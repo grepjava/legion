@@ -257,12 +257,37 @@ async fn runs_a_pod() {
         ]
     );
 
-    // Shutting the task down removes the pod and its limits.
+    // The node got the first pod subnet; the pod its first address, on an
+    // epair from the bridge into the infra jail, with a default route.
+    assert_eq!(node.status["podCidr"], "10.200.0.0/24");
+    assert_eq!(status.ip.as_deref(), Some("10.200.0.2"));
+    let uid = h.store.get(&key).unwrap().unwrap().metadata.uid;
+    let host_end = legion_net::host_interface(&uid);
+    assert_eq!(
+        h.sys.interface(legion_net::BRIDGE).unwrap().members,
+        std::slice::from_ref(&host_end)
+    );
+    let inside = h.sys.interfaces(Some(&infra)).unwrap();
+    assert_eq!(inside.len(), 2, "lo0 and the pod's end: {inside:?}");
+    let routes = h.sys.routes(Some(&infra));
+    assert_eq!(
+        routes[&legion_sys::Destination::Default].to_string(),
+        "10.200.0.1"
+    );
+
+    // Shutting the task down removes the pod, its network and its limits.
     h.shut_down(&key).await;
     h.wait_state(&key, TaskState::Shutdown).await;
     assert!(h.rt.containers().is_empty());
     assert!(h.sys.rctl_rules().is_empty());
     assert!(h.sys.jails().unwrap().is_empty());
+    assert!(h.sys.interface(&host_end).is_none());
+    assert_eq!(h.sys.interfaces(None).unwrap(), ["lo0", legion_net::BRIDGE]);
+
+    // The next pod reuses the freed address.
+    let next = h.task("web-2", WEB).await;
+    let status = h.wait_state(&next, TaskState::Running).await;
+    assert_eq!(status.ip.as_deref(), Some("10.200.0.2"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -434,6 +459,13 @@ restartPolicy: { condition: any, delay: 0s }
     assert_eq!(h.rt.created(), created, "no container recreated");
     eventually("restart counted", || h.status(&key).restarts == 1).await;
     assert_eq!(h.status(&key).state, TaskState::Running);
+    // The adopted pod keeps its address, and a new pod does not take it.
+    assert_eq!(h.status(&key).ip.as_deref(), Some("10.200.0.2"));
+    let other = h
+        .task("other-1", r#"containers: [{ name: app, image: "app:1" }]"#)
+        .await;
+    let st = h.wait_state(&other, TaskState::Running).await;
+    assert_eq!(st.ip.as_deref(), Some("10.200.0.3"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

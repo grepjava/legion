@@ -58,7 +58,7 @@ self-heals on one node.
   pod down when the task ends or stops. Pods survive agent restarts and are
   adopted; containers no task accounts for are removed. Tested in CI with
   fakes of Podman and the system; `tests/live.rs` runs a real pod on
-  FreeBSD. Not yet: networking (step 1), probes (step 4; tasks count as ready
+  FreeBSD. Not yet: probes (step 3; tasks count as ready
   when they have no readiness probe), secrets, configs and volumes (tasks
   using them are rejected).
 - **Service controller and scheduler** (`legion-manager`, DESIGN.md §3.3):
@@ -68,6 +68,12 @@ self-heals on one node.
   services and nodes with their state. `tests/e2e.rs` (in `legion-agent`)
   runs apply to running pods in one process; on FreeBSD, a Service applied
   through the CLI runs as real pods.
+- **Node-local networking** (`legion-net`, DESIGN.md §5.3): each node gets a
+  /24 of `10.200.0.0/16` on registration; the agent creates `legion0`, gives
+  each pod an epair, the lowest free address and a default route, keeps the
+  address across agent restarts and removes the pair at teardown. Pods reach
+  each other and the host. `tests/live.rs` in `legion-net` (in a VNET jail)
+  and `legion-agent` check it on FreeBSD. Not yet: outbound NAT and pf.
 
 ### To do, in order
 
@@ -75,19 +81,18 @@ Each step ends with tests that run in CI; steps that need jails, pf or ZFS
 also get an integration test run by hand on a FreeBSD host until CI can run
 them.
 
-1. **Node-local networking** (`legion-net`): `legion0` bridge, per-pod
-   epair, IP allocation from the node subnet, pf anchors with the default-block
-   ruleset (§5.3).
-2. **Service VIPs and endpoints**: allocator for VIPs, Endpoints controller,
-   pf tables for load balancing with soft drain and kill-by-key (§5.4).
-3. **DNS**: resolver on the bridge gateway for cluster names, forwarding the
+1. **Service VIPs and endpoints**: allocator for VIPs, Endpoints controller,
+   pf anchors with the default-block ruleset and tables for load balancing
+   with soft drain and kill-by-key (§5.4); outbound NAT for pods. Needs the
+   host's pf to reference Legion's anchors.
+2. **DNS**: resolver on the bridge gateway for cluster names, forwarding the
    rest (§5.5).
-4. **Probes**: liveness and readiness (TCP, HTTP, gRPC from the host; exec in
+3. **Probes**: liveness and readiness (TCP, HTTP, gRPC from the host; exec in
    the container); readiness feeds Endpoints.
-5. **Secrets and configs**: per-task tmpfs, read-only nullfs mounts.
-6. **ZFS volumes**: create, mount into containers, keep across task
+4. **Secrets and configs**: per-task tmpfs, read-only nullfs mounts.
+5. **ZFS volumes**: create, mount into containers, keep across task
    restarts.
-7. **Exit test**: a multi-service app (for example web + database + cache)
+6. **Exit test**: a multi-service app (for example web + database + cache)
    with probes and a volume; kill containers and the agent and check that it
    comes back.
 

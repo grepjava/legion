@@ -13,6 +13,7 @@ publish = false
 legion-agent = { path = "crates/legion-agent" }
 legion-api = { path = "crates/legion-api" }
 legion-manager = { path = "crates/legion-manager" }
+legion-net = { path = "crates/legion-net" }
 legion-podman = { path = "crates/legion-podman" }
 legion-proto = { path = "crates/legion-proto" }
 legion-store = { path = "crates/legion-store" }

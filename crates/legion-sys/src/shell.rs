@@ -229,6 +229,11 @@ impl<R: Runner> Sys for Shell<R> {
         self.run("ifconfig", &args([name, "destroy"])).map(drop)
     }
 
+    fn interface_rename(&self, name: &str, new_name: &str) -> Result<()> {
+        self.run("ifconfig", &args([name, "name", new_name]))
+            .map(drop)
+    }
+
     fn bridge_add_member(&self, bridge: &str, member: &str) -> Result<()> {
         self.run("ifconfig", &args([bridge, "addm", member]))
             .map(drop)

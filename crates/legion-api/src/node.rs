@@ -68,6 +68,10 @@ pub struct NodeStatus {
     pub allocatable: Capacity,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub version: String,
+    /// This node's part of the cluster pod network, e.g. `10.200.3.0/24`.
+    /// Assigned once, when the node first registers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_cidr: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

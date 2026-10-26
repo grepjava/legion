@@ -25,7 +25,7 @@ pub mod pod;
 pub mod runtime;
 mod task;
 
-pub use control::{Assignment, Assignments, Control, ControlError, StoreControl};
+pub use control::{Assignment, Assignments, Control, ControlError, Registration, StoreControl};
 pub use runtime::Runtime;
 
 use crate::pod::{LABEL_NODE, LABEL_TASK};
@@ -76,6 +76,8 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 control,
                 node: config.node,
                 infra_image: config.infra_image,
+                net: Arc::default(),
+                ips: Arc::default(),
             },
             resync: config.resync,
         }
@@ -96,10 +98,17 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             tracing::warn!("loading kernel module {e}");
         }
 
-        tokio::select! {
-            _ = register(&ctx, &status) => {}
+        let registration = tokio::select! {
+            r = register(&ctx, &status) => r,
             _ = &mut shutdown => return,
+        };
+        let net = legion_net::PodNetwork::new(registration.pod_cidr);
+        tracing::info!(subnet = %net.subnet, "pod network");
+        let bridge = net.clone();
+        if let Err(e) = task::blocking(&ctx.sys, move |sys| bridge.ensure_bridge(sys)).await {
+            tracing::error!("setting up the pod bridge: {e}; pods will fail to start");
         }
+        let _ = ctx.net.set(net);
 
         let mut assignments = ctx.control.assignments(&ctx.node);
         // Nothing is reconciled before the first complete set of
@@ -112,6 +121,20 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             },
             _ = &mut shutdown => return,
         }
+        // Addresses held by tasks that may still run, so new pods do not
+        // take them.
+        {
+            let mut ips = ctx.ips.lock().unwrap_or_else(|e| e.into_inner());
+            for (uid, a) in assignments.borrow().iter() {
+                if a.status.state.is_terminal() {
+                    continue;
+                }
+                if let Some(ip) = a.status.ip.as_deref().and_then(|s| s.parse().ok()) {
+                    ips.insert(uid.clone(), ip);
+                }
+            }
+        }
+
         let (events_tx, mut events) = mpsc::channel(256);
         let forwarder = tokio::spawn(forward_events(ctx.clone(), events_tx));
         let mut workers: BTreeMap<String, Worker> = BTreeMap::new();
@@ -187,13 +210,13 @@ impl<R: Runtime, C: Control> Agent<R, C> {
 }
 
 /// Registers the node, retrying until the manager takes it.
-async fn register<R, C: Control>(ctx: &Ctx<R, C>, status: &NodeStatus) {
+async fn register<R, C: Control>(ctx: &Ctx<R, C>, status: &NodeStatus) -> control::Registration {
     let mut warned = false;
     loop {
         match ctx.control.register(&ctx.node, status).await {
-            Ok(()) => {
+            Ok(r) => {
                 tracing::info!(node = %ctx.node, "node registered");
-                return;
+                return r;
             }
             Err(e) => {
                 if !warned {

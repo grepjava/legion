@@ -116,6 +116,8 @@ async fn start_agent(
             memory: Bytes(physical_memory().unwrap_or(0)),
         },
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        // Assigned by the manager on registration.
+        pod_cidr: None,
     };
     let agent = Agent::new(
         config,

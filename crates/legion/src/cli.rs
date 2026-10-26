@@ -370,7 +370,7 @@ fn print_objects(objects: &[pb::Object], format: Format, kind: Kind) -> anyhow::
                 print_table(["NAMESPACE", "NAME", "MODE", "READY", "IMAGES"], &rows);
             }
             Kind::Task => {
-                let rows: Vec<[String; 5]> = objects
+                let rows: Vec<[String; 6]> = objects
                     .iter()
                     .map(|o| {
                         [
@@ -378,11 +378,15 @@ fn print_objects(objects: &[pb::Object], format: Format, kind: Kind) -> anyhow::
                             o.metadata.name.clone(),
                             field(&o.spec, &["node"]),
                             field(&o.status, &["state"]),
+                            field(&o.status, &["ip"]),
                             field(&o.status, &["message"]),
                         ]
                     })
                     .collect();
-                print_table(["NAMESPACE", "NAME", "NODE", "STATE", "MESSAGE"], &rows);
+                print_table(
+                    ["NAMESPACE", "NAME", "NODE", "STATE", "IP", "MESSAGE"],
+                    &rows,
+                );
             }
             Kind::Node => {
                 let rows: Vec<[String; 5]> = objects

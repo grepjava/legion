@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 futures.workspace = true
 legion-api.workspace = true
+legion-net.workspace = true
 legion-podman.workspace = true
 legion-store.workspace = true
 legion-sys.workspace = true

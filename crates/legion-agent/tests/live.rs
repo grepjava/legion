@@ -160,6 +160,17 @@ async fn agent_runs_a_real_pod() {
     let app = podman.inspect("lab_web-1_app").await.unwrap();
     assert!(infra.state.running && app.state.running);
 
+    // The pod has its address on the node's bridge, reachable from the host.
+    let ip = status(&store, &key).ip.expect("pod address");
+    assert!(ip.starts_with("10.200.0."), "{ip}");
+    let ping = sh(&format!("ping -c1 -t2 {ip} >/dev/null && echo reachable"));
+    assert_eq!(ping.trim(), "reachable", "host to pod {ip}");
+    let route = sh(&format!("route -j {} -n get default", infra.id));
+    assert!(route.contains("gateway: 10.200.0.1"), "{route}");
+    let uid = status_uid(&store, &key);
+    let host_end = legion_net::host_interface(&uid);
+    assert!(sh("ifconfig -l").contains(&host_end));
+
     // ocijail names the app's jail <infra id>.<app id>, as the limits assume.
     let child = format!("{}.{}", infra.id, app.id);
     let jails = sh("jls -n name vnet");
@@ -233,11 +244,19 @@ async fn agent_runs_a_real_pod() {
     );
     assert!(!sh("jls -n name").contains(&infra.id));
     assert!(sh(&format!("rctl jail:{child}")).trim().is_empty());
+    assert!(
+        !sh("ifconfig -l").contains(&host_end),
+        "pod interface removed"
+    );
 
     stop.send(()).unwrap();
     agent.await.unwrap();
     drop(manager);
     service.shutdown().await;
+    // The bridge outlives tasks; remove it with the lab.
+    let _ = Process::new("ifconfig")
+        .args([legion_net::BRIDGE, "destroy"])
+        .status();
 }
 
 fn status_uid(store: &Store, key: &ObjectKey) -> String {

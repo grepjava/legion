@@ -59,6 +59,8 @@ pub trait Sys: Send + Sync {
     /// Creates an epair in the host stack.
     fn epair_create(&self) -> Result<Epair>;
     fn interface_destroy(&self, name: &str) -> Result<()>;
+    /// Renames a host interface (at most 15 characters).
+    fn interface_rename(&self, name: &str, new_name: &str) -> Result<()>;
     fn bridge_add_member(&self, bridge: &str, member: &str) -> Result<()>;
     /// Moves a host interface into a VNET jail. It returns to the host when
     /// the jail is removed.

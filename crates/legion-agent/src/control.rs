@@ -13,6 +13,7 @@ use legion_api::node::{NodeSpec, NodeStatus};
 use legion_api::task::{TaskSpec, TaskStatus};
 use legion_api::{Kind, Object, ObjectKey};
 use legion_store::{Command, Event, Outcome, Precondition, Store, WatchError};
+use legion_sys::Ipv4Net;
 use openraft::error::{ClientWriteError, RaftError};
 use tokio::sync::watch;
 
@@ -37,17 +38,25 @@ pub struct Assignment {
     pub status: TaskStatus,
 }
 
+/// What the manager gives a node when it registers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Registration {
+    /// The node's pod subnet.
+    pub pod_cidr: Ipv4Net,
+}
+
 /// Every task assigned to the node, by uid.
 pub type Assignments = BTreeMap<String, Assignment>;
 
 pub trait Control: Send + Sync + 'static {
     /// Creates the node's `Node` object, or updates its status, keeping the
-    /// spec and labels operators set.
+    /// spec and labels operators set and the pod subnet assigned on first
+    /// registration.
     fn register(
         &self,
         name: &str,
         status: &NodeStatus,
-    ) -> impl Future<Output = Result<(), ControlError>> + Send;
+    ) -> impl Future<Output = Result<Registration, ControlError>> + Send;
 
     /// The tasks assigned to `node`, kept current. The receiver's initial
     /// value is empty and not yet marked changed; the first change is the
@@ -100,6 +109,26 @@ impl StoreControl {
         }
     }
 
+    /// The lowest node subnet no node holds.
+    fn free_subnet(&self) -> Result<Ipv4Net, ControlError> {
+        let nodes = self
+            .store
+            .list(Kind::Node, None)
+            .map_err(|e| ControlError::Other(e.to_string()))?;
+        let taken = nodes
+            .objects
+            .iter()
+            .filter_map(|n| {
+                serde_json::from_value::<NodeStatus>(n.status.clone())
+                    .ok()?
+                    .pod_cidr
+            })
+            .filter_map(|c| c.parse::<Ipv4Net>().ok())
+            .collect();
+        legion_net::free_node_subnet(&taken)
+            .ok_or_else(|| ControlError::Other("the cluster pod network is full".into()))
+    }
+
     fn get(&self, key: &ObjectKey) -> Result<Option<Object>, ControlError> {
         self.store
             .get(key)
@@ -108,30 +137,51 @@ impl StoreControl {
 }
 
 impl Control for StoreControl {
-    async fn register(&self, name: &str, status: &NodeStatus) -> Result<(), ControlError> {
+    async fn register(
+        &self,
+        name: &str,
+        status: &NodeStatus,
+    ) -> Result<Registration, ControlError> {
         let key = ObjectKey::new(Kind::Node, "", name);
-        let status =
-            serde_json::to_value(status).map_err(|e| ControlError::Other(e.to_string()))?;
+        let other = |e: serde_json::Error| ControlError::Other(e.to_string());
         for _ in 0..ATTEMPTS {
-            let (object, precondition) = match self.get(&key)? {
+            let existing = self.get(&key)?;
+            let mut status = status.clone();
+            status.pod_cidr = match existing
+                .as_ref()
+                .and_then(|n| serde_json::from_value::<NodeStatus>(n.status.clone()).ok())
+                .and_then(|s| s.pod_cidr)
+            {
+                Some(cidr) => Some(cidr),
+                None => Some(self.free_subnet()?.to_string()),
+            };
+            let registration = Registration {
+                pod_cidr: status
+                    .pod_cidr
+                    .as_deref()
+                    .unwrap_or_default()
+                    .parse()
+                    .map_err(ControlError::Other)?,
+            };
+            let status = serde_json::to_value(&status).map_err(other)?;
+            let (object, precondition) = match existing {
                 Some(mut node) => {
                     if node.status == status {
-                        return Ok(());
+                        return Ok(registration);
                     }
-                    node.status = status.clone();
+                    node.status = status;
                     let version = node.metadata.version;
                     (node, Precondition::Version(version))
                 }
                 None => {
-                    let spec = serde_json::to_value(NodeSpec::default())
-                        .map_err(|e| ControlError::Other(e.to_string()))?;
+                    let spec = serde_json::to_value(NodeSpec::default()).map_err(other)?;
                     let mut node = Object::new(Kind::Node, "", name, spec);
-                    node.status = status.clone();
+                    node.status = status;
                     (node, Precondition::MustNotExist)
                 }
             };
             match self.write(object, precondition).await? {
-                Outcome::Written(_) => return Ok(()),
+                Outcome::Written(_) => return Ok(registration),
                 Outcome::Conflict { .. } => continue,
                 other => return Err(ControlError::Other(format!("unexpected outcome {other:?}"))),
             }

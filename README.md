@@ -39,7 +39,8 @@ The daemon listens on `127.0.0.1:7470` without TLS; set `--listen`, or point the
 CLI elsewhere with `--server` or `LEGION_SERVER`. Without `--no-agent`, on
 FreeBSD and as root, it also runs the agent with its own Podman service, so
 applied services run as pods of jails on the node (`legion list tasks -n
-shop`). Pods have no network yet.
+shop` shows each pod's address on the node's `legion0` bridge). Pods reach
+each other and the host; there is no outbound NAT yet.
 
 ## Layout
 
@@ -52,6 +53,7 @@ shop`). Pods have no network yet.
 | `legion-podman` | libpod REST client; supervises Legion's own Podman service |
 | `legion-sys` | FreeBSD operations: jails, interfaces, routes, rctl, pf, ZFS |
 | `legion-agent` | Registers the node; runs assigned tasks as pod jails |
+| `legion-net` | Pod bridge, pod interfaces and addresses |
 | `legion` | Daemon and CLI |
 
 ## Licence

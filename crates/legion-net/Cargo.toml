@@ -1,0 +1,13 @@
+[package]
+name = "legion-net"
+description = "Legion node networking: the pod bridge, pod interfaces and addresses"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+legion-sys.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

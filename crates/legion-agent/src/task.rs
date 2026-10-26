@@ -3,12 +3,14 @@
 //! pod's restart policy, and tears the pod down when the task ends or is
 //! stopped. Every state change is reported to the manager.
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use legion_api::service::{PodSpec, RestartCondition};
 use legion_api::task::{DesiredState, TaskState, TaskStatus};
+use legion_net::PodNetwork;
 use legion_sys::Sys;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -36,6 +38,10 @@ pub(crate) struct Ctx<R, C> {
     pub control: Arc<C>,
     pub node: String,
     pub infra_image: String,
+    /// Set once the node has registered, before any worker starts.
+    pub net: Arc<OnceLock<PodNetwork>>,
+    /// Pod addresses in use, by task uid.
+    pub ips: Arc<Mutex<BTreeMap<String, Ipv4Addr>>>,
 }
 
 impl<R, C> Clone for Ctx<R, C> {
@@ -46,6 +52,8 @@ impl<R, C> Clone for Ctx<R, C> {
             control: self.control.clone(),
             node: self.node.clone(),
             infra_image: self.infra_image.clone(),
+            net: self.net.clone(),
+            ips: self.ips.clone(),
         }
     }
 }
@@ -207,6 +215,13 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             }
             if members.len() == self.pod().containers.len() {
                 tracing::info!("adopted running pod");
+                if let Err(e) = self.attach(&infra.id).await {
+                    let why = match e {
+                        Abort::Failed(m) | Abort::Rejected(m) => m,
+                        Abort::Stopped => "stopped".into(),
+                    };
+                    tracing::warn!("adopted pod's network: {why}");
+                }
                 return Some(Pod {
                     infra: infra.id.clone(),
                     members,
@@ -252,6 +267,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             .await
             .map_err(|e| Abort::Failed(format!("starting the infra container: {e}")))?;
         self.check_infra_jail(&infra).await?;
+        self.attach(&infra).await?;
 
         self.report(TaskState::Starting, "starting containers")
             .await;
@@ -313,6 +329,48 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         }
         self.report(TaskState::Running, "").await;
         Ok(Pod { infra, members })
+    }
+
+    /// Gives the pod its address: the one it had (an adopted pod, or a task
+    /// whose status carries one) or the lowest free one.
+    async fn attach(&mut self, infra: &str) -> Result<(), Abort> {
+        let net = self
+            .ctx
+            .net
+            .get()
+            .expect("network set at registration")
+            .clone();
+        let ip = {
+            let mut ips = self.ctx.ips.lock().unwrap_or_else(|e| e.into_inner());
+            let own = self
+                .status
+                .ip
+                .as_deref()
+                .and_then(|s| s.parse::<Ipv4Addr>().ok())
+                .filter(|ip| {
+                    net.contains(*ip)
+                        && !ips
+                            .iter()
+                            .any(|(uid, other)| other == ip && *uid != self.a.uid)
+                });
+            let ip = match own {
+                Some(ip) => ip,
+                None => {
+                    let used: BTreeSet<Ipv4Addr> = ips.values().copied().collect();
+                    net.allocate(&used).ok_or_else(|| {
+                        Abort::Rejected(format!("no free address in {}", net.subnet))
+                    })?
+                }
+            };
+            ips.insert(self.a.uid.clone(), ip);
+            ip
+        };
+        let (uid, jail) = (self.a.uid.clone(), infra.to_owned());
+        blocking(&self.ctx.sys, move |sys| net.attach(sys, &uid, &jail, ip))
+            .await
+            .map_err(|e| Abort::Failed(format!("attaching the pod network: {e}")))?;
+        self.status.ip = Some(ip.to_string());
+        Ok(())
     }
 
     /// The infra jail must have its own VNET: without the annotation taking
@@ -532,6 +590,18 @@ async fn sleep_until(t: Option<Instant>) {
 /// Removes every container of the task and their rctl rules. Failures are
 /// logged; the next reconcile retries whatever is left.
 pub(crate) async fn teardown<R: Runtime, C: Control>(ctx: &Ctx<R, C>, uid: &str, grace: Duration) {
+    // The epair goes first: destroying its host end removes both ends, even
+    // while the other is still in the jail.
+    if let Some(net) = ctx.net.get().cloned() {
+        let id = uid.to_owned();
+        if let Err(e) = blocking(&ctx.sys, move |sys| net.detach(sys, &id)).await {
+            tracing::warn!(uid, "removing the pod network: {e}");
+        }
+    }
+    ctx.ips
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(uid);
     let found = match ctx.runtime.list(&[(LABEL_TASK, uid)]).await {
         Ok(f) => f,
         Err(e) => {

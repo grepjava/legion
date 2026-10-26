@@ -417,6 +417,15 @@ default `10.88.0.0/16`, for example).
   underlay IP, pod subnet). The agent converges `wg0` peers and routes to it
   incrementally with `wg set`; S6 showed 100 peers added and removed in under
   a second with no loss on existing peers.
+- **Built** (`legion-net`, phase 1): a node is given the lowest free /24 of
+  the pod CIDR when it first registers, kept in `Node.status.podCidr`. The
+  agent allocates pod addresses from it (the lowest free one, recorded in
+  `Task.status.ip`, kept across agent restarts), and renames each pod's host
+  end `lp<last 12 hex digits of the task uid>`, which finds it again after a
+  restart. Teardown destroys the host end first, which removes the pair
+  even while the other end is still in the jail. Routing between nodes,
+  NAT to the outside and pf are not built yet; until then pods reach each
+  other and the host only.
 - **Bridge sysctls**: `net.link.bridge.pfil_*` are per-VNET, but Legion runs in
   the host VNET, so changing them would affect every bridge on the host,
   including Podman's own. Legion leaves them at their defaults and uses the

@@ -268,6 +268,36 @@ impl Sys for FakeSys {
         Ok(())
     }
 
+    fn interface_rename(&self, name: &str, new_name: &str) -> Result<()> {
+        let mut s = self.state();
+        if s.interfaces.contains_key(new_name) {
+            return Err(fail(
+                "ifconfig name",
+                "ioctl SIOCSIFNAME (set name): File exists",
+            ));
+        }
+        if new_name.len() > 15 {
+            return Err(fail(
+                "ifconfig name",
+                "ioctl SIOCSIFNAME (set name): Invalid argument",
+            ));
+        }
+        s.interface_mut("ifconfig name", None, name)?;
+        let i = s.interfaces.remove(name).expect("checked");
+        if let Some(peer) = &i.peer
+            && let Some(p) = s.interfaces.get_mut(peer)
+        {
+            p.peer = Some(new_name.to_owned());
+        }
+        for other in s.interfaces.values_mut() {
+            for m in other.members.iter_mut().filter(|m| *m == name) {
+                *m = new_name.to_owned();
+            }
+        }
+        s.interfaces.insert(new_name.to_owned(), i);
+        Ok(())
+    }
+
     fn bridge_add_member(&self, bridge: &str, member: &str) -> Result<()> {
         let mut s = self.state();
         s.interface_mut("ifconfig addm", None, member)?;
