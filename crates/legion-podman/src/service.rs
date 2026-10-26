@@ -30,7 +30,7 @@ pub struct ServiceConfig {
     /// view of its containers.
     pub tmpdir: PathBuf,
     pub socket: PathBuf,
-    /// OCI runtime; `ocijail` unless overridden.
+    /// OCI runtime, by name or path; `ocijail` unless overridden.
     pub runtime: Option<String>,
     pub storage_driver: Option<String>,
     /// `--storage-opt` values, e.g. `zfs.fsname=zroot/legion/podman`.

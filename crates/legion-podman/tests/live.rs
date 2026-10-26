@@ -7,6 +7,9 @@
 //!     target/debug/deps/live-<hash> --ignored --nocapture
 //! ```
 //!
+//! `LEGION_OCIJAIL` names the OCI runtime to use instead of `ocijail` from
+//! `PATH`, e.g. a development build of ocijail.
+//!
 //! The lab directory gets its own root, runroot and tmpdir, so the host's
 //! own Podman containers are not affected. Remove it afterwards with
 //! `chflags -R 0` and `rm -rf`: FreeBSD base images contain immutable files.
@@ -26,7 +29,10 @@ const LABEL: &str = "legion.test";
 async fn pod_lifecycle() {
     let lab = PathBuf::from(std::env::var("LEGION_PODMAN_LAB").expect("set LEGION_PODMAN_LAB"));
     let run = std::process::id().to_string();
-    let config = ServiceConfig::new(&lab.join("state"), &lab.join("run"));
+    let mut config = ServiceConfig::new(&lab.join("state"), &lab.join("run"));
+    if let Ok(runtime) = std::env::var("LEGION_OCIJAIL") {
+        config.runtime = Some(runtime);
+    }
     let service = PodmanService::start(config, Duration::from_secs(30))
         .await
         .expect("podman service");

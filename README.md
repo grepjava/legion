@@ -47,6 +47,7 @@ CLI elsewhere with `--server` or `LEGION_SERVER`.
 | `legion-proto` | gRPC definitions (compiled with protox) |
 | `legion-manager` | API server, Raft transport |
 | `legion-podman` | libpod REST client; supervises Legion's own Podman service |
+| `legion-sys` | FreeBSD operations: jails, interfaces, routes, rctl, pf, ZFS |
 | `legion` | Daemon and CLI |
 
 ## Licence

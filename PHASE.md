@@ -45,6 +45,10 @@ self-heals on one node.
   Unit tests run against a canned server in CI; `tests/live.rs` runs the pod
   pattern (§6.2) against real Podman and ocijail and is run by hand on a
   FreeBSD host.
+- **System layer** (`legion-sys`): the `Sys` trait over jails, interfaces,
+  routes, rctl, pf anchors and tables, and ZFS; `Shell` runs the FreeBSD
+  tools, `FakeSys` models them in memory for tests. `tests/live.rs` checks
+  `Shell` on FreeBSD (DESIGN.md §3.6).
 
 ### To do, in order
 
@@ -52,30 +56,28 @@ Each step ends with tests that run in CI; steps that need jails, pf or ZFS
 also get an integration test run by hand on a FreeBSD host until CI can run
 them.
 
-1. **System layer** (`legion-sys`): trait over jail, rctl, zfs, ifconfig,
-   route and pfctl; shell-out implementation and a fake for tests.
-2. **Agent and executor** (`legion-agent`): the daemon registers its `Node`;
+1. **Agent and executor** (`legion-agent`): the daemon registers its `Node`;
    runs assigned Tasks as an infra jail plus child container jails (§6.2);
    per-container rctl limits (§6.3); reconciles Podman against assignments by
    label on start, on events and periodically; reports Task state.
-3. **Service controller and scheduler**: replicated and global services
+2. **Service controller and scheduler**: replicated and global services
    create and remove Tasks; single-node placement (resource requests fit);
    restart policy; Task state machine (§7).
-4. **Node-local networking** (`legion-net`): `legion0` bridge, per-pod
+3. **Node-local networking** (`legion-net`): `legion0` bridge, per-pod
    epair, IP allocation from the node subnet, pf anchors with the default-block
    ruleset (§5.3).
-5. **Service VIPs and endpoints**: allocator for VIPs, Endpoints controller,
+4. **Service VIPs and endpoints**: allocator for VIPs, Endpoints controller,
    pf tables for load balancing with soft drain and kill-by-key (§5.4).
-6. **DNS**: resolver on the bridge gateway for cluster names, forwarding the
+5. **DNS**: resolver on the bridge gateway for cluster names, forwarding the
    rest (§5.5).
-7. **Probes**: liveness and readiness (TCP, HTTP, gRPC from the host; exec in
+6. **Probes**: liveness and readiness (TCP, HTTP, gRPC from the host; exec in
    the container); readiness feeds Endpoints.
-8. **Secrets and configs**: per-task tmpfs, read-only nullfs mounts.
-9. **ZFS volumes**: create, mount into containers, keep across task
+7. **Secrets and configs**: per-task tmpfs, read-only nullfs mounts.
+8. **ZFS volumes**: create, mount into containers, keep across task
    restarts.
-10. **Exit test**: a multi-service app (for example web + database + cache)
-    with probes and a volume; kill containers and the agent and check that it
-    comes back.
+9. **Exit test**: a multi-service app (for example web + database + cache)
+   with probes and a volume; kill containers and the agent and check that it
+   comes back.
 
 ### Deferred to phase 2
 

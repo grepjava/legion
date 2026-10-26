@@ -177,6 +177,26 @@ easy to debug), and native ioctl / netlink / `libpfctl` versions that replace it
 per operation once each path is stable. Tests use a fake implementation. Every
 command used in the shell implementation has been exercised in the phase-0 lab.
 
+`legion-sys` implements this as the `Sys` trait (synchronous, so the agent can
+hold it as `Arc<dyn Sys>` and call it on the blocking pool), with `Shell` and
+`FakeSys`. Its live tests run on FreeBSD 15.1: network and pf inside a
+throwaway VNET jail, rctl on the host against lab jails, ZFS on a file-backed
+pool. Details they pinned down:
+
+- A pod's interface is configured from the host with `ifconfig -j <jail>` and
+  `route -j <jail>`; nothing needs to exist inside the image.
+- `jls --libxo=json` gives every value as a string; a child jail is named
+  `<parent>.<child>`.
+- `rctl -r jail:<name>` fails with "No such process" when the jail has no
+  rules (treated as success); `rctl -u` for an unknown jail reports zeros.
+  Memory amounts come back in bytes.
+- `pfctl -T replace` with no addresses empties a table; `-T show` on a missing
+  table fails with "Table does not exist" (treated as empty).
+- `zfs create -p` succeeds on an existing dataset, so creation is idempotent.
+- **Kernel modules**: after a reboot `if_bridge` and `if_epair` are not loaded,
+  and a jail cannot load them on demand (`SIOCIFCREATE2: Invalid argument`).
+  The agent loads `if_bridge`, `if_epair` and `pf` at startup.
+
 ### 3.7 Store internals
 
 Built and tested in spike S4 (`crates/legion-store`).
@@ -508,7 +528,8 @@ libpod REST API (annotations and labels in `containers/create`).
 - Events: the libpod event stream works and drives fast state updates; the
   agent also reconciles periodically in case events are missed. A container's
   `died` event carries its exit code (`containerExitCode`).
-- libpod details the client (`legion-podman`) handles, from Podman 5.8.9:
+- libpod details the client (`legion-podman`) handles, from Podman 5.8.9 with
+  ocijail 0.7.0-dev:
   `start` and `stop` answer 304 when the container is already in that state;
   exec in a stopped container is HTTP 500 "container state improper", not
   409; exec and log output use Docker's multiplexed framing; `wait` returns a

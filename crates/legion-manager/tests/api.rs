@@ -335,7 +335,7 @@ async fn three_managers_forward_and_fail_over() {
     let old = managers.remove(0);
     drop(leader_raft);
     old.stop().await;
-    let mut api = managers[0].objects().await;
+    let api = managers[0].objects().await;
     eventually(|| {
         let mut api = api.clone();
         async move { api.apply(apply(service("after", 1))).await }
