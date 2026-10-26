@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
 
+# The emulated aarch64 job takes about an hour; a newer push to the same
+# branch or pull request replaces the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 

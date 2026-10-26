@@ -700,7 +700,7 @@ WireGuard and bridge, with tasks as VNET jails attached to the node bridges.
 
 | Phase | Theme | Contents | Exit criteria |
 |-------|-------|----------|---------------|
-| 0 | Spikes | ~~S1–S6~~ done; workspace started; CI building on FreeBSD 15 (amd64, arm64) remaining | ~~S4 answered~~ met |
+| 0 | Spikes | ~~S1–S6, workspace, CI on FreeBSD 15 amd64 and arm64~~ done | ~~S4 answered~~ met |
 | 1 | Single node | Store (one member), API, CLI, `apply`/`diff`, replicated and global services, pods, executor, node-local networking, DNS, VIPs, liveness and readiness probes, restart policy, secrets, configs, ZFS volumes, labels | A multi-service app with probes and volumes runs and self-heals on one node |
 | 2 | Cluster (**MVP**) | `init`/`join`, PKI, 3–5 managers, dispatcher, WireGuard mesh, routed pod network, scheduler (constraints, requests, taints), node failure handling, routing mesh, rolling updates and rollback, drain, rctl limits, compose `stack deploy` | A compose app deploys on 3 nodes, survives losing any one node, and updates with zero downtime |
 | 3 | K8s-lite | Namespaces, RBAC, init containers, startup probes, jobs and cronjobs, network policy, disruption budgets, `logs`/`exec`/`port-forward`, security profiles, Prometheus metrics endpoint | Two teams share a cluster with isolation enforced |

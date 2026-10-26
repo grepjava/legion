@@ -14,7 +14,7 @@ Current phase: **1 — Single node**.
 | Cargo workspace | Done |
 | CI: Linux fmt, clippy, test | Done |
 | CI: tests on FreeBSD 15.1 amd64 | Done |
-| CI: tests on FreeBSD 15.1 arm64 (emulated) | Added; first run pending |
+| CI: tests on FreeBSD 15.1 arm64 (emulated) | Done (about 55 minutes per run) |
 
 ## Phase 1 — Single node
 
