@@ -44,3 +44,7 @@ CLI elsewhere with `--server` or `LEGION_SERVER`.
 | `legion-proto` | gRPC definitions (compiled with protox) |
 | `legion-manager` | API server, Raft transport |
 | `legion` | Daemon and CLI |
+
+## Licence
+
+BSD-2-Clause; see [LICENSE](LICENSE).

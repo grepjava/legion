@@ -689,5 +689,5 @@ WireGuard and bridge, with tasks as VNET jails attached to the node bridges.
 
 1. Do we want a built-in image registry (a system service backed by ZFS) for air-gapped clusters?
 2. Package distribution: FreeBSD ports/pkg from the start, or release tarballs until phase 2?
-3. Licence (BSD-2-Clause fits the FreeBSD ecosystem).
+3. ~~Licence~~ Decided: BSD-2-Clause, which fits the FreeBSD ecosystem.
 4. Should Legion also manage tasks for the system Podman (adopt existing containers), or stay strictly separate? This draft says separate.
