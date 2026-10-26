@@ -1,0 +1,122 @@
+// Legion's public API (DESIGN.md §3.2, D2).
+syntax = "proto3";
+
+package legion.v1;
+
+// The common envelope (DESIGN.md §7). Specs and statuses travel as JSON until
+// each kind gets a typed message.
+message Object {
+  string kind = 1;
+  string namespace = 2;
+  string name = 3;
+  map<string, string> labels = 4;
+  // Set by the server.
+  string uid = 5;
+  uint64 version = 6;
+  uint64 generation = 7;
+  bytes spec_json = 8;
+  bytes status_json = 9;
+}
+
+message ObjectRef {
+  string kind = 1;
+  // Empty for cluster-scoped kinds; "default" when omitted for the others.
+  string namespace = 2;
+  string name = 3;
+}
+
+service Objects {
+  // Server-side apply: creates the object, or replaces its labels and spec.
+  // Status is kept. Last applier wins unless expected_version is set.
+  rpc Apply(ApplyRequest) returns (ApplyResponse);
+  rpc Get(ObjectRef) returns (Object);
+  rpc List(ListRequest) returns (ListResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  // Changes after from_version. Ends with ABORTED when the client must list
+  // again (history compacted, or the store was reset from a snapshot).
+  rpc Watch(WatchRequest) returns (stream WatchEvent);
+}
+
+message ApplyRequest {
+  Object object = 1;
+  // Fail with ABORTED unless the object is at exactly this version.
+  optional uint64 expected_version = 2;
+}
+
+enum ApplyResult {
+  APPLY_RESULT_UNSPECIFIED = 0;
+  APPLY_RESULT_CREATED = 1;
+  APPLY_RESULT_UPDATED = 2;
+  APPLY_RESULT_UNCHANGED = 3;
+}
+
+message ApplyResponse {
+  Object object = 1;
+  ApplyResult result = 2;
+}
+
+message ListRequest {
+  string kind = 1;
+  // Empty: all namespaces.
+  string namespace = 2;
+  // Every label must match exactly.
+  map<string, string> match_labels = 3;
+}
+
+message ListResponse {
+  repeated Object objects = 1;
+  // Watch from this version to follow changes.
+  uint64 version = 2;
+}
+
+message DeleteRequest {
+  ObjectRef ref = 1;
+  optional uint64 expected_version = 2;
+}
+
+message DeleteResponse {
+  uint64 version = 1;
+}
+
+message WatchRequest {
+  // Empty: every kind.
+  string kind = 1;
+  uint64 from_version = 2;
+}
+
+message WatchEvent {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    TYPE_PUT = 1;
+    TYPE_DELETE = 2;
+  }
+  Type type = 1;
+  Object object = 2;
+}
+
+service Cluster {
+  // Makes this manager the first member of a new cluster. Fails with
+  // ALREADY_EXISTS if it already belongs to one.
+  rpc Init(InitRequest) returns (StatusResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+message InitRequest {}
+
+message StatusRequest {}
+
+message StatusResponse {
+  uint64 node_id = 1;
+  optional uint64 leader_id = 2;
+  // "Leader", "Follower", "Candidate", "Learner" or "Shutdown".
+  string state = 3;
+  uint64 term = 4;
+  uint64 applied_version = 5;
+  repeated Member members = 6;
+}
+
+message Member {
+  uint64 id = 1;
+  string addr = 2;
+  bool voter = 3;
+}

@@ -1,0 +1,16 @@
+// Raft transport between managers. Payloads are openraft's own types
+// serialized as JSON, so this file does not track openraft's structures.
+syntax = "proto3";
+
+package legion.v1;
+
+service Raft {
+  rpc AppendEntries(RaftPayload) returns (RaftPayload);
+  rpc Vote(RaftPayload) returns (RaftPayload);
+  rpc InstallSnapshot(RaftPayload) returns (RaftPayload);
+}
+
+// Request: the openraft request. Response: Result<response, RaftError>.
+message RaftPayload {
+  bytes json = 1;
+}
