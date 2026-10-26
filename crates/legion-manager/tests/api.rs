@@ -311,13 +311,16 @@ async fn three_managers_forward_and_fail_over() {
         .collect();
     leader_raft.change_membership(ids, false).await.unwrap();
 
-    // Writes through a follower are forwarded to the leader.
-    let mut follower = managers[2].objects().await;
+    // Writes through a follower are forwarded to the leader. On a slow host
+    // (the emulated CI runner) leadership can still move here, which the API
+    // reports as retryable.
+    let follower = managers[2].objects().await;
     for n in 0..20 {
-        follower
-            .apply(apply(service(&format!("s{n}"), 1)))
-            .await
-            .unwrap();
+        eventually(|| {
+            let mut follower = follower.clone();
+            async move { follower.apply(apply(service(&format!("s{n}"), 1))).await }
+        })
+        .await;
     }
     let status = managers[2]
         .cluster()
