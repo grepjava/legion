@@ -354,13 +354,18 @@ async fn three_managers_forward_and_fail_over() {
     .await
     .into_inner();
     assert_eq!(listing.objects.len(), 21);
-    api.get(ObjectRef {
-        kind: "Service".into(),
-        namespace: "default".into(),
-        name: "s19".into(),
+    eventually(|| {
+        let mut api = api.clone();
+        async move {
+            api.get(ObjectRef {
+                kind: "Service".into(),
+                namespace: "default".into(),
+                name: "s19".into(),
+            })
+            .await
+        }
     })
-    .await
-    .unwrap();
+    .await;
 
     for m in managers {
         m.stop().await;
