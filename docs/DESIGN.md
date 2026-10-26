@@ -72,6 +72,8 @@ One binary, `legion`, with two roles:
 
 - `legion daemon` runs on every node as an rc.d service (`legion_enable="YES"`).
   It always runs the **agent**. On manager nodes it also runs the **manager**.
+  In phase 1 (single node) the agent reads its assignments from the local
+  store instead of a dispatcher stream; the stream arrives with phase 2.
 - `legion <command>` is the CLI. It talks gRPC over mTLS to any manager.
 
 ```
@@ -504,7 +506,17 @@ libpod REST API (annotations and labels in `containers/create`).
   policy.
 - Metrics: libpod `stats` returns zeros on FreeBSD; usage comes from `rctl -u`.
 - Events: the libpod event stream works and drives fast state updates; the
-  agent also reconciles periodically in case events are missed.
+  agent also reconciles periodically in case events are missed. A container's
+  `died` event carries its exit code (`containerExitCode`).
+- libpod details the client (`legion-podman`) handles, from Podman 5.8.9:
+  `start` and `stop` answer 304 when the container is already in that state;
+  exec in a stopped container is HTTP 500 "container state improper", not
+  409; exec and log output use Docker's multiplexed framing; `wait` returns a
+  bare exit code. Under the API service, each container's conmon lingers for
+  `exit_command_delay` (300 s) after the container exits before it runs the
+  cleanup command; this is expected and not a leak.
+- FreeBSD base images contain files with the `schg` flag, so removing image
+  storage by hand needs `chflags -R 0` first.
 - Base images: the official FreeBSD OCI images (`freebsd-runtime` and related).
   These are minimal (no `grep`, `tail`, `true`), which is why network probes run
   from the host rather than in the container.

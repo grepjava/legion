@@ -12,13 +12,20 @@ publish = false
 [workspace.dependencies]
 legion-api = { path = "crates/legion-api" }
 legion-manager = { path = "crates/legion-manager" }
+legion-podman = { path = "crates/legion-podman" }
 legion-proto = { path = "crates/legion-proto" }
 legion-store = { path = "crates/legion-store" }
 
 anyhow = "1.0"
 base64 = "0.22"
+bytes = "1.12"
 clap = { version = "4.6", features = ["derive"] }
+form_urlencoded = "1.2"
 futures = "0.3"
+http = "1.5"
+http-body-util = "0.1.5"
+hyper = "1.12"
+hyper-util = "0.1.21"
 openraft = { version = "0.9.25", features = ["serde", "storage-v2"] }
 prost = "0.14"
 protox = "0.10"

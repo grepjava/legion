@@ -46,6 +46,7 @@ CLI elsewhere with `--server` or `LEGION_SERVER`.
 | `legion-store` | openraft state machine on redb, watches |
 | `legion-proto` | gRPC definitions (compiled with protox) |
 | `legion-manager` | API server, Raft transport |
+| `legion-podman` | libpod REST client; supervises Legion's own Podman service |
 | `legion` | Daemon and CLI |
 
 ## Licence

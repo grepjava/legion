@@ -1,0 +1,27 @@
+[package]
+name = "legion-podman"
+description = "Typed client for the libpod REST API, and supervision of Legion's own Podman service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+form_urlencoded.workspace = true
+futures.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "process"] }
+tracing.workspace = true
+
+[dev-dependencies]
+hyper = { workspace = true, features = ["server", "http1"] }
+tempfile.workspace = true
