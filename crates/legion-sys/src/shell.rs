@@ -161,6 +161,10 @@ struct JlsJail {
 }
 
 impl<R: Runner> Sys for Shell<R> {
+    fn kld_load(&self, module: &str) -> Result<()> {
+        self.run("kldload", &args(["-n", module])).map(drop)
+    }
+
     fn jails(&self) -> Result<Vec<Jail>> {
         let a = args([
             "--libxo=json",

@@ -733,9 +733,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "legion-agent",
  "legion-api",
  "legion-manager",
+ "legion-podman",
  "legion-proto",
+ "legion-sys",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -743,6 +746,26 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "legion-agent"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "legion-api",
+ "legion-manager",
+ "legion-podman",
+ "legion-store",
+ "legion-sys",
+ "openraft",
+ "serde_json",
+ "serde_yaml_ng",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

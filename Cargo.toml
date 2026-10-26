@@ -10,11 +10,13 @@ license = "BSD-2-Clause"
 publish = false
 
 [workspace.dependencies]
+legion-agent = { path = "crates/legion-agent" }
 legion-api = { path = "crates/legion-api" }
 legion-manager = { path = "crates/legion-manager" }
 legion-podman = { path = "crates/legion-podman" }
 legion-proto = { path = "crates/legion-proto" }
 legion-store = { path = "crates/legion-store" }
+legion-sys = { path = "crates/legion-sys" }
 
 anyhow = "1.0"
 base64 = "0.22"

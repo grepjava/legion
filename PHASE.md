@@ -49,6 +49,18 @@ self-heals on one node.
   routes, rctl, pf anchors and tables, and ZFS; `Shell` runs the FreeBSD
   tools, `FakeSys` models them in memory for tests. `tests/live.rs` checks
   `Shell` on FreeBSD (DESIGN.md §3.6).
+- **Agent and executor** (`legion-agent`): `legion daemon` starts Legion's
+  Podman service and the agent, which loads `if_bridge`, `if_epair` and
+  `pf`, registers its `Node`, and follows its assigned Tasks. Each task gets
+  a worker that pulls images, starts the infra jail (refusing it without a
+  VNET), runs init containers, starts the containers as child jails with
+  rctl limits, applies the restart policy, reports Task state and tears the
+  pod down when the task ends or stops. Pods survive agent restarts and are
+  adopted; containers no task accounts for are removed. Tested in CI with
+  fakes of Podman and the system; `tests/live.rs` runs a real pod on
+  FreeBSD. Not yet: networking (step 2), probes (step 5; tasks count as ready
+  when they have no readiness probe), secrets, configs and volumes (tasks
+  using them are rejected).
 
 ### To do, in order
 
@@ -56,26 +68,22 @@ Each step ends with tests that run in CI; steps that need jails, pf or ZFS
 also get an integration test run by hand on a FreeBSD host until CI can run
 them.
 
-1. **Agent and executor** (`legion-agent`): the daemon registers its `Node`;
-   runs assigned Tasks as an infra jail plus child container jails (§6.2);
-   per-container rctl limits (§6.3); reconciles Podman against assignments by
-   label on start, on events and periodically; reports Task state.
-2. **Service controller and scheduler**: replicated and global services
+1. **Service controller and scheduler**: replicated and global services
    create and remove Tasks; single-node placement (resource requests fit);
    restart policy; Task state machine (§7).
-3. **Node-local networking** (`legion-net`): `legion0` bridge, per-pod
+2. **Node-local networking** (`legion-net`): `legion0` bridge, per-pod
    epair, IP allocation from the node subnet, pf anchors with the default-block
    ruleset (§5.3).
-4. **Service VIPs and endpoints**: allocator for VIPs, Endpoints controller,
+3. **Service VIPs and endpoints**: allocator for VIPs, Endpoints controller,
    pf tables for load balancing with soft drain and kill-by-key (§5.4).
-5. **DNS**: resolver on the bridge gateway for cluster names, forwarding the
+4. **DNS**: resolver on the bridge gateway for cluster names, forwarding the
    rest (§5.5).
-6. **Probes**: liveness and readiness (TCP, HTTP, gRPC from the host; exec in
+5. **Probes**: liveness and readiness (TCP, HTTP, gRPC from the host; exec in
    the container); readiness feeds Endpoints.
-7. **Secrets and configs**: per-task tmpfs, read-only nullfs mounts.
-8. **ZFS volumes**: create, mount into containers, keep across task
+6. **Secrets and configs**: per-task tmpfs, read-only nullfs mounts.
+7. **ZFS volumes**: create, mount into containers, keep across task
    restarts.
-9. **Exit test**: a multi-service app (for example web + database + cache)
+8. **Exit test**: a multi-service app (for example web + database + cache)
    with probes and a volume; kill containers and the agent and check that it
    comes back.
 

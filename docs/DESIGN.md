@@ -514,6 +514,16 @@ libpod REST API (annotations and labels in `containers/create`).
 - Pod-level totals are read from the infra jail's accounting and used for
   scheduling feedback, metrics and eviction decisions.
 - The rule set is removed explicitly when a task ends.
+- The agent sets its rules **after** each container start and restart, not
+  before. ocijail with rctl support (0.7.0-dev, "next") enforces the OCI
+  `linux.resources` limits itself and *replaces* a jail's rules when it
+  creates the jail, also when the container has no limits, so rules set
+  beforehand are lost. Re-adding a rule replaces it, so reapplying is
+  harmless; adopted containers get their rules reapplied too.
+- Open: with runtimes that enforce OCI limits, Legion could pass limits
+  through Podman instead, so they apply from the first instruction. Note the
+  semantics differ: ocijail kills on `memoryuse` (like the Linux OOM killer),
+  where Legion denies on `vmemoryuse`.
 
 ### 6.4 Other runtime details
 

@@ -41,6 +41,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// optional jail: `None` is the agent's own (host) network stack, `Some`
 /// a VNET jail's, reached with `ifconfig -j` / `route -j`.
 pub trait Sys: Send + Sync {
+    /// Loads a kernel module unless it is loaded already (`kldload -n`).
+    fn kld_load(&self, module: &str) -> Result<()>;
+
     // Jails.
 
     /// Every jail visible to the caller, children included.

@@ -1,11 +1,11 @@
 //! `legion`: the daemon (`legion daemon`) and the CLI that talks to it.
 
 mod cli;
+mod daemon;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -29,15 +29,27 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the node daemon (manager role).
+    /// Run the node daemon: the manager, and on FreeBSD the agent.
     Daemon {
         #[arg(long, default_value = "/var/db/legion")]
         data_dir: PathBuf,
+        /// Runtime files: Podman's runroot, tmpdir and socket.
+        #[arg(long, default_value = "/var/run/legion")]
+        run_dir: PathBuf,
         #[arg(long, default_value = "127.0.0.1:7470")]
         listen: SocketAddr,
         /// Address other managers reach this one at. Defaults to --listen.
         #[arg(long)]
         advertise: Option<String>,
+        /// Run the manager only; no tasks run on this node.
+        #[arg(long)]
+        no_agent: bool,
+        /// Name of this node (default: the hostname's first label).
+        #[arg(long)]
+        node_name: Option<String>,
+        /// Image for pod infra containers.
+        #[arg(long)]
+        infra_image: Option<String>,
     },
     /// Start a new cluster with the reached manager as its first member.
     Init,
@@ -98,44 +110,30 @@ async fn main() -> anyhow::Result<()> {
     match args.command {
         Command::Daemon {
             data_dir,
+            run_dir,
             listen,
             advertise,
-        } => daemon(data_dir, listen, advertise).await,
+            no_agent,
+            node_name,
+            infra_image,
+        } => {
+            daemon::run(daemon::Options {
+                data_dir,
+                run_dir,
+                listen,
+                advertise,
+                agent: !no_agent,
+                node_name,
+                infra_image,
+            })
+            .await
+        }
         command => cli::run(&args.server, command).await,
     }
 }
 
-async fn daemon(
-    data_dir: PathBuf,
-    listen: SocketAddr,
-    advertise: Option<String>,
-) -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,openraft=warn".into()),
-        )
-        .init();
-    let manager = legion_manager::Manager::open(legion_manager::ManagerConfig {
-        data_dir,
-        advertise: advertise.unwrap_or_else(|| listen.to_string()),
-        raft: legion_manager::default_raft_config(),
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!(e))
-    .context("opening the store")?;
-    let listener = tokio::net::TcpListener::bind(listen)
-        .await
-        .with_context(|| format!("listening on {listen}"))?;
-    tracing::info!(%listen, node_id = manager.id(), "serving");
-    manager
-        .serve(listener, shutdown_signal())
-        .await
-        .map_err(|e| anyhow::anyhow!(e))
-}
-
 /// SIGTERM (rc.d stop) or Ctrl-C.
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     #[cfg(unix)]
     {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())

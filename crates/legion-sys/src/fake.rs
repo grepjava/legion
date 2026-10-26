@@ -32,6 +32,7 @@ pub struct FakeInterface {
 
 #[derive(Debug, Default)]
 struct State {
+    modules: BTreeSet<String>,
     next_jid: u32,
     next_epair: u32,
     jails: BTreeMap<String, Jail>,
@@ -145,6 +146,10 @@ impl FakeSys {
         self.state().anchors.get(anchor).cloned()
     }
 
+    pub fn modules(&self) -> BTreeSet<String> {
+        self.state().modules.clone()
+    }
+
     pub fn snapshots(&self) -> BTreeSet<String> {
         self.state().snapshots.clone()
     }
@@ -175,6 +180,11 @@ impl State {
 }
 
 impl Sys for FakeSys {
+    fn kld_load(&self, module: &str) -> Result<()> {
+        self.state().modules.insert(module.to_owned());
+        Ok(())
+    }
+
     fn jails(&self) -> Result<Vec<Jail>> {
         Ok(self.state().jails.values().cloned().collect())
     }

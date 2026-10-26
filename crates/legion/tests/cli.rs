@@ -29,7 +29,7 @@ fn start_daemon() -> Daemon {
         .port();
     let server = format!("127.0.0.1:{port}");
     let child = Command::new(LEGION)
-        .args(["daemon", "--listen", &server, "--data-dir"])
+        .args(["daemon", "--no-agent", "--listen", &server, "--data-dir"])
         .arg(dir.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

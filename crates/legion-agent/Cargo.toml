@@ -1,0 +1,26 @@
+[package]
+name = "legion-agent"
+description = "Legion agent: registers the node and runs its assigned tasks as pod jails"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+futures.workspace = true
+legion-api.workspace = true
+legion-podman.workspace = true
+legion-store.workspace = true
+legion-sys.workspace = true
+openraft.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+legion-manager.workspace = true
+serde_yaml_ng.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true

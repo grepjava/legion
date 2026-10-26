@@ -10,9 +10,12 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+legion-agent.workspace = true
 legion-api.workspace = true
 legion-manager.workspace = true
+legion-podman.workspace = true
 legion-proto.workspace = true
+legion-sys.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true

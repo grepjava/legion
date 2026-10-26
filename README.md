@@ -19,7 +19,7 @@ cargo test --workspace
 ## Try it
 
 ```sh
-legion daemon --data-dir /tmp/legion &
+legion daemon --data-dir /tmp/legion --no-agent &
 legion init
 cat <<'EOF' | legion apply -f -
 apiVersion: legion/v1
@@ -36,7 +36,9 @@ legion watch Service
 ```
 
 The daemon listens on `127.0.0.1:7470` without TLS; set `--listen`, or point the
-CLI elsewhere with `--server` or `LEGION_SERVER`.
+CLI elsewhere with `--server` or `LEGION_SERVER`. Without `--no-agent`, on
+FreeBSD and as root, it also runs the agent with its own Podman service and
+registers the node; tasks run once the Service controller exists.
 
 ## Layout
 
@@ -48,6 +50,7 @@ CLI elsewhere with `--server` or `LEGION_SERVER`.
 | `legion-manager` | API server, Raft transport |
 | `legion-podman` | libpod REST client; supervises Legion's own Podman service |
 | `legion-sys` | FreeBSD operations: jails, interfaces, routes, rctl, pf, ZFS |
+| `legion-agent` | Registers the node; runs assigned tasks as pod jails |
 | `legion` | Daemon and CLI |
 
 ## Licence
