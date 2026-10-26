@@ -730,6 +730,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "similar",
  "tempfile",
  "tokio",
  "tonic",
@@ -741,8 +742,11 @@ dependencies = [
 name = "legion-api"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
+ "serde_path_to_error",
+ "serde_yaml_ng",
  "thiserror 2.0.21",
 ]
 
@@ -1418,6 +1422,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_yaml_ng"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1454,6 +1469,12 @@ dependencies = [
  "errno",
  "libc",
 ]
+
+[[package]]
+name = "similar"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "slab"

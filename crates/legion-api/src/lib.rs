@@ -1,13 +1,25 @@
-//! Legion object model: the envelope every object shares (DESIGN.md §7).
+//! Legion object model (DESIGN.md §7): the envelope every object shares, the
+//! typed spec and status of each kind, and admission, which validates and
+//! normalises a spec before it is stored.
 //!
-//! Specs and statuses stay untyped JSON here; typed specs per kind are added as
-//! the controllers that read them are written.
+//! The envelope carries spec and status as JSON so the store and the API
+//! stay independent of kinds; [`admit`] and [`parse`] convert to the types.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+
+pub mod admit;
+pub mod data;
+pub mod node;
+pub mod quantity;
+pub mod service;
+pub mod task;
+pub mod volume;
+
+pub use admit::{Invalid, Spec, admit, parse};
 
 pub const API_VERSION: &str = "legion/v1";
 
@@ -233,6 +245,12 @@ pub enum Error {
     Scope(Kind),
     #[error("malformed object key {0:?}")]
     BadKey(String),
+    #[error("invalid {kind}: {invalid}")]
+    Spec { kind: Kind, invalid: Invalid },
+    #[error("{0} objects are managed by Legion")]
+    Managed(Kind),
+    #[error("{0} is not supported yet")]
+    Unsupported(Kind),
 }
 
 #[cfg(test)]

@@ -592,6 +592,34 @@ pending → assigned → accepted → preparing → starting → running → com
 
 `ready` is a separate condition on a running task, set by its readiness probe.
 
+### Admission
+
+Every apply runs the object through admission (`legion_api::admit`) before it
+is stored:
+
+- The spec is parsed into the kind's Rust type. Unknown fields are errors, and
+  errors name the field (`spec.pod.containers[0].image: missing field`).
+- Cross-field checks: probe and service ports resolve to a container port;
+  port names and numbers are unique across the pod, since its containers share
+  one network stack; mounts name a pod volume and no target is mounted twice;
+  requests do not exceed limits; placement constraints parse
+  (`node.labels.<key>`, `node.name`, `node.hostname`, `node.role`,
+  `node.platform.os`, `node.platform.arch`, with `==` or `!=`).
+- The spec is stored **normalised**: every default written out and quantities
+  in canonical form (`0.5` → `500m`, `1073741824` → `1Gi`). Controllers read
+  specs without applying defaults, and two manifests that mean the same thing
+  store the same spec, so re-applying either is a no-op.
+- `Task` objects are written only by Legion. Kinds whose controllers do not
+  exist yet are rejected rather than stored unchecked.
+
+A `Secret` or `Config` holds one value, as in Swarm, given as `data` (base64)
+or `text` and stored as `data`; at most 500 KiB. Containers get it as a file
+(by default `/run/secrets/<name>` or `/run/configs/<name>`) or as an
+environment variable.
+
+`legion diff -f` sends a dry-run apply and prints a unified diff of each
+object's labels and normalised spec against the stored one.
+
 ---
 
 ## 8. Compose support

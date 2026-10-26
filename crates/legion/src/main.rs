@@ -48,6 +48,12 @@ enum Command {
         #[arg(short, long = "filename", required = true)]
         files: Vec<PathBuf>,
     },
+    /// Show what `apply` would change, as a diff of each object's labels and
+    /// spec. Exits with status 1 when there are differences.
+    Diff {
+        #[arg(short, long = "filename", required = true)]
+        files: Vec<PathBuf>,
+    },
     /// Show one object.
     Get {
         kind: String,

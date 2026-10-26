@@ -111,13 +111,8 @@ impl ApiService {
             .object
             .ok_or_else(|| Status::invalid_argument("object is required"))?;
         let mut desired = Object::try_from(wire).map_err(invalid)?;
-        if desired.kind == Kind::Task {
-            return Err(Status::invalid_argument(
-                "Task objects are managed by Legion",
-            ));
-        }
         default_namespace(desired.kind, &mut desired.metadata.namespace);
-        desired.validate().map_err(invalid)?;
+        legion_api::admit(&mut desired).map_err(invalid)?;
         let key = desired.key();
 
         for _ in 0..APPLY_ATTEMPTS {
@@ -150,6 +145,12 @@ impl ApiService {
                     ApplyResult::Created,
                 ),
             };
+            if req.dry_run {
+                return Ok(ApplyResponse {
+                    object: Some((&object).into()),
+                    result: result.into(),
+                });
+            }
             match self
                 .write(Command::Put {
                     object,

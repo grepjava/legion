@@ -44,7 +44,7 @@ pub async fn run(server: &str, command: Command) -> anyhow::Result<()> {
                     let resp = objects
                         .apply(ApplyRequest {
                             object: Some((&object).into()),
-                            expected_version: None,
+                            ..Default::default()
                         })
                         .await
                         .with_context(|| format!("applying {key}"))?
@@ -63,6 +63,17 @@ pub async fn run(server: &str, command: Command) -> anyhow::Result<()> {
                         o.version
                     );
                 }
+            }
+        }
+        Command::Diff { files } => {
+            let mut changed = false;
+            for file in files {
+                for object in read_objects(&file)? {
+                    changed |= diff(&mut objects, &object).await?;
+                }
+            }
+            if changed {
+                std::process::exit(1);
             }
         }
         Command::Get {
@@ -160,6 +171,66 @@ pub async fn run(server: &str, command: Command) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Prints how applying `object` would change the stored one; true if it would.
+async fn diff(objects: &mut ObjectsClient<Channel>, object: &Object) -> anyhow::Result<bool> {
+    let key = object.key();
+    let resp = objects
+        .apply(ApplyRequest {
+            object: Some(object.into()),
+            dry_run: true,
+            ..Default::default()
+        })
+        .await
+        .with_context(|| format!("checking {key}"))?
+        .into_inner();
+    let result = resp.result();
+    let after = resp.object.unwrap_or_default();
+    let name = format!("{}/{}", after.kind, display_name(&after));
+    let before = match result {
+        ApplyResult::Unchanged => return Ok(false),
+        ApplyResult::Created => String::new(),
+        _ => {
+            let live = objects
+                .get(ObjectRef {
+                    kind: after.kind.clone(),
+                    namespace: after.namespace.clone(),
+                    name: after.name.clone(),
+                })
+                .await
+                .with_context(|| format!("reading {name}"))?
+                .into_inner();
+            manifest_yaml(live)?
+        }
+    };
+    let after = manifest_yaml(after)?;
+    let text = similar::TextDiff::from_lines(&before, &after);
+    print!(
+        "{}",
+        text.unified_diff()
+            .context_radius(3)
+            .header(&format!("live {name}"), &format!("applied {name}"))
+    );
+    Ok(true)
+}
+
+/// The parts of an object a manifest sets, as YAML.
+fn manifest_yaml(o: pb::Object) -> anyhow::Result<String> {
+    let o = Object::try_from(o)?;
+    let mut metadata = serde_json::json!({ "name": o.metadata.name });
+    if !o.metadata.namespace.is_empty() {
+        metadata["namespace"] = o.metadata.namespace.into();
+    }
+    if !o.metadata.labels.is_empty() {
+        metadata["labels"] = serde_json::to_value(&o.metadata.labels)?;
+    }
+    Ok(serde_yaml_ng::to_string(&serde_json::json!({
+        "apiVersion": o.api_version,
+        "kind": o.kind,
+        "metadata": metadata,
+        "spec": o.spec,
+    }))?)
 }
 
 async fn connect(server: &str) -> anyhow::Result<Channel> {

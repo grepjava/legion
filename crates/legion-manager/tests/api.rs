@@ -89,7 +89,10 @@ fn service(name: &str, replicas: u64) -> Object {
     Object {
         kind: "Service".into(),
         name: name.into(),
-        spec_json: format!(r#"{{"replicas":{replicas}}}"#).into_bytes(),
+        spec_json: format!(
+            r#"{{"replicas":{replicas},"pod":{{"containers":[{{"name":"web","image":"web:1"}}]}}}}"#
+        )
+        .into_bytes(),
         ..Default::default()
     }
 }
@@ -97,7 +100,7 @@ fn service(name: &str, replicas: u64) -> Object {
 fn apply(object: Object) -> ApplyRequest {
     ApplyRequest {
         object: Some(object),
-        expected_version: None,
+        ..Default::default()
     }
 }
 
@@ -156,6 +159,33 @@ async fn single_manager_crud_and_watch() {
         .into_inner();
     assert_eq!(same.result(), ApplyResult::Unchanged);
 
+    // Invalid specs are rejected with the field at fault.
+    let mut bad = service("web", 1);
+    bad.spec_json = br#"{"pod":{"containers":[{"name":"web"}]}}"#.to_vec();
+    let err = api.apply(apply(bad)).await.unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert!(
+        err.message()
+            .contains("spec.pod.containers[0]: missing field `image`"),
+        "{}",
+        err.message()
+    );
+
+    // A dry run reports the change without making it.
+    let dry = api
+        .apply(ApplyRequest {
+            object: Some(service("web", 2)),
+            dry_run: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(dry.result(), ApplyResult::Updated);
+    let dry_spec: serde_json::Value =
+        serde_json::from_slice(&dry.object.unwrap().spec_json).unwrap();
+    assert_eq!(dry_spec["replicas"], 2);
+
     let listing = api
         .list(ListRequest {
             kind: "Service".into(),
@@ -187,6 +217,7 @@ async fn single_manager_crud_and_watch() {
         .apply(ApplyRequest {
             object: Some(service("web", 4)),
             expected_version: Some(web.version),
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -198,7 +229,10 @@ async fn single_manager_crud_and_watch() {
         name: "web".into(),
     };
     let got = api.get(web_ref.clone()).await.unwrap().into_inner();
-    assert_eq!(got.spec_json, br#"{"replicas":3}"#);
+    let spec: serde_json::Value = serde_json::from_slice(&got.spec_json).unwrap();
+    assert_eq!(spec["replicas"], 3);
+    // Stored with defaults filled in.
+    assert_eq!(spec["pod"]["restartPolicy"]["condition"], "any");
     api.delete(DeleteRequest {
         r#ref: Some(web_ref.clone()),
         expected_version: None,

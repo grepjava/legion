@@ -27,7 +27,8 @@ message ObjectRef {
 
 service Objects {
   // Server-side apply: creates the object, or replaces its labels and spec.
-  // Status is kept. Last applier wins unless expected_version is set.
+  // Status is kept. Last applier wins unless expected_version is set. The
+  // spec is validated and stored with its defaults filled in.
   rpc Apply(ApplyRequest) returns (ApplyResponse);
   rpc Get(ObjectRef) returns (Object);
   rpc List(ListRequest) returns (ListResponse);
@@ -41,6 +42,8 @@ message ApplyRequest {
   Object object = 1;
   // Fail with ABORTED unless the object is at exactly this version.
   optional uint64 expected_version = 2;
+  // Validate and return what would be stored, without writing.
+  bool dry_run = 3;
 }
 
 enum ApplyResult {

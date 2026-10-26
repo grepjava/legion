@@ -87,11 +87,13 @@ metadata:
   labels: { app: web, tier: front }
 spec:
   replicas: 3
+  pod:
+    containers: [{ name: web, image: web:1 }]
 ---
 apiVersion: legion/v1
 kind: Service
 metadata: { name: db, namespace: shop, labels: { app: db } }
-spec: { replicas: 1 }
+spec: { pod: { containers: [{ name: db, image: postgres:17 }] } }
 ---
 "#,
     )
@@ -101,6 +103,25 @@ spec: { replicas: 1 }
     assert!(applied.contains("Service/shop/db created"), "{applied}");
     let again = ok(&d, &["apply", "-f", manifest.to_str().unwrap()]);
     assert_eq!(again.matches("unchanged").count(), 2, "{again}");
+
+    // `diff` is silent and succeeds when nothing would change...
+    assert_eq!(ok(&d, &["diff", "-f", manifest.to_str().unwrap()]), "");
+    // ...and shows the change and exits 1 otherwise.
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(&manifest, text.replace("replicas: 3", "replicas: 4")).unwrap();
+    let diff = legion(&d, &["diff", "-f", manifest.to_str().unwrap()]);
+    assert_eq!(diff.status.code(), Some(1));
+    let diff = String::from_utf8_lossy(&diff.stdout);
+    assert!(diff.contains("--- live Service/shop/web"), "{diff}");
+    assert!(
+        diff.contains(
+            "-  replicas: 3
++  replicas: 4"
+        ),
+        "{diff}"
+    );
+    assert!(!diff.contains("Service/shop/db"), "{diff}");
+    std::fs::write(&manifest, text).unwrap();
 
     let table = ok(&d, &["list", "services", "-n", "shop"]);
     assert!(table.starts_with("NAMESPACE"), "{table}");

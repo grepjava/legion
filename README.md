@@ -25,7 +25,10 @@ cat <<'EOF' | legion apply -f -
 apiVersion: legion/v1
 kind: Service
 metadata: { name: web, namespace: shop, labels: { app: web } }
-spec: { replicas: 3 }
+spec:
+  replicas: 3
+  pod:
+    containers: [{ name: web, image: nginx:1.27 }]
 EOF
 legion list svc -A
 legion get svc web -n shop
@@ -39,7 +42,7 @@ CLI elsewhere with `--server` or `LEGION_SERVER`.
 
 | Crate | Role |
 |-------|------|
-| `legion-api` | Object envelope, keys, validation |
+| `legion-api` | Object model: envelope, typed specs, admission |
 | `legion-store` | openraft state machine on redb, watches |
 | `legion-proto` | gRPC definitions (compiled with protox) |
 | `legion-manager` | API server, Raft transport |
