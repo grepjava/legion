@@ -117,6 +117,36 @@ One binary, `legion`, with two roles:
 | Autoscaler (phase 4) | Task metrics | Adjusts replicas between min and max to hit a CPU or memory target. |
 | Cert rotation | Node certs | Renews certificates before expiry; rotates root CA on demand. |
 
+The Service controller and the scheduler are built (`legion-manager`,
+`controller/plan.rs`) as one pure function from Services, Tasks and Nodes to
+the writes that converge them; a loop on the leader runs it on every store
+change, on planned wake-ups and every 5 seconds, and writes with version
+preconditions. Rules:
+
+- **Slots.** A replicated service has slots `1..replicas`; a global service
+  one per eligible node. Each slot runs at most one current task, named
+  `<service>-<slot>-<n>`. Tasks carry the label `legion.service`.
+- **Current** means the task runs the service's pod spec as it is now. Other
+  spec changes (replicas, placement, update settings) bump the generation
+  but replace nothing.
+- **Replacement.** A slot whose task is gone gets a new one: after
+  `shutdown` at once; after a failure (unless the restart condition is
+  `none`) with backoff, the restart delay (at least 1 s) doubled per failure
+  in a row, at most 60 s; after `complete` only with condition `any`.
+  Container restarts within a task are the agent's job; a task fails when
+  its restart policy is exhausted.
+- **History.** The last 5 terminal tasks of a slot are kept; slots no longer
+  wanted keep none. Tasks of deleted services are stopped, then deleted.
+- **Updates** replace outdated tasks `parallelism` slots at a time, in
+  `stop-first` or `start-first` order. Monitoring, failure actions and
+  rollback are phase 2.
+- **Nodes.** A drained node's tasks stop and move elsewhere; a paused node
+  keeps its tasks but gets no new ones.
+- **Scheduling** filters nodes (ready, active, constraints, requests within
+  allocatable) and prefers the fewest tasks of the same service, then the
+  least requested CPU and memory. An unplaceable task stays `pending` with
+  the reasons in its message, e.g. `no node can run it: 1 constraints`.
+
 ### 3.4 Agent components
 
 | Component | Responsibility |

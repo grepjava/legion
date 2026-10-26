@@ -1,9 +1,11 @@
 //! The Legion manager (DESIGN.md §3.2): the replicated store, the public API
-//! and the Raft transport, served together on one gRPC port.
+//! and the Raft transport, served together on one gRPC port, and the
+//! controllers, which run while this manager leads.
 //!
 //! Phase 1 serves plaintext gRPC; mTLS arrives with the cluster PKI in phase 2.
 
 mod api;
+pub mod controller;
 mod raft_net;
 
 use std::future::Future;
@@ -78,6 +80,11 @@ impl Manager {
         shutdown: impl Future<Output = ()> + Send,
     ) -> Result<(), Error> {
         let (closing_tx, closing) = tokio::sync::watch::channel(false);
+        let controllers = tokio::spawn(controller::run(
+            self.store.clone(),
+            self.id,
+            closing.clone(),
+        ));
         let api = api::ApiService {
             id: self.id,
             advertise: self.advertise.clone(),
@@ -99,11 +106,17 @@ impl Manager {
                     .max_decoding_message_size(MAX_MESSAGE)
                     .max_encoding_message_size(MAX_MESSAGE),
             )
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
-                shutdown.await;
-                let _ = closing_tx.send(true);
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), {
+                let closing_tx = closing_tx.clone();
+                async move {
+                    shutdown.await;
+                    let _ = closing_tx.send(true);
+                }
             })
             .await?;
+        // The controllers hold a store handle; they stop on `closing`.
+        let _ = closing_tx.send(true);
+        let _ = controllers.await;
         tracing::info!("API stopped; shutting down the store");
         self.store.shutdown().await?;
         Ok(())

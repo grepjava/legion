@@ -758,6 +758,7 @@ dependencies = [
  "legion-api",
  "legion-manager",
  "legion-podman",
+ "legion-proto",
  "legion-store",
  "legion-sys",
  "openraft",
@@ -766,6 +767,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]
@@ -792,6 +794,7 @@ dependencies = [
  "openraft",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

@@ -1,6 +1,5 @@
 //! CLI commands: thin gRPC calls plus formatting.
 
-use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
 
@@ -329,21 +328,103 @@ fn print_objects(objects: &[pb::Object], format: Format, kind: Kind) -> anyhow::
             println!("no {kind} objects");
             return Ok(());
         }
-        let rows: Vec<[String; 5]> = objects
+        let objects: Vec<Object> = objects
             .iter()
-            .map(|o| {
-                let labels: BTreeMap<_, _> = o.labels.iter().collect();
-                let labels: Vec<_> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                [
-                    o.namespace.clone(),
-                    o.name.clone(),
-                    o.version.to_string(),
-                    o.generation.to_string(),
-                    labels.join(","),
-                ]
-            })
-            .collect();
-        print_table(["NAMESPACE", "NAME", "VERSION", "GEN", "LABELS"], &rows);
+            .cloned()
+            .map(Object::try_from)
+            .collect::<Result<_, _>>()?;
+        let field = |v: &serde_json::Value, path: &[&str]| -> String {
+            let mut v = v;
+            for p in path {
+                v = &v[*p];
+            }
+            match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Null => String::new(),
+                other => other.to_string(),
+            }
+        };
+        let count = |v: &serde_json::Value, key: &str| v[key].as_u64().unwrap_or(0);
+        match kind {
+            Kind::Service => {
+                let rows: Vec<[String; 5]> = objects
+                    .iter()
+                    .map(|o| {
+                        let images: Vec<String> = o.spec["pod"]["containers"]
+                            .as_array()
+                            .map(|cs| cs.iter().map(|c| field(c, &["image"])).collect())
+                            .unwrap_or_default();
+                        [
+                            o.metadata.namespace.clone(),
+                            o.metadata.name.clone(),
+                            field(&o.spec, &["mode"]),
+                            format!(
+                                "{}/{}",
+                                count(&o.status, "ready"),
+                                count(&o.status, "desired")
+                            ),
+                            images.join(","),
+                        ]
+                    })
+                    .collect();
+                print_table(["NAMESPACE", "NAME", "MODE", "READY", "IMAGES"], &rows);
+            }
+            Kind::Task => {
+                let rows: Vec<[String; 5]> = objects
+                    .iter()
+                    .map(|o| {
+                        [
+                            o.metadata.namespace.clone(),
+                            o.metadata.name.clone(),
+                            field(&o.spec, &["node"]),
+                            field(&o.status, &["state"]),
+                            field(&o.status, &["message"]),
+                        ]
+                    })
+                    .collect();
+                print_table(["NAMESPACE", "NAME", "NODE", "STATE", "MESSAGE"], &rows);
+            }
+            Kind::Node => {
+                let rows: Vec<[String; 5]> = objects
+                    .iter()
+                    .map(|o| {
+                        [
+                            o.metadata.name.clone(),
+                            field(&o.status, &["state"]),
+                            field(&o.spec, &["availability"]),
+                            field(&o.spec, &["role"]),
+                            format!(
+                                "{}/{}",
+                                field(&o.status, &["platform", "os"]),
+                                field(&o.status, &["platform", "arch"])
+                            ),
+                        ]
+                    })
+                    .collect();
+                print_table(["NAME", "STATE", "AVAILABILITY", "ROLE", "PLATFORM"], &rows);
+            }
+            _ => {
+                let rows: Vec<[String; 5]> = objects
+                    .iter()
+                    .map(|o| {
+                        let labels: Vec<_> = o
+                            .metadata
+                            .labels
+                            .iter()
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .collect();
+                        [
+                            o.metadata.namespace.clone(),
+                            o.metadata.name.clone(),
+                            o.metadata.version.to_string(),
+                            o.metadata.generation.to_string(),
+                            labels.join(","),
+                        ]
+                    })
+                    .collect();
+                print_table(["NAMESPACE", "NAME", "VERSION", "GEN", "LABELS"], &rows);
+            }
+        }
         return Ok(());
     }
     let objects: Vec<Object> = objects

@@ -37,8 +37,9 @@ legion watch Service
 
 The daemon listens on `127.0.0.1:7470` without TLS; set `--listen`, or point the
 CLI elsewhere with `--server` or `LEGION_SERVER`. Without `--no-agent`, on
-FreeBSD and as root, it also runs the agent with its own Podman service and
-registers the node; tasks run once the Service controller exists.
+FreeBSD and as root, it also runs the agent with its own Podman service, so
+applied services run as pods of jails on the node (`legion list tasks -n
+shop`). Pods have no network yet.
 
 ## Layout
 

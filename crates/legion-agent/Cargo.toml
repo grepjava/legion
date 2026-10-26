@@ -21,6 +21,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 legion-manager.workspace = true
+legion-proto.workspace = true
 serde_yaml_ng.workspace = true
 tempfile.workspace = true
+tonic.workspace = true
 tracing-subscriber.workspace = true

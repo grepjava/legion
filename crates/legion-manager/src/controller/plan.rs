@@ -1,0 +1,592 @@
+//! The Service controller and the scheduler as one pure function: from the
+//! current Services, Tasks and Nodes, the writes that move the cluster
+//! toward what the Services ask for (DESIGN.md §3.3, §3.5).
+//!
+//! Every call looks at the whole state, so a lost write or a missed event
+//! only delays convergence until the next call.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
+
+use legion_api::node::{Availability, NodeSpec, NodeState, NodeStatus};
+use legion_api::service::{
+    Constraint, NodeAttribute, RestartCondition, ServiceMode, ServiceSpec, ServiceStatus,
+    UpdateOrder,
+};
+use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
+use legion_api::{Kind, Object, ObjectKey};
+use tokio::time::Instant;
+
+/// Terminal tasks kept per slot, as Swarm's task history limit.
+pub const HISTORY: usize = 5;
+/// Longest wait before replacing a failed task.
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Label tying a task to its service, for `legion list tasks -l`.
+pub const LABEL_SERVICE: &str = "legion.service";
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    Create(Object),
+    /// Replace an object last written at `version`.
+    Update(Object, u64),
+    Delete(ObjectKey, u64),
+}
+
+impl Action {
+    fn key(&self) -> ObjectKey {
+        match self {
+            Action::Create(o) | Action::Update(o, _) => o.key(),
+            Action::Delete(k, _) => k.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Service {
+    pub object: Object,
+    pub spec: ServiceSpec,
+}
+
+#[derive(Debug, Clone)]
+pub struct Task {
+    pub object: Object,
+    pub spec: TaskSpec,
+    pub status: TaskStatus,
+}
+
+#[derive(Debug, Clone)]
+pub struct Node {
+    pub object: Object,
+    pub spec: NodeSpec,
+    pub status: NodeStatus,
+}
+
+impl Task {
+    fn active(&self) -> bool {
+        self.spec.desired_state == DesiredState::Running && !self.status.state.is_terminal()
+    }
+
+    fn stopping(&self) -> bool {
+        self.spec.desired_state == DesiredState::Shutdown && !self.status.state.is_terminal()
+    }
+
+    fn failed(&self) -> bool {
+        matches!(
+            self.status.state,
+            TaskState::Failed | TaskState::Rejected | TaskState::Orphaned
+        )
+    }
+
+    fn uid(&self) -> &str {
+        &self.object.metadata.uid
+    }
+
+    fn owner(&self) -> (&str, &str) {
+        (&self.object.metadata.namespace, &self.spec.service)
+    }
+}
+
+impl Service {
+    fn key(&self) -> (&str, &str) {
+        (&self.object.metadata.namespace, &self.object.metadata.name)
+    }
+
+    fn owns(&self, t: &Task) -> bool {
+        t.owner() == self.key() && t.spec.service_uid == self.object.metadata.uid
+    }
+}
+
+/// What the controller remembers between calls: when it first saw each
+/// task fail, for backoff.
+#[derive(Debug, Default)]
+pub struct Memory {
+    pub failed_at: BTreeMap<String, Instant>,
+}
+
+#[derive(Debug, Default)]
+pub struct Plan {
+    pub actions: Vec<Action>,
+    /// Call again by then, even if nothing changes.
+    pub wake: Option<Instant>,
+}
+
+impl Plan {
+    fn wake_at(&mut self, t: Instant) {
+        self.wake = Some(self.wake.map_or(t, |w| w.min(t)));
+    }
+}
+
+/// Where a task belongs in its service.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Slot {
+    Replica(u32),
+    Node(String),
+}
+
+pub fn plan(
+    services: &[Service],
+    tasks: &[Task],
+    nodes: &[Node],
+    memory: &mut Memory,
+    now: Instant,
+) -> Plan {
+    let mut plan = Plan::default();
+    let live: BTreeSet<&str> = tasks.iter().map(Task::uid).collect();
+    memory
+        .failed_at
+        .retain(|uid, _| live.contains(uid.as_str()));
+    for t in tasks.iter().filter(|t| t.failed()) {
+        memory.failed_at.entry(t.uid().to_owned()).or_insert(now);
+    }
+
+    let mut created: Vec<Task> = Vec::new();
+    for s in services {
+        let mine: Vec<&Task> = tasks.iter().filter(|t| s.owns(t)).collect();
+        service(s, &mine, nodes, memory, now, &mut plan, &mut created);
+    }
+
+    // Tasks whose service is gone: stop, then delete once stopped.
+    for t in tasks.iter().filter(|t| !services.iter().any(|s| s.owns(t))) {
+        if t.active() {
+            plan.actions.push(stop(t));
+        } else if t.status.state.is_terminal() {
+            plan.actions.push(delete(t));
+        }
+    }
+
+    schedule(services, tasks, created, nodes, &mut plan);
+    plan
+}
+
+fn service(
+    s: &Service,
+    tasks: &[&Task],
+    nodes: &[Node],
+    memory: &Memory,
+    now: Instant,
+    plan: &mut Plan,
+    created: &mut Vec<Task>,
+) {
+    let generation = s.object.metadata.generation;
+    let mut by_slot: BTreeMap<Slot, Vec<&Task>> = BTreeMap::new();
+    for t in tasks {
+        let slot = match t.spec.slot {
+            Some(n) => Slot::Replica(n),
+            None => Slot::Node(t.spec.node.clone()),
+        };
+        by_slot.entry(slot).or_default().push(t);
+    }
+    for list in by_slot.values_mut() {
+        // Uids are Raft indexes in hex: creation order.
+        list.sort_by(|a, b| a.uid().cmp(b.uid()));
+    }
+
+    let wanted: Vec<Slot> = match s.spec.mode {
+        ServiceMode::Global => nodes
+            .iter()
+            .filter(|n| eligible(n, s).is_ok())
+            .map(|n| Slot::Node(n.object.metadata.name.clone()))
+            .collect(),
+        _ => (1..=s.spec.replicas.unwrap_or(1))
+            .map(Slot::Replica)
+            .collect(),
+    };
+    let wanted_set: BTreeSet<&Slot> = wanted.iter().collect();
+
+    // Slots no longer wanted: stop what runs there and drop the history. A
+    // paused node keeps its global task; a drained or vanished one does not.
+    for (slot, list) in &by_slot {
+        if wanted_set.contains(slot) {
+            continue;
+        }
+        let paused = matches!(slot, Slot::Node(name) if nodes.iter().any(|n| {
+            &n.object.metadata.name == name && n.spec.availability == Availability::Pause
+        }));
+        for t in list {
+            if t.active() && !paused {
+                plan.actions.push(stop(t));
+            } else if t.status.state.is_terminal() {
+                plan.actions.push(delete(t));
+            }
+        }
+    }
+
+    // Replicated tasks on a node that is draining move elsewhere.
+    for t in tasks.iter().filter(|t| t.active() && t.spec.slot.is_some()) {
+        if nodes.iter().any(|n| {
+            n.object.metadata.name == t.spec.node && n.spec.availability == Availability::Drain
+        }) {
+            plan.actions.push(stop(t));
+        }
+    }
+
+    // A task is current if it runs the service's pod as it is now. Other
+    // spec changes (replicas, placement, update settings) bump the
+    // generation too, but replace nothing.
+    let current_pod = |t: &Task| t.spec.pod == s.spec.pod;
+
+    // Rolling update budget: slots mid-update count against parallelism.
+    let parallelism = match s.spec.update.parallelism {
+        0 => usize::MAX,
+        n => n as usize,
+    };
+    let in_flight = wanted
+        .iter()
+        .filter(|slot| {
+            by_slot.get(*slot).is_some_and(|list| {
+                list.iter().any(|t| {
+                    t.stopping()
+                        || (current_pod(t) && t.active() && t.status.state != TaskState::Running)
+                })
+            })
+        })
+        .count();
+    let mut budget = parallelism.saturating_sub(in_flight);
+
+    let policy = &s.spec.pod.restart_policy;
+    for slot in &wanted {
+        let list: &[&Task] = by_slot.get(slot).map_or(&[], Vec::as_slice);
+        let (current, outdated): (Vec<&Task>, Vec<&Task>) = list
+            .iter()
+            .copied()
+            .filter(|t| t.active())
+            .partition(|t| current_pod(t));
+
+        // Never more than one current task per slot.
+        for extra in current.iter().skip(1) {
+            plan.actions.push(stop(extra));
+        }
+        if let Some(new) = current.first() {
+            // start-first: the old task goes once the new one runs.
+            if new.status.state == TaskState::Running {
+                for old in &outdated {
+                    plan.actions.push(stop(old));
+                }
+            }
+        } else if !outdated.is_empty() {
+            if budget > 0 {
+                budget -= 1;
+                match s.spec.update.order {
+                    UpdateOrder::StopFirst => {
+                        for old in &outdated {
+                            plan.actions.push(stop(old));
+                        }
+                    }
+                    UpdateOrder::StartFirst => created.push(new_task(s, slot, list)),
+                }
+            }
+        } else if list.iter().any(|t| t.stopping()) {
+            // Wait for the stopping task (stop-first update, drain) to end.
+        } else {
+            // Nothing runs in the slot: start a task, unless the last one
+            // ended for good or the next try is not due yet.
+            let replace = match list.last() {
+                None => true,
+                Some(last) => match last.status.state {
+                    TaskState::Complete => policy.condition == RestartCondition::Any,
+                    TaskState::Shutdown => true,
+                    _ => last.failed() && policy.condition != RestartCondition::None,
+                },
+            };
+            if replace {
+                let failures = list.iter().rev().take_while(|t| t.failed()).count();
+                let due = list.last().map_or(now, |last| {
+                    backoff(last, failures, policy.delay.as_std(), memory, now)
+                });
+                if due <= now {
+                    created.push(new_task(s, slot, list));
+                } else {
+                    plan.wake_at(due);
+                }
+            }
+        }
+
+        // History: keep the newest terminal tasks of the slot.
+        let terminal: Vec<&&Task> = list
+            .iter()
+            .filter(|t| t.status.state.is_terminal())
+            .collect();
+        for old in terminal.iter().rev().skip(HISTORY) {
+            plan.actions.push(delete(old));
+        }
+    }
+
+    // Status, from the tasks as they are now.
+    let running: Vec<&&Task> = tasks
+        .iter()
+        .filter(|t| t.active() && t.status.state == TaskState::Running)
+        .collect();
+    let previous: ServiceStatus =
+        serde_json::from_value(s.object.status.clone()).unwrap_or_default();
+    let status = ServiceStatus {
+        observed_generation: generation,
+        desired: wanted.len() as u32,
+        running: running.len() as u32,
+        ready: running.iter().filter(|t| t.status.ready).count() as u32,
+        virtual_ip: previous.virtual_ip,
+    };
+    let status = serde_json::to_value(&status).expect("status serialises");
+    if s.object.status != status {
+        let mut o = s.object.clone();
+        o.status = status;
+        plan.actions
+            .push(Action::Update(o, s.object.metadata.version));
+    }
+}
+
+/// When a slot whose last task failed gets a new one: the restart delay
+/// (at least a second), doubled for each failure in a row, counted from
+/// when the failure was first seen.
+fn backoff(
+    last: &Task,
+    failures: usize,
+    delay: Duration,
+    memory: &Memory,
+    now: Instant,
+) -> Instant {
+    if failures == 0 {
+        return now;
+    }
+    let base = delay.max(Duration::from_secs(1));
+    let wait = base
+        .saturating_mul(1 << (failures - 1).min(16))
+        .min(MAX_BACKOFF);
+    memory.failed_at.get(last.uid()).copied().unwrap_or(now) + wait
+}
+
+/// A new task for `slot`, named `<service>-<slot>-<n>` with `n` counting up
+/// within the slot.
+fn new_task(s: &Service, slot: &Slot, history: &[&Task]) -> Task {
+    let svc = &s.object.metadata.name;
+    let n = history
+        .iter()
+        .filter_map(|t| {
+            t.object
+                .metadata
+                .name
+                .rsplit('-')
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let (slot_part, replica, node) = match slot {
+        Slot::Replica(r) => (r.to_string(), Some(*r), String::new()),
+        Slot::Node(node) => (node.clone(), None, node.clone()),
+    };
+    let suffix = format!("-{slot_part}-{n}");
+    let keep = 63usize.saturating_sub(suffix.len()).min(svc.len());
+    let name = format!("{}{suffix}", svc[..keep].trim_end_matches('-'));
+    let spec = TaskSpec {
+        service: svc.clone(),
+        service_uid: s.object.metadata.uid.clone(),
+        service_generation: s.object.metadata.generation,
+        slot: replica,
+        node,
+        desired_state: DesiredState::Running,
+        pod: s.spec.pod.clone(),
+    };
+    let mut object = Object::new(
+        Kind::Task,
+        &s.object.metadata.namespace,
+        &name,
+        serde_json::to_value(&spec).expect("spec serialises"),
+    );
+    object
+        .metadata
+        .labels
+        .insert(LABEL_SERVICE.to_owned(), svc.clone());
+    Task {
+        object,
+        spec,
+        status: TaskStatus::default(),
+    }
+}
+
+fn stop(t: &Task) -> Action {
+    let mut o = t.object.clone();
+    o.spec["desiredState"] = serde_json::to_value(DesiredState::Shutdown).expect("serialises");
+    Action::Update(o, t.object.metadata.version)
+}
+
+fn delete(t: &Task) -> Action {
+    Action::Delete(t.object.key(), t.object.metadata.version)
+}
+
+/// Whether `n` may run tasks of `s` at all; requests are checked when
+/// placing.
+fn eligible(n: &Node, s: &Service) -> Result<(), &'static str> {
+    if n.status.state != NodeState::Ready {
+        return Err("not ready");
+    }
+    if n.spec.availability != Availability::Active {
+        return Err("not active");
+    }
+    let hold = s
+        .spec
+        .placement
+        .constraints
+        .iter()
+        .all(|c| c.parse::<Constraint>().is_ok_and(|c| matches(&c, n)));
+    if !hold {
+        return Err("constraints");
+    }
+    Ok(())
+}
+
+fn matches(c: &Constraint, n: &Node) -> bool {
+    let actual = match &c.attribute {
+        NodeAttribute::Name => Some(n.object.metadata.name.as_str()),
+        NodeAttribute::Hostname => Some(n.status.hostname.as_str()),
+        NodeAttribute::Role => Some(n.spec.role.as_str()),
+        NodeAttribute::Os => Some(n.status.platform.os.as_str()),
+        NodeAttribute::Arch => Some(n.status.platform.arch.as_str()),
+        NodeAttribute::Label(k) => n.object.metadata.labels.get(k).map(String::as_str),
+    };
+    (actual == Some(c.value.as_str())) == c.equal
+}
+
+/// Requests placed on a node, and its tasks per service.
+#[derive(Debug, Default, Clone)]
+struct Load {
+    cpu: u64,
+    memory: u64,
+    per_service: BTreeMap<(String, String), u32>,
+}
+
+impl Load {
+    fn add(&mut self, t: &Task) {
+        let r = t.spec.pod.requests();
+        self.cpu += r.cpu.0;
+        self.memory += r.memory.0;
+        let (ns, svc) = t.owner();
+        *self
+            .per_service
+            .entry((ns.to_owned(), svc.to_owned()))
+            .or_default() += 1;
+    }
+}
+
+/// Places unassigned tasks: filter nodes (eligible, requests fit), then
+/// prefer the node with the fewest tasks of the same service, then the
+/// least requested. New tasks are created already placed; existing
+/// pending ones are updated.
+fn schedule(
+    services: &[Service],
+    tasks: &[Task],
+    created: Vec<Task>,
+    nodes: &[Node],
+    plan: &mut Plan,
+) {
+    let mut load: BTreeMap<String, Load> = BTreeMap::new();
+    for t in tasks
+        .iter()
+        .filter(|t| !t.spec.node.is_empty() && !t.status.state.is_terminal())
+    {
+        load.entry(t.spec.node.clone()).or_default().add(t);
+    }
+
+    // Never-scheduled tasks told to stop have no agent to report for them.
+    for t in tasks
+        .iter()
+        .filter(|t| t.spec.node.is_empty() && t.stopping())
+    {
+        let mut o = t.object.clone();
+        o.status = serde_json::to_value(TaskStatus {
+            state: TaskState::Shutdown,
+            message: "stopped before it was scheduled".into(),
+            ..Default::default()
+        })
+        .expect("serialises");
+        plan.actions
+            .push(Action::Update(o, t.object.metadata.version));
+    }
+
+    let touched: BTreeSet<ObjectKey> = plan.actions.iter().map(Action::key).collect();
+    let existing = tasks.iter().filter(|t| {
+        t.spec.node.is_empty()
+            && t.active()
+            && t.status.state == TaskState::Pending
+            && !touched.contains(&t.object.key())
+    });
+    let pending: Vec<(Task, Option<&Task>)> = existing
+        .map(|t| (t.clone(), Some(t)))
+        .chain(created.into_iter().map(|t| (t, None)))
+        .collect();
+
+    for (mut t, original) in pending {
+        let Some(s) = services.iter().find(|s| s.owns(&t)) else {
+            continue;
+        };
+        let requests = t.spec.pod.requests();
+        let mut reasons: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut best: Option<(&str, (u32, u64, u64))> = None;
+        for n in nodes {
+            let name = n.object.metadata.name.as_str();
+            if !t.spec.node.is_empty() && t.spec.node != name {
+                continue;
+            }
+            if let Err(why) = eligible(n, s) {
+                *reasons.entry(why).or_default() += 1;
+                continue;
+            }
+            let l = load.get(name).cloned().unwrap_or_default();
+            let alloc = n.status.allocatable;
+            if (alloc.cpu.0 > 0 && l.cpu + requests.cpu.0 > alloc.cpu.0)
+                || (alloc.memory.0 > 0 && l.memory + requests.memory.0 > alloc.memory.0)
+            {
+                *reasons.entry("insufficient resources").or_default() += 1;
+                continue;
+            }
+            let same = l
+                .per_service
+                .get(&(s.key().0.to_owned(), s.key().1.to_owned()))
+                .copied()
+                .unwrap_or(0);
+            let score = (
+                same,
+                l.cpu * 1000 / alloc.cpu.0.max(1),
+                l.memory * 1000 / alloc.memory.0.max(1),
+            );
+            if best.as_ref().is_none_or(|(_, b)| score < *b) {
+                best = Some((name, score));
+            }
+        }
+        t.status = match best {
+            Some((name, _)) => {
+                t.spec.node = name.to_owned();
+                load.entry(name.to_owned()).or_default().add(&t);
+                TaskStatus {
+                    state: TaskState::Assigned,
+                    ..Default::default()
+                }
+            }
+            None => {
+                let why = if reasons.is_empty() {
+                    "no nodes".to_owned()
+                } else {
+                    let r: Vec<String> = reasons.iter().map(|(r, n)| format!("{n} {r}")).collect();
+                    r.join(", ")
+                };
+                TaskStatus {
+                    state: TaskState::Pending,
+                    message: format!("no node can run it: {why}"),
+                    ..Default::default()
+                }
+            }
+        };
+        let mut o = t.object.clone();
+        o.spec = serde_json::to_value(&t.spec).expect("serialises");
+        o.status = serde_json::to_value(&t.status).expect("serialises");
+        match original {
+            None => plan.actions.push(Action::Create(o)),
+            Some(orig) if orig.object != o => {
+                plan.actions
+                    .push(Action::Update(o, orig.object.metadata.version));
+            }
+            Some(_) => {}
+        }
+    }
+}

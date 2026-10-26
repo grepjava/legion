@@ -1,0 +1,288 @@
+//! From `apply` to running pods in one process: a served manager (API and
+//! controllers) and an agent with Podman and the system faked.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use legion_agent::fake::FakeRuntime;
+use legion_agent::{Agent, AgentConfig, StoreControl};
+use legion_api::node::{NodeState, NodeStatus};
+use legion_api::{Kind, Object};
+use legion_manager::{Manager, ManagerConfig, default_raft_config};
+use legion_proto::v1::cluster_client::ClusterClient;
+use legion_proto::v1::objects_client::ObjectsClient;
+use legion_proto::v1::{ApplyRequest, DeleteRequest, InitRequest, ListRequest, ObjectRef};
+use legion_sys::{FakeSys, Sys};
+use tokio::sync::oneshot;
+use tonic::transport::Channel;
+
+const INFRA: &str = "docker.io/freebsd/freebsd-runtime:15.1";
+
+struct Cluster {
+    api: ObjectsClient<Channel>,
+    rt: Arc<FakeRuntime>,
+    stop: Option<oneshot::Sender<()>>,
+    server: tokio::task::JoinHandle<()>,
+    _dir: tempfile::TempDir,
+}
+
+impl Cluster {
+    async fn start() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let manager = Manager::open(ManagerConfig {
+            data_dir: dir.path().to_owned(),
+            advertise: addr.clone(),
+            raft: default_raft_config(),
+        })
+        .await
+        .unwrap();
+
+        let sys = Arc::new(FakeSys::new());
+        let rt = Arc::new(FakeRuntime::new(sys.clone()));
+        rt.add_image(INFRA);
+        let mut config = AgentConfig::new("n1");
+        config.infra_image = INFRA.into();
+        config.resync = Duration::from_millis(100);
+        let agent = Agent::new(
+            config,
+            rt.clone(),
+            sys as Arc<dyn Sys>,
+            Arc::new(StoreControl::new(manager.store().clone())),
+        );
+        let (agent_stop, agent_stopped) = oneshot::channel::<()>();
+        let agent = tokio::spawn(agent.run(
+            NodeStatus {
+                state: NodeState::Ready,
+                ..Default::default()
+            },
+            async move {
+                let _ = agent_stopped.await;
+            },
+        ));
+
+        // As the daemon does: the agent stops before the store closes.
+        let (stop, stopped) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            manager
+                .serve(listener, async move {
+                    let _ = stopped.await;
+                    let _ = agent_stop.send(());
+                    let _ = agent.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let url = format!("http://{addr}");
+        let channel = loop {
+            if let Ok(c) = Channel::from_shared(url.clone()).unwrap().connect().await {
+                break c;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        ClusterClient::new(channel.clone())
+            .init(InitRequest {})
+            .await
+            .unwrap();
+        Cluster {
+            api: ObjectsClient::new(channel),
+            rt,
+            stop: Some(stop),
+            server,
+            _dir: dir,
+        }
+    }
+
+    async fn apply(&self, yaml: &str) {
+        let o: Object = serde_yaml_ng::from_str(yaml).unwrap();
+        self.api
+            .clone()
+            .apply(ApplyRequest {
+                object: Some((&o).into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn list(&self, kind: Kind) -> Vec<Object> {
+        let resp = self
+            .api
+            .clone()
+            .list(ListRequest {
+                kind: kind.to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        resp.objects
+            .into_iter()
+            .map(|o| Object::try_from(o).unwrap())
+            .collect()
+    }
+
+    /// `name state` of every task, sorted.
+    async fn tasks(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .list(Kind::Task)
+            .await
+            .iter()
+            .map(|t| {
+                format!(
+                    "{} {}",
+                    t.metadata.name,
+                    t.status["state"].as_str().unwrap_or("?")
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Names of running containers, sorted.
+    fn running(&self) -> Vec<String> {
+        self.rt
+            .containers()
+            .into_iter()
+            .filter(|(_, running, _)| *running)
+            .map(|(n, _, _)| n)
+            .collect()
+    }
+
+    async fn stop(mut self) {
+        self.stop.take().unwrap().send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(15), self.server)
+            .await
+            .expect("server stops")
+            .unwrap();
+    }
+}
+
+async fn eventually<F: AsyncFnMut() -> bool>(what: &str, mut f: F) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !f().await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn service(replicas: u32, image: &str) -> String {
+    format!(
+        r#"
+apiVersion: legion/v1
+kind: Service
+metadata: {{ name: web, namespace: shop }}
+spec:
+  replicas: {replicas}
+  pod:
+    containers: [{{ name: web, image: "{image}" }}]
+    restartPolicy: {{ condition: on-failure, maxAttempts: 1, delay: 0s }}
+"#
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn apply_to_running_pods() {
+    let c = Cluster::start().await;
+    c.rt.add_image("web:1");
+    c.rt.add_image("web:2");
+
+    c.apply(&service(2, "web:1")).await;
+    eventually("two running tasks", async || {
+        c.tasks().await == ["web-1-1 running", "web-2-1 running"]
+    })
+    .await;
+    assert_eq!(
+        c.running(),
+        [
+            "shop_web-1-1",
+            "shop_web-1-1_web",
+            "shop_web-2-1",
+            "shop_web-2-1_web"
+        ]
+    );
+    eventually("service status", async || {
+        let s = &c.list(Kind::Service).await[0];
+        s.status["running"] == 2 && s.status["ready"] == 2 && s.status["desired"] == 2
+    })
+    .await;
+    // The node registered itself and the scheduler used it.
+    let nodes = c.list(Kind::Node).await;
+    assert_eq!(nodes[0].metadata.name, "n1");
+    let task = &c.list(Kind::Task).await[0];
+    assert_eq!(task.spec["node"], "n1");
+    assert_eq!(task.metadata.labels["legion.service"], "web");
+
+    // A new image rolls through, one slot at a time.
+    c.apply(&service(2, "web:2")).await;
+    eventually("updated", async || {
+        c.running()
+            == [
+                "shop_web-1-2",
+                "shop_web-1-2_web",
+                "shop_web-2-2",
+                "shop_web-2-2_web",
+            ]
+    })
+    .await;
+    eventually("old tasks shut down", async || {
+        c.tasks().await
+            == [
+                "web-1-1 shutdown",
+                "web-1-2 running",
+                "web-2-1 shutdown",
+                "web-2-2 running",
+            ]
+    })
+    .await;
+
+    // Scaling down removes a slot with its history.
+    c.apply(&service(1, "web:2")).await;
+    eventually("scaled down", async || {
+        c.tasks().await == ["web-1-1 shutdown", "web-1-2 running"]
+    })
+    .await;
+    assert_eq!(c.running(), ["shop_web-1-2", "shop_web-1-2_web"]);
+
+    // A container that keeps failing exhausts the restart policy; the task
+    // fails and the controller replaces it.
+    c.rt.exit("shop_web-1-2_web", 1);
+    eventually("restarted once", async || {
+        c.rt.containers()
+            .iter()
+            .any(|(n, running, starts)| n == "shop_web-1-2_web" && *running && *starts == 2)
+    })
+    .await;
+    c.rt.exit("shop_web-1-2_web", 1);
+    eventually("replaced", async || {
+        c.tasks().await.contains(&"web-1-3 running".to_owned())
+    })
+    .await;
+    assert!(c.tasks().await.contains(&"web-1-2 failed".to_owned()));
+
+    // Deleting the service removes its tasks and pods.
+    c.api
+        .clone()
+        .delete(DeleteRequest {
+            r#ref: Some(ObjectRef {
+                kind: "Service".into(),
+                namespace: "shop".into(),
+                name: "web".into(),
+            }),
+            expected_version: None,
+        })
+        .await
+        .unwrap();
+    eventually("all gone", async || {
+        c.tasks().await.is_empty() && c.running().is_empty()
+    })
+    .await;
+
+    c.stop().await;
+}
