@@ -58,6 +58,8 @@ struct State {
     sysctls: BTreeMap<String, String>,
     main_rules: String,
     states: Vec<PfState>,
+    /// Commands that fail once, the next time they run.
+    failing: BTreeSet<String>,
 }
 
 /// A WireGuard interface's settings.
@@ -227,6 +229,12 @@ impl FakeSys {
 
     pub fn states(&self) -> Vec<PfState> {
         self.state().states.clone()
+    }
+
+    /// Makes `command` fail the next time it runs. Only some honour it:
+    /// `pfctl -ss` and `pfctl -k`.
+    pub fn fail_next(&self, command: &str) {
+        self.state().failing.insert(command.to_owned());
     }
 
     /// tmpfs mount points and their sizes.
@@ -571,11 +579,19 @@ impl Sys for FakeSys {
     }
 
     fn pf_states(&self) -> Result<Vec<PfState>> {
-        Ok(self.state().states.clone())
+        let mut s = self.state();
+        if s.failing.remove("pfctl -ss") {
+            return Err(fail("pfctl -ss", "Device busy"));
+        }
+        Ok(s.states.clone())
     }
 
     fn pf_kill_state(&self, id: &str) -> Result<()> {
-        self.state().states.retain(|s| s.id != id);
+        let mut s = self.state();
+        if s.failing.remove("pfctl -k") {
+            return Err(fail("pfctl -k", "Device busy"));
+        }
+        s.states.retain(|s| s.id != id);
         Ok(())
     }
 

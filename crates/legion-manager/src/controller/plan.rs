@@ -260,6 +260,8 @@ fn orphan(tasks: &[Task], nodes: &[Node], plan: &mut Plan) -> (Vec<Task>, BTreeS
 struct Addresses {
     vip: Option<Ipv4Addr>,
     published: Vec<PublishedPort>,
+    /// Ports the service names that an older service holds.
+    conflicts: Vec<String>,
 }
 
 /// VIPs and published ports for every service, by uid. What a service
@@ -286,10 +288,15 @@ fn addresses(services: &[Service]) -> BTreeMap<&str, Addresses> {
     let mut out: BTreeMap<&str, Addresses> = BTreeMap::new();
     let mut vips: BTreeSet<Ipv4Addr> = BTreeSet::new();
     let mut ports: BTreeSet<(u16, legion_api::service::Protocol)> = BTreeSet::new();
-    // Explicitly published ports are the service's own; picked ones yield.
+    // Explicitly published ports are the service's own, the oldest
+    // service's when two name the same one; picked ones yield.
+    let mut owners: BTreeMap<(u16, legion_api::service::Protocol), &str> = BTreeMap::new();
     for s in &by_uid {
         for p in s.spec.endpoint.iter().flat_map(|e| &e.ports) {
             if let Some(n) = p.published_port {
+                owners
+                    .entry((n, p.protocol))
+                    .or_insert(&s.object.metadata.uid);
                 ports.insert((n, p.protocol));
             }
         }
@@ -297,6 +304,7 @@ fn addresses(services: &[Service]) -> BTreeMap<&str, Addresses> {
     for s in &by_uid {
         let old = previous(s);
         let mut a = Addresses::default();
+        let uid = s.object.metadata.uid.as_str();
         if wants_vip(s)
             && let Some(ip) = old.virtual_ip.as_deref().and_then(|v| v.parse().ok())
             && in_range(ip)
@@ -314,7 +322,18 @@ fn addresses(services: &[Service]) -> BTreeMap<&str, Addresses> {
                 .find(|o| o.port == p.port && o.protocol == p.protocol)
                 .map(|o| o.published_port);
             let n = match (p.published_port, kept) {
-                (Some(n), _) => Some(n),
+                (Some(n), _) if owners[&(n, p.protocol)] == uid => Some(n),
+                (Some(n), _) => {
+                    let owner = by_uid
+                        .iter()
+                        .find(|o| o.object.metadata.uid == owners[&(n, p.protocol)])
+                        .expect("an owner is a service");
+                    a.conflicts.push(format!(
+                        "published port {n}/{} is taken by {}/{}",
+                        p.protocol, owner.object.metadata.namespace, owner.object.metadata.name
+                    ));
+                    None
+                }
                 (None, Some(n)) if !ports.contains(&(n, p.protocol)) => {
                     ports.insert((n, p.protocol));
                     Some(n)
@@ -344,7 +363,9 @@ fn addresses(services: &[Service]) -> BTreeMap<&str, Addresses> {
             }
         }
         for p in s.spec.endpoint.iter().flat_map(|e| &e.ports) {
+            // A port named but taken is not swapped for another.
             if p.publish == Publish::None
+                || p.published_port.is_some()
                 || a.published
                     .iter()
                     .any(|o| o.port == p.port && o.protocol == p.protocol)
@@ -638,6 +659,7 @@ fn service(
         ready: running.iter().filter(|t| t.status.ready).count() as u32,
         virtual_ip: addrs.vip.map(|ip| ip.to_string()),
         published_ports: addrs.published,
+        conflicts: addrs.conflicts,
         last_tasks,
         spec: Some(s.spec.clone()),
         update,

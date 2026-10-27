@@ -1020,3 +1020,32 @@ endpoint: { mode: dnsrr, ports: [{ port: 80, publish: host, publishedPort: 8080 
     assert_eq!(vip(&w, "b"), None);
     assert!(published(&w, "b").is_empty());
 }
+
+#[test]
+fn a_published_port_belongs_to_one_service() {
+    let fixed = r#"
+pod:
+  containers: [{ name: app, image: "app:1", ports: [{ containerPort: 8080 }] }]
+endpoint:
+  ports: [{ port: 80, targetPort: 8080, publish: ingress, publishedPort: 30080 }]
+"#;
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.service("old", fixed);
+    w.settle();
+    w.service("new", fixed);
+    w.settle();
+    // The older one keeps it; the newer goes without, and says why.
+    assert_eq!(published(&w, "old"), [(80, 30080)]);
+    assert!(published(&w, "new").is_empty());
+    assert!(status(&w, "old").conflicts.is_empty());
+    assert_eq!(
+        status(&w, "new").conflicts,
+        ["published port 30080/tcp is taken by shop/old"]
+    );
+    // Released, it moves.
+    w.delete_service("old");
+    w.settle();
+    assert_eq!(published(&w, "new"), [(80, 30080)]);
+    assert!(status(&w, "new").conflicts.is_empty());
+}

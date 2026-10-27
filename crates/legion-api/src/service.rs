@@ -1167,6 +1167,10 @@ pub struct ServiceStatus {
     /// Every published port, those Legion picked included.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub published_ports: Vec<PublishedPort>,
+    /// What the service asks for that another service holds, such as a
+    /// published port; it goes without until that is released.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<String>,
     /// The number of the newest task of each slot (replica number or
     /// node), so a deleted task's name is never given to another.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

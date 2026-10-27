@@ -209,7 +209,6 @@ impl LoadBalancer {
             .collect();
         let gone: BTreeSet<Ipv4Addr> = self.backends.difference(&backends).copied().collect();
         self.tables = tables;
-        self.backends = backends;
         if !gone.is_empty() {
             for state in sys.pf_states()? {
                 if state.addrs.iter().any(|a| gone.contains(a)) {
@@ -217,6 +216,8 @@ impl LoadBalancer {
                 }
             }
         }
+        // Only now: if killing failed, the next pass finds them gone again.
+        self.backends = backends;
         Ok(())
     }
 }
@@ -331,6 +332,30 @@ mod tests {
             "{host}nat-anchor \"legion/*\" all\nrdr-anchor \"legion/*\" all\nanchor \"legion/*\" all\n"
         );
         assert!(missing_hooks(&hooked).is_empty());
+    }
+
+    #[test]
+    fn failed_cleanup_is_retried() {
+        let sys = FakeSys::new();
+        let subnet = "10.200.0.0/24".parse().unwrap();
+        let mut lb = LoadBalancer::default();
+        let both = [web(&["10.200.0.2", "10.200.0.3"], &[])];
+        let one = [web(&["10.200.0.3"], &[])];
+        lb.apply(&sys, &both, subnet, Exits::default()).unwrap();
+        sys.add_state(PfState {
+            id: "a".into(),
+            addrs: vec![ip("10.200.0.2"), ip("10.201.0.1")],
+        });
+        // .2 goes, but its connections cannot be listed, then not killed.
+        for command in ["pfctl -ss", "pfctl -k"] {
+            sys.fail_next(command);
+            let r = lb.apply(&sys, &one, subnet, Exits::default());
+            assert!(r.is_err(), "{command} did not fail");
+            assert_eq!(sys.states().len(), 1, "after {command} failed");
+        }
+        // The next pass still knows .2 went.
+        lb.apply(&sys, &one, subnet, Exits::default()).unwrap();
+        assert!(sys.states().is_empty());
     }
 
     #[test]

@@ -190,7 +190,7 @@ impl DispatcherService {
                 .and_then(|s| s.pod_cidr)
             {
                 Some(cidr) => Some(cidr),
-                None => Some(self.free_subnet()?.to_string()),
+                None => Some(self.reserve_subnet(name).await?.to_string()),
             };
             let response = RegisterResponse {
                 pod_cidr: status.pod_cidr.clone().unwrap_or_default(),
@@ -228,21 +228,50 @@ impl DispatcherService {
         Err(Status::unavailable(format!("{key} keeps changing")))
     }
 
-    /// The lowest node subnet no node holds.
-    fn free_subnet(&self) -> Result<legion_sys::Ipv4Net, Status> {
-        let nodes = self.store().list(Kind::Node, None).map_err(internal)?;
-        let taken = nodes
-            .objects
-            .iter()
-            .filter_map(|n| {
+    /// The node's subnet: the one it reserved before, or the lowest free one,
+    /// reserved now. Reservations share one object, so two nodes registering
+    /// at once conflict there rather than both taking the same subnet (their
+    /// Node objects are different keys).
+    async fn reserve_subnet(&self, name: &str) -> Result<legion_sys::Ipv4Net, Status> {
+        let key = subnets_key();
+        for _ in 0..ATTEMPTS {
+            let existing = self.get(&key)?;
+            let mut held: BTreeMap<String, String> = match &existing {
+                Some(o) => serde_json::from_value(o.spec.clone()).map_err(internal)?,
+                None => BTreeMap::new(),
+            };
+            if let Some(cidr) = held.get(name).and_then(|c| c.parse().ok()) {
+                return Ok(cidr);
+            }
+            // Nodes registered before reservations existed hold theirs in
+            // their status only.
+            let nodes = self.store().list(Kind::Node, None).map_err(internal)?;
+            let in_status = nodes.objects.iter().filter_map(|n| {
                 serde_json::from_value::<NodeStatus>(n.status.clone())
                     .ok()?
                     .pod_cidr
-            })
-            .filter_map(|c| c.parse().ok())
-            .collect();
-        legion_net::free_node_subnet(&taken)
-            .ok_or_else(|| Status::resource_exhausted("the cluster pod network is full"))
+            });
+            let taken = held
+                .values()
+                .cloned()
+                .chain(in_status)
+                .filter_map(|c| c.parse().ok())
+                .collect();
+            let subnet = legion_net::free_node_subnet(&taken)
+                .ok_or_else(|| Status::resource_exhausted("the cluster pod network is full"))?;
+            held.insert(name.to_owned(), subnet.to_string());
+            let spec = serde_json::to_value(&held).map_err(internal)?;
+            let precondition = existing.map_or(Precondition::MustNotExist, |o| {
+                Precondition::Version(o.metadata.version)
+            });
+            let object = Object::new(key.kind, &key.namespace, &key.name, spec);
+            match self.write(object, precondition).await? {
+                Outcome::Written(_) => return Ok(subnet),
+                Outcome::Conflict { .. } => continue,
+                other => return Err(unexpected(other)),
+            }
+        }
+        Err(Status::unavailable(format!("{key} keeps changing")))
     }
 
     async fn report_local(
@@ -854,6 +883,11 @@ fn assignment(o: &Object, node: &str) -> Option<Assignment> {
 
 fn invalid(e: impl std::fmt::Display) -> Status {
     Status::invalid_argument(e.to_string())
+}
+
+/// Node subnets by node name, in the reserved namespace.
+fn subnets_key() -> ObjectKey {
+    ObjectKey::new(Kind::Config, crate::join::SYSTEM_NAMESPACE, "node-subnets")
 }
 
 fn internal(e: impl std::fmt::Display) -> Status {

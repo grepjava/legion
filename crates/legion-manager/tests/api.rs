@@ -681,6 +681,48 @@ async fn until(what: &str, mut f: impl FnMut() -> bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nodes_registering_at_once_get_their_own_subnets() {
+    let ca = Ca::generate().unwrap();
+    let first = Running::start_with(Some(&ca)).await;
+    first.cluster().await.init(InitRequest {}).await.unwrap();
+    async fn register(d: DispatcherClient<Channel>) -> String {
+        eventually(|| {
+            let mut d = d.clone();
+            async move {
+                d.register(RegisterRequest {
+                    node: String::new(),
+                    status_json: br#"{"state":"ready"}"#.to_vec(),
+                })
+                .await
+            }
+        })
+        .await
+        .into_inner()
+        .pod_cidr
+    }
+    let mut clients = Vec::new();
+    for n in 0..8 {
+        let w = creds(&ca, &format!("w{n}"), Role::Worker);
+        clients.push(DispatcherClient::new(
+            first.channel(Some(&w)).await.unwrap(),
+        ));
+    }
+    let mut all = tokio::task::JoinSet::new();
+    for (n, d) in clients.iter().cloned().enumerate() {
+        all.spawn(async move { (n, register(d).await) });
+    }
+    let mut subnets = std::collections::BTreeMap::new();
+    while let Some(r) = all.join_next().await {
+        let (n, cidr) = r.unwrap();
+        subnets.insert(n, cidr);
+    }
+    let distinct: std::collections::BTreeSet<&String> = subnets.values().collect();
+    assert_eq!(distinct.len(), 8, "{subnets:?}");
+    // Registering again keeps the subnet.
+    assert_eq!(register(clients[3].clone()).await, subnets[&3]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn workers_follow_their_work_through_any_manager() {
     let ca = Ca::generate().unwrap();
     let first = Running::start_with(Some(&ca)).await;
