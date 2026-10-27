@@ -46,7 +46,7 @@ struct State {
     datasets: BTreeMap<String, Dataset>,
     snapshots: BTreeSet<String>,
     /// tmpfs mount points, with their size.
-    mounts: BTreeMap<String, u64>,
+    mounts: BTreeMap<String, Option<u64>>,
 }
 
 fn fail(command: &str, message: impl Into<String>) -> Error {
@@ -158,7 +158,7 @@ impl FakeSys {
     }
 
     /// tmpfs mount points and their sizes.
-    pub fn tmpfs_mounts(&self) -> BTreeMap<String, u64> {
+    pub fn tmpfs_mounts(&self) -> BTreeMap<String, Option<u64>> {
         self.state().mounts.clone()
     }
 }
@@ -523,7 +523,7 @@ impl Sys for FakeSys {
         Ok(())
     }
 
-    fn mount_tmpfs(&self, path: &str, size: u64) -> Result<()> {
+    fn mount_tmpfs(&self, path: &str, size: Option<u64>, _mode: u32) -> Result<()> {
         let mut s = self.state();
         if s.mounts.contains_key(path) {
             // The real mount would stack a second file system on the first.
@@ -544,16 +544,13 @@ impl Sys for FakeSys {
     }
 
     fn mounts(&self, prefix: &str) -> Result<Vec<String>> {
-        let prefix = prefix.trim_end_matches('/');
+        // By path components, so tests on any platform see what FreeBSD does.
+        let prefix = std::path::Path::new(prefix);
         Ok(self
             .state()
             .mounts
             .keys()
-            .filter(|p| {
-                *p == prefix
-                    || p.strip_prefix(prefix)
-                        .is_some_and(|rest| rest.starts_with('/'))
-            })
+            .filter(|p| std::path::Path::new(p).starts_with(prefix))
             .cloned()
             .collect())
     }

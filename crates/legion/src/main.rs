@@ -50,6 +50,10 @@ enum Command {
         /// Image for pod infra containers.
         #[arg(long)]
         infra_image: Option<String>,
+        /// ZFS dataset for volumes, e.g. `zroot/legion`; without it, tasks
+        /// using volumes are rejected.
+        #[arg(long)]
+        zfs_root: Option<String>,
     },
     /// Start a new cluster with the reached manager as its first member.
     Init,
@@ -116,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
             no_agent,
             node_name,
             infra_image,
+            zfs_root,
         } => {
             daemon::run(daemon::Options {
                 data_dir,
@@ -125,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
                 agent: !no_agent,
                 node_name,
                 infra_image,
+                zfs_root,
             })
             .await
         }

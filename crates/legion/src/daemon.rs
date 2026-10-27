@@ -20,6 +20,7 @@ pub struct Options {
     pub agent: bool,
     pub node_name: Option<String>,
     pub infra_image: Option<String>,
+    pub zfs_root: Option<String>,
 }
 
 pub async fn run(opts: Options) -> anyhow::Result<()> {
@@ -100,6 +101,7 @@ async fn start_agent(
     if let Some(image) = &opts.infra_image {
         config.infra_image = image.clone();
     }
+    config.zfs_root = opts.zfs_root.clone();
     let status = NodeStatus {
         state: NodeState::Ready,
         hostname,

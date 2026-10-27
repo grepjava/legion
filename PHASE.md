@@ -58,7 +58,7 @@ self-heals on one node.
   pod down when the task ends or stops. Pods survive agent restarts and are
   adopted; containers no task accounts for are removed. Tested in CI with
   fakes of Podman and the system; `tests/live.rs` runs a real pod on
-  FreeBSD. Not yet: volumes (tasks using them are rejected).
+  FreeBSD.
 - **Service controller and scheduler** (`legion-manager`, DESIGN.md §3.3):
   replicated and global services, scaling, replacement of failed tasks with
   backoff, task history, rolling updates (`parallelism`, `order`), drain and
@@ -89,6 +89,15 @@ self-heals on one node.
   retries with backoff. The tmpfs goes with the pod, and the agent removes
   any it finds for a task it does not run. Values are read at pod start: a
   changed Secret reaches a task when its pod next starts.
+- **Volumes** (`legion-agent`): a `Volume` is the ZFS dataset
+  `<zfs root>/volumes/<ns>/<name>` (`legion daemon --zfs-root`), created on
+  first use with its `size` as quota and bound to that node in the Volume's
+  status; tasks elsewhere are rejected. Its mountpoint is bind-mounted into
+  each container that mounts it, read-only where asked, and the data
+  outlives tasks. Pod `tmpfs` volumes are shared by the pod's containers and
+  go with the pod. Not yet: removing datasets of deleted Volumes (they are
+  left in place), and scheduling tasks to the node holding their volume
+  (one node in phase 1).
 
 ### To do, in order
 
@@ -102,9 +111,7 @@ them.
    host's pf to reference Legion's anchors.
 2. **DNS**: resolver on the bridge gateway for cluster names, forwarding the
    rest (§5.5).
-3. **ZFS volumes**: create, mount into containers, keep across task
-   restarts.
-4. **Exit test**: a multi-service app (for example web + database + cache)
+3. **Exit test**: a multi-service app (for example web + database + cache)
    with probes and a volume; kill containers and the agent and check that it
    comes back.
 

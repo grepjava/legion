@@ -148,16 +148,7 @@ pub fn rctl_rules(c: &Container, jail: &str) -> Vec<RctlRule> {
 /// Pod features later phase-1 steps add (PHASE.md). A task using one is
 /// rejected rather than run without it.
 pub fn unsupported(pod: &PodSpec) -> Option<String> {
-    if !pod.volumes.is_empty() {
-        return Some("volumes are not supported yet".into());
-    }
     for c in pod.containers() {
-        if !c.volume_mounts.is_empty() {
-            return Some(format!(
-                "container {}: volume mounts are not supported yet",
-                c.name
-            ));
-        }
         let probes = &c.probes;
         if [&probes.startup, &probes.liveness, &probes.readiness]
             .into_iter()

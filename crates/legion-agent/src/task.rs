@@ -20,10 +20,10 @@ use tokio::time::Instant;
 use tracing::Instrument;
 
 use crate::control::{Assignment, Control, ControlError};
-use crate::files;
 use crate::pod::{self, LABEL_CONTAINER, LABEL_ROLE, LABEL_TASK, Role};
 use crate::probe::{self, Outcome, Prober};
 use crate::runtime::Runtime;
+use crate::{files, volumes};
 
 /// What the agent tells a worker.
 #[derive(Debug)]
@@ -44,6 +44,7 @@ pub(crate) struct Ctx<R, C> {
     pub node: String,
     pub infra_image: String,
     pub files_dir: std::path::PathBuf,
+    pub zfs_root: Option<String>,
     /// Set once the node has registered, before any worker starts.
     pub net: Arc<OnceLock<PodNetwork>>,
     /// Pod addresses in use, by task uid.
@@ -59,6 +60,7 @@ impl<R, C> Clone for Ctx<R, C> {
             node: self.node.clone(),
             infra_image: self.infra_image.clone(),
             files_dir: self.files_dir.clone(),
+            zfs_root: self.zfs_root.clone(),
             net: self.net.clone(),
             ips: self.ips.clone(),
         }
@@ -303,6 +305,20 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         )
         .await
         .map_err(Abort::Failed)?;
+        // After the files: their tmpfs would hide mount points made before.
+        let sources = volumes::prepare(
+            self.ctx.control.as_ref(),
+            &self.ctx.sys,
+            &self.ctx.node,
+            self.ctx.zfs_root.as_deref(),
+            &self.ctx.files_dir,
+            &self.a,
+        )
+        .await
+        .map_err(|e| match e {
+            volumes::Error::Failed(m) => Abort::Failed(m),
+            volumes::Error::Rejected(m) => Abort::Rejected(m),
+        })?;
 
         let infra = rt
             .create(&pod::infra_spec(
@@ -323,6 +339,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         let init: Vec<_> = self.pod().init_containers.clone();
         for c in &init {
             let mut spec = pod::container_spec(&self.ctx.node, &self.a, c, Role::Init, &infra);
+            spec.mounts.extend(volumes::mounts(c, &sources));
             files.apply(&c.name, &mut spec);
             let id = rt
                 .create(&spec)
@@ -350,6 +367,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         let apps: Vec<_> = self.pod().containers.clone();
         for c in &apps {
             let mut spec = pod::container_spec(&self.ctx.node, &self.a, c, Role::App, &infra);
+            spec.mounts.extend(volumes::mounts(c, &sources));
             files.apply(&c.name, &mut spec);
             let id = rt
                 .create(&spec)

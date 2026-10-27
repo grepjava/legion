@@ -9,6 +9,15 @@
 //! Everything lives under the lab directory, with Podman on its own root,
 //! runroot and tmpdir. `LEGION_OCIJAIL` picks the OCI runtime. Remove the lab
 //! afterwards with `chflags -R 0` and `rm -rf`.
+//!
+//! With `LEGION_AGENT_ZFS_ROOT=<dataset>` the pod also mounts a ZFS volume,
+//! created under that dataset and left there. A throwaway pool will do:
+//!
+//! ```sh
+//! kldload -n zfs; truncate -s 256m /var/tmp/lvol.img
+//! zpool create -m /var/tmp/lvol lvol /var/tmp/lvol.img   # LEGION_AGENT_ZFS_ROOT=lvol/legion
+//! zpool destroy lvol; rm /var/tmp/lvol.img
+//! ```
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -49,6 +58,7 @@ async fn eventually(what: &str, secs: u64, mut f: impl AsyncFnMut() -> bool) {
 fn start_agent(store: &Store, podman: &Podman) -> (oneshot::Sender<()>, JoinHandle<()>) {
     let lab = PathBuf::from(std::env::var("LEGION_AGENT_LAB").expect("set LEGION_AGENT_LAB"));
     let mut config = AgentConfig::new("lab", lab.join("tasks"));
+    config.zfs_root = std::env::var("LEGION_AGENT_ZFS_ROOT").ok();
     config.infra_image = IMAGE.into();
     config.resync = Duration::from_secs(2);
     let agent = Agent::new(
@@ -127,7 +137,8 @@ async fn agent_runs_a_real_pod() {
 
     let (stop, agent) = start_agent(&store, &podman);
 
-    let pod: serde_json::Value = serde_json::json!({
+    let zfs_root = std::env::var("LEGION_AGENT_ZFS_ROOT").ok();
+    let mut pod: serde_json::Value = serde_json::json!({
         "containers": [{
             "name": "app",
             "image": IMAGE,
@@ -151,6 +162,23 @@ async fn agent_runs_a_real_pod() {
         "restartPolicy": { "condition": "any", "delay": "1s" },
         "stopGracePeriod": "2s",
     });
+    let mut volume_mounts = vec![serde_json::json!({ "name": "scratch", "path": "/scratch" })];
+    pod["volumes"] = serde_json::json!([{ "name": "scratch", "tmpfs": { "size": "16Mi" } }]);
+    if zfs_root.is_some() {
+        volume_mounts.push(serde_json::json!({ "name": "data", "path": "/data" }));
+        pod["volumes"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "name": "data", "volume": { "name": "data" } }));
+        let v = Object::new(
+            Kind::Volume,
+            "lab",
+            "data",
+            serde_json::json!({ "size": "64Mi" }),
+        );
+        put(&store, v, Precondition::MustNotExist).await;
+    }
+    pod["containers"][0]["volumeMounts"] = volume_mounts.into();
     let mut spec: TaskSpec = legion_api::parse(&serde_json::json!({
         "service": "web", "serviceUid": "1", "serviceGeneration": 1, "slot": 1,
         "node": "lab", "pod": pod,
@@ -270,6 +298,25 @@ async fn agent_runs_a_real_pod() {
             .await
             .unwrap()
     };
+
+    // Volumes are writable; the ZFS one keeps its data beyond the pod.
+    let out = sh_in("echo kept > /scratch/f && read x < /scratch/f && echo $x").await;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "kept\n",
+        "tmpfs volume"
+    );
+    let data_dir = zfs_root.as_ref().map(|root| {
+        let ds = format!("{root}/volumes/lab/data");
+        let list = sh(&format!("zfs get -H -p -o value quota,mountpoint {ds}"));
+        let mut it = list.lines();
+        assert_eq!(it.next(), Some("67108864"), "quota of {ds}: {list}");
+        PathBuf::from(it.next().expect("mountpoint"))
+    });
+    if data_dir.is_some() {
+        let out = sh_in("echo kept > /data/f && echo ok").await;
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n", "zfs volume");
+    }
     sh_in(": > /tmp/ready").await;
     eventually("ready", 15, async || status(&store, &key).ready).await;
 
@@ -338,6 +385,13 @@ async fn agent_runs_a_real_pod() {
         "task tmpfs unmounted"
     );
     assert!(!task_files.exists());
+    if let Some(dir) = &data_dir {
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f")).unwrap(),
+            "kept\n",
+            "the volume's data outlives the task"
+        );
+    }
 
     stop.send(()).unwrap();
     agent.await.unwrap();

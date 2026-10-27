@@ -77,6 +77,7 @@ impl Harness {
         let mut config = AgentConfig::new(NODE, self.files_dir());
         config.infra_image = INFRA.into();
         config.resync = Duration::from_millis(100);
+        config.zfs_root = Some("tank/legion".into());
         let agent = Agent::new(
             config,
             self.rt.clone(),
@@ -413,16 +414,19 @@ async fn startup_failures() {
         status.message
     );
 
-    let vol = h
+    let https = h
         .task(
-            "v-1",
+            "h-1",
             r#"
-containers: [{ name: app, image: "web:1", volumeMounts: [{ name: data, path: /data }] }]
-volumes: [{ name: data, tmpfs: {} }]
+containers:
+  - name: app
+    image: "web:1"
+    ports: [{ name: https, containerPort: 443 }]
+    probes: { readiness: { http: { port: https, scheme: https } } }
 "#,
         )
         .await;
-    let status = h.wait_state(&vol, TaskState::Rejected).await;
+    let status = h.wait_state(&https, TaskState::Rejected).await;
     assert!(
         status.message.contains("not supported yet"),
         "{}",
@@ -714,4 +718,120 @@ async fn removes_files_of_unknown_tasks() {
     std::fs::create_dir_all(stale.join("secrets")).unwrap();
     std::fs::write(stale.join("secrets").join("old"), "x").unwrap();
     eventually("stale files removed", || !stale.exists()).await;
+}
+
+const VOLUMES: &str = r#"
+containers:
+  - name: db
+    image: "app:1"
+    volumeMounts:
+      - { name: data, path: /var/db/app }
+      - { name: scratch, path: /var/tmp/scratch }
+  - name: backup
+    image: "app:1"
+    volumeMounts: [{ name: data, path: /backup/data, readOnly: true }]
+volumes:
+  - { name: data, volume: { name: data } }
+  - { name: scratch, tmpfs: { size: 64Mi } }
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn volumes() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let volume = ObjectKey::new(Kind::Volume, "shop", "data");
+    h.write(
+        Object::new(
+            Kind::Volume,
+            "shop",
+            "data",
+            serde_json::json!({ "size": "1Gi" }),
+        ),
+        Precondition::MustNotExist,
+    )
+    .await;
+    let key = h.task("db-1", VOLUMES).await;
+    h.wait_state(&key, TaskState::Running).await;
+    let uid = h.store.get(&key).unwrap().unwrap().metadata.uid;
+
+    // The volume is a dataset with its quota, bound to this node.
+    let ds = "tank/legion/volumes/shop/data";
+    let datasets = h.sys.zfs_list(ds).unwrap();
+    assert_eq!(datasets.len(), 1, "{datasets:?}");
+    assert_eq!(datasets[0].quota, Some(1 << 30));
+    let status = h.store.get(&volume).unwrap().unwrap().status;
+    assert_eq!(status["node"], NODE);
+    assert_eq!(status["dataset"], ds);
+
+    // Each container mounts what it asks for, read-only where asked.
+    let scratch = h.files_dir().join(&uid).join("volumes").join("scratch");
+    let mounts = |name: &str| -> Vec<(String, String, bool)> {
+        h.rt.spec(name)
+            .unwrap()
+            .mounts
+            .iter()
+            .map(|m| {
+                (
+                    m.source.clone(),
+                    m.destination.clone(),
+                    m.options.contains(&"ro".to_owned()),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        mounts("shop_db-1_db"),
+        [
+            (
+                "/tank/legion/volumes/shop/data".to_owned(),
+                "/var/db/app".to_owned(),
+                false
+            ),
+            (
+                scratch.to_str().unwrap().to_owned(),
+                "/var/tmp/scratch".to_owned(),
+                false
+            ),
+        ]
+    );
+    assert_eq!(
+        mounts("shop_db-1_backup"),
+        [(
+            "/tank/legion/volumes/shop/data".to_owned(),
+            "/backup/data".to_owned(),
+            true
+        )]
+    );
+    assert_eq!(
+        h.sys.tmpfs_mounts(),
+        [(scratch.to_str().unwrap().to_owned(), Some(64 << 20))].into()
+    );
+
+    // The tmpfs goes with the pod; the dataset stays for the next task.
+    h.shut_down(&key).await;
+    h.wait_state(&key, TaskState::Shutdown).await;
+    assert!(h.sys.tmpfs_mounts().is_empty());
+    assert_eq!(h.sys.zfs_list(ds).unwrap().len(), 1);
+    let next = h.task("db-2", VOLUMES).await;
+    h.wait_state(&next, TaskState::Running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn volume_problems() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    // Missing: fails, so the controller tries again later.
+    let key = h.task("db-1", VOLUMES).await;
+    let st = h.wait_state(&key, TaskState::Failed).await;
+    assert_eq!(st.message, "volume data not found");
+
+    // Held by another node: rejected.
+    let mut v = Object::new(Kind::Volume, "shop", "data", serde_json::json!({}));
+    v.status = serde_json::json!({ "node": "n2", "dataset": "tank/legion/volumes/shop/data" });
+    h.write(v, Precondition::MustNotExist).await;
+    let key = h.task("db-2", VOLUMES).await;
+    let st = h.wait_state(&key, TaskState::Rejected).await;
+    assert_eq!(st.message, "volume data lives on node n2");
+    assert!(h.sys.zfs_list("tank").unwrap().is_empty());
+    assert!(h.rt.containers().is_empty());
 }

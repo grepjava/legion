@@ -27,8 +27,11 @@ pub mod pod;
 mod probe;
 pub mod runtime;
 mod task;
+mod volumes;
 
-pub use control::{Assignment, Assignments, Control, ControlError, Registration, StoreControl};
+pub use control::{
+    Assignment, Assignments, Control, ControlError, Registration, StoreControl, VolumeClaim,
+};
 pub use runtime::Runtime;
 
 use crate::pod::{LABEL_NODE, LABEL_TASK};
@@ -50,6 +53,9 @@ pub struct AgentConfig {
     /// Holds a tmpfs per task with its secrets and configs. The agent owns
     /// it: entries no task accounts for are removed.
     pub files_dir: PathBuf,
+    /// The ZFS dataset under which volumes are created (`<pool>/legion`);
+    /// without one, tasks using volumes are rejected.
+    pub zfs_root: Option<String>,
 }
 
 impl AgentConfig {
@@ -59,6 +65,7 @@ impl AgentConfig {
             infra_image: "docker.io/freebsd/freebsd-runtime:15.1".to_owned(),
             resync: Duration::from_secs(30),
             files_dir: files_dir.into(),
+            zfs_root: None,
         }
     }
 }
@@ -84,6 +91,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 node: config.node,
                 infra_image: config.infra_image,
                 files_dir: config.files_dir,
+                zfs_root: config.zfs_root,
                 net: Arc::default(),
                 ips: Arc::default(),
             },

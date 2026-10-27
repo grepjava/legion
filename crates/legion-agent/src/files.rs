@@ -136,7 +136,7 @@ pub(crate) async fn prepare<C: Control>(
         std::fs::create_dir_all(&dir).map_err(|e| format!("creating {path}: {e}"))?;
         let mounted = sys.mounts(path).map_err(|e| e.to_string())?;
         if !mounted.iter().any(|m| m == path) {
-            sys.mount_tmpfs(path, size)
+            sys.mount_tmpfs(path, Some(size), 0o700)
                 .map_err(|e| format!("mounting the task's tmpfs: {e}"))?;
         }
         for ((kind, name), value) in &values {

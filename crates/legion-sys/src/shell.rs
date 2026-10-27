@@ -402,8 +402,11 @@ impl<R: Runner> Sys for Shell<R> {
         self.run("zfs", &a).map(drop)
     }
 
-    fn mount_tmpfs(&self, path: &str, size: u64) -> Result<()> {
-        let opts = format!("size={size},mode=0700");
+    fn mount_tmpfs(&self, path: &str, size: Option<u64>, mode: u32) -> Result<()> {
+        let mut opts = format!("mode={mode:04o}");
+        if let Some(size) = size {
+            opts += &format!(",size={size}");
+        }
         self.run("mount", &args(["-t", "tmpfs", "-o", &opts, "tmpfs", path]))
             .map(drop)
     }
@@ -559,7 +562,11 @@ mod tests {
     fn mounts() {
         let sh = Script::shell(vec![
             (
-                "mount -t tmpfs -o size=1048576,mode=0700 tmpfs /var/run/legion/tasks/t1",
+                "mount -t tmpfs -o mode=0700,size=1048576 tmpfs /var/run/legion/tasks/t1",
+                ok(""),
+            ),
+            (
+                "mount -t tmpfs -o mode=0777 tmpfs /var/run/legion/tasks/t1/volumes/cache",
                 ok(""),
             ),
             (
@@ -573,7 +580,10 @@ mod tests {
             ),
             ("umount -f /var/run/legion/tasks/t1", ok("")),
         ]);
-        sh.mount_tmpfs("/var/run/legion/tasks/t1", 1 << 20).unwrap();
+        sh.mount_tmpfs("/var/run/legion/tasks/t1", Some(1 << 20), 0o700)
+            .unwrap();
+        sh.mount_tmpfs("/var/run/legion/tasks/t1/volumes/cache", None, 0o777)
+            .unwrap();
         assert_eq!(
             sh.mounts("/var/run/legion/tasks/").unwrap(),
             [

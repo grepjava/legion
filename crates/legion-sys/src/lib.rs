@@ -103,9 +103,10 @@ pub trait Sys: Send + Sync {
 
     // Mounts.
 
-    /// Mounts a memory-backed file system of at most `size` bytes on the
-    /// existing directory `path`; only root may enter it.
-    fn mount_tmpfs(&self, path: &str, size: u64) -> Result<()>;
+    /// Mounts a memory-backed file system on the existing directory `path`,
+    /// of at most `size` bytes (by default, as much as memory and swap
+    /// allow), with `mode` as its root's permissions.
+    fn mount_tmpfs(&self, path: &str, size: Option<u64>, mode: u32) -> Result<()>;
     /// Unmounts `path`, forcibly: callers unmount only what nothing uses.
     fn unmount(&self, path: &str) -> Result<()>;
     /// Mount points at or below `prefix`.

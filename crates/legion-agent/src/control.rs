@@ -12,6 +12,7 @@ use std::time::Duration;
 use legion_api::data::DataSpec;
 use legion_api::node::{NodeSpec, NodeStatus};
 use legion_api::task::{TaskSpec, TaskStatus};
+use legion_api::volume::{VolumeSpec, VolumeStatus};
 use legion_api::{Kind, Object, ObjectKey};
 use legion_store::{Command, Event, Outcome, Precondition, Store, WatchError};
 use legion_sys::Ipv4Net;
@@ -46,6 +47,16 @@ pub struct Registration {
     pub pod_cidr: Ipv4Net,
 }
 
+/// The outcome of [`Control::claim_volume`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VolumeClaim {
+    /// The volume is this node's now, or was already.
+    Claimed(VolumeSpec),
+    Missing,
+    /// Another node holds the volume's data.
+    Elsewhere(String),
+}
+
 /// Every task assigned to the node, by uid.
 pub type Assignments = BTreeMap<String, Assignment>;
 
@@ -72,6 +83,16 @@ pub trait Control: Send + Sync + 'static {
         uid: &str,
         status: &TaskStatus,
     ) -> impl Future<Output = Result<(), ControlError>> + Send;
+
+    /// Binds a `Volume` to `node`, recording its dataset there, unless
+    /// another node holds it.
+    fn claim_volume(
+        &self,
+        namespace: &str,
+        name: &str,
+        node: &str,
+        dataset: &str,
+    ) -> impl Future<Output = Result<VolumeClaim, ControlError>> + Send;
 
     /// The value of a `Secret` or `Config`; `None` if it does not exist.
     fn data(
@@ -223,6 +244,43 @@ impl Control for StoreControl {
             let version = task.metadata.version;
             match self.write(task, Precondition::Version(version)).await? {
                 Outcome::Written(_) => return Ok(()),
+                Outcome::Conflict { .. } => continue,
+                other => return Err(ControlError::Other(format!("unexpected outcome {other:?}"))),
+            }
+        }
+        Err(ControlError::Unavailable(format!("{key} keeps changing")))
+    }
+
+    async fn claim_volume(
+        &self,
+        namespace: &str,
+        name: &str,
+        node: &str,
+        dataset: &str,
+    ) -> Result<VolumeClaim, ControlError> {
+        let key = ObjectKey::new(Kind::Volume, namespace, name);
+        let other = |e: serde_json::Error| ControlError::Other(e.to_string());
+        for _ in 0..ATTEMPTS {
+            let Some(mut volume) = self.get(&key)? else {
+                return Ok(VolumeClaim::Missing);
+            };
+            let spec: VolumeSpec = serde_json::from_value(volume.spec.clone()).map_err(other)?;
+            let status: VolumeStatus =
+                serde_json::from_value(volume.status.clone()).unwrap_or_default();
+            if !status.node.is_empty() && status.node != node {
+                return Ok(VolumeClaim::Elsewhere(status.node));
+            }
+            if status.node == node && status.dataset == dataset {
+                return Ok(VolumeClaim::Claimed(spec));
+            }
+            volume.status = serde_json::to_value(VolumeStatus {
+                node: node.to_owned(),
+                dataset: dataset.to_owned(),
+            })
+            .map_err(other)?;
+            let version = volume.metadata.version;
+            match self.write(volume, Precondition::Version(version)).await? {
+                Outcome::Written(_) => return Ok(VolumeClaim::Claimed(spec)),
                 Outcome::Conflict { .. } => continue,
                 other => return Err(ControlError::Other(format!("unexpected outcome {other:?}"))),
             }
