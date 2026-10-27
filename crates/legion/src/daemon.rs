@@ -36,10 +36,20 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         .advertise
         .clone()
         .unwrap_or_else(|| opts.listen.to_string());
+    let hostname = hostname()?;
+    let node = match &opts.node_name {
+        Some(n) => n.clone(),
+        None => node_name(&hostname)?,
+    };
+    legion_api::validate_name(&node).context("node name")?;
+    let tls = crate::pki::Pki::new(&opts.data_dir)
+        .ensure(&node, &opts.data_dir)
+        .context("setting up certificates")?;
     let manager = legion_manager::Manager::open(legion_manager::ManagerConfig {
         data_dir: opts.data_dir.clone(),
         advertise: advertise.clone(),
         raft: legion_manager::default_raft_config(),
+        tls: Some(tls),
     })
     .await
     .map_err(|e| anyhow::anyhow!(e))
@@ -51,7 +61,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
 
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let agent = if opts.agent && cfg!(target_os = "freebsd") {
-        Some(start_agent(&opts, &advertise, &manager, stopped).await?)
+        Some(start_agent(&opts, &node, hostname, &advertise, &manager, stopped).await?)
     } else {
         tracing::info!("agent disabled; this daemon runs the manager only");
         None
@@ -81,17 +91,12 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
 
 async fn start_agent(
     opts: &Options,
+    node: &str,
+    hostname: String,
     advertise: &str,
     manager: &legion_manager::Manager,
     mut stopped: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<(tokio::task::JoinHandle<()>, PodmanService)> {
-    let hostname = hostname()?;
-    let node = match &opts.node_name {
-        Some(n) => n.clone(),
-        None => node_name(&hostname)?,
-    };
-    legion_api::validate_name(&node).context("node name")?;
-
     let podman = PodmanService::start(
         ServiceConfig::new(&opts.data_dir, &opts.run_dir),
         Duration::from_secs(60),
@@ -99,7 +104,7 @@ async fn start_agent(
     .await
     .context("starting Legion's Podman service")?;
 
-    let mut config = AgentConfig::new(&node, opts.run_dir.join("tasks"));
+    let mut config = AgentConfig::new(node, opts.run_dir.join("tasks"));
     if let Some(image) = &opts.infra_image {
         config.infra_image = image.clone();
     }

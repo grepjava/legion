@@ -19,7 +19,7 @@ use openraft::raft::{
 use openraft::{BasicNode, RaftNetwork, RaftNetworkFactory};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Request, Response, Status};
 
 /// Largest gRPC message a manager accepts, for log batches and snapshot chunks.
@@ -29,6 +29,17 @@ pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 #[derive(Default)]
 pub struct GrpcNetwork {
     channels: HashMap<(NodeId, String), Channel>,
+    tls: Option<ClientTlsConfig>,
+}
+
+impl GrpcNetwork {
+    /// Calls peers with mutual TLS when `tls` is given.
+    pub fn new(tls: Option<ClientTlsConfig>) -> Self {
+        GrpcNetwork {
+            channels: HashMap::new(),
+            tls,
+        }
+    }
 }
 
 impl RaftNetworkFactory<TypeConfig> for GrpcNetwork {
@@ -38,7 +49,7 @@ impl RaftNetworkFactory<TypeConfig> for GrpcNetwork {
         let channel = self
             .channels
             .entry((target, node.addr.clone()))
-            .or_insert_with(|| connect_lazy(&node.addr))
+            .or_insert_with(|| connect_lazy(&node.addr, self.tls.as_ref()))
             .clone();
         PeerClient {
             target,
@@ -51,10 +62,17 @@ impl RaftNetworkFactory<TypeConfig> for GrpcNetwork {
 
 /// `addr` is `host:port`. A malformed address yields a channel that never
 /// connects, which openraft sees as an unreachable peer.
-pub(crate) fn connect_lazy(addr: &str) -> Channel {
-    Endpoint::from_shared(format!("http://{addr}"))
-        .unwrap_or_else(|_| Endpoint::from_static("http://invalid.invalid:1"))
-        .connect_lazy()
+pub(crate) fn connect_lazy(addr: &str, tls: Option<&ClientTlsConfig>) -> Channel {
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    let endpoint = Endpoint::from_shared(format!("{scheme}://{addr}"))
+        .unwrap_or_else(|_| Endpoint::from_static("http://invalid.invalid:1"));
+    match tls {
+        Some(tls) => match endpoint.tls_config(tls.clone()) {
+            Ok(e) => e.connect_lazy(),
+            Err(_) => Endpoint::from_static("http://invalid.invalid:1").connect_lazy(),
+        },
+        None => endpoint.connect_lazy(),
+    }
 }
 
 pub struct PeerClient {

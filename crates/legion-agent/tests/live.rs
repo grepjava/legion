@@ -117,6 +117,7 @@ async fn agent_runs_a_real_pod() {
         data_dir: lab.join("store"),
         advertise: "127.0.0.1:1".into(),
         raft: default_raft_config(),
+        tls: None,
     })
     .await
     .unwrap();

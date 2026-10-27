@@ -2,7 +2,8 @@
 
 use std::time::Duration;
 
-use legion_manager::{Manager, ManagerConfig, default_raft_config};
+use legion_manager::{Manager, ManagerConfig, Tls, client_config, default_raft_config};
+use legion_pki::{CERT_LIFETIME, Ca, Identity, Role};
 use legion_proto::v1::cluster_client::ClusterClient;
 use legion_proto::v1::objects_client::ObjectsClient;
 use legion_proto::v1::{
@@ -16,10 +17,12 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tonic::Code;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, ClientTlsConfig};
 
 struct Running {
     addr: String,
+    /// Admin credentials, when the manager runs with TLS.
+    tls: Option<ClientTlsConfig>,
     store: Store,
     stop: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
@@ -28,6 +31,11 @@ struct Running {
 
 impl Running {
     async fn start() -> Running {
+        Running::start_with(None).await
+    }
+
+    /// With `ca`, the manager has a certificate from it and requires one.
+    async fn start_with(ca: Option<&Ca>) -> Running {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_test_writer()
@@ -35,6 +43,20 @@ impl Running {
         let dir = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
+        let tls = ca.map(|ca| {
+            let node = ca
+                .issue(
+                    &Identity::new(&format!("m{addr}"), Role::Manager),
+                    CERT_LIFETIME,
+                )
+                .unwrap();
+            Tls {
+                ca_pem: ca.cert_pem().into(),
+                cert_pem: node.cert_pem,
+                key_pem: node.key_pem,
+            }
+        });
+        let admin = ca.map(|ca| creds(ca, "admin", Role::Admin));
         let manager = Manager::open(ManagerConfig {
             data_dir: dir.path().to_owned(),
             advertise: addr.clone(),
@@ -44,6 +66,7 @@ impl Running {
                 election_timeout_max: 400,
                 ..default_raft_config()
             },
+            tls,
         })
         .await
         .unwrap();
@@ -59,6 +82,7 @@ impl Running {
         });
         Running {
             addr,
+            tls: admin,
             store,
             stop: Some(stop),
             task,
@@ -66,16 +90,33 @@ impl Running {
         }
     }
 
+    async fn channel(
+        &self,
+        tls: Option<&ClientTlsConfig>,
+    ) -> Result<Channel, tonic::transport::Error> {
+        match tls {
+            Some(tls) => {
+                Channel::from_shared(format!("https://{}", self.addr))
+                    .unwrap()
+                    .tls_config(tls.clone())?
+                    .connect()
+                    .await
+            }
+            None => {
+                Channel::from_shared(format!("http://{}", self.addr))
+                    .unwrap()
+                    .connect()
+                    .await
+            }
+        }
+    }
+
     async fn objects(&self) -> ObjectsClient<Channel> {
-        ObjectsClient::connect(format!("http://{}", self.addr))
-            .await
-            .unwrap()
+        ObjectsClient::new(self.channel(self.tls.as_ref()).await.unwrap())
     }
 
     async fn cluster(&self) -> ClusterClient<Channel> {
-        ClusterClient::connect(format!("http://{}", self.addr))
-            .await
-            .unwrap()
+        ClusterClient::new(self.channel(self.tls.as_ref()).await.unwrap())
     }
 
     async fn stop(mut self) {
@@ -268,12 +309,14 @@ async fn single_manager_crud_and_watch() {
     m.stop().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn three_managers_forward_and_fail_over() {
-    let mut managers = Vec::new();
-    for _ in 0..3 {
-        managers.push(Running::start().await);
-    }
+/// Client credentials from `ca`.
+fn creds(ca: &Ca, name: &str, role: Role) -> ClientTlsConfig {
+    let issued = ca.issue(&Identity::new(name, role), CERT_LIFETIME).unwrap();
+    client_config(ca.cert_pem(), &issued.cert_pem, &issued.key_pem)
+}
+
+/// Makes `managers[0]` the first member and the others voters.
+async fn form_cluster(managers: &[Running]) {
     managers[0]
         .cluster()
         .await
@@ -310,6 +353,16 @@ async fn three_managers_forward_and_fail_over() {
         .map(|(id, _)| *id)
         .collect();
     leader_raft.change_membership(ids, false).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_managers_forward_and_fail_over() {
+    let mut managers = Vec::new();
+    for _ in 0..3 {
+        managers.push(Running::start().await);
+    }
+    form_cluster(&managers).await;
+    let leader_raft = managers[0].store.raft.clone();
 
     // Writes through a follower are forwarded to the leader. On a slow host
     // (the emulated CI runner) leadership can still move here, which the API
@@ -366,6 +419,67 @@ async fn three_managers_forward_and_fail_over() {
         }
     })
     .await;
+
+    for m in managers {
+        m.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mutual_tls() {
+    let ca = Ca::generate().unwrap();
+    let mut managers = Vec::new();
+    for _ in 0..3 {
+        managers.push(Running::start_with(Some(&ca)).await);
+    }
+    // Raft between managers and forwarding to the leader run over mTLS.
+    form_cluster(&managers).await;
+    let follower = managers[2].objects().await;
+    eventually(|| {
+        let mut follower = follower.clone();
+        async move { follower.apply(apply(service("web", 1))).await }
+    })
+    .await;
+
+    let m = &managers[1];
+    let list = || ListRequest {
+        kind: "Service".into(),
+        ..Default::default()
+    };
+    // No certificate, a plaintext client, or one from another CA: no
+    // connection at all.
+    let no_cert = ClientTlsConfig::new()
+        .ca_certificate(tonic::transport::Certificate::from_pem(ca.cert_pem()))
+        .domain_name(legion_pki::SERVER_NAME);
+    let refused = async |tls: Option<&ClientTlsConfig>| match m.channel(tls).await {
+        Err(_) => true,
+        Ok(ch) => ObjectsClient::new(ch).list(list()).await.is_err(),
+    };
+    assert!(refused(Some(&no_cert)).await, "no client certificate");
+    assert!(refused(None).await, "plaintext");
+    let other = Ca::generate().unwrap();
+    assert!(
+        refused(Some(&creds(&other, "admin", Role::Admin))).await,
+        "another cluster's CA"
+    );
+
+    // A worker may not use the API; an admin may not speak Raft.
+    let worker = m
+        .channel(Some(&creds(&ca, "w1", Role::Worker)))
+        .await
+        .unwrap();
+    let err = ObjectsClient::new(worker).list(list()).await.unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied, "{err}");
+    let admin = m.channel(m.tls.as_ref()).await.unwrap();
+    let err = legion_proto::v1::raft_client::RaftClient::new(admin)
+        .vote(legion_proto::v1::RaftPayload::default())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied, "{err}");
+
+    // The admin lists what was written through the follower.
+    let listed = m.objects().await.list(list()).await.unwrap().into_inner();
+    assert_eq!(listed.objects.len(), 1);
 
     for m in managers {
         m.stop().await;

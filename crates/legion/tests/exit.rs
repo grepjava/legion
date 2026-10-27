@@ -113,8 +113,12 @@ fn text(b: &[u8]) -> String {
 }
 
 fn legion(args: &[&str]) -> Output {
+    let identity = PathBuf::from(std::env::var("LEGION_EXIT_LAB").expect("set LEGION_EXIT_LAB"))
+        .join("data/admin.pem");
     Command::new(LEGION)
         .args(["--server", SERVER])
+        .arg("--identity")
+        .arg(identity)
         .args(args)
         .stdin(Stdio::null())
         .output()

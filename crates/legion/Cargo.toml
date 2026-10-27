@@ -12,6 +12,7 @@ anyhow.workspace = true
 clap.workspace = true
 legion-agent.workspace = true
 legion-api.workspace = true
+legion-pki.workspace = true
 legion-manager.workspace = true
 legion-podman.workspace = true
 legion-proto.workspace = true
@@ -21,7 +22,7 @@ serde_json.workspace = true
 serde_yaml_ng.workspace = true
 similar.workspace = true
 tokio.workspace = true
-tonic.workspace = true
+tonic = { workspace = true, features = ["tls-ring"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

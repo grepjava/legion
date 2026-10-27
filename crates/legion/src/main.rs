@@ -2,6 +2,7 @@
 
 mod cli;
 mod daemon;
+mod pki;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -23,6 +24,15 @@ struct Args {
         default_value = "127.0.0.1:7470"
     )]
     server: String,
+    /// Credentials: a PEM file with a client certificate, its key and the
+    /// cluster CA. The daemon writes `<data-dir>/admin.pem`.
+    #[arg(
+        long,
+        global = true,
+        env = "LEGION_IDENTITY",
+        default_value = "/var/db/legion/admin.pem"
+    )]
+    identity: PathBuf,
     #[command(subcommand)]
     command: Command,
 }
@@ -134,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
             })
             .await
         }
-        command => cli::run(&args.server, command).await,
+        command => cli::run(&args.server, &args.identity, command).await,
     }
 }
 

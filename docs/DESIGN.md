@@ -273,8 +273,10 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
 
 - **One gRPC port per manager** (default `7470`) serves three services:
   `Objects` (Apply, Get, List, Delete, Watch), `Cluster` (Init, Status) and
-  `Raft` (the transport between managers). Phase 1 is plaintext and listens on
-  `127.0.0.1` by default; mTLS arrives with the PKI in phase 2.
+  `Raft` (the transport between managers). It listens on `127.0.0.1` by
+  default. Since phase 2 every connection is mutual TLS with certificates
+  from the cluster CA (§9); the API takes admins and managers, Raft only
+  managers.
 - **Wire format.** The object envelope is a protobuf message; spec and status
   travel as JSON bytes until each kind gets a typed message. Raft messages are
   openraft's own types as JSON inside one bytes field, so the proto file does

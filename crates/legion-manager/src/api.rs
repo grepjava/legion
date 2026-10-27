@@ -38,6 +38,8 @@ pub struct ApiService {
     /// Becomes true when the manager shuts down; open watches then end so
     /// the server's graceful shutdown can finish.
     pub(crate) closing: tokio::sync::watch::Receiver<bool>,
+    /// For forwarding to the leader.
+    pub(crate) peer_tls: Option<tonic::transport::ClientTlsConfig>,
 }
 
 enum Route {
@@ -64,7 +66,7 @@ impl ApiService {
                         Status::unavailable(format!("leader {leader} has no address"))
                     })?;
                 Ok(Route::Leader(
-                    ObjectsClient::new(connect_lazy(&addr))
+                    ObjectsClient::new(connect_lazy(&addr, self.peer_tls.as_ref()))
                         .max_decoding_message_size(MAX_MESSAGE)
                         .max_encoding_message_size(MAX_MESSAGE),
                 ))

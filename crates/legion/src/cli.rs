@@ -22,8 +22,8 @@ pub enum Format {
     Json,
 }
 
-pub async fn run(server: &str, command: Command) -> anyhow::Result<()> {
-    let channel = connect(server).await?;
+pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Result<()> {
+    let channel = connect(server, identity).await?;
     let mut objects = ObjectsClient::new(channel.clone());
     let mut cluster = ClusterClient::new(channel);
     match command {
@@ -232,14 +232,25 @@ fn manifest_yaml(o: pb::Object) -> anyhow::Result<String> {
     }))?)
 }
 
-async fn connect(server: &str) -> anyhow::Result<Channel> {
-    let url = if server.contains("://") {
-        server.to_owned()
-    } else {
-        format!("http://{server}")
-    };
+async fn connect(server: &str, identity: &Path) -> anyhow::Result<Channel> {
+    let pem = std::fs::read_to_string(identity).with_context(|| {
+        format!(
+            "reading credentials from {} (pass --identity or set LEGION_IDENTITY; \
+             the daemon writes <data-dir>/admin.pem)",
+            identity.display()
+        )
+    })?;
+    let bundle = legion_pki::Bundle::parse(&pem)
+        .with_context(|| format!("reading credentials from {}", identity.display()))?;
+    let tls = legion_manager::client_config(&bundle.ca_pem, &bundle.cert_pem, &bundle.key_pem);
+    let addr = server
+        .strip_prefix("https://")
+        .or_else(|| server.strip_prefix("http://"))
+        .unwrap_or(server);
+    let url = format!("https://{addr}");
     Channel::from_shared(url.clone())
         .with_context(|| format!("bad server address {server:?}"))?
+        .tls_config(tls)?
         .connect()
         .await
         .with_context(|| format!("connecting to {url}"))

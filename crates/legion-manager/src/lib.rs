@@ -2,11 +2,14 @@
 //! and the Raft transport, served together on one gRPC port, and the
 //! controllers, which run while this manager leads.
 //!
-//! Phase 1 serves plaintext gRPC; mTLS arrives with the cluster PKI in phase 2.
+//! With [`Tls`], every connection is mutual TLS with certificates from the
+//! cluster CA: the API takes admins and managers, the Raft transport only
+//! managers. Without it (tests only) everything is plaintext.
 
 mod api;
 pub mod controller;
 mod raft_net;
+mod tls;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -19,6 +22,9 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 
 pub use raft_net::{GrpcNetwork, MAX_MESSAGE};
+pub use tls::{Tls, client_config};
+
+use legion_pki::Role;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -27,6 +33,8 @@ pub struct ManagerConfig {
     /// `host:port` other managers use to reach this one.
     pub advertise: String,
     pub raft: openraft::Config,
+    /// `None` serves and calls plaintext: for tests.
+    pub tls: Option<Tls>,
 }
 
 /// Raft timing for managers on a LAN. Snapshot chunks stay well under the
@@ -47,6 +55,7 @@ pub struct Manager {
     id: NodeId,
     advertise: String,
     store: Store,
+    tls: Option<Tls>,
 }
 
 impl Manager {
@@ -55,12 +64,14 @@ impl Manager {
     pub async fn open(config: ManagerConfig) -> Result<Manager, Error> {
         std::fs::create_dir_all(&config.data_dir)?;
         let id = node_id(&config.data_dir)?;
-        let store = Store::open(id, &config.data_dir, config.raft, GrpcNetwork::default()).await?;
-        tracing::info!(node_id = id, advertise = %config.advertise, "manager open");
+        let network = GrpcNetwork::new(config.tls.as_ref().map(Tls::client));
+        let store = Store::open(id, &config.data_dir, config.raft, network).await?;
+        tracing::info!(node_id = id, advertise = %config.advertise, tls = config.tls.is_some(), "manager open");
         Ok(Manager {
             id,
             advertise: config.advertise,
             store,
+            tls: config.tls,
         })
     }
 
@@ -90,22 +101,36 @@ impl Manager {
             advertise: self.advertise.clone(),
             store: self.store.clone(),
             closing,
+            peer_tls: self.tls.as_ref().map(Tls::client),
         };
         let raft = raft_net::RaftService {
             raft: self.store.raft.clone(),
         };
-        tonic::transport::Server::builder()
-            .add_service(
+        let mut server = tonic::transport::Server::builder();
+        if let Some(tls) = &self.tls {
+            server = server.tls_config(tls.server())?;
+        }
+        let on = self.tls.is_some();
+        // Managers forward writes to the leader as themselves.
+        const API: &[Role] = &[Role::Admin, Role::Manager];
+        const RAFT: &[Role] = &[Role::Manager];
+        server
+            .add_service(tonic::service::interceptor::InterceptedService::new(
                 ObjectsServer::new(api.clone())
                     .max_decoding_message_size(MAX_MESSAGE)
                     .max_encoding_message_size(MAX_MESSAGE),
-            )
-            .add_service(ClusterServer::new(api))
-            .add_service(
+                tls::only(API, on),
+            ))
+            .add_service(tonic::service::interceptor::InterceptedService::new(
+                ClusterServer::new(api),
+                tls::only(API, on),
+            ))
+            .add_service(tonic::service::interceptor::InterceptedService::new(
                 RaftServer::new(raft)
                     .max_decoding_message_size(MAX_MESSAGE)
                     .max_encoding_message_size(MAX_MESSAGE),
-            )
+                tls::only(RAFT, on),
+            ))
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), {
                 let closing_tx = closing_tx.clone();
                 async move {

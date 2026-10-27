@@ -145,16 +145,52 @@ them.
 
 Nothing left in phase 1.
 
-### Deferred to phase 2
-
-mTLS and PKI (the API is plaintext on loopback until then), `join`, the
-dispatcher and agent streams across nodes, WireGuard, and multi-node
-scheduling.
-
 Decided: in phase 1 the agent runs in the same process as the manager and
 reads its assignments from the store directly, through a narrow interface
 that the phase 2 dispatcher stream replaces. This keeps phase 1 to one node
 and builds the manager–agent protocol once, when it is needed.
+
+## Phase 2 — Cluster (MVP)
+
+Exit criterion (DESIGN.md §11): a compose app deploys on 3 nodes, survives
+losing any one node, and updates with zero downtime.
+
+There is one FreeBSD host (weft-bsd). Extra nodes are jails on it: VNET
+jails for the network (WireGuard, routing), and agents with the fake
+runtime for scheduling and failure handling; a second real node is for the
+end.
+
+### Done
+
+- **mTLS and PKI** (`legion-pki`, `legion-manager`, `legion`): the first
+  `legion daemon` start creates a cluster CA, the manager's certificate and
+  `<data-dir>/admin.pem` (certificate, key and CA in one file, mode 0600)
+  under `<data-dir>/pki`; later starts reuse them and reissue the
+  manager's certificate after two thirds of its 90 days. Certificates name
+  an identity (common name and role: manager, worker, admin) and the DNS
+  name `legion`, which clients verify whatever address they dial. Every
+  connection is mutual TLS: the API takes admins and managers (managers
+  forward writes to the leader as themselves), the Raft transport only
+  managers. The CLI reads `--identity` (`LEGION_IDENTITY`, default
+  `/var/db/legion/admin.pem`). Tested: a 3-manager cluster over mTLS, and
+  refusals of no certificate, plaintext, another CA, a worker on the API
+  and an admin on Raft; the exit test passes on FreeBSD over mTLS.
+
+### To do, in order
+
+1. **Join**: tokens (`LGN-1-<ca-digest>-<secret>`, worker and manager), an
+   unauthenticated Join call that checks the token and issues a
+   certificate, `legion join`, managers added as voters, CA distribution.
+2. **Dispatcher**: the agent's `Control` over a gRPC stream from any
+   manager (assignments, endpoints, secrets for its tasks only, status
+   reports, heartbeats); node down detection.
+3. **WireGuard mesh and routed pod network**: per-node keys, peers from
+   the store, routes to other nodes' pod subnets; pf rules for remote
+   backends (§5.4).
+4. **Scheduling and failure handling across nodes**: taints, tasks of a
+   lost node rescheduled, the routing mesh on every node.
+5. **Rollback and compose `stack deploy`**.
+6. **Exit test**.
 
 ## Later phases
 

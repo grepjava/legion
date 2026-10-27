@@ -52,6 +52,8 @@ fn legion(d: &Daemon, args: &[&str]) -> Output {
     Command::new(LEGION)
         .arg("--server")
         .arg(&d.server)
+        .arg("--identity")
+        .arg(d._dir.path().join("admin.pem"))
         .args(args)
         .output()
         .unwrap()

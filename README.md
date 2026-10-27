@@ -20,6 +20,7 @@ cargo test --workspace
 
 ```sh
 legion daemon --data-dir /tmp/legion --no-agent &
+export LEGION_IDENTITY=/tmp/legion/admin.pem   # written by the daemon
 legion init
 cat <<'EOF' | legion apply -f -
 apiVersion: legion/v1
@@ -64,7 +65,8 @@ anchor "legion/*"
 | `legion-podman` | libpod REST client; supervises Legion's own Podman service |
 | `legion-sys` | FreeBSD operations: jails, interfaces, routes, rctl, pf, ZFS |
 | `legion-agent` | Registers the node; runs assigned tasks as pod jails |
-| `legion-net` | Pod bridge, pod interfaces and addresses |
+| `legion-net` | Pod bridge and interfaces, the node resolver, pf load balancing |
+| `legion-pki` | Cluster CA, node and user certificates, identities |
 | `legion` | Daemon and CLI |
 
 ## Licence

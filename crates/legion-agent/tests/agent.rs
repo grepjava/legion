@@ -36,6 +36,7 @@ impl Harness {
             data_dir: dir.path().to_owned(),
             advertise: "127.0.0.1:1".into(),
             raft: default_raft_config(),
+            tls: None,
         })
         .await
         .unwrap();

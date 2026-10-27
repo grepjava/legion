@@ -38,6 +38,7 @@ impl Cluster {
             data_dir: dir.path().to_owned(),
             advertise: addr.clone(),
             raft: default_raft_config(),
+            tls: None,
         })
         .await
         .unwrap();
