@@ -95,9 +95,11 @@ impl Node {
 
     fn balance(&self, lb: &mut LoadBalancer, services: &[Service], mesh: bool) {
         let egress = self.sys.default_interface().unwrap();
+        let published: Vec<String> = egress.iter().cloned().collect();
         let exits = Exits {
             egress: egress.as_deref(),
             mesh: mesh.then_some(mesh::INTERFACE),
+            published: &published,
         };
         lb.apply(&self.sys, services, self.net.subnet, exits)
             .unwrap();

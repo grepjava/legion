@@ -197,8 +197,19 @@ impl FakeSys {
         self.state().snapshots.clone()
     }
 
+    /// The host's interface with the default route; it is created if
+    /// missing, as a host's would exist.
     pub fn set_default_interface(&self, name: &str) {
-        self.state().default_interface = Some(name.to_owned());
+        let mut s = self.state();
+        s.default_interface = Some(name.to_owned());
+        s.interfaces
+            .entry(name.to_owned())
+            .or_insert_with(|| FakeInterface {
+                jail: None,
+                config: IfConfig::default(),
+                members: Vec::new(),
+                peer: None,
+            });
     }
 
     pub fn sysctl(&self, name: &str) -> Option<String> {

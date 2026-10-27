@@ -24,6 +24,18 @@ pub enum Format {
 }
 
 pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Result<()> {
+    // Needs no cluster.
+    if let Command::Stack {
+        command:
+            StackCommand::Convert {
+                stack,
+                file,
+                namespace,
+            },
+    } = command
+    {
+        return print_converted(&file, &stack, namespace);
+    }
     let channel = connect(server, identity).await?;
     let mut objects = ObjectsClient::new(channel.clone());
     let mut cluster = ClusterClient::new(channel);
@@ -253,29 +265,7 @@ async fn stack(objects: &mut ObjectsClient<Channel>, command: StackCommand) -> a
                 }
             }
         }
-        StackCommand::Convert {
-            stack,
-            file,
-            namespace,
-        } => {
-            let namespace = namespace.unwrap_or_else(|| stack.clone());
-            let converted = convert(&file, &stack, &namespace)?;
-            for o in &converted.objects {
-                print!(
-                    "---\n{}",
-                    serde_yaml_ng::to_string(&serde_json::json!({
-                        "apiVersion": o.api_version,
-                        "kind": o.kind,
-                        "metadata": {
-                            "name": o.metadata.name,
-                            "namespace": o.metadata.namespace,
-                            "labels": o.metadata.labels,
-                        },
-                        "spec": o.spec,
-                    }))?
-                );
-            }
-        }
+        StackCommand::Convert { .. } => unreachable!("handled in run"),
         StackCommand::Rm { stack, namespace } => {
             let namespace = namespace.unwrap_or_else(|| stack.clone());
             let kinds = [Kind::Service, Kind::Secret, Kind::Config];
@@ -287,6 +277,28 @@ async fn stack(objects: &mut ObjectsClient<Channel>, command: StackCommand) -> a
                 delete(objects, &o).await?;
             }
         }
+    }
+    Ok(())
+}
+
+/// `stack convert`: the objects as Legion YAML documents.
+fn print_converted(file: &Path, stack: &str, namespace: Option<String>) -> anyhow::Result<()> {
+    let namespace = namespace.unwrap_or_else(|| stack.to_owned());
+    let converted = convert(file, stack, &namespace)?;
+    for o in &converted.objects {
+        print!(
+            "---\n{}",
+            serde_yaml_ng::to_string(&serde_json::json!({
+                "apiVersion": o.api_version,
+                "kind": o.kind,
+                "metadata": {
+                    "name": o.metadata.name,
+                    "namespace": o.metadata.namespace,
+                    "labels": o.metadata.labels,
+                },
+                "spec": o.spec,
+            }))?
+        );
     }
     Ok(())
 }

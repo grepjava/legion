@@ -115,7 +115,8 @@ with service traffic through pf VIPs. Phase 1 is done.
   without `publishedPort`; both go in the Service status and stay put. The
   agent enables IP forwarding and keeps the pf anchor `legion/svc` in line
   with the endpoints: an `rdr` per VIP port and per published port (on the
-  egress interface) round-robin over a table of the ready tasks, NAT for
+  egress interface; since phase 2 on every interface of the node but the
+  bridge, pod links, the mesh and loopback, rechecked every 30 s) round-robin over a table of the ready tasks, NAT for
   hairpin traffic on `legion0`, and NAT for pods going out. Readiness
   changes only touch tables, so connections drain; connections of tasks
   that are gone are killed by state id. Legion never touches the host's

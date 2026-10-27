@@ -63,7 +63,7 @@ pub struct Port {
     pub port: u16,
     /// On the tasks.
     pub target: u16,
-    /// On the node's egress interface, if published.
+    /// On every address of the node, if published.
     pub published: Option<u16>,
 }
 
@@ -99,6 +99,20 @@ pub struct Exits<'a> {
     pub egress: Option<&'a str>,
     /// The mesh interface to other nodes.
     pub mesh: Option<&'a str>,
+    /// Where published ports are reached: the node's own interfaces.
+    pub published: &'a [String],
+}
+
+/// Whether published ports should be reached through `interface`: every
+/// interface of the node but loopback, pf's, the pod bridge, pods' links
+/// and the mesh, as Swarm publishes on every address.
+pub fn publishes_on(interface: &str) -> bool {
+    !(interface.starts_with("lo")
+        || interface.starts_with("pflog")
+        || interface.starts_with("pfsync")
+        || interface == BRIDGE
+        || interface.starts_with("lp")
+        || interface == crate::mesh::INTERFACE)
 }
 
 /// The anchor's rules for this node.
@@ -135,11 +149,13 @@ pub fn rules(services: &[Service], subnet: Ipv4Net, exits: Exits) -> String {
                     p.port
                 );
             }
-            if let (Some(ext), Some(published)) = (egress, p.published) {
-                let _ = writeln!(
-                    r,
-                    "rdr pass on {ext} inet proto {proto} to ({ext}) port {published} tag {TAG} -> {to}"
-                );
+            if let Some(published) = p.published {
+                for i in exits.published {
+                    let _ = writeln!(
+                        r,
+                        "rdr pass on {i} inet proto {proto} to ({i}) port {published} tag {TAG} -> {to}"
+                    );
+                }
             }
         }
     }
@@ -266,9 +282,11 @@ mod tests {
         dnsrr.uid = "0000000000000008".into();
         dnsrr.vip = None;
         dnsrr.ports.iter_mut().for_each(|p| p.published = None);
+        let published = ["re0".to_owned(), "wlan0".to_owned()];
         let exits = Exits {
             egress: Some("wlan0"),
             mesh: Some("wg0"),
+            published: &published,
         };
         assert_eq!(
             rules(&[web(&[], &[]), dnsrr], subnet, exits),
@@ -276,6 +294,7 @@ mod tests {
              nat pass on wlan0 inet from 10.200.0.0/24 to ! 10.200.0.0/16 -> (wlan0)\n\
              nat pass on wg0 inet from ! 10.200.0.0/16 to 10.200.0.0/16 -> (wg0)\n\
              rdr pass on legion0 inet proto tcp to 10.201.0.1 port 80 tag LSVC -> <s0000000000000007> port 8080 round-robin\n\
+             rdr pass on re0 inet proto tcp to (re0) port 30000 tag LSVC -> <s0000000000000007> port 8080 round-robin\n\
              rdr pass on wlan0 inet proto tcp to (wlan0) port 30000 tag LSVC -> <s0000000000000007> port 8080 round-robin\n\
              rdr pass on legion0 inet proto udp to 10.201.0.1 port 53 tag LSVC -> <s0000000000000007> port 5353 round-robin\n"
         );
@@ -285,6 +304,22 @@ mod tests {
             !r.contains("wlan0") && !r.contains("wg0") && r.contains("10.201.0.1 port 80"),
             "{r}"
         );
+    }
+
+    #[test]
+    fn published_on_the_nodes_own_interfaces() {
+        let all = [
+            "re0",
+            "wlan0",
+            "lo0",
+            "pflog0",
+            "legion0",
+            "lp0000000004d2",
+            "wg0",
+            "lvbr0",
+        ];
+        let on: Vec<&str> = all.into_iter().filter(|i| publishes_on(i)).collect();
+        assert_eq!(on, ["re0", "wlan0", "lvbr0"]);
     }
 
     #[test]

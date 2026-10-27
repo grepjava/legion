@@ -491,15 +491,17 @@ async fn load_balancing(
 
     let mut balancer = LoadBalancer::default();
     let mut retry = false;
+    let mut first = true;
     loop {
-        if retry {
+        // Interfaces come and go too, so look again now and then.
+        let wait = if retry { 5 } else { 30 };
+        if !first {
             tokio::select! {
                 r = endpoints.changed() => if r.is_err() { return },
-                () = tokio::time::sleep(Duration::from_secs(5)) => {}
+                () = tokio::time::sleep(Duration::from_secs(wait)) => {}
             }
-        } else if endpoints.changed().await.is_err() {
-            return;
         }
+        first = false;
         let services: Vec<Service> = endpoints
             .borrow_and_update()
             .iter()
@@ -529,9 +531,19 @@ async fn load_balancing(
                 tracing::warn!("finding the egress interface: {e}");
                 None
             });
+            let published: Vec<String> = sys
+                .interfaces(None)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("listing interfaces: {e}");
+                    Vec::new()
+                })
+                .into_iter()
+                .filter(|i| lb::publishes_on(i))
+                .collect();
             let exits = Exits {
                 egress: egress.as_deref(),
                 mesh: mesh.then_some(legion_net::mesh::INTERFACE),
+                published: &published,
             };
             let r = b.apply(sys, &services, subnet, exits);
             (b, r)
