@@ -25,11 +25,11 @@ use std::process::Command as Process;
 use std::sync::Arc;
 use std::time::Duration;
 
-use legion_agent::{Agent, AgentConfig, StoreControl};
+use legion_agent::{Agent, AgentConfig, GrpcControl};
 use legion_api::node::{NodeState, NodeStatus};
 use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
 use legion_api::{Kind, Object, ObjectKey, Spec};
-use legion_manager::{Manager, ManagerConfig, default_raft_config};
+use legion_manager::{Manager, ManagerConfig};
 use legion_podman::Podman;
 use legion_podman::service::{PodmanService, ServiceConfig};
 use legion_store::{Command, Outcome, Precondition, Store};
@@ -55,7 +55,7 @@ async fn eventually(what: &str, secs: u64, mut f: impl AsyncFnMut() -> bool) {
     }
 }
 
-fn start_agent(store: &Store, podman: &Podman) -> (oneshot::Sender<()>, JoinHandle<()>) {
+fn start_agent(manager: &str, podman: &Podman) -> (oneshot::Sender<()>, JoinHandle<()>) {
     let lab = PathBuf::from(std::env::var("LEGION_AGENT_LAB").expect("set LEGION_AGENT_LAB"));
     let mut config = AgentConfig::new("lab", lab.join("tasks"));
     config.zfs_root = std::env::var("LEGION_AGENT_ZFS_ROOT").ok();
@@ -65,7 +65,7 @@ fn start_agent(store: &Store, podman: &Podman) -> (oneshot::Sender<()>, JoinHand
         config,
         Arc::new(podman.clone()),
         Arc::new(legion_sys::Shell::new()),
-        Arc::new(StoreControl::new(store.clone())),
+        Arc::new(GrpcControl::new("lab", vec![manager.to_owned()], None).unwrap()),
     );
     let (tx, rx) = oneshot::channel();
     let status = NodeStatus {
@@ -113,30 +113,32 @@ async fn agent_runs_a_real_pod() {
     // A fresh store each run; Podman's images are kept.
     let _ = std::fs::remove_dir_all(lab.join("store"));
     std::fs::create_dir_all(lab.join("store")).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    // The test writes its task without a service, which the controllers
+    // would remove.
     let manager = Manager::open(ManagerConfig {
-        data_dir: lab.join("store"),
-        advertise: "127.0.0.1:1".into(),
-        raft: default_raft_config(),
-        tls: None,
+        controllers: false,
+        ..ManagerConfig::new(lab.join("store"), &addr)
     })
     .await
     .unwrap();
     let store = manager.store().clone();
     let id = manager.id();
-    let members: BTreeMap<_, _> = [(
-        id,
-        BasicNode {
-            addr: "127.0.0.1:1".into(),
-        },
-    )]
-    .into();
+    let members: BTreeMap<_, _> = [(id, BasicNode { addr: addr.clone() })].into();
     store.raft.initialize(members).await.unwrap();
     eventually("leader", 10, async || {
         store.raft.metrics().borrow().current_leader == Some(id)
     })
     .await;
+    let server = tokio::spawn(async move {
+        manager
+            .serve(listener, std::future::pending())
+            .await
+            .unwrap();
+    });
 
-    let (stop, agent) = start_agent(&store, &podman);
+    let (stop, agent) = start_agent(&addr, &podman);
 
     let zfs_root = std::env::var("LEGION_AGENT_ZFS_ROOT").ok();
     let mut pod: serde_json::Value = serde_json::json!({
@@ -380,7 +382,7 @@ async fn agent_runs_a_real_pod() {
     // A new agent adopts the running pod.
     stop.send(()).unwrap();
     agent.await.unwrap();
-    let (stop, agent) = start_agent(&store, &podman);
+    let (stop, agent) = start_agent(&addr, &podman);
     tokio::time::sleep(Duration::from_secs(5)).await;
     let again = podman.inspect("lab_web-1_app").await.unwrap();
     assert_eq!(again.id, app.id, "the pod was adopted, not recreated");
@@ -426,7 +428,7 @@ async fn agent_runs_a_real_pod() {
 
     stop.send(()).unwrap();
     agent.await.unwrap();
-    drop(manager);
+    server.abort();
     service.shutdown().await;
     // The bridge outlives tasks; remove it with the lab.
     let _ = Process::new("ifconfig")

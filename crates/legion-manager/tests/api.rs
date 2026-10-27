@@ -2,13 +2,16 @@
 
 use std::time::Duration;
 
+use legion_api::dispatch::{Assignment, ServiceEndpoints};
 use legion_manager::{Manager, ManagerConfig, Tls, client_config, default_raft_config};
 use legion_pki::{CERT_LIFETIME, Ca, Identity, Role};
 use legion_proto::v1::cluster_client::ClusterClient;
+use legion_proto::v1::dispatcher_client::DispatcherClient;
 use legion_proto::v1::objects_client::ObjectsClient;
 use legion_proto::v1::{
-    ApplyRequest, ApplyResult, DeleteRequest, InitRequest, JoinTokenRequest, ListRequest, Object,
-    ObjectRef, StatusRequest, WatchRequest, watch_event,
+    ApplyRequest, ApplyResult, AssignmentsRequest, DataRequest, DeleteRequest, EndpointsRequest,
+    HeartbeatRequest, InitRequest, JoinTokenRequest, ListRequest, Object, ObjectRef,
+    RegisterRequest, ReportRequest, StatusRequest, WatchRequest, watch_event,
 };
 use legion_store::Store;
 use openraft::BasicNode;
@@ -18,6 +21,9 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tonic::Code;
 use tonic::transport::{Channel, ClientTlsConfig};
+
+/// Short, so node-down detection is quick to test.
+const HEARTBEAT: Duration = Duration::from_millis(200);
 
 struct Running {
     addr: String,
@@ -82,8 +88,6 @@ impl Running {
     ) -> Running {
         let addr = listener.local_addr().unwrap().to_string();
         let manager = Manager::open(ManagerConfig {
-            data_dir: dir.path().to_owned(),
-            advertise: addr.clone(),
             raft: openraft::Config {
                 heartbeat_interval: 50,
                 election_timeout_min: 200,
@@ -91,6 +95,8 @@ impl Running {
                 ..default_raft_config()
             },
             tls,
+            heartbeat: HEARTBEAT,
+            ..ManagerConfig::new(dir.path(), &addr)
         })
         .await
         .unwrap();
@@ -638,6 +644,249 @@ async fn nodes_join_with_tokens() {
     assert_eq!(err.code(), Code::PermissionDenied);
 
     for m in [first, second, third] {
+        m.stop().await;
+    }
+}
+
+/// Applies an object given as JSON, retrying while the cluster settles.
+async fn apply_json(m: &Running, kind: &str, name: &str, spec: serde_json::Value) {
+    let objects = m.objects().await;
+    let object = Object {
+        kind: kind.into(),
+        name: name.into(),
+        spec_json: spec.to_string().into_bytes(),
+        ..Default::default()
+    };
+    eventually(|| {
+        let mut objects = objects.clone();
+        let object = object.clone();
+        async move { objects.apply(apply(object)).await }
+    })
+    .await;
+}
+
+/// The node's state as the leader's store has it.
+fn node_state(m: &Running, name: &str) -> Option<String> {
+    let key = legion_api::ObjectKey::new(legion_api::Kind::Node, "", name);
+    let node = m.store.get(&key).unwrap()?;
+    node.status["state"].as_str().map(str::to_owned)
+}
+
+async fn until(what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !f() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workers_follow_their_work_through_any_manager() {
+    let ca = Ca::generate().unwrap();
+    let first = Running::start_with(Some(&ca)).await;
+    first.cluster().await.init(InitRequest {}).await.unwrap();
+    let token = first
+        .cluster()
+        .await
+        .join_token(JoinTokenRequest {
+            role: "manager".into(),
+            rotate: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    let admin = creds(&ca, "admin", Role::Admin);
+    // The worker calls a follower, which forwards writes to the leader.
+    let follower = Running::join(&first.addr, &token, "m2", admin.clone()).await;
+    until("the follower knows the leader", || {
+        follower
+            .store
+            .raft
+            .metrics()
+            .borrow()
+            .current_leader
+            .is_some()
+    })
+    .await;
+    let w1 = creds(&ca, "w1", Role::Worker);
+    let d1 = DispatcherClient::new(follower.channel(Some(&w1)).await.unwrap());
+    let ready = br#"{"state":"ready"}"#.to_vec();
+
+    let registered = eventually(|| {
+        let mut d = d1.clone();
+        let status_json = ready.clone();
+        async move {
+            d.register(RegisterRequest {
+                node: String::new(),
+                status_json,
+            })
+            .await
+        }
+    })
+    .await
+    .into_inner();
+    assert!(registered.pod_cidr.starts_with("10.200."), "{registered:?}");
+    assert_eq!(node_state(&first, "w1").as_deref(), Some("ready"));
+
+    // A worker acts only for itself, and admins do not dispatch.
+    let err = d1
+        .clone()
+        .register(RegisterRequest {
+            node: "w2".into(),
+            status_json: ready.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied, "{err}");
+    let err = DispatcherClient::new(first.channel(Some(&admin)).await.unwrap())
+        .heartbeat(HeartbeatRequest { node: "w1".into() })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied, "{err}");
+
+    // Heartbeats keep the node up while the test runs.
+    let beating = tokio::spawn({
+        let d = d1.clone();
+        async move {
+            loop {
+                let _ = d.clone().heartbeat(HeartbeatRequest::default()).await;
+                tokio::time::sleep(HEARTBEAT / 2).await;
+            }
+        }
+    });
+
+    // A service using one of two secrets lands on the only node.
+    apply_json(
+        &first,
+        "Secret",
+        "token",
+        serde_json::json!({ "text": "s3cret" }),
+    )
+    .await;
+    apply_json(
+        &first,
+        "Secret",
+        "other",
+        serde_json::json!({ "text": "no" }),
+    )
+    .await;
+    apply_json(
+        &first,
+        "Service",
+        "web",
+        serde_json::json!({
+            "replicas": 1,
+            "pod": { "containers": [{
+                "name": "web", "image": "web:1", "secrets": [{ "name": "token" }],
+            }] },
+        }),
+    )
+    .await;
+    let mut stream = d1
+        .clone()
+        .assignments(AssignmentsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let task = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let update = stream.message().await.unwrap().expect("stream open");
+            let set: Vec<Assignment> = serde_json::from_slice(&update.assignments_json).unwrap();
+            if let Some(a) = set.into_iter().next() {
+                break a;
+            }
+        }
+    })
+    .await
+    .expect("the task reaches the worker");
+    assert_eq!(task.spec.node, "w1");
+
+    // The worker reads the secrets its tasks use, and no others.
+    let data = |name: &str| {
+        let mut d = d1.clone();
+        let req = DataRequest {
+            node: String::new(),
+            namespace: "default".into(),
+            kind: "Secret".into(),
+            name: name.into(),
+        };
+        async move { d.data(req).await }
+    };
+    let value = data("token").await.unwrap().into_inner().value;
+    assert_eq!(value.as_deref(), Some(&b"s3cret"[..]));
+    assert_eq!(
+        data("other").await.unwrap_err().code(),
+        Code::PermissionDenied
+    );
+
+    // It reports on its own task through the follower; another node cannot.
+    let report = |status: &str| ReportRequest {
+        node: String::new(),
+        namespace: task.key.namespace.clone(),
+        name: task.key.name.clone(),
+        uid: task.uid.clone(),
+        status_json: status.as_bytes().to_vec(),
+    };
+    d1.clone()
+        .report(report(r#"{"state":"running","ip":"10.200.0.9"}"#))
+        .await
+        .unwrap();
+    let key = task.key.clone();
+    until("the report reaches the leader", || {
+        first.store.get(&key).unwrap().unwrap().status["state"] == "running"
+    })
+    .await;
+    let w2 = creds(&ca, "w2", Role::Worker);
+    let err = DispatcherClient::new(first.channel(Some(&w2)).await.unwrap())
+        .report(report(r#"{"state":"failed"}"#))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied, "{err}");
+
+    // Endpoints come from the follower's replica.
+    let mut endpoints = d1
+        .clone()
+        .endpoints(EndpointsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let update = endpoints.message().await.unwrap().expect("stream open");
+            let set: Vec<ServiceEndpoints> =
+                serde_json::from_slice(&update.endpoints_json).unwrap();
+            if set.iter().any(|s| {
+                s.name == "web" && s.alive == ["10.200.0.9".parse::<std::net::Ipv4Addr>().unwrap()]
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the task's address reaches the endpoints");
+
+    // Silent for three periods, the node is down; heard from, it is up.
+    beating.abort();
+    until("w1 down", || {
+        node_state(&first, "w1").as_deref() == Some("down")
+    })
+    .await;
+    let beat = d1
+        .clone()
+        .heartbeat(HeartbeatRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(beat.period_ms, HEARTBEAT.as_millis() as u32);
+    assert_eq!(beat.managers.len(), 2, "{beat:?}");
+    until("w1 up", || {
+        node_state(&first, "w1").as_deref() == Some("ready")
+    })
+    .await;
+
+    drop((stream, endpoints));
+    for m in [first, follower] {
         m.stop().await;
     }
 }

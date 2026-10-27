@@ -64,6 +64,10 @@ enum Command {
         /// using volumes are rejected.
         #[arg(long)]
         zfs_root: Option<String>,
+        /// Workers: a manager to call, `host:port` (repeatable). Defaults to
+        /// the managers recorded at join and learned since.
+        #[arg(long = "manager")]
+        managers: Vec<String>,
     },
     /// Start a new cluster with the reached manager as its first member.
     Init,
@@ -155,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
             node_name,
             infra_image,
             zfs_root,
+            managers,
         } => {
             daemon::run(daemon::Options {
                 data_dir,
@@ -165,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
                 node_name,
                 infra_image,
                 zfs_root,
+                managers,
             })
             .await
         }

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod admit;
 pub mod data;
+pub mod dispatch;
 pub mod node;
 pub mod quantity;
 pub mod service;

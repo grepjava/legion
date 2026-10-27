@@ -166,6 +166,32 @@ impl PodSpec {
         self.init_containers.iter().chain(&self.containers)
     }
 
+    /// Every secret and config the pod's containers use.
+    pub fn data_refs(&self) -> std::collections::BTreeSet<(crate::Kind, String)> {
+        use crate::Kind;
+        let mut refs = std::collections::BTreeSet::new();
+        for c in self.containers() {
+            refs.extend(c.secrets.iter().map(|f| (Kind::Secret, f.name.clone())));
+            refs.extend(c.configs.iter().map(|f| (Kind::Config, f.name.clone())));
+            for e in &c.env {
+                if let Some(n) = &e.secret {
+                    refs.insert((Kind::Secret, n.clone()));
+                }
+                if let Some(n) = &e.config {
+                    refs.insert((Kind::Config, n.clone()));
+                }
+            }
+        }
+        refs
+    }
+
+    /// Whether the pod mounts the `Volume` object `name`.
+    pub fn uses_volume(&self, name: &str) -> bool {
+        self.volumes
+            .iter()
+            .any(|v| v.volume.as_ref().is_some_and(|s| s.name == name))
+    }
+
     /// Resolves a port reference against the pod's container ports.
     pub fn resolve_port(&self, port: &PortRef) -> Option<u16> {
         match port {
@@ -1141,4 +1167,8 @@ pub struct ServiceStatus {
     /// Every published port, those Legion picked included.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub published_ports: Vec<PublishedPort>,
+    /// The number of the newest task of each slot (replica number or
+    /// node), so a deleted task's name is never given to another.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub last_tasks: BTreeMap<String, u64>,
 }

@@ -148,7 +148,8 @@ Nothing left in phase 1.
 Decided: in phase 1 the agent runs in the same process as the manager and
 reads its assignments from the store directly, through a narrow interface
 that the phase 2 dispatcher stream replaces. This keeps phase 1 to one node
-and builds the manager–agent protocol once, when it is needed.
+and builds the manager–agent protocol once, when it is needed. The
+dispatcher replaced it in phase 2.
 
 ## Phase 2 — Cluster (MVP)
 
@@ -189,19 +190,40 @@ end.
   managers join and vote, a worker gets a worker certificate without the CA
   key, bad, rotated and foreign tokens fail, the tokens stay out of the
   API; and through the CLI, a second daemon joins and serves.
+- **Dispatcher** (`legion-manager::dispatcher`, `legion_agent::GrpcControl`,
+  `proto/legion/v1/dispatcher.proto`): the agent's `Control` is a gRPC
+  client of any manager, which streams the node's assignments and every
+  service's endpoints from its replica (complete sets, sent again after
+  each change) and serves the secrets and configs the node's tasks use;
+  registration, status reports, volume claims and heartbeats go to the
+  leader, forwarded by followers. A worker acts only as itself (its
+  certificate's name); a manager names the node it acts for. The leader
+  marks a node `down` after three silent heartbeat periods (5 s) and
+  `ready` when it hears from it again; a new leader allows three periods
+  from taking over. The agent fails over to the next manager when one
+  fails and learns the managers from heartbeat replies. `legion daemon` on
+  a node that joined as a worker runs only the agent, calling the managers
+  recorded at join (or `--manager`), and saves the list it learned on exit;
+  a manager node's own agent calls its manager over mTLS too. Task names
+  are never reused now (a deleted task's number stays taken, in
+  `ServiceStatus.lastTasks`), which the exit test caught once the old
+  pod's name came back. Tested: through a follower, a worker registers,
+  receives its task and the endpoints, reads only its tasks' secrets,
+  reports only on its tasks, goes `down` when silent and `ready` again;
+  the agent tests and the exit test (FreeBSD) run through the dispatcher.
 
 ### To do, in order
 
-1. **Dispatcher**: the agent's `Control` over a gRPC stream from any
-   manager (assignments, endpoints, secrets for its tasks only, status
-   reports, heartbeats); node down detection.
-2. **WireGuard mesh and routed pod network**: per-node keys, peers from
+1. **WireGuard mesh and routed pod network**: per-node keys, peers from
    the store, routes to other nodes' pod subnets; pf rules for remote
    backends (§5.4).
-3. **Scheduling and failure handling across nodes**: taints, tasks of a
+2. **Scheduling and failure handling across nodes**: taints, tasks of a
    lost node rescheduled, the routing mesh on every node.
-4. **Rollback and compose `stack deploy`**.
-5. **Exit test**.
+3. **Rollback and compose `stack deploy`**.
+4. **Exit test**.
+
+Smaller follow-ups: workers renew their certificates through managers;
+`--listen` still defaults to loopback.
 
 ## Later phases
 

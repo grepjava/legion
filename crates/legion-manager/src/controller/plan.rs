@@ -125,6 +125,16 @@ enum Slot {
     Node(String),
 }
 
+impl Slot {
+    /// How the slot appears in task names and in the service's status.
+    fn key(&self) -> String {
+        match self {
+            Slot::Replica(r) => r.to_string(),
+            Slot::Node(node) => node.clone(),
+        }
+    }
+}
+
 pub fn plan(
     services: &[Service],
     tasks: &[Task],
@@ -298,13 +308,12 @@ fn service(
     created: &mut Vec<Task>,
 ) {
     let generation = s.object.metadata.generation;
+    let previous: ServiceStatus =
+        serde_json::from_value(s.object.status.clone()).unwrap_or_default();
+    let mut last_tasks = BTreeMap::new();
     let mut by_slot: BTreeMap<Slot, Vec<&Task>> = BTreeMap::new();
     for t in tasks {
-        let slot = match t.spec.slot {
-            Some(n) => Slot::Replica(n),
-            None => Slot::Node(t.spec.node.clone()),
-        };
-        by_slot.entry(slot).or_default().push(t);
+        by_slot.entry(slot_of(t)).or_default().push(t);
     }
     for list in by_slot.values_mut() {
         // Uids are Raft indexes in hex: creation order.
@@ -402,7 +411,9 @@ fn service(
                             plan.actions.push(stop(old));
                         }
                     }
-                    UpdateOrder::StartFirst => created.push(new_task(s, slot, list)),
+                    UpdateOrder::StartFirst => {
+                        created.push(new_task(s, slot, list, &previous.last_tasks))
+                    }
                 }
             }
         } else if list.iter().any(|t| t.stopping()) {
@@ -424,11 +435,23 @@ fn service(
                     backoff(last, failures, policy.delay.as_std(), memory, now)
                 });
                 if due <= now {
-                    created.push(new_task(s, slot, list));
+                    created.push(new_task(s, slot, list, &previous.last_tasks));
                 } else {
                     plan.wake_at(due);
                 }
             }
+        }
+
+        // The slot's newest number, counting the task just created.
+        let newest = created
+            .iter()
+            .filter(|t| t.spec.service_uid == s.object.metadata.uid && slot_of(t) == *slot)
+            .chain(list.iter().copied())
+            .filter_map(|t| task_number(&t.object.metadata.name))
+            .chain(previous.last_tasks.get(&slot.key()).copied())
+            .max();
+        if let Some(n) = newest {
+            last_tasks.insert(slot.key(), n);
         }
 
         // History: keep the newest terminal tasks of the slot.
@@ -453,6 +476,7 @@ fn service(
         ready: running.iter().filter(|t| t.status.ready).count() as u32,
         virtual_ip: addrs.vip.map(|ip| ip.to_string()),
         published_ports: addrs.published,
+        last_tasks,
     };
     let status = serde_json::to_value(&status).expect("status serialises");
     if s.object.status != status {
@@ -483,21 +507,27 @@ fn backoff(
     memory.failed_at.get(last.uid()).copied().unwrap_or(now) + wait
 }
 
+/// The `n` of a task named `<service>-<slot>-<n>`.
+fn task_number(name: &str) -> Option<u64> {
+    name.rsplit('-').next()?.parse().ok()
+}
+
+fn slot_of(t: &Task) -> Slot {
+    match t.spec.slot {
+        Some(n) => Slot::Replica(n),
+        None => Slot::Node(t.spec.node.clone()),
+    }
+}
+
 /// A new task for `slot`, named `<service>-<slot>-<n>` with `n` counting up
-/// within the slot.
-fn new_task(s: &Service, slot: &Slot, history: &[&Task]) -> Task {
+/// within the slot, past every task it has had (`last`, from the service's
+/// status, remembers deleted ones).
+fn new_task(s: &Service, slot: &Slot, history: &[&Task], last: &BTreeMap<String, u64>) -> Task {
     let svc = &s.object.metadata.name;
     let n = history
         .iter()
-        .filter_map(|t| {
-            t.object
-                .metadata
-                .name
-                .rsplit('-')
-                .next()?
-                .parse::<u64>()
-                .ok()
-        })
+        .filter_map(|t| task_number(&t.object.metadata.name))
+        .chain(last.get(&slot.key()).copied())
         .max()
         .unwrap_or(0)
         + 1;

@@ -4,7 +4,8 @@
 //! cluster CA, this manager's certificate and `<data dir>/admin.pem`, the
 //! CLI's credentials. `legion join` writes the cluster's CA and the node's
 //! certificate instead, with the CA key only for managers. Managers reissue
-//! their own certificate once two thirds of its life are gone.
+//! their own certificate once two thirds of its life are gone; workers
+//! cannot renew theirs yet.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -58,12 +59,39 @@ impl Pki {
         write_public(&self.path("role"), &format!("{}\n", joined.role))
     }
 
+    /// A worker's name, from its certificate, and its credentials for
+    /// calling managers.
+    pub fn worker(&self) -> anyhow::Result<(String, tonic::transport::ClientTlsConfig)> {
+        let missing = || format!("{} holds no worker certificate", self.dir.display());
+        let bundle = Bundle {
+            cert_pem: read(&self.path("node.crt"))?.with_context(missing)?,
+            key_pem: read(&self.path("node.key"))?.with_context(missing)?,
+            ca_pem: read(&self.path("ca.crt"))?.with_context(missing)?,
+        };
+        let id = bundle
+            .identity()
+            .context("reading the worker certificate")?;
+        if id.role != Role::Worker {
+            anyhow::bail!(
+                "{} certifies {id}, not a worker",
+                self.path("node.crt").display()
+            );
+        }
+        if legion_pki::needs_renewal(&bundle.cert_pem, SystemTime::now()) {
+            tracing::warn!(
+                "this worker's certificate is past two thirds of its life; join again before it expires"
+            );
+        }
+        let tls = legion_manager::client_config(&bundle.ca_pem, &bundle.cert_pem, &bundle.key_pem);
+        Ok((id.name, tls))
+    }
+
     /// The CA, this manager's credentials and the admin bundle, made or
     /// renewed as needed.
     pub fn ensure(&self, node: &str, data_dir: &Path) -> anyhow::Result<legion_manager::Tls> {
         private_dir(&self.dir)?;
         if self.role()? != Role::Manager {
-            anyhow::bail!("this node joined as a worker; worker mode arrives with the dispatcher");
+            anyhow::bail!("this node joined as a worker and holds no manager credentials");
         }
         let ca = match (read(&self.path("ca.crt"))?, read(&self.path("ca.key"))?) {
             (Some(cert), Some(key)) => Ca::load(&cert, &key).context("loading the cluster CA")?,
@@ -119,6 +147,26 @@ impl Pki {
         })
     }
 }
+
+/// The managers a worker calls, one `host:port` per line of
+/// `<data dir>/managers`.
+pub fn read_managers(data_dir: &Path) -> anyhow::Result<Vec<String>> {
+    Ok(read(&data_dir.join(MANAGERS))?
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+pub fn write_managers(data_dir: &Path, managers: &[String]) -> anyhow::Result<()> {
+    let mut text = managers.join("\n");
+    text.push('\n');
+    write_public(&data_dir.join(MANAGERS), &text)
+}
+
+const MANAGERS: &str = "managers";
 
 /// Whether a certificate names `id`.
 fn issued_as(cert_pem: &str, id: &Identity) -> bool {

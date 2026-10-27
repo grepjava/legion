@@ -1123,6 +1123,7 @@ dependencies = [
  "legion-store",
  "legion-sys",
  "openraft",
+ "serde",
  "serde_json",
  "serde_yaml_ng",
  "tempfile",
@@ -1152,9 +1153,11 @@ name = "legion-manager"
 version = "0.1.0"
 dependencies = [
  "legion-api",
+ "legion-net",
  "legion-pki",
  "legion-proto",
  "legion-store",
+ "legion-sys",
  "openraft",
  "serde",
  "serde_json",

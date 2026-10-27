@@ -31,8 +31,8 @@ mod task;
 mod volumes;
 
 pub use control::{
-    Assignment, Assignments, Control, ControlError, EndpointPort, Endpoints, Registration,
-    ServiceEndpoints, StoreControl, VolumeClaim,
+    Assignment, Assignments, Control, ControlError, EndpointPort, Endpoints, GrpcControl,
+    Registration, ServiceEndpoints, VolumeClaim,
 };
 pub use runtime::Runtime;
 
@@ -120,6 +120,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             r = register(&ctx, &status) => r,
             _ = &mut shutdown => return,
         };
+        let heartbeats = tokio::spawn(heartbeats(ctx.control.clone(), ctx.node.clone()));
         let net = legion_net::PodNetwork::new(registration.pod_cidr);
         tracing::info!(subnet = %net.subnet, "pod network");
         let bridge = net.clone();
@@ -139,9 +140,13 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         tokio::select! {
             loaded = assignments.changed() => if loaded.is_err() {
                 tracing::warn!("assignments ended");
+                heartbeats.abort();
                 return;
             },
-            _ = &mut shutdown => return,
+            _ = &mut shutdown => {
+                heartbeats.abort();
+                return;
+            }
         }
         // Addresses held by tasks that may still run, so new pods do not
         // take them.
@@ -214,6 +219,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
 
         // Dropping the senders ends each worker without touching its pod.
         forwarder.abort();
+        heartbeats.abort();
         if let Some(dns) = dns {
             dns.abort();
         }
@@ -371,6 +377,34 @@ async fn load_balancing(
                 true
             }
         };
+    }
+}
+
+/// Sends heartbeats for `node` as often as the managers ask, for as long
+/// as the agent runs.
+async fn heartbeats<C: Control>(control: Arc<C>, node: String) {
+    let mut period = Duration::from_secs(1);
+    let mut failing = false;
+    loop {
+        match control.heartbeat(&node).await {
+            Ok(p) => {
+                if failing {
+                    tracing::info!("heartbeats reach the managers again");
+                    failing = false;
+                }
+                period = p;
+            }
+            Err(e) => {
+                if !failing {
+                    tracing::warn!("heartbeat: {e}");
+                    failing = true;
+                }
+                // Another manager may answer sooner.
+                tokio::time::sleep(period.min(Duration::from_secs(1))).await;
+                continue;
+            }
+        }
+        tokio::time::sleep(period).await;
     }
 }
 

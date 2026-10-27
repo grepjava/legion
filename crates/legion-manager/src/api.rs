@@ -64,7 +64,7 @@ fn check_namespace(namespace: &str) -> Result<(), Status> {
 
 impl ApiService {
     /// The leader's address, or `None` if this manager leads.
-    fn leader_addr<T>(&self, req: &Request<T>) -> Result<Option<String>, Status> {
+    pub(crate) fn leader_addr<T>(&self, req: &Request<T>) -> Result<Option<String>, Status> {
         match self.route(req)? {
             Route::Local => Ok(None),
             Route::Leader(_) => {
@@ -145,7 +145,7 @@ impl ApiService {
             .map_err(|e| Status::unavailable(e.to_string()))
     }
 
-    async fn write(&self, cmd: Command) -> Result<Outcome, Status> {
+    pub(crate) async fn write(&self, cmd: Command) -> Result<Outcome, Status> {
         match self.store.raft.client_write(cmd).await {
             Ok(resp) => Ok(resp.data),
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ForwardToLeader {
@@ -278,7 +278,7 @@ fn conflict(key: &ObjectKey, current: Option<&Object>) -> Status {
     }
 }
 
-fn forwarded<T>(inner: T) -> Request<T> {
+pub(crate) fn forwarded<T>(inner: T) -> Request<T> {
     let mut req = Request::new(inner);
     req.metadata_mut()
         .insert(FORWARDED, tonic::metadata::MetadataValue::from_static("1"));

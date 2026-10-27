@@ -72,8 +72,8 @@ One binary, `legion`, with two roles:
 
 - `legion daemon` runs on every node as an rc.d service (`legion_enable="YES"`).
   It always runs the **agent**. On manager nodes it also runs the **manager**.
-  In phase 1 (single node) the agent reads its assignments from the local
-  store instead of a dispatcher stream; the stream arrives with phase 2.
+  The agent follows its work through the dispatcher in either case, on a
+  manager node through its own manager first.
 - `legion <command>` is the CLI. It talks gRPC over mTLS to any manager.
 
 ```
@@ -101,7 +101,7 @@ One binary, `legion`, with two roles:
 | **Controllers** | Run on the leader only. Each watches the store and writes desired changes back. See 3.3. |
 | **Scheduler** | Assigns pending tasks to nodes: filter, then score. See 3.5. |
 | **Allocator** | Assigns task IPs, service VIPs, published ports, node pod subnets. |
-| **Dispatcher** | Leader-only. Holds one stream per agent: sends assignments (tasks, secrets, configs, network peers, endpoints), receives status and heartbeats. Followers redirect agents to the leader. |
+| **Dispatcher** | On every manager. Streams each agent its node's assignments and every service's endpoints from the local replica, and serves the secrets, configs and volume claims of the node's own tasks; status reports, registration and heartbeats are forwarded to the leader, which alone tracks liveness. Agents fail over between managers and learn the manager list from heartbeat replies. |
 | **CA** | Issues and rotates node and user certificates. Root key stored in Raft, optionally sealed with an autolock key. |
 
 ### 3.3 Controllers
@@ -112,7 +112,7 @@ One binary, `legion`, with two roles:
 | Stateful | Service (`mode: stateful`) | Tasks with stable ordinals and per-ordinal volumes; ordered start and stop. |
 | Update | Service spec generation | Rolling replacement honouring parallelism, delay, failure action, `maxUnavailable`; automatic rollback. |
 | Job / CronJob | Job, CronJob | Run-to-completion tasks; CronJob creates Jobs on schedule with concurrency policy and history limit. |
-| Node health | Heartbeats | Marks nodes `down` after missed heartbeats; marks their tasks orphaned so the Service controller replaces them. |
+| Node health | Heartbeats | Marks nodes `down` after three missed heartbeats (5 s each; a new leader allows three from taking over) and `ready` when heard from again; marks their tasks orphaned so the Service controller replaces them. |
 | Endpoints | Task readiness | Per-service list of ready task IPs, pushed to every agent for load balancing and DNS. |
 | Autoscaler (phase 4) | Task metrics | Adjusts replicas between min and max to hit a CPU or memory target. |
 | Cert rotation | Node certs | Renews certificates before expiry; rotates root CA on demand. |

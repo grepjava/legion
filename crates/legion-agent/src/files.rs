@@ -13,7 +13,7 @@
 //! The same tmpfs holds the pod's `resolv.conf`, mounted at
 //! `/etc/resolv.conf` in every container that does not mount its own.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use legion_api::Kind;
@@ -57,24 +57,6 @@ fn dir_name(kind: Kind) -> &'static str {
     }
 }
 
-/// Every secret and config the pod's containers use.
-fn references(pod: &PodSpec) -> BTreeSet<(Kind, String)> {
-    let mut refs = BTreeSet::new();
-    for c in pod.containers() {
-        refs.extend(c.secrets.iter().map(|f| (Kind::Secret, f.name.clone())));
-        refs.extend(c.configs.iter().map(|f| (Kind::Config, f.name.clone())));
-        for e in &c.env {
-            if let Some(n) = &e.secret {
-                refs.insert((Kind::Secret, n.clone()));
-            }
-            if let Some(n) = &e.config {
-                refs.insert((Kind::Config, n.clone()));
-            }
-        }
-    }
-    refs
-}
-
 fn wants_files(pod: &PodSpec) -> bool {
     pod.containers()
         .any(|c| !c.secrets.is_empty() || !c.configs.is_empty())
@@ -93,7 +75,7 @@ pub(crate) async fn prepare<C: Control>(
 ) -> Result<Files, String> {
     let pod = &a.spec.pod;
     let mut values = BTreeMap::new();
-    for (kind, name) in references(pod) {
+    for (kind, name) in pod.data_refs() {
         let what = kind.as_str().to_lowercase();
         match control.data(&a.key.namespace, kind, &name).await {
             Ok(Some(v)) => {

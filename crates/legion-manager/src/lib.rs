@@ -1,13 +1,15 @@
 //! The Legion manager (DESIGN.md §3.2): the replicated store, the public API
 //! and the Raft transport, served together on one gRPC port, and the
-//! controllers, which run while this manager leads.
+//! controllers, which run while this manager leads, and the dispatcher,
+//! which agents follow their work through.
 //!
 //! With [`Tls`], every connection is mutual TLS with certificates from the
-//! cluster CA: the API takes admins and managers, the Raft transport only
-//! managers. Without it (tests only) everything is plaintext.
+//! cluster CA: the API takes admins and managers, the dispatcher workers and
+//! managers, the Raft transport only managers. Without it (tests only) everything is plaintext.
 
 mod api;
 pub mod controller;
+mod dispatcher;
 pub mod join;
 mod raft_net;
 mod tls;
@@ -22,6 +24,7 @@ use legion_store::{NodeId, Store};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 
+pub use dispatcher::HEARTBEAT_PERIOD;
 pub use join::{Joined, SYSTEM_NAMESPACE, join};
 pub use raft_net::{GrpcNetwork, MAX_MESSAGE};
 pub use tls::{Tls, client_config};
@@ -37,6 +40,27 @@ pub struct ManagerConfig {
     pub raft: openraft::Config,
     /// `None` serves and calls plaintext: for tests.
     pub tls: Option<Tls>,
+    /// How often agents send heartbeats; a node silent for three periods is
+    /// down. [`HEARTBEAT_PERIOD`] unless testing.
+    pub heartbeat: std::time::Duration,
+    /// Whether to run the controllers while leading; off only in tests that
+    /// write tasks themselves.
+    pub controllers: bool,
+}
+
+impl ManagerConfig {
+    /// Defaults for everything but where the manager keeps its data and is
+    /// reached; plaintext until `tls` is set.
+    pub fn new(data_dir: impl Into<PathBuf>, advertise: impl Into<String>) -> ManagerConfig {
+        ManagerConfig {
+            data_dir: data_dir.into(),
+            advertise: advertise.into(),
+            raft: default_raft_config(),
+            tls: None,
+            heartbeat: HEARTBEAT_PERIOD,
+            controllers: true,
+        }
+    }
 }
 
 /// Raft timing for managers on a LAN. Snapshot chunks stay well under the
@@ -58,6 +82,8 @@ pub struct Manager {
     advertise: String,
     store: Store,
     tls: Option<Tls>,
+    heartbeat: std::time::Duration,
+    controllers: bool,
 }
 
 impl Manager {
@@ -74,6 +100,8 @@ impl Manager {
             advertise: config.advertise,
             store,
             tls: config.tls,
+            heartbeat: config.heartbeat,
+            controllers: config.controllers,
         })
     }
 
@@ -93,11 +121,13 @@ impl Manager {
         shutdown: impl Future<Output = ()> + Send,
     ) -> Result<(), Error> {
         let (closing_tx, closing) = tokio::sync::watch::channel(false);
-        let controllers = tokio::spawn(controller::run(
-            self.store.clone(),
-            self.id,
-            closing.clone(),
-        ));
+        let controllers = self.controllers.then(|| {
+            tokio::spawn(controller::run(
+                self.store.clone(),
+                self.id,
+                closing.clone(),
+            ))
+        });
         let issuer = match self
             .tls
             .as_ref()
@@ -121,6 +151,8 @@ impl Manager {
             peer_tls: self.tls.as_ref().map(Tls::client),
             issuer,
         };
+        let (dispatcher, dispatching) =
+            dispatcher::DispatcherService::start(api.clone(), self.tls.is_some(), self.heartbeat);
         let raft = raft_net::RaftService {
             raft: self.store.raft.clone(),
         };
@@ -132,6 +164,7 @@ impl Manager {
         // Managers forward writes to the leader as themselves.
         const API: &[Role] = &[Role::Admin, Role::Manager];
         const RAFT: &[Role] = &[Role::Manager];
+        const DISPATCHER: &[Role] = &[Role::Worker, Role::Manager];
         server
             .add_service(tonic::service::interceptor::InterceptedService::new(
                 ObjectsServer::new(api.clone())
@@ -142,6 +175,12 @@ impl Manager {
             .add_service(tonic::service::interceptor::InterceptedService::new(
                 ClusterServer::new(api.clone()),
                 tls::only(API, on),
+            ))
+            .add_service(tonic::service::interceptor::InterceptedService::new(
+                legion_proto::v1::dispatcher_server::DispatcherServer::new(dispatcher)
+                    .max_decoding_message_size(MAX_MESSAGE)
+                    .max_encoding_message_size(MAX_MESSAGE),
+                tls::only(DISPATCHER, on),
             ))
             .add_service(legion_proto::v1::join_server::JoinServer::new(
                 join::JoinService { api },
@@ -162,8 +201,11 @@ impl Manager {
             .await?;
         // The controllers hold a store handle; they stop on `closing`.
         let _ = closing_tx.send(true);
-        let _ = controllers.await;
+        if let Some(controllers) = controllers {
+            let _ = controllers.await;
+        }
         let _ = promote.await;
+        let _ = dispatching.await;
         tracing::info!("API stopped; shutting down the store");
         self.store.shutdown().await?;
         Ok(())

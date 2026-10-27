@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use legion_agent::fake::FakeRuntime;
-use legion_agent::{Agent, AgentConfig, EndpointPort, ServiceEndpoints, StoreControl};
+use legion_agent::{Agent, AgentConfig, EndpointPort, GrpcControl, ServiceEndpoints};
 use legion_api::node::{NodeState, NodeStatus};
 use legion_api::{Kind, Object};
-use legion_manager::{Manager, ManagerConfig, default_raft_config};
+use legion_manager::{Manager, ManagerConfig};
 use legion_proto::v1::cluster_client::ClusterClient;
 use legion_proto::v1::objects_client::ObjectsClient;
 use legion_proto::v1::{ApplyRequest, DeleteRequest, InitRequest, ListRequest, ObjectRef};
@@ -34,14 +34,9 @@ impl Cluster {
         let dir = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let manager = Manager::open(ManagerConfig {
-            data_dir: dir.path().to_owned(),
-            advertise: addr.clone(),
-            raft: default_raft_config(),
-            tls: None,
-        })
-        .await
-        .unwrap();
+        let manager = Manager::open(ManagerConfig::new(dir.path(), &addr))
+            .await
+            .unwrap();
 
         let sys = Arc::new(FakeSys::new());
         sys.set_default_interface("re0");
@@ -50,14 +45,14 @@ impl Cluster {
         let mut config = AgentConfig::new("n1", dir.path().join("tasks"));
         config.infra_image = INFRA.into();
         config.resync = Duration::from_millis(100);
+        let control = GrpcControl::new("n1", vec![addr.clone()], None).unwrap();
+        let endpoints = legion_agent::Control::endpoints(&control);
         let agent = Agent::new(
             config,
             rt.clone(),
             sys.clone() as Arc<dyn Sys>,
-            Arc::new(StoreControl::new(manager.store().clone())),
+            Arc::new(control),
         );
-        let endpoints =
-            legion_agent::Control::endpoints(&StoreControl::new(manager.store().clone()));
         let (agent_stop, agent_stopped) = oneshot::channel::<()>();
         let agent = tokio::spawn(agent.run(
             NodeStatus {

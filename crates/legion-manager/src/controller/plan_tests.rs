@@ -339,6 +339,25 @@ fn failed_tasks_are_replaced_after_a_backoff() {
 }
 
 #[test]
+fn deleted_tasks_leave_their_names_unused() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.service(
+        "web",
+        &format!(
+            "replicas: 1
+{POD}"
+        ),
+    );
+    w.settle();
+    // An operator deletes the slot's only task.
+    w.tasks.retain(|t| t.object.metadata.name != "web-1-1");
+    w.settle();
+    assert_eq!(w.tasks(), ["web-1-2 running n1"]);
+    assert_eq!(w.status("web").last_tasks["1"], 2);
+}
+
+#[test]
 fn history_is_bounded() {
     let mut w = World::new();
     w.node("n1", &[]);

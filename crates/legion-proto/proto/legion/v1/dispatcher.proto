@@ -1,0 +1,108 @@
+// The dispatcher (DESIGN.md §3.4): how agents follow and report the work
+// assigned to their node. Every manager serves it; writes and heartbeats go
+// to the leader, which a follower forwards them to.
+//
+// A worker calls as itself: `node` is empty or its certificate's name. A
+// manager calls for its own agent or forwards for another node, so `node`
+// names the node it acts for.
+syntax = "proto3";
+
+package legion.v1;
+
+service Dispatcher {
+  // Creates the node's Node object or updates its status; returns the pod
+  // subnet it holds.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  // The tasks assigned to the node: the complete set first, and again after
+  // every change.
+  rpc Assignments(AssignmentsRequest) returns (stream AssignmentsUpdate);
+  // Every service's endpoints: the complete set first, and again after
+  // every change.
+  rpc Endpoints(EndpointsRequest) returns (stream EndpointsUpdate);
+  // A task's status, from the node it is assigned to.
+  rpc Report(ReportRequest) returns (ReportResponse);
+  // Binds a volume one of the node's tasks uses to the node.
+  rpc ClaimVolume(ClaimVolumeRequest) returns (ClaimVolumeResponse);
+  // A secret or config one of the node's tasks uses.
+  rpc Data(DataRequest) returns (DataResponse);
+  // Tells the leader the node is alive. A node silent for three periods is
+  // marked down.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+message RegisterRequest {
+  string node = 1;
+  // NodeStatus as JSON; the manager assigns pod_cidr.
+  bytes status_json = 2;
+}
+
+message RegisterResponse {
+  string pod_cidr = 1;
+}
+
+message AssignmentsRequest {
+  string node = 1;
+}
+
+message AssignmentsUpdate {
+  // A JSON array of assignments.
+  bytes assignments_json = 1;
+}
+
+message EndpointsRequest {
+  string node = 1;
+}
+
+message EndpointsUpdate {
+  // A JSON array of service endpoints.
+  bytes endpoints_json = 1;
+}
+
+message ReportRequest {
+  string node = 1;
+  string namespace = 2;
+  string name = 3;
+  // The run the status is for; a report for another run is ignored.
+  string uid = 4;
+  // TaskStatus as JSON.
+  bytes status_json = 5;
+}
+
+message ReportResponse {}
+
+message ClaimVolumeRequest {
+  string node = 1;
+  string namespace = 2;
+  string name = 3;
+  // The node's dataset for it.
+  string dataset = 4;
+}
+
+message ClaimVolumeResponse {
+  // VolumeClaim as JSON.
+  bytes claim_json = 1;
+}
+
+message DataRequest {
+  string node = 1;
+  string namespace = 2;
+  // "Secret" or "Config".
+  string kind = 3;
+  string name = 4;
+}
+
+message DataResponse {
+  // Unset when the object does not exist.
+  optional bytes value = 1;
+}
+
+message HeartbeatRequest {
+  string node = 1;
+}
+
+message HeartbeatResponse {
+  // How often to send heartbeats.
+  uint32 period_ms = 1;
+  // Every manager's address, for reaching another when this one fails.
+  repeated string managers = 2;
+}

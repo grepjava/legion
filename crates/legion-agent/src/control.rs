@@ -1,25 +1,27 @@
 //! The agent's view of the manager: register the node, follow the tasks
 //! assigned to it, report their status.
 //!
-//! In phase 1 the agent runs in the manager's process and [`StoreControl`]
-//! reads and writes the local store. Phase 2 replaces it with the
-//! dispatcher stream; the agent is written against [`Control`] only.
+//! The agent is written against [`Control`]; [`GrpcControl`] implements it
+//! over the managers' dispatcher.
 
-use std::collections::BTreeMap;
 use std::future::Future;
-use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use legion_api::data::DataSpec;
-use legion_api::node::{NodeSpec, NodeStatus};
-use legion_api::service::{PortRef, Protocol, ServiceSpec, ServiceStatus};
-use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
-use legion_api::volume::{VolumeSpec, VolumeStatus};
-use legion_api::{Kind, Object, ObjectKey};
-use legion_store::{Command, Event, Outcome, Precondition, Store, WatchError};
+pub use legion_api::dispatch::{
+    Assignment, Assignments, EndpointPort, Endpoints, ServiceEndpoints, VolumeClaim,
+};
+use legion_api::node::NodeStatus;
+use legion_api::task::TaskStatus;
+use legion_api::{Kind, ObjectKey};
+use legion_proto::v1::dispatcher_client::DispatcherClient;
+use legion_proto::v1::{
+    AssignmentsRequest, ClaimVolumeRequest, DataRequest, EndpointsRequest, HeartbeatRequest,
+    RegisterRequest, ReportRequest,
+};
 use legion_sys::Ipv4Net;
-use openraft::error::{ClientWriteError, RaftError};
 use tokio::sync::watch;
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
@@ -31,64 +33,12 @@ pub enum ControlError {
     Other(String),
 }
 
-/// A task assigned to this node.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Assignment {
-    pub key: ObjectKey,
-    /// Identifies this run; a task recreated under the same name gets a new
-    /// uid.
-    pub uid: String,
-    pub spec: TaskSpec,
-    pub status: TaskStatus,
-}
-
 /// What the manager gives a node when it registers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registration {
     /// The node's pod subnet.
     pub pod_cidr: Ipv4Net,
 }
-
-/// The outcome of [`Control::claim_volume`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VolumeClaim {
-    /// The volume is this node's now, or was already.
-    Claimed(VolumeSpec),
-    Missing,
-    /// Another node holds the volume's data.
-    Elsewhere(String),
-}
-
-/// A service's addresses, for DNS and, later, load balancing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServiceEndpoints {
-    pub namespace: String,
-    pub name: String,
-    pub uid: String,
-    pub vip: Option<Ipv4Addr>,
-    pub ports: Vec<EndpointPort>,
-    /// Addresses of the service's ready tasks, in order.
-    pub ready: Vec<Ipv4Addr>,
-    /// Addresses of its running tasks, ready or not, in order.
-    pub alive: Vec<Ipv4Addr>,
-}
-
-/// A service port, resolved against the pod.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EndpointPort {
-    pub protocol: Protocol,
-    pub port: u16,
-    /// The tasks' port.
-    pub target: u16,
-    /// Where it is published, if it is.
-    pub published: Option<u16>,
-}
-
-/// Every service in the cluster, by namespace and name.
-pub type Endpoints = Vec<ServiceEndpoints>;
-
-/// Every task assigned to the node, by uid.
-pub type Assignments = BTreeMap<String, Assignment>;
 
 pub trait Control: Send + Sync + 'static {
     /// Creates the node's `Node` object, or updates its status, keeping the
@@ -134,133 +84,309 @@ pub trait Control: Send + Sync + 'static {
         kind: Kind,
         name: &str,
     ) -> impl Future<Output = Result<Option<Vec<u8>>, ControlError>> + Send;
+
+    /// Tells the managers `node` is alive; returns how long to wait before
+    /// the next heartbeat.
+    fn heartbeat(&self, node: &str) -> impl Future<Output = Result<Duration, ControlError>> + Send;
 }
 
-/// [`Control`] over the local store.
+/// How long a call to a manager may take before the agent tries another.
+const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Largest dispatcher message, matching the managers' limit.
+const MAX_MESSAGE: usize = 64 * 1024 * 1024;
+
+/// [`Control`] over the managers' dispatcher. Calls go to one manager at a
+/// time; when it fails, the next one in the list takes over. Heartbeat
+/// responses keep the list current.
 #[derive(Clone)]
-pub struct StoreControl {
-    store: Store,
+pub struct GrpcControl {
+    node: String,
+    tls: Option<ClientTlsConfig>,
+    conn: Arc<Mutex<Conn>>,
 }
 
-/// Attempts at a read-modify-write that keeps losing to other writers.
-const ATTEMPTS: usize = 5;
+struct Conn {
+    managers: Vec<String>,
+    at: usize,
+    /// Bumped on every switch, so concurrent failures switch only once.
+    generation: u64,
+    channel: Channel,
+}
 
-impl StoreControl {
-    pub fn new(store: Store) -> Self {
-        StoreControl { store }
+impl GrpcControl {
+    /// Calls `managers` (`host:port`) for `node`, with mutual TLS when
+    /// `tls` is given.
+    pub fn new(
+        node: &str,
+        managers: Vec<String>,
+        tls: Option<ClientTlsConfig>,
+    ) -> Result<GrpcControl, ControlError> {
+        if managers.is_empty() {
+            return Err(ControlError::Other("no manager address".into()));
+        }
+        let channel = connect(&managers[0], tls.as_ref())?;
+        Ok(GrpcControl {
+            node: node.to_owned(),
+            tls,
+            conn: Arc::new(Mutex::new(Conn {
+                managers,
+                at: 0,
+                generation: 0,
+                channel,
+            })),
+        })
     }
 
-    async fn write(
-        &self,
-        object: Object,
-        precondition: Precondition,
-    ) -> Result<Outcome, ControlError> {
-        match self
-            .store
-            .raft
-            .client_write(Command::Put {
-                object,
-                precondition,
-            })
-            .await
-        {
-            Ok(resp) => Ok(resp.data),
-            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => Err(
-                ControlError::Unavailable(format!("not the leader (leader: {:?})", f.leader_id)),
-            ),
-            Err(e) => Err(ControlError::Unavailable(e.to_string())),
+    /// The managers, starting with the one in use.
+    pub fn managers(&self) -> Vec<String> {
+        let conn = self.conn.lock().unwrap();
+        let mut list = conn.managers.clone();
+        list.rotate_left(conn.at);
+        list
+    }
+
+    fn client(&self) -> (u64, DispatcherClient<Channel>) {
+        let conn = self.conn.lock().unwrap();
+        let client = DispatcherClient::new(conn.channel.clone())
+            .max_decoding_message_size(MAX_MESSAGE)
+            .max_encoding_message_size(MAX_MESSAGE);
+        (conn.generation, client)
+    }
+
+    /// Moves to the next manager after a failure on `generation`'s.
+    fn failed(&self, generation: u64) {
+        let mut conn = self.conn.lock().unwrap();
+        if conn.generation != generation || conn.managers.len() < 2 {
+            return;
+        }
+        let next = (conn.at + 1) % conn.managers.len();
+        match connect(&conn.managers[next], self.tls.as_ref()) {
+            Ok(channel) => {
+                tracing::debug!(manager = %conn.managers[next], "switching manager");
+                conn.at = next;
+                conn.generation += 1;
+                conn.channel = channel;
+            }
+            Err(e) => tracing::warn!("{e}"),
         }
     }
 
-    /// The lowest node subnet no node holds.
-    fn free_subnet(&self) -> Result<Ipv4Net, ControlError> {
-        let nodes = self
-            .store
-            .list(Kind::Node, None)
-            .map_err(|e| ControlError::Other(e.to_string()))?;
-        let taken = nodes
-            .objects
-            .iter()
-            .filter_map(|n| {
-                serde_json::from_value::<NodeStatus>(n.status.clone())
-                    .ok()?
-                    .pod_cidr
-            })
-            .filter_map(|c| c.parse::<Ipv4Net>().ok())
-            .collect();
-        legion_net::free_node_subnet(&taken)
-            .ok_or_else(|| ControlError::Other("the cluster pod network is full".into()))
+    /// Takes the managers' current addresses, keeping the one in use.
+    fn set_managers(&self, mut managers: Vec<String>) {
+        if managers.is_empty() {
+            return;
+        }
+        managers.sort();
+        managers.dedup();
+        let mut conn = self.conn.lock().unwrap();
+        let current = conn.managers[conn.at].clone();
+        match managers.iter().position(|m| *m == current) {
+            Some(at) => {
+                conn.managers = managers;
+                conn.at = at;
+            }
+            // The one in use is not listed (it may be reached under another
+            // address); keep it until it fails.
+            None => {
+                managers.insert(0, current);
+                conn.managers = managers;
+                conn.at = 0;
+            }
+        }
     }
 
-    fn get(&self, key: &ObjectKey) -> Result<Option<Object>, ControlError> {
-        self.store
-            .get(key)
-            .map_err(|e| ControlError::Other(e.to_string()))
+    /// Runs one unary call against the current manager, moving on to the
+    /// next if the manager cannot be reached.
+    async fn call<T, F>(
+        &self,
+        f: impl FnOnce(DispatcherClient<Channel>) -> F,
+    ) -> Result<T, ControlError>
+    where
+        F: Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+    {
+        let (generation, client) = self.client();
+        match tokio::time::timeout(CALL_TIMEOUT, f(client)).await {
+            Ok(Ok(resp)) => Ok(resp.into_inner()),
+            Ok(Err(status)) => {
+                let err = error(status);
+                if matches!(err, ControlError::Unavailable(_)) {
+                    self.failed(generation);
+                }
+                Err(err)
+            }
+            Err(_) => {
+                self.failed(generation);
+                Err(ControlError::Unavailable(
+                    "the manager did not answer".into(),
+                ))
+            }
+        }
+    }
+
+    /// Keeps `tx` equal to what a dispatcher stream sends, opening it again
+    /// whenever it ends. Ends when every receiver is gone.
+    async fn follow<T, M, S, Fut>(
+        self,
+        tx: watch::Sender<T>,
+        open: impl Fn(DispatcherClient<Channel>) -> Fut + Send,
+        decode: impl Fn(M) -> Result<T, String> + Send,
+        publish: impl Fn(&watch::Sender<T>, T) + Send,
+    ) where
+        T: Send + Sync,
+        M: Send,
+        S: futures::Stream<Item = Result<M, tonic::Status>> + Send + Unpin,
+        Fut: Future<Output = Result<tonic::Response<S>, tonic::Status>> + Send,
+    {
+        use futures::StreamExt;
+        loop {
+            let (generation, client) = self.client();
+            let opened = tokio::select! {
+                o = tokio::time::timeout(CALL_TIMEOUT, open(client)) => o,
+                _ = tx.closed() => return,
+            };
+            match opened {
+                Ok(Ok(resp)) => {
+                    let mut stream = resp.into_inner();
+                    loop {
+                        let next = tokio::select! {
+                            n = stream.next() => n,
+                            _ = tx.closed() => return,
+                        };
+                        match next {
+                            Some(Ok(m)) => match decode(m) {
+                                Ok(v) => publish(&tx, v),
+                                Err(e) => {
+                                    tracing::warn!("undecodable dispatcher message: {e}");
+                                    break;
+                                }
+                            },
+                            Some(Err(status)) => {
+                                tracing::debug!("dispatcher stream ended: {status}");
+                                self.failed(generation);
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+                Ok(Err(status)) => {
+                    tracing::debug!("opening a dispatcher stream: {status}");
+                    if matches!(error(status), ControlError::Unavailable(_)) {
+                        self.failed(generation);
+                    }
+                }
+                Err(_) => self.failed(generation),
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                _ = tx.closed() => return,
+            }
+        }
     }
 }
 
-impl Control for StoreControl {
+/// A lazily connected channel to a manager, with keepalives so a manager
+/// that vanishes without closing the connection is noticed.
+fn connect(addr: &str, tls: Option<&ClientTlsConfig>) -> Result<Channel, ControlError> {
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    let bad = |e: tonic::transport::Error| ControlError::Other(format!("manager {addr}: {e}"));
+    let mut endpoint = Endpoint::from_shared(format!("{scheme}://{addr}"))
+        .map_err(bad)?
+        .connect_timeout(Duration::from_secs(5))
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .keep_alive_timeout(Duration::from_secs(10))
+        .keep_alive_while_idle(true);
+    if let Some(tls) = tls {
+        endpoint = endpoint.tls_config(tls.clone()).map_err(bad)?;
+    }
+    Ok(endpoint.connect_lazy())
+}
+
+/// Codes worth retrying, against this manager or another, are
+/// [`ControlError::Unavailable`].
+fn error(status: tonic::Status) -> ControlError {
+    use tonic::Code;
+    match status.code() {
+        Code::Unavailable
+        | Code::Unknown
+        | Code::DeadlineExceeded
+        | Code::Cancelled
+        | Code::Aborted
+        | Code::FailedPrecondition => ControlError::Unavailable(status.message().to_owned()),
+        _ => ControlError::Other(status.message().to_owned()),
+    }
+}
+
+fn decode<T: serde::de::DeserializeOwned>(json: &[u8]) -> Result<T, String> {
+    serde_json::from_slice(json).map_err(|e| e.to_string())
+}
+
+impl Control for GrpcControl {
     async fn register(
         &self,
         name: &str,
         status: &NodeStatus,
     ) -> Result<Registration, ControlError> {
-        let key = ObjectKey::new(Kind::Node, "", name);
-        let other = |e: serde_json::Error| ControlError::Other(e.to_string());
-        for _ in 0..ATTEMPTS {
-            let existing = self.get(&key)?;
-            let mut status = status.clone();
-            status.pod_cidr = match existing
-                .as_ref()
-                .and_then(|n| serde_json::from_value::<NodeStatus>(n.status.clone()).ok())
-                .and_then(|s| s.pod_cidr)
-            {
-                Some(cidr) => Some(cidr),
-                None => Some(self.free_subnet()?.to_string()),
-            };
-            let registration = Registration {
-                pod_cidr: status
-                    .pod_cidr
-                    .as_deref()
-                    .unwrap_or_default()
-                    .parse()
-                    .map_err(ControlError::Other)?,
-            };
-            let status = serde_json::to_value(&status).map_err(other)?;
-            let (object, precondition) = match existing {
-                Some(mut node) => {
-                    if node.status == status {
-                        return Ok(registration);
-                    }
-                    node.status = status;
-                    let version = node.metadata.version;
-                    (node, Precondition::Version(version))
-                }
-                None => {
-                    let spec = serde_json::to_value(NodeSpec::default()).map_err(other)?;
-                    let mut node = Object::new(Kind::Node, "", name, spec);
-                    node.status = status;
-                    (node, Precondition::MustNotExist)
-                }
-            };
-            match self.write(object, precondition).await? {
-                Outcome::Written(_) => return Ok(registration),
-                Outcome::Conflict { .. } => continue,
-                other => return Err(ControlError::Other(format!("unexpected outcome {other:?}"))),
-            }
-        }
-        Err(ControlError::Unavailable(format!("{key} keeps changing")))
+        let req = RegisterRequest {
+            node: name.to_owned(),
+            status_json: serde_json::to_vec(status)
+                .map_err(|e| ControlError::Other(e.to_string()))?,
+        };
+        let resp = self
+            .call(|mut c| async move { c.register(req).await })
+            .await?;
+        Ok(Registration {
+            pod_cidr: resp
+                .pod_cidr
+                .parse()
+                .map_err(|e| ControlError::Other(format!("pod subnet {:?}: {e}", resp.pod_cidr)))?,
+        })
     }
 
     fn assignments(&self, node: &str) -> watch::Receiver<Assignments> {
         let (tx, rx) = watch::channel(Assignments::new());
-        tokio::spawn(follow(self.store.clone(), node.to_owned(), tx));
+        let node = node.to_owned();
+        tokio::spawn(self.clone().follow(
+            tx,
+            move |mut c| {
+                let node = node.clone();
+                async move { c.assignments(AssignmentsRequest { node }).await }
+            },
+            |m: legion_proto::v1::AssignmentsUpdate| {
+                let list: Vec<Assignment> = decode(&m.assignments_json)?;
+                Ok(list.into_iter().map(|a| (a.uid.clone(), a)).collect())
+            },
+            // Every set is published, even if equal: the first one after
+            // (re)connecting tells the agent the set is complete.
+            |tx, set| {
+                tx.send_replace(set);
+            },
+        ));
         rx
     }
 
     fn endpoints(&self) -> watch::Receiver<Endpoints> {
         let (tx, rx) = watch::channel(Endpoints::new());
-        tokio::spawn(follow_endpoints(self.store.clone(), tx));
+        let node = self.node.clone();
+        tokio::spawn(self.clone().follow(
+            tx,
+            move |mut c| {
+                let node = node.clone();
+                async move { c.endpoints(EndpointsRequest { node }).await }
+            },
+            |m: legion_proto::v1::EndpointsUpdate| decode(&m.endpoints_json),
+            |tx, set| {
+                tx.send_if_modified(|old| {
+                    if *old == set {
+                        false
+                    } else {
+                        *old = set;
+                        true
+                    }
+                });
+            },
+        ));
         rx
     }
 
@@ -270,24 +396,17 @@ impl Control for StoreControl {
         uid: &str,
         status: &TaskStatus,
     ) -> Result<(), ControlError> {
-        let status =
-            serde_json::to_value(status).map_err(|e| ControlError::Other(e.to_string()))?;
-        for _ in 0..ATTEMPTS {
-            let Some(mut task) = self.get(key)? else {
-                return Ok(());
-            };
-            if task.metadata.uid != uid || task.status == status {
-                return Ok(());
-            }
-            task.status = status.clone();
-            let version = task.metadata.version;
-            match self.write(task, Precondition::Version(version)).await? {
-                Outcome::Written(_) => return Ok(()),
-                Outcome::Conflict { .. } => continue,
-                other => return Err(ControlError::Other(format!("unexpected outcome {other:?}"))),
-            }
-        }
-        Err(ControlError::Unavailable(format!("{key} keeps changing")))
+        let req = ReportRequest {
+            node: self.node.clone(),
+            namespace: key.namespace.clone(),
+            name: key.name.clone(),
+            uid: uid.to_owned(),
+            status_json: serde_json::to_vec(status)
+                .map_err(|e| ControlError::Other(e.to_string()))?,
+        };
+        self.call(|mut c| async move { c.report(req).await })
+            .await
+            .map(|_| ())
     }
 
     async fn claim_volume(
@@ -297,34 +416,16 @@ impl Control for StoreControl {
         node: &str,
         dataset: &str,
     ) -> Result<VolumeClaim, ControlError> {
-        let key = ObjectKey::new(Kind::Volume, namespace, name);
-        let other = |e: serde_json::Error| ControlError::Other(e.to_string());
-        for _ in 0..ATTEMPTS {
-            let Some(mut volume) = self.get(&key)? else {
-                return Ok(VolumeClaim::Missing);
-            };
-            let spec: VolumeSpec = serde_json::from_value(volume.spec.clone()).map_err(other)?;
-            let status: VolumeStatus =
-                serde_json::from_value(volume.status.clone()).unwrap_or_default();
-            if !status.node.is_empty() && status.node != node {
-                return Ok(VolumeClaim::Elsewhere(status.node));
-            }
-            if status.node == node && status.dataset == dataset {
-                return Ok(VolumeClaim::Claimed(spec));
-            }
-            volume.status = serde_json::to_value(VolumeStatus {
-                node: node.to_owned(),
-                dataset: dataset.to_owned(),
-            })
-            .map_err(other)?;
-            let version = volume.metadata.version;
-            match self.write(volume, Precondition::Version(version)).await? {
-                Outcome::Written(_) => return Ok(VolumeClaim::Claimed(spec)),
-                Outcome::Conflict { .. } => continue,
-                other => return Err(ControlError::Other(format!("unexpected outcome {other:?}"))),
-            }
-        }
-        Err(ControlError::Unavailable(format!("{key} keeps changing")))
+        let req = ClaimVolumeRequest {
+            node: node.to_owned(),
+            namespace: namespace.to_owned(),
+            name: name.to_owned(),
+            dataset: dataset.to_owned(),
+        };
+        let resp = self
+            .call(|mut c| async move { c.claim_volume(req).await })
+            .await?;
+        decode(&resp.claim_json).map_err(ControlError::Other)
     }
 
     async fn data(
@@ -333,230 +434,24 @@ impl Control for StoreControl {
         kind: Kind,
         name: &str,
     ) -> Result<Option<Vec<u8>>, ControlError> {
-        let Some(o) = self.get(&ObjectKey::new(kind, namespace, name))? else {
-            return Ok(None);
+        let req = DataRequest {
+            node: self.node.clone(),
+            namespace: namespace.to_owned(),
+            kind: kind.to_string(),
+            name: name.to_owned(),
         };
-        let spec: DataSpec =
-            serde_json::from_value(o.spec).map_err(|e| ControlError::Other(e.to_string()))?;
-        spec.bytes()
-            .map(Some)
-            .map_err(|e| ControlError::Other(e.to_string()))
+        let resp = self.call(|mut c| async move { c.data(req).await }).await?;
+        Ok(resp.value)
     }
-}
 
-/// Keeps `tx` equal to the node's tasks: list, then watch; list again
-/// whenever the watch is lost. Ends when every receiver is gone.
-async fn follow(store: Store, node: String, tx: watch::Sender<Assignments>) {
-    loop {
-        let listing = match store.list(Kind::Task, None) {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::warn!("listing tasks: {e}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
-            }
+    async fn heartbeat(&self, node: &str) -> Result<Duration, ControlError> {
+        let req = HeartbeatRequest {
+            node: node.to_owned(),
         };
-        let mut current: Assignments = listing
-            .objects
-            .iter()
-            .filter_map(|o| assignment(o, &node))
-            .map(|a| (a.uid.clone(), a))
-            .collect();
-        // A fresh listing is always published, even if equal: the first one
-        // tells the agent the set is complete.
-        tx.send_replace(current.clone());
-        let mut watcher = match store.watch(listing.version, Some(Kind::Task)) {
-            Ok(w) => w,
-            Err(WatchError::Closed) => return,
-            Err(e) => {
-                tracing::debug!("watching tasks: {e}; listing again");
-                continue;
-            }
-        };
-        loop {
-            let event = tokio::select! {
-                ev = watcher.next() => ev,
-                _ = tx.closed() => return,
-            };
-            match event {
-                Ok(Event::Put(o)) => {
-                    current.retain(|_, a| a.key != o.key());
-                    if let Some(a) = assignment(&o, &node) {
-                        current.insert(a.uid.clone(), a);
-                    }
-                }
-                Ok(Event::Delete(o)) => current.retain(|_, a| a.key != o.key()),
-                Err(WatchError::Closed) => return,
-                Ok(Event::Reset(_)) | Err(_) => break,
-            }
-            tx.send_if_modified(|old| replace(old, &current));
-        }
+        let resp = self
+            .call(|mut c| async move { c.heartbeat(req).await })
+            .await?;
+        self.set_managers(resp.managers);
+        Ok(Duration::from_millis(resp.period_ms.max(100).into()))
     }
-}
-
-/// Keeps `tx` equal to the endpoints of every service: lists services and
-/// tasks, then follows changes to both. Ends when every receiver is gone.
-async fn follow_endpoints(store: Store, tx: watch::Sender<Endpoints>) {
-    loop {
-        let (services, tasks) = match (
-            store.list(Kind::Service, None),
-            store.list(Kind::Task, None),
-        ) {
-            (Ok(s), Ok(t)) => (s, t),
-            (Err(e), _) | (_, Err(e)) => {
-                tracing::warn!("listing services and tasks: {e}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
-            }
-        };
-        // Changes after the older listing, so none is missed; replaying
-        // some the newer listing already holds is harmless.
-        let since = services.version.min(tasks.version);
-        let by_key = |objects: Vec<Object>| -> BTreeMap<ObjectKey, Object> {
-            objects.into_iter().map(|o| (o.key(), o)).collect()
-        };
-        let (mut services, mut tasks) = (by_key(services.objects), by_key(tasks.objects));
-        tx.send_if_modified(|old| replace(old, &endpoints(&services, &tasks)));
-        let mut watcher = match store.watch(since, None) {
-            Ok(w) => w,
-            Err(WatchError::Closed) => return,
-            Err(e) => {
-                tracing::debug!("watching services and tasks: {e}; listing again");
-                continue;
-            }
-        };
-        loop {
-            let event = tokio::select! {
-                ev = watcher.next() => ev,
-                _ = tx.closed() => return,
-            };
-            let (o, put) = match event {
-                Ok(Event::Put(o)) => (o, true),
-                Ok(Event::Delete(o)) => (o, false),
-                Err(WatchError::Closed) => return,
-                Ok(Event::Reset(_)) | Err(_) => break,
-            };
-            let m = match o.kind {
-                Kind::Service => &mut services,
-                Kind::Task => &mut tasks,
-                _ => continue,
-            };
-            if put {
-                m.insert(o.key(), o);
-            } else {
-                m.remove(&o.key());
-            }
-            tx.send_if_modified(|old| replace(old, &endpoints(&services, &tasks)));
-        }
-    }
-}
-
-/// The ready tasks of each service: running, ready, with an address, and
-/// of the service as it is now (not an earlier one of the same name).
-fn endpoints(
-    services: &BTreeMap<ObjectKey, Object>,
-    tasks: &BTreeMap<ObjectKey, Object>,
-) -> Endpoints {
-    /// Ready and running task addresses.
-    type Addrs = (Vec<Ipv4Addr>, Vec<Ipv4Addr>);
-    let mut by_service: BTreeMap<(&str, String), Addrs> = BTreeMap::new();
-    for t in tasks.values() {
-        let Ok(spec) = legion_api::parse::<TaskSpec>(&t.spec) else {
-            continue;
-        };
-        let status: TaskStatus = serde_json::from_value(t.status.clone()).unwrap_or_default();
-        if status.state != TaskState::Running {
-            continue;
-        }
-        let Some(ip) = status.ip.as_deref().and_then(|s| s.parse().ok()) else {
-            continue;
-        };
-        let entry = by_service
-            .entry((t.metadata.namespace.as_str(), spec.service_uid))
-            .or_default();
-        entry.1.push(ip);
-        if spec.desired_state == DesiredState::Running && status.ready {
-            entry.0.push(ip);
-        }
-    }
-    services
-        .values()
-        .map(|s| {
-            let status: ServiceStatus =
-                serde_json::from_value(s.status.clone()).unwrap_or_default();
-            let (mut ready, mut alive) = by_service
-                .remove(&(s.metadata.namespace.as_str(), s.metadata.uid.clone()))
-                .unwrap_or_default();
-            ready.sort();
-            alive.sort();
-            let ports = legion_api::parse::<ServiceSpec>(&s.spec)
-                .ok()
-                .and_then(|spec| {
-                    let pod = spec.pod;
-                    let ports = spec.endpoint?.ports;
-                    Some(
-                        ports
-                            .iter()
-                            .filter_map(|p| {
-                                let target =
-                                    p.target_port.clone().unwrap_or(PortRef::Number(p.port));
-                                Some(EndpointPort {
-                                    protocol: p.protocol,
-                                    port: p.port,
-                                    target: pod.resolve_port(&target)?,
-                                    published: status
-                                        .published_ports
-                                        .iter()
-                                        .find(|o| o.port == p.port && o.protocol == p.protocol)
-                                        .map(|o| o.published_port),
-                                })
-                            })
-                            .collect(),
-                    )
-                })
-                .unwrap_or_default();
-            ServiceEndpoints {
-                namespace: s.metadata.namespace.clone(),
-                name: s.metadata.name.clone(),
-                uid: s.metadata.uid.clone(),
-                vip: status.virtual_ip.as_deref().and_then(|v| v.parse().ok()),
-                ports,
-                ready,
-                alive,
-            }
-        })
-        .collect()
-}
-
-fn replace<T: PartialEq + Clone>(old: &mut T, new: &T) -> bool {
-    if old == new {
-        false
-    } else {
-        *old = new.clone();
-        true
-    }
-}
-
-fn assignment(o: &Object, node: &str) -> Option<Assignment> {
-    let spec: TaskSpec = match legion_api::parse(&o.spec) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(task = %o.key(), "unreadable task spec: {e}");
-            return None;
-        }
-    };
-    if spec.node != node {
-        return None;
-    }
-    let status = if o.status.is_null() {
-        TaskStatus::default()
-    } else {
-        serde_json::from_value(o.status.clone()).unwrap_or_default()
-    };
-    Some(Assignment {
-        key: o.key(),
-        uid: o.metadata.uid.clone(),
-        spec,
-        status,
-    })
 }

@@ -1,5 +1,7 @@
-//! `legion daemon`: the manager, and on FreeBSD the agent with its own
-//! Podman service.
+//! `legion daemon`: on a manager node the manager, and on FreeBSD the agent
+//! with its own Podman service; on a worker node only the agent. The agent
+//! follows its work through the managers' dispatcher either way, its own
+//! manager first.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -7,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use legion_agent::{Agent, AgentConfig, StoreControl};
+use legion_agent::{Agent, AgentConfig, GrpcControl};
 use legion_api::node::{Capacity, NodeState, NodeStatus, Platform};
 use legion_api::quantity::{Bytes, Cpu};
 use legion_podman::service::{PodmanService, ServiceConfig};
@@ -21,6 +23,8 @@ pub struct Options {
     pub node_name: Option<String>,
     pub infra_image: Option<String>,
     pub zfs_root: Option<String>,
+    /// Workers: managers to call instead of those recorded at join.
+    pub managers: Vec<String>,
 }
 
 pub async fn run(opts: Options) -> anyhow::Result<()> {
@@ -37,19 +41,24 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| opts.listen.to_string());
     let hostname = hostname()?;
+    let pki = crate::pki::Pki::new(&opts.data_dir);
+    if pki.role()? == legion_pki::Role::Worker {
+        return run_worker(&opts, &pki, hostname).await;
+    }
     let node = match &opts.node_name {
         Some(n) => n.clone(),
         None => node_name(&hostname)?,
     };
     legion_api::validate_name(&node).context("node name")?;
-    let tls = crate::pki::Pki::new(&opts.data_dir)
+    let tls = pki
         .ensure(&node, &opts.data_dir)
         .context("setting up certificates")?;
+    // The agent calls this manager as the node.
+    let control = GrpcControl::new(&node, vec![advertise.clone()], Some(tls.client()))
+        .map_err(|e| anyhow::anyhow!(e))?;
     let manager = legion_manager::Manager::open(legion_manager::ManagerConfig {
-        data_dir: opts.data_dir.clone(),
-        advertise: advertise.clone(),
-        raft: legion_manager::default_raft_config(),
         tls: Some(tls),
+        ..legion_manager::ManagerConfig::new(&opts.data_dir, &advertise)
     })
     .await
     .map_err(|e| anyhow::anyhow!(e))
@@ -61,7 +70,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
 
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let agent = if opts.agent && cfg!(target_os = "freebsd") {
-        Some(start_agent(&opts, &node, hostname, &advertise, &manager, stopped).await?)
+        Some(start_agent(&opts, &node, status(hostname, &advertise), control, stopped).await?)
     } else {
         tracing::info!("agent disabled; this daemon runs the manager only");
         None
@@ -87,6 +96,45 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         podman.shutdown().await;
     }
     served
+}
+
+/// A worker node: the agent alone, calling the cluster's managers.
+async fn run_worker(opts: &Options, pki: &crate::pki::Pki, hostname: String) -> anyhow::Result<()> {
+    let (node, tls) = pki.worker()?;
+    if let Some(name) = &opts.node_name
+        && *name != node
+    {
+        bail!("this worker joined as {node}; its certificate does not cover --node-name {name}");
+    }
+    if !(opts.agent && cfg!(target_os = "freebsd")) {
+        bail!("a worker runs tasks only: it needs the agent, on FreeBSD");
+    }
+    let managers = if opts.managers.is_empty() {
+        crate::pki::read_managers(&opts.data_dir)?
+    } else {
+        opts.managers.clone()
+    };
+    if managers.is_empty() {
+        bail!("no manager to call: pass --manager or join again");
+    }
+    let control = GrpcControl::new(&node, managers, Some(tls)).map_err(|e| anyhow::anyhow!(e))?;
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let advertise = opts.advertise.clone().unwrap_or_default();
+    let (task, podman) = start_agent(
+        opts,
+        &node,
+        status(hostname, &advertise),
+        control.clone(),
+        stopped,
+    )
+    .await?;
+    tracing::info!(%node, "worker running");
+    crate::shutdown_signal().await;
+    let _ = stop.send(true);
+    let _ = task.await;
+    podman.shutdown().await;
+    // The managers the agent learned of, for the next start.
+    crate::pki::write_managers(&opts.data_dir, &control.managers())
 }
 
 /// `legion join`: certifies this node with the cluster and stores its
@@ -117,6 +165,9 @@ pub async fn join(
         .await
         .map_err(|e| anyhow::anyhow!("joining through {manager}: {e}"))?;
     pki.write_joined(&joined)?;
+    if joined.role == legion_pki::Role::Worker {
+        crate::pki::write_managers(data_dir, &[manager.to_owned()])?;
+    }
     println!(
         "joined as {} {node}; start the daemon with --data-dir {}",
         joined.role,
@@ -128,9 +179,8 @@ pub async fn join(
 async fn start_agent(
     opts: &Options,
     node: &str,
-    hostname: String,
-    advertise: &str,
-    manager: &legion_manager::Manager,
+    status: NodeStatus,
+    control: GrpcControl,
     mut stopped: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<(tokio::task::JoinHandle<()>, PodmanService)> {
     let podman = PodmanService::start(
@@ -145,7 +195,22 @@ async fn start_agent(
         config.infra_image = image.clone();
     }
     config.zfs_root = opts.zfs_root.clone();
-    let status = NodeStatus {
+    let agent = Agent::new(
+        config,
+        Arc::new(podman.client().clone()),
+        Arc::new(legion_sys::Shell::new()),
+        Arc::new(control),
+    );
+    tracing::info!(%node, "starting the agent");
+    let task = tokio::spawn(agent.run(status, async move {
+        let _ = stopped.wait_for(|s| *s).await;
+    }));
+    Ok((task, podman))
+}
+
+/// What the node registers with: `advertise` is `host:port` or a host.
+fn status(hostname: String, advertise: &str) -> NodeStatus {
+    NodeStatus {
         state: NodeState::Ready,
         hostname,
         addr: advertise
@@ -163,18 +228,7 @@ async fn start_agent(
         version: env!("CARGO_PKG_VERSION").to_owned(),
         // Assigned by the manager on registration.
         pod_cidr: None,
-    };
-    let agent = Agent::new(
-        config,
-        Arc::new(podman.client().clone()),
-        Arc::new(legion_sys::Shell::new()),
-        Arc::new(StoreControl::new(manager.store().clone())),
-    );
-    tracing::info!(%node, "starting the agent");
-    let task = tokio::spawn(agent.run(status, async move {
-        let _ = stopped.wait_for(|s| *s).await;
-    }));
-    Ok((task, podman))
+    }
 }
 
 fn hostname() -> anyhow::Result<String> {

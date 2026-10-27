@@ -9,9 +9,11 @@ publish.workspace = true
 
 [dependencies]
 legion-api.workspace = true
+legion-net.workspace = true
 legion-pki.workspace = true
 legion-proto.workspace = true
 legion-store.workspace = true
+legion-sys.workspace = true
 openraft.workspace = true
 serde.workspace = true
 serde_json.workspace = true

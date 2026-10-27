@@ -42,18 +42,8 @@ FreeBSD and as root, it also runs the agent with its own Podman service, so
 applied services run as pods of jails on the node (`legion list tasks -n
 shop` shows each pod's address on the node's `legion0` bridge). Pods reach
 each other and the host, and find services by name (`web`, `web.shop` or
-`web.shop.legion`) through the node's resolver on the bridge; there is no
-outbound NAT yet. Give it
-`--zfs-root <pool>/legion` to run tasks that use volumes.
-
-More managers join with a token (the daemon must listen where the others
-can reach it, for example `--listen 0.0.0.0:7470 --advertise 10.0.0.1:7470`):
-
-```sh
-legion join-token manager            # on a member
-legion join <token> --manager 10.0.0.1:7470 --advertise 10.0.0.2:7470
-legion daemon --listen 0.0.0.0:7470 --advertise 10.0.0.2:7470
-``` Service VIPs,
+`web.shop.legion`) through the node's resolver on the bridge. Give it
+`--zfs-root <pool>/legion` to run tasks that use volumes. Service VIPs,
 published ports and NAT for pods need the host's `/etc/pf.conf` to call
 Legion's anchors:
 
@@ -61,6 +51,20 @@ Legion's anchors:
 nat-anchor "legion/*"
 rdr-anchor "legion/*"
 anchor "legion/*"
+```
+
+More nodes join with a token. Managers must listen where the others can
+reach them, for example `--listen 0.0.0.0:7470 --advertise 10.0.0.1:7470`.
+A worker runs only the agent, which follows its work through any manager
+and fails over to the others:
+
+```sh
+legion join-token manager            # or worker; on a member
+legion join <token> --manager 10.0.0.1:7470 --advertise 10.0.0.2:7470
+legion daemon --listen 0.0.0.0:7470 --advertise 10.0.0.2:7470
+
+legion join <worker-token> --manager 10.0.0.1:7470    # on a worker
+legion daemon
 ```
 
 ## Layout

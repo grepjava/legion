@@ -1,15 +1,15 @@
-//! The agent against a real single-manager store, with Podman and the
-//! system faked in memory.
+//! The agent against a real single manager, through its dispatcher, with
+//! Podman and the system faked in memory.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use legion_agent::fake::FakeRuntime;
-use legion_agent::{Agent, AgentConfig, StoreControl};
+use legion_agent::{Agent, AgentConfig, GrpcControl};
 use legion_api::node::{NodeState, NodeStatus};
 use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
 use legion_api::{Kind, Object, ObjectKey, Spec};
-use legion_manager::{Manager, ManagerConfig, default_raft_config};
+use legion_manager::{Manager, ManagerConfig};
 use legion_store::{Command, Outcome, Precondition, Store};
 use legion_sys::{FakeSys, Sys};
 use openraft::BasicNode;
@@ -22,7 +22,9 @@ const INFRA: &str = "docker.io/freebsd/freebsd-runtime:15.1";
 
 struct Harness {
     _dir: TempDir,
-    _manager: Manager,
+    /// The manager's address.
+    addr: String,
+    _server: JoinHandle<()>,
     store: Store,
     sys: Arc<FakeSys>,
     rt: Arc<FakeRuntime>,
@@ -32,11 +34,13 @@ struct Harness {
 impl Harness {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        // The tests write tasks without services, which the controllers
+        // would remove.
         let manager = Manager::open(ManagerConfig {
-            data_dir: dir.path().to_owned(),
-            advertise: "127.0.0.1:1".into(),
-            raft: default_raft_config(),
-            tls: None,
+            controllers: false,
+            ..ManagerConfig::new(dir.path(), &addr)
         })
         .await
         .unwrap();
@@ -45,14 +49,9 @@ impl Harness {
         store
             .raft
             .initialize(
-                [(
-                    id,
-                    BasicNode {
-                        addr: "127.0.0.1:1".into(),
-                    },
-                )]
-                .into_iter()
-                .collect::<std::collections::BTreeMap<_, _>>(),
+                [(id, BasicNode { addr: addr.clone() })]
+                    .into_iter()
+                    .collect::<std::collections::BTreeMap<_, _>>(),
             )
             .await
             .unwrap();
@@ -60,11 +59,18 @@ impl Harness {
             store.raft.metrics().borrow().current_leader == Some(id)
         })
         .await;
+        let server = tokio::spawn(async move {
+            manager
+                .serve(listener, std::future::pending())
+                .await
+                .unwrap();
+        });
         let sys = Arc::new(FakeSys::new());
         let rt = Arc::new(FakeRuntime::new(sys.clone()));
         let mut h = Harness {
             _dir: dir,
-            _manager: manager,
+            addr,
+            _server: server,
             store,
             sys,
             rt,
@@ -83,7 +89,7 @@ impl Harness {
             config,
             self.rt.clone(),
             self.sys.clone() as Arc<dyn Sys>,
-            Arc::new(StoreControl::new(self.store.clone())),
+            Arc::new(GrpcControl::new(NODE, vec![self.addr.clone()], None).unwrap()),
         );
         let (tx, rx) = oneshot::channel();
         let status = NodeStatus {
