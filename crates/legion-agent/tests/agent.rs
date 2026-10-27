@@ -281,7 +281,7 @@ async fn runs_a_pod() {
     assert_eq!(
         rules,
         [
-            format!("jail:{infra}.{web}:vmemoryuse:deny=268435456"),
+            format!("jail:{infra}.{web}:memoryuse:sigkill=268435456"),
             format!("jail:{infra}.{web}:pcpu:deny=50"),
             format!("jail:{infra}.{web}:maxproc:deny=64"),
         ]

@@ -260,7 +260,7 @@ impl FromStr for Ipv4Net {
     }
 }
 
-/// An rctl rule on a jail, always with the `deny` action: the limits Legion
+/// An rctl rule on a jail, with the resource's action: the limits Legion
 /// sets are hard ones (DESIGN.md §6.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RctlRule {
@@ -273,9 +273,10 @@ impl fmt::Display for RctlRule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "jail:{}:{}:deny={}",
+            "jail:{}:{}:{}={}",
             self.jail,
             self.resource.as_str(),
+            self.resource.action(),
             self.amount
         )
     }
@@ -283,8 +284,10 @@ impl fmt::Display for RctlRule {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Resource {
-    /// Bytes of virtual memory; enforced by refusing allocations.
-    VMemoryUse,
+    /// Bytes of resident memory; a process taking the jail past it is
+    /// killed, as Linux's OOM killer does in a container. (`deny` would
+    /// page the jail out instead, which rctl(8) warns can thrash.)
+    MemoryUse,
     /// Percent of one CPU; enforced by pausing the process.
     Pcpu,
     MaxProc,
@@ -294,10 +297,18 @@ pub enum Resource {
 impl Resource {
     pub fn as_str(self) -> &'static str {
         match self {
-            Resource::VMemoryUse => "vmemoryuse",
+            Resource::MemoryUse => "memoryuse",
             Resource::Pcpu => "pcpu",
             Resource::MaxProc => "maxproc",
             Resource::OpenFiles => "openfiles",
+        }
+    }
+
+    /// The rctl action enforcing the limit.
+    pub fn action(self) -> &'static str {
+        match self {
+            Resource::MemoryUse => "sigkill",
+            _ => "deny",
         }
     }
 }
@@ -334,9 +345,9 @@ mod tests {
     fn rctl_rule_text() {
         let r = RctlRule {
             jail: "abc.def".into(),
-            resource: Resource::VMemoryUse,
+            resource: Resource::MemoryUse,
             amount: 512 << 20,
         };
-        assert_eq!(r.to_string(), "jail:abc.def:vmemoryuse:deny=536870912");
+        assert_eq!(r.to_string(), "jail:abc.def:memoryuse:sigkill=536870912");
     }
 }

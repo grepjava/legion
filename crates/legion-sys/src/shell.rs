@@ -992,7 +992,7 @@ mod tests {
     #[test]
     fn rctl() {
         let sh = Script::shell(vec![
-            ("rctl -a jail:i.c:vmemoryuse:deny=536870912", ok("")),
+            ("rctl -a jail:i.c:memoryuse:sigkill=536870912", ok("")),
             (
                 "rctl -r jail:gone",
                 err("rctl: failed to remove rule 'jail:gone': No such process"),
@@ -1008,7 +1008,7 @@ mod tests {
         ]);
         sh.rctl_add(&RctlRule {
             jail: "i.c".into(),
-            resource: Resource::VMemoryUse,
+            resource: Resource::MemoryUse,
             amount: 512 << 20,
         })
         .unwrap();

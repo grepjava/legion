@@ -251,7 +251,7 @@ async fn agent_runs_a_real_pod() {
     );
     assert!(jails.contains(&format!("name={child} ")), "{jails}");
     let rules = sh(&format!("rctl jail:{child}"));
-    assert!(rules.contains("vmemoryuse:deny=268435456"), "{rules}");
+    assert!(rules.contains("memoryuse:sigkill=268435456"), "{rules}");
     assert!(rules.contains("maxproc:deny=32"), "{rules}");
     // The limit holds inside the container.
     let forks = podman

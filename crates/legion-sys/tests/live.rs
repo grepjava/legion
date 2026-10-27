@@ -189,7 +189,7 @@ fn rctl_on_child_jail() {
     sh(&format!("jexec {parent} jail -c name=c1 path=/ persist"));
 
     for (resource, amount) in [
-        (Resource::VMemoryUse, 512 << 20),
+        (Resource::MemoryUse, 512 << 20),
         (Resource::MaxProc, 50),
         (Resource::Pcpu, 50),
     ] {
@@ -202,7 +202,7 @@ fn rctl_on_child_jail() {
     }
     let rules = sh(&format!("rctl jail:{child}"));
     assert!(
-        rules.contains(&format!("jail:{child}:vmemoryuse:deny=536870912")),
+        rules.contains(&format!("jail:{child}:memoryuse:sigkill=536870912")),
         "{rules}"
     );
     assert!(

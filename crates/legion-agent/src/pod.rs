@@ -130,7 +130,7 @@ pub fn rctl_rules(c: &Container, jail: &str) -> Vec<RctlRule> {
     };
     let mut rules = Vec::new();
     if let Some(m) = l.memory {
-        rules.push(rule(Resource::VMemoryUse, m.0));
+        rules.push(rule(Resource::MemoryUse, m.0));
     }
     if let Some(cpu) = l.cpu {
         // pcpu is a percentage of one CPU.
@@ -204,7 +204,7 @@ mod tests {
         assert_eq!(
             rules,
             [
-                "jail:i.c:vmemoryuse:deny=536870912",
+                "jail:i.c:memoryuse:sigkill=536870912",
                 "jail:i.c:pcpu:deny=150",
                 "jail:i.c:maxproc:deny=64",
             ]
