@@ -220,6 +220,15 @@ async fn agent_runs_a_real_pod() {
     assert_eq!(ping.trim(), "reachable", "host to pod {ip}");
     let route = sh(&format!("route -j {} -n get default", infra.id));
     assert!(route.contains("gateway: 10.200.0.1"), "{route}");
+
+    // The node resolver answers on the gateway: cluster names itself,
+    // others through the host's resolvers.
+    let nx = sh("drill @10.200.0.1 nope.lab.legion A");
+    assert!(nx.contains("rcode: NXDOMAIN") && nx.contains(" aa "), "{nx}");
+    let out = sh("drill @10.200.0.1 freebsd.org A");
+    assert!(out.contains("rcode: NOERROR") && out.contains("IN\tA\t"), "{out}");
+    let tcp = sh("drill -t @10.200.0.1 freebsd.org A");
+    assert!(tcp.contains("rcode: NOERROR"), "over TCP: {tcp}");
     let uid = status_uid(&store, &key);
     let host_end = legion_net::host_interface(&uid);
     assert!(sh("ifconfig -l").contains(&host_end));
@@ -260,6 +269,21 @@ async fn agent_runs_a_real_pod() {
         .await
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&env.stdout), "hello\n");
+    let resolv = podman
+        .exec(
+            &app.id,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "while read l; do echo \"$l\"; done < /etc/resolv.conf".into(),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&resolv.stdout),
+        "search lab.legion legion\nnameserver 10.200.0.1\noptions ndots:2\n"
+    );
 
     // Secrets and configs are read-only files from the task's tmpfs.
     let files = podman

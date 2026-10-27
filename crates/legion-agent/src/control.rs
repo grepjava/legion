@@ -7,11 +7,13 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use legion_api::data::DataSpec;
 use legion_api::node::{NodeSpec, NodeStatus};
-use legion_api::task::{TaskSpec, TaskStatus};
+use legion_api::service::ServiceStatus;
+use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
 use legion_api::volume::{VolumeSpec, VolumeStatus};
 use legion_api::{Kind, Object, ObjectKey};
 use legion_store::{Command, Event, Outcome, Precondition, Store, WatchError};
@@ -57,6 +59,19 @@ pub enum VolumeClaim {
     Elsewhere(String),
 }
 
+/// A service's addresses, for DNS and, later, load balancing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceEndpoints {
+    pub namespace: String,
+    pub name: String,
+    pub vip: Option<Ipv4Addr>,
+    /// Addresses of the service's ready tasks, in order.
+    pub ready: Vec<Ipv4Addr>,
+}
+
+/// Every service in the cluster, by namespace and name.
+pub type Endpoints = Vec<ServiceEndpoints>;
+
 /// Every task assigned to the node, by uid.
 pub type Assignments = BTreeMap<String, Assignment>;
 
@@ -74,6 +89,9 @@ pub trait Control: Send + Sync + 'static {
     /// value is empty and not yet marked changed; the first change is the
     /// first complete set, which may be empty too.
     fn assignments(&self, node: &str) -> watch::Receiver<Assignments>;
+
+    /// Every service's endpoints, kept current; empty until first known.
+    fn endpoints(&self) -> watch::Receiver<Endpoints>;
 
     /// Writes a task's status. A task that is gone, or was replaced by one
     /// with another uid, is ignored.
@@ -225,6 +243,12 @@ impl Control for StoreControl {
         rx
     }
 
+    fn endpoints(&self) -> watch::Receiver<Endpoints> {
+        let (tx, rx) = watch::channel(Endpoints::new());
+        tokio::spawn(follow_endpoints(self.store.clone(), tx));
+        rx
+    }
+
     async fn report(
         &self,
         key: &ObjectKey,
@@ -355,7 +379,107 @@ async fn follow(store: Store, node: String, tx: watch::Sender<Assignments>) {
     }
 }
 
-fn replace(old: &mut Assignments, new: &Assignments) -> bool {
+/// Keeps `tx` equal to the endpoints of every service: lists services and
+/// tasks, then follows changes to both. Ends when every receiver is gone.
+async fn follow_endpoints(store: Store, tx: watch::Sender<Endpoints>) {
+    loop {
+        let (services, tasks) = match (
+            store.list(Kind::Service, None),
+            store.list(Kind::Task, None),
+        ) {
+            (Ok(s), Ok(t)) => (s, t),
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::warn!("listing services and tasks: {e}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        // Changes after the older listing, so none is missed; replaying
+        // some the newer listing already holds is harmless.
+        let since = services.version.min(tasks.version);
+        let by_key = |objects: Vec<Object>| -> BTreeMap<ObjectKey, Object> {
+            objects.into_iter().map(|o| (o.key(), o)).collect()
+        };
+        let (mut services, mut tasks) = (by_key(services.objects), by_key(tasks.objects));
+        tx.send_if_modified(|old| replace(old, &endpoints(&services, &tasks)));
+        let mut watcher = match store.watch(since, None) {
+            Ok(w) => w,
+            Err(WatchError::Closed) => return,
+            Err(e) => {
+                tracing::debug!("watching services and tasks: {e}; listing again");
+                continue;
+            }
+        };
+        loop {
+            let event = tokio::select! {
+                ev = watcher.next() => ev,
+                _ = tx.closed() => return,
+            };
+            let (o, put) = match event {
+                Ok(Event::Put(o)) => (o, true),
+                Ok(Event::Delete(o)) => (o, false),
+                Err(WatchError::Closed) => return,
+                Ok(Event::Reset(_)) | Err(_) => break,
+            };
+            let m = match o.kind {
+                Kind::Service => &mut services,
+                Kind::Task => &mut tasks,
+                _ => continue,
+            };
+            if put {
+                m.insert(o.key(), o);
+            } else {
+                m.remove(&o.key());
+            }
+            tx.send_if_modified(|old| replace(old, &endpoints(&services, &tasks)));
+        }
+    }
+}
+
+/// The ready tasks of each service: running, ready, with an address, and
+/// of the service as it is now (not an earlier one of the same name).
+fn endpoints(
+    services: &BTreeMap<ObjectKey, Object>,
+    tasks: &BTreeMap<ObjectKey, Object>,
+) -> Endpoints {
+    let mut ready: BTreeMap<(&str, String), Vec<Ipv4Addr>> = BTreeMap::new();
+    for t in tasks.values() {
+        let Ok(spec) = legion_api::parse::<TaskSpec>(&t.spec) else {
+            continue;
+        };
+        let status: TaskStatus = serde_json::from_value(t.status.clone()).unwrap_or_default();
+        if spec.desired_state != DesiredState::Running
+            || status.state != TaskState::Running
+            || !status.ready
+        {
+            continue;
+        }
+        let Some(ip) = status.ip.as_deref().and_then(|s| s.parse().ok()) else {
+            continue;
+        };
+        let service = (t.metadata.namespace.as_str(), spec.service_uid);
+        ready.entry(service).or_default().push(ip);
+    }
+    services
+        .values()
+        .map(|s| {
+            let status: ServiceStatus =
+                serde_json::from_value(s.status.clone()).unwrap_or_default();
+            let mut ips = ready
+                .remove(&(s.metadata.namespace.as_str(), s.metadata.uid.clone()))
+                .unwrap_or_default();
+            ips.sort();
+            ServiceEndpoints {
+                namespace: s.metadata.namespace.clone(),
+                name: s.metadata.name.clone(),
+                vip: status.virtual_ip.as_deref().and_then(|v| v.parse().ok()),
+                ready: ips,
+            }
+        })
+        .collect()
+}
+
+fn replace<T: PartialEq + Clone>(old: &mut T, new: &T) -> bool {
     if old == new {
         false
     } else {

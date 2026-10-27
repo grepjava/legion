@@ -658,6 +658,7 @@ containers:
     let mounts: Vec<_> = spec
         .mounts
         .iter()
+        .filter(|m| m.destination != "/etc/resolv.conf")
         .map(|m| {
             (
                 m.source.as_str(),
@@ -686,8 +687,22 @@ containers:
     );
     assert_eq!(spec.env["DB_PASSWORD"], "s3cret");
     assert_eq!(spec.env["MODE"], "prod");
+    // Every container gets the pod's resolv.conf, from the same tmpfs.
     let sidecar = h.rt.spec("shop_app-1_sidecar").unwrap();
-    assert!(sidecar.mounts.is_empty() && sidecar.env.is_empty());
+    assert!(sidecar.env.is_empty());
+    let resolv = dir.join("resolv.conf");
+    assert_eq!(
+        sidecar
+            .mounts
+            .iter()
+            .map(|m| (m.source.as_str(), m.destination.as_str()))
+            .collect::<Vec<_>>(),
+        [(resolv.to_str().unwrap(), "/etc/resolv.conf")]
+    );
+    assert_eq!(
+        std::fs::read_to_string(&resolv).unwrap(),
+        "search shop.legion legion\nnameserver 10.200.0.1\noptions ndots:2\n"
+    );
 
     // Shutting down removes the files with the pod.
     h.shut_down(&key).await;
@@ -770,6 +785,7 @@ async fn volumes() {
             .unwrap()
             .mounts
             .iter()
+            .filter(|m| m.destination != "/etc/resolv.conf")
             .map(|m| {
                 (
                     m.source.clone(),
@@ -802,9 +818,11 @@ async fn volumes() {
             true
         )]
     );
+    let tmpfs = h.sys.tmpfs_mounts();
     assert_eq!(
-        h.sys.tmpfs_mounts(),
-        [(scratch.to_str().unwrap().to_owned(), Some(64 << 20))].into()
+        tmpfs.get(scratch.to_str().unwrap()),
+        Some(&Some(64 << 20)),
+        "{tmpfs:?}"
     );
 
     // The tmpfs goes with the pod; the dataset stays for the next task.

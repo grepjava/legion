@@ -480,6 +480,13 @@ The node resolver answers:
 
 Data comes from the endpoints stream, so answers are local and fast.
 
+Built (phase 1): names live under `legion.` (`web.shop.legion`); pods get
+`search <ns>.legion legion` and `ndots:2`, so `web` and `web.shop` work as
+well. Cluster answers carry a 5-second TTL and the authoritative flag;
+unknown names under `legion.` are NXDOMAIN and never leave the node.
+Answers too large for UDP set the truncation flag and the client retries
+over TCP.
+
 ### 5.6 Network policy
 
 - Compose networks and namespaces become pf tables of member IPs.

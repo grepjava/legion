@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use legion_agent::fake::FakeRuntime;
-use legion_agent::{Agent, AgentConfig, StoreControl};
+use legion_agent::{Agent, AgentConfig, ServiceEndpoints, StoreControl};
 use legion_api::node::{NodeState, NodeStatus};
 use legion_api::{Kind, Object};
 use legion_manager::{Manager, ManagerConfig, default_raft_config};
@@ -21,6 +21,8 @@ const INFRA: &str = "docker.io/freebsd/freebsd-runtime:15.1";
 struct Cluster {
     api: ObjectsClient<Channel>,
     rt: Arc<FakeRuntime>,
+    /// What the node resolver and load balancing see.
+    endpoints: tokio::sync::watch::Receiver<legion_agent::Endpoints>,
     stop: Option<oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
@@ -51,6 +53,8 @@ impl Cluster {
             sys as Arc<dyn Sys>,
             Arc::new(StoreControl::new(manager.store().clone())),
         );
+        let endpoints =
+            legion_agent::Control::endpoints(&StoreControl::new(manager.store().clone()));
         let (agent_stop, agent_stopped) = oneshot::channel::<()>();
         let agent = tokio::spawn(agent.run(
             NodeStatus {
@@ -89,6 +93,7 @@ impl Cluster {
         Cluster {
             api: ObjectsClient::new(channel),
             rt,
+            endpoints,
             stop: Some(stop),
             server,
             _dir: dir,
@@ -153,6 +158,9 @@ impl Cluster {
     }
 
     async fn stop(mut self) {
+        // Followers of the store end with their last receiver, and the
+        // store closes only once they have.
+        drop(self.endpoints);
         self.stop.take().unwrap().send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(15), self.server)
             .await
@@ -212,6 +220,19 @@ async fn apply_to_running_pods() {
         s.status["running"] == 2 && s.status["ready"] == 2 && s.status["desired"] == 2
     })
     .await;
+    // Both tasks are the service's endpoints.
+    let web = |ready: &[[u8; 4]]| {
+        vec![ServiceEndpoints {
+            namespace: "shop".into(),
+            name: "web".into(),
+            vip: None,
+            ready: ready.iter().map(|&a| a.into()).collect(),
+        }]
+    };
+    eventually("endpoints", async || {
+        *c.endpoints.borrow() == web(&[[10, 200, 0, 2], [10, 200, 0, 3]])
+    })
+    .await;
     // The node registered itself and the scheduler used it.
     let nodes = c.list(Kind::Node).await;
     assert_eq!(nodes[0].metadata.name, "n1");
@@ -249,6 +270,10 @@ async fn apply_to_running_pods() {
     })
     .await;
     assert_eq!(c.running(), ["shop_web-1-2", "shop_web-1-2_web"]);
+    eventually("one endpoint", async || {
+        c.endpoints.borrow()[0].ready.len() == 1
+    })
+    .await;
 
     // A container that keeps failing exhausts the restart policy; the task
     // fails and the controller replaces it.

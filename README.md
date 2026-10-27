@@ -40,7 +40,9 @@ CLI elsewhere with `--server` or `LEGION_SERVER`. Without `--no-agent`, on
 FreeBSD and as root, it also runs the agent with its own Podman service, so
 applied services run as pods of jails on the node (`legion list tasks -n
 shop` shows each pod's address on the node's `legion0` bridge). Pods reach
-each other and the host; there is no outbound NAT yet. Give it
+each other and the host, and find services by name (`web`, `web.shop` or
+`web.shop.legion`) through the node's resolver on the bridge; there is no
+outbound NAT yet. Give it
 `--zfs-root <pool>/legion` to run tasks that use volumes.
 
 ## Layout

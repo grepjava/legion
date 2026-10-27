@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +18,7 @@ use futures::StreamExt;
 use legion_api::node::NodeStatus;
 use legion_api::task::DesiredState;
 use legion_sys::Sys;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
 pub mod control;
@@ -30,7 +31,8 @@ mod task;
 mod volumes;
 
 pub use control::{
-    Assignment, Assignments, Control, ControlError, Registration, StoreControl, VolumeClaim,
+    Assignment, Assignments, Control, ControlError, Endpoints, Registration, ServiceEndpoints,
+    StoreControl, VolumeClaim,
 };
 pub use runtime::Runtime;
 
@@ -124,7 +126,9 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         if let Err(e) = task::blocking(&ctx.sys, move |sys| bridge.ensure_bridge(sys)).await {
             tracing::error!("setting up the pod bridge: {e}; pods will fail to start");
         }
+        let gateway = net.gateway();
         let _ = ctx.net.set(net);
+        let dns = dns(ctx.control.as_ref(), gateway).await;
 
         let mut assignments = ctx.control.assignments(&ctx.node);
         // Nothing is reconciled before the first complete set of
@@ -208,6 +212,9 @@ impl<R: Runtime, C: Control> Agent<R, C> {
 
         // Dropping the senders ends each worker without touching its pod.
         forwarder.abort();
+        if let Some(dns) = dns {
+            dns.abort();
+        }
         workers.clear();
         let deadline = tokio::time::sleep(Duration::from_secs(5));
         tokio::pin!(deadline);
@@ -223,6 +230,54 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         cleanups.abort_all();
         tracing::info!("agent stopped");
     }
+}
+
+/// Runs the node resolver on the pod gateway, answering from the service
+/// endpoints and relaying the rest to the host's resolvers. Pods still
+/// start without it, with names outside the cluster unresolvable.
+async fn dns<C: Control>(control: &C, gateway: Ipv4Addr) -> Option<tokio::task::JoinHandle<()>> {
+    use legion_net::dns::{self, ServiceAddrs, Zone};
+
+    let addr = SocketAddr::from((gateway, 53));
+    let (udp, tcp) = match (
+        tokio::net::UdpSocket::bind(addr).await,
+        tokio::net::TcpListener::bind(addr).await,
+    ) {
+        (Ok(u), Ok(t)) => (u, t),
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::warn!(%addr, "starting the node resolver: {e}");
+            return None;
+        }
+    };
+    let upstream: Vec<SocketAddr> = std::fs::read_to_string("/etc/resolv.conf")
+        .map(|t| dns::resolv_conf_servers(&t))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.ip() != gateway)
+        .collect();
+    if upstream.is_empty() {
+        tracing::warn!("no name servers in /etc/resolv.conf: only cluster names will resolve");
+    }
+    tracing::info!(%addr, ?upstream, "node resolver");
+    let mut endpoints = control.endpoints();
+    let (tx, rx) = watch::channel(Arc::new(Zone::default()));
+    Some(tokio::spawn(async move {
+        let follow = async move {
+            while endpoints.changed().await.is_ok() {
+                let zone = Zone::new(endpoints.borrow_and_update().iter().map(|e| ServiceAddrs {
+                    namespace: e.namespace.clone(),
+                    name: e.name.clone(),
+                    vip: e.vip,
+                    tasks: e.ready.clone(),
+                }));
+                tx.send_replace(Arc::new(zone));
+            }
+        };
+        tokio::select! {
+            () = dns::serve(udp, tcp, rx, upstream) => {}
+            () = follow => {}
+        }
+    }))
 }
 
 /// Registers the node, retrying until the manager takes it.

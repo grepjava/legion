@@ -98,6 +98,15 @@ self-heals on one node.
   go with the pod. Not yet: removing datasets of deleted Volumes (they are
   left in place), and scheduling tasks to the node holding their volume
   (one node in phase 1).
+- **DNS** (`legion-net::dns`, `legion-agent`): the agent runs a resolver on
+  the pod gateway (`10.200.N.1:53`, UDP and TCP). It answers
+  `<svc>.<ns>.legion`, `tasks.<svc>.<ns>.legion` and `<svc>.<ns>` with the
+  ready tasks' addresses (the VIP once services have one), NXDOMAIN for
+  other names under `legion.`, and relays everything else to the host's
+  resolvers, so pods resolve outside names without a route out. Each pod
+  gets a `resolv.conf` (search `<ns>.legion legion`, `ndots:2`) from its
+  tmpfs. The agent follows service endpoints through `Control`, which the
+  load balancing step reuses. Not yet: stateful `<svc>-<n>` names.
 
 ### To do, in order
 
@@ -109,9 +118,7 @@ them.
    pf anchors with the default-block ruleset and tables for load balancing
    with soft drain and kill-by-key (§5.4); outbound NAT for pods. Needs the
    host's pf to reference Legion's anchors.
-2. **DNS**: resolver on the bridge gateway for cluster names, forwarding the
-   rest (§5.5).
-3. **Exit test**: a multi-service app (for example web + database + cache)
+2. **Exit test**: a multi-service app (for example web + database + cache)
    with probes and a volume; kill containers and the agent and check that it
    comes back.
 

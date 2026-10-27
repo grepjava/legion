@@ -297,11 +297,17 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             }
         }
 
+        let resolv_conf = self
+            .ctx
+            .net
+            .get()
+            .map(|n| legion_net::dns::pod_resolv_conf(&self.a.key.namespace, n.gateway()));
         let files = files::prepare(
             self.ctx.control.as_ref(),
             &self.ctx.sys,
             &self.ctx.files_dir,
             &self.a,
+            resolv_conf,
         )
         .await
         .map_err(Abort::Failed)?;

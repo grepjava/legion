@@ -9,6 +9,9 @@
 //!
 //! The values are read once per pod start: a changed Secret reaches a task
 //! when its pod next starts.
+//!
+//! The same tmpfs holds the pod's `resolv.conf`, mounted at
+//! `/etc/resolv.conf` in every container that does not mount its own.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -77,13 +80,16 @@ fn wants_files(pod: &PodSpec) -> bool {
         .any(|c| !c.secrets.is_empty() || !c.configs.is_empty())
 }
 
-/// Fetches the pod's secrets and configs and writes the files. The error
-/// says what is missing or failed.
+const RESOLV_CONF: &str = "/etc/resolv.conf";
+
+/// Fetches the pod's secrets and configs and writes the files, with
+/// `resolv_conf` if given. The error says what is missing or failed.
 pub(crate) async fn prepare<C: Control>(
     control: &C,
     sys: &std::sync::Arc<dyn Sys>,
     root: &Path,
     a: &Assignment,
+    resolv_conf: Option<String>,
 ) -> Result<Files, String> {
     let pod = &a.spec.pod;
     let mut values = BTreeMap::new();
@@ -122,13 +128,22 @@ pub(crate) async fn prepare<C: Control>(
             files.env.insert(c.name.clone(), env);
         }
     }
-    if !wants_files(pod) {
+    if !wants_files(pod) && resolv_conf.is_none() {
         return Ok(files);
     }
 
     let dir = task_dir(root, &a.uid);
     for c in pod.containers() {
-        files.mounts.insert(c.name.clone(), mounts(c, &dir));
+        let mut m = mounts(c, &dir);
+        let own = m.iter().any(|m| m.destination == RESOLV_CONF)
+            || c.volume_mounts
+                .iter()
+                .any(|v| v.path == RESOLV_CONF || v.path == "/etc");
+        if resolv_conf.is_some() && !own {
+            let source = dir.join("resolv.conf");
+            m.push(Mount::nullfs(&source.to_string_lossy(), RESOLV_CONF, true));
+        }
+        files.mounts.insert(c.name.clone(), m);
     }
     let size = values.values().map(|v| v.len() as u64).sum::<u64>() + SLACK;
     let write = move |sys: &dyn Sys| -> Result<(), String> {
@@ -143,6 +158,10 @@ pub(crate) async fn prepare<C: Control>(
             let sub = dir.join(dir_name(*kind));
             std::fs::create_dir_all(&sub).map_err(|e| format!("creating {sub:?}: {e}"))?;
             write_file(&sub.join(name), value).map_err(|e| format!("writing {name}: {e}"))?;
+        }
+        if let Some(conf) = &resolv_conf {
+            write_file(&dir.join("resolv.conf"), conf.as_bytes())
+                .map_err(|e| format!("writing resolv.conf: {e}"))?;
         }
         Ok(())
     };

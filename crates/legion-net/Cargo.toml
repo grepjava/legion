@@ -8,6 +8,11 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+hickory-proto.workspace = true
 legion-sys.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
 tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }

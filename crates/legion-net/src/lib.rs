@@ -15,6 +15,8 @@ use std::net::Ipv4Addr;
 
 use legion_sys::{Destination, IfConfig, Ipv4Net, Sys};
 
+pub mod dns;
+
 pub use legion_sys::Error;
 
 /// The pod network of the whole cluster; each node gets one /24 of it.
