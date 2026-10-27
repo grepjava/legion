@@ -171,3 +171,33 @@ async fn pod_lifecycle() {
         "service still answering after shutdown"
     );
 }
+
+/// A service a killed daemon left running is stopped when the next one
+/// starts on the same socket, instead of running beside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs root and Podman; set LEGION_PODMAN_LAB"]
+async fn a_left_service_is_stopped() {
+    let lab = PathBuf::from(std::env::var("LEGION_PODMAN_LAB").expect("set LEGION_PODMAN_LAB"));
+    let config = || ServiceConfig::new(&lab.join("state"), &lab.join("run-left"));
+    let socket = config().socket.display().to_string();
+    let running = || {
+        let out = std::process::Command::new("pgrep")
+            .args(["-f", &socket])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().count()
+    };
+    let first = PodmanService::start(config(), Duration::from_secs(30))
+        .await
+        .expect("podman service");
+    // As a SIGKILL of the daemon: nothing stops the service.
+    std::mem::forget(first);
+    assert_eq!(running(), 1);
+    let second = PodmanService::start(config(), Duration::from_secs(30))
+        .await
+        .expect("podman service");
+    assert_eq!(running(), 1, "only the new service runs");
+    second.client().ping().await.unwrap();
+    second.shutdown().await;
+    assert_eq!(running(), 0);
+}

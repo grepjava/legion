@@ -170,6 +170,42 @@ impl Drop for PodmanService {
     }
 }
 
+/// Stops the service recorded in `pidfile` if it is still running and
+/// serving `socket`: the pid alone could be another process's by now.
+fn stop_stale(pidfile: &std::path::Path, socket: &std::path::Path) {
+    let Some(pid) = std::fs::read_to_string(pidfile)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    else {
+        return;
+    };
+    let pid = pid.to_string();
+    let serving = || {
+        std::process::Command::new("ps")
+            .args(["-o", "command=", "-p", &pid])
+            .output()
+            .is_ok_and(|o| {
+                String::from_utf8_lossy(&o.stdout).contains(&socket.display().to_string())
+            })
+    };
+    if !serving() {
+        return;
+    }
+    tracing::info!(pid, "stopping the podman service a previous run left");
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &pid])
+        .status();
+    for _ in 0..50 {
+        if !serving() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &pid])
+        .status();
+}
+
 fn spawn(config: &ServiceConfig) -> Result<Child, ServiceError> {
     let err = |source| ServiceError::Spawn {
         program: config.program.display().to_string(),
@@ -181,7 +217,10 @@ fn spawn(config: &ServiceConfig) -> Result<Child, ServiceError> {
     if let Some(parent) = config.socket.parent() {
         std::fs::create_dir_all(parent).map_err(err)?;
     }
-    // A socket left by a killed service would make the new one fail to bind.
+    // A service left by a killed daemon would keep running beside the new
+    // one, and its socket would make the new one fail to bind.
+    let pidfile = config.socket.with_extension("pid");
+    stop_stale(&pidfile, &config.socket);
     let _ = std::fs::remove_file(&config.socket);
     let mut child = Command::new(&config.program)
         .args(config.args())
@@ -191,6 +230,15 @@ fn spawn(config: &ServiceConfig) -> Result<Child, ServiceError> {
         .kill_on_drop(true)
         .spawn()
         .map_err(err)?;
+    if let Some(pid) = child.id() {
+        let _ = std::fs::write(
+            &pidfile,
+            format!(
+                "{pid}
+"
+            ),
+        );
+    }
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(async move {
             let mut lines = tokio::io::BufReader::new(stderr).lines();

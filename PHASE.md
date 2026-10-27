@@ -260,6 +260,12 @@ end.
 1. **Exit test**: a compose app on 3 nodes that survives losing any one
    node and updates with zero downtime.
 
+   Whole nodes cannot be VNET jails on weft-bsd: inside a jail, ocijail
+   fails creating containers ("removing rctl rules ... Operation not
+   permitted"; FreeBSD has no jail parameter allowing rctl), and Legion's
+   own rctl limits would fail the same way. The test needs bhyve guests (or
+   real machines) as nodes.
+
 Smaller follow-ups: workers renew their certificates through managers;
 `--listen` still defaults to loopback; a worker without `--advertise` has
 no WireGuard endpoint (it could use the address it reaches managers from);
