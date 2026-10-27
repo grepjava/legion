@@ -31,8 +31,8 @@ mod task;
 mod volumes;
 
 pub use control::{
-    Assignment, Assignments, Control, ControlError, Endpoints, Registration, ServiceEndpoints,
-    StoreControl, VolumeClaim,
+    Assignment, Assignments, Control, ControlError, EndpointPort, Endpoints, Registration,
+    ServiceEndpoints, StoreControl, VolumeClaim,
 };
 pub use runtime::Runtime;
 
@@ -126,9 +126,11 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         if let Err(e) = task::blocking(&ctx.sys, move |sys| bridge.ensure_bridge(sys)).await {
             tracing::error!("setting up the pod bridge: {e}; pods will fail to start");
         }
-        let gateway = net.gateway();
+        let (gateway, subnet) = (net.gateway(), net.subnet);
         let _ = ctx.net.set(net);
-        let dns = dns(ctx.control.as_ref(), gateway).await;
+        let endpoints = ctx.control.endpoints();
+        let dns = dns(endpoints.clone(), gateway).await;
+        let lb = tokio::spawn(load_balancing(ctx.sys.clone(), endpoints, subnet));
 
         let mut assignments = ctx.control.assignments(&ctx.node);
         // Nothing is reconciled before the first complete set of
@@ -215,6 +217,8 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         if let Some(dns) = dns {
             dns.abort();
         }
+        // Rules and tables stay: the pods keep running.
+        lb.abort();
         workers.clear();
         let deadline = tokio::time::sleep(Duration::from_secs(5));
         tokio::pin!(deadline);
@@ -235,7 +239,10 @@ impl<R: Runtime, C: Control> Agent<R, C> {
 /// Runs the node resolver on the pod gateway, answering from the service
 /// endpoints and relaying the rest to the host's resolvers. Pods still
 /// start without it, with names outside the cluster unresolvable.
-async fn dns<C: Control>(control: &C, gateway: Ipv4Addr) -> Option<tokio::task::JoinHandle<()>> {
+async fn dns(
+    mut endpoints: watch::Receiver<Endpoints>,
+    gateway: Ipv4Addr,
+) -> Option<tokio::task::JoinHandle<()>> {
     use legion_net::dns::{self, ServiceAddrs, Zone};
 
     let addr = SocketAddr::from((gateway, 53));
@@ -259,7 +266,6 @@ async fn dns<C: Control>(control: &C, gateway: Ipv4Addr) -> Option<tokio::task::
         tracing::warn!("no name servers in /etc/resolv.conf: only cluster names will resolve");
     }
     tracing::info!(%addr, ?upstream, "node resolver");
-    let mut endpoints = control.endpoints();
     let (tx, rx) = watch::channel(Arc::new(Zone::default()));
     Some(tokio::spawn(async move {
         let follow = async move {
@@ -278,6 +284,94 @@ async fn dns<C: Control>(control: &C, gateway: Ipv4Addr) -> Option<tokio::task::
             () = follow => {}
         }
     }))
+}
+
+/// Programs pf from the service endpoints (see [`legion_net::lb`]): VIPs,
+/// published ports, the hairpin NAT and NAT for pods going out. Failures
+/// are retried a few seconds later.
+async fn load_balancing(
+    sys: Arc<dyn Sys>,
+    mut endpoints: watch::Receiver<Endpoints>,
+    subnet: legion_sys::Ipv4Net,
+) {
+    use legion_net::lb::{self, LoadBalancer, Port, Proto, Service};
+
+    let checks = task::blocking(&sys, |sys| {
+        if let Err(e) = sys.sysctl_set("net.inet.ip.forwarding", "1") {
+            tracing::warn!("enabling IP forwarding: {e}; VIPs and NAT will not work");
+        }
+        match sys.pf_main_rules() {
+            Ok(rules) => lb::missing_hooks(&rules),
+            Err(e) => {
+                tracing::warn!("reading pf's main ruleset: {e}");
+                Vec::new()
+            }
+        }
+    })
+    .await;
+    if !checks.is_empty() {
+        tracing::warn!(
+            "pf's main ruleset does not call Legion's anchors, so VIPs, published ports \
+             and NAT for pods do nothing; add to /etc/pf.conf and reload: {}",
+            checks.join("; ")
+        );
+    }
+
+    let mut balancer = LoadBalancer::default();
+    let mut retry = false;
+    loop {
+        if retry {
+            tokio::select! {
+                r = endpoints.changed() => if r.is_err() { return },
+                () = tokio::time::sleep(Duration::from_secs(5)) => {}
+            }
+        } else if endpoints.changed().await.is_err() {
+            return;
+        }
+        let services: Vec<Service> = endpoints
+            .borrow_and_update()
+            .iter()
+            .map(|e| Service {
+                uid: e.uid.clone(),
+                vip: e.vip,
+                ports: e
+                    .ports
+                    .iter()
+                    .map(|p| Port {
+                        proto: match p.protocol {
+                            legion_api::service::Protocol::Tcp => Proto::Tcp,
+                            legion_api::service::Protocol::Udp => Proto::Udp,
+                        },
+                        port: p.port,
+                        target: p.target,
+                        published: p.published,
+                    })
+                    .collect(),
+                ready: e.ready.clone(),
+                alive: e.alive.clone(),
+            })
+            .collect();
+        let (b, result) = task::blocking(&sys, move |sys| {
+            let mut b = balancer;
+            let egress = sys.default_interface().unwrap_or_else(|e| {
+                tracing::warn!("finding the egress interface: {e}");
+                None
+            });
+            let r = b.apply(sys, &services, subnet, egress.as_deref());
+            (b, r)
+        })
+        .await;
+        balancer = b;
+        retry = match result {
+            Ok(()) => false,
+            Err(e) => {
+                tracing::warn!("programming pf for services: {e}; retrying");
+                // Start over: the anchor's state is unknown.
+                balancer = LoadBalancer::default();
+                true
+            }
+        };
+    }
 }
 
 /// Registers the node, retrying until the manager takes it.

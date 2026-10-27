@@ -1109,6 +1109,22 @@ pub enum FailureAction {
     Rollback,
 }
 
+/// Where service VIPs come from (DESIGN.md §5.2): `10.201.0.0/16`.
+pub const SERVICE_NET: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 201, 0, 0);
+pub const SERVICE_PREFIX: u8 = 16;
+/// Ports Legion picks from for `publish: ingress` without `publishedPort`.
+pub const PUBLISHED_PORTS: std::ops::RangeInclusive<u16> = 30000..=32767;
+
+/// A port the service publishes outside the cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishedPort {
+    /// The service port it leads to.
+    pub port: u16,
+    pub protocol: Protocol,
+    pub published_port: u16,
+}
+
 /// Observed state, written by the Service controller.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1118,7 +1134,11 @@ pub struct ServiceStatus {
     pub desired: u32,
     pub running: u32,
     pub ready: u32,
-    /// Assigned by the allocator when `endpoint.mode` is `vip`.
+    /// Assigned by the allocator when `endpoint.mode` is `vip` and the
+    /// service has ports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtual_ip: Option<String>,
+    /// Every published port, those Legion picked included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub published_ports: Vec<PublishedPort>,
 }

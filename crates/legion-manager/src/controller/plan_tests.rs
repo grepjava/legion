@@ -538,3 +538,77 @@ fn unscheduled_tasks_stop_without_an_agent() {
     w.settle();
     assert!(w.tasks.is_empty(), "{:?}", w.tasks());
 }
+
+fn status(w: &World, name: &str) -> ServiceStatus {
+    let s = w
+        .services
+        .iter()
+        .find(|s| s.object.metadata.name == name)
+        .unwrap();
+    serde_json::from_value(s.object.status.clone()).unwrap()
+}
+
+fn vip(w: &World, name: &str) -> Option<String> {
+    status(w, name).virtual_ip
+}
+
+fn published(w: &World, name: &str) -> Vec<(u16, u16)> {
+    status(w, name)
+        .published_ports
+        .iter()
+        .map(|p| (p.port, p.published_port))
+        .collect()
+}
+
+const PORTS: &str = r#"
+pod:
+  containers: [{ name: app, image: "app:1", ports: [{ containerPort: 8080 }] }]
+endpoint:
+  ports: [{ port: 80, targetPort: 8080 }, { port: 81, targetPort: 8080, publish: ingress }]
+"#;
+
+#[test]
+fn services_get_vips_and_published_ports() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.service("a", PORTS);
+    w.service("b", PORTS);
+    // No ports, or dnsrr: no VIP.
+    w.service(
+        "c",
+        r#"pod: { containers: [{ name: app, image: "app:1" }] }"#,
+    );
+    w.service(
+        "d",
+        r#"
+pod: { containers: [{ name: app, image: "app:1", ports: [{ containerPort: 80 }] }] }
+endpoint: { mode: dnsrr, ports: [{ port: 80, publish: host, publishedPort: 8080 }] }
+"#,
+    );
+    w.settle();
+    assert_eq!(vip(&w, "a").as_deref(), Some("10.201.0.1"));
+    assert_eq!(vip(&w, "b").as_deref(), Some("10.201.0.2"));
+    assert_eq!(vip(&w, "c"), None);
+    assert_eq!(vip(&w, "d"), None);
+    assert_eq!(published(&w, "a"), [(81, 30000)]);
+    assert_eq!(published(&w, "b"), [(81, 30001)]);
+    assert_eq!(published(&w, "d"), [(80, 8080)]);
+
+    // Addresses stay put; freed ones are reused.
+    w.delete_service("a");
+    w.service("e", PORTS);
+    w.settle();
+    assert_eq!(vip(&w, "b").as_deref(), Some("10.201.0.2"));
+    assert_eq!(vip(&w, "e").as_deref(), Some("10.201.0.1"));
+    assert_eq!(published(&w, "b"), [(81, 30001)]);
+    assert_eq!(published(&w, "e"), [(81, 30000)]);
+
+    // Dropping the ports releases the VIP.
+    w.service(
+        "b",
+        r#"pod: { containers: [{ name: app, image: "app:1", ports: [{ containerPort: 8080 }] }] }"#,
+    );
+    w.settle();
+    assert_eq!(vip(&w, "b"), None);
+    assert!(published(&w, "b").is_empty());
+}

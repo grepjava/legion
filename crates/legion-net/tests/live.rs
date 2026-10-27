@@ -10,6 +10,7 @@
 use std::net::Ipv4Addr;
 use std::process::Command;
 
+use legion_net::lb::{ANCHOR, LoadBalancer, Port, Proto, Service};
 use legion_net::{BRIDGE, MTU, PodNetwork, host_interface};
 use legion_sys::{Shell, Sys};
 
@@ -75,6 +76,67 @@ fn pods_on_the_bridge() {
     assert!(route.contains("gateway: 10.200.7.1"), "{route}");
     let (_, mtu) = sh(&format!("ifconfig -j {a} -l"));
     assert!(mtu.contains("epair"), "{mtu}");
+
+    // A service VIP on this jail's pf, with Legion's anchors hooked in.
+    assert!(sh("sysctl net.inet.ip.forwarding=1").0);
+    sh("pfctl -e");
+    let hooks = legion_net::lb::HOOKS.join("\n") + "\n";
+    let (ok, out) = sh(&format!(
+        "printf '{}' | pfctl -f -",
+        hooks.replace('"', "\\\"")
+    ));
+    assert!(ok, "{out}");
+    assert!(legion_net::lb::missing_hooks(&sys.pf_main_rules().unwrap()).is_empty());
+    let svc = |ready: &[Ipv4Addr], alive: &[Ipv4Addr]| Service {
+        uid: "00000000000000aa".into(),
+        vip: Some(Ipv4Addr::new(10, 201, 0, 1)),
+        ports: vec![Port {
+            proto: Proto::Tcp,
+            port: 80,
+            target: 8080,
+            published: None,
+        }],
+        ready: ready.to_vec(),
+        alive: alive.to_vec(),
+    };
+    let server = ips[1];
+    let mut lb = LoadBalancer::default();
+    lb.apply(&sys, &[svc(&[server], &[server])], net.subnet, None)
+        .unwrap();
+    // Pod a talks to pod b on the same bridge through the VIP: the
+    // hairpin NAT brings the reply back through the host.
+    // Background processes must not hold on to sh()'s output pipes.
+    sh(&format!(
+        "jexec {b} sh -c 'nc -l 8080 > /tmp/lnet-got 2>/dev/null </dev/null &'"
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    sh(&format!(
+        "jexec {a} sh -c '((echo through-the-vip; sleep 30) | nc 10.201.0.1 80) >/dev/null 2>&1 </dev/null &'"
+    ));
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let (_, got) = sh(&format!("jexec {b} cat /tmp/lnet-got"));
+    assert_eq!(got.trim(), "through-the-vip");
+    let to_server = |sys: &Shell| {
+        sys.pf_states()
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.addrs.contains(&server))
+            .count()
+    };
+    assert!(to_server(&sys) >= 2, "{:?}", sys.pf_states());
+    // Not ready but running: out of the table, the connection stays.
+    lb.apply(&sys, &[svc(&[], &[server])], net.subnet, None)
+        .unwrap();
+    assert!(
+        sys.pf_table_show(ANCHOR, "s00000000000000aa")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(to_server(&sys) >= 2);
+    // Gone: its connections are killed.
+    lb.apply(&sys, &[svc(&[], &[])], net.subnet, None).unwrap();
+    assert_eq!(to_server(&sys), 0, "{:?}", sys.pf_states());
+    sys.pf_flush_anchor(ANCHOR).unwrap();
 
     // Detaching removes both ends, even with the pod's end still in its jail.
     net.detach(&sys, pods[0].1).unwrap();

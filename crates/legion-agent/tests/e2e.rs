@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use legion_agent::fake::FakeRuntime;
-use legion_agent::{Agent, AgentConfig, ServiceEndpoints, StoreControl};
+use legion_agent::{Agent, AgentConfig, EndpointPort, ServiceEndpoints, StoreControl};
 use legion_api::node::{NodeState, NodeStatus};
 use legion_api::{Kind, Object};
 use legion_manager::{Manager, ManagerConfig, default_raft_config};
@@ -21,6 +21,7 @@ const INFRA: &str = "docker.io/freebsd/freebsd-runtime:15.1";
 struct Cluster {
     api: ObjectsClient<Channel>,
     rt: Arc<FakeRuntime>,
+    sys: Arc<FakeSys>,
     /// What the node resolver and load balancing see.
     endpoints: tokio::sync::watch::Receiver<legion_agent::Endpoints>,
     stop: Option<oneshot::Sender<()>>,
@@ -42,6 +43,7 @@ impl Cluster {
         .unwrap();
 
         let sys = Arc::new(FakeSys::new());
+        sys.set_default_interface("re0");
         let rt = Arc::new(FakeRuntime::new(sys.clone()));
         rt.add_image(INFRA);
         let mut config = AgentConfig::new("n1", dir.path().join("tasks"));
@@ -50,7 +52,7 @@ impl Cluster {
         let agent = Agent::new(
             config,
             rt.clone(),
-            sys as Arc<dyn Sys>,
+            sys.clone() as Arc<dyn Sys>,
             Arc::new(StoreControl::new(manager.store().clone())),
         );
         let endpoints =
@@ -93,6 +95,7 @@ impl Cluster {
         Cluster {
             api: ObjectsClient::new(channel),
             rt,
+            sys,
             endpoints,
             stop: Some(stop),
             server,
@@ -189,8 +192,10 @@ metadata: {{ name: web, namespace: shop }}
 spec:
   replicas: {replicas}
   pod:
-    containers: [{{ name: web, image: "{image}" }}]
+    containers: [{{ name: web, image: "{image}", ports: [{{ name: http, containerPort: 8080 }}] }}]
     restartPolicy: {{ condition: on-failure, maxAttempts: 1, delay: 0s }}
+  endpoint:
+    ports: [{{ port: 80, targetPort: http, publish: ingress }}]
 "#
     )
 }
@@ -220,19 +225,46 @@ async fn apply_to_running_pods() {
         s.status["running"] == 2 && s.status["ready"] == 2 && s.status["desired"] == 2
     })
     .await;
-    // Both tasks are the service's endpoints.
-    let web = |ready: &[[u8; 4]]| {
-        vec![ServiceEndpoints {
-            namespace: "shop".into(),
-            name: "web".into(),
-            vip: None,
-            ready: ready.iter().map(|&a| a.into()).collect(),
-        }]
-    };
+    // Both tasks are the service's endpoints, behind its VIP.
+    let uid = c.list(Kind::Service).await[0].metadata.uid.clone();
+    let both: Vec<std::net::Ipv4Addr> = vec![[10, 200, 0, 2].into(), [10, 200, 0, 3].into()];
     eventually("endpoints", async || {
-        *c.endpoints.borrow() == web(&[[10, 200, 0, 2], [10, 200, 0, 3]])
+        *c.endpoints.borrow()
+            == [ServiceEndpoints {
+                namespace: "shop".into(),
+                name: "web".into(),
+                uid: uid.clone(),
+                vip: Some([10, 201, 0, 1].into()),
+                ports: vec![EndpointPort {
+                    protocol: legion_api::service::Protocol::Tcp,
+                    port: 80,
+                    target: 8080,
+                    published: Some(30000),
+                }],
+                ready: both.clone(),
+                alive: both.clone(),
+            }]
     })
     .await;
+    // pf balances the VIP and the published port over the ready tasks.
+    let table = format!("s{uid}");
+    eventually("the service's pf table", async || {
+        c.sys.pf_table_show(legion_net::lb::ANCHOR, &table).unwrap() == both
+    })
+    .await;
+    let rules = c.sys.anchor(legion_net::lb::ANCHOR).unwrap();
+    assert!(
+        rules.contains(&format!(
+            "rdr pass on legion0 inet proto tcp to 10.201.0.1 port 80 tag LSVC -> <{table}> port 8080"
+        )),
+        "{rules}"
+    );
+    assert!(rules.contains("to (re0) port 30000"), "{rules}");
+    assert!(
+        rules.contains("nat pass on re0 inet from 10.200.0.0/24"),
+        "{rules}"
+    );
+    assert_eq!(c.sys.sysctl("net.inet.ip.forwarding").as_deref(), Some("1"));
     // The node registered itself and the scheduler used it.
     let nodes = c.list(Kind::Node).await;
     assert_eq!(nodes[0].metadata.name, "n1");

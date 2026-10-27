@@ -16,6 +16,7 @@ use std::net::Ipv4Addr;
 use legion_sys::{Destination, IfConfig, Ipv4Net, Sys};
 
 pub mod dns;
+pub mod lb;
 
 pub use legion_sys::Error;
 

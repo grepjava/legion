@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-use crate::{Dataset, Destination, Epair, Error, IfConfig, Jail, RctlRule, Result, Sys};
+use crate::{Dataset, Destination, Epair, Error, IfConfig, Jail, PfState, RctlRule, Result, Sys};
 
 /// Runs one program to completion.
 pub trait Runner: Send + Sync {
@@ -305,6 +305,42 @@ impl<R: Runner> Sys for Shell<R> {
             .collect()
     }
 
+    fn default_interface(&self) -> Result<Option<String>> {
+        let a = args(["-n", "get", "default"]);
+        let out = self.output("route", &a, None)?;
+        if !out.success {
+            if out.stderr.contains("not in table") {
+                return Ok(None);
+            }
+            return Err(failed("route", &a, &out));
+        }
+        Ok(out
+            .stdout
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("interface:"))
+            .map(|i| i.trim().to_owned()))
+    }
+
+    fn sysctl_set(&self, name: &str, value: &str) -> Result<()> {
+        self.run("sysctl", &[format!("{name}={value}")]).map(drop)
+    }
+
+    fn pf_main_rules(&self) -> Result<String> {
+        let nat = self.run("pfctl", &args(["-sn"]))?;
+        let filter = self.run("pfctl", &args(["-sr"]))?;
+        Ok(nat + &filter)
+    }
+
+    fn pf_states(&self) -> Result<Vec<PfState>> {
+        let out = self.run("pfctl", &args(["-ss", "-vv"]))?;
+        Ok(parse_states(&out))
+    }
+
+    fn pf_kill_state(&self, id: &str) -> Result<()> {
+        self.run("pfctl", &args(["-q", "-k", "id", "-k", id]))
+            .map(drop)
+    }
+
     fn pf_load_anchor(&self, anchor: &str, rules: &str) -> Result<()> {
         self.run_input("pfctl", &args(["-a", anchor, "-f", "-"]), Some(rules))
             .map(drop)
@@ -437,6 +473,41 @@ fn parse_mounts(out: &str, prefix: &str) -> Vec<String> {
         .collect()
 }
 
+/// States from `pfctl -ss -vv`: a line per state, then indented detail
+/// lines, one of them `id: <id> creatorid: <creator>`.
+fn parse_states(out: &str) -> Vec<PfState> {
+    let mut states = Vec::new();
+    let mut addrs: Option<Vec<Ipv4Addr>> = None;
+    for line in out.lines() {
+        if !line.starts_with(' ') {
+            addrs = Some(
+                line.split_whitespace()
+                    .filter_map(|w| {
+                        let w = w.trim_start_matches('(').trim_end_matches(')');
+                        w.rsplit_once(':')
+                            .map_or(w, |(a, _)| a)
+                            .parse::<Ipv4Addr>()
+                            .ok()
+                    })
+                    .collect(),
+            );
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        if words.next() == Some("id:")
+            && let (Some(id), Some("creatorid:"), Some(creator)) =
+                (words.next(), words.next(), words.next())
+            && let Some(addrs) = addrs.take()
+        {
+            states.push(PfState {
+                id: format!("{id}/{creator}"),
+                addrs,
+            });
+        }
+    }
+    states
+}
+
 fn route_dest(dest: Destination) -> Vec<String> {
     match dest {
         Destination::Default => vec!["default".to_owned()],
@@ -556,6 +627,61 @@ mod tests {
                 assert!(left.is_empty(), "commands not run: {left:?}");
             }
         }
+    }
+
+    #[test]
+    fn states_and_routes() {
+        let sh = Script::shell(vec![
+            (
+                "pfctl -ss -vv",
+                // Captured on FreeBSD 15.1: a connection to a VIP, through
+                // the hairpin NAT.
+                ok(
+                    "all tcp 10.200.9.3:8080 (10.201.0.1:80) <- 10.200.9.2:10226       ESTABLISHED:ESTABLISHED\n   \
+                    [311516909 + 65792] wscale 8  [2002298317 + 65792] wscale 8\n   \
+                    age 00:02:36, expires in 23:57:25, 3:2 pkts, 170:112 bytes, anchor 0\n   \
+                    id: 52f5df6a00000000 creatorid: b38009b1\n   \
+                    origif: lb0\n\
+                    all tcp 10.200.9.1:63804 (10.200.9.2:10226) -> 10.200.9.3:8080       ESTABLISHED:ESTABLISHED\n   \
+                    [2002298317 + 65792] wscale 8  [311516909 + 65792] wscale 8\n   \
+                    id: 53f5df6a00000000 creatorid: b38009b1\n",
+                ),
+            ),
+            ("pfctl -q -k id -k 52f5df6a00000000/b38009b1", ok("")),
+            (
+                "route -n get default",
+                ok(
+                    "   route to: 0.0.0.0\ndestination: 0.0.0.0\n    gateway: 192.168.100.1\n  interface: wlan0\n",
+                ),
+            ),
+            (
+                "route -n get default",
+                err("route: route has not been found\nnot in table\n"),
+            ),
+            (
+                "sysctl net.inet.ip.forwarding=1",
+                ok("net.inet.ip.forwarding: 0 -> 1\n"),
+            ),
+        ]);
+        let states = sh.pf_states().unwrap();
+        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        assert_eq!(
+            states,
+            [
+                PfState {
+                    id: "52f5df6a00000000/b38009b1".into(),
+                    addrs: vec![ip("10.200.9.3"), ip("10.201.0.1"), ip("10.200.9.2")],
+                },
+                PfState {
+                    id: "53f5df6a00000000/b38009b1".into(),
+                    addrs: vec![ip("10.200.9.1"), ip("10.200.9.2"), ip("10.200.9.3")],
+                },
+            ]
+        );
+        sh.pf_kill_state(&states[0].id).unwrap();
+        assert_eq!(sh.default_interface().unwrap().as_deref(), Some("wlan0"));
+        assert_eq!(sh.default_interface().unwrap(), None);
+        sh.sysctl_set("net.inet.ip.forwarding", "1").unwrap();
     }
 
     #[test]

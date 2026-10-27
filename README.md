@@ -43,7 +43,15 @@ shop` shows each pod's address on the node's `legion0` bridge). Pods reach
 each other and the host, and find services by name (`web`, `web.shop` or
 `web.shop.legion`) through the node's resolver on the bridge; there is no
 outbound NAT yet. Give it
-`--zfs-root <pool>/legion` to run tasks that use volumes.
+`--zfs-root <pool>/legion` to run tasks that use volumes. Service VIPs,
+published ports and NAT for pods need the host's `/etc/pf.conf` to call
+Legion's anchors:
+
+```
+nat-anchor "legion/*"
+rdr-anchor "legion/*"
+anchor "legion/*"
+```
 
 ## Layout
 

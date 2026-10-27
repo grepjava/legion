@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use legion_api::data::DataSpec;
 use legion_api::node::{NodeSpec, NodeStatus};
-use legion_api::service::ServiceStatus;
+use legion_api::service::{PortRef, Protocol, ServiceSpec, ServiceStatus};
 use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
 use legion_api::volume::{VolumeSpec, VolumeStatus};
 use legion_api::{Kind, Object, ObjectKey};
@@ -64,9 +64,24 @@ pub enum VolumeClaim {
 pub struct ServiceEndpoints {
     pub namespace: String,
     pub name: String,
+    pub uid: String,
     pub vip: Option<Ipv4Addr>,
+    pub ports: Vec<EndpointPort>,
     /// Addresses of the service's ready tasks, in order.
     pub ready: Vec<Ipv4Addr>,
+    /// Addresses of its running tasks, ready or not, in order.
+    pub alive: Vec<Ipv4Addr>,
+}
+
+/// A service port, resolved against the pod.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointPort {
+    pub protocol: Protocol,
+    pub port: u16,
+    /// The tasks' port.
+    pub target: u16,
+    /// Where it is published, if it is.
+    pub published: Option<u16>,
 }
 
 /// Every service in the cluster, by namespace and name.
@@ -442,38 +457,72 @@ fn endpoints(
     services: &BTreeMap<ObjectKey, Object>,
     tasks: &BTreeMap<ObjectKey, Object>,
 ) -> Endpoints {
-    let mut ready: BTreeMap<(&str, String), Vec<Ipv4Addr>> = BTreeMap::new();
+    /// Ready and running task addresses.
+    type Addrs = (Vec<Ipv4Addr>, Vec<Ipv4Addr>);
+    let mut by_service: BTreeMap<(&str, String), Addrs> = BTreeMap::new();
     for t in tasks.values() {
         let Ok(spec) = legion_api::parse::<TaskSpec>(&t.spec) else {
             continue;
         };
         let status: TaskStatus = serde_json::from_value(t.status.clone()).unwrap_or_default();
-        if spec.desired_state != DesiredState::Running
-            || status.state != TaskState::Running
-            || !status.ready
-        {
+        if status.state != TaskState::Running {
             continue;
         }
         let Some(ip) = status.ip.as_deref().and_then(|s| s.parse().ok()) else {
             continue;
         };
-        let service = (t.metadata.namespace.as_str(), spec.service_uid);
-        ready.entry(service).or_default().push(ip);
+        let entry = by_service
+            .entry((t.metadata.namespace.as_str(), spec.service_uid))
+            .or_default();
+        entry.1.push(ip);
+        if spec.desired_state == DesiredState::Running && status.ready {
+            entry.0.push(ip);
+        }
     }
     services
         .values()
         .map(|s| {
             let status: ServiceStatus =
                 serde_json::from_value(s.status.clone()).unwrap_or_default();
-            let mut ips = ready
+            let (mut ready, mut alive) = by_service
                 .remove(&(s.metadata.namespace.as_str(), s.metadata.uid.clone()))
                 .unwrap_or_default();
-            ips.sort();
+            ready.sort();
+            alive.sort();
+            let ports = legion_api::parse::<ServiceSpec>(&s.spec)
+                .ok()
+                .and_then(|spec| {
+                    let pod = spec.pod;
+                    let ports = spec.endpoint?.ports;
+                    Some(
+                        ports
+                            .iter()
+                            .filter_map(|p| {
+                                let target =
+                                    p.target_port.clone().unwrap_or(PortRef::Number(p.port));
+                                Some(EndpointPort {
+                                    protocol: p.protocol,
+                                    port: p.port,
+                                    target: pod.resolve_port(&target)?,
+                                    published: status
+                                        .published_ports
+                                        .iter()
+                                        .find(|o| o.port == p.port && o.protocol == p.protocol)
+                                        .map(|o| o.published_port),
+                                })
+                            })
+                            .collect(),
+                    )
+                })
+                .unwrap_or_default();
             ServiceEndpoints {
                 namespace: s.metadata.namespace.clone(),
                 name: s.metadata.name.clone(),
+                uid: s.metadata.uid.clone(),
                 vip: status.virtual_ip.as_deref().and_then(|v| v.parse().ok()),
-                ready: ips,
+                ports,
+                ready,
+                alive,
             }
         })
         .collect()

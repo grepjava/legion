@@ -19,8 +19,9 @@ Current phase: **1 — Single node**.
 ## Phase 1 — Single node
 
 Exit criterion: a multi-service app with probes and volumes runs and
-self-heals on one node. **Met** on FreeBSD 15.1 (see the exit test below);
-service VIPs and outbound NAT remain.
+self-heals on one node. **Met** on FreeBSD 15.1 (see the exit test below).
+Service VIPs and outbound NAT are built and checked in a VNET jail; the
+end-to-end check on a host waits for its pf.conf to call Legion's anchors.
 
 ### Done
 
@@ -108,6 +109,21 @@ service VIPs and outbound NAT remain.
   gets a `resolv.conf` (search `<ns>.legion legion`, `ndots:2`) from its
   tmpfs. The agent follows service endpoints through `Control`, which the
   load balancing step reuses. Not yet: stateful `<svc>-<n>` names.
+- **Service VIPs, published ports and outbound NAT** (`legion-manager`,
+  `legion-net::lb`, `legion-agent`): the Service controller gives each
+  service with ports and `mode: vip` the lowest free address in
+  `10.201.0.0/16`, and picks ports from 30000-32767 for `publish: ingress`
+  without `publishedPort`; both go in the Service status and stay put. The
+  agent enables IP forwarding and keeps the pf anchor `legion/svc` in line
+  with the endpoints: an `rdr` per VIP port and per published port (on the
+  egress interface) round-robin over a table of the ready tasks, NAT for
+  hairpin traffic on `legion0`, and NAT for pods going out. Readiness
+  changes only touch tables, so connections drain; connections of tasks
+  that are gone are killed by state id. Legion never touches the host's
+  main ruleset: pf.conf calls its anchors (`nat-anchor`, `rdr-anchor`,
+  `anchor "legion/*"`), and the agent warns when it does not. Tested with
+  fakes in CI and against real pf in a VNET jail (`legion-net`'s
+  `tests/live.rs`: VIP with hairpin, soft drain, kill).
 - **Exit test** (`crates/legion/tests/exit.rs`, run by hand on FreeBSD with
   a throwaway ZFS pool): `tests/exit/app.yaml` runs web (two replicas, HTTP
   readiness and TCP liveness probes), db (ZFS volume) and cache (tmpfs
@@ -124,10 +140,8 @@ Each step ends with tests that run in CI; steps that need jails, pf or ZFS
 also get an integration test run by hand on a FreeBSD host until CI can run
 them.
 
-1. **Service VIPs and endpoints**: allocator for VIPs, Endpoints controller,
-   pf anchors with the default-block ruleset and tables for load balancing
-   with soft drain and kill-by-key (§5.4); outbound NAT for pods. Needs the
-   host's pf to reference Legion's anchors.
+1. **VIPs on a host**: add the anchor hooks to weft-bsd's pf.conf and run
+   the exit test and a published port end to end through VIPs.
 
 ### Deferred to phase 2
 

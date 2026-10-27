@@ -6,11 +6,13 @@
 //! only delays convergence until the next call.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use legion_api::node::{Availability, NodeSpec, NodeState, NodeStatus};
 use legion_api::service::{
-    Constraint, NodeAttribute, RestartCondition, ServiceMode, ServiceSpec, ServiceStatus,
+    Constraint, EndpointMode, NodeAttribute, PUBLISHED_PORTS, Publish, PublishedPort,
+    RestartCondition, SERVICE_NET, SERVICE_PREFIX, ServiceMode, ServiceSpec, ServiceStatus,
     UpdateOrder,
 };
 use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
@@ -139,10 +141,14 @@ pub fn plan(
         memory.failed_at.entry(t.uid().to_owned()).or_insert(now);
     }
 
+    let mut addresses = addresses(services);
     let mut created: Vec<Task> = Vec::new();
     for s in services {
         let mine: Vec<&Task> = tasks.iter().filter(|t| s.owns(t)).collect();
-        service(s, &mine, nodes, memory, now, &mut plan, &mut created);
+        let addrs = addresses
+            .remove(s.object.metadata.uid.as_str())
+            .unwrap_or_default();
+        service(s, &mine, nodes, memory, now, addrs, &mut plan, &mut created);
     }
 
     // Tasks whose service is gone: stop, then delete once stopped.
@@ -158,12 +164,136 @@ pub fn plan(
     plan
 }
 
+/// A service's VIP and published ports.
+#[derive(Debug, Default)]
+struct Addresses {
+    vip: Option<Ipv4Addr>,
+    published: Vec<PublishedPort>,
+}
+
+/// VIPs and published ports for every service, by uid. What a service
+/// already has it keeps; what it newly needs it gets, lowest free first;
+/// what it no longer needs is released.
+fn addresses(services: &[Service]) -> BTreeMap<&str, Addresses> {
+    let previous = |s: &Service| -> ServiceStatus {
+        serde_json::from_value(s.object.status.clone()).unwrap_or_default()
+    };
+    let wants_vip = |s: &Service| {
+        s.spec
+            .endpoint
+            .as_ref()
+            .is_some_and(|e| e.mode == EndpointMode::Vip && !e.ports.is_empty())
+    };
+    let in_range = |ip: Ipv4Addr| {
+        let host_bits = 32 - u32::from(SERVICE_PREFIX);
+        u32::from(ip) >> host_bits == u32::from(SERVICE_NET) >> host_bits
+    };
+
+    // Kept first, in creation order, so a clash cannot move an old one.
+    let mut by_uid: Vec<&Service> = services.iter().collect();
+    by_uid.sort_by(|a, b| a.object.metadata.uid.cmp(&b.object.metadata.uid));
+    let mut out: BTreeMap<&str, Addresses> = BTreeMap::new();
+    let mut vips: BTreeSet<Ipv4Addr> = BTreeSet::new();
+    let mut ports: BTreeSet<(u16, legion_api::service::Protocol)> = BTreeSet::new();
+    // Explicitly published ports are the service's own; picked ones yield.
+    for s in &by_uid {
+        for p in s.spec.endpoint.iter().flat_map(|e| &e.ports) {
+            if let Some(n) = p.published_port {
+                ports.insert((n, p.protocol));
+            }
+        }
+    }
+    for s in &by_uid {
+        let old = previous(s);
+        let mut a = Addresses::default();
+        if wants_vip(s)
+            && let Some(ip) = old.virtual_ip.as_deref().and_then(|v| v.parse().ok())
+            && in_range(ip)
+            && vips.insert(ip)
+        {
+            a.vip = Some(ip);
+        }
+        for p in s.spec.endpoint.iter().flat_map(|e| &e.ports) {
+            if p.publish == Publish::None {
+                continue;
+            }
+            let kept = old
+                .published_ports
+                .iter()
+                .find(|o| o.port == p.port && o.protocol == p.protocol)
+                .map(|o| o.published_port);
+            let n = match (p.published_port, kept) {
+                (Some(n), _) => Some(n),
+                (None, Some(n)) if !ports.contains(&(n, p.protocol)) => {
+                    ports.insert((n, p.protocol));
+                    Some(n)
+                }
+                _ => None,
+            };
+            if let Some(n) = n {
+                a.published.push(PublishedPort {
+                    port: p.port,
+                    protocol: p.protocol,
+                    published_port: n,
+                });
+            }
+        }
+        out.insert(s.object.metadata.uid.as_str(), a);
+    }
+    // New needs, lowest free first.
+    let size = 1u32 << (32 - u32::from(SERVICE_PREFIX));
+    let base = u32::from(SERVICE_NET);
+    let mut next_vip = (1..size - 1).map(|n| Ipv4Addr::from(base + n));
+    for s in &by_uid {
+        let a = out.get_mut(s.object.metadata.uid.as_str()).expect("added");
+        if wants_vip(s) && a.vip.is_none() {
+            a.vip = next_vip.by_ref().find(|ip| !vips.contains(ip));
+            if let Some(ip) = a.vip {
+                vips.insert(ip);
+            }
+        }
+        for p in s.spec.endpoint.iter().flat_map(|e| &e.ports) {
+            if p.publish == Publish::None
+                || a.published
+                    .iter()
+                    .any(|o| o.port == p.port && o.protocol == p.protocol)
+            {
+                continue;
+            }
+            if let Some(n) = PUBLISHED_PORTS
+                .clone()
+                .find(|n| !ports.contains(&(*n, p.protocol)))
+            {
+                ports.insert((n, p.protocol));
+                a.published.push(PublishedPort {
+                    port: p.port,
+                    protocol: p.protocol,
+                    published_port: n,
+                });
+            }
+        }
+        // In the order of the spec's ports.
+        let order: Vec<(u16, legion_api::service::Protocol)> = s
+            .spec
+            .endpoint
+            .iter()
+            .flat_map(|e| &e.ports)
+            .map(|p| (p.port, p.protocol))
+            .collect();
+        a.published
+            .sort_by_key(|o| order.iter().position(|k| *k == (o.port, o.protocol)));
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 fn service(
     s: &Service,
     tasks: &[&Task],
     nodes: &[Node],
     memory: &Memory,
     now: Instant,
+    addrs: Addresses,
     plan: &mut Plan,
     created: &mut Vec<Task>,
 ) {
@@ -316,14 +446,13 @@ fn service(
         .iter()
         .filter(|t| t.active() && t.status.state == TaskState::Running)
         .collect();
-    let previous: ServiceStatus =
-        serde_json::from_value(s.object.status.clone()).unwrap_or_default();
     let status = ServiceStatus {
         observed_generation: generation,
         desired: wanted.len() as u32,
         running: running.len() as u32,
         ready: running.iter().filter(|t| t.status.ready).count() as u32,
-        virtual_ip: previous.virtual_ip,
+        virtual_ip: addrs.vip.map(|ip| ip.to_string()),
+        published_ports: addrs.published,
     };
     let status = serde_json::to_value(&status).expect("status serialises");
     if s.object.status != status {

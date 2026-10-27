@@ -436,9 +436,14 @@ default `10.88.0.0/16`, for example).
 pf does the load balancing, programmed by the agent on **every** node. All of
 this was verified in a 3-node lab (S3).
 
-- **Default-block ruleset.** Legion's main ruleset blocks by default and passes
-  with state. This is required: with a permissive ruleset, killing states has
-  no effect because packets simply pass statelessly.
+- **Legion's anchors, not the main ruleset.** The host's pf.conf belongs to
+  the operator (and to Podman's CNI, on a host that runs other containers);
+  Legion loads only the anchors under `legion/` that pf.conf calls with
+  `nat-anchor`, `rdr-anchor` and `anchor "legion/*"`. Translation rules use
+  `pass`, so they create states whatever the host's filter policy, and
+  killing a dead backend's states makes the client's next packet fail fast.
+  (A default-block policy for pod traffic belongs with network policy,
+  §5.6.)
 - One pf table per service holding its **ready** endpoints, cluster-wide.
 - East-west traffic (task to VIP):
   `rdr on legion0 proto tcp to <VIP> port 80 tag LSVC -> <svc_web> port 8080 round-robin`.

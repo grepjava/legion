@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::sync::{Mutex, MutexGuard};
 
-use crate::{Dataset, Destination, Epair, Error, IfConfig, Jail, RctlRule, Result, Sys};
+use crate::{Dataset, Destination, Epair, Error, IfConfig, Jail, PfState, RctlRule, Result, Sys};
 
 #[derive(Debug, Default)]
 pub struct FakeSys {
@@ -47,6 +47,10 @@ struct State {
     snapshots: BTreeSet<String>,
     /// tmpfs mount points, with their size.
     mounts: BTreeMap<String, Option<u64>>,
+    default_interface: Option<String>,
+    sysctls: BTreeMap<String, String>,
+    main_rules: String,
+    states: Vec<PfState>,
 }
 
 fn fail(command: &str, message: impl Into<String>) -> Error {
@@ -155,6 +159,27 @@ impl FakeSys {
 
     pub fn snapshots(&self) -> BTreeSet<String> {
         self.state().snapshots.clone()
+    }
+
+    pub fn set_default_interface(&self, name: &str) {
+        self.state().default_interface = Some(name.to_owned());
+    }
+
+    pub fn sysctl(&self, name: &str) -> Option<String> {
+        self.state().sysctls.get(name).cloned()
+    }
+
+    /// What `pfctl -sn` and `-sr` would print for the main ruleset.
+    pub fn set_main_rules(&self, rules: &str) {
+        self.state().main_rules = rules.to_owned();
+    }
+
+    pub fn add_state(&self, state: PfState) {
+        self.state().states.push(state);
+    }
+
+    pub fn states(&self) -> Vec<PfState> {
+        self.state().states.clone()
     }
 
     /// tmpfs mount points and their sizes.
@@ -391,6 +416,30 @@ impl Sys for FakeSys {
 
     fn rctl_usage(&self, jail: &str) -> Result<BTreeMap<String, u64>> {
         Ok(self.state().usage.get(jail).cloned().unwrap_or_default())
+    }
+
+    fn default_interface(&self) -> Result<Option<String>> {
+        Ok(self.state().default_interface.clone())
+    }
+
+    fn sysctl_set(&self, name: &str, value: &str) -> Result<()> {
+        self.state()
+            .sysctls
+            .insert(name.to_owned(), value.to_owned());
+        Ok(())
+    }
+
+    fn pf_main_rules(&self) -> Result<String> {
+        Ok(self.state().main_rules.clone())
+    }
+
+    fn pf_states(&self) -> Result<Vec<PfState>> {
+        Ok(self.state().states.clone())
+    }
+
+    fn pf_kill_state(&self, id: &str) -> Result<()> {
+        self.state().states.retain(|s| s.id != id);
+        Ok(())
     }
 
     fn pf_load_anchor(&self, anchor: &str, rules: &str) -> Result<()> {

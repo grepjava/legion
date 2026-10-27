@@ -78,8 +78,20 @@ pub trait Sys: Send + Sync {
     /// Current usage by resource (`memoryuse`, `pcpu`, `maxproc`, ...).
     fn rctl_usage(&self, jail: &str) -> Result<BTreeMap<String, u64>>;
 
+    /// The interface of the default route, if there is one.
+    fn default_interface(&self) -> Result<Option<String>>;
+    /// Sets a kernel variable (`sysctl name=value`).
+    fn sysctl_set(&self, name: &str, value: &str) -> Result<()>;
+
     // pf.
 
+    /// The main ruleset's translation and filter rules, as `pfctl -sn` and
+    /// `-sr` print them: enough to check that Legion's anchors are called.
+    fn pf_main_rules(&self) -> Result<String>;
+    /// Every pf state.
+    fn pf_states(&self) -> Result<Vec<PfState>>;
+    /// Kills one state by its [`PfState::id`]; one already gone is fine.
+    fn pf_kill_state(&self, id: &str) -> Result<()>;
     /// Replaces the rules of `anchor` (e.g. `legion/svc`).
     fn pf_load_anchor(&self, anchor: &str, rules: &str) -> Result<()>;
     /// Removes the rules and tables of `anchor`.
@@ -124,6 +136,16 @@ pub struct Jail {
     pub children_cur: u32,
     /// Parent's jid; 0 at the top level.
     pub parent: u32,
+}
+
+/// A pf state, as far as Legion cares: which addresses it involves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PfState {
+    /// `<id>/<creatorid>`, for [`Sys::pf_kill_state`].
+    pub id: String,
+    /// Every address on the state's line: both ends and the translated
+    /// one (the VIP of a load-balanced connection, for example).
+    pub addrs: Vec<Ipv4Addr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
