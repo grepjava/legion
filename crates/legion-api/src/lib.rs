@@ -12,6 +12,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 pub mod admit;
+pub mod compose;
 pub mod data;
 pub mod dispatch;
 pub mod node;

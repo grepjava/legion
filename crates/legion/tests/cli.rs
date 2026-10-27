@@ -179,6 +179,85 @@ spec: { pod: { containers: [{ name: db, image: postgres:17 }] } }
 }
 
 #[test]
+fn compose_stacks() {
+    let d = start_daemon();
+    ok(&d, &["init"]);
+    let dir = d._dir.path();
+    std::fs::write(dir.join("pw.txt"), "s3cret").unwrap();
+    let compose = dir.join("compose.yaml");
+    let app = r#"
+services:
+  web:
+    image: nginx:1.27
+    ports: ["8080:80"]
+    depends_on: [db]
+    deploy: { replicas: 2 }
+  db:
+    image: postgres:17
+    secrets: [db_pw]
+    volumes: ["data:/var/lib/postgresql/data"]
+volumes:
+  data: {}
+secrets:
+  db_pw: { file: pw.txt }
+"#;
+    std::fs::write(&compose, app).unwrap();
+    let file = compose.to_str().unwrap();
+
+    // Something Legion cannot honour: a warning, or a refusal with --strict.
+    let strict = legion(&d, &["stack", "deploy", "shop", "-c", file, "--strict"]);
+    assert!(!strict.status.success());
+    let stderr = String::from_utf8_lossy(&strict.stderr);
+    assert!(
+        stderr.contains("warning: services.web.depends_on"),
+        "{stderr}"
+    );
+    assert!(
+        !ok(&d, &["list", "services", "-n", "shop"]).contains("web"),
+        "nothing deployed"
+    );
+
+    let deployed = ok(&d, &["stack", "deploy", "shop", "-c", file]);
+    for line in [
+        "Namespace/shop created",
+        "Volume/shop/data created",
+        "Secret/shop/db-pw created",
+        "Service/shop/db created",
+        "Service/shop/web created",
+    ] {
+        assert!(deployed.contains(line), "{line}\n{deployed}");
+    }
+    let yaml = ok(&d, &["get", "service", "web", "-n", "shop"]);
+    assert!(yaml.contains("legion.stack: shop"), "{yaml}");
+    assert!(yaml.contains("publishedPort: 8080"), "{yaml}");
+    let again = ok(&d, &["stack", "deploy", "shop", "-c", file]);
+    assert_eq!(again.matches("unchanged").count(), 5, "{again}");
+
+    let converted = ok(&d, &["stack", "convert", "shop", "-c", file, "-n", "other"]);
+    assert_eq!(converted.matches("kind: Service").count(), 2, "{converted}");
+    assert!(converted.contains("namespace: other"), "{converted}");
+
+    // Without db, --prune removes it.
+    let web_only = app.replace("    depends_on: [db]\n", "");
+    let web_only = &web_only[..web_only.find("  db:").unwrap()];
+    std::fs::write(&compose, web_only).unwrap();
+    let pruned = ok(&d, &["stack", "deploy", "shop", "-c", file, "--prune"]);
+    assert!(pruned.contains("Service/shop/db deleted"), "{pruned}");
+    let services = ok(&d, &["list", "services", "-n", "shop"]);
+    assert!(
+        services.contains("web") && !services.contains(" db "),
+        "{services}"
+    );
+
+    // rm takes the services and secrets; volumes keep their data.
+    let removed = ok(&d, &["stack", "rm", "shop"]);
+    assert!(removed.contains("Service/shop/web deleted"), "{removed}");
+    assert!(removed.contains("Secret/shop/db-pw deleted"), "{removed}");
+    assert!(ok(&d, &["list", "volumes", "-n", "shop"]).contains("data"));
+    assert!(!legion(&d, &["stack", "rm", "shop"]).status.success());
+}
+
+#[test]
 fn a_second_manager_joins() {
     let first = start_daemon();
     ok(&first, &["init"]);

@@ -247,11 +247,18 @@ end.
   `legion rollback` applies the spec the latest update came from. Tested in
   the planner (completion, delay, pause, automatic and manual rollback) and
   through the CLI.
+- **Compose stacks** (`legion_api::compose`, `legion stack deploy`,
+  `convert`, `rm`): compose files become Services, Volumes, Secrets and
+  Configs labelled `legion.stack`, in a namespace named after the stack;
+  DESIGN.md §8 lists what maps and what is warned about (`--strict`
+  refuses). Tested: a compose file with most keys converted, interpolation,
+  errors that name the place; and through the CLI, deploy (again
+  unchanged), `--strict`, convert, `--prune` and `rm`.
 
 ### To do, in order
 
-1. **Compose `stack deploy`**.
-2. **Exit test**.
+1. **Exit test**: a compose app on 3 nodes that survives losing any one
+   node and updates with zero downtime.
 
 Smaller follow-ups: workers renew their certificates through managers;
 `--listen` still defaults to loopback; a worker without `--advertise` has

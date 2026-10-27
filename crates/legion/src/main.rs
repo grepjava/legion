@@ -137,6 +137,11 @@ enum Command {
         #[arg(short, long)]
         namespace: Option<String>,
     },
+    /// Deploy, convert or remove compose stacks.
+    Stack {
+        #[command(subcommand)]
+        command: StackCommand,
+    },
     /// Roll a service back to the spec its latest update came from.
     Rollback {
         service: String,
@@ -149,6 +154,41 @@ enum Command {
         /// Start after this version (default: changes from now on).
         #[arg(long)]
         from: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum StackCommand {
+    /// Create or update a stack's services, volumes, secrets and configs
+    /// from a compose file.
+    Deploy {
+        stack: String,
+        #[arg(short = 'c', long = "compose-file", required = true)]
+        file: PathBuf,
+        /// Namespace of the stack's objects (default: the stack's name).
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// Remove the stack's services the file no longer has.
+        #[arg(long)]
+        prune: bool,
+        /// Fail on anything Legion cannot honour instead of warning.
+        #[arg(long)]
+        strict: bool,
+    },
+    /// Print the objects a compose file becomes, as Legion YAML.
+    Convert {
+        stack: String,
+        #[arg(short = 'c', long = "compose-file", required = true)]
+        file: PathBuf,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// Remove a stack's services, secrets and configs; its volumes and
+    /// their data stay.
+    Rm {
+        stack: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
     },
 }
 

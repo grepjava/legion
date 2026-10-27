@@ -14,7 +14,7 @@ use legion_proto::v1::{
 };
 use tonic::transport::Channel;
 
-use crate::Command;
+use crate::{Command, StackCommand};
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Format {
@@ -49,31 +49,11 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
         Command::Apply { files } => {
             for file in files {
                 for object in read_objects(&file)? {
-                    let key = object.key();
-                    let resp = objects
-                        .apply(ApplyRequest {
-                            object: Some((&object).into()),
-                            ..Default::default()
-                        })
-                        .await
-                        .with_context(|| format!("applying {key}"))?
-                        .into_inner();
-                    let verb = match resp.result() {
-                        ApplyResult::Created => "created",
-                        ApplyResult::Updated => "updated",
-                        ApplyResult::Unchanged => "unchanged",
-                        ApplyResult::Unspecified => "applied",
-                    };
-                    let o = resp.object.unwrap_or_default();
-                    println!(
-                        "{}/{} {verb} (version {})",
-                        o.kind,
-                        display_name(&o),
-                        o.version
-                    );
+                    apply(&mut objects, &object).await?;
                 }
             }
         }
+        Command::Stack { command } => stack(&mut objects, command).await?,
         Command::Diff { files } => {
             let mut changed = false;
             for file in files {
@@ -216,6 +196,174 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             }
         }
     }
+    Ok(())
+}
+
+async fn apply(objects: &mut ObjectsClient<Channel>, object: &Object) -> anyhow::Result<()> {
+    let key = object.key();
+    let resp = objects
+        .apply(ApplyRequest {
+            object: Some(object.into()),
+            ..Default::default()
+        })
+        .await
+        .with_context(|| format!("applying {key}"))?
+        .into_inner();
+    let verb = match resp.result() {
+        ApplyResult::Created => "created",
+        ApplyResult::Updated => "updated",
+        ApplyResult::Unchanged => "unchanged",
+        ApplyResult::Unspecified => "applied",
+    };
+    let o = resp.object.unwrap_or_default();
+    println!(
+        "{}/{} {verb} (version {})",
+        o.kind,
+        display_name(&o),
+        o.version
+    );
+    Ok(())
+}
+
+async fn stack(objects: &mut ObjectsClient<Channel>, command: StackCommand) -> anyhow::Result<()> {
+    match command {
+        StackCommand::Deploy {
+            stack,
+            file,
+            namespace,
+            prune,
+            strict,
+        } => {
+            let namespace = namespace.unwrap_or_else(|| stack.clone());
+            let converted = convert(&file, &stack, &namespace)?;
+            if strict && !converted.warnings.is_empty() {
+                bail!("{} cannot be deployed as it is (--strict)", file.display());
+            }
+            let ns = Object::new(Kind::Namespace, "", &namespace, serde_json::json!({}));
+            apply(objects, &ns).await?;
+            for object in &converted.objects {
+                apply(objects, object).await?;
+            }
+            if prune {
+                let keep: Vec<_> = converted.objects.iter().map(Object::key).collect();
+                for o in stack_objects(objects, &stack, &namespace, &[Kind::Service]).await? {
+                    if !keep.contains(&o.key()) {
+                        delete(objects, &o).await?;
+                    }
+                }
+            }
+        }
+        StackCommand::Convert {
+            stack,
+            file,
+            namespace,
+        } => {
+            let namespace = namespace.unwrap_or_else(|| stack.clone());
+            let converted = convert(&file, &stack, &namespace)?;
+            for o in &converted.objects {
+                print!(
+                    "---\n{}",
+                    serde_yaml_ng::to_string(&serde_json::json!({
+                        "apiVersion": o.api_version,
+                        "kind": o.kind,
+                        "metadata": {
+                            "name": o.metadata.name,
+                            "namespace": o.metadata.namespace,
+                            "labels": o.metadata.labels,
+                        },
+                        "spec": o.spec,
+                    }))?
+                );
+            }
+        }
+        StackCommand::Rm { stack, namespace } => {
+            let namespace = namespace.unwrap_or_else(|| stack.clone());
+            let kinds = [Kind::Service, Kind::Secret, Kind::Config];
+            let found = stack_objects(objects, &stack, &namespace, &kinds).await?;
+            if found.is_empty() {
+                bail!("no stack {stack} in namespace {namespace}");
+            }
+            for o in found {
+                delete(objects, &o).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Converts a compose file, printing what Legion cannot honour.
+fn convert(
+    file: &Path,
+    stack: &str,
+    namespace: &str,
+) -> anyhow::Result<legion_api::compose::Stack> {
+    let text = if file == Path::new("-") {
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        s
+    } else {
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?
+    };
+    let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
+    let env = |k: &str| std::env::var(k).ok();
+    let read = |p: &str| std::fs::read(dir.join(p)).map_err(|e| e.to_string());
+    let converted = legion_api::compose::convert(
+        &text,
+        stack,
+        namespace,
+        &legion_api::compose::Inputs {
+            env: &env,
+            read: &read,
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
+    for w in &converted.warnings {
+        eprintln!("warning: {w}");
+    }
+    Ok(converted)
+}
+
+/// The objects of `kinds` that carry the stack's label.
+async fn stack_objects(
+    objects: &mut ObjectsClient<Channel>,
+    stack: &str,
+    namespace: &str,
+    kinds: &[Kind],
+) -> anyhow::Result<Vec<Object>> {
+    let mut out = Vec::new();
+    for kind in kinds {
+        let resp = objects
+            .list(ListRequest {
+                kind: kind.to_string(),
+                namespace: namespace.to_owned(),
+                match_labels: [(
+                    legion_api::compose::LABEL_STACK.to_owned(),
+                    stack.to_owned(),
+                )]
+                .into(),
+            })
+            .await?
+            .into_inner();
+        for o in resp.objects {
+            out.push(Object::try_from(o)?);
+        }
+    }
+    Ok(out)
+}
+
+async fn delete(objects: &mut ObjectsClient<Channel>, o: &Object) -> anyhow::Result<()> {
+    objects
+        .delete(DeleteRequest {
+            r#ref: Some(ObjectRef {
+                kind: o.kind.to_string(),
+                namespace: o.metadata.namespace.clone(),
+                name: o.metadata.name.clone(),
+            }),
+            expected_version: None,
+        })
+        .await
+        .with_context(|| format!("deleting {}", o.key()))?;
+    println!("{} deleted", o.key());
     Ok(())
 }
 

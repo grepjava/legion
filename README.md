@@ -69,6 +69,18 @@ legion join <worker-token> --manager 10.0.0.1:7470    # on a worker
 legion daemon --advertise 10.0.0.3
 ```
 
+Compose files deploy as stacks. Each stack gets a namespace of its name, in
+which services find each other by their compose names; what Legion cannot
+honour (bind mounts, `depends_on`, `privileged`, ...) is reported as a
+warning, or refused with `--strict`:
+
+```sh
+legion stack deploy shop -c compose.yaml
+legion stack convert shop -c compose.yaml   # the Legion YAML it becomes
+legion rollback web -n shop                 # undo the latest update
+legion stack rm shop                        # volumes and their data stay
+```
+
 ## Layout
 
 | Crate | Role |

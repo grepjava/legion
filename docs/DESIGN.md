@@ -772,6 +772,36 @@ object's labels and normalised spec against the stored one.
 `legion stack convert` writes the native YAML, for teams that want to leave
 compose behind.
 
+Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
+
+- The namespace defaults to the stack's name and services keep their
+  compose names, so `db` resolves as it would on a compose network. Names
+  become DNS labels (`db_data` is `db-data`, with a warning).
+- `${VAR}`, `${VAR:-default}`, `${VAR-default}`, `${VAR:?error}`, `$VAR`
+  and `$$` are interpolated from the CLI's environment, as `docker stack
+  deploy` does (no `.env` file); YAML merge keys work.
+- Mapped: `image`, `command` (args) and `entrypoint` (command), `environment`
+  and `env_file`, `working_dir`, `user`, `ports` (VIP port = target; short
+  and long forms, `mode: host`), `expose` (container ports only),
+  `volumes` (named volumes and `tmpfs`), `tmpfs`, `secrets` and `configs`
+  (Swarm's default targets `/run/secrets/<source>` and `/<source>`),
+  `healthcheck` (an exec probe used for both liveness and readiness, with
+  Docker's 30 s defaults), `stop_grace_period`, and under `deploy`: `mode`,
+  `replicas`, `endpoint_mode`, `labels` (on the Service), `placement`
+  (`constraints`, `preferences`), `resources` (Docker sizes are binary),
+  `restart_policy`, `update_config`.
+- Top-level `volumes` become Volumes (`x-legion: { size }` sets a quota),
+  `secrets` and `configs` with `file`, `environment` or `content` become
+  Secrets and Configs; `external` ones are referred to, not created.
+- Warned and ignored: bind mounts and anonymous volumes, `depends_on` and
+  `restart` (as `docker stack deploy` does), `rollback_config` (a rollback
+  uses the restored spec's update settings), networks (not separated
+  until §5.6), and every key Legion does not map. `--strict` refuses them.
+- `x-legion` on a service is merged into the generated spec (mappings key by
+  key, lists replaced): probes, init containers, tolerations and so on.
+- `deploy --prune` deletes the stack's Services the file no longer has;
+  `stack rm` deletes its Services, Secrets and Configs and keeps Volumes.
+
 ---
 
 ## 9. Security

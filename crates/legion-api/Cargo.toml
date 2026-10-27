@@ -12,7 +12,5 @@ base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_path_to_error.workspace = true
-thiserror.workspace = true
-
-[dev-dependencies]
 serde_yaml_ng.workspace = true
+thiserror.workspace = true
