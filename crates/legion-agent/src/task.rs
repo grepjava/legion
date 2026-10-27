@@ -1,10 +1,13 @@
 //! One worker per assigned task. It brings the pod up (or adopts the one
 //! already running after an agent restart), restarts containers under the
 //! pod's restart policy, and tears the pod down when the task ends or is
-//! stopped. Every state change is reported to the manager.
+//! stopped. Every state change is reported to the manager. Running
+//! containers are probed (see [`crate::probe`]): a failing liveness probe
+//! stops the container, which then restarts under the policy, and readiness
+//! decides the task's `ready`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -18,6 +21,7 @@ use tracing::Instrument;
 
 use crate::control::{Assignment, Control, ControlError};
 use crate::pod::{self, LABEL_CONTAINER, LABEL_ROLE, LABEL_TASK, Role};
+use crate::probe::{self, Outcome, Prober};
 use crate::runtime::Runtime;
 
 /// What the agent tells a worker.
@@ -67,13 +71,45 @@ struct Member {
     /// Restarts so far, for `maxAttempts`.
     attempts: u32,
     restart_at: Option<Instant>,
-    /// Exit code once it has finished for good.
-    done: Option<i32>,
+    /// Exit code, and what happened, once it has finished for good.
+    done: Option<(i32, String)>,
+    /// Counts the container's runs, to tell current probe reports from
+    /// stale ones.
+    run: u64,
+    prober: Option<Prober>,
+    /// Passes its readiness probe, or has none.
+    ready: bool,
+    /// Why a probe had the container stopped.
+    unhealthy: Option<String>,
+}
+
+impl Member {
+    fn new(name: &str, id: &str, running: bool) -> Member {
+        Member {
+            name: name.to_owned(),
+            id: id.to_owned(),
+            running,
+            attempts: 0,
+            restart_at: None,
+            done: None,
+            run: 0,
+            prober: None,
+            ready: false,
+            unhealthy: None,
+        }
+    }
 }
 
 struct Pod {
     infra: String,
     members: Vec<Member>,
+}
+
+impl Pod {
+    /// Every app container runs and is ready.
+    fn ready(&self) -> bool {
+        self.members.iter().all(|m| m.running && m.ready)
+    }
 }
 
 /// Why a pod could not be brought up.
@@ -91,6 +127,10 @@ struct Worker<R, C> {
     a: Assignment,
     status: TaskStatus,
     rx: mpsc::Receiver<Msg>,
+    /// The pod's readiness, reported while running.
+    ready: bool,
+    probe_tx: mpsc::UnboundedSender<probe::Report>,
+    probe_rx: mpsc::UnboundedReceiver<probe::Report>,
 }
 
 pub(crate) async fn run<R: Runtime, C: Control>(
@@ -99,7 +139,16 @@ pub(crate) async fn run<R: Runtime, C: Control>(
     rx: mpsc::Receiver<Msg>,
 ) {
     let status = a.status.clone();
-    let mut w = Worker { ctx, a, status, rx };
+    let (probe_tx, probe_rx) = mpsc::unbounded_channel();
+    let mut w = Worker {
+        ctx,
+        a,
+        status,
+        rx,
+        ready: false,
+        probe_tx,
+        probe_rx,
+    };
     let span = tracing::info_span!("task", task = %w.a.key, uid = %w.a.uid);
     w.main().instrument(span).await;
 }
@@ -142,12 +191,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
     async fn report(&mut self, state: TaskState, message: impl Into<String>) {
         self.status.state = state;
         self.status.message = message.into();
-        self.status.ready = state == TaskState::Running
-            && self
-                .pod()
-                .containers
-                .iter()
-                .all(|c| c.probes.readiness.is_none());
+        self.status.ready = state == TaskState::Running && self.ready;
         report(&self.ctx, &self.a, &self.status).await;
     }
 
@@ -204,14 +248,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 }) else {
                     break;
                 };
-                members.push(Member {
-                    name: spec.name.clone(),
-                    id: c.id.clone(),
-                    running: c.state == "running",
-                    attempts: 0,
-                    restart_at: None,
-                    done: None,
-                });
+                members.push(Member::new(&spec.name, &c.id, c.state == "running"));
             }
             if members.len() == self.pod().containers.len() {
                 tracing::info!("adopted running pod");
@@ -318,17 +355,14 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 .await
                 .map_err(|e| Abort::Failed(format!("starting container {}: {e}", c.name)))?;
             self.limit(c, &infra, &id).await;
-            members.push(Member {
-                name: c.name.clone(),
-                id,
-                running: true,
-                attempts: 0,
-                restart_at: None,
-                done: None,
-            });
+            let mut m = Member::new(&c.name, &id, true);
+            self.probe(&mut m);
+            members.push(m);
         }
+        let pod = Pod { infra, members };
+        self.ready = pod.ready();
         self.report(TaskState::Running, "").await;
-        Ok(Pod { infra, members })
+        Ok(pod)
     }
 
     /// Gives the pod its address: the one it had (an adopted pod, or a task
@@ -420,14 +454,84 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         }
     }
 
-    async fn monitor(&mut self, mut pod: Pod) {
-        // Limits are reapplied for adopted containers, in case they were
-        // lost (rules of a jail removed by hand, a host reboot).
-        for m in pod.members.iter().filter(|m| m.running) {
-            if let Some(c) = self.pod().containers.iter().find(|c| c.name == m.name) {
-                self.limit(c, &pod.infra, &m.id).await;
+    /// Starts probing a container run that has just begun. Until its
+    /// readiness probe passes, the container is not ready.
+    fn probe(&self, m: &mut Member) {
+        let Some(c) = self.pod().containers.iter().find(|c| c.name == m.name) else {
+            return;
+        };
+        m.run += 1;
+        m.ready = c.probes.readiness.is_none();
+        m.unhealthy = None;
+        let ip = self
+            .status
+            .ip
+            .as_deref()
+            .and_then(|s| s.parse::<IpAddr>().ok());
+        m.prober = probe::start(
+            &self.ctx.runtime,
+            c,
+            self.pod(),
+            ip,
+            &m.id,
+            m.run,
+            self.probe_tx.clone(),
+        );
+    }
+
+    /// Reports the pod's readiness if it changed.
+    async fn update_ready(&mut self, pod: &Pod) {
+        self.ready = pod.ready();
+        if self.status.state == TaskState::Running && self.status.ready != self.ready {
+            let message = self.status.message.clone();
+            self.report(TaskState::Running, message).await;
+        }
+    }
+
+    async fn probed(&mut self, pod: &mut Pod, r: probe::Report) {
+        let Some(m) = pod
+            .members
+            .iter_mut()
+            .find(|m| m.id == r.id && m.run == r.run && m.running)
+        else {
+            return;
+        };
+        match r.outcome {
+            Outcome::Started => tracing::info!(container = %m.name, "started"),
+            Outcome::Ready(ready) => {
+                tracing::info!(container = %m.name, ready, "readiness changed");
+                m.ready = ready;
+                self.update_ready(pod).await;
+            }
+            Outcome::Unhealthy(why) => {
+                tracing::info!(container = %m.name, "{why}; stopping it");
+                m.prober = None;
+                m.ready = false;
+                m.unhealthy = Some(why);
+                let id = m.id.clone();
+                if let Err(e) = self.ctx.runtime.stop(&id, self.grace()).await {
+                    tracing::warn!("stopping an unhealthy container: {e}");
+                }
+                self.update_ready(pod).await;
             }
         }
+    }
+
+    async fn monitor(&mut self, mut pod: Pod) {
+        // Limits are reapplied for adopted containers, in case they were
+        // lost (rules of a jail removed by hand, a host reboot), and their
+        // probes start over.
+        for i in 0..pod.members.len() {
+            if !pod.members[i].running {
+                continue;
+            }
+            let (name, id) = (pod.members[i].name.clone(), pod.members[i].id.clone());
+            if let Some(c) = self.pod().containers.iter().find(|c| c.name == name) {
+                self.limit(c, &pod.infra, &id).await;
+            }
+            self.probe(&mut pod.members[i]);
+        }
+        self.update_ready(&pod).await;
         // Containers found stopped on adoption count as exits now.
         for i in 0..pod.members.len() {
             if !pod.members[i].running && pod.members[i].done.is_none() {
@@ -476,6 +580,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                         }
                     }
                 },
+                Some(r) = self.probe_rx.recv() => self.probed(&mut pod, r).await,
                 _ = sleep_until(next_restart) => {
                     let now = Instant::now();
                     for i in 0..pod.members.len() {
@@ -493,6 +598,11 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         let policy = self.pod().restart_policy.clone();
         let m = &mut pod.members[i];
         m.running = false;
+        m.prober = None;
+        let what = match m.unhealthy.take() {
+            Some(why) => format!("container {}: {why}", m.name),
+            None => format!("container {} exited with {code}", m.name),
+        };
         let wants = match policy.condition {
             RestartCondition::Any => true,
             RestartCondition::OnFailure => code != 0,
@@ -502,16 +612,15 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         if wants && allowed {
             m.attempts += 1;
             m.restart_at = Some(Instant::now() + policy.delay.as_std());
-            let message = format!(
-                "container {} exited with {code}; restarting in {}",
-                m.name, policy.delay
-            );
+            let message = format!("{what}; restarting in {}", policy.delay);
             tracing::info!("{message}");
             self.status.restarts += 1;
+            self.ready = pod.ready();
             self.report(TaskState::Running, message).await;
         } else {
-            tracing::info!(container = %m.name, code, "container finished");
-            m.done = Some(code);
+            tracing::info!(code, "container finished: {what}");
+            m.done = Some((code, what));
+            self.update_ready(pod).await;
         }
     }
 
@@ -531,11 +640,13 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 {
                     self.limit(&c, &pod.infra, &id).await;
                 }
+                self.probe(&mut pod.members[i]);
+                self.ready = pod.ready();
                 self.report(TaskState::Running, "").await;
             }
             Err(e) => {
                 let message = format!("restarting container {}: {e}", m.name);
-                m.done = Some(-1);
+                m.done = Some((-1, message.clone()));
                 tracing::warn!("{message}");
                 self.status.message = message;
             }
@@ -561,22 +672,18 @@ impl<R: Runtime, C: Control> Worker<R, C> {
 
 /// The task's end state once every app container has finished for good.
 fn finished(pod: &Pod) -> Option<(TaskState, String, Option<i32>)> {
-    let codes: Vec<(&str, i32)> = pod
+    let done: Vec<&(i32, String)> = pod
         .members
         .iter()
-        .map(|m| m.done.map(|c| (m.name.as_str(), c)))
+        .map(|m| m.done.as_ref())
         .collect::<Option<_>>()?;
-    match codes.iter().find(|(_, c)| *c != 0) {
+    match done.into_iter().find(|(c, _)| *c != 0) {
         None => Some((
             TaskState::Complete,
             "all containers exited successfully".into(),
             Some(0),
         )),
-        Some((name, code)) => Some((
-            TaskState::Failed,
-            format!("container {name} exited with {code}"),
-            Some(*code),
-        )),
+        Some((code, what)) => Some((TaskState::Failed, what.clone(), Some(*code))),
     }
 }
 

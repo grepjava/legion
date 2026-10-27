@@ -8,7 +8,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+bytes.workspace = true
 futures.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 legion-api.workspace = true
 legion-net.workspace = true
 legion-podman.workspace = true
@@ -18,6 +23,8 @@ openraft.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tonic.workspace = true
+tonic-health.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
@@ -25,5 +32,5 @@ legion-manager.workspace = true
 legion-proto.workspace = true
 serde_yaml_ng.workspace = true
 tempfile.workspace = true
-tonic.workspace = true
+tokio-stream.workspace = true
 tracing-subscriber.workspace = true

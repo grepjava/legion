@@ -58,9 +58,8 @@ self-heals on one node.
   pod down when the task ends or stops. Pods survive agent restarts and are
   adopted; containers no task accounts for are removed. Tested in CI with
   fakes of Podman and the system; `tests/live.rs` runs a real pod on
-  FreeBSD. Not yet: probes (step 3; tasks count as ready
-  when they have no readiness probe), secrets, configs and volumes (tasks
-  using them are rejected).
+  FreeBSD. Not yet: secrets, configs and volumes (tasks using them are
+  rejected).
 - **Service controller and scheduler** (`legion-manager`, DESIGN.md §3.3):
   replicated and global services, scaling, replacement of failed tasks with
   backoff, task history, rolling updates (`parallelism`, `order`), drain and
@@ -74,6 +73,14 @@ self-heals on one node.
   address across agent restarts and removes the pair at teardown. Pods reach
   each other and the host. `tests/live.rs` in `legion-net` (in a VNET jail)
   and `legion-agent` check it on FreeBSD. Not yet: outbound NAT and pf.
+- **Probes** (`legion-agent`): startup, liveness and readiness probes per
+  container. HTTP, TCP and gRPC (`grpc.health.v1`) checks run from the host
+  against the pod's address; exec checks run in the container. A failing
+  startup or liveness probe stops the container, which then restarts under
+  the restart policy; readiness sets the Task's `ready`, which the Service
+  status counts. Probes start over after a restart and on adoption. Not
+  yet: HTTPS probes (rejected); readiness feeding Endpoints comes with
+  step 1.
 
 ### To do, in order
 
@@ -87,12 +94,10 @@ them.
    host's pf to reference Legion's anchors.
 2. **DNS**: resolver on the bridge gateway for cluster names, forwarding the
    rest (§5.5).
-3. **Probes**: liveness and readiness (TCP, HTTP, gRPC from the host; exec in
-   the container); readiness feeds Endpoints.
-4. **Secrets and configs**: per-task tmpfs, read-only nullfs mounts.
-5. **ZFS volumes**: create, mount into containers, keep across task
+3. **Secrets and configs**: per-task tmpfs, read-only nullfs mounts.
+4. **ZFS volumes**: create, mount into containers, keep across task
    restarts.
-6. **Exit test**: a multi-service app (for example web + database + cache)
+5. **Exit test**: a multi-service app (for example web + database + cache)
    with probes and a volume; kill containers and the agent and check that it
    comes back.
 

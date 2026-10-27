@@ -157,7 +157,7 @@ preconditions. Rules:
 | **Volumes** | Creates, mounts and snapshots ZFS datasets; mounts them into containers (nullfs). |
 | **Secrets** | Writes secrets and configs to a per-task tmpfs and mounts them read-only into the containers. Nothing secret touches disk. |
 | **Resources** | Applies rctl rules to **each container's own jail** (memory, CPU percentage, process and open-file limits) and `cpuset` pinning. Removes the rules when the task ends; rctl keys rules by jail name and keeps them after the jail is gone. Reads usage with `rctl -u` for metrics and autoscaling. See 6.3. |
-| **Probes** | Startup, liveness and readiness probes. TCP, HTTP and gRPC probes run from the host, which can reach every local pod IP on `legion0`; exec probes run in the container. |
+| **Probes** | Startup, liveness and readiness probes. TCP, HTTP and gRPC probes run from the host, which can reach every local pod IP on `legion0`; exec probes run in the container. One prober per running container reports only transitions to the task's worker: a failed startup or liveness probe stops the container and the restart policy decides what follows; readiness sets the Task's `ready`. HTTP passes on 2xx and 3xx; gRPC uses `grpc.health.v1.Health/Check`. |
 | **DNS** | Resolver on each node's bridge gateway address (`hickory-dns`). Answers cluster names, forwards everything else to the host's resolvers. |
 
 ### 3.5 Scheduling

@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use legion_podman::{ContainerInspect, ContainerSpec, ContainerSummary, Event, Podman, Result};
+use legion_podman::{
+    ContainerInspect, ContainerSpec, ContainerSummary, Event, ExecOutput, Podman, Result,
+};
 
 pub trait Runtime: Send + Sync + 'static {
     fn image_exists(&self, reference: &str) -> impl Future<Output = Result<bool>> + Send;
@@ -17,6 +19,8 @@ pub trait Runtime: Send + Sync + 'static {
     fn remove(&self, id: &str) -> impl Future<Output = Result<()>> + Send;
     fn inspect(&self, id: &str) -> impl Future<Output = Result<ContainerInspect>> + Send;
     fn wait(&self, id: &str) -> impl Future<Output = Result<i32>> + Send;
+    /// Runs a command in a running container and collects its output.
+    fn exec(&self, id: &str, cmd: &[String]) -> impl Future<Output = Result<ExecOutput>> + Send;
     fn list(
         &self,
         labels: &[(&str, &str)],
@@ -59,6 +63,10 @@ impl Runtime for Podman {
 
     async fn wait(&self, id: &str) -> Result<i32> {
         Podman::wait(self, id).await
+    }
+
+    async fn exec(&self, id: &str, cmd: &[String]) -> Result<ExecOutput> {
+        Podman::exec(self, id, cmd).await
     }
 
     async fn list(&self, labels: &[(&str, &str)]) -> Result<Vec<ContainerSummary>> {

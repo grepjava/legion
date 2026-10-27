@@ -490,3 +490,104 @@ async fn removes_pods_of_deleted_tasks() {
     h.start_agent();
     eventually("b removed", || h.rt.containers().is_empty()).await;
 }
+
+const PROBED: &str = r#"
+restartPolicy: { condition: any, delay: 0s }
+containers:
+  - name: app
+    image: "app:1"
+    probes:
+      readiness: { exec: { command: [/ready] }, period: 20ms, failureThreshold: 1 }
+      liveness: { exec: { command: [/alive] }, period: 20ms, failureThreshold: 2 }
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn readiness_decides_ready() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    // The same fake answer serves both probes: failing readiness alone is
+    // not possible here, so liveness tolerates it for a while.
+    let key = h
+        .task(
+            "app-1",
+            &PROBED.replace("failureThreshold: 2", "failureThreshold: 1000"),
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    eventually("ready", || h.status(&key).ready).await;
+
+    h.rt.set_exec("shop_app-1_app", 1);
+    eventually("not ready", || !h.status(&key).ready).await;
+    assert_eq!(h.status(&key).state, TaskState::Running);
+    assert_eq!(h.status(&key).restarts, 0);
+
+    h.rt.set_exec("shop_app-1_app", 0);
+    eventually("ready again", || h.status(&key).ready).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn liveness_restarts_the_container() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h.task("app-1", PROBED).await;
+    h.wait_state(&key, TaskState::Running).await;
+    eventually("ready", || h.status(&key).ready).await;
+
+    h.rt.set_exec("shop_app-1_app", 1);
+    eventually("restarted", || h.status(&key).restarts >= 1).await;
+    let st = h.status(&key);
+    assert!(
+        st.message.contains("liveness probe failed") || st.message.is_empty(),
+        "{}",
+        st.message
+    );
+    h.rt.set_exec("shop_app-1_app", 0);
+    eventually("ready after the restart", || {
+        let st = h.status(&key);
+        st.ready && st.state == TaskState::Running
+    })
+    .await;
+    let restarts = h.status(&key).restarts;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        h.status(&key).restarts,
+        restarts,
+        "healthy now: no restarts"
+    );
+    let (_, running, starts) =
+        h.rt.containers()
+            .into_iter()
+            .find(|(n, ..)| n == "shop_app-1_app")
+            .unwrap();
+    assert!(running && starts >= 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failing_startup_probe_fails_the_task() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    h.rt.set_exec("shop_app-1_app", 1);
+    let key = h
+        .task(
+            "app-1",
+            r#"
+restartPolicy: { condition: none }
+containers:
+  - name: app
+    image: "app:1"
+    probes:
+      startup: { exec: { command: [/started] }, period: 20ms, failureThreshold: 3 }
+      readiness: { exec: { command: [/ready] }, period: 20ms }
+"#,
+        )
+        .await;
+    let st = h.wait_state(&key, TaskState::Failed).await;
+    assert!(!st.ready);
+    assert!(
+        st.message
+            .contains("startup probe failed: \"/started\" exited with 1: unhealthy"),
+        "{}",
+        st.message
+    );
+    assert!(h.rt.containers().is_empty(), "pod removed");
+}

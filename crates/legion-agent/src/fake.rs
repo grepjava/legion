@@ -5,7 +5,8 @@
 //! jail goes away, stopping the infra jail kills the pod, and every death
 //! is reported as a `died` event carrying the container's labels. Starting
 //! a container clears its jail's rctl rules, as ocijail with rctl support
-//! does.
+//! does. Exec runs nothing: each container answers with the exit code
+//! set by [`FakeRuntime::set_exec`], 0 by default.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -15,7 +16,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use legion_podman::{
     Actor, ContainerConfig, ContainerInspect, ContainerSpec, ContainerState, ContainerSummary,
-    Error, Event, Result,
+    Error, Event, ExecOutput, Result,
 };
 use legion_sys::FakeSys;
 use tokio::sync::broadcast;
@@ -41,6 +42,9 @@ struct State {
     /// Exit code of init containers, which exit as soon as they start.
     init_exit_code: i32,
     created: usize,
+    /// Exit code of exec in containers, by container name.
+    exec: BTreeMap<String, i32>,
+    execs: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +90,16 @@ impl FakeRuntime {
 
     pub fn set_init_exit_code(&self, code: i32) {
         self.state().init_exit_code = code;
+    }
+
+    /// Exec in the container `name` exits with `code` from now on.
+    pub fn set_exec(&self, name: &str, code: i32) {
+        self.state().exec.insert(name.to_owned(), code);
+    }
+
+    /// Execs run so far.
+    pub fn execs(&self) -> usize {
+        self.state().execs
     }
 
     /// Containers created so far, removed ones included.
@@ -311,6 +325,30 @@ impl Runtime for FakeRuntime {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    async fn exec(&self, id: &str, _cmd: &[String]) -> Result<ExecOutput> {
+        let mut s = self.state();
+        let c = s
+            .containers
+            .get(id)
+            .ok_or_else(|| api(404, "no such container"))?;
+        if !c.running {
+            return Err(api(500, "container state improper"));
+        }
+        let code = s.exec.get(&c.spec.name).copied().unwrap_or(0);
+        s.execs += 1;
+        Ok(ExecOutput {
+            exit_code: code,
+            stderr: if code == 0 {
+                vec![]
+            } else {
+                b"unhealthy
+"
+                .to_vec()
+            },
+            ..Default::default()
+        })
     }
 
     async fn list(&self, labels: &[(&str, &str)]) -> Result<Vec<ContainerSummary>> {

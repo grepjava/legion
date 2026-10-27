@@ -130,7 +130,18 @@ async fn agent_runs_a_real_pod() {
         "containers": [{
             "name": "app",
             "image": IMAGE,
-            "command": ["/bin/sh", "-c", "echo started; exec sleep 3600"],
+            "command": ["/bin/sh", "-c", ": > /tmp/dead; echo started; exec sleep 3600"],
+            // The image has no utilities to spare: only sh builtins.
+            "probes": {
+                "readiness": {
+                    "exec": { "command": ["/bin/sh", "-c", "test -e /tmp/ready"] },
+                    "period": "1s", "failureThreshold": 1,
+                },
+                "liveness": {
+                    "exec": { "command": ["/bin/sh", "-c", "test ! -s /tmp/dead"] },
+                    "period": "1s", "failureThreshold": 2,
+                },
+            },
             "env": [{ "name": "GREETING", "value": "hello" }],
             "resources": { "limits": { "memory": "256Mi", "maxproc": 32 } },
         }],
@@ -159,6 +170,10 @@ async fn agent_runs_a_real_pod() {
     let infra = podman.inspect("lab_web-1").await.unwrap();
     let app = podman.inspect("lab_web-1_app").await.unwrap();
     assert!(infra.state.running && app.state.running);
+    assert!(
+        !status(&store, &key).ready,
+        "readiness probe not passed yet"
+    );
 
     // The pod has its address on the node's bridge, reachable from the host.
     let ip = status(&store, &key).ip.expect("pod address");
@@ -208,11 +223,39 @@ async fn agent_runs_a_real_pod() {
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&env.stdout), "hello\n");
 
+    // Readiness follows its probe.
+    let sh_in = async |cmd: &str| {
+        podman
+            .exec(&app.id, &["/bin/sh".into(), "-c".into(), cmd.into()])
+            .await
+            .unwrap()
+    };
+    sh_in(": > /tmp/ready").await;
+    eventually("ready", 15, async || status(&store, &key).ready).await;
+
     // A killed container is restarted under the policy.
     podman.kill(&app.id, "SIGKILL").await.unwrap();
     eventually("restart", 30, async || {
         status(&store, &key).restarts == 1
             && podman.inspect(&app.id).await.is_ok_and(|c| c.state.running)
+    })
+    .await;
+
+    // A failing liveness probe restarts the container too; the command
+    // clears the marker, so it comes back healthy and, its ready file
+    // still there, ready.
+    eventually("ready after the restart", 15, async || {
+        status(&store, &key).ready
+    })
+    .await;
+    sh_in("echo dead > /tmp/dead").await;
+    eventually("liveness restart", 30, async || {
+        status(&store, &key).restarts == 2
+    })
+    .await;
+    eventually("healthy and ready", 30, async || {
+        let st = status(&store, &key);
+        st.ready && st.state == TaskState::Running
     })
     .await;
 
@@ -225,6 +268,8 @@ async fn agent_runs_a_real_pod() {
     assert_eq!(again.id, app.id, "the pod was adopted, not recreated");
     assert!(again.state.running);
     assert_eq!(status(&store, &key).state, TaskState::Running);
+    eventually("adopted pod ready", 15, async || status(&store, &key).ready).await;
+    assert_eq!(status(&store, &key).restarts, 2);
 
     // Shutting the task down removes containers, jails and limits.
     let mut o = store.get(&key).unwrap().unwrap();

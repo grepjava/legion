@@ -22,6 +22,7 @@ use tokio::task::JoinSet;
 pub mod control;
 pub mod fake;
 pub mod pod;
+mod probe;
 pub mod runtime;
 mod task;
 

@@ -164,6 +164,18 @@ pub fn unsupported(pod: &PodSpec) -> Option<String> {
                 c.name
             ));
         }
+        let probes = &c.probes;
+        if [&probes.startup, &probes.liveness, &probes.readiness]
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.http.as_ref())
+            .any(|h| h.scheme == legion_api::service::HttpScheme::Https)
+        {
+            return Some(format!(
+                "container {}: HTTPS probes are not supported yet",
+                c.name
+            ));
+        }
         if let Some(e) = c.env.iter().find(|e| e.value.is_none()) {
             return Some(format!(
                 "container {}: env {} from a secret or config is not supported yet",
