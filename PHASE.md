@@ -58,8 +58,7 @@ self-heals on one node.
   pod down when the task ends or stops. Pods survive agent restarts and are
   adopted; containers no task accounts for are removed. Tested in CI with
   fakes of Podman and the system; `tests/live.rs` runs a real pod on
-  FreeBSD. Not yet: secrets, configs and volumes (tasks using them are
-  rejected).
+  FreeBSD. Not yet: volumes (tasks using them are rejected).
 - **Service controller and scheduler** (`legion-manager`, DESIGN.md §3.3):
   replicated and global services, scaling, replacement of failed tasks with
   backoff, task history, rolling updates (`parallelism`, `order`), drain and
@@ -81,6 +80,15 @@ self-heals on one node.
   status counts. Probes start over after a restart and on adoption. Not
   yet: HTTPS probes (rejected); readiness feeding Endpoints comes with
   step 1.
+- **Secrets and configs** (`legion-agent`, `legion-sys`): when a pod starts,
+  the agent reads the Secrets and Configs its containers name, writes them
+  to a tmpfs of the task's own and bind-mounts each file read-only (nullfs)
+  into the container that asked for it, at `/run/secrets/<name>`,
+  `/run/configs/<name>` or its `target`; values for environment variables
+  are passed to Podman. A missing one fails the task, so the controller
+  retries with backoff. The tmpfs goes with the pod, and the agent removes
+  any it finds for a task it does not run. Values are read at pod start: a
+  changed Secret reaches a task when its pod next starts.
 
 ### To do, in order
 
@@ -94,10 +102,9 @@ them.
    host's pf to reference Legion's anchors.
 2. **DNS**: resolver on the bridge gateway for cluster names, forwarding the
    rest (§5.5).
-3. **Secrets and configs**: per-task tmpfs, read-only nullfs mounts.
-4. **ZFS volumes**: create, mount into containers, keep across task
+3. **ZFS volumes**: create, mount into containers, keep across task
    restarts.
-5. **Exit test**: a multi-service app (for example web + database + cache)
+4. **Exit test**: a multi-service app (for example web + database + cache)
    with probes and a volume; kill containers and the agent and check that it
    comes back.
 

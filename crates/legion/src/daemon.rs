@@ -96,7 +96,7 @@ async fn start_agent(
     .await
     .context("starting Legion's Podman service")?;
 
-    let mut config = AgentConfig::new(&node);
+    let mut config = AgentConfig::new(&node, opts.run_dir.join("tasks"));
     if let Some(image) = &opts.infra_image {
         config.infra_image = image.clone();
     }

@@ -1,8 +1,9 @@
 //! [`Sys`] in memory, for tests of the agent. It models what the agent
 //! relies on: interfaces live in one network stack at a time and return to
 //! the host when their jail goes away; rctl rules, pf anchors and tables, and
-//! datasets are kept as given. Failures mirror the real tools' (missing
-//! interface, missing jail, existing dataset).
+//! datasets and mounts are kept as given. Failures mirror the real tools'
+//! (missing interface, missing jail, existing dataset, unmounting what is
+//! not mounted).
 //!
 //! Jails are created by Podman in production, so tests add them with
 //! [`FakeSys::add_jail`] and remove them with [`FakeSys::remove_jail`].
@@ -44,6 +45,8 @@ struct State {
     tables: BTreeMap<(String, String), Vec<Ipv4Addr>>,
     datasets: BTreeMap<String, Dataset>,
     snapshots: BTreeSet<String>,
+    /// tmpfs mount points, with their size.
+    mounts: BTreeMap<String, u64>,
 }
 
 fn fail(command: &str, message: impl Into<String>) -> Error {
@@ -152,6 +155,11 @@ impl FakeSys {
 
     pub fn snapshots(&self) -> BTreeSet<String> {
         self.state().snapshots.clone()
+    }
+
+    /// tmpfs mount points and their sizes.
+    pub fn tmpfs_mounts(&self) -> BTreeMap<String, u64> {
+        self.state().mounts.clone()
     }
 }
 
@@ -513,6 +521,41 @@ impl Sys for FakeSys {
         s.snapshots
             .retain(|d| !d.starts_with(&snap) && !d.starts_with(&child));
         Ok(())
+    }
+
+    fn mount_tmpfs(&self, path: &str, size: u64) -> Result<()> {
+        let mut s = self.state();
+        if s.mounts.contains_key(path) {
+            // The real mount would stack a second file system on the first.
+            return Err(fail("mount", format!("{path}: already mounted (fake)")));
+        }
+        s.mounts.insert(path.to_owned(), size);
+        Ok(())
+    }
+
+    fn unmount(&self, path: &str) -> Result<()> {
+        match self.state().mounts.remove(path) {
+            Some(_) => Ok(()),
+            None => Err(fail(
+                "umount",
+                format!("{path}: not a file system root directory"),
+            )),
+        }
+    }
+
+    fn mounts(&self, prefix: &str) -> Result<Vec<String>> {
+        let prefix = prefix.trim_end_matches('/');
+        Ok(self
+            .state()
+            .mounts
+            .keys()
+            .filter(|p| {
+                *p == prefix
+                    || p.strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+            .cloned()
+            .collect())
     }
 }
 

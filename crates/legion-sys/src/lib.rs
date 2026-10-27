@@ -1,8 +1,9 @@
 //! FreeBSD system operations the agent needs (DESIGN.md §3.6): jails,
-//! interfaces and routes, rctl, pf anchors and tables, and ZFS datasets.
+//! interfaces and routes, rctl, pf anchors and tables, ZFS datasets and
+//! tmpfs mounts.
 //!
 //! [`Sys`] is the interface. [`Shell`] implements it by running `jls`,
-//! `jail`, `ifconfig`, `route`, `rctl`, `pfctl` and `zfs`, with the forms
+//! `jail`, `ifconfig`, `route`, `rctl`, `pfctl`, `zfs` and `mount`, with the forms
 //! checked on FreeBSD 15.1; native ioctl versions can replace single methods
 //! later. [`FakeSys`] keeps the same state in memory for tests of the layers
 //! above.
@@ -99,6 +100,16 @@ pub trait Sys: Send + Sync {
     fn zfs_set(&self, name: &str, prop: &str, value: &str) -> Result<()>;
     fn zfs_snapshot(&self, snapshot: &str) -> Result<()>;
     fn zfs_destroy(&self, name: &str, recursive: bool) -> Result<()>;
+
+    // Mounts.
+
+    /// Mounts a memory-backed file system of at most `size` bytes on the
+    /// existing directory `path`; only root may enter it.
+    fn mount_tmpfs(&self, path: &str, size: u64) -> Result<()>;
+    /// Unmounts `path`, forcibly: callers unmount only what nothing uses.
+    fn unmount(&self, path: &str) -> Result<()>;
+    /// Mount points at or below `prefix`.
+    fn mounts(&self, prefix: &str) -> Result<Vec<String>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

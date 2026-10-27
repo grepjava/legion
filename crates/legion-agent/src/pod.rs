@@ -158,12 +158,6 @@ pub fn unsupported(pod: &PodSpec) -> Option<String> {
                 c.name
             ));
         }
-        if !c.secrets.is_empty() || !c.configs.is_empty() {
-            return Some(format!(
-                "container {}: secret and config files are not supported yet",
-                c.name
-            ));
-        }
         let probes = &c.probes;
         if [&probes.startup, &probes.liveness, &probes.readiness]
             .into_iter()
@@ -174,12 +168,6 @@ pub fn unsupported(pod: &PodSpec) -> Option<String> {
             return Some(format!(
                 "container {}: HTTPS probes are not supported yet",
                 c.name
-            ));
-        }
-        if let Some(e) = c.env.iter().find(|e| e.value.is_none()) {
-            return Some(format!(
-                "container {}: env {} from a secret or config is not supported yet",
-                c.name, e.name
             ));
         }
     }

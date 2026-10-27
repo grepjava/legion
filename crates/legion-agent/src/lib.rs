@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ use tokio::task::JoinSet;
 
 pub mod control;
 pub mod fake;
+mod files;
 pub mod pod;
 mod probe;
 pub mod runtime;
@@ -45,14 +47,18 @@ pub struct AgentConfig {
     /// How often to check containers against assignments regardless of
     /// events.
     pub resync: Duration,
+    /// Holds a tmpfs per task with its secrets and configs. The agent owns
+    /// it: entries no task accounts for are removed.
+    pub files_dir: PathBuf,
 }
 
 impl AgentConfig {
-    pub fn new(node: &str) -> Self {
+    pub fn new(node: &str, files_dir: impl Into<PathBuf>) -> Self {
         AgentConfig {
             node: node.to_owned(),
             infra_image: "docker.io/freebsd/freebsd-runtime:15.1".to_owned(),
             resync: Duration::from_secs(30),
+            files_dir: files_dir.into(),
         }
     }
 }
@@ -77,6 +83,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 control,
                 node: config.node,
                 infra_image: config.infra_image,
+                files_dir: config.files_dir,
                 net: Arc::default(),
                 ips: Arc::default(),
             },
@@ -284,16 +291,21 @@ async fn reconcile<R: Runtime, C: Control>(
             return;
         }
     };
+    let root = ctx.files_dir.clone();
+    let with_files = tokio::task::spawn_blocking(move || files::present(&root))
+        .await
+        .unwrap_or_default();
     let orphans: BTreeSet<String> = found
         .iter()
         .filter_map(|c| c.labels.get(LABEL_TASK).cloned())
+        .chain(with_files)
         .filter(|uid| !workers.contains_key(uid) && !cleaning.contains(uid))
         .collect();
     for uid in orphans {
         let grace = assignments.get(&uid).map_or(Duration::from_secs(10), |a| {
             a.spec.pod.stop_grace_period.as_std()
         });
-        tracing::info!(uid, "removing containers of a task not assigned here");
+        tracing::info!(uid, "removing what is left of a task not assigned here");
         cleaning.insert(uid.clone());
         let ctx = ctx.clone();
         cleanups.spawn(async move {

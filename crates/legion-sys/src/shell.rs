@@ -401,6 +401,37 @@ impl<R: Runner> Sys for Shell<R> {
         };
         self.run("zfs", &a).map(drop)
     }
+
+    fn mount_tmpfs(&self, path: &str, size: u64) -> Result<()> {
+        let opts = format!("size={size},mode=0700");
+        self.run("mount", &args(["-t", "tmpfs", "-o", &opts, "tmpfs", path]))
+            .map(drop)
+    }
+
+    fn unmount(&self, path: &str) -> Result<()> {
+        self.run("umount", &args(["-f", path])).map(drop)
+    }
+
+    fn mounts(&self, prefix: &str) -> Result<Vec<String>> {
+        let out = self.run("mount", &args(["-p"]))?;
+        Ok(parse_mounts(&out, prefix))
+    }
+}
+
+/// Mount points from `mount -p` (fstab lines: source, mount point, type,
+/// options, dump, pass) at or below `prefix`. fstab escapes spaces in
+/// paths as `\040`.
+fn parse_mounts(out: &str, prefix: &str) -> Vec<String> {
+    let prefix = prefix.trim_end_matches('/');
+    out.lines()
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .map(|p| p.replace("\\040", " "))
+        .filter(|p| {
+            p == prefix
+                || p.strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .collect()
 }
 
 fn route_dest(dest: Destination) -> Vec<String> {
@@ -522,6 +553,35 @@ mod tests {
                 assert!(left.is_empty(), "commands not run: {left:?}");
             }
         }
+    }
+
+    #[test]
+    fn mounts() {
+        let sh = Script::shell(vec![
+            (
+                "mount -t tmpfs -o size=1048576,mode=0700 tmpfs /var/run/legion/tasks/t1",
+                ok(""),
+            ),
+            (
+                "mount -p",
+                // Captured on FreeBSD 15.1, with the task mounts added.
+                ok("/dev/ada0p2\t\t/\t\t\tufs\trw\t\t1 1\n\
+                    devfs\t\t\t/dev\t\t\tdevfs\trw\t\t0 0\n\
+                    tmpfs\t\t\t/var/run/legion/tasks/t1\ttmpfs\trw,size=1048576,mode=0700\t0 0\n\
+                    tmpfs\t\t\t/var/run/legion/tasks-other\ttmpfs\trw\t0 0\n\
+                    /var/run/legion/tasks/t1/web/s\t/var/run/legion/tasks/t1/web/x\\040y\tnullfs\tro\t0 0\n"),
+            ),
+            ("umount -f /var/run/legion/tasks/t1", ok("")),
+        ]);
+        sh.mount_tmpfs("/var/run/legion/tasks/t1", 1 << 20).unwrap();
+        assert_eq!(
+            sh.mounts("/var/run/legion/tasks/").unwrap(),
+            [
+                "/var/run/legion/tasks/t1",
+                "/var/run/legion/tasks/t1/web/x y"
+            ]
+        );
+        sh.unmount("/var/run/legion/tasks/t1").unwrap();
     }
 
     #[test]

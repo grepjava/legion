@@ -119,6 +119,15 @@ impl FakeRuntime {
         v
     }
 
+    /// The spec a container was created with.
+    pub fn spec(&self, name: &str) -> Option<ContainerSpec> {
+        self.state()
+            .containers
+            .values()
+            .find(|c| c.spec.name == name)
+            .map(|c| c.spec.clone())
+    }
+
     pub fn id_of(&self, name: &str) -> Option<String> {
         self.state()
             .containers

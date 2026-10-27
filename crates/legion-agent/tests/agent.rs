@@ -74,7 +74,7 @@ impl Harness {
     }
 
     fn start_agent(&mut self) {
-        let mut config = AgentConfig::new(NODE);
+        let mut config = AgentConfig::new(NODE, self.files_dir());
         config.infra_image = INFRA.into();
         config.resync = Duration::from_millis(100);
         let agent = Agent::new(
@@ -93,6 +93,10 @@ impl Harness {
             let _ = rx.await;
         }));
         self.agent = Some((tx, handle));
+    }
+
+    fn files_dir(&self) -> std::path::PathBuf {
+        self._dir.path().join("tasks")
     }
 
     async fn stop_agent(&mut self) {
@@ -590,4 +594,124 @@ containers:
         st.message
     );
     assert!(h.rt.containers().is_empty(), "pod removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn secrets_and_configs() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    for (kind, name, spec) in [
+        (
+            Kind::Secret,
+            "db-password",
+            serde_json::json!({ "text": "s3cret" }),
+        ),
+        (
+            Kind::Config,
+            "app-conf",
+            serde_json::json!({ "text": "level = debug\n" }),
+        ),
+    ] {
+        h.write(
+            Object::new(kind, "shop", name, spec),
+            Precondition::MustNotExist,
+        )
+        .await;
+    }
+    let key = h
+        .task(
+            "app-1",
+            r#"
+containers:
+  - name: app
+    image: "app:1"
+    secrets: [{ name: db-password }]
+    configs: [{ name: app-conf, target: /etc/app.conf }]
+    env: [{ name: DB_PASSWORD, secret: db-password }, { name: MODE, value: prod }]
+  - name: sidecar
+    image: "app:1"
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    let uid = h.store.get(&key).unwrap().unwrap().metadata.uid;
+    let dir = h.files_dir().join(&uid);
+
+    // The task's files live on a tmpfs of its own...
+    let mounts = h.sys.tmpfs_mounts();
+    assert_eq!(
+        mounts.keys().collect::<Vec<_>>(),
+        [dir.to_str().unwrap()],
+        "{mounts:?}"
+    );
+    let secret = dir.join("secrets").join("db-password");
+    let config = dir.join("configs").join("app-conf");
+    assert_eq!(std::fs::read_to_string(&secret).unwrap(), "s3cret");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), "level = debug\n");
+
+    // ...mounted read-only into the container that asked for them only.
+    let spec = h.rt.spec("shop_app-1_app").unwrap();
+    let mounts: Vec<_> = spec
+        .mounts
+        .iter()
+        .map(|m| {
+            (
+                m.source.as_str(),
+                m.destination.as_str(),
+                m.kind.as_str(),
+                m.options.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        mounts,
+        [
+            (
+                secret.to_str().unwrap(),
+                "/run/secrets/db-password",
+                "nullfs",
+                vec!["ro".to_owned()]
+            ),
+            (
+                config.to_str().unwrap(),
+                "/etc/app.conf",
+                "nullfs",
+                vec!["ro".to_owned()]
+            ),
+        ]
+    );
+    assert_eq!(spec.env["DB_PASSWORD"], "s3cret");
+    assert_eq!(spec.env["MODE"], "prod");
+    let sidecar = h.rt.spec("shop_app-1_sidecar").unwrap();
+    assert!(sidecar.mounts.is_empty() && sidecar.env.is_empty());
+
+    // Shutting down removes the files with the pod.
+    h.shut_down(&key).await;
+    h.wait_state(&key, TaskState::Shutdown).await;
+    assert!(h.sys.tmpfs_mounts().is_empty());
+    assert!(!dir.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn missing_secret_fails_the_task() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task(
+            "app-1",
+            r#"containers: [{ name: app, image: "app:1", env: [{ name: TOKEN, secret: nope }] }]"#,
+        )
+        .await;
+    let st = h.wait_state(&key, TaskState::Failed).await;
+    assert_eq!(st.message, "secret nope not found");
+    assert!(h.rt.containers().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removes_files_of_unknown_tasks() {
+    let h = Harness::new().await;
+    let stale = h.files_dir().join("0123456789abcdef");
+    std::fs::create_dir_all(stale.join("secrets")).unwrap();
+    std::fs::write(stale.join("secrets").join("old"), "x").unwrap();
+    eventually("stale files removed", || !stale.exists()).await;
 }

@@ -20,6 +20,7 @@ use tokio::time::Instant;
 use tracing::Instrument;
 
 use crate::control::{Assignment, Control, ControlError};
+use crate::files;
 use crate::pod::{self, LABEL_CONTAINER, LABEL_ROLE, LABEL_TASK, Role};
 use crate::probe::{self, Outcome, Prober};
 use crate::runtime::Runtime;
@@ -42,6 +43,7 @@ pub(crate) struct Ctx<R, C> {
     pub control: Arc<C>,
     pub node: String,
     pub infra_image: String,
+    pub files_dir: std::path::PathBuf,
     /// Set once the node has registered, before any worker starts.
     pub net: Arc<OnceLock<PodNetwork>>,
     /// Pod addresses in use, by task uid.
@@ -56,6 +58,7 @@ impl<R, C> Clone for Ctx<R, C> {
             control: self.control.clone(),
             node: self.node.clone(),
             infra_image: self.infra_image.clone(),
+            files_dir: self.files_dir.clone(),
             net: self.net.clone(),
             ips: self.ips.clone(),
         }
@@ -292,6 +295,15 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             }
         }
 
+        let files = files::prepare(
+            self.ctx.control.as_ref(),
+            &self.ctx.sys,
+            &self.ctx.files_dir,
+            &self.a,
+        )
+        .await
+        .map_err(Abort::Failed)?;
+
         let infra = rt
             .create(&pod::infra_spec(
                 &self.ctx.node,
@@ -310,14 +322,10 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             .await;
         let init: Vec<_> = self.pod().init_containers.clone();
         for c in &init {
+            let mut spec = pod::container_spec(&self.ctx.node, &self.a, c, Role::Init, &infra);
+            files.apply(&c.name, &mut spec);
             let id = rt
-                .create(&pod::container_spec(
-                    &self.ctx.node,
-                    &self.a,
-                    c,
-                    Role::Init,
-                    &infra,
-                ))
+                .create(&spec)
                 .await
                 .map_err(|e| Abort::Failed(format!("creating init container {}: {e}", c.name)))?;
             rt.start(&id)
@@ -341,14 +349,10 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         let mut members = Vec::new();
         let apps: Vec<_> = self.pod().containers.clone();
         for c in &apps {
+            let mut spec = pod::container_spec(&self.ctx.node, &self.a, c, Role::App, &infra);
+            files.apply(&c.name, &mut spec);
             let id = rt
-                .create(&pod::container_spec(
-                    &self.ctx.node,
-                    &self.a,
-                    c,
-                    Role::App,
-                    &infra,
-                ))
+                .create(&spec)
                 .await
                 .map_err(|e| Abort::Failed(format!("creating container {}: {e}", c.name)))?;
             rt.start(&id)
@@ -750,6 +754,10 @@ pub(crate) async fn teardown<R: Runtime, C: Control>(ctx: &Ctx<R, C>, uid: &str,
     .await;
     if let Err(e) = result {
         tracing::warn!(uid, "removing limits: {e}");
+    }
+    let (root, id) = (ctx.files_dir.clone(), uid.to_owned());
+    if let Err(e) = blocking(&ctx.sys, move |sys| files::release(sys, &root, &id)).await {
+        tracing::warn!(uid, "removing secrets and configs: {e}");
     }
 }
 

@@ -42,7 +42,7 @@ impl Cluster {
         let sys = Arc::new(FakeSys::new());
         let rt = Arc::new(FakeRuntime::new(sys.clone()));
         rt.add_image(INFRA);
-        let mut config = AgentConfig::new("n1");
+        let mut config = AgentConfig::new("n1", dir.path().join("tasks"));
         config.infra_image = INFRA.into();
         config.resync = Duration::from_millis(100);
         let agent = Agent::new(

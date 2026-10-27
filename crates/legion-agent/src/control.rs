@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::Duration;
 
+use legion_api::data::DataSpec;
 use legion_api::node::{NodeSpec, NodeStatus};
 use legion_api::task::{TaskSpec, TaskStatus};
 use legion_api::{Kind, Object, ObjectKey};
@@ -71,6 +72,14 @@ pub trait Control: Send + Sync + 'static {
         uid: &str,
         status: &TaskStatus,
     ) -> impl Future<Output = Result<(), ControlError>> + Send;
+
+    /// The value of a `Secret` or `Config`; `None` if it does not exist.
+    fn data(
+        &self,
+        namespace: &str,
+        kind: Kind,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, ControlError>> + Send;
 }
 
 /// [`Control`] over the local store.
@@ -219,6 +228,22 @@ impl Control for StoreControl {
             }
         }
         Err(ControlError::Unavailable(format!("{key} keeps changing")))
+    }
+
+    async fn data(
+        &self,
+        namespace: &str,
+        kind: Kind,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, ControlError> {
+        let Some(o) = self.get(&ObjectKey::new(kind, namespace, name))? else {
+            return Ok(None);
+        };
+        let spec: DataSpec =
+            serde_json::from_value(o.spec).map_err(|e| ControlError::Other(e.to_string()))?;
+        spec.bytes()
+            .map(Some)
+            .map_err(|e| ControlError::Other(e.to_string()))
     }
 }
 

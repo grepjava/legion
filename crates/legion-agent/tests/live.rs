@@ -47,7 +47,8 @@ async fn eventually(what: &str, secs: u64, mut f: impl AsyncFnMut() -> bool) {
 }
 
 fn start_agent(store: &Store, podman: &Podman) -> (oneshot::Sender<()>, JoinHandle<()>) {
-    let mut config = AgentConfig::new("lab");
+    let lab = PathBuf::from(std::env::var("LEGION_AGENT_LAB").expect("set LEGION_AGENT_LAB"));
+    let mut config = AgentConfig::new("lab", lab.join("tasks"));
     config.infra_image = IMAGE.into();
     config.resync = Duration::from_secs(2);
     let agent = Agent::new(
@@ -142,7 +143,9 @@ async fn agent_runs_a_real_pod() {
                     "period": "1s", "failureThreshold": 2,
                 },
             },
-            "env": [{ "name": "GREETING", "value": "hello" }],
+            "env": [{ "name": "GREETING", "secret": "greeting" }],
+            "secrets": [{ "name": "greeting" }],
+            "configs": [{ "name": "app-conf", "target": "/etc/app.conf" }],
             "resources": { "limits": { "memory": "256Mi", "maxproc": 32 } },
         }],
         "restartPolicy": { "condition": "any", "delay": "1s" },
@@ -161,6 +164,13 @@ async fn agent_runs_a_real_pod() {
         serde_json::to_value(&spec).unwrap(),
     );
     let key = task.key();
+    for (kind, name, text) in [
+        (Kind::Secret, "greeting", "hello"),
+        (Kind::Config, "app-conf", "level = debug"),
+    ] {
+        let o = Object::new(kind, "lab", name, serde_json::json!({ "text": text }));
+        put(&store, o, Precondition::MustNotExist).await;
+    }
     put(&store, task, Precondition::MustNotExist).await;
 
     eventually("running", 120, async || {
@@ -222,6 +232,36 @@ async fn agent_runs_a_real_pod() {
         .await
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&env.stdout), "hello\n");
+
+    // Secrets and configs are read-only files from the task's tmpfs.
+    let files = podman
+        .exec(
+            &app.id,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "read s < /run/secrets/greeting; read c < /etc/app.conf; echo \"$s|$c\"; \
+                 echo x > /run/secrets/greeting || echo read-only"
+                    .into(),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&files.stdout),
+        "hello|level = debug\nread-only\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&files.stderr)
+    );
+    let uid = status_uid(&store, &key);
+    let tasks_dir = lab.join("tasks");
+    let task_files = tasks_dir.join(&uid);
+    let mounts = sh("mount -p");
+    let tmpfs = mounts.lines().any(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        f.get(1) == task_files.to_str().as_ref() && f.get(2) == Some(&"tmpfs")
+    });
+    assert!(tmpfs, "{mounts}");
 
     // Readiness follows its probe.
     let sh_in = async |cmd: &str| {
@@ -293,6 +333,11 @@ async fn agent_runs_a_real_pod() {
         !sh("ifconfig -l").contains(&host_end),
         "pod interface removed"
     );
+    assert!(
+        !sh("mount -p").contains(tasks_dir.to_str().unwrap()),
+        "task tmpfs unmounted"
+    );
+    assert!(!task_files.exists());
 
     stop.send(()).unwrap();
     agent.await.unwrap();
