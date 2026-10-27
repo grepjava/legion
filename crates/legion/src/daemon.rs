@@ -29,6 +29,8 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,openraft=warn".into()),
         )
+        // Colours only on a terminal, not in log files.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
     let advertise = opts
         .advertise

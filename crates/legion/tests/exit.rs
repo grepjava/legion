@@ -1,0 +1,326 @@
+//! The phase 1 exit test (PHASE.md): a multi-service app with probes and
+//! volumes runs on one node and comes back from failures. It drives the
+//! real daemon and CLI on FreeBSD as root, so it is ignored by default:
+//!
+//! ```sh
+//! kldload -n zfs; truncate -s 1g /var/tmp/lexit.img
+//! zpool create -m /var/tmp/lexit-pool lexit /var/tmp/lexit.img
+//! sudo LEGION_EXIT_LAB=/var/tmp/lexit LEGION_EXIT_ZFS_ROOT=lexit/legion \
+//!     target/debug/deps/exit-<hash> --ignored --nocapture
+//! zpool destroy lexit; rm /var/tmp/lexit.img
+//! ```
+//!
+//! The app is `tests/exit/app.yaml`: web (two replicas) counts requests in
+//! db, whose data is on a ZFS volume, and in cache, whose data is on a
+//! tmpfs volume. The lab directory is wiped first; remove it afterwards
+//! with `chflags -R 0` and `rm -rf`.
+
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+
+const LEGION: &str = env!("CARGO_BIN_EXE_legion");
+const SERVER: &str = "127.0.0.1:7471";
+
+struct Lab {
+    dir: PathBuf,
+    zfs_root: String,
+    daemon: Option<Child>,
+}
+
+impl Lab {
+    fn start_daemon(&mut self) {
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join("daemon.log"))
+            .unwrap();
+        let child = Command::new(LEGION)
+            .args(["daemon", "--listen", SERVER, "--zfs-root", &self.zfs_root])
+            .arg("--data-dir")
+            .arg(self.dir.join("data"))
+            .arg("--run-dir")
+            .arg(self.dir.join("run"))
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        self.daemon = Some(child);
+        wait("the daemon", 60, || legion(&["status"]).status.success());
+    }
+
+    /// Like a crash: no chance to clean up.
+    fn kill_daemon(&mut self) {
+        let mut child = self.daemon.take().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    fn stop_daemon(&mut self) {
+        if let Some(mut child) = self.daemon.take() {
+            let _ = Command::new("kill")
+                .args(["-INT", &child.id().to_string()])
+                .status();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+
+    /// Legion's own Podman, through the daemon's socket.
+    fn podman(&self, args: &[&str]) -> String {
+        let socket = format!("unix://{}", self.dir.join("run/podman.sock").display());
+        let out = Command::new("podman")
+            .args(["--url", &socket])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "podman {args:?}: {}",
+            text(&out.stderr)
+        );
+        text(&out.stdout)
+    }
+
+    fn container_id(&self, name: &str) -> String {
+        self.podman(&["inspect", "--format", "{{.Id}}", name])
+            .trim()
+            .to_owned()
+    }
+}
+
+impl Drop for Lab {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.daemon.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn text(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).into_owned()
+}
+
+fn legion(args: &[&str]) -> Output {
+    Command::new(LEGION)
+        .args(["--server", SERVER])
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+fn ok(args: &[&str]) -> String {
+    let out = legion(args);
+    assert!(
+        out.status.success(),
+        "legion {args:?}: {}",
+        text(&out.stderr)
+    );
+    text(&out.stdout)
+}
+
+fn wait(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while !f() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Objects of a kind in `shop`, as JSON.
+fn list(kind: &str) -> Vec<Value> {
+    let out = legion(&["list", kind, "-n", "shop", "-o", "json"]);
+    if !out.status.success() {
+        return Vec::new();
+    }
+    match serde_json::from_slice(&out.stdout) {
+        Ok(Value::Array(v)) => v,
+        Ok(one @ Value::Object(_)) => vec![one],
+        _ => Vec::new(),
+    }
+}
+
+/// Every service has all its tasks ready.
+fn app_ready() -> bool {
+    let services = list("services");
+    services.len() == 3
+        && services.iter().all(|s| {
+            let st = &s["status"];
+            st["desired"].as_u64().is_some_and(|d| d > 0)
+                && st["ready"] == st["desired"]
+                && st["observedGeneration"] == s["metadata"]["generation"]
+        })
+}
+
+/// The running tasks of a service: (name, ip).
+fn running(service: &str) -> Vec<(String, String)> {
+    list("tasks")
+        .into_iter()
+        .filter(|t| {
+            t["spec"]["service"] == service
+                && t["status"]["state"] == "running"
+                && t["spec"]["desiredState"] == "running"
+        })
+        .map(|t| {
+            (
+                t["metadata"]["name"].as_str().unwrap().to_owned(),
+                t["status"]["ip"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// One HTTP/1.0 GET: (status, body).
+fn get(ip: &str, path: &str) -> Option<(u16, String)> {
+    let addr: SocketAddr = format!("{ip}:8080").parse().ok()?;
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    write!(s, "GET {path} HTTP/1.0\r\n\r\n").ok()?;
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).ok()?;
+    let status = resp.split_whitespace().nth(1)?.parse().ok()?;
+    let body = resp.split_once("\r\n\r\n")?.1.trim().to_owned();
+    Some((status, body))
+}
+
+/// A counter through some web task.
+fn count(path: &str) -> u64 {
+    for (_, ip) in running("web") {
+        if let Some((200, body)) = get(&ip, path) {
+            return body.parse().unwrap_or_else(|_| panic!("{path}: {body:?}"));
+        }
+    }
+    panic!("no web task answered {path}");
+}
+
+fn sh(cmd: &str) -> String {
+    text(
+        &Command::new("/bin/sh")
+            .args(["-c", cmd])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+}
+
+#[test]
+#[ignore = "needs root, Podman, ocijail and ZFS on FreeBSD; set LEGION_EXIT_LAB and LEGION_EXIT_ZFS_ROOT"]
+fn app_survives_failures() {
+    let dir = PathBuf::from(std::env::var("LEGION_EXIT_LAB").expect("set LEGION_EXIT_LAB"));
+    let zfs_root = std::env::var("LEGION_EXIT_ZFS_ROOT").expect("set LEGION_EXIT_ZFS_ROOT");
+    if dir.exists() {
+        sh(&format!("chflags -R 0 {0} && rm -rf {0}", dir.display()));
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut lab = Lab {
+        dir,
+        zfs_root,
+        daemon: None,
+    };
+    lab.start_daemon();
+    ok(&["init"]);
+    let app = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/exit/app.yaml");
+    ok(&["apply", "-f", app.to_str().unwrap()]);
+    // The first run pulls the image.
+    wait("the app to be ready", 300, app_ready);
+    assert_eq!(running("web").len(), 2);
+
+    // Both web tasks reach db and cache by name.
+    assert_eq!(count("/count"), 1);
+    assert_eq!(count("/count"), 2);
+    assert_eq!(count("/hits"), 1);
+    for (name, ip) in running("web") {
+        assert_eq!(get(&ip, "/healthz"), Some((200, "ok".into())), "{name}");
+    }
+
+    // A database crash: the container restarts in its pod, the data stays.
+    let db = running("db")[0].0.clone();
+    lab.podman(&["kill", &format!("shop_{db}_db")]);
+    wait("db to restart", 60, || {
+        list("tasks")
+            .iter()
+            .any(|t| t["metadata"]["name"] == db.as_str() && t["status"]["restarts"] == 1)
+    });
+    wait("the app after the db restart", 60, app_ready);
+    assert_eq!(count("/count"), 3);
+
+    // A lost database pod: a new task mounts the same dataset.
+    ok(&["delete", "task", &db, "-n", "shop"]);
+    wait("a new db task", 120, || {
+        running("db").first().is_some_and(|(n, _)| *n != db) && app_ready()
+    });
+    assert_eq!(count("/count"), 4);
+
+    // The cache keeps its data across a container restart, not across pods.
+    let cache = running("cache")[0].0.clone();
+    lab.podman(&["kill", &format!("shop_{cache}_cache")]);
+    wait("cache to restart", 60, || {
+        list("tasks")
+            .iter()
+            .any(|t| t["metadata"]["name"] == cache.as_str() && t["status"]["restarts"] == 1)
+    });
+    wait("the app after the cache restart", 60, app_ready);
+    assert_eq!(count("/hits"), 2);
+    ok(&["delete", "task", &cache, "-n", "shop"]);
+    wait("a new cache task", 120, || {
+        running("cache").first().is_some_and(|(n, _)| *n != cache) && app_ready()
+    });
+    assert_eq!(count("/hits"), 1, "a new tmpfs");
+
+    // web's process dies: the container restarts under the policy.
+    let (web, web_ip) = running("web")[0].clone();
+    lab.podman(&["exec", &format!("shop_{web}_web"), "pkill", "inetd"]);
+    wait("web to be restarted", 90, || {
+        list("tasks")
+            .iter()
+            .any(|t| t["metadata"]["name"] == web.as_str() && t["status"]["restarts"] == 1)
+    });
+    wait("the app after the web restart", 60, app_ready);
+    assert_eq!(get(&web_ip, "/healthz"), Some((200, "ok".into())));
+
+    // The daemon crashes: pods keep running, and the new daemon adopts them.
+    let before: Vec<String> = running("web")
+        .iter()
+        .map(|(n, _)| lab.container_id(&format!("shop_{n}_web")))
+        .collect();
+    lab.kill_daemon();
+    assert_eq!(
+        get(&web_ip, "/healthz"),
+        Some((200, "ok".into())),
+        "pods outlive the daemon"
+    );
+    lab.start_daemon();
+    wait("the app after the daemon restart", 120, app_ready);
+    let after: Vec<String> = running("web")
+        .iter()
+        .map(|(n, _)| lab.container_id(&format!("shop_{n}_web")))
+        .collect();
+    assert_eq!(before, after, "the same containers, adopted");
+    assert_eq!(count("/count"), 5);
+
+    // Clean up: the pods go, the volume's dataset stays.
+    for s in ["web", "db", "cache"] {
+        ok(&["delete", "service", s, "-n", "shop"]);
+    }
+    wait("pods removed", 120, || {
+        lab.podman(&["ps", "-aq"]).trim().is_empty()
+    });
+    lab.stop_daemon();
+    let _ = Command::new("ifconfig")
+        .args(["legion0", "destroy"])
+        .status();
+    let ds = format!("{}/volumes/shop/db-data", lab.zfs_root);
+    assert!(sh(&format!("zfs list -H -o name {ds}")).contains(&ds));
+}

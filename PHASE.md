@@ -19,7 +19,8 @@ Current phase: **1 — Single node**.
 ## Phase 1 — Single node
 
 Exit criterion: a multi-service app with probes and volumes runs and
-self-heals on one node.
+self-heals on one node. **Met** on FreeBSD 15.1 (see the exit test below);
+service VIPs and outbound NAT remain.
 
 ### Done
 
@@ -107,6 +108,15 @@ self-heals on one node.
   gets a `resolv.conf` (search `<ns>.legion legion`, `ndots:2`) from its
   tmpfs. The agent follows service endpoints through `Control`, which the
   load balancing step reuses. Not yet: stateful `<svc>-<n>` names.
+- **Exit test** (`crates/legion/tests/exit.rs`, run by hand on FreeBSD with
+  a throwaway ZFS pool): `tests/exit/app.yaml` runs web (two replicas, HTTP
+  readiness and TCP liveness probes), db (ZFS volume) and cache (tmpfs
+  volume), built from FreeBSD base tools and wired by DNS names. The test
+  kills the db container (it restarts, data kept), deletes the db task (a
+  new pod mounts the same dataset), restarts and replaces the cache (its
+  tmpfs survives the first, not the second), kills web's process, and
+  SIGKILLs the daemon: the pods keep serving, the new daemon adopts the
+  same containers, and the count goes on. Passes in about 140 s.
 
 ### To do, in order
 
@@ -118,9 +128,6 @@ them.
    pf anchors with the default-block ruleset and tables for load balancing
    with soft drain and kill-by-key (§5.4); outbound NAT for pods. Needs the
    host's pf to reference Legion's anchors.
-2. **Exit test**: a multi-service app (for example web + database + cache)
-   with probes and a volume; kill containers and the agent and check that it
-   comes back.
 
 ### Deferred to phase 2
 
