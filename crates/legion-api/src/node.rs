@@ -4,8 +4,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::admit::{Invalid, Spec};
+use crate::admit::{Invalid, Spec, field, index};
 use crate::quantity::{Bytes, Cpu};
+use crate::service::TaintEffect;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -14,11 +15,44 @@ pub struct NodeSpec {
     pub availability: Availability,
     #[serde(default)]
     pub role: Role,
+    /// Keep tasks off the node unless their service tolerates them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub taints: Vec<Taint>,
 }
 
 impl Spec for NodeSpec {
     fn admit(&mut self) -> Result<(), Invalid> {
+        for (i, t) in self.taints.iter().enumerate() {
+            if t.key.is_empty() {
+                return Err(Invalid::new(
+                    field(&index("", "taints", i), "key"),
+                    "must not be empty",
+                ));
+            }
+        }
         Ok(())
+    }
+}
+
+/// `NoSchedule` keeps new tasks off, `PreferNoSchedule` makes the node a
+/// last choice, `NoExecute` also moves running tasks away.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Taint {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub value: String,
+    pub effect: TaintEffect,
+}
+
+impl Taint {
+    /// Whether one of `tolerations` covers this taint.
+    pub fn tolerated_by(&self, tolerations: &[crate::service::Toleration]) -> bool {
+        tolerations.iter().any(|t| {
+            t.key == self.key
+                && (t.value.is_empty() || t.value == self.value)
+                && t.effect.is_none_or(|e| e == self.effect)
+        })
     }
 }
 

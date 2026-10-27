@@ -4,19 +4,20 @@
 
 use std::time::Duration;
 
-use legion_api::node::{Availability, Capacity, NodeSpec, NodeState, NodeStatus};
+use legion_api::node::{Availability, Capacity, NodeSpec, NodeState, NodeStatus, Taint};
 use legion_api::quantity::{Bytes, Cpu};
-use legion_api::service::{ServiceSpec, ServiceStatus};
+use legion_api::service::{ServiceSpec, ServiceStatus, TaintEffect};
 use legion_api::task::{DesiredState, TaskState, TaskStatus};
 use legion_api::{Kind, Object, Spec};
 use tokio::time::Instant;
 
-use super::plan::{Action, HISTORY, Memory, Node, Service, Task, plan};
+use super::plan::{Action, HISTORY, Homes, Memory, Node, Service, Task, plan};
 
 struct World {
     services: Vec<Service>,
     tasks: Vec<Task>,
     nodes: Vec<Node>,
+    homes: Homes,
     index: u64,
     memory: Memory,
     now: Instant,
@@ -30,6 +31,7 @@ impl World {
             services: vec![],
             tasks: vec![],
             nodes: vec![],
+            homes: Homes::new(),
             index: 0,
             memory: Memory::default(),
             now: Instant::now(),
@@ -63,13 +65,39 @@ impl World {
         });
     }
 
-    fn availability(&mut self, name: &str, a: Availability) {
+    fn node_mut(&mut self, name: &str) -> &mut Node {
         self.nodes
             .iter_mut()
             .find(|n| n.object.metadata.name == name)
             .unwrap()
-            .spec
-            .availability = a;
+    }
+
+    fn availability(&mut self, name: &str, a: Availability) {
+        self.node_mut(name).spec.availability = a;
+    }
+
+    fn state(&mut self, name: &str, state: NodeState) {
+        self.node_mut(name).status.state = state;
+    }
+
+    fn taint(&mut self, name: &str, key: &str, effect: TaintEffect) {
+        self.node_mut(name).spec.taints.push(Taint {
+            key: key.into(),
+            value: String::new(),
+            effect,
+        });
+    }
+
+    /// Nodes of the running tasks of `service`, sorted.
+    fn placed(&self, service: &str) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|t| t.spec.service == service && t.status.state == TaskState::Running)
+            .map(|t| t.spec.node.clone())
+            .collect();
+        v.sort();
+        v
     }
 
     /// Creates or updates a service from a YAML spec, as an apply would.
@@ -160,7 +188,8 @@ impl World {
         }
     }
 
-    /// Agents: assigned tasks start; stopping tasks stop.
+    /// Agents: assigned tasks start; stopping tasks stop. A node that is
+    /// down does neither.
     fn agents(&mut self) -> bool {
         if !self.agents {
             return false;
@@ -168,7 +197,10 @@ impl World {
         let mut changed = false;
         for i in 0..self.tasks.len() {
             let t = &self.tasks[i];
-            if t.spec.node.is_empty() || t.status.state.is_terminal() {
+            let up = self.nodes.iter().any(|n| {
+                n.object.metadata.name == t.spec.node && n.status.state != NodeState::Down
+            });
+            if !up || t.status.state.is_terminal() {
                 continue;
             }
             let next = match t.spec.desired_state {
@@ -197,6 +229,7 @@ impl World {
                 &self.services,
                 &self.tasks,
                 &self.nodes,
+                &self.homes,
                 &mut self.memory,
                 self.now,
             );
@@ -230,6 +263,7 @@ impl World {
             &self.services,
             &self.tasks,
             &self.nodes,
+            &self.homes,
             &mut self.memory,
             self.now,
         )
@@ -402,7 +436,14 @@ fn rolling_update_stop_first() {
         "replicas: 3\npod: { containers: [{ name: web, image: \"web:2\" }] }",
     );
     // One slot at a time: the first pass stops one old task only.
-    let p = plan(&w.services, &w.tasks, &w.nodes, &mut w.memory, w.now);
+    let p = plan(
+        &w.services,
+        &w.tasks,
+        &w.nodes,
+        &w.homes,
+        &mut w.memory,
+        w.now,
+    );
     let stops = p
         .actions
         .iter()
@@ -434,7 +475,14 @@ fn rolling_update_start_first() {
     w.settle();
     w.agents = false;
     w.service("web", "replicas: 1\npod: { containers: [{ name: web, image: \"web:2\" }] }\nupdate: { order: start-first }");
-    let p = plan(&w.services, &w.tasks, &w.nodes, &mut w.memory, w.now);
+    let p = plan(
+        &w.services,
+        &w.tasks,
+        &w.nodes,
+        &w.homes,
+        &mut w.memory,
+        w.now,
+    );
     w.apply(p.actions);
     // The new task exists while the old one still runs.
     assert_eq!(w.tasks(), ["web-1-1 running n1", "web-1-2 assigned n1"]);
@@ -499,6 +547,151 @@ fn draining_moves_replicated_tasks() {
         .collect();
     assert_eq!(running.len(), 2);
     assert!(running.iter().all(|t| t.spec.node == "n2"));
+}
+
+#[test]
+fn tasks_of_a_lost_node_move() {
+    let mut w = World::new();
+    for n in ["n1", "n2", "n3"] {
+        w.node(n, &[]);
+    }
+    w.service("web", &format!("replicas: 3\n{POD}"));
+    w.service(
+        "agent",
+        "mode: global\npod: { containers: [{ name: a, image: \"a:1\" }] }",
+    );
+    w.settle();
+    assert_eq!(w.placed("web"), ["n1", "n2", "n3"]);
+    let lost = w
+        .tasks
+        .iter()
+        .find(|t| t.spec.service == "web" && t.spec.node == "n2")
+        .unwrap()
+        .object
+        .metadata
+        .name
+        .clone();
+
+    w.state("n2", NodeState::Down);
+    w.settle();
+    // The lost task is orphaned and told to stop, so the node removes its
+    // pod if it comes back; its slot runs elsewhere at once.
+    let old = w
+        .tasks
+        .iter()
+        .find(|t| t.object.metadata.name == lost)
+        .unwrap();
+    assert_eq!(old.status.state, TaskState::Orphaned);
+    assert_eq!(old.status.message, "node n2 is down");
+    assert_eq!(old.spec.desired_state, DesiredState::Shutdown);
+    assert_eq!(w.placed("web").len(), 3);
+    assert!(!w.placed("web").contains(&"n2".to_owned()));
+    assert_eq!(w.status("web").running, 3);
+    // The global task goes with its node.
+    assert_eq!(w.placed("agent"), ["n1", "n3"]);
+    assert!(!w.tasks().iter().any(|t| t.starts_with("agent-n2")));
+
+    // Back: the global task returns under a new name; web stays put.
+    w.state("n2", NodeState::Ready);
+    w.settle();
+    assert_eq!(w.placed("agent"), ["n1", "n2", "n3"]);
+    assert!(w.tasks().contains(&"agent-n2-2 running n2".to_owned()));
+    assert!(!w.placed("web").contains(&"n2".to_owned()));
+}
+
+#[test]
+fn lost_tasks_are_replaced_whatever_the_restart_policy() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.service("job", "replicas: 1\npod: { containers: [{ name: j, image: \"j:1\" }], restartPolicy: { condition: none } }");
+    w.settle();
+    let first = w.placed("job")[0].clone();
+    w.state(&first, NodeState::Down);
+    w.settle();
+    assert_eq!(w.placed("job").len(), 1);
+    assert_ne!(w.placed("job")[0], first);
+    assert!(w.wake().is_none(), "no backoff");
+}
+
+#[test]
+fn taints_keep_tasks_off() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.taint("n2", "dedicated", TaintEffect::NoSchedule);
+    w.service("web", &format!("replicas: 2\n{POD}"));
+    w.service(
+        "db",
+        &format!("replicas: 2\n{POD}\nplacement: {{ tolerations: [{{ key: dedicated }}] }}"),
+    );
+    w.settle();
+    assert_eq!(w.placed("web"), ["n1", "n1"]);
+    assert_eq!(w.placed("db"), ["n1", "n2"]);
+
+    // PreferNoSchedule: a last choice, yet used when nothing else fits.
+    w.node("n3", &[]);
+    w.taint("n3", "spare", TaintEffect::PreferNoSchedule);
+    w.service("cache", &format!("replicas: 1\n{POD}"));
+    w.settle();
+    assert_eq!(w.placed("cache"), ["n1"]);
+    w.availability("n1", Availability::Drain);
+    w.settle();
+    assert_eq!(w.placed("cache"), ["n3"]);
+    assert_eq!(w.placed("web"), ["n3", "n3"]);
+
+    // NoExecute moves running tasks that do not tolerate it.
+    w.availability("n1", Availability::Active);
+    w.taint("n3", "broken", TaintEffect::NoExecute);
+    w.settle();
+    assert_eq!(w.placed("web"), ["n1", "n1"]);
+    assert_eq!(w.placed("cache"), ["n1"]);
+    let db = w.tasks.iter().find(|t| t.spec.service == "db").unwrap();
+    assert_eq!(db.status.message, "");
+
+    // An untolerated taint of any effect but PreferNoSchedule is reported.
+    w.service(
+        "only",
+        &format!("replicas: 1\n{POD}\nplacement: {{ constraints: [\"node.name == n3\"] }}"),
+    );
+    w.settle();
+    let only = w.tasks.iter().find(|t| t.spec.service == "only").unwrap();
+    assert_eq!(
+        only.status.message,
+        "no node can run it: 1 constraints, 2 taints"
+    );
+}
+
+#[test]
+fn tasks_go_where_their_volume_is() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.homes
+        .insert(("shop".into(), "pgdata".into()), "n2".into());
+    w.service(
+        "db",
+        "replicas: 1\npod: { containers: [{ name: db, image: \"pg:17\" }], volumes: [{ name: data, volume: { name: pgdata } }] }",
+    );
+    w.settle();
+    assert_eq!(w.placed("db"), ["n2"]);
+
+    // Its node lost, it waits for it.
+    w.state("n2", NodeState::Down);
+    w.settle();
+    assert!(w.placed("db").is_empty());
+    let pending = w
+        .tasks
+        .iter()
+        .find(|t| t.status.state == TaskState::Pending)
+        .unwrap();
+    assert_eq!(
+        pending.status.message,
+        "no node can run it: 1 not ready, 1 volume on another node"
+    );
+    w.state("n2", NodeState::Ready);
+    w.settle();
+    assert_eq!(w.placed("db"), ["n2"]);
 }
 
 #[test]

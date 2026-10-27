@@ -97,8 +97,8 @@ with service traffic through pf VIPs. Phase 1 is done.
   each container that mounts it, read-only where asked, and the data
   outlives tasks. Pod `tmpfs` volumes are shared by the pod's containers and
   go with the pod. Not yet: removing datasets of deleted Volumes (they are
-  left in place), and scheduling tasks to the node holding their volume
-  (one node in phase 1).
+  left in place). Scheduling tasks to the node holding their volume came
+  in phase 2.
 - **DNS** (`legion-net::dns`, `legion-agent`): the agent runs a resolver on
   the pod gateway (`10.200.N.1:53`, UDP and TCP). It answers
   `<svc>.<ns>.legion`, `tasks.<svc>.<ns>.legion` and `<svc>.<ns>` with the
@@ -225,19 +225,32 @@ end.
   reaches both (and nothing connects without the NAT rule), and a node
   removed from the peers is unreachable. The exit test passes with the mesh
   up on its single node.
+- **Failure handling and taints** (`legion-manager` controller): the tasks
+  of a node that goes `down` are orphaned and told to stop, so they leave
+  the endpoints and their slots run elsewhere at once, whatever the restart
+  policy; the node removes their pods when it is back. Nodes take taints
+  (`NoSchedule`, `PreferNoSchedule`, `NoExecute`) that services tolerate
+  through `placement.tolerations`. Tasks mounting a claimed Volume go only
+  to the node holding it, and wait for it while it is down. Tested in the
+  planner and in `legion-agent`'s `tests/cluster.rs`: one manager and three
+  agents with fake runtimes, each through the dispatcher. Tasks spread one
+  per node; every node balances the VIP and the published port over all
+  of them and has the others as mesh peers (the routing mesh on every
+  node). Then a node goes silent: its task is orphaned and replaced on
+  the others, which stop balancing to it. It comes back and removes the
+  lost pod, and a `NoExecute` taint empties a node.
 
 ### To do, in order
 
-1. **Scheduling and failure handling across nodes**: taints, tasks of a
-   lost node rescheduled, the routing mesh on every node.
-2. **Rollback and compose `stack deploy`**.
-3. **Exit test**.
+1. **Rollback and compose `stack deploy`**.
+2. **Exit test**.
 
 Smaller follow-ups: workers renew their certificates through managers;
 `--listen` still defaults to loopback; a worker without `--advertise` has
 no WireGuard endpoint (it could use the address it reaches managers from);
 the mesh lab test drives `legion-net` in jails, not whole daemons, which
-comes with the exit test.
+comes with the exit test; placement preferences (`spread`) are accepted but
+not used yet.
 
 ## Later phases
 

@@ -118,8 +118,8 @@ One binary, `legion`, with two roles:
 | Cert rotation | Node certs | Renews certificates before expiry; rotates root CA on demand. |
 
 The Service controller and the scheduler are built (`legion-manager`,
-`controller/plan.rs`) as one pure function from Services, Tasks and Nodes to
-the writes that converge them; a loop on the leader runs it on every store
+`controller/plan.rs`) as one pure function from Services, Tasks, Nodes and
+the nodes holding Volumes to the writes that converge them; a loop on the leader runs it on every store
 change, on planned wake-ups and every 5 seconds, and writes with version
 preconditions. Rules:
 
@@ -130,7 +130,7 @@ preconditions. Rules:
   spec changes (replicas, placement, update settings) bump the generation
   but replace nothing.
 - **Replacement.** A slot whose task is gone gets a new one: after
-  `shutdown` at once; after a failure (unless the restart condition is
+  `shutdown` or `orphaned` at once, whatever the restart condition; after a failure (unless the restart condition is
   `none`) with backoff, the restart delay (at least 1 s) doubled per failure
   in a row, at most 60 s; after `complete` only with condition `any`.
   Container restarts within a task are the agent's job; a task fails when
@@ -141,10 +141,22 @@ preconditions. Rules:
   `stop-first` or `start-first` order. Monitoring, failure actions and
   rollback are phase 2.
 - **Nodes.** A drained node's tasks stop and move elsewhere; a paused node
-  keeps its tasks but gets no new ones.
-- **Scheduling** filters nodes (ready, active, constraints, requests within
-  allocatable) and prefers the fewest tasks of the same service, then the
-  least requested CPU and memory. An unplaceable task stays `pending` with
+  keeps its tasks but gets no new ones. The tasks of a node that is `down`
+  are marked `orphaned` and told to stop, in one write: they leave the
+  endpoints, their slots run elsewhere at once (a global service's slot
+  goes with the node, and keeps its task number for when the node is
+  back), and a node that comes back removes their pods. Tasks do not move
+  back by themselves.
+- **Taints** on a node (`spec.taints: [{key, value, effect}]`) apply unless
+  the service tolerates them (`placement.tolerations`, matching the key,
+  and the value and effect when given): `NoSchedule` keeps new tasks off,
+  `NoExecute` also moves running ones away, `PreferNoSchedule` makes the
+  node a last choice.
+- **Scheduling** filters nodes (ready, active, taints, constraints, the node
+  holding any claimed Volume the pod mounts, requests within allocatable)
+  and prefers nodes without an untolerated `PreferNoSchedule` taint, then
+  the fewest tasks of the same service, then the least requested CPU and
+  memory. An unplaceable task stays `pending` with
   the reasons in its message, e.g. `no node can run it: 1 constraints`.
 
 ### 3.4 Agent components

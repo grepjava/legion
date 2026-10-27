@@ -13,7 +13,7 @@ use legion_api::node::{Availability, NodeSpec, NodeState, NodeStatus};
 use legion_api::service::{
     Constraint, EndpointMode, NodeAttribute, PUBLISHED_PORTS, Publish, PublishedPort,
     RestartCondition, SERVICE_NET, SERVICE_PREFIX, ServiceMode, ServiceSpec, ServiceStatus,
-    UpdateOrder,
+    TaintEffect, UpdateOrder,
 };
 use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
 use legion_api::{Kind, Object, ObjectKey};
@@ -63,6 +63,23 @@ pub struct Node {
     pub status: NodeStatus,
 }
 
+/// The node each claimed Volume lives on, by namespace and name.
+pub type Homes = BTreeMap<(String, String), String>;
+
+impl Node {
+    fn name(&self) -> &str {
+        &self.object.metadata.name
+    }
+
+    /// Whether the node has a taint of `effect` that `s` does not tolerate.
+    fn repels(&self, s: &Service, effect: TaintEffect) -> bool {
+        self.spec
+            .taints
+            .iter()
+            .any(|t| t.effect == effect && !t.tolerated_by(&s.spec.placement.tolerations))
+    }
+}
+
 impl Task {
     fn active(&self) -> bool {
         self.spec.desired_state == DesiredState::Running && !self.status.state.is_terminal()
@@ -73,10 +90,7 @@ impl Task {
     }
 
     fn failed(&self) -> bool {
-        matches!(
-            self.status.state,
-            TaskState::Failed | TaskState::Rejected | TaskState::Orphaned
-        )
+        matches!(self.status.state, TaskState::Failed | TaskState::Rejected)
     }
 
     fn uid(&self) -> &str {
@@ -139,10 +153,14 @@ pub fn plan(
     services: &[Service],
     tasks: &[Task],
     nodes: &[Node],
+    homes: &Homes,
     memory: &mut Memory,
     now: Instant,
 ) -> Plan {
     let mut plan = Plan::default();
+    let (tasks, orphaned) = orphan(tasks, nodes, &mut plan);
+    let tasks = tasks.as_slice();
+    let first = plan.actions.len();
     let live: BTreeSet<&str> = tasks.iter().map(Task::uid).collect();
     memory
         .failed_at
@@ -158,7 +176,17 @@ pub fn plan(
         let addrs = addresses
             .remove(s.object.metadata.uid.as_str())
             .unwrap_or_default();
-        service(s, &mine, nodes, memory, now, addrs, &mut plan, &mut created);
+        service(
+            s,
+            &mine,
+            nodes,
+            homes,
+            memory,
+            now,
+            addrs,
+            &mut plan,
+            &mut created,
+        );
     }
 
     // Tasks whose service is gone: stop, then delete once stopped.
@@ -170,8 +198,49 @@ pub fn plan(
         }
     }
 
-    schedule(services, tasks, created, nodes, &mut plan);
+    schedule(services, tasks, created, nodes, homes, &mut plan);
+
+    // An orphaned task is written once per pass; what else was planned for
+    // it waits for the next one.
+    let later = plan.actions.split_off(first);
+    plan.actions
+        .extend(later.into_iter().filter(|a| !orphaned.contains(&a.key())));
     plan
+}
+
+/// Tasks on a node that is down are lost: they are marked orphaned and told
+/// to stop, so they leave the endpoints, their slots get new tasks
+/// elsewhere, and a node that comes back removes their pods. Returns the
+/// tasks as they are after these writes, and the orphaned ones' keys.
+fn orphan(tasks: &[Task], nodes: &[Node], plan: &mut Plan) -> (Vec<Task>, BTreeSet<ObjectKey>) {
+    let down: BTreeSet<&str> = nodes
+        .iter()
+        .filter(|n| n.status.state == NodeState::Down)
+        .map(Node::name)
+        .collect();
+    let mut keys = BTreeSet::new();
+    let tasks = tasks
+        .iter()
+        .map(|t| {
+            if t.status.state.is_terminal() || !down.contains(t.spec.node.as_str()) {
+                return t.clone();
+            }
+            let mut t = t.clone();
+            t.spec.desired_state = DesiredState::Shutdown;
+            t.status = TaskStatus {
+                state: TaskState::Orphaned,
+                message: format!("node {} is down", t.spec.node),
+                ..Default::default()
+            };
+            t.object.spec = serde_json::to_value(&t.spec).expect("serialises");
+            t.object.status = serde_json::to_value(&t.status).expect("serialises");
+            plan.actions
+                .push(Action::Update(t.object.clone(), t.object.metadata.version));
+            keys.insert(t.object.key());
+            t
+        })
+        .collect();
+    (tasks, keys)
 }
 
 /// A service's VIP and published ports.
@@ -301,6 +370,7 @@ fn service(
     s: &Service,
     tasks: &[&Task],
     nodes: &[Node],
+    homes: &Homes,
     memory: &Memory,
     now: Instant,
     addrs: Addresses,
@@ -323,7 +393,7 @@ fn service(
     let wanted: Vec<Slot> = match s.spec.mode {
         ServiceMode::Global => nodes
             .iter()
-            .filter(|n| eligible(n, s).is_ok())
+            .filter(|n| eligible(n, s, homes).is_ok())
             .map(|n| Slot::Node(n.object.metadata.name.clone()))
             .collect(),
         _ => (1..=s.spec.replicas.unwrap_or(1))
@@ -333,13 +403,16 @@ fn service(
     let wanted_set: BTreeSet<&Slot> = wanted.iter().collect();
 
     // Slots no longer wanted: stop what runs there and drop the history. A
-    // paused node keeps its global task; a drained or vanished one does not.
+    // paused node keeps its global task; a drained or vanished one does
+    // not, nor one whose taints evict it.
     for (slot, list) in &by_slot {
         if wanted_set.contains(slot) {
             continue;
         }
         let paused = matches!(slot, Slot::Node(name) if nodes.iter().any(|n| {
-            &n.object.metadata.name == name && n.spec.availability == Availability::Pause
+            n.name() == name
+                && n.spec.availability == Availability::Pause
+                && !n.repels(s, TaintEffect::NoExecute)
         }));
         for t in list {
             if t.active() && !paused {
@@ -350,10 +423,13 @@ fn service(
         }
     }
 
-    // Replicated tasks on a node that is draining move elsewhere.
+    // Replicated tasks on a node that is draining, or whose taints evict
+    // them, move elsewhere.
     for t in tasks.iter().filter(|t| t.active() && t.spec.slot.is_some()) {
         if nodes.iter().any(|n| {
-            n.object.metadata.name == t.spec.node && n.spec.availability == Availability::Drain
+            n.name() == t.spec.node
+                && (n.spec.availability == Availability::Drain
+                    || n.repels(s, TaintEffect::NoExecute))
         }) {
             plan.actions.push(stop(t));
         }
@@ -425,7 +501,7 @@ fn service(
                 None => true,
                 Some(last) => match last.status.state {
                     TaskState::Complete => policy.condition == RestartCondition::Any,
-                    TaskState::Shutdown => true,
+                    TaskState::Shutdown | TaskState::Orphaned => true,
                     _ => last.failed() && policy.condition != RestartCondition::None,
                 },
             };
@@ -461,6 +537,16 @@ fn service(
             .collect();
         for old in terminal.iter().rev().skip(HISTORY) {
             plan.actions.push(delete(old));
+        }
+    }
+
+    // A node's slot keeps its number while the node exists, though no
+    // longer wanted: its old pod may still be there when it is again.
+    if s.spec.mode == ServiceMode::Global {
+        for (key, n) in &previous.last_tasks {
+            if nodes.iter().any(|node| node.name() == key) {
+                last_tasks.entry(key.clone()).or_insert(*n);
+            }
         }
     }
 
@@ -576,12 +662,27 @@ fn delete(t: &Task) -> Action {
 
 /// Whether `n` may run tasks of `s` at all; requests are checked when
 /// placing.
-fn eligible(n: &Node, s: &Service) -> Result<(), &'static str> {
+fn eligible(n: &Node, s: &Service, homes: &Homes) -> Result<(), &'static str> {
     if n.status.state != NodeState::Ready {
         return Err("not ready");
     }
     if n.spec.availability != Availability::Active {
         return Err("not active");
+    }
+    if n.repels(s, TaintEffect::NoSchedule) || n.repels(s, TaintEffect::NoExecute) {
+        return Err("taints");
+    }
+    let namespace = &s.object.metadata.namespace;
+    let elsewhere = s
+        .spec
+        .pod
+        .volumes
+        .iter()
+        .filter_map(|v| v.volume.as_ref())
+        .filter_map(|v| homes.get(&(namespace.clone(), v.name.clone())))
+        .any(|home| home != n.name());
+    if elsewhere {
+        return Err("volume on another node");
     }
     let hold = s
         .spec
@@ -628,15 +729,21 @@ impl Load {
     }
 }
 
+/// Lower is better: an untolerated `PreferNoSchedule` taint, tasks of the
+/// same service, then requested CPU and memory in thousandths.
+type Score = (bool, u32, u64, u64);
+
 /// Places unassigned tasks: filter nodes (eligible, requests fit), then
-/// prefer the node with the fewest tasks of the same service, then the
-/// least requested. New tasks are created already placed; existing
+/// prefer a node without an untolerated `PreferNoSchedule` taint, then the
+/// one with the fewest tasks of the same service, then the least
+/// requested. New tasks are created already placed; existing
 /// pending ones are updated.
 fn schedule(
     services: &[Service],
     tasks: &[Task],
     created: Vec<Task>,
     nodes: &[Node],
+    homes: &Homes,
     plan: &mut Plan,
 ) {
     let mut load: BTreeMap<String, Load> = BTreeMap::new();
@@ -681,13 +788,13 @@ fn schedule(
         };
         let requests = t.spec.pod.requests();
         let mut reasons: BTreeMap<&str, usize> = BTreeMap::new();
-        let mut best: Option<(&str, (u32, u64, u64))> = None;
+        let mut best: Option<(&str, Score)> = None;
         for n in nodes {
             let name = n.object.metadata.name.as_str();
             if !t.spec.node.is_empty() && t.spec.node != name {
                 continue;
             }
-            if let Err(why) = eligible(n, s) {
+            if let Err(why) = eligible(n, s, homes) {
                 *reasons.entry(why).or_default() += 1;
                 continue;
             }
@@ -705,6 +812,7 @@ fn schedule(
                 .copied()
                 .unwrap_or(0);
             let score = (
+                n.repels(s, TaintEffect::PreferNoSchedule),
                 same,
                 l.cpu * 1000 / alloc.cpu.0.max(1),
                 l.memory * 1000 / alloc.memory.0.max(1),
