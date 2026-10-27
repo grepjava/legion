@@ -289,6 +289,13 @@ Built and tested in spike S4 (`crates/legion-store`).
   Reads run inline. The committed log id is not persisted (openraft's
   default): the state machine already records what it applied, and saving it
   cost one more fsync per write on every node.
+- **Timing.** Heartbeats every second, elections after 5 to 10 s of
+  silence (Swarm elects after about 10 s). openraft also uses the
+  heartbeat interval as the timeout of each replication call, so it must
+  exceed the slowest round trip between managers: at 250 ms, managers 225
+  ms apart never kept a leader (the phase 2 exit test). Writes and
+  linearizable reads give up after 30 s without a quorum, with an error
+  saying the write may still apply, rather than hang.
 
 ---
 
@@ -463,6 +470,14 @@ default `10.88.0.0/16`, for example).
   without an endpoint is reached once it has reached the other side. The
   agent applies the peer list only once it has one, so a restarting agent
   does not cut traffic. Down nodes stay peers until their Node is removed.
+- **Reachability**: managers must reach each other's advertised addresses
+  (Raft, both ways), every agent must reach a manager, and nodes must reach
+  each other's WireGuard endpoints. A node behind NAT cannot be one today:
+  its advertised address is unreachable from outside, and the endpoint it
+  advertises replaces the one its peers' WireGuard learned from its
+  keepalives. Such a node joins through a site tunnel or VPN and
+  advertises its address there (the phase 2 exit test does this for a
+  remote server); traversing NAT without one is later work.
 - **Bridge sysctls**: `net.link.bridge.pfil_*` are per-VNET, but Legion runs in
   the host VNET, so changing them would affect every bridge on the host,
   including Podman's own. Legion leaves them at their defaults and uses the
@@ -569,6 +584,10 @@ that resetting a second store with only `--root`/`--runroot` changed wiped that
 directory, and the system Podman then marked a running container as exited
 while its process kept running.
 
+The storage driver comes from the host's `containers/storage.conf`. The
+FreeBSD package sets `zfs`; on a UFS host Podman then refuses to start
+("could not open /dev/zfs") until the driver is set to `vfs`.
+
 ### 6.2 Pod construction
 
 Podman pods and `--network container:` do **not** give a private shared VNET on
@@ -598,8 +617,17 @@ libpod REST API (annotations and labels in `containers/create`).
 - rctl rules on the infra jail **account** for all child processes but are
   **not enforced** on them. Limits are therefore set on each container's own
   jail (`jail:<infra>.<ctr>:...`), where they are enforced: `maxproc` refuses
-  forks, `vmemoryuse` refuses allocations, `pcpu` throttles by pausing the
-  process (usage is bursty rather than smooth).
+  forks, `pcpu` throttles by pausing the process (usage is bursty rather
+  than smooth), and the memory limit is `memoryuse:sigkill`: a process that
+  takes the container's resident memory past it is killed, as Linux's OOM
+  killer does in a container, which is what a compose `memory:` means.
+  Legion denied on `vmemoryuse` at first, but that sums the address space
+  of every process in the container: a small shell-and-inetd app with
+  `memory: 128M` failed to fork under light load while using a few MB.
+  `memoryuse:deny` is no better: it pages the jail out rather than
+  refusing, and rctl(8) warns it can thrash the machine.
+- rctl needs the loader tunable `kern.racct.enable=1`. Without it, setting
+  limits fails and the agent only warns, so pods run unlimited.
 - Pod-level totals are read from the infra jail's accounting and used for
   scheduling feedback, metrics and eviction decisions.
 - The rule set is removed explicitly when a task ends.
@@ -610,9 +638,8 @@ libpod REST API (annotations and labels in `containers/create`).
   beforehand are lost. Re-adding a rule replaces it, so reapplying is
   harmless; adopted containers get their rules reapplied too.
 - Open: with runtimes that enforce OCI limits, Legion could pass limits
-  through Podman instead, so they apply from the first instruction. Note the
-  semantics differ: ocijail kills on `memoryuse` (like the Linux OOM killer),
-  where Legion denies on `vmemoryuse`.
+  through Podman instead, so they apply from the first instruction. ocijail
+  also kills on `memoryuse`, so the memory semantics now match.
 
 ### 6.4 Other runtime details
 
@@ -856,8 +883,8 @@ WireGuard and bridge, with tasks as VNET jails attached to the node bridges.
 | Phase | Theme | Contents | Exit criteria |
 |-------|-------|----------|---------------|
 | 0 | Spikes | ~~S1–S6, workspace, CI on FreeBSD 15 amd64 and arm64~~ done | ~~S4 answered~~ met |
-| 1 | Single node | Store (one member), API, CLI, `apply`/`diff`, replicated and global services, pods, executor, node-local networking, DNS, VIPs, liveness and readiness probes, restart policy, secrets, configs, ZFS volumes, labels | A multi-service app with probes and volumes runs and self-heals on one node |
-| 2 | Cluster (**MVP**) | `init`/`join`, PKI, 3–5 managers, dispatcher, WireGuard mesh, routed pod network, scheduler (constraints, requests, taints), node failure handling, routing mesh, rolling updates and rollback, drain, rctl limits, compose `stack deploy` | A compose app deploys on 3 nodes, survives losing any one node, and updates with zero downtime |
+| 1 | Single node | Store (one member), API, CLI, `apply`/`diff`, replicated and global services, pods, executor, node-local networking, DNS, VIPs, liveness and readiness probes, restart policy, secrets, configs, ZFS volumes, labels | ~~A multi-service app with probes and volumes runs and self-heals on one node~~ met |
+| 2 | Cluster (**MVP**) | `init`/`join`, PKI, 3–5 managers, dispatcher, WireGuard mesh, routed pod network, scheduler (constraints, requests, taints), node failure handling, routing mesh, rolling updates and rollback, drain, rctl limits, compose `stack deploy` | ~~A compose app deploys on 3 nodes, survives losing any one node, and updates with zero downtime~~ met |
 | 3 | K8s-lite | Namespaces, RBAC, init containers, startup probes, jobs and cronjobs, network policy, disruption budgets, `logs`/`exec`/`port-forward`, security profiles, Prometheus metrics endpoint | Two teams share a cluster with isolation enforced |
 | 4 | Stateful and operations | Stateful services, ZFS snapshot and migration, ingress routes, autoscaling, CARP VIP, autolock, backup and restore of the store | Postgres with replicas runs as a stateful service and migrates between nodes |
 | 5 | Extensions | Linux images, IPv6 dual-stack, volume plugin interface (NFS, iSCSI), bhyve tasks (exploratory) | Per feature |

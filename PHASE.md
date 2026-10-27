@@ -4,7 +4,7 @@ Where Legion stands against the roadmap in [docs/DESIGN.md](docs/DESIGN.md)
 (section 11). The design says what to build and why; this file says what is
 done and what comes next. Update it in the same commit as the work.
 
-Current phase: **1 — Single node**.
+Current phase: **3 — K8s-lite** (phases 1 and 2 met their exit criteria).
 
 ## Phase 0 — Spikes
 
@@ -157,10 +157,11 @@ dispatcher replaced it in phase 2.
 Exit criterion (DESIGN.md §11): a compose app deploys on 3 nodes, survives
 losing any one node, and updates with zero downtime.
 
-There is one FreeBSD host (weft-bsd). Extra nodes are jails on it: VNET
-jails for the network (WireGuard, routing), and agents with the fake
-runtime for scheduling and failure handling; a second real node is for the
-end.
+Most of it was built on one FreeBSD host (weft-bsd), with extra nodes as
+jails on it: VNET jails for the network (WireGuard, routing), and agents
+with the fake runtime for scheduling and failure handling. The exit test
+runs real daemons on three machines: weft-bsd, a bhyve guest on it, and a
+remote FreeBSD server reached through a WireGuard site tunnel.
 
 ### Done
 
@@ -255,24 +256,66 @@ end.
   refuses). Tested: a compose file with most keys converted, interpolation,
   errors that name the place; and through the CLI, deploy (again
   unchanged), `--strict`, convert, `--prune` and `rm`.
+- **Exit test** (`crates/legion/tests/cluster.rs`, ignored; run as root on
+  a FreeBSD host, see its docs): passes on three real nodes, all managers:
+  weft-bsd, a bhyve guest on it, and a remote server about 225 ms away
+  through a WireGuard site tunnel. It starts this host's daemon, copies its
+  own `legion` (stripped) to the others over ssh and joins them, deploys
+  `tests/cluster/compose.yaml` (web published on 30080 asks api for its
+  name through api's VIP), and checks that tasks spread one per node and
+  that every node answers on the published port and reaches every task.
+  It then updates web start-first under load (35 requests, none failed),
+  powers the bhyve node off (3 of 23 requests failed in the 13 s before
+  the node was marked down; the app was back on the other two after 17 s,
+  with no failure after), and updates again on the two left.
+
+  It found, and these were fixed: pods' `lo0` had no 127.0.0.1 (a new
+  VNET's loopback gets only `::1`); a manager joining while another was
+  being promoted was refused (it now waits for the membership change);
+  openraft's replication timeout is the heartbeat interval, so at 250 ms
+  managers 225 ms apart never kept a leader (now 1 s, elections after 5 to
+  10 s); a write without a quorum hung forever (now 30 s, then an error);
+  and memory limits denied on the virtual memory of all a container's
+  processes, so `memory: 128M` failed to fork under light load (now
+  `memoryuse:sigkill`, DESIGN.md §6.3). A review found, also fixed with
+  tests: nodes registering at once got the same subnet (now reserved in
+  one object), two services could claim the same published port (the
+  older keeps it; the other reports it in `status.conflicts`), and a
+  failed connection cleanup in the load balancer was not retried.
+
+  Learned on the way:
+  - Whole nodes cannot be VNET jails: inside a jail, ocijail fails
+    creating containers ("removing rctl rules ... Operation not
+    permitted"; FreeBSD has no jail parameter allowing rctl), and
+    Legion's own rctl limits would fail the same way. Nodes are bhyve
+    guests or real machines.
+  - Nodes must reach each other's advertised addresses (DESIGN.md §5.3,
+    Reachability); a node behind NAT joins through a site tunnel.
+  - The Podman package's `storage.conf` defaults to the ZFS driver, so on
+    a UFS host Legion's Podman exits at start (125) until the driver is
+    set to `vfs`; rctl needs `kern.racct.enable=1` in `loader.conf`.
+  - A host cannot reach its own published ports (DESIGN.md §5.4), so the
+    test asks for this host's from another node.
 
 ### To do, in order
 
-1. **Exit test**: a compose app on 3 nodes that survives losing any one
-   node and updates with zero downtime.
-
-   Whole nodes cannot be VNET jails on weft-bsd: inside a jail, ocijail
-   fails creating containers ("removing rctl rules ... Operation not
-   permitted"; FreeBSD has no jail parameter allowing rctl), and Legion's
-   own rctl limits would fail the same way. The test needs bhyve guests (or
-   real machines) as nodes.
+Nothing left in phase 2.
 
 Smaller follow-ups: workers renew their certificates through managers;
 `--listen` still defaults to loopback; a worker without `--advertise` has
 no WireGuard endpoint (it could use the address it reaches managers from);
-the mesh lab test drives `legion-net` in jails, not whole daemons, which
-comes with the exit test; placement preferences (`spread`) are accepted but
-not used yet.
+placement preferences (`spread`) are accepted but not used yet; the daemon takes Podman's storage driver from `storage.conf`
+(it could choose `vfs` itself when its root is not on ZFS); a node's
+advertised WireGuard endpoint replaces the one WireGuard learned, so a
+node behind NAT cannot be reached by its peers' replies alone; node subnets
+are reserved by name (`Config/legion-system/node-subnets`) and a deleted
+Node's reservation is not released; on a host without
+`kern.racct.enable=1` (a loader tunable) rctl limits fail and the agent
+only warns, so the pod runs unlimited (it could refuse to start, or report
+it in the Node's status); a lost node's tasks keep getting a share of
+new connections until the node is marked down (three missed 5 s
+heartbeats), which a faster down signal or per-connection retry could
+shorten.
 
 ## Later phases
 
