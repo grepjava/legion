@@ -23,6 +23,7 @@ use legion_pki::{CERT_LIFETIME, Ca, Identity, Role, SERVER_NAME};
 use legion_proto::v1::join_client::JoinClient;
 use legion_proto::v1::{JoinRequest, JoinResponse};
 use legion_store::{Command, NodeId, Outcome, Precondition, Raft, Store};
+use openraft::error::{ChangeMembershipError, ClientWriteError, RaftError};
 use openraft::{BasicNode, ChangeMembers};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
@@ -34,6 +35,8 @@ use crate::Tls;
 /// Where Legion keeps its own records; the API refuses it.
 pub const SYSTEM_NAMESPACE: &str = "legion-system";
 const TOKENS: &str = "join-tokens";
+/// How long a manager's join waits for another membership change.
+const MEMBERSHIP_WAIT: Duration = Duration::from_secs(30);
 
 /// A parsed join token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,17 +187,30 @@ impl Issuer {
                     "a manager joins with its node id and advertised address",
                 ));
             }
-            self.store
-                .raft
-                .add_learner(
-                    req.node_id,
-                    BasicNode {
-                        addr: req.advertise.clone(),
-                    },
-                    false,
-                )
-                .await
-                .map_err(|e| Status::unavailable(format!("adding the manager: {e}")))?;
+            // Raft takes one membership change at a time: wait for the one
+            // in flight (another manager joining or being promoted), which
+            // takes a few round trips.
+            let deadline = tokio::time::Instant::now() + MEMBERSHIP_WAIT;
+            loop {
+                let node = BasicNode {
+                    addr: req.advertise.clone(),
+                };
+                let add = self.store.raft.add_learner(req.node_id, node, false);
+                let added = tokio::time::timeout(crate::COMMIT_TIMEOUT, add)
+                    .await
+                    .map_err(|_| crate::no_quorum())?;
+                match added {
+                    Ok(_) => break,
+                    Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(
+                        ChangeMembershipError::InProgress(_),
+                    ))) if tokio::time::Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    Err(e) => {
+                        return Err(Status::unavailable(format!("adding the manager: {e}")));
+                    }
+                }
+            }
             ca_key_pem = self.ca.key_pem().to_owned();
         }
         tracing::info!(%id, node_id = req.node_id, advertise = %req.advertise, "node joined");
@@ -212,13 +228,13 @@ async fn write(
     object: Object,
     precondition: Precondition,
 ) -> Result<Outcome, Status> {
-    store
-        .raft
-        .client_write(Command::Put {
-            object,
-            precondition,
-        })
+    let put = store.raft.client_write(Command::Put {
+        object,
+        precondition,
+    });
+    tokio::time::timeout(crate::COMMIT_TIMEOUT, put)
         .await
+        .map_err(|_| crate::no_quorum())?
         .map(|r| r.data)
         .map_err(|e| Status::unavailable(e.to_string()))
 }

@@ -185,10 +185,9 @@ async fn apply(store: &Store, action: Action) -> Result<(), String> {
             precondition: Precondition::Version(version),
         },
     };
-    let out = store
-        .raft
-        .client_write(command)
+    let out = tokio::time::timeout(crate::COMMIT_TIMEOUT, store.raft.client_write(command))
         .await
+        .map_err(|_| crate::no_quorum().message().to_owned())?
         .map_err(|e| e.to_string())?;
     match out.data {
         Outcome::Written(_) | Outcome::Deleted { .. } => Ok(()),

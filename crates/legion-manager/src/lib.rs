@@ -63,14 +63,32 @@ impl ManagerConfig {
     }
 }
 
-/// Raft timing for managers on a LAN. Snapshot chunks stay well under the
-/// gRPC message limit after JSON encoding.
+/// How long a write waits to be committed. Without a quorum it never is,
+/// and callers get an error rather than hang (the write may still apply
+/// if a quorum comes back).
+pub(crate) const COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The error for a write or read that timed out waiting for a quorum.
+pub(crate) fn no_quorum() -> tonic::Status {
+    tonic::Status::unavailable(format!(
+        "no quorum of managers answered within {}s; it may still apply",
+        COMMIT_TIMEOUT.as_secs()
+    ))
+}
+
+/// Raft timing for managers on a LAN or across sites. openraft also uses
+/// the heartbeat interval as the timeout of each replication call, so it
+/// must exceed the slowest round trip between managers (with TLS and a
+/// disk write); at 250 ms a 225 ms link never kept a leader. Elections
+/// then come after 5 to 10 s of silence, close to Swarm's default.
+/// Snapshot chunks stay well under the gRPC message limit after JSON
+/// encoding.
 pub fn default_raft_config() -> openraft::Config {
     openraft::Config {
         cluster_name: "legion".into(),
-        heartbeat_interval: 250,
-        election_timeout_min: 1000,
-        election_timeout_max: 2000,
+        heartbeat_interval: 1000,
+        election_timeout_min: 5000,
+        election_timeout_max: 10_000,
         snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(10_000),
         snapshot_max_chunk_size: 1024 * 1024,
         ..Default::default()

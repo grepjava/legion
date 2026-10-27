@@ -137,16 +137,19 @@ impl ApiService {
     }
 
     async fn consistent(&self) -> Result<(), Status> {
-        self.store
-            .raft
-            .ensure_linearizable()
+        tokio::time::timeout(crate::COMMIT_TIMEOUT, self.store.raft.ensure_linearizable())
             .await
+            .map_err(|_| crate::no_quorum())?
             .map(|_| ())
             .map_err(|e| Status::unavailable(e.to_string()))
     }
 
     pub(crate) async fn write(&self, cmd: Command) -> Result<Outcome, Status> {
-        match self.store.raft.client_write(cmd).await {
+        let written =
+            tokio::time::timeout(crate::COMMIT_TIMEOUT, self.store.raft.client_write(cmd))
+                .await
+                .map_err(|_| crate::no_quorum())?;
+        match written {
             Ok(resp) => Ok(resp.data),
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ForwardToLeader {
                 leader_id,
