@@ -61,10 +61,12 @@ fn pods_on_the_bridge() {
         [Ipv4Addr::new(10, 200, 7, 2), Ipv4Addr::new(10, 200, 7, 3)]
     );
 
-    // Host to pod, pod to gateway, pod to pod across the bridge.
+    // Host to pod, pod to its loopback, pod to gateway, pod to pod across
+    // the bridge.
     let (a, b) = (&pods[0].0, &pods[1].0);
     for cmd in [
         "ping -c1 -t2 10.200.7.2".to_owned(),
+        format!("jexec {a} ping -c1 -t2 127.0.0.1"),
         format!("jexec {a} ping -c1 -t2 10.200.7.1"),
         format!("jexec {a} ping -c1 -t2 10.200.7.3"),
         format!("jexec {b} ping -c1 -t2 10.200.7.2"),

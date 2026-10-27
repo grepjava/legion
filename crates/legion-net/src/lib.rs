@@ -125,10 +125,13 @@ impl PodNetwork {
             )?;
             sys.bridge_add_member(BRIDGE, &host)?;
             sys.interface_move(&pair.b, jail)?;
+            // A new VNET's loopback has only ::1; rc gives the host its
+            // 127.0.0.1, so a pod needs it set too.
             sys.interface_configure(
                 Some(jail),
                 "lo0",
                 &IfConfig {
+                    addr: Some(Ipv4Net::new(Ipv4Addr::LOCALHOST, 8)),
                     up: true,
                     ..Default::default()
                 },
