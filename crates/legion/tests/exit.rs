@@ -237,7 +237,22 @@ fn app_survives_failures() {
     wait("the app to be ready", 300, app_ready);
     assert_eq!(running("web").len(), 2);
 
-    // Both web tasks reach db and cache by name.
+    // Each service has a VIP, and names resolve to it.
+    for (svc, vip) in [
+        ("web", "10.201.0.1"),
+        ("db", "10.201.0.2"),
+        ("cache", "10.201.0.3"),
+    ] {
+        let s = list("services")
+            .into_iter()
+            .find(|s| s["metadata"]["name"] == svc)
+            .unwrap();
+        assert_eq!(s["status"]["virtualIp"], vip, "{svc}");
+        let answer = sh(&format!("drill @10.200.0.1 {svc}.shop.legion A"));
+        assert!(answer.contains(&format!("IN	A	{vip}")), "{answer}");
+    }
+
+    // Both web tasks reach db and cache by name, through their VIPs.
     assert_eq!(count("/count"), 1);
     assert_eq!(count("/count"), 2);
     assert_eq!(count("/hits"), 1);

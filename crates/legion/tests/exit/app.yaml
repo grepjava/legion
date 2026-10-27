@@ -5,7 +5,9 @@
 #   db     a counter store on a ZFS volume: survives restarts and new pods
 #   cache  the same store on a tmpfs volume: lost with the pod
 #
-# web reaches the others by name through the node resolver.
+# web reaches the others by name through the node resolver, which answers
+# with their VIPs; pf balances them over the ready tasks. web is published
+# on port 30080 of the node.
 apiVersion: legion/v1
 kind: Config
 metadata: { name: services, namespace: shop }
@@ -90,6 +92,8 @@ spec:
           readiness: { http: { port: http, path: /healthz }, period: 2s }
           liveness: { tcp: { port: http }, period: 5s }
         resources: { limits: { memory: 128Mi, maxproc: 64 } }
+  endpoint:
+    ports: [{ port: 80, targetPort: http, publish: ingress, publishedPort: 30080 }]
 ---
 apiVersion: legion/v1
 kind: Service
@@ -110,6 +114,8 @@ spec:
         probes:
           readiness: { tcp: { port: store }, period: 2s }
     volumes: [{ name: data, volume: { name: db-data } }]
+  endpoint:
+    ports: [{ port: 7000, targetPort: store }]
 ---
 apiVersion: legion/v1
 kind: Service
@@ -130,3 +136,5 @@ spec:
         probes:
           readiness: { tcp: { port: store }, period: 2s }
     volumes: [{ name: data, tmpfs: { size: 16Mi } }]
+  endpoint:
+    ports: [{ port: 7000, targetPort: store }]
