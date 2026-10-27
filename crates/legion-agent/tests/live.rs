@@ -224,9 +224,15 @@ async fn agent_runs_a_real_pod() {
     // The node resolver answers on the gateway: cluster names itself,
     // others through the host's resolvers.
     let nx = sh("drill @10.200.0.1 nope.lab.legion A");
-    assert!(nx.contains("rcode: NXDOMAIN") && nx.contains(" aa "), "{nx}");
+    assert!(
+        nx.contains("rcode: NXDOMAIN") && nx.contains(" aa "),
+        "{nx}"
+    );
     let out = sh("drill @10.200.0.1 freebsd.org A");
-    assert!(out.contains("rcode: NOERROR") && out.contains("IN\tA\t"), "{out}");
+    assert!(
+        out.contains("rcode: NOERROR") && out.contains("IN\tA\t"),
+        "{out}"
+    );
     let tcp = sh("drill -t @10.200.0.1 freebsd.org A");
     assert!(tcp.contains("rcode: NOERROR"), "over TCP: {tcp}");
     let uid = status_uid(&store, &key);
