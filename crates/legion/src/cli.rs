@@ -4,6 +4,7 @@ use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, bail};
+use legion_api::service::ServiceStatus;
 use legion_api::{API_VERSION, Kind, Object};
 use legion_proto::v1::cluster_client::ClusterClient;
 use legion_proto::v1::objects_client::ObjectsClient;
@@ -141,6 +142,43 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 .await?
                 .into_inner();
             println!("{kind}/{name} deleted (version {})", resp.version);
+        }
+        Command::Rollback { service, namespace } => {
+            let current = objects
+                .get(ObjectRef {
+                    kind: Kind::Service.to_string(),
+                    namespace: namespace.unwrap_or_default(),
+                    name: service,
+                })
+                .await?
+                .into_inner();
+            let mut object = Object::try_from(current)?;
+            let status: ServiceStatus =
+                serde_json::from_value(object.status.clone()).unwrap_or_default();
+            let Some(update) = status.update else {
+                bail!("{} has had no update to roll back", object.key());
+            };
+            if serde_json::to_value(&update.previous)? == object.spec {
+                bail!(
+                    "{} already runs the spec before its latest update",
+                    object.key()
+                );
+            }
+            object.spec = serde_json::to_value(&update.previous)?;
+            // Only over the spec just read: a newer change wins.
+            let resp = objects
+                .apply(ApplyRequest {
+                    object: Some((&object).into()),
+                    expected_version: Some(object.metadata.version),
+                    ..Default::default()
+                })
+                .await?
+                .into_inner();
+            println!(
+                "{} rolling back (version {})",
+                object.key(),
+                resp.object.unwrap_or_default().version
+            );
         }
         Command::Watch { kind, from } => {
             let kind = kind.as_deref().map(parse_kind).transpose()?;
@@ -367,7 +405,7 @@ fn print_objects(objects: &[pb::Object], format: Format, kind: Kind) -> anyhow::
         let count = |v: &serde_json::Value, key: &str| v[key].as_u64().unwrap_or(0);
         match kind {
             Kind::Service => {
-                let rows: Vec<[String; 5]> = objects
+                let rows: Vec<[String; 6]> = objects
                     .iter()
                     .map(|o| {
                         let images: Vec<String> = o.spec["pod"]["containers"]
@@ -384,10 +422,14 @@ fn print_objects(objects: &[pb::Object], format: Format, kind: Kind) -> anyhow::
                                 count(&o.status, "desired")
                             ),
                             images.join(","),
+                            field(&o.status, &["update", "state"]),
                         ]
                     })
                     .collect();
-                print_table(["NAMESPACE", "NAME", "MODE", "READY", "IMAGES"], &rows);
+                print_table(
+                    ["NAMESPACE", "NAME", "MODE", "READY", "IMAGES", "UPDATE"],
+                    &rows,
+                );
             }
             Kind::Task => {
                 let rows: Vec<[String; 6]> = objects

@@ -10,10 +10,11 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use legion_api::node::{Availability, NodeSpec, NodeState, NodeStatus};
+use legion_api::service::FailureAction;
 use legion_api::service::{
     Constraint, EndpointMode, NodeAttribute, PUBLISHED_PORTS, Publish, PublishedPort,
     RestartCondition, SERVICE_NET, SERVICE_PREFIX, ServiceMode, ServiceSpec, ServiceStatus,
-    TaintEffect, UpdateOrder,
+    TaintEffect, UpdateOrder, UpdateState, UpdateStatus,
 };
 use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
 use legion_api::{Kind, Object, ObjectKey};
@@ -113,10 +114,12 @@ impl Service {
 }
 
 /// What the controller remembers between calls: when it first saw each
-/// task fail, for backoff.
+/// task fail, for backoff, and run, for rolling updates' delay and monitor
+/// window. A new leader starts afresh, which only makes it wait longer.
 #[derive(Debug, Default)]
 pub struct Memory {
     pub failed_at: BTreeMap<String, Instant>,
+    pub running_at: BTreeMap<String, Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -167,6 +170,15 @@ pub fn plan(
         .retain(|uid, _| live.contains(uid.as_str()));
     for t in tasks.iter().filter(|t| t.failed()) {
         memory.failed_at.entry(t.uid().to_owned()).or_insert(now);
+    }
+    memory
+        .running_at
+        .retain(|uid, _| live.contains(uid.as_str()));
+    for t in tasks
+        .iter()
+        .filter(|t| t.status.state == TaskState::Running)
+    {
+        memory.running_at.entry(t.uid().to_owned()).or_insert(now);
     }
 
     let mut addresses = addresses(services);
@@ -380,6 +392,10 @@ fn service(
     let generation = s.object.metadata.generation;
     let previous: ServiceStatus =
         serde_json::from_value(s.object.status.clone()).unwrap_or_default();
+    let mut update = match track_update(s, tasks, &previous, memory, plan) {
+        Some(update) => update,
+        None => return,
+    };
     let mut last_tasks = BTreeMap::new();
     let mut by_slot: BTreeMap<Slot, Vec<&Task>> = BTreeMap::new();
     for t in tasks {
@@ -440,23 +456,50 @@ fn service(
     // generation too, but replace nothing.
     let current_pod = |t: &Task| t.spec.pod == s.spec.pod;
 
-    // Rolling update budget: slots mid-update count against parallelism.
+    // Rolling update budget: slots mid-update count against parallelism,
+    // until their new task is ready and has run for the update's delay.
+    let delay = s.spec.update.delay.as_std();
+    let settling = |t: &Task| {
+        if t.status.state != TaskState::Running || !t.status.ready {
+            return true;
+        }
+        let since = memory.running_at.get(t.uid()).copied().unwrap_or(now);
+        since + delay > now
+    };
     let parallelism = match s.spec.update.parallelism {
         0 => usize::MAX,
         n => n as usize,
     };
-    let in_flight = wanted
-        .iter()
-        .filter(|slot| {
-            by_slot.get(*slot).is_some_and(|list| {
-                list.iter().any(|t| {
-                    t.stopping()
-                        || (current_pod(t) && t.active() && t.status.state != TaskState::Running)
-                })
-            })
-        })
-        .count();
-    let mut budget = parallelism.saturating_sub(in_flight);
+    let mut in_flight = 0;
+    for slot in &wanted {
+        let Some(list) = by_slot.get(slot) else {
+            continue;
+        };
+        // Between an old task stopping and its replacement starting, or a
+        // new one failing and its retry, nothing runs in the slot.
+        let gap = !list.iter().any(|t| t.active())
+            && list.last().is_some_and(|t| !current_pod(t) || t.failed());
+        if gap || list.iter().any(|t| t.stopping()) {
+            in_flight += 1;
+        } else if let Some(t) = list
+            .iter()
+            .find(|t| current_pod(t) && t.active() && settling(t))
+        {
+            in_flight += 1;
+            if let Some(since) = memory.running_at.get(t.uid())
+                && t.status.state == TaskState::Running
+                && t.status.ready
+            {
+                plan.wake_at(*since + delay);
+            }
+        }
+    }
+    let paused = update.as_ref().is_some_and(|u| u.state.paused());
+    let mut budget = if paused {
+        0
+    } else {
+        parallelism.saturating_sub(in_flight)
+    };
 
     let policy = &s.spec.pod.restart_policy;
     for slot in &wanted {
@@ -472,8 +515,8 @@ fn service(
             plan.actions.push(stop(extra));
         }
         if let Some(new) = current.first() {
-            // start-first: the old task goes once the new one runs.
-            if new.status.state == TaskState::Running {
+            // start-first: the old task goes once the new one is ready.
+            if new.status.state == TaskState::Running && new.status.ready {
                 for old in &outdated {
                     plan.actions.push(stop(old));
                 }
@@ -550,6 +593,39 @@ fn service(
         }
     }
 
+    // The update is done once every slot runs a new task only, ready and
+    // past the monitor window.
+    if let Some(u) = update.as_mut().filter(|u| u.state.in_progress()) {
+        let monitor = s.spec.update.monitor.as_std();
+        let mut done = true;
+        for slot in &wanted {
+            let list: &[&Task] = by_slot.get(slot).map_or(&[], Vec::as_slice);
+            if list.iter().any(|t| t.active() && !current_pod(t)) {
+                done = false;
+                continue;
+            }
+            let new = list.iter().find(|t| t.active() && current_pod(t));
+            match new.and_then(|t| {
+                (t.status.state == TaskState::Running && t.status.ready)
+                    .then(|| memory.running_at.get(t.uid()).copied())
+                    .flatten()
+            }) {
+                Some(since) if since + monitor <= now => {}
+                Some(since) => {
+                    done = false;
+                    plan.wake_at(since + monitor);
+                }
+                None => done = false,
+            }
+        }
+        if done {
+            u.state = match u.state {
+                UpdateState::RollingBack => UpdateState::RolledBack,
+                _ => UpdateState::Completed,
+            };
+        }
+    }
+
     // Status, from the tasks as they are now.
     let running: Vec<&&Task> = tasks
         .iter()
@@ -563,6 +639,8 @@ fn service(
         virtual_ip: addrs.vip.map(|ip| ip.to_string()),
         published_ports: addrs.published,
         last_tasks,
+        spec: Some(s.spec.clone()),
+        update,
     };
     let status = serde_json::to_value(&status).expect("status serialises");
     if s.object.status != status {
@@ -571,6 +649,90 @@ fn service(
         plan.actions
             .push(Action::Update(o, s.object.metadata.version));
     }
+}
+
+/// The service's rolling update after this pass: started when the pod in
+/// the spec changed since the last pass (a rollback when it went back to
+/// the spec the update came from), and stopped by a new task failing
+/// before it outlived the monitor window, as `failureAction` says. `None`
+/// when the service's spec was just written back for a rollback, which the
+/// next pass picks up.
+fn track_update(
+    s: &Service,
+    tasks: &[&Task],
+    previous: &ServiceStatus,
+    memory: &Memory,
+    plan: &mut Plan,
+) -> Option<Option<UpdateStatus>> {
+    let mut update = previous.update.clone();
+    if let Some(old) = previous.spec.as_ref()
+        && old.pod != s.spec.pod
+    {
+        let back = update.as_ref().is_some_and(|u| u.previous == s.spec);
+        let message = match &update {
+            Some(u) if back && u.state == UpdateState::RollingBack => u.message.clone(),
+            _ => String::new(),
+        };
+        update = Some(UpdateStatus {
+            state: if back {
+                UpdateState::RollingBack
+            } else {
+                UpdateState::Updating
+            },
+            message,
+            generation: s.object.metadata.generation,
+            previous: old.clone(),
+        });
+    }
+    let Some(u) = update.as_mut().filter(|u| u.state.in_progress()) else {
+        return Some(update);
+    };
+    let monitor = s.spec.update.monitor.as_std();
+    let failed = tasks.iter().find(|t| {
+        t.spec.service_generation >= u.generation
+            && t.spec.pod == s.spec.pod
+            && t.failed()
+            && match (
+                memory.running_at.get(t.uid()),
+                memory.failed_at.get(t.uid()),
+            ) {
+                (Some(ran), Some(failed)) => *failed < *ran + monitor,
+                _ => true,
+            }
+    });
+    let Some(t) = failed else {
+        return Some(update);
+    };
+    let why = match t.status.message.as_str() {
+        "" => format!("task {} failed", t.object.metadata.name),
+        m => format!("task {} failed: {m}", t.object.metadata.name),
+    };
+    match (u.state, s.spec.update.failure_action) {
+        (UpdateState::RollingBack, _) => {
+            u.state = UpdateState::RollbackPaused;
+            u.message = format!("rollback paused: {why}");
+        }
+        (_, FailureAction::Continue) => {}
+        (_, FailureAction::Pause) => {
+            u.state = UpdateState::Paused;
+            u.message = format!("update paused: {why}");
+        }
+        (_, FailureAction::Rollback) => {
+            // The spec goes back as it was; the status keeps the spec seen
+            // last, so the next pass sees the change as a rollback.
+            u.state = UpdateState::RollingBack;
+            u.message = format!("rolled back: {why}");
+            let mut o = s.object.clone();
+            o.spec = serde_json::to_value(&u.previous).expect("serialises");
+            let mut status = previous.clone();
+            status.update = update;
+            o.status = serde_json::to_value(&status).expect("serialises");
+            plan.actions
+                .push(Action::Update(o, s.object.metadata.version));
+            return None;
+        }
+    }
+    Some(update)
 }
 
 /// When a slot whose last task failed gets a new one: the restart delay

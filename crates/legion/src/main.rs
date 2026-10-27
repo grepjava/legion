@@ -137,6 +137,12 @@ enum Command {
         #[arg(short, long)]
         namespace: Option<String>,
     },
+    /// Roll a service back to the spec its latest update came from.
+    Rollback {
+        service: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
     /// Stream changes, optionally of one kind.
     Watch {
         kind: Option<String>,

@@ -239,10 +239,18 @@ end.
   node). Then a node goes silent: its task is orphaned and replaced on
   the others, which stop balancing to it. It comes back and removes the
   lost pod, and a `NoExecute` taint empties a node.
+- **Rolling update monitoring and rollback** (`legion-manager` controller,
+  `legion rollback`): updates honour `delay`, wait for readiness, watch new
+  tasks for `monitor`, and on a failure pause, continue or roll back as
+  `failureAction` says; the service status shows the update's state and
+  why it stopped (`legion list services` has an UPDATE column).
+  `legion rollback` applies the spec the latest update came from. Tested in
+  the planner (completion, delay, pause, automatic and manual rollback) and
+  through the CLI.
 
 ### To do, in order
 
-1. **Rollback and compose `stack deploy`**.
+1. **Compose `stack deploy`**.
 2. **Exit test**.
 
 Smaller follow-ups: workers renew their certificates through managers;

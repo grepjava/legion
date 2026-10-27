@@ -129,7 +129,7 @@ spec: { pod: { containers: [{ name: db, image: postgres:17 }] } }
         "{diff}"
     );
     assert!(!diff.contains("Service/shop/db"), "{diff}");
-    std::fs::write(&manifest, text).unwrap();
+    std::fs::write(&manifest, &text).unwrap();
 
     let table = ok(&d, &["list", "services", "-n", "shop"]);
     assert!(table.starts_with("NAMESPACE"), "{table}");
@@ -143,6 +143,31 @@ spec: { pod: { containers: [{ name: db, image: postgres:17 }] } }
     let yaml = ok(&d, &["get", "service", "web", "-n", "shop"]);
     assert!(yaml.contains("replicas: 3"), "{yaml}");
     assert!(yaml.contains("generation: 1"), "{yaml}");
+
+    // A new image starts an update (no agent: it never finishes), which
+    // `rollback` undoes.
+    let rolled = legion(&d, &["rollback", "web", "-n", "shop"]);
+    assert!(
+        String::from_utf8_lossy(&rolled.stderr).contains("no update to roll back"),
+        "{rolled:?}"
+    );
+    std::fs::write(&manifest, text.replace("web:1", "web:2")).unwrap();
+    ok(&d, &["apply", "-f", manifest.to_str().unwrap()]);
+    let updating = || ok(&d, &["list", "services", "-n", "shop"]).contains("updating");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !updating() {
+        assert!(std::time::Instant::now() < deadline, "no update");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(ok(&d, &["rollback", "web", "-n", "shop"]).contains("rolling back"));
+    let yaml = ok(&d, &["get", "service", "web", "-n", "shop"]);
+    assert!(yaml.contains("image: web:1"), "{yaml}");
+    let rolling = || ok(&d, &["list", "services", "-n", "shop"]).contains("rolling-back");
+    while !rolling() {
+        assert!(std::time::Instant::now() < deadline, "no rollback");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    std::fs::write(&manifest, &text).unwrap();
 
     ok(&d, &["delete", "service", "web", "-n", "shop"]);
     let missing = legion(&d, &["get", "service", "web", "-n", "shop"]);

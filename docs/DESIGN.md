@@ -138,8 +138,21 @@ preconditions. Rules:
 - **History.** The last 5 terminal tasks of a slot are kept; slots no longer
   wanted keep none. Tasks of deleted services are stopped, then deleted.
 - **Updates** replace outdated tasks `parallelism` slots at a time, in
-  `stop-first` or `start-first` order. Monitoring, failure actions and
-  rollback are phase 2.
+  `stop-first` or `start-first` order (the old task stops once the new one
+  is ready). A slot counts against `parallelism` until its new task is
+  ready and has run for `delay`. An update starts when the pod in the spec
+  changes; the status keeps the spec seen last (`status.spec`) and the
+  update (`status.update`: state, message, the spec it came from). A new
+  task failing before it has run for `monitor` (5 s) triggers
+  `failureAction`: `pause` stops replacing tasks until the spec changes
+  again, `continue` ignores it, `rollback` writes the previous spec back.
+  The update completes once every slot runs a new task only, ready and
+  past `monitor`. Changing the spec back to the one the update came from
+  is a rollback (`legion rollback <service>` does that), with states
+  `rolling-back`, `rolled-back`, and `rollback-paused` when a task fails
+  during it. Swarm's `maxFailureRatio` and a separate rollback config are
+  not built: any failure counts, and a rollback uses the restored spec's
+  own update settings.
 - **Nodes.** A drained node's tasks stop and move elsewhere; a paused node
   keeps its tasks but gets no new ones. The tasks of a node that is `down`
   are marked `orphaned` and told to stop, in one write: they leave the

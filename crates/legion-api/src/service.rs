@@ -1152,7 +1152,7 @@ pub struct PublishedPort {
 }
 
 /// Observed state, written by the Service controller.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceStatus {
     /// The spec generation the counts below reflect.
@@ -1171,4 +1171,63 @@ pub struct ServiceStatus {
     /// node), so a deleted task's name is never given to another.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub last_tasks: BTreeMap<String, u64>,
+    /// The spec as the controller last saw it. When the Service's spec
+    /// differs in its pod, an update starts from this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<ServiceSpec>,
+    /// The latest rolling update, once there has been one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<UpdateStatus>,
+}
+
+/// How a rolling update went (DESIGN.md §3.3, Update).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateStatus {
+    pub state: UpdateState,
+    /// Why it paused or rolled back.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    /// The Service's generation when the update started: tasks of this or
+    /// a later one are the update's.
+    pub generation: u64,
+    /// The spec updated from, which a rollback restores.
+    pub previous: ServiceSpec,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpdateState {
+    Updating,
+    /// A new task failed and `failureAction` is `pause`: no more tasks are
+    /// replaced until the spec changes again.
+    Paused,
+    Completed,
+    /// Going back to the previous spec, after a failure or by request.
+    RollingBack,
+    /// A task failed while rolling back.
+    RollbackPaused,
+    RolledBack,
+}
+
+impl UpdateState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UpdateState::Updating => "updating",
+            UpdateState::Paused => "paused",
+            UpdateState::Completed => "completed",
+            UpdateState::RollingBack => "rolling-back",
+            UpdateState::RollbackPaused => "rollback-paused",
+            UpdateState::RolledBack => "rolled-back",
+        }
+    }
+
+    /// Whether tasks are being replaced.
+    pub fn in_progress(self) -> bool {
+        matches!(self, UpdateState::Updating | UpdateState::RollingBack)
+    }
+
+    pub fn paused(self) -> bool {
+        matches!(self, UpdateState::Paused | UpdateState::RollbackPaused)
+    }
 }

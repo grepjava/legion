@@ -174,6 +174,11 @@ impl World {
                                 .find(|s| s.object.key() == o.key())
                                 .unwrap();
                             if s.object.metadata.version == version {
+                                // As the store: a new spec is a new generation.
+                                if o.spec != s.object.spec {
+                                    o.metadata.generation += 1;
+                                    s.spec = legion_api::parse(&o.spec).unwrap();
+                                }
                                 s.object = o;
                             }
                         }
@@ -307,6 +312,197 @@ impl World {
             .unwrap();
         serde_json::from_value(s.object.status.clone()).unwrap()
     }
+}
+
+impl World {
+    /// The service's update state and message.
+    fn update(&self, name: &str) -> (String, String) {
+        let u = self.status(name).update.expect("an update");
+        (u.state.as_str().to_owned(), u.message)
+    }
+
+    /// Images of the running tasks of `service`, sorted.
+    fn images(&self, service: &str) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|t| t.spec.service == service && t.status.state == TaskState::Running)
+            .map(|t| t.spec.pod.containers[0].image.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The running task of `service` with `image`.
+    fn running_with(&self, service: &str, image: &str) -> String {
+        self.tasks
+            .iter()
+            .find(|t| {
+                t.spec.service == service
+                    && t.status.state == TaskState::Running
+                    && t.spec.pod.containers[0].image == image
+            })
+            .unwrap()
+            .object
+            .metadata
+            .name
+            .clone()
+    }
+}
+
+fn web(image: &str, update: &str) -> String {
+    format!(
+        "replicas: 2\npod: {{ containers: [{{ name: web, image: \"{image}\" }}], restartPolicy: {{ delay: 0s }} }}\nupdate: {{ {update} }}"
+    )
+}
+
+#[test]
+fn updates_complete_after_the_monitor_window() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.service("web", &web("web:1", ""));
+    w.settle();
+    assert!(w.status("web").update.is_none(), "creating is no update");
+
+    w.service("web", &web("web:2", ""));
+    w.settle();
+    assert_eq!(w.images("web"), ["web:2", "web:2"]);
+    assert_eq!(
+        w.update("web").0,
+        "updating",
+        "still watching the new tasks"
+    );
+    let u = w.status("web").update.unwrap();
+    assert_eq!(u.previous.pod.containers[0].image, "web:1");
+    assert_eq!(w.wake(), Some(w.now + Duration::from_secs(5)));
+
+    w.now += Duration::from_secs(5);
+    w.settle();
+    assert_eq!(w.update("web").0, "completed");
+
+    // Other changes are no update.
+    w.service("web", &web("web:2", "parallelism: 2"));
+    w.settle();
+    assert_eq!(w.update("web").0, "completed");
+}
+
+#[test]
+fn delay_spaces_the_slots() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.service("web", &web("web:1", "delay: 10s"));
+    w.settle();
+    w.service("web", &web("web:2", "delay: 10s"));
+    w.settle();
+    assert_eq!(w.images("web"), ["web:1", "web:2"]);
+    w.now += Duration::from_secs(5);
+    w.settle();
+    assert_eq!(w.images("web"), ["web:1", "web:2"]);
+    w.now += Duration::from_secs(5);
+    w.settle();
+    assert_eq!(w.images("web"), ["web:2", "web:2"]);
+}
+
+#[test]
+fn a_failing_update_pauses() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.service("web", &web("web:1", "delay: 10s"));
+    w.settle();
+    w.service("web", &web("web:2", "delay: 10s"));
+    w.settle();
+    let new = w.running_with("web", "web:2");
+    w.fail(&new);
+    w.settle();
+    assert_eq!(
+        w.update("web"),
+        (
+            "paused".to_owned(),
+            format!("update paused: task {new} failed: container exited with 1")
+        )
+    );
+    // The old task is left alone; the failed slot is retried as usual.
+    w.now += Duration::from_secs(60);
+    w.settle();
+    assert_eq!(w.images("web"), ["web:1", "web:2"]);
+
+    // A new spec starts a new update.
+    w.service("web", &web("web:3", "delay: 10s"));
+    w.settle();
+    assert_eq!(w.update("web").0, "updating");
+}
+
+#[test]
+fn a_failing_update_rolls_back() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    let update = "delay: 10s, failureAction: rollback";
+    w.service("web", &web("web:1", update));
+    w.settle();
+    w.service("web", &web("web:2", update));
+    w.settle();
+    // web-1-2 runs web:2; web-2-1 still runs web:1, for the delay.
+    w.now += Duration::from_secs(10);
+    w.settle();
+    // web-1-2 failing now, past the monitor window, does not count.
+    w.fail("web-1-2");
+    w.settle();
+    assert_eq!(w.update("web").0, "updating");
+    w.now += Duration::from_secs(1);
+    w.settle();
+    assert_eq!(w.running(), ["web-1-3", "web-2-2"]);
+
+    // web-2-2 failing within it does: the spec goes back and the tasks
+    // follow.
+    w.fail("web-2-2");
+    w.settle();
+    let s = w
+        .services
+        .iter()
+        .find(|s| s.object.metadata.name == "web")
+        .unwrap();
+    assert_eq!(s.spec.pod.containers[0].image, "web:1");
+    assert_eq!(
+        w.update("web"),
+        (
+            "rolling-back".to_owned(),
+            "rolled back: task web-2-2 failed: container exited with 1".to_owned()
+        )
+    );
+    // The spec rolled back to spaces its slots too.
+    for _ in 0..12 {
+        w.now += Duration::from_secs(1);
+        w.settle();
+    }
+    assert_eq!(w.images("web"), ["web:1", "web:1"]);
+    w.now += Duration::from_secs(5);
+    w.settle();
+    assert_eq!(w.update("web").0, "rolled-back");
+    assert_eq!(
+        w.status("web").update.unwrap().previous.pod.containers[0].image,
+        "web:2"
+    );
+}
+
+#[test]
+fn rollback_by_hand() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.service("web", &web("web:1", ""));
+    w.settle();
+    w.service("web", &web("web:2", ""));
+    w.settle();
+    w.now += Duration::from_secs(5);
+    w.settle();
+    // As `legion rollback` does: apply the spec the update came from.
+    let previous = w.status("web").update.unwrap().previous;
+    w.service("web", &serde_json::to_string(&previous).unwrap());
+    w.settle();
+    assert_eq!(w.update("web").0, "rolling-back");
+    assert_eq!(w.images("web"), ["web:1", "web:1"]);
+    w.now += Duration::from_secs(5);
+    w.settle();
+    assert_eq!(w.update("web").0, "rolled-back");
 }
 
 fn task(o: Object) -> Task {
