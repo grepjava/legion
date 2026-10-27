@@ -1,6 +1,6 @@
 //! What managers and agents exchange over the dispatcher (DESIGN.md §3.4):
-//! the tasks assigned to a node, every service's endpoints, and the outcome
-//! of claiming a volume. These travel as JSON inside the dispatcher's
+//! the tasks assigned to a node, every service's endpoints, the nodes of
+//! the WireGuard mesh, and the outcome of claiming a volume. These travel as JSON inside the dispatcher's
 //! messages.
 
 use std::collections::BTreeMap;
@@ -54,6 +54,20 @@ pub struct EndpointPort {
 
 /// Every service in the cluster, by namespace and name.
 pub type Endpoints = Vec<ServiceEndpoints>;
+
+/// A node of the WireGuard mesh (DESIGN.md §5.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Peer {
+    pub node: String,
+    pub public_key: String,
+    /// `host:port`, if the node gave one.
+    pub endpoint: Option<String>,
+    /// The node's pod subnet, e.g. `10.200.3.0/24`.
+    pub pod_cidr: String,
+}
+
+/// Every node with a pod subnet and a WireGuard key, by name.
+pub type Peers = Vec<Peer>;
 
 /// The outcome of claiming a volume for a node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

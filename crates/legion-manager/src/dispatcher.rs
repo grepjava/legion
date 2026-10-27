@@ -1,6 +1,6 @@
 //! The dispatcher (DESIGN.md §3.4): agents follow the tasks assigned to
-//! their node and the cluster's endpoints, and report back, through any
-//! manager.
+//! their node, the cluster's endpoints and the nodes of the WireGuard mesh,
+//! and report back, through any manager.
 //!
 //! Streams and reads are served from the local replica. Writes go to the
 //! leader, which a follower forwards them to, naming the node it acts for.
@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use legion_api::data::DataSpec;
 use legion_api::dispatch::{
-    Assignment, Assignments, EndpointPort, Endpoints, ServiceEndpoints, VolumeClaim,
+    Assignment, Assignments, EndpointPort, Endpoints, Peer, Peers, ServiceEndpoints, VolumeClaim,
 };
 use legion_api::node::{NodeSpec, NodeState, NodeStatus};
 use legion_api::service::{PortRef, ServiceSpec, ServiceStatus};
@@ -31,7 +31,7 @@ use legion_proto::v1::dispatcher_server::Dispatcher;
 use legion_proto::v1::{
     AssignmentsRequest, AssignmentsUpdate, ClaimVolumeRequest, ClaimVolumeResponse, DataRequest,
     DataResponse, EndpointsRequest, EndpointsUpdate, HeartbeatRequest, HeartbeatResponse,
-    RegisterRequest, RegisterResponse, ReportRequest, ReportResponse,
+    PeersRequest, PeersUpdate, RegisterRequest, RegisterResponse, ReportRequest, ReportResponse,
 };
 use legion_store::{Command, Event, Outcome, Precondition, Store, WatchError};
 use tokio::sync::watch;
@@ -63,27 +63,32 @@ pub(crate) struct DispatcherService {
     seen: Arc<Mutex<HashMap<String, Instant>>>,
     /// Every service's endpoints, once first listed.
     endpoints: watch::Receiver<Option<Endpoints>>,
+    /// Every node of the mesh, once first listed.
+    peers: watch::Receiver<Option<Peers>>,
 }
 
 impl DispatcherService {
-    /// Starts following the cluster's endpoints and, while this manager
-    /// leads, the nodes' heartbeats. Both stop on `api.closing`.
+    /// Starts following the cluster's endpoints and peers and, while this
+    /// manager leads, the nodes' heartbeats. Both stop on `api.closing`.
     pub(crate) fn start(
         api: ApiService,
         tls: bool,
         period: Duration,
     ) -> (DispatcherService, tokio::task::JoinHandle<()>) {
-        let (tx, endpoints) = watch::channel(None);
+        let (endpoints_tx, endpoints) = watch::channel(None);
+        let (peers_tx, peers) = watch::channel(None);
         let service = DispatcherService {
             tls,
             period,
             seen: Arc::default(),
             endpoints,
+            peers,
             api,
         };
-        let follow = tokio::spawn(follow_endpoints(
+        let follow = tokio::spawn(follow_cluster(
             service.api.store.clone(),
-            tx,
+            endpoints_tx,
+            peers_tx,
             service.api.closing.clone(),
         ));
         let monitor = tokio::spawn(service.clone().monitor());
@@ -436,6 +441,22 @@ impl Dispatcher for DispatcherService {
         })))
     }
 
+    type PeersStream = ReceiverStream<Result<PeersUpdate, Status>>;
+
+    async fn peers(
+        &self,
+        req: Request<PeersRequest>,
+    ) -> Result<Response<Self::PeersStream>, Status> {
+        self.node(&req, &req.get_ref().node)?;
+        let mut rx = self.peers.clone();
+        rx.mark_changed();
+        Ok(Response::new(stream(&self.api.closing, rx, |set| {
+            PeersUpdate {
+                peers_json: serde_json::to_vec(set).expect("peers serialize"),
+            }
+        })))
+    }
+
     async fn report(
         &self,
         req: Request<ReportRequest>,
@@ -617,40 +638,48 @@ async fn follow_assignments(
     }
 }
 
-/// Keeps `tx` equal to the endpoints of every service: lists services and
-/// tasks, then follows changes to both. Ends when the manager shuts down.
-async fn follow_endpoints(
+/// Keeps `endpoints` equal to the endpoints of every service and `peers` to
+/// the nodes of the mesh: lists services, tasks and nodes, then follows
+/// changes to them. Ends when the manager shuts down.
+async fn follow_cluster(
     store: Store,
-    tx: watch::Sender<Option<Endpoints>>,
+    endpoints_tx: watch::Sender<Option<Endpoints>>,
+    peers_tx: watch::Sender<Option<Peers>>,
     mut closing: watch::Receiver<bool>,
 ) {
     loop {
-        let (services, tasks) = match (
+        let (services, tasks, nodes) = match (
             store.list(Kind::Service, None),
             store.list(Kind::Task, None),
+            store.list(Kind::Node, None),
         ) {
-            (Ok(s), Ok(t)) => (s, t),
-            (Err(e), _) | (_, Err(e)) => {
-                tracing::warn!("listing services and tasks: {e}");
+            (Ok(s), Ok(t), Ok(n)) => (s, t, n),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                tracing::warn!("listing services, tasks and nodes: {e}");
                 if pause(&mut closing).await {
                     return;
                 }
                 continue;
             }
         };
-        // Changes after the older listing, so none is missed; replaying
-        // some the newer listing already holds is harmless.
-        let since = services.version.min(tasks.version);
+        // Changes after the oldest listing, so none is missed; replaying
+        // some a newer listing already holds is harmless.
+        let since = services.version.min(tasks.version).min(nodes.version);
         let by_key = |objects: Vec<Object>| -> BTreeMap<ObjectKey, Object> {
             objects.into_iter().map(|o| (o.key(), o)).collect()
         };
-        let (mut services, mut tasks) = (by_key(services.objects), by_key(tasks.objects));
-        tx.send_if_modified(|old| replace(old, Some(&endpoints(&services, &tasks))));
+        let (mut services, mut tasks, mut nodes) = (
+            by_key(services.objects),
+            by_key(tasks.objects),
+            by_key(nodes.objects),
+        );
+        endpoints_tx.send_if_modified(|old| replace(old, Some(&endpoints(&services, &tasks))));
+        peers_tx.send_if_modified(|old| replace(old, Some(&peers(&nodes))));
         let mut watcher = match store.watch(since, None) {
             Ok(w) => w,
             Err(WatchError::Closed) => return,
             Err(e) => {
-                tracing::debug!("watching services and tasks: {e}; listing again");
+                tracing::debug!("watching services, tasks and nodes: {e}; listing again");
                 continue;
             }
         };
@@ -668,16 +697,41 @@ async fn follow_endpoints(
             let m = match o.kind {
                 Kind::Service => &mut services,
                 Kind::Task => &mut tasks,
+                Kind::Node => &mut nodes,
                 _ => continue,
             };
+            let kind = o.kind;
             if put {
                 m.insert(o.key(), o);
             } else {
                 m.remove(&o.key());
             }
-            tx.send_if_modified(|old| replace(old, Some(&endpoints(&services, &tasks))));
+            if kind == Kind::Node {
+                peers_tx.send_if_modified(|old| replace(old, Some(&peers(&nodes))));
+            } else {
+                endpoints_tx
+                    .send_if_modified(|old| replace(old, Some(&endpoints(&services, &tasks))));
+            }
         }
     }
+}
+
+/// The nodes with a pod subnet and a WireGuard key, down ones included:
+/// they keep their place in the mesh until they are removed.
+fn peers(nodes: &BTreeMap<ObjectKey, Object>) -> Peers {
+    nodes
+        .values()
+        .filter_map(|n| {
+            let status: NodeStatus = serde_json::from_value(n.status.clone()).ok()?;
+            let wireguard = status.wireguard?;
+            Some(Peer {
+                node: n.metadata.name.clone(),
+                public_key: wireguard.public_key,
+                endpoint: wireguard.endpoint,
+                pod_cidr: status.pod_cidr?,
+            })
+        })
+        .collect()
 }
 
 /// Waits a second; true if the manager shuts down meanwhile.

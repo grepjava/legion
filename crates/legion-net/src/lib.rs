@@ -7,8 +7,8 @@
 //! The host end is renamed after the task (`lp<id>`), so the agent finds it
 //! again after a restart, and destroying it removes the pair.
 //!
-//! Traffic leaving the node (routing to other nodes, NAT to the outside)
-//! and pf come later.
+//! Pods on other nodes are reached over the WireGuard mesh ([`mesh`]);
+//! services, published ports and NAT to the outside are pf rules ([`lb`]).
 
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
@@ -17,6 +17,7 @@ use legion_sys::{Destination, IfConfig, Ipv4Net, Sys};
 
 pub mod dns;
 pub mod lb;
+pub mod mesh;
 
 pub use legion_sys::Error;
 

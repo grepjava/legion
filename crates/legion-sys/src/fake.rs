@@ -1,7 +1,8 @@
 //! [`Sys`] in memory, for tests of the agent. It models what the agent
 //! relies on: interfaces live in one network stack at a time and return to
-//! the host when their jail goes away; rctl rules, pf anchors and tables, and
-//! datasets and mounts are kept as given. Failures mirror the real tools'
+//! the host when their jail goes away; WireGuard interfaces, rctl rules, pf
+//! anchors and tables, and datasets and mounts are kept as given. Keys are
+//! made up: a public key is `pub:` and the private one. Failures mirror the real tools'
 //! (missing interface, missing jail, existing dataset, unmounting what is
 //! not mounted).
 //!
@@ -12,7 +13,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::sync::{Mutex, MutexGuard};
 
-use crate::{Dataset, Destination, Epair, Error, IfConfig, Jail, PfState, RctlRule, Result, Sys};
+use crate::{
+    Dataset, Destination, Epair, Error, IfConfig, Jail, PfState, RctlRule, Result, Sys, WgPeer,
+};
 
 #[derive(Debug, Default)]
 pub struct FakeSys {
@@ -39,6 +42,10 @@ struct State {
     jails: BTreeMap<String, Jail>,
     interfaces: BTreeMap<String, FakeInterface>,
     routes: BTreeMap<Option<String>, BTreeMap<Destination, Ipv4Addr>>,
+    /// Routes out of an interface, by stack and destination.
+    interface_routes: BTreeMap<Option<String>, BTreeMap<Destination, String>>,
+    next_key: u32,
+    wireguard: BTreeMap<String, FakeWireGuard>,
     rctl: Vec<RctlRule>,
     usage: BTreeMap<String, BTreeMap<String, u64>>,
     anchors: BTreeMap<String, String>,
@@ -51,6 +58,15 @@ struct State {
     sysctls: BTreeMap<String, String>,
     main_rules: String,
     states: Vec<PfState>,
+}
+
+/// A WireGuard interface's settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FakeWireGuard {
+    pub private_key: Option<String>,
+    pub port: Option<u16>,
+    /// By public key.
+    pub peers: BTreeMap<String, WgPeer>,
 }
 
 fn fail(command: &str, message: impl Into<String>) -> Error {
@@ -145,6 +161,26 @@ impl FakeSys {
             .unwrap_or_default()
     }
 
+    pub fn interface_routes(&self, jail: Option<&str>) -> BTreeMap<Destination, String> {
+        self.state()
+            .interface_routes
+            .get(&jail.map(str::to_owned))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn wireguard(&self, name: &str) -> Option<FakeWireGuard> {
+        self.state().wireguard.get(name).cloned()
+    }
+
+    /// A peer WireGuard knows of without being told, as when it learns one
+    /// from a handshake.
+    pub fn add_wg_peer(&self, name: &str, peer: WgPeer) {
+        if let Some(wg) = self.state().wireguard.get_mut(name) {
+            wg.peers.insert(peer.public_key.clone(), peer);
+        }
+    }
+
     pub fn rctl_rules(&self) -> Vec<RctlRule> {
         self.state().rctl.clone()
     }
@@ -186,6 +222,12 @@ impl FakeSys {
     pub fn tmpfs_mounts(&self) -> BTreeMap<String, Option<u64>> {
         self.state().mounts.clone()
     }
+}
+
+fn wg_mut<'a>(s: &'a mut State, name: &str) -> Result<&'a mut FakeWireGuard> {
+    s.wireguard
+        .get_mut(name)
+        .ok_or_else(|| fail("wg", format!("Unable to access interface {name}")))
 }
 
 impl State {
@@ -291,6 +333,10 @@ impl Sys for FakeSys {
             .peer
             .clone();
         s.interfaces.remove(name);
+        s.wireguard.remove(name);
+        for table in s.interface_routes.values_mut() {
+            table.retain(|_, i| i != name);
+        }
         // Destroying either end of an epair destroys both.
         if let Some(peer) = peer {
             s.interfaces.remove(&peer);
@@ -399,6 +445,86 @@ impl Sys for FakeSys {
             .and_then(|t| t.remove(&dest))
             .map(drop)
             .ok_or_else(|| fail("route delete", "not in table"))
+    }
+
+    fn route_to_interface(
+        &self,
+        jail: Option<&str>,
+        dest: Destination,
+        interface: &str,
+    ) -> Result<()> {
+        let mut s = self.state();
+        s.check_jail("route add", jail)?;
+        s.interface_mut("route add", jail, interface)?;
+        if let Some(t) = s.routes.get_mut(&jail.map(str::to_owned)) {
+            t.remove(&dest);
+        }
+        s.interface_routes
+            .entry(jail.map(str::to_owned))
+            .or_default()
+            .insert(dest, interface.to_owned());
+        Ok(())
+    }
+
+    fn wg_genkey(&self) -> Result<String> {
+        let mut s = self.state();
+        s.next_key += 1;
+        Ok(format!("key{}", s.next_key))
+    }
+
+    fn wg_pubkey(&self, private_key: &str) -> Result<String> {
+        Ok(format!("pub:{private_key}"))
+    }
+
+    fn wg_create(&self, name: &str) -> Result<()> {
+        let mut s = self.state();
+        if s.interfaces.contains_key(name) {
+            return Err(fail("ifconfig wg create", "File exists"));
+        }
+        s.interfaces
+            .insert(name.to_owned(), FakeInterface::default());
+        s.wireguard
+            .insert(name.to_owned(), FakeWireGuard::default());
+        Ok(())
+    }
+
+    fn wg_configure(&self, name: &str, private_key: &str, port: u16) -> Result<()> {
+        let mut s = self.state();
+        let wg = wg_mut(&mut s, name)?;
+        wg.private_key = Some(private_key.to_owned());
+        wg.port = Some(port);
+        Ok(())
+    }
+
+    fn wg_peers(&self, name: &str) -> Result<Vec<WgPeer>> {
+        let mut s = self.state();
+        Ok(wg_mut(&mut s, name)?.peers.values().cloned().collect())
+    }
+
+    fn wg_set_peer(&self, name: &str, peer: &WgPeer) -> Result<()> {
+        let mut s = self.state();
+        let wg = wg_mut(&mut s, name)?;
+        let mut peer = peer.clone();
+        peer.allowed_ips.sort();
+        let entry = wg
+            .peers
+            .entry(peer.public_key.clone())
+            .or_insert_with(|| WgPeer {
+                endpoint: None,
+                ..peer.clone()
+            });
+        if peer.endpoint.is_some() {
+            entry.endpoint = peer.endpoint;
+        }
+        entry.allowed_ips = peer.allowed_ips;
+        entry.keepalive = peer.keepalive;
+        Ok(())
+    }
+
+    fn wg_remove_peer(&self, name: &str, public_key: &str) -> Result<()> {
+        let mut s = self.state();
+        wg_mut(&mut s, name)?.peers.remove(public_key);
+        Ok(())
     }
 
     fn rctl_add(&self, rule: &RctlRule) -> Result<()> {

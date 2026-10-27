@@ -211,19 +211,33 @@ end.
   receives its task and the endpoints, reads only its tasks' secrets,
   reports only on its tasks, goes `down` when silent and `ready` again;
   the agent tests and the exit test (FreeBSD) run through the dispatcher.
+- **WireGuard mesh** (`legion-net::mesh`, the dispatcher's `Peers` stream):
+  each node makes its key on first start, registers the public key and its
+  endpoint, and keeps `wg0` (address `100.64.<n>.1`, from its pod subnet)
+  with every other node as a peer; one route sends the pod CIDR into `wg0`
+  and WireGuard's allowed IPs pick the node. Traffic from outside the pod
+  network going to another node's pod (a published port's) is NATed to the
+  node's `wg0` address so replies return through it. Tested: the agent
+  makes and keeps its key, sets up `wg0` and follows nodes appearing and
+  going; and on FreeBSD, three VNET jails as nodes run the mesh and load
+  balancing code: pods reach pods on other nodes, a VIP balances over a
+  local and a remote task, a published port on a node without tasks
+  reaches both (and nothing connects without the NAT rule), and a node
+  removed from the peers is unreachable. The exit test passes with the mesh
+  up on its single node.
 
 ### To do, in order
 
-1. **WireGuard mesh and routed pod network**: per-node keys, peers from
-   the store, routes to other nodes' pod subnets; pf rules for remote
-   backends (§5.4).
-2. **Scheduling and failure handling across nodes**: taints, tasks of a
+1. **Scheduling and failure handling across nodes**: taints, tasks of a
    lost node rescheduled, the routing mesh on every node.
-3. **Rollback and compose `stack deploy`**.
-4. **Exit test**.
+2. **Rollback and compose `stack deploy`**.
+3. **Exit test**.
 
 Smaller follow-ups: workers renew their certificates through managers;
-`--listen` still defaults to loopback.
+`--listen` still defaults to loopback; a worker without `--advertise` has
+no WireGuard endpoint (it could use the address it reaches managers from);
+the mesh lab test drives `legion-net` in jails, not whole daemons, which
+comes with the exit test.
 
 ## Later phases
 

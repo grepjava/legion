@@ -12,7 +12,10 @@
 //! that went through a VIP is NATed to the gateway (the hairpin rule), or
 //! the backend would answer the client directly and the client would drop
 //! the reply. Pods reach the outside through NAT on the egress interface,
-//! where published ports also lead into service tables.
+//! where published ports also lead into service tables. Traffic
+//! from outside the pod network that leaves for another node's pod (a
+//! published port's, to a remote task) is NATed to this node's mesh
+//! address, so the reply comes back through here to be translated.
 //!
 //! Rules change only with services and ports; readiness changes only touch
 //! tables, so connections to a task that stops being ready finish (soft
@@ -89,8 +92,18 @@ impl Service {
     }
 }
 
+/// Where this node's traffic leaves it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Exits<'a> {
+    /// The interface of the default route.
+    pub egress: Option<&'a str>,
+    /// The mesh interface to other nodes.
+    pub mesh: Option<&'a str>,
+}
+
 /// The anchor's rules for this node.
-pub fn rules(services: &[Service], subnet: Ipv4Net, egress: Option<&str>) -> String {
+pub fn rules(services: &[Service], subnet: Ipv4Net, exits: Exits) -> String {
+    let egress = exits.egress;
     let local = format!("{}/{}", subnet.network(), subnet.prefix);
     let cluster = format!("{}/{}", CLUSTER_POD_CIDR.network(), CLUSTER_POD_CIDR.prefix);
     let mut r = String::new();
@@ -102,6 +115,12 @@ pub fn rules(services: &[Service], subnet: Ipv4Net, egress: Option<&str>) -> Str
         let _ = writeln!(
             r,
             "nat pass on {ext} inet from {local} to ! {cluster} -> ({ext})"
+        );
+    }
+    if let Some(mesh) = exits.mesh {
+        let _ = writeln!(
+            r,
+            "nat pass on {mesh} inet from ! {cluster} to {cluster} -> ({mesh})"
         );
     }
     for s in services.iter().filter(|s| s.balanced()) {
@@ -143,9 +162,9 @@ impl LoadBalancer {
         sys: &dyn Sys,
         services: &[Service],
         subnet: Ipv4Net,
-        egress: Option<&str>,
+        exits: Exits,
     ) -> legion_sys::Result<()> {
-        let rules = rules(services, subnet, egress);
+        let rules = rules(services, subnet, exits);
         if self.loaded.as_ref() != Some(&rules) {
             sys.pf_load_anchor(ANCHOR, &rules)?;
             self.loaded = Some(rules);
@@ -247,18 +266,23 @@ mod tests {
         dnsrr.uid = "0000000000000008".into();
         dnsrr.vip = None;
         dnsrr.ports.iter_mut().for_each(|p| p.published = None);
+        let exits = Exits {
+            egress: Some("wlan0"),
+            mesh: Some("wg0"),
+        };
         assert_eq!(
-            rules(&[web(&[], &[]), dnsrr], subnet, Some("wlan0")),
+            rules(&[web(&[], &[]), dnsrr], subnet, exits),
             "nat pass on legion0 inet from 10.200.0.0/24 to 10.200.0.0/24 tagged LSVC -> (legion0)\n\
              nat pass on wlan0 inet from 10.200.0.0/24 to ! 10.200.0.0/16 -> (wlan0)\n\
+             nat pass on wg0 inet from ! 10.200.0.0/16 to 10.200.0.0/16 -> (wg0)\n\
              rdr pass on legion0 inet proto tcp to 10.201.0.1 port 80 tag LSVC -> <s0000000000000007> port 8080 round-robin\n\
              rdr pass on wlan0 inet proto tcp to (wlan0) port 30000 tag LSVC -> <s0000000000000007> port 8080 round-robin\n\
              rdr pass on legion0 inet proto udp to 10.201.0.1 port 53 tag LSVC -> <s0000000000000007> port 5353 round-robin\n"
         );
-        // No route out: no outbound NAT, nothing published.
-        let r = rules(&[web(&[], &[])], subnet, None);
+        // No route out and no mesh: no outbound NAT, nothing published.
+        let r = rules(&[web(&[], &[])], subnet, Exits::default());
         assert!(
-            !r.contains("wlan0") && r.contains("10.201.0.1 port 80"),
+            !r.contains("wlan0") && !r.contains("wg0") && r.contains("10.201.0.1 port 80"),
             "{r}"
         );
     }
@@ -289,7 +313,7 @@ mod tests {
             &sys,
             &[web(&["10.200.0.3", "10.200.0.2"], &[])],
             subnet,
-            None,
+            Exits::default(),
         )
         .unwrap();
         assert!(sys.anchor(ANCHOR).unwrap().contains("10.201.0.1 port 80"));
@@ -302,8 +326,13 @@ mod tests {
         // connections kept.
         sys.add_state(state("a", "10.200.0.3"));
         sys.add_state(state("b", "10.200.0.2"));
-        lb.apply(&sys, &[web(&["10.200.0.2"], &["10.200.0.3"])], subnet, None)
-            .unwrap();
+        lb.apply(
+            &sys,
+            &[web(&["10.200.0.2"], &["10.200.0.3"])],
+            subnet,
+            Exits::default(),
+        )
+        .unwrap();
         assert_eq!(
             sys.pf_table_show(ANCHOR, table).unwrap(),
             [ip("10.200.0.2")]
@@ -311,8 +340,13 @@ mod tests {
         assert_eq!(sys.states().len(), 2);
 
         // .2 is gone: its connections are killed; .3 is ready again.
-        lb.apply(&sys, &[web(&["10.200.0.3"], &["10.200.0.3"])], subnet, None)
-            .unwrap();
+        lb.apply(
+            &sys,
+            &[web(&["10.200.0.3"], &["10.200.0.3"])],
+            subnet,
+            Exits::default(),
+        )
+        .unwrap();
         assert_eq!(
             sys.pf_table_show(ANCHOR, table).unwrap(),
             [ip("10.200.0.3")]
@@ -331,12 +365,17 @@ mod tests {
             &sys,
             &[web(&["10.200.0.3"], &["10.200.0.3", "10.200.0.4"])],
             subnet,
-            None,
+            Exits::default(),
         )
         .unwrap();
         assert_eq!(sys.states().len(), 2);
-        lb.apply(&sys, &[web(&["10.200.0.3"], &["10.200.0.3"])], subnet, None)
-            .unwrap();
+        lb.apply(
+            &sys,
+            &[web(&["10.200.0.3"], &["10.200.0.3"])],
+            subnet,
+            Exits::default(),
+        )
+        .unwrap();
         assert_eq!(
             sys.states()
                 .iter()
@@ -347,8 +386,13 @@ mod tests {
 
         // Nothing changed: no reload (a reload would refill the table).
         sys.pf_table_replace(ANCHOR, table, &[]).unwrap();
-        lb.apply(&sys, &[web(&["10.200.0.3"], &["10.200.0.3"])], subnet, None)
-            .unwrap();
+        lb.apply(
+            &sys,
+            &[web(&["10.200.0.3"], &["10.200.0.3"])],
+            subnet,
+            Exits::default(),
+        )
+        .unwrap();
         assert!(sys.pf_table_show(ANCHOR, table).unwrap().is_empty());
     }
 }

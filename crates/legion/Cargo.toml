@@ -14,6 +14,7 @@ legion-agent.workspace = true
 legion-api.workspace = true
 legion-pki.workspace = true
 legion-manager.workspace = true
+legion-net.workspace = true
 legion-podman.workspace = true
 legion-proto.workspace = true
 legion-sys.workspace = true

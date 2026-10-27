@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use legion_api::dispatch::{Assignment, ServiceEndpoints};
+use legion_api::dispatch::{Assignment, Peer, ServiceEndpoints};
 use legion_manager::{Manager, ManagerConfig, Tls, client_config, default_raft_config};
 use legion_pki::{CERT_LIFETIME, Ca, Identity, Role};
 use legion_proto::v1::cluster_client::ClusterClient;
@@ -10,7 +10,7 @@ use legion_proto::v1::dispatcher_client::DispatcherClient;
 use legion_proto::v1::objects_client::ObjectsClient;
 use legion_proto::v1::{
     ApplyRequest, ApplyResult, AssignmentsRequest, DataRequest, DeleteRequest, EndpointsRequest,
-    HeartbeatRequest, InitRequest, JoinTokenRequest, ListRequest, Object, ObjectRef,
+    HeartbeatRequest, InitRequest, JoinTokenRequest, ListRequest, Object, ObjectRef, PeersRequest,
     RegisterRequest, ReportRequest, StatusRequest, WatchRequest, watch_event,
 };
 use legion_store::Store;
@@ -711,7 +711,9 @@ async fn workers_follow_their_work_through_any_manager() {
     .await;
     let w1 = creds(&ca, "w1", Role::Worker);
     let d1 = DispatcherClient::new(follower.channel(Some(&w1)).await.unwrap());
-    let ready = br#"{"state":"ready"}"#.to_vec();
+    let ready =
+        br#"{"state":"ready","wireguard":{"publicKey":"pub1","endpoint":"192.0.2.1:51820"}}"#
+            .to_vec();
 
     let registered = eventually(|| {
         let mut d = d1.clone();
@@ -844,6 +846,29 @@ async fn workers_follow_their_work_through_any_manager() {
         .unwrap_err();
     assert_eq!(err.code(), Code::PermissionDenied, "{err}");
 
+    // So do the nodes of the mesh, with what the worker registered.
+    let mut peers = d1
+        .clone()
+        .peers(PeersRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let update = tokio::time::timeout(Duration::from_secs(10), peers.message())
+        .await
+        .expect("the peers arrive")
+        .unwrap()
+        .expect("stream open");
+    let list: Vec<Peer> = serde_json::from_slice(&update.peers_json).unwrap();
+    assert_eq!(
+        list,
+        [Peer {
+            node: "w1".into(),
+            public_key: "pub1".into(),
+            endpoint: Some("192.0.2.1:51820".into()),
+            pod_cidr: registered.pod_cidr.clone(),
+        }]
+    );
+
     // Endpoints come from the follower's replica.
     let mut endpoints = d1
         .clone()
@@ -885,7 +910,7 @@ async fn workers_follow_their_work_through_any_manager() {
     })
     .await;
 
-    drop((stream, endpoints));
+    drop((stream, endpoints, peers));
     for m in [first, follower] {
         m.stop().await;
     }

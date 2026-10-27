@@ -1,9 +1,9 @@
 //! FreeBSD system operations the agent needs (DESIGN.md §3.6): jails,
-//! interfaces and routes, rctl, pf anchors and tables, ZFS datasets and
-//! tmpfs mounts.
+//! interfaces and routes, WireGuard, rctl, pf anchors and tables, ZFS
+//! datasets and tmpfs mounts.
 //!
 //! [`Sys`] is the interface. [`Shell`] implements it by running `jls`,
-//! `jail`, `ifconfig`, `route`, `rctl`, `pfctl`, `zfs` and `mount`, with the forms
+//! `jail`, `ifconfig`, `route`, `wg`, `rctl`, `pfctl`, `zfs` and `mount`, with the forms
 //! checked on FreeBSD 15.1; native ioctl versions can replace single methods
 //! later. [`FakeSys`] keeps the same state in memory for tests of the layers
 //! above.
@@ -18,7 +18,7 @@ use std::str::FromStr;
 mod fake;
 mod shell;
 
-pub use fake::FakeSys;
+pub use fake::{FakeSys, FakeWireGuard};
 pub use shell::{CommandOutput, Host, Runner, Shell};
 
 #[derive(Debug, thiserror::Error)]
@@ -69,6 +69,32 @@ pub trait Sys: Send + Sync {
     fn interface_configure(&self, jail: Option<&str>, name: &str, config: &IfConfig) -> Result<()>;
     fn route_add(&self, jail: Option<&str>, dest: Destination, gateway: Ipv4Addr) -> Result<()>;
     fn route_delete(&self, jail: Option<&str>, dest: Destination) -> Result<()>;
+    /// Routes `dest` out of `interface` with no gateway, replacing any
+    /// route to `dest` already there.
+    fn route_to_interface(
+        &self,
+        jail: Option<&str>,
+        dest: Destination,
+        interface: &str,
+    ) -> Result<()>;
+
+    // WireGuard (host only). Keys are base64, as `wg` prints them.
+
+    /// A new private key.
+    fn wg_genkey(&self) -> Result<String>;
+    /// The public key of a private one.
+    fn wg_pubkey(&self, private_key: &str) -> Result<String>;
+    /// Creates the WireGuard interface `name`.
+    fn wg_create(&self, name: &str) -> Result<()>;
+    /// Sets the interface's private key and the UDP port it listens on.
+    fn wg_configure(&self, name: &str, private_key: &str, port: u16) -> Result<()>;
+    fn wg_peers(&self, name: &str) -> Result<Vec<WgPeer>>;
+    /// Adds a peer or updates it: its allowed IPs and keepalive are
+    /// replaced, its endpoint only when one is given (otherwise WireGuard
+    /// keeps the one it learned).
+    fn wg_set_peer(&self, name: &str, peer: &WgPeer) -> Result<()>;
+    /// Removes a peer; one not there is fine.
+    fn wg_remove_peer(&self, name: &str, public_key: &str) -> Result<()>;
 
     // rctl (host only).
 
@@ -146,6 +172,18 @@ pub struct PfState {
     /// Every address on the state's line: both ends and the translated
     /// one (the VIP of a load-balanced connection, for example).
     pub addrs: Vec<Ipv4Addr>,
+}
+
+/// A WireGuard peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WgPeer {
+    pub public_key: String,
+    /// `host:port`.
+    pub endpoint: Option<String>,
+    /// The addresses it may send from and is sent to, in order.
+    pub allowed_ips: Vec<Ipv4Net>,
+    /// Seconds between keepalives.
+    pub keepalive: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

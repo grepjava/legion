@@ -19,6 +19,9 @@ service Dispatcher {
   // Every service's endpoints: the complete set first, and again after
   // every change.
   rpc Endpoints(EndpointsRequest) returns (stream EndpointsUpdate);
+  // Every node of the WireGuard mesh: the complete set first, and again
+  // after every change.
+  rpc Peers(PeersRequest) returns (stream PeersUpdate);
   // A task's status, from the node it is assigned to.
   rpc Report(ReportRequest) returns (ReportResponse);
   // Binds a volume one of the node's tasks uses to the node.
@@ -56,6 +59,15 @@ message EndpointsRequest {
 message EndpointsUpdate {
   // A JSON array of service endpoints.
   bytes endpoints_json = 1;
+}
+
+message PeersRequest {
+  string node = 1;
+}
+
+message PeersUpdate {
+  // A JSON array of peers.
+  bytes peers_json = 1;
 }
 
 message ReportRequest {

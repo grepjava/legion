@@ -416,18 +416,28 @@ default `10.88.0.0/16`, for example).
   work over WireGuard (S3), but Legion should not rely on it; pf also clamps
   MSS (`scrub ... max-mss`) for traffic that leaves via `wg0`.
 - The dispatcher sends each agent the full peer list (public key, endpoint,
-  underlay IP, pod subnet). The agent converges `wg0` peers and routes to it
-  incrementally with `wg set`; S6 showed 100 peers added and removed in under
-  a second with no loss on existing peers.
+  pod subnet). The agent converges `wg0` peers to it incrementally with
+  `wg set`; S6 showed 100 peers added and removed in under a second with no
+  loss on existing peers.
 - **Built** (`legion-net`, phase 1): a node is given the lowest free /24 of
   the pod CIDR when it first registers, kept in `Node.status.podCidr`. The
   agent allocates pod addresses from it (the lowest free one, recorded in
   `Task.status.ip`, kept across agent restarts), and renames each pod's host
   end `lp<last 12 hex digits of the task uid>`, which finds it again after a
   restart. Teardown destroys the host end first, which removes the pair
-  even while the other end is still in the jail. Routing between nodes,
-  NAT to the outside and pf are not built yet; until then pods reach each
-  other and the host only.
+  even while the other end is still in the jail.
+- **Built** (phase 2): the mesh. Each node makes a WireGuard key on first
+  start (`<data-dir>/wireguard.key`, mode 0600) and registers its public
+  key and endpoint (its advertised address, port 51820) in
+  `Node.status.wireguard`. Its `wg0` address is derived from its pod
+  subnet (`10.200.<n>.0/24` has `100.64.<n>.1/16`), so nothing more is
+  allocated. One static route sends the whole pod CIDR into `wg0`; the
+  node's own /24 on `legion0` is a longer match, and WireGuard picks the
+  peer by allowed IPs (the peer's /24 and underlay /32), so routes never
+  change as nodes come and go. Peers have a 25-second keepalive; a node
+  without an endpoint is reached once it has reached the other side. The
+  agent applies the peer list only once it has one, so a restarting agent
+  does not cut traffic. Down nodes stay peers until their Node is removed.
 - **Bridge sysctls**: `net.link.bridge.pfil_*` are per-VNET, but Legion runs in
   the host VNET, so changing them would affect every bridge on the host,
   including Podman's own. Legion leaves them at their defaults and uses the
@@ -456,8 +466,9 @@ this was verified in a 3-node lab (S3).
   `nat on legion0 from <podnet_local> to <podnet_local> tagged LSVC -> (legion0)`.
   (Without it, the hairpin case times out unless `pfil_bridge=1`.)
 - **Routing mesh** (`publish: ingress`): `rdr on $ext_if` from the published
-  port to the service table, plus `nat on wg0 from ! <podcidr> to <table> -> (wg0)`
-  so replies from remote backends return through the ingress node. Without
+  port to the service table, plus `nat on wg0 from ! <podcidr> to <podcidr> -> (wg0)`
+  so replies from remote backends return through the ingress node (built:
+  one rule for every service, since pod traffic is never matched). Without
   that NAT rule, every remote backend times out. As in Swarm, the backend sees
   the ingress node's `wg0` address, not the client's. `publish: host` keeps the
   client address and forwards only to local tasks.

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use legion_agent::{Agent, AgentConfig, GrpcControl};
+use legion_agent::{Agent, AgentConfig, GrpcControl, WireGuardConfig};
 use legion_api::node::{Capacity, NodeState, NodeStatus, Platform};
 use legion_api::quantity::{Bytes, Cpu};
 use legion_podman::service::{PodmanService, ServiceConfig};
@@ -195,6 +195,10 @@ async fn start_agent(
         config.infra_image = image.clone();
     }
     config.zfs_root = opts.zfs_root.clone();
+    config.wireguard = Some(WireGuardConfig {
+        key_file: opts.data_dir.join("wireguard.key"),
+        port: legion_net::mesh::PORT,
+    });
     let agent = Agent::new(
         config,
         Arc::new(podman.client().clone()),
@@ -228,6 +232,8 @@ fn status(hostname: String, advertise: &str) -> NodeStatus {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         // Assigned by the manager on registration.
         pod_cidr: None,
+        // Filled in by the agent.
+        wireguard: None,
     }
 }
 

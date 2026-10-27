@@ -31,17 +31,18 @@ mod task;
 mod volumes;
 
 pub use control::{
-    Assignment, Assignments, Control, ControlError, EndpointPort, Endpoints, GrpcControl,
-    Registration, ServiceEndpoints, VolumeClaim,
+    Assignment, Assignments, Control, ControlError, EndpointPort, Endpoints, GrpcControl, Peer,
+    Peers, Registration, ServiceEndpoints, VolumeClaim,
 };
 pub use runtime::Runtime;
 
 use crate::pod::{LABEL_NODE, LABEL_TASK};
 use crate::task::{Ctx, Msg};
 
-/// Modules the node needs: bridges and epairs for pod networking, pf for
-/// services and policy. Jails cannot load them on demand.
-pub const MODULES: [&str; 3] = ["if_bridge", "if_epair", "pf"];
+/// Modules the node needs: bridges and epairs for pod networking, WireGuard
+/// between nodes, pf for services and policy. Jails cannot load them on
+/// demand.
+pub const MODULES: [&str; 4] = ["if_bridge", "if_epair", "if_wg", "pf"];
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -58,6 +59,17 @@ pub struct AgentConfig {
     /// The ZFS dataset under which volumes are created (`<pool>/legion`);
     /// without one, tasks using volumes are rejected.
     pub zfs_root: Option<String>,
+    /// The node's end of the WireGuard mesh to other nodes; without it, pods
+    /// reach only this node.
+    pub wireguard: Option<WireGuardConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WireGuardConfig {
+    /// Holds the node's private key, made on first start.
+    pub key_file: PathBuf,
+    /// The UDP port the node listens on.
+    pub port: u16,
 }
 
 impl AgentConfig {
@@ -68,6 +80,7 @@ impl AgentConfig {
             resync: Duration::from_secs(30),
             files_dir: files_dir.into(),
             zfs_root: None,
+            wireguard: None,
         }
     }
 }
@@ -75,6 +88,7 @@ impl AgentConfig {
 pub struct Agent<R, C> {
     ctx: Ctx<R, C>,
     resync: Duration,
+    wireguard: Option<WireGuardConfig>,
 }
 
 /// A running task worker.
@@ -98,11 +112,12 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 ips: Arc::default(),
             },
             resync: config.resync,
+            wireguard: config.wireguard,
         }
     }
 
     /// Runs until `shutdown` resolves. Pods keep running afterwards.
-    pub async fn run(self, status: NodeStatus, shutdown: impl Future<Output = ()> + Send) {
+    pub async fn run(self, mut status: NodeStatus, shutdown: impl Future<Output = ()> + Send) {
         tokio::pin!(shutdown);
         let ctx = self.ctx;
         let modules = task::blocking(&ctx.sys, |sys| {
@@ -114,6 +129,36 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         .await;
         for e in modules {
             tracing::warn!("loading kernel module {e}");
+        }
+
+        // Other nodes learn the key and where to send from the node's status.
+        let mut private_key = None;
+        if let Some(wg) = &self.wireguard {
+            match wireguard_key(&ctx.sys, wg.key_file.clone()).await {
+                Ok((private, public)) => {
+                    let endpoint = match status.addr.as_str() {
+                        "" => None,
+                        host if host.contains(':') => Some(format!("[{host}]:{}", wg.port)),
+                        host => Some(format!("{host}:{}", wg.port)),
+                    };
+                    if endpoint.is_none() {
+                        tracing::warn!(
+                            "the node has no address (--advertise) for other nodes to send \
+                             WireGuard traffic to: they reach it only after it reaches them, \
+                             and two such nodes never reach each other"
+                        );
+                    }
+                    status.wireguard = Some(legion_api::node::WireGuard {
+                        public_key: public,
+                        endpoint,
+                    });
+                    private_key = Some(private);
+                }
+                Err(e) => tracing::error!(
+                    "the WireGuard key in {}: {e}; pods will reach this node only",
+                    wg.key_file.display()
+                ),
+            }
         }
 
         let registration = tokio::select! {
@@ -129,9 +174,29 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         }
         let (gateway, subnet) = (net.gateway(), net.subnet);
         let _ = ctx.net.set(net);
+        let mesh = match (&self.wireguard, private_key) {
+            (Some(wg), Some(private_key)) => {
+                let mesh = legion_net::mesh::Mesh {
+                    subnet,
+                    private_key,
+                    port: wg.port,
+                };
+                Some(tokio::spawn(mesh_peers(
+                    ctx.sys.clone(),
+                    ctx.control.peers(),
+                    mesh,
+                )))
+            }
+            _ => None,
+        };
         let endpoints = ctx.control.endpoints();
         let dns = dns(endpoints.clone(), gateway).await;
-        let lb = tokio::spawn(load_balancing(ctx.sys.clone(), endpoints, subnet));
+        let lb = tokio::spawn(load_balancing(
+            ctx.sys.clone(),
+            endpoints,
+            subnet,
+            mesh.is_some(),
+        ));
 
         let mut assignments = ctx.control.assignments(&ctx.node);
         // Nothing is reconciled before the first complete set of
@@ -223,8 +288,11 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         if let Some(dns) = dns {
             dns.abort();
         }
-        // Rules and tables stay: the pods keep running.
+        // Rules, tables and peers stay: the pods keep running and talking.
         lb.abort();
+        if let Some(mesh) = mesh {
+            mesh.abort();
+        }
         workers.clear();
         let deadline = tokio::time::sleep(Duration::from_secs(5));
         tokio::pin!(deadline);
@@ -292,15 +360,113 @@ async fn dns(
     }))
 }
 
+/// The node's WireGuard private and public keys: the private one from
+/// `key_file`, made and saved there (readable by root only) if missing.
+async fn wireguard_key(sys: &Arc<dyn Sys>, key_file: PathBuf) -> Result<(String, String), String> {
+    task::blocking(sys, move |sys| {
+        let private = match std::fs::read_to_string(&key_file) {
+            Ok(k) => k.trim().to_owned(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let key = sys.wg_genkey().map_err(|e| e.to_string())?;
+                if let Some(dir) = key_file.parent() {
+                    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                }
+                write_private(&key_file, &format!("{key}\n")).map_err(|e| e.to_string())?;
+                tracing::info!(file = %key_file.display(), "made the node's WireGuard key");
+                key
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        let public = sys.wg_pubkey(&private).map_err(|e| e.to_string())?;
+        Ok((private, public))
+    })
+    .await
+}
+
+/// Writes a file only its owner can read, replacing any.
+fn write_private(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)?.write_all(contents.as_bytes())
+}
+
+/// Keeps the node in the WireGuard mesh (see [`legion_net::mesh`]): `wg0`
+/// set up and its peers the nodes the managers list. Nothing is removed
+/// before the first list arrives, so a restarting agent leaves traffic
+/// alone. Failures are retried a few seconds later.
+async fn mesh_peers(
+    sys: Arc<dyn Sys>,
+    mut peers: watch::Receiver<Peers>,
+    mesh: legion_net::mesh::Mesh,
+) {
+    let m = mesh.clone();
+    let mut retry = match task::blocking(&sys, move |sys| m.ensure(sys)).await {
+        Ok(()) => false,
+        Err(e) => {
+            tracing::warn!("setting up the WireGuard mesh: {e}; retrying");
+            true
+        }
+    };
+    // Whether a list has arrived.
+    let mut known = false;
+    loop {
+        let changed = if retry {
+            tokio::select! {
+                r = peers.changed() => Some(r),
+                () = tokio::time::sleep(Duration::from_secs(5)) => None,
+            }
+        } else {
+            Some(peers.changed().await)
+        };
+        match changed {
+            Some(Ok(())) => known = true,
+            Some(Err(_)) => return,
+            None => {}
+        }
+        let list: Vec<legion_net::mesh::Peer> = peers
+            .borrow_and_update()
+            .iter()
+            .filter_map(|p| {
+                Some(legion_net::mesh::Peer {
+                    public_key: p.public_key.clone(),
+                    endpoint: p.endpoint.clone(),
+                    subnet: p.pod_cidr.parse().ok()?,
+                })
+            })
+            .collect();
+        let m = mesh.clone();
+        let result = task::blocking(&sys, move |sys| {
+            m.ensure(sys)?;
+            if known {
+                m.apply(sys, &list)?;
+            }
+            Ok::<_, legion_net::Error>(())
+        })
+        .await;
+        retry = match result {
+            Ok(()) => false,
+            Err(e) => {
+                tracing::warn!("updating the WireGuard mesh: {e}; retrying");
+                true
+            }
+        };
+    }
+}
+
 /// Programs pf from the service endpoints (see [`legion_net::lb`]): VIPs,
-/// published ports, the hairpin NAT and NAT for pods going out. Failures
-/// are retried a few seconds later.
+/// published ports, the hairpin NAT, NAT for pods going out and, with the
+/// mesh, for traffic from outside going to other nodes' pods. Failures are
+/// retried a few seconds later.
 async fn load_balancing(
     sys: Arc<dyn Sys>,
     mut endpoints: watch::Receiver<Endpoints>,
     subnet: legion_sys::Ipv4Net,
+    mesh: bool,
 ) {
-    use legion_net::lb::{self, LoadBalancer, Port, Proto, Service};
+    use legion_net::lb::{self, Exits, LoadBalancer, Port, Proto, Service};
 
     let checks = task::blocking(&sys, |sys| {
         if let Err(e) = sys.sysctl_set("net.inet.ip.forwarding", "1") {
@@ -363,7 +529,11 @@ async fn load_balancing(
                 tracing::warn!("finding the egress interface: {e}");
                 None
             });
-            let r = b.apply(sys, &services, subnet, egress.as_deref());
+            let exits = Exits {
+                egress: egress.as_deref(),
+                mesh: mesh.then_some(legion_net::mesh::INTERFACE),
+            };
+            let r = b.apply(sys, &services, subnet, exits);
             (b, r)
         })
         .await;

@@ -1090,6 +1090,7 @@ dependencies = [
  "legion-agent",
  "legion-api",
  "legion-manager",
+ "legion-net",
  "legion-pki",
  "legion-podman",
  "legion-proto",

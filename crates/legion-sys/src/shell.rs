@@ -8,7 +8,10 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-use crate::{Dataset, Destination, Epair, Error, IfConfig, Jail, PfState, RctlRule, Result, Sys};
+use crate::{
+    Dataset, Destination, Epair, Error, IfConfig, Ipv4Net, Jail, PfState, RctlRule, Result, Sys,
+    WgPeer,
+};
 
 /// Runs one program to completion.
 pub trait Runner: Send + Sync {
@@ -273,6 +276,87 @@ impl<R: Runner> Sys for Shell<R> {
         self.run("route", &a).map(drop)
     }
 
+    fn route_to_interface(
+        &self,
+        jail: Option<&str>,
+        dest: Destination,
+        interface: &str,
+    ) -> Result<()> {
+        let route = |verb: &str| {
+            let mut a = in_jail(jail);
+            a.extend(["-q".to_owned(), verb.to_owned()]);
+            a.extend(route_dest(dest));
+            a.extend(["-interface".to_owned(), interface.to_owned()]);
+            a
+        };
+        let a = route("add");
+        let out = self.output("route", &a, None)?;
+        if out.success {
+            return Ok(());
+        }
+        if !out.stderr.contains("File exists") {
+            return Err(failed("route", &a, &out));
+        }
+        self.run("route", &route("change")).map(drop)
+    }
+
+    fn wg_genkey(&self) -> Result<String> {
+        Ok(self.run("wg", &args(["genkey"]))?.trim().to_owned())
+    }
+
+    fn wg_pubkey(&self, private_key: &str) -> Result<String> {
+        let out = self.run_input("wg", &args(["pubkey"]), Some(&format!("{private_key}\n")))?;
+        Ok(out.trim().to_owned())
+    }
+
+    fn wg_create(&self, name: &str) -> Result<()> {
+        self.run("ifconfig", &args(["wg", "create", "name", name]))
+            .map(drop)
+    }
+
+    fn wg_configure(&self, name: &str, private_key: &str, port: u16) -> Result<()> {
+        // The key goes on stdin, never on a command line.
+        let port = port.to_string();
+        let a = args([
+            "set",
+            name,
+            "private-key",
+            "/dev/stdin",
+            "listen-port",
+            &port,
+        ]);
+        self.run_input("wg", &a, Some(&format!("{private_key}\n")))
+            .map(drop)
+    }
+
+    fn wg_peers(&self, name: &str) -> Result<Vec<WgPeer>> {
+        let a = args(["show", name, "dump"]);
+        let out = self.run("wg", &a)?;
+        parse_wg_dump(&out).map_err(|message| Error::Parse {
+            command: describe("wg", &a),
+            message,
+        })
+    }
+
+    fn wg_set_peer(&self, name: &str, peer: &WgPeer) -> Result<()> {
+        let mut a = args(["set", name, "peer", &peer.public_key]);
+        if let Some(endpoint) = &peer.endpoint {
+            a.extend(["endpoint".to_owned(), endpoint.clone()]);
+        }
+        let allowed: Vec<String> = peer.allowed_ips.iter().map(|n| n.to_string()).collect();
+        a.extend(["allowed-ips".to_owned(), allowed.join(",")]);
+        a.extend([
+            "persistent-keepalive".to_owned(),
+            peer.keepalive.map_or("off".to_owned(), |k| k.to_string()),
+        ]);
+        self.run("wg", &a).map(drop)
+    }
+
+    fn wg_remove_peer(&self, name: &str, public_key: &str) -> Result<()> {
+        self.run("wg", &args(["set", name, "peer", public_key, "remove"]))
+            .map(drop)
+    }
+
     fn rctl_add(&self, rule: &RctlRule) -> Result<()> {
         self.run("rctl", &["-a".to_owned(), rule.to_string()])
             .map(drop)
@@ -506,6 +590,32 @@ fn parse_states(out: &str) -> Vec<PfState> {
         }
     }
     states
+}
+
+/// Peers from `wg show <name> dump`: a line for the interface (private key,
+/// public key, port, fwmark), then one per peer, tab-separated: public key,
+/// preshared key, endpoint, allowed IPs, latest handshake, bytes received
+/// and sent, keepalive. Allowed IPs other than IPv4 networks are left out.
+fn parse_wg_dump(out: &str) -> Result<Vec<WgPeer>, String> {
+    out.lines()
+        .skip(1)
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            let cols: Vec<&str> = line.split('\t').collect();
+            if cols.len() < 8 {
+                return Err(format!("bad peer line {line:?}"));
+            }
+            let mut allowed_ips: Vec<Ipv4Net> =
+                cols[3].split(',').filter_map(|n| n.parse().ok()).collect();
+            allowed_ips.sort();
+            Ok(WgPeer {
+                public_key: cols[0].to_owned(),
+                endpoint: (cols[2] != "(none)").then(|| cols[2].to_owned()),
+                allowed_ips,
+                keepalive: cols[7].parse().ok(),
+            })
+        })
+        .collect()
 }
 
 fn route_dest(dest: Destination) -> Vec<String> {
@@ -799,6 +909,70 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sh.interfaces(Some("pod1")).unwrap(), ["lo0", "epair0b"]);
+    }
+
+    #[test]
+    fn wireguard() {
+        let key = "IKZKpQMHH2P54bdfaIAH2z5gZ5z/zMKXR3aVlYeff1U=";
+        let public = "bHl/X2scPeKxboeUJP6EVXRQT6n3N0uWVAj/pVg5rj0=";
+        let peer = "5nbajeT02rOuwRCUy6ojUtx5QYfcxNWsyvKG+zkJDlY=";
+        let dump = format!(
+            // Captured on FreeBSD 15.1, with a peer that has no endpoint
+            // yet added.
+            "{key}\t{public}\t51820\toff\n\
+             {peer}\t(none)\t192.168.251.2:51820\t10.200.2.0/24,100.64.2.1/32\t1793078934\t644\t784\t25\n\
+             x6TAvtkCJ4t2nKnVPZvb4CFNTsbtUH0cDNzEhsEyd0A=\t(none)\t(none)\t(none)\t0\t0\t0\toff\n"
+        );
+        let set = format!(
+            "wg set wg0 peer {peer} endpoint 192.168.251.2:51820 \
+             allowed-ips 100.64.2.1/32,10.200.2.0/24 persistent-keepalive 25"
+        );
+        let remove = format!("wg set wg0 peer {peer} remove");
+        let sh = Script::shell(vec![
+            ("wg genkey", ok(&format!("{key}\n"))),
+            ("wg pubkey", ok(&format!("{public}\n"))),
+            ("ifconfig wg create name wg0", ok("wg0\n")),
+            (
+                "wg set wg0 private-key /dev/stdin listen-port 51820",
+                ok(""),
+            ),
+            ("wg show wg0 dump", ok(&dump)),
+            (&set, ok("")),
+            (&remove, ok("")),
+            (
+                "route -q add -net 10.200.0.0/16 -interface wg0",
+                err("route: message indicates error: File exists"),
+            ),
+            ("route -q change -net 10.200.0.0/16 -interface wg0", ok("")),
+        ]);
+        assert_eq!(sh.wg_genkey().unwrap(), key);
+        assert_eq!(sh.wg_pubkey(key).unwrap(), public);
+        sh.wg_create("wg0").unwrap();
+        sh.wg_configure("wg0", key, 51820).unwrap();
+        let net = |s: &str| s.parse::<Ipv4Net>().unwrap();
+        let peers = sh.wg_peers("wg0").unwrap();
+        assert_eq!(
+            peers[0],
+            WgPeer {
+                public_key: peer.into(),
+                endpoint: Some("192.168.251.2:51820".into()),
+                allowed_ips: vec![net("10.200.2.0/24"), net("100.64.2.1/32")],
+                keepalive: Some(25),
+            }
+        );
+        assert_eq!((&peers[1].endpoint, peers[1].keepalive), (&None, None));
+        assert!(peers[1].allowed_ips.is_empty());
+        sh.wg_set_peer(
+            "wg0",
+            &WgPeer {
+                allowed_ips: vec![net("100.64.2.1/32"), net("10.200.2.0/24")],
+                ..peers[0].clone()
+            },
+        )
+        .unwrap();
+        sh.wg_remove_peer("wg0", peer).unwrap();
+        sh.route_to_interface(None, Destination::Net(net("10.200.0.0/16")), "wg0")
+            .unwrap();
     }
 
     #[test]

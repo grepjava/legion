@@ -10,7 +10,7 @@
 use std::net::Ipv4Addr;
 use std::process::Command;
 
-use legion_net::lb::{ANCHOR, LoadBalancer, Port, Proto, Service};
+use legion_net::lb::{ANCHOR, Exits, LoadBalancer, Port, Proto, Service};
 use legion_net::{BRIDGE, MTU, PodNetwork, host_interface};
 use legion_sys::{Shell, Sys};
 
@@ -101,8 +101,13 @@ fn pods_on_the_bridge() {
     };
     let server = ips[1];
     let mut lb = LoadBalancer::default();
-    lb.apply(&sys, &[svc(&[server], &[server])], net.subnet, None)
-        .unwrap();
+    lb.apply(
+        &sys,
+        &[svc(&[server], &[server])],
+        net.subnet,
+        Exits::default(),
+    )
+    .unwrap();
     // Pod a talks to pod b on the same bridge through the VIP: the
     // hairpin NAT brings the reply back through the host.
     // Background processes must not hold on to sh()'s output pipes.
@@ -125,7 +130,7 @@ fn pods_on_the_bridge() {
     };
     assert!(to_server(&sys) >= 2, "{:?}", sys.pf_states());
     // Not ready but running: out of the table, the connection stays.
-    lb.apply(&sys, &[svc(&[], &[server])], net.subnet, None)
+    lb.apply(&sys, &[svc(&[], &[server])], net.subnet, Exits::default())
         .unwrap();
     assert!(
         sys.pf_table_show(ANCHOR, "s00000000000000aa")
@@ -134,7 +139,8 @@ fn pods_on_the_bridge() {
     );
     assert!(to_server(&sys) >= 2);
     // Gone: its connections are killed.
-    lb.apply(&sys, &[svc(&[], &[])], net.subnet, None).unwrap();
+    lb.apply(&sys, &[svc(&[], &[])], net.subnet, Exits::default())
+        .unwrap();
     assert_eq!(to_server(&sys), 0, "{:?}", sys.pf_states());
     sys.pf_flush_anchor(ANCHOR).unwrap();
 

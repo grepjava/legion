@@ -56,7 +56,9 @@ anchor "legion/*"
 More nodes join with a token. Managers must listen where the others can
 reach them, for example `--listen 0.0.0.0:7470 --advertise 10.0.0.1:7470`.
 A worker runs only the agent, which follows its work through any manager
-and fails over to the others:
+and fails over to the others. Pods on different nodes reach each other over
+a WireGuard mesh (UDP port 51820, which the hosts must let through); each
+node's `--advertise` address is where the others send to:
 
 ```sh
 legion join-token manager            # or worker; on a member
@@ -64,7 +66,7 @@ legion join <token> --manager 10.0.0.1:7470 --advertise 10.0.0.2:7470
 legion daemon --listen 0.0.0.0:7470 --advertise 10.0.0.2:7470
 
 legion join <worker-token> --manager 10.0.0.1:7470    # on a worker
-legion daemon
+legion daemon --advertise 10.0.0.3
 ```
 
 ## Layout
@@ -76,9 +78,9 @@ legion daemon
 | `legion-proto` | gRPC definitions (compiled with protox) |
 | `legion-manager` | API server, Raft transport |
 | `legion-podman` | libpod REST client; supervises Legion's own Podman service |
-| `legion-sys` | FreeBSD operations: jails, interfaces, routes, rctl, pf, ZFS |
+| `legion-sys` | FreeBSD operations: jails, interfaces, routes, WireGuard, rctl, pf, ZFS |
 | `legion-agent` | Registers the node; runs assigned tasks as pod jails |
-| `legion-net` | Pod bridge and interfaces, the node resolver, pf load balancing |
+| `legion-net` | Pod bridge and interfaces, the WireGuard mesh, the node resolver, pf load balancing |
 | `legion-pki` | Cluster CA, node and user certificates, identities |
 | `legion` | Daemon and CLI |
 

@@ -1,5 +1,6 @@
 //! The agent's view of the manager: register the node, follow the tasks
-//! assigned to it, report their status.
+//! assigned to it and the cluster's endpoints and peers, report their
+//! status.
 //!
 //! The agent is written against [`Control`]; [`GrpcControl`] implements it
 //! over the managers' dispatcher.
@@ -9,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use legion_api::dispatch::{
-    Assignment, Assignments, EndpointPort, Endpoints, ServiceEndpoints, VolumeClaim,
+    Assignment, Assignments, EndpointPort, Endpoints, Peer, Peers, ServiceEndpoints, VolumeClaim,
 };
 use legion_api::node::NodeStatus;
 use legion_api::task::TaskStatus;
@@ -17,7 +18,7 @@ use legion_api::{Kind, ObjectKey};
 use legion_proto::v1::dispatcher_client::DispatcherClient;
 use legion_proto::v1::{
     AssignmentsRequest, ClaimVolumeRequest, DataRequest, EndpointsRequest, HeartbeatRequest,
-    RegisterRequest, ReportRequest,
+    PeersRequest, RegisterRequest, ReportRequest,
 };
 use legion_sys::Ipv4Net;
 use tokio::sync::watch;
@@ -57,6 +58,10 @@ pub trait Control: Send + Sync + 'static {
 
     /// Every service's endpoints, kept current; empty until first known.
     fn endpoints(&self) -> watch::Receiver<Endpoints>;
+
+    /// Every node of the WireGuard mesh, this one included, kept current;
+    /// empty until first known.
+    fn peers(&self) -> watch::Receiver<Peers>;
 
     /// Writes a task's status. A task that is gone, or was replaced by one
     /// with another uid, is ignored.
@@ -322,6 +327,18 @@ fn decode<T: serde::de::DeserializeOwned>(json: &[u8]) -> Result<T, String> {
     serde_json::from_slice(json).map_err(|e| e.to_string())
 }
 
+/// Publishes `set` if it differs from what `tx` holds.
+fn publish_changed<T: PartialEq>(tx: &watch::Sender<T>, set: T) {
+    tx.send_if_modified(|old| {
+        if *old == set {
+            false
+        } else {
+            *old = set;
+            true
+        }
+    });
+}
+
 impl Control for GrpcControl {
     async fn register(
         &self,
@@ -376,16 +393,22 @@ impl Control for GrpcControl {
                 async move { c.endpoints(EndpointsRequest { node }).await }
             },
             |m: legion_proto::v1::EndpointsUpdate| decode(&m.endpoints_json),
-            |tx, set| {
-                tx.send_if_modified(|old| {
-                    if *old == set {
-                        false
-                    } else {
-                        *old = set;
-                        true
-                    }
-                });
+            publish_changed,
+        ));
+        rx
+    }
+
+    fn peers(&self) -> watch::Receiver<Peers> {
+        let (tx, rx) = watch::channel(Peers::new());
+        let node = self.node.clone();
+        tokio::spawn(self.clone().follow(
+            tx,
+            move |mut c| {
+                let node = node.clone();
+                async move { c.peers(PeersRequest { node }).await }
             },
+            |m: legion_proto::v1::PeersUpdate| decode(&m.peers_json),
+            publish_changed,
         ));
         rx
     }

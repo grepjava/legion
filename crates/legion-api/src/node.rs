@@ -72,6 +72,21 @@ pub struct NodeStatus {
     /// Assigned once, when the node first registers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_cidr: Option<String>,
+    /// How other nodes reach this one over the WireGuard mesh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wireguard: Option<WireGuard>,
+}
+
+/// A node's end of the WireGuard mesh.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuard {
+    /// Base64, as `wg` prints it.
+    pub public_key: String,
+    /// `host:port` other nodes send to. Without one, they wait for this
+    /// node to reach them first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use legion_agent::fake::FakeRuntime;
-use legion_agent::{Agent, AgentConfig, GrpcControl};
+use legion_agent::{Agent, AgentConfig, GrpcControl, WireGuardConfig};
 use legion_api::node::{NodeState, NodeStatus};
 use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
 use legion_api::{Kind, Object, ObjectKey, Spec};
@@ -29,10 +29,16 @@ struct Harness {
     sys: Arc<FakeSys>,
     rt: Arc<FakeRuntime>,
     agent: Option<(oneshot::Sender<()>, JoinHandle<()>)>,
+    /// Whether the agent joins the WireGuard mesh.
+    mesh: bool,
 }
 
 impl Harness {
     async fn new() -> Self {
+        Self::start(false).await
+    }
+
+    async fn start(mesh: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -75,6 +81,7 @@ impl Harness {
             sys,
             rt,
             agent: None,
+            mesh,
         };
         h.start_agent();
         h
@@ -85,6 +92,12 @@ impl Harness {
         config.infra_image = INFRA.into();
         config.resync = Duration::from_millis(100);
         config.zfs_root = Some("tank/legion".into());
+        if self.mesh {
+            config.wireguard = Some(WireGuardConfig {
+                key_file: self.key_file(),
+                port: 51820,
+            });
+        }
         let agent = Agent::new(
             config,
             self.rt.clone(),
@@ -95,6 +108,7 @@ impl Harness {
         let status = NodeStatus {
             state: NodeState::Ready,
             hostname: "n1.example".into(),
+            addr: "192.0.2.1".into(),
             ..Default::default()
         };
         let handle = tokio::spawn(agent.run(status, async move {
@@ -105,6 +119,10 @@ impl Harness {
 
     fn files_dir(&self) -> std::path::PathBuf {
         self._dir.path().join("tasks")
+    }
+
+    fn key_file(&self) -> std::path::PathBuf {
+        self._dir.path().join("wg").join("wireguard.key")
     }
 
     async fn stop_agent(&mut self) {
@@ -247,7 +265,7 @@ async fn runs_a_pod() {
     assert_eq!(node.spec["availability"], "active");
     assert_eq!(
         h.sys.modules().into_iter().collect::<Vec<_>>(),
-        ["if_bridge", "if_epair", "pf"]
+        ["if_bridge", "if_epair", "if_wg", "pf"]
     );
 
     // The pod is an infra jail with a VNET and the containers as its
@@ -859,4 +877,100 @@ async fn volume_problems() {
     assert_eq!(st.message, "volume data lives on node n2");
     assert!(h.sys.zfs_list("tank").unwrap().is_empty());
     assert!(h.rt.containers().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn joins_the_mesh() {
+    let mut h = Harness::start(true).await;
+    let node_status = |h: &Harness, name: &str| {
+        h.store
+            .get(&ObjectKey::new(Kind::Node, "", name))
+            .unwrap()
+            .map(|n| n.status)
+    };
+    eventually("the node registers with its key", || {
+        node_status(&h, NODE).is_some_and(|s| s.get("wireguard").is_some())
+    })
+    .await;
+
+    // The key is made once and kept; the status carries its public half
+    // and where other nodes send to.
+    let key = std::fs::read_to_string(h.key_file()).unwrap();
+    let key = key.trim();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(h.key_file())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    let status = node_status(&h, NODE).unwrap();
+    assert_eq!(
+        status["wireguard"],
+        serde_json::json!({ "publicKey": format!("pub:{key}"), "endpoint": "192.0.2.1:51820" })
+    );
+    eventually("wg0 is set up", || {
+        h.sys
+            .wireguard(legion_net::mesh::INTERFACE)
+            .is_some_and(|wg| wg.private_key.as_deref() == Some(key))
+    })
+    .await;
+    let wg0 = h.sys.interface(legion_net::mesh::INTERFACE).unwrap();
+    assert_eq!(wg0.config.addr.unwrap().to_string(), "100.64.0.1/16");
+    assert_eq!(
+        h.sys.interface_routes(None)
+            [&legion_sys::Destination::Net("10.200.0.0/16".parse().unwrap())],
+        legion_net::mesh::INTERFACE
+    );
+
+    // Another node appears: it becomes a peer; this one does not.
+    let mut other = Object::new(
+        Kind::Node,
+        "",
+        "n2",
+        serde_json::to_value(legion_api::node::NodeSpec::default()).unwrap(),
+    );
+    other.status = serde_json::json!({
+        "state": "ready",
+        "podCidr": "10.200.5.0/24",
+        "wireguard": { "publicKey": "pub:other", "endpoint": "192.0.2.2:51820" },
+    });
+    let other = h.write(other, Precondition::MustNotExist).await;
+    let peers = |h: &Harness| {
+        h.sys
+            .wireguard(legion_net::mesh::INTERFACE)
+            .unwrap()
+            .peers
+            .into_values()
+            .collect::<Vec<_>>()
+    };
+    eventually("n2 is a peer", || peers(&h).len() == 1).await;
+    let peer = &peers(&h)[0];
+    assert_eq!(peer.public_key, "pub:other");
+    assert_eq!(peer.endpoint.as_deref(), Some("192.0.2.2:51820"));
+    assert_eq!(
+        peer.allowed_ips
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["10.200.5.0/24", "100.64.5.1/32"]
+    );
+
+    // A restarted agent keeps its key and its peers.
+    h.stop_agent().await;
+    h.start_agent();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(std::fs::read_to_string(h.key_file()).unwrap().trim(), key);
+    assert_eq!(peers(&h).len(), 1);
+    assert_eq!(
+        node_status(&h, NODE).unwrap()["wireguard"]["publicKey"],
+        format!("pub:{key}")
+    );
+
+    // The node is removed: so is the peer.
+    h.delete(&other.key()).await;
+    eventually("n2 is no longer a peer", || peers(&h).is_empty()).await;
+    h.stop_agent().await;
 }
