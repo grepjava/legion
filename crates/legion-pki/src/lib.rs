@@ -150,33 +150,73 @@ impl Ca {
         digest(&self.cert_pem).expect("own certificate parses")
     }
 
-    /// A certificate for `id`, valid for `lifetime`.
+    /// A certificate for `id`, valid for `lifetime`, with a new key.
     pub fn issue(&self, id: &Identity, lifetime: Duration) -> Result<Issued> {
         let key = KeyPair::generate()?;
-        let mut params = CertificateParams::default();
-        let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, id.name.as_str());
-        dn.push(DnType::OrganizationName, id.role.as_str());
-        params.distinguished_name = dn;
-        params.subject_alt_names = vec![SanType::DnsName(SERVER_NAME.try_into()?)];
-        params.key_usages = vec![
-            KeyUsagePurpose::DigitalSignature,
-            KeyUsagePurpose::KeyEncipherment,
-        ];
-        params.extended_key_usages = vec![
-            ExtendedKeyUsagePurpose::ServerAuth,
-            ExtendedKeyUsagePurpose::ClientAuth,
-        ];
-        params.use_authority_key_identifier_extension = true;
-        let now = SystemTime::now();
-        params.not_before = (now - BACKDATE).into();
-        params.not_after = (now + lifetime).into();
-        let cert = params.signed_by(&key, &self.issuer)?;
+        let cert = leaf_params(id, lifetime)?.signed_by(&key, &self.issuer)?;
         Ok(Issued {
             cert_pem: lf(cert.pem()),
             key_pem: lf(key.serialize_pem()),
         })
     }
+
+    /// A certificate for `id` for the key of a certificate request, made
+    /// with [`request`]. Only the key is taken from the request: the CA
+    /// decides who the certificate is for.
+    pub fn sign(&self, csr_pem: &str, id: &Identity, lifetime: Duration) -> Result<String> {
+        let csr = rcgen::CertificateSigningRequestParams::from_pem(csr_pem)?;
+        let cert = leaf_params(id, lifetime)?.signed_by(&csr.public_key, &self.issuer)?;
+        Ok(lf(cert.pem()))
+    }
+}
+
+fn leaf_params(id: &Identity, lifetime: Duration) -> Result<CertificateParams> {
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, id.name.as_str());
+    dn.push(DnType::OrganizationName, id.role.as_str());
+    params.distinguished_name = dn;
+    params.subject_alt_names = vec![SanType::DnsName(SERVER_NAME.try_into()?)];
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    params.use_authority_key_identifier_extension = true;
+    let now = SystemTime::now();
+    params.not_before = (now - BACKDATE).into();
+    params.not_after = (now + lifetime).into();
+    Ok(params)
+}
+
+/// A new key and a request to certify it: `(key_pem, csr_pem)`.
+pub fn request() -> Result<(String, String)> {
+    let key = KeyPair::generate()?;
+    let csr = CertificateParams::default().serialize_request(&key)?;
+    Ok((lf(key.serialize_pem()), lf(csr.pem()?)))
+}
+
+/// 32 random bytes in hex: for join token secrets.
+pub fn random_secret() -> String {
+    let mut buf = [0u8; 32];
+    getrandom::fill(&mut buf).expect("the system random source works");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// SHA-256 of a DER certificate, in hex.
+pub fn digest_der(der: &[u8]) -> String {
+    Sha256::digest(der)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A DER certificate as PEM.
+pub fn cert_pem(der: &[u8]) -> String {
+    encode("CERTIFICATE", der)
 }
 
 /// rcgen ends lines as the platform does; files Legion writes use `\n`.
@@ -195,11 +235,7 @@ fn first_cert_der(pem: &str) -> Result<Vec<u8>> {
 
 /// SHA-256 of the first certificate in `pem`, in hex.
 pub fn digest(cert_pem: &str) -> Result<String> {
-    let der = first_cert_der(cert_pem)?;
-    Ok(Sha256::digest(&der)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+    Ok(digest_der(&first_cert_der(cert_pem)?))
 }
 
 /// The identity a certificate (DER) names.
@@ -388,6 +424,26 @@ mod tests {
             identity(&first_cert_der(&user.cert_pem).unwrap()).unwrap(),
             Identity::new("alice", Role::Admin)
         );
+    }
+
+    #[test]
+    fn signs_requests() {
+        let ca = Ca::generate().unwrap();
+        let (key_pem, csr_pem) = request().unwrap();
+        let id = Identity::new("n2", Role::Worker);
+        let cert_pem = ca.sign(&csr_pem, &id, CERT_LIFETIME).unwrap();
+        assert_eq!(identity(&first_cert_der(&cert_pem).unwrap()).unwrap(), id);
+        // The certificate is for the requester's key.
+        let cert = first_cert_der(&cert_pem).unwrap();
+        let (_, parsed) = X509Certificate::from_der(&cert).unwrap();
+        let key = KeyPair::from_pem(&key_pem).unwrap();
+        assert_eq!(
+            parsed.public_key().subject_public_key.data.as_ref(),
+            rcgen::PublicKeyData::der_bytes(&key)
+        );
+        assert!(ca.sign("not a request", &id, CERT_LIFETIME).is_err());
+        // The PEM and digest helpers agree.
+        assert_eq!(digest(&super::cert_pem(&cert)).unwrap(), digest_der(&cert));
     }
 
     #[test]

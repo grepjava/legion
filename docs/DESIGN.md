@@ -745,7 +745,12 @@ compose behind.
   days, renewed automatically at two-thirds of their life.
 - **Join tokens**: `LGN-1-<ca-digest>-<secret>`, with separate tokens for workers and
   managers, and rotation on demand. The digest lets a joining node verify the
-  cluster it reaches before sending anything.
+  cluster it reaches before sending anything. Built: the joining node reads
+  the CA from the manager's TLS chain and checks it against the digest,
+  then sends a certificate request for its own key; managers also receive
+  the CA key (every manager can certify nodes) and join Raft as learners,
+  promoted to voters once caught up. Token secrets live in the store under
+  the reserved namespace `legion-system`, which the API never exposes.
 - **Users**: `legion user create alice --role edit -n shop` issues a client
   certificate bundle. RBAC binds the certificate identity to roles per namespace.
 - **Encryption at rest**: Raft log and snapshots are encrypted with a data key.

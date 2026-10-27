@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use legion_api::{CLUSTER_SCOPE, Kind, Object, ObjectKey};
+use legion_pki::Role;
 use legion_proto::v1::cluster_server::Cluster;
 use legion_proto::v1::objects_client::ObjectsClient;
 use legion_proto::v1::objects_server::Objects;
@@ -22,6 +23,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
+use crate::join::SYSTEM_NAMESPACE;
 use crate::raft_net::{MAX_MESSAGE, connect_lazy};
 
 const FORWARDED: &str = "legion-forwarded";
@@ -40,6 +42,8 @@ pub struct ApiService {
     pub(crate) closing: tokio::sync::watch::Receiver<bool>,
     /// For forwarding to the leader.
     pub(crate) peer_tls: Option<tonic::transport::ClientTlsConfig>,
+    /// Certifies joining nodes; managers without the CA key cannot.
+    pub(crate) issuer: Option<crate::join::Issuer>,
 }
 
 enum Route {
@@ -47,7 +51,53 @@ enum Route {
     Leader(ObjectsClient<Channel>),
 }
 
+/// The reserved namespace holds Legion's own records; no caller sees it.
+fn check_namespace(namespace: &str) -> Result<(), Status> {
+    if namespace == SYSTEM_NAMESPACE {
+        Err(Status::permission_denied(format!(
+            "namespace {SYSTEM_NAMESPACE} is reserved for Legion"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 impl ApiService {
+    /// The leader's address, or `None` if this manager leads.
+    fn leader_addr<T>(&self, req: &Request<T>) -> Result<Option<String>, Status> {
+        match self.route(req)? {
+            Route::Local => Ok(None),
+            Route::Leader(_) => {
+                let m = self.store.raft.metrics().borrow().clone();
+                let leader = m.current_leader.expect("routed to a leader");
+                Ok(m.membership_config
+                    .membership()
+                    .get_node(&leader)
+                    .map(|n| n.addr.clone()))
+            }
+        }
+    }
+
+    fn issuer(&self) -> Result<&crate::join::Issuer, Status> {
+        self.issuer
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("this manager cannot issue certificates"))
+    }
+
+    pub(crate) async fn join(
+        &self,
+        req: Request<pb::JoinRequest>,
+    ) -> Result<Response<pb::JoinResponse>, Status> {
+        if let Some(addr) = self.leader_addr(&req)? {
+            let mut c = legion_proto::v1::join_client::JoinClient::new(connect_lazy(
+                &addr,
+                self.peer_tls.as_ref(),
+            ));
+            return c.join(forwarded(req.into_inner())).await;
+        }
+        Ok(Response::new(self.issuer()?.join(req.into_inner()).await?))
+    }
+
     /// Where a leader-only request should run.
     fn route<T>(&self, req: &Request<T>) -> Result<Route, Status> {
         let metrics = self.store.raft.metrics().borrow().clone();
@@ -114,6 +164,10 @@ impl ApiService {
             .ok_or_else(|| Status::invalid_argument("object is required"))?;
         let mut desired = Object::try_from(wire).map_err(invalid)?;
         default_namespace(desired.kind, &mut desired.metadata.namespace);
+        check_namespace(&desired.metadata.namespace)?;
+        if desired.kind == Kind::Namespace {
+            check_namespace(&desired.metadata.name)?;
+        }
         legion_api::admit(&mut desired).map_err(invalid)?;
         let key = desired.key();
 
@@ -241,6 +295,7 @@ impl Objects for ApiService {
     }
 
     async fn get(&self, req: Request<ObjectRef>) -> Result<Response<pb::Object>, Status> {
+        check_namespace(&req.get_ref().namespace)?;
         if let Route::Leader(mut c) = self.route(&req)? {
             return c.get(forwarded(req.into_inner())).await;
         }
@@ -258,6 +313,7 @@ impl Objects for ApiService {
         }
         let req = req.into_inner();
         let kind = parse_kind(&req.kind)?;
+        check_namespace(&req.namespace)?;
         let namespace = (!req.namespace.is_empty()).then_some(req.namespace.as_str());
         self.consistent().await?;
         let listing = self.store.list(kind, namespace).map_err(internal)?;
@@ -265,6 +321,7 @@ impl Objects for ApiService {
         let objects = listing
             .objects
             .iter()
+            .filter(|o| o.metadata.namespace != SYSTEM_NAMESPACE)
             .filter(|o| {
                 selector
                     .iter()
@@ -287,6 +344,7 @@ impl Objects for ApiService {
         }
         let req = req.into_inner();
         let key = parse_ref(req.r#ref)?;
+        check_namespace(&key.namespace)?;
         let precondition = req
             .expected_version
             .map_or(Precondition::None, Precondition::Version);
@@ -338,6 +396,11 @@ impl Objects for ApiService {
                     return;
                 };
                 let item = match next {
+                    Ok(Event::Put(o) | Event::Delete(o))
+                        if o.metadata.namespace == SYSTEM_NAMESPACE =>
+                    {
+                        continue;
+                    }
                     Ok(Event::Put(o)) => Ok(pb::WatchEvent {
                         r#type: watch_event::Type::Put.into(),
                         object: Some((&o).into()),
@@ -389,6 +452,27 @@ impl Cluster for ApiService {
         _req: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
         Ok(Response::new(self.status()?))
+    }
+
+    async fn join_token(
+        &self,
+        req: Request<pb::JoinTokenRequest>,
+    ) -> Result<Response<pb::JoinTokenResponse>, Status> {
+        if let Some(addr) = self.leader_addr(&req)? {
+            let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                &addr,
+                self.peer_tls.as_ref(),
+            ));
+            return c.join_token(forwarded(req.into_inner())).await;
+        }
+        let req = req.into_inner();
+        let role = Role::parse(&req.role)
+            .filter(|r| *r != Role::Admin)
+            .ok_or_else(|| Status::invalid_argument("the role is `manager` or `worker`"))?;
+        let token = self.issuer()?.token(role, req.rotate).await?;
+        Ok(Response::new(pb::JoinTokenResponse {
+            token: token.to_string(),
+        }))
     }
 }
 

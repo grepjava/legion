@@ -8,6 +8,7 @@
 
 mod api;
 pub mod controller;
+pub mod join;
 mod raft_net;
 mod tls;
 
@@ -21,6 +22,7 @@ use legion_store::{NodeId, Store};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 
+pub use join::{Joined, SYSTEM_NAMESPACE, join};
 pub use raft_net::{GrpcNetwork, MAX_MESSAGE};
 pub use tls::{Tls, client_config};
 
@@ -96,12 +98,28 @@ impl Manager {
             self.id,
             closing.clone(),
         ));
+        let issuer = match self
+            .tls
+            .as_ref()
+            .and_then(|t| t.ca_key_pem.as_ref().map(|k| (t, k)))
+        {
+            Some((t, key)) => Some(join::Issuer {
+                ca: std::sync::Arc::new(legion_pki::Ca::load(&t.ca_pem, key)?),
+                store: self.store.clone(),
+            }),
+            None => None,
+        };
+        let promote = tokio::spawn(join::promote_learners(
+            self.store.raft.clone(),
+            closing.clone(),
+        ));
         let api = api::ApiService {
             id: self.id,
             advertise: self.advertise.clone(),
             store: self.store.clone(),
             closing,
             peer_tls: self.tls.as_ref().map(Tls::client),
+            issuer,
         };
         let raft = raft_net::RaftService {
             raft: self.store.raft.clone(),
@@ -122,8 +140,11 @@ impl Manager {
                 tls::only(API, on),
             ))
             .add_service(tonic::service::interceptor::InterceptedService::new(
-                ClusterServer::new(api),
+                ClusterServer::new(api.clone()),
                 tls::only(API, on),
+            ))
+            .add_service(legion_proto::v1::join_server::JoinServer::new(
+                join::JoinService { api },
             ))
             .add_service(tonic::service::interceptor::InterceptedService::new(
                 RaftServer::new(raft)
@@ -142,6 +163,7 @@ impl Manager {
         // The controllers hold a store handle; they stop on `closing`.
         let _ = closing_tx.send(true);
         let _ = controllers.await;
+        let _ = promote.await;
         tracing::info!("API stopped; shutting down the store");
         self.store.shutdown().await?;
         Ok(())
@@ -149,7 +171,7 @@ impl Manager {
 }
 
 /// The node's Raft id, generated once and kept in `data_dir/node-id`.
-fn node_id(dir: &Path) -> Result<NodeId, Error> {
+pub fn node_id(dir: &Path) -> Result<NodeId, Error> {
     let path = dir.join("node-id");
     match std::fs::read_to_string(&path) {
         Ok(s) => Ok(s.trim().parse()?),

@@ -102,6 +102,45 @@ service Cluster {
   // ALREADY_EXISTS if it already belongs to one.
   rpc Init(InitRequest) returns (StatusResponse);
   rpc Status(StatusRequest) returns (StatusResponse);
+  // The token that lets a node join with `role` ("manager" or "worker");
+  // `rotate` replaces it, so the old token stops working.
+  rpc JoinToken(JoinTokenRequest) returns (JoinTokenResponse);
+}
+
+message JoinTokenRequest {
+  string role = 1;
+  bool rotate = 2;
+}
+
+message JoinTokenResponse {
+  string token = 1;
+}
+
+// The one service callers reach without a client certificate: a node
+// presents a join token and gets one.
+service Join {
+  rpc Join(JoinRequest) returns (JoinResponse);
+}
+
+message JoinRequest {
+  // LGN-1-<ca-digest>-<secret>.
+  string token = 1;
+  // The node's name, for its certificate.
+  string name = 2;
+  // A PEM certificate request for the node's own key.
+  string csr_pem = 3;
+  // Managers only: the Raft id and the address other managers use.
+  uint64 node_id = 4;
+  string advertise = 5;
+}
+
+message JoinResponse {
+  // "manager" or "worker", from the token.
+  string role = 1;
+  string cert_pem = 2;
+  string ca_pem = 3;
+  // Managers only: they issue certificates too.
+  string ca_key_pem = 4;
 }
 
 message InitRequest {}

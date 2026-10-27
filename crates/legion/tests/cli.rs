@@ -19,15 +19,21 @@ impl Drop for Daemon {
     }
 }
 
-fn start_daemon() -> Daemon {
-    let dir = tempfile::tempdir().unwrap();
-    // Pick a free port; the race with other processes is acceptable in tests.
+/// A free port; the race with other processes is acceptable in tests.
+fn free_addr() -> String {
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
         .port();
-    let server = format!("127.0.0.1:{port}");
+    format!("127.0.0.1:{port}")
+}
+
+fn start_daemon() -> Daemon {
+    start_daemon_in(tempfile::tempdir().unwrap(), free_addr())
+}
+
+fn start_daemon_in(dir: tempfile::TempDir, server: String) -> Daemon {
     let child = Command::new(LEGION)
         .args(["daemon", "--no-agent", "--listen", &server, "--data-dir"])
         .arg(dir.path())
@@ -145,4 +151,62 @@ spec: { pod: { containers: [{ name: db, image: postgres:17 }] } }
 
     let bad = legion(&d, &["list", "pods"]);
     assert!(String::from_utf8_lossy(&bad.stderr).contains("unknown kind"));
+}
+
+#[test]
+fn a_second_manager_joins() {
+    let first = start_daemon();
+    ok(&first, &["init"]);
+    let token = ok(&first, &["join-token", "manager"]).trim().to_owned();
+    assert!(token.starts_with("LGN-1-"), "{token}");
+
+    // The new node joins from an empty data directory, then starts.
+    let dir = tempfile::tempdir().unwrap();
+    let addr = free_addr();
+    let out = Command::new(LEGION)
+        .args([
+            "join",
+            &token,
+            "--manager",
+            &first.server,
+            "--advertise",
+            &addr,
+        ])
+        .args(["--node-name", "m2", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("joined as manager m2"));
+    // Joining again into the same directory is refused.
+    let again = Command::new(LEGION)
+        .args(["join", &token, "--manager", &first.server, "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(!again.status.success());
+
+    let second = start_daemon_in(dir, addr);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = ok(&second, &["status"]);
+        if status.matches("voter").count() >= 2 && !status.contains("learner") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{status}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // The second manager's own admin credentials work against the first.
+    let manifest = second._dir.path().join("ns.yaml");
+    std::fs::write(
+        &manifest,
+        "apiVersion: legion/v1\nkind: Namespace\nmetadata: { name: shop }\n",
+    )
+    .unwrap();
+    ok(&second, &["apply", "-f", manifest.to_str().unwrap()]);
+    assert!(ok(&first, &["get", "namespace", "shop"]).contains("name: shop"));
 }

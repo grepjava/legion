@@ -2,7 +2,7 @@
 //! Podman service.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -87,6 +87,42 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         podman.shutdown().await;
     }
     served
+}
+
+/// `legion join`: certifies this node with the cluster and stores its
+/// credentials in `data_dir`, before the daemon first starts there.
+pub async fn join(
+    token: &str,
+    manager: &str,
+    data_dir: &Path,
+    advertise: Option<&str>,
+    name: Option<String>,
+) -> anyhow::Result<()> {
+    let pki = crate::pki::Pki::new(data_dir);
+    if pki.exists() || data_dir.join("store.redb").exists() {
+        bail!(
+            "{} already holds a node (its own CA or a store); join from an empty data directory",
+            data_dir.display()
+        );
+    }
+    let node = match name {
+        Some(n) => n,
+        None => node_name(&hostname()?)?,
+    };
+    legion_api::validate_name(&node).context("node name")?;
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating {}", data_dir.display()))?;
+    let id = legion_manager::node_id(data_dir).map_err(|e| anyhow::anyhow!(e))?;
+    let joined = legion_manager::join(manager, token, &node, id, advertise.unwrap_or(""))
+        .await
+        .map_err(|e| anyhow::anyhow!("joining through {manager}: {e}"))?;
+    pki.write_joined(&joined)?;
+    println!(
+        "joined as {} {node}; start the daemon with --data-dir {}",
+        joined.role,
+        data_dir.display()
+    );
+    Ok(())
 }
 
 async fn start_agent(

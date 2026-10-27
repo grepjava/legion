@@ -175,22 +175,33 @@ end.
   `/var/db/legion/admin.pem`). Tested: a 3-manager cluster over mTLS, and
   refusals of no certificate, plaintext, another CA, a worker on the API
   and an admin on Raft; the exit test passes on FreeBSD over mTLS.
+- **Join** (`legion-manager::join`, `legion join`, `legion join-token`):
+  tokens are `LGN-1-<ca-digest>-<secret>`, one secret per role, kept in the
+  store in the reserved namespace `legion-system`, which the API refuses
+  and leaves out of lists and watches; `join-token --rotate` replaces one.
+  `legion join <token> --manager <addr>` runs on the new node before its
+  daemon starts: it reads the CA from the chain the manager presents, keeps
+  it only if it matches the token's digest, connects again verifying with
+  it, and sends the token with a certificate request for a key that never
+  leaves the node. The manager (the leader; others forward) signs it for the
+  token's role. Managers also get the CA key and join Raft as learners; the
+  leader promotes learners to voters once they have caught up. Tested: two
+  managers join and vote, a worker gets a worker certificate without the CA
+  key, bad, rotated and foreign tokens fail, the tokens stay out of the
+  API; and through the CLI, a second daemon joins and serves.
 
 ### To do, in order
 
-1. **Join**: tokens (`LGN-1-<ca-digest>-<secret>`, worker and manager), an
-   unauthenticated Join call that checks the token and issues a
-   certificate, `legion join`, managers added as voters, CA distribution.
-2. **Dispatcher**: the agent's `Control` over a gRPC stream from any
+1. **Dispatcher**: the agent's `Control` over a gRPC stream from any
    manager (assignments, endpoints, secrets for its tasks only, status
    reports, heartbeats); node down detection.
-3. **WireGuard mesh and routed pod network**: per-node keys, peers from
+2. **WireGuard mesh and routed pod network**: per-node keys, peers from
    the store, routes to other nodes' pod subnets; pf rules for remote
    backends (§5.4).
-4. **Scheduling and failure handling across nodes**: taints, tasks of a
+3. **Scheduling and failure handling across nodes**: taints, tasks of a
    lost node rescheduled, the routing mesh on every node.
-5. **Rollback and compose `stack deploy`**.
-6. **Exit test**.
+4. **Rollback and compose `stack deploy`**.
+5. **Exit test**.
 
 ## Later phases
 

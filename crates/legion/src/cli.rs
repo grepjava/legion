@@ -36,6 +36,15 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             );
         }
         Command::Status => print_status(&cluster.status(StatusRequest {}).await?.into_inner()),
+        Command::JoinToken { role, rotate } => {
+            let token = cluster
+                .join_token(pb::JoinTokenRequest { role, rotate })
+                .await?
+                .into_inner()
+                .token;
+            println!("{token}");
+        }
+        Command::Join { .. } => unreachable!("handled in main"),
         Command::Apply { files } => {
             for file in files {
                 for object in read_objects(&file)? {

@@ -1,9 +1,10 @@
 //! The daemon's certificates, under `<data dir>/pki` (DESIGN.md §9).
 //!
-//! The first start creates a cluster CA, this manager's certificate and
-//! `<data dir>/admin.pem`, the CLI's credentials. Later starts reuse them
-//! and reissue the manager's certificate once two thirds of its life are
-//! gone. (`legion join` will replace the CA with the cluster's.)
+//! The first start of a node that has not joined a cluster creates a
+//! cluster CA, this manager's certificate and `<data dir>/admin.pem`, the
+//! CLI's credentials. `legion join` writes the cluster's CA and the node's
+//! certificate instead, with the CA key only for managers. Managers reissue
+//! their own certificate once two thirds of its life are gone.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -29,12 +30,46 @@ impl Pki {
         self.dir.join(name)
     }
 
+    /// The node's role: a manager unless it joined as a worker.
+    pub fn role(&self) -> anyhow::Result<Role> {
+        Ok(match read(&self.path("role"))? {
+            Some(r) => Role::parse(r.trim()).with_context(|| {
+                format!("unknown role {r:?} in {}", self.path("role").display())
+            })?,
+            None => Role::Manager,
+        })
+    }
+
+    /// Whether the node has joined a cluster or holds a CA of its own.
+    pub fn exists(&self) -> bool {
+        self.path("ca.crt").exists()
+    }
+
+    /// Stores what joining a cluster gave the node.
+    pub fn write_joined(&self, joined: &legion_manager::Joined) -> anyhow::Result<()> {
+        private_dir(&self.dir)?;
+        let tls = &joined.tls;
+        if let Some(key) = &tls.ca_key_pem {
+            write_private(&self.path("ca.key"), key)?;
+        }
+        write_public(&self.path("ca.crt"), &tls.ca_pem)?;
+        write_private(&self.path("node.key"), &tls.key_pem)?;
+        write_public(&self.path("node.crt"), &tls.cert_pem)?;
+        write_public(&self.path("role"), &format!("{}\n", joined.role))
+    }
+
     /// The CA, this manager's credentials and the admin bundle, made or
     /// renewed as needed.
     pub fn ensure(&self, node: &str, data_dir: &Path) -> anyhow::Result<legion_manager::Tls> {
         private_dir(&self.dir)?;
+        if self.role()? != Role::Manager {
+            anyhow::bail!("this node joined as a worker; worker mode arrives with the dispatcher");
+        }
         let ca = match (read(&self.path("ca.crt"))?, read(&self.path("ca.key"))?) {
             (Some(cert), Some(key)) => Ca::load(&cert, &key).context("loading the cluster CA")?,
+            (Some(_), None) => {
+                anyhow::bail!("{} has no CA key: a manager needs one", self.dir.display())
+            }
             _ => {
                 let ca = Ca::generate()?;
                 write_private(&self.path("ca.key"), ca.key_pem())?;
@@ -80,6 +115,7 @@ impl Pki {
             ca_pem: ca.cert_pem().to_owned(),
             cert_pem,
             key_pem,
+            ca_key_pem: Some(ca.key_pem().to_owned()),
         })
     }
 }

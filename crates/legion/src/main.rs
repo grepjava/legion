@@ -67,6 +67,30 @@ enum Command {
     },
     /// Start a new cluster with the reached manager as its first member.
     Init,
+    /// Print the token that lets a node join as a manager or a worker.
+    JoinToken {
+        #[arg(value_parser = ["manager", "worker"])]
+        role: String,
+        /// Replace the token; the old one stops working.
+        #[arg(long)]
+        rotate: bool,
+    },
+    /// Join a cluster. Run on the new node before its daemon starts, with
+    /// the daemon's --data-dir; the daemon then starts as a member.
+    Join {
+        token: String,
+        /// Any manager of the cluster, `host:port`.
+        #[arg(long)]
+        manager: String,
+        #[arg(long, default_value = "/var/db/legion")]
+        data_dir: PathBuf,
+        /// Managers only: the address other managers reach this one at.
+        #[arg(long)]
+        advertise: Option<String>,
+        /// Name of this node (default: the hostname's first label).
+        #[arg(long)]
+        node_name: Option<String>,
+    },
     /// Show the reached manager's view of the cluster.
     Status,
     /// Create or update objects from YAML or JSON files ("-" reads stdin).
@@ -144,6 +168,13 @@ async fn main() -> anyhow::Result<()> {
             })
             .await
         }
+        Command::Join {
+            token,
+            manager,
+            data_dir,
+            advertise,
+            node_name,
+        } => daemon::join(&token, &manager, &data_dir, advertise.as_deref(), node_name).await,
         command => cli::run(&args.server, &args.identity, command).await,
     }
 }

@@ -7,8 +7,8 @@ use legion_pki::{CERT_LIFETIME, Ca, Identity, Role};
 use legion_proto::v1::cluster_client::ClusterClient;
 use legion_proto::v1::objects_client::ObjectsClient;
 use legion_proto::v1::{
-    ApplyRequest, ApplyResult, DeleteRequest, InitRequest, ListRequest, Object, ObjectRef,
-    StatusRequest, WatchRequest, watch_event,
+    ApplyRequest, ApplyResult, DeleteRequest, InitRequest, JoinTokenRequest, ListRequest, Object,
+    ObjectRef, StatusRequest, WatchRequest, watch_event,
 };
 use legion_store::Store;
 use openraft::BasicNode;
@@ -54,9 +54,33 @@ impl Running {
                 ca_pem: ca.cert_pem().into(),
                 cert_pem: node.cert_pem,
                 key_pem: node.key_pem,
+                ca_key_pem: Some(ca.key_pem().into()),
             }
         });
         let admin = ca.map(|ca| creds(ca, "admin", Role::Admin));
+        Running::serve(dir, listener, tls, admin).await
+    }
+
+    /// A fresh manager that joins the cluster at `via` with `token`.
+    async fn join(via: &str, token: &str, name: &str, admin: ClientTlsConfig) -> Running {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let id = legion_manager::node_id(dir.path()).unwrap();
+        let joined = legion_manager::join(via, token, name, id, &addr)
+            .await
+            .unwrap();
+        assert_eq!(joined.role, Role::Manager);
+        Running::serve(dir, listener, Some(joined.tls), Some(admin)).await
+    }
+
+    async fn serve(
+        dir: TempDir,
+        listener: TcpListener,
+        tls: Option<Tls>,
+        admin: Option<ClientTlsConfig>,
+    ) -> Running {
+        let addr = listener.local_addr().unwrap().to_string();
         let manager = Manager::open(ManagerConfig {
             data_dir: dir.path().to_owned(),
             advertise: addr.clone(),
@@ -285,8 +309,16 @@ async fn single_manager_crud_and_watch() {
     let ev = events.message().await.unwrap().unwrap();
     assert_eq!(ev.r#type(), watch_event::Type::Put);
     assert_eq!(ev.object.unwrap().generation, 2);
-    let ev = events.message().await.unwrap().unwrap();
-    assert_eq!(ev.r#type(), watch_event::Type::Delete);
+    // The Service controller may write the status in between: same
+    // generation, then the delete.
+    loop {
+        let ev = events.message().await.unwrap().unwrap();
+        if ev.r#type() == watch_event::Type::Delete {
+            break;
+        }
+        assert_eq!(ev.r#type(), watch_event::Type::Put);
+        assert_eq!(ev.object.unwrap().generation, 2, "a status write");
+    }
 
     // Bad input.
     let task = Object {
@@ -482,6 +514,130 @@ async fn mutual_tls() {
     assert_eq!(listed.objects.len(), 1);
 
     for m in managers {
+        m.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nodes_join_with_tokens() {
+    let ca = Ca::generate().unwrap();
+    let first = Running::start_with(Some(&ca)).await;
+    first.cluster().await.init(InitRequest {}).await.unwrap();
+    let token = |role: &str, rotate: bool| {
+        let first = &first;
+        let role = role.to_owned();
+        async move {
+            first
+                .cluster()
+                .await
+                .join_token(JoinTokenRequest { role, rotate })
+                .await
+                .unwrap()
+                .into_inner()
+                .token
+        }
+    };
+    let manager_token = token("manager", false).await;
+    assert_eq!(token("manager", false).await, manager_token, "stable");
+    assert!(manager_token.starts_with(&format!("LGN-1-{}-", ca.digest())));
+
+    // Two managers join and become voters once they have caught up.
+    let admin = creds(&ca, "admin", Role::Admin);
+    let second = Running::join(&first.addr, &manager_token, "m2", admin.clone()).await;
+    let third = Running::join(&first.addr, &manager_token, "m3", admin).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = third
+            .cluster()
+            .await
+            .status(StatusRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        if status.members.iter().filter(|m| m.voter).count() == 3 {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{status:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Writes through a joined manager reach the leader.
+    let follower = third.objects().await;
+    eventually(|| {
+        let mut follower = follower.clone();
+        async move { follower.apply(apply(service("web", 1))).await }
+    })
+    .await;
+
+    // A worker gets a worker certificate and no CA key.
+    let worker_token = token("worker", false).await;
+    assert_ne!(worker_token, manager_token);
+    let worker = legion_manager::join(&second.addr, &worker_token, "w1", 0, "")
+        .await
+        .unwrap();
+    assert_eq!(worker.role, Role::Worker);
+    assert!(worker.tls.ca_key_pem.is_none());
+    let bundle = legion_pki::Bundle {
+        cert_pem: worker.tls.cert_pem.clone(),
+        key_pem: worker.tls.key_pem.clone(),
+        ca_pem: worker.tls.ca_pem.clone(),
+    };
+    assert_eq!(
+        bundle.identity().unwrap(),
+        Identity::new("w1", Role::Worker)
+    );
+    // A manager must say where other managers reach it.
+    let err = legion_manager::join(&first.addr, &manager_token, "m4", 9, "")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("advertised address"), "{err}");
+
+    // Bad, rotated and foreign tokens are refused.
+    let digest = ca.digest();
+    let err = legion_manager::join(&first.addr, &format!("LGN-1-{digest}-nope"), "w2", 0, "")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("invalid or rotated"), "{err}");
+    let rotated = token("worker", true).await;
+    assert_ne!(rotated, worker_token);
+    let err = legion_manager::join(&first.addr, &worker_token, "w2", 0, "")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("invalid or rotated"), "{err}");
+    legion_manager::join(&first.addr, &rotated, "w2", 0, "")
+        .await
+        .unwrap();
+    let other = Ca::generate().unwrap();
+    let foreign = format!("LGN-1-{}-x", other.digest());
+    let err = legion_manager::join(&first.addr, &foreign, "w3", 0, "")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("CA digest mismatch"), "{err}");
+
+    // The tokens themselves stay out of the API.
+    let secrets = first
+        .objects()
+        .await
+        .list(ListRequest {
+            kind: "Secret".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(secrets.objects.is_empty());
+    let err = first
+        .objects()
+        .await
+        .list(ListRequest {
+            kind: "Secret".into(),
+            namespace: legion_manager::SYSTEM_NAMESPACE.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+
+    for m in [first, second, third] {
         m.stop().await;
     }
 }
