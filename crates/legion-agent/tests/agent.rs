@@ -97,6 +97,7 @@ impl Harness {
         config.infra_image = INFRA.into();
         config.resync = Duration::from_millis(100);
         config.zfs_root = Some("tank/legion".into());
+        config.logs_dir = Some(self.logs_dir());
         if self.mesh {
             config.wireguard = Some(WireGuardConfig {
                 key_file: self.key_file(),
@@ -124,6 +125,10 @@ impl Harness {
 
     fn files_dir(&self) -> std::path::PathBuf {
         self._dir.path().join("tasks")
+    }
+
+    fn logs_dir(&self) -> std::path::PathBuf {
+        self._dir.path().join("logs")
     }
 
     fn key_file(&self) -> std::path::PathBuf {
@@ -1254,4 +1259,69 @@ async fn sessions_reach_the_pod() {
     );
     h.rt.exit(APP, 0);
     assert_eq!(s.rest().await, (vec![], None));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn finished_tasks_keep_their_output() {
+    let h = Harness::new().await;
+    h.rt.add_image("job:1");
+    let key = h
+        .task(
+            "web-1",
+            r#"
+initContainers: [{ name: setup, image: "job:1" }]
+containers: [{ name: app, image: "job:1" }]
+restartPolicy: { condition: none }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    h.rt.log("shop_web-1_app", Output::Stdout, "done 1\ndone 2\n");
+    h.rt.log("shop_web-1_app", Output::Stderr, "warned\n");
+    h.rt.exit("shop_web-1_app", 0);
+    h.wait_state(&key, TaskState::Complete).await;
+    eventually("pod removed", || h.rt.containers().is_empty()).await;
+
+    // By the task's name, or its owner's when nothing of it runs.
+    for task in ["web-1", "web"] {
+        let mut s = Session::open(&h, open(task, logs(false, None)))
+            .await
+            .unwrap();
+        assert_eq!(
+            s.rest().await,
+            (
+                vec![
+                    Frame::Stdout(b"done 1\n".to_vec()),
+                    Frame::Stdout(b"done 2\n".to_vec()),
+                    Frame::Stderr(b"warned\n".to_vec()),
+                ],
+                None
+            )
+        );
+    }
+    let mut s = Session::open(&h, open("web-1", logs(true, Some(1))))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.rest().await,
+        (vec![Frame::Stderr(b"warned\n".to_vec())], None)
+    );
+    let mut setup = open("web-1", logs(false, None));
+    setup.container = "setup".into();
+    let mut s = Session::open(&h, setup).await.unwrap();
+    assert_eq!(s.rest().await, (vec![], None));
+    // Exec needs the pod.
+    let refused = Session::open(&h, open("web-1", exec(&["ls"], false, false)))
+        .await
+        .err()
+        .expect("refused");
+    assert_eq!(refused.message(), "task web-1 is complete, not running");
+
+    // The output goes with the task.
+    let kept = h
+        .logs_dir()
+        .join(&h.store.get(&key).unwrap().unwrap().metadata.uid);
+    assert!(kept.join("app").exists());
+    h.delete(&key).await;
+    eventually("output removed", || !kept.exists()).await;
 }

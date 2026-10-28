@@ -113,7 +113,8 @@ spec:
 ```
 
 Into the tasks themselves, through any manager; a service name picks one
-of its running tasks (a Job's name works too):
+of its running tasks (a Job's name works too). A finished task's output is
+kept until the task is deleted, so `logs` works on a completed Job:
 
 ```sh
 legion logs web -n shop -f --tail 20

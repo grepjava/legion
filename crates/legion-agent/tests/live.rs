@@ -59,6 +59,7 @@ fn start_agent(manager: &str, podman: &Podman) -> (oneshot::Sender<()>, JoinHand
     let lab = PathBuf::from(std::env::var("LEGION_AGENT_LAB").expect("set LEGION_AGENT_LAB"));
     let mut config = AgentConfig::new("lab", lab.join("tasks"));
     config.zfs_root = std::env::var("LEGION_AGENT_ZFS_ROOT").ok();
+    config.logs_dir = Some(lab.join("logs"));
     config.infra_image = IMAGE.into();
     config.resync = Duration::from_secs(2);
     let agent = Agent::new(
@@ -480,6 +481,17 @@ async fn agent_runs_a_real_pod() {
             .await
             .unwrap()
             .is_empty()
+    );
+    // Its output outlives the pod.
+    let lab = PathBuf::from(std::env::var("LEGION_AGENT_LAB").unwrap());
+    let kept = lab.join("logs").join(status_uid(&store, &failing));
+    let saved = String::from_utf8_lossy(&std::fs::read(kept.join("check")).unwrap()).into_owned();
+    assert!(
+        saved.contains(
+            "checking
+"
+        ) && saved.contains("missing schema"),
+        "{saved:?}"
     );
 
     stop.send(()).unwrap();

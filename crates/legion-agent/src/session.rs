@@ -9,6 +9,7 @@
 //! process that stops reading never stalls its output.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,14 +38,15 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) async fn serve<R: Runtime>(
     runtime: Arc<R>,
     node: String,
+    kept: Option<PathBuf>,
     mut offers: mpsc::Receiver<Offer>,
 ) {
     while let Some(offer) = offers.recv().await {
-        tokio::spawn(run(runtime.clone(), node.clone(), offer));
+        tokio::spawn(run(runtime.clone(), node.clone(), kept.clone(), offer));
     }
 }
 
-async fn run<R: Runtime>(runtime: Arc<R>, node: String, offer: Offer) {
+async fn run<R: Runtime>(runtime: Arc<R>, node: String, kept: Option<PathBuf>, offer: Offer) {
     let id = offer.offer.id.clone();
     let (tx, rx) = mpsc::channel(16);
     let _ = tx.send(frame(Frame::Attach(id.clone()))).await;
@@ -61,6 +63,12 @@ async fn run<R: Runtime>(runtime: Arc<R>, node: String, offer: Offer) {
         Some(Action::Logs(opts)) => {
             match container(runtime.as_ref(), &node, &o.task_uid, &open.container).await {
                 Ok(c) => logs(runtime.as_ref(), &c, opts, &tx, &mut inbound).await,
+                Err(e) if e.code() == tonic::Code::NotFound => {
+                    match saved(kept, &o.task_uid, &open.container, opts.tail).await {
+                        Some(lines) => send_all(lines, &tx).await,
+                        None => Err(e),
+                    }
+                }
                 Err(e) => Err(e),
             }
         }
@@ -138,6 +146,29 @@ async fn logs<R: Runtime>(
             },
         }
     }
+}
+
+/// The output kept of a container whose pod is gone.
+async fn saved(
+    root: Option<PathBuf>,
+    uid: &str,
+    container: &str,
+    tail: Option<u32>,
+) -> Option<Vec<Chunk>> {
+    let (uid, container) = (uid.to_owned(), container.to_owned());
+    let tail = tail.map(|n| n as usize);
+    tokio::task::spawn_blocking(move || crate::output::read(&root?, &uid, &container, tail))
+        .await
+        .ok()?
+}
+
+async fn send_all(lines: Vec<Chunk>, tx: &mpsc::Sender<SessionFrame>) -> Result<(), Status> {
+    for c in lines {
+        if tx.send(output_frame(c)).await.is_err() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 async fn exec<R: Runtime>(

@@ -24,6 +24,7 @@ use tokio::task::JoinSet;
 pub mod control;
 pub mod fake;
 mod files;
+mod output;
 pub mod pod;
 pub mod policing;
 mod probe;
@@ -58,6 +59,9 @@ pub struct AgentConfig {
     /// Holds a tmpfs per task with its secrets and configs. The agent owns
     /// it: entries no task accounts for are removed.
     pub files_dir: PathBuf,
+    /// Keeps the output of tasks whose pods are gone, until the tasks are
+    /// deleted; without it, output goes with the pod. The agent owns it.
+    pub logs_dir: Option<PathBuf>,
     /// The ZFS dataset under which volumes are created (`<pool>/legion`);
     /// without one, tasks using volumes are rejected.
     pub zfs_root: Option<String>,
@@ -81,6 +85,7 @@ impl AgentConfig {
             infra_image: "docker.io/freebsd/freebsd-runtime:15.1".to_owned(),
             resync: Duration::from_secs(30),
             files_dir: files_dir.into(),
+            logs_dir: None,
             zfs_root: None,
             wireguard: None,
         }
@@ -109,6 +114,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 node: config.node,
                 infra_image: config.infra_image,
                 files_dir: config.files_dir,
+                logs_dir: config.logs_dir,
                 zfs_root: config.zfs_root,
                 net: Arc::default(),
                 ips: Arc::default(),
@@ -171,6 +177,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         let sessions = tokio::spawn(session::serve(
             ctx.runtime.clone(),
             ctx.node.clone(),
+            ctx.logs_dir.clone(),
             ctx.control.sessions(&ctx.node),
         ));
         let net = legion_net::PodNetwork::new(registration.pod_cidr);
@@ -780,10 +787,31 @@ async fn reconcile<R: Runtime, C: Control>(
         tracing::info!(uid, "removing what is left of a task not assigned here");
         cleaning.insert(uid.clone());
         let ctx = ctx.clone();
+        let keep = assignments.contains_key(&uid);
         cleanups.spawn(async move {
-            task::teardown(&ctx, &uid, grace).await;
+            task::teardown(&ctx, &uid, grace, keep).await;
             uid
         });
+    }
+
+    // Kept output goes with its task.
+    if let Some(root) = ctx.logs_dir.clone() {
+        let known: BTreeSet<String> = assignments
+            .keys()
+            .chain(workers.keys())
+            .chain(cleaning.iter())
+            .cloned()
+            .collect();
+        let removed = tokio::task::spawn_blocking(move || {
+            for uid in output::present(&root) {
+                if !known.contains(&uid)
+                    && let Err(e) = output::remove(&root, &uid)
+                {
+                    tracing::warn!(uid, "removing kept output: {e}");
+                }
+            }
+        });
+        let _ = removed.await;
     }
 }
 

@@ -180,7 +180,7 @@ impl Pods for PodsService {
             None => return Err(Status::invalid_argument("the session needs an action")),
         };
         caller.check(&self.api.store, verb, Kind::Task, &open.namespace)?;
-        let task = self.task(&open)?;
+        let task = self.task(&open, verb == Verb::Read)?;
         let spec: TaskSpec = legion_api::parse(&task.spec).map_err(internal)?;
         let status: TaskStatus = serde_json::from_value(task.status.clone()).unwrap_or_default();
         open.task = task.metadata.name.clone();
@@ -222,14 +222,16 @@ impl Pods for PodsService {
 
 impl PodsService {
     /// The task `open` names, or a running task of the Service, or else the
-    /// Job, it names.
-    fn task(&self, open: &SessionOpen) -> Result<Object, Status> {
+    /// Job, it names. With `finished`, a Service or Job with none running
+    /// gives the task that last ended on a node, whose output the node
+    /// keeps.
+    fn task(&self, open: &SessionOpen, finished: bool) -> Result<Object, Status> {
         let store = &self.api.store;
         let key = ObjectKey::new(Kind::Task, &open.namespace, &open.task);
         if let Some(t) = store.get(&key).map_err(internal)? {
             return Ok(t);
         }
-        let mut tasks: Vec<(Object, bool, TaskState)> = store
+        let mut tasks: Vec<(Object, bool, TaskState, bool)> = store
             .list(Kind::Task, Some(&open.namespace))
             .map_err(internal)?
             .objects
@@ -240,7 +242,8 @@ impl PodsService {
                 let state = serde_json::from_value::<TaskStatus>(t.status.clone())
                     .unwrap_or_default()
                     .state;
-                Some((t, spec.job, state))
+                let on_node = !spec.node.is_empty();
+                Some((t, spec.job, state, on_node))
             })
             .collect();
         let exists = |kind| {
@@ -251,7 +254,7 @@ impl PodsService {
             false
         } else if exists(Kind::Job)? {
             true
-        } else if let Some((_, job, _)) = tasks.first() {
+        } else if let Some((_, job, ..)) = tasks.first() {
             *job
         } else {
             return Err(Status::not_found(format!(
@@ -259,9 +262,22 @@ impl PodsService {
                 open.task, open.namespace
             )));
         };
-        tasks.retain(|(_, j, state)| *j == job && *state == TaskState::Running);
-        tasks.sort_by(|a, b| a.0.metadata.name.cmp(&b.0.metadata.name));
-        tasks.into_iter().next().map(|(t, _, _)| t).ok_or_else(|| {
+        tasks.retain(|(_, j, ..)| *j == job);
+        let running = tasks
+            .iter()
+            .filter(|(_, _, s, _)| *s == TaskState::Running)
+            .min_by(|a, b| a.0.metadata.name.cmp(&b.0.metadata.name));
+        // Rejected tasks never ran.
+        let ended = || {
+            tasks
+                .iter()
+                .filter(|(_, _, s, on_node)| {
+                    *on_node && s.is_terminal() && *s != TaskState::Rejected
+                })
+                .max_by_key(|(t, ..)| t.metadata.version)
+        };
+        let found = running.or_else(|| ended().filter(|_| finished));
+        found.map(|(t, ..)| t.clone()).ok_or_else(|| {
             let owner = if job { "job" } else { "service" };
             Status::failed_precondition(format!("{owner} {} has no running task", open.task))
         })

@@ -391,6 +391,14 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   Docker. Port-forward is one session per TCP connection, from the agent
   to the pod's address. A worker may attach only to its own node's
   sessions.
+- **Output of finished tasks** (phase 3). Before it removes a pod, the
+  agent saves each container's output, the last 1 MiB, under
+  `<data-dir>/logs/<task uid>`, and keeps it until the task is no longer
+  assigned to the node, which is when the task is deleted. `logs` on a
+  task whose pod is gone reads the saved copy (following it ends at its
+  end); on a Service or Job with no running task it picks the task that
+  last ended on a node. A restarted container's earlier runs are not
+  kept.
 - **CLI.** `legion init | status | apply -f | get | list | delete | watch`,
   with kubectl-style kind names (`service`, `services`, `svc`), `-n`, `-A`,
   `-l key=value` and `-o table|yaml|json`. `apply` reads multi-document YAML

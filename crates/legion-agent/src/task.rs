@@ -23,7 +23,7 @@ use crate::control::{Assignment, Control, ControlError};
 use crate::pod::{self, LABEL_CONTAINER, LABEL_ROLE, LABEL_TASK, Role};
 use crate::probe::{self, Outcome, Prober};
 use crate::runtime::Runtime;
-use crate::{files, volumes};
+use crate::{files, output, volumes};
 
 /// What the agent tells a worker.
 #[derive(Debug)]
@@ -44,6 +44,7 @@ pub(crate) struct Ctx<R, C> {
     pub node: String,
     pub infra_image: String,
     pub files_dir: std::path::PathBuf,
+    pub logs_dir: Option<std::path::PathBuf>,
     pub zfs_root: Option<String>,
     /// Set once the node has registered, before any worker starts.
     pub net: Arc<OnceLock<PodNetwork>>,
@@ -60,6 +61,7 @@ impl<R, C> Clone for Ctx<R, C> {
             node: self.node.clone(),
             infra_image: self.infra_image.clone(),
             files_dir: self.files_dir.clone(),
+            logs_dir: self.logs_dir.clone(),
             zfs_root: self.zfs_root.clone(),
             net: self.net.clone(),
             ips: self.ips.clone(),
@@ -164,7 +166,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             return self.stop().await;
         }
         if let Some(why) = pod::unsupported(&self.a.spec.pod) {
-            teardown(&self.ctx, &self.a.uid, self.grace()).await;
+            teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
             return self.finish(TaskState::Rejected, why, None).await;
         }
         let pod = match self.adopt().await {
@@ -173,11 +175,11 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 Ok(pod) => pod,
                 Err(Abort::Stopped) => return self.stop().await,
                 Err(Abort::Failed(why)) => {
-                    teardown(&self.ctx, &self.a.uid, self.grace()).await;
+                    teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
                     return self.finish(TaskState::Failed, why, None).await;
                 }
                 Err(Abort::Rejected(why)) => {
-                    teardown(&self.ctx, &self.a.uid, self.grace()).await;
+                    teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
                     return self.finish(TaskState::Rejected, why, None).await;
                 }
             },
@@ -207,7 +209,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
     }
 
     async fn stop(&mut self) {
-        teardown(&self.ctx, &self.a.uid, self.grace()).await;
+        teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
         if !self.status.state.is_terminal() {
             self.finish(TaskState::Shutdown, "stopped".into(), None)
                 .await;
@@ -283,7 +285,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             }
         }
         tracing::info!("removing an incomplete pod left by a previous run");
-        teardown(&self.ctx, &self.a.uid, self.grace()).await;
+        teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
         None
     }
 
@@ -587,7 +589,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         }
         loop {
             if let Some((state, message, code)) = finished(&pod) {
-                teardown(&self.ctx, &self.a.uid, self.grace()).await;
+                teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
                 return self.finish(state, message, code).await;
             }
             let next_restart = pod.members.iter().filter_map(|m| m.restart_at).min();
@@ -597,7 +599,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                     None => return,
                     Some(Msg::Stop) => return self.stop().await,
                     Some(Msg::Died { id, .. }) if id == pod.infra => {
-                        teardown(&self.ctx, &self.a.uid, self.grace()).await;
+                        teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
                         return self
                             .finish(TaskState::Failed, "the infra container exited".into(), None)
                             .await;
@@ -613,7 +615,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                     }
                     Some(Msg::Resync) => {
                         if !self.is_running(&pod.infra).await {
-                            teardown(&self.ctx, &self.a.uid, self.grace()).await;
+                            teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
                             return self
                                 .finish(TaskState::Failed, "the infra container exited".into(), None)
                                 .await;
@@ -774,9 +776,15 @@ async fn sleep_until(t: Option<Instant>) {
     }
 }
 
-/// Removes every container of the task and their rctl rules. Failures are
-/// logged; the next reconcile retries whatever is left.
-pub(crate) async fn teardown<R: Runtime, C: Control>(ctx: &Ctx<R, C>, uid: &str, grace: Duration) {
+/// Removes every container of the task and their rctl rules, keeping their
+/// output first if `keep` (see [`crate::output`]). Failures are logged; the
+/// next reconcile retries whatever is left.
+pub(crate) async fn teardown<R: Runtime, C: Control>(
+    ctx: &Ctx<R, C>,
+    uid: &str,
+    grace: Duration,
+    keep: bool,
+) {
     // The epair goes first: destroying its host end removes both ends, even
     // while the other is still in the jail.
     if let Some(net) = ctx.net.get().cloned() {
@@ -810,6 +818,14 @@ pub(crate) async fn teardown<R: Runtime, C: Control>(ctx: &Ctx<R, C>, uid: &str,
         if let Some(infra) = &infra {
             jails.push(pod::child_jail(infra, &c.id));
         }
+    }
+    if let Some(root) = ctx.logs_dir.as_ref().filter(|_| keep) {
+        let containers: Vec<(String, String)> = found
+            .iter()
+            .filter(|c| Some(&c.id) != infra.as_ref())
+            .filter_map(|c| Some((c.labels.get(LABEL_CONTAINER)?.clone(), c.id.clone())))
+            .collect();
+        output::save(ctx.runtime.as_ref(), root, uid, &containers).await;
     }
     if let Some(infra) = &infra {
         if let Err(e) = ctx.runtime.stop(infra, Duration::from_secs(1)).await {

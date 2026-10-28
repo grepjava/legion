@@ -418,6 +418,15 @@ Already there from phase 1: namespaces scope names and DNS
   parallelism, retries, the backoff limit, the deadline, global jobs,
   drains, deletion; schedules, history, the concurrency policies, suspend
   and the starting deadline), and a Job through a manager and an agent.
+- **Output of finished tasks** (`legion-agent::output`, DESIGN.md §3.8):
+  before removing a pod the agent saves the last 1 MiB of each
+  container's output, init containers' too, under
+  `<data-dir>/logs/<task uid>`, and removes it when the task is deleted.
+  `logs` falls back to it when the pod is gone, and a Service or Job with
+  no running task gives its last finished task. Tested: the file format
+  and bound, a completed task's logs by its name and its owner's, tail,
+  follow, exec refused, removal with the task; on weft-bsd, a failed init
+  container's output kept from real Podman.
 
 ### To do, in order
 
@@ -425,14 +434,11 @@ The first three are what the exit criterion rests on: who may do what,
 what may talk to what, and how much each team may use; all three are
 done.
 
-1. **Output of finished tasks**: the agent keeps a finished task's logs
-   (bounded) until the task is deleted, so `legion logs` works on a
-   completed Job; today the pod and its output go when the task ends.
-2. **Disruption budgets**: `maxUnavailable` honoured by drain and updates.
-3. **Security profiles**: the jail defaults in DESIGN.md §9, loosened per
+1. **Disruption budgets**: `maxUnavailable` honoured by drain and updates.
+2. **Security profiles**: the jail defaults in DESIGN.md §9, loosened per
    service only explicitly.
-4. **Metrics**: a Prometheus endpoint on each manager and agent.
-5. **Exit test**: two teams, each with its own user and namespace, deploy
+3. **Metrics**: a Prometheus endpoint on each manager and agent.
+4. **Exit test**: two teams, each with its own user and namespace, deploy
     on the same cluster; neither can read or change the other's objects,
     reach the other's tasks, or exceed its quota.
 
