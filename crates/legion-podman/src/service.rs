@@ -35,6 +35,8 @@ pub struct ServiceConfig {
     pub storage_driver: Option<String>,
     /// `--storage-opt` values, e.g. `zfs.fsname=zroot/legion/podman`.
     pub storage_opts: Vec<String>,
+    /// OCI hooks, in place of the system's: the agent's jail hook.
+    pub hooks_dir: Option<PathBuf>,
 }
 
 impl ServiceConfig {
@@ -50,6 +52,7 @@ impl ServiceConfig {
             runtime: Some("ocijail".to_owned()),
             storage_driver: None,
             storage_opts: Vec::new(),
+            hooks_dir: Some(run_dir.join("podman-hooks")),
         }
     }
 
@@ -74,6 +77,9 @@ impl ServiceConfig {
         }
         for opt in &self.storage_opts {
             args.extend(["--storage-opt".into(), opt.into()]);
+        }
+        if let Some(dir) = &self.hooks_dir {
+            args.extend(["--hooks-dir".into(), dir.clone().into()]);
         }
         let mut socket = OsString::from("unix://");
         socket.push(&self.socket);
@@ -308,6 +314,8 @@ mod tests {
                 "/var/run/legion/podman-tmp",
                 "--runtime",
                 "ocijail",
+                "--hooks-dir",
+                "/var/run/legion/podman-hooks",
                 "system",
                 "service",
                 "--time",

@@ -110,6 +110,8 @@ impl Member {
 struct Pod {
     infra: String,
     members: Vec<Member>,
+    /// Why the pod may not run on, found while it runs.
+    refused: Option<String>,
 }
 
 impl Pod {
@@ -281,6 +283,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 return Some(Pod {
                     infra: infra.id.clone(),
                     members,
+                    refused: None,
                 });
             }
         }
@@ -369,6 +372,9 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 .await
                 .map_err(|e| Abort::Failed(format!("starting init container {}: {e}", c.name)))?;
             self.limit(c, &infra, &id).await;
+            self.check_jail(c, &infra, &id, false)
+                .await
+                .map_err(Abort::Rejected)?;
             // It may run for long, or never end: a stop must not wait for it.
             let code = tokio::select! {
                 code = rt.wait(&id) => code.map_err(|e| {
@@ -403,11 +409,18 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 .await
                 .map_err(|e| Abort::Failed(format!("starting container {}: {e}", c.name)))?;
             self.limit(c, &infra, &id).await;
+            self.check_jail(c, &infra, &id, false)
+                .await
+                .map_err(Abort::Rejected)?;
             let mut m = Member::new(&c.name, &id, true);
             self.probe(&mut m);
             members.push(m);
         }
-        let pod = Pod { infra, members };
+        let pod = Pod {
+            infra,
+            members,
+            refused: None,
+        };
         self.ready = pod.ready();
         self.report(TaskState::Running, "").await;
         Ok(pod)
@@ -502,6 +515,48 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         }
     }
 
+    /// Checks that a container's jail has its profile (DESIGN.md §9), which
+    /// Legion's hook sets before the container's process starts
+    /// ([`crate::hook`]). A jail without it means the hook did not run, and
+    /// the pod is refused. With `fix`, for a pod adopted from an agent
+    /// older than the hook, the running jail is tightened instead. A jail
+    /// already gone has nothing left to check.
+    async fn check_jail(
+        &self,
+        c: &legion_api::service::Container,
+        infra: &str,
+        id: &str,
+        fix: bool,
+    ) -> Result<(), String> {
+        let want = pod::jail_params(&c.security);
+        let jail = pod::child_jail(infra, id);
+        let name = c.name.clone();
+        blocking(&self.ctx.sys, move |sys| {
+            let names = want.each_ref().map(|(k, _)| *k);
+            let got = match sys.jail_get(&jail, &names) {
+                Ok(got) => got,
+                Err(legion_sys::Error::NotFound(_)) => return Ok(()),
+                Err(e) => return Err(format!("reading container {name}'s jail: {e}")),
+            };
+            let Some((k, v)) = want.iter().find(|(k, v)| got.get(*k) != Some(v)) else {
+                return Ok(());
+            };
+            if fix {
+                let params: Vec<(&str, &str)> =
+                    want.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                tracing::info!(container = %name, "setting the jail profile on an adopted container");
+                return sys
+                    .jail_set(&jail, &params)
+                    .map_err(|e| format!("setting container {name}'s jail profile: {e}"));
+            }
+            Err(format!(
+                "container {name}'s jail has {k}={}, not {v}: Legion's jail hook did not run,                  so the jail is not locked down",
+                got.get(*k).map_or("?", String::as_str)
+            ))
+        })
+        .await
+    }
+
     /// Starts probing a container run that has just begun. Until its
     /// readiness probe passes, the container is not ready.
     fn probe(&self, m: &mut Member) {
@@ -574,8 +629,17 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 continue;
             }
             let (name, id) = (pod.members[i].name.clone(), pod.members[i].id.clone());
-            if let Some(c) = self.pod().containers.iter().find(|c| c.name == name) {
-                self.limit(c, &pod.infra, &id).await;
+            if let Some(c) = self
+                .pod()
+                .containers
+                .iter()
+                .find(|c| c.name == name)
+                .cloned()
+            {
+                self.limit(&c, &pod.infra, &id).await;
+                if let Err(why) = self.check_jail(&c, &pod.infra, &id, true).await {
+                    pod.refused = Some(why);
+                }
             }
             self.probe(&mut pod.members[i]);
         }
@@ -588,6 +652,10 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             }
         }
         loop {
+            if let Some(why) = pod.refused.take() {
+                teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
+                return self.finish(TaskState::Rejected, why, None).await;
+            }
             if let Some((state, message, code)) = finished(&pod) {
                 teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
                 return self.finish(state, message, code).await;
@@ -687,6 +755,9 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                     .cloned()
                 {
                     self.limit(&c, &pod.infra, &id).await;
+                    if let Err(why) = self.check_jail(&c, &pod.infra, &id, false).await {
+                        pod.refused = Some(why);
+                    }
                 }
                 self.probe(&mut pod.members[i]);
                 self.ready = pod.ready();

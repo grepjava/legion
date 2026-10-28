@@ -51,6 +51,9 @@ pub trait Sys: Send + Sync {
     fn jails(&self) -> Result<Vec<Jail>>;
     /// Sets parameters on an existing jail (`jail -m`).
     fn jail_set(&self, jail: &str, params: &[(&str, &str)]) -> Result<()>;
+    /// Reads a jail's parameters (`jls -j <jail> -n`); booleans read
+    /// `true` or `false`. [`Error::NotFound`] if the jail is gone.
+    fn jail_get(&self, jail: &str, params: &[&str]) -> Result<BTreeMap<String, String>>;
 
     // Interfaces and routes.
 

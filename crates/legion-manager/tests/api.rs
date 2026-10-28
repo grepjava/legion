@@ -1302,3 +1302,88 @@ async fn namespace_quotas_refuse_what_would_not_fit() {
     try_apply(free).await.unwrap();
     m.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn namespaces_decide_how_far_jails_loosen() {
+    let m = Running::start().await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let api = m.objects().await;
+    let try_apply = |req: ApplyRequest| {
+        let mut api = api.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match api.apply(req.clone()).await {
+                    Err(s)
+                        if s.code() == Code::Unavailable
+                            && tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    r => return r.map(|_| ()),
+                }
+            }
+        }
+    };
+    let pod = |security: serde_json::Value| {
+        serde_json::json!({ "containers": [
+            { "name": "c", "image": "c:1", "security": security }
+        ] })
+    };
+    let svc = |security| {
+        object(
+            "Service",
+            "team",
+            "ping",
+            serde_json::json!({ "pod": pod(security) }),
+        )
+    };
+    let job = |security| {
+        object(
+            "Job",
+            "team",
+            "fsck",
+            serde_json::json!({ "pod": pod(security) }),
+        )
+    };
+    let cron = |security| {
+        object(
+            "CronJob",
+            "team",
+            "nightly",
+            serde_json::json!({ "schedule": "0 3 * * *", "job": { "pod": pod(security) } }),
+        )
+    };
+    let raw = serde_json::json!({ "allow": ["rawSockets"] });
+    let low = serde_json::json!({ "securelevel": -1, "enforceStatfs": 1 });
+
+    // Without a word from the namespace, nothing is loosened.
+    try_apply(svc(serde_json::json!({}))).await.unwrap();
+    assert_eq!(
+        denied(try_apply(svc(raw.clone())).await),
+        "namespace team does not allow its containers' jails rawSockets \
+         (the cluster admin sets spec.security.allow on the Namespace)"
+    );
+    try_apply(object("Namespace", "", "team", serde_json::json!({})))
+        .await
+        .unwrap();
+    denied(try_apply(svc(raw.clone())).await);
+
+    try_apply(object(
+        "Namespace",
+        "",
+        "team",
+        serde_json::json!({ "security": { "allow": ["rawSockets", "securelevel"] } }),
+    ))
+    .await
+    .unwrap();
+    try_apply(svc(raw.clone())).await.unwrap();
+    let why = denied(try_apply(job(low.clone())).await);
+    assert!(why.contains("jails enforceStatfs ("), "{why}");
+    let why = denied(try_apply(cron(low)).await);
+    assert!(why.contains("jails enforceStatfs ("), "{why}");
+    try_apply(cron(serde_json::json!({ "securelevel": 0 })))
+        .await
+        .unwrap();
+    m.stop().await;
+}

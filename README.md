@@ -95,6 +95,25 @@ spec:
   quota: { cpu: 4, memory: 8Gi, tasks: 20, volumes: 5, storage: 100Gi }
 ```
 
+Containers' jails get no raw sockets, `chflags`, mlock, SysV IPC or
+mounts, at `securelevel` 2 and `enforce_statfs` 2. A container's `security`
+loosens that only as far as its namespace allows, which again only the
+cluster admin sets:
+
+```yaml
+kind: Namespace
+metadata: { name: shop }
+spec:
+  security: { allow: [rawSockets] }   # also chflags, mlock, sysvipc,
+                                      # securelevel, enforceStatfs
+---
+# in a Service's pod
+containers:
+  - name: probe
+    image: "registry.example/shop/netcheck:1"
+    security: { allow: [rawSockets] }   # ping works here
+```
+
 Jobs run pods to completion, retrying failures; CronJobs make Jobs on a
 schedule (UTC):
 

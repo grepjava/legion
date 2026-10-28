@@ -9,6 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::admit::{Invalid, Spec, check_absolute, check_name, field, index};
 use crate::quantity::{Bytes, Cpu, Duration};
+use crate::security::Security;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -267,6 +268,9 @@ pub struct Container {
     /// Mounted read-only at `target`, by default `/run/configs/<name>`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub configs: Vec<FileRef>,
+    /// How its jail is loosened from Legion's defaults.
+    #[serde(default, skip_serializing_if = "Security::is_default")]
+    pub security: Security,
 }
 
 impl Container {
@@ -303,6 +307,7 @@ impl Container {
             }
         }
         self.resources.admit(&field(path, "resources"))?;
+        self.security.admit(&field(path, "security"))?;
         if init && !self.probes.is_empty() {
             return Err(Invalid::new(
                 field(path, "probes"),

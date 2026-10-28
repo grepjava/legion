@@ -214,6 +214,7 @@ impl ApiService {
                 ),
             };
             crate::quota::check(&self.store, &object)?;
+            crate::security::check(&self.store, &object)?;
             if req.dry_run {
                 return Ok(ApplyResponse {
                     object: Some((&object).into()),

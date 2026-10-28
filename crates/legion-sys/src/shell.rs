@@ -187,9 +187,33 @@ impl<R: Runner> Sys for Shell<R> {
     }
 
     fn jail_set(&self, jail: &str, params: &[(&str, &str)]) -> Result<()> {
-        let mut a = vec!["-m".to_owned(), format!("name={jail}")];
+        // `name=<parent>.<child>` would ask to move the jail under that
+        // parent; a child jail is named by its jid instead.
+        let target = if jail.contains('.') {
+            let jid = self.run("jls", &args(["-j", jail, "jid"]))?;
+            format!("jid={}", jid.trim())
+        } else {
+            format!("name={jail}")
+        };
+        let mut a = vec!["-m".to_owned(), target];
         a.extend(params.iter().map(|(k, v)| format!("{k}={v}")));
         self.run("jail", &a).map(drop)
+    }
+
+    fn jail_get(&self, jail: &str, params: &[&str]) -> Result<BTreeMap<String, String>> {
+        let mut a = args(["-j", jail, "--libxo=json", "-n"]);
+        a.extend(params.iter().map(|p| (*p).to_owned()));
+        let out = self.output("jls", &a, None)?;
+        if !out.success {
+            if out.stderr.contains("not found") {
+                return Err(Error::NotFound(format!("jail {jail}")));
+            }
+            return Err(failed("jls", &a, &out));
+        }
+        parse_jail_params(&out.stdout).map_err(|message| Error::Parse {
+            command: describe("jls", &a),
+            message,
+        })
     }
 
     fn interfaces(&self, jail: Option<&str>) -> Result<Vec<String>> {
@@ -648,6 +672,27 @@ fn parse_jls(out: &str) -> Result<Vec<Jail>, String> {
         .collect()
 }
 
+/// One jail's parameters from `jls --libxo=json -n`, which writes booleans
+/// as JSON booleans and everything else as strings.
+fn parse_jail_params(out: &str) -> Result<BTreeMap<String, String>, String> {
+    let parsed: serde_json::Value = serde_json::from_str(out).map_err(|e| e.to_string())?;
+    let jail = parsed
+        .pointer("/jail-information/jail/0")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("no jail")?;
+    jail.iter()
+        .map(|(k, v)| {
+            let v = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Number(n) => n.to_string(),
+                other => return Err(format!("{k}: unexpected {other}")),
+            };
+            Ok((k.clone(), v))
+        })
+        .collect()
+}
+
 fn parse_dataset(line: &str) -> Option<Dataset> {
     let mut cols = line.split('\t');
     let name = cols.next()?.to_owned();
@@ -841,6 +886,42 @@ mod tests {
         )]);
         let jails = sh.jails().unwrap();
         assert_eq!(jails.len(), 2);
+        let sh = Script::shell(vec![
+            (
+                "jls -j lgq.c --libxo=json -n allow.raw_sockets enforce_statfs securelevel",
+                // Captured on FreeBSD 15.1.
+                ok(
+                    r#"{"__version": "2", "jail-information": {"jail": [{"allow.raw_sockets":false,"enforce_statfs":"2","securelevel":"2"}]}}"#,
+                ),
+            ),
+            (
+                "jls -j gone --libxo=json -n securelevel",
+                err("jls: jail \"gone\" not found\n"),
+            ),
+            ("jls -j lgq.c jid", ok("12\n")),
+            ("jail -m jid=12 securelevel=2", ok("")),
+            ("jail -m name=lgq children.max=2", ok("")),
+        ]);
+        let params = sh
+            .jail_get(
+                "lgq.c",
+                &["allow.raw_sockets", "enforce_statfs", "securelevel"],
+            )
+            .unwrap();
+        assert_eq!(
+            params.into_iter().collect::<Vec<_>>(),
+            [
+                ("allow.raw_sockets".to_owned(), "false".to_owned()),
+                ("enforce_statfs".to_owned(), "2".to_owned()),
+                ("securelevel".to_owned(), "2".to_owned()),
+            ]
+        );
+        assert!(matches!(
+            sh.jail_get("gone", &["securelevel"]),
+            Err(Error::NotFound(_))
+        ));
+        sh.jail_set("lgq.c", &[("securelevel", "2")]).unwrap();
+        sh.jail_set("lgq", &[("children.max", "2")]).unwrap();
         assert_eq!(
             jails[1],
             Jail {

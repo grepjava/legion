@@ -183,12 +183,13 @@ async fn start_agent(
     control: GrpcControl,
     mut stopped: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<(tokio::task::JoinHandle<()>, PodmanService)> {
-    let podman = PodmanService::start(
-        ServiceConfig::new(&opts.data_dir, &opts.run_dir),
-        Duration::from_secs(60),
-    )
-    .await
-    .context("starting Legion's Podman service")?;
+    let podman_config = ServiceConfig::new(&opts.data_dir, &opts.run_dir);
+    if let Some(dir) = &podman_config.hooks_dir {
+        legion_agent::hook::install(dir).context("installing Legion's jail hook")?;
+    }
+    let podman = PodmanService::start(podman_config, Duration::from_secs(60))
+        .await
+        .context("starting Legion's Podman service")?;
 
     let mut config = AgentConfig::new(node, opts.run_dir.join("tasks"));
     config.logs_dir = Some(opts.data_dir.join("logs"));

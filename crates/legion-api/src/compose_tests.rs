@@ -28,6 +28,8 @@ services:
     secrets: [db_password]
     configs: [{ source: nginx_conf, target: /etc/nginx/nginx.conf }]
     depends_on: [db]
+    cap_add: [NET_RAW, SYS_ADMIN]
+    cap_drop: [ALL]
     deploy:
       replicas: 3
       update_config: { parallelism: 1, delay: 10s, order: start-first, failure_action: rollback }
@@ -153,6 +155,10 @@ fn converts_a_stack() {
     );
     assert_eq!(web.pod.restart_policy.max_attempts, 3);
     assert_eq!(web.placement.constraints, ["node.role == worker"]);
+    assert_eq!(
+        c.security.allow,
+        [crate::security::Allow::RawSockets].into()
+    );
     assert_eq!(stack.objects[4].metadata.labels["tier"], "front");
 
     let db = spec(&stack, "db");
@@ -188,6 +194,7 @@ fn converts_a_stack() {
         "volumes.db_data: named db-data in Legion",
         "services.web.restart: ignored",
         "services.web.depends_on: ignored",
+        "services.web.cap_add: SYS_ADMIN: not supported, ignored",
         "services.web.ports[1]: the host address is ignored",
         "services.db.volumes[1]: bind mounts of host paths are not supported",
         "networks: not separated yet",

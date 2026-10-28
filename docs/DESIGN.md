@@ -969,6 +969,31 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
   are generated on the node; only public keys go through the managers.
 - **Jail defaults**: no raw sockets, no mounting, `enforce_statfs=2`,
   `securelevel=2` where possible; profiles loosen these explicitly.
+  Built (phase 3): every container's jail has no raw sockets, no
+  `chflags`, no mlock, no SysV IPC and no mounting, with
+  `enforce_statfs=2` and `securelevel=2`. A container's `security`
+  (`allow: [rawSockets, chflags, mlock, sysvipc]`, `securelevel` -1 to 3,
+  `enforceStatfs` 1 or 2) loosens that, and admission refuses a Service,
+  Job or CronJob that loosens more than its Namespace's
+  `spec.security.allow` lists (the same names, plus `securelevel` for a
+  level below 2 and `enforceStatfs` for 1). Namespaces are cluster-scoped,
+  so only the cluster admin decides. Compose's `cap_add: [NET_RAW]` asks
+  for raw sockets. How it is applied: through Podman, ocijail gives every
+  jail raw sockets, `chflags` and `enforce_statfs=1`, and annotations can
+  only add to that. The kernel refuses a child jail more than its parent
+  has, so a locked-down infra jail would only stop ocijail making the
+  containers. Legion's Podman therefore runs a `createRuntime` hook
+  (`--hooks-dir`), which ocijail calls once a container's jail exists and
+  before its process enters it. The hook sets the parameters from the
+  container's `legion.jail` annotation with `jail -m`, and a failing hook
+  fails the start. What a child may have only if its parent does (mlock,
+  SysV IPC) is asked of ocijail for the infra jail and the container. A
+  pod's containers that allow SysV IPC share the infra jail's namespace.
+  After each start the agent reads the jail's parameters back and refuses
+  the pod if the hook did not run. A pod adopted from an agent older than
+  the hook has its running jails tightened in place, which the host may
+  do, rather than being restarted. The infra jail keeps ocijail's
+  defaults; it runs only `sleep`, and no session reaches it.
 - **No host networking by accident**: the executor verifies every task's infra
   jail has `vnet=new` before starting containers (see 6.2).
 

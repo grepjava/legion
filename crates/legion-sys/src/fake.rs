@@ -40,6 +40,8 @@ struct State {
     next_jid: u32,
     next_epair: u32,
     jails: BTreeMap<String, Jail>,
+    /// Parameters set with `jail -m`, by jail name.
+    jail_params: BTreeMap<String, BTreeMap<String, String>>,
     interfaces: BTreeMap<String, FakeInterface>,
     routes: BTreeMap<Option<String>, BTreeMap<Destination, Ipv4Addr>>,
     /// Routes out of an interface, by stack and destination.
@@ -133,6 +135,7 @@ impl FakeSys {
         }
         for j in &gone {
             s.jails.remove(j);
+            s.jail_params.remove(j);
             s.routes.remove(&Some(j.clone()));
         }
         for i in s.interfaces.values_mut() {
@@ -296,7 +299,28 @@ impl Sys for FakeSys {
                     .map_err(|_| fail("jail -m", format!("children.max: invalid {v:?}")))?;
             }
         }
+        let kept = s.jail_params.entry(jail.to_owned()).or_default();
+        for (k, v) in params {
+            kept.insert((*k).to_owned(), (*v).to_owned());
+        }
         Ok(())
+    }
+
+    fn jail_get(&self, jail: &str, params: &[&str]) -> Result<BTreeMap<String, String>> {
+        let s = self.state();
+        if !s.jails.contains_key(jail) {
+            return Err(Error::NotFound(format!("jail {jail}")));
+        }
+        let kept = s.jail_params.get(jail);
+        params
+            .iter()
+            .map(|p| {
+                let v = kept
+                    .and_then(|k| k.get(*p))
+                    .ok_or_else(|| fail("jls", format!("{p} was never set")))?;
+                Ok(((*p).to_owned(), v.clone()))
+            })
+            .collect()
     }
 
     fn interfaces(&self, jail: Option<&str>) -> Result<Vec<String>> {

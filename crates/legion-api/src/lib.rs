@@ -23,6 +23,7 @@ pub mod policy;
 pub mod quantity;
 pub mod quota;
 pub mod rbac;
+pub mod security;
 pub mod service;
 pub mod task;
 pub mod volume;

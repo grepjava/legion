@@ -24,6 +24,7 @@ use tokio::task::JoinSet;
 pub mod control;
 pub mod fake;
 mod files;
+pub mod hook;
 mod output;
 pub mod pod;
 pub mod policing;

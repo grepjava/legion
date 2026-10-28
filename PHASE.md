@@ -434,17 +434,33 @@ Already there from phase 1: namespaces scope names and DNS
   `update.maxUnavailable`, which nothing read. Tested in the planner: the
   fewest ready tasks during a drain and during an all-at-once update,
   unbounded, at 1 and at 0, and a drain while another slot has failed.
+- **Security profiles** (`legion_api::security`, `legion-manager::security`,
+  `legion-agent::hook`, DESIGN.md §9): containers' jails have no raw
+  sockets, `chflags`, mlock, SysV IPC or mounting, with `enforce_statfs=2`
+  and `securelevel=2`. A container's `security` loosens them, only as far
+  as its Namespace's `spec.security.allow` (cluster admin only) lets it;
+  admission refuses Services, Jobs and CronJobs that go further. The
+  parameters are set by a `createRuntime` hook in Legion's Podman before
+  the container's process starts, since ocijail cannot be told through
+  Podman; the agent checks them after each start and refuses a pod whose
+  jail lacks them, and tightens adopted pods from older agents in place.
+  Compose's `cap_add: [NET_RAW]` maps to raw sockets. Tested: the profile
+  and its bounds, admission through the API (no namespace, an empty one,
+  allowed and refused loosenings for each kind), the annotations, the
+  fake runtime with and without the hook and an adopted pod tightened;
+  the hook script against a jail on FreeBSD; and on weft-bsd with real
+  Podman and ocijail, a locked-down container refused `ping` at
+  securelevel 2 while one allowed raw sockets pinged.
 
 ### To do, in order
 
 The first three are what the exit criterion rests on: who may do what,
 what may talk to what, and how much each team may use; all three are
-done.
+done, as are the jail defaults that keep a team's tasks from more than
+their own jails.
 
-1. **Security profiles**: the jail defaults in DESIGN.md §9, loosened per
-   service only explicitly.
-2. **Metrics**: a Prometheus endpoint on each manager and agent.
-3. **Exit test**: two teams, each with its own user and namespace, deploy
+1. **Metrics**: a Prometheus endpoint on each manager and agent.
+2. **Exit test**: two teams, each with its own user and namespace, deploy
     on the same cluster; neither can read or change the other's objects,
     reach the other's tasks, or exceed its quota.
 

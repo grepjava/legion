@@ -5,7 +5,9 @@
 //! jail goes away, stopping the infra jail kills the pod, and every death
 //! is reported as a `died` event carrying the container's labels. Starting
 //! a container clears its jail's rctl rules, as ocijail with rctl support
-//! does. Exec runs nothing: each container answers with the exit code
+//! does. A child jail gets ocijail's parameters (raw sockets, chflags,
+//! `enforce_statfs=1`), then those of the `legion.jail` annotation, as
+//! Legion's hook sets them, unless [`FakeRuntime::skip_jail_hook`]. Exec runs nothing: each container answers with the exit code
 //! set by [`FakeRuntime::set_exec`], 0 by default. An attached exec of
 //! `cat` echoes its stdin; any other command prints itself and the
 //! terminal size, if it has one. Logs are what [`FakeRuntime::log`] wrote.
@@ -24,7 +26,7 @@ use legion_podman::{
 use legion_sys::FakeSys;
 use tokio::sync::broadcast;
 
-use crate::pod::{ANNOTATION_PARENT, ANNOTATION_VNET, LABEL_ROLE, child_jail};
+use crate::pod::{ANNOTATION_JAIL, ANNOTATION_PARENT, ANNOTATION_VNET, LABEL_ROLE, child_jail};
 use crate::runtime::Runtime;
 
 pub struct FakeRuntime {
@@ -42,6 +44,8 @@ struct State {
     containers: BTreeMap<String, Container>,
     /// Ignore the VNET annotation, as a runtime without support would.
     ignore_vnet: bool,
+    /// Run without Legion's jail hook, as a Podman without `--hooks-dir`.
+    no_hook: bool,
     /// Exit code of init containers, which exit as soon as they start.
     init_exit_code: i32,
     /// Init containers run until stopped instead.
@@ -126,6 +130,10 @@ impl FakeRuntime {
 
     pub fn ignore_vnet(&self) {
         self.state().ignore_vnet = true;
+    }
+
+    pub fn skip_jail_hook(&self) {
+        self.state().no_hook = true;
     }
 
     pub fn set_init_exit_code(&self, code: i32) {
@@ -333,6 +341,19 @@ impl Runtime for FakeRuntime {
                 }
                 let name = child_jail(parent, id);
                 self.sys.add_jail(&name, false);
+                let mut params = vec![
+                    ("allow.raw_sockets", "true"),
+                    ("allow.chflags", "true"),
+                    ("enforce_statfs", "1"),
+                    ("securelevel", "-1"),
+                ];
+                if !s.no_hook
+                    && let Some(hooked) = c.spec.annotations.get(ANNOTATION_JAIL)
+                {
+                    params.extend(hooked.split(' ').filter_map(|p| p.split_once('=')));
+                }
+                legion_sys::Sys::jail_set(self.sys.as_ref(), &name, &params)
+                    .expect("the jail exists");
                 name
             }
             None => {

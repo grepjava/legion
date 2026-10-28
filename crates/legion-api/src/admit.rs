@@ -58,6 +58,12 @@ pub struct NamespaceSpec {
     /// Limits on what the namespace's tasks and volumes may take.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<crate::quota::Quota>,
+    /// How far the namespace's containers may loosen their jails.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::security::NamespaceSecurity::is_empty"
+    )]
+    pub security: crate::security::NamespaceSecurity,
 }
 
 impl Spec for NamespaceSpec {

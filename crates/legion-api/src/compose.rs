@@ -355,6 +355,21 @@ impl Converter<'_> {
                 "user" => {
                     container.insert("user".into(), json!(scalar(val)));
                 }
+                // Jails have no capabilities; raw sockets are what NET_RAW
+                // gives. The namespace must allow them (DESIGN.md §9).
+                "cap_add" => {
+                    for cap in strings(val) {
+                        match cap.trim_start_matches("CAP_") {
+                            "NET_RAW" => {
+                                container
+                                    .insert("security".into(), json!({ "allow": ["rawSockets"] }));
+                            }
+                            other => self.warn(format!("{at}: {other}: not supported, ignored")),
+                        }
+                    }
+                }
+                // Nothing is granted to drop.
+                "cap_drop" => {}
                 "env_file" => {
                     for file in strings(val) {
                         let text =

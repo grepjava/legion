@@ -106,6 +106,7 @@ async fn agent_runs_a_real_pod() {
     if let Ok(runtime) = std::env::var("LEGION_OCIJAIL") {
         config.runtime = Some(runtime);
     }
+    legion_agent::hook::install(config.hooks_dir.as_ref().unwrap()).unwrap();
     let service = PodmanService::start(config, Duration::from_secs(30))
         .await
         .unwrap();
@@ -162,6 +163,11 @@ async fn agent_runs_a_real_pod() {
             "secrets": [{ "name": "greeting" }],
             "configs": [{ "name": "app-conf", "target": "/etc/app.conf" }],
             "resources": { "limits": { "memory": "256Mi", "maxproc": 32 } },
+        }, {
+            "name": "pinger",
+            "image": IMAGE,
+            "command": ["/bin/sleep", "3600"],
+            "security": { "allow": ["rawSockets"] },
         }],
         "restartPolicy": { "condition": "any", "delay": "1s" },
         "stopGracePeriod": "2s",
@@ -263,6 +269,43 @@ async fn agent_runs_a_real_pod() {
     let rules = sh(&format!("rctl jail:{child}"));
     assert!(rules.contains("memoryuse:sigkill=268435456"), "{rules}");
     assert!(rules.contains("maxproc:deny=32"), "{rules}");
+    // The jails are locked down (DESIGN.md §9): Legion's hook set the
+    // profile before the containers' processes started. Only the container
+    // allowed raw sockets can ping.
+    let params = sh(&format!(
+        "jls -j {child} -n allow.raw_sockets allow.chflags enforce_statfs securelevel"
+    ));
+    assert_eq!(
+        params.trim(),
+        "allow.noraw_sockets allow.nochflags enforce_statfs=2 securelevel=2"
+    );
+    let pinger = podman.inspect("lab_web-1_pinger").await.unwrap();
+    for (id, want) in [
+        (
+            &app.id, "2
+",
+        ),
+        (
+            &pinger.id,
+            "pinged
+2
+",
+        ),
+    ] {
+        let out = podman
+            .exec(
+                id,
+                &[
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "/sbin/ping -c1 -t2 10.200.0.1 >/dev/null 2>&1 && echo pinged;                      /sbin/sysctl -n kern.securelevel"
+                        .into(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+    }
     // The limit holds inside the container.
     let forks = podman
         .exec(

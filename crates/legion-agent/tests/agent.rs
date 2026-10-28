@@ -425,6 +425,108 @@ async fn refuses_a_pod_without_vnet() {
     assert_eq!(h.rt.created(), 1, "no app container was created");
 }
 
+/// The profile of a pod member's jail, as `k=v` in name order.
+fn jail_profile(h: &Harness, pod: &str, container: &str) -> Vec<String> {
+    let jail = legion_agent::pod::child_jail(
+        &h.rt.id_of(pod).unwrap(),
+        &h.rt.id_of(&format!("{pod}_{container}")).unwrap(),
+    );
+    let params = [
+        "allow.raw_sockets",
+        "allow.chflags",
+        "enforce_statfs",
+        "securelevel",
+    ];
+    h.sys
+        .jail_get(&jail, &params)
+        .unwrap()
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jails_are_locked_down() {
+    let mut h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task(
+            "app-1",
+            r#"
+containers:
+  - { name: app, image: "app:1" }
+  - name: ping
+    image: "app:1"
+    security: { allow: [rawSockets, mlock, sysvipc], securelevel: 0 }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    let locked = [
+        "allow.chflags=false",
+        "allow.raw_sockets=false",
+        "enforce_statfs=2",
+        "securelevel=2",
+    ];
+    assert_eq!(jail_profile(&h, "shop_app-1", "app"), locked);
+    assert_eq!(
+        jail_profile(&h, "shop_app-1", "ping"),
+        [
+            "allow.chflags=false",
+            "allow.raw_sockets=true",
+            "enforce_statfs=2",
+            "securelevel=0"
+        ]
+    );
+    // What a child jail may have only if its parent has it is asked of
+    // ocijail for both, and only for the container that wants it.
+    let infra = h.rt.spec("shop_app-1").unwrap().annotations;
+    assert_eq!(infra["org.freebsd.jail.allow.mlock"], "true");
+    assert_eq!(infra["org.freebsd.jail.sysvshm"], "new");
+    let ping = h.rt.spec("shop_app-1_ping").unwrap().annotations;
+    assert_eq!(ping["org.freebsd.jail.sysvshm"], "inherit");
+    let app = h.rt.spec("shop_app-1_app").unwrap().annotations;
+    assert!(!app.contains_key("org.freebsd.jail.allow.mlock"));
+
+    // A pod adopted from an agent older than the profile is tightened in
+    // place rather than restarted.
+    h.stop_agent().await;
+    let jail = legion_agent::pod::child_jail(
+        &h.rt.id_of("shop_app-1").unwrap(),
+        &h.rt.id_of("shop_app-1_app").unwrap(),
+    );
+    h.sys
+        .jail_set(
+            &jail,
+            &[("allow.raw_sockets", "true"), ("securelevel", "-1")],
+        )
+        .unwrap();
+    let created = h.rt.created();
+    h.start_agent();
+    eventually("tightened", || {
+        jail_profile(&h, "shop_app-1", "app") == locked
+    })
+    .await;
+    assert_eq!(h.status(&key).state, TaskState::Running);
+    assert_eq!(h.rt.created(), created);
+
+    // Without the hook, a new pod is refused.
+    h.rt.skip_jail_hook();
+    let bare = h
+        .task("bare-1", r#"containers: [{ name: app, image: "app:1" }]"#)
+        .await;
+    let status = h.wait_state(&bare, TaskState::Rejected).await;
+    assert!(
+        status.message.contains("jail hook did not run"),
+        "{}",
+        status.message
+    );
+    eventually("refused pod removed", || {
+        !h.running().iter().any(|n| n.starts_with("shop_bare-1"))
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn init_containers_run_first_and_can_be_stopped() {
     let h = Harness::new().await;

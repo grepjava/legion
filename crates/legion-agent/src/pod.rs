@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use legion_api::security::{Allow, Security};
 use legion_api::service::{Container, PodSpec};
 use legion_podman::ContainerSpec;
 use legion_sys::{RctlRule, Resource};
@@ -18,6 +19,15 @@ pub const LABEL_CONTAINER: &str = "legion.container";
 
 pub const ANNOTATION_VNET: &str = "org.freebsd.jail.vnet";
 pub const ANNOTATION_PARENT: &str = "org.freebsd.parentJail";
+/// The jail parameters Legion's hook sets on a container's jail before its
+/// process starts (see [`crate::hook`]).
+pub const ANNOTATION_JAIL: &str = "legion.jail";
+const ANNOTATION_MLOCK: &str = "org.freebsd.jail.allow.mlock";
+const ANNOTATION_SYSV: [&str; 3] = [
+    "org.freebsd.jail.sysvmsg",
+    "org.freebsd.jail.sysvsem",
+    "org.freebsd.jail.sysvshm",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -72,15 +82,32 @@ fn labels(node: &str, a: &Assignment, role: Role, container: &str) -> BTreeMap<S
 }
 
 /// The infra container: an empty jail with its own VNET that the pod's
-/// containers run inside.
+/// containers run inside. A child jail may have only what its parent has,
+/// so it allows what any of the pod's containers needs from it: mlock,
+/// and SysV IPC, which those containers then share.
 pub fn infra_spec(node: &str, a: &Assignment, image: &str) -> ContainerSpec {
+    let mut annotations = BTreeMap::from([(ANNOTATION_VNET.to_owned(), "new".to_owned())]);
+    let allows = |x| {
+        a.spec
+            .pod
+            .containers()
+            .any(|c| c.security.allow.contains(&x))
+    };
+    if allows(Allow::Mlock) {
+        annotations.insert(ANNOTATION_MLOCK.to_owned(), "true".to_owned());
+    }
+    if allows(Allow::Sysvipc) {
+        for k in ANNOTATION_SYSV {
+            annotations.insert(k.to_owned(), "new".to_owned());
+        }
+    }
     ContainerSpec {
         name: container_name(a, None),
         image: image.to_owned(),
         entrypoint: vec!["/bin/sleep".into()],
         command: vec!["2147483647".into()],
         labels: labels(node, a, Role::Infra, ""),
-        annotations: [(ANNOTATION_VNET.to_owned(), "new".to_owned())].into(),
+        annotations,
         stop_timeout: Some(1),
         ..Default::default()
     }
@@ -107,10 +134,46 @@ pub fn container_spec(
         work_dir: c.working_dir.clone(),
         user: c.user.clone(),
         labels: labels(node, a, role, &c.name),
-        annotations: [(ANNOTATION_PARENT.to_owned(), infra_id.to_owned())].into(),
+        annotations: container_annotations(&c.security, infra_id),
         stop_timeout: Some(a.spec.pod.stop_grace_period.millis().div_ceil(1000)),
         ..Default::default()
     }
+}
+
+fn container_annotations(s: &Security, infra_id: &str) -> BTreeMap<String, String> {
+    let params = jail_params(s)
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut annotations = BTreeMap::from([
+        (ANNOTATION_PARENT.to_owned(), infra_id.to_owned()),
+        (ANNOTATION_JAIL.to_owned(), params),
+    ]);
+    if s.allow.contains(&Allow::Mlock) {
+        annotations.insert(ANNOTATION_MLOCK.to_owned(), "true".to_owned());
+    }
+    if s.allow.contains(&Allow::Sysvipc) {
+        for k in ANNOTATION_SYSV {
+            annotations.insert(k.to_owned(), "inherit".to_owned());
+        }
+    }
+    annotations
+}
+
+/// The parameters a container's jail must have (DESIGN.md §9). ocijail
+/// gives every jail raw sockets, chflags and `enforce_statfs=1`, and cannot
+/// be told otherwise through Podman, so Legion's hook sets these on the new
+/// jail, and the agent checks them once the container runs. mlock and SysV
+/// IPC are off unless ocijail is asked for them.
+pub fn jail_params(s: &Security) -> [(&'static str, String); 4] {
+    let allow = |a| s.allow.contains(&a).to_string();
+    [
+        ("allow.raw_sockets", allow(Allow::RawSockets)),
+        ("allow.chflags", allow(Allow::Chflags)),
+        ("enforce_statfs", s.enforce_statfs.to_string()),
+        ("securelevel", s.securelevel.to_string()),
+    ]
 }
 
 /// The jail a pod member runs in: a child of the infra jail. ocijail names
@@ -173,6 +236,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn jail_annotations() {
+        let mut s = Security::default();
+        let a = container_annotations(&s, "i");
+        assert_eq!(
+            a[ANNOTATION_JAIL],
+            "allow.raw_sockets=false allow.chflags=false enforce_statfs=2 securelevel=2"
+        );
+        assert_eq!(a.len(), 2);
+        s.allow = [Allow::RawSockets, Allow::Mlock, Allow::Sysvipc].into();
+        s.securelevel = -1;
+        let a = container_annotations(&s, "i");
+        assert_eq!(
+            a[ANNOTATION_JAIL],
+            "allow.raw_sockets=true allow.chflags=false enforce_statfs=2 securelevel=-1"
+        );
+        assert_eq!(a[ANNOTATION_MLOCK], "true");
+        assert_eq!(a["org.freebsd.jail.sysvshm"], "inherit");
+    }
+
+    #[test]
     fn rules_from_limits() {
         let c = Container {
             name: "web".into(),
@@ -196,6 +279,7 @@ mod tests {
             volume_mounts: vec![],
             secrets: vec![],
             configs: vec![],
+            security: Default::default(),
         };
         let rules: Vec<String> = rctl_rules(&c, "i.c")
             .iter()
