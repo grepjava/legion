@@ -44,6 +44,8 @@ struct State {
     ignore_vnet: bool,
     /// Exit code of init containers, which exit as soon as they start.
     init_exit_code: i32,
+    /// Init containers run until stopped instead.
+    hold_init: bool,
     created: usize,
     /// Exit code of exec in containers, by container name.
     exec: BTreeMap<String, i32>,
@@ -128,6 +130,11 @@ impl FakeRuntime {
 
     pub fn set_init_exit_code(&self, code: i32) {
         self.state().init_exit_code = code;
+    }
+
+    /// Init containers started from now on run until stopped.
+    pub fn hold_init(&self, hold: bool) {
+        self.state().hold_init = hold;
     }
 
     /// Exec in the container `name` exits with `code` from now on.
@@ -310,7 +317,7 @@ impl Runtime for FakeRuntime {
     async fn start(&self, id: &str) -> Result<()> {
         let mut s = self.state();
         let ignore_vnet = s.ignore_vnet;
-        let init_exit = s.init_exit_code;
+        let init_exit = (!s.hold_init).then_some(s.init_exit_code);
         let c = s
             .containers
             .get(id)
@@ -342,8 +349,10 @@ impl Runtime for FakeRuntime {
         c.running = true;
         c.starts += 1;
         c.jail = Some(jail);
-        if c.spec.labels.get(LABEL_ROLE).map(String::as_str) == Some("init") {
-            self.die(&mut s, id, init_exit);
+        if c.spec.labels.get(LABEL_ROLE).map(String::as_str) == Some("init")
+            && let Some(code) = init_exit
+        {
+            self.die(&mut s, id, code);
         }
         Ok(())
     }

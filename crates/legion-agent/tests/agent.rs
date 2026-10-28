@@ -421,6 +421,26 @@ async fn refuses_a_pod_without_vnet() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn init_containers_run_first_and_can_be_stopped() {
+    let h = Harness::new().await;
+    h.rt.add_image("web:1");
+    h.rt.hold_init(true);
+    let key = h.task("web-1", WEB).await;
+    eventually("the init container", || {
+        h.status(&key).message == "init container migrate (1/1)"
+    })
+    .await;
+    assert_eq!(h.status(&key).state, TaskState::Starting);
+    assert_eq!(h.running(), ["shop_web-1", "shop_web-1_migrate"]);
+
+    // An init container that never ends does not hold up a stop.
+    h.shut_down(&key).await;
+    h.wait_state(&key, TaskState::Shutdown).await;
+    assert!(h.rt.containers().is_empty());
+    assert!(h.sys.jails().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn startup_failures() {
     let h = Harness::new().await;
     h.rt.fail_pulls_of("private:1");
@@ -436,15 +456,27 @@ async fn startup_failures() {
 
     h.rt.add_image("web:1");
     h.rt.set_init_exit_code(2);
+    // The pod goes with the failure, so its last words are kept.
+    h.rt.log(
+        "shop_i-1_migrate",
+        Output::Stdout,
+        "migrating
+
+",
+    );
+    h.rt.log(
+        "shop_i-1_migrate",
+        Output::Stderr,
+        "no such table: users
+",
+    );
     let init = h.task("i-1", WEB).await;
     let status = h.wait_state(&init, TaskState::Failed).await;
-    assert!(
-        status
-            .message
-            .contains("init container migrate exited with 2"),
-        "{}",
-        status.message
+    assert_eq!(
+        status.message,
+        "init container migrate exited with 2: migrating; no such table: users"
     );
+    h.rt.set_init_exit_code(0);
 
     let https = h
         .task(

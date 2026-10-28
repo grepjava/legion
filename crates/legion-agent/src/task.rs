@@ -225,6 +225,18 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         false
     }
 
+    /// Resolves once a stop arrives; other messages are dropped, as in
+    /// [`Self::stop_requested`].
+    async fn stopped(&mut self) {
+        loop {
+            match self.rx.recv().await {
+                Some(Msg::Stop) => return,
+                Some(_) => {}
+                None => std::future::pending().await,
+            }
+        }
+    }
+
     /// Takes over a pod left running by a previous agent. A pod that is
     /// incomplete or whose infra container has stopped is removed instead,
     /// and started again from scratch.
@@ -340,10 +352,10 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         self.check_infra_jail(&infra).await?;
         self.attach(&infra).await?;
 
-        self.report(TaskState::Starting, "starting containers")
-            .await;
         let init: Vec<_> = self.pod().init_containers.clone();
-        for c in &init {
+        for (i, c) in init.iter().enumerate() {
+            let step = format!("init container {} ({}/{})", c.name, i + 1, init.len());
+            self.report(TaskState::Starting, step).await;
             let mut spec = pod::container_spec(&self.ctx.node, &self.a, c, Role::Init, &infra);
             spec.mounts.extend(volumes::mounts(c, &sources));
             files.apply(&c.name, &mut spec);
@@ -355,19 +367,25 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 .await
                 .map_err(|e| Abort::Failed(format!("starting init container {}: {e}", c.name)))?;
             self.limit(c, &infra, &id).await;
-            let code = rt.wait(&id).await.map_err(|e| {
-                Abort::Failed(format!("waiting for init container {}: {e}", c.name))
-            })?;
+            // It may run for long, or never end: a stop must not wait for it.
+            let code = tokio::select! {
+                code = rt.wait(&id) => code.map_err(|e| {
+                    Abort::Failed(format!("waiting for init container {}: {e}", c.name))
+                })?,
+                () = self.stopped() => return Err(Abort::Stopped),
+            };
             if code != 0 {
+                // The pod and its output go with the failure: keep the end.
+                let tail = last_output(rt.as_ref(), &id).await;
                 return Err(Abort::Failed(format!(
-                    "init container {} exited with {code}",
+                    "init container {} exited with {code}{tail}",
                     c.name
                 )));
             }
-            if self.stop_requested() {
-                return Err(Abort::Stopped);
-            }
         }
+
+        self.report(TaskState::Starting, "starting containers")
+            .await;
 
         let mut members = Vec::new();
         let apps: Vec<_> = self.pod().containers.clone();
@@ -699,6 +717,40 @@ impl<R: Runtime, C: Control> Worker<R, C> {
 }
 
 /// The task's end state once every app container has finished for good.
+/// The last lines a container wrote, as `": <line>; <line>"`, short enough
+/// for a status message; empty if there are none.
+async fn last_output<R: Runtime>(rt: &R, id: &str) -> String {
+    const LINES: usize = 5;
+    const MAX: usize = 400;
+    let Ok(chunks) = rt.logs(id, false, Some(LINES)).await else {
+        return String::new();
+    };
+    let chunks: Vec<_> = futures::StreamExt::collect(chunks).await;
+    let text: String = chunks
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|c| String::from_utf8_lossy(&c.data).into_owned())
+        .collect();
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let mut out = lines[lines.len().saturating_sub(LINES)..].join("; ");
+    if out.len() > MAX {
+        let mut at = out.len() - MAX;
+        while !out.is_char_boundary(at) {
+            at += 1;
+        }
+        out = format!("...{}", &out[at..]);
+    }
+    if out.is_empty() {
+        out
+    } else {
+        format!(": {out}")
+    }
+}
+
 fn finished(pod: &Pod) -> Option<(TaskState, String, Option<i32>)> {
     let done: Vec<&(i32, String)> = pod
         .members

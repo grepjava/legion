@@ -182,6 +182,14 @@ async fn agent_runs_a_real_pod() {
         put(&store, v, Precondition::MustNotExist).await;
     }
     pod["containers"][0]["volumeMounts"] = volume_mounts.into();
+    // Runs first, in the pod: what it leaves in the pod's volume is there
+    // for the app.
+    pod["initContainers"] = serde_json::json!([{
+        "name": "prepare",
+        "image": IMAGE,
+        "command": ["/bin/sh", "-c", "echo prepared > /scratch/init"],
+        "volumeMounts": [{ "name": "scratch", "path": "/scratch" }],
+    }]);
     let mut spec: TaskSpec = legion_api::parse(&serde_json::json!({
         "service": "web", "serviceUid": "1", "serviceGeneration": 1, "slot": 1,
         "node": "lab", "pod": pod,
@@ -334,6 +342,13 @@ async fn agent_runs_a_real_pod() {
     };
 
     // Volumes are writable; the ZFS one keeps its data beyond the pod.
+    let out = sh_in("read x < /scratch/init && echo $x").await;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "prepared
+",
+        "the init container ran first"
+    );
     let out = sh_in("echo kept > /scratch/f && read x < /scratch/f && echo $x").await;
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
@@ -426,6 +441,46 @@ async fn agent_runs_a_real_pod() {
             "the volume's data outlives the task"
         );
     }
+
+    // A failing init container fails the task; its output is in the
+    // message, since the pod is gone.
+    let mut spec: TaskSpec = legion_api::parse(&serde_json::json!({
+        "service": "web", "serviceUid": "1", "serviceGeneration": 1, "slot": 2,
+        "node": "lab", "pod": {
+            "initContainers": [{
+                "name": "check",
+                "image": IMAGE,
+                "command": ["/bin/sh", "-c", "echo checking; echo missing schema >&2; exit 3"],
+            }],
+            "containers": [{ "name": "app", "image": IMAGE, "command": ["/bin/sleep", "3600"] }],
+        },
+    }))
+    .unwrap();
+    spec.admit().unwrap();
+    let mut task = Object::new(
+        Kind::Task,
+        "lab",
+        "web-2",
+        serde_json::to_value(&spec).unwrap(),
+    );
+    task.status = serde_json::json!({ "state": "assigned" });
+    let failing = task.key();
+    put(&store, task, Precondition::MustNotExist).await;
+    eventually("failed", 120, async || {
+        status(&store, &failing).state == TaskState::Failed
+    })
+    .await;
+    assert_eq!(
+        status(&store, &failing).message,
+        "init container check exited with 3: checking; missing schema"
+    );
+    assert!(
+        podman
+            .list(&[("legion.task.id", &status_uid(&store, &failing))])
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     stop.send(()).unwrap();
     agent.await.unwrap();

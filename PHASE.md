@@ -392,6 +392,17 @@ Already there from phase 1: namespaces scope names and DNS
   errors, and port-forward; RBAC over TLS; and in the phase 1 exit test on
   FreeBSD, the CLI's exec (`-i`, `-t` under script(1)), logs and
   port-forward against the real app.
+- **Init containers** (`legion-agent::task`): run in order, each to
+  completion, as child jails of the pod with its volumes, before the main
+  containers start; they do not run again when a main container restarts.
+  The task shows which one is running (`init container migrate (1/2)`); a
+  stop does not wait for one that never ends. One that fails fails the task
+  with its last lines of output in the message, since the pod goes with
+  it. The scheduler and quotas count the larger of the init containers'
+  and the main containers' requests. Tested with the fakes and, on
+  FreeBSD, with real Podman and ocijail: an init container leaves a file in
+  the pod's volume for the app, and a failing one's output reaches the
+  task's message.
 
 ### To do, in order
 
@@ -399,14 +410,13 @@ The first three are what the exit criterion rests on: who may do what,
 what may talk to what, and how much each team may use; all three are
 done.
 
-1. **Init containers**: run in order to completion before the main ones.
-2. **Jobs and CronJobs**: run to completion, retries and deadlines; cron
+1. **Jobs and CronJobs**: run to completion, retries and deadlines; cron
    schedules, concurrency policy, history limits.
-3. **Disruption budgets**: `maxUnavailable` honoured by drain and updates.
-4. **Security profiles**: the jail defaults in DESIGN.md §9, loosened per
+2. **Disruption budgets**: `maxUnavailable` honoured by drain and updates.
+3. **Security profiles**: the jail defaults in DESIGN.md §9, loosened per
    service only explicitly.
-5. **Metrics**: a Prometheus endpoint on each manager and agent.
-6. **Exit test**: two teams, each with its own user and namespace, deploy
+4. **Metrics**: a Prometheus endpoint on each manager and agent.
+5. **Exit test**: two teams, each with its own user and namespace, deploy
     on the same cluster; neither can read or change the other's objects,
     reach the other's tasks, or exceed its quota.
 
