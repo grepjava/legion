@@ -54,6 +54,8 @@ struct State {
     tables: BTreeMap<(String, String), Vec<Ipv4Addr>>,
     datasets: BTreeMap<String, Dataset>,
     snapshots: BTreeSet<String>,
+    /// What tests wrote into datasets, and what their snapshots hold.
+    contents: BTreeMap<String, Vec<u8>>,
     /// tmpfs mount points, with their size.
     mounts: BTreeMap<String, Option<u64>>,
     default_interface: Option<String>,
@@ -202,6 +204,18 @@ impl FakeSys {
         self.state().snapshots.clone()
     }
 
+    /// Replaces what a dataset holds, as a task writing to it would.
+    pub fn write_dataset(&self, dataset: &str, data: &[u8]) {
+        self.state()
+            .contents
+            .insert(dataset.to_owned(), data.to_vec());
+    }
+
+    /// What a dataset holds.
+    pub fn dataset_contents(&self, dataset: &str) -> Option<Vec<u8>> {
+        self.state().contents.get(dataset).cloned()
+    }
+
     /// The host's interface with the default route; it is created if
     /// missing, as a host's would exist.
     pub fn set_default_interface(&self, name: &str) {
@@ -235,7 +249,7 @@ impl FakeSys {
     }
 
     /// Makes `command` fail the next time it runs. Only some honour it:
-    /// `pfctl -ss` and `pfctl -k`.
+    /// `pfctl -ss`, `pfctl -k` and `zfs destroy -r`.
     pub fn fail_next(&self, command: &str) {
         self.state().failing.insert(command.to_owned());
     }
@@ -721,11 +735,29 @@ impl Sys for FakeSys {
                 format!("cannot create snapshot '{snapshot}': dataset already exists"),
             ));
         }
+        let data = s.contents.get(ds).cloned().unwrap_or_default();
+        s.contents.insert(snapshot.to_owned(), data);
         Ok(())
     }
 
     fn zfs_destroy(&self, name: &str, recursive: bool) -> Result<()> {
         let mut s = self.state();
+        if recursive && s.failing.remove("zfs destroy -r") {
+            return Err(fail(
+                "zfs destroy",
+                format!("cannot destroy '{name}': dataset is busy"),
+            ));
+        }
+        if name.contains('@') {
+            if !s.snapshots.remove(name) {
+                return Err(fail(
+                    "zfs destroy",
+                    "could not find any snapshots to destroy; check snapshot names.".to_owned(),
+                ));
+            }
+            s.contents.remove(name);
+            return Ok(());
+        }
         if !s.datasets.contains_key(name) {
             return Err(fail(
                 "zfs destroy",
@@ -746,6 +778,113 @@ impl Sys for FakeSys {
             .retain(|d, _| d != name && !d.starts_with(&child));
         s.snapshots
             .retain(|d| !d.starts_with(&snap) && !d.starts_with(&child));
+        s.contents
+            .retain(|d, _| d != name && !d.starts_with(&snap) && !d.starts_with(&child));
+        Ok(())
+    }
+
+    /// The stream is `fakezfs <snapshot name> <since or ->` on one line,
+    /// then what the snapshot holds.
+    fn zfs_send(
+        &self,
+        snapshot: &str,
+        since: Option<&str>,
+        out: &mut dyn std::io::Write,
+    ) -> Result<()> {
+        let (header, data) = {
+            let s = self.state();
+            let fail_send = |m: String| fail("zfs send", m);
+            let (ds, name) = snapshot
+                .split_once('@')
+                .ok_or_else(|| fail_send(format!("invalid snapshot name {snapshot:?}")))?;
+            if !s.snapshots.contains(snapshot) {
+                return Err(fail_send(format!(
+                    "cannot open '{snapshot}': dataset does not exist"
+                )));
+            }
+            if let Some(since) = since
+                && !s.snapshots.contains(&format!("{ds}@{since}"))
+            {
+                return Err(fail_send(format!(
+                    "cannot open '{ds}@{since}': dataset does not exist"
+                )));
+            }
+            (
+                format!("fakezfs {name} {}\n", since.unwrap_or("-")),
+                s.contents.get(snapshot).cloned().unwrap_or_default(),
+            )
+        };
+        out.write_all(header.as_bytes())
+            .and_then(|()| out.write_all(&data))
+            .map_err(|e| fail("zfs send", e.to_string()))
+    }
+
+    fn zfs_receive(&self, dataset: &str, input: &mut dyn std::io::Read) -> Result<()> {
+        let mut stream = Vec::new();
+        input
+            .read_to_end(&mut stream)
+            .map_err(|e| fail("zfs receive", e.to_string()))?;
+        let bad = || fail("zfs receive", "invalid backup stream".to_owned());
+        let end = stream.iter().position(|b| *b == b'\n').ok_or_else(bad)?;
+        let header = String::from_utf8_lossy(&stream[..end]).into_owned();
+        let data = stream[end + 1..].to_vec();
+        let mut parts = header.split(' ');
+        let (Some("fakezfs"), Some(name), Some(since)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(bad());
+        };
+        let mut s = self.state();
+        let parent = dataset.rsplit_once('/').map(|(p, _)| p);
+        if let Some(parent) = parent
+            && !s.datasets.contains_key(parent)
+        {
+            return Err(fail(
+                "zfs receive",
+                format!("cannot receive new filesystem stream: parent '{parent}' does not exist"),
+            ));
+        }
+        let snap = format!("{dataset}@");
+        if since == "-" {
+            if let Some(old) = s.snapshots.iter().find(|d| d.starts_with(&snap)) {
+                return Err(fail(
+                    "zfs receive",
+                    format!(
+                        "cannot receive new filesystem stream: destination has snapshots (eg. {old})
+must destroy them to overwrite it"
+                    ),
+                ));
+            }
+            s.datasets.insert(
+                dataset.to_owned(),
+                Dataset {
+                    name: dataset.to_owned(),
+                    mountpoint: None,
+                    quota: None,
+                },
+            );
+        } else if !s.snapshots.contains(&format!("{dataset}@{since}")) {
+            return Err(fail(
+                "zfs receive",
+                format!(
+                    "cannot receive incremental stream: most recent snapshot of {dataset} does not match incremental source"
+                ),
+            ));
+        }
+        s.snapshots.insert(format!("{dataset}@{name}"));
+        s.contents.insert(format!("{dataset}@{name}"), data.clone());
+        s.contents.insert(dataset.to_owned(), data);
+        Ok(())
+    }
+
+    fn zfs_mount(&self, dataset: &str) -> Result<()> {
+        let mut s = self.state();
+        let ds = s.datasets.get_mut(dataset).ok_or_else(|| {
+            fail(
+                "zfs mount",
+                format!("cannot open '{dataset}': dataset does not exist"),
+            )
+        })?;
+        ds.mountpoint.get_or_insert_with(|| format!("/{dataset}"));
         Ok(())
     }
 
@@ -881,6 +1020,59 @@ mod tests {
         assert_eq!(jails[1].parent, parent);
         sys.remove_jail("infra1");
         assert!(sys.jails().unwrap().is_empty());
+    }
+
+    #[test]
+    fn zfs_streams() {
+        let (a, b) = (FakeSys::new(), FakeSys::new());
+        let src = "tank/legion/volumes/shop/data";
+        let dst = "lvol/legion/volumes/shop/data";
+        a.zfs_create(src, &[]).unwrap();
+        a.write_dataset(src, b"one");
+        a.zfs_snapshot(&format!("{src}@m1")).unwrap();
+        a.write_dataset(src, b"two");
+        let send = |snap: &str, since: Option<&str>| {
+            let mut out = Vec::new();
+            a.zfs_send(&format!("{src}@{snap}"), since, &mut out)
+                .unwrap();
+            out
+        };
+        // The parent must be there.
+        let full = send("m1", None);
+        assert!(b.zfs_receive(dst, &mut full.as_slice()).is_err());
+        b.zfs_create("lvol/legion/volumes/shop", &[]).unwrap();
+        b.zfs_receive(dst, &mut full.as_slice()).unwrap();
+        assert_eq!(b.dataset_contents(dst).unwrap(), b"one");
+        // Received unmounted.
+        assert_eq!(b.zfs_list(dst).unwrap()[0].mountpoint, None);
+
+        a.zfs_snapshot(&format!("{src}@m2")).unwrap();
+        let incremental = send("m2", Some("m1"));
+        b.zfs_receive(dst, &mut incremental.as_slice()).unwrap();
+        assert_eq!(b.dataset_contents(dst).unwrap(), b"two");
+        // A full stream does not replace a dataset with snapshots.
+        assert!(b.zfs_receive(dst, &mut full.as_slice()).is_err());
+        // Not again: the target is past m1's successor already, so an
+        // increment from a snapshot it lacks fails.
+        a.zfs_snapshot(&format!("{src}@m3")).unwrap();
+        let skip = {
+            let mut out = Vec::new();
+            a.zfs_send(&format!("{src}@m3"), Some("m2"), &mut out)
+                .unwrap();
+            out
+        };
+        b.zfs_destroy(&format!("{dst}@m2"), false).unwrap();
+        assert!(b.zfs_receive(dst, &mut skip.as_slice()).is_err());
+        assert!(
+            a.zfs_send(&format!("{src}@m9"), None, &mut Vec::new())
+                .is_err()
+        );
+
+        b.zfs_mount(dst).unwrap();
+        assert_eq!(
+            b.zfs_list(dst).unwrap()[0].mountpoint.as_deref(),
+            Some("/lvol/legion/volumes/shop/data")
+        );
     }
 
     #[test]

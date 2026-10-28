@@ -1,7 +1,8 @@
 //! Three nodes in one process: a served manager and three agents, each
 //! with its own faked Podman and system, all through the dispatcher. Tasks
-//! spread over the nodes, every node balances every service, and a node
-//! that goes silent loses its tasks to the others.
+//! spread over the nodes, every node balances every service, a node that
+//! goes silent loses its tasks to the others, and a stateful task's data
+//! moves with it off a draining node.
 
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
@@ -107,6 +108,7 @@ impl Cluster {
         }
         let mut config = AgentConfig::new(&node.name, dir.join("tasks"));
         config.drain = Duration::ZERO;
+        config.zfs_root = Some("tank/legion".into());
         config.infra_image = INFRA.into();
         config.resync = Duration::from_millis(100);
         config.wireguard = Some(WireGuardConfig {
@@ -152,6 +154,25 @@ impl Cluster {
                 .any(|n| n.metadata.name == name && n.status["state"] == "ready")
         })
         .await;
+    }
+
+    /// Sets a node's availability (`active`, `pause`, `drain`).
+    async fn availability(&self, name: &str, availability: &str) {
+        let mut node = self
+            .list(Kind::Node)
+            .await
+            .into_iter()
+            .find(|n| n.metadata.name == name)
+            .unwrap();
+        node.spec["availability"] = availability.into();
+        self.api
+            .clone()
+            .apply(ApplyRequest {
+                object: Some((&node).into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
     }
 
     async fn apply(&self, yaml: &str) {
@@ -388,5 +409,130 @@ spec:
     .await;
     eventually("n1's pods gone", async || c.pods(0).is_empty()).await;
 
+    c.stop().await;
+}
+
+const DB: &str = r#"
+apiVersion: legion/v1
+kind: Service
+metadata: { name: db, namespace: shop }
+spec:
+  mode: stateful
+  replicas: 1
+  maxUnavailable: MAX
+  pod:
+    containers: [{ name: db, image: "web:1", volumeMounts: [{ name: data, path: /var/db }] }]
+    volumes: [{ name: data, claim: { size: 1Gi } }]
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stateful_data_moves_off_a_draining_node() {
+    let c = Cluster::start(3).await;
+    // No task may stop yet: the test writes between the copy and the stop.
+    c.apply(&DB.replace("MAX", "0")).await;
+    let task = async |c: &Cluster| {
+        c.list(Kind::Task)
+            .await
+            .into_iter()
+            .find(|t| t.status["state"] == "running")
+    };
+    eventually("db running", async || task(&c).await.is_some()).await;
+    let t = task(&c).await.unwrap();
+    let from = t.spec["node"].as_str().unwrap().to_owned();
+    let index = |name: &str| c.nodes.iter().position(|n| n.name == name).unwrap();
+    let ds = "tank/legion/volumes/shop/data-db-0";
+    c.nodes[index(&from)].sys.write_dataset(ds, b"rows 1");
+
+    // Drained, the node sends a full copy while the task runs on.
+    c.availability(&from, "drain").await;
+    let volume = async |c: &Cluster| {
+        c.list(Kind::Volume)
+            .await
+            .into_iter()
+            .find(|v| v.metadata.name == "data-db-0")
+            .unwrap()
+    };
+    eventually("copied", async || {
+        volume(&c).await.status["migration"]["phase"] == "copied"
+    })
+    .await;
+    let to = volume(&c).await.status["migration"]["to"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(to, from);
+    assert_eq!(
+        c.nodes[index(&to)].sys.dataset_contents(ds).as_deref(),
+        Some(&b"rows 1"[..])
+    );
+    assert_eq!(task(&c).await.unwrap().spec["node"], from.as_str());
+
+    // What the task writes meanwhile follows once it stops.
+    c.nodes[index(&from)].sys.write_dataset(ds, b"rows 2");
+    c.apply(&DB.replace("MAX", "1")).await;
+    eventually("db running elsewhere", async || {
+        task(&c)
+            .await
+            .is_some_and(|t| t.spec["node"] == to.as_str())
+    })
+    .await;
+    let v = volume(&c).await;
+    assert_eq!(v.status["node"], to.as_str());
+    assert!(v.status.get("migration").is_none(), "{}", v.status);
+    let target = &c.nodes[index(&to)].sys;
+    assert_eq!(target.dataset_contents(ds).as_deref(), Some(&b"rows 2"[..]));
+    // Mounted for the task, without the migration's snapshots.
+    assert!(target.zfs_list(ds).unwrap()[0].mountpoint.is_some());
+    assert!(target.snapshots().is_empty(), "{:?}", target.snapshots());
+    // The old node drops its copy.
+    eventually("old copy dropped", async || {
+        c.nodes[index(&from)].sys.zfs_list(ds).unwrap().is_empty()
+    })
+    .await;
+    c.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stateful_data_moves_back_over_a_stale_copy() {
+    let c = Cluster::start(2).await;
+    c.apply(&DB.replace("MAX", "1")).await;
+    let on = async |c: &Cluster, node: &str| {
+        c.list(Kind::Task)
+            .await
+            .iter()
+            .any(|t| t.status["state"] == "running" && t.spec["node"] == node)
+    };
+    eventually("db running", async || {
+        on(&c, "n1").await || on(&c, "n2").await
+    })
+    .await;
+    let (a, b) = if on(&c, "n1").await { (0, 1) } else { (1, 0) };
+    let (na, nb) = (c.nodes[a].name.clone(), c.nodes[b].name.clone());
+    let ds = "tank/legion/volumes/shop/data-db-0";
+    c.nodes[a].sys.write_dataset(ds, b"rows 1");
+
+    // Its old copy cannot be dropped, and stays.
+    c.nodes[a].sys.fail_next("zfs destroy -r");
+    c.availability(&na, "drain").await;
+    eventually("moved", async || on(&c, &nb).await).await;
+    assert_eq!(
+        c.nodes[b].sys.dataset_contents(ds).as_deref(),
+        Some(&b"rows 1"[..])
+    );
+    assert!(!c.nodes[a].sys.zfs_list(ds).unwrap().is_empty());
+
+    // Moving back, the full copy takes the stale one's place.
+    c.nodes[b].sys.write_dataset(ds, b"rows 2");
+    c.availability(&na, "active").await;
+    c.availability(&nb, "drain").await;
+    eventually("moved back", async || on(&c, &na).await).await;
+    assert_eq!(
+        c.nodes[a].sys.dataset_contents(ds).as_deref(),
+        Some(&b"rows 2"[..])
+    );
+    eventually("copy dropped", async || {
+        c.nodes[b].sys.zfs_list(ds).unwrap().is_empty()
+    })
+    .await;
     c.stop().await;
 }

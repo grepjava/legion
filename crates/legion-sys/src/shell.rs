@@ -108,6 +108,62 @@ impl<R: Runner> Shell<R> {
     }
 }
 
+/// Runs a command whose input or output is a stream: `pump` moves it
+/// while the command runs, then the command must succeed. A pump that
+/// fails stops the command.
+fn stream(
+    program: &str,
+    args: &[String],
+    pump: impl FnOnce(&mut std::process::Child) -> std::io::Result<()>,
+) -> Result<()> {
+    use std::io::Read;
+    let command = describe(program, args);
+    tracing::debug!(%command, "run");
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| Error::Spawn {
+            command: command.clone(),
+            source,
+        })?;
+    // Read stderr meanwhile, so the command cannot block on it.
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    let pumped = pump(&mut child);
+    if pumped.is_err() {
+        let _ = child.kill();
+    }
+    // The command sees the end of its input.
+    drop(child.stdin.take());
+    let status = child.wait().map_err(|source| Error::Spawn {
+        command: command.clone(),
+        source,
+    })?;
+    let stderr = errors.join().unwrap_or_default();
+    if !status.success() {
+        let message = stderr.trim();
+        return Err(Error::Failed {
+            command,
+            message: if message.is_empty() {
+                format!("failed ({status})")
+            } else {
+                message.to_owned()
+            },
+        });
+    }
+    pumped.map_err(|e| Error::Failed {
+        command,
+        message: format!("streaming: {e}"),
+    })
+}
+
 fn describe(program: &str, args: &[String]) -> String {
     std::iter::once(program)
         .chain(args.iter().map(String::as_str))
@@ -544,6 +600,41 @@ impl<R: Runner> Sys for Shell<R> {
             args(["destroy", name])
         };
         self.run("zfs", &a).map(drop)
+    }
+
+    fn zfs_send(
+        &self,
+        snapshot: &str,
+        since: Option<&str>,
+        out: &mut dyn std::io::Write,
+    ) -> Result<()> {
+        let mut a = args(["send"]);
+        if let Some(since) = since {
+            a.extend(["-i".to_owned(), format!("@{since}")]);
+        }
+        a.push(snapshot.to_owned());
+        stream("zfs", &a, |child| {
+            let mut from = child.stdout.take().expect("piped stdout");
+            std::io::copy(&mut from, out).map(drop)
+        })
+    }
+
+    fn zfs_receive(&self, dataset: &str, input: &mut dyn std::io::Read) -> Result<()> {
+        stream("zfs", &args(["receive", "-F", "-u", dataset]), |child| {
+            let mut to = child.stdin.take().expect("piped stdin");
+            std::io::copy(input, &mut to).map(drop)
+        })
+    }
+
+    fn zfs_mount(&self, dataset: &str) -> Result<()> {
+        let mounted = self.run(
+            "zfs",
+            &args(["get", "-H", "-o", "value", "mounted", dataset]),
+        )?;
+        if mounted.trim() == "yes" {
+            return Ok(());
+        }
+        self.run("zfs", &args(["mount", dataset])).map(drop)
     }
 
     fn mount_tmpfs(&self, path: &str, size: Option<u64>, mode: u32) -> Result<()> {

@@ -249,6 +249,56 @@ fn zfs_datasets() {
     assert_eq!(sys.zfs_list(&vol).unwrap()[0].quota, None, "quota cleared");
     sys.zfs_snapshot(&format!("{vol}@t1")).unwrap();
     assert!(sys.zfs_destroy(&vol, false).is_err(), "has a snapshot");
+    sys.zfs_destroy(&format!("{vol}@t1"), false).unwrap();
+
+    // Moving a volume: a full stream, then what changed since, into a
+    // dataset under another parent, left unmounted until mounted.
+    let mountpoint = |ds: &str| sys.zfs_list(ds).unwrap()[0].mountpoint.clone().unwrap();
+    let file = |ds: &str| format!("{}/f", mountpoint(ds));
+    std::fs::write(file(&vol), "one").unwrap();
+    sys.zfs_snapshot(&format!("{vol}@m1")).unwrap();
+    std::fs::write(file(&vol), "two").unwrap();
+    sys.zfs_snapshot(&format!("{vol}@m2")).unwrap();
+    let send = |snap: &str, since: Option<&str>| {
+        let mut out = Vec::new();
+        sys.zfs_send(&format!("{vol}@{snap}"), since, &mut out)
+            .unwrap();
+        out
+    };
+    let moved = format!("{base}/other/shop/data");
+    assert!(
+        sys.zfs_receive(&moved, &mut send("m1", None).as_slice())
+            .is_err(),
+        "no parent"
+    );
+    sys.zfs_create(&format!("{base}/other/shop"), &[]).unwrap();
+    sys.zfs_receive(&moved, &mut send("m1", None).as_slice())
+        .unwrap();
+    let mounted = sh(&format!("zfs get -H -o value mounted {moved}"));
+    assert_eq!(mounted.trim(), "no", "received unmounted");
+    sys.zfs_receive(&moved, &mut send("m2", Some("m1")).as_slice())
+        .unwrap();
+    // A full stream does not replace a dataset with snapshots.
+    assert!(
+        sys.zfs_receive(&moved, &mut send("m2", None).as_slice())
+            .is_err()
+    );
+    sys.zfs_mount(&moved).unwrap();
+    sys.zfs_mount(&moved).unwrap(); // mounted already: fine
+    assert_eq!(std::fs::read_to_string(file(&moved)).unwrap(), "two");
+    // A stream cut short fails, and the dataset stays as it was.
+    let full = send("m2", None);
+    let broken = format!("{base}/other/shop/broken");
+    assert!(
+        sys.zfs_receive(&broken, &mut &full[..full.len() / 2])
+            .is_err()
+    );
+    assert!(sys.zfs_list(&broken).unwrap().is_empty());
+    assert!(
+        sys.zfs_send(&format!("{vol}@m9"), None, &mut Vec::new())
+            .is_err()
+    );
+
     sys.zfs_destroy(&base, true).unwrap();
     assert!(sys.zfs_list(&base).unwrap().is_empty());
 }

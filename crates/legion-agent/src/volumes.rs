@@ -118,6 +118,14 @@ fn zfs(sys: &dyn Sys, dataset: &str, spec: &VolumeSpec) -> Result<String, String
         sys.zfs_set(dataset, "quota", &quota)
             .map_err(|e| e.to_string())?;
     }
+    // One received from another node may not be mounted yet.
+    sys.zfs_mount(dataset).map_err(|e| e.to_string())?;
+    let ds = sys
+        .zfs_list(dataset)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|d| d.name == dataset)
+        .ok_or_else(|| format!("{dataset} missing after mounting it"))?;
     ds.mountpoint
         .ok_or_else(|| format!("{dataset} is not mounted"))
 }

@@ -13,6 +13,7 @@ pub mod controller;
 mod dispatcher;
 pub mod join;
 pub mod metrics;
+mod migrate;
 mod quota;
 mod raft_net;
 mod security;
@@ -177,6 +178,15 @@ impl Manager {
             self.store.raft.clone(),
             closing.clone(),
         ));
+        let sessions: std::sync::Arc<session::Hub> = Default::default();
+        let migrator = self.controllers.then(|| {
+            tokio::spawn(migrate::run(
+                self.store.clone(),
+                sessions.clone(),
+                self.id,
+                closing.clone(),
+            ))
+        });
         let api = api::ApiService {
             id: self.id,
             advertise: self.advertise.clone(),
@@ -185,7 +195,7 @@ impl Manager {
             peer_tls: self.tls.as_ref().map(Tls::client),
             issuer,
             quota_lock: Default::default(),
-            sessions: Default::default(),
+            sessions,
         };
         let (dispatcher, dispatching) =
             dispatcher::DispatcherService::start(api.clone(), self.tls.is_some(), self.heartbeat);
@@ -246,6 +256,9 @@ impl Manager {
         let _ = closing_tx.send(true);
         if let Some(controllers) = controllers {
             let _ = controllers.await;
+        }
+        if let Some(migrator) = migrator {
+            let _ = migrator.await;
         }
         let _ = promote.await;
         let _ = dispatching.await;

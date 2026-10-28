@@ -140,7 +140,24 @@ pub trait Sys: Send + Sync {
     fn zfs_create(&self, name: &str, props: &[(&str, &str)]) -> Result<()>;
     fn zfs_set(&self, name: &str, prop: &str, value: &str) -> Result<()>;
     fn zfs_snapshot(&self, snapshot: &str) -> Result<()>;
+    /// Destroys a dataset or, if `name` has an `@`, a snapshot.
     fn zfs_destroy(&self, name: &str, recursive: bool) -> Result<()>;
+    /// Writes a `zfs send` stream of `snapshot` (`<dataset>@<name>`) to
+    /// `out`: everything, or only what changed since the dataset's snapshot
+    /// `since` (the name after the `@`).
+    fn zfs_send(
+        &self,
+        snapshot: &str,
+        since: Option<&str>,
+        out: &mut dyn std::io::Write,
+    ) -> Result<()>;
+    /// Receives a `zfs send` stream from `input` into `dataset`, whose
+    /// parent must exist, and leaves it unmounted (`zfs receive -F -u`): an
+    /// incremental stream rolls the dataset back to the stream's starting
+    /// snapshot first; a full one replaces it only if it has no snapshots.
+    fn zfs_receive(&self, dataset: &str, input: &mut dyn std::io::Read) -> Result<()>;
+    /// Mounts a dataset at its mountpoint unless it is mounted.
+    fn zfs_mount(&self, dataset: &str) -> Result<()>;
 
     // Mounts.
 

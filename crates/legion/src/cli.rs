@@ -887,6 +887,29 @@ fn print_objects(objects: &[pb::Object], format: Format, kind: Kind) -> anyhow::
                     &rows,
                 );
             }
+            Kind::Volume => {
+                let rows: Vec<[String; 5]> = objects
+                    .iter()
+                    .map(|o| {
+                        let m = &o.status["migration"];
+                        let moving = match (field(m, &["phase"]), field(m, &["message"])) {
+                            (phase, _) if phase.is_empty() => String::new(),
+                            (phase, why) if why.is_empty() => {
+                                format!("{phase} to {}", field(m, &["to"]))
+                            }
+                            (phase, why) => format!("{phase} to {}: {why}", field(m, &["to"])),
+                        };
+                        [
+                            o.metadata.namespace.clone(),
+                            o.metadata.name.clone(),
+                            field(&o.spec, &["size"]),
+                            field(&o.status, &["node"]),
+                            moving,
+                        ]
+                    })
+                    .collect();
+                print_table(["NAMESPACE", "NAME", "SIZE", "NODE", "MIGRATION"], &rows);
+            }
             Kind::Node => {
                 let rows: Vec<[String; 5]> = objects
                     .iter()

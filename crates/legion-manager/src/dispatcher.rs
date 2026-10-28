@@ -24,7 +24,7 @@ use legion_api::dispatch::{
 use legion_api::node::{NodeSpec, NodeState, NodeStatus};
 use legion_api::service::{PortRef, ServiceSpec, ServiceStatus};
 use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
-use legion_api::volume::{VolumeSpec, VolumeStatus};
+use legion_api::volume::{MigrationPhase, VolumeSpec, VolumeStatus};
 use legion_api::{Kind, Object, ObjectKey};
 use legion_pki::Role;
 use legion_proto::v1::dispatcher_client::DispatcherClient;
@@ -340,12 +340,19 @@ impl DispatcherService {
             if !status.node.is_empty() && status.node != node {
                 return Ok(VolumeClaim::Elsewhere(status.node));
             }
+            // Its last changes are on their way to another node.
+            if let Some(m) = &status.migration
+                && m.phase == MigrationPhase::Finishing
+            {
+                return Ok(VolumeClaim::Elsewhere(m.to.clone()));
+            }
             if status.node == node && status.dataset == dataset {
                 return Ok(VolumeClaim::Claimed(spec));
             }
             volume.status = serde_json::to_value(VolumeStatus {
                 node: node.to_owned(),
                 dataset: dataset.to_owned(),
+                ..status
             })
             .map_err(internal)?;
             let version = volume.metadata.version;

@@ -55,9 +55,9 @@ struct Pending {
 }
 
 /// An agent's end of a session.
-struct Attachment {
-    from_agent: Streaming<SessionFrame>,
-    to_agent: mpsc::Sender<Result<SessionFrame, Status>>,
+pub(crate) struct Attachment {
+    pub(crate) from_agent: Streaming<SessionFrame>,
+    pub(crate) to_agent: mpsc::Sender<Result<SessionFrame, Status>>,
 }
 
 impl Hub {
@@ -72,7 +72,7 @@ impl Hub {
     }
 
     /// Offers a session to `node`'s agent; resolves once it attaches.
-    async fn offer(
+    pub(crate) async fn offer(
         self: &Arc<Self>,
         node: &str,
         offer: SessionOffer,
@@ -177,6 +177,11 @@ impl Pods for PodsService {
         let verb = match open.action {
             Some(Action::Logs(_)) => Verb::Read,
             Some(Action::Exec(_) | Action::Port(_)) => Verb::Write,
+            Some(Action::VolumeSend(_) | Action::VolumeReceive(_) | Action::VolumeDrop(_)) => {
+                return Err(Status::invalid_argument(
+                    "volumes move between nodes only when the managers move them",
+                ));
+            }
             None => return Err(Status::invalid_argument("the session needs an action")),
         };
         caller.check(&self.api.store, verb, Kind::Task, &open.namespace)?;

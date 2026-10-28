@@ -150,6 +150,7 @@ impl World {
         let status = legion_api::volume::VolumeStatus {
             node: node.into(),
             dataset: format!("tank/legion/volumes/shop/{name}"),
+            migration: None,
         };
         o.status = serde_json::to_value(&status).unwrap();
         self.volumes.insert(
@@ -160,6 +161,34 @@ impl World {
                 status,
             },
         );
+    }
+
+    /// The leader's migrator, done with each migration's current phase.
+    fn migrate(&mut self) {
+        use legion_api::volume::MigrationPhase;
+        for v in self.volumes.values_mut() {
+            let Some(m) = &mut v.status.migration else {
+                continue;
+            };
+            match m.phase {
+                MigrationPhase::Copying => m.phase = MigrationPhase::Copied,
+                MigrationPhase::Finishing => {
+                    v.status.node = m.to.clone();
+                    v.status.dataset.clear();
+                    v.status.migration = None;
+                }
+                MigrationPhase::Copied => continue,
+            }
+            v.object.status = serde_json::to_value(&v.status).unwrap();
+            self.index += 1;
+            v.object.metadata.version = self.index;
+        }
+    }
+
+    /// The migration of a Volume: its node and phase.
+    fn migration(&self, name: &str) -> Option<(String, legion_api::volume::MigrationPhase)> {
+        let v = &self.volumes[&("shop".to_owned(), name.to_owned())];
+        v.status.migration.as_ref().map(|m| (m.to.clone(), m.phase))
     }
 
     /// One pass, and the agents acting on it.
@@ -192,6 +221,13 @@ impl World {
             .collect();
         v.sort();
         v
+    }
+
+    fn placed_task(&self, name: &str) -> &Task {
+        self.tasks
+            .iter()
+            .find(|t| t.object.metadata.name == name)
+            .unwrap_or_else(|| panic!("no task {name}: {:?}", self.tasks()))
     }
 
     fn delete_service(&mut self, name: &str) {
@@ -289,6 +325,8 @@ impl World {
                             let v = self.volumes.get_mut(&key).unwrap();
                             if v.object.metadata.version == version {
                                 v.spec = legion_api::parse(&o.spec).unwrap();
+                                v.status =
+                                    serde_json::from_value(o.status.clone()).unwrap_or_default();
                                 v.object = o;
                             }
                         }
@@ -347,6 +385,7 @@ impl World {
                         && v.status.node.is_empty()
                     {
                         v.status.node = node.clone();
+                        v.object.status = serde_json::to_value(&v.status).unwrap();
                     }
                 }
             }
@@ -1945,4 +1984,83 @@ fn stateful_admission() {
         "spec.pod.volumes: volume \"data\": only a stateful service's tasks claim volumes"
     );
     assert!(admit(STATEFUL).is_ok());
+}
+
+#[test]
+fn stateful_tasks_move_with_their_data_off_a_draining_node() {
+    use legion_api::volume::MigrationPhase::*;
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.node("n3", &[]);
+    w.service("db", &STATEFUL.replace("replicas: 3", "replicas: 2"));
+    w.settle();
+    let from = w.placed_task("db-0-1").spec.node.clone();
+    let busy = w.placed_task("db-1-1").spec.node.clone();
+    let free = ["n1", "n2", "n3"]
+        .into_iter()
+        .find(|n| *n != from && *n != busy)
+        .unwrap();
+
+    // Draining its node starts a copy to the node with fewest of its
+    // tasks, while the task runs on.
+    w.availability(&from, Availability::Drain);
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some((free.to_owned(), Copying)));
+    assert_eq!(w.wanted("db"), ["db-0-1", "db-1-1"]);
+
+    // Copied, the task stops; with nothing using the Volume the last part
+    // goes, and its next task waits for it.
+    w.migrate();
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some((free.to_owned(), Finishing)));
+    let next = w.placed_task("db-0-2");
+    assert_eq!(next.status.state, TaskState::Pending);
+    assert_eq!(
+        next.status.message,
+        "no node can run it: 1 not active, 2 volume moving"
+    );
+
+    // Moved, the task runs where its data is.
+    w.migrate();
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), None);
+    assert_eq!(
+        w.volumes[&("shop".to_owned(), "data-db-0".to_owned())]
+            .status
+            .node,
+        free
+    );
+    assert_eq!(w.placed_task("db-0-2").spec.node, free);
+    assert_eq!(w.placed_task("db-0-2").status.state, TaskState::Running);
+}
+
+#[test]
+fn migrations_stop_when_no_longer_needed_or_possible() {
+    use legion_api::volume::MigrationPhase::*;
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.service("db", &STATEFUL.replace("replicas: 3", "replicas: 1"));
+    w.settle();
+    let from = w.placed_task("db-0-1").spec.node.clone();
+    let to = if from == "n1" { "n2" } else { "n1" };
+
+    // The drain called off, the copy is dropped and the task stays.
+    w.availability(&from, Availability::Drain);
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some((to.to_owned(), Copying)));
+    w.availability(&from, Availability::Active);
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), None);
+    assert_eq!(w.wanted("db"), ["db-0-1"]);
+
+    // The new node lost, the copy is dropped; with no other node, none
+    // starts, and the task runs on.
+    w.availability(&from, Availability::Drain);
+    w.settle();
+    w.state(to, NodeState::Down);
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), None);
+    assert_eq!(w.placed_task("db-0-1").status.state, TaskState::Running);
 }

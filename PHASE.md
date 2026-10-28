@@ -554,14 +554,38 @@ service and migrates between nodes.
   admission, quotas through the API, DNS names, and the agent mounting a
   task's own Volume with its hostname set.
 
+- **Migration** (`legion-manager::migrate`, `controller/plan/migrate.rs`,
+  `legion-agent::transfer`, DESIGN.md §4.3): draining a node moves each
+  wanted stateful ordinal's Volumes to the eligible node with fewest of
+  its service's tasks. The migration lives in the Volume's status
+  (`copying`, `copied`, `finishing`, with the last failure's message);
+  the leader's migrator offers the old node a `VolumeSend` session and
+  the new node a `VolumeReceive` and joins them, so data goes through the
+  leader and nodes still need no port. A full copy goes while the task
+  runs; once copied the drain stops the task; with nothing placed using
+  the Volume the increment since goes, the Volume becomes the new node's
+  and the old node drops its copy (`VolumeDrop`). Meanwhile the slot's
+  next task waits with `volume moving`. A migration is dropped when its
+  new node is no longer ready and active, or, before its last part, when
+  the old node stops draining; failures are noted and retried after 5 s.
+  `Sys` gained `zfs_send`, `zfs_receive` (`-F -u`) and `zfs_mount`;
+  volumes are mounted before use. `legion list volumes` shows sizes,
+  nodes and migrations. Tested: the planner (start, copy, stop, finish,
+  placement on the new node; dropped when the drain is called off or the
+  new node goes); through one manager and three agents with fake ZFS,
+  data written before and after the full copy arriving, mounted, with the
+  snapshots gone and the old copy dropped, and moving back onto a node
+  whose old copy could not be dropped (fails without replacing it); and
+  on weft-bsd, the streams with real ZFS: full, incremental, into a new
+  parent, unmounted then mounted, refused over a dataset with snapshots
+  (which the fake missed), a cut stream leaving nothing.
+
 ### To do, in order
 
-1. Migration: move a stateful task's Volume to another node with a full
-   then incremental `zfs send/recv` when its node drains, or on request.
-2. Snapshots before updates, and restoring them on rollback.
-3. Exit test: Postgres with replicas, migrated between nodes.
-4. Ingress routes, autoscaling, CARP VIP, autolock, store backup and
-   restore.
+1. Snapshots before updates, and restoring them on rollback.
+2. Exit test: Postgres with replicas, migrated between nodes.
+3. Ingress routes, autoscaling, CARP VIP, autolock, store backup and
+   restore. Moving a Volume on request rather than by a drain.
 
 ## Later phases
 

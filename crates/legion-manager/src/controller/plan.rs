@@ -23,6 +23,7 @@ use legion_api::{Kind, Object, ObjectKey};
 use tokio::time::Instant;
 
 mod jobs;
+mod migrate;
 pub use jobs::{CronJob, Job, Jobs};
 
 /// Terminal tasks kept per slot, as Swarm's task history limit.
@@ -212,6 +213,7 @@ pub fn plan(
         memory.running_at.entry(t.uid().to_owned()).or_insert(now);
     }
 
+    migrate::migrations(services, tasks, nodes, volumes, &mut plan);
     let mut addresses = addresses(services);
     let mut created: Vec<Task> = Vec::new();
     for s in services {
@@ -665,8 +667,10 @@ fn service(
             // Off a draining node: stopped first if the budget allows,
             // else replaced first, as a failed replacement is, after its
             // backoff. A stateful task's replacement needs its volumes, so
-            // it waits for the budget.
-            if !start_first && may_stop(&moving) {
+            // it waits for the budget, and for them to be copied to where
+            // they go.
+            let copied = !stateful || moving.iter().all(|t| migrate::copied(t, volumes));
+            if copied && !start_first && may_stop(&moving) {
                 for old in &moving {
                     plan.actions.push(stop(old));
                 }
@@ -1061,6 +1065,15 @@ fn eligible(
         return Err("taints");
     }
     let namespace = &s.object.metadata.namespace;
+    let finishing = mounts.iter().any(|v| {
+        volumes
+            .get(&(namespace.clone(), v.clone()))
+            .and_then(|v| v.status.migration.as_ref())
+            .is_some_and(|m| m.phase == legion_api::volume::MigrationPhase::Finishing)
+    });
+    if finishing {
+        return Err("volume moving");
+    }
     let elsewhere = mounts
         .iter()
         .filter_map(|v| home(volumes, namespace, v))

@@ -33,6 +33,7 @@ mod probe;
 pub mod runtime;
 mod session;
 mod task;
+pub mod transfer;
 mod volumes;
 
 pub use control::{
@@ -194,6 +195,10 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             ctx.runtime.clone(),
             ctx.node.clone(),
             ctx.logs_dir.clone(),
+            Arc::new(transfer::Volumes {
+                sys: ctx.sys.clone(),
+                zfs_root: ctx.zfs_root.clone(),
+            }),
             ctx.control.sessions(&ctx.node),
         ));
         let net = legion_net::PodNetwork::new(registration.pod_cidr);

@@ -25,7 +25,30 @@ message SessionOpen {
     ExecOptions exec = 5;
     // Port-forward: one forwarded connection to this port of the pod.
     uint32 port = 6;
+    // Managers only, moving a Volume's data between nodes (DESIGN.md
+    // §4.3): the sending agent's output is the receiving agent's input.
+    VolumeSend volume_send = 7;
+    VolumeReceive volume_receive = 8;
+    // Remove this node's copy of a Volume that has moved away.
+    string volume_drop = 9;
   }
+}
+
+// Snapshots the Volume and sends it as `stdout` frames, ending with
+// `exit_code` 0.
+message VolumeSend {
+  string volume = 1;
+  // Only what changed since the full copy, from a second snapshot.
+  bool last = 2;
+}
+
+// Receives what `VolumeSend` sends, from `input` frames until
+// `input_closed`, and ends with `exit_code` 0.
+message VolumeReceive {
+  string volume = 1;
+  // The last part: afterwards the dataset is mounted and the migration's
+  // snapshots go.
+  bool last = 2;
 }
 
 message LogsOptions {

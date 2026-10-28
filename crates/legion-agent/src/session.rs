@@ -26,6 +26,7 @@ use tonic::{Status, Streaming};
 use crate::control::Offer;
 use crate::pod::{LABEL_CONTAINER, LABEL_NODE, LABEL_ROLE, LABEL_TASK};
 use crate::runtime::Runtime;
+use crate::transfer::{self, Volumes};
 
 /// How long connecting to a pod for port-forward may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -39,14 +40,27 @@ pub(crate) async fn serve<R: Runtime>(
     runtime: Arc<R>,
     node: String,
     kept: Option<PathBuf>,
+    volumes: Arc<Volumes>,
     mut offers: mpsc::Receiver<Offer>,
 ) {
     while let Some(offer) = offers.recv().await {
-        tokio::spawn(run(runtime.clone(), node.clone(), kept.clone(), offer));
+        tokio::spawn(run(
+            runtime.clone(),
+            node.clone(),
+            kept.clone(),
+            volumes.clone(),
+            offer,
+        ));
     }
 }
 
-async fn run<R: Runtime>(runtime: Arc<R>, node: String, kept: Option<PathBuf>, offer: Offer) {
+async fn run<R: Runtime>(
+    runtime: Arc<R>,
+    node: String,
+    kept: Option<PathBuf>,
+    volumes: Arc<Volumes>,
+    offer: Offer,
+) {
     let id = offer.offer.id.clone();
     let (tx, rx) = mpsc::channel(16);
     let _ = tx.send(frame(Frame::Attach(id.clone()))).await;
@@ -79,6 +93,15 @@ async fn run<R: Runtime>(runtime: Arc<R>, node: String, kept: Option<PathBuf>, o
             }
         }
         Some(Action::Port(port)) => forward(&o.pod_ip, port, &tx, &mut inbound).await,
+        Some(Action::VolumeSend(opts)) => {
+            transfer::send(&volumes, &open.namespace, opts, &tx).await
+        }
+        Some(Action::VolumeReceive(opts)) => {
+            transfer::receive(&volumes, &open.namespace, opts, &tx, &mut inbound).await
+        }
+        Some(Action::VolumeDrop(volume)) => {
+            transfer::drop_copy(&volumes, &open.namespace, &volume, &tx).await
+        }
         None => Err(Status::invalid_argument("the session has no action")),
     };
     if let Err(e) = result {
