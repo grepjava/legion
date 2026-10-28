@@ -846,6 +846,37 @@ libpod REST API (annotations and labels in `containers/create`).
 
 ---
 
+### 6.5 Native jail runtime (phase 5)
+
+Podman gives Legion three things: pulling images, a root filesystem per
+container, and supervising its processes. Everything FreeBSD-specific
+(VNET, epairs, pf, rctl on each container's own jail, ZFS volumes)
+Legion does itself, and most of the runtime's trouble came from the
+layer in between: libpod's stats are zeros on FreeBSD, conmons that
+outlive exec sessions, a `podman system service` per node that leaked
+when killed, the shared tmpdir, vfs copying whole images, and an infra
+container that exists only so a process holds the pod.
+
+A native runtime keeps OCI as the image format and runs it on jails
+directly: a registry client (auth, manifests and indexes) pulls layers
+into ZFS, one snapshot per layer, applied with OCI whiteouts; a
+container's root filesystem is a clone of its image's top snapshot; a
+pod is a `persist` VNET jail with no processes, and each container a
+child jail running the image's entrypoint as its user, supervised by the
+agent (output to the per-task log files, exit codes, stop signals and
+the grace period) in a way that survives agent restarts. Exec and
+images no longer used complete it.
+
+It is a second implementation of the agent's `Runtime` trait, chosen
+per node, so the existing tests apply to it and Podman stays as the
+fallback. It does not change rctl: memory limits for workloads with
+large shared memory need their own answer either way.
+
+It starts with a spike on a FreeBSD host, as phase 0 did: pull an image
+into ZFS clones, run its entrypoint in a child jail of a `persist` VNET
+pod jail under the agent's supervision, and compare start time and disk
+use with Podman. If it holds, it becomes the default.
+
 ## 7. Object model
 
 Every object has the same envelope:
@@ -1098,7 +1129,7 @@ WireGuard and bridge, with tasks as VNET jails attached to the node bridges.
 | 2 | Cluster (**MVP**) | `init`/`join`, PKI, 3–5 managers, dispatcher, WireGuard mesh, routed pod network, scheduler (constraints, requests, taints), node failure handling, routing mesh, rolling updates and rollback, drain, rctl limits, compose `stack deploy` | ~~A compose app deploys on 3 nodes, survives losing any one node, and updates with zero downtime~~ met |
 | 3 | K8s-lite | Namespaces, RBAC, init containers, startup probes, jobs and cronjobs, network policy, disruption budgets, `logs`/`exec`/`port-forward`, security profiles, Prometheus metrics endpoint | Two teams share a cluster with isolation enforced |
 | 4 | Stateful and operations | Stateful services, ZFS snapshot and migration, ingress routes, autoscaling, CARP VIP, autolock, backup and restore of the store | Postgres with replicas runs as a stateful service and migrates between nodes |
-| 5 | Extensions | Linux images, IPv6 dual-stack, volume plugin interface (NFS, iSCSI), bhyve tasks (exploratory) | Per feature |
+| 5 | Extensions | Native jail runtime (6.5), Linux images, IPv6 dual-stack, volume plugin interface (NFS, iSCSI), bhyve tasks (exploratory) | Per feature |
 
 ---
 

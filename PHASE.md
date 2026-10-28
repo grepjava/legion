@@ -680,4 +680,8 @@ Smaller follow-ups: memory limits for workloads with large shared memory
 
 ## Later phases
 
-See DESIGN.md §11: 5 Extensions.
+See DESIGN.md §11: 5 Extensions. First in phase 5: the native jail
+runtime (DESIGN.md §6.5), starting with its spike (an image pulled into
+ZFS clones, its entrypoint run in a child jail of a `persist` VNET pod
+jail under the agent's supervision, start time and disk use against
+Podman).
