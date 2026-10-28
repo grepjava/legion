@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use legion_api::dispatch::{
-    Assignment, Assignments, EndpointPort, Endpoints, Peer, Peers, ServiceEndpoints, VolumeClaim,
+    Assignment, Assignments, EndpointPort, Endpoints, Peer, Peers, Policies, ServiceEndpoints,
+    VolumeClaim,
 };
 use legion_api::node::NodeStatus;
 use legion_api::task::TaskStatus;
@@ -18,7 +19,7 @@ use legion_api::{Kind, ObjectKey};
 use legion_proto::v1::dispatcher_client::DispatcherClient;
 use legion_proto::v1::{
     AssignmentsRequest, ClaimVolumeRequest, DataRequest, EndpointsRequest, HeartbeatRequest,
-    PeersRequest, RegisterRequest, ReportRequest,
+    PeersRequest, PoliciesRequest, RegisterRequest, ReportRequest,
 };
 use legion_sys::Ipv4Net;
 use tokio::sync::watch;
@@ -62,6 +63,10 @@ pub trait Control: Send + Sync + 'static {
     /// Every node of the WireGuard mesh, this one included, kept current;
     /// empty until first known.
     fn peers(&self) -> watch::Receiver<Peers>;
+
+    /// Namespaces' isolation and every network policy, kept current; `None`
+    /// until first known.
+    fn policies(&self) -> watch::Receiver<Option<Policies>>;
 
     /// Writes a task's status. A task that is gone, or was replaced by one
     /// with another uid, is ignored.
@@ -408,6 +413,21 @@ impl Control for GrpcControl {
                 async move { c.peers(PeersRequest { node }).await }
             },
             |m: legion_proto::v1::PeersUpdate| decode(&m.peers_json),
+            publish_changed,
+        ));
+        rx
+    }
+
+    fn policies(&self) -> watch::Receiver<Option<Policies>> {
+        let (tx, rx) = watch::channel(None);
+        let node = self.node.clone();
+        tokio::spawn(self.clone().follow(
+            tx,
+            move |mut c| {
+                let node = node.clone();
+                async move { c.policies(PoliciesRequest { node }).await }
+            },
+            |m: legion_proto::v1::PoliciesUpdate| decode(&m.policies_json).map(Some),
             publish_changed,
         ));
         rx

@@ -289,6 +289,27 @@ async fn tasks_survive_losing_a_node() {
         .await;
         let rules = c.nodes[i].sys.anchor(legion_net::lb::ANCHOR).unwrap();
         assert!(rules.contains("to (re0) port 30080"), "{rules}");
+        // Its pod takes traffic from its namespace's tasks, all three.
+        eventually("the node guards its pod", async || {
+            let Some(rules) = c.nodes[i].sys.anchor(legion_net::policy::ANCHOR) else {
+                return false;
+            };
+            let Some(table) = rules
+                .split(['<', '>'])
+                .nth(1)
+                .filter(|_| rules.contains("block drop out quick on lp"))
+            else {
+                return false;
+            };
+            let addrs: BTreeSet<Ipv4Addr> = c.nodes[i]
+                .sys
+                .pf_table_show(legion_net::policy::ANCHOR, table)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            addrs == all
+        })
+        .await;
         eventually("the node has the others as peers", async || {
             c.nodes[i]
                 .sys

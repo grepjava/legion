@@ -478,10 +478,16 @@ default `10.88.0.0/16`, for example).
   keepalives. Such a node joins through a site tunnel or VPN and
   advertises its address there (the phase 2 exit test does this for a
   remote server); traversing NAT without one is later work.
-- **Bridge sysctls**: `net.link.bridge.pfil_*` are per-VNET, but Legion runs in
-  the host VNET, so changing them would affect every bridge on the host,
-  including Podman's own. Legion leaves them at their defaults and uses the
-  hairpin NAT rule in 5.4, which works either way.
+- **Bridge sysctls**: `net.link.bridge.pfil_*` are per-VNET, and Legion runs
+  in the host VNET, so they apply to every bridge on the host, Podman's own
+  included. Load balancing needs none of them (the hairpin NAT rule in 5.4
+  works either way), but network policy (5.6) does: FreeBSD 15 defaults
+  `pfil_member` to 0, so pf never sees traffic bridged between pods, and
+  without `pfil_local_phys` a pod's frames for the host are filtered only
+  on the bridge, after a VIP's `rdr pass` has translated them. The agent
+  sets both to 1 at start (decided with the user, phase 3). Other bridges'
+  members are then filtered too, which a pass-by-default main ruleset does
+  not notice; Legion nodes are expected to be dedicated.
 
 ### 5.4 Services and load balancing
 
@@ -553,13 +559,34 @@ over TCP.
 - `NetworkPolicy` objects add allow rules by namespace, labels and ports, for
   ingress and egress.
 - Rules are enforced on the **destination** node, on the task's own epair
-  (`out on epairNa`, toward the jail). With the host's default
-  `pfil_member=1`, pf sees same-node bridged traffic there, so policy also
-  covers traffic between tasks on one node. A misbehaving node cannot bypass
-  rules enforced on another.
+  (`out on lpX`, toward the jail). With `pfil_member=1` (5.3), pf sees
+  same-node bridged traffic there, so policy also covers traffic between
+  tasks on one node. A misbehaving node cannot bypass rules enforced on
+  another.
 - Each policy compiles to rules in the `legion/policy` anchor that reference
   tables. Membership changes update tables only; rules are reloaded only when
   policies change.
+- **Built** (phase 3; `legion_api::policy`, `legion-agent::policing`,
+  `legion-net::policy`): `Namespace.spec.isolation` is `namespace` (the
+  default), `open` or `locked` (not even the namespace's own tasks).
+  `NetworkPolicy` selects services of its namespace by labels
+  (`services`) and lists `ingress` rules: `from` peers (namespace,
+  default its own; service labels, default all; none listed: every task)
+  and `ports` (the tasks' ports, default all). The dispatcher streams the
+  non-default isolations and every policy to the agents (`Policies`), and
+  the endpoints now carry each service's labels. On each pod's host end
+  the agent allows in: the nodes (this gateway and the mesh range: probes,
+  other hosts, published ports reached through another node), traffic a
+  published port's or VIP's `rdr` translated here (`tagged LSVC`), and a
+  table per allowed peer set, on its ports; and drops the rest. A pod may
+  send only from its own address and never IPv6; what it starts is kept as
+  `if-bound` state, so replies pass its own guard (a floating state would
+  match the same packet again on the bridge before the VIP's translation).
+  VIP traffic to a task on the same node is NATed to the gateway by the
+  hairpin rule, losing its source, so VIPs are checked at the client pod
+  instead (`in on lpX`, still to the VIP; this is what needs
+  `pfil_local_phys`): each pod may reach the VIP ports whose tasks would
+  let it in. Egress policies are not built yet.
 
 ### 5.7 IPv6
 

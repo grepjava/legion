@@ -168,3 +168,164 @@ fn pods_on_the_bridge() {
     );
     sys.interface_destroy(BRIDGE).unwrap();
 }
+
+#[test]
+#[ignore = "needs root inside a throwaway VNET jail"]
+fn policy_on_the_bridge() {
+    use std::collections::BTreeMap;
+
+    use legion_net::policy::{self, Allow, Guard, Policy};
+
+    assert_eq!(
+        sh("sysctl -n security.jail.jailed").1.trim(),
+        "1",
+        "run inside a VNET jail"
+    );
+    let sys = Shell::new();
+    let net = PodNetwork::new("10.200.8.0/24".parse().unwrap());
+    net.ensure_bridge(&sys).unwrap();
+    let pid = std::process::id();
+    let pods = [
+        (format!("lpolpod{pid}a"), "00000000000000c1"),
+        (format!("lpolpod{pid}b"), "00000000000000d2"),
+    ];
+    let mut ips = Vec::new();
+    for (jail, id) in &pods {
+        assert!(sh(&format!("jail -c name={jail} path=/ vnet persist")).0);
+        let ip = net.allocate(&ips.iter().copied().collect()).unwrap();
+        net.attach(&sys, id, jail, ip).unwrap();
+        ips.push(ip);
+    }
+    let (a, b) = (&pods[0].0, &pods[1].0);
+    let (a_ip, b_ip) = (ips[0], ips[1]);
+    assert!(sh("sysctl net.inet.ip.forwarding=1").0);
+    // pf must see bridged traffic on the members (FreeBSD 15 defaults to
+    // not); this jail's VNET only.
+    assert!(sh("sysctl net.link.bridge.pfil_member=1").0);
+    // And on the member a frame for the host came in on, not only on the
+    // bridge: before the VIP's translation there.
+    assert!(sh("sysctl net.link.bridge.pfil_local_phys=1").0);
+    sh("pfctl -e");
+    let hooks = legion_net::lb::HOOKS.join("\n") + "\n";
+    assert!(
+        sh(&format!(
+            "printf '{}' | pfctl -f -",
+            hooks.replace('"', "\\\"")
+        ))
+        .0
+    );
+    // b serves on 8080, also behind a VIP.
+    let vip = Ipv4Addr::new(10, 201, 0, 9);
+    let mut lb = LoadBalancer::default();
+    let svc = Service {
+        uid: "00000000000000dd".into(),
+        vip: Some(vip),
+        ports: vec![Port {
+            proto: Proto::Tcp,
+            port: 80,
+            target: 8080,
+            published: None,
+        }],
+        ready: vec![b_ip],
+        alive: vec![b_ip],
+    };
+    lb.apply(&sys, &[svc], net.subnet, Exits::default())
+        .unwrap();
+    sh(&format!(
+        "jexec {b} sh -c 'while :; do nc -l 8080 </dev/null >/dev/null 2>&1; done &' </dev/null >/dev/null 2>&1"
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let reach = |from: Option<&str>, to: &str, port: u16| {
+        let cmd = match from {
+            Some(j) => format!("jexec {j} nc -z -w 2 {to} {port}"),
+            None => format!("nc -z -w 2 {to} {port}"),
+        };
+        sh(&cmd).0
+    };
+    assert!(
+        reach(Some(a), &b_ip.to_string(), 8080),
+        "open before any policy"
+    );
+
+    let services = "10.201.0.0/16".parse().unwrap();
+    let guard = |allowed: &[Ipv4Addr], vips: bool| {
+        let guards = vec![
+            Guard {
+                interface: host_interface(pods[0].1),
+                ip: a_ip,
+                open: false,
+                allowed: vec![],
+                vips: if vips {
+                    vec![(vip, Proto::Tcp, 80)]
+                } else {
+                    vec![]
+                },
+            },
+            Guard {
+                interface: host_interface(pods[1].1),
+                ip: b_ip,
+                open: false,
+                allowed: vec![Allow {
+                    table: "tfriends".into(),
+                    ports: vec![(Proto::Tcp, 8080)],
+                }],
+                vips: vec![],
+            },
+        ];
+        let tables = BTreeMap::from([("tfriends".to_owned(), allowed.to_vec())]);
+        (guards, tables)
+    };
+    let mut p = Policy::default();
+    let mut set = |allowed: &[Ipv4Addr], vips: bool| {
+        let (guards, tables) = guard(allowed, vips);
+        p.apply(&sys, &guards, &tables, net.gateway(), services)
+            .unwrap();
+    };
+
+    // Nobody allowed: a cannot reach b, directly or through the VIP; the
+    // host (probes) still can.
+    set(&[], false);
+    assert!(
+        !reach(Some(a), &b_ip.to_string(), 8080),
+        "direct, refused: {}{}{}",
+        sh("pfctl -a legion/policy -vsr").1,
+        sh("pfctl -ss").1,
+        sh("sysctl net.link.bridge").1
+    );
+    assert!(
+        !reach(Some(a), &vip.to_string(), 80),
+        "VIP, refused: {}{}",
+        sh("pfctl -a legion/policy -vsr").1,
+        sh("pfctl -ss").1
+    );
+    assert!(reach(None, &b_ip.to_string(), 8080), "the host");
+    // a allowed on 8080: directly, yes (the reply passes a's own guard as
+    // state of what a started); the VIP still closed at a.
+    set(&[a_ip], false);
+    assert!(reach(Some(a), &b_ip.to_string(), 8080), "direct, allowed");
+    assert!(!reach(Some(a), &vip.to_string(), 80), "VIP, refused at a");
+    // And the VIP opened at a: through it, with the hairpin NAT.
+    set(&[a_ip], true);
+    assert!(reach(Some(a), &vip.to_string(), 80), "VIP, allowed");
+    // An address that is not a's own is refused, though allowed at b.
+    let fake = Ipv4Addr::new(10, 200, 8, 50);
+    set(&[a_ip, fake], true);
+    let epair = sh(&format!("ifconfig -j {a} -l")).1;
+    let epair = epair
+        .split_whitespace()
+        .find(|i| i.starts_with("epair"))
+        .unwrap()
+        .to_owned();
+    assert!(sh(&format!("ifconfig -j {a} {epair} inet {fake}/32 alias")).0);
+    assert!(
+        !sh(&format!("jexec {a} nc -z -w 2 -s {fake} {b_ip} 8080")).0,
+        "spoofed source"
+    );
+    sys.pf_flush_anchor(policy::ANCHOR).unwrap();
+    sys.pf_flush_anchor(ANCHOR).unwrap();
+    for (jail, id) in &pods {
+        net.detach(&sys, id).unwrap();
+        assert!(sh(&format!("jail -r {jail}")).0);
+    }
+    sys.interface_destroy(BRIDGE).unwrap();
+}

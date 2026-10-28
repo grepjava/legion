@@ -32,7 +32,7 @@ use crate::{BRIDGE, CLUSTER_POD_CIDR};
 
 pub const ANCHOR: &str = "legion/svc";
 /// Marks translated service traffic for the hairpin NAT.
-const TAG: &str = "LSVC";
+pub(crate) const TAG: &str = "LSVC";
 
 /// The lines a host's pf.conf needs for Legion's anchors.
 pub const HOOKS: [&str; 3] = [
@@ -48,7 +48,7 @@ pub enum Proto {
 }
 
 impl Proto {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Proto::Tcp => "tcp",
             Proto::Udp => "udp",

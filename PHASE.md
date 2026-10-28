@@ -343,30 +343,50 @@ Already there from phase 1: namespaces scope names and DNS
   may issue certificates; through the CLI, `user create` and a user
   applying, listing and deploying a stack in their namespace only.
 
+- **Namespace isolation and network policy** (`legion_api::policy`,
+  `legion-agent::policing`, `legion-net::policy`, DESIGN.md §5.6): a
+  task is reached by its namespace's tasks, the nodes and published
+  ports by default; `Namespace.spec.isolation` can be `open` or `locked`,
+  and `NetworkPolicy` objects let in more by namespace, service labels and
+  ports. The agent guards each pod's host end in the `legion/policy`
+  anchor: only its own address out, no IPv6, VIPs checked at the client
+  pod (the hairpin NAT hides the source at the server), replies passing as
+  `if-bound` state. pf only sees bridged pod traffic with
+  `net.link.bridge.pfil_member=1` and `pfil_local_phys=1`, which FreeBSD
+  15 leaves off; the agent sets both, host-wide (decided with the user).
+  `stack deploy` no longer re-applies an existing namespace, so its
+  isolation stays. Tested: the decisions (namespace, open, locked,
+  policies by namespace, labels and ports, VIPs), the rules and tables,
+  the agent guarding its pods in the fake cluster; and on FreeBSD in a
+  VNET jail, a pod refused and then allowed directly, a VIP closed and
+  then opened at the client, the host still reaching a refused pod, and a
+  spoofed source dropped. Egress policies are not built.
+
 ### To do, in order
 
 The first three are what the exit criterion rests on: who may do what,
-what may talk to what, and how much each team may use; RBAC is done.
+what may talk to what, and how much each team may use; the first two
+are done.
 
-1. **Namespace isolation and network policy**: by default a task reaches
-   tasks of its own namespace and the node's DNS only; `NetworkPolicy`
-   allows more by namespace, labels and ports, compiled to the
-   `legion/policy` anchor and enforced on the destination node
-   (DESIGN.md §5.6).
-2. **Namespace quotas**: limits on the requests, tasks and volumes a
+1. **Namespace quotas**: limits on the requests, tasks and volumes a
    namespace may hold, checked at admission and by the scheduler.
-3. **`logs`, `exec`, `port-forward`**: streamed from the agent through a
+2. **`logs`, `exec`, `port-forward`**: streamed from the agent through a
    manager, under RBAC (`exec` and `port-forward` need `edit`).
-4. **Init containers**: run in order to completion before the main ones.
-5. **Jobs and CronJobs**: run to completion, retries and deadlines; cron
+3. **Init containers**: run in order to completion before the main ones.
+4. **Jobs and CronJobs**: run to completion, retries and deadlines; cron
    schedules, concurrency policy, history limits.
-6. **Disruption budgets**: `maxUnavailable` honoured by drain and updates.
-7. **Security profiles**: the jail defaults in DESIGN.md §9, loosened per
+5. **Disruption budgets**: `maxUnavailable` honoured by drain and updates.
+6. **Security profiles**: the jail defaults in DESIGN.md §9, loosened per
    service only explicitly.
-8. **Metrics**: a Prometheus endpoint on each manager and agent.
-9. **Exit test**: two teams, each with its own user and namespace, deploy
+7. **Metrics**: a Prometheus endpoint on each manager and agent.
+8. **Exit test**: two teams, each with its own user and namespace, deploy
     on the same cluster; neither can read or change the other's objects,
     reach the other's tasks, or exceed its quota.
+
+Smaller follow-ups: egress policies; a new pod is unguarded for the
+moment between its start and the agent's next pass (the guard could go in
+before its containers start); lab runs on weft-bsd leave the bridge
+sysctls at 1.
 
 ## Later phases
 

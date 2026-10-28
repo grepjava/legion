@@ -81,6 +81,11 @@ legion rollback web -n shop                 # undo the latest update
 legion stack rm shop                        # volumes and their data stay
 ```
 
+A namespace's tasks are reached only by its own tasks, the nodes and
+published ports, unless its `isolation` is `open` (or `locked`, not even
+its own); `NetworkPolicy` objects let more in by namespace, service labels
+and ports.
+
 `admin.pem` is the cluster admin's. People get their own credentials and a
 role (`view`, `edit` or `admin`) in a namespace; the key is made where the
 command runs:

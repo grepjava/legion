@@ -231,7 +231,8 @@ secrets:
     assert!(yaml.contains("legion.stack: shop"), "{yaml}");
     assert!(yaml.contains("publishedPort: 8080"), "{yaml}");
     let again = ok(&d, &["stack", "deploy", "shop", "-c", file]);
-    assert_eq!(again.matches("unchanged").count(), 5, "{again}");
+    // The namespace is left alone once it exists.
+    assert_eq!(again.matches("unchanged").count(), 4, "{again}");
 
     let converted = ok(&d, &["stack", "convert", "shop", "-c", file, "-n", "other"]);
     assert_eq!(converted.matches("kind: Service").count(), 2, "{converted}");

@@ -290,16 +290,25 @@ async fn stack(objects: &mut ObjectsClient<Channel>, command: StackCommand) -> a
             if strict && !converted.warnings.is_empty() {
                 bail!("{} cannot be deployed as it is (--strict)", file.display());
             }
-            // A user may not create namespaces; one with a role in this
-            // one deploys into it as the cluster admin made it.
-            let ns = Object::new(Kind::Namespace, "", &namespace, serde_json::json!({}));
-            if let Err(e) = apply(objects, &ns).await {
-                let denied = e
-                    .downcast_ref::<tonic::Status>()
-                    .is_some_and(|s| s.code() == tonic::Code::PermissionDenied);
-                if !denied {
-                    return Err(e);
+            // Made only when missing, so its isolation stays as set. A user
+            // may not even look: one with a role in it deploys into it as
+            // the cluster admin made it.
+            let found = objects
+                .get(ObjectRef {
+                    kind: Kind::Namespace.as_str().into(),
+                    namespace: String::new(),
+                    name: namespace.clone(),
+                })
+                .await;
+            match found {
+                Err(s) if s.code() == tonic::Code::NotFound => {
+                    let ns = Object::new(Kind::Namespace, "", &namespace, serde_json::json!({}));
+                    apply(objects, &ns).await?;
                 }
+                Err(s) if s.code() != tonic::Code::PermissionDenied => {
+                    return Err(anyhow::Error::from(s).context(format!("namespace {namespace}")));
+                }
+                _ => {}
             }
             for object in &converted.objects {
                 apply(objects, object).await?;

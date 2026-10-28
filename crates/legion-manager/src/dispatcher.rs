@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use legion_api::data::DataSpec;
 use legion_api::dispatch::{
-    Assignment, Assignments, EndpointPort, Endpoints, Peer, Peers, ServiceEndpoints, VolumeClaim,
+    Assignment, Assignments, EndpointPort, Endpoints, NamespacedPolicy, Peer, Peers, Policies,
+    ServiceEndpoints, VolumeClaim,
 };
 use legion_api::node::{NodeSpec, NodeState, NodeStatus};
 use legion_api::service::{PortRef, ServiceSpec, ServiceStatus};
@@ -31,7 +32,8 @@ use legion_proto::v1::dispatcher_server::Dispatcher;
 use legion_proto::v1::{
     AssignmentsRequest, AssignmentsUpdate, ClaimVolumeRequest, ClaimVolumeResponse, DataRequest,
     DataResponse, EndpointsRequest, EndpointsUpdate, HeartbeatRequest, HeartbeatResponse,
-    PeersRequest, PeersUpdate, RegisterRequest, RegisterResponse, ReportRequest, ReportResponse,
+    PeersRequest, PeersUpdate, PoliciesRequest, PoliciesUpdate, RegisterRequest, RegisterResponse,
+    ReportRequest, ReportResponse,
 };
 use legion_store::{Command, Event, Outcome, Precondition, Store, WatchError};
 use tokio::sync::watch;
@@ -65,6 +67,8 @@ pub(crate) struct DispatcherService {
     endpoints: watch::Receiver<Option<Endpoints>>,
     /// Every node of the mesh, once first listed.
     peers: watch::Receiver<Option<Peers>>,
+    /// Isolation and network policies, once first listed.
+    policies: watch::Receiver<Option<Policies>>,
 }
 
 impl DispatcherService {
@@ -77,18 +81,23 @@ impl DispatcherService {
     ) -> (DispatcherService, tokio::task::JoinHandle<()>) {
         let (endpoints_tx, endpoints) = watch::channel(None);
         let (peers_tx, peers) = watch::channel(None);
+        let (policies_tx, policies) = watch::channel(None);
         let service = DispatcherService {
             tls,
             period,
             seen: Arc::default(),
             endpoints,
             peers,
+            policies,
             api,
         };
         let follow = tokio::spawn(follow_cluster(
             service.api.store.clone(),
-            endpoints_tx,
-            peers_tx,
+            Followed {
+                endpoints: endpoints_tx,
+                peers: peers_tx,
+                policies: policies_tx,
+            },
             service.api.closing.clone(),
         ));
         let monitor = tokio::spawn(service.clone().monitor());
@@ -486,6 +495,22 @@ impl Dispatcher for DispatcherService {
         })))
     }
 
+    type PoliciesStream = ReceiverStream<Result<PoliciesUpdate, Status>>;
+
+    async fn policies(
+        &self,
+        req: Request<PoliciesRequest>,
+    ) -> Result<Response<Self::PoliciesStream>, Status> {
+        self.node(&req, &req.get_ref().node)?;
+        let mut rx = self.policies.clone();
+        rx.mark_changed();
+        Ok(Response::new(stream(&self.api.closing, rx, |set| {
+            PoliciesUpdate {
+                policies_json: serde_json::to_vec(set).expect("policies serialize"),
+            }
+        })))
+    }
+
     async fn report(
         &self,
         req: Request<ReportRequest>,
@@ -670,45 +695,71 @@ async fn follow_assignments(
 /// Keeps `endpoints` equal to the endpoints of every service and `peers` to
 /// the nodes of the mesh: lists services, tasks and nodes, then follows
 /// changes to them. Ends when the manager shuts down.
-async fn follow_cluster(
-    store: Store,
-    endpoints_tx: watch::Sender<Option<Endpoints>>,
-    peers_tx: watch::Sender<Option<Peers>>,
-    mut closing: watch::Receiver<bool>,
-) {
+/// Where [`follow_cluster`] publishes what it derives from the store.
+struct Followed {
+    endpoints: watch::Sender<Option<Endpoints>>,
+    peers: watch::Sender<Option<Peers>>,
+    policies: watch::Sender<Option<Policies>>,
+}
+
+/// The kinds [`follow_cluster`] keeps, by key.
+const FOLLOWED: [Kind; 5] = [
+    Kind::Service,
+    Kind::Task,
+    Kind::Node,
+    Kind::Namespace,
+    Kind::NetworkPolicy,
+];
+
+async fn follow_cluster(store: Store, out: Followed, mut closing: watch::Receiver<bool>) {
     loop {
-        let (services, tasks, nodes) = match (
-            store.list(Kind::Service, None),
-            store.list(Kind::Task, None),
-            store.list(Kind::Node, None),
-        ) {
-            (Ok(s), Ok(t), Ok(n)) => (s, t, n),
-            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-                tracing::warn!("listing services, tasks and nodes: {e}");
-                if pause(&mut closing).await {
-                    return;
+        let mut objects: BTreeMap<Kind, BTreeMap<ObjectKey, Object>> = BTreeMap::new();
+        let mut since = u64::MAX;
+        let mut failed = None;
+        for kind in FOLLOWED {
+            match store.list(kind, None) {
+                Ok(l) => {
+                    // Changes after the oldest listing, so none is missed;
+                    // replaying some a newer listing already holds is
+                    // harmless.
+                    since = since.min(l.version);
+                    objects.insert(kind, l.objects.into_iter().map(|o| (o.key(), o)).collect());
                 }
-                continue;
+                Err(e) => failed = Some(e),
+            }
+        }
+        if let Some(e) = failed {
+            tracing::warn!("listing what the dispatcher follows: {e}");
+            if pause(&mut closing).await {
+                return;
+            }
+            continue;
+        }
+        let publish = |objects: &BTreeMap<Kind, BTreeMap<ObjectKey, Object>>, kind: Kind| {
+            let of = |k: Kind| &objects[&k];
+            match kind {
+                Kind::Node => out
+                    .peers
+                    .send_if_modified(|old| replace(old, Some(&peers(of(Kind::Node))))),
+                Kind::Namespace | Kind::NetworkPolicy => out.policies.send_if_modified(|old| {
+                    replace(
+                        old,
+                        Some(&policies(of(Kind::Namespace), of(Kind::NetworkPolicy))),
+                    )
+                }),
+                _ => out.endpoints.send_if_modified(|old| {
+                    replace(old, Some(&endpoints(of(Kind::Service), of(Kind::Task))))
+                }),
             }
         };
-        // Changes after the oldest listing, so none is missed; replaying
-        // some a newer listing already holds is harmless.
-        let since = services.version.min(tasks.version).min(nodes.version);
-        let by_key = |objects: Vec<Object>| -> BTreeMap<ObjectKey, Object> {
-            objects.into_iter().map(|o| (o.key(), o)).collect()
-        };
-        let (mut services, mut tasks, mut nodes) = (
-            by_key(services.objects),
-            by_key(tasks.objects),
-            by_key(nodes.objects),
-        );
-        endpoints_tx.send_if_modified(|old| replace(old, Some(&endpoints(&services, &tasks))));
-        peers_tx.send_if_modified(|old| replace(old, Some(&peers(&nodes))));
+        for kind in [Kind::Service, Kind::Node, Kind::Namespace] {
+            publish(&objects, kind);
+        }
         let mut watcher = match store.watch(since, None) {
             Ok(w) => w,
             Err(WatchError::Closed) => return,
             Err(e) => {
-                tracing::debug!("watching services, tasks and nodes: {e}; listing again");
+                tracing::debug!("watching what the dispatcher follows: {e}; listing again");
                 continue;
             }
         };
@@ -723,25 +774,44 @@ async fn follow_cluster(
                 Err(WatchError::Closed) => return,
                 Ok(Event::Reset(_)) | Err(_) => break,
             };
-            let m = match o.kind {
-                Kind::Service => &mut services,
-                Kind::Task => &mut tasks,
-                Kind::Node => &mut nodes,
-                _ => continue,
-            };
             let kind = o.kind;
+            let Some(m) = objects.get_mut(&kind) else {
+                continue;
+            };
             if put {
                 m.insert(o.key(), o);
             } else {
                 m.remove(&o.key());
             }
-            if kind == Kind::Node {
-                peers_tx.send_if_modified(|old| replace(old, Some(&peers(&nodes))));
-            } else {
-                endpoints_tx
-                    .send_if_modified(|old| replace(old, Some(&endpoints(&services, &tasks))));
-            }
+            publish(&objects, kind);
         }
+    }
+}
+
+/// Namespaces' isolation, where it is not the default, and every policy.
+fn policies(
+    namespaces: &BTreeMap<ObjectKey, Object>,
+    policies: &BTreeMap<ObjectKey, Object>,
+) -> Policies {
+    Policies {
+        isolation: namespaces
+            .values()
+            .filter_map(|n| {
+                let spec: legion_api::admit::NamespaceSpec = legion_api::parse(&n.spec).ok()?;
+                (spec.isolation != Default::default())
+                    .then(|| (n.metadata.name.clone(), spec.isolation))
+            })
+            .collect(),
+        policies: policies
+            .values()
+            .filter_map(|p| {
+                Some(NamespacedPolicy {
+                    namespace: p.metadata.namespace.clone(),
+                    name: p.metadata.name.clone(),
+                    spec: legion_api::parse(&p.spec).ok()?,
+                })
+            })
+            .collect(),
     }
 }
 
@@ -839,6 +909,7 @@ fn endpoints(
                 namespace: s.metadata.namespace.clone(),
                 name: s.metadata.name.clone(),
                 uid: s.metadata.uid.clone(),
+                labels: s.metadata.labels.clone(),
                 vip: status.virtual_ip.as_deref().and_then(|v| v.parse().ok()),
                 ports,
                 ready,

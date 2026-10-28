@@ -1,7 +1,7 @@
 //! What managers and agents exchange over the dispatcher (DESIGN.md §3.4):
 //! the tasks assigned to a node, every service's endpoints, the nodes of
-//! the WireGuard mesh, and the outcome of claiming a volume. These travel as JSON inside the dispatcher's
-//! messages.
+//! the WireGuard mesh, network policy, and the outcome of claiming a
+//! volume. These travel as JSON inside the dispatcher's messages.
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -9,6 +9,7 @@ use std::net::Ipv4Addr;
 use serde::{Deserialize, Serialize};
 
 use crate::ObjectKey;
+use crate::policy::{Isolation, NetworkPolicySpec};
 use crate::service::Protocol;
 use crate::task::{TaskSpec, TaskStatus};
 use crate::volume::VolumeSpec;
@@ -33,6 +34,9 @@ pub struct ServiceEndpoints {
     pub namespace: String,
     pub name: String,
     pub uid: String,
+    /// The Service's labels, which network policies select by.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     pub vip: Option<Ipv4Addr>,
     pub ports: Vec<EndpointPort>,
     /// Addresses of the service's ready tasks, in order.
@@ -54,6 +58,30 @@ pub struct EndpointPort {
 
 /// Every service in the cluster, by namespace and name.
 pub type Endpoints = Vec<ServiceEndpoints>;
+
+/// What may reach which tasks, cluster-wide (DESIGN.md §5.6).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Policies {
+    /// Namespaces whose isolation is not the default.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub isolation: BTreeMap<String, Isolation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policies: Vec<NamespacedPolicy>,
+}
+
+impl Policies {
+    pub fn isolation(&self, namespace: &str) -> Isolation {
+        self.isolation.get(namespace).copied().unwrap_or_default()
+    }
+}
+
+/// A `NetworkPolicy`, with where it applies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespacedPolicy {
+    pub namespace: String,
+    pub name: String,
+    pub spec: NetworkPolicySpec,
+}
 
 /// A node of the WireGuard mesh (DESIGN.md §5.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

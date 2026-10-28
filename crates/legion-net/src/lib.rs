@@ -18,6 +18,7 @@ use legion_sys::{Destination, IfConfig, Ipv4Net, Sys};
 pub mod dns;
 pub mod lb;
 pub mod mesh;
+pub mod policy;
 
 pub use legion_sys::Error;
 

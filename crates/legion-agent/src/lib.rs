@@ -25,6 +25,7 @@ pub mod control;
 pub mod fake;
 mod files;
 pub mod pod;
+pub mod policing;
 mod probe;
 pub mod runtime;
 mod task;
@@ -193,7 +194,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         let dns = dns(endpoints.clone(), gateway).await;
         let lb = tokio::spawn(load_balancing(
             ctx.sys.clone(),
-            endpoints,
+            endpoints.clone(),
             subnet,
             mesh.is_some(),
         ));
@@ -226,6 +227,14 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 }
             }
         }
+
+        let policy = tokio::spawn(policing_loop(
+            ctx.sys.clone(),
+            endpoints,
+            ctx.control.policies(),
+            assignments.clone(),
+            gateway,
+        ));
 
         let (events_tx, mut events) = mpsc::channel(256);
         let forwarder = tokio::spawn(forward_events(ctx.clone(), events_tx));
@@ -290,6 +299,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         }
         // Rules, tables and peers stay: the pods keep running and talking.
         lb.abort();
+        policy.abort();
         if let Some(mesh) = mesh {
             mesh.abort();
         }
@@ -556,6 +566,81 @@ async fn load_balancing(
                 tracing::warn!("programming pf for services: {e}; retrying");
                 // Start over: the anchor's state is unknown.
                 balancer = LoadBalancer::default();
+                true
+            }
+        };
+    }
+}
+
+/// Keeps the `legion/policy` anchor in line with the namespaces' isolation,
+/// the policies and the pods running here (DESIGN.md §5.6). Nothing is
+/// enforced before the policies are first known.
+async fn policing_loop(
+    sys: Arc<dyn Sys>,
+    mut endpoints: watch::Receiver<legion_api::dispatch::Endpoints>,
+    mut policies: watch::Receiver<Option<legion_api::dispatch::Policies>>,
+    mut assignments: watch::Receiver<legion_api::dispatch::Assignments>,
+    gateway: Ipv4Addr,
+) {
+    use legion_api::service::{SERVICE_NET, SERVICE_PREFIX};
+    use legion_net::policy::Policy;
+
+    // pf must see bridged traffic on the members (FreeBSD 15 does not by
+    // default), and frames for the host on the member they came in on as
+    // well as on the bridge: a pod's traffic to a VIP is checked there,
+    // before the VIP's translation. Host-wide: every bridge's members are
+    // filtered then, which a pass-by-default ruleset does not notice.
+    task::blocking(&sys, |sys| {
+        for name in [
+            "net.link.bridge.pfil_member",
+            "net.link.bridge.pfil_local_phys",
+        ] {
+            if let Err(e) = sys.sysctl_set(name, "1") {
+                tracing::warn!("setting {name}: {e}; network policy will not hold");
+            }
+        }
+    })
+    .await;
+    let services = legion_sys::Ipv4Net::new(SERVICE_NET, SERVICE_PREFIX);
+    let mut policy = Policy::default();
+    let mut retry = false;
+    loop {
+        let wait = Duration::from_secs(if retry { 5 } else { 60 });
+        tokio::select! {
+            r = endpoints.changed() => if r.is_err() { return },
+            r = policies.changed() => if r.is_err() { return },
+            r = assignments.changed() => if r.is_err() { return },
+            () = tokio::time::sleep(wait) => {}
+        }
+        let Some(current) = policies.borrow_and_update().clone() else {
+            continue;
+        };
+        let pods: Vec<policing::LocalPod> = assignments
+            .borrow_and_update()
+            .iter()
+            .filter(|(_, a)| !a.status.state.is_terminal())
+            .filter_map(|(uid, a)| {
+                Some(policing::LocalPod {
+                    interface: legion_net::host_interface(uid),
+                    ip: a.status.ip.as_deref()?.parse().ok()?,
+                    namespace: a.key.namespace.clone(),
+                    service: a.spec.service.clone(),
+                })
+            })
+            .collect();
+        let (guards, tables) = policing::guards(&pods, &endpoints.borrow_and_update(), &current);
+        let (p, result) = task::blocking(&sys, move |sys| {
+            let mut p = policy;
+            let r = p.apply(sys, &guards, &tables, gateway, services);
+            (p, r)
+        })
+        .await;
+        policy = p;
+        retry = match result {
+            Ok(()) => false,
+            Err(e) => {
+                tracing::warn!("programming pf for network policy: {e}; retrying");
+                policy = Policy::default();
                 true
             }
         };

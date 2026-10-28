@@ -199,7 +199,7 @@ fn secret_text_is_stored_as_base64() {
 #[test]
 fn empty_specs_get_defaults() {
     let ns = admitted("apiVersion: legion/v1\nkind: Namespace\nmetadata: { name: shop }\n");
-    assert_eq!(ns.spec, serde_json::json!({}));
+    assert_eq!(ns.spec, serde_json::json!({ "isolation": "namespace" }));
     let node = admitted("apiVersion: legion/v1\nkind: Node\nmetadata: { name: n1 }\n");
     assert_eq!(
         node.spec,

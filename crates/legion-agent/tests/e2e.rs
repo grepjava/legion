@@ -230,6 +230,7 @@ async fn apply_to_running_pods() {
                 namespace: "shop".into(),
                 name: "web".into(),
                 uid: uid.clone(),
+                labels: Default::default(),
                 vip: Some([10, 201, 0, 1].into()),
                 ports: vec![EndpointPort {
                     protocol: legion_api::service::Protocol::Tcp,
@@ -261,6 +262,13 @@ async fn apply_to_running_pods() {
         "{rules}"
     );
     assert_eq!(c.sys.sysctl("net.inet.ip.forwarding").as_deref(), Some("1"));
+    // pf sees the pod bridge's members, for network policy.
+    for name in [
+        "net.link.bridge.pfil_member",
+        "net.link.bridge.pfil_local_phys",
+    ] {
+        assert_eq!(c.sys.sysctl(name).as_deref(), Some("1"), "{name}");
+    }
     // The node registered itself and the scheduler used it.
     let nodes = c.list(Kind::Node).await;
     assert_eq!(nodes[0].metadata.name, "n1");

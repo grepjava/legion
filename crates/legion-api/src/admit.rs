@@ -48,10 +48,14 @@ impl fmt::Display for Invalid {
     }
 }
 
-/// Spec of a `Namespace`: nothing yet.
+/// Spec of a `Namespace`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NamespaceSpec {}
+pub struct NamespaceSpec {
+    /// Which tasks may reach this namespace's tasks without a policy.
+    #[serde(default)]
+    pub isolation: crate::policy::Isolation,
+}
 
 impl Spec for NamespaceSpec {
     fn admit(&mut self) -> Result<(), Invalid> {
@@ -71,7 +75,8 @@ pub fn admit(obj: &mut Object) -> Result<(), Error> {
         Kind::Volume => normalise::<VolumeSpec>(spec),
         Kind::Task => return Err(Error::Managed(obj.kind)),
         Kind::RoleBinding => normalise::<crate::rbac::RoleBindingSpec>(spec),
-        Kind::Job | Kind::CronJob | Kind::NetworkPolicy | Kind::Route => {
+        Kind::NetworkPolicy => normalise::<crate::policy::NetworkPolicySpec>(spec),
+        Kind::Job | Kind::CronJob | Kind::Route => {
             return Err(Error::Unsupported(obj.kind));
         }
     };
