@@ -215,7 +215,10 @@ async fn pod_lifecycle() {
 #[ignore = "needs root and Podman; set LEGION_PODMAN_LAB"]
 async fn a_left_service_is_stopped() {
     let lab = PathBuf::from(std::env::var("LEGION_PODMAN_LAB").expect("set LEGION_PODMAN_LAB"));
-    let config = || ServiceConfig::new(&lab.join("state"), &lab.join("run-left"));
+    // Its own root: Podman records the runroot under the root and refuses
+    // another, so sharing pod_lifecycle's would fail whichever starts second.
+    let left = lab.join("left");
+    let config = || ServiceConfig::new(&left.join("state"), &left.join("run"));
     let socket = config().socket.display().to_string();
     let running = || {
         let out = std::process::Command::new("pgrep")
