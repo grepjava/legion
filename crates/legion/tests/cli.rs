@@ -542,3 +542,27 @@ fn a_manager_is_restored_from_a_backup_and_from_its_own_store() {
         .count();
     assert_eq!(kept, 2, "both old stores kept");
 }
+
+#[test]
+fn a_volume_is_asked_to_move() {
+    let d = start_daemon();
+    ok(&d, &["init"]);
+    let manifest = d._dir.path().join("vol.yaml");
+    std::fs::write(
+        &manifest,
+        "apiVersion: legion/v1\nkind: Volume\nmetadata: { name: cache }\nspec: { size: 1Gi }\n",
+    )
+    .unwrap();
+    ok(&d, &["apply", "-f", manifest.to_str().unwrap()]);
+    let out = ok(&d, &["volume", "move", "cache", "n2"]);
+    assert!(out.contains("moves to n2"), "{out}");
+    let out = ok(&d, &["volume", "move", "cache", "n2"]);
+    assert!(out.contains("already"), "{out}");
+    let got = ok(&d, &["get", "volume", "cache"]);
+    assert!(
+        got.contains("node: n2") && got.contains("size: 1Gi"),
+        "{got}"
+    );
+    let bad = legion(&d, &["volume", "move", "cache", "Not_A_Node"]);
+    assert!(!bad.status.success());
+}

@@ -2334,3 +2334,128 @@ fn autoscale_admission() {
         assert!(err.contains(why), "{bad}: {err}");
     }
 }
+
+impl World {
+    /// Asks for a Volume's data to be on `node`, as an apply would.
+    fn ask(&mut self, volume: &str, node: Option<&str>) {
+        let index = self.next();
+        let v = self
+            .volumes
+            .get_mut(&("shop".to_owned(), volume.to_owned()))
+            .unwrap();
+        v.spec.node = node.map(str::to_owned);
+        v.object.spec = serde_json::to_value(&v.spec).unwrap();
+        v.object.metadata.version = index;
+    }
+
+    fn volume_node(&self, volume: &str) -> String {
+        self.volumes[&("shop".to_owned(), volume.to_owned())]
+            .status
+            .node
+            .clone()
+    }
+}
+
+#[test]
+fn a_volume_moves_where_it_is_asked_to_be_with_its_task() {
+    use legion_api::volume::MigrationPhase::*;
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.service("db", &STATEFUL.replace("replicas: 3", "replicas: 1"));
+    w.settle();
+    let from = w.placed_task("db-0-1").spec.node.clone();
+    let to = if from == "n1" { "n2" } else { "n1" };
+
+    // Asked to be where it is: nothing.
+    w.ask("data-db-0", Some(&from));
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), None);
+
+    // Asked elsewhere: copied while the task runs, then the task stops and
+    // its next one waits for the rest, and runs there.
+    w.ask("data-db-0", Some(to));
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some((to.to_owned(), Copying)));
+    assert_eq!(w.wanted("db"), ["db-0-1"]);
+    w.migrate();
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some((to.to_owned(), Finishing)));
+    assert_eq!(
+        w.placed_task("db-0-2").status.message,
+        "no node can run it: 2 volume moving"
+    );
+    w.migrate();
+    w.settle();
+    assert_eq!(w.volume_node("data-db-0"), to);
+    assert_eq!(w.placed_task("db-0-2").spec.node, to);
+    assert_eq!(w.placed_task("db-0-2").status.state, TaskState::Running);
+
+    // Asked back, then not before the copy is done: dropped, nothing moves.
+    w.ask("data-db-0", Some(&from));
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some((from.clone(), Copying)));
+    w.ask("data-db-0", None);
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), None);
+    assert_eq!(w.wanted("db"), ["db-0-2"]);
+
+    // Asked to a node that cannot take it: waits for it.
+    w.ask("data-db-0", Some(&from));
+    w.availability(&from, Availability::Pause);
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), None);
+    w.availability(&from, Availability::Active);
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some((from.clone(), Copying)));
+}
+
+#[test]
+fn a_drain_moves_a_volume_asked_to_be_there_and_it_comes_back() {
+    use legion_api::volume::MigrationPhase::*;
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.service("db", &STATEFUL.replace("replicas: 3", "replicas: 1"));
+    w.settle();
+    let home = w.placed_task("db-0-1").spec.node.clone();
+    let other = if home == "n1" { "n2" } else { "n1" };
+    w.ask("data-db-0", Some(&home));
+    w.availability(&home, Availability::Drain);
+    for _ in 0..2 {
+        w.settle();
+        w.migrate();
+    }
+    w.settle();
+    assert_eq!(w.volume_node("data-db-0"), other);
+    assert_eq!(
+        w.migration("data-db-0"),
+        None,
+        "stays while its node drains"
+    );
+    w.availability(&home, Availability::Active);
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some((home.clone(), Copying)));
+    for _ in 0..2 {
+        w.migrate();
+        w.settle();
+    }
+    assert_eq!(w.volume_node("data-db-0"), home);
+    assert_eq!(w.running(), ["db-0-3"]);
+}
+
+#[test]
+fn a_new_volume_asked_to_be_on_a_node_takes_its_first_task_there() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.volume("pgdata", "");
+    w.ask("pgdata", Some("n2"));
+    w.service(
+        "db",
+        "replicas: 1\npod: { containers: [{ name: db, image: \"pg:17\" }], volumes: [{ name: data, volume: { name: pgdata } }] }",
+    );
+    w.settle();
+    assert_eq!(w.placed("db"), ["n2"]);
+    assert_eq!(w.volume_node("pgdata"), "n2", "bound by its first task");
+}

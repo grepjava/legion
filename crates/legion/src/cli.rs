@@ -60,6 +60,38 @@ impl Objects {
         .await
     }
 
+    /// Sets `field` of an object's spec to `value`, over the object as just
+    /// read: another write meanwhile (a node's heartbeat, a Volume's
+    /// migration) has it read again. Returns the object's key, and whether
+    /// the field changed.
+    async fn set_spec(
+        &mut self,
+        r#ref: ObjectRef,
+        field: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<(String, bool)> {
+        loop {
+            let current = self.get(r#ref.clone()).await?.into_inner();
+            let mut object = Object::try_from(current)?;
+            if object.spec[field] == value {
+                return Ok((object.key().to_string(), false));
+            }
+            object.spec[field] = value.clone();
+            match self
+                .apply(ApplyRequest {
+                    object: Some((&object).into()),
+                    expected_version: Some(object.metadata.version),
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(_) => return Ok((object.key().to_string(), true)),
+                Err(s) if s.code() == tonic::Code::Aborted => continue,
+                Err(s) => return Err(s.into()),
+            }
+        }
+    }
+
     async fn get(&mut self, req: ObjectRef) -> Answer<pb::Object> {
         let client = &self.0;
         retrying(|| {
@@ -333,31 +365,30 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 namespace: String::new(),
                 name: node,
             };
-            loop {
-                let current = objects.get(r#ref.clone()).await?.into_inner();
-                let mut object = Object::try_from(current)?;
-                if object.spec["availability"] == availability {
-                    println!("{} is already {availability}", object.key());
-                    break;
-                }
-                object.spec["availability"] = availability.into();
-                // Over the node as just read; the node's heartbeats move
-                // its version meanwhile, and then it is read again.
-                match objects
-                    .apply(ApplyRequest {
-                        object: Some((&object).into()),
-                        expected_version: Some(object.metadata.version),
-                        ..Default::default()
-                    })
-                    .await
-                {
-                    Ok(_) => {
-                        println!("{} {availability}", object.key());
-                        break;
-                    }
-                    Err(s) if s.code() == tonic::Code::Aborted => continue,
-                    Err(s) => return Err(s.into()),
-                }
+            match objects
+                .set_spec(r#ref, "availability", availability.into())
+                .await?
+            {
+                (key, true) => println!("{key} {availability}"),
+                (key, false) => println!("{key} is already {availability}"),
+            }
+        }
+        Command::Volume {
+            command:
+                crate::VolumeCommand::Move {
+                    volume,
+                    node,
+                    namespace,
+                },
+        } => {
+            let r#ref = ObjectRef {
+                kind: Kind::Volume.to_string(),
+                namespace: namespace.unwrap_or_default(),
+                name: volume,
+            };
+            match objects.set_spec(r#ref, "node", node.clone().into()).await? {
+                (key, true) => println!("{key} moves to {node}"),
+                (key, false) => println!("{key} is already asked to be on {node}"),
             }
         }
         Command::Rollback { service, namespace } => {

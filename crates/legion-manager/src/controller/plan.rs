@@ -83,10 +83,11 @@ pub type Volumes = BTreeMap<(String, String), Volume>;
 
 /// The node holding a Volume's data, once a task has used it.
 fn home<'a>(volumes: &'a Volumes, namespace: &str, name: &str) -> Option<&'a str> {
-    volumes
-        .get(&(namespace.to_owned(), name.to_owned()))
-        .map(|v| v.status.node.as_str())
-        .filter(|n| !n.is_empty())
+    let v = volumes.get(&(namespace.to_owned(), name.to_owned()))?;
+    match v.status.node.as_str() {
+        "" => v.spec.node.as_deref(),
+        node => Some(node),
+    }
 }
 
 /// Namespace quotas, by namespace.
@@ -548,8 +549,12 @@ fn service(
         t.active() && t.spec.slot.is_some() && nodes.iter().any(|n| n.name() == t.spec.node && f(n))
     };
     let evicted = |t: &Task| on_node(t, &|n| n.repels(s, TaintEffect::NoExecute));
-    let draining =
-        |t: &Task| !evicted(t) && on_node(t, &|n| n.spec.availability == Availability::Drain);
+    // Off a draining node, or with its data moving off its node.
+    let draining = |t: &Task| {
+        !evicted(t)
+            && (on_node(t, &|n| n.spec.availability == Availability::Drain)
+                || (on_node(t, &|_| true) && migrate::leaving(t, volumes)))
+    };
     for t in tasks.iter().filter(|t| evicted(t)) {
         plan.actions.push(stop(t));
     }
@@ -1104,13 +1109,13 @@ fn eligible(
         return Err("taints");
     }
     let namespace = &s.object.metadata.namespace;
-    let finishing = mounts.iter().any(|v| {
+    // A task starting now would hold the data where it no longer stays.
+    let moving = mounts.iter().any(|v| {
         volumes
             .get(&(namespace.clone(), v.clone()))
-            .and_then(|v| v.status.migration.as_ref())
-            .is_some_and(|m| m.phase == legion_api::volume::MigrationPhase::Finishing)
+            .is_some_and(|v| v.status.migration.is_some())
     });
-    if finishing {
+    if moving {
         return Err("volume moving");
     }
     let elsewhere = mounts

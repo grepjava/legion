@@ -646,10 +646,23 @@ service and migrates between nodes.
   admission, and through a manager and two agents with fake rctl, a busy
   service growing from one task to three and back.
 
+- **Moving a Volume on request** (`spec.node` on Volumes, `legion volume
+  move`, DESIGN.md §4.3): a Volume's `node` names where its data should
+  be; set elsewhere than the data, the migrator moves it as for a drain
+  and the tasks using it follow, and set before first use it places the
+  first task. A drain still moves a Volume asked to be on the draining
+  node, which returns once the node is active. New placements wait during
+  any migration (`volume moving`), not only its last part. `legion node`
+  and `legion volume move` share a read-then-write that retries over
+  concurrent writes. Tested: the planner (no move to where it is, copy
+  with the task running, stop, wait, run on the new node; called off;
+  waiting for a paused node; drained and back; a first task placed by
+  `node`), through a manager and two agents with fake ZFS (the data
+  arriving, the old copy dropped), and the CLI.
+
 ### To do, in order
 
-1. Ingress routes, CARP VIP, autolock. Moving a Volume on request rather
-   than by a drain.
+1. Ingress routes, CARP VIP, autolock.
 
 Smaller follow-ups: memory limits for workloads with large shared memory
 (rctl counts it per process; `vmemoryuse` or a pod-wide allowance).

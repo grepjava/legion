@@ -659,3 +659,54 @@ spec:
     .await;
     c.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_volume_moves_to_the_node_it_is_asked_to_be_on() {
+    let c = Cluster::start(2).await;
+    c.apply(&DB.replace("MAX", "1")).await;
+    let task = async |c: &Cluster| {
+        c.list(Kind::Task)
+            .await
+            .into_iter()
+            .find(|t| t.status["state"] == "running")
+    };
+    eventually("db running", async || task(&c).await.is_some()).await;
+    let from = task(&c).await.unwrap().spec["node"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let to = if from == "n1" { "n2" } else { "n1" };
+    let index = |name: &str| c.nodes.iter().position(|n| n.name == name).unwrap();
+    let ds = "tank/legion/volumes/shop/data-db-0";
+    c.nodes[index(&from)].sys.write_dataset(ds, b"rows 1");
+
+    // As `legion volume move` does: the Volume's spec names the node.
+    let mut v = c
+        .list(Kind::Volume)
+        .await
+        .into_iter()
+        .find(|v| v.metadata.name == "data-db-0")
+        .unwrap();
+    v.spec["node"] = to.into();
+    c.api
+        .clone()
+        .apply(ApplyRequest {
+            object: Some((&v).into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    eventually("db running on the other node", async || {
+        task(&c).await.is_some_and(|t| t.spec["node"] == to)
+    })
+    .await;
+    assert_eq!(
+        c.nodes[index(to)].sys.dataset_contents(ds).as_deref(),
+        Some(&b"rows 1"[..])
+    );
+    eventually("old copy dropped", async || {
+        c.nodes[index(&from)].sys.zfs_list(ds).unwrap().is_empty()
+    })
+    .await;
+    c.stop().await;
+}

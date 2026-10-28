@@ -183,6 +183,11 @@ enum Command {
         availability: String,
         node: String,
     },
+    /// Volumes: where their data is.
+    Volume {
+        #[command(subcommand)]
+        command: VolumeCommand,
+    },
     /// Roll a service back to the spec its latest update came from.
     Rollback {
         service: String,
@@ -241,6 +246,19 @@ enum Command {
         /// Where to listen.
         #[arg(long, default_value = "127.0.0.1")]
         address: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum VolumeCommand {
+    /// Move a Volume's data to NODE (its `spec.node`): copied while its
+    /// tasks run, which then stop and start again there once the rest has
+    /// gone. It stays there, and returns there after a drain.
+    Move {
+        volume: String,
+        node: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
     },
 }
 

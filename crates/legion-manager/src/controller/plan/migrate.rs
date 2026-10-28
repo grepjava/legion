@@ -34,14 +34,14 @@ pub(super) fn migrations(
         })
     };
 
-    // Advance or drop the migrations under way.
+    // Advance or drop the migrations under way. One not yet finishing goes
+    // when neither a drain nor the Volume's `node` calls for it any more.
     for ((namespace, name), v) in volumes {
         let Some(m) = &v.status.migration else {
             continue;
         };
-        let next = if !usable(&m.to)
-            || (m.phase != MigrationPhase::Finishing && !draining(&v.status.node))
-        {
+        let wanted = requested(v) == Some(m.to.as_str()) || draining(&v.status.node);
+        let next = if !usable(&m.to) || (m.phase != MigrationPhase::Finishing && !wanted) {
             None
         } else if m.phase == MigrationPhase::Copied
             && !tasks.iter().any(|t| {
@@ -59,8 +59,27 @@ pub(super) fn migrations(
         write(v, next, plan);
     }
 
-    // Start one for each wanted ordinal whose Volumes are on a draining
-    // node; all of an ordinal's Volumes go to the same node.
+    // Start one for each Volume asked to be on another node that can take
+    // it.
+    let mut started = std::collections::BTreeSet::new();
+    for (key, v) in volumes {
+        if let Some(to) = requested(v)
+            && v.status.migration.is_none()
+            && usable(to)
+        {
+            let m = Migration {
+                to: to.to_owned(),
+                phase: MigrationPhase::Copying,
+                message: String::new(),
+            };
+            write(v, Some(m), plan);
+            started.insert(key);
+        }
+    }
+
+    // And one for each wanted ordinal whose Volumes are on a draining
+    // node, even one asked to be there, where it returns once the node is
+    // active again; all of an ordinal's Volumes go to the same node.
     for s in services
         .iter()
         .filter(|s| s.spec.mode == ServiceMode::Stateful)
@@ -72,7 +91,8 @@ pub(super) fn migrations(
                 .pod
                 .claims()
                 .filter_map(|(claim, _)| {
-                    volumes.get(&(namespace.to_owned(), claim_volume(claim, svc, n)))
+                    let key = (namespace.to_owned(), claim_volume(claim, svc, n));
+                    volumes.get(&key).filter(|_| !started.contains(&key))
                 })
                 .filter(|v| {
                     v.status.migration.is_none()
@@ -96,6 +116,14 @@ pub(super) fn migrations(
             }
         }
     }
+}
+
+/// Where a Volume is asked to be, when that is not where it is.
+fn requested(v: &Volume) -> Option<&str> {
+    v.spec
+        .node
+        .as_deref()
+        .filter(|to| !v.status.node.is_empty() && *to != v.status.node)
 }
 
 /// Where an ordinal of `s` moves from `from`: a node its tasks may run on,
@@ -128,6 +156,16 @@ fn write(v: &Volume, migration: Option<Migration>, plan: &mut Plan) {
     .expect("serialises");
     plan.actions
         .push(Action::Update(o, v.object.metadata.version));
+}
+
+/// Whether one of the Volumes a task uses is moving off its node.
+pub(super) fn leaving(t: &Task, volumes: &Volumes) -> bool {
+    let namespace = &t.object.metadata.namespace;
+    t.spec.volumes().iter().any(|name| {
+        volumes
+            .get(&(namespace.clone(), name.clone()))
+            .is_some_and(|v| v.status.node == t.spec.node && v.status.migration.is_some())
+    })
 }
 
 /// Whether a task on a draining node may stop: its Volumes there have been

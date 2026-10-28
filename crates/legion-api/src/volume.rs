@@ -14,6 +14,11 @@ pub struct VolumeSpec {
     /// ZFS quota; none by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<Bytes>,
+    /// The node to keep the data on. Unset, the first task to use the
+    /// Volume decides; set to another node, the data moves there, as off
+    /// a draining node, its tasks with it (DESIGN.md §4.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +32,9 @@ impl Spec for VolumeSpec {
     fn admit(&mut self) -> Result<(), Invalid> {
         if self.size == Some(Bytes(0)) {
             return Err(Invalid::new("size", "must be above zero"));
+        }
+        if let Some(node) = &self.node {
+            crate::validate_name(node).map_err(|e| Invalid::new("node", e.to_string()))?;
         }
         Ok(())
     }
