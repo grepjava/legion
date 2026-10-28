@@ -464,6 +464,18 @@ Already there from phase 1: namespaces scope names and DNS
   from the fake runtime (the infra jail left out); and on weft-bsd, real
   rctl usage of both containers in the agent's live test, and the phase
   1 exit test's daemon scraped once its app was ready.
+- **Flaky tests fixed.** One was a bug: a container's `died` event that
+  came after a resync had already seen the exit and restarted the
+  container counted as a new exit, restarting the new run (an extra
+  restart, and an attempt used up); the agent now ignores the event while
+  the container runs. Also `legion rollback` failed with ABORTED when the
+  controllers wrote the Service's status between its read and its write;
+  it now reads again while only the status changed. The rest were races
+  in tests: an init container checked before it started, followed logs
+  opened after the line they waited for, and a probe test's closed port
+  taken by another test. Tested: a held-back event against a restarted
+  container (fails without the fix), and 14 clean runs of the whole suite
+  in a row.
 
 ### To do, in order
 
@@ -479,9 +491,7 @@ their own jails.
 Smaller follow-ups: egress policies; a new pod is unguarded for the
 moment between its start and the agent's next pass (the guard could go in
 before its containers start); lab runs on weft-bsd leave the bridge
-sysctls at 1; the agent tests' timing flakes under load (a different test
-each time: liveness, restart policy, sessions), each
-passing alone; API request counts and latencies in the metrics.
+sysctls at 1; API request counts and latencies in the metrics.
 
 ## Later phases
 

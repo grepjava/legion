@@ -211,41 +211,54 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             println!("{kind}/{name} deleted (version {})", resp.version);
         }
         Command::Rollback { service, namespace } => {
-            let current = objects
-                .get(ObjectRef {
-                    kind: Kind::Service.to_string(),
-                    namespace: namespace.unwrap_or_default(),
-                    name: service,
-                })
-                .await?
-                .into_inner();
-            let mut object = Object::try_from(current)?;
-            let status: ServiceStatus =
-                serde_json::from_value(object.status.clone()).unwrap_or_default();
-            let Some(update) = status.update else {
-                bail!("{} has had no update to roll back", object.key());
+            let r#ref = ObjectRef {
+                kind: Kind::Service.to_string(),
+                namespace: namespace.unwrap_or_default(),
+                name: service,
             };
-            if serde_json::to_value(&update.previous)? == object.spec {
-                bail!(
-                    "{} already runs the spec before its latest update",
-                    object.key()
+            // The generation the rollback undoes the latest update of.
+            let mut generation = None;
+            loop {
+                let current = objects.get(r#ref.clone()).await?.into_inner();
+                let mut object = Object::try_from(current)?;
+                if generation.is_some_and(|g| g != object.metadata.generation) {
+                    bail!("{} changed meanwhile; nothing rolled back", object.key());
+                }
+                generation = Some(object.metadata.generation);
+                let status: ServiceStatus =
+                    serde_json::from_value(object.status.clone()).unwrap_or_default();
+                let Some(update) = status.update else {
+                    bail!("{} has had no update to roll back", object.key());
+                };
+                if serde_json::to_value(&update.previous)? == object.spec {
+                    bail!(
+                        "{} already runs the spec before its latest update",
+                        object.key()
+                    );
+                }
+                object.spec = serde_json::to_value(&update.previous)?;
+                // Only over the spec just read: a newer change wins. The
+                // controllers write the status meanwhile, which moves the
+                // version too; then it is read again.
+                let resp = match objects
+                    .apply(ApplyRequest {
+                        object: Some((&object).into()),
+                        expected_version: Some(object.metadata.version),
+                        ..Default::default()
+                    })
+                    .await
+                {
+                    Ok(resp) => resp.into_inner(),
+                    Err(s) if s.code() == tonic::Code::Aborted => continue,
+                    Err(s) => return Err(s.into()),
+                };
+                println!(
+                    "{} rolling back (version {})",
+                    object.key(),
+                    resp.object.unwrap_or_default().version
                 );
+                break;
             }
-            object.spec = serde_json::to_value(&update.previous)?;
-            // Only over the spec just read: a newer change wins.
-            let resp = objects
-                .apply(ApplyRequest {
-                    object: Some((&object).into()),
-                    expected_version: Some(object.metadata.version),
-                    ..Default::default()
-                })
-                .await?
-                .into_inner();
-            println!(
-                "{} rolling back (version {})",
-                object.key(),
-                resp.object.unwrap_or_default().version
-            );
         }
         Command::Watch { kind, from } => {
             let kind = kind.as_deref().map(parse_kind).transpose()?;

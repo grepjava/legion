@@ -374,6 +374,38 @@ restartPolicy: { condition: on-failure, maxAttempts: 2, delay: 0s }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_events_do_not_restart_a_new_run() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task(
+            "app-1",
+            r#"
+containers: [{ name: app, image: "app:1" }]
+restartPolicy: { condition: any, delay: 0s }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    let starts = || {
+        h.rt.containers()
+            .into_iter()
+            .find(|(n, ..)| n == "shop_app-1_app")
+            .map_or(0, |(_, _, starts)| starts)
+    };
+
+    // The exit's event comes only after a resync has seen the exit and
+    // restarted the container: it is about the run before.
+    h.rt.hold_events(true);
+    h.rt.exit("shop_app-1_app", 1);
+    eventually("restarted by a resync", || starts() == 2).await;
+    h.rt.hold_events(false);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(starts(), 2, "the late event restarted the new run");
+    assert_eq!(h.status(&key).restarts, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn run_to_completion() {
     let h = Harness::new().await;
     h.rt.add_image("job:1");
@@ -1412,15 +1444,20 @@ async fn sessions_reach_the_pod() {
     s.send(Frame::InputClosed(pb::InputClosed {})).await;
     assert_eq!(s.rest().await, (vec![], None));
 
-    // Followed logs go on until the container stops.
-    let mut s = Session::open(&h, open("web-1", logs(true, Some(0))))
+    // Followed logs go on until the container stops. The session is open
+    // before the agent follows, so they are followed from the start: a
+    // line written in between comes either way.
+    let mut s = Session::open(&h, open("web-1", logs(true, None)))
         .await
         .unwrap();
     h.rt.log(APP, Output::Stdout, "three\n");
-    assert_eq!(
-        s.next().await.unwrap().unwrap(),
-        Frame::Stdout(b"three\n".to_vec())
-    );
+    for want in [
+        Frame::Stdout(b"one\n".to_vec()),
+        Frame::Stderr(b"two\n".to_vec()),
+        Frame::Stdout(b"three\n".to_vec()),
+    ] {
+        assert_eq!(s.next().await.unwrap().unwrap(), want);
+    }
     h.rt.exit(APP, 0);
     assert_eq!(s.rest().await, (vec![], None));
 }

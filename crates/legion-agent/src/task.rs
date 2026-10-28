@@ -673,7 +673,13 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                             .await;
                     }
                     Some(Msg::Died { id, code }) => {
-                        if let Some(i) = pod.members.iter().position(|m| m.id == id && m.running) {
+                        // A resync may have seen the exit first and the
+                        // container been restarted since: the event is
+                        // then about the run before, and acting on it
+                        // would restart the new run.
+                        if let Some(i) = pod.members.iter().position(|m| m.id == id && m.running)
+                            && !self.is_running(&id).await
+                        {
                             let code = match code {
                                 Some(c) => c,
                                 None => self.exit_code(&id).await,

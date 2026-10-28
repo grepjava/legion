@@ -389,10 +389,11 @@ mod tests {
         let rt = rt();
         let addr = server("200 OK").await;
         assert_eq!(Check::Tcp { addr }.run(&rt, T).await, Ok(()));
-        // A port nothing listens on, taken from a listener just closed.
-        let gone = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = gone.local_addr().unwrap();
-        drop(gone);
+        // A port nothing listens on: bound, so no other test takes it, but
+        // not listening.
+        let held = tokio::net::TcpSocket::new_v4().unwrap();
+        held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = held.local_addr().unwrap();
         // Refused at once, or (Windows retries refused connections) late.
         let err = Check::Tcp { addr }.run(&rt, T).await.unwrap_err();
         assert!(

@@ -58,6 +58,8 @@ struct State {
     logs: BTreeMap<String, Vec<Chunk>>,
     /// Attached execs: their exit code once done, and terminal size.
     sessions: BTreeMap<String, Session>,
+    /// Events held back, while holding them, as a slow event stream would.
+    held: Option<Vec<Event>>,
 }
 
 /// An attached exec's view of its session.
@@ -138,6 +140,22 @@ impl FakeRuntime {
 
     pub fn set_init_exit_code(&self, code: i32) {
         self.state().init_exit_code = code;
+    }
+
+    /// Holds back events from now on, as a slow event stream would; they
+    /// go out when `hold` is false again.
+    pub fn hold_events(&self, hold: bool) {
+        let held = {
+            let mut s = self.state();
+            if hold {
+                s.held.get_or_insert_with(Vec::new);
+                return;
+            }
+            s.held.take().unwrap_or_default()
+        };
+        for e in held {
+            let _ = self.events.send(e);
+        }
     }
 
     /// Init containers started from now on run until stopped.
@@ -254,7 +272,7 @@ impl FakeRuntime {
         let mut attributes = labels;
         attributes.insert("name".into(), name);
         attributes.insert("containerExitCode".into(), code.to_string());
-        let _ = self.events.send(Event {
+        let event = Event {
             kind: "container".into(),
             action: "died".into(),
             actor: Actor {
@@ -262,7 +280,13 @@ impl FakeRuntime {
                 attributes,
             },
             time_nano: 0,
-        });
+        };
+        match s.held.as_mut() {
+            Some(held) => held.push(event),
+            None => {
+                let _ = self.events.send(event);
+            }
+        }
     }
 
     fn get(&self, id: &str) -> Result<Container> {
