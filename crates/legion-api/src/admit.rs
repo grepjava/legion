@@ -93,7 +93,7 @@ pub fn admit(obj: &mut Object) -> Result<(), Error> {
                     invalid: Invalid::new(
                         "",
                         format!(
-                            "a CronJob's name is at most {} characters: its Jobs add the time                              of each run",
+                            "a CronJob's name is at most {} characters: its Jobs add the time of each run",
                             crate::job::CRON_JOB_NAME_MAX
                         ),
                     ),

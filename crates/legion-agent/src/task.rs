@@ -550,7 +550,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                     .map_err(|e| format!("setting container {name}'s jail profile: {e}"));
             }
             Err(format!(
-                "container {name}'s jail has {k}={}, not {v}: Legion's jail hook did not run,                  so the jail is not locked down",
+                "container {name}'s jail has {k}={}, not {v}: Legion's jail hook did not run, so the jail is not locked down",
                 got.get(*k).map_or("?", String::as_str)
             ))
         })

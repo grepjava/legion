@@ -124,7 +124,7 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             };
             crate::pki::write_private(&path, &bundle.to_pem())?;
             println!(
-                "wrote {}: user {name}'s credentials for {days} days; hand it to them                  for --identity",
+                "wrote {}: user {name}'s credentials for {days} days; hand it to them for --identity",
                 path.display()
             );
             if let (Some(role), Some(namespace)) = (role, namespace) {

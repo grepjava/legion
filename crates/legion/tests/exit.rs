@@ -292,11 +292,7 @@ fn app_survives_failures() {
         "legion_agent_pods 4",
         "legion_agent_usage_unread 0",
     ] {
-        assert!(
-            metrics.lines().any(|l| l == line),
-            "{line} in:
-{metrics}"
-        );
+        assert!(metrics.lines().any(|l| l == line), "{line} in:\n{metrics}");
     }
     let memory = |metrics: &str| -> Vec<f64> {
         metrics

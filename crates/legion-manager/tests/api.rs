@@ -1395,14 +1395,7 @@ async fn namespaces_decide_how_far_jails_loosen() {
 async fn the_leader_reports_the_cluster() {
     let m = Running::start().await;
     let before = m.metrics.collect().finish();
-    assert!(
-        before.contains(
-            "
-legion_raft_leader 0
-"
-        ),
-        "{before}"
-    );
+    assert!(before.contains("\nlegion_raft_leader 0\n"), "{before}");
     assert!(!before.contains("legion_tasks"), "{before}");
 
     m.cluster().await.init(InitRequest {}).await.unwrap();
@@ -1444,10 +1437,7 @@ legion_raft_leader 0
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let text = loop {
         let text = m.metrics.collect().finish();
-        if text.contains(
-            "legion_tasks{namespace=\"team\",state=\"pending\"} 2
-",
-        ) {
+        if text.contains("legion_tasks{namespace=\"team\",state=\"pending\"} 2\n") {
             break text;
         }
         assert!(tokio::time::Instant::now() < deadline, "{text}");
@@ -1469,15 +1459,7 @@ legion_raft_leader 0
         "legion_quota_used{namespace=\"team\",resource=\"tasks\"} 0",
         "legion_quota_used{namespace=\"team\",resource=\"volumes\"} 1",
     ] {
-        assert!(
-            text.contains(&format!(
-                "
-{line}
-"
-            )),
-            "{line} in:
-{text}"
-        );
+        assert!(text.contains(&format!("\n{line}\n")), "{line} in:\n{text}");
     }
     assert!(!text.contains("resource=\"cpu\""), "{text}");
 

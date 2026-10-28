@@ -37,6 +37,11 @@ pub struct ServiceConfig {
     pub storage_opts: Vec<String>,
     /// OCI hooks, in place of the system's: the agent's jail hook.
     pub hooks_dir: Option<PathBuf>,
+    /// How long an exec session's conmon stays after the command ends, so
+    /// a client of the service can still read the exit code. Podman's
+    /// default is five minutes, which with exec probes keeps hundreds of
+    /// conmons per probed container; Legion reads the code at once.
+    pub exec_exit_delay: Duration,
 }
 
 impl ServiceConfig {
@@ -53,7 +58,22 @@ impl ServiceConfig {
             storage_driver: None,
             storage_opts: Vec::new(),
             hooks_dir: Some(run_dir.join("podman-hooks")),
+            exec_exit_delay: Duration::from_secs(5),
         }
+    }
+
+    /// Settings beyond the command line, in containers.conf form; the
+    /// service reads them after the system's own.
+    pub fn conf(&self) -> String {
+        format!(
+            "[engine]\nexit_command_delay = {}\n",
+            self.exec_exit_delay.as_secs()
+        )
+    }
+
+    /// Where the service's containers.conf overrides are written.
+    pub fn conf_file(&self) -> PathBuf {
+        self.socket.with_extension("conf")
     }
 
     pub fn endpoint(&self) -> Endpoint {
@@ -228,8 +248,11 @@ fn spawn(config: &ServiceConfig) -> Result<Child, ServiceError> {
     let pidfile = config.socket.with_extension("pid");
     stop_stale(&pidfile, &config.socket);
     let _ = std::fs::remove_file(&config.socket);
+    let conf = config.conf_file();
+    std::fs::write(&conf, config.conf()).map_err(err)?;
     let mut child = Command::new(&config.program)
         .args(config.args())
+        .env("CONTAINERS_CONF_OVERRIDE", &conf)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -237,13 +260,7 @@ fn spawn(config: &ServiceConfig) -> Result<Child, ServiceError> {
         .spawn()
         .map_err(err)?;
     if let Some(pid) = child.id() {
-        let _ = std::fs::write(
-            &pidfile,
-            format!(
-                "{pid}
-"
-            ),
-        );
+        let _ = std::fs::write(&pidfile, format!("{pid}\n"));
     }
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(async move {
@@ -294,6 +311,16 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_sessions_end_soon() {
+        let c = ServiceConfig::new(Path::new("/var/db/legion"), Path::new("/var/run/legion"));
+        assert_eq!(c.conf(), "[engine]\nexit_command_delay = 5\n");
+        assert_eq!(
+            c.conf_file().to_string_lossy().replace('\\', "/"),
+            "/var/run/legion/podman.conf"
+        );
+    }
 
     #[test]
     fn args_keep_all_three_paths_separate() {

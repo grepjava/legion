@@ -280,25 +280,13 @@ async fn agent_runs_a_real_pod() {
     assert!(rules.contains("maxproc:deny=32"), "{rules}");
     // The agent's metrics read each container's usage from rctl.
     let text = metrics.collect().await.finish();
-    assert!(
-        text.contains(
-            "
-legion_agent_usage_unread 0
-"
-        ),
-        "{text}"
-    );
+    assert!(text.contains("\nlegion_agent_usage_unread 0\n"), "{text}");
     let usage = |name: &str, container: &str| -> f64 {
         let series =
             format!("{name}{{namespace=\"lab\",task=\"web-1\",container=\"{container}\"}} ");
         text.lines()
             .find_map(|l| l.strip_prefix(&series))
-            .unwrap_or_else(|| {
-                panic!(
-                    "{series} in:
-{text}"
-                )
-            })
+            .unwrap_or_else(|| panic!("{series} in:\n{text}"))
             .parse()
             .unwrap()
     };
@@ -317,25 +305,14 @@ legion_agent_usage_unread 0
         "allow.noraw_sockets allow.nochflags enforce_statfs=2 securelevel=2"
     );
     let pinger = podman.inspect("lab_web-1_pinger").await.unwrap();
-    for (id, want) in [
-        (
-            &app.id, "2
-",
-        ),
-        (
-            &pinger.id,
-            "pinged
-2
-",
-        ),
-    ] {
+    for (id, want) in [(&app.id, "2\n"), (&pinger.id, "pinged\n2\n")] {
         let out = podman
             .exec(
                 id,
                 &[
                     "/bin/sh".into(),
                     "-c".into(),
-                    "/sbin/ping -c1 -t2 10.200.0.1 >/dev/null 2>&1 && echo pinged;                      /sbin/sysctl -n kern.securelevel"
+                    "/sbin/ping -c1 -t2 10.200.0.1 >/dev/null 2>&1 && echo pinged; /sbin/sysctl -n kern.securelevel"
                         .into(),
                 ],
             )
@@ -426,8 +403,7 @@ legion_agent_usage_unread 0
     let out = sh_in("read x < /scratch/init && echo $x").await;
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "prepared
-",
+        "prepared\n",
         "the init container ran first"
     );
     let out = sh_in("echo kept > /scratch/f && read x < /scratch/f && echo $x").await;
@@ -567,10 +543,7 @@ legion_agent_usage_unread 0
     let kept = lab.join("logs").join(status_uid(&store, &failing));
     let saved = String::from_utf8_lossy(&std::fs::read(kept.join("check")).unwrap()).into_owned();
     assert!(
-        saved.contains(
-            "checking
-"
-        ) && saved.contains("missing schema"),
+        saved.contains("checking\n") && saved.contains("missing schema"),
         "{saved:?}"
     );
 

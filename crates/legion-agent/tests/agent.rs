@@ -624,20 +624,9 @@ containers:
         "legion_container_memory_bytes{namespace=\"shop\",task=\"app-1\",container=\"side\"} 1024",
         "legion_container_processes{namespace=\"shop\",task=\"app-1\",container=\"app\"} 3",
     ] {
-        assert!(
-            text.contains(&format!(
-                "
-{line}
-"
-            )),
-            "{line} in:
-{text}"
-        );
+        assert!(text.contains(&format!("\n{line}\n")), "{line} in:\n{text}");
     }
-    assert!(text.contains(
-        "# TYPE legion_container_cpu_seconds_total counter
-"
-    ));
+    assert!(text.contains("# TYPE legion_container_cpu_seconds_total counter\n"));
     assert!(!text.contains("5120"), "{text}");
 }
 
@@ -658,19 +647,8 @@ async fn startup_failures() {
     h.rt.add_image("web:1");
     h.rt.set_init_exit_code(2);
     // The pod goes with the failure, so its last words are kept.
-    h.rt.log(
-        "shop_i-1_migrate",
-        Output::Stdout,
-        "migrating
-
-",
-    );
-    h.rt.log(
-        "shop_i-1_migrate",
-        Output::Stderr,
-        "no such table: users
-",
-    );
+    h.rt.log("shop_i-1_migrate", Output::Stdout, "migrating\n\n");
+    h.rt.log("shop_i-1_migrate", Output::Stderr, "no such table: users\n");
     let init = h.task("i-1", WEB).await;
     let status = h.wait_state(&init, TaskState::Failed).await;
     assert_eq!(

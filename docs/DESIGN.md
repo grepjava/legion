@@ -711,6 +711,15 @@ The storage driver comes from the host's `containers/storage.conf`. The
 FreeBSD package sets `zfs`; on a UFS host Podman then refuses to start
 ("could not open /dev/zfs") until the driver is set to `vfs`.
 
+Through the service's API, each exec session's conmon stays for Podman's
+`exit_command_delay` after the command ends, so the client can still
+read the exit code: five minutes by default. With an exec probe every
+second that is some 300 conmon pairs per probed container. Legion reads
+the code as soon as the output ends, so its Podman gets five seconds,
+from a containers.conf override (`<run-dir>/podman.conf`, passed as
+`CONTAINERS_CONF_OVERRIDE`) that leaves the system's configuration
+alone.
+
 ### 6.2 Pod construction
 
 Podman pods and `--network container:` do **not** give a private shared VNET on

@@ -476,6 +476,11 @@ Already there from phase 1: namespaces scope names and DNS
   taken by another test. Tested: a held-back event against a restarted
   container (fails without the fix), and 14 clean runs of the whole suite
   in a row.
+- **Exec sessions no longer keep conmons for five minutes** (DESIGN.md
+  §6.1): Legion's Podman gets `exit_command_delay = 5` through a
+  containers.conf override. Found when the exit test left conmon pairs
+  behind; on weft-bsd, with exec probes every second, the live test now
+  peaks at about 40 conmons and is back to none seconds after it ends.
 
 ### To do, in order
 
