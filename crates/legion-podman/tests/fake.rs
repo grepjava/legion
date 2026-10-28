@@ -245,6 +245,92 @@ async fn exec_collects_output_and_exit_code() {
     );
 }
 
+/// Exec with stdin: libpod answers the start with 101 and then echoes, as
+/// `cat` would, multiplexed, until stdin closes.
+#[tokio::test]
+async fn exec_attach_takes_over_the_connection() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let (conn, _) = listener.accept().await.unwrap();
+            let log = log.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let log = log.clone();
+                    async move {
+                        let path = req.uri().path().to_owned();
+                        let upgrade = req.headers().get("upgrade").cloned();
+                        log.lock().unwrap().push((path.clone(), upgrade.clone()));
+                        let reply = |status, body: &'static [u8]| {
+                            Response::builder()
+                                .status(status)
+                                .body(Full::new(Bytes::from_static(body)))
+                                .unwrap()
+                        };
+                        if path.ends_with("/containers/c1/exec") {
+                            return Ok::<_, Infallible>(reply(201, br#"{"Id":"e1"}"#));
+                        }
+                        if path.ends_with("/exec/e1/json") {
+                            return Ok(reply(200, br#"{"ExitCode":0,"Running":false}"#));
+                        }
+                        assert!(path.ends_with("/exec/e1/start"));
+                        assert!(upgrade.is_some(), "no upgrade asked for");
+                        tokio::spawn(async move {
+                            let mut io = TokioIo::new(hyper::upgrade::on(req).await.unwrap());
+                            let mut buf = [0u8; 64];
+                            loop {
+                                let n = io.read(&mut buf).await.unwrap();
+                                if n == 0 {
+                                    break;
+                                }
+                                let mut frame = vec![1, 0, 0, 0];
+                                frame.extend_from_slice(&(n as u32).to_be_bytes());
+                                frame.extend_from_slice(&buf[..n]);
+                                io.write_all(&frame).await.unwrap();
+                            }
+                            io.write_all(b"\x02\0\0\0\0\0\0\x03eof").await.unwrap();
+                            io.shutdown().await.unwrap();
+                        });
+                        Ok(Response::builder()
+                            .status(101)
+                            .header("connection", "Upgrade")
+                            .header("upgrade", "tcp")
+                            .body(Full::new(Bytes::new()))
+                            .unwrap())
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(conn), svc)
+                    .with_upgrades()
+                    .await;
+            });
+        }
+    });
+    let podman = Podman::new(Endpoint::Tcp(addr.to_string()));
+    let mut attached = podman
+        .exec_attach("c1", &["cat".into()], true, false)
+        .await
+        .unwrap();
+    let mut stdin = attached.stdin.take().unwrap();
+    stdin.write_all(b"hi").await.unwrap();
+    let first = attached.output.next().await.unwrap().unwrap();
+    assert_eq!(
+        (first.stream, &first.data[..]),
+        (Output::Stdout, &b"hi"[..])
+    );
+    stdin.shutdown().await.unwrap();
+    let last = attached.output.next().await.unwrap().unwrap();
+    assert_eq!((last.stream, &last.data[..]), (Output::Stderr, &b"eof"[..]));
+    assert!(attached.output.next().await.is_none());
+    assert_eq!(podman.exec_exit_code(&attached.id).await.unwrap(), 0);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen[1].1.as_ref().unwrap(), "tcp");
+}
+
 #[tokio::test]
 async fn logs_are_demultiplexed() {
     let (podman, seen) = fake(vec![(

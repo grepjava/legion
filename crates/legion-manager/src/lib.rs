@@ -14,6 +14,7 @@ mod dispatcher;
 pub mod join;
 mod quota;
 mod raft_net;
+mod session;
 mod tls;
 
 use std::future::Future;
@@ -171,6 +172,7 @@ impl Manager {
             peer_tls: self.tls.as_ref().map(Tls::client),
             issuer,
             quota_lock: Default::default(),
+            sessions: Default::default(),
         };
         let (dispatcher, dispatching) =
             dispatcher::DispatcherService::start(api.clone(), self.tls.is_some(), self.heartbeat);
@@ -203,6 +205,12 @@ impl Manager {
                     .max_decoding_message_size(MAX_MESSAGE)
                     .max_encoding_message_size(MAX_MESSAGE),
                 tls::only(DISPATCHER, on),
+            ))
+            .add_service(tonic::service::interceptor::InterceptedService::new(
+                legion_proto::v1::pods_server::PodsServer::new(session::PodsService {
+                    api: api.clone(),
+                }),
+                tls::only(API, on),
             ))
             .add_service(legion_proto::v1::join_server::JoinServer::new(
                 join::JoinService { api },

@@ -20,6 +20,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use legion_podman::service::{PodmanService, ServiceConfig};
 use legion_podman::{ContainerSpec, Output};
+use tokio::io::AsyncWriteExt;
 
 const IMAGE: &str = "docker.io/freebsd/freebsd-runtime:15.1";
 const LABEL: &str = "legion.test";
@@ -127,6 +128,42 @@ async fn pod_lifecycle() {
         (out.exit_code, &out.stdout[..], &out.stderr[..]),
         (3, &b"out\n"[..], &b"err\n"[..])
     );
+
+    // Attached: stdin reaches the process and closing it ends `cat`.
+    let cmd = ["/bin/sh", "-c", "cat; echo done >&2; exit 4"].map(String::from);
+    let mut attached = podman
+        .exec_attach(&infra_id, &cmd, true, false)
+        .await
+        .unwrap();
+    let mut stdin = attached.stdin.take().unwrap();
+    stdin.write_all(b"hello\n").await.unwrap();
+    stdin.shutdown().await.unwrap();
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    while let Some(chunk) = attached.output.next().await {
+        let chunk = chunk.unwrap();
+        match chunk.stream {
+            Output::Stdout => stdout.extend_from_slice(&chunk.data),
+            Output::Stderr => stderr.extend_from_slice(&chunk.data),
+        }
+    }
+    assert_eq!(
+        (&stdout[..], &stderr[..]),
+        (&b"hello\n"[..], &b"done\n"[..])
+    );
+    assert_eq!(podman.exec_exit_code(&attached.id).await.unwrap(), 4);
+
+    // Under a terminal, sized as asked.
+    let cmd = ["/bin/sh", "-c", "sleep 0.5; stty size"].map(String::from);
+    let mut attached = podman
+        .exec_attach(&infra_id, &cmd, false, true)
+        .await
+        .unwrap();
+    podman.exec_resize(&attached.id, 100, 30).await.unwrap();
+    let mut out = Vec::new();
+    while let Some(chunk) = attached.output.next().await {
+        out.extend_from_slice(&chunk.unwrap().data);
+    }
+    assert_eq!(String::from_utf8_lossy(&out).trim(), "30 100");
 
     podman
         .stop(&infra_id, Duration::from_secs(1))

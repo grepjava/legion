@@ -32,6 +32,7 @@ http = "1.5"
 http-body-util = "0.1.5"
 hyper = "1.12"
 hyper-util = "0.1.21"
+libc = "0.2"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "x509-parser"] }
 openraft = { version = "0.9.25", features = ["serde", "storage-v2"] }
 prost = "0.14"

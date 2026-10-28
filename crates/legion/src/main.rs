@@ -3,6 +3,7 @@
 mod cli;
 mod daemon;
 mod pki;
+mod session;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -159,6 +160,52 @@ enum Command {
         /// Start after this version (default: changes from now on).
         #[arg(long)]
         from: Option<u64>,
+    },
+    /// Print a container's output. A service name picks one of its running
+    /// tasks.
+    Logs {
+        task: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// The container, when the pod has more than one.
+        #[arg(short, long)]
+        container: Option<String>,
+        /// Keep printing until the container stops.
+        #[arg(short, long)]
+        follow: bool,
+        /// Only the last lines.
+        #[arg(long)]
+        tail: Option<u32>,
+    },
+    /// Run a command in a task's container; exits with its exit code. A
+    /// service name picks one of its running tasks.
+    Exec {
+        task: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+        #[arg(short, long)]
+        container: Option<String>,
+        /// Pass stdin to the command.
+        #[arg(short, long)]
+        interactive: bool,
+        /// Give the command a terminal.
+        #[arg(short, long)]
+        tty: bool,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Forward local ports to a task's pod: `LOCAL:REMOTE`, or `PORT` for
+    /// both. Each connection may reach another running task when TASK names
+    /// a service.
+    PortForward {
+        task: String,
+        #[arg(required = true)]
+        ports: Vec<String>,
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// Where to listen.
+        #[arg(long, default_value = "127.0.0.1")]
+        address: String,
     },
 }
 

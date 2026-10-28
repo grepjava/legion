@@ -1,0 +1,89 @@
+// Sessions with a task's containers (DESIGN.md §4.2): logs, exec and
+// port-forward. A user opens one at any manager, which checks their rights,
+// offers it to the agent of the task's node over that agent's `Sessions`
+// stream, and joins the user's stream to the one the agent opens with
+// `Attach`.
+syntax = "proto3";
+
+package legion.v1;
+
+service Pods {
+  // The client's first frame is `open`; after it, for exec and
+  // port-forward, input. The server sends output and, for exec, ends with
+  // `exit_code`. Logs and forwarded connections end when their stream does.
+  rpc Session(stream SessionFrame) returns (stream SessionFrame);
+}
+
+message SessionOpen {
+  string namespace = 1;
+  // A task, or a service, for one of its running tasks.
+  string task = 2;
+  // The container; may be left out when the pod has only one.
+  string container = 3;
+  oneof action {
+    LogsOptions logs = 4;
+    ExecOptions exec = 5;
+    // Port-forward: one forwarded connection to this port of the pod.
+    uint32 port = 6;
+  }
+}
+
+message LogsOptions {
+  // Keep streaming until the container stops.
+  bool follow = 1;
+  // Only the last lines.
+  optional uint32 tail = 2;
+}
+
+message ExecOptions {
+  repeated string command = 1;
+  // Pass input to the process's stdin.
+  bool stdin = 2;
+  // Run under a terminal, which merges stderr into stdout.
+  bool tty = 3;
+  optional TerminalSize size = 4;
+}
+
+message TerminalSize {
+  uint32 width = 1;
+  uint32 height = 2;
+}
+
+message SessionError {
+  // A gRPC status code.
+  int32 code = 1;
+  string message = 2;
+}
+
+message InputClosed {}
+
+message SessionFrame {
+  oneof frame {
+    SessionOpen open = 1;
+    // To the process's stdin, or the forwarded connection.
+    bytes input = 2;
+    // No more input: stdin or the connection's sending side closes.
+    InputClosed input_closed = 3;
+    TerminalSize resize = 4;
+    // From the process, or the forwarded connection.
+    bytes stdout = 5;
+    bytes stderr = 6;
+    // The process has exited; the last frame of an exec.
+    int32 exit_code = 7;
+    // Agents only: the first frame of `Attach`, naming the session.
+    string attach = 8;
+    // The session failed; the last frame.
+    SessionError error = 9;
+  }
+}
+
+// What a manager offers an agent.
+message SessionOffer {
+  string id = 1;
+  // With the namespace, task and container resolved.
+  SessionOpen open = 2;
+  // The task's run, which the agent knows its containers by.
+  string task_uid = 3;
+  // The pod's address, for port-forward.
+  string pod_ip = 4;
+}

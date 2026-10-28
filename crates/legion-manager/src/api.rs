@@ -47,6 +47,8 @@ pub struct ApiService {
     pub(crate) issuer: Option<crate::join::Issuer>,
     /// Held from quota check to write, so two applies cannot both fit.
     pub(crate) quota_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// The agents connected to this manager, for sessions with their tasks.
+    pub(crate) sessions: std::sync::Arc<crate::session::Hub>,
 }
 
 enum Route {
@@ -55,7 +57,7 @@ enum Route {
 }
 
 /// The reserved namespace holds Legion's own records; no caller sees it.
-fn check_namespace(namespace: &str) -> Result<(), Status> {
+pub(crate) fn check_namespace(namespace: &str) -> Result<(), Status> {
     if namespace == SYSTEM_NAMESPACE {
         Err(Status::permission_denied(format!(
             "namespace {SYSTEM_NAMESPACE} is reserved for Legion"
@@ -297,7 +299,7 @@ pub(crate) fn forwarded<T>(inner: T) -> Request<T> {
 }
 
 impl ApiService {
-    fn caller<T>(&self, req: &Request<T>) -> Result<Caller, Status> {
+    pub(crate) fn caller<T>(&self, req: &Request<T>) -> Result<Caller, Status> {
         Caller::of(req, self.peer_tls.is_some())
     }
 

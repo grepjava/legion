@@ -42,6 +42,8 @@ pub enum Error {
     },
     #[error("podman HTTP: {0}")]
     Http(#[from] hyper::Error),
+    #[error("podman stream: {0}")]
+    Io(#[from] std::io::Error),
     #[error("decoding podman response: {0}")]
     Decode(#[from] serde_json::Error),
     #[error("podman protocol: {0}")]
@@ -72,6 +74,25 @@ impl Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// A process started by [`Podman::exec_attach`].
+pub struct Attached {
+    /// The exec session, for [`Podman::exec_resize`] and
+    /// [`Podman::exec_exit_code`].
+    pub id: String,
+    /// What the process writes; ends when it exits.
+    pub output: futures::stream::BoxStream<'static, Result<Chunk>>,
+    /// Its stdin, when asked for; shutting it down closes stdin.
+    pub stdin: Option<std::pin::Pin<Box<dyn AsyncWrite + Send>>>,
+}
+
+impl std::fmt::Debug for Attached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Attached")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Where the service listens.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,8 +256,10 @@ impl Podman {
                 &format!("/containers/{}/exec", segment(id)),
                 Some(&ExecCreate {
                     cmd,
+                    attach_stdin: false,
                     attach_stdout: true,
                     attach_stderr: true,
+                    tty: false,
                 }),
             )
             .await?;
@@ -259,19 +282,105 @@ impl Podman {
                 Output::Stderr => out.stderr.extend_from_slice(&chunk.data),
             }
         }
+        out.exit_code = self.exec_exit_code(&created.id).await?;
+        Ok(out)
+    }
+
+    /// Starts `cmd` in a running container with its output streamed and,
+    /// with `stdin`, its input taken from the caller. Under `tty` the
+    /// process gets a terminal, and its output comes unframed as stdout.
+    pub async fn exec_attach(
+        &self,
+        id: &str,
+        cmd: &[String],
+        stdin: bool,
+        tty: bool,
+    ) -> Result<Attached> {
+        use futures::StreamExt;
+        let created: Created = self
+            .json(
+                Method::POST,
+                &format!("/containers/{}/exec", segment(id)),
+                Some(&ExecCreate {
+                    cmd,
+                    attach_stdin: stdin,
+                    attach_stdout: true,
+                    attach_stderr: true,
+                    tty,
+                }),
+            )
+            .await?;
+        // libpod hijacks the connection for the process's streams; asking
+        // for an upgrade gets a 101 that hyper hands the connection over on.
+        let io = self.connect().await?;
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+        tokio::spawn(async move {
+            if let Err(e) = conn.with_upgrades().await {
+                tracing::debug!("podman exec connection: {e}");
+            }
+        });
+        let start = serde_json::json!({ "Detach": false, "Tty": tty });
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("{API}/exec/{}/start", segment(&created.id)))
+            .header(http::header::HOST, "podman")
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(http::header::CONNECTION, "Upgrade")
+            .header(http::header::UPGRADE, "tcp")
+            .body(Full::new(Bytes::from(serde_json::to_vec(&start)?)))
+            .map_err(|e| Error::Protocol(e.to_string()))?;
+        let resp = sender.send_request(req).await?;
+        if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+            let status = check(resp).await?.status();
+            return Err(Error::Protocol(format!(
+                "exec start answered HTTP {status} instead of taking over the connection"
+            )));
+        }
+        let upgraded = hyper::upgrade::on(resp).await?;
+        let (read, write) = tokio::io::split(TokioIo::new(upgraded));
+        let raw = Box::pin(stream::read(read));
+        let output = if tty {
+            raw.map(|b| {
+                b.map(|data| Chunk {
+                    stream: Output::Stdout,
+                    data,
+                })
+            })
+            .boxed()
+        } else {
+            stream::demux(raw).boxed()
+        };
+        Ok(Attached {
+            id: created.id,
+            output,
+            stdin: stdin.then(|| Box::pin(write) as std::pin::Pin<Box<dyn AsyncWrite + Send>>),
+        })
+    }
+
+    /// Sets the terminal size of an exec session started with a tty.
+    pub async fn exec_resize(&self, exec_id: &str, width: u16, height: u16) -> Result<()> {
+        let path = format!(
+            "/exec/{}/resize?{}",
+            segment(exec_id),
+            query(&[("h", &height.to_string()), ("w", &width.to_string())])
+        );
+        self.no_content(Method::POST, &path).await
+    }
+
+    /// The exit code of an exec session whose output has ended.
+    pub async fn exec_exit_code(&self, exec_id: &str) -> Result<i32> {
         // The output ends when the process does, but libpod may record the
         // exit code a moment later.
         for _ in 0..50 {
             let inspect: ExecInspect = self
                 .json::<(), _>(
                     Method::GET,
-                    &format!("/exec/{}/json", segment(&created.id)),
+                    &format!("/exec/{}/json", segment(exec_id)),
                     None,
                 )
                 .await?;
             if !inspect.running {
-                out.exit_code = inspect.exit_code;
-                return Ok(out);
+                return Ok(inspect.exit_code);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

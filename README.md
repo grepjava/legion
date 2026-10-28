@@ -4,8 +4,8 @@ A container orchestrator for FreeBSD: Docker Swarm's operating model plus
 selected Kubernetes features, running workloads as jails through Podman and
 `ocijail`. The plan and its rationale are in [docs/DESIGN.md](docs/DESIGN.md).
 
-Status: phase 1 in progress. The replicated store, the API server and the CLI
-work; nothing schedules or runs containers yet.
+Status: phases 1 (single node) and 2 (cluster) are done; phase 3 (K8s-lite)
+is in progress. [PHASE.md](PHASE.md) tracks what is built and what is next.
 
 ## Build
 
@@ -95,12 +95,22 @@ spec:
   quota: { cpu: 4, memory: 8Gi, tasks: 20, volumes: 5, storage: 100Gi }
 ```
 
+Into the tasks themselves, through any manager; a service name picks one
+of its running tasks:
+
+```sh
+legion logs web -n shop -f --tail 20
+legion exec -it web -n shop -- /bin/sh       # exits with the command's code
+legion port-forward web -n shop 8080:80      # localhost:8080 to the pod's 80
+```
+
 `admin.pem` is the cluster admin's. People get their own credentials and a
 role (`view`, `edit` or `admin`) in a namespace; the key is made where the
 command runs:
 
 ```sh
 legion user create alice --role edit -n shop   # writes alice.pem; hand it over
+                                               # (view may read logs; exec needs edit)
 legion --identity alice.pem list services -n shop
 legion delete RoleBinding alice -n shop        # takes her rights away
 ```

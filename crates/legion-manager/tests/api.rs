@@ -8,11 +8,15 @@ use legion_pki::{CERT_LIFETIME, Ca, Identity, Role};
 use legion_proto::v1::cluster_client::ClusterClient;
 use legion_proto::v1::dispatcher_client::DispatcherClient;
 use legion_proto::v1::objects_client::ObjectsClient;
+use legion_proto::v1::pods_client::PodsClient;
+use legion_proto::v1::session_frame::Frame;
+use legion_proto::v1::session_open::Action;
 use legion_proto::v1::{
     ApplyRequest, ApplyResult, AssignmentsRequest, DataRequest, DeleteRequest, EndpointsRequest,
     HeartbeatRequest, InitRequest, JoinTokenRequest, ListRequest, Object, ObjectRef, PeersRequest,
     RegisterRequest, ReportRequest, StatusRequest, WatchRequest, watch_event,
 };
+use legion_proto::v1::{ExecOptions, LogsOptions, SessionFrame, SessionOpen};
 use legion_store::Store;
 use openraft::BasicNode;
 use tempfile::TempDir;
@@ -1120,6 +1124,56 @@ async fn users_act_within_their_role_bindings() {
         })
         .await,
     );
+
+    // Sessions with tasks: logs take view, exec and port-forward edit. The
+    // service has no running task (no node), which is as far as a
+    // permitted session gets here.
+    let session = |name: &str, namespace: &str, action: Action| {
+        let creds = creds(&ca, name, Role::User);
+        let m = &m;
+        let namespace = namespace.to_owned();
+        async move {
+            let channel = m.channel(Some(&creds)).await.unwrap();
+            let open = SessionFrame {
+                frame: Some(Frame::Open(SessionOpen {
+                    namespace,
+                    task: "web".into(),
+                    container: String::new(),
+                    action: Some(action),
+                })),
+            };
+            PodsClient::new(channel)
+                .session(tokio_stream::iter([open]))
+                .await
+                .map(drop)
+        }
+    };
+    let logs = || Action::Logs(LogsOptions::default());
+    let exec = || {
+        Action::Exec(ExecOptions {
+            command: vec!["sh".into()],
+            ..Default::default()
+        })
+    };
+    let refused = |r: Result<(), tonic::Status>| {
+        let s = r.unwrap_err();
+        (s.code(), s.message().to_owned())
+    };
+    let no_task = (
+        Code::FailedPrecondition,
+        "service web has no running task".to_owned(),
+    );
+    assert_eq!(refused(session("alice", "a", logs()).await), no_task);
+    let why = denied(session("alice", "a", exec()).await);
+    assert!(why.contains("to change Tasks takes edit"), "{why}");
+    denied(session("alice", "a", Action::Port(80)).await);
+    denied(session("alice", "b", logs()).await);
+    assert_eq!(refused(session("bob", "a", exec()).await), no_task);
+    assert_eq!(
+        refused(session("bob", "a", Action::Port(80)).await),
+        no_task
+    );
+    denied(session("bob", "b", exec()).await);
 
     // admin manages the namespace's bindings.
     let (mut carol, _) = user("carol").await;

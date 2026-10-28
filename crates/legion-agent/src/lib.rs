@@ -28,12 +28,13 @@ pub mod pod;
 pub mod policing;
 mod probe;
 pub mod runtime;
+mod session;
 mod task;
 mod volumes;
 
 pub use control::{
-    Assignment, Assignments, Control, ControlError, EndpointPort, Endpoints, GrpcControl, Peer,
-    Peers, Registration, ServiceEndpoints, VolumeClaim,
+    Assignment, Assignments, Control, ControlError, EndpointPort, Endpoints, GrpcControl, Offer,
+    Peer, Peers, Registration, ServiceEndpoints, VolumeClaim,
 };
 pub use runtime::Runtime;
 
@@ -167,6 +168,11 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             _ = &mut shutdown => return,
         };
         let heartbeats = tokio::spawn(heartbeats(ctx.control.clone(), ctx.node.clone()));
+        let sessions = tokio::spawn(session::serve(
+            ctx.runtime.clone(),
+            ctx.node.clone(),
+            ctx.control.sessions(&ctx.node),
+        ));
         let net = legion_net::PodNetwork::new(registration.pod_cidr);
         tracing::info!(subnet = %net.subnet, "pod network");
         let bridge = net.clone();
@@ -207,10 +213,12 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             loaded = assignments.changed() => if loaded.is_err() {
                 tracing::warn!("assignments ended");
                 heartbeats.abort();
+                sessions.abort();
                 return;
             },
             _ = &mut shutdown => {
                 heartbeats.abort();
+                sessions.abort();
                 return;
             }
         }
@@ -294,6 +302,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         // Dropping the senders ends each worker without touching its pod.
         forwarder.abort();
         heartbeats.abort();
+        sessions.abort();
         if let Some(dns) = dns {
             dns.abort();
         }

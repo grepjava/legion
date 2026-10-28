@@ -20,6 +20,23 @@ pub(crate) fn chunks(body: Incoming) -> impl Stream<Item = Result<Bytes, Error>>
     })
 }
 
+/// The bytes read from `io` until its end.
+pub(crate) fn read<R>(io: R) -> impl Stream<Item = Result<Bytes, Error>> + Send
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+{
+    futures::stream::unfold(Some(io), |io| async move {
+        use tokio::io::AsyncReadExt;
+        let mut io = io?;
+        let mut buf = BytesMut::with_capacity(16 * 1024);
+        match io.read_buf(&mut buf).await {
+            Ok(0) => None,
+            Ok(_) => Some((Ok(buf.freeze()), Some(io))),
+            Err(e) => Some((Err(Error::Io(e)), None)),
+        }
+    })
+}
+
 /// Splits a byte stream into lines and parses each as `T`. Blank lines are
 /// skipped; a final line without a newline still counts.
 pub(crate) fn json_lines<T, S>(input: S) -> impl Stream<Item = Result<T, Error>> + Send

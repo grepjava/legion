@@ -101,7 +101,7 @@ One binary, `legion`, with two roles:
 | **Controllers** | Run on the leader only. Each watches the store and writes desired changes back. See 3.3. |
 | **Scheduler** | Assigns pending tasks to nodes: filter, then score. See 3.5. |
 | **Allocator** | Assigns task IPs, service VIPs, published ports, node pod subnets. |
-| **Dispatcher** | On every manager. Streams each agent its node's assignments and every service's endpoints from the local replica, and serves the secrets, configs and volume claims of the node's own tasks; status reports, registration and heartbeats are forwarded to the leader, which alone tracks liveness. Agents fail over between managers and learn the manager list from heartbeat replies. |
+| **Dispatcher** | On every manager. Streams each agent its node's assignments and every service's endpoints from the local replica, and serves the secrets, configs and volume claims of the node's own tasks; status reports, registration and heartbeats are forwarded to the leader, which alone tracks liveness. Agents fail over between managers and learn the manager list from heartbeat replies. It also carries sessions (`logs`, `exec`, `port-forward`): see 3.8. |
 | **CA** | Issues and rotates node and user certificates. Root key stored in Raft, optionally sealed with an autolock key. |
 
 ### 3.3 Controllers
@@ -197,6 +197,7 @@ preconditions. Rules:
 | **Volumes** | Creates, mounts and snapshots ZFS datasets; mounts them into containers (nullfs). A `Volume` is `<pool>/legion/volumes/<ns>/<name>`, created on first use with its size as quota and bound to that node in its status. Pod `tmpfs` volumes live and die with the pod. |
 | **Secrets** | Writes secrets and configs to a per-task tmpfs (`<run dir>/tasks/<task uid>`) and bind-mounts each file read-only into the container that names it. Files never touch disk. Values used as environment variables are passed to Podman, which keeps them in the container's configuration under its root; files are the safer form. Values are read when the pod starts. |
 | **Resources** | Applies rctl rules to **each container's own jail** (memory, CPU percentage, process and open-file limits) and `cpuset` pinning. Removes the rules when the task ends; rctl keys rules by jail name and keeps them after the jail is gone. Reads usage with `rctl -u` for metrics and autoscaling. See 6.3. |
+| **Sessions** | Runs the `logs`, `exec` and `port-forward` sessions managers offer it: Podman's log stream, an exec attached through libpod's upgraded connection (stdin, a terminal and its size), or a TCP connection to the pod's address. See 3.8. |
 | **Probes** | Startup, liveness and readiness probes. TCP, HTTP and gRPC probes run from the host, which can reach every local pod IP on `legion0`; exec probes run in the container. One prober per running container reports only transitions to the task's worker: a failed startup or liveness probe stops the container and the restart policy decides what follows; readiness sets the Task's `ready`. HTTP passes on 2xx and 3xx; gRPC uses `grpc.health.v1.Health/Check`. |
 | **DNS** | Resolver on each node's bridge gateway address (`hickory-dns`). Answers cluster names, forwards everything else to the host's resolvers. |
 
@@ -346,6 +347,21 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
 - **Identity.** A manager generates a random 64-bit node id on first start and
   keeps it in `<data-dir>/node-id`. A new daemon belongs to no cluster;
   `legion init` makes it the first member.
+- **Sessions** (phase 3). `logs`, `exec` and `port-forward` go through the
+  `Pods` service of any manager, which checks RBAC (logs take `view` in the
+  task's namespace, exec and port-forward `edit`), resolves the task (or a
+  running task of the service named) and its container, and offers the
+  session to the agent of the task's node. Every agent keeps a `Sessions`
+  stream open with every manager, so any manager reaches any node without
+  forwarding between managers and without a port on the node: nodes behind
+  NAT work too. The agent answers an offer with `Attach` to that manager,
+  which then relays frames both ways: input, input closed and terminal
+  size from the user; stdout, stderr and the exit code back, or an error
+  that ends the session. A user who goes away ends the agent's side, which
+  drops the process's streams; the process itself may run on, as with
+  Docker. Port-forward is one session per TCP connection, from the agent
+  to the pod's address. A worker may attach only to its own node's
+  sessions.
 - **CLI.** `legion init | status | apply -f | get | list | delete | watch`,
   with kubectl-style kind names (`service`, `services`, `svc`), `-n`, `-A`,
   `-l key=value` and `-o table|yaml|json`. `apply` reads multi-document YAML
@@ -386,7 +402,7 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
 | Ingress | A system global service running haproxy, configured from routes Legion renders from service labels. | 4 |
 | Autoscaling | CPU and memory targets read from rctl; no separate metrics server. | 4 |
 | `apply` / `diff` | Server-side apply with field ownership kept simple: last applier wins per object. | 1 |
-| `logs`, `exec`, `port-forward` | Streamed through the manager to the agent. | 3 |
+| `logs`, `exec`, `port-forward` | Streamed through the manager to the agent, under RBAC (3.8). | 3 |
 
 ### 4.3 FreeBSD-specific
 

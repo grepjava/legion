@@ -33,14 +33,14 @@ use legion_proto::v1::{
     AssignmentsRequest, AssignmentsUpdate, ClaimVolumeRequest, ClaimVolumeResponse, DataRequest,
     DataResponse, EndpointsRequest, EndpointsUpdate, HeartbeatRequest, HeartbeatResponse,
     PeersRequest, PeersUpdate, PoliciesRequest, PoliciesUpdate, RegisterRequest, RegisterResponse,
-    ReportRequest, ReportResponse,
+    ReportRequest, ReportResponse, SessionFrame, SessionOffer, SessionsRequest,
 };
 use legion_store::{Command, Event, Outcome, Precondition, Store, WatchError};
 use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, Streaming};
 
 use crate::api::{ApiService, forwarded};
 use crate::raft_net::{MAX_MESSAGE, connect_lazy};
@@ -592,6 +592,68 @@ impl Dispatcher for DispatcherService {
             period_ms: self.period.as_millis() as u32,
             managers: self.managers(),
         }))
+    }
+
+    type SessionsStream = ReceiverStream<Result<SessionOffer, Status>>;
+
+    async fn sessions(
+        &self,
+        req: Request<SessionsRequest>,
+    ) -> Result<Response<Self::SessionsStream>, Status> {
+        use tokio_stream::StreamExt;
+        let node = self.node(&req, &req.get_ref().node)?;
+        let mut offers = self.api.sessions.follow(&node);
+        // Relayed so the stream ends when the manager shuts down.
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut closing = self.api.closing.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    offer = offers.next() => match offer {
+                        Some(o) => if tx.send(o).await.is_err() {
+                            return;
+                        },
+                        None => return,
+                    },
+                    _ = tx.closed() => return,
+                    () = crate::session::shutdown(&mut closing) => break,
+                }
+            }
+            let _ = tx
+                .send(Err(Status::unavailable("manager shutting down")))
+                .await;
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    type AttachStream = crate::session::Frames;
+
+    async fn attach(
+        &self,
+        req: Request<Streaming<SessionFrame>>,
+    ) -> Result<Response<Self::AttachStream>, Status> {
+        use legion_proto::v1::session_frame::Frame;
+        use tokio_stream::StreamExt;
+        // A worker attaches only to its own node's sessions.
+        let node = crate::tls::caller(&req, self.tls)?
+            .filter(|id| id.role == Role::Worker)
+            .map(|id| id.name);
+        let mut from_agent = req.into_inner();
+        let id = match from_agent.next().await {
+            Some(Ok(SessionFrame {
+                frame: Some(Frame::Attach(id)),
+            })) => id,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "an attach starts with the session's id",
+                ));
+            }
+        };
+        Ok(Response::new(self.api.sessions.attach(
+            node.as_deref(),
+            &id,
+            from_agent,
+        )?))
     }
 }
 

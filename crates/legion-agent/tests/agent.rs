@@ -10,6 +10,11 @@ use legion_api::node::{NodeState, NodeStatus};
 use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
 use legion_api::{Kind, Object, ObjectKey, Spec};
 use legion_manager::{Manager, ManagerConfig};
+use legion_podman::Output;
+use legion_proto::v1 as pb;
+use legion_proto::v1::pods_client::PodsClient;
+use legion_proto::v1::session_frame::Frame;
+use legion_proto::v1::session_open::Action;
 use legion_store::{Command, Outcome, Precondition, Store};
 use legion_sys::{FakeSys, Sys};
 use openraft::BasicNode;
@@ -975,4 +980,246 @@ async fn joins_the_mesh() {
     h.delete(&other.key()).await;
     eventually("n2 is no longer a peer", || peers(&h).is_empty()).await;
     h.stop_agent().await;
+}
+
+/// A session opened at the manager, as the CLI opens one.
+struct Session {
+    tx: tokio::sync::mpsc::Sender<pb::SessionFrame>,
+    rx: tonic::Streaming<pb::SessionFrame>,
+}
+
+impl Session {
+    /// Opens a session, waiting for the agent to be reachable through the
+    /// manager.
+    async fn open(h: &Harness, open: pb::SessionOpen) -> Result<Session, tonic::Status> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            tx.send(frame(Frame::Open(open.clone()))).await.unwrap();
+            let mut client = PodsClient::connect(format!("http://{}", h.addr))
+                .await
+                .unwrap();
+            match client
+                .session(tokio_stream::wrappers::ReceiverStream::new(rx))
+                .await
+            {
+                Ok(resp) => {
+                    return Ok(Session {
+                        tx,
+                        rx: resp.into_inner(),
+                    });
+                }
+                Err(s)
+                    if s.code() == tonic::Code::Unavailable
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(s) => return Err(s),
+            }
+        }
+    }
+
+    async fn send(&self, f: Frame) {
+        self.tx.send(frame(f)).await.unwrap();
+    }
+
+    async fn next(&mut self) -> Option<Result<Frame, tonic::Status>> {
+        tokio::time::timeout(Duration::from_secs(10), self.rx.message())
+            .await
+            .expect("a frame in time")
+            .transpose()
+            .map(|r| r.map(|f| f.frame.unwrap()))
+    }
+
+    /// Every frame to the end, and the error the session ended with.
+    async fn rest(&mut self) -> (Vec<Frame>, Option<(tonic::Code, String)>) {
+        let mut frames = Vec::new();
+        loop {
+            match self.next().await {
+                Some(Ok(f)) => frames.push(f),
+                Some(Err(s)) => return (frames, Some((s.code(), s.message().to_owned()))),
+                None => return (frames, None),
+            }
+        }
+    }
+}
+
+fn frame(f: Frame) -> pb::SessionFrame {
+    pb::SessionFrame { frame: Some(f) }
+}
+
+fn open(task: &str, action: Action) -> pb::SessionOpen {
+    pb::SessionOpen {
+        namespace: "shop".into(),
+        task: task.into(),
+        container: String::new(),
+        action: Some(action),
+    }
+}
+
+fn exec(command: &[&str], stdin: bool, tty: bool) -> Action {
+    Action::Exec(pb::ExecOptions {
+        command: command.iter().map(|s| s.to_string()).collect(),
+        stdin,
+        tty,
+        size: tty.then_some(pb::TerminalSize {
+            width: 80,
+            height: 24,
+        }),
+    })
+}
+
+fn logs(follow: bool, tail: Option<u32>) -> Action {
+    Action::Logs(pb::LogsOptions { follow, tail })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sessions_reach_the_pod() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task("web-1", r#"containers: [{ name: app, image: "app:1" }]"#)
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    const APP: &str = "shop_web-1_app";
+    h.rt.log(APP, Output::Stdout, "one\n");
+    h.rt.log(APP, Output::Stderr, "two\n");
+
+    // Logs, of the task or its service's running task.
+    for task in ["web-1", "web"] {
+        let mut s = Session::open(&h, open(task, logs(false, None)))
+            .await
+            .unwrap();
+        assert_eq!(
+            s.rest().await,
+            (
+                vec![
+                    Frame::Stdout(b"one\n".to_vec()),
+                    Frame::Stderr(b"two\n".to_vec())
+                ],
+                None
+            )
+        );
+    }
+    let mut s = Session::open(&h, open("web-1", logs(false, Some(1))))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.rest().await,
+        (vec![Frame::Stderr(b"two\n".to_vec())], None)
+    );
+
+    // Exec with stdin: `cat` echoes until its input closes.
+    let mut s = Session::open(&h, open("web-1", exec(&["cat"], true, false)))
+        .await
+        .unwrap();
+    s.send(Frame::Input(b"abc".to_vec())).await;
+    assert_eq!(
+        s.next().await.unwrap().unwrap(),
+        Frame::Stdout(b"abc".to_vec())
+    );
+    s.send(Frame::InputClosed(pb::InputClosed {})).await;
+    assert_eq!(s.rest().await, (vec![Frame::ExitCode(0)], None));
+
+    // Under a terminal of the size asked for; the exit code comes last.
+    h.rt.set_exec(APP, 3);
+    let mut s = Session::open(&h, open("web-1", exec(&["ls", "-l"], false, true)))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.rest().await,
+        (
+            vec![
+                Frame::Stdout(b"ran ls -l\n24 80\n".to_vec()),
+                Frame::Stderr(b"failed\n".to_vec()),
+                Frame::ExitCode(3),
+            ],
+            None
+        )
+    );
+
+    // A user who goes away takes the process's streams with them.
+    let s = Session::open(&h, open("web-1", exec(&["cat"], true, false)))
+        .await
+        .unwrap();
+    eventually("cat runs", || h.rt.attached() == 1).await;
+    drop(s);
+    eventually("cat ends", || h.rt.attached() == 0).await;
+
+    // What cannot be opened says why.
+    let refused = |r: Result<Session, tonic::Status>| {
+        let s = r.err().expect("refused");
+        (s.code(), s.message().to_owned())
+    };
+    let mut bad = open("web-1", logs(false, None));
+    bad.container = "db".into();
+    assert_eq!(
+        refused(Session::open(&h, bad).await),
+        (
+            tonic::Code::NotFound,
+            "task web-1 has no container db; it has app".into()
+        )
+    );
+    assert_eq!(
+        refused(Session::open(&h, open("nope", logs(false, None))).await),
+        (
+            tonic::Code::NotFound,
+            "no task or service nope in namespace shop".into()
+        )
+    );
+    // Errors from the agent end the stream.
+    let mut s = Session::open(&h, open("web-1", exec(&[], false, false)))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.rest().await,
+        (
+            vec![],
+            Some((tonic::Code::InvalidArgument, "exec needs a command".into()))
+        )
+    );
+
+    // Port-forward: one connection per session, to the pod's address
+    // (here a local echo server standing in for the pod).
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = echo.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut c, _) = echo.accept().await.unwrap();
+        let mut buf = [0u8; 64];
+        loop {
+            let n = c.read(&mut buf).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            c.write_all(&buf[..n]).await.unwrap();
+        }
+    });
+    let mut task = h.store.get(&key).unwrap().unwrap();
+    task.status["ip"] = "127.0.0.1".into();
+    let v = task.metadata.version;
+    h.write(task, Precondition::Version(v)).await;
+    let mut s = Session::open(&h, open("web-1", Action::Port(port.into())))
+        .await
+        .unwrap();
+    s.send(Frame::Input(b"ping".to_vec())).await;
+    assert_eq!(
+        s.next().await.unwrap().unwrap(),
+        Frame::Stdout(b"ping".to_vec())
+    );
+    s.send(Frame::InputClosed(pb::InputClosed {})).await;
+    assert_eq!(s.rest().await, (vec![], None));
+
+    // Followed logs go on until the container stops.
+    let mut s = Session::open(&h, open("web-1", logs(true, Some(0))))
+        .await
+        .unwrap();
+    h.rt.log(APP, Output::Stdout, "three\n");
+    assert_eq!(
+        s.next().await.unwrap().unwrap(),
+        Frame::Stdout(b"three\n".to_vec())
+    );
+    h.rt.exit(APP, 0);
+    assert_eq!(s.rest().await, (vec![], None));
 }

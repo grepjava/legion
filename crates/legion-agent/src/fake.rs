@@ -6,17 +6,20 @@
 //! is reported as a `died` event carrying the container's labels. Starting
 //! a container clears its jail's rctl rules, as ocijail with rctl support
 //! does. Exec runs nothing: each container answers with the exit code
-//! set by [`FakeRuntime::set_exec`], 0 by default.
+//! set by [`FakeRuntime::set_exec`], 0 by default. An attached exec of
+//! `cat` echoes its stdin; any other command prints itself and the
+//! terminal size, if it has one. Logs are what [`FakeRuntime::log`] wrote.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use legion_podman::{
-    Actor, ContainerConfig, ContainerInspect, ContainerSpec, ContainerState, ContainerSummary,
-    Error, Event, ExecOutput, Result,
+    Actor, Attached, Chunk, ContainerConfig, ContainerInspect, ContainerSpec, ContainerState,
+    ContainerSummary, Error, Event, ExecOutput, Output, Result,
 };
 use legion_sys::FakeSys;
 use tokio::sync::broadcast;
@@ -26,7 +29,7 @@ use crate::runtime::Runtime;
 
 pub struct FakeRuntime {
     sys: Arc<FakeSys>,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     events: broadcast::Sender<Event>,
 }
 
@@ -45,6 +48,37 @@ struct State {
     /// Exit code of exec in containers, by container name.
     exec: BTreeMap<String, i32>,
     execs: usize,
+    /// Output so far, by container name.
+    logs: BTreeMap<String, Vec<Chunk>>,
+    /// Attached execs: their exit code once done, and terminal size.
+    sessions: BTreeMap<String, Session>,
+}
+
+/// An attached exec's view of its session.
+struct SessionHandle {
+    runtime: Arc<Mutex<State>>,
+    exec_id: String,
+}
+
+impl SessionHandle {
+    fn with<T>(&self, f: impl FnOnce(&mut Session) -> T) -> Option<T> {
+        let mut s = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+        s.sessions.get_mut(&self.exec_id).map(f)
+    }
+
+    fn size(&self) -> Option<(u16, u16)> {
+        self.with(|s| s.size).flatten()
+    }
+
+    fn exited(&self, code: i32) {
+        self.with(|s| s.exit_code = Some(code));
+    }
+}
+
+#[derive(Debug, Default)]
+struct Session {
+    exit_code: Option<i32>,
+    size: Option<(u16, u16)>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,13 +101,17 @@ impl FakeRuntime {
     pub fn new(sys: Arc<FakeSys>) -> Self {
         FakeRuntime {
             sys,
-            state: Mutex::new(State::default()),
+            state: Default::default(),
             events: broadcast::channel(1024).0,
         }
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn state_handle(&self) -> Arc<Mutex<State>> {
+        self.state.clone()
     }
 
     pub fn add_image(&self, reference: &str) {
@@ -100,6 +138,27 @@ impl FakeRuntime {
     /// Execs run so far.
     pub fn execs(&self) -> usize {
         self.state().execs
+    }
+
+    /// The container `name` writes `data`.
+    pub fn log(&self, name: &str, stream: Output, data: &str) {
+        self.state()
+            .logs
+            .entry(name.to_owned())
+            .or_default()
+            .push(Chunk {
+                stream,
+                data: Bytes::from(data.to_owned()),
+            });
+    }
+
+    /// Attached execs still running.
+    pub fn attached(&self) -> usize {
+        self.state()
+            .sessions
+            .values()
+            .filter(|s| s.exit_code.is_none())
+            .count()
     }
 
     /// Containers created so far, removed ones included.
@@ -358,6 +417,153 @@ impl Runtime for FakeRuntime {
             },
             ..Default::default()
         })
+    }
+
+    async fn exec_attach(
+        &self,
+        id: &str,
+        cmd: &[String],
+        stdin: bool,
+        _tty: bool,
+    ) -> Result<Attached> {
+        use tokio::io::AsyncReadExt;
+        let (exec_id, code) = {
+            let mut s = self.state();
+            let c = s
+                .containers
+                .get(id)
+                .ok_or_else(|| api(404, "no such container"))?;
+            if !c.running {
+                return Err(api(500, "container state improper"));
+            }
+            let code = s.exec.get(&c.spec.name).copied().unwrap_or(0);
+            s.next_id += 1;
+            let exec_id = format!("exec{}", s.next_id);
+            s.sessions.insert(exec_id.clone(), Session::default());
+            (exec_id, code)
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Chunk>>(16);
+        let (input, mut process_stdin) = tokio::io::duplex(1024);
+        let chunk = |stream, data: Vec<u8>| Chunk {
+            stream,
+            data: Bytes::from(data),
+        };
+        let cat = cmd == ["cat"];
+        let line = cmd.join(" ");
+        let sessions = SessionHandle {
+            runtime: self.state_handle(),
+            exec_id: exec_id.clone(),
+        };
+        tokio::spawn(async move {
+            let mut code = code;
+            if cat {
+                let mut buf = [0u8; 1024];
+                loop {
+                    match process_stdin.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if tx
+                                .send(Ok(chunk(Output::Stdout, buf[..n].to_vec())))
+                                .await
+                                .is_err()
+                            {
+                                code = 141;
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Gives the caller a moment to size the terminal.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let mut out = format!("ran {line}\n");
+                if let Some((w, h)) = sessions.size() {
+                    out.push_str(&format!("{h} {w}\n"));
+                }
+                let _ = tx.send(Ok(chunk(Output::Stdout, out.into_bytes()))).await;
+                if code != 0 {
+                    let _ = tx
+                        .send(Ok(chunk(Output::Stderr, b"failed\n".to_vec())))
+                        .await;
+                }
+            }
+            sessions.exited(code);
+        });
+        Ok(Attached {
+            id: exec_id,
+            output: futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|c| (c, rx))
+            })
+            .boxed(),
+            stdin: stdin
+                .then(|| Box::pin(input) as std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>),
+        })
+    }
+
+    async fn exec_resize(&self, exec_id: &str, width: u16, height: u16) -> Result<()> {
+        let mut s = self.state();
+        let session = s
+            .sessions
+            .get_mut(exec_id)
+            .ok_or_else(|| api(404, "no such exec session"))?;
+        session.size = Some((width, height));
+        Ok(())
+    }
+
+    async fn exec_exit_code(&self, exec_id: &str) -> Result<i32> {
+        for _ in 0..200 {
+            match self.state().sessions.get(exec_id) {
+                None => return Err(api(404, "no such exec session")),
+                Some(Session {
+                    exit_code: Some(code),
+                    ..
+                }) => return Ok(*code),
+                Some(_) => {}
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Err(Error::Protocol("exec still running".into()))
+    }
+
+    async fn logs(
+        &self,
+        id: &str,
+        follow: bool,
+        tail: Option<usize>,
+    ) -> Result<BoxStream<'static, Result<Chunk>>> {
+        let name = self.get(id)?.spec.name;
+        let mut written = self.state().logs.get(&name).cloned().unwrap_or_default();
+        if let Some(n) = tail {
+            written = written.split_off(written.len().saturating_sub(n));
+        }
+        let past = futures::stream::iter(written.into_iter().map(Ok));
+        if !follow {
+            return Ok(past.boxed());
+        }
+        // Then what comes later, until the container stops.
+        let state = self.state_handle();
+        let id = id.to_owned();
+        let from = self.state().logs.get(&name).map_or(0, Vec::len);
+        let later = futures::stream::unfold(from, move |at| {
+            let state = state.clone();
+            let id = id.clone();
+            let name = name.clone();
+            async move {
+                loop {
+                    {
+                        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(c) = s.logs.get(&name).and_then(|l| l.get(at)) {
+                            return Some((Ok(c.clone()), at + 1));
+                        }
+                        if !s.containers.get(&id).is_some_and(|c| c.running) {
+                            return None;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        });
+        Ok(past.chain(later).boxed())
     }
 
     async fn list(&self, labels: &[(&str, &str)]) -> Result<Vec<ContainerSummary>> {

@@ -7,7 +7,8 @@ use std::time::Duration;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use legion_podman::{
-    ContainerInspect, ContainerSpec, ContainerSummary, Event, ExecOutput, Podman, Result,
+    Attached, Chunk, ContainerInspect, ContainerSpec, ContainerSummary, Event, ExecOutput, Podman,
+    Result,
 };
 
 pub trait Runtime: Send + Sync + 'static {
@@ -21,6 +22,30 @@ pub trait Runtime: Send + Sync + 'static {
     fn wait(&self, id: &str) -> impl Future<Output = Result<i32>> + Send;
     /// Runs a command in a running container and collects its output.
     fn exec(&self, id: &str, cmd: &[String]) -> impl Future<Output = Result<ExecOutput>> + Send;
+    /// Starts a command in a running container with its output streamed
+    /// and, with `stdin`, its input from the caller.
+    fn exec_attach(
+        &self,
+        id: &str,
+        cmd: &[String],
+        stdin: bool,
+        tty: bool,
+    ) -> impl Future<Output = Result<Attached>> + Send;
+    fn exec_resize(
+        &self,
+        exec_id: &str,
+        width: u16,
+        height: u16,
+    ) -> impl Future<Output = Result<()>> + Send;
+    /// The exit code of an attached exec whose output has ended.
+    fn exec_exit_code(&self, exec_id: &str) -> impl Future<Output = Result<i32>> + Send;
+    /// A container's output; with `follow`, until it stops.
+    fn logs(
+        &self,
+        id: &str,
+        follow: bool,
+        tail: Option<usize>,
+    ) -> impl Future<Output = Result<BoxStream<'static, Result<Chunk>>>> + Send;
     fn list(
         &self,
         labels: &[(&str, &str)],
@@ -67,6 +92,33 @@ impl Runtime for Podman {
 
     async fn exec(&self, id: &str, cmd: &[String]) -> Result<ExecOutput> {
         Podman::exec(self, id, cmd).await
+    }
+
+    async fn exec_attach(
+        &self,
+        id: &str,
+        cmd: &[String],
+        stdin: bool,
+        tty: bool,
+    ) -> Result<Attached> {
+        Podman::exec_attach(self, id, cmd, stdin, tty).await
+    }
+
+    async fn exec_resize(&self, exec_id: &str, width: u16, height: u16) -> Result<()> {
+        Podman::exec_resize(self, exec_id, width, height).await
+    }
+
+    async fn exec_exit_code(&self, exec_id: &str) -> Result<i32> {
+        Podman::exec_exit_code(self, exec_id).await
+    }
+
+    async fn logs(
+        &self,
+        id: &str,
+        follow: bool,
+        tail: Option<usize>,
+    ) -> Result<BoxStream<'static, Result<Chunk>>> {
+        Ok(Podman::logs(self, id, follow, tail).await?.boxed())
     }
 
     async fn list(&self, labels: &[(&str, &str)]) -> Result<Vec<ContainerSummary>> {

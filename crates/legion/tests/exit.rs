@@ -112,17 +112,34 @@ fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
-fn legion(args: &[&str]) -> Output {
-    let identity = PathBuf::from(std::env::var("LEGION_EXIT_LAB").expect("set LEGION_EXIT_LAB"))
-        .join("data/admin.pem");
-    Command::new(LEGION)
-        .args(["--server", SERVER])
+fn identity() -> PathBuf {
+    PathBuf::from(std::env::var("LEGION_EXIT_LAB").expect("set LEGION_EXIT_LAB"))
+        .join("data/admin.pem")
+}
+
+fn cli() -> Command {
+    let mut c = Command::new(LEGION);
+    c.args(["--server", SERVER])
         .arg("--identity")
-        .arg(identity)
+        .arg(identity());
+    c
+}
+
+fn legion(args: &[&str]) -> Output {
+    cli().args(args).stdin(Stdio::null()).output().unwrap()
+}
+
+/// `legion` with `input` on its stdin.
+fn legion_input(args: &[&str], input: &[u8]) -> Output {
+    let mut child = cli()
         .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
 }
 
 fn ok(args: &[&str]) -> String {
@@ -186,9 +203,13 @@ fn running(service: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// One HTTP/1.0 GET: (status, body).
+/// One HTTP/1.0 GET of a web task: (status, body).
 fn get(ip: &str, path: &str) -> Option<(u16, String)> {
-    let addr: SocketAddr = format!("{ip}:8080").parse().ok()?;
+    get_at(&format!("{ip}:8080"), path)
+}
+
+fn get_at(addr: &str, path: &str) -> Option<(u16, String)> {
+    let addr: SocketAddr = addr.parse().ok()?;
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     write!(s, "GET {path} HTTP/1.0\r\n\r\n").ok()?;
@@ -263,6 +284,51 @@ fn app_survives_failures() {
     for (name, ip) in running("web") {
         assert_eq!(get(&ip, "/healthz"), Some((200, "ok".into())), "{name}");
     }
+
+    // Sessions through the manager. Exec passes output, exit code and,
+    // with -i, stdin; with -t the command gets a terminal (script(1) gives
+    // the CLI one).
+    let out = legion(&[
+        "exec",
+        "web",
+        "-n",
+        "shop",
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo out; echo err >&2; exit 3",
+    ]);
+    assert_eq!(
+        (out.status.code(), text(&out.stdout), text(&out.stderr)),
+        (Some(3), "out\n".into(), "err\n".into())
+    );
+    let out = legion_input(
+        &["exec", "-i", "db", "-n", "shop", "--", "/bin/cat"],
+        b"piped\n",
+    );
+    assert_eq!(text(&out.stdout), "piped\n", "{}", text(&out.stderr));
+    let tty = sh(&format!(
+        "script -q /dev/null {LEGION} --server {SERVER} --identity {} \
+         exec -t web -n shop -- /bin/sh -c 'test -t 0 && echo terminal' </dev/null",
+        identity().display()
+    ));
+    assert!(tty.contains("terminal"), "{tty:?}");
+    // Logs: inetd -d lists its services as it starts.
+    let out = legion(&["logs", "db", "-n", "shop", "--tail", "100"]);
+    let logs = text(&out.stdout) + &text(&out.stderr);
+    assert!(logs.contains("legion-store"), "{logs}");
+    // Port-forward: a local port reaches a web task.
+    let mut forward = cli()
+        .args(["port-forward", "web", "-n", "shop", "18080:8080"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait("the forwarded port", 30, || {
+        get_at("127.0.0.1:18080", "/healthz") == Some((200, "ok".into()))
+    });
+    forward.kill().unwrap();
+    forward.wait().unwrap();
 
     // A database crash: the container restarts in its pod, the data stays.
     let db = running("db")[0].0.clone();

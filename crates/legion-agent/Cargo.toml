@@ -22,7 +22,8 @@ legion-sys.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+tokio-stream.workspace = true
 tonic = { workspace = true, features = ["tls-ring"] }
 tonic-health.workspace = true
 tracing.workspace = true
@@ -33,5 +34,4 @@ legion-store.workspace = true
 openraft.workspace = true
 serde_yaml_ng.workspace = true
 tempfile.workspace = true
-tokio-stream.workspace = true
 tracing-subscriber.workspace = true

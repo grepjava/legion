@@ -4,6 +4,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/legion/v1/api.proto",
         "proto/legion/v1/dispatcher.proto",
         "proto/legion/v1/raft.proto",
+        "proto/legion/v1/session.proto",
     ];
     for proto in protos {
         println!("cargo:rerun-if-changed={proto}");

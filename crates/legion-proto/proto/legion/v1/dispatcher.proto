@@ -9,6 +9,8 @@ syntax = "proto3";
 
 package legion.v1;
 
+import "legion/v1/session.proto";
+
 service Dispatcher {
   // Creates the node's Node object or updates its status; returns the pod
   // subnet it holds.
@@ -34,6 +36,17 @@ service Dispatcher {
   // Tells the leader the node is alive. A node silent for three periods is
   // marked down.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  // Sessions users open with the node's tasks. An agent keeps this stream
+  // open with every manager, so each can reach it, and answers each offer
+  // with `Attach` to the manager that made it.
+  rpc Sessions(SessionsRequest) returns (stream SessionOffer);
+  // An offered session: the agent's first frame is `attach` with its id;
+  // then the manager relays the user's input and the agent's output.
+  rpc Attach(stream SessionFrame) returns (stream SessionFrame);
+}
+
+message SessionsRequest {
+  string node = 1;
 }
 
 message RegisterRequest {

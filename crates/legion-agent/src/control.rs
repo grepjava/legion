@@ -19,10 +19,11 @@ use legion_api::{Kind, ObjectKey};
 use legion_proto::v1::dispatcher_client::DispatcherClient;
 use legion_proto::v1::{
     AssignmentsRequest, ClaimVolumeRequest, DataRequest, EndpointsRequest, HeartbeatRequest,
-    PeersRequest, PoliciesRequest, RegisterRequest, ReportRequest,
+    PeersRequest, PoliciesRequest, RegisterRequest, ReportRequest, SessionFrame, SessionOffer,
+    SessionsRequest,
 };
 use legion_sys::Ipv4Net;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 #[derive(Debug, thiserror::Error)]
@@ -98,7 +99,43 @@ pub trait Control: Send + Sync + 'static {
     /// Tells the managers `node` is alive; returns how long to wait before
     /// the next heartbeat.
     fn heartbeat(&self, node: &str) -> impl Future<Output = Result<Duration, ControlError>> + Send;
+
+    /// Sessions users open with the node's tasks, as any manager offers
+    /// them.
+    fn sessions(&self, node: &str) -> mpsc::Receiver<Offer>;
 }
+
+/// A session a manager offers the agent.
+pub struct Offer {
+    pub offer: SessionOffer,
+    manager: DispatcherClient<Channel>,
+}
+
+impl Offer {
+    /// Opens the session's stream with the manager that offered it.
+    /// `frames` start with the session's id (`attach`).
+    pub async fn attach(
+        &self,
+        frames: mpsc::Receiver<SessionFrame>,
+    ) -> Result<tonic::Streaming<SessionFrame>, ControlError> {
+        let mut manager = self.manager.clone();
+        match tokio::time::timeout(
+            CALL_TIMEOUT,
+            manager.attach(tokio_stream::wrappers::ReceiverStream::new(frames)),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => Ok(resp.into_inner()),
+            Ok(Err(status)) => Err(error(status)),
+            Err(_) => Err(ControlError::Unavailable(
+                "the manager did not answer".into(),
+            )),
+        }
+    }
+}
+
+/// How often the agent looks for managers to follow sessions from.
+const SESSION_MANAGERS: Duration = Duration::from_secs(5);
 
 /// How long a call to a manager may take before the agent tries another.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -296,6 +333,64 @@ impl GrpcControl {
     }
 }
 
+/// Passes on the sessions `manager` offers, following its stream again
+/// whenever it ends, until `tx` is closed.
+async fn follow_sessions(
+    manager: String,
+    tls: Option<ClientTlsConfig>,
+    node: String,
+    tx: mpsc::Sender<Offer>,
+) {
+    use futures::StreamExt;
+    let channel = match connect(&manager, tls.as_ref()) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("{e}");
+            return;
+        }
+    };
+    let client = DispatcherClient::new(channel);
+    loop {
+        let mut c = client.clone();
+        let opened = tokio::select! {
+            o = c.sessions(SessionsRequest { node: node.clone() }) => o,
+            _ = tx.closed() => return,
+        };
+        match opened {
+            Ok(resp) => {
+                let mut offers = resp.into_inner();
+                loop {
+                    let next = tokio::select! {
+                        n = offers.next() => n,
+                        _ = tx.closed() => return,
+                    };
+                    match next {
+                        Some(Ok(offer)) => {
+                            let offer = Offer {
+                                offer,
+                                manager: client.clone(),
+                            };
+                            if tx.send(offer).await.is_err() {
+                                return;
+                            }
+                        }
+                        Some(Err(status)) => {
+                            tracing::debug!(%manager, "sessions stream ended: {status}");
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+            }
+            Err(status) => tracing::debug!(%manager, "following sessions: {status}"),
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            _ = tx.closed() => return,
+        }
+    }
+}
+
 /// A lazily connected channel to a manager, with keepalives so a manager
 /// that vanishes without closing the connection is noticed.
 fn connect(addr: &str, tls: Option<&ClientTlsConfig>) -> Result<Channel, ControlError> {
@@ -485,6 +580,46 @@ impl Control for GrpcControl {
         };
         let resp = self.call(|mut c| async move { c.data(req).await }).await?;
         Ok(resp.value)
+    }
+
+    fn sessions(&self, node: &str) -> mpsc::Receiver<Offer> {
+        let (tx, rx) = mpsc::channel(16);
+        let this = self.clone();
+        let node = node.to_owned();
+        // One stream per manager, so any of them can reach the node; the
+        // heartbeats keep the list of managers current.
+        tokio::spawn(async move {
+            let mut following: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+                Default::default();
+            loop {
+                let managers = this.managers();
+                following.retain(|m, h| {
+                    let keep = managers.contains(m);
+                    if !keep {
+                        h.abort();
+                    }
+                    keep && !h.is_finished()
+                });
+                for m in managers {
+                    following.entry(m.clone()).or_insert_with(|| {
+                        tokio::spawn(follow_sessions(
+                            m,
+                            this.tls.clone(),
+                            node.clone(),
+                            tx.clone(),
+                        ))
+                    });
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(SESSION_MANAGERS) => {}
+                    _ = tx.closed() => break,
+                }
+            }
+            for h in following.values() {
+                h.abort();
+            }
+        });
+        rx
     }
 
     async fn heartbeat(&self, node: &str) -> Result<Duration, ControlError> {

@@ -377,22 +377,36 @@ Already there from phase 1: namespaces scope names and DNS
   storage, missing requests and sizes, shrinking under a lowered quota,
   other namespaces unaffected.
 
+- **`logs`, `exec`, `port-forward`** (`legion-manager::session`,
+  `legion-agent::session`, `session.proto`, DESIGN.md §3.8): opened at any
+  manager's `Pods` service, which checks RBAC (logs `view`, the others
+  `edit`), resolves the task, or a running task of a service, and its
+  container, and offers the session to the node's agent. Agents keep a
+  `Sessions` stream with every manager and answer with `Attach`, so no
+  manager forwards to another and nodes need no port. Exec runs attached
+  through libpod's upgraded connection, with stdin, a terminal and resizes;
+  the CLI exits with the command's code. Port-forward is a session per
+  connection. Tested: the libpod upgrade against a canned server and real
+  Podman; through a manager and the agent, logs (tail, follow to the end),
+  exec with stdin, a terminal size and exit code, a user going away, the
+  errors, and port-forward; RBAC over TLS; and in the phase 1 exit test on
+  FreeBSD, the CLI's exec (`-i`, `-t` under script(1)), logs and
+  port-forward against the real app.
+
 ### To do, in order
 
 The first three are what the exit criterion rests on: who may do what,
 what may talk to what, and how much each team may use; all three are
 done.
 
-1. **`logs`, `exec`, `port-forward`**: streamed from the agent through a
-   manager, under RBAC (`exec` and `port-forward` need `edit`).
-2. **Init containers**: run in order to completion before the main ones.
-3. **Jobs and CronJobs**: run to completion, retries and deadlines; cron
+1. **Init containers**: run in order to completion before the main ones.
+2. **Jobs and CronJobs**: run to completion, retries and deadlines; cron
    schedules, concurrency policy, history limits.
-4. **Disruption budgets**: `maxUnavailable` honoured by drain and updates.
-5. **Security profiles**: the jail defaults in DESIGN.md §9, loosened per
+3. **Disruption budgets**: `maxUnavailable` honoured by drain and updates.
+4. **Security profiles**: the jail defaults in DESIGN.md §9, loosened per
    service only explicitly.
-6. **Metrics**: a Prometheus endpoint on each manager and agent.
-7. **Exit test**: two teams, each with its own user and namespace, deploy
+5. **Metrics**: a Prometheus endpoint on each manager and agent.
+6. **Exit test**: two teams, each with its own user and namespace, deploy
     on the same cluster; neither can read or change the other's objects,
     reach the other's tasks, or exceed its quota.
 

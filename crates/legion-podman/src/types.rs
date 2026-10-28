@@ -188,8 +188,10 @@ impl Event {
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct ExecCreate<'a> {
     pub cmd: &'a [String],
+    pub attach_stdin: bool,
     pub attach_stdout: bool,
     pub attach_stderr: bool,
+    pub tty: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -38,7 +38,7 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
     }
     let channel = connect(server, identity).await?;
     let mut objects = ObjectsClient::new(channel.clone());
-    let mut cluster = ClusterClient::new(channel);
+    let mut cluster = ClusterClient::new(channel.clone());
     match command {
         Command::Daemon { .. } => unreachable!("handled in main"),
         Command::Init => {
@@ -58,6 +58,42 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             println!("{token}");
         }
         Command::Join { .. } => unreachable!("handled in main"),
+        Command::Logs {
+            task,
+            namespace,
+            container,
+            follow,
+            tail,
+        } => {
+            let target = target(task, namespace, container);
+            crate::session::logs(&channel, &target, follow, tail).await?;
+        }
+        Command::Exec {
+            task,
+            namespace,
+            container,
+            interactive,
+            tty,
+            command,
+        } => {
+            let target = target(task, namespace, container);
+            let code = crate::session::exec(&channel, &target, command, interactive, tty).await?;
+            // Without waiting for a stdin read that may never return.
+            std::process::exit(code);
+        }
+        Command::PortForward {
+            task,
+            ports,
+            namespace,
+            address,
+        } => {
+            let ports = ports
+                .iter()
+                .map(|p| crate::session::parse_ports(p))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let target = target(task, namespace, None);
+            crate::session::port_forward(&channel, target, &address, &ports).await?;
+        }
         Command::User {
             command:
                 UserCommand::Create {
@@ -494,6 +530,18 @@ fn manifest_yaml(o: pb::Object) -> anyhow::Result<String> {
         "metadata": metadata,
         "spec": o.spec,
     }))?)
+}
+
+fn target(
+    task: String,
+    namespace: Option<String>,
+    container: Option<String>,
+) -> crate::session::Target {
+    crate::session::Target {
+        namespace: namespace.unwrap_or_else(|| "default".into()),
+        task,
+        container: container.unwrap_or_default(),
+    }
 }
 
 async fn connect(server: &str, identity: &Path) -> anyhow::Result<Channel> {
