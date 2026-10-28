@@ -55,6 +55,9 @@ pub struct NamespaceSpec {
     /// Which tasks may reach this namespace's tasks without a policy.
     #[serde(default)]
     pub isolation: crate::policy::Isolation,
+    /// Limits on what the namespace's tasks and volumes may take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<crate::quota::Quota>,
 }
 
 impl Spec for NamespaceSpec {

@@ -1,6 +1,6 @@
 //! Controllers (DESIGN.md §3.3). They run on the leader only: each pass
-//! reads Services, Tasks, Nodes and Volumes from the local store, plans the writes
-//! that converge them ([`plan`]) and makes them with version
+//! reads Services, Tasks, Nodes, Volumes and Namespaces from the local store,
+//! plans the writes that converge them ([`plan`]) and makes them with version
 //! preconditions, so a write based on stale state fails and the next pass
 //! sees the newer state.
 //!
@@ -18,7 +18,7 @@ use legion_store::{Command, NodeId, Outcome, Precondition, Store};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use plan::{Action, Homes, Memory, Node, Service, Task};
+use plan::{Action, Homes, Memory, Node, Quotas, Service, Task};
 
 /// Changes arriving within this window are handled in one pass.
 const DEBOUNCE: Duration = Duration::from_millis(50);
@@ -91,14 +91,22 @@ async fn lead(store: &Store) {
 
 /// One reconcile pass; returns when the next one is due at the latest.
 async fn pass(store: &Store, memory: &mut Memory) -> Option<Instant> {
-    let (services, tasks, nodes, homes) = match read(store) {
+    let (services, tasks, nodes, homes, quotas) = match read(store) {
         Ok(state) => state,
         Err(e) => {
             tracing::warn!("reading the store: {e}");
             return Some(Instant::now() + Duration::from_secs(1));
         }
     };
-    let plan = plan::plan(&services, &tasks, &nodes, &homes, memory, Instant::now());
+    let plan = plan::plan(
+        &services,
+        &tasks,
+        &nodes,
+        &homes,
+        &quotas,
+        memory,
+        Instant::now(),
+    );
     for action in plan.actions {
         if let Err(e) = apply(store, action).await {
             tracing::debug!("controller write: {e}");
@@ -107,7 +115,7 @@ async fn pass(store: &Store, memory: &mut Memory) -> Option<Instant> {
     plan.wake
 }
 
-type State = (Vec<Service>, Vec<Task>, Vec<Node>, Homes);
+type State = (Vec<Service>, Vec<Task>, Vec<Node>, Homes, Quotas);
 
 fn read(store: &Store) -> Result<State, legion_store::Error> {
     let services = store
@@ -157,7 +165,16 @@ fn read(store: &Store) -> Result<State, legion_store::Error> {
                 .then_some(((o.metadata.namespace, o.metadata.name), status.node))
         })
         .collect();
-    Ok((services, tasks, nodes, homes))
+    let quotas = store
+        .list(Kind::Namespace, None)?
+        .objects
+        .into_iter()
+        .filter_map(|o| {
+            let spec: legion_api::admit::NamespaceSpec = parsed(&o)?;
+            Some((o.metadata.name, spec.quota?))
+        })
+        .collect();
+    Ok((services, tasks, nodes, homes, quotas))
 }
 
 fn parsed<T: legion_api::Spec>(o: &Object) -> Option<T> {

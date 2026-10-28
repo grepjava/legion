@@ -1158,3 +1158,93 @@ async fn users_act_within_their_role_bindings() {
     };
     assert_eq!(bundle.identity().unwrap(), Identity::new("eve", Role::User));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn namespace_quotas_refuse_what_would_not_fit() {
+    let m = Running::start().await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let api = m.objects().await;
+    let try_apply = |req: ApplyRequest| {
+        let api = api.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match api.clone().apply(req.clone()).await {
+                    Err(s)
+                        if s.code() == Code::Unavailable
+                            && tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    r => return r.map(|_| ()),
+                }
+            }
+        }
+    };
+    let refused = |r: Result<(), tonic::Status>| match r {
+        Err(e) if e.code() == Code::FailedPrecondition => e.message().to_owned(),
+        other => panic!("{other:?}"),
+    };
+    let quota =
+        |q: serde_json::Value| object("Namespace", "", "team", serde_json::json!({ "quota": q }));
+    let svc = |name: &str, replicas: u32, cpu: Option<&str>| {
+        let resources = match cpu {
+            Some(c) => serde_json::json!({ "requests": { "cpu": c } }),
+            None => serde_json::json!({}),
+        };
+        object(
+            "Service",
+            "team",
+            name,
+            serde_json::json!({ "replicas": replicas, "pod": { "containers": [
+                { "name": "c", "image": "c:1", "resources": resources }
+            ] } }),
+        )
+    };
+    let volume = |name: &str, size: Option<&str>| {
+        let spec = match size {
+            Some(s) => serde_json::json!({ "size": s }),
+            None => serde_json::json!({}),
+        };
+        object("Volume", "team", name, spec)
+    };
+
+    try_apply(quota(
+        serde_json::json!({ "cpu": "1", "tasks": 3, "volumes": 1, "storage": "10Gi" }),
+    ))
+    .await
+    .unwrap();
+    // Under a CPU quota, a pod must say what it needs.
+    let why = refused(try_apply(svc("web", 2, None)).await);
+    assert!(why.contains("must request cpu"), "{why}");
+    try_apply(svc("web", 2, Some("400m"))).await.unwrap();
+    assert_eq!(
+        refused(try_apply(svc("api", 2, Some("300m"))).await),
+        "over the quota of namespace team: cpu 1400m of 1, tasks 4 of 3"
+    );
+    // Room made, it fits.
+    try_apply(svc("web", 1, Some("400m"))).await.unwrap();
+    try_apply(svc("api", 2, Some("300m"))).await.unwrap();
+
+    // Volumes: counted, and sized under a storage quota.
+    let why = refused(try_apply(volume("data", None)).await);
+    assert!(why.contains("needs a size"), "{why}");
+    try_apply(volume("data", Some("10Gi"))).await.unwrap();
+    assert_eq!(
+        refused(try_apply(volume("logs", Some("1Gi"))).await),
+        "over the quota of namespace team: volumes 2 of 1, storage 11Gi of 10Gi"
+    );
+
+    // Under a lowered quota, shrinking still goes through; growing does not.
+    try_apply(quota(serde_json::json!({ "tasks": 1 })))
+        .await
+        .unwrap();
+    try_apply(svc("api", 1, Some("300m"))).await.unwrap();
+    refused(try_apply(svc("api", 2, Some("300m"))).await);
+
+    // Other namespaces are not limited.
+    let mut free = svc("api", 50, None);
+    free.object.as_mut().unwrap().namespace = "other".into();
+    try_apply(free).await.unwrap();
+    m.stop().await;
+}

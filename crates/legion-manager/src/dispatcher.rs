@@ -944,6 +944,11 @@ fn assignment(o: &Object, node: &str) -> Option<Assignment> {
     } else {
         serde_json::from_value(o.status.clone()).unwrap_or_default()
     };
+    // A global task names its node before the scheduler places it there
+    // (it may lack room, or its namespace quota).
+    if status.state == TaskState::Pending {
+        return None;
+    }
     Some(Assignment {
         key: o.key(),
         uid: o.metadata.uid.clone(),

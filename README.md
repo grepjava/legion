@@ -84,7 +84,16 @@ legion stack rm shop                        # volumes and their data stay
 A namespace's tasks are reached only by its own tasks, the nodes and
 published ports, unless its `isolation` is `open` (or `locked`, not even
 its own); `NetworkPolicy` objects let more in by namespace, service labels
-and ports.
+and ports. A namespace's `quota`, which only the cluster admin sets, caps
+what its tasks request, how many run, and its volumes; tasks beyond it
+wait as `pending`:
+
+```yaml
+kind: Namespace
+metadata: { name: shop }
+spec:
+  quota: { cpu: 4, memory: 8Gi, tasks: 20, volumes: 5, storage: 100Gi }
+```
 
 `admin.pem` is the cluster admin's. People get their own credentials and a
 role (`view`, `edit` or `admin`) in a namespace; the key is made where the

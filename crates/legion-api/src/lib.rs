@@ -18,6 +18,7 @@ pub mod dispatch;
 pub mod node;
 pub mod policy;
 pub mod quantity;
+pub mod quota;
 pub mod rbac;
 pub mod service;
 pub mod task;

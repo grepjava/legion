@@ -164,12 +164,14 @@ impl Harness {
         }))
         .unwrap();
         spec.admit().unwrap();
-        let object = Object::new(
+        let mut object = Object::new(
             Kind::Task,
             "shop",
             name,
             serde_json::to_value(&spec).unwrap(),
         );
+        // As the scheduler leaves it.
+        object.status = serde_json::json!({ "state": "assigned" });
         self.write(object, Precondition::MustNotExist).await.key()
     }
 

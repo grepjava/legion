@@ -45,6 +45,8 @@ pub struct ApiService {
     pub(crate) peer_tls: Option<tonic::transport::ClientTlsConfig>,
     /// Certifies joining nodes; managers without the CA key cannot.
     pub(crate) issuer: Option<crate::join::Issuer>,
+    /// Held from quota check to write, so two applies cannot both fit.
+    pub(crate) quota_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 enum Route {
@@ -174,6 +176,10 @@ impl ApiService {
         }
         legion_api::admit(&mut desired).map_err(invalid)?;
         let key = desired.key();
+        let _counting = match crate::quota::counts(desired.kind) {
+            true => Some(self.quota_lock.lock().await),
+            false => None,
+        };
 
         for _ in 0..APPLY_ATTEMPTS {
             let current = self.store.get(&key).map_err(internal)?;
@@ -205,6 +211,7 @@ impl ApiService {
                     ApplyResult::Created,
                 ),
             };
+            crate::quota::check(&self.store, &object)?;
             if req.dry_run {
                 return Ok(ApplyResponse {
                     object: Some((&object).into()),

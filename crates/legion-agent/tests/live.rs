@@ -188,12 +188,13 @@ async fn agent_runs_a_real_pod() {
     }))
     .unwrap();
     spec.admit().unwrap();
-    let task = Object::new(
+    let mut task = Object::new(
         Kind::Task,
         "lab",
         "web-1",
         serde_json::to_value(&spec).unwrap(),
     );
+    task.status = serde_json::json!({ "state": "assigned" });
     let key = task.key();
     for (kind, name, text) in [
         (Kind::Secret, "greeting", "hello"),

@@ -171,6 +171,21 @@ preconditions. Rules:
   the fewest tasks of the same service, then the least requested CPU and
   memory. An unplaceable task stays `pending` with
   the reasons in its message, e.g. `no node can run it: 1 constraints`.
+  A global task names its node from the start but is not sent there
+  until placed.
+- **Namespace quotas** (`Namespace.spec.quota: {cpu, memory, tasks,
+  volumes, storage}`, set by the cluster admin only, as Namespaces are
+  cluster-scoped): the scheduler places a task only if its namespace's
+  placed tasks, with it, stay within the CPU and memory requests and the
+  task count; otherwise it stays `pending` with, e.g., `over the quota of
+  namespace shop: cpu 1200m of 1`. Admission refuses a Service or Volume
+  whose namespace would then want more than the quota in all (replicas
+  times requests; a global service counts one task per node), and, under
+  a CPU, memory or storage quota, one that does not say what it needs.
+  Only growth is refused: under a lowered quota, nothing is stopped and
+  shrinking still goes through. Volumes are held to the quota at
+  admission only, so the leader admits and writes Services and Volumes one
+  at a time. A start-first update needs room for one more task.
 
 ### 3.4 Agent components
 

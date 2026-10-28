@@ -11,13 +11,14 @@ use legion_api::task::{DesiredState, TaskState, TaskStatus};
 use legion_api::{Kind, Object, Spec};
 use tokio::time::Instant;
 
-use super::plan::{Action, HISTORY, Homes, Memory, Node, Service, Task, plan};
+use super::plan::{Action, HISTORY, Homes, Memory, Node, Quotas, Service, Task, plan};
 
 struct World {
     services: Vec<Service>,
     tasks: Vec<Task>,
     nodes: Vec<Node>,
     homes: Homes,
+    quotas: Quotas,
     index: u64,
     memory: Memory,
     now: Instant,
@@ -32,6 +33,7 @@ impl World {
             tasks: vec![],
             nodes: vec![],
             homes: Homes::new(),
+            quotas: Quotas::new(),
             index: 0,
             memory: Memory::default(),
             now: Instant::now(),
@@ -194,7 +196,7 @@ impl World {
     }
 
     /// Agents: assigned tasks start; stopping tasks stop. A node that is
-    /// down does neither.
+    /// down does neither, and pending tasks are not sent to agents.
     fn agents(&mut self) -> bool {
         if !self.agents {
             return false;
@@ -205,7 +207,7 @@ impl World {
             let up = self.nodes.iter().any(|n| {
                 n.object.metadata.name == t.spec.node && n.status.state != NodeState::Down
             });
-            if !up || t.status.state.is_terminal() {
+            if !up || t.status.state.is_terminal() || t.status.state == TaskState::Pending {
                 continue;
             }
             let next = match t.spec.desired_state {
@@ -235,6 +237,7 @@ impl World {
                 &self.tasks,
                 &self.nodes,
                 &self.homes,
+                &self.quotas,
                 &mut self.memory,
                 self.now,
             );
@@ -269,6 +272,7 @@ impl World {
             &self.tasks,
             &self.nodes,
             &self.homes,
+            &self.quotas,
             &mut self.memory,
             self.now,
         )
@@ -637,6 +641,7 @@ fn rolling_update_stop_first() {
         &w.tasks,
         &w.nodes,
         &w.homes,
+        &w.quotas,
         &mut w.memory,
         w.now,
     );
@@ -676,6 +681,7 @@ fn rolling_update_start_first() {
         &w.tasks,
         &w.nodes,
         &w.homes,
+        &w.quotas,
         &mut w.memory,
         w.now,
     );
@@ -1048,4 +1054,69 @@ endpoint:
     w.settle();
     assert_eq!(published(&w, "new"), [(80, 30080)]);
     assert!(status(&w, "new").conflicts.is_empty());
+}
+
+#[test]
+fn a_namespace_quota_holds_tasks() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    let quota = |y: &str| serde_yaml_ng::from_str(y).unwrap();
+    w.quotas
+        .insert("shop".into(), quota("{ cpu: 1, tasks: 3 }"));
+    w.service(
+        "web",
+        "replicas: 3
+pod: { containers: [{ name: web, image: \"web:1\", resources: { requests: { cpu: 400m } } }] }",
+    );
+    w.service(
+        "agent",
+        "mode: global
+pod: { containers: [{ name: a, image: \"a:1\" }] }",
+    );
+    w.settle();
+    // Two of web fit the CPU, one of agent the task count; the rest wait,
+    // agent's on the node it names, unstarted.
+    assert_eq!(
+        w.tasks(),
+        [
+            "agent-n1-1 running n1",
+            "agent-n2-1 pending n2",
+            "web-1-1 running n1",
+            "web-2-1 running n2",
+            "web-3-1 pending ",
+        ]
+    );
+    let message = |w: &World, name: &str| {
+        let t = w.tasks.iter().find(|t| t.object.metadata.name == name);
+        t.unwrap().status.message.clone()
+    };
+    assert_eq!(
+        message(&w, "web-3-1"),
+        "over the quota of namespace shop: cpu 1200m of 1, tasks 4 of 3"
+    );
+    assert_eq!(
+        message(&w, "agent-n2-1"),
+        "over the quota of namespace shop: tasks 4 of 3"
+    );
+
+    // A larger quota lets them run.
+    w.quotas
+        .insert("shop".into(), quota("{ cpu: 2, tasks: 5 }"));
+    w.settle();
+    assert_eq!(w.running().len(), 5);
+
+    // A smaller one stops nothing, but a replacement waits for room.
+    w.quotas.insert("shop".into(), quota("{ tasks: 4 }"));
+    w.settle();
+    assert_eq!(w.running().len(), 5);
+    w.fail("web-1-1");
+    w.settle();
+    w.now += Duration::from_secs(60);
+    w.settle();
+    assert_eq!(w.running().len(), 4);
+    assert_eq!(
+        message(&w, "web-1-2"),
+        "over the quota of namespace shop: tasks 5 of 4"
+    );
 }

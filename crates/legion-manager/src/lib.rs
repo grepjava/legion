@@ -12,6 +12,7 @@ mod authz;
 pub mod controller;
 mod dispatcher;
 pub mod join;
+mod quota;
 mod raft_net;
 mod tls;
 
@@ -169,6 +170,7 @@ impl Manager {
             closing,
             peer_tls: self.tls.as_ref().map(Tls::client),
             issuer,
+            quota_lock: Default::default(),
         };
         let (dispatcher, dispatching) =
             dispatcher::DispatcherService::start(api.clone(), self.tls.is_some(), self.heartbeat);

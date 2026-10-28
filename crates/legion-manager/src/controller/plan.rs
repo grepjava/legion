@@ -10,6 +10,7 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use legion_api::node::{Availability, NodeSpec, NodeState, NodeStatus};
+use legion_api::quota::{Quota, Usage};
 use legion_api::service::FailureAction;
 use legion_api::service::{
     Constraint, EndpointMode, NodeAttribute, PUBLISHED_PORTS, Publish, PublishedPort,
@@ -67,6 +68,9 @@ pub struct Node {
 /// The node each claimed Volume lives on, by namespace and name.
 pub type Homes = BTreeMap<(String, String), String>;
 
+/// Namespace quotas, by namespace.
+pub type Quotas = BTreeMap<String, Quota>;
+
 impl Node {
     fn name(&self) -> &str {
         &self.object.metadata.name
@@ -82,6 +86,11 @@ impl Node {
 }
 
 impl Task {
+    /// On a node, as far as resources and quotas go: placed and not ended.
+    fn placed(&self) -> bool {
+        self.status.state != TaskState::Pending && !self.status.state.is_terminal()
+    }
+
     fn active(&self) -> bool {
         self.spec.desired_state == DesiredState::Running && !self.status.state.is_terminal()
     }
@@ -157,6 +166,7 @@ pub fn plan(
     tasks: &[Task],
     nodes: &[Node],
     homes: &Homes,
+    quotas: &Quotas,
     memory: &mut Memory,
     now: Instant,
 ) -> Plan {
@@ -210,7 +220,7 @@ pub fn plan(
         }
     }
 
-    schedule(services, tasks, created, nodes, homes, &mut plan);
+    schedule(services, tasks, created, nodes, homes, quotas, &mut plan);
 
     // An orphaned task is written once per pass; what else was planned for
     // it waits for the next one.
@@ -917,31 +927,36 @@ impl Load {
 /// same service, then requested CPU and memory in thousandths.
 type Score = (bool, u32, u64, u64);
 
-/// Places unassigned tasks: filter nodes (eligible, requests fit), then
-/// prefer a node without an untolerated `PreferNoSchedule` taint, then the
-/// one with the fewest tasks of the same service, then the least
-/// requested. New tasks are created already placed; existing
-/// pending ones are updated.
+/// Places pending tasks: hold those their namespace's quota has no room
+/// for, filter nodes (eligible, requests fit), then prefer a node without
+/// an untolerated `PreferNoSchedule` taint, then the one with the fewest
+/// tasks of the same service, then the least requested. New tasks are
+/// created already placed; existing pending ones are updated. A global
+/// task names its node from the start, but is pending, and not sent to
+/// the agent, until placed there.
+#[allow(clippy::too_many_arguments)]
 fn schedule(
     services: &[Service],
     tasks: &[Task],
     created: Vec<Task>,
     nodes: &[Node],
     homes: &Homes,
+    quotas: &Quotas,
     plan: &mut Plan,
 ) {
     let mut load: BTreeMap<String, Load> = BTreeMap::new();
-    for t in tasks
-        .iter()
-        .filter(|t| !t.spec.node.is_empty() && !t.status.state.is_terminal())
-    {
+    let mut used: BTreeMap<String, Usage> = BTreeMap::new();
+    for t in tasks.iter().filter(|t| t.placed()) {
         load.entry(t.spec.node.clone()).or_default().add(t);
+        used.entry(t.object.metadata.namespace.clone())
+            .or_default()
+            .add_tasks(t.spec.pod.requests(), 1);
     }
 
-    // Never-scheduled tasks told to stop have no agent to report for them.
+    // Never-placed tasks told to stop have no agent to report for them.
     for t in tasks
         .iter()
-        .filter(|t| t.spec.node.is_empty() && t.stopping())
+        .filter(|t| t.status.state == TaskState::Pending && t.stopping())
     {
         let mut o = t.object.clone();
         o.status = serde_json::to_value(TaskStatus {
@@ -956,10 +971,7 @@ fn schedule(
 
     let touched: BTreeSet<ObjectKey> = plan.actions.iter().map(Action::key).collect();
     let existing = tasks.iter().filter(|t| {
-        t.spec.node.is_empty()
-            && t.active()
-            && t.status.state == TaskState::Pending
-            && !touched.contains(&t.object.key())
+        t.active() && t.status.state == TaskState::Pending && !touched.contains(&t.object.key())
     });
     let pending: Vec<(Task, Option<&Task>)> = existing
         .map(|t| (t.clone(), Some(t)))
@@ -971,9 +983,17 @@ fn schedule(
             continue;
         };
         let requests = t.spec.pod.requests();
+        let namespace = t.object.metadata.namespace.clone();
+        let before = used.get(&namespace).copied().unwrap_or_default();
+        let mut after = before;
+        after.add_tasks(requests, 1);
+        let over = quotas
+            .get(&namespace)
+            .map(|q| q.exceeded(&before, &after))
+            .unwrap_or_default();
         let mut reasons: BTreeMap<&str, usize> = BTreeMap::new();
         let mut best: Option<(&str, Score)> = None;
-        for n in nodes {
+        for n in nodes.iter().filter(|_| over.is_empty()) {
             let name = n.object.metadata.name.as_str();
             if !t.spec.node.is_empty() && t.spec.node != name {
                 continue;
@@ -1009,11 +1029,20 @@ fn schedule(
             Some((name, _)) => {
                 t.spec.node = name.to_owned();
                 load.entry(name.to_owned()).or_default().add(&t);
+                used.insert(namespace, after);
                 TaskStatus {
                     state: TaskState::Assigned,
                     ..Default::default()
                 }
             }
+            None if !over.is_empty() => TaskStatus {
+                state: TaskState::Pending,
+                message: format!(
+                    "over the quota of namespace {namespace}: {}",
+                    legion_api::quota::describe(&over)
+                ),
+                ..Default::default()
+            },
             None => {
                 let why = if reasons.is_empty() {
                     "no nodes".to_owned()

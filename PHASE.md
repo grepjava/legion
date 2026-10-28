@@ -362,24 +362,37 @@ Already there from phase 1: namespaces scope names and DNS
   then opened at the client, the host still reaching a refused pod, and a
   spoofed source dropped. Egress policies are not built.
 
+- **Namespace quotas** (`legion_api::quota`, `legion-manager::quota`,
+  DESIGN.md §3.3): `Namespace.spec.quota` limits the CPU and memory its
+  tasks request, its placed tasks, its volumes and their sizes. The
+  scheduler holds tasks over it as `pending`, with the limits in the
+  message; admission refuses a Service or Volume whose desired state
+  would go over, and, under a CPU, memory or storage quota, one that does
+  not state its needs. Only growth is refused. Quota-counted applies are
+  serialised on the leader. Pending tasks are no longer sent to agents: a
+  global task held for lack of room (or quota) used to run anyway. Tested:
+  the arithmetic; the scheduler holding replicated and global tasks,
+  releasing them when the quota grows and stopping nothing when it
+  shrinks; through the API, refusals by CPU, task count, volume count and
+  storage, missing requests and sizes, shrinking under a lowered quota,
+  other namespaces unaffected.
+
 ### To do, in order
 
 The first three are what the exit criterion rests on: who may do what,
-what may talk to what, and how much each team may use; the first two
-are done.
+what may talk to what, and how much each team may use; all three are
+done.
 
-1. **Namespace quotas**: limits on the requests, tasks and volumes a
-   namespace may hold, checked at admission and by the scheduler.
-2. **`logs`, `exec`, `port-forward`**: streamed from the agent through a
+1. **`logs`, `exec`, `port-forward`**: streamed from the agent through a
    manager, under RBAC (`exec` and `port-forward` need `edit`).
-3. **Init containers**: run in order to completion before the main ones.
-4. **Jobs and CronJobs**: run to completion, retries and deadlines; cron
+2. **Init containers**: run in order to completion before the main ones.
+3. **Jobs and CronJobs**: run to completion, retries and deadlines; cron
    schedules, concurrency policy, history limits.
-5. **Disruption budgets**: `maxUnavailable` honoured by drain and updates.
-6. **Security profiles**: the jail defaults in DESIGN.md §9, loosened per
+4. **Disruption budgets**: `maxUnavailable` honoured by drain and updates.
+5. **Security profiles**: the jail defaults in DESIGN.md §9, loosened per
    service only explicitly.
-7. **Metrics**: a Prometheus endpoint on each manager and agent.
-8. **Exit test**: two teams, each with its own user and namespace, deploy
+6. **Metrics**: a Prometheus endpoint on each manager and agent.
+7. **Exit test**: two teams, each with its own user and namespace, deploy
     on the same cluster; neither can read or change the other's objects,
     reach the other's tasks, or exceed its quota.
 
