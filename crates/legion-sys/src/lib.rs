@@ -140,6 +140,12 @@ pub trait Sys: Send + Sync {
     fn zfs_create(&self, name: &str, props: &[(&str, &str)]) -> Result<()>;
     fn zfs_set(&self, name: &str, prop: &str, value: &str) -> Result<()>;
     fn zfs_snapshot(&self, snapshot: &str) -> Result<()>;
+    /// The names (after the `@`) of a dataset's snapshots, oldest first;
+    /// empty if the dataset does not exist.
+    fn zfs_snapshots(&self, dataset: &str) -> Result<Vec<String>>;
+    /// Rolls a dataset back to `snapshot` (`<dataset>@<name>`), destroying
+    /// the snapshots taken after it (`zfs rollback -r`).
+    fn zfs_rollback(&self, snapshot: &str) -> Result<()>;
     /// Destroys a dataset or, if `name` has an `@`, a snapshot.
     fn zfs_destroy(&self, name: &str, recursive: bool) -> Result<()>;
     /// Writes a `zfs send` stream of `snapshot` (`<dataset>@<name>`) to

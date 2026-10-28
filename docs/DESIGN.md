@@ -150,9 +150,11 @@ preconditions. Rules:
   past `monitor`. Changing the spec back to the one the update came from
   is a rollback (`legion rollback <service>` does that), with states
   `rolling-back`, `rolled-back`, and `rollback-paused` when a task fails
-  during it. Swarm's `maxFailureRatio` and a separate rollback config are
-  not built: any failure counts, and a rollback uses the restored spec's
-  own update settings.
+  during it. A slot whose last task failed running the pod the rollback
+  left is refilled whatever the restart policy. Swarm's `maxFailureRatio`
+  and a separate rollback config are not built: any failure counts, and a
+  rollback uses the restored spec's own update settings. A stateful
+  service may snapshot its Volumes for an update (4.3).
 - **Nodes.** A drained node's tasks stop and move elsewhere; a paused node
   keeps its tasks but gets no new ones. The tasks of a node that is `down`
   are marked `orphaned` and told to stop, in one write: they leave the
@@ -475,7 +477,7 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
 | Feature | Notes | Phase |
 |---------|-------|-------|
 | ZFS image and volume storage | Podman's ZFS storage driver for images (one dataset per layer); one dataset per volume under `<pool>/legion/volumes/<ns>/<name>`. | 1 |
-| Snapshots before updates | Optional per service: snapshot volumes before rollout; rollback restores data along with the image. | 4 |
+| Snapshots before updates | A stateful service's `update.snapshot: true`: each task an update starts snapshots its claimed Volumes (`@legion-update-<generation>`, named in `status.update.snapshot`) before it runs, unless taken already, dropping older updates' snapshots; its old task has stopped by then, as stateful updates are stop-first. Each task the update's rollback starts, automatic or by `legion rollback` (even after the update completed, which discards what was written since), rolls its Volumes back to the snapshot and drops it, so a restart keeps its data. An ordinal the update never reached has no snapshot and keeps its data; so does a Volume migrated since, as migration sends no other snapshots. | 4 |
 | Stateful migration | Draining a node moves each wanted stateful ordinal's Volumes to a node its service may run on, the one with fewest of its tasks: the Service controller records a migration in the Volume's status (`copying`); the leader's migrator has the old node's agent snapshot and `zfs send` a full copy while the task runs, and the new node's `zfs receive -u` it, joining the two agents' sessions (3.8), so nodes need no port. Once `copied`, the drain stops the task; with nothing on a node using the Volume it is `finishing`: a second snapshot's increment goes, the Volume becomes the new node's (mounted, the migration's snapshots gone) and the old node drops its copy. The slot's next task waits (`volume moving`) and then runs there. A migration whose new node goes away, or whose old node stops draining before the last part, is dropped and started again if still needed; a failed attempt is noted in it and retried. A stale copy on the receiving node is replaced. | 4 |
 | CARP manager VIP | Optional floating address for the API. | 4 |
 | Security profiles | Per-service jail parameters (e.g. `allow.raw_sockets`, securelevel, enforce_statfs), with optional MAC policy. | 3 |

@@ -536,3 +536,47 @@ async fn stateful_data_moves_back_over_a_stale_copy() {
     .await;
     c.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rollback_returns_stateful_data_to_the_update_snapshot() {
+    let c = Cluster::start(1).await;
+    let spec = DB.replace("MAX", "1").replace(
+        "    volumes:",
+        "    restartPolicy: { condition: none }\n    volumes:",
+    ) + "  update: { snapshot: true, failureAction: rollback }\n";
+    let running = async |c: &Cluster, name: &str| {
+        c.list(Kind::Task)
+            .await
+            .iter()
+            .any(|t| t.metadata.name == name && t.status["state"] == "running")
+    };
+    c.apply(&spec).await;
+    eventually("db-0-1 running", async || running(&c, "db-0-1").await).await;
+    let sys = &c.nodes[0].sys;
+    let ds = "tank/legion/volumes/shop/data-db-0";
+    sys.write_dataset(ds, b"rows 1");
+
+    // The update's task snapshots the Volume before it runs.
+    c.apply(&spec.replace("web:1", "web:2")).await;
+    eventually("db-0-2 running", async || running(&c, "db-0-2").await).await;
+    assert_eq!(
+        sys.snapshots().into_iter().collect::<Vec<_>>(),
+        [format!("{ds}@legion-update-2")]
+    );
+    // It changes the data, as a migration to a new schema might, and fails.
+    sys.write_dataset(ds, b"rows 1, new schema");
+    c.nodes[0].rt.exit("shop_db-0-2_db", 1);
+
+    // The rollback's task finds the data as it was before the update.
+    eventually("db-0-3 running", async || running(&c, "db-0-3").await).await;
+    assert_eq!(sys.dataset_contents(ds).as_deref(), Some(&b"rows 1"[..]));
+    assert!(sys.snapshots().is_empty(), "{:?}", sys.snapshots());
+    let t = c
+        .list(Kind::Task)
+        .await
+        .into_iter()
+        .find(|t| t.metadata.name == "db-0-3")
+        .unwrap();
+    assert_eq!(t.spec["pod"]["containers"][0]["image"], "web:1");
+    c.stop().await;
+}

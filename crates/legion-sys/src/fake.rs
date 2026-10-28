@@ -53,7 +53,9 @@ struct State {
     anchors: BTreeMap<String, String>,
     tables: BTreeMap<(String, String), Vec<Ipv4Addr>>,
     datasets: BTreeMap<String, Dataset>,
-    snapshots: BTreeSet<String>,
+    /// Snapshots, with the order they were taken in.
+    snapshots: BTreeMap<String, u64>,
+    next_snapshot: u64,
     /// What tests wrote into datasets, and what their snapshots hold.
     contents: BTreeMap<String, Vec<u8>>,
     /// tmpfs mount points, with their size.
@@ -64,6 +66,14 @@ struct State {
     states: Vec<PfState>,
     /// Commands that fail once, the next time they run.
     failing: BTreeSet<String>,
+}
+
+impl State {
+    fn take_snapshot(&mut self, snapshot: &str) {
+        self.next_snapshot += 1;
+        self.snapshots
+            .insert(snapshot.to_owned(), self.next_snapshot);
+    }
 }
 
 /// A WireGuard interface's settings.
@@ -201,7 +211,7 @@ impl FakeSys {
     }
 
     pub fn snapshots(&self) -> BTreeSet<String> {
-        self.state().snapshots.clone()
+        self.state().snapshots.keys().cloned().collect()
     }
 
     /// Replaces what a dataset holds, as a task writing to it would.
@@ -729,14 +739,57 @@ impl Sys for FakeSys {
                 format!("cannot open '{ds}': dataset does not exist"),
             ));
         }
-        if !s.snapshots.insert(snapshot.to_owned()) {
+        if s.snapshots.contains_key(snapshot) {
             return Err(fail(
                 "zfs snapshot",
                 format!("cannot create snapshot '{snapshot}': dataset already exists"),
             ));
         }
+        s.take_snapshot(snapshot);
         let data = s.contents.get(ds).cloned().unwrap_or_default();
         s.contents.insert(snapshot.to_owned(), data);
+        Ok(())
+    }
+
+    fn zfs_snapshots(&self, dataset: &str) -> Result<Vec<String>> {
+        let s = self.state();
+        let prefix = format!("{dataset}@");
+        let mut found: Vec<(u64, String)> = s
+            .snapshots
+            .iter()
+            .filter_map(|(d, n)| Some((*n, d.strip_prefix(&prefix)?.to_owned())))
+            .collect();
+        found.sort();
+        Ok(found.into_iter().map(|(_, name)| name).collect())
+    }
+
+    fn zfs_rollback(&self, snapshot: &str) -> Result<()> {
+        let mut s = self.state();
+        let (ds, _) = snapshot.split_once('@').ok_or_else(|| {
+            fail(
+                "zfs rollback",
+                format!("invalid snapshot name {snapshot:?}"),
+            )
+        })?;
+        let Some(&taken) = s.snapshots.get(snapshot) else {
+            return Err(fail(
+                "zfs rollback",
+                format!("cannot open '{snapshot}': dataset does not exist"),
+            ));
+        };
+        let prefix = format!("{ds}@");
+        let later: Vec<String> = s
+            .snapshots
+            .iter()
+            .filter(|(d, n)| d.starts_with(&prefix) && **n > taken)
+            .map(|(d, _)| d.clone())
+            .collect();
+        for d in later {
+            s.snapshots.remove(&d);
+            s.contents.remove(&d);
+        }
+        let data = s.contents.get(snapshot).cloned().unwrap_or_default();
+        s.contents.insert(ds.to_owned(), data);
         Ok(())
     }
 
@@ -749,7 +802,7 @@ impl Sys for FakeSys {
             ));
         }
         if name.contains('@') {
-            if !s.snapshots.remove(name) {
+            if s.snapshots.remove(name).is_none() {
                 return Err(fail(
                     "zfs destroy",
                     "could not find any snapshots to destroy; check snapshot names.".to_owned(),
@@ -767,7 +820,7 @@ impl Sys for FakeSys {
         let child = format!("{name}/");
         let snap = format!("{name}@");
         let has_children = s.datasets.keys().any(|d| d.starts_with(&child))
-            || s.snapshots.iter().any(|d| d.starts_with(&snap));
+            || s.snapshots.keys().any(|d| d.starts_with(&snap));
         if has_children && !recursive {
             return Err(fail(
                 "zfs destroy",
@@ -777,7 +830,7 @@ impl Sys for FakeSys {
         s.datasets
             .retain(|d, _| d != name && !d.starts_with(&child));
         s.snapshots
-            .retain(|d| !d.starts_with(&snap) && !d.starts_with(&child));
+            .retain(|d, _| !d.starts_with(&snap) && !d.starts_with(&child));
         s.contents
             .retain(|d, _| d != name && !d.starts_with(&snap) && !d.starts_with(&child));
         Ok(())
@@ -797,13 +850,13 @@ impl Sys for FakeSys {
             let (ds, name) = snapshot
                 .split_once('@')
                 .ok_or_else(|| fail_send(format!("invalid snapshot name {snapshot:?}")))?;
-            if !s.snapshots.contains(snapshot) {
+            if !s.snapshots.contains_key(snapshot) {
                 return Err(fail_send(format!(
                     "cannot open '{snapshot}': dataset does not exist"
                 )));
             }
             if let Some(since) = since
-                && !s.snapshots.contains(&format!("{ds}@{since}"))
+                && !s.snapshots.contains_key(&format!("{ds}@{since}"))
             {
                 return Err(fail_send(format!(
                     "cannot open '{ds}@{since}': dataset does not exist"
@@ -845,7 +898,7 @@ impl Sys for FakeSys {
         }
         let snap = format!("{dataset}@");
         if since == "-" {
-            if let Some(old) = s.snapshots.iter().find(|d| d.starts_with(&snap)) {
+            if let Some(old) = s.snapshots.keys().find(|d| d.starts_with(&snap)) {
                 return Err(fail(
                     "zfs receive",
                     format!(
@@ -862,7 +915,7 @@ must destroy them to overwrite it"
                     quota: None,
                 },
             );
-        } else if !s.snapshots.contains(&format!("{dataset}@{since}")) {
+        } else if !s.snapshots.contains_key(&format!("{dataset}@{since}")) {
             return Err(fail(
                 "zfs receive",
                 format!(
@@ -870,7 +923,7 @@ must destroy them to overwrite it"
                 ),
             ));
         }
-        s.snapshots.insert(format!("{dataset}@{name}"));
+        s.take_snapshot(&format!("{dataset}@{name}"));
         s.contents.insert(format!("{dataset}@{name}"), data.clone());
         s.contents.insert(dataset.to_owned(), data);
         Ok(())
@@ -1123,5 +1176,24 @@ mod tests {
         assert_eq!(sys.zfs_list("tank/legion").unwrap().len(), 1);
         assert!(sys.snapshots().is_empty());
         assert!(sys.zfs_list("tank/nothing").unwrap().is_empty());
+    }
+
+    #[test]
+    fn zfs_rollback() {
+        let sys = FakeSys::new();
+        let ds = "tank/legion/volumes/shop/data";
+        sys.zfs_create(ds, &[]).unwrap();
+        assert!(sys.zfs_snapshots(ds).unwrap().is_empty());
+        for (snap, data) in [("b", b"one"), ("a", b"two"), ("c", b"thr")] {
+            sys.write_dataset(ds, data);
+            sys.zfs_snapshot(&format!("{ds}@{snap}")).unwrap();
+        }
+        sys.write_dataset(ds, b"four");
+        assert_eq!(sys.zfs_snapshots(ds).unwrap(), ["b", "a", "c"]);
+        sys.zfs_rollback(&format!("{ds}@a")).unwrap();
+        assert_eq!(sys.dataset_contents(ds).unwrap(), b"two");
+        assert_eq!(sys.zfs_snapshots(ds).unwrap(), ["b", "a"]);
+        assert!(sys.zfs_rollback(&format!("{ds}@c")).is_err());
+        assert!(sys.zfs_snapshots("tank/nothing").unwrap().is_empty());
     }
 }

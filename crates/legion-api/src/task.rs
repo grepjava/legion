@@ -32,6 +32,22 @@ pub struct TaskSpec {
     #[serde(default)]
     pub desired_state: DesiredState,
     pub pod: PodSpec,
+    /// What happens to a stateful task's claimed Volumes before it runs,
+    /// for an update that snapshots them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<VolumeSnapshot>,
+}
+
+/// A snapshot of a stateful task's claimed Volumes (DESIGN.md §4.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VolumeSnapshot {
+    /// The snapshot's name, after the `@`.
+    pub name: String,
+    /// Return the Volumes to the snapshot, then drop it (a rollback's
+    /// task); otherwise take it unless taken (an update's).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restore: bool,
 }
 
 impl TaskSpec {

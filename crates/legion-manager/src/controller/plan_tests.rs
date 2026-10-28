@@ -665,6 +665,34 @@ fn a_failing_update_rolls_back() {
 }
 
 #[test]
+fn a_rollback_replaces_a_failed_task_whatever_the_restart_policy() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    let spec = |image: &str| {
+        format!(
+            "pod: {{ containers: [{{ name: web, image: \"{image}\" }}], restartPolicy: {{ condition: none }} }}
+update: {{ failureAction: rollback }}"
+        )
+    };
+    w.service("web", &spec("web:1"));
+    w.settle();
+    w.service("web", &spec("web:2"));
+    w.settle();
+    w.fail("web-1-2");
+    for _ in 0..15 {
+        w.now += Duration::from_secs(1);
+        w.settle();
+    }
+    assert_eq!(w.images("web"), ["web:1"]);
+    assert_eq!(w.update("web").0, "rolled-back");
+    // A task of the pod as it is now that fails stays failed.
+    w.fail("web-1-3");
+    w.now += Duration::from_secs(60);
+    w.settle();
+    assert!(w.running().is_empty());
+}
+
+#[test]
 fn rollback_by_hand() {
     let mut w = World::new();
     w.node("n1", &[]);
@@ -1969,6 +1997,78 @@ fn stateful_updates_go_from_the_highest_ordinal_down() {
 }
 
 #[test]
+fn stateful_updates_snapshot_and_their_rollbacks_restore() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    let spec = format!("{STATEFUL}\nupdate: {{ snapshot: true, failureAction: rollback }}");
+    w.service("db", &spec);
+    w.settle();
+    let steps = |w: &World| -> Vec<String> {
+        let mut v: Vec<String> = w
+            .tasks
+            .iter()
+            .filter(|t| !t.status.state.is_terminal())
+            .map(|t| {
+                let step = match &t.spec.snapshot {
+                    None => "-".to_owned(),
+                    Some(s) if s.restore => format!("restore {}", s.name),
+                    Some(s) => format!("take {}", s.name),
+                };
+                format!("{} {step}", t.object.metadata.name)
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(steps(&w), ["db-0-1 -", "db-1-1 -", "db-2-1 -"]);
+
+    // The update's tasks snapshot their Volumes first.
+    w.service("db", &spec.replace("pg:17", "pg:18"));
+    w.settle();
+    assert_eq!(
+        w.status("db").update.unwrap().snapshot.as_deref(),
+        Some("legion-update-2")
+    );
+    assert_eq!(
+        steps(&w),
+        [
+            "db-0-2 take legion-update-2",
+            "db-1-2 take legion-update-2",
+            "db-2-2 take legion-update-2"
+        ]
+    );
+
+    // One failing within the monitor window rolls back, and the rollback's
+    // tasks return to the snapshot.
+    w.fail("db-0-2");
+    for _ in 0..12 {
+        w.now += Duration::from_secs(1);
+        w.settle();
+    }
+    assert_eq!(w.update("db").0, "rolled-back");
+    assert_eq!(
+        steps(&w),
+        [
+            "db-0-3 restore legion-update-2",
+            "db-1-3 restore legion-update-2",
+            "db-2-3 restore legion-update-2"
+        ]
+    );
+    // Tasks after the rollback leave the Volumes be.
+    w.fail("db-2-3");
+    w.settle();
+    w.now += Duration::from_secs(10);
+    w.settle();
+    assert_eq!(steps(&w)[2], "db-2-4 -");
+
+    // Without `snapshot`, an update takes none.
+    w.service("db", &STATEFUL.replace("pg:17", "pg:19"));
+    w.settle();
+    assert_eq!(w.status("db").update.unwrap().snapshot, None);
+    assert!(steps(&w).iter().all(|s| s.ends_with(" -")));
+}
+
+#[test]
 fn stateful_admission() {
     let admit = |spec: &str| -> Result<(), String> {
         let value: serde_json::Value = serde_yaml_ng::from_str(spec).unwrap();
@@ -1982,6 +2082,10 @@ fn stateful_admission() {
     assert_eq!(
         admit(&STATEFUL.replace("mode: stateful", "mode: replicated")).unwrap_err(),
         "spec.pod.volumes: volume \"data\": only a stateful service's tasks claim volumes"
+    );
+    assert_eq!(
+        admit(&format!("{POD}\nupdate: {{ snapshot: true }}")).unwrap_err(),
+        "spec.update.snapshot: only a stateful service's tasks have volumes of their own to snapshot"
     );
     assert!(admit(STATEFUL).is_ok());
 }

@@ -579,12 +579,26 @@ service and migrates between nodes.
   on weft-bsd, the streams with real ZFS: full, incremental, into a new
   parent, unmounted then mounted, refused over a dataset with snapshots
   (which the fake missed), a cut stream leaving nothing.
+- **Snapshots before updates** (`update.snapshot`, `legion-agent`
+  volumes): a stateful service's update records its snapshot
+  (`legion-update-<generation>`) in `status.update.snapshot`, and its
+  tasks carry a step (`spec.snapshot`): an update's tasks take the
+  snapshot of their claimed Volumes before they run unless taken,
+  dropping older ones; a rollback's tasks roll back to it and drop it.
+  Refused outside stateful services. `Sys` gained `zfs_snapshots` and
+  `zfs_rollback` (`-r`). Also fixed: with `restartPolicy.condition:
+  none`, a rollback left the slot of the task that failed empty; a task
+  that failed running another pod is now replaced whatever the policy.
+  Tested: the planner (take on update, restore on rollback, nothing after,
+  nothing without `snapshot`; the restart-policy case); through a manager
+  and an agent with fake ZFS, data changed by the failing update's task
+  back as it was before the update; and on weft-bsd, snapshot listing
+  and a rollback of a mounted dataset with real ZFS.
 
 ### To do, in order
 
-1. Snapshots before updates, and restoring them on rollback.
-2. Exit test: Postgres with replicas, migrated between nodes.
-3. Ingress routes, autoscaling, CARP VIP, autolock, store backup and
+1. Exit test: Postgres with replicas, migrated between nodes.
+2. Ingress routes, autoscaling, CARP VIP, autolock, store backup and
    restore. Moving a Volume on request rather than by a drain.
 
 ## Later phases

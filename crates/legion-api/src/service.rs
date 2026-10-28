@@ -72,6 +72,12 @@ impl ServiceSpec {
 impl Spec for ServiceSpec {
     fn admit(&mut self) -> Result<(), Invalid> {
         match self.mode {
+            ServiceMode::Replicated | ServiceMode::Global if self.update.snapshot => {
+                return Err(Invalid::new(
+                    "update.snapshot",
+                    "only a stateful service's tasks have volumes of their own to snapshot",
+                ));
+            }
             ServiceMode::Replicated => {
                 self.replicas.get_or_insert(1);
             }
@@ -1169,6 +1175,11 @@ pub struct UpdateConfig {
     /// How long a new task must stay running before it counts as updated.
     #[serde(default = "default_monitor")]
     pub monitor: Duration,
+    /// A stateful service's update snapshots each task's claimed Volumes
+    /// before its new task runs, and a rollback of the update returns them
+    /// to that snapshot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub snapshot: bool,
 }
 
 impl Default for UpdateConfig {
@@ -1179,6 +1190,7 @@ impl Default for UpdateConfig {
             order: UpdateOrder::default(),
             failure_action: FailureAction::default(),
             monitor: default_monitor(),
+            snapshot: false,
         }
     }
 }
@@ -1266,6 +1278,18 @@ pub struct UpdateStatus {
     pub generation: u64,
     /// The spec updated from, which a rollback restores.
     pub previous: ServiceSpec,
+    /// The snapshot of the claimed Volumes the update's tasks take before
+    /// they run (`update.snapshot`), and a rollback of it returns to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+}
+
+/// How the snapshots updates take begin.
+pub const UPDATE_SNAPSHOT: &str = "legion-update-";
+
+/// The snapshot taken by an update that started at `generation`.
+pub fn update_snapshot(generation: u64) -> String {
+    format!("{UPDATE_SNAPSHOT}{generation}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

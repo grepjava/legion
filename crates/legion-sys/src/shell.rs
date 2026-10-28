@@ -593,6 +593,40 @@ impl<R: Runner> Sys for Shell<R> {
         self.run("zfs", &args(["snapshot", snapshot])).map(drop)
     }
 
+    fn zfs_snapshots(&self, dataset: &str) -> Result<Vec<String>> {
+        let a = args([
+            "list",
+            "-H",
+            "-t",
+            "snapshot",
+            "-o",
+            "name",
+            "-s",
+            "createtxg",
+            "-d",
+            "1",
+            dataset,
+        ]);
+        let out = self.output("zfs", &a, None)?;
+        if !out.success {
+            if out.stderr.contains("dataset does not exist") {
+                return Ok(Vec::new());
+            }
+            return Err(failed("zfs", &a, &out));
+        }
+        Ok(out
+            .stdout
+            .lines()
+            .filter_map(|l| l.split_once('@'))
+            .map(|(_, name)| name.to_owned())
+            .collect())
+    }
+
+    fn zfs_rollback(&self, snapshot: &str) -> Result<()> {
+        self.run("zfs", &args(["rollback", "-r", snapshot]))
+            .map(drop)
+    }
+
     fn zfs_destroy(&self, name: &str, recursive: bool) -> Result<()> {
         let a = if recursive {
             args(["destroy", "-r", name])

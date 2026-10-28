@@ -15,9 +15,9 @@ use legion_api::service::FailureAction;
 use legion_api::service::{
     Constraint, EndpointMode, NodeAttribute, PUBLISHED_PORTS, Publish, PublishedPort,
     RestartCondition, SERVICE_NET, SERVICE_PREFIX, ServiceMode, ServiceSpec, ServiceStatus,
-    TaintEffect, UpdateOrder, UpdateState, UpdateStatus, claim_volume,
+    TaintEffect, UpdateOrder, UpdateState, UpdateStatus, claim_volume, update_snapshot,
 };
-use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
+use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus, VolumeSnapshot};
 use legion_api::volume::{VolumeSpec, VolumeStatus};
 use legion_api::{Kind, Object, ObjectKey};
 use tokio::time::Instant;
@@ -628,6 +628,26 @@ fn service(
         order.reverse();
     }
 
+    // An update that snapshots has its tasks take the snapshot before they
+    // run, and its rollback's tasks return to it.
+    let step = update.as_ref().filter(|_| stateful).and_then(|u| {
+        let name = u.snapshot.clone()?;
+        let restore = match u.state {
+            UpdateState::Updating | UpdateState::Paused => false,
+            UpdateState::RollingBack | UpdateState::RollbackPaused => true,
+            UpdateState::Completed | UpdateState::RolledBack => return None,
+        };
+        Some(VolumeSnapshot { name, restore })
+    });
+    let new_task = |slot: &Slot, list: &[&Task]| {
+        let mut t = new_task(s, slot, list, &previous.last_tasks);
+        if step.is_some() {
+            t.spec.snapshot = step.clone();
+            t.object.spec = serde_json::to_value(&t.spec).expect("spec serialises");
+        }
+        t
+    };
+
     let policy = &s.spec.pod.restart_policy;
     for slot in order {
         let list: &[&Task] = by_slot.get(slot).map_or(&[], Vec::as_slice);
@@ -680,7 +700,7 @@ fn service(
                     backoff(last, failures, policy.delay.as_std(), memory, now)
                 });
                 if due <= now {
-                    created.push(new_task(s, slot, list, &previous.last_tasks));
+                    created.push(new_task(slot, list));
                 } else {
                     plan.wake_at(due);
                 }
@@ -693,20 +713,25 @@ fn service(
                         plan.actions.push(stop(old));
                     }
                 } else if !stateful {
-                    created.push(new_task(s, slot, list, &previous.last_tasks));
+                    created.push(new_task(slot, list));
                 }
             }
         } else if list.iter().any(|t| t.stopping()) {
             // Wait for the stopping task (stop-first update, drain) to end.
         } else {
             // Nothing runs in the slot: start a task, unless the last one
-            // ended for good or the next try is not due yet.
+            // ended for good or the next try is not due yet. One that failed
+            // running another pod (an update rolled back) is replaced
+            // whatever the restart policy.
             let replace = match list.last() {
                 None => true,
                 Some(last) => match last.status.state {
                     TaskState::Complete => policy.condition == RestartCondition::Any,
                     TaskState::Shutdown | TaskState::Orphaned => true,
-                    _ => last.failed() && policy.condition != RestartCondition::None,
+                    _ => {
+                        last.failed()
+                            && (policy.condition != RestartCondition::None || !current_pod(last))
+                    }
                 },
             };
             if replace && ready_below(slot) {
@@ -715,7 +740,7 @@ fn service(
                     backoff(last, failures, policy.delay.as_std(), memory, now)
                 });
                 if due <= now {
-                    created.push(new_task(s, slot, list, &previous.last_tasks));
+                    created.push(new_task(slot, list));
                 } else {
                     plan.wake_at(due);
                 }
@@ -886,6 +911,12 @@ fn track_update(
             Some(u) if back && u.state == UpdateState::RollingBack => u.message.clone(),
             _ => String::new(),
         };
+        // A rollback returns to the snapshot of the update it undoes.
+        let snapshot = match &update {
+            Some(u) if back => u.snapshot.clone(),
+            _ => (s.spec.mode == ServiceMode::Stateful && s.spec.update.snapshot)
+                .then(|| update_snapshot(s.object.metadata.generation)),
+        };
         update = Some(UpdateStatus {
             state: if back {
                 UpdateState::RollingBack
@@ -895,6 +926,7 @@ fn track_update(
             message,
             generation: s.object.metadata.generation,
             previous: old.clone(),
+            snapshot,
         });
     }
     let Some(u) = update.as_mut().filter(|u| u.state.in_progress()) else {
@@ -1009,6 +1041,7 @@ fn new_task(s: &Service, slot: &Slot, history: &[&Task], last: &BTreeMap<String,
         node,
         desired_state: DesiredState::Running,
         pod: s.spec.pod.clone(),
+        snapshot: None,
     };
     let mut object = Object::new(
         Kind::Task,

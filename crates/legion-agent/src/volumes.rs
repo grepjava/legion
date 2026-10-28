@@ -10,6 +10,11 @@
 //! elsewhere are rejected. The dataset outlives tasks: deleting the
 //! `Volume` object leaves it in place.
 //!
+//! An update that snapshots (`update.snapshot`) has its tasks snapshot
+//! their claimed Volumes before they run, unless done already, dropping
+//! older updates' snapshots; a rollback's tasks return their Volumes to the
+//! snapshot and drop it, so a rollback task that restarts keeps its data.
+//!
 //! A `tmpfs` volume lives as long as its pod, at
 //! `<files dir>/<task uid>/volumes/<name>`, and is shared by the pod's
 //! containers.
@@ -18,6 +23,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use legion_api::service::UPDATE_SNAPSHOT;
+use legion_api::task::VolumeSnapshot;
 use legion_api::volume::VolumeSpec;
 use legion_podman::Mount;
 use legion_sys::Sys;
@@ -76,9 +83,16 @@ pub(crate) async fn prepare<C: Control>(
                     return Err(Error::Failed(format!("volume {name}: {e}")));
                 }
             };
-            crate::task::blocking(sys, move |sys| zfs(sys, &dataset, &spec))
-                .await
-                .map_err(|e| Error::Failed(format!("volume {name}: {e}")))?
+            let step = a.spec.snapshot.clone().filter(|_| v.claim.is_some());
+            crate::task::blocking(sys, move |sys| {
+                let path = zfs(sys, &dataset, &spec)?;
+                if let Some(step) = &step {
+                    snapshot(sys, &dataset, step)?;
+                }
+                Ok(path)
+            })
+            .await
+            .map_err(|e: String| Error::Failed(format!("volume {name}: {e}")))?
         } else if v.claim.is_some() {
             return Err(Error::Rejected(format!(
                 "volume {}: only a stateful service's tasks claim volumes",
@@ -128,6 +142,29 @@ fn zfs(sys: &dyn Sys, dataset: &str, spec: &VolumeSpec) -> Result<String, String
         .ok_or_else(|| format!("{dataset} missing after mounting it"))?;
     ds.mountpoint
         .ok_or_else(|| format!("{dataset} is not mounted"))
+}
+
+/// Takes an update's snapshot of a dataset, or returns it to one.
+fn snapshot(sys: &dyn Sys, dataset: &str, step: &VolumeSnapshot) -> Result<(), String> {
+    let e = |e: legion_sys::Error| e.to_string();
+    let names = sys.zfs_snapshots(dataset).map_err(e)?;
+    let at = |name: &str| format!("{dataset}@{name}");
+    let taken = names.contains(&step.name);
+    if step.restore {
+        // Not there if returned to already, or if the update never reached
+        // this task's ordinal (or the Volume has moved since).
+        if taken {
+            tracing::info!(dataset, snapshot = %step.name, "returning the volume to its snapshot");
+            sys.zfs_rollback(&at(&step.name)).map_err(e)?;
+            sys.zfs_destroy(&at(&step.name), false).map_err(e)?;
+        }
+    } else if !taken {
+        for old in names.iter().filter(|n| n.starts_with(UPDATE_SNAPSHOT)) {
+            sys.zfs_destroy(&at(old), false).map_err(e)?;
+        }
+        sys.zfs_snapshot(&at(&step.name)).map_err(e)?;
+    }
+    Ok(())
 }
 
 /// Mounts a tmpfs any container user may write to, unless already there.

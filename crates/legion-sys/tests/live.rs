@@ -299,6 +299,18 @@ fn zfs_datasets() {
             .is_err()
     );
 
+    // Snapshots oldest first, and a rollback of the mounted dataset to one
+    // of them, which drops those after it.
+    assert_eq!(sys.zfs_snapshots(&vol).unwrap(), ["m1", "m2"]);
+    std::fs::write(file(&vol), "three").unwrap();
+    sys.zfs_snapshot(&format!("{vol}@a0")).unwrap();
+    assert_eq!(sys.zfs_snapshots(&vol).unwrap(), ["m1", "m2", "a0"]);
+    sys.zfs_rollback(&format!("{vol}@m1")).unwrap();
+    assert_eq!(std::fs::read_to_string(file(&vol)).unwrap(), "one");
+    assert_eq!(sys.zfs_snapshots(&vol).unwrap(), ["m1"]);
+    assert!(sys.zfs_rollback(&format!("{vol}@m2")).is_err());
+    assert!(sys.zfs_snapshots(&format!("{base}/nothing")).unwrap().is_empty());
+
     sys.zfs_destroy(&base, true).unwrap();
     assert!(sys.zfs_list(&base).unwrap().is_empty());
 }
