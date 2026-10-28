@@ -1569,3 +1569,124 @@ fn suspended_and_late_runs_are_skipped() {
     w.settle();
     assert_eq!(w.job_names(), [run("2026-10-28T09:45:00Z")]);
 }
+
+impl World {
+    /// Settles, returning how many of `service`'s tasks are ready after each
+    /// pass's writes, before the agents act on them.
+    fn ready_per_pass(&mut self, service: &str) -> Vec<usize> {
+        let mut seen = Vec::new();
+        for _ in 1..100 {
+            let p = plan(
+                &self.services,
+                &self.jobs,
+                &self.tasks,
+                &self.nodes,
+                &self.homes,
+                &self.quotas,
+                &mut self.memory,
+                self.now,
+            );
+            let acted = !p.actions.is_empty();
+            self.apply(p.actions);
+            seen.push(
+                self.tasks
+                    .iter()
+                    .filter(|t| {
+                        t.spec.service == service && t.spec.desired_state == DesiredState::Running
+                    })
+                    .filter(|t| t.status.state == TaskState::Running && t.status.ready)
+                    .count(),
+            );
+            if !self.agents() && !acted {
+                return seen;
+            }
+        }
+        panic!("did not settle");
+    }
+
+    fn nodes_of(&self, service: &str) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|t| t.spec.service == service && t.status.state == TaskState::Running)
+            .map(|t| t.spec.node.clone())
+            .collect();
+        v.sort();
+        v
+    }
+}
+
+#[test]
+fn a_disruption_budget_paces_drains() {
+    for (budget, least) in [("", 2), ("maxUnavailable: 1", 3), ("maxUnavailable: 0", 4)] {
+        let mut w = World::new();
+        w.node("n1", &[]);
+        w.node("n2", &[]);
+        w.service("web", &format!("replicas: 4\n{POD}\n{budget}"));
+        w.settle();
+        assert_eq!(w.nodes_of("web"), ["n1", "n1", "n2", "n2"]);
+
+        w.availability("n1", Availability::Drain);
+        let ready = w.ready_per_pass("web");
+        assert_eq!(ready.iter().min(), Some(&least), "{budget:?}: {ready:?}");
+        assert_eq!(w.nodes_of("web"), ["n2", "n2", "n2", "n2"], "{budget:?}");
+    }
+}
+
+#[test]
+fn a_budget_spent_elsewhere_drains_start_first() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.service("web", &format!("replicas: 2\n{POD}\nmaxUnavailable: 1"));
+    w.settle();
+    // One slot is already down: draining the other must not stop it first.
+    let on_n2 = w.tasks.iter().find(|t| t.spec.node == "n2").unwrap();
+    let name = on_n2.object.metadata.name.clone();
+    w.agents = false;
+    w.fail(&name);
+    w.availability("n1", Availability::Drain);
+    let p = plan(
+        &w.services,
+        &w.jobs,
+        &w.tasks,
+        &w.nodes,
+        &w.homes,
+        &w.quotas,
+        &mut w.memory,
+        w.now,
+    );
+    w.apply(p.actions);
+    let on_n1: Vec<String> = w
+        .tasks
+        .iter()
+        .filter(|t| t.spec.node == "n1")
+        .map(|t| format!("{} {:?}", t.status.state.as_str(), t.spec.desired_state))
+        .collect();
+    assert_eq!(on_n1, ["running Running"]);
+    w.agents = true;
+    w.now += Duration::from_secs(60);
+    w.settle();
+    assert_eq!(w.nodes_of("web"), ["n2", "n2"]);
+}
+
+#[test]
+fn a_disruption_budget_paces_updates() {
+    // Parallelism 0 replaces every slot at once; the budget holds it back.
+    for (budget, least) in [("", 0), ("maxUnavailable: 1", 2), ("maxUnavailable: 0", 3)] {
+        let mut w = World::new();
+        w.node("n1", &[]);
+        let spec = |image: &str| {
+            format!(
+                "replicas: 3\npod: {{ containers: [{{ name: web, image: \"{image}\" }}] }}\nupdate: {{ parallelism: 0, monitor: 0s }}\n{budget}"
+            )
+        };
+        w.service("web", &spec("web:1"));
+        w.settle();
+        w.service("web", &spec("web:2"));
+        let ready = w.ready_per_pass("web");
+        assert_eq!(ready.iter().min(), Some(&least), "{budget:?}: {ready:?}");
+        assert_eq!(w.images("web"), ["web:2", "web:2", "web:2"], "{budget:?}");
+        assert_eq!(w.update("web").0, "completed", "{budget:?}");
+    }
+}

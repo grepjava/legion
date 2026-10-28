@@ -160,6 +160,15 @@ preconditions. Rules:
   goes with the node, and keeps its task number for when the node is
   back), and a node that comes back removes their pods. Tasks do not move
   back by themselves.
+- **Disruption budget** (phase 3). `maxUnavailable` on a Service bounds
+  the voluntary disruptions, updates and drains: they take a slot's ready
+  task away only while fewer than `maxUnavailable` of the service's slots
+  lack one, failures included. Past that, the replacement starts first,
+  and the old task stops once the new one is ready, so `maxUnavailable: 0`
+  surges instead of stalling. A start-first service drains that way too.
+  Unset, there is no bound beyond the update's `parallelism`. A
+  `NoExecute` taint evicts at once, and a global service's task goes
+  with its drained node.
 - **Taints** on a node (`spec.taints: [{key, value, effect}]`) apply unless
   the service tolerates them (`placement.tolerations`, matching the key,
   and the value and effect when given): `NoSchedule` keeps new tasks off,
@@ -832,7 +841,7 @@ spec:
     delay: 10s
     order: start-first
     failureAction: rollback
-    maxUnavailable: 1
+  maxUnavailable: 1
 ```
 
 ### Task states

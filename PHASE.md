@@ -427,6 +427,13 @@ Already there from phase 1: namespaces scope names and DNS
   and bound, a completed task's logs by its name and its owner's, tail,
   follow, exec refused, removal with the task; on weft-bsd, a failed init
   container's output kept from real Podman.
+- **Disruption budgets** (`maxUnavailable` on the Service, DESIGN.md
+  §3.3): updates and drains take a ready task away only while fewer than
+  `maxUnavailable` slots lack one, and otherwise start the replacement
+  first; start-first services also drain start-first. Moved from
+  `update.maxUnavailable`, which nothing read. Tested in the planner: the
+  fewest ready tasks during a drain and during an all-at-once update,
+  unbounded, at 1 and at 0, and a drain while another slot has failed.
 
 ### To do, in order
 
@@ -434,18 +441,19 @@ The first three are what the exit criterion rests on: who may do what,
 what may talk to what, and how much each team may use; all three are
 done.
 
-1. **Disruption budgets**: `maxUnavailable` honoured by drain and updates.
-2. **Security profiles**: the jail defaults in DESIGN.md §9, loosened per
+1. **Security profiles**: the jail defaults in DESIGN.md §9, loosened per
    service only explicitly.
-3. **Metrics**: a Prometheus endpoint on each manager and agent.
-4. **Exit test**: two teams, each with its own user and namespace, deploy
+2. **Metrics**: a Prometheus endpoint on each manager and agent.
+3. **Exit test**: two teams, each with its own user and namespace, deploy
     on the same cluster; neither can read or change the other's objects,
     reach the other's tasks, or exceed its quota.
 
 Smaller follow-ups: egress policies; a new pod is unguarded for the
 moment between its start and the agent's next pass (the guard could go in
 before its containers start); lab runs on weft-bsd leave the bridge
-sysctls at 1.
+sysctls at 1; the agent tests' timing flakes under load (a different test
+each time: liveness, init containers, restart policy, sessions), each
+passing alone.
 
 ## Later phases
 

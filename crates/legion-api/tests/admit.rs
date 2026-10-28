@@ -65,7 +65,7 @@ spec:
     delay: 10s
     order: start-first
     failureAction: rollback
-    maxUnavailable: 1
+  maxUnavailable: 1
 "#;
 
 #[test]
@@ -73,6 +73,7 @@ fn design_example_is_admitted() {
     let o = admitted(DESIGN_EXAMPLE);
     let spec: ServiceSpec = parse(&o.spec).unwrap();
     assert_eq!(spec.replicas, Some(3));
+    assert_eq!(spec.max_unavailable, Some(1));
     let web = &spec.pod.containers[0];
     assert_eq!(web.resources.requests.cpu.unwrap().millis(), 500);
     assert_eq!(web.resources.limits.memory.unwrap().0, 512 << 20);

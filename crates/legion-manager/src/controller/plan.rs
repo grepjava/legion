@@ -498,17 +498,32 @@ fn service(
         }
     }
 
-    // Replicated tasks on a node that is draining, or whose taints evict
-    // them, move elsewhere.
-    for t in tasks.iter().filter(|t| t.active() && t.spec.slot.is_some()) {
-        if nodes.iter().any(|n| {
-            n.name() == t.spec.node
-                && (n.spec.availability == Availability::Drain
-                    || n.repels(s, TaintEffect::NoExecute))
-        }) {
-            plan.actions.push(stop(t));
-        }
+    // Replicated tasks on a node whose taints evict them stop now; those on
+    // a draining node move under the disruption budget, below.
+    let on_node = |t: &Task, f: &dyn Fn(&Node) -> bool| {
+        t.active() && t.spec.slot.is_some() && nodes.iter().any(|n| n.name() == t.spec.node && f(n))
+    };
+    let evicted = |t: &Task| on_node(t, &|n| n.repels(s, TaintEffect::NoExecute));
+    let draining =
+        |t: &Task| !evicted(t) && on_node(t, &|n| n.spec.availability == Availability::Drain);
+    for t in tasks.iter().filter(|t| evicted(t)) {
+        plan.actions.push(stop(t));
     }
+
+    // Disruption budget: updates and drains take a ready task away only
+    // while fewer than `maxUnavailable` slots lack one; past that, the
+    // replacement starts first.
+    let up = |t: &Task| {
+        t.active() && t.status.state == TaskState::Running && t.status.ready && !evicted(t)
+    };
+    let unavailable = wanted
+        .iter()
+        .filter(|slot| !by_slot.get(slot).is_some_and(|l| l.iter().any(|t| up(t))))
+        .count();
+    let mut disruptions = s
+        .spec
+        .max_unavailable
+        .map_or(usize::MAX, |n| (n as usize).saturating_sub(unavailable));
 
     // A task is current if it runs the service's pod as it is now. Other
     // spec changes (replicas, placement, update settings) bump the
@@ -563,35 +578,66 @@ fn service(
     let policy = &s.spec.pod.restart_policy;
     for slot in &wanted {
         let list: &[&Task] = by_slot.get(slot).map_or(&[], Vec::as_slice);
-        let (current, outdated): (Vec<&Task>, Vec<&Task>) = list
+        let (moving, staying): (Vec<&Task>, Vec<&Task>) = list
             .iter()
             .copied()
-            .filter(|t| t.active())
-            .partition(|t| current_pod(t));
+            .filter(|t| t.active() && !evicted(t))
+            .partition(|t| draining(t));
+        let (current, outdated): (Vec<&Task>, Vec<&Task>) =
+            staying.into_iter().partition(|t| current_pod(t));
+        // Whether stopping these takes the slot's ready task away, and the
+        // budget lets it.
+        let mut may_stop = |old: &[&Task]| {
+            if !old.iter().any(|t| up(t)) {
+                return true;
+            }
+            let ok = disruptions > 0;
+            if ok {
+                disruptions -= 1;
+            }
+            ok
+        };
+        let start_first = s.spec.update.order == UpdateOrder::StartFirst;
 
         // Never more than one current task per slot.
         for extra in current.iter().skip(1) {
             plan.actions.push(stop(extra));
         }
         if let Some(new) = current.first() {
-            // start-first: the old task goes once the new one is ready.
+            // Started first: the old task goes once the new one is ready.
             if new.status.state == TaskState::Running && new.status.ready {
-                for old in &outdated {
+                for old in outdated.iter().chain(&moving) {
                     plan.actions.push(stop(old));
+                }
+            }
+        } else if !moving.is_empty() {
+            // Off a draining node: stopped first if the budget allows,
+            // else replaced first, as a failed replacement is, after its
+            // backoff.
+            if !start_first && may_stop(&moving) {
+                for old in &moving {
+                    plan.actions.push(stop(old));
+                }
+            } else {
+                let failures = list.iter().rev().take_while(|t| t.failed()).count();
+                let due = list.last().map_or(now, |last| {
+                    backoff(last, failures, policy.delay.as_std(), memory, now)
+                });
+                if due <= now {
+                    created.push(new_task(s, slot, list, &previous.last_tasks));
+                } else {
+                    plan.wake_at(due);
                 }
             }
         } else if !outdated.is_empty() {
             if budget > 0 {
                 budget -= 1;
-                match s.spec.update.order {
-                    UpdateOrder::StopFirst => {
-                        for old in &outdated {
-                            plan.actions.push(stop(old));
-                        }
+                if !start_first && may_stop(&outdated) {
+                    for old in &outdated {
+                        plan.actions.push(stop(old));
                     }
-                    UpdateOrder::StartFirst => {
-                        created.push(new_task(s, slot, list, &previous.last_tasks))
-                    }
+                } else {
+                    created.push(new_task(s, slot, list, &previous.last_tasks));
                 }
             }
         } else if list.iter().any(|t| t.stopping()) {

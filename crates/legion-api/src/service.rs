@@ -25,6 +25,11 @@ pub struct ServiceSpec {
     pub endpoint: Option<Endpoint>,
     #[serde(default)]
     pub update: UpdateConfig,
+    /// Most slots that may lack a ready task before an update or a drain
+    /// takes another one's away; past it, replacements start first. Unset,
+    /// there is no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_unavailable: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1097,8 +1102,6 @@ pub struct UpdateConfig {
     /// How long a new task must stay running before it counts as updated.
     #[serde(default = "default_monitor")]
     pub monitor: Duration,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_unavailable: Option<u32>,
 }
 
 impl Default for UpdateConfig {
@@ -1109,7 +1112,6 @@ impl Default for UpdateConfig {
             order: UpdateOrder::default(),
             failure_action: FailureAction::default(),
             monitor: default_monitor(),
-            max_unavailable: None,
         }
     }
 }

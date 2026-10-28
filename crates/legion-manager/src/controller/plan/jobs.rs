@@ -75,6 +75,7 @@ impl Job {
                 placement: self.spec.placement.clone(),
                 endpoint: None,
                 update: Default::default(),
+                max_unavailable: None,
             },
         }
     }
