@@ -106,6 +106,7 @@ impl Cluster {
             std::fs::write(&key_file, format!("key-{}\n", node.name)).unwrap();
         }
         let mut config = AgentConfig::new(&node.name, dir.join("tasks"));
+        config.drain = Duration::ZERO;
         config.infra_image = INFRA.into();
         config.resync = Duration::from_millis(100);
         config.wireguard = Some(WireGuardConfig {

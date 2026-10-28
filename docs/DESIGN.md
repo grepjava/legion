@@ -618,6 +618,14 @@ this was verified in a 3-node lab (S3).
 - **Readiness changes only update the table.** Existing connections keep their
   state and finish (soft drain, verified: a live stream completed after its
   backend was removed from the table).
+- **Draining a stopping task.** A task told to stop leaves the endpoints at
+  once, but every other node learns it through its own stream and then
+  reloads its table, a few hundred milliseconds later across a WAN; until
+  then it still sends the task new connections. The task's agent therefore
+  keeps a ready Service task running for a drain (2 s) before stopping it,
+  as Kubernetes users do with a preStop sleep. Found as the odd request
+  timing out during the phase 2 exit test's rolling update. Job tasks and
+  tasks never ready stop at once.
 - **Dead backends**: the agent lists states and kills those whose translation
   targets the dead backend, by state key or ID (`pfctl -k key -k '<key>'`, or
   `pfctl_kill_states` via `libpfctl`). Killing by address does not work for

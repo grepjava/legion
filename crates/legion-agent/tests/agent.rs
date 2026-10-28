@@ -35,6 +35,9 @@ struct Harness {
     rt: Arc<FakeRuntime>,
     agent: Option<(oneshot::Sender<()>, JoinHandle<()>)>,
     metrics: Option<legion_agent::metrics::AgentMetrics<FakeRuntime>>,
+    /// The agent's drain before stopping a ready task; none unless a test
+    /// asks.
+    drain: Duration,
     /// Whether the agent joins the WireGuard mesh.
     mesh: bool,
 }
@@ -88,6 +91,7 @@ impl Harness {
             rt,
             agent: None,
             metrics: None,
+            drain: Duration::ZERO,
             mesh,
         };
         h.start_agent();
@@ -98,6 +102,7 @@ impl Harness {
         let mut config = AgentConfig::new(NODE, self.files_dir());
         config.infra_image = INFRA.into();
         config.resync = Duration::from_millis(100);
+        config.drain = self.drain;
         config.zfs_root = Some("tank/legion".into());
         config.logs_dir = Some(self.logs_dir());
         if self.mesh {
@@ -166,11 +171,17 @@ impl Harness {
 
     /// Creates a task for this node running `pod` (YAML).
     async fn task(&self, name: &str, pod: &str) -> ObjectKey {
+        self.task_of(name, pod, false).await
+    }
+
+    /// A task of a Service, or with `job` of a Job.
+    async fn task_of(&self, name: &str, pod: &str, job: bool) -> ObjectKey {
         let pod: serde_json::Value = serde_yaml_ng::from_str(pod).unwrap();
         let mut spec: TaskSpec = legion_api::parse(&serde_json::json!({
             "service": "web",
             "serviceUid": "0000000000000001",
             "serviceGeneration": 1,
+            "job": job,
             "slot": 1,
             "node": NODE,
             "pod": pod,
@@ -371,6 +382,36 @@ restartPolicy: { condition: on-failure, maxAttempts: 2, delay: 0s }
         status.message
     );
     eventually("pod removed", || h.rt.containers().is_empty()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ready_tasks_drain_before_they_stop() {
+    let mut h = Harness::new().await;
+    h.stop_agent().await;
+    h.drain = Duration::from_millis(1500);
+    h.start_agent();
+    h.rt.add_image("app:1");
+    let pod = r#"containers: [{ name: app, image: "app:1" }]"#;
+    let web = h.task("web-1", pod).await;
+    let job = h.task_of("job-1", pod, true).await;
+    h.wait_state(&web, TaskState::Running).await;
+    h.wait_state(&job, TaskState::Running).await;
+    eventually("web ready", || h.status(&web).ready).await;
+
+    // Other nodes may still send the service's task connections for a
+    // moment: it runs on. A Job's task has nothing to drain.
+    h.shut_down(&web).await;
+    h.shut_down(&job).await;
+    h.wait_state(&job, TaskState::Shutdown).await;
+    assert!(
+        h.running().iter().any(|n| n == "shop_web-1_app"),
+        "web drains"
+    );
+    h.wait_state(&web, TaskState::Shutdown).await;
+    eventually("web's pod removed", || {
+        !h.running().iter().any(|n| n.starts_with("shop_web-1"))
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

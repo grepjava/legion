@@ -43,6 +43,7 @@ impl Cluster {
         let rt = Arc::new(FakeRuntime::new(sys.clone()));
         rt.add_image(INFRA);
         let mut config = AgentConfig::new("n1", dir.path().join("tasks"));
+        config.drain = Duration::ZERO;
         config.infra_image = INFRA.into();
         config.resync = Duration::from_millis(100);
         let control = GrpcControl::new("n1", vec![addr.clone()], None).unwrap();

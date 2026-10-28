@@ -50,6 +50,8 @@ pub(crate) struct Ctx<R, C> {
     pub net: Arc<OnceLock<PodNetwork>>,
     /// Pod addresses in use, by task uid.
     pub ips: Arc<Mutex<BTreeMap<String, Ipv4Addr>>>,
+    /// How long a ready task told to stop keeps running first.
+    pub drain: std::time::Duration,
 }
 
 impl<R, C> Clone for Ctx<R, C> {
@@ -65,6 +67,7 @@ impl<R, C> Clone for Ctx<R, C> {
             zfs_root: self.zfs_root.clone(),
             net: self.net.clone(),
             ips: self.ips.clone(),
+            drain: self.drain,
         }
     }
 }
@@ -208,6 +211,18 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         tracing::info!(state = state.as_str(), "{message}");
         self.status.exit_code = exit_code;
         self.report(state, message).await;
+    }
+
+    /// Before a ready task of a service stops, other nodes learn that it is
+    /// leaving their balancing (it left the endpoints as it was told to
+    /// stop) at their own pace; until they have, they still send it new
+    /// connections, which a pod already gone would leave hanging. So it
+    /// runs on for a moment, serving them.
+    async fn drain(&self) {
+        if self.status.ready && !self.a.spec.job && !self.ctx.drain.is_zero() {
+            tracing::info!(drain = ?self.ctx.drain, "draining before the stop");
+            tokio::time::sleep(self.ctx.drain).await;
+        }
     }
 
     async fn stop(&mut self) {
@@ -665,7 +680,10 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 msg = self.rx.recv() => match msg {
                     // The agent is shutting down; the pod keeps running.
                     None => return,
-                    Some(Msg::Stop) => return self.stop().await,
+                    Some(Msg::Stop) => {
+                        self.drain().await;
+                        return self.stop().await;
+                    }
                     Some(Msg::Died { id, .. }) if id == pod.infra => {
                         teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
                         return self

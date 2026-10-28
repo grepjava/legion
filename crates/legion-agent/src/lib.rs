@@ -70,6 +70,9 @@ pub struct AgentConfig {
     /// The node's end of the WireGuard mesh to other nodes; without it, pods
     /// reach only this node.
     pub wireguard: Option<WireGuardConfig>,
+    /// How long a ready task of a service told to stop keeps running, so
+    /// the other nodes stop sending it connections first.
+    pub drain: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +93,7 @@ impl AgentConfig {
             logs_dir: None,
             zfs_root: None,
             wireguard: None,
+            drain: Duration::from_secs(2),
         }
     }
 }
@@ -120,6 +124,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 zfs_root: config.zfs_root,
                 net: Arc::default(),
                 ips: Arc::default(),
+                drain: config.drain,
             },
             resync: config.resync,
             wireguard: config.wireguard,

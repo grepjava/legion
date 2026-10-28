@@ -509,6 +509,15 @@ Already there from phase 1: namespaces scope names and DNS
   up to 30 s. A first layout with the remote server as the second of two
   managers lost its quorum whenever that server stalled for a few seconds:
   with two managers Raft needs both, so far nodes are better workers.
+- **Draining stopping tasks** (`AgentConfig.drain`, DESIGN.md §5.4): a
+  ready Service task told to stop runs on for 2 s first, while the other
+  nodes take it out of their balancing; before, a node across the WAN
+  could still send it a connection after its pod was gone, which hung.
+  Found as an occasional request timing out during the phase 2 exit
+  test's rolling update (1 run of 3). Tested: a ready task drains while a
+  Job's task stops at once (fails with no drain); the phase 2 exit test
+  twice more with no request failing during the update, and the phase 3
+  exit test again.
 
 ### To do, in order
 
