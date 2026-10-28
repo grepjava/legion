@@ -12,7 +12,7 @@ use legion_api::{Kind, Object, Spec};
 use tokio::time::Instant;
 
 use super::plan::{
-    Action, CronJob, HISTORY, Homes, Job, Jobs, Memory, Node, Quotas, Service, Task, plan,
+    Action, CronJob, HISTORY, Job, Jobs, Memory, Node, Quotas, Service, Task, Volume, Volumes, plan,
 };
 
 struct World {
@@ -20,7 +20,7 @@ struct World {
     jobs: Jobs,
     tasks: Vec<Task>,
     nodes: Vec<Node>,
-    homes: Homes,
+    volumes: Volumes,
     quotas: Quotas,
     index: u64,
     memory: Memory,
@@ -39,7 +39,7 @@ impl World {
             },
             tasks: vec![],
             nodes: vec![],
-            homes: Homes::new(),
+            volumes: Volumes::new(),
             quotas: Quotas::new(),
             index: 0,
             memory: Memory::default(),
@@ -143,6 +143,57 @@ impl World {
         }
     }
 
+    /// A Volume whose data is on `node`.
+    fn volume(&mut self, name: &str, node: &str) {
+        let mut o = Object::new(Kind::Volume, "shop", name, serde_json::json!({}));
+        o.metadata.version = self.next();
+        let status = legion_api::volume::VolumeStatus {
+            node: node.into(),
+            dataset: format!("tank/legion/volumes/shop/{name}"),
+        };
+        o.status = serde_json::to_value(&status).unwrap();
+        self.volumes.insert(
+            ("shop".into(), name.into()),
+            Volume {
+                object: o,
+                spec: Default::default(),
+                status,
+            },
+        );
+    }
+
+    /// One pass, and the agents acting on it.
+    fn step(&mut self) {
+        let p = plan(
+            &self.services,
+            &self.jobs,
+            &self.tasks,
+            &self.nodes,
+            &self.volumes,
+            &self.quotas,
+            &mut self.memory,
+            self.now,
+        );
+        self.apply(p.actions);
+        self.agents();
+    }
+
+    /// Names of the tasks of `service` that are told to run, sorted.
+    fn wanted(&self, service: &str) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|t| {
+                t.spec.service == service
+                    && t.spec.desired_state == DesiredState::Running
+                    && !t.status.state.is_terminal()
+            })
+            .map(|t| t.object.metadata.name.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
     fn delete_service(&mut self, name: &str) {
         self.services.retain(|s| s.object.metadata.name != name);
     }
@@ -165,6 +216,20 @@ impl World {
                         status: Default::default(),
                         object: o,
                     });
+                }
+                Action::Create(mut o) if o.kind == Kind::Volume => {
+                    let key = (o.metadata.namespace.clone(), o.metadata.name.clone());
+                    assert!(!self.volumes.contains_key(&key), "duplicate volume {key:?}");
+                    o.metadata.uid = format!("{index:016x}");
+                    o.metadata.version = index;
+                    self.volumes.insert(
+                        key,
+                        Volume {
+                            spec: legion_api::parse(&o.spec).unwrap(),
+                            status: Default::default(),
+                            object: o,
+                        },
+                    );
                 }
                 Action::Create(mut o) => {
                     assert_eq!(o.kind, Kind::Task);
@@ -219,6 +284,14 @@ impl World {
                                 j.object = o;
                             }
                         }
+                        Kind::Volume => {
+                            let key = (o.metadata.namespace.clone(), o.metadata.name.clone());
+                            let v = self.volumes.get_mut(&key).unwrap();
+                            if v.object.metadata.version == version {
+                                v.spec = legion_api::parse(&o.spec).unwrap();
+                                v.object = o;
+                            }
+                        }
                         Kind::CronJob => {
                             let c = self
                                 .jobs
@@ -266,6 +339,17 @@ impl World {
                 DesiredState::Shutdown => TaskState::Shutdown,
                 _ => continue,
             };
+            // A task's first start claims its volumes for its node.
+            if next == TaskState::Running {
+                let (ns, node) = (t.object.metadata.namespace.clone(), t.spec.node.clone());
+                for name in t.spec.volumes() {
+                    if let Some(v) = self.volumes.get_mut(&(ns.clone(), name))
+                        && v.status.node.is_empty()
+                    {
+                        v.status.node = node.clone();
+                    }
+                }
+            }
             let version = self.next();
             let t = &mut self.tasks[i];
             t.status = TaskStatus {
@@ -288,7 +372,7 @@ impl World {
                 &self.jobs,
                 &self.tasks,
                 &self.nodes,
-                &self.homes,
+                &self.volumes,
                 &self.quotas,
                 &mut self.memory,
                 self.now,
@@ -324,7 +408,7 @@ impl World {
             &self.jobs,
             &self.tasks,
             &self.nodes,
-            &self.homes,
+            &self.volumes,
             &self.quotas,
             &mut self.memory,
             self.now,
@@ -694,7 +778,7 @@ fn rolling_update_stop_first() {
         &w.jobs,
         &w.tasks,
         &w.nodes,
-        &w.homes,
+        &w.volumes,
         &w.quotas,
         &mut w.memory,
         w.now,
@@ -735,7 +819,7 @@ fn rolling_update_start_first() {
         &w.jobs,
         &w.tasks,
         &w.nodes,
-        &w.homes,
+        &w.volumes,
         &w.quotas,
         &mut w.memory,
         w.now,
@@ -924,8 +1008,7 @@ fn tasks_go_where_their_volume_is() {
     let mut w = World::new();
     w.node("n1", &[]);
     w.node("n2", &[]);
-    w.homes
-        .insert(("shop".into(), "pgdata".into()), "n2".into());
+    w.volume("pgdata", "n2");
     w.service(
         "db",
         "replicas: 1\npod: { containers: [{ name: db, image: \"pg:17\" }], volumes: [{ name: data, volume: { name: pgdata } }] }",
@@ -1581,7 +1664,7 @@ impl World {
                 &self.jobs,
                 &self.tasks,
                 &self.nodes,
-                &self.homes,
+                &self.volumes,
                 &self.quotas,
                 &mut self.memory,
                 self.now,
@@ -1651,7 +1734,7 @@ fn a_budget_spent_elsewhere_drains_start_first() {
         &w.jobs,
         &w.tasks,
         &w.nodes,
-        &w.homes,
+        &w.volumes,
         &w.quotas,
         &mut w.memory,
         w.now,
@@ -1689,4 +1772,177 @@ fn a_disruption_budget_paces_updates() {
         assert_eq!(w.images("web"), ["web:2", "web:2", "web:2"], "{budget:?}");
         assert_eq!(w.update("web").0, "completed", "{budget:?}");
     }
+}
+
+const STATEFUL: &str = "mode: stateful\nreplicas: 3\npod: { containers: [{ name: db, image: \"pg:17\" }], volumes: [{ name: data, claim: { size: 1G } }] }";
+
+#[test]
+fn stateful_tasks_start_in_order_with_their_own_volumes() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.node("n3", &[]);
+    w.agents = false;
+    w.service("db", STATEFUL);
+    w.step();
+    // Every ordinal's Volume is made at once; only ordinal 0 starts.
+    let mut names: Vec<&String> = w.volumes.keys().map(|(_, n)| n).collect();
+    names.sort();
+    assert_eq!(names, ["data-db-0", "data-db-1", "data-db-2"]);
+    let v = &w.volumes[&("shop".to_owned(), "data-db-1".to_owned())];
+    assert_eq!(v.spec.size, Some(Bytes(1_000_000_000)));
+    assert_eq!(v.object.metadata.labels["legion.service"], "db");
+    assert_eq!(w.wanted("db"), ["db-0-1"]);
+    // Not before it is ready.
+    w.step();
+    assert_eq!(w.wanted("db"), ["db-0-1"]);
+    w.agents = true;
+    w.agents();
+    w.step();
+    assert_eq!(w.wanted("db"), ["db-0-1", "db-1-1"]);
+    w.settle();
+    assert_eq!(w.wanted("db"), ["db-0-1", "db-1-1", "db-2-1"]);
+
+    // Each task knows its ordinal and claims its own Volume.
+    let t = w
+        .tasks
+        .iter()
+        .find(|t| t.object.metadata.name == "db-1-1")
+        .unwrap();
+    assert!(t.spec.stateful);
+    assert_eq!(t.spec.slot, Some(1));
+    assert_eq!(t.spec.hostname().as_deref(), Some("db-1"));
+    assert_eq!(t.spec.volumes(), ["data-db-1"]);
+    let home = &w.volumes[&("shop".to_owned(), "data-db-1".to_owned())]
+        .status
+        .node;
+    assert_eq!(*home, t.spec.node);
+    // Spread over the nodes, as replicas are.
+    assert_eq!(w.placed("db"), ["n1", "n2", "n3"]);
+
+    // A replacement goes where its Volume is.
+    let node = t.spec.node.clone();
+    w.fail("db-1-1");
+    w.settle();
+    w.now += Duration::from_secs(5);
+    w.settle();
+    let t = w
+        .tasks
+        .iter()
+        .find(|t| t.object.metadata.name == "db-1-2")
+        .unwrap();
+    assert_eq!(t.spec.node, node);
+}
+
+#[test]
+fn a_failed_ordinal_holds_back_the_ones_above() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.agents = false;
+    w.service("db", STATEFUL);
+    w.step();
+    w.fail("db-0-1");
+    w.step();
+    w.now += Duration::from_secs(5);
+    w.step();
+    assert_eq!(w.wanted("db"), ["db-0-2"]);
+    w.fail("db-0-2");
+    w.step();
+    w.now += Duration::from_secs(10);
+    w.step();
+    assert_eq!(w.wanted("db"), ["db-0-3"]);
+}
+
+#[test]
+fn stateful_services_shrink_from_the_top_one_at_a_time() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.service("db", STATEFUL);
+    w.settle();
+    w.service("db", &STATEFUL.replace("replicas: 3", "replicas: 1"));
+    w.agents = false;
+    w.step();
+    assert_eq!(w.wanted("db"), ["db-0-1", "db-1-1"]);
+    w.step();
+    assert_eq!(
+        w.wanted("db"),
+        ["db-0-1", "db-1-1"],
+        "waits for db-2 to stop"
+    );
+    w.agents = true;
+    w.agents();
+    w.agents = false;
+    w.step();
+    assert_eq!(w.wanted("db"), ["db-0-1"]);
+    w.agents = true;
+    w.settle();
+    assert_eq!(w.wanted("db"), ["db-0-1"]);
+    // The Volumes stay, for the data in them; growing again finds them.
+    assert_eq!(w.volumes.len(), 3);
+    w.service("db", STATEFUL);
+    w.settle();
+    assert_eq!(w.wanted("db"), ["db-0-1", "db-1-1", "db-2-1"]);
+    assert_eq!(w.volumes.len(), 3);
+
+    // Gone, the service leaves them too; a resized claim resizes them.
+    w.service("db", &STATEFUL.replace("1G", "2G"));
+    w.settle();
+    assert!(
+        w.volumes
+            .values()
+            .all(|v| v.spec.size == Some(Bytes(2_000_000_000)))
+    );
+    w.delete_service("db");
+    w.settle();
+    assert!(w.wanted("db").is_empty());
+    assert_eq!(w.volumes.len(), 3);
+}
+
+#[test]
+fn stateful_updates_go_from_the_highest_ordinal_down() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.service("db", STATEFUL);
+    w.settle();
+    w.service("db", &STATEFUL.replace("pg:17", "pg:18"));
+    // Stop-first, one slot at a time, highest first.
+    let mut order = vec![];
+    for _ in 0..30 {
+        w.step();
+        for t in &w.tasks {
+            let name = &t.object.metadata.name;
+            if t.spec.pod.containers[0].image == "pg:18"
+                && t.status.state == TaskState::Running
+                && !order.contains(name)
+            {
+                order.push(name.clone());
+            }
+        }
+        let active = |slot| {
+            w.tasks
+                .iter()
+                .filter(|t| t.spec.slot == Some(slot) && !t.status.state.is_terminal())
+                .count()
+        };
+        assert!((0..3).all(|s| active(s) <= 1), "two tasks share a slot");
+    }
+    assert_eq!(order, ["db-2-2", "db-1-2", "db-0-2"]);
+}
+
+#[test]
+fn stateful_admission() {
+    let admit = |spec: &str| -> Result<(), String> {
+        let value: serde_json::Value = serde_yaml_ng::from_str(spec).unwrap();
+        let mut s: ServiceSpec = legion_api::parse(&value).unwrap();
+        s.admit().map_err(|e| e.to_string())
+    };
+    assert_eq!(
+        admit(&format!("{STATEFUL}\nupdate: {{ order: start-first }}")).unwrap_err(),
+        "spec.update.order: a stateful task's volumes are its own: its replacement starts after it stops"
+    );
+    assert_eq!(
+        admit(&STATEFUL.replace("mode: stateful", "mode: replicated")).unwrap_err(),
+        "spec.pod.volumes: volume \"data\": only a stateful service's tasks claim volumes"
+    );
+    assert!(admit(STATEFUL).is_ok());
 }

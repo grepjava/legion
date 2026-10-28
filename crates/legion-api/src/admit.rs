@@ -79,7 +79,11 @@ pub fn admit(obj: &mut Object) -> Result<(), Error> {
     let normalised = match obj.kind {
         Kind::Namespace => normalise::<NamespaceSpec>(spec),
         Kind::Node => normalise::<NodeSpec>(spec),
-        Kind::Service => normalise::<ServiceSpec>(spec),
+        Kind::Service => normalise::<ServiceSpec>(spec).and_then(|v| {
+            let s: ServiceSpec = parse(&v)?;
+            s.check_names(&obj.metadata.name)?;
+            Ok(v)
+        }),
         Kind::Secret | Kind::Config => normalise::<DataSpec>(spec),
         Kind::Volume => normalise::<VolumeSpec>(spec),
         Kind::Task => return Err(Error::Managed(obj.kind)),

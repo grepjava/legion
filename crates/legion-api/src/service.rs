@@ -42,6 +42,33 @@ pub enum ServiceMode {
     Stateful,
 }
 
+impl ServiceSpec {
+    /// A stateful service's names made from its own, its tasks' hostnames
+    /// (`<service>-<ordinal>`) and Volumes, must be valid names too.
+    pub(crate) fn check_names(&self, service: &str) -> Result<(), Invalid> {
+        if self.mode != ServiceMode::Stateful {
+            return Ok(());
+        }
+        let last = self.replicas.unwrap_or(1).saturating_sub(1);
+        check_name("replicas", &format!("{service}-{last}")).map_err(|_| {
+            Invalid::new(
+                "replicas",
+                format!("the name of task {service}-{last} would be over 63 characters"),
+            )
+        })?;
+        for (i, v) in self.pod.volumes.iter().enumerate() {
+            let name = claim_volume(&v.name, service, last);
+            if v.claim.is_some() && crate::validate_name(&name).is_err() {
+                return Err(Invalid::new(
+                    field(&index("pod", "volumes", i), "name"),
+                    format!("the name of Volume {name} would be over 63 characters"),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Spec for ServiceSpec {
     fn admit(&mut self) -> Result<(), Invalid> {
         match self.mode {
@@ -57,13 +84,24 @@ impl Spec for ServiceSpec {
                 }
             }
             ServiceMode::Stateful => {
-                return Err(Invalid::new(
-                    "mode",
-                    "stateful services are not supported yet (roadmap phase 4)",
-                ));
+                self.replicas.get_or_insert(1);
+                if self.update.order == UpdateOrder::StartFirst {
+                    return Err(Invalid::new(
+                        "update.order",
+                        "a stateful task's volumes are its own: its replacement starts after it stops",
+                    ));
+                }
             }
         }
         self.pod.admit("pod")?;
+        if self.mode != ServiceMode::Stateful
+            && let Some((name, _)) = self.pod.claims().next()
+        {
+            return Err(Invalid::new(
+                "pod.volumes",
+                format!("volume {name:?}: only a stateful service's tasks claim volumes"),
+            ));
+        }
         self.placement.admit("placement")?;
         if let Some(endpoint) = &mut self.endpoint {
             endpoint.admit("endpoint", &self.pod)?;
@@ -191,11 +229,11 @@ impl PodSpec {
         refs
     }
 
-    /// Whether the pod mounts the `Volume` object `name`.
-    pub fn uses_volume(&self, name: &str) -> bool {
+    /// The pod's claims on Volumes of each stateful task's own.
+    pub fn claims(&self) -> impl Iterator<Item = (&str, &ClaimSource)> {
         self.volumes
             .iter()
-            .any(|v| v.volume.as_ref().is_some_and(|s| s.name == name))
+            .filter_map(|v| Some((v.name.as_str(), v.claim.as_ref()?)))
     }
 
     /// Resolves a port reference against the pod's container ports.
@@ -768,7 +806,8 @@ pub struct FileRef {
 }
 
 /// A volume the pod's containers can mount: exactly one of a `Volume` object
-/// (`volume`) or a memory-backed `tmpfs`.
+/// (`volume`), a memory-backed `tmpfs`, or, in a stateful service, a
+/// `claim` on a Volume of the task's own (DESIGN.md §4.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PodVolume {
@@ -777,20 +816,43 @@ pub struct PodVolume {
     pub volume: Option<VolumeSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmpfs: Option<TmpfsSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<ClaimSource>,
 }
 
 impl PodVolume {
     fn admit(&self, path: &str) -> Result<(), Invalid> {
         check_name(&field(path, "name"), &self.name)?;
-        match (&self.volume, &self.tmpfs) {
-            (Some(v), None) => check_name(&field(path, "volume.name"), &v.name),
-            (None, Some(_)) => Ok(()),
+        match (&self.volume, &self.tmpfs, &self.claim) {
+            (Some(v), None, None) => check_name(&field(path, "volume.name"), &v.name),
+            (None, Some(_), None) => Ok(()),
+            (None, None, Some(c)) if c.size == Some(Bytes(0)) => Err(Invalid::new(
+                field(path, "claim.size"),
+                "must be above zero",
+            )),
+            (None, None, Some(_)) => Ok(()),
             _ => Err(Invalid::new(
                 path,
-                "set exactly one of `volume` and `tmpfs`",
+                "set exactly one of `volume`, `tmpfs` and `claim`",
             )),
         }
     }
+}
+
+/// The Volume a stateful task's claim `claim` mounts: one per claim and
+/// ordinal, `<claim>-<service>-<ordinal>`, made by the Service controller
+/// and kept when the service shrinks or goes.
+pub fn claim_volume(claim: &str, service: &str, ordinal: u32) -> String {
+    format!("{claim}-{service}-{ordinal}")
+}
+
+/// A Volume per stateful task, made from this template.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimSource {
+    /// ZFS quota of each task's Volume; none by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<Bytes>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

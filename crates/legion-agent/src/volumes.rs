@@ -2,7 +2,9 @@
 //! `tmpfs` volumes, bind-mounted (nullfs) into the containers that mount
 //! them.
 //!
-//! A `Volume` is the dataset `<zfs root>/volumes/<namespace>/<name>`. The
+//! A `Volume` is the dataset `<zfs root>/volumes/<namespace>/<name>`; a
+//! stateful task's claim mounts its own Volume, named after the claim, the
+//! service and the task's ordinal. The
 //! first node to use it creates it, with the volume's quota, and records
 //! itself in the volume's status; the data stays on that node, so tasks
 //! elsewhere are rejected. The dataset outlives tasks: deleting the
@@ -50,36 +52,38 @@ pub(crate) async fn prepare<C: Control>(
 ) -> Result<Sources, Error> {
     let mut sources = Sources::new();
     for v in &a.spec.pod.volumes {
-        let source = if let Some(src) = &v.volume {
+        let source = if let Some(name) = a.spec.volume_name(v) {
             let root = zfs_root.ok_or_else(|| {
                 Error::Rejected(format!(
-                    "volume {}: this node has no ZFS dataset for volumes",
-                    src.name
+                    "volume {name}: this node has no ZFS dataset for volumes"
                 ))
             })?;
-            let dataset = dataset(root, &a.key.namespace, &src.name);
+            let dataset = dataset(root, &a.key.namespace, &name);
             let spec = match control
-                .claim_volume(&a.key.namespace, &src.name, node, &dataset)
+                .claim_volume(&a.key.namespace, &name, node, &dataset)
                 .await
             {
                 Ok(VolumeClaim::Claimed(spec)) => spec,
                 Ok(VolumeClaim::Missing) => {
-                    return Err(Error::Failed(format!("volume {} not found", src.name)));
+                    return Err(Error::Failed(format!("volume {name} not found")));
                 }
                 Ok(VolumeClaim::Elsewhere(other)) => {
                     return Err(Error::Rejected(format!(
-                        "volume {} lives on node {other}",
-                        src.name
+                        "volume {name} lives on node {other}"
                     )));
                 }
                 Err(e) => {
-                    return Err(Error::Failed(format!("volume {}: {e}", src.name)));
+                    return Err(Error::Failed(format!("volume {name}: {e}")));
                 }
             };
-            let name = src.name.clone();
             crate::task::blocking(sys, move |sys| zfs(sys, &dataset, &spec))
                 .await
                 .map_err(|e| Error::Failed(format!("volume {name}: {e}")))?
+        } else if v.claim.is_some() {
+            return Err(Error::Rejected(format!(
+                "volume {}: only a stateful service's tasks claim volumes",
+                v.name
+            )));
         } else {
             let size = v.tmpfs.as_ref().and_then(|t| t.size).map(|b| b.0);
             let dir = files::task_dir(files_dir, &a.uid)

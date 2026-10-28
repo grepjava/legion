@@ -109,7 +109,7 @@ One binary, `legion`, with two roles:
 | Controller | Watches | Produces |
 |------------|---------|----------|
 | Service | Service, Task, Node | Creates and removes Tasks to match replicas / one per eligible node (global). |
-| Stateful | Service (`mode: stateful`) | Tasks with stable ordinals and per-ordinal volumes; ordered start and stop. |
+| Stateful | Service (`mode: stateful`) | Tasks with ordinals from 0, each `<svc>-<n>` to its pod (hostname) and DNS. A pod volume with `claim: { size }` mounts a Volume of the task's own, `<claim>-<svc>-<n>`, which the controller makes for every wanted ordinal (resized with the claim) and keeps when the service shrinks or goes. Ordinal `n` starts only once every lower one has a ready task; the service shrinks from its highest ordinal, one task at a time, and updates from the highest down, always stopping a task before its replacement starts (`start-first` is refused). Quotas count the Volumes claims will make. |
 | Update | Service spec generation | Rolling replacement honouring parallelism, delay, failure action, `maxUnavailable`; automatic rollback. |
 | Job / CronJob | Job, CronJob | Run-to-completion tasks; CronJob creates Jobs on schedule with concurrency policy and history limit. |
 | Node health | Heartbeats | Marks nodes `down` after three missed heartbeats (5 s each; a new leader allows three from taking over) and `ready` when heard from again; marks their tasks orphaned so the Service controller replaces them. |
@@ -464,7 +464,7 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
 | CronJobs | Cron schedule, concurrency policy, history limits. | 3 |
 | Network policy | Ingress and egress rules by namespace, label and port; compiled to pf. | 3 |
 | Disruption budgets | `maxUnavailable` on the service, honoured by drain and updates. | 3 |
-| Stateful services | `mode: stateful`: stable names `<svc>-<n>`, per-ordinal ZFS volumes, ordered rollout. Data moves between nodes with `zfs send/recv`. | 4 |
+| Stateful services | `mode: stateful`: stable names `<svc>-<n>`, per-ordinal ZFS volumes from claims, ordered rollout (3.3). Data moves between nodes with `zfs send/recv`. | 4 |
 | Ingress | A system global service running haproxy, configured from routes Legion renders from service labels. | 4 |
 | Autoscaling | CPU and memory targets read from rctl; no separate metrics server. | 4 |
 | `apply` / `diff` | Server-side apply with field ownership kept simple: last applier wins per object. | 1 |

@@ -19,7 +19,7 @@ use legion_store::{Command, NodeId, Outcome, Precondition, Store};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use plan::{Action, CronJob, Homes, Job, Jobs, Memory, Node, Quotas, Service, Task};
+use plan::{Action, CronJob, Job, Jobs, Memory, Node, Quotas, Service, Task, Volume, Volumes};
 
 /// Changes arriving within this window are handled in one pass.
 const DEBOUNCE: Duration = Duration::from_millis(50);
@@ -92,7 +92,7 @@ async fn lead(store: &Store) {
 
 /// One reconcile pass; returns when the next one is due at the latest.
 async fn pass(store: &Store, memory: &mut Memory) -> Option<Instant> {
-    let (services, jobs, tasks, nodes, homes, quotas) = match read(store) {
+    let (services, jobs, tasks, nodes, volumes, quotas) = match read(store) {
         Ok(state) => state,
         Err(e) => {
             tracing::warn!("reading the store: {e}");
@@ -104,7 +104,7 @@ async fn pass(store: &Store, memory: &mut Memory) -> Option<Instant> {
         &jobs,
         &tasks,
         &nodes,
-        &homes,
+        &volumes,
         &quotas,
         memory,
         Instant::now(),
@@ -117,7 +117,7 @@ async fn pass(store: &Store, memory: &mut Memory) -> Option<Instant> {
     plan.wake
 }
 
-type State = (Vec<Service>, Jobs, Vec<Task>, Vec<Node>, Homes, Quotas);
+type State = (Vec<Service>, Jobs, Vec<Task>, Vec<Node>, Volumes, Quotas);
 
 fn read(store: &Store) -> Result<State, legion_store::Error> {
     let services = store
@@ -188,14 +188,22 @@ fn read(store: &Store) -> Result<State, legion_store::Error> {
             })
         })
         .collect();
-    let homes = store
+    let volumes = store
         .list(Kind::Volume, None)?
         .objects
         .into_iter()
         .filter_map(|o| {
-            let status: legion_api::volume::VolumeStatus = serde_json::from_value(o.status).ok()?;
-            (!status.node.is_empty())
-                .then_some(((o.metadata.namespace, o.metadata.name), status.node))
+            let spec = parsed(&o)?;
+            let status = status_of(&o);
+            let key = (o.metadata.namespace.clone(), o.metadata.name.clone());
+            Some((
+                key,
+                Volume {
+                    object: o,
+                    spec,
+                    status,
+                },
+            ))
         })
         .collect();
     let quotas = store
@@ -207,7 +215,7 @@ fn read(store: &Store) -> Result<State, legion_store::Error> {
             Some((o.metadata.name, spec.quota?))
         })
         .collect();
-    Ok((services, jobs, tasks, nodes, homes, quotas))
+    Ok((services, jobs, tasks, nodes, volumes, quotas))
 }
 
 fn status_of<T: serde::de::DeserializeOwned + Default>(o: &Object) -> T {

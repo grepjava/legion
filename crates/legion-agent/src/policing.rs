@@ -197,6 +197,7 @@ mod tests {
             }],
             ready: alive.iter().map(|a| ip(a)).collect(),
             alive: alive.iter().map(|a| ip(a)).collect(),
+            ordinals: BTreeMap::new(),
         }
     }
 

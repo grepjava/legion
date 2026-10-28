@@ -1119,6 +1119,62 @@ async fn volumes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stateful_tasks_mount_their_own_volumes() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    // The controller makes `<claim>-<service>-<ordinal>`.
+    let volume = ObjectKey::new(Kind::Volume, "shop", "data-web-1");
+    h.write(
+        Object::new(
+            Kind::Volume,
+            "shop",
+            "data-web-1",
+            serde_json::json!({ "size": "1Gi" }),
+        ),
+        Precondition::MustNotExist,
+    )
+    .await;
+    let pod = "containers: [{ name: db, image: \"app:1\", volumeMounts: [{ name: data, path: /var/db }] }]\nvolumes: [{ name: data, claim: { size: 1Gi } }]";
+    let pod: serde_json::Value = serde_yaml_ng::from_str(pod).unwrap();
+    let mut spec: TaskSpec = legion_api::parse(&serde_json::json!({
+        "service": "web",
+        "serviceUid": "0000000000000001",
+        "serviceGeneration": 1,
+        "slot": 1,
+        "stateful": true,
+        "node": NODE,
+        "pod": pod,
+    }))
+    .unwrap();
+    spec.admit().unwrap();
+    let mut object = Object::new(
+        Kind::Task,
+        "shop",
+        "web-1-1",
+        serde_json::to_value(&spec).unwrap(),
+    );
+    object.status = serde_json::json!({ "state": "assigned" });
+    let key = h.write(object, Precondition::MustNotExist).await.key();
+    h.wait_state(&key, TaskState::Running).await;
+
+    let ds = "tank/legion/volumes/shop/data-web-1";
+    assert_eq!(h.sys.zfs_list(ds).unwrap()[0].quota, Some(1 << 30));
+    assert_eq!(h.store.get(&volume).unwrap().unwrap().status["node"], NODE);
+    let spec = h.rt.spec("shop_web-1-1_db").unwrap();
+    assert!(
+        spec.mounts
+            .iter()
+            .any(|m| m.source == format!("/{ds}") && m.destination == "/var/db"),
+        "{:?}",
+        spec.mounts
+    );
+    // Its pod is named for its ordinal.
+    assert_eq!(spec.hostname.as_deref(), Some("web-1"));
+    let infra = h.rt.spec("shop_web-1-1").unwrap();
+    assert_eq!(infra.hostname.as_deref(), Some("web-1"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn volume_problems() {
     let h = Harness::new().await;
     h.rt.add_image("app:1");

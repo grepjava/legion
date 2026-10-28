@@ -9,6 +9,7 @@
 //! |------|--------|
 //! | `<svc>.<ns>.legion` | the service's address: its VIP, or its ready tasks |
 //! | `tasks.<svc>.<ns>.legion` | the service's ready tasks |
+//! | `<svc>-<n>.<svc>.<ns>.legion` | a stateful service's ready task `n` |
 //!
 //! `<svc>.<ns>` and `tasks.<svc>.<ns>` answer too when the service exists,
 //! and pods search `<ns>.legion` and `legion`, so `<svc>` works within a
@@ -42,6 +43,8 @@ pub struct ServiceAddrs {
     pub vip: Option<Ipv4Addr>,
     /// Ready tasks.
     pub tasks: Vec<Ipv4Addr>,
+    /// A stateful service's ready tasks, by ordinal.
+    pub ordinals: Vec<(u32, Ipv4Addr)>,
 }
 
 /// The cluster names and their addresses.
@@ -76,6 +79,10 @@ impl Zone {
                 None => tasks.clone(),
             };
             zone.names.insert(format!("tasks.{base}"), tasks);
+            for (n, ip) in s.ordinals {
+                let name = format!("{}-{n}.{base}", s.name.to_lowercase());
+                zone.names.insert(name, vec![ip]);
+            }
             zone.names.insert(base, addrs);
             zone.namespaces.insert(s.namespace.to_lowercase());
         }
@@ -303,18 +310,21 @@ mod tests {
                 name: "web".into(),
                 vip: None,
                 tasks: vec![Ipv4Addr::new(10, 200, 0, 3), Ipv4Addr::new(10, 200, 0, 2)],
+                ordinals: vec![],
             },
             ServiceAddrs {
                 namespace: "shop".into(),
                 name: "db".into(),
                 vip: Some(Ipv4Addr::new(10, 201, 0, 7)),
                 tasks: vec![Ipv4Addr::new(10, 200, 0, 9)],
+                ordinals: vec![(0, Ipv4Addr::new(10, 200, 0, 9))],
             },
             ServiceAddrs {
                 namespace: "shop".into(),
                 name: "idle".into(),
                 vip: None,
                 tasks: vec![],
+                ordinals: vec![],
             },
         ])
     }
@@ -327,6 +337,10 @@ mod tests {
         assert_eq!(z.lookup("WEB.Shop.legion"), Lookup::Found(&web));
         assert_eq!(z.lookup("web.shop."), Lookup::Found(&web));
         assert_eq!(z.lookup("tasks.web.shop.legion."), Lookup::Found(&web));
+        let db0 = [Ipv4Addr::new(10, 200, 0, 9)];
+        assert_eq!(z.lookup("db-0.db.shop.legion."), Lookup::Found(&db0));
+        assert_eq!(z.lookup("db-0.db.shop."), Lookup::Found(&db0));
+        assert_eq!(z.lookup("db-1.db.shop.legion."), Lookup::NoSuchName);
         assert_eq!(
             z.lookup("db.shop.legion."),
             Lookup::Found(&[Ipv4Addr::new(10, 201, 0, 7)])
@@ -454,6 +468,7 @@ mod tests {
             name: "web".into(),
             vip: None,
             tasks: (2..200).map(|n| Ipv4Addr::new(10, 200, 0, n)).collect(),
+            ordinals: vec![],
         }]);
         let q = query("web.shop.legion.", RecordType::A);
         let r = Message::from_vec(&answer(&q, &many, &[], false).await.unwrap()).unwrap();

@@ -2,11 +2,15 @@
 //! is refused when what its namespace would then ask for in all goes over
 //! the quota. The scheduler holds tasks to the quota again as it places
 //! them; volumes are held to it only here, so the API server admits and
-//! writes quota-counted objects one at a time.
+//! writes quota-counted objects one at a time. A stateful service's claims
+//! count as the Volumes they will make, before the controller makes them.
+
+use std::collections::BTreeMap;
 
 use legion_api::admit::NamespaceSpec;
+use legion_api::quantity::Bytes;
 use legion_api::quota::{Quota, Usage, describe};
-use legion_api::service::{ServiceMode, ServiceSpec};
+use legion_api::service::{ServiceMode, ServiceSpec, claim_volume};
 use legion_api::volume::VolumeSpec;
 use legion_api::{CLUSTER_SCOPE, Kind, Object, ObjectKey};
 use legion_store::Store;
@@ -27,31 +31,30 @@ pub(crate) fn check(store: &Store, desired: &Object) -> Result<(), Status> {
     let Some(quota) = quota_of(store, namespace)? else {
         return Ok(());
     };
-    let others = store
-        .list(desired.kind, Some(namespace))
-        .map_err(internal)?
-        .objects;
-    let mut before = Usage::default();
-    let mut after = Usage::default();
+    let list = |kind| -> Result<Vec<Object>, Status> {
+        Ok(store.list(kind, Some(namespace)).map_err(internal)?.objects)
+    };
+    // Services and Volumes, before and after.
+    let services: Vec<(String, ServiceSpec)> = list(Kind::Service)?
+        .into_iter()
+        .filter_map(|o| Some((o.metadata.name, legion_api::parse(&o.spec).ok()?)))
+        .collect();
+    let volumes: Vec<(String, Option<Bytes>)> = list(Kind::Volume)?
+        .into_iter()
+        .filter_map(|o| {
+            let v: VolumeSpec = legion_api::parse(&o.spec).ok()?;
+            Some((o.metadata.name, v.size))
+        })
+        .collect();
+    let mut services_after = services.clone();
+    let mut volumes_after = volumes.clone();
+    let name = &desired.metadata.name;
     match desired.kind {
         Kind::Service => {
-            let nodes = store
-                .list(Kind::Node, None)
-                .map_err(internal)?
-                .objects
-                .len() as u32;
             let spec: ServiceSpec = legion_api::parse(&desired.spec).map_err(internal)?;
             needs_requests(&quota, &spec, namespace)?;
-            for o in &others {
-                let Ok(s) = legion_api::parse::<ServiceSpec>(&o.spec) else {
-                    continue;
-                };
-                add_service(&mut before, &s, nodes);
-                if o.metadata.name != desired.metadata.name {
-                    add_service(&mut after, &s, nodes);
-                }
-            }
-            add_service(&mut after, &spec, nodes);
+            services_after.retain(|(n, _)| n != name);
+            services_after.push((name.clone(), spec));
         }
         Kind::Volume => {
             let spec: VolumeSpec = legion_api::parse(&desired.spec).map_err(internal)?;
@@ -60,19 +63,18 @@ pub(crate) fn check(store: &Store, desired: &Object) -> Result<(), Status> {
                     "namespace {namespace} has a storage quota: the volume needs a size"
                 )));
             }
-            for o in &others {
-                let Ok(v) = legion_api::parse::<VolumeSpec>(&o.spec) else {
-                    continue;
-                };
-                before.add_volume(v.size);
-                if o.metadata.name != desired.metadata.name {
-                    after.add_volume(v.size);
-                }
-            }
-            after.add_volume(spec.size);
+            volumes_after.retain(|(n, _)| n != name);
+            volumes_after.push((name.clone(), spec.size));
         }
         _ => unreachable!("counted kinds"),
     }
+    let nodes = store
+        .list(Kind::Node, None)
+        .map_err(internal)?
+        .objects
+        .len() as u32;
+    let before = usage(&services, &volumes, nodes);
+    let after = usage(&services_after, &volumes_after, nodes);
     let over = quota.exceeded(&before, &after);
     if over.is_empty() {
         Ok(())
@@ -93,9 +95,42 @@ fn quota_of(store: &Store, namespace: &str) -> Result<Option<Quota>, Status> {
     Ok(spec.quota)
 }
 
+/// What a namespace's Services and Volumes take: the services' tasks, and
+/// the Volumes, with those stateful services' claims would make.
+fn usage(
+    services: &[(String, ServiceSpec)],
+    volumes: &[(String, Option<Bytes>)],
+    nodes: u32,
+) -> Usage {
+    let mut u = Usage::default();
+    let mut all: BTreeMap<String, Option<Bytes>> = volumes.iter().cloned().collect();
+    for (name, s) in services {
+        add_service(&mut u, s, nodes);
+        if s.mode != ServiceMode::Stateful {
+            continue;
+        }
+        for n in 0..s.replicas.unwrap_or(1) {
+            for (claim, src) in s.pod.claims() {
+                all.entry(claim_volume(claim, name, n)).or_insert(src.size);
+            }
+        }
+    }
+    for size in all.values() {
+        u.add_volume(*size);
+    }
+    u
+}
+
 /// Under a CPU or memory quota every task must say what it needs, or the
-/// quota would not hold it.
+/// quota would not hold it; under a storage quota, every claim its size.
 fn needs_requests(quota: &Quota, spec: &ServiceSpec, namespace: &str) -> Result<(), Status> {
+    if quota.storage.is_some()
+        && let Some((name, _)) = spec.pod.claims().find(|(_, c)| c.size.is_none())
+    {
+        return Err(Status::failed_precondition(format!(
+            "namespace {namespace} has a storage quota: claim {name} needs a size"
+        )));
+    }
     let r = spec.pod.requests();
     for (limited, missing, what) in [
         (quota.cpu.is_some(), r.cpu.0 == 0, "cpu"),

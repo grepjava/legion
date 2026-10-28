@@ -391,6 +391,7 @@ async fn dns(
                     name: e.name.clone(),
                     vip: e.vip,
                     tasks: e.ready.clone(),
+                    ordinals: e.ordinals.iter().map(|(n, ip)| (*n, *ip)).collect(),
                 }));
                 tx.send_replace(Arc::new(zone));
             }

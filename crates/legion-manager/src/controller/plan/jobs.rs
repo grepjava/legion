@@ -31,7 +31,9 @@ use legion_api::task::TaskState;
 use legion_api::{Kind, Object};
 use tokio::time::Instant;
 
-use super::{Action, Homes, Memory, Node, Plan, Service, Slot, Task, eligible, stop};
+use super::{
+    Action, Memory, Node, Plan, Service, Slot, Task, Volumes, eligible, shared_volumes, stop,
+};
 
 /// The first retry of a failed task waits this long, doubling per failure
 /// in a row in its slot, up to [`super::MAX_BACKOFF`].
@@ -89,7 +91,7 @@ pub(super) fn job(
     owner: &Service,
     tasks: &[&Task],
     nodes: &[Node],
-    homes: &Homes,
+    volumes: &Volumes,
     memory: &Memory,
     now: Instant,
     wall: i64,
@@ -122,7 +124,7 @@ pub(super) fn job(
         JobMode::Global => {
             let mut slots: BTreeSet<Slot> = nodes
                 .iter()
-                .filter(|n| eligible(n, owner, homes).is_ok())
+                .filter(|n| eligible(n, owner, volumes, &shared_volumes(owner)).is_ok())
                 .map(|n| Slot::Node(n.name().to_owned()))
                 .collect();
             slots.extend(by_slot.keys().filter(|s| done(s)).cloned());

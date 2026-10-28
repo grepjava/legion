@@ -1303,6 +1303,67 @@ async fn namespace_quotas_refuse_what_would_not_fit() {
     let mut free = svc("api", 50, None);
     free.object.as_mut().unwrap().namespace = "other".into();
     try_apply(free).await.unwrap();
+
+    // A stateful service's claims count as the Volumes they make, made or
+    // not, and once only.
+    try_apply(object(
+        "Namespace",
+        "",
+        "store",
+        serde_json::json!({ "quota": { "volumes": 2, "storage": "3Gi" } }),
+    ))
+    .await
+    .unwrap();
+    let db = |replicas: u32, size: Option<&str>| {
+        let claim = match size {
+            Some(s) => serde_json::json!({ "size": s }),
+            None => serde_json::json!({}),
+        };
+        object(
+            "Service",
+            "store",
+            "db",
+            serde_json::json!({ "mode": "stateful", "replicas": replicas, "pod": {
+                "containers": [{ "name": "c", "image": "c:1",
+                                 "volumeMounts": [{ "name": "data", "path": "/data" }] }],
+                "volumes": [{ "name": "data", "claim": claim }],
+            } }),
+        )
+    };
+    let why = refused(try_apply(db(2, None)).await);
+    assert!(why.contains("claim data needs a size"), "{why}");
+    assert_eq!(
+        refused(try_apply(db(3, Some("1Gi"))).await),
+        "over the quota of namespace store: volumes 3 of 2"
+    );
+    try_apply(db(2, Some("1Gi"))).await.unwrap();
+    let mut extra = volume("extra", Some("1Gi"));
+    extra.object.as_mut().unwrap().namespace = "store".into();
+    assert_eq!(
+        refused(try_apply(extra.clone()).await),
+        "over the quota of namespace store: volumes 3 of 2"
+    );
+    // Made by the controller, they still count once.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let list = api
+            .clone()
+            .list(ListRequest {
+                kind: "Volume".into(),
+                namespace: "store".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        if list.objects.len() == 2 {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "volumes not made");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    try_apply(db(2, Some("1Gi"))).await.unwrap();
+    refused(try_apply(extra).await);
     m.stop().await;
 }
 

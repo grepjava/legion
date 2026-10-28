@@ -43,6 +43,9 @@ pub struct ServiceEndpoints {
     pub ready: Vec<Ipv4Addr>,
     /// Addresses of its running tasks, ready or not, in order.
     pub alive: Vec<Ipv4Addr>,
+    /// A stateful service's ready tasks, by ordinal.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ordinals: BTreeMap<u32, Ipv4Addr>,
 }
 
 /// A service port, resolved against the pod.

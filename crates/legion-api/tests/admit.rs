@@ -171,6 +171,22 @@ fn errors_name_the_field() {
             "  pod:\n    containers: []\n",
             "spec.pod.containers: a pod needs",
         ),
+        (
+            "  mode: stateful\n  pod:\n    containers: [{ name: web, image: web:1 }]\n    volumes: [{ name: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddd, claim: {} }]\n",
+            "spec.pod.volumes[0].name: the name of Volume dddddddddddddddddddddddddddddddddddddddddddddddddddddddddd-web-0 would be over 63 characters",
+        ),
+        (
+            "  mode: stateful\n  pod:\n    containers: [{ name: web, image: web:1 }]\n    volumes: [{ name: data, claim: {}, tmpfs: {} }]\n",
+            "spec.pod.volumes[0]: set exactly one of `volume`, `tmpfs` and `claim`",
+        ),
+        (
+            "  pod:\n    containers: [{ name: web, image: web:1 }]\n    volumes: [{ name: data, claim: {} }]\n",
+            "spec.pod.volumes: volume \"data\": only a stateful service's tasks claim volumes",
+        ),
+        (
+            "  mode: stateful\n  update: { order: start-first }\n  pod:\n    containers: [{ name: web, image: web:1 }]\n",
+            "spec.update.order: a stateful task's volumes are its own",
+        ),
     ];
     for (spec, want) in cases {
         let got = rejected(&service(spec));

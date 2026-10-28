@@ -323,7 +323,7 @@ impl DispatcherService {
         if !self
             .tasks_of(node, namespace)?
             .iter()
-            .any(|a| a.spec.pod.uses_volume(name))
+            .any(|a| a.spec.uses_volume(name))
         {
             return Err(Status::permission_denied(format!(
                 "no task of node {node} uses volume {namespace}/{name}"
@@ -909,8 +909,8 @@ fn endpoints(
     services: &BTreeMap<ObjectKey, Object>,
     tasks: &BTreeMap<ObjectKey, Object>,
 ) -> Endpoints {
-    /// Ready and running task addresses.
-    type Addrs = (Vec<Ipv4Addr>, Vec<Ipv4Addr>);
+    /// Ready and running task addresses, and ready ones by ordinal.
+    type Addrs = (Vec<Ipv4Addr>, Vec<Ipv4Addr>, BTreeMap<u32, Ipv4Addr>);
     let mut by_service: BTreeMap<(&str, String), Addrs> = BTreeMap::new();
     for t in tasks.values() {
         let Ok(spec) = legion_api::parse::<TaskSpec>(&t.spec) else {
@@ -923,12 +923,16 @@ fn endpoints(
         let Some(ip) = status.ip.as_deref().and_then(|s| s.parse().ok()) else {
             continue;
         };
+        let ordinal = spec.ordinal();
         let entry = by_service
             .entry((t.metadata.namespace.as_str(), spec.service_uid))
             .or_default();
         entry.1.push(ip);
         if spec.desired_state == DesiredState::Running && status.ready {
             entry.0.push(ip);
+            if let Some(n) = ordinal {
+                entry.2.insert(n, ip);
+            }
         }
     }
     services
@@ -936,7 +940,7 @@ fn endpoints(
         .map(|s| {
             let status: ServiceStatus =
                 serde_json::from_value(s.status.clone()).unwrap_or_default();
-            let (mut ready, mut alive) = by_service
+            let (mut ready, mut alive, ordinals) = by_service
                 .remove(&(s.metadata.namespace.as_str(), s.metadata.uid.clone()))
                 .unwrap_or_default();
             ready.sort();
@@ -976,6 +980,7 @@ fn endpoints(
                 ports,
                 ready,
                 alive,
+                ordinals,
             }
         })
         .collect()

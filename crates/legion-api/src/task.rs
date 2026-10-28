@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::admit::{Invalid, Spec};
-use crate::service::PodSpec;
+use crate::service::{PodSpec, PodVolume, claim_volume};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -17,9 +17,14 @@ pub struct TaskSpec {
     /// The owner is a Job: the task is no endpoint of a Service.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub job: bool,
-    /// Replica number of a replicated service, from 1.
+    /// Replica number of a replicated service, from 1, or ordinal of a
+    /// stateful one, from 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot: Option<u32>,
+    /// The owner is a stateful service: the task is `<service>-<slot>` to
+    /// its pod and DNS, and its claims mount Volumes of its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stateful: bool,
     /// The node it runs on; empty until scheduled. Fixed at creation for
     /// global services.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -27,6 +32,40 @@ pub struct TaskSpec {
     #[serde(default)]
     pub desired_state: DesiredState,
     pub pod: PodSpec,
+}
+
+impl TaskSpec {
+    /// The name of the Volume object a pod volume mounts, if any.
+    pub fn volume_name(&self, v: &PodVolume) -> Option<String> {
+        if let Some(src) = &v.volume {
+            return Some(src.name.clone());
+        }
+        v.claim.as_ref()?;
+        Some(claim_volume(&v.name, &self.service, self.ordinal()?))
+    }
+
+    /// The Volume objects the task mounts.
+    pub fn volumes(&self) -> Vec<String> {
+        self.pod
+            .volumes
+            .iter()
+            .filter_map(|v| self.volume_name(v))
+            .collect()
+    }
+
+    pub fn uses_volume(&self, name: &str) -> bool {
+        self.volumes().iter().any(|v| v == name)
+    }
+
+    /// A stateful task's ordinal.
+    pub fn ordinal(&self) -> Option<u32> {
+        self.slot.filter(|_| self.stateful)
+    }
+
+    /// The pod's hostname, `<service>-<ordinal>` for a stateful task.
+    pub fn hostname(&self) -> Option<String> {
+        Some(format!("{}-{}", self.service, self.ordinal()?))
+    }
 }
 
 impl Spec for TaskSpec {

@@ -15,9 +15,10 @@ use legion_api::service::FailureAction;
 use legion_api::service::{
     Constraint, EndpointMode, NodeAttribute, PUBLISHED_PORTS, Publish, PublishedPort,
     RestartCondition, SERVICE_NET, SERVICE_PREFIX, ServiceMode, ServiceSpec, ServiceStatus,
-    TaintEffect, UpdateOrder, UpdateState, UpdateStatus,
+    TaintEffect, UpdateOrder, UpdateState, UpdateStatus, claim_volume,
 };
 use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
+use legion_api::volume::{VolumeSpec, VolumeStatus};
 use legion_api::{Kind, Object, ObjectKey};
 use tokio::time::Instant;
 
@@ -68,8 +69,23 @@ pub struct Node {
     pub status: NodeStatus,
 }
 
-/// The node each claimed Volume lives on, by namespace and name.
-pub type Homes = BTreeMap<(String, String), String>;
+#[derive(Debug, Clone)]
+pub struct Volume {
+    pub object: Object,
+    pub spec: VolumeSpec,
+    pub status: VolumeStatus,
+}
+
+/// Every Volume, by namespace and name.
+pub type Volumes = BTreeMap<(String, String), Volume>;
+
+/// The node holding a Volume's data, once a task has used it.
+fn home<'a>(volumes: &'a Volumes, namespace: &str, name: &str) -> Option<&'a str> {
+    volumes
+        .get(&(namespace.to_owned(), name.to_owned()))
+        .map(|v| v.status.node.as_str())
+        .filter(|n| !n.is_empty())
+}
 
 /// Namespace quotas, by namespace.
 pub type Quotas = BTreeMap<String, Quota>;
@@ -170,7 +186,7 @@ pub fn plan(
     jobs: &Jobs,
     tasks: &[Task],
     nodes: &[Node],
-    homes: &Homes,
+    volumes: &Volumes,
     quotas: &Quotas,
     memory: &mut Memory,
     now: Instant,
@@ -207,7 +223,7 @@ pub fn plan(
             s,
             &mine,
             nodes,
-            homes,
+            volumes,
             memory,
             now,
             addrs,
@@ -225,7 +241,7 @@ pub fn plan(
             owner,
             &mine,
             nodes,
-            homes,
+            volumes,
             memory,
             now,
             jobs.wall,
@@ -248,7 +264,7 @@ pub fn plan(
         }
     }
 
-    schedule(&owners, tasks, created, nodes, homes, quotas, &mut plan);
+    schedule(&owners, tasks, created, nodes, volumes, quotas, &mut plan);
 
     // An orphaned task is written once per pass; what else was planned for
     // it waits for the next one.
@@ -441,7 +457,7 @@ fn service(
     s: &Service,
     tasks: &[&Task],
     nodes: &[Node],
-    homes: &Homes,
+    volumes: &Volumes,
     memory: &Memory,
     now: Instant,
     addrs: Addresses,
@@ -468,22 +484,37 @@ fn service(
     let wanted: Vec<Slot> = match s.spec.mode {
         ServiceMode::Global => nodes
             .iter()
-            .filter(|n| eligible(n, s, homes).is_ok())
+            .filter(|n| eligible(n, s, volumes, &shared_volumes(s)).is_ok())
             .map(|n| Slot::Node(n.object.metadata.name.clone()))
             .collect(),
-        _ => (1..=s.spec.replicas.unwrap_or(1))
+        ServiceMode::Replicated => (1..=s.spec.replicas.unwrap_or(1))
+            .map(Slot::Replica)
+            .collect(),
+        ServiceMode::Stateful => (0..s.spec.replicas.unwrap_or(1))
             .map(Slot::Replica)
             .collect(),
     };
     let wanted_set: BTreeSet<&Slot> = wanted.iter().collect();
+    let stateful = s.spec.mode == ServiceMode::Stateful;
+    if stateful {
+        claims(s, &wanted, volumes, plan);
+    }
 
     // Slots no longer wanted: stop what runs there and drop the history. A
     // paused node keeps its global task; a drained or vanished one does
-    // not, nor one whose taints evict it.
-    for (slot, list) in &by_slot {
-        if wanted_set.contains(slot) {
-            continue;
-        }
+    // not, nor one whose taints evict it. A stateful service stops its
+    // highest ordinal first, one at a time.
+    let mut unwanted: Vec<(&Slot, &Vec<&Task>)> = by_slot
+        .iter()
+        .filter(|(slot, _)| !wanted_set.contains(slot))
+        .collect();
+    if stateful {
+        unwanted.reverse();
+    }
+    let mut one_stopping = unwanted
+        .iter()
+        .any(|(_, list)| list.iter().any(|t| t.stopping()));
+    for (slot, list) in unwanted {
         let paused = matches!(slot, Slot::Node(name) if nodes.iter().any(|n| {
             n.name() == name
                 && n.spec.availability == Availability::Pause
@@ -491,6 +522,12 @@ fn service(
         }));
         for t in list {
             if t.active() && !paused {
+                if stateful {
+                    if one_stopping {
+                        continue;
+                    }
+                    one_stopping = true;
+                }
                 plan.actions.push(stop(t));
             } else if t.status.state.is_terminal() {
                 plan.actions.push(delete(t));
@@ -575,8 +612,22 @@ fn service(
         parallelism.saturating_sub(in_flight)
     };
 
+    // A stateful service starts a task only once every lower ordinal has a
+    // ready one, and updates from its highest ordinal down.
+    let ready_below = |slot: &Slot| {
+        !stateful
+            || wanted
+                .iter()
+                .take_while(|w| *w != slot)
+                .all(|w| by_slot.get(w).is_some_and(|l| l.iter().any(|t| up(t))))
+    };
+    let mut order: Vec<&Slot> = wanted.iter().collect();
+    if stateful {
+        order.reverse();
+    }
+
     let policy = &s.spec.pod.restart_policy;
-    for slot in &wanted {
+    for slot in order {
         let list: &[&Task] = by_slot.get(slot).map_or(&[], Vec::as_slice);
         let (moving, staying): (Vec<&Task>, Vec<&Task>) = list
             .iter()
@@ -613,12 +664,13 @@ fn service(
         } else if !moving.is_empty() {
             // Off a draining node: stopped first if the budget allows,
             // else replaced first, as a failed replacement is, after its
-            // backoff.
+            // backoff. A stateful task's replacement needs its volumes, so
+            // it waits for the budget.
             if !start_first && may_stop(&moving) {
                 for old in &moving {
                     plan.actions.push(stop(old));
                 }
-            } else {
+            } else if !stateful {
                 let failures = list.iter().rev().take_while(|t| t.failed()).count();
                 let due = list.last().map_or(now, |last| {
                     backoff(last, failures, policy.delay.as_std(), memory, now)
@@ -636,7 +688,7 @@ fn service(
                     for old in &outdated {
                         plan.actions.push(stop(old));
                     }
-                } else {
+                } else if !stateful {
                     created.push(new_task(s, slot, list, &previous.last_tasks));
                 }
             }
@@ -653,7 +705,7 @@ fn service(
                     _ => last.failed() && policy.condition != RestartCondition::None,
                 },
             };
-            if replace {
+            if replace && ready_below(slot) {
                 let failures = list.iter().rev().take_while(|t| t.failed()).count();
                 let due = list.last().map_or(now, |last| {
                     backoff(last, failures, policy.delay.as_std(), memory, now)
@@ -754,6 +806,57 @@ fn service(
         o.status = status;
         plan.actions
             .push(Action::Update(o, s.object.metadata.version));
+    }
+}
+
+/// The Volumes a stateful service's claims ask for, one per claim and
+/// wanted ordinal: made when missing, and resized with the claim. They stay
+/// when the service shrinks or goes, as the data in them may be wanted
+/// again.
+fn claims(s: &Service, wanted: &[Slot], volumes: &Volumes, plan: &mut Plan) {
+    let (namespace, svc) = s.key();
+    for slot in wanted {
+        let Slot::Replica(n) = slot else { continue };
+        for (claim, src) in s.spec.pod.claims() {
+            let name = claim_volume(claim, svc, *n);
+            match volumes.get(&(namespace.to_owned(), name.clone())) {
+                None => {
+                    let spec = VolumeSpec {
+                        size: src.size,
+                        ..Default::default()
+                    };
+                    let mut o = Object::new(
+                        Kind::Volume,
+                        namespace,
+                        &name,
+                        serde_json::to_value(&spec).expect("serialises"),
+                    );
+                    o.metadata
+                        .labels
+                        .insert(LABEL_SERVICE.to_owned(), svc.to_owned());
+                    plan.actions.push(Action::Create(o));
+                }
+                Some(v)
+                    if v.spec.size != src.size
+                        && v.object
+                            .metadata
+                            .labels
+                            .get(LABEL_SERVICE)
+                            .map(String::as_str)
+                            == Some(svc) =>
+                {
+                    let mut o = v.object.clone();
+                    o.spec = serde_json::to_value(VolumeSpec {
+                        size: src.size,
+                        ..v.spec.clone()
+                    })
+                    .expect("serialises");
+                    plan.actions
+                        .push(Action::Update(o, v.object.metadata.version));
+                }
+                Some(_) => {}
+            }
+        }
     }
 }
 
@@ -898,6 +1001,7 @@ fn new_task(s: &Service, slot: &Slot, history: &[&Task], last: &BTreeMap<String,
         service_generation: s.object.metadata.generation,
         job: false,
         slot: replica,
+        stateful: s.spec.mode == ServiceMode::Stateful,
         node,
         desired_state: DesiredState::Running,
         pod: s.spec.pod.clone(),
@@ -929,9 +1033,24 @@ fn delete(t: &Task) -> Action {
     Action::Delete(t.object.key(), t.object.metadata.version)
 }
 
-/// Whether `n` may run tasks of `s` at all; requests are checked when
-/// placing.
-fn eligible(n: &Node, s: &Service, homes: &Homes) -> Result<(), &'static str> {
+/// The Volume objects a pod mounts that are not a stateful task's own.
+pub(super) fn shared_volumes(s: &Service) -> Vec<String> {
+    s.spec
+        .pod
+        .volumes
+        .iter()
+        .filter_map(|v| Some(v.volume.as_ref()?.name.clone()))
+        .collect()
+}
+
+/// Whether `n` may run tasks of `s` that mount the Volumes `mounts` at
+/// all; requests are checked when placing.
+fn eligible(
+    n: &Node,
+    s: &Service,
+    volumes: &Volumes,
+    mounts: &[String],
+) -> Result<(), &'static str> {
     if n.status.state != NodeState::Ready {
         return Err("not ready");
     }
@@ -942,13 +1061,9 @@ fn eligible(n: &Node, s: &Service, homes: &Homes) -> Result<(), &'static str> {
         return Err("taints");
     }
     let namespace = &s.object.metadata.namespace;
-    let elsewhere = s
-        .spec
-        .pod
-        .volumes
+    let elsewhere = mounts
         .iter()
-        .filter_map(|v| v.volume.as_ref())
-        .filter_map(|v| homes.get(&(namespace.clone(), v.name.clone())))
+        .filter_map(|v| home(volumes, namespace, v))
         .any(|home| home != n.name());
     if elsewhere {
         return Err("volume on another node");
@@ -1015,7 +1130,7 @@ fn schedule(
     tasks: &[Task],
     created: Vec<Task>,
     nodes: &[Node],
-    homes: &Homes,
+    volumes: &Volumes,
     quotas: &Quotas,
     plan: &mut Plan,
 ) {
@@ -1073,7 +1188,7 @@ fn schedule(
             if !t.spec.node.is_empty() && t.spec.node != name {
                 continue;
             }
-            if let Err(why) = eligible(n, s, homes) {
+            if let Err(why) = eligible(n, s, volumes, &t.spec.volumes()) {
                 *reasons.entry(why).or_default() += 1;
                 continue;
             }

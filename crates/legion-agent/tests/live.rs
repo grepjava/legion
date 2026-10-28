@@ -184,15 +184,17 @@ async fn agent_runs_a_real_pod() {
     let mut volume_mounts = vec![serde_json::json!({ "name": "scratch", "path": "/scratch" })];
     pod["volumes"] = serde_json::json!([{ "name": "scratch", "tmpfs": { "size": "16Mi" } }]);
     if zfs_root.is_some() {
+        // The task is stateful: its claim mounts its own Volume, which the
+        // controller would have made.
         volume_mounts.push(serde_json::json!({ "name": "data", "path": "/data" }));
         pod["volumes"]
             .as_array_mut()
             .unwrap()
-            .push(serde_json::json!({ "name": "data", "volume": { "name": "data" } }));
+            .push(serde_json::json!({ "name": "data", "claim": { "size": "64Mi" } }));
         let v = Object::new(
             Kind::Volume,
             "lab",
-            "data",
+            "data-web-1",
             serde_json::json!({ "size": "64Mi" }),
         );
         put(&store, v, Precondition::MustNotExist).await;
@@ -208,7 +210,7 @@ async fn agent_runs_a_real_pod() {
     }]);
     let mut spec: TaskSpec = legion_api::parse(&serde_json::json!({
         "service": "web", "serviceUid": "1", "serviceGeneration": 1, "slot": 1,
-        "node": "lab", "pod": pod,
+        "stateful": true, "node": "lab", "pod": pod,
     }))
     .unwrap();
     spec.admit().unwrap();
@@ -278,10 +280,9 @@ async fn agent_runs_a_real_pod() {
     let rules = sh(&format!("rctl jail:{child}"));
     assert!(rules.contains("memoryuse:sigkill=268435456"), "{rules}");
     assert!(rules.contains("maxproc:deny=32"), "{rules}");
-    // The agent's metrics read each container's usage from rctl.
-    let text = metrics.collect().await.finish();
-    assert!(text.contains("\nlegion_agent_usage_unread 0\n"), "{text}");
-    let usage = |name: &str, container: &str| -> f64 {
+    // The agent's metrics read each container's usage from rctl, which
+    // can show no memory yet for a container just started.
+    let usage = |text: &str, name: &str, container: &str| -> f64 {
         let series =
             format!("{name}{{namespace=\"lab\",task=\"web-1\",container=\"{container}\"}} ");
         text.lines()
@@ -290,9 +291,20 @@ async fn agent_runs_a_real_pod() {
             .parse()
             .unwrap()
     };
+    let mut text = String::new();
+    eventually("memory in use", 10, async || {
+        text = metrics.collect().await.finish();
+        ["app", "pinger"]
+            .iter()
+            .all(|c| usage(&text, "legion_container_memory_bytes", c) > 0.0)
+    })
+    .await;
+    assert!(text.contains("\nlegion_agent_usage_unread 0\n"), "{text}");
     for c in ["app", "pinger"] {
-        assert!(usage("legion_container_memory_bytes", c) > 0.0, "{text}");
-        assert!(usage("legion_container_processes", c) >= 1.0, "{text}");
+        assert!(
+            usage(&text, "legion_container_processes", c) >= 1.0,
+            "{text}"
+        );
     }
     // The jails are locked down (DESIGN.md §9): Legion's hook set the
     // profile before the containers' processes started. Only the container
@@ -413,7 +425,7 @@ async fn agent_runs_a_real_pod() {
         "tmpfs volume"
     );
     let data_dir = zfs_root.as_ref().map(|root| {
-        let ds = format!("{root}/volumes/lab/data");
+        let ds = format!("{root}/volumes/lab/data-web-1");
         let list = sh(&format!("zfs get -H -p -o value quota,mountpoint {ds}"));
         let mut it = list.lines();
         assert_eq!(it.next(), Some("67108864"), "quota of {ds}: {list}");
@@ -422,6 +434,11 @@ async fn agent_runs_a_real_pod() {
     if data_dir.is_some() {
         let out = sh_in("echo kept > /data/f && echo ok").await;
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n", "zfs volume");
+    }
+    // A stateful task's pod is named for its ordinal, in every jail.
+    for jail in [infra.id.as_str(), child.as_str()] {
+        let name = sh(&format!("jls -j {jail} host.hostname"));
+        assert_eq!(name.trim(), "web-1", "hostname of jail {jail}");
     }
     sh_in(": > /tmp/ready").await;
     eventually("ready", 15, async || status(&store, &key).ready).await;

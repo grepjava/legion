@@ -94,6 +94,12 @@ impl JobSpec {
         }
         let pod = field(path, "pod");
         self.pod.admit(&pod)?;
+        if let Some((name, _)) = self.pod.claims().next() {
+            return Err(Invalid::new(
+                field(&pod, "volumes"),
+                format!("volume {name:?}: only a stateful service's tasks claim volumes"),
+            ));
+        }
         if self.pod.restart_policy.condition == RestartCondition::Any {
             return Err(Invalid::new(
                 field(&field(&pod, "restartPolicy"), "condition"),

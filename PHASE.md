@@ -528,6 +528,41 @@ moment between its start and the agent's next pass (the guard could go in
 before its containers start); lab runs on weft-bsd leave the bridge
 sysctls at 1; API request counts and latencies in the metrics.
 
+## Phase 4 — Stateful and operations
+
+Exit criterion (DESIGN.md §11): Postgres with replicas runs as a stateful
+service and migrates between nodes.
+
+### Done
+
+- **Stateful services** (`mode: stateful`, DESIGN.md §3.3): tasks have
+  ordinals from 0 and are `<svc>-<n>` to their pod (its hostname) and to
+  DNS (`<svc>-<n>.<svc>.<ns>.legion`, the ordinal's ready task). A pod
+  volume `claim: { size }` mounts a Volume of the task's own,
+  `<claim>-<svc>-<n>`, which the controller makes for each wanted ordinal,
+  resizes with the claim, and keeps when the service shrinks or is deleted;
+  the first task to use it binds it to its node, as any Volume. Ordinal `n`
+  starts only once every lower ordinal has a ready task; the service
+  shrinks from the top one task at a time and updates from the highest
+  ordinal down, stopping each task before its replacement starts
+  (`start-first` is refused). Quotas count the Volumes claims will make,
+  made or not, once. Claims are refused outside stateful services, and
+  names that would pass 63 characters at admission. Tested: the planner
+  (ordered start, a failing ordinal holding back the others, shrinking,
+  growing back onto the kept Volumes, resizing, update order, one task
+  per slot throughout, replacements going where their Volume is),
+  admission, quotas through the API, DNS names, and the agent mounting a
+  task's own Volume with its hostname set.
+
+### To do, in order
+
+1. Migration: move a stateful task's Volume to another node with a full
+   then incremental `zfs send/recv` when its node drains, or on request.
+2. Snapshots before updates, and restoring them on rollback.
+3. Exit test: Postgres with replicas, migrated between nodes.
+4. Ingress routes, autoscaling, CARP VIP, autolock, store backup and
+   restore.
+
 ## Later phases
 
-See DESIGN.md §11: 4 Stateful and operations, 5 Extensions.
+See DESIGN.md §11: 5 Extensions.
