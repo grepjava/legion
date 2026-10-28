@@ -660,9 +660,20 @@ service and migrates between nodes.
   `node`), through a manager and two agents with fake ZFS (the data
   arriving, the old copy dropped), and the CLI.
 
+- **CARP VIP** (`legion-manager::vip`, `legion daemon --vip`, DESIGN.md
+  §4.3): managers on one link share a floating address for the API, a
+  CARP virtual host the leader takes (skew 0, forced master) and
+  followers stand by for (skew 100, keeping it only until a better
+  advertiser takes it). Released on shutdown. `Sys` gained `carp_set`,
+  `carp_state` and `carp_remove`. Tested: the forms against FreeBSD
+  15.1's output, the loop with the fake, and with real CARP on weft-bsd
+  (`crates/legion/tests/vip.rs`): three managers in VNET jails on a
+  bridge, the leader holding the address alone and the API answering on
+  it; a clean stop and a SIGKILL each moving it to the next leader.
+
 ### To do, in order
 
-1. Ingress routes, CARP VIP, autolock.
+1. Ingress routes, autolock (with encryption at rest, not built yet).
 
 Smaller follow-ups: memory limits for workloads with large shared memory
 (rctl counts it per process; `vmemoryuse` or a pod-wide allowance).

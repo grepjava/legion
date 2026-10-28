@@ -14,7 +14,8 @@ use std::net::Ipv4Addr;
 use std::sync::{Mutex, MutexGuard};
 
 use crate::{
-    Dataset, Destination, Epair, Error, IfConfig, Jail, PfState, RctlRule, Result, Sys, WgPeer,
+    Carp, CarpState, Dataset, Destination, Epair, Error, IfConfig, Jail, PfState, RctlRule, Result,
+    Sys, WgPeer,
 };
 
 #[derive(Debug, Default)]
@@ -64,6 +65,8 @@ struct State {
     sysctls: BTreeMap<String, String>,
     main_rules: String,
     states: Vec<PfState>,
+    /// CARP virtual hosts by interface and vhid, with their state.
+    carp: BTreeMap<(String, u8), (Carp, CarpState)>,
     /// Commands that fail once, the next time they run.
     failing: BTreeSet<String>,
 }
@@ -155,6 +158,22 @@ impl FakeSys {
                 i.jail = None;
                 i.config = IfConfig::default();
             }
+        }
+    }
+
+    /// The CARP virtual host `vhid` on `interface`, with its state.
+    pub fn carp(&self, interface: &str, vhid: u8) -> Option<(Carp, CarpState)> {
+        self.state()
+            .carp
+            .get(&(interface.to_owned(), vhid))
+            .cloned()
+    }
+
+    /// Changes a virtual host's state, as CARP advertisements on the link
+    /// would.
+    pub fn set_carp_state(&self, interface: &str, vhid: u8, state: CarpState) {
+        if let Some(c) = self.state().carp.get_mut(&(interface.to_owned(), vhid)) {
+            c.1 = state;
         }
     }
 
@@ -530,6 +549,31 @@ impl Sys for FakeSys {
             .entry(jail.map(str::to_owned))
             .or_default()
             .insert(dest, interface.to_owned());
+        Ok(())
+    }
+
+    fn carp_set(&self, interface: &str, carp: &Carp, state: Option<CarpState>) -> Result<()> {
+        let mut s = self.state();
+        s.modules.insert("carp".into());
+        let entry = s
+            .carp
+            .entry((interface.to_owned(), carp.vhid))
+            .or_insert_with(|| (carp.clone(), CarpState::Backup));
+        entry.0.advskew = carp.advskew;
+        if let Some(state) = state.filter(|s| *s != CarpState::Init) {
+            entry.1 = state;
+        }
+        Ok(())
+    }
+
+    fn carp_state(&self, interface: &str, vhid: u8) -> Result<Option<CarpState>> {
+        Ok(self.carp(interface, vhid).map(|(_, state)| state))
+    }
+
+    fn carp_remove(&self, interface: &str, addr: Ipv4Addr) -> Result<()> {
+        self.state()
+            .carp
+            .retain(|(i, _), (c, _)| !(i == interface && c.addr == addr));
         Ok(())
     }
 

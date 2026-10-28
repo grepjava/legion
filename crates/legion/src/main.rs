@@ -75,6 +75,20 @@ enum Command {
         /// tasks show there.
         #[arg(long)]
         metrics_listen: Option<SocketAddr>,
+        /// Managers: a floating address for the API, held by one manager at
+        /// a time (the leader when it can) with CARP on --vip-interface.
+        /// Every manager on the link sets the same address, vhid and
+        /// password; listen on 0.0.0.0 so the API answers on it.
+        #[arg(long, requires_all = ["vip_interface", "vip_password_file"])]
+        vip: Option<std::net::Ipv4Addr>,
+        #[arg(long)]
+        vip_interface: Option<String>,
+        /// The CARP virtual host id, 1 to 255.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..))]
+        vip_vhid: u8,
+        /// A file holding the CARP password.
+        #[arg(long)]
+        vip_password_file: Option<PathBuf>,
     },
     /// Start a new cluster with the reached manager as its first member.
     Init,
@@ -333,7 +347,26 @@ async fn main() -> anyhow::Result<()> {
             zfs_root,
             managers,
             metrics_listen,
+            vip,
+            vip_interface,
+            vip_vhid,
+            vip_password_file,
         } => {
+            let vip = match (vip, vip_interface, vip_password_file) {
+                (Some(addr), Some(interface), Some(file)) => {
+                    let password = std::fs::read_to_string(&file)
+                        .map_err(|e| anyhow::anyhow!("reading {}: {e}", file.display()))?
+                        .trim()
+                        .to_owned();
+                    Some(legion_manager::vip::VipConfig {
+                        interface,
+                        vhid: vip_vhid,
+                        addr,
+                        password,
+                    })
+                }
+                _ => None,
+            };
             daemon::run(daemon::Options {
                 data_dir,
                 run_dir,
@@ -345,6 +378,7 @@ async fn main() -> anyhow::Result<()> {
                 zfs_root,
                 managers,
                 metrics_listen,
+                vip,
             })
             .await
         }

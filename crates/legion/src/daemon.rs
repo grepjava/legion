@@ -27,6 +27,8 @@ pub struct Options {
     pub managers: Vec<String>,
     /// Where to serve Prometheus metrics, if anywhere.
     pub metrics_listen: Option<SocketAddr>,
+    /// Managers: the floating address.
+    pub vip: Option<legion_manager::vip::VipConfig>,
 }
 
 pub async fn run(opts: Options) -> anyhow::Result<()> {
@@ -58,8 +60,17 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     // The agent calls this manager as the node.
     let control = GrpcControl::new(&node, vec![advertise.clone()], Some(tls.client()))
         .map_err(|e| anyhow::anyhow!(e))?;
+    let vip = match &opts.vip {
+        Some(_) if !cfg!(target_os = "freebsd") => bail!("--vip needs CARP: FreeBSD only"),
+        Some(v) => {
+            let sys: Arc<dyn legion_sys::Sys> = Arc::new(legion_sys::Shell::new());
+            Some((sys, v.clone()))
+        }
+        None => None,
+    };
     let manager = legion_manager::Manager::open(legion_manager::ManagerConfig {
         tls: Some(tls),
+        vip,
         ..legion_manager::ManagerConfig::new(&opts.data_dir, &advertise)
     })
     .await
@@ -120,6 +131,9 @@ async fn run_worker(opts: &Options, pki: &crate::pki::Pki, hostname: String) -> 
     }
     if !(opts.agent && cfg!(target_os = "freebsd")) {
         bail!("a worker runs tasks only: it needs the agent, on FreeBSD");
+    }
+    if opts.vip.is_some() {
+        bail!("--vip is the managers' address; this node is a worker");
     }
     let managers = if opts.managers.is_empty() {
         crate::pki::read_managers(&opts.data_dir)?

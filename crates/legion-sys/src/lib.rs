@@ -81,6 +81,18 @@ pub trait Sys: Send + Sync {
         interface: &str,
     ) -> Result<()>;
 
+    // CARP (host only).
+
+    /// Puts `carp.addr` on `interface` as CARP virtual host `carp.vhid`
+    /// (loading `carp`), or, when it is there, sets its skew; `state`
+    /// forces the virtual host master or backup.
+    fn carp_set(&self, interface: &str, carp: &Carp, state: Option<CarpState>) -> Result<()>;
+    /// The state of virtual host `vhid` on `interface`; `None` if absent.
+    fn carp_state(&self, interface: &str, vhid: u8) -> Result<Option<CarpState>>;
+    /// Removes the address, and with it the virtual host; one not there
+    /// is fine.
+    fn carp_remove(&self, interface: &str, addr: Ipv4Addr) -> Result<()>;
+
     // WireGuard (host only). Keys are base64, as `wg` prints them.
 
     /// A new private key.
@@ -218,6 +230,34 @@ pub struct Epair {
     pub a: String,
     /// Goes into the pod's jail.
     pub b: String,
+}
+
+/// A CARP virtual host: an address that one of the hosts sharing `vhid`
+/// and `password` on a link holds at a time, the one advertising with the
+/// lowest `advskew` when they disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Carp {
+    pub vhid: u8,
+    pub addr: Ipv4Addr,
+    pub password: String,
+    pub advskew: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarpState {
+    Init,
+    Backup,
+    Master,
+}
+
+impl CarpState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CarpState::Init => "init",
+            CarpState::Backup => "backup",
+            CarpState::Master => "master",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

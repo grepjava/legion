@@ -9,8 +9,8 @@ use std::process::{Command, Stdio};
 use serde::Deserialize;
 
 use crate::{
-    Dataset, Destination, Epair, Error, IfConfig, Ipv4Net, Jail, PfState, RctlRule, Result, Sys,
-    WgPeer,
+    Carp, CarpState, Dataset, Destination, Epair, Error, IfConfig, Ipv4Net, Jail, PfState,
+    RctlRule, Result, Sys, WgPeer,
 };
 
 /// Runs one program to completion.
@@ -187,6 +187,35 @@ fn args<const N: usize>(a: [&str; N]) -> Vec<String> {
     a.iter().map(|s| (*s).to_owned()).collect()
 }
 
+/// The vhid of `addr` in `ifconfig <interface>` output, if the interface
+/// has the address as a CARP address.
+fn carp_addr(shown: &str, addr: Ipv4Addr) -> Option<u8> {
+    let addr = addr.to_string();
+    shown.lines().find_map(|line| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if words.first() != Some(&"inet") || words.get(1) != Some(&addr.as_str()) {
+            return None;
+        }
+        let at = words.iter().position(|w| *w == "vhid")?;
+        words.get(at + 1)?.parse().ok()
+    })
+}
+
+/// The state in a `carp: MASTER vhid 7 advbase 1 advskew 0` line.
+fn parse_carp_state(shown: &str, vhid: u8) -> Option<CarpState> {
+    shown.lines().find_map(|line| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if words.first() != Some(&"carp:") || words.get(3) != Some(&vhid.to_string().as_str()) {
+            return None;
+        }
+        match *words.get(1)? {
+            "MASTER" => Some(CarpState::Master),
+            "BACKUP" => Some(CarpState::Backup),
+            _ => Some(CarpState::Init),
+        }
+    })
+}
+
 /// `ifconfig -j <jail>` / `route -j <jail>` prefix.
 fn in_jail(jail: Option<&str>) -> Vec<String> {
     match jail {
@@ -338,6 +367,42 @@ impl<R: Runner> Sys for Shell<R> {
         if config.up {
             a.push("up".into());
         }
+        self.run("ifconfig", &a).map(drop)
+    }
+
+    fn carp_set(&self, interface: &str, carp: &Carp, state: Option<CarpState>) -> Result<()> {
+        let shown = self.run("ifconfig", &args([interface]))?;
+        let mut a = args([interface, "vhid"]);
+        a.extend([
+            carp.vhid.to_string(),
+            "advskew".into(),
+            carp.advskew.to_string(),
+        ]);
+        if carp_addr(&shown, carp.addr).is_none() {
+            // In a jail even `kldload -n` of a loaded module is refused.
+            if self.run("kldstat", &args(["-q", "-m", "carp"])).is_err() {
+                self.kld_load("carp")?;
+            }
+            a.extend(["pass".into(), carp.password.clone(), "alias".into()]);
+            a.push(format!("{}/32", carp.addr));
+        }
+        if let Some(state) = state.filter(|s| *s != CarpState::Init) {
+            a.extend(["state".into(), state.as_str().into()]);
+        }
+        self.run("ifconfig", &a).map(drop)
+    }
+
+    fn carp_state(&self, interface: &str, vhid: u8) -> Result<Option<CarpState>> {
+        let shown = self.run("ifconfig", &args([interface]))?;
+        Ok(parse_carp_state(&shown, vhid))
+    }
+
+    fn carp_remove(&self, interface: &str, addr: Ipv4Addr) -> Result<()> {
+        let shown = self.run("ifconfig", &args([interface]))?;
+        if carp_addr(&shown, addr).is_none() {
+            return Ok(());
+        }
+        let a = args([interface, "inet", &addr.to_string(), "-alias"]);
         self.run("ifconfig", &a).map(drop)
     }
 
@@ -907,6 +972,61 @@ mod tests {
                 assert!(left.is_empty(), "commands not run: {left:?}");
             }
         }
+    }
+
+    /// `ifconfig epair0a` on FreeBSD 15.1 with a CARP address.
+    const CARP_SHOWN: &str = "epair0a: flags=1008943<UP,BROADCAST,RUNNING,PROMISC,SIMPLEX,MULTICAST,LOWER_UP> metric 0 mtu 1500
+	ether c2:c4:69:1c:c3:ed
+	inet 10.77.0.1 netmask 0xffffff00 broadcast 10.77.0.255
+	inet 10.77.0.100 netmask 0xffffffff broadcast 10.77.0.100 vhid 7
+	groups: epair
+	carp: BACKUP vhid 7 advbase 1 advskew 100
+	      peer 224.0.0.18 peer6 ff02::12
+	status: active
+";
+
+    #[test]
+    fn carp() {
+        let plain = "epair0a: flags=8843<UP> mtu 1500
+	inet 10.77.0.1 netmask 0xffffff00 broadcast 10.77.0.255
+";
+        let master = CARP_SHOWN.replace(
+            "BACKUP vhid 7 advbase 1 advskew 100",
+            "MASTER vhid 7 advbase 1 advskew 0",
+        );
+        let sh = Script::shell(vec![
+            ("ifconfig epair0a", ok(plain)),
+            ("kldstat -q -m carp", err("")),
+            ("kldload -n carp", ok("")),
+            (
+                "ifconfig epair0a vhid 7 advskew 100 pass s3cret alias 10.77.0.100/32",
+                ok(""),
+            ),
+            ("ifconfig epair0a", ok(CARP_SHOWN)),
+            ("ifconfig epair0a vhid 7 advskew 0 state master", ok("")),
+            ("ifconfig epair0a", ok(&master)),
+            ("ifconfig epair0a", ok(CARP_SHOWN)),
+            ("ifconfig epair0a", ok(CARP_SHOWN)),
+            ("ifconfig epair0a inet 10.77.0.100 -alias", ok("")),
+            ("ifconfig epair0a", ok(plain)),
+        ]);
+        let mut carp = Carp {
+            vhid: 7,
+            addr: Ipv4Addr::new(10, 77, 0, 100),
+            password: "s3cret".into(),
+            advskew: 100,
+        };
+        sh.carp_set("epair0a", &carp, None).unwrap();
+        carp.advskew = 0;
+        sh.carp_set("epair0a", &carp, Some(CarpState::Master))
+            .unwrap();
+        assert_eq!(
+            sh.carp_state("epair0a", 7).unwrap(),
+            Some(CarpState::Master)
+        );
+        assert_eq!(sh.carp_state("epair0a", 8).unwrap(), None);
+        sh.carp_remove("epair0a", carp.addr).unwrap();
+        sh.carp_remove("epair0a", carp.addr).unwrap();
     }
 
     #[test]

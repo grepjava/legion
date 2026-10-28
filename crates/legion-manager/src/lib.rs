@@ -20,6 +20,7 @@ mod security;
 mod session;
 mod tls;
 mod usage;
+pub mod vip;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -53,6 +54,8 @@ pub struct ManagerConfig {
     /// Whether to run the controllers while leading; off only in tests that
     /// write tasks themselves.
     pub controllers: bool,
+    /// The floating address managers share, and the system to set it with.
+    pub vip: Option<(std::sync::Arc<dyn legion_sys::Sys>, vip::VipConfig)>,
 }
 
 impl ManagerConfig {
@@ -66,6 +69,7 @@ impl ManagerConfig {
             tls: None,
             heartbeat: HEARTBEAT_PERIOD,
             controllers: true,
+            vip: None,
         }
     }
 }
@@ -109,6 +113,7 @@ pub struct Manager {
     tls: Option<Tls>,
     heartbeat: std::time::Duration,
     controllers: bool,
+    vip: Option<(std::sync::Arc<dyn legion_sys::Sys>, vip::VipConfig)>,
     /// The store as metrics read it, emptied before the store shuts down.
     metrics: metrics::Slot,
 }
@@ -128,6 +133,7 @@ impl Manager {
             tls: config.tls,
             heartbeat: config.heartbeat,
             controllers: config.controllers,
+            vip: config.vip,
             metrics: std::sync::Arc::new(std::sync::RwLock::new(Some(store.clone()))),
             store,
         })
@@ -177,6 +183,15 @@ impl Manager {
             }),
             None => None,
         };
+        let vip = self.vip.clone().map(|(sys, config)| {
+            tokio::spawn(vip::run(
+                sys,
+                config,
+                self.store.raft.metrics(),
+                self.id,
+                closing.clone(),
+            ))
+        });
         let promote = tokio::spawn(join::promote_learners(
             self.store.raft.clone(),
             closing.clone(),
@@ -263,6 +278,10 @@ impl Manager {
         }
         if let Some(migrator) = migrator {
             let _ = migrator.await;
+        }
+        // Released as soon as `closing` turned, for another to take.
+        if let Some(vip) = vip {
+            let _ = vip.await;
         }
         let _ = promote.await;
         let _ = dispatching.await;
