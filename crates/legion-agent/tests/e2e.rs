@@ -347,3 +347,70 @@ async fn apply_to_running_pods() {
 
     c.stop().await;
 }
+
+const JOB: &str = r#"
+apiVersion: legion/v1
+kind: Job
+metadata: { name: backup, namespace: shop }
+spec:
+  completions: 2
+  pod:
+    containers: [{ name: dump, image: "tools:1" }]
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_job_runs_to_completion() {
+    let c = Cluster::start().await;
+    c.rt.add_image("tools:1");
+    c.apply(JOB).await;
+
+    // One at a time: the second starts when the first completes.
+    eventually("the first task", async || {
+        c.tasks().await == ["backup-1-1 running"]
+    })
+    .await;
+    c.rt.exit("shop_backup-1-1_dump", 0);
+    eventually("the second task", async || {
+        c.tasks().await == ["backup-1-1 complete", "backup-2-1 running"]
+    })
+    .await;
+    // A failure is retried as a new task; the Job still completes.
+    c.rt.exit("shop_backup-2-1_dump", 1);
+    eventually("the retry", async || {
+        c.tasks().await.contains(&"backup-2-2 running".to_owned())
+    })
+    .await;
+    c.rt.exit("shop_backup-2-2_dump", 0);
+    eventually("the job complete", async || {
+        let j = &c.list(Kind::Job).await[0];
+        j.status["state"] == "complete"
+    })
+    .await;
+    let j = &c.list(Kind::Job).await[0];
+    assert_eq!(
+        (
+            &j.status["succeeded"],
+            &j.status["failed"],
+            &j.status["active"]
+        ),
+        (&2.into(), &1.into(), &0.into())
+    );
+    eventually("pods gone", async || c.running().is_empty()).await;
+
+    // Deleting the Job removes its tasks.
+    c.api
+        .clone()
+        .delete(DeleteRequest {
+            r#ref: Some(ObjectRef {
+                kind: "Job".into(),
+                namespace: "shop".into(),
+                name: "backup".into(),
+            }),
+            expected_version: None,
+        })
+        .await
+        .unwrap();
+    eventually("tasks gone", async || c.tasks().await.is_empty()).await;
+
+    c.stop().await;
+}

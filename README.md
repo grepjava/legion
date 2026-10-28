@@ -95,8 +95,25 @@ spec:
   quota: { cpu: 4, memory: 8Gi, tasks: 20, volumes: 5, storage: 100Gi }
 ```
 
+Jobs run pods to completion, retrying failures; CronJobs make Jobs on a
+schedule (UTC):
+
+```yaml
+kind: CronJob
+metadata: { name: backup, namespace: shop }
+spec:
+  schedule: "30 2 * * *"
+  concurrencyPolicy: forbid
+  job:
+    completions: 1
+    backoffLimit: 3
+    activeDeadline: 1h
+    pod:
+      containers: [{ name: dump, image: "registry.example/shop/tools:1" }]
+```
+
 Into the tasks themselves, through any manager; a service name picks one
-of its running tasks:
+of its running tasks (a Job's name works too):
 
 ```sh
 legion logs web -n shop -f --tail 20

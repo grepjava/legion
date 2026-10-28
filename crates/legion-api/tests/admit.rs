@@ -218,6 +218,136 @@ fn empty_specs_get_defaults() {
 fn kinds_not_written_through_admission() {
     let mut task = Object::new(Kind::Task, "shop", "web-1", serde_json::json!({}));
     assert_eq!(admit(&mut task), Err(Error::Managed(Kind::Task)));
-    let mut job = Object::new(Kind::Job, "shop", "backup", serde_json::json!({}));
-    assert_eq!(admit(&mut job), Err(Error::Unsupported(Kind::Job)));
+    let mut route = Object::new(Kind::Route, "shop", "www", serde_json::json!({}));
+    assert_eq!(admit(&mut route), Err(Error::Unsupported(Kind::Route)));
+}
+
+fn job(spec: &str) -> String {
+    format!(
+        "apiVersion: legion/v1
+kind: Job
+metadata: {{ name: backup, namespace: shop }}
+spec:
+{spec}"
+    )
+}
+
+fn cron_job(name: &str, spec: &str) -> String {
+    format!(
+        "apiVersion: legion/v1
+kind: CronJob
+metadata: {{ name: {name}, namespace: shop }}
+spec:
+{spec}"
+    )
+}
+
+const POD: &str = "  pod: { containers: [{ name: dump, image: \"tools:1\" }] }
+";
+
+#[test]
+fn jobs() {
+    // Defaults written out; the pod restarts nothing in place.
+    let o = admitted(&job(POD));
+    assert_eq!(o.spec["mode"], "replicated");
+    assert_eq!(o.spec["completions"], 1);
+    assert_eq!(o.spec["parallelism"], 1);
+    assert_eq!(o.spec["backoffLimit"], 6);
+    assert_eq!(o.spec["pod"]["restartPolicy"]["condition"], "none");
+    let o = admitted(&job("  mode: global
+  activeDeadline: 10m
+  pod:
+    containers: [{ name: dump, image: \"tools:1\" }]
+    restartPolicy: { condition: on-failure, maxAttempts: 2 }
+"));
+    assert_eq!(o.spec["pod"]["restartPolicy"]["condition"], "on-failure");
+    assert_eq!(o.spec["activeDeadline"], "10m");
+    assert!(o.spec.get("completions").is_none());
+
+    for (spec, why) in [
+        (
+            "  pod:
+    containers: [{ name: dump, image: \"tools:1\" }]
+    restartPolicy: { condition: any }
+"
+            .to_owned(),
+            "spec.pod.restartPolicy.condition: a Job's pod runs to completion",
+        ),
+        (
+            format!(
+                "  completions: 0
+{POD}"
+            ),
+            "spec.completions: must be at least 1",
+        ),
+        (
+            format!(
+                "  mode: global
+  parallelism: 2
+{POD}"
+            ),
+            "spec.parallelism: a global job",
+        ),
+        (
+            format!(
+                "  activeDeadline: 0s
+{POD}"
+            ),
+            "spec.activeDeadline",
+        ),
+        (
+            "  pod: { containers: [] }
+"
+            .to_owned(),
+            "spec.pod.containers",
+        ),
+    ] {
+        let e = rejected(&job(&spec));
+        assert!(e.contains(why), "{e}");
+    }
+}
+
+#[test]
+fn cron_jobs() {
+    let o = admitted(&cron_job(
+        "nightly",
+        &format!(
+            "  schedule: \"30 2 * * *\"
+  job:
+  {POD}"
+        ),
+    ));
+    assert_eq!(o.spec["concurrencyPolicy"], "allow");
+    assert_eq!(o.spec["suspend"], false);
+    assert_eq!(o.spec["successfulJobsHistoryLimit"], 3);
+    assert_eq!(o.spec["failedJobsHistoryLimit"], 1);
+    assert_eq!(o.spec["job"]["completions"], 1);
+    assert_eq!(o.spec["job"]["pod"]["restartPolicy"]["condition"], "none");
+
+    let e = rejected(&cron_job(
+        "nightly",
+        &format!(
+            "  schedule: \"61 * * * *\"
+  job:
+  {POD}"
+        ),
+    ));
+    assert!(e.contains("spec.schedule: minute \"61\""), "{e}");
+    let e = rejected(&cron_job(
+        "nightly",
+        "  schedule: \"@daily\"
+  job: { pod: { containers: [{ name: a, image: i }], restartPolicy: { condition: any } } }
+",
+    ));
+    assert!(e.contains("spec.job.pod.restartPolicy.condition"), "{e}");
+    let long = "a".repeat(53);
+    let e = rejected(&cron_job(
+        &long,
+        &format!(
+            "  schedule: \"@daily\"
+  job:
+  {POD}"
+        ),
+    ));
+    assert!(e.contains("at most 52 characters"), "{e}");
 }

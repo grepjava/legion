@@ -633,7 +633,12 @@ async fn policing_loop(
                     interface: legion_net::host_interface(uid),
                     ip: a.status.ip.as_deref()?.parse().ok()?,
                     namespace: a.key.namespace.clone(),
-                    service: a.spec.service.clone(),
+                    // A Job's task has no Service's labels, even one of its name.
+                    service: if a.spec.job {
+                        String::new()
+                    } else {
+                        a.spec.service.clone()
+                    },
                 })
             })
             .collect();

@@ -21,6 +21,9 @@ use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
 use legion_api::{Kind, Object, ObjectKey};
 use tokio::time::Instant;
 
+mod jobs;
+pub use jobs::{CronJob, Job, Jobs};
+
 /// Terminal tasks kept per slot, as Swarm's task history limit.
 pub const HISTORY: usize = 5;
 /// Longest wait before replacing a failed task.
@@ -161,8 +164,10 @@ impl Slot {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn plan(
     services: &[Service],
+    jobs: &Jobs,
     tasks: &[Task],
     nodes: &[Node],
     homes: &Homes,
@@ -211,8 +216,31 @@ pub fn plan(
         );
     }
 
-    // Tasks whose service is gone: stop, then delete once stopped.
-    for t in tasks.iter().filter(|t| !services.iter().any(|s| s.owns(t))) {
+    // Jobs own tasks as services do; the scheduler sees them alike.
+    let job_owners: Vec<Service> = jobs.jobs.iter().map(Job::owner).collect();
+    for (j, owner) in jobs.jobs.iter().zip(&job_owners) {
+        let mine: Vec<&Task> = tasks.iter().filter(|t| owner.owns(t)).collect();
+        jobs::job(
+            j,
+            owner,
+            &mine,
+            nodes,
+            homes,
+            memory,
+            now,
+            jobs.wall,
+            &mut plan,
+            &mut created,
+        );
+    }
+    for c in &jobs.cron_jobs {
+        jobs::cron_job(c, &jobs.jobs, now, jobs.wall, &mut plan);
+    }
+    jobs::abandoned(jobs, &mut plan);
+    let owners: Vec<&Service> = services.iter().chain(&job_owners).collect();
+
+    // Tasks whose owner is gone: stop, then delete once stopped.
+    for t in tasks.iter().filter(|t| !owners.iter().any(|s| s.owns(t))) {
         if t.active() {
             plan.actions.push(stop(t));
         } else if t.status.state.is_terminal() {
@@ -220,7 +248,7 @@ pub fn plan(
         }
     }
 
-    schedule(services, tasks, created, nodes, homes, quotas, &mut plan);
+    schedule(&owners, tasks, created, nodes, homes, quotas, &mut plan);
 
     // An orphaned task is written once per pass; what else was planned for
     // it waits for the next one.
@@ -822,6 +850,7 @@ fn new_task(s: &Service, slot: &Slot, history: &[&Task], last: &BTreeMap<String,
         service: svc.clone(),
         service_uid: s.object.metadata.uid.clone(),
         service_generation: s.object.metadata.generation,
+        job: false,
         slot: replica,
         node,
         desired_state: DesiredState::Running,
@@ -936,7 +965,7 @@ type Score = (bool, u32, u64, u64);
 /// the agent, until placed there.
 #[allow(clippy::too_many_arguments)]
 fn schedule(
-    services: &[Service],
+    services: &[&Service],
     tasks: &[Task],
     created: Vec<Task>,
     nodes: &[Node],

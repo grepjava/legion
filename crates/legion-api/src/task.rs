@@ -9,11 +9,14 @@ use crate::service::PodSpec;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskSpec {
-    /// The owning service, in the task's namespace.
+    /// The owning Service, or Job if `job` is set, in the task's namespace.
     pub service: String,
     pub service_uid: String,
-    /// The service generation whose pod this task runs.
+    /// The owner's generation whose pod this task runs.
     pub service_generation: u64,
+    /// The owner is a Job: the task is no endpoint of a Service.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub job: bool,
     /// Replica number of a replicated service, from 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot: Option<u32>,

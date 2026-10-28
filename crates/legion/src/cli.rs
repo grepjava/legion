@@ -715,6 +715,68 @@ fn print_objects(objects: &[pb::Object], format: Format, kind: Kind) -> anyhow::
                     &rows,
                 );
             }
+            Kind::Job => {
+                let rows: Vec<[String; 7]> = objects
+                    .iter()
+                    .map(|o| {
+                        let done = count(&o.status, "succeeded");
+                        let completions = match o.spec["completions"].as_u64() {
+                            Some(n) => format!("{done}/{n}"),
+                            None => done.to_string(),
+                        };
+                        [
+                            o.metadata.namespace.clone(),
+                            o.metadata.name.clone(),
+                            field(&o.status, &["state"]),
+                            completions,
+                            count(&o.status, "active").to_string(),
+                            count(&o.status, "failed").to_string(),
+                            field(&o.status, &["message"]),
+                        ]
+                    })
+                    .collect();
+                print_table(
+                    [
+                        "NAMESPACE",
+                        "NAME",
+                        "STATE",
+                        "COMPLETIONS",
+                        "ACTIVE",
+                        "FAILED",
+                        "MESSAGE",
+                    ],
+                    &rows,
+                );
+            }
+            Kind::CronJob => {
+                let rows: Vec<[String; 7]> = objects
+                    .iter()
+                    .map(|o| {
+                        let suspended = o.spec["suspend"].as_bool() == Some(true);
+                        [
+                            o.metadata.namespace.clone(),
+                            o.metadata.name.clone(),
+                            field(&o.spec, &["schedule"]),
+                            if suspended { "suspended" } else { "" }.to_owned(),
+                            field(&o.status, &["lastSchedule"]),
+                            field(&o.status, &["lastJob"]),
+                            field(&o.status, &["message"]),
+                        ]
+                    })
+                    .collect();
+                print_table(
+                    [
+                        "NAMESPACE",
+                        "NAME",
+                        "SCHEDULE",
+                        "SUSPEND",
+                        "LAST SCHEDULE",
+                        "LAST JOB",
+                        "MESSAGE",
+                    ],
+                    &rows,
+                );
+            }
             Kind::Node => {
                 let rows: Vec<[String; 5]> = objects
                     .iter()

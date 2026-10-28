@@ -12,9 +12,12 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 pub mod admit;
+pub mod clock;
 pub mod compose;
+pub mod cron;
 pub mod data;
 pub mod dispatch;
+pub mod job;
 pub mod node;
 pub mod policy;
 pub mod quantity;

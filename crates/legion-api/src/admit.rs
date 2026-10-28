@@ -79,7 +79,23 @@ pub fn admit(obj: &mut Object) -> Result<(), Error> {
         Kind::Task => return Err(Error::Managed(obj.kind)),
         Kind::RoleBinding => normalise::<crate::rbac::RoleBindingSpec>(spec),
         Kind::NetworkPolicy => normalise::<crate::policy::NetworkPolicySpec>(spec),
-        Kind::Job | Kind::CronJob | Kind::Route => {
+        Kind::Job => normalise::<crate::job::JobSpec>(job_defaults(spec, &["pod"])),
+        Kind::CronJob => {
+            if obj.metadata.name.len() > crate::job::CRON_JOB_NAME_MAX {
+                return Err(Error::Spec {
+                    kind: obj.kind,
+                    invalid: Invalid::new(
+                        "",
+                        format!(
+                            "a CronJob's name is at most {} characters: its Jobs add the time                              of each run",
+                            crate::job::CRON_JOB_NAME_MAX
+                        ),
+                    ),
+                });
+            }
+            normalise::<crate::job::CronJobSpec>(job_defaults(spec, &["job", "pod"]))
+        }
+        Kind::Route => {
             return Err(Error::Unsupported(obj.kind));
         }
     };
@@ -88,6 +104,28 @@ pub fn admit(obj: &mut Object) -> Result<(), Error> {
         invalid,
     })?;
     Ok(())
+}
+
+/// A Job's pod restarts nothing in place unless asked: its restart
+/// condition defaults to `none` rather than a Service's `any`, which a Job
+/// may not have. `pod` is the path to the pod in `spec`.
+fn job_defaults(mut spec: serde_json::Value, pod: &[&str]) -> serde_json::Value {
+    let mut at = &mut spec;
+    for key in pod {
+        match at.get_mut(*key) {
+            Some(v) => at = v,
+            None => return spec,
+        }
+    }
+    if let Some(pod) = at.as_object_mut() {
+        let policy = pod
+            .entry("restartPolicy")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(policy) = policy.as_object_mut() {
+            policy.entry("condition").or_insert_with(|| "none".into());
+        }
+    }
+    spec
 }
 
 /// Parses `value` as `T`, as the stored spec of an object that passed

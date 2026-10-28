@@ -221,39 +221,49 @@ impl Pods for PodsService {
 }
 
 impl PodsService {
-    /// The task `open` names, or a running task of the service it names.
+    /// The task `open` names, or a running task of the Service, or else the
+    /// Job, it names.
     fn task(&self, open: &SessionOpen) -> Result<Object, Status> {
         let store = &self.api.store;
         let key = ObjectKey::new(Kind::Task, &open.namespace, &open.task);
         if let Some(t) = store.get(&key).map_err(internal)? {
             return Ok(t);
         }
-        let mut tasks: Vec<(Object, TaskState)> = store
+        let mut tasks: Vec<(Object, bool, TaskState)> = store
             .list(Kind::Task, Some(&open.namespace))
             .map_err(internal)?
             .objects
             .into_iter()
-            .filter(|t| {
-                legion_api::parse::<TaskSpec>(&t.spec).is_ok_and(|s| s.service == open.task)
-            })
-            .map(|t| {
+            .filter_map(|t| {
+                let spec = legion_api::parse::<TaskSpec>(&t.spec).ok()?;
+                (spec.service == open.task).then_some(())?;
                 let state = serde_json::from_value::<TaskStatus>(t.status.clone())
                     .unwrap_or_default()
                     .state;
-                (t, state)
+                Some((t, spec.job, state))
             })
             .collect();
-        let service = ObjectKey::new(Kind::Service, &open.namespace, &open.task);
-        if tasks.is_empty() && store.get(&service).map_err(internal)?.is_none() {
+        let exists = |kind| {
+            let key = ObjectKey::new(kind, &open.namespace, &open.task);
+            store.get(&key).map(|o| o.is_some()).map_err(internal)
+        };
+        let job = if exists(Kind::Service)? {
+            false
+        } else if exists(Kind::Job)? {
+            true
+        } else if let Some((_, job, _)) = tasks.first() {
+            *job
+        } else {
             return Err(Status::not_found(format!(
-                "no task or service {} in namespace {}",
+                "no task, service or job {} in namespace {}",
                 open.task, open.namespace
             )));
-        }
-        tasks.retain(|(_, state)| *state == TaskState::Running);
+        };
+        tasks.retain(|(_, j, state)| *j == job && *state == TaskState::Running);
         tasks.sort_by(|a, b| a.0.metadata.name.cmp(&b.0.metadata.name));
-        tasks.into_iter().next().map(|(t, _)| t).ok_or_else(|| {
-            Status::failed_precondition(format!("service {} has no running task", open.task))
+        tasks.into_iter().next().map(|(t, _, _)| t).ok_or_else(|| {
+            let owner = if job { "job" } else { "service" };
+            Status::failed_precondition(format!("{owner} {} has no running task", open.task))
         })
     }
 }

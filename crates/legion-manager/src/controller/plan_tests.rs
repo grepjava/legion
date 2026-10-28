@@ -11,10 +11,13 @@ use legion_api::task::{DesiredState, TaskState, TaskStatus};
 use legion_api::{Kind, Object, Spec};
 use tokio::time::Instant;
 
-use super::plan::{Action, HISTORY, Homes, Memory, Node, Quotas, Service, Task, plan};
+use super::plan::{
+    Action, CronJob, HISTORY, Homes, Job, Jobs, Memory, Node, Quotas, Service, Task, plan,
+};
 
 struct World {
     services: Vec<Service>,
+    jobs: Jobs,
     tasks: Vec<Task>,
     nodes: Vec<Node>,
     homes: Homes,
@@ -30,6 +33,10 @@ impl World {
     fn new() -> Self {
         World {
             services: vec![],
+            jobs: Jobs {
+                wall: legion_api::clock::parse("2026-10-28T09:31:00Z").unwrap(),
+                ..Default::default()
+            },
             tasks: vec![],
             nodes: vec![],
             homes: Homes::new(),
@@ -144,6 +151,21 @@ impl World {
         for a in actions {
             let index = self.next();
             match a {
+                Action::Create(mut o) if o.kind == Kind::Job => {
+                    assert!(
+                        !self.jobs.jobs.iter().any(|j| j.object.key() == o.key()),
+                        "duplicate job {}",
+                        o.key()
+                    );
+                    o.metadata.uid = format!("{index:016x}");
+                    o.metadata.version = index;
+                    o.metadata.generation = 1;
+                    self.jobs.jobs.push(Job {
+                        spec: legion_api::parse(&o.spec).unwrap(),
+                        status: Default::default(),
+                        object: o,
+                    });
+                }
                 Action::Create(mut o) => {
                     assert_eq!(o.kind, Kind::Task);
                     assert!(
@@ -184,12 +206,41 @@ impl World {
                                 s.object = o;
                             }
                         }
+                        Kind::Job => {
+                            let j = self
+                                .jobs
+                                .jobs
+                                .iter_mut()
+                                .find(|j| j.object.key() == o.key())
+                                .unwrap();
+                            if j.object.metadata.version == version {
+                                assert_eq!(o.spec, j.object.spec, "only the status changes");
+                                j.status = serde_json::from_value(o.status.clone()).unwrap();
+                                j.object = o;
+                            }
+                        }
+                        Kind::CronJob => {
+                            let c = self
+                                .jobs
+                                .cron_jobs
+                                .iter_mut()
+                                .find(|c| c.object.key() == o.key())
+                                .unwrap();
+                            if c.object.metadata.version == version {
+                                assert_eq!(o.spec, c.object.spec, "only the status changes");
+                                c.status = serde_json::from_value(o.status.clone()).unwrap();
+                                c.object = o;
+                            }
+                        }
                         k => panic!("unexpected update of {k}"),
                     }
                 }
                 Action::Delete(key, version) => {
                     self.tasks
                         .retain(|t| t.object.key() != key || t.object.metadata.version != version);
+                    self.jobs
+                        .jobs
+                        .retain(|j| j.object.key() != key || j.object.metadata.version != version);
                 }
             }
         }
@@ -234,6 +285,7 @@ impl World {
         for pass in 1..100 {
             let p = plan(
                 &self.services,
+                &self.jobs,
                 &self.tasks,
                 &self.nodes,
                 &self.homes,
@@ -269,6 +321,7 @@ impl World {
     fn wake(&mut self) -> Option<Instant> {
         plan(
             &self.services,
+            &self.jobs,
             &self.tasks,
             &self.nodes,
             &self.homes,
@@ -638,6 +691,7 @@ fn rolling_update_stop_first() {
     // One slot at a time: the first pass stops one old task only.
     let p = plan(
         &w.services,
+        &w.jobs,
         &w.tasks,
         &w.nodes,
         &w.homes,
@@ -678,6 +732,7 @@ fn rolling_update_start_first() {
     w.service("web", "replicas: 1\npod: { containers: [{ name: web, image: \"web:2\" }] }\nupdate: { order: start-first }");
     let p = plan(
         &w.services,
+        &w.jobs,
         &w.tasks,
         &w.nodes,
         &w.homes,
@@ -1119,4 +1174,398 @@ pod: { containers: [{ name: a, image: \"a:1\" }] }",
         message(&w, "web-1-2"),
         "over the quota of namespace shop: tasks 5 of 4"
     );
+}
+
+impl World {
+    /// Creates or replaces a Job, as an apply would.
+    fn job(&mut self, name: &str, spec: &str) {
+        let value: serde_json::Value = serde_yaml_ng::from_str(spec).unwrap();
+        let mut o = Object::new(Kind::Job, "shop", name, value);
+        legion_api::admit(&mut o).unwrap();
+        let index = self.next();
+        o.metadata.uid = format!("{index:016x}");
+        o.metadata.version = index;
+        o.metadata.generation = 1;
+        self.jobs.jobs.retain(|j| j.object.metadata.name != name);
+        self.jobs.jobs.push(Job {
+            spec: legion_api::parse(&o.spec).unwrap(),
+            status: Default::default(),
+            object: o,
+        });
+    }
+
+    /// Creates or updates a CronJob, as an apply would: an update keeps
+    /// the status.
+    fn cron_job(&mut self, name: &str, spec: &str) {
+        let value: serde_json::Value = serde_yaml_ng::from_str(spec).unwrap();
+        let mut o = Object::new(Kind::CronJob, "shop", name, value);
+        legion_api::admit(&mut o).unwrap();
+        let index = self.next();
+        o.metadata.version = index;
+        let spec = legion_api::parse(&o.spec).unwrap();
+        match self
+            .jobs
+            .cron_jobs
+            .iter_mut()
+            .find(|c| c.object.metadata.name == name)
+        {
+            Some(c) => {
+                o.metadata.uid = c.object.metadata.uid.clone();
+                o.metadata.generation = c.object.metadata.generation + 1;
+                o.status = c.object.status.clone();
+                c.object = o;
+                c.spec = spec;
+            }
+            None => {
+                o.metadata.uid = format!("{index:016x}");
+                o.metadata.generation = 1;
+                self.jobs.cron_jobs.push(CronJob {
+                    object: o,
+                    spec,
+                    status: Default::default(),
+                });
+            }
+        }
+    }
+
+    fn advance(&mut self, secs: u64) {
+        self.now += Duration::from_secs(secs);
+        self.jobs.wall += secs as i64;
+    }
+
+    /// The task `name` ends in `state`, as its agent would report.
+    fn end(&mut self, name: &str, state: TaskState) {
+        let version = self.next();
+        let t = self
+            .tasks
+            .iter_mut()
+            .find(|t| t.object.metadata.name == name)
+            .unwrap();
+        t.status = TaskStatus {
+            state,
+            ..Default::default()
+        };
+        t.object.status = serde_json::to_value(&t.status).unwrap();
+        t.object.metadata.version = version;
+    }
+
+    fn job_status(&self, name: &str) -> legion_api::job::JobStatus {
+        let j = self
+            .jobs
+            .jobs
+            .iter()
+            .find(|j| j.object.metadata.name == name)
+            .unwrap();
+        serde_json::from_value(j.object.status.clone()).unwrap()
+    }
+
+    fn cron_status(&self, name: &str) -> legion_api::job::CronJobStatus {
+        let c = self
+            .jobs
+            .cron_jobs
+            .iter()
+            .find(|c| c.object.metadata.name == name)
+            .unwrap();
+        serde_json::from_value(c.object.status.clone()).unwrap()
+    }
+
+    fn job_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .jobs
+            .jobs
+            .iter()
+            .map(|j| j.object.metadata.name.clone())
+            .collect();
+        v.sort();
+        v
+    }
+}
+
+fn job(extra: &str) -> String {
+    format!("{extra}\npod: {{ containers: [{{ name: dump, image: \"tools:1\" }}] }}")
+}
+
+fn at(time: &str) -> i64 {
+    legion_api::clock::parse(time).unwrap()
+}
+
+#[test]
+fn a_job_runs_its_completions() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.job("backup", &job("completions: 3\nparallelism: 2"));
+    w.settle();
+    assert_eq!(w.running(), ["backup-1-1", "backup-2-1"]);
+    let t = w
+        .tasks
+        .iter()
+        .find(|t| t.object.metadata.name == "backup-1-1")
+        .unwrap();
+    assert!(t.spec.job);
+    assert_eq!(
+        t.object.metadata.labels.get("legion.job").unwrap(),
+        "backup"
+    );
+    assert!(!t.object.metadata.labels.contains_key("legion.service"));
+    let st = w.job_status("backup");
+    assert_eq!(
+        (st.state.as_str(), st.active, st.succeeded),
+        ("running", 2, 0)
+    );
+    assert_eq!(st.started.as_deref(), Some("2026-10-28T09:31:00Z"));
+
+    // As one completes, the next starts.
+    w.end("backup-1-1", TaskState::Complete);
+    w.settle();
+    assert_eq!(w.running(), ["backup-2-1", "backup-3-1"]);
+    w.advance(30);
+    w.end("backup-2-1", TaskState::Complete);
+    w.end("backup-3-1", TaskState::Complete);
+    w.settle();
+    let st = w.job_status("backup");
+    assert_eq!(
+        (st.state.as_str(), st.active, st.succeeded, st.failed),
+        ("complete", 0, 3, 0)
+    );
+    assert_eq!(st.finished.as_deref(), Some("2026-10-28T09:31:30Z"));
+    // Its tasks stay, for the record, until the Job goes.
+    assert_eq!(
+        w.tasks(),
+        [
+            "backup-1-1 complete n1",
+            "backup-2-1 complete n1",
+            "backup-3-1 complete n1"
+        ]
+    );
+    w.jobs.jobs.clear();
+    w.settle();
+    assert!(w.tasks.is_empty());
+}
+
+#[test]
+fn a_job_retries_until_its_backoff_limit() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.job("flaky", &job("backoffLimit: 1"));
+    w.settle();
+    w.fail("flaky-1-1");
+    w.settle();
+    assert!(w.running().is_empty(), "the retry waits");
+    assert_eq!(w.wake(), Some(w.now + Duration::from_secs(10)));
+    w.advance(10);
+    w.settle();
+    assert_eq!(w.running(), ["flaky-1-2"]);
+    let st = w.job_status("flaky");
+    assert_eq!((st.state.as_str(), st.failed), ("running", 1));
+
+    w.fail("flaky-1-2");
+    w.settle();
+    let st = w.job_status("flaky");
+    assert_eq!(st.state.as_str(), "failed");
+    assert_eq!(
+        st.message,
+        "2 tasks failed, more than its backoffLimit of 1; the last: container exited with 1"
+    );
+    w.advance(600);
+    w.settle();
+    assert!(w.running().is_empty(), "a failed Job runs no more");
+}
+
+#[test]
+fn a_job_stops_at_its_deadline() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.job("slow", &job("activeDeadline: 1m"));
+    w.settle();
+    assert_eq!(w.running(), ["slow-1-1"]);
+    assert_eq!(w.wake(), Some(w.now + Duration::from_secs(60)));
+    w.advance(60);
+    w.settle();
+    let st = w.job_status("slow");
+    assert_eq!(st.state.as_str(), "failed");
+    assert_eq!(st.message, "ran longer than its activeDeadline of 1m");
+    assert_eq!(w.tasks(), ["slow-1-1 shutdown n1"]);
+}
+
+#[test]
+fn a_global_job_runs_once_per_node() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.job("scan", &job("mode: global"));
+    w.settle();
+    assert_eq!(w.running(), ["scan-n1-1", "scan-n2-1"]);
+    w.end("scan-n1-1", TaskState::Complete);
+    w.settle();
+    assert_eq!(w.job_status("scan").state.as_str(), "running");
+    w.end("scan-n2-1", TaskState::Complete);
+    w.settle();
+    let st = w.job_status("scan");
+    assert_eq!((st.state.as_str(), st.succeeded), ("complete", 2));
+    // A node that comes later finds the Job done.
+    w.node("n3", &[]);
+    w.settle();
+    assert!(w.running().is_empty());
+}
+
+#[test]
+fn a_drained_node_moves_a_job_task_without_a_failure() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.job("backup", &job(""));
+    w.settle();
+    assert_eq!(w.tasks(), ["backup-1-1 running n1"]);
+    w.node("n2", &[]);
+    w.availability("n1", Availability::Drain);
+    w.settle();
+    assert_eq!(
+        w.tasks(),
+        ["backup-1-1 shutdown n1", "backup-1-2 running n2"]
+    );
+    assert_eq!(w.job_status("backup").failed, 0);
+}
+
+fn report(extra: &str) -> String {
+    format!(
+        "schedule: \"*/5 * * * *\"\n{extra}\njob:\n  pod: {{ containers: [{{ name: r, image: \"tools:1\" }}] }}"
+    )
+}
+
+/// The name of the run of `report` due at `time`.
+fn run(time: &str) -> String {
+    format!("report-{}", at(time) / 60)
+}
+
+/// Completes the running tasks of the Job `job`.
+fn complete_job(w: &mut World, job: &str) {
+    let names: Vec<String> = w
+        .tasks
+        .iter()
+        .filter(|t| t.spec.service == job && t.status.state == TaskState::Running)
+        .map(|t| t.object.metadata.name.clone())
+        .collect();
+    for n in names {
+        w.end(&n, TaskState::Complete);
+    }
+    w.settle();
+}
+
+#[test]
+fn a_cron_job_runs_on_schedule() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.cron_job("report", &report("successfulJobsHistoryLimit: 1"));
+    w.settle();
+    // Runs before it was made are not owed.
+    assert!(w.job_names().is_empty());
+    let st = w.cron_status("report");
+    assert_eq!(st.last_schedule.as_deref(), Some("2026-10-28T09:31:00Z"));
+    assert_eq!(w.wake(), Some(w.now + Duration::from_secs(4 * 60)));
+
+    w.advance(4 * 60);
+    w.settle();
+    let first = run("2026-10-28T09:35:00Z");
+    assert_eq!(w.job_names(), std::slice::from_ref(&first));
+    let j = &w.jobs.jobs[0];
+    assert_eq!(
+        j.object.metadata.labels.get("legion.cronjob").unwrap(),
+        "report"
+    );
+    assert_eq!(w.running(), [format!("{first}-1-1")]);
+    let st = w.cron_status("report");
+    assert_eq!(st.last_schedule.as_deref(), Some("2026-10-28T09:35:00Z"));
+    assert_eq!(st.last_job, first);
+    complete_job(&mut w, &first);
+    assert_eq!(w.job_status(&first).state.as_str(), "complete");
+
+    // The next run; history keeps one finished Job, so the first goes,
+    // its tasks with it.
+    w.advance(5 * 60);
+    w.settle();
+    let second = run("2026-10-28T09:40:00Z");
+    complete_job(&mut w, &second);
+    assert_eq!(w.job_names(), std::slice::from_ref(&second));
+    assert_eq!(w.tasks(), [format!("{second}-1-1 complete n1")]);
+
+    // A controller away for long owes only the latest run.
+    w.advance(23 * 60);
+    w.settle();
+    let late = run("2026-10-28T10:00:00Z");
+    assert_eq!(w.job_names(), [second.clone(), late.clone()]);
+
+    // Deleting the CronJob deletes its Jobs.
+    w.jobs.cron_jobs.clear();
+    w.settle();
+    assert!(w.job_names().is_empty());
+    assert!(w.tasks.is_empty());
+}
+
+#[test]
+fn concurrency_policies() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.cron_job("report", &report("concurrencyPolicy: forbid"));
+    w.settle();
+    w.advance(4 * 60);
+    w.settle();
+    let first = run("2026-10-28T09:35:00Z");
+    assert_eq!(w.job_names(), std::slice::from_ref(&first));
+
+    // Still running: forbid skips the run.
+    w.advance(5 * 60);
+    w.settle();
+    assert_eq!(w.job_names(), std::slice::from_ref(&first));
+    let st = w.cron_status("report");
+    assert_eq!(
+        st.message,
+        format!("skipped the run due at 2026-10-28T09:40:00Z: {first} still running")
+    );
+    assert_eq!(st.last_schedule.as_deref(), Some("2026-10-28T09:40:00Z"));
+
+    // Replace: the running Job goes, its task stopped, and the new run
+    // takes its place.
+    w.cron_job("report", &report("concurrencyPolicy: replace"));
+    w.advance(5 * 60);
+    w.settle();
+    let third = run("2026-10-28T09:45:00Z");
+    assert_eq!(w.job_names(), std::slice::from_ref(&third));
+    assert_eq!(w.running(), [format!("{third}-1-1")]);
+    assert!(w.cron_status("report").message.is_empty());
+
+    // Allow: runs side by side.
+    w.cron_job("report", &report("concurrencyPolicy: allow"));
+    w.advance(5 * 60);
+    w.settle();
+    let fourth = run("2026-10-28T09:50:00Z");
+    assert_eq!(w.job_names(), [third.clone(), fourth.clone()]);
+    assert_eq!(w.running().len(), 2);
+}
+
+#[test]
+fn suspended_and_late_runs_are_skipped() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.cron_job("report", &report("suspend: true\nstartingDeadline: 30s"));
+    w.settle();
+    w.advance(4 * 60);
+    w.settle();
+    assert!(w.job_names().is_empty());
+    assert_eq!(
+        w.cron_status("report").message,
+        "suspended: skipped the run due at 2026-10-28T09:35:00Z"
+    );
+
+    // Resumed, but the next pass comes 40s after the run was due.
+    w.cron_job("report", &report("startingDeadline: 30s"));
+    w.advance(5 * 60 + 40);
+    w.settle();
+    assert!(w.job_names().is_empty());
+    assert_eq!(
+        w.cron_status("report").message,
+        "skipped the run due at 2026-10-28T09:40:00Z: more than its startingDeadline of 30s late"
+    );
+    // On time again.
+    w.advance(5 * 60 - 40);
+    w.settle();
+    assert_eq!(w.job_names(), [run("2026-10-28T09:45:00Z")]);
 }

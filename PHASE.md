@@ -403,6 +403,21 @@ Already there from phase 1: namespaces scope names and DNS
   FreeBSD, with real Podman and ocijail: an init container leaves a file in
   the pod's volume for the app, and a failing one's output reaches the
   task's message.
+- **Jobs and CronJobs** (`legion-api::job`, `cron`, `clock`;
+  `legion-manager::controller::plan::jobs`, DESIGN.md §3.3): Jobs run
+  their completion slots (`completions`, `parallelism`, or one per node
+  when global) through the same planner and scheduler as Services, retry
+  failed tasks with backoff up to `backoffLimit`, and fail past
+  `activeDeadline`; their pods' restart condition defaults to `none`.
+  CronJobs make a Job per run of a five-field UTC schedule, owe only the
+  latest missed run, skip runs while suspended, past `startingDeadline` or
+  under `forbid`, replace under `replace`, and keep their history limits.
+  `legion list jobs` and `cronjobs` show the progress; `logs`, `exec` and
+  `port-forward` take a Job's name as they take a Service's. Tested: cron
+  parsing and next and owed runs, admission, the planner (completions,
+  parallelism, retries, the backoff limit, the deadline, global jobs,
+  drains, deletion; schedules, history, the concurrency policies, suspend
+  and the starting deadline), and a Job through a manager and an agent.
 
 ### To do, in order
 
@@ -410,8 +425,9 @@ The first three are what the exit criterion rests on: who may do what,
 what may talk to what, and how much each team may use; all three are
 done.
 
-1. **Jobs and CronJobs**: run to completion, retries and deadlines; cron
-   schedules, concurrency policy, history limits.
+1. **Output of finished tasks**: the agent keeps a finished task's logs
+   (bounded) until the task is deleted, so `legion logs` works on a
+   completed Job; today the pod and its output go when the task ends.
 2. **Disruption budgets**: `maxUnavailable` honoured by drain and updates.
 3. **Security profiles**: the jail defaults in DESIGN.md §9, loosened per
    service only explicitly.

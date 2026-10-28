@@ -1,5 +1,6 @@
 //! Controllers (DESIGN.md §3.3). They run on the leader only: each pass
-//! reads Services, Tasks, Nodes, Volumes and Namespaces from the local store,
+//! reads Services, Jobs, CronJobs, Tasks, Nodes, Volumes and Namespaces
+//! from the local store,
 //! plans the writes that converge them ([`plan`]) and makes them with version
 //! preconditions, so a write based on stale state fails and the next pass
 //! sees the newer state.
@@ -18,7 +19,7 @@ use legion_store::{Command, NodeId, Outcome, Precondition, Store};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use plan::{Action, Homes, Memory, Node, Quotas, Service, Task};
+use plan::{Action, CronJob, Homes, Job, Jobs, Memory, Node, Quotas, Service, Task};
 
 /// Changes arriving within this window are handled in one pass.
 const DEBOUNCE: Duration = Duration::from_millis(50);
@@ -91,7 +92,7 @@ async fn lead(store: &Store) {
 
 /// One reconcile pass; returns when the next one is due at the latest.
 async fn pass(store: &Store, memory: &mut Memory) -> Option<Instant> {
-    let (services, tasks, nodes, homes, quotas) = match read(store) {
+    let (services, jobs, tasks, nodes, homes, quotas) = match read(store) {
         Ok(state) => state,
         Err(e) => {
             tracing::warn!("reading the store: {e}");
@@ -100,6 +101,7 @@ async fn pass(store: &Store, memory: &mut Memory) -> Option<Instant> {
     };
     let plan = plan::plan(
         &services,
+        &jobs,
         &tasks,
         &nodes,
         &homes,
@@ -115,7 +117,7 @@ async fn pass(store: &Store, memory: &mut Memory) -> Option<Instant> {
     plan.wake
 }
 
-type State = (Vec<Service>, Vec<Task>, Vec<Node>, Homes, Quotas);
+type State = (Vec<Service>, Jobs, Vec<Task>, Vec<Node>, Homes, Quotas);
 
 fn read(store: &Store) -> Result<State, legion_store::Error> {
     let services = store
@@ -127,6 +129,37 @@ fn read(store: &Store) -> Result<State, legion_store::Error> {
             Some(Service { object: o, spec })
         })
         .collect();
+    let jobs = Jobs {
+        jobs: store
+            .list(Kind::Job, None)?
+            .objects
+            .into_iter()
+            .filter_map(|o| {
+                let spec = parsed(&o)?;
+                let status = status_of(&o);
+                Some(Job {
+                    object: o,
+                    spec,
+                    status,
+                })
+            })
+            .collect(),
+        cron_jobs: store
+            .list(Kind::CronJob, None)?
+            .objects
+            .into_iter()
+            .filter_map(|o| {
+                let spec = parsed(&o)?;
+                let status = status_of(&o);
+                Some(CronJob {
+                    object: o,
+                    spec,
+                    status,
+                })
+            })
+            .collect(),
+        wall: legion_api::clock::now(),
+    };
     let tasks = store
         .list(Kind::Task, None)?
         .objects
@@ -174,7 +207,11 @@ fn read(store: &Store) -> Result<State, legion_store::Error> {
             Some((o.metadata.name, spec.quota?))
         })
         .collect();
-    Ok((services, tasks, nodes, homes, quotas))
+    Ok((services, jobs, tasks, nodes, homes, quotas))
+}
+
+fn status_of<T: serde::de::DeserializeOwned + Default>(o: &Object) -> T {
+    serde_json::from_value(o.status.clone()).unwrap_or_default()
 }
 
 fn parsed<T: legion_api::Spec>(o: &Object) -> Option<T> {

@@ -850,7 +850,7 @@ impl Placement {
         *self == Placement::default()
     }
 
-    fn admit(&self, path: &str) -> Result<(), Invalid> {
+    pub(crate) fn admit(&self, path: &str) -> Result<(), Invalid> {
         for (i, c) in self.constraints.iter().enumerate() {
             c.parse::<Constraint>()
                 .map_err(|e| Invalid::new(index(path, "constraints", i), e))?;

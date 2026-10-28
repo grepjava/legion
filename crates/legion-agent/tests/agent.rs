@@ -1197,7 +1197,7 @@ async fn sessions_reach_the_pod() {
         refused(Session::open(&h, open("nope", logs(false, None))).await),
         (
             tonic::Code::NotFound,
-            "no task or service nope in namespace shop".into()
+            "no task, service or job nope in namespace shop".into()
         )
     );
     // Errors from the agent end the stream.

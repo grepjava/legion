@@ -186,6 +186,35 @@ preconditions. Rules:
   shrinking still goes through. Volumes are held to the quota at
   admission only, so the leader admits and writes Services and Volumes one
   at a time. A start-first update needs room for one more task.
+- **Jobs** (phase 3, `controller/plan/jobs.rs`, part of the same pure
+  function) own tasks as Services do, so scheduling, quotas, draining and
+  lost nodes treat them alike; their tasks carry `job: true` and the label
+  `legion.job`, and are no Service's endpoints. A replicated Job has
+  completion slots `1..completions`, `parallelism` (1) running at once; a
+  global one a slot per eligible node, plus those it completed on. A slot
+  is done when a task in it completes. A failed task is retried in its
+  slot as a new task, after 10 s doubling per failure in a row (at most
+  60 s); the Job fails once more than `backoffLimit` (6) tasks failed,
+  with the last failure in its message, or when it runs past
+  `activeDeadline`, and its running tasks are stopped. Tasks stopped by a
+  drain or lost with their node are retried without counting. The pod's
+  restart condition defaults to `none` for Jobs and may not be `any`. A
+  finished Job keeps its tasks until it is deleted, which removes them.
+  Status: `state` (running, complete, failed), `started`, `finished`,
+  `active`, `succeeded`, `failed`, `message`. Admission does not check
+  Jobs against quotas: tasks beyond the quota wait `pending`.
+- **CronJobs** make a Job, `<cronjob>-<minutes since the epoch>` labelled
+  `legion.cronjob`, for the latest run due since `status.lastSchedule`
+  (five-field cron, UTC; set to the time the controller first sees the
+  CronJob, so earlier runs are not owed, and a controller that was away
+  owes the latest run only). A run is skipped, with the reason in the
+  status message, while `suspend` is set, when it is more than
+  `startingDeadline` late, or under `concurrencyPolicy: forbid` while an
+  earlier Job runs; `replace` deletes the running Jobs first, `allow` (the
+  default) runs alongside. The newest finished Jobs are kept per outcome
+  (`successfulJobsHistoryLimit` 3, `failedJobsHistoryLimit` 1), the rest
+  deleted; deleting a CronJob deletes the Jobs labelled with it. A
+  CronJob's name is at most 52 characters, leaving room for the suffix.
 
 ### 3.4 Agent components
 
