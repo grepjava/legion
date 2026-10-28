@@ -797,7 +797,10 @@ async fn workers_follow_their_work_through_any_manager() {
         .unwrap_err();
     assert_eq!(err.code(), Code::PermissionDenied, "{err}");
     let err = DispatcherClient::new(first.channel(Some(&admin)).await.unwrap())
-        .heartbeat(HeartbeatRequest { node: "w1".into() })
+        .heartbeat(HeartbeatRequest {
+            node: "w1".into(),
+            ..Default::default()
+        })
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::PermissionDenied, "{err}");

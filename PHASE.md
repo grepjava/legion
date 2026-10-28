@@ -631,10 +631,25 @@ service and migrates between nodes.
   daemon, restore after a crash, a manager joining with the backed-up
   token, and a restore from the manager's own store once it is lost.
 
+- **Autoscaling** (`autoscale` on replicated services,
+  `controller/plan/autoscale.rs`, `legion-manager::usage`, DESIGN.md §3.3
+  and §4.3): agents send each running task's use (rctl `pcpu` and
+  `memoryuse` over its app containers) with a heartbeat every 15 s; the
+  leader keeps the reports for a minute, from the task's own node only,
+  and the Service controller's pass turns them into the replica count,
+  in `status.autoscale` with the measured percentages. It grows at once
+  and shrinks after `downDelay`; quotas count `max`. Tested: the planner
+  (start at min, growth to the target, staying within the tolerance, the
+  delay before shrinking, the cap at max, reports from the wrong node
+  ignored, silent tasks counted as idle growing and on target shrinking,
+  a new leader's wait, back to `replicas` without `autoscale`),
+  admission, and through a manager and two agents with fake rctl, a busy
+  service growing from one task to three and back.
+
 ### To do, in order
 
-1. Ingress routes, autoscaling, CARP VIP, autolock. Moving a Volume on
-   request rather than by a drain.
+1. Ingress routes, CARP VIP, autolock. Moving a Volume on request rather
+   than by a drain.
 
 Smaller follow-ups: memory limits for workloads with large shared memory
 (rctl counts it per process; `vmemoryuse` or a pod-wide allowance).

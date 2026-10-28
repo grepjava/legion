@@ -592,8 +592,24 @@ impl Dispatcher for DispatcherService {
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let node = self.node(&req, &req.get_ref().node)?;
         if let Some(mut leader) = self.leader(&req)? {
-            return leader.heartbeat(forwarded(HeartbeatRequest { node })).await;
+            let usage = req.into_inner().usage;
+            return leader
+                .heartbeat(forwarded(HeartbeatRequest { node, usage }))
+                .await;
         }
+        let reported = req.into_inner().usage;
+        self.api.usage.record(
+            &node,
+            reported.into_iter().map(|u| {
+                (
+                    format!("{}/{}", u.namespace, u.task),
+                    legion_api::dispatch::TaskUsage {
+                        cpu: u.cpu_percent,
+                        memory: u.memory_bytes,
+                    },
+                )
+            }),
+        );
         self.seen.lock().unwrap().insert(node, Instant::now());
         Ok(Response::new(HeartbeatResponse {
             period_ms: self.period.as_millis() as u32,

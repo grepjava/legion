@@ -22,6 +22,7 @@ use legion_api::volume::{VolumeSpec, VolumeStatus};
 use legion_api::{Kind, Object, ObjectKey};
 use tokio::time::Instant;
 
+mod autoscale;
 mod jobs;
 mod migrate;
 pub use jobs::{CronJob, Job, Jobs};
@@ -149,6 +150,11 @@ impl Service {
 pub struct Memory {
     pub failed_at: BTreeMap<String, Instant>,
     pub running_at: BTreeMap<String, Instant>,
+    /// What tasks use, by `namespace/task`, with the node that reported
+    /// it; the controller sets it before each pass.
+    pub usage: BTreeMap<String, (String, legion_api::dispatch::TaskUsage)>,
+    /// The autoscaler's recent recommendations, by service uid.
+    pub recommended: BTreeMap<String, Vec<(Instant, u32)>>,
 }
 
 #[derive(Debug, Default)]
@@ -460,7 +466,7 @@ fn service(
     tasks: &[&Task],
     nodes: &[Node],
     volumes: &Volumes,
-    memory: &Memory,
+    memory: &mut Memory,
     now: Instant,
     addrs: Addresses,
     plan: &mut Plan,
@@ -483,15 +489,14 @@ fn service(
         list.sort_by(|a, b| a.uid().cmp(b.uid()));
     }
 
+    let (replicas, autoscale) = autoscale::replicas(s, tasks, &previous, memory, now);
     let wanted: Vec<Slot> = match s.spec.mode {
         ServiceMode::Global => nodes
             .iter()
             .filter(|n| eligible(n, s, volumes, &shared_volumes(s)).is_ok())
             .map(|n| Slot::Node(n.object.metadata.name.clone()))
             .collect(),
-        ServiceMode::Replicated => (1..=s.spec.replicas.unwrap_or(1))
-            .map(Slot::Replica)
-            .collect(),
+        ServiceMode::Replicated => (1..=replicas).map(Slot::Replica).collect(),
         ServiceMode::Stateful => (0..s.spec.replicas.unwrap_or(1))
             .map(Slot::Replica)
             .collect(),
@@ -828,6 +833,7 @@ fn service(
         last_tasks,
         spec: Some(s.spec.clone()),
         update,
+        autoscale,
     };
     let status = serde_json::to_value(&status).expect("status serialises");
     if s.object.status != status {

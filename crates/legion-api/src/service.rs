@@ -31,6 +31,74 @@ pub struct ServiceSpec {
     /// there is no limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_unavailable: Option<u32>,
+    /// Replicated services only: the controller sets the replica count
+    /// between `min` and `max` from what the tasks use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autoscale: Option<Autoscale>,
+}
+
+/// Autoscaling (DESIGN.md §3.3, Autoscaler): the replica count that brings
+/// the tasks' average use to the targets, which are percentages of what
+/// the pod's containers request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Autoscale {
+    pub min: u32,
+    pub max: u32,
+    /// Average CPU use, in percent of `requests.cpu`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<u32>,
+    /// Average memory use, in percent of `requests.memory`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<u32>,
+    /// How long use must stay low before the service shrinks; it grows
+    /// at once.
+    #[serde(default = "default_down_delay")]
+    pub down_delay: Duration,
+}
+
+fn default_down_delay() -> Duration {
+    Duration::from_secs(300)
+}
+
+impl Autoscale {
+    fn admit(&self, path: &str, pod: &PodSpec) -> Result<(), Invalid> {
+        if self.min == 0 || self.min > self.max {
+            return Err(Invalid::new(
+                path,
+                format!(
+                    "min {} and max {}: at least 1, and min at most max",
+                    self.min, self.max
+                ),
+            ));
+        }
+        if self.cpu.is_none() && self.memory.is_none() {
+            return Err(Invalid::new(path, "set a cpu or memory target"));
+        }
+        for (target, name) in [(self.cpu, "cpu"), (self.memory, "memory")] {
+            let Some(target) = target else { continue };
+            if target == 0 {
+                return Err(Invalid::new(field(path, name), "a target above 0"));
+            }
+            for c in &pod.containers {
+                let requests = &c.resources.requests;
+                let set = match name {
+                    "cpu" => requests.cpu.is_some(),
+                    _ => requests.memory.is_some(),
+                };
+                if !set {
+                    return Err(Invalid::new(
+                        field(path, name),
+                        format!(
+                            "container {:?} requests no {name}; the target is a share of the request",
+                            c.name
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -79,7 +147,8 @@ impl Spec for ServiceSpec {
                 ));
             }
             ServiceMode::Replicated => {
-                self.replicas.get_or_insert(1);
+                let start = self.autoscale.as_ref().map_or(1, |a| a.min);
+                self.replicas.get_or_insert(start);
             }
             ServiceMode::Global => {
                 if self.replicas.is_some() {
@@ -109,6 +178,15 @@ impl Spec for ServiceSpec {
             ));
         }
         self.placement.admit("placement")?;
+        if let Some(a) = &self.autoscale {
+            if self.mode != ServiceMode::Replicated {
+                return Err(Invalid::new(
+                    "autoscale",
+                    "only a replicated service scales",
+                ));
+            }
+            a.admit("autoscale", &self.pod)?;
+        }
         if let Some(endpoint) = &mut self.endpoint {
             endpoint.admit("endpoint", &self.pod)?;
         }
@@ -1263,6 +1341,25 @@ pub struct ServiceStatus {
     /// The latest rolling update, once there has been one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update: Option<UpdateStatus>,
+    /// What the autoscaler decided, for a service with `autoscale`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autoscale: Option<AutoscaleStatus>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoscaleStatus {
+    /// The replica count the service runs.
+    pub replicas: u32,
+    /// The tasks' average use, in percent of their requests, as last
+    /// measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<u32>,
+    /// Why it does not scale, when it cannot tell.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
 }
 
 /// How a rolling update went (DESIGN.md §3.3, Update).

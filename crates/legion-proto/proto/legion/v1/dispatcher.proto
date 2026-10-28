@@ -135,6 +135,17 @@ message DataResponse {
 
 message HeartbeatRequest {
   string node = 1;
+  // What the node's running tasks use, when the agent has read it since
+  // its last heartbeat; the autoscaler works from it.
+  repeated TaskUsage usage = 2;
+}
+
+message TaskUsage {
+  string namespace = 1;
+  string task = 2;
+  // Its containers together, in percent of one CPU.
+  double cpu_percent = 3;
+  uint64 memory_bytes = 4;
 }
 
 message HeartbeatResponse {

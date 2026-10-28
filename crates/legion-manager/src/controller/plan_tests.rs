@@ -2168,3 +2168,169 @@ fn migrations_stop_when_no_longer_needed_or_possible() {
     assert_eq!(w.migration("data-db-0"), None);
     assert_eq!(w.placed_task("db-0-1").status.state, TaskState::Running);
 }
+
+impl World {
+    /// Every running task of `service` reports this use (percent of a CPU,
+    /// bytes) from its node.
+    fn report(&mut self, service: &str, cpu: f64, memory: u64) {
+        self.memory.usage = self
+            .tasks
+            .iter()
+            .filter(|t| t.spec.service == service && t.status.state == TaskState::Running)
+            .map(|t| {
+                (
+                    format!("shop/{}", t.object.metadata.name),
+                    (
+                        t.spec.node.clone(),
+                        legion_api::dispatch::TaskUsage { cpu, memory },
+                    ),
+                )
+            })
+            .collect();
+    }
+
+    fn scaled(&self, service: &str) -> legion_api::service::AutoscaleStatus {
+        self.status(service).autoscale.expect("autoscaled")
+    }
+}
+
+const SCALED: &str = "autoscale: { min: 1, max: 5, cpu: 50, downDelay: 60s }
+pod:
+  containers:
+    - { name: web, image: web, resources: { requests: { cpu: 500m, memory: 64Mi } } }";
+
+#[test]
+fn autoscaling_grows_at_once_and_shrinks_after_the_delay() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.service("web", SCALED);
+    w.settle();
+    assert_eq!(w.running().len(), 1, "starts at min");
+    let st = w.scaled("web");
+    assert_eq!(st.replicas, 1);
+    assert!(st.message.contains("no use reported"), "{st:?}");
+
+    // One task at a whole CPU: 200% of its request, four times the target.
+    w.report("web", 100.0, 32 << 20);
+    w.settle();
+    assert_eq!(w.running().len(), 4, "{:?}", w.tasks());
+    let st = w.scaled("web");
+    assert_eq!(
+        (st.replicas, st.cpu, st.message.as_str()),
+        (4, Some(200), "")
+    );
+    assert_eq!(w.status("web").desired, 4);
+    // More passes on the same reports change nothing.
+    w.now += Duration::from_secs(5);
+    w.settle();
+    assert_eq!(w.running().len(), 4);
+
+    // Within a tenth of the target: stays.
+    w.report("web", 27.0, 32 << 20);
+    w.settle();
+    assert_eq!(w.scaled("web").replicas, 4);
+
+    // Idle: shrinks only once low for the whole delay.
+    w.report("web", 5.0, 32 << 20);
+    for _ in 0..11 {
+        w.now += Duration::from_secs(5);
+        w.settle();
+        assert_eq!(w.running().len(), 4, "too soon");
+    }
+    w.now += Duration::from_secs(10);
+    w.settle();
+    // 4 tasks at 10% of their request, a fifth of the target: one.
+    assert_eq!(w.running().len(), 1, "{:?}", w.tasks());
+    assert_eq!(w.scaled("web").cpu, Some(10));
+
+    // Far over the target: up to max, no further.
+    w.report("web", 1000.0, 32 << 20);
+    w.settle();
+    assert_eq!(w.running().len(), 5);
+}
+
+#[test]
+fn autoscaling_counts_only_reports_it_can_believe() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.service("web", &SCALED.replace("min: 1", "min: 2"));
+    w.settle();
+    assert_eq!(w.running().len(), 2);
+
+    // A report from another node than the task's is ignored.
+    w.report("web", 100.0, 0);
+    for (node, _) in w.memory.usage.values_mut() {
+        *node = "elsewhere".into();
+    }
+    w.settle();
+    assert_eq!(w.running().len(), 2);
+    assert!(w.scaled("web").message.contains("no use reported"));
+
+    // One busy task reports, the other does not: grows by the busy one
+    // alone (the silent one counts as idle).
+    w.report("web", 100.0, 0);
+    let first = w.memory.usage.keys().next().unwrap().clone();
+    w.memory.usage.retain(|k, _| *k == first);
+    w.settle();
+    assert_eq!(w.running().len(), 4);
+
+    // Idle, but the other tasks silent: they count as on target, so it
+    // keeps three of the four, and a delay later two of the three.
+    w.report("web", 0.0, 0);
+    let first = w.memory.usage.keys().next().unwrap().clone();
+    w.memory.usage.retain(|k, _| *k == first);
+    w.now += Duration::from_secs(120);
+    w.settle();
+    assert_eq!(w.running().len(), 3, "{:?}", w.tasks());
+    w.now += Duration::from_secs(61);
+    w.settle();
+    assert_eq!(w.running().len(), 2, "{:?}", w.tasks());
+
+    // A new leader waits the delay before shrinking.
+    w.report("web", 100.0, 0);
+    w.settle();
+    assert_eq!(w.running().len(), 5, "8 wanted, 5 at most");
+    w.memory = Memory::default();
+    w.report("web", 0.0, 0);
+    w.settle();
+    w.now += Duration::from_secs(30);
+    w.settle();
+    assert_eq!(w.running().len(), 5, "too soon for a new leader");
+    w.now += Duration::from_secs(31);
+    w.settle();
+    assert_eq!(w.running().len(), 2, "down to min");
+
+    // Without autoscale, replicas rules again.
+    w.service("web", &format!("replicas: 3\n{POD}"));
+    w.settle();
+    assert_eq!(w.running().len(), 3);
+    assert!(w.status("web").autoscale.is_none());
+}
+
+#[test]
+fn autoscale_admission() {
+    let admit = |spec: &str| {
+        let value: serde_json::Value = serde_yaml_ng::from_str(spec).unwrap();
+        let mut spec: ServiceSpec = legion_api::parse(&value).unwrap();
+        spec.admit().map(|()| spec).map_err(|e| e.to_string())
+    };
+    let ok = admit(SCALED).unwrap();
+    assert_eq!(ok.replicas, Some(1), "starts at min");
+    for (bad, why) in [
+        (SCALED.replace("min: 1", "min: 0"), "at least 1"),
+        (SCALED.replace("max: 5", "max: 0"), "min at most max"),
+        (SCALED.replace("cpu: 50, ", ""), "cpu or memory"),
+        (
+            SCALED
+                .replace("cpu: 50, ", "memory: 80, ")
+                .replace("memory: 64Mi", ""),
+            "requests no memory",
+        ),
+        (SCALED.replace("cpu: 500m, ", ""), "requests no cpu"),
+        (format!("mode: global\n{SCALED}"), "only a replicated"),
+    ] {
+        let err = admit(&bad).unwrap_err();
+        assert!(err.contains(why), "{bad}: {err}");
+    }
+}

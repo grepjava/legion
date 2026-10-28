@@ -19,6 +19,7 @@ mod raft_net;
 mod security;
 mod session;
 mod tls;
+mod usage;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -156,10 +157,12 @@ impl Manager {
         shutdown: impl Future<Output = ()> + Send,
     ) -> Result<(), Error> {
         let (closing_tx, closing) = tokio::sync::watch::channel(false);
+        let usage: std::sync::Arc<usage::Usage> = Default::default();
         let controllers = self.controllers.then(|| {
             tokio::spawn(controller::run(
                 self.store.clone(),
                 self.id,
+                usage.clone(),
                 closing.clone(),
             ))
         });
@@ -196,6 +199,7 @@ impl Manager {
             issuer,
             quota_lock: Default::default(),
             sessions,
+            usage,
         };
         let (dispatcher, dispatching) =
             dispatcher::DispatcherService::start(api.clone(), self.tls.is_some(), self.heartbeat);

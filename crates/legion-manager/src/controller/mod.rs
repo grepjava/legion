@@ -27,7 +27,12 @@ const PERIOD: Duration = Duration::from_secs(5);
 
 /// Runs the controllers whenever this manager leads, until `closing` turns
 /// true.
-pub async fn run(store: Store, id: NodeId, mut closing: watch::Receiver<bool>) {
+pub async fn run(
+    store: Store,
+    id: NodeId,
+    usage: std::sync::Arc<crate::usage::Usage>,
+    mut closing: watch::Receiver<bool>,
+) {
     let mut metrics = store.raft.metrics();
     loop {
         // Wait for leadership.
@@ -45,7 +50,7 @@ pub async fn run(store: Store, id: NodeId, mut closing: watch::Receiver<bool>) {
         }
         tracing::info!("leading: controllers started");
         tokio::select! {
-            _ = lead(&store) => {}
+            _ = lead(&store, &usage) => {}
             _ = lost(&mut metrics, id) => tracing::info!("no longer leading: controllers stopped"),
             _ = closing.wait_for(|c| *c) => return,
         }
@@ -63,7 +68,7 @@ async fn lost(
     }
 }
 
-async fn lead(store: &Store) {
+async fn lead(store: &Store, usage: &crate::usage::Usage) {
     let mut memory = Memory::default();
     loop {
         let from = match store.applied_version() {
@@ -74,6 +79,7 @@ async fn lead(store: &Store) {
                 continue;
             }
         };
+        memory.usage = usage.fresh();
         let wake = pass(store, &mut memory).await;
         // Sleep until something changes, the planned wake-up, or the period.
         let mut watcher = match store.watch(from, None) {

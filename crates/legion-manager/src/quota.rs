@@ -150,7 +150,11 @@ fn needs_requests(quota: &Quota, spec: &ServiceSpec, namespace: &str) -> Result<
 fn add_service(u: &mut Usage, s: &ServiceSpec, nodes: u32) {
     let n = match s.mode {
         ServiceMode::Global => nodes,
-        _ => s.replicas.unwrap_or(1),
+        // Autoscaled: as many as it may grow to.
+        _ => s
+            .autoscale
+            .as_ref()
+            .map_or(s.replicas.unwrap_or(1), |a| a.max),
     };
     u.add_tasks(s.pod.requests(), n);
 }

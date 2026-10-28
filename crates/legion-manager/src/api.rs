@@ -49,6 +49,8 @@ pub struct ApiService {
     pub(crate) quota_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// The agents connected to this manager, for sessions with their tasks.
     pub(crate) sessions: std::sync::Arc<crate::session::Hub>,
+    /// What tasks use, as heartbeats report it.
+    pub(crate) usage: std::sync::Arc<crate::usage::Usage>,
 }
 
 enum Route {

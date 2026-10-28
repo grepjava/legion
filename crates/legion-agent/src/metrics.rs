@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use legion_api::dispatch::TaskUsage;
 use legion_api::metrics::Metrics;
 use legion_sys::Sys;
 
@@ -108,17 +109,28 @@ impl<R> Clone for AgentMetrics<R> {
 
 /// A running container of a pod.
 struct Running {
+    /// An app container, not an init container.
+    app: bool,
     namespace: String,
     task: String,
     container: String,
     jail: String,
 }
 
+/// What rctl gave of a container, by resource.
+type Reading = Result<BTreeMap<String, u64>, String>;
+
+/// Running containers with what rctl gave of each, and the pods.
+struct Read {
+    pods: usize,
+    containers: Vec<(Running, Reading)>,
+}
+
 impl<R: Runtime> AgentMetrics<R> {
     pub async fn collect(&self) -> Metrics {
         let mut m = Metrics::default();
-        let found = match self.runtime.list(&[(LABEL_NODE, &self.node)]).await {
-            Ok(f) => f,
+        let read = match self.read().await {
+            Ok(r) => r,
             Err(e) => {
                 tracing::warn!("listing containers for metrics: {e}");
                 m.gauge(
@@ -134,49 +146,18 @@ impl<R: Runtime> AgentMetrics<R> {
             "1 if the agent reached its Podman, else 0.",
         )
         .sample(&[], 1.0);
-        let role = |c: &legion_podman::ContainerSummary| {
-            c.labels.get(LABEL_ROLE).and_then(|r| Role::parse(r))
-        };
-        let infra: BTreeMap<&str, &str> = found
-            .iter()
-            .filter(|c| role(c) == Some(Role::Infra) && c.state == "running")
-            .filter_map(|c| Some((c.labels.get(LABEL_TASK)?.as_str(), c.id.as_str())))
-            .collect();
         m.gauge("legion_agent_pods", "Pods running on the node.")
-            .sample(&[], infra.len() as f64);
-        let running: Vec<Running> = found
-            .iter()
-            .filter(|c| matches!(role(c), Some(Role::Init | Role::App)) && c.state == "running")
-            .filter_map(|c| {
-                let infra = infra.get(c.labels.get(LABEL_TASK)?.as_str())?;
-                let (namespace, task) = c.labels.get(LABEL_TASK_NAME)?.split_once('/')?;
-                Some(Running {
-                    namespace: namespace.to_owned(),
-                    task: task.to_owned(),
-                    container: c.labels.get(LABEL_CONTAINER)?.clone(),
-                    jail: pod::child_jail(infra, &c.id),
-                })
-            })
-            .collect();
+            .sample(&[], read.pods as f64);
         m.gauge(
             "legion_agent_containers",
             "Containers of pods running on the node, the infra containers aside.",
         )
-        .sample(&[], running.len() as f64);
-
-        let jails: Vec<String> = running.iter().map(|r| r.jail.clone()).collect();
-        let usage = crate::task::blocking(&self.sys, move |sys| {
-            jails
-                .iter()
-                .map(|j| sys.rctl_usage(j).map_err(|e| e.to_string()))
-                .collect::<Vec<_>>()
-        })
-        .await;
+        .sample(&[], read.containers.len() as f64);
         let mut unread = 0;
-        let mut read = Vec::new();
-        for (r, u) in running.iter().zip(usage) {
+        let mut usage = Vec::new();
+        for (r, u) in &read.containers {
             match u {
-                Ok(u) => read.push((r, u)),
+                Ok(u) => usage.push((r, u)),
                 Err(e) => {
                     tracing::debug!(task = %r.task, container = %r.container, "reading usage: {e}");
                     unread += 1;
@@ -194,7 +175,7 @@ impl<R: Runtime> AgentMetrics<R> {
             } else {
                 m.gauge(name, help)
             };
-            for (r, u) in &read {
+            for (r, u) in &usage {
                 if let Some(v) = u.get(key) {
                     f.sample(
                         &[
@@ -208,5 +189,77 @@ impl<R: Runtime> AgentMetrics<R> {
             }
         }
         m
+    }
+
+    /// What each running task's app containers use together, by
+    /// `namespace/task`, for the autoscaler. A task with a container rctl
+    /// gave nothing for is left out.
+    pub async fn tasks(&self) -> Vec<(String, TaskUsage)> {
+        let Ok(read) = self.read().await else {
+            return Vec::new();
+        };
+        let mut tasks: BTreeMap<String, Option<TaskUsage>> = BTreeMap::new();
+        for (r, u) in &read.containers {
+            if !r.app {
+                continue;
+            }
+            let entry = tasks
+                .entry(format!("{}/{}", r.namespace, r.task))
+                .or_insert(Some(TaskUsage::default()));
+            match (entry.as_mut(), u) {
+                (Some(t), Ok(u)) => {
+                    t.cpu += u.get("pcpu").copied().unwrap_or(0) as f64;
+                    t.memory += u.get("memoryuse").copied().unwrap_or(0);
+                }
+                _ => *entry = None,
+            }
+        }
+        tasks
+            .into_iter()
+            .filter_map(|(task, u)| Some((task, u?)))
+            .collect()
+    }
+
+    async fn read(&self) -> Result<Read, String> {
+        let found = self
+            .runtime
+            .list(&[(LABEL_NODE, &self.node)])
+            .await
+            .map_err(|e| e.to_string())?;
+        let role = |c: &legion_podman::ContainerSummary| {
+            c.labels.get(LABEL_ROLE).and_then(|r| Role::parse(r))
+        };
+        let infra: BTreeMap<&str, &str> = found
+            .iter()
+            .filter(|c| role(c) == Some(Role::Infra) && c.state == "running")
+            .filter_map(|c| Some((c.labels.get(LABEL_TASK)?.as_str(), c.id.as_str())))
+            .collect();
+        let running: Vec<Running> = found
+            .iter()
+            .filter(|c| matches!(role(c), Some(Role::Init | Role::App)) && c.state == "running")
+            .filter_map(|c| {
+                let infra = infra.get(c.labels.get(LABEL_TASK)?.as_str())?;
+                let (namespace, task) = c.labels.get(LABEL_TASK_NAME)?.split_once('/')?;
+                Some(Running {
+                    app: role(c) == Some(Role::App),
+                    namespace: namespace.to_owned(),
+                    task: task.to_owned(),
+                    container: c.labels.get(LABEL_CONTAINER)?.clone(),
+                    jail: pod::child_jail(infra, &c.id),
+                })
+            })
+            .collect();
+        let jails: Vec<String> = running.iter().map(|r| r.jail.clone()).collect();
+        let usage = crate::task::blocking(&self.sys, move |sys| {
+            jails
+                .iter()
+                .map(|j| sys.rctl_usage(j).map_err(|e| e.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .await;
+        Ok(Read {
+            pods: infra.len(),
+            containers: running.into_iter().zip(usage).collect(),
+        })
     }
 }

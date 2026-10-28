@@ -111,6 +111,7 @@ impl Cluster {
         config.zfs_root = Some("tank/legion".into());
         config.infra_image = INFRA.into();
         config.resync = Duration::from_millis(100);
+        config.usage_period = Duration::from_millis(100);
         config.wireguard = Some(WireGuardConfig {
             key_file,
             port: 51820,
@@ -578,5 +579,83 @@ async fn a_rollback_returns_stateful_data_to_the_update_snapshot() {
         .find(|t| t.metadata.name == "db-0-3")
         .unwrap();
     assert_eq!(t.spec["pod"]["containers"][0]["image"], "web:1");
+    c.stop().await;
+}
+
+impl Cluster {
+    /// Every app container of a pod, on every node, uses `pcpu` percent
+    /// of a CPU from now on, as rctl would report.
+    async fn load(&self, pcpu: u64) {
+        use legion_agent::Runtime;
+        use legion_agent::pod::{LABEL_ROLE, LABEL_TASK, child_jail};
+        for node in &self.nodes {
+            let found = node.rt.list(&[]).await.unwrap();
+            for c in &found {
+                if c.labels.get(LABEL_ROLE).map(String::as_str) != Some("app") {
+                    continue;
+                }
+                let infra = found.iter().find(|i| {
+                    i.labels.get(LABEL_ROLE).map(String::as_str) == Some("infra")
+                        && i.labels.get(LABEL_TASK) == c.labels.get(LABEL_TASK)
+                });
+                if let Some(infra) = infra {
+                    node.sys.set_usage(
+                        &child_jail(&infra.id, &c.id),
+                        &[("pcpu", pcpu), ("memoryuse", 1 << 20)],
+                    );
+                }
+            }
+        }
+    }
+
+    async fn running(&self) -> usize {
+        self.list(Kind::Task)
+            .await
+            .iter()
+            .filter(|t| t.status["state"] == "running" && t.spec["desiredState"] == "running")
+            .count()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_busy_service_grows_from_what_its_nodes_report() {
+    let c = Cluster::start(2).await;
+    c.apply(
+        r#"
+apiVersion: legion/v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  autoscale: { min: 1, max: 3, cpu: 50, downDelay: 1s }
+  pod:
+    containers:
+      - { name: web, image: "web:1", resources: { requests: { cpu: 500m } } }
+"#,
+    )
+    .await;
+    eventually("one task running", async || c.running().await == 1).await;
+
+    // A whole CPU against half a CPU requested: four times the target.
+    c.load(100).await;
+    eventually("three tasks running", async || {
+        c.load(100).await;
+        c.running().await == 3
+    })
+    .await;
+    let status = &c
+        .list(Kind::Service)
+        .await
+        .into_iter()
+        .find(|s| s.metadata.name == "web")
+        .unwrap()
+        .status;
+    assert_eq!(status["autoscale"]["replicas"], 3, "{status}");
+
+    // Idle: back to one once the delay has passed.
+    eventually("one task again", async || {
+        c.load(0).await;
+        c.running().await == 1
+    })
+    .await;
     c.stop().await;
 }

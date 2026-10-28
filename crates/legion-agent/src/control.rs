@@ -9,6 +9,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use legion_api::dispatch::TaskUsage;
 pub use legion_api::dispatch::{
     Assignment, Assignments, EndpointPort, Endpoints, Peer, Peers, Policies, ServiceEndpoints,
     VolumeClaim,
@@ -96,9 +97,14 @@ pub trait Control: Send + Sync + 'static {
         name: &str,
     ) -> impl Future<Output = Result<Option<Vec<u8>>, ControlError>> + Send;
 
-    /// Tells the managers `node` is alive; returns how long to wait before
-    /// the next heartbeat.
-    fn heartbeat(&self, node: &str) -> impl Future<Output = Result<Duration, ControlError>> + Send;
+    /// Tells the managers `node` is alive, with what its tasks use when
+    /// read since the last heartbeat (by `namespace/task`); returns how
+    /// long to wait before the next heartbeat.
+    fn heartbeat(
+        &self,
+        node: &str,
+        usage: Vec<(String, TaskUsage)>,
+    ) -> impl Future<Output = Result<Duration, ControlError>> + Send;
 
     /// Sessions users open with the node's tasks, as any manager offers
     /// them.
@@ -622,9 +628,26 @@ impl Control for GrpcControl {
         rx
     }
 
-    async fn heartbeat(&self, node: &str) -> Result<Duration, ControlError> {
+    async fn heartbeat(
+        &self,
+        node: &str,
+        usage: Vec<(String, TaskUsage)>,
+    ) -> Result<Duration, ControlError> {
+        let usage = usage
+            .into_iter()
+            .filter_map(|(key, u)| {
+                let (namespace, task) = key.split_once('/')?;
+                Some(legion_proto::v1::TaskUsage {
+                    namespace: namespace.to_owned(),
+                    task: task.to_owned(),
+                    cpu_percent: u.cpu,
+                    memory_bytes: u.memory,
+                })
+            })
+            .collect();
         let req = HeartbeatRequest {
             node: node.to_owned(),
+            usage,
         };
         let resp = self
             .call(|mut c| async move { c.heartbeat(req).await })

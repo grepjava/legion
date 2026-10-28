@@ -74,6 +74,9 @@ pub struct AgentConfig {
     /// How long a ready task of a service told to stop keeps running, so
     /// the other nodes stop sending it connections first.
     pub drain: Duration,
+    /// How often heartbeats carry what the node's tasks use, for the
+    /// autoscaler.
+    pub usage_period: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +98,7 @@ impl AgentConfig {
             zfs_root: None,
             wireguard: None,
             drain: Duration::from_secs(2),
+            usage_period: Duration::from_secs(15),
         }
     }
 }
@@ -102,6 +106,7 @@ impl AgentConfig {
 pub struct Agent<R, C> {
     ctx: Ctx<R, C>,
     resync: Duration,
+    usage_period: Duration,
     wireguard: Option<WireGuardConfig>,
 }
 
@@ -128,6 +133,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 drain: config.drain,
             },
             resync: config.resync,
+            usage_period: config.usage_period,
             wireguard: config.wireguard,
         }
     }
@@ -190,7 +196,16 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             r = register(&ctx, &status) => r,
             _ = &mut shutdown => return,
         };
-        let heartbeats = tokio::spawn(heartbeats(ctx.control.clone(), ctx.node.clone()));
+        let heartbeats = tokio::spawn(heartbeats(
+            ctx.control.clone(),
+            ctx.node.clone(),
+            metrics::AgentMetrics {
+                runtime: ctx.runtime.clone(),
+                sys: ctx.sys.clone(),
+                node: ctx.node.clone(),
+            },
+            self.usage_period,
+        ));
         let sessions = tokio::spawn(session::serve(
             ctx.runtime.clone(),
             ctx.node.clone(),
@@ -691,12 +706,24 @@ async fn policing_loop(
 }
 
 /// Sends heartbeats for `node` as often as the managers ask, for as long
-/// as the agent runs.
-async fn heartbeats<C: Control>(control: Arc<C>, node: String) {
+/// as the agent runs, with its tasks' use every `usage_period`.
+async fn heartbeats<R: Runtime, C: Control>(
+    control: Arc<C>,
+    node: String,
+    metrics: metrics::AgentMetrics<R>,
+    usage_period: Duration,
+) {
     let mut period = Duration::from_secs(1);
     let mut failing = false;
+    let mut usage_due = tokio::time::Instant::now();
     loop {
-        match control.heartbeat(&node).await {
+        let usage = if tokio::time::Instant::now() >= usage_due {
+            usage_due = tokio::time::Instant::now() + usage_period;
+            metrics.tasks().await
+        } else {
+            Vec::new()
+        };
+        match control.heartbeat(&node, usage).await {
             Ok(p) => {
                 if failing {
                     tracing::info!("heartbeats reach the managers again");

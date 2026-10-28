@@ -68,6 +68,7 @@ impl Job {
         Service {
             object: self.object.clone(),
             spec: ServiceSpec {
+                autoscale: None,
                 mode: match self.spec.mode {
                     JobMode::Replicated => ServiceMode::Replicated,
                     JobMode::Global => ServiceMode::Global,

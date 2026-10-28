@@ -109,3 +109,12 @@ pub enum VolumeClaim {
     /// Another node holds the volume's data.
     Elsewhere(String),
 }
+
+/// What a running task's containers use together, as its node last read
+/// it from rctl.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct TaskUsage {
+    /// In percent of one CPU.
+    pub cpu: f64,
+    pub memory: u64,
+}

@@ -114,7 +114,7 @@ One binary, `legion`, with two roles:
 | Job / CronJob | Job, CronJob | Run-to-completion tasks; CronJob creates Jobs on schedule with concurrency policy and history limit. |
 | Node health | Heartbeats | Marks nodes `down` after three missed heartbeats (5 s each; a new leader allows three from taking over) and `ready` when heard from again; marks their tasks orphaned so the Service controller replaces them. |
 | Endpoints | Task readiness | Per-service list of ready task IPs, pushed to every agent for load balancing and DNS. |
-| Autoscaler (phase 4) | Task metrics | Adjusts replicas between min and max to hit a CPU or memory target. |
+| Autoscaler | Task use from heartbeats | A replicated service's `autoscale: {min, max, cpu, memory, downDelay}` sets its replica count (`status.autoscale.replicas`; `spec.replicas` is only where it starts) so its ready tasks' average use comes to the targets, percentages of the containers' requests. Part of the Service controller's pass. |
 | Cert rotation | Node certs | Renews certificates before expiry; rotates root CA on demand. |
 
 The Service controller and the scheduler are built (`legion-manager`,
@@ -493,7 +493,7 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
 | Disruption budgets | `maxUnavailable` on the service, honoured by drain and updates. | 3 |
 | Stateful services | `mode: stateful`: stable names `<svc>-<n>`, per-ordinal ZFS volumes from claims, ordered rollout (3.3). Data moves between nodes with `zfs send/recv`. | 4 |
 | Ingress | A system global service running haproxy, configured from routes Legion renders from service labels. | 4 |
-| Autoscaling | CPU and memory targets read from rctl; no separate metrics server. | 4 |
+| Autoscaling | CPU and memory targets read from rctl; no separate metrics server. Every `usagePeriod` (15 s) an agent's heartbeat carries what each running task's app containers use together (rctl `pcpu` and `memoryuse`); the leader keeps the reports in memory for a minute, believing each only from the task's own node. Each pass, a service with `autoscale` wants `ceil(measured × use / target)` replicas over its ready tasks with a report, for the target asking most, between `min` and `max`, and keeps its count while use is within a tenth of every target; ready tasks without a report count as idle for growing and on target for shrinking. Passes are far more frequent than reports, so the count follows from the reports alone. It grows at once and shrinks only to the most recommended over the last `downDelay` (5 min); a new leader waits that long before shrinking. Admission needs a target, `1 ≤ min ≤ max`, and every container requesting what a target measures; quotas count `max` tasks, so the service fits whatever it scales to. | 4 |
 | `apply` / `diff` | Server-side apply with field ownership kept simple: last applier wins per object. | 1 |
 | `logs`, `exec`, `port-forward` | Streamed through the manager to the agent, under RBAC (3.8). | 3 |
 
