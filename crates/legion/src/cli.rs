@@ -14,7 +14,7 @@ use legion_proto::v1::{
 };
 use tonic::transport::Channel;
 
-use crate::{Command, StackCommand};
+use crate::{Command, StackCommand, UserCommand};
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Format {
@@ -58,6 +58,45 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             println!("{token}");
         }
         Command::Join { .. } => unreachable!("handled in main"),
+        Command::User {
+            command:
+                UserCommand::Create {
+                    name,
+                    role,
+                    namespace,
+                    output,
+                    days,
+                },
+        } => {
+            let path = output.unwrap_or_else(|| format!("{name}.pem").into());
+            if path.exists() {
+                bail!("{} exists; choose another with -o", path.display());
+            }
+            let (key_pem, csr_pem) = legion_pki::request()?;
+            let issued = cluster
+                .issue_user(pb::IssueUserRequest {
+                    name: name.clone(),
+                    csr_pem,
+                    days,
+                })
+                .await?
+                .into_inner();
+            let bundle = legion_pki::Bundle {
+                cert_pem: issued.cert_pem,
+                key_pem,
+                ca_pem: issued.ca_pem,
+            };
+            crate::pki::write_private(&path, &bundle.to_pem())?;
+            println!(
+                "wrote {}: user {name}'s credentials for {days} days; hand it to them                  for --identity",
+                path.display()
+            );
+            if let (Some(role), Some(namespace)) = (role, namespace) {
+                let spec = serde_json::json!({ "user": name, "role": role });
+                let binding = Object::new(Kind::RoleBinding, &namespace, &name, spec);
+                apply(&mut objects, &binding).await?;
+            }
+        }
         Command::Apply { files } => {
             for file in files {
                 for object in read_objects(&file)? {
@@ -251,8 +290,17 @@ async fn stack(objects: &mut ObjectsClient<Channel>, command: StackCommand) -> a
             if strict && !converted.warnings.is_empty() {
                 bail!("{} cannot be deployed as it is (--strict)", file.display());
             }
+            // A user may not create namespaces; one with a role in this
+            // one deploys into it as the cluster admin made it.
             let ns = Object::new(Kind::Namespace, "", &namespace, serde_json::json!({}));
-            apply(objects, &ns).await?;
+            if let Err(e) = apply(objects, &ns).await {
+                let denied = e
+                    .downcast_ref::<tonic::Status>()
+                    .is_some_and(|s| s.code() == tonic::Code::PermissionDenied);
+                if !denied {
+                    return Err(e);
+                }
+            }
             for object in &converted.objects {
                 apply(objects, object).await?;
             }

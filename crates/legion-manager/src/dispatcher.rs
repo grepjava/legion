@@ -121,7 +121,7 @@ impl DispatcherService {
                 }
                 Role::Manager if named.is_empty() => id.name,
                 Role::Manager => named.to_owned(),
-                Role::Admin => {
+                Role::Admin | Role::User => {
                     return Err(Status::permission_denied(format!(
                         "{id} may not call the dispatcher"
                     )));

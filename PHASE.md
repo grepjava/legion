@@ -317,7 +317,57 @@ new connections until the node is marked down (three missed 5 s
 heartbeats), which a faster down signal or per-connection retry could
 shorten.
 
+## Phase 3 — K8s-lite
+
+Exit criterion (DESIGN.md §11): two teams share a cluster with isolation
+enforced.
+
+Already there from phase 1: namespaces scope names and DNS
+(`<svc>.<ns>.legion`), and startup probes run.
+
+### Done
+
+- **RBAC and users** (`legion-manager::authz`, `legion_api::rbac`,
+  `legion user create`): certificates for people carry the role `user`;
+  `legion user create <name> [--role R -n NS] [-o FILE] [--days N]` makes
+  the key where it runs, has a manager sign a request for it (`IssueUser`,
+  cluster admin only) and writes a bundle (mode 0600, never overwritten),
+  plus a RoleBinding named after the user. A `RoleBinding` gives `view`,
+  `edit` or `admin` in its namespace (DESIGN.md §9); users never touch
+  cluster-scoped objects, `init` or join tokens, and lists and watches
+  across namespaces show only what they may read. The manager a request
+  reaches first decides, before forwarding. `stack deploy` by a user
+  skips creating the namespace. Tested: through the API, each role's
+  reads and writes, Secrets, other namespaces, cluster-scoped kinds,
+  filtered lists and watches, revocation by deleting the binding, and who
+  may issue certificates; through the CLI, `user create` and a user
+  applying, listing and deploying a stack in their namespace only.
+
+### To do, in order
+
+The first three are what the exit criterion rests on: who may do what,
+what may talk to what, and how much each team may use; RBAC is done.
+
+1. **Namespace isolation and network policy**: by default a task reaches
+   tasks of its own namespace and the node's DNS only; `NetworkPolicy`
+   allows more by namespace, labels and ports, compiled to the
+   `legion/policy` anchor and enforced on the destination node
+   (DESIGN.md §5.6).
+2. **Namespace quotas**: limits on the requests, tasks and volumes a
+   namespace may hold, checked at admission and by the scheduler.
+3. **`logs`, `exec`, `port-forward`**: streamed from the agent through a
+   manager, under RBAC (`exec` and `port-forward` need `edit`).
+4. **Init containers**: run in order to completion before the main ones.
+5. **Jobs and CronJobs**: run to completion, retries and deadlines; cron
+   schedules, concurrency policy, history limits.
+6. **Disruption budgets**: `maxUnavailable` honoured by drain and updates.
+7. **Security profiles**: the jail defaults in DESIGN.md §9, loosened per
+   service only explicitly.
+8. **Metrics**: a Prometheus endpoint on each manager and agent.
+9. **Exit test**: two teams, each with its own user and namespace, deploy
+    on the same cluster; neither can read or change the other's objects,
+    reach the other's tasks, or exceed its quota.
+
 ## Later phases
 
-See DESIGN.md §11: 2 Cluster (MVP), 3 K8s-lite, 4 Stateful and operations,
-5 Extensions.
+See DESIGN.md §11: 4 Stateful and operations, 5 Extensions.

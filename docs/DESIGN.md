@@ -846,6 +846,16 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
   the reserved namespace `legion-system`, which the API never exposes.
 - **Users**: `legion user create alice --role edit -n shop` issues a client
   certificate bundle. RBAC binds the certificate identity to roles per namespace.
+  Built (phase 3): user certificates carry the role `user`; the CLI makes
+  the key and sends the manager only a certificate request (`IssueUser`,
+  cluster admin only, any manager signs). A `RoleBinding` (`spec: {user,
+  role}`) gives `view` (read all but Secrets), `edit` (also Secrets, and
+  apply and delete) or `admin` (also the namespace's RoleBindings). Users
+  never act on cluster-scoped objects, `init` or join tokens; lists and
+  watches across namespaces show only what they may read. The manager a
+  request reaches first decides, from its own replica, before forwarding,
+  so a binding deleted takes effect there as soon as it replicates. The
+  cluster admin (`admin.pem`) and managers keep every right.
 - **Encryption at rest**: Raft log and snapshots are encrypted with a data key.
   With autolock, the data key is wrapped by a key held by the operator and
   managers need `legion unlock` after restart.

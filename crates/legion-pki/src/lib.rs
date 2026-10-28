@@ -42,9 +42,11 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub enum Role {
     Manager,
     Worker,
-    /// A person or tool using the API with full rights (RBAC narrows this
-    /// in phase 3).
+    /// The cluster administrator: every right on the API.
     Admin,
+    /// A person using the API with the rights their RoleBindings give, in
+    /// the namespaces they name.
+    User,
 }
 
 impl Role {
@@ -53,6 +55,7 @@ impl Role {
             Role::Manager => "manager",
             Role::Worker => "worker",
             Role::Admin => "admin",
+            Role::User => "user",
         }
     }
 
@@ -61,6 +64,7 @@ impl Role {
             "manager" => Some(Role::Manager),
             "worker" => Some(Role::Worker),
             "admin" => Some(Role::Admin),
+            "user" => Some(Role::User),
             _ => None,
         }
     }

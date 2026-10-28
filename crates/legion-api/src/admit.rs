@@ -70,7 +70,8 @@ pub fn admit(obj: &mut Object) -> Result<(), Error> {
         Kind::Secret | Kind::Config => normalise::<DataSpec>(spec),
         Kind::Volume => normalise::<VolumeSpec>(spec),
         Kind::Task => return Err(Error::Managed(obj.kind)),
-        Kind::Job | Kind::CronJob | Kind::NetworkPolicy | Kind::Route | Kind::RoleBinding => {
+        Kind::RoleBinding => normalise::<crate::rbac::RoleBindingSpec>(spec),
+        Kind::Job | Kind::CronJob | Kind::NetworkPolicy | Kind::Route => {
             return Err(Error::Unsupported(obj.kind));
         }
     };

@@ -957,3 +957,204 @@ async fn workers_follow_their_work_through_any_manager() {
         m.stop().await;
     }
 }
+
+fn object(kind: &str, namespace: &str, name: &str, spec: serde_json::Value) -> ApplyRequest {
+    apply(Object {
+        kind: kind.into(),
+        namespace: namespace.into(),
+        name: name.into(),
+        spec_json: spec.to_string().into_bytes(),
+        ..Default::default()
+    })
+}
+
+fn binding(namespace: &str, user: &str, role: &str) -> ApplyRequest {
+    object(
+        "RoleBinding",
+        namespace,
+        user,
+        serde_json::json!({ "user": user, "role": role }),
+    )
+}
+
+/// The message of a refusal.
+fn denied<T>(r: Result<T, tonic::Status>) -> String {
+    match r {
+        Err(e) if e.code() == Code::PermissionDenied => e.message().to_owned(),
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("allowed"),
+    }
+}
+
+fn get(kind: &str, namespace: &str, name: &str) -> ObjectRef {
+    ObjectRef {
+        kind: kind.into(),
+        namespace: namespace.into(),
+        name: name.into(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn users_act_within_their_role_bindings() {
+    let ca = Ca::generate().unwrap();
+    let m = Running::start_with(Some(&ca)).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let mut admin = m.objects().await;
+    let web = |ns: &str| {
+        let mut s = service("web", 1);
+        s.namespace = ns.into();
+        apply(s)
+    };
+    for req in [
+        web("a"),
+        web("b"),
+        object(
+            "Secret",
+            "a",
+            "key",
+            serde_json::json!({ "text": "s3cret" }),
+        ),
+        binding("a", "alice", "view"),
+        binding("a", "bob", "edit"),
+        binding("a", "carol", "admin"),
+    ] {
+        eventually(|| {
+            let mut admin = admin.clone();
+            let req = req.clone();
+            async move { admin.apply(req).await }
+        })
+        .await;
+    }
+    let user = |name: &str| {
+        let creds = creds(&ca, name, Role::User);
+        let m = &m;
+        async move {
+            let channel = m.channel(Some(&creds)).await.unwrap();
+            (
+                ObjectsClient::new(channel.clone()),
+                ClusterClient::new(channel),
+            )
+        }
+    };
+
+    // view reads its namespace, but not Secrets, and changes nothing.
+    let (mut alice, mut alice_cluster) = user("alice").await;
+    alice.get(get("Service", "a", "web")).await.unwrap();
+    let why = denied(alice.get(get("Service", "b", "web")).await);
+    assert!(why.contains("no role in namespace b"), "{why}");
+    let why = denied(alice.get(get("Secret", "a", "key")).await);
+    assert!(why.contains("takes edit"), "{why}");
+    denied(alice.apply(web("a")).await);
+    // Across namespaces, only what it may read; nothing cluster-scoped.
+    let all = alice
+        .list(ListRequest {
+            kind: "Service".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let seen: Vec<&str> = all.objects.iter().map(|o| o.namespace.as_str()).collect();
+    assert_eq!(seen, ["a"]);
+    denied(
+        alice
+            .list(ListRequest {
+                kind: "Node".into(),
+                ..Default::default()
+            })
+            .await,
+    );
+    denied(alice_cluster.init(InitRequest {}).await);
+    denied(
+        alice_cluster
+            .join_token(JoinTokenRequest {
+                role: "worker".into(),
+                rotate: false,
+            })
+            .await,
+    );
+    alice_cluster.status(StatusRequest {}).await.unwrap();
+
+    // A watch of every namespace shows only its own.
+    let from = all.version;
+    let mut events = alice
+        .watch(WatchRequest {
+            kind: "Service".into(),
+            from_version: from,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut other = service("other", 1);
+    other.namespace = "b".into();
+    admin.apply(apply(other)).await.unwrap();
+    let mut mine = service("mine", 1);
+    mine.namespace = "a".into();
+    admin.apply(apply(mine)).await.unwrap();
+    // The controller writes statuses meanwhile: read until "mine".
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), events.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let o = event.object.unwrap();
+        assert_eq!(o.namespace, "a", "{} from another namespace", o.name);
+        if o.name == "mine" {
+            break;
+        }
+    }
+
+    // edit reads Secrets and changes objects, but not RoleBindings, and
+    // only in its namespace.
+    let (mut bob, _) = user("bob").await;
+    bob.get(get("Secret", "a", "key")).await.unwrap();
+    bob.apply(web("a")).await.unwrap();
+    let why = denied(bob.apply(binding("a", "bob", "admin")).await);
+    assert!(why.contains("takes admin"), "{why}");
+    denied(bob.apply(web("b")).await);
+    denied(
+        bob.delete(DeleteRequest {
+            r#ref: Some(get("Service", "b", "web")),
+            ..Default::default()
+        })
+        .await,
+    );
+
+    // admin manages the namespace's bindings.
+    let (mut carol, _) = user("carol").await;
+    carol.apply(binding("a", "dave", "view")).await.unwrap();
+    denied(carol.apply(binding("b", "dave", "view")).await);
+
+    // Rights live in the bindings: deleting one takes them away at once.
+    admin
+        .delete(DeleteRequest {
+            r#ref: Some(get("RoleBinding", "a", "alice")),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    denied(alice.get(get("Service", "a", "web")).await);
+
+    // Only the cluster admin certifies users.
+    let (key_pem, csr) = legion_pki::request().unwrap();
+    let issue = |name: &str| legion_proto::v1::IssueUserRequest {
+        name: name.into(),
+        csr_pem: csr.clone(),
+        days: 7,
+    };
+    denied(alice_cluster.issue_user(issue("eve")).await);
+    let issued = m
+        .cluster()
+        .await
+        .issue_user(issue("eve"))
+        .await
+        .unwrap()
+        .into_inner();
+    let bundle = legion_pki::Bundle {
+        cert_pem: issued.cert_pem,
+        key_pem,
+        ca_pem: issued.ca_pem,
+    };
+    assert_eq!(bundle.identity().unwrap(), Identity::new("eve", Role::User));
+}

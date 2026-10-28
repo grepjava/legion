@@ -83,7 +83,7 @@ impl Secrets {
         match role {
             Role::Manager => Some(&mut self.manager),
             Role::Worker => Some(&mut self.worker),
-            Role::Admin => None,
+            Role::Admin | Role::User => None,
         }
     }
 
@@ -128,7 +128,7 @@ impl Issuer {
     /// The token for `role`, made on first use; `rotate` makes a new one.
     /// Leader only: it writes.
     pub async fn token(&self, role: Role, rotate: bool) -> Result<Token, Status> {
-        if role == Role::Admin {
+        if !matches!(role, Role::Manager | Role::Worker) {
             return Err(Status::invalid_argument(
                 "join tokens are for managers and workers",
             ));

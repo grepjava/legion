@@ -81,6 +81,16 @@ legion rollback web -n shop                 # undo the latest update
 legion stack rm shop                        # volumes and their data stay
 ```
 
+`admin.pem` is the cluster admin's. People get their own credentials and a
+role (`view`, `edit` or `admin`) in a namespace; the key is made where the
+command runs:
+
+```sh
+legion user create alice --role edit -n shop   # writes alice.pem; hand it over
+legion --identity alice.pem list services -n shop
+legion delete RoleBinding alice -n shop        # takes her rights away
+```
+
 ## Layout
 
 | Crate | Role |

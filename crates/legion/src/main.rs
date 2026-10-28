@@ -142,6 +142,11 @@ enum Command {
         #[command(subcommand)]
         command: StackCommand,
     },
+    /// People's access: user certificates and their roles.
+    User {
+        #[command(subcommand)]
+        command: UserCommand,
+    },
     /// Roll a service back to the spec its latest update came from.
     Rollback {
         service: String,
@@ -154,6 +159,27 @@ enum Command {
         /// Start after this version (default: changes from now on).
         #[arg(long)]
         from: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum UserCommand {
+    /// Certify a person as user NAME and write their credentials to a file
+    /// to hand them; with --role, also give them that role in a namespace
+    /// (a RoleBinding named after them). The key is made here and never
+    /// sent anywhere.
+    Create {
+        name: String,
+        #[arg(long, value_parser = ["view", "edit", "admin"], requires = "namespace")]
+        role: Option<String>,
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// Where to write the credentials (default: NAME.pem).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// How long the certificate is valid.
+        #[arg(long, default_value_t = 90)]
+        days: u32,
     },
 }
 

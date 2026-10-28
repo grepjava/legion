@@ -23,6 +23,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
+use crate::authz::{Caller, Verb};
 use crate::join::SYSTEM_NAMESPACE;
 use crate::raft_net::{MAX_MESSAGE, connect_lazy};
 
@@ -288,33 +289,12 @@ pub(crate) fn forwarded<T>(inner: T) -> Request<T> {
     req
 }
 
-#[tonic::async_trait]
-impl Objects for ApiService {
-    async fn apply(&self, req: Request<ApplyRequest>) -> Result<Response<ApplyResponse>, Status> {
-        match self.route(&req)? {
-            Route::Leader(mut c) => c.apply(forwarded(req.into_inner())).await,
-            Route::Local => Ok(Response::new(self.apply_local(req.into_inner()).await?)),
-        }
+impl ApiService {
+    fn caller<T>(&self, req: &Request<T>) -> Result<Caller, Status> {
+        Caller::of(req, self.peer_tls.is_some())
     }
 
-    async fn get(&self, req: Request<ObjectRef>) -> Result<Response<pb::Object>, Status> {
-        check_namespace(&req.get_ref().namespace)?;
-        if let Route::Leader(mut c) = self.route(&req)? {
-            return c.get(forwarded(req.into_inner())).await;
-        }
-        let key = parse_ref(Some(req.into_inner()))?;
-        self.consistent().await?;
-        match self.store.get(&key).map_err(internal)? {
-            Some(o) => Ok(Response::new((&o).into())),
-            None => Err(not_found(&key)),
-        }
-    }
-
-    async fn list(&self, req: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
-        if let Route::Leader(mut c) = self.route(&req)? {
-            return c.list(forwarded(req.into_inner())).await;
-        }
-        let req = req.into_inner();
+    async fn list_local(&self, req: ListRequest) -> Result<ListResponse, Status> {
         let kind = parse_kind(&req.kind)?;
         check_namespace(&req.namespace)?;
         let namespace = (!req.namespace.is_empty()).then_some(req.namespace.as_str());
@@ -332,16 +312,74 @@ impl Objects for ApiService {
             })
             .map(pb::Object::from)
             .collect();
-        Ok(Response::new(ListResponse {
+        Ok(ListResponse {
             objects,
             version: listing.version,
-        }))
+        })
+    }
+}
+
+#[tonic::async_trait]
+impl Objects for ApiService {
+    async fn apply(&self, req: Request<ApplyRequest>) -> Result<Response<ApplyResponse>, Status> {
+        if let Some(o) = &req.get_ref().object {
+            let kind = parse_kind(&o.kind)?;
+            let mut namespace = o.namespace.clone();
+            default_namespace(kind, &mut namespace);
+            self.caller(&req)?
+                .check(&self.store, Verb::Write, kind, &namespace)?;
+        }
+        match self.route(&req)? {
+            Route::Leader(mut c) => c.apply(forwarded(req.into_inner())).await,
+            Route::Local => Ok(Response::new(self.apply_local(req.into_inner()).await?)),
+        }
+    }
+
+    async fn get(&self, req: Request<ObjectRef>) -> Result<Response<pb::Object>, Status> {
+        check_namespace(&req.get_ref().namespace)?;
+        let key = parse_ref(Some(req.get_ref().clone()))?;
+        self.caller(&req)?
+            .check(&self.store, Verb::Read, key.kind, &key.namespace)?;
+        if let Route::Leader(mut c) = self.route(&req)? {
+            return c.get(forwarded(req.into_inner())).await;
+        }
+        let key = parse_ref(Some(req.into_inner()))?;
+        self.consistent().await?;
+        match self.store.get(&key).map_err(internal)? {
+            Some(o) => Ok(Response::new((&o).into())),
+            None => Err(not_found(&key)),
+        }
+    }
+
+    async fn list(&self, req: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
+        let caller = self.caller(&req)?;
+        let kind = parse_kind(&req.get_ref().kind)?;
+        if !req.get_ref().namespace.is_empty() || kind.is_cluster_scoped() {
+            let mut namespace = req.get_ref().namespace.clone();
+            default_namespace(kind, &mut namespace);
+            caller.check(&self.store, Verb::Read, kind, &namespace)?;
+        }
+        let mut listed = match self.route(&req)? {
+            Route::Leader(mut c) => c.list(forwarded(req.into_inner())).await?,
+            Route::Local => Response::new(self.list_local(req.into_inner()).await?),
+        };
+        // Across namespaces, a user sees those they may read in.
+        if caller != Caller::All {
+            listed
+                .get_mut()
+                .objects
+                .retain(|o| caller.may(&self.store, Verb::Read, kind, &o.namespace));
+        }
+        Ok(listed)
     }
 
     async fn delete(
         &self,
         req: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
+        let key = parse_ref(req.get_ref().r#ref.clone())?;
+        self.caller(&req)?
+            .check(&self.store, Verb::Write, key.kind, &key.namespace)?;
         if let Route::Leader(mut c) = self.route(&req)? {
             return c.delete(forwarded(req.into_inner())).await;
         }
@@ -374,12 +412,17 @@ impl Objects for ApiService {
         &self,
         req: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
+        let caller = self.caller(&req)?;
         let req = req.into_inner();
         let kind = if req.kind.is_empty() {
             None
         } else {
             Some(parse_kind(&req.kind)?)
         };
+        if let Some(k) = kind.filter(|k| k.is_cluster_scoped()) {
+            caller.check(&self.store, Verb::Read, k, "")?;
+        }
+        let store = self.store.clone();
         let mut watcher = self
             .store
             .watch(req.from_version, kind)
@@ -400,7 +443,8 @@ impl Objects for ApiService {
                 };
                 let item = match next {
                     Ok(Event::Put(o) | Event::Delete(o))
-                        if o.metadata.namespace == SYSTEM_NAMESPACE =>
+                        if o.metadata.namespace == SYSTEM_NAMESPACE
+                            || !caller.may(&store, Verb::Read, o.kind, &o.metadata.namespace) =>
                     {
                         continue;
                     }
@@ -429,7 +473,8 @@ impl Objects for ApiService {
 
 #[tonic::async_trait]
 impl Cluster for ApiService {
-    async fn init(&self, _req: Request<InitRequest>) -> Result<Response<StatusResponse>, Status> {
+    async fn init(&self, req: Request<InitRequest>) -> Result<Response<StatusResponse>, Status> {
+        self.caller(&req)?.require_all("initialise the cluster")?;
         let raft = &self.store.raft;
         if raft.is_initialized().await.map_err(internal)? {
             return Err(Status::already_exists(
@@ -461,6 +506,7 @@ impl Cluster for ApiService {
         &self,
         req: Request<pb::JoinTokenRequest>,
     ) -> Result<Response<pb::JoinTokenResponse>, Status> {
+        self.caller(&req)?.require_all("see join tokens")?;
         if let Some(addr) = self.leader_addr(&req)? {
             let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
                 &addr,
@@ -470,11 +516,36 @@ impl Cluster for ApiService {
         }
         let req = req.into_inner();
         let role = Role::parse(&req.role)
-            .filter(|r| *r != Role::Admin)
+            .filter(|r| matches!(r, Role::Manager | Role::Worker))
             .ok_or_else(|| Status::invalid_argument("the role is `manager` or `worker`"))?;
         let token = self.issuer()?.token(role, req.rotate).await?;
         Ok(Response::new(pb::JoinTokenResponse {
             token: token.to_string(),
+        }))
+    }
+
+    async fn issue_user(
+        &self,
+        req: Request<pb::IssueUserRequest>,
+    ) -> Result<Response<pb::IssueUserResponse>, Status> {
+        self.caller(&req)?.require_all("issue user certificates")?;
+        let req = req.into_inner();
+        legion_api::validate_name(&req.name)
+            .map_err(|e| Status::invalid_argument(format!("user name: {e}")))?;
+        let lifetime = match req.days {
+            0 => legion_pki::CERT_LIFETIME,
+            days => std::time::Duration::from_secs(u64::from(days) * 24 * 3600),
+        };
+        // Any manager with the CA key can sign: nothing is written.
+        let ca = &self.issuer()?.ca;
+        let id = legion_pki::Identity::new(&req.name, Role::User);
+        let cert_pem = ca
+            .sign(&req.csr_pem, &id, lifetime)
+            .map_err(|e| Status::invalid_argument(format!("certificate request: {e}")))?;
+        tracing::info!(%id, days = lifetime.as_secs() / 86_400, "issued a user certificate");
+        Ok(Response::new(pb::IssueUserResponse {
+            cert_pem,
+            ca_pem: ca.cert_pem().to_owned(),
         }))
     }
 }

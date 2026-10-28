@@ -8,6 +8,7 @@
 //! managers, the Raft transport only managers. Without it (tests only) everything is plaintext.
 
 mod api;
+mod authz;
 pub mod controller;
 mod dispatcher;
 pub mod join;
@@ -179,8 +180,9 @@ impl Manager {
             server = server.tls_config(tls.server())?;
         }
         let on = self.tls.is_some();
-        // Managers forward writes to the leader as themselves.
-        const API: &[Role] = &[Role::Admin, Role::Manager];
+        // Managers forward writes to the leader as themselves. Users get
+        // what their RoleBindings give (authz.rs).
+        const API: &[Role] = &[Role::Admin, Role::Manager, Role::User];
         const RAFT: &[Role] = &[Role::Manager];
         const DISPATCHER: &[Role] = &[Role::Worker, Role::Manager];
         server

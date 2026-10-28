@@ -314,3 +314,84 @@ fn a_second_manager_joins() {
     ok(&second, &["apply", "-f", manifest.to_str().unwrap()]);
     assert!(ok(&first, &["get", "namespace", "shop"]).contains("name: shop"));
 }
+
+/// Runs a command with another identity.
+fn legion_as(d: &Daemon, identity: &std::path::Path, args: &[&str]) -> Output {
+    Command::new(LEGION)
+        .arg("--server")
+        .arg(&d.server)
+        .arg("--identity")
+        .arg(identity)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn users_get_their_roles() {
+    let d = start_daemon();
+    ok(&d, &["init"]);
+    let dir = d._dir.path();
+    let pem = dir.join("alice.pem");
+    let pem_arg = pem.to_str().unwrap();
+    let made = ok(
+        &d,
+        &[
+            "user", "create", "alice", "--role", "edit", "-n", "shop", "-o", pem_arg,
+        ],
+    );
+    assert!(made.contains("user alice's credentials"), "{made}");
+    assert!(made.contains("RoleBinding/shop/alice created"), "{made}");
+    // Never overwritten.
+    let again = legion(&d, &["user", "create", "alice", "-o", pem_arg]);
+    assert!(!again.status.success());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&pem).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    let manifest = dir.join("web.yaml");
+    std::fs::write(
+        &manifest,
+        "apiVersion: legion/v1\nkind: Service\nmetadata: { name: web, namespace: shop }\n\
+         spec: { pod: { containers: [{ name: web, image: \"web:1\" }] } }\n",
+    )
+    .unwrap();
+    let applied = legion_as(&d, &pem, &["apply", "-f", manifest.to_str().unwrap()]);
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let listed = legion_as(&d, &pem, &["list", "services", "-n", "shop"]);
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("web"));
+    // A stack too, though the user may not create its namespace.
+    let compose = dir.join("compose.yaml");
+    std::fs::write(&compose, "services:\n  api:\n    image: api:1\n").unwrap();
+    let deployed = legion_as(
+        &d,
+        &pem,
+        &["stack", "deploy", "shop", "-c", compose.to_str().unwrap()],
+    );
+    let stdout = String::from_utf8_lossy(&deployed.stdout);
+    assert!(
+        deployed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deployed.stderr)
+    );
+    assert!(stdout.contains("Service/shop/api created"), "{stdout}");
+    // Elsewhere, and on the cluster itself, nothing.
+    for args in [
+        &["list", "services", "-n", "default"][..],
+        &["list", "nodes"],
+        &["join-token", "worker"],
+        &["user", "create", "mallory", "-o", "unused.pem"],
+    ] {
+        let out = legion_as(&d, &pem, args);
+        assert!(!out.status.success(), "{args:?} was allowed");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("user alice"), "{args:?}: {stderr}");
+    }
+}

@@ -198,7 +198,7 @@ fn private_dir(dir: &Path) -> anyhow::Result<()> {
 }
 
 /// Written whole and then renamed, readable by the owner only.
-fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
+pub(crate) fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
     write(path, contents, 0o600)
 }
 

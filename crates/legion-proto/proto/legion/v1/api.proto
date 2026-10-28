@@ -105,6 +105,21 @@ service Cluster {
   // The token that lets a node join with `role` ("manager" or "worker");
   // `rotate` replaces it, so the old token stops working.
   rpc JoinToken(JoinTokenRequest) returns (JoinTokenResponse);
+  // Certifies a person as user `name`, for `days` (90 when 0). The key
+  // stays with the caller, who sends only a certificate request. What the
+  // user may do comes from RoleBindings, not the certificate.
+  rpc IssueUser(IssueUserRequest) returns (IssueUserResponse);
+}
+
+message IssueUserRequest {
+  string name = 1;
+  string csr_pem = 2;
+  uint32 days = 3;
+}
+
+message IssueUserResponse {
+  string cert_pem = 1;
+  string ca_pem = 2;
 }
 
 message JoinTokenRequest {
