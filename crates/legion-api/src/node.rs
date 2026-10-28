@@ -132,6 +132,18 @@ pub enum NodeState {
     Down,
 }
 
+impl NodeState {
+    pub const ALL: [NodeState; 3] = [NodeState::Unknown, NodeState::Ready, NodeState::Down];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NodeState::Unknown => "unknown",
+            NodeState::Ready => "ready",
+            NodeState::Down => "down",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Platform {
     /// `freebsd`.

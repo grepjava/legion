@@ -1087,6 +1087,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "legion-agent",
  "legion-api",
  "legion-manager",

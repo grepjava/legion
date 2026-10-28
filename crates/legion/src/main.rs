@@ -2,6 +2,7 @@
 
 mod cli;
 mod daemon;
+mod metrics;
 mod pki;
 mod session;
 
@@ -69,6 +70,11 @@ enum Command {
         /// the managers recorded at join and learned since.
         #[arg(long = "manager")]
         managers: Vec<String>,
+        /// Serve Prometheus metrics at `http://<addr>/metrics`, without TLS
+        /// or authentication: the names of every namespace's services and
+        /// tasks show there.
+        #[arg(long)]
+        metrics_listen: Option<SocketAddr>,
     },
     /// Start a new cluster with the reached manager as its first member.
     Init,
@@ -279,6 +285,7 @@ async fn main() -> anyhow::Result<()> {
             infra_image,
             zfs_root,
             managers,
+            metrics_listen,
         } => {
             daemon::run(daemon::Options {
                 data_dir,
@@ -290,6 +297,7 @@ async fn main() -> anyhow::Result<()> {
                 infra_image,
                 zfs_root,
                 managers,
+                metrics_listen,
             })
             .await
         }

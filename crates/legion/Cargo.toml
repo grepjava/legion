@@ -10,6 +10,10 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+futures.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 legion-agent.workspace = true
 legion-api.workspace = true
 legion-pki.workspace = true

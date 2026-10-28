@@ -451,6 +451,19 @@ Already there from phase 1: namespaces scope names and DNS
   the hook script against a jail on FreeBSD; and on weft-bsd with real
   Podman and ocijail, a locked-down container refused `ping` at
   securelevel 2 while one allowed raw sockets pinged.
+- **Metrics** (`legion_api::metrics`, `legion-manager::metrics`,
+  `legion-agent::metrics`, DESIGN.md §3.8): `legion daemon
+  --metrics-listen <addr>` serves `/metrics` in Prometheus's text format.
+  Every manager reports Raft; the leader alone reports objects, tasks by
+  state, task restarts, services' replicas and ready tasks, nodes and
+  quota limits beside use; the agent reports each running container's
+  rctl usage (CPU, memory, processes, threads, open files, I/O). Tested:
+  the text format and its escaping, the HTTP endpoint, the leader's
+  report through the API (and nothing from a manager that has stopped,
+  with its store shut down while a handle is held), the agent's report
+  from the fake runtime (the infra jail left out); and on weft-bsd, real
+  rctl usage of both containers in the agent's live test, and the phase
+  1 exit test's daemon scraped once its app was ready.
 
 ### To do, in order
 
@@ -459,8 +472,7 @@ what may talk to what, and how much each team may use; all three are
 done, as are the jail defaults that keep a team's tasks from more than
 their own jails.
 
-1. **Metrics**: a Prometheus endpoint on each manager and agent.
-2. **Exit test**: two teams, each with its own user and namespace, deploy
+1. **Exit test**: two teams, each with its own user and namespace, deploy
     on the same cluster; neither can read or change the other's objects,
     reach the other's tasks, or exceed its quota.
 
@@ -468,8 +480,8 @@ Smaller follow-ups: egress policies; a new pod is unguarded for the
 moment between its start and the agent's next pass (the guard could go in
 before its containers start); lab runs on weft-bsd leave the bridge
 sysctls at 1; the agent tests' timing flakes under load (a different test
-each time: liveness, init containers, restart policy, sessions), each
-passing alone.
+each time: liveness, restart policy, sessions), each
+passing alone; API request counts and latencies in the metrics.
 
 ## Later phases
 

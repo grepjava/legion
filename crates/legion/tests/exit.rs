@@ -25,6 +25,7 @@ use serde_json::Value;
 
 const LEGION: &str = env!("CARGO_BIN_EXE_legion");
 const SERVER: &str = "127.0.0.1:7471";
+const METRICS: &str = "127.0.0.1:7472";
 
 struct Lab {
     dir: PathBuf,
@@ -41,6 +42,7 @@ impl Lab {
             .unwrap();
         let child = Command::new(LEGION)
             .args(["daemon", "--listen", SERVER, "--zfs-root", &self.zfs_root])
+            .args(["--metrics-listen", METRICS])
             .arg("--data-dir")
             .arg(self.dir.join("data"))
             .arg("--run-dir")
@@ -245,6 +247,16 @@ fn sh(cmd: &str) -> String {
 fn app_survives_failures() {
     let dir = PathBuf::from(std::env::var("LEGION_EXIT_LAB").expect("set LEGION_EXIT_LAB"));
     let zfs_root = std::env::var("LEGION_EXIT_ZFS_ROOT").expect("set LEGION_EXIT_ZFS_ROOT");
+    // A failed run leaves its pods running; wiping the lab under them
+    // would orphan them.
+    let jails = sh("jls path");
+    assert!(
+        !jails
+            .lines()
+            .any(|p| p.starts_with(&*dir.to_string_lossy())),
+        "jails from an earlier run still run under {}: remove them first",
+        dir.display()
+    );
     if dir.exists() {
         sh(&format!("chflags -R 0 {0} && rm -rf {0}", dir.display()));
     }
@@ -261,6 +273,45 @@ fn app_survives_failures() {
     // The first run pulls the image.
     wait("the app to be ready", 300, app_ready);
     assert_eq!(running("web").len(), 2);
+
+    // Prometheus sees the cluster and what each container uses. The kernel
+    // updates a jail's resident memory once a second, so a container that
+    // has only just started may show none yet.
+    let scrape = || {
+        let (code, metrics) = get_at(METRICS, "/metrics").expect("metrics");
+        assert_eq!(code, 200, "{metrics}");
+        metrics
+    };
+    let mut metrics = scrape();
+    for line in [
+        "legion_raft_leader 1",
+        "legion_nodes{state=\"ready\"} 1",
+        "legion_service_replicas{namespace=\"shop\",service=\"web\"} 2",
+        "legion_service_ready_tasks{namespace=\"shop\",service=\"web\"} 2",
+        "legion_tasks{namespace=\"shop\",state=\"running\"} 4",
+        "legion_agent_pods 4",
+        "legion_agent_usage_unread 0",
+    ] {
+        assert!(
+            metrics.lines().any(|l| l == line),
+            "{line} in:
+{metrics}"
+        );
+    }
+    let memory = |metrics: &str| -> Vec<f64> {
+        metrics
+            .lines()
+            .filter(|l| l.starts_with("legion_container_memory_bytes{namespace=\"shop\","))
+            .filter_map(|l| l.rsplit(' ').next()?.parse().ok())
+            .collect()
+    };
+    assert_eq!(memory(&metrics).len(), 4, "{metrics}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !memory(&metrics).iter().all(|m| *m > 0.0) {
+        assert!(Instant::now() < deadline, "{metrics}");
+        std::thread::sleep(Duration::from_millis(500));
+        metrics = scrape();
+    }
 
     // Each service has a VIP, and names resolve to it.
     for (svc, vip) in [

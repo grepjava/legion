@@ -34,6 +34,7 @@ struct Harness {
     sys: Arc<FakeSys>,
     rt: Arc<FakeRuntime>,
     agent: Option<(oneshot::Sender<()>, JoinHandle<()>)>,
+    metrics: Option<legion_agent::metrics::AgentMetrics<FakeRuntime>>,
     /// Whether the agent joins the WireGuard mesh.
     mesh: bool,
 }
@@ -86,6 +87,7 @@ impl Harness {
             sys,
             rt,
             agent: None,
+            metrics: None,
             mesh,
         };
         h.start_agent();
@@ -110,6 +112,7 @@ impl Harness {
             self.sys.clone() as Arc<dyn Sys>,
             Arc::new(GrpcControl::new(NODE, vec![self.addr.clone()], None).unwrap()),
         );
+        self.metrics = Some(agent.metrics());
         let (tx, rx) = oneshot::channel();
         let status = NodeStatus {
             state: NodeState::Ready,
@@ -533,18 +536,77 @@ async fn init_containers_run_first_and_can_be_stopped() {
     h.rt.add_image("web:1");
     h.rt.hold_init(true);
     let key = h.task("web-1", WEB).await;
+    // The message comes as the agent turns to the container, which may
+    // not have started yet.
     eventually("the init container", || {
         h.status(&key).message == "init container migrate (1/1)"
+            && h.running() == ["shop_web-1", "shop_web-1_migrate"]
     })
     .await;
     assert_eq!(h.status(&key).state, TaskState::Starting);
-    assert_eq!(h.running(), ["shop_web-1", "shop_web-1_migrate"]);
 
     // An init container that never ends does not hold up a stop.
     h.shut_down(&key).await;
     h.wait_state(&key, TaskState::Shutdown).await;
     assert!(h.rt.containers().is_empty());
     assert!(h.sys.jails().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn containers_report_their_usage() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task(
+            "app-1",
+            r#"
+containers:
+  - { name: app, image: "app:1" }
+  - { name: side, image: "app:1" }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    let jail = |c: &str| {
+        legion_agent::pod::child_jail(
+            &h.rt.id_of("shop_app-1").unwrap(),
+            &h.rt.id_of(&format!("shop_app-1_{c}")).unwrap(),
+        )
+    };
+    h.sys.set_usage(
+        &jail("app"),
+        &[("cputime", 12), ("memoryuse", 4096), ("maxproc", 3)],
+    );
+    h.sys.set_usage(&jail("side"), &[("memoryuse", 1024)]);
+    // The infra jail's usage, which counts its containers', is left out.
+    h.sys
+        .set_usage(&h.rt.id_of("shop_app-1").unwrap(), &[("memoryuse", 5120)]);
+    let text = h.metrics.as_ref().unwrap().collect().await.finish();
+    for line in [
+        "legion_agent_runtime_up 1",
+        "legion_agent_pods 1",
+        "legion_agent_containers 2",
+        "legion_agent_usage_unread 0",
+        "legion_container_cpu_seconds_total{namespace=\"shop\",task=\"app-1\",container=\"app\"} 12",
+        "legion_container_memory_bytes{namespace=\"shop\",task=\"app-1\",container=\"app\"} 4096",
+        "legion_container_memory_bytes{namespace=\"shop\",task=\"app-1\",container=\"side\"} 1024",
+        "legion_container_processes{namespace=\"shop\",task=\"app-1\",container=\"app\"} 3",
+    ] {
+        assert!(
+            text.contains(&format!(
+                "
+{line}
+"
+            )),
+            "{line} in:
+{text}"
+        );
+    }
+    assert!(text.contains(
+        "# TYPE legion_container_cpu_seconds_total counter
+"
+    ));
+    assert!(!text.contains("5120"), "{text}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

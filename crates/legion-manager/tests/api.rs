@@ -34,6 +34,7 @@ struct Running {
     /// Admin credentials, when the manager runs with TLS.
     tls: Option<ClientTlsConfig>,
     store: Store,
+    metrics: legion_manager::metrics::ManagerMetrics,
     stop: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
     _dir: TempDir,
@@ -105,6 +106,7 @@ impl Running {
         .await
         .unwrap();
         let store = manager.store().clone();
+        let metrics = manager.metrics();
         let (stop, stopped) = oneshot::channel();
         let task = tokio::spawn(async move {
             manager
@@ -118,6 +120,7 @@ impl Running {
             addr,
             tls: admin,
             store,
+            metrics,
             stop: Some(stop),
             task,
             _dir: dir,
@@ -1386,4 +1389,100 @@ async fn namespaces_decide_how_far_jails_loosen() {
         .await
         .unwrap();
     m.stop().await;
+}
+
+#[tokio::test]
+async fn the_leader_reports_the_cluster() {
+    let m = Running::start().await;
+    let before = m.metrics.collect().finish();
+    assert!(
+        before.contains(
+            "
+legion_raft_leader 0
+"
+        ),
+        "{before}"
+    );
+    assert!(!before.contains("legion_tasks"), "{before}");
+
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let api = m.objects().await;
+    let apply = |req: ApplyRequest| {
+        let mut api = api.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match api.apply(req.clone()).await {
+                    Err(s)
+                        if s.code() == Code::Unavailable
+                            && tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    r => return r.unwrap(),
+                }
+            }
+        }
+    };
+    apply(object(
+        "Namespace",
+        "",
+        "team",
+        serde_json::json!({ "quota": { "tasks": 5, "volumes": 2 } }),
+    ))
+    .await;
+    apply(object(
+        "Service",
+        "team",
+        "web",
+        serde_json::json!({ "replicas": 2, "pod": { "containers": [{ "name": "c", "image": "c:1" }] } }),
+    ))
+    .await;
+    apply(object("Volume", "team", "data", serde_json::json!({}))).await;
+
+    // The controllers make the tasks; with no node, they wait.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let text = loop {
+        let text = m.metrics.collect().finish();
+        if text.contains(
+            "legion_tasks{namespace=\"team\",state=\"pending\"} 2
+",
+        ) {
+            break text;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{text}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    for line in [
+        "legion_raft_leader 1",
+        "legion_raft_voters 1",
+        "legion_objects{kind=\"Namespace\",namespace=\"\"} 1",
+        "legion_objects{kind=\"Service\",namespace=\"team\"} 1",
+        "legion_objects{kind=\"Task\",namespace=\"team\"} 2",
+        "legion_tasks{namespace=\"team\",state=\"running\"} 0",
+        "legion_task_restarts{namespace=\"team\",task=\"web-1-1\",service=\"web\",node=\"\"} 0",
+        "legion_service_replicas{namespace=\"team\",service=\"web\"} 2",
+        "legion_service_ready_tasks{namespace=\"team\",service=\"web\"} 0",
+        "legion_nodes{state=\"ready\"} 0",
+        "legion_quota_limit{namespace=\"team\",resource=\"tasks\"} 5",
+        "legion_quota_limit{namespace=\"team\",resource=\"volumes\"} 2",
+        "legion_quota_used{namespace=\"team\",resource=\"tasks\"} 0",
+        "legion_quota_used{namespace=\"team\",resource=\"volumes\"} 1",
+    ] {
+        assert!(
+            text.contains(&format!(
+                "
+{line}
+"
+            )),
+            "{line} in:
+{text}"
+        );
+    }
+    assert!(!text.contains("resource=\"cpu\""), "{text}");
+
+    // A scraper holding on does not keep the store open.
+    let metrics = m.metrics.clone();
+    m.stop().await;
+    assert_eq!(metrics.collect().finish(), "");
 }

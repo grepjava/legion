@@ -25,6 +25,7 @@ pub mod control;
 pub mod fake;
 mod files;
 pub mod hook;
+pub mod metrics;
 mod output;
 pub mod pod;
 pub mod policing;
@@ -122,6 +123,15 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             },
             resync: config.resync,
             wireguard: config.wireguard,
+        }
+    }
+
+    /// Reads the node's metrics, also while the agent runs.
+    pub fn metrics(&self) -> metrics::AgentMetrics<R> {
+        metrics::AgentMetrics {
+            runtime: self.ctx.runtime.clone(),
+            sys: self.ctx.sys.clone(),
+            node: self.ctx.node.clone(),
         }
     }
 

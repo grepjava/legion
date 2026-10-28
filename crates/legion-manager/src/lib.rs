@@ -12,6 +12,7 @@ mod authz;
 pub mod controller;
 mod dispatcher;
 pub mod join;
+pub mod metrics;
 mod quota;
 mod raft_net;
 mod security;
@@ -106,6 +107,8 @@ pub struct Manager {
     tls: Option<Tls>,
     heartbeat: std::time::Duration,
     controllers: bool,
+    /// The store as metrics read it, emptied before the store shuts down.
+    metrics: metrics::Slot,
 }
 
 impl Manager {
@@ -120,10 +123,11 @@ impl Manager {
         Ok(Manager {
             id,
             advertise: config.advertise,
-            store,
             tls: config.tls,
             heartbeat: config.heartbeat,
             controllers: config.controllers,
+            metrics: std::sync::Arc::new(std::sync::RwLock::new(Some(store.clone()))),
+            store,
         })
     }
 
@@ -133,6 +137,14 @@ impl Manager {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Reads this manager's metrics until its store shuts down.
+    pub fn metrics(&self) -> metrics::ManagerMetrics {
+        metrics::ManagerMetrics {
+            id: self.id,
+            store: self.metrics.clone(),
+        }
     }
 
     /// Serves the API and Raft transport on `listener` until `shutdown`
@@ -238,6 +250,7 @@ impl Manager {
         let _ = promote.await;
         let _ = dispatching.await;
         tracing::info!("API stopped; shutting down the store");
+        *self.metrics.write().unwrap_or_else(|e| e.into_inner()) = None;
         self.store.shutdown().await?;
         Ok(())
     }

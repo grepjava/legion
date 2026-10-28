@@ -71,6 +71,20 @@ pub enum TaskState {
 }
 
 impl TaskState {
+    pub const ALL: [TaskState; 11] = [
+        TaskState::Pending,
+        TaskState::Assigned,
+        TaskState::Accepted,
+        TaskState::Preparing,
+        TaskState::Starting,
+        TaskState::Running,
+        TaskState::Complete,
+        TaskState::Failed,
+        TaskState::Rejected,
+        TaskState::Shutdown,
+        TaskState::Orphaned,
+    ];
+
     /// The task will not run again; its service needs a new task to replace it.
     pub fn is_terminal(self) -> bool {
         matches!(

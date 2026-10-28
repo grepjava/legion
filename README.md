@@ -152,6 +152,12 @@ legion --identity alice.pem list services -n shop
 legion delete RoleBinding alice -n shop        # takes her rights away
 ```
 
+`--metrics-listen 0.0.0.0:7472` on the daemon serves Prometheus metrics
+at `/metrics`: Raft, objects, tasks, services, nodes and quotas from the
+leading manager, and each container's CPU, memory and I/O from rctl on
+every node. It is plain HTTP without authentication, and shows every
+namespace's names, so keep it on an admin network.
+
 ## Layout
 
 | Crate | Role |

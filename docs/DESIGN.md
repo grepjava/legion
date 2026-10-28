@@ -408,6 +408,25 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   end); on a Service or Job with no running task it picks the task that
   last ended on a node. A restarted container's earlier runs are not
   kept.
+- **Metrics** (phase 3). With `--metrics-listen <addr>` the daemon serves
+  Prometheus's text format at `/metrics` over plain HTTP, without
+  authentication: the endpoint names every namespace's services and
+  tasks, so it belongs on an admin network. Every manager reports its
+  Raft state (leader, term, log and applied indexes, voters, and on the
+  leader each follower's lag). Only the leader reports the cluster:
+  objects by kind and namespace, tasks by state, restarts of tasks not
+  ended, services' replicas and ready tasks, nodes, and each quota's
+  limits beside what the namespace uses of them. A sum across managers
+  then counts each thing once. The agent reports each running
+  container's usage from rctl on the container's own jail: CPU time and
+  percent, resident and virtual memory, swap, processes, threads, open
+  files and storage I/O (the infra jail, which counts its containers
+  again, is left out). The kernel refreshes memory once a second, so a
+  container started within the last second may show none. Without
+  racct the usage is missing and `legion_agent_usage_unread` counts the
+  containers concerned. The manager's metrics read the store through a
+  slot emptied before the store shuts down, so a scraper holding a
+  connection open never keeps the store open.
 - **CLI.** `legion init | status | apply -f | get | list | delete | watch`,
   with kubectl-style kind names (`service`, `services`, `svc`), `-n`, `-A`,
   `-l key=value` and `-o table|yaml|json`. `apply` reads multi-document YAML

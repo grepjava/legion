@@ -55,7 +55,14 @@ async fn eventually(what: &str, secs: u64, mut f: impl AsyncFnMut() -> bool) {
     }
 }
 
-fn start_agent(manager: &str, podman: &Podman) -> (oneshot::Sender<()>, JoinHandle<()>) {
+fn start_agent(
+    manager: &str,
+    podman: &Podman,
+) -> (
+    oneshot::Sender<()>,
+    JoinHandle<()>,
+    legion_agent::metrics::AgentMetrics<Podman>,
+) {
     let lab = PathBuf::from(std::env::var("LEGION_AGENT_LAB").expect("set LEGION_AGENT_LAB"));
     let mut config = AgentConfig::new("lab", lab.join("tasks"));
     config.zfs_root = std::env::var("LEGION_AGENT_ZFS_ROOT").ok();
@@ -68,6 +75,7 @@ fn start_agent(manager: &str, podman: &Podman) -> (oneshot::Sender<()>, JoinHand
         Arc::new(legion_sys::Shell::new()),
         Arc::new(GrpcControl::new("lab", vec![manager.to_owned()], None).unwrap()),
     );
+    let metrics = agent.metrics();
     let (tx, rx) = oneshot::channel();
     let status = NodeStatus {
         state: NodeState::Ready,
@@ -78,6 +86,7 @@ fn start_agent(manager: &str, podman: &Podman) -> (oneshot::Sender<()>, JoinHand
         tokio::spawn(agent.run(status, async move {
             let _ = rx.await;
         })),
+        metrics,
     )
 }
 
@@ -140,7 +149,7 @@ async fn agent_runs_a_real_pod() {
             .unwrap();
     });
 
-    let (stop, agent) = start_agent(&addr, &podman);
+    let (stop, agent, metrics) = start_agent(&addr, &podman);
 
     let zfs_root = std::env::var("LEGION_AGENT_ZFS_ROOT").ok();
     let mut pod: serde_json::Value = serde_json::json!({
@@ -269,6 +278,34 @@ async fn agent_runs_a_real_pod() {
     let rules = sh(&format!("rctl jail:{child}"));
     assert!(rules.contains("memoryuse:sigkill=268435456"), "{rules}");
     assert!(rules.contains("maxproc:deny=32"), "{rules}");
+    // The agent's metrics read each container's usage from rctl.
+    let text = metrics.collect().await.finish();
+    assert!(
+        text.contains(
+            "
+legion_agent_usage_unread 0
+"
+        ),
+        "{text}"
+    );
+    let usage = |name: &str, container: &str| -> f64 {
+        let series =
+            format!("{name}{{namespace=\"lab\",task=\"web-1\",container=\"{container}\"}} ");
+        text.lines()
+            .find_map(|l| l.strip_prefix(&series))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{series} in:
+{text}"
+                )
+            })
+            .parse()
+            .unwrap()
+    };
+    for c in ["app", "pinger"] {
+        assert!(usage("legion_container_memory_bytes", c) > 0.0, "{text}");
+        assert!(usage("legion_container_processes", c) >= 1.0, "{text}");
+    }
     // The jails are locked down (DESIGN.md §9): Legion's hook set the
     // profile before the containers' processes started. Only the container
     // allowed raw sockets can ping.
@@ -442,7 +479,7 @@ async fn agent_runs_a_real_pod() {
     // A new agent adopts the running pod.
     stop.send(()).unwrap();
     agent.await.unwrap();
-    let (stop, agent) = start_agent(&addr, &podman);
+    let (stop, agent, _) = start_agent(&addr, &podman);
     tokio::time::sleep(Duration::from_secs(5)).await;
     let again = podman.inspect("lab_web-1_app").await.unwrap();
     assert_eq!(again.id, app.id, "the pod was adopted, not recreated");

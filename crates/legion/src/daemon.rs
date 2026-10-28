@@ -25,6 +25,8 @@ pub struct Options {
     pub zfs_root: Option<String>,
     /// Workers: managers to call instead of those recorded at join.
     pub managers: Vec<String>,
+    /// Where to serve Prometheus metrics, if anywhere.
+    pub metrics_listen: Option<SocketAddr>,
 }
 
 pub async fn run(opts: Options) -> anyhow::Result<()> {
@@ -67,6 +69,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("listening on {}", opts.listen))?;
     tracing::info!(listen = %opts.listen, node_id = manager.id(), "serving");
+    let metrics_listener = bind_metrics(&opts).await?;
 
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let agent = if opts.agent && cfg!(target_os = "freebsd") {
@@ -77,10 +80,16 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     };
 
     // The agent holds store handles, so it stops before the store does.
-    let (agent_task, podman) = match agent {
-        Some((task, podman)) => (Some(task), Some(podman)),
-        None => (None, None),
+    let (agent_task, podman, agent_metrics) = match agent {
+        Some(a) => (Some(a.task), Some(a.podman), Some(a.metrics)),
+        None => (None, None, None),
     };
+    let metrics = metrics_listener.map(|l| {
+        tokio::spawn(crate::metrics::serve(
+            l,
+            crate::metrics::collect(Some(manager.metrics()), agent_metrics),
+        ))
+    });
     let shutdown = async move {
         crate::shutdown_signal().await;
         let _ = stop.send(true);
@@ -92,6 +101,9 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         .serve(listener, shutdown)
         .await
         .map_err(|e| anyhow::anyhow!(e));
+    if let Some(metrics) = metrics {
+        metrics.abort();
+    }
     if let Some(podman) = podman {
         podman.shutdown().await;
     }
@@ -118,9 +130,10 @@ async fn run_worker(opts: &Options, pki: &crate::pki::Pki, hostname: String) -> 
         bail!("no manager to call: pass --manager or join again");
     }
     let control = GrpcControl::new(&node, managers, Some(tls)).map_err(|e| anyhow::anyhow!(e))?;
+    let metrics_listener = bind_metrics(opts).await?;
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let advertise = opts.advertise.clone().unwrap_or_default();
-    let (task, podman) = start_agent(
+    let agent = start_agent(
         opts,
         &node,
         status(hostname, &advertise),
@@ -128,11 +141,20 @@ async fn run_worker(opts: &Options, pki: &crate::pki::Pki, hostname: String) -> 
         stopped,
     )
     .await?;
+    let metrics = metrics_listener.map(|l| {
+        tokio::spawn(crate::metrics::serve(
+            l,
+            crate::metrics::collect(None, Some(agent.metrics)),
+        ))
+    });
     tracing::info!(%node, "worker running");
     crate::shutdown_signal().await;
     let _ = stop.send(true);
-    let _ = task.await;
-    podman.shutdown().await;
+    let _ = agent.task.await;
+    if let Some(metrics) = metrics {
+        metrics.abort();
+    }
+    agent.podman.shutdown().await;
     // The managers the agent learned of, for the next start.
     crate::pki::write_managers(&opts.data_dir, &control.managers())
 }
@@ -176,13 +198,32 @@ pub async fn join(
     Ok(())
 }
 
+/// Binds the metrics endpoint's listener, if asked for one.
+async fn bind_metrics(opts: &Options) -> anyhow::Result<Option<tokio::net::TcpListener>> {
+    let Some(addr) = opts.metrics_listen else {
+        return Ok(None);
+    };
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("listening for metrics on {addr}"))?;
+    tracing::info!(%addr, "serving metrics at /metrics");
+    Ok(Some(listener))
+}
+
+/// A running agent and what it needs.
+struct Running {
+    task: tokio::task::JoinHandle<()>,
+    podman: PodmanService,
+    metrics: legion_agent::metrics::AgentMetrics<legion_podman::Podman>,
+}
+
 async fn start_agent(
     opts: &Options,
     node: &str,
     status: NodeStatus,
     control: GrpcControl,
     mut stopped: tokio::sync::watch::Receiver<bool>,
-) -> anyhow::Result<(tokio::task::JoinHandle<()>, PodmanService)> {
+) -> anyhow::Result<Running> {
     let podman_config = ServiceConfig::new(&opts.data_dir, &opts.run_dir);
     if let Some(dir) = &podman_config.hooks_dir {
         legion_agent::hook::install(dir).context("installing Legion's jail hook")?;
@@ -207,11 +248,16 @@ async fn start_agent(
         Arc::new(legion_sys::Shell::new()),
         Arc::new(control),
     );
+    let metrics = agent.metrics();
     tracing::info!(%node, "starting the agent");
     let task = tokio::spawn(agent.run(status, async move {
         let _ = stopped.wait_for(|s| *s).await;
     }));
-    Ok((task, podman))
+    Ok(Running {
+        task,
+        podman,
+        metrics,
+    })
 }
 
 /// What the node registers with: `advertise` is `host:port` or a host.
