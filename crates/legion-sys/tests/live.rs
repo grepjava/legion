@@ -309,7 +309,11 @@ fn zfs_datasets() {
     assert_eq!(std::fs::read_to_string(file(&vol)).unwrap(), "one");
     assert_eq!(sys.zfs_snapshots(&vol).unwrap(), ["m1"]);
     assert!(sys.zfs_rollback(&format!("{vol}@m2")).is_err());
-    assert!(sys.zfs_snapshots(&format!("{base}/nothing")).unwrap().is_empty());
+    assert!(
+        sys.zfs_snapshots(&format!("{base}/nothing"))
+            .unwrap()
+            .is_empty()
+    );
 
     sys.zfs_destroy(&base, true).unwrap();
     assert!(sys.zfs_list(&base).unwrap().is_empty());

@@ -595,11 +595,31 @@ service and migrates between nodes.
   back as it was before the update; and on weft-bsd, snapshot listing
   and a rollback of a mounted dataset with real ZFS.
 
+- **Exit test** (`crates/legion/tests/stateful.rs`, met 2026-10-29):
+  Postgres 17 as the stateful service `db`, ordinal 0 the primary and
+  ordinal 1 a streaming replica of `db-0.db.data.legion`, each on a
+  claimed Volume, in a namespace allowing the SysV shared memory Postgres
+  needs (`security.allow: [sysvipc]`). On weft-bsd (n1), the Vultr VPS
+  (n2, worker) and the bhyve VM lvm3 (n3), each with a throwaway
+  file-backed pool: 1000 rows on the primary reach the replica; draining
+  the primary's node moved it (n1 to n3) with its rows, it took 1000 more
+  and the replica followed it to its new address; draining the replica's
+  node moved the replica (n2 to n1), which streamed again. Passed twice in a row (6 and 7 minutes).
+  The image comes from `tests/stateful/Containerfile` (the server without
+  its LLVM JIT, 363 MB) and is loaded into every node's Podman through
+  its socket, as the lab has no registry; the lab hooks gained per-node
+  setup, daemon flags and teardown. Added for it: `legion node
+  drain|pause|activate <node>`. Found: rctl's `memoryuse` counts shared
+  memory once per process, so a 256 MiB limit killed Postgres's WAL
+  sender during the base backup; the test sets no memory limit.
+
 ### To do, in order
 
-1. Exit test: Postgres with replicas, migrated between nodes.
-2. Ingress routes, autoscaling, CARP VIP, autolock, store backup and
+1. Ingress routes, autoscaling, CARP VIP, autolock, store backup and
    restore. Moving a Volume on request rather than by a drain.
+
+Smaller follow-ups: memory limits for workloads with large shared memory
+(rctl counts it per process; `vmemoryuse` or a pod-wide allowance).
 
 ## Later phases
 

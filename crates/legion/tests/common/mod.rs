@@ -55,6 +55,14 @@ pub struct Lab {
     pub vms: Vec<Vm>,
     pub key: String,
     pub daemon: Option<Child>,
+    /// Run as root on each VM before its daemon starts, after what an
+    /// earlier run left is removed.
+    pub setup: String,
+    /// More flags for each VM's daemon.
+    pub flags: String,
+    /// Run as root on every node once the lab's daemons have stopped and
+    /// their pods are gone.
+    pub teardown: String,
 }
 
 impl Lab {
@@ -94,6 +102,9 @@ impl Lab {
             vms,
             key: var("LEGION_CLUSTER_KEY"),
             daemon: None,
+            setup: String::new(),
+            flags: String::new(),
+            teardown: String::new(),
         }
     }
 
@@ -171,6 +182,18 @@ impl Lab {
         child.wait_with_output().unwrap()
     }
 
+    /// Copies a file to a VM, as the user that logs in.
+    pub fn copy(&self, vm: &Vm, from: &str, to: &str) {
+        let status = self
+            .remote("scp")
+            .arg("-q")
+            .arg(from)
+            .arg(format!("{}:{to}", vm.login()))
+            .status()
+            .unwrap();
+        assert!(status.success(), "copying {from} to {}", vm.name);
+    }
+
     /// Copies the test's `legion` to a VM, stripped: it is far smaller.
     fn install(&self, vm: &Vm) {
         let stripped = self.dir.join("legion");
@@ -183,14 +206,7 @@ impl Lab {
                 .unwrap();
             assert!(status.success(), "stripping legion");
         }
-        let status = self
-            .remote("scp")
-            .arg("-q")
-            .arg(&stripped)
-            .arg(format!("{}:/tmp/legion-lab", vm.login()))
-            .status()
-            .unwrap();
-        assert!(status.success(), "copying legion to {}", vm.name);
+        self.copy(vm, stripped.to_str().unwrap(), "/tmp/legion-lab");
         let out = self.ssh(
             vm,
             &format!("install -m 755 /tmp/legion-lab {REMOTE} && rm /tmp/legion-lab"),
@@ -242,14 +258,17 @@ impl Lab {
             "{STOP}
              {clean}
              set -e
+             {setup}
              {REMOTE} join {token} --manager {server} --data-dir /var/db/legion-lab \
                  {join} --node-name {name}
              daemon -o /var/log/legion-lab.log {REMOTE} daemon --node-name {name} \
                  --data-dir /var/db/legion-lab --run-dir /var/run/legion-lab \
-                 {daemon} </dev/null >/dev/null 2>&1
+                 {daemon} {flags} </dev/null >/dev/null 2>&1
 ",
-            clean = clean("/var/db/legion-lab", "/var/run/legion-lab"),
+            clean = clean(VM_DATA, VM_RUN),
             server = self.server(),
+            setup = self.setup,
+            flags = self.flags,
         );
         let out = self.ssh(vm, &cmd);
         assert!(
@@ -319,6 +338,10 @@ pub fn clean(data: &str, run: &str) -> String {
     )
 }
 
+/// A VM's lab directories.
+pub const VM_DATA: &str = "/var/db/legion-lab";
+pub const VM_RUN: &str = "/var/run/legion-lab";
+
 /// Stops a VM's daemon, waiting up to 30 s.
 pub const STOP: &str = "pkill -INT -f 'legion-lab daemon'
     i=0; while pgrep -qf 'legion-lab daemon' && [ $i -lt 30 ]; do sleep 1; i=$((i + 1)); done
@@ -327,8 +350,15 @@ pub const STOP: &str = "pkill -INT -f 'legion-lab daemon'
 
 impl Drop for Lab {
     fn drop(&mut self) {
+        let teardown = |data: &str, run: &str| {
+            if self.teardown.is_empty() {
+                String::new()
+            } else {
+                format!("{}{}", clean(data, run), self.teardown)
+            }
+        };
         for vm in &self.vms {
-            let _ = self.ssh(vm, STOP);
+            let _ = self.ssh(vm, &format!("{STOP}{}", teardown(VM_DATA, VM_RUN)));
         }
         if let Some(mut child) = self.daemon.take() {
             let _ = Command::new("kill")
@@ -340,6 +370,11 @@ impl Drop for Lab {
             }
             let _ = child.kill();
             let _ = child.wait();
+        }
+        if !self.teardown.is_empty() {
+            let d = self.dir.display();
+            let script = teardown(&format!("{d}/data"), &format!("{d}/run"));
+            let _ = Command::new("/bin/sh").args(["-c", &script]).status();
         }
     }
 }

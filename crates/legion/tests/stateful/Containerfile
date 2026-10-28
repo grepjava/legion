@@ -1,0 +1,13 @@
+# Postgres for the phase 4 exit test (tests/stateful.rs): the server
+# without its JIT (LLVM) and the scripting languages it was built with,
+# which it does not need to run. Build and save it with
+#
+#   podman build --network host -t localhost/legion-pg:17 .
+#   podman save localhost/legion-pg:17 | gzip > /var/tmp/legion-pg.tar.gz
+FROM docker.io/freebsd/freebsd-notoolchain:15.1
+RUN env ASSUME_ALWAYS_YES=yes pkg bootstrap -f >/dev/null \
+ && env ASSUME_ALWAYS_YES=yes pkg install -y postgresql17-server >/dev/null \
+ && pkg delete -fy llvm19 python312 perl5 >/dev/null \
+ && rm -f /usr/local/lib/postgresql/llvmjit* \
+ && pkg clean -ay >/dev/null && rm -rf /var/db/pkg/repos /var/cache/pkg/*
+USER postgres

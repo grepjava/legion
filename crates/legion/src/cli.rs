@@ -307,6 +307,43 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 .into_inner();
             println!("{kind}/{name} deleted (version {})", resp.version);
         }
+        Command::Node { availability, node } => {
+            let availability = match availability.as_str() {
+                "activate" => "active",
+                other => other,
+            };
+            let r#ref = ObjectRef {
+                kind: Kind::Node.to_string(),
+                namespace: String::new(),
+                name: node,
+            };
+            loop {
+                let current = objects.get(r#ref.clone()).await?.into_inner();
+                let mut object = Object::try_from(current)?;
+                if object.spec["availability"] == availability {
+                    println!("{} is already {availability}", object.key());
+                    break;
+                }
+                object.spec["availability"] = availability.into();
+                // Over the node as just read; the node's heartbeats move
+                // its version meanwhile, and then it is read again.
+                match objects
+                    .apply(ApplyRequest {
+                        object: Some((&object).into()),
+                        expected_version: Some(object.metadata.version),
+                        ..Default::default()
+                    })
+                    .await
+                {
+                    Ok(_) => {
+                        println!("{} {availability}", object.key());
+                        break;
+                    }
+                    Err(s) if s.code() == tonic::Code::Aborted => continue,
+                    Err(s) => return Err(s.into()),
+                }
+            }
+        }
         Command::Rollback { service, namespace } => {
             let r#ref = ObjectRef {
                 kind: Kind::Service.to_string(),

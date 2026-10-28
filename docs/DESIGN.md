@@ -156,7 +156,8 @@ preconditions. Rules:
   rollback uses the restored spec's own update settings. A stateful
   service may snapshot its Volumes for an update (4.3).
 - **Nodes.** A drained node's tasks stop and move elsewhere; a paused node
-  keeps its tasks but gets no new ones. The tasks of a node that is `down`
+  keeps its tasks but gets no new ones (`legion node drain|pause|activate
+  <node>` sets it). The tasks of a node that is `down`
   are marked `orphaned` and told to stop, in one write: they leave the
   endpoints, their slots run elsewhere at once (a global service's slot
   goes with the node, and keeps its task number for when the node is

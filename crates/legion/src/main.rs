@@ -154,6 +154,14 @@ enum Command {
         #[command(subcommand)]
         command: UserCommand,
     },
+    /// Set a node's availability: `drain` moves its tasks elsewhere (and
+    /// stateful tasks' Volumes with them), `pause` keeps its tasks but
+    /// places no new ones, `activate` undoes either.
+    Node {
+        #[arg(value_parser = ["drain", "pause", "activate"])]
+        availability: String,
+        node: String,
+    },
     /// Roll a service back to the spec its latest update came from.
     Rollback {
         service: String,
