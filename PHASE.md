@@ -613,10 +613,28 @@ service and migrates between nodes.
   memory once per process, so a 256 MiB limit killed Postgres's WAL
   sender during the base backup; the test sets no memory limit.
 
+- **Store backup and restore** (`legion_store::backup`, `legion backup`,
+  `legion restore`, DESIGN.md §3.7): a backup is every object read at one
+  linearizable version on the leader, with the managers, as JSON;
+  restoring, offline, writes a new store in which they are applied at
+  that version, the log purged up to it, and the manager the only voter,
+  from a backup file or from the manager's own store (quorum lost). The
+  old store is set aside. Raft calls from managers outside the membership
+  are now refused, so those of the cluster a restore left cannot pull it
+  back (without that, openraft took their log or, in debug builds,
+  panicked). Tested: the store (versions and uids kept, writes continuing
+  above the backup, a fourth manager joining through the restored
+  snapshot, restarting from its own store, formats refused); through
+  three managers over gRPC, a backup through a follower, restored at the
+  same address while the other two keep electing and writing, staying
+  alone and serving; and the binary: backup, refused under a running
+  daemon, restore after a crash, a manager joining with the backed-up
+  token, and a restore from the manager's own store once it is lost.
+
 ### To do, in order
 
-1. Ingress routes, autoscaling, CARP VIP, autolock, store backup and
-   restore. Moving a Volume on request rather than by a drain.
+1. Ingress routes, autoscaling, CARP VIP, autolock. Moving a Volume on
+   request rather than by a drain.
 
 Smaller follow-ups: memory limits for workloads with large shared memory
 (rctl counts it per process; `vmemoryuse` or a pod-wide allowance).

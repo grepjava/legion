@@ -8,6 +8,7 @@
 //! The Raft transport is left to the caller ([`openraft::RaftNetworkFactory`]):
 //! the manager plugs in gRPC, tests plug in an in-process router.
 
+mod backup;
 mod log_store;
 mod state_machine;
 mod watch;
@@ -20,6 +21,7 @@ use legion_api::{Kind, Object, ObjectKey};
 use openraft::{BasicNode, RaftNetworkFactory};
 use serde::{Deserialize, Serialize};
 
+pub use backup::{Backup, restore, set_aside};
 pub use log_store::LogStore;
 pub use state_machine::{Listing, StateMachine};
 pub use watch::{Event, WatchError, Watcher};
@@ -127,6 +129,22 @@ impl Store {
 
     pub fn list(&self, kind: Kind, namespace: Option<&str>) -> Result<Listing, Error> {
         self.state.list(kind, namespace)
+    }
+
+    /// Every object, read at one version, and the managers. The caller
+    /// makes it linearizable as for a list.
+    pub fn backup(&self) -> Result<Backup, Error> {
+        self.state.backup()
+    }
+
+    /// Whether `from` is one of the managers this one knows, or this one
+    /// knows none yet (it is joining): Raft calls from anything else come
+    /// from another cluster, such as the managers of one a restore left.
+    pub fn knows(&self, from: Option<NodeId>) -> bool {
+        let metrics = self.raft.metrics().borrow().clone();
+        let membership = metrics.membership_config.membership();
+        let mut nodes = membership.nodes().peekable();
+        nodes.peek().is_none() || from.is_some_and(|f| membership.get_node(&f).is_some())
     }
 
     /// Index of the last entry applied locally.

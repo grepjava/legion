@@ -12,6 +12,16 @@ struct Daemon {
     _dir: tempfile::TempDir,
 }
 
+impl Daemon {
+    /// Kills the daemon, as a crash would, and hands back its data
+    /// directory.
+    fn kill(mut self) -> tempfile::TempDir {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        std::mem::replace(&mut self._dir, tempfile::tempdir().unwrap())
+    }
+}
+
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -395,4 +405,140 @@ fn users_get_their_roles() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("user alice"), "{args:?}: {stderr}");
     }
+}
+
+/// `legion restore` in `dir`.
+fn restore(dir: &std::path::Path, file: Option<&std::path::Path>) -> Output {
+    let mut cmd = Command::new(LEGION);
+    cmd.arg("restore").arg("--data-dir").arg(dir);
+    if let Some(file) = file {
+        cmd.arg(file);
+    }
+    cmd.output().unwrap()
+}
+
+fn namespace(d: &Daemon, name: &str) {
+    let manifest = d._dir.path().join(format!("{name}.yaml"));
+    std::fs::write(
+        &manifest,
+        format!("apiVersion: legion/v1\nkind: Namespace\nmetadata: {{ name: {name} }}\n"),
+    )
+    .unwrap();
+    ok(d, &["apply", "-f", manifest.to_str().unwrap()]);
+}
+
+fn voters(d: &Daemon) -> usize {
+    ok(d, &["status"]).matches("voter").count()
+}
+
+#[test]
+fn a_manager_is_restored_from_a_backup_and_from_its_own_store() {
+    let first = start_daemon();
+    ok(&first, &["init"]);
+    let token = ok(&first, &["join-token", "manager"]).trim().to_owned();
+    namespace(&first, "kept");
+    let backups = tempfile::tempdir().unwrap();
+    let file = backups.path().join("backup.json");
+    let out = ok(&first, &["backup", "-o", file.to_str().unwrap()]);
+    assert!(out.contains("backed up"), "{out}");
+    namespace(&first, "lost");
+
+    let busy = restore(first._dir.path(), Some(&file));
+    assert!(!busy.status.success(), "restored under a running daemon");
+    assert!(
+        String::from_utf8_lossy(&busy.stderr).contains("stop the daemon"),
+        "{}",
+        String::from_utf8_lossy(&busy.stderr)
+    );
+    let server = first.server.clone();
+    let dir = first.kill();
+    let out = restore(dir.path(), Some(&file));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let first = start_daemon_in(dir, server);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !legion(&first, &["get", "namespace", "kept"])
+        .status
+        .success()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the restored manager does not serve"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        !legion(&first, &["get", "namespace", "lost"])
+            .status
+            .success()
+    );
+    assert_eq!(voters(&first), 1);
+
+    // The backed-up token lets a manager join the restored cluster.
+    let dir = tempfile::tempdir().unwrap();
+    let addr = free_addr();
+    let out = Command::new(LEGION)
+        .args([
+            "join",
+            &token,
+            "--manager",
+            &first.server,
+            "--advertise",
+            &addr,
+        ])
+        .args(["--node-name", "m2", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let second = start_daemon_in(dir, addr);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while voters(&first) < 2 {
+        assert!(Instant::now() < deadline, "{}", ok(&first, &["status"]));
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    namespace(&second, "joined");
+
+    // The second manager is lost: the first restarts the cluster from its
+    // own store, with everything written so far.
+    drop(second);
+    let server = first.server.clone();
+    let dir = first.kill();
+    let out = restore(dir.path(), None);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let first = start_daemon_in(dir, server);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !legion(&first, &["get", "namespace", "joined"])
+        .status
+        .success()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the restarted manager does not serve"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(voters(&first), 1);
+    let kept = std::fs::read_dir(first._dir.path())
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("store.redb.")
+        })
+        .count();
+    assert_eq!(kept, 2, "both old stores kept");
 }

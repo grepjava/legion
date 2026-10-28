@@ -109,6 +109,15 @@ service Cluster {
   // stays with the caller, who sends only a certificate request. What the
   // user may do comes from RoleBindings, not the certificate.
   rpc IssueUser(IssueUserRequest) returns (IssueUserResponse);
+  // Every object, read at one version, with the cluster's managers: the
+  // JSON of a backup (legion_store::Backup) in pieces of up to 1 MiB.
+  rpc Backup(BackupRequest) returns (stream BackupChunk);
+}
+
+message BackupRequest {}
+
+message BackupChunk {
+  bytes data = 1;
 }
 
 message IssueUserRequest {

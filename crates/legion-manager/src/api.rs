@@ -534,6 +534,55 @@ impl Cluster for ApiService {
         }))
     }
 
+    type BackupStream = ReceiverStream<Result<pb::BackupChunk, Status>>;
+
+    async fn backup(
+        &self,
+        req: Request<pb::BackupRequest>,
+    ) -> Result<Response<Self::BackupStream>, Status> {
+        // Secrets and join tokens included.
+        self.caller(&req)?.require_all("back up the cluster")?;
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        if let Some(addr) = self.leader_addr(&req)? {
+            let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                &addr,
+                self.peer_tls.as_ref(),
+            ));
+            let mut chunks = c.backup(forwarded(req.into_inner())).await?.into_inner();
+            tokio::spawn(async move {
+                loop {
+                    let chunk = chunks.message().await.transpose();
+                    let Some(chunk) = chunk else { return };
+                    let last = chunk.is_err();
+                    if tx.send(chunk).await.is_err() || last {
+                        return;
+                    }
+                }
+            });
+            return Ok(Response::new(ReceiverStream::new(rx)));
+        }
+        self.consistent().await?;
+        let backup = self.store.backup().map_err(internal)?;
+        let json = serde_json::to_vec(&backup).map_err(internal)?;
+        tracing::info!(
+            version = backup.version,
+            objects = backup.objects.len(),
+            bytes = json.len(),
+            "backup"
+        );
+        tokio::spawn(async move {
+            for data in json.chunks(1 << 20) {
+                let chunk = pb::BackupChunk {
+                    data: data.to_vec(),
+                };
+                if tx.send(Ok(chunk)).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
     async fn issue_user(
         &self,
         req: Request<pb::IssueUserRequest>,

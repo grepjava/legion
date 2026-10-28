@@ -1098,6 +1098,7 @@ dependencies = [
  "legion-pki",
  "legion-podman",
  "legion-proto",
+ "legion-store",
  "legion-sys",
  "libc",
  "serde",

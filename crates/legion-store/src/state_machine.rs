@@ -21,6 +21,7 @@ use crate::log_store::{any, blocking};
 use crate::watch::{Event, Hub, WatchError, Watcher};
 use openraft::BasicNode;
 
+use crate::backup::Backup;
 use crate::{Command, Error, NodeId, Outcome, Precondition, TypeConfig};
 
 const OBJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("objects");
@@ -116,6 +117,71 @@ impl StateMachine {
 
     pub(crate) fn db_handle(&self) -> std::sync::Weak<Database> {
         Arc::downgrade(&self.db)
+    }
+
+    /// Every object and the managers, read at one version.
+    pub fn backup(&self) -> Result<Backup, Error> {
+        let txn = self.db.begin_read().map_err(Error::db)?;
+        let meta = txn.open_table(SM_META).map_err(Error::db)?;
+        let version = read_json::<Option<LogId<NodeId>>>(&meta, LAST_APPLIED)?
+            .flatten()
+            .map_or(0, |id| id.index);
+        let membership: Membership = read_json(&meta, MEMBERSHIP)?.unwrap_or_default();
+        let managers = membership
+            .membership()
+            .nodes()
+            .map(|(id, node)| (*id, node.addr.clone()))
+            .collect();
+        let table = txn.open_table(OBJECTS).map_err(Error::db)?;
+        let mut objects = Vec::new();
+        for item in table.iter().map_err(Error::db)? {
+            let (_, v) = item.map_err(Error::db)?;
+            objects.push(serde_json::from_slice(v.value())?);
+        }
+        Ok(Backup {
+            format: crate::backup::FORMAT,
+            version,
+            managers,
+            objects,
+        })
+    }
+
+    /// Writes a restored state into a new store: `objects` applied up to
+    /// `last`, and a snapshot of them for managers that join.
+    pub(crate) fn restore_in(
+        txn: &WriteTransaction,
+        last: LogId<NodeId>,
+        membership: Membership,
+        objects: &[Object],
+    ) -> Result<(), Error> {
+        {
+            let mut table = txn.open_table(OBJECTS).map_err(Error::db)?;
+            for object in objects {
+                let value = serde_json::to_vec(object)?;
+                table
+                    .insert(object.key().to_string().as_str(), value.as_slice())
+                    .map_err(Error::db)?;
+            }
+        }
+        let data = serde_json::to_vec(&SnapshotData {
+            objects: objects.to_vec(),
+        })?;
+        let meta = SnapshotMeta {
+            last_log_id: Some(last),
+            last_membership: membership.clone(),
+            snapshot_id: format!("restored-{}", last.index),
+        };
+        let write = || -> Result<(), AnyError> {
+            write_json(txn, LAST_APPLIED, &Some(last))?;
+            write_json(txn, MEMBERSHIP, &membership)?;
+            write_json(txn, SNAPSHOT_META, &meta)?;
+            txn.open_table(SM_META)
+                .map_err(any)?
+                .insert(SNAPSHOT_DATA, data.as_slice())
+                .map_err(any)?;
+            Ok(())
+        };
+        write().map_err(|e| Error::Db(e.to_string()))
     }
 
     fn read_meta<T: for<'de> Deserialize<'de>>(&self, key: &str) -> Result<Option<T>, AnyError> {

@@ -322,6 +322,57 @@ fn physical_memory() -> Option<u64> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
+/// `legion restore`: replaces a stopped manager's store with one holding
+/// `file`'s backup, or what its own store holds, in which this manager is
+/// the only member (DESIGN.md §3.7).
+pub fn restore(
+    file: Option<&Path>,
+    data_dir: &Path,
+    advertise: Option<String>,
+) -> anyhow::Result<()> {
+    let pki = crate::pki::Pki::new(data_dir);
+    if !pki.exists() || pki.role()? != legion_pki::Role::Manager {
+        bail!(
+            "{} holds no manager of a cluster: restore where a manager ran, with its pki",
+            data_dir.display()
+        );
+    }
+    let id_file = data_dir.join("node-id");
+    if !id_file.exists() {
+        bail!("{} is missing", id_file.display());
+    }
+    let id = legion_manager::node_id(data_dir).map_err(|e| anyhow::anyhow!(e))?;
+    let backup = match file {
+        Some(file) => {
+            let json =
+                std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+            serde_json::from_slice(&json)
+                .with_context(|| format!("{} is not a Legion backup", file.display()))?
+        }
+        None => legion_store::Backup::of_store(data_dir)?,
+    };
+    backup.check()?;
+    let Some(addr) = advertise.or_else(|| backup.managers.get(&id).cloned()) else {
+        bail!("the backup does not record this manager's address: pass --advertise");
+    };
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        .to_string();
+    let aside = legion_store::set_aside(data_dir, &suffix)?;
+    legion_store::restore(data_dir, id, &addr, &backup)?;
+    println!(
+        "restored {} objects at version {}; this manager ({addr}) is the cluster's only member",
+        backup.objects.len(),
+        backup.version
+    );
+    if let Some(aside) = aside {
+        println!("the old store is at {}", aside.display());
+    }
+    println!("start the daemon; other managers join again from empty data directories");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

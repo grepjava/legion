@@ -353,6 +353,30 @@ Built and tested in spike S4 (`crates/legion-store`).
   ms apart never kept a leader (the phase 2 exit test). Writes and
   linearizable reads give up after 30 s without a quorum, with an error
   saying the write may still apply, rather than hang.
+- **Backup and restore** (phase 4). `legion backup -o FILE` (cluster
+  admin) has the leader read every object at one linearizable version,
+  with the managers' ids and addresses, and streams it as JSON (file mode
+  0600: it holds Secrets and join tokens). The managers' keys are not in
+  it; `<data-dir>/pki` is backed up beside it. `legion restore [FILE]`
+  runs offline on a stopped manager's data directory, its `pki` and
+  `node-id` in place: it sets the old store aside (`store.redb.<time>`,
+  refused while a daemon holds it) and writes a new one in which the
+  backup's objects are applied at the backup's version, the log is purged
+  up to it, a snapshot of them is kept for joiners, and this manager is
+  the only voter, at the address the backup records for it or
+  `--advertise`. Without FILE it reads the manager's own store: a cluster
+  that lost its quorum restarts from a survivor. The daemon then leads a
+  cluster of one; versions and uids carry on above the backup's, and
+  managers join again from empty data directories, with the backed-up
+  tokens. Agents keep their certificates (the CA is the same) and
+  reconcile: tasks created after the backup are stopped, and the
+  controllers replace what is missing. Raft calls from managers outside
+  the current membership are refused (unless the manager knows no
+  members yet, as when joining), so the old cluster's managers cannot
+  take the restored one back: openraft would otherwise accept their log
+  over its own (in debug builds it panics). The other managers should
+  still be stopped before restoring, as their agents would keep following
+  them.
 
 ---
 

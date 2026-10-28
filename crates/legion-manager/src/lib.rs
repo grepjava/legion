@@ -200,7 +200,7 @@ impl Manager {
         let (dispatcher, dispatching) =
             dispatcher::DispatcherService::start(api.clone(), self.tls.is_some(), self.heartbeat);
         let raft = raft_net::RaftService {
-            raft: self.store.raft.clone(),
+            store: self.store.clone(),
         };
         let mut server = tonic::transport::Server::builder();
         if let Some(tls) = &self.tls {

@@ -7,7 +7,7 @@ use std::io;
 use legion_proto::v1::RaftPayload;
 use legion_proto::v1::raft_client::RaftClient;
 use legion_proto::v1::raft_server;
-use legion_store::{NodeId, Raft, TypeConfig};
+use legion_store::{NodeId, Store, TypeConfig};
 use openraft::error::{
     InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable,
 };
@@ -16,7 +16,7 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::{BasicNode, RaftNetwork, RaftNetworkFactory};
+use openraft::{BasicNode, RaftNetwork, RaftNetworkFactory, Vote};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
@@ -155,12 +155,28 @@ impl RaftNetwork<TypeConfig> for PeerClient {
 
 /// Serves Raft RPCs from peers into the local node.
 pub struct RaftService {
-    pub raft: Raft,
+    pub store: Store,
 }
 
 fn decode<T: DeserializeOwned>(req: Request<RaftPayload>) -> Result<T, Status> {
     serde_json::from_slice(&req.into_inner().json)
         .map_err(|e| Status::invalid_argument(format!("bad raft payload: {e}")))
+}
+
+impl RaftService {
+    /// Refuses calls from managers this one does not know: those of the
+    /// cluster a restore left (DESIGN.md §3.7), which would otherwise vote
+    /// it back into the old cluster.
+    fn known(&self, vote: &Vote<NodeId>) -> Result<(), Status> {
+        let from = vote.leader_id().voted_for();
+        if self.store.knows(from) {
+            return Ok(());
+        }
+        Err(Status::permission_denied(format!(
+            "manager {} is not a member of this cluster",
+            from.map_or("?".into(), |f| f.to_string())
+        )))
+    }
 }
 
 fn encode<T: Serialize>(result: T) -> Result<Response<RaftPayload>, Status> {
@@ -174,17 +190,23 @@ impl raft_server::Raft for RaftService {
         &self,
         req: Request<RaftPayload>,
     ) -> Result<Response<RaftPayload>, Status> {
-        encode(self.raft.append_entries(decode(req)?).await)
+        let rpc: AppendEntriesRequest<TypeConfig> = decode(req)?;
+        self.known(&rpc.vote)?;
+        encode(self.store.raft.append_entries(rpc).await)
     }
 
     async fn vote(&self, req: Request<RaftPayload>) -> Result<Response<RaftPayload>, Status> {
-        encode(self.raft.vote(decode(req)?).await)
+        let rpc: VoteRequest<NodeId> = decode(req)?;
+        self.known(&rpc.vote)?;
+        encode(self.store.raft.vote(rpc).await)
     }
 
     async fn install_snapshot(
         &self,
         req: Request<RaftPayload>,
     ) -> Result<Response<RaftPayload>, Status> {
-        encode(self.raft.install_snapshot(decode(req)?).await)
+        let rpc: InstallSnapshotRequest<TypeConfig> = decode(req)?;
+        self.known(&rpc.vote)?;
+        encode(self.store.raft.install_snapshot(rpc).await)
     }
 }

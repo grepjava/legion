@@ -42,6 +42,25 @@ impl LogStore {
         Ok(LogStore { db })
     }
 
+    /// Writes a restored log into a new store: `vote`, and nothing but what
+    /// was purged up to `purged`.
+    pub(crate) fn restore_in(
+        txn: &redb::WriteTransaction,
+        vote: Vote<NodeId>,
+        purged: LogId<NodeId>,
+    ) -> Result<(), crate::Error> {
+        let mut table = txn.open_table(META).map_err(crate::Error::db)?;
+        for (key, value) in [
+            (VOTE, serde_json::to_vec(&vote)?),
+            (LAST_PURGED, serde_json::to_vec(&purged)?),
+        ] {
+            table
+                .insert(key, value.as_slice())
+                .map_err(crate::Error::db)?;
+        }
+        Ok(())
+    }
+
     fn get_meta<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, AnyError> {
         let txn = self.db.begin_read().map_err(any)?;
         let table = txn.open_table(META).map_err(any)?;

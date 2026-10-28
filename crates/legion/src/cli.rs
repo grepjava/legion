@@ -154,7 +154,23 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 .token;
             println!("{token}");
         }
-        Command::Join { .. } => unreachable!("handled in main"),
+        Command::Backup { output } => {
+            let mut chunks = cluster.backup(pb::BackupRequest {}).await?.into_inner();
+            let mut json = Vec::new();
+            while let Some(chunk) = chunks.message().await? {
+                json.extend_from_slice(&chunk.data);
+            }
+            let backup: legion_store::Backup =
+                serde_json::from_slice(&json).context("reading the backup")?;
+            crate::pki::write_private(&output, &String::from_utf8(json)?)?;
+            println!(
+                "backed up {} objects at version {} to {}",
+                backup.objects.len(),
+                backup.version,
+                output.display()
+            );
+        }
+        Command::Join { .. } | Command::Restore { .. } => unreachable!("handled in main"),
         Command::Logs {
             task,
             namespace,

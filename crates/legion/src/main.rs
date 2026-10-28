@@ -104,6 +104,27 @@ enum Command {
     },
     /// Show the reached manager's view of the cluster.
     Status,
+    /// Save every object of the cluster, read at one version, to a file.
+    /// It holds Secrets and join tokens: keep it as safe as the managers'
+    /// disks. The managers' keys are not in it; keep `<data-dir>/pki` too.
+    Backup {
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// Restore a stopped manager's store, from a backup or, without FILE,
+    /// from its own store when the other managers are lost. The manager
+    /// becomes the only member of the cluster; start its daemon after, and
+    /// have other managers join it again from empty data directories. The
+    /// old store is kept beside the new one.
+    Restore {
+        file: Option<PathBuf>,
+        #[arg(long, default_value = "/var/db/legion")]
+        data_dir: PathBuf,
+        /// The address other managers reach this one at. Defaults to the
+        /// one the backup records for this manager.
+        #[arg(long)]
+        advertise: Option<String>,
+    },
     /// Create or update objects from YAML or JSON files ("-" reads stdin).
     Apply {
         #[arg(short, long = "filename", required = true)]
@@ -316,6 +337,11 @@ async fn main() -> anyhow::Result<()> {
             advertise,
             node_name,
         } => daemon::join(&token, &manager, &data_dir, advertise.as_deref(), node_name).await,
+        Command::Restore {
+            file,
+            data_dir,
+            advertise,
+        } => daemon::restore(file.as_deref(), &data_dir, advertise),
         command => cli::run(&args.server, &args.identity, command).await,
     }
 }

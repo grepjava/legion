@@ -156,10 +156,16 @@ impl Running {
         ClusterClient::new(self.channel(self.tls.as_ref()).await.unwrap())
     }
 
-    async fn stop(mut self) {
+    async fn stop(self) {
+        self.stop_keeping().await;
+    }
+
+    /// Stops the manager and hands back its data directory.
+    async fn stop_keeping(mut self) -> TempDir {
         drop(self.store);
         self.stop.take().unwrap().send(()).unwrap();
         self.task.await.unwrap();
+        self._dir
     }
 }
 
@@ -1528,4 +1534,109 @@ async fn the_leader_reports_the_cluster() {
     let metrics = m.metrics.clone();
     m.stop().await;
     assert_eq!(metrics.collect().finish(), "");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restored_manager_leads_alone_and_ignores_the_old_cluster() {
+    let mut managers = Vec::new();
+    for _ in 0..3 {
+        managers.push(Running::start().await);
+    }
+    form_cluster(&managers).await;
+    let follower = managers[2].objects().await;
+    for n in 0..10 {
+        eventually(|| {
+            let mut follower = follower.clone();
+            async move { follower.apply(apply(service(&format!("s{n}"), 1))).await }
+        })
+        .await;
+    }
+
+    // Through a follower, which forwards to the leader.
+    let mut chunks = managers[2]
+        .cluster()
+        .await
+        .backup(legion_proto::v1::BackupRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let mut json = Vec::new();
+    while let Some(chunk) = chunks.message().await.unwrap() {
+        json.extend(chunk.data);
+    }
+    let backup: legion_store::Backup = serde_json::from_slice(&json).unwrap();
+    let services = |objects: &[legion_api::Object]| {
+        objects
+            .iter()
+            .filter(|o| o.kind == legion_api::Kind::Service)
+            .count()
+    };
+    assert_eq!(services(&backup.objects), 10);
+    assert_eq!(backup.managers.len(), 3);
+
+    // Restored at the same address while the other two carry on: they
+    // must not pull it back into the old cluster with what they wrote.
+    follower
+        .clone()
+        .apply(apply(service("lost", 1)))
+        .await
+        .unwrap();
+    let first = managers.remove(0);
+    let addr = first.addr.clone();
+    let dir = first.stop_keeping().await;
+    let id = legion_manager::node_id(dir.path()).unwrap();
+    legion_store::set_aside(dir.path(), "old").unwrap();
+    legion_store::restore(dir.path(), id, &addr, &backup).unwrap();
+    let listener = loop {
+        match TcpListener::bind(&addr).await {
+            Ok(l) => break l,
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    };
+    let restored = Running::serve(dir, listener, None, None).await;
+    let raft = restored.store.raft.clone();
+    raft.wait(Some(Duration::from_secs(10)))
+        .current_leader(id, "lead the restored cluster")
+        .await
+        .unwrap();
+    // The old cluster elects at ever higher terms and keeps writing.
+    for _ in 0..3 {
+        for m in &managers {
+            let _ = m.store.raft.trigger().elect().await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        eventually(|| {
+            let mut follower = follower.clone();
+            async move { follower.apply(apply(service("lost", 2))).await }
+        })
+        .await;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let api = restored.objects().await;
+    eventually(|| {
+        let mut api = api.clone();
+        async move { api.apply(apply(service("after", 1))).await }
+    })
+    .await;
+    let m = raft.metrics().borrow().clone();
+    assert_eq!(m.current_leader, Some(id));
+    assert_eq!(
+        m.membership_config.membership().nodes().count(),
+        1,
+        "{:?}",
+        m.membership_config
+    );
+    let listed = restored
+        .store
+        .list(legion_api::Kind::Service, None)
+        .unwrap()
+        .objects;
+    let names: Vec<_> = listed.iter().map(|o| o.metadata.name.as_str()).collect();
+    assert_eq!(names.len(), 11, "{names:?}");
+    assert!(names.contains(&"after") && !names.contains(&"lost"));
+
+    restored.stop().await;
+    for m in managers {
+        m.stop().await;
+    }
 }
