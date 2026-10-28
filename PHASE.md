@@ -481,17 +481,38 @@ Already there from phase 1: namespaces scope names and DNS
   containers.conf override. Found when the exit test left conmon pairs
   behind; on weft-bsd, with exec probes every second, the live test now
   peaks at about 40 conmons and is back to none seconds after it ends.
+- **Exit test** (`crates/legion/tests/teams.rs`, ignored; run as root on
+  a FreeBSD host, see its docs; the lab code it shares with the phase 2
+  test is in `tests/common`): passes on weft-bsd and the bhyve guest as
+  managers and the remote server, about 225 ms away, as a worker. The
+  cluster admin makes namespaces `alpha` and `beta` with task quotas and
+  the users alice and bob with `edit` in one each; each deploys, as
+  itself, a Secret and `web` (one task per node, published). Then for
+  each user against the other's namespace: listing, reading, the Secret,
+  deleting, applying, `logs` and `exec` are refused, `-A` lists show only
+  their own, and neither may change a Namespace, even their own quota.
+  From inside each task, the team's own tasks on every node and its VIP
+  answer while the other team's tasks on every node and its VIP do not.
+  A Service of beta's asking for alpha's published port is refused it
+  (`status.conflicts`) and alpha keeps answering there. Over the quota,
+  alpha's six replicas are refused and a Job's third task waits as
+  `pending`, while beta's next task runs; the leader's metrics show both
+  quotas beside their use; raw sockets the namespace does not allow are
+  refused.
+
+  It found, and these were fixed: the guards on pods' host ends were
+  never evaluated for traffic from other nodes (pf does not see what the
+  host sends onto the bridge), so a task reached every other namespace's
+  tasks on other nodes; that traffic is now checked as it comes in on
+  `wg0` (DESIGN.md §5.6). And the CLI gave up at the first `UNAVAILABLE`,
+  which a manager's moment without quorum causes; it now asks again for
+  up to 30 s. A first layout with the remote server as the second of two
+  managers lost its quorum whenever that server stalled for a few seconds:
+  with two managers Raft needs both, so far nodes are better workers.
 
 ### To do, in order
 
-The first three are what the exit criterion rests on: who may do what,
-what may talk to what, and how much each team may use; all three are
-done, as are the jail defaults that keep a team's tasks from more than
-their own jails.
-
-1. **Exit test**: two teams, each with its own user and namespace, deploy
-    on the same cluster; neither can read or change the other's objects,
-    reach the other's tasks, or exceed its quota.
+Nothing left in phase 3.
 
 Smaller follow-ups: egress policies; a new pod is unguarded for the
 moment between its start and the agent's next pass (the guard could go in

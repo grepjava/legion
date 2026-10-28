@@ -378,7 +378,8 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
 - **Any manager answers.** Writes and Get/List go to the leader; a follower
   forwards the request once, marked so it is never forwarded twice. Get and
   List call `ensure_linearizable` first. Watches are served from the local
-  replica. During an election the API returns `UNAVAILABLE` and clients retry.
+  replica. During an election the API returns `UNAVAILABLE` and clients retry:
+  the CLI asks again for up to 30 s (single calls only, not streams).
 - **Shutdown.** SIGTERM (rc.d) or Ctrl-C stops accepting requests, ends open
   watch streams with `UNAVAILABLE` (otherwise graceful shutdown would wait on
   them forever), then closes the store.
@@ -654,11 +655,13 @@ over TCP.
   namespace can be marked open or locked down.
 - `NetworkPolicy` objects add allow rules by namespace, labels and ports, for
   ingress and egress.
-- Rules are enforced on the **destination** node, on the task's own epair
-  (`out on lpX`, toward the jail). With `pfil_member=1` (5.3), pf sees
-  same-node bridged traffic there, so policy also covers traffic between
-  tasks on one node. A misbehaving node cannot bypass rules enforced on
-  another.
+- Rules are enforced on the **destination** node. With `pfil_member=1`
+  (5.3), pf sees traffic between tasks on one node on the task's own
+  epair (`out on lpX`, toward the jail). It does not see there what the
+  host itself sends onto the bridge, which includes everything routed in
+  from other nodes, so traffic from other nodes' tasks is checked where it
+  arrives, `in on wg0`, against the same tables. A misbehaving node cannot
+  bypass rules enforced on another.
 - Each policy compiles to rules in the `legion/policy` anchor that reference
   tables. Membership changes update tables only; rules are reloaded only when
   policies change.
@@ -678,6 +681,12 @@ over TCP.
   send only from its own address and never IPv6; what it starts is kept as
   `if-bound` state, so replies pass its own guard (a floating state would
   match the same packet again on the bridge before the VIP's translation).
+  On the mesh, connections from other nodes' tasks are let in from the
+  same tables and the rest from the pod range dropped; what a pod starts
+  toward other nodes is kept as (floating) state on `wg0` too, so the
+  replies are not taken for new connections. Found by the phase 3 exit
+  test: the guards on the host ends had never been evaluated for traffic
+  from other nodes, so a task reached any other namespace's tasks there.
   VIP traffic to a task on the same node is NATed to the gateway by the
   hairpin rule, losing its source, so VIPs are checked at the client pod
   instead (`in on lpX`, still to the VIP; this is what needs

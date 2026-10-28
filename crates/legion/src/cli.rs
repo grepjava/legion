@@ -1,7 +1,9 @@
 //! CLI commands: thin gRPC calls plus formatting.
 
+use std::future::Future;
 use std::io::Read;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use legion_api::service::ServiceStatus;
@@ -15,6 +17,94 @@ use legion_proto::v1::{
 use tonic::transport::Channel;
 
 use crate::{Command, StackCommand, UserCommand};
+
+/// How long a command keeps asking while the API is unavailable: during
+/// an election, or while a manager waits on a quorum (DESIGN.md §3.8).
+const RETRY_FOR: Duration = Duration::from_secs(30);
+
+/// Calls `call` again while it fails as unavailable, for up to
+/// [`RETRY_FOR`].
+async fn retrying<T, Fut>(mut call: impl FnMut() -> Fut) -> Result<T, tonic::Status>
+where
+    Fut: Future<Output = Result<T, tonic::Status>>,
+{
+    let deadline = tokio::time::Instant::now() + RETRY_FOR;
+    loop {
+        match call().await {
+            Err(s)
+                if s.code() == tonic::Code::Unavailable
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            r => return r,
+        }
+    }
+}
+
+/// The Objects API, its single calls retried while it is unavailable.
+/// Applying again is harmless; a delete that went through before its
+/// answer was lost finds nothing the second time, which counts as done.
+#[derive(Clone)]
+struct Objects(ObjectsClient<Channel>);
+
+type Answer<T> = Result<tonic::Response<T>, tonic::Status>;
+
+impl Objects {
+    async fn apply(&mut self, req: ApplyRequest) -> Answer<pb::ApplyResponse> {
+        let client = &self.0;
+        retrying(|| {
+            let (mut c, req) = (client.clone(), req.clone());
+            async move { c.apply(req).await }
+        })
+        .await
+    }
+
+    async fn get(&mut self, req: ObjectRef) -> Answer<pb::Object> {
+        let client = &self.0;
+        retrying(|| {
+            let (mut c, req) = (client.clone(), req.clone());
+            async move { c.get(req).await }
+        })
+        .await
+    }
+
+    async fn list(&mut self, req: ListRequest) -> Answer<pb::ListResponse> {
+        let client = &self.0;
+        retrying(|| {
+            let (mut c, req) = (client.clone(), req.clone());
+            async move { c.list(req).await }
+        })
+        .await
+    }
+
+    async fn delete(&mut self, req: DeleteRequest) -> Answer<pb::DeleteResponse> {
+        let deadline = tokio::time::Instant::now() + RETRY_FOR;
+        let mut retried = false;
+        loop {
+            match self.0.delete(req.clone()).await {
+                Err(s)
+                    if s.code() == tonic::Code::Unavailable
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    retried = true;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(s) if s.code() == tonic::Code::NotFound && retried => {
+                    return Ok(tonic::Response::new(pb::DeleteResponse::default()));
+                }
+                r => return r,
+            }
+        }
+    }
+
+    async fn watch(
+        &mut self,
+        req: WatchRequest,
+    ) -> Answer<tonic::codec::Streaming<pb::WatchEvent>> {
+        self.0.watch(req).await
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Format {
@@ -37,7 +127,7 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
         return print_converted(&file, &stack, namespace);
     }
     let channel = connect(server, identity).await?;
-    let mut objects = ObjectsClient::new(channel.clone());
+    let mut objects = Objects(ObjectsClient::new(channel.clone()));
     let mut cluster = ClusterClient::new(channel.clone());
     match command {
         Command::Daemon { .. } => unreachable!("handled in main"),
@@ -48,7 +138,14 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 status.node_id
             );
         }
-        Command::Status => print_status(&cluster.status(StatusRequest {}).await?.into_inner()),
+        Command::Status => {
+            let status = retrying(|| {
+                let mut cluster = cluster.clone();
+                async move { cluster.status(StatusRequest {}).await }
+            })
+            .await?;
+            print_status(&status.into_inner())
+        }
         Command::JoinToken { role, rotate } => {
             let token = cluster
                 .join_token(pb::JoinTokenRequest { role, rotate })
@@ -299,7 +396,7 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
     Ok(())
 }
 
-async fn apply(objects: &mut ObjectsClient<Channel>, object: &Object) -> anyhow::Result<()> {
+async fn apply(objects: &mut Objects, object: &Object) -> anyhow::Result<()> {
     let key = object.key();
     let resp = objects
         .apply(ApplyRequest {
@@ -325,7 +422,7 @@ async fn apply(objects: &mut ObjectsClient<Channel>, object: &Object) -> anyhow:
     Ok(())
 }
 
-async fn stack(objects: &mut ObjectsClient<Channel>, command: StackCommand) -> anyhow::Result<()> {
+async fn stack(objects: &mut Objects, command: StackCommand) -> anyhow::Result<()> {
     match command {
         StackCommand::Deploy {
             stack,
@@ -443,7 +540,7 @@ fn convert(
 
 /// The objects of `kinds` that carry the stack's label.
 async fn stack_objects(
-    objects: &mut ObjectsClient<Channel>,
+    objects: &mut Objects,
     stack: &str,
     namespace: &str,
     kinds: &[Kind],
@@ -469,7 +566,7 @@ async fn stack_objects(
     Ok(out)
 }
 
-async fn delete(objects: &mut ObjectsClient<Channel>, o: &Object) -> anyhow::Result<()> {
+async fn delete(objects: &mut Objects, o: &Object) -> anyhow::Result<()> {
     objects
         .delete(DeleteRequest {
             r#ref: Some(ObjectRef {
@@ -486,7 +583,7 @@ async fn delete(objects: &mut ObjectsClient<Channel>, o: &Object) -> anyhow::Res
 }
 
 /// Prints how applying `object` would change the stored one; true if it would.
-async fn diff(objects: &mut ObjectsClient<Channel>, object: &Object) -> anyhow::Result<bool> {
+async fn diff(objects: &mut Objects, object: &Object) -> anyhow::Result<bool> {
     let key = object.key();
     let resp = objects
         .apply(ApplyRequest {
@@ -893,5 +990,37 @@ fn print_status(s: &StatusResponse) {
             let role = if m.voter { "voter" } else { "learner" };
             println!("  {:<20} {:<22} {role}", m.id, m.addr);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retries_only_while_unavailable() {
+        let calls = std::cell::Cell::new(0);
+        let r = retrying(|| {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move {
+                if n < 3 {
+                    Err(tonic::Status::unavailable("electing"))
+                } else {
+                    Ok(n)
+                }
+            }
+        })
+        .await;
+        assert_eq!(r.unwrap(), 3);
+
+        calls.set(0);
+        let r: Result<(), _> = retrying(|| {
+            calls.set(calls.get() + 1);
+            async { Err(tonic::Status::not_found("gone")) }
+        })
+        .await;
+        assert_eq!(r.unwrap_err().code(), tonic::Code::NotFound);
+        assert_eq!(calls.get(), 1, "other errors are not retried");
     }
 }

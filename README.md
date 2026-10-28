@@ -4,8 +4,9 @@ A container orchestrator for FreeBSD: Docker Swarm's operating model plus
 selected Kubernetes features, running workloads as jails through Podman and
 `ocijail`. The plan and its rationale are in [docs/DESIGN.md](docs/DESIGN.md).
 
-Status: phases 1 (single node) and 2 (cluster) are done; phase 3 (K8s-lite)
-is in progress. [PHASE.md](PHASE.md) tracks what is built and what is next.
+Status: phases 1 (single node), 2 (cluster) and 3 (K8s-lite: namespaces,
+RBAC, network policy, quotas, jobs, security profiles, metrics) are done;
+phase 4 (stateful services and operations) is next. [PHASE.md](PHASE.md) tracks what is built and what is next.
 
 ## Build
 

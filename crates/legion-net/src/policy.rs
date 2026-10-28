@@ -1,11 +1,17 @@
 //! Network policy with pf (DESIGN.md §5.6), in the anchor `legion/policy`:
 //! what may reach each pod on this node, and which VIPs it may use.
 //!
-//! Rules sit on the pod's host end (`lp…`), which pf sees bridged traffic
-//! on as well as routed: `out on` it is traffic to the pod, `in on` it is
-//! traffic from the pod. A pod may send only from its own address, so it
-//! cannot pass for a node or for another namespace's task, and whatever it
-//! starts is kept as state, so replies come back through its own refusals.
+//! Rules sit on the pod's host end (`lp…`): `out on` it is traffic to the
+//! pod, `in on` it is traffic from the pod. pf sees traffic there only as
+//! the bridge forwards it between its members, from pods on this node; a
+//! packet the host itself sends onto the bridge, routed in from another
+//! node or from the host, goes out the member unfiltered. Traffic from
+//! other nodes' pods is therefore checked where it comes in, on the mesh
+//! (`in on wg0`), against the same tables; the state made there carries
+//! the connection the rest of its way. A pod may send only from its own
+//! address, so it cannot pass for a node or for another namespace's task,
+//! and whatever it starts is kept as state, so replies come back through
+//! its own refusals.
 //!
 //! What reaches a pod is checked here, on its node, by source: the nodes
 //! (probes, other hosts, published ports reached through another node),
@@ -15,9 +21,10 @@
 //! its source is lost by then: VIPs are checked at the client pod instead,
 //! while the destination is still the VIP.
 //!
-//! States are bound to the interface (`if-bound`): a floating one made
-//! here would match the same packet again on the bridge, before the VIP's
-//! translation, and break it.
+//! States on the host ends are bound to the interface (`if-bound`): a
+//! floating one made there would match the same packet again on the
+//! bridge, before the VIP's translation, and break it. Those on the mesh
+//! float, so they also pass the packet out to the pod, and its replies.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -25,8 +32,9 @@ use std::net::Ipv4Addr;
 
 use legion_sys::{Ipv4Net, Sys};
 
+use crate::CLUSTER_POD_CIDR;
 use crate::lb::{Proto, TAG};
-use crate::mesh::UNDERLAY;
+use crate::mesh::{INTERFACE as MESH, UNDERLAY};
 
 pub const ANCHOR: &str = "legion/policy";
 
@@ -60,6 +68,7 @@ pub fn rules(guards: &[Guard], gateway: Ipv4Addr, services: Ipv4Net) -> String {
         UNDERLAY.prefix
     );
     let vips = format!("{}/{}", services.network(), services.prefix);
+    let pods = format!("{}/{}", CLUSTER_POD_CIDR.network(), CLUSTER_POD_CIDR.prefix);
     let state = "keep state (if-bound)";
     let mut r = String::new();
     for g in guards {
@@ -77,6 +86,10 @@ pub fn rules(guards: &[Guard], gateway: Ipv4Addr, services: Ipv4Net) -> String {
         }
         let _ = writeln!(r, "block drop in quick on {lp} inet to {vips}");
         let _ = writeln!(r, "pass in quick on {lp} inet from {ip} {state}");
+        // Its state there is bound to its host end; what it starts toward
+        // other nodes needs one on the mesh as well, which its replies
+        // match before the refusals below.
+        let _ = writeln!(r, "pass out quick on {MESH} inet from {ip} keep state");
         // To the pod.
         if g.open {
             let _ = writeln!(r, "pass out quick on {lp} inet {state}");
@@ -98,6 +111,24 @@ pub fn rules(guards: &[Guard], gateway: Ipv4Addr, services: Ipv4Net) -> String {
             }
         }
         let _ = writeln!(r, "block drop out quick on {lp} inet all");
+        // From other nodes' pods, which the host routes in from the mesh.
+        for a in &g.allowed {
+            let from = format!("<{}>", a.table);
+            if a.ports.is_empty() {
+                let _ = writeln!(
+                    r,
+                    "pass in quick on {MESH} inet from {from} to {ip} keep state"
+                );
+            }
+            for (proto, port) in &a.ports {
+                let _ = writeln!(
+                    r,
+                    "pass in quick on {MESH} inet proto {} from {from} to {ip} port {port} keep state",
+                    proto.as_str()
+                );
+            }
+        }
+        let _ = writeln!(r, "block drop in quick on {MESH} inet from {pods} to {ip}");
     }
     r
 }
@@ -198,15 +229,20 @@ mod tests {
              pass in quick on lp000000000007 inet proto tcp from 10.200.0.7 to 10.201.0.3 port 80 keep state (if-bound)\n\
              block drop in quick on lp000000000007 inet to 10.201.0.0/16\n\
              pass in quick on lp000000000007 inet from 10.200.0.7 keep state (if-bound)\n\
+             pass out quick on wg0 inet from 10.200.0.7 keep state\n\
              pass out quick on lp000000000007 inet tagged LSVC keep state (if-bound)\n\
              pass out quick on lp000000000007 inet from { 10.200.0.1, 100.64.0.0/16 } keep state (if-bound)\n\
              pass out quick on lp000000000007 inet from <n0123> keep state (if-bound)\n\
              pass out quick on lp000000000007 inet proto tcp from <p4567> to 10.200.0.7 port 5432 keep state (if-bound)\n\
              block drop out quick on lp000000000007 inet all\n\
+             pass in quick on wg0 inet from <n0123> to 10.200.0.7 keep state\n\
+             pass in quick on wg0 inet proto tcp from <p4567> to 10.200.0.7 port 5432 keep state\n\
+             block drop in quick on wg0 inet from 10.200.0.0/16 to 10.200.0.7\n\
              block drop quick on lp000000000008 inet6 all\n\
              block drop in quick on lp000000000008 inet from ! 10.200.0.8\n\
              block drop in quick on lp000000000008 inet to 10.201.0.0/16\n\
              pass in quick on lp000000000008 inet from 10.200.0.8 keep state (if-bound)\n\
+             pass out quick on wg0 inet from 10.200.0.8 keep state\n\
              pass out quick on lp000000000008 inet keep state (if-bound)\n"
         );
     }
