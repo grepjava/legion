@@ -356,4 +356,27 @@ async fn imports_an_oci_layout() {
     assert_eq!(image.digest, m);
     assert_eq!(image.layers.len(), 1);
     assert!(s.get("localhost/built:1").unwrap().is_some());
+
+    // The same layout as an archive, named by its index.
+    let archive = t.path().join("built.tar");
+    let mut b = tar::Builder::new(std::fs::File::create(&archive).unwrap());
+    b.append_dir_all(".", dir.path()).unwrap();
+    b.finish().unwrap();
+    drop(b);
+    assert!(s.remove("localhost/built:1").await.unwrap());
+    let loaded = s.load(&archive, None).await.unwrap();
+    assert_eq!(loaded.references, ["localhost/built:1"]);
+    let renamed = s.load(&archive, Some("localhost/other:2")).await.unwrap();
+    assert_eq!(renamed.id, loaded.id);
+    assert_eq!(
+        renamed.references,
+        ["localhost/built:1", "localhost/other:2"]
+    );
+    let not_oci = t.path().join("plain.tar");
+    let mut b = tar::Builder::new(std::fs::File::create(&not_oci).unwrap());
+    b.append_path_with_name(&archive, "manifest.json").unwrap();
+    b.finish().unwrap();
+    drop(b);
+    let e = s.load(&not_oci, None).await.unwrap_err();
+    assert!(e.to_string().contains("oci-archive"), "{e}");
 }

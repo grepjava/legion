@@ -39,12 +39,16 @@ legion watch Service
 
 The daemon listens on `127.0.0.1:7470` without TLS; set `--listen`, or point the
 CLI elsewhere with `--server` or `LEGION_SERVER`. Without `--no-agent`, on
-FreeBSD and as root, it also runs the agent with its own Podman service, so
-applied services run as pods of jails on the node (`legion list tasks -n
-shop` shows each pod's address on the node's `legion0` bridge). Pods reach
-each other and the host, and find services by name (`web`, `web.shop` or
-`web.shop.legion`) through the node's resolver on the bridge. Give it
-`--zfs-root <pool>/legion` to run tasks that use volumes. Service VIPs,
+FreeBSD and as root, it also runs the agent, so applied services run as
+pods of jails on the node (`legion list tasks -n shop` shows each pod's
+address on the node's `legion0` bridge). The agent runs them itself: it
+pulls OCI images into ZFS and runs each container as a jail on a clone of
+its image, so it needs `--zfs-root <pool>/legion`, where images,
+containers and volumes live (`legion image load` adds images no registry
+serves). `--runtime podman` runs them with a Podman service of its own and
+ocijail instead. Pods reach each other and the host, and find services by
+name (`web`, `web.shop` or `web.shop.legion`) through the node's resolver
+on the bridge. Service VIPs,
 published ports and NAT for pods need the host's `/etc/pf.conf` to call
 Legion's anchors:
 

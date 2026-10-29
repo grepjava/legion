@@ -99,7 +99,7 @@ enum Command {
         #[arg(long)]
         ingress_tls_listen: Option<SocketAddr>,
         /// What runs the agent's containers.
-        #[arg(long, value_enum, default_value = "podman")]
+        #[arg(long, value_enum, default_value = "jail")]
         runtime: daemon::RuntimeKind,
     },
     /// Start a new cluster with the reached manager as its first member.
@@ -168,6 +168,11 @@ enum Command {
         /// With autolock on, a file holding the unlock key.
         #[arg(long)]
         unlock_key_file: Option<PathBuf>,
+    },
+    /// Images on this node, for the jail runtime.
+    Image {
+        #[command(subcommand)]
+        command: ImageCommand,
     },
     /// Create or update objects from YAML or JSON files ("-" reads stdin).
     Apply {
@@ -290,6 +295,24 @@ enum Command {
         /// Where to listen.
         #[arg(long, default_value = "127.0.0.1")]
         address: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ImageCommand {
+    /// Load an image from an OCI archive (`podman save --format
+    /// oci-archive`) into this node's image store, beside a running daemon
+    /// or not: for images no registry serves (`localhost/...`).
+    Load {
+        file: PathBuf,
+        /// Its name; by default the one the archive gives.
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, default_value = "/var/db/legion")]
+        data_dir: PathBuf,
+        /// The daemon's `--zfs-root`.
+        #[arg(long)]
+        zfs_root: String,
     },
 }
 
@@ -451,6 +474,15 @@ async fn run() -> anyhow::Result<()> {
             advertise,
             unlock_key_file.as_deref(),
         ),
+        Command::Image {
+            command:
+                ImageCommand::Load {
+                    file,
+                    name,
+                    data_dir,
+                    zfs_root,
+                },
+        } => daemon::load_image(&file, name.as_deref(), &data_dir, &zfs_root).await,
         Command::Unlock { key_file } => cli::unlock(&args.server, key_file.as_deref()).await,
         command => cli::run(&args.server, &args.identity, command).await,
     }

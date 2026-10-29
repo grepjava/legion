@@ -2,7 +2,7 @@
 //! updates with zero downtime, and survives losing any one node. It drives
 //! real daemons, so it is ignored by default and run by hand on a FreeBSD
 //! host as root: this host is node n1, and two machines reachable over ssh
-//! are n2 and n3, each with Podman and ocijail. The test copies its own
+//! are n2 and n3 (each gets a throwaway ZFS pool). The test copies its own
 //! `legion` to them. All three are managers.
 //!
 //! ```sh
@@ -141,7 +141,7 @@ impl Load {
 }
 
 #[test]
-#[ignore = "needs root, bhyve guests and Podman on FreeBSD; see the module docs"]
+#[ignore = "needs root, bhyve guests and ZFS on FreeBSD; see the module docs"]
 fn app_updates_and_survives_losing_a_node() {
     let mut lab = Lab::from_env();
     let step = |what: &str| eprintln!("--- {what}");

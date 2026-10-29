@@ -10,8 +10,8 @@
 //! zpool destroy lexit; rm /var/tmp/lexit.img
 //! ```
 //!
-//! `LEGION_EXIT_RUNTIME=jail` runs it on the jail runtime instead of
-//! Podman.
+//! It runs on the jail runtime; `LEGION_EXIT_RUNTIME=podman` runs it on
+//! Podman and ocijail instead.
 //!
 //! The app is `tests/exit/app.yaml`: web (two replicas) counts requests in
 //! db, whose data is on a ZFS volume, and in cache, whose data is on a
@@ -318,11 +318,13 @@ fn sh(cmd: &str) -> String {
 }
 
 #[test]
-#[ignore = "needs root, Podman, ocijail and ZFS on FreeBSD; set LEGION_EXIT_LAB and LEGION_EXIT_ZFS_ROOT"]
+#[ignore = "needs root and ZFS on FreeBSD; set LEGION_EXIT_LAB and LEGION_EXIT_ZFS_ROOT"]
 fn app_survives_failures() {
     let dir = PathBuf::from(std::env::var("LEGION_EXIT_LAB").expect("set LEGION_EXIT_LAB"));
     let zfs_root = std::env::var("LEGION_EXIT_ZFS_ROOT").expect("set LEGION_EXIT_ZFS_ROOT");
-    let on_jails = std::env::var("LEGION_EXIT_RUNTIME").is_ok_and(|r| r == "jail");
+    let on_jails = std::env::var("LEGION_EXIT_RUNTIME")
+        .ok()
+        .is_none_or(|r| r != "podman");
     // A failed run leaves its pods running; wiping the lab under them
     // would orphan them.
     let jails = sh("jls path");

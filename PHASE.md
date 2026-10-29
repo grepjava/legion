@@ -790,14 +790,27 @@ replaces Podman and ocijail.
   DNS, VIPs, ingress over HTTP and HTTPS, metrics, a daemon restart
   adopting the running pods, all without Podman.
 
+- **`legion image load`** (`Store::load`): an OCI archive (`podman save
+  --format oci-archive`) into a node's image store, named as the archive
+  names it or `--name`; the store holds a file lock while it changes, so
+  this runs beside a daemon that pulls. Tested: loading by the archive's
+  name and another, and a non-OCI archive refused with what to do.
+- **Every exit test passes on the jail runtime** (2026-10-29, weft-bsd
+  with the Vultr VPS and bhyve `lvm3`; `LEGION_CLUSTER_RUNTIME` and
+  `LEGION_EXIT_RUNTIME` choose, each node of the multi-node lab getting a
+  throwaway pool): phase 1 (174 s), phase 2 cluster (411 s: deploy, a
+  zero-downtime update, a node lost), phase 3 teams (328 s: isolation,
+  network policy across nodes, published ports, quotas) and phase 4
+  stateful (1094 s: Postgres primary and replica, both drained and moved
+  with their data, the image loaded with `legion image load`).
+- **The jail runtime is the default** (`--runtime jail`, which needs
+  `--zfs-root`); `--runtime podman` keeps Podman and ocijail for now.
+
 ### To do, in order
 
-1. The phase 2-4 exit tests (cluster, teams, stateful) on the jail
-   runtime; the stateful one needs its Postgres image loaded into the
-   image store (`legion image load` of an OCI archive).
-2. The jail runtime becomes the default.
-3. Podman's runtime removed once nothing needs it; the `Runtime` trait
-   gets its own types then, instead of `legion_podman`'s.
+1. Podman's runtime removed: `legion-podman`, the hook, `--runtime`,
+   the Podman lab code; the `Runtime` trait gets its own types instead
+   of `legion_podman`'s.
 
 Then: Linux images, IPv6 dual-stack, a volume plugin interface (NFS,
 iSCSI), bhyve tasks (exploratory).

@@ -9,17 +9,21 @@
 //! It drives real daemons, so it is ignored by default and run by hand on
 //! a FreeBSD host as root, with the lab of `tests/common` (see there), as
 //! the phase 3 test is, and with the Postgres image of
-//! `tests/stateful/Containerfile` saved to `LEGION_PG_IMAGE`, which it
-//! loads into every node's Podman:
+//! `tests/stateful/Containerfile` saved to `LEGION_PG_IMAGE` as an OCI
+//! archive (`podman save --format oci-archive`), which it loads into every
+//! node with `legion image load`:
 //!
 //! ```sh
 //! sudo LEGION_CLUSTER_LAB=/var/tmp/lpg \
 //!     LEGION_CLUSTER_HOST=192.168.253.254 \
 //!     LEGION_CLUSTER_VMS="vultr=grepjava@192.168.254.2 lvm3=192.168.253.3" \
 //!     LEGION_CLUSTER_KEY=/var/tmp/lvm/id_lab \
-//!     LEGION_PG_IMAGE=/var/tmp/legion-pg.tar.gz \
+//!     LEGION_PG_IMAGE=/var/tmp/legion-pg.oci.tar \
 //!     target/debug/deps/stateful-<hash> --ignored --nocapture
 //! ```
+//!
+//! With `LEGION_CLUSTER_RUNTIME=podman` it is any archive `podman load`
+//! reads, loaded into every node's Podman.
 //!
 //! Every node gets a throwaway ZFS pool, `llab`, backed by a file in
 //! `/var/tmp`, which goes again when the test ends.
@@ -28,19 +32,8 @@ mod common;
 
 use std::process::Command;
 
-use common::{Lab, Role, VM_RUN, text, wait};
+use common::{Lab, Role, VM_DATA, VM_RUN, ZFS_ROOT, text, wait};
 use serde_json::Value;
-
-/// A throwaway pool for the node's volumes.
-const POOL: &str = "kldload -n zfs
-    zpool destroy -f llab 2>/dev/null || true
-    rm -f /var/tmp/llab.img
-    truncate -s 2g /var/tmp/llab.img
-    zpool create -m /var/tmp/llab llab /var/tmp/llab.img
-";
-const NO_POOL: &str = "zpool destroy -f llab
-    rm -f /var/tmp/llab.img
-";
 
 /// The namespace, allowed the SysV shared memory Postgres needs, the
 /// script its tasks run, and the service.
@@ -111,9 +104,40 @@ spec:
 "#;
 
 impl Lab {
-    /// Loads the image saved at `tar` into every node's Podman, through the
+    /// Loads the image saved at `tar` into every node: its image store with
+    /// the jail runtime (`tar` an OCI archive), or its Podman, through the
     /// socket of the lab's own Podman service.
     fn load_image(&self, tar: &str) {
+        if self.jails {
+            let out = Command::new(common::LEGION)
+                .args(["image", "load", tar, "--zfs-root", ZFS_ROOT, "--data-dir"])
+                .arg(self.dir.join("data"))
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "loading the image here: {}",
+                text(&out.stderr)
+            );
+            for vm in &self.vms {
+                self.copy(vm, tar, "/var/tmp/legion-pg.oci.tar");
+                let out = self.ssh(
+                    vm,
+                    &format!(
+                        "{} image load /var/tmp/legion-pg.oci.tar --zfs-root {ZFS_ROOT} \
+                             --data-dir {VM_DATA} && rm /var/tmp/legion-pg.oci.tar",
+                        common::REMOTE
+                    ),
+                );
+                assert!(
+                    out.status.success(),
+                    "loading the image on {}: {}",
+                    vm.name,
+                    text(&out.stderr)
+                );
+            }
+            return;
+        }
         let socket = format!("unix://{}/run/podman.sock", self.dir.display());
         wait("the image loaded here", 120, || {
             Command::new("podman")
@@ -217,19 +241,15 @@ impl Lab {
 }
 
 #[test]
-#[ignore = "needs root, Podman and ZFS on FreeBSD, two more nodes and the image; see the module docs"]
+#[ignore = "needs root and ZFS on FreeBSD, two more nodes and the image; see the module docs"]
 fn postgres_moves_between_nodes() {
     let image = std::env::var("LEGION_PG_IMAGE").expect("set LEGION_PG_IMAGE");
     let mut lab = Lab::from_env();
-    lab.setup = POOL.to_owned();
-    lab.flags = "--zfs-root llab/legion".to_owned();
-    lab.teardown = NO_POOL.to_owned();
+    lab.use_pool();
     let step = |what: &str| eprintln!("--- {what}");
 
     step("two managers and a worker, each with a pool for volumes");
-    let status = Command::new("/bin/sh").args(["-c", POOL]).status().unwrap();
-    assert!(status.success(), "creating this host's pool");
-    lab.start_host(&["--zfs-root", "llab/legion"]);
+    lab.start_host(&[]);
     lab.ok(&["init"]);
     let manager = lab.ok(&["join-token", "manager"]).trim().to_owned();
     let worker = lab.ok(&["join-token", "worker"]).trim().to_owned();

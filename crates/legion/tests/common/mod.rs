@@ -6,6 +6,8 @@
 //! - `LEGION_CLUSTER_VMS`: the two machines, as `name=[user@]addr`, logging
 //!   in as root unless a user is given, who must have sudo.
 //! - `LEGION_CLUSTER_KEY`: the ssh key to log in with.
+//! - `LEGION_CLUSTER_RUNTIME=podman`: Podman and ocijail rather than the
+//!   jail runtime, which gives every node the throwaway pool [`POOL`].
 //!
 //! The test's own `legion` is copied to the machines. Remove the lab
 //! directory afterwards with `chflags -R 0` and `rm -rf`.
@@ -49,8 +51,23 @@ pub enum Role {
     Worker,
 }
 
+/// A throwaway pool, `llab`, backed by a file in `/var/tmp`.
+pub const POOL: &str = "kldload -n zfs
+    zpool destroy -f llab 2>/dev/null || true
+    rm -f /var/tmp/llab.img
+    truncate -s 2g /var/tmp/llab.img
+    zpool create -m /var/tmp/llab llab /var/tmp/llab.img
+";
+pub const NO_POOL: &str = "zpool destroy -f llab
+    rm -f /var/tmp/llab.img
+";
+/// The daemons' dataset in [`POOL`].
+pub const ZFS_ROOT: &str = "llab/legion";
+
 pub struct Lab {
     pub dir: PathBuf,
+    /// The jail runtime rather than Podman.
+    pub jails: bool,
     pub host: String,
     pub vms: Vec<Vm>,
     pub key: String,
@@ -96,8 +113,12 @@ impl Lab {
                 .unwrap();
         }
         std::fs::create_dir_all(&dir).unwrap();
-        Lab {
+        let jails = std::env::var("LEGION_CLUSTER_RUNTIME")
+            .ok()
+            .is_none_or(|r| r != "podman");
+        let mut lab = Lab {
             dir,
+            jails,
             host: var("LEGION_CLUSTER_HOST"),
             vms,
             key: var("LEGION_CLUSTER_KEY"),
@@ -105,6 +126,27 @@ impl Lab {
             setup: String::new(),
             flags: String::new(),
             teardown: String::new(),
+        };
+        if jails {
+            lab.use_pool();
+        }
+        lab
+    }
+
+    /// Every node gets [`POOL`], its daemon `--zfs-root` in it, and the
+    /// pool goes when the lab does.
+    pub fn use_pool(&mut self) {
+        self.setup = POOL.to_owned();
+        self.flags = format!("--zfs-root {ZFS_ROOT}");
+        self.teardown = NO_POOL.to_owned();
+    }
+
+    /// The runtime flag for every daemon.
+    fn runtime(&self) -> &'static str {
+        if self.jails {
+            "--runtime jail"
+        } else {
+            "--runtime podman"
         }
     }
 
@@ -216,6 +258,13 @@ impl Lab {
 
     /// Starts this host's daemon as the manager `n1`, with `extra` flags.
     pub fn start_host(&mut self, extra: &[&str]) {
+        if !self.setup.is_empty() {
+            let status = Command::new("/bin/sh")
+                .args(["-c", &self.setup])
+                .status()
+                .unwrap();
+            assert!(status.success(), "setting this host up");
+        }
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -228,6 +277,8 @@ impl Lab {
             .arg(self.dir.join("data"))
             .arg("--run-dir")
             .arg(self.dir.join("run"))
+            .args(self.runtime().split_whitespace())
+            .args(self.flags.split_whitespace())
             .args(extra)
             .stdout(log.try_clone().unwrap())
             .stderr(log)
@@ -263,11 +314,12 @@ impl Lab {
                  {join} --node-name {name}
              daemon -o /var/log/legion-lab.log {REMOTE} daemon --node-name {name} \
                  --data-dir /var/db/legion-lab --run-dir /var/run/legion-lab \
-                 {daemon} {flags} </dev/null >/dev/null 2>&1
+                 {daemon} {runtime} {flags} </dev/null >/dev/null 2>&1
 ",
             clean = clean(VM_DATA, VM_RUN),
             server = self.server(),
             setup = self.setup,
+            runtime = self.runtime(),
             flags = self.flags,
         );
         let out = self.ssh(vm, &cmd);
@@ -319,10 +371,19 @@ impl Lab {
 }
 
 /// A script removing what a stopped daemon with these directories left:
-/// its pods, Podman service, interfaces, load balancing and state.
+/// its pods (the jail runtime's by their records' ids, as pod jails are on
+/// /var/empty), Podman service, interfaces, load balancing and state.
 pub fn clean(data: &str, run: &str) -> String {
     format!(
-        "pkill -f 'podman --root {data}/podman'
+        "for r in {data}/jails/*/record.json; do
+             [ -f \"$r\" ] || continue
+             id=$(basename $(dirname \"$r\"))
+             jls -j $id jid >/dev/null 2>&1 && jail -r $id
+         done
+         i=0; while jls -d -h path | grep -q '^{data}/' && [ $i -lt 90 ]; do
+             sleep 1; i=$((i + 1))
+         done
+         pkill -f 'podman --root {data}/podman'
          podman --root {data}/podman --runroot {run}/podman --tmpdir {run}/podman-tmp \
              rm -af -t 0 >/dev/null 2>&1
          for i in $(ifconfig -l); do
@@ -330,8 +391,14 @@ pub fn clean(data: &str, run: &str) -> String {
          done
          pfctl -a legion/svc -F all >/dev/null 2>&1
          pfctl -a legion/policy -F all >/dev/null 2>&1
-         mount -p | awk '{{print $2}}' | grep -E '^({data}|{run})/' | sort -r |
-             while read -r m; do umount -f \"$m\"; done
+         # Dying jails may hold mounts for a while: try again until none
+         # are left, for up to 30 s.
+         i=0; while mount -p | awk '{{print $2}}' | grep -qE '^({data}|{run})/' && [ $i -lt 30 ]; do
+             mount -p | awk '{{print $2}}' | grep -E '^({data}|{run})/' | sort -r |
+                 while read -r m; do umount -f \"$m\" 2>/dev/null; done
+             mount -p | awk '{{print $2}}' | grep -qE '^({data}|{run})/' && sleep 1
+             i=$((i + 1))
+         done
          chflags -R 0 {data} {run} 2>/dev/null
          rm -rf {data} {run}
 "

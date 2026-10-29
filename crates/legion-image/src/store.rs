@@ -240,7 +240,7 @@ impl Store {
                 "{r} is a local image: no registry serves it; load it onto the node"
             )));
         }
-        let _held = self.lock.lock().await;
+        let _held = self.hold().await?;
         let source = Source::Registry {
             client: &self.client,
             reference: &r,
@@ -252,8 +252,66 @@ impl Store {
     /// Adds the image in an OCI layout directory as `reference`.
     pub async fn import(&self, layout: &Path, reference: &str) -> Result<Image, Error> {
         let r = Reference::parse(reference)?;
-        let _held = self.lock.lock().await;
+        let _held = self.hold().await?;
         self.ingest(&Source::Layout(layout), &r).await
+    }
+
+    /// Adds the image in an OCI archive (`podman save --format
+    /// oci-archive`, a tar of a layout), named `reference` or as the
+    /// archive names it.
+    pub async fn load(&self, archive: &Path, reference: Option<&str>) -> Result<Image, Error> {
+        let _held = self.hold().await?;
+        let tmp = tempfile::Builder::new()
+            .prefix("load")
+            .tempdir_in(self.dir.join("tmp"))?;
+        let out = std::process::Command::new("tar")
+            .arg("-xf")
+            .arg(archive)
+            .arg("-C")
+            .arg(tmp.path())
+            .output()?;
+        if !out.status.success() {
+            return Err(Error::Extract(
+                String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            ));
+        }
+        let index = tmp.path().join("index.json");
+        if !index.exists() {
+            return Err(Error::Unsupported(
+                "not an OCI archive (no index.json): save it with --format oci-archive".to_owned(),
+            ));
+        }
+        let name = match reference {
+            Some(r) => r.to_owned(),
+            None => {
+                let doc = Document::parse(&std::fs::read(&index)?)?;
+                doc.manifests
+                    .unwrap_or_default()
+                    .iter()
+                    .find_map(|m| {
+                        m.annotations
+                            .get("org.opencontainers.image.ref.name")
+                            .cloned()
+                    })
+                    .ok_or_else(|| {
+                        Error::Unsupported("the archive names no image: give a name".to_owned())
+                    })?
+            }
+        };
+        let r = Reference::parse(&name)?;
+        self.ingest(&Source::Layout(tmp.path()), &r).await
+    }
+
+    /// The store to itself: this process's other users wait, and so do
+    /// other processes (`legion image load` beside a running daemon).
+    async fn hold(&self) -> Result<Held<'_>, Error> {
+        let inner = self.lock.lock().await;
+        let path = self.dir.join("lock");
+        let file = blocking(move || lock_file(&path)).await?;
+        Ok(Held {
+            _inner: inner,
+            _file: file,
+        })
     }
 
     async fn ingest(&self, source: &Source<'_>, r: &Reference) -> Result<Image, Error> {
@@ -342,7 +400,7 @@ impl Store {
     /// (those that containers still use stay until a later prune).
     pub async fn remove(&self, reference: &str) -> Result<bool, Error> {
         let name = Reference::parse(reference)?.to_string();
-        let _held = self.lock.lock().await;
+        let _held = self.hold().await?;
         let mut images = self.images()?;
         let mut found = false;
         for i in &mut images {
@@ -359,7 +417,7 @@ impl Store {
     /// Destroys layers that no image uses and no container was cloned
     /// from; returns their chain ids.
     pub async fn prune(&self) -> Result<Vec<String>, Error> {
-        let _held = self.lock.lock().await;
+        let _held = self.hold().await?;
         let images = self.images()?;
         self.prune_held(&images).await
     }
@@ -396,6 +454,29 @@ impl Store {
         })
         .await
     }
+}
+
+struct Held<'a> {
+    _inner: tokio::sync::MutexGuard<'a, ()>,
+    /// Holds the lock while open.
+    _file: std::fs::File,
+}
+
+fn lock_file(path: &Path) -> Result<std::fs::File, Error> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock on a descriptor we own; released when it closes.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(file)
 }
 
 /// Makes layer dataset `ds` (a clone of `parent`, or new), applies `tar`

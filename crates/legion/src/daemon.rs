@@ -306,6 +306,37 @@ async fn start_agent(
     }
 }
 
+fn image_store(
+    sys: Arc<dyn legion_sys::Sys>,
+    data_dir: &Path,
+    zfs_root: &str,
+) -> anyhow::Result<legion_image::Store> {
+    let client = legion_image::Client::new().map_err(|e| anyhow::anyhow!(e))?;
+    legion_image::Store::open(
+        sys,
+        &format!("{zfs_root}/images"),
+        &data_dir.join("images"),
+        client,
+    )
+    .map_err(|e| anyhow::anyhow!("opening the image store: {e}"))
+}
+
+/// `legion image load`: an OCI archive into this node's image store.
+pub async fn load_image(
+    file: &Path,
+    name: Option<&str>,
+    data_dir: &Path,
+    zfs_root: &str,
+) -> anyhow::Result<()> {
+    let store = image_store(Arc::new(legion_sys::Shell::new()), data_dir, zfs_root)?;
+    let image = store
+        .load(file, name)
+        .await
+        .map_err(|e| anyhow::anyhow!("loading {}: {e}", file.display()))?;
+    println!("loaded {} ({})", image.references.join(", "), image.id);
+    Ok(())
+}
+
 #[cfg(unix)]
 fn jail_runtime(
     opts: &Options,
@@ -314,14 +345,7 @@ fn jail_runtime(
     let Some(zfs) = opts.zfs_root.as_deref() else {
         bail!("the jail runtime keeps images and containers in ZFS: pass --zfs-root");
     };
-    let client = legion_image::Client::new().map_err(|e| anyhow::anyhow!(e))?;
-    let images = legion_image::Store::open(
-        sys.clone(),
-        &format!("{zfs}/images"),
-        &opts.data_dir.join("images"),
-        client,
-    )
-    .map_err(|e| anyhow::anyhow!("opening the image store: {e}"))?;
+    let images = image_store(sys.clone(), &opts.data_dir, zfs)?;
     let exe = std::env::current_exe().context("finding this binary, for the supervisor")?;
     legion_jail::JailRuntime::new(
         sys.clone(),

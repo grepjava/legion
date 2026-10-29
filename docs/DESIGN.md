@@ -912,9 +912,10 @@ large shared memory need their own answer either way.
 
 It started with a spike on a FreeBSD host, as phase 0 did (S7 in §10),
 which held: a container starts in about 55 ms against Podman's 900, and
-costs 1 KB of disk against a full copy of its image. So it becomes the
-default once built, and the Podman runtime is removed when the native
-one has run the exit tests and lab clusters without it.
+costs 1 KB of disk against a full copy of its image. Built, it passed
+every phase's exit test, on one node and across the lab cluster, and is
+the default since 2026-10-29 (`--runtime jail`; `--runtime podman` until
+the Podman runtime is removed).
 
 How it is built:
 

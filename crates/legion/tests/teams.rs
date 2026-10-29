@@ -224,7 +224,7 @@ fn line_from(lab: &Lab, vm: usize, host: &str, port: u16) -> String {
 }
 
 #[test]
-#[ignore = "needs root, Podman on FreeBSD and two more nodes; see the module docs"]
+#[ignore = "needs root, ZFS on FreeBSD and two more nodes; see the module docs"]
 fn two_teams_share_a_cluster() {
     let mut lab = Lab::from_env();
     let step = |what: &str| eprintln!("--- {what}");
