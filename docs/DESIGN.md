@@ -862,9 +862,14 @@ node and routes change without reloads.
   ready task: 503; a task that does not answer: 502 (504 after 5 s).
 - **HTTPS** (`--ingress-tls-listen 0.0.0.0:443`): a route with `tls: {
   secret }` names a Secret of its namespace holding the certificate chain
-  and its private key in PEM. Every node may read such a Secret (the
-  dispatcher allows a Secret that a route names as well as those its
-  tasks use), as any node may serve the route. The proxy chooses the
+  and its private key in PEM. Nodes read such a Secret through the
+  dispatcher, which allows a Secret that a route names as well as those
+  a node's tasks use, but a route's only if it holds a certificate and a
+  key, so a route cannot hand nodes another Secret. While no node is
+  labelled `legion.ingress=true`, every node may read them, as any may
+  serve the route; once one is, only labelled nodes may, so a worker
+  that serves no HTTPS cannot read the keys (`legion node label NODE
+  legion.ingress=true` on each node serving HTTPS). The proxy chooses the
   certificate by SNI, an exact host before a `*.` one, and reads the
   Secrets again when routes change and every minute, so a renewed
   certificate takes over; one that cannot be read or parsed keeps the

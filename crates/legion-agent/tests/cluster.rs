@@ -200,6 +200,26 @@ impl Cluster {
             .unwrap();
     }
 
+    /// Sets a label on Node `name`, as `legion node label` does.
+    async fn label_node(&self, name: &str, key: &str, value: &str) {
+        let mut node = self
+            .list(Kind::Node)
+            .await
+            .into_iter()
+            .find(|n| n.metadata.name == name)
+            .unwrap();
+        node.metadata.labels.insert(key.into(), value.into());
+        self.api
+            .clone()
+            .apply(ApplyRequest {
+                object: Some((&node).into()),
+                expected_version: Some(node.metadata.version),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
     async fn list(&self, kind: Kind) -> Vec<Object> {
         let resp = self
             .api
@@ -916,6 +936,43 @@ async fn any_node_reads_the_certificates_of_routes_but_no_other_secret() {
         .unwrap_err();
     assert!(
         err.to_string().contains("not a PEM certificate and key"),
+        "{err}"
+    );
+    c.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn once_nodes_are_marked_for_ingress_only_they_read_certificates() {
+    use legion_agent::Control;
+    let c = Cluster::start(2).await;
+    let key = rcgen::generate_simple_self_signed(vec!["shop.example.org".to_owned()]).unwrap();
+    let pem = format!("{}{}", key.cert.pem(), key.signing_key.serialize_pem());
+    c.apply(&format!(
+        "apiVersion: legion/v1\nkind: Secret\nmetadata: {{ name: www-cert, namespace: shop }}\nspec: {{ text: {} }}\n",
+        serde_json::to_string(&pem).unwrap()
+    ))
+    .await;
+    c.apply(
+        "apiVersion: legion/v1\nkind: Route\nmetadata: { name: www, namespace: shop }\n\
+         spec: { host: shop.example.org, service: web, tls: { secret: www-cert } }\n",
+    )
+    .await;
+    let read = async |node: &str| {
+        GrpcControl::new(node, vec![c.addr.clone()], None)
+            .unwrap()
+            .data("shop", Kind::Secret, "www-cert")
+            .await
+    };
+    // None marked: any node.
+    assert!(read("n1").await.is_ok());
+    assert!(read("n2").await.is_ok());
+    // n1 marked: only n1.
+    c.label_node("n1", legion_api::node::LABEL_INGRESS, "true")
+        .await;
+    assert_eq!(read("n1").await.unwrap().as_deref(), Some(pem.as_bytes()));
+    let err = read("n2").await.unwrap_err();
+    assert!(
+        err.to_string().contains("not marked to serve HTTPS routes"),
         "{err}"
     );
     c.stop().await;

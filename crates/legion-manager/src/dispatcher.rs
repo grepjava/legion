@@ -198,6 +198,23 @@ impl DispatcherService {
             .any(|r| r.tls.is_some_and(|t| t.secret == name)))
     }
 
+    /// Whether `node` may read routes' certificates: it is marked as
+    /// serving HTTPS routes, or no node is.
+    fn serves_routes(&self, node: &str) -> Result<bool, Status> {
+        let nodes = self.store().list(Kind::Node, None).map_err(internal)?;
+        let marked = |o: &Object| {
+            o.metadata
+                .labels
+                .get(legion_api::node::LABEL_INGRESS)
+                .is_some_and(|v| v == "true")
+        };
+        Ok(!nodes.objects.iter().any(marked)
+            || nodes
+                .objects
+                .iter()
+                .any(|o| o.metadata.name == node && marked(o)))
+    }
+
     fn managers(&self) -> Vec<String> {
         let m = self.store().raft.metrics().borrow().clone();
         m.membership_config
@@ -683,6 +700,13 @@ impl Dispatcher for DispatcherService {
             .any(|a| a.spec.pod.data_refs().contains(&wanted));
         let route =
             !used && kind == Kind::Secret && self.route_certificate(&r.namespace, &r.name)?;
+        if route && !self.serves_routes(&node)? {
+            return Err(Status::permission_denied(format!(
+                "node {node} is not marked to serve HTTPS routes: other nodes are \
+                 (`legion node label {node} {}=true`)",
+                legion_api::node::LABEL_INGRESS
+            )));
+        }
         if !used && !route {
             return Err(Status::permission_denied(format!(
                 "no task of node {node} uses {} {}/{}",

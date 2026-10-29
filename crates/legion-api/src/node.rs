@@ -8,6 +8,11 @@ use crate::admit::{Invalid, Spec, field, index};
 use crate::quantity::{Bytes, Cpu};
 use crate::service::TaintEffect;
 
+/// Label (`true`) marking the nodes that serve HTTPS routes. While no node
+/// has it, any node may read routes' certificates; once one has it, only
+/// nodes with it may.
+pub const LABEL_INGRESS: &str = "legion.ingress";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeSpec {

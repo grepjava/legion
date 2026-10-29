@@ -194,6 +194,17 @@ legion --identity alice.pem list services -n shop
 legion delete RoleBinding alice -n shop        # takes her rights away
 ```
 
+Nodes started with `--ingress-listen 0.0.0.0:80` (and
+`--ingress-tls-listen 0.0.0.0:443`) serve `Route` objects: HTTP by host
+and path to a service's ready tasks, HTTPS with a certificate and key
+from a Secret the route names. Any node may read those Secrets until
+one node is labelled as serving HTTPS; then only labelled nodes may, so
+label every node that serves it:
+
+```sh
+legion node label n1 legion.ingress=true    # key- removes a label
+```
+
 `--metrics-listen 0.0.0.0:7472` on the daemon serves Prometheus metrics
 at `/metrics`: Raft, objects, tasks, services, nodes and quotas from the
 leading manager, and each container's CPU, memory and I/O from rctl on

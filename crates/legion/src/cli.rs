@@ -92,6 +92,41 @@ impl Objects {
         }
     }
 
+    /// Sets (`Some`) or removes (`None`) labels of an object, retrying
+    /// when it changes meanwhile; whether anything changed.
+    async fn set_labels(
+        &mut self,
+        r#ref: ObjectRef,
+        changes: &[(String, Option<String>)],
+    ) -> anyhow::Result<(String, bool)> {
+        loop {
+            let current = self.get(r#ref.clone()).await?.into_inner();
+            let mut object = Object::try_from(current)?;
+            let before = object.metadata.labels.clone();
+            for (k, v) in changes {
+                match v {
+                    Some(v) => object.metadata.labels.insert(k.clone(), v.clone()),
+                    None => object.metadata.labels.remove(k),
+                };
+            }
+            if object.metadata.labels == before {
+                return Ok((object.key().to_string(), false));
+            }
+            match self
+                .apply(ApplyRequest {
+                    object: Some((&object).into()),
+                    expected_version: Some(object.metadata.version),
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(_) => return Ok((object.key().to_string(), true)),
+                Err(s) if s.code() == tonic::Code::Aborted => continue,
+                Err(s) => return Err(s.into()),
+            }
+        }
+    }
+
     async fn get(&mut self, req: ObjectRef) -> Answer<pb::Object> {
         let client = &self.0;
         retrying(|| {
@@ -380,10 +415,29 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 .into_inner();
             println!("{kind}/{name} deleted (version {})", resp.version);
         }
-        Command::Node { availability, node } => {
-            let availability = match availability.as_str() {
-                "activate" => "active",
-                other => other,
+        Command::Node {
+            command: crate::NodeCommand::Label { node, labels },
+        } => {
+            let changes = labels
+                .iter()
+                .map(|l| label_change(l))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let r#ref = ObjectRef {
+                kind: Kind::Node.to_string(),
+                namespace: String::new(),
+                name: node,
+            };
+            match objects.set_labels(r#ref, &changes).await? {
+                (key, true) => println!("{key} labelled"),
+                (key, false) => println!("{key} already has those labels"),
+            }
+        }
+        Command::Node { command } => {
+            let (availability, node) = match command {
+                crate::NodeCommand::Drain { node } => ("drain", node),
+                crate::NodeCommand::Pause { node } => ("pause", node),
+                crate::NodeCommand::Activate { node } => ("active", node),
+                crate::NodeCommand::Label { .. } => unreachable!("handled above"),
             };
             let r#ref = ObjectRef {
                 kind: Kind::Node.to_string(),
@@ -826,6 +880,15 @@ fn parse_selector(
         .collect()
 }
 
+/// `key=value` sets a label, `key-` removes it.
+fn label_change(s: &str) -> anyhow::Result<(String, Option<String>)> {
+    match (s.split_once('='), s.strip_suffix('-')) {
+        (Some((k, v)), _) if !k.is_empty() => Ok((k.to_owned(), Some(v.to_owned()))),
+        (None, Some(k)) if !k.is_empty() => Ok((k.to_owned(), None)),
+        _ => bail!("label {s:?} must be key=value, or key- to remove it"),
+    }
+}
+
 /// Every document in a YAML stream (JSON is YAML too).
 fn read_objects(path: &Path) -> anyhow::Result<Vec<Object>> {
     let text = if path == Path::new("-") {
@@ -1155,6 +1218,26 @@ pub async fn unlock(server: &str, key_file: Option<&Path>) -> anyhow::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn label_changes() {
+        assert_eq!(
+            label_change("zone=a").unwrap(),
+            ("zone".into(), Some("a".into()))
+        );
+        assert_eq!(
+            label_change("legion.ingress=true").unwrap(),
+            ("legion.ingress".into(), Some("true".into()))
+        );
+        assert_eq!(label_change("zone-").unwrap(), ("zone".into(), None));
+        assert_eq!(
+            label_change("a=b-").unwrap(),
+            ("a".into(), Some("b-".into()))
+        );
+        for bad in ["zone", "=a", "-", ""] {
+            assert!(label_change(bad).is_err(), "{bad}");
+        }
+    }
 
     #[tokio::test]
     async fn retries_only_while_unavailable() {

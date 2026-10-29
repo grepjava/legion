@@ -1071,6 +1071,15 @@ real, in the order agreed with the user.
   unless told otherwise. Left as known costs: a Raft snapshot is the
   whole object table in memory, and an all-namespace watch checks RBAC
   per event (a RoleBinding read).
+- **Ingress nodes marked** (DESIGN.md §5.8, README). Any node could read
+  every route's certificate and key. Now, once any node is labelled
+  `legion.ingress=true`, only labelled nodes may; with none labelled,
+  every node may, as before, so nothing changes for a cluster that does
+  not opt in. `legion node label NODE key=value|key-` sets labels (also
+  for constraints and spread); `legion node drain|pause|activate` are its
+  siblings, used as before. Tested: in the fake cluster, two nodes read a
+  route's certificate, then with n1 labelled only n1 does and n2 is told
+  why; the CLI against a daemon (set, unchanged, removed, refused).
 - **FreeBSD port** (`packaging/freebsd/port`, its README). `sysutils/legion`
   with the ports' cargo framework, FreeBSD 15 and newer, amd64 and
   aarch64; it installs the binary (stripped), the rc.d script with

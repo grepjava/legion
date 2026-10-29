@@ -240,13 +240,10 @@ enum Command {
         #[command(subcommand)]
         command: UserCommand,
     },
-    /// Set a node's availability: `drain` moves its tasks elsewhere (and
-    /// stateful tasks' Volumes with them), `pause` keeps its tasks but
-    /// places no new ones, `activate` undoes either.
+    /// Nodes: their availability and labels.
     Node {
-        #[arg(value_parser = ["drain", "pause", "activate"])]
-        availability: String,
-        node: String,
+        #[command(subcommand)]
+        command: NodeCommand,
     },
     /// Volumes: where their data is.
     Volume {
@@ -329,6 +326,25 @@ pub enum ImageCommand {
         /// The daemon's `--zfs-root`.
         #[arg(long)]
         zfs_root: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum NodeCommand {
+    /// Move the node's tasks elsewhere (and stateful tasks' Volumes with
+    /// them), and place no new ones there.
+    Drain { node: String },
+    /// Keep the node's tasks but place no new ones there.
+    Pause { node: String },
+    /// Undo a drain or a pause.
+    Activate { node: String },
+    /// Set labels (`key=value`) or remove them (`key-`), for placement
+    /// constraints and preferences; `legion.ingress=true` marks a node
+    /// that serves HTTPS routes (see the README).
+    Label {
+        node: String,
+        #[arg(required = true)]
+        labels: Vec<String>,
     },
 }
 
