@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 mod fake;
@@ -77,7 +77,8 @@ pub trait Sys: Send + Sync {
     /// the jail is removed.
     fn interface_move(&self, name: &str, jail: &str) -> Result<()>;
     fn interface_configure(&self, jail: Option<&str>, name: &str, config: &IfConfig) -> Result<()>;
-    fn route_add(&self, jail: Option<&str>, dest: Destination, gateway: Ipv4Addr) -> Result<()>;
+    /// Routes `dest` through `gateway`, which is of the same family.
+    fn route_add(&self, jail: Option<&str>, dest: Destination, gateway: IpAddr) -> Result<()>;
     fn route_delete(&self, jail: Option<&str>, dest: Destination) -> Result<()>;
     /// Routes `dest` out of `interface` with no gateway, replacing any
     /// route to `dest` already there.
@@ -144,11 +145,12 @@ pub trait Sys: Send + Sync {
     fn pf_load_anchor(&self, anchor: &str, rules: &str) -> Result<()>;
     /// Removes the rules and tables of `anchor`.
     fn pf_flush_anchor(&self, anchor: &str) -> Result<()>;
-    /// Sets a table's contents, creating it if needed. Existing states are
-    /// untouched, so connections to removed addresses drain.
-    fn pf_table_replace(&self, anchor: &str, table: &str, addrs: &[Ipv4Addr]) -> Result<()>;
+    /// Sets a table's contents (of either family, or both), creating it if
+    /// needed. Existing states are untouched, so connections to removed
+    /// addresses drain.
+    fn pf_table_replace(&self, anchor: &str, table: &str, addrs: &[IpAddr]) -> Result<()>;
     /// A table's contents; empty if it does not exist.
-    fn pf_table_show(&self, anchor: &str, table: &str) -> Result<Vec<Ipv4Addr>>;
+    fn pf_table_show(&self, anchor: &str, table: &str) -> Result<Vec<IpAddr>>;
 
     // ZFS.
 
@@ -233,7 +235,7 @@ pub struct PfState {
     pub id: String,
     /// Every address on the state's line: both ends and the translated
     /// one (the VIP of a load-balanced connection, for example).
-    pub addrs: Vec<Ipv4Addr>,
+    pub addrs: Vec<IpAddr>,
 }
 
 /// A WireGuard peer.
@@ -243,7 +245,7 @@ pub struct WgPeer {
     /// `host:port`.
     pub endpoint: Option<String>,
     /// The addresses it may send from and is sent to, in order.
-    pub allowed_ips: Vec<Ipv4Net>,
+    pub allowed_ips: Vec<IpNet>,
     /// Seconds between keepalives.
     pub keepalive: Option<u16>,
 }
@@ -287,6 +289,9 @@ impl CarpState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IfConfig {
     pub addr: Option<Ipv4Net>,
+    /// Added beside the interface's other IPv6 addresses (its link-local
+    /// one), usable at once: duplicate address detection is turned off.
+    pub addr6: Option<Ipv6Net>,
     pub mtu: Option<u32>,
     pub up: bool,
 }
@@ -295,6 +300,9 @@ pub struct IfConfig {
 pub enum Destination {
     Default,
     Net(Ipv4Net),
+    /// The IPv6 default route.
+    Default6,
+    Net6(Ipv6Net),
 }
 
 impl fmt::Display for Destination {
@@ -302,6 +310,8 @@ impl fmt::Display for Destination {
         match self {
             Destination::Default => f.write_str("default"),
             Destination::Net(n) => n.fmt(f),
+            Destination::Default6 => f.write_str("default (IPv6)"),
+            Destination::Net6(n) => n.fmt(f),
         }
     }
 }
@@ -347,6 +357,90 @@ impl FromStr for Ipv4Net {
         let addr = addr.parse().map_err(|_| bad())?;
         let prefix = prefix.parse().ok().filter(|&p| p <= 32).ok_or_else(bad)?;
         Ok(Ipv4Net { addr, prefix })
+    }
+}
+
+/// An IPv6 address with a prefix length: `fd00:10:200:3::11/64`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Ipv6Net {
+    pub addr: Ipv6Addr,
+    pub prefix: u8,
+}
+
+impl Ipv6Net {
+    pub fn new(addr: Ipv6Addr, prefix: u8) -> Self {
+        assert!(prefix <= 128, "prefix {prefix} is longer than 128");
+        Ipv6Net { addr, prefix }
+    }
+
+    /// The network address (host bits cleared).
+    pub fn network(&self) -> Ipv6Addr {
+        let mask = u128::MAX
+            .checked_shl(128 - u32::from(self.prefix))
+            .unwrap_or(0);
+        Ipv6Addr::from(u128::from(self.addr) & mask)
+    }
+
+    pub fn contains(&self, ip: Ipv6Addr) -> bool {
+        Ipv6Net::new(ip, self.prefix).network() == self.network()
+    }
+}
+
+impl fmt::Display for Ipv6Net {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.addr, self.prefix)
+    }
+}
+
+impl FromStr for Ipv6Net {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let bad = || format!("invalid IPv6 network {s:?}: expected addr/len");
+        let (addr, prefix) = s.split_once('/').ok_or_else(bad)?;
+        let addr = addr.parse().map_err(|_| bad())?;
+        let prefix = prefix.parse().ok().filter(|&p| p <= 128).ok_or_else(bad)?;
+        Ok(Ipv6Net { addr, prefix })
+    }
+}
+
+/// A network of either family, where both may appear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IpNet {
+    V4(Ipv4Net),
+    V6(Ipv6Net),
+}
+
+impl From<Ipv4Net> for IpNet {
+    fn from(n: Ipv4Net) -> Self {
+        IpNet::V4(n)
+    }
+}
+
+impl From<Ipv6Net> for IpNet {
+    fn from(n: Ipv6Net) -> Self {
+        IpNet::V6(n)
+    }
+}
+
+impl fmt::Display for IpNet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IpNet::V4(n) => n.fmt(f),
+            IpNet::V6(n) => n.fmt(f),
+        }
+    }
+}
+
+impl FromStr for IpNet {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        if s.contains(':') {
+            s.parse().map(IpNet::V6)
+        } else {
+            s.parse().map(IpNet::V4)
+        }
     }
 }
 
@@ -429,6 +523,26 @@ mod tests {
         );
         assert!("10.0.0.1/33".parse::<Ipv4Net>().is_err());
         assert!("10.0.0.1".parse::<Ipv4Net>().is_err());
+    }
+
+    #[test]
+    fn ipv6_net() {
+        let n: Ipv6Net = "fd00:10:200:3::11/64".parse().unwrap();
+        assert_eq!(n.network(), "fd00:10:200:3::".parse::<Ipv6Addr>().unwrap());
+        assert!(n.contains("fd00:10:200:3::1".parse().unwrap()));
+        assert!(!n.contains("fd00:10:200:4::1".parse().unwrap()));
+        assert_eq!(n.to_string(), "fd00:10:200:3::11/64");
+        assert_eq!(
+            "::/0".parse::<Ipv6Net>().unwrap().network(),
+            Ipv6Addr::UNSPECIFIED
+        );
+        assert!("fd00::1/129".parse::<Ipv6Net>().is_err());
+        let both: Vec<IpNet> = ["10.200.2.0/24", "fd00:10:200:2::/64"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert!(matches!(both[..], [IpNet::V4(_), IpNet::V6(_)]));
+        assert_eq!(both[1].to_string(), "fd00:10:200:2::/64");
     }
 
     #[test]

@@ -248,7 +248,12 @@ async fn apply_to_running_pods() {
     // pf balances the VIP and the published port over the ready tasks.
     let table = format!("s{uid}");
     eventually("the service's pf table", async || {
-        c.sys.pf_table_show(legion_net::lb::ANCHOR, &table).unwrap() == both
+        // With the tasks' IPv6 twins.
+        let twins =
+            ["fd00:10:200::2", "fd00:10:200::3"].map(|a| a.parse::<std::net::IpAddr>().unwrap());
+        let mut want: Vec<std::net::IpAddr> = both.iter().map(|&a| a.into()).collect();
+        want.extend(twins);
+        c.sys.pf_table_show(legion_net::lb::ANCHOR, &table).unwrap() == want
     })
     .await;
     let rules = c.sys.anchor(legion_net::lb::ANCHOR).unwrap();

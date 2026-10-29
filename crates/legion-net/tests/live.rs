@@ -7,7 +7,7 @@
 //! jail -r lnet
 //! ```
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::process::Command;
 
 use legion_net::lb::{ANCHOR, Exits, LoadBalancer, Port, Proto, Service};
@@ -40,6 +40,10 @@ fn pods_on_the_bridge() {
         "{bridge}"
     );
     assert!(bridge.contains(&format!("mtu {MTU}")), "{bridge}");
+    assert!(
+        bridge.contains("inet6 fd00:10:200:7::1 prefixlen 64"),
+        "{bridge}"
+    );
 
     // Two pods, as infra jails with their own VNET.
     let pid = std::process::id();
@@ -70,17 +74,26 @@ fn pods_on_the_bridge() {
         format!("jexec {a} ping -c1 -t2 10.200.7.1"),
         format!("jexec {a} ping -c1 -t2 10.200.7.3"),
         format!("jexec {b} ping -c1 -t2 10.200.7.2"),
+        // The same over IPv6, at once (no duplicate address detection).
+        "ping -6 -c1 -t2 fd00:10:200:7::2".to_owned(),
+        format!("jexec {a} ping -6 -c1 -t2 ::1"),
+        format!("jexec {a} ping -6 -c1 -t2 fd00:10:200:7::1"),
+        format!("jexec {a} ping -6 -c1 -t2 fd00:10:200:7::3"),
+        format!("jexec {b} ping -6 -c1 -t2 fd00:10:200:7::2"),
     ] {
         let (ok, out) = sh(&cmd);
         assert!(ok, "{cmd}: {out}");
     }
     let (_, route) = sh(&format!("route -j {a} -n get default"));
     assert!(route.contains("gateway: 10.200.7.1"), "{route}");
+    let (_, route) = sh(&format!("route -j {a} -n get -inet6 default"));
+    assert!(route.contains("gateway: fd00:10:200:7::1"), "{route}");
     let (_, mtu) = sh(&format!("ifconfig -j {a} -l"));
     assert!(mtu.contains("epair"), "{mtu}");
 
     // A service VIP on this jail's pf, with Legion's anchors hooked in.
     assert!(sh("sysctl net.inet.ip.forwarding=1").0);
+    assert!(sh("sysctl net.inet6.ip6.forwarding=1").0);
     sh("pfctl -e");
     let hooks = legion_net::lb::HOOKS.join("\n") + "\n";
     let (ok, out) = sh(&format!(
@@ -123,14 +136,32 @@ fn pods_on_the_bridge() {
     std::thread::sleep(std::time::Duration::from_secs(1));
     let (_, got) = sh(&format!("jexec {b} cat /tmp/lnet-got"));
     assert_eq!(got.trim(), "through-the-vip");
+    // And through the VIP's IPv6 twin, to the server's.
+    sh(&format!(
+        "jexec {b} sh -c 'nc -6 -l 8080 > /tmp/lnet-got6 2>/dev/null </dev/null &'"
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    sh(&format!(
+        "jexec {a} sh -c '((echo through-the-vip6; sleep 30) | nc fd00:10:201::1 80) >/dev/null 2>&1 </dev/null &'"
+    ));
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let (_, got) = sh(&format!("jexec {b} cat /tmp/lnet-got6"));
+    assert_eq!(
+        got.trim(),
+        "through-the-vip6",
+        "{}{}",
+        sh("pfctl -a legion/svc -sn").1,
+        sh("pfctl -ss").1
+    );
+    let server6 = IpAddr::V6(net.twin(server));
     let to_server = |sys: &Shell| {
         sys.pf_states()
             .unwrap()
             .into_iter()
-            .filter(|s| s.addrs.contains(&server))
+            .filter(|s| s.addrs.contains(&server.into()) || s.addrs.contains(&server6))
             .count()
     };
-    assert!(to_server(&sys) >= 2, "{:?}", sys.pf_states());
+    assert!(to_server(&sys) >= 4, "{:?}", sys.pf_states());
     // Not ready but running: out of the table, the connection stays.
     lb.apply(&sys, &[svc(&[], &[server])], net.subnet, Exits::default())
         .unwrap();
@@ -199,6 +230,7 @@ fn policy_on_the_bridge() {
     let (a, b) = (&pods[0].0, &pods[1].0);
     let (a_ip, b_ip) = (ips[0], ips[1]);
     assert!(sh("sysctl net.inet.ip.forwarding=1").0);
+    assert!(sh("sysctl net.inet6.ip6.forwarding=1").0);
     // pf must see bridged traffic on the members (FreeBSD 15 defaults to
     // not); this jail's VNET only.
     assert!(sh("sysctl net.link.bridge.pfil_member=1").0);
@@ -231,9 +263,11 @@ fn policy_on_the_bridge() {
     };
     lb.apply(&sys, &[svc], net.subnet, Exits::default())
         .unwrap();
-    sh(&format!(
-        "jexec {b} sh -c 'while :; do nc -l 8080 </dev/null >/dev/null 2>&1; done &' </dev/null >/dev/null 2>&1"
-    ));
+    for family in ["-4", "-6"] {
+        sh(&format!(
+            "jexec {b} sh -c 'while :; do nc {family} -l 8080 </dev/null >/dev/null 2>&1; done &' </dev/null >/dev/null 2>&1"
+        ));
+    }
     std::thread::sleep(std::time::Duration::from_millis(500));
     let reach = |from: Option<&str>, to: &str, port: u16| {
         let cmd = match from {
@@ -242,8 +276,9 @@ fn policy_on_the_bridge() {
         };
         sh(&cmd).0
     };
+    let (b6, vip6) = (net.twin(b_ip).to_string(), "fd00:10:201::9");
     assert!(
-        reach(Some(a), &b_ip.to_string(), 8080),
+        reach(Some(a), &b_ip.to_string(), 8080) && reach(Some(a), &b6, 8080),
         "open before any policy"
     );
 
@@ -299,14 +334,25 @@ fn policy_on_the_bridge() {
         sh("pfctl -ss").1
     );
     assert!(reach(None, &b_ip.to_string(), 8080), "the host");
+    assert!(!reach(Some(a), &b6, 8080), "direct over IPv6, refused");
+    assert!(!reach(Some(a), vip6, 80), "VIP over IPv6, refused");
+    assert!(reach(None, &b6, 8080), "the host over IPv6");
     // a allowed on 8080: directly, yes (the reply passes a's own guard as
     // state of what a started); the VIP still closed at a.
     set(&[a_ip], false);
     assert!(reach(Some(a), &b_ip.to_string(), 8080), "direct, allowed");
+    assert!(reach(Some(a), &b6, 8080), "direct over IPv6, allowed");
     assert!(!reach(Some(a), &vip.to_string(), 80), "VIP, refused at a");
+    assert!(!reach(Some(a), vip6, 80), "VIP over IPv6, refused at a");
     // And the VIP opened at a: through it, with the hairpin NAT.
     set(&[a_ip], true);
     assert!(reach(Some(a), &vip.to_string(), 80), "VIP, allowed");
+    assert!(
+        reach(Some(a), vip6, 80),
+        "VIP over IPv6, allowed: {}{}",
+        sh("pfctl -a legion/policy -vsr").1,
+        sh("pfctl -ss").1
+    );
     // An address that is not a's own is refused, though allowed at b.
     let fake = Ipv4Addr::new(10, 200, 8, 50);
     set(&[a_ip, fake], true);
@@ -321,6 +367,18 @@ fn policy_on_the_bridge() {
         !sh(&format!("jexec {a} nc -z -w 2 -s {fake} {b_ip} 8080")).0,
         "spoofed source"
     );
+    let fake6 = net.twin(fake);
+    assert!(
+        sh(&format!(
+            "ifconfig -j {a} {epair} inet6 {fake6}/128 alias no_dad"
+        ))
+        .0
+    );
+    assert!(
+        !sh(&format!("jexec {a} nc -z -w 2 -s {fake6} {b6} 8080")).0,
+        "spoofed IPv6 source"
+    );
+    assert!(reach(Some(a), &b6, 8080), "a's own IPv6 address still");
     sys.pf_flush_anchor(policy::ANCHOR).unwrap();
     sys.pf_flush_anchor(ANCHOR).unwrap();
     for (jail, id) in &pods {

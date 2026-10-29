@@ -850,9 +850,19 @@ replaces Podman and ocijail.
   without Linux, user and group resolution, placement; on FreeBSD 15.1,
   `alpine:3.20` (musl) and `debian:bookworm-slim` (glibc) as `nobody` in
   a FreeBSD pod, and the FreeBSD live test again.
+- **IPv6 dual-stack** (DESIGN.md §5.7): every pod, VIP and node address
+  has an IPv6 twin in a ULA range (`10.200.3.17` is
+  `fd00:10:200:3::11`), derived on each node, so nothing new is
+  allocated or sent. The bridge, pods (no duplicate address detection),
+  `wg0`, routes and WireGuard peers carry both families; every load
+  balancing and policy rule has an `inet6` twin, tables hold both, and
+  neighbor discovery passes on pods' links. DNS answers AAAA. Pods reach
+  the outside over IPv4 only. Tested: the address mapping, rules, tables
+  and peers; on FreeBSD 15.1, the system layer's live test, pods and
+  policy on one bridge, and the three-node mesh, all over IPv6 as well.
 
 ### To do, in order
 
-Next in phase 5: IPv6 dual-stack, a volume plugin
-interface (NFS, iSCSI), bhyve tasks (exploratory).
+Next in phase 5: a volume plugin interface (NFS, iSCSI), bhyve tasks
+(exploratory).
 

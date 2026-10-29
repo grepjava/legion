@@ -5,7 +5,7 @@
 //! moves with it off a draining node.
 
 use std::collections::BTreeSet;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +24,14 @@ use tonic::transport::Channel;
 
 const INFRA: &str = "docker.io/freebsd/freebsd-runtime:15.1";
 const HEARTBEAT: Duration = Duration::from_millis(200);
+
+/// A table entry's IPv4 address (tables hold the IPv6 twins as well).
+fn v4(a: IpAddr) -> Option<Ipv4Addr> {
+    match a {
+        IpAddr::V4(a) => Some(a),
+        IpAddr::V6(_) => None,
+    }
+}
 
 struct Node {
     name: String,
@@ -235,6 +243,7 @@ impl Cluster {
             .pf_table_show(legion_net::lb::ANCHOR, &format!("s{uid}"))
             .unwrap_or_default()
             .into_iter()
+            .filter_map(v4)
             .collect()
     }
 
@@ -329,6 +338,7 @@ async fn tasks_survive_losing_a_node() {
                 .pf_table_show(legion_net::policy::ANCHOR, table)
                 .unwrap_or_default()
                 .into_iter()
+                .filter_map(v4)
                 .collect();
             addrs == all
         })

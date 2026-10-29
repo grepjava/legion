@@ -22,6 +22,9 @@ use legion_sys::{CommandOutput, Host, Ipv4Net, Runner, Shell, Sys};
 const SWITCH: &str = "lmesh-sw";
 const NODES: [&str; 3] = ["lmesh-n1", "lmesh-n2", "lmesh-n3"];
 const VIP: Ipv4Addr = Ipv4Addr::new(10, 201, 0, 1);
+const VIP6: &str = "fd00:10:201::1";
+/// The nodes' LAN, for IPv6 (`192.168.252.0/24` for IPv4).
+const LAN6: &str = "fd00:192:168:252";
 const PUBLISHED: u16 = 30080;
 
 fn sh(cmd: &str) -> (bool, String) {
@@ -145,6 +148,12 @@ fn pods_across_nodes() {
     must(&format!(
         "jexec {SWITCH} ifconfig {bridge} inet 192.168.252.254/24 up"
     ));
+    must(&format!(
+        "jexec {SWITCH} ifconfig {bridge} inet6 -ifdisabled no_dad"
+    ));
+    must(&format!(
+        "jexec {SWITCH} ifconfig {bridge} inet6 {LAN6}::fe/64"
+    ));
 
     // The nodes, each on a link to the switch, as on a LAN.
     let mut nodes = Vec::new();
@@ -174,9 +183,14 @@ fn pods_across_nodes() {
             "jexec {jail} ifconfig {a} inet 192.168.252.{n}/24 up"
         ));
         must(&format!(
+            "jexec {jail} ifconfig {a} inet6 -ifdisabled no_dad"
+        ));
+        must(&format!("jexec {jail} ifconfig {a} inet6 {LAN6}::{n}/64"));
+        must(&format!(
             "jexec {jail} route -q add default 192.168.252.254"
         ));
         must(&format!("jexec {jail} sysctl net.inet.ip.forwarding=1"));
+        must(&format!("jexec {jail} sysctl net.inet6.ip6.forwarding=1"));
         // The node's own pf, with Legion's anchors hooked in.
         let hooks = lb::HOOKS.join("\n") + "\npass all\n";
         let (ok, out) = sh(&format!(
@@ -237,12 +251,14 @@ fn pods_across_nodes() {
         ips.insert(pod, ip);
         if pod != "c" {
             // Background processes must not hold on to sh()'s pipes.
-            n.pod(
-                pod,
-                &format!(
-                    "sh -c 'while :; do echo {pod} | nc -N -l 8080; done >/dev/null 2>&1 </dev/null &'"
-                ),
-            );
+            for family in ["-4", "-6"] {
+                n.pod(
+                    pod,
+                    &format!(
+                        "sh -c 'while :; do echo {pod} | nc {family} -N -l 8080; done >/dev/null 2>&1 </dev/null &'"
+                    ),
+                );
+            }
         }
     }
     std::thread::sleep(Duration::from_millis(500));
@@ -255,6 +271,17 @@ fn pods_across_nodes() {
     assert!(ok, "node 2 to node 3: {out}");
     let (ok, out) = sh(&format!("jexec {} ping -c1 -t3 {c}", nodes[2].jail));
     assert!(ok, "node 3 to c: {out}");
+    // The same over IPv6.
+    let (c6, w2_6) = (nodes[0].net.twin(c), nodes[1].net.twin(w2));
+    let (ok, out) = nodes[0].pod("c", &format!("ping -6 -c2 -t3 {w2_6}"));
+    assert!(ok, "c to w2 over IPv6: {out}");
+    let (ok, out) = sh(&format!(
+        "jexec {} ping -6 -c1 -t3 fd00:100:64::3:1",
+        nodes[1].jail
+    ));
+    assert!(ok, "node 2 to node 3 over IPv6: {out}");
+    let (ok, out) = sh(&format!("jexec {} ping -6 -c1 -t3 {c6}", nodes[2].jail));
+    assert!(ok, "node 3 to c over IPv6: {out}");
 
     // A service with a task on each of nodes 1 and 2, balanced on every
     // node.
@@ -280,6 +307,9 @@ fn pods_across_nodes() {
     let got = connect(&client, &VIP.to_string(), 80, 6);
     assert_eq!(names(&got), ["w1", "w2"].into(), "{got:?}");
     assert!(got.iter().all(Option::is_some), "{got:?}");
+    let got = connect(&client, VIP6, 80, 6);
+    assert_eq!(names(&got), ["w1", "w2"].into(), "over IPv6: {got:?}");
+    assert!(got.iter().all(Option::is_some), "over IPv6: {got:?}");
 
     // From outside, the published port on node 3, which runs no task,
     // reaches both: the replies come back through node 3.
@@ -287,6 +317,9 @@ fn pods_across_nodes() {
     let got = connect(&outside, "192.168.252.3", PUBLISHED, 6);
     assert_eq!(names(&got), ["w1", "w2"].into(), "{got:?}");
     assert!(got.iter().all(Option::is_some), "{got:?}");
+    let got = connect(&outside, &format!("{LAN6}::3"), PUBLISHED, 6);
+    assert_eq!(names(&got), ["w1", "w2"].into(), "over IPv6: {got:?}");
+    assert!(got.iter().all(Option::is_some), "over IPv6: {got:?}");
     // Without the NAT on wg0 the remote tasks answer the client directly,
     // from the wrong address, and nothing connects.
     let mut bare = LoadBalancer::default();

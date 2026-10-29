@@ -608,6 +608,9 @@ async fn load_balancing(
         if let Err(e) = sys.sysctl_set("net.inet.ip.forwarding", "1") {
             tracing::warn!("enabling IP forwarding: {e}; VIPs and NAT will not work");
         }
+        if let Err(e) = sys.sysctl_set("net.inet6.ip6.forwarding", "1") {
+            tracing::warn!("enabling IPv6 forwarding: {e}; pods' IPv6 will not leave the node");
+        }
         match sys.pf_main_rules() {
             Ok(rules) => lb::missing_hooks(&rules),
             Err(e) => {
@@ -710,6 +713,12 @@ async fn policing_loop(
 ) {
     use legion_api::service::{SERVICE_NET, SERVICE_PREFIX};
     use legion_net::policy::Policy;
+
+    // legion-net derives the VIPs' IPv6 twins from its own copy of the range.
+    const _: () = assert!(
+        SERVICE_NET.to_bits() == legion_net::SERVICE_CIDR.addr.to_bits()
+            && SERVICE_PREFIX == legion_net::SERVICE_CIDR.prefix
+    );
 
     // pf must see bridged traffic on the members (FreeBSD 15 does not by
     // default), and frames for the host on the member they came in on as

@@ -21,14 +21,19 @@
 //! tables, so connections to a task that stops being ready finish (soft
 //! drain). Connections to a task that is gone are killed, so clients fail
 //! fast instead of waiting on a dead backend.
+//!
+//! Every rule but the NAT to the outside has an IPv6 twin, with the twins
+//! of the addresses ([`crate::v6`]); a service's table holds its tasks'
+//! addresses of both families, and pf takes those of the packet's.
+//! Pods reach the outside over IPv4 only.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use legion_sys::{Ipv4Net, Sys};
 
-use crate::{BRIDGE, CLUSTER_POD_CIDR};
+use crate::{BRIDGE, CLUSTER_POD_CIDR, CLUSTER_POD_CIDR6, PodNetwork, mesh, v6};
 
 pub const ANCHOR: &str = "legion/svc";
 /// Marks translated service traffic for the hairpin NAT.
@@ -92,6 +97,18 @@ impl Service {
     }
 }
 
+/// Addresses and their IPv6 twins, sorted.
+pub(crate) fn dual(addrs: &[Ipv4Addr]) -> Vec<IpAddr> {
+    let mut all: Vec<IpAddr> = addrs
+        .iter()
+        .flat_map(|&ip| [Some(IpAddr::V4(ip)), v6(ip).map(IpAddr::V6)])
+        .flatten()
+        .collect();
+    all.sort();
+    all.dedup();
+    all
+}
+
 /// Where this node's traffic leaves it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Exits<'a> {
@@ -118,12 +135,20 @@ pub fn publishes_on(interface: &str) -> bool {
 /// The anchor's rules for this node.
 pub fn rules(services: &[Service], subnet: Ipv4Net, exits: Exits) -> String {
     let egress = exits.egress;
+    let net = PodNetwork::new(subnet);
     let local = format!("{}/{}", subnet.network(), subnet.prefix);
     let cluster = format!("{}/{}", CLUSTER_POD_CIDR.network(), CLUSTER_POD_CIDR.prefix);
+    let (local6, cluster6) = (net.subnet6(), CLUSTER_POD_CIDR6);
     let mut r = String::new();
     let _ = writeln!(
         r,
         "nat pass on {BRIDGE} inet from {local} to {local} tagged {TAG} -> ({BRIDGE})"
+    );
+    // Not `({BRIDGE})`: for IPv6 that holds the link-local address too.
+    let _ = writeln!(
+        r,
+        "nat pass on {BRIDGE} inet6 from {local6} to {local6} tagged {TAG} -> {}",
+        net.gateway6()
     );
     if let Some(ext) = egress {
         let _ = writeln!(
@@ -131,11 +156,17 @@ pub fn rules(services: &[Service], subnet: Ipv4Net, exits: Exits) -> String {
             "nat pass on {ext} inet from {local} to ! {cluster} -> ({ext})"
         );
     }
-    if let Some(mesh) = exits.mesh {
+    if let Some(wg) = exits.mesh {
         let _ = writeln!(
             r,
-            "nat pass on {mesh} inet from ! {cluster} to {cluster} -> ({mesh})"
+            "nat pass on {wg} inet from ! {cluster} to {cluster} -> ({wg})"
         );
+        if let Some(own) = mesh::underlay_addr6(subnet) {
+            let _ = writeln!(
+                r,
+                "nat pass on {wg} inet6 from ! {cluster6} to {cluster6} -> {own}"
+            );
+        }
     }
     for s in services.iter().filter(|s| s.balanced()) {
         let table = s.table();
@@ -148,13 +179,22 @@ pub fn rules(services: &[Service], subnet: Ipv4Net, exits: Exits) -> String {
                     "rdr pass on {BRIDGE} inet proto {proto} to {vip} port {} tag {TAG} -> {to}",
                     p.port
                 );
+                if let Some(vip6) = v6(vip) {
+                    let _ = writeln!(
+                        r,
+                        "rdr pass on {BRIDGE} inet6 proto {proto} to {vip6} port {} tag {TAG} -> {to}",
+                        p.port
+                    );
+                }
             }
             if let Some(published) = p.published {
                 for i in exits.published {
-                    let _ = writeln!(
-                        r,
-                        "rdr pass on {i} inet proto {proto} to ({i}) port {published} tag {TAG} -> {to}"
-                    );
+                    for family in ["inet", "inet6"] {
+                        let _ = writeln!(
+                            r,
+                            "rdr pass on {i} {family} proto {proto} to ({i}) port {published} tag {TAG} -> {to}"
+                        );
+                    }
                 }
             }
         }
@@ -166,10 +206,10 @@ pub fn rules(services: &[Service], subnet: Ipv4Net, exits: Exits) -> String {
 #[derive(Debug, Default)]
 pub struct LoadBalancer {
     loaded: Option<String>,
-    tables: BTreeMap<String, Vec<Ipv4Addr>>,
-    /// Tasks of balanced services last time, ready or draining: when one
-    /// goes away, so do its connections.
-    backends: BTreeSet<Ipv4Addr>,
+    tables: BTreeMap<String, Vec<IpAddr>>,
+    /// Tasks of balanced services last time, ready or draining, with their
+    /// twins: when one goes away, so do its connections.
+    backends: BTreeSet<IpAddr>,
 }
 
 impl LoadBalancer {
@@ -190,9 +230,7 @@ impl LoadBalancer {
 
         let mut tables = BTreeMap::new();
         for s in services.iter().filter(|s| s.balanced()) {
-            let mut ready = s.ready.clone();
-            ready.sort();
-            ready.dedup();
+            let ready = dual(&s.ready);
             let table = s.table();
             if self.tables.get(&table) != Some(&ready) {
                 sys.pf_table_replace(ANCHOR, &table, &ready)?;
@@ -201,13 +239,12 @@ impl LoadBalancer {
         }
 
         // Backends that no longer run anywhere.
-        let backends: BTreeSet<Ipv4Addr> = services
+        let backends: BTreeSet<IpAddr> = services
             .iter()
             .filter(|s| s.balanced())
-            .flat_map(|s| s.alive.iter().chain(&s.ready))
-            .copied()
+            .flat_map(|s| dual(&s.alive).into_iter().chain(dual(&s.ready)))
             .collect();
-        let gone: BTreeSet<Ipv4Addr> = self.backends.difference(&backends).copied().collect();
+        let gone: BTreeSet<IpAddr> = self.backends.difference(&backends).copied().collect();
         self.tables = tables;
         if !gone.is_empty() {
             for state in sys.pf_states()? {
@@ -292,12 +329,18 @@ mod tests {
         assert_eq!(
             rules(&[web(&[], &[]), dnsrr], subnet, exits),
             "nat pass on legion0 inet from 10.200.0.0/24 to 10.200.0.0/24 tagged LSVC -> (legion0)\n\
+             nat pass on legion0 inet6 from fd00:10:200::/64 to fd00:10:200::/64 tagged LSVC -> fd00:10:200::1\n\
              nat pass on wlan0 inet from 10.200.0.0/24 to ! 10.200.0.0/16 -> (wlan0)\n\
              nat pass on wg0 inet from ! 10.200.0.0/16 to 10.200.0.0/16 -> (wg0)\n\
+             nat pass on wg0 inet6 from ! fd00:10:200::/48 to fd00:10:200::/48 -> fd00:100:64::1\n\
              rdr pass on legion0 inet proto tcp to 10.201.0.1 port 80 tag LSVC -> <s0000000000000007> port 8080 round-robin\n\
+             rdr pass on legion0 inet6 proto tcp to fd00:10:201::1 port 80 tag LSVC -> <s0000000000000007> port 8080 round-robin\n\
              rdr pass on re0 inet proto tcp to (re0) port 30000 tag LSVC -> <s0000000000000007> port 8080 round-robin\n\
+             rdr pass on re0 inet6 proto tcp to (re0) port 30000 tag LSVC -> <s0000000000000007> port 8080 round-robin\n\
              rdr pass on wlan0 inet proto tcp to (wlan0) port 30000 tag LSVC -> <s0000000000000007> port 8080 round-robin\n\
-             rdr pass on legion0 inet proto udp to 10.201.0.1 port 53 tag LSVC -> <s0000000000000007> port 5353 round-robin\n"
+             rdr pass on wlan0 inet6 proto tcp to (wlan0) port 30000 tag LSVC -> <s0000000000000007> port 8080 round-robin\n\
+             rdr pass on legion0 inet proto udp to 10.201.0.1 port 53 tag LSVC -> <s0000000000000007> port 5353 round-robin\n\
+             rdr pass on legion0 inet6 proto udp to fd00:10:201::1 port 53 tag LSVC -> <s0000000000000007> port 5353 round-robin\n"
         );
         // No route out and no mesh: no outbound NAT, nothing published.
         let r = rules(&[web(&[], &[])], subnet, Exits::default());
@@ -344,7 +387,7 @@ mod tests {
         lb.apply(&sys, &both, subnet, Exits::default()).unwrap();
         sys.add_state(PfState {
             id: "a".into(),
-            addrs: vec![ip("10.200.0.2"), ip("10.201.0.1")],
+            addrs: dual(&[ip("10.200.0.2"), ip("10.201.0.1")]),
         });
         // .2 goes, but its connections cannot be listed, then not killed.
         for command in ["pfctl -ss", "pfctl -k"] {
@@ -366,7 +409,11 @@ mod tests {
         let table = "s0000000000000007";
         let state = |id: &str, backend: &str| PfState {
             id: id.into(),
-            addrs: vec![ip(backend), ip("10.201.0.1"), ip("10.200.0.9")],
+            addrs: vec![
+                ip(backend).into(),
+                ip("10.201.0.1").into(),
+                ip("10.200.0.9").into(),
+            ],
         };
 
         lb.apply(
@@ -379,7 +426,7 @@ mod tests {
         assert!(sys.anchor(ANCHOR).unwrap().contains("10.201.0.1 port 80"));
         assert_eq!(
             sys.pf_table_show(ANCHOR, table).unwrap(),
-            [ip("10.200.0.2"), ip("10.200.0.3")]
+            dual(&[ip("10.200.0.2"), ip("10.200.0.3")])
         );
 
         // .3 stops being ready but runs: out of the table, its
@@ -395,7 +442,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             sys.pf_table_show(ANCHOR, table).unwrap(),
-            [ip("10.200.0.2")]
+            dual(&[ip("10.200.0.2")])
         );
         assert_eq!(sys.states().len(), 2);
 
@@ -409,7 +456,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             sys.pf_table_show(ANCHOR, table).unwrap(),
-            [ip("10.200.0.3")]
+            dual(&[ip("10.200.0.3")])
         );
         assert_eq!(
             sys.states()

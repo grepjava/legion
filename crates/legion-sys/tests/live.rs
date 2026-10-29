@@ -13,7 +13,7 @@
 //! it only touches jails it creates. `zfs_datasets` runs when
 //! `LEGION_SYS_ZFS_ROOT` names a dataset it may create children under.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::process::Command;
 
 use legion_sys::{Destination, IfConfig, Ipv4Net, RctlRule, Resource, Shell, Sys};
@@ -59,6 +59,7 @@ fn network_and_pf() {
         "lsys0",
         &IfConfig {
             addr: Some("10.200.3.1/24".parse().unwrap()),
+            addr6: Some("fd00:10:200:3::1/64".parse().unwrap()),
             mtu: Some(1420),
             up: true,
         },
@@ -111,6 +112,7 @@ fn network_and_pf() {
         &pair.b,
         &IfConfig {
             addr: Some("10.200.3.17/24".parse().unwrap()),
+            addr6: Some("fd00:10:200:3::11/64".parse().unwrap()),
             mtu: Some(1420),
             up: true,
         },
@@ -119,15 +121,26 @@ fn network_and_pf() {
     sys.route_add(
         Some(&pod),
         Destination::Default,
-        Ipv4Addr::new(10, 200, 3, 1),
+        Ipv4Addr::new(10, 200, 3, 1).into(),
+    )
+    .unwrap();
+    sys.route_add(
+        Some(&pod),
+        Destination::Default6,
+        "fd00:10:200:3::1".parse().unwrap(),
     )
     .unwrap();
     sh("ping -c1 -t2 10.200.3.17");
     sh(&format!("jexec {pod} ping -c1 -t2 10.200.3.1"));
+    // IPv6 at once: no address is still tentative.
+    sh("ping -6 -c1 -t2 fd00:10:200:3::11");
+    sh(&format!("jexec {pod} ping -6 -c1 -t2 fd00:10:200:3::1"));
+    let routes = sh(&format!("jexec {pod} route -n get -inet6 default"));
+    assert!(routes.contains("gateway: fd00:10:200:3::1"), "{routes}");
 
     // A network route on the host side, through the pod.
     let net = Destination::Net("10.250.0.0/16".parse::<Ipv4Net>().unwrap());
-    sys.route_add(None, net, Ipv4Addr::new(10, 200, 3, 17))
+    sys.route_add(None, net, Ipv4Addr::new(10, 200, 3, 17).into())
         .unwrap();
     assert!(sh("route -n get 10.250.1.1").contains("gateway: 10.200.3.17"));
     sys.route_delete(None, net).unwrap();
@@ -137,7 +150,11 @@ fn network_and_pf() {
     sh("echo 'anchor \"legion/*\"' | pfctl -f -");
     sys.pf_load_anchor("legion/svc", "pass in quick on lsys0 from <svc_test>\n")
         .unwrap();
-    let ips = [Ipv4Addr::new(10, 200, 3, 17), Ipv4Addr::new(10, 200, 3, 18)];
+    let ips: [IpAddr; 3] = [
+        Ipv4Addr::new(10, 200, 3, 17).into(),
+        Ipv4Addr::new(10, 200, 3, 18).into(),
+        "fd00:10:200:3::11".parse().unwrap(),
+    ];
     sys.pf_table_replace("legion/svc", "svc_test", &ips)
         .unwrap();
     assert_eq!(sys.pf_table_show("legion/svc", "svc_test").unwrap(), ips);

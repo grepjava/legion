@@ -6,14 +6,15 @@
 //! and pod subnet. One route sends the whole cluster pod network into
 //! `wg0`; this node's own subnet is on the bridge, a longer match, and
 //! WireGuard picks the peer for each packet by its allowed IPs. So routes
-//! never change as nodes come and go: only peers do.
+//! never change as nodes come and go: only peers do. IPv6 is the same,
+//! with the twins of the addresses and subnets ([`crate::v6`]).
 
 use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
-use legion_sys::{Destination, IfConfig, Ipv4Net, Sys, WgPeer};
+use legion_sys::{Destination, IfConfig, IpNet, Ipv4Net, Ipv6Net, Sys, WgPeer};
 
-use crate::{CLUSTER_POD_CIDR, Error, MTU, NODE_PREFIX};
+use crate::{CLUSTER_POD_CIDR, CLUSTER_POD_CIDR6, Error, MTU, NODE_PREFIX, node_subnet6, v6};
 
 pub const INTERFACE: &str = "wg0";
 /// The UDP port every node listens on.
@@ -22,6 +23,11 @@ pub const PORT: u16 = 51820;
 pub const UNDERLAY: Ipv4Net = Ipv4Net {
     addr: Ipv4Addr::new(100, 64, 0, 0),
     prefix: 16,
+};
+/// The IPv6 twin of [`UNDERLAY`].
+pub const UNDERLAY6: Ipv6Net = Ipv6Net {
+    addr: Ipv6Addr::new(0xfd00, 0x100, 0x64, 0, 0, 0, 0, 0),
+    prefix: 96,
 };
 /// Keeps NAT mappings open, so a node behind NAT stays reachable.
 const KEEPALIVE: u16 = 25;
@@ -35,6 +41,11 @@ pub fn underlay_addr(subnet: Ipv4Net) -> Option<Ipv4Addr> {
     }
     let n = (net - base) >> (32 - NODE_PREFIX);
     Some(Ipv4Addr::from(u32::from(UNDERLAY.network()) + (n << 8) + 1))
+}
+
+/// [`underlay_addr`]'s IPv6 twin.
+pub fn underlay_addr6(subnet: Ipv4Net) -> Option<Ipv6Addr> {
+    underlay_addr(subnet).and_then(v6)
 }
 
 /// Another node, as the mesh needs it.
@@ -58,10 +69,12 @@ impl Mesh {
     /// Creates `wg0` if it is missing, and sets its key, port, address and
     /// the route into it. Peers are left as they are.
     pub fn ensure(&self, sys: &dyn Sys) -> Result<(), Error> {
-        let addr = underlay_addr(self.subnet).ok_or_else(|| Error::Parse {
-            command: "mesh".into(),
-            message: format!("{} is not a node subnet of {CLUSTER_POD_CIDR}", self.subnet),
-        })?;
+        let (addr, addr6) = underlay_addr(self.subnet)
+            .zip(underlay_addr6(self.subnet))
+            .ok_or_else(|| Error::Parse {
+                command: "mesh".into(),
+                message: format!("{} is not a node subnet of {CLUSTER_POD_CIDR}", self.subnet),
+            })?;
         if !sys.interfaces(None)?.iter().any(|i| i == INTERFACE) {
             sys.wg_create(INTERFACE)?;
             tracing::info!(interface = INTERFACE, "created the WireGuard interface");
@@ -72,6 +85,7 @@ impl Mesh {
             INTERFACE,
             &IfConfig {
                 addr: Some(Ipv4Net::new(addr, UNDERLAY.prefix)),
+                addr6: Some(Ipv6Net::new(addr6, UNDERLAY6.prefix)),
                 mtu: Some(MTU),
                 up: true,
             },
@@ -83,7 +97,8 @@ impl Mesh {
                 CLUSTER_POD_CIDR.prefix,
             )),
             INTERFACE,
-        )
+        )?;
+        sys.route_to_interface(None, Destination::Net6(CLUSTER_POD_CIDR6), INTERFACE)
     }
 
     /// Makes `wg0`'s peers exactly `peers`, leaving out this node's own
@@ -95,7 +110,12 @@ impl Mesh {
             .filter(|p| p.subnet.network() != own)
             .filter_map(|p| {
                 let subnet = Ipv4Net::new(p.subnet.network(), p.subnet.prefix);
-                let mut allowed_ips = vec![subnet, Ipv4Net::new(underlay_addr(subnet)?, 32)];
+                let mut allowed_ips: Vec<IpNet> = vec![
+                    subnet.into(),
+                    Ipv4Net::new(underlay_addr(subnet)?, 32).into(),
+                    node_subnet6(subnet)?.into(),
+                    Ipv6Net::new(underlay_addr6(subnet)?, 128).into(),
+                ];
                 allowed_ips.sort();
                 Some((
                     p.public_key.as_str(),
@@ -158,6 +178,10 @@ mod tests {
         );
         assert_eq!(underlay_addr(net("10.201.0.0/24")), None);
         assert_eq!(underlay_addr(net("10.200.0.0/16")), None);
+        assert_eq!(
+            underlay_addr6(net("10.200.3.0/24")).unwrap().to_string(),
+            "fd00:100:64::3:1"
+        );
     }
 
     #[test]
@@ -177,9 +201,12 @@ mod tests {
         );
         let i = sys.interface(INTERFACE).unwrap();
         assert_eq!(i.config.addr, Some(net("100.64.1.1/16")));
+        assert_eq!(i.config.addr6, Some("fd00:100:64::1:1/96".parse().unwrap()));
         assert_eq!(i.config.mtu, Some(MTU));
+        let routes = sys.interface_routes(None);
+        assert_eq!(routes[&Destination::Net(net("10.200.0.0/16"))], INTERFACE);
         assert_eq!(
-            sys.interface_routes(None)[&Destination::Net(net("10.200.0.0/16"))],
+            routes[&Destination::Net6("fd00:10:200::/48".parse().unwrap())],
             INTERFACE
         );
 
@@ -200,7 +227,15 @@ mod tests {
             WgPeer {
                 public_key: "pub:key2".into(),
                 endpoint: Some("192.0.2.2:51820".into()),
-                allowed_ips: vec![net("10.200.2.0/24"), net("100.64.2.1/32")],
+                allowed_ips: [
+                    "10.200.2.0/24",
+                    "100.64.2.1/32",
+                    "fd00:10:200:2::/64",
+                    "fd00:100:64::2:1/128"
+                ]
+                .iter()
+                .map(|n| n.parse().unwrap())
+                .collect(),
                 keepalive: Some(KEEPALIVE),
             }
         );
@@ -217,7 +252,7 @@ mod tests {
             WgPeer {
                 public_key: "stranger".into(),
                 endpoint: None,
-                allowed_ips: vec![net("10.200.9.0/24")],
+                allowed_ips: vec![net("10.200.9.0/24").into()],
                 keepalive: None,
             },
         );

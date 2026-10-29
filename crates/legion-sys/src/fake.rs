@@ -11,7 +11,7 @@
 //! a runtime does through [`Sys::jail_create`] and [`Sys::jail_remove`].
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::{
@@ -45,7 +45,7 @@ struct State {
     /// Parameters set with `jail -m`, by jail name.
     jail_params: BTreeMap<String, BTreeMap<String, String>>,
     interfaces: BTreeMap<String, FakeInterface>,
-    routes: BTreeMap<Option<String>, BTreeMap<Destination, Ipv4Addr>>,
+    routes: BTreeMap<Option<String>, BTreeMap<Destination, IpAddr>>,
     /// Routes out of an interface, by stack and destination.
     interface_routes: BTreeMap<Option<String>, BTreeMap<Destination, String>>,
     next_key: u32,
@@ -53,7 +53,7 @@ struct State {
     rctl: Vec<RctlRule>,
     usage: BTreeMap<String, BTreeMap<String, u64>>,
     anchors: BTreeMap<String, String>,
-    tables: BTreeMap<(String, String), Vec<Ipv4Addr>>,
+    tables: BTreeMap<(String, String), Vec<IpAddr>>,
     datasets: BTreeMap<String, Dataset>,
     /// Snapshots, with the order they were taken in.
     snapshots: BTreeMap<String, u64>,
@@ -194,7 +194,7 @@ impl FakeSys {
         self.state().interfaces.get(name).cloned()
     }
 
-    pub fn routes(&self, jail: Option<&str>) -> BTreeMap<Destination, Ipv4Addr> {
+    pub fn routes(&self, jail: Option<&str>) -> BTreeMap<Destination, IpAddr> {
         self.state()
             .routes
             .get(&jail.map(str::to_owned))
@@ -542,6 +542,9 @@ impl Sys for FakeSys {
         if config.addr.is_some() {
             i.config.addr = config.addr;
         }
+        if config.addr6.is_some() {
+            i.config.addr6 = config.addr6;
+        }
         if config.mtu.is_some() {
             i.config.mtu = config.mtu;
         }
@@ -549,12 +552,16 @@ impl Sys for FakeSys {
         Ok(())
     }
 
-    fn route_add(&self, jail: Option<&str>, dest: Destination, gateway: Ipv4Addr) -> Result<()> {
+    fn route_add(&self, jail: Option<&str>, dest: Destination, gateway: IpAddr) -> Result<()> {
         let mut s = self.state();
         s.check_jail("route add", jail)?;
         // The gateway must be on a configured, attached network.
         let reachable = s.interfaces.values().any(|i| {
-            i.jail.as_deref() == jail && i.config.addr.is_some_and(|a| a.contains(gateway))
+            i.jail.as_deref() == jail
+                && match gateway {
+                    IpAddr::V4(g) => i.config.addr.is_some_and(|a| a.contains(g)),
+                    IpAddr::V6(g) => i.config.addr6.is_some_and(|a| a.contains(g)),
+                }
         });
         if !reachable {
             return Err(fail("route add", "Network is unreachable"));
@@ -745,7 +752,7 @@ impl Sys for FakeSys {
         Ok(())
     }
 
-    fn pf_table_replace(&self, anchor: &str, table: &str, addrs: &[Ipv4Addr]) -> Result<()> {
+    fn pf_table_replace(&self, anchor: &str, table: &str, addrs: &[IpAddr]) -> Result<()> {
         let mut addrs = addrs.to_vec();
         addrs.sort();
         addrs.dedup();
@@ -755,7 +762,7 @@ impl Sys for FakeSys {
         Ok(())
     }
 
-    fn pf_table_show(&self, anchor: &str, table: &str) -> Result<Vec<Ipv4Addr>> {
+    fn pf_table_show(&self, anchor: &str, table: &str) -> Result<Vec<IpAddr>> {
         Ok(self
             .state()
             .tables
@@ -1171,6 +1178,7 @@ mod tests {
             addr: Some(addr.parse::<Ipv4Net>().unwrap()),
             mtu: Some(1420),
             up: true,
+            ..Default::default()
         }
     }
 
@@ -1202,7 +1210,7 @@ mod tests {
             sys.route_add(
                 Some("infra1"),
                 Destination::Default,
-                Ipv4Addr::new(10, 9, 9, 9)
+                Ipv4Addr::new(10, 9, 9, 9).into()
             )
             .is_err(),
             "gateway off-link"
@@ -1210,9 +1218,24 @@ mod tests {
         sys.route_add(
             Some("infra1"),
             Destination::Default,
-            Ipv4Addr::new(10, 200, 3, 1),
+            Ipv4Addr::new(10, 200, 3, 1).into(),
         )
         .unwrap();
+        // An IPv6 gateway needs an IPv6 address on its link.
+        let gw6: IpAddr = "fd00:10:200:3::1".parse().unwrap();
+        assert!(
+            sys.route_add(Some("infra1"), Destination::Default6, gw6)
+                .is_err()
+        );
+        let addr6 = IfConfig {
+            addr6: Some("fd00:10:200:3::11/64".parse().unwrap()),
+            ..Default::default()
+        };
+        sys.interface_configure(Some("infra1"), &pair.b, &addr6)
+            .unwrap();
+        sys.route_add(Some("infra1"), Destination::Default6, gw6)
+            .unwrap();
+        assert_eq!(sys.routes(Some("infra1")).len(), 2);
         assert_eq!(sys.interfaces(Some("infra1")).unwrap(), ["lo0", "epair0b"]);
         assert_eq!(sys.interface("legion0").unwrap().members, ["epair0a"]);
 
@@ -1310,7 +1333,7 @@ mod tests {
         sys.set_usage("infra1.web", &[("memoryuse", 42)]);
         assert_eq!(sys.rctl_usage("infra1.web").unwrap()["memoryuse"], 42);
 
-        let ip = |n| Ipv4Addr::new(10, 200, 3, n);
+        let ip = |n| IpAddr::V4(Ipv4Addr::new(10, 200, 3, n));
         sys.pf_table_replace("legion/svc", "svc_web", &[ip(9), ip(3), ip(9)])
             .unwrap();
         assert_eq!(

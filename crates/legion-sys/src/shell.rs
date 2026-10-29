@@ -3,14 +3,14 @@
 //! outputs).
 
 use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
 use crate::{
-    Carp, CarpState, Dataset, Destination, Epair, Error, IfConfig, Ipv4Net, Jail, PfState,
-    RctlRule, Result, Sys, WgPeer,
+    Carp, CarpState, Dataset, Destination, Epair, Error, IfConfig, IpNet, Jail, PfState, RctlRule,
+    Result, Sys, WgPeer,
 };
 
 /// Runs one program to completion.
@@ -395,7 +395,19 @@ impl<R: Runner> Sys for Shell<R> {
         if config.up {
             a.push("up".into());
         }
-        self.run("ifconfig", &a).map(drop)
+        self.run("ifconfig", &a)?;
+        if let Some(addr) = config.addr6 {
+            // devd may have disabled IPv6 on the interface as it appeared
+            // (rc.conf's `ipv6_activate_all_interfaces`); and an address
+            // waiting for duplicate address detection cannot be bound.
+            let mut flags = in_jail(jail);
+            flags.extend(args([name, "inet6", "-ifdisabled", "no_dad"]));
+            self.run("ifconfig", &flags)?;
+            let mut a = in_jail(jail);
+            a.extend(args([name, "inet6", &addr.to_string()]));
+            self.run("ifconfig", &a)?;
+        }
+        Ok(())
     }
 
     fn carp_set(&self, interface: &str, carp: &Carp, state: Option<CarpState>) -> Result<()> {
@@ -434,7 +446,7 @@ impl<R: Runner> Sys for Shell<R> {
         self.run("ifconfig", &a).map(drop)
     }
 
-    fn route_add(&self, jail: Option<&str>, dest: Destination, gateway: Ipv4Addr) -> Result<()> {
+    fn route_add(&self, jail: Option<&str>, dest: Destination, gateway: IpAddr) -> Result<()> {
         let mut a = in_jail(jail);
         a.extend(["-q".to_owned(), "add".to_owned()]);
         a.extend(route_dest(dest));
@@ -608,13 +620,13 @@ impl<R: Runner> Sys for Shell<R> {
             .map(drop)
     }
 
-    fn pf_table_replace(&self, anchor: &str, table: &str, addrs: &[Ipv4Addr]) -> Result<()> {
+    fn pf_table_replace(&self, anchor: &str, table: &str, addrs: &[IpAddr]) -> Result<()> {
         let mut a = args(["-q", "-a", anchor, "-t", table, "-T", "replace"]);
-        a.extend(addrs.iter().map(Ipv4Addr::to_string));
+        a.extend(addrs.iter().map(IpAddr::to_string));
         self.run("pfctl", &a).map(drop)
     }
 
-    fn pf_table_show(&self, anchor: &str, table: &str) -> Result<Vec<Ipv4Addr>> {
+    fn pf_table_show(&self, anchor: &str, table: &str) -> Result<Vec<IpAddr>> {
         let a = args(["-a", anchor, "-t", table, "-T", "show"]);
         let out = self.output("pfctl", &a, None)?;
         if !out.success {
@@ -849,20 +861,22 @@ fn parse_mounts(out: &str, prefix: &str) -> Vec<String> {
 }
 
 /// States from `pfctl -ss -vv`: a line per state, then indented detail
-/// lines, one of them `id: <id> creatorid: <creator>`.
+/// lines, one of them `id: <id> creatorid: <creator>`. Addresses carry
+/// their ports as `10.200.9.3:8080` and `fd00:10:200:9::3[8080]`.
 fn parse_states(out: &str) -> Vec<PfState> {
     let mut states = Vec::new();
-    let mut addrs: Option<Vec<Ipv4Addr>> = None;
+    let mut addrs: Option<Vec<IpAddr>> = None;
     for line in out.lines() {
         if !line.starts_with(' ') {
             addrs = Some(
                 line.split_whitespace()
                     .filter_map(|w| {
                         let w = w.trim_start_matches('(').trim_end_matches(')');
-                        w.rsplit_once(':')
-                            .map_or(w, |(a, _)| a)
-                            .parse::<Ipv4Addr>()
-                            .ok()
+                        let w = w.split_once('[').map_or(w, |(a, _)| a);
+                        w.parse::<IpAddr>().ok().or_else(|| {
+                            let (a, _) = w.rsplit_once(':')?;
+                            a.parse::<Ipv4Addr>().ok().map(IpAddr::V4)
+                        })
                     })
                     .collect(),
             );
@@ -886,7 +900,7 @@ fn parse_states(out: &str) -> Vec<PfState> {
 /// Peers from `wg show <name> dump`: a line for the interface (private key,
 /// public key, port, fwmark), then one per peer, tab-separated: public key,
 /// preshared key, endpoint, allowed IPs, latest handshake, bytes received
-/// and sent, keepalive. Allowed IPs other than IPv4 networks are left out.
+/// and sent, keepalive.
 fn parse_wg_dump(out: &str) -> Result<Vec<WgPeer>, String> {
     out.lines()
         .skip(1)
@@ -896,7 +910,7 @@ fn parse_wg_dump(out: &str) -> Result<Vec<WgPeer>, String> {
             if cols.len() < 8 {
                 return Err(format!("bad peer line {line:?}"));
             }
-            let mut allowed_ips: Vec<Ipv4Net> =
+            let mut allowed_ips: Vec<IpNet> =
                 cols[3].split(',').filter_map(|n| n.parse().ok()).collect();
             allowed_ips.sort();
             Ok(WgPeer {
@@ -913,6 +927,8 @@ fn route_dest(dest: Destination) -> Vec<String> {
     match dest {
         Destination::Default => vec!["default".to_owned()],
         Destination::Net(n) => vec!["-net".to_owned(), format!("{}/{}", n.network(), n.prefix)],
+        Destination::Default6 => args(["-inet6", "default"]),
+        Destination::Net6(n) => args(["-inet6", "-net", &format!("{}/{}", n.network(), n.prefix)]),
     }
 }
 
@@ -983,7 +999,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::{Ipv4Net, Resource};
+    use crate::{Ipv4Net, Ipv6Net, Resource};
 
     /// Replies to each expected command line in order.
     struct Script {
@@ -1121,7 +1137,9 @@ mod tests {
                     origif: lb0\n\
                     all tcp 10.200.9.1:63804 (10.200.9.2:10226) -> 10.200.9.3:8080       ESTABLISHED:ESTABLISHED\n   \
                     [2002298317 + 65792] wscale 8  [311516909 + 65792] wscale 8\n   \
-                    id: 53f5df6a00000000 creatorid: b38009b1\n",
+                    id: 53f5df6a00000000 creatorid: b38009b1\n\
+                    all tcp fd00:10:200:9::3[8080] (fd00:10:201::1[80]) <- fd00:10:200:9::2[10226]       ESTABLISHED:ESTABLISHED\n   \
+                    id: 54f5df6a00000000 creatorid: b38009b1\n",
                 ),
             ),
             ("pfctl -q -k id -k 52f5df6a00000000/b38009b1", ok("")),
@@ -1141,7 +1159,7 @@ mod tests {
             ),
         ]);
         let states = sh.pf_states().unwrap();
-        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         assert_eq!(
             states,
             [
@@ -1152,6 +1170,14 @@ mod tests {
                 PfState {
                     id: "53f5df6a00000000/b38009b1".into(),
                     addrs: vec![ip("10.200.9.1"), ip("10.200.9.2"), ip("10.200.9.3")],
+                },
+                PfState {
+                    id: "54f5df6a00000000/b38009b1".into(),
+                    addrs: vec![
+                        ip("fd00:10:200:9::3"),
+                        ip("fd00:10:201::1"),
+                        ip("fd00:10:200:9::2")
+                    ],
                 },
             ]
         );
@@ -1270,7 +1296,16 @@ mod tests {
                 "ifconfig -j pod1 epair0b inet 10.200.3.17/24 mtu 1420 up",
                 ok(""),
             ),
+            ("ifconfig -j pod1 epair0b inet6 -ifdisabled no_dad", ok("")),
+            (
+                "ifconfig -j pod1 epair0b inet6 fd00:10:200:3::11/64",
+                ok(""),
+            ),
             ("route -j pod1 -q add default 10.200.3.1", ok("")),
+            (
+                "route -j pod1 -q add -inet6 default fd00:10:200:3::1",
+                ok(""),
+            ),
             ("route -q add -net 10.200.2.0/24 100.64.0.2", ok("")),
             ("ifconfig -j pod1 -l", ok("lo0 epair0b\n")),
         ]);
@@ -1282,6 +1317,7 @@ mod tests {
                 addr: Some("10.200.3.1/24".parse().unwrap()),
                 mtu: Some(1420),
                 up: true,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1294,6 +1330,7 @@ mod tests {
             &pair.b,
             &IfConfig {
                 addr: Some("10.200.3.17/24".parse().unwrap()),
+                addr6: Some("fd00:10:200:3::11/64".parse::<Ipv6Net>().unwrap()),
                 mtu: Some(1420),
                 up: true,
             },
@@ -1302,13 +1339,19 @@ mod tests {
         sh.route_add(
             Some("pod1"),
             Destination::Default,
-            Ipv4Addr::new(10, 200, 3, 1),
+            Ipv4Addr::new(10, 200, 3, 1).into(),
+        )
+        .unwrap();
+        sh.route_add(
+            Some("pod1"),
+            Destination::Default6,
+            "fd00:10:200:3::1".parse().unwrap(),
         )
         .unwrap();
         sh.route_add(
             None,
             Destination::Net("10.200.2.9/24".parse::<Ipv4Net>().unwrap()),
-            Ipv4Addr::new(100, 64, 0, 2),
+            Ipv4Addr::new(100, 64, 0, 2).into(),
         )
         .unwrap();
         assert_eq!(sh.interfaces(Some("pod1")).unwrap(), ["lo0", "epair0b"]);
@@ -1323,12 +1366,12 @@ mod tests {
             // Captured on FreeBSD 15.1, with a peer that has no endpoint
             // yet added.
             "{key}\t{public}\t51820\toff\n\
-             {peer}\t(none)\t192.168.251.2:51820\t10.200.2.0/24,100.64.2.1/32\t1793078934\t644\t784\t25\n\
+             {peer}\t(none)\t192.168.251.2:51820\t10.200.2.0/24,100.64.2.1/32,fd00:10:200:2::/64\t1793078934\t644\t784\t25\n\
              x6TAvtkCJ4t2nKnVPZvb4CFNTsbtUH0cDNzEhsEyd0A=\t(none)\t(none)\t(none)\t0\t0\t0\toff\n"
         );
         let set = format!(
             "wg set wg0 peer {peer} endpoint 192.168.251.2:51820 \
-             allowed-ips 100.64.2.1/32,10.200.2.0/24 persistent-keepalive 25"
+             allowed-ips 100.64.2.1/32,10.200.2.0/24,fd00:10:200:2::/64 persistent-keepalive 25"
         );
         let remove = format!("wg set wg0 peer {peer} remove");
         let sh = Script::shell(vec![
@@ -1347,19 +1390,27 @@ mod tests {
                 err("route: message indicates error: File exists"),
             ),
             ("route -q change -net 10.200.0.0/16 -interface wg0", ok("")),
+            (
+                "route -q add -inet6 -net fd00:10:200::/48 -interface wg0",
+                ok(""),
+            ),
         ]);
         assert_eq!(sh.wg_genkey().unwrap(), key);
         assert_eq!(sh.wg_pubkey(key).unwrap(), public);
         sh.wg_create("wg0").unwrap();
         sh.wg_configure("wg0", key, 51820).unwrap();
-        let net = |s: &str| s.parse::<Ipv4Net>().unwrap();
+        let net = |s: &str| s.parse::<IpNet>().unwrap();
         let peers = sh.wg_peers("wg0").unwrap();
         assert_eq!(
             peers[0],
             WgPeer {
                 public_key: peer.into(),
                 endpoint: Some("192.168.251.2:51820".into()),
-                allowed_ips: vec![net("10.200.2.0/24"), net("100.64.2.1/32")],
+                allowed_ips: vec![
+                    net("10.200.2.0/24"),
+                    net("100.64.2.1/32"),
+                    net("fd00:10:200:2::/64")
+                ],
                 keepalive: Some(25),
             }
         );
@@ -1368,13 +1419,21 @@ mod tests {
         sh.wg_set_peer(
             "wg0",
             &WgPeer {
-                allowed_ips: vec![net("100.64.2.1/32"), net("10.200.2.0/24")],
+                allowed_ips: vec![
+                    net("100.64.2.1/32"),
+                    net("10.200.2.0/24"),
+                    net("fd00:10:200:2::/64"),
+                ],
                 ..peers[0].clone()
             },
         )
         .unwrap();
         sh.wg_remove_peer("wg0", peer).unwrap();
-        sh.route_to_interface(None, Destination::Net(net("10.200.0.0/16")), "wg0")
+        let v4 = "10.200.0.0/16".parse().unwrap();
+        sh.route_to_interface(None, Destination::Net(v4), "wg0")
+            .unwrap();
+        let v6 = "fd00:10:200::/48".parse().unwrap();
+        sh.route_to_interface(None, Destination::Net6(v6), "wg0")
             .unwrap();
     }
 
@@ -1426,12 +1485,12 @@ mod tests {
         let sh = Script::shell(vec![
             ("pfctl -a legion/svc -f -", ok("")),
             (
-                "pfctl -q -a legion/svc -t svc_web -T replace 10.200.3.17 10.200.3.18",
+                "pfctl -q -a legion/svc -t svc_web -T replace 10.200.3.17 fd00:10:200:3::11",
                 ok(""),
             ),
             (
                 "pfctl -a legion/svc -t svc_web -T show",
-                ok("   10.200.3.17\n   10.200.3.18\n"),
+                ok("   10.200.3.17\n   fd00:10:200:3::11\n"),
             ),
             (
                 "pfctl -a legion/svc -t nope -T show",
@@ -1442,7 +1501,10 @@ mod tests {
         ]);
         sh.pf_load_anchor("legion/svc", "pass in quick on legion0 from <svc_web>\n")
             .unwrap();
-        let addrs = [Ipv4Addr::new(10, 200, 3, 17), Ipv4Addr::new(10, 200, 3, 18)];
+        let addrs: [IpAddr; 2] = [
+            Ipv4Addr::new(10, 200, 3, 17).into(),
+            "fd00:10:200:3::11".parse().unwrap(),
+        ];
         sh.pf_table_replace("legion/svc", "svc_web", &addrs)
             .unwrap();
         assert_eq!(sh.pf_table_show("legion/svc", "svc_web").unwrap(), addrs);

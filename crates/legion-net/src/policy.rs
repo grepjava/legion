@@ -25,16 +25,20 @@
 //! floating one made there would match the same packet again on the
 //! bridge, before the VIP's translation, and break it. Those on the mesh
 //! float, so they also pass the packet out to the pod, and its replies.
+//!
+//! IPv6 gets the same rules with the twins of the addresses
+//! ([`crate::v6`]); the tables hold both. Neighbor discovery, which IPv6
+//! does over ICMPv6 where IPv4 has ARP below pf, passes on the host ends.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use legion_sys::{Ipv4Net, Sys};
 
-use crate::CLUSTER_POD_CIDR;
-use crate::lb::{Proto, TAG};
-use crate::mesh::{INTERFACE as MESH, UNDERLAY};
+use crate::lb::{Proto, TAG, dual};
+use crate::mesh::{INTERFACE as MESH, UNDERLAY, UNDERLAY6};
+use crate::{CLUSTER_POD_CIDR, CLUSTER_POD_CIDR6, SERVICE_CIDR6, v6};
 
 pub const ANCHOR: &str = "legion/policy";
 
@@ -59,89 +63,138 @@ pub struct Guard {
     pub vips: Vec<(Ipv4Addr, Proto, u16)>,
 }
 
+/// One address family's addresses for a guard's rules.
+struct Family {
+    name: &'static str,
+    ip: IpAddr,
+    /// The nodes: this one's gateway and the mesh range.
+    nodes: String,
+    /// The VIP range.
+    vips: String,
+    pods: String,
+    /// The VIPs the pod may use.
+    allowed_vips: Vec<(IpAddr, Proto, u16)>,
+}
+
 /// The anchor's rules. `gateway` is this node's address on the bridge;
 /// `services` is the VIP range.
 pub fn rules(guards: &[Guard], gateway: Ipv4Addr, services: Ipv4Net) -> String {
-    let nodes = format!(
-        "{{ {gateway}, {}/{} }}",
-        UNDERLAY.network(),
-        UNDERLAY.prefix
-    );
-    let vips = format!("{}/{}", services.network(), services.prefix);
-    let pods = format!("{}/{}", CLUSTER_POD_CIDR.network(), CLUSTER_POD_CIDR.prefix);
-    let state = "keep state (if-bound)";
     let mut r = String::new();
     for g in guards {
-        let (lp, ip) = (&g.interface, g.ip);
-        // Pods speak IPv4 only; link-local IPv6 would go around all this.
-        let _ = writeln!(r, "block drop quick on {lp} inet6 all");
-        // From the pod.
-        let _ = writeln!(r, "block drop in quick on {lp} inet from ! {ip}");
-        for (vip, proto, port) in &g.vips {
+        let inet = Family {
+            name: "inet",
+            ip: g.ip.into(),
+            nodes: format!(
+                "{{ {gateway}, {}/{} }}",
+                UNDERLAY.network(),
+                UNDERLAY.prefix
+            ),
+            vips: format!("{}/{}", services.network(), services.prefix),
+            pods: format!("{}/{}", CLUSTER_POD_CIDR.network(), CLUSTER_POD_CIDR.prefix),
+            allowed_vips: g.vips.iter().map(|&(v, p, n)| (v.into(), p, n)).collect(),
+        };
+        guard_rules(&mut r, g, &inet);
+        let lp = &g.interface;
+        let (Some(ip6), Some(gateway6)) = (v6(g.ip), v6(gateway)) else {
+            // No twin: link-local IPv6 would go around all this.
+            let _ = writeln!(r, "block drop quick on {lp} inet6 all");
+            continue;
+        };
+        let _ = writeln!(
+            r,
+            "pass quick on {lp} inet6 proto icmp6 icmp6-type {{ neighbrsol, neighbradv }} no state"
+        );
+        let inet6 = Family {
+            name: "inet6",
+            ip: ip6.into(),
+            nodes: format!("{{ {gateway6}, {UNDERLAY6} }}"),
+            vips: SERVICE_CIDR6.to_string(),
+            pods: CLUSTER_POD_CIDR6.to_string(),
+            allowed_vips: g
+                .vips
+                .iter()
+                .filter_map(|&(v, p, n)| Some((v6(v)?.into(), p, n)))
+                .collect(),
+        };
+        guard_rules(&mut r, g, &inet6);
+    }
+    r
+}
+
+/// A guard's rules for one family.
+fn guard_rules(r: &mut String, g: &Guard, f: &Family) {
+    let (lp, ip, af) = (&g.interface, f.ip, f.name);
+    let state = "keep state (if-bound)";
+    // From the pod.
+    let _ = writeln!(r, "block drop in quick on {lp} {af} from ! {ip}");
+    for (vip, proto, port) in &f.allowed_vips {
+        let _ = writeln!(
+            r,
+            "pass in quick on {lp} {af} proto {} from {ip} to {vip} port {port} {state}",
+            proto.as_str()
+        );
+    }
+    let _ = writeln!(r, "block drop in quick on {lp} {af} to {}", f.vips);
+    let _ = writeln!(r, "pass in quick on {lp} {af} from {ip} {state}");
+    // Its state there is bound to its host end; what it starts toward
+    // other nodes needs one on the mesh as well, which its replies
+    // match before the refusals below.
+    let _ = writeln!(r, "pass out quick on {MESH} {af} from {ip} keep state");
+    // To the pod.
+    if g.open {
+        let _ = writeln!(r, "pass out quick on {lp} {af} {state}");
+        return;
+    }
+    let _ = writeln!(r, "pass out quick on {lp} {af} tagged {TAG} {state}");
+    let _ = writeln!(r, "pass out quick on {lp} {af} from {} {state}", f.nodes);
+    for a in &g.allowed {
+        let from = format!("<{}>", a.table);
+        if a.ports.is_empty() {
+            let _ = writeln!(r, "pass out quick on {lp} {af} from {from} {state}");
+        }
+        for (proto, port) in &a.ports {
             let _ = writeln!(
                 r,
-                "pass in quick on {lp} inet proto {} from {ip} to {vip} port {port} {state}",
+                "pass out quick on {lp} {af} proto {} from {from} to {ip} port {port} {state}",
                 proto.as_str()
             );
         }
-        let _ = writeln!(r, "block drop in quick on {lp} inet to {vips}");
-        let _ = writeln!(r, "pass in quick on {lp} inet from {ip} {state}");
-        // Its state there is bound to its host end; what it starts toward
-        // other nodes needs one on the mesh as well, which its replies
-        // match before the refusals below.
-        let _ = writeln!(r, "pass out quick on {MESH} inet from {ip} keep state");
-        // To the pod.
-        if g.open {
-            let _ = writeln!(r, "pass out quick on {lp} inet {state}");
-            continue;
-        }
-        let _ = writeln!(r, "pass out quick on {lp} inet tagged {TAG} {state}");
-        let _ = writeln!(r, "pass out quick on {lp} inet from {nodes} {state}");
-        for a in &g.allowed {
-            let from = format!("<{}>", a.table);
-            if a.ports.is_empty() {
-                let _ = writeln!(r, "pass out quick on {lp} inet from {from} {state}");
-            }
-            for (proto, port) in &a.ports {
-                let _ = writeln!(
-                    r,
-                    "pass out quick on {lp} inet proto {} from {from} to {ip} port {port} {state}",
-                    proto.as_str()
-                );
-            }
-        }
-        let _ = writeln!(r, "block drop out quick on {lp} inet all");
-        // From other nodes' pods, which the host routes in from the mesh.
-        for a in &g.allowed {
-            let from = format!("<{}>", a.table);
-            if a.ports.is_empty() {
-                let _ = writeln!(
-                    r,
-                    "pass in quick on {MESH} inet from {from} to {ip} keep state"
-                );
-            }
-            for (proto, port) in &a.ports {
-                let _ = writeln!(
-                    r,
-                    "pass in quick on {MESH} inet proto {} from {from} to {ip} port {port} keep state",
-                    proto.as_str()
-                );
-            }
-        }
-        let _ = writeln!(r, "block drop in quick on {MESH} inet from {pods} to {ip}");
     }
-    r
+    let _ = writeln!(r, "block drop out quick on {lp} {af} all");
+    // From other nodes' pods, which the host routes in from the mesh.
+    for a in &g.allowed {
+        let from = format!("<{}>", a.table);
+        if a.ports.is_empty() {
+            let _ = writeln!(
+                r,
+                "pass in quick on {MESH} {af} from {from} to {ip} keep state"
+            );
+        }
+        for (proto, port) in &a.ports {
+            let _ = writeln!(
+                r,
+                "pass in quick on {MESH} {af} proto {} from {from} to {ip} port {port} keep state",
+                proto.as_str()
+            );
+        }
+    }
+    let _ = writeln!(
+        r,
+        "block drop in quick on {MESH} {af} from {} to {ip}",
+        f.pods
+    );
 }
 
 /// Keeps the anchor in line, doing only what changed.
 #[derive(Debug, Default)]
 pub struct Policy {
     loaded: Option<String>,
-    tables: BTreeMap<String, Vec<Ipv4Addr>>,
+    tables: BTreeMap<String, Vec<IpAddr>>,
 }
 
 impl Policy {
-    /// Loads `guards`' rules and sets `tables`, the source tables they name.
+    /// Loads `guards`' rules and sets `tables`, the source tables they name
+    /// (with the addresses' twins).
     pub fn apply(
         &mut self,
         sys: &dyn Sys,
@@ -153,9 +206,7 @@ impl Policy {
         // Tables first: rules naming one that is not there yet would see
         // it empty and refuse what they should let through.
         for (name, addrs) in tables {
-            let mut addrs = addrs.clone();
-            addrs.sort();
-            addrs.dedup();
+            let addrs = dual(addrs);
             if self.tables.get(name) != Some(&addrs) {
                 sys.pf_table_replace(ANCHOR, name, &addrs)?;
                 self.tables.insert(name.clone(), addrs);
@@ -169,9 +220,7 @@ impl Policy {
             // name; set every table again next time.
             self.tables.clear();
             for (name, addrs) in tables {
-                let mut addrs = addrs.clone();
-                addrs.sort();
-                addrs.dedup();
+                let addrs = dual(addrs);
                 sys.pf_table_replace(ANCHOR, name, &addrs)?;
                 self.tables.insert(name.clone(), addrs);
             }
@@ -224,8 +273,7 @@ mod tests {
         let services = Ipv4Net::new(ip("10.201.0.0"), 16);
         assert_eq!(
             rules(&guards(), ip("10.200.0.1"), services),
-            "block drop quick on lp000000000007 inet6 all\n\
-             block drop in quick on lp000000000007 inet from ! 10.200.0.7\n\
+            "block drop in quick on lp000000000007 inet from ! 10.200.0.7\n\
              pass in quick on lp000000000007 inet proto tcp from 10.200.0.7 to 10.201.0.3 port 80 keep state (if-bound)\n\
              block drop in quick on lp000000000007 inet to 10.201.0.0/16\n\
              pass in quick on lp000000000007 inet from 10.200.0.7 keep state (if-bound)\n\
@@ -238,12 +286,31 @@ mod tests {
              pass in quick on wg0 inet from <n0123> to 10.200.0.7 keep state\n\
              pass in quick on wg0 inet proto tcp from <p4567> to 10.200.0.7 port 5432 keep state\n\
              block drop in quick on wg0 inet from 10.200.0.0/16 to 10.200.0.7\n\
-             block drop quick on lp000000000008 inet6 all\n\
+             pass quick on lp000000000007 inet6 proto icmp6 icmp6-type { neighbrsol, neighbradv } no state\n\
+             block drop in quick on lp000000000007 inet6 from ! fd00:10:200::7\n\
+             pass in quick on lp000000000007 inet6 proto tcp from fd00:10:200::7 to fd00:10:201::3 port 80 keep state (if-bound)\n\
+             block drop in quick on lp000000000007 inet6 to fd00:10:201::/96\n\
+             pass in quick on lp000000000007 inet6 from fd00:10:200::7 keep state (if-bound)\n\
+             pass out quick on wg0 inet6 from fd00:10:200::7 keep state\n\
+             pass out quick on lp000000000007 inet6 tagged LSVC keep state (if-bound)\n\
+             pass out quick on lp000000000007 inet6 from { fd00:10:200::1, fd00:100:64::/96 } keep state (if-bound)\n\
+             pass out quick on lp000000000007 inet6 from <n0123> keep state (if-bound)\n\
+             pass out quick on lp000000000007 inet6 proto tcp from <p4567> to fd00:10:200::7 port 5432 keep state (if-bound)\n\
+             block drop out quick on lp000000000007 inet6 all\n\
+             pass in quick on wg0 inet6 from <n0123> to fd00:10:200::7 keep state\n\
+             pass in quick on wg0 inet6 proto tcp from <p4567> to fd00:10:200::7 port 5432 keep state\n\
+             block drop in quick on wg0 inet6 from fd00:10:200::/48 to fd00:10:200::7\n\
              block drop in quick on lp000000000008 inet from ! 10.200.0.8\n\
              block drop in quick on lp000000000008 inet to 10.201.0.0/16\n\
              pass in quick on lp000000000008 inet from 10.200.0.8 keep state (if-bound)\n\
              pass out quick on wg0 inet from 10.200.0.8 keep state\n\
-             pass out quick on lp000000000008 inet keep state (if-bound)\n"
+             pass out quick on lp000000000008 inet keep state (if-bound)\n\
+             pass quick on lp000000000008 inet6 proto icmp6 icmp6-type { neighbrsol, neighbradv } no state\n\
+             block drop in quick on lp000000000008 inet6 from ! fd00:10:200::8\n\
+             block drop in quick on lp000000000008 inet6 to fd00:10:201::/96\n\
+             pass in quick on lp000000000008 inet6 from fd00:10:200::8 keep state (if-bound)\n\
+             pass out quick on wg0 inet6 from fd00:10:200::8 keep state\n\
+             pass out quick on lp000000000008 inet6 keep state (if-bound)\n"
         );
     }
 
@@ -262,7 +329,7 @@ mod tests {
         assert!(sys.anchor(ANCHOR).unwrap().contains("lp000000000007"));
         assert_eq!(
             sys.pf_table_show(ANCHOR, "n0123").unwrap(),
-            [ip("10.200.0.7"), ip("10.200.1.5")]
+            dual(&[ip("10.200.0.7"), ip("10.200.1.5")])
         );
         // A table changes; the rules stay.
         tables.insert("p4567".into(), vec![ip("10.200.2.9")]);
@@ -270,7 +337,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sys.pf_table_show(ANCHOR, "p4567").unwrap(),
-            [ip("10.200.2.9")]
+            dual(&[ip("10.200.2.9")])
         );
         // No pods: an empty anchor.
         p.apply(&sys, &[], &BTreeMap::new(), gateway, services)

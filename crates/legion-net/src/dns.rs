@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
-use hickory_proto::rr::rdata::A;
+use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{RData, Record, RecordType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -242,6 +242,12 @@ pub async fn answer(
                     resp.add_answer(Record::from_rdata(q.name().clone(), TTL, RData::A(A(*ip))));
                 }
             }
+            if matches!(q.query_type(), RecordType::AAAA | RecordType::ANY) {
+                for ip in addrs.iter().filter_map(|ip| crate::v6(*ip)) {
+                    let data = RData::AAAA(AAAA(ip));
+                    resp.add_answer(Record::from_rdata(q.name().clone(), TTL, data));
+                }
+            }
         }
     }
     let bytes = resp.to_vec().ok()?;
@@ -436,8 +442,22 @@ mod tests {
             [Ipv4Addr::new(10, 200, 0, 2), Ipv4Addr::new(10, 200, 0, 3)]
         );
         assert!(r.answers.iter().all(|a| a.ttl == TTL));
-        // AAAA for a cluster name: the name exists, with no such records.
+        // AAAA: the same addresses' IPv6 twins.
         let r = ask("web.shop.legion.", RecordType::AAAA).await;
+        assert_eq!(r.metadata.response_code, ResponseCode::NoError);
+        let six: Vec<String> = r
+            .answers
+            .iter()
+            .filter_map(|r| match &r.data {
+                RData::AAAA(a) => Some(a.0.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(six, ["fd00:10:200::2", "fd00:10:200::3"]);
+        let r = ask("db.shop.legion.", RecordType::AAAA).await;
+        assert_eq!(r.answers.len(), 1, "the VIP's twin");
+        // A namespace exists, with no records.
+        let r = ask("shop.legion.", RecordType::AAAA).await;
         assert_eq!(r.metadata.response_code, ResponseCode::NoError);
         assert!(r.answers.is_empty());
         let r = ask("nope.shop.legion.", RecordType::A).await;

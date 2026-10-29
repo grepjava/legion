@@ -512,6 +512,7 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
 | CARP manager VIP | Optional floating address for the API: `legion daemon --vip ADDR --vip-interface IF --vip-password-file F [--vip-vhid N]` on managers sharing a link puts ADDR on IF as a CARP virtual host (`/32`, loading `carp`). Any manager answers the API, so the address need only be on a running one: the leader advertises skew 0 and forces itself master when it is not, followers advertise 100 and keep the address only until a better advertiser takes it, so it never goes without a holder (a follower holds it while a manager without `--vip` leads). Set again every 5 s and on every leadership change; released on shutdown, so a clean stop hands it on at once and a crash after CARP's timeout (3 s). The API listens on `0.0.0.0` to answer on it; certificates name the fixed server name, so no change is needed for clients using it. | 4 |
 | Security profiles | Per-service jail parameters (e.g. `allow.raw_sockets`, securelevel, enforce_statfs), with optional MAC policy. | 3 |
 | Linux images | Via `linux64` on nodes started with `--linux`, which placement selects with `node.platform.linux == true` (6.6). | 5 |
+| IPv6 dual-stack | Every pod, VIP and node address has an IPv6 twin in a ULA range, with routes, WireGuard peers, pf rules and tables, DNS AAAA and policy for both families (5.7). | 5 |
 | bhyve tasks | `runtime: bhyve` for workloads that need their own kernel. | 5 (exploratory) |
 
 ---
@@ -540,11 +541,11 @@ workloads.
 
 ### 5.2 Addressing
 
-| Range | Default | Purpose |
-|-------|---------|---------|
-| Underlay | `100.64.0.0/16` | One `wg0` address per node |
-| Pod CIDR | `10.200.0.0/16` | One `/24` per node, one IP per task |
-| Service CIDR | `10.201.0.0/16` | One VIP per service |
+| Range | Default | IPv6 (5.7) | Purpose |
+|-------|---------|------------|---------|
+| Underlay | `100.64.0.0/16` | `fd00:100:64::/96` | One `wg0` address per node |
+| Pod CIDR | `10.200.0.0/16` | `fd00:10:200::/48` | One `/24` (`/64`) per node, one IP per task |
+| Service CIDR | `10.201.0.0/16` | `fd00:10:201::/96` | One VIP per service |
 
 All three are set at `legion init` and are fixed for the life of the cluster.
 `init` checks that they do not overlap networks already on the hosts (Podman's
@@ -685,6 +686,7 @@ Built (phase 1): names live under `legion.` (`web.shop.legion`); pods get
 `search <ns>.legion legion` and `ndots:2`, so `web` and `web.shop` work as
 well. Cluster answers carry a 5-second TTL and the authoritative flag;
 unknown names under `legion.` are NXDOMAIN and never leave the node.
+AAAA queries get the IPv6 twins of the same addresses (5.7).
 Answers too large for UDP set the truncation flag and the client retries
 over TCP.
 
@@ -718,7 +720,7 @@ over TCP.
   other hosts, published ports reached through another node), traffic a
   published port's or VIP's `rdr` translated here (`tagged LSVC`), and a
   table per allowed peer set, on its ports; and drops the rest. A pod may
-  send only from its own address and never IPv6; what it starts is kept as
+  send only from its own addresses (5.7); what it starts is kept as
   `if-bound` state, so replies pass its own guard (a floating state would
   match the same packet again on the bridge before the VIP's translation).
   On the mesh, connections from other nodes' tasks are let in from the
@@ -735,8 +737,54 @@ over TCP.
 
 ### 5.7 IPv6
 
-Dual-stack is planned for phase 5. The model (per-node prefix, WireGuard
-routing, pf tables) carries over unchanged.
+**Built** (phase 5): the pod network is dual-stack, with nothing
+allocated for IPv6. Every address Legion gives out is IPv4, and each has
+an IPv6 twin in a ULA range (`legion_net::v6`): the last two octets
+become the low groups, written as hex digits the way the ranges' first
+two read.
+
+| IPv4 | IPv6 |
+|------|------|
+| pod `10.200.n.h` | `fd00:10:200:n::h` (the node's `/64`) |
+| VIP `10.201.a.b` | `fd00:10:201::a:b` |
+| node `100.64.n.1` | `fd00:100:64::n:1` |
+
+So pod `10.200.3.17` is also `fd00:10:200:3::11`. Nodes, the API, Task
+status and the endpoints stream stay IPv4; each node derives the rest.
+
+- **Node**: `legion0` also has the node's `fd00:10:200:n::1/64`, `wg0`
+  its underlay twin, and one more static route sends `fd00:10:200::/48`
+  into `wg0`. Each peer's allowed IPs add its `/64` and underlay `/128`.
+  The agent enables `net.inet6.ip6.forwarding`.
+- **Pod**: the twin on its epair and an IPv6 default route to the
+  gateway. Duplicate address detection is off (`no_dad`), so the address
+  is usable at once (a container that binds it at start would fail on
+  a tentative one), and `-ifdisabled` undoes what rc.conf's default
+  `ipv6_activate_all_interfaces=NO` may have done. Containers share the
+  pod's stack, as for IPv4.
+- **Services** (5.4): every rule has an `inet6` twin, the VIP's and the
+  published ports'. A service's table holds the tasks' addresses of both
+  families, and pf's round-robin takes those of the packet's. The
+  hairpin and mesh NAT translate to explicit addresses (the gateway's and
+  the node's underlay twin), as `(interface)` would include link-local
+  ones. A published port is reached over IPv6 where the node has an IPv6
+  address. Gone backends' states are killed for both families.
+- **DNS** (5.5): AAAA answers carry the twins of the A answers.
+- **Policy** (5.6): each guard's rules are repeated for `inet6` with the
+  twins, and the tables hold both families. Neighbor solicitations and
+  advertisements pass on the host ends: IPv6 does over ICMPv6 what ARP
+  does below pf.
+- **Not yet**: pods reach the outside over IPv4 only (no NAT66 to the
+  egress interface). Applications pick IPv4 for outside names anyway,
+  as a ULA source ranks below IPv4 (RFC 6724). An IPv6-only cluster and
+  configurable ranges are not planned.
+
+Tested on FreeBSD 15.1, in jails: the system layer's IPv6 addresses,
+routes, tables and states; pods on one bridge over IPv6, through a VIP
+twin with the hairpin NAT; policy over IPv6 (refused, allowed, a VIP
+twin, a spoofed source); and three nodes over WireGuard (pod to pod,
+node to node, a VIP twin with tasks on two nodes, a published port
+reached from outside over IPv6 through a node with no task).
 
 ### 5.8 Ingress
 

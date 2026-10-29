@@ -9,11 +9,15 @@
 //!
 //! Pods on other nodes are reached over the WireGuard mesh ([`mesh`]);
 //! services, published ports and NAT to the outside are pf rules ([`lb`]).
+//!
+//! The network is dual-stack (DESIGN.md §5.7), with nothing allocated for
+//! IPv6: every address Legion gives out is IPv4, and each has an IPv6 twin
+//! ([`v6`]) that the bridge, pods, mesh, pf and DNS use beside it.
 
 use std::collections::BTreeSet;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
-use legion_sys::{Destination, IfConfig, Ipv4Net, Sys};
+use legion_sys::{Destination, IfConfig, Ipv4Net, Ipv6Net, Sys};
 
 pub mod dns;
 pub mod lb;
@@ -28,6 +32,22 @@ pub const CLUSTER_POD_CIDR: Ipv4Net = Ipv4Net {
     prefix: 16,
 };
 pub const NODE_PREFIX: u8 = 24;
+/// The IPv6 twin of [`CLUSTER_POD_CIDR`]; each node gets one /64 of it.
+pub const CLUSTER_POD_CIDR6: Ipv6Net = Ipv6Net {
+    addr: Ipv6Addr::new(0xfd00, 0x10, 0x200, 0, 0, 0, 0, 0),
+    prefix: 48,
+};
+pub const NODE_PREFIX6: u8 = 64;
+/// The VIP range, as `legion_api::service::SERVICE_NET` (which the agent
+/// checks), and its IPv6 twin.
+pub const SERVICE_CIDR: Ipv4Net = Ipv4Net {
+    addr: Ipv4Addr::new(10, 201, 0, 0),
+    prefix: 16,
+};
+pub const SERVICE_CIDR6: Ipv6Net = Ipv6Net {
+    addr: Ipv6Addr::new(0xfd00, 0x10, 0x201, 0, 0, 0, 0, 0),
+    prefix: 96,
+};
 pub const BRIDGE: &str = "legion0";
 /// The WireGuard MTU, which pods use from the start so nothing changes when
 /// traffic starts crossing nodes (DESIGN.md §5.3).
@@ -50,6 +70,40 @@ pub fn free_node_subnet(taken: &BTreeSet<Ipv4Net>) -> Option<Ipv4Net> {
     (0..).map_while(node_subnet).find(|s| !taken.contains(s))
 }
 
+/// The IPv6 twin of a pod's, node's or service's address; `None` outside
+/// those ranges. The last two octets become the low groups, each written
+/// as hex digits, the way the ranges' first two read:
+///
+/// | IPv4         | IPv6               |
+/// |--------------|--------------------|
+/// | `10.200.n.h` | `fd00:10:200:n::h` |
+/// | `10.201.a.b` | `fd00:10:201::a:b` |
+/// | `100.64.n.1` | `fd00:100:64::n:1` |
+///
+/// so pod `10.200.3.17` is `fd00:10:200:3::11`, in its node's /64.
+pub fn v6(ip: Ipv4Addr) -> Option<Ipv6Addr> {
+    let [_, _, c, d] = ip.octets();
+    let (c, d) = (u16::from(c), u16::from(d));
+    if CLUSTER_POD_CIDR.contains(ip) {
+        let [a, b, e, ..] = CLUSTER_POD_CIDR6.addr.segments();
+        Some(Ipv6Addr::new(a, b, e, c, 0, 0, 0, d))
+    } else if SERVICE_CIDR.contains(ip) {
+        let [a, b, e, ..] = SERVICE_CIDR6.addr.segments();
+        Some(Ipv6Addr::new(a, b, e, 0, 0, 0, c, d))
+    } else if mesh::UNDERLAY.contains(ip) {
+        let [a, b, e, ..] = mesh::UNDERLAY6.addr.segments();
+        Some(Ipv6Addr::new(a, b, e, 0, 0, 0, c, d))
+    } else {
+        None
+    }
+}
+
+/// The /64 of node subnet `subnet`.
+pub fn node_subnet6(subnet: Ipv4Net) -> Option<Ipv6Net> {
+    let net = v6(subnet.network()).filter(|_| subnet.prefix == NODE_PREFIX)?;
+    Some(Ipv6Net::new(net, NODE_PREFIX6))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodNetwork {
     /// This node's subnet, e.g. `10.200.3.0/24`.
@@ -68,6 +122,24 @@ impl PodNetwork {
         Ipv4Addr::from(u32::from(self.subnet.network()) + 1)
     }
 
+    /// The bridge's IPv6 address.
+    pub fn gateway6(&self) -> Ipv6Addr {
+        self.twin(self.gateway())
+    }
+
+    /// This node's /64.
+    pub fn subnet6(&self) -> Ipv6Net {
+        Ipv6Net::new(self.twin(self.subnet.network()), NODE_PREFIX6)
+    }
+
+    /// A pod's IPv6 address, [`v6`]'s; a subnet outside the cluster network
+    /// (some tests use one) gets the same from its last two octets.
+    pub fn twin(&self, ip: Ipv4Addr) -> Ipv6Addr {
+        let [.., c, d] = ip.octets();
+        let [a, b, e, ..] = CLUSTER_POD_CIDR6.addr.segments();
+        Ipv6Addr::new(a, b, e, c.into(), 0, 0, 0, d.into())
+    }
+
     fn broadcast(&self) -> Ipv4Addr {
         let host_bits = 32 - u32::from(self.subnet.prefix);
         Ipv4Addr::from(u32::from(self.subnet.network()) | ((1u32 << host_bits) - 1))
@@ -84,6 +156,7 @@ impl PodNetwork {
             BRIDGE,
             &IfConfig {
                 addr: Some(Ipv4Net::new(self.gateway(), self.subnet.prefix)),
+                addr6: Some(Ipv6Net::new(self.gateway6(), NODE_PREFIX6)),
                 mtu: Some(MTU),
                 up: true,
             },
@@ -142,11 +215,13 @@ impl PodNetwork {
                 &pair.b,
                 &IfConfig {
                     addr: Some(Ipv4Net::new(ip, self.subnet.prefix)),
+                    addr6: Some(Ipv6Net::new(self.twin(ip), NODE_PREFIX6)),
                     mtu: Some(MTU),
                     up: true,
                 },
             )?;
-            sys.route_add(Some(jail), Destination::Default, self.gateway())
+            sys.route_add(Some(jail), Destination::Default, self.gateway().into())?;
+            sys.route_add(Some(jail), Destination::Default6, self.gateway6().into())
         })();
         if let Err(e) = result {
             // Either end name works until the rename; try both.
@@ -198,12 +273,44 @@ mod tests {
     }
 
     #[test]
+    fn twins() {
+        let twin = |s: &str| v6(ip(s)).map(|a| a.to_string());
+        assert_eq!(twin("10.200.3.17").as_deref(), Some("fd00:10:200:3::11"));
+        assert_eq!(
+            twin("10.200.255.254").as_deref(),
+            Some("fd00:10:200:ff::fe")
+        );
+        assert_eq!(twin("10.201.0.7").as_deref(), Some("fd00:10:201::7"));
+        assert_eq!(twin("10.201.1.2").as_deref(), Some("fd00:10:201::1:2"));
+        assert_eq!(twin("100.64.3.1").as_deref(), Some("fd00:100:64::3:1"));
+        assert_eq!(twin("192.0.2.1"), None);
+        for s in ["10.200.3.17", "10.201.1.2", "100.64.3.1"] {
+            let t = v6(ip(s)).unwrap();
+            let ranges = [CLUSTER_POD_CIDR6, SERVICE_CIDR6, mesh::UNDERLAY6];
+            assert_eq!(ranges.iter().filter(|r| r.contains(t)).count(), 1, "{s}");
+        }
+        let node = node_subnet6("10.200.3.0/24".parse().unwrap()).unwrap();
+        assert_eq!(node.to_string(), "fd00:10:200:3::/64");
+        assert!(CLUSTER_POD_CIDR6.contains(node.addr));
+        assert_eq!(node_subnet6("10.200.0.0/16".parse().unwrap()), None);
+        // A test subnet outside the cluster: twins as node 0's.
+        let other = PodNetwork::new("10.77.0.0/24".parse().unwrap());
+        assert_eq!(other.gateway6().to_string(), "fd00:10:200::1");
+    }
+
+    #[test]
     fn addresses() {
         let net = PodNetwork::new("10.200.3.77/24".parse().unwrap());
         assert_eq!(net.subnet.to_string(), "10.200.3.0/24");
         assert_eq!(net.gateway(), ip("10.200.3.1"));
         let used: BTreeSet<_> = [ip("10.200.3.2"), ip("10.200.3.4")].into();
         assert_eq!(net.allocate(&used), Some(ip("10.200.3.3")));
+        assert_eq!(
+            net.gateway6(),
+            "fd00:10:200:3::1".parse::<Ipv6Addr>().unwrap()
+        );
+        assert_eq!(net.subnet6().to_string(), "fd00:10:200:3::/64");
+        assert_eq!(net.twin(ip("10.200.3.17")).to_string(), "fd00:10:200:3::11");
         let full: BTreeSet<_> = (2..=254).map(|n| Ipv4Addr::new(10, 200, 3, n)).collect();
         assert_eq!(net.allocate(&full), None);
         assert!(net.contains(ip("10.200.3.9")));
@@ -219,6 +326,10 @@ mod tests {
         net.ensure_bridge(&sys).unwrap(); // again: fine
         let bridge = sys.interface(BRIDGE).unwrap();
         assert_eq!(bridge.config.addr.unwrap().to_string(), "10.200.3.1/24");
+        assert_eq!(
+            bridge.config.addr6.unwrap().to_string(),
+            "fd00:10:200:3::1/64"
+        );
 
         sys.add_jail("infra1", true);
         net.attach(&sys, "00000000000000aa", "infra1", ip("10.200.3.2"))
@@ -234,10 +345,10 @@ mod tests {
         assert_eq!(inside, ["lo0", "epair0b"]);
         let b = sys.interface("epair0b").unwrap();
         assert_eq!(b.config.addr.unwrap().to_string(), "10.200.3.2/24");
-        assert_eq!(
-            sys.routes(Some("infra1"))[&Destination::Default],
-            net.gateway()
-        );
+        assert_eq!(b.config.addr6.unwrap().to_string(), "fd00:10:200:3::2/64");
+        let routes = sys.routes(Some("infra1"));
+        assert_eq!(routes[&Destination::Default], net.gateway());
+        assert_eq!(routes[&Destination::Default6], net.gateway6());
 
         // A jail without VNET cannot take the interface; nothing is left.
         sys.add_jail("plain", false);

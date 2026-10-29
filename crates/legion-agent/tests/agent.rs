@@ -1344,7 +1344,12 @@ async fn joins_the_mesh() {
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>(),
-        ["10.200.5.0/24", "100.64.5.1/32"]
+        [
+            "10.200.5.0/24",
+            "100.64.5.1/32",
+            "fd00:10:200:5::/64",
+            "fd00:100:64::5:1/128"
+        ]
     );
 
     // A restarted agent keeps its key and its peers.
