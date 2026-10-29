@@ -721,9 +721,7 @@ service and migrates between nodes.
 
 Nothing left in phase 4.
 
-Smaller follow-ups: memory limits for workloads with large shared memory
-(rctl counts it per process; `vmemoryuse` or a pod-wide allowance);
-ingress HTTP/2, connection reuse and ACME certificates; sealing the
+Smaller follow-ups: ingress HTTP/2, connection reuse and ACME certificates; sealing the
 WireGuard key under autolock.
 
 ## Phase 5 — Extensions
@@ -937,11 +935,33 @@ real, in the order agreed with the user.
   with nothing run, then starts once pf takes it, its guard already in
   place (the test fails without the wait); on FreeBSD 15.1, the phase 1
   exit test.
+- **Memory limits that count shared memory once** (DESIGN.md §6.3).
+  rctl's `memoryuse` sums a jail's processes, so Postgres's shared
+  buffers counted once per backend and a limit killed it (the phase 4
+  exit test ran without one). Now the agent counts each limited
+  container's memory itself, every page once (`legion_sys::JailMemory`,
+  from `kern.proc.vmmap` and `vm.swap_objects`, following copy-on-write
+  chains), every second, and kills the process with the most memory of
+  its own in a container over its limit; the task's message says so when
+  the container exits. rctl's rule is now per process, a backstop that
+  never kills what the count spares. Metrics and the autoscaler use the
+  same count. Tested: the counting (shared segments, forks, SysV and
+  POSIX segments), the agent sparing a container rctl counts at 2 GiB and
+  killing the largest process of one over its limit; on FreeBSD 15.1, a
+  jail with a 64 MiB segment in five processes counted at 101 MiB (rctl:
+  375 MiB), and `tests/memory.rs`: Postgres under 256 MiB with 128 MiB of
+  buffers left alone by sixteen sessions reading them (rctl: 1276 MiB),
+  losing a backend to eight sessions of 50 MiB (counted: 701 MiB) and
+  to one of 300 MiB, and recovering each time without a restart. The
+  lab's cleanup now also removes the rctl rules of the pods it removes
+  (rctl keeps rules of jails that are gone; twenty had piled up). Also
+  fixed, found as a flaky `restart_policy`: an exit event arriving after
+  the resync had restarted the container, and the new run had ended,
+  gave the task the earlier run's exit code; the code is now the
+  runtime's.
 
 ### To do, in order
 
-1. Memory limits for workloads with large shared memory (phase 4
-   follow-up).
-2. Packaging: an rc.d script, defaults for `--listen` and a worker's
+1. Packaging: an rc.d script, defaults for `--listen` and a worker's
    endpoint, and a port or release tarballs (DESIGN.md §13, question 2).
 

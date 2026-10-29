@@ -26,6 +26,7 @@ pub mod fake;
 mod files;
 pub mod ingress;
 mod logins;
+mod memory;
 pub mod metrics;
 mod output;
 pub mod pod;
@@ -83,6 +84,8 @@ pub struct AgentConfig {
     /// How often heartbeats carry what the node's tasks use, for the
     /// autoscaler.
     pub usage_period: Duration,
+    /// How often containers with a memory limit are measured against it.
+    pub memory_check: Duration,
     /// Where the ingress proxy listens for HTTP, if anywhere.
     pub ingress: Option<std::net::SocketAddr>,
     /// Where it listens for HTTPS, for routes with `tls`, if anywhere.
@@ -115,6 +118,7 @@ impl AgentConfig {
             wireguard: None,
             drain: Duration::from_secs(2),
             usage_period: Duration::from_secs(15),
+            memory_check: Duration::from_secs(1),
             ingress: None,
             ingress_tls: None,
         }
@@ -125,6 +129,7 @@ pub struct Agent<R, C> {
     ctx: Ctx<R, C>,
     resync: Duration,
     usage_period: Duration,
+    memory_check: Duration,
     ingress: Option<std::net::SocketAddr>,
     ingress_tls: Option<std::net::SocketAddr>,
     wireguard: Option<WireGuardConfig>,
@@ -154,10 +159,12 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 net: Arc::default(),
                 ips: Arc::default(),
                 guarding: Arc::new(policing::Guarding::new()),
+                memory: Arc::default(),
                 drain: config.drain,
             },
             resync: config.resync,
             usage_period: config.usage_period,
+            memory_check: config.memory_check,
             ingress: config.ingress,
             ingress_tls: config.ingress_tls,
             wireguard: config.wireguard,
@@ -363,6 +370,11 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             ctx.guarding.clone(),
             gateway,
         ));
+        let memory = tokio::spawn(memory::enforce(
+            ctx.sys.clone(),
+            ctx.memory.clone(),
+            self.memory_check,
+        ));
 
         let (events_tx, mut events) = mpsc::channel(256);
         let forwarder = tokio::spawn(forward_events(ctx.clone(), events_tx));
@@ -441,6 +453,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         // Rules, tables and peers stay: the pods keep running and talking.
         lb.abort();
         policy.abort();
+        memory.abort();
         if let Some(mesh) = mesh {
             mesh.abort();
         }

@@ -7,6 +7,9 @@
 //!   in as root unless a user is given, who must have sudo.
 //! - `LEGION_CLUSTER_KEY`: the ssh key to log in with.
 //!
+//! [`Lab::local`] is this host alone, reached on loopback, from
+//! `LEGION_CLUSTER_LAB` only.
+//!
 //! Every node gets the throwaway pool [`POOL`] for images, containers
 //! and volumes. The test's own `legion` is copied to the machines. Remove the lab
 //! directory afterwards with `chflags -R 0` and `rm -rf`.
@@ -101,6 +104,21 @@ impl Lab {
             })
             .collect();
         assert_eq!(vms.len(), 2, "two VMs");
+        Lab::new(
+            dir,
+            var("LEGION_CLUSTER_HOST"),
+            vms,
+            var("LEGION_CLUSTER_KEY"),
+        )
+    }
+
+    /// This host alone, as the manager `n1` on loopback.
+    pub fn local() -> Lab {
+        let dir = std::env::var("LEGION_CLUSTER_LAB").expect("set LEGION_CLUSTER_LAB");
+        Lab::new(dir.into(), "127.0.0.1".into(), Vec::new(), String::new())
+    }
+
+    fn new(dir: PathBuf, host: String, vms: Vec<Vm>, key: String) -> Lab {
         if dir.exists() {
             let d = dir.display();
             let script = clean(&format!("{d}/data"), &format!("{d}/run"));
@@ -114,9 +132,9 @@ impl Lab {
         // pool goes when the lab does.
         Lab {
             dir,
-            host: var("LEGION_CLUSTER_HOST"),
+            host,
             vms,
-            key: var("LEGION_CLUSTER_KEY"),
+            key,
             daemon: None,
             setup: POOL.to_owned(),
             flags: format!("--zfs-root {ZFS_ROOT}"),
@@ -351,6 +369,9 @@ pub fn clean(data: &str, run: &str) -> String {
              [ -f \"$r\" ] || continue
              id=$(basename $(dirname \"$r\"))
              jls -j $id jid >/dev/null 2>&1 && jail -r $id
+             # rctl keeps the rules of jails that are gone.
+             rctl | cut -d: -f2 | grep \"^$id\\.\" | sort -u |
+                 while read -r j; do rctl -r \"jail:$j\"; done
          done
          i=0; while jls -d -h path | grep -q '^{data}/' && [ $i -lt 90 ]; do
              sleep 1; i=$((i + 1))

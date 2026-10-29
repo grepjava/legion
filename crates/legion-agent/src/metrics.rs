@@ -31,7 +31,7 @@ const USAGE: [(&str, &str, &str, bool); 12] = [
     (
         "memoryuse",
         "legion_container_memory_bytes",
-        "Resident memory of the container's processes.",
+        "Resident memory of the container's processes, each page counted once.",
         false,
     ),
     (
@@ -251,9 +251,21 @@ impl<R: Runtime> AgentMetrics<R> {
             .collect();
         let jails: Vec<String> = running.iter().map(|r| r.jail.clone()).collect();
         let usage = crate::task::blocking(&self.sys, move |sys| {
+            // rctl's memoryuse counts shared pages once per process: the
+            // container's memory is counted instead, when it can be.
+            let memory = sys.jail_memory(&jails).unwrap_or_else(|e| {
+                tracing::debug!("counting containers' memory: {e}");
+                BTreeMap::new()
+            });
             jails
                 .iter()
-                .map(|j| sys.rctl_usage(j).map_err(|e| e.to_string()))
+                .map(|j| {
+                    let mut u = sys.rctl_usage(j).map_err(|e| e.to_string())?;
+                    if let Some(m) = memory.get(j) {
+                        u.insert("memoryuse".into(), m.bytes);
+                    }
+                    Ok(u)
+                })
                 .collect::<Vec<_>>()
         })
         .await;

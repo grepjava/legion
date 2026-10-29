@@ -927,16 +927,35 @@ containers with it.
   **not enforced** on them. Limits are therefore set on each container's own
   jail (`jail:<infra>.<ctr>:...`), where they are enforced: `maxproc` refuses
   forks, `pcpu` throttles by pausing the process (usage is bursty rather
-  than smooth), and the memory limit is `memoryuse:sigkill`: a process that
-  takes the container's resident memory past it is killed, as Linux's OOM
-  killer does in a container, which is what a compose `memory:` means.
+  than smooth), and a process that takes the container's resident memory
+  past its memory limit is killed, as Linux's OOM killer does in a
+  container, which is what a compose `memory:` means (see below for how).
   Legion denied on `vmemoryuse` at first, but that sums the address space
   of every process in the container: a small shell-and-inetd app with
   `memory: 128M` failed to fork under light load while using a few MB.
   `memoryuse:deny` is no better: it pages the jail out rather than
   refusing, and rctl(8) warns it can thrash the machine.
-- rctl counts shared memory once per process, so a workload with large
-  shared buffers (Postgres) needs no limit or a generous one for now.
+- Memory is counted once per page. rctl's `memoryuse` for a jail sums its
+  processes' resident pages, so memory they share counts once for each:
+  Postgres with 128 MiB of buffers and sixteen sessions reading them was
+  1.2 GiB to rctl, and a 256 MiB limit there killed its WAL sender in the
+  phase 4 exit test. So the agent counts a container's memory itself
+  (`legion_sys::JailMemory`), from each process's map
+  (`kern.proc.vmmap`) and the anonymous objects (`vm.swap_objects`):
+  anonymous memory by object, following the chain behind each mapping,
+  as a forked process's copy-on-write pages sit in an object it shares
+  with its parent behind one of its own; files by mapped range; SysV and
+  POSIX segments, which the map names no object for, by name (anonymous
+  POSIX segments, all of one name, by address too, which forks inherit).
+  Every second it measures the containers with a limit and kills the
+  process with the most memory of its own in one over it. The rctl rule
+  stays as a backstop for each process alone
+  (`memoryuse:sigkill=<limit>/process`): no process uses more than its
+  container, so it never kills one the count would spare, and it holds
+  if the count cannot be read. rctl reads resident memory about once a
+  second too, so either may act first. Metrics and the autoscaler use
+  the same count. A database losing a backend restarts its others, as it
+  would under Linux's OOM killer.
 - rctl needs the loader tunable `kern.racct.enable=1`. Without it, setting
   limits fails and the agent only warns, so pods run unlimited.
 - Pod-level totals are read from the infra jail's accounting and used for

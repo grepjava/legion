@@ -16,7 +16,7 @@ use legion_proto::v1::pods_client::PodsClient;
 use legion_proto::v1::session_frame::Frame;
 use legion_proto::v1::session_open::Action;
 use legion_store::{Command, Outcome, Precondition, Store};
-use legion_sys::{FakeSys, Sys};
+use legion_sys::{FakeSys, JailMemory, Sys};
 use openraft::BasicNode;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -107,6 +107,7 @@ impl Harness {
         let mut config = AgentConfig::new(NODE, self.files_dir());
         config.infra_image = INFRA.into();
         config.resync = Duration::from_millis(100);
+        config.memory_check = Duration::from_millis(50);
         config.drain = self.drain;
         config.zfs_root = Some("tank/legion".into());
         config.logs_dir = Some(self.logs_dir());
@@ -329,7 +330,7 @@ async fn runs_a_pod() {
     assert_eq!(
         rules,
         [
-            format!("jail:{infra}.{web}:memoryuse:sigkill=268435456"),
+            format!("jail:{infra}.{web}:memoryuse:sigkill=268435456/process"),
             format!("jail:{infra}.{web}:pcpu:deny=50"),
             format!("jail:{infra}.{web}:maxproc:deny=64"),
         ]
@@ -404,6 +405,96 @@ restartPolicy: { condition: on-failure, maxAttempts: 2, delay: 0s }
         status.message
     );
     h.nothing_left().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_exit_event_does_not_give_the_code() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task(
+            "app-1",
+            r#"
+containers: [{ name: app, image: "app:1" }]
+restartPolicy: { condition: on-failure, maxAttempts: 1, delay: 0s }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+
+    // The resync sees the first exit and restarts the container before
+    // the exit's event arrives; by then the next run has ended too.
+    h.rt.hold_events(true);
+    h.rt.exit("shop_app-1_app", 1);
+    eventually("restart", || {
+        h.rt.containers()
+            .iter()
+            .any(|(n, running, starts)| n == "shop_app-1_app" && *running && *starts == 2)
+    })
+    .await;
+    h.rt.exit("shop_app-1_app", 3);
+    h.rt.hold_events(false);
+    let status = h.wait_state(&key, TaskState::Failed).await;
+    assert_eq!(status.exit_code, Some(3), "{}", status.message);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_limits_count_shared_pages_once() {
+    let h = Harness::new().await;
+    h.rt.add_image("db:1");
+    let key = h
+        .task(
+            "db-1",
+            r#"
+containers: [{ name: db, image: "db:1", resources: { limits: { memory: 256Mi } } }]
+restartPolicy: { condition: none }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    let infra = h.rt.id_of("shop_db-1").unwrap();
+    let db = h.rt.id_of("shop_db-1_db").unwrap();
+    let jail = format!("{infra}.{db}");
+
+    // Its processes share most of their pages: rctl, counting them once
+    // per process, says 2 GiB; counted once they are under the limit, and
+    // that is what is reported too.
+    h.sys.set_usage(&jail, &[("memoryuse", 2 << 30)]);
+    h.sys.set_memory(
+        &jail,
+        JailMemory {
+            bytes: 200 << 20,
+            largest: Some((4242, 20 << 20)),
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(h.sys.kills().is_empty(), "{:?}", h.sys.kills());
+    let usage = h.metrics.as_ref().unwrap().tasks().await;
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].1.memory, 200 << 20);
+
+    // Over it: the largest process is killed, and the exit says why.
+    h.sys.set_memory(
+        &jail,
+        JailMemory {
+            bytes: 300 << 20,
+            largest: Some((4242, 120 << 20)),
+        },
+    );
+    eventually("the largest process killed", || {
+        h.sys.kills().contains(&4242)
+    })
+    .await;
+    h.sys.set_memory(&jail, JailMemory::default());
+    h.rt.exit("shop_db-1_db", 137);
+    let status = h.wait_state(&key, TaskState::Failed).await;
+    assert!(
+        status
+            .message
+            .contains("db: out of memory: used 300 MiB of its 256 MiB limit; exited with 137"),
+        "{}",
+        status.message
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

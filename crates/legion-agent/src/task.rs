@@ -62,6 +62,8 @@ pub(crate) struct Ctx<R, C> {
     pub ips: Arc<Mutex<BTreeMap<String, Ipv4Addr>>>,
     /// Holds new pods back until they are guarded.
     pub guarding: Arc<crate::policing::Guarding>,
+    /// Containers' memory limits, kept by the agent.
+    pub memory: Arc<crate::memory::Limits>,
     /// How long a ready task told to stop keeps running first.
     pub drain: std::time::Duration,
 }
@@ -96,6 +98,7 @@ impl<R, C> Clone for Ctx<R, C> {
             net: self.net.clone(),
             ips: self.ips.clone(),
             guarding: self.guarding.clone(),
+            memory: self.memory.clone(),
             drain: self.drain,
         }
     }
@@ -594,7 +597,11 @@ impl<R: Runtime, C: Control> Worker<R, C> {
     /// Legion's rules must hold for every run. Adding a rule
     /// again replaces it, so repeating this is harmless.
     async fn limit(&self, c: &legion_api::service::Container, infra: &str, id: &str) {
-        let rules = pod::rctl_rules(c, &pod::child_jail(infra, id));
+        let jail = pod::child_jail(infra, id);
+        self.ctx
+            .memory
+            .started(&jail, c.resources.limits.memory.map(|m| m.0));
+        let rules = pod::rctl_rules(c, &jail);
         if rules.is_empty() {
             return;
         }
@@ -774,9 +781,12 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                         if let Some(i) = pod.members.iter().position(|m| m.id == id && m.running)
                             && !self.is_running(&id).await
                         {
-                            let code = match code {
-                                Some(c) => c,
-                                None => self.exit_code(&id).await,
+                            // The new run may have ended as well, and the
+                            // code is the one it ended with: the runtime's,
+                            // not the event's, unless the container is gone.
+                            let code = match self.ctx.runtime.inspect(&id).await {
+                                Ok(c) => c.state.exit_code,
+                                Err(_) => code.unwrap_or(-1),
                             };
                             self.exited(&mut pod, i, code).await;
                         }
@@ -815,9 +825,11 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         let m = &mut pod.members[i];
         m.running = false;
         m.prober = None;
-        let what = match m.unhealthy.take() {
-            Some(why) => format!("container {}: {why}", m.name),
-            None => format!("container {} exited with {code}", m.name),
+        let oom = self.ctx.memory.killed(&pod::child_jail(&pod.infra, &m.id));
+        let what = match (m.unhealthy.take(), oom) {
+            (Some(why), _) => format!("container {}: {why}", m.name),
+            (None, Some(why)) => format!("container {}: {why}; exited with {code}", m.name),
+            (None, None) => format!("container {} exited with {code}", m.name),
         };
         let wants = match policy.condition {
             RestartCondition::Any => true,
@@ -980,6 +992,9 @@ pub(crate) async fn teardown<R: Runtime, C: Control>(
         .iter()
         .find(|c| c.labels.get(LABEL_ROLE).map(String::as_str) == Some(Role::Infra.as_str()))
         .map(|c| c.id.clone());
+    if let Some(infra) = &infra {
+        ctx.memory.removed(infra);
+    }
     let mut jails = Vec::new();
     for c in found.iter().filter(|c| Some(&c.id) != infra.as_ref()) {
         if c.state == "running"

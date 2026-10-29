@@ -289,7 +289,7 @@ mod tests {
         assert_eq!(
             rules,
             [
-                "jail:i.c:memoryuse:sigkill=536870912",
+                "jail:i.c:memoryuse:sigkill=536870912/process",
                 "jail:i.c:pcpu:deny=150",
                 "jail:i.c:maxproc:deny=64",
             ]

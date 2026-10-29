@@ -15,8 +15,8 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::{
-    Carp, CarpState, Dataset, Destination, Epair, Error, IfConfig, IscsiSession, Jail, PfState,
-    RctlRule, Result, Sys, WgPeer,
+    Carp, CarpState, Dataset, Destination, Epair, Error, IfConfig, IscsiSession, Jail, JailMemory,
+    PfState, RctlRule, Result, Sys, WgPeer,
 };
 
 #[derive(Debug, Default)]
@@ -95,6 +95,9 @@ struct State {
     failing: BTreeSet<String>,
     /// Anchors whose loads fail until told otherwise.
     broken_anchors: BTreeSet<String>,
+    /// What jails' processes use, as set.
+    memory: BTreeMap<String, JailMemory>,
+    kills: Vec<u32>,
 }
 
 impl State {
@@ -201,6 +204,17 @@ impl FakeSys {
         if let Some(c) = self.state().carp.get_mut(&(interface.to_owned(), vhid)) {
             c.1 = state;
         }
+    }
+
+    /// Sets what [`Sys::jail_memory`] reports for a jail; without it,
+    /// what [`FakeSys::set_usage`] gave as `memoryuse`.
+    pub fn set_memory(&self, jail: &str, memory: JailMemory) {
+        self.state().memory.insert(jail.to_owned(), memory);
+    }
+
+    /// The processes killed so far, in order.
+    pub fn kills(&self) -> Vec<u32> {
+        self.state().kills.clone()
     }
 
     /// Sets what [`Sys::rctl_usage`] reports for a jail.
@@ -808,6 +822,33 @@ impl Sys for FakeSys {
 
     fn rctl_usage(&self, jail: &str) -> Result<BTreeMap<String, u64>> {
         Ok(self.state().usage.get(jail).cloned().unwrap_or_default())
+    }
+
+    fn jail_memory(&self, jails: &[String]) -> Result<BTreeMap<String, JailMemory>> {
+        let s = self.state();
+        let rctl = |j: &str| JailMemory {
+            bytes: s
+                .usage
+                .get(j)
+                .and_then(|u| u.get("memoryuse"))
+                .copied()
+                .unwrap_or(0),
+            largest: None,
+        };
+        Ok(jails
+            .iter()
+            .map(|j| {
+                (
+                    j.clone(),
+                    s.memory.get(j).copied().unwrap_or_else(|| rctl(j)),
+                )
+            })
+            .collect())
+    }
+
+    fn kill(&self, pid: u32) -> Result<()> {
+        self.state().kills.push(pid);
+        Ok(())
     }
 
     fn default_interface(&self) -> Result<Option<String>> {

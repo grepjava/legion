@@ -16,9 +16,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 mod fake;
+mod memory;
 mod shell;
 
 pub use fake::{FakeSys, FakeWireGuard};
+pub use memory::JailMemory;
 pub use shell::{CommandOutput, Host, Runner, Shell};
 
 #[derive(Debug, thiserror::Error)]
@@ -130,6 +132,11 @@ pub trait Sys: Send + Sync {
     fn rctl_remove_jail(&self, jail: &str) -> Result<()>;
     /// Current usage by resource (`memoryuse`, `pcpu`, `maxproc`, ...).
     fn rctl_usage(&self, jail: &str) -> Result<BTreeMap<String, u64>>;
+    /// The memory of each of these jails' processes, every page counted
+    /// once (see [`JailMemory`]); a jail with none running has none.
+    fn jail_memory(&self, jails: &[String]) -> Result<BTreeMap<String, JailMemory>>;
+    /// Kills a process (`SIGKILL`); one already gone is fine.
+    fn kill(&self, pid: u32) -> Result<()>;
 
     /// The interface of the default route, if there is one.
     fn default_interface(&self) -> Result<Option<String>>;
@@ -522,15 +529,24 @@ impl fmt::Display for RctlRule {
             self.resource.as_str(),
             self.resource.action(),
             self.amount
-        )
+        )?;
+        if self.resource == Resource::MemoryUse {
+            f.write_str("/process")?;
+        }
+        Ok(())
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Resource {
-    /// Bytes of resident memory; a process taking the jail past it is
-    /// killed, as Linux's OOM killer does in a container. (`deny` would
-    /// page the jail out instead, which rctl(8) warns can thrash.)
+    /// Bytes of resident memory, for each process of the jail on its own:
+    /// one going past it is killed (rctl reads resident memory about once
+    /// a second, as the agent does). rctl sums the jail's processes
+    /// counting shared pages once for each, so the jail's total is the
+    /// agent's to keep ([`Sys::jail_memory`]); no process can use more
+    /// than its jail, so this never kills one the total would spare.
+    /// (`deny` would page the process out instead, which rctl(8) warns
+    /// can thrash.)
     MemoryUse,
     /// Percent of one CPU; enforced by pausing the process.
     Pcpu,
@@ -612,6 +628,9 @@ mod tests {
             resource: Resource::MemoryUse,
             amount: 512 << 20,
         };
-        assert_eq!(r.to_string(), "jail:abc.def:memoryuse:sigkill=536870912");
+        assert_eq!(
+            r.to_string(),
+            "jail:abc.def:memoryuse:sigkill=536870912/process"
+        );
     }
 }

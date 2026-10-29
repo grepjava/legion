@@ -95,8 +95,7 @@ spec:
         security: { allow: [sysvipc] }
         probes:
           readiness: { tcp: { port: 5432 }, period: 2s }
-        # No memory limit: rctl's memoryuse counts the shared buffers once
-        # per Postgres process.
+        # No memory limit: tests/memory.rs runs Postgres under one.
     volumes: [{ name: pg, claim: { size: 512Mi } }]
 "#;
 

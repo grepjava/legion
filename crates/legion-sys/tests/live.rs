@@ -9,8 +9,8 @@
 //! jail -r lsys
 //! ```
 //!
-//! `rctl_on_child_jail` runs on the host (rctl is not available in jails);
-//! it only touches jails it creates. `zfs_datasets` runs when
+//! `rctl_on_child_jail` and `jail_memory` run on the host (rctl is not
+//! available in jails); they only touch jails they create. `zfs_datasets` runs when
 //! `LEGION_SYS_ZFS_ROOT` names a dataset it may create children under.
 
 use std::net::{IpAddr, Ipv4Addr};
@@ -219,7 +219,7 @@ fn rctl_on_child_jail() {
     }
     let rules = sh(&format!("rctl jail:{child}"));
     assert!(
-        rules.contains(&format!("jail:{child}:memoryuse:sigkill=536870912")),
+        rules.contains(&format!("jail:{child}:memoryuse:sigkill=536870912/process")),
         "{rules}"
     );
     assert!(
@@ -243,6 +243,123 @@ fn rctl_on_child_jail() {
 
     sh(&format!("jexec {parent} jail -r c1"));
     sh(&format!("jail -r {parent}"));
+}
+
+/// Run in a jail by `jail_memory` (with `LEGION_SYS_HOG` set): what a
+/// database does, a 64 MiB shared segment touched by four forked
+/// children, each with 8 MiB of its own. Prints `ready`, and ends when its
+/// stdin closes, its children when they see it gone.
+#[cfg(target_os = "freebsd")]
+fn hog() {
+    use std::io::Read;
+    const SHARED: usize = 64 << 20;
+    const OWN: usize = 8 << 20;
+    let map = |len, flags| {
+        // SAFETY: a new anonymous mapping, checked below.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                flags | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED);
+        p.cast::<u8>()
+    };
+    let touch = |p: *mut u8, len: usize| {
+        for o in (0..len).step_by(4096) {
+            // SAFETY: within the mapping.
+            unsafe { p.add(o).write_volatile(1) };
+        }
+    };
+    let shared = map(SHARED, libc::MAP_SHARED);
+    touch(shared, SHARED);
+    // SAFETY: plain calls; the children only touch memory and sleep.
+    let parent = unsafe { libc::getpid() };
+    for _ in 0..4 {
+        if unsafe { libc::fork() } == 0 {
+            touch(shared, SHARED);
+            let own = map(OWN, libc::MAP_PRIVATE);
+            touch(own, OWN);
+            while unsafe { libc::getppid() } == parent {
+                unsafe { libc::usleep(100_000) };
+            }
+            unsafe { libc::_exit(0) };
+        }
+    }
+    println!("ready");
+    let _ = std::io::stdin().read(&mut [0]);
+}
+
+#[test]
+#[ignore = "needs root on the host"]
+fn jail_memory() {
+    #[cfg(target_os = "freebsd")]
+    if std::env::var_os("LEGION_SYS_HOG").is_some() {
+        return hog();
+    }
+    use std::io::BufRead;
+    assert!(!jailed(), "rctl is only available on the host");
+    let sys = Shell::new();
+    let jail = format!("lsysmem{}", std::process::id());
+    sh(&format!("jail -c name={jail} path=/ persist"));
+    let exe = std::env::current_exe().unwrap();
+    let mut hog = Command::new("jexec")
+        .arg(&jail)
+        .arg(&exe)
+        .args(["--ignored", "--exact", "jail_memory", "--nocapture"])
+        .env("LEGION_SYS_HOG", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = std::io::BufReader::new(hog.stdout.take().unwrap());
+    let mut line = String::new();
+    while line.trim() != "ready" {
+        line.clear();
+        assert!(out.read_line(&mut line).unwrap() > 0, "the hog ended");
+    }
+    // The children may still be touching their pages.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // rctl counts the segment once per process; counted once, the jail
+    // holds it and the children's own pages, and a little more (the
+    // test binary).
+    let m = sys.jail_memory(std::slice::from_ref(&jail)).unwrap()[&jail];
+    let rctl = sys.rctl_usage(&jail).unwrap()["memoryuse"];
+    const MIB: u64 = 1 << 20;
+    eprintln!(
+        "counted once {} MiB, rctl {} MiB, largest {:?}",
+        m.bytes / MIB,
+        rctl / MIB,
+        m.largest
+    );
+    assert!(rctl > 5 * 64 * MIB, "rctl {rctl}");
+    assert!(
+        (96 * MIB..160 * MIB).contains(&m.bytes),
+        "{} MiB (rctl {} MiB)",
+        m.bytes / MIB,
+        rctl / MIB
+    );
+    let (pid, own) = m.largest.unwrap();
+    assert!((8 * MIB..24 * MIB).contains(&own), "{pid}: {own}");
+
+    // The largest goes, and the jail with it holds less.
+    sys.kill(pid).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let after = sys.jail_memory(std::slice::from_ref(&jail)).unwrap()[&jail];
+    assert!(after.bytes + 7 * MIB < m.bytes, "{after:?} after {m:?}");
+    sys.kill(pid).unwrap(); // gone: still fine
+
+    drop(hog.stdin.take());
+    hog.wait().unwrap();
+    // The children see their parent gone within a tenth of a second.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    sys.rctl_remove_jail(&jail).unwrap();
+    sh(&format!("jail -r {jail}"));
 }
 
 #[test]

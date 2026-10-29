@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[target.'cfg(target_os = "freebsd")'.dependencies]
+libc.workspace = true
+
+[target.'cfg(target_os = "freebsd")'.dev-dependencies]
+libc.workspace = true
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

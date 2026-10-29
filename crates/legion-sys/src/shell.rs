@@ -10,8 +10,54 @@ use serde::Deserialize;
 
 use crate::{
     Carp, CarpState, Dataset, Destination, Epair, Error, IfConfig, IpNet, IscsiSession, Jail,
-    PfState, RctlRule, Result, Sys, WgPeer,
+    JailMemory, PfState, RctlRule, Result, Sys, WgPeer,
 };
+
+/// Counts the memory of each jail's processes from the kernel's maps.
+#[cfg(target_os = "freebsd")]
+fn jail_memory(pids: BTreeMap<String, Vec<u32>>) -> Result<BTreeMap<String, JailMemory>> {
+    use crate::memory::{count, freebsd};
+    let read = |what: &str, e: std::io::Error| Error::Failed {
+        command: format!("sysctl {what}"),
+        message: e.to_string(),
+    };
+    if pids.values().all(Vec::is_empty) {
+        return Ok(pids
+            .into_keys()
+            .map(|j| (j, JailMemory::default()))
+            .collect());
+    }
+    let objects = freebsd::objects().map_err(|e| read("vm.swap_objects", e))?;
+    let page = freebsd::page_size();
+    pids.into_iter()
+        .map(|(jail, pids)| {
+            let mut processes = Vec::new();
+            for pid in pids {
+                match freebsd::mappings(pid) {
+                    Ok(map) => processes.push((pid, map)),
+                    // Exited since ps listed it.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(read(&format!("kern.proc.vmmap.{pid}"), e)),
+                }
+            }
+            Ok((jail, count(&processes, &objects, page)))
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "freebsd"))]
+fn jail_memory(pids: BTreeMap<String, Vec<u32>>) -> Result<BTreeMap<String, JailMemory>> {
+    if pids.values().all(Vec::is_empty) {
+        return Ok(pids
+            .into_keys()
+            .map(|j| (j, JailMemory::default()))
+            .collect());
+    }
+    Err(Error::Failed {
+        command: "sysctl kern.proc.vmmap".into(),
+        message: "only on FreeBSD".into(),
+    })
+}
 
 /// Runs one program to completion.
 pub trait Runner: Send + Sync {
@@ -579,6 +625,35 @@ impl<R: Runner> Sys for Shell<R> {
             Ok(())
         } else {
             Err(failed("rctl", &a, &out))
+        }
+    }
+
+    fn jail_memory(&self, jails: &[String]) -> Result<BTreeMap<String, JailMemory>> {
+        let mut pids: BTreeMap<String, Vec<u32>> =
+            jails.iter().map(|j| (j.clone(), Vec::new())).collect();
+        if jails.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let a = args(["-ax", "-o", "pid=", "-o", "jail="]);
+        for line in self.run("ps", &a)?.lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(pid), Some(jail)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            if let (Some(list), Ok(pid)) = (pids.get_mut(jail), pid.parse()) {
+                list.push(pid);
+            }
+        }
+        jail_memory(pids)
+    }
+
+    fn kill(&self, pid: u32) -> Result<()> {
+        let a = vec!["-KILL".to_owned(), pid.to_string()];
+        let out = self.output("kill", &a, None)?;
+        if out.success || out.stderr.contains("No such process") {
+            Ok(())
+        } else {
+            Err(failed("kill", &a, &out))
         }
     }
 
@@ -1675,7 +1750,10 @@ mod tests {
     #[test]
     fn rctl() {
         let sh = Script::shell(vec![
-            ("rctl -a jail:i.c:memoryuse:sigkill=536870912", ok("")),
+            (
+                "rctl -a jail:i.c:memoryuse:sigkill=536870912/process",
+                ok(""),
+            ),
             (
                 "rctl -r jail:gone",
                 err("rctl: failed to remove rule 'jail:gone': No such process"),
