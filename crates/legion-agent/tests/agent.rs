@@ -181,6 +181,10 @@ impl Harness {
 
     /// A task of a Service, or with `job` of a Job.
     async fn task_of(&self, name: &str, pod: &str, job: bool) -> ObjectKey {
+        self.task_in("shop", name, pod, job).await
+    }
+
+    async fn task_in(&self, namespace: &str, name: &str, pod: &str, job: bool) -> ObjectKey {
         let pod: serde_json::Value = serde_yaml_ng::from_str(pod).unwrap();
         let mut spec: TaskSpec = legion_api::parse(&serde_json::json!({
             "service": "web",
@@ -195,7 +199,7 @@ impl Harness {
         spec.admit().unwrap();
         let mut object = Object::new(
             Kind::Task,
-            "shop",
+            namespace,
             name,
             serde_json::to_value(&spec).unwrap(),
         );
@@ -900,6 +904,58 @@ containers:
         st.message
     );
     assert!(h.rt.containers().is_empty(), "pod removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn private_images() {
+    let h = Harness::new().await;
+    let image = "ghcr.io/team/app:1";
+    h.rt.private_image(image, "bot", "pw");
+    for ns in ["shop", "other"] {
+        let login =
+            serde_json::json!({ "auths": { "ghcr.io": { "username": "bot", "password": "pw" } } });
+        h.write(
+            Object::new(
+                Kind::Secret,
+                ns,
+                "ghcr",
+                serde_json::json!({ "text": login.to_string() }),
+            ),
+            Precondition::MustNotExist,
+        )
+        .await;
+    }
+    let with = format!(
+        r#"{{ imagePullSecrets: [ghcr], containers: [{{ name: app, image: "{image}" }}] }}"#
+    );
+    let without = format!(r#"{{ containers: [{{ name: app, image: "{image}" }}] }}"#);
+
+    let key = h.task("p-1", &without).await;
+    let status = h.wait_state(&key, TaskState::Failed).await;
+    assert!(status.message.contains("denied"), "{}", status.message);
+    let key = h.task("p-2", &with).await;
+    h.wait_state(&key, TaskState::Running).await;
+    // The login stays out of the task's files.
+    let uid = h.store.get(&key).unwrap().unwrap().metadata.uid;
+    assert!(!h.files_dir().join(&uid).join("secrets").exists());
+
+    // Another namespace without the login cannot use the image the node
+    // has; with its own, it can.
+    let key = h.task_in("other", "p-3", &without, false).await;
+    let status = h.wait_state(&key, TaskState::Failed).await;
+    assert!(status.message.contains("denied"), "{}", status.message);
+    let key = h.task_in("other", "p-4", &with, false).await;
+    h.wait_state(&key, TaskState::Running).await;
+
+    let missing =
+        r#"{ imagePullSecrets: [nope], containers: [{ name: app, image: "ghcr.io/team/app:2" }] }"#;
+    let key = h.task("p-5", missing).await;
+    let status = h.wait_state(&key, TaskState::Failed).await;
+    assert!(
+        status.message.contains("secret nope not found"),
+        "{}",
+        status.message
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

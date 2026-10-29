@@ -75,7 +75,7 @@ pub(crate) async fn prepare<C: Control>(
 ) -> Result<Files, String> {
     let pod = &a.spec.pod;
     let mut values = BTreeMap::new();
-    for (kind, name) in pod.data_refs() {
+    for (kind, name) in pod.container_data_refs() {
         let what = kind.as_str().to_lowercase();
         match control.data(&a.key.namespace, kind, &name).await {
             Ok(Some(v)) => {

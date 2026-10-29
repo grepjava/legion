@@ -45,7 +45,7 @@ services:
     environment: { POSTGRES_PASSWORD_FILE: /run/secrets/db_password }
     secrets: [{ source: db_password, target: pw }]
     healthcheck: { test: pg_isready }
-    x-legion: { placement: { tolerations: [{ key: dedicated }] } }
+    x-legion: { placement: { tolerations: [{ key: dedicated }] }, pod: { imagePullSecrets: [registry-login] } }
 volumes:
   db_data: {}
   shared: { external: true }
@@ -188,6 +188,8 @@ fn converts_a_stack() {
         ["/bin/sh", "-c", "pg_isready"]
     );
     assert_eq!(db.placement.tolerations[0].key, "dedicated");
+    assert_eq!(db.pod.image_pull_secrets, ["registry-login"]);
+    assert_eq!(db.pod.containers.len(), 1, "merged into the pod");
 
     let warnings = stack.warnings.join("\n");
     for expected in [

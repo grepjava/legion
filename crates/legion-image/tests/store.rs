@@ -5,10 +5,12 @@ use std::convert::Infallible;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Request, Response, StatusCode};
-use legion_image::{Client, Error, Store, chain_ids, oci};
+use legion_image::{Client, Credentials, Error, Store, chain_ids, oci};
 use legion_sys::{FakeSys, Sys};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -39,6 +41,8 @@ struct Registry {
     files: BTreeMap<String, (Vec<u8>, String)>,
     /// Blob requests served, by digest.
     fetched: Vec<String>,
+    /// Repositories only this `user:password` may pull.
+    private: BTreeMap<String, String>,
 }
 
 impl Registry {
@@ -148,12 +152,33 @@ fn answer(
             .body(Full::new(Bytes::from(body)))
             .unwrap()
     };
+    let auth = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let private = |repo: &str| registry.lock().unwrap().private.get(repo).cloned();
     if path == "/token" {
-        let scope = req.uri().query().unwrap_or("");
-        assert!(scope.contains("scope=repository"), "{scope}");
+        let query = req.uri().query().unwrap_or("");
+        let query = query.replace("%3A", ":").replace("%2F", "/");
+        assert!(query.contains("scope=repository"), "{query}");
+        let repo = query
+            .split("scope=repository:")
+            .nth(1)
+            .and_then(|r| r.split(':').next())
+            .unwrap_or("");
+        // As Docker Hub does, a token without access for the wrong account.
+        let token = match private(repo) {
+            None => TOKEN.to_owned(),
+            Some(account) if auth == format!("Basic {}", STANDARD.encode(&account)) => {
+                format!("{TOKEN}-{repo}")
+            }
+            Some(_) => "no-access".to_owned(),
+        };
         return reply(
             StatusCode::OK,
-            json!({"token": TOKEN}).to_string().into_bytes(),
+            json!({"token": token}).to_string().into_bytes(),
         );
     }
     if let Some(rest) = path.strip_prefix("/cdn/") {
@@ -162,10 +187,15 @@ fn answer(
         r.fetched.push(rest.rsplit('/').next().unwrap().to_owned());
         return reply(StatusCode::OK, data);
     }
-    let authorized = req
-        .headers()
-        .get("authorization")
-        .is_some_and(|v| v == format!("Bearer {TOKEN}").as_str());
+    let rest = path.strip_prefix("/v2/").unwrap_or("");
+    let repo = rest
+        .split_once("/manifests/")
+        .or_else(|| rest.split_once("/blobs/"))
+        .map_or("", |(r, _)| r);
+    let authorized = match private(repo) {
+        None => auth == format!("Bearer {TOKEN}"),
+        Some(_) => auth == format!("Bearer {TOKEN}-{repo}"),
+    };
     if !authorized {
         return Response::builder()
             .status(StatusCode::UNAUTHORIZED)
@@ -176,7 +206,6 @@ fn answer(
             .body(Full::new(Bytes::new()))
             .unwrap();
     }
-    let rest = path.strip_prefix("/v2/").unwrap_or("");
     if rest.contains("/blobs/") {
         return Response::builder()
             .status(StatusCode::TEMPORARY_REDIRECT)
@@ -221,7 +250,10 @@ async fn pulls_share_layers_and_removal_waits_for_containers() {
     let sys = Arc::new(FakeSys::new());
     let s = store(&sys, t.path(), &addr);
 
-    let image = s.pull(&format!("{addr}/team/app:1"), None).await.unwrap();
+    let image = s
+        .pull(&format!("{addr}/team/app:1"), None, "t")
+        .await
+        .unwrap();
     let chains = chain_ids(&[base.1.clone(), app.1.clone()]);
     let hex: Vec<String> = chains.iter().map(|c| c[7..].to_owned()).collect();
     assert_eq!(image.layers, hex);
@@ -247,11 +279,16 @@ async fn pulls_share_layers_and_removal_waits_for_containers() {
 
     // The other image shares the base layer: only its own is fetched.
     let before = registry.lock().unwrap().fetched.len();
-    let second = s.pull(&format!("{addr}/team/other:1"), None).await.unwrap();
+    let second = s
+        .pull(&format!("{addr}/team/other:1"), None, "t")
+        .await
+        .unwrap();
     assert_eq!(second.layers[0], hex[0]);
     assert_eq!(registry.lock().unwrap().fetched.len(), before + 2);
     // Pulling again fetches only the config.
-    s.pull(&format!("{addr}/team/app:1"), None).await.unwrap();
+    s.pull(&format!("{addr}/team/app:1"), None, "t")
+        .await
+        .unwrap();
     assert_eq!(registry.lock().unwrap().fetched.len(), before + 3);
     assert_eq!(s.images().unwrap().len(), 2);
     assert!(s.get(&format!("{addr}/team/app:1")).unwrap().is_some());
@@ -273,17 +310,78 @@ async fn pulls_share_layers_and_removal_waits_for_containers() {
 
     // Only images for this node's OS.
     let e = s
-        .pull(&format!("{addr}/team/linux:1"), None)
+        .pull(&format!("{addr}/team/linux:1"), None, "t")
         .await
         .unwrap_err();
     assert!(e.to_string().contains("no image for freebsd"), "{e}");
     let e = s
-        .pull(&format!("{addr}/team/none:1"), None)
+        .pull(&format!("{addr}/team/none:1"), None, "t")
         .await
         .unwrap_err();
     assert!(matches!(e, Error::NotFound(_)), "{e}");
-    let e = s.pull("localhost/built:1", None).await.unwrap_err();
+    let e = s.pull("localhost/built:1", None, "t").await.unwrap_err();
     assert!(e.to_string().contains("local image"), "{e}");
+}
+
+#[tokio::test]
+async fn private_images_are_for_those_who_pulled_them() {
+    let base = layer(&[("etc/base", "b")]);
+    let registry = Arc::new(Mutex::new(Registry::default()));
+    {
+        let mut r = registry.lock().unwrap();
+        r.image("team/secret", "1", "freebsd", std::slice::from_ref(&base));
+        r.image("team/open", "1", "freebsd", std::slice::from_ref(&base));
+        r.private.insert("team/secret".into(), "bot:pw".into());
+    }
+    let addr = serve(registry.clone()).await;
+    let t = tempfile::tempdir().unwrap();
+    let sys = Arc::new(FakeSys::new());
+    let s = store(&sys, t.path(), &addr);
+    let secret = format!("{addr}/team/secret:1");
+    let creds = Credentials {
+        username: "bot".into(),
+        password: "pw".into(),
+    };
+    let wrong = Credentials {
+        username: "bot".into(),
+        password: "nope".into(),
+    };
+
+    let e = s.pull(&secret, None, "a").await.unwrap_err();
+    assert!(e.to_string().contains("access denied"), "{e}");
+    s.pull(&secret, Some(&wrong), "a").await.unwrap_err();
+    s.pull(&secret, Some(&creds), "a").await.unwrap();
+    assert!(s.usable(&secret, "a").unwrap().is_some());
+    assert!(s.usable(&secret, "b").unwrap().is_none());
+    assert!(s.get(&secret).unwrap().is_some(), "the node has it");
+
+    // The token the first pull got does not serve another's.
+    let e = s.pull(&secret, None, "b").await.unwrap_err();
+    assert!(e.to_string().contains("access denied"), "{e}");
+    s.pull(&secret, Some(&wrong), "b").await.unwrap_err();
+    assert!(s.usable(&secret, "b").unwrap().is_none());
+    // With its own login, only the manifest and config are fetched.
+    let before = registry.lock().unwrap().fetched.len();
+    s.pull(&secret, Some(&creds), "b").await.unwrap();
+    assert_eq!(registry.lock().unwrap().fetched.len(), before + 1);
+    assert!(s.usable(&secret, "a").unwrap().is_some());
+    assert!(s.usable(&secret, "b").unwrap().is_some());
+
+    // Public images are for anyone, whoever pulled them and how.
+    let open = format!("{addr}/team/open:1");
+    s.pull(&open, None, "a").await.unwrap();
+    assert!(s.usable(&open, "c").unwrap().is_some());
+    // The same image under a public name stays private under its own.
+    assert_eq!(s.images().unwrap().len(), 1);
+    assert!(s.usable(&secret, "c").unwrap().is_none());
+    // An image found public later is anyone's.
+    registry.lock().unwrap().private.clear();
+    s.pull(&secret, None, "c").await.unwrap();
+    assert!(s.usable(&secret, "d").unwrap().is_some());
+
+    // Removing a name forgets who could use it.
+    s.remove(&secret).await.unwrap();
+    assert!(s.images().unwrap()[0].private.is_empty());
 }
 
 #[tokio::test]
@@ -309,7 +407,7 @@ async fn tampered_layers_are_refused() {
     let s = store(&sys, t.path(), &addr);
     for repo in ["blob", "diff"] {
         let e = s
-            .pull(&format!("{addr}/team/{repo}:1"), None)
+            .pull(&format!("{addr}/team/{repo}:1"), None, "t")
             .await
             .unwrap_err();
         assert!(matches!(e, Error::Digest { .. }), "{repo}: {e}");

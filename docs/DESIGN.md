@@ -791,6 +791,16 @@ says why that went and what was kept of it.
   host's proxy settings. From an index it picks the entry for
   `freebsd/<arch>`; images for another OS are refused. Every blob is
   checked against its digest, and a manifest asked for by digest too.
+- **Logins**: a pod's `imagePullSecrets` name Secrets of its namespace
+  holding Docker configs (`{"auths": {"ghcr.io": {"auth": ...}}}`, as
+  `docker login` writes them; `username` and `password` work too, credential
+  helpers do not). The agent reads them only when an image needs pulling,
+  and the runtime uses the login for the image's registry. Tokens are kept
+  per account, and an image pulled with a login is private to the
+  namespaces that pulled it: another namespace's task pulls it again, so
+  the registry decides (only the manifest and config are fetched, the
+  layers are shared). Images pulled without a login, or loaded, are
+  anyone's. The logins never reach the task's files.
 - **Layers**: each layer is decompressed (gzip, zstd or plain) and checked
   against its `diff_id` **before** anything is extracted: images share
   layers by chain id, so a layer claiming another's id would otherwise
@@ -972,6 +982,7 @@ spec:
     volumes:
       - name: uploads
         volume: { name: uploads }
+    imagePullSecrets: [registry-login]   # Docker configs, §6.1
     restartPolicy: { condition: on-failure, maxAttempts: 5, delay: 5s }
   placement:
     constraints: ["node.labels.disk == ssd"]
@@ -1042,7 +1053,8 @@ object's labels and normalised spec against the stored one.
 - Unsupported keys (`privileged`, `cap_add`, `devices`, `network_mode: host`, ...)
   produce warnings, or errors with `--strict`.
 - An `x-legion:` extension on a service exposes features compose cannot express:
-  probes, init containers, sidecars, stateful mode, tolerations, security profile.
+  probes, init containers, sidecars, stateful mode, tolerations, security profile,
+  registry logins (`x-legion: { pod: { imagePullSecrets: [...] } }`).
 
 `legion stack convert` writes the native YAML, for teams that want to leave
 compose behind.

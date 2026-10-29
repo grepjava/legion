@@ -23,7 +23,7 @@ use crate::control::{Assignment, Control, ControlError};
 use crate::pod::{self, LABEL_CONTAINER, LABEL_ROLE, LABEL_TASK, Role};
 use crate::probe::{self, Outcome, Prober};
 use crate::runtime::Runtime;
-use crate::{files, output, volumes};
+use crate::{files, logins, output, volumes};
 
 /// What the agent tells a worker.
 #[derive(Debug)]
@@ -315,14 +315,25 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         let images: BTreeSet<String> = std::iter::once(self.ctx.infra_image.clone())
             .chain(self.pod().containers().map(|c| c.image.clone()))
             .collect();
+        let namespace = self.a.key.namespace.clone();
+        // Read when an image needs pulling: a private image another
+        // namespace pulled is pulled again, so the registry checks this
+        // namespace's access.
+        let mut logins = None;
         for image in &images {
-            let present = rt
-                .image_exists(image)
+            let usable = rt
+                .image_usable(image, &namespace)
                 .await
                 .map_err(|e| Abort::Failed(format!("checking image {image}: {e}")))?;
-            if !present {
+            if !usable {
+                if logins.is_none() {
+                    let read = logins::read(self.ctx.control.as_ref(), &self.a)
+                        .await
+                        .map_err(Abort::Failed)?;
+                    logins = Some(read);
+                }
                 tracing::info!(%image, "pulling");
-                rt.pull(image)
+                rt.pull(image, &namespace, logins.as_deref().unwrap_or_default())
                     .await
                     .map_err(|e| Abort::Failed(format!("pulling {image}: {e}")))?;
             }

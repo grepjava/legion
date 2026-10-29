@@ -4,7 +4,7 @@
 //! layer. What images there are, and their configs, is kept in
 //! `<dir>/index.json`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -29,6 +29,18 @@ pub struct Image {
     /// Chain ids (hex), bottom layer first.
     pub layers: Vec<String>,
     pub config: ImageConfig,
+    /// References pulled with credentials, and who pulled them: only they
+    /// may use the image without asking its registry again. Others are
+    /// public (pulled without credentials, or loaded).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub private: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl Image {
+    /// Whether `user` may use the image as `reference` names it.
+    pub fn usable_by(&self, reference: &str, user: &str) -> bool {
+        self.private.get(reference).is_none_or(|u| u.contains(user))
+    }
 }
 
 pub struct Store {
@@ -232,8 +244,22 @@ impl Store {
         Some(format!("{}/{top}@{SNAPSHOT}", self.dataset))
     }
 
-    /// Pulls `reference` from its registry.
-    pub async fn pull(&self, reference: &str, creds: Option<&Credentials>) -> Result<Image, Error> {
+    /// The image `reference` names if the store has it and `user` may use
+    /// it without asking its registry (see [`Image::private`]).
+    pub fn usable(&self, reference: &str, user: &str) -> Result<Option<Image>, Error> {
+        let name = Reference::parse(reference)?.to_string();
+        Ok(self.get(&name)?.filter(|i| i.usable_by(&name, user)))
+    }
+
+    /// Pulls `reference` from its registry for `user`, with `creds` if
+    /// given; an image pulled with credentials is then private to those
+    /// who pulled it.
+    pub async fn pull(
+        &self,
+        reference: &str,
+        creds: Option<&Credentials>,
+        user: &str,
+    ) -> Result<Image, Error> {
         let r = Reference::parse(reference)?;
         if r.is_local() {
             return Err(Error::NotFound(format!(
@@ -246,14 +272,14 @@ impl Store {
             reference: &r,
             creds,
         };
-        self.ingest(&source, &r).await
+        self.ingest(&source, &r, creds.map(|_| user)).await
     }
 
     /// Adds the image in an OCI layout directory as `reference`.
     pub async fn import(&self, layout: &Path, reference: &str) -> Result<Image, Error> {
         let r = Reference::parse(reference)?;
         let _held = self.hold().await?;
-        self.ingest(&Source::Layout(layout), &r).await
+        self.ingest(&Source::Layout(layout), &r, None).await
     }
 
     /// Adds the image in an OCI archive (`podman save --format
@@ -299,7 +325,7 @@ impl Store {
             }
         };
         let r = Reference::parse(&name)?;
-        self.ingest(&Source::Layout(tmp.path()), &r).await
+        self.ingest(&Source::Layout(tmp.path()), &r, None).await
     }
 
     /// The store to itself: this process's other users wait, and so do
@@ -314,7 +340,13 @@ impl Store {
         })
     }
 
-    async fn ingest(&self, source: &Source<'_>, r: &Reference) -> Result<Image, Error> {
+    /// Adds the image `source` holds as `r`, private to `private` if given.
+    async fn ingest(
+        &self,
+        source: &Source<'_>,
+        r: &Reference,
+        private: Option<&str>,
+    ) -> Result<Image, Error> {
         let (digest, manifest) = source.manifest().await?;
         let tmp = tempfile::Builder::new()
             .prefix("pull")
@@ -375,22 +407,34 @@ impl Store {
             references: vec![r.to_string()],
             layers,
             config,
+            private: BTreeMap::new(),
         };
         let mut images = self.images()?;
         let name = r.to_string();
-        for i in &mut images {
+        for i in images.iter_mut().filter(|i| i.id != image.id) {
             i.references.retain(|n| *n != name);
+            i.private.remove(&name);
         }
-        let image = match images.iter_mut().find(|i| i.id == image.id) {
-            Some(i) => {
-                i.references.push(name);
-                i.clone()
-            }
+        let i = match images.iter().position(|i| i.id == image.id) {
+            Some(i) => i,
             None => {
-                images.push(image.clone());
-                image
+                images.push(image);
+                images.len() - 1
             }
         };
+        let i = &mut images[i];
+        if !i.references.contains(&name) {
+            i.references.push(name.clone());
+        }
+        match private {
+            Some(user) => {
+                i.private.entry(name).or_default().insert(user.to_owned());
+            }
+            None => {
+                i.private.remove(&name);
+            }
+        }
+        let image = i.clone();
         images.retain(|i| !i.references.is_empty());
         self.save(&images)?;
         Ok(image)
@@ -406,6 +450,7 @@ impl Store {
         for i in &mut images {
             let before = i.references.len();
             i.references.retain(|n| *n != name);
+            i.private.remove(&name);
             found |= i.references.len() != before;
         }
         images.retain(|i| !i.references.is_empty());

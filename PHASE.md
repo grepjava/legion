@@ -822,11 +822,23 @@ replaces Podman and ocijail.
   database's last handle, but an `Arc`'s count drops before its value's
   drop has closed the file, which may still run on another thread; it
   now waits until the file opens again.
+- **Registry logins from Secrets**: `imagePullSecrets` on a pod names
+  Secrets holding Docker configs; the node may read them (they count among
+  the pod's `data_refs`) but they are not written to the task's files. The
+  registry client keys its tokens by account, so a token one login got
+  never serves a pull without it. The image store records who pulled an
+  image with a login (`Image::private`, by reference); another namespace's
+  task pulls it again, so the registry checks its access. Tested: against
+  the test registry (a private repository; wrong, missing and right
+  logins; a cached token not reused; layers not fetched twice; an image
+  found public later), the Docker config forms, and the agent (a task
+  without the login fails, another namespace needs its own, a missing
+  Secret fails the task).
 
 ### To do, in order
 
 Next in phase 5: Linux images, IPv6 dual-stack, a volume plugin
 interface (NFS, iSCSI), bhyve tasks (exploratory). Smaller follow-ups of
-the jail runtime: registry credentials from Secrets, an image pulled
-again just as it is pruned (the task retries).
+the jail runtime: an image pulled again just as it is pruned (the task
+retries).
 

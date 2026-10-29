@@ -103,6 +103,23 @@ impl Reference {
     }
 }
 
+/// The registry a Docker config's `auths` key names, as a [`Reference`]
+/// names it: `https://index.docker.io/v1/` is `docker.io`,
+/// `https://ghcr.io` is `ghcr.io`.
+pub fn registry_of(key: &str) -> String {
+    let key = key
+        .strip_prefix("https://")
+        .or_else(|| key.strip_prefix("http://"))
+        .unwrap_or(key);
+    let host = key.split('/').next().unwrap_or("").to_ascii_lowercase();
+    match host.as_str() {
+        "index.docker.io" | "registry-1.docker.io" | "registry.hub.docker.com" => {
+            DOCKER_HUB.to_owned()
+        }
+        _ => host,
+    }
+}
+
 impl fmt::Display for Reference {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.registry, self.repository)?;
@@ -122,6 +139,24 @@ mod tests {
 
     fn canonical(s: &str) -> String {
         Reference::parse(s).unwrap().to_string()
+    }
+
+    #[test]
+    fn registries_of_docker_config_keys() {
+        for (key, registry) in [
+            ("https://index.docker.io/v1/", "docker.io"),
+            ("registry-1.docker.io", "docker.io"),
+            ("docker.io", "docker.io"),
+            ("https://ghcr.io", "ghcr.io"),
+            ("Registry.Example.com:5000/v2/", "registry.example.com:5000"),
+            ("http://localhost:5000", "localhost:5000"),
+        ] {
+            assert_eq!(registry_of(key), registry, "{key}");
+        }
+        assert_eq!(
+            Reference::parse("nginx").unwrap().registry,
+            registry_of("https://index.docker.io/v1/")
+        );
     }
 
     #[test]

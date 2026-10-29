@@ -28,7 +28,7 @@ use legion_sys::FakeSys;
 use tokio::sync::broadcast;
 
 use crate::pod::{ANNOTATION_JAIL, ANNOTATION_PARENT, ANNOTATION_VNET, LABEL_ROLE, child_jail};
-use crate::runtime::Runtime;
+use crate::runtime::{Login, Runtime};
 
 pub struct FakeRuntime {
     sys: Arc<FakeSys>,
@@ -41,6 +41,9 @@ struct State {
     images: BTreeSet<String>,
     /// Pulls of these fail.
     unpullable: BTreeSet<String>,
+    /// Images pulled only with this account (username, password), and who
+    /// pulled them.
+    private: BTreeMap<String, ((String, String), BTreeSet<String>)>,
     next_id: u64,
     containers: BTreeMap<String, Container>,
     /// Ignore the VNET annotation, as a runtime without support would.
@@ -128,6 +131,14 @@ impl FakeRuntime {
 
     pub fn add_image(&self, reference: &str) {
         self.state().images.insert(reference.to_owned());
+    }
+
+    /// `reference` pulls only with this account.
+    pub fn private_image(&self, reference: &str, username: &str, password: &str) {
+        self.state().private.insert(
+            reference.to_owned(),
+            ((username.to_owned(), password.to_owned()), BTreeSet::new()),
+        );
     }
 
     pub fn fail_pulls_of(&self, reference: &str) {
@@ -304,17 +315,31 @@ impl FakeRuntime {
 }
 
 impl Runtime for FakeRuntime {
-    async fn image_exists(&self, reference: &str) -> Result<bool> {
-        Ok(self.state().images.contains(reference))
+    async fn image_usable(&self, reference: &str, user: &str) -> Result<bool> {
+        let s = self.state();
+        Ok(s.images.contains(reference)
+            && s.private
+                .get(reference)
+                .is_none_or(|(_, users)| users.contains(user)))
     }
 
-    async fn pull(&self, reference: &str) -> Result<()> {
+    async fn pull(&self, reference: &str, user: &str, logins: &[Login]) -> Result<()> {
         let mut s = self.state();
+        let denied = || Error::Pull {
+            image: reference.to_owned(),
+            message: "requested access to the resource is denied".into(),
+        };
         if s.unpullable.contains(reference) {
-            return Err(Error::Pull {
-                image: reference.to_owned(),
-                message: "requested access to the resource is denied".into(),
-            });
+            return Err(denied());
+        }
+        if let Some(((username, password), users)) = s.private.get_mut(reference) {
+            if !logins
+                .iter()
+                .any(|l| l.username == *username && l.password == *password)
+            {
+                return Err(denied());
+            }
+            users.insert(user.to_owned());
         }
         s.images.insert(reference.to_owned());
         Ok(())

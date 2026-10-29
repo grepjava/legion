@@ -19,8 +19,8 @@ pub const LABEL_CONTAINER: &str = "legion.container";
 
 pub const ANNOTATION_VNET: &str = "org.freebsd.jail.vnet";
 pub const ANNOTATION_PARENT: &str = "org.freebsd.parentJail";
-/// The jail parameters Legion's hook sets on a container's jail before its
-/// process starts (see [`crate::hook`]).
+/// The jail parameters the runtime gives a container's jail when it makes
+/// it (see [`jail_params`]).
 pub const ANNOTATION_JAIL: &str = "legion.jail";
 const ANNOTATION_MLOCK: &str = "org.freebsd.jail.allow.mlock";
 const ANNOTATION_SYSV: [&str; 3] = [

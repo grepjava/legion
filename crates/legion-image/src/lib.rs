@@ -8,7 +8,7 @@ mod registry;
 mod store;
 
 pub use oci::{Config, ImageConfig};
-pub use reference::Reference;
+pub use reference::{Reference, registry_of};
 pub use registry::{Client, Credentials};
 pub use store::{Image, Store, chain_ids};
 

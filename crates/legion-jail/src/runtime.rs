@@ -20,9 +20,9 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use legion_agent::runtime::{
     Actor, Attached, Chunk, ContainerConfig, ContainerInspect, ContainerSpec, ContainerState,
-    ContainerSummary, Error, Event, ExecOutput, Output, Result,
+    ContainerSummary, Error, Event, ExecOutput, Login, Output, Result,
 };
-use legion_image::Store;
+use legion_image::{Credentials, Reference, Store};
 use legion_sys::Sys;
 use tokio::sync::{broadcast, watch};
 
@@ -684,13 +684,31 @@ impl JailRuntime {
 }
 
 impl legion_agent::Runtime for JailRuntime {
-    async fn image_exists(&self, reference: &str) -> Result<bool> {
-        Ok(self.images.get(reference).map_err(image_error)?.is_some())
+    async fn image_usable(&self, reference: &str, user: &str) -> Result<bool> {
+        Ok(self
+            .images
+            .usable(reference, user)
+            .map_err(image_error)?
+            .is_some())
     }
 
-    async fn pull(&self, reference: &str) -> Result<()> {
+    async fn pull(&self, reference: &str, user: &str, logins: &[Login]) -> Result<()> {
+        let pull_error = |message: String| Error::Pull {
+            image: reference.to_owned(),
+            message,
+        };
+        let registry = Reference::parse(reference)
+            .map_err(|e| pull_error(e.to_string()))?
+            .registry;
+        let creds = logins
+            .iter()
+            .find(|l| legion_image::registry_of(&l.registry) == registry)
+            .map(|l| Credentials {
+                username: l.username.clone(),
+                password: l.password.clone(),
+            });
         self.images
-            .pull(reference, None)
+            .pull(reference, creds.as_ref(), user)
             .await
             .map(drop)
             .map_err(|e| Error::Pull {

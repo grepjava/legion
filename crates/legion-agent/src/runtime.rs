@@ -11,8 +11,22 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 
 pub trait Runtime: Send + Sync + 'static {
-    fn image_exists(&self, reference: &str) -> impl Future<Output = Result<bool>> + Send;
-    fn pull(&self, reference: &str) -> impl Future<Output = Result<()>> + Send;
+    /// Whether the node has the image `reference` names and `user` (a
+    /// namespace) may use it without asking its registry: it was pulled
+    /// without credentials, loaded onto the node, or pulled for `user`.
+    fn image_usable(
+        &self,
+        reference: &str,
+        user: &str,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// Pulls `reference` for `user`, with the login in `logins` for its
+    /// registry if there is one.
+    fn pull(
+        &self,
+        reference: &str,
+        user: &str,
+        logins: &[Login],
+    ) -> impl Future<Output = Result<()>> + Send;
     fn create(&self, spec: &ContainerSpec) -> impl Future<Output = Result<String>> + Send;
     fn start(&self, id: &str) -> impl Future<Output = Result<()>> + Send;
     fn stop(&self, id: &str, timeout: Duration) -> impl Future<Output = Result<()>> + Send;
@@ -84,6 +98,25 @@ impl Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// A registry account, from a pod's `imagePullSecrets`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Login {
+    /// As a Docker config's `auths` names it: `ghcr.io`,
+    /// `https://index.docker.io/v1/`.
+    pub registry: String,
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for Login {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Login")
+            .field("registry", &self.registry)
+            .field("username", &self.username)
+            .finish_non_exhaustive()
+    }
+}
 
 /// A container to create.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

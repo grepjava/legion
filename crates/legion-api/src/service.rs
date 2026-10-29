@@ -203,6 +203,11 @@ pub struct PodSpec {
     pub containers: Vec<Container>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<PodVolume>,
+    /// Secrets in the task's namespace holding registry logins for the
+    /// pod's images, each a Docker config (`{"auths": {"<registry>":
+    /// {"auth": "<base64 of user:password>"}}}`, as `docker login` writes).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_pull_secrets: Vec<String>,
     #[serde(default)]
     pub restart_policy: RestartPolicy,
     /// Time between the stop signal and SIGKILL.
@@ -221,6 +226,9 @@ impl PodSpec {
                 field(path, "containers"),
                 "a pod needs at least one container",
             ));
+        }
+        for (i, name) in self.image_pull_secrets.iter().enumerate() {
+            check_name(&index(path, "imagePullSecrets", i), name)?;
         }
         let mut volumes = BTreeSet::new();
         for (i, v) in self.volumes.iter().enumerate() {
@@ -294,8 +302,20 @@ impl PodSpec {
         self.init_containers.iter().chain(&self.containers)
     }
 
-    /// Every secret and config the pod's containers use.
+    /// Every secret and config the pod uses: its containers' and its
+    /// registry logins. The node may read these.
     pub fn data_refs(&self) -> std::collections::BTreeSet<(crate::Kind, String)> {
+        let mut refs = self.container_data_refs();
+        refs.extend(
+            self.image_pull_secrets
+                .iter()
+                .map(|n| (crate::Kind::Secret, n.clone())),
+        );
+        refs
+    }
+
+    /// Every secret and config the pod's containers use.
+    pub fn container_data_refs(&self) -> std::collections::BTreeSet<(crate::Kind, String)> {
         use crate::Kind;
         let mut refs = std::collections::BTreeSet::new();
         for c in self.containers() {

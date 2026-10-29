@@ -52,7 +52,7 @@ async fn pulls_from_docker_hub() {
     .unwrap();
     let started = std::time::Instant::now();
     let image = store
-        .pull("freebsd/freebsd-runtime:15.1", None)
+        .pull("freebsd/freebsd-runtime:15.1", None, "t")
         .await
         .unwrap();
     eprintln!("pulled in {:?}: {image:?}", started.elapsed());

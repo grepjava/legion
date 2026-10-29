@@ -105,9 +105,9 @@ async fn pods_of_jails() {
         .unwrap(),
     );
     let rt = runtime(&sys, &images, dir.as_path(), &base);
-    assert!(!rt.image_exists(IMAGE).await.unwrap());
-    rt.pull(IMAGE).await.unwrap();
-    assert!(rt.image_exists(IMAGE).await.unwrap());
+    assert!(!rt.image_usable(IMAGE, "shop").await.unwrap());
+    rt.pull(IMAGE, "shop", &[]).await.unwrap();
+    assert!(rt.image_usable(IMAGE, "shop").await.unwrap());
 
     // The pod: a VNET jail running nothing.
     let pod = rt

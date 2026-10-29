@@ -25,6 +25,7 @@ pub mod control;
 pub mod fake;
 mod files;
 pub mod ingress;
+mod logins;
 pub mod metrics;
 mod output;
 pub mod pod;
