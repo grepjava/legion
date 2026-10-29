@@ -844,6 +844,18 @@ async fn nodes_registering_at_once_get_their_own_subnets() {
     assert_eq!(distinct.len(), 8, "{subnets:?}");
     // Registering again keeps the subnet.
     assert_eq!(register(clients[3].clone()).await, subnets[&3]);
+    // So does a node deleted and registering again: the network is not full.
+    first
+        .objects()
+        .await
+        .delete(DeleteRequest {
+            r#ref: Some(get("Node", "", "w3")),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(register(clients[3].clone()).await, subnets[&3]);
+    assert_eq!(node_state(&first, "w3").as_deref(), Some("ready"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

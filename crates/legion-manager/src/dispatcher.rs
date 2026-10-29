@@ -215,10 +215,25 @@ impl DispatcherService {
         let key = ObjectKey::new(Kind::Node, "", name);
         for _ in 0..ATTEMPTS {
             let existing = self.get(&key)?;
+            if existing.is_none() {
+                // The Node comes before its subnet's reservation, so a
+                // reservation without a Node is never one being made and
+                // may be reused. Its state is unknown, and it takes no
+                // tasks, until the status below.
+                let spec = serde_json::to_value(NodeSpec::default()).map_err(internal)?;
+                let mut node = Object::new(Kind::Node, "", name, spec);
+                node.status = serde_json::to_value(NodeStatus::default()).map_err(internal)?;
+                match self.write(node, Precondition::MustNotExist).await? {
+                    Outcome::Written(_) | Outcome::Conflict { .. } => continue,
+                    other => return Err(unexpected(other)),
+                }
+            }
+            let Some(mut node) = existing else {
+                continue;
+            };
             let mut status = status.clone();
-            status.pod_cidr = match existing
-                .as_ref()
-                .and_then(|n| serde_json::from_value::<NodeStatus>(n.status.clone()).ok())
+            status.pod_cidr = match serde_json::from_value::<NodeStatus>(node.status.clone())
+                .ok()
                 .and_then(|s| s.pod_cidr)
             {
                 Some(cidr) => Some(cidr),
@@ -228,23 +243,12 @@ impl DispatcherService {
                 pod_cidr: status.pod_cidr.clone().unwrap_or_default(),
             };
             let status = serde_json::to_value(&status).map_err(internal)?;
-            let (object, precondition) = match existing {
-                Some(mut node) => {
-                    if node.status == status {
-                        return Ok(response);
-                    }
-                    node.status = status;
-                    let version = node.metadata.version;
-                    (node, Precondition::Version(version))
-                }
-                None => {
-                    let spec = serde_json::to_value(NodeSpec::default()).map_err(internal)?;
-                    let mut node = Object::new(Kind::Node, "", name, spec);
-                    node.status = status;
-                    (node, Precondition::MustNotExist)
-                }
-            };
-            match self.write(object, precondition).await? {
+            if node.status == status {
+                return Ok(response);
+            }
+            node.status = status;
+            let precondition = Precondition::Version(node.metadata.version);
+            match self.write(node, precondition).await? {
                 Outcome::Written(_) => {
                     // A node that registers is alive.
                     self.seen
@@ -283,14 +287,18 @@ impl DispatcherService {
                     .ok()?
                     .pod_cidr
             });
-            let taken = held
-                .values()
-                .cloned()
-                .chain(in_status)
-                .filter_map(|c| c.parse().ok())
+            let in_status: Vec<String> = in_status.collect();
+            let names: BTreeSet<&str> = nodes
+                .objects
+                .iter()
+                .map(|n| n.metadata.name.as_str())
                 .collect();
-            let subnet = legion_net::free_node_subnet(&taken)
+            let (subnet, released) = choose_subnet(&held, &in_status, &names)
                 .ok_or_else(|| Status::resource_exhausted("the cluster pod network is full"))?;
+            if let Some(gone) = released {
+                tracing::info!(node = %name, subnet = %subnet, from = %gone, "reusing a deleted node's subnet");
+                held.remove(&gone);
+            }
             held.insert(name.to_owned(), subnet.to_string());
             let spec = serde_json::to_value(&held).map_err(internal)?;
             let precondition = existing.map_or(Precondition::MustNotExist, |o| {
@@ -1212,6 +1220,34 @@ fn invalid(e: impl std::fmt::Display) -> Status {
     Status::invalid_argument(e.to_string())
 }
 
+/// A subnet for a node not in `held`: the lowest neither reserved (`held`)
+/// nor in a Node's status (`in_status`); else, the network being full,
+/// the lowest reserved for a node whose Node is gone (not in `nodes`),
+/// with that node's name to release. A deleted node keeps its subnet until
+/// then, so one that rejoins soon has it back.
+fn choose_subnet(
+    held: &BTreeMap<String, String>,
+    in_status: &[String],
+    nodes: &BTreeSet<&str>,
+) -> Option<(legion_sys::Ipv4Net, Option<String>)> {
+    let taken = held
+        .values()
+        .chain(in_status)
+        .filter_map(|c| c.parse().ok())
+        .collect();
+    if let Some(free) = legion_net::free_node_subnet(&taken) {
+        return Some((free, None));
+    }
+    let in_status: BTreeSet<legion_sys::Ipv4Net> =
+        in_status.iter().filter_map(|c| c.parse().ok()).collect();
+    held.iter()
+        .filter(|(name, _)| !nodes.contains(name.as_str()))
+        .filter_map(|(name, c)| Some((c.parse::<legion_sys::Ipv4Net>().ok()?, name)))
+        .filter(|(c, _)| !in_status.contains(c))
+        .min_by_key(|(c, _)| *c)
+        .map(|(c, name)| (c, Some(name.clone())))
+}
+
 /// Node subnets by node name, in the reserved namespace.
 fn subnets_key() -> ObjectKey {
     ObjectKey::new(Kind::Config, crate::join::SYSTEM_NAMESPACE, "node-subnets")
@@ -1223,4 +1259,44 @@ fn internal(e: impl std::fmt::Display) -> Status {
 
 fn unexpected(outcome: Outcome) -> Status {
     Status::internal(format!("unexpected outcome {outcome:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn subnet(n: u32) -> String {
+        legion_net::node_subnet(n).unwrap().to_string()
+    }
+
+    #[test]
+    fn a_deleted_nodes_subnet_is_reused_only_once_the_network_is_full() {
+        let mut held: BTreeMap<String, String> = [("n0", 0), ("gone", 1), ("n2", 2)]
+            .into_iter()
+            .map(|(name, n)| (name.to_owned(), subnet(n)))
+            .collect();
+        let nodes: BTreeSet<&str> = ["n0", "n2", "new"].into();
+        // Room left: the lowest free subnet, the deleted node's kept.
+        let (free, released) = choose_subnet(&held, &[], &nodes).unwrap();
+        assert_eq!((free.to_string(), released), (subnet(3), None));
+
+        // Full: the deleted node's subnet, and its name to release.
+        let count = (0..).map_while(legion_net::node_subnet).count() as u32;
+        for n in 3..count {
+            held.insert(format!("n{n}"), subnet(n));
+        }
+        let mut nodes: BTreeSet<&str> = held.keys().map(String::as_str).collect();
+        nodes.remove("gone");
+        let (reused, released) = choose_subnet(&held, &[], &nodes).unwrap();
+        assert_eq!(
+            (reused.to_string(), released.as_deref()),
+            (subnet(1), Some("gone"))
+        );
+
+        // Not one a node still holds in its status, from before
+        // reservations, and nothing when no node is gone.
+        assert_eq!(choose_subnet(&held, &[subnet(1)], &nodes), None);
+        nodes.insert("gone");
+        assert_eq!(choose_subnet(&held, &[], &nodes), None);
+    }
 }

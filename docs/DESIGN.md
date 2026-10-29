@@ -587,7 +587,12 @@ default `10.88.0.0/16`, on a host that also runs Podman, for example).
   `wg set`; S6 showed 100 peers added and removed in under a second with no
   loss on existing peers.
 - **Built** (`legion-net`, phase 1): a node is given the lowest free /24 of
-  the pod CIDR when it first registers, kept in `Node.status.podCidr`. The
+  the pod CIDR when it first registers, kept in `Node.status.podCidr` and
+  reserved under its name (`Config/legion-system/node-subnets`). A deleted
+  node keeps its reservation, so it has the same /24 back if it rejoins,
+  until the 256 are all taken: then a new node takes the lowest one whose
+  Node is gone. A new Node is written before its reservation, so a
+  reservation without a Node is never one being made. The
   agent allocates pod addresses from it (the lowest free one, recorded in
   `Task.status.ip`, kept across agent restarts), and renames each pod's host
   end `lp<last 12 hex digits of the task uid>`, which finds it again after a
