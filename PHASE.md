@@ -303,9 +303,8 @@ remote FreeBSD server reached through a WireGuard site tunnel.
 
 Nothing left in phase 2.
 
-Smaller follow-ups: a node's advertised WireGuard endpoint replaces the one
-WireGuard learned, so a node behind NAT cannot be reached by its peers'
-replies alone.
+Smaller follow-ups: none left (nodes behind NAT and node subnets: see
+Hardening).
 
 ## Phase 3 — K8s-lite
 
@@ -1027,9 +1026,23 @@ real, in the order agreed with the user.
   (the lowest free while any is, then a gone node's, never one still in
   a Node's status, none when no node is gone); nodes registering at once
   still get their own; a deleted node registering again has its own back.
+- **Workers behind NAT** (DESIGN.md §5.3). Each change to the peer list
+  set every peer's advertised WireGuard endpoint again, replacing the one
+  WireGuard had learned from the peer's packets; for a node behind NAT,
+  which advertises an address of its own network, that learned one is
+  the only one that reaches it, so it was cut off until its next
+  keepalive. Now the advertised endpoint is set only when a peer is new
+  or advertises another than in the list applied before, and otherwise
+  the endpoint WireGuard has stands, also after an agent restart. Tested:
+  in the mesh unit test (new, moved, learned kept across list changes
+  and a restart, then a new advertised one taken); on FreeBSD 15.1 in
+  the mesh lab, node 3 behind a NAT (pf on it sends WireGuard from
+  another port and blocks the advertised one) is reached by the others
+  from its NAT's port, and still right after the peer list changes; with
+  the old rule, that last ping fails.
 
 ### To do, in order
 
 Nothing left in the hardening agreed with the user. Candidates from the
-phases' follow-ups: a FreeBSD port; nodes behind NAT.
+phases' follow-ups: a FreeBSD port.
 

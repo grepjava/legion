@@ -622,12 +622,16 @@ default `10.88.0.0/16`, on a host that also runs Podman, for example).
   does not cut traffic. Down nodes stay peers until their Node is removed.
 - **Reachability**: managers must reach each other's advertised addresses
   (Raft, both ways), every agent must reach a manager, and nodes must reach
-  each other's WireGuard endpoints. A node behind NAT cannot be one today:
-  its advertised address is unreachable from outside, and the endpoint it
-  advertises replaces the one its peers' WireGuard learned from its
-  keepalives. Such a node joins through a site tunnel or VPN and
-  advertises its address there (the phase 2 exit test does this for a
-  remote server); traversing NAT without one is later work.
+  each other's WireGuard endpoints, except that a worker behind NAT may
+  be reached through its own keepalives. The endpoint it advertises (an
+  address of its own network) is set on a peer only when the peer is new
+  or advertises another; otherwise the endpoint WireGuard learned from
+  its packets, its NAT's, stands, also across agent restarts. So nodes
+  with public addresses reach it within one keepalive of its joining.
+  Two nodes behind different NATs do not reach each other (no relay),
+  nor does a manager behind NAT serve Raft; those join through a site
+  tunnel or VPN and advertise their address there, as the phase 2 exit
+  test does for a remote server.
 - **Bridge sysctls**: `net.link.bridge.pfil_*` are per-VNET, and Legion runs
   in the host VNET, so they apply to every bridge on the host, other
   container runtimes' included. Load balancing needs none of them (the hairpin NAT rule in 5.4

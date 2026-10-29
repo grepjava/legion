@@ -102,8 +102,13 @@ impl Mesh {
     }
 
     /// Makes `wg0`'s peers exactly `peers`, leaving out this node's own
-    /// subnet, and touching only peers that changed.
-    pub fn apply(&self, sys: &dyn Sys, peers: &[Peer]) -> Result<(), Error> {
+    /// subnet, and touching only peers that changed. `before` is the list
+    /// applied last (empty at first): a peer's advertised endpoint is set
+    /// when the peer is new to `wg0` or advertises another than in
+    /// `before`, and otherwise the one WireGuard has stands. That may be
+    /// one it learned from the peer's packets, the only one that reaches a
+    /// node behind NAT, which advertises an address of its own network.
+    pub fn apply(&self, sys: &dyn Sys, peers: &[Peer], before: &[Peer]) -> Result<(), Error> {
         let own = self.subnet.network();
         let wanted: BTreeMap<&str, WgPeer> = peers
             .iter()
@@ -137,14 +142,27 @@ impl Mesh {
         }
         for (key, want) in &wanted {
             let have = current.iter().find(|p| p.public_key == *key);
-            // An endpoint WireGuard learned stands unless we know one.
+            let advertised = |list: &[Peer]| {
+                list.iter()
+                    .find(|p| p.public_key == *key)
+                    .map(|p| p.endpoint.clone())
+            };
+            let moved = match advertised(before) {
+                Some(was) => was != want.endpoint,
+                None => false,
+            };
+            let mut want = want.clone();
+            if have.is_some_and(|h| h.endpoint.is_some()) && !moved {
+                // Unset, WireGuard keeps the endpoint it has.
+                want.endpoint = None;
+            }
             let same = have.is_some_and(|h| {
                 h.allowed_ips == want.allowed_ips
                     && h.keepalive == want.keepalive
                     && (want.endpoint.is_none() || h.endpoint == want.endpoint)
             });
             if !same {
-                sys.wg_set_peer(INTERFACE, want)?;
+                sys.wg_set_peer(INTERFACE, &want)?;
                 tracing::info!(peer = %key, endpoint = ?want.endpoint, "set a WireGuard peer");
             }
         }
@@ -218,8 +236,8 @@ mod tests {
         let me = peer("pub:key1", Some("192.0.2.1:51820"), "10.200.1.0/24");
         let two = peer("pub:key2", Some("192.0.2.2:51820"), "10.200.2.0/24");
         let three = peer("pub:key3", None, "10.200.3.0/24");
-        mesh.apply(&sys, &[me.clone(), two.clone(), three.clone()])
-            .unwrap();
+        let first = [me.clone(), two.clone(), three.clone()];
+        mesh.apply(&sys, &first, &[]).unwrap();
         let peers = sys.wireguard(INTERFACE).unwrap().peers;
         assert_eq!(peers.keys().collect::<Vec<_>>(), ["pub:key2", "pub:key3"]);
         assert_eq!(
@@ -257,7 +275,8 @@ mod tests {
             },
         );
         let moved = peer("pub:key2", Some("192.0.2.22:51820"), "10.200.2.0/24");
-        mesh.apply(&sys, &[me, moved, three]).unwrap();
+        let second = [me.clone(), moved.clone(), three.clone()];
+        mesh.apply(&sys, &second, &first).unwrap();
         let peers = sys.wireguard(INTERFACE).unwrap().peers;
         assert_eq!(peers.keys().collect::<Vec<_>>(), ["pub:key2", "pub:key3"]);
         assert_eq!(
@@ -266,7 +285,42 @@ mod tests {
         );
         assert_eq!(peers["pub:key3"], learned);
 
-        mesh.apply(&sys, &[]).unwrap();
+        // Four is behind NAT: it advertises an address of its own network,
+        // set while it is new, and reaches us from its NAT's.
+        let four = peer("pub:key4", Some("192.168.1.4:51820"), "10.200.4.0/24");
+        let third = [me.clone(), moved.clone(), three.clone(), four.clone()];
+        mesh.apply(&sys, &third, &second).unwrap();
+        let peers = sys.wireguard(INTERFACE).unwrap().peers;
+        assert_eq!(
+            peers["pub:key4"].endpoint.as_deref(),
+            Some("192.168.1.4:51820")
+        );
+        let nat = WgPeer {
+            endpoint: Some("203.0.113.9:61000".into()),
+            ..peers["pub:key4"].clone()
+        };
+        sys.add_wg_peer(INTERFACE, nat.clone());
+        // The list changes elsewhere, and after a restart (nothing applied
+        // before): the endpoint learned stays.
+        let five = peer("pub:key5", Some("192.0.2.5:51820"), "10.200.5.0/24");
+        let fourth = [me.clone(), moved, three, four, five];
+        mesh.apply(&sys, &fourth, &third).unwrap();
+        mesh.apply(&sys, &fourth, &[]).unwrap();
+        let peers = sys.wireguard(INTERFACE).unwrap().peers;
+        assert_eq!(peers["pub:key4"], nat);
+        assert_eq!(peers["pub:key3"], learned);
+        // Until it advertises another.
+        let mut fifth = fourth.clone();
+        fifth[3].endpoint = Some("192.168.7.4:51820".into());
+        mesh.apply(&sys, &fifth, &fourth).unwrap();
+        assert_eq!(
+            sys.wireguard(INTERFACE).unwrap().peers["pub:key4"]
+                .endpoint
+                .as_deref(),
+            Some("192.168.7.4:51820")
+        );
+
+        mesh.apply(&sys, &[], &fifth).unwrap();
         assert!(sys.wireguard(INTERFACE).unwrap().peers.is_empty());
     }
 }

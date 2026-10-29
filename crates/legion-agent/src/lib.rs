@@ -595,6 +595,8 @@ async fn mesh_peers(
     };
     // Whether a list has arrived.
     let mut known = false;
+    // The list applied last.
+    let mut applied: Arc<Vec<legion_net::mesh::Peer>> = Arc::default();
     loop {
         let changed = if retry {
             tokio::select! {
@@ -621,16 +623,23 @@ async fn mesh_peers(
             })
             .collect();
         let m = mesh.clone();
+        let list = Arc::new(list);
+        let (now, before) = (list.clone(), applied.clone());
         let result = task::blocking(&sys, move |sys| {
             m.ensure(sys)?;
             if known {
-                m.apply(sys, &list)?;
+                m.apply(sys, &now, &before)?;
             }
             Ok::<_, legion_net::Error>(())
         })
         .await;
         retry = match result {
-            Ok(()) => false,
+            Ok(()) => {
+                if known {
+                    applied = list;
+                }
+                false
+            }
             Err(e) => {
                 tracing::warn!("updating the WireGuard mesh: {e}; retrying");
                 true

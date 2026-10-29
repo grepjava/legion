@@ -1,7 +1,9 @@
 //! The mesh and services across nodes, on FreeBSD itself. Three VNET jails
 //! are the nodes and run Legion's network code through `jexec`; their pods
 //! are child jails. A fourth jail joins the nodes' links like a switch and
-//! is a client outside the cluster. Run as root on the host (it touches
+//! is a client outside the cluster. Node 3 is behind NAT: its WireGuard
+//! traffic leaves from another port, and nothing reaches the one it
+//! advertises. Run as root on the host (it touches
 //! nothing outside its jails, named `lmesh-*`, which it removes):
 //!
 //! ```sh
@@ -191,8 +193,17 @@ fn pods_across_nodes() {
         ));
         must(&format!("jexec {jail} sysctl net.inet.ip.forwarding=1"));
         must(&format!("jexec {jail} sysctl net.inet6.ip6.forwarding=1"));
-        // The node's own pf, with Legion's anchors hooked in.
-        let hooks = lb::HOOKS.join("\n") + "\npass all\n";
+        // The node's own pf, with Legion's anchors hooked in. Node 3's
+        // also stands for a NAT in front of it: WireGuard leaves from port
+        // 61000, and only answers come back to it.
+        let mut hooks = lb::HOOKS.join("\n") + "\npass all\n";
+        if n == 3 {
+            hooks = format!(
+                "nat on {a} inet proto udp from ({a}) port {port} to any -> ({a}) port 61000\n\
+                 {hooks}block in quick on {a} proto udp to port {{ {port} 61000 }}\n",
+                port = mesh::PORT
+            );
+        }
         let (ok, out) = sh(&format!(
             "printf '{}' | jexec {jail} pfctl -f -",
             hooks.replace('"', "\\\"")
@@ -227,9 +238,22 @@ fn pods_across_nodes() {
     }
     let peers: Vec<Peer> = nodes.iter().map(|n| n.peer.clone()).collect();
     for n in &nodes {
-        n.mesh.apply(&n.sys, &peers).unwrap();
-        n.mesh.apply(&n.sys, &peers).unwrap(); // nothing changes
+        n.mesh.apply(&n.sys, &peers, &[]).unwrap();
+        n.mesh.apply(&n.sys, &peers, &peers).unwrap(); // nothing changes
         assert_eq!(n.sys.wg_peers(mesh::INTERFACE).unwrap().len(), 2);
+    }
+    // Node 3 behind NAT is reached once it has reached the others, from
+    // its NAT's port.
+    let n3 = "100.64.3.1";
+    for n in &nodes[..2] {
+        let reached = (0..30).any(|_| sh(&format!("jexec {} ping -c1 -t1 {n3}", n.jail)).0);
+        assert!(reached, "{} reaches node 3", n.jail);
+        let wg = must(&format!(
+            "jexec {} wg show {} endpoints",
+            n.jail,
+            mesh::INTERFACE
+        ));
+        assert!(wg.contains("192.168.252.3:61000"), "{wg}");
     }
 
     // Pods: a client and a server on node 1, a server on node 2, none on
@@ -342,13 +366,25 @@ fn pods_across_nodes() {
         .filter(|p| p.subnet != nodes[1].peer.subnet)
         .cloned()
         .collect();
-    nodes[0].mesh.apply(&nodes[0].sys, &without).unwrap();
+    nodes[0]
+        .mesh
+        .apply(&nodes[0].sys, &without, &peers)
+        .unwrap();
     assert_eq!(nodes[0].sys.wg_peers(mesh::INTERFACE).unwrap().len(), 1);
     let (ok, _) = nodes[0].pod("c", &format!("ping -c1 -t2 {w2}"));
     assert!(!ok, "w2 is still reachable without its node as a peer");
-    nodes[0].mesh.apply(&nodes[0].sys, &peers).unwrap();
+    // The list changed, and node 3 behind NAT is still reached: the
+    // endpoint learned stands over the one it advertises.
+    let (ok, out) = sh(&format!("jexec {} ping -c1 -t2 {n3}", nodes[0].jail));
+    assert!(ok, "node 3 after the peers changed: {out}");
+    nodes[0]
+        .mesh
+        .apply(&nodes[0].sys, &peers, &without)
+        .unwrap();
     let (ok, out) = nodes[0].pod("c", &format!("ping -c2 -t3 {w2}"));
     assert!(ok, "c to w2 again: {out}");
+    let (ok, out) = sh(&format!("jexec {} ping -c1 -t2 {n3}", nodes[0].jail));
+    assert!(ok, "node 3 again: {out}");
 
     drop(lab);
     let left = must("ifconfig -l");
