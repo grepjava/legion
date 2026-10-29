@@ -158,7 +158,11 @@ pub trait Sys: Send + Sync {
     /// Rolls a dataset back to `snapshot` (`<dataset>@<name>`), destroying
     /// the snapshots taken after it (`zfs rollback -r`).
     fn zfs_rollback(&self, snapshot: &str) -> Result<()>;
-    /// Destroys a dataset or, if `name` has an `@`, a snapshot.
+    /// Makes `dataset` a writable clone of `snapshot` (`<dataset>@<name>`),
+    /// with `props` set on it.
+    fn zfs_clone(&self, snapshot: &str, dataset: &str, props: &[(&str, &str)]) -> Result<()>;
+    /// Destroys a dataset or, if `name` has an `@`, a snapshot. A snapshot
+    /// that clones were made from cannot be destroyed, nor its dataset.
     fn zfs_destroy(&self, name: &str, recursive: bool) -> Result<()>;
     /// Writes a `zfs send` stream of `snapshot` (`<dataset>@<name>`) to
     /// `out`: everything, or only what changed since the dataset's snapshot

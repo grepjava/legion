@@ -739,12 +739,27 @@ replaces Podman and ocijail.
   layers and run as child jails of a `persist` VNET pod jail; about 55
   ms to start against Podman's 900, 1 KB of disk per container against
   a full copy.
+- **Image store** (crate `legion-image`; `Sys::zfs_clone`): image
+  references as Podman reads them; a registry client (token and basic
+  auth, platform chosen from indexes, every blob's digest checked,
+  redirects to CDNs, plain HTTP only for registries named so); layers
+  decompressed (gzip, zstd) and checked against their `diff_id` before
+  anything is extracted, whiteouts applied without following links and
+  clearing file flags, then bsdtar; each layer a clone of the one below,
+  snapshotted by chain id, so images share layers; import of OCI layout
+  directories; removal and prune leave layers that containers were
+  cloned from until they are gone. Tested: references, configs in either
+  case, platform choice, whiteouts (and staying inside the root); against
+  a registry served in the test: token auth, redirects, shared layers
+  fetched once, tampered blobs and false `diff_id`s refused with nothing
+  left behind, Linux-only images refused, removal held by a container's
+  clone; on FreeBSD with real ZFS: `freebsd-runtime` from Docker Hub
+  (12 s) with its `schg` and set-uid files and numeric owners, and a
+  whiteout and a replacement of `schg` files.
 
 ### To do, in order
 
-1. `legion-image`: registry client and ZFS layer store (pull, whiteouts,
-   image configs, removal of unused images).
-2. The jail runtime in the agent: containers as clones and jails, the
+1. The jail runtime in the agent: containers as clones and jails, the
    `legion jail-shim` supervisor, logs, exec, events, recovery after an
    agent restart; `--runtime jail|podman` on the daemon.
 3. The exit tests on the jail runtime, then it becomes the default.

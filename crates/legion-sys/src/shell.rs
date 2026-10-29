@@ -692,6 +692,15 @@ impl<R: Runner> Sys for Shell<R> {
             .map(drop)
     }
 
+    fn zfs_clone(&self, snapshot: &str, dataset: &str, props: &[(&str, &str)]) -> Result<()> {
+        let mut a = args(["clone"]);
+        for (k, v) in props {
+            a.extend(["-o".to_owned(), format!("{k}={v}")]);
+        }
+        a.extend([snapshot.to_owned(), dataset.to_owned()]);
+        self.run("zfs", &a).map(drop)
+    }
+
     fn zfs_destroy(&self, name: &str, recursive: bool) -> Result<()> {
         let a = if recursive {
             args(["destroy", "-r", name])
@@ -1392,6 +1401,10 @@ mod tests {
                 err("cannot open 'tank/nothing': dataset does not exist"),
             ),
             ("zfs snapshot tank/legion/volumes/shop/data@t1", ok("")),
+            (
+                "zfs clone -o mountpoint=/c tank/legion/volumes/shop/data@t1 tank/c",
+                ok(""),
+            ),
             ("zfs destroy -r tank/legion/volumes/shop/data", ok("")),
         ]);
         sh.zfs_create("tank/legion/volumes/shop/data", &[("quota", "10737418240")])
@@ -1403,6 +1416,12 @@ mod tests {
         assert_eq!(ds[2].mountpoint, None);
         assert!(sh.zfs_list("tank/nothing").unwrap().is_empty());
         sh.zfs_snapshot("tank/legion/volumes/shop/data@t1").unwrap();
+        sh.zfs_clone(
+            "tank/legion/volumes/shop/data@t1",
+            "tank/c",
+            &[("mountpoint", "/c")],
+        )
+        .unwrap();
         sh.zfs_destroy("tank/legion/volumes/shop/data", true)
             .unwrap();
     }

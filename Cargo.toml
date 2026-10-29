@@ -12,6 +12,7 @@ publish = false
 [workspace.dependencies]
 legion-agent = { path = "crates/legion-agent" }
 legion-api = { path = "crates/legion-api" }
+legion-image = { path = "crates/legion-image" }
 legion-manager = { path = "crates/legion-manager" }
 legion-net = { path = "crates/legion-net" }
 legion-pki = { path = "crates/legion-pki" }

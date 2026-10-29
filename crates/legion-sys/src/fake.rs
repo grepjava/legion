@@ -59,6 +59,8 @@ struct State {
     next_snapshot: u64,
     /// What tests wrote into datasets, and what their snapshots hold.
     contents: BTreeMap<String, Vec<u8>>,
+    /// Clones, with the snapshot each was made from.
+    origins: BTreeMap<String, String>,
     /// tmpfs mount points, with their size.
     mounts: BTreeMap<String, Option<u64>>,
     default_interface: Option<String>,
@@ -837,8 +839,59 @@ impl Sys for FakeSys {
         Ok(())
     }
 
+    fn zfs_clone(&self, snapshot: &str, dataset: &str, props: &[(&str, &str)]) -> Result<()> {
+        let mut s = self.state();
+        if !s.snapshots.contains_key(snapshot) {
+            return Err(fail(
+                "zfs clone",
+                format!("cannot open '{snapshot}': dataset does not exist"),
+            ));
+        }
+        if s.datasets.contains_key(dataset) {
+            return Err(fail(
+                "zfs clone",
+                format!("cannot create '{dataset}': dataset already exists"),
+            ));
+        }
+        let parent = dataset.rsplit_once('/').map_or("", |(p, _)| p);
+        if !s.datasets.contains_key(parent) {
+            return Err(fail(
+                "zfs clone",
+                format!("cannot create '{dataset}': parent does not exist"),
+            ));
+        }
+        let mut ds = Dataset {
+            name: dataset.to_owned(),
+            mountpoint: Some(format!("/{dataset}")),
+            quota: None,
+        };
+        for (k, v) in props {
+            apply_prop(&mut ds, k, v)?;
+        }
+        s.datasets.insert(dataset.to_owned(), ds);
+        let data = s.contents.get(snapshot).cloned().unwrap_or_default();
+        s.contents.insert(dataset.to_owned(), data);
+        s.origins.insert(dataset.to_owned(), snapshot.to_owned());
+        Ok(())
+    }
+
     fn zfs_destroy(&self, name: &str, recursive: bool) -> Result<()> {
         let mut s = self.state();
+        // Clones of the snapshot, or of any of the dataset's, outside what
+        // is destroyed.
+        let gone = |d: &str| {
+            d == name || d.starts_with(&format!("{name}@")) || d.starts_with(&format!("{name}/"))
+        };
+        if let Some((clone, _)) = s
+            .origins
+            .iter()
+            .find(|(c, o)| gone(o) && !(recursive && gone(c)))
+        {
+            return Err(fail(
+                "zfs destroy",
+                format!("cannot destroy '{name}': snapshot has dependent clones ({clone})"),
+            ));
+        }
         if recursive && s.failing.remove("zfs destroy -r") {
             return Err(fail(
                 "zfs destroy",
@@ -877,6 +930,7 @@ impl Sys for FakeSys {
             .retain(|d, _| !d.starts_with(&snap) && !d.starts_with(&child));
         s.contents
             .retain(|d, _| d != name && !d.starts_with(&snap) && !d.starts_with(&child));
+        s.origins.retain(|d, _| d != name && !d.starts_with(&child));
         Ok(())
     }
 
@@ -1220,6 +1274,36 @@ mod tests {
         assert_eq!(sys.zfs_list("tank/legion").unwrap().len(), 1);
         assert!(sys.snapshots().is_empty());
         assert!(sys.zfs_list("tank/nothing").unwrap().is_empty());
+    }
+
+    #[test]
+    fn zfs_clones_keep_their_origin() {
+        let sys = FakeSys::new();
+        sys.zfs_create("tank/img/a", &[("mountpoint", "none")])
+            .unwrap();
+        sys.zfs_snapshot("tank/img/a@layer").unwrap();
+        sys.zfs_create("tank/ctr", &[]).unwrap();
+        sys.zfs_clone("tank/img/a@layer", "tank/ctr/c1", &[("mountpoint", "/c1")])
+            .unwrap();
+        assert!(
+            sys.zfs_clone("tank/img/a@layer", "tank/ctr/c1", &[])
+                .is_err()
+        );
+        assert!(
+            sys.zfs_clone("tank/img/b@layer", "tank/ctr/c2", &[])
+                .is_err()
+        );
+        assert_eq!(
+            sys.zfs_list("tank/ctr/c1").unwrap()[0]
+                .mountpoint
+                .as_deref(),
+            Some("/c1")
+        );
+        let busy = sys.zfs_destroy("tank/img/a@layer", false).unwrap_err();
+        assert!(busy.to_string().contains("dependent clones"), "{busy}");
+        assert!(sys.zfs_destroy("tank/img/a", true).is_err());
+        sys.zfs_destroy("tank/ctr/c1", false).unwrap();
+        sys.zfs_destroy("tank/img/a", true).unwrap();
     }
 
     #[test]
