@@ -15,9 +15,9 @@ async fn restore_node(c: &mut Cluster, id: u64, backup: &Backup) {
     c.stop(id).await;
     let dir = c.dir(id);
     set_aside(&dir, "old").unwrap();
-    restore(&dir, id, "n1:7470", backup).unwrap();
+    restore(&dir, id, "n1:7470", backup, None).unwrap();
     assert!(
-        restore(&dir, id, "n1:7470", backup).is_err(),
+        restore(&dir, id, "n1:7470", backup, None).is_err(),
         "over a store"
     );
 }
@@ -101,10 +101,10 @@ async fn a_manager_restarts_the_cluster_from_its_own_store() {
         c.stop(id).await;
     }
     c.stop(1).await;
-    let own = Backup::of_store(&c.dir(1)).unwrap();
+    let own = Backup::of_store(&c.dir(1), None).unwrap();
     assert!(own.version >= last);
     assert_eq!(own.objects.len(), 20);
-    assert!(Backup::of_store(&c.dir(1).join("missing")).is_err());
+    assert!(Backup::of_store(&c.dir(1).join("missing"), None).is_err());
     c.start(1).await;
     restore_node(&mut c, 1, &own).await;
     let store = c.start(1).await;
@@ -117,7 +117,7 @@ async fn a_manager_restarts_the_cluster_from_its_own_store() {
     drop(store);
     c.stop(1).await;
     let dir = c.dir(1);
-    assert!(Backup::of_store(&dir).is_ok());
+    assert!(Backup::of_store(&dir, None).is_ok());
     assert_eq!(
         set_aside(&dir, "old").unwrap(),
         Some(dir.join("store.redb.old-1"))

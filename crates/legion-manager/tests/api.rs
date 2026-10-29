@@ -1589,7 +1589,7 @@ async fn a_restored_manager_leads_alone_and_ignores_the_old_cluster() {
     let dir = first.stop_keeping().await;
     let id = legion_manager::node_id(dir.path()).unwrap();
     legion_store::set_aside(dir.path(), "old").unwrap();
-    legion_store::restore(dir.path(), id, &addr, &backup).unwrap();
+    legion_store::restore(dir.path(), id, &addr, &backup, None).unwrap();
     let listener = loop {
         match TcpListener::bind(&addr).await {
             Ok(l) => break l,

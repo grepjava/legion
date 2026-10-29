@@ -587,3 +587,26 @@ fn a_volume_is_asked_to_move() {
     let bad = legion(&d, &["volume", "move", "cache", "Not_A_Node"]);
     assert!(!bad.status.success());
 }
+
+#[test]
+fn the_daemon_seals_its_store() {
+    let d = start_daemon();
+    ok(&d, &["init"]);
+    let manifest = d._dir.path().join("secret.yaml");
+    std::fs::write(
+        &manifest,
+        "apiVersion: legion/v1\nkind: Secret\nmetadata: { name: db }\nspec: { text: correct-horse-battery }\n",
+    )
+    .unwrap();
+    ok(&d, &["apply", "-f", manifest.to_str().unwrap()]);
+    assert!(d._dir.path().join("pki/store.key").exists());
+    let dir = d.kill();
+    let store = std::fs::read(dir.path().join("store.redb")).unwrap();
+    // The text, and its base64 as the Secret's spec holds it.
+    for needle in ["correct-horse-battery", "Y29ycmVjdC1ob3JzZS1iYXR0ZXJ5"] {
+        assert!(
+            !store.windows(needle.len()).any(|w| w == needle.as_bytes()),
+            "{needle} in the store"
+        );
+    }
+}

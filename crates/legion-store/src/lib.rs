@@ -9,6 +9,7 @@
 //! the manager plugs in gRPC, tests plug in an in-process router.
 
 mod backup;
+mod cipher;
 mod log_store;
 mod state_machine;
 mod watch;
@@ -22,6 +23,7 @@ use openraft::{BasicNode, RaftNetworkFactory};
 use serde::{Deserialize, Serialize};
 
 pub use backup::{Backup, restore, set_aside};
+pub use cipher::StoreKey;
 pub use log_store::LogStore;
 pub use state_machine::{Listing, StateMachine};
 pub use watch::{Event, WatchError, Watcher};
@@ -86,6 +88,8 @@ pub enum Error {
     Decode(#[from] serde_json::Error),
     #[error("store still open after shutdown: another Store clone is alive")]
     StillOpen,
+    #[error("encryption: {0}")]
+    Sealed(String),
 }
 
 impl Error {
@@ -105,7 +109,8 @@ pub struct Store {
 }
 
 impl Store {
-    /// Opens (or creates) `dir/store.redb` and starts the Raft node.
+    /// Opens (or creates) `dir/store.redb` and starts the Raft node,
+    /// writing in the clear: for tests.
     pub async fn open<N>(
         id: NodeId,
         dir: &Path,
@@ -115,9 +120,26 @@ impl Store {
     where
         N: RaftNetworkFactory<TypeConfig>,
     {
+        Store::open_with(id, dir, None, config, network).await
+    }
+
+    /// Opens (or creates) `dir/store.redb`, every value sealed with `key`
+    /// (values from before it was encrypted still read), and starts the
+    /// Raft node.
+    pub async fn open_with<N>(
+        id: NodeId,
+        dir: &Path,
+        key: Option<&StoreKey>,
+        config: openraft::Config,
+        network: N,
+    ) -> Result<Store, Box<dyn std::error::Error + Send + Sync>>
+    where
+        N: RaftNetworkFactory<TypeConfig>,
+    {
         let db = Arc::new(redb::Database::create(dir.join("store.redb"))?);
-        let log = LogStore::open(db.clone())?;
-        let state = StateMachine::open(db)?;
+        let codec = Arc::new(cipher::Codec::new(key));
+        let log = LogStore::open_with(db.clone(), codec.clone())?;
+        let state = StateMachine::open_with(db, codec)?;
         let config = Arc::new(config.validate()?);
         let raft = Raft::new(id, config, network, log, state.clone()).await?;
         Ok(Store { raft, state })

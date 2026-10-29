@@ -71,9 +71,11 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         }
         None => None,
     };
+    let store_key = crate::pki::store_key(&opts.data_dir).context("the store's key")?;
     let manager = legion_manager::Manager::open(legion_manager::ManagerConfig {
         tls: Some(tls),
         vip,
+        store_key: Some(store_key),
         ..legion_manager::ManagerConfig::new(&opts.data_dir, &advertise)
     })
     .await
@@ -361,6 +363,7 @@ pub fn restore(
         bail!("{} is missing", id_file.display());
     }
     let id = legion_manager::node_id(data_dir).map_err(|e| anyhow::anyhow!(e))?;
+    let key = crate::pki::store_key(data_dir)?;
     let backup = match file {
         Some(file) => {
             let json =
@@ -368,7 +371,7 @@ pub fn restore(
             serde_json::from_slice(&json)
                 .with_context(|| format!("{} is not a Legion backup", file.display()))?
         }
-        None => legion_store::Backup::of_store(data_dir)?,
+        None => legion_store::Backup::of_store(data_dir, Some(&key))?,
     };
     backup.check()?;
     let Some(addr) = advertise.or_else(|| backup.managers.get(&id).cloned()) else {
@@ -379,7 +382,7 @@ pub fn restore(
         .as_secs()
         .to_string();
     let aside = legion_store::set_aside(data_dir, &suffix)?;
-    legion_store::restore(data_dir, id, &addr, &backup)?;
+    legion_store::restore(data_dir, id, &addr, &backup, Some(&key))?;
     println!(
         "restored {} objects at version {}; this manager ({addr}) is the cluster's only member",
         backup.objects.len(),

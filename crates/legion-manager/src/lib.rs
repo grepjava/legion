@@ -56,6 +56,9 @@ pub struct ManagerConfig {
     pub controllers: bool,
     /// The floating address managers share, and the system to set it with.
     pub vip: Option<(std::sync::Arc<dyn legion_sys::Sys>, vip::VipConfig)>,
+    /// The key the store seals its values with; `None` writes them in the
+    /// clear (tests).
+    pub store_key: Option<legion_store::StoreKey>,
 }
 
 impl ManagerConfig {
@@ -70,6 +73,7 @@ impl ManagerConfig {
             heartbeat: HEARTBEAT_PERIOD,
             controllers: true,
             vip: None,
+            store_key: None,
         }
     }
 }
@@ -125,8 +129,15 @@ impl Manager {
         std::fs::create_dir_all(&config.data_dir)?;
         let id = node_id(&config.data_dir)?;
         let network = GrpcNetwork::new(config.tls.as_ref().map(Tls::client));
-        let store = Store::open(id, &config.data_dir, config.raft, network).await?;
-        tracing::info!(node_id = id, advertise = %config.advertise, tls = config.tls.is_some(), "manager open");
+        let key = config.store_key.as_ref();
+        let store = Store::open_with(id, &config.data_dir, key, config.raft, network).await?;
+        tracing::info!(
+            node_id = id,
+            advertise = %config.advertise,
+            tls = config.tls.is_some(),
+            encrypted = key.is_some(),
+            "manager open"
+        );
         Ok(Manager {
             id,
             advertise: config.advertise,

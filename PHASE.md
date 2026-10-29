@@ -696,9 +696,20 @@ service and migrates between nodes.
   built binary on Windows took over 20 s once) and print its log if it
   does not come up.
 
+- **Encryption at rest** (`legion_store::cipher`, DESIGN.md §9): every
+  value a manager's store writes is sealed with ChaCha20-Poly1305 under
+  its own key, `pki/store.key`, bound to where it is stored; snapshots
+  travel in the clear between managers and are sealed by each; plain
+  stores from before still read and are sealed as written. Tested:
+  sealing and opening (another place, another key, no key, cut short),
+  openraft's storage conformance suite with encryption on, a secret
+  absent from the file (log and snapshot) and read back only with the
+  key, a plain store taking a key, and the daemon's own store.
+
 ### To do, in order
 
-1. Autolock, with encryption at rest (not built yet).
+1. Autolock: the data key and the managers' private keys sealed with an
+   unlock key the operator holds, `legion unlock` after a restart.
 
 Smaller follow-ups: memory limits for workloads with large shared memory
 (rctl counts it per process; `vmemoryuse` or a pod-wide allowance).

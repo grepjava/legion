@@ -11,6 +11,7 @@ publish.workspace = true
 legion-api.workspace = true
 openraft.workspace = true
 redb.workspace = true
+ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

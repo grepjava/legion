@@ -22,10 +22,14 @@ use crate::watch::{Event, Hub, WatchError, Watcher};
 use openraft::BasicNode;
 
 use crate::backup::Backup;
+use crate::cipher::Codec;
 use crate::{Command, Error, NodeId, Outcome, Precondition, TypeConfig};
 
 const OBJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("objects");
 const SM_META: TableDefinition<&str, &[u8]> = TableDefinition::new("sm_meta");
+/// The tables' names, as sealed values are bound to them.
+const OBJECTS_NAME: &str = "objects";
+const SM_META_NAME: &str = "sm_meta";
 
 const LAST_APPLIED: &str = "last_applied";
 const MEMBERSHIP: &str = "membership";
@@ -53,18 +57,25 @@ pub struct Listing {
 #[derive(Clone)]
 pub struct StateMachine {
     db: Arc<Database>,
+    codec: Arc<Codec>,
     hub: Arc<Hub>,
     snapshot_seq: Arc<AtomicU64>,
 }
 
 impl StateMachine {
-    pub fn open(db: Arc<Database>) -> Result<Self, Error> {
+    /// The state machine in `db`, its values sealed with `key` if given.
+    pub fn open(db: Arc<Database>, key: Option<&crate::StoreKey>) -> Result<Self, Error> {
+        StateMachine::open_with(db, Arc::new(Codec::new(key)))
+    }
+
+    pub(crate) fn open_with(db: Arc<Database>, codec: Arc<Codec>) -> Result<Self, Error> {
         let txn = db.begin_write().map_err(Error::db)?;
         txn.open_table(OBJECTS).map_err(Error::db)?;
         txn.open_table(SM_META).map_err(Error::db)?;
         txn.commit().map_err(Error::db)?;
         let mut sm = StateMachine {
             db,
+            codec,
             hub: Arc::new(Hub::new(0)),
             snapshot_seq: Arc::new(AtomicU64::new(0)),
         };
@@ -76,8 +87,9 @@ impl StateMachine {
     pub fn get(&self, key: &ObjectKey) -> Result<Option<Object>, Error> {
         let txn = self.db.begin_read().map_err(Error::db)?;
         let table = txn.open_table(OBJECTS).map_err(Error::db)?;
-        match table.get(key.to_string().as_str()).map_err(Error::db)? {
-            Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+        let key = key.to_string();
+        match table.get(key.as_str()).map_err(Error::db)? {
+            Some(v) => Ok(Some(self.codec.decode(OBJECTS_NAME, &key, v.value())?)),
             None => Ok(None),
         }
     }
@@ -87,7 +99,7 @@ impl StateMachine {
     pub fn list(&self, kind: Kind, namespace: Option<&str>) -> Result<Listing, Error> {
         let txn = self.db.begin_read().map_err(Error::db)?;
         let meta = txn.open_table(SM_META).map_err(Error::db)?;
-        let version = read_json::<Option<LogId<NodeId>>>(&meta, LAST_APPLIED)?
+        let version = read_json::<Option<LogId<NodeId>>>(&self.codec, &meta, LAST_APPLIED)?
             .flatten()
             .map_or(0, |id| id.index);
         let table = txn.open_table(OBJECTS).map_err(Error::db)?;
@@ -98,7 +110,7 @@ impl StateMachine {
             if !k.value().starts_with(&prefix) {
                 break;
             }
-            objects.push(serde_json::from_slice(v.value())?);
+            objects.push(self.codec.decode(OBJECTS_NAME, k.value(), v.value())?);
         }
         Ok(Listing { version, objects })
     }
@@ -106,9 +118,11 @@ impl StateMachine {
     pub fn applied_version(&self) -> Result<u64, Error> {
         let txn = self.db.begin_read().map_err(Error::db)?;
         let meta = txn.open_table(SM_META).map_err(Error::db)?;
-        Ok(read_json::<Option<LogId<NodeId>>>(&meta, LAST_APPLIED)?
-            .flatten()
-            .map_or(0, |id| id.index))
+        Ok(
+            read_json::<Option<LogId<NodeId>>>(&self.codec, &meta, LAST_APPLIED)?
+                .flatten()
+                .map_or(0, |id| id.index),
+        )
     }
 
     pub fn watch(&self, from_version: u64, kind: Option<Kind>) -> Result<Watcher, WatchError> {
@@ -123,10 +137,10 @@ impl StateMachine {
     pub fn backup(&self) -> Result<Backup, Error> {
         let txn = self.db.begin_read().map_err(Error::db)?;
         let meta = txn.open_table(SM_META).map_err(Error::db)?;
-        let version = read_json::<Option<LogId<NodeId>>>(&meta, LAST_APPLIED)?
+        let version = read_json::<Option<LogId<NodeId>>>(&self.codec, &meta, LAST_APPLIED)?
             .flatten()
             .map_or(0, |id| id.index);
-        let membership: Membership = read_json(&meta, MEMBERSHIP)?.unwrap_or_default();
+        let membership: Membership = read_json(&self.codec, &meta, MEMBERSHIP)?.unwrap_or_default();
         let managers = membership
             .membership()
             .nodes()
@@ -135,8 +149,8 @@ impl StateMachine {
         let table = txn.open_table(OBJECTS).map_err(Error::db)?;
         let mut objects = Vec::new();
         for item in table.iter().map_err(Error::db)? {
-            let (_, v) = item.map_err(Error::db)?;
-            objects.push(serde_json::from_slice(v.value())?);
+            let (k, v) = item.map_err(Error::db)?;
+            objects.push(self.codec.decode(OBJECTS_NAME, k.value(), v.value())?);
         }
         Ok(Backup {
             format: crate::backup::FORMAT,
@@ -150,6 +164,7 @@ impl StateMachine {
     /// `last`, and a snapshot of them for managers that join.
     pub(crate) fn restore_in(
         txn: &WriteTransaction,
+        codec: &Codec,
         last: LogId<NodeId>,
         membership: Membership,
         objects: &[Object],
@@ -157,24 +172,29 @@ impl StateMachine {
         {
             let mut table = txn.open_table(OBJECTS).map_err(Error::db)?;
             for object in objects {
-                let value = serde_json::to_vec(object)?;
+                let key = object.key().to_string();
+                let value = codec.encode(OBJECTS_NAME, &key, object)?;
                 table
-                    .insert(object.key().to_string().as_str(), value.as_slice())
+                    .insert(key.as_str(), value.as_slice())
                     .map_err(Error::db)?;
             }
         }
-        let data = serde_json::to_vec(&SnapshotData {
-            objects: objects.to_vec(),
-        })?;
+        let data = codec.encode(
+            SM_META_NAME,
+            SNAPSHOT_DATA,
+            &SnapshotData {
+                objects: objects.to_vec(),
+            },
+        )?;
         let meta = SnapshotMeta {
             last_log_id: Some(last),
             last_membership: membership.clone(),
             snapshot_id: format!("restored-{}", last.index),
         };
         let write = || -> Result<(), AnyError> {
-            write_json(txn, LAST_APPLIED, &Some(last))?;
-            write_json(txn, MEMBERSHIP, &membership)?;
-            write_json(txn, SNAPSHOT_META, &meta)?;
+            write_json(codec, txn, LAST_APPLIED, &Some(last))?;
+            write_json(codec, txn, MEMBERSHIP, &membership)?;
+            write_json(codec, txn, SNAPSHOT_META, &meta)?;
             txn.open_table(SM_META)
                 .map_err(any)?
                 .insert(SNAPSHOT_DATA, data.as_slice())
@@ -187,22 +207,29 @@ impl StateMachine {
     fn read_meta<T: for<'de> Deserialize<'de>>(&self, key: &str) -> Result<Option<T>, AnyError> {
         let txn = self.db.begin_read().map_err(any)?;
         let meta = txn.open_table(SM_META).map_err(any)?;
-        read_json(&meta, key).map_err(any)
+        read_json(&self.codec, &meta, key).map_err(any)
     }
 }
 
+/// A value of the state machine's meta table.
 fn read_json<T: for<'de> Deserialize<'de>>(
+    codec: &Codec,
     table: &impl ReadableTable<&'static str, &'static [u8]>,
     key: &str,
 ) -> Result<Option<T>, Error> {
     match table.get(key).map_err(Error::db)? {
-        Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+        Some(v) => Ok(Some(codec.decode(SM_META_NAME, key, v.value())?)),
         None => Ok(None),
     }
 }
 
-fn write_json<T: Serialize>(txn: &WriteTransaction, key: &str, value: &T) -> Result<(), AnyError> {
-    let bytes = serde_json::to_vec(value).map_err(any)?;
+fn write_json<T: Serialize>(
+    codec: &Codec,
+    txn: &WriteTransaction,
+    key: &str,
+    value: &T,
+) -> Result<(), AnyError> {
+    let bytes = codec.encode(SM_META_NAME, key, value).map_err(any)?;
     txn.open_table(SM_META)
         .map_err(any)?
         .insert(key, bytes.as_slice())
@@ -213,6 +240,7 @@ fn write_json<T: Serialize>(txn: &WriteTransaction, key: &str, value: &T) -> Res
 /// Applies one command at `index` inside `txn`. Returns the outcome and the
 /// event to publish once the transaction commits.
 fn apply_command(
+    codec: &Codec,
     txn: &WriteTransaction,
     index: u64,
     cmd: Command,
@@ -224,7 +252,11 @@ fn apply_command(
     };
     let key_str = key.to_string();
     let current: Option<Object> = match table.get(key_str.as_str()).map_err(any)? {
-        Some(v) => Some(serde_json::from_slice(v.value()).map_err(any)?),
+        Some(v) => Some(
+            codec
+                .decode(OBJECTS_NAME, &key_str, v.value())
+                .map_err(any)?,
+        ),
         None => None,
     };
     let current_version = current.as_ref().map(|o| o.metadata.version);
@@ -264,7 +296,7 @@ fn apply_command(
                     meta.generation = 1;
                 }
             }
-            let bytes = serde_json::to_vec(&object).map_err(any)?;
+            let bytes = codec.encode(OBJECTS_NAME, &key_str, &object).map_err(any)?;
             table
                 .insert(key_str.as_str(), bytes.as_slice())
                 .map_err(any)?;
@@ -307,7 +339,7 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
     {
         let entries: Vec<Entry<TypeConfig>> = entries.into_iter().collect();
         let last = entries.last().map(|e| e.log_id);
-        let db = self.db.clone();
+        let (db, codec) = (self.db.clone(), self.codec.clone());
         let applied = blocking(move || {
             let mut outcomes = Vec::new();
             let mut events = Vec::new();
@@ -316,18 +348,20 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                 match entry.payload {
                     EntryPayload::Blank => outcomes.push(Outcome::Nothing),
                     EntryPayload::Normal(cmd) => {
-                        let (outcome, event) = apply_command(&txn, entry.log_id.index, cmd)?;
+                        let (outcome, event) =
+                            apply_command(&codec, &txn, entry.log_id.index, cmd)?;
                         outcomes.push(outcome);
                         events.extend(event);
                     }
                     EntryPayload::Membership(m) => {
-                        write_json(&txn, MEMBERSHIP, &Membership::new(Some(entry.log_id), m))?;
+                        let membership = Membership::new(Some(entry.log_id), m);
+                        write_json(&codec, &txn, MEMBERSHIP, &membership)?;
                         outcomes.push(Outcome::Nothing);
                     }
                 }
             }
             if last.is_some() {
-                write_json(&txn, LAST_APPLIED, &last)?;
+                write_json(&codec, &txn, LAST_APPLIED, &last)?;
             }
             txn.commit().map_err(any)?;
             Ok((outcomes, events))
@@ -355,8 +389,10 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> StResult<()> {
         tracing::info!(snapshot = %meta.snapshot_id, "installing snapshot");
+        // In the clear, as the leader sent it: each manager seals with its
+        // own key.
         let bytes = snapshot.into_inner();
-        let db = self.db.clone();
+        let (db, codec) = (self.db.clone(), self.codec.clone());
         let owned_meta = meta.clone();
         let install = blocking(move || {
             let meta = &owned_meta;
@@ -366,18 +402,20 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                 let mut table = txn.open_table(OBJECTS).map_err(any)?;
                 table.retain(|_, _| false).map_err(any)?;
                 for object in &data.objects {
-                    let value = serde_json::to_vec(object).map_err(any)?;
-                    table
-                        .insert(object.key().to_string().as_str(), value.as_slice())
-                        .map_err(any)?;
+                    let key = object.key().to_string();
+                    let value = codec.encode(OBJECTS_NAME, &key, object).map_err(any)?;
+                    table.insert(key.as_str(), value.as_slice()).map_err(any)?;
                 }
             }
-            write_json(&txn, LAST_APPLIED, &meta.last_log_id)?;
-            write_json(&txn, MEMBERSHIP, &meta.last_membership)?;
-            write_json(&txn, SNAPSHOT_META, meta)?;
+            write_json(&codec, &txn, LAST_APPLIED, &meta.last_log_id)?;
+            write_json(&codec, &txn, MEMBERSHIP, &meta.last_membership)?;
+            write_json(&codec, &txn, SNAPSHOT_META, meta)?;
+            let sealed = codec
+                .seal(SM_META_NAME, SNAPSHOT_DATA, bytes)
+                .map_err(any)?;
             txn.open_table(SM_META)
                 .map_err(any)?
-                .insert(SNAPSHOT_DATA, bytes.as_slice())
+                .insert(SNAPSHOT_DATA, sealed.as_slice())
                 .map_err(any)?;
             txn.commit().map_err(any)
         });
@@ -394,15 +432,18 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
             let txn = self.db.begin_read().map_err(any)?;
             let table = txn.open_table(SM_META).map_err(any)?;
             let Some(meta) =
-                read_json::<SnapshotMeta<NodeId, BasicNode>>(&table, SNAPSHOT_META).map_err(any)?
+                read_json::<SnapshotMeta<NodeId, BasicNode>>(&self.codec, &table, SNAPSHOT_META)
+                    .map_err(any)?
             else {
                 return Ok(None);
             };
-            let data = table
-                .get(SNAPSHOT_DATA)
-                .map_err(any)?
-                .map(|v| v.value().to_vec())
-                .unwrap_or_default();
+            let data = match table.get(SNAPSHOT_DATA).map_err(any)? {
+                Some(v) => self
+                    .codec
+                    .open(SM_META_NAME, SNAPSHOT_DATA, v.value())
+                    .map_err(any)?,
+                None => Vec::new(),
+            };
             Ok(Some(Snapshot {
                 meta,
                 snapshot: Box::new(Cursor::new(data)),
@@ -414,24 +455,27 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
 
 impl RaftSnapshotBuilder<TypeConfig> for StateMachine {
     async fn build_snapshot(&mut self) -> StResult<Snapshot<TypeConfig>> {
-        let db = self.db.clone();
+        let (db, codec) = (self.db.clone(), self.codec.clone());
         let seq = self.snapshot_seq.fetch_add(1, Ordering::Relaxed);
         let build = blocking(move || {
             // One read transaction: objects and meta from the same version.
             let txn = db.begin_read().map_err(any)?;
             let meta_table = txn.open_table(SM_META).map_err(any)?;
             let last: Option<LogId<NodeId>> =
-                read_json::<Option<LogId<NodeId>>>(&meta_table, LAST_APPLIED)
+                read_json::<Option<LogId<NodeId>>>(&codec, &meta_table, LAST_APPLIED)
                     .map_err(any)?
                     .flatten();
-            let membership: Membership = read_json(&meta_table, MEMBERSHIP)
+            let membership: Membership = read_json(&codec, &meta_table, MEMBERSHIP)
                 .map_err(any)?
                 .unwrap_or_default();
             let objects_table = txn.open_table(OBJECTS).map_err(any)?;
-            let mut objects = Vec::new();
+            let mut objects: Vec<Object> = Vec::new();
             for item in objects_table.iter().map_err(any)? {
-                let (_, v) = item.map_err(any)?;
-                objects.push(serde_json::from_slice(v.value()).map_err(any)?);
+                let (k, v) = item.map_err(any)?;
+                let object = codec
+                    .decode(OBJECTS_NAME, k.value(), v.value())
+                    .map_err(any)?;
+                objects.push(object);
             }
             drop(txn);
 
@@ -448,13 +492,20 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachine {
 
             let txn = db.begin_write().map_err(any)?;
             // An installed snapshot may have overtaken this build.
-            let stored: Option<SnapshotMeta<NodeId, BasicNode>> =
-                read_json(&txn.open_table(SM_META).map_err(any)?, SNAPSHOT_META).map_err(any)?;
+            let stored: Option<SnapshotMeta<NodeId, BasicNode>> = read_json(
+                &codec,
+                &txn.open_table(SM_META).map_err(any)?,
+                SNAPSHOT_META,
+            )
+            .map_err(any)?;
             if stored.is_none_or(|s| s.last_log_id <= meta.last_log_id) {
-                write_json(&txn, SNAPSHOT_META, &meta)?;
+                write_json(&codec, &txn, SNAPSHOT_META, &meta)?;
+                let sealed = codec
+                    .seal(SM_META_NAME, SNAPSHOT_DATA, data.clone())
+                    .map_err(any)?;
                 txn.open_table(SM_META)
                     .map_err(any)?
-                    .insert(SNAPSHOT_DATA, data.as_slice())
+                    .insert(SNAPSHOT_DATA, sealed.as_slice())
                     .map_err(any)?;
             }
             txn.commit().map_err(any)?;

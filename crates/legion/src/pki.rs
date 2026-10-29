@@ -179,6 +179,28 @@ fn issued_as(cert_pem: &str, id: &Identity) -> bool {
     .is_ok_and(|got| got == *id)
 }
 
+/// The key this manager's store is sealed with, `pki/store.key`, made on
+/// first use. A store written before it existed is read as it is and
+/// sealed as it is written again.
+pub fn store_key(data_dir: &Path) -> anyhow::Result<legion_store::StoreKey> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    let dir = data_dir.join("pki");
+    let path = dir.join("store.key");
+    if let Some(text) = read(&path)? {
+        let bytes = STANDARD
+            .decode(text.trim())
+            .with_context(|| format!("{} is not base64", path.display()))?;
+        return legion_store::StoreKey::from_bytes(&bytes)
+            .with_context(|| format!("reading {}", path.display()));
+    }
+    private_dir(&dir)?;
+    let key = legion_store::StoreKey::generate();
+    write_private(&path, &format!("{}\n", STANDARD.encode(key.as_bytes())))?;
+    tracing::info!(path = %path.display(), "made the store's key");
+    Ok(key)
+}
+
 fn read(path: &Path) -> anyhow::Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(s) => Ok(Some(s)),

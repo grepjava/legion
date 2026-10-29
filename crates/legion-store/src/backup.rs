@@ -16,6 +16,7 @@ use legion_api::Object;
 use openraft::{BasicNode, CommittedLeaderId, LogId, Membership, StoredMembership, Vote};
 use serde::{Deserialize, Serialize};
 
+use crate::cipher::{Codec, StoreKey};
 use crate::log_store::LogStore;
 use crate::state_machine::StateMachine;
 use crate::{Error, NodeId};
@@ -35,10 +36,10 @@ pub struct Backup {
 }
 
 impl Backup {
-    /// What the store in `dir` holds, read with its daemon stopped: a
-    /// manager restarting a cluster from its own data, when the others are
-    /// lost.
-    pub fn of_store(dir: &Path) -> Result<Backup, Error> {
+    /// What the store in `dir` holds, read with its daemon stopped and
+    /// its key: a manager restarting a cluster from its own data, when the
+    /// others are lost.
+    pub fn of_store(dir: &Path, key: Option<&StoreKey>) -> Result<Backup, Error> {
         let path = dir.join("store.redb");
         if !path.exists() {
             return Err(Error::Db(format!("{} does not exist", path.display())));
@@ -48,7 +49,7 @@ impl Backup {
             Err(redb::DatabaseError::DatabaseAlreadyOpen) => return Err(in_use(&path)),
             Err(e) => return Err(Error::db(e)),
         };
-        StateMachine::open(db)?.backup()
+        StateMachine::open(db, key)?.backup()
     }
 
     /// Checks that this build can restore the backup.
@@ -97,9 +98,15 @@ fn in_use(path: &Path) -> Error {
     ))
 }
 
-/// Writes a new store in `dir` holding `backup`, with this manager, `id` at
-/// `addr`, the only voter. `dir` must hold no store.
-pub fn restore(dir: &Path, id: NodeId, addr: &str, backup: &Backup) -> Result<(), Error> {
+/// Writes a new store in `dir` holding `backup`, sealed with `key`, with
+/// this manager, `id` at `addr`, the only voter. `dir` must hold no store.
+pub fn restore(
+    dir: &Path,
+    id: NodeId,
+    addr: &str,
+    backup: &Backup,
+    key: Option<&StoreKey>,
+) -> Result<(), Error> {
     backup.check()?;
     let path = dir.join("store.redb");
     if path.exists() {
@@ -109,8 +116,9 @@ pub fn restore(dir: &Path, id: NodeId, addr: &str, backup: &Backup) -> Result<()
         )));
     }
     let db = Arc::new(redb::Database::create(&path).map_err(Error::db)?);
-    LogStore::open(db.clone())?;
-    StateMachine::open(db.clone())?;
+    let codec = Arc::new(Codec::new(key));
+    LogStore::open_with(db.clone(), codec.clone())?;
+    StateMachine::open_with(db.clone(), codec.clone())?;
     let last = LogId::new(CommittedLeaderId::new(1, id), backup.version);
     let membership = StoredMembership::new(
         Some(last),
@@ -125,7 +133,7 @@ pub fn restore(dir: &Path, id: NodeId, addr: &str, backup: &Backup) -> Result<()
         ),
     );
     let txn = db.begin_write().map_err(Error::db)?;
-    StateMachine::restore_in(&txn, last, membership, &backup.objects)?;
-    LogStore::restore_in(&txn, Vote::new_committed(1, id), last)?;
+    StateMachine::restore_in(&txn, &codec, last, membership, &backup.objects)?;
+    LogStore::restore_in(&txn, &codec, Vote::new_committed(1, id), last)?;
     txn.commit().map_err(Error::db)
 }

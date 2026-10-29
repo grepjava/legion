@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use legion_api::{Kind, Object, ObjectKey};
-use legion_store::{Command, NodeId, Outcome, Precondition, Raft, Store, TypeConfig};
+use legion_store::{Command, NodeId, Outcome, Precondition, Raft, Store, StoreKey, TypeConfig};
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
 use openraft::network::RPCOption;
 use openraft::raft::{
@@ -132,6 +132,8 @@ pub struct Cluster {
     pub config: openraft::Config,
     dirs: BTreeMap<NodeId, TempDir>,
     pub nodes: BTreeMap<NodeId, Store>,
+    /// The key nodes seal their stores with, if any.
+    pub key: Option<StoreKey>,
 }
 
 impl Cluster {
@@ -148,6 +150,7 @@ impl Cluster {
             config,
             dirs: BTreeMap::new(),
             nodes: BTreeMap::new(),
+            key: None,
         }
     }
 
@@ -167,7 +170,7 @@ impl Cluster {
             id,
             router: self.router.clone(),
         };
-        let store = Store::open(id, &dir, self.config.clone(), net)
+        let store = Store::open_with(id, &dir, self.key.as_ref(), self.config.clone(), net)
             .await
             .unwrap();
         self.router

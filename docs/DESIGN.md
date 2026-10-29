@@ -1103,6 +1103,18 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
 - **Encryption at rest**: Raft log and snapshots are encrypted with a data key.
   With autolock, the data key is wrapped by a key held by the operator and
   managers need `legion unlock` after restart.
+  Built (phase 4): every value a manager's store writes (objects, Raft
+  log entries, the vote, the state machine's meta, snapshots) is sealed
+  with ChaCha20-Poly1305 under the manager's own 256-bit data key,
+  `<data-dir>/pki/store.key` (mode 0600, made on first start), with a
+  random nonce and the table and key it is stored under as associated
+  data, so a value cannot be moved to another place. Keys of the tables
+  (object kinds, namespaces and names, log indexes) stay readable.
+  Snapshots go between managers in the clear, over mTLS, and each seals
+  them with its own key. A store written before is read as it is, and
+  each value is sealed when next written. Backups are plain JSON (they
+  are for restoring anywhere), so their file is kept as safe as the
+  key. Autolock is not built yet.
 - **Secrets in transit and on nodes**: delivered only to nodes running tasks
   that use them; held in tmpfs; removed when the last task using them stops.
 - **Data plane**: all node-to-node traffic goes over WireGuard. WireGuard keys
