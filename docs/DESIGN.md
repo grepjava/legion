@@ -910,10 +910,42 @@ per node, so the existing tests apply to it and Podman stays as the
 fallback. It does not change rctl: memory limits for workloads with
 large shared memory need their own answer either way.
 
-It starts with a spike on a FreeBSD host, as phase 0 did: pull an image
-into ZFS clones, run its entrypoint in a child jail of a `persist` VNET
-pod jail under the agent's supervision, and compare start time and disk
-use with Podman. If it holds, it becomes the default.
+It started with a spike on a FreeBSD host, as phase 0 did (S7 in §10),
+which held: a container starts in about 55 ms against Podman's 900, and
+costs 1 KB of disk against a full copy of its image. So it becomes the
+default once built, and the Podman runtime is removed when the native
+one has run the exit tests and lab clusters without it.
+
+How it is built:
+
+- **Images** (crate `legion-image`): a registry client (anonymous and
+  bearer-token auth, credentials from Secrets later) picks the
+  `freebsd/<arch>` manifest from an index, checks every blob's digest
+  and applies each layer into a ZFS dataset cloned from the one below,
+  snapshotted as `<root>/img/<chain id>`, so images share their common
+  layers. Extraction is bsdtar's (file flags, extended attributes,
+  numeric owners; it refuses `..` and paths through symlinks), and
+  whiteouts are applied first without following symlinks. An image's
+  config is kept beside its top layer. Configs written with lowercase
+  keys (FreeBSD's own images write `cmd`) are read too.
+- **Containers** (`legion-agent`'s jail runtime): the same `Runtime`
+  trait and container specs as Podman's, so the agent does not change. A
+  container is a ZFS clone of its image's top layer and a jail named by
+  its id, as ocijail names them: the infra container (annotation
+  `org.freebsd.jail.vnet=new`) becomes a `persist` VNET jail with no
+  process, the others child jails of it (`org.freebsd.parentJail`) with
+  `ip4`/`ip6` inherited, devfs (ruleset 4) and Legion's jail parameters
+  (`legion.jail`) set at creation, so the hook is no longer needed.
+  Mounts are nullfs and tmpfs into the clone.
+- **Supervision**: each container's process is started by a small
+  supervisor (`legion jail-shim`, the same binary), detached from the
+  agent, that enters the jail, runs the entrypoint as its user with the
+  image's environment, writes its output to the container's log (capped,
+  rotated) and its exit status to a file, and stays until the agent has
+  read it. So the agent may restart while containers run, and finds them
+  again from their state directories. Stop sends the stop signal, waits
+  the grace period, then removes the jail (which kills what is left).
+  Exec is a process attached to the jail the same way.
 
 ## 7. Object model
 
@@ -1184,6 +1216,7 @@ WireGuard and bridge, with tasks as VNET jails attached to the node bridges.
 | S5 | libpod REST API coverage. | **Sufficient.** create (with annotations and labels), start, stop, exec, logs, events, label filters, pull, delete all work. `stats` returns zeros; use rctl. |
 | S6 | WireGuard mesh churn. | **Passes.** 100 peers added and removed in under a second each; 0 of 3,000 pings lost on an existing peer. |
 | — | ZFS storage and volumes. | **Works.** Podman ZFS driver, nullfs volume mounts, snapshot, full + incremental send/recv, rollback. |
+| S7 | A native jail runtime (6.5), run 2026-10-29. | **Holds.** Images pulled from Docker Hub with curl into ZFS, one snapshot per layer by chain id (`freebsd-runtime` 16 s, `freebsd-notoolchain` 46 s); whiteouts applied from a two-layer image exported by Podman, whose base layer was shared with the pulled one (77 KB for the new layer); `schg` and setuid bits kept; compression 2.87x. A pod is a `persist` VNET jail with no process, containers child jails on clones with `ip4=inherit`: two containers talk over the pod's `127.0.0.1`, rctl applies per child jail. Clone, start, run and remove take about 55 ms against 900 ms for `podman run --rm` (vfs, ocijail); a container's clone costs 1 KB against Podman's 158 MB copy. Found: `jail(8)` does not pass on the command's exit status, and devfs is not always unmounted on removal, so the runtime starts processes and mounts devfs itself. |
 
 ---
 

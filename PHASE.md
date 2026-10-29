@@ -728,10 +728,27 @@ Smaller follow-ups: memory limits for workloads with large shared memory
 ingress HTTP/2, connection reuse and ACME certificates; sealing the
 WireGuard key under autolock.
 
-## Later phases
+## Phase 5 — Extensions
 
-See DESIGN.md §11: 5 Extensions. First in phase 5: the native jail
-runtime (DESIGN.md §6.5), starting with its spike (an image pulled into
-ZFS clones, its entrypoint run in a child jail of a `persist` VNET pod
-jail under the agent's supervision, start time and disk use against
-Podman).
+DESIGN.md §11. First the native jail runtime (DESIGN.md §6.5), which
+replaces Podman and ocijail.
+
+### Done
+
+- **Native runtime spike** (DESIGN.md §10, S7): an image pulled into ZFS
+  layers and run as child jails of a `persist` VNET pod jail; about 55
+  ms to start against Podman's 900, 1 KB of disk per container against
+  a full copy.
+
+### To do, in order
+
+1. `legion-image`: registry client and ZFS layer store (pull, whiteouts,
+   image configs, removal of unused images).
+2. The jail runtime in the agent: containers as clones and jails, the
+   `legion jail-shim` supervisor, logs, exec, events, recovery after an
+   agent restart; `--runtime jail|podman` on the daemon.
+3. The exit tests on the jail runtime, then it becomes the default.
+4. Podman's runtime removed once nothing needs it.
+
+Then: Linux images, IPv6 dual-stack, a volume plugin interface (NFS,
+iSCSI), bhyve tasks (exploratory).
