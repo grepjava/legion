@@ -1,0 +1,5 @@
+bin/legion
+etc/newsyslog.conf.d/legion.conf
+etc/rc.d/legion
+@dir libexec/legion/volume
+@dir libexec/legion

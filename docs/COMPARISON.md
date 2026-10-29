@@ -142,7 +142,7 @@ Linux hosts, an ecosystem of tools and charts, or proven production use.
 | Port forwarding | `legion port-forward` | No | `kubectl port-forward` |
 | Watching objects | `legion watch` | `docker events` | `kubectl get --watch` |
 | Metrics | Prometheus endpoint: cluster state, and each container's CPU, memory and I/O | Engine metrics endpoint | metrics-server, kube-state-metrics, cAdvisor in kubelet |
-| Packaging | rc.d script under daemon(8), newsyslog entry, a script that builds release tarballs; no published release yet | Distribution packages | Distribution packages, many installers |
+| Packaging | rc.d script under daemon(8), newsyslog entry, release tarballs built by a script, a FreeBSD port (not yet in the ports tree); no published release yet | Distribution packages | Distribution packages, many installers |
 | Running containers by hand beside the cluster | Yes; Legion touches only its own jails and pf anchors | Yes | Not recommended |
 
 ## Not in Legion

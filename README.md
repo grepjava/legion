@@ -15,7 +15,8 @@ IPv6, network volumes) are done; it is being hardened for real use.
 ## Install
 
 On FreeBSD 15, from a release tarball (or one made with
-`packaging/freebsd/release.sh`), as root:
+`packaging/freebsd/release.sh`; a port is in `packaging/freebsd/port`), as
+root:
 
 ```sh
 tar -xf legion-<version>-freebsd15-amd64.tar.xz --strip-components 1 -C /usr/local

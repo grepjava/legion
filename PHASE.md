@@ -966,8 +966,8 @@ real, in the order agreed with the user.
   address it reaches `--manager` from. Tested: the defaults; on FreeBSD
   15.1, the tarball built and unpacked, and its rc.d script starting the
   daemon (the CLI reaching it), daemon(8) restarting it after a kill,
-  the log reopened after a rotation, and a clean stop. Not built: a
-  FreeBSD port, for when the flags have settled.
+  the log reopened after a rotation, and a clean stop. The FreeBSD port
+  came later (below).
 - **No pods with limits where limits cannot hold** (DESIGN.md §6.3). On a
   host without `kern.racct.enable=1`, rctl refused the limits and the
   agent only warned, so such pods ran unlimited. Now the agent reads the
@@ -1040,9 +1040,21 @@ real, in the order agreed with the user.
   another port and blocks the advertised one) is reached by the others
   from its NAT's port, and still right after the peer list changes; with
   the old rule, that last ping fails.
+- **FreeBSD port** (`packaging/freebsd/port`, its README). `sysutils/legion`
+  with the ports' cargo framework, FreeBSD 15 and newer, amd64 and
+  aarch64; it installs the binary (stripped), the rc.d script with
+  `/usr/local` made `${PREFIX}`, the newsyslog entry, the volume plugin
+  directory and the docs. `Makefile.crates` is kept; `distinfo` waits for
+  a tagged release, as it holds the GitHub tarball's checksum. Tested on
+  FreeBSD 15.1 in a ports tree, from a tarball of the tree standing for
+  the release's: built, `check-plist` and `stage-qa` (with `DEVELOPER`)
+  clean, packaged (5 MB, no dependencies), installed into an empty root,
+  its `legion --version` run. Not done: a poudriere run, tagging a
+  release and submitting the port, which are the user's.
 
 ### To do, in order
 
-Nothing left in the hardening agreed with the user. Candidates from the
-phases' follow-ups: a FreeBSD port.
+Nothing left in the hardening agreed with the user, nor in the phases'
+follow-ups. Waiting on the user: a first release (a tag, the GitHub
+release with tarballs, then the port's `distinfo` and its submission).
 
