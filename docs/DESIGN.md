@@ -820,8 +820,10 @@ says why that went and what was kept of it.
   `legion image load` adds one from an OCI archive (`podman save --format
   oci-archive`, or any tool's OCI layout in a tar) on the node. The store
   takes a file lock while it changes, so this runs beside a pulling daemon.
-- **Removal**: images no container has used for an hour go (checked every
-  ten minutes), then the layers nothing uses. A layer a container was
+- **Removal**: images no container has used, and no task has found or
+  pulled, for an hour go (checked every ten minutes), then the layers
+  nothing uses. A task that has just found an image therefore keeps it
+  while it makes its containers. A layer a container was
   cloned from cannot be destroyed, so it stays until that container goes.
 
 ### 6.2 Pod construction

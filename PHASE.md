@@ -834,11 +834,14 @@ replaces Podman and ocijail.
   found public later), the Docker config forms, and the agent (a task
   without the login fails, another namespace needs its own, a missing
   Secret fails the task).
+- **Pruning and starting tasks**: an image a task had just found could be
+  pruned before the task made its containers, failing that start. The
+  runtime now notes when a task finds or pulls an image, and pruning
+  holds that note while it removes, so such an image stays another hour.
+  Re-checked on FreeBSD: the runtime's live test.
 
 ### To do, in order
 
 Next in phase 5: Linux images, IPv6 dual-stack, a volume plugin
-interface (NFS, iSCSI), bhyve tasks (exploratory). Smaller follow-ups of
-the jail runtime: an image pulled again just as it is pruned (the task
-retries).
+interface (NFS, iSCSI), bhyve tasks (exploratory).
 

@@ -69,7 +69,13 @@ pub struct JailRuntime {
     boot: u64,
     events: broadcast::Sender<Event>,
     execs: Mutex<HashMap<String, Session>>,
+    used: Used,
 }
+
+/// When each image (by canonical name) was last used. Pruning holds it
+/// while it removes, so an image a task has just found stays for
+/// [`UNUSED_FOR`] while the task makes its containers.
+type Used = Arc<tokio::sync::Mutex<BTreeMap<String, tokio::time::Instant>>>;
 
 struct Session {
     code: watch::Receiver<Option<i32>>,
@@ -185,6 +191,7 @@ impl JailRuntime {
             boot: state::boot_time(),
             events,
             execs: Mutex::new(HashMap::new()),
+            used: Used::default(),
         };
         tokio::spawn(watch_exits(
             rt.sys.clone(),
@@ -192,7 +199,11 @@ impl JailRuntime {
             rt.boot,
             rt.events.clone(),
         ));
-        tokio::spawn(prune_images(rt.images.clone(), rt.dir.clone()));
+        tokio::spawn(prune_images(
+            rt.images.clone(),
+            rt.dir.clone(),
+            rt.used.clone(),
+        ));
         Ok(rt)
     }
 
@@ -334,16 +345,15 @@ async fn watch_exits(sys: Arc<dyn Sys>, dir: PathBuf, boot: u64, events: broadca
     }
 }
 
-/// Removes images no container has used for [`UNUSED_FOR`], then the
-/// layers nothing uses.
-async fn prune_images(images: Arc<Store>, dir: PathBuf) {
-    let mut last_used: BTreeMap<String, tokio::time::Instant> = BTreeMap::new();
+/// Removes images no container or task has used for [`UNUSED_FOR`], then
+/// the layers nothing uses.
+async fn prune_images(images: Arc<Store>, dir: PathBuf, used: Used) {
     loop {
         let now = tokio::time::Instant::now();
         let in_use: std::collections::BTreeSet<String> = match records(&dir) {
             Ok(r) => r
                 .iter()
-                .filter_map(|r| legion_image::Reference::parse(&r.image).ok())
+                .filter_map(|r| Reference::parse(&r.image).ok())
                 .map(|r| r.to_string())
                 .collect(),
             Err(e) => {
@@ -352,6 +362,7 @@ async fn prune_images(images: Arc<Store>, dir: PathBuf) {
                 continue;
             }
         };
+        let mut last_used = used.lock().await;
         let known = images.images().unwrap_or_default();
         for image in &known {
             for name in &image.references {
@@ -369,7 +380,14 @@ async fn prune_images(images: Arc<Store>, dir: PathBuf) {
         let names: std::collections::BTreeSet<&String> =
             known.iter().flat_map(|i| &i.references).collect();
         last_used.retain(|n, _| names.contains(n));
+        drop(last_used);
         tokio::time::sleep(PRUNE_EVERY).await;
+    }
+}
+
+fn mark_used(used: &mut BTreeMap<String, tokio::time::Instant>, reference: &str) {
+    if let Ok(r) = Reference::parse(reference) {
+        used.insert(r.to_string(), tokio::time::Instant::now());
     }
 }
 
@@ -685,11 +703,16 @@ impl JailRuntime {
 
 impl legion_agent::Runtime for JailRuntime {
     async fn image_usable(&self, reference: &str, user: &str) -> Result<bool> {
-        Ok(self
+        let mut used = self.used.lock().await;
+        let usable = self
             .images
             .usable(reference, user)
             .map_err(image_error)?
-            .is_some())
+            .is_some();
+        if usable {
+            mark_used(&mut used, reference);
+        }
+        Ok(usable)
     }
 
     async fn pull(&self, reference: &str, user: &str, logins: &[Login]) -> Result<()> {
@@ -707,14 +730,14 @@ impl legion_agent::Runtime for JailRuntime {
                 username: l.username.clone(),
                 password: l.password.clone(),
             });
-        self.images
-            .pull(reference, creds.as_ref(), user)
-            .await
-            .map(drop)
-            .map_err(|e| Error::Pull {
-                image: reference.to_owned(),
-                message: e.to_string(),
-            })
+        // Before and after: an image pulled again must not go meanwhile.
+        mark_used(&mut *self.used.lock().await, reference);
+        let pulled = self.images.pull(reference, creds.as_ref(), user).await;
+        mark_used(&mut *self.used.lock().await, reference);
+        pulled.map(drop).map_err(|e| Error::Pull {
+            image: reference.to_owned(),
+            message: e.to_string(),
+        })
     }
 
     async fn create(&self, spec: &ContainerSpec) -> Result<String> {
