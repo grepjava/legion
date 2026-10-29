@@ -51,6 +51,13 @@ pub trait Sys: Send + Sync {
     fn jails(&self) -> Result<Vec<Jail>>;
     /// Sets parameters on an existing jail (`jail -m`).
     fn jail_set(&self, jail: &str, params: &[(&str, &str)]) -> Result<()>;
+    /// Creates a jail with these parameters (`name` among them; a child's
+    /// is `<parent>.<child>`); an empty value sets a flag (`persist`,
+    /// `vnet`). Returns its jid.
+    fn jail_create(&self, params: &[(&str, &str)]) -> Result<u32>;
+    /// Removes a jail and its children, killing their processes.
+    /// [`Error::NotFound`] if there is no such jail.
+    fn jail_remove(&self, jail: &str) -> Result<()>;
     /// Reads a jail's parameters (`jls -j <jail> -n`); booleans read
     /// `true` or `false`. [`Error::NotFound`] if the jail is gone.
     fn jail_get(&self, jail: &str, params: &[&str]) -> Result<BTreeMap<String, String>>;
@@ -187,6 +194,11 @@ pub trait Sys: Send + Sync {
     /// of at most `size` bytes (by default, as much as memory and swap
     /// allow), with `mode` as its root's permissions.
     fn mount_tmpfs(&self, path: &str, size: Option<u64>, mode: u32) -> Result<()>;
+    /// Mounts `source` (a directory or a file) at `target` with nullfs.
+    fn mount_nullfs(&self, source: &str, target: &str, read_only: bool) -> Result<()>;
+    /// Mounts a devfs at `target` showing what devfs ruleset `ruleset`
+    /// allows.
+    fn mount_devfs(&self, target: &str, ruleset: u32) -> Result<()>;
     /// Unmounts `path`, forcibly: callers unmount only what nothing uses.
     fn unmount(&self, path: &str) -> Result<()>;
     /// Mount points at or below `prefix`.

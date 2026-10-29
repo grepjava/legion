@@ -285,6 +285,34 @@ impl<R: Runner> Sys for Shell<R> {
         self.run("jail", &a).map(drop)
     }
 
+    fn jail_create(&self, params: &[(&str, &str)]) -> Result<u32> {
+        let mut a = args(["-i", "-c"]);
+        a.extend(params.iter().map(|(k, v)| {
+            if v.is_empty() {
+                (*k).to_owned()
+            } else {
+                format!("{k}={v}")
+            }
+        }));
+        let out = self.run("jail", &a)?;
+        out.trim().parse().map_err(|_| Error::Parse {
+            command: describe("jail", &a),
+            message: format!("not a jid: {out:?}"),
+        })
+    }
+
+    fn jail_remove(&self, jail: &str) -> Result<()> {
+        let a = args(["-j", jail, "jid"]);
+        let out = self.output("jls", &a, None)?;
+        if !out.success {
+            if out.stderr.contains("not found") {
+                return Err(Error::NotFound(format!("jail {jail}")));
+            }
+            return Err(failed("jls", &a, &out));
+        }
+        self.run("jail", &args(["-r", out.stdout.trim()])).map(drop)
+    }
+
     fn jail_get(&self, jail: &str, params: &[&str]) -> Result<BTreeMap<String, String>> {
         let mut a = args(["-j", jail, "--libxo=json", "-n"]);
         a.extend(params.iter().map(|p| (*p).to_owned()));
@@ -752,6 +780,26 @@ impl<R: Runner> Sys for Shell<R> {
         }
         self.run("mount", &args(["-t", "tmpfs", "-o", &opts, "tmpfs", path]))
             .map(drop)
+    }
+
+    fn mount_nullfs(&self, source: &str, target: &str, read_only: bool) -> Result<()> {
+        let opts = if read_only { "ro" } else { "rw" };
+        self.run("mount", &args(["-t", "nullfs", "-o", opts, source, target]))
+            .map(drop)
+    }
+
+    fn mount_devfs(&self, target: &str, ruleset: u32) -> Result<()> {
+        self.run("mount", &args(["-t", "devfs", "devfs", target]))?;
+        let set = ruleset.to_string();
+        let applied = self
+            .run("devfs", &args(["-m", target, "ruleset", &set]))
+            .and_then(|_| self.run("devfs", &args(["-m", target, "rule", "applyset"])));
+        if let Err(e) = applied {
+            // Not left showing every device.
+            let _ = self.run("umount", &args(["-f", target]));
+            return Err(e);
+        }
+        Ok(())
     }
 
     fn unmount(&self, path: &str) -> Result<()> {
@@ -1424,6 +1472,41 @@ mod tests {
         .unwrap();
         sh.zfs_destroy("tank/legion/volumes/shop/data", true)
             .unwrap();
+    }
+
+    #[test]
+    fn jails_and_mounts() {
+        let sh = Script::shell(vec![
+            (
+                "jail -i -c name=p path=/var/empty vnet persist",
+                ok("7
+"),
+            ),
+            (
+                "jls -j p.c jid",
+                ok("8
+"),
+            ),
+            ("jail -r 8", ok("")),
+            ("jls -j gone jid", err("jls: jail \"gone\" not found")),
+            ("mount -t nullfs -o ro /src /dst", ok("")),
+            ("mount -t devfs devfs /r/dev", ok("")),
+            ("devfs -m /r/dev ruleset 4", ok("")),
+            ("devfs -m /r/dev rule applyset", ok("")),
+        ]);
+        let jid = sh
+            .jail_create(&[
+                ("name", "p"),
+                ("path", "/var/empty"),
+                ("vnet", ""),
+                ("persist", ""),
+            ])
+            .unwrap();
+        assert_eq!(jid, 7);
+        sh.jail_remove("p.c").unwrap();
+        assert!(matches!(sh.jail_remove("gone"), Err(Error::NotFound(_))));
+        sh.mount_nullfs("/src", "/dst", true).unwrap();
+        sh.mount_devfs("/r/dev", 4).unwrap();
     }
 
     #[test]

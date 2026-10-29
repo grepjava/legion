@@ -351,6 +351,41 @@ impl Sys for FakeSys {
         Ok(())
     }
 
+    fn jail_create(&self, params: &[(&str, &str)]) -> Result<u32> {
+        let get = |k: &str| params.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
+        let name = get("name").ok_or_else(|| fail("jail", "no name"))?;
+        {
+            let s = self.state();
+            if s.jails.contains_key(name) {
+                return Err(fail("jail", format!("jail \"{name}\" already exists")));
+            }
+            if let Some((p, _)) = name.rsplit_once('.')
+                && !s.jails.contains_key(p)
+            {
+                return Err(fail("jail", format!("jail \"{p}\" not found")));
+            }
+        }
+        let vnet = matches!(get("vnet"), Some("" | "new"));
+        let jid = self.add_jail(name, vnet);
+        let mut s = self.state();
+        let recorded = s.jail_params.entry(name.to_owned()).or_default();
+        for (k, v) in params {
+            recorded.insert((*k).to_owned(), (*v).to_owned());
+        }
+        if let Some(max) = get("children.max").and_then(|m| m.parse().ok()) {
+            s.jails.get_mut(name).expect("added").children_max = max;
+        }
+        Ok(jid)
+    }
+
+    fn jail_remove(&self, jail: &str) -> Result<()> {
+        if !self.state().jails.contains_key(jail) {
+            return Err(Error::NotFound(format!("jail {jail}")));
+        }
+        self.remove_jail(jail);
+        Ok(())
+    }
+
     fn jail_get(&self, jail: &str, params: &[&str]) -> Result<BTreeMap<String, String>> {
         let s = self.state();
         if !s.jails.contains_key(jail) {
@@ -1047,6 +1082,14 @@ must destroy them to overwrite it"
         }
         s.mounts.insert(path.to_owned(), size);
         Ok(())
+    }
+
+    fn mount_nullfs(&self, _source: &str, target: &str, _read_only: bool) -> Result<()> {
+        self.mount_tmpfs(target, None, 0)
+    }
+
+    fn mount_devfs(&self, target: &str, _ruleset: u32) -> Result<()> {
+        self.mount_tmpfs(target, None, 0)
     }
 
     fn unmount(&self, path: &str) -> Result<()> {

@@ -1262,6 +1262,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "legion-jail"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "getrandom 0.3.4",
+ "legion-agent",
+ "legion-image",
+ "legion-podman",
+ "legion-sys",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "legion-manager"
 version = "0.1.0"
 dependencies = [
