@@ -67,8 +67,13 @@ pub struct AgentConfig {
     /// deleted; without it, output goes with the pod. The agent owns it.
     pub logs_dir: Option<PathBuf>,
     /// The ZFS dataset under which volumes are created (`<pool>/legion`);
-    /// without one, tasks using volumes are rejected.
+    /// without one, tasks using ZFS volumes are rejected.
     pub zfs_root: Option<String>,
+    /// Where the node mounts volumes for all its tasks (iSCSI LUNs); beside
+    /// `files_dir` by default.
+    pub volumes_dir: PathBuf,
+    /// Volume plugins, executables by name (DESIGN.md §6.7).
+    pub plugin_dir: PathBuf,
     /// The node's end of the WireGuard mesh to other nodes; without it, pods
     /// reach only this node.
     pub wireguard: Option<WireGuardConfig>,
@@ -84,6 +89,9 @@ pub struct AgentConfig {
     pub ingress_tls: Option<std::net::SocketAddr>,
 }
 
+/// Where volume plugins are by default.
+pub const DEFAULT_PLUGIN_DIR: &str = "/usr/local/libexec/legion/volume";
+
 #[derive(Debug, Clone)]
 pub struct WireGuardConfig {
     /// Holds the node's private key, made on first start.
@@ -94,13 +102,16 @@ pub struct WireGuardConfig {
 
 impl AgentConfig {
     pub fn new(node: &str, files_dir: impl Into<PathBuf>) -> Self {
+        let files_dir: PathBuf = files_dir.into();
         AgentConfig {
             node: node.to_owned(),
             infra_image: "docker.io/freebsd/freebsd-runtime:15.1".to_owned(),
             resync: Duration::from_secs(30),
-            files_dir: files_dir.into(),
+            volumes_dir: files_dir.with_file_name("volumes"),
+            files_dir,
             logs_dir: None,
             zfs_root: None,
+            plugin_dir: PathBuf::from(DEFAULT_PLUGIN_DIR),
             wireguard: None,
             drain: Duration::from_secs(2),
             usage_period: Duration::from_secs(15),
@@ -137,6 +148,9 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 files_dir: config.files_dir,
                 logs_dir: config.logs_dir,
                 zfs_root: config.zfs_root,
+                volumes_dir: config.volumes_dir,
+                plugin_dir: config.plugin_dir,
+                volume_lock: Arc::default(),
                 net: Arc::default(),
                 ips: Arc::default(),
                 drain: config.drain,

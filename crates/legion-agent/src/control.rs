@@ -93,6 +93,15 @@ pub trait Control: Send + Sync + 'static {
         dataset: &str,
     ) -> impl Future<Output = Result<VolumeClaim, ControlError>> + Send;
 
+    /// Lets go of a volume used one node at a time, which the node has
+    /// unmounted and detached; the next node may then use it.
+    fn release_volume(
+        &self,
+        namespace: &str,
+        name: &str,
+        node: &str,
+    ) -> impl Future<Output = Result<(), ControlError>> + Send;
+
     /// The value of a `Secret` or `Config`; `None` if it does not exist.
     fn data(
         &self,
@@ -584,11 +593,30 @@ impl Control for GrpcControl {
             namespace: namespace.to_owned(),
             name: name.to_owned(),
             dataset: dataset.to_owned(),
+            release: false,
         };
         let resp = self
             .call(|mut c| async move { c.claim_volume(req).await })
             .await?;
         decode(&resp.claim_json).map_err(ControlError::Other)
+    }
+
+    async fn release_volume(
+        &self,
+        namespace: &str,
+        name: &str,
+        node: &str,
+    ) -> Result<(), ControlError> {
+        let req = ClaimVolumeRequest {
+            node: node.to_owned(),
+            namespace: namespace.to_owned(),
+            name: name.to_owned(),
+            dataset: String::new(),
+            release: true,
+        };
+        self.call(|mut c| async move { c.claim_volume(req).await })
+            .await
+            .map(drop)
     }
 
     async fn data(

@@ -31,6 +31,8 @@ pub struct Options {
     pub ingress_tls_listen: Option<SocketAddr>,
     /// Run Linux images too, through the Linux ABI.
     pub linux: bool,
+    /// Where the volume plugins are, if not in the default place.
+    pub volume_plugins: Option<PathBuf>,
 }
 
 pub async fn run(opts: Options) -> anyhow::Result<()> {
@@ -250,6 +252,9 @@ async fn start_agent(
         config.infra_image = image.clone();
     }
     config.zfs_root = opts.zfs_root.clone();
+    if let Some(dir) = &opts.volume_plugins {
+        config.plugin_dir = dir.clone();
+    }
     config.ingress = opts.ingress_listen;
     config.ingress_tls = opts.ingress_tls_listen;
     config.wireguard = Some(WireGuardConfig {

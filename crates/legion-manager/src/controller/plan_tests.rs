@@ -163,6 +163,19 @@ impl World {
         );
     }
 
+    /// A Volume of `spec`, held by `node` if not empty.
+    fn volume_of(&mut self, name: &str, spec: serde_json::Value, node: &str) {
+        self.volume(name, node);
+        let v = self
+            .volumes
+            .get_mut(&("shop".to_owned(), name.to_owned()))
+            .unwrap();
+        v.spec = legion_api::parse(&spec).unwrap();
+        v.object.spec = spec;
+        v.status.dataset.clear();
+        v.object.status = serde_json::to_value(&v.status).unwrap();
+    }
+
     /// The leader's migrator, done with each migration's current phase.
     fn migrate(&mut self) {
         use legion_api::volume::MigrationPhase;
@@ -1126,6 +1139,68 @@ fn tasks_go_where_their_volume_is() {
     w.state("n2", NodeState::Ready);
     w.settle();
     assert_eq!(w.placed("db"), ["n2"]);
+}
+
+#[test]
+fn network_volumes_place_by_their_access() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    // NFS: anywhere, held by no node.
+    w.volume_of(
+        "files",
+        serde_json::json!({ "driver": "nfs", "nfs": { "server": "files.lan", "path": "/x" } }),
+        "",
+    );
+    w.service(
+        "web",
+        "replicas: 2
+pod: { containers: [{ name: web, image: \"web:1\" }], volumes: [{ name: f, volume: { name: files } }] }",
+    );
+    // iSCSI: where it is held, while it is.
+    w.volume_of(
+        "block",
+        serde_json::json!({ "driver": "iscsi", "iscsi": { "portal": "a", "target": "iqn.x" } }),
+        "n2",
+    );
+    w.service(
+        "db",
+        "replicas: 1
+pod: { containers: [{ name: db, image: \"pg:17\" }], volumes: [{ name: data, volume: { name: block } }] }",
+    );
+    w.settle();
+    let mut web = w.placed("web");
+    web.sort();
+    assert_eq!(web, ["n1", "n2"]);
+    assert_eq!(w.placed("db"), ["n2"]);
+    // A drain neither waits for a copy nor moves it: the task stops, and
+    // its next one waits for n2 to let go.
+    w.availability("n2", Availability::Drain);
+    w.settle();
+    assert!(w.placed("db").is_empty());
+    assert_eq!(w.volume_node("block"), "n2");
+    assert!(
+        w.volumes[&("shop".to_owned(), "block".to_owned())]
+            .status
+            .migration
+            .is_none()
+    );
+    // Once it has, the task goes to n1.
+    w.volume_of(
+        "block",
+        serde_json::json!({ "driver": "iscsi", "iscsi": { "portal": "a", "target": "iqn.x" } }),
+        "",
+    );
+    w.settle();
+    assert_eq!(w.placed("db"), ["n1"]);
+    // A removed node lets go of what it held.
+    w.volume_of(
+        "held",
+        serde_json::json!({ "driver": "iscsi", "iscsi": { "portal": "a", "target": "iqn.y" } }),
+        "n3",
+    );
+    w.settle();
+    assert_eq!(w.volume_node("held"), "");
 }
 
 #[test]

@@ -9,8 +9,8 @@ use std::process::{Command, Stdio};
 use serde::Deserialize;
 
 use crate::{
-    Carp, CarpState, Dataset, Destination, Epair, Error, IfConfig, IpNet, Jail, PfState, RctlRule,
-    Result, Sys, WgPeer,
+    Carp, CarpState, Dataset, Destination, Epair, Error, IfConfig, IpNet, IscsiSession, Jail,
+    PfState, RctlRule, Result, Sys, WgPeer,
 };
 
 /// Runs one program to completion.
@@ -834,6 +834,60 @@ impl<R: Runner> Sys for Shell<R> {
         self.run("mount", &a).map(drop)
     }
 
+    fn mount_fs(&self, fstype: &str, source: &str, target: &str, options: &str) -> Result<()> {
+        let mut a = args(["-t", fstype]);
+        if !options.is_empty() {
+            a.extend(args(["-o", options]));
+        }
+        a.extend(args([source, target]));
+        self.run("mount", &a).map(drop)
+    }
+
+    fn fs_type(&self, device: &str) -> Result<Option<String>> {
+        let a = args([device]);
+        let out = self.output("fstyp", &a, None)?;
+        if out.success {
+            return Ok(Some(out.stdout.trim().to_owned()));
+        }
+        if out.stderr.contains("filesystem not recognized") {
+            return Ok(None);
+        }
+        Err(failed("fstyp", &a, &out))
+    }
+
+    fn iscsi_sessions(&self) -> Result<Vec<IscsiSession>> {
+        let a = args(["--libxo", "json", "-L", "-v"]);
+        let out = self.run("iscsictl", &a)?;
+        parse_iscsi(&out).map_err(|message| Error::Parse {
+            command: describe("iscsictl", &a),
+            message,
+        })
+    }
+
+    fn iscsi_attach(&self, portal: &str, target: &str) -> Result<()> {
+        self.run("iscsictl", &args(["-A", "-p", portal, "-t", target]))
+            .map(drop)
+    }
+
+    fn iscsi_detach(&self, target: &str) -> Result<()> {
+        if !self.iscsi_sessions()?.iter().any(|s| s.target == target) {
+            return Ok(());
+        }
+        self.run("iscsictl", &args(["-R", "-t", target])).map(drop)
+    }
+
+    fn run_program(&self, program: &str, args: &[&str], input: &str) -> Result<String> {
+        let a: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+        match self.output(program, &a, Some(input)) {
+            Err(Error::Spawn { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                Err(Error::NotFound(program.to_owned()))
+            }
+            Err(e) => Err(e),
+            Ok(out) if out.success => Ok(out.stdout),
+            Ok(out) => Err(failed(program, &a, &out)),
+        }
+    }
+
     fn unmount(&self, path: &str) -> Result<()> {
         self.run("umount", &args(["-f", path])).map(drop)
     }
@@ -921,6 +975,60 @@ fn parse_wg_dump(out: &str) -> Result<Vec<WgPeer>, String> {
             })
         })
         .collect()
+}
+
+/// Sessions from `iscsictl --libxo json -L -v`.
+fn parse_iscsi(out: &str) -> Result<Vec<IscsiSession>, String> {
+    #[derive(Deserialize)]
+    struct Out {
+        iscsictl: List,
+    }
+    #[derive(Deserialize)]
+    struct List {
+        #[serde(default)]
+        session: Vec<Session>,
+    }
+    #[derive(Deserialize)]
+    struct Session {
+        target: Target,
+        state: String,
+        #[serde(default, rename = "failureReason")]
+        failure: String,
+        #[serde(default)]
+        devices: Option<Devices>,
+    }
+    #[derive(Deserialize)]
+    struct Target {
+        name: String,
+        #[serde(default)]
+        portal: String,
+    }
+    #[derive(Deserialize)]
+    struct Devices {
+        #[serde(default)]
+        lun: Vec<Lun>,
+    }
+    #[derive(Deserialize)]
+    struct Lun {
+        lun: u32,
+        device: String,
+    }
+    let parsed: Out = serde_json::from_str(out).map_err(|e| e.to_string())?;
+    Ok(parsed
+        .iscsictl
+        .session
+        .into_iter()
+        .map(|s| IscsiSession {
+            target: s.target.name,
+            portal: s.target.portal,
+            state: s.state,
+            failure: s.failure,
+            luns: s
+                .devices
+                .map(|d| d.lun.into_iter().map(|l| (l.lun, l.device)).collect())
+                .unwrap_or_default(),
+        })
+        .collect())
 }
 
 fn route_dest(dest: Destination) -> Vec<String> {
@@ -1120,6 +1228,66 @@ mod tests {
         assert_eq!(sh.carp_state("epair0a", 8).unwrap(), None);
         sh.carp_remove("epair0a", carp.addr).unwrap();
         sh.carp_remove("epair0a", carp.addr).unwrap();
+    }
+
+    #[test]
+    fn storage() {
+        // Captured on FreeBSD 15.1: a session with two LUNs, connected, and
+        // one that failed.
+        let sessions = r#"{"__version": "1", "iscsictl": {"session": [{"sessionId":2, "initiator": {"name":"iqn.1994-09.org.freebsd:freebsd","portal":"","alias":""}, "target": {"name":"iqn.2026-10.lan.legion:spike","portal":"127.0.0.1","alias":""}, "auth": {"user":"","secret":"","mutualUser":"","mutualSecret":""},"type":"Normal","enable":"Yes","state":"Connected","failureReason":"","headerDigest":"None","dataDigest":"None","recvDataSegmentLen":262144,"sendDataSegmentLen":262144,"maxBurstLen":1048576,"firstBurstLen":1048576,"immediateData":"Yes","iSER":"No","offloadDriver":"None", "devices": {"lun": [{"lun":0,"device":"da0"}, {"lun":1,"device":"da1"}],"scbus":2,"bus":0,"target":0}}, {"sessionId":1, "initiator": {"name":"iqn.1994-09.org.freebsd:freebsd","portal":"","alias":""}, "target": {"name":"iqn.2026-10.lan.legion:nope","portal":"127.0.0.1","alias":""}, "auth": {"user":"","secret":"","mutualUser":"","mutualSecret":""},"type":"Normal","enable":"Yes","state":"Disconnected","failureReason":"Not found","headerDigest":"None","dataDigest":"None","recvDataSegmentLen":8192,"sendDataSegmentLen":8192,"maxBurstLen":262144,"firstBurstLen":65536,"immediateData":"No","iSER":"No","offloadDriver":"None", "devices": {"lun": [],"scbus":-1,"bus":0,"target":-1}}]}}"#;
+        let spike = "iqn.2026-10.lan.legion:spike";
+        let sh = Script::shell(vec![
+            ("iscsictl --libxo json -L -v", ok(sessions)),
+            (&format!("iscsictl -A -p 127.0.0.1:3260 -t {spike}"), ok("")),
+            ("iscsictl --libxo json -L -v", ok(sessions)),
+            (&format!("iscsictl -R -t {spike}"), ok("")),
+            (
+                "iscsictl --libxo json -L -v",
+                ok(r#"{"__version": "1", "iscsictl": {}}"#),
+            ),
+            ("fstyp /dev/da0", ok("ufs\n")),
+            (
+                "fstyp /dev/da1",
+                err("fstyp: /dev/da1: filesystem not recognized"),
+            ),
+            ("mount -t ufs /dev/da0 /var/run/legion/volumes/x", ok("")),
+            (
+                "mount -t nfs -o nfsv4,soft files:/export /var/run/legion/tasks/t/volumes/v",
+                ok(""),
+            ),
+        ]);
+        let s = sh.iscsi_sessions().unwrap();
+        assert_eq!(s.len(), 2);
+        assert!(s[0].connected() && !s[1].connected());
+        assert_eq!(
+            (s[0].target.as_str(), s[0].portal.as_str()),
+            (spike, "127.0.0.1")
+        );
+        assert_eq!(
+            s[0].luns,
+            BTreeMap::from([(0, "da0".into()), (1, "da1".into())])
+        );
+        assert_eq!((s[1].failure.as_str(), s[1].luns.len()), ("Not found", 0));
+        assert_eq!(s[0].device(1), Some("da1"));
+        let probing = IscsiSession {
+            luns: BTreeMap::from([(0, "probe0".into())]),
+            ..s[0].clone()
+        };
+        assert_eq!(probing.device(0), None);
+        sh.iscsi_attach("127.0.0.1:3260", spike).unwrap();
+        sh.iscsi_detach(spike).unwrap();
+        sh.iscsi_detach(spike).unwrap(); // no session: nothing to do
+        assert_eq!(sh.fs_type("/dev/da0").unwrap().as_deref(), Some("ufs"));
+        assert_eq!(sh.fs_type("/dev/da1").unwrap(), None);
+        sh.mount_fs("ufs", "/dev/da0", "/var/run/legion/volumes/x", "")
+            .unwrap();
+        sh.mount_fs(
+            "nfs",
+            "files:/export",
+            "/var/run/legion/tasks/t/volumes/v",
+            "nfsv4,soft",
+        )
+        .unwrap();
     }
 
     #[test]

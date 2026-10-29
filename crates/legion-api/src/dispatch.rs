@@ -115,7 +115,7 @@ pub type Peers = Vec<Peer>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VolumeClaim {
     /// The volume is the node's now, or was already.
-    Claimed(VolumeSpec),
+    Claimed(Box<VolumeSpec>),
     Missing,
     /// Another node holds the volume's data.
     Elsewhere(String),

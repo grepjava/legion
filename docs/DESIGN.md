@@ -237,7 +237,7 @@ preconditions. Rules:
 | **Session** | Connects to the leader, receives the assignment set, reports task state. Persists the last assignment set in a local `redb` so running tasks survive a manager outage and agent restarts. |
 | **Executor** | Runs each task through the jail runtime (section 6): pulls images into ZFS, builds an infra jail plus child container jails on clones of their images, runs init containers in order, starts containers under their supervisors, reads their output and events. Every container carries `legion.task.id` and `legion.node.id` labels, so the agent can always reconcile the runtime's view against assignments. |
 | **Network** | Creates epairs, attaches them to the node bridge, moves the jail end into the pod's VNET, programs routes, WireGuard peers and pf anchors. See section 5. |
-| **Volumes** | Creates, mounts and snapshots ZFS datasets; mounts them into containers (nullfs). A `Volume` is `<pool>/legion/volumes/<ns>/<name>`, created on first use with its size as quota and bound to that node in its status. Pod `tmpfs` volumes live and die with the pod. |
+| **Volumes** | Creates, mounts and snapshots ZFS datasets; mounts them into containers (nullfs). A ZFS `Volume` is `<pool>/legion/volumes/<ns>/<name>`, created on first use with its size as quota and bound to that node in its status. NFS, iSCSI and plugin volumes are mounted from elsewhere, and iSCSI and unshared plugin ones bound to a node only while it uses them (6.7). Pod `tmpfs` volumes live and die with the pod. |
 | **Secrets** | Writes secrets and configs to a per-task tmpfs (`<run dir>/tasks/<task uid>`) and bind-mounts each file read-only into the container that names it. Files never touch disk. Values used as environment variables are passed to the runtime, which keeps them in the container's record under the data directory; files are the safer form. Values are read when the pod starts. |
 | **Resources** | Applies rctl rules to **each container's own jail** (memory, CPU percentage, process and open-file limits) and `cpuset` pinning. Removes the rules when the task ends; rctl keys rules by jail name and keeps them after the jail is gone. Reads usage with `rctl -u` for metrics and autoscaling. See 6.3. |
 | **Sessions** | Runs the `logs`, `exec` and `port-forward` sessions managers offer it: the container's log, an exec in its jail (stdin, a terminal and its size), or a TCP connection to the pod's address. See 3.8. |
@@ -513,6 +513,7 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
 | Security profiles | Per-service jail parameters (e.g. `allow.raw_sockets`, securelevel, enforce_statfs), with optional MAC policy. | 3 |
 | Linux images | Via `linux64` on nodes started with `--linux`, which placement selects with `node.platform.linux == true` (6.6). | 5 |
 | IPv6 dual-stack | Every pod, VIP and node address has an IPv6 twin in a ULA range, with routes, WireGuard peers, pf rules and tables, DNS AAAA and policy for both families (5.7). | 5 |
+| Volume drivers | `driver: nfs`, `iscsi` (UFS on a LUN, one node at a time) or `plugin` (an executable on the node), beside ZFS (6.7). | 5 |
 | bhyve tasks | `runtime: bhyve` for workloads that need their own kernel. | 5 (exploratory) |
 
 ---
@@ -1009,6 +1010,72 @@ no FreeBSD build, through FreeBSD's Linux ABI (linux(4)):
 - The ABI is not Linux: no namespaces, cgroups, seccomp or io_uring, so
   images that run their own containers or sandboxes do not work, and
   programs reading Linux-only `/proc` or `/sys` files may not either.
+
+### 6.7 Volume drivers and plugins (phase 5)
+
+A `Volume`'s `driver` says where its data is, and with it how tasks may
+share it:
+
+| Driver | Data | Shared | Bound to a node |
+|--------|------|--------|-----------------|
+| `zfs` (default) | A dataset on one node (6.4, 4.3) | By that node's tasks | For good, unless moved |
+| `nfs` | `nfs: { server, path, options }` | By any tasks, anywhere | Never |
+| `iscsi` | `iscsi: { portal, target, lun }`, UFS | By one node's tasks at a time | While its tasks use it |
+| `plugin` | `plugin: { name, options, shared }` | `shared: true`: anywhere; otherwise as iSCSI | Unless shared |
+
+`size` and `node` are for ZFS only; claims (stateful services) always
+make ZFS volumes. Built in `legion_api::volume`, `legion-agent::volumes`,
+`legion-sys`, the dispatcher's claim and the planner's placement.
+
+- **Binding**: an agent claims each Volume before using it, as before. A
+  shared one is never bound; one used a node at a time is bound to the
+  first node, and others' tasks are refused (`held by node …`) and not
+  placed there (`volume on another node`) until it lets go. The agent
+  lets go once no task of its own uses the volume: it unmounts, detaches,
+  and only then tells the dispatcher (`ClaimVolume` with `release`). The
+  release comes from the agent because only the agent knows the device is
+  free; a node that is down keeps its volumes until it returns or is
+  removed, and removing it lets go of them, as removing a node is the
+  word that it no longer runs anything. Draining stops such tasks without
+  a copy; their next tasks wait for the release. Migration (4.3) is for
+  ZFS only.
+- **NFS**: each task mounts the export in its own directory
+  (`<run>/tasks/<uid>/volumes/<name>`), with `nfsv4` unless `options`
+  says otherwise; the task's teardown unmounts it with its other files.
+- **iSCSI**: the node logs in (`iscsictl -A`, loading `iscsi`; iscsid
+  must run), waits for the LUN's device (iscsictl names a LUN `probe…`
+  while CAM probes it, found by the live test), checks it holds UFS
+  (fstyp) and mounts it once at `<run>/volumes/iscsi/<ns>/<name>` for all
+  its tasks. A LUN without UFS is refused, never formatted: a disk whose
+  partition table fstyp does not know would look blank, and formatting it
+  would destroy it. Make the file system once by hand (`newfs`).
+- **Plugins** are the interface for anything else: an executable
+  `<plugin dir>/<name>` (`legion daemon --volume-plugins DIR`, by default
+  `/usr/local/libexec/legion/volume`), run per task as `<plugin> mount
+  <dir>` and `<plugin> unmount <dir>`, with `{"namespace", "volume",
+  "options"}` as JSON on its standard input. Exit 0 is success, standard
+  error the reason otherwise; `mount` must leave a file system mounted at
+  `<dir>`. A plugin missing from the node fails the task (it may be
+  elsewhere); one missing at teardown has its mount unmounted directly.
+- **Records**: a task writes what its teardown must undo (iSCSI targets,
+  plugin mounts) to `attached.json` in its directory before attaching, so
+  a teardown after a failed start or an agent restart still finds it;
+  until the undoing succeeds the directory stays, and the agent's sweep
+  of leftover task directories tries again. One lock keeps a starting
+  task's claim and attach apart from a stopping task's detach and
+  release.
+- Containers get the volumes as before, by nullfs, read-only per mount.
+- Tested: admission of each driver; placement (shared anywhere, a held
+  volume pins its tasks, a drain waits for the release, a removed node's
+  volumes freed); the agent with NFS, iSCSI and a plugin (two tasks
+  sharing a LUN, the release only after the last, a blank LUN refused and
+  logged out of, a volume held elsewhere, a missing plugin); on FreeBSD
+  15.1, an NFSv3 export and a ctld iSCSI target on 127.0.0.1 (the LUN a
+  UFS image built by makefs): mount, write, read back, log out.
+- **Not yet**: CHAP for iSCSI, multipath, other file systems on LUNs,
+  Compose `driver_opts`, timeouts for plugins that hang, and an end-to-end
+  run of a pod on real network storage (the agent's handling is tested
+  with the fake system, the commands on FreeBSD).
 
 ## 7. Object model
 

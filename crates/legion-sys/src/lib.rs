@@ -209,6 +209,30 @@ pub trait Sys: Send + Sync {
     /// Mounts a file system that needs no source (`linprocfs`, `linsysfs`,
     /// `fdescfs`) at `target`, with `options` if not empty.
     fn mount_pseudo(&self, fstype: &str, target: &str, options: &str) -> Result<()>;
+    /// Mounts `source` (`server:/path` for `nfs`, a device for `ufs`) at
+    /// the existing directory `target`, with `options` (comma-separated)
+    /// if not empty.
+    fn mount_fs(&self, fstype: &str, source: &str, target: &str, options: &str) -> Result<()>;
+    /// The file system on a device (`ufs`, `zfs`, `msdosfs`, ...), as
+    /// fstyp(8) knows it; `None` if it finds none.
+    fn fs_type(&self, device: &str) -> Result<Option<String>>;
+
+    // iSCSI initiator (host only; iscsid(8) must run).
+
+    /// The node's iSCSI sessions.
+    fn iscsi_sessions(&self) -> Result<Vec<IscsiSession>>;
+    /// Logs in to `target` at `portal` (`host[:port]`); the session
+    /// connects in the background.
+    fn iscsi_attach(&self, portal: &str, target: &str) -> Result<()>;
+    /// Logs out of `target`, removing its devices; no session is fine.
+    fn iscsi_detach(&self, target: &str) -> Result<()>;
+
+    // Programs.
+
+    /// Runs `program` with `args` and `input` on its standard input, as
+    /// volume plugins are; its standard output if it succeeds.
+    /// [`Error::NotFound`] if there is no such program.
+    fn run_program(&self, program: &str, args: &[&str], input: &str) -> Result<String>;
     /// Unmounts `path`, forcibly: callers unmount only what nothing uses.
     fn unmount(&self, path: &str) -> Result<()>;
     /// Mount points at or below `prefix`.
@@ -236,6 +260,34 @@ pub struct PfState {
     /// Every address on the state's line: both ends and the translated
     /// one (the VIP of a load-balanced connection, for example).
     pub addrs: Vec<IpAddr>,
+}
+
+/// An iSCSI session of this node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IscsiSession {
+    pub target: String,
+    pub portal: String,
+    /// `Connected`, `Disconnected`, ...
+    pub state: String,
+    /// Why it is not connected, if it says.
+    pub failure: String,
+    /// Its LUNs' devices (`da0`), by LUN.
+    pub luns: BTreeMap<u32, String>,
+}
+
+impl IscsiSession {
+    pub fn connected(&self) -> bool {
+        self.state == "Connected"
+    }
+
+    /// The device of a LUN, once it has one: while CAM probes it, iscsictl
+    /// shows a placeholder (`probe0`) that is no device.
+    pub fn device(&self, lun: u32) -> Option<&str> {
+        self.luns
+            .get(&lun)
+            .map(String::as_str)
+            .filter(|d| !d.starts_with("probe"))
+    }
 }
 
 /// A WireGuard peer.

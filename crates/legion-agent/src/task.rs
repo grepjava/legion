@@ -46,12 +46,31 @@ pub(crate) struct Ctx<R, C> {
     pub files_dir: std::path::PathBuf,
     pub logs_dir: Option<std::path::PathBuf>,
     pub zfs_root: Option<String>,
+    /// What the node mounts once for all its tasks (iSCSI volumes).
+    pub volumes_dir: std::path::PathBuf,
+    /// Volume plugins, by name.
+    pub plugin_dir: std::path::PathBuf,
+    /// Keeps attaching and letting go of volumes apart.
+    pub volume_lock: Arc<tokio::sync::Mutex<()>>,
     /// Set once the node has registered, before any worker starts.
     pub net: Arc<OnceLock<PodNetwork>>,
     /// Pod addresses in use, by task uid.
     pub ips: Arc<Mutex<BTreeMap<String, Ipv4Addr>>>,
     /// How long a ready task told to stop keeps running first.
     pub drain: std::time::Duration,
+}
+
+impl<R, C> Ctx<R, C> {
+    pub(crate) fn places(&self) -> volumes::Places<'_> {
+        volumes::Places {
+            node: &self.node,
+            zfs_root: self.zfs_root.as_deref(),
+            files_dir: &self.files_dir,
+            volumes_dir: &self.volumes_dir,
+            plugin_dir: &self.plugin_dir,
+            lock: &self.volume_lock,
+        }
+    }
 }
 
 impl<R, C> Clone for Ctx<R, C> {
@@ -65,6 +84,9 @@ impl<R, C> Clone for Ctx<R, C> {
             files_dir: self.files_dir.clone(),
             logs_dir: self.logs_dir.clone(),
             zfs_root: self.zfs_root.clone(),
+            volumes_dir: self.volumes_dir.clone(),
+            plugin_dir: self.plugin_dir.clone(),
+            volume_lock: self.volume_lock.clone(),
             net: self.net.clone(),
             ips: self.ips.clone(),
             drain: self.drain,
@@ -360,9 +382,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         let sources = volumes::prepare(
             self.ctx.control.as_ref(),
             &self.ctx.sys,
-            &self.ctx.node,
-            self.ctx.zfs_root.as_deref(),
-            &self.ctx.files_dir,
+            &self.ctx.places(),
             &self.a,
         )
         .await
@@ -952,6 +972,11 @@ pub(crate) async fn teardown<R: Runtime, C: Control>(
     .await;
     if let Err(e) = result {
         tracing::warn!(uid, "removing limits: {e}");
+    }
+    // Volumes first: what they record is in the task's directory.
+    if let Err(e) = volumes::release(ctx.control.as_ref(), &ctx.sys, &ctx.places(), uid).await {
+        tracing::warn!(uid, "letting go of volumes: {e}");
+        return;
     }
     let (root, id) = (ctx.files_dir.clone(), uid.to_owned());
     if let Err(e) = blocking(&ctx.sys, move |sys| files::release(sys, &root, &id)).await {

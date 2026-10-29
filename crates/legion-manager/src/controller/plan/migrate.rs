@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use legion_api::node::{Availability, NodeState};
 use legion_api::service::{ServiceMode, claim_volume};
-use legion_api::volume::{Migration, MigrationPhase, VolumeStatus};
+use legion_api::volume::{Access, Migration, MigrationPhase, VolumeStatus};
 
 use super::{Action, Node, Plan, Service, Task, Volume, Volumes, eligible, shared_volumes};
 
@@ -33,6 +33,21 @@ pub(super) fn migrations(
             n.status.state == NodeState::Ready && n.spec.availability == Availability::Active
         })
     };
+
+    // A volume used one node at a time stays with its node until the node
+    // lets go of it, or is removed: removing a node is the word that it
+    // no longer uses anything.
+    for v in volumes.values() {
+        if v.spec.access() == Access::Single
+            && !v.status.node.is_empty()
+            && node(&v.status.node).is_none()
+        {
+            let mut o = v.object.clone();
+            o.status = serde_json::to_value(VolumeStatus::default()).expect("serialises");
+            plan.actions
+                .push(Action::Update(o, v.object.metadata.version));
+        }
+    }
 
     // Advance or drop the migrations under way. One not yet finishing goes
     // when neither a drain nor the Volume's `node` calls for it any more.
@@ -176,7 +191,8 @@ pub(super) fn copied(t: &Task, volumes: &Volumes) -> bool {
         volumes
             .get(&(namespace.clone(), name.clone()))
             .is_none_or(|v| {
-                v.status.node != t.spec.node
+                v.spec.access() != Access::Local
+                    || v.status.node != t.spec.node
                     || v.status.migration.as_ref().is_some_and(|m| {
                         matches!(m.phase, MigrationPhase::Copied | MigrationPhase::Finishing)
                     })

@@ -104,6 +104,11 @@ enum Command {
         /// `node.platform.linux == true`.
         #[arg(long)]
         linux: bool,
+        /// Where the node's volume plugins are: executables, by the name
+        /// a Volume's `plugin.name` gives [default:
+        /// /usr/local/libexec/legion/volume].
+        #[arg(long)]
+        volume_plugins: Option<PathBuf>,
     },
     /// Start a new cluster with the reached manager as its first member.
     Init,
@@ -425,6 +430,7 @@ async fn run() -> anyhow::Result<()> {
             ingress_listen,
             ingress_tls_listen,
             linux,
+            volume_plugins,
         } => {
             let vip = match (vip, vip_interface, vip_password_file) {
                 (Some(addr), Some(interface), Some(file)) => {
@@ -456,6 +462,7 @@ async fn run() -> anyhow::Result<()> {
                 ingress_listen,
                 ingress_tls_listen,
                 linux,
+                volume_plugins,
             })
             .await
         }

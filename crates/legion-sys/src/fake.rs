@@ -15,8 +15,8 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::{
-    Carp, CarpState, Dataset, Destination, Epair, Error, IfConfig, Jail, PfState, RctlRule, Result,
-    Sys, WgPeer,
+    Carp, CarpState, Dataset, Destination, Epair, Error, IfConfig, IscsiSession, Jail, PfState,
+    RctlRule, Result, Sys, WgPeer,
 };
 
 #[derive(Debug, Default)]
@@ -64,6 +64,19 @@ struct State {
     origins: BTreeMap<String, String>,
     /// tmpfs mount points, with their size.
     mounts: BTreeMap<String, Option<u64>>,
+    /// What `mount_fs` mounted where: `<fstype> <source>`.
+    sources: BTreeMap<String, String>,
+    /// iSCSI targets that may be logged in to, with their LUNs' devices.
+    targets: BTreeMap<String, BTreeMap<u32, String>>,
+    /// Targets logged in to, with their portals.
+    sessions: BTreeMap<String, String>,
+    /// File systems on devices, by device path.
+    filesystems: BTreeMap<String, String>,
+    /// Programs that run as volume plugins: `mount <dir>` mounts something
+    /// there, `unmount <dir>` unmounts it.
+    plugins: BTreeSet<String>,
+    /// Every program run, with its arguments.
+    ran: Vec<String>,
     /// devfs links: path, target. They go with their devfs's unmount.
     links: BTreeMap<String, String>,
     default_interface: Option<String>,
@@ -295,6 +308,43 @@ impl FakeSys {
 
     pub fn devfs_links(&self) -> BTreeMap<String, String> {
         self.state().links.clone()
+    }
+
+    /// What [`Sys::mount_fs`] mounted at `path`: `<fstype> <source>`.
+    pub fn mount_source(&self, path: &str) -> Option<String> {
+        let s = self.state();
+        s.mounts
+            .contains_key(path)
+            .then(|| s.sources.get(path).cloned())?
+    }
+
+    /// An iSCSI target this host may log in to, its LUNs as devices
+    /// (`da0`) holding file systems (`ufs`, or none).
+    pub fn add_iscsi_target(&self, target: &str, luns: &[(u32, &str, Option<&str>)]) {
+        let mut s = self.state();
+        let devices = luns.iter().map(|(l, d, _)| (*l, (*d).to_owned())).collect();
+        s.targets.insert(target.to_owned(), devices);
+        for (_, device, fs) in luns {
+            if let Some(fs) = fs {
+                s.filesystems
+                    .insert(format!("/dev/{device}"), (*fs).to_owned());
+            }
+        }
+    }
+
+    /// The targets logged in to.
+    pub fn iscsi_targets(&self) -> Vec<String> {
+        self.state().sessions.keys().cloned().collect()
+    }
+
+    /// Makes `program` a volume plugin.
+    pub fn add_plugin(&self, program: &str) {
+        self.state().plugins.insert(program.to_owned());
+    }
+
+    /// The programs run so far, each with its arguments.
+    pub fn programs_run(&self) -> Vec<String> {
+        self.state().ran.clone()
     }
 }
 
@@ -1120,10 +1170,104 @@ must destroy them to overwrite it"
         self.mount_tmpfs(target, None, 0)
     }
 
+    fn mount_fs(&self, fstype: &str, source: &str, target: &str, _options: &str) -> Result<()> {
+        if fstype == "ufs" && !self.state().filesystems.contains_key(source) {
+            return Err(fail("mount", format!("{source}: Invalid argument")));
+        }
+        self.mount_tmpfs(target, None, 0)?;
+        self.state()
+            .sources
+            .insert(target.to_owned(), format!("{fstype} {source}"));
+        Ok(())
+    }
+
+    fn fs_type(&self, device: &str) -> Result<Option<String>> {
+        let s = self.state();
+        let attached = s
+            .sessions
+            .keys()
+            .filter_map(|t| s.targets.get(t))
+            .any(|luns| luns.values().any(|d| format!("/dev/{d}") == device));
+        if !attached {
+            return Err(fail(
+                "fstyp",
+                format!("{device}: No such file or directory"),
+            ));
+        }
+        Ok(s.filesystems.get(device).cloned())
+    }
+
+    fn iscsi_sessions(&self) -> Result<Vec<IscsiSession>> {
+        let s = self.state();
+        Ok(s.sessions
+            .iter()
+            .map(|(target, portal)| IscsiSession {
+                target: target.clone(),
+                portal: portal.clone(),
+                state: "Connected".into(),
+                failure: String::new(),
+                luns: s.targets[target].clone(),
+            })
+            .collect())
+    }
+
+    fn iscsi_attach(&self, portal: &str, target: &str) -> Result<()> {
+        let mut s = self.state();
+        if s.sessions.contains_key(target) {
+            return Err(fail("iscsictl", "iscsictl: session already exists"));
+        }
+        if !s.targets.contains_key(target) {
+            // The real one adds a session that never connects.
+            return Err(fail("iscsictl", format!("{target}: Not found (fake)")));
+        }
+        s.sessions.insert(target.to_owned(), portal.to_owned());
+        Ok(())
+    }
+
+    fn iscsi_detach(&self, target: &str) -> Result<()> {
+        let mut s = self.state();
+        if let Some(luns) = s.targets.get(target) {
+            let devices: Vec<String> = luns.values().map(|d| format!("/dev/{d}")).collect();
+            if s.sources.iter().any(|(path, src)| {
+                s.mounts.contains_key(path)
+                    && devices.iter().any(|d| src.ends_with(&format!(" {d}")))
+            }) {
+                return Err(fail("iscsictl", "device busy: still mounted (fake)"));
+            }
+        }
+        s.sessions.remove(target);
+        Ok(())
+    }
+
+    fn run_program(&self, program: &str, args: &[&str], _input: &str) -> Result<String> {
+        let mut s = self.state();
+        s.ran.push(
+            std::iter::once(program)
+                .chain(args.iter().copied())
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        if !s.plugins.contains(program) {
+            return Err(Error::NotFound(program.to_owned()));
+        }
+        drop(s);
+        match args {
+            ["mount", dir] => self.mount_tmpfs(dir, None, 0).map(|()| String::new()),
+            ["unmount", dir] => {
+                if self.state().mounts.contains_key(*dir) {
+                    self.unmount(dir)?;
+                }
+                Ok(String::new())
+            }
+            _ => Err(fail(program, "usage: mount|unmount DIR")),
+        }
+    }
+
     fn unmount(&self, path: &str) -> Result<()> {
         let mut s = self.state();
         let inside = format!("{path}/");
         s.links.retain(|l, _| !l.starts_with(&inside));
+        s.sources.remove(path);
         match s.mounts.remove(path) {
             Some(_) => Ok(()),
             None => Err(fail(

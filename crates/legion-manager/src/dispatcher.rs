@@ -24,7 +24,7 @@ use legion_api::dispatch::{
 use legion_api::node::{NodeSpec, NodeState, NodeStatus};
 use legion_api::service::{PortRef, ServiceSpec, ServiceStatus};
 use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
-use legion_api::volume::{MigrationPhase, VolumeSpec, VolumeStatus};
+use legion_api::volume::{Access, MigrationPhase, VolumeSpec, VolumeStatus};
 use legion_api::{Kind, Object, ObjectKey};
 use legion_pki::Role;
 use legion_proto::v1::dispatcher_client::DispatcherClient;
@@ -338,7 +338,11 @@ impl DispatcherService {
         namespace: &str,
         name: &str,
         dataset: &str,
+        release: bool,
     ) -> Result<VolumeClaim, Status> {
+        if release {
+            return self.release_local(node, namespace, name).await;
+        }
         if !self
             .tasks_of(node, namespace)?
             .iter()
@@ -356,6 +360,13 @@ impl DispatcherService {
             let spec: VolumeSpec = serde_json::from_value(volume.spec.clone()).map_err(internal)?;
             let status: VolumeStatus =
                 serde_json::from_value(volume.status.clone()).unwrap_or_default();
+            // A node without ZFS names no dataset, and must not hold one;
+            // it refuses the volume itself.
+            if spec.access() == Access::Shared
+                || (spec.access() == Access::Local && dataset.is_empty())
+            {
+                return Ok(VolumeClaim::Claimed(Box::new(spec)));
+            }
             if !status.node.is_empty() && status.node != node {
                 return Ok(VolumeClaim::Elsewhere(status.node));
             }
@@ -366,7 +377,7 @@ impl DispatcherService {
                 return Ok(VolumeClaim::Elsewhere(m.to.clone()));
             }
             if status.node == node && status.dataset == dataset {
-                return Ok(VolumeClaim::Claimed(spec));
+                return Ok(VolumeClaim::Claimed(Box::new(spec)));
             }
             volume.status = serde_json::to_value(VolumeStatus {
                 node: node.to_owned(),
@@ -376,7 +387,37 @@ impl DispatcherService {
             .map_err(internal)?;
             let version = volume.metadata.version;
             match self.write(volume, Precondition::Version(version)).await? {
-                Outcome::Written(_) => return Ok(VolumeClaim::Claimed(spec)),
+                Outcome::Written(_) => return Ok(VolumeClaim::Claimed(Box::new(spec))),
+                Outcome::Conflict { .. } => continue,
+                other => return Err(unexpected(other)),
+            }
+        }
+        Err(Status::unavailable(format!("{key} keeps changing")))
+    }
+
+    /// Unbinds a volume used one node at a time from `node`, which has let
+    /// go of it; one bound elsewhere, or to nothing, is left alone.
+    async fn release_local(
+        &self,
+        node: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<VolumeClaim, Status> {
+        let key = ObjectKey::new(Kind::Volume, namespace, name);
+        for _ in 0..ATTEMPTS {
+            let Some(mut volume) = self.get(&key)? else {
+                return Ok(VolumeClaim::Missing);
+            };
+            let spec: VolumeSpec = serde_json::from_value(volume.spec.clone()).map_err(internal)?;
+            let status: VolumeStatus =
+                serde_json::from_value(volume.status.clone()).unwrap_or_default();
+            if spec.access() != Access::Single || status.node != node {
+                return Ok(VolumeClaim::Claimed(Box::new(spec)));
+            }
+            volume.status = serde_json::to_value(VolumeStatus::default()).map_err(internal)?;
+            let version = volume.metadata.version;
+            match self.write(volume, Precondition::Version(version)).await? {
+                Outcome::Written(_) => return Ok(VolumeClaim::Claimed(Box::new(spec))),
                 Outcome::Conflict { .. } => continue,
                 other => return Err(unexpected(other)),
             }
@@ -584,7 +625,7 @@ impl Dispatcher for DispatcherService {
         }
         let r = req.into_inner();
         let claim = self
-            .claim_local(&node, &r.namespace, &r.name, &r.dataset)
+            .claim_local(&node, &r.namespace, &r.name, &r.dataset, r.release)
             .await?;
         Ok(Response::new(ClaimVolumeResponse {
             claim_json: serde_json::to_vec(&claim).map_err(internal)?,

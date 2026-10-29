@@ -1263,8 +1263,216 @@ async fn volume_problems() {
     h.write(v, Precondition::MustNotExist).await;
     let key = h.task("db-2", VOLUMES).await;
     let st = h.wait_state(&key, TaskState::Rejected).await;
-    assert_eq!(st.message, "volume data lives on node n2");
+    assert_eq!(st.message, "volume data is held by node n2");
     assert!(h.sys.zfs_list("tank").unwrap().is_empty());
+    assert!(h.rt.containers().is_empty());
+}
+
+const NETWORK_VOLUMES: &str = r#"
+containers:
+  - name: app
+    image: "app:1"
+    volumeMounts:
+      - { name: files, path: /srv/files }
+      - { name: block, path: /var/db }
+      - { name: objects, path: /srv/objects }
+volumes:
+  - { name: files, volume: { name: files } }
+  - { name: block, volume: { name: block } }
+  - { name: objects, volume: { name: objects } }
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_volumes() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let iqn = "iqn.2026-10.lan.legion:block";
+    h.sys.add_iscsi_target(iqn, &[(0, "da0", Some("ufs"))]);
+    let plugin = format!("{}/store", legion_agent::DEFAULT_PLUGIN_DIR);
+    h.sys.add_plugin(&plugin);
+    for (name, spec) in [
+        (
+            "files",
+            serde_json::json!({ "driver": "nfs", "nfs": { "server": "files.lan", "path": "/export/shop", "options": ["nfsv3", "soft"] } }),
+        ),
+        (
+            "block",
+            serde_json::json!({ "driver": "iscsi", "iscsi": { "portal": "192.0.2.9", "target": iqn } }),
+        ),
+        (
+            "objects",
+            serde_json::json!({ "driver": "plugin", "plugin": { "name": "store", "options": { "bucket": "shop" } } }),
+        ),
+    ] {
+        h.write(
+            Object::new(Kind::Volume, "shop", name, spec),
+            Precondition::MustNotExist,
+        )
+        .await;
+    }
+    let volume_node = |name: &str| {
+        let v = h
+            .store
+            .get(&ObjectKey::new(Kind::Volume, "shop", name))
+            .unwrap()
+            .unwrap();
+        v.status["node"].as_str().unwrap_or_default().to_owned()
+    };
+
+    let one = h.task("app-1", NETWORK_VOLUMES).await;
+    eventually("app-1 running", || {
+        let st = h.status(&one);
+        assert!(!st.state.is_terminal(), "{st:?}");
+        st.state == TaskState::Running
+    })
+    .await;
+    let uid = |key: &ObjectKey| h.store.get(key).unwrap().unwrap().metadata.uid;
+    let task_volume = |key: &ObjectKey, name: &str| {
+        h.files_dir()
+            .join(uid(key))
+            .join("volumes")
+            .join(name)
+            .to_str()
+            .unwrap()
+            .to_owned()
+    };
+    // NFS, in the task's directory; bound to no node.
+    assert_eq!(
+        h.sys.mount_source(&task_volume(&one, "files")).as_deref(),
+        Some("nfs files.lan:/export/shop")
+    );
+    assert_eq!(volume_node("files"), "");
+    // iSCSI: logged in, mounted once for the node, bound to it.
+    let block = h
+        ._dir
+        .path()
+        .join("volumes")
+        .join("iscsi")
+        .join("shop")
+        .join("block");
+    let block = block.to_str().unwrap();
+    assert_eq!(h.sys.iscsi_targets(), [iqn]);
+    assert_eq!(h.sys.mount_source(block).as_deref(), Some("ufs /dev/da0"));
+    assert_eq!(volume_node("block"), NODE);
+    // The plugin mounted its volume, unshared, so bound as well.
+    let objects = task_volume(&one, "objects");
+    assert!(
+        h.sys
+            .programs_run()
+            .contains(&format!("{plugin} mount {objects}")),
+        "{:?}",
+        h.sys.programs_run()
+    );
+    assert_eq!(volume_node("objects"), NODE);
+    let spec = h.rt.spec("shop_app-1_app").unwrap();
+    for (source, dest) in [
+        (task_volume(&one, "files"), "/srv/files"),
+        (block.to_owned(), "/var/db"),
+        (objects.clone(), "/srv/objects"),
+    ] {
+        assert!(
+            spec.mounts
+                .iter()
+                .any(|m| m.source == source && m.destination == dest),
+            "{source} at {dest}: {:?}",
+            spec.mounts
+        );
+    }
+
+    // A second task here shares the iSCSI mount.
+    let two = h.task("app-2", NETWORK_VOLUMES).await;
+    h.wait_state(&two, TaskState::Running).await;
+    assert_eq!(h.sys.iscsi_targets(), [iqn]);
+    // The first goes: the second still uses the LUN and the plugin's
+    // volume, so the node keeps them.
+    h.delete(&one).await;
+    eventually("app-1's pod is gone", || {
+        h.sys.mount_source(&task_volume(&two, "files")).is_some()
+            && h.rt.spec("shop_app-1_app").is_none()
+            && h.sys
+                .programs_run()
+                .contains(&format!("{plugin} unmount {objects}"))
+    })
+    .await;
+    assert_eq!(h.sys.iscsi_targets(), [iqn]);
+    assert!(h.sys.mount_source(block).is_some());
+    assert_eq!(
+        (volume_node("block"), volume_node("objects")),
+        (NODE.to_owned(), NODE.to_owned())
+    );
+    // The last goes: unmounted, logged out, let go.
+    h.delete(&two).await;
+    eventually("the node lets go", || {
+        h.sys.iscsi_targets().is_empty()
+            && volume_node("block").is_empty()
+            && volume_node("objects").is_empty()
+    })
+    .await;
+    assert!(h.sys.mount_source(block).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_volume_problems() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let pod = |volume: &str| {
+        format!(
+            "containers: [{{ name: app, image: \"app:1\", volumeMounts: [{{ name: v, path: /v }}] }}]\n\
+             volumes: [{{ name: v, volume: {{ name: {volume} }} }}]"
+        )
+    };
+    let iscsi = |target: &str| serde_json::json!({ "driver": "iscsi", "iscsi": { "portal": "192.0.2.9", "target": target } });
+    // A LUN with no file system is refused, not formatted; the node lets
+    // go of it.
+    h.sys
+        .add_iscsi_target("iqn.2026-10.lan.legion:blank", &[(0, "da1", None)]);
+    h.write(
+        Object::new(
+            Kind::Volume,
+            "shop",
+            "blank",
+            iscsi("iqn.2026-10.lan.legion:blank"),
+        ),
+        Precondition::MustNotExist,
+    )
+    .await;
+    let key = h.task("a-1", &pod("blank")).await;
+    let st = h.wait_state(&key, TaskState::Failed).await;
+    assert!(
+        st.message.contains("holds no file system"),
+        "{}",
+        st.message
+    );
+    eventually("logged out of the blank LUN", || {
+        h.sys.iscsi_targets().is_empty()
+    })
+    .await;
+    // A LUN another node holds: rejected.
+    let mut v = Object::new(
+        Kind::Volume,
+        "shop",
+        "held",
+        iscsi("iqn.2026-10.lan.legion:held"),
+    );
+    v.status = serde_json::json!({ "node": "n2" });
+    h.write(v, Precondition::MustNotExist).await;
+    let key = h.task("a-2", &pod("held")).await;
+    let st = h.wait_state(&key, TaskState::Rejected).await;
+    assert_eq!(st.message, "volume held is held by node n2");
+    // A plugin the node does not have.
+    h.write(
+        Object::new(
+            Kind::Volume,
+            "shop",
+            "odd",
+            serde_json::json!({ "driver": "plugin", "plugin": { "name": "nope", "shared": true } }),
+        ),
+        Precondition::MustNotExist,
+    )
+    .await;
+    let key = h.task("a-3", &pod("odd")).await;
+    let st = h.wait_state(&key, TaskState::Failed).await;
+    assert!(st.message.contains("no volume plugin"), "{}", st.message);
     assert!(h.rt.containers().is_empty());
 }
 

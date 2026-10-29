@@ -335,3 +335,69 @@ fn zfs_datasets() {
     sys.zfs_destroy(&base, true).unwrap();
     assert!(sys.zfs_list(&base).unwrap().is_empty());
 }
+
+/// Network storage against servers set up beforehand, which it only
+/// mounts, writes to and lets go of: `LEGION_SYS_NFS` names an export
+/// (`server:/path`, NFSv3) and `LEGION_SYS_ISCSI` a target holding UFS on
+/// LUN 0 (`portal target`); iscsid must run.
+#[test]
+#[ignore = "needs root, LEGION_SYS_NFS and LEGION_SYS_ISCSI"]
+fn network_storage() {
+    let sys = Shell::new();
+    let dir = std::env::temp_dir().join(format!("lsysnet{}", std::process::id()));
+    let (nfs_dir, ufs_dir) = (dir.join("nfs"), dir.join("ufs"));
+    std::fs::create_dir_all(&nfs_dir).unwrap();
+    std::fs::create_dir_all(&ufs_dir).unwrap();
+    let (nfs_path, ufs_path) = (nfs_dir.to_str().unwrap(), ufs_dir.to_str().unwrap());
+
+    if let Ok(export) = std::env::var("LEGION_SYS_NFS") {
+        sys.mount_fs("nfs", &export, nfs_path, "nfsv3").unwrap();
+        assert!(sys.mounts(nfs_path).unwrap().contains(&nfs_path.to_owned()));
+        let file = nfs_dir.join(format!("legion-{}", std::process::id()));
+        std::fs::write(&file, "over nfs").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "over nfs");
+        std::fs::remove_file(&file).unwrap();
+        sys.unmount(nfs_path).unwrap();
+        assert!(sys.mounts(nfs_path).unwrap().is_empty());
+    }
+
+    if let Ok(spec) = std::env::var("LEGION_SYS_ISCSI") {
+        let (portal, target) = spec.split_once(' ').expect("portal target");
+        sys.kld_load("iscsi").unwrap();
+        sys.iscsi_attach(portal, target).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let device = loop {
+            let s = sys.iscsi_sessions().unwrap();
+            let s = s.iter().find(|s| s.target == target).expect("a session");
+            if s.connected()
+                && let Some(d) = s.device(0)
+            {
+                break format!("/dev/{d}");
+            }
+            assert!(std::time::Instant::now() < deadline, "{s:?}");
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        };
+        assert_eq!(sys.fs_type(&device).unwrap().as_deref(), Some("ufs"));
+        sys.mount_fs("ufs", &device, ufs_path, "").unwrap();
+        let file = ufs_dir.join("legion");
+        std::fs::write(&file, "on the lun").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "on the lun");
+        sys.unmount(ufs_path).unwrap();
+        sys.iscsi_detach(target).unwrap();
+        sys.iscsi_detach(target).unwrap(); // gone: fine
+        assert!(
+            !sys.iscsi_sessions()
+                .unwrap()
+                .iter()
+                .any(|s| s.target == target)
+        );
+    }
+
+    // Plugins are programs fed their input.
+    assert_eq!(sys.run_program("/bin/cat", &[], "fed").unwrap(), "fed");
+    assert!(matches!(
+        sys.run_program("/nonexistent/plugin", &["mount", "/x"], ""),
+        Err(legion_sys::Error::NotFound(_))
+    ));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

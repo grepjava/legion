@@ -32,7 +32,8 @@ service Dispatcher {
   rpc Routes(RoutesRequest) returns (stream RoutesUpdate);
   // A task's status, from the node it is assigned to.
   rpc Report(ReportRequest) returns (ReportResponse);
-  // Binds a volume one of the node's tasks uses to the node.
+  // Binds a volume one of the node's tasks uses to the node, or, with
+  // `release`, lets go of one used one node at a time.
   rpc ClaimVolume(ClaimVolumeRequest) returns (ClaimVolumeResponse);
   // A secret or config one of the node's tasks uses.
   rpc Data(DataRequest) returns (DataResponse);
@@ -125,6 +126,8 @@ message ClaimVolumeRequest {
   string name = 3;
   // The node's dataset for it.
   string dataset = 4;
+  // The node no longer uses it: it has unmounted and detached it.
+  bool release = 5;
 }
 
 message ClaimVolumeResponse {

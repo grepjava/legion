@@ -18,7 +18,7 @@ use legion_api::service::{
     TaintEffect, UpdateOrder, UpdateState, UpdateStatus, claim_volume, update_snapshot,
 };
 use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus, VolumeSnapshot};
-use legion_api::volume::{VolumeSpec, VolumeStatus};
+use legion_api::volume::{Access, VolumeDriver, VolumeSpec, VolumeStatus};
 use legion_api::{Kind, Object, ObjectKey};
 use tokio::time::Instant;
 
@@ -81,12 +81,14 @@ pub struct Volume {
 /// Every Volume, by namespace and name.
 pub type Volumes = BTreeMap<(String, String), Volume>;
 
-/// The node holding a Volume's data, once a task has used it.
+/// The node holding a Volume's data, once a task has used it, or using a
+/// volume only one node may use at a time; none for a shared one.
 fn home<'a>(volumes: &'a Volumes, namespace: &str, name: &str) -> Option<&'a str> {
     let v = volumes.get(&(namespace.to_owned(), name.to_owned()))?;
-    match v.status.node.as_str() {
-        "" => v.spec.node.as_deref(),
-        node => Some(node),
+    match (v.spec.access(), v.status.node.as_str()) {
+        (Access::Shared, _) | (Access::Single, "") => None,
+        (Access::Local, "") => v.spec.node.as_deref(),
+        (_, node) => Some(node),
     }
 }
 
@@ -878,6 +880,7 @@ fn claims(s: &Service, wanted: &[Slot], volumes: &Volumes, plan: &mut Plan) {
                 }
                 Some(v)
                     if v.spec.size != src.size
+                        && v.spec.driver == VolumeDriver::Zfs
                         && v.object
                             .metadata
                             .labels

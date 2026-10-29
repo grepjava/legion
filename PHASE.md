@@ -861,8 +861,21 @@ replaces Podman and ocijail.
   and peers; on FreeBSD 15.1, the system layer's live test, pods and
   policy on one bridge, and the three-node mesh, all over IPv6 as well.
 
+- **Volume drivers and plugins** (DESIGN.md §6.7): a Volume's `driver`
+  is `zfs` (as before), `nfs` (mounted per task, shared by any nodes),
+  `iscsi` (logged in to and mounted once per node; one node at a time)
+  or `plugin` (an executable in the node's plugin directory, run as
+  `mount|unmount <dir>` with the options as JSON; shared or one node at
+  a time). A volume used one node at a time is bound to the node while
+  its tasks use it; the agent lets go (unmounts, logs out, then
+  `ClaimVolume` with `release`) after the last one, and a removed node's
+  volumes are freed. LUNs must hold UFS: Legion never formats. Tested:
+  admission, placement, the agent with all three drivers on the fake
+  system; on FreeBSD 15.1, mounts of a real NFSv3 export and a ctld
+  iSCSI LUN, which found that a LUN's device is a `probe…` placeholder
+  for a moment after login.
+
 ### To do, in order
 
-Next in phase 5: a volume plugin interface (NFS, iSCSI), bhyve tasks
-(exploratory).
+Next in phase 5: bhyve tasks (exploratory).
 
