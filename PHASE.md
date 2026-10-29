@@ -757,13 +757,34 @@ replaces Podman and ocijail.
   (12 s) with its `schg` and set-uid files and numeric owners, and a
   whiteout and a replacement of `schg` files.
 
+- **Jail runtime** (crate `legion-jail`; `Sys::jail_create`,
+  `jail_remove`, `mount_nullfs`, `mount_devfs`): the agent's `Runtime`
+  over jails. A pod is a `persist` VNET jail on `/var/empty`; members are
+  child jails on ZFS clones of their images, with devfs (ruleset 4),
+  nullfs mounts (targets made without following the image's links) and
+  the security profile's jail parameters set at creation. Each process
+  runs under a supervisor (`legion-jail-shim`, to be `legion jail-shim`)
+  that enters the jail as the container's user, keeps its output (lines
+  by stream, rotated at 8 MiB) and its exit status, and removes the jail
+  when the process ends; it outlives the agent, which finds its
+  containers again from their state directories (a run from before a
+  reboot counts as over). Stop asks the supervisor for the stop signal,
+  then removes the jail after the grace period. Exec enters the jail the
+  same way, with a terminal when asked. Tested: log records, rotation and
+  tails, stop signals, mount targets; on FreeBSD, a pod with members (a
+  member starts in about 30 ms), a mounted file, environment, user
+  switching, exec with and without a terminal, exit codes and `died`
+  events, a missing command failing the start, a new runtime finding
+  everything, stop by signal and by grace period, restart, and removal
+  leaving no jail, mount or dataset.
+
 ### To do, in order
 
-1. The jail runtime in the agent: containers as clones and jails, the
-   `legion jail-shim` supervisor, logs, exec, events, recovery after an
-   agent restart; `--runtime jail|podman` on the daemon.
-3. The exit tests on the jail runtime, then it becomes the default.
-4. Podman's runtime removed once nothing needs it.
+1. The jail runtime in the daemon: `legion jail-shim`, `--runtime
+   jail|podman`, the image store on the node's ZFS dataset, unused
+   images pruned, and the agent's live tests run on it.
+2. The exit tests on the jail runtime, then it becomes the default.
+3. Podman's runtime removed once nothing needs it.
 
 Then: Linux images, IPv6 dual-stack, a volume plugin interface (NFS,
 iSCSI), bhyve tasks (exploratory).
