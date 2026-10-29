@@ -1,5 +1,5 @@
 //! Three nodes in one process: a served manager and three agents, each
-//! with its own faked Podman and system, all through the dispatcher. Tasks
+//! with its own faked runtime and system, all through the dispatcher. Tasks
 //! spread over the nodes, every node balances every service, a node that
 //! goes silent loses its tasks to the others, and a stateful task's data
 //! moves with it off a draining node.

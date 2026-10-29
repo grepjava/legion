@@ -22,9 +22,6 @@
 //!     target/debug/deps/stateful-<hash> --ignored --nocapture
 //! ```
 //!
-//! With `LEGION_CLUSTER_RUNTIME=podman` it is any archive `podman load`
-//! reads, loaded into every node's Podman.
-//!
 //! Every node gets a throwaway ZFS pool, `llab`, backed by a file in
 //! `/var/tmp`, which goes again when the test ends.
 
@@ -32,7 +29,7 @@ mod common;
 
 use std::process::Command;
 
-use common::{Lab, Role, VM_DATA, VM_RUN, ZFS_ROOT, text, wait};
+use common::{Lab, Role, VM_DATA, ZFS_ROOT, text, wait};
 use serde_json::Value;
 
 /// The namespace, allowed the SysV shared memory Postgres needs, the
@@ -104,61 +101,26 @@ spec:
 "#;
 
 impl Lab {
-    /// Loads the image saved at `tar` into every node: its image store with
-    /// the jail runtime (`tar` an OCI archive), or its Podman, through the
-    /// socket of the lab's own Podman service.
+    /// Loads the OCI archive `tar` into every node's image store.
     fn load_image(&self, tar: &str) {
-        if self.jails {
-            let out = Command::new(common::LEGION)
-                .args(["image", "load", tar, "--zfs-root", ZFS_ROOT, "--data-dir"])
-                .arg(self.dir.join("data"))
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "loading the image here: {}",
-                text(&out.stderr)
-            );
-            for vm in &self.vms {
-                self.copy(vm, tar, "/var/tmp/legion-pg.oci.tar");
-                let out = self.ssh(
-                    vm,
-                    &format!(
-                        "{} image load /var/tmp/legion-pg.oci.tar --zfs-root {ZFS_ROOT} \
-                             --data-dir {VM_DATA} && rm /var/tmp/legion-pg.oci.tar",
-                        common::REMOTE
-                    ),
-                );
-                assert!(
-                    out.status.success(),
-                    "loading the image on {}: {}",
-                    vm.name,
-                    text(&out.stderr)
-                );
-            }
-            return;
-        }
-        let socket = format!("unix://{}/run/podman.sock", self.dir.display());
-        wait("the image loaded here", 120, || {
-            Command::new("podman")
-                .args(["--remote", "--url", &socket, "load", "-i", tar])
-                .output()
-                .unwrap()
-                .status
-                .success()
-        });
+        let out = Command::new(common::LEGION)
+            .args(["image", "load", tar, "--zfs-root", ZFS_ROOT, "--data-dir"])
+            .arg(self.dir.join("data"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "loading the image here: {}",
+            text(&out.stderr)
+        );
         for vm in &self.vms {
-            self.copy(vm, tar, "/var/tmp/legion-pg.tar.gz");
+            self.copy(vm, tar, "/var/tmp/legion-pg.oci.tar");
             let out = self.ssh(
                 vm,
                 &format!(
-                    "i=0
-                     until podman --remote --url unix://{VM_RUN}/podman.sock \
-                         load -i /var/tmp/legion-pg.tar.gz >/dev/null; do
-                         i=$((i + 1)); [ $i -lt 60 ] || exit 1; sleep 2
-                     done
-                     rm /var/tmp/legion-pg.tar.gz
-"
+                    "{} image load /var/tmp/legion-pg.oci.tar --zfs-root {ZFS_ROOT} \
+                         --data-dir {VM_DATA} && rm /var/tmp/legion-pg.oci.tar",
+                    common::REMOTE
                 ),
             );
             assert!(
@@ -245,7 +207,6 @@ impl Lab {
 fn postgres_moves_between_nodes() {
     let image = std::env::var("LEGION_PG_IMAGE").expect("set LEGION_PG_IMAGE");
     let mut lab = Lab::from_env();
-    lab.use_pool();
     let step = |what: &str| eprintln!("--- {what}");
 
     step("two managers and a worker, each with a pool for volumes");

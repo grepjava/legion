@@ -4,7 +4,7 @@ Legion is a container orchestrator for FreeBSD. It takes the operating model of
 Docker Swarm (one binary, `init`/`join`, embedded Raft, automatic mTLS, compose
 stacks) and adds the Kubernetes capabilities that matter most in practice:
 pods, real probes, namespaces, stateful workloads, network policy. Workloads run
-as jails through Podman and the `ocijail` runtime.
+as jails, from OCI images, which Legion pulls into ZFS and runs itself.
 
 Status: draft v0.4, 2026-10-26. All phase-0 spikes (S1–S6) have been run on
 FreeBSD 15.1; results are in section 10 and are reflected throughout. Phase 1
@@ -20,7 +20,7 @@ are added as their phase starts.
 |---|----------|--------|
 | D1 | Implementation | Fresh implementation in Rust. SwarmKit is a reference, not a dependency. |
 | D2 | API surface | Own gRPC API and `legion` CLI. Compose files accepted via `legion stack deploy`. No Docker Engine/Swarm API compatibility. |
-| D3 | Networking | Legion owns jail networking (VNET, epair, bridge, routing, pf). Podman is used for image and process lifecycle only. |
+| D3 | Networking | Legion owns jail networking (VNET, epair, bridge, routing, pf). The runtime (images, jails, processes) is Legion's too since phase 5 (section 6). |
 | D4 | Linux images | Nice-to-have, late phase, behind a node capability flag. |
 | D5 | Target OS | FreeBSD 15.x only, amd64 and arm64. |
 | D6 | Kubernetes scope | Selected features, phased (section 4). No Kubernetes API compatibility. |
@@ -33,11 +33,11 @@ those features or fake them. Compose is the part of the Docker ecosystem people
 actually depend on, so Legion accepts compose files directly and offers an
 `x-legion` extension for the extra features.
 
-**Why own the network (D3).** Podman's FreeBSD networking is built for single
-hosts. Cluster-wide addressing, service VIPs, routing mesh and policy all need
-one owner that knows the whole cluster. Spike S1 also showed that Podman's own
-pod and shared-network modes do not give a private network stack in the way
-Legion needs (section 6).
+**Why own the network (D3).** Container runtimes' FreeBSD networking is built
+for single hosts. Cluster-wide addressing, service VIPs, routing mesh and policy
+all need one owner that knows the whole cluster. Spike S1 also showed that
+Podman's own pod and shared-network modes did not give a private network stack
+in the way Legion needs (section 6).
 
 ---
 
@@ -85,9 +85,11 @@ One binary, `legion`, with two roles:
                        ▼                       ▼                       ▼
                  ┌──────────┐            ┌──────────┐            ┌──────────┐
                  │  agent   │            │  agent   │            │  agent   │
-                 │ executor │◄─ libpod ─►│ podman + │            │   ...    │
-                 │ net/dns  │   REST     │ ocijail  │            │          │
-                 │ probes   │            │  (jails) │            │          │
+                 │ executor │            │   ...    │            │   ...    │
+                 │ jails    │            │          │            │          │
+                 │ images   │            │          │            │          │
+                 │ net/dns  │            │          │            │          │
+                 │ probes   │            │          │            │          │
                  └──────────┘            └──────────┘            └──────────┘
                        ▲───────── WireGuard mesh (wg0) between all nodes ──────▲
 ```
@@ -233,12 +235,12 @@ preconditions. Rules:
 | Component | Responsibility |
 |-----------|----------------|
 | **Session** | Connects to the leader, receives the assignment set, reports task state. Persists the last assignment set in a local `redb` so running tasks survive a manager outage and agent restarts. |
-| **Executor** | Drives a **Legion-owned Podman instance** through the libpod REST API (section 6). Builds each task as an infra jail plus child container jails, pulls images, runs init containers in order, starts containers, streams logs and events. Every Podman object carries `legion.task.id` and `legion.node.id` labels, so the agent can always reconcile Podman's view against assignments. |
+| **Executor** | Runs each task through the jail runtime (section 6): pulls images into ZFS, builds an infra jail plus child container jails on clones of their images, runs init containers in order, starts containers under their supervisors, reads their output and events. Every container carries `legion.task.id` and `legion.node.id` labels, so the agent can always reconcile the runtime's view against assignments. |
 | **Network** | Creates epairs, attaches them to the node bridge, moves the jail end into the pod's VNET, programs routes, WireGuard peers and pf anchors. See section 5. |
 | **Volumes** | Creates, mounts and snapshots ZFS datasets; mounts them into containers (nullfs). A `Volume` is `<pool>/legion/volumes/<ns>/<name>`, created on first use with its size as quota and bound to that node in its status. Pod `tmpfs` volumes live and die with the pod. |
-| **Secrets** | Writes secrets and configs to a per-task tmpfs (`<run dir>/tasks/<task uid>`) and bind-mounts each file read-only into the container that names it. Files never touch disk. Values used as environment variables are passed to Podman, which keeps them in the container's configuration under its root; files are the safer form. Values are read when the pod starts. |
+| **Secrets** | Writes secrets and configs to a per-task tmpfs (`<run dir>/tasks/<task uid>`) and bind-mounts each file read-only into the container that names it. Files never touch disk. Values used as environment variables are passed to the runtime, which keeps them in the container's record under the data directory; files are the safer form. Values are read when the pod starts. |
 | **Resources** | Applies rctl rules to **each container's own jail** (memory, CPU percentage, process and open-file limits) and `cpuset` pinning. Removes the rules when the task ends; rctl keys rules by jail name and keeps them after the jail is gone. Reads usage with `rctl -u` for metrics and autoscaling. See 6.3. |
-| **Sessions** | Runs the `logs`, `exec` and `port-forward` sessions managers offer it: Podman's log stream, an exec attached through libpod's upgraded connection (stdin, a terminal and its size), or a TCP connection to the pod's address. See 3.8. |
+| **Sessions** | Runs the `logs`, `exec` and `port-forward` sessions managers offer it: the container's log, an exec in its jail (stdin, a terminal and its size), or a TCP connection to the pod's address. See 3.8. |
 | **Probes** | Startup, liveness and readiness probes. TCP, HTTP and gRPC probes run from the host, which can reach every local pod IP on `legion0`; exec probes run in the container. One prober per running container reports only transitions to the task's worker: a failed startup or liveness probe stops the container and the restart policy decides what follows; readiness sets the Task's `ready`. HTTP passes on 2xx and 3xx; gRPC uses `grpc.health.v1.Health/Check`. |
 | **DNS** | Resolver on each node's bridge gateway address (`hickory-dns`). Answers cluster names, forwards everything else to the host's resolvers. |
 
@@ -270,7 +272,8 @@ crates/
   legion-manager    API server, controllers, scheduler, allocator, dispatcher, CA
   legion-agent      session, executor, probes, volumes, secrets, resources
   legion-net        FreeBSD networking: interfaces, routes, WireGuard, pf, DNS
-  legion-podman     typed libpod REST client
+  legion-image      OCI images: registry client, ZFS layer store
+  legion-jail       the jail runtime: containers as jails, their supervisor
   legion-sys        thin FreeBSD bindings (ioctl, rctl, jail, ZFS via libzfs_core or zfs(8))
   legion            the binary: daemon and CLI (clap)
 ```
@@ -502,7 +505,7 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
 
 | Feature | Notes | Phase |
 |---------|-------|-------|
-| ZFS image and volume storage | Podman's ZFS storage driver for images (one dataset per layer); one dataset per volume under `<pool>/legion/volumes/<ns>/<name>`. | 1 |
+| ZFS image and volume storage | Legion's image store (one dataset per layer, containers as clones, 6.1); one dataset per volume under `<pool>/legion/volumes/<ns>/<name>`. | 1, 5 |
 | Snapshots before updates | A stateful service's `update.snapshot: true`: each task an update starts snapshots its claimed Volumes (`@legion-update-<generation>`, named in `status.update.snapshot`) before it runs, unless taken already, dropping older updates' snapshots; its old task has stopped by then, as stateful updates are stop-first. Each task the update's rollback starts, automatic or by `legion rollback` (even after the update completed, which discards what was written since), rolls its Volumes back to the snapshot and drops it, so a restart keeps its data. An ordinal the update never reached has no snapshot and keeps its data; so does a Volume migrated since, as migration sends no other snapshots. | 4 |
 | Stateful migration | Draining a node moves each wanted stateful ordinal's Volumes to a node its service may run on, the one with fewest of its tasks: the Service controller records a migration in the Volume's status (`copying`); the leader's migrator has the old node's agent snapshot and `zfs send` a full copy while the task runs, and the new node's `zfs receive -u` it, joining the two agents' sessions (3.8), so nodes need no port. Once `copied`, the drain stops the task; with nothing on a node using the Volume it is `finishing`: a second snapshot's increment goes, the Volume becomes the new node's (mounted, the migration's snapshots gone) and the old node drops its copy. The slot's next task waits (`volume moving`) and then runs there. A migration whose new node goes away, or whose old node stops draining before the last part, is dropped and started again if still needed; a failed attempt is noted in it and retried. A stale copy on the receiving node is replaced. A Volume's `spec.node` (`legion volume move VOLUME NODE`) asks for its data on a node: unset, the first task to use the Volume chooses; set before then, that task goes there; set to another node than the data's, a migration to it starts once the node is ready and active, and the tasks using the Volume on the old node stop once it is copied, as off a draining node, their next ones waiting until it has moved (`volume moving` holds new placements throughout a migration). A drain still moves a Volume asked to be on the draining node; the data returns once the node is active again. A migration lasts while a drain or the Volume's `node` calls for it. | 4 |
 | CARP manager VIP | Optional floating address for the API: `legion daemon --vip ADDR --vip-interface IF --vip-password-file F [--vip-vhid N]` on managers sharing a link puts ADDR on IF as a CARP virtual host (`/32`, loading `carp`). Any manager answers the API, so the address need only be on a running one: the leader advertises skew 0 and forces itself master when it is not, followers advertise 100 and keep the address only until a better advertiser takes it, so it never goes without a holder (a follower holds it while a manager without `--vip` leads). Set again every 5 s and on every leadership change; released on shutdown, so a clean stop hands it on at once and a crash after CARP's timeout (3 s). The API listens on `0.0.0.0` to answer on it; certificates name the fixed server name, so no change is needed for clients using it. | 4 |
@@ -544,7 +547,7 @@ workloads.
 
 All three are set at `legion init` and are fixed for the life of the cluster.
 `init` checks that they do not overlap networks already on the hosts (Podman's
-default `10.88.0.0/16`, for example).
+default `10.88.0.0/16`, on a host that also runs Podman, for example).
 
 ### 5.3 Per-node layout
 
@@ -604,8 +607,8 @@ default `10.88.0.0/16`, for example).
   advertises its address there (the phase 2 exit test does this for a
   remote server); traversing NAT without one is later work.
 - **Bridge sysctls**: `net.link.bridge.pfil_*` are per-VNET, and Legion runs
-  in the host VNET, so they apply to every bridge on the host, Podman's own
-  included. Load balancing needs none of them (the hairpin NAT rule in 5.4
+  in the host VNET, so they apply to every bridge on the host, other
+  container runtimes' included. Load balancing needs none of them (the hairpin NAT rule in 5.4
   works either way), but network policy (5.6) does: FreeBSD 15 defaults
   `pfil_member` to 0, so pf never sees traffic bridged between pods, and
   without `pfil_local_phys` a pod's frames for the host are filtered only
@@ -773,61 +776,70 @@ node and routes change without reloads.
 
 ---
 
-## 6. Runtime: Podman and ocijail
+## 6. Runtime: jails
 
-### 6.1 A Legion-owned Podman instance
+The agent runs containers as jails itself (crates `legion-image` and
+`legion-jail`), with OCI as the image format and no Podman or OCI runtime
+in between. Phases 0 to 4 used a Legion-owned Podman with ocijail; §6.5
+says why that went and what was kept of it.
 
-The agent runs its own `podman system service` with **its own `--root`,
-`--runroot` and `--tmpdir`** on a Legion ZFS dataset, and talks to it over a
-private socket. This keeps Legion's containers apart from containers the
-operator runs with the system Podman.
+### 6.1 Images
 
-All three paths must be separate. Podman's temp directory (default
-`/var/run/libpod`) is shared even when `--root` and `--runroot` differ, and
-holds the "alive" marker Podman uses to detect reboots. Phase-0 testing showed
-that resetting a second store with only `--root`/`--runroot` changed wiped that
-directory, and the system Podman then marked a running container as exited
-while its process kept running.
-
-The storage driver comes from the host's `containers/storage.conf`. The
-FreeBSD package sets `zfs`; on a UFS host Podman then refuses to start
-("could not open /dev/zfs") until the driver is set to `vfs`.
-
-Through the service's API, each exec session's conmon stays for Podman's
-`exit_command_delay` after the command ends, so the client can still
-read the exit code: five minutes by default. With an exec probe every
-second that is some 300 conmon pairs per probed container. Legion reads
-the code as soon as the output ends, so its Podman gets five seconds,
-from a containers.conf override (`<run-dir>/podman.conf`, passed as
-`CONTAINERS_CONF_OVERRIDE`) that leaves the system's configuration
-alone.
+- **Pulls**: a registry client speaking the OCI distribution API, anonymous
+  or with a bearer token from the registry's auth service (basic
+  credentials answer a challenge), following redirects to CDNs and the
+  host's proxy settings. From an index it picks the entry for
+  `freebsd/<arch>`; images for another OS are refused. Every blob is
+  checked against its digest, and a manifest asked for by digest too.
+- **Layers**: each layer is decompressed (gzip, zstd or plain) and checked
+  against its `diff_id` **before** anything is extracted: images share
+  layers by chain id, so a layer claiming another's id would otherwise
+  reach every image built on it. Whiteouts are applied first, without
+  following links and clearing file flags (`schg`) that would refuse the
+  removal; then bsdtar extracts the rest (`--fflags --xattrs
+  --numeric-owner`, `--clear-nochange-fflags` for files a layer replaces;
+  it refuses `..` and paths through links).
+- **Storage**: a layer is a ZFS dataset `<zfs-root>/images/<chain id>`,
+  cloned from the layer below and snapshotted `@layer`, so images share
+  their common layers and a container's root is a clone of its image's
+  top layer (1 KB until it writes). What images there are, by canonical
+  reference (`docker.io/library/nginx:latest`), with their configs, is in
+  `<data-dir>/images/index.json`. Configs with lower-case keys (FreeBSD's
+  own images write `cmd`) are read too.
+- **Local images**: `localhost/...` names images no registry serves;
+  `legion image load` adds one from an OCI archive (`podman save --format
+  oci-archive`, or any tool's OCI layout in a tar) on the node. The store
+  takes a file lock while it changes, so this runs beside a pulling daemon.
+- **Removal**: images no container has used for an hour go (checked every
+  ten minutes), then the layers nothing uses. A layer a container was
+  cloned from cannot be destroyed, so it stays until that container goes.
 
 ### 6.2 Pod construction
 
-Podman pods and `--network container:` do **not** give a private shared VNET on
-FreeBSD (S1): with `--network none` the jails get `vnet=inherit`, which is the
-**host's** network stack. Legion therefore builds pods itself:
+The agent's container specs carry the pod's shape in annotations, as they
+did for ocijail:
 
-1. **Infra container**: `--network none` plus the annotation
-   `org.freebsd.jail.vnet=new`, running a trivial long-lived process. This
-   gives a jail with an empty private VNET. Without the annotation, `none`
-   means host networking, so the executor treats a missing `vnet=new` as a bug
-   and refuses to start the task.
-2. The agent sets `children.max` on the infra jail and attaches the epair
-   (section 5.3).
-3. **Each container**: `--network none` plus `org.freebsd.parentJail=<infra id>`.
-   It becomes a child jail sharing the infra jail's VNET; it sees only `lo0`
-   and the pod's epair.
+1. **Infra container** (`org.freebsd.jail.vnet=new`): a `persist` VNET jail
+   on `/var/empty`, named by the container's id, with no process. A child
+   jail's root need not lie inside its parent's, so the pod jail never sees
+   the host's file system. The agent checks it has its own VNET (a jail
+   with `vnet=inherit` would use the **host's** network stack), sets
+   `children.max` and attaches the epair (§5.3), configured from the host
+   (`ifconfig -j`), so the pod jail needs no binaries.
+2. **Each container** (`org.freebsd.parentJail=<infra id>`): a child jail
+   `<infra id>.<id>` on a ZFS clone of its image, with `ip4`/`ip6`
+   inherited (it shares the pod's VNET, sees `lo0` and the pod's epair),
+   devfs with ruleset 4, nullfs mounts for volumes, secrets and configs
+   (targets made inside the clone without following the image's links),
+   and the security profile's parameters (`legion.jail`, mlock and SysV
+   IPC annotations) set at creation (§9).
 
-Verified behaviour: containers in a pod share the interface; a container
-restart keeps the pod's network; stopping the infra container kills all child
-containers, so a pod lives and dies as one unit. All of this works through the
-libpod REST API (annotations and labels in `containers/create`).
+Containers in a pod share the network and `127.0.0.1`; a container's
+restart keeps the pod's network; removing the pod jail removes its
+containers with it.
 
 ### 6.3 Resource limits
 
-- `podman run --memory` / `--cpus` are **silently ignored** on FreeBSD (no rctl
-  rules are created), so Legion applies limits itself.
 - rctl rules on the infra jail **account** for all child processes but are
   **not enforced** on them. Limits are therefore set on each container's own
   jail (`jail:<infra>.<ctr>:...`), where they are enforced: `maxproc` refuses
@@ -840,113 +852,71 @@ libpod REST API (annotations and labels in `containers/create`).
   `memory: 128M` failed to fork under light load while using a few MB.
   `memoryuse:deny` is no better: it pages the jail out rather than
   refusing, and rctl(8) warns it can thrash the machine.
+- rctl counts shared memory once per process, so a workload with large
+  shared buffers (Postgres) needs no limit or a generous one for now.
 - rctl needs the loader tunable `kern.racct.enable=1`. Without it, setting
   limits fails and the agent only warns, so pods run unlimited.
 - Pod-level totals are read from the infra jail's accounting and used for
   scheduling feedback, metrics and eviction decisions.
-- The rule set is removed explicitly when a task ends.
-- The agent sets its rules **after** each container start and restart, not
-  before. ocijail with rctl support (0.7.0-dev, "next") enforces the OCI
-  `linux.resources` limits itself and *replaces* a jail's rules when it
-  creates the jail, also when the container has no limits, so rules set
-  beforehand are lost. Re-adding a rule replaces it, so reapplying is
-  harmless; adopted containers get their rules reapplied too.
-- Open: with runtimes that enforce OCI limits, Legion could pass limits
-  through Podman instead, so they apply from the first instruction. ocijail
-  also kills on `memoryuse`, so the memory semantics now match.
+- The agent sets the rules after each container start and restart
+  (re-adding a rule replaces it, and an adopted container gets its rules
+  again), and removes them when the task ends.
 
 ### 6.4 Other runtime details
 
-- Images: pulled by Legion's Podman with the ZFS storage driver
-  (`zfs.fsname=<pool>/legion/podman`), one dataset per layer. Registry
-  credentials are Legion secrets passed per pull. Container start on ZFS was
-  slightly faster than on vfs in testing (about 0.19 s vs 0.24 s).
-- Mounts: volumes, secrets and configs are bind (nullfs) mounts into containers.
-- Restart: the agent restarts containers itself according to the task's restart
-  policy.
-- Metrics: libpod `stats` returns zeros on FreeBSD; usage comes from `rctl -u`.
-- Events: the libpod event stream works and drives fast state updates; the
-  agent also reconciles periodically in case events are missed. A container's
-  `died` event carries its exit code (`containerExitCode`).
-- libpod details the client (`legion-podman`) handles, from Podman 5.8.9 with
-  ocijail 0.7.0-dev:
-  `start` and `stop` answer 304 when the container is already in that state;
-  exec in a stopped container is HTTP 500 "container state improper", not
-  409; exec and log output use Docker's multiplexed framing; `wait` returns a
-  bare exit code. Under the API service, each container's conmon lingers for
-  `exit_command_delay` (300 s) after the container exits before it runs the
-  cleanup command; this is expected and not a leak.
-- FreeBSD base images contain files with the `schg` flag, so removing image
-  storage by hand needs `chflags -R 0` first.
-- Base images: the official FreeBSD OCI images (`freebsd-runtime` and related).
-  These are minimal (no `grep`, `tail`, `true`), which is why network probes run
-  from the host rather than in the container.
+- Mounts: volumes, secrets and configs are bind (nullfs) mounts into
+  containers; tmpfs volumes and the per-task files are tmpfs on the host.
+- Restart: the agent restarts containers itself according to the task's
+  restart policy; a task whose worker has reported an end is not started
+  again, even while the assignments still carry an older state.
+- Metrics: usage comes from `rctl -u` on each container's jail.
+- Events: the runtime reports a container's end as a `died` event with its
+  exit code; the agent also reconciles periodically in case one is missed.
+- FreeBSD base images contain files with the `schg` flag, so removing their
+  datasets' contents by hand needs `chflags -R 0` first.
+- Base images: the official FreeBSD OCI images (`freebsd-runtime` and
+  related). These are minimal (no `grep`, `tail`, `true`, `tty`), which is
+  why network probes run from the host rather than in the container.
 
----
+### 6.5 Supervision, and the native runtime replacing Podman (phase 5)
 
-### 6.5 Native jail runtime (phase 5)
+Each container's process runs under a supervisor, `legion jail-shim` (the
+same binary, dispatched before anything else starts, as it forks and must
+be single-threaded), started detached from the agent in its own process
+group. It enters the jail (`jail_attach`), becomes the container's user as
+the image's own databases name it (`user[:group]`, by name or number, with
+its supplementary groups), changes to its working directory and execs the
+command with the image's environment and the spec's over it; a command
+that cannot be run fails the start with the reason. It writes the output
+to the container's log as records (`<time> <stdout|stderr> <F|P> <text>`,
+rotated at 8 MiB, one old file kept), and when the main process ends it
+removes the jail, so nothing the process left behind keeps running, then
+writes its exit status. Everything is kept in `<data-dir>/jails/<id>`
+(record, run, exit, log), so the agent may restart while containers run
+and finds them again; a run from before a reboot counts as over. Stop asks
+the supervisor to send the image's stop signal, waits the grace period,
+then removes the jail. Exec enters the jail the same way, with a
+pseudo-terminal when asked.
 
-Podman gives Legion three things: pulling images, a root filesystem per
-container, and supervising its processes. Everything FreeBSD-specific
-(VNET, epairs, pf, rctl on each container's own jail, ZFS volumes)
-Legion does itself, and most of the runtime's trouble came from the
-layer in between: libpod's stats are zeros on FreeBSD, conmons that
-outlive exec sessions, a `podman system service` per node that leaked
-when killed, the shared tmpdir, vfs copying whole images, and an infra
-container that exists only so a process holds the pod.
+Podman gave Legion three things: pulling images, a root file system per
+container, and supervising processes. Everything FreeBSD-specific (VNET,
+epairs, pf, rctl on each container's jail, ZFS volumes) Legion did itself,
+and most of the runtime's trouble came from the layer in between: Podman
+pods and `--network none` share the **host's** stack on FreeBSD (S1), so
+pods needed ocijail's annotations; `--memory` and `--cpus` were silently
+ignored; libpod's stats were zeros; Podman's temp directory had to be
+kept apart from the system Podman's, whose containers it otherwise marked
+exited; conmons outlived exec sessions for `exit_command_delay`; a
+`podman system service` per node leaked when killed; ocijail gave every
+jail raw sockets, chflags and `enforce_statfs=1`, so a `createRuntime`
+hook had to tighten each jail; and vfs copied whole images per container.
 
-A native runtime keeps OCI as the image format and runs it on jails
-directly: a registry client (auth, manifests and indexes) pulls layers
-into ZFS, one snapshot per layer, applied with OCI whiteouts; a
-container's root filesystem is a clone of its image's top snapshot; a
-pod is a `persist` VNET jail with no processes, and each container a
-child jail running the image's entrypoint as its user, supervised by the
-agent (output to the per-task log files, exit codes, stop signals and
-the grace period) in a way that survives agent restarts. Exec and
-images no longer used complete it.
-
-It is a second implementation of the agent's `Runtime` trait, chosen
-per node, so the existing tests apply to it and Podman stays as the
-fallback. It does not change rctl: memory limits for workloads with
-large shared memory need their own answer either way.
-
-It started with a spike on a FreeBSD host, as phase 0 did (S7 in §10),
-which held: a container starts in about 55 ms against Podman's 900, and
-costs 1 KB of disk against a full copy of its image. Built, it passed
-every phase's exit test, on one node and across the lab cluster, and is
-the default since 2026-10-29 (`--runtime jail`; `--runtime podman` until
-the Podman runtime is removed).
-
-How it is built:
-
-- **Images** (crate `legion-image`): a registry client (anonymous and
-  bearer-token auth, credentials from Secrets later) picks the
-  `freebsd/<arch>` manifest from an index, checks every blob's digest
-  and applies each layer into a ZFS dataset cloned from the one below,
-  snapshotted as `<root>/img/<chain id>`, so images share their common
-  layers. Extraction is bsdtar's (file flags, extended attributes,
-  numeric owners; it refuses `..` and paths through symlinks), and
-  whiteouts are applied first without following symlinks. An image's
-  config is kept beside its top layer. Configs written with lowercase
-  keys (FreeBSD's own images write `cmd`) are read too.
-- **Containers** (`legion-agent`'s jail runtime): the same `Runtime`
-  trait and container specs as Podman's, so the agent does not change. A
-  container is a ZFS clone of its image's top layer and a jail named by
-  its id, as ocijail names them: the infra container (annotation
-  `org.freebsd.jail.vnet=new`) becomes a `persist` VNET jail with no
-  process, the others child jails of it (`org.freebsd.parentJail`) with
-  `ip4`/`ip6` inherited, devfs (ruleset 4) and Legion's jail parameters
-  (`legion.jail`) set at creation, so the hook is no longer needed.
-  Mounts are nullfs and tmpfs into the clone.
-- **Supervision**: each container's process is started by a small
-  supervisor (`legion jail-shim`, the same binary), detached from the
-  agent, that enters the jail, runs the entrypoint as its user with the
-  image's environment, writes its output to the container's log (capped,
-  rotated) and its exit status to a file, and stays until the agent has
-  read it. So the agent may restart while containers run, and finds them
-  again from their state directories. Stop sends the stop signal, waits
-  the grace period, then removes the jail (which kills what is left).
-  Exec is a process attached to the jail the same way.
+The replacement started with a spike (S7 in §10): a container starts in
+about 55 ms against Podman's 900, and costs 1 KB of disk against a full
+copy of its image. Built as a second implementation of the agent's
+`Runtime` trait, it passed every phase's exit test on one node and across
+the lab cluster on 2026-10-29, became the default, and the Podman runtime
+(`legion-podman`, the hook) was removed the same day.
 
 ## 7. Object model
 
@@ -1181,22 +1151,17 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
   `spec.security.allow` lists (the same names, plus `securelevel` for a
   level below 2 and `enforceStatfs` for 1). Namespaces are cluster-scoped,
   so only the cluster admin decides. Compose's `cap_add: [NET_RAW]` asks
-  for raw sockets. How it is applied: through Podman, ocijail gives every
-  jail raw sockets, `chflags` and `enforce_statfs=1`, and annotations can
-  only add to that. The kernel refuses a child jail more than its parent
-  has, so a locked-down infra jail would only stop ocijail making the
-  containers. Legion's Podman therefore runs a `createRuntime` hook
-  (`--hooks-dir`), which ocijail calls once a container's jail exists and
-  before its process enters it. The hook sets the parameters from the
-  container's `legion.jail` annotation with `jail -m`, and a failing hook
-  fails the start. What a child may have only if its parent does (mlock,
-  SysV IPC) is asked of ocijail for the infra jail and the container. A
-  pod's containers that allow SysV IPC share the infra jail's namespace.
-  After each start the agent reads the jail's parameters back and refuses
-  the pod if the hook did not run. A pod adopted from an agent older than
-  the hook has its running jails tightened in place, which the host may
-  do, rather than being restarted. The infra jail keeps ocijail's
-  defaults; it runs only `sleep`, and no session reaches it.
+  for raw sockets. How it is applied: the runtime creates each container's
+  jail with the parameters of its `legion.jail` annotation (6.2). What a
+  child may have only if its parent does (mlock, SysV IPC) is asked for on
+  the infra jail and the container; a pod's containers that allow SysV IPC
+  share the infra jail's namespace. After each start the agent reads the
+  jail's parameters back and refuses the pod if they differ; an adopted
+  pod's running jails are tightened in place instead, which the host may
+  do. The infra jail runs no process, on `/var/empty`, and no session
+  reaches it. (With Podman, until phase 5, ocijail gave every jail raw
+  sockets, `chflags` and `enforce_statfs=1`, so a `createRuntime` hook
+  tightened each jail before its process entered it.)
 - **No host networking by accident**: the executor verifies every task's infra
   jail has `vnet=new` before starting containers (see 6.2).
 
@@ -1238,9 +1203,8 @@ WireGuard and bridge, with tasks as VNET jails attached to the node bridges.
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Legion depends on ocijail annotations (`org.freebsd.jail.vnet`, `org.freebsd.parentJail`) and Podman passing them through | A change upstream breaks pods | Pin tested versions; integration test for the pod pattern in CI; ocijail-direct fallback |
-| Podman semantics differ from Linux (`--network none` = host stack, ignored resource flags, empty stats) | Silent security or limit gaps | Executor verifies jail parameters after create; limits and metrics via rctl, never Podman flags |
-| Shared Podman temp directory | Interference with the operator's containers | Legion's Podman uses its own root, runroot **and** tmpdir (6.1) |
+| Legion's own runtime and registry client have less mileage than Podman's | Images or containers that misbehave in ways the tests miss | OCI conformance where it matters (whiteouts, digests, platforms), tested against Docker Hub and Podman-built images; exit tests of every phase on real jails |
+| A jail that does not get its profile | Silent security gaps | The agent reads every container jail's parameters back after start and refuses the pod (§9) |
 | pf is not a full load balancer (no weights, no health checks) | Uneven load, rough failover | Table-only updates for soft drain; source-hash option; kill-by-key for dead backends; userspace proxy fallback per service if needed |
 | `pcpu` throttling is bursty | Latency spikes for CPU-limited tasks | Document; prefer `cpuset` for latency-sensitive services |
 | Small FreeBSD OCI image ecosystem | Adoption | Good base images and build docs; Linux images in phase 5 |
@@ -1255,4 +1219,4 @@ WireGuard and bridge, with tasks as VNET jails attached to the node bridges.
 1. Do we want a built-in image registry (a system service backed by ZFS) for air-gapped clusters?
 2. Package distribution: FreeBSD ports/pkg from the start, or release tarballs until phase 2?
 3. ~~Licence~~ Decided: BSD-2-Clause, which fits the FreeBSD ecosystem.
-4. Should Legion also manage tasks for the system Podman (adopt existing containers), or stay strictly separate? This draft says separate.
+4. ~~Manage the system Podman's containers~~ Decided: no; Legion runs its own jails and leaves other runtimes alone.

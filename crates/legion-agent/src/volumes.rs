@@ -23,10 +23,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::runtime::Mount;
 use legion_api::service::UPDATE_SNAPSHOT;
 use legion_api::task::VolumeSnapshot;
 use legion_api::volume::VolumeSpec;
-use legion_podman::Mount;
 use legion_sys::Sys;
 
 use crate::control::{Assignment, Control, VolumeClaim};

@@ -1,15 +1,14 @@
-//! The container runtime calls the agent makes: Podman in production,
+//! The container runtime calls the agent makes, and what they take and
+//! give: `legion_jail::JailRuntime` in production,
 //! [`crate::fake::FakeRuntime`] in tests.
 
 use std::future::Future;
 use std::time::Duration;
 
-use futures::StreamExt;
+use std::collections::BTreeMap;
+
+use bytes::Bytes;
 use futures::stream::BoxStream;
-use legion_podman::{
-    Attached, Chunk, ContainerInspect, ContainerSpec, ContainerSummary, Event, ExecOutput, Podman,
-    Result,
-};
 
 pub trait Runtime: Send + Sync + 'static {
     fn image_exists(&self, reference: &str) -> impl Future<Output = Result<bool>> + Send;
@@ -57,75 +56,187 @@ pub trait Runtime: Send + Sync + 'static {
     ) -> impl Future<Output = Result<BoxStream<'static, Result<Event>>>> + Send;
 }
 
-impl Runtime for Podman {
-    async fn image_exists(&self, reference: &str) -> Result<bool> {
-        Podman::image_exists(self, reference).await
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// No such container, image or exec session.
+    #[error("{0}")]
+    NotFound(String),
+    /// The container is in the wrong state for the call, e.g. exec in a
+    /// stopped one.
+    #[error("{0}")]
+    WrongState(String),
+    #[error("{0}")]
+    Failed(String),
+    #[error("pulling {image}: {message}")]
+    Pull { image: String, message: String },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+impl Error {
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Error::NotFound(_))
     }
 
-    async fn pull(&self, reference: &str) -> Result<()> {
-        Podman::pull(self, reference, None).await.map(drop)
+    pub fn is_wrong_state(&self) -> bool {
+        matches!(self, Error::WrongState(_))
     }
+}
 
-    async fn create(&self, spec: &ContainerSpec) -> Result<String> {
-        Podman::create(self, spec).await
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// A container to create.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerSpec {
+    pub name: String,
+    pub image: String,
+    /// Replaces the image's entrypoint (and then its command).
+    pub entrypoint: Vec<String>,
+    /// Replaces the image's command.
+    pub command: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub work_dir: Option<String>,
+    pub user: Option<String>,
+    pub hostname: Option<String>,
+    pub labels: BTreeMap<String, String>,
+    /// How to make its jail (see [`crate::pod`]).
+    pub annotations: BTreeMap<String, String>,
+    pub mounts: Vec<Mount>,
+    /// Seconds between the stop signal and killing it.
+    pub stop_timeout: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mount {
+    pub destination: String,
+    /// `nullfs`.
+    pub kind: String,
+    pub source: String,
+    /// `ro` for read-only.
+    pub options: Vec<String>,
+}
+
+impl Mount {
+    pub fn nullfs(source: &str, destination: &str, read_only: bool) -> Self {
+        Mount {
+            destination: destination.to_owned(),
+            kind: "nullfs".to_owned(),
+            source: source.to_owned(),
+            options: if read_only {
+                vec!["ro".to_owned()]
+            } else {
+                Vec::new()
+            },
+        }
     }
+}
 
-    async fn start(&self, id: &str) -> Result<()> {
-        Podman::start(self, id).await
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerSummary {
+    pub id: String,
+    pub names: Vec<String>,
+    pub image: String,
+    pub labels: BTreeMap<String, String>,
+    /// `created`, `running` or `exited`.
+    pub state: String,
+    pub exit_code: i32,
+    pub exited: bool,
+    pub pid: i64,
+}
+
+impl ContainerSummary {
+    pub fn name(&self) -> &str {
+        self.names.first().map_or("", String::as_str)
     }
+}
 
-    async fn stop(&self, id: &str, timeout: Duration) -> Result<()> {
-        Podman::stop(self, id, timeout).await
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerInspect {
+    pub id: String,
+    pub name: String,
+    pub state: ContainerState,
+    pub config: ContainerConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerState {
+    pub status: String,
+    pub running: bool,
+    pub pid: i64,
+    pub exit_code: i32,
+    pub oom_killed: bool,
+    pub started_at: String,
+    pub finished_at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerConfig {
+    pub labels: BTreeMap<String, String>,
+    pub annotations: BTreeMap<String, String>,
+}
+
+/// Something that happened to a container.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Event {
+    /// `container`.
+    pub kind: String,
+    /// `died`, ...
+    pub action: String,
+    pub actor: Actor,
+    pub time_nano: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Actor {
+    pub id: String,
+    /// The container's labels, its `name`, and on `died` its
+    /// `containerExitCode`.
+    pub attributes: BTreeMap<String, String>,
+}
+
+impl Event {
+    pub fn exit_code(&self) -> Option<i32> {
+        self.actor.attributes.get("containerExitCode")?.parse().ok()
     }
+}
 
-    async fn remove(&self, id: &str) -> Result<()> {
-        Podman::remove(self, id).await
-    }
+/// Output of a finished exec.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecOutput {
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
 
-    async fn inspect(&self, id: &str) -> Result<ContainerInspect> {
-        Podman::inspect(self, id).await
-    }
+/// Which stream a piece of output came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Output {
+    Stdout,
+    Stderr,
+}
 
-    async fn wait(&self, id: &str) -> Result<i32> {
-        Podman::wait(self, id).await
-    }
+/// A piece of container output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chunk {
+    pub stream: Output,
+    pub data: Bytes,
+}
 
-    async fn exec(&self, id: &str, cmd: &[String]) -> Result<ExecOutput> {
-        Podman::exec(self, id, cmd).await
-    }
+/// A process started by [`Runtime::exec_attach`].
+pub struct Attached {
+    /// The exec session, for [`Runtime::exec_resize`] and
+    /// [`Runtime::exec_exit_code`].
+    pub id: String,
+    /// What the process writes; ends when it exits.
+    pub output: BoxStream<'static, Result<Chunk>>,
+    /// Its stdin, when asked for; shutting it down closes stdin.
+    pub stdin: Option<std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>>,
+}
 
-    async fn exec_attach(
-        &self,
-        id: &str,
-        cmd: &[String],
-        stdin: bool,
-        tty: bool,
-    ) -> Result<Attached> {
-        Podman::exec_attach(self, id, cmd, stdin, tty).await
-    }
-
-    async fn exec_resize(&self, exec_id: &str, width: u16, height: u16) -> Result<()> {
-        Podman::exec_resize(self, exec_id, width, height).await
-    }
-
-    async fn exec_exit_code(&self, exec_id: &str) -> Result<i32> {
-        Podman::exec_exit_code(self, exec_id).await
-    }
-
-    async fn logs(
-        &self,
-        id: &str,
-        follow: bool,
-        tail: Option<usize>,
-    ) -> Result<BoxStream<'static, Result<Chunk>>> {
-        Ok(Podman::logs(self, id, follow, tail).await?.boxed())
-    }
-
-    async fn list(&self, labels: &[(&str, &str)]) -> Result<Vec<ContainerSummary>> {
-        Podman::list(self, labels).await
-    }
-
-    async fn events(&self, labels: &[(&str, &str)]) -> Result<BoxStream<'static, Result<Event>>> {
-        Ok(Podman::events(self, labels).await?.boxed())
+impl std::fmt::Debug for Attached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Attached")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
     }
 }

@@ -7,7 +7,7 @@
 //! (`org.freebsd.parentJail`) on a ZFS clone of its image, sharing the
 //! pod's network, with devfs (ruleset 4) and its nullfs mounts, its
 //! process run by a supervisor ([`crate::shim`]). Jails are named by
-//! container id, as ocijail names them, so the agent finds them the same.
+//! container id.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -18,11 +18,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use legion_image::Store;
-use legion_podman::{
+use legion_agent::runtime::{
     Actor, Attached, Chunk, ContainerConfig, ContainerInspect, ContainerSpec, ContainerState,
     ContainerSummary, Error, Event, ExecOutput, Output, Result,
 };
+use legion_image::Store;
 use legion_sys::Sys;
 use tokio::sync::{broadcast, watch};
 
@@ -79,9 +79,11 @@ struct Session {
 }
 
 fn api(status: u16, message: impl Into<String>) -> Error {
-    Error::Api {
-        status,
-        message: message.into(),
+    let message = message.into();
+    match status {
+        404 => Error::NotFound(message),
+        409 => Error::WrongState(message),
+        _ => Error::Failed(message),
     }
 }
 

@@ -803,14 +803,30 @@ replaces Podman and ocijail.
   network policy across nodes, published ports, quotas) and phase 4
   stateful (1094 s: Postgres primary and replica, both drained and moved
   with their data, the image loaded with `legion image load`).
-- **The jail runtime is the default** (`--runtime jail`, which needs
-  `--zfs-root`); `--runtime podman` keeps Podman and ocijail for now.
+- **Podman and ocijail removed** (the same day, once every exit test had
+  passed on jails): `legion-podman`, the ocijail hook, the agent's Podman
+  live test, `--runtime` and the Podman paths of the lab tests. The
+  `Runtime` trait has its own types (`legion_agent::runtime`), with
+  errors of its own (not found, wrong state, failed, pull). The agent
+  needs `--zfs-root`. Re-checked on FreeBSD: the runtime's live test and
+  the phase 1 exit test (168 s).
+- **Flaky tests fixed**: an agent started a task again whose worker had
+  just reported its end, while the assignments still carried the older
+  state: in tests the pod ran on (`startup_failures`,
+  `finished_tasks_keep_their_output`, `restart_policy` failed most runs
+  on FreeBSD, and had before this phase); in a cluster a failed task's
+  pod could have run beside its replacement. The agent now remembers the
+  tasks whose workers ended. The agent tests' harness logs with
+  `RUST_LOG`, and its waits name the containers left. Two store backup tests
+  failed now and then on Windows: `Store::shutdown` waited for the
+  database's last handle, but an `Arc`'s count drops before its value's
+  drop has closed the file, which may still run on another thread; it
+  now waits until the file opens again.
 
 ### To do, in order
 
-1. Podman's runtime removed: `legion-podman`, the hook, `--runtime`,
-   the Podman lab code; the `Runtime` trait gets its own types instead
-   of `legion_podman`'s.
+Next in phase 5: Linux images, IPv6 dual-stack, a volume plugin
+interface (NFS, iSCSI), bhyve tasks (exploratory). Smaller follow-ups of
+the jail runtime: registry credentials from Secrets, an image pulled
+again just as it is pruned (the task retries).
 
-Then: Linux images, IPv6 dual-stack, a volume plugin interface (NFS,
-iSCSI), bhyve tasks (exploratory).

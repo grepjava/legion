@@ -9,9 +9,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::runtime::{Chunk, Output};
 use bytes::Bytes;
 use futures::StreamExt;
-use legion_podman::{Chunk, Output};
 
 use crate::runtime::Runtime;
 
@@ -25,7 +25,7 @@ fn file(root: &Path, uid: &str, container: &str) -> PathBuf {
     root.join(uid).join(container)
 }
 
-/// Saves the output of each `(container name, Podman id)`. A container
+/// Saves the output of each `(container name, container id)`. A container
 /// whose output cannot be read is skipped.
 pub(crate) async fn save<R: Runtime>(
     rt: &R,

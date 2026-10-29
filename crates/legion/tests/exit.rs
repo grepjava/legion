@@ -10,9 +10,6 @@
 //! zpool destroy lexit; rm /var/tmp/lexit.img
 //! ```
 //!
-//! It runs on the jail runtime; `LEGION_EXIT_RUNTIME=podman` runs it on
-//! Podman and ocijail instead.
-//!
 //! The app is `tests/exit/app.yaml`: web (two replicas) counts requests in
 //! db, whose data is on a ZFS volume, and in cache, whose data is on a
 //! tmpfs volume. The lab directory is wiped first; remove it afterwards
@@ -35,8 +32,6 @@ const INGRESS_TLS: &str = "127.0.0.1:7474";
 struct Lab {
     dir: PathBuf,
     zfs_root: String,
-    /// The jail runtime rather than Podman.
-    jails: bool,
     daemon: Option<Child>,
 }
 
@@ -52,7 +47,6 @@ impl Lab {
             .args(["--metrics-listen", METRICS])
             .args(["--ingress-listen", INGRESS])
             .args(["--ingress-tls-listen", INGRESS_TLS])
-            .args(["--runtime", if self.jails { "jail" } else { "podman" }])
             .arg("--data-dir")
             .arg(self.dir.join("data"))
             .arg("--run-dir")
@@ -88,23 +82,7 @@ impl Lab {
         }
     }
 
-    /// Legion's own Podman, through the daemon's socket.
-    fn podman(&self, args: &[&str]) -> String {
-        let socket = format!("unix://{}", self.dir.join("run/podman.sock").display());
-        let out = Command::new("podman")
-            .args(["--url", &socket])
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "podman {args:?}: {}",
-            text(&out.stderr)
-        );
-        text(&out.stdout)
-    }
-
-    /// The jail runtime's records: (id, name, jail).
+    /// The containers' records: (id, name, jail).
     fn records(&self) -> Vec<(String, String, String)> {
         let Ok(dirs) = std::fs::read_dir(self.dir.join("data/jails")) else {
             return Vec::new();
@@ -129,40 +107,23 @@ impl Lab {
     }
 
     fn container_id(&self, name: &str) -> String {
-        if self.jails {
-            return self.jail_record(name).0;
-        }
-        self.podman(&["inspect", "--format", "{{.Id}}", name])
-            .trim()
-            .to_owned()
+        self.jail_record(name).0
     }
 
     /// The container's processes die at once, as in a crash.
     fn kill_container(&self, name: &str) {
-        if self.jails {
-            let jid = sh(&format!("jls -j {} jid", self.jail_record(name).1));
-            sh(&format!("pkill -KILL -j {}", jid.trim()));
-        } else {
-            self.podman(&["kill", name]);
-        }
+        let jid = sh(&format!("jls -j {} jid", self.jail_record(name).1));
+        sh(&format!("pkill -KILL -j {}", jid.trim()));
     }
 
     /// One process in the container dies.
     fn kill_process(&self, name: &str, process: &str) {
-        if self.jails {
-            let jid = sh(&format!("jls -j {} jid", self.jail_record(name).1));
-            sh(&format!("pkill -j {} {process}", jid.trim()));
-        } else {
-            self.podman(&["exec", name, "pkill", process]);
-        }
+        let jid = sh(&format!("jls -j {} jid", self.jail_record(name).1));
+        sh(&format!("pkill -j {} {process}", jid.trim()));
     }
 
     fn no_containers(&self) -> bool {
-        if self.jails {
-            self.records().is_empty()
-        } else {
-            self.podman(&["ps", "-aq"]).trim().is_empty()
-        }
+        self.records().is_empty()
     }
 }
 
@@ -322,9 +283,6 @@ fn sh(cmd: &str) -> String {
 fn app_survives_failures() {
     let dir = PathBuf::from(std::env::var("LEGION_EXIT_LAB").expect("set LEGION_EXIT_LAB"));
     let zfs_root = std::env::var("LEGION_EXIT_ZFS_ROOT").expect("set LEGION_EXIT_ZFS_ROOT");
-    let on_jails = std::env::var("LEGION_EXIT_RUNTIME")
-        .ok()
-        .is_none_or(|r| r != "podman");
     // A failed run leaves its pods running; wiping the lab under them
     // would orphan them.
     let jails = sh("jls path");
@@ -338,10 +296,9 @@ fn app_survives_failures() {
     let mut lab = Lab {
         dir,
         zfs_root,
-        jails: on_jails,
         daemon: None,
     };
-    // The jail runtime's pod jails are on /var/empty: found by their ids.
+    // Pod jails are on /var/empty: found by their ids.
     for (id, _, _) in lab.records() {
         assert!(
             !sh("jls name").lines().any(|j| j == id),

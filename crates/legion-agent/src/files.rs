@@ -5,7 +5,7 @@
 //! `<files dir>/<task uid>`, so nothing secret touches disk. Each file a
 //! container asks for is bind-mounted (nullfs) read-only at its target; a
 //! container sees only its own. Values asked for as environment variables
-//! are passed to Podman, which keeps them in the container's configuration.
+//! are passed to the runtime, which keeps them in the container's record.
 //!
 //! The values are read once per pod start: a changed Secret reaches a task
 //! when its pod next starts.
@@ -16,9 +16,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::runtime::{ContainerSpec, Mount};
 use legion_api::Kind;
 use legion_api::service::{Container, PodSpec};
-use legion_podman::{ContainerSpec, Mount};
 use legion_sys::Sys;
 
 use crate::control::{Assignment, Control};

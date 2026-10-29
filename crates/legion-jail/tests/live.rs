@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use legion_agent::Runtime;
+use legion_agent::runtime::{ContainerSpec, Mount, Output};
 use legion_image::{Client, Store};
 use legion_jail::{Config, JailRuntime};
-use legion_podman::{ContainerSpec, Mount, Output};
 use legion_sys::{Shell, Sys};
 
 const IMAGE: &str = "docker.io/freebsd/freebsd-runtime:15.1";

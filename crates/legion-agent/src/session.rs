@@ -1,7 +1,7 @@
 //! Sessions users open with this node's tasks (DESIGN.md §4.2): `logs`,
 //! `exec` and `port-forward`. A manager offers each one over the agent's
 //! `Sessions` stream with it, after checking the user's rights; the agent
-//! attaches to it at that manager and runs it against Podman or the pod.
+//! attaches to it at that manager and runs it against the runtime or the pod.
 //!
 //! The manager's end of an attached session closing means the user is
 //! gone: whatever the session runs is dropped. Exec and port-forward carry
@@ -13,9 +13,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::runtime::{Chunk, Output};
 use bytes::Bytes;
 use futures::StreamExt;
-use legion_podman::{Chunk, Output};
 use legion_proto::v1::session_frame::Frame;
 use legion_proto::v1::session_open::Action;
 use legion_proto::v1::{ExecOptions, LogsOptions, SessionError, SessionFrame};
@@ -120,7 +120,7 @@ async fn run<R: Runtime>(
     let _ = tokio::time::timeout(DRAIN_TIMEOUT, drained).await;
 }
 
-/// The Podman id of the task's container `name`.
+/// The runtime's id of the task's container `name`.
 async fn container<R: Runtime>(
     runtime: &R,
     node: &str,
@@ -134,7 +134,7 @@ async fn container<R: Runtime>(
             (LABEL_CONTAINER, name),
         ])
         .await
-        .map_err(podman)?;
+        .map_err(runtime_status)?;
     found
         .into_iter()
         .find(|c| c.labels.get(LABEL_ROLE).map(String::as_str) != Some("infra"))
@@ -154,14 +154,17 @@ async fn logs<R: Runtime>(
     inbound: &mut Streaming<SessionFrame>,
 ) -> Result<(), Status> {
     let tail = opts.tail.map(|n| n as usize);
-    let mut output = runtime.logs(id, opts.follow, tail).await.map_err(podman)?;
+    let mut output = runtime
+        .logs(id, opts.follow, tail)
+        .await
+        .map_err(runtime_status)?;
     loop {
         tokio::select! {
             chunk = output.next() => match chunk {
                 Some(Ok(c)) => if tx.send(output_frame(c)).await.is_err() {
                     return Ok(());
                 },
-                Some(Err(e)) => return Err(podman(e)),
+                Some(Err(e)) => return Err(runtime_status(e)),
                 None => return Ok(()),
             },
             f = inbound.next() => if !matches!(f, Some(Ok(_))) {
@@ -207,7 +210,7 @@ async fn exec<R: Runtime>(
     let attached = runtime
         .exec_attach(id, &opts.command, opts.stdin, opts.tty)
         .await
-        .map_err(podman)?;
+        .map_err(runtime_status)?;
     let exec_id = attached.id.clone();
     if let (true, Some(size)) = (opts.tty, opts.size) {
         resize(runtime.as_ref(), &exec_id, size.width, size.height).await;
@@ -220,11 +223,18 @@ async fn exec<R: Runtime>(
         let exec_id = exec_id.clone();
         tokio::spawn(async move {
             while let Some(chunk) = output.next().await {
-                if tx.send(output_frame(chunk.map_err(podman)?)).await.is_err() {
+                if tx
+                    .send(output_frame(chunk.map_err(runtime_status)?))
+                    .await
+                    .is_err()
+                {
                     return Ok(());
                 }
             }
-            let code = runtime.exec_exit_code(&exec_id).await.map_err(podman)?;
+            let code = runtime
+                .exec_exit_code(&exec_id)
+                .await
+                .map_err(runtime_status)?;
             let _ = tx.send(frame(Frame::ExitCode(code))).await;
             Ok(())
         })
@@ -362,7 +372,7 @@ fn output_frame(c: Chunk) -> SessionFrame {
     })
 }
 
-fn podman(e: legion_podman::Error) -> Status {
+fn runtime_status(e: crate::runtime::Error) -> Status {
     if e.is_not_found() {
         Status::not_found(e.to_string())
     } else if e.is_wrong_state() {

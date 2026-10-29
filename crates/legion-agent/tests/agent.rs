@@ -1,16 +1,16 @@
 //! The agent against a real single manager, through its dispatcher, with
-//! Podman and the system faked in memory.
+//! the runtime and the system faked in memory.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use legion_agent::fake::FakeRuntime;
+use legion_agent::runtime::Output;
 use legion_agent::{Agent, AgentConfig, GrpcControl, WireGuardConfig};
 use legion_api::node::{NodeState, NodeStatus};
 use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
 use legion_api::{Kind, Object, ObjectKey, Spec};
 use legion_manager::{Manager, ManagerConfig};
-use legion_podman::Output;
 use legion_proto::v1 as pb;
 use legion_proto::v1::pods_client::PodsClient;
 use legion_proto::v1::session_frame::Frame;
@@ -48,6 +48,11 @@ impl Harness {
     }
 
     async fn start(mesh: bool) -> Self {
+        // RUST_LOG shows what the agent and manager do, for a failing test.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init();
         let dir = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -234,6 +239,19 @@ impl Harness {
         self.status(key)
     }
 
+    /// Waits until no container is left, naming those that are if not.
+    async fn nothing_left(&self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !self.rt.containers().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "containers left: {:?}",
+                self.rt.containers()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Names of the containers that are running.
     fn running(&self) -> Vec<String> {
         self.rt
@@ -381,7 +399,7 @@ restartPolicy: { condition: on-failure, maxAttempts: 2, delay: 0s }
         "{}",
         status.message
     );
-    eventually("pod removed", || h.rt.containers().is_empty()).await;
+    h.nothing_left().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -466,7 +484,7 @@ restartPolicy: { condition: on-failure }
     h.rt.exit("shop_job-1_b", 0);
     let status = h.wait_state(&key, TaskState::Complete).await;
     assert_eq!(status.exit_code, Some(0));
-    eventually("pod removed", || h.rt.containers().is_empty()).await;
+    h.nothing_left().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -480,7 +498,7 @@ async fn infra_death_fails_the_task() {
     h.rt.exit("shop_app-1", 137);
     let status = h.wait_state(&key, TaskState::Failed).await;
     assert!(status.message.contains("infra"), "{}", status.message);
-    eventually("pod removed", || h.rt.containers().is_empty()).await;
+    h.nothing_left().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -497,7 +515,7 @@ async fn refuses_a_pod_without_vnet() {
         "{}",
         status.message
     );
-    eventually("nothing left", || h.rt.containers().is_empty()).await;
+    h.nothing_left().await;
     assert_eq!(h.rt.created(), 1, "no app container was created");
 }
 
@@ -555,7 +573,7 @@ containers:
         ]
     );
     // What a child jail may have only if its parent has it is asked of
-    // ocijail for both, and only for the container that wants it.
+    // the runtime for both, and only for the container that wants it.
     let infra = h.rt.spec("shop_app-1").unwrap().annotations;
     assert_eq!(infra["org.freebsd.jail.allow.mlock"], "true");
     assert_eq!(infra["org.freebsd.jail.sysvshm"], "new");
@@ -716,7 +734,7 @@ containers:
         "{}",
         status.message
     );
-    eventually("nothing left", || h.rt.containers().is_empty()).await;
+    h.nothing_left().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1556,7 +1574,7 @@ restartPolicy: { condition: none }
     h.rt.log("shop_web-1_app", Output::Stderr, "warned\n");
     h.rt.exit("shop_web-1_app", 0);
     h.wait_state(&key, TaskState::Complete).await;
-    eventually("pod removed", || h.rt.containers().is_empty()).await;
+    h.nothing_left().await;
 
     // By the task's name, or its owner's when nothing of it runs.
     for task in ["web-1", "web"] {

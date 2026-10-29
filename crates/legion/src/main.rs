@@ -48,7 +48,7 @@ enum Command {
     Daemon {
         #[arg(long, default_value = "/var/db/legion")]
         data_dir: PathBuf,
-        /// Runtime files: Podman's runroot, tmpdir and socket.
+        /// Runtime files: tasks' secrets and configs.
         #[arg(long, default_value = "/var/run/legion")]
         run_dir: PathBuf,
         #[arg(long, default_value = "127.0.0.1:7470")]
@@ -98,9 +98,6 @@ enum Command {
         /// Serve HTTPS for routes with `tls` here, e.g. `0.0.0.0:443`.
         #[arg(long)]
         ingress_tls_listen: Option<SocketAddr>,
-        /// What runs the agent's containers.
-        #[arg(long, value_enum, default_value = "jail")]
-        runtime: daemon::RuntimeKind,
     },
     /// Start a new cluster with the reached manager as its first member.
     Init,
@@ -169,7 +166,7 @@ enum Command {
         #[arg(long)]
         unlock_key_file: Option<PathBuf>,
     },
-    /// Images on this node, for the jail runtime.
+    /// Images on this node.
     Image {
         #[command(subcommand)]
         command: ImageCommand,
@@ -421,7 +418,6 @@ async fn run() -> anyhow::Result<()> {
             vip_password_file,
             ingress_listen,
             ingress_tls_listen,
-            runtime,
         } => {
             let vip = match (vip, vip_interface, vip_password_file) {
                 (Some(addr), Some(interface), Some(file)) => {
@@ -439,7 +435,6 @@ async fn run() -> anyhow::Result<()> {
                 _ => None,
             };
             daemon::run(daemon::Options {
-                runtime,
                 data_dir,
                 run_dir,
                 listen,

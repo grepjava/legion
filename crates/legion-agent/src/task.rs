@@ -149,7 +149,7 @@ pub(crate) async fn run<R: Runtime, C: Control>(
     ctx: Ctx<R, C>,
     a: Assignment,
     rx: mpsc::Receiver<Msg>,
-) {
+) -> TaskState {
     let status = a.status.clone();
     let (probe_tx, probe_rx) = mpsc::unbounded_channel();
     let mut w = Worker {
@@ -163,6 +163,8 @@ pub(crate) async fn run<R: Runtime, C: Control>(
     };
     let span = tracing::info_span!("task", task = %w.a.key, uid = %w.a.uid);
     w.main().instrument(span).await;
+    // What it last reported.
+    w.status.state
 }
 
 impl<R: Runtime, C: Control> Worker<R, C> {
@@ -270,7 +272,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         if found.is_empty() {
             return None;
         }
-        let role = |c: &legion_podman::ContainerSummary| {
+        let role = |c: &crate::runtime::ContainerSummary| {
             c.labels.get(LABEL_ROLE).and_then(|r| Role::parse(r))
         };
         let infra = found
@@ -512,9 +514,8 @@ impl<R: Runtime, C: Control> Worker<R, C> {
     }
 
     /// Sets rctl limits on a container's jail. This runs after every start:
-    /// an OCI runtime may clear a jail's rules when it creates the jail
-    /// (ocijail with rctl support replaces them with the container's OCI
-    /// limits), and Legion's rules must hold for every run. Adding a rule
+    /// a runtime may clear a jail's rules when it creates the jail, and
+    /// Legion's rules must hold for every run. Adding a rule
     /// again replaces it, so repeating this is harmless.
     async fn limit(&self, c: &legion_api::service::Container, infra: &str, id: &str) {
         let rules = pod::rctl_rules(c, &pod::child_jail(infra, id));
@@ -531,10 +532,9 @@ impl<R: Runtime, C: Control> Worker<R, C> {
     }
 
     /// Checks that a container's jail has its profile (DESIGN.md §9), which
-    /// Legion's hook sets before the container's process starts
-    /// ([`crate::hook`]). A jail without it means the hook did not run, and
-    /// the pod is refused. With `fix`, for a pod adopted from an agent
-    /// older than the hook, the running jail is tightened instead. A jail
+    /// the runtime sets when it creates the jail. A jail without it is
+    /// refused. With `fix`, for an adopted pod, the running jail is
+    /// tightened instead. A jail
     /// already gone has nothing left to check.
     async fn check_jail(
         &self,
@@ -800,7 +800,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         match self.ctx.runtime.inspect(id).await {
             Ok(c) => c.state.running,
             Err(e) if e.is_not_found() => false,
-            // Podman unreachable: assume nothing changed until it answers.
+            // The runtime unreachable: assume nothing changed until it answers.
             Err(_) => true,
         }
     }

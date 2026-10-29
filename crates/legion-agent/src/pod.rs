@@ -1,11 +1,11 @@
-//! How a task's pod maps onto Podman containers (DESIGN.md §6.2): names,
+//! How a task's pod maps onto the runtime's containers (DESIGN.md §6.2): names,
 //! labels, container specs and rctl rules.
 
 use std::collections::BTreeMap;
 
+use crate::runtime::ContainerSpec;
 use legion_api::security::{Allow, Security};
 use legion_api::service::{Container, PodSpec};
-use legion_podman::ContainerSpec;
 use legion_sys::{RctlRule, Resource};
 
 use crate::control::Assignment;
@@ -55,7 +55,7 @@ impl Role {
     }
 }
 
-/// Podman name of a pod member: `<ns>_<task>` for the infra container,
+/// The runtime's name of a pod member: `<ns>_<task>` for the infra container,
 /// `<ns>_<task>_<container>` for the others. `_` cannot occur in object
 /// names, so the forms cannot collide.
 pub fn container_name(a: &Assignment, container: Option<&str>) -> String {
@@ -163,11 +163,10 @@ fn container_annotations(s: &Security, infra_id: &str) -> BTreeMap<String, Strin
     annotations
 }
 
-/// The parameters a container's jail must have (DESIGN.md §9). ocijail
-/// gives every jail raw sockets, chflags and `enforce_statfs=1`, and cannot
-/// be told otherwise through Podman, so Legion's hook sets these on the new
-/// jail, and the agent checks them once the container runs. mlock and SysV
-/// IPC are off unless ocijail is asked for them.
+/// The parameters a container's jail must have (DESIGN.md §9). The
+/// runtime sets them when it creates the jail (from the `legion.jail`
+/// annotation), and the agent checks them once the container runs. mlock
+/// and SysV IPC are off unless their annotations ask for them.
 pub fn jail_params(s: &Security) -> [(&'static str, String); 4] {
     let allow = |a| s.allow.contains(&a).to_string();
     [
@@ -178,8 +177,8 @@ pub fn jail_params(s: &Security) -> [(&'static str, String); 4] {
     ]
 }
 
-/// The jail a pod member runs in: a child of the infra jail. ocijail names
-/// a container's jail after the container id.
+/// The jail a pod member runs in: a child of the infra jail. The runtime
+/// names a container's jail after the container id.
 pub fn child_jail(infra_id: &str, container_id: &str) -> String {
     format!("{infra_id}.{container_id}")
 }

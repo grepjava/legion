@@ -1,13 +1,14 @@
-//! An in-memory [`Runtime`] for tests. It behaves like Podman with ocijail
+//! An in-memory [`Runtime`] for tests. It behaves like the jail runtime
 //! where the agent depends on it: starting a container creates its jail in
 //! a [`FakeSys`] (with a VNET when the infra annotation asks for one, as a
 //! child of the infra jail when `parentJail` is set), a stopped container's
 //! jail goes away, stopping the infra jail kills the pod, and every death
-//! is reported as a `died` event carrying the container's labels. Starting
-//! a container clears its jail's rctl rules, as ocijail with rctl support
-//! does. A child jail gets ocijail's parameters (raw sockets, chflags,
-//! `enforce_statfs=1`), then those of the `legion.jail` annotation, as
-//! Legion's hook sets them, unless [`FakeRuntime::skip_jail_hook`]. Exec runs nothing: each container answers with the exit code
+//! is reported as a `died` event carrying the container's labels. To keep
+//! the agent honest it is less kind than the jail runtime: starting a
+//! container clears its jail's rctl rules (an OCI runtime may), and a
+//! child jail gets loose parameters (raw sockets, chflags,
+//! `enforce_statfs=1`), then those of the `legion.jail` annotation, unless
+//! [`FakeRuntime::skip_jail_hook`]. Exec runs nothing: each container answers with the exit code
 //! set by [`FakeRuntime::set_exec`], 0 by default. An attached exec of
 //! `cat` echoes its stdin; any other command prints itself and the
 //! terminal size, if it has one. Logs are what [`FakeRuntime::log`] wrote.
@@ -16,13 +17,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use bytes::Bytes;
-use futures::StreamExt;
-use futures::stream::BoxStream;
-use legion_podman::{
+use crate::runtime::{
     Actor, Attached, Chunk, ContainerConfig, ContainerInspect, ContainerSpec, ContainerState,
     ContainerSummary, Error, Event, ExecOutput, Output, Result,
 };
+use bytes::Bytes;
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use legion_sys::FakeSys;
 use tokio::sync::broadcast;
 
@@ -44,7 +45,8 @@ struct State {
     containers: BTreeMap<String, Container>,
     /// Ignore the VNET annotation, as a runtime without support would.
     ignore_vnet: bool,
-    /// Run without Legion's jail hook, as a Podman without `--hooks-dir`.
+    /// Ignore the `legion.jail` annotation, as a runtime that does not set
+    /// a jail's parameters would.
     no_hook: bool,
     /// Exit code of init containers, which exit as soon as they start.
     init_exit_code: i32,
@@ -99,9 +101,11 @@ struct Container {
 }
 
 fn api(status: u16, message: impl Into<String>) -> Error {
-    Error::Api {
-        status,
-        message: message.into(),
+    let message = message.into();
+    match status {
+        404 => Error::NotFound(message),
+        409 => Error::WrongState(message),
+        _ => Error::Failed(message),
     }
 }
 
@@ -387,8 +391,8 @@ impl Runtime for FakeRuntime {
                 id.to_owned()
             }
         };
-        // Like ocijail with rctl support: a new jail starts with only the
-        // container's own OCI limits, none here.
+        // As an OCI runtime may: a new jail starts with only the container's
+        // own OCI limits, none here.
         let _ = legion_sys::Sys::rctl_remove_jail(self.sys.as_ref(), &jail);
         let c = s.containers.get_mut(id).expect("exists");
         c.running = true;
@@ -576,7 +580,7 @@ impl Runtime for FakeRuntime {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        Err(Error::Protocol("exec still running".into()))
+        Err(Error::Failed("exec still running".into()))
     }
 
     async fn logs(

@@ -17,7 +17,6 @@ legion-jail = { path = "crates/legion-jail" }
 legion-manager = { path = "crates/legion-manager" }
 legion-net = { path = "crates/legion-net" }
 legion-pki = { path = "crates/legion-pki" }
-legion-podman = { path = "crates/legion-podman" }
 legion-proto = { path = "crates/legion-proto" }
 legion-store = { path = "crates/legion-store" }
 legion-sys = { path = "crates/legion-sys" }

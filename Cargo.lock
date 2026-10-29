@@ -1175,7 +1175,6 @@ dependencies = [
  "legion-manager",
  "legion-net",
  "legion-pki",
- "legion-podman",
  "legion-proto",
  "legion-store",
  "legion-sys",
@@ -1205,7 +1204,6 @@ dependencies = [
  "legion-api",
  "legion-manager",
  "legion-net",
- "legion-podman",
  "legion-proto",
  "legion-store",
  "legion-sys",
@@ -1272,7 +1270,6 @@ dependencies = [
  "getrandom 0.3.4",
  "legion-agent",
  "legion-image",
- "legion-podman",
  "legion-sys",
  "libc",
  "serde",
@@ -1328,26 +1325,6 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "x509-parser",
-]
-
-[[package]]
-name = "legion-podman"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "form_urlencoded",
- "futures",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
 ]
 
 [[package]]

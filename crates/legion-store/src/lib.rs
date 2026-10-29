@@ -106,6 +106,8 @@ impl Error {
 pub struct Store {
     pub raft: Raft,
     state: StateMachine,
+    /// The database file, to know when [`Store::shutdown`] has closed it.
+    path: std::path::PathBuf,
 }
 
 impl Store {
@@ -136,13 +138,14 @@ impl Store {
     where
         N: RaftNetworkFactory<TypeConfig>,
     {
-        let db = Arc::new(redb::Database::create(dir.join("store.redb"))?);
+        let path = dir.join("store.redb");
+        let db = Arc::new(redb::Database::create(&path)?);
         let codec = Arc::new(cipher::Codec::new(key));
         let log = LogStore::open_with(db.clone(), codec.clone())?;
         let state = StateMachine::open_with(db, codec)?;
         let config = Arc::new(config.validate()?);
         let raft = Raft::new(id, config, network, log, state.clone()).await?;
-        Ok(Store { raft, state })
+        Ok(Store { raft, state, path })
     }
 
     pub fn get(&self, key: &ObjectKey) -> Result<Option<Object>, Error> {
@@ -190,6 +193,7 @@ impl Store {
     /// this `Store` is still alive.
     pub async fn shutdown(self) -> Result<(), Error> {
         let db = self.state.db_handle();
+        let path = self.path.clone();
         // A join error means the Raft core panicked; it has stopped either way.
         let _ = self.raft.shutdown().await;
         drop(self);
@@ -200,6 +204,18 @@ impl Store {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        Ok(())
+        // The count drops before the database's own drop has closed the
+        // file, which may still be running on another thread: done once
+        // the file opens again.
+        loop {
+            match redb::Database::open(&path) {
+                Err(redb::DatabaseError::DatabaseAlreadyOpen) => {}
+                _ => return Ok(()),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::StillOpen);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 }

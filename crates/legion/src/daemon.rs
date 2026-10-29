@@ -1,31 +1,17 @@
 //! `legion daemon`: on a manager node the manager, and on FreeBSD the agent
-//! with its container runtime (jails, or its own Podman service); on a
-//! worker node only the agent. The agent follows its work through the
+//! running tasks as jails; on a worker node only the agent. The agent follows its work through the
 //! managers' dispatcher either way, its own manager first.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, bail};
 use legion_agent::{Agent, AgentConfig, GrpcControl, WireGuardConfig};
 use legion_api::node::{Capacity, NodeState, NodeStatus, Platform};
 use legion_api::quantity::{Bytes, Cpu};
-use legion_podman::service::{PodmanService, ServiceConfig};
-
-/// What runs the agent's containers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum RuntimeKind {
-    /// Legion's own: jails on ZFS clones of their images (needs
-    /// `--zfs-root`).
-    Jail,
-    /// Legion's Podman service, with ocijail.
-    Podman,
-}
 
 pub struct Options {
-    pub runtime: RuntimeKind,
     pub data_dir: PathBuf,
     pub run_dir: PathBuf,
     pub listen: SocketAddr,
@@ -112,10 +98,9 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     };
 
     // The agent holds store handles, so it stops before the store does.
-    let (agent_task, podman, agent_metrics) = match agent {
-        // The Podman service, if this runtime has one, outlives the agent.
-        Some(a) => (Some(a.task), Some(a.podman), Some(a.metrics)),
-        None => (None, None, None),
+    let (agent_task, agent_metrics) = match agent {
+        Some(a) => (Some(a.task), Some(a.metrics)),
+        None => (None, None),
     };
     let metrics = metrics_listener.map(|l| {
         tokio::spawn(crate::metrics::serve(
@@ -138,9 +123,6 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         metrics.abort();
     }
     autolock.abort();
-    if let Some(podman) = podman.flatten() {
-        podman.shutdown().await;
-    }
     served
 }
 
@@ -190,9 +172,6 @@ async fn run_worker(opts: &Options, pki: &crate::pki::Pki, hostname: String) -> 
     let _ = agent.task.await;
     if let Some(metrics) = metrics {
         metrics.abort();
-    }
-    if let Some(podman) = agent.podman {
-        podman.shutdown().await;
     }
     // The managers the agent learned of, for the next start.
     crate::pki::write_managers(&opts.data_dir, &control.managers())
@@ -252,8 +231,6 @@ async fn bind_metrics(opts: &Options) -> anyhow::Result<Option<tokio::net::TcpLi
 /// A running agent and what it needs.
 struct Running {
     task: tokio::task::JoinHandle<()>,
-    /// With the Podman runtime, its service.
-    podman: Option<PodmanService>,
     metrics: crate::metrics::Collect,
 }
 
@@ -277,33 +254,9 @@ async fn start_agent(
         port: legion_net::mesh::PORT,
     });
     let sys: Arc<dyn legion_sys::Sys> = Arc::new(legion_sys::Shell::new());
-    match opts.runtime {
-        RuntimeKind::Podman => {
-            let podman_config = ServiceConfig::new(&opts.data_dir, &opts.run_dir);
-            if let Some(dir) = &podman_config.hooks_dir {
-                legion_agent::hook::install(dir).context("installing Legion's jail hook")?;
-            }
-            let podman = PodmanService::start(podman_config, Duration::from_secs(60))
-                .await
-                .context("starting Legion's Podman service")?;
-            let runtime = Arc::new(podman.client().clone());
-            let (task, metrics) = spawn_agent(config, runtime, sys, control, node, status, stopped);
-            Ok(Running {
-                task,
-                podman: Some(podman),
-                metrics,
-            })
-        }
-        RuntimeKind::Jail => {
-            let runtime = Arc::new(jail_runtime(opts, &sys)?);
-            let (task, metrics) = spawn_agent(config, runtime, sys, control, node, status, stopped);
-            Ok(Running {
-                task,
-                podman: None,
-                metrics,
-            })
-        }
-    }
+    let runtime = Arc::new(jail_runtime(opts, &sys)?);
+    let (task, metrics) = spawn_agent(config, runtime, sys, control, node, status, stopped);
+    Ok(Running { task, metrics })
 }
 
 fn image_store(
@@ -343,7 +296,7 @@ fn jail_runtime(
     sys: &Arc<dyn legion_sys::Sys>,
 ) -> anyhow::Result<legion_jail::JailRuntime> {
     let Some(zfs) = opts.zfs_root.as_deref() else {
-        bail!("the jail runtime keeps images and containers in ZFS: pass --zfs-root");
+        bail!("the agent keeps images and containers in ZFS: pass --zfs-root");
     };
     let images = image_store(sys.clone(), &opts.data_dir, zfs)?;
     let exe = std::env::current_exe().context("finding this binary, for the supervisor")?;
@@ -359,12 +312,13 @@ fn jail_runtime(
     .context("starting the jail runtime")
 }
 
+/// Elsewhere the agent does not run; this only keeps the code building.
 #[cfg(not(unix))]
 fn jail_runtime(
     _: &Options,
     _: &Arc<dyn legion_sys::Sys>,
-) -> anyhow::Result<legion_podman::Podman> {
-    bail!("the jail runtime needs FreeBSD")
+) -> anyhow::Result<legion_agent::fake::FakeRuntime> {
+    bail!("the agent runs tasks as jails, on FreeBSD")
 }
 
 fn spawn_agent<R: legion_agent::Runtime>(

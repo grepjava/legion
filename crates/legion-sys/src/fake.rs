@@ -6,8 +6,9 @@
 //! (missing interface, missing jail, existing dataset, unmounting what is
 //! not mounted).
 //!
-//! Jails are created by Podman in production, so tests add them with
-//! [`FakeSys::add_jail`] and remove them with [`FakeSys::remove_jail`].
+//! Tests that fake a runtime add jails with
+//! [`FakeSys::add_jail`] and remove them with [`FakeSys::remove_jail`], as
+//! a runtime does through [`Sys::jail_create`] and [`Sys::jail_remove`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
@@ -106,7 +107,7 @@ impl FakeSys {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Creates a jail, as Podman does for a container. A child's `name` is
+    /// Creates a jail, as a runtime does for a container. A child's `name` is
     /// `<parent>.<child>`.
     pub fn add_jail(&self, name: &str, vnet: bool) -> u32 {
         let mut s = self.state();

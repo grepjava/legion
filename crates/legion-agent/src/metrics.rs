@@ -135,7 +135,7 @@ impl<R: Runtime> AgentMetrics<R> {
                 tracing::warn!("listing containers for metrics: {e}");
                 m.gauge(
                     "legion_agent_runtime_up",
-                    "1 if the agent reached its Podman, else 0.",
+                    "1 if the agent reached its container runtime, else 0.",
                 )
                 .sample(&[], 0.0);
                 return m;
@@ -143,7 +143,7 @@ impl<R: Runtime> AgentMetrics<R> {
         };
         m.gauge(
             "legion_agent_runtime_up",
-            "1 if the agent reached its Podman, else 0.",
+            "1 if the agent reached its container runtime, else 0.",
         )
         .sample(&[], 1.0);
         m.gauge("legion_agent_pods", "Pods running on the node.")
@@ -226,7 +226,7 @@ impl<R: Runtime> AgentMetrics<R> {
             .list(&[(LABEL_NODE, &self.node)])
             .await
             .map_err(|e| e.to_string())?;
-        let role = |c: &legion_podman::ContainerSummary| {
+        let role = |c: &crate::runtime::ContainerSummary| {
             c.labels.get(LABEL_ROLE).and_then(|r| Role::parse(r))
         };
         let infra: BTreeMap<&str, &str> = found

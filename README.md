@@ -1,12 +1,14 @@
 # Legion
 
 A container orchestrator for FreeBSD: Docker Swarm's operating model plus
-selected Kubernetes features, running workloads as jails through Podman and
-`ocijail`. The plan and its rationale are in [docs/DESIGN.md](docs/DESIGN.md).
+selected Kubernetes features, running workloads as jails from OCI images,
+which it pulls into ZFS and runs itself. The plan and its rationale are in
+[docs/DESIGN.md](docs/DESIGN.md).
 
-Status: phases 1 (single node), 2 (cluster) and 3 (K8s-lite: namespaces,
-RBAC, network policy, quotas, jobs, security profiles, metrics) are done;
-phase 4 (stateful services and operations) is next. [PHASE.md](PHASE.md) tracks what is built and what is next.
+Status: phases 1 (single node), 2 (cluster), 3 (K8s-lite: namespaces, RBAC,
+network policy, quotas, jobs, security profiles, metrics) and 4 (stateful
+services and operations) are done; phase 5 has replaced Podman and ocijail
+with Legion's own jail runtime. [PHASE.md](PHASE.md) tracks what is built and what is next.
 
 ## Build
 
@@ -45,8 +47,7 @@ address on the node's `legion0` bridge). The agent runs them itself: it
 pulls OCI images into ZFS and runs each container as a jail on a clone of
 its image, so it needs `--zfs-root <pool>/legion`, where images,
 containers and volumes live (`legion image load` adds images no registry
-serves). `--runtime podman` runs them with a Podman service of its own and
-ocijail instead. Pods reach each other and the host, and find services by
+serves). Pods reach each other and the host, and find services by
 name (`web`, `web.shop` or `web.shop.legion`) through the node's resolver
 on the bridge. Service VIPs,
 published ports and NAT for pods need the host's `/etc/pf.conf` to call
@@ -171,7 +172,8 @@ namespace's names, so keep it on an admin network.
 | `legion-store` | openraft state machine on redb, watches |
 | `legion-proto` | gRPC definitions (compiled with protox) |
 | `legion-manager` | API server, Raft transport |
-| `legion-podman` | libpod REST client; supervises Legion's own Podman service |
+| `legion-image` | OCI images: registry client, ZFS layer store |
+| `legion-jail` | The jail runtime: containers as jails on ZFS clones, each under a supervisor |
 | `legion-sys` | FreeBSD operations: jails, interfaces, routes, WireGuard, rctl, pf, ZFS |
 | `legion-agent` | Registers the node; runs assigned tasks as pod jails |
 | `legion-net` | Pod bridge and interfaces, the WireGuard mesh, the node resolver, pf load balancing |

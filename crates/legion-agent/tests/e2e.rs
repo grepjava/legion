@@ -1,5 +1,5 @@
 //! From `apply` to running pods in one process: a served manager (API and
-//! controllers) and an agent with Podman and the system faked.
+//! controllers) and an agent with the runtime and the system faked.
 
 use std::sync::Arc;
 use std::time::Duration;

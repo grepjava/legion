@@ -1,9 +1,9 @@
 //! The Legion agent (DESIGN.md §3.4): registers its node and runs the tasks
-//! assigned to it as pods of jails through the Legion-owned Podman.
+//! assigned to it as pods of jails, through its runtime (`legion_jail`).
 //!
 //! The agent compares three views and converges them: the assignments from
-//! the manager, its task workers, and the containers Podman holds with this
-//! node's label. It reconciles whenever the assignments change, on every
+//! the manager, its task workers, and the containers the runtime holds with
+//! this node's label. It reconciles whenever the assignments change, on every
 //! container event, and periodically in case an event was missed. Pods
 //! outlive the agent: when it restarts, workers adopt the running pods.
 
@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use legion_api::node::NodeStatus;
-use legion_api::task::DesiredState;
+use legion_api::task::{DesiredState, TaskState};
 use legion_sys::Sys;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -24,7 +24,6 @@ use tokio::task::JoinSet;
 pub mod control;
 pub mod fake;
 mod files;
-pub mod hook;
 pub mod ingress;
 pub mod metrics;
 mod output;
@@ -351,7 +350,11 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         let (events_tx, mut events) = mpsc::channel(256);
         let forwarder = tokio::spawn(forward_events(ctx.clone(), events_tx));
         let mut workers: BTreeMap<String, Worker> = BTreeMap::new();
-        let mut running: JoinSet<String> = JoinSet::new();
+        let mut running: JoinSet<(String, TaskState)> = JoinSet::new();
+        // Tasks whose workers ended having reported an end: assignments may
+        // still carry an older state for a while, and must not start them
+        // again.
+        let mut ended: BTreeSet<String> = BTreeSet::new();
         // Uids whose leftover containers are being removed.
         let mut cleaning: BTreeSet<String> = BTreeSet::new();
         let mut cleanups: JoinSet<String> = JoinSet::new();
@@ -367,7 +370,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                         break;
                     }
                     let current = assignments.borrow_and_update().clone();
-                    reconcile(&ctx, &current, &mut workers, &mut running, &mut cleaning, &mut cleanups).await;
+                    reconcile(&ctx, &current, &mut workers, &mut running, &mut ended, &mut cleaning, &mut cleanups).await;
                 }
                 Some(event) = events.recv() => match event {
                     Forwarded::Event { uid, msg } => {
@@ -383,14 +386,19 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 },
                 _ = tick.tick() => {
                     let current = assignments.borrow().clone();
-                    reconcile(&ctx, &current, &mut workers, &mut running, &mut cleaning, &mut cleanups).await;
+                    reconcile(&ctx, &current, &mut workers, &mut running, &mut ended, &mut cleaning, &mut cleanups).await;
                     for w in workers.values() {
                         let _ = w.tx.try_send(Msg::Resync);
                     }
                 }
                 Some(done) = running.join_next() => {
                     match done {
-                        Ok(uid) => { workers.remove(&uid); }
+                        Ok((uid, state)) => {
+                            workers.remove(&uid);
+                            if state.is_terminal() {
+                                ended.insert(uid);
+                            }
+                        }
                         Err(e) if e.is_panic() => tracing::error!("task worker panicked: {e}"),
                         Err(_) => {}
                     }
@@ -831,18 +839,21 @@ async fn register<R, C: Control>(ctx: &Ctx<R, C>, status: &NodeStatus) -> contro
     }
 }
 
-/// Starts workers for new tasks, stops workers for tasks that went away or
-/// should stop, and removes containers no task accounts for.
+/// Starts workers for new tasks (not those whose workers ended), stops
+/// workers for tasks that went away or should stop, and removes containers
+/// no task accounts for.
 async fn reconcile<R: Runtime, C: Control>(
     ctx: &Ctx<R, C>,
     assignments: &control::Assignments,
     workers: &mut BTreeMap<String, Worker>,
-    running: &mut JoinSet<String>,
+    running: &mut JoinSet<(String, TaskState)>,
+    ended: &mut BTreeSet<String>,
     cleaning: &mut BTreeSet<String>,
     cleanups: &mut JoinSet<String>,
 ) {
+    ended.retain(|uid| assignments.contains_key(uid));
     for (uid, a) in assignments {
-        let terminal = a.status.state.is_terminal();
+        let terminal = a.status.state.is_terminal() || ended.contains(uid);
         let wanted = a.spec.desired_state == DesiredState::Running && !terminal;
         match workers.get_mut(uid) {
             Some(w) => {
@@ -856,8 +867,8 @@ async fn reconcile<R: Runtime, C: Control>(
                 let (tx, rx) = mpsc::channel(64);
                 let (worker_ctx, a, key) = (ctx.clone(), a.clone(), uid.clone());
                 running.spawn(async move {
-                    task::run(worker_ctx, a, rx).await;
-                    key
+                    let state = task::run(worker_ctx, a, rx).await;
+                    (key, state)
                 });
                 workers.insert(
                     uid.clone(),
@@ -937,7 +948,7 @@ enum Forwarded {
     Reconnected,
 }
 
-/// Follows Podman's events for this node's containers, reconnecting when
+/// Follows the runtime's events for this node's containers, reconnecting when
 /// the stream ends.
 async fn forward_events<R: Runtime, C>(ctx: Ctx<R, C>, tx: mpsc::Sender<Forwarded>) {
     let mut first = true;
@@ -951,7 +962,7 @@ async fn forward_events<R: Runtime, C>(ctx: Ctx<R, C>, tx: mpsc::Sender<Forwarde
                     let event = match event {
                         Ok(e) => e,
                         Err(e) => {
-                            tracing::debug!("podman events: {e}");
+                            tracing::debug!("runtime events: {e}");
                             break;
                         }
                     };
@@ -970,7 +981,7 @@ async fn forward_events<R: Runtime, C>(ctx: Ctx<R, C>, tx: mpsc::Sender<Forwarde
                     }
                 }
             }
-            Err(e) => tracing::debug!("podman events: {e}"),
+            Err(e) => tracing::debug!("runtime events: {e}"),
         }
         first = false;
         tokio::time::sleep(Duration::from_secs(1)).await;

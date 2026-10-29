@@ -6,10 +6,9 @@
 //! - `LEGION_CLUSTER_VMS`: the two machines, as `name=[user@]addr`, logging
 //!   in as root unless a user is given, who must have sudo.
 //! - `LEGION_CLUSTER_KEY`: the ssh key to log in with.
-//! - `LEGION_CLUSTER_RUNTIME=podman`: Podman and ocijail rather than the
-//!   jail runtime, which gives every node the throwaway pool [`POOL`].
 //!
-//! The test's own `legion` is copied to the machines. Remove the lab
+//! Every node gets the throwaway pool [`POOL`] for images, containers
+//! and volumes. The test's own `legion` is copied to the machines. Remove the lab
 //! directory afterwards with `chflags -R 0` and `rm -rf`.
 
 #![allow(dead_code)]
@@ -66,8 +65,6 @@ pub const ZFS_ROOT: &str = "llab/legion";
 
 pub struct Lab {
     pub dir: PathBuf,
-    /// The jail runtime rather than Podman.
-    pub jails: bool,
     pub host: String,
     pub vms: Vec<Vm>,
     pub key: String,
@@ -113,40 +110,17 @@ impl Lab {
                 .unwrap();
         }
         std::fs::create_dir_all(&dir).unwrap();
-        let jails = std::env::var("LEGION_CLUSTER_RUNTIME")
-            .ok()
-            .is_none_or(|r| r != "podman");
-        let mut lab = Lab {
+        // Every node gets the pool, its daemon `--zfs-root` in it, and the
+        // pool goes when the lab does.
+        Lab {
             dir,
-            jails,
             host: var("LEGION_CLUSTER_HOST"),
             vms,
             key: var("LEGION_CLUSTER_KEY"),
             daemon: None,
-            setup: String::new(),
-            flags: String::new(),
-            teardown: String::new(),
-        };
-        if jails {
-            lab.use_pool();
-        }
-        lab
-    }
-
-    /// Every node gets [`POOL`], its daemon `--zfs-root` in it, and the
-    /// pool goes when the lab does.
-    pub fn use_pool(&mut self) {
-        self.setup = POOL.to_owned();
-        self.flags = format!("--zfs-root {ZFS_ROOT}");
-        self.teardown = NO_POOL.to_owned();
-    }
-
-    /// The runtime flag for every daemon.
-    fn runtime(&self) -> &'static str {
-        if self.jails {
-            "--runtime jail"
-        } else {
-            "--runtime podman"
+            setup: POOL.to_owned(),
+            flags: format!("--zfs-root {ZFS_ROOT}"),
+            teardown: NO_POOL.to_owned(),
         }
     }
 
@@ -277,7 +251,6 @@ impl Lab {
             .arg(self.dir.join("data"))
             .arg("--run-dir")
             .arg(self.dir.join("run"))
-            .args(self.runtime().split_whitespace())
             .args(self.flags.split_whitespace())
             .args(extra)
             .stdout(log.try_clone().unwrap())
@@ -314,12 +287,11 @@ impl Lab {
                  {join} --node-name {name}
              daemon -o /var/log/legion-lab.log {REMOTE} daemon --node-name {name} \
                  --data-dir /var/db/legion-lab --run-dir /var/run/legion-lab \
-                 {daemon} {runtime} {flags} </dev/null >/dev/null 2>&1
+                 {daemon} {flags} </dev/null >/dev/null 2>&1
 ",
             clean = clean(VM_DATA, VM_RUN),
             server = self.server(),
             setup = self.setup,
-            runtime = self.runtime(),
             flags = self.flags,
         );
         let out = self.ssh(vm, &cmd);
@@ -371,8 +343,8 @@ impl Lab {
 }
 
 /// A script removing what a stopped daemon with these directories left:
-/// its pods (the jail runtime's by their records' ids, as pod jails are on
-/// /var/empty), Podman service, interfaces, load balancing and state.
+/// its pods (by their records' ids, as pod jails are on /var/empty),
+/// interfaces, load balancing and state.
 pub fn clean(data: &str, run: &str) -> String {
     format!(
         "for r in {data}/jails/*/record.json; do
@@ -383,9 +355,6 @@ pub fn clean(data: &str, run: &str) -> String {
          i=0; while jls -d -h path | grep -q '^{data}/' && [ $i -lt 90 ]; do
              sleep 1; i=$((i + 1))
          done
-         pkill -f 'podman --root {data}/podman'
-         podman --root {data}/podman --runroot {run}/podman --tmpdir {run}/podman-tmp \
-             rm -af -t 0 >/dev/null 2>&1
          for i in $(ifconfig -l); do
              case $i in lp*|legion0|wg0) ifconfig $i destroy ;; esac
          done

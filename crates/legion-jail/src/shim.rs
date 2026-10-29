@@ -57,7 +57,7 @@ mod imp {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    use legion_podman::Output;
+    use legion_agent::runtime::Output;
 
     use crate::log::Writer;
     use crate::state::{self, EXIT, Exit, LOG, RECORD, RUN, Record, Run};
