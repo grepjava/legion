@@ -440,7 +440,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             rt.start(&id)
                 .await
                 .map_err(|e| Abort::Failed(format!("starting init container {}: {e}", c.name)))?;
-            self.limit(c, &infra, &id).await;
+            self.limit(c, &infra, &id).await.map_err(Abort::Failed)?;
             self.check_jail(c, &infra, &id, false)
                 .await
                 .map_err(Abort::Rejected)?;
@@ -477,7 +477,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             rt.start(&id)
                 .await
                 .map_err(|e| Abort::Failed(format!("starting container {}: {e}", c.name)))?;
-            self.limit(c, &infra, &id).await;
+            self.limit(c, &infra, &id).await.map_err(Abort::Failed)?;
             self.check_jail(c, &infra, &id, false)
                 .await
                 .map_err(Abort::Rejected)?;
@@ -605,23 +605,28 @@ impl<R: Runtime, C: Control> Worker<R, C> {
     /// Sets rctl limits on a container's jail. This runs after every start:
     /// a runtime may clear a jail's rules when it creates the jail, and
     /// Legion's rules must hold for every run. Adding a rule
-    /// again replaces it, so repeating this is harmless.
-    async fn limit(&self, c: &legion_api::service::Container, infra: &str, id: &str) {
+    /// again replaces it, so repeating this is harmless. A container whose
+    /// limits could not be set must not run without them: the error is
+    /// the caller's to fail or refuse the pod with.
+    async fn limit(
+        &self,
+        c: &legion_api::service::Container,
+        infra: &str,
+        id: &str,
+    ) -> Result<(), String> {
         let jail = pod::child_jail(infra, id);
         self.ctx
             .memory
             .started(&jail, c.resources.limits.memory.map(|m| m.0));
         let rules = pod::rctl_rules(c, &jail);
         if rules.is_empty() {
-            return;
+            return Ok(());
         }
-        let result = blocking(&self.ctx.sys, move |sys| {
+        blocking(&self.ctx.sys, move |sys| {
             rules.iter().try_for_each(|r| sys.rctl_add(r))
         })
-        .await;
-        if let Err(e) = result {
-            tracing::warn!(container = %c.name, "setting limits: {e}");
-        }
+        .await
+        .map_err(|e| format!("setting container {}'s limits: {e}", c.name))
     }
 
     /// Checks that a container's jail has its profile (DESIGN.md §9), which
@@ -744,8 +749,11 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 .find(|c| c.name == name)
                 .cloned()
             {
-                self.limit(&c, &pod.infra, &id).await;
-                if let Err(why) = self.check_jail(&c, &pod.infra, &id, true).await {
+                let checked = match self.limit(&c, &pod.infra, &id).await {
+                    Ok(()) => self.check_jail(&c, &pod.infra, &id, true).await,
+                    Err(why) => Err(why),
+                };
+                if let Err(why) = checked {
                     pod.refused = Some(why);
                 }
             }
@@ -876,8 +884,11 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                     .find(|c| c.name == name)
                     .cloned()
                 {
-                    self.limit(&c, &pod.infra, &id).await;
-                    if let Err(why) = self.check_jail(&c, &pod.infra, &id, false).await {
+                    let checked = match self.limit(&c, &pod.infra, &id).await {
+                        Ok(()) => self.check_jail(&c, &pod.infra, &id, false).await,
+                        Err(why) => Err(why),
+                    };
+                    if let Err(why) = checked {
                         pod.refused = Some(why);
                     }
                 }

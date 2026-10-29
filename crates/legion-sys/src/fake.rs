@@ -324,7 +324,7 @@ impl FakeSys {
     }
 
     /// Makes `command` fail the next time it runs. Only some honour it:
-    /// `pfctl -ss`, `pfctl -k` and `zfs destroy -r`.
+    /// `pfctl -ss`, `pfctl -k`, `rctl -a` and `zfs destroy -r`.
     pub fn fail_next(&self, command: &str) {
         self.state().failing.insert(command.to_owned());
     }
@@ -814,6 +814,9 @@ impl Sys for FakeSys {
 
     fn rctl_add(&self, rule: &RctlRule) -> Result<()> {
         let mut s = self.state();
+        if s.failing.remove("rctl -a") {
+            return Err(fail("rctl -a", "Operation not permitted"));
+        }
         if !s.rctl.contains(rule) {
             s.rctl.push(rule.clone());
         }

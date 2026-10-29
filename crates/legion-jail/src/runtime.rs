@@ -81,8 +81,56 @@ pub struct JailRuntime {
     shim: Vec<OsString>,
     boot: u64,
     events: broadcast::Sender<Event>,
-    execs: Mutex<HashMap<String, Session>>,
+    execs: Execs,
     used: Used,
+}
+
+/// Attached execs by id. Each is removed when its exit code is taken, when
+/// its caller lets go, or [`EXEC_KEPT`] after its process ended.
+type Execs = Arc<Mutex<HashMap<String, Session>>>;
+
+/// How long an ended exec's exit code waits for its caller.
+const EXEC_KEPT: Duration = Duration::from_secs(60);
+
+/// Reaps an attached exec's process, then publishes its exit code and
+/// forgets the session once its caller has had time to take it.
+fn reap(
+    mut child: tokio::process::Child,
+    code: watch::Sender<Option<i32>>,
+    execs: Execs,
+    exec_id: String,
+) {
+    tokio::spawn(async move {
+        let got = child
+            .wait()
+            .await
+            .ok()
+            .and_then(|s| s.code())
+            .unwrap_or(255);
+        let _ = code.send(Some(got));
+        tokio::time::sleep(EXEC_KEPT).await;
+        execs.lock().expect("execs").remove(&exec_id);
+    });
+}
+
+/// Kills a process group when dropped, unless disarmed: a command run
+/// for its output whose caller stopped waiting (a probe timing out) must
+/// not keep running, nor what it started.
+struct KillGroup(Option<u32>);
+
+impl KillGroup {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for KillGroup {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0.and_then(|p| libc::pid_t::try_from(p).ok()) {
+            // SAFETY: a plain system call; a group already gone is fine.
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
+    }
 }
 
 /// When each image (by canonical name) was last used. Pruning holds it
@@ -203,7 +251,7 @@ impl JailRuntime {
             shim: config.shim,
             boot: state::boot_time(),
             events,
-            execs: Mutex::new(HashMap::new()),
+            execs: Arc::default(),
             used: Used::default(),
         };
         tokio::spawn(watch_exits(
@@ -944,12 +992,21 @@ impl legion_agent::Runtime for JailRuntime {
         ];
         args.extend(cmd.iter().map(OsString::from));
         let refs: Vec<&std::ffi::OsStr> = args.iter().map(OsString::as_os_str).collect();
-        let out = self
-            .shim_command(&refs)
+        let mut command = self.shim_command(&refs);
+        // In a group of its own, which goes if this future is dropped
+        // first; kill_on_drop has tokio reap the command then.
+        command
             .stdin(std::process::Stdio::null())
-            .output()
-            .await
-            .map_err(internal)?;
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true);
+        let child = command.spawn().map_err(internal)?;
+        let group = KillGroup(child.id());
+        let out = child.wait_with_output().await;
+        // Reaped now, so its id may be another's soon.
+        group.disarm();
+        let out = out.map_err(internal)?;
         Ok(ExecOutput {
             exit_code: out.status.code().unwrap_or(255),
             stdout: out.stdout,
@@ -988,17 +1045,9 @@ impl legion_agent::Runtime for JailRuntime {
                     .stdin(stdio(&slave)?)
                     .stdout(stdio(&slave)?)
                     .stderr(stdio(&slave)?);
-                let mut child = command.spawn().map_err(internal)?;
+                let child = command.spawn().map_err(internal)?;
                 drop(slave);
-                tokio::spawn(async move {
-                    let code = child
-                        .wait()
-                        .await
-                        .ok()
-                        .and_then(|s| s.code())
-                        .unwrap_or(255);
-                    let _ = code_tx.send(Some(code));
-                });
+                reap(child, code_tx, self.execs.clone(), exec_id.clone());
                 let master = Arc::new(master);
                 let reader = tokio::fs::File::from_std(std::fs::File::from(
                     master.try_clone().map_err(internal)?,
@@ -1046,15 +1095,7 @@ impl legion_agent::Runtime for JailRuntime {
         let out = child.stdout.take().expect("piped");
         let err = child.stderr.take().expect("piped");
         let input = child.stdin.take();
-        tokio::spawn(async move {
-            let code = child
-                .wait()
-                .await
-                .ok()
-                .and_then(|s| s.code())
-                .unwrap_or(255);
-            let _ = code_tx.send(Some(code));
-        });
+        reap(child, code_tx, self.execs.clone(), exec_id.clone());
         self.execs.lock().expect("execs").insert(
             exec_id.clone(),
             Session {
@@ -1124,6 +1165,11 @@ impl legion_agent::Runtime for JailRuntime {
             .expect("some");
         self.execs.lock().expect("execs").remove(exec_id);
         Ok(got)
+    }
+
+    async fn exec_release(&self, exec_id: &str) {
+        // Dropping the session drops the terminal's last descriptor.
+        self.execs.lock().expect("execs").remove(exec_id);
     }
 
     async fn logs(

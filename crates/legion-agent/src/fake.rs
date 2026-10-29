@@ -204,6 +204,11 @@ impl FakeRuntime {
     }
 
     /// Attached execs still running.
+    /// Exec sessions the runtime still keeps, ended or not.
+    pub fn exec_sessions(&self) -> usize {
+        self.state().sessions.len()
+    }
+
     pub fn attached(&self) -> usize {
         self.state()
             .sessions
@@ -609,17 +614,31 @@ impl Runtime for FakeRuntime {
 
     async fn exec_exit_code(&self, exec_id: &str) -> Result<i32> {
         for _ in 0..200 {
-            match self.state().sessions.get(exec_id) {
-                None => return Err(api(404, "no such exec session")),
-                Some(Session {
-                    exit_code: Some(code),
-                    ..
-                }) => return Ok(*code),
-                Some(_) => {}
+            let done = {
+                let mut s = self.state();
+                match s.sessions.get(exec_id) {
+                    None => Some(Err(api(404, "no such exec session"))),
+                    Some(Session {
+                        exit_code: Some(code),
+                        ..
+                    }) => {
+                        let code = *code;
+                        s.sessions.remove(exec_id);
+                        Some(Ok(code))
+                    }
+                    Some(_) => None,
+                }
+            };
+            if let Some(done) = done {
+                return done;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         Err(Error::Failed("exec still running".into()))
+    }
+
+    async fn exec_release(&self, exec_id: &str) {
+        self.state().sessions.remove(exec_id);
     }
 
     async fn logs(

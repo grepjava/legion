@@ -1040,6 +1040,23 @@ real, in the order agreed with the user.
   another port and blocks the advertised one) is reached by the others
   from its NAT's port, and still right after the peer list changes; with
   the old rule, that last ping fails.
+- **From a review: limits, exec probes, exec sessions.** Three faults a
+  review found, each confirmed in the code first. A container whose rctl
+  rules could not be set ran without them, with a warning: now the pod
+  fails at start (its restart policy decides), and a restarted or
+  adopted one is refused. An exec probe that timed out left its command
+  running, and what it started: the command now runs in a process group
+  of its own, killed if the exec is given up on, and reaped. An attached
+  exec's session, and a terminal's last descriptor, stayed with the
+  runtime unless its exit code was taken, so users disconnecting leaked
+  descriptors and their shells were never hung up: the agent now lets
+  go of each session however it ends (`Runtime::exec_release`), and the
+  jail runtime drops ended ones a minute after they end. Tested: an agent
+  test with `rctl -a` failing; the session test checks nothing is kept
+  after a disconnect; on FreeBSD 15.1, the jail runtime's live test has
+  an exec given up on after 1 s end with its background child, and a
+  released terminal hang up its shell; each of those two fails with its
+  fix taken out.
 - **FreeBSD port** (`packaging/freebsd/port`, its README). `sysutils/legion`
   with the ports' cargo framework, FreeBSD 15 and newer, amd64 and
   aarch64; it installs the binary (stripped), the rc.d script with

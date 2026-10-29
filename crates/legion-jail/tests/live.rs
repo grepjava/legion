@@ -207,6 +207,53 @@ async fn pods_of_jails() {
     let seen = String::from_utf8_lossy(&seen);
     assert!(seen.contains("isatty") && seen.contains("hi"), "{seen}");
     assert_eq!(rt.exec_exit_code(&attached.id).await.unwrap(), 0);
+    let running = |what: &'static str| {
+        let child = child.clone();
+        move || {
+            let out = std::process::Command::new("ps")
+                .args(["-J", &child, "-o", "command="])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).contains(what)
+        }
+    };
+    // An exec given up on (a probe timing out) ends, with what it started.
+    let slow_cmd: [String; 3] = [
+        "/bin/sh".into(),
+        "-c".into(),
+        "sleep 300 & exec sleep 301".into(),
+    ];
+    let slow = rt.exec(&app, &slow_cmd);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), slow)
+            .await
+            .is_err()
+    );
+    let (bg, fg) = (running("sleep 300"), running("sleep 301"));
+    until("the abandoned exec ends", async || !bg() && !fg()).await;
+    // A terminal session let go of is hung up.
+    let mut attached = rt
+        .exec_attach(
+            &app,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo up; exec sleep 302".into(),
+            ],
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains("up") {
+        seen.extend_from_slice(&attached.output.next().await.unwrap().unwrap().data);
+    }
+    let session = attached.id.clone();
+    drop(attached);
+    rt.exec_release(&session).await;
+    let held = running("sleep 302");
+    until("the released terminal hangs up", async || !held()).await;
 
     // Another member, as another user, that ends.
     let mut spec = member("shop_web_job", &pod, "id -un; exit 3");

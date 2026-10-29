@@ -291,6 +291,21 @@ containers:
 "#;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pod_whose_limits_cannot_be_set_does_not_run() {
+    let h = Harness::new().await;
+    h.rt.add_image("web:1");
+    h.sys.fail_next("rctl -a");
+    let key = h.task("web-1", WEB).await;
+    let status = h.wait_state(&key, TaskState::Failed).await;
+    assert!(
+        status.message.contains("setting container web's limits"),
+        "{}",
+        status.message
+    );
+    h.nothing_left().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn runs_a_pod() {
     let h = Harness::new().await;
     // Images are pulled as needed.
@@ -1863,13 +1878,15 @@ async fn sessions_reach_the_pod() {
         )
     );
 
-    // A user who goes away takes the process's streams with them.
+    // A user who goes away takes the process's streams with them, and the
+    // runtime lets go of the session; so it does of those that ended.
     let s = Session::open(&h, open("web-1", exec(&["cat"], true, false)))
         .await
         .unwrap();
     eventually("cat runs", || h.rt.attached() == 1).await;
     drop(s);
     eventually("cat ends", || h.rt.attached() == 0).await;
+    eventually("no sessions kept", || h.rt.exec_sessions() == 0).await;
 
     // What cannot be opened says why.
     let refused = |r: Result<Session, tonic::Status>| {

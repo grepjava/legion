@@ -212,6 +212,22 @@ async fn exec<R: Runtime>(
         .await
         .map_err(runtime_status)?;
     let exec_id = attached.id.clone();
+    let result = attached_exec(runtime.clone(), attached, &opts, tx, inbound).await;
+    // Whatever became of the user, the runtime lets go of the session.
+    runtime.exec_release(&exec_id).await;
+    result
+}
+
+/// The session of an exec started: its output and exit code out, its input
+/// and terminal size in, until it ends or the user goes.
+async fn attached_exec<R: Runtime>(
+    runtime: Arc<R>,
+    attached: crate::runtime::Attached,
+    opts: &ExecOptions,
+    tx: &mpsc::Sender<SessionFrame>,
+    inbound: &mut Streaming<SessionFrame>,
+) -> Result<(), Status> {
+    let exec_id = attached.id.clone();
     if let (true, Some(size)) = (opts.tty, opts.size) {
         resize(runtime.as_ref(), &exec_id, size.width, size.height).await;
     }

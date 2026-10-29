@@ -52,6 +52,10 @@ pub trait Runtime: Send + Sync + 'static {
     ) -> impl Future<Output = Result<()>> + Send;
     /// The exit code of an attached exec whose output has ended.
     fn exec_exit_code(&self, exec_id: &str) -> impl Future<Output = Result<i32>> + Send;
+    /// Lets go of an attached exec, however its caller ended: its exit code
+    /// is no longer wanted, and a terminal's last descriptor closes, which
+    /// hangs the terminal up. One already gone is fine.
+    fn exec_release(&self, exec_id: &str) -> impl Future<Output = ()> + Send;
     /// A container's output; with `follow`, until it stops.
     fn logs(
         &self,
