@@ -72,6 +72,9 @@ struct State {
     sessions: BTreeMap<String, String>,
     /// File systems on devices, by device path.
     filesystems: BTreeMap<String, String>,
+    /// Devices whose file system is unclean: mounted read-write only after
+    /// a check.
+    unclean: BTreeSet<String>,
     /// Programs that run as volume plugins: `mount <dir>` mounts something
     /// there, `unmount <dir>` unmounts it.
     plugins: BTreeSet<String>,
@@ -330,6 +333,12 @@ impl FakeSys {
                     .insert(format!("/dev/{device}"), (*fs).to_owned());
             }
         }
+    }
+
+    /// Marks the file system on `device` (`/dev/da0`) unclean, as a crash
+    /// leaves it.
+    pub fn make_unclean(&self, device: &str) {
+        self.state().unclean.insert(device.to_owned());
     }
 
     /// The targets logged in to.
@@ -1174,6 +1183,12 @@ must destroy them to overwrite it"
         if fstype == "ufs" && !self.state().filesystems.contains_key(source) {
             return Err(fail("mount", format!("{source}: Invalid argument")));
         }
+        if fstype == "ufs" && self.state().unclean.contains(source) {
+            return Err(fail(
+                "mount",
+                format!("{source}: R/W mount denied. Filesystem is not clean - run fsck."),
+            ));
+        }
         self.mount_tmpfs(target, None, 0)?;
         self.state()
             .sources
@@ -1195,6 +1210,11 @@ must destroy them to overwrite it"
             ));
         }
         Ok(s.filesystems.get(device).cloned())
+    }
+
+    fn fsck_preen(&self, device: &str) -> Result<()> {
+        self.state().unclean.remove(device);
+        Ok(())
     }
 
     fn iscsi_sessions(&self) -> Result<Vec<IscsiSession>> {

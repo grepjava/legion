@@ -1288,6 +1288,8 @@ async fn network_volumes() {
     h.rt.add_image("app:1");
     let iqn = "iqn.2026-10.lan.legion:block";
     h.sys.add_iscsi_target(iqn, &[(0, "da0", Some("ufs"))]);
+    // As the last node to use it left it, going down.
+    h.sys.make_unclean("/dev/da0");
     let plugin = format!("{}/store", legion_agent::DEFAULT_PLUGIN_DIR);
     h.sys.add_plugin(&plugin);
     for (name, spec) in [

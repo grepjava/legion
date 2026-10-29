@@ -392,6 +392,9 @@ fn mount_iscsi(sys: &dyn Sys, iscsi: &IscsiSource, dir: &Path) -> Result<String,
             ));
         }
     }
+    // A node that went down using it leaves it unclean, which mounts
+    // read-only at best: checked first, as boot checks its own.
+    sys.fsck_preen(&device).map_err(e)?;
     std::fs::create_dir_all(dir).map_err(|e| format!("creating {path}: {e}"))?;
     sys.mount_fs("ufs", &device, &path, "").map_err(e)?;
     Ok(path)

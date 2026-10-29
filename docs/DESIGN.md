@@ -1045,8 +1045,10 @@ make ZFS volumes. Built in `legion_api::volume`, `legion-agent::volumes`,
 - **iSCSI**: the node logs in (`iscsictl -A`, loading `iscsi`; iscsid
   must run), waits for the LUN's device (iscsictl names a LUN `probe…`
   while CAM probes it, found by the live test), checks it holds UFS
-  (fstyp) and mounts it once at `<run>/volumes/iscsi/<ns>/<name>` for all
-  its tasks. A LUN without UFS is refused, never formatted: a disk whose
+  (fstyp), checks it as boot checks its own file systems (`fsck -p`: a
+  node that went down using it leaves it unclean, and FreeBSD refuses an
+  unclean one read-write; found by the end-to-end test) and mounts it
+  once at `<run>/volumes/iscsi/<ns>/<name>` for all its tasks. A LUN without UFS is refused, never formatted: a disk whose
   partition table fstyp does not know would look blank, and formatting it
   would destroy it. Make the file system once by hand (`newfs`).
 - **Plugins** are the interface for anything else: an executable
@@ -1071,11 +1073,12 @@ make ZFS volumes. Built in `legion_api::volume`, `legion-agent::volumes`,
   sharing a LUN, the release only after the last, a blank LUN refused and
   logged out of, a volume held elsewhere, a missing plugin); on FreeBSD
   15.1, an NFSv3 export and a ctld iSCSI target on 127.0.0.1 (the LUN a
-  UFS image built by makefs): mount, write, read back, log out.
+  UFS image built by makefs): mount, write, read back, log out; and end
+  to end (`crates/legion/tests/storage.rs`), a service on both through
+  the daemon, scaled to nothing (the node logs out and lets go) and back
+  (its data still there), with a clean daemon stop.
 - **Not yet**: CHAP for iSCSI, multipath, other file systems on LUNs,
-  Compose `driver_opts`, timeouts for plugins that hang, and an end-to-end
-  run of a pod on real network storage (the agent's handling is tested
-  with the fake system, the commands on FreeBSD).
+  Compose `driver_opts`, timeouts for plugins that hang.
 
 ## 7. Object model
 

@@ -118,6 +118,10 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         if let Some(task) = agent_task {
             let _ = task.await;
         }
+        // It holds a store handle as well, and the store closes only once
+        // every handle is gone: it must end before serving does.
+        autolock.abort();
+        let _ = autolock.await;
     };
     let served = manager
         .serve(listener, shutdown)
@@ -126,7 +130,6 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     if let Some(metrics) = metrics {
         metrics.abort();
     }
-    autolock.abort();
     served
 }
 

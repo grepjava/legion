@@ -216,6 +216,10 @@ pub trait Sys: Send + Sync {
     /// The file system on a device (`ufs`, `zfs`, `msdosfs`, ...), as
     /// fstyp(8) knows it; `None` if it finds none.
     fn fs_type(&self, device: &str) -> Result<Option<String>>;
+    /// Checks a UFS file system as boot does before mounting it (`fsck -p`):
+    /// a clean one at once, an unclean one (left by a crash) repaired where
+    /// that is safe; an error if it needs a person.
+    fn fsck_preen(&self, device: &str) -> Result<()>;
 
     // iSCSI initiator (host only; iscsid(8) must run).
 

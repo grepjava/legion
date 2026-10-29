@@ -873,7 +873,17 @@ replaces Podman and ocijail.
   admission, placement, the agent with all three drivers on the fake
   system; on FreeBSD 15.1, mounts of a real NFSv3 export and a ctld
   iSCSI LUN, which found that a LUN's device is a `probe…` placeholder
-  for a moment after login.
+  for a moment after login; and end to end
+  (`crates/legion/tests/storage.rs`): a service on both through the
+  daemon, scaled to nothing and back with its data. That run found three
+  more: an unclean LUN (left by a node going down) mounts read-only at
+  best, so the agent preens it first (`fsck -p`); a jail still dying
+  after its removal failed the removal instead of counting as gone; and
+  every manager daemon's stop failed with "store still open" after 5 s,
+  as the autolock follower held a store handle until after the store
+  closed (since autolock, 8f37bb4). The test now checks the daemon stops
+  cleanly. Open: two jails of the first run's first pod stayed dying
+  (later runs' pods did not); not yet explained.
 
 ### To do, in order
 

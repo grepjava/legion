@@ -164,6 +164,13 @@ fn stream(
     })
 }
 
+/// Whether jls says the jail is gone: not there, or dying, which is a
+/// jail already removed whose last references (sockets timing out, its
+/// root's vnode) have yet to go.
+fn gone(stderr: &str) -> bool {
+    stderr.contains("not found") || stderr.contains("is dying")
+}
+
 fn describe(program: &str, args: &[String]) -> String {
     std::iter::once(program)
         .chain(args.iter().map(String::as_str))
@@ -305,7 +312,7 @@ impl<R: Runner> Sys for Shell<R> {
         let a = args(["-j", jail, "jid"]);
         let out = self.output("jls", &a, None)?;
         if !out.success {
-            if out.stderr.contains("not found") {
+            if gone(&out.stderr) {
                 return Err(Error::NotFound(format!("jail {jail}")));
             }
             return Err(failed("jls", &a, &out));
@@ -318,7 +325,7 @@ impl<R: Runner> Sys for Shell<R> {
         a.extend(params.iter().map(|p| (*p).to_owned()));
         let out = self.output("jls", &a, None)?;
         if !out.success {
-            if out.stderr.contains("not found") {
+            if gone(&out.stderr) {
                 return Err(Error::NotFound(format!("jail {jail}")));
             }
             return Err(failed("jls", &a, &out));
@@ -855,6 +862,11 @@ impl<R: Runner> Sys for Shell<R> {
         Err(failed("fstyp", &a, &out))
     }
 
+    fn fsck_preen(&self, device: &str) -> Result<()> {
+        self.run("fsck", &args(["-t", "ufs", "-p", device]))
+            .map(drop)
+    }
+
     fn iscsi_sessions(&self) -> Result<Vec<IscsiSession>> {
         let a = args(["--libxo", "json", "-L", "-v"]);
         let out = self.run("iscsictl", &a)?;
@@ -1247,6 +1259,10 @@ mod tests {
             ),
             ("fstyp /dev/da0", ok("ufs\n")),
             (
+                "fsck -t ufs -p /dev/da0",
+                ok("/dev/da0: 2 files, 2 used, 30000 free\n"),
+            ),
+            (
                 "fstyp /dev/da1",
                 err("fstyp: /dev/da1: filesystem not recognized"),
             ),
@@ -1278,6 +1294,7 @@ mod tests {
         sh.iscsi_detach(spike).unwrap();
         sh.iscsi_detach(spike).unwrap(); // no session: nothing to do
         assert_eq!(sh.fs_type("/dev/da0").unwrap().as_deref(), Some("ufs"));
+        sh.fsck_preen("/dev/da0").unwrap();
         assert_eq!(sh.fs_type("/dev/da1").unwrap(), None);
         sh.mount_fs("ufs", "/dev/da0", "/var/run/legion/volumes/x", "")
             .unwrap();
@@ -1739,6 +1756,8 @@ mod tests {
             ),
             ("jail -r 8", ok("")),
             ("jls -j gone jid", err("jls: jail \"gone\" not found")),
+            // Captured on FreeBSD 15.1, just after the jail's removal.
+            ("jls -j dying jid", err("jls: jail \"dying\" is dying")),
             ("mount -t nullfs -o ro /src /dst", ok("")),
             ("mount -t devfs devfs /r/dev", ok("")),
             ("devfs -m /r/dev ruleset 4", ok("")),
@@ -1755,6 +1774,7 @@ mod tests {
         assert_eq!(jid, 7);
         sh.jail_remove("p.c").unwrap();
         assert!(matches!(sh.jail_remove("gone"), Err(Error::NotFound(_))));
+        assert!(matches!(sh.jail_remove("dying"), Err(Error::NotFound(_))));
         sh.mount_nullfs("/src", "/dst", true).unwrap();
         sh.mount_devfs("/r/dev", 4).unwrap();
     }
