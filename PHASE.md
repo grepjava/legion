@@ -203,7 +203,8 @@ remote FreeBSD server reached through a WireGuard site tunnel.
   certificate's name); a manager names the node it acts for. The leader
   marks a node `down` after three silent heartbeat periods (5 s) and
   `ready` when it hears from it again; a new leader allows three periods
-  from taking over. The agent fails over to the next manager when one
+  from taking over. (Since hardening: 2 s periods, `suspect` after three
+  and `down` after eight; see DESIGN.md §3.3.) The agent fails over to the next manager when one
   fails and learns the managers from heartbeat replies. `legion daemon` on
   a node that joined as a worker runs only the agent, calling the managers
   recorded at join (or `--manager`), and saves the list it learned on exit;
@@ -306,10 +307,7 @@ Smaller follow-ups: placement preferences (`spread`) are accepted but not used y
 advertised WireGuard endpoint replaces the one WireGuard learned, so a
 node behind NAT cannot be reached by its peers' replies alone; node subnets
 are reserved by name (`Config/legion-system/node-subnets`) and a deleted
-Node's reservation is not released; a lost node's tasks keep getting a share of
-new connections until the node is marked down (three missed 5 s
-heartbeats), which a faster down signal or per-connection retry could
-shorten.
+Node's reservation is not released.
 
 ## Phase 3 — K8s-lite
 
@@ -1000,10 +998,22 @@ real, in the order agreed with the user.
   traffic to another pod over IPv4 and IPv6 while the host still reached
   it, then let through to a table on a port (both families) and to a
   network (IPv4 only).
+- **Silent nodes lose their connections first** (DESIGN.md §3.3). A
+  lost node's tasks kept a share of new connections until it was down,
+  15 s. Now heartbeats come every 2 s; a node silent for three is
+  `suspect`, and its tasks leave the endpoints (other nodes stop sending
+  to them) and it gets no new ones, but nothing is replaced, so a blip
+  costs no rescheduling; after eight (16 s) it is down as before. A new
+  leader marks no node suspect before hearing from it. Tested: in the
+  fake cluster, a node gone silent turns suspect while its task still
+  runs and the others stop balancing over it, nothing started elsewhere;
+  heard from again, it is ready and its task is balanced over again; on
+  FreeBSD 15.1, the phase 1 exit test (its daemon killed and restarted)
+  with no node ever marked suspect.
 
 ### To do, in order
 
 Nothing left in the hardening agreed with the user. Candidates from the
-phases' follow-ups: a faster down signal for lost nodes, and a FreeBSD
-port.
+phases' follow-ups: a FreeBSD port; placement preferences (`spread`);
+releasing a deleted node's pod subnet; nodes behind NAT.
 

@@ -129,16 +129,26 @@ pub enum NodeState {
     #[default]
     Unknown,
     Ready,
+    /// Silent for a few heartbeats: its tasks get no new connections and it
+    /// no new tasks, but they are not replaced yet. Ready again when heard
+    /// from, down if it stays silent.
+    Suspect,
     Down,
 }
 
 impl NodeState {
-    pub const ALL: [NodeState; 3] = [NodeState::Unknown, NodeState::Ready, NodeState::Down];
+    pub const ALL: [NodeState; 4] = [
+        NodeState::Unknown,
+        NodeState::Ready,
+        NodeState::Suspect,
+        NodeState::Down,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             NodeState::Unknown => "unknown",
             NodeState::Ready => "ready",
+            NodeState::Suspect => "suspect",
             NodeState::Down => "down",
         }
     }

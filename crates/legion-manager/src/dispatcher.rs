@@ -11,7 +11,7 @@
 //! A node sees only its own work: it reports on its own tasks, and reads the
 //! secrets and configs and claims the volumes its tasks use.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -47,10 +47,14 @@ use crate::api::{ApiService, forwarded};
 use crate::raft_net::{MAX_MESSAGE, connect_lazy};
 
 /// How often agents send heartbeats unless configured otherwise.
-pub const HEARTBEAT_PERIOD: Duration = Duration::from_secs(5);
+pub const HEARTBEAT_PERIOD: Duration = Duration::from_secs(2);
 
 /// Silent periods after which a node is down.
-const MISSED_HEARTBEATS: u32 = 3;
+const MISSED_HEARTBEATS: u32 = 8;
+/// Heartbeats missed before a node is suspect: its tasks leave the
+/// services' endpoints, so other nodes stop sending them connections,
+/// long before it is down and they are replaced.
+const SUSPECT_HEARTBEATS: u32 = 3;
 
 /// Attempts at a read-modify-write that keeps losing to other writers.
 const ATTEMPTS: usize = 5;
@@ -425,11 +429,12 @@ impl DispatcherService {
         Err(Status::unavailable(format!("{key} keeps changing")))
     }
 
-    /// While this manager leads, marks nodes down when they fall silent and
-    /// up again when they are heard from.
+    /// While this manager leads, marks nodes suspect and then down when
+    /// they fall silent, and ready again when they are heard from.
     async fn monitor(self) {
         let mut closing = self.api.closing.clone();
         let grace = self.period * MISSED_HEARTBEATS;
+        let suspect = self.period * SUSPECT_HEARTBEATS;
         let tick = self.period.min(Duration::from_secs(1));
         let mut leading_since: Option<Instant> = None;
         loop {
@@ -458,12 +463,14 @@ impl DispatcherService {
                     continue;
                 };
                 let seen = self.seen.lock().unwrap().get(&node.metadata.name).copied();
-                let alive = now.duration_since(seen.unwrap_or(since).max(since)) < grace;
-                let state = match (alive, seen.is_some()) {
-                    (true, true) => NodeState::Ready,
-                    (false, _) => NodeState::Down,
-                    // Not heard from yet under this leader, within grace.
-                    (true, false) => continue,
+                let silent = now.duration_since(seen.unwrap_or(since).max(since));
+                let state = match seen {
+                    _ if silent >= grace => NodeState::Down,
+                    Some(_) if silent >= suspect => NodeState::Suspect,
+                    Some(_) => NodeState::Ready,
+                    // Not heard from yet under this leader, within grace:
+                    // after an election, nodes take a moment to find it.
+                    None => continue,
                 };
                 if status.state == state {
                     continue;
@@ -479,6 +486,9 @@ impl DispatcherService {
                 match self.write(node, Precondition::Version(version)).await {
                     Ok(Outcome::Written(_)) => match state {
                         NodeState::Down => tracing::warn!(node = %name, "node down"),
+                        NodeState::Suspect => {
+                            tracing::warn!(node = %name, "node silent: suspect")
+                        }
                         _ => tracing::info!(node = %name, "node up"),
                     },
                     // Changed meanwhile; the next tick looks again.
@@ -921,9 +931,24 @@ async fn follow_cluster(store: Store, out: Followed, mut closing: watch::Receive
         let publish = |objects: &BTreeMap<Kind, BTreeMap<ObjectKey, Object>>, kind: Kind| {
             let of = |k: Kind| &objects[&k];
             match kind {
-                Kind::Node => out
-                    .peers
-                    .send_if_modified(|old| replace(old, Some(&peers(of(Kind::Node))))),
+                // Nodes change the endpoints too: a suspect one's tasks
+                // leave them.
+                Kind::Node => {
+                    let endpoints = out.endpoints.send_if_modified(|old| {
+                        replace(
+                            old,
+                            Some(&endpoints(
+                                of(Kind::Service),
+                                of(Kind::Task),
+                                of(Kind::Node),
+                            )),
+                        )
+                    });
+                    let peers = out
+                        .peers
+                        .send_if_modified(|old| replace(old, Some(&peers(of(Kind::Node)))));
+                    endpoints || peers
+                }
                 Kind::Route => out
                     .routes
                     .send_if_modified(|old| replace(old, Some(&routes(of(Kind::Route))))),
@@ -934,7 +959,14 @@ async fn follow_cluster(store: Store, out: Followed, mut closing: watch::Receive
                     )
                 }),
                 _ => out.endpoints.send_if_modified(|old| {
-                    replace(old, Some(&endpoints(of(Kind::Service), of(Kind::Task))))
+                    replace(
+                        old,
+                        Some(&endpoints(
+                            of(Kind::Service),
+                            of(Kind::Task),
+                            of(Kind::Node),
+                        )),
+                    )
                 }),
             }
         };
@@ -1040,12 +1072,24 @@ async fn pause(closing: &mut watch::Receiver<bool>) -> bool {
     }
 }
 
-/// The ready tasks of each service: running, ready, with an address, and
-/// of the service as it is now (not an earlier one of the same name).
+/// The ready tasks of each service: running, ready, with an address, of
+/// the service as it is now (not an earlier one of the same name), and on
+/// a node not suspect (or down).
 fn endpoints(
     services: &BTreeMap<ObjectKey, Object>,
     tasks: &BTreeMap<ObjectKey, Object>,
+    nodes: &BTreeMap<ObjectKey, Object>,
 ) -> Endpoints {
+    let silent: BTreeSet<&str> = nodes
+        .values()
+        .filter(|n| {
+            matches!(
+                serde_json::from_value::<NodeStatus>(n.status.clone()).map(|s| s.state),
+                Ok(NodeState::Suspect | NodeState::Down)
+            )
+        })
+        .map(|n| n.metadata.name.as_str())
+        .collect();
     /// Ready and running task addresses, and ready ones by ordinal.
     type Addrs = (Vec<Ipv4Addr>, Vec<Ipv4Addr>, BTreeMap<u32, Ipv4Addr>);
     let mut by_service: BTreeMap<(&str, String), Addrs> = BTreeMap::new();
@@ -1065,7 +1109,10 @@ fn endpoints(
             .entry((t.metadata.namespace.as_str(), spec.service_uid))
             .or_default();
         entry.1.push(ip);
-        if spec.desired_state == DesiredState::Running && status.ready {
+        if spec.desired_state == DesiredState::Running
+            && status.ready
+            && !silent.contains(spec.node.as_str())
+        {
             entry.0.push(ip);
             if let Some(n) = ordinal {
                 entry.2.insert(n, ip);

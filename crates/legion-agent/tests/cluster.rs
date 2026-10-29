@@ -51,11 +51,15 @@ struct Cluster {
 
 impl Cluster {
     async fn start(nodes: usize) -> Self {
+        Self::start_with(nodes, HEARTBEAT).await
+    }
+
+    async fn start_with(nodes: usize, heartbeat: Duration) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let mut config = ManagerConfig::new(dir.path().join("manager"), &addr);
-        config.heartbeat = HEARTBEAT;
+        config.heartbeat = heartbeat;
         let manager = Manager::open(config).await.unwrap();
         let (stop, stopped) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
@@ -420,6 +424,78 @@ spec:
     .await;
     eventually("n1's pods gone", async || c.pods(0).is_empty()).await;
 
+    c.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silent_node_loses_its_connections_before_its_tasks() {
+    // Suspect after three missed heartbeats, down after eight: 3 s and 8 s.
+    let mut c = Cluster::start_with(3, Duration::from_secs(1)).await;
+    c.apply(WEB).await;
+    eventually("one task per node", async || {
+        c.placed().await == ["n1", "n2", "n3"]
+    })
+    .await;
+    let uid = c.list(Kind::Service).await[0].metadata.uid.clone();
+    let all = c.addresses().await;
+    for i in 0..3 {
+        eventually("the node balances over all tasks", async || {
+            c.table(i, &uid) == all
+        })
+        .await;
+    }
+    let task_on = |tasks: &[Object], node: &str| {
+        tasks
+            .iter()
+            .find(|t| t.spec["node"] == node)
+            .map(|t| (t.metadata.name.clone(), t.status["state"].clone()))
+    };
+    let (n2_task, _) = task_on(&c.list(Kind::Task).await, "n2").unwrap();
+    let n2_ip: Ipv4Addr = c
+        .list(Kind::Task)
+        .await
+        .iter()
+        .find(|t| t.spec["node"] == "n2")
+        .map(|t| t.status["ip"].as_str().unwrap().parse().unwrap())
+        .unwrap();
+
+    // n2 falls silent: suspect, and the others stop sending to its task,
+    // which still runs and is not replaced.
+    c.stop_agent(1).await;
+    eventually("n2 suspect", async || {
+        c.list(Kind::Node)
+            .await
+            .iter()
+            .any(|n| n.metadata.name == "n2" && n.status["state"] == "suspect")
+    })
+    .await;
+    let rest: BTreeSet<Ipv4Addr> = all.iter().copied().filter(|ip| *ip != n2_ip).collect();
+    for i in [0, 2] {
+        eventually("the node stops sending to n2's task", async || {
+            c.table(i, &uid) == rest
+        })
+        .await;
+    }
+    let tasks = c.list(Kind::Task).await;
+    assert_eq!(
+        task_on(&tasks, "n2"),
+        Some((n2_task.clone(), "running".into())),
+        "not replaced while suspect"
+    );
+    assert_eq!(tasks.len(), 3, "nothing started elsewhere");
+
+    // Heard from again before it is down: ready, the same task, sent to.
+    c.start_agent(1);
+    c.eventually_node_ready("n2").await;
+    for i in 0..3 {
+        eventually("the node sends to n2's task again", async || {
+            c.table(i, &uid) == all
+        })
+        .await;
+    }
+    let tasks = c.list(Kind::Task).await;
+    assert_eq!(tasks.len(), 3);
+    assert_eq!(task_on(&tasks, "n2"), Some((n2_task, "running".into())));
     c.stop().await;
 }
 
