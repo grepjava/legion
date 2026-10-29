@@ -1111,6 +1111,9 @@ fn eligible(
     if n.repels(s, TaintEffect::NoSchedule) || n.repels(s, TaintEffect::NoExecute) {
         return Err("taints");
     }
+    if n.status.platform.no_limits && s.spec.pod.limited() {
+        return Err("no limits (kern.racct.enable)");
+    }
     let namespace = &s.object.metadata.namespace;
     // A task starting now would hold the data where it no longer stays.
     let moving = mounts.iter().any(|v| {

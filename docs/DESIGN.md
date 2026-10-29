@@ -956,8 +956,13 @@ containers with it.
   second too, so either may act first. Metrics and the autoscaler use
   the same count. A database losing a backend restarts its others, as it
   would under Linux's OOM killer.
-- rctl needs the loader tunable `kern.racct.enable=1`. Without it, setting
-  limits fails and the agent only warns, so pods run unlimited.
+- rctl needs the loader tunable `kern.racct.enable=1`. A node without it
+  says so in its status (`platform.noLimits`), and the scheduler places
+  no pod with limits there (a task with nowhere else to go waits as
+  `pending`, "no limits (kern.racct.enable)"); a pod with limits assigned
+  there anyway is rejected rather than run without them. Pods without
+  limits run there as anywhere. The field is the negative so that nodes
+  reporting nothing, as older agents do, still take pods with limits.
 - Pod-level totals are read from the infra jail's accounting and used for
   scheduling feedback, metrics and eviction decisions.
 - The agent sets the rules after each container start and restart

@@ -1111,6 +1111,40 @@ fn taints_keep_tasks_off() {
 }
 
 #[test]
+fn limited_pods_go_where_limits_hold() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.node_mut("n1").status.platform.no_limits = true;
+    w.service(
+        "capped",
+        "mode: global\npod: { containers: [{ name: a, image: \"a:1\", resources: { limits: { memory: 64Mi } } }] }",
+    );
+    w.service("free", &format!("mode: global\n{POD}"));
+    w.settle();
+    assert_eq!(w.placed("capped"), ["n2"]);
+    assert_eq!(w.placed("free"), ["n1", "n2"]);
+
+    // With no node where they hold, it waits and says why.
+    w.service(
+        "one",
+        "replicas: 1\npod: { containers: [{ name: a, image: \"a:1\", resources: { limits: { cpu: 500m } } }] }",
+    );
+    w.availability("n2", Availability::Pause);
+    w.settle();
+    assert!(w.placed("one").is_empty());
+    let pending = w
+        .tasks
+        .iter()
+        .find(|t| t.status.state == TaskState::Pending)
+        .unwrap();
+    assert_eq!(
+        pending.status.message,
+        "no node can run it: 1 no limits (kern.racct.enable), 1 not active"
+    );
+}
+
+#[test]
 fn tasks_go_where_their_volume_is() {
     let mut w = World::new();
     w.node("n1", &[]);

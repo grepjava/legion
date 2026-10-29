@@ -142,6 +142,8 @@ pub trait Sys: Send + Sync {
     fn default_interface(&self) -> Result<Option<String>>;
     /// Sets a kernel variable (`sysctl name=value`).
     fn sysctl_set(&self, name: &str, value: &str) -> Result<()>;
+    /// A kernel variable's value (`sysctl -n name`).
+    fn sysctl_get(&self, name: &str) -> Result<String>;
 
     // pf.
 

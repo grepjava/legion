@@ -125,8 +125,13 @@ fn fail(command: &str, message: impl Into<String>) -> Error {
 }
 
 impl FakeSys {
+    /// A host as Legion wants it: racct on, so rctl limits hold.
     pub fn new() -> Self {
-        Self::default()
+        let sys = Self::default();
+        sys.state()
+            .sysctls
+            .insert("kern.racct.enable".into(), "1".into());
+        sys
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -853,6 +858,14 @@ impl Sys for FakeSys {
 
     fn default_interface(&self) -> Result<Option<String>> {
         Ok(self.state().default_interface.clone())
+    }
+
+    fn sysctl_get(&self, name: &str) -> Result<String> {
+        self.state()
+            .sysctls
+            .get(name)
+            .cloned()
+            .ok_or_else(|| fail("sysctl", format!("unknown oid '{name}'")))
     }
 
     fn sysctl_set(&self, name: &str, value: &str) -> Result<()> {

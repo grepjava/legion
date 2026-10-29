@@ -469,6 +469,7 @@ fn status(hostname: String, advertise: &str) -> NodeStatus {
             arch: oci_arch().to_owned(),
             // Set by the agent's start.
             linux: false,
+            no_limits: false,
         },
         allocatable: Capacity {
             cpu: Cpu(std::thread::available_parallelism().map_or(1, |n| n.get()) as u64 * 1000),

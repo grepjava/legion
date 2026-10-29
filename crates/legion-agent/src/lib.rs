@@ -160,6 +160,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 ips: Arc::default(),
                 guarding: Arc::new(policing::Guarding::new()),
                 memory: Arc::default(),
+                no_limits: false,
                 drain: config.drain,
             },
             resync: config.resync,
@@ -183,7 +184,24 @@ impl<R: Runtime, C: Control> Agent<R, C> {
     /// Runs until `shutdown` resolves. Pods keep running afterwards.
     pub async fn run(self, mut status: NodeStatus, shutdown: impl Future<Output = ()> + Send) {
         tokio::pin!(shutdown);
-        let ctx = self.ctx;
+        let mut ctx = self.ctx;
+        // rctl needs racct, a loader tunable: without it, limits cannot
+        // hold, and pods with them go to other nodes.
+        let racct = task::blocking(&ctx.sys, |sys| sys.sysctl_get("kern.racct.enable")).await;
+        ctx.no_limits = match racct {
+            Ok(v) => v != "1",
+            Err(e) => {
+                tracing::warn!("reading kern.racct.enable: {e}");
+                true
+            }
+        };
+        if ctx.no_limits {
+            tracing::warn!(
+                "kern.racct.enable is not 1: containers' limits cannot hold here, so pods \
+                 with limits run on other nodes (set it in /boot/loader.conf and reboot)"
+            );
+        }
+        status.platform.no_limits = ctx.no_limits;
         let modules = task::blocking(&ctx.sys, |sys| {
             MODULES
                 .iter()

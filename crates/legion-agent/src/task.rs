@@ -64,6 +64,8 @@ pub(crate) struct Ctx<R, C> {
     pub guarding: Arc<crate::policing::Guarding>,
     /// Containers' memory limits, kept by the agent.
     pub memory: Arc<crate::memory::Limits>,
+    /// rctl cannot hold limits here (`kern.racct.enable` is not 1).
+    pub no_limits: bool,
     /// How long a ready task told to stop keeps running first.
     pub drain: std::time::Duration,
 }
@@ -99,6 +101,7 @@ impl<R, C> Clone for Ctx<R, C> {
             ips: self.ips.clone(),
             guarding: self.guarding.clone(),
             memory: self.memory.clone(),
+            no_limits: self.no_limits,
             drain: self.drain,
         }
     }
@@ -207,6 +210,13 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         if let Some(why) = pod::unsupported(&self.a.spec.pod) {
             teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
             return self.finish(TaskState::Rejected, why, None).await;
+        }
+        // The scheduler places such a pod elsewhere; one assigned before
+        // this node said so is not run without its limits.
+        if self.ctx.no_limits && self.a.spec.pod.limited() {
+            teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
+            let why = "this node cannot hold the pod's limits: kern.racct.enable is not 1";
+            return self.finish(TaskState::Rejected, why.into(), None).await;
         }
         let pod = match self.adopt().await {
             Some(pod) => pod,

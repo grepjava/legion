@@ -693,6 +693,11 @@ impl<R: Runner> Sys for Shell<R> {
         self.run("sysctl", &[format!("{name}={value}")]).map(drop)
     }
 
+    fn sysctl_get(&self, name: &str) -> Result<String> {
+        self.run("sysctl", &["-n".to_owned(), name.to_owned()])
+            .map(|v| v.trim().to_owned())
+    }
+
     fn pf_main_rules(&self) -> Result<String> {
         let nat = self.run("pfctl", &args(["-sn"]))?;
         let filter = self.run("pfctl", &args(["-sr"]))?;
@@ -1453,6 +1458,7 @@ mod tests {
                 "sysctl net.inet.ip.forwarding=1",
                 ok("net.inet.ip.forwarding: 0 -> 1\n"),
             ),
+            ("sysctl -n kern.racct.enable", ok("1\n")),
         ]);
         let states = sh.pf_states().unwrap();
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
@@ -1481,6 +1487,7 @@ mod tests {
         assert_eq!(sh.default_interface().unwrap().as_deref(), Some("wlan0"));
         assert_eq!(sh.default_interface().unwrap(), None);
         sh.sysctl_set("net.inet.ip.forwarding", "1").unwrap();
+        assert_eq!(sh.sysctl_get("kern.racct.enable").unwrap(), "1");
     }
 
     #[test]

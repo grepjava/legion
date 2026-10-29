@@ -408,6 +408,42 @@ restartPolicy: { condition: on-failure, maxAttempts: 2, delay: 0s }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_racct_pods_with_limits_are_refused() {
+    let mut h = Harness::new().await;
+    h.stop_agent().await;
+    h.sys.sysctl_set("kern.racct.enable", "0").unwrap();
+    h.start_agent();
+    eventually("the node says limits cannot hold", || {
+        h.store
+            .get(&ObjectKey::new(Kind::Node, "", NODE))
+            .unwrap()
+            .is_some_and(|n| n.status["platform"]["noLimits"] == true)
+    })
+    .await;
+
+    // The scheduler places such pods elsewhere; one assigned here anyway
+    // does not run without its limits. Others run.
+    h.rt.add_image("app:1");
+    let capped = h
+        .task(
+            "capped-1",
+            r#"containers: [{ name: app, image: "app:1", resources: { limits: { memory: 64Mi } } }]"#,
+        )
+        .await;
+    let free = h
+        .task("free-1", r#"containers: [{ name: app, image: "app:1" }]"#)
+        .await;
+    let status = h.wait_state(&capped, TaskState::Rejected).await;
+    assert!(
+        status.message.contains("kern.racct.enable"),
+        "{}",
+        status.message
+    );
+    h.wait_state(&free, TaskState::Running).await;
+    assert_eq!(h.running(), ["shop_free-1", "shop_free-1_app"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_late_exit_event_does_not_give_the_code() {
     let h = Harness::new().await;
     h.rt.add_image("app:1");

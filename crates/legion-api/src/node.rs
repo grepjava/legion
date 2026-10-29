@@ -153,6 +153,16 @@ pub struct Platform {
     /// Whether the node runs Linux images too, through the Linux ABI.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub linux: bool,
+    /// Whether containers' limits cannot hold here: rctl needs
+    /// `kern.racct.enable=1`, a loader tunable. Pods with limits are not
+    /// placed on such a node. (The negative, so that nodes reporting
+    /// nothing, as older agents do, still take them.)
+    #[serde(
+        default,
+        rename = "noLimits",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub no_limits: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

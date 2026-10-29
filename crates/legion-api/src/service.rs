@@ -302,6 +302,11 @@ impl PodSpec {
         self.init_containers.iter().chain(&self.containers)
     }
 
+    /// Whether any container has limits, which need rctl on the node.
+    pub fn limited(&self) -> bool {
+        self.containers().any(|c| !c.resources.limits.is_empty())
+    }
+
     /// Every secret and config the pod uses: its containers' and its
     /// registry logins. The node may read these.
     pub fn data_refs(&self) -> std::collections::BTreeSet<(crate::Kind, String)> {

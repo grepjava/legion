@@ -306,10 +306,7 @@ Smaller follow-ups: placement preferences (`spread`) are accepted but not used y
 advertised WireGuard endpoint replaces the one WireGuard learned, so a
 node behind NAT cannot be reached by its peers' replies alone; node subnets
 are reserved by name (`Config/legion-system/node-subnets`) and a deleted
-Node's reservation is not released; on a host without
-`kern.racct.enable=1` (a loader tunable) rctl limits fail and the agent
-only warns, so the pod runs unlimited (it could refuse to start, or report
-it in the Node's status); a lost node's tasks keep getting a share of
+Node's reservation is not released; a lost node's tasks keep getting a share of
 new connections until the node is marked down (three missed 5 s
 heartbeats), which a faster down signal or per-connection retry could
 shorten.
@@ -976,11 +973,19 @@ real, in the order agreed with the user.
   daemon (the CLI reaching it), daemon(8) restarting it after a kill,
   the log reopened after a rotation, and a clean stop. Not built: a
   FreeBSD port, for when the flags have settled.
+- **No pods with limits where limits cannot hold** (DESIGN.md §6.3). On a
+  host without `kern.racct.enable=1`, rctl refused the limits and the
+  agent only warned, so such pods ran unlimited. Now the agent reads the
+  tunable at start and reports `platform.noLimits`, the scheduler places
+  pods with limits on other nodes (or holds them `pending`, saying why),
+  and the agent rejects one assigned anyway; pods without limits run
+  there as before. Tested: placement around such a node and the pending
+  reason; the agent reporting it, refusing a pod with limits and running
+  one without; `sysctl -n` as FreeBSD 15.1 prints it.
 
 ### To do, in order
 
 Nothing left in the hardening agreed with the user. Candidates from the
-phases' follow-ups: refusing to run pods unlimited on a host without
-racct, egress network policy, a faster down signal for lost nodes, and a
-FreeBSD port.
+phases' follow-ups: egress network policy, a faster down signal for lost
+nodes, and a FreeBSD port.
 
