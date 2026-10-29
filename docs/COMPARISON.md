@@ -18,7 +18,7 @@ what is built today, not what is planned.
 | | Legion | Docker Swarm | Kubernetes |
 |---|---|---|---|
 | Hosts | FreeBSD 15 and newer (amd64, aarch64) | Linux, Windows | Linux (Windows workers) |
-| Workloads | Jails from OCI images; Linux images through `linux64` | Linux and Windows containers | Linux and Windows containers |
+| Workloads | Jails, run by Legion itself (no Docker, containerd or Podman); their root file systems come from OCI images pulled from any registry into ZFS. Linux images run in jails through FreeBSD's Linux compatibility layer | Linux and Windows containers | Linux and Windows containers |
 | What you install | One binary on every node | Docker Engine on every node | Control plane (API server, etcd, scheduler, controllers), kubelet, a container runtime, a CNI plugin, then add-ons |
 | Configuration | YAML objects, or compose files as stacks | Compose files, `docker service` flags | YAML objects, Helm charts, operators |
 | Extensible API | No (fixed kinds) | No | Yes (CRDs, operators, webhooks) |
