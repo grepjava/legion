@@ -536,6 +536,27 @@ impl Cluster for ApiService {
         }))
     }
 
+    async fn autolock(
+        &self,
+        req: Request<pb::AutolockRequest>,
+    ) -> Result<Response<pb::AutolockResponse>, Status> {
+        self.caller(&req)?.require_all("change autolock")?;
+        if let Some(addr) = self.leader_addr(&req)? {
+            let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                &addr,
+                self.peer_tls.as_ref(),
+            ));
+            return c.autolock(forwarded(req.into_inner())).await;
+        }
+        let key = crate::autolock::apply(self, &req.into_inner().action).await?;
+        Ok(Response::new(pb::AutolockResponse {
+            key: key
+                .as_ref()
+                .map(crate::autolock::encode)
+                .unwrap_or_default(),
+        }))
+    }
+
     type BackupStream = ReceiverStream<Result<pb::BackupChunk, Status>>;
 
     async fn backup(

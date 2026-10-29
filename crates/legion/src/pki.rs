@@ -18,17 +18,125 @@ pub const ADMIN_BUNDLE: &str = "admin.pem";
 
 pub struct Pki {
     dir: PathBuf,
+    /// The unlock key, while autolock seals the private keys.
+    lock: Option<legion_store::StoreKey>,
 }
+
+/// The private keys autolock seals: the CA's, the node's and the store's.
+const SEALABLE: [&str; 3] = ["ca.key", "node.key", "store.key"];
 
 impl Pki {
     pub fn new(data_dir: &Path) -> Pki {
         Pki {
             dir: data_dir.join("pki"),
+            lock: None,
         }
     }
 
     fn path(&self, name: &str) -> PathBuf {
         self.dir.join(name)
+    }
+
+    fn sealed_path(&self, name: &str) -> PathBuf {
+        self.dir.join(format!("{name}.sealed"))
+    }
+
+    /// Whether autolock sealed this node's private keys: it needs the
+    /// unlock key to start.
+    pub fn locked(&self) -> bool {
+        SEALABLE.iter().any(|f| self.sealed_path(f).exists())
+    }
+
+    /// The same, with its sealed keys opened by `key`; fails if `key` does
+    /// not open them.
+    pub fn unlock(self, key: legion_store::StoreKey) -> anyhow::Result<Pki> {
+        for f in SEALABLE {
+            let path = self.sealed_path(f);
+            if let Ok(sealed) = std::fs::read(&path) {
+                legion_store::open_sealed(&key, f, &sealed)
+                    .map_err(|_| anyhow::anyhow!("the key does not unlock this manager"))?;
+            }
+        }
+        Ok(Pki {
+            lock: Some(key),
+            ..self
+        })
+    }
+
+    /// The unlock key the private keys are sealed with, if they are.
+    pub fn lock(&self) -> Option<&legion_store::StoreKey> {
+        self.lock.as_ref()
+    }
+
+    /// A private key, opened if sealed.
+    fn read_secret(&self, name: &str) -> anyhow::Result<Option<String>> {
+        let sealed = self.sealed_path(name);
+        match (std::fs::read(&sealed), &self.lock) {
+            (Ok(bytes), Some(key)) => {
+                let plain = legion_store::open_sealed(key, name, &bytes)
+                    .with_context(|| format!("opening {}", sealed.display()))?;
+                Ok(Some(String::from_utf8(plain)?))
+            }
+            (Ok(_), None) if !self.path(name).exists() => {
+                anyhow::bail!("{} is sealed: unlock the manager first", sealed.display())
+            }
+            _ => read(&self.path(name)),
+        }
+    }
+
+    /// Writes a private key, sealed while autolock is on; then drops the
+    /// other form, so a crash between leaves both rather than neither.
+    fn write_secret(&self, name: &str, text: &str) -> anyhow::Result<()> {
+        let (plain, sealed) = (self.path(name), self.sealed_path(name));
+        match &self.lock {
+            Some(key) => {
+                let bytes = legion_store::seal(key, name, text.as_bytes())?;
+                write_bytes(&sealed, &bytes, 0o600)?;
+                remove(&plain)
+            }
+            None => {
+                write_private(&plain, text)?;
+                remove(&sealed)
+            }
+        }
+    }
+
+    /// Seals the private keys with `lock`, or with `None` writes them in
+    /// the clear again.
+    pub fn reseal(&mut self, lock: Option<legion_store::StoreKey>) -> anyhow::Result<()> {
+        let mut keys = Vec::new();
+        for f in SEALABLE {
+            if let Some(text) = self.read_secret(f)? {
+                keys.push((f, text));
+            }
+        }
+        self.lock = lock;
+        for (f, text) in keys {
+            self.write_secret(f, &text)?;
+        }
+        Ok(())
+    }
+
+    /// The key this manager's store is sealed with, `store.key`, made on
+    /// first use. A store written before it existed is read as it is and
+    /// sealed as it is written again.
+    pub fn store_key(&self) -> anyhow::Result<legion_store::StoreKey> {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+        if let Some(text) = self.read_secret("store.key")? {
+            let bytes = STANDARD
+                .decode(text.trim())
+                .context("the store key is not base64")?;
+            return legion_store::StoreKey::from_bytes(&bytes).context("reading the store key");
+        }
+        private_dir(&self.dir)?;
+        let key = legion_store::StoreKey::generate();
+        self.write_secret(
+            "store.key",
+            &format!("{}\n", STANDARD.encode(key.as_bytes())),
+        )?;
+        tracing::info!("made the store's key");
+        Ok(key)
     }
 
     /// The node's role: a manager unless it joined as a worker.
@@ -93,14 +201,14 @@ impl Pki {
         if self.role()? != Role::Manager {
             anyhow::bail!("this node joined as a worker and holds no manager credentials");
         }
-        let ca = match (read(&self.path("ca.crt"))?, read(&self.path("ca.key"))?) {
+        let ca = match (read(&self.path("ca.crt"))?, self.read_secret("ca.key")?) {
             (Some(cert), Some(key)) => Ca::load(&cert, &key).context("loading the cluster CA")?,
             (Some(_), None) => {
                 anyhow::bail!("{} has no CA key: a manager needs one", self.dir.display())
             }
             _ => {
                 let ca = Ca::generate()?;
-                write_private(&self.path("ca.key"), ca.key_pem())?;
+                self.write_secret("ca.key", ca.key_pem())?;
                 write_public(&self.path("ca.crt"), ca.cert_pem())?;
                 tracing::info!(digest = %ca.digest(), "created a cluster CA");
                 ca
@@ -108,7 +216,7 @@ impl Pki {
         };
 
         let id = Identity::new(node, Role::Manager);
-        let current = match (read(&self.path("node.crt"))?, read(&self.path("node.key"))?) {
+        let current = match (read(&self.path("node.crt"))?, self.read_secret("node.key")?) {
             (Some(cert), Some(key)) => Some((cert, key)),
             _ => None,
         };
@@ -119,7 +227,7 @@ impl Pki {
             Some(pair) if usable => pair,
             _ => {
                 let issued = ca.issue(&id, CERT_LIFETIME)?;
-                write_private(&self.path("node.key"), &issued.key_pem)?;
+                self.write_secret("node.key", &issued.key_pem)?;
                 write_public(&self.path("node.crt"), &issued.cert_pem)?;
                 tracing::info!(%id, "issued this manager's certificate");
                 (issued.cert_pem, issued.key_pem)
@@ -179,28 +287,6 @@ fn issued_as(cert_pem: &str, id: &Identity) -> bool {
     .is_ok_and(|got| got == *id)
 }
 
-/// The key this manager's store is sealed with, `pki/store.key`, made on
-/// first use. A store written before it existed is read as it is and
-/// sealed as it is written again.
-pub fn store_key(data_dir: &Path) -> anyhow::Result<legion_store::StoreKey> {
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD;
-    let dir = data_dir.join("pki");
-    let path = dir.join("store.key");
-    if let Some(text) = read(&path)? {
-        let bytes = STANDARD
-            .decode(text.trim())
-            .with_context(|| format!("{} is not base64", path.display()))?;
-        return legion_store::StoreKey::from_bytes(&bytes)
-            .with_context(|| format!("reading {}", path.display()));
-    }
-    private_dir(&dir)?;
-    let key = legion_store::StoreKey::generate();
-    write_private(&path, &format!("{}\n", STANDARD.encode(key.as_bytes())))?;
-    tracing::info!(path = %path.display(), "made the store's key");
-    Ok(key)
-}
-
 fn read(path: &Path) -> anyhow::Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(s) => Ok(Some(s)),
@@ -228,7 +314,20 @@ fn write_public(path: &Path, contents: &str) -> anyhow::Result<()> {
     write(path, contents, 0o644)
 }
 
+fn remove(path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("removing {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn write(path: &Path, contents: &str, mode: u32) -> anyhow::Result<()> {
+    write_bytes(path, contents.as_bytes(), mode)
+}
+
+fn write_bytes(path: &Path, contents: &[u8], mode: u32) -> anyhow::Result<()> {
     let tmp = path.with_extension("new");
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -242,7 +341,7 @@ fn write(path: &Path, contents: &str, mode: u32) -> anyhow::Result<()> {
     let mut f = options
         .open(&tmp)
         .with_context(|| format!("writing {}", tmp.display()))?;
-    std::io::Write::write_all(&mut f, contents.as_bytes())?;
+    std::io::Write::write_all(&mut f, contents)?;
     f.sync_all()?;
     std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
 }

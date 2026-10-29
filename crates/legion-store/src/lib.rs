@@ -23,7 +23,7 @@ use openraft::{BasicNode, RaftNetworkFactory};
 use serde::{Deserialize, Serialize};
 
 pub use backup::{Backup, restore, set_aside};
-pub use cipher::StoreKey;
+pub use cipher::{StoreKey, open as open_sealed, seal};
 pub use log_store::LogStore;
 pub use state_machine::{Listing, StateMachine};
 pub use watch::{Event, WatchError, Watcher};

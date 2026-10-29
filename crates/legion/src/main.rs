@@ -1,5 +1,6 @@
 //! `legion`: the daemon (`legion daemon`) and the CLI that talks to it.
 
+mod autolock;
 mod cli;
 mod daemon;
 mod metrics;
@@ -126,6 +127,21 @@ enum Command {
     },
     /// Show the reached manager's view of the cluster.
     Status,
+    /// Autolock: managers seal their private keys with an unlock key and,
+    /// after a restart, wait for `legion unlock` before they start.
+    /// `enable` prints the key (keep it safe: without it a restarted
+    /// manager does not start), `rotate` replaces it, `disable` drops it,
+    /// `show` prints it.
+    Autolock {
+        #[arg(value_parser = ["enable", "disable", "rotate", "show"])]
+        action: String,
+    },
+    /// Give a locked manager on this host its unlock key, read from
+    /// --key-file or else from stdin.
+    Unlock {
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+    },
     /// Save every object of the cluster, read at one version, to a file.
     /// It holds Secrets and join tokens: keep it as safe as the managers'
     /// disks. The managers' keys are not in it; keep `<data-dir>/pki` too.
@@ -146,6 +162,9 @@ enum Command {
         /// one the backup records for this manager.
         #[arg(long)]
         advertise: Option<String>,
+        /// With autolock on, a file holding the unlock key.
+        #[arg(long)]
+        unlock_key_file: Option<PathBuf>,
     },
     /// Create or update objects from YAML or JSON files ("-" reads stdin).
     Apply {
@@ -405,7 +424,14 @@ async fn main() -> anyhow::Result<()> {
             file,
             data_dir,
             advertise,
-        } => daemon::restore(file.as_deref(), &data_dir, advertise),
+            unlock_key_file,
+        } => daemon::restore(
+            file.as_deref(),
+            &data_dir,
+            advertise,
+            unlock_key_file.as_deref(),
+        ),
+        Command::Unlock { key_file } => cli::unlock(&args.server, key_file.as_deref()).await,
         command => cli::run(&args.server, &args.identity, command).await,
     }
 }

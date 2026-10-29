@@ -44,6 +44,13 @@ fn start_daemon() -> Daemon {
 }
 
 fn start_daemon_in(dir: tempfile::TempDir, server: String) -> Daemon {
+    let daemon = spawn_daemon(dir, server);
+    wait_up(&daemon);
+    daemon
+}
+
+/// Starts a daemon without waiting for it to answer.
+fn spawn_daemon(dir: tempfile::TempDir, server: String) -> Daemon {
     // Appended to across restarts, and shown if the daemon does not come up.
     let log_path = dir.path().join("daemon.log");
     let log = std::fs::OpenOptions::new()
@@ -58,31 +65,28 @@ fn start_daemon_in(dir: tempfile::TempDir, server: String) -> Daemon {
         .stderr(log)
         .spawn()
         .unwrap();
-    let daemon = Daemon {
+    Daemon {
         child,
         server,
         _dir: dir,
-    };
+    }
+}
+
+/// Waits for the daemon to answer; shows its log if it does not.
+fn wait_up(daemon: &Daemon) {
+    let log_path = daemon._dir.path().join("daemon.log");
     // Generous: the first start of a freshly built binary can be slow (on
     // Windows, while it is scanned).
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !legion(&daemon, &["status"]).status.success() {
+    while !legion(daemon, &["status"]).status.success() {
         if Instant::now() >= deadline {
             let log = std::fs::read_to_string(&log_path).unwrap_or_default();
             let tail: Vec<&str> = log.lines().rev().take(30).collect();
             let tail: Vec<&str> = tail.into_iter().rev().collect();
-            panic!(
-                "daemon did not come up:
-{}",
-                tail.join(
-                    "
-"
-                )
-            );
+            panic!("daemon did not come up:\n{}", tail.join("\n"));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    daemon
 }
 
 fn legion(d: &Daemon, args: &[&str]) -> Output {
@@ -609,4 +613,140 @@ fn the_daemon_seals_its_store() {
             "{needle} in the store"
         );
     }
+}
+
+/// `legion unlock` against `d` with `key` on stdin.
+fn unlock(d: &Daemon, key: &str) -> Output {
+    use std::io::Write;
+    let mut child = Command::new(LEGION)
+        .args(["--server", &d.server, "unlock"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "{key}").unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// Waits until the daemon's private keys are sealed, or all in the clear.
+fn wait_sealed(d: &Daemon, sealed: bool) {
+    let pki = d._dir.path().join("pki");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let done = ["ca.key", "node.key", "store.key"].iter().all(|f| {
+            pki.join(format!("{f}.sealed")).exists() == sealed && pki.join(f).exists() != sealed
+        });
+        if done {
+            return;
+        }
+        assert!(Instant::now() < deadline, "keys not sealed={sealed}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Waits for a locked daemon to listen, and checks a wrong key fails.
+fn refuses(d: &Daemon, key: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let out = unlock(d, key);
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(!out.status.success(), "unlocked with {key}");
+        if err.contains("does not unlock") {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{err}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn autolock_seals_the_keys_and_a_restart_waits_for_the_unlock_key() {
+    let d = start_daemon();
+    ok(&d, &["init"]);
+    namespace(&d, "kept");
+    assert!(ok(&d, &["autolock", "show"]).contains("autolock is off"));
+    let key = ok(&d, &["autolock", "enable"]).trim().to_owned();
+    assert!(key.starts_with("LGN-UNLOCK-"), "{key}");
+    assert_eq!(ok(&d, &["autolock", "enable"]).trim(), key, "kept");
+    assert_eq!(ok(&d, &["autolock", "show"]).trim(), key);
+    wait_sealed(&d, true);
+
+    // Restarted, it serves nothing but Unlock until given the key.
+    let server = d.server.clone();
+    let dir = d.kill();
+    let d = spawn_daemon(dir, server);
+    let wrong = format!("LGN-UNLOCK-{}", "A".repeat(43));
+    refuses(&d, &wrong);
+    assert!(!legion(&d, &["status"]).status.success(), "locked");
+    let out = unlock(&d, &key);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    wait_up(&d);
+    assert!(ok(&d, &["get", "namespace", "kept"]).contains("name: kept"));
+
+    // Rotated, the old key no longer opens it.
+    let rotated = ok(&d, &["autolock", "rotate"]).trim().to_owned();
+    assert_ne!(rotated, key);
+    let sealed_at = std::fs::read(d._dir.path().join("pki/store.key.sealed")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::fs::read(d._dir.path().join("pki/store.key.sealed")).unwrap() == sealed_at {
+        assert!(Instant::now() < deadline, "not resealed");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let server = d.server.clone();
+    let dir = d.kill();
+    let d = spawn_daemon(dir, server);
+    refuses(&d, &key);
+    assert!(unlock(&d, &rotated).status.success());
+    wait_up(&d);
+
+    // Disabled, the keys are in the clear again and a restart needs none.
+    assert!(ok(&d, &["autolock", "disable"]).contains("autolock is off"));
+    wait_sealed(&d, false);
+    let server = d.server.clone();
+    let dir = d.kill();
+    let d = start_daemon_in(dir, server);
+    assert!(ok(&d, &["get", "namespace", "kept"]).contains("name: kept"));
+}
+
+#[test]
+fn every_manager_seals_its_keys_once_autolock_is_on() {
+    let first = start_daemon();
+    ok(&first, &["init"]);
+    let token = ok(&first, &["join-token", "manager"]).trim().to_owned();
+    let dir = tempfile::tempdir().unwrap();
+    let addr = free_addr();
+    let out = Command::new(LEGION)
+        .args([
+            "join",
+            &token,
+            "--manager",
+            &first.server,
+            "--advertise",
+            &addr,
+        ])
+        .args(["--node-name", "m2", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let second = start_daemon_in(dir, addr);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while voters(&first) < 2 {
+        assert!(Instant::now() < deadline, "{}", ok(&first, &["status"]));
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Enabled through the second, which forwards to the leader.
+    let key = ok(&second, &["autolock", "enable"]).trim().to_owned();
+    wait_sealed(&first, true);
+    wait_sealed(&second, true);
+    assert_eq!(ok(&first, &["autolock", "show"]).trim(), key);
 }

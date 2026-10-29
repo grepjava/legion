@@ -202,7 +202,29 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 output.display()
             );
         }
-        Command::Join { .. } | Command::Restore { .. } => unreachable!("handled in main"),
+        Command::Autolock { action } => {
+            let key = cluster
+                .autolock(pb::AutolockRequest {
+                    action: action.clone(),
+                })
+                .await?
+                .into_inner()
+                .key;
+            match (action.as_str(), key.is_empty()) {
+                (_, true) => println!("autolock is off"),
+                ("show", false) => println!("{key}"),
+                (_, false) => {
+                    println!("{key}");
+                    eprintln!(
+                        "keep this key safe: a manager restarted from now on starts only \
+                         after `legion unlock` with it"
+                    );
+                }
+            }
+        }
+        Command::Join { .. } | Command::Restore { .. } | Command::Unlock { .. } => {
+            unreachable!("handled in main")
+        }
         Command::Logs {
             task,
             namespace,
@@ -1098,6 +1120,33 @@ fn print_status(s: &StatusResponse) {
             println!("  {:<20} {:<22} {role}", m.id, m.addr);
         }
     }
+}
+
+/// `legion unlock`: sends a locked manager on this host its unlock key, in
+/// the clear, as the manager has no credentials to offer until unlocked.
+pub async fn unlock(server: &str, key_file: Option<&Path>) -> anyhow::Result<()> {
+    let key = match key_file {
+        Some(f) => {
+            std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?
+        }
+        None => {
+            let mut key = String::new();
+            std::io::stdin().read_line(&mut key)?;
+            key
+        }
+    };
+    let channel = Channel::from_shared(format!("http://{server}"))?
+        .connect()
+        .await
+        .with_context(|| format!("reaching the manager at {server}"))?;
+    legion_proto::v1::unlock_client::UnlockClient::new(channel)
+        .unlock(pb::UnlockRequest {
+            key: key.trim().to_owned(),
+        })
+        .await
+        .map_err(|s| anyhow::anyhow!("{}", s.message()))?;
+    println!("unlocked");
+    Ok(())
 }
 
 #[cfg(test)]

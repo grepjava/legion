@@ -48,9 +48,13 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| opts.listen.to_string());
     let hostname = hostname()?;
-    let pki = crate::pki::Pki::new(&opts.data_dir);
+    let mut pki = crate::pki::Pki::new(&opts.data_dir);
     if pki.role()? == legion_pki::Role::Worker {
         return run_worker(&opts, &pki, hostname).await;
+    }
+    if pki.locked() {
+        let key = crate::autolock::wait(opts.listen, &opts.data_dir).await?;
+        pki = pki.unlock(key)?;
     }
     let node = match &opts.node_name {
         Some(n) => n.clone(),
@@ -71,7 +75,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         }
         None => None,
     };
-    let store_key = crate::pki::store_key(&opts.data_dir).context("the store's key")?;
+    let store_key = pki.store_key().context("the store's key")?;
     let manager = legion_manager::Manager::open(legion_manager::ManagerConfig {
         tls: Some(tls),
         vip,
@@ -81,6 +85,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     .await
     .map_err(|e| anyhow::anyhow!(e))
     .context("opening the store")?;
+    let autolock = tokio::spawn(crate::autolock::follow(manager.store().clone(), pki));
     let listener = tokio::net::TcpListener::bind(opts.listen)
         .await
         .with_context(|| format!("listening on {}", opts.listen))?;
@@ -120,6 +125,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     if let Some(metrics) = metrics {
         metrics.abort();
     }
+    autolock.abort();
     if let Some(podman) = podman {
         podman.shutdown().await;
     }
@@ -350,8 +356,18 @@ pub fn restore(
     file: Option<&Path>,
     data_dir: &Path,
     advertise: Option<String>,
+    unlock_key_file: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let pki = crate::pki::Pki::new(data_dir);
+    let mut pki = crate::pki::Pki::new(data_dir);
+    if pki.locked() {
+        let Some(f) = unlock_key_file else {
+            bail!("this manager is locked: pass --unlock-key-file");
+        };
+        let text =
+            std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?;
+        let key = legion_manager::autolock::parse(&text).map_err(|e| anyhow::anyhow!(e))?;
+        pki = pki.unlock(key)?;
+    }
     if !pki.exists() || pki.role()? != legion_pki::Role::Manager {
         bail!(
             "{} holds no manager of a cluster: restore where a manager ran, with its pki",
@@ -363,7 +379,7 @@ pub fn restore(
         bail!("{} is missing", id_file.display());
     }
     let id = legion_manager::node_id(data_dir).map_err(|e| anyhow::anyhow!(e))?;
-    let key = crate::pki::store_key(data_dir)?;
+    let key = pki.store_key()?;
     let backup = match file {
         Some(file) => {
             let json =

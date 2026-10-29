@@ -112,7 +112,32 @@ service Cluster {
   // Every object, read at one version, with the cluster's managers: the
   // JSON of a backup (legion_store::Backup) in pieces of up to 1 MiB.
   rpc Backup(BackupRequest) returns (stream BackupChunk);
+  // Autolock: `enable` makes the unlock key (or keeps the one there is),
+  // `rotate` replaces it, `disable` drops it, `show` only reads it. Every
+  // manager seals its private keys with the key, and after a restart waits
+  // for it (`Unlock`). Returns the key, empty once disabled.
+  rpc Autolock(AutolockRequest) returns (AutolockResponse);
 }
+
+message AutolockRequest {
+  string action = 1;
+}
+
+message AutolockResponse {
+  string key = 1;
+}
+
+// What a locked manager serves, in the clear and to its own host only,
+// until it is given the unlock key.
+service Unlock {
+  rpc Unlock(UnlockRequest) returns (UnlockResponse);
+}
+
+message UnlockRequest {
+  string key = 1;
+}
+
+message UnlockResponse {}
 
 message BackupRequest {}
 

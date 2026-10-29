@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64.workspace = true
 legion-api.workspace = true
 legion-net.workspace = true
 legion-pki.workspace = true

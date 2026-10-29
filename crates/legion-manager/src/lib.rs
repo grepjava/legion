@@ -9,6 +9,7 @@
 
 mod api;
 mod authz;
+pub mod autolock;
 pub mod controller;
 mod dispatcher;
 pub mod join;

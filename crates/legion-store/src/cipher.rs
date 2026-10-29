@@ -136,6 +136,20 @@ impl Codec {
     }
 }
 
+/// Seals `plain` with `key`, bound to `label`: files autolock protects.
+pub fn seal(key: &StoreKey, label: &str, plain: &[u8]) -> Result<Vec<u8>, Error> {
+    Codec::new(Some(key)).seal("file", label, plain.to_vec())
+}
+
+/// Opens what [`seal`] sealed with the same key and label; anything else,
+/// plain bytes included, is refused.
+pub fn open(key: &StoreKey, label: &str, sealed: &[u8]) -> Result<Vec<u8>, Error> {
+    if !sealed.starts_with(&SEALED) {
+        return Err(Error::Sealed(format!("{label} is not sealed")));
+    }
+    Codec::new(Some(key)).open("file", label, sealed)
+}
+
 fn aad(table: &str, key: &str) -> Vec<u8> {
     format!("{table}/{key}").into_bytes()
 }

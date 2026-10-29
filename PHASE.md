@@ -706,13 +706,27 @@ service and migrates between nodes.
   absent from the file (log and snapshot) and read back only with the
   key, a plain store taking a key, and the daemon's own store.
 
+- **Autolock** (`legion autolock enable|disable|rotate|show`, `legion
+  unlock`, `legion_manager::autolock`, `legion::autolock`, DESIGN.md
+  §9): an unlock key kept in the store, with which every manager seals
+  its CA, node and store keys on disk (rechecked every 5 s, so rotations
+  reseal and disabling unseals); a restarted manager with sealed keys
+  serves only `Unlock`, from its own host, until given a key that opens
+  them. `legion restore` takes `--unlock-key-file`. Tested: key format;
+  through the binary, enable (and enable again keeping the key), keys
+  sealed on disk, a restart serving only `Unlock`, a wrong key refused,
+  the right one starting it with its data, a rotation refusing the old
+  key, disabling and starting without a key; two managers, enabled
+  through the follower, both sealing theirs.
+
 ### To do, in order
 
-1. Autolock: the data key and the managers' private keys sealed with an
-   unlock key the operator holds, `legion unlock` after a restart.
+Nothing left in phase 4.
 
 Smaller follow-ups: memory limits for workloads with large shared memory
-(rctl counts it per process; `vmemoryuse` or a pod-wide allowance).
+(rctl counts it per process; `vmemoryuse` or a pod-wide allowance);
+ingress HTTP/2, connection reuse and ACME certificates; sealing the
+WireGuard key under autolock.
 
 ## Later phases
 

@@ -465,7 +465,8 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
 ### 4.1 From Swarm (kept)
 
 - `legion init`, `legion join <token>`, join tokens that embed the CA digest.
-- Automatic PKI: node certificates, rotation, optional manager autolock.
+- Automatic PKI: node certificates, rotation, optional manager autolock
+  (built: §9).
 - Raft managers embedded in the daemon; promote and demote nodes.
 - Replicated and global services; replicated and global jobs.
 - Rolling updates and rollback with Swarm's knobs (parallelism, delay, order
@@ -1114,7 +1115,24 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
   them with its own key. A store written before is read as it is, and
   each value is sealed when next written. Backups are plain JSON (they
   are for restoring anywhere), so their file is kept as safe as the
-  key. Autolock is not built yet.
+  key.
+- **Autolock** (built, phase 4): `legion autolock enable` makes a 256-bit
+  unlock key (`LGN-UNLOCK-...`, printed once; `show` prints it again,
+  `rotate` replaces it, `disable` drops it) and keeps it in the store, in
+  the reserved namespace, where every manager reads it (sealed there by
+  each one's data key). Each manager then seals its private keys, the
+  CA's, its node's and its store's (`<name>.sealed`, ChaCha20-Poly1305,
+  bound to the file's name), and removes them in the clear; it rechecks
+  every 5 s, so a rotation reseals and `disable` writes them in the clear
+  again. A manager that starts with sealed keys serves only `Unlock`, in
+  the clear and to its own host (loopback) only, as it has no
+  credentials yet; `legion unlock` (the key on stdin or `--key-file`)
+  gives it the key, which must open its sealed keys, and it starts as
+  usual with them held in memory. A manager down during a rotation needs
+  the key it last sealed with, then reseals. `legion restore` on a locked
+  manager takes `--unlock-key-file`. Not sealed: `admin.pem` (the CLI's
+  credentials), workers' keys and WireGuard keys, as in Swarm only
+  managers lock. Backups hold the unlock key with the rest.
 - **Secrets in transit and on nodes**: delivered only to nodes running tasks
   that use them; held in tmpfs; removed when the last task using them stops.
 - **Data plane**: all node-to-node traffic goes over WireGuard. WireGuard keys
