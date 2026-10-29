@@ -26,6 +26,7 @@ use serde_json::Value;
 const LEGION: &str = env!("CARGO_BIN_EXE_legion");
 const SERVER: &str = "127.0.0.1:7471";
 const METRICS: &str = "127.0.0.1:7472";
+const INGRESS: &str = "127.0.0.1:7473";
 
 struct Lab {
     dir: PathBuf,
@@ -43,6 +44,7 @@ impl Lab {
         let child = Command::new(LEGION)
             .args(["daemon", "--listen", SERVER, "--zfs-root", &self.zfs_root])
             .args(["--metrics-listen", METRICS])
+            .args(["--ingress-listen", INGRESS])
             .arg("--data-dir")
             .arg(self.dir.join("data"))
             .arg("--run-dir")
@@ -211,10 +213,20 @@ fn get(ip: &str, path: &str) -> Option<(u16, String)> {
 }
 
 fn get_at(addr: &str, path: &str) -> Option<(u16, String)> {
+    get_host(addr, "", path)
+}
+
+/// With a `Host` header, unless `host` is empty.
+fn get_host(addr: &str, host: &str, path: &str) -> Option<(u16, String)> {
     let addr: SocketAddr = addr.parse().ok()?;
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    write!(s, "GET {path} HTTP/1.0\r\n\r\n").ok()?;
+    let host = if host.is_empty() {
+        String::new()
+    } else {
+        format!("Host: {host}\r\n")
+    };
+    write!(s, "GET {path} HTTP/1.0\r\n{host}\r\n").ok()?;
     let mut resp = String::new();
     s.read_to_string(&mut resp).ok()?;
     let status = resp.split_whitespace().nth(1)?.parse().ok()?;
@@ -331,6 +343,29 @@ fn app_survives_failures() {
     for (name, ip) in running("web") {
         assert_eq!(get(&ip, "/healthz"), Some((200, "ok".into())), "{name}");
     }
+
+    // A route sends HTTP for its host through the node's ingress proxy.
+    let route = lab.dir.join("route.yaml");
+    std::fs::write(
+        &route,
+        "apiVersion: legion/v1\nkind: Route\nmetadata: { name: www, namespace: shop }\n\
+         spec: { host: shop.example.org, service: web }\n",
+    )
+    .unwrap();
+    ok(&["apply", "-f", route.to_str().unwrap()]);
+    wait("the route", 30, || {
+        get_host(INGRESS, "shop.example.org", "/healthz") == Some((200, "ok".into()))
+    });
+    // The port in the header and the case of the name do not matter. (Not
+    // /count: the steps below count on its value.)
+    assert_eq!(
+        get_host(INGRESS, "Shop.Example.org:80", "/healthz"),
+        Some((200, "ok".into()))
+    );
+    assert_eq!(
+        get_host(INGRESS, "other.example.org", "/healthz").map(|r| r.0),
+        Some(404)
+    );
 
     // Sessions through the manager. Exec passes output, exit code and,
     // with -i, stdin; with -t the command gets a terminal (script(1) gives

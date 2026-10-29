@@ -86,6 +86,17 @@ pub struct NamespacedPolicy {
     pub spec: NetworkPolicySpec,
 }
 
+/// A `Route`, with its namespace (DESIGN.md §5.8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespacedRoute {
+    pub namespace: String,
+    pub name: String,
+    pub spec: crate::route::RouteSpec,
+}
+
+/// Every route in the cluster.
+pub type Routes = Vec<NamespacedRoute>;
+
 /// A node of the WireGuard mesh (DESIGN.md §5.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Peer {

@@ -235,8 +235,28 @@ fn empty_specs_get_defaults() {
 fn kinds_not_written_through_admission() {
     let mut task = Object::new(Kind::Task, "shop", "web-1", serde_json::json!({}));
     assert_eq!(admit(&mut task), Err(Error::Managed(Kind::Task)));
-    let mut route = Object::new(Kind::Route, "shop", "www", serde_json::json!({}));
-    assert_eq!(admit(&mut route), Err(Error::Unsupported(Kind::Route)));
+}
+
+#[test]
+fn routes_take_a_host_and_default_to_the_root_path() {
+    let mut route = Object::new(
+        Kind::Route,
+        "shop",
+        "www",
+        serde_json::json!({ "host": "shop.example.org", "service": "web" }),
+    );
+    admit(&mut route).unwrap();
+    assert_eq!(
+        route.spec,
+        serde_json::json!({ "host": "shop.example.org", "path": "/", "service": "web" })
+    );
+    let mut bad = Object::new(
+        Kind::Route,
+        "shop",
+        "www",
+        serde_json::json!({ "service": "web" }),
+    );
+    assert!(admit(&mut bad).is_err());
 }
 
 fn job(spec: &str) -> String {

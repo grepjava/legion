@@ -671,9 +671,22 @@ service and migrates between nodes.
   bridge, the leader holding the address alone and the API answering on
   it; a clean stop and a SIGKILL each moving it to the next leader.
 
+- **Ingress routes** (`legion_api::route`, `legion-agent::ingress`,
+  DESIGN.md §5.8): `Route` objects (host or `*.domain`, path prefix,
+  service, port), streamed by the dispatcher to every agent and served by
+  an HTTP proxy in the agent (`legion daemon --ingress-listen`) instead of
+  the haproxy service earlier drafts planned: longest match, exact host
+  before wildcard, ready tasks in turn at their own addresses,
+  `X-Forwarded-*` headers, upgrades passed through. Tested: matching and
+  admission; the proxy against real local backends (routing, 404, 503,
+  502, routes and endpoints changing, a WebSocket-style upgrade); routes
+  reaching a node through the dispatcher; and on weft-bsd in the phase 1
+  exit test, the app's web service answering through a route with real
+  pods.
+
 ### To do, in order
 
-1. Ingress routes, autolock (with encryption at rest, not built yet).
+1. Autolock, with encryption at rest (not built yet). TLS for routes.
 
 Smaller follow-ups: memory limits for workloads with large shared memory
 (rctl counts it per process; `vmemoryuse` or a pod-wide allowance).

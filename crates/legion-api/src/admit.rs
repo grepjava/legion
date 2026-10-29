@@ -105,9 +105,7 @@ pub fn admit(obj: &mut Object) -> Result<(), Error> {
             }
             normalise::<crate::job::CronJobSpec>(job_defaults(spec, &["job", "pod"]))
         }
-        Kind::Route => {
-            return Err(Error::Unsupported(obj.kind));
-        }
+        Kind::Route => normalise::<crate::route::RouteSpec>(spec),
     };
     obj.spec = normalised.map_err(|invalid| Error::Spec {
         kind: obj.kind,

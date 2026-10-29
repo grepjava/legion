@@ -99,9 +99,6 @@ impl ManagerMetrics {
 fn cluster(store: &Store, m: &mut Metrics) -> Result<(), legion_store::Error> {
     let mut objects: BTreeMap<Kind, Vec<Object>> = BTreeMap::new();
     for kind in Kind::ALL {
-        if kind == Kind::Route {
-            continue;
-        }
         objects.insert(kind, store.list(kind, None)?.objects);
     }
     let of = |k: Kind| objects.get(&k).map_or(&[][..], Vec::as_slice);

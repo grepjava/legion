@@ -40,6 +40,8 @@ struct Args {
 }
 
 #[derive(Subcommand)]
+// Parsed once per run: the daemon's many flags cost nothing to keep inline.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Run the node daemon: the manager, and on FreeBSD the agent.
     Daemon {
@@ -89,6 +91,9 @@ enum Command {
         /// A file holding the CARP password.
         #[arg(long)]
         vip_password_file: Option<PathBuf>,
+        /// Serve HTTP routes (`Route` objects) here, e.g. `0.0.0.0:80`.
+        #[arg(long)]
+        ingress_listen: Option<SocketAddr>,
     },
     /// Start a new cluster with the reached manager as its first member.
     Init,
@@ -351,6 +356,7 @@ async fn main() -> anyhow::Result<()> {
             vip_interface,
             vip_vhid,
             vip_password_file,
+            ingress_listen,
         } => {
             let vip = match (vip, vip_interface, vip_password_file) {
                 (Some(addr), Some(interface), Some(file)) => {
@@ -379,6 +385,7 @@ async fn main() -> anyhow::Result<()> {
                 managers,
                 metrics_listen,
                 vip,
+                ingress_listen,
             })
             .await
         }

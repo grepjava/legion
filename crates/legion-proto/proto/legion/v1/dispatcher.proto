@@ -27,6 +27,9 @@ service Dispatcher {
   // Namespaces' isolation and every network policy: the complete set
   // first, and again after every change.
   rpc Policies(PoliciesRequest) returns (stream PoliciesUpdate);
+  // Every route, for the ingress proxy: the complete set first, and again
+  // after every change.
+  rpc Routes(RoutesRequest) returns (stream RoutesUpdate);
   // A task's status, from the node it is assigned to.
   rpc Report(ReportRequest) returns (ReportResponse);
   // Binds a volume one of the node's tasks uses to the node.
@@ -83,6 +86,15 @@ message PeersRequest {
 
 message PoliciesRequest {
   string node = 1;
+}
+
+message RoutesRequest {
+  string node = 1;
+}
+
+message RoutesUpdate {
+  // A JSON array of routes with their namespaces.
+  bytes routes_json = 1;
 }
 
 message PoliciesUpdate {

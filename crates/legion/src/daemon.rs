@@ -29,6 +29,8 @@ pub struct Options {
     pub metrics_listen: Option<SocketAddr>,
     /// Managers: the floating address.
     pub vip: Option<legion_manager::vip::VipConfig>,
+    /// Where the ingress proxy listens, if anywhere.
+    pub ingress_listen: Option<SocketAddr>,
 }
 
 pub async fn run(opts: Options) -> anyhow::Result<()> {
@@ -252,6 +254,7 @@ async fn start_agent(
         config.infra_image = image.clone();
     }
     config.zfs_root = opts.zfs_root.clone();
+    config.ingress = opts.ingress_listen;
     config.wireguard = Some(WireGuardConfig {
         key_file: opts.data_dir.join("wireguard.key"),
         port: legion_net::mesh::PORT,

@@ -25,6 +25,7 @@ pub mod control;
 pub mod fake;
 mod files;
 pub mod hook;
+pub mod ingress;
 pub mod metrics;
 mod output;
 pub mod pod;
@@ -77,6 +78,8 @@ pub struct AgentConfig {
     /// How often heartbeats carry what the node's tasks use, for the
     /// autoscaler.
     pub usage_period: Duration,
+    /// Where the ingress proxy listens for HTTP, if anywhere.
+    pub ingress: Option<std::net::SocketAddr>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +102,7 @@ impl AgentConfig {
             wireguard: None,
             drain: Duration::from_secs(2),
             usage_period: Duration::from_secs(15),
+            ingress: None,
         }
     }
 }
@@ -107,6 +111,7 @@ pub struct Agent<R, C> {
     ctx: Ctx<R, C>,
     resync: Duration,
     usage_period: Duration,
+    ingress: Option<std::net::SocketAddr>,
     wireguard: Option<WireGuardConfig>,
 }
 
@@ -134,6 +139,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             },
             resync: config.resync,
             usage_period: config.usage_period,
+            ingress: config.ingress,
             wireguard: config.wireguard,
         }
     }
@@ -240,6 +246,23 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             _ => None,
         };
         let endpoints = ctx.control.endpoints();
+        let ingress = match self.ingress {
+            Some(addr) => match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    tracing::info!(%addr, "ingress proxy listening");
+                    Some(tokio::spawn(ingress::serve(
+                        listener,
+                        ctx.control.routes(),
+                        endpoints.clone(),
+                    )))
+                }
+                Err(e) => {
+                    tracing::error!(%addr, "ingress proxy: {e}; routes go unserved here");
+                    None
+                }
+            },
+            None => None,
+        };
         let dns = dns(endpoints.clone(), gateway).await;
         let lb = tokio::spawn(load_balancing(
             ctx.sys.clone(),
@@ -257,11 +280,17 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 tracing::warn!("assignments ended");
                 heartbeats.abort();
                 sessions.abort();
+                if let Some(i) = &ingress {
+                    i.abort();
+                }
                 return;
             },
             _ = &mut shutdown => {
                 heartbeats.abort();
                 sessions.abort();
+                if let Some(i) = &ingress {
+                    i.abort();
+                }
                 return;
             }
         }
@@ -346,6 +375,9 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         forwarder.abort();
         heartbeats.abort();
         sessions.abort();
+        if let Some(i) = ingress {
+            i.abort();
+        }
         if let Some(dns) = dns {
             dns.abort();
         }

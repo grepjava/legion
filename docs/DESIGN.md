@@ -492,7 +492,7 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
 | Network policy | Ingress and egress rules by namespace, label and port; compiled to pf. | 3 |
 | Disruption budgets | `maxUnavailable` on the service, honoured by drain and updates. | 3 |
 | Stateful services | `mode: stateful`: stable names `<svc>-<n>`, per-ordinal ZFS volumes from claims, ordered rollout (3.3). Data moves between nodes with `zfs send/recv`. | 4 |
-| Ingress | A system global service running haproxy, configured from routes Legion renders from service labels. | 4 |
+| Ingress | `Route` objects (host, path prefix, service, port) served by an HTTP proxy in every agent that enables it (5.8). | 4 |
 | Autoscaling | CPU and memory targets read from rctl; no separate metrics server. Every 15 s an agent's heartbeat carries what each running task's app containers use together (rctl `pcpu` and `memoryuse`); the leader keeps the reports in memory for a minute, believing each only from the task's own node. Each pass, a service with `autoscale` wants `ceil(measured × use / target)` replicas over its ready tasks with a report, for the target asking most, between `min` and `max`, and keeps its count while use is within a tenth of every target; ready tasks without a report count as idle for growing and on target for shrinking. Passes are far more frequent than reports, so the count follows from the reports alone. It grows at once and shrinks only to the most recommended over the last `downDelay` (5 min); a new leader waits that long before shrinking. Admission needs a target, `1 ≤ min ≤ max`, and every container requesting what a target measures; quotas count `max` tasks, so the service fits whatever it scales to. | 4 |
 | `apply` / `diff` | Server-side apply with field ownership kept simple: last applier wins per object. | 1 |
 | `logs`, `exec`, `port-forward` | Streamed through the manager to the agent, under RBAC (3.8). | 3 |
@@ -732,6 +732,34 @@ over TCP.
 
 Dual-stack is planned for phase 5. The model (per-node prefix, WireGuard
 routing, pf tables) carries over unchanged.
+
+### 5.8 Ingress
+
+HTTP routing by host and path. Earlier drafts planned a system global
+service running haproxy from rendered routes; the agent proxies itself
+instead, with the hyper it already has, so no image has to reach every
+node and routes change without reloads.
+
+- **`Route`** (namespaced): `host` (lower case; `*.example.org` takes any
+  one label in front), `path` (a prefix of whole segments, `/` by
+  default; `/shop` takes `/shop/cart`, not `/shopping`), `service` (of the
+  route's namespace) and `port` (the service's port, needed when it has
+  more than one TCP port).
+- **Every node that enables it** (`legion daemon --ingress-listen
+  0.0.0.0:80`) runs the proxy. The dispatcher streams every route to the
+  agents (`Routes`), beside the endpoints they already follow. A request
+  goes to the route matching its `Host` (port dropped, case ignored) with
+  the longest path, an exact host before a wildcard; then to the next of
+  the service's ready tasks in turn, at the task's address and target
+  port, which the node reaches directly (nodes may reach every pod, 5.6).
+  So, unlike the routing mesh, there is no NAT: the backend sees the
+  node, and the client in `X-Forwarded-For` (with `X-Forwarded-Host` and
+  `-Proto`). Upgrades such as WebSocket pass through. No route: 404; no
+  ready task: 503; a task that does not answer: 502 (504 after 5 s).
+- **Not yet:** TLS termination (a Route naming a Secret with the
+  certificate, served by SNI; the dispatcher would have to deliver those
+  Secrets to ingress nodes), HTTP/2, connection reuse to backends,
+  retries on another task.
 
 ---
 

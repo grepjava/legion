@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use legion_api::data::DataSpec;
 use legion_api::dispatch::{
-    Assignment, Assignments, EndpointPort, Endpoints, NamespacedPolicy, Peer, Peers, Policies,
-    ServiceEndpoints, VolumeClaim,
+    Assignment, Assignments, EndpointPort, Endpoints, NamespacedPolicy, NamespacedRoute, Peer,
+    Peers, Policies, Routes, ServiceEndpoints, VolumeClaim,
 };
 use legion_api::node::{NodeSpec, NodeState, NodeStatus};
 use legion_api::service::{PortRef, ServiceSpec, ServiceStatus};
@@ -33,7 +33,8 @@ use legion_proto::v1::{
     AssignmentsRequest, AssignmentsUpdate, ClaimVolumeRequest, ClaimVolumeResponse, DataRequest,
     DataResponse, EndpointsRequest, EndpointsUpdate, HeartbeatRequest, HeartbeatResponse,
     PeersRequest, PeersUpdate, PoliciesRequest, PoliciesUpdate, RegisterRequest, RegisterResponse,
-    ReportRequest, ReportResponse, SessionFrame, SessionOffer, SessionsRequest,
+    ReportRequest, ReportResponse, RoutesRequest, RoutesUpdate, SessionFrame, SessionOffer,
+    SessionsRequest,
 };
 use legion_store::{Command, Event, Outcome, Precondition, Store, WatchError};
 use tokio::sync::watch;
@@ -69,6 +70,8 @@ pub(crate) struct DispatcherService {
     peers: watch::Receiver<Option<Peers>>,
     /// Isolation and network policies, once first listed.
     policies: watch::Receiver<Option<Policies>>,
+    /// Every route, once first listed.
+    routes: watch::Receiver<Option<Routes>>,
 }
 
 impl DispatcherService {
@@ -82,6 +85,7 @@ impl DispatcherService {
         let (endpoints_tx, endpoints) = watch::channel(None);
         let (peers_tx, peers) = watch::channel(None);
         let (policies_tx, policies) = watch::channel(None);
+        let (routes_tx, routes) = watch::channel(None);
         let service = DispatcherService {
             tls,
             period,
@@ -89,6 +93,7 @@ impl DispatcherService {
             endpoints,
             peers,
             policies,
+            routes,
             api,
         };
         let follow = tokio::spawn(follow_cluster(
@@ -97,6 +102,7 @@ impl DispatcherService {
                 endpoints: endpoints_tx,
                 peers: peers_tx,
                 policies: policies_tx,
+                routes: routes_tx,
             },
             service.api.closing.clone(),
         ));
@@ -518,6 +524,22 @@ impl Dispatcher for DispatcherService {
         })))
     }
 
+    type RoutesStream = ReceiverStream<Result<RoutesUpdate, Status>>;
+
+    async fn routes(
+        &self,
+        req: Request<RoutesRequest>,
+    ) -> Result<Response<Self::RoutesStream>, Status> {
+        self.node(&req, &req.get_ref().node)?;
+        let mut rx = self.routes.clone();
+        rx.mark_changed();
+        Ok(Response::new(stream(&self.api.closing, rx, |set| {
+            RoutesUpdate {
+                routes_json: serde_json::to_vec(set).expect("routes serialize"),
+            }
+        })))
+    }
+
     async fn report(
         &self,
         req: Request<ReportRequest>,
@@ -785,15 +807,17 @@ struct Followed {
     endpoints: watch::Sender<Option<Endpoints>>,
     peers: watch::Sender<Option<Peers>>,
     policies: watch::Sender<Option<Policies>>,
+    routes: watch::Sender<Option<Routes>>,
 }
 
 /// The kinds [`follow_cluster`] keeps, by key.
-const FOLLOWED: [Kind; 5] = [
+const FOLLOWED: [Kind; 6] = [
     Kind::Service,
     Kind::Task,
     Kind::Node,
     Kind::Namespace,
     Kind::NetworkPolicy,
+    Kind::Route,
 ];
 
 async fn follow_cluster(store: Store, out: Followed, mut closing: watch::Receiver<bool>) {
@@ -826,6 +850,9 @@ async fn follow_cluster(store: Store, out: Followed, mut closing: watch::Receive
                 Kind::Node => out
                     .peers
                     .send_if_modified(|old| replace(old, Some(&peers(of(Kind::Node))))),
+                Kind::Route => out
+                    .routes
+                    .send_if_modified(|old| replace(old, Some(&routes(of(Kind::Route))))),
                 Kind::Namespace | Kind::NetworkPolicy => out.policies.send_if_modified(|old| {
                     replace(
                         old,
@@ -837,7 +864,7 @@ async fn follow_cluster(store: Store, out: Followed, mut closing: watch::Receive
                 }),
             }
         };
-        for kind in [Kind::Service, Kind::Node, Kind::Namespace] {
+        for kind in [Kind::Service, Kind::Node, Kind::Namespace, Kind::Route] {
             publish(&objects, kind);
         }
         let mut watcher = match store.watch(since, None) {
@@ -871,6 +898,19 @@ async fn follow_cluster(store: Store, out: Followed, mut closing: watch::Receive
             publish(&objects, kind);
         }
     }
+}
+
+fn routes(routes: &BTreeMap<ObjectKey, Object>) -> Routes {
+    routes
+        .values()
+        .filter_map(|r| {
+            Some(NamespacedRoute {
+                namespace: r.metadata.namespace.clone(),
+                name: r.metadata.name.clone(),
+                spec: legion_api::parse(&r.spec).ok()?,
+            })
+        })
+        .collect()
 }
 
 /// Namespaces' isolation, where it is not the default, and every policy.

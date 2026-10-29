@@ -710,3 +710,33 @@ async fn a_volume_moves_to_the_node_it_is_asked_to_be_on() {
     .await;
     c.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nodes_follow_the_routes() {
+    use legion_agent::Control;
+    let c = Cluster::start(1).await;
+    let control = GrpcControl::new("n1", vec![c.addr.clone()], None).unwrap();
+    let mut routes = control.routes();
+    let route = r#"
+apiVersion: legion/v1
+kind: Route
+metadata: { name: www, namespace: shop }
+spec: { host: shop.example.org, path: /cart/, service: web }
+"#;
+    c.apply(route).await;
+    eventually("the route on the node", async || {
+        let r = routes.borrow_and_update().clone();
+        r.len() == 1 && r[0].namespace == "shop" && r[0].spec.path == "/cart"
+    })
+    .await;
+    c.apply(&route.replace("service: web", "service: api"))
+        .await;
+    eventually("the change on the node", async || {
+        routes
+            .borrow()
+            .first()
+            .is_some_and(|r| r.spec.service == "api")
+    })
+    .await;
+    c.stop().await;
+}

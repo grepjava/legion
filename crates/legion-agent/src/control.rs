@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use legion_api::dispatch::TaskUsage;
 pub use legion_api::dispatch::{
-    Assignment, Assignments, EndpointPort, Endpoints, Peer, Peers, Policies, ServiceEndpoints,
-    VolumeClaim,
+    Assignment, Assignments, EndpointPort, Endpoints, Peer, Peers, Policies, Routes,
+    ServiceEndpoints, VolumeClaim,
 };
 use legion_api::node::NodeStatus;
 use legion_api::task::TaskStatus;
@@ -20,8 +20,8 @@ use legion_api::{Kind, ObjectKey};
 use legion_proto::v1::dispatcher_client::DispatcherClient;
 use legion_proto::v1::{
     AssignmentsRequest, ClaimVolumeRequest, DataRequest, EndpointsRequest, HeartbeatRequest,
-    PeersRequest, PoliciesRequest, RegisterRequest, ReportRequest, SessionFrame, SessionOffer,
-    SessionsRequest,
+    PeersRequest, PoliciesRequest, RegisterRequest, ReportRequest, RoutesRequest, SessionFrame,
+    SessionOffer, SessionsRequest,
 };
 use legion_sys::Ipv4Net;
 use tokio::sync::{mpsc, watch};
@@ -69,6 +69,10 @@ pub trait Control: Send + Sync + 'static {
     /// Namespaces' isolation and every network policy, kept current; `None`
     /// until first known.
     fn policies(&self) -> watch::Receiver<Option<Policies>>;
+
+    /// Every route, for the ingress proxy, kept current; empty until
+    /// first known.
+    fn routes(&self) -> watch::Receiver<Routes>;
 
     /// Writes a task's status. A task that is gone, or was replaced by one
     /// with another uid, is ignored.
@@ -529,6 +533,21 @@ impl Control for GrpcControl {
                 async move { c.policies(PoliciesRequest { node }).await }
             },
             |m: legion_proto::v1::PoliciesUpdate| decode(&m.policies_json).map(Some),
+            publish_changed,
+        ));
+        rx
+    }
+
+    fn routes(&self) -> watch::Receiver<Routes> {
+        let (tx, rx) = watch::channel(Routes::new());
+        let node = self.node.clone();
+        tokio::spawn(self.clone().follow(
+            tx,
+            move |mut c| {
+                let node = node.clone();
+                async move { c.routes(RoutesRequest { node }).await }
+            },
+            |m: legion_proto::v1::RoutesUpdate| decode(&m.routes_json),
             publish_changed,
         ));
         rx
