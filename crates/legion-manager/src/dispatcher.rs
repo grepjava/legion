@@ -181,6 +181,19 @@ impl DispatcherService {
             .collect())
     }
 
+    /// Whether a route of `namespace` serves HTTPS with Secret `name`: any
+    /// node's ingress proxy may need it.
+    fn route_certificate(&self, namespace: &str, name: &str) -> Result<bool, Status> {
+        Ok(self
+            .store()
+            .list(Kind::Route, Some(namespace))
+            .map_err(internal)?
+            .objects
+            .iter()
+            .filter_map(|o| legion_api::parse::<legion_api::route::RouteSpec>(&o.spec).ok())
+            .any(|r| r.tls.is_some_and(|t| t.secret == name)))
+    }
+
     fn managers(&self) -> Vec<String> {
         let m = self.store().raft.metrics().borrow().clone();
         m.membership_config
@@ -590,6 +603,7 @@ impl Dispatcher for DispatcherService {
             .tasks_of(&node, &r.namespace)?
             .iter()
             .any(|a| a.spec.pod.data_refs().contains(&wanted))
+            && !(kind == Kind::Secret && self.route_certificate(&r.namespace, &r.name)?)
         {
             return Err(Status::permission_denied(format!(
                 "no task of node {node} uses {} {}/{}",

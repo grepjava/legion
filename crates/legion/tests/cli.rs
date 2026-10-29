@@ -1,7 +1,7 @@
 //! Runs the real binary: a daemon plus CLI commands against it.
 
 use std::net::TcpListener;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant};
 
 const LEGION: &str = env!("CARGO_BIN_EXE_legion");
@@ -44,11 +44,18 @@ fn start_daemon() -> Daemon {
 }
 
 fn start_daemon_in(dir: tempfile::TempDir, server: String) -> Daemon {
+    // Appended to across restarts, and shown if the daemon does not come up.
+    let log_path = dir.path().join("daemon.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .unwrap();
     let child = Command::new(LEGION)
         .args(["daemon", "--no-agent", "--listen", &server, "--data-dir"])
         .arg(dir.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
         .spawn()
         .unwrap();
     let daemon = Daemon {
@@ -56,9 +63,23 @@ fn start_daemon_in(dir: tempfile::TempDir, server: String) -> Daemon {
         server,
         _dir: dir,
     };
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // Generous: the first start of a freshly built binary can be slow (on
+    // Windows, while it is scanned).
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !legion(&daemon, &["status"]).status.success() {
-        assert!(Instant::now() < deadline, "daemon did not come up");
+        if Instant::now() >= deadline {
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let tail: Vec<&str> = log.lines().rev().take(30).collect();
+            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            panic!(
+                "daemon did not come up:
+{}",
+                tail.join(
+                    "
+"
+                )
+            );
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
     daemon

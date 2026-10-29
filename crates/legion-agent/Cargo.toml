@@ -14,6 +14,7 @@ http.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["client", "server", "http1"] }
 hyper-util = { workspace = true, features = ["tokio"] }
+tokio-rustls.workspace = true
 legion-api.workspace = true
 legion-net.workspace = true
 legion-podman.workspace = true
@@ -29,6 +30,7 @@ tonic-health.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 legion-manager.workspace = true
 legion-store.workspace = true
 openraft.workspace = true

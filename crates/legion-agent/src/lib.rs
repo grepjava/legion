@@ -80,6 +80,8 @@ pub struct AgentConfig {
     pub usage_period: Duration,
     /// Where the ingress proxy listens for HTTP, if anywhere.
     pub ingress: Option<std::net::SocketAddr>,
+    /// Where it listens for HTTPS, for routes with `tls`, if anywhere.
+    pub ingress_tls: Option<std::net::SocketAddr>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +105,7 @@ impl AgentConfig {
             drain: Duration::from_secs(2),
             usage_period: Duration::from_secs(15),
             ingress: None,
+            ingress_tls: None,
         }
     }
 }
@@ -112,6 +115,7 @@ pub struct Agent<R, C> {
     resync: Duration,
     usage_period: Duration,
     ingress: Option<std::net::SocketAddr>,
+    ingress_tls: Option<std::net::SocketAddr>,
     wireguard: Option<WireGuardConfig>,
 }
 
@@ -140,6 +144,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             resync: config.resync,
             usage_period: config.usage_period,
             ingress: config.ingress,
+            ingress_tls: config.ingress_tls,
             wireguard: config.wireguard,
         }
     }
@@ -246,23 +251,50 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             _ => None,
         };
         let endpoints = ctx.control.endpoints();
-        let ingress = match self.ingress {
-            Some(addr) => match tokio::net::TcpListener::bind(addr).await {
-                Ok(listener) => {
-                    tracing::info!(%addr, "ingress proxy listening");
-                    Some(tokio::spawn(ingress::serve(
+        let mut ingress = Vec::new();
+        if self.ingress.is_some() || self.ingress_tls.is_some() {
+            let routes = ctx.control.routes();
+            for (addr, https) in [(self.ingress, false), (self.ingress_tls, true)] {
+                let Some(addr) = addr else { continue };
+                let listener = match tokio::net::TcpListener::bind(addr).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::error!(%addr, "ingress proxy: {e}; routes go unserved here");
+                        continue;
+                    }
+                };
+                tracing::info!(%addr, https, "ingress proxy listening");
+                if !https {
+                    ingress.push(tokio::spawn(ingress::serve(
                         listener,
-                        ctx.control.routes(),
+                        routes.clone(),
                         endpoints.clone(),
-                    )))
+                    )));
+                    continue;
                 }
-                Err(e) => {
-                    tracing::error!(%addr, "ingress proxy: {e}; routes go unserved here");
-                    None
-                }
-            },
-            None => None,
-        };
+                let certificates: Arc<ingress::Certificates> = Arc::default();
+                let control = ctx.control.clone();
+                ingress.push(tokio::spawn(ingress::follow_certificates(
+                    routes.clone(),
+                    certificates.clone(),
+                    move |namespace, name| {
+                        let control = control.clone();
+                        async move {
+                            control
+                                .data(&namespace, legion_api::Kind::Secret, &name)
+                                .await
+                                .map_err(|e| e.to_string())
+                        }
+                    },
+                )));
+                ingress.push(tokio::spawn(ingress::serve_tls(
+                    listener,
+                    routes.clone(),
+                    endpoints.clone(),
+                    certificates,
+                )));
+            }
+        }
         let dns = dns(endpoints.clone(), gateway).await;
         let lb = tokio::spawn(load_balancing(
             ctx.sys.clone(),
@@ -280,7 +312,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 tracing::warn!("assignments ended");
                 heartbeats.abort();
                 sessions.abort();
-                if let Some(i) = &ingress {
+                for i in &ingress {
                     i.abort();
                 }
                 return;
@@ -288,7 +320,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             _ = &mut shutdown => {
                 heartbeats.abort();
                 sessions.abort();
-                if let Some(i) = &ingress {
+                for i in &ingress {
                     i.abort();
                 }
                 return;
@@ -375,7 +407,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         forwarder.abort();
         heartbeats.abort();
         sessions.abort();
-        if let Some(i) = ingress {
+        for i in ingress {
             i.abort();
         }
         if let Some(dns) = dns {

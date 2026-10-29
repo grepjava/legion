@@ -756,10 +756,19 @@ node and routes change without reloads.
   node, and the client in `X-Forwarded-For` (with `X-Forwarded-Host` and
   `-Proto`). Upgrades such as WebSocket pass through. No route: 404; no
   ready task: 503; a task that does not answer: 502 (504 after 5 s).
-- **Not yet:** TLS termination (a Route naming a Secret with the
-  certificate, served by SNI; the dispatcher would have to deliver those
-  Secrets to ingress nodes), HTTP/2, connection reuse to backends,
-  retries on another task.
+- **HTTPS** (`--ingress-tls-listen 0.0.0.0:443`): a route with `tls: {
+  secret }` names a Secret of its namespace holding the certificate chain
+  and its private key in PEM. Every node may read such a Secret (the
+  dispatcher allows a Secret that a route names as well as those its
+  tasks use), as any node may serve the route. The proxy chooses the
+  certificate by SNI, an exact host before a `*.` one, and reads the
+  Secrets again when routes change and every minute, so a renewed
+  certificate takes over; one that cannot be read or parsed keeps the
+  last good one. A host without a certificate fails the handshake. The
+  backend gets `X-Forwarded-Proto: https`. Plain HTTP still serves the
+  route; redirecting it is left to the backend.
+- **Not yet:** HTTP/2, connection reuse to backends, retries on another
+  task, certificates from ACME.
 
 ---
 

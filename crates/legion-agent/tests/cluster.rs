@@ -740,3 +740,34 @@ spec: { host: shop.example.org, path: /cart/, service: web }
     .await;
     c.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn any_node_reads_the_certificates_of_routes_but_no_other_secret() {
+    use legion_agent::Control;
+    let c = Cluster::start(1).await;
+    for (name, text) in [("www-cert", "PEM"), ("db-password", "hunter2")] {
+        c.apply(&format!(
+            "apiVersion: legion/v1\nkind: Secret\nmetadata: {{ name: {name}, namespace: shop }}\nspec: {{ text: {text} }}\n"
+        ))
+        .await;
+    }
+    c.apply(
+        "apiVersion: legion/v1\nkind: Route\nmetadata: { name: www, namespace: shop }\n\
+         spec: { host: shop.example.org, service: web, tls: { secret: www-cert } }\n",
+    )
+    .await;
+    let control = GrpcControl::new("n1", vec![c.addr.clone()], None).unwrap();
+    let cert = control
+        .data("shop", Kind::Secret, "www-cert")
+        .await
+        .unwrap();
+    assert_eq!(cert.as_deref(), Some(&b"PEM"[..]));
+    assert!(
+        control
+            .data("shop", Kind::Secret, "db-password")
+            .await
+            .is_err(),
+        "no task here uses it"
+    );
+    c.stop().await;
+}

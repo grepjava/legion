@@ -27,6 +27,7 @@ const LEGION: &str = env!("CARGO_BIN_EXE_legion");
 const SERVER: &str = "127.0.0.1:7471";
 const METRICS: &str = "127.0.0.1:7472";
 const INGRESS: &str = "127.0.0.1:7473";
+const INGRESS_TLS: &str = "127.0.0.1:7474";
 
 struct Lab {
     dir: PathBuf,
@@ -45,6 +46,7 @@ impl Lab {
             .args(["daemon", "--listen", SERVER, "--zfs-root", &self.zfs_root])
             .args(["--metrics-listen", METRICS])
             .args(["--ingress-listen", INGRESS])
+            .args(["--ingress-tls-listen", INGRESS_TLS])
             .arg("--data-dir")
             .arg(self.dir.join("data"))
             .arg("--run-dir")
@@ -366,6 +368,39 @@ fn app_survives_failures() {
         get_host(INGRESS, "other.example.org", "/healthz").map(|r| r.0),
         Some(404)
     );
+
+    // With a certificate in a Secret, the route answers HTTPS too, checked
+    // against that certificate.
+    let (cert, key) = (lab.dir.join("www.crt"), lab.dir.join("www.key"));
+    sh(&format!(
+        "openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
+         -subj /CN=shop.example.org -addext subjectAltName=DNS:shop.example.org \
+         -keyout {} -out {} 2>/dev/null",
+        key.display(),
+        cert.display()
+    ));
+    let pem = std::fs::read_to_string(&cert).unwrap() + &std::fs::read_to_string(&key).unwrap();
+    let indented: String = pem.lines().map(|l| format!("    {l}\n")).collect();
+    std::fs::write(
+        &route,
+        format!(
+            "apiVersion: legion/v1\nkind: Secret\nmetadata: {{ name: www-cert, namespace: shop }}\n\
+             spec:\n  text: |\n{indented}---\n\
+             apiVersion: legion/v1\nkind: Route\nmetadata: {{ name: www, namespace: shop }}\n\
+             spec: {{ host: shop.example.org, service: web, tls: {{ secret: www-cert }} }}\n"
+        ),
+    )
+    .unwrap();
+    ok(&["apply", "-f", route.to_str().unwrap()]);
+    let https = || {
+        sh(&format!(
+            "printf 'GET /healthz HTTP/1.0\\r\\nHost: shop.example.org\\r\\n\\r\\n' | \
+             openssl s_client -quiet -connect {INGRESS_TLS} -servername shop.example.org \
+             -verify_return_error -CAfile {} 2>/dev/null",
+            cert.display()
+        ))
+    };
+    wait("HTTPS on the route", 30, || https().contains("\r\n\r\nok"));
 
     // Sessions through the manager. Exec passes output, exit code and,
     // with -i, stdin; with -t the command gets a terminal (script(1) gives

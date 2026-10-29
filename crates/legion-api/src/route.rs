@@ -20,6 +20,17 @@ pub struct RouteSpec {
     /// The service's port, needed when it has more than one TCP port.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// HTTPS for the host, with the certificate in a Secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<RouteTls>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RouteTls {
+    /// A Secret of the route's namespace holding, in PEM, the certificate
+    /// chain for the host and its private key. Every node may read it.
+    pub secret: String,
 }
 
 fn root() -> String {
@@ -52,6 +63,9 @@ impl Spec for RouteSpec {
         check_name("service", &self.service)?;
         if self.port == Some(0) {
             return Err(Invalid::new("port", "a port above 0"));
+        }
+        if let Some(tls) = &self.tls {
+            check_name("tls.secret", &tls.secret)?;
         }
         Ok(())
     }
@@ -93,6 +107,7 @@ mod tests {
             path: path.into(),
             service: "web".into(),
             port: None,
+            tls: None,
         };
         r.admit().unwrap();
         r
@@ -128,6 +143,7 @@ mod tests {
                 path: path.into(),
                 service: "web".into(),
                 port: None,
+                tls: None,
             };
             assert!(r.admit().is_err(), "{host} {path}");
         }

@@ -4,11 +4,16 @@
 //! longest path prefix, an exact host before a wildcard; tasks take turns.
 //! The backend sees the client in `X-Forwarded-For`. Upgrades (WebSocket)
 //! pass through.
+//!
+//! HTTPS serves the hosts of routes with `tls`, each with the certificate
+//! in its Secret, chosen by SNI; the Secrets are read again when routes
+//! change and every minute, so renewed certificates take over.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -21,28 +26,63 @@ use legion_api::dispatch::{Endpoints, Routes};
 use legion_api::service::Protocol;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::pki_types::pem::PemObject;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert};
+use tokio_rustls::rustls::sign::CertifiedKey;
 
 type Body = BoxBody<Bytes, hyper::Error>;
 
 /// How long a backend has to accept the connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often the routes' certificates are read again.
+const CERTIFICATES_PERIOD: Duration = Duration::from_secs(60);
+
 struct Proxy {
     routes: watch::Receiver<Routes>,
     endpoints: watch::Receiver<Endpoints>,
     turn: AtomicUsize,
+    https: bool,
 }
 
-/// Serves `listener` until the task is dropped.
+/// Serves HTTP on `listener` until the task is dropped.
 pub async fn serve(
     listener: TcpListener,
     routes: watch::Receiver<Routes>,
     endpoints: watch::Receiver<Endpoints>,
 ) {
+    run(listener, routes, endpoints, None).await
+}
+
+/// Serves HTTPS on `listener`, with the certificates `certificates` holds.
+pub async fn serve_tls(
+    listener: TcpListener,
+    routes: watch::Receiver<Routes>,
+    endpoints: watch::Receiver<Endpoints>,
+    certificates: Arc<Certificates>,
+) {
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(certificates);
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    run(listener, routes, endpoints, Some(acceptor)).await
+}
+
+async fn run(
+    listener: TcpListener,
+    routes: watch::Receiver<Routes>,
+    endpoints: watch::Receiver<Endpoints>,
+    tls: Option<TlsAcceptor>,
+) {
     let proxy = Arc::new(Proxy {
         routes,
         endpoints,
         turn: AtomicUsize::new(0),
+        https: tls.is_some(),
     });
     loop {
         let (stream, client) = match listener.accept().await {
@@ -53,19 +93,126 @@ pub async fn serve(
                 continue;
             }
         };
-        let proxy = proxy.clone();
+        let (proxy, tls) = (proxy.clone(), tls.clone());
         tokio::spawn(async move {
-            let service = hyper::service::service_fn(move |req| {
-                let proxy = proxy.clone();
-                async move { Ok::<_, Infallible>(proxy.handle(req, client).await) }
-            });
-            let conn = hyper::server::conn::http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), service)
-                .with_upgrades();
-            if let Err(e) = conn.await {
-                tracing::debug!(%client, "ingress connection: {e}");
+            match tls {
+                None => connection(stream, proxy, client).await,
+                Some(acceptor) => match acceptor.accept(stream).await {
+                    Ok(stream) => connection(stream, proxy, client).await,
+                    Err(e) => tracing::debug!(%client, "ingress TLS handshake: {e}"),
+                },
             }
         });
+    }
+}
+
+async fn connection<IO>(io: IO, proxy: Arc<Proxy>, client: SocketAddr)
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let service = hyper::service::service_fn(move |req| {
+        let proxy = proxy.clone();
+        async move { Ok::<_, Infallible>(proxy.handle(req, client).await) }
+    });
+    let conn = hyper::server::conn::http1::Builder::new()
+        .serve_connection(TokioIo::new(io), service)
+        .with_upgrades();
+    if let Err(e) = conn.await {
+        tracing::debug!(%client, "ingress connection: {e}");
+    }
+}
+
+/// The certificates of routes with `tls`, by host as the routes give it
+/// (`*.example.org` included), chosen by the client's SNI.
+#[derive(Debug, Default)]
+pub struct Certificates {
+    by_host: RwLock<BTreeMap<String, Arc<CertifiedKey>>>,
+}
+
+impl Certificates {
+    /// Parses `pem`, a certificate chain and its private key, for `host`.
+    pub fn set(&self, host: &str, pem: &[u8]) -> Result<(), String> {
+        let certs = CertificateDer::pem_slice_iter(pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("certificates: {e}"))?;
+        if certs.is_empty() {
+            return Err("no certificate in the PEM".into());
+        }
+        let key = PrivateKeyDer::from_pem_slice(pem).map_err(|e| format!("private key: {e}"))?;
+        let key = tokio_rustls::rustls::crypto::ring::sign::any_supported_type(&key)
+            .map_err(|e| format!("private key: {e}"))?;
+        let certified = CertifiedKey::new(certs, key);
+        certified
+            .keys_match()
+            .map_err(|e| format!("the key is not the certificate's: {e}"))?;
+        self.by_host
+            .write()
+            .unwrap()
+            .insert(host.to_owned(), Arc::new(certified));
+        Ok(())
+    }
+
+    /// Drops the certificates of hosts not in `hosts`.
+    pub fn retain(&self, hosts: &BTreeSet<String>) {
+        self.by_host
+            .write()
+            .unwrap()
+            .retain(|h, _| hosts.contains(h));
+    }
+
+    fn get(&self, sni: &str) -> Option<Arc<CertifiedKey>> {
+        let by_host = self.by_host.read().unwrap();
+        let sni = sni.to_ascii_lowercase();
+        by_host.get(&sni).cloned().or_else(|| {
+            let (_, domain) = sni.split_once('.')?;
+            by_host.get(&format!("*.{domain}")).cloned()
+        })
+    }
+}
+
+impl ResolvesServerCert for Certificates {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.get(hello.server_name()?)
+    }
+}
+
+/// Keeps `certificates` holding those of the routes' Secrets, read with
+/// `read` (namespace, name) when routes change and every
+/// [`CERTIFICATES_PERIOD`]. One that cannot be read keeps what was read
+/// before.
+pub async fn follow_certificates<F, Fut>(
+    mut routes: watch::Receiver<Routes>,
+    certificates: Arc<Certificates>,
+    read: F,
+) where
+    F: Fn(String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Vec<u8>>, String>>,
+{
+    loop {
+        let wanted: Vec<(String, String, String)> = routes
+            .borrow_and_update()
+            .iter()
+            .filter_map(|r| {
+                let tls = r.spec.tls.as_ref()?;
+                Some((r.spec.host.clone(), r.namespace.clone(), tls.secret.clone()))
+            })
+            .collect();
+        certificates.retain(&wanted.iter().map(|(h, _, _)| h.clone()).collect());
+        for (host, namespace, secret) in wanted {
+            let outcome = match read(namespace.clone(), secret.clone()).await {
+                Ok(Some(pem)) => certificates.set(&host, &pem),
+                Ok(None) => Err("no such Secret".into()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = outcome {
+                let secret = format!("{namespace}/{secret}");
+                tracing::warn!(%host, %secret, "route certificate: {e}");
+            }
+        }
+        tokio::select! {
+            changed = routes.changed() => if changed.is_err() { return },
+            _ = tokio::time::sleep(CERTIFICATES_PERIOD) => {}
+        }
     }
 }
 
@@ -153,7 +300,8 @@ impl Proxy {
         if let Ok(v) = HeaderValue::from_str(&host) {
             headers.insert("x-forwarded-host", v);
         }
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        let proto = if self.https { "https" } else { "http" };
+        headers.insert("x-forwarded-proto", HeaderValue::from_static(proto));
         // Only the path goes on to the backend.
         if let Some(pq) = req.uri().path_and_query().cloned() {
             *req.uri_mut() = pq.as_str().parse().expect("a path and query parse");
@@ -253,6 +401,7 @@ mod tests {
                 path: path.into(),
                 service: service.into(),
                 port: None,
+                tls: None,
             },
         }
     }
@@ -426,5 +575,169 @@ mod tests {
         let mut got = [0u8; 4];
         io.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"ping");
+    }
+
+    /// A self-signed certificate for `names`, with its key, in PEM.
+    fn certificate(names: &[&str]) -> (String, CertificateDer<'static>) {
+        let names: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
+        let c = rcgen::generate_simple_self_signed(names).unwrap();
+        let pem = format!("{}{}", c.cert.pem(), c.signing_key.serialize_pem());
+        (pem, c.cert.der().clone())
+    }
+
+    /// The certificate the proxy shows for `sni`, and the response to a GET.
+    async fn get_tls(
+        proxy: SocketAddr,
+        sni: &str,
+        trusted: &[CertificateDer<'static>],
+    ) -> Result<String, String> {
+        use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
+        let mut roots = RootCertStore::empty();
+        for c in trusted {
+            roots.add(c.clone()).unwrap();
+        }
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let tcp = TcpStream::connect(proxy).await.unwrap();
+        let name = ServerName::try_from(sni.to_owned()).unwrap();
+        let tls = connector
+            .connect(name, tcp)
+            .await
+            .map_err(|e| e.to_string())?;
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+            .await
+            .map_err(|e| e.to_string())?;
+        tokio::spawn(conn);
+        let req = Request::get("/")
+            .header(HOST, sni)
+            .header("x-forwarded-proto", "made-up")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = sender.send_request(req).await.map_err(|e| e.to_string())?;
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        Ok(String::from_utf8_lossy(&body).trim().to_owned())
+    }
+
+    #[tokio::test]
+    async fn https_with_each_route_certificate() {
+        let web = backend("web").await;
+        let mut shop = route("www", "shop.example.org", "/", "web");
+        shop.spec.tls = Some(legion_api::route::RouteTls {
+            secret: "shop-cert".into(),
+        });
+        let mut any = route("any", "*.example.org", "/", "web");
+        any.spec.tls = Some(legion_api::route::RouteTls {
+            secret: "wild-cert".into(),
+        });
+        let (routes_tx, routes) = watch::channel(vec![shop, any]);
+        let (_endpoints_tx, endpoints) =
+            watch::channel(vec![service("web", web, vec![Ipv4Addr::LOCALHOST])]);
+        let (shop_pem, shop_der) = certificate(&["shop.example.org"]);
+        let (wild_pem, wild_der) = certificate(&["*.example.org"]);
+        let secrets = Arc::new(std::sync::Mutex::new(BTreeMap::from([
+            ("shop-cert".to_owned(), shop_pem.into_bytes()),
+            ("wild-cert".to_owned(), wild_pem.into_bytes()),
+            ("broken".to_owned(), b"not PEM".to_vec()),
+        ])));
+        let certificates: Arc<Certificates> = Arc::default();
+        let read = {
+            let secrets = secrets.clone();
+            move |namespace: String, name: String| {
+                let found = secrets.lock().unwrap().get(&name).cloned();
+                async move {
+                    assert_eq!(namespace, "shop");
+                    Ok(found)
+                }
+            }
+        };
+        tokio::spawn(follow_certificates(
+            routes.clone(),
+            certificates.clone(),
+            read,
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        tokio::spawn(serve_tls(listener, routes, endpoints, certificates.clone()));
+
+        // Each host gets its own certificate, a wildcard the rest.
+        let mut got = Err(String::new());
+        for _ in 0..50 {
+            got = get_tls(proxy, "shop.example.org", std::slice::from_ref(&shop_der)).await;
+            if got.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let body = got.unwrap();
+        assert!(body.starts_with("web / host=shop.example.org"), "{body}");
+        assert!(
+            get_tls(proxy, "www.example.org", std::slice::from_ref(&wild_der))
+                .await
+                .is_ok()
+        );
+        assert!(
+            get_tls(proxy, "www.example.org", std::slice::from_ref(&shop_der))
+                .await
+                .is_err(),
+            "the wildcard's certificate, not the shop's"
+        );
+        assert!(
+            get_tls(
+                proxy,
+                "other.example.com",
+                &[shop_der.clone(), wild_der.clone()]
+            )
+            .await
+            .is_err(),
+            "no certificate for a host without a route"
+        );
+
+        // A renewed certificate takes over once read again; a broken one
+        // keeps the last good one.
+        let (renewed_pem, renewed_der) = certificate(&["shop.example.org"]);
+        secrets
+            .lock()
+            .unwrap()
+            .insert("shop-cert".into(), renewed_pem.into_bytes());
+        routes_tx.send_modify(|_| {});
+        let mut renewed = false;
+        for _ in 0..50 {
+            if get_tls(
+                proxy,
+                "shop.example.org",
+                std::slice::from_ref(&renewed_der),
+            )
+            .await
+            .is_ok()
+            {
+                renewed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(renewed);
+        routes_tx.send_modify(|r| r[0].spec.tls.as_mut().unwrap().secret = "broken".into());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            get_tls(
+                proxy,
+                "shop.example.org",
+                std::slice::from_ref(&renewed_der)
+            )
+            .await
+            .is_ok()
+        );
+
+        // A route gone takes its certificate with it.
+        routes_tx.send_modify(|r| r.retain(|r| r.name != "www"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            certificates
+                .get("shop.example.org")
+                .is_some_and(|c| { c.cert[0] == wild_der }),
+            "only the wildcard is left for the shop"
+        );
     }
 }

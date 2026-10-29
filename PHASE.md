@@ -684,9 +684,21 @@ service and migrates between nodes.
   exit test, the app's web service answering through a route with real
   pods.
 
+- **HTTPS for routes** (`tls: { secret }`, `--ingress-tls-listen`,
+  DESIGN.md §5.8): the certificate of each route's host from a PEM Secret,
+  by SNI (wildcards after exact hosts), read again on route changes and
+  every minute; any node may read a Secret a route names. Tested: the
+  proxy with self-signed certificates (per host, wildcard, none for other
+  hosts, renewed, a broken one keeping the last), the dispatcher letting a
+  node without tasks read a route's Secret and no other, and in the phase
+  1 exit test on weft-bsd with an `openssl` certificate and client. Also:
+  the CLI tests give a starting daemon 60 s (the first start of a freshly
+  built binary on Windows took over 20 s once) and print its log if it
+  does not come up.
+
 ### To do, in order
 
-1. Autolock, with encryption at rest (not built yet). TLS for routes.
+1. Autolock, with encryption at rest (not built yet).
 
 Smaller follow-ups: memory limits for workloads with large shared memory
 (rctl counts it per process; `vmemoryuse` or a pod-wide allowance).

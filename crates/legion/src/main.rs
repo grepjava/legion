@@ -94,6 +94,9 @@ enum Command {
         /// Serve HTTP routes (`Route` objects) here, e.g. `0.0.0.0:80`.
         #[arg(long)]
         ingress_listen: Option<SocketAddr>,
+        /// Serve HTTPS for routes with `tls` here, e.g. `0.0.0.0:443`.
+        #[arg(long)]
+        ingress_tls_listen: Option<SocketAddr>,
     },
     /// Start a new cluster with the reached manager as its first member.
     Init,
@@ -357,6 +360,7 @@ async fn main() -> anyhow::Result<()> {
             vip_vhid,
             vip_password_file,
             ingress_listen,
+            ingress_tls_listen,
         } => {
             let vip = match (vip, vip_interface, vip_password_file) {
                 (Some(addr), Some(interface), Some(file)) => {
@@ -386,6 +390,7 @@ async fn main() -> anyhow::Result<()> {
                 metrics_listen,
                 vip,
                 ingress_listen,
+                ingress_tls_listen,
             })
             .await
         }
