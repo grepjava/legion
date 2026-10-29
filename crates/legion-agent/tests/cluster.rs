@@ -423,6 +423,52 @@ spec:
     c.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pod_runs_nothing_before_it_is_guarded() {
+    let c = Cluster::start(1).await;
+    // pf takes no policy: the pod is attached, but nothing in it runs.
+    c.nodes[0]
+        .sys
+        .break_anchor(legion_net::policy::ANCHOR, true);
+    c.apply(&WEB.replace("replicas: 3", "replicas: 1")).await;
+    let task = || async {
+        c.list(Kind::Task)
+            .await
+            .into_iter()
+            .find(|t| t.metadata.namespace == "shop")
+    };
+    eventually("the task attached", async || {
+        task().await.is_some_and(|t| t.status["ip"].is_string())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let t = task().await.unwrap();
+    assert_eq!(t.status["state"], "starting", "{:?}", t.status);
+    let name = format!("shop_{}_web", t.metadata.name);
+    assert_eq!(c.nodes[0].rt.policy_at_start(&name), None);
+
+    // Once pf takes it, the pod starts guarded at its address.
+    c.nodes[0]
+        .sys
+        .break_anchor(legion_net::policy::ANCHOR, false);
+    eventually("the task running", async || {
+        task().await.is_some_and(|t| t.status["state"] == "running")
+    })
+    .await;
+    let rules = c.nodes[0].rt.policy_at_start(&name).unwrap();
+    let lp = legion_net::host_interface(&t.metadata.uid);
+    for rule in [
+        format!("block drop out quick on {lp} inet all"),
+        format!(
+            "block drop in quick on {lp} inet from ! {}",
+            t.status["ip"].as_str().unwrap()
+        ),
+    ] {
+        assert!(rules.contains(&rule), "{rule} not in:\n{rules}");
+    }
+    c.stop().await;
+}
+
 const DB: &str = r#"
 apiVersion: legion/v1
 kind: Service

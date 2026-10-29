@@ -10,6 +10,7 @@ use legion_api::policy::{Isolation, PolicyPeer, selects};
 use legion_api::service::Protocol;
 use legion_net::lb::Proto;
 use legion_net::policy::{Allow, Guard};
+use tokio::sync::watch;
 
 /// A pod running on this node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +19,75 @@ pub struct LocalPod {
     pub ip: Ipv4Addr,
     pub namespace: String,
     pub service: String,
+}
+
+impl LocalPod {
+    /// The pod of the task assigned as `a`, at `ip`.
+    pub fn of(a: &legion_api::dispatch::Assignment, ip: Ipv4Addr) -> LocalPod {
+        LocalPod {
+            interface: legion_net::host_interface(&a.uid),
+            ip,
+            namespace: a.key.namespace.clone(),
+            // A Job's task has no Service's labels, even one of its name.
+            service: if a.spec.job {
+                String::new()
+            } else {
+                a.spec.service.clone()
+            },
+        }
+    }
+}
+
+/// Between the task workers and the policy pass: a new pod's containers
+/// start only once its host end is guarded, since until then pf lets
+/// anyone reach it. The assignments learn a pod's address only after the
+/// agent reports it, so workers tell the pass themselves.
+pub(crate) struct Guarding {
+    /// Pods whose network is up here, by task uid, until it is removed.
+    attached: watch::Sender<BTreeMap<String, LocalPod>>,
+    /// What the last pass did.
+    passes: watch::Sender<Pass>,
+}
+
+/// One policy pass: the pods it guarded, by task uid with the address
+/// guarded, or why it failed.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Pass {
+    pub guarded: BTreeMap<String, Ipv4Addr>,
+    pub error: Option<String>,
+}
+
+impl Guarding {
+    pub fn new() -> Guarding {
+        Guarding {
+            attached: watch::Sender::new(BTreeMap::new()),
+            passes: watch::Sender::new(Pass::default()),
+        }
+    }
+
+    pub fn attach(&self, uid: &str, pod: LocalPod) {
+        self.attached.send_modify(|a| {
+            a.insert(uid.to_owned(), pod);
+        });
+    }
+
+    pub fn detach(&self, uid: &str) {
+        self.attached.send_if_modified(|a| a.remove(uid).is_some());
+    }
+
+    /// Follows the pods attached, for the pass.
+    pub fn attached(&self) -> watch::Receiver<BTreeMap<String, LocalPod>> {
+        self.attached.subscribe()
+    }
+
+    /// Follows the passes, for the workers.
+    pub fn passes(&self) -> watch::Receiver<Pass> {
+        self.passes.subscribe()
+    }
+
+    pub fn passed(&self, pass: Pass) {
+        self.passes.send_replace(pass);
+    }
 }
 
 /// Each local pod's guard, and the source tables they name.

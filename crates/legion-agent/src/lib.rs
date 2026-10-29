@@ -153,6 +153,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 volume_lock: Arc::default(),
                 net: Arc::default(),
                 ips: Arc::default(),
+                guarding: Arc::new(policing::Guarding::new()),
                 drain: config.drain,
             },
             resync: config.resync,
@@ -359,6 +360,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             endpoints,
             ctx.control.policies(),
             assignments.clone(),
+            ctx.guarding.clone(),
             gateway,
         ));
 
@@ -716,13 +718,16 @@ async fn load_balancing(
 }
 
 /// Keeps the `legion/policy` anchor in line with the namespaces' isolation,
-/// the policies and the pods running here (DESIGN.md §5.6). Nothing is
-/// enforced before the policies are first known.
+/// the policies and the pods running here (DESIGN.md §5.6): those the
+/// assignments carry and those the workers have just attached, whose
+/// containers wait for this. Nothing is enforced before the policies are
+/// first known.
 async fn policing_loop(
     sys: Arc<dyn Sys>,
     mut endpoints: watch::Receiver<legion_api::dispatch::Endpoints>,
     mut policies: watch::Receiver<Option<legion_api::dispatch::Policies>>,
     mut assignments: watch::Receiver<legion_api::dispatch::Assignments>,
+    guarding: Arc<policing::Guarding>,
     gateway: Ipv4Addr,
 ) {
     use legion_api::service::{SERVICE_NET, SERVICE_PREFIX};
@@ -751,6 +756,7 @@ async fn policing_loop(
     })
     .await;
     let services = legion_sys::Ipv4Net::new(SERVICE_NET, SERVICE_PREFIX);
+    let mut attached = guarding.attached();
     let mut policy = Policy::default();
     let mut retry = false;
     loop {
@@ -759,29 +765,30 @@ async fn policing_loop(
             r = endpoints.changed() => if r.is_err() { return },
             r = policies.changed() => if r.is_err() { return },
             r = assignments.changed() => if r.is_err() { return },
+            r = attached.changed() => if r.is_err() { return },
             () = tokio::time::sleep(wait) => {}
         }
         let Some(current) = policies.borrow_and_update().clone() else {
+            // Seen, or their changes would wake the loop at once again.
+            endpoints.mark_unchanged();
+            assignments.mark_unchanged();
+            attached.mark_unchanged();
             continue;
         };
-        let pods: Vec<policing::LocalPod> = assignments
+        let mut pods: BTreeMap<String, policing::LocalPod> = assignments
             .borrow_and_update()
             .iter()
             .filter(|(_, a)| !a.status.state.is_terminal())
             .filter_map(|(uid, a)| {
-                Some(policing::LocalPod {
-                    interface: legion_net::host_interface(uid),
-                    ip: a.status.ip.as_deref()?.parse().ok()?,
-                    namespace: a.key.namespace.clone(),
-                    // A Job's task has no Service's labels, even one of its name.
-                    service: if a.spec.job {
-                        String::new()
-                    } else {
-                        a.spec.service.clone()
-                    },
-                })
+                let ip = a.status.ip.as_deref()?.parse().ok()?;
+                Some((uid.clone(), policing::LocalPod::of(a, ip)))
             })
             .collect();
+        // A worker's address is the current one.
+        pods.extend(attached.borrow_and_update().clone());
+        let guarded: BTreeMap<String, Ipv4Addr> =
+            pods.iter().map(|(uid, p)| (uid.clone(), p.ip)).collect();
+        let pods: Vec<policing::LocalPod> = pods.into_values().collect();
         let (guards, tables) = policing::guards(&pods, &endpoints.borrow_and_update(), &current);
         let (p, result) = task::blocking(&sys, move |sys| {
             let mut p = policy;
@@ -791,9 +798,19 @@ async fn policing_loop(
         .await;
         policy = p;
         retry = match result {
-            Ok(()) => false,
+            Ok(()) => {
+                guarding.passed(policing::Pass {
+                    guarded,
+                    error: None,
+                });
+                false
+            }
             Err(e) => {
                 tracing::warn!("programming pf for network policy: {e}; retrying");
+                guarding.passed(policing::Pass {
+                    guarded: BTreeMap::new(),
+                    error: Some(e.to_string()),
+                });
                 policy = Policy::default();
                 true
             }

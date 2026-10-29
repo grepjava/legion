@@ -25,6 +25,10 @@ use crate::probe::{self, Outcome, Prober};
 use crate::runtime::Runtime;
 use crate::{files, logins, output, volumes};
 
+/// How long a new pod waits for its guard: the policy pass retries a
+/// failed load every few seconds.
+const GUARD_WAIT: Duration = Duration::from_secs(60);
+
 /// What the agent tells a worker.
 #[derive(Debug)]
 pub(crate) enum Msg {
@@ -56,6 +60,8 @@ pub(crate) struct Ctx<R, C> {
     pub net: Arc<OnceLock<PodNetwork>>,
     /// Pod addresses in use, by task uid.
     pub ips: Arc<Mutex<BTreeMap<String, Ipv4Addr>>>,
+    /// Holds new pods back until they are guarded.
+    pub guarding: Arc<crate::policing::Guarding>,
     /// How long a ready task told to stop keeps running first.
     pub drain: std::time::Duration,
 }
@@ -89,6 +95,7 @@ impl<R, C> Clone for Ctx<R, C> {
             volume_lock: self.volume_lock.clone(),
             net: self.net.clone(),
             ips: self.ips.clone(),
+            guarding: self.guarding.clone(),
             drain: self.drain,
         }
     }
@@ -404,6 +411,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             .map_err(|e| Abort::Failed(format!("starting the infra container: {e}")))?;
         self.check_infra_jail(&infra).await?;
         self.attach(&infra).await?;
+        self.guarded().await?;
 
         let init: Vec<_> = self.pod().init_containers.clone();
         for (i, c) in init.iter().enumerate() {
@@ -513,7 +521,44 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             .await
             .map_err(|e| Abort::Failed(format!("attaching the pod network: {e}")))?;
         self.status.ip = Some(ip.to_string());
+        self.ctx
+            .guarding
+            .attach(&self.a.uid, crate::policing::LocalPod::of(&self.a, ip));
         Ok(())
+    }
+
+    /// Waits until the pod's host end is guarded at its address, before
+    /// anything in the pod runs: until then pf lets anyone reach it, and it
+    /// may send from any address. A pod not guarded in time fails.
+    async fn guarded(&mut self) -> Result<(), Abort> {
+        let Some(ip) = self.status.ip.as_deref().and_then(|s| s.parse().ok()) else {
+            return Err(Abort::Failed("the pod has no address".into()));
+        };
+        self.report(TaskState::Starting, "loading the pod's network policy")
+            .await;
+        let uid = self.a.uid.clone();
+        let mut passes = self.ctx.guarding.passes();
+        let wait = async {
+            passes
+                .wait_for(|p| p.guarded.get(&uid) == Some(&ip))
+                .await
+                .is_ok()
+        };
+        let guarded = tokio::select! {
+            r = tokio::time::timeout(GUARD_WAIT, wait) => r.unwrap_or(false),
+            () = self.stopped() => return Err(Abort::Stopped),
+        };
+        if guarded {
+            return Ok(());
+        }
+        let why = match passes.borrow().error.clone() {
+            Some(e) => format!(": {e}"),
+            None => " (are the network policies known?)".into(),
+        };
+        Err(Abort::Failed(format!(
+            "the pod's network policy was not loaded within {}s{why}",
+            GUARD_WAIT.as_secs()
+        )))
     }
 
     /// The infra jail must have its own VNET: without the annotation taking
@@ -923,6 +968,7 @@ pub(crate) async fn teardown<R: Runtime, C: Control>(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(uid);
+    ctx.guarding.detach(uid);
     let found = match ctx.runtime.list(&[(LABEL_TASK, uid)]).await {
         Ok(f) => f,
         Err(e) => {

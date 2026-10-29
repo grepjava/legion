@@ -65,6 +65,9 @@ struct State {
     sessions: BTreeMap<String, Session>,
     /// Events held back, while holding them, as a slow event stream would.
     held: Option<Vec<Event>>,
+    /// The network policy anchor's rules as each container (by name) last
+    /// started.
+    policy_at_start: BTreeMap<String, String>,
 }
 
 /// An attached exec's view of its session.
@@ -207,6 +210,12 @@ impl FakeRuntime {
             .values()
             .filter(|s| s.exit_code.is_none())
             .count()
+    }
+
+    /// The `legion/policy` anchor's rules when the container `name` last
+    /// started, for checking that a pod was guarded before it ran.
+    pub fn policy_at_start(&self, name: &str) -> Option<String> {
+        self.state().policy_at_start.get(name).cloned()
     }
 
     /// Containers created so far, removed ones included.
@@ -419,6 +428,11 @@ impl Runtime for FakeRuntime {
         // As an OCI runtime may: a new jail starts with only the container's
         // own OCI limits, none here.
         let _ = legion_sys::Sys::rctl_remove_jail(self.sys.as_ref(), &jail);
+        let policy = self
+            .sys
+            .anchor(legion_net::policy::ANCHOR)
+            .unwrap_or_default();
+        s.policy_at_start.insert(c.spec.name.clone(), policy);
         let c = s.containers.get_mut(id).expect("exists");
         c.running = true;
         c.starts += 1;

@@ -523,9 +523,7 @@ Already there from phase 1: namespaces scope names and DNS
 
 Nothing left in phase 3.
 
-Smaller follow-ups: egress policies; a new pod is unguarded for the
-moment between its start and the agent's next pass (the guard could go in
-before its containers start); lab runs on weft-bsd leave the bridge
+Smaller follow-ups: egress policies; lab runs on weft-bsd leave the bridge
 sysctls at 1; API request counts and latencies in the metrics.
 
 ## Phase 4 — Stateful and operations
@@ -928,12 +926,22 @@ real, in the order agreed with the user.
   server's certificate replaced while serving, the worker's write
   surviving a crash at each step; on FreeBSD 15.1, the phase 1 exit
   test and the three-manager VIP test over the new transport.
+- **New pods guarded before they run** (DESIGN.md §5.6). The policy pass
+  built guards from the assignments, which carry a pod's address only
+  after the agent reports it, so a new pod's containers ran unguarded
+  until then. Now the worker hands the pod to the pass once its network
+  is up and starts nothing in it until the guard is loaded at its
+  address; a pod not guarded within a minute fails. The pass also no
+  longer spins while the policies are still unknown. Tested: in the fake
+  cluster, with pf refusing the policy anchor, a task stays `starting`
+  with nothing run, then starts once pf takes it, its guard already in
+  place (the test fails without the wait); on FreeBSD 15.1, the phase 1
+  exit test.
 
 ### To do, in order
 
-1. Guard a new pod before its containers start (phase 3 follow-up).
-2. Memory limits for workloads with large shared memory (phase 4
+1. Memory limits for workloads with large shared memory (phase 4
    follow-up).
-3. Packaging: an rc.d script, defaults for `--listen` and a worker's
+2. Packaging: an rc.d script, defaults for `--listen` and a worker's
    endpoint, and a port or release tarballs (DESIGN.md §13, question 2).
 

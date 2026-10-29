@@ -745,6 +745,16 @@ over TCP.
   instead (`in on lpX`, still to the VIP; this is what needs
   `pfil_local_phys`): each pod may reach the VIP ports whose tasks would
   let it in. Egress policies are not built yet.
+- **Built** (hardening): a new pod is guarded before anything in it runs.
+  Its worker hands the pod (host end, address, namespace, service) to the
+  policy pass as soon as its network is up, since the assignments learn
+  the address only after the agent reports it, and holds the init and app
+  containers back until a pass has loaded the guard at that address
+  (`starting`, "loading the pod's network policy"). A pod not guarded
+  within a minute fails (pf refusing the rules, or the policies never
+  arriving), so a node whose pf cannot take the policy runs no new pods
+  rather than unguarded ones. Pods adopted after an agent restart are
+  handed over too but not held: their guards are still loaded.
 
 ### 5.7 IPv6
 

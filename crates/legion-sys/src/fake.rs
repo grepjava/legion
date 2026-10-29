@@ -93,6 +93,8 @@ struct State {
     carp: BTreeMap<(String, u8), (Carp, CarpState)>,
     /// Commands that fail once, the next time they run.
     failing: BTreeSet<String>,
+    /// Anchors whose loads fail until told otherwise.
+    broken_anchors: BTreeSet<String>,
 }
 
 impl State {
@@ -306,6 +308,16 @@ impl FakeSys {
     /// `pfctl -ss`, `pfctl -k` and `zfs destroy -r`.
     pub fn fail_next(&self, command: &str) {
         self.state().failing.insert(command.to_owned());
+    }
+
+    /// Makes loading `anchor` fail from now on, or work again.
+    pub fn break_anchor(&self, anchor: &str, broken: bool) {
+        let mut s = self.state();
+        if broken {
+            s.broken_anchors.insert(anchor.to_owned());
+        } else {
+            s.broken_anchors.remove(anchor);
+        }
     }
 
     /// tmpfs mount points and their sizes.
@@ -831,9 +843,11 @@ impl Sys for FakeSys {
     }
 
     fn pf_load_anchor(&self, anchor: &str, rules: &str) -> Result<()> {
-        self.state()
-            .anchors
-            .insert(anchor.to_owned(), rules.to_owned());
+        let mut s = self.state();
+        if s.broken_anchors.contains(anchor) {
+            return Err(fail("pfctl -f", "Device busy"));
+        }
+        s.anchors.insert(anchor.to_owned(), rules.to_owned());
         Ok(())
     }
 
