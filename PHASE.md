@@ -1057,6 +1057,20 @@ real, in the order agreed with the user.
   an exec given up on after 1 s end with its background child, and a
   released terminal hang up its shell; each of those two fails with its
   fix taken out.
+- **From a second review.** A route could name any Secret of its
+  namespace for HTTPS, and every node could then read it: a route's
+  Secret is now handed out only if it holds a PEM certificate and key.
+  A crash while a manager wrote its first `node-id` could leave the file
+  empty and the daemon unable to start: it is written whole, synced,
+  then renamed. The docs said roughly 500 nodes; the pod network holds
+  256 /24s, and the IPv6 twins and underlay addresses number nodes by
+  the same octet, so 256 it is. Checked and not changed: SIGTERM is
+  handled (`service legion stop` drains), the ingress proxy has a 5 s
+  connect timeout (pooling is a known gap, §5.8), extraction uses
+  bsdtar, which refuses `..`, absolute paths and writing through links
+  unless told otherwise. Left as known costs: a Raft snapshot is the
+  whole object table in memory, and an all-namespace watch checks RBAC
+  per event (a RoleBinding read).
 - **FreeBSD port** (`packaging/freebsd/port`, its README). `sysutils/legion`
   with the ports' cargo framework, FreeBSD 15 and newer, amd64 and
   aarch64; it installs the binary (stripped), the rc.d script with

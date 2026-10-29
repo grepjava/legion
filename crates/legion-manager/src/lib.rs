@@ -338,7 +338,16 @@ pub fn node_id(dir: &Path) -> Result<NodeId, Error> {
             // RandomState is seeded randomly per process. Zero is avoided so
             // an id is never mistaken for an unset value.
             let id = std::hash::RandomState::new().build_hasher().finish().max(1);
-            std::fs::write(&path, format!("{id}\n"))?;
+            // Whole or not at all: a crash must not leave an empty file,
+            // which the next start could not read.
+            let tmp = dir.join("node-id.tmp");
+            {
+                use std::io::Write;
+                let mut f = std::fs::File::create(&tmp)?;
+                writeln!(f, "{id}")?;
+                f.sync_all()?;
+            }
+            std::fs::rename(&tmp, &path)?;
             Ok(id)
         }
         Err(e) => Err(e.into()),

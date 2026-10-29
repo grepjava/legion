@@ -60,7 +60,9 @@ in the way Legion needs (section 6).
 - Custom resource definitions, operators, admission webhooks.
 - Running on Linux or older FreeBSD releases.
 - Layer-2 features between containers (multicast, broadcast) across nodes.
-- Clusters beyond roughly 500 nodes / 20,000 tasks in the first versions.
+- Clusters beyond 256 nodes (one /24 of the /16 pod network each, which
+  the IPv6 twins and underlay addresses also number by) or about 20,000
+  tasks in the first versions.
 
 ---
 

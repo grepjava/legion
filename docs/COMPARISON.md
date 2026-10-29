@@ -22,7 +22,7 @@ what is built today, not what is planned.
 | What you install | One binary on every node | Docker Engine on every node | Control plane (API server, etcd, scheduler, controllers), kubelet, a container runtime, a CNI plugin, then add-ons |
 | Configuration | YAML objects, or compose files as stacks | Compose files, `docker service` flags | YAML objects, Helm charts, operators |
 | Extensible API | No (fixed kinds) | No | Yes (CRDs, operators, webhooks) |
-| Scale it is built for | Up to about 500 nodes and 20,000 tasks | Hundreds of nodes | Thousands of nodes |
+| Scale it is built for | Up to 256 nodes (one /24 of the pod network each) and about 20,000 tasks | Hundreds of nodes | Thousands of nodes |
 | Maturity | New; not yet released or used in production | Mature, in maintenance | Mature, very widely used |
 
 Choose Legion to run services on FreeBSD hosts with ZFS, pf and jails,

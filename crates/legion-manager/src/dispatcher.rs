@@ -677,12 +677,13 @@ impl Dispatcher for DispatcherService {
             return Err(Status::invalid_argument("kind is Secret or Config"));
         }
         let wanted = (kind, r.name.clone());
-        if !self
+        let used = self
             .tasks_of(&node, &r.namespace)?
             .iter()
-            .any(|a| a.spec.pod.data_refs().contains(&wanted))
-            && !(kind == Kind::Secret && self.route_certificate(&r.namespace, &r.name)?)
-        {
+            .any(|a| a.spec.pod.data_refs().contains(&wanted));
+        let route =
+            !used && kind == Kind::Secret && self.route_certificate(&r.namespace, &r.name)?;
+        if !used && !route {
             return Err(Status::permission_denied(format!(
                 "no task of node {node} uses {} {}/{}",
                 kind.as_str().to_lowercase(),
@@ -697,6 +698,14 @@ impl Dispatcher for DispatcherService {
             }
             None => None,
         };
+        // Every node may read a route's certificate, so a route must not
+        // hand them any other Secret of its namespace.
+        if route && value.as_deref().is_some_and(|v| !certificate_and_key(v)) {
+            return Err(Status::permission_denied(format!(
+                "secret {}/{} is named by a route but is not a PEM certificate and key",
+                r.namespace, r.name
+            )));
+        }
         Ok(Response::new(DataResponse { value }))
     }
 
@@ -1218,6 +1227,15 @@ fn assignment(o: &Object, node: &str) -> Option<Assignment> {
 
 fn invalid(e: impl std::fmt::Display) -> Status {
     Status::invalid_argument(e.to_string())
+}
+
+/// Whether `pem` holds a certificate and a private key, as a route's
+/// Secret must.
+fn certificate_and_key(pem: &[u8]) -> bool {
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    CertificateDer::pem_slice_iter(pem).any(|c| c.is_ok())
+        && PrivateKeyDer::from_pem_slice(pem).is_ok()
 }
 
 /// A subnet for a node not in `held`: the lowest neither reserved (`held`)

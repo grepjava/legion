@@ -877,7 +877,10 @@ spec: { host: shop.example.org, path: /cart/, service: web }
 async fn any_node_reads_the_certificates_of_routes_but_no_other_secret() {
     use legion_agent::Control;
     let c = Cluster::start(1).await;
-    for (name, text) in [("www-cert", "PEM"), ("db-password", "hunter2")] {
+    let key = rcgen::generate_simple_self_signed(vec!["shop.example.org".to_owned()]).unwrap();
+    let pem = format!("{}{}", key.cert.pem(), key.signing_key.serialize_pem());
+    let quoted = serde_json::to_string(&pem).unwrap();
+    for (name, text) in [("www-cert", quoted.as_str()), ("db-password", "hunter2")] {
         c.apply(&format!(
             "apiVersion: legion/v1\nkind: Secret\nmetadata: {{ name: {name}, namespace: shop }}\nspec: {{ text: {text} }}\n"
         ))
@@ -893,13 +896,27 @@ async fn any_node_reads_the_certificates_of_routes_but_no_other_secret() {
         .data("shop", Kind::Secret, "www-cert")
         .await
         .unwrap();
-    assert_eq!(cert.as_deref(), Some(&b"PEM"[..]));
+    assert_eq!(cert.as_deref(), Some(pem.as_bytes()));
     assert!(
         control
             .data("shop", Kind::Secret, "db-password")
             .await
             .is_err(),
         "no task here uses it"
+    );
+    // A route naming another Secret does not hand it out.
+    c.apply(
+        "apiVersion: legion/v1\nkind: Route\nmetadata: { name: leak, namespace: shop }\n\
+         spec: { host: leak.example.org, service: web, tls: { secret: db-password } }\n",
+    )
+    .await;
+    let err = control
+        .data("shop", Kind::Secret, "db-password")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not a PEM certificate and key"),
+        "{err}"
     );
     c.stop().await;
 }
