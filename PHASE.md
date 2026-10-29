@@ -303,10 +303,9 @@ remote FreeBSD server reached through a WireGuard site tunnel.
 
 Nothing left in phase 2.
 
-Smaller follow-ups: placement preferences (`spread`) are accepted but not used yet; a node's
-advertised WireGuard endpoint replaces the one WireGuard learned, so a
-node behind NAT cannot be reached by its peers' replies alone; node subnets
-are reserved by name (`Config/legion-system/node-subnets`) and a deleted
+Smaller follow-ups: a node's advertised WireGuard endpoint replaces the one
+WireGuard learned, so a node behind NAT cannot be reached by its peers'
+replies alone; node subnets are reserved by name (`Config/legion-system/node-subnets`) and a deleted
 Node's reservation is not released.
 
 ## Phase 3 — K8s-lite
@@ -1010,10 +1009,19 @@ real, in the order agreed with the user.
   heard from again, it is ready and its task is balanced over again; on
   FreeBSD 15.1, the phase 1 exit test (its daemon killed and restarted)
   with no node ever marked suspect.
+- **Placement preferences** (DESIGN.md §3.5). `spread: node.labels.<key>`
+  had been accepted and ignored. The scheduler now balances a service's
+  new tasks over the key's values, nodes without it counting as one more
+  value, and each later preference within the values of those before it,
+  as Swarm does; after an untolerated `PreferNoSchedule` taint, before
+  tasks per node. Tested in the planner: three tasks over zones a (three
+  nodes), b (one) and unlabelled go one to each, six two to each; a
+  second preference on racks splits zone a's two over its racks; without
+  preferences, tasks go one per node as before.
 
 ### To do, in order
 
 Nothing left in the hardening agreed with the user. Candidates from the
-phases' follow-ups: a FreeBSD port; placement preferences (`spread`);
-releasing a deleted node's pod subnet; nodes behind NAT.
+phases' follow-ups: a FreeBSD port; releasing a deleted node's pod
+subnet; nodes behind NAT.
 

@@ -1160,6 +1160,13 @@ fn matches(c: &Constraint, n: &Node) -> bool {
     (actual == Some(c.value.as_str())) == c.equal
 }
 
+/// The values of the labels `keys` on `n`, for a spread preference.
+fn group<'a>(n: &'a Node, keys: &[&str]) -> Vec<Option<&'a String>> {
+    keys.iter()
+        .map(|k| n.object.metadata.labels.get(*k))
+        .collect()
+}
+
 /// Requests placed on a node, and its tasks per service.
 #[derive(Debug, Default, Clone)]
 struct Load {
@@ -1182,16 +1189,19 @@ impl Load {
 }
 
 /// Lower is better: an untolerated `PreferNoSchedule` taint, tasks of the
-/// same service, then requested CPU and memory in thousandths.
-type Score = (bool, u32, u64, u64);
+/// same service in the node's group for each spread preference, on the
+/// node, then requested CPU and memory in thousandths.
+type Score = (bool, Vec<u32>, u32, u64, u64);
 
 /// Places pending tasks: hold those their namespace's quota has no room
 /// for, filter nodes (eligible, requests fit), then prefer a node without
-/// an untolerated `PreferNoSchedule` taint, then the one with the fewest
-/// tasks of the same service, then the least requested. New tasks are
-/// created already placed; existing pending ones are updated. A global
-/// task names its node from the start, but is pending, and not sent to
-/// the agent, until placed there.
+/// an untolerated `PreferNoSchedule` taint, then one whose group under
+/// each spread preference in turn (nodes with the same values of its
+/// label and the ones before it) has the fewest tasks of the same
+/// service, then the node with the fewest, then the least requested. New
+/// tasks are created already placed; existing pending ones are updated. A
+/// global task names its node from the start, but is pending, and not
+/// sent to the agent, until placed there.
 #[allow(clippy::too_many_arguments)]
 fn schedule(
     services: &[&Service],
@@ -1249,6 +1259,20 @@ fn schedule(
             .get(&namespace)
             .map(|q| q.exceeded(&before, &after))
             .unwrap_or_default();
+        let owner = (s.key().0.to_owned(), s.key().1.to_owned());
+        let on = |node: &str| {
+            load.get(node)
+                .and_then(|l| l.per_service.get(&owner))
+                .copied()
+                .unwrap_or(0)
+        };
+        let spread: Vec<&str> = s
+            .spec
+            .placement
+            .preferences
+            .iter()
+            .map(|p| p.label())
+            .collect();
         let mut reasons: BTreeMap<&str, usize> = BTreeMap::new();
         let mut best: Option<(&str, Score)> = None;
         for n in nodes.iter().filter(|_| over.is_empty()) {
@@ -1268,14 +1292,20 @@ fn schedule(
                 *reasons.entry("insufficient resources").or_default() += 1;
                 continue;
             }
-            let same = l
-                .per_service
-                .get(&(s.key().0.to_owned(), s.key().1.to_owned()))
-                .copied()
-                .unwrap_or(0);
+            let groups = (1..=spread.len())
+                .map(|depth| {
+                    let mine = group(n, &spread[..depth]);
+                    nodes
+                        .iter()
+                        .filter(|m| group(m, &spread[..depth]) == mine)
+                        .map(|m| on(m.name()))
+                        .sum()
+                })
+                .collect();
             let score = (
                 n.repels(s, TaintEffect::PreferNoSchedule),
-                same,
+                groups,
+                on(name),
                 l.cpu * 1000 / alloc.cpu.0.max(1),
                 l.memory * 1000 / alloc.memory.0.max(1),
             );

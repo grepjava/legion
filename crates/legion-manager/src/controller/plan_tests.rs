@@ -2,6 +2,7 @@
 //! would (versions, uids, generations), and agents move assigned tasks to
 //! running and stopping tasks to shutdown.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use legion_api::node::{Availability, Capacity, NodeSpec, NodeState, NodeStatus, Taint};
@@ -973,6 +974,63 @@ placement: { constraints: [\"node.platform.linux == false\"] }",
         !w.tasks().iter().any(|t| t.starts_with("native-")),
         "n2 runs Linux"
     );
+}
+
+#[test]
+fn spread_preferences_balance_over_label_values() {
+    let mut w = World::new();
+    w.node("n1", &[("zone", "a"), ("rack", "1")]);
+    w.node("n2", &[("zone", "a"), ("rack", "1")]);
+    w.node("n3", &[("zone", "a"), ("rack", "2")]);
+    w.node("n4", &[("zone", "b"), ("rack", "1")]);
+    w.node("n5", &[]);
+    let spread = "placement: { preferences: [{ spread: node.labels.zone }] }";
+    w.service("web", &format!("replicas: 3\n{POD}\n{spread}"));
+    w.settle();
+    let zones = |w: &World, service: &str| {
+        let mut per: BTreeMap<&str, usize> = BTreeMap::new();
+        for n in w.placed(service) {
+            let zone = match n.as_str() {
+                "n1" | "n2" | "n3" => "a",
+                "n4" => "b",
+                _ => "-",
+            };
+            *per.entry(zone).or_default() += 1;
+        }
+        per
+    };
+    // Nodes without the label are one more value: one task each.
+    assert_eq!(zones(&w, "web"), [("-", 1), ("a", 1), ("b", 1)].into());
+
+    // Scaled up, the zones stay even, though zone a has three nodes.
+    w.service("web", &format!("replicas: 6\n{POD}\n{spread}"));
+    w.settle();
+    assert_eq!(zones(&w, "web"), [("-", 2), ("a", 2), ("b", 2)].into());
+    let placed = w.placed("web");
+    assert_eq!(
+        placed.iter().filter(|n| *n == "n4").count(),
+        2,
+        "zone b is n4 alone: {placed:?}"
+    );
+
+    // A second preference spreads within each value of the first: zone a's
+    // two tasks go to racks 1 and 2.
+    let racks =
+        "placement: { preferences: [{ spread: node.labels.zone }, { spread: node.labels.rack }] }";
+    w.service("api", &format!("replicas: 6\n{POD}\n{racks}"));
+    w.settle();
+    assert_eq!(zones(&w, "api"), [("-", 2), ("a", 2), ("b", 2)].into());
+    let placed = w.placed("api");
+    assert_eq!(
+        placed.iter().filter(|n| *n == "n3").count(),
+        1,
+        "rack 2 of zone a: {placed:?}"
+    );
+
+    // Without preferences, tasks spread over nodes.
+    w.service("db", &format!("replicas: 5\n{POD}"));
+    w.settle();
+    assert_eq!(w.placed("db"), ["n1", "n2", "n3", "n4", "n5"]);
 }
 
 #[test]

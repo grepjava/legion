@@ -255,9 +255,13 @@ Filter, then score, per task:
    labels; the task tolerates every taint on the node; required anti-affinity
    holds; host-mode published ports are free; stateful tasks go to the node
    holding their volume unless migration is allowed.
-2. **Scores**: placement preferences (spread across a label such as `zone`);
-   fewest tasks of the same service on the node; least requested resources;
-   preferred affinity.
+2. **Scores**, in order: no untolerated `PreferNoSchedule` taint; placement
+   preferences, each `spread: node.labels.<key>` balancing the service's
+   tasks evenly over the key's values (nodes without the key are one more
+   value), and each after the first within the values of those before it,
+   as in Swarm; fewest tasks of the same service on the node; least
+   requested resources; preferred affinity. Preferences place new tasks
+   only: nothing already running moves when labels change.
 
 The scheduler places by **requests**; rctl enforces **limits**. A task with no
 requests is scheduled as zero-cost but is the first to be evicted when a node is

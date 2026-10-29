@@ -1059,7 +1059,18 @@ impl Placement {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Preference {
+    /// `node.labels.<key>`: tasks are spread evenly over the key's values,
+    /// nodes without it counting as one more value.
     pub spread: String,
+}
+
+impl Preference {
+    /// The label key spread over.
+    pub fn label(&self) -> &str {
+        self.spread
+            .strip_prefix("node.labels.")
+            .unwrap_or(&self.spread)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
