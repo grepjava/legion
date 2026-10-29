@@ -17,15 +17,16 @@ pub use legion_api::dispatch::{
 use legion_api::node::NodeStatus;
 use legion_api::task::TaskStatus;
 use legion_api::{Kind, ObjectKey};
+use legion_proto::tls::Credentials;
 use legion_proto::v1::dispatcher_client::DispatcherClient;
 use legion_proto::v1::{
     AssignmentsRequest, ClaimVolumeRequest, DataRequest, EndpointsRequest, HeartbeatRequest,
-    PeersRequest, PoliciesRequest, RegisterRequest, ReportRequest, RoutesRequest, SessionFrame,
-    SessionOffer, SessionsRequest,
+    PeersRequest, PoliciesRequest, RegisterRequest, RenewRequest, ReportRequest, RoutesRequest,
+    SessionFrame, SessionOffer, SessionsRequest,
 };
 use legion_sys::Ipv4Net;
 use tokio::sync::{mpsc, watch};
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use tonic::transport::{Channel, Endpoint};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
@@ -168,7 +169,7 @@ const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 #[derive(Clone)]
 pub struct GrpcControl {
     node: String,
-    tls: Option<ClientTlsConfig>,
+    tls: Option<Arc<Credentials>>,
     conn: Arc<Mutex<Conn>>,
 }
 
@@ -186,7 +187,7 @@ impl GrpcControl {
     pub fn new(
         node: &str,
         managers: Vec<String>,
-        tls: Option<ClientTlsConfig>,
+        tls: Option<Arc<Credentials>>,
     ) -> Result<GrpcControl, ControlError> {
         if managers.is_empty() {
             return Err(ControlError::Other("no manager address".into()));
@@ -205,6 +206,14 @@ impl GrpcControl {
     }
 
     /// The managers, starting with the one in use.
+    /// A new certificate for this worker, for the key `csr_pem` was made
+    /// with, from any manager.
+    pub async fn renew(&self, csr_pem: String) -> Result<String, ControlError> {
+        let req = RenewRequest { csr_pem };
+        let resp = self.call(|mut c| async move { c.renew(req).await }).await?;
+        Ok(resp.cert_pem)
+    }
+
     pub fn managers(&self) -> Vec<String> {
         let conn = self.conn.lock().unwrap();
         let mut list = conn.managers.clone();
@@ -356,7 +365,7 @@ impl GrpcControl {
 /// whenever it ends, until `tx` is closed.
 async fn follow_sessions(
     manager: String,
-    tls: Option<ClientTlsConfig>,
+    tls: Option<Arc<Credentials>>,
     node: String,
     tx: mpsc::Sender<Offer>,
 ) {
@@ -412,19 +421,18 @@ async fn follow_sessions(
 
 /// A lazily connected channel to a manager, with keepalives so a manager
 /// that vanishes without closing the connection is noticed.
-fn connect(addr: &str, tls: Option<&ClientTlsConfig>) -> Result<Channel, ControlError> {
-    let scheme = if tls.is_some() { "https" } else { "http" };
+fn connect(addr: &str, tls: Option<&Arc<Credentials>>) -> Result<Channel, ControlError> {
     let bad = |e: tonic::transport::Error| ControlError::Other(format!("manager {addr}: {e}"));
-    let mut endpoint = Endpoint::from_shared(format!("{scheme}://{addr}"))
+    let endpoint = Endpoint::from_shared(format!("http://{addr}"))
         .map_err(bad)?
         .connect_timeout(Duration::from_secs(5))
         .http2_keep_alive_interval(Duration::from_secs(10))
         .keep_alive_timeout(Duration::from_secs(10))
         .keep_alive_while_idle(true);
-    if let Some(tls) = tls {
-        endpoint = endpoint.tls_config(tls.clone()).map_err(bad)?;
-    }
-    Ok(endpoint.connect_lazy())
+    Ok(match tls {
+        Some(tls) => tls.channel(endpoint),
+        None => endpoint.connect_lazy(),
+    })
 }
 
 /// Codes worth retrying, against this manager or another, are

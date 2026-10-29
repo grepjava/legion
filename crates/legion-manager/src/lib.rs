@@ -35,6 +35,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 
 pub use dispatcher::HEARTBEAT_PERIOD;
 pub use join::{Joined, SYSTEM_NAMESPACE, join};
+pub use legion_proto::tls::Credentials;
 pub use raft_net::{GrpcNetwork, MAX_MESSAGE};
 pub use tls::{Tls, client_config};
 
@@ -115,7 +116,9 @@ pub struct Manager {
     id: NodeId,
     advertise: String,
     store: Store,
-    tls: Option<Tls>,
+    credentials: Option<std::sync::Arc<Credentials>>,
+    /// Held by managers, to certify joining and renewing nodes.
+    ca_key_pem: Option<String>,
     heartbeat: std::time::Duration,
     controllers: bool,
     vip: Option<(std::sync::Arc<dyn legion_sys::Sys>, vip::VipConfig)>,
@@ -129,20 +132,26 @@ impl Manager {
     pub async fn open(config: ManagerConfig) -> Result<Manager, Error> {
         std::fs::create_dir_all(&config.data_dir)?;
         let id = node_id(&config.data_dir)?;
-        let network = GrpcNetwork::new(config.tls.as_ref().map(Tls::client));
+        let credentials = config
+            .tls
+            .as_ref()
+            .map(|t| Credentials::new(&t.ca_pem, &t.cert_pem, &t.key_pem))
+            .transpose()?;
+        let network = GrpcNetwork::new(credentials.clone());
         let key = config.store_key.as_ref();
         let store = Store::open_with(id, &config.data_dir, key, config.raft, network).await?;
         tracing::info!(
             node_id = id,
             advertise = %config.advertise,
-            tls = config.tls.is_some(),
+            tls = credentials.is_some(),
             encrypted = key.is_some(),
             "manager open"
         );
         Ok(Manager {
             id,
             advertise: config.advertise,
-            tls: config.tls,
+            credentials,
+            ca_key_pem: config.tls.and_then(|t| t.ca_key_pem),
             heartbeat: config.heartbeat,
             controllers: config.controllers,
             vip: config.vip,
@@ -157,6 +166,12 @@ impl Manager {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// The credentials the manager serves and calls with, to renew and to
+    /// share with the agent beside it; `None` in plaintext.
+    pub fn credentials(&self) -> Option<std::sync::Arc<Credentials>> {
+        self.credentials.clone()
     }
 
     /// Reads this manager's metrics until its store shuts down.
@@ -184,16 +199,12 @@ impl Manager {
                 closing.clone(),
             ))
         });
-        let issuer = match self
-            .tls
-            .as_ref()
-            .and_then(|t| t.ca_key_pem.as_ref().map(|k| (t, k)))
-        {
-            Some((t, key)) => Some(join::Issuer {
-                ca: std::sync::Arc::new(legion_pki::Ca::load(&t.ca_pem, key)?),
+        let issuer = match (&self.credentials, &self.ca_key_pem) {
+            (Some(c), Some(key)) => Some(join::Issuer {
+                ca: std::sync::Arc::new(legion_pki::Ca::load(c.ca_pem(), key)?),
                 store: self.store.clone(),
             }),
-            None => None,
+            _ => None,
         };
         let vip = self.vip.clone().map(|(sys, config)| {
             tokio::spawn(vip::run(
@@ -222,28 +233,28 @@ impl Manager {
             advertise: self.advertise.clone(),
             store: self.store.clone(),
             closing,
-            peer_tls: self.tls.as_ref().map(Tls::client),
+            peer_tls: self.credentials.clone(),
             issuer,
             quota_lock: Default::default(),
             sessions,
             usage,
         };
-        let (dispatcher, dispatching) =
-            dispatcher::DispatcherService::start(api.clone(), self.tls.is_some(), self.heartbeat);
+        let (dispatcher, dispatching) = dispatcher::DispatcherService::start(
+            api.clone(),
+            self.credentials.is_some(),
+            self.heartbeat,
+        );
         let raft = raft_net::RaftService {
             store: self.store.clone(),
         };
         let mut server = tonic::transport::Server::builder();
-        if let Some(tls) = &self.tls {
-            server = server.tls_config(tls.server())?;
-        }
-        let on = self.tls.is_some();
+        let on = self.credentials.is_some();
         // Managers forward writes to the leader as themselves. Users get
         // what their RoleBindings give (authz.rs).
         const API: &[Role] = &[Role::Admin, Role::Manager, Role::User];
         const RAFT: &[Role] = &[Role::Manager];
         const DISPATCHER: &[Role] = &[Role::Worker, Role::Manager];
-        server
+        let router = server
             .add_service(tonic::service::interceptor::InterceptedService::new(
                 ObjectsServer::new(api.clone())
                     .max_decoding_message_size(MAX_MESSAGE)
@@ -274,15 +285,28 @@ impl Manager {
                     .max_decoding_message_size(MAX_MESSAGE)
                     .max_encoding_message_size(MAX_MESSAGE),
                 tls::only(RAFT, on),
-            ))
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), {
-                let closing_tx = closing_tx.clone();
-                async move {
-                    shutdown.await;
-                    let _ = closing_tx.send(true);
-                }
-            })
-            .await?;
+            ));
+        let stopping = {
+            let closing_tx = closing_tx.clone();
+            async move {
+                shutdown.await;
+                let _ = closing_tx.send(true);
+            }
+        };
+        // TLS is ended here rather than by tonic, so a renewed certificate
+        // is served without a restart.
+        match &self.credentials {
+            Some(c) => {
+                router
+                    .serve_with_incoming_shutdown(c.incoming(listener), stopping)
+                    .await?
+            }
+            None => {
+                router
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), stopping)
+                    .await?
+            }
+        }
         // The controllers hold a store handle; they stop on `closing`.
         let _ = closing_tx.send(true);
         if let Some(controllers) = controllers {

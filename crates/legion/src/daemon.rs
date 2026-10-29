@@ -65,9 +65,6 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     let tls = pki
         .ensure(&node, &opts.data_dir)
         .context("setting up certificates")?;
-    // The agent calls this manager as the node.
-    let control = GrpcControl::new(&node, vec![advertise.clone()], Some(tls.client()))
-        .map_err(|e| anyhow::anyhow!(e))?;
     let vip = match &opts.vip {
         Some(_) if !cfg!(target_os = "freebsd") => bail!("--vip needs CARP: FreeBSD only"),
         Some(v) => {
@@ -86,7 +83,21 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     .await
     .map_err(|e| anyhow::anyhow!(e))
     .context("opening the store")?;
-    let autolock = tokio::spawn(crate::autolock::follow(manager.store().clone(), pki));
+    let credentials = manager.credentials().expect("a manager serves with TLS");
+    // The agent calls this manager as the node, with the same credentials.
+    let control = GrpcControl::new(&node, vec![advertise.clone()], Some(credentials.clone()))
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let pki = Arc::new(std::sync::Mutex::new(pki));
+    let autolock = tokio::spawn(crate::autolock::follow(
+        manager.store().clone(),
+        pki.clone(),
+    ));
+    let renewal = tokio::spawn(crate::pki::renew_manager(
+        pki,
+        node.clone(),
+        opts.data_dir.clone(),
+        credentials,
+    ));
     let listener = tokio::net::TcpListener::bind(opts.listen)
         .await
         .with_context(|| format!("listening on {}", opts.listen))?;
@@ -122,6 +133,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         // every handle is gone: it must end before serving does.
         autolock.abort();
         let _ = autolock.await;
+        renewal.abort();
     };
     let served = manager
         .serve(listener, shutdown)
@@ -135,7 +147,11 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
 
 /// A worker node: the agent alone, calling the cluster's managers.
 async fn run_worker(opts: &Options, pki: &crate::pki::Pki, hostname: String) -> anyhow::Result<()> {
-    let (node, tls) = pki.worker()?;
+    let (node, bundle) = pki.worker()?;
+    let credentials =
+        legion_manager::Credentials::new(&bundle.ca_pem, &bundle.cert_pem, &bundle.key_pem)
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("loading the worker's certificate")?;
     if let Some(name) = &opts.node_name
         && *name != node
     {
@@ -155,7 +171,13 @@ async fn run_worker(opts: &Options, pki: &crate::pki::Pki, hostname: String) -> 
     if managers.is_empty() {
         bail!("no manager to call: pass --manager or join again");
     }
-    let control = GrpcControl::new(&node, managers, Some(tls)).map_err(|e| anyhow::anyhow!(e))?;
+    let control = GrpcControl::new(&node, managers, Some(credentials.clone()))
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let renewal = tokio::spawn(crate::pki::renew_worker(
+        crate::pki::Pki::new(&opts.data_dir),
+        credentials,
+        control.clone(),
+    ));
     let metrics_listener = bind_metrics(opts).await?;
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let advertise = opts.advertise.clone().unwrap_or_default();
@@ -175,6 +197,7 @@ async fn run_worker(opts: &Options, pki: &crate::pki::Pki, hostname: String) -> 
     });
     tracing::info!(%node, "worker running");
     crate::shutdown_signal().await;
+    renewal.abort();
     let _ = stop.send(true);
     let _ = agent.task.await;
     if let Some(metrics) = metrics {

@@ -42,7 +42,7 @@ pub struct ApiService {
     /// the server's graceful shutdown can finish.
     pub(crate) closing: tokio::sync::watch::Receiver<bool>,
     /// For forwarding to the leader.
-    pub(crate) peer_tls: Option<tonic::transport::ClientTlsConfig>,
+    pub(crate) peer_tls: Option<std::sync::Arc<crate::Credentials>>,
     /// Certifies joining nodes; managers without the CA key cannot.
     pub(crate) issuer: Option<crate::join::Issuer>,
     /// Held from quota check to write, so two applies cannot both fit.
@@ -89,6 +89,15 @@ impl ApiService {
         self.issuer
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("this manager cannot issue certificates"))
+    }
+
+    /// A certificate for `id` again, for a new key: any manager with the CA
+    /// signs it, leader or not, as nothing is written.
+    pub(crate) fn renew(&self, csr_pem: &str, id: &legion_pki::Identity) -> Result<String, Status> {
+        self.issuer()?
+            .ca
+            .sign(csr_pem, id, legion_pki::CERT_LIFETIME)
+            .map_err(|e| Status::invalid_argument(format!("certificate request: {e}")))
     }
 
     pub(crate) async fn join(

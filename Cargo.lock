@@ -1332,14 +1332,21 @@ dependencies = [
 name = "legion-proto"
 version = "0.1.0"
 dependencies = [
+ "hyper-util",
  "legion-api",
+ "legion-pki",
  "prost",
  "protox",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tower-service",
+ "tracing",
 ]
 
 [[package]]

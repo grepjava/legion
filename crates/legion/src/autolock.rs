@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use legion_proto::v1::unlock_server::{Unlock, UnlockServer};
@@ -77,11 +78,12 @@ pub async fn wait(listen: SocketAddr, data_dir: &Path) -> anyhow::Result<StoreKe
 
 /// Keeps `pki`'s private keys sealed with the unlock key the store holds,
 /// or in the clear when it holds none, for as long as the task runs.
-pub async fn follow(store: Store, mut pki: Pki) {
+pub async fn follow(store: Store, pki: Arc<Mutex<Pki>>) {
     loop {
         match legion_manager::autolock::current(&store) {
             Ok(now) => {
                 let wanted = now.map(|(key, _)| key);
+                let mut pki = pki.lock().unwrap_or_else(|e| e.into_inner());
                 if wanted.as_ref() != pki.lock() {
                     let sealing = wanted.is_some();
                     match pki.reseal(wanted) {

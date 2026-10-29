@@ -1286,7 +1286,19 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
 
 - **Cluster PKI**: a root CA is generated at `init` (or an external one is
   imported). Node certificates carry the node ID and role; default lifetime 90
-  days, renewed automatically at two-thirds of their life.
+  days, renewed automatically at two-thirds of their life. Built: a
+  running manager checks hourly and issues itself a new certificate
+  (written sealed if autolock is on, the admin bundle renewed with it); a
+  worker makes a new key and asks any manager for a certificate
+  (`Dispatcher.Renew`), which names whoever the calling certificate names,
+  so it cannot change a node's name or role, and writes the pair beside
+  the old one before renaming it in place, so a crash leaves one whole
+  pair. Neither restarts: Legion ends TLS itself
+  (`legion_proto::tls::Credentials`, rustls with a certificate resolver on
+  both sides) rather than through tonic's fixed configuration, so each
+  handshake after a renewal presents the new certificate and open
+  connections carry on. There is no revocation: a removed node's
+  certificate, renewals included, stays valid until it expires.
 - **Join tokens**: `LGN-1-<ca-digest>-<secret>`, with separate tokens for workers and
   managers, and rotation on demand. The digest lets a joining node verify the
   cluster it reaches before sending anything. Built: the joining node reads

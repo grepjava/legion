@@ -1,6 +1,6 @@
 [package]
 name = "legion-proto"
-description = "Legion gRPC definitions and generated code"
+description = "Legion gRPC definitions, generated code and the TLS transport"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,12 +8,19 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+hyper-util = { workspace = true, features = ["tokio"] }
 legion-api.workspace = true
+legion-pki.workspace = true
 prost.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tonic.workspace = true
+tokio = { workspace = true, features = ["net", "time", "sync", "rt", "macros"] }
+tokio-rustls.workspace = true
+tokio-stream.workspace = true
+tonic = { workspace = true, features = ["tls-ring"] }
 tonic-prost.workspace = true
+tower-service.workspace = true
+tracing.workspace = true
 
 [build-dependencies]
 protox.workspace = true

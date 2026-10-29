@@ -3,7 +3,9 @@
 use std::time::Duration;
 
 use legion_api::dispatch::{Assignment, Peer, ServiceEndpoints};
-use legion_manager::{Manager, ManagerConfig, Tls, client_config, default_raft_config};
+use legion_manager::{
+    Credentials, Manager, ManagerConfig, Tls, client_config, default_raft_config,
+};
 use legion_pki::{CERT_LIFETIME, Ca, Identity, Role};
 use legion_proto::v1::cluster_client::ClusterClient;
 use legion_proto::v1::dispatcher_client::DispatcherClient;
@@ -14,7 +16,7 @@ use legion_proto::v1::session_open::Action;
 use legion_proto::v1::{
     ApplyRequest, ApplyResult, AssignmentsRequest, DataRequest, DeleteRequest, EndpointsRequest,
     HeartbeatRequest, InitRequest, JoinTokenRequest, ListRequest, Object, ObjectRef, PeersRequest,
-    RegisterRequest, ReportRequest, StatusRequest, WatchRequest, watch_event,
+    RegisterRequest, RenewRequest, ReportRequest, StatusRequest, WatchRequest, watch_event,
 };
 use legion_proto::v1::{ExecOptions, LogsOptions, SessionFrame, SessionOpen};
 use legion_store::Store;
@@ -33,6 +35,8 @@ struct Running {
     addr: String,
     /// Admin credentials, when the manager runs with TLS.
     tls: Option<ClientTlsConfig>,
+    /// The manager's own, which it serves with.
+    credentials: Option<std::sync::Arc<Credentials>>,
     store: Store,
     metrics: legion_manager::metrics::ManagerMetrics,
     stop: Option<oneshot::Sender<()>>,
@@ -107,6 +111,7 @@ impl Running {
         .unwrap();
         let store = manager.store().clone();
         let metrics = manager.metrics();
+        let credentials = manager.credentials();
         let (stop, stopped) = oneshot::channel();
         let task = tokio::spawn(async move {
             manager
@@ -119,6 +124,7 @@ impl Running {
         Running {
             addr,
             tls: admin,
+            credentials,
             store,
             metrics,
             stop: Some(stop),
@@ -535,6 +541,111 @@ async fn mutual_tls() {
     for m in managers {
         m.stop().await;
     }
+}
+
+/// Whom a certificate names.
+fn named(cert_pem: &str) -> Identity {
+    legion_pki::Bundle {
+        cert_pem: cert_pem.to_owned(),
+        key_pem: String::new(),
+        ca_pem: String::new(),
+    }
+    .identity()
+    .unwrap()
+}
+
+/// The certificate the server at `addr` presents to a new connection.
+async fn served(addr: &str, ca: &Ca) -> Vec<u8> {
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from_pem_slice(ca.cert_pem().as_bytes()).unwrap())
+        .unwrap();
+    let config = tokio_rustls::rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        tokio_rustls::rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let tls = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+        .connect(ServerName::try_from(legion_pki::SERVER_NAME).unwrap(), tcp)
+        .await
+        .unwrap();
+    tls.get_ref().1.peer_certificates().unwrap()[0].to_vec()
+}
+
+fn der(cert_pem: &str) -> Vec<u8> {
+    use tokio_rustls::rustls::pki_types::CertificateDer;
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
+    CertificateDer::from_pem_slice(cert_pem.as_bytes())
+        .unwrap()
+        .to_vec()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn certificates_renew_without_restart() {
+    let ca = Ca::generate().unwrap();
+    let m = Running::start_with(Some(&ca)).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let endpoint =
+        || tonic::transport::Endpoint::from_shared(format!("http://{}", m.addr)).unwrap();
+
+    // A worker, calling as nodes do, gets a certificate for a new key
+    // that names it as before, and calls with it from then on.
+    let issued = ca
+        .issue(&Identity::new("w1", Role::Worker), CERT_LIFETIME)
+        .unwrap();
+    let worker = Credentials::new(ca.cert_pem(), &issued.cert_pem, &issued.key_pem).unwrap();
+    let renew = |channel: Channel| async move {
+        let (key_pem, csr_pem) = legion_pki::request().unwrap();
+        DispatcherClient::new(channel)
+            .renew(RenewRequest { csr_pem })
+            .await
+            .map(|r| (r.into_inner().cert_pem, key_pem))
+    };
+    let (cert_pem, key_pem) = renew(worker.channel(endpoint())).await.unwrap();
+    assert_ne!(cert_pem, issued.cert_pem);
+    assert_eq!(named(&cert_pem), Identity::new("w1", Role::Worker));
+    worker.renew(&cert_pem, &key_pem).unwrap();
+    renew(worker.channel(endpoint())).await.unwrap();
+
+    // Others are refused: managers issue their own, and admins and users
+    // are not nodes.
+    for (name, role) in [("m9", Role::Manager), ("admin", Role::Admin)] {
+        let other = m.channel(Some(&creds(&ca, name, role))).await.unwrap();
+        let err = renew(other).await.unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied, "{role:?}: {err}");
+    }
+    let err = DispatcherClient::new(worker.channel(endpoint()))
+        .renew(RenewRequest {
+            csr_pem: "not a request".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+
+    // The manager's own certificate, renewed while it serves: the next
+    // connection is shown the new one, and the API goes on.
+    let credentials = m.credentials.clone().unwrap();
+    let (current, _) = credentials.cert_and_key();
+    assert_eq!(served(&m.addr, &ca).await, der(&current));
+    let next = ca.issue(&named(&current), CERT_LIFETIME).unwrap();
+    credentials.renew(&next.cert_pem, &next.key_pem).unwrap();
+    assert_eq!(served(&m.addr, &ca).await, der(&next.cert_pem));
+    let listed = m
+        .objects()
+        .await
+        .list(ListRequest {
+            kind: "Service".into(),
+            ..Default::default()
+        })
+        .await;
+    assert!(listed.is_ok(), "{listed:?}");
+
+    m.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

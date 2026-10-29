@@ -257,8 +257,14 @@ fn guest_on_the_bridge() {
     assert!(reach(Some(&pod), &guest6, 8080));
     assert_eq!(fetch(&to_guest.to_string()).trim(), "from-the-guest");
     assert_eq!(fetch(&to_guest6).trim(), "from-the-guest");
-    assert!(guest.probes("probe", 0, "from-the-pod"), "the guest to a VIP");
-    assert!(guest.probes("probe6", 0, "from-the-pod"), "the guest to a VIP6");
+    assert!(
+        guest.probes("probe", 0, "from-the-pod"),
+        "the guest to a VIP"
+    );
+    assert!(
+        guest.probes("probe6", 0, "from-the-pod"),
+        "the guest to a VIP6"
+    );
 
     // Policy, with the tap as the guest's host end.
     let ips = |allowed: &[Ipv4Addr]| BTreeMap::from([("tfriends".to_owned(), allowed.to_vec())]);
@@ -307,9 +313,15 @@ fn guest_on_the_bridge() {
     // host still reaches it.
     let mark = guest.console().len();
     set(&[], false);
-    assert!(!reach(Some(&pod), &guest_ip.to_string(), 8080), "pod to guest");
+    assert!(
+        !reach(Some(&pod), &guest_ip.to_string(), 8080),
+        "pod to guest"
+    );
     assert!(!reach(Some(&pod), &guest6, 8080), "pod to guest over IPv6");
-    assert!(!reach(Some(&pod), &to_guest.to_string(), 80), "pod to its VIP");
+    assert!(
+        !reach(Some(&pod), &to_guest.to_string(), 80),
+        "pod to its VIP"
+    );
     assert!(reach(None, &guest_ip.to_string(), 8080), "the host");
     assert!(
         guest.probes("probe", mark, "refused"),
@@ -320,7 +332,10 @@ fn guest_on_the_bridge() {
     // Allowed: the pod on 8080, each the other's VIP.
     let mark = guest.console().len();
     set(&[pod_ip], true);
-    assert!(reach(Some(&pod), &guest_ip.to_string(), 8080), "pod to guest");
+    assert!(
+        reach(Some(&pod), &guest_ip.to_string(), 8080),
+        "pod to guest"
+    );
     assert!(reach(Some(&pod), &guest6, 8080), "pod to guest over IPv6");
     assert_eq!(fetch(&to_guest.to_string()).trim(), "from-the-guest");
     assert_eq!(fetch(&to_guest6).trim(), "from-the-guest");

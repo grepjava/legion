@@ -1219,7 +1219,10 @@ mod tests {
     fn ether() {
         let sh = Script::shell(vec![
             ("ifconfig epair0a", ok(CARP_SHOWN)),
-            ("ifconfig lo0", ok("lo0: flags=8049<UP,LOOPBACK> mtu 16384\n")),
+            (
+                "ifconfig lo0",
+                ok("lo0: flags=8049<UP,LOOPBACK> mtu 16384\n"),
+            ),
             ("ifconfig lp0123 ether c2:c4:69:1c:c3:ed", ok("")),
         ]);
         assert_eq!(sh.interface_ether("epair0a").unwrap(), "c2:c4:69:1c:c3:ed");

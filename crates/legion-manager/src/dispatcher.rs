@@ -33,8 +33,8 @@ use legion_proto::v1::{
     AssignmentsRequest, AssignmentsUpdate, ClaimVolumeRequest, ClaimVolumeResponse, DataRequest,
     DataResponse, EndpointsRequest, EndpointsUpdate, HeartbeatRequest, HeartbeatResponse,
     PeersRequest, PeersUpdate, PoliciesRequest, PoliciesUpdate, RegisterRequest, RegisterResponse,
-    ReportRequest, ReportResponse, RoutesRequest, RoutesUpdate, SessionFrame, SessionOffer,
-    SessionsRequest,
+    RenewRequest, RenewResponse, ReportRequest, ReportResponse, RoutesRequest, RoutesUpdate,
+    SessionFrame, SessionOffer, SessionsRequest,
 };
 use legion_store::{Command, Event, Outcome, Precondition, Store, WatchError};
 use tokio::sync::watch;
@@ -630,6 +630,25 @@ impl Dispatcher for DispatcherService {
         Ok(Response::new(ClaimVolumeResponse {
             claim_json: serde_json::to_vec(&claim).map_err(internal)?,
         }))
+    }
+
+    async fn renew(&self, req: Request<RenewRequest>) -> Result<Response<RenewResponse>, Status> {
+        let id = match crate::tls::caller(&req, self.tls)? {
+            Some(id) if id.role == Role::Worker => id,
+            Some(id) => {
+                return Err(Status::permission_denied(format!(
+                    "{id}: only workers renew here; managers issue their own"
+                )));
+            }
+            None => {
+                return Err(Status::failed_precondition(
+                    "this manager serves without TLS",
+                ));
+            }
+        };
+        let cert_pem = self.api.renew(&req.get_ref().csr_pem, &id)?;
+        tracing::info!(%id, "renewed a worker's certificate");
+        Ok(Response::new(RenewResponse { cert_pem }))
     }
 
     async fn data(&self, req: Request<DataRequest>) -> Result<Response<DataResponse>, Status> {

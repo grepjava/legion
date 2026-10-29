@@ -4,7 +4,8 @@ Where Legion stands against the roadmap in [docs/DESIGN.md](docs/DESIGN.md)
 (section 11). The design says what to build and why; this file says what is
 done and what comes next. Update it in the same commit as the work.
 
-Current phase: **3 — K8s-lite** (phases 1 and 2 met their exit criteria).
+Current work: **hardening** for real use, after phase 5 (phases 1 to 4
+met their exit criteria; phase 5's features are built, bhyve as a spike).
 
 ## Phase 0 — Spikes
 
@@ -301,8 +302,7 @@ remote FreeBSD server reached through a WireGuard site tunnel.
 
 Nothing left in phase 2.
 
-Smaller follow-ups: workers renew their certificates through managers;
-`--listen` still defaults to loopback; a worker without `--advertise` has
+Smaller follow-ups: `--listen` still defaults to loopback; a worker without `--advertise` has
 no WireGuard endpoint (it could use the address it reaches managers from);
 placement preferences (`spread`) are accepted but not used yet; the daemon takes Podman's storage driver from `storage.conf`
 (it could choose `vfs` itself when its root is not on ZFS); a node's
@@ -902,6 +902,38 @@ replaces Podman and ocijail.
 
 ### To do, in order
 
-Next in phase 5: decide on a `runtime: bhyve` (DESIGN.md §6.8 lists
-what it needs; the network needs nothing more).
+Nothing left in phase 5. Decided with the user (2026-10-29): bhyve stays
+a spike until a workload needs its own kernel; DESIGN.md §6.8 lists what
+a `runtime: bhyve` would take.
+
+## Hardening
+
+Follow-ups from the phases that matter before anyone runs Legion for
+real, in the order agreed with the user.
+
+### Done
+
+- **Certificate renewal without restarts** (DESIGN.md §9). Managers
+  renewed only at start, so one running 90 days served an expired
+  certificate, and workers never did. Now a running manager issues
+  itself a new certificate past two thirds of its life, and a worker
+  asks a manager for one (`Dispatcher.Renew`, for the identity its
+  current certificate names). TLS is ended by Legion
+  (`legion_proto::tls::Credentials`), with certificates picked per
+  handshake on both sides, so the new one is served and presented from
+  the next connection on. A worker writes the new pair beside the old
+  and renames it in place, and a manager whose key and certificate do
+  not match (a crash between writes) issues itself a new pair. Tested:
+  renewal through the dispatcher (a manager or admin refused), the
+  server's certificate replaced while serving, the worker's write
+  surviving a crash at each step; on FreeBSD 15.1, the phase 1 exit
+  test and the three-manager VIP test over the new transport.
+
+### To do, in order
+
+1. Guard a new pod before its containers start (phase 3 follow-up).
+2. Memory limits for workloads with large shared memory (phase 4
+   follow-up).
+3. Packaging: an rc.d script, defaults for `--listen` and a worker's
+   endpoint, and a port or release tarballs (DESIGN.md §13, question 2).
 

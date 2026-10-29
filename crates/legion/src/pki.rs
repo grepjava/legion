@@ -3,14 +3,17 @@
 //! The first start of a node that has not joined a cluster creates a
 //! cluster CA, this manager's certificate and `<data dir>/admin.pem`, the
 //! CLI's credentials. `legion join` writes the cluster's CA and the node's
-//! certificate instead, with the CA key only for managers. Managers reissue
-//! their own certificate once two thirds of its life are gone; workers
-//! cannot renew theirs yet.
+//! certificate instead, with the CA key only for managers. Once two thirds
+//! of a certificate's life are gone, a manager issues itself a new one and
+//! a worker asks a manager for one (`Renew`); the running daemon takes it
+//! over without a restart.
 
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
+use legion_manager::Credentials;
 use legion_pki::{Bundle, CERT_LIFETIME, Ca, Identity, Role};
 
 /// The CLI's credentials, written on first start.
@@ -169,7 +172,8 @@ impl Pki {
 
     /// A worker's name, from its certificate, and its credentials for
     /// calling managers.
-    pub fn worker(&self) -> anyhow::Result<(String, tonic::transport::ClientTlsConfig)> {
+    pub fn worker(&self) -> anyhow::Result<(String, Bundle)> {
+        self.finish_renewal()?;
         let missing = || format!("{} holds no worker certificate", self.dir.display());
         let bundle = Bundle {
             cert_pem: read(&self.path("node.crt"))?.with_context(missing)?,
@@ -185,13 +189,30 @@ impl Pki {
                 self.path("node.crt").display()
             );
         }
-        if legion_pki::needs_renewal(&bundle.cert_pem, SystemTime::now()) {
-            tracing::warn!(
-                "this worker's certificate is past two thirds of its life; join again before it expires"
-            );
+        Ok((id.name, bundle))
+    }
+
+    /// Replaces a worker's certificate and key. Both are written beside
+    /// the old ones first and then renamed over them, the key first, so a
+    /// crash leaves either the old pair or the new one complete beside it,
+    /// which the next start puts in place.
+    pub fn write_worker(&self, cert_pem: &str, key_pem: &str) -> anyhow::Result<()> {
+        write_private(&self.path(NEXT_KEY), key_pem)?;
+        write_public(&self.path(NEXT_CERT), cert_pem)?;
+        self.finish_renewal()
+    }
+
+    /// Puts a completely written new pair in place; drops a half-written
+    /// one (a key without its certificate).
+    fn finish_renewal(&self) -> anyhow::Result<()> {
+        let (key, cert) = (self.path(NEXT_KEY), self.path(NEXT_CERT));
+        if !cert.exists() {
+            return remove(&key);
         }
-        let tls = legion_manager::client_config(&bundle.ca_pem, &bundle.cert_pem, &bundle.key_pem);
-        Ok((id.name, tls))
+        if key.exists() {
+            rename(&key, &self.path("node.key"))?;
+        }
+        rename(&cert, &self.path("node.crt"))
     }
 
     /// The CA, this manager's credentials and the admin bundle, made or
@@ -220,8 +241,12 @@ impl Pki {
             (Some(cert), Some(key)) => Some((cert, key)),
             _ => None,
         };
-        let usable = current.as_ref().is_some_and(|(cert, _)| {
-            !legion_pki::needs_renewal(cert, SystemTime::now()) && issued_as(cert, &id)
+        // A crash between writing a new key and its certificate leaves a
+        // pair that does not belong together: issued again.
+        let usable = current.as_ref().is_some_and(|(cert, key)| {
+            !legion_pki::needs_renewal(cert, SystemTime::now())
+                && issued_as(cert, &id)
+                && Credentials::new(ca.cert_pem(), cert, key).is_ok()
         });
         let (cert_pem, key_pem) = match current {
             Some(pair) if usable => pair,
@@ -254,6 +279,107 @@ impl Pki {
             ca_key_pem: Some(ca.key_pem().to_owned()),
         })
     }
+}
+
+/// How often a running daemon checks whether its certificate needs
+/// renewing.
+const RENEWAL_CHECK: Duration = Duration::from_secs(3600);
+/// After a failed renewal, how soon to try again.
+const RENEWAL_RETRY: Duration = Duration::from_secs(300);
+
+/// A worker's next certificate and key, while it is written.
+const NEXT_CERT: &str = "node.crt.next";
+const NEXT_KEY: &str = "node.key.next";
+
+/// Keeps a manager's certificate current: past two thirds of its life,
+/// a new one is issued with the CA, written as autolock wants it, and
+/// served and called with from then on. The admin bundle is renewed
+/// alongside. Runs until aborted.
+pub async fn renew_manager(
+    pki: Arc<Mutex<Pki>>,
+    node: String,
+    data_dir: PathBuf,
+    credentials: Arc<Credentials>,
+) {
+    loop {
+        let wait = if legion_pki::needs_renewal(&credentials.cert_and_key().0, SystemTime::now()) {
+            let renewed = pki
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .ensure(&node, &data_dir)
+                .and_then(|tls| {
+                    credentials
+                        .renew(&tls.cert_pem, &tls.key_pem)
+                        .map_err(|e| anyhow::anyhow!(e))
+                });
+            match renewed {
+                Ok(()) => {
+                    tracing::info!("renewed this manager's certificate");
+                    RENEWAL_CHECK
+                }
+                Err(e) => {
+                    tracing::warn!("renewing this manager's certificate: {e:#}");
+                    RENEWAL_RETRY
+                }
+            }
+        } else {
+            RENEWAL_CHECK
+        };
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// Keeps a worker's certificate current: past two thirds of its life, it
+/// asks a manager to certify a new key under the same name, writes both
+/// and calls with them from then on. Runs until aborted.
+pub async fn renew_worker(
+    pki: Pki,
+    credentials: Arc<Credentials>,
+    control: legion_agent::GrpcControl,
+) {
+    loop {
+        let wait = if legion_pki::needs_renewal(&credentials.cert_and_key().0, SystemTime::now()) {
+            match renew_worker_once(&pki, &credentials, &control).await {
+                Ok(()) => {
+                    tracing::info!("renewed this worker's certificate");
+                    RENEWAL_CHECK
+                }
+                Err(e) => {
+                    tracing::warn!("renewing this worker's certificate: {e:#}");
+                    RENEWAL_RETRY
+                }
+            }
+        } else {
+            RENEWAL_CHECK
+        };
+        tokio::time::sleep(wait).await;
+    }
+}
+
+async fn renew_worker_once(
+    pki: &Pki,
+    credentials: &Credentials,
+    control: &legion_agent::GrpcControl,
+) -> anyhow::Result<()> {
+    let (key_pem, csr_pem) = legion_pki::request()?;
+    let cert_pem = control
+        .renew(csr_pem)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let current = Bundle {
+        cert_pem: credentials.cert_and_key().0,
+        key_pem: String::new(),
+        ca_pem: String::new(),
+    }
+    .identity()?;
+    if !issued_as(&cert_pem, &current) {
+        anyhow::bail!("the manager certified someone other than {current}");
+    }
+    // Checked to belong together before anything is written.
+    credentials
+        .renew(&cert_pem, &key_pem)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    pki.write_worker(&cert_pem, &key_pem)
 }
 
 /// The managers a worker calls, one `host:port` per line of
@@ -312,6 +438,11 @@ pub(crate) fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
 
 fn write_public(path: &Path, contents: &str) -> anyhow::Result<()> {
     write(path, contents, 0o644)
+}
+
+fn rename(from: &Path, to: &Path) -> anyhow::Result<()> {
+    std::fs::rename(from, to)
+        .with_context(|| format!("moving {} to {}", from.display(), to.display()))
 }
 
 fn remove(path: &Path) -> anyhow::Result<()> {
@@ -380,5 +511,59 @@ mod tests {
             &renamed.cert_pem,
             &Identity::new("n2", Role::Manager)
         ));
+
+        // A key without its certificate (a crash between the writes): a
+        // new pair, not one that fails every handshake.
+        let (key_pem, _) = legion_pki::request().unwrap();
+        write_private(&pki.path("node.key"), &key_pem).unwrap();
+        let healed = pki.ensure("n2", dir.path()).unwrap();
+        assert_ne!(healed.cert_pem, renamed.cert_pem);
+        assert!(Credentials::new(&healed.ca_pem, &healed.cert_pem, &healed.key_pem).is_ok());
+    }
+
+    #[test]
+    fn a_worker_renewal_survives_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let pki = Pki::new(dir.path());
+        let ca = Ca::generate().unwrap();
+        let issue = || {
+            ca.issue(&Identity::new("w1", Role::Worker), CERT_LIFETIME)
+                .unwrap()
+        };
+        let first = issue();
+        pki.write_joined(&legion_manager::Joined {
+            role: Role::Worker,
+            tls: legion_manager::Tls {
+                ca_pem: ca.cert_pem().into(),
+                cert_pem: first.cert_pem.clone(),
+                key_pem: first.key_pem.clone(),
+                ca_key_pem: None,
+            },
+        })
+        .unwrap();
+        let current = |pki: &Pki| {
+            let (name, b) = pki.worker().unwrap();
+            assert_eq!(name, "w1");
+            (b.cert_pem, b.key_pem)
+        };
+
+        let second = issue();
+        pki.write_worker(&second.cert_pem, &second.key_pem).unwrap();
+        assert_eq!(current(&pki), (second.cert_pem.clone(), second.key_pem));
+
+        // Down before the certificate was written: the old pair stays.
+        let third = issue();
+        write_private(&pki.path(NEXT_KEY), &third.key_pem).unwrap();
+        assert_eq!(current(&pki).0, second.cert_pem);
+        assert!(!pki.path(NEXT_KEY).exists());
+        // Down after both were written, or after the key was moved: the
+        // new pair is put in place.
+        write_private(&pki.path(NEXT_KEY), &third.key_pem).unwrap();
+        write_public(&pki.path(NEXT_CERT), &third.cert_pem).unwrap();
+        assert_eq!(current(&pki), (third.cert_pem.clone(), third.key_pem));
+        let fourth = issue();
+        write_private(&pki.path("node.key"), &fourth.key_pem).unwrap();
+        write_public(&pki.path(NEXT_CERT), &fourth.cert_pem).unwrap();
+        assert_eq!(current(&pki), (fourth.cert_pem, fourth.key_pem));
     }
 }

@@ -47,6 +47,17 @@ service Dispatcher {
   // An offered session: the agent's first frame is `attach` with its id;
   // then the manager relays the user's input and the agent's output.
   rpc Attach(stream SessionFrame) returns (stream SessionFrame);
+  // A new certificate for the calling worker, as its current one names
+  // it, for the key `csr_pem` was made with. Managers issue their own.
+  rpc Renew(RenewRequest) returns (RenewResponse);
+}
+
+message RenewRequest {
+  string csr_pem = 1;
+}
+
+message RenewResponse {
+  string cert_pem = 1;
 }
 
 message SessionsRequest {

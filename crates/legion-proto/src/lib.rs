@@ -1,5 +1,8 @@
 //! Generated gRPC code for Legion's API and Raft transport, plus conversions
-//! between the wire envelope and [`legion_api::Object`].
+//! between the wire envelope and [`legion_api::Object`], and the TLS
+//! transport ([`tls`]).
+
+pub mod tls;
 
 pub mod v1 {
     tonic::include_proto!("legion.v1");

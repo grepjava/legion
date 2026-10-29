@@ -3,7 +3,7 @@
 //! may call what follows from the client certificate's role.
 
 use legion_pki::{Identity, Role, SERVER_NAME};
-use tonic::transport::{Certificate, ClientTlsConfig, Identity as TlsIdentity, ServerTlsConfig};
+use tonic::transport::{Certificate, ClientTlsConfig, Identity as TlsIdentity};
 use tonic::{Request, Status};
 
 /// A manager's credentials: the cluster CA and its own certificate.
@@ -14,25 +14,6 @@ pub struct Tls {
     pub key_pem: String,
     /// Managers hold the CA key, to certify joining nodes.
     pub ca_key_pem: Option<String>,
-}
-
-impl Tls {
-    /// The chain includes the CA, which joining nodes read (and check
-    /// against their token) before they trust it. Client certificates are
-    /// optional in the handshake, for `Join`; every other service requires
-    /// one.
-    pub(crate) fn server(&self) -> ServerTlsConfig {
-        let chain = format!("{}{}", self.cert_pem, self.ca_pem);
-        ServerTlsConfig::new()
-            .identity(TlsIdentity::from_pem(chain, &self.key_pem))
-            .client_ca_root(Certificate::from_pem(&self.ca_pem))
-            .client_auth_optional(true)
-    }
-
-    /// For calls to other managers, as this manager.
-    pub fn client(&self) -> ClientTlsConfig {
-        client_config(&self.ca_pem, &self.cert_pem, &self.key_pem)
-    }
 }
 
 /// A client of a manager: verifies it against the cluster CA and presents
