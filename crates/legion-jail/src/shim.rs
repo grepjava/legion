@@ -50,7 +50,7 @@ mod imp {
 
 #[cfg(target_os = "freebsd")]
 mod imp {
-    use std::ffi::{CStr, CString};
+    use std::ffi::CString;
     use std::io::Write;
     use std::os::fd::RawFd;
     use std::path::Path;
@@ -368,17 +368,16 @@ mod imp {
                 libc::ioctl(0, libc::TIOCSCTTY, 0);
             }
         }
-        let user = resolve_user(&rec.user)?;
+        // In the jail, so these are the image's own.
+        let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+        let user = crate::users::resolve(&rec.user, &read("/etc/passwd"), &read("/etc/group"))?;
+        let groups: Vec<libc::gid_t> = user.groups.iter().map(|&g| g as _).collect();
         // SAFETY: dropping privileges: groups, then gid, then uid.
         unsafe {
-            let groups_set = match &user.name {
-                Some(n) => libc::initgroups(n.as_ptr(), user.gid as _) == 0,
-                None => libc::setgroups(1, &user.gid) == 0,
-            };
-            if !groups_set {
+            if libc::setgroups(groups.len() as _, groups.as_ptr()) != 0 {
                 return Err(format!("setting the groups of {}: {}", rec.user, errno()));
             }
-            if libc::setgid(user.gid) != 0 || libc::setuid(user.uid) != 0 {
+            if libc::setgid(user.gid as _) != 0 || libc::setuid(user.uid as _) != 0 {
                 return Err(format!("becoming {}: {}", rec.user, errno()));
             }
         }
@@ -424,67 +423,5 @@ mod imp {
     fn executable(path: &str) -> bool {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-    }
-
-    struct User {
-        uid: libc::uid_t,
-        gid: libc::gid_t,
-        /// For the supplementary groups, when the jail knows the user.
-        name: Option<CString>,
-        home: String,
-    }
-
-    /// `user[:group]` by name or number, from the jail's own databases.
-    fn resolve_user(spec: &str) -> Result<User, String> {
-        let (user, group) = match spec.split_once(':') {
-            Some((u, g)) => (u, Some(g)),
-            None => (spec, None),
-        };
-        let user = if user.is_empty() { "0" } else { user };
-        // SAFETY: getpwnam/getpwuid return a pointer to static storage or
-        // null; it is read at once.
-        let pw = unsafe {
-            match user.parse::<libc::uid_t>() {
-                Ok(uid) => libc::getpwuid(uid),
-                Err(_) => libc::getpwnam(cstring(user)?.as_ptr()),
-            }
-        };
-        let (uid, mut gid, name, home) = if pw.is_null() {
-            let uid = user
-                .parse()
-                .map_err(|_| format!("no user {user:?} in the image"))?;
-            (uid, 0, None, "/".to_owned())
-        } else {
-            // SAFETY: pw is a valid passwd entry.
-            unsafe {
-                let p = &*pw;
-                (
-                    p.pw_uid,
-                    p.pw_gid,
-                    Some(CStr::from_ptr(p.pw_name).to_owned()),
-                    CStr::from_ptr(p.pw_dir).to_string_lossy().into_owned(),
-                )
-            }
-        };
-        if let Some(g) = group {
-            gid = match g.parse() {
-                Ok(n) => n,
-                Err(_) => {
-                    // SAFETY: as above, for the group database.
-                    let gr = unsafe { libc::getgrnam(cstring(g)?.as_ptr()) };
-                    if gr.is_null() {
-                        return Err(format!("no group {g:?} in the image"));
-                    }
-                    // SAFETY: gr is a valid group entry.
-                    unsafe { (*gr).gr_gid }
-                }
-            };
-        }
-        Ok(User {
-            uid,
-            gid,
-            name,
-            home,
-        })
     }
 }

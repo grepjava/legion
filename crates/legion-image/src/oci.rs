@@ -78,28 +78,29 @@ impl Document {
     }
 }
 
-/// This node's platform in OCI's words.
-pub fn platform() -> (&'static str, &'static str) {
-    let arch = match std::env::consts::ARCH {
+/// This node's architecture in OCI's words.
+pub fn arch() -> &'static str {
+    match std::env::consts::ARCH {
         "x86_64" => "amd64",
         "aarch64" => "arm64",
         "x86" => "386",
         "powerpc64" => "ppc64",
         "riscv64" => "riscv64",
         other => other,
-    };
-    ("freebsd", arch)
+    }
 }
 
-/// The entry of an index for this node's platform.
-pub fn select(manifests: &[Descriptor]) -> Result<&Descriptor, Error> {
-    let (os, arch) = platform();
-    manifests
-        .iter()
-        .find(|m| {
-            m.platform
-                .as_ref()
-                .is_some_and(|p| p.os == os && p.architecture == arch)
+/// The entry of an index for this node's architecture and the first of
+/// `oses`, in order of preference, that it offers.
+pub fn select<'a>(manifests: &'a [Descriptor], oses: &[&str]) -> Result<&'a Descriptor, Error> {
+    let arch = arch();
+    oses.iter()
+        .find_map(|os| {
+            manifests.iter().find(|m| {
+                m.platform
+                    .as_ref()
+                    .is_some_and(|p| p.os == *os && p.architecture == arch)
+            })
         })
         .ok_or_else(|| {
             let offered: Vec<String> = manifests
@@ -107,8 +108,10 @@ pub fn select(manifests: &[Descriptor]) -> Result<&Descriptor, Error> {
                 .filter_map(|m| m.platform.as_ref())
                 .map(|p| format!("{}/{}", p.os, p.architecture))
                 .collect();
+            let wanted: Vec<String> = oses.iter().map(|os| format!("{os}/{arch}")).collect();
             Error::Unsupported(format!(
-                "no image for {os}/{arch} (offered: {})",
+                "no image for {} (offered: {})",
+                wanted.join(" or "),
                 if offered.is_empty() {
                     "none".to_owned()
                 } else {
@@ -207,14 +210,28 @@ mod tests {
 
     #[test]
     fn selects_this_platform() {
-        let (os, arch) = platform();
+        let arch = arch();
         let list: Vec<Descriptor> = serde_json::from_value(serde_json::json!([
             {"digest": "sha256:l", "platform": {"os": "linux", "architecture": arch}},
-            {"digest": "sha256:f", "platform": {"os": os, "architecture": arch}},
+            {"digest": "sha256:o", "platform": {"os": "freebsd", "architecture": "other"}},
+            {"digest": "sha256:f", "platform": {"os": "freebsd", "architecture": arch}},
         ]))
         .unwrap();
-        assert_eq!(select(&list).unwrap().digest, "sha256:f");
-        let e = select(&list[..1]).unwrap_err().to_string();
-        assert!(e.contains(&format!("linux/{arch}")), "{e}");
+        let both = ["freebsd", "linux"];
+        assert_eq!(select(&list, &["freebsd"]).unwrap().digest, "sha256:f");
+        assert_eq!(select(&list, &both).unwrap().digest, "sha256:f");
+        assert_eq!(select(&list[..2], &both).unwrap().digest, "sha256:l");
+        let e = select(&list[..2], &["freebsd"]).unwrap_err().to_string();
+        assert!(
+            e.contains(&format!(
+                "no image for freebsd/{arch} (offered: linux/{arch}"
+            )),
+            "{e}"
+        );
+        let e = select(&list[1..2], &both).unwrap_err().to_string();
+        assert!(
+            e.contains(&format!("freebsd/{arch} or linux/{arch}")),
+            "{e}"
+        );
     }
 }

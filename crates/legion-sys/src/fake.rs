@@ -64,6 +64,8 @@ struct State {
     origins: BTreeMap<String, String>,
     /// tmpfs mount points, with their size.
     mounts: BTreeMap<String, Option<u64>>,
+    /// devfs links: path, target. They go with their devfs's unmount.
+    links: BTreeMap<String, String>,
     default_interface: Option<String>,
     sysctls: BTreeMap<String, String>,
     main_rules: String,
@@ -289,6 +291,10 @@ impl FakeSys {
     /// tmpfs mount points and their sizes.
     pub fn tmpfs_mounts(&self) -> BTreeMap<String, Option<u64>> {
         self.state().mounts.clone()
+    }
+
+    pub fn devfs_links(&self) -> BTreeMap<String, String> {
+        self.state().links.clone()
     }
 }
 
@@ -1093,8 +1099,25 @@ must destroy them to overwrite it"
         self.mount_tmpfs(target, None, 0)
     }
 
+    fn devfs_link(&self, dev: &str, name: &str, target: &str) -> Result<()> {
+        let link = format!("{}/{name}", dev.trim_end_matches('/'));
+        let mut s = self.state();
+        if s.links.contains_key(&link) {
+            return Err(fail("ln", format!("{link}: File exists")));
+        }
+        s.links.insert(link, target.to_owned());
+        Ok(())
+    }
+
+    fn mount_pseudo(&self, _fstype: &str, target: &str, _options: &str) -> Result<()> {
+        self.mount_tmpfs(target, None, 0)
+    }
+
     fn unmount(&self, path: &str) -> Result<()> {
-        match self.state().mounts.remove(path) {
+        let mut s = self.state();
+        let inside = format!("{path}/");
+        s.links.retain(|l, _| !l.starts_with(&inside));
+        match s.mounts.remove(path) {
             Some(_) => Ok(()),
             None => Err(fail(
                 "umount",

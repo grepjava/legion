@@ -150,6 +150,9 @@ pub struct Platform {
     pub os: String,
     /// OCI architecture name: `amd64`, `arm64`.
     pub arch: String,
+    /// Whether the node runs Linux images too, through the Linux ABI.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub linux: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

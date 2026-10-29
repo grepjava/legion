@@ -41,6 +41,19 @@ const ANNOTATION_SYSV: [(&str, &str); 3] = [
 /// The pod jail's root: it runs nothing, and its members' roots lie
 /// outside it.
 const POD_ROOT: &str = "/var/empty";
+/// What Linux programs expect beside `/dev` (as the Handbook's Linux
+/// jails have them): file system type, where, options.
+const LINUX_MOUNTS: [(&str, &str, &str); 4] = [
+    ("linprocfs", "/proc", ""),
+    ("linsysfs", "/sys", ""),
+    ("fdescfs", "/dev/fd", "linrdlnk"),
+    ("tmpfs", SHM, ""),
+];
+
+/// Where a Linux container's `/dev/shm` is: nothing mounts on a devfs
+/// directory, so `/dev/shm` links to this tmpfs.
+const SHM: &str = "/.legion-shm";
+
 /// devfs(8)'s ruleset for jails.
 const DEVFS_RULESET: u32 = 4;
 /// How often state is looked at for exits.
@@ -429,6 +442,16 @@ impl JailRuntime {
             .get(&spec.image)
             .map_err(image_error)?
             .ok_or_else(|| api(404, format!("{}: image not known", spec.image)))?;
+        let linux = image.config.os == "linux";
+        if linux && !self.images.runs("linux") {
+            return Err(api(
+                400,
+                format!(
+                    "{} is a Linux image, and this node does not run them (legion daemon --linux)",
+                    spec.image
+                ),
+            ));
+        }
         let mut params = Vec::new();
         if let Some(p) = spec.annotations.get(ANNOTATION_JAIL) {
             for kv in p.split_whitespace() {
@@ -534,6 +557,7 @@ impl JailRuntime {
             params,
             stop_signal: state::signal(&cfg.stop_signal).unwrap_or(15),
             stop_timeout: spec.stop_timeout.unwrap_or(10),
+            linux,
         })
     }
 
@@ -549,6 +573,25 @@ impl JailRuntime {
         if !is_mounted(&dev) {
             sys.mount_devfs(&dev.to_string_lossy(), DEVFS_RULESET)
                 .map_err(internal)?;
+        }
+        if rec.linux {
+            for (fstype, at, options) in LINUX_MOUNTS {
+                let at = target(&rec.root, at, false)?;
+                if is_mounted(&at) {
+                    continue;
+                }
+                let at = at.to_string_lossy();
+                match fstype {
+                    "tmpfs" => sys.mount_tmpfs(&at, None, 0o1777),
+                    _ => sys.mount_pseudo(fstype, &at, options),
+                }
+                .map_err(internal)?;
+            }
+            // Made with the devfs, so only a new one lacks it.
+            if !is_mounted(&dev) {
+                sys.devfs_link(&dev.to_string_lossy(), "shm", SHM)
+                    .map_err(internal)?;
+            }
         }
         for m in &rec.mounts {
             let file = std::fs::metadata(&m.source)

@@ -49,6 +49,8 @@ pub struct Store {
     dir: PathBuf,
     client: Client,
     lock: tokio::sync::Mutex<()>,
+    /// Operating systems whose images the node runs, preferred first.
+    oses: Vec<&'static str>,
 }
 
 enum Source<'a> {
@@ -62,13 +64,13 @@ enum Source<'a> {
 }
 
 impl Source<'_> {
-    async fn manifest(&self) -> Result<(String, Manifest), Error> {
+    async fn manifest(&self, oses: &[&str]) -> Result<(String, Manifest), Error> {
         match self {
             Source::Registry {
                 client,
                 reference,
                 creds,
-            } => client.manifest(reference, *creds).await,
+            } => client.manifest(reference, *creds, oses).await,
             Source::Layout(dir) => {
                 let mut doc = Document::parse(&std::fs::read(dir.join("index.json"))?)?;
                 let mut digest = String::new();
@@ -79,7 +81,7 @@ impl Source<'_> {
                     };
                     let chosen = match manifests.as_slice() {
                         [one] => one,
-                        many => oci::select(many)?,
+                        many => oci::select(many, oses)?,
                     };
                     digest = chosen.digest.clone();
                     let bytes = std::fs::read(blob_path(dir, &digest)?)?;
@@ -206,7 +208,24 @@ impl Store {
             dir: dir.to_owned(),
             client,
             lock: tokio::sync::Mutex::new(()),
+            oses: vec!["freebsd"],
         })
+    }
+
+    /// Takes Linux images too, where the image offers no FreeBSD one: for
+    /// nodes that run them through the Linux ABI.
+    pub fn with_linux(mut self, linux: bool) -> Store {
+        self.oses = if linux {
+            vec!["freebsd", "linux"]
+        } else {
+            vec!["freebsd"]
+        };
+        self
+    }
+
+    /// Whether the node runs images for `os`.
+    pub fn runs(&self, os: &str) -> bool {
+        self.oses.contains(&os)
     }
 
     fn index_path(&self) -> PathBuf {
@@ -347,7 +366,7 @@ impl Store {
         r: &Reference,
         private: Option<&str>,
     ) -> Result<Image, Error> {
-        let (digest, manifest) = source.manifest().await?;
+        let (digest, manifest) = source.manifest(&self.oses).await?;
         let tmp = tempfile::Builder::new()
             .prefix("pull")
             .tempdir_in(self.dir.join("tmp"))?;
@@ -355,11 +374,12 @@ impl Store {
         source.blob(&manifest.config.digest, &config_path).await?;
         let config: ImageConfig = serde_json::from_slice(&std::fs::read(&config_path)?)
             .map_err(|e| Error::Unsupported(format!("the image config: {e}")))?;
-        let (os, _) = oci::platform();
-        if !config.os.is_empty() && config.os != os {
+        if !config.os.is_empty() && !self.oses.contains(&config.os.as_str()) {
             return Err(Error::Unsupported(format!(
-                "{r} is an image for {}/{}, not {os}",
-                config.os, config.architecture
+                "{r} is an image for {}/{}; this node runs {} images",
+                config.os,
+                config.architecture,
+                self.oses.join(" and ")
             )));
         }
         if config.rootfs.diff_ids.len() != manifest.layers.len() {

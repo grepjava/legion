@@ -199,6 +199,14 @@ pub trait Sys: Send + Sync {
     /// Mounts a devfs at `target` showing what devfs ruleset `ruleset`
     /// allows.
     fn mount_devfs(&self, target: &str, ruleset: u32) -> Result<()>;
+    /// Makes `name` in the devfs mounted at `dev` a symbolic link to
+    /// `target`, shown whatever the mount's ruleset hides. (devfs makes
+    /// directories but nothing mounts on them, and links are how it shows
+    /// other file systems.)
+    fn devfs_link(&self, dev: &str, name: &str, target: &str) -> Result<()>;
+    /// Mounts a file system that needs no source (`linprocfs`, `linsysfs`,
+    /// `fdescfs`) at `target`, with `options` if not empty.
+    fn mount_pseudo(&self, fstype: &str, target: &str, options: &str) -> Result<()>;
     /// Unmounts `path`, forcibly: callers unmount only what nothing uses.
     fn unmount(&self, path: &str) -> Result<()>;
     /// Mount points at or below `prefix`.

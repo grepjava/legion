@@ -68,9 +68,9 @@ impl Registry {
     }
 
     /// An image of these layers for `os`, under an index that also holds a
-    /// Linux one.
+    /// Linux one, listed first, if `os` is another.
     fn image(&mut self, repo: &str, tag: &str, os: &str, layers: &[(Vec<u8>, String)]) {
-        let (_, arch) = oci::platform();
+        let arch = oci::arch();
         let config = json!({
             "architecture": arch, "os": os,
             "config": {"cmd": ["/bin/sh"], "Env": ["PATH=/bin"]},
@@ -94,19 +94,24 @@ impl Registry {
                    "layers": descs}),
             oci::OCI_MANIFEST,
         );
-        let linux = self.doc(
-            repo,
-            None,
-            json!({"schemaVersion": 2, "config": {"digest": cfg}, "layers": []}),
-            oci::OCI_MANIFEST,
-        );
+        let mut entries =
+            vec![json!({"digest": manifest, "platform": {"os": os, "architecture": arch}})];
+        if os != "linux" {
+            let linux = self.doc(
+                repo,
+                None,
+                json!({"schemaVersion": 2, "config": {"digest": cfg}, "layers": []}),
+                oci::OCI_MANIFEST,
+            );
+            entries.insert(
+                0,
+                json!({"digest": linux, "platform": {"os": "linux", "architecture": arch}}),
+            );
+        }
         self.doc(
             repo,
             Some(tag),
-            json!({"schemaVersion": 2, "mediaType": oci::OCI_INDEX, "manifests": [
-                {"digest": linux, "platform": {"os": "linux", "architecture": arch}},
-                {"digest": manifest, "platform": {"os": os, "architecture": arch}},
-            ]}),
+            json!({"schemaVersion": 2, "mediaType": oci::OCI_INDEX, "manifests": entries}),
             oci::OCI_INDEX,
         );
     }
@@ -314,6 +319,22 @@ async fn pulls_share_layers_and_removal_waits_for_containers() {
         .await
         .unwrap_err();
     assert!(e.to_string().contains("no image for freebsd"), "{e}");
+    assert!(!s.runs("linux"));
+    // With the Linux ABI, Linux images too, but FreeBSD ones first.
+    let s = store(&sys, t.path(), &addr).with_linux(true);
+    assert!(s.runs("linux"));
+    let linux = s
+        .pull(&format!("{addr}/team/linux:1"), None, "t")
+        .await
+        .unwrap();
+    assert_eq!(linux.config.os, "linux");
+    let app = s
+        .pull(&format!("{addr}/team/app:1"), None, "t")
+        .await
+        .unwrap();
+    assert_eq!(app.config.os, "freebsd");
+    s.remove(&format!("{addr}/team/linux:1")).await.unwrap();
+    s.remove(&format!("{addr}/team/app:1")).await.unwrap();
     let e = s
         .pull(&format!("{addr}/team/none:1"), None, "t")
         .await

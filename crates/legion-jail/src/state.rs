@@ -38,6 +38,9 @@ pub struct Record {
     pub stop_signal: i32,
     /// Seconds.
     pub stop_timeout: u64,
+    /// A Linux image's, run through the Linux ABI.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub linux: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -249,7 +249,8 @@ preconditions. Rules:
 Filter, then score, per task:
 
 1. **Filters**: node is `ready` and `active` (not drained or paused); platform
-   matches the image (os/arch, and `linux` capability for Linux images);
+   constraints hold (`node.platform.arch`, `node.platform.linux == true` for
+   Linux images: the manager does not read images, 6.6);
    resource **requests** fit in allocatable capacity; constraints match node
    labels; the task tolerates every taint on the node; required anti-affinity
    holds; host-mode published ports are free; stateful tasks go to the node
@@ -510,7 +511,7 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
 | Stateful migration | Draining a node moves each wanted stateful ordinal's Volumes to a node its service may run on, the one with fewest of its tasks: the Service controller records a migration in the Volume's status (`copying`); the leader's migrator has the old node's agent snapshot and `zfs send` a full copy while the task runs, and the new node's `zfs receive -u` it, joining the two agents' sessions (3.8), so nodes need no port. Once `copied`, the drain stops the task; with nothing on a node using the Volume it is `finishing`: a second snapshot's increment goes, the Volume becomes the new node's (mounted, the migration's snapshots gone) and the old node drops its copy. The slot's next task waits (`volume moving`) and then runs there. A migration whose new node goes away, or whose old node stops draining before the last part, is dropped and started again if still needed; a failed attempt is noted in it and retried. A stale copy on the receiving node is replaced. A Volume's `spec.node` (`legion volume move VOLUME NODE`) asks for its data on a node: unset, the first task to use the Volume chooses; set before then, that task goes there; set to another node than the data's, a migration to it starts once the node is ready and active, and the tasks using the Volume on the old node stop once it is copied, as off a draining node, their next ones waiting until it has moved (`volume moving` holds new placements throughout a migration). A drain still moves a Volume asked to be on the draining node; the data returns once the node is active again. A migration lasts while a drain or the Volume's `node` calls for it. | 4 |
 | CARP manager VIP | Optional floating address for the API: `legion daemon --vip ADDR --vip-interface IF --vip-password-file F [--vip-vhid N]` on managers sharing a link puts ADDR on IF as a CARP virtual host (`/32`, loading `carp`). Any manager answers the API, so the address need only be on a running one: the leader advertises skew 0 and forces itself master when it is not, followers advertise 100 and keep the address only until a better advertiser takes it, so it never goes without a holder (a follower holds it while a manager without `--vip` leads). Set again every 5 s and on every leadership change; released on shutdown, so a clean stop hands it on at once and a crash after CARP's timeout (3 s). The API listens on `0.0.0.0` to answer on it; certificates name the fixed server name, so no change is needed for clients using it. | 4 |
 | Security profiles | Per-service jail parameters (e.g. `allow.raw_sockets`, securelevel, enforce_statfs), with optional MAC policy. | 3 |
-| Linux images | Via `linux64` on nodes labelled with the `linux` capability. | 5 |
+| Linux images | Via `linux64` on nodes started with `--linux`, which placement selects with `node.platform.linux == true` (6.6). | 5 |
 | bhyve tasks | `runtime: bhyve` for workloads that need their own kernel. | 5 (exploratory) |
 
 ---
@@ -789,7 +790,8 @@ says why that went and what was kept of it.
   or with a bearer token from the registry's auth service (basic
   credentials answer a challenge), following redirects to CDNs and the
   host's proxy settings. From an index it picks the entry for
-  `freebsd/<arch>`; images for another OS are refused. Every blob is
+  `freebsd/<arch>`, then on a node that runs them `linux/<arch>` (6.6);
+  images for another OS are refused. Every blob is
   checked against its digest, and a manifest asked for by digest too.
 - **Logins**: a pod's `imagePullSecrets` name Secrets of its namespace
   holding Docker configs (`{"auths": {"ghcr.io": {"auth": ...}}}`, as
@@ -929,6 +931,36 @@ copy of its image. Built as a second implementation of the agent's
 `Runtime` trait, it passed every phase's exit test on one node and across
 the lab cluster on 2026-10-29, became the default, and the Podman runtime
 (`legion-podman`, the hook) was removed the same day.
+
+### 6.6 Linux images (phase 5)
+
+A node started with `legion daemon --linux` also runs images that offer
+no FreeBSD build, through FreeBSD's Linux ABI (linux(4)):
+
+- The daemon loads `linux64`, `linprocfs`, `linsysfs`, `fdescfs` and
+  `tmpfs`, and does not start if it cannot. The node's status says
+  `platform.linux: true`; the manager does not read images, so in a cluster
+  with other nodes a service with a Linux image asks for such nodes with
+  the constraint `node.platform.linux == true`.
+- Pulls take `freebsd/<arch>` from an index first, then `linux/<arch>`.
+  A node without `--linux` refuses Linux images at the pull, and one
+  already in its store at the start.
+- A Linux container is a child jail like any other, of a FreeBSD pod jail.
+  Beside its devfs it gets what Linux programs expect, as the Handbook's
+  Linux jails have it: linprocfs at `/proc`, linsysfs at `/sys`, fdescfs
+  (`linrdlnk`) at `/dev/fd`, and `/dev/shm`. devfs makes directories, but
+  nothing mounts on them (`EOPNOTSUPP`), so `/dev/shm` is a link in the
+  container's devfs, unhidden for that mount alone (`devfs rule apply`),
+  to a tmpfs (mode 1777) at `/.legion-shm` in its root.
+- musl and glibc programs both run without `kern.elf64.fallback_brand`:
+  tested with `alpine:3.20` and `debian:bookworm-slim` from Docker Hub,
+  as `nobody`, on FreeBSD 15.1.
+- The supervisor reads the container's user from the image's
+  `/etc/passwd` and `/etc/group` as text, for every image: Linux images
+  have no `pwd.db`, and FreeBSD images keep the text files beside it.
+- The ABI is not Linux: no namespaces, cgroups, seccomp or io_uring, so
+  images that run their own containers or sandboxes do not work, and
+  programs reading Linux-only `/proc` or `/sys` files may not either.
 
 ## 7. Object model
 

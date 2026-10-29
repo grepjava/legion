@@ -839,9 +839,20 @@ replaces Podman and ocijail.
   runtime now notes when a task finds or pulls an image, and pruning
   holds that note while it removes, so such an image stays another hour.
   Re-checked on FreeBSD: the runtime's live test.
+- **Linux images** (DESIGN.md §6.6): `legion daemon --linux` loads the
+  Linux ABI and its file systems, takes `linux/<arch>` where an image has
+  no FreeBSD build and reports `platform.linux`, which placement selects
+  with `node.platform.linux == true`; other nodes refuse Linux images.
+  Linux containers get linprocfs, linsysfs, fdescfs and a `/dev/shm`
+  (a devfs link to a tmpfs, as devfs takes no mounts). The supervisor now
+  reads users and groups from the image's `/etc/passwd` and `/etc/group`
+  as text, for every image. Tested: platform choice, the store with and
+  without Linux, user and group resolution, placement; on FreeBSD 15.1,
+  `alpine:3.20` (musl) and `debian:bookworm-slim` (glibc) as `nobody` in
+  a FreeBSD pod, and the FreeBSD live test again.
 
 ### To do, in order
 
-Next in phase 5: Linux images, IPv6 dual-stack, a volume plugin
+Next in phase 5: IPv6 dual-stack, a volume plugin
 interface (NFS, iSCSI), bhyve tasks (exploratory).
 

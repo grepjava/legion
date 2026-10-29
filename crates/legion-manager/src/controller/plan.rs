@@ -1144,6 +1144,11 @@ fn matches(c: &Constraint, n: &Node) -> bool {
         NodeAttribute::Role => Some(n.spec.role.as_str()),
         NodeAttribute::Os => Some(n.status.platform.os.as_str()),
         NodeAttribute::Arch => Some(n.status.platform.arch.as_str()),
+        NodeAttribute::Linux => Some(if n.status.platform.linux {
+            "true"
+        } else {
+            "false"
+        }),
         NodeAttribute::Label(k) => n.object.metadata.labels.get(k).map(String::as_str),
     };
     (actual == Some(c.value.as_str())) == c.equal

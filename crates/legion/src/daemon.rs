@@ -29,6 +29,8 @@ pub struct Options {
     /// Where the ingress proxy listens, if anywhere: HTTP and HTTPS.
     pub ingress_listen: Option<SocketAddr>,
     pub ingress_tls_listen: Option<SocketAddr>,
+    /// Run Linux images too, through the Linux ABI.
+    pub linux: bool,
 }
 
 pub async fn run(opts: Options) -> anyhow::Result<()> {
@@ -237,10 +239,11 @@ struct Running {
 async fn start_agent(
     opts: &Options,
     node: &str,
-    status: NodeStatus,
+    mut status: NodeStatus,
     control: GrpcControl,
     stopped: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<Running> {
+    status.platform.linux = opts.linux;
     let mut config = AgentConfig::new(node, opts.run_dir.join("tasks"));
     config.logs_dir = Some(opts.data_dir.join("logs"));
     if let Some(image) = &opts.infra_image {
@@ -298,7 +301,14 @@ fn jail_runtime(
     let Some(zfs) = opts.zfs_root.as_deref() else {
         bail!("the agent keeps images and containers in ZFS: pass --zfs-root");
     };
-    let images = image_store(sys.clone(), &opts.data_dir, zfs)?;
+    let mut images = image_store(sys.clone(), &opts.data_dir, zfs)?;
+    if opts.linux {
+        for m in legion_jail::LINUX_MODULES {
+            sys.kld_load(m)
+                .with_context(|| format!("loading {m}, for Linux images"))?;
+        }
+        images = images.with_linux(true);
+    }
     let exe = std::env::current_exe().context("finding this binary, for the supervisor")?;
     legion_jail::JailRuntime::new(
         sys.clone(),
@@ -351,6 +361,8 @@ fn status(hostname: String, advertise: &str) -> NodeStatus {
         platform: Platform {
             os: std::env::consts::OS.to_owned(),
             arch: oci_arch().to_owned(),
+            // Set by the agent's start.
+            linux: false,
         },
         allocatable: Capacity {
             cpu: Cpu(std::thread::available_parallelism().map_or(1, |n| n.get()) as u64 * 1000),

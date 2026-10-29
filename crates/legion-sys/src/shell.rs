@@ -802,6 +802,26 @@ impl<R: Runner> Sys for Shell<R> {
         Ok(())
     }
 
+    fn devfs_link(&self, dev: &str, name: &str, target: &str) -> Result<()> {
+        let link = format!("{}/{name}", dev.trim_end_matches('/'));
+        self.run("ln", &args(["-s", target, &link]))?;
+        self.run(
+            "devfs",
+            &args(["-m", dev, "rule", "apply", "path", name, "unhide"]),
+        )
+        .map(drop)
+    }
+
+    fn mount_pseudo(&self, fstype: &str, target: &str, options: &str) -> Result<()> {
+        let mut a = vec!["-t", fstype];
+        if !options.is_empty() {
+            a.extend(["-o", options]);
+        }
+        a.extend([fstype, target]);
+        let a: Vec<String> = a.iter().map(|s| (*s).to_owned()).collect();
+        self.run("mount", &a).map(drop)
+    }
+
     fn unmount(&self, path: &str) -> Result<()> {
         self.run("umount", &args(["-f", path])).map(drop)
     }

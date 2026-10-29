@@ -933,6 +933,33 @@ fn global_follows_nodes() {
     w.settle();
     assert!(w.tasks().contains(&"ssd-n2-1 running n2".to_owned()));
     assert!(!w.tasks().iter().any(|t| t.starts_with("ssd-n1")));
+
+    // So does the Linux ABI.
+    w.node_mut("n2").status.platform.linux = true;
+    w.service(
+        "linux",
+        "mode: global
+pod: { containers: [{ name: a, image: \"a:1\" }] }
+placement: { constraints: [\"node.platform.linux == true\"] }",
+    );
+    w.settle();
+    assert!(w.tasks().contains(&"linux-n2-1 running n2".to_owned()));
+    assert!(
+        !w.tasks()
+            .iter()
+            .any(|t| t.starts_with("linux-n1") || t.starts_with("linux-n3"))
+    );
+    w.service(
+        "native",
+        "mode: global
+pod: { containers: [{ name: a, image: \"a:1\" }] }
+placement: { constraints: [\"node.platform.linux == false\"] }",
+    );
+    w.settle();
+    assert!(
+        !w.tasks().iter().any(|t| t.starts_with("native-")),
+        "n2 runs Linux"
+    );
 }
 
 #[test]

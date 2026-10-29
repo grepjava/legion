@@ -98,6 +98,12 @@ enum Command {
         /// Serve HTTPS for routes with `tls` here, e.g. `0.0.0.0:443`.
         #[arg(long)]
         ingress_tls_listen: Option<SocketAddr>,
+        /// Run Linux images too (where an image offers no FreeBSD one),
+        /// through FreeBSD's Linux ABI: loads linux64 and the file systems
+        /// Linux programs expect. Placement can ask for such nodes with
+        /// `node.platform.linux == true`.
+        #[arg(long)]
+        linux: bool,
     },
     /// Start a new cluster with the reached manager as its first member.
     Init,
@@ -418,6 +424,7 @@ async fn run() -> anyhow::Result<()> {
             vip_password_file,
             ingress_listen,
             ingress_tls_listen,
+            linux,
         } => {
             let vip = match (vip, vip_interface, vip_password_file) {
                 (Some(addr), Some(interface), Some(file)) => {
@@ -448,6 +455,7 @@ async fn run() -> anyhow::Result<()> {
                 vip,
                 ingress_listen,
                 ingress_tls_listen,
+                linux,
             })
             .await
         }

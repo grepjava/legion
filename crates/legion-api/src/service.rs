@@ -1091,6 +1091,8 @@ pub enum NodeAttribute {
     Role,
     Os,
     Arch,
+    /// `true` or `false`.
+    Linux,
     Label(String),
 }
 
@@ -1112,12 +1114,13 @@ impl FromStr for Constraint {
             "node.role" => NodeAttribute::Role,
             "node.platform.os" => NodeAttribute::Os,
             "node.platform.arch" => NodeAttribute::Arch,
+            "node.platform.linux" => NodeAttribute::Linux,
             _ => match lhs.strip_prefix("node.labels.") {
                 Some(key) if !key.is_empty() => NodeAttribute::Label(key.to_owned()),
                 _ => {
                     return Err(format!(
                         "{lhs:?}: expected node.name, node.hostname, node.role, \
-                         node.platform.os, node.platform.arch or node.labels.<key>"
+                         node.platform.os, node.platform.arch, node.platform.linux                          or node.labels.<key>"
                     ));
                 }
             },

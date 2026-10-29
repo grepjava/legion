@@ -299,3 +299,123 @@ async fn pods_of_jails() {
     sys.zfs_destroy(&base, true).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Linux images (musl and glibc), and the `ID` their os-release gives.
+const LINUX_IMAGES: [(&str, &str); 2] = [
+    ("docker.io/library/alpine:3.20", "alpine"),
+    ("docker.io/library/debian:bookworm-slim", "debian"),
+];
+
+/// Also needs the Linux ABI loaded (`kldload linux64 linprocfs linsysfs`)
+/// and `LEGION_JAIL_LINUX` set.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs root, LEGION_JAIL_ZFS_ROOT, LEGION_JAIL_LINUX, linux64 and the network"]
+async fn linux_images() {
+    let (Ok(root), Ok(_)) = (
+        std::env::var("LEGION_JAIL_ZFS_ROOT"),
+        std::env::var("LEGION_JAIL_LINUX"),
+    ) else {
+        eprintln!("LEGION_JAIL_ZFS_ROOT or LEGION_JAIL_LINUX not set; skipping");
+        return;
+    };
+    let base = format!("{root}/llinux{}", std::process::id());
+    let dir = tempfile::Builder::new()
+        .prefix("llinux")
+        .tempdir_in("/var/tmp")
+        .unwrap()
+        .keep();
+    let sys = Arc::new(Shell::new());
+    let open = |linux| {
+        Store::open(
+            sys.clone() as Arc<dyn Sys>,
+            &format!("{base}/images"),
+            &dir.as_path().join("images"),
+            Client::new().unwrap(),
+        )
+        .unwrap()
+        .with_linux(linux)
+    };
+    // Without the Linux ABI, Alpine (which has no FreeBSD image) is refused.
+    let e = open(false)
+        .pull(LINUX_IMAGES[0].0, None, "t")
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("no image for freebsd"), "{e}");
+    let images = Arc::new(open(true));
+    let rt = runtime(&sys, &images, dir.as_path(), &base);
+    rt.pull(IMAGE, "t", &[]).await.unwrap();
+    for (image, _) in LINUX_IMAGES {
+        rt.pull(image, "t", &[]).await.unwrap();
+    }
+
+    // The pod is FreeBSD's, its member Alpine.
+    let pod = rt
+        .create(&ContainerSpec {
+            name: "lx".into(),
+            image: IMAGE.into(),
+            labels: labels("t2", "infra"),
+            annotations: BTreeMap::from([("org.freebsd.jail.vnet".to_owned(), "new".to_owned())]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    rt.start(&pod).await.unwrap();
+    sys.jail_set(&pod, &[("children.max", "4")]).unwrap();
+    let mut members = Vec::new();
+    for (i, (image, id)) in LINUX_IMAGES.into_iter().enumerate() {
+        let mut spec = member(
+            &format!("lx_{i}"),
+            &pod,
+            "uname -s; id -u; id -G; grep ^ID= /etc/os-release;              head -1 /proc/meminfo; ls /sys | head -1; ls -l /proc/self/fd/0;              echo shm > /dev/shm/x && cat /dev/shm/x;              touch /etc/passwd 2>&1 || echo refused",
+        );
+        spec.image = image.into();
+        spec.labels = labels("t2", "app");
+        spec.user = Some("nobody".into());
+        let app = rt.create(&spec).await.unwrap();
+        rt.start(&app).await.unwrap();
+        assert_eq!(
+            rt.wait(&app).await.unwrap(),
+            0,
+            "{}",
+            output(&rt, &app).await
+        );
+        let out = output(&rt, &app).await;
+        eprintln!(
+            "{image}:
+{out}"
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "Linux");
+        assert_eq!(lines[1], "65534", "nobody, from the image's /etc/passwd");
+        assert_eq!(lines[3], format!("ID={id}"));
+        assert!(lines[4].starts_with("MemTotal:"), "linprocfs: {out}");
+        assert!(
+            out.contains(
+                "
+shm
+"
+            ),
+            "/dev/shm: {out}"
+        );
+        assert!(
+            out.contains("refused"),
+            "nobody cannot write /etc/passwd: {out}"
+        );
+        members.push(app);
+    }
+
+    for id in members.iter().chain([&pod]) {
+        rt.remove(id).await.unwrap();
+    }
+    assert!(
+        sys.mounts(&dir.as_path().to_string_lossy())
+            .unwrap()
+            .is_empty()
+    );
+    for (image, _) in LINUX_IMAGES {
+        images.remove(image).await.unwrap();
+    }
+    images.remove(IMAGE).await.unwrap();
+    sys.zfs_destroy(&base, true).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
