@@ -51,9 +51,15 @@ enum Command {
         /// Runtime files: tasks' secrets and configs.
         #[arg(long, default_value = "/var/run/legion")]
         run_dir: PathBuf,
-        #[arg(long, default_value = "127.0.0.1:7470")]
+        /// Where a manager serves the API. Every call but `Join` (which
+        /// takes a token) needs a cluster certificate.
+        #[arg(long, default_value = "0.0.0.0:7470")]
         listen: SocketAddr,
-        /// Address other managers reach this one at. Defaults to --listen.
+        /// Managers: the address other nodes reach this one at; defaults to
+        /// --listen, or with --listen on every address to this host's
+        /// address on its default route. Workers: where other nodes'
+        /// WireGuard reaches this one; defaults to the address it reaches
+        /// its managers from.
         #[arg(long)]
         advertise: Option<String>,
         /// Run the manager only; no tasks run on this node.
@@ -129,7 +135,9 @@ enum Command {
         manager: String,
         #[arg(long, default_value = "/var/db/legion")]
         data_dir: PathBuf,
-        /// Managers only: the address other managers reach this one at.
+        /// Managers only: the address other managers reach this one at
+        /// [default: the address this host reaches --manager from, port
+        /// 7470].
         #[arg(long)]
         advertise: Option<String>,
         /// Name of this node (default: the hostname's first label).

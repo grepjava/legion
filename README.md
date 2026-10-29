@@ -6,9 +6,28 @@ which it pulls into ZFS and runs itself. The plan and its rationale are in
 [docs/DESIGN.md](docs/DESIGN.md).
 
 Status: phases 1 (single node), 2 (cluster), 3 (K8s-lite: namespaces, RBAC,
-network policy, quotas, jobs, security profiles, metrics) and 4 (stateful
-services and operations) are done; phase 5 has replaced Podman and ocijail
-with Legion's own jail runtime. [PHASE.md](PHASE.md) tracks what is built and what is next.
+network policy, quotas, jobs, security profiles, metrics), 4 (stateful
+services and operations) and 5 (Legion's own jail runtime, Linux images,
+IPv6, network volumes) are done; it is being hardened for real use.
+[PHASE.md](PHASE.md) tracks what is built and what is next.
+
+## Install
+
+On FreeBSD 15, from a release tarball (or one made with
+`packaging/freebsd/release.sh`), as root:
+
+```sh
+tar -xf legion-<version>-freebsd15-amd64.tar.xz --strip-components 1 -C /usr/local
+sysrc -f /boot/loader.conf kern.racct.enable=1   # rctl limits; reboot once
+zfs create zroot/legion       # images, containers and volumes; must be mounted
+sysrc legion_enable=YES legion_args="--zfs-root zroot/legion"
+service legion start
+legion init                   # on the first manager; other nodes join (below)
+```
+
+`/etc/pf.conf` must call Legion's anchors (see below). The daemon logs to
+`/var/log/legion.log`, which newsyslog rotates; `service legion stop`
+leaves the pods running, and the next start takes them over.
 
 ## Build
 
@@ -39,8 +58,10 @@ legion get svc web -n shop
 legion watch Service
 ```
 
-The daemon listens on `127.0.0.1:7470` without TLS; set `--listen`, or point the
-CLI elsewhere with `--server` or `LEGION_SERVER`. Without `--no-agent`, on
+The daemon serves the API on port 7470 of every address, with mutual TLS:
+every call but joining needs a certificate of the cluster's, as
+`admin.pem` holds. Point the CLI at another manager with `--server` or
+`LEGION_SERVER`. Without `--no-agent`, on
 FreeBSD and as root, it also runs the agent, so applied services run as
 pods of jails on the node (`legion list tasks -n shop` shows each pod's
 address on the node's `legion0` bridge). The agent runs them itself: it
@@ -59,20 +80,18 @@ rdr-anchor "legion/*"
 anchor "legion/*"
 ```
 
-More nodes join with a token. Managers must listen where the others can
-reach them, for example `--listen 0.0.0.0:7470 --advertise 10.0.0.1:7470`.
-A worker runs only the agent, which follows its work through any manager
-and fails over to the others. Pods on different nodes reach each other over
-a WireGuard mesh (UDP port 51820, which the hosts must let through); each
-node's `--advertise` address is where the others send to:
+More nodes join with a token. A manager advertises the address of its
+default route to the others (or `--listen`'s, when that names one), and a
+worker the address it reaches its managers from; `--advertise` chooses
+another. A worker runs only the agent, which follows its work through any
+manager and fails over to the others. Pods on different nodes reach each
+other over a WireGuard mesh (UDP port 51820, which the hosts must let
+through), sent to each node's advertised address:
 
 ```sh
 legion join-token manager            # or worker; on a member
-legion join <token> --manager 10.0.0.1:7470 --advertise 10.0.0.2:7470
-legion daemon --listen 0.0.0.0:7470 --advertise 10.0.0.2:7470
-
-legion join <worker-token> --manager 10.0.0.1:7470    # on a worker
-legion daemon --advertise 10.0.0.3
+legion join <token> --manager 10.0.0.1:7470    # on the new node, then
+service legion start                           # or legion daemon
 ```
 
 Compose files deploy as stacks. Each stack gets a namespace of its name, in

@@ -302,9 +302,7 @@ remote FreeBSD server reached through a WireGuard site tunnel.
 
 Nothing left in phase 2.
 
-Smaller follow-ups: `--listen` still defaults to loopback; a worker without `--advertise` has
-no WireGuard endpoint (it could use the address it reaches managers from);
-placement preferences (`spread`) are accepted but not used yet; a node's
+Smaller follow-ups: placement preferences (`spread`) are accepted but not used yet; a node's
 advertised WireGuard endpoint replaces the one WireGuard learned, so a
 node behind NAT cannot be reached by its peers' replies alone; node subnets
 are reserved by name (`Config/legion-system/node-subnets`) and a deleted
@@ -959,8 +957,30 @@ real, in the order agreed with the user.
   gave the task the earlier run's exit code; the code is now the
   runtime's.
 
+- **Packaging** (README.md, Install; `packaging/freebsd`). An rc.d
+  script runs the daemon under daemon(8), which restarts it 5 s after a
+  crash and writes its output to `/var/log/legion.log` (reopened on
+  SIGHUP, for the newsyslog entry beside it); its flags are
+  `legion_args`, since rc.subr hands `legion_flags` to daemon(8), and it
+  warns when racct is off. `release.sh` builds, on a FreeBSD host, a
+  tarball laid out as `/usr/local` (the binary, the rc.d script, the
+  newsyslog entry, the volume plugin directory, the docs), owned by root,
+  with its SHA-256. The daemon now listens on every address by default
+  (every call but `Join` needs a cluster certificate, and `Unlock` only
+  answers loopback); a manager advertises `--listen` when it names an
+  address and otherwise its address on the default route, a worker the
+  address it reaches its managers from (its WireGuard endpoint, which it
+  had none of before), and `legion join` sends a manager's from the
+  address it reaches `--manager` from. Tested: the defaults; on FreeBSD
+  15.1, the tarball built and unpacked, and its rc.d script starting the
+  daemon (the CLI reaching it), daemon(8) restarting it after a kill,
+  the log reopened after a rotation, and a clean stop. Not built: a
+  FreeBSD port, for when the flags have settled.
+
 ### To do, in order
 
-1. Packaging: an rc.d script, defaults for `--listen` and a worker's
-   endpoint, and a port or release tarballs (DESIGN.md §13, question 2).
+Nothing left in the hardening agreed with the user. Candidates from the
+phases' follow-ups: refusing to run pods unlimited on a host without
+racct, egress network policy, a faster down signal for lost nodes, and a
+FreeBSD port.
 

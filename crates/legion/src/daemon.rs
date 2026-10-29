@@ -2,7 +2,7 @@
 //! running tasks as jails; on a worker node only the agent. The agent follows its work through the
 //! managers' dispatcher either way, its own manager first.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -44,10 +44,6 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         // Colours only on a terminal, not in log files.
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
-    let advertise = opts
-        .advertise
-        .clone()
-        .unwrap_or_else(|| opts.listen.to_string());
     let hostname = hostname()?;
     let mut pki = crate::pki::Pki::new(&opts.data_dir);
     if pki.role()? == legion_pki::Role::Worker {
@@ -65,6 +61,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     let tls = pki
         .ensure(&node, &opts.data_dir)
         .context("setting up certificates")?;
+    let advertise = manager_address(opts.advertise.as_deref(), opts.listen);
     let vip = match &opts.vip {
         Some(_) if !cfg!(target_os = "freebsd") => bail!("--vip needs CARP: FreeBSD only"),
         Some(v) => {
@@ -171,7 +168,7 @@ async fn run_worker(opts: &Options, pki: &crate::pki::Pki, hostname: String) -> 
     if managers.is_empty() {
         bail!("no manager to call: pass --manager or join again");
     }
-    let control = GrpcControl::new(&node, managers, Some(credentials.clone()))
+    let control = GrpcControl::new(&node, managers.clone(), Some(credentials.clone()))
         .map_err(|e| anyhow::anyhow!(e))?;
     let renewal = tokio::spawn(crate::pki::renew_worker(
         crate::pki::Pki::new(&opts.data_dir),
@@ -180,7 +177,10 @@ async fn run_worker(opts: &Options, pki: &crate::pki::Pki, hostname: String) -> 
     ));
     let metrics_listener = bind_metrics(opts).await?;
     let (stop, stopped) = tokio::sync::watch::channel(false);
-    let advertise = opts.advertise.clone().unwrap_or_default();
+    let advertise = match &opts.advertise {
+        Some(a) => a.clone(),
+        None => worker_address(&managers),
+    };
     let agent = start_agent(
         opts,
         &node,
@@ -231,7 +231,14 @@ pub async fn join(
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("creating {}", data_dir.display()))?;
     let id = legion_manager::node_id(data_dir).map_err(|e| anyhow::anyhow!(e))?;
-    let joined = legion_manager::join(manager, token, &node, id, advertise.unwrap_or(""))
+    // A manager needs one; a worker's is ignored.
+    let advertise = match advertise {
+        Some(a) => a.to_owned(),
+        None => reaching(manager)
+            .map(|ip| SocketAddr::new(ip, DEFAULT_PORT).to_string())
+            .unwrap_or_default(),
+    };
+    let joined = legion_manager::join(manager, token, &node, id, &advertise)
         .await
         .map_err(|e| anyhow::anyhow!("joining through {manager}: {e}"))?;
     pki.write_joined(&joined)?;
@@ -244,6 +251,74 @@ pub async fn join(
         data_dir.display()
     );
     Ok(())
+}
+
+/// The API's port unless --listen says otherwise.
+const DEFAULT_PORT: u16 = 7470;
+
+/// The address this host sends from toward `to`: its address on the route
+/// there. Connecting a UDP socket picks it and sends nothing.
+fn source_address(to: SocketAddr) -> Option<IpAddr> {
+    let any: SocketAddr = if to.is_ipv4() {
+        (Ipv4Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    let socket = std::net::UdpSocket::bind(any).ok()?;
+    socket.connect(to).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified()).then_some(ip)
+}
+
+/// The address this host reaches `manager` (`host:port`) from.
+fn reaching(manager: &str) -> Option<IpAddr> {
+    use std::net::ToSocketAddrs;
+    let to = manager.to_socket_addrs().ok()?.next()?;
+    source_address(to)
+}
+
+/// Where other managers reach this one: `--advertise`, or `--listen` when
+/// it names an address, or this host's address on its default route.
+fn manager_address(advertise: Option<&str>, listen: SocketAddr) -> String {
+    if let Some(a) = advertise {
+        return a.to_owned();
+    }
+    if !listen.ip().is_unspecified() {
+        return listen.to_string();
+    }
+    // Any address outside this host's networks takes the default route.
+    let outside = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 9));
+    match source_address(outside) {
+        Some(ip) => {
+            let addr = SocketAddr::new(ip, listen.port()).to_string();
+            tracing::info!(%addr, "advertising the default route's address; --advertise chooses another");
+            addr
+        }
+        None => {
+            tracing::warn!(
+                "no default route: advertising 127.0.0.1, which no other node reaches; pass --advertise"
+            );
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), listen.port()).to_string()
+        }
+    }
+}
+
+/// Where other nodes' WireGuard reaches a worker: the address it reaches
+/// its first manager from. Empty, with a warning, if there is none: the
+/// node then has no WireGuard endpoint.
+fn worker_address(managers: &[String]) -> String {
+    match managers.iter().find_map(|m| reaching(m)) {
+        Some(ip) => {
+            tracing::info!(%ip, "advertising the address the managers are reached from; --advertise chooses another");
+            ip.to_string()
+        }
+        None => {
+            tracing::warn!(
+                "no route to a manager: no WireGuard endpoint to advertise; pass --advertise"
+            );
+            String::new()
+        }
+    }
 }
 
 /// Binds the metrics endpoint's listener, if asked for one.
@@ -509,6 +584,25 @@ pub fn restore(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advertised_addresses() {
+        let any: SocketAddr = "0.0.0.0:7470".parse().unwrap();
+        assert_eq!(manager_address(Some("10.0.0.5:7470"), any), "10.0.0.5:7470");
+        let one: SocketAddr = "10.0.0.6:7471".parse().unwrap();
+        assert_eq!(manager_address(None, one), "10.0.0.6:7471");
+        // Every address: one this host has, on the listening port.
+        let picked: SocketAddr = manager_address(None, any).parse().unwrap();
+        assert_eq!(picked.port(), 7470);
+        assert!(!picked.ip().is_unspecified());
+        // A manager on this host is reached from loopback.
+        assert_eq!(
+            reaching("127.0.0.1:7470"),
+            Some(IpAddr::from(Ipv4Addr::LOCALHOST))
+        );
+        assert_eq!(worker_address(&["127.0.0.1:7470".into()]), "127.0.0.1");
+        assert_eq!(worker_address(&[]), "");
+    }
 
     #[test]
     fn node_names() {

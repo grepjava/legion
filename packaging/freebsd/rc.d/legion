@@ -1,0 +1,55 @@
+#!/bin/sh
+#
+# PROVIDE: legion
+# REQUIRE: LOGIN NETWORKING pf zfs
+# KEYWORD: shutdown
+#
+# The Legion node daemon (`legion daemon`), kept running by daemon(8).
+# Add to /etc/rc.conf (sysrc legion_enable=YES ...):
+#
+# legion_enable (bool):      Set to YES to start Legion at boot.
+# legion_args (str):         The daemon's flags, e.g. "--zfs-root zroot/legion".
+#                            (Not legion_flags: those would go to daemon(8).)
+# legion_data_dir (path):    The node's state. Default: /var/db/legion.
+# legion_run_dir (path):     Runtime files. Default: /var/run/legion.
+# legion_log (path):         The daemon's output. Default: /var/log/legion.log.
+# legion_bin (path):         Default: /usr/local/bin/legion.
+#
+# Stopping the daemon leaves its pods running; the next start takes them
+# over.
+
+. /etc/rc.subr
+
+name=legion
+rcvar=legion_enable
+desc="Legion container orchestration node daemon"
+
+load_rc_config $name
+
+: ${legion_enable:=NO}
+: ${legion_args:=}
+: ${legion_data_dir:=/var/db/legion}
+: ${legion_run_dir:=/var/run/legion}
+: ${legion_log:=/var/log/legion.log}
+: ${legion_bin:=/usr/local/bin/legion}
+
+pidfile=/var/run/${name}.pid
+command=/usr/sbin/daemon
+# -f detaches from the terminal; -r restarts the daemon 5 s after it exits
+# on its own; -H reopens the log on SIGHUP, for newsyslog.
+command_args="-f -r -R 5 -H -P ${pidfile} -o ${legion_log} -- ${legion_bin} daemon \
+    --data-dir ${legion_data_dir} --run-dir ${legion_run_dir} ${legion_args}"
+required_files=${legion_bin}
+start_precmd=legion_precmd
+
+legion_precmd()
+{
+	if [ "$(sysctl -n kern.racct.enable 2>/dev/null)" != 1 ]; then
+		warn "kern.racct.enable is not 1: containers' CPU and memory limits will not hold" \
+		    "(set kern.racct.enable=1 in /boot/loader.conf and reboot)"
+	fi
+	install -d -m 700 ${legion_data_dir}
+	install -d -m 700 ${legion_run_dir}
+}
+
+run_rc_command "$1"
