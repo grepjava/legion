@@ -98,6 +98,9 @@ enum Command {
         /// Serve HTTPS for routes with `tls` here, e.g. `0.0.0.0:443`.
         #[arg(long)]
         ingress_tls_listen: Option<SocketAddr>,
+        /// What runs the agent's containers.
+        #[arg(long, value_enum, default_value = "podman")]
+        runtime: daemon::RuntimeKind,
     },
     /// Start a new cluster with the reached manager as its first member.
     Init,
@@ -359,8 +362,23 @@ pub enum StackCommand {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// The jail runtime's supervisor (`legion jail-shim ...`, see
+/// `legion_jail::shim`): run before anything else starts, as it forks and
+/// must be single-threaded.
+pub const JAIL_SHIM: &str = "jail-shim";
+
+fn main() -> anyhow::Result<()> {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some(JAIL_SHIM) {
+        std::process::exit(legion_jail::shim::main(&argv[2..]));
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.command {
         Command::Daemon {
@@ -380,6 +398,7 @@ async fn main() -> anyhow::Result<()> {
             vip_password_file,
             ingress_listen,
             ingress_tls_listen,
+            runtime,
         } => {
             let vip = match (vip, vip_interface, vip_password_file) {
                 (Some(addr), Some(interface), Some(file)) => {
@@ -397,6 +416,7 @@ async fn main() -> anyhow::Result<()> {
                 _ => None,
             };
             daemon::run(daemon::Options {
+                runtime,
                 data_dir,
                 run_dir,
                 listen,

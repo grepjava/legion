@@ -778,13 +778,26 @@ replaces Podman and ocijail.
   everything, stop by signal and by grace period, restart, and removal
   leaving no jail, mount or dataset.
 
+- **The jail runtime in the daemon** (`legion daemon --runtime
+  jail|podman`, Podman still the default; `legion jail-shim`, run before
+  the async runtime starts since it forks): images in
+  `<zfs-root>/images` with their index in `<data-dir>/images`,
+  containers in `<data-dir>/jails` and `<zfs-root>/jails`; images no
+  container has used for an hour are removed (checked every 10 minutes),
+  then the layers nothing uses. The phase 1 exit test takes
+  `LEGION_EXIT_RUNTIME=jail` and **passes on the jail runtime** on
+  weft-bsd (174 s): probes, ZFS and tmpfs volumes, crashes and restarts,
+  DNS, VIPs, ingress over HTTP and HTTPS, metrics, a daemon restart
+  adopting the running pods, all without Podman.
+
 ### To do, in order
 
-1. The jail runtime in the daemon: `legion jail-shim`, `--runtime
-   jail|podman`, the image store on the node's ZFS dataset, unused
-   images pruned, and the agent's live tests run on it.
-2. The exit tests on the jail runtime, then it becomes the default.
-3. Podman's runtime removed once nothing needs it.
+1. The phase 2-4 exit tests (cluster, teams, stateful) on the jail
+   runtime; the stateful one needs its Postgres image loaded into the
+   image store (`legion image load` of an OCI archive).
+2. The jail runtime becomes the default.
+3. Podman's runtime removed once nothing needs it; the `Runtime` trait
+   gets its own types then, instead of `legion_podman`'s.
 
 Then: Linux images, IPv6 dual-stack, a volume plugin interface (NFS,
 iSCSI), bhyve tasks (exploratory).

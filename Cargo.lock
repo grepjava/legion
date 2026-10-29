@@ -1170,6 +1170,8 @@ dependencies = [
  "hyper-util",
  "legion-agent",
  "legion-api",
+ "legion-image",
+ "legion-jail",
  "legion-manager",
  "legion-net",
  "legion-pki",

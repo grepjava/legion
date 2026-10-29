@@ -15,10 +15,18 @@ use tokio::net::TcpListener;
 /// Collects the metrics for one scrape.
 pub type Collect = Arc<dyn Fn() -> BoxFuture<'static, Metrics> + Send + Sync>;
 
+/// Collects an agent's metrics, whatever runtime it uses.
+pub fn agent<R: legion_agent::Runtime>(m: legion_agent::metrics::AgentMetrics<R>) -> Collect {
+    Arc::new(move || {
+        let m = m.clone();
+        Box::pin(async move { m.collect().await })
+    })
+}
+
 /// Collects from the manager and the agent the daemon runs.
 pub fn collect(
     manager: Option<legion_manager::metrics::ManagerMetrics>,
-    agent: Option<legion_agent::metrics::AgentMetrics<legion_podman::Podman>>,
+    agent: Option<Collect>,
 ) -> Collect {
     Arc::new(move || {
         let (manager, agent) = (manager.clone(), agent.clone());
@@ -31,7 +39,7 @@ pub fn collect(
                 }
             }
             if let Some(agent) = agent {
-                m.extend(agent.collect().await);
+                m.extend(agent().await);
             }
             m
         })

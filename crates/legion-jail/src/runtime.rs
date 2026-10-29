@@ -45,6 +45,10 @@ const POD_ROOT: &str = "/var/empty";
 const DEVFS_RULESET: u32 = 4;
 /// How often state is looked at for exits.
 const TICK: Duration = Duration::from_millis(200);
+/// How often unused images are looked for, and how long one stays after
+/// its last container (or its pull, or the agent's start) before it goes.
+const PRUNE_EVERY: Duration = Duration::from_secs(600);
+const UNUSED_FOR: Duration = Duration::from_secs(3600);
 
 pub struct Config {
     /// Where containers' records, output and status live.
@@ -186,6 +190,7 @@ impl JailRuntime {
             rt.boot,
             rt.events.clone(),
         ));
+        tokio::spawn(prune_images(rt.images.clone(), rt.dir.clone()));
         Ok(rt)
     }
 
@@ -324,6 +329,45 @@ async fn watch_exits(sys: Arc<dyn Sys>, dir: PathBuf, boot: u64, events: broadca
             Err(e) => tracing::warn!("jail runtime: {e}"),
         }
         tokio::time::sleep(TICK).await;
+    }
+}
+
+/// Removes images no container has used for [`UNUSED_FOR`], then the
+/// layers nothing uses.
+async fn prune_images(images: Arc<Store>, dir: PathBuf) {
+    let mut last_used: BTreeMap<String, tokio::time::Instant> = BTreeMap::new();
+    loop {
+        let now = tokio::time::Instant::now();
+        let in_use: std::collections::BTreeSet<String> = match records(&dir) {
+            Ok(r) => r
+                .iter()
+                .filter_map(|r| legion_image::Reference::parse(&r.image).ok())
+                .map(|r| r.to_string())
+                .collect(),
+            Err(e) => {
+                tracing::warn!("jail runtime: listing containers for pruning: {e}");
+                tokio::time::sleep(PRUNE_EVERY).await;
+                continue;
+            }
+        };
+        let known = images.images().unwrap_or_default();
+        for image in &known {
+            for name in &image.references {
+                let since = last_used.entry(name.clone()).or_insert(now);
+                if in_use.contains(name) {
+                    *since = now;
+                } else if now.duration_since(*since) >= UNUSED_FOR {
+                    match images.remove(name).await {
+                        Ok(_) => tracing::info!(image = %name, "removed unused image"),
+                        Err(e) => tracing::warn!(image = %name, "removing an unused image: {e}"),
+                    }
+                }
+            }
+        }
+        let names: std::collections::BTreeSet<&String> =
+            known.iter().flat_map(|i| &i.references).collect();
+        last_used.retain(|n, _| names.contains(n));
+        tokio::time::sleep(PRUNE_EVERY).await;
     }
 }
 

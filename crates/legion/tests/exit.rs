@@ -10,6 +10,9 @@
 //! zpool destroy lexit; rm /var/tmp/lexit.img
 //! ```
 //!
+//! `LEGION_EXIT_RUNTIME=jail` runs it on the jail runtime instead of
+//! Podman.
+//!
 //! The app is `tests/exit/app.yaml`: web (two replicas) counts requests in
 //! db, whose data is on a ZFS volume, and in cache, whose data is on a
 //! tmpfs volume. The lab directory is wiped first; remove it afterwards
@@ -32,6 +35,8 @@ const INGRESS_TLS: &str = "127.0.0.1:7474";
 struct Lab {
     dir: PathBuf,
     zfs_root: String,
+    /// The jail runtime rather than Podman.
+    jails: bool,
     daemon: Option<Child>,
 }
 
@@ -47,6 +52,7 @@ impl Lab {
             .args(["--metrics-listen", METRICS])
             .args(["--ingress-listen", INGRESS])
             .args(["--ingress-tls-listen", INGRESS_TLS])
+            .args(["--runtime", if self.jails { "jail" } else { "podman" }])
             .arg("--data-dir")
             .arg(self.dir.join("data"))
             .arg("--run-dir")
@@ -98,10 +104,65 @@ impl Lab {
         text(&out.stdout)
     }
 
+    /// The jail runtime's records: (id, name, jail).
+    fn records(&self) -> Vec<(String, String, String)> {
+        let Ok(dirs) = std::fs::read_dir(self.dir.join("data/jails")) else {
+            return Vec::new();
+        };
+        dirs.filter_map(|d| {
+            let r: Value =
+                serde_json::from_slice(&std::fs::read(d.ok()?.path().join("record.json")).ok()?)
+                    .ok()?;
+            let s = |k: &str| r[k].as_str().unwrap_or_default().to_owned();
+            Some((s("id"), s("name"), s("jail")))
+        })
+        .collect()
+    }
+
+    fn jail_record(&self, name: &str) -> (String, String) {
+        let (id, _, jail) = self
+            .records()
+            .into_iter()
+            .find(|(_, n, _)| n == name)
+            .unwrap_or_else(|| panic!("no container {name}"));
+        (id, jail)
+    }
+
     fn container_id(&self, name: &str) -> String {
+        if self.jails {
+            return self.jail_record(name).0;
+        }
         self.podman(&["inspect", "--format", "{{.Id}}", name])
             .trim()
             .to_owned()
+    }
+
+    /// The container's processes die at once, as in a crash.
+    fn kill_container(&self, name: &str) {
+        if self.jails {
+            let jid = sh(&format!("jls -j {} jid", self.jail_record(name).1));
+            sh(&format!("pkill -KILL -j {}", jid.trim()));
+        } else {
+            self.podman(&["kill", name]);
+        }
+    }
+
+    /// One process in the container dies.
+    fn kill_process(&self, name: &str, process: &str) {
+        if self.jails {
+            let jid = sh(&format!("jls -j {} jid", self.jail_record(name).1));
+            sh(&format!("pkill -j {} {process}", jid.trim()));
+        } else {
+            self.podman(&["exec", name, "pkill", process]);
+        }
+    }
+
+    fn no_containers(&self) -> bool {
+        if self.jails {
+            self.records().is_empty()
+        } else {
+            self.podman(&["ps", "-aq"]).trim().is_empty()
+        }
     }
 }
 
@@ -261,6 +322,7 @@ fn sh(cmd: &str) -> String {
 fn app_survives_failures() {
     let dir = PathBuf::from(std::env::var("LEGION_EXIT_LAB").expect("set LEGION_EXIT_LAB"));
     let zfs_root = std::env::var("LEGION_EXIT_ZFS_ROOT").expect("set LEGION_EXIT_ZFS_ROOT");
+    let on_jails = std::env::var("LEGION_EXIT_RUNTIME").is_ok_and(|r| r == "jail");
     // A failed run leaves its pods running; wiping the lab under them
     // would orphan them.
     let jails = sh("jls path");
@@ -271,15 +333,26 @@ fn app_survives_failures() {
         "jails from an earlier run still run under {}: remove them first",
         dir.display()
     );
-    if dir.exists() {
-        sh(&format!("chflags -R 0 {0} && rm -rf {0}", dir.display()));
-    }
-    std::fs::create_dir_all(&dir).unwrap();
     let mut lab = Lab {
         dir,
         zfs_root,
+        jails: on_jails,
         daemon: None,
     };
+    // The jail runtime's pod jails are on /var/empty: found by their ids.
+    for (id, _, _) in lab.records() {
+        assert!(
+            !sh("jls name").lines().any(|j| j == id),
+            "pod jail {id} from an earlier run still runs: remove it first"
+        );
+    }
+    if lab.dir.exists() {
+        sh(&format!(
+            "chflags -R 0 {0} && rm -rf {0}",
+            lab.dir.display()
+        ));
+    }
+    std::fs::create_dir_all(&lab.dir).unwrap();
     lab.start_daemon();
     ok(&["init"]);
     let app = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/exit/app.yaml");
@@ -449,7 +522,7 @@ fn app_survives_failures() {
 
     // A database crash: the container restarts in its pod, the data stays.
     let db = running("db")[0].0.clone();
-    lab.podman(&["kill", &format!("shop_{db}_db")]);
+    lab.kill_container(&format!("shop_{db}_db"));
     wait("db to restart", 60, || {
         list("tasks")
             .iter()
@@ -467,7 +540,7 @@ fn app_survives_failures() {
 
     // The cache keeps its data across a container restart, not across pods.
     let cache = running("cache")[0].0.clone();
-    lab.podman(&["kill", &format!("shop_{cache}_cache")]);
+    lab.kill_container(&format!("shop_{cache}_cache"));
     wait("cache to restart", 60, || {
         list("tasks")
             .iter()
@@ -483,7 +556,7 @@ fn app_survives_failures() {
 
     // web's process dies: the container restarts under the policy.
     let (web, web_ip) = running("web")[0].clone();
-    lab.podman(&["exec", &format!("shop_{web}_web"), "pkill", "inetd"]);
+    lab.kill_process(&format!("shop_{web}_web"), "inetd");
     wait("web to be restarted", 90, || {
         list("tasks")
             .iter()
@@ -516,9 +589,7 @@ fn app_survives_failures() {
     for s in ["web", "db", "cache"] {
         ok(&["delete", "service", s, "-n", "shop"]);
     }
-    wait("pods removed", 120, || {
-        lab.podman(&["ps", "-aq"]).trim().is_empty()
-    });
+    wait("pods removed", 120, || lab.no_containers());
     lab.stop_daemon();
     let _ = Command::new("ifconfig")
         .args(["legion0", "destroy"])

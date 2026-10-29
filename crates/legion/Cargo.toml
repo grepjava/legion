@@ -17,6 +17,8 @@ hyper = { workspace = true, features = ["http1", "server"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 legion-agent.workspace = true
 legion-api.workspace = true
+legion-image.workspace = true
+legion-jail.workspace = true
 legion-pki.workspace = true
 legion-manager.workspace = true
 legion-net.workspace = true
