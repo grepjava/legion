@@ -304,8 +304,7 @@ Nothing left in phase 2.
 
 Smaller follow-ups: `--listen` still defaults to loopback; a worker without `--advertise` has
 no WireGuard endpoint (it could use the address it reaches managers from);
-placement preferences (`spread`) are accepted but not used yet; the daemon takes Podman's storage driver from `storage.conf`
-(it could choose `vfs` itself when its root is not on ZFS); a node's
+placement preferences (`spread`) are accepted but not used yet; a node's
 advertised WireGuard endpoint replaces the one WireGuard learned, so a
 node behind NAT cannot be reached by its peers' replies alone; node subnets
 are reserved by name (`Config/legion-system/node-subnets`) and a deleted
