@@ -73,6 +73,10 @@ pub trait Sys: Send + Sync {
     /// Renames a host interface (at most 15 characters).
     fn interface_rename(&self, name: &str, new_name: &str) -> Result<()>;
     fn bridge_add_member(&self, bridge: &str, member: &str) -> Result<()>;
+    /// A host interface's Ethernet address (`ifconfig`'s `ether`).
+    fn interface_ether(&self, name: &str) -> Result<String>;
+    /// Gives a host interface another Ethernet address.
+    fn interface_set_ether(&self, name: &str, ether: &str) -> Result<()>;
     /// Moves a host interface into a VNET jail. It returns to the host when
     /// the jail is removed.
     fn interface_move(&self, name: &str, jail: &str) -> Result<()>;

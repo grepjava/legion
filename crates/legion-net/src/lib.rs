@@ -188,16 +188,7 @@ impl PodNetwork {
         let pair = sys.epair_create()?;
         let result = (|| {
             sys.interface_rename(&pair.a, &host)?;
-            sys.interface_configure(
-                None,
-                &host,
-                &IfConfig {
-                    mtu: Some(MTU),
-                    up: true,
-                    ..Default::default()
-                },
-            )?;
-            sys.bridge_add_member(BRIDGE, &host)?;
+            self.join(sys, &host)?;
             sys.interface_move(&pair.b, jail)?;
             // A new VNET's loopback has only ::1; rc gives the host its
             // 127.0.0.1, so a pod needs it set too.
@@ -233,6 +224,30 @@ impl PodNetwork {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Puts a pod's host end (an epair's, a guest's tap) on the bridge,
+    /// with the bridge's MTU and Ethernet address. With an address of its
+    /// own, the pod's ARP for the gateway could be answered with it: the
+    /// bridge hands a broadcast up on the member it came in on as well as
+    /// on itself, and ARP answers with the address of the interface it
+    /// heard on, twice, the last answer winning. Frames to the member's
+    /// address are then taken in on the member, where the VIPs' rules,
+    /// which are on the bridge, never see them, and the pod's VIPs fail
+    /// until the host's next ARP request gives it the bridge's address
+    /// again. Neighbor discovery answers on the bridge only.
+    pub fn join(&self, sys: &dyn Sys, name: &str) -> Result<(), Error> {
+        sys.interface_set_ether(name, &sys.interface_ether(BRIDGE)?)?;
+        sys.interface_configure(
+            None,
+            name,
+            &IfConfig {
+                mtu: Some(MTU),
+                up: true,
+                ..Default::default()
+            },
+        )?;
+        sys.bridge_add_member(BRIDGE, name)
     }
 
     /// Removes the pod's epair, wherever its jail end is.
@@ -341,6 +356,9 @@ mod tests {
             sys.interface(BRIDGE).unwrap().members,
             std::slice::from_ref(&host)
         );
+        // The bridge's own address: ARP's answers name the bridge.
+        assert_eq!(sys.interface(&host).unwrap().ether, bridge.ether);
+        assert!(bridge.ether.is_some());
         let inside = sys.interfaces(Some("infra1")).unwrap();
         assert_eq!(inside, ["lo0", "epair0b"]);
         let b = sys.interface("epair0b").unwrap();

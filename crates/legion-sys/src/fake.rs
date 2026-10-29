@@ -34,6 +34,8 @@ pub struct FakeInterface {
     pub members: Vec<String>,
     /// The other end, for an epair.
     pub peer: Option<String>,
+    /// Its Ethernet address, for a bridge or an epair end.
+    pub ether: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -41,6 +43,7 @@ struct State {
     modules: BTreeSet<String>,
     next_jid: u32,
     next_epair: u32,
+    next_ether: u32,
     jails: BTreeMap<String, Jail>,
     /// Parameters set with `jail -m`, by jail name.
     jail_params: BTreeMap<String, BTreeMap<String, String>>,
@@ -278,6 +281,7 @@ impl FakeSys {
                 config: IfConfig::default(),
                 members: Vec::new(),
                 peer: None,
+                ether: None,
             });
     }
 
@@ -371,6 +375,13 @@ impl State {
             }
             _ => Ok(()),
         }
+    }
+
+    /// A new, locally administered Ethernet address.
+    fn new_ether(&mut self) -> String {
+        self.next_ether += 1;
+        let n = self.next_ether;
+        format!("02:00:00:00:{:02x}:{:02x}", (n >> 8) & 0xff, n & 0xff)
     }
 
     /// An interface in the given network stack.
@@ -490,8 +501,14 @@ impl Sys for FakeSys {
                 "ioctl SIOCSIFNAME (set name): File exists",
             ));
         }
-        s.interfaces
-            .insert(name.to_owned(), FakeInterface::default());
+        let ether = Some(s.new_ether());
+        s.interfaces.insert(
+            name.to_owned(),
+            FakeInterface {
+                ether,
+                ..Default::default()
+            },
+        );
         Ok(())
     }
 
@@ -504,10 +521,12 @@ impl Sys for FakeSys {
             b: format!("epair{n}b"),
         };
         for (me, peer) in [(&pair.a, &pair.b), (&pair.b, &pair.a)] {
+            let ether = Some(s.new_ether());
             s.interfaces.insert(
                 me.clone(),
                 FakeInterface {
                     peer: Some(peer.clone()),
+                    ether,
                     ..Default::default()
                 },
             );
@@ -573,6 +592,20 @@ impl Sys for FakeSys {
         if !b.members.iter().any(|m| m == member) {
             b.members.push(member.to_owned());
         }
+        Ok(())
+    }
+
+    fn interface_ether(&self, name: &str) -> Result<String> {
+        let mut s = self.state();
+        let i = s.interface_mut("ifconfig", None, name)?;
+        i.ether
+            .clone()
+            .ok_or_else(|| fail("ifconfig", format!("{name} has no Ethernet address")))
+    }
+
+    fn interface_set_ether(&self, name: &str, ether: &str) -> Result<()> {
+        let mut s = self.state();
+        s.interface_mut("ifconfig ether", None, name)?.ether = Some(ether.to_owned());
         Ok(())
     }
 

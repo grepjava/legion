@@ -1,9 +1,10 @@
 //! The pod network on FreeBSD itself. It changes interfaces and routes, so
-//! it refuses to run outside a VNET jail; run it in a throwaway one:
+//! it refuses to run outside a VNET jail; run it in a throwaway one, a
+//! test at a time (they share the bridge):
 //!
 //! ```sh
 //! jail -c name=lnet path=/ vnet persist children.max=4 allow.raw_sockets
-//! jexec lnet target/debug/deps/live-<hash> --ignored
+//! jexec lnet target/debug/deps/live-<hash> --ignored --test-threads=1
 //! jail -r lnet
 //! ```
 
@@ -83,6 +84,15 @@ fn pods_on_the_bridge() {
     ] {
         let (ok, out) = sh(&cmd);
         assert!(ok, "{cmd}: {out}");
+    }
+    // However often a pod asks, the gateway is the bridge's address, not
+    // its host end's (which the VIPs' rules would never see).
+    let bridge_ether = sys.interface_ether(BRIDGE).unwrap();
+    for _ in 0..5 {
+        sh(&format!("jexec {a} arp -d 10.200.7.1"));
+        assert!(sh(&format!("jexec {a} ping -c1 -t2 10.200.7.1")).0);
+        let (_, arp) = sh(&format!("jexec {a} arp -n 10.200.7.1"));
+        assert!(arp.contains(&bridge_ether), "{arp}");
     }
     let (_, route) = sh(&format!("route -j {a} -n get default"));
     assert!(route.contains("gateway: 10.200.7.1"), "{route}");

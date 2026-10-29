@@ -885,7 +885,23 @@ replaces Podman and ocijail.
   cleanly. Open: two jails of the first run's first pod stayed dying
   (later runs' pods did not); not yet explained.
 
+- **bhyve spike** (DESIGN.md §6.8, `legion-net/tests/bhyve.rs`): a
+  small FreeBSD guest boots from a zvol in 2.9 s inside a VNET jail
+  with `allow.vmm`, configured by loader variables, on a tap in
+  `legion0`. Legion's service and policy rules work for it unchanged,
+  both ways and over both families, with the tap as its host end.
+- **Pods' VIPs failing after an ARP exchange** (DESIGN.md §5.3), found
+  by the spike: the host answered a pod's ARP for its gateway twice,
+  with the bridge's address and with the pod's host end's, the last
+  answer winning; with the host end's, the pod's frames bypassed the
+  VIPs' rules on the bridge until the host next asked for the pod's
+  address. Host ends now take the bridge's Ethernet address
+  (`PodNetwork::join`, `Sys::interface_ether`/`interface_set_ether`);
+  the live test asks five times and checks the answer, and fails at the
+  first ask without the fix.
+
 ### To do, in order
 
-Next in phase 5: bhyve tasks (exploratory).
+Next in phase 5: decide on a `runtime: bhyve` (DESIGN.md §6.8 lists
+what it needs; the network needs nothing more).
 

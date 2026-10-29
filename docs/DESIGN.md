@@ -514,7 +514,7 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
 | Linux images | Via `linux64` on nodes started with `--linux`, which placement selects with `node.platform.linux == true` (6.6). | 5 |
 | IPv6 dual-stack | Every pod, VIP and node address has an IPv6 twin in a ULA range, with routes, WireGuard peers, pf rules and tables, DNS AAAA and policy for both families (5.7). | 5 |
 | Volume drivers | `driver: nfs`, `iscsi` (UFS on a LUN, one node at a time) or `plugin` (an executable on the node), beside ZFS (6.7). | 5 |
-| bhyve tasks | `runtime: bhyve` for workloads that need their own kernel. | 5 (exploratory) |
+| bhyve tasks | `runtime: bhyve` for workloads that need their own kernel. Spiked (6.8): a guest on a tap is a pod to the network; the runtime is not built. | 5 (exploratory) |
 
 ---
 
@@ -589,6 +589,16 @@ default `10.88.0.0/16`, on a host that also runs Podman, for example).
   end `lp<last 12 hex digits of the task uid>`, which finds it again after a
   restart. Teardown destroys the host end first, which removes the pair
   even while the other end is still in the jail.
+- **Host ends carry the bridge's Ethernet address** (found by the bhyve
+  spike, 6.8). The bridge hands a broadcast up twice, on itself and on
+  the member it came in on, and ARP answers each with the address of the
+  interface it heard on; whichever answer came last was the pod's entry
+  for its gateway. With the member's, the pod's frames for the host were
+  taken in on the member, where the VIPs' `rdr` rules, which are on
+  `legion0`, never matched, and the pod's VIPs failed until the host's
+  next ARP request to it put the bridge's address back. With one address
+  for both, the bridge claims the frames as its own. Neighbor discovery
+  answers on the bridge only, so IPv6 never had this.
 - **Built** (phase 2): the mesh. Each node makes a WireGuard key on first
   start (`<data-dir>/wireguard.key`, mode 0600) and registers its public
   key and endpoint (its advertised address, port 51820) in
@@ -1079,6 +1089,35 @@ make ZFS volumes. Built in `legion_api::volume`, `legion-agent::volumes`,
   (its data still there), with a clean daemon stop.
 - **Not yet**: CHAP for iSCSI, multipath, other file systems on LUNs,
   Compose `driver_opts`, timeouts for plugins that hang.
+
+### 6.8 bhyve tasks: the spike (phase 5)
+
+Can a virtual machine be a pod? The spike (`legion-net/tests/bhyve.rs`)
+boots a small FreeBSD guest (`tests/bhyve-guest.sh`: this host's kernel,
+`/rescue`, `nc` and an rc, built by makefs) from a zvol with `bhyveload`
+and `bhyve`, inside a VNET jail with `allow.vmm`, beside a jail pod, and
+checks it against Legion's own rules. On FreeBSD 15.1:
+
+- It is up (addresses set, serving) 2.9 s after `bhyveload` starts.
+- Its configuration needs nothing in the image: `bhyveload -e
+  legion.ip=…` sets loader variables, which the guest reads with `kenv`.
+  That is for FreeBSD guests only; others boot with UEFI firmware
+  (`edk2-bhyve`, a package) and would read a cloud-init NoCloud seed.
+- Its tap is a pod's host end like any other (`PodNetwork::join`): the
+  host and the pod reach it directly and through its VIP, it reaches the
+  pod through the pod's VIP, over IPv4 and IPv6, and policy refuses and
+  allows it with the tap as the guard's interface. No rule changed.
+- It found the ARP fault in 5.3, which every pod had.
+
+What a `runtime: bhyve` would still need, none of it networking: disk
+images (a raw image, not OCI layers, cloned per task from a zvol, as
+images are now), boot (bhyveload for FreeBSD, UEFI otherwise), the
+seed, supervision of the bhyve process (a restart is a reboot), limits
+(`-c` and `-m` from the pod's), the console as the task's log, a
+graceful stop (ACPI power button, then `bhyvectl --destroy`), and
+volumes as virtio-blk zvols or NFS from inside. Not checked: a guest
+spoofing its source (the policy refuses any other source on the tap, as
+on an epair), and guests on other nodes (routed like any pod).
 
 ## 7. Object model
 

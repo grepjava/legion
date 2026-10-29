@@ -386,6 +386,23 @@ impl<R: Runner> Sys for Shell<R> {
             .map(drop)
     }
 
+    fn interface_ether(&self, name: &str) -> Result<String> {
+        let a = args([name]);
+        self.run("ifconfig", &a)?
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("ether "))
+            .map(|e| e.trim().to_owned())
+            .ok_or_else(|| Error::Parse {
+                command: describe("ifconfig", &a),
+                message: format!("{name} has no Ethernet address"),
+            })
+    }
+
+    fn interface_set_ether(&self, name: &str, ether: &str) -> Result<()> {
+        self.run("ifconfig", &args([name, "ether", ether]))
+            .map(drop)
+    }
+
     fn interface_move(&self, name: &str, jail: &str) -> Result<()> {
         self.run("ifconfig", &args([name, "vnet", jail])).map(drop)
     }
@@ -1197,6 +1214,22 @@ mod tests {
 	      peer 224.0.0.18 peer6 ff02::12
 	status: active
 ";
+
+    #[test]
+    fn ether() {
+        let sh = Script::shell(vec![
+            ("ifconfig epair0a", ok(CARP_SHOWN)),
+            ("ifconfig lo0", ok("lo0: flags=8049<UP,LOOPBACK> mtu 16384\n")),
+            ("ifconfig lp0123 ether c2:c4:69:1c:c3:ed", ok("")),
+        ]);
+        assert_eq!(sh.interface_ether("epair0a").unwrap(), "c2:c4:69:1c:c3:ed");
+        assert!(matches!(
+            sh.interface_ether("lo0"),
+            Err(Error::Parse { .. })
+        ));
+        sh.interface_set_ether("lp0123", "c2:c4:69:1c:c3:ed")
+            .unwrap();
+    }
 
     #[test]
     fn carp() {
