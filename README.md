@@ -109,7 +109,22 @@ legion stack rm shop                        # volumes and their data stay
 A namespace's tasks are reached only by its own tasks, the nodes and
 published ports, unless its `isolation` is `open` (or `locked`, not even
 its own); `NetworkPolicy` objects let more in by namespace, service labels
-and ports. A namespace's `quota`, which only the cluster admin sets, caps
+and ports. With `egress`, a policy also limits where the tasks it
+selects may send (DNS always works; `egress: []` allows nothing else):
+
+```yaml
+kind: NetworkPolicy
+metadata: { name: api-out, namespace: shop }
+spec:
+  services: { app: api }
+  egress:
+    - to: [{ services: { app: db } }]
+      ports: [{ port: 5432 }]
+    - to: [{ cidr: 192.0.2.0/24 }]   # a payment provider
+      ports: [{ port: 443 }]
+```
+
+A namespace's `quota`, which only the cluster admin sets, caps
 what its tasks request, how many run, and its volumes; tasks beyond it
 wait as `pending`:
 

@@ -517,7 +517,7 @@ Already there from phase 1: namespaces scope names and DNS
 
 Nothing left in phase 3.
 
-Smaller follow-ups: egress policies; lab runs on weft-bsd leave the bridge
+Smaller follow-ups: lab runs on weft-bsd leave the bridge
 sysctls at 1; API request counts and latencies in the metrics.
 
 ## Phase 4 — Stateful and operations
@@ -982,10 +982,28 @@ real, in the order agreed with the user.
   there as before. Tested: placement around such a node and the pending
   reason; the agent reporting it, refusing a pod with limits and running
   one without; `sysctl -n` as FreeBSD 15.1 prints it.
+- **Egress network policy** (DESIGN.md §5.6, README.md). A policy's
+  `egress`, when given, limits what the tasks it selects send to its
+  rules' destinations (tasks by namespace and labels, or an IPv4 `cidr`;
+  on the destination's ports) and DNS to the node's resolver; `egress:
+  []` allows nothing more, and a policy without it limits nothing. VIPs
+  are open to a pod only where its egress allows their service as well.
+  The live test found that a pod with egress limited could not answer
+  what the host sends it (probes, VIP traffic hairpin-NATed on its node,
+  published ports): that passes the host end unseen, so it leaves no
+  state there, and the pod's catch-all pass had been carrying the
+  answers. Such pods now get that traffic passed out on the bridge with a
+  floating state. Tested: admission (`egress: []` and none told apart,
+  addresses or tasks but not both); the guards (tables, networks, the
+  VIPs narrowed, policies without egress adding nothing); the rules; on
+  FreeBSD 15.1 in a VNET jail, a pod with egress limited refused direct
+  traffic to another pod over IPv4 and IPv6 while the host still reached
+  it, then let through to a table on a port (both families) and to a
+  network (IPv4 only).
 
 ### To do, in order
 
 Nothing left in the hardening agreed with the user. Candidates from the
-phases' follow-ups: egress network policy, a faster down signal for lost
-nodes, and a FreeBSD port.
+phases' follow-ups: a faster down signal for lost nodes, and a FreeBSD
+port.
 

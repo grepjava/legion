@@ -280,6 +280,7 @@ fn guest_on_the_bridge() {
                 } else {
                     vec![]
                 },
+                egress: None,
             },
             Guard {
                 interface: tap.clone(),
@@ -294,6 +295,7 @@ fn guest_on_the_bridge() {
                 } else {
                     vec![]
                 },
+                egress: None,
             },
         ]
     };

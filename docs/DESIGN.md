@@ -744,7 +744,22 @@ over TCP.
   hairpin rule, losing its source, so VIPs are checked at the client pod
   instead (`in on lpX`, still to the VIP; this is what needs
   `pfil_local_phys`): each pod may reach the VIP ports whose tasks would
-  let it in. Egress policies are not built yet.
+  let it in.
+- **Built** (hardening): egress. A policy's `egress`, when given, limits
+  what the tasks it selects send to what one of the egress rules of the
+  policies selecting them allows (`to`: tasks by namespace and service
+  labels, or an IPv4 `cidr`; empty, anywhere; `ports`: the destination's,
+  a task's rather than a VIP's), and DNS to the node's resolver; `egress:
+  []` allows nothing more. A policy without it limits nothing. Pods may
+  use a VIP's port only if their egress allows its service too. The
+  guard's catch-all pass for what the pod sends becomes DNS, the allowed
+  tables and networks (networks for IPv4 only, as pods reach the outside
+  over IPv4), and a block. What the host sends such a pod (probes,
+  hairpin-NATed VIP traffic, published ports) passes its host end unseen
+  and so leaves no state there for the pod's replies, which the catch-all
+  used to pass: it is now passed out on `legion0` keeping a floating
+  state. Agents from before egress cannot read a policy that has it
+  (unknown field).
 - **Built** (hardening): a new pod is guarded before anything in it runs.
   Its worker hands the pod (host end, address, namespace, service) to the
   policy pass as soon as its network is up, since the assignments learn

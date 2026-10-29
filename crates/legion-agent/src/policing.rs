@@ -1,15 +1,17 @@
 //! Network policy on this node (DESIGN.md §5.6): which tasks may reach the
-//! pods here, and which VIPs they may use, from the namespaces' isolation
-//! and the policies. legion-net turns this into pf rules.
+//! pods here, which VIPs they may use, and where else they may send when
+//! a policy's egress limits it, from the namespaces' isolation and the
+//! policies. legion-net turns this into pf rules.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 
 use legion_api::dispatch::{Endpoints, Policies, ServiceEndpoints};
-use legion_api::policy::{Isolation, PolicyPeer, selects};
+use legion_api::policy::{EgressRule, Isolation, PolicyPeer, parse_cidr, selects};
 use legion_api::service::Protocol;
 use legion_net::lb::Proto;
-use legion_net::policy::{Allow, Guard};
+use legion_net::policy::{Allow, Egress, Guard, Target};
+use legion_sys::Ipv4Net;
 use tokio::sync::watch;
 
 /// A pod running on this node.
@@ -136,22 +138,31 @@ pub fn guards(
                 });
             }
         }
+        let rules = egress_rules(policies, pod, mine);
         let vips = endpoints
             .iter()
             .filter_map(|e| Some((e, e.vip?)))
             .flat_map(|(e, vip)| {
+                let rules = &rules;
                 e.ports
                     .iter()
-                    .filter(|port| may_reach(policies, pod, mine, e, port.protocol, port.target))
+                    .filter(move |port| {
+                        may_reach(policies, pod, mine, e, port.protocol, port.target)
+                            && may_send(rules.as_deref(), pod, e, port.protocol, port.target)
+                    })
                     .map(move |port| (vip, proto(port.protocol), port.port))
             })
             .collect();
+        let egress = rules
+            .as_deref()
+            .map(|rules| egress(&mut tables, endpoints, ns, rules));
         guards.push(Guard {
             interface: pod.interface.clone(),
             ip: pod.ip,
             open: isolation == Isolation::Open,
             allowed,
             vips,
+            egress,
         });
     }
     (guards, tables)
@@ -191,6 +202,103 @@ fn may_reach(
                     .any(|p| p.port == port && p.protocol == protocol);
             peer_ok && port_ok
         })
+}
+
+/// The egress rules of the policies selecting `pod`, if any of them
+/// limits what it sends.
+fn egress_rules<'a>(
+    policies: &'a Policies,
+    pod: &LocalPod,
+    labels: &BTreeMap<String, String>,
+) -> Option<Vec<&'a EgressRule>> {
+    let mut limited = false;
+    let mut rules = Vec::new();
+    for p in policies
+        .policies
+        .iter()
+        .filter(|p| p.namespace == pod.namespace && selects(&p.spec.services, labels))
+    {
+        if let Some(egress) = &p.spec.egress {
+            limited = true;
+            rules.extend(egress);
+        }
+    }
+    limited.then_some(rules)
+}
+
+/// Whether a pod limited to `rules` (unlimited without) may send to
+/// `to`'s tasks on `port`, as through their VIP.
+fn may_send(
+    rules: Option<&[&EgressRule]>,
+    from: &LocalPod,
+    to: &ServiceEndpoints,
+    protocol: Protocol,
+    port: u16,
+) -> bool {
+    let Some(rules) = rules else {
+        return true;
+    };
+    rules.iter().any(|rule| {
+        let to_ok = rule.to.is_empty()
+            || rule.to.iter().any(|peer| match peer.tasks() {
+                Some(t) => {
+                    t.namespace.as_deref().unwrap_or(&from.namespace) == to.namespace
+                        && selects(&t.services, &to.labels)
+                }
+                None => peer
+                    .cidr
+                    .as_deref()
+                    .and_then(parse_cidr)
+                    .zip(to.vip)
+                    .is_some_and(|((net, prefix), vip)| Ipv4Net::new(net, prefix).contains(vip)),
+            });
+        let port_ok = rule.ports.is_empty()
+            || rule
+                .ports
+                .iter()
+                .any(|p| p.port == port && p.protocol == protocol);
+        to_ok && port_ok
+    })
+}
+
+/// Where `rules` let a pod of namespace `ns` send: tasks as tables (added
+/// to `tables`), addresses as networks.
+fn egress(
+    tables: &mut BTreeMap<String, Vec<Ipv4Addr>>,
+    endpoints: &Endpoints,
+    ns: &str,
+    rules: &[&EgressRule],
+) -> Vec<Egress> {
+    let mut out = Vec::new();
+    for rule in rules {
+        let ports: Vec<(Proto, u16)> = rule
+            .ports
+            .iter()
+            .map(|p| (proto(p.protocol), p.port))
+            .collect();
+        let mut send = |to| {
+            out.push(Egress {
+                to,
+                ports: ports.clone(),
+            })
+        };
+        if rule.to.is_empty() {
+            send(Target::Any);
+            continue;
+        }
+        let tasks: Vec<PolicyPeer> = rule.to.iter().filter_map(|p| p.tasks()).collect();
+        if !tasks.is_empty() {
+            send(Target::Table(table(tables, endpoints, ns, &tasks)));
+        }
+        for (net, prefix) in rule
+            .to
+            .iter()
+            .filter_map(|p| p.cidr.as_deref().and_then(parse_cidr))
+        {
+            send(Target::Net(Ipv4Net::new(net, prefix)));
+        }
+    }
+    out
 }
 
 /// The table of the running tasks `peers` name (all of the cluster's when
@@ -244,7 +352,7 @@ fn fnv(s: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use legion_api::dispatch::{EndpointPort, NamespacedPolicy};
-    use legion_api::policy::{IngressRule, NetworkPolicySpec, PolicyPort};
+    use legion_api::policy::{EgressPeer, IngressRule, NetworkPolicySpec, PolicyPort};
 
     use super::*;
 
@@ -351,6 +459,7 @@ mod tests {
                             protocol: Protocol::Tcp,
                         }],
                     }],
+                    egress: None,
                 },
             }],
             ..Default::default()
@@ -370,5 +479,76 @@ mod tests {
         // b's web may use a's db VIP, not a's web VIP.
         let vips: Vec<Ipv4Addr> = guards[2].vips.iter().map(|v| v.0).collect();
         assert_eq!(vips, [ip("10.201.0.2"), ip("10.201.0.3")]);
+        assert!(guards.iter().all(|g| g.egress.is_none()), "no egress said");
+    }
+
+    fn policy(name: &str, app: &str, egress: Option<Vec<EgressRule>>) -> NamespacedPolicy {
+        NamespacedPolicy {
+            namespace: "a".into(),
+            name: name.into(),
+            spec: NetworkPolicySpec {
+                services: BTreeMap::from([("app".into(), app.into())]),
+                egress,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn egress_limits_what_pods_send() {
+        // a's web may send to a's db on 8080 and to 192.0.2.0/24 on 443.
+        let port = |port| PolicyPort {
+            port,
+            protocol: Protocol::Tcp,
+        };
+        let rules = vec![
+            EgressRule {
+                to: vec![EgressPeer {
+                    services: BTreeMap::from([("app".into(), "db".into())]),
+                    ..Default::default()
+                }],
+                ports: vec![port(8080)],
+            },
+            EgressRule {
+                to: vec![EgressPeer {
+                    cidr: Some("192.0.2.0/24".into()),
+                    ..Default::default()
+                }],
+                ports: vec![port(443)],
+            },
+        ];
+        let policies = Policies {
+            policies: vec![
+                policy("web-out", "web", Some(rules)),
+                // Saying nothing of egress adds nothing, and takes nothing.
+                policy("web-in", "web", None),
+            ],
+            ..Default::default()
+        };
+        let pods = [pod("a", "web", "10.200.0.2"), pod("a", "db", "10.200.0.3")];
+        let (guards, tables) = guards(&pods, &endpoints(), &policies);
+        let egress = guards[0].egress.as_ref().unwrap();
+        assert_eq!(egress.len(), 2);
+        let Target::Table(db) = &egress[0].to else {
+            panic!("{egress:?}")
+        };
+        assert_eq!(tables[db], [ip("10.200.0.3")]);
+        assert_eq!(egress[0].ports, [(Proto::Tcp, 8080)]);
+        assert_eq!(egress[1].to, Target::Net("192.0.2.0/24".parse().unwrap()));
+        assert_eq!(egress[1].ports, [(Proto::Tcp, 443)]);
+        // Its own namespace's VIPs are open to it, but it may send only
+        // to db's.
+        let vips: Vec<Ipv4Addr> = guards[0].vips.iter().map(|v| v.0).collect();
+        assert_eq!(vips, [ip("10.201.0.2")]);
+        assert!(guards[1].egress.is_none(), "db is not selected");
+
+        // An empty list: only DNS, and no VIP.
+        let policies = Policies {
+            policies: vec![policy("db-out", "db", Some(vec![]))],
+            ..Default::default()
+        };
+        let (shut, _) = super::guards(&pods, &endpoints(), &policies);
+        assert_eq!(shut[1].egress, Some(vec![]));
+        assert!(shut[1].vips.is_empty());
     }
 }

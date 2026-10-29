@@ -13,6 +13,17 @@
 //! and whatever it starts is kept as state, so replies come back through
 //! its own refusals.
 //!
+//! What a pod sends is checked as it leaves it (`in on` its host end): it
+//! must come from the pod's address, a VIP only on the ports it may use,
+//! and with egress limited, only to what that allows, and DNS to the
+//! node's resolver; replies to what reached it pass as their connection's
+//! state. What the host sends the pod (probes, VIP traffic the hairpin
+//! rule NATed to the gateway, published ports' translated traffic) makes
+//! no state on the host end, as pf does not see it there: for a pod with
+//! egress limited, it is passed out on the bridge keeping a floating
+//! state, which the pod's replies match. Other nodes' traffic already
+//! floats from the mesh.
+//!
 //! What reaches a pod is checked here, on its node, by source: the nodes
 //! (probes, other hosts, published ports reached through another node),
 //! traffic a published port's or a VIP's rule translated here, and the
@@ -38,7 +49,7 @@ use legion_sys::{Ipv4Net, Sys};
 
 use crate::lb::{Proto, TAG, dual};
 use crate::mesh::{INTERFACE as MESH, UNDERLAY, UNDERLAY6};
-use crate::{CLUSTER_POD_CIDR, CLUSTER_POD_CIDR6, SERVICE_CIDR6, v6};
+use crate::{BRIDGE, CLUSTER_POD_CIDR, CLUSTER_POD_CIDR6, SERVICE_CIDR6, v6};
 
 pub const ANCHOR: &str = "legion/policy";
 
@@ -47,6 +58,22 @@ pub const ANCHOR: &str = "legion/policy";
 pub struct Allow {
     pub table: String,
     pub ports: Vec<(Proto, u16)>,
+}
+
+/// Where a pod may send, on some ports (all if empty).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Egress {
+    pub to: Target,
+    pub ports: Vec<(Proto, u16)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Any,
+    /// A table of tasks, as [`Allow::table`].
+    Table(String),
+    /// IPv4 addresses (pods reach the outside over IPv4 only).
+    Net(Ipv4Net),
 }
 
 /// A pod on this node, with what may reach it and what it may reach.
@@ -61,12 +88,17 @@ pub struct Guard {
     pub allowed: Vec<Allow>,
     /// The VIP ports it may use; other VIPs are refused at the pod.
     pub vips: Vec<(Ipv4Addr, Proto, u16)>,
+    /// Where else it may send, if that is limited; besides these, only
+    /// DNS to its gateway.
+    pub egress: Option<Vec<Egress>>,
 }
 
 /// One address family's addresses for a guard's rules.
 struct Family {
     name: &'static str,
     ip: IpAddr,
+    /// This node's address on the bridge, the pods' resolver.
+    gateway: IpAddr,
     /// The nodes: this one's gateway and the mesh range.
     nodes: String,
     /// The VIP range.
@@ -84,6 +116,7 @@ pub fn rules(guards: &[Guard], gateway: Ipv4Addr, services: Ipv4Net) -> String {
         let inet = Family {
             name: "inet",
             ip: g.ip.into(),
+            gateway: gateway.into(),
             nodes: format!(
                 "{{ {gateway}, {}/{} }}",
                 UNDERLAY.network(),
@@ -107,6 +140,7 @@ pub fn rules(guards: &[Guard], gateway: Ipv4Addr, services: Ipv4Net) -> String {
         let inet6 = Family {
             name: "inet6",
             ip: ip6.into(),
+            gateway: gateway6.into(),
             nodes: format!("{{ {gateway6}, {UNDERLAY6} }}"),
             vips: SERVICE_CIDR6.to_string(),
             pods: CLUSTER_POD_CIDR6.to_string(),
@@ -135,7 +169,47 @@ fn guard_rules(r: &mut String, g: &Guard, f: &Family) {
         );
     }
     let _ = writeln!(r, "block drop in quick on {lp} {af} to {}", f.vips);
-    let _ = writeln!(r, "pass in quick on {lp} {af} from {ip} {state}");
+    match &g.egress {
+        None => {
+            let _ = writeln!(r, "pass in quick on {lp} {af} from {ip} {state}");
+        }
+        Some(egress) => {
+            let gateway = f.gateway;
+            let _ = writeln!(
+                r,
+                "pass in quick on {lp} {af} proto {{ udp, tcp }} from {ip} to {gateway} port 53 {state}"
+            );
+            for e in egress {
+                let to = match &e.to {
+                    Target::Any => "any".to_owned(),
+                    Target::Table(t) => format!("<{t}>"),
+                    Target::Net(_) if af != "inet" => continue,
+                    Target::Net(n) => format!("{}/{}", n.network(), n.prefix),
+                };
+                if e.ports.is_empty() {
+                    let _ = writeln!(r, "pass in quick on {lp} {af} from {ip} to {to} {state}");
+                }
+                for (proto, port) in &e.ports {
+                    let _ = writeln!(
+                        r,
+                        "pass in quick on {lp} {af} proto {} from {ip} to {to} port {port} {state}",
+                        proto.as_str()
+                    );
+                }
+            }
+            let _ = writeln!(r, "block drop in quick on {lp} {af} all");
+            // Replies to what the host sends it, which passes the host end
+            // unseen: a floating state where pf does see it.
+            let _ = writeln!(
+                r,
+                "pass out quick on {BRIDGE} {af} from {gateway} to {ip} keep state"
+            );
+            let _ = writeln!(
+                r,
+                "pass out quick on {BRIDGE} {af} to {ip} tagged {TAG} keep state"
+            );
+        }
+    }
     // Its state there is bound to its host end; what it starts toward
     // other nodes needs one on the mesh as well, which its replies
     // match before the refusals below.
@@ -257,6 +331,7 @@ mod tests {
                     },
                 ],
                 vips: vec![(ip("10.201.0.3"), Proto::Tcp, 80)],
+                egress: None,
             },
             Guard {
                 interface: "lp000000000008".into(),
@@ -264,8 +339,62 @@ mod tests {
                 open: true,
                 allowed: vec![],
                 vips: vec![],
+                egress: None,
             },
         ]
+    }
+
+    #[test]
+    fn renders_egress() {
+        let services = Ipv4Net::new(ip("10.201.0.0"), 16);
+        let g = Guard {
+            interface: "lp000000000009".into(),
+            ip: ip("10.200.0.9"),
+            open: true,
+            allowed: vec![],
+            vips: vec![],
+            egress: Some(vec![
+                Egress {
+                    to: Target::Table("tdb".into()),
+                    ports: vec![(Proto::Tcp, 5432)],
+                },
+                Egress {
+                    to: Target::Net(Ipv4Net::new(ip("192.0.2.0"), 24)),
+                    ports: vec![],
+                },
+            ]),
+        };
+        let r = rules(&[g], ip("10.200.0.1"), services);
+        let from_pod: Vec<&str> = r
+            .lines()
+            .filter(|l| l.contains("in quick on lp000000000009"))
+            .collect();
+        assert_eq!(
+            from_pod,
+            [
+                "block drop in quick on lp000000000009 inet from ! 10.200.0.9",
+                "block drop in quick on lp000000000009 inet to 10.201.0.0/16",
+                "pass in quick on lp000000000009 inet proto { udp, tcp } from 10.200.0.9 to 10.200.0.1 port 53 keep state (if-bound)",
+                "pass in quick on lp000000000009 inet proto tcp from 10.200.0.9 to <tdb> port 5432 keep state (if-bound)",
+                "pass in quick on lp000000000009 inet from 10.200.0.9 to 192.0.2.0/24 keep state (if-bound)",
+                "block drop in quick on lp000000000009 inet all",
+                "block drop in quick on lp000000000009 inet6 from ! fd00:10:200::9",
+                "block drop in quick on lp000000000009 inet6 to fd00:10:201::/96",
+                "pass in quick on lp000000000009 inet6 proto { udp, tcp } from fd00:10:200::9 to fd00:10:200::1 port 53 keep state (if-bound)",
+                "pass in quick on lp000000000009 inet6 proto tcp from fd00:10:200::9 to <tdb> port 5432 keep state (if-bound)",
+                "block drop in quick on lp000000000009 inet6 all",
+            ]
+        );
+        // What the host sends it keeps a state its replies match.
+        for rule in [
+            "pass out quick on legion0 inet from 10.200.0.1 to 10.200.0.9 keep state",
+            "pass out quick on legion0 inet to 10.200.0.9 tagged LSVC keep state",
+            "pass out quick on legion0 inet6 from fd00:10:200::1 to fd00:10:200::9 keep state",
+        ] {
+            assert!(r.contains(rule), "{rule}");
+        }
+        // Not for a pod whose egress is free: its own rule passes replies.
+        assert!(!rules(&guards(), ip("10.200.0.1"), services).contains("on legion0"));
     }
 
     #[test]

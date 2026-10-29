@@ -215,7 +215,7 @@ fn pods_on_the_bridge() {
 fn policy_on_the_bridge() {
     use std::collections::BTreeMap;
 
-    use legion_net::policy::{self, Allow, Guard, Policy};
+    use legion_net::policy::{self, Allow, Egress, Guard, Policy, Target};
 
     assert_eq!(
         sh("sysctl -n security.jail.jailed").1.trim(),
@@ -278,6 +278,10 @@ fn policy_on_the_bridge() {
             "jexec {b} sh -c 'while :; do nc {family} -l 8080 </dev/null >/dev/null 2>&1; done &' </dev/null >/dev/null 2>&1"
         ));
     }
+    // And a on 9090, for replies while its egress is limited.
+    sh(&format!(
+        "jexec {a} sh -c 'while :; do nc -4 -l 9090 </dev/null >/dev/null 2>&1; done &' </dev/null >/dev/null 2>&1"
+    ));
     std::thread::sleep(std::time::Duration::from_millis(500));
     let reach = |from: Option<&str>, to: &str, port: u16| {
         let cmd = match from {
@@ -293,7 +297,7 @@ fn policy_on_the_bridge() {
     );
 
     let services = "10.201.0.0/16".parse().unwrap();
-    let guard = |allowed: &[Ipv4Addr], vips: bool| {
+    let guard = |allowed: &[Ipv4Addr], vips: bool, egress: Option<Vec<Egress>>| {
         let guards = vec![
             Guard {
                 interface: host_interface(pods[0].1),
@@ -305,6 +309,7 @@ fn policy_on_the_bridge() {
                 } else {
                     vec![]
                 },
+                egress,
             },
             Guard {
                 interface: host_interface(pods[1].1),
@@ -315,21 +320,25 @@ fn policy_on_the_bridge() {
                     ports: vec![(Proto::Tcp, 8080)],
                 }],
                 vips: vec![],
+                egress: None,
             },
         ];
-        let tables = BTreeMap::from([("tfriends".to_owned(), allowed.to_vec())]);
+        let tables = BTreeMap::from([
+            ("tfriends".to_owned(), allowed.to_vec()),
+            ("tb".to_owned(), vec![b_ip]),
+        ]);
         (guards, tables)
     };
     let mut p = Policy::default();
-    let mut set = |allowed: &[Ipv4Addr], vips: bool| {
-        let (guards, tables) = guard(allowed, vips);
+    let mut set = |allowed: &[Ipv4Addr], vips: bool, egress: Option<Vec<Egress>>| {
+        let (guards, tables) = guard(allowed, vips, egress);
         p.apply(&sys, &guards, &tables, net.gateway(), services)
             .unwrap();
     };
 
     // Nobody allowed: a cannot reach b, directly or through the VIP; the
     // host (probes) still can.
-    set(&[], false);
+    set(&[], false, None);
     assert!(
         !reach(Some(a), &b_ip.to_string(), 8080),
         "direct, refused: {}{}{}",
@@ -349,13 +358,13 @@ fn policy_on_the_bridge() {
     assert!(reach(None, &b6, 8080), "the host over IPv6");
     // a allowed on 8080: directly, yes (the reply passes a's own guard as
     // state of what a started); the VIP still closed at a.
-    set(&[a_ip], false);
+    set(&[a_ip], false, None);
     assert!(reach(Some(a), &b_ip.to_string(), 8080), "direct, allowed");
     assert!(reach(Some(a), &b6, 8080), "direct over IPv6, allowed");
     assert!(!reach(Some(a), &vip.to_string(), 80), "VIP, refused at a");
     assert!(!reach(Some(a), vip6, 80), "VIP over IPv6, refused at a");
     // And the VIP opened at a: through it, with the hairpin NAT.
-    set(&[a_ip], true);
+    set(&[a_ip], true, None);
     assert!(reach(Some(a), &vip.to_string(), 80), "VIP, allowed");
     assert!(
         reach(Some(a), vip6, 80),
@@ -365,7 +374,7 @@ fn policy_on_the_bridge() {
     );
     // An address that is not a's own is refused, though allowed at b.
     let fake = Ipv4Addr::new(10, 200, 8, 50);
-    set(&[a_ip, fake], true);
+    set(&[a_ip, fake], true, None);
     let epair = sh(&format!("ifconfig -j {a} -l")).1;
     let epair = epair
         .split_whitespace()
@@ -389,6 +398,36 @@ fn policy_on_the_bridge() {
         "spoofed IPv6 source"
     );
     assert!(reach(Some(a), &b6, 8080), "a's own IPv6 address still");
+
+    // Egress limited at a, with b letting a in throughout: nothing but
+    // DNS at first, while what reaches a still gets its replies.
+    set(&[a_ip], false, Some(vec![]));
+    assert!(!reach(Some(a), &b_ip.to_string(), 8080), "egress: none");
+    assert!(!reach(Some(a), &b6, 8080), "egress over IPv6: none");
+    assert!(reach(None, &a_ip.to_string(), 9090), "replies from a");
+    // b's tasks on 8080, as a table: both families.
+    let to_b = Egress {
+        to: Target::Table("tb".into()),
+        ports: vec![(Proto::Tcp, 8080)],
+    };
+    set(&[a_ip], false, Some(vec![to_b]));
+    assert!(
+        reach(Some(a), &b_ip.to_string(), 8080),
+        "egress to b's tasks: {}",
+        sh("pfctl -a legion/policy -vsr").1
+    );
+    assert!(reach(Some(a), &b6, 8080), "egress to b's tasks over IPv6");
+    // b's address as a network: IPv4 only.
+    let to_net = Egress {
+        to: Target::Net(format!("{b_ip}/32").parse().unwrap()),
+        ports: vec![],
+    };
+    set(&[a_ip], false, Some(vec![to_net]));
+    assert!(
+        reach(Some(a), &b_ip.to_string(), 8080),
+        "egress to a network"
+    );
+    assert!(!reach(Some(a), &b6, 8080), "networks are IPv4 only");
     sys.pf_flush_anchor(policy::ANCHOR).unwrap();
     sys.pf_flush_anchor(ANCHOR).unwrap();
     for (jail, id) in &pods {
