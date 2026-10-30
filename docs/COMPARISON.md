@@ -23,7 +23,7 @@ what is built today, not what is planned.
 | Configuration | YAML objects, or compose files as stacks | Compose files, `docker service` flags | YAML objects, Helm charts, operators |
 | Extensible API | No (fixed kinds) | No | Yes (CRDs, operators, webhooks) |
 | Scale it is built for | Up to 256 nodes (one /24 of the pod network each) and about 20,000 tasks | Hundreds of nodes | Thousands of nodes |
-| Maturity | New; not yet released or used in production | Mature, in maintenance | Mature, very widely used |
+| Maturity | New; first release (v0.1.0), not used in production | Mature, in maintenance | Mature, very widely used |
 
 Choose Legion to run services on FreeBSD hosts with ZFS, pf and jails,
 without assembling a stack of components. Choose Swarm or Kubernetes for
@@ -145,7 +145,7 @@ Linux hosts, an ecosystem of tools and charts, or proven production use.
 | Live view in the terminal | `legion top`: every kind of object, CPU and memory with graphs, details and YAML, a log of changes, and keys to drain, scale, roll back, move, delete, follow logs and open shells | `docker stats` (one node), `docker service ps` | `kubectl top`; k9s and others, separately |
 | Web UI | No; a Grafana dashboard for its metrics | No; Portainer and others, separately | The Kubernetes Dashboard, an add-on |
 | Metrics | Prometheus endpoint: cluster state, and each container's CPU, memory and I/O; a Grafana dashboard | Engine metrics endpoint | metrics-server, kube-state-metrics, cAdvisor in kubelet |
-| Packaging | rc.d script under daemon(8), newsyslog entry, release tarballs built by a script, a FreeBSD port (not yet in the ports tree); no published release yet | Distribution packages | Distribution packages, many installers |
+| Packaging | rc.d script under daemon(8), newsyslog entry, release tarballs built by a script, a FreeBSD port (not yet in the ports tree); release tarballs for amd64 on GitHub | Distribution packages | Distribution packages, many installers |
 | Running containers by hand beside the cluster | Yes; Legion touches only its own jails and pf anchors | Yes | Not recommended |
 
 ## Not in Legion

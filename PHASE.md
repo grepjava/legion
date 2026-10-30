@@ -1180,8 +1180,8 @@ real, in the order agreed with the user.
   only what may be scaled); `top --once` against a manager on Windows;
   on FreeBSD 15.1 in a pty, keys typed into `top` scaled a service to 3
   and ran its logs, whose error waited for Enter before `top` came back.
-  The port's `Makefile.crates` needs regenerating for ratatui at the
-  next release.
+  The port's `Makefile.crates` was made again for v0.1.0, with ratatui
+  and vt100.
 - **`legion top`, full** (asked 2026-10-30: "full featured and slick,
   with pretty panels"). Split into a module (model, view, draw). Rounded
   panels; a header with nodes and tasks by state, the managers, and CPU
@@ -1277,6 +1277,9 @@ real, in the order agreed with the user.
 ### To do, in order
 
 Nothing left in the hardening agreed with the user, nor in the phases'
-follow-ups. Waiting on the user: a first release (a tag, the GitHub
-release with tarballs, then the port's `distinfo` and its submission).
+follow-ups. v0.1.0, the first release, was tagged on 2026-10-31 (asked:
+"create a new release and upgrade it"), its GitHub release holding the
+amd64 tarball built on FreeBSD 15.1; weft-bsd runs it as a service.
+Waiting on the user: an aarch64 tarball (no aarch64 host), the port's
+`distinfo` and its submission.
 
