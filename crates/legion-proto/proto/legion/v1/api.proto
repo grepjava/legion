@@ -3,6 +3,8 @@ syntax = "proto3";
 
 package legion.v1;
 
+import "legion/v1/dispatcher.proto";
+
 // The common envelope (DESIGN.md §7). Specs and statuses travel as JSON until
 // each kind gets a typed message.
 message Object {
@@ -117,6 +119,23 @@ service Cluster {
   // manager seals its private keys with the key, and after a restart waits
   // for it (`Unlock`). Returns the key, empty once disabled.
   rpc Autolock(AutolockRequest) returns (AutolockResponse);
+  // What tasks use, as their nodes last reported it (within a minute), by
+  // node: the tasks of `namespace`, or of every namespace when empty, that
+  // the caller may read.
+  rpc Usage(UsageRequest) returns (UsageResponse);
+}
+
+message UsageRequest {
+  string namespace = 1;
+}
+
+message UsageResponse {
+  repeated NodeUsage nodes = 1;
+}
+
+message NodeUsage {
+  string node = 1;
+  repeated TaskUsage tasks = 2;
 }
 
 message AutolockRequest {

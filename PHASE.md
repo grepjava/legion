@@ -1156,6 +1156,25 @@ real, in the order agreed with the user.
   with no `activeDeadline` may be never. It now makes way once the data
   is copied, as a drain makes it (stopped, not failed), and its next task
   runs where the data went; a planner test fails without it.
+- **`legion top` and a Grafana dashboard** (decided with the user
+  2026-10-30: a terminal UI and a dashboard for the metrics, no web UI
+  for now, since one needs browser logins, a gRPC gateway and a
+  JavaScript build). `legion top` shows nodes, services and Jobs, tasks
+  with their use, and a log of changes, live from a list and a watch;
+  Enter lists a node's or a service's tasks, `h` adds ended tasks, `--once`
+  prints it as text. It only reads so far: actions (drain, pause, scale,
+  roll back, logs, exec) come next. Usage comes from a new
+  `Cluster.Usage` call, answered by the leader and filtered to what the
+  caller may read. `packaging/grafana/legion.json` is a dashboard of the
+  metrics: leader, nodes and tasks by state, services short of ready
+  tasks, restarts, CPU, memory and I/O by task and node, quota use, the
+  agents. Tested: unit tests of top's model and screens (rendered to a
+  test backend); an API test of `Usage` (an admin sees every task, a
+  user only their namespaces, and is refused another's), which fails
+  without the filter; a test that the dashboard names only exported
+  metrics; `top --once` against a manager on Windows, and the full
+  screen in a pty on FreeBSD 15.1. The port's `Makefile.crates` needs
+  regenerating for ratatui at the next release.
 - **From a second review.** A route could name any Secret of its
   namespace for HTTPS, and every node could then read it: a route's
   Secret is now handed out only if it holds a PEM certificate and key.

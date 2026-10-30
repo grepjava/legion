@@ -6,6 +6,7 @@ mod daemon;
 mod metrics;
 mod pki;
 mod session;
+mod top;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -255,6 +256,17 @@ enum Command {
         service: String,
         #[arg(short, long)]
         namespace: Option<String>,
+    },
+    /// The cluster live in the terminal: nodes, services and Jobs, tasks,
+    /// what they use, and what changes.
+    Top {
+        /// Only this namespace (default: every one you may read).
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// Print nodes, services and Jobs, and tasks once, as text, and
+        /// exit.
+        #[arg(long)]
+        once: bool,
     },
     /// Stream changes, optionally of one kind.
     Watch {

@@ -566,6 +566,56 @@ impl Cluster for ApiService {
         }))
     }
 
+    async fn usage(
+        &self,
+        req: Request<pb::UsageRequest>,
+    ) -> Result<Response<pb::UsageResponse>, Status> {
+        let caller = self.caller(&req)?;
+        let namespace = req.get_ref().namespace.clone();
+        if !namespace.is_empty() {
+            check_namespace(&namespace)?;
+            caller.check(&self.store, Verb::Read, Kind::Task, &namespace)?;
+        }
+        // Only the leader hears heartbeats.
+        let mut usage = if let Some(addr) = self.leader_addr(&req)? {
+            let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                &addr,
+                self.peer_tls.as_ref(),
+            ));
+            c.usage(forwarded(req.into_inner())).await?.into_inner()
+        } else {
+            let mut nodes: BTreeMap<String, Vec<pb::TaskUsage>> = BTreeMap::new();
+            for (key, (node, u)) in self.usage.fresh() {
+                let Some((ns, task)) = key.split_once('/') else {
+                    continue;
+                };
+                if ns == SYSTEM_NAMESPACE || (!namespace.is_empty() && ns != namespace) {
+                    continue;
+                }
+                nodes.entry(node).or_default().push(pb::TaskUsage {
+                    namespace: ns.to_owned(),
+                    task: task.to_owned(),
+                    cpu_percent: u.cpu,
+                    memory_bytes: u.memory,
+                });
+            }
+            pb::UsageResponse {
+                nodes: nodes
+                    .into_iter()
+                    .map(|(node, tasks)| pb::NodeUsage { node, tasks })
+                    .collect(),
+            }
+        };
+        // A user sees the tasks of the namespaces they may read in.
+        if caller != Caller::All {
+            for n in &mut usage.nodes {
+                n.tasks
+                    .retain(|t| caller.may(&self.store, Verb::Read, Kind::Task, &t.namespace));
+            }
+        }
+        Ok(Response::new(usage))
+    }
+
     type BackupStream = ReceiverStream<Result<pb::BackupChunk, Status>>;
 
     async fn backup(

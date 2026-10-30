@@ -59,7 +59,14 @@ EOF
 legion list svc -A
 legion get svc web -n shop
 legion watch Service
+legion top
 ```
+
+`legion top` shows the cluster live in the terminal: nodes, services and
+Jobs, tasks, what they use, and what changes (`legion top --once` prints
+it as text). For dashboards, Prometheus can scrape each daemon's
+`--metrics-listen` endpoint; [packaging/grafana](packaging/grafana) has a
+Grafana dashboard for it.
 
 The daemon serves the API on port 7470 of every address, with mutual TLS:
 every call but joining needs a certificate of the cluster's, as

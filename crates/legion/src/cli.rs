@@ -520,6 +520,8 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 break;
             }
         }
+        Command::Top { namespace, once } if once => crate::top::once(channel, namespace).await?,
+        Command::Top { namespace, .. } => crate::top::run(channel, namespace).await?,
         Command::Watch { kind, from } => {
             let kind = kind.as_deref().map(parse_kind).transpose()?;
             let from_version = match from {

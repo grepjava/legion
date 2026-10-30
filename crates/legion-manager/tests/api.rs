@@ -1134,6 +1134,72 @@ fn get(kind: &str, namespace: &str, name: &str) -> ObjectRef {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn usage_shows_what_the_caller_may_read() {
+    let ca = Ca::generate().unwrap();
+    let m = Running::start_with(Some(&ca)).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let admin = m.objects().await;
+    eventually(|| {
+        let mut admin = admin.clone();
+        async move { admin.apply(binding("a", "alice", "view")).await }
+    })
+    .await;
+    let w1 = creds(&ca, "w1", Role::Worker);
+    let d1 = DispatcherClient::new(m.channel(Some(&w1)).await.unwrap());
+    let task = |namespace: &str, cpu_percent| legion_proto::v1::TaskUsage {
+        namespace: namespace.into(),
+        task: "web-1-1".into(),
+        cpu_percent,
+        memory_bytes: 1 << 20,
+    };
+    eventually(|| {
+        let mut d = d1.clone();
+        let usage = vec![task("a", 25.0), task("b", 50.0)];
+        async move {
+            d.heartbeat(HeartbeatRequest {
+                node: String::new(),
+                usage,
+            })
+            .await
+        }
+    })
+    .await;
+    let usage = |mut c: ClusterClient<Channel>, namespace: &str| {
+        let req = legion_proto::v1::UsageRequest {
+            namespace: namespace.into(),
+        };
+        async move { c.usage(req).await }
+    };
+    let seen = |u: legion_proto::v1::UsageResponse| -> Vec<(String, String, f64)> {
+        u.nodes
+            .into_iter()
+            .flat_map(|n| {
+                let node = n.node;
+                n.tasks
+                    .into_iter()
+                    .map(move |t| (node.clone(), t.namespace, t.cpu_percent))
+            })
+            .collect()
+    };
+    let row = |ns: &str, cpu| ("w1".to_owned(), ns.to_owned(), cpu);
+
+    // The admin sees every task, by node; one namespace when asked.
+    let all = usage(m.cluster().await, "").await.unwrap().into_inner();
+    assert_eq!(seen(all), [row("a", 25.0), row("b", 50.0)]);
+    let b = usage(m.cluster().await, "b").await.unwrap().into_inner();
+    assert_eq!(seen(b), [row("b", 50.0)]);
+    // A user, only the namespaces they may read in.
+    let alice = ClusterClient::new(
+        m.channel(Some(&creds(&ca, "alice", Role::User)))
+            .await
+            .unwrap(),
+    );
+    let mine = usage(alice.clone(), "").await.unwrap().into_inner();
+    assert_eq!(seen(mine), [row("a", 25.0)]);
+    denied(usage(alice, "b").await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn users_act_within_their_role_bindings() {
     let ca = Ca::generate().unwrap();
     let m = Running::start_with(Some(&ca)).await;

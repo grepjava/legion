@@ -469,6 +469,20 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   with kubectl-style kind names (`service`, `services`, `svc`), `-n`, `-A`,
   `-l key=value` and `-o table|yaml|json`. `apply` reads multi-document YAML
   or JSON, or stdin with `-f -`.
+- **`legion top`.** The cluster live in the terminal (ratatui): nodes
+  with their tasks and use against what they can hold, services and
+  Jobs with ready tasks and update or Job state, tasks with node, state,
+  readiness, restarts, CPU, memory and address, and a log of changes
+  (node state and availability, services created, changed and their
+  updates' steps, Jobs' states, tasks reaching running or ending,
+  restarting, turning ready or not). It lists the four kinds, then
+  follows one watch from the oldest listing's version, ignoring what is
+  older than what it holds; a broken watch lists again. Usage comes from
+  `Cluster.Usage`, which the leader answers from the heartbeats' reports
+  (a follower forwards it), keeping the tasks of namespaces the caller
+  may read. Enter on a node, service or Job lists its tasks. It only
+  reads: a user sees what their role bindings let them, and kinds they
+  may not list say so. `--once` prints the views as text and exits.
 
 ## 4. Feature set
 
