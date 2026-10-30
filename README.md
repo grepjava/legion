@@ -22,13 +22,14 @@ root:
 ```sh
 tar -xf legion-<version>-freebsd15-amd64.tar.xz --strip-components 1 -C /usr/local
 sysrc -f /boot/loader.conf kern.racct.enable=1   # rctl limits; reboot once
-zfs create zroot/legion       # images, containers and volumes; must be mounted
+zfs create -o mountpoint=/zroot/legion zroot/legion   # images, containers, volumes
 sysrc legion_enable=YES legion_args="--zfs-root zroot/legion"
 service legion start
 legion init                   # on the first manager; other nodes join (below)
 ```
 
-`/etc/pf.conf` must call Legion's anchors (see below). The daemon logs to
+pf must be enabled (`sysrc pf_enable=YES`) and `/etc/pf.conf` must call
+Legion's anchors (see below) before the daemon starts. The daemon logs to
 `/var/log/legion.log`, which newsyslog rotates; `service legion stop`
 leaves the pods running, and the next start takes them over.
 
