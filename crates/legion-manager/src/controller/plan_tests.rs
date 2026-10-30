@@ -1732,6 +1732,37 @@ fn a_job_stops_at_its_deadline() {
 }
 
 #[test]
+fn a_global_task_stays_on_a_node_taking_no_new_ones() {
+    let mut w = World::new();
+    for n in ["n1", "n2", "n3", "n4"] {
+        w.node(n, &[]);
+    }
+    w.service(
+        "agent",
+        "mode: global\npod: { containers: [{ name: a, image: \"a:1\" }] }",
+    );
+    w.settle();
+    assert_eq!(w.running().len(), 4);
+
+    // Suspect, tainted NoSchedule, paused: no new task, the one there
+    // stays, and so does its history.
+    w.state("n1", NodeState::Suspect);
+    w.taint("n2", "dedicated", TaintEffect::NoSchedule);
+    w.availability("n3", Availability::Pause);
+    w.end("agent-n3-1", TaskState::Failed);
+    w.settle();
+    assert_eq!(w.running(), ["agent-n1-1", "agent-n2-1", "agent-n4-1"]);
+    assert!(w.tasks().contains(&"agent-n3-1 failed n3".to_owned()));
+    assert_eq!(w.status("agent").desired, 1, "only n4 takes new tasks");
+
+    // Down, or tainted NoExecute: it goes.
+    w.state("n1", NodeState::Down);
+    w.taint("n2", "evict", TaintEffect::NoExecute);
+    w.settle();
+    assert_eq!(w.running(), ["agent-n4-1"]);
+}
+
+#[test]
 fn a_global_job_runs_once_per_node() {
     let mut w = World::new();
     w.node("n1", &[]);
@@ -2355,6 +2386,29 @@ fn ordinals_drained_from_one_node_spread_over_the_others() {
     let (zero, one) = (to("data-db-0").flatten(), to("data-db-1").flatten());
     assert!(zero.is_some() && one.is_some(), "{zero:?} {one:?}");
     assert_ne!(zero, one);
+}
+
+#[test]
+fn an_ordinal_whose_data_arrived_counts_before_its_task_starts() {
+    use legion_api::volume::MigrationPhase::*;
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.service("db", &STATEFUL.replace("replicas: 3", "replicas: 2"));
+    w.settle();
+    w.node("n2", &[]);
+    w.node("n3", &[]);
+    w.settle();
+    // Ordinal 1's data is on n2, its task not placed yet; ordinal 0's
+    // drains off n1.
+    w.tasks.retain(|t| t.object.metadata.name != "db-1-1");
+    w.volumes
+        .get_mut(&("shop".to_owned(), "data-db-1".to_owned()))
+        .unwrap()
+        .status
+        .node = "n2".into();
+    w.availability("n1", Availability::Drain);
+    w.step();
+    assert_eq!(w.migration("data-db-0"), Some(("n3".to_owned(), Copying)));
 }
 
 #[test]

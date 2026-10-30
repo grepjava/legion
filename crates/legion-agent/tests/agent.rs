@@ -1001,6 +1001,33 @@ async fn an_adopted_pod_is_reported_running() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pod_whose_address_was_not_reported_starts_over() {
+    let mut h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task("app-1", r#"containers: [{ name: app, image: "app:1" }]"#)
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    let created = h.rt.created();
+
+    // The agent went after giving the pod its address, before reporting
+    // it: the next cannot know the address in the pod's jail.
+    h.stop_agent().await;
+    let mut o = h.store.get(&key).unwrap().unwrap();
+    o.status["state"] = "starting".into();
+    o.status["ip"] = serde_json::Value::Null;
+    let v = o.metadata.version;
+    h.write(o, Precondition::Version(v)).await;
+    h.start_agent();
+    eventually("the pod made again", || {
+        h.rt.created() == created + 2 && h.running().len() == 2
+    })
+    .await;
+    let st = h.wait_state(&key, TaskState::Running).await;
+    assert_eq!(st.ip.as_deref(), Some("10.200.0.2"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn removes_pods_of_deleted_tasks() {
     let mut h = Harness::new().await;
     h.rt.add_image("app:1");

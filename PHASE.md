@@ -1117,6 +1117,27 @@ real, in the order agreed with the user.
   ordinals drained from one node to two), a unit test of the exit
   comparison; each fails with its fix taken out. The live jail tests
   pass on FreeBSD 15.1.
+- **From a sixth review.** Three faults, each confirmed first. A global
+  task was stopped, and its history dropped, as soon as its node stopped
+  taking new tasks for any reason but a pause: a node suspect for a
+  couple of missed heartbeats, or tainted `NoSchedule`, which DESIGN.md
+  says keeps only new tasks off; a paused node kept its task but lost
+  its history. A node that is paused, suspect or tainted `NoSchedule`
+  now keeps its global task and history, unless its taints evict the
+  task, the service's constraints or limits no longer allow the node,
+  or it is drained or down. Ordinals drained off a node were counted
+  against placed tasks and migrations under way, missing one whose data
+  had arrived on a node before its task started there: each ordinal now
+  counts where its Volumes go or are, else where its task is. An adopted
+  pod whose address the previous agent had not reported was given the
+  lowest free one, while its jail kept the first, so pf dropped its
+  traffic; and an adoption whose network failed went on regardless. Such
+  a pod is now made again. Tested: a planner test (suspect, `NoSchedule`
+  and paused nodes keep their global tasks and a failed one's history,
+  down and `NoExecute` ones do not), a planner test (an ordinal's data on
+  n2 sends another ordinal to n3), an agent test (a pod adopted with its
+  address cleared is made again, at the same address); each fails with
+  its fix taken out.
 - **From a second review.** A route could name any Secret of its
   namespace for HTTPS, and every node could then read it: a route's
   Secret is now handed out only if it holds a PEM certificate and key.

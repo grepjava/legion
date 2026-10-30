@@ -511,9 +511,11 @@ fn service(
     }
 
     // Slots no longer wanted: stop what runs there and drop the history. A
-    // paused node keeps its global task; a drained or vanished one does
-    // not, nor one whose taints evict it. A stateful service stops its
-    // highest ordinal first, one at a time.
+    // node that only takes no new tasks (paused, suspect, or tainted
+    // `NoSchedule`) keeps its global task and history; a drained, down or
+    // vanished one does not, nor one whose taints evict it or that the
+    // service may no longer run on. A stateful service stops its highest
+    // ordinal first, one at a time.
     let mut unwanted: Vec<(&Slot, &Vec<&Task>)> = by_slot
         .iter()
         .filter(|(slot, _)| !wanted_set.contains(slot))
@@ -525,13 +527,14 @@ fn service(
         .iter()
         .any(|(_, list)| list.iter().any(|t| t.stopping()));
     for (slot, list) in unwanted {
-        let paused = matches!(slot, Slot::Node(name) if nodes.iter().any(|n| {
-            n.name() == name
-                && n.spec.availability == Availability::Pause
-                && !n.repels(s, TaintEffect::NoExecute)
+        let kept = matches!(slot, Slot::Node(name) if nodes.iter().any(|n| {
+            n.name() == name && keeps_global(n, s)
         }));
+        if kept {
+            continue;
+        }
         for t in list {
-            if t.active() && !paused {
+            if t.active() {
                 if stateful {
                     if one_stopping {
                         continue;
@@ -1094,6 +1097,25 @@ pub(super) fn shared_volumes(s: &Service) -> Vec<String> {
         .collect()
 }
 
+/// Whether a global task of `s` already on `n` stays, though `n` takes no
+/// new one: `n` is paused, suspect or tainted `NoSchedule`, which keep
+/// new tasks off and no more.
+fn keeps_global(n: &Node, s: &Service) -> bool {
+    matches!(n.status.state, NodeState::Ready | NodeState::Suspect)
+        && n.spec.availability != Availability::Drain
+        && !n.repels(s, TaintEffect::NoExecute)
+        && !(n.status.platform.no_limits && s.spec.pod.limited())
+        && constraints_hold(s, n)
+}
+
+fn constraints_hold(s: &Service, n: &Node) -> bool {
+    s.spec
+        .placement
+        .constraints
+        .iter()
+        .all(|c| c.parse::<Constraint>().is_ok_and(|c| matches(&c, n)))
+}
+
 /// Whether `n` may run tasks of `s` that mount the Volumes `mounts` at
 /// all; requests are checked when placing.
 fn eligible(
@@ -1131,13 +1153,7 @@ fn eligible(
     if elsewhere {
         return Err("volume on another node");
     }
-    let hold = s
-        .spec
-        .placement
-        .constraints
-        .iter()
-        .all(|c| c.parse::<Constraint>().is_ok_and(|c| matches(&c, n)));
-    if !hold {
+    if !constraints_hold(s, n) {
         return Err("constraints");
     }
     Ok(())

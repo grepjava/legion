@@ -302,8 +302,9 @@ impl<R: Runtime, C: Control> Worker<R, C> {
 
     /// Takes over a pod left running by a previous agent. A pod that is
     /// incomplete (a container missing, or created but never started: the
-    /// agent went between the two) or whose infra container has stopped is
-    /// removed instead, and started again from scratch.
+    /// agent went between the two), whose infra container has stopped, or
+    /// whose address is not known to be its own (the agent went before
+    /// reporting it) is removed instead, and started again from scratch.
     async fn adopt(&mut self) -> Option<Pod> {
         let found = match self.ctx.runtime.list(&[(LABEL_TASK, &self.a.uid)]).await {
             Ok(f) => f,
@@ -334,19 +335,20 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 members.push(Member::new(&spec.name, &c.id, c.state == "running"));
             }
             if members.len() == self.pod().containers.len() {
-                tracing::info!("adopted running pod");
-                if let Err(e) = self.attach(&infra.id).await {
-                    let why = match e {
-                        Abort::Failed(m) | Abort::Rejected(m) => m,
-                        Abort::Stopped => "stopped".into(),
-                    };
-                    tracing::warn!("adopted pod's network: {why}");
+                match self.attach(&infra.id, true).await {
+                    Ok(()) => {
+                        tracing::info!("adopted running pod");
+                        return Some(Pod {
+                            infra: infra.id.clone(),
+                            members,
+                            refused: None,
+                        });
+                    }
+                    Err(Abort::Failed(why) | Abort::Rejected(why)) => {
+                        tracing::warn!("adopting the pod's network: {why}");
+                    }
+                    Err(Abort::Stopped) => {}
                 }
-                return Some(Pod {
-                    infra: infra.id.clone(),
-                    members,
-                    refused: None,
-                });
             }
         }
         tracing::info!("removing an incomplete pod left by a previous run");
@@ -426,7 +428,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             .await
             .map_err(|e| Abort::Failed(format!("starting the infra container: {e}")))?;
         self.check_infra_jail(&infra).await?;
-        self.attach(&infra).await?;
+        self.attach(&infra, false).await?;
         self.guarded().await?;
 
         let init: Vec<_> = self.pod().init_containers.clone();
@@ -499,8 +501,9 @@ impl<R: Runtime, C: Control> Worker<R, C> {
     }
 
     /// Gives the pod its address: the one it had (an adopted pod, or a task
-    /// whose status carries one) or the lowest free one.
-    async fn attach(&mut self, infra: &str) -> Result<(), Abort> {
+    /// whose status carries one) or the lowest free one. An adopted pod
+    /// (`adopting`) must have had one: its jail holds it already.
+    async fn attach(&mut self, infra: &str, adopting: bool) -> Result<(), Abort> {
         let net = self
             .ctx
             .net
@@ -522,6 +525,11 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 });
             let ip = match own {
                 Some(ip) => ip,
+                None if adopting => {
+                    return Err(Abort::Failed(
+                        "its address is not known, or is another pod's".into(),
+                    ));
+                }
                 None => {
                     let used: BTreeSet<Ipv4Addr> = ips.values().copied().collect();
                     net.allocate(&used).ok_or_else(|| {
