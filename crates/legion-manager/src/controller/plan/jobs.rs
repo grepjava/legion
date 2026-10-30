@@ -203,7 +203,7 @@ pub(super) fn job(
         }
     } else {
         start(
-            j, owner, &wanted, &by_slot, nodes, memory, now, plan, created,
+            j, owner, &wanted, &by_slot, nodes, volumes, memory, now, plan, created,
         );
     }
 
@@ -221,8 +221,10 @@ pub(super) fn job(
     }
 }
 
-/// Moves tasks off nodes they may no longer run on and starts tasks for
-/// slots that need one, `parallelism` at a time.
+/// Moves tasks off nodes they may no longer run on, or once the data they
+/// mount, moving off their node, has been copied (as a drain does: the
+/// move waits for no task to use it), and starts tasks for slots that need
+/// one, `parallelism` at a time.
 #[allow(clippy::too_many_arguments)]
 fn start(
     j: &Job,
@@ -230,6 +232,7 @@ fn start(
     wanted: &[Slot],
     by_slot: &BTreeMap<Slot, Vec<&Task>>,
     nodes: &[Node],
+    volumes: &Volumes,
     memory: &Memory,
     now: Instant,
     plan: &mut Plan,
@@ -243,7 +246,8 @@ fn start(
                 n.name() == t.spec.node
                     && (n.spec.availability == Availability::Drain
                         || n.repels(owner, TaintEffect::NoExecute))
-            });
+            }) || (super::migrate::leaving(t, volumes)
+                && super::migrate::copied(t, volumes));
             if leaving || !wanted_set.contains(slot) {
                 plan.actions.push(stop(t));
             }

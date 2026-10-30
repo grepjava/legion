@@ -1151,6 +1151,11 @@ real, in the order agreed with the user.
   Job's task on a suspect and a `NoSchedule` node runs on and the Job
   waits for it; on a paused node, a start-first update finishes and a
   volume moved off it gets there), each failing with its fix taken out.
+  Its re-review found no fault left, and one inconsistency: a replicated
+  Job's task held a Volume moved off its node until the task ended, which
+  with no `activeDeadline` may be never. It now makes way once the data
+  is copied, as a drain makes it (stopped, not failed), and its next task
+  runs where the data went; a planner test fails without it.
 - **From a second review.** A route could name any Secret of its
   namespace for HTTPS, and every node could then read it: a route's
   Secret is now handed out only if it holds a PEM certificate and key.

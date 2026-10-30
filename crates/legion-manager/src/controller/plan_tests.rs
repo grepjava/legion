@@ -1872,6 +1872,36 @@ fn a_drained_node_moves_a_job_task_without_a_failure() {
     assert_eq!(w.job_status("backup").failed, 0);
 }
 
+#[test]
+fn a_job_task_lets_its_data_move_without_a_failure() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.volume("scratch", "");
+    w.ask("scratch", Some("n1"));
+    w.job(
+        "backup",
+        "pod: { containers: [{ name: dump, image: \"tools:1\" }], volumes: [{ name: s, volume: { name: scratch } }] }",
+    );
+    w.settle();
+    assert_eq!(w.tasks(), ["backup-1-1 running n1"]);
+    // Moved: the task runs on while the data is copied, then makes way,
+    // and its next runs where the data went.
+    w.ask("scratch", Some("n2"));
+    w.settle();
+    assert_eq!(w.tasks(), ["backup-1-1 running n1"]);
+    for _ in 0..2 {
+        w.migrate();
+        w.settle();
+    }
+    assert_eq!(w.volume_node("scratch"), "n2");
+    assert_eq!(
+        w.tasks(),
+        ["backup-1-1 shutdown n1", "backup-1-2 running n2"]
+    );
+    assert_eq!(w.job_status("backup").failed, 0);
+}
+
 fn report(extra: &str) -> String {
     format!(
         "schedule: \"*/5 * * * *\"\n{extra}\njob:\n  pod: {{ containers: [{{ name: r, image: \"tools:1\" }}] }}"
