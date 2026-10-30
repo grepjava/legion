@@ -1084,6 +1084,13 @@ real, in the order agreed with the user.
   failing with its signal taken out. That test first passed with the
   kill taken out: it took the shell's command line, naming the command,
   for the command, and hung it up before its `trap` ran.
+  A fourth review found the kill still waited on the command alone: one
+  that ended on the hangup, leaving a child that ignored it, was never
+  killed. Release now follows the command's process group in the
+  container's jail (`pkill`/`pgrep -g GROUP -j JID`, so a group id reused
+  on the host after the group emptied is never touched) until none of it
+  is left, killing what outlasts the grace. The live test's third case
+  (`(trap '' HUP; exec sleep 305) & wait`) fails on the code before.
 - **From a second review.** A route could name any Secret of its
   namespace for HTTPS, and every node could then read it: a route's
   Secret is now handed out only if it holds a PEM certificate and key.

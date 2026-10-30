@@ -143,6 +143,8 @@ struct Session {
     /// The process group the command leads: its own, or with a terminal
     /// its session's.
     group: Option<u32>,
+    /// The container's jail, which the command and all it starts are in.
+    jid: u32,
     /// The terminal's controlling side, for resizing.
     #[cfg(unix)]
     master: Option<Arc<Pty>>,
@@ -150,6 +152,25 @@ struct Session {
 
 /// How long a command let go of has after its hangup before it is killed.
 const EXEC_HANGUP_GRACE: Duration = Duration::from_secs(5);
+
+/// Sends `signal` (`HUP`, `KILL`, or `0` to only look) to the members of
+/// process group `group` in jail `jid`; whether there were any. Only that
+/// jail's: once a group has emptied, its id may be another's on the host.
+async fn signal_group(group: u32, jid: u32, signal: &str) -> bool {
+    let (group, jid) = (group.to_string(), jid.to_string());
+    let status = if signal == "0" {
+        tokio::process::Command::new("pgrep")
+            .args(["-q", "-g", &group, "-j", &jid])
+            .status()
+            .await
+    } else {
+        tokio::process::Command::new("pkill")
+            .args([&format!("-{signal}"), "-g", &group, "-j", &jid])
+            .status()
+            .await
+    };
+    status.is_ok_and(|s| s.success())
+}
 
 /// A terminal's controlling side, non-blocking and polled by the reactor,
 /// shared by the session, its output and its input. Its one descriptor
@@ -1175,6 +1196,7 @@ impl legion_agent::Runtime for JailRuntime {
                     Session {
                         code: code_rx,
                         group,
+                        jid,
                         master: Some(master),
                     },
                 );
@@ -1219,6 +1241,7 @@ impl legion_agent::Runtime for JailRuntime {
             Session {
                 code: code_rx,
                 group,
+                jid,
                 #[cfg(unix)]
                 master: None,
             },
@@ -1285,32 +1308,32 @@ impl legion_agent::Runtime for JailRuntime {
         Ok(got)
     }
 
-    /// Its command, if it still runs, is hung up as a terminal would be,
-    /// and killed if it outlasts [`EXEC_HANGUP_GRACE`]: no one is left to
-    /// read it. Dropping the session drops a terminal's last descriptor.
+    /// Its command and what it started, if still running, are hung up as
+    /// a terminal would be, and killed if any outlast
+    /// [`EXEC_HANGUP_GRACE`]: no one is left to read them. That is the
+    /// command's process group in the container's jail, which the command
+    /// itself may have left already. Dropping the session drops a
+    /// terminal's last descriptor.
     async fn exec_release(&self, exec_id: &str) {
         let Some(session) = self.execs.lock().expect("execs").remove(exec_id) else {
             return;
         };
-        let Some(group) = session.group.and_then(|g| libc::pid_t::try_from(g).ok()) else {
+        let (Some(group), jid) = (session.group, session.jid) else {
             return;
         };
-        let mut code = session.code.clone();
         drop(session);
-        // Not reaped while there is no code, so the group is still its.
-        let signal = |sig| {
-            if code.borrow().is_none() {
-                // SAFETY: a plain system call; a group already gone is fine.
-                unsafe { libc::killpg(group, sig) };
-            }
-        };
-        signal(libc::SIGHUP);
+        if !signal_group(group, jid, "HUP").await {
+            return;
+        }
         tokio::spawn(async move {
-            let ended = tokio::time::timeout(EXEC_HANGUP_GRACE, code.wait_for(Option::is_some));
-            if ended.await.is_err() && code.borrow().is_none() {
-                // SAFETY: as above.
-                unsafe { libc::killpg(group, libc::SIGKILL) };
+            let deadline = tokio::time::Instant::now() + EXEC_HANGUP_GRACE;
+            while tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                if !signal_group(group, jid, "0").await {
+                    return;
+                }
             }
+            signal_group(group, jid, "KILL").await;
         });
     }
 

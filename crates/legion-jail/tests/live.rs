@@ -270,7 +270,13 @@ async fn pods_of_jails() {
     until("the released terminal hangs up", async || !held()).await;
     // So does a command without a terminal, and one ignoring the hangup is
     // killed after a grace.
-    for script in ["exec sleep 303", "trap '' HUP; sleep 304; sleep 304"] {
+    // And when the command ends on the hangup but leaves behind a child
+    // ignoring it, the child is killed all the same.
+    for script in [
+        "exec sleep 303",
+        "trap '' HUP; sleep 304; sleep 304",
+        "(trap '' HUP; exec sleep 305) & wait",
+    ] {
         let attached = rt
             .exec_attach(
                 &app,
@@ -280,11 +286,10 @@ async fn pods_of_jails() {
             )
             .await
             .unwrap();
-        let what = if script.contains("303") {
-            "sleep 303"
-        } else {
-            "sleep 304"
-        };
+        let what = ["sleep 303", "sleep 304", "sleep 305"]
+            .into_iter()
+            .find(|w| script.contains(w))
+            .unwrap();
         let alive = running(what);
         until("the command", async || alive()).await;
         let session = attached.id.clone();
