@@ -1199,6 +1199,15 @@ real, in the order agreed with the user.
   filters, each request and question, container choice, the log,
   permissions, Secrets' values never kept); `--once` against a manager
   holding one of each kind.
+- **Logs in `legion top`** (asked 2026-10-30: logs "in the red
+  section", the room under a short table). `l` follows them in a pane
+  under the table, as tall as the rest of the screen, instead of handing
+  the terminal to `legion logs`; the table and its keys stay. PgUp and
+  PgDn scroll (new lines then keep the view still), `z` lays the pane
+  over the table, Esc closes it and ends the stream. Lines are cut at
+  newlines per stream (stderr in yellow), with tabs expanded and colour
+  codes and control characters dropped; 5000 are kept. `legion logs` and
+  `top` share one `LogStream`. Shells still run the CLI.
 - **From a second review.** A route could name any Secret of its
   namespace for HTTPS, and every node could then read it: a route's
   Secret is now handed out only if it holds a PEM certificate and key.

@@ -75,23 +75,47 @@ pub async fn logs(
     follow: bool,
     tail: Option<u32>,
 ) -> anyhow::Result<()> {
-    let action = Action::Logs(LogsOptions { follow, tail });
-    let mut s = Session::open(channel, target.open(action)).await?;
+    let mut s = LogStream::open(channel, target, follow, tail).await?;
     let (mut stdout, mut stderr) = (tokio::io::stdout(), tokio::io::stderr());
-    while let Some(f) = s.next().await? {
-        match f {
-            Frame::Stdout(data) => {
-                stdout.write_all(&data).await?;
-                stdout.flush().await?;
-            }
-            Frame::Stderr(data) => {
-                stderr.write_all(&data).await?;
-                stderr.flush().await?;
-            }
-            _ => {}
+    while let Some((on_stderr, data)) = s.next().await? {
+        if on_stderr {
+            stderr.write_all(&data).await?;
+            stderr.flush().await?;
+        } else {
+            stdout.write_all(&data).await?;
+            stdout.flush().await?;
         }
     }
     Ok(())
+}
+
+/// A task's logs as they come, for `logs` and `legion top`.
+pub struct LogStream(Session);
+
+impl LogStream {
+    pub async fn open(
+        channel: &Channel,
+        target: &Target,
+        follow: bool,
+        tail: Option<u32>,
+    ) -> anyhow::Result<LogStream> {
+        let action = Action::Logs(LogsOptions { follow, tail });
+        Ok(LogStream(
+            Session::open(channel, target.open(action)).await?,
+        ))
+    }
+
+    /// What came next, and whether on stderr; `None` at the end.
+    pub async fn next(&mut self) -> anyhow::Result<Option<(bool, Vec<u8>)>> {
+        loop {
+            match self.0.next().await? {
+                Some(Frame::Stdout(data)) => return Ok(Some((false, data))),
+                Some(Frame::Stderr(data)) => return Ok(Some((true, data))),
+                Some(_) => {}
+                None => return Ok(None),
+            }
+        }
+    }
 }
 
 /// Runs `command` and returns its exit code.

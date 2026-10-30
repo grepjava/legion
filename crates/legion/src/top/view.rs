@@ -14,6 +14,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::draw::{BAD, OK, WARN, bytes, dimmed, fg, meter, trim};
+use super::logs::Logs;
 use super::model::{Key, Model, containers, key, kind_word, owner, spec, status, word};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,6 +239,8 @@ pub struct View {
     /// An object's YAML over everything, scrolled this far.
     pub(super) yaml: Option<(Key, u16)>,
     pub(super) help: bool,
+    /// Logs followed under the table.
+    pub(super) logs: Option<Logs>,
     pub(super) quit: bool,
 }
 
@@ -254,12 +257,29 @@ impl Default for View {
             detail: None,
             yaml: None,
             help: false,
+            logs: None,
             quit: false,
         }
     }
 }
 
 impl View {
+    /// Starts showing the logs a request asks for, in place of any shown.
+    pub(super) fn show_logs(&mut self, request: &Request) {
+        if let Request::Logs {
+            namespace,
+            name,
+            container,
+        } = request
+        {
+            let mut of = format!("{namespace}/{name}");
+            if let Some(c) = container {
+                of = format!("{of}/{c}");
+            }
+            self.logs = Some(Logs::new(of));
+        }
+    }
+
     pub(super) fn index(&self) -> usize {
         TABS.iter().position(|t| *t == self.tab).expect("a tab")
     }
@@ -298,6 +318,28 @@ impl View {
             return None;
         }
         self.notice = None;
+        if let Some(logs) = &mut self.logs {
+            let page = 20;
+            match k.code {
+                KeyCode::Esc => {
+                    self.logs = None;
+                    return None;
+                }
+                KeyCode::PageUp => {
+                    logs.scroll(page);
+                    return None;
+                }
+                KeyCode::PageDown => {
+                    logs.scroll(-page);
+                    return None;
+                }
+                KeyCode::Char('z') => {
+                    logs.zoom = !logs.zoom;
+                    return None;
+                }
+                _ => {}
+            }
+        }
         let selected = self.selected_key(model);
         if let KeyCode::Char(c) = k.code
             && let Some(key) = &selected

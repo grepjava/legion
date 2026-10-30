@@ -1,6 +1,6 @@
 //! Drawing `legion top`: a header of the cluster at a glance with graphs
 //! of what its tasks use, the tabs, the selected tab's table beside the
-//! selected object's details, and the bottom line of keys, questions and
+//! selected object's details, logs followed under them, and the bottom line of keys, questions and
 //! answers; over them, an object's YAML or the keys' help. The colours
 //! and bars follow jmon's.
 
@@ -19,6 +19,7 @@ use ratatui::widgets::{
     ScrollbarState, Sparkline, Table, TableState, Tabs, Wrap,
 };
 
+use super::logs::Logs;
 use super::model::{Model, kind_word, status};
 use super::view::{Focus, Prompt, TABS, Tab, View, rows};
 
@@ -136,14 +137,24 @@ pub fn render(f: &mut Frame, model: &Model, view: &View) {
     .areas(area);
     header(f, model, top);
     f.render_widget(tab_bar(model, view), tabs);
-    if shows_detail(view, area.width) {
-        let side = (area.width / 3).clamp(40, 70);
-        let [table, detail_area] =
-            Layout::horizontal([Constraint::Fill(1), Constraint::Length(side)]).areas(body);
-        draw_table(f, model, view, table);
-        detail(f, model, view, detail_area);
-    } else {
-        draw_table(f, model, view, body);
+    let body = match &view.logs {
+        Some(l) if l.zoom => {
+            logs(f, l, body);
+            None
+        }
+        Some(l) => {
+            // The table as tall as its rows, up to half.
+            let rows = rows(model, view).len().min(1000) as u16 + 3;
+            let upper = rows.clamp(5, (body.height / 2).max(5));
+            let [upper, lower] =
+                Layout::vertical([Constraint::Length(upper), Constraint::Fill(1)]).areas(body);
+            logs(f, l, lower);
+            Some(upper)
+        }
+        None => Some(body),
+    };
+    if let Some(body) = body {
+        upper_body(f, model, view, body);
     }
     f.render_widget(Paragraph::new(bottom_line(view)), bottom);
     if let Some((key, scroll)) = &view.yaml {
@@ -152,6 +163,53 @@ pub fn render(f: &mut Frame, model: &Model, view: &View) {
     if view.help {
         help(f, view);
     }
+}
+
+/// The table, with the details beside it when shown.
+fn upper_body(f: &mut Frame, model: &Model, view: &View, body: Rect) {
+    let width = f.area().width;
+    if shows_detail(view, width) {
+        let side = (width / 3).clamp(40, 70);
+        let [table, detail_area] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(side)]).areas(body);
+        draw_table(f, model, view, table);
+        detail(f, model, view, detail_area);
+    } else {
+        draw_table(f, model, view, body);
+    }
+}
+
+/// The logs followed: the newest lines, or those scrolled back to.
+fn logs(f: &mut Frame, logs: &Logs, area: Rect) {
+    let state = match (&logs.ended, logs.back) {
+        (_, back @ 1..) => Span::styled(format!(" {back} lines back · PgDn returns "), fg(WARN)),
+        (Some(why), _) if why.starts_with("Failed") => Span::styled(format!(" {why} "), fg(BAD)),
+        (Some(why), _) => Span::styled(format!(" {why} "), dim()),
+        (None, _) => Span::styled(" following ", fg(OK)),
+    };
+    let block = panel(title(format!("Logs of {}", logs.of)))
+        .title(Line::from(state).right_aligned())
+        .title_bottom(
+            Line::from(Span::styled(
+                " PgUp PgDn scroll · z enlarges · Esc closes ",
+                dim(),
+            ))
+            .right_aligned(),
+        );
+    let height = block.inner(area).height as usize;
+    let end = logs.lines.len() - logs.back.min(logs.lines.len());
+    let lines: Vec<Line> = if logs.lines.is_empty() && logs.ended.is_none() {
+        vec![dimmed("Waiting for lines…")]
+    } else {
+        logs.lines
+            .range(end.saturating_sub(height)..end)
+            .map(|(stderr, l)| {
+                let style = if *stderr { fg(WARN) } else { Style::default() };
+                Line::from(Span::styled(l.clone(), style))
+            })
+            .collect()
+    };
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// The managers, nodes and tasks at a glance, and graphs of use.
@@ -561,9 +619,17 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("s r", "service: scale, roll back (asked)"),
             ("u", "cron job: suspend or resume"),
             ("m", "volume: move to a node"),
-            ("l", "logs of a task, service or Job"),
+            ("l", "follow logs of a task, service or Job below"),
             ("x", "a shell in a task"),
             ("D", "delete (type the name; a task: asked)"),
+        ],
+    ),
+    (
+        "While logs show",
+        &[
+            ("PgUp PgDn", "scroll them"),
+            ("z", "logs over the table, or not"),
+            ("Esc", "close them"),
         ],
     ),
 ];
@@ -675,9 +741,15 @@ fn bottom_line(view: &View) -> Line<'static> {
         Tab::Network | Tab::Config => &[("y", "YAML"), ("D", "delete")],
         Tab::Log => &[],
     };
+    let logs: &[(&str, &str)] = if view.logs.is_some() {
+        &[("Esc", "close logs")]
+    } else {
+        &[]
+    };
     let mut spans = Vec::new();
-    for (k, what) in keys
+    for (k, what) in logs
         .iter()
+        .chain(keys)
         .chain(&[("/", "filter"), ("?", "help"), ("q", "quit")])
     {
         spans.push(Span::styled(

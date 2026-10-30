@@ -126,7 +126,11 @@ fn cluster() -> Model {
 }
 
 fn screen_of(model: &Model, view: &View, width: u16) -> String {
-    let mut t = Terminal::new(TestBackend::new(width, 20)).unwrap();
+    screen_sized(model, view, width, 20)
+}
+
+fn screen_sized(model: &Model, view: &View, width: u16, height: u16) -> String {
+    let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
     t.draw(|f| draw::render(f, model, view)).unwrap();
     let buf = t.backend().buffer();
     (0..buf.area.height)
@@ -427,6 +431,117 @@ fn logs_and_shells_ask_which_container_when_there_are_several() {
             ..
         })
     ));
+}
+
+#[test]
+fn logs_follow_under_the_table() {
+    let m = cluster();
+    let mut v = View::default();
+    let logs = typed(&mut v, &m, "3l").unwrap();
+    assert_eq!(command(&logs), None, "not run by the CLI");
+    v.show_logs(&logs);
+    let s = screen_sized(&m, &v, 130, 30);
+    assert!(s.contains("Logs of shop/web-1-1"), "{s}");
+    assert!(s.contains("Waiting for lines"));
+    assert!(s.contains("following"));
+    // The table keeps its rows above.
+    let table = s.lines().position(|l| l.contains("web-2-1")).unwrap();
+    let pane = s.lines().position(|l| l.contains("Logs of")).unwrap();
+    assert!(table < pane, "{s}");
+
+    let l = v.logs.as_mut().unwrap();
+    // Lines come in pieces, with colours, tabs and carriage returns.
+    l.push(
+        false,
+        b"GET / 200
+GET /a",
+    );
+    l.push(
+        false,
+        b"bout 404
+[31mred[0m	x
+",
+    );
+    l.push(
+        true,
+        b"warning: slow
+",
+    );
+    for i in 0..30 {
+        l.push(
+            false,
+            format!(
+                "line {i}
+"
+            )
+            .as_bytes(),
+        );
+    }
+    let s = screen_sized(&m, &v, 130, 30);
+    assert!(s.contains("line 29"), "{s}");
+    assert!(!s.contains("GET / 200"), "the oldest are above the pane");
+    assert_eq!(
+        v.logs
+            .as_ref()
+            .unwrap()
+            .lines
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>(),
+        [
+            (false, "GET / 200".to_owned()),
+            (false, "GET /about 404".to_owned()),
+            (false, "red     x".to_owned()),
+        ]
+    );
+    assert_eq!(
+        v.logs.as_ref().unwrap().lines[3],
+        (true, "warning: slow".into())
+    );
+
+    // Back a page: the same lines stay as more come; forward follows again.
+    typed_code(&mut v, &m, KeyCode::PageUp);
+    let s = screen_sized(&m, &v, 130, 30);
+    assert!(s.contains("20 lines back"), "{s}");
+    assert!(!s.contains("line 29"));
+    v.logs.as_mut().unwrap().push(
+        false,
+        b"line 30
+",
+    );
+    assert!(screen_sized(&m, &v, 130, 30).contains("21 lines back"));
+    typed_code(&mut v, &m, KeyCode::PageDown);
+    typed_code(&mut v, &m, KeyCode::PageDown);
+    let s = screen_sized(&m, &v, 130, 30);
+    assert!(s.contains("line 30") && s.contains("following"), "{s}");
+
+    // z puts them over the table; the table's keys still work.
+    typed(&mut v, &m, "z");
+    let s = screen_sized(&m, &v, 130, 30);
+    assert!(!s.contains("web-2-1"), "{s}");
+    typed(&mut v, &m, "z");
+
+    v.logs.as_mut().unwrap().push(false, b"no newline");
+    v.logs
+        .as_mut()
+        .unwrap()
+        .end("No more: the task ended.".into());
+    let s = screen_sized(&m, &v, 130, 30);
+    assert!(
+        s.contains("no newline") && s.contains("No more: the task ended."),
+        "{s}"
+    );
+
+    // Esc closes them first, and the tab stays.
+    typed(&mut v, &m, "");
+    assert!(v.logs.is_none());
+    assert_eq!(v.tab, Tab::Tasks);
+    assert!(!screen_sized(&m, &v, 130, 30).contains("Logs of"));
+}
+
+fn typed_code(view: &mut View, model: &Model, code: KeyCode) {
+    view.key(model, KeyEvent::new(code, KeyModifiers::NONE));
 }
 
 #[test]

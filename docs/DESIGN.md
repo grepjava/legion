@@ -484,9 +484,10 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   first), pause, activate or label a node; scale or roll back (asked) a
   service; suspend or resume a cron job; move a volume; delete anything
   (by typing its name; a task after a yes, as its owner starts another);
-  follow logs or open a shell, by running the CLI itself with the
-  terminal (Ctrl-C ends the logs, not `top`), asking which container
-  when a pod has several. It lists every kind, then follows one watch
+  follow logs in a pane under the table (PgUp and PgDn scroll it, `z`
+  lays it over the table, Esc closes it; colour codes and other control
+  characters are dropped), or open a shell by running the CLI itself
+  with the terminal, asking which container when a pod has several. It lists every kind, then follows one watch
   from the oldest listing's version, ignoring what is older than what it
   holds; a broken watch lists again. Usage comes from `Cluster.Usage`,
   which the leader answers from the heartbeats' reports (a follower

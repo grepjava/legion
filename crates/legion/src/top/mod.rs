@@ -3,10 +3,12 @@
 //! current; asks the leader every few seconds what tasks use; and keeps a
 //! log of what changed while it ran. Keys act on the selected row: drain,
 //! pause, label or delete a node; scale or roll back a service; suspend a
-//! cron job; move a volume; delete anything; follow logs or open a shell,
-//! by running the CLI itself, which has the terminal until it ends.
+//! cron job; move a volume; delete anything; follow logs in a pane under
+//! the table; open a shell, by running the CLI itself, which has the
+//! terminal until it ends.
 
 mod draw;
+mod logs;
 mod model;
 #[cfg(test)]
 mod tests;
@@ -50,6 +52,10 @@ enum Msg {
     Key(KeyEvent),
     /// What came of a request.
     Done(String),
+    /// Logs of the stream numbered so, on stderr or not.
+    Log(u64, bool, Vec<u8>),
+    /// That stream ended, and why.
+    LogEnded(u64, String),
     Redraw,
     /// The terminal is gone.
     HungUp,
@@ -67,13 +73,16 @@ pub async fn run(channel: Channel, cli: Cli, namespace: Option<String>) -> anyho
     let (tx, mut rx) = mpsc::unbounded_channel();
     let follower = tokio::spawn(follow(channel.clone(), namespace.clone(), tx.clone()));
     let poller = tokio::spawn(poll(channel.clone(), namespace.clone(), tx.clone()));
-    // Ctrl-C reaches a logs or shell run from here as well as this
-    // process, which stays.
+    // Ctrl-C reaches a shell run from here as well as this process,
+    // which stays.
     tokio::spawn(async { while tokio::signal::ctrl_c().await.is_ok() {} });
     let paused = Arc::new(AtomicBool::new(false));
     read_keys(tx.clone(), paused.clone());
 
-    let objects = crate::cli::Objects::new(channel);
+    // The logs shown, numbered: what an earlier stream sent is dropped.
+    let mut logs: Option<(u64, tokio::task::JoinHandle<()>)> = None;
+    let mut streams = 0u64;
+    let objects = crate::cli::Objects::new(channel.clone());
     let mut model = Model::new(namespace);
     let mut view = View::default();
     let mut terminal = ratatui::init();
@@ -100,13 +109,36 @@ pub async fn run(channel: Channel, cli: Cli, namespace: Option<String>) -> anyho
                 Msg::Problem(p) => model.problem = Some(p),
                 Msg::Key(k) => requests.extend(view.key(&model, k)),
                 Msg::Done(what) => view.notice = Some(what),
+                Msg::Log(n, stderr, data) => {
+                    if let (Some(l), Some((shown, _))) = (&mut view.logs, &logs)
+                        && n == *shown
+                    {
+                        l.push(stderr, &data);
+                    }
+                }
+                Msg::LogEnded(n, why) => {
+                    if let (Some(l), Some((shown, _))) = (&mut view.logs, &logs)
+                        && n == *shown
+                    {
+                        l.end(why);
+                    }
+                }
                 Msg::Redraw => {}
                 Msg::HungUp => view.quit = true,
             }
             next = rx.try_recv().ok();
         }
         for request in requests {
-            if let Some(args) = command(&request) {
+            if let Request::Logs { .. } = &request {
+                if let Some((_, stream)) = logs.take() {
+                    stream.abort();
+                }
+                streams += 1;
+                view.show_logs(&request);
+                let stream =
+                    tokio::spawn(stream_logs(channel.clone(), request, streams, tx.clone()));
+                logs = Some((streams, stream));
+            } else if let Some(args) = command(&request) {
                 paused.store(true, Ordering::SeqCst);
                 // A poll under way ends first.
                 tokio::time::sleep(Duration::from_millis(150)).await;
@@ -121,6 +153,11 @@ pub async fn run(channel: Channel, cli: Cli, namespace: Option<String>) -> anyho
                     let _ = tx.send(Msg::Done(act(objects, request).await));
                 });
             }
+        }
+        if view.logs.is_none()
+            && let Some((_, stream)) = logs.take()
+        {
+            stream.abort();
         }
         if view.quit {
             break Ok(());
@@ -195,17 +232,6 @@ fn command(request: &Request) -> Option<(String, Vec<String>)> {
         v
     };
     match request {
-        Request::Logs {
-            namespace,
-            name,
-            container,
-        } => Some((
-            format!("Logs of {namespace}/{name}; Ctrl-C returns to legion top."),
-            args(
-                &["logs", "-f", "--tail", "200", "-n", namespace, name],
-                container,
-            ),
-        )),
         Request::Exec {
             namespace,
             task,
@@ -220,6 +246,38 @@ fn command(request: &Request) -> Option<(String, Vec<String>)> {
         }
         _ => None,
     }
+}
+
+/// Follows the logs a request asks for, numbered `n`.
+async fn stream_logs(channel: Channel, request: Request, n: u64, tx: mpsc::UnboundedSender<Msg>) {
+    let Request::Logs {
+        namespace,
+        name,
+        container,
+    } = request
+    else {
+        return;
+    };
+    let target = crate::session::Target {
+        namespace,
+        task: name,
+        container: container.unwrap_or_default(),
+    };
+    let why = match crate::session::LogStream::open(&channel, &target, true, Some(200)).await {
+        Ok(mut s) => loop {
+            match s.next().await {
+                Ok(Some((stderr, data))) => {
+                    if tx.send(Msg::Log(n, stderr, data)).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => break "No more: the task ended.".to_owned(),
+                Err(e) => break format!("Failed: {e:#}"),
+            }
+        },
+        Err(e) => format!("Failed: {e:#}"),
+    };
+    let _ = tx.send(Msg::LogEnded(n, why));
 }
 
 /// Runs the CLI with the terminal until it ends; what came of it.
@@ -374,7 +432,7 @@ async fn act(mut objects: crate::cli::Objects, request: Request) -> String {
                 .map(|_| format!("{} deleted", key.replace("//", "/")))
                 .map_err(Into::into)
         }
-        Request::Logs { .. } | Request::Exec { .. } => unreachable!("run by the CLI"),
+        Request::Logs { .. } | Request::Exec { .. } => unreachable!("not asked of the API"),
     };
     result.unwrap_or_else(|e| format!("Failed: {e:#}"))
 }
