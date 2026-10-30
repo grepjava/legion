@@ -418,9 +418,6 @@ fn logs_and_shells_ask_which_container_when_there_are_several() {
             container: Some("log".into())
         }
     );
-    let (banner, args) = command(&shell).unwrap();
-    assert!(banner.starts_with("A shell in shop/web-2-1"));
-    assert_eq!(args.join(" "), "exec -it -n shop web-2-1 -c log -- /bin/sh");
     // A task is deleted after a yes: its service starts another.
     assert_eq!(typed(&mut v, &m, "D"), None);
     assert!(screen(&m, &v).contains("Its service starts another"));
@@ -438,7 +435,6 @@ fn logs_follow_under_the_table() {
     let m = cluster();
     let mut v = View::default();
     let logs = typed(&mut v, &m, "3l").unwrap();
-    assert_eq!(command(&logs), None, "not run by the CLI");
     v.show_logs(&logs);
     let s = screen_sized(&m, &v, 130, 30);
     assert!(s.contains("Logs of shop/web-1-1"), "{s}");
@@ -540,8 +536,100 @@ GET /a",
     assert!(!screen_sized(&m, &v, 130, 30).contains("Logs of"));
 }
 
-fn typed_code(view: &mut View, model: &Model, code: KeyCode) {
-    view.key(model, KeyEvent::new(code, KeyModifiers::NONE));
+fn typed_code(view: &mut View, model: &Model, code: KeyCode) -> Option<Request> {
+    view.key(model, KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+fn ctrl(view: &mut View, model: &Model, c: char) -> Option<Request> {
+    view.key(
+        model,
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL),
+    )
+}
+
+#[test]
+fn a_shell_opens_under_the_table_and_takes_the_keys() {
+    let m = cluster();
+    let mut v = View::default();
+    let exec = typed(&mut v, &m, "3x").unwrap();
+    v.show_shell(&exec);
+    let area = ratatui::layout::Rect::new(0, 0, 130, 30);
+    let (rows, cols) = draw::shell_size(&m, &v, area).unwrap();
+    let sh = v.shell.as_mut().unwrap();
+    sh.set_size(rows, cols);
+    // A prompt, a coloured word, and a line drawn over by a carriage
+    // return, as a terminal shows them.
+    sh.output(b"# ls\r\n\x1b[31mred\x1b[0m file\r\nold line\rnew\r\n# ");
+    let s = screen_sized(&m, &v, 130, 30);
+    assert!(s.contains("Shell in shop/web-1-1"), "{s}");
+    assert!(s.contains("red file"), "{s}");
+    assert!(s.contains("new line"), "{s}");
+    let table = s.lines().position(|l| l.contains("web-2-1")).unwrap();
+    let pane = s.lines().position(|l| l.contains("Shell in")).unwrap();
+    assert!(table < pane, "the table stays above: {s}");
+    // The pane's inside is the shell's screen.
+    let inside = s.lines().nth(pane + 1).unwrap();
+    assert!(inside.starts_with("│# ls"), "{inside}");
+    assert_eq!(cols, 128);
+
+    // Every key goes to the shell, Ctrl-C and q too.
+    assert_eq!(typed(&mut v, &m, "q"), Some(Request::Input(b"q".to_vec())));
+    assert_eq!(ctrl(&mut v, &m, 'c'), Some(Request::Input(vec![3])));
+    assert!(!v.quit);
+    assert_eq!(
+        typed(&mut v, &m, "\n"),
+        Some(Request::Input(b"\r".to_vec()))
+    );
+    assert_eq!(
+        typed_code(&mut v, &m, KeyCode::Up),
+        Some(Request::Input(b"\x1b[A".to_vec()))
+    );
+    // A full-screen program asks for application cursor keys.
+    v.shell.as_mut().unwrap().output(b"\x1b[?1h");
+    assert_eq!(
+        typed_code(&mut v, &m, KeyCode::Up),
+        Some(Request::Input(b"\x1bOA".to_vec()))
+    );
+    assert!(screen_sized(&m, &v, 130, 30).contains("The shell has the keys"));
+
+    // Ctrl-] gives the keys back: the table moves again.
+    assert_eq!(ctrl(&mut v, &m, ']'), None);
+    assert!(!v.typing());
+    assert_eq!(typed(&mut v, &m, "j"), None);
+    assert_eq!(v.selected[2], 1);
+    // As crossterm reads Ctrl-] on a terminal: Ctrl-5.
+    assert_eq!(ctrl(&mut v, &m, '5'), None);
+    assert!(v.typing());
+    ctrl(&mut v, &m, ']');
+
+    // z over the table, z back.
+    typed(&mut v, &m, "z");
+    assert!(!screen_sized(&m, &v, 130, 30).contains("web-2-1"));
+    let (_, cols) = draw::shell_size(&m, &v, area).unwrap();
+    assert_eq!(cols, 128);
+    typed(&mut v, &m, "z");
+
+    // It ends: the keys stay with top, and Ctrl-] cannot go back.
+    let sh = v.shell.as_mut().unwrap();
+    sh.ended = Some("Ended with 0.".into());
+    sh.focus = false;
+    assert!(screen_sized(&m, &v, 130, 30).contains("Ended with 0."));
+    ctrl(&mut v, &m, ']');
+    assert!(!v.typing());
+    typed(&mut v, &m, "\x1b");
+    assert!(v.shell.is_none());
+
+    // Logs and a shell share the pane: one closes the other.
+    v.show_shell(&exec);
+    let logs = Request::Logs {
+        namespace: "shop".into(),
+        name: "web-1-1".into(),
+        container: None,
+    };
+    v.show_logs(&logs);
+    assert!(v.shell.is_none() && v.logs.is_some());
+    v.show_shell(&exec);
+    assert!(v.logs.is_none() && v.shell.is_some());
 }
 
 #[test]

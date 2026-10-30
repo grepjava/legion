@@ -21,6 +21,7 @@ use ratatui::widgets::{
 
 use super::logs::Logs;
 use super::model::{Model, kind_word, status};
+use super::shell::Shell;
 use super::view::{Focus, Prompt, TABS, Tab, View, rows};
 
 pub(super) const ACCENT: Color = Color::Cyan;
@@ -137,24 +138,17 @@ pub fn render(f: &mut Frame, model: &Model, view: &View) {
     .areas(area);
     header(f, model, top);
     f.render_widget(tab_bar(model, view), tabs);
-    let body = match &view.logs {
-        Some(l) if l.zoom => {
-            logs(f, l, body);
-            None
-        }
-        Some(l) => {
-            // The table as tall as its rows, up to half.
-            let rows = rows(model, view).len().min(1000) as u16 + 3;
-            let upper = rows.clamp(5, (body.height / 2).max(5));
-            let [upper, lower] =
-                Layout::vertical([Constraint::Length(upper), Constraint::Fill(1)]).areas(body);
+    let (upper, lower) = split(model, view, body);
+    if let Some(upper) = upper {
+        upper_body(f, model, view, upper);
+    }
+    if let Some(lower) = lower {
+        if let Some(l) = &view.logs {
             logs(f, l, lower);
-            Some(upper)
         }
-        None => Some(body),
-    };
-    if let Some(body) = body {
-        upper_body(f, model, view, body);
+        if let Some(s) = &view.shell {
+            shell(f, s, lower);
+        }
     }
     f.render_widget(Paragraph::new(bottom_line(view)), bottom);
     if let Some((key, scroll)) = &view.yaml {
@@ -162,6 +156,121 @@ pub fn render(f: &mut Frame, model: &Model, view: &View) {
     }
     if view.help {
         help(f, view);
+    }
+}
+
+/// The table's area and the pane's under it, if they show.
+fn split(model: &Model, view: &View, body: Rect) -> (Option<Rect>, Option<Rect>) {
+    if view.logs.is_none() && view.shell.is_none() {
+        return (Some(body), None);
+    }
+    if view.zoom {
+        return (None, Some(body));
+    }
+    // The table as tall as its rows, up to half.
+    let rows = rows(model, view).len().min(1000) as u16 + 3;
+    let upper = rows.clamp(5, (body.height / 2).max(5));
+    let [upper, lower] =
+        Layout::vertical([Constraint::Length(upper), Constraint::Fill(1)]).areas(body);
+    (Some(upper), Some(lower))
+}
+
+/// The rows and columns of the shell's screen on a terminal of `area`.
+pub(super) fn shell_size(model: &Model, view: &View, area: Rect) -> Option<(u16, u16)> {
+    if area.width < 60 || area.height < 12 {
+        return None;
+    }
+    let body = Rect {
+        y: area.y + 5,
+        height: area.height - 6,
+        ..area
+    };
+    let lower = split(model, view, body).1?;
+    let inner = panel(Line::default()).inner(lower);
+    Some((inner.height.max(1), inner.width.max(1)))
+}
+
+/// The shell's screen, as the terminal emulated shows it.
+fn shell(f: &mut Frame, shell: &Shell, area: Rect) {
+    let screen = shell.screen.screen();
+    let state = match (&shell.ended, shell.focus, screen.scrollback()) {
+        (Some(why), ..) if why.starts_with("Failed") => Span::styled(format!(" {why} "), fg(BAD)),
+        (Some(why), ..) => Span::styled(format!(" {why} "), dim()),
+        (None, _, back @ 1..) => {
+            Span::styled(format!(" {back} lines back · PgDn returns "), fg(WARN))
+        }
+        (None, true, _) => Span::styled(" has the keys · Ctrl-] gives them back ", fg(OK)),
+        (None, false, _) => Span::styled(" Ctrl-] types in it again ", fg(WARN)),
+    };
+    let hint = if shell.focus {
+        " keys go to the shell "
+    } else {
+        " PgUp PgDn scroll · z enlarges · Esc closes "
+    };
+    let border = if shell.focus { ACCENT } else { Color::DarkGray };
+    let block = panel(title(format!("Shell in {}", shell.of)))
+        .border_style(fg(border))
+        .title(Line::from(state).right_aligned())
+        .title_bottom(Line::from(Span::styled(hint, dim())).right_aligned());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let buf = f.buffer_mut();
+    let (rows, cols) = shell.size();
+    for row in 0..rows.min(inner.height) {
+        for col in 0..cols.min(inner.width) {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let at = &mut buf[(inner.x + col, inner.y + row)];
+            let text = cell.contents();
+            at.set_symbol(if text.is_empty() { " " } else { text });
+            at.set_style(cell_style(cell));
+        }
+    }
+    let (row, col) = screen.cursor_position();
+    if shell.focus
+        && shell.ended.is_none()
+        && screen.scrollback() == 0
+        && !screen.hide_cursor()
+        && row < inner.height
+        && col < inner.width
+    {
+        f.set_cursor_position((inner.x + col, inner.y + row));
+    }
+}
+
+fn cell_style(cell: &vt100::Cell) -> Style {
+    let mut style = Style::default();
+    if !mono() {
+        if let Some(c) = color(cell.fgcolor()) {
+            style = style.fg(c);
+        }
+        if let Some(c) = color(cell.bgcolor()) {
+            style = style.bg(c);
+        }
+    }
+    for (on, m) in [
+        (cell.bold(), Modifier::BOLD),
+        (cell.dim(), Modifier::DIM),
+        (cell.italic(), Modifier::ITALIC),
+        (cell.underline(), Modifier::UNDERLINED),
+        (cell.inverse(), Modifier::REVERSED),
+    ] {
+        if on {
+            style = style.add_modifier(m);
+        }
+    }
+    style
+}
+
+fn color(c: vt100::Color) -> Option<Color> {
+    match c {
+        vt100::Color::Default => None,
+        vt100::Color::Idx(i) => Some(Color::Indexed(i)),
+        vt100::Color::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
     }
 }
 
@@ -620,16 +729,19 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("u", "cron job: suspend or resume"),
             ("m", "volume: move to a node"),
             ("l", "follow logs of a task, service or Job below"),
-            ("x", "a shell in a task"),
+            (
+                "x",
+                "a shell in a task, below; Ctrl-] leaves it and returns",
+            ),
             ("D", "delete (type the name; a task: asked)"),
         ],
     ),
     (
-        "While logs show",
+        "While logs or a shell show",
         &[
-            ("PgUp PgDn", "scroll them"),
-            ("z", "logs over the table, or not"),
-            ("Esc", "close them"),
+            ("PgUp PgDn", "scroll back"),
+            ("z", "over the table, or not"),
+            ("Esc", "close (a shell ends)"),
         ],
     ),
 ];
@@ -741,8 +853,22 @@ fn bottom_line(view: &View) -> Line<'static> {
         Tab::Network | Tab::Config => &[("y", "YAML"), ("D", "delete")],
         Tab::Log => &[],
     };
+    if view.typing() {
+        return Line::from(vec![
+            Span::styled(
+                " The shell has the keys. ",
+                fg(OK).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Ctrl-] ", fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(" gives them back to legion top ", dim()),
+        ]);
+    }
     let logs: &[(&str, &str)] = if view.logs.is_some() {
         &[("Esc", "close logs")]
+    } else if view.shell.as_ref().is_some_and(|s| s.ended.is_none()) {
+        &[("Ctrl-]", "to the shell"), ("Esc", "end it")]
+    } else if view.shell.is_some() {
+        &[("Esc", "close")]
     } else {
         &[]
     };

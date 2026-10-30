@@ -39,6 +39,7 @@ openraft = { version = "0.9.25", features = ["serde", "storage-v2"] }
 prost = "0.14"
 protox = "0.10"
 ratatui = "0.30"
+vt100 = "0.18"
 redb = "4.4"
 ring = "0.17"
 serde = { version = "1.0", features = ["derive"] }

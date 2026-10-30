@@ -481,13 +481,7 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             );
         }
         Command::Top { namespace, once } if once => crate::top::once(channel, namespace).await?,
-        Command::Top { namespace, .. } => {
-            let cli = crate::top::Cli {
-                server: server.to_owned(),
-                identity: identity.to_owned(),
-            };
-            crate::top::run(channel, cli, namespace).await?
-        }
+        Command::Top { namespace, .. } => crate::top::run(channel, namespace).await?,
         Command::Watch { kind, from } => {
             let kind = kind.as_deref().map(parse_kind).transpose()?;
             let from_version = match from {

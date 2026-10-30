@@ -17,8 +17,6 @@ pub(super) struct Logs {
     pub(super) back: usize,
     /// Why no more come.
     pub(super) ended: Option<String>,
-    /// Over the table too.
-    pub(super) zoom: bool,
 }
 
 impl Logs {
@@ -29,7 +27,6 @@ impl Logs {
             partial: Default::default(),
             back: 0,
             ended: None,
-            zoom: false,
         }
     }
 

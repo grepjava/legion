@@ -67,7 +67,7 @@ tasks, volumes, routes and policies, namespaces and their quotas, Secrets
 and Configs, with graphs of what tasks use, each object's details and
 YAML, and a log of what changes. Keys drain, pause or label nodes, scale
 or roll back services, suspend cron jobs, move volumes, delete objects,
-follow logs in a pane under the table, and open a shell in a task; `/` filters and `?` lists the
+and follow logs or open a shell in a task in a pane under the table; `/` filters and `?` lists the
 keys (`legion top --once` prints it as text). For dashboards, Prometheus can scrape each daemon's
 `--metrics-listen` endpoint; [packaging/grafana](packaging/grafana) has a
 Grafana dashboard for it.

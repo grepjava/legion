@@ -3,22 +3,19 @@
 //! current; asks the leader every few seconds what tasks use; and keeps a
 //! log of what changed while it ran. Keys act on the selected row: drain,
 //! pause, label or delete a node; scale or roll back a service; suspend a
-//! cron job; move a volume; delete anything; follow logs in a pane under
-//! the table; open a shell, by running the CLI itself, which has the
-//! terminal until it ends.
+//! cron job; move a volume; delete anything; follow logs or open a shell
+//! in a pane under the table.
 
 mod draw;
 mod logs;
 mod model;
+mod shell;
 #[cfg(test)]
 mod tests;
 mod view;
 
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use legion_api::{Kind, Object};
@@ -29,9 +26,12 @@ use legion_proto::v1::{
 };
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{self, Event, KeyEvent, KeyEventKind};
+use ratatui::layout::Rect;
 use ratatui::{Terminal, crossterm};
 use tokio::sync::mpsc;
 use tonic::transport::Channel;
+
+use crate::session::{ExecEvent, ExecStream};
 
 pub use model::Model;
 pub use view::{Request, View};
@@ -56,31 +56,31 @@ enum Msg {
     Log(u64, bool, Vec<u8>),
     /// That stream ended, and why.
     LogEnded(u64, String),
+    /// What the shell numbered so wrote.
+    ShellOutput(u64, Vec<u8>),
+    /// That shell ended, and why.
+    ShellEnded(u64, String),
     Redraw,
     /// The terminal is gone.
     HungUp,
 }
 
-/// How to run the CLI again, for logs and shells.
-pub struct Cli {
-    pub server: String,
-    pub identity: PathBuf,
-}
-
 /// Runs until the person quits or the terminal goes.
-pub async fn run(channel: Channel, cli: Cli, namespace: Option<String>) -> anyhow::Result<()> {
+pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<()> {
     draw::set_mono(std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()));
     let (tx, mut rx) = mpsc::unbounded_channel();
     let follower = tokio::spawn(follow(channel.clone(), namespace.clone(), tx.clone()));
     let poller = tokio::spawn(poll(channel.clone(), namespace.clone(), tx.clone()));
-    // Ctrl-C reaches a shell run from here as well as this process,
-    // which stays.
-    tokio::spawn(async { while tokio::signal::ctrl_c().await.is_ok() {} });
-    let paused = Arc::new(AtomicBool::new(false));
-    read_keys(tx.clone(), paused.clone());
+    read_keys(tx.clone());
 
     // The logs shown, numbered: what an earlier stream sent is dropped.
     let mut logs: Option<(u64, tokio::task::JoinHandle<()>)> = None;
+    // The shell shown, numbered too, and where its typing goes.
+    let mut shell: Option<(
+        u64,
+        tokio::task::JoinHandle<()>,
+        mpsc::Sender<pb::SessionFrame>,
+    )> = None;
     let mut streams = 0u64;
     let objects = crate::cli::Objects::new(channel.clone());
     let mut model = Model::new(namespace);
@@ -91,6 +91,16 @@ pub async fn run(channel: Channel, cli: Cli, namespace: Option<String>) -> anyho
         if painted.elapsed() >= REPAINT {
             invalidate(&mut terminal);
             painted = Instant::now();
+        }
+        // The shell's screen as large as its pane.
+        if let Some((_, _, input)) = &shell
+            && let Ok(size) = terminal.size()
+            && let Some((rows, cols)) = draw::shell_size(&model, &view, size.into())
+            && let Some(s) = &mut view.shell
+            && s.size() != (rows, cols)
+        {
+            s.set_size(rows, cols);
+            let _ = input.try_send(crate::session::resize(cols, rows));
         }
         if let Err(e) = terminal.draw(|f| draw::render(f, &model, &view)) {
             break Err(e.into());
@@ -116,6 +126,21 @@ pub async fn run(channel: Channel, cli: Cli, namespace: Option<String>) -> anyho
                         l.push(stderr, &data);
                     }
                 }
+                Msg::ShellOutput(n, data) => {
+                    if let (Some(s), Some((shown, ..))) = (&mut view.shell, &shell)
+                        && n == *shown
+                    {
+                        s.output(&data);
+                    }
+                }
+                Msg::ShellEnded(n, why) => {
+                    if let (Some(s), Some((shown, ..))) = (&mut view.shell, &shell)
+                        && n == *shown
+                    {
+                        s.ended = Some(why);
+                        s.focus = false;
+                    }
+                }
                 Msg::LogEnded(n, why) => {
                     if let (Some(l), Some((shown, _))) = (&mut view.logs, &logs)
                         && n == *shown
@@ -129,30 +154,61 @@ pub async fn run(channel: Channel, cli: Cli, namespace: Option<String>) -> anyho
             next = rx.try_recv().ok();
         }
         for request in requests {
-            if let Request::Logs { .. } = &request {
-                if let Some((_, stream)) = logs.take() {
-                    stream.abort();
+            match request {
+                Request::Logs { .. } | Request::Exec { .. } => {
+                    if let Some((_, stream)) = logs.take() {
+                        stream.abort();
+                    }
+                    if let Some((_, stream, _)) = shell.take() {
+                        stream.abort();
+                    }
+                    streams += 1;
+                    if let Request::Logs { .. } = &request {
+                        view.show_logs(&request);
+                        let stream = tokio::spawn(stream_logs(
+                            channel.clone(),
+                            request,
+                            streams,
+                            tx.clone(),
+                        ));
+                        logs = Some((streams, stream));
+                    } else {
+                        view.show_shell(&request);
+                        let area = terminal.size().map(Rect::from).unwrap_or_default();
+                        let size = draw::shell_size(&model, &view, area).unwrap_or((24, 80));
+                        if let Some(s) = &mut view.shell {
+                            s.set_size(size.0, size.1);
+                        }
+                        let (input, typed) = mpsc::channel(256);
+                        let stream = tokio::spawn(run_shell(
+                            channel.clone(),
+                            request,
+                            streams,
+                            size,
+                            typed,
+                            tx.clone(),
+                        ));
+                        shell = Some((streams, stream, input));
+                    }
                 }
-                streams += 1;
-                view.show_logs(&request);
-                let stream =
-                    tokio::spawn(stream_logs(channel.clone(), request, streams, tx.clone()));
-                logs = Some((streams, stream));
-            } else if let Some(args) = command(&request) {
-                paused.store(true, Ordering::SeqCst);
-                // A poll under way ends first.
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                ratatui::restore();
-                view.notice = Some(hand_over(&cli, args).await);
-                terminal = ratatui::init();
-                paused.store(false, Ordering::SeqCst);
-            } else {
-                view.notice = Some("Asking…".into());
-                let (objects, tx) = (objects.clone(), tx.clone());
-                tokio::spawn(async move {
-                    let _ = tx.send(Msg::Done(act(objects, request).await));
-                });
+                Request::Input(data) => {
+                    if let Some((_, _, input)) = &shell {
+                        let _ = input.try_send(crate::session::input(data));
+                    }
+                }
+                request => {
+                    view.notice = Some("Asking…".into());
+                    let (objects, tx) = (objects.clone(), tx.clone());
+                    tokio::spawn(async move {
+                        let _ = tx.send(Msg::Done(act(objects, request).await));
+                    });
+                }
             }
+        }
+        if view.shell.is_none()
+            && let Some((_, stream, _)) = shell.take()
+        {
+            stream.abort();
         }
         if view.logs.is_none()
             && let Some((_, stream)) = logs.take()
@@ -176,20 +232,16 @@ pub async fn run(channel: Channel, cli: Cli, namespace: Option<String>) -> anyho
     result
 }
 
-/// Reads keys on a thread of its own, except while a command run from
-/// here has the terminal. crossterm reads a hung-up terminal forever
-/// (jmon found it), so it stops once stdin is no longer a terminal.
-fn read_keys(tx: mpsc::UnboundedSender<Msg>, paused: Arc<AtomicBool>) {
+/// Reads keys on a thread of its own. crossterm reads a hung-up terminal
+/// forever (jmon found it), so it stops once stdin is no longer a
+/// terminal.
+fn read_keys(tx: mpsc::UnboundedSender<Msg>) {
     let watch_tty = std::io::stdin().is_terminal();
     std::thread::spawn(move || {
         loop {
             if watch_tty && !std::io::stdin().is_terminal() {
                 let _ = tx.send(Msg::HungUp);
                 return;
-            }
-            if paused.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(50));
-                continue;
             }
             match event::poll(Duration::from_millis(100)) {
                 Ok(true) => {}
@@ -219,33 +271,6 @@ fn invalidate<B: Backend>(terminal: &mut Terminal<B>) {
         c.set_symbol("\u{fffe}");
     }
     terminal.swap_buffers();
-}
-
-/// The CLI's arguments for a request it runs itself, with what to tell
-/// the person first.
-fn command(request: &Request) -> Option<(String, Vec<String>)> {
-    let args = |a: &[&str], container: &Option<String>| {
-        let mut v: Vec<String> = a.iter().map(|s| (*s).to_owned()).collect();
-        if let Some(c) = container {
-            v.extend(["-c".to_owned(), c.clone()]);
-        }
-        v
-    };
-    match request {
-        Request::Exec {
-            namespace,
-            task,
-            container,
-        } => {
-            let mut a = args(&["exec", "-it", "-n", namespace, task], container);
-            a.extend(["--".to_owned(), "/bin/sh".to_owned()]);
-            Some((
-                format!("A shell in {namespace}/{task}; exit returns to legion top."),
-                a,
-            ))
-        }
-        _ => None,
-    }
 }
 
 /// Follows the logs a request asks for, numbered `n`.
@@ -280,42 +305,56 @@ async fn stream_logs(channel: Channel, request: Request, n: u64, tx: mpsc::Unbou
     let _ = tx.send(Msg::LogEnded(n, why));
 }
 
-/// Runs the CLI with the terminal until it ends; what came of it.
-async fn hand_over(cli: &Cli, (banner, args): (String, Vec<String>)) -> String {
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(e) => return format!("Failed: cannot run legion again: {e}"),
+/// Runs the shell a request asks for, numbered `n`, on a screen of
+/// `size` (rows, columns), sending it what `input` brings.
+async fn run_shell(
+    channel: Channel,
+    request: Request,
+    n: u64,
+    (rows, cols): (u16, u16),
+    mut input: mpsc::Receiver<pb::SessionFrame>,
+    tx: mpsc::UnboundedSender<Msg>,
+) {
+    let Request::Exec {
+        namespace,
+        task,
+        container,
+    } = request
+    else {
+        return;
     };
-    let mut command = std::process::Command::new(exe);
-    command
-        .arg("--server")
-        .arg(&cli.server)
-        .arg("--identity")
-        .arg(&cli.identity)
-        .args(&args);
-    println!("{banner}");
-    let done = tokio::task::spawn_blocking(move || {
-        let status = command.status();
-        // An error stays on the screen until read.
-        if status
-            .as_ref()
-            .is_ok_and(|s| s.code().is_some_and(|c| c != 0))
-        {
-            println!("[Enter returns to legion top]");
-            let _ = std::io::stdin().read_line(&mut String::new());
+    let target = crate::session::Target {
+        namespace,
+        task,
+        container: container.unwrap_or_default(),
+    };
+    let command = vec!["/bin/sh".to_owned()];
+    let why = match ExecStream::open(&channel, &target, command, (cols, rows)).await {
+        Ok(mut s) => {
+            let send = s.sender();
+            loop {
+                tokio::select! {
+                    next = s.next() => match next {
+                        Ok(Some(ExecEvent::Output(data))) => {
+                            if tx.send(Msg::ShellOutput(n, data)).is_err() {
+                                return;
+                            }
+                        }
+                        Ok(Some(ExecEvent::Exit(code))) => break format!("Ended with {code}."),
+                        Ok(None) => break "Ended.".to_owned(),
+                        Err(e) => break format!("Failed: {e:#}"),
+                    },
+                    Some(frame) = input.recv() => {
+                        if send.send(frame).await.is_err() {
+                            break "Ended.".to_owned();
+                        }
+                    }
+                }
+            }
         }
-        status
-    })
-    .await;
-    match done {
-        Ok(Ok(s)) if s.success() => "Back.".into(),
-        Ok(Ok(s)) => match s.code() {
-            Some(code) => format!("Not done: it ended with {code}."),
-            None => "Back.".into(),
-        },
-        Ok(Err(e)) => format!("Failed: cannot run legion again: {e}"),
-        Err(e) => format!("Failed: cannot run legion again: {e}"),
-    }
+        Err(e) => format!("Failed: {e:#}"),
+    };
+    let _ = tx.send(Msg::ShellEnded(n, why));
 }
 
 fn object_ref(kind: Kind, namespace: String, name: String) -> ObjectRef {
@@ -432,7 +471,9 @@ async fn act(mut objects: crate::cli::Objects, request: Request) -> String {
                 .map(|_| format!("{} deleted", key.replace("//", "/")))
                 .map_err(Into::into)
         }
-        Request::Logs { .. } | Request::Exec { .. } => unreachable!("not asked of the API"),
+        Request::Logs { .. } | Request::Exec { .. } | Request::Input(_) => {
+            unreachable!("not asked of the API")
+        }
     };
     result.unwrap_or_else(|e| format!("Failed: {e:#}"))
 }

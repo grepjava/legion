@@ -1208,6 +1208,21 @@ real, in the order agreed with the user.
   newlines per stream (stderr in yellow), with tabs expanded and colour
   codes and control characters dropped; 5000 are kept. `legion logs` and
   `top` share one `LogStream`. Shells still run the CLI.
+- **Shells in `legion top`'s pane** (asked 2026-10-30: "can the
+  terminal also open on the same area as logs?"). `x` opens `/bin/sh` in
+  the pane under the table, which logs and shells share. A terminal is
+  emulated in `top` (the vt100 crate, MIT): the exec session runs with a
+  terminal the pane's size, resized with it (`z`, the window), and its
+  screen is drawn cell by cell with colours and the cursor. While the
+  shell has the keys every key goes to it as a terminal would send it
+  (Ctrl-C, arrows in both cursor modes, function keys, Alt); Ctrl-]
+  (crossterm reads it as Ctrl-5) gives them back to `top` and returns to
+  the shell. PgUp and PgDn scroll back 2000 lines; Esc ends the shell.
+  Nothing hands the terminal to a CLI any more, so the paused key
+  reader, the Ctrl-C catcher and `top::Cli` went. Tried on weft-bsd: a
+  command's output, and `stty size` in the shell matching the pane; no
+  shell left in the jail after `top` quits. The port's
+  `Makefile.crates` needs vt100 too.
 - **A task's jail id** (asked 2026-10-30: "where would the jail number
   appear?"). The runtime's `inspect` gives a running container's JID; the
   agent reports the pod jail's as `status.jid` once the pod has its

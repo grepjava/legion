@@ -118,6 +118,70 @@ impl LogStream {
     }
 }
 
+/// A command in a task with a terminal, for `legion top`: what it writes
+/// as it comes, and what to send it.
+pub struct ExecStream(Session);
+
+/// What a command in a terminal did.
+pub enum ExecEvent {
+    Output(Vec<u8>),
+    Exit(i32),
+}
+
+impl ExecStream {
+    pub async fn open(
+        channel: &Channel,
+        target: &Target,
+        command: Vec<String>,
+        (width, height): (u16, u16),
+    ) -> anyhow::Result<ExecStream> {
+        let action = Action::Exec(ExecOptions {
+            command,
+            stdin: true,
+            tty: true,
+            size: Some(TerminalSize {
+                width: width.into(),
+                height: height.into(),
+            }),
+        });
+        Ok(ExecStream(
+            Session::open(channel, target.open(action)).await?,
+        ))
+    }
+
+    /// Where to send typing and resizes ([`input`], [`resize`]).
+    pub fn sender(&self) -> mpsc::Sender<SessionFrame> {
+        self.0.tx.clone()
+    }
+
+    /// What came next; `None` if it ended without an exit code.
+    pub async fn next(&mut self) -> anyhow::Result<Option<ExecEvent>> {
+        loop {
+            match self.0.next().await? {
+                Some(Frame::Stdout(data) | Frame::Stderr(data)) => {
+                    return Ok(Some(ExecEvent::Output(data)));
+                }
+                Some(Frame::ExitCode(code)) => return Ok(Some(ExecEvent::Exit(code))),
+                Some(_) => {}
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+/// Typing, for [`ExecStream::sender`].
+pub fn input(data: Vec<u8>) -> SessionFrame {
+    frame(Frame::Input(data))
+}
+
+/// A new terminal size, for [`ExecStream::sender`].
+pub fn resize(width: u16, height: u16) -> SessionFrame {
+    frame(Frame::Resize(TerminalSize {
+        width: width.into(),
+        height: height.into(),
+    }))
+}
+
 /// Runs `command` and returns its exit code.
 pub async fn exec(
     channel: &Channel,

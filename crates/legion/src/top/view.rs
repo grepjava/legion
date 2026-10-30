@@ -16,6 +16,7 @@ use ratatui::text::{Line, Span};
 use super::draw::{BAD, OK, WARN, bytes, dimmed, fg, meter, trim};
 use super::logs::Logs;
 use super::model::{Key, Model, containers, key, kind_word, owner, spec, status, word};
+use super::shell::{self, Shell};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
@@ -170,6 +171,8 @@ pub enum Request {
         task: String,
         container: Option<String>,
     },
+    /// Typing for the shell shown.
+    Input(Vec<u8>),
 }
 
 /// What typed text is for.
@@ -242,6 +245,10 @@ pub struct View {
     pub(super) help: bool,
     /// Logs followed under the table.
     pub(super) logs: Option<Logs>,
+    /// Or a shell there.
+    pub(super) shell: Option<Shell>,
+    /// That pane over the table too.
+    pub(super) zoom: bool,
     pub(super) quit: bool,
 }
 
@@ -259,6 +266,8 @@ impl Default for View {
             yaml: None,
             help: false,
             logs: None,
+            shell: None,
+            zoom: false,
             quit: false,
         }
     }
@@ -277,8 +286,76 @@ impl View {
             if let Some(c) = container {
                 of = format!("{of}/{c}");
             }
+            self.shell = None;
             self.logs = Some(Logs::new(of));
         }
+    }
+
+    /// Starts showing the shell a request asks for, with the keys.
+    pub(super) fn show_shell(&mut self, request: &Request) {
+        if let Request::Exec {
+            namespace,
+            task,
+            container,
+        } = request
+        {
+            let mut of = format!("{namespace}/{task}");
+            if let Some(c) = container {
+                of = format!("{of}/{c}");
+            }
+            self.logs = None;
+            self.shell = Some(Shell::new(of));
+        }
+    }
+
+    /// Whether the shell has the keys.
+    pub(super) fn typing(&self) -> bool {
+        self.shell.as_ref().is_some_and(|s| s.focus)
+    }
+
+    /// The pane under the table: what keys do to it, if anything.
+    fn pane_key(&mut self, k: KeyEvent) -> Option<Option<Request>> {
+        if let Some(s) = &mut self.shell {
+            if s.focus {
+                if shell::is_leave(k) {
+                    s.focus = false;
+                    return Some(None);
+                }
+                return Some(s.bytes(k).map(Request::Input));
+            }
+            if shell::is_leave(k) && s.ended.is_none() {
+                s.focus = true;
+                s.scroll(isize::MIN);
+                return Some(None);
+            }
+        }
+        if self.logs.is_none() && self.shell.is_none() {
+            return None;
+        }
+        let page = 20;
+        match k.code {
+            KeyCode::Esc => {
+                self.logs = None;
+                self.shell = None;
+                self.zoom = false;
+            }
+            KeyCode::PageUp | KeyCode::PageDown => {
+                let n = if k.code == KeyCode::PageUp {
+                    page
+                } else {
+                    -page
+                };
+                if let Some(l) = &mut self.logs {
+                    l.scroll(n);
+                }
+                if let Some(s) = &mut self.shell {
+                    s.scroll(n);
+                }
+            }
+            KeyCode::Char('z') => self.zoom = !self.zoom,
+            _ => return None,
+        }
+        Some(None)
     }
 
     pub(super) fn index(&self) -> usize {
@@ -295,6 +372,10 @@ impl View {
 
     /// What a key does, and the request it makes, if any.
     pub fn key(&mut self, model: &Model, k: KeyEvent) -> Option<Request> {
+        // Ctrl-C and all go to the shell while it has the keys.
+        if self.typing() {
+            return self.pane_key(k).flatten();
+        }
         if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
             self.quit = true;
             return None;
@@ -319,27 +400,8 @@ impl View {
             return None;
         }
         self.notice = None;
-        if let Some(logs) = &mut self.logs {
-            let page = 20;
-            match k.code {
-                KeyCode::Esc => {
-                    self.logs = None;
-                    return None;
-                }
-                KeyCode::PageUp => {
-                    logs.scroll(page);
-                    return None;
-                }
-                KeyCode::PageDown => {
-                    logs.scroll(-page);
-                    return None;
-                }
-                KeyCode::Char('z') => {
-                    logs.zoom = !logs.zoom;
-                    return None;
-                }
-                _ => {}
-            }
+        if let Some(done) = self.pane_key(k) {
+            return done;
         }
         let selected = self.selected_key(model);
         if let KeyCode::Char(c) = k.code

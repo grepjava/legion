@@ -488,8 +488,10 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   (by typing its name; a task after a yes, as its owner starts another);
   follow logs in a pane under the table (PgUp and PgDn scroll it, `z`
   lays it over the table, Esc closes it; colour codes and other control
-  characters are dropped), or open a shell by running the CLI itself
-  with the terminal, asking which container when a pod has several. It lists every kind, then follows one watch
+  characters are dropped), or open a shell in that pane: a terminal
+  emulated in `top` (vt100) shows it, sized to the pane, and has every
+  key, Ctrl-C too, until Ctrl-] gives them back (and again to return);
+  logs and shells ask which container when a pod has several. It lists every kind, then follows one watch
   from the oldest listing's version, ignoring what is older than what it
   holds; a broken watch lists again. Usage comes from `Cluster.Usage`,
   which the leader answers from the heartbeats' reports (a follower
