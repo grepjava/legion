@@ -623,8 +623,11 @@ async fn stack(objects: &mut Objects, command: StackCommand) -> anyhow::Result<(
                 apply(objects, object).await?;
             }
             if prune {
+                // What `stack rm` would remove, Volumes and their data
+                // staying.
                 let keep: Vec<_> = converted.objects.iter().map(Object::key).collect();
-                for o in stack_objects(objects, &stack, &namespace, &[Kind::Service]).await? {
+                let kinds = [Kind::Service, Kind::Secret, Kind::Config];
+                for o in stack_objects(objects, &stack, &namespace, &kinds).await? {
                     if !keep.contains(&o.key()) {
                         delete(objects, &o).await?;
                     }

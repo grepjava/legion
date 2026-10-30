@@ -214,7 +214,11 @@ async fn pods_of_jails() {
                 .args(["-J", &child, "-o", "command="])
                 .output()
                 .unwrap();
-            String::from_utf8_lossy(&out.stdout).contains(what)
+            // The command itself, not a shell whose script names it: that
+            // runs before the script has done anything.
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|l| l.trim() == what)
         }
     };
     // An exec given up on (a probe timing out) ends, with what it started.
@@ -264,6 +268,30 @@ async fn pods_of_jails() {
     rt.exec_release(&session).await;
     let held = running("sleep 302");
     until("the released terminal hangs up", async || !held()).await;
+    // So does a command without a terminal, and one ignoring the hangup is
+    // killed after a grace.
+    for script in ["exec sleep 303", "trap '' HUP; sleep 304; sleep 304"] {
+        let attached = rt
+            .exec_attach(
+                &app,
+                &["/bin/sh".into(), "-c".into(), script.into()],
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+        let what = if script.contains("303") {
+            "sleep 303"
+        } else {
+            "sleep 304"
+        };
+        let alive = running(what);
+        until("the command", async || alive()).await;
+        let session = attached.id.clone();
+        drop(attached);
+        rt.exec_release(&session).await;
+        until("the released command ends", async || !alive()).await;
+    }
 
     // Another member, as another user, that ends.
     let mut spec = member("shop_web_job", &pod, "id -un; exit 3");

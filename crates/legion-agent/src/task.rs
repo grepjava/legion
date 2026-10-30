@@ -759,7 +759,10 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             }
             self.probe(&mut pod.members[i]);
         }
-        self.update_ready(&pod).await;
+        // A refused pod is torn down below, never reported ready.
+        if pod.refused.is_none() {
+            self.update_ready(&pod).await;
+        }
         // Containers found stopped on adoption count as exits now.
         for i in 0..pod.members.len() {
             if !pod.members[i].running && pod.members[i].done.is_none() {
@@ -889,7 +892,10 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                         Err(why) => Err(why),
                     };
                     if let Err(why) = checked {
+                        // Torn down as the monitor's next turn finds it,
+                        // never reported running again.
                         pod.refused = Some(why);
+                        return;
                     }
                 }
                 self.probe(&mut pod.members[i]);

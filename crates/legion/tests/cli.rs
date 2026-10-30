@@ -273,12 +273,15 @@ secrets:
     assert_eq!(converted.matches("kind: Service").count(), 2, "{converted}");
     assert!(converted.contains("namespace: other"), "{converted}");
 
-    // Without db, --prune removes it.
+    // Without db, --prune removes it, and its secret, which the file no
+    // longer has; the volume keeps its data.
     let web_only = app.replace("    depends_on: [db]\n", "");
     let web_only = &web_only[..web_only.find("  db:").unwrap()];
     std::fs::write(&compose, web_only).unwrap();
     let pruned = ok(&d, &["stack", "deploy", "shop", "-c", file, "--prune"]);
     assert!(pruned.contains("Service/shop/db deleted"), "{pruned}");
+    assert!(pruned.contains("Secret/shop/db-pw deleted"), "{pruned}");
+    assert!(!pruned.contains("Volume/shop/data deleted"), "{pruned}");
     let services = ok(&d, &["list", "services", "-n", "shop"]);
     assert!(
         services.contains("web") && !services.contains(" db "),
@@ -288,7 +291,6 @@ secrets:
     // rm takes the services and secrets; volumes keep their data.
     let removed = ok(&d, &["stack", "rm", "shop"]);
     assert!(removed.contains("Service/shop/web deleted"), "{removed}");
-    assert!(removed.contains("Secret/shop/db-pw deleted"), "{removed}");
     assert!(ok(&d, &["list", "volumes", "-n", "shop"]).contains("data"));
     assert!(!legion(&d, &["stack", "rm", "shop"]).status.success());
 }

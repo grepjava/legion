@@ -140,10 +140,16 @@ type Used = Arc<tokio::sync::Mutex<BTreeMap<String, tokio::time::Instant>>>;
 
 struct Session {
     code: watch::Receiver<Option<i32>>,
+    /// The process group the command leads: its own, or with a terminal
+    /// its session's.
+    group: Option<u32>,
     /// The terminal's controlling side, for resizing.
     #[cfg(unix)]
     master: Option<Arc<Pty>>,
 }
+
+/// How long a command let go of has after its hangup before it is killed.
+const EXEC_HANGUP_GRACE: Duration = Duration::from_secs(5);
 
 /// A terminal's controlling side, non-blocking and polled by the reactor,
 /// shared by the session, its output and its input. Its one descriptor
@@ -1155,8 +1161,10 @@ impl legion_agent::Runtime for JailRuntime {
                     .stdin(stdio(&slave)?)
                     .stdout(stdio(&slave)?)
                     .stderr(stdio(&slave)?);
+                // The shim makes it a session's leader, and so its group's.
                 let child = command.spawn().map_err(internal)?;
                 drop(slave);
+                let group = child.id();
                 reap(child, code_tx, self.execs.clone(), exec_id.clone());
                 // One descriptor for all three, so dropping them closes it.
                 let master = Pty::new(master).map_err(internal)?;
@@ -1166,6 +1174,7 @@ impl legion_agent::Runtime for JailRuntime {
                     exec_id.clone(),
                     Session {
                         code: code_rx,
+                        group,
                         master: Some(master),
                     },
                 );
@@ -1197,16 +1206,19 @@ impl legion_agent::Runtime for JailRuntime {
                 std::process::Stdio::null()
             })
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            .process_group(0);
         let mut child = command.spawn().map_err(internal)?;
         let out = child.stdout.take().expect("piped");
         let err = child.stderr.take().expect("piped");
         let input = child.stdin.take();
+        let group = child.id();
         reap(child, code_tx, self.execs.clone(), exec_id.clone());
         self.execs.lock().expect("execs").insert(
             exec_id.clone(),
             Session {
                 code: code_rx,
+                group,
                 #[cfg(unix)]
                 master: None,
             },
@@ -1273,9 +1285,33 @@ impl legion_agent::Runtime for JailRuntime {
         Ok(got)
     }
 
+    /// Its command, if it still runs, is hung up as a terminal would be,
+    /// and killed if it outlasts [`EXEC_HANGUP_GRACE`]: no one is left to
+    /// read it. Dropping the session drops a terminal's last descriptor.
     async fn exec_release(&self, exec_id: &str) {
-        // Dropping the session drops the terminal's last descriptor.
-        self.execs.lock().expect("execs").remove(exec_id);
+        let Some(session) = self.execs.lock().expect("execs").remove(exec_id) else {
+            return;
+        };
+        let Some(group) = session.group.and_then(|g| libc::pid_t::try_from(g).ok()) else {
+            return;
+        };
+        let mut code = session.code.clone();
+        drop(session);
+        // Not reaped while there is no code, so the group is still its.
+        let signal = |sig| {
+            if code.borrow().is_none() {
+                // SAFETY: a plain system call; a group already gone is fine.
+                unsafe { libc::killpg(group, sig) };
+            }
+        };
+        signal(libc::SIGHUP);
+        tokio::spawn(async move {
+            let ended = tokio::time::timeout(EXEC_HANGUP_GRACE, code.wait_for(Option::is_some));
+            if ended.await.is_err() && code.borrow().is_none() {
+                // SAFETY: as above.
+                unsafe { libc::killpg(group, libc::SIGKILL) };
+            }
+        });
     }
 
     async fn logs(

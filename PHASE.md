@@ -1063,6 +1063,27 @@ real, in the order agreed with the user.
   non-blocking descriptor polled by the reactor and shared by session,
   output and input, so it closes when they go; the live test lets go
   while a read waits on a silent command, which fails on the old code.
+- **From a third review.** Five faults, each confirmed first. Under a
+  storage quota a Volume needed a size, which only ZFS volumes may have,
+  so NFS, iSCSI and plugin volumes could not be made at all: only ZFS
+  volumes need one now, and the others still count as volumes. Jobs and
+  CronJobs were not checked at admission, so under a CPU or memory quota
+  one requesting nothing ran as if free: they must request what the
+  quota limits, as services must. An attached exec without a terminal
+  kept running after its user left: each exec now leads a process group
+  of its own (a terminal's, its session's), hung up on release and
+  killed 5 s later if still there. A restarted container whose limits
+  or profile failed was reported running before being refused: it is
+  not now, and an adopted refused pod is not reported ready.
+  `stack deploy --prune` removed only services: it removes what `stack
+  rm` would (services, secrets, configs), Volumes staying. Tested: the
+  quota API test (an NFS volume counted without a size; a Job and a
+  CronJob refused without requests); an agent test with `rctl -a` failing
+  on a restart; the CLI's stack test; on FreeBSD 15.1, released execs
+  without a terminal end, one ignoring the hangup after the grace, each
+  failing with its signal taken out. That test first passed with the
+  kill taken out: it took the shell's command line, naming the command,
+  for the command, and hung it up before its `trap` ran.
 - **From a second review.** A route could name any Secret of its
   namespace for HTTPS, and every node could then read it: a route's
   Secret is now handed out only if it holds a PEM certificate and key.

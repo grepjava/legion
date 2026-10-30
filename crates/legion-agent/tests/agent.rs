@@ -385,6 +385,34 @@ async fn runs_a_pod() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_whose_limits_cannot_be_set_refuses_the_pod() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task(
+            "app-1",
+            r#"
+containers:
+  - name: app
+    image: "app:1"
+    resources: { limits: { memory: 64Mi } }
+restartPolicy: { condition: on-failure, maxAttempts: 2, delay: 0s }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    h.sys.fail_next("rctl -a");
+    h.rt.exit("shop_app-1_app", 1);
+    let status = h.wait_state(&key, TaskState::Rejected).await;
+    assert!(
+        status.message.contains("setting container app's limits"),
+        "{}",
+        status.message
+    );
+    h.nothing_left().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_policy() {
     let h = Harness::new().await;
     h.rt.add_image("app:1");

@@ -8,10 +8,11 @@
 use std::collections::BTreeMap;
 
 use legion_api::admit::NamespaceSpec;
+use legion_api::job::{CronJobSpec, JobSpec};
 use legion_api::quantity::Bytes;
 use legion_api::quota::{Quota, Usage, describe};
-use legion_api::service::{ServiceMode, ServiceSpec, claim_volume};
-use legion_api::volume::VolumeSpec;
+use legion_api::service::{PodSpec, ServiceMode, ServiceSpec, claim_volume};
+use legion_api::volume::{VolumeDriver, VolumeSpec};
 use legion_api::{CLUSTER_SCOPE, Kind, Object, ObjectKey};
 use legion_store::Store;
 use tonic::Status;
@@ -24,10 +25,32 @@ pub(crate) fn counts(kind: Kind) -> bool {
 /// Refuses `desired` if, with it in place of its current version, its
 /// namespace would go over its quota.
 pub(crate) fn check(store: &Store, desired: &Object) -> Result<(), Status> {
+    let namespace = &desired.metadata.namespace;
+    // A Job's tasks are held to the quota as they are placed, which only
+    // holds if they say what they need.
+    let job_pod = match desired.kind {
+        Kind::Job => Some(
+            legion_api::parse::<JobSpec>(&desired.spec)
+                .map_err(internal)?
+                .pod,
+        ),
+        Kind::CronJob => Some(
+            legion_api::parse::<CronJobSpec>(&desired.spec)
+                .map_err(internal)?
+                .job
+                .pod,
+        ),
+        _ => None,
+    };
+    if let Some(pod) = job_pod {
+        return match quota_of(store, namespace)? {
+            Some(quota) => needs_requests(&quota, &pod, namespace),
+            None => Ok(()),
+        };
+    }
     if !counts(desired.kind) {
         return Ok(());
     }
-    let namespace = &desired.metadata.namespace;
     let Some(quota) = quota_of(store, namespace)? else {
         return Ok(());
     };
@@ -52,13 +75,15 @@ pub(crate) fn check(store: &Store, desired: &Object) -> Result<(), Status> {
     match desired.kind {
         Kind::Service => {
             let spec: ServiceSpec = legion_api::parse(&desired.spec).map_err(internal)?;
-            needs_requests(&quota, &spec, namespace)?;
+            needs_requests(&quota, &spec.pod, namespace)?;
             services_after.retain(|(n, _)| n != name);
             services_after.push((name.clone(), spec));
         }
         Kind::Volume => {
             let spec: VolumeSpec = legion_api::parse(&desired.spec).map_err(internal)?;
-            if quota.storage.is_some() && spec.size.is_none() {
+            // Only ZFS volumes take the cluster's storage, and only they
+            // may have a size.
+            if quota.storage.is_some() && spec.driver == VolumeDriver::Zfs && spec.size.is_none() {
                 return Err(Status::failed_precondition(format!(
                     "namespace {namespace} has a storage quota: the volume needs a size"
                 )));
@@ -123,15 +148,15 @@ fn usage(
 
 /// Under a CPU or memory quota every task must say what it needs, or the
 /// quota would not hold it; under a storage quota, every claim its size.
-fn needs_requests(quota: &Quota, spec: &ServiceSpec, namespace: &str) -> Result<(), Status> {
+fn needs_requests(quota: &Quota, pod: &PodSpec, namespace: &str) -> Result<(), Status> {
     if quota.storage.is_some()
-        && let Some((name, _)) = spec.pod.claims().find(|(_, c)| c.size.is_none())
+        && let Some((name, _)) = pod.claims().find(|(_, c)| c.size.is_none())
     {
         return Err(Status::failed_precondition(format!(
             "namespace {namespace} has a storage quota: claim {name} needs a size"
         )));
     }
-    let r = spec.pod.requests();
+    let r = pod.requests();
     for (limited, missing, what) in [
         (quota.cpu.is_some(), r.cpu.0 == 0, "cpu"),
         (quota.memory.is_some(), r.memory.0 == 0, "memory"),

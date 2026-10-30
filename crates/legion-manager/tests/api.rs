@@ -1414,6 +1414,28 @@ async fn namespace_quotas_refuse_what_would_not_fit() {
     // Room made, it fits.
     try_apply(svc("web", 1, Some("400m"))).await.unwrap();
     try_apply(svc("api", 2, Some("300m"))).await.unwrap();
+    // So must a Job's and a CronJob's, whose tasks the scheduler holds to
+    // the quota.
+    let job = |cpu: Option<&str>| {
+        let resources = match cpu {
+            Some(c) => serde_json::json!({ "requests": { "cpu": c } }),
+            None => serde_json::json!({}),
+        };
+        serde_json::json!({ "pod": { "containers": [
+            { "name": "c", "image": "c:1", "resources": resources }
+        ] } })
+    };
+    let why = refused(try_apply(object("Job", "team", "once", job(None))).await);
+    assert!(why.contains("must request cpu"), "{why}");
+    try_apply(object("Job", "team", "once", job(Some("100m"))))
+        .await
+        .unwrap();
+    let cron = |cpu| serde_json::json!({ "schedule": "0 3 * * *", "job": job(cpu) });
+    let why = refused(try_apply(object("CronJob", "team", "nightly", cron(None))).await);
+    assert!(why.contains("must request cpu"), "{why}");
+    try_apply(object("CronJob", "team", "nightly", cron(Some("100m"))))
+        .await
+        .unwrap();
 
     // Volumes: counted, and sized under a storage quota.
     let why = refused(try_apply(volume("data", None)).await);
@@ -1422,6 +1444,18 @@ async fn namespace_quotas_refuse_what_would_not_fit() {
     assert_eq!(
         refused(try_apply(volume("logs", Some("1Gi"))).await),
         "over the quota of namespace team: volumes 2 of 1, storage 11Gi of 10Gi"
+    );
+    // A volume of another driver takes no storage, so has no size, and is
+    // counted all the same.
+    let nfs = object(
+        "Volume",
+        "team",
+        "shared",
+        serde_json::json!({ "driver": "nfs", "nfs": { "server": "files", "path": "/export" } }),
+    );
+    assert_eq!(
+        refused(try_apply(nfs).await),
+        "over the quota of namespace team: volumes 2 of 1"
     );
 
     // Under a lowered quota, shrinking still goes through; growing does not.
