@@ -94,6 +94,7 @@ impl Tab {
                 "CPU",
                 "MEMORY",
                 "IP",
+                "JID",
                 "MESSAGE",
             ],
             Tab::Storage => &[
@@ -951,6 +952,7 @@ fn task_rows(model: &Model, view: &View) -> Vec<TableRow> {
                     cpu,
                     memory,
                     dimmed(st.ip.unwrap_or_default()),
+                    dimmed(st.jid.map(|j| j.to_string()).unwrap_or_default()),
                     text(st.message),
                 ],
                 Some(key(t)),

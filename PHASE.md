@@ -1208,6 +1208,13 @@ real, in the order agreed with the user.
   newlines per stream (stderr in yellow), with tabs expanded and colour
   codes and control characters dropped; 5000 are kept. `legion logs` and
   `top` share one `LogStream`. Shells still run the CLI.
+- **A task's jail id** (asked 2026-10-30: "where would the jail number
+  appear?"). The runtime's `inspect` gives a running container's JID; the
+  agent reports the pod jail's as `status.jid` once the pod has its
+  address (an adopted pod's too) and drops it when the task ends. `top`
+  shows it in a JID column on the Tasks tab and in the details. Agent
+  tests: the JID is the pod jail's, kept by an adopted pod, gone at the
+  end.
 - **From a second review.** A route could name any Secret of its
   namespace for HTTPS, and every node could then read it: a route's
   Secret is now handed out only if it holds a PEM certificate and key.

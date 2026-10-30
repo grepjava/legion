@@ -911,10 +911,10 @@ impl JailRuntime {
 
     fn inspect_record(&self, rec: &Record) -> Result<ContainerInspect> {
         let s = self.status(rec)?;
-        let (pid, exit_code, started, finished) = match &s {
-            Status::Running(r) => (r.pid, 0, r.started, 0),
-            Status::Exited(e) => (0, e.code, 0, e.finished),
-            Status::Created => (0, 0, 0, 0),
+        let (pid, jid, exit_code, started, finished) = match &s {
+            Status::Running(r) => (r.pid, r.jid, 0, r.started, 0),
+            Status::Exited(e) => (0, 0, e.code, 0, e.finished),
+            Status::Created => (0, 0, 0, 0, 0),
         };
         Ok(ContainerInspect {
             id: rec.id.clone(),
@@ -923,6 +923,7 @@ impl JailRuntime {
                 status: s.name().to_owned(),
                 running: matches!(s, Status::Running(_)),
                 pid: pid.into(),
+                jid,
                 exit_code,
                 oom_killed: false,
                 started_at: started.to_string(),

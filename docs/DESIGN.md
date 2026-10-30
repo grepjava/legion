@@ -473,7 +473,9 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   shows nodes and tasks by state, the managers, and graphs of what all
   tasks use against what the nodes hold. Seven tabs: nodes (state,
   availability, tasks, CPU and memory bars against capacity), workloads
-  (services, Jobs, cron jobs), tasks, storage (volumes, the tasks using
+  (services, Jobs, cron jobs), tasks (with the pod jail's id, which
+  the agent reports while the pod runs, for `jls` and `jexec` on its
+  node), storage (volumes, the tasks using
   them, migrations), network (routes, network policies), config
   (namespaces with their quotas, Secrets, Configs, role bindings) and
   the log of changes. Beside the table, when wide enough (`i` toggles),

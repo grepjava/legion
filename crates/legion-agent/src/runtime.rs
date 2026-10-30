@@ -200,6 +200,8 @@ pub struct ContainerState {
     pub status: String,
     pub running: bool,
     pub pid: i64,
+    /// Its jail's id while it runs; 0 otherwise, or where there is none.
+    pub jid: u32,
     pub exit_code: i32,
     pub oom_killed: bool,
     pub started_at: String,

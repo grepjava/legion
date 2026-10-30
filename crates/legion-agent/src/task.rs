@@ -254,6 +254,8 @@ impl<R: Runtime, C: Control> Worker<R, C> {
     async fn finish(&mut self, state: TaskState, message: String, exit_code: Option<i32>) {
         tracing::info!(state = state.as_str(), "{message}");
         self.status.exit_code = exit_code;
+        // Its jail is gone, or soon will be.
+        self.status.jid = None;
         self.report(state, message).await;
     }
 
@@ -545,6 +547,10 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             .await
             .map_err(|e| Abort::Failed(format!("attaching the pod network: {e}")))?;
         self.status.ip = Some(ip.to_string());
+        self.status.jid = match self.ctx.runtime.inspect(infra).await {
+            Ok(i) if i.state.jid != 0 => Some(i.state.jid),
+            _ => None,
+        };
         self.ctx
             .guarding
             .attach(&self.a.uid, crate::policing::LocalPod::of(&self.a, ip));
@@ -783,7 +789,10 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             // The agent before may have gone before saying it runs.
             self.ready = pod.ready();
             let said = self.status.state == TaskState::Running;
-            if finished(&pod).is_none() && (!said || self.status.ready != self.ready) {
+            // Its jail's id too, which an agent before this one did not
+            // report.
+            let jid = self.status.jid != self.a.status.jid;
+            if finished(&pod).is_none() && (!said || self.status.ready != self.ready || jid) {
                 let message = if said {
                     self.status.message.clone()
                 } else {

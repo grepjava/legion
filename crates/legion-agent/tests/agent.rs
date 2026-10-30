@@ -236,6 +236,17 @@ impl Harness {
         }
     }
 
+    /// The id of the jail of the container named so.
+    fn jid(&self, container: &str) -> u32 {
+        let name = self.rt.id_of(container).expect("the container exists");
+        legion_sys::Sys::jails(self.sys.as_ref())
+            .unwrap()
+            .into_iter()
+            .find(|j| j.name == name)
+            .map(|j| j.jid)
+            .unwrap_or_else(|| panic!("no jail for {container}"))
+    }
+
     async fn wait_state(&self, key: &ObjectKey, state: TaskState) -> TaskStatus {
         eventually(&format!("{key} {}", state.as_str()), || {
             self.status(key).state == state
@@ -318,6 +329,8 @@ async fn runs_a_pod() {
         h.running(),
         ["shop_web-1", "shop_web-1_shipper", "shop_web-1_web"]
     );
+    // It says which jail is the pod's, for jls and jexec.
+    assert_eq!(status.jid, Some(h.jid("shop_web-1")));
 
     // The node registered itself and loaded the modules it needs.
     let node = h
@@ -651,13 +664,15 @@ restartPolicy: { condition: on-failure }
 "#,
         )
         .await;
-    h.wait_state(&key, TaskState::Running).await;
+    let running = h.wait_state(&key, TaskState::Running).await;
+    assert_eq!(running.jid, Some(h.jid("shop_job-1")));
     h.rt.exit("shop_job-1_a", 0);
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(h.status(&key).state, TaskState::Running, "b still runs");
     h.rt.exit("shop_job-1_b", 0);
     let status = h.wait_state(&key, TaskState::Complete).await;
     assert_eq!(status.exit_code, Some(0));
+    assert_eq!(status.jid, None, "its jail is gone");
     h.nothing_left().await;
 }
 
@@ -987,7 +1002,8 @@ async fn an_adopted_pod_is_reported_running() {
     let key = h
         .task("app-1", r#"containers: [{ name: app, image: "app:1" }]"#)
         .await;
-    h.wait_state(&key, TaskState::Running).await;
+    let jid = h.wait_state(&key, TaskState::Running).await.jid;
+    assert!(jid.is_some());
     let created = h.rt.created();
 
     // The agent went after starting the pod, before saying so.
@@ -997,8 +1013,30 @@ async fn an_adopted_pod_is_reported_running() {
     let v = o.metadata.version;
     h.write(o, Precondition::Version(v)).await;
     h.start_agent();
-    h.wait_state(&key, TaskState::Running).await;
+    let status = h.wait_state(&key, TaskState::Running).await;
     assert_eq!(h.rt.created(), created, "no container recreated");
+    assert_eq!(status.jid, jid, "the same jail");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_adopted_pod_reports_its_jail_id() {
+    let mut h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task("app-1", r#"containers: [{ name: app, image: "app:1" }]"#)
+        .await;
+    let jid = h.wait_state(&key, TaskState::Running).await.jid;
+    assert!(jid.is_some());
+
+    // An agent that did not report jail ids ran it: running and ready,
+    // nothing else changes on adoption.
+    h.stop_agent().await;
+    let mut o = h.store.get(&key).unwrap().unwrap();
+    o.status.as_object_mut().unwrap().remove("jid");
+    let v = o.metadata.version;
+    h.write(o, Precondition::Version(v)).await;
+    h.start_agent();
+    eventually("the jail id reported", || h.status(&key).jid == jid).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

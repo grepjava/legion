@@ -530,12 +530,21 @@ impl Runtime for FakeRuntime {
 
     async fn inspect(&self, id: &str) -> Result<ContainerInspect> {
         let c = self.get(id)?;
+        let jid = match (&c.jail, c.running) {
+            (Some(name), true) => legion_sys::Sys::jails(self.sys.as_ref())
+                .unwrap_or_default()
+                .into_iter()
+                .find(|j| &j.name == name)
+                .map_or(0, |j| j.jid),
+            _ => 0,
+        };
         Ok(ContainerInspect {
             id: id.to_owned(),
             name: c.spec.name.clone(),
             state: ContainerState {
                 status: c.state().into(),
                 running: c.running,
+                jid,
                 exit_code: c.exit_code,
                 ..Default::default()
             },

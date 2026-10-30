@@ -45,7 +45,7 @@ fn task(name: &str, version: u64, node: &str, state: &str, ready: bool) -> Objec
         serde_json::json!({ "service": "web", "serviceUid": "1", "serviceGeneration": 1, "node": node,
             "pod": { "containers": [{ "name": "web", "image": "nginx:1" }],
                      "volumes": [{ "name": "d", "volume": { "name": "data" } }] } }),
-        serde_json::json!({ "state": state, "ready": ready, "ip": "10.200.0.2" }),
+        serde_json::json!({ "state": state, "ready": ready, "ip": "10.200.0.2", "jid": 494 }),
     );
     t.metadata.labels.insert(LABEL_SERVICE.into(), "web".into());
     t
@@ -209,7 +209,7 @@ fn shows_every_kind_with_its_use() {
     let s = screen(&m, &v);
     assert_eq!(
         line(&s, "web-1-1"),
-        "shop web-1-1 n1 running ✓ 0 25% 64Mi 10.200.0.2"
+        "shop web-1-1 n1 running ✓ 0 25% 64Mi 10.200.0.2 494"
     );
     typed(&mut v, &m, "4");
     assert_eq!(

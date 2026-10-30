@@ -180,6 +180,9 @@ pub struct TaskStatus {
     /// The pod's address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip: Option<String>,
+    /// The pod's jail on its node, as `jls` and `jexec` know it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jid: Option<u32>,
     /// Set by the readiness probe while running.
     #[serde(default)]
     pub ready: bool,
