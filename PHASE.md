@@ -1223,6 +1223,15 @@ real, in the order agreed with the user.
   command's output, and `stty size` in the shell matching the pane; no
   shell left in the jail after `top` quits. The port's
   `Makefile.crates` needs vt100 too.
+- **`legion top`'s CPU and memory lines** (asked 2026-10-30: "make the
+  CPU and memory graphics better"; the graphs were scaled to the whole
+  cluster, so a light load drew nothing). Each line now has a bar of the
+  share of what the nodes hold in jmon's colours, that share as a
+  percentage, the amounts (`0.7 CPU of 8`), and the samples as a graph
+  scaled to their peak, with the peak beside it. The scale is at least
+  2 % of the nodes', so an idle cluster's noise stays a low line. Test:
+  the bar, share and amounts; a graph's levels against its peak; idle
+  noise kept low.
 - **A task's jail id** (asked 2026-10-30: "where would the jail number
   appear?"). The runtime's `inspect` gives a running container's JID; the
   agent reports the pod jail's as `status.jid` once the pod has its

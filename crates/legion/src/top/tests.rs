@@ -188,7 +188,7 @@ fn shows_every_kind_with_its_use() {
         s.contains("2/2 nodes ready") && s.contains("1 running"),
         "{s}"
     );
-    assert!(s.contains("0.2/8 CPU"), "{s}");
+    assert!(s.contains("0.2 CPU of 8"), "{s}");
     assert_eq!(
         line(&s, "n1 "),
         "n1 ● ready active worker 1 0.25/4 64Mi/8Gi"
@@ -734,6 +734,38 @@ fn once_prints_plain_tables() {
     assert!(lines[0].starts_with("NAME  STATE"), "{text}");
     assert!(lines[1].starts_with("n1    ● ready"), "{text}");
     assert!(draw::plain_summary(&m).starts_with("● 2/2 nodes ready"));
+}
+
+#[test]
+fn the_header_graphs_show_small_loads() {
+    let mut m = cluster();
+    // 8 CPUs and 16Gi in all; the tasks used 0.1, 0.5, then 0.25 CPU.
+    m.history.clear();
+    for cpu in [10.0, 50.0, 25.0] {
+        m.history.push_back((cpu, 64 << 20));
+    }
+    let s = screen_of(&m, &View::default(), 170);
+    let cpu = s.lines().find(|l| l.contains("cpu ")).unwrap();
+    let mem = s.lines().find(|l| l.contains("mem ")).unwrap();
+    // The share of what the nodes hold, its bar, and the amounts.
+    assert!(cpu.contains("cpu █░░░░░░░░░   3% 0.2 CPU of 8"), "{cpu}");
+    assert!(mem.contains("mem █░░░░░░░░░  <1% 64Mi of 16Gi"), "{mem}");
+    // The graph is scaled to its peak: a fifth, all, a half of it.
+    assert!(cpu.contains("▁█▄"), "{cpu}");
+    assert!(cpu.contains("peak 0.5"), "{cpu}");
+    // Under 2 % of what the nodes hold, steady use is a low line, not
+    // a full one.
+    assert!(mem.contains("▁▁▁") && mem.contains("peak 64Mi"), "{mem}");
+
+    // An idle cluster's noise stays near the floor, not at full height.
+    m.history.clear();
+    for cpu in [1.0, 2.0, 1.0] {
+        m.history.push_back((cpu, 0));
+    }
+    let s = screen_of(&m, &View::default(), 170);
+    let cpu = s.lines().find(|l| l.contains("cpu ")).unwrap();
+    let graph = cpu.split("of 8").nth(1).unwrap();
+    assert!(!graph.contains('█') && graph.contains('▁'), "{cpu}");
 }
 
 #[test]

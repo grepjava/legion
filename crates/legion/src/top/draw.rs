@@ -349,46 +349,103 @@ fn header(f: &mut Frame, model: &Model, area: Rect) {
 
     let (millicores, memory) = model.capacity();
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(right);
-    let now = model.history.back().copied();
-    let cpu: Vec<u64> = model.history.iter().map(|(c, _)| *c as u64).collect();
-    let mem: Vec<u64> = model.history.iter().map(|(_, m)| *m >> 20).collect();
-    let cpu_label = format!(
-        "{}/{} CPU",
-        now.map_or("-".into(), |(c, _)| format!("{:.1}", c / 100.0)),
-        trim(millicores as f64 / 1000.0)
+    let cpu: Vec<f64> = model.history.iter().map(|(c, _)| c / 100.0).collect();
+    let mem: Vec<f64> = model.history.iter().map(|(_, m)| *m as f64).collect();
+    let cores = |c: f64| format!("{c:.1}");
+    let cpu_total = format!(" CPU of {}", trim(millicores as f64 / 1000.0));
+    let mem_total = format!(" of {}", bytes(memory));
+    let mib = |m: f64| bytes(m as u64);
+    graph(
+        f,
+        rows[0],
+        "cpu",
+        &cpu,
+        millicores as f64 / 1000.0,
+        &cores,
+        &cpu_total,
+        OK,
     );
-    let mem_label = format!(
-        "{}/{}",
-        now.map_or("-".into(), |(_, m)| bytes(m)),
-        bytes(memory)
+    graph(
+        f,
+        rows[1],
+        "mem",
+        &mem,
+        memory as f64,
+        &mib,
+        &mem_total,
+        ACCENT,
     );
-    graph(f, rows[0], "cpu", &cpu, millicores / 10, &cpu_label, OK);
-    graph(f, rows[1], "mem", &mem, memory >> 20, &mem_label, ACCENT);
 }
 
-/// One line: a name, a graph of the latest samples against `max`, and
-/// the value now.
-fn graph(f: &mut Frame, area: Rect, name: &str, data: &[u64], max: u64, now: &str, color: Color) {
-    let [label, spark, value] = Layout::horizontal([
-        Constraint::Length(4),
+/// One line of what all tasks use: a bar of the share of what the nodes
+/// hold, in jmon's colours; that share and the amounts; then the latest
+/// samples, scaled to their peak so that small loads show, and the peak.
+#[allow(clippy::too_many_arguments)]
+fn graph(
+    f: &mut Frame,
+    area: Rect,
+    name: &str,
+    samples: &[f64],
+    capacity: f64,
+    show: &dyn Fn(f64) -> String,
+    total: &str,
+    color: Color,
+) {
+    let now = samples.last().copied();
+    let frac = match now {
+        Some(n) if capacity > 0.0 => n / capacity,
+        _ => 0.0,
+    };
+    let share = match now {
+        None => "  -".to_owned(),
+        Some(n) if n > 0.0 && frac < 0.01 => " <1%".to_owned(),
+        Some(_) => format!("{:>3.0}%", frac * 100.0),
+    };
+    let mut head = vec![Span::styled(format!("{name} "), dim())];
+    head.extend(meter(frac, 10));
+    head.push(Span::styled(
+        format!(" {share} "),
+        fg(busy(frac)).add_modifier(Modifier::BOLD),
+    ));
+    head.push(Span::raw(now.map_or("-".into(), show)));
+    head.push(Span::styled(total.to_owned(), dim()));
+    let head = Line::from(head);
+    let [head_area, spark, peak_area] = Layout::horizontal([
+        Constraint::Length(head.width() as u16 + 2),
         Constraint::Fill(1),
-        Constraint::Length(now.chars().count() as u16 + 1),
+        Constraint::Length(14),
     ])
     .areas(area);
-    f.render_widget(Paragraph::new(Span::styled(name.to_owned(), dim())), label);
-    let skip = data.len().saturating_sub(spark.width as usize);
-    let mut spark_widget = Sparkline::default()
-        .data(&data[skip..])
-        .style(fg(color))
-        .bar_set(symbols::bar::NINE_LEVELS);
-    if max > 0 {
-        spark_widget = spark_widget.max(max);
+    f.render_widget(Paragraph::new(head), head_area);
+    if spark.width < 8 {
+        return;
     }
-    f.render_widget(spark_widget, spark);
+    let shown = &samples[samples.len().saturating_sub(spark.width as usize)..];
+    let peak = shown.iter().copied().fold(0.0, f64::max);
+    // Scaled to the peak, but not below 2 % of what the nodes hold:
+    // noise on an idle cluster stays flat.
+    let scale = peak.max(capacity * 0.02).max(f64::MIN_POSITIVE);
+    let data: Vec<u64> = shown
+        .iter()
+        .map(|v| (v / scale * 64.0).round() as u64)
+        .collect();
     f.render_widget(
-        Paragraph::new(Span::raw(now.to_owned())).alignment(Alignment::Right),
-        value,
+        Sparkline::default()
+            .data(&data)
+            .max(64)
+            .style(fg(color))
+            .bar_set(symbols::bar::NINE_LEVELS),
+        spark,
     );
+    if !shown.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" peak ", dim()),
+                Span::raw(show(peak)),
+            ])),
+            peak_area,
+        );
+    }
 }
 
 /// Two lines: nodes and tasks by state, then the managers.

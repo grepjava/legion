@@ -470,8 +470,11 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   `-l key=value` and `-o table|yaml|json`. `apply` reads multi-document YAML
   or JSON, or stdin with `-f -`.
 - **`legion top`.** The cluster live in the terminal (ratatui). A header
-  shows nodes and tasks by state, the managers, and graphs of what all
-  tasks use against what the nodes hold. Seven tabs: nodes (state,
+  shows nodes and tasks by state, the managers, and for CPU and memory
+  what all tasks use: a bar and a share of what the nodes hold, the
+  amounts, and the last 20 minutes as a graph scaled to their peak (not
+  below 2 % of the nodes', so idle noise stays flat), with the peak.
+  Seven tabs: nodes (state,
   availability, tasks, CPU and memory bars against capacity), workloads
   (services, Jobs, cron jobs), tasks (with the pod jail's id, which
   the agent reports while the pod runs, for `jls` and `jexec` on its
