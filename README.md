@@ -62,10 +62,13 @@ legion watch Service
 legion top
 ```
 
-`legion top` shows the cluster live in the terminal: nodes, services and
-Jobs, tasks, what they use, and what changes; keys drain or pause nodes,
-scale or roll back services, and follow logs or open a shell in a task
-(`legion top --once` prints it as text). For dashboards, Prometheus can scrape each daemon's
+`legion top` shows the cluster live in the terminal: nodes, workloads,
+tasks, volumes, routes and policies, namespaces and their quotas, Secrets
+and Configs, with graphs of what tasks use, each object's details and
+YAML, and a log of what changes. Keys drain, pause or label nodes, scale
+or roll back services, suspend cron jobs, move volumes, delete objects,
+and follow logs or open a shell in a task; `/` filters and `?` lists the
+keys (`legion top --once` prints it as text). For dashboards, Prometheus can scrape each daemon's
 `--metrics-listen` endpoint; [packaging/grafana](packaging/grafana) has a
 Grafana dashboard for it.
 

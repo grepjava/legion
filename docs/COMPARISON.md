@@ -142,7 +142,7 @@ Linux hosts, an ecosystem of tools and charts, or proven production use.
 | Exec into a task | `legion exec`, through any manager | Only on the node (`docker exec`) | `kubectl exec` |
 | Port forwarding | `legion port-forward` | No | `kubectl port-forward` |
 | Watching objects | `legion watch` | `docker events` | `kubectl get --watch` |
-| Live view in the terminal | `legion top`: nodes, services and Jobs, tasks with their CPU and memory, and a log of changes | `docker stats` (one node), `docker service ps` | `kubectl top`; k9s and others, separately |
+| Live view in the terminal | `legion top`: every kind of object, CPU and memory with graphs, details and YAML, a log of changes, and keys to drain, scale, roll back, move, delete, follow logs and open shells | `docker stats` (one node), `docker service ps` | `kubectl top`; k9s and others, separately |
 | Web UI | No; a Grafana dashboard for its metrics | No; Portainer and others, separately | The Kubernetes Dashboard, an add-on |
 | Metrics | Prometheus endpoint: cluster state, and each container's CPU, memory and I/O; a Grafana dashboard | Engine metrics endpoint | metrics-server, kube-state-metrics, cAdvisor in kubelet |
 | Packaging | rc.d script under daemon(8), newsyslog entry, release tarballs built by a script, a FreeBSD port (not yet in the ports tree); no published release yet | Distribution packages | Distribution packages, many installers |

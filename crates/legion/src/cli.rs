@@ -98,7 +98,7 @@ impl Objects {
 
     /// Sets (`Some`) or removes (`None`) labels of an object, retrying
     /// when it changes meanwhile; whether anything changed.
-    async fn set_labels(
+    pub(crate) async fn set_labels(
         &mut self,
         r#ref: ObjectRef,
         changes: &[(String, Option<String>)],
@@ -149,7 +149,7 @@ impl Objects {
         .await
     }
 
-    async fn delete(&mut self, req: DeleteRequest) -> Answer<pb::DeleteResponse> {
+    pub(crate) async fn delete(&mut self, req: DeleteRequest) -> Answer<pb::DeleteResponse> {
         let deadline = tokio::time::Instant::now() + RETRY_FOR;
         let mut retried = false;
         loop {
@@ -908,7 +908,7 @@ fn parse_selector(
 }
 
 /// `key=value` sets a label, `key-` removes it.
-fn label_change(s: &str) -> anyhow::Result<(String, Option<String>)> {
+pub(crate) fn label_change(s: &str) -> anyhow::Result<(String, Option<String>)> {
     match (s.split_once('='), s.strip_suffix('-')) {
         (Some((k, v)), _) if !k.is_empty() => Ok((k.to_owned(), Some(v.to_owned()))),
         (None, Some(k)) if !k.is_empty() => Ok((k.to_owned(), None)),

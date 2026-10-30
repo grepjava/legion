@@ -469,27 +469,34 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   with kubectl-style kind names (`service`, `services`, `svc`), `-n`, `-A`,
   `-l key=value` and `-o table|yaml|json`. `apply` reads multi-document YAML
   or JSON, or stdin with `-f -`.
-- **`legion top`.** The cluster live in the terminal (ratatui): nodes
-  with their tasks and use against what they can hold, services and
-  Jobs with ready tasks and update or Job state, tasks with node, state,
-  readiness, restarts, CPU, memory and address, and a log of changes
-  (node state and availability, services created, changed and their
-  updates' steps, Jobs' states, tasks reaching running or ending,
-  restarting, turning ready or not). It lists the four kinds, then
-  follows one watch from the oldest listing's version, ignoring what is
-  older than what it holds; a broken watch lists again. Usage comes from
-  `Cluster.Usage`, which the leader answers from the heartbeats' reports
-  (a follower forwards it), keeping the tasks of namespaces the caller
-  may read. Enter on a node, service or Job lists its tasks. Keys act on
-  the selected row through the same calls as the CLI: `d` drains a node
-  (asked first), `p` pauses and `a` activates it; `s` scales a
-  replicated or stateful service without autoscale (the number typed),
-  `r` rolls it back (asked first); `l` follows a task's, service's or
-  Job's logs and `x` opens a shell in a task, both by running the CLI
-  itself, which has the terminal until it ends (Ctrl-C ends the logs,
-  not `top`). A user sees and may do what their role bindings let them;
-  kinds they may not list say so, and a refused request says why.
-  `--once` prints the views as text and exits.
+- **`legion top`.** The cluster live in the terminal (ratatui). A header
+  shows nodes and tasks by state, the managers, and graphs of what all
+  tasks use against what the nodes hold. Seven tabs: nodes (state,
+  availability, tasks, CPU and memory bars against capacity), workloads
+  (services, Jobs, cron jobs), tasks, storage (volumes, the tasks using
+  them, migrations), network (routes, network policies), config
+  (namespaces with their quotas, Secrets, Configs, role bindings) and
+  the log of changes. Beside the table, when wide enough (`i` toggles),
+  the selected object field by field; `y` shows its YAML. A Secret's
+  value is dropped as it arrives: only its size is kept. `/` filters the
+  rows as typed; Enter on a node or workload lists its tasks. Keys act
+  on the selected row through the same calls as the CLI: drain (asked
+  first), pause, activate or label a node; scale or roll back (asked) a
+  service; suspend or resume a cron job; move a volume; delete anything
+  (by typing its name; a task after a yes, as its owner starts another);
+  follow logs or open a shell, by running the CLI itself with the
+  terminal (Ctrl-C ends the logs, not `top`), asking which container
+  when a pod has several. It lists every kind, then follows one watch
+  from the oldest listing's version, ignoring what is older than what it
+  holds; a broken watch lists again. Usage comes from `Cluster.Usage`,
+  which the leader answers from the heartbeats' reports (a follower
+  forwards it), keeping the tasks of namespaces the caller may read. A
+  user sees and may do what their role bindings let them; kinds they
+  may not list say so. From jmon: the bars' colours, a full repaint
+  every 5 s, a blank screen on leaving (the console has no alternate
+  screen), `NO_COLOR`, and stopping once the terminal hangs up, which
+  crossterm would otherwise read forever. `--once` prints the views as
+  text and exits.
 
 ## 4. Feature set
 

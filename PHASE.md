@@ -1182,6 +1182,23 @@ real, in the order agreed with the user.
   and ran its logs, whose error waited for Enter before `top` came back.
   The port's `Makefile.crates` needs regenerating for ratatui at the
   next release.
+- **`legion top`, full** (asked 2026-10-30: "full featured and slick,
+  with pretty panels"). Split into a module (model, view, draw). Rounded
+  panels; a header with nodes and tasks by state, the managers, and CPU
+  and memory graphs against capacity; seven tabs adding storage, network
+  and config, so every kind shows; usage bars on nodes; a details panel
+  beside the table when wide enough; YAML and help over everything; `/`
+  filters as typed. New keys: label a node, suspend a cron job, move a
+  volume, delete anything (typing its name; a task after a yes), and a
+  choice of container for logs and shells. Secrets keep only their size.
+  Borrowed from jmon (the user's FreeBSD monitor, same licence): its bar
+  colours, a full repaint every 5 s, blanking the console on leaving,
+  `NO_COLOR`, and leaving once the terminal hangs up, since crossterm
+  reads a hung-up terminal forever. Tested: thirteen unit tests over the
+  rendered screen and the keys (each tab's rows, details and YAML,
+  filters, each request and question, container choice, the log,
+  permissions, Secrets' values never kept); `--once` against a manager
+  holding one of each kind.
 - **From a second review.** A route could name any Secret of its
   namespace for HTTPS, and every node could then read it: a route's
   Secret is now handed out only if it holds a PEM certificate and key.
