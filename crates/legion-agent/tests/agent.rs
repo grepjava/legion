@@ -976,7 +976,8 @@ async fn a_pod_left_before_its_containers_started_starts_over() {
         h.rt.created() == created + 2 && h.running().len() == 2
     })
     .await;
-    assert_eq!(h.status(&key).state, TaskState::Running);
+    // Reported running once its containers are, a moment after.
+    h.wait_state(&key, TaskState::Running).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

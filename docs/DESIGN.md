@@ -480,9 +480,16 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   older than what it holds; a broken watch lists again. Usage comes from
   `Cluster.Usage`, which the leader answers from the heartbeats' reports
   (a follower forwards it), keeping the tasks of namespaces the caller
-  may read. Enter on a node, service or Job lists its tasks. It only
-  reads: a user sees what their role bindings let them, and kinds they
-  may not list say so. `--once` prints the views as text and exits.
+  may read. Enter on a node, service or Job lists its tasks. Keys act on
+  the selected row through the same calls as the CLI: `d` drains a node
+  (asked first), `p` pauses and `a` activates it; `s` scales a
+  replicated or stateful service without autoscale (the number typed),
+  `r` rolls it back (asked first); `l` follows a task's, service's or
+  Job's logs and `x` opens a shell in a task, both by running the CLI
+  itself, which has the terminal until it ends (Ctrl-C ends the logs,
+  not `top`). A user sees and may do what their role bindings let them;
+  kinds they may not list say so, and a refused request says why.
+  `--once` prints the views as text and exits.
 
 ## 4. Feature set
 

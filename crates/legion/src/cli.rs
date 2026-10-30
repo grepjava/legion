@@ -46,11 +46,15 @@ where
 /// Applying again is harmless; a delete that went through before its
 /// answer was lost finds nothing the second time, which counts as done.
 #[derive(Clone)]
-struct Objects(ObjectsClient<Channel>);
+pub(crate) struct Objects(ObjectsClient<Channel>);
 
 type Answer<T> = Result<tonic::Response<T>, tonic::Status>;
 
 impl Objects {
+    pub(crate) fn new(channel: Channel) -> Self {
+        Objects(ObjectsClient::new(channel))
+    }
+
     async fn apply(&mut self, req: ApplyRequest) -> Answer<pb::ApplyResponse> {
         let client = &self.0;
         retrying(|| {
@@ -64,7 +68,7 @@ impl Objects {
     /// read: another write meanwhile (a node's heartbeat, a Volume's
     /// migration) has it read again. Returns the object's key, and whether
     /// the field changed.
-    async fn set_spec(
+    pub(crate) async fn set_spec(
         &mut self,
         r#ref: ObjectRef,
         field: &str,
@@ -471,57 +475,19 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             }
         }
         Command::Rollback { service, namespace } => {
-            let r#ref = ObjectRef {
-                kind: Kind::Service.to_string(),
-                namespace: namespace.unwrap_or_default(),
-                name: service,
-            };
-            // The generation the rollback undoes the latest update of.
-            let mut generation = None;
-            loop {
-                let current = objects.get(r#ref.clone()).await?.into_inner();
-                let mut object = Object::try_from(current)?;
-                if generation.is_some_and(|g| g != object.metadata.generation) {
-                    bail!("{} changed meanwhile; nothing rolled back", object.key());
-                }
-                generation = Some(object.metadata.generation);
-                let status: ServiceStatus =
-                    serde_json::from_value(object.status.clone()).unwrap_or_default();
-                let Some(update) = status.update else {
-                    bail!("{} has had no update to roll back", object.key());
-                };
-                if serde_json::to_value(&update.previous)? == object.spec {
-                    bail!(
-                        "{} already runs the spec before its latest update",
-                        object.key()
-                    );
-                }
-                object.spec = serde_json::to_value(&update.previous)?;
-                // Only over the spec just read: a newer change wins. The
-                // controllers write the status meanwhile, which moves the
-                // version too; then it is read again.
-                let resp = match objects
-                    .apply(ApplyRequest {
-                        object: Some((&object).into()),
-                        expected_version: Some(object.metadata.version),
-                        ..Default::default()
-                    })
-                    .await
-                {
-                    Ok(resp) => resp.into_inner(),
-                    Err(s) if s.code() == tonic::Code::Aborted => continue,
-                    Err(s) => return Err(s.into()),
-                };
-                println!(
-                    "{} rolling back (version {})",
-                    object.key(),
-                    resp.object.unwrap_or_default().version
-                );
-                break;
-            }
+            println!(
+                "{}",
+                rollback(&mut objects, namespace.unwrap_or_default(), service).await?
+            );
         }
         Command::Top { namespace, once } if once => crate::top::once(channel, namespace).await?,
-        Command::Top { namespace, .. } => crate::top::run(channel, namespace).await?,
+        Command::Top { namespace, .. } => {
+            let cli = crate::top::Cli {
+                server: server.to_owned(),
+                identity: identity.to_owned(),
+            };
+            crate::top::run(channel, cli, namespace).await?
+        }
         Command::Watch { kind, from } => {
             let kind = kind.as_deref().map(parse_kind).transpose()?;
             let from_version = match from {
@@ -559,6 +525,62 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
         }
     }
     Ok(())
+}
+
+/// Rolls a service back to the spec its latest update came from; what
+/// happened, for people.
+pub(crate) async fn rollback(
+    objects: &mut Objects,
+    namespace: String,
+    service: String,
+) -> anyhow::Result<String> {
+    let r#ref = ObjectRef {
+        kind: Kind::Service.to_string(),
+        namespace,
+        name: service,
+    };
+    // The generation the rollback undoes the latest update of.
+    let mut generation = None;
+    loop {
+        let current = objects.get(r#ref.clone()).await?.into_inner();
+        let mut object = Object::try_from(current)?;
+        if generation.is_some_and(|g| g != object.metadata.generation) {
+            bail!("{} changed meanwhile; nothing rolled back", object.key());
+        }
+        generation = Some(object.metadata.generation);
+        let status: ServiceStatus =
+            serde_json::from_value(object.status.clone()).unwrap_or_default();
+        let Some(update) = status.update else {
+            bail!("{} has had no update to roll back", object.key());
+        };
+        if serde_json::to_value(&update.previous)? == object.spec {
+            bail!(
+                "{} already runs the spec before its latest update",
+                object.key()
+            );
+        }
+        object.spec = serde_json::to_value(&update.previous)?;
+        // Only over the spec just read: a newer change wins. The
+        // controllers write the status meanwhile, which moves the
+        // version too; then it is read again.
+        let resp = match objects
+            .apply(ApplyRequest {
+                object: Some((&object).into()),
+                expected_version: Some(object.metadata.version),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(resp) => resp.into_inner(),
+            Err(s) if s.code() == tonic::Code::Aborted => continue,
+            Err(s) => return Err(s.into()),
+        };
+        return Ok(format!(
+            "{} rolling back (version {})",
+            object.key(),
+            resp.object.unwrap_or_default().version
+        ));
+    }
 }
 
 async fn apply(objects: &mut Objects, object: &Object) -> anyhow::Result<()> {

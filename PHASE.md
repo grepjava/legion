@@ -1162,8 +1162,12 @@ real, in the order agreed with the user.
   JavaScript build). `legion top` shows nodes, services and Jobs, tasks
   with their use, and a log of changes, live from a list and a watch;
   Enter lists a node's or a service's tasks, `h` adds ended tasks, `--once`
-  prints it as text. It only reads so far: actions (drain, pause, scale,
-  roll back, logs, exec) come next. Usage comes from a new
+  prints it as text. Keys act on the selected row: drain (asked first),
+  pause or activate a node, scale or roll back (asked first) a service,
+  follow logs or open a shell, the last two by running the CLI itself
+  with the terminal, since `exec` leaves a stdin reader behind that would
+  take the keys; the key reader pauses meanwhile and Ctrl-C reaches only
+  the command. Usage comes from a new
   `Cluster.Usage` call, answered by the leader and filtered to what the
   caller may read. `packaging/grafana/legion.json` is a dashboard of the
   metrics: leader, nodes and tasks by state, services short of ready
@@ -1172,9 +1176,12 @@ real, in the order agreed with the user.
   test backend); an API test of `Usage` (an admin sees every task, a
   user only their namespaces, and is refused another's), which fails
   without the filter; a test that the dashboard names only exported
-  metrics; `top --once` against a manager on Windows, and the full
-  screen in a pty on FreeBSD 15.1. The port's `Makefile.crates` needs
-  regenerating for ratatui at the next release.
+  metrics; unit tests of the keys (each request, the questions, scaling
+  only what may be scaled); `top --once` against a manager on Windows;
+  on FreeBSD 15.1 in a pty, keys typed into `top` scaled a service to 3
+  and ran its logs, whose error waited for Enter before `top` came back.
+  The port's `Makefile.crates` needs regenerating for ratatui at the
+  next release.
 - **From a second review.** A route could name any Secret of its
   namespace for HTTPS, and every node could then read it: a route's
   Secret is now handed out only if it holds a PEM certificate and key.

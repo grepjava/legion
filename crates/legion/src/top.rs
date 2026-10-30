@@ -1,9 +1,15 @@
 //! `legion top`: the cluster, live, in the terminal. It lists nodes,
 //! services, Jobs and tasks, then follows a watch to keep them current;
 //! asks the leader every few seconds what tasks use; and keeps a log of
-//! what changed while it ran. It changes nothing in the cluster.
+//! what changed while it ran. Keys act on the selected row: drain, pause
+//! or activate a node; scale or roll back a service; follow a task's or
+//! service's logs, or open a shell in a task, through the CLI itself,
+//! which has the terminal until it ends.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use legion_api::job::{JobState, JobStatus, LABEL_JOB};
@@ -13,7 +19,9 @@ use legion_api::task::{TaskState, TaskStatus};
 use legion_api::{Kind, Object};
 use legion_proto::v1::cluster_client::ClusterClient;
 use legion_proto::v1::objects_client::ObjectsClient;
-use legion_proto::v1::{self as pb, ListRequest, StatusRequest, WatchRequest, watch_event};
+use legion_proto::v1::{
+    self as pb, ListRequest, ObjectRef, StatusRequest, WatchRequest, watch_event,
+};
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
@@ -302,6 +310,76 @@ enum Focus {
     Owner(Kind, String, String),
 }
 
+/// What a row stands for, to act on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Subject {
+    Node(String),
+    Service {
+        namespace: String,
+        name: String,
+        /// Replicated or stateful, without autoscale: its replicas are
+        /// the person's to set.
+        scalable: bool,
+    },
+    Job(String, String),
+    Task(String, String),
+}
+
+impl Subject {
+    /// The tasks Enter lists.
+    fn focus(&self) -> Option<Focus> {
+        match self {
+            Subject::Node(n) => Some(Focus::Node(n.clone())),
+            Subject::Service {
+                namespace, name, ..
+            } => Some(Focus::Owner(Kind::Service, namespace.clone(), name.clone())),
+            Subject::Job(ns, name) => Some(Focus::Owner(Kind::Job, ns.clone(), name.clone())),
+            Subject::Task(..) => None,
+        }
+    }
+}
+
+/// What the person asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Request {
+    /// `drain`, `pause` or `active`.
+    Availability {
+        node: String,
+        to: &'static str,
+    },
+    Scale {
+        namespace: String,
+        service: String,
+        replicas: u32,
+    },
+    Rollback {
+        namespace: String,
+        service: String,
+    },
+    /// Of a task, or a service's or Job's (the CLI picks a task).
+    Logs {
+        namespace: String,
+        name: String,
+    },
+    Exec {
+        namespace: String,
+        task: String,
+    },
+}
+
+/// A question on the bottom line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Prompt {
+    /// Asked first: `y` does it.
+    Confirm(Request, String),
+    /// The replicas being typed.
+    Scale {
+        namespace: String,
+        service: String,
+        input: String,
+    },
+}
+
 /// What the person looks at.
 pub struct View {
     tab: Tab,
@@ -310,6 +388,9 @@ pub struct View {
     focus: Option<Focus>,
     /// Tasks that ended are listed too.
     history: bool,
+    prompt: Option<Prompt>,
+    /// What came of the last request, or why it was not made.
+    notice: Option<String>,
     quit: bool,
 }
 
@@ -320,6 +401,8 @@ impl Default for View {
             selected: [0; 4],
             focus: None,
             history: false,
+            prompt: None,
+            notice: None,
             quit: false,
         }
     }
@@ -334,7 +417,22 @@ impl View {
         self.tab = tab;
     }
 
-    pub fn key(&mut self, model: &Model, k: KeyEvent) {
+    /// What a key does, and the request it makes, if any.
+    pub fn key(&mut self, model: &Model, k: KeyEvent) -> Option<Request> {
+        if let Some(prompt) = self.prompt.take() {
+            return self.answer(prompt, k);
+        }
+        self.notice = None;
+        let subject = rows(model, self)
+            .into_iter()
+            .nth(self.selected[self.index()])
+            .and_then(|r| r.subject);
+        if let KeyCode::Char(c) = k.code
+            && !k.modifiers.contains(KeyModifiers::CONTROL)
+            && let Some(request) = self.act(c, subject)
+        {
+            return Some(request);
+        }
         let count = rows(model, self).len();
         let i = self.index();
         let sel = &mut self.selected[i];
@@ -358,10 +456,10 @@ impl View {
             KeyCode::Char('h') => self.history = !self.history,
             KeyCode::Enter => {
                 let at = *sel;
-                let focus = match (self.tab, rows(model, self).get(at)) {
-                    (Tab::Nodes | Tab::Workloads, Some(r)) => r.focus.clone(),
-                    _ => None,
-                };
+                let focus = rows(model, self)
+                    .get(at)
+                    .and_then(|r| r.subject.as_ref())
+                    .and_then(Subject::focus);
                 if let Some(focus) = focus {
                     self.focus = Some(focus);
                     self.selected[TABS.iter().position(|t| *t == Tab::Tasks).unwrap()] = 0;
@@ -370,14 +468,128 @@ impl View {
             }
             _ => {}
         }
+        None
+    }
+
+    /// A letter acting on the selected row: a request, a question first,
+    /// or why not.
+    fn act(&mut self, c: char, subject: Option<Subject>) -> Option<Request> {
+        let subject = subject?;
+        match (c, subject) {
+            ('d', Subject::Node(node)) => {
+                let ask = format!("Drain node {node}? Its tasks move to other nodes. y/n");
+                self.prompt = Some(Prompt::Confirm(
+                    Request::Availability { node, to: "drain" },
+                    ask,
+                ));
+                None
+            }
+            ('p', Subject::Node(node)) => Some(Request::Availability { node, to: "pause" }),
+            ('a', Subject::Node(node)) => Some(Request::Availability { node, to: "active" }),
+            (
+                's',
+                Subject::Service {
+                    namespace,
+                    name,
+                    scalable,
+                },
+            ) => {
+                if scalable {
+                    self.prompt = Some(Prompt::Scale {
+                        namespace,
+                        service: name,
+                        input: String::new(),
+                    });
+                } else {
+                    self.notice = Some(format!(
+                        "{namespace}/{name} is global or autoscaled: its spec decides its tasks"
+                    ));
+                }
+                None
+            }
+            (
+                'r',
+                Subject::Service {
+                    namespace, name, ..
+                },
+            ) => {
+                let ask = format!(
+                    "Roll service {namespace}/{name} back to the spec before its latest update? y/n"
+                );
+                self.prompt = Some(Prompt::Confirm(
+                    Request::Rollback {
+                        namespace,
+                        service: name,
+                    },
+                    ask,
+                ));
+                None
+            }
+            (
+                'l',
+                Subject::Task(namespace, name)
+                | Subject::Job(namespace, name)
+                | Subject::Service {
+                    namespace, name, ..
+                },
+            ) => Some(Request::Logs { namespace, name }),
+            ('x', Subject::Task(namespace, task)) => Some(Request::Exec { namespace, task }),
+            _ => None,
+        }
+    }
+
+    fn answer(&mut self, prompt: Prompt, k: KeyEvent) -> Option<Request> {
+        match prompt {
+            Prompt::Confirm(request, _) if k.code == KeyCode::Char('y') => Some(request),
+            Prompt::Confirm(..) => {
+                self.notice = Some("Cancelled.".into());
+                None
+            }
+            Prompt::Scale {
+                namespace,
+                service,
+                mut input,
+            } => {
+                match k.code {
+                    KeyCode::Char(c) if c.is_ascii_digit() && input.len() < 6 => input.push(c),
+                    KeyCode::Backspace => {
+                        input.pop();
+                    }
+                    KeyCode::Enter => {
+                        return match input.parse() {
+                            Ok(replicas) => Some(Request::Scale {
+                                namespace,
+                                service,
+                                replicas,
+                            }),
+                            Err(_) => {
+                                self.notice = Some("Cancelled: no number given.".into());
+                                None
+                            }
+                        };
+                    }
+                    KeyCode::Esc => {
+                        self.notice = Some("Cancelled.".into());
+                        return None;
+                    }
+                    _ => {}
+                }
+                self.prompt = Some(Prompt::Scale {
+                    namespace,
+                    service,
+                    input,
+                });
+                None
+            }
+        }
     }
 }
 
-/// A row of a table, and the tasks it stands for.
+/// A row of a table, and what it stands for.
 struct TableRow {
     cells: Vec<String>,
     style: Style,
-    focus: Option<Focus>,
+    subject: Option<Subject>,
 }
 
 fn rows(model: &Model, view: &View) -> Vec<TableRow> {
@@ -391,7 +603,7 @@ fn rows(model: &Model, view: &View) -> Vec<TableRow> {
             .map(|(at, what)| TableRow {
                 cells: vec![time_of_day(*at), what.clone()],
                 style: Style::default(),
-                focus: None,
+                subject: None,
             })
             .collect(),
     }
@@ -473,7 +685,7 @@ fn node_rows(model: &Model) -> Vec<TableRow> {
                     labels.join(","),
                 ],
                 style,
-                focus: Some(Focus::Node(name)),
+                subject: Some(Subject::Node(name)),
             }
         })
         .collect()
@@ -507,11 +719,13 @@ fn workload_rows(model: &Model) -> Vec<TableRow> {
         } else {
             Style::default()
         };
+        let mode = s.spec["mode"].as_str().unwrap_or("replicated").to_owned();
+        let scalable = mode != "global" && s.spec["autoscale"].is_null();
         TableRow {
             cells: vec![
                 s.metadata.namespace.clone(),
                 s.metadata.name.clone(),
-                s.spec["mode"].as_str().unwrap_or("replicated").to_owned(),
+                mode,
                 format!("{}/{}", st.ready, st.desired),
                 state,
                 used.map_or(String::new(), |(c, _)| format!("{c:.0}%")),
@@ -519,11 +733,11 @@ fn workload_rows(model: &Model) -> Vec<TableRow> {
                 images(s),
             ],
             style,
-            focus: Some(Focus::Owner(
-                Kind::Service,
-                s.metadata.namespace.clone(),
-                s.metadata.name.clone(),
-            )),
+            subject: Some(Subject::Service {
+                namespace: s.metadata.namespace.clone(),
+                name: s.metadata.name.clone(),
+                scalable,
+            }),
         }
     });
     let jobs = model.of(Kind::Job).map(|j| {
@@ -550,8 +764,7 @@ fn workload_rows(model: &Model) -> Vec<TableRow> {
                 images(j),
             ],
             style,
-            focus: Some(Focus::Owner(
-                Kind::Job,
+            subject: Some(Subject::Job(
                 j.metadata.namespace.clone(),
                 j.metadata.name.clone(),
             )),
@@ -612,7 +825,10 @@ fn task_rows(model: &Model, view: &View) -> Vec<TableRow> {
                         st.message,
                     ],
                     style,
-                    focus: None,
+                    subject: Some(Subject::Task(
+                        t.metadata.namespace.clone(),
+                        t.metadata.name.clone(),
+                    )),
                 },
             ))
         })
@@ -711,9 +927,36 @@ pub fn render(f: &mut Frame, model: &Model, view: &View) {
         f.render_stateful_widget(table, body, &mut state);
     }
 
-    let mut help = vec![Span::raw(
-        "q quit  ←→ tabs  ↑↓ select  Enter tasks of  h ended tasks",
-    )];
+    f.render_widget(Paragraph::new(bottom_line(view)), bottom);
+}
+
+/// A question, else what came of the last request, else the keys.
+fn bottom_line(view: &View) -> Line<'static> {
+    match &view.prompt {
+        Some(Prompt::Confirm(_, ask)) => return Line::from(ask.clone()).yellow().bold(),
+        Some(Prompt::Scale {
+            namespace,
+            service,
+            input,
+        }) => {
+            return Line::from(format!(
+                "Replicas for {namespace}/{service}: {input}_  (Enter sets, Esc cancels)"
+            ))
+            .yellow()
+            .bold();
+        }
+        None => {}
+    }
+    if let Some(notice) = &view.notice {
+        return Line::from(notice.clone()).bold();
+    }
+    let keys = match view.tab {
+        Tab::Nodes => "q quit  ←→ tabs  ↑↓ select  Enter tasks  d drain  p pause  a activate",
+        Tab::Workloads => "q quit  ←→ tabs  ↑↓ select  Enter tasks  s scale  r roll back  l logs",
+        Tab::Tasks => "q quit  ←→ tabs  ↑↓ select  l logs  x shell  h ended tasks",
+        Tab::Log => "q quit  ←→ tabs  ↑↓ select",
+    };
+    let mut help = vec![Span::raw(keys)];
     if let Some(focus) = &view.focus {
         let of = match focus {
             Focus::Node(n) => format!("node {n}"),
@@ -723,7 +966,7 @@ pub fn render(f: &mut Frame, model: &Model, view: &View) {
         };
         help.push(Span::raw(format!("  Esc all tasks  — tasks of {of}")).bold());
     }
-    f.render_widget(Paragraph::new(Line::from(help)), bottom);
+    Line::from(help)
 }
 
 /// The top line: the managers, nodes and tasks at a glance, or why it is
@@ -768,29 +1011,53 @@ enum Msg {
     Status(pb::StatusResponse),
     Problem(String),
     Key(KeyEvent),
+    /// What came of a request.
+    Done(String),
     Redraw,
 }
 
+/// How to run the CLI again, for logs and shells.
+pub struct Cli {
+    pub server: String,
+    pub identity: PathBuf,
+}
+
 /// Runs until the person quits.
-pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<()> {
+pub async fn run(channel: Channel, cli: Cli, namespace: Option<String>) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let follower = tokio::spawn(follow(channel.clone(), namespace.clone(), tx.clone()));
-    let poller = tokio::spawn(poll(channel, namespace.clone(), tx.clone()));
-    // Reading keys blocks; the thread ends with the process.
+    let poller = tokio::spawn(poll(channel.clone(), namespace.clone(), tx.clone()));
+    // Ctrl-C reaches a logs or shell run from here as well as this
+    // process, which stays.
+    tokio::spawn(async { while tokio::signal::ctrl_c().await.is_ok() {} });
+    // Reads keys, except while a command run from here has the terminal.
+    let paused = Arc::new(AtomicBool::new(false));
+    let keys = tx.clone();
+    let reading = paused.clone();
     std::thread::spawn(move || {
         loop {
+            if reading.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            match event::poll(Duration::from_millis(100)) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => return,
+            }
             let msg = match event::read() {
                 Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => Msg::Key(k),
                 Ok(Event::Resize(..)) => Msg::Redraw,
                 Ok(_) => continue,
                 Err(_) => return,
             };
-            if tx.send(msg).is_err() {
+            if keys.send(msg).is_err() {
                 return;
             }
         }
     });
 
+    let objects = crate::cli::Objects::new(channel);
     let mut model = Model::new(namespace);
     let mut view = View::default();
     let mut terminal = ratatui::init();
@@ -802,6 +1069,7 @@ pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<
             break Ok(());
         };
         let mut next = Some(msg);
+        let mut requests = Vec::new();
         while let Some(msg) = next {
             match msg {
                 Msg::Listed(objects, hidden) => model.listed(objects, hidden),
@@ -809,10 +1077,27 @@ pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<
                 Msg::Usage(u) => model.usage(u),
                 Msg::Status(s) => model.cluster = Some(s),
                 Msg::Problem(p) => model.problem = Some(p),
-                Msg::Key(k) => view.key(&model, k),
+                Msg::Key(k) => requests.extend(view.key(&model, k)),
+                Msg::Done(what) => view.notice = Some(what),
                 Msg::Redraw => {}
             }
             next = rx.try_recv().ok();
+        }
+        for request in requests {
+            if let Some(args) = command(&request) {
+                paused.store(true, Ordering::SeqCst);
+                // A poll under way ends first.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                ratatui::restore();
+                view.notice = Some(hand_over(&cli, args).await);
+                terminal = ratatui::init();
+                paused.store(false, Ordering::SeqCst);
+            } else {
+                let (objects, tx) = (objects.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let _ = tx.send(Msg::Done(act(objects, request).await));
+                });
+            }
         }
         if view.quit {
             break Ok(());
@@ -822,6 +1107,112 @@ pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<
     follower.abort();
     poller.abort();
     result
+}
+
+/// The CLI's arguments for a request it runs itself, with what to tell
+/// the person first.
+fn command(request: &Request) -> Option<(String, Vec<String>)> {
+    let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect();
+    match request {
+        Request::Logs { namespace, name } => Some((
+            format!("Logs of {namespace}/{name}; Ctrl-C returns to legion top."),
+            args(&["logs", "-f", "--tail", "200", "-n", namespace, name]),
+        )),
+        Request::Exec { namespace, task } => Some((
+            format!("A shell in {namespace}/{task}; exit returns to legion top."),
+            args(&["exec", "-it", "-n", namespace, task, "--", "/bin/sh"]),
+        )),
+        _ => None,
+    }
+}
+
+/// Runs the CLI with the terminal until it ends; what came of it.
+async fn hand_over(cli: &Cli, (banner, args): (String, Vec<String>)) -> String {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => return format!("Cannot run legion again: {e}"),
+    };
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("--server")
+        .arg(&cli.server)
+        .arg("--identity")
+        .arg(&cli.identity)
+        .args(&args);
+    println!("{banner}");
+    let done = tokio::task::spawn_blocking(move || {
+        let status = command.status();
+        // An error stays on the screen until read.
+        if status
+            .as_ref()
+            .is_ok_and(|s| s.code().is_some_and(|c| c != 0))
+        {
+            println!("[Enter returns to legion top]");
+            let _ = std::io::stdin().read_line(&mut String::new());
+        }
+        status
+    })
+    .await;
+    match done {
+        Ok(Ok(s)) if s.success() => "Back from it.".into(),
+        Ok(Ok(s)) => match s.code() {
+            Some(code) => format!("It ended with {code}."),
+            None => "Back from it.".into(),
+        },
+        Ok(Err(e)) => format!("Cannot run legion again: {e}"),
+        Err(e) => format!("Cannot run legion again: {e}"),
+    }
+}
+
+/// Makes a request over the API; what came of it, for people.
+async fn act(mut objects: crate::cli::Objects, request: Request) -> String {
+    let result = match request {
+        Request::Availability { node, to } => objects
+            .set_spec(
+                ObjectRef {
+                    kind: Kind::Node.to_string(),
+                    namespace: String::new(),
+                    name: node,
+                },
+                "availability",
+                to.into(),
+            )
+            .await
+            .map(|(key, changed)| {
+                if changed {
+                    format!("{key} {to}")
+                } else {
+                    format!("{key} is already {to}")
+                }
+            }),
+        Request::Scale {
+            namespace,
+            service,
+            replicas,
+        } => objects
+            .set_spec(
+                ObjectRef {
+                    kind: Kind::Service.to_string(),
+                    namespace,
+                    name: service,
+                },
+                "replicas",
+                replicas.into(),
+            )
+            .await
+            .map(|(key, changed)| {
+                if changed {
+                    format!("{key} scaled to {replicas}")
+                } else {
+                    format!("{key} already has {replicas}")
+                }
+            }),
+        Request::Rollback { namespace, service } => {
+            crate::cli::rollback(&mut objects, namespace, service).await
+        }
+        Request::Logs { .. } | Request::Exec { .. } => unreachable!("run by the CLI"),
+    };
+    result.unwrap_or_else(|e| format!("Failed: {e:#}"))
 }
 
 /// Lists, then follows the watch; again from the start when it breaks.
@@ -961,9 +1352,11 @@ fn text(model: &Model, view: &View, width: u16) -> String {
     let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
         .expect("a test backend");
     let plain = View {
+        tab: view.tab,
         selected: [usize::MAX; 4],
         focus: view.focus.clone(),
-        ..*view
+        history: view.history,
+        ..View::default()
     };
     t.draw(|f| render(f, model, &plain)).expect("drawn");
     let buf = t.backend().buffer();
@@ -1080,8 +1473,115 @@ mod tests {
         l.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
-    fn press(view: &mut View, model: &Model, code: KeyCode) {
-        view.key(model, KeyEvent::new(code, KeyModifiers::NONE));
+    fn press(view: &mut View, model: &Model, code: KeyCode) -> Option<Request> {
+        view.key(model, KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn typed(view: &mut View, model: &Model, keys: &str) -> Option<Request> {
+        let mut last = None;
+        for c in keys.chars() {
+            let code = match c {
+                '\n' => KeyCode::Enter,
+                '\x1b' => KeyCode::Esc,
+                c => KeyCode::Char(c),
+            };
+            last = press(view, model, code);
+        }
+        last
+    }
+
+    #[test]
+    fn keys_act_on_the_selected_row() {
+        let m = cluster();
+        let mut v = View::default();
+        // A drain is asked first; anything but y cancels.
+        assert_eq!(typed(&mut v, &m, "d"), None);
+        assert!(screen(&m, &v).contains("Drain node n1? Its tasks move"));
+        assert_eq!(typed(&mut v, &m, "n"), None);
+        assert!(screen(&m, &v).contains("Cancelled."));
+        let drain = Request::Availability {
+            node: "n1".into(),
+            to: "drain",
+        };
+        assert_eq!(typed(&mut v, &m, "dy"), Some(drain));
+        assert_eq!(
+            typed(&mut v, &m, "jp"),
+            Some(Request::Availability {
+                node: "n2".into(),
+                to: "pause"
+            })
+        );
+        assert_eq!(
+            typed(&mut v, &m, "a"),
+            Some(Request::Availability {
+                node: "n2".into(),
+                to: "active"
+            })
+        );
+        // Letters for other rows do nothing here.
+        assert_eq!(typed(&mut v, &m, "sx"), None);
+
+        // Scaling takes a number.
+        let mut v = View::default();
+        assert_eq!(typed(&mut v, &m, "2s1"), None);
+        assert!(screen(&m, &v).contains("Replicas for shop/web: 1_"));
+        assert_eq!(
+            typed(&mut v, &m, "x2\n"),
+            Some(Request::Scale {
+                namespace: "shop".into(),
+                service: "web".into(),
+                replicas: 12
+            })
+        );
+        assert_eq!(typed(&mut v, &m, "s5\x1b"), None);
+        assert!(screen(&m, &v).contains("Cancelled."));
+        assert_eq!(
+            typed(&mut v, &m, "ry"),
+            Some(Request::Rollback {
+                namespace: "shop".into(),
+                service: "web".into()
+            })
+        );
+        assert_eq!(
+            typed(&mut v, &m, "l"),
+            Some(Request::Logs {
+                namespace: "shop".into(),
+                name: "web".into()
+            })
+        );
+
+        // A task's logs, and a shell in it.
+        let mut v = View::default();
+        assert_eq!(
+            typed(&mut v, &m, "3jx"),
+            Some(Request::Exec {
+                namespace: "shop".into(),
+                task: "web-2-1".into()
+            })
+        );
+        assert!(screen(&m, &v).contains("l logs  x shell"));
+        let logs = typed(&mut v, &m, "l").unwrap();
+        let (banner, args) = command(&logs).unwrap();
+        assert!(banner.starts_with("Logs of shop/web-2-1"));
+        assert_eq!(args.join(" "), "logs -f --tail 200 -n shop web-2-1");
+    }
+
+    #[test]
+    fn global_and_autoscaled_services_are_not_scaled_here() {
+        let mut m = cluster();
+        let mut global = service(20, 1, 1);
+        global.spec["mode"] = "global".into();
+        m.changed(true, global, 0);
+        let mut v = View::default();
+        assert_eq!(typed(&mut v, &m, "2s"), None);
+        assert!(
+            screen(&m, &v).contains("shop/web is global or autoscaled"),
+            "{}",
+            screen(&m, &v)
+        );
+        // The next key clears it.
+        typed(&mut v, &m, "j");
+        assert!(screen(&m, &v).contains("s scale  r roll back"));
     }
 
     fn cluster() -> Model {

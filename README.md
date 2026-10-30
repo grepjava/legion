@@ -63,8 +63,9 @@ legion top
 ```
 
 `legion top` shows the cluster live in the terminal: nodes, services and
-Jobs, tasks, what they use, and what changes (`legion top --once` prints
-it as text). For dashboards, Prometheus can scrape each daemon's
+Jobs, tasks, what they use, and what changes; keys drain or pause nodes,
+scale or roll back services, and follow logs or open a shell in a task
+(`legion top --once` prints it as text). For dashboards, Prometheus can scrape each daemon's
 `--metrics-listen` endpoint; [packaging/grafana](packaging/grafana) has a
 Grafana dashboard for it.
 
