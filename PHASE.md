@@ -1091,6 +1091,32 @@ real, in the order agreed with the user.
   on the host after the group emptied is never touched) until none of it
   is left, killing what outlasts the grace. The live test's third case
   (`(trap '' HUP; exec sleep 305) & wait`) fails on the code before.
+- **From a fifth review.** Five faults, each confirmed first. An agent
+  gone between creating a container and starting it left a pod the next
+  agent adopted, taking the never-started container for one that had
+  exited with 0, so a Job completed without running: a container only
+  created makes the pod incomplete, and it is made again. An agent gone
+  after starting a pod but before reporting it left the task `starting`
+  for good, since an adopted pod was only reported when its readiness
+  changed: an adopted pod is now reported running unless it has ended
+  (a refused one is neither reported nor has its exits acted on). The
+  jail runtime told one run's exit from the next by its start, to the
+  second, so a container restarted and exited again between two looks
+  within a second gave no event (the resync caught it, up to 30 s on):
+  runs are now told apart whole (jail, shim and process ids). An exec's
+  input writer, waiting on a process that read nothing, outlived the
+  session and held its terminal open: it goes with the session. Releasing
+  an iSCSI volume logged out of its target even while another volume
+  here used another LUN of it: the target is logged out of once no volume
+  here is on it. Ordinals drained off one node all went to the same
+  node, since the choice counted placed tasks only: ordinals moving,
+  already or in the same pass, count where they go. Tested: agent tests
+  (a container put back to created while the agent is down; a status put
+  back to `starting`; an exec writing 64 KiB to a process not reading;
+  two volumes on LUNs 0 and 1 of one target), a planner test (two
+  ordinals drained from one node to two), a unit test of the exit
+  comparison; each fails with its fix taken out. The live jail tests
+  pass on FreeBSD 15.1.
 - **From a second review.** A route could name any Secret of its
   namespace for HTTPS, and every node could then read it: a route's
   Secret is now handed out only if it holds a PEM certificate and key.

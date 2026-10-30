@@ -255,10 +255,12 @@ async fn attached_exec<R: Runtime>(
             Ok(())
         })
     };
-    // Input to the process: `None` closes its stdin.
+    // Input to the process: `None` closes its stdin. The writer goes when
+    // the session does, even while a write waits on a process not reading.
     let (input, mut input_rx) = mpsc::channel::<Option<Bytes>>(16);
+    let mut writer = tokio::task::JoinSet::new();
     if let Some(mut stdin) = attached.stdin {
-        tokio::spawn(async move {
+        writer.spawn(async move {
             while let Some(data) = input_rx.recv().await {
                 let Some(data) = data else {
                     let _ = stdin.shutdown().await;

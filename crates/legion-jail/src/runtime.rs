@@ -499,22 +499,19 @@ fn status(
 
 /// Sends `died` when a container that was not over is.
 async fn watch_exits(sys: Arc<dyn Sys>, dir: PathBuf, boot: u64, events: broadcast::Sender<Event>) {
-    let mut seen: BTreeMap<String, (Status, Option<u64>)> = BTreeMap::new();
+    let mut seen: BTreeMap<String, (Status, Option<Run>)> = BTreeMap::new();
     let mut first = true;
     loop {
         let dir2 = dir.clone();
         let sys2 = sys.clone();
         let now =
-            tokio::task::spawn_blocking(move || -> Result<Vec<(Record, Status, Option<u64>)>> {
+            tokio::task::spawn_blocking(move || -> Result<Vec<(Record, Status, Option<Run>)>> {
                 let jails = jail_names(&*sys2)?;
                 let mut out = Vec::new();
                 for rec in records(&dir2)? {
                     let s = status(&dir2, &rec, boot, &jails)?;
-                    let started = state::read::<Run>(&dir2.join(&rec.id), RUN)
-                        .ok()
-                        .flatten()
-                        .map(|r| r.started);
-                    out.push((rec, s, started));
+                    let run = state::read::<Run>(&dir2.join(&rec.id), RUN).ok().flatten();
+                    out.push((rec, s, run));
                 }
                 Ok(out)
             })
@@ -522,16 +519,17 @@ async fn watch_exits(sys: Arc<dyn Sys>, dir: PathBuf, boot: u64, events: broadca
         match now {
             Ok(Ok(now)) => {
                 let mut next = BTreeMap::new();
-                for (rec, s, started) in now {
-                    if let Status::Exited(exit) = &s {
-                        let changed = seen.get(&rec.id).is_none_or(|(old, at)| {
-                            !matches!(old, Status::Exited(_)) || *at != started
-                        });
-                        if !first && changed && seen.contains_key(&rec.id) {
-                            let _ = events.send(died(&rec, exit.code));
-                        }
+                for (rec, s, run) in now {
+                    let now = (s, run);
+                    if let Status::Exited(exit) = &now.0
+                        && !first
+                        && seen
+                            .get(&rec.id)
+                            .is_some_and(|before| exited_since(before, &now))
+                    {
+                        let _ = events.send(died(&rec, exit.code));
                     }
-                    next.insert(rec.id.clone(), (s, started));
+                    next.insert(rec.id.clone(), now);
                 }
                 seen = next;
                 first = false;
@@ -541,6 +539,15 @@ async fn watch_exits(sys: Arc<dyn Sys>, dir: PathBuf, boot: u64, events: broadca
         }
         tokio::time::sleep(TICK).await;
     }
+}
+
+/// Whether a container seen as `before` has exited since: it ran then, or
+/// its exit is another run's. A run is told by its jail and processes, not
+/// its start, which is to the second: a run and its restart may both end
+/// between two looks.
+fn exited_since(before: &(Status, Option<Run>), now: &(Status, Option<Run>)) -> bool {
+    matches!(now.0, Status::Exited(_))
+        && (!matches!(before.0, Status::Exited(_)) || before.1 != now.1)
 }
 
 /// Removes images no container or task has used for [`UNUSED_FOR`], then
@@ -1502,6 +1509,33 @@ fn pty() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exits_are_told_apart_by_their_run() {
+        let run = |jid| {
+            Some(Run {
+                shim: 10 + jid,
+                pid: 20 + jid,
+                jid,
+                started: 1000,
+                boot: 1,
+            })
+        };
+        let exited = |code| {
+            Status::Exited(Exit {
+                code,
+                finished: 1000,
+                error: None,
+            })
+        };
+        let running = |jid| (Status::Running(run(jid).unwrap()), run(jid));
+        assert!(exited_since(&running(1), &(exited(1), run(1))));
+        assert!(!exited_since(&(exited(1), run(1)), &(exited(1), run(1))));
+        // Restarted and ended again within the second, between two looks.
+        assert!(exited_since(&(exited(1), run(1)), &(exited(1), run(2))));
+        assert!(!exited_since(&running(1), &running(2)));
+        assert!(exited_since(&(Status::Created, None), &(exited(1), run(1))));
+    }
 
     #[test]
     #[cfg(unix)]

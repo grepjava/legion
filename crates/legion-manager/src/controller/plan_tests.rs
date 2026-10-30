@@ -2334,6 +2334,30 @@ fn stateful_tasks_move_with_their_data_off_a_draining_node() {
 }
 
 #[test]
+fn ordinals_drained_from_one_node_spread_over_the_others() {
+    use legion_api::volume::MigrationPhase::*;
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.service("db", &STATEFUL.replace("replicas: 3", "replicas: 2"));
+    w.settle();
+    assert_eq!(w.placed_task("db-0-1").spec.node, "n1");
+    assert_eq!(w.placed_task("db-1-1").spec.node, "n1");
+    w.node("n2", &[]);
+    w.node("n3", &[]);
+    w.settle();
+
+    w.availability("n1", Availability::Drain);
+    w.settle();
+    let to = |v| {
+        w.migration(v)
+            .map(|(to, phase)| (phase == Copying).then_some(to))
+    };
+    let (zero, one) = (to("data-db-0").flatten(), to("data-db-1").flatten());
+    assert!(zero.is_some() && one.is_some(), "{zero:?} {one:?}");
+    assert_ne!(zero, one);
+}
+
+#[test]
 fn migrations_stop_when_no_longer_needed_or_possible() {
     use legion_api::volume::MigrationPhase::*;
     let mut w = World::new();

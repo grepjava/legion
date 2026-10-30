@@ -435,8 +435,9 @@ fn mount_plugin(
 
 /// Undoes what a task attached, before its directory goes: plugins
 /// unmount, and a volume used one node at a time that no other task here
-/// uses any more is unmounted, detached and let go. An error leaves the
-/// record, for the next teardown to finish.
+/// uses any more is unmounted, detached and let go. An iSCSI target is
+/// logged out of once no volume here, of any of its LUNs, is on it. An
+/// error leaves the record, for the next teardown to finish.
 pub(crate) async fn release<C: Control>(
     control: &C,
     sys: &Arc<dyn Sys>,
@@ -456,7 +457,7 @@ pub(crate) async fn release<C: Control>(
         .flat_map(|other| attached(&files::task_dir(p.files_dir, &other)).unwrap_or_default())
         .collect();
     let in_use = |entry: &Attached| others.iter().any(|o| o.volume() == entry.volume());
-    for entry in &mine {
+    for (i, entry) in mine.iter().enumerate() {
         let (namespace, volume) = entry.volume();
         let single = match entry {
             Attached::Plugin {
@@ -476,14 +477,19 @@ pub(crate) async fn release<C: Control>(
             Attached::Iscsi { target, .. } => {
                 if !in_use(entry) {
                     let path = path_str(&node_mount(p.volumes_dir, namespace, volume))?;
+                    let on_target = |a: &Attached| matches!(a, Attached::Iscsi { target: t, .. } if t == target);
+                    let last = !others.iter().chain(&mine[i + 1..]).any(on_target);
                     let target = target.clone();
                     crate::task::blocking(sys, move |sys| {
                         let e = |e: legion_sys::Error| e.to_string();
                         if sys.mounts(&path).map_err(e)?.contains(&path) {
                             sys.unmount(&path).map_err(e)?;
                         }
-                        tracing::info!(%target, "logging out of the iSCSI target");
-                        sys.iscsi_detach(&target).map_err(e)
+                        if last {
+                            tracing::info!(%target, "logging out of the iSCSI target");
+                            sys.iscsi_detach(&target).map_err(e)?;
+                        }
+                        Ok::<(), String>(())
                     })
                     .await?;
                 }

@@ -94,12 +94,24 @@ pub(super) fn migrations(
 
     // And one for each wanted ordinal whose Volumes are on a draining
     // node, even one asked to be there, where it returns once the node is
-    // active again; all of an ordinal's Volumes go to the same node.
+    // active again; all of an ordinal's Volumes go to the same node. The
+    // ordinals moving, already or in this pass, count where they go.
     for s in services
         .iter()
         .filter(|s| s.spec.mode == ServiceMode::Stateful)
     {
         let (namespace, svc) = s.key();
+        let ordinal_volumes = |n| {
+            s.spec.pod.claims().filter_map(move |(claim, _)| {
+                volumes.get(&(namespace.to_owned(), claim_volume(claim, svc, n)))
+            })
+        };
+        let mut moving: BTreeMap<String, usize> = BTreeMap::new();
+        for n in 0..s.spec.replicas.unwrap_or(1) {
+            if let Some(m) = ordinal_volumes(n).find_map(|v| v.status.migration.as_ref()) {
+                *moving.entry(m.to.clone()).or_default() += 1;
+            }
+        }
         for n in 0..s.spec.replicas.unwrap_or(1) {
             let stuck: Vec<&Volume> = s
                 .spec
@@ -118,9 +130,10 @@ pub(super) fn migrations(
             let Some(from) = stuck.first().map(|v| v.status.node.as_str()) else {
                 continue;
             };
-            let Some(to) = target(s, from, tasks, nodes, volumes) else {
+            let Some(to) = target(s, from, tasks, nodes, volumes, &moving) else {
                 continue;
             };
+            *moving.entry(to.to_owned()).or_default() += 1;
             for v in stuck.iter().filter(|v| v.status.node == from) {
                 let m = Migration {
                     to: to.to_owned(),
@@ -142,17 +155,21 @@ fn requested(v: &Volume) -> Option<&str> {
 }
 
 /// Where an ordinal of `s` moves from `from`: a node its tasks may run on,
-/// with the fewest of them.
+/// with the fewest of them, counting the ordinals `moving` there.
 fn target<'a>(
     s: &Service,
     from: &str,
     tasks: &[Task],
     nodes: &'a [Node],
     volumes: &Volumes,
+    moving: &BTreeMap<String, usize>,
 ) -> Option<&'a str> {
     let mut count: BTreeMap<&str, usize> = BTreeMap::new();
     for t in tasks.iter().filter(|t| t.placed() && s.owns(t)) {
         *count.entry(t.spec.node.as_str()).or_default() += 1;
+    }
+    for (to, n) in moving {
+        *count.entry(to.as_str()).or_default() += n;
     }
     let mounts = shared_volumes(s);
     nodes

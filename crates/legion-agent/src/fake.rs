@@ -63,6 +63,8 @@ struct State {
     logs: BTreeMap<String, Vec<Chunk>>,
     /// Attached execs: their exit code once done, and terminal size.
     sessions: BTreeMap<String, Session>,
+    /// One for each exec's stdin given out, gone once it is dropped.
+    stdin: Vec<std::sync::Weak<()>>,
     /// Events held back, while holding them, as a slow event stream would.
     held: Option<Vec<Event>>,
     /// The network policy anchor's rules as each container (by name) last
@@ -104,6 +106,46 @@ struct Container {
     exit_code: i32,
     starts: u32,
     jail: Option<String>,
+}
+
+/// An exec's stdin, whose token goes when it is dropped.
+struct Stdin {
+    input: tokio::io::DuplexStream,
+    _token: Arc<()>,
+}
+
+impl tokio::io::AsyncWrite for Stdin {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.input).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.input).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.input).poll_shutdown(cx)
+    }
+}
+
+impl Container {
+    fn state(&self) -> &'static str {
+        match (self.running, self.starts) {
+            (true, _) => "running",
+            (false, 0) => "created",
+            (false, _) => "exited",
+        }
+    }
 }
 
 fn api(status: u16, message: impl Into<String>) -> Error {
@@ -203,10 +245,18 @@ impl FakeRuntime {
             });
     }
 
-    /// Attached execs still running.
     /// Exec sessions the runtime still keeps, ended or not.
     pub fn exec_sessions(&self) -> usize {
         self.state().sessions.len()
+    }
+
+    /// Execs' stdins given out and not yet dropped.
+    pub fn stdin_open(&self) -> usize {
+        self.state()
+            .stdin
+            .iter()
+            .filter(|s| s.strong_count() > 0)
+            .count()
     }
 
     pub fn attached(&self) -> usize {
@@ -262,6 +312,15 @@ impl FakeRuntime {
         let id = self.id_of(name).expect("container exists");
         let mut s = self.state();
         self.die(&mut s, &id, code);
+    }
+
+    /// Puts a container back as created and never started, as an agent
+    /// going between creating and starting it leaves it.
+    pub fn unstart(&self, name: &str) {
+        let id = self.id_of(name).expect("container exists");
+        let mut s = self.state();
+        self.die(&mut s, &id, 0);
+        s.containers.get_mut(&id).expect("exists").starts = 0;
     }
 
     fn die(&self, s: &mut State, id: &str, code: i32) {
@@ -475,7 +534,7 @@ impl Runtime for FakeRuntime {
             id: id.to_owned(),
             name: c.spec.name.clone(),
             state: ContainerState {
-                status: if c.running { "running" } else { "exited" }.into(),
+                status: c.state().into(),
                 running: c.running,
                 exit_code: c.exit_code,
                 ..Default::default()
@@ -551,6 +610,7 @@ impl Runtime for FakeRuntime {
             data: Bytes::from(data),
         };
         let cat = cmd == ["cat"];
+        let sleep = cmd == ["sleep"];
         let line = cmd.join(" ");
         let sessions = SessionHandle {
             runtime: self.state_handle(),
@@ -575,6 +635,11 @@ impl Runtime for FakeRuntime {
                         }
                     }
                 }
+            } else if sleep {
+                // Runs on, reading nothing, as one the runtime is yet to
+                // stop; it holds its stdin.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                drop(process_stdin);
             } else {
                 // Gives the caller a moment to size the terminal.
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -597,8 +662,14 @@ impl Runtime for FakeRuntime {
                 rx.recv().await.map(|c| (c, rx))
             })
             .boxed(),
-            stdin: stdin
-                .then(|| Box::pin(input) as std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>),
+            stdin: stdin.then(|| {
+                let token = Arc::new(());
+                self.state().stdin.push(Arc::downgrade(&token));
+                Box::pin(Stdin {
+                    input,
+                    _token: token,
+                }) as std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>
+            }),
         })
     }
 
@@ -697,9 +768,9 @@ impl Runtime for FakeRuntime {
                 names: vec![c.spec.name.clone()],
                 image: c.spec.image.clone(),
                 labels: c.spec.labels.clone(),
-                state: if c.running { "running" } else { "exited" }.into(),
+                state: c.state().into(),
                 exit_code: c.exit_code,
-                exited: !c.running,
+                exited: c.state() == "exited",
                 pid: 0,
             })
             .collect())

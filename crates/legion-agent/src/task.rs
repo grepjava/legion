@@ -301,8 +301,9 @@ impl<R: Runtime, C: Control> Worker<R, C> {
     }
 
     /// Takes over a pod left running by a previous agent. A pod that is
-    /// incomplete or whose infra container has stopped is removed instead,
-    /// and started again from scratch.
+    /// incomplete (a container missing, or created but never started: the
+    /// agent went between the two) or whose infra container has stopped is
+    /// removed instead, and started again from scratch.
     async fn adopt(&mut self) -> Option<Pod> {
         let found = match self.ctx.runtime.list(&[(LABEL_TASK, &self.a.uid)]).await {
             Ok(f) => f,
@@ -324,7 +325,9 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         if let Some(infra) = infra {
             for spec in &self.pod().containers {
                 let Some(c) = found.iter().find(|c| {
-                    role(c) == Some(Role::App) && c.labels.get(LABEL_CONTAINER) == Some(&spec.name)
+                    role(c) == Some(Role::App)
+                        && c.labels.get(LABEL_CONTAINER) == Some(&spec.name)
+                        && (c.state == "running" || c.exited)
                 }) else {
                     break;
                 };
@@ -759,15 +762,26 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             }
             self.probe(&mut pod.members[i]);
         }
-        // A refused pod is torn down below, never reported ready.
+        // A refused pod is torn down below, never reported running, nor
+        // its stopped containers restarted.
         if pod.refused.is_none() {
-            self.update_ready(&pod).await;
-        }
-        // Containers found stopped on adoption count as exits now.
-        for i in 0..pod.members.len() {
-            if !pod.members[i].running && pod.members[i].done.is_none() {
-                let code = self.exit_code(&pod.members[i].id).await;
-                self.exited(&mut pod, i, code).await;
+            // Containers found stopped on adoption count as exits now.
+            for i in 0..pod.members.len() {
+                if !pod.members[i].running && pod.members[i].done.is_none() {
+                    let code = self.exit_code(&pod.members[i].id).await;
+                    self.exited(&mut pod, i, code).await;
+                }
+            }
+            // The agent before may have gone before saying it runs.
+            self.ready = pod.ready();
+            let said = self.status.state == TaskState::Running;
+            if finished(&pod).is_none() && (!said || self.status.ready != self.ready) {
+                let message = if said {
+                    self.status.message.clone()
+                } else {
+                    String::new()
+                };
+                self.report(TaskState::Running, message).await;
             }
         }
         loop {

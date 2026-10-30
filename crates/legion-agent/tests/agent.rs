@@ -953,6 +953,54 @@ restartPolicy: { condition: any, delay: 0s }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pod_left_before_its_containers_started_starts_over() {
+    let mut h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task_of(
+            "job-1",
+            r#"containers: [{ name: app, image: "app:1" }]"#,
+            true,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    let created = h.rt.created();
+
+    // The agent went after creating the container, before starting it.
+    h.stop_agent().await;
+    h.rt.unstart("shop_job-1_app");
+    h.start_agent();
+    // Not taken for a container that ran and exited with 0: the pod is
+    // made again, and runs.
+    eventually("the pod made again", || {
+        h.rt.created() == created + 2 && h.running().len() == 2
+    })
+    .await;
+    assert_eq!(h.status(&key).state, TaskState::Running);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_adopted_pod_is_reported_running() {
+    let mut h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task("app-1", r#"containers: [{ name: app, image: "app:1" }]"#)
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    let created = h.rt.created();
+
+    // The agent went after starting the pod, before saying so.
+    h.stop_agent().await;
+    let mut o = h.store.get(&key).unwrap().unwrap();
+    o.status["state"] = "starting".into();
+    let v = o.metadata.version;
+    h.write(o, Precondition::Version(v)).await;
+    h.start_agent();
+    h.wait_state(&key, TaskState::Running).await;
+    assert_eq!(h.rt.created(), created, "no container recreated");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn removes_pods_of_deleted_tasks() {
     let mut h = Harness::new().await;
     h.rt.add_image("app:1");
@@ -1584,6 +1632,73 @@ async fn network_volumes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn volumes_on_luns_of_one_target() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let iqn = "iqn.2026-10.lan.legion:luns";
+    h.sys
+        .add_iscsi_target(iqn, &[(0, "da0", Some("ufs")), (1, "da1", Some("ufs"))]);
+    for (name, lun) in [("lun0", 0), ("lun1", 1)] {
+        h.write(
+            Object::new(
+                Kind::Volume,
+                "shop",
+                name,
+                serde_json::json!({ "driver": "iscsi", "iscsi": { "portal": "192.0.2.9", "target": iqn, "lun": lun } }),
+            ),
+            Precondition::MustNotExist,
+        )
+        .await;
+    }
+    let pod = |volume: &str| {
+        format!(
+            "containers: [{{ name: app, image: \"app:1\", volumeMounts: [{{ name: v, path: /v }}] }}]\n\
+             volumes: [{{ name: v, volume: {{ name: {volume} }} }}]"
+        )
+    };
+    let volume_node = |name: &str| {
+        let v = h
+            .store
+            .get(&ObjectKey::new(Kind::Volume, "shop", name))
+            .unwrap()
+            .unwrap();
+        v.status["node"].as_str().unwrap_or_default().to_owned()
+    };
+    let mount = |name: &str| {
+        let path = h
+            ._dir
+            .path()
+            .join("volumes")
+            .join("iscsi")
+            .join("shop")
+            .join(name);
+        h.sys.mount_source(path.to_str().unwrap())
+    };
+    let one = h.task("a-1", &pod("lun0")).await;
+    let two = h.task("a-2", &pod("lun1")).await;
+    h.wait_state(&one, TaskState::Running).await;
+    h.wait_state(&two, TaskState::Running).await;
+    assert_eq!(h.sys.iscsi_targets(), [iqn]);
+    assert_eq!(mount("lun0").as_deref(), Some("ufs /dev/da0"));
+    assert_eq!(mount("lun1").as_deref(), Some("ufs /dev/da1"));
+
+    // The first goes: its LUN is unmounted and let go, and the target
+    // stays logged in for the other.
+    h.delete(&one).await;
+    eventually("lun0 let go", || volume_node("lun0").is_empty()).await;
+    assert_eq!(mount("lun0"), None);
+    assert_eq!(h.sys.iscsi_targets(), [iqn]);
+    assert_eq!(mount("lun1").as_deref(), Some("ufs /dev/da1"));
+    assert_eq!(volume_node("lun1"), NODE);
+    // The last goes: logged out.
+    h.delete(&two).await;
+    eventually("logged out", || {
+        h.sys.iscsi_targets().is_empty() && volume_node("lun1").is_empty()
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn network_volume_problems() {
     let h = Harness::new().await;
     h.rt.add_image("app:1");
@@ -1915,6 +2030,16 @@ async fn sessions_reach_the_pod() {
     drop(s);
     eventually("cat ends", || h.rt.attached() == 0).await;
     eventually("no sessions kept", || h.rt.exec_sessions() == 0).await;
+    // So they take its input, even with a write waiting on a process that
+    // reads none of it.
+    let s = Session::open(&h, open("web-1", exec(&["sleep"], true, false)))
+        .await
+        .unwrap();
+    eventually("sleep runs", || h.rt.stdin_open() == 1).await;
+    s.send(Frame::Input(vec![b'x'; 64 * 1024])).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(s);
+    eventually("its input closed", || h.rt.stdin_open() == 0).await;
 
     // What cannot be opened says why.
     let refused = |r: Result<Session, tonic::Status>| {
