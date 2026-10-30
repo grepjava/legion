@@ -1138,6 +1138,19 @@ real, in the order agreed with the user.
   n2 sends another ordinal to n3), an agent test (a pod adopted with its
   address cleared is made again, at the same address); each fails with
   its fix taken out.
+- **From a seventh review.** Two faults, each confirmed first, both in
+  what the sixth review's fix left out. A global Job still dropped a
+  node that only takes no new tasks: its running task was stopped, and
+  with every other node done the Job was marked complete while it ran.
+  Such a node now stays among the Job's, while its task runs. A kept
+  global task ignored where its data was: one whose data was moving off
+  the node ran on after the copy, so the move never finished; it now goes
+  once its data is copied, and from a node its data is no longer on. And
+  a kept node skipped the end of a start-first update: once the new task
+  there is ready, the old one now goes. Tested: planner tests (a global
+  Job's task on a suspect and a `NoSchedule` node runs on and the Job
+  waits for it; on a paused node, a start-first update finishes and a
+  volume moved off it gets there), each failing with its fix taken out.
 - **From a second review.** A route could name any Secret of its
   namespace for HTTPS, and every node could then read it: a route's
   Secret is now handed out only if it holds a PEM certificate and key.

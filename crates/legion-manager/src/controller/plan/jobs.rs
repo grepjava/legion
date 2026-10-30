@@ -121,7 +121,8 @@ pub(super) fn job(
     };
     let wanted: Vec<Slot> = match j.spec.mode {
         JobMode::Replicated => (1..=j.spec.completions()).map(Slot::Replica).collect(),
-        // Nodes that may run it now, and those it already completed on.
+        // Nodes that may run it now, those it already completed on, and
+        // those that take no new task but keep the one running there.
         JobMode::Global => {
             let mut slots: BTreeSet<Slot> = nodes
                 .iter()
@@ -129,6 +130,15 @@ pub(super) fn job(
                 .map(|n| Slot::Node(n.name().to_owned()))
                 .collect();
             slots.extend(by_slot.keys().filter(|s| done(s)).cloned());
+            slots.extend(
+                by_slot
+                    .iter()
+                    .filter(|(slot, list)| {
+                        list.iter().any(|t| t.active())
+                            && super::kept_global(slot, list, nodes, owner, volumes)
+                    })
+                    .map(|(slot, _)| slot.clone()),
+            );
             slots.into_iter().collect()
         }
     };

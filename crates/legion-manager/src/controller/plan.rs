@@ -512,10 +512,10 @@ fn service(
 
     // Slots no longer wanted: stop what runs there and drop the history. A
     // node that only takes no new tasks (paused, suspect, or tainted
-    // `NoSchedule`) keeps its global task and history; a drained, down or
-    // vanished one does not, nor one whose taints evict it or that the
-    // service may no longer run on. A stateful service stops its highest
-    // ordinal first, one at a time.
+    // `NoSchedule`) keeps its global task and history (see
+    // [`kept_global`]), and once a task of the current pod there is ready
+    // the outdated ones go, as in a wanted slot. A stateful service stops
+    // its highest ordinal first, one at a time.
     let mut unwanted: Vec<(&Slot, &Vec<&Task>)> = by_slot
         .iter()
         .filter(|(slot, _)| !wanted_set.contains(slot))
@@ -527,10 +527,16 @@ fn service(
         .iter()
         .any(|(_, list)| list.iter().any(|t| t.stopping()));
     for (slot, list) in unwanted {
-        let kept = matches!(slot, Slot::Node(name) if nodes.iter().any(|n| {
-            n.name() == name && keeps_global(n, s)
-        }));
-        if kept {
+        if kept_global(slot, list, nodes, s, volumes) {
+            let current = |t: &Task| t.active() && t.spec.pod == s.spec.pod;
+            if list
+                .iter()
+                .any(|t| current(t) && t.status.state == TaskState::Running && t.status.ready)
+            {
+                for t in list.iter().filter(|t| t.active() && !current(t)) {
+                    plan.actions.push(stop(t));
+                }
+            }
             continue;
         }
         for t in list {
@@ -1097,15 +1103,38 @@ pub(super) fn shared_volumes(s: &Service) -> Vec<String> {
         .collect()
 }
 
-/// Whether a global task of `s` already on `n` stays, though `n` takes no
-/// new one: `n` is paused, suspect or tainted `NoSchedule`, which keep
-/// new tasks off and no more.
-fn keeps_global(n: &Node, s: &Service) -> bool {
+/// Whether the global tasks of `s` in `slot` (`list`) stay, though their
+/// node takes no new one: it is paused, suspect or tainted `NoSchedule`,
+/// which keep new tasks off and no more. They go from a node drained, down
+/// or vanished, one whose taints evict them or that the service may no
+/// longer run on, one the data they mount is no longer on, or once that
+/// data, moving off it, has been copied.
+fn kept_global(
+    slot: &Slot,
+    list: &[&Task],
+    nodes: &[Node],
+    s: &Service,
+    volumes: &Volumes,
+) -> bool {
+    let Slot::Node(name) = slot else {
+        return false;
+    };
+    let Some(n) = nodes.iter().find(|n| n.name() == name) else {
+        return false;
+    };
+    let namespace = &s.object.metadata.namespace;
     matches!(n.status.state, NodeState::Ready | NodeState::Suspect)
         && n.spec.availability != Availability::Drain
         && !n.repels(s, TaintEffect::NoExecute)
         && !(n.status.platform.no_limits && s.spec.pod.limited())
         && constraints_hold(s, n)
+        && shared_volumes(s)
+            .iter()
+            .filter_map(|v| home(volumes, namespace, v))
+            .all(|home| home == name)
+        && !list
+            .iter()
+            .any(|t| t.active() && migrate::leaving(t, volumes) && migrate::copied(t, volumes))
 }
 
 fn constraints_hold(s: &Service, n: &Node) -> bool {

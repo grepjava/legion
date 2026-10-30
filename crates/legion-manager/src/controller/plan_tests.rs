@@ -1763,6 +1763,78 @@ fn a_global_task_stays_on_a_node_taking_no_new_ones() {
 }
 
 #[test]
+fn a_global_task_on_a_node_taking_no_new_ones_still_updates_and_moves() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    const GLOBAL: &str = "mode: global\nupdate: { order: start-first }\npod: { containers: [{ name: a, image: \"a:1\" }] }";
+    w.service("agent", GLOBAL);
+    w.settle();
+
+    // An update started first: once the new task is ready the old goes,
+    // though the node was paused in between.
+    w.service("agent", &GLOBAL.replace("a:1", "a:2"));
+    w.step();
+    w.availability("n1", Availability::Pause);
+    w.settle();
+    let on_n1: Vec<String> = w
+        .tasks()
+        .into_iter()
+        .filter(|t| t.starts_with("agent-n1") && t.contains(" running "))
+        .collect();
+    assert_eq!(on_n1.len(), 1, "{:?}", w.tasks());
+    assert_eq!(
+        w.running_with("agent", "a:2"),
+        on_n1[0].split(' ').next().unwrap()
+    );
+
+    // Data moving off the paused node: the task there stays while it is
+    // copied, then goes, so the move can finish.
+    w.volume("pgdata", "");
+    w.ask("pgdata", Some("n2"));
+    w.service(
+        "mounts",
+        "mode: global\npod: { containers: [{ name: a, image: \"a:1\" }], volumes: [{ name: d, volume: { name: pgdata } }] }",
+    );
+    w.availability("n1", Availability::Active);
+    w.settle();
+    assert_eq!(w.placed("mounts"), ["n2"]);
+    w.availability("n2", Availability::Pause);
+    w.ask("pgdata", Some("n1"));
+    w.settle();
+    assert_eq!(w.placed("mounts"), ["n2"], "runs on while copied");
+    for _ in 0..2 {
+        w.migrate();
+        w.settle();
+    }
+    assert_eq!(w.volume_node("pgdata"), "n1");
+    assert_eq!(w.placed("mounts"), ["n1"]);
+}
+
+#[test]
+fn a_global_job_keeps_its_task_on_a_node_taking_no_new_ones() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.job("scan", &job("mode: global"));
+    w.settle();
+    w.end("scan-n1-1", TaskState::Complete);
+    // n2's task runs on, and the Job is not done without it.
+    w.state("n2", NodeState::Suspect);
+    w.settle();
+    assert_eq!(w.running(), ["scan-n2-1"]);
+    assert_eq!(w.job_status("scan").state.as_str(), "running");
+    w.state("n2", NodeState::Ready);
+    w.taint("n2", "dedicated", TaintEffect::NoSchedule);
+    w.settle();
+    assert_eq!(w.running(), ["scan-n2-1"]);
+    w.end("scan-n2-1", TaskState::Complete);
+    w.settle();
+    let st = w.job_status("scan");
+    assert_eq!((st.state.as_str(), st.succeeded), ("complete", 2));
+}
+
+#[test]
 fn a_global_job_runs_once_per_node() {
     let mut w = World::new();
     w.node("n1", &[]);
