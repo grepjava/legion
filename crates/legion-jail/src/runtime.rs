@@ -142,7 +142,117 @@ struct Session {
     code: watch::Receiver<Option<i32>>,
     /// The terminal's controlling side, for resizing.
     #[cfg(unix)]
-    master: Option<Arc<std::os::fd::OwnedFd>>,
+    master: Option<Arc<Pty>>,
+}
+
+/// A terminal's controlling side, non-blocking and polled by the reactor,
+/// shared by the session, its output and its input. Its one descriptor
+/// closes when the last of them goes, which hangs the terminal up; a read
+/// waiting on a blocking thread, as `tokio::fs::File` does, would hold it
+/// open while the command stays silent.
+struct Pty(tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>);
+
+impl Pty {
+    fn new(fd: std::os::fd::OwnedFd) -> std::io::Result<Arc<Self>> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: plain fcntl calls on a descriptor we own.
+        unsafe {
+            let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+            if flags < 0 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        // SAFETY: the OwnedFd is the AsyncFd's own: it stays open, and the
+        // same descriptor, until the AsyncFd drops it.
+        let fd = unsafe { tokio::io::unix::AsyncFd::register(fd)? };
+        Ok(Arc::new(Pty(fd)))
+    }
+
+    fn raw(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.0.as_raw_fd()
+    }
+}
+
+/// A [`Pty`]'s reading end.
+struct PtyReader(Arc<Pty>);
+
+impl tokio::io::AsyncRead for PtyReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        loop {
+            let mut guard = std::task::ready!(self.0.0.poll_read_ready(cx))?;
+            let unfilled = buf.initialize_unfilled();
+            let read = guard.try_io(|fd| {
+                use std::os::fd::AsRawFd;
+                // SAFETY: reading into a buffer of the length given.
+                let n = unsafe {
+                    libc::read(fd.as_raw_fd(), unfilled.as_mut_ptr().cast(), unfilled.len())
+                };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            });
+            match read {
+                Ok(Ok(n)) => {
+                    buf.advance(n);
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                Ok(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+}
+
+/// A [`Pty`]'s writing end.
+struct PtyWriter(Arc<Pty>);
+
+impl tokio::io::AsyncWrite for PtyWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        loop {
+            let mut guard = std::task::ready!(self.0.0.poll_write_ready(cx))?;
+            let written = guard.try_io(|fd| {
+                use std::os::fd::AsRawFd;
+                // SAFETY: writing from a buffer of the length given.
+                let n = unsafe { libc::write(fd.as_raw_fd(), data.as_ptr().cast(), data.len()) };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            });
+            match written {
+                Ok(r) => return std::task::Poll::Ready(r),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    /// A terminal has no half-close: its input ends with the session.
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
 }
 
 fn api(status: u16, message: impl Into<String>) -> Error {
@@ -1048,13 +1158,10 @@ impl legion_agent::Runtime for JailRuntime {
                 let child = command.spawn().map_err(internal)?;
                 drop(slave);
                 reap(child, code_tx, self.execs.clone(), exec_id.clone());
-                let master = Arc::new(master);
-                let reader = tokio::fs::File::from_std(std::fs::File::from(
-                    master.try_clone().map_err(internal)?,
-                ));
-                let writer = tokio::fs::File::from_std(std::fs::File::from(
-                    master.try_clone().map_err(internal)?,
-                ));
+                // One descriptor for all three, so dropping them closes it.
+                let master = Pty::new(master).map_err(internal)?;
+                let reader = PtyReader(master.clone());
+                let writer = PtyWriter(master.clone());
                 self.execs.lock().expect("execs").insert(
                     exec_id.clone(),
                     Session {
@@ -1125,7 +1232,6 @@ impl legion_agent::Runtime for JailRuntime {
     async fn exec_resize(&self, exec_id: &str, width: u16, height: u16) -> Result<()> {
         #[cfg(unix)]
         {
-            use std::os::fd::AsRawFd;
             let master = self
                 .execs
                 .lock()
@@ -1142,7 +1248,7 @@ impl legion_agent::Runtime for JailRuntime {
                     ws_ypixel: 0,
                 };
                 // SAFETY: setting the size of a terminal we hold.
-                unsafe { libc::ioctl(m.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
+                unsafe { libc::ioctl(m.raw(), libc::TIOCSWINSZ, &ws) };
             }
         }
         let _ = (exec_id, width, height);

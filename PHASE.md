@@ -1056,7 +1056,13 @@ real, in the order agreed with the user.
   after a disconnect; on FreeBSD 15.1, the jail runtime's live test has
   an exec given up on after 1 s end with its background child, and a
   released terminal hang up its shell; each of those two fails with its
-  fix taken out.
+  fix taken out. A follow-up review found the terminal could still stay
+  up: its output was read through `tokio::fs::File`, whose read, waiting
+  on a blocking thread, held its own descriptor of the terminal while the
+  command said nothing. The terminal's controlling side is now one
+  non-blocking descriptor polled by the reactor and shared by session,
+  output and input, so it closes when they go; the live test lets go
+  while a read waits on a silent command, which fails on the old code.
 - **From a second review.** A route could name any Secret of its
   namespace for HTTPS, and every node could then read it: a route's
   Secret is now handed out only if it holds a PEM certificate and key.

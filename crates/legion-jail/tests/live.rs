@@ -231,8 +231,9 @@ async fn pods_of_jails() {
     );
     let (bg, fg) = (running("sleep 300"), running("sleep 301"));
     until("the abandoned exec ends", async || !bg() && !fg()).await;
-    // A terminal session let go of is hung up.
-    let mut attached = rt
+    // A terminal session let go of is hung up, even while a read of its
+    // output waits on a command that says nothing more.
+    let attached = rt
         .exec_attach(
             &app,
             &[
@@ -245,12 +246,21 @@ async fn pods_of_jails() {
         )
         .await
         .unwrap();
-    let mut seen = Vec::new();
-    while !String::from_utf8_lossy(&seen).contains("up") {
-        seen.extend_from_slice(&attached.output.next().await.unwrap().unwrap().data);
-    }
     let session = attached.id.clone();
-    drop(attached);
+    let mut stream = attached.output;
+    let reading = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        while let Some(Ok(c)) = stream.next().await {
+            seen.extend_from_slice(&c.data);
+        }
+        seen
+    });
+    let held = running("sleep 302");
+    until("the silent command", async || held()).await;
+    // Give the output's next read time to start waiting.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    reading.abort();
+    drop(attached.stdin);
     rt.exec_release(&session).await;
     let held = running("sleep 302");
     until("the released terminal hangs up", async || !held()).await;
