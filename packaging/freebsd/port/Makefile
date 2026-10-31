@@ -32,9 +32,8 @@ IGNORE=		needs FreeBSD 15 or newer
 post-install:
 	${STRIP_CMD} ${STAGEDIR}${PREFIX}/bin/legion
 	${SED} -e 's|/usr/local|${PREFIX}|g' \
-		${WRKSRC}/packaging/freebsd/rc.d/legion \
-		> ${STAGEDIR}${PREFIX}/etc/rc.d/legion
-	${CHMOD} 555 ${STAGEDIR}${PREFIX}/etc/rc.d/legion
+		${WRKSRC}/packaging/freebsd/rc.d/legion > ${WRKDIR}/legion.rc
+	${INSTALL_SCRIPT} ${WRKDIR}/legion.rc ${STAGEDIR}${PREFIX}/etc/rc.d/legion
 	${MKDIR} ${STAGEDIR}${PREFIX}/etc/newsyslog.conf.d
 	${INSTALL_DATA} ${WRKSRC}/packaging/freebsd/newsyslog.conf.d/legion.conf \
 		${STAGEDIR}${PREFIX}/etc/newsyslog.conf.d/legion.conf
