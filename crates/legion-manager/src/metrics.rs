@@ -1,5 +1,5 @@
-//! The manager's metrics, for Prometheus. Every manager reports its own
-//! view of Raft; only the leader reports the cluster's objects, tasks,
+//! The manager's metrics, for Prometheus. Every manager reports the API
+//! requests it answered and its own view of Raft; only the leader reports the cluster's objects, tasks,
 //! nodes and quotas, so summing a metric across managers counts each thing
 //! once, and what is reported is what the controllers act on.
 
@@ -25,14 +25,16 @@ pub(crate) type Slot = Arc<RwLock<Option<Store>>>;
 pub struct ManagerMetrics {
     pub(crate) id: NodeId,
     pub(crate) store: Slot,
+    pub(crate) requests: Arc<crate::requests::Requests>,
 }
 
 impl ManagerMetrics {
     /// The metrics as they are now. Reads the store: call it off the
     /// async threads.
-    /// Nothing once the manager has stopped.
+    /// Only the requests once the manager has stopped.
     pub fn collect(&self) -> Metrics {
         let mut m = Metrics::default();
+        self.requests.collect(&mut m);
         let slot = self.store.read().unwrap_or_else(|e| e.into_inner());
         let Some(store) = slot.as_ref() else {
             return m;

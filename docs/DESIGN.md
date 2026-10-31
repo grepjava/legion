@@ -449,7 +449,12 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
 - **Metrics** (phase 3). With `--metrics-listen <addr>` the daemon serves
   Prometheus's text format at `/metrics` over plain HTTP, without
   authentication: the endpoint names every namespace's services and
-  tasks, so it belongs on an admin network. Every manager reports its
+  tasks, so it belongs on an admin network. Every manager reports the
+  gRPC calls it answered, by service, method and the code they ended
+  with, and a histogram of how long each method took to answer (until
+  the answer starts: a stream's first message); a stream the client drops
+  ends `Cancelled`, and calls to methods it does not serve count under
+  `unknown`. Every manager reports its
   Raft state (leader, term, log and applied indexes, voters, and on the
   leader each follower's lag). Only the leader reports the cluster:
   objects by kind and namespace, tasks by state, restarts of tasks not

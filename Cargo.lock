@@ -1589,6 +1589,8 @@ name = "legion-manager"
 version = "0.1.6"
 dependencies = [
  "base64 0.22.1",
+ "http",
+ "http-body",
  "legion-api",
  "legion-net",
  "legion-pki",
@@ -1605,6 +1607,8 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tonic",
+ "tower-layer",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
 ]

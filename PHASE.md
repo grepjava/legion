@@ -512,8 +512,14 @@ Already there from phase 1: namespaces scope names and DNS
 
 Nothing left in phase 3.
 
-Smaller follow-ups: lab runs on weft-bsd leave the bridge
-sysctls at 1; API request counts and latencies in the metrics.
+Nothing left of its follow-ups either. The managers' metrics count
+the API's calls by method and code and time them
+(`legion_api_requests_total`, `legion_api_request_duration_seconds`,
+`legion_manager::requests`), a tower layer on the gRPC server. Tested:
+counts, codes and buckets, and through a served manager, unary calls
+ending `Ok` and `NotFound` and a watch the client drops ending
+`Cancelled`. The bridge sysctls lab runs left at 1 on weft-bsd are what
+the Legion service there sets anyway.
 
 ## Phase 4 — Stateful and operations
 

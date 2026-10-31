@@ -1838,10 +1838,65 @@ async fn the_leader_reports_the_cluster() {
     }
     assert!(!text.contains("resource=\"cpu\""), "{text}");
 
-    // A scraper holding on does not keep the store open.
+    // A scraper holding on does not keep the store open; what it reads
+    // then is the requests the manager answered.
     let metrics = m.metrics.clone();
     m.stop().await;
-    assert_eq!(metrics.collect().finish(), "");
+    let text = metrics.collect().finish();
+    assert!(
+        text.starts_with("# HELP legion_api_requests_total"),
+        "{text}"
+    );
+    assert!(!text.contains("legion_raft"), "{text}");
+}
+
+#[tokio::test]
+async fn requests_are_counted_by_method_and_code_and_timed() {
+    let m = Running::start().await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let mut api = m.objects().await;
+    let missing = ObjectRef {
+        kind: "Service".into(),
+        namespace: String::new(),
+        name: "none".into(),
+    };
+    for _ in 0..2 {
+        assert_eq!(
+            api.get(missing.clone()).await.unwrap_err().code(),
+            Code::NotFound
+        );
+    }
+    // A stream the client drops ends cancelled.
+    let events = api
+        .watch(WatchRequest {
+            kind: "Service".into(),
+            from_version: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    drop(events);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let text = loop {
+        let text = m.metrics.collect().finish();
+        let watch = "legion_api_requests_total{service=\"legion.v1.Objects\",\
+                     method=\"Watch\",code=\"Cancelled\"} 1\n";
+        if text.contains(watch) {
+            break text;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{text}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    for line in [
+        "legion_api_requests_total{service=\"legion.v1.Cluster\",method=\"Init\",code=\"Ok\"} 1",
+        "legion_api_requests_total{service=\"legion.v1.Objects\",method=\"Get\",code=\"NotFound\"} 2",
+        "legion_api_request_duration_seconds_count{service=\"legion.v1.Objects\",method=\"Get\"} 2",
+        "legion_api_request_duration_seconds_bucket{service=\"legion.v1.Objects\",method=\"Get\",le=\"+Inf\"} 2",
+        "legion_api_request_duration_seconds_count{service=\"legion.v1.Objects\",method=\"Watch\"} 1",
+    ] {
+        assert!(text.contains(&format!("\n{line}\n")), "{line} in:\n{text}");
+    }
+    m.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

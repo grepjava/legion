@@ -32,6 +32,12 @@ impl Metrics {
         self.family(name, "counter", help)
     }
 
+    /// Starts a family of histograms: observations counted into buckets,
+    /// each sample written as [`Family::observed`] writes it.
+    pub fn histogram<'a>(&'a mut self, name: &'a str, help: &str) -> Family<'a> {
+        self.family(name, "histogram", help)
+    }
+
     fn family<'a>(&'a mut self, name: &'a str, kind: &str, help: &str) -> Family<'a> {
         let help = help.replace('\\', "\\\\").replace('\n', "\\n");
         let _ = writeln!(self.out, "# HELP {name} {help}");
@@ -55,8 +61,33 @@ impl Metrics {
 impl Family<'_> {
     /// Adds a sample with these labels.
     pub fn sample(&mut self, labels: &[(&str, &str)], value: f64) -> &mut Self {
+        self.line("", labels, None, value);
+        self
+    }
+
+    /// Adds a histogram's sample with these labels: `buckets` holds each
+    /// bucket's upper bound and how many observations were at most it
+    /// (counted cumulatively, as Prometheus does); `+Inf` is `count`.
+    pub fn observed(
+        &mut self,
+        labels: &[(&str, &str)],
+        buckets: &[(f64, u64)],
+        sum: f64,
+        count: u64,
+    ) -> &mut Self {
+        for (le, n) in buckets {
+            self.line("_bucket", labels, Some(*le), *n as f64);
+        }
+        self.line("_bucket", labels, Some(f64::INFINITY), count as f64);
+        self.line("_sum", labels, None, sum);
+        self.line("_count", labels, None, count as f64);
+        self
+    }
+
+    fn line(&mut self, suffix: &str, labels: &[(&str, &str)], le: Option<f64>, value: f64) {
         self.out.push_str(self.name);
-        if !labels.is_empty() {
+        self.out.push_str(suffix);
+        if !labels.is_empty() || le.is_some() {
             self.out.push('{');
             for (i, (k, v)) in labels.iter().enumerate() {
                 if i > 0 {
@@ -73,10 +104,15 @@ impl Family<'_> {
                 }
                 self.out.push('"');
             }
+            if let Some(le) = le {
+                if !labels.is_empty() {
+                    self.out.push(',');
+                }
+                let _ = write!(self.out, "le=\"{}\"", Value(le));
+            }
             self.out.push('}');
         }
         let _ = writeln!(self.out, " {}", Value(value));
-        self
     }
 }
 
@@ -113,6 +149,28 @@ mod tests {
              # TYPE legion_things_total counter\n\
              legion_things_total{ns=\"a\\\"b\\\\c\",x=\"1\"} 3.5\n\
              legion_things_total{ns=\"d\"} 1000000000000\n"
+        );
+    }
+
+    #[test]
+    fn histograms() {
+        let mut m = Metrics::default();
+        m.histogram("legion_wait_seconds", "Waits.")
+            .observed(&[("m", "a")], &[(0.1, 1), (1.0, 3)], 2.5, 4)
+            .observed(&[], &[(0.1, 0)], 0.0, 0);
+        assert_eq!(
+            m.finish(),
+            "# HELP legion_wait_seconds Waits.\n\
+             # TYPE legion_wait_seconds histogram\n\
+             legion_wait_seconds_bucket{m=\"a\",le=\"0.1\"} 1\n\
+             legion_wait_seconds_bucket{m=\"a\",le=\"1\"} 3\n\
+             legion_wait_seconds_bucket{m=\"a\",le=\"+Inf\"} 4\n\
+             legion_wait_seconds_sum{m=\"a\"} 2.5\n\
+             legion_wait_seconds_count{m=\"a\"} 4\n\
+             legion_wait_seconds_bucket{le=\"0.1\"} 0\n\
+             legion_wait_seconds_bucket{le=\"+Inf\"} 0\n\
+             legion_wait_seconds_sum 0\n\
+             legion_wait_seconds_count 0\n"
         );
     }
 }

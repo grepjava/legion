@@ -17,6 +17,7 @@ pub mod metrics;
 mod migrate;
 mod quota;
 mod raft_net;
+pub mod requests;
 mod security;
 mod session;
 mod tls;
@@ -124,6 +125,8 @@ pub struct Manager {
     vip: Option<(std::sync::Arc<dyn legion_sys::Sys>, vip::VipConfig)>,
     /// The store as metrics read it, emptied before the store shuts down.
     metrics: metrics::Slot,
+    /// The requests it has answered, for the metrics.
+    requests: std::sync::Arc<requests::Requests>,
 }
 
 impl Manager {
@@ -156,6 +159,7 @@ impl Manager {
             controllers: config.controllers,
             vip: config.vip,
             metrics: std::sync::Arc::new(std::sync::RwLock::new(Some(store.clone()))),
+            requests: Default::default(),
             store,
         })
     }
@@ -179,6 +183,7 @@ impl Manager {
         metrics::ManagerMetrics {
             id: self.id,
             store: self.metrics.clone(),
+            requests: self.requests.clone(),
         }
     }
 
@@ -247,7 +252,8 @@ impl Manager {
         let raft = raft_net::RaftService {
             store: self.store.clone(),
         };
-        let mut server = tonic::transport::Server::builder();
+        let mut server =
+            tonic::transport::Server::builder().layer(requests::Layer(self.requests.clone()));
         let on = self.credentials.is_some();
         // Managers forward writes to the leader as themselves. Users get
         // what their RoleBindings give (authz.rs).

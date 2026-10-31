@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 base64.workspace = true
+http.workspace = true
+http-body.workspace = true
 legion-api.workspace = true
 legion-net.workspace = true
 legion-pki.workspace = true
@@ -23,6 +25,8 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 tokio-stream.workspace = true
 tonic = { workspace = true, features = ["tls-ring"] }
+tower-layer.workspace = true
+tower-service.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
