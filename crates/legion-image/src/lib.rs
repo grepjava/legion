@@ -1,5 +1,7 @@
 //! OCI images for Legion's jail runtime (DESIGN.md §6.5): references, a
-//! registry client, and a node's store of images as ZFS layers.
+//! registry client, and a node's store of images as ZFS layers; and for
+//! building images (jailer), pushing and exporting them, and keeping them
+//! without ZFS.
 
 pub mod layer;
 pub mod oci;
@@ -9,8 +11,8 @@ mod store;
 
 pub use oci::{Config, ImageConfig};
 pub use reference::{Reference, registry_of};
-pub use registry::{Client, Credentials};
-pub use store::{Image, Store, chain_ids};
+pub use registry::{Client, Credentials, sha256};
+pub use store::{GcRoots, Image, Pin, StorageMode, Store, StoreLock, chain_ids, hex_of};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

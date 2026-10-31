@@ -1293,8 +1293,30 @@ real, in the order agreed with the user.
   host's network and on a VNET of its own (only lo0), checking file flags,
   the working directory, the environment, the lent resolver and that the
   mount points went; `pods_of_jails` still passes. The image store's half
-  (directory mode, blobs kept, push, export, build commits, pins) is
-  jailer's session's, on branch `image-share`.
+  is the next entry.
+- **legion-image shared with jailer** (DESIGN.md §6.1, "Building
+  hosts"). jailer kept its own copy of the image store, registry client,
+  references and layers, which had drifted (and dropped config keys such
+  as `ExposedPorts`, `OnBuild` and `history` that Legion's copy did not
+  name). The build-host parts move here, all opt-in, so a node's store is
+  unchanged: `Store::open_directory` (layers as directories, without
+  ZFS), `keep_blobs` (pulled blobs and layer descriptors kept),
+  `commit_built_layer` and `register_built_image`, `Pin` and
+  `pin_image`, `with_gc_roots`, `lock` and `prune_locked` (for a build
+  cache kept beside the store), `find` (a build host's names: `app` is
+  `localhost/app:latest`, then ids by prefix), `prepare_rootfs` and
+  `cleanup_rootfs` (a ZFS clone, or a directory copy), `export` (an OCI
+  archive with Docker's `manifest.json`), `push` and `push_index`, and the
+  client's `push_blob`, `push_document`, `document` and `describe`.
+  `ImageConfig` and `Config` keep unknown keys (`extra`), and name
+  `created`, `history`, `ExposedPorts`, `Volumes` and `OnBuild`;
+  `Reference::parse_local_tag`, `select_for_arch`, the config and layer
+  media types, and `layer::{pack, compress, archive, copy_tree,
+  remove_tree}` are public. Store::open's callers are unchanged. Tested:
+  the workspace on Windows; on FreeBSD 15.1 the crate's tests and its live
+  ones on a throwaway dataset, a built layer committed on ZFS, roots as
+  clones and copies, and an image exported without kept blobs packed
+  again with its whiteouts and file flags as they were.
 
 ### To do, in order
 
