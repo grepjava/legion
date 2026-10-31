@@ -93,6 +93,9 @@ struct State {
     carp: BTreeMap<(String, u8), (Carp, CarpState)>,
     /// Commands that fail once, the next time they run.
     failing: BTreeSet<String>,
+    /// Mount points something still holds (a dying jail its root): a
+    /// dataset mounted there is busy until the path is unmounted, by force.
+    held: BTreeSet<String>,
     /// Anchors whose loads fail until told otherwise.
     broken_anchors: BTreeSet<String>,
     /// What jails' processes use, as set.
@@ -327,6 +330,13 @@ impl FakeSys {
     /// `pfctl -ss`, `pfctl -k`, `rctl -a` and `zfs destroy -r`.
     pub fn fail_next(&self, command: &str) {
         self.state().failing.insert(command.to_owned());
+    }
+
+    /// Holds the mount point `path`, as a dying jail holds its root: the
+    /// dataset mounted there cannot be destroyed until [`Sys::unmount`]
+    /// (a forced unmount) lets it go.
+    pub fn hold(&self, path: &str) {
+        self.state().held.insert(path.to_owned());
     }
 
     /// Makes loading `anchor` fail from now on, or work again.
@@ -1110,6 +1120,17 @@ impl Sys for FakeSys {
                 format!("cannot destroy '{name}': dataset is busy"),
             ));
         }
+        if let Some(at) = s
+            .datasets
+            .iter()
+            .filter(|(d, _)| gone(d))
+            .find_map(|(_, ds)| ds.mountpoint.as_ref().filter(|m| s.held.contains(*m)))
+        {
+            return Err(fail(
+                "zfs destroy",
+                format!("cannot unmount '{at}': pool or dataset is busy"),
+            ));
+        }
         if name.contains('@') {
             if s.snapshots.remove(name).is_none() {
                 return Err(fail(
@@ -1389,6 +1410,10 @@ must destroy them to overwrite it"
 
     fn unmount(&self, path: &str) -> Result<()> {
         let mut s = self.state();
+        // Forced: what held it lets go.
+        if s.held.remove(path) {
+            return Ok(());
+        }
         let inside = format!("{path}/");
         s.links.retain(|l, _| !l.starts_with(&inside));
         s.sources.remove(path);

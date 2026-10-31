@@ -623,6 +623,48 @@ async fn standalone_containers_and_build_steps() {
         "{left:?}"
     );
 
+    // Removed right after its last connection closed: its jail is dying a
+    // while yet (the socket's TIME_WAIT holds it), its root still busy.
+    // The host's nc (and the libraries it needs beyond the image's) serves
+    // one connection and closes it first, so the TIME_WAIT is the jail's.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut spec = standalone("server", &format!("echo hi | nc -N -l 127.0.0.1 {port}"));
+    for f in [
+        "/usr/bin/nc",
+        "/lib/libipsec.so.4",
+        "/lib/libsbuf.so.6",
+        "/lib/libstats.so.0",
+    ] {
+        spec.mounts.push(Mount {
+            destination: f.to_owned(),
+            kind: "nullfs".to_owned(),
+            source: f.to_owned(),
+            options: vec!["ro".to_owned()],
+        });
+    }
+    let server = rt.create(&spec).await.unwrap();
+    rt.start(&server).await.unwrap();
+    let mut said = String::new();
+    until("the server's answer", async || {
+        use std::io::Read;
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(mut c) => {
+                c.read_to_string(&mut said).unwrap();
+                true
+            }
+            Err(_) => false,
+        }
+    })
+    .await;
+    assert_eq!(said, "hi\n");
+    assert_eq!(rt.wait(&server).await.unwrap(), 0);
+    rt.remove(&server).await.unwrap();
+    assert!(rt.find("server").is_err());
+
     for id in [&app, &once, &long] {
         rt.remove(id).await.unwrap();
     }

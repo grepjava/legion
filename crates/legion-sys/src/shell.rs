@@ -720,8 +720,21 @@ impl<R: Runner> Sys for Shell<R> {
     }
 
     fn pf_flush_anchor(&self, anchor: &str) -> Result<()> {
-        self.run("pfctl", &args(["-q", "-a", anchor, "-F", "all"]))
-            .map(drop)
+        // Each part on its own: `-F all` on an anchor fails on FreeBSD 15
+        // ("Operation not supported by device") after flushing it. An
+        // anchor that is not there (or no longer, emptied) has nothing
+        // left to flush: pfctl says so, or, for tables, that same
+        // "Operation not supported by device".
+        for what in ["Tables", "nat", "rules"] {
+            let a = args(["-q", "-a", anchor, "-F", what]);
+            let out = self.output("pfctl", &a, None)?;
+            let absent = out.stderr.contains("Anchor does not exist")
+                || (what == "Tables" && out.stderr.contains("Operation not supported by device"));
+            if !out.success && !absent {
+                return Err(failed("pfctl", &a, &out));
+            }
+        }
+        Ok(())
     }
 
     fn pf_table_replace(&self, anchor: &str, table: &str, addrs: &[IpAddr]) -> Result<()> {
@@ -1803,7 +1816,25 @@ mod tests {
                 err("pfctl: Table does not exist."),
             ),
             ("pfctl -q -a legion/svc -t svc_web -T replace", ok("")),
-            ("pfctl -q -a legion/svc -F all", ok("")),
+            ("pfctl -q -a legion/svc -F Tables", ok("")),
+            ("pfctl -q -a legion/svc -F nat", ok("")),
+            // Emptied, the anchor is gone.
+            (
+                "pfctl -q -a legion/svc -F rules",
+                err("pfctl: Anchor does not exist."),
+            ),
+            // An anchor never loaded.
+            (
+                "pfctl -q -a legion/none -F Tables",
+                err("pfctl: Operation not supported by device"),
+            ),
+            ("pfctl -q -a legion/none -F nat", ok("")),
+            ("pfctl -q -a legion/none -F rules", ok("")),
+            // Anything else is an error.
+            (
+                "pfctl -q -a legion/bad -F Tables",
+                err("pfctl: Permission denied"),
+            ),
         ]);
         sh.pf_load_anchor("legion/svc", "pass in quick on legion0 from <svc_web>\n")
             .unwrap();
@@ -1817,6 +1848,8 @@ mod tests {
         assert!(sh.pf_table_show("legion/svc", "nope").unwrap().is_empty());
         sh.pf_table_replace("legion/svc", "svc_web", &[]).unwrap();
         sh.pf_flush_anchor("legion/svc").unwrap();
+        sh.pf_flush_anchor("legion/none").unwrap();
+        assert!(sh.pf_flush_anchor("legion/bad").is_err());
     }
 
     #[test]

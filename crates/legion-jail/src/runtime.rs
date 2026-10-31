@@ -1115,6 +1115,16 @@ impl legion_runtime::Runtime for JailRuntime {
             }
         } else {
             self.unmount(&rec)?;
+            // A jail just removed may be dying a while yet, its TCP
+            // connections in TIME_WAIT holding it and so its root, which
+            // its dataset's destroy would find busy. Nothing runs there
+            // now: its root is unmounted by force first.
+            if rec.dataset.is_some() {
+                if jail_names(&*self.sys)?.contains(&rec.jail) {
+                    let _ = self.sys.jail_remove(&rec.jail);
+                }
+                let _ = self.sys.unmount(&rec.root.to_string_lossy());
+            }
             // Its clone, or its copy (whose files may have flags).
             self.images
                 .cleanup_rootfs(&rec.root, rec.dataset.as_deref())
@@ -1630,6 +1640,68 @@ mod tests {
         // unmounts all as well.
         assert!(rt.start("c1").await.is_err());
         assert_eq!(mounted(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_root_a_dying_jail_holds_is_removed_all_the_same() {
+        use legion_runtime::Runtime as _;
+        let t = tempfile::tempdir().unwrap();
+        let sys = Arc::new(legion_sys::FakeSys::new());
+        sys.zfs_create("tank", &[]).unwrap();
+        let images = Store::open(
+            sys.clone(),
+            "tank/images",
+            &t.path().join("images"),
+            legion_image::Client::new().unwrap(),
+        )
+        .unwrap();
+        let rt = JailRuntime::new(
+            sys.clone(),
+            Arc::new(images),
+            Config {
+                state_dir: t.path().join("state"),
+                dataset: Some("tank/jails".into()),
+                shim: vec![t.path().join("no-shim").into()],
+                prune_images: false,
+            },
+        )
+        .unwrap();
+        let root = t.path().join("state/c2/root");
+        std::fs::create_dir_all(&root).unwrap();
+        let at = root.to_string_lossy().into_owned();
+        sys.zfs_create("tank/jails", &[("mountpoint", "none")])
+            .unwrap();
+        sys.zfs_create("tank/jails/c2", &[("mountpoint", &at)])
+            .unwrap();
+        let rec = Record {
+            id: "c2".into(),
+            name: "c2".into(),
+            image: String::new(),
+            created: 0,
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            parent: None,
+            standalone: true,
+            jail: "c2".into(),
+            root: root.clone(),
+            dataset: Some("tank/jails/c2".into()),
+            argv: vec!["/bin/true".into()],
+            env: Vec::new(),
+            user: String::new(),
+            work_dir: "/".into(),
+            hostname: "c2".into(),
+            mounts: Vec::new(),
+            params: Vec::new(),
+            stop_signal: 15,
+            stop_timeout: 10,
+            linux: false,
+        };
+        state::write(&t.path().join("state/c2"), RECORD, &rec).unwrap();
+        // Its jail ended, but is dying yet, holding its root.
+        sys.hold(&at);
+        rt.remove("c2").await.unwrap();
+        assert!(sys.zfs_list("tank/jails/c2").unwrap().is_empty());
+        assert!(!t.path().join("state/c2").exists());
     }
 
     #[test]
