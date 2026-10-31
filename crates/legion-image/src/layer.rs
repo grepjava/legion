@@ -241,7 +241,7 @@ pub fn apply(tar: &Path, root: &Path) -> Result<(), Error> {
 pub fn archive(root: &Path, tar: &Path) -> Result<(), Error> {
     let out = archive_command(root, tar).output()?;
     if !out.status.success() {
-        return Err(archiving(root, &out.stderr));
+        return Err(Error::Extract(archiving(root, &out.stderr)));
     }
     Ok(())
 }
@@ -256,12 +256,12 @@ fn archive_command(root: &Path, tar: &Path) -> Command {
     cmd
 }
 
-fn archiving(root: &Path, stderr: &[u8]) -> Error {
-    Error::Extract(format!(
+fn archiving(root: &Path, stderr: &[u8]) -> String {
+    format!(
         "archiving {}: {}",
         root.display(),
         String::from_utf8_lossy(stderr).trim()
-    ))
+    )
 }
 
 /// Copies the tree at `src` to `dst` as [`archive`] and [`extract`] keep it
@@ -287,16 +287,19 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), Error> {
         let into = extract_command(stdout, dst).stdin(pipe).output();
         let archived = from.wait()?;
         let errors = errors.join().unwrap_or_default();
-        if !archived.success() {
-            return Err(archiving(src, &errors));
-        }
         let into = into?;
-        if !into.status.success() {
-            return Err(Error::Extract(
-                String::from_utf8_lossy(&into.stderr).trim().to_owned(),
-            ));
-        }
-        return Ok(());
+        // An extraction that fails early breaks the pipe, and the archive
+        // fails after it: its error is the cause, so it comes first.
+        let extracting = String::from_utf8_lossy(&into.stderr).trim().to_owned();
+        return match (into.status.success(), archived.success()) {
+            (true, true) => Ok(()),
+            (true, false) => Err(Error::Extract(archiving(src, &errors))),
+            (false, true) => Err(Error::Extract(extracting)),
+            (false, false) => Err(Error::Extract(format!(
+                "{extracting}; {}",
+                archiving(src, &errors)
+            ))),
+        };
     }
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -518,6 +521,27 @@ mod tests {
         );
         // A source that is not there is an error.
         assert!(copy_tree(&t.path().join("none"), &t.path().join("d2")).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_copy_that_cannot_extract_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: reads this process's effective user.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root enters any directory
+        }
+        let t = tempfile::tempdir().unwrap();
+        let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+        std::fs::create_dir_all(&src).unwrap();
+        // More than a pipe holds: the archive is still writing when the
+        // extraction gives up, and fails on the broken pipe after it.
+        std::fs::write(src.join("big"), vec![7u8; 4 << 20]).unwrap();
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let e = copy_tree(&src, &dst).unwrap_err().to_string();
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(e.contains(&*dst.to_string_lossy()), "{e}");
     }
 
     #[test]

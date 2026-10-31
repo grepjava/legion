@@ -412,4 +412,25 @@ async fn what_a_push_reads_stays_while_it_runs() {
         .await
         .unwrap();
     assert!(archive.exists());
+
+    // What it packs again, it does not write over where it is already
+    // (another push may be reading it): made read-only, it is left alone.
+    let packed = blobs(plain.dir());
+    assert!(!packed.is_empty());
+    for b in &packed {
+        let path = plain.dir().join("blobs/sha256").join(b);
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+    plain
+        .export(&target.to_string(), &archive, None)
+        .await
+        .unwrap();
+    assert_eq!(blobs(plain.dir()), packed);
+    assert_eq!(
+        std::fs::read_dir(plain.dir().join("tmp")).unwrap().count(),
+        0,
+        "nothing left in the store's tmp"
+    );
 }

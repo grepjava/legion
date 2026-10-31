@@ -1087,7 +1087,7 @@ impl Store {
             );
             let art = self.with_layer_mounted(top, |root| layer::pack(root, &tar, &gz))?;
             pin.add(&[hex_of(&art.blob_digest)?])?;
-            std::fs::copy(&gz, self.blob_dest(&art.blob_digest)?)?;
+            put_blob(&gz, &self.blob_dest(&art.blob_digest)?)?;
             image.config.rootfs.diff_ids = vec![art.diff_id];
             for h in &mut image.config.history {
                 h.empty_layer = true;
@@ -1110,7 +1110,9 @@ impl Store {
         pin.add(&[hex_of(&config_digest)?])?;
         let kept = self.blob_dest(&config_digest)?;
         if !kept.exists() {
-            std::fs::write(&kept, &config_bytes)?;
+            let tmp = tempfile::NamedTempFile::new_in(self.dir.join("tmp"))?;
+            std::fs::write(tmp.path(), &config_bytes)?;
+            put_blob(tmp.path(), &kept)?;
         }
         let manifest = Manifest::new(
             Descriptor {
@@ -1250,6 +1252,17 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// Puts the file `from`, in the store's `tmp`, at the blob path `dest`,
+/// unless the blob is there already: by renaming it, so that another
+/// process reading the blob (a push or export of the same image) never
+/// sees it half written.
+fn put_blob(from: &Path, dest: &Path) -> Result<(), Error> {
+    if !dest.exists() {
+        std::fs::rename(from, dest)?;
+    }
+    Ok(())
 }
 
 fn refuse_local(target: &Reference) -> Result<(), Error> {
