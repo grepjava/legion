@@ -197,6 +197,17 @@ fn clear_flags(_: &Path) -> Result<(), Error> {
 
 /// Extracts an uncompressed layer into `root`, leaving out whiteout files.
 pub fn extract(tar: &Path, root: &Path) -> Result<(), Error> {
+    let out = extract_command(tar, root).output()?;
+    if !out.status.success() {
+        return Err(Error::Extract(
+            String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// [`extract`]'s bsdtar; `tar` is `-` for its input.
+fn extract_command(tar: &Path, root: &Path) -> Command {
     let mut cmd = Command::new("tar");
     cmd.arg("-x");
     if cfg!(target_os = "freebsd") {
@@ -216,13 +227,7 @@ pub fn extract(tar: &Path, root: &Path) -> Result<(), Error> {
         .arg("-C")
         .arg(root)
         .args(["--exclude", ".wh.*", "--exclude", "*/.wh.*"]);
-    let out = cmd.output()?;
-    if !out.status.success() {
-        return Err(Error::Extract(
-            String::from_utf8_lossy(&out.stderr).trim().to_owned(),
-        ));
-    }
-    Ok(())
+    cmd
 }
 
 /// Applies an uncompressed layer to `root`.
@@ -234,35 +239,64 @@ pub fn apply(tar: &Path, root: &Path) -> Result<(), Error> {
 /// Archives the tree at `root` into `tar` with bsdtar, keeping owners as
 /// numbers, modes and, on FreeBSD, file flags and extended attributes.
 pub fn archive(root: &Path, tar: &Path) -> Result<(), Error> {
-    let mut cmd = Command::new("tar");
-    if cfg!(target_os = "freebsd") {
-        cmd.args(["--numeric-owner", "--fflags", "--xattrs"]);
-    }
-    let out = cmd
-        .arg("-cf")
-        .arg(tar)
-        .arg("-C")
-        .arg(root)
-        .arg(".")
-        .output()?;
+    let out = archive_command(root, tar).output()?;
     if !out.status.success() {
-        return Err(Error::Extract(format!(
-            "archiving {}: {}",
-            root.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
+        return Err(archiving(root, &out.stderr));
     }
     Ok(())
 }
 
+/// [`archive`]'s bsdtar; `tar` is `-` for its output.
+fn archive_command(root: &Path, tar: &Path) -> Command {
+    let mut cmd = Command::new("tar");
+    if cfg!(target_os = "freebsd") {
+        cmd.args(["--numeric-owner", "--fflags", "--xattrs"]);
+    }
+    cmd.arg("-cf").arg(tar).arg("-C").arg(root).arg(".");
+    cmd
+}
+
+fn archiving(root: &Path, stderr: &[u8]) -> Error {
+    Error::Extract(format!(
+        "archiving {}: {}",
+        root.display(),
+        String::from_utf8_lossy(stderr).trim()
+    ))
+}
+
 /// Copies the tree at `src` to `dst` as [`archive`] and [`extract`] keep it
-/// (elsewhere than Unix, files, directories and links only).
+/// (elsewhere than Unix, files, directories and links only). On Unix one
+/// tar pipes into the other: nothing is written but the copy, however big
+/// the tree.
 pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), Error> {
     std::fs::create_dir_all(dst)?;
     if cfg!(unix) {
-        let tmp = tempfile::NamedTempFile::new()?;
-        archive(src, tmp.path())?;
-        return extract(tmp.path(), dst);
+        use std::process::Stdio;
+        let stdout = Path::new("-");
+        let mut from = archive_command(src, stdout)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let pipe = from.stdout.take().expect("piped");
+        let mut errors = from.stderr.take().expect("piped");
+        let errors = std::thread::spawn(move || {
+            let mut e = Vec::new();
+            let _ = errors.read_to_end(&mut e);
+            e
+        });
+        let into = extract_command(stdout, dst).stdin(pipe).output();
+        let archived = from.wait()?;
+        let errors = errors.join().unwrap_or_default();
+        if !archived.success() {
+            return Err(archiving(src, &errors));
+        }
+        let into = into?;
+        if !into.status.success() {
+            return Err(Error::Extract(
+                String::from_utf8_lossy(&into.stderr).trim().to_owned(),
+            ));
+        }
+        return Ok(());
     }
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -447,6 +481,43 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Run again in a process of its own whose temporary directory is
+    /// missing, between the two directories named in the environment.
+    #[test]
+    #[cfg(unix)]
+    fn a_copy_takes_no_temporary_space() {
+        const DIRS: &str = "LEGION_COPY_TREE_DIRS";
+        if let Ok(dirs) = std::env::var(DIRS) {
+            let (src, dst) = dirs.split_once('\n').unwrap();
+            copy_tree(Path::new(src), Path::new(dst)).unwrap();
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+        std::fs::create_dir_all(src.join("etc")).unwrap();
+        std::fs::write(src.join("etc/motd"), "hi").unwrap();
+        std::os::unix::fs::symlink("motd", src.join("etc/link")).unwrap();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "layer::tests::a_copy_takes_no_temporary_space"])
+            .env(DIRS, format!("{}\n{}", src.display(), dst.display()))
+            .env("TMPDIR", t.path().join("missing"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"));
+        assert_eq!(std::fs::read_to_string(dst.join("etc/motd")).unwrap(), "hi");
+        assert_eq!(
+            std::fs::read_link(dst.join("etc/link")).unwrap(),
+            Path::new("motd")
+        );
+        // A source that is not there is an error.
+        assert!(copy_tree(&t.path().join("none"), &t.path().join("d2")).is_err());
     }
 
     #[test]

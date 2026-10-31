@@ -1320,6 +1320,21 @@ real, in the order agreed with the user.
   ones on a throwaway dataset, a built layer committed on ZFS, roots as
   clones and copies, and an image exported without kept blobs packed
   again with its whiteouts and file flags as they were.
+- **Review of the shared crates** (2026-10-31). A member's start that
+  fails unmounts what it mounted, so the next one makes a new devfs, and
+  a Linux member's `/dev/shm` with it. `run_step` and `run_attached` undo
+  their jail, mounts and mount points when their future is dropped too
+  (an attached run is then recorded as ended), and the lent resolver
+  file goes back only once the step's jail is gone. A mount target with
+  `..` is refused before anything is made for it. `copy_tree` pipes one
+  tar into the other instead of through a file in `/tmp`. `export` (now
+  async) and `push` pin what they read, and what `ensure_blobs` packs
+  again, against a removal or prune meanwhile. Tested on FreeBSD 15.1:
+  the crates' tests and the live ones, with a step and an attached run
+  cancelled; each new unit test failed without its fix.
+- **A node's role is its certificate's.** Nodes registered as workers
+  whatever they were, so `legion list nodes` showed managers as workers
+  and `node.role` constraints never matched a manager.
 
 ### To do, in order
 

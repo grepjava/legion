@@ -868,10 +868,18 @@ impl Store {
     /// Writes the image [`Self::find`] finds for `query` as an OCI archive
     /// at `out`, as `legion image load` and `podman load` take it, named
     /// `name` or by its first reference. Docker's `manifest.json` is in it
-    /// too, as `docker save` writes it, for `docker load`.
-    pub fn export(&self, query: &str, out: &Path, name: Option<&str>) -> Result<Image, Error> {
+    /// too, as `docker save` writes it, for `docker load`. What it reads is
+    /// pinned while it runs.
+    pub async fn export(
+        &self,
+        query: &str,
+        out: &Path,
+        name: Option<&str>,
+    ) -> Result<Image, Error> {
+        let pin = self.pin()?;
         let mut image = self
-            .find(query)?
+            .pin_image(&pin, query)
+            .await?
             .ok_or_else(|| Error::NotFound(format!("{query}: image not found")))?;
         let name = match name {
             Some(n) => Reference::parse_local_tag(n)?.to_string(),
@@ -881,7 +889,7 @@ impl Store {
                 .cloned()
                 .unwrap_or_else(|| query.to_owned()),
         };
-        let (manifest, config_bytes) = self.ensure_blobs(&mut image)?;
+        let (manifest, config_bytes) = self.ensure_blobs(&mut image, &pin)?;
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         let manifest_digest = sha256(&manifest_bytes);
 
@@ -1030,17 +1038,20 @@ impl Store {
     }
 
     /// Uploads the layer and config blobs of the image `query` finds to
-    /// `target`'s repository, returning its manifest and platform.
+    /// `target`'s repository, returning its manifest and platform. They are
+    /// pinned while it runs.
     async fn push_blobs(
         &self,
         query: &str,
         target: &Reference,
         creds: Option<&Credentials>,
     ) -> Result<(Manifest, Platform), Error> {
+        let pin = self.pin()?;
         let mut image = self
-            .find(query)?
+            .pin_image(&pin, query)
+            .await?
             .ok_or_else(|| Error::NotFound(format!("{query}: image not found")))?;
-        let (manifest, _) = self.ensure_blobs(&mut image)?;
+        let (manifest, _) = self.ensure_blobs(&mut image, &pin)?;
         for d in manifest.layers.iter().chain([&manifest.config]) {
             let uploaded = self
                 .client
@@ -1055,8 +1066,9 @@ impl Store {
     /// returns its manifest and config. Where a layer blob is not kept, the
     /// image's files are packed again as one layer (a layer's files are the
     /// whole image up to it, not what it changed), which changes the
-    /// config, and so the image's digest.
-    fn ensure_blobs(&self, image: &mut Image) -> Result<(Manifest, Vec<u8>), Error> {
+    /// config, and so the image's digest. What it writes, no image names:
+    /// `pin` keeps it, as it keeps the image's own.
+    fn ensure_blobs(&self, image: &mut Image, pin: &Pin) -> Result<(Manifest, Vec<u8>), Error> {
         let mut kept = image.layer_descriptors.len() == image.layers.len();
         for d in &image.layer_descriptors {
             kept &= self.blob_path(&d.digest)?.exists();
@@ -1074,6 +1086,7 @@ impl Store {
                 tmp.path().join("layer.tar.gz"),
             );
             let art = self.with_layer_mounted(top, |root| layer::pack(root, &tar, &gz))?;
+            pin.add(&[hex_of(&art.blob_digest)?])?;
             std::fs::copy(&gz, self.blob_dest(&art.blob_digest)?)?;
             image.config.rootfs.diff_ids = vec![art.diff_id];
             for h in &mut image.config.history {
@@ -1094,6 +1107,7 @@ impl Store {
         let descriptors = image.layer_descriptors.clone();
         let config_bytes = serde_json::to_vec_pretty(&image.config)?;
         let config_digest = sha256(&config_bytes);
+        pin.add(&[hex_of(&config_digest)?])?;
         let kept = self.blob_dest(&config_digest)?;
         if !kept.exists() {
             std::fs::write(&kept, &config_bytes)?;

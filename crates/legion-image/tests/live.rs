@@ -302,7 +302,10 @@ async fn rootfs_copies_built_layers_and_exports_on_zfs() {
     // Exported without kept blobs, the image's files are packed again as
     // one layer, flags and whiteouts as they were.
     let archive = dir.path().join("flags.tar");
-    store.export("localhost/flags:1", &archive, None).unwrap();
+    store
+        .export("localhost/flags:1", &archive, None)
+        .await
+        .unwrap();
     let other_dir = tempfile::tempdir_in("/var/tmp").unwrap();
     let other = Store::open_directory(
         sys.clone() as Arc<dyn Sys>,

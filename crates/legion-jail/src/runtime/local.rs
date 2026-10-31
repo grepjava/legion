@@ -119,27 +119,20 @@ impl JailRuntime {
             started: state::now(),
             boot: self.boot,
         };
+        let mut undo = UndoAttached {
+            rt: self,
+            rec: &rec,
+            done: false,
+        };
         state::write(&dir, RUN, &run).map_err(internal)?;
-        let status = self
-            .shim_exec(&rec, jid, &rec.argv, stdin, tty)
-            .status()
-            .await;
-        let _ = self.sys.jail_remove(&rec.jail);
-        let _ = self.unmount(&rec);
+        let mut cmd = self.shim_exec(&rec, jid, &rec.argv, stdin, tty);
+        cmd.kill_on_drop(true);
+        let status = cmd.status().await;
         let (code, error) = match &status {
             Ok(s) => (s.code().unwrap_or(255), None),
             Err(e) => (127, Some(e.to_string())),
         };
-        state::write(
-            &dir,
-            EXIT,
-            &Exit {
-                code,
-                finished: state::now(),
-                error,
-            },
-        )
-        .map_err(internal)?;
+        undo.finish(code, error)?;
         status.map_err(|e| internal(format!("running {}: {e}", rec.name)))?;
         Ok(code)
     }
@@ -209,33 +202,34 @@ impl JailRuntime {
     /// is there while the step runs. The jail and the step's mounts go
     /// afterwards, and so do the mount points and the resolver file it
     /// made, so none of them lands in the layer.
+    /// So does all that when the future is dropped before the step ends.
     pub async fn run_step(&self, step: &Step<'_>) -> Result<i32> {
         let id = new_id();
         let dir = self.dir.join(".steps").join(&id);
         std::fs::create_dir_all(&dir).map_err(internal)?;
-        let mut made: Vec<Made> = Vec::new();
-        let ran = self.step_in(step, &dir, &mut made).await;
-        let _ = self.sys.jail_remove(step.name);
-        for (at, first) in made.iter().rev() {
-            let _ = self.sys.unmount(&at.to_string_lossy());
-            if let Some(first) = first {
-                remove_made(at, first);
-            }
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-        ran
+        let mut undo = UndoStep {
+            rt: self,
+            name: step.name,
+            dir,
+            made: Vec::new(),
+            resolver: None,
+        };
+        self.step_in(step, &mut undo).await
     }
 
-    async fn step_in(&self, step: &Step<'_>, dir: &Path, made: &mut Vec<Made>) -> Result<i32> {
+    async fn step_in(&self, step: &Step<'_>, undo: &mut UndoStep<'_>) -> Result<i32> {
+        let (dir, made) = (undo.dir.clone(), &mut undo.made);
+        let dir = dir.as_path();
         let work_dir = if step.work_dir.is_empty() {
             "/"
         } else {
             step.work_dir
         };
         target(step.root, work_dir, false)?;
-        let _resolver = (step.network == StepNetwork::Host)
+        undo.resolver = (step.network == StepNetwork::Host)
             .then(|| Resolver::lend(step.root))
-            .transpose()?;
+            .transpose()?
+            .flatten();
         // The supervisor reads the user, environment and directory here.
         let rec = Record {
             id: new_id(),
@@ -301,6 +295,63 @@ impl JailRuntime {
     }
 }
 
+/// Ends an attached run: its jail and mounts go, then its exit is
+/// recorded. Dropped before [`UndoAttached::finish`], as when the run's
+/// future is, it does the same, recording the run as cancelled.
+struct UndoAttached<'a> {
+    rt: &'a JailRuntime,
+    rec: &'a Record,
+    done: bool,
+}
+
+impl UndoAttached<'_> {
+    fn finish(&mut self, code: i32, error: Option<String>) -> Result<()> {
+        self.done = true;
+        let _ = self.rt.sys.jail_remove(&self.rec.jail);
+        let _ = self.rt.unmount(self.rec);
+        let exit = Exit {
+            code,
+            finished: state::now(),
+            error,
+        };
+        state::write(&self.rt.container_dir(&self.rec.id), EXIT, &exit).map_err(internal)
+    }
+}
+
+impl Drop for UndoAttached<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = self.finish(255, Some("cancelled".into()));
+        }
+    }
+}
+
+/// Undoes a step when dropped, whether it ended or its future was dropped:
+/// its jail goes, then its mounts and what was made for them, then the
+/// lent resolver file (nothing in the jail reads it any more), then its
+/// record.
+struct UndoStep<'a> {
+    rt: &'a JailRuntime,
+    name: &'a str,
+    dir: PathBuf,
+    made: Vec<Made>,
+    resolver: Option<Resolver>,
+}
+
+impl Drop for UndoStep<'_> {
+    fn drop(&mut self) {
+        let _ = self.rt.sys.jail_remove(self.name);
+        for (at, first) in self.made.iter().rev() {
+            let _ = self.rt.sys.unmount(&at.to_string_lossy());
+            if let Some(first) = first {
+                remove_made(at, first);
+            }
+        }
+        drop(self.resolver.take());
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// A step's jail: as a member's, but allowed to change file flags, with
 /// no securelevel, and on the host's network or a VNET of its own.
 fn step_params(step: &Step<'_>) -> Vec<(String, String)> {
@@ -333,7 +384,12 @@ fn step_params(step: &Step<'_>) -> Vec<(String, String)> {
 /// directory or file made on the way to it.
 fn mount_point(root: &Path, dest: &str, file: bool, made: &mut Vec<Made>) -> Result<PathBuf> {
     let first = first_missing(root, dest);
-    let at = target(root, dest, file)?;
+    let at = target(root, dest, file).inspect_err(|_| {
+        // What it made before failing; all of it under `first` is new.
+        if let Some(first) = &first {
+            let _ = std::fs::remove_dir_all(first);
+        }
+    })?;
     made.push((at.clone(), first));
     Ok(at)
 }
@@ -476,6 +532,17 @@ mod tests {
         assert!(!root.join("run/secrets").exists());
         assert!(root.join("run/kept").exists());
         assert!(!root.join("etc/x").exists() && root.join("etc").is_dir());
+    }
+
+    #[test]
+    fn a_refused_mount_point_leaves_nothing_made() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        let mut made = Vec::new();
+        assert!(mount_point(root, "/a/b/../../../x", false, &mut made).is_err());
+        assert!(made.is_empty());
+        assert!(!root.join("a").exists());
+        assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
     }
 
     #[test]

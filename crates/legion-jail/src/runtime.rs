@@ -351,14 +351,17 @@ fn alive(_: u32) -> bool {
 /// mount outside its root.
 fn target(root: &Path, dest: &str, file: bool) -> Result<PathBuf> {
     let mut path = root.to_path_buf();
+    // Refused before anything is made for it.
     let parts: Vec<_> = Path::new(dest)
         .components()
-        .filter(|c| !matches!(c, Component::RootDir | Component::CurDir))
-        .collect();
-    for (i, c) in parts.iter().enumerate() {
-        let Component::Normal(name) = c else {
-            return Err(api(400, format!("mount target {dest}: no `..` allowed")));
-        };
+        .filter_map(|c| match c {
+            Component::RootDir | Component::CurDir => None,
+            Component::Normal(name) => Some(Some(name)),
+            _ => Some(None),
+        })
+        .collect::<Option<_>>()
+        .ok_or_else(|| api(400, format!("mount target {dest}: no `..` allowed")))?;
+    for (i, name) in parts.iter().enumerate() {
         path.push(name);
         let last = i + 1 == parts.len();
         match std::fs::symlink_metadata(&path) {
@@ -1033,10 +1036,18 @@ impl legion_runtime::Runtime for JailRuntime {
         if jail_names(&*self.sys)?.contains(&rec.jail) {
             let _ = self.sys.jail_remove(&rec.jail);
         }
+        // A start that fails leaves nothing mounted, so the next one mounts
+        // afresh (a Linux member's `/dev/shm` is made with its devfs).
+        let undo = |e| {
+            if !rec.is_pod() {
+                let _ = self.unmount(&rec);
+            }
+            e
+        };
         if !rec.is_pod() {
-            self.mount(&rec)?;
+            self.mount(&rec).map_err(undo)?;
         }
-        let jid = self.create_jail(&rec)?;
+        let jid = self.create_jail(&rec).map_err(undo)?;
         if rec.is_pod() {
             let run = Run {
                 shim: 0,
@@ -1049,7 +1060,7 @@ impl legion_runtime::Runtime for JailRuntime {
         }
         if let Err(e) = self.supervise(&rec, jid).await {
             let _ = self.sys.jail_remove(&rec.jail);
-            return Err(e);
+            return Err(undo(e));
         }
         Ok(())
     }
@@ -1538,6 +1549,87 @@ mod tests {
         assert!(exited_since(&(exited(1), run(1)), &(exited(1), run(2))));
         assert!(!exited_since(&running(1), &running(2)));
         assert!(exited_since(&(Status::Created, None), &(exited(1), run(1))));
+    }
+
+    #[tokio::test]
+    async fn a_start_that_fails_leaves_nothing_mounted() {
+        use legion_runtime::Runtime as _;
+        let t = tempfile::tempdir().unwrap();
+        let sys = Arc::new(legion_sys::FakeSys::new());
+        let images = Store::open_directory(
+            sys.clone(),
+            &t.path().join("images"),
+            legion_image::Client::new().unwrap(),
+        )
+        .unwrap();
+        let rt = JailRuntime::new(
+            sys.clone(),
+            Arc::new(images),
+            Config {
+                state_dir: t.path().join("state"),
+                dataset: None,
+                shim: vec![t.path().join("no-shim").into()],
+                prune_images: false,
+            },
+        )
+        .unwrap();
+        let root = t.path().join("state/c1/root");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = t.path().join("data");
+        let rec = Record {
+            id: "c1".into(),
+            name: "c1".into(),
+            image: String::new(),
+            created: 0,
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            parent: None,
+            standalone: true,
+            jail: "c1".into(),
+            root: root.clone(),
+            dataset: None,
+            argv: vec!["/bin/true".into()],
+            env: Vec::new(),
+            user: String::new(),
+            work_dir: "/".into(),
+            hostname: "c1".into(),
+            mounts: vec![state::Mount {
+                source: source.to_string_lossy().into_owned(),
+                destination: "/data".into(),
+                read_only: false,
+            }],
+            params: Vec::new(),
+            stop_signal: 15,
+            stop_timeout: 10,
+            linux: true,
+        };
+        state::write(&t.path().join("state/c1"), RECORD, &rec).unwrap();
+        let mounted = || sys.mounts(&root.to_string_lossy()).unwrap();
+
+        // The volume's source is missing: the devfs and Linux file systems
+        // mounted before it go again.
+        assert!(rt.start("c1").await.is_err());
+        assert_eq!(mounted(), Vec::<String>::new());
+        // `/proc` is a link, refused after the devfs is mounted and before
+        // `/dev/shm` is made in it: that devfs goes too, so the next mount
+        // makes a new one, with `/dev/shm`.
+        std::fs::create_dir(&source).unwrap();
+        std::fs::remove_dir(root.join("proc")).unwrap();
+        std::os::unix::fs::symlink("/proc", root.join("proc")).unwrap();
+        assert!(rt.start("c1").await.is_err());
+        assert_eq!(mounted(), Vec::<String>::new());
+        std::fs::remove_file(root.join("proc")).unwrap();
+        rt.mount(&rec).unwrap();
+        let shm = root.join("dev/shm").to_string_lossy().into_owned();
+        assert!(
+            sys.devfs_links().contains_key(&shm),
+            "{:?}",
+            sys.devfs_links()
+        );
+        // The supervisor is missing: a start that gets that far fails, and
+        // unmounts all as well.
+        assert!(rt.start("c1").await.is_err());
+        assert_eq!(mounted(), Vec::<String>::new());
     }
 
     #[test]

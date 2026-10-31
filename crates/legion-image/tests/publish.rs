@@ -20,6 +20,12 @@ use legion_sys::{FakeSys, Sys};
 struct Registry {
     blobs: BTreeMap<String, Vec<u8>>,
     manifests: BTreeMap<String, Vec<u8>>,
+    /// Told when a push next asks whether a blob is here; the question
+    /// then waits to be resumed.
+    hook: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
 }
 
 /// Serves `registry` without authentication, taking monolithic uploads.
@@ -58,6 +64,14 @@ async fn answer(
     let path = req.uri().path().to_owned();
     let query = req.uri().query().unwrap_or("").to_owned();
     let body = req.into_body().collect().await.unwrap().to_bytes().to_vec();
+    // Before a push reads the blob it asks about.
+    if method == Method::HEAD && path.contains("/blobs/") {
+        let hook = registry.lock().unwrap().hook.take();
+        if let Some((told, resume)) = hook {
+            let _ = told.send(());
+            let _ = resume.await;
+        }
+    }
     let last = path.rsplit('/').next().unwrap_or("").to_owned();
     let mut r = registry.lock().unwrap();
     match method {
@@ -189,7 +203,7 @@ async fn built_images_kept_without_zfs_pinned_and_exported() {
     // An export loads into another store as the same image, and holds
     // Docker's manifest too.
     let archive = t.path().join("app.tar");
-    s.export("app:1", &archive, None).unwrap();
+    s.export("app:1", &archive, None).await.unwrap();
     let other = directory_store(&t.path().join("other"), Client::new().unwrap());
     let loaded = other.load(&archive, None).await.unwrap();
     assert_eq!(
@@ -330,4 +344,72 @@ async fn pushes_images_and_indexes_and_pulls_them_back() {
     let root = t.path().join("repacked");
     fresh.prepare_rootfs(&repacked, &root, None).unwrap();
     assert_eq!(std::fs::read_to_string(root.join("bin/app")).unwrap(), "n");
+}
+
+#[tokio::test]
+async fn what_a_push_reads_stays_while_it_runs() {
+    let registry = Arc::new(Mutex::new(Registry::default()));
+    let addr = serve(registry.clone()).await;
+    let client = || Client::new().unwrap().plain_http(&addr);
+    let t = tempfile::tempdir().unwrap();
+    // Pauses the next upload; while it waits, `meddle` runs.
+    async fn paused<F: Future<Output = ()>>(
+        registry: &Mutex<Registry>,
+        push: impl Future<Output = Result<String, legion_image::Error>>,
+        meddle: impl FnOnce() -> F,
+    ) -> Result<String, legion_image::Error> {
+        let (told, arrived) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        registry.lock().unwrap().hook = Some((told, resumed));
+        let meddling = async {
+            arrived.await.unwrap();
+            meddle().await;
+            resume.send(()).unwrap();
+        };
+        tokio::join!(push, meddling).0
+    }
+
+    // The image removed while it is pushed: its blobs stay until the push
+    // is done.
+    let s = directory_store(&t.path().join("store"), client());
+    let pin = s.pin().unwrap();
+    let image = build(&s, &pin, "app:gone", oci::arch(), &[("bin/app", "g")]).await;
+    drop(pin);
+    let target = Reference::parse(&format!("{addr}/me/app:gone")).unwrap();
+    let pushed = paused(&registry, s.push("app:gone", &target, None), || async {
+        assert!(s.remove("localhost/app:gone").await.unwrap());
+    })
+    .await;
+    assert_eq!(pushed.unwrap(), image.digest);
+    assert!(s.find("app:gone").unwrap().is_none());
+    s.prune().await.unwrap();
+    assert!(blobs(s.dir()).is_empty(), "and go after it");
+
+    // A store that keeps no blobs packs the layer again for a push; a prune
+    // meanwhile leaves what it packed.
+    let plain = Store::open_directory(
+        Arc::new(FakeSys::new()) as Arc<dyn Sys>,
+        &t.path().join("plain"),
+        client(),
+    )
+    .unwrap();
+    plain.pull(&target.to_string(), None, "t").await.unwrap();
+    let again = Reference::parse(&format!("{addr}/me/app:again")).unwrap();
+    let pushed = paused(
+        &registry,
+        plain.push(&target.to_string(), &again, None),
+        || async {
+            plain.prune().await.unwrap();
+        },
+    )
+    .await;
+    pushed.unwrap();
+
+    // An export, too, holds what it reads.
+    let archive = t.path().join("plain.tar");
+    plain
+        .export(&target.to_string(), &archive, None)
+        .await
+        .unwrap();
+    assert!(archive.exists());
 }

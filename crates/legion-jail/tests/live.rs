@@ -605,8 +605,25 @@ async fn standalone_containers_and_build_steps() {
     assert!(!sys.jails().unwrap().iter().any(|j| j.name == once));
     // And again.
     assert_eq!(rt.run_attached(&once, false, false).await.unwrap(), 7);
+    // Its future dropped while it runs: the same, and recorded as ended.
+    let long = rt.create(&standalone("long", "sleep 60")).await.unwrap();
+    let attached = rt.run_attached(&long, false, false);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), attached)
+            .await
+            .is_err()
+    );
+    assert!(!rt.inspect(&long).await.unwrap().state.running);
+    assert!(!sys.jails().unwrap().iter().any(|j| j.name == long));
+    let left: Vec<String> = sys.mounts(&dir.as_path().to_string_lossy()).unwrap();
+    assert!(
+        !left
+            .iter()
+            .any(|m| m.contains(&long) && m.ends_with("/dev")),
+        "{left:?}"
+    );
 
-    for id in [&app, &once] {
+    for id in [&app, &once, &long] {
         rt.remove(id).await.unwrap();
     }
     assert!(rt.list(&[]).await.unwrap().is_empty());
@@ -716,6 +733,24 @@ async fn standalone_containers_and_build_steps() {
     };
     assert_eq!(rt.run_step(&alone).await.unwrap(), 3);
     assert_eq!(read("ifs"), "lo0\n");
+    // Its future dropped while it runs: all of that goes all the same.
+    let slow = Step {
+        argv: &argv("sleep 60"),
+        ..step
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), rt.run_step(&slow))
+            .await
+            .is_err()
+    );
+    assert!(!build.join("legion-out").exists());
+    assert!(!build.join("legion-scratch").exists());
+    assert_eq!(
+        std::fs::read(build.join("etc/resolv.conf")).ok(),
+        resolv_before
+    );
+    let steps = dir.as_path().join("jails/.steps");
+    assert!(!steps.exists() || std::fs::read_dir(&steps).unwrap().next().is_none());
     assert!(!sys.jails().unwrap().iter().any(|j| j.name == "lstand_step"));
     assert!(
         sys.mounts(&build.to_string_lossy())
