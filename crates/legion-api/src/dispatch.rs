@@ -91,7 +91,13 @@ pub struct NamespacedPolicy {
 pub struct NamespacedRoute {
     pub namespace: String,
     pub name: String,
+    /// Without `tls.acme`, which the proxies have no use for.
     pub spec: crate::route::RouteSpec,
+    /// The HTTP-01 challenges the proxies answer for the route's host,
+    /// token to key authorization, while the leader orders its
+    /// certificate.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub challenges: std::collections::BTreeMap<String, String>,
 }
 
 /// Every route in the cluster.

@@ -1070,14 +1070,24 @@ async fn follow_cluster(store: Store, out: Followed, mut closing: watch::Receive
     }
 }
 
+/// Every route, with the challenges the leader is having validated for it
+/// (DESIGN.md §5.8). The ACME settings stay behind: proxies do not need
+/// them, and those before them refuse a `tls` they do not know.
 fn routes(routes: &BTreeMap<ObjectKey, Object>) -> Routes {
     routes
         .values()
         .filter_map(|r| {
+            let mut spec: legion_api::route::RouteSpec = legion_api::parse(&r.spec).ok()?;
+            if let Some(tls) = &mut spec.tls {
+                tls.acme = None;
+            }
+            let status: legion_api::route::RouteStatus =
+                serde_json::from_value(r.status.clone()).unwrap_or_default();
             Some(NamespacedRoute {
                 namespace: r.metadata.namespace.clone(),
                 name: r.metadata.name.clone(),
-                spec: legion_api::parse(&r.spec).ok()?,
+                spec,
+                challenges: status.acme.map(|a| a.challenges).unwrap_or_default(),
             })
         })
         .collect()
@@ -1345,6 +1355,36 @@ fn unexpected(outcome: Outcome) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routes_go_out_with_their_challenges_and_without_acme() {
+        let mut r = Object::new(
+            Kind::Route,
+            "shop",
+            "www",
+            serde_json::json!({
+                "host": "shop.example.org",
+                "service": "web",
+                "tls": {"secret": "cert", "acme": {"email": "ops@example.org"}},
+            }),
+        );
+        r.status = serde_json::json!({"acme": {"challenges": {"tok": "tok.thumb"}, "failures": 2}});
+        let plain = Object::new(
+            Kind::Route,
+            "shop",
+            "plain",
+            serde_json::json!({"host": "plain.example.org", "service": "web"}),
+        );
+        let out = routes(&[r, plain].into_iter().map(|o| (o.key(), o)).collect());
+        let (plain, www) = (&out[0], &out[1]);
+        assert_eq!(www.spec.tls.as_ref().unwrap().secret, "cert");
+        assert_eq!(www.spec.tls.as_ref().unwrap().acme, None);
+        assert_eq!(www.challenges["tok"], "tok.thumb");
+        assert!(plain.challenges.is_empty());
+        // What older agents read: no `acme`, which they would refuse.
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(!json.contains("acme") && !json.contains("ops@"), "{json}");
+    }
 
     fn subnet(n: u32) -> String {
         legion_net::node_subnet(n).unwrap().to_string()

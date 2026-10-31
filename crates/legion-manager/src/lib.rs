@@ -7,6 +7,7 @@
 //! cluster CA: the API takes admins and managers, the dispatcher workers and
 //! managers, the Raft transport only managers. Without it (tests only) everything is plaintext.
 
+pub mod acme;
 mod api;
 mod authz;
 pub mod autolock;
@@ -204,6 +205,9 @@ impl Manager {
                 closing.clone(),
             ))
         });
+        let acme = self
+            .controllers
+            .then(|| tokio::spawn(acme::run(self.store.clone(), self.id, closing.clone())));
         let issuer = match (&self.credentials, &self.ca_key_pem) {
             (Some(c), Some(key)) => Some(join::Issuer {
                 ca: std::sync::Arc::new(legion_pki::Ca::load(c.ca_pem(), key)?),
@@ -317,6 +321,9 @@ impl Manager {
         let _ = closing_tx.send(true);
         if let Some(controllers) = controllers {
             let _ = controllers.await;
+        }
+        if let Some(acme) = acme {
+            let _ = acme.await;
         }
         if let Some(migrator) = migrator {
             let _ = migrator.await;

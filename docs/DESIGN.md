@@ -926,8 +926,32 @@ node and routes change without reloads.
   last good one. A host without a certificate fails the handshake. The
   backend gets `X-Forwarded-Proto: https`. Plain HTTP still serves the
   route; redirecting it is left to the backend.
+- **Certificates from ACME** (`tls: { secret, acme: { email, directory }
+  }`, Let's Encrypt's directory unless given; applying such a route
+  accepts the authority's terms). The leader keeps the Secret holding a
+  certificate for the route's host, and for the hosts of every route
+  naming the same Secret, which share one: it orders one when the Secret
+  has none for every host, or one past two thirds of its life (60 days of
+  Let's Encrypt's 90), so a certificate given by hand is kept while it
+  lasts. Validation is HTTP-01, on port 80 of whichever node the host's
+  name leads to: the leader writes each challenge's token and key
+  authorization into the routes' status, the dispatcher hands them to the
+  proxies with the routes, and every proxy answers
+  `/.well-known/acme-challenge/<token>` for that host; other paths, and
+  other tokens, go to the backend. Then it writes the chain and a new
+  P-256 key into the Secret (creating it; one holding no certificate is
+  left alone, as the status says, so a mistyped name cannot wipe
+  another Secret), and the proxies take it as any renewed Secret. The status says when the certificate expires, or
+  why the last order failed and when the next is: after 10 minutes, then
+  twice as long each time up to a day, which stays within Let's Encrypt's
+  limits on failed validations. Each directory and email has an account,
+  made on first use and kept in a Secret of `legion-system`. A `*.` host
+  needs a DNS challenge and is refused; the authority's directory must be
+  HTTPS (plain HTTP only on loopback, for tests). Proxies get routes
+  without the `acme` settings, which proxies of 0.1.6 would refuse.
 - **Not yet:** HTTP/2 to backends (so no gRPC backends), WebSocket over
-  HTTP/2, retries on another task, certificates from ACME.
+  HTTP/2, retries on another task, DNS challenges (so no wildcard
+  certificates from ACME).
 
 ---
 

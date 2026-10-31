@@ -271,6 +271,24 @@ pub fn validity(cert_pem: &str) -> Result<(SystemTime, Duration)> {
     Ok((to, to.duration_since(from).unwrap_or_default()))
 }
 
+/// The DNS names the first certificate in `pem` is for.
+pub fn dns_names(cert_pem: &str) -> Result<Vec<String>> {
+    let der = first_cert_der(cert_pem)?;
+    let (_, cert) = X509Certificate::from_der(&der)
+        .map_err(|e| Error::Invalid(format!("unreadable certificate: {e}")))?;
+    let san = cert
+        .subject_alternative_name()
+        .map_err(|e| Error::Invalid(format!("unreadable subject alternative names: {e}")))?;
+    Ok(san
+        .into_iter()
+        .flat_map(|san| &san.value.general_names)
+        .filter_map(|n| match n {
+            x509_parser::extensions::GeneralName::DNSName(d) => Some(d.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect())
+}
+
 /// Whether a certificate has used up two thirds of its life, when it is
 /// renewed (DESIGN.md §9).
 pub fn needs_renewal(cert_pem: &str, now: SystemTime) -> bool {
@@ -464,6 +482,25 @@ mod tests {
         assert!(!needs_renewal(&issued.cert_pem, now + CERT_LIFETIME / 2));
         assert!(needs_renewal(&issued.cert_pem, not_after - lifetime / 3));
         assert!(needs_renewal("garbage", now));
+    }
+
+    #[test]
+    fn names_of_a_certificate() {
+        let mut params = rcgen::CertificateParams::new(vec![
+            "Shop.example.org".to_owned(),
+            "www.example.org".to_owned(),
+        ])
+        .unwrap();
+        params
+            .subject_alt_names
+            .push(SanType::IpAddress([127, 0, 0, 1].into()));
+        let key = KeyPair::generate().unwrap();
+        let pem = params.self_signed(&key).unwrap().pem();
+        assert_eq!(
+            dns_names(&pem).unwrap(),
+            ["shop.example.org", "www.example.org"]
+        );
+        assert!(dns_names("garbage").is_err());
     }
 
     #[test]

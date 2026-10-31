@@ -212,9 +212,11 @@ legion delete RoleBinding alice -n shop        # takes her rights away
 Nodes started with `--ingress-listen 0.0.0.0:80` (and
 `--ingress-tls-listen 0.0.0.0:443`) serve `Route` objects: HTTP by host
 and path to a service's ready tasks, HTTPS with a certificate and key
-from a Secret the route names. Any node may read those Secrets until
-one node is labelled as serving HTTPS; then only labelled nodes may, so
-label every node that serves it:
+from a Secret the route names, which the cluster can keep filled from
+Let's Encrypt (`tls: { secret: shop-cert, acme: { email:
+ops@example.org } }`, validated on port 80). Any node may read those
+Secrets until one node is labelled as serving HTTPS; then only labelled
+nodes may, so label every node that serves it:
 
 ```sh
 legion node label n1 legion.ingress=true    # key- removes a label

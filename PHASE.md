@@ -716,7 +716,7 @@ service and migrates between nodes.
 
 Nothing left in phase 4.
 
-Smaller follow-ups: ingress certificates from ACME.
+Smaller follow-ups: none.
 
 - **Ingress HTTP/2 and connection reuse** (`legion-agent::ingress`,
   DESIGN.md §5.8): clients speak HTTP/1.1 or HTTP/2 (ALPN `h2` over TLS,
@@ -734,6 +734,22 @@ Smaller follow-ups: ingress certificates from ACME.
   keep their node keys unsealed. Tested: the key taken over, kept,
   sealed and unsealed with the others, refused while locked, opened by
   the unlock key, and made where there is none.
+
+- **Ingress certificates from ACME** (`tls.acme`, `legion_manager::acme`,
+  DESIGN.md §5.8): the leader orders and renews (past two thirds of
+  their life) certificates for routes that ask, one per Secret for all
+  the hosts of the routes naming it, with instant-acme; HTTP-01
+  challenges travel in the routes' status to every proxy, which answers
+  them for the route's host; failures back off from 10 minutes to a day,
+  as the status shows; accounts are kept in `legion-system` Secrets.
+  Tested: admission (no `*.` hosts, HTTPS directories but loopback, email
+  addresses); the dispatcher handing challenges out and keeping `acme`
+  from older proxies; the proxy answering a token for its host only; and
+  a manager against an ACME authority served in the test, which checks
+  each answer as the proxies would serve it: two routes sharing one
+  certificate, a host added and a short-lived certificate renewed with
+  the account kept, a failed validation recorded with its retry, and a
+  Secret holding no certificate left alone.
 
 ## Phase 5 — Extensions
 

@@ -9,8 +9,12 @@ publish.workspace = true
 
 [dependencies]
 base64.workspace = true
+bytes.workspace = true
 http.workspace = true
 http-body.workspace = true
+hyper-rustls.workspace = true
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2", "tokio"] }
+instant-acme.workspace = true
 legion-api.workspace = true
 legion-net.workspace = true
 legion-pki.workspace = true
@@ -20,6 +24,7 @@ legion-sys.workspace = true
 openraft.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
@@ -30,6 +35,9 @@ tower-service.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["http1", "server"] }
+rcgen.workspace = true
 legion-pki.workspace = true
 serde_yaml_ng.workspace = true
 tempfile.workspace = true

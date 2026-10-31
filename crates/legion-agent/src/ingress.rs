@@ -9,7 +9,9 @@
 //!
 //! HTTPS serves the hosts of routes with `tls`, each with the certificate
 //! in its Secret, chosen by SNI; the Secrets are read again when routes
-//! change and every minute, so renewed certificates take over.
+//! change and every minute, so renewed certificates take over. While the
+//! leader orders a route's certificate from an ACME authority, the proxy
+//! answers its HTTP-01 challenges for the route's host.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
@@ -45,6 +47,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a connection to a backend is kept open for another request.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Where an ACME authority asks for a challenge's key authorization.
+const CHALLENGE_PATH: &str = "/.well-known/acme-challenge/";
 
 /// How often the routes' certificates are read again.
 const CERTIFICATES_PERIOD: Duration = Duration::from_secs(60);
@@ -243,6 +248,15 @@ fn reply(status: StatusCode, message: &str) -> Response<Body> {
 }
 
 impl Proxy {
+    /// The key authorization for challenge `token` of a route of `host`.
+    fn challenge(&self, host: &str, token: &str) -> Option<String> {
+        let routes = self.routes.borrow();
+        routes
+            .iter()
+            .filter(|r| r.spec.host == host)
+            .find_map(|r| r.challenges.get(token).cloned())
+    }
+
     /// The backend for a request: a ready task's address and port.
     fn backend(&self, host: &str, path: &str) -> Result<SocketAddr, (StatusCode, String)> {
         let routes = self.routes.borrow();
@@ -300,6 +314,20 @@ impl Proxy {
             .filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit()))
             .map_or(host, |(name, _)| name)
             .to_ascii_lowercase();
+        if let Some(token) = req.uri().path().strip_prefix(CHALLENGE_PATH)
+            && let Some(answer) = self.challenge(&host, token)
+        {
+            let mut r = Response::new(
+                Full::new(Bytes::from(answer))
+                    .map_err(|n| match n {})
+                    .boxed(),
+            );
+            r.headers_mut().insert(
+                hyper::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            return r;
+        }
         let backend = match self.backend(&host, req.uri().path()) {
             Ok(b) => b,
             Err((status, why)) => return reply(status, &why),
@@ -437,6 +465,7 @@ mod tests {
                 port: None,
                 tls: None,
             },
+            challenges: Default::default(),
         }
     }
 
@@ -548,6 +577,43 @@ mod tests {
         assert_eq!(
             get(proxy, "shop.example.org", "/").await.0,
             StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[tokio::test]
+    async fn acme_challenges_answered_for_their_host() {
+        let web = backend("web").await;
+        let mut shop = route("www", "shop.example.org", "/", "web");
+        shop.challenges
+            .insert("tok-1".into(), "tok-1.thumbprint".into());
+        let (_routes_tx, routes) =
+            watch::channel(vec![shop, route("other", "other.example.org", "/", "web")]);
+        let (_endpoints_tx, endpoints) =
+            watch::channel(vec![service("web", web, vec![Ipv4Addr::LOCALHOST])]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, routes, endpoints));
+
+        let path = "/.well-known/acme-challenge/tok-1";
+        assert_eq!(
+            get(proxy, "Shop.example.org:80", path).await,
+            (StatusCode::OK, "tok-1.thumbprint".to_owned())
+        );
+        // Other tokens, and the token on another host, go to the backend.
+        let (status, body) = get(
+            proxy,
+            "shop.example.org",
+            "/.well-known/acme-challenge/tok-2",
+        )
+        .await;
+        assert_eq!(
+            (status, body.split(' ').next()),
+            (StatusCode::OK, Some("web"))
+        );
+        let (status, body) = get(proxy, "other.example.org", path).await;
+        assert_eq!(
+            (status, body.split(' ').next()),
+            (StatusCode::OK, Some("web"))
         );
     }
 
@@ -734,10 +800,12 @@ mod tests {
         let mut shop = route("www", "shop.example.org", "/", "web");
         shop.spec.tls = Some(legion_api::route::RouteTls {
             secret: "shop-cert".into(),
+            acme: None,
         });
         let mut any = route("any", "*.example.org", "/", "web");
         any.spec.tls = Some(legion_api::route::RouteTls {
             secret: "wild-cert".into(),
+            acme: None,
         });
         let (routes_tx, routes) = watch::channel(vec![shop, any]);
         let (_endpoints_tx, endpoints) =

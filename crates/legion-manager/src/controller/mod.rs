@@ -31,8 +31,23 @@ pub async fn run(
     store: Store,
     id: NodeId,
     usage: std::sync::Arc<crate::usage::Usage>,
-    mut closing: watch::Receiver<bool>,
+    closing: watch::Receiver<bool>,
 ) {
+    while_leading(&store, id, closing, "controllers", || lead(&store, &usage)).await
+}
+
+/// Runs `lead` whenever this manager leads, stopping it when another does,
+/// until `closing` turns true.
+pub(crate) async fn while_leading<F, Fut>(
+    store: &Store,
+    id: NodeId,
+    mut closing: watch::Receiver<bool>,
+    what: &str,
+    mut lead: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = ()>,
+{
     let mut metrics = store.raft.metrics();
     loop {
         // Wait for leadership.
@@ -48,10 +63,10 @@ pub async fn run(
                 _ = closing.changed() => {}
             }
         }
-        tracing::info!("leading: controllers started");
+        tracing::info!("leading: {what} started");
         tokio::select! {
-            _ = lead(&store, &usage) => {}
-            _ = lost(&mut metrics, id) => tracing::info!("no longer leading: controllers stopped"),
+            _ = lead() => {}
+            _ = lost(&mut metrics, id) => tracing::info!("no longer leading: {what} stopped"),
             _ = closing.wait_for(|c| *c) => return,
         }
     }
