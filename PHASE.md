@@ -1349,6 +1349,21 @@ real, in the order agreed with the user.
   address) nor its WireGuard MTU. Tested
   on FreeBSD 15.1: the crates' tests and the jail live tests (CPUs read
   back from a member's jail and from inside a step).
+- **Two nodes over the internet** (2026-10-31, v0.1.6). A public FreeBSD
+  15.1 VPS (UFS root, a 20 GB file-backed pool for `--zfs-root`) is the
+  manager; weft-bsd, behind NAT, left its one-node cluster (its state kept
+  aside) and joined as a worker, its WireGuard endpoint learned from its
+  keepalives. Across them, ~225 ms apart: a service's two replicas on
+  both nodes, reached directly over IPv4 and IPv6 and through the VIP
+  by name, balanced over both; a `node.role == manager` constraint
+  placing on the manager; both daemons upgraded with their pods adopted;
+  the worker stopped, suspect in 3 s, down in 15 s, its tasks orphaned
+  and replaced on the manager; restarted, it removed its orphaned pods.
+  The test image was built with jailer 0.4.0 and loaded with
+  `legion image load`. Found and fixed on the way: a pod's first
+  outside connection waited ~30 s for IPv6 (a new VNET has no address
+  selection policies); a node that joined another cluster kept its old
+  bridge IPv6 address, routing another node's subnet into its own bridge.
 - **A node's role is its certificate's.** Nodes registered as workers
   whatever they were, so `legion list nodes` showed managers as workers
   and `node.role` constraints never matched a manager.
