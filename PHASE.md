@@ -1271,8 +1271,8 @@ real, in the order agreed with the user.
   FreeBSD 15.1 in a ports tree, from a tarball of the tree standing for
   the release's: built, `check-plist` and `stage-qa` (with `DEVELOPER`)
   clean, packaged (5 MB, no dependencies), installed into an empty root,
-  its `legion --version` run. Not done: a poudriere run, tagging a
-  release and submitting the port, which are the user's.
+  its `legion --version` run. Not done: a poudriere run and
+  submitting the port, which are the user's (v0.1.0 is tagged).
 
 ### To do, in order
 
