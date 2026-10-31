@@ -40,12 +40,22 @@ fn free_addr() -> String {
 }
 
 fn start_daemon() -> Daemon {
-    start_daemon_in(tempfile::tempdir().unwrap(), free_addr())
+    // Another test may take the free port before the daemon listens on it;
+    // the daemon then exits, and another port is tried.
+    for _ in 0..5 {
+        let mut daemon = spawn_daemon(tempfile::tempdir().unwrap(), free_addr());
+        match up(&mut daemon) {
+            Ok(()) => return daemon,
+            Err((true, _)) => continue,
+            Err((false, log)) => panic!("daemon did not come up:\n{log}"),
+        }
+    }
+    panic!("daemon exited on five ports");
 }
 
 fn start_daemon_in(dir: tempfile::TempDir, server: String) -> Daemon {
-    let daemon = spawn_daemon(dir, server);
-    wait_up(&daemon);
+    let mut daemon = spawn_daemon(dir, server);
+    wait_up(&mut daemon);
     daemon
 }
 
@@ -73,20 +83,34 @@ fn spawn_daemon(dir: tempfile::TempDir, server: String) -> Daemon {
 }
 
 /// Waits for the daemon to answer; shows its log if it does not.
-fn wait_up(daemon: &Daemon) {
-    let log_path = daemon._dir.path().join("daemon.log");
+fn wait_up(daemon: &mut Daemon) {
+    if let Err((_, log)) = up(daemon) {
+        panic!("daemon did not come up:\n{log}");
+    }
+}
+
+/// Waits for the daemon to answer. Otherwise the tail of its log, and
+/// whether it exited rather than staying silent.
+fn up(daemon: &mut Daemon) -> Result<(), (bool, String)> {
+    let tail = |daemon: &Daemon| {
+        let log = std::fs::read_to_string(daemon._dir.path().join("daemon.log"));
+        let log = log.unwrap_or_default();
+        let tail: Vec<&str> = log.lines().rev().take(30).collect();
+        tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+    };
     // Generous: the first start of a freshly built binary can be slow (on
     // Windows, while it is scanned).
     let deadline = Instant::now() + Duration::from_secs(60);
     while !legion(daemon, &["status"]).status.success() {
+        if daemon.child.try_wait().unwrap().is_some() {
+            return Err((true, tail(daemon)));
+        }
         if Instant::now() >= deadline {
-            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-            let tail: Vec<&str> = log.lines().rev().take(30).collect();
-            let tail: Vec<&str> = tail.into_iter().rev().collect();
-            panic!("daemon did not come up:\n{}", tail.join("\n"));
+            return Err((false, tail(daemon)));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    Ok(())
 }
 
 fn legion(d: &Daemon, args: &[&str]) -> Output {
@@ -677,7 +701,7 @@ fn autolock_seals_the_keys_and_a_restart_waits_for_the_unlock_key() {
     // Restarted, it serves nothing but Unlock until given the key.
     let server = d.server.clone();
     let dir = d.kill();
-    let d = spawn_daemon(dir, server);
+    let mut d = spawn_daemon(dir, server);
     let wrong = format!("LGN-UNLOCK-{}", "A".repeat(43));
     refuses(&d, &wrong);
     assert!(!legion(&d, &["status"]).status.success(), "locked");
@@ -687,7 +711,7 @@ fn autolock_seals_the_keys_and_a_restart_waits_for_the_unlock_key() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    wait_up(&d);
+    wait_up(&mut d);
     assert!(ok(&d, &["get", "namespace", "kept"]).contains("name: kept"));
 
     // Rotated, the old key no longer opens it.
@@ -701,10 +725,10 @@ fn autolock_seals_the_keys_and_a_restart_waits_for_the_unlock_key() {
     }
     let server = d.server.clone();
     let dir = d.kill();
-    let d = spawn_daemon(dir, server);
+    let mut d = spawn_daemon(dir, server);
     refuses(&d, &key);
     assert!(unlock(&d, &rotated).status.success());
-    wait_up(&d);
+    wait_up(&mut d);
 
     // Disabled, the keys are in the clear again and a restart needs none.
     assert!(ok(&d, &["autolock", "disable"]).contains("autolock is off"));
