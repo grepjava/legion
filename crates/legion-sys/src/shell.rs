@@ -210,6 +210,18 @@ fn stream(
     })
 }
 
+/// The IPv6 addresses `ifconfig <if> inet6` shows that are neither
+/// link-local nor `keep`.
+fn stale_inet6(shown: &str, keep: std::net::Ipv6Addr) -> Vec<std::net::Ipv6Addr> {
+    shown
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("inet6 "))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .filter_map(|a| a.split('%').next()?.parse::<std::net::Ipv6Addr>().ok())
+        .filter(|a| *a != keep && !a.is_unicast_link_local() && !a.is_loopback())
+        .collect()
+}
+
 /// Whether jls says the jail is gone: not there, or dying, which is a
 /// jail already removed whose last references (sockets timing out, its
 /// root's vnode) have yet to go.
@@ -498,6 +510,18 @@ impl<R: Runner> Sys for Shell<R> {
             let mut a = in_jail(jail);
             a.extend(args([name, "inet6", &addr.to_string()]));
             self.run("ifconfig", &a)?;
+            // `inet` replaces the address, `inet6` adds one: others but the
+            // link-local go, as an address left from an earlier subnet
+            // (a node that joined another cluster) would route that
+            // subnet here.
+            let mut show = in_jail(jail);
+            show.extend(args([name, "inet6"]));
+            let shown = self.run("ifconfig", &show)?;
+            for old in stale_inet6(&shown, addr.addr) {
+                let mut a = in_jail(jail);
+                a.extend(args([name, "inet6", &old.to_string(), "-alias"]));
+                self.run("ifconfig", &a)?;
+            }
         }
         Ok(())
     }
@@ -1637,6 +1661,20 @@ mod tests {
             ("ifconfig -j pod1 epair0b inet6 -ifdisabled no_dad", ok("")),
             (
                 "ifconfig -j pod1 epair0b inet6 fd00:10:200:3::11/64",
+                ok(""),
+            ),
+            // One left from another subnet goes; the link-local stays.
+            (
+                "ifconfig -j pod1 epair0b inet6",
+                ok(
+                    "epair0b: flags=8863<UP,BROADCAST,RUNNING> metric 0 mtu 1420\n\
+                    \tinet6 fe80::1%epair0b prefixlen 64 scopeid 0x2\n\
+                    \tinet6 fd00:10:200:3::11 prefixlen 64\n\
+                    \tinet6 fd00:10:200::11 prefixlen 64\n",
+                ),
+            ),
+            (
+                "ifconfig -j pod1 epair0b inet6 fd00:10:200::11 -alias",
                 ok(""),
             ),
             ("route -j pod1 -q add default 10.200.3.1", ok("")),
