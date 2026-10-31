@@ -116,6 +116,24 @@ pub struct PodNetwork {
     /// What the names of pods' host interfaces start with: [`HOST_PREFIX`],
     /// unless named otherwise.
     pub prefix: String,
+    /// Where its IPv6 addresses come from: the cluster's range, unless
+    /// [`Self::with_v6`] or [`Self::without_v6`] say otherwise.
+    pub v6: PodV6,
+    /// The bridge's and pods' MTU: [`MTU`], for the WireGuard mesh, unless
+    /// [`Self::with_mtu`] says otherwise.
+    pub mtu: u32,
+}
+
+/// Where a pod network's IPv6 addresses come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PodV6 {
+    /// Legion's: [`v6`]'s, in the cluster's range.
+    Cluster,
+    /// A /64 of a tool's own: a pod's address there ends in the last two
+    /// octets of its IPv4 address (`10.88.1.5` is `<net>::1:5`).
+    Within(Ipv6Net),
+    /// None: IPv4 only.
+    Off,
 }
 
 /// The longest interface name FreeBSD takes.
@@ -127,7 +145,38 @@ impl PodNetwork {
             subnet: Ipv4Net::new(subnet.network(), subnet.prefix),
             bridge: BRIDGE.to_owned(),
             prefix: HOST_PREFIX.to_owned(),
+            v6: PodV6::Cluster,
+            mtu: MTU,
         }
+    }
+
+    /// The same network with its IPv6 addresses in the /64 that `net`
+    /// starts (its first 64 bits), not the cluster's range, which a tool
+    /// beside Legion must not take. `None` for a prefix longer than 64.
+    pub fn with_v6(self, net: Ipv6Net) -> Option<Self> {
+        if net.prefix > NODE_PREFIX6 {
+            return None;
+        }
+        let [a, b, c, d, ..] = net.addr.segments();
+        let net = Ipv6Net::new(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0), NODE_PREFIX6);
+        Some(PodNetwork {
+            v6: PodV6::Within(net),
+            ..self
+        })
+    }
+
+    /// The same network without IPv6.
+    pub fn without_v6(self) -> Self {
+        PodNetwork {
+            v6: PodV6::Off,
+            ..self
+        }
+    }
+
+    /// The same network with MTU `mtu` (1500 where there is no WireGuard
+    /// mesh to fit in).
+    pub fn with_mtu(self, mtu: u32) -> Self {
+        PodNetwork { mtu, ..self }
     }
 
     /// The same network on a bridge of another name, its pods' host
@@ -167,15 +216,30 @@ impl PodNetwork {
 
     /// This node's /64.
     pub fn subnet6(&self) -> Ipv6Net {
-        Ipv6Net::new(self.twin(self.subnet.network()), NODE_PREFIX6)
+        match self.v6 {
+            PodV6::Within(net) => net,
+            PodV6::Cluster | PodV6::Off => {
+                Ipv6Net::new(self.twin(self.subnet.network()), NODE_PREFIX6)
+            }
+        }
     }
 
     /// A pod's IPv6 address, [`v6`]'s; a subnet outside the cluster network
-    /// (some tests use one) gets the same from its last two octets.
+    /// (some tests use one) gets the same from its last two octets. In a
+    /// network [`Self::with_v6`], its address in that /64 (see [`PodV6`]).
     pub fn twin(&self, ip: Ipv4Addr) -> Ipv6Addr {
         let [.., c, d] = ip.octets();
+        if let PodV6::Within(net) = self.v6 {
+            let [a, b, e, f, ..] = net.addr.segments();
+            return Ipv6Addr::new(a, b, e, f, 0, 0, c.into(), d.into());
+        }
         let [a, b, e, ..] = CLUSTER_POD_CIDR6.addr.segments();
         Ipv6Addr::new(a, b, e, c.into(), 0, 0, 0, d.into())
+    }
+
+    /// `ip`'s IPv6 twin as an interface address, unless IPv6 is off.
+    fn addr6(&self, ip: Ipv4Addr) -> Option<Ipv6Net> {
+        (self.v6 != PodV6::Off).then(|| Ipv6Net::new(self.twin(ip), NODE_PREFIX6))
     }
 
     fn broadcast(&self) -> Ipv4Addr {
@@ -195,8 +259,8 @@ impl PodNetwork {
             bridge,
             &IfConfig {
                 addr: Some(Ipv4Net::new(self.gateway(), self.subnet.prefix)),
-                addr6: Some(Ipv6Net::new(self.gateway6(), NODE_PREFIX6)),
-                mtu: Some(MTU),
+                addr6: self.addr6(self.gateway()),
+                mtu: Some(self.mtu),
                 up: true,
             },
         )
@@ -245,12 +309,15 @@ impl PodNetwork {
                 &pair.b,
                 &IfConfig {
                     addr: Some(Ipv4Net::new(ip, self.subnet.prefix)),
-                    addr6: Some(Ipv6Net::new(self.twin(ip), NODE_PREFIX6)),
-                    mtu: Some(MTU),
+                    addr6: self.addr6(ip),
+                    mtu: Some(self.mtu),
                     up: true,
                 },
             )?;
             sys.route_add(Some(jail), Destination::Default, self.gateway().into())?;
+            if self.v6 == PodV6::Off {
+                return Ok(());
+            }
             sys.route_add(Some(jail), Destination::Default6, self.gateway6().into())
         })();
         if let Err(e) = result {
@@ -281,7 +348,7 @@ impl PodNetwork {
             None,
             name,
             &IfConfig {
-                mtu: Some(MTU),
+                mtu: Some(self.mtu),
                 up: true,
                 ..Default::default()
             },
@@ -465,5 +532,50 @@ mod tests {
         assert!(!named("jailer0", "prefix_too_long"));
         assert!(!named("jailer 0", "jp"));
         assert!(!named("0bridge", "jp"));
+    }
+
+    #[test]
+    fn a_named_network_keeps_off_legions_v6() {
+        let jailer = || {
+            PodNetwork::new("10.88.0.0/16".parse().unwrap())
+                .named("jailer0", "jp")
+                .unwrap()
+        };
+        let legion = PodNetwork::new("10.88.0.0/16".parse().unwrap());
+        // Its own /64: the bridge and a pod there, nothing of Legion's.
+        let sys = FakeSys::new();
+        let net = jailer()
+            .with_v6("fd00:88::/48".parse().unwrap())
+            .unwrap()
+            .with_mtu(1500);
+        net.ensure_bridge(&sys).unwrap();
+        let bridge = sys.interface("jailer0").unwrap();
+        assert_eq!(bridge.config.addr6.unwrap().to_string(), "fd00:88::1/64");
+        assert_ne!(net.gateway6(), legion.gateway6());
+        assert_eq!(bridge.config.mtu, Some(1500));
+        assert_eq!(net.subnet6().to_string(), "fd00:88::/64");
+        sys.add_jail("j1", true);
+        net.attach(&sys, "00000000000000aa", "j1", ip("10.88.1.5"))
+            .unwrap();
+        let b = sys.interface("epair0b").unwrap();
+        assert_eq!(b.config.addr6.unwrap().to_string(), "fd00:88::1:5/64");
+        assert_eq!(b.config.mtu, Some(1500));
+        let routes = sys.routes(Some("j1"));
+        assert_eq!(routes[&Destination::Default6], net.gateway6());
+        assert!(jailer().with_v6("fd00:88::/96".parse().unwrap()).is_none());
+
+        // Without IPv6: none on the bridge or the pod, and no route.
+        let sys = FakeSys::new();
+        let net = jailer().without_v6();
+        net.ensure_bridge(&sys).unwrap();
+        assert_eq!(sys.interface("jailer0").unwrap().config.addr6, None);
+        sys.add_jail("j2", true);
+        net.attach(&sys, "00000000000000bb", "j2", ip("10.88.0.2"))
+            .unwrap();
+        assert_eq!(sys.interface("epair0b").unwrap().config.addr6, None);
+        assert!(!sys.routes(Some("j2")).contains_key(&Destination::Default6));
+
+        // Legion's own, unchanged.
+        assert_eq!((legion.v6, legion.mtu), (PodV6::Cluster, MTU));
     }
 }
