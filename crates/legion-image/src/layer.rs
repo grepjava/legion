@@ -1,6 +1,7 @@
 //! Applying a layer to a directory: the blob decompressed and checked
 //! against its `diff_id`, whiteouts applied, then the rest extracted by
-//! bsdtar, which keeps file flags and refuses paths leaving the root.
+//! bsdtar, which keeps file flags and refuses paths leaving the root. And
+//! the other way: a directory packed into a layer and compressed.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
@@ -13,6 +14,17 @@ use crate::Error;
 
 const WHITEOUT: &str = ".wh.";
 const OPAQUE: &str = ".wh..wh..opq";
+
+/// A layer packed and compressed for a manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerArtifact {
+    /// The uncompressed tar's digest, for the config's `rootfs.diff_ids`.
+    pub diff_id: String,
+    /// The gzip blob's digest, for the manifest.
+    pub blob_digest: String,
+    /// The gzip blob's size in bytes.
+    pub blob_size: u64,
+}
 
 /// Decompresses `blob` (gzip, zstd or plain tar, told by its first bytes)
 /// into `tar`, checking the result against `diff_id`.
@@ -124,7 +136,7 @@ pub fn apply_whiteouts(root: &Path, whiteouts: &[Whiteout]) -> Result<(), Error>
         match w {
             Whiteout::Remove(rel) => {
                 if let Some(p) = inside(root, rel)? {
-                    remove(&p)?;
+                    remove_tree(&p)?;
                 }
             }
             Whiteout::Opaque(rel) => {
@@ -134,7 +146,7 @@ pub fn apply_whiteouts(root: &Path, whiteouts: &[Whiteout]) -> Result<(), Error>
                 match std::fs::symlink_metadata(&dir) {
                     Ok(m) if m.is_dir() => {
                         for e in std::fs::read_dir(&dir)? {
-                            remove(&e?.path())?;
+                            remove_tree(&e?.path())?;
                         }
                     }
                     _ => {}
@@ -147,7 +159,7 @@ pub fn apply_whiteouts(root: &Path, whiteouts: &[Whiteout]) -> Result<(), Error>
 
 /// Removes a file, link or directory tree without following links,
 /// clearing file flags (`schg` and the like) that would refuse it.
-fn remove(path: &Path) -> Result<(), Error> {
+pub fn remove_tree(path: &Path) -> Result<(), Error> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -156,7 +168,7 @@ fn remove(path: &Path) -> Result<(), Error> {
     clear_flags(path)?;
     if meta.is_dir() {
         for e in std::fs::read_dir(path)? {
-            remove(&e?.path())?;
+            remove_tree(&e?.path())?;
         }
         std::fs::remove_dir(path)?;
     } else {
@@ -217,6 +229,106 @@ pub fn extract(tar: &Path, root: &Path) -> Result<(), Error> {
 pub fn apply(tar: &Path, root: &Path) -> Result<(), Error> {
     apply_whiteouts(root, &whiteouts(tar)?)?;
     extract(tar, root)
+}
+
+/// Archives the tree at `root` into `tar` with bsdtar, keeping owners as
+/// numbers, modes and, on FreeBSD, file flags and extended attributes.
+pub fn archive(root: &Path, tar: &Path) -> Result<(), Error> {
+    let mut cmd = Command::new("tar");
+    if cfg!(target_os = "freebsd") {
+        cmd.args(["--numeric-owner", "--fflags", "--xattrs"]);
+    }
+    let out = cmd
+        .arg("-cf")
+        .arg(tar)
+        .arg("-C")
+        .arg(root)
+        .arg(".")
+        .output()?;
+    if !out.status.success() {
+        return Err(Error::Extract(format!(
+            "archiving {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Copies the tree at `src` to `dst` as [`archive`] and [`extract`] keep it
+/// (elsewhere than Unix, files, directories and links only).
+pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), Error> {
+    std::fs::create_dir_all(dst)?;
+    if cfg!(unix) {
+        let tmp = tempfile::NamedTempFile::new()?;
+        archive(src, tmp.path())?;
+        return extract(tmp.path(), dst);
+    }
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let target = dst.join(entry.file_name());
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() {
+            let link = std::fs::read_link(&path)?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(link, &target)?;
+            #[cfg(windows)]
+            if path.is_dir() {
+                std::os::windows::fs::symlink_dir(link, &target)?;
+            } else {
+                std::os::windows::fs::symlink_file(link, &target)?;
+            }
+        } else if meta.is_dir() {
+            copy_tree(&path, &target)?;
+        } else {
+            std::fs::copy(&path, &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Packs the tree at `root` into a layer: `tar_out`, and `gz_out` its
+/// gzip blob.
+pub fn pack(root: &Path, tar_out: &Path, gz_out: &Path) -> Result<LayerArtifact, Error> {
+    archive(root, tar_out)?;
+    compress(tar_out, gz_out)
+}
+
+/// Compresses the layer `tar` to `gz` and names both by digest.
+pub fn compress(tar: &Path, gz: &Path) -> Result<LayerArtifact, Error> {
+    let mut input = BufReader::new(File::open(tar)?);
+    let mut enc = flate2::write::GzEncoder::new(
+        std::io::BufWriter::new(File::create(gz)?),
+        flate2::Compression::default(),
+    );
+    let mut diff = Sha256::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        let n = input.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        diff.update(&buf[..n]);
+        enc.write_all(&buf[..n])?;
+    }
+    enc.finish()?.flush()?;
+    let mut blob = Sha256::new();
+    let mut size = 0u64;
+    let mut input = BufReader::new(File::open(gz)?);
+    loop {
+        let n = input.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        blob.update(&buf[..n]);
+        size += n as u64;
+    }
+    Ok(LayerArtifact {
+        diff_id: format!("sha256:{:x}", diff.finalize()),
+        blob_digest: format!("sha256:{:x}", blob.finalize()),
+        blob_size: size,
+    })
 }
 
 #[cfg(test)]

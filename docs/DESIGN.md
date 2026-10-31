@@ -967,6 +967,22 @@ says why that went and what was kept of it.
   nothing uses. A task that has just found an image therefore keeps it
   while it makes its containers. A layer a container was
   cloned from cannot be destroyed, so it stays until that container goes.
+- **Building hosts**: jailer, which builds, tries and publishes images,
+  uses the same crate (`legion-image`), so what it pulls, stores and
+  checks is what a node does. A build host's store may also keep its
+  layers as directories (`<dir>/layers/<chain id>`, a full copy each) where
+  there is no ZFS; keep the compressed blobs it pulls, and their
+  descriptors, so an image goes out as it came; take layers built on the
+  host and record built images (config and manifest blobs written there);
+  pin what unfinished work uses (a locked file under `<dir>/pins` naming
+  layers and blobs, so a removal or prune beside it leaves them; a pin
+  whose work died is dropped), keep what a caller names besides (a
+  build cache's layers); push images and per-platform indexes; and export
+  an image as an OCI archive that also holds Docker's `manifest.json`. An
+  image without kept blobs is pushed or exported packed again as one
+  layer. Configs keep the keys the crate does not name, so a config read
+  and written again loses nothing. None of it is on in a node's store,
+  which behaves as above.
 
 ### 6.2 Pod construction
 

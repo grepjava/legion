@@ -101,6 +101,26 @@ impl Reference {
     pub fn is_local(&self) -> bool {
         self.registry == "localhost"
     }
+
+    /// Parses a name for an image built or loaded here: without a registry
+    /// (`app:1`, `me/app`) it is a `localhost/` name, as Podman's are;
+    /// with one (`ghcr.io/me/app:1`, `localhost/app`) it is taken as is.
+    pub fn parse_local_tag(s: &str) -> Result<Reference, Error> {
+        let slash = s.rfind('/').map_or(0, |i| i + 1);
+        let before_tag = match s[slash..].rfind(':') {
+            Some(i) => &s[..slash + i],
+            None => s,
+        };
+        let has_registry = match before_tag.split_once('/') {
+            Some((first, _)) => first.contains(['.', ':']) || first == "localhost",
+            None => false,
+        };
+        if has_registry {
+            Self::parse(s)
+        } else {
+            Self::parse(&format!("localhost/{s}"))
+        }
+    }
 }
 
 /// The registry a Docker config's `auths` key names, as a [`Reference`]
@@ -157,6 +177,17 @@ mod tests {
             Reference::parse("nginx").unwrap().registry,
             registry_of("https://index.docker.io/v1/")
         );
+    }
+
+    #[test]
+    fn local_tags() {
+        let local = |s: &str| Reference::parse_local_tag(s).unwrap().to_string();
+        assert_eq!(local("myapp"), "localhost/myapp:latest");
+        assert_eq!(local("myapp:1.0"), "localhost/myapp:1.0");
+        assert_eq!(local("me/app"), "localhost/me/app:latest");
+        assert_eq!(local("localhost/app:2"), "localhost/app:2");
+        assert_eq!(local("ghcr.io/me/app:v1"), "ghcr.io/me/app:v1");
+        assert_eq!(local("registry:5000/app"), "registry:5000/app:latest");
     }
 
     #[test]

@@ -8,26 +8,30 @@ use crate::Error;
 
 pub const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
 pub const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+pub const OCI_CONFIG: &str = "application/vnd.oci.image.config.v1+json";
+pub const OCI_LAYER_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+pub const OCI_LAYER_TAR: &str = "application/vnd.oci.image.layer.v1.tar";
 pub const DOCKER_LIST: &str = "application/vnd.docker.distribution.manifest.list.v2+json";
 pub const DOCKER_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v2+json";
+
 /// What a client accepts when asking for a manifest.
 pub const MANIFEST_TYPES: [&str; 4] = [OCI_INDEX, DOCKER_LIST, OCI_MANIFEST, DOCKER_MANIFEST];
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Descriptor {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub media_type: String,
     pub digest: String,
     #[serde(default)]
     pub size: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<Platform>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub annotations: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Platform {
     pub architecture: String,
     pub os: String,
@@ -35,24 +39,45 @@ pub struct Platform {
 
 /// An index or a manifest, told apart by their contents: some registries
 /// leave `mediaType` out.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Document {
     #[serde(default)]
-    pub media_type: String,
-    #[serde(default)]
-    pub manifests: Option<Vec<Descriptor>>,
-    #[serde(default)]
-    pub config: Option<Descriptor>,
-    #[serde(default)]
-    pub layers: Vec<Descriptor>,
-    #[serde(default)]
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub media_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifests: Option<Vec<Descriptor>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<Descriptor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<Descriptor>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub annotations: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Manifest {
+    pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub media_type: String,
     pub config: Descriptor,
     pub layers: Vec<Descriptor>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub annotations: BTreeMap<String, String>,
+}
+
+impl Manifest {
+    pub fn new(config: Descriptor, layers: Vec<Descriptor>) -> Self {
+        Self {
+            schema_version: 2,
+            media_type: OCI_MANIFEST.to_owned(),
+            config,
+            layers,
+            annotations: BTreeMap::new(),
+        }
+    }
 }
 
 impl Document {
@@ -72,8 +97,19 @@ impl Document {
             .config
             .ok_or_else(|| Error::Unsupported("a manifest without a config".to_owned()))?;
         Ok(Manifest {
+            schema_version: if self.schema_version == 0 {
+                2
+            } else {
+                self.schema_version
+            },
+            media_type: if self.media_type.is_empty() {
+                OCI_MANIFEST.to_owned()
+            } else {
+                self.media_type
+            },
             config,
             layers: self.layers,
+            annotations: self.annotations,
         })
     }
 }
@@ -90,10 +126,17 @@ pub fn arch() -> &'static str {
     }
 }
 
-/// The entry of an index for this node's architecture and the first of
-/// `oses`, in order of preference, that it offers.
+/// The entry of an index for `arch` and the first of `oses`, in order of
+/// preference, that it offers.
 pub fn select<'a>(manifests: &'a [Descriptor], oses: &[&str]) -> Result<&'a Descriptor, Error> {
-    let arch = arch();
+    select_for_arch(manifests, oses, arch())
+}
+
+pub fn select_for_arch<'a>(
+    manifests: &'a [Descriptor],
+    oses: &[&str],
+    arch: &str,
+) -> Result<&'a Descriptor, Error> {
     oses.iter()
         .find_map(|os| {
             manifests.iter().find(|m| {
@@ -121,9 +164,12 @@ pub fn select<'a>(manifests: &'a [Descriptor], oses: &[&str]) -> Result<&'a Desc
         })
 }
 
-/// An image's configuration file.
+/// An image's configuration file. Keys this crate does not name are kept
+/// in `extra`, so a config read and written again loses nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageConfig {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub created: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub architecture: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -132,47 +178,129 @@ pub struct ImageConfig {
     pub config: Config,
     #[serde(default)]
     pub rootfs: RootFs,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<History>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootFs {
+    #[serde(rename = "type", default = "default_rootfs_type")]
+    pub kind: String,
     #[serde(default)]
     pub diff_ids: Vec<String>,
 }
 
+fn default_rootfs_type() -> String {
+    "layers".to_owned()
+}
+
+impl Default for RootFs {
+    fn default() -> Self {
+        Self {
+            kind: default_rootfs_type(),
+            diff_ids: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct History {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub created: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub created_by: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub empty_layer: bool,
+}
+
 /// How to run the image. FreeBSD's own images write these keys in lower
-/// case (`cmd`), so both spellings are read.
+/// case (`cmd`), so both spellings are read. Other keys are kept in
+/// `extra`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(
         rename = "Entrypoint",
         alias = "entrypoint",
         default,
-        deserialize_with = "nullable"
+        deserialize_with = "nullable",
+        skip_serializing_if = "Vec::is_empty"
     )]
     pub entrypoint: Vec<String>,
-    #[serde(rename = "Cmd", alias = "cmd", default, deserialize_with = "nullable")]
+    #[serde(
+        rename = "Cmd",
+        alias = "cmd",
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub cmd: Vec<String>,
-    #[serde(rename = "Env", alias = "env", default, deserialize_with = "nullable")]
+    #[serde(
+        rename = "Env",
+        alias = "env",
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub env: Vec<String>,
-    #[serde(rename = "User", alias = "user", default)]
+    #[serde(
+        rename = "User",
+        alias = "user",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub user: String,
     #[serde(
         rename = "WorkingDir",
         alias = "workingdir",
         alias = "working_dir",
-        default
+        default,
+        skip_serializing_if = "String::is_empty"
     )]
     pub working_dir: String,
-    #[serde(rename = "StopSignal", alias = "stopsignal", default)]
+    #[serde(
+        rename = "StopSignal",
+        alias = "stopsignal",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub stop_signal: String,
     #[serde(
         rename = "Labels",
         alias = "labels",
         default,
-        deserialize_with = "nullable"
+        deserialize_with = "nullable",
+        skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub labels: BTreeMap<String, String>,
+    #[serde(
+        rename = "ExposedPorts",
+        alias = "exposedports",
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub exposed_ports: BTreeMap<String, serde_json::Value>,
+    #[serde(
+        rename = "Volumes",
+        alias = "volumes",
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub volumes: BTreeMap<String, serde_json::Value>,
+    /// `ONBUILD` instructions, run by builds that use the image as a base.
+    #[serde(
+        rename = "OnBuild",
+        alias = "onbuild",
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub on_build: Vec<String>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 fn nullable<'de, D, T>(d: D) -> Result<T, D::Error>
@@ -233,5 +361,23 @@ mod tests {
             e.contains(&format!("freebsd/{arch} or linux/{arch}")),
             "{e}"
         );
+    }
+
+    #[test]
+    fn configs_keep_what_they_do_not_name() {
+        let text = r#"{"architecture":"amd64","author":"me","os":"freebsd",
+            "config":{"Cmd":["x"],"Healthcheck":{"Test":["NONE"]},"OnBuild":["RUN y"],
+                "ExposedPorts":{"80/tcp":{}}},
+            "rootfs":{"type":"layers","diff_ids":["sha256:aa"]},
+            "history":[{"created_by":"z","empty_layer":true}]}"#;
+        let c: ImageConfig = serde_json::from_str(text).unwrap();
+        assert_eq!(c.extra["author"], "me");
+        assert_eq!(c.config.extra["Healthcheck"]["Test"][0], "NONE");
+        assert_eq!(c.config.on_build, ["RUN y"]);
+        assert_eq!(c.history[0].created_by, "z");
+        let again: ImageConfig = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
+        assert_eq!(again, c);
+        let expected: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(serde_json::to_value(&c).unwrap(), expected);
     }
 }
