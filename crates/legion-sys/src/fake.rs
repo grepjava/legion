@@ -15,8 +15,8 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::{
-    Carp, CarpState, Dataset, Destination, Epair, Error, IfConfig, IscsiSession, Jail, JailMemory,
-    PfState, RctlRule, Result, Sys, WgPeer,
+    Carp, CarpState, Dataset, Destination, Epair, Error, IfConfig, Ipv6Net, IscsiSession, Jail,
+    JailMemory, PfState, RctlRule, Result, Sys, WgPeer,
 };
 
 #[derive(Debug, Default)]
@@ -96,6 +96,8 @@ struct State {
     /// Mount points something still holds (a dying jail its root): a
     /// dataset mounted there is busy until the path is unmounted, by force.
     held: BTreeSet<String>,
+    /// Address selection policies added to jails' VNETs.
+    addr_policies: BTreeMap<String, Vec<(Ipv6Net, u32, u32)>>,
     /// Anchors whose loads fail until told otherwise.
     broken_anchors: BTreeSet<String>,
     /// What jails' processes use, as set.
@@ -339,6 +341,15 @@ impl FakeSys {
         self.state().held.insert(path.to_owned());
     }
 
+    /// The address selection policies [`Sys::addr_policy_add`] gave `jail`.
+    pub fn addr_policies(&self, jail: &str) -> Vec<(Ipv6Net, u32, u32)> {
+        self.state()
+            .addr_policies
+            .get(jail)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Makes loading `anchor` fail from now on, or work again.
     pub fn break_anchor(&self, anchor: &str, broken: bool) {
         let mut s = self.state();
@@ -509,6 +520,18 @@ impl Sys for FakeSys {
             .entry(name)
             .or_default()
             .insert("cpuset".to_owned(), cpus.to_owned());
+        Ok(())
+    }
+
+    fn addr_policy_add(&self, jail: &str, policies: &[(Ipv6Net, u32, u32)]) -> Result<()> {
+        let mut s = self.state();
+        if !s.jails.get(jail).is_some_and(|j| j.vnet == "new") {
+            return Err(fail("ip6addrctl", format!("{jail}: not a VNET jail")));
+        }
+        s.addr_policies
+            .entry(jail.to_owned())
+            .or_default()
+            .extend_from_slice(policies);
         Ok(())
     }
 

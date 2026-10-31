@@ -139,6 +139,24 @@ pub enum PodV6 {
 /// The longest interface name FreeBSD takes.
 const IFNAMSIZ: usize = 15;
 
+/// The address selection policies (prefix, precedence, label) of RFC 6724
+/// preferring IPv4, as FreeBSD's rc installs them on a host
+/// (`ip6addrctl_policy="ipv4_prefer"`, which `AUTO` picks there). A new
+/// VNET has none, and without them a pod ranks its ULA source above IPv4:
+/// it tries an outside name's IPv6 address first, which it cannot reach
+/// (no NAT66), and waits for that to time out before IPv4.
+const ADDR_POLICIES: [(&str, u32, u32); 9] = [
+    ("::1/128", 50, 0),
+    ("::/0", 40, 1),
+    ("::ffff:0.0.0.0/96", 100, 4),
+    ("2002::/16", 30, 2),
+    ("2001::/32", 5, 5),
+    ("fc00::/7", 3, 13),
+    ("::/96", 1, 3),
+    ("fec0::/10", 1, 11),
+    ("3ffe::/16", 1, 12),
+];
+
 impl PodNetwork {
     pub fn new(subnet: Ipv4Net) -> Self {
         PodNetwork {
@@ -318,6 +336,11 @@ impl PodNetwork {
             if self.v6 == PodV6::Off {
                 return Ok(());
             }
+            let policies: Vec<(Ipv6Net, u32, u32)> = ADDR_POLICIES
+                .iter()
+                .map(|(p, prec, label)| (p.parse().expect("a prefix"), *prec, *label))
+                .collect();
+            sys.addr_policy_add(jail, &policies)?;
             sys.route_add(Some(jail), Destination::Default6, self.gateway6().into())
         })();
         if let Err(e) = result {
@@ -480,6 +503,17 @@ mod tests {
         let routes = sys.routes(Some("infra1"));
         assert_eq!(routes[&Destination::Default], net.gateway());
         assert_eq!(routes[&Destination::Default6], net.gateway6());
+        // The host's address selection: IPv4 before a ULA source's IPv6.
+        let policies = sys.addr_policies("infra1");
+        assert_eq!(policies.len(), 9);
+        let ranked = |p: &str| {
+            policies
+                .iter()
+                .find(|(n, ..)| n.to_string() == p)
+                .map(|(_, prec, label)| (*prec, *label))
+        };
+        assert_eq!(ranked("::ffff:0.0.0.0/96"), Some((100, 4)));
+        assert_eq!(ranked("fc00::/7"), Some((3, 13)));
 
         // A jail without VNET cannot take the interface; nothing is left.
         sys.add_jail("plain", false);
@@ -574,6 +608,7 @@ mod tests {
             .unwrap();
         assert_eq!(sys.interface("epair0b").unwrap().config.addr6, None);
         assert!(!sys.routes(Some("j2")).contains_key(&Destination::Default6));
+        assert!(sys.addr_policies("j2").is_empty());
 
         // Legion's own, unchanged.
         assert_eq!((legion.v6, legion.mtu), (PodV6::Cluster, MTU));

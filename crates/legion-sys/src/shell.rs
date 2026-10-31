@@ -9,8 +9,8 @@ use std::process::{Command, Stdio};
 use serde::Deserialize;
 
 use crate::{
-    Carp, CarpState, Dataset, Destination, Epair, Error, IfConfig, IpNet, IscsiSession, Jail,
-    JailMemory, PfState, RctlRule, Result, Sys, WgPeer,
+    Carp, CarpState, Dataset, Destination, Epair, Error, IfConfig, IpNet, Ipv6Net, IscsiSession,
+    Jail, JailMemory, PfState, RctlRule, Result, Sys, WgPeer,
 };
 
 /// Counts the memory of each jail's processes from the kernel's maps.
@@ -357,6 +357,23 @@ impl<R: Runner> Sys for Shell<R> {
     fn jail_cpuset(&self, jid: u32, cpus: &str) -> Result<()> {
         self.run("cpuset", &args(["-l", cpus, "-j", &jid.to_string()]))
             .map(drop)
+    }
+
+    fn addr_policy_add(&self, jail: &str, policies: &[(Ipv6Net, u32, u32)]) -> Result<()> {
+        for (prefix, precedence, label) in policies {
+            self.run(
+                "ip6addrctl",
+                &args([
+                    "-j",
+                    jail,
+                    "add",
+                    &prefix.to_string(),
+                    &precedence.to_string(),
+                    &label.to_string(),
+                ]),
+            )?;
+        }
+        Ok(())
     }
 
     fn jail_remove(&self, jail: &str) -> Result<()> {

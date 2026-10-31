@@ -60,6 +60,10 @@ pub trait Sys: Send + Sync {
     /// Confines jail `jid` (and what is started in it after) to the CPUs
     /// `cpus`, a list as cpuset(1)'s `-l` takes it (`0-3,6`).
     fn jail_cpuset(&self, jid: u32, cpus: &str) -> Result<()>;
+    /// Adds IPv6 source and destination address selection policies
+    /// (`prefix`, precedence, label) to `jail`'s VNET, which starts with
+    /// none (`ip6addrctl -j <jail> add`).
+    fn addr_policy_add(&self, jail: &str, policies: &[(Ipv6Net, u32, u32)]) -> Result<()>;
     /// Removes a jail and its children, killing their processes.
     /// [`Error::NotFound`] if there is no such jail.
     fn jail_remove(&self, jail: &str) -> Result<()>;

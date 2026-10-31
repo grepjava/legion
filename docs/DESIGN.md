@@ -863,8 +863,12 @@ status and the endpoints stream stay IPv4; each node derives the rest.
   does below pf.
 - **Not yet**: pods reach the outside over IPv4 only (no NAT66 to the
   egress interface). Applications pick IPv4 for outside names anyway,
-  as a ULA source ranks below IPv4 (RFC 6724). An IPv6-only cluster and
-  configurable ranges are not planned.
+  as a ULA source ranks below IPv4 (RFC 6724), given the address
+  selection policies: a new VNET has none, so each pod gets the host's
+  IPv4-preferring table (`ip6addrctl -j`) with its address. Without it
+  a pod tried an outside name's IPv6 address first and waited for it to
+  time out. An IPv6-only cluster and configurable ranges are not
+  planned.
 
 Tested on FreeBSD 15.1, in jails: the system layer's IPv6 addresses,
 routes, tables and states; pods on one bridge over IPv6, through a VIP
