@@ -24,7 +24,7 @@ fn runtime(sys: &Arc<Shell>, images: &Arc<Store>, dir: &Path, base: &str) -> Jai
         images.clone(),
         Config {
             state_dir: dir.join("jails"),
-            dataset: format!("{base}/jails"),
+            dataset: Some(format!("{base}/jails")),
             shim: vec![env!("CARGO_BIN_EXE_legion-jail-shim").into()],
             prune_images: false,
         },
@@ -610,6 +610,35 @@ async fn standalone_containers_and_build_steps() {
         rt.remove(id).await.unwrap();
     }
     assert!(rt.list(&[]).await.unwrap().is_empty());
+
+    // Without a dataset for them, roots are copies of the image.
+    let copies = JailRuntime::new(
+        sys.clone() as Arc<dyn Sys>,
+        images.clone(),
+        Config {
+            state_dir: dir.as_path().join("copies"),
+            dataset: None,
+            shim: vec![env!("CARGO_BIN_EXE_legion-jail-shim").into()],
+            prune_images: false,
+        },
+    )
+    .unwrap();
+    let copy = copies
+        .create(&standalone("copy", "test -x /bin/sh && exit 6"))
+        .await
+        .unwrap();
+    let copy_root = dir.as_path().join("copies").join(&copy).join("root");
+    assert!(copy_root.join("bin/sh").is_file());
+    assert!(
+        !sys.mounts(&dir.as_path().join("copies").to_string_lossy())
+            .unwrap()
+            .iter()
+            .any(|m| std::path::Path::new(m) == copy_root),
+        "a plain directory, not a clone"
+    );
+    assert_eq!(copies.run_attached(&copy, false, false).await.unwrap(), 6);
+    copies.remove(&copy).await.unwrap();
+    assert!(!copy_root.exists());
 
     // Build steps, on a plain directory (here a clone of the image).
     let image = images.get(IMAGE).unwrap().unwrap();

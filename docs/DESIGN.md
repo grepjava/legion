@@ -1118,7 +1118,9 @@ them, so `jailer run` sets a jail up as a node does. For that the
 `Runtime` trait and its types are a crate of their own
 (`legion-runtime`, re-exported as `legion_agent::runtime`), so
 `legion-jail` needs no agent; the runtime's image pruning is a `Config`
-option, off for a store that is not only the runtime's; and the jail
+option, off for a store that is not only the runtime's; members' roots
+come from the store's `prepare_rootfs` (a ZFS clone, or a copy when the
+runtime has no dataset, as on a host without ZFS); and the jail
 annotations and devfs ruleset are `legion_jail`'s public constants. A
 container with neither a pod nor the VNET annotation is a *standalone
 member*: its own jail on the host's addresses, otherwise as a pod's

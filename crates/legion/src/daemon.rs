@@ -421,7 +421,7 @@ fn jail_runtime(
         Arc::new(images),
         legion_jail::Config {
             state_dir: opts.data_dir.join("jails"),
-            dataset: format!("{zfs}/jails"),
+            dataset: Some(format!("{zfs}/jails")),
             shim: vec![exe.into(), crate::JAIL_SHIM.into()],
             prune_images: true,
         },

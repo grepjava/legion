@@ -1293,7 +1293,10 @@ real, in the order agreed with the user.
   host's network and on a VNET of its own (only lo0), checking file flags,
   the working directory, the environment, the lent resolver and that the
   mount points went; `pods_of_jails` still passes. The image store's half
-  is the next entry.
+  is the next entry. Once merged, the runtime makes members' roots with
+  the store's `prepare_rootfs` and removes them with `cleanup_rootfs`, and
+  `Config::dataset` is optional: without one, roots are copies (the live
+  test runs a standalone member on a copy and checks it goes).
 - **legion-image shared with jailer** (DESIGN.md §6.1, "Building
   hosts"). jailer kept its own copy of the image store, registry client,
   references and layers, which had drifted (and dropped config keys such
@@ -1326,8 +1329,9 @@ follow-ups. v0.1.0, the first release, was tagged on 2026-10-31 (asked:
 amd64 tarball built on FreeBSD 15.1; weft-bsd runs it as a service. The
 port's `distinfo` is made for it and the port builds and packages clean.
 
-1. Merge the image store's half for jailer (branch `image-share`), then
-   tag v0.1.1 for jailer to depend on.
+v0.1.1 is tagged (no GitHub release) for jailer to depend on; jailer's
+session switches jailer over to it. The port stays at v0.1.0, the latest
+release.
 
 Waiting on the user: an aarch64 tarball (no aarch64 host), a poudriere
 run and the port's submission.

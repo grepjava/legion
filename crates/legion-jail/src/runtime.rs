@@ -66,8 +66,10 @@ const UNUSED_FOR: Duration = Duration::from_secs(3600);
 pub struct Config {
     /// Where containers' records, output and status live.
     pub state_dir: PathBuf,
-    /// The ZFS dataset members' root file systems are cloned under.
-    pub dataset: String,
+    /// The ZFS dataset members' root file systems are cloned under; `None`
+    /// copies them instead (a store without ZFS, see
+    /// `legion_image::Store::prepare_rootfs`).
+    pub dataset: Option<String>,
     /// The supervisor: a program and the arguments before `supervise` or
     /// `exec` (for Legion, its own binary and `jail-shim`).
     pub shim: Vec<OsString>,
@@ -80,7 +82,7 @@ pub struct JailRuntime {
     sys: Arc<dyn Sys>,
     images: Arc<Store>,
     dir: PathBuf,
-    dataset: String,
+    dataset: Option<String>,
     shim: Vec<OsString>,
     boot: u64,
     events: broadcast::Sender<Event>,
@@ -704,7 +706,7 @@ impl JailRuntime {
                 (
                     format!("{}.{id}", pod.jail),
                     self.container_dir(&id).join("root"),
-                    Some(format!("{}/{id}", self.dataset)),
+                    self.dataset.as_ref().map(|d| format!("{d}/{id}")),
                 )
             }
             (None, false) => {
@@ -714,7 +716,7 @@ impl JailRuntime {
                 (
                     id.clone(),
                     self.container_dir(&id).join("root"),
-                    Some(format!("{}/{id}", self.dataset)),
+                    self.dataset.as_ref().map(|d| format!("{d}/{id}")),
                 )
             }
         };
@@ -990,25 +992,18 @@ impl legion_runtime::Runtime for JailRuntime {
         let rec = self.make_record(spec)?;
         let dir = self.container_dir(&rec.id);
         std::fs::create_dir_all(&dir).map_err(internal)?;
-        if let Some(ds) = rec.dataset.clone() {
+        if !rec.is_pod() {
             let image = self
                 .images
                 .get(&rec.image)
                 .map_err(image_error)?
                 .ok_or_else(|| api(404, format!("{}: image not known", rec.image)))?;
-            let snapshot = self
-                .images
-                .snapshot(&image)
-                .ok_or_else(|| api(400, format!("{}: an image without layers", rec.image)))?;
-            let sys = self.sys.clone();
-            let root = rec.root.clone();
-            let parent = self.dataset.clone();
+            let images = self.images.clone();
+            let (root, ds) = (rec.root.clone(), rec.dataset.clone());
             let made = blocking(move || {
-                sys.zfs_create(&parent, &[("mountpoint", "none")])
-                    .map_err(internal)?;
-                std::fs::create_dir_all(&root).map_err(internal)?;
-                sys.zfs_clone(&snapshot, &ds, &[("mountpoint", &root.to_string_lossy())])
-                    .map_err(internal)
+                images
+                    .prepare_rootfs(&image, &root, ds.as_deref())
+                    .map_err(image_error)
             })
             .await;
             if let Err(e) = made {
@@ -1109,13 +1104,10 @@ impl legion_runtime::Runtime for JailRuntime {
             }
         } else {
             self.unmount(&rec)?;
-            if let Some(ds) = &rec.dataset
-                && !self.sys.zfs_list(ds).map_err(internal)?.is_empty()
-            {
-                self.sys
-                    .zfs_destroy(ds, true)
-                    .map_err(|e| internal(format!("destroying {ds}: {e}")))?;
-            }
+            // Its clone, or its copy (whose files may have flags).
+            self.images
+                .cleanup_rootfs(&rec.root, rec.dataset.as_deref())
+                .map_err(|e| internal(format!("removing {}: {e}", rec.root.display())))?;
         }
         std::fs::remove_dir_all(self.container_dir(id)).map_err(internal)?;
         Ok(())
