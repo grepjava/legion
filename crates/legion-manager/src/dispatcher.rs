@@ -21,12 +21,12 @@ use legion_api::dispatch::{
     Assignment, Assignments, EndpointPort, Endpoints, NamespacedPolicy, NamespacedRoute, Peer,
     Peers, Policies, Routes, ServiceEndpoints, VolumeClaim,
 };
-use legion_api::node::{NodeSpec, NodeState, NodeStatus};
+use legion_api::node::{NodeSpec, NodeState, NodeStatus, Role as NodeRole};
 use legion_api::service::{PortRef, ServiceSpec, ServiceStatus};
 use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
 use legion_api::volume::{Access, MigrationPhase, VolumeSpec, VolumeStatus};
 use legion_api::{Kind, Object, ObjectKey};
-use legion_pki::Role;
+use legion_pki::{Identity, Role};
 use legion_proto::v1::dispatcher_client::DispatcherClient;
 use legion_proto::v1::dispatcher_server::Dispatcher;
 use legion_proto::v1::{
@@ -227,6 +227,7 @@ impl DispatcherService {
     async fn register_local(
         &self,
         name: &str,
+        role: NodeRole,
         status: NodeStatus,
     ) -> Result<RegisterResponse, Status> {
         let key = ObjectKey::new(Kind::Node, "", name);
@@ -237,7 +238,11 @@ impl DispatcherService {
                 // reservation without a Node is never one being made and
                 // may be reused. Its state is unknown, and it takes no
                 // tasks, until the status below.
-                let spec = serde_json::to_value(NodeSpec::default()).map_err(internal)?;
+                let spec = NodeSpec {
+                    role,
+                    ..NodeSpec::default()
+                };
+                let spec = serde_json::to_value(spec).map_err(internal)?;
                 let mut node = Object::new(Kind::Node, "", name, spec);
                 node.status = serde_json::to_value(NodeStatus::default()).map_err(internal)?;
                 match self.write(node, Precondition::MustNotExist).await? {
@@ -260,10 +265,20 @@ impl DispatcherService {
                 pod_cidr: status.pod_cidr.clone().unwrap_or_default(),
             };
             let status = serde_json::to_value(&status).map_err(internal)?;
-            if node.status == status {
+            // The role is the certificate's: a Node made before the role was
+            // recorded, or edited since, gets it back.
+            let mut spec: NodeSpec = legion_api::parse(&node.spec).map_err(internal)?;
+            let spec = if spec.role == role {
+                node.spec.clone()
+            } else {
+                spec.role = role;
+                serde_json::to_value(spec).map_err(internal)?
+            };
+            if node.status == status && node.spec == spec {
                 return Ok(response);
             }
             node.status = status;
+            node.spec = spec;
             let precondition = Precondition::Version(node.metadata.version);
             match self.write(node, precondition).await? {
                 Outcome::Written(_) => {
@@ -532,14 +547,22 @@ impl Dispatcher for DispatcherService {
         req: Request<RegisterRequest>,
     ) -> Result<Response<RegisterResponse>, Status> {
         let node = self.node(&req, &req.get_ref().node)?;
+        let role = registering_role(
+            crate::tls::caller(&req, self.tls)?,
+            &node,
+            &req.get_ref().role,
+        );
         if let Some(mut leader) = self.leader(&req)? {
             let mut inner = req.into_inner();
             inner.node = node;
+            inner.role = role.as_str().to_owned();
             return leader.register(forwarded(inner)).await;
         }
         let status: NodeStatus =
             serde_json::from_slice(&req.get_ref().status_json).map_err(invalid)?;
-        Ok(Response::new(self.register_local(&node, status).await?))
+        Ok(Response::new(
+            self.register_local(&node, role, status).await?,
+        ))
     }
 
     type AssignmentsStream = ReceiverStream<Result<AssignmentsUpdate, Status>>;
@@ -1247,6 +1270,22 @@ fn assignment(o: &Object, node: &str) -> Option<Assignment> {
         spec,
         status,
     })
+}
+
+/// The role of `node`, registering through `caller`: its certificate's, or,
+/// in a request a manager forwards for another node (or without TLS), the
+/// role the request names.
+fn registering_role(caller: Option<Identity>, node: &str, named: &str) -> NodeRole {
+    let named = || match named {
+        "manager" => NodeRole::Manager,
+        _ => NodeRole::Worker,
+    };
+    match caller {
+        None => named(),
+        Some(id) if id.role == Role::Manager && id.name != node => named(),
+        Some(id) if id.role == Role::Manager => NodeRole::Manager,
+        Some(_) => NodeRole::Worker,
+    }
 }
 
 fn invalid(e: impl std::fmt::Display) -> Status {

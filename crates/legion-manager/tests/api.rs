@@ -816,6 +816,7 @@ async fn nodes_registering_at_once_get_their_own_subnets() {
                 d.register(RegisterRequest {
                     node: String::new(),
                     status_json: br#"{"state":"ready"}"#.to_vec(),
+                    ..Default::default()
                 })
                 .await
             }
@@ -856,6 +857,85 @@ async fn nodes_registering_at_once_get_their_own_subnets() {
         .unwrap();
     assert_eq!(register(clients[3].clone()).await, subnets[&3]);
     assert_eq!(node_state(&first, "w3").as_deref(), Some("ready"));
+}
+
+/// The node's role as the leader's store has it.
+fn node_role(m: &Running, name: &str) -> Option<String> {
+    let key = legion_api::ObjectKey::new(legion_api::Kind::Node, "", name);
+    let node = m.store.get(&key).unwrap()?;
+    node.spec["role"].as_str().map(str::to_owned)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nodes_register_with_their_certificates_role() {
+    let ca = Ca::generate().unwrap();
+    let first = Running::start_with(Some(&ca)).await;
+    first.cluster().await.init(InitRequest {}).await.unwrap();
+    let token = first
+        .cluster()
+        .await
+        .join_token(JoinTokenRequest {
+            role: "manager".into(),
+            rotate: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    let admin = creds(&ca, "admin", Role::Admin);
+    let follower = Running::join(&first.addr, &token, "m2", admin).await;
+    until("the follower knows the leader", || {
+        follower
+            .store
+            .raft
+            .metrics()
+            .borrow()
+            .current_leader
+            .is_some()
+    })
+    .await;
+    async fn register(d: DispatcherClient<Channel>, role: &str) {
+        eventually(|| {
+            let mut d = d.clone();
+            let role = role.to_owned();
+            async move {
+                d.register(RegisterRequest {
+                    node: String::new(),
+                    status_json: br#"{"state":"ready"}"#.to_vec(),
+                    role,
+                })
+                .await
+            }
+        })
+        .await;
+    }
+    let through = |m: &'static str, name: &str, role| {
+        let creds = creds(&ca, name, role);
+        let m = if m == "leader" { &first } else { &follower };
+        async move { DispatcherClient::new(m.channel(Some(&creds)).await.unwrap()) }
+    };
+
+    // A manager, to the leader and through a follower, which forwards.
+    register(through("leader", "m1", Role::Manager).await, "").await;
+    assert_eq!(node_role(&first, "m1").as_deref(), Some("manager"));
+    let m2 = through("follower", "m2", Role::Manager).await;
+    register(m2.clone(), "").await;
+    assert_eq!(node_role(&first, "m2").as_deref(), Some("manager"));
+    // A worker, whatever it claims.
+    register(through("follower", "w1", Role::Worker).await, "manager").await;
+    assert_eq!(node_role(&first, "w1").as_deref(), Some("worker"));
+
+    // A role edited away comes back when the node registers again.
+    apply_json(
+        &first,
+        "Node",
+        "m2",
+        serde_json::json!({ "role": "worker" }),
+    )
+    .await;
+    assert_eq!(node_role(&first, "m2").as_deref(), Some("worker"));
+    register(m2, "").await;
+    assert_eq!(node_role(&first, "m2").as_deref(), Some("manager"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -900,6 +980,7 @@ async fn workers_follow_their_work_through_any_manager() {
             d.register(RegisterRequest {
                 node: String::new(),
                 status_json,
+                ..Default::default()
             })
             .await
         }
@@ -915,6 +996,7 @@ async fn workers_follow_their_work_through_any_manager() {
         .register(RegisterRequest {
             node: "w2".into(),
             status_json: ready.clone(),
+            ..Default::default()
         })
         .await
         .unwrap_err();

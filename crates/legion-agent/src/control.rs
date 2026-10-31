@@ -476,6 +476,7 @@ impl Control for GrpcControl {
             node: name.to_owned(),
             status_json: serde_json::to_vec(status)
                 .map_err(|e| ControlError::Other(e.to_string()))?,
+            ..Default::default()
         };
         let resp = self
             .call(|mut c| async move { c.register(req).await })

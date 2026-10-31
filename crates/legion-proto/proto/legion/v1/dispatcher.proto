@@ -68,6 +68,10 @@ message RegisterRequest {
   string node = 1;
   // NodeStatus as JSON; the manager assigns pod_cidr.
   bytes status_json = 2;
+  // "manager" or "worker", from the node's certificate. Set by a manager
+  // forwarding the request to the leader, which cannot see that
+  // certificate; ignored from anyone else.
+  string role = 3;
 }
 
 message RegisterResponse {
