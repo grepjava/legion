@@ -1,5 +1,7 @@
 # Legion
 
+![Legion of BSD Daemons](docs/hero2.jpg)
+
 A container orchestrator for FreeBSD: Docker Swarm's operating model plus
 selected Kubernetes features, running workloads as jails from OCI images,
 which it pulls into ZFS and runs itself. The plan and its rationale are in
