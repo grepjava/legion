@@ -18,6 +18,7 @@ legion-manager = { path = "crates/legion-manager" }
 legion-net = { path = "crates/legion-net" }
 legion-pki = { path = "crates/legion-pki" }
 legion-proto = { path = "crates/legion-proto" }
+legion-runtime = { path = "crates/legion-runtime" }
 legion-store = { path = "crates/legion-store" }
 legion-sys = { path = "crates/legion-sys" }
 

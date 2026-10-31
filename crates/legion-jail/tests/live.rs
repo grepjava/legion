@@ -11,8 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use legion_agent::Runtime;
-use legion_agent::runtime::{ContainerSpec, Mount, Output};
+use legion_runtime::{ContainerSpec, Mount, Output, Runtime};
 use legion_image::{Client, Store};
 use legion_jail::{Config, JailRuntime};
 use legion_sys::{Shell, Sys};

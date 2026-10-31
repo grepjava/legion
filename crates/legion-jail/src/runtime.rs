@@ -18,7 +18,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use legion_agent::runtime::{
+use legion_runtime::{
     Actor, Attached, Chunk, ContainerConfig, ContainerInspect, ContainerSpec, ContainerState,
     ContainerSummary, Error, Event, ExecOutput, Login, Output, Result,
 };
@@ -937,7 +937,7 @@ impl JailRuntime {
     }
 }
 
-impl legion_agent::Runtime for JailRuntime {
+impl legion_runtime::Runtime for JailRuntime {
     async fn image_usable(&self, reference: &str, user: &str) -> Result<bool> {
         let mut used = self.used.lock().await;
         let usable = self

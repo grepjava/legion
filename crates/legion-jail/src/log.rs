@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use legion_agent::runtime::{Chunk, Output};
+use legion_runtime::{Chunk, Output};
 
 /// The longest piece of a line held before it is written as `P`.
 const PIECE: usize = 16 << 10;

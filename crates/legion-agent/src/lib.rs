@@ -32,7 +32,7 @@ mod output;
 pub mod pod;
 pub mod policing;
 mod probe;
-pub mod runtime;
+pub use legion_runtime as runtime;
 mod session;
 mod task;
 pub mod transfer;

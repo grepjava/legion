@@ -19,6 +19,7 @@ tokio-rustls.workspace = true
 legion-api.workspace = true
 legion-net.workspace = true
 legion-proto.workspace = true
+legion-runtime.workspace = true
 legion-sys.workspace = true
 serde.workspace = true
 serde_json.workspace = true

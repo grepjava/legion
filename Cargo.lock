@@ -1509,6 +1509,7 @@ dependencies = [
  "legion-manager",
  "legion-net",
  "legion-proto",
+ "legion-runtime",
  "legion-store",
  "legion-sys",
  "openraft",
@@ -1572,8 +1573,8 @@ dependencies = [
  "bytes",
  "futures",
  "getrandom 0.3.4",
- "legion-agent",
  "legion-image",
+ "legion-runtime",
  "legion-sys",
  "libc",
  "serde",
@@ -1650,6 +1651,16 @@ dependencies = [
  "tonic-prost-build",
  "tower-service",
  "tracing",
+]
+
+[[package]]
+name = "legion-runtime"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

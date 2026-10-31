@@ -1,6 +1,7 @@
-//! The container runtime calls the agent makes, and what they take and
-//! give: `legion_jail::JailRuntime` in production,
-//! [`crate::fake::FakeRuntime`] in tests.
+//! The container runtime calls Legion's agent makes, and what they take
+//! and give: `legion_jail::JailRuntime` in production,
+//! `legion_agent::fake::FakeRuntime` in tests. A crate of its own, so that
+//! a runtime (and what uses one, such as jailer) needs no agent.
 
 use std::future::Future;
 use std::time::Duration;
@@ -136,7 +137,7 @@ pub struct ContainerSpec {
     pub user: Option<String>,
     pub hostname: Option<String>,
     pub labels: BTreeMap<String, String>,
-    /// How to make its jail (see [`crate::pod`]).
+    /// How to make its jail (see `legion_agent::pod`).
     pub annotations: BTreeMap<String, String>,
     pub mounts: Vec<Mount>,
     /// Seconds between the stop signal and killing it.
