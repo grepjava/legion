@@ -65,7 +65,7 @@ Linux hosts, an ecosystem of tools and charts, or proven production use.
 | Probes | Startup, liveness and readiness: exec, TCP, HTTP, gRPC | One healthcheck (exec) | Startup, liveness and readiness: exec, TCP, HTTP, gRPC |
 | Restart policy | `any`, `on-failure`, `none`, with delay and attempts | Same | Always, OnFailure, Never |
 | Private registries | `imagePullSecrets` | `--with-registry-auth` | `imagePullSecrets` |
-| Building images | No: buildah or Podman on FreeBSD ([IMAGES.md](IMAGES.md)) | `docker build` | No (external tools) |
+| Building images | No: jailer, made for Legion, or buildah or Podman on FreeBSD ([IMAGES.md](IMAGES.md)) | `docker build` | No (external tools) |
 | Linux images | Run through FreeBSD's Linux layer (`linux64`) on nodes started with `--linux`, not on a Linux kernel | Native | Native |
 
 ## Scheduling

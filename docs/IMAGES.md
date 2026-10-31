@@ -1,8 +1,9 @@
 # Images for Legion
 
 Legion runs containers from OCI images, the same format Docker and
-Kubernetes use, but it does not build them. You build images with the
-usual tools, push them to a registry or copy them to the nodes, and
+Kubernetes use, but it does not build them. You build images with
+[jailer](https://github.com/grepjava/jailer), made for Legion, or with
+the usual tools, push them to a registry or copy them to the nodes, and
 Legion pulls or loads them. This guide covers where to get FreeBSD
 images, how to build your own, how to get them onto a cluster, and what
 to expect from Linux images.
@@ -35,15 +36,20 @@ release may not run on an older kernel.
 
 ## Building a FreeBSD image
 
-Build on a FreeBSD machine with buildah or Podman, both in the ports tree
-(`pkg install buildah` or `pkg install podman`). Building does not need a
-Legion node, and is best done on a build machine or in CI rather than on
-a node.
+Build with jailer, on a FreeBSD machine. It needs nothing but the base
+system: no buildah, Podman or Docker. Building does not need a Legion
+node, and is best done on a build machine or in CI rather than on a
+node. Install it with Rust's cargo (`pkg install rust`):
 
-A Containerfile is written as for Docker. This one, from Legion's
-stateful-service test (`crates/legion/tests/stateful/Containerfile`),
-installs PostgreSQL and removes what the server does not need at run
-time:
+```sh
+cargo install --git https://github.com/grepjava/jailer
+```
+
+A Containerfile is written as for Docker (`jailer init` writes one for a
+Rust, Go, Node, Python or C project, or one that installs packages).
+This one, from Legion's stateful-service test
+(`crates/legion/tests/stateful/Containerfile`), installs PostgreSQL and
+removes what the server does not need at run time:
 
 ```dockerfile
 FROM docker.io/freebsd/freebsd-notoolchain:15.1
@@ -55,7 +61,25 @@ RUN env ASSUME_ALWAYS_YES=yes pkg bootstrap -f >/dev/null \
 USER postgres
 ```
 
-Build it:
+Build it and try it, as root, since `RUN` steps and test runs are jails:
+
+```sh
+doas jailer build --strict -t pg:17 .
+doas jailer run pg:17               # in a jail set up as Legion sets one up
+```
+
+jailer checks the image against what Legion runs: that the `USER` is in
+the image's `/etc/passwd`, that the entrypoint exists and is executable,
+and that the stop signal is one Legion knows. It warns about `pkg`
+caches left in the image and Containerfile settings Legion ignores.
+`--strict` fails the build when a check fails; `jailer check` runs the
+checks alone, on a Containerfile or an image. A rebuild reuses the `RUN`
+steps whose inputs did not change.
+
+### With buildah or Podman
+
+They build the same Containerfiles (`pkg install buildah` or
+`pkg install podman`), without jailer's checks:
 
 ```sh
 podman build --network host -t registry.example/shop/pg:17 .
@@ -63,27 +87,6 @@ podman build --network host -t registry.example/shop/pg:17 .
 
 `--network host` gives the `RUN` steps the host's network, which `pkg`
 needs to fetch packages.
-
-### With jailer
-
-jailer builds the same Containerfiles without buildah or Podman, and
-checks the result against what Legion runs: that the `USER` is in the
-image's `/etc/passwd`, that the entrypoint exists and is executable, and
-that the stop signal is one Legion knows. It warns about `pkg` caches
-left in the image and Containerfile settings Legion ignores. It can also
-run the image in a jail set up as Legion sets one up, push it, and save
-it for `legion image load`. As root, since `RUN` steps and test runs are
-jails:
-
-```sh
-doas jailer build --strict -t pg:17 .
-doas jailer run pg:17                               # try it in a jail
-doas jailer push pg:17 registry.example/shop/pg:17
-doas jailer export pg:17 pg.tar                     # or save it for loading
-```
-
-`--strict` fails the build when a check fails. A rebuild reuses the
-`RUN` steps whose inputs did not change.
 
 Some tips:
 
@@ -103,9 +106,10 @@ Some tips:
 
 Legion runs on amd64 and aarch64 nodes, and picks the entry for its own
 architecture from an image index. Build the image on (or for) each
-architecture and publish both under one name, for example with
-`buildah manifest create` and `buildah manifest push --all`. A
-single-architecture image runs only on nodes of that architecture.
+architecture and publish both under one name. jailer publishes one
+architecture per name; for an index use `buildah manifest create` and
+`buildah manifest push --all`. A single-architecture image runs only on
+nodes of that architecture.
 
 ## Getting an image to the cluster
 
@@ -116,8 +120,11 @@ Docker Hub, GitHub's or GitLab's container registry, Harbor, a cloud
 provider's registry, or one you run yourself.
 
 ```sh
-podman push registry.example/shop/pg:17
+doas jailer login -u ci -p "$TOKEN" registry.example
+doas jailer push pg:17 registry.example/shop/pg:17
 ```
+
+(Or `podman push`, for an image Podman built.)
 
 Then name it in a pod. Each node pulls it the first time it needs it:
 
@@ -164,9 +171,11 @@ Save the image as an OCI archive and load it on each node that may run
 it, as root:
 
 ```sh
-podman save --format oci-archive -o pg.tar localhost/pg:17
-legion image load pg.tar --zfs-root zroot/legion   # the daemon's --zfs-root
+doas jailer export localhost/pg:17 pg.tar          # on the build machine
+legion image load pg.tar --zfs-root zroot/legion   # on a node: the daemon's --zfs-root
 ```
+
+(Or `podman save --format oci-archive -o pg.tar localhost/pg:17`.)
 
 Name such images `localhost/...`: Legion never tries to pull those, so a
 node without the image fails the task instead of asking a registry.
