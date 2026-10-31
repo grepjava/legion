@@ -1361,8 +1361,7 @@ follow-ups. v0.1.0, the first release, was tagged on 2026-10-31 (asked:
 amd64 tarball built on FreeBSD 15.1; weft-bsd runs it as a service. The
 port's `distinfo` is made for it and the port builds and packages clean.
 
-v0.1.1 to v0.1.4 were tagged for jailer to depend on, without GitHub
-releases. v0.1.5, made on 2026-10-31 with the amd64 tarball, has the
+v0.1.1 to v0.1.5 were tagged, without GitHub releases. v0.1.6, made on 2026-10-31 with the amd64 tarball, has the
 fixes since v0.1.0 and the crates jailer uses; weft-bsd runs it, and
 the port's `distinfo` is made for it (built, check-plist, stage-qa,
 packaged and portlint clean, its two known warnings aside). jailer v0.3.0 is built on
