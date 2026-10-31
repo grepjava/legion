@@ -22,11 +22,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use legion_image::{Credentials, Reference, Store};
 use legion_runtime::{
     Actor, Attached, Chunk, ContainerConfig, ContainerInspect, ContainerSpec, ContainerState,
     ContainerSummary, Error, Event, ExecOutput, Login, Output, Result,
 };
-use legion_image::{Credentials, Reference, Store};
 use legion_sys::Sys;
 use tokio::sync::{broadcast, watch};
 

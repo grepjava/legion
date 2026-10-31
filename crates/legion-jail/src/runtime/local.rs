@@ -42,7 +42,10 @@ pub enum StepMount {
         target: String,
         read_only: bool,
     },
-    Tmpfs { target: String, size: Option<u64> },
+    Tmpfs {
+        target: String,
+        size: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,7 +437,10 @@ mod tests {
             work_dir: "",
             mounts: &[],
             network: StepNetwork::Host,
-            params: &[("allow.chflags".into(), "false".into()), ("x".into(), "1".into())],
+            params: &[
+                ("allow.chflags".into(), "false".into()),
+                ("x".into(), "1".into()),
+            ],
         };
         let p = step_params(&step);
         let get = |k: &str| p.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());

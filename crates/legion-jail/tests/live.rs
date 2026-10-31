@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use legion_runtime::{ContainerSpec, Mount, Output, Runtime};
 use legion_image::{Client, Store};
 use legion_jail::{Config, JailRuntime};
+use legion_runtime::{ContainerSpec, Mount, Output, Runtime};
 use legion_sys::{Shell, Sys};
 
 const IMAGE: &str = "docker.io/freebsd/freebsd-runtime:15.1";
@@ -560,12 +560,21 @@ async fn standalone_containers_and_build_steps() {
     assert_eq!(rt.find(&app[..12]).unwrap(), app);
     assert!(rt.find("nothing").is_err());
     rt.start(&app).await.unwrap();
-    until("the app's output", async || output(&rt, &app).await.contains("up")).await;
+    until("the app's output", async || {
+        output(&rt, &app).await.contains("up")
+    })
+    .await;
     assert_eq!(output(&rt, &app).await, "app\nup\n");
     let params = sys
         .jail_get(
             &app,
-            &["ip4", "vnet", "securelevel", "devfs_ruleset", "allow.chflags"],
+            &[
+                "ip4",
+                "vnet",
+                "securelevel",
+                "devfs_ruleset",
+                "allow.chflags",
+            ],
         )
         .unwrap();
     assert_eq!(params["ip4"], "inherit", "{params:?}");
@@ -575,7 +584,12 @@ async fn standalone_containers_and_build_steps() {
     assert_eq!(params["allow.chflags"], "false", "{params:?}");
     // An exec on this process's output gives its exit code.
     let code = rt
-        .exec_inherit(&app, &["/bin/sh".into(), "-c".into(), "exit 5".into()], false, false)
+        .exec_inherit(
+            &app,
+            &["/bin/sh".into(), "-c".into(), "exit 5".into()],
+            false,
+            false,
+        )
         .await
         .unwrap();
     assert_eq!(code, 5);
@@ -660,7 +674,10 @@ async fn standalone_containers_and_build_steps() {
     // wrote stayed.
     assert!(!build.join("legion-out").exists());
     assert!(!build.join("legion-scratch").exists());
-    assert_eq!(std::fs::read(build.join("etc/resolv.conf")).ok(), resolv_before);
+    assert_eq!(
+        std::fs::read(build.join("etc/resolv.conf")).ok(),
+        resolv_before
+    );
     assert!(build.join("srv/app").is_dir() && build.join("flagged").exists());
     // Without a network: only lo0; and its exit code.
     let alone = Step {
