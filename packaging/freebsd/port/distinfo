@@ -1,4 +1,4 @@
-TIMESTAMP = 1793431527
+TIMESTAMP = 1793458399
 SHA256 (rust/crates/adler2-2.0.1.crate) = 320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa
 SIZE (rust/crates/adler2-2.0.1.crate) = 13366
 SHA256 (rust/crates/aho-corasick-1.1.5.crate) = c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba
@@ -867,5 +867,5 @@ SHA256 (rust/crates/zlib-rs-0.6.8.crate) = b268e58e7c693d7c271f93ffc4ba3b3804125
 SIZE (rust/crates/zlib-rs-0.6.8.crate) = 215857
 SHA256 (rust/crates/zmij-1.0.23.crate) = 29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b
 SIZE (rust/crates/zmij-1.0.23.crate) = 28612
-SHA256 (grepjava-legion-v0.1.0_GH0.tar.gz) = d656fbc738d286f5e97abe27d30533632cce977dc42bb5c5d7eafcb0b0649ba4
-SIZE (grepjava-legion-v0.1.0_GH0.tar.gz) = 640427
+SHA256 (grepjava-legion-v0.1.5_GH0.tar.gz) = ac2bf6aa990b0b8f409ee80e973b9bfee1f9e023bc14ff84488dc10c6f481dad
+SIZE (grepjava-legion-v0.1.5_GH0.tar.gz) = 2673819
