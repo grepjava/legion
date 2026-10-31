@@ -3,7 +3,9 @@
 //! the task's address and port. Routes match the `Host` header and the
 //! longest path prefix, an exact host before a wildcard; tasks take turns.
 //! The backend sees the client in `X-Forwarded-For`. Upgrades (WebSocket)
-//! pass through.
+//! pass through. Clients speak HTTP/1.1 or HTTP/2 (over TLS by ALPN, in
+//! the clear by its preface); backends HTTP/1.1, over connections kept
+//! open for the next request.
 //!
 //! HTTPS serves the hosts of routes with `tls`, each with the certificate
 //! in its Secret, chosen by SNI; the Secrets are read again when routes
@@ -21,10 +23,13 @@ use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::header::{HOST, HeaderValue};
 use hyper::{Request, Response, StatusCode};
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use legion_api::dispatch::{Endpoints, Routes};
 use legion_api::service::Protocol;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
@@ -38,6 +43,9 @@ type Body = BoxBody<Bytes, hyper::Error>;
 /// How long a backend has to accept the connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a connection to a backend is kept open for another request.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// How often the routes' certificates are read again.
 const CERTIFICATES_PERIOD: Duration = Duration::from_secs(60);
 
@@ -46,6 +54,8 @@ struct Proxy {
     endpoints: watch::Receiver<Endpoints>,
     turn: AtomicUsize,
     https: bool,
+    /// To the backends, keeping connections open between requests.
+    client: Client<HttpConnector, Incoming>,
 }
 
 /// Serves HTTP on `listener` until the task is dropped.
@@ -67,7 +77,7 @@ pub async fn serve_tls(
     let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(certificates);
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let acceptor = TlsAcceptor::from(Arc::new(config));
     run(listener, routes, endpoints, Some(acceptor)).await
 }
@@ -78,11 +88,18 @@ async fn run(
     endpoints: watch::Receiver<Endpoints>,
     tls: Option<TlsAcceptor>,
 ) {
+    let mut connector = HttpConnector::new();
+    connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
+    connector.set_nodelay(true);
+    let client = Client::builder(TokioExecutor::new())
+        .pool_idle_timeout(IDLE_TIMEOUT)
+        .build(connector);
     let proxy = Arc::new(Proxy {
         routes,
         endpoints,
         turn: AtomicUsize::new(0),
         https: tls.is_some(),
+        client,
     });
     loop {
         let (stream, client) = match listener.accept().await {
@@ -114,9 +131,8 @@ where
         let proxy = proxy.clone();
         async move { Ok::<_, Infallible>(proxy.handle(req, client).await) }
     });
-    let conn = hyper::server::conn::http1::Builder::new()
-        .serve_connection(TokioIo::new(io), service)
-        .with_upgrades();
+    let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    let conn = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
     if let Err(e) = conn.await {
         tracing::debug!(%client, "ingress connection: {e}");
     }
@@ -302,40 +318,40 @@ impl Proxy {
         }
         let proto = if self.https { "https" } else { "http" };
         headers.insert("x-forwarded-proto", HeaderValue::from_static(proto));
-        // Only the path goes on to the backend.
-        if let Some(pq) = req.uri().path_and_query().cloned() {
-            *req.uri_mut() = pq.as_str().parse().expect("a path and query parse");
-        }
-
-        let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(backend)).await
+        // An HTTP/2 request names its host in its URI alone; the backend
+        // speaks HTTP/1.1 and reads it from `Host`.
+        if !headers.contains_key(HOST)
+            && let Some(authority) = req.uri().authority()
+            && let Ok(v) = HeaderValue::from_str(authority.as_str())
         {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => return reply(StatusCode::BAD_GATEWAY, &format!("{backend}: {e}")),
-            Err(_) => {
-                return reply(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    &format!("{backend}: timed out"),
-                );
-            }
+            req.headers_mut().insert(HOST, v);
+        }
+        *req.version_mut() = hyper::Version::HTTP_11;
+        let pq = req.uri().path_and_query().map_or("/", |pq| pq.as_str());
+        *req.uri_mut() = match format!("http://{backend}{pq}").parse() {
+            Ok(uri) => uri,
+            Err(e) => return reply(StatusCode::BAD_REQUEST, &format!("{pq}: {e}")),
         };
-        let (mut sender, conn) =
-            match hyper::client::conn::http1::handshake(TokioIo::new(stream)).await {
-                Ok(c) => c,
-                Err(e) => return reply(StatusCode::BAD_GATEWAY, &format!("{backend}: {e}")),
-            };
-        tokio::spawn(async move {
-            if let Err(e) = conn.with_upgrades().await {
-                tracing::debug!(%backend, "ingress backend connection: {e}");
-            }
-        });
 
         let upgrade = req
             .headers()
             .contains_key(hyper::header::UPGRADE)
             .then(|| hyper::upgrade::on(&mut req));
-        let mut resp = match sender.send_request(req).await {
+        let mut resp = match self.client.request(req).await {
             Ok(r) => r,
-            Err(e) => return reply(StatusCode::BAD_GATEWAY, &format!("{backend}: {e}")),
+            Err(e) if timed_out(&e) => {
+                return reply(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    &format!("{backend}: timed out"),
+                );
+            }
+            Err(e) => {
+                let why = std::iter::successors(Some(&e as &dyn std::error::Error), |e| e.source())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(": ");
+                return reply(StatusCode::BAD_GATEWAY, &format!("{backend}: {why}"));
+            }
         };
         if resp.status() == StatusCode::SWITCHING_PROTOCOLS
             && let Some(client_side) = upgrade
@@ -353,19 +369,37 @@ impl Proxy {
     }
 }
 
+/// Whether a backend did not accept the connection in time.
+fn timed_out(e: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(e), |e| e.source()).any(|e| {
+        e.downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use legion_api::dispatch::{EndpointPort, NamespacedRoute, ServiceEndpoints};
     use legion_api::route::RouteSpec;
+    use std::sync::atomic::AtomicU32;
+    use tokio::net::TcpStream;
 
     /// A backend answering with its name, and the headers it was sent.
     async fn backend(name: &'static str) -> u16 {
+        counted_backend(name).await.0
+    }
+
+    /// [`backend`], with the connections made to it so far.
+    async fn counted_backend(name: &'static str) -> (u16, Arc<AtomicU32>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let connections = Arc::new(AtomicU32::new(0));
+        let counted = connections.clone();
         tokio::spawn(async move {
             loop {
                 let (s, _) = listener.accept().await.unwrap();
+                counted.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
                     let svc =
                         hyper::service::service_fn(move |req: Request<Incoming>| async move {
@@ -389,7 +423,7 @@ mod tests {
                 });
             }
         });
-        port
+        (port, connections)
     }
 
     fn route(name: &str, host: &str, path: &str, service: &str) -> NamespacedRoute {
@@ -517,6 +551,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn http2_clients_and_backend_connections_kept() {
+        let (web, connections) = counted_backend("web").await;
+        let (_routes_tx, routes) =
+            watch::channel(vec![route("www", "shop.example.org", "/", "web")]);
+        let (_endpoints_tx, endpoints) =
+            watch::channel(vec![service("web", web, vec![Ipv4Addr::LOCALHOST])]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, routes, endpoints));
+
+        // HTTP/1.1 requests on connections of their own share one to the
+        // backend.
+        for _ in 0..3 {
+            let (status, body) = get(proxy, "shop.example.org", "/").await;
+            assert_eq!(
+                (status, body.split(' ').next()),
+                (StatusCode::OK, Some("web"))
+            );
+        }
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+
+        // HTTP/2 in the clear, its host in its URI: the backend gets it as
+        // `Host`.
+        let stream = TcpStream::connect(proxy).await.unwrap();
+        let (mut sender, conn) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+                .await
+                .unwrap();
+        tokio::spawn(conn);
+        let req = Request::get("http://shop.example.org/h2?x=1")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(
+            (resp.status(), resp.version()),
+            (StatusCode::OK, hyper::Version::HTTP_2)
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "web /h2?x=1 host=shop.example.org xff=127.0.0.1 xfh=shop.example.org"
+        );
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+    }
+
     /// A backend that switches to echoing whatever comes.
     async fn echo_backend() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -591,14 +671,27 @@ mod tests {
         sni: &str,
         trusted: &[CertificateDer<'static>],
     ) -> Result<String, String> {
+        get_tls_alpn(proxy, sni, trusted, false).await
+    }
+
+    /// [`get_tls`], over HTTP/2 if `h2`, which ALPN agrees.
+    async fn get_tls_alpn(
+        proxy: SocketAddr,
+        sni: &str,
+        trusted: &[CertificateDer<'static>],
+        h2: bool,
+    ) -> Result<String, String> {
         use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
         let mut roots = RootCertStore::empty();
         for c in trusted {
             roots.add(c.clone()).unwrap();
         }
-        let config = ClientConfig::builder()
+        let mut config = ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
+        if h2 {
+            config.alpn_protocols = vec![b"h2".to_vec()];
+        }
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
         let tcp = TcpStream::connect(proxy).await.unwrap();
         let name = ServerName::try_from(sni.to_owned()).unwrap();
@@ -606,6 +699,21 @@ mod tests {
             .connect(name, tcp)
             .await
             .map_err(|e| e.to_string())?;
+        if h2 {
+            assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+            let (mut sender, conn) =
+                hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            tokio::spawn(conn);
+            let req = Request::get(format!("https://{sni}/"))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let resp = sender.send_request(req).await.map_err(|e| e.to_string())?;
+            assert_eq!(resp.version(), hyper::Version::HTTP_2);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            return Ok(String::from_utf8_lossy(&body).trim().to_owned());
+        }
         let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
             .await
             .map_err(|e| e.to_string())?;
@@ -671,6 +779,15 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let body = got.unwrap();
+        assert!(body.starts_with("web / host=shop.example.org"), "{body}");
+        let body = get_tls_alpn(
+            proxy,
+            "shop.example.org",
+            std::slice::from_ref(&shop_der),
+            true,
+        )
+        .await
+        .unwrap();
         assert!(body.starts_with("web / host=shop.example.org"), "{body}");
         assert!(
             get_tls(proxy, "www.example.org", std::slice::from_ref(&wild_der))

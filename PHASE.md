@@ -716,7 +716,15 @@ service and migrates between nodes.
 
 Nothing left in phase 4.
 
-Smaller follow-ups: ingress HTTP/2, connection reuse and ACME certificates.
+Smaller follow-ups: ingress certificates from ACME.
+
+- **Ingress HTTP/2 and connection reuse** (`legion-agent::ingress`,
+  DESIGN.md §5.8): clients speak HTTP/1.1 or HTTP/2 (ALPN `h2` over TLS,
+  the preface in the clear), an HTTP/2 request's authority becoming the
+  backend's `Host`; backends get HTTP/1.1 over pooled connections (idle
+  for up to a minute). Tested: three requests on their own connections
+  reaching the backend over one, HTTP/2 in the clear and over TLS, and
+  the earlier routing, upgrade and certificate tests.
 
 - **The WireGuard key under autolock** (`legion::pki`, DESIGN.md §9): a
   manager keeps its WireGuard key in `pki/` with its other private keys,

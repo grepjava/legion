@@ -905,8 +905,11 @@ node and routes change without reloads.
   port, which the node reaches directly (nodes may reach every pod, 5.6).
   So, unlike the routing mesh, there is no NAT: the backend sees the
   node, and the client in `X-Forwarded-For` (with `X-Forwarded-Host` and
-  `-Proto`). Upgrades such as WebSocket pass through. No route: 404; no
-  ready task: 503; a task that does not answer: 502 (504 after 5 s).
+  `-Proto`). Upgrades such as WebSocket pass through. Clients speak
+  HTTP/1.1 or HTTP/2 (over TLS by ALPN, in the clear by its preface);
+  backends get HTTP/1.1, over connections the proxy keeps open for the
+  next request (idle for up to a minute). No route: 404; no ready task:
+  503; a task that does not answer: 502 (504 after 5 s).
 - **HTTPS** (`--ingress-tls-listen 0.0.0.0:443`): a route with `tls: {
   secret }` names a Secret of its namespace holding the certificate chain
   and its private key in PEM. Nodes read such a Secret through the
@@ -923,8 +926,8 @@ node and routes change without reloads.
   last good one. A host without a certificate fails the handshake. The
   backend gets `X-Forwarded-Proto: https`. Plain HTTP still serves the
   route; redirecting it is left to the backend.
-- **Not yet:** HTTP/2, connection reuse to backends, retries on another
-  task, certificates from ACME.
+- **Not yet:** HTTP/2 to backends (so no gRPC backends), WebSocket over
+  HTTP/2, retries on another task, certificates from ACME.
 
 ---
 
