@@ -64,6 +64,27 @@ podman build --network host -t registry.example/shop/pg:17 .
 `--network host` gives the `RUN` steps the host's network, which `pkg`
 needs to fetch packages.
 
+### With jailer
+
+jailer builds the same Containerfiles without buildah or Podman, and
+checks the result against what Legion runs: that the `USER` is in the
+image's `/etc/passwd`, that the entrypoint exists and is executable, and
+that the stop signal is one Legion knows. It warns about `pkg` caches
+left in the image and Containerfile settings Legion ignores. It can also
+run the image in a jail set up as Legion sets one up, push it, and save
+it for `legion image load`. As root, since `RUN` steps and test runs are
+jails:
+
+```sh
+doas jailer build --strict -t pg:17 .
+doas jailer run pg:17                               # try it in a jail
+doas jailer push pg:17 registry.example/shop/pg:17
+doas jailer export pg:17 pg.tar                     # or save it for loading
+```
+
+`--strict` fails the build when a check fails. A rebuild reuses the
+`RUN` steps whose inputs did not change.
+
 Some tips:
 
 - **Keep images small.** Remove what the program does not need at run
