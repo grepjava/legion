@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 
 use legion_api::Kind;
 use legion_api::node::{NodeState, NodeStatus};
-use legion_api::task::{TaskState, TaskStatus};
+use legion_api::task::TaskState;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -20,9 +20,9 @@ use ratatui::widgets::{
 };
 
 use super::logs::Logs;
-use super::model::{Model, kind_word, status};
+use super::model::{Key, Model, kind_word, status, task_state};
 use super::shell::Shell;
-use super::view::{Focus, Prompt, TABS, Tab, View, rows};
+use super::view::{Focus, Prompt, TABS, Tab, TableRow, View, rows};
 
 pub(super) const ACCENT: Color = Color::Cyan;
 pub(super) const OK: Color = Color::Green;
@@ -138,9 +138,14 @@ pub fn render(f: &mut Frame, model: &Model, view: &View) {
     .areas(area);
     header(f, model, top);
     f.render_widget(tab_bar(model, view), tabs);
-    let (upper, lower) = split(model, view, body);
+    let rows = if view.zoom && (view.logs.is_some() || view.shell.is_some()) {
+        Vec::new()
+    } else {
+        rows(model, view)
+    };
+    let (upper, lower) = split(view, rows.len(), body);
     if let Some(upper) = upper {
-        upper_body(f, model, view, upper);
+        upper_body(f, model, view, rows, upper);
     }
     if let Some(lower) = lower {
         if let Some(l) = &view.logs {
@@ -160,7 +165,7 @@ pub fn render(f: &mut Frame, model: &Model, view: &View) {
 }
 
 /// The table's area and the pane's under it, if they show.
-fn split(model: &Model, view: &View, body: Rect) -> (Option<Rect>, Option<Rect>) {
+fn split(view: &View, row_count: usize, body: Rect) -> (Option<Rect>, Option<Rect>) {
     if view.logs.is_none() && view.shell.is_none() {
         return (Some(body), None);
     }
@@ -168,7 +173,7 @@ fn split(model: &Model, view: &View, body: Rect) -> (Option<Rect>, Option<Rect>)
         return (None, Some(body));
     }
     // The table as tall as its rows, up to half.
-    let rows = rows(model, view).len().min(1000) as u16 + 3;
+    let rows = row_count.min(1000) as u16 + 3;
     let upper = rows.clamp(5, (body.height / 2).max(5));
     let [upper, lower] =
         Layout::vertical([Constraint::Length(upper), Constraint::Fill(1)]).areas(body);
@@ -185,7 +190,8 @@ pub(super) fn shell_size(model: &Model, view: &View, area: Rect) -> Option<(u16,
         height: area.height - 6,
         ..area
     };
-    let lower = split(model, view, body).1?;
+    let row_count = if view.zoom { 0 } else { rows(model, view).len() };
+    let lower = split(view, row_count, body).1?;
     let inner = panel(Line::default()).inner(lower);
     Some((inner.height.max(1), inner.width.max(1)))
 }
@@ -275,16 +281,17 @@ fn color(c: vt100::Color) -> Option<Color> {
 }
 
 /// The table, with the details beside it when shown.
-fn upper_body(f: &mut Frame, model: &Model, view: &View, body: Rect) {
+fn upper_body(f: &mut Frame, model: &Model, view: &View, rows: Vec<TableRow>, body: Rect) {
     let width = f.area().width;
     if shows_detail(view, width) {
+        let selected = rows.get(view.selected[view.index()]).and_then(|r| r.key.clone());
         let side = (width / 3).clamp(40, 70);
         let [table, detail_area] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(side)]).areas(body);
-        draw_table(f, model, view, table);
-        detail(f, model, view, detail_area);
+        draw_table(f, model, view, rows, table);
+        detail(f, model, selected, detail_area);
     } else {
-        draw_table(f, model, view, body);
+        draw_table(f, model, view, rows, body);
     }
 }
 
@@ -452,17 +459,26 @@ fn graph(
 fn summary(model: &Model) -> Vec<Line<'static>> {
     let mut first = Vec::new();
     if !model.hidden.contains(&Kind::Node) {
-        let nodes: Vec<NodeStatus> = model.of(Kind::Node).map(status).collect();
-        let ready = nodes.iter().filter(|n| n.state == NodeState::Ready).count();
-        let color = if ready == nodes.len() { OK } else { WARN };
+        let (mut total, mut ready) = (0usize, 0usize);
+        for n in model.of(Kind::Node) {
+            total += 1;
+            if status::<NodeStatus>(n).state == NodeState::Ready {
+                ready += 1;
+            }
+        }
+        let color = if ready == total { OK } else { WARN };
         first.push(Span::styled("● ", fg(color)));
-        first.push(Span::raw(format!("{ready}/{} nodes ready   ", nodes.len())));
+        first.push(Span::raw(format!("{ready}/{total} nodes ready   ")));
     }
-    let tasks: Vec<TaskStatus> = model.of(Kind::Task).map(status).collect();
-    let count = |f: &dyn Fn(TaskState) -> bool| tasks.iter().filter(|t| f(t.state)).count();
-    let running = count(&|s| s == TaskState::Running);
-    let failed = count(&|s| matches!(s, TaskState::Failed | TaskState::Rejected));
-    let waiting = count(&|s| s != TaskState::Running && !s.is_terminal());
+    let (mut running, mut waiting, mut failed) = (0usize, 0usize, 0usize);
+    for t in model.of(Kind::Task) {
+        match task_state(t) {
+            TaskState::Running => running += 1,
+            TaskState::Failed | TaskState::Rejected => failed += 1,
+            s if !s.is_terminal() => waiting += 1,
+            _ => {}
+        }
+    }
     first.extend([
         Span::styled("▲ ", fg(OK)),
         Span::raw(format!("{running} running   ")),
@@ -524,7 +540,7 @@ fn tab_bar(model: &Model, view: &View) -> Tabs<'static> {
         .padding(" ", " ")
 }
 
-fn draw_table(f: &mut Frame, model: &Model, view: &View, area: Rect) {
+fn draw_table(f: &mut Frame, model: &Model, view: &View, rows: Vec<TableRow>, area: Rect) {
     let mut heading = vec![Span::styled(
         format!(" {} ", view.tab.title()),
         fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -557,7 +573,6 @@ fn draw_table(f: &mut Frame, model: &Model, view: &View, area: Rect) {
         );
         return;
     }
-    let rows = rows(model, view);
     let count = rows.len();
     let block = block.title(Line::from(Span::styled(format!(" {count} "), dim())).right_aligned());
     if rows.is_empty() {
@@ -589,6 +604,13 @@ fn draw_table(f: &mut Frame, model: &Model, view: &View, area: Rect) {
         })
         .collect();
     let selected = view.selected[view.index()].min(count - 1);
+    let page = area.height.saturating_sub(3) as usize;
+    let start = if page > 0 {
+        selected.saturating_sub(page - 1)
+    } else {
+        0
+    };
+    let end = (start + page).min(count);
     let highlight = if mono() {
         Style::default().add_modifier(Modifier::REVERSED)
     } else {
@@ -598,6 +620,8 @@ fn draw_table(f: &mut Frame, model: &Model, view: &View, area: Rect) {
     };
     let table = Table::new(
         rows.into_iter()
+            .skip(start)
+            .take(end - start)
             .map(|r| Row::new(r.cells.into_iter().map(Cell::from)).style(r.style)),
         constraints,
     )
@@ -609,7 +633,7 @@ fn draw_table(f: &mut Frame, model: &Model, view: &View, area: Rect) {
     .column_spacing(2)
     .row_highlight_style(highlight)
     .highlight_symbol(Span::styled("▌", fg(ACCENT)));
-    let mut state = TableState::default().with_selected(Some(selected));
+    let mut state = TableState::default().with_selected(Some(selected - start));
     f.render_stateful_widget(table.block(block), area, &mut state);
     if count + 3 > area.height as usize {
         let mut bar = ScrollbarState::new(count).position(selected);
@@ -628,8 +652,8 @@ fn draw_table(f: &mut Frame, model: &Model, view: &View, area: Rect) {
 }
 
 /// The selected object, field by field.
-fn detail(f: &mut Frame, model: &Model, view: &View, area: Rect) {
-    let Some(key) = view.selected_key(model) else {
+fn detail(f: &mut Frame, model: &Model, selected: Option<Key>, area: Rect) {
+    let Some(key) = selected else {
         f.render_widget(
             Paragraph::new(dimmed("Nothing selected.")).block(panel(title("Details"))),
             area,

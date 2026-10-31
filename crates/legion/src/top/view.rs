@@ -1,21 +1,26 @@
 //! What the person looks at and what their keys do: the tabs, the rows of
 //! each, and the requests keys make.
 
+use std::collections::BTreeMap;
+
 use legion_api::data::DataSpec;
 use legion_api::job::{CronJobStatus, JobState, JobStatus};
 use legion_api::node::{NodeSpec, NodeState, NodeStatus};
 use legion_api::route::RouteSpec;
 use legion_api::service::ServiceStatus;
-use legion_api::task::{TaskSpec, TaskState, TaskStatus};
+use legion_api::task::{TaskSpec, TaskState};
 use legion_api::volume::{VolumeSpec, VolumeStatus};
 use legion_api::{Kind, Object};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use serde::Deserialize;
 
 use super::draw::{BAD, OK, WARN, bytes, dimmed, fg, meter, trim};
 use super::logs::Logs;
-use super::model::{Key, Model, containers, key, kind_word, owner, spec, status, word};
+use super::model::{
+    Key, Model, containers, key, kind_word, owner, spec, status, task_state, word,
+};
 use super::shell::{self, Shell};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -362,14 +367,6 @@ impl View {
         TABS.iter().position(|t| *t == self.tab).expect("a tab")
     }
 
-    /// The object of the selected row.
-    pub(super) fn selected_key(&self, model: &Model) -> Option<Key> {
-        rows(model, self)
-            .into_iter()
-            .nth(self.selected[self.index()])
-            .and_then(|r| r.key)
-    }
-
     /// What a key does, and the request it makes, if any.
     pub fn key(&mut self, model: &Model, k: KeyEvent) -> Option<Request> {
         // Ctrl-C and all go to the shell while it has the keys.
@@ -403,7 +400,10 @@ impl View {
         if let Some(done) = self.pane_key(k) {
             return done;
         }
-        let selected = self.selected_key(model);
+        let rows = rows(model, self);
+        let count = rows.len();
+        let i = self.index();
+        let selected = rows.into_iter().nth(self.selected[i]).and_then(|r| r.key);
         if let KeyCode::Char(c) = k.code
             && let Some(key) = &selected
             && let Some(request) = self.act(c, model, key)
@@ -413,8 +413,6 @@ impl View {
         if self.prompt.is_some() || self.notice.is_some() {
             return None;
         }
-        let count = rows(model, self).len();
-        let i = self.index();
         let sel = &mut self.selected[i];
         let last = count.saturating_sub(1);
         match k.code {
@@ -811,17 +809,27 @@ fn dim() -> Style {
 }
 
 fn node_rows(model: &Model) -> Vec<TableRow> {
+    let mut running: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut used: BTreeMap<&str, (f64, u64)> = BTreeMap::new();
+    for t in model.of(Kind::Task) {
+        let Some(node) = t.spec["node"].as_str().filter(|n| !n.is_empty()) else {
+            continue;
+        };
+        if task_state(t) == TaskState::Running {
+            *running.entry(node).or_default() += 1;
+        }
+        if let Some((c, m)) = model.task_usage(t) {
+            let u = used.entry(node).or_default();
+            *u = (u.0 + c, u.1 + m);
+        }
+    }
     model
         .of(Kind::Node)
         .map(|n| {
             let (spec, st): (NodeSpec, NodeStatus) = (spec(n), status(n));
             let name = n.metadata.name.clone();
-            let on = |t: &Object| t.spec["node"].as_str() == Some(name.as_str());
-            let running = model
-                .of(Kind::Task)
-                .filter(|t| on(t) && status::<TaskStatus>(t).state == TaskState::Running)
-                .count();
-            let used = model.sum_usage(on);
+            let running = running.get(name.as_str()).copied().unwrap_or(0);
+            let used = used.get(name.as_str()).copied();
             let cores = st.allocatable.cpu.millis() as f64 / 1000.0;
             let cpu = gauge(
                 used.map(|(c, _)| c / 100.0),
@@ -893,12 +901,24 @@ fn usage_cells(used: Option<(f64, u64)>) -> [Line<'static>; 2] {
 }
 
 fn workload_rows(model: &Model) -> Vec<TableRow> {
-    let owned_by = |t: &Object, kind: Kind, o: &Object| {
-        t.metadata.namespace == o.metadata.namespace && owner(t) == Some((kind, &o.metadata.name))
+    let mut used: BTreeMap<(Kind, &str, &str), (f64, u64)> = BTreeMap::new();
+    for t in model.of(Kind::Task) {
+        if let Some((kind, name)) = owner(t)
+            && let Some((c, m)) = model.task_usage(t)
+        {
+            let u = used
+                .entry((kind, t.metadata.namespace.as_str(), name))
+                .or_default();
+            *u = (u.0 + c, u.1 + m);
+        }
+    }
+    let used_by = |kind: Kind, o: &Object| {
+        used.get(&(kind, o.metadata.namespace.as_str(), o.metadata.name.as_str()))
+            .copied()
     };
     let services = model.of(Kind::Service).map(|s| {
         let st: ServiceStatus = status(s);
-        let [cpu, memory] = usage_cells(model.sum_usage(|t| owned_by(t, Kind::Service, s)));
+        let [cpu, memory] = usage_cells(used_by(Kind::Service, s));
         let update = st
             .update
             .as_ref()
@@ -929,7 +949,7 @@ fn workload_rows(model: &Model) -> Vec<TableRow> {
     });
     let jobs = model.of(Kind::Job).map(|j| {
         let st: JobStatus = status(j);
-        let [cpu, memory] = usage_cells(model.sum_usage(|t| owned_by(t, Kind::Job, j)));
+        let [cpu, memory] = usage_cells(used_by(Kind::Job, j));
         let done = match j.spec["completions"].as_u64() {
             Some(n) => format!("{}/{n}", st.succeeded),
             None => st.succeeded.to_string(),
@@ -991,16 +1011,21 @@ fn task_rows(model: &Model, view: &View) -> Vec<TableRow> {
             }
         })
         .filter_map(|t| {
-            let st: TaskStatus = status(t);
-            let ended = st.state.is_terminal();
+            let st = task_state(t);
+            let ended = st.is_terminal();
             if ended && !view.history {
                 return None;
             }
+            let ready = t.status["ready"].as_bool().unwrap_or(false);
+            let restarts = t.status["restarts"].as_u64().unwrap_or(0);
+            let ip = t.status["ip"].as_str().unwrap_or_default();
+            let jid = t.status["jid"].as_i64();
+            let message = t.status["message"].as_str().unwrap_or_default();
             let [cpu, memory] = usage_cells(model.task_usage(t));
-            let state = match st.state {
+            let state = match st {
                 TaskState::Failed | TaskState::Rejected => fg(BAD),
                 _ if ended => dim(),
-                TaskState::Running if st.ready => fg(OK),
+                TaskState::Running if ready => fg(OK),
                 _ => fg(WARN),
             };
             let row = TableRow::new(
@@ -1008,14 +1033,14 @@ fn task_rows(model: &Model, view: &View) -> Vec<TableRow> {
                     dimmed(t.metadata.namespace.clone()),
                     text(t.metadata.name.clone()),
                     text(t.spec["node"].as_str().unwrap_or_default().to_owned()),
-                    colored(word(&st.state), state),
-                    colored(if st.ready { "✓" } else { "" }, fg(OK)),
-                    text(st.restarts.to_string()),
+                    colored(word(&st), state),
+                    colored(if ready { "✓" } else { "" }, fg(OK)),
+                    text(restarts.to_string()),
                     cpu,
                     memory,
-                    dimmed(st.ip.unwrap_or_default()),
-                    dimmed(st.jid.map(|j| j.to_string()).unwrap_or_default()),
-                    text(st.message),
+                    dimmed(ip.to_owned()),
+                    dimmed(jid.map(|j| j.to_string()).unwrap_or_default()),
+                    text(message.to_owned()),
                 ],
                 Some(key(t)),
             );
@@ -1029,19 +1054,25 @@ fn task_rows(model: &Model, view: &View) -> Vec<TableRow> {
 
 fn volume_rows(model: &Model) -> Vec<TableRow> {
     // What running tasks mount, by namespace and Volume.
-    let mut users: std::collections::BTreeMap<(String, String), Vec<String>> = Default::default();
+    let mut users: BTreeMap<(&str, String), Vec<&str>> = Default::default();
     for t in model.of(Kind::Task) {
-        if status::<TaskStatus>(t).state.is_terminal() {
+        if task_state(t).is_terminal() {
             continue;
         }
-        let Ok(task) = serde_json::from_value::<TaskSpec>(t.spec.clone()) else {
+        if !t.spec["pod"]["volumes"]
+            .as_array()
+            .is_some_and(|v| !v.is_empty())
+        {
+            continue;
+        }
+        let Ok(task) = TaskSpec::deserialize(&t.spec) else {
             continue;
         };
         for v in task.volumes() {
             users
-                .entry((t.metadata.namespace.clone(), v))
+                .entry((t.metadata.namespace.as_str(), v))
                 .or_default()
-                .push(t.metadata.name.clone());
+                .push(t.metadata.name.as_str());
         }
     }
     model
@@ -1057,7 +1088,7 @@ fn volume_rows(model: &Model) -> Vec<TableRow> {
                 None => text(""),
             };
             let used_by = users
-                .get(&(v.metadata.namespace.clone(), v.metadata.name.clone()))
+                .get(&(v.metadata.namespace.as_str(), v.metadata.name.clone()))
                 .map(|u| u.join(","))
                 .unwrap_or_default();
             TableRow::new(
@@ -1078,7 +1109,7 @@ fn volume_rows(model: &Model) -> Vec<TableRow> {
 
 fn network_rows(model: &Model) -> Vec<TableRow> {
     let routes = model.of(Kind::Route).map(|r| {
-        let sp: RouteSpec = serde_json::from_value(r.spec.clone()).unwrap_or(RouteSpec {
+        let sp = RouteSpec::deserialize(&r.spec).unwrap_or(RouteSpec {
             host: String::new(),
             path: "/".into(),
             service: String::new(),
@@ -1169,7 +1200,7 @@ fn config_rows(model: &Model) -> Vec<TableRow> {
                     None => "(hidden)".into(),
                 }
             } else {
-                let size = serde_json::from_value::<DataSpec>(d.spec.clone())
+                let size = DataSpec::deserialize(&d.spec)
                     .ok()
                     .and_then(|s| s.bytes().ok())
                     .map_or(0, |b| b.len() as u64);

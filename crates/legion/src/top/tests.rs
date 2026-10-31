@@ -775,3 +775,70 @@ fn sizes() {
     assert_eq!(draw::bytes(3 << 29), "1.5Gi");
     assert_eq!(draw::trim(4.0), "4");
 }
+
+#[test]
+fn renders_max_scale_cluster_of_256_nodes_and_20000_tasks() {
+    let mut objects = Vec::with_capacity(256 + 100 + 20_000);
+    for i in 0..256 {
+        objects.push(node(&format!("n-{i:03}"), 1, "ready", "active"));
+    }
+    for i in 0..100 {
+        let mut s = service(1, 200, 200);
+        s.metadata.name = format!("svc-{i:03}");
+        objects.push(s);
+    }
+    let mut tasks_usage = Vec::with_capacity(20_000);
+    for i in 0..20_000 {
+        let node_name = format!("n-{:03}", i % 256);
+        let svc_name = format!("svc-{:03}", i % 100);
+        let task_name = format!("t-{i:05}");
+        let mut t = object(
+            Kind::Task,
+            "shop",
+            &task_name,
+            1,
+            serde_json::json!({
+                "service": svc_name,
+                "serviceUid": "1",
+                "serviceGeneration": 1,
+                "node": node_name,
+                "pod": { "containers": [{ "name": "web", "image": "nginx:1" }] }
+            }),
+            serde_json::json!({ "state": "running", "ready": true, "ip": "10.200.0.2", "jid": i }),
+        );
+        t.metadata.labels.insert(LABEL_SERVICE.into(), svc_name);
+        objects.push(t);
+        tasks_usage.push(pb::TaskUsage {
+            namespace: "shop".into(),
+            task: task_name,
+            cpu_percent: 1.0,
+            memory_bytes: 1 << 20,
+        });
+    }
+    let mut m = Model::new(None);
+    m.listed(objects, BTreeSet::new());
+    m.usage(pb::UsageResponse {
+        nodes: vec![pb::NodeUsage {
+            node: "n-000".into(),
+            tasks: tasks_usage,
+        }],
+    });
+
+    let mut v = View::default();
+    let s = screen(&m, &v);
+    assert!(s.contains("256/256 nodes ready") && s.contains("20000 running"), "{s}");
+    // Node n-000 gets 79 tasks (20000 = 256 * 78 + 32).
+    assert!(
+        line(&s, "n-000").starts_with("n-000 ● ready active worker 79 0.79/4 79Mi/8Gi")
+    );
+
+    typed(&mut v, &m, "2");
+    let s = screen(&m, &v);
+    assert!(
+        line(&s, "svc-000").starts_with("shop svc-000 replicated 200/200 200% 200Mi nginx:1")
+    );
+
+    typed(&mut v, &m, "3G");
+    let s = screen_of(&m, &v, 170);
+    assert!(s.contains("t-19999") && s.contains("task shop/t-19999"), "{s}");
+}

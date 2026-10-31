@@ -11,7 +11,7 @@ use legion_api::task::{TaskState, TaskStatus};
 use legion_api::volume::VolumeStatus;
 use legion_api::{Kind, Object};
 use legion_proto::v1 as pb;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Changes kept in the log.
 const LOG: usize = 500;
@@ -30,7 +30,7 @@ pub struct Model {
     pub(super) namespace: Option<String>,
     pub(super) objects: BTreeMap<Key, Object>,
     /// What tasks use, by namespace and task: percent of a CPU, bytes.
-    pub(super) usage: BTreeMap<(String, String), (f64, u64)>,
+    pub(super) usage: BTreeMap<String, BTreeMap<String, (f64, u64)>>,
     /// What all tasks used, at each poll.
     pub(super) history: VecDeque<(f64, u64)>,
     /// What changed, newest first, with when (Unix seconds).
@@ -101,16 +101,15 @@ impl Model {
     }
 
     pub(super) fn usage(&mut self, u: pb::UsageResponse) {
-        self.usage = u
-            .nodes
-            .into_iter()
-            .flat_map(|n| n.tasks)
-            .map(|t| ((t.namespace, t.task), (t.cpu_percent, t.memory_bytes)))
-            .collect();
-        let total = self
-            .usage
-            .values()
-            .fold((0.0, 0), |(c, m), (tc, tm)| (c + tc, m + tm));
+        self.usage.clear();
+        let mut total = (0.0, 0);
+        for t in u.nodes.into_iter().flat_map(|n| n.tasks) {
+            total = (total.0 + t.cpu_percent, total.1 + t.memory_bytes);
+            self.usage
+                .entry(t.namespace)
+                .or_default()
+                .insert(t.task, (t.cpu_percent, t.memory_bytes));
+        }
         self.history.push_back(total);
         while self.history.len() > HISTORY {
             self.history.pop_front();
@@ -131,16 +130,9 @@ impl Model {
     /// What a task uses, if reported.
     pub(super) fn task_usage(&self, t: &Object) -> Option<(f64, u64)> {
         self.usage
-            .get(&(t.metadata.namespace.clone(), t.metadata.name.clone()))
+            .get(&t.metadata.namespace)?
+            .get(&t.metadata.name)
             .copied()
-    }
-
-    /// What tasks matching `f` use together, if any reported.
-    pub(super) fn sum_usage(&self, f: impl Fn(&Object) -> bool) -> Option<(f64, u64)> {
-        self.of(Kind::Task)
-            .filter(|t| f(t))
-            .filter_map(|t| self.task_usage(t))
-            .reduce(|(c1, m1), (c2, m2)| (c1 + c2, m1 + m2))
     }
 
     /// What the nodes can hold together: millicores, bytes.
@@ -164,7 +156,7 @@ pub(super) fn key(o: &Object) -> Key {
 /// A Secret's value never reaches the screen: only its size is kept.
 fn sanitized(mut o: Object) -> Object {
     if o.kind == Kind::Secret {
-        let size = serde_json::from_value::<DataSpec>(o.spec.clone())
+        let size = DataSpec::deserialize(&o.spec)
             .ok()
             .and_then(|d| d.bytes().ok())
             .map(|b| b.len());
@@ -202,11 +194,15 @@ pub(super) fn kind_word(kind: Kind) -> &'static str {
 }
 
 pub(super) fn status<T: serde::de::DeserializeOwned + Default>(o: &Object) -> T {
-    serde_json::from_value(o.status.clone()).unwrap_or_default()
+    T::deserialize(&o.status).unwrap_or_default()
 }
 
 pub(super) fn spec<T: serde::de::DeserializeOwned + Default>(o: &Object) -> T {
-    serde_json::from_value(o.spec.clone()).unwrap_or_default()
+    T::deserialize(&o.spec).unwrap_or_default()
+}
+
+pub(super) fn task_state(t: &Object) -> TaskState {
+    TaskState::deserialize(&t.status["state"]).unwrap_or_default()
 }
 
 /// An enum as it is written in the API: `ready`, `drain`.
