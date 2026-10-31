@@ -25,8 +25,14 @@ pub struct Pki {
     lock: Option<legion_store::StoreKey>,
 }
 
-/// The private keys autolock seals: the CA's, the node's and the store's.
-const SEALABLE: [&str; 3] = ["ca.key", "node.key", "store.key"];
+/// The private keys autolock seals: the CA's, the node's, the store's and
+/// the node's WireGuard key.
+const SEALABLE: [&str; 4] = ["ca.key", "node.key", "store.key", WIREGUARD_KEY];
+
+/// A manager's WireGuard key, here; a worker's agent keeps its own in
+/// `<data dir>/wireguard.key`, where managers kept theirs before autolock
+/// sealed them.
+const WIREGUARD_KEY: &str = "wireguard.key";
 
 impl Pki {
     pub fn new(data_dir: &Path) -> Pki {
@@ -139,6 +145,35 @@ impl Pki {
             &format!("{}\n", STANDARD.encode(key.as_bytes())),
         )?;
         tracing::info!("made the store's key");
+        Ok(key)
+    }
+
+    /// This manager's WireGuard private key, kept with its other private
+    /// keys so that autolock seals it: taken over from
+    /// `<data dir>/wireguard.key` where the agent made it, or made with
+    /// `genkey` on first use.
+    pub fn wireguard_key(
+        &self,
+        data_dir: &Path,
+        genkey: impl FnOnce() -> anyhow::Result<String>,
+    ) -> anyhow::Result<String> {
+        if let Some(text) = self.read_secret(WIREGUARD_KEY)? {
+            return Ok(text.trim().to_owned());
+        }
+        let agents = data_dir.join(WIREGUARD_KEY);
+        let key = match read(&agents)? {
+            Some(text) => text.trim().to_owned(),
+            None => genkey().context("making the node's WireGuard key")?,
+        };
+        private_dir(&self.dir)?;
+        self.write_secret(
+            WIREGUARD_KEY,
+            &format!(
+                "{key}
+"
+            ),
+        )?;
+        remove(&agents)?;
         Ok(key)
     }
 
@@ -519,6 +554,54 @@ mod tests {
         let healed = pki.ensure("n2", dir.path()).unwrap();
         assert_ne!(healed.cert_pem, renamed.cert_pem);
         assert!(Credentials::new(&healed.ca_pem, &healed.cert_pem, &healed.key_pem).is_ok());
+    }
+
+    #[test]
+    fn the_wireguard_key_is_taken_over_and_sealed_with_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pki = Pki::new(dir.path());
+        pki.store_key().unwrap();
+        // The one the agent made before is the one kept.
+        let agents = dir.path().join("wireguard.key");
+        std::fs::write(
+            &agents, "wg1
+",
+        )
+        .unwrap();
+        let made = || -> anyhow::Result<String> { panic!("a key was made") };
+        assert_eq!(pki.wireguard_key(dir.path(), made).unwrap(), "wg1");
+        assert!(!agents.exists());
+        assert_eq!(pki.wireguard_key(dir.path(), made).unwrap(), "wg1");
+
+        // Sealed and unsealed with the others.
+        let key = legion_store::StoreKey::generate();
+        pki.reseal(Some(key.clone())).unwrap();
+        assert!(!pki.path("wireguard.key").exists());
+        assert!(pki.sealed_path("wireguard.key").exists());
+        let locked = Pki::new(dir.path());
+        assert!(locked.locked());
+        assert!(locked.wireguard_key(dir.path(), made).is_err());
+        let unlocked = locked.unlock(key).unwrap();
+        assert_eq!(unlocked.wireguard_key(dir.path(), made).unwrap(), "wg1");
+        pki.reseal(None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pki.path("wireguard.key")).unwrap(),
+            "wg1
+"
+        );
+
+        // Made where there is none.
+        let other = tempfile::tempdir().unwrap();
+        let pki = Pki::new(other.path());
+        let made = pki
+            .wireguard_key(other.path(), || Ok("wg2".to_owned()))
+            .unwrap();
+        assert_eq!(made, "wg2");
+        assert_eq!(
+            pki.wireguard_key(other.path(), || Ok("wg3".to_owned()))
+                .unwrap(),
+            "wg2"
+        );
     }
 
     #[test]

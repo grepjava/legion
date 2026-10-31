@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
-use legion_agent::{Agent, AgentConfig, GrpcControl, WireGuardConfig};
+use legion_agent::{Agent, AgentConfig, GrpcControl, WireGuardConfig, WireGuardKey};
 use legion_api::node::{Capacity, NodeState, NodeStatus, Platform};
 use legion_api::quantity::{Bytes, Cpu};
 
@@ -84,6 +84,19 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     // The agent calls this manager as the node, with the same credentials.
     let control = GrpcControl::new(&node, vec![advertise.clone()], Some(credentials.clone()))
         .map_err(|e| anyhow::anyhow!(e))?;
+    let run_agent = opts.agent && cfg!(target_os = "freebsd");
+    // Kept with the other private keys, so that autolock seals it too.
+    let wireguard = run_agent.then(|| {
+        let sys = legion_sys::Shell::new();
+        let genkey = || Ok(legion_sys::Sys::wg_genkey(&sys)?);
+        match pki.wireguard_key(&opts.data_dir, genkey) {
+            Ok(key) => WireGuardKey::Given(key),
+            Err(e) => {
+                tracing::warn!("{e:#}; the agent tries for one itself");
+                WireGuardKey::File(opts.data_dir.join("wireguard.key"))
+            }
+        }
+    });
     let pki = Arc::new(std::sync::Mutex::new(pki));
     let autolock = tokio::spawn(crate::autolock::follow(
         manager.store().clone(),
@@ -102,8 +115,18 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     let metrics_listener = bind_metrics(&opts).await?;
 
     let (stop, stopped) = tokio::sync::watch::channel(false);
-    let agent = if opts.agent && cfg!(target_os = "freebsd") {
-        Some(start_agent(&opts, &node, status(hostname, &advertise), control, stopped).await?)
+    let agent = if let Some(wireguard) = wireguard {
+        Some(
+            start_agent(
+                &opts,
+                &node,
+                status(hostname, &advertise),
+                control,
+                wireguard,
+                stopped,
+            )
+            .await?,
+        )
     } else {
         tracing::info!("agent disabled; this daemon runs the manager only");
         None
@@ -186,6 +209,7 @@ async fn run_worker(opts: &Options, pki: &crate::pki::Pki, hostname: String) -> 
         &node,
         status(hostname, &advertise),
         control.clone(),
+        WireGuardKey::File(opts.data_dir.join("wireguard.key")),
         stopped,
     )
     .await?;
@@ -344,6 +368,7 @@ async fn start_agent(
     node: &str,
     mut status: NodeStatus,
     control: GrpcControl,
+    wireguard: WireGuardKey,
     stopped: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<Running> {
     status.platform.linux = opts.linux;
@@ -359,7 +384,7 @@ async fn start_agent(
     config.ingress = opts.ingress_listen;
     config.ingress_tls = opts.ingress_tls_listen;
     config.wireguard = Some(WireGuardConfig {
-        key_file: opts.data_dir.join("wireguard.key"),
+        key: wireguard,
         port: legion_net::mesh::PORT,
     });
     let sys: Arc<dyn legion_sys::Sys> = Arc::new(legion_sys::Shell::new());

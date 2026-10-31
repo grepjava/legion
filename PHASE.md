@@ -716,8 +716,16 @@ service and migrates between nodes.
 
 Nothing left in phase 4.
 
-Smaller follow-ups: ingress HTTP/2, connection reuse and ACME certificates; sealing the
-WireGuard key under autolock.
+Smaller follow-ups: ingress HTTP/2, connection reuse and ACME certificates.
+
+- **The WireGuard key under autolock** (`legion::pki`, DESIGN.md §9): a
+  manager keeps its WireGuard key in `pki/` with its other private keys,
+  so autolock seals it; the daemon hands it to the agent
+  (`WireGuardKey::Given`), and takes over the one the agent kept in
+  `<data dir>/wireguard.key` before. Workers keep theirs there, as they
+  keep their node keys unsealed. Tested: the key taken over, kept,
+  sealed and unsealed with the others, refused while locked, opened by
+  the unlock key, and made where there is none.
 
 ## Phase 5 — Extensions
 

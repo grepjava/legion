@@ -97,10 +97,29 @@ pub const DEFAULT_PLUGIN_DIR: &str = "/usr/local/libexec/legion/volume";
 
 #[derive(Debug, Clone)]
 pub struct WireGuardConfig {
-    /// Holds the node's private key, made on first start.
-    pub key_file: PathBuf,
+    /// The node's private key.
+    pub key: WireGuardKey,
     /// The UDP port the node listens on.
     pub port: u16,
+}
+
+/// Where the agent finds the node's WireGuard private key.
+#[derive(Clone)]
+pub enum WireGuardKey {
+    /// In this file, made there (readable by root only) on first start.
+    File(PathBuf),
+    /// Given: the caller keeps it (a manager's daemon, sealed under
+    /// autolock).
+    Given(String),
+}
+
+impl std::fmt::Debug for WireGuardKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WireGuardKey::File(path) => f.debug_tuple("File").field(path).finish(),
+            WireGuardKey::Given(_) => f.write_str("Given(..)"),
+        }
+    }
 }
 
 impl AgentConfig {
@@ -216,7 +235,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         // Other nodes learn the key and where to send from the node's status.
         let mut private_key = None;
         if let Some(wg) = &self.wireguard {
-            match wireguard_key(&ctx.sys, wg.key_file.clone()).await {
+            match wireguard_key(&ctx.sys, wg.key.clone()).await {
                 Ok((private, public)) => {
                     let endpoint = match status.addr.as_str() {
                         "" => None,
@@ -236,10 +255,9 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                     });
                     private_key = Some(private);
                 }
-                Err(e) => tracing::error!(
-                    "the WireGuard key in {}: {e}; pods will reach this node only",
-                    wg.key_file.display()
-                ),
+                Err(e) => {
+                    tracing::error!("the node's WireGuard key: {e}; pods will reach this node only")
+                }
             }
         }
 
@@ -543,10 +561,17 @@ async fn dns(
     }))
 }
 
-/// The node's WireGuard private and public keys: the private one from
-/// `key_file`, made and saved there (readable by root only) if missing.
-async fn wireguard_key(sys: &Arc<dyn Sys>, key_file: PathBuf) -> Result<(String, String), String> {
+/// The node's WireGuard private and public keys: the private one given, or
+/// from its file, made and saved there (readable by root only) if missing.
+async fn wireguard_key(sys: &Arc<dyn Sys>, key: WireGuardKey) -> Result<(String, String), String> {
     task::blocking(sys, move |sys| {
+        let key_file = match key {
+            WireGuardKey::Given(private) => {
+                let public = sys.wg_pubkey(&private).map_err(|e| e.to_string())?;
+                return Ok((private, public));
+            }
+            WireGuardKey::File(path) => path,
+        };
         let private = match std::fs::read_to_string(&key_file) {
             Ok(k) => k.trim().to_owned(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

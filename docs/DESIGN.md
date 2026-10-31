@@ -652,7 +652,9 @@ default `10.88.0.0/16`, on a host that also runs Podman, for example).
   for both, the bridge claims the frames as its own. Neighbor discovery
   answers on the bridge only, so IPv6 never had this.
 - **Built** (phase 2): the mesh. Each node makes a WireGuard key on first
-  start (`<data-dir>/wireguard.key`, mode 0600) and registers its public
+  start (a worker's in `<data-dir>/wireguard.key`, a manager's in
+  `<data-dir>/pki` with its other private keys, so that autolock seals
+  it; both mode 0600) and registers its public
   key and endpoint (its advertised address, port 51820) in
   `Node.status.wireguard`. Its `wg0` address is derived from its pod
   subnet (`10.200.<n>.0/24` has `100.64.<n>.1/16`), so nothing more is
@@ -1492,7 +1494,8 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
   `rotate` replaces it, `disable` drops it) and keeps it in the store, in
   the reserved namespace, where every manager reads it (sealed there by
   each one's data key). Each manager then seals its private keys, the
-  CA's, its node's and its store's (`<name>.sealed`, ChaCha20-Poly1305,
+  CA's, its node's, its store's and its WireGuard key (`<name>.sealed`,
+  ChaCha20-Poly1305,
   bound to the file's name), and removes them in the clear; it rechecks
   every 5 s, so a rotation reseals and `disable` writes them in the clear
   again. A manager that starts with sealed keys serves only `Unlock`, in
@@ -1502,8 +1505,9 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
   usual with them held in memory. A manager down during a rotation needs
   the key it last sealed with, then reseals. `legion restore` on a locked
   manager takes `--unlock-key-file`. Not sealed: `admin.pem` (the CLI's
-  credentials), workers' keys and WireGuard keys, as in Swarm only
-  managers lock. Backups hold the unlock key with the rest.
+  credentials) and workers' keys, as in Swarm only managers lock. A
+  manager's WireGuard key moves from `<data-dir>/wireguard.key`, where
+  versions before 0.1.7 kept it, into `pki/` at its next start. Backups hold the unlock key with the rest.
 - **Secrets in transit and on nodes**: delivered only to nodes running tasks
   that use them; held in tmpfs; removed when the last task using them stops.
 - **Data plane**: all node-to-node traffic goes over WireGuard. WireGuard keys

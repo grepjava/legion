@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use legion_agent::fake::FakeRuntime;
 use legion_agent::runtime::Output;
-use legion_agent::{Agent, AgentConfig, GrpcControl, WireGuardConfig};
+use legion_agent::{Agent, AgentConfig, GrpcControl, WireGuardConfig, WireGuardKey};
 use legion_api::node::{NodeState, NodeStatus};
 use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
 use legion_api::{Kind, Object, ObjectKey, Spec};
@@ -113,7 +113,7 @@ impl Harness {
         config.logs_dir = Some(self.logs_dir());
         if self.mesh {
             config.wireguard = Some(WireGuardConfig {
-                key_file: self.key_file(),
+                key: WireGuardKey::File(self.key_file()),
                 port: 51820,
             });
         }

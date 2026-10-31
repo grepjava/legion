@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use legion_agent::fake::FakeRuntime;
-use legion_agent::{Agent, AgentConfig, GrpcControl, WireGuardConfig};
+use legion_agent::{Agent, AgentConfig, GrpcControl, WireGuardConfig, WireGuardKey};
 use legion_api::node::{NodeState, NodeStatus};
 use legion_api::{Kind, Object};
 use legion_manager::{Manager, ManagerConfig};
@@ -125,7 +125,7 @@ impl Cluster {
         config.resync = Duration::from_millis(100);
         config.usage_period = Duration::from_millis(100);
         config.wireguard = Some(WireGuardConfig {
-            key_file,
+            key: WireGuardKey::File(key_file),
             port: 51820,
         });
         let control = GrpcControl::new(&node.name, vec![self.addr.clone()], None).unwrap();
