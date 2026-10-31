@@ -26,6 +26,7 @@ fn runtime(sys: &Arc<Shell>, images: &Arc<Store>, dir: &Path, base: &str) -> Jai
             state_dir: dir.join("jails"),
             dataset: format!("{base}/jails"),
             shim: vec![env!("CARGO_BIN_EXE_legion-jail-shim").into()],
+            prune_images: false,
         },
     )
     .unwrap()
@@ -504,6 +505,184 @@ shm
     for (image, _) in LINUX_IMAGES {
         images.remove(image).await.unwrap();
     }
+    images.remove(IMAGE).await.unwrap();
+    sys.zfs_destroy(&base, true).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// What jailer calls: a container with no pod, run supervised and on the
+/// caller's output, found by name, and a build's steps on a directory.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs root, LEGION_JAIL_ZFS_ROOT and the network"]
+async fn standalone_containers_and_build_steps() {
+    use legion_jail::{Step, StepMount, StepNetwork};
+
+    let Ok(root) = std::env::var("LEGION_JAIL_ZFS_ROOT") else {
+        eprintln!("LEGION_JAIL_ZFS_ROOT not set; skipping");
+        return;
+    };
+    let base = format!("{root}/lstand{}", std::process::id());
+    let dir = tempfile::Builder::new()
+        .prefix("lstand")
+        .tempdir_in("/var/tmp")
+        .unwrap()
+        .keep();
+    let sys = Arc::new(Shell::new());
+    let images = Arc::new(
+        Store::open(
+            sys.clone() as Arc<dyn Sys>,
+            &format!("{base}/images"),
+            &dir.as_path().join("images"),
+            Client::new().unwrap(),
+        )
+        .unwrap(),
+    );
+    let rt = runtime(&sys, &images, dir.as_path(), &base);
+    rt.pull(IMAGE, "t", &[]).await.unwrap();
+    let standalone = |name: &str, script: &str| ContainerSpec {
+        name: name.to_owned(),
+        image: IMAGE.to_owned(),
+        entrypoint: vec!["/bin/sh".into(), "-c".into(), script.into()],
+        annotations: BTreeMap::from([(
+            "legion.jail".to_owned(),
+            "allow.raw_sockets=false allow.chflags=false enforce_statfs=2 securelevel=2".to_owned(),
+        )]),
+        ..Default::default()
+    };
+
+    // Supervised: a jail of its own on the host's addresses, locked down
+    // as a pod's member is.
+    let app = rt
+        .create(&standalone("app", "hostname; echo up; exec sleep 60"))
+        .await
+        .unwrap();
+    assert_eq!(rt.find("app").unwrap(), app);
+    assert_eq!(rt.find(&app[..12]).unwrap(), app);
+    assert!(rt.find("nothing").is_err());
+    rt.start(&app).await.unwrap();
+    until("the app's output", async || output(&rt, &app).await.contains("up")).await;
+    assert_eq!(output(&rt, &app).await, "app\nup\n");
+    let params = sys
+        .jail_get(
+            &app,
+            &["ip4", "vnet", "securelevel", "devfs_ruleset", "allow.chflags"],
+        )
+        .unwrap();
+    assert_eq!(params["ip4"], "inherit", "{params:?}");
+    assert_eq!(params["vnet"], "inherit", "{params:?}");
+    assert_eq!(params["securelevel"], "2", "{params:?}");
+    assert_eq!(params["devfs_ruleset"], "4", "{params:?}");
+    assert_eq!(params["allow.chflags"], "false", "{params:?}");
+    // An exec on this process's output gives its exit code.
+    let code = rt
+        .exec_inherit(&app, &["/bin/sh".into(), "-c".into(), "exit 5".into()], false, false)
+        .await
+        .unwrap();
+    assert_eq!(code, 5);
+    rt.stop(&app, Duration::from_secs(5)).await.unwrap();
+    assert!(!rt.inspect(&app).await.unwrap().state.running);
+
+    // On this process's output: its exit code, recorded too, and its jail
+    // gone after.
+    let once = rt.create(&standalone("once", "exit 7")).await.unwrap();
+    assert_eq!(rt.run_attached(&once, false, false).await.unwrap(), 7);
+    let i = rt.inspect(&once).await.unwrap();
+    assert_eq!((i.state.running, i.state.exit_code), (false, 7));
+    assert!(!sys.jails().unwrap().iter().any(|j| j.name == once));
+    // And again.
+    assert_eq!(rt.run_attached(&once, false, false).await.unwrap(), 7);
+
+    for id in [&app, &once] {
+        rt.remove(id).await.unwrap();
+    }
+    assert!(rt.list(&[]).await.unwrap().is_empty());
+
+    // Build steps, on a plain directory (here a clone of the image).
+    let image = images.get(IMAGE).unwrap().unwrap();
+    let build = dir.as_path().join("build");
+    std::fs::create_dir(&build).unwrap();
+    sys.zfs_clone(
+        &images.snapshot(&image).unwrap(),
+        &format!("{base}/build"),
+        &[("mountpoint", &build.to_string_lossy())],
+    )
+    .unwrap();
+    let resolv_before = std::fs::read(build.join("etc/resolv.conf")).ok();
+    let out = dir.as_path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    // Written by nobody too.
+    std::fs::set_permissions(&out, std::os::unix::fs::PermissionsExt::from_mode(0o777)).unwrap();
+    let mounts = [
+        StepMount::Nullfs {
+            source: out.clone(),
+            target: "/legion-out".into(),
+            read_only: false,
+        },
+        StepMount::Tmpfs {
+            target: "/legion-scratch".into(),
+            size: Some(1 << 20),
+        },
+    ];
+    let argv = |script: &str| vec!["/bin/sh".to_owned(), "-c".to_owned(), script.to_owned()];
+    let script = "id -un > /legion-out/user; pwd > /legion-out/pwd; \
+        test -s /etc/resolv.conf && echo yes > /legion-out/resolver; \
+        : > /legion-scratch/x; : > /flagged && chflags schg /flagged && echo ok > /legion-out/chflags; \
+        echo $GREETING > /legion-out/env";
+    let step = Step {
+        name: "lstand_step",
+        root: &build,
+        argv: &argv(script),
+        env: &["GREETING=hello".to_owned()],
+        user: "",
+        work_dir: "/srv/app",
+        mounts: &mounts,
+        network: StepNetwork::Host,
+        params: &[],
+    };
+    assert_eq!(rt.run_step(&step).await.unwrap(), 0);
+    let read = |f: &str| std::fs::read_to_string(out.join(f)).unwrap_or_default();
+    assert_eq!(read("user"), "root\n");
+    assert_eq!(read("pwd"), "/srv/app\n");
+    assert_eq!(read("chflags"), "ok\n", "a step may set file flags");
+    assert_eq!(read("env"), "hello\n");
+    if std::path::Path::new("/etc/resolv.conf").exists() {
+        assert_eq!(read("resolver"), "yes\n", "the host's resolver is lent");
+    }
+    // As another user, from the root's /etc/passwd.
+    let as_nobody = Step {
+        user: "nobody",
+        argv: &argv("id -un > /legion-out/who"),
+        ..step
+    };
+    assert_eq!(rt.run_step(&as_nobody).await.unwrap(), 0);
+    assert_eq!(read("who"), "nobody\n");
+    // What the step made for its mounts and its resolver went; what it
+    // wrote stayed.
+    assert!(!build.join("legion-out").exists());
+    assert!(!build.join("legion-scratch").exists());
+    assert_eq!(std::fs::read(build.join("etc/resolv.conf")).ok(), resolv_before);
+    assert!(build.join("srv/app").is_dir() && build.join("flagged").exists());
+    // Without a network: only lo0; and its exit code.
+    let alone = Step {
+        argv: &argv("ifconfig -l > /legion-out/ifs; exit 3"),
+        network: StepNetwork::None,
+        ..step
+    };
+    assert_eq!(rt.run_step(&alone).await.unwrap(), 3);
+    assert_eq!(read("ifs"), "lo0\n");
+    assert!(!sys.jails().unwrap().iter().any(|j| j.name == "lstand_step"));
+    assert!(
+        sys.mounts(&build.to_string_lossy())
+            .unwrap()
+            .iter()
+            .all(|m| std::path::Path::new(m) == build),
+        "only the root's own dataset is mounted"
+    );
+    let _ = std::process::Command::new("chflags")
+        .args(["noschg", &build.join("flagged").to_string_lossy()])
+        .status();
+
+    sys.zfs_destroy(&format!("{base}/build"), true).unwrap();
     images.remove(IMAGE).await.unwrap();
     sys.zfs_destroy(&base, true).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();

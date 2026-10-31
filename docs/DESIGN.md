@@ -1096,6 +1096,27 @@ copy of its image. Built as a second implementation of the agent's
 the lab cluster on 2026-10-29, became the default, and the Podman runtime
 (`legion-podman`, the hook) was removed the same day.
 
+**Shared with jailer** (2026-10-31). jailer, which builds and tries images
+for Legion, uses this runtime and the image store instead of copies of
+them, so `jailer run` sets a jail up as a node does. For that the
+`Runtime` trait and its types are a crate of their own
+(`legion-runtime`, re-exported as `legion_agent::runtime`), so
+`legion-jail` needs no agent; the runtime's image pruning is a `Config`
+option, off for a store that is not only the runtime's; and the jail
+annotations and devfs ruleset are `legion_jail`'s public constants. A
+container with neither a pod nor the VNET annotation is a *standalone
+member*: its own jail on the host's addresses, otherwise as a pod's
+member (devfs ruleset 4, its security parameters from `legion.jail`,
+which jailer takes from `Security::default().jail_params()` in
+`legion-api`, as the agent does). Beyond the trait the runtime offers a
+local tool `find` (by id, name or id prefix), `run_attached` and
+`exec_inherit` (a member's process, or an exec, on the caller's
+terminal), and `run_step`, a build's `RUN` step: a jail on a plain
+directory that may change file flags and has no securelevel, on the
+host's network or a VNET of its own, with nullfs and tmpfs mounts and
+the host's resolver lent when the image has none; what it made for
+those goes afterwards, so it stays out of the layer.
+
 ### 6.6 Linux images (phase 5)
 
 A node started with `legion daemon --linux` also runs images that offer

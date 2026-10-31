@@ -116,6 +116,32 @@ impl Security {
         Ok(())
     }
 
+    /// The parameters a container's jail must have (DESIGN.md §9), for
+    /// this profile: the runtime sets them when it creates the jail (from
+    /// the `legion.jail` annotation), and the agent checks them once the
+    /// container runs. mlock and SysV IPC are off unless their annotations
+    /// ask for them. jailer gives `Security::default()`'s to the images it
+    /// tries, so they run as locked down as on a node.
+    pub fn jail_params(&self) -> [(&'static str, String); 4] {
+        let allow = |a| self.allow.contains(&a).to_string();
+        [
+            ("allow.raw_sockets", allow(Allow::RawSockets)),
+            ("allow.chflags", allow(Allow::Chflags)),
+            ("enforce_statfs", self.enforce_statfs.to_string()),
+            ("securelevel", self.securelevel.to_string()),
+        ]
+    }
+
+    /// [`Security::jail_params`] as the `legion.jail` annotation gives
+    /// them: `name=value`, separated by spaces.
+    pub fn jail_annotation(&self) -> String {
+        self.jail_params()
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// How this profile loosens the defaults.
     pub fn loosenings(&self) -> BTreeSet<Loosening> {
         let mut l: BTreeSet<Loosening> = self.allow.iter().map(|&a| a.into()).collect();

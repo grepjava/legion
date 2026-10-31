@@ -8,6 +8,10 @@
 //! pod's network, with devfs (ruleset 4) and its nullfs mounts, its
 //! process run by a supervisor ([`crate::shim`]). Jails are named by
 //! container id.
+//!
+//! A container with neither annotation is a standalone member: a jail of
+//! its own on the host's network (`ip4`/`ip6` inherited), set up as a pod's
+//! member is. Legion's agent never makes one; jailer runs images so.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -29,15 +33,13 @@ use tokio::sync::{broadcast, watch};
 use crate::log;
 use crate::state::{self, EXIT, Exit, LOG, RECORD, RUN, Record, Run, SHIM_LOG};
 
-const ANNOTATION_VNET: &str = "org.freebsd.jail.vnet";
-const ANNOTATION_PARENT: &str = "org.freebsd.parentJail";
-const ANNOTATION_JAIL: &str = "legion.jail";
-const ANNOTATION_MLOCK: &str = "org.freebsd.jail.allow.mlock";
-const ANNOTATION_SYSV: [(&str, &str); 3] = [
-    ("org.freebsd.jail.sysvmsg", "sysvmsg"),
-    ("org.freebsd.jail.sysvsem", "sysvsem"),
-    ("org.freebsd.jail.sysvshm", "sysvshm"),
-];
+use crate::{
+    ANNOTATION_JAIL, ANNOTATION_MLOCK, ANNOTATION_PARENT, ANNOTATION_SYSV, ANNOTATION_VNET,
+    DEVFS_RULESET,
+};
+
+mod local;
+pub use local::{Step, StepMount, StepNetwork};
 /// The pod jail's root: it runs nothing, and its members' roots lie
 /// outside it.
 const POD_ROOT: &str = "/var/empty";
@@ -54,8 +56,6 @@ const LINUX_MOUNTS: [(&str, &str, &str); 4] = [
 /// directory, so `/dev/shm` links to this tmpfs.
 const SHM: &str = "/.legion-shm";
 
-/// devfs(8)'s ruleset for jails.
-const DEVFS_RULESET: u32 = 4;
 /// How often state is looked at for exits.
 const TICK: Duration = Duration::from_millis(200);
 /// How often unused images are looked for, and how long one stays after
@@ -71,6 +71,9 @@ pub struct Config {
     /// The supervisor: a program and the arguments before `supervise` or
     /// `exec` (for Legion, its own binary and `jail-shim`).
     pub shim: Vec<OsString>,
+    /// Whether images no container has used for an hour are removed, as
+    /// a node's are. Off for a store that is not only this runtime's.
+    pub prune_images: bool,
 }
 
 pub struct JailRuntime {
@@ -397,11 +400,13 @@ impl JailRuntime {
             rt.boot,
             rt.events.clone(),
         ));
-        tokio::spawn(prune_images(
-            rt.images.clone(),
-            rt.dir.clone(),
-            rt.used.clone(),
-        ));
+        if config.prune_images {
+            tokio::spawn(prune_images(
+                rt.images.clone(),
+                rt.dir.clone(),
+                rt.used.clone(),
+            ));
+        }
         Ok(rt)
     }
 
@@ -425,7 +430,7 @@ impl JailRuntime {
     fn running_jid(&self, id: &str) -> Result<(Record, u32)> {
         let rec = self.record(id)?;
         match self.status(&rec)? {
-            Status::Running(run) if rec.parent.is_some() => Ok((rec, run.jid)),
+            Status::Running(run) if !rec.is_pod() => Ok((rec, run.jid)),
             _ => Err(api(
                 409,
                 format!("container {id} is not running: container state improper"),
@@ -481,7 +486,7 @@ fn status(
     };
     let here = jails.contains(&rec.jail);
     let running = run.boot == boot
-        && if rec.parent.is_none() {
+        && if rec.is_pod() {
             here
         } else {
             here || alive(run.shim)
@@ -491,7 +496,7 @@ fn status(
     }
     // A pod jail removed, or a supervisor gone without a word (a reboot).
     Ok(Status::Exited(Exit {
-        code: if rec.parent.is_none() { 0 } else { 255 },
+        code: if rec.is_pod() { 0 } else { 255 },
         finished: run.started,
         error: None,
     }))
@@ -691,7 +696,7 @@ impl JailRuntime {
             (_, true) => (id.clone(), PathBuf::from(POD_ROOT), None),
             (Some(p), false) => {
                 let pod = load(&self.dir, p)?
-                    .filter(|r| r.parent.is_none())
+                    .filter(Record::is_pod)
                     .ok_or_else(|| api(404, format!("no pod {p} to run in")))?;
                 if argv.is_empty() {
                     return Err(api(400, format!("{}: no command to run", spec.name)));
@@ -703,10 +708,14 @@ impl JailRuntime {
                 )
             }
             (None, false) => {
-                return Err(api(
-                    400,
-                    "the jail runtime runs containers in pods: no parent jail given",
-                ));
+                if argv.is_empty() {
+                    return Err(api(400, format!("{}: no command to run", spec.name)));
+                }
+                (
+                    id.clone(),
+                    self.container_dir(&id).join("root"),
+                    Some(format!("{}/{id}", self.dataset)),
+                )
             }
         };
         let mut mounts = Vec::new();
@@ -727,6 +736,7 @@ impl JailRuntime {
             created: state::now(),
             labels: spec.labels.clone(),
             annotations: spec.annotations.clone(),
+            standalone: !pod && parent.is_none(),
             parent: if pod { None } else { parent },
             jail,
             root,
@@ -821,7 +831,7 @@ impl JailRuntime {
             ("persist".into(), String::new()),
             ("enforce_statfs".into(), "2".into()),
         ];
-        if rec.parent.is_none() {
+        if rec.is_pod() {
             p.push(("vnet".into(), String::new()));
         } else {
             p.extend([
@@ -1028,11 +1038,11 @@ impl legion_runtime::Runtime for JailRuntime {
         if jail_names(&*self.sys)?.contains(&rec.jail) {
             let _ = self.sys.jail_remove(&rec.jail);
         }
-        if rec.parent.is_some() {
+        if !rec.is_pod() {
             self.mount(&rec)?;
         }
         let jid = self.create_jail(&rec)?;
-        if rec.parent.is_none() {
+        if rec.is_pod() {
             let run = Run {
                 shim: 0,
                 pid: 0,
@@ -1054,7 +1064,7 @@ impl legion_runtime::Runtime for JailRuntime {
         let Status::Running(run) = self.status(&rec)? else {
             return Ok(());
         };
-        if rec.parent.is_none() {
+        if rec.is_pod() {
             return match self.sys.jail_remove(&rec.jail) {
                 Ok(()) | Err(legion_sys::Error::NotFound(_)) => Ok(()),
                 Err(e) => Err(internal(e)),
@@ -1091,7 +1101,7 @@ impl legion_runtime::Runtime for JailRuntime {
     async fn remove(&self, id: &str) -> Result<()> {
         let rec = self.record(id)?;
         self.stop(id, Duration::ZERO).await?;
-        if rec.parent.is_none() {
+        if rec.is_pod() {
             // Members first; then the pod's jail if it outlived them.
             match self.sys.jail_remove(&rec.jail) {
                 Ok(()) | Err(legion_sys::Error::NotFound(_)) => {}

@@ -143,11 +143,7 @@ pub fn container_spec(
 }
 
 fn container_annotations(s: &Security, infra_id: &str) -> BTreeMap<String, String> {
-    let params = jail_params(s)
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let params = s.jail_annotation();
     let mut annotations = BTreeMap::from([
         (ANNOTATION_PARENT.to_owned(), infra_id.to_owned()),
         (ANNOTATION_JAIL.to_owned(), params),
@@ -161,20 +157,6 @@ fn container_annotations(s: &Security, infra_id: &str) -> BTreeMap<String, Strin
         }
     }
     annotations
-}
-
-/// The parameters a container's jail must have (DESIGN.md §9). The
-/// runtime sets them when it creates the jail (from the `legion.jail`
-/// annotation), and the agent checks them once the container runs. mlock
-/// and SysV IPC are off unless their annotations ask for them.
-pub fn jail_params(s: &Security) -> [(&'static str, String); 4] {
-    let allow = |a| s.allow.contains(&a).to_string();
-    [
-        ("allow.raw_sockets", allow(Allow::RawSockets)),
-        ("allow.chflags", allow(Allow::Chflags)),
-        ("enforce_statfs", s.enforce_statfs.to_string()),
-        ("securelevel", s.securelevel.to_string()),
-    ]
 }
 
 /// The jail a pod member runs in: a child of the infra jail. The runtime

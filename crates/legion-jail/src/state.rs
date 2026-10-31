@@ -18,9 +18,13 @@ pub struct Record {
     pub created: u64,
     pub labels: BTreeMap<String, String>,
     pub annotations: BTreeMap<String, String>,
-    /// The pod (infra container) a member runs in; `None` for a pod.
+    /// The pod (infra container) a member runs in; `None` for a pod or a
+    /// standalone member.
     pub parent: Option<String>,
-    /// The jail's name: the id, or `<pod>.<id>` for a member.
+    /// A member with no pod: a jail of its own on the host's network.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub standalone: bool,
+    /// The jail's name: the id, or `<pod>.<id>` for a pod's member.
     pub jail: String,
     pub root: PathBuf,
     /// The member's root file system, a clone of its image.
@@ -41,6 +45,13 @@ pub struct Record {
     /// A Linux image's, run through the Linux ABI.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub linux: bool,
+}
+
+impl Record {
+    /// A pod's jail, which runs nothing; every other record is a member.
+    pub fn is_pod(&self) -> bool {
+        self.parent.is_none() && !self.standalone
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

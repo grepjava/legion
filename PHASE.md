@@ -1274,12 +1274,39 @@ real, in the order agreed with the user.
   its `legion --version` run. Not done: a poudriere run and
   submitting the port, which are the user's (v0.1.0 is tagged).
 
+- **The jail runtime shared with jailer** (asked 2026-10-31: jailer, which
+  builds images, to use Legion's runtime and image store instead of its
+  copies; the differences decided by the user through jailer's session).
+  `legion-runtime` holds the `Runtime` trait and its types, so
+  `legion-jail` no longer depends on the agent; image pruning is
+  `Config::prune_images`; the annotations and devfs ruleset are public
+  constants; `Security::jail_params` (legion-api) replaces the agent's
+  function, so jailer gives the same defaults. New: standalone members (no
+  pod, the host's addresses), `find`, `run_attached`, `exec_inherit` and
+  `run_step` for build steps (DESIGN.md §6.5). Tested: unit tests of a
+  step's jail parameters, of removing what a step made for its mounts and
+  of lending the resolver; on FreeBSD 15.1 a live test
+  (`standalone_containers_and_build_steps`) runs a standalone member
+  supervised (its jail on the host's addresses, securelevel 2, devfs 4)
+  and attached (exit code kept, jail gone), execs in it, finds it by name
+  and id prefix, and runs steps on a clone as root and as nobody, on the
+  host's network and on a VNET of its own (only lo0), checking file flags,
+  the working directory, the environment, the lent resolver and that the
+  mount points went; `pods_of_jails` still passes. The image store's half
+  (directory mode, blobs kept, push, export, build commits, pins) is
+  jailer's session's, on branch `image-share`.
+
 ### To do, in order
 
 Nothing left in the hardening agreed with the user, nor in the phases'
 follow-ups. v0.1.0, the first release, was tagged on 2026-10-31 (asked:
 "create a new release and upgrade it"), its GitHub release holding the
-amd64 tarball built on FreeBSD 15.1; weft-bsd runs it as a service.
-Waiting on the user: an aarch64 tarball (no aarch64 host), the port's
-`distinfo` and its submission.
+amd64 tarball built on FreeBSD 15.1; weft-bsd runs it as a service. The
+port's `distinfo` is made for it and the port builds and packages clean.
+
+1. Merge the image store's half for jailer (branch `image-share`), then
+   tag v0.1.1 for jailer to depend on.
+
+Waiting on the user: an aarch64 tarball (no aarch64 host), a poudriere
+run and the port's submission.
 

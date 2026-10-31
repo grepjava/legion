@@ -658,7 +658,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         id: &str,
         fix: bool,
     ) -> Result<(), String> {
-        let want = pod::jail_params(&c.security);
+        let want = c.security.jail_params();
         let jail = pod::child_jail(infra, id);
         let name = c.name.clone();
         blocking(&self.ctx.sys, move |sys| {

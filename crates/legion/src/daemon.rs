@@ -423,6 +423,7 @@ fn jail_runtime(
             state_dir: opts.data_dir.join("jails"),
             dataset: format!("{zfs}/jails"),
             shim: vec![exe.into(), crate::JAIL_SHIM.into()],
+            prune_images: true,
         },
     )
     .context("starting the jail runtime")
