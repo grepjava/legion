@@ -1418,7 +1418,12 @@ v0.1.1 to v0.1.5 were tagged, without GitHub releases. v0.1.6, made on 2026-10-3
 fixes since v0.1.0 and the crates jailer uses; weft-bsd runs it, and
 the port's `distinfo` is made for it (built, check-plist, stage-qa,
 packaged and portlint clean, its two known warnings aside). jailer v0.4.0 is built on
-v0.1.4, and IMAGES.md installs that release.
+v0.1.4, and IMAGES.md installs that release. v0.1.7, tagged on
+2026-11-01 for jailer to move to, has the image store's fix for one
+config with other layer blobs, the API's request metrics, the WireGuard
+key under autolock, ingress HTTP/2 and connection reuse, and ingress
+certificates from ACME; its `Makefile.crates` is made from `Cargo.lock`
+(adding instant-acme).
 
 Waiting on the user: an aarch64 tarball (no aarch64 host), a poudriere
 run and the port's submission.

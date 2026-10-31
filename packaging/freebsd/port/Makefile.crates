@@ -135,6 +135,7 @@ CARGO_CRATES=	adler2-2.0.1 \
 		indexmap-2.14.2 \
 		indoc-2.0.8 \
 		instability-0.3.14 \
+		instant-acme-0.8.5 \
 		ipnet-2.12.2 \
 		is_terminal_polyfill-1.70.2 \
 		itertools-0.14.0 \
