@@ -1330,7 +1330,7 @@ amd64 tarball built on FreeBSD 15.1; weft-bsd runs it as a service. The
 port's `distinfo` is made for it and the port builds and packages clean.
 
 v0.1.1 is tagged (no GitHub release) for jailer to depend on; jailer
-v0.2.0, released, is built on it, and IMAGES.md installs that release.
+v0.3.0, released, is built on it, and IMAGES.md installs that release.
 The port stays at v0.1.0, the latest release.
 
 Waiting on the user: an aarch64 tarball (no aarch64 host), a poudriere

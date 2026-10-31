@@ -42,14 +42,14 @@ node, and is best done on a build machine or in CI rather than on a
 node. Install it from its release (amd64, FreeBSD 15):
 
 ```sh
-fetch https://github.com/grepjava/jailer/releases/download/v0.2.0/jailer-0.2.0-freebsd15-amd64.tar.gz
-tar xzf jailer-0.2.0-freebsd15-amd64.tar.gz
-doas install -s jailer-0.2.0-freebsd15-amd64/bin/jailer /usr/local/bin/
-doas install -m 444 jailer-0.2.0-freebsd15-amd64/man/man1/jailer.1 /usr/local/share/man/man1/
+fetch https://github.com/grepjava/jailer/releases/download/v0.3.0/jailer-0.3.0-freebsd15-amd64.tar.gz
+tar xzf jailer-0.3.0-freebsd15-amd64.tar.gz
+doas install -s jailer-0.3.0-freebsd15-amd64/bin/jailer /usr/local/bin/
+doas install -m 444 jailer-0.3.0-freebsd15-amd64/man/man1/jailer.1 /usr/local/share/man/man1/
 ```
 
 or, on another architecture, with Rust's cargo (`pkg install rust`):
-`cargo install --git https://github.com/grepjava/jailer --tag v0.2.0`.
+`cargo install --git https://github.com/grepjava/jailer --tag v0.3.0`.
 
 A Containerfile is written as for Docker (`jailer init` writes one for a
 Rust, Go, Node, Python or C project, or one that installs packages).
