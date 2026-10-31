@@ -1379,8 +1379,8 @@ port's `distinfo` is made for it and the port builds and packages clean.
 v0.1.1 to v0.1.5 were tagged, without GitHub releases. v0.1.6, made on 2026-10-31 with the amd64 tarball, has the
 fixes since v0.1.0 and the crates jailer uses; weft-bsd runs it, and
 the port's `distinfo` is made for it (built, check-plist, stage-qa,
-packaged and portlint clean, its two known warnings aside). jailer v0.3.0 is built on
-v0.1.1, and IMAGES.md installs that release.
+packaged and portlint clean, its two known warnings aside). jailer v0.4.0 is built on
+v0.1.4, and IMAGES.md installs that release.
 
 Waiting on the user: an aarch64 tarball (no aarch64 host), a poudriere
 run and the port's submission.
