@@ -728,14 +728,17 @@ impl Store {
     }
 
     /// Records `image` as `r`, taking the name from any other image.
+    /// An image is its manifest: two of one config but other layer blobs
+    /// (gzip and zstd, say) are two images.
     fn upsert(&self, image: Image, r: &Reference, private: Option<&str>) -> Result<Image, Error> {
         let mut images = self.images()?;
         let name = r.to_string();
-        for i in images.iter_mut().filter(|i| i.id != image.id) {
+        let same = |i: &Image| i.id == image.id && i.digest == image.digest;
+        for i in images.iter_mut().filter(|i| !same(i)) {
             i.references.retain(|n| *n != name);
             i.private.remove(&name);
         }
-        let i = match images.iter().position(|i| i.id == image.id) {
+        let i = match images.iter().position(same) {
             Some(i) => {
                 if !image.layer_descriptors.is_empty() {
                     images[i].layer_descriptors = image.layer_descriptors;

@@ -507,3 +507,66 @@ async fn annotations_built_in_stay_through_pushes_and_exports() {
     let kept = std::fs::read(s.blob_path(&plain.digest).unwrap()).unwrap();
     assert!(!String::from_utf8_lossy(&kept).contains("annotations"));
 }
+
+#[tokio::test]
+async fn one_config_with_other_layer_blobs_is_another_image() {
+    let t = tempfile::tempdir().unwrap();
+    let s = directory_store(&t.path().join("store"), Client::new().unwrap());
+    let pin = s.pin().unwrap();
+    let gzip = build(&s, &pin, "app:gz", oci::arch(), &[("bin/app", "a")]).await;
+    // The same build, its layer compressed with zstd: the same config.
+    let zstd_layer = Descriptor {
+        media_type: "application/vnd.oci.image.layer.v1.tar+zstd".to_owned(),
+        digest: sha256(b"the layer, as zstd"),
+        size: 18,
+        platform: None,
+        annotations: BTreeMap::new(),
+    };
+    let zstd = s
+        .register_built_image(
+            &pin,
+            &Reference::parse_local_tag("app:zst").unwrap(),
+            gzip.config.clone(),
+            gzip.layers.clone(),
+            vec![zstd_layer.clone()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(zstd.id, gzip.id);
+    assert_ne!(zstd.digest, gzip.digest);
+
+    // Each name keeps its own manifest and the blobs it names.
+    let manifest = |i: &Image| -> oci::Manifest {
+        serde_json::from_slice(&std::fs::read(s.blob_path(&i.digest).unwrap()).unwrap()).unwrap()
+    };
+    let found = s.find("app:gz").unwrap().unwrap();
+    assert_eq!(
+        (&found.digest, &found.references, &found.layer_descriptors),
+        (&gzip.digest, &gzip.references, &gzip.layer_descriptors)
+    );
+    assert_eq!(manifest(&found).layers, gzip.layer_descriptors);
+    let found = s.find("app:zst").unwrap().unwrap();
+    assert_eq!(
+        (&found.digest, &found.layer_descriptors),
+        (&zstd.digest, &vec![zstd_layer])
+    );
+    assert_eq!(found.references, ["localhost/app:zst"]);
+    assert_eq!(manifest(&found).layers, found.layer_descriptors);
+
+    // A name moved from one to the other leaves the first image.
+    s.register_built_image(
+        &pin,
+        &Reference::parse_local_tag("app:gz").unwrap(),
+        gzip.config.clone(),
+        gzip.layers.clone(),
+        zstd.layer_descriptors.clone(),
+    )
+    .await
+    .unwrap();
+    let images = s.images().unwrap();
+    assert_eq!(images.len(), 1, "{images:?}");
+    assert_eq!(
+        images[0].references,
+        ["localhost/app:zst", "localhost/app:gz"]
+    );
+}
