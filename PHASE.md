@@ -1343,7 +1343,10 @@ real, in the order agreed with the user.
   exports, and by pulls into a store that keeps blobs); the
   `org.freebsd.jail.cpuset` annotation and `Step::cpuset`, set on the jail
   before anything runs in it (`Sys::jail_cpuset`); `PodNetwork::named`,
-  a pod network on another bridge with another interface prefix. Tested
+  a pod network on another bridge with another interface prefix, and
+  `with_v6`, `without_v6` and `with_mtu`, so that it takes none of the
+  cluster's IPv6 range (jailer's `jailer0` would have had `legion0`'s
+  address) nor its WireGuard MTU. Tested
   on FreeBSD 15.1: the crates' tests and the jail live tests (CPUs read
   back from a member's jail and from inside a step).
 - **A node's role is its certificate's.** Nodes registered as workers
@@ -1358,9 +1361,11 @@ follow-ups. v0.1.0, the first release, was tagged on 2026-10-31 (asked:
 amd64 tarball built on FreeBSD 15.1; weft-bsd runs it as a service. The
 port's `distinfo` is made for it and the port builds and packages clean.
 
-v0.1.1 is tagged (no GitHub release) for jailer to depend on; jailer
-v0.3.0, released, is built on it, and IMAGES.md installs that release.
-The port stays at v0.1.0, the latest release.
+v0.1.1 to v0.1.3 were tagged for jailer to depend on, without GitHub
+releases. v0.1.4, released on 2026-10-31 with the amd64 tarball, has
+the fixes since v0.1.0 and the crates jailer uses; weft-bsd runs it,
+and the port's `distinfo` is made for it. jailer v0.3.0 is built on
+v0.1.1, and IMAGES.md installs that release.
 
 Waiting on the user: an aarch64 tarball (no aarch64 host), a poudriere
 run and the port's submission.

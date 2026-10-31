@@ -5,7 +5,7 @@ It builds the `legion` binary with the ports' cargo framework and installs
 it with the rc.d script and newsyslog entry from `packaging/freebsd`, the
 volume plugin directory, and README.md and DESIGN.md as docs.
 
-`distinfo` is for the latest release, v0.1.0: it holds the checksum of
+`distinfo` is for the latest release, v0.1.4: it holds the checksum of
 the release's GitHub tarball, which exists only once the release is
 tagged, so between releases it lags `Cargo.lock`.
 
