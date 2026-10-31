@@ -1,7 +1,8 @@
-# Legion, Docker Swarm and Kubernetes
+# Legion compared with Docker Swarm, Kubernetes, CBSD and BastilleBSD
 
-How Legion's features compare with Docker's cluster mode (Swarm) and with
-Kubernetes. Legion takes Swarm's way of running a cluster (one binary,
+How Legion's features compare with Docker's cluster mode (Swarm) and
+Kubernetes, and with the FreeBSD jail managers [CBSD and BastilleBSD](#cbsd-and-bastillebsd).
+Legion takes Swarm's way of running a cluster (one binary,
 built-in Raft and PKI, `init` and `join`, compose files) and adds the parts
 of Kubernetes that teams sharing a cluster need (namespaces, RBAC, network
 policy, quotas, jobs, stateful services, autoscaling). It runs only on
@@ -163,3 +164,44 @@ planning soon:
   join.
 - A relay for nodes that are both behind NAT, and IPv6 NAT to the outside.
 - Virtual machines as tasks: bhyve was tried but is not a runtime yet.
+
+## CBSD and BastilleBSD
+
+CBSD and BastilleBSD also manage jails on FreeBSD, but solve a different
+problem from Legion:
+
+- **Legion** is a multi-node container orchestrator. Workloads are pods of
+  disposable jails built from OCI images (or Docker Compose stacks),
+  scheduled across a cluster with built-in Raft state, mTLS, a WireGuard
+  mesh, service discovery, probes and rolling updates.
+- **CBSD** is a virtual environment framework (C utilities, shell scripts
+  and per-node SQLite) that manages both FreeBSD jails and `bhyve`, Xen or
+  QEMU virtual machines, with interactive `bsdconfig`-style TUI menus and
+  full-OS jail lifecycles.
+- **BastilleBSD** is a lightweight single-host jail manager written in
+  POSIX shell that provisions thin (`nullfs`) or thick jails from FreeBSD
+  base releases and automates them with `Bastillefile` templates.
+
+| Feature | Legion | CBSD | BastilleBSD |
+|---|---|---|---|
+| Primary role | Multi-node declarative container orchestrator | Single- or multi-host jail and VM (`bhyve`/Xen) management framework | Single-host jail provisioning and templating tool |
+| Implementation | One Rust binary (`legion` daemon and CLI), no external dependencies | C binaries, shell scripts and per-node SQLite | POSIX `/bin/sh` scripts |
+| Packaging and images | OCI images from any registry (plus Linux OCI images via `linux64`), Compose files (`legion stack deploy`) | FreeBSD base releases, `CBSDfile`, exported image archives, VM disk/ISO images | FreeBSD base releases (`bastille bootstrap`) and `Bastillefile` templates |
+| Unit of workload | Pod (one or more container jails sharing a VNET stack, plus init and sidecar containers) | Individual jail (thin or thick) or virtual machine (`bhyve`) | Individual jail (thin `nullfs` or thick ZFS/UFS) |
+| Cluster state | Built-in Raft (`openraft` on `redb`), automatic CA and mTLS, `legion init` and `legion join` | Per-node SQLite; multi-node relies on external brokers (`cbsd-mq`), Reggae or configuration management | Single host (multi-host via external tools such as Ansible or Salt) |
+| Scheduling and failover | Controllers reconcile desired replicas, `global` and `stateful` services, `Job`/`CronJob`, probes, rolling updates, rollbacks, `rctl` autoscaling and automatic replacement when a node goes down | Imperative start/stop (`jstart`, `bstart`) and manual or scripted cold/live migration (`jcoldmigrate`) between hosts | Imperative start/stop/upgrade (`bastille start`, `stop`, `upgrade`) on the host |
+| Networking | Cluster-wide routed VNET (`/24` per node over an automatic WireGuard mesh, dual-stack IPv6), `pf` Service VIPs, ingress routing mesh, built-in DNS (`<svc>.<ns>.legion`), L7 `Route` proxy and `NetworkPolicy` | Host bridges, VNET/`epair`, shared IP, NAT helpers; cross-host overlays configured externally | Shared IP (`lo1` with `pf` rdr), VNET (`epair` and bridge) or interface binding on the host |
+| Storage | Required ZFS pool (`--zfs-root`): OCI layer clones, quota-enforced ZFS volumes, `zfs send` on drain or `volume move`, stateful pre-update snapshots, NFS and iSCSI | ZFS datasets and zvols, UFS, `md`, NFS/Gluster/Ceph helpers | ZFS datasets or UFS directories with `nullfs` mounts |
+| Multi-tenancy and security | Namespaces, per-user client certificates and RBAC (`view`, `edit`, `admin`), namespace quotas, hardened default jail profile (`securelevel 2`, no raw sockets or mounts) | Host root/operator tool; per-jail `rctl` limits, sysctls and `devfs` rulesets | Host root/operator tool; per-jail `rctl` limits and `jail.conf` settings |
+| Observability | `legion top` cluster TUI, Prometheus metrics endpoint, `legion logs`, `exec` and `port-forward` through any manager | `cbsd jstatus`, TUI dialogs, optional Prometheus exporter | `bastille list`, `bastille top` (wraps host `top`/`jls`) |
+
+Choose **Legion** to run replicated, self-healing services from OCI images
+or Compose files across one or more FreeBSD 15 hosts with built-in
+clustering, service discovery, load balancing and multi-tenant isolation.
+Choose **CBSD** when you need `bhyve` virtual machines alongside full-OS
+FreeBSD jails or interactive TUI management. Choose **BastilleBSD** when you
+want a minimal shell tool on a single host to manage traditional FreeBSD
+base or thin jails with `Bastillefile` templates. Because Legion touches
+only its own ZFS subtree (`<pool>/legion`), bridge (`legion0`) and `pf`
+anchors (`legion/*`), it can run on the same host beside CBSD or
+BastilleBSD jails.
