@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
-use super::{JailRuntime, Status, api, internal, jail_names, new_id, records, target};
+use super::{
+    JailRuntime, Status, api, confine, cpu_list, internal, jail_names, new_id, records, target,
+};
 use crate::DEVFS_RULESET;
 use crate::state::{self, EXIT, Exit, RECORD, RUN, Record, Run};
 use legion_runtime::Result;
@@ -31,6 +33,9 @@ pub struct Step<'a> {
     pub network: StepNetwork,
     /// More jail parameters, which win over the step's own.
     pub params: &'a [(String, String)],
+    /// The CPUs the step may run on (as `crate::ANNOTATION_CPUSET`), set
+    /// on its jail before the step runs.
+    pub cpuset: Option<&'a str>,
 }
 
 /// A mount for one step. What the step made to mount it on goes after.
@@ -253,7 +258,9 @@ impl JailRuntime {
             stop_signal: 15,
             stop_timeout: 10,
             linux: false,
+            cpuset: None,
         };
+        let cpus = step.cpuset.map(cpu_list).transpose()?;
         state::write(dir, RECORD, &rec).map_err(internal)?;
         let dev = mount_point(step.root, "/dev", false, made)?;
         self.sys
@@ -288,6 +295,9 @@ impl JailRuntime {
             .sys
             .jail_create(&refs)
             .map_err(|e| internal(format!("creating jail {}: {e}", step.name)))?;
+        if let Some(cpus) = &cpus {
+            confine(&*self.sys, step.name, jid, cpus)?;
+        }
         let mut cmd = self.shim_exec_in(dir, jid, step.argv, false, false);
         cmd.kill_on_drop(true);
         let status = cmd.status().await.map_err(internal)?;
@@ -497,6 +507,7 @@ mod tests {
                 ("allow.chflags".into(), "false".into()),
                 ("x".into(), "1".into()),
             ],
+            cpuset: None,
         };
         let p = step_params(&step);
         let get = |k: &str| p.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());

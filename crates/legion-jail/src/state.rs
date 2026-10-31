@@ -45,6 +45,9 @@ pub struct Record {
     /// A Linux image's, run through the Linux ABI.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub linux: bool,
+    /// The CPUs its jail is confined to (`crate::ANNOTATION_CPUSET`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpuset: Option<String>,
 }
 
 impl Record {

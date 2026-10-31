@@ -49,6 +49,9 @@ pub const SERVICE_CIDR6: Ipv6Net = Ipv6Net {
     prefix: 96,
 };
 pub const BRIDGE: &str = "legion0";
+/// What Legion's pods' host interfaces are named with (`lp` and the end of
+/// the pod's id).
+pub const HOST_PREFIX: &str = "lp";
 /// The WireGuard MTU, which pods use from the start so nothing changes when
 /// traffic starts crossing nodes (DESIGN.md §5.3).
 pub const MTU: u32 = 1420;
@@ -108,13 +111,48 @@ pub fn node_subnet6(subnet: Ipv4Net) -> Option<Ipv6Net> {
 pub struct PodNetwork {
     /// This node's subnet, e.g. `10.200.3.0/24`.
     pub subnet: Ipv4Net,
+    /// The bridge pods join: [`BRIDGE`], unless [`Self::named`] otherwise.
+    pub bridge: String,
+    /// What the names of pods' host interfaces start with: [`HOST_PREFIX`],
+    /// unless named otherwise.
+    pub prefix: String,
 }
+
+/// The longest interface name FreeBSD takes.
+const IFNAMSIZ: usize = 15;
 
 impl PodNetwork {
     pub fn new(subnet: Ipv4Net) -> Self {
         PodNetwork {
             subnet: Ipv4Net::new(subnet.network(), subnet.prefix),
+            bridge: BRIDGE.to_owned(),
+            prefix: HOST_PREFIX.to_owned(),
         }
+    }
+
+    /// The same network on a bridge of another name, its pods' host
+    /// interfaces named `prefix` and the end of their ids: for a tool
+    /// beside Legion on the host (jailer's `jailer0`). `None` for a name
+    /// FreeBSD would not take, or a prefix leaving fewer than eight
+    /// characters of an id.
+    pub fn named(self, bridge: &str, prefix: &str) -> Option<Self> {
+        let name = |n: &str, max: usize| {
+            !n.is_empty()
+                && n.len() <= max
+                && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && n.as_bytes()[0].is_ascii_alphabetic()
+        };
+        (name(bridge, IFNAMSIZ) && name(prefix, IFNAMSIZ - 8)).then(|| PodNetwork {
+            bridge: bridge.to_owned(),
+            prefix: prefix.to_owned(),
+            ..self
+        })
+    }
+
+    /// The host end's name for the pod `id`, as [`host_interface`] names it
+    /// with this network's prefix.
+    pub fn host_interface(&self, id: &str) -> String {
+        named_interface(&self.prefix, id)
     }
 
     /// The bridge's address, every pod's default route.
@@ -147,13 +185,14 @@ impl PodNetwork {
 
     /// Creates the bridge if it is missing and gives it the gateway address.
     pub fn ensure_bridge(&self, sys: &dyn Sys) -> Result<(), Error> {
-        if !sys.interfaces(None)?.iter().any(|i| i == BRIDGE) {
-            sys.bridge_create(BRIDGE)?;
-            tracing::info!(bridge = BRIDGE, "created the pod bridge");
+        let bridge = self.bridge.as_str();
+        if !sys.interfaces(None)?.iter().any(|i| i == bridge) {
+            sys.bridge_create(bridge)?;
+            tracing::info!(bridge, "created the pod bridge");
         }
         sys.interface_configure(
             None,
-            BRIDGE,
+            bridge,
             &IfConfig {
                 addr: Some(Ipv4Net::new(self.gateway(), self.subnet.prefix)),
                 addr6: Some(Ipv6Net::new(self.gateway6(), NODE_PREFIX6)),
@@ -178,10 +217,10 @@ impl PodNetwork {
     }
 
     /// Gives the pod in `jail` the address `ip`: an epair whose host end
-    /// (named [`host_interface`]`(id)`) joins the bridge and whose other end
+    /// (named [`Self::host_interface`]`(id)`) joins the bridge and whose other end
     /// moves into the jail. Does nothing if the host end exists already.
     pub fn attach(&self, sys: &dyn Sys, id: &str, jail: &str, ip: Ipv4Addr) -> Result<(), Error> {
-        let host = host_interface(id);
+        let host = self.host_interface(id);
         if sys.interfaces(None)?.contains(&host) {
             return Ok(());
         }
@@ -237,7 +276,7 @@ impl PodNetwork {
     /// until the host's next ARP request gives it the bridge's address
     /// again. Neighbor discovery answers on the bridge only.
     pub fn join(&self, sys: &dyn Sys, name: &str) -> Result<(), Error> {
-        sys.interface_set_ether(name, &sys.interface_ether(BRIDGE)?)?;
+        sys.interface_set_ether(name, &sys.interface_ether(&self.bridge)?)?;
         sys.interface_configure(
             None,
             name,
@@ -247,12 +286,12 @@ impl PodNetwork {
                 ..Default::default()
             },
         )?;
-        sys.bridge_add_member(BRIDGE, name)
+        sys.bridge_add_member(&self.bridge, name)
     }
 
     /// Removes the pod's epair, wherever its jail end is.
     pub fn detach(&self, sys: &dyn Sys, id: &str) -> Result<(), Error> {
-        let host = host_interface(id);
+        let host = self.host_interface(id);
         if sys.interfaces(None)?.contains(&host) {
             sys.interface_destroy(&host)?;
         }
@@ -260,11 +299,18 @@ impl PodNetwork {
     }
 }
 
-/// Host-side interface name for a pod: `lp` and the last 12 characters of
-/// its id (a task uid, hex), within the 15-character limit.
+/// Host-side interface name for a pod: [`HOST_PREFIX`] and the last 12
+/// characters of its id (a task uid, hex), within the 15-character limit.
 pub fn host_interface(id: &str) -> String {
-    let tail = &id[id.len().saturating_sub(12)..];
-    format!("lp{tail}")
+    named_interface(HOST_PREFIX, id)
+}
+
+/// `prefix` and the last 12 characters of `id`, or as many as the name has
+/// room for.
+fn named_interface(prefix: &str, id: &str) -> String {
+    let room = IFNAMSIZ.saturating_sub(prefix.len()).min(12);
+    let tail = &id[id.len().saturating_sub(room)..];
+    format!("{prefix}{tail}")
 }
 
 #[cfg(test)]
@@ -381,5 +427,43 @@ mod tests {
         net.detach(&sys, "00000000000000aa").unwrap(); // gone: fine
         assert!(sys.interface("epair0b").is_none());
         assert!(sys.interface(BRIDGE).unwrap().members.is_empty());
+    }
+
+    #[test]
+    fn a_network_of_other_names() {
+        let sys = FakeSys::new();
+        let net = PodNetwork::new("10.88.0.0/16".parse().unwrap())
+            .named("jailer0", "jp")
+            .unwrap();
+        net.ensure_bridge(&sys).unwrap();
+        assert!(sys.interface(BRIDGE).is_none(), "not Legion's");
+        let bridge = sys.interface("jailer0").unwrap();
+        assert_eq!(bridge.config.addr.unwrap().to_string(), "10.88.0.1/16");
+        sys.add_jail("j1", true);
+        let id = "0123456789abcdef0123";
+        net.attach(&sys, id, "j1", ip("10.88.0.2")).unwrap();
+        let host = net.host_interface(id);
+        // The end of its id, as Legion's pods' are named.
+        assert_eq!(host, "jp89abcdef0123");
+        assert_eq!(
+            sys.interface("jailer0").unwrap().members,
+            std::slice::from_ref(&host)
+        );
+        net.detach(&sys, id).unwrap();
+        assert!(sys.interface(&host).is_none());
+        // Legion's own names, unchanged.
+        let legion = PodNetwork::new("10.200.3.0/24".parse().unwrap());
+        assert_eq!(
+            (legion.bridge.as_str(), legion.prefix.as_str()),
+            (BRIDGE, "lp")
+        );
+        assert_eq!(legion.host_interface(id), host_interface(id));
+        // Names FreeBSD would not take.
+        let named = |b: &str, p: &str| legion.clone().named(b, p).is_some();
+        assert!(!named("", "jp"));
+        assert!(!named("a-very-long-bridge", "jp"));
+        assert!(!named("jailer0", "prefix_too_long"));
+        assert!(!named("jailer 0", "jp"));
+        assert!(!named("0bridge", "jp"));
     }
 }

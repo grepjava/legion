@@ -57,6 +57,9 @@ pub trait Sys: Send + Sync {
     /// is `<parent>.<child>`); an empty value sets a flag (`persist`,
     /// `vnet`). Returns its jid.
     fn jail_create(&self, params: &[(&str, &str)]) -> Result<u32>;
+    /// Confines jail `jid` (and what is started in it after) to the CPUs
+    /// `cpus`, a list as cpuset(1)'s `-l` takes it (`0-3,6`).
+    fn jail_cpuset(&self, jid: u32, cpus: &str) -> Result<()>;
     /// Removes a jail and its children, killing their processes.
     /// [`Error::NotFound`] if there is no such jail.
     fn jail_remove(&self, jail: &str) -> Result<()>;

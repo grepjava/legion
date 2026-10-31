@@ -623,6 +623,30 @@ async fn standalone_containers_and_build_steps() {
         "{left:?}"
     );
 
+    // Confined to some CPUs from its jail's start.
+    let mut spec = standalone("pinned", "exec sleep 60");
+    spec.annotations
+        .insert("org.freebsd.jail.cpuset".into(), "1".into());
+    let pinned = rt.create(&spec).await.unwrap();
+    rt.start(&pinned).await.unwrap();
+    let jid = &sys.jail_get(&pinned, &["jid"]).unwrap()["jid"];
+    let mask = std::process::Command::new("cpuset")
+        .args(["-g", "-j", jid])
+        .output()
+        .unwrap();
+    let mask = String::from_utf8_lossy(&mask.stdout).into_owned();
+    // Its CPUs first, then its memory domains.
+    assert_eq!(
+        mask.lines().next(),
+        Some(format!("jail {jid} mask: 1").as_str()),
+        "{mask}"
+    );
+    rt.remove(&pinned).await.unwrap();
+    let mut spec = standalone("badcpus", "true");
+    spec.annotations
+        .insert("org.freebsd.jail.cpuset".into(), "all".into());
+    assert!(rt.create(&spec).await.is_err());
+
     // Removed right after its last connection closed: its jail is dying a
     // while yet (the socket's TIME_WAIT holds it), its root still busy.
     // The host's nc (and the libraries it needs beyond the image's) serves
@@ -740,6 +764,7 @@ async fn standalone_containers_and_build_steps() {
         mounts: &mounts,
         network: StepNetwork::Host,
         params: &[],
+        cpuset: None,
     };
     assert_eq!(rt.run_step(&step).await.unwrap(), 0);
     let read = |f: &str| std::fs::read_to_string(out.join(f)).unwrap_or_default();
@@ -775,6 +800,29 @@ async fn standalone_containers_and_build_steps() {
     };
     assert_eq!(rt.run_step(&alone).await.unwrap(), 3);
     assert_eq!(read("ifs"), "lo0\n");
+    // On some CPUs only (the host's cpuset, and the libraries it needs, to
+    // tell from inside).
+    let mut with_cpuset = mounts.to_vec();
+    for f in ["/usr/bin/cpuset", "/lib/libjail.so.1", "/lib/libutil.so.10"] {
+        with_cpuset.push(StepMount::Nullfs {
+            source: f.into(),
+            target: f.into(),
+            read_only: true,
+        });
+    }
+    let pinned = Step {
+        argv: &argv("cpuset -g > /legion-out/cpus"),
+        mounts: &with_cpuset,
+        cpuset: Some("0-1"),
+        ..step
+    };
+    assert_eq!(rt.run_step(&pinned).await.unwrap(), 0);
+    assert!(read("cpus").contains("mask: 0, 1\n"), "{}", read("cpus"));
+    let bad = Step {
+        cpuset: Some("0;reboot"),
+        ..step
+    };
+    assert!(rt.run_step(&bad).await.is_err());
     // Its future dropped while it runs: all of that goes all the same.
     let slow = Step {
         argv: &argv("sleep 60"),

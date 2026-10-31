@@ -28,6 +28,10 @@ pub const ANNOTATION_SYSV: [(&str, &str); 3] = [
     ("org.freebsd.jail.sysvsem", "sysvsem"),
     ("org.freebsd.jail.sysvshm", "sysvshm"),
 ];
+/// The CPUs a member's processes may run on, a list as cpuset(1)'s `-l`
+/// takes it (`0-3,6`): set on its jail as soon as it is made, before
+/// anything runs in it.
+pub const ANNOTATION_CPUSET: &str = "org.freebsd.jail.cpuset";
 /// devfs(8)'s ruleset for jails, a member's `/dev`.
 pub const DEVFS_RULESET: u32 = 4;
 

@@ -110,6 +110,18 @@ async fn answer(
 
 /// Builds a one-layer image of these files in `s` as `name`, for `arch`.
 async fn build(s: &Store, pin: &Pin, name: &str, arch: &str, files: &[(&str, &str)]) -> Image {
+    build_with(s, pin, name, arch, files, BTreeMap::new()).await
+}
+
+/// [`build`], its manifest with these annotations.
+async fn build_with(
+    s: &Store,
+    pin: &Pin,
+    name: &str,
+    arch: &str,
+    files: &[(&str, &str)],
+    annotations: BTreeMap<String, String>,
+) -> Image {
     let work = tempfile::tempdir_in(s.dir()).unwrap();
     let root = work.path().join("root");
     for (p, data) in files {
@@ -135,12 +147,13 @@ async fn build(s: &Store, pin: &Pin, name: &str, arch: &str, files: &[(&str, &st
     config
         .extra
         .insert("author".to_owned(), serde_json::json!("test"));
-    s.register_built_image(
+    s.register_built_image_with(
         pin,
         &Reference::parse_local_tag(name).unwrap(),
         config,
         vec![hex],
         vec![desc],
+        annotations,
     )
     .await
     .unwrap()
@@ -433,4 +446,64 @@ async fn what_a_push_reads_stays_while_it_runs() {
         0,
         "nothing left in the store's tmp"
     );
+}
+
+#[tokio::test]
+async fn annotations_built_in_stay_through_pushes_and_exports() {
+    let registry = Arc::new(Mutex::new(Registry::default()));
+    let addr = serve(registry.clone()).await;
+    let client = || Client::new().unwrap().plain_http(&addr);
+    let t = tempfile::tempdir().unwrap();
+    let s = directory_store(&t.path().join("store"), client());
+    let annotations = BTreeMap::from([(
+        "org.opencontainers.image.source".to_owned(),
+        "https://example.org/app".to_owned(),
+    )]);
+    let pin = s.pin().unwrap();
+    let image = build_with(
+        &s,
+        &pin,
+        "app:1",
+        oci::arch(),
+        &[("bin/app", "a")],
+        annotations.clone(),
+    )
+    .await;
+    drop(pin);
+    assert_eq!(image.annotations, annotations);
+    let manifest = |bytes: &[u8]| -> oci::Manifest { serde_json::from_slice(bytes).unwrap() };
+    let kept = std::fs::read(s.blob_path(&image.digest).unwrap()).unwrap();
+    assert_eq!(manifest(&kept).annotations, annotations);
+
+    // Pushed, the same manifest: its digest and its annotations.
+    let target = Reference::parse(&format!("{addr}/me/app:1")).unwrap();
+    assert_eq!(s.push("app:1", &target, None).await.unwrap(), image.digest);
+    let pushed = registry.lock().unwrap().manifests[&image.digest].clone();
+    assert_eq!(manifest(&pushed).annotations, annotations);
+    // Pulled into a store that keeps blobs, they are its too.
+    let other = directory_store(&t.path().join("other"), client());
+    let pulled = other.pull(&target.to_string(), None, "t").await.unwrap();
+    assert_eq!(
+        (pulled.digest.as_str(), &pulled.annotations),
+        (image.digest.as_str(), &annotations)
+    );
+
+    // Exported and loaded, likewise.
+    let archive = t.path().join("app.tar");
+    s.export("app:1", &archive, None).await.unwrap();
+    let loaded = directory_store(&t.path().join("loaded"), client())
+        .load(&archive, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (loaded.digest.as_str(), &loaded.annotations),
+        (image.digest.as_str(), &annotations)
+    );
+
+    // Without any, as before.
+    let pin = s.pin().unwrap();
+    let plain = build(&s, &pin, "app:2", oci::arch(), &[("bin/app", "b")]).await;
+    assert!(plain.annotations.is_empty());
+    let kept = std::fs::read(s.blob_path(&plain.digest).unwrap()).unwrap();
+    assert!(!String::from_utf8_lossy(&kept).contains("annotations"));
 }

@@ -34,8 +34,8 @@ use crate::log;
 use crate::state::{self, EXIT, Exit, LOG, RECORD, RUN, Record, Run, SHIM_LOG};
 
 use crate::{
-    ANNOTATION_JAIL, ANNOTATION_MLOCK, ANNOTATION_PARENT, ANNOTATION_SYSV, ANNOTATION_VNET,
-    DEVFS_RULESET,
+    ANNOTATION_CPUSET, ANNOTATION_JAIL, ANNOTATION_MLOCK, ANNOTATION_PARENT, ANNOTATION_SYSV,
+    ANNOTATION_VNET, DEVFS_RULESET,
 };
 
 mod local;
@@ -344,6 +344,35 @@ fn alive(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn alive(_: u32) -> bool {
     false
+}
+
+/// `cpus` as cpuset(1)'s `-l` takes it: numbers and ranges of them,
+/// separated by commas.
+fn cpu_list(cpus: &str) -> Result<String> {
+    let number = |n: &str| !n.is_empty() && n.len() <= 4 && n.bytes().all(|b| b.is_ascii_digit());
+    let ok = cpus.split(',').all(|part| match part.split_once('-') {
+        Some((a, b)) => number(a) && number(b),
+        None => number(part),
+    });
+    if !ok {
+        return Err(api(
+            400,
+            format!("{ANNOTATION_CPUSET}={cpus:?}: CPUs as cpuset -l takes them, e.g. 0-3,6"),
+        ));
+    }
+    Ok(cpus.to_owned())
+}
+
+/// Confines the new jail `jid` to `cpus` before anything runs in it; a
+/// jail that cannot be confined goes again.
+fn confine(sys: &dyn Sys, jail: &str, jid: u32, cpus: &str) -> Result<()> {
+    if let Err(e) = sys.jail_cpuset(jid, cpus) {
+        let _ = sys.jail_remove(jail);
+        return Err(internal(format!(
+            "confining jail {jail} to CPUs {cpus}: {e}"
+        )));
+    }
+    Ok(())
 }
 
 /// `dest` (a path in the container) under `root`, made if missing (a file
@@ -765,6 +794,16 @@ impl JailRuntime {
             stop_signal: state::signal(&cfg.stop_signal).unwrap_or(15),
             stop_timeout: spec.stop_timeout.unwrap_or(10),
             linux,
+            cpuset: match spec.annotations.get(ANNOTATION_CPUSET) {
+                Some(_) if pod => {
+                    return Err(api(
+                        400,
+                        format!("{ANNOTATION_CPUSET}: a pod runs nothing to confine"),
+                    ));
+                }
+                Some(c) => Some(cpu_list(c)?),
+                None => None,
+            },
         })
     }
 
@@ -860,9 +899,14 @@ impl JailRuntime {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        self.sys
+        let jid = self
+            .sys
             .jail_create(&refs)
-            .map_err(|e| internal(format!("creating jail {}: {e}", rec.jail)))
+            .map_err(|e| internal(format!("creating jail {}: {e}", rec.jail)))?;
+        if let Some(cpus) = &rec.cpuset {
+            confine(&*self.sys, &rec.jail, jid, cpus)?;
+        }
+        Ok(jid)
     }
 
     /// Starts the member's supervisor in its new jail and waits for its
@@ -1612,6 +1656,7 @@ mod tests {
             stop_signal: 15,
             stop_timeout: 10,
             linux: true,
+            cpuset: None,
         };
         state::write(&t.path().join("state/c1"), RECORD, &rec).unwrap();
         let mounted = || sys.mounts(&root.to_string_lossy()).unwrap();
@@ -1695,6 +1740,7 @@ mod tests {
             stop_signal: 15,
             stop_timeout: 10,
             linux: false,
+            cpuset: None,
         };
         state::write(&t.path().join("state/c2"), RECORD, &rec).unwrap();
         // Its jail ended, but is dying yet, holding its root.
@@ -1702,6 +1748,16 @@ mod tests {
         rt.remove("c2").await.unwrap();
         assert!(sys.zfs_list("tank/jails/c2").unwrap().is_empty());
         assert!(!t.path().join("state/c2").exists());
+    }
+
+    #[test]
+    fn cpu_lists_as_cpuset_takes_them() {
+        for ok in ["0", "0-3", "0-3,6", "1,3,5-7"] {
+            assert_eq!(cpu_list(ok).unwrap(), ok);
+        }
+        for bad in ["", "all", "0-", "-1", "1,,2", "0;reboot", "1 2", "12345"] {
+            assert!(cpu_list(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

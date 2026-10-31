@@ -496,6 +496,22 @@ impl Sys for FakeSys {
         Ok(jid)
     }
 
+    /// Kept as the jail's parameter `cpuset`, which `jail_get` reads.
+    fn jail_cpuset(&self, jid: u32, cpus: &str) -> Result<()> {
+        let mut s = self.state();
+        let name = s
+            .jails
+            .values()
+            .find(|j| j.jid == jid)
+            .map(|j| j.name.clone())
+            .ok_or_else(|| fail("cpuset", format!("jail {jid}: not found")))?;
+        s.jail_params
+            .entry(name)
+            .or_default()
+            .insert("cpuset".to_owned(), cpus.to_owned());
+        Ok(())
+    }
+
     fn jail_remove(&self, jail: &str) -> Result<()> {
         if !self.state().jails.contains_key(jail) {
             return Err(Error::NotFound(format!("jail {jail}")));

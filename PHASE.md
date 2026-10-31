@@ -1332,6 +1332,20 @@ real, in the order agreed with the user.
   again, against a removal or prune meanwhile. Tested on FreeBSD 15.1:
   the crates' tests and the live ones, with a step and an attached run
   cancelled; each new unit test failed without its fix.
+- **For jailer, and fixes it found** (2026-10-31). Removing a member
+  whose jail is still dying (its TCP connections in TIME_WAIT hold it,
+  and so its root) unmounts the root by force before destroying its
+  dataset, which was busy. `pf_flush_anchor` flushes tables, NAT and
+  rules each: `-F all` fails on FreeBSD 15 after flushing. Blobs that
+  `ensure_blobs` packs again are renamed into place, never written over
+  one another push may be reading. Added, Legion unchanged:
+  `register_built_image_with` (manifest annotations, kept by pushes and
+  exports, and by pulls into a store that keeps blobs); the
+  `org.freebsd.jail.cpuset` annotation and `Step::cpuset`, set on the jail
+  before anything runs in it (`Sys::jail_cpuset`); `PodNetwork::named`,
+  a pod network on another bridge with another interface prefix. Tested
+  on FreeBSD 15.1: the crates' tests and the jail live tests (CPUs read
+  back from a member's jail and from inside a step).
 - **A node's role is its certificate's.** Nodes registered as workers
   whatever they were, so `legion list nodes` showed managers as workers
   and `node.role` constraints never matched a manager.

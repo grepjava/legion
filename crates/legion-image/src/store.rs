@@ -43,6 +43,10 @@ pub struct Image {
     /// a push or an export sends.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub layer_descriptors: Vec<Descriptor>,
+    /// The manifest's annotations, which a push or an export writes again:
+    /// those it was built with, or pulled with where the store keeps blobs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub annotations: BTreeMap<String, String>,
     /// References pulled with credentials, and who pulled them: only they
     /// may use the image without asking its registry again. Others are
     /// public (pulled without credentials, or loaded).
@@ -681,6 +685,11 @@ impl Store {
             } else {
                 Vec::new()
             },
+            annotations: if self.keep_blobs {
+                manifest.annotations
+            } else {
+                BTreeMap::new()
+            },
             private: BTreeMap::new(),
         };
         self.upsert(image, r, private)
@@ -795,11 +804,34 @@ impl Store {
         layers: Vec<String>,
         layer_descriptors: Vec<Descriptor>,
     ) -> Result<Image, Error> {
+        self.register_built_image_with(
+            pin,
+            reference,
+            config,
+            layers,
+            layer_descriptors,
+            BTreeMap::new(),
+        )
+        .await
+    }
+
+    /// [`Self::register_built_image`], its manifest with `annotations`
+    /// (`org.opencontainers.image.*` and the like), which pushes and
+    /// exports of it keep.
+    pub async fn register_built_image_with(
+        &self,
+        pin: &Pin,
+        reference: &Reference,
+        config: ImageConfig,
+        layers: Vec<String>,
+        layer_descriptors: Vec<Descriptor>,
+        annotations: BTreeMap<String, String>,
+    ) -> Result<Image, Error> {
         let config_bytes = serde_json::to_vec_pretty(&config)?;
         let config_digest = sha256(&config_bytes);
         pin.add(&[hex_of(&config_digest)?])?;
         std::fs::write(self.blob_dest(&config_digest)?, &config_bytes)?;
-        let manifest = Manifest::new(
+        let mut manifest = Manifest::new(
             Descriptor {
                 media_type: OCI_CONFIG.to_owned(),
                 digest: config_digest.clone(),
@@ -809,6 +841,7 @@ impl Store {
             },
             layer_descriptors.clone(),
         );
+        manifest.annotations = annotations.clone();
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         let manifest_digest = sha256(&manifest_bytes);
         pin.add(&[hex_of(&manifest_digest)?])?;
@@ -820,6 +853,7 @@ impl Store {
             layers,
             config,
             layer_descriptors,
+            annotations,
             private: BTreeMap::new(),
         };
         let _held = self.lock().await?;
@@ -1114,7 +1148,7 @@ impl Store {
             std::fs::write(tmp.path(), &config_bytes)?;
             put_blob(tmp.path(), &kept)?;
         }
-        let manifest = Manifest::new(
+        let mut manifest = Manifest::new(
             Descriptor {
                 media_type: OCI_CONFIG.to_owned(),
                 digest: config_digest,
@@ -1124,6 +1158,7 @@ impl Store {
             },
             descriptors,
         );
+        manifest.annotations = image.annotations.clone();
         Ok((manifest, config_bytes))
     }
 

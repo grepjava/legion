@@ -354,6 +354,11 @@ impl<R: Runner> Sys for Shell<R> {
         })
     }
 
+    fn jail_cpuset(&self, jid: u32, cpus: &str) -> Result<()> {
+        self.run("cpuset", &args(["-l", cpus, "-j", &jid.to_string()]))
+            .map(drop)
+    }
+
     fn jail_remove(&self, jail: &str) -> Result<()> {
         let a = args(["-j", jail, "jid"]);
         let out = self.output("jls", &a, None)?;
