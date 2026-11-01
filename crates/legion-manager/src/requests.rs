@@ -159,7 +159,11 @@ where
             let res = answer.await?;
             let code = grpc_status(res.headers());
             let method = requests.answered(&path, code, started.elapsed());
-            let open = code.is_none().then_some(Open { requests, method });
+            let open = code.is_none().then_some(Open {
+                requests,
+                method,
+                ended: false,
+            });
             Ok(res.map(|inner| Watched { inner, open }))
         })
     }
@@ -173,18 +177,21 @@ fn grpc_status(headers: &http::HeaderMap) -> Option<i32> {
 struct Open {
     requests: Arc<Requests>,
     method: Method,
+    ended: bool,
 }
 
 impl Open {
-    fn end(self, code: i32) {
+    fn end(mut self, code: i32) {
         self.requests.ended(&self.method, code);
-        std::mem::forget(self);
+        self.ended = true;
     }
 }
 
 impl Drop for Open {
     fn drop(&mut self) {
-        self.requests.ended(&self.method, Code::Cancelled as i32);
+        if !self.ended {
+            self.requests.ended(&self.method, Code::Cancelled as i32);
+        }
     }
 }
 
@@ -251,11 +258,14 @@ mod tests {
             let open = Open {
                 requests: r.clone(),
                 method,
+                ended: false,
             };
             if let Some(code) = end {
                 open.end(code);
             }
         }
+        // Ended or dropped, an open call lets go of what it held.
+        assert_eq!(Arc::strong_count(&r), 1);
         let mut m = Metrics::default();
         r.collect(&mut m);
         let text = m.finish();

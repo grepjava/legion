@@ -1201,6 +1201,9 @@ fn endpoints(
     /// Ready and running task addresses, and ready ones by ordinal.
     type Addrs = (Vec<Ipv4Addr>, Vec<Ipv4Addr>, BTreeMap<u32, Ipv4Addr>);
     let mut by_service: BTreeMap<(&str, String), Addrs> = BTreeMap::new();
+    // Jobs' running tasks, by namespace and Job: no endpoints, but sources
+    // network policy lets in as its namespace's.
+    let mut jobs: BTreeMap<(&str, String), (String, Vec<Ipv4Addr>)> = BTreeMap::new();
     for t in tasks.values() {
         let Ok(spec) = legion_api::parse::<TaskSpec>(&t.spec) else {
             continue;
@@ -1212,6 +1215,13 @@ fn endpoints(
         let Some(ip) = status.ip.as_deref().and_then(|s| s.parse().ok()) else {
             continue;
         };
+        if spec.job {
+            jobs.entry((t.metadata.namespace.as_str(), spec.service_uid))
+                .or_insert_with(|| (spec.service, Vec::new()))
+                .1
+                .push(ip);
+            continue;
+        }
         let ordinal = spec.ordinal();
         let entry = by_service
             .entry((t.metadata.namespace.as_str(), spec.service_uid))
@@ -1273,8 +1283,27 @@ fn endpoints(
                 ready,
                 alive,
                 ordinals,
+                job: false,
             }
         })
+        .chain(
+            jobs.into_iter()
+                .map(|((namespace, uid), (name, mut alive))| {
+                    alive.sort();
+                    ServiceEndpoints {
+                        namespace: namespace.to_owned(),
+                        name,
+                        uid,
+                        labels: BTreeMap::new(),
+                        vip: None,
+                        ports: Vec::new(),
+                        ready: Vec::new(),
+                        alive,
+                        ordinals: BTreeMap::new(),
+                        job: true,
+                    }
+                }),
+        )
         .collect()
 }
 
@@ -1418,6 +1447,57 @@ mod tests {
         // What older agents read: no `acme`, which they would refuse.
         let json = serde_json::to_string(&out).unwrap();
         assert!(!json.contains("acme") && !json.contains("ops@"), "{json}");
+    }
+
+    /// A Job's running tasks go out as its namespace's, with no VIP, ports
+    /// or labels: network policy lets them in; nothing balances to them.
+    #[test]
+    fn jobs_tasks_go_out_for_network_policy() {
+        let task = |name: &str, owner: &str, uid: &str, job: bool, ip: &str| {
+            let mut t = Object::new(
+                Kind::Task,
+                "a",
+                name,
+                serde_json::json!({
+                    "service": owner,
+                    "serviceUid": uid,
+                    "serviceGeneration": 1,
+                    "job": job,
+                    "node": "n1",
+                    "pod": {"containers": [{"name": "c", "image": "x"}]},
+                }),
+            );
+            t.status = serde_json::json!({"state": "running", "ip": ip, "ready": true});
+            t
+        };
+        let mut web = Object::new(
+            Kind::Service,
+            "a",
+            "web",
+            serde_json::json!({"pod": {"containers": [{"name": "c", "image": "x"}]}}),
+        );
+        web.metadata.uid = "svc-uid".into();
+        let services = [web].into_iter().map(|o| (o.key(), o)).collect();
+        let tasks = [
+            task("web-1-1", "web", "svc-uid", false, "10.200.0.2"),
+            task("batch-1", "batch", "job-uid", true, "10.200.0.9"),
+            task("batch-2", "batch", "job-uid", true, "10.200.0.8"),
+        ]
+        .into_iter()
+        .map(|o| (o.key(), o))
+        .collect();
+        let out = endpoints(&services, &tasks, &BTreeMap::new());
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(!out[0].job);
+        assert_eq!(out[0].alive, [Ipv4Addr::new(10, 200, 0, 2)]);
+        let job = &out[1];
+        assert!(job.job);
+        assert_eq!((job.namespace.as_str(), job.name.as_str()), ("a", "batch"));
+        assert_eq!(
+            job.alive,
+            [Ipv4Addr::new(10, 200, 0, 8), Ipv4Addr::new(10, 200, 0, 9)]
+        );
+        assert!(job.vip.is_none() && job.ports.is_empty() && job.ready.is_empty());
     }
 
     fn subnet(n: u32) -> String {

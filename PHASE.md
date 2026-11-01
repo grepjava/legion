@@ -1430,6 +1430,19 @@ real, in the order agreed with the user.
   leader already had (now only the manager serving a request checks
   them), and a Node delete refused for a stale version still recorded
   the node as removed (now checked first).
+- **Third review** (2026-11-01), five findings, all real, each with a
+  test (the migration's checked to fail without its fix): an autolock
+  reseal that failed midway left keys under two unlock keys and was not
+  tried again (now written aside, then a marker and renames, carried
+  through at start or by the next check); the new node of a Volume
+  dropped the move's snapshots on the last part, so a retry after a
+  failed mount or commit could never apply (kept until the Volume's first
+  use there; a retry rolls back to the full copy); network policy tables
+  had only Services' tasks, so a Job's could not reach its namespace's
+  (the dispatcher now sends Jobs' running tasks as endpoints without VIP,
+  ports or labels); a directory-mode layer cut short was taken as whole
+  (made aside, renamed when done); request metrics leaked each answered
+  call's `Open` through `mem::forget`.
 
 ### To do, in order
 

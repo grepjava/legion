@@ -739,15 +739,19 @@ impl Store {
                 let dst = self.layer_dir(hex);
                 let parent = parent.map(|p| self.layer_dir(p));
                 blocking(move || {
-                    // A directory left by an interrupted attempt is made again.
-                    layer::remove_tree(&dst)?;
+                    // Made aside and renamed whole, so a layer directory is
+                    // only ever a complete one; what an interrupted attempt
+                    // left aside is made again.
+                    let part = dst.with_extension("partial");
+                    layer::remove_tree(&part)?;
                     let made = match parent {
-                        Some(p) => layer::copy_tree(&p, &dst),
-                        None => std::fs::create_dir_all(&dst).map_err(Error::from),
+                        Some(p) => layer::copy_tree(&p, &part),
+                        None => std::fs::create_dir_all(&part).map_err(Error::from),
                     }
-                    .and_then(|()| layer::apply(&tar, &dst));
+                    .and_then(|()| layer::apply(&tar, &part))
+                    .and_then(|()| std::fs::rename(&part, &dst).map_err(Error::from));
                     if made.is_err() {
-                        let _ = layer::remove_tree(&dst);
+                        let _ = layer::remove_tree(&part);
                     }
                     made
                 })

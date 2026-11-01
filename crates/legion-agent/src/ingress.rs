@@ -275,7 +275,7 @@ impl Proxy {
         let endpoints = self.endpoints.borrow();
         let service = endpoints
             .iter()
-            .find(|s| s.namespace == route.namespace && s.name == route.spec.service)
+            .find(|s| !s.job && s.namespace == route.namespace && s.name == route.spec.service)
             .ok_or_else(|| {
                 let what = format!("service {}/{}", route.namespace, route.spec.service);
                 (StatusCode::SERVICE_UNAVAILABLE, format!("no {what}"))
@@ -491,6 +491,7 @@ mod tests {
             ready: ready.clone(),
             alive: ready,
             ordinals: Default::default(),
+            job: false,
         }
     }
 

@@ -46,6 +46,10 @@ pub struct ServiceEndpoints {
     /// A stateful service's ready tasks, by ordinal.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ordinals: BTreeMap<u32, Ipv4Addr>,
+    /// A Job's running tasks (`alive`), not a Service: there only for
+    /// network policy, which counts them in their namespace.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub job: bool,
 }
 
 /// A service port, resolved against the pod.

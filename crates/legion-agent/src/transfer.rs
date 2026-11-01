@@ -3,7 +3,9 @@
 //! moves to one to receive it, and joins the two: what one sends as output
 //! the other takes as input. The first part is a full copy, sent while the
 //! Volume's tasks still run; the last, sent once they have stopped, is what
-//! changed since. The node it left then drops its copy.
+//! changed since. The node it left then drops its copy. The new node keeps
+//! the move's snapshots, so the last part can be sent again until the
+//! manager gives it the Volume; the Volume's first use there drops them.
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -48,22 +50,8 @@ pub(crate) async fn send(
     let ds = v.dataset(namespace, &opts.volume)?;
     let out = tx.clone();
     crate::task::blocking(&v.sys, move |sys| -> Result<(), String> {
-        let snap = |n: &str| format!("{ds}@{n}");
-        // A snapshot left by an earlier attempt goes first.
-        let fresh = |n: &str| {
-            let _ = sys.zfs_destroy(&snap(n), false);
-            sys.zfs_snapshot(&snap(n)).map_err(|e| e.to_string())
-        };
         let mut out = FrameWriter::new(out);
-        if opts.last {
-            fresh(LAST)?;
-            sys.zfs_send(&snap(LAST), Some(FULL), &mut out)
-        } else {
-            let _ = sys.zfs_destroy(&snap(LAST), false);
-            fresh(FULL)?;
-            sys.zfs_send(&snap(FULL), None, &mut out)
-        }
-        .map_err(|e| e.to_string())?;
+        give(sys, &ds, opts.last, &mut out)?;
         out.flush().map_err(|e| e.to_string())
     })
     .await
@@ -73,8 +61,8 @@ pub(crate) async fn send(
 }
 
 /// Receives what the sending node sends, until the input closes. After
-/// the last part the dataset is mounted, ready for the Volume's tasks, and
-/// the migration's snapshots go.
+/// the last part the dataset is mounted, ready for the Volume's tasks; the
+/// move's snapshots stay until then (see [`crate::volumes`]).
 pub(crate) async fn receive(
     v: &Volumes,
     namespace: &str,
@@ -84,30 +72,8 @@ pub(crate) async fn receive(
 ) -> Result<(), Status> {
     let ds = v.dataset(namespace, &opts.volume)?;
     let (data, rx) = mpsc::channel::<Result<Vec<u8>, String>>(16);
-    let work = crate::task::blocking(&v.sys, move |sys| -> Result<(), String> {
-        if let Some((parent, _)) = ds.rsplit_once('/') {
-            sys.zfs_create(parent, &[]).map_err(|e| e.to_string())?;
-        }
-        // A copy here from before (an attempt cut short, or the Volume's
-        // last stay) is stale: the full copy takes its place.
-        if !opts.last
-            && sys
-                .zfs_list(&ds)
-                .map_err(|e| e.to_string())?
-                .iter()
-                .any(|d| d.name == ds)
-        {
-            sys.zfs_destroy(&ds, true).map_err(|e| e.to_string())?;
-        }
-        sys.zfs_receive(&ds, &mut FrameReader::new(rx))
-            .map_err(|e| e.to_string())?;
-        if opts.last {
-            for n in [FULL, LAST] {
-                let _ = sys.zfs_destroy(&format!("{ds}@{n}"), false);
-            }
-            sys.zfs_mount(&ds).map_err(|e| e.to_string())?;
-        }
-        Ok(())
+    let work = crate::task::blocking(&v.sys, move |sys| {
+        take(sys, &ds, opts.last, &mut FrameReader::new(rx))
     });
     // Input until it closes; anything else ends the stream early, which
     // makes the receive fail.
@@ -136,6 +102,63 @@ pub(crate) async fn receive(
     let (result, ()) = tokio::join!(work, feed);
     result.map_err(Status::internal)?;
     let _ = tx.send(frame(Frame::ExitCode(0))).await;
+    Ok(())
+}
+
+/// Snapshots dataset `ds` and writes it to `out`: all of it, or with
+/// `last` what changed since the full copy.
+fn give(sys: &dyn Sys, ds: &str, last: bool, out: &mut dyn Write) -> Result<(), String> {
+    let snap = |n: &str| format!("{ds}@{n}");
+    // A snapshot left by an earlier attempt goes first.
+    let fresh = |n: &str| {
+        let _ = sys.zfs_destroy(&snap(n), false);
+        sys.zfs_snapshot(&snap(n)).map_err(|e| e.to_string())
+    };
+    if last {
+        fresh(LAST)?;
+        sys.zfs_send(&snap(LAST), Some(FULL), out)
+    } else {
+        let _ = sys.zfs_destroy(&snap(LAST), false);
+        fresh(FULL)?;
+        sys.zfs_send(&snap(FULL), None, out)
+    }
+    .map_err(|e| e.to_string())
+}
+
+/// Takes into dataset `ds` what `give` wrote; after the last part, mounts
+/// it.
+fn take(sys: &dyn Sys, ds: &str, last: bool, input: &mut dyn Read) -> Result<(), String> {
+    if let Some((parent, _)) = ds.rsplit_once('/') {
+        sys.zfs_create(parent, &[]).map_err(|e| e.to_string())?;
+    }
+    // A copy here from before (an attempt cut short, or the Volume's
+    // last stay) is stale: the full copy takes its place.
+    if !last
+        && sys
+            .zfs_list(ds)
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|d| d.name == ds)
+    {
+        sys.zfs_destroy(ds, true).map_err(|e| e.to_string())?;
+    }
+    // The last part again (the manager did not take the first in): back
+    // to the full copy, as it was before, to take it on.
+    if last {
+        let snaps = sys.zfs_snapshots(ds).map_err(|e| e.to_string())?;
+        if snaps.iter().any(|s| s == LAST) {
+            sys.zfs_destroy(&format!("{ds}@{LAST}"), false)
+                .map_err(|e| e.to_string())?;
+        }
+        if snaps.iter().any(|s| s == FULL) {
+            sys.zfs_rollback(&format!("{ds}@{FULL}"))
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    sys.zfs_receive(ds, input).map_err(|e| e.to_string())?;
+    if last {
+        sys.zfs_mount(ds).map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -236,5 +259,50 @@ impl Read for FrameReader {
         out[..n].copy_from_slice(&self.buf[self.at..self.at + n]);
         self.at += n;
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use legion_api::volume::VolumeSpec;
+    use legion_sys::FakeSys;
+
+    use super::*;
+
+    const DS: &str = "tank/legion/volumes/shop/data";
+
+    fn sent(sys: &FakeSys, last: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        give(sys, DS, last, &mut out).unwrap();
+        out
+    }
+
+    /// The last part may be taken twice, as when the manager did not take
+    /// the first in: the new node keeps the move's snapshots until the
+    /// Volume is first used there.
+    #[test]
+    fn the_last_part_may_come_again() {
+        let (from, to) = (FakeSys::new(), FakeSys::new());
+        from.zfs_create(DS, &[]).unwrap();
+        to.zfs_create("tank/legion/volumes", &[]).unwrap();
+        from.write_dataset(DS, b"one");
+        take(&to, DS, false, &mut &sent(&from, false)[..]).unwrap();
+
+        from.write_dataset(DS, b"two");
+        take(&to, DS, true, &mut &sent(&from, true)[..]).unwrap();
+        from.write_dataset(DS, b"three");
+        take(&to, DS, true, &mut &sent(&from, true)[..]).unwrap();
+        assert_eq!(to.dataset_contents(DS).unwrap(), b"three");
+        assert_eq!(to.zfs_snapshots(DS).unwrap(), [FULL, LAST]);
+
+        // Used: the move is over, its snapshots go. Not on the node it
+        // left while a full copy is all there is (the move under way).
+        crate::volumes::zfs(&to, DS, &VolumeSpec::default()).unwrap();
+        assert!(to.zfs_snapshots(DS).unwrap().is_empty());
+        let other = FakeSys::new();
+        other.zfs_create(DS, &[]).unwrap();
+        sent(&other, false);
+        crate::volumes::zfs(&other, DS, &VolumeSpec::default()).unwrap();
+        assert_eq!(other.zfs_snapshots(DS).unwrap(), [FULL]);
     }
 }

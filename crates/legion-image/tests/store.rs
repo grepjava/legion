@@ -344,6 +344,37 @@ async fn pulls_share_layers_and_removal_waits_for_containers() {
     assert!(e.to_string().contains("local image"), "{e}");
 }
 
+/// Layers as directories are made aside and renamed whole: what an
+/// interrupted pull left is made again, never taken for a layer.
+#[tokio::test]
+async fn an_interrupted_layer_is_made_again() {
+    let base = layer(&[("etc/base", "b")]);
+    let registry = Arc::new(Mutex::new(Registry::default()));
+    registry
+        .lock()
+        .unwrap()
+        .image("team/base", "1", "freebsd", std::slice::from_ref(&base));
+    let addr = serve(registry).await;
+    let t = tempfile::tempdir().unwrap();
+    let client = Client::new().unwrap().plain_http(&addr);
+    let s =
+        Store::open_directory(Arc::new(FakeSys::new()) as Arc<dyn Sys>, t.path(), client).unwrap();
+    let hex = chain_ids(std::slice::from_ref(&base.1))[0][7..].to_owned();
+    let left = t.path().join("layers").join(format!("{hex}.partial"));
+    std::fs::create_dir_all(left.join("etc")).unwrap();
+    std::fs::write(left.join("etc/half"), "h").unwrap();
+
+    let image = s
+        .pull(&format!("{addr}/team/base:1"), None, "t")
+        .await
+        .unwrap();
+    assert_eq!(image.layers, std::slice::from_ref(&hex));
+    let dir = s.layer_dir(&hex);
+    assert_eq!(std::fs::read_to_string(dir.join("etc/base")).unwrap(), "b");
+    assert!(!dir.join("etc/half").exists());
+    assert!(!left.exists());
+}
+
 #[tokio::test]
 async fn private_images_are_for_those_who_pulled_them() {
     let base = layer(&[("etc/base", "b")]);

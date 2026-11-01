@@ -102,7 +102,7 @@ pub fn guards(
     let labels = |namespace: &str, service: &str| {
         endpoints
             .iter()
-            .find(|e| e.namespace == namespace && e.name == service)
+            .find(|e| !e.job && e.namespace == namespace && e.name == service)
             .map_or(&no_labels, |e| &e.labels)
     };
     let mut tables: BTreeMap<String, Vec<Ipv4Addr>> = BTreeMap::new();
@@ -376,6 +376,7 @@ mod tests {
             ready: alive.iter().map(|a| ip(a)).collect(),
             alive: alive.iter().map(|a| ip(a)).collect(),
             ordinals: BTreeMap::new(),
+            job: false,
         }
     }
 
@@ -402,6 +403,50 @@ mod tests {
             .iter()
             .flat_map(|a| tables[&a.table].iter().copied())
             .collect()
+    }
+
+    /// A Job's tasks are of their namespace too, though no Service's: let
+    /// in by its isolation, not by policies naming services' labels.
+    #[test]
+    fn jobs_are_of_their_namespace() {
+        let mut endpoints = endpoints();
+        // Named as a Service is, and first: taken for none.
+        endpoints.insert(
+            0,
+            ServiceEndpoints {
+                labels: BTreeMap::new(),
+                vip: None,
+                ports: Vec::new(),
+                ready: Vec::new(),
+                job: true,
+                ..svc("a", "web", "", "0.0.0.0", &["10.200.0.9"])
+            },
+        );
+        let pods = [pod("a", "db", "10.200.0.3")];
+        let (g, tables) = guards(&pods, &endpoints, &Policies::default());
+        assert!(sources(&g[0], &tables).contains(&ip("10.200.0.9")));
+        assert_eq!(g[0].vips.len(), 2, "a Job has no VIP");
+
+        let isolated = Policies {
+            isolation: BTreeMap::from([("a".into(), Isolation::Locked)]),
+            policies: vec![NamespacedPolicy {
+                namespace: "a".into(),
+                name: "web-to-db".into(),
+                spec: NetworkPolicySpec {
+                    services: BTreeMap::from([("app".into(), "db".into())]),
+                    ingress: vec![IngressRule {
+                        from: vec![PolicyPeer {
+                            namespace: None,
+                            services: BTreeMap::from([("app".into(), "web".into())]),
+                        }],
+                        ports: vec![],
+                    }],
+                    egress: None,
+                },
+            }],
+        };
+        let (g, tables) = guards(&pods, &endpoints, &isolated);
+        assert_eq!(sources(&g[0], &tables), BTreeSet::from([ip("10.200.0.2")]));
     }
 
     #[test]

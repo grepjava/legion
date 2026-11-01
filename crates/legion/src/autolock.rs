@@ -84,7 +84,12 @@ pub async fn follow(store: Store, pki: Arc<Mutex<Pki>>) {
             Ok(now) => {
                 let wanted = now.map(|(key, _)| key);
                 let mut pki = pki.lock().unwrap_or_else(|e| e.into_inner());
-                if wanted.as_ref() != pki.lock() {
+                if pki.resealing() {
+                    match pki.settle() {
+                        Ok(()) => tracing::info!("autolock: an interrupted reseal is finished"),
+                        Err(e) => tracing::warn!("autolock: {e:#}"),
+                    }
+                } else if wanted.as_ref() != pki.lock() {
                     let sealing = wanted.is_some();
                     match pki.reseal(wanted) {
                         Ok(()) if sealing => tracing::info!("autolock: private keys sealed"),

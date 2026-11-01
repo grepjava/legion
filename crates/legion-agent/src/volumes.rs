@@ -539,7 +539,7 @@ fn unmount_plugin(sys: &dyn Sys, program: &str, dir: &str, input: &str) -> Resul
 
 /// Creates the dataset if needed, keeps its quota in line with the spec and
 /// returns where it is mounted.
-fn zfs(sys: &dyn Sys, dataset: &str, spec: &VolumeSpec) -> Result<String, String> {
+pub(crate) fn zfs(sys: &dyn Sys, dataset: &str, spec: &VolumeSpec) -> Result<String, String> {
     let quota = spec.size.map_or("none".to_owned(), |b| b.0.to_string());
     let props: &[(&str, &str)] = match spec.size {
         Some(_) => &[("quota", &quota)],
@@ -558,6 +558,17 @@ fn zfs(sys: &dyn Sys, dataset: &str, spec: &VolumeSpec) -> Result<String, String
     }
     // One received from another node may not be mounted yet.
     sys.zfs_mount(dataset).map_err(|e| e.to_string())?;
+    // A move's two snapshots: the move is over, the Volume being used
+    // here (received, or kept by a move given up). Only a full copy's is
+    // one still under way.
+    let snaps = sys.zfs_snapshots(dataset).map_err(|e| e.to_string())?;
+    let moves = [crate::transfer::FULL, crate::transfer::LAST];
+    if moves.iter().all(|m| snaps.iter().any(|s| s == m)) {
+        for m in moves {
+            sys.zfs_destroy(&format!("{dataset}@{m}"), false)
+                .map_err(|e| e.to_string())?;
+        }
+    }
     let ds = sys
         .zfs_list(dataset)
         .map_err(|e| e.to_string())?

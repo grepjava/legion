@@ -242,6 +242,7 @@ async fn apply_to_running_pods() {
                 ready: both.clone(),
                 alive: both.clone(),
                 ordinals: Default::default(),
+                job: false,
             }]
     })
     .await;
