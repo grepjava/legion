@@ -1460,6 +1460,11 @@ real, in the order agreed with the user.
   - jailer's report: a build step's working directory through a link
     (FreeBSD's `/home`) was refused; it now resolves inside the root, as
     the jail does. Mount targets stay strict.
+  - `logs --follow` lost a line written between its first read and the
+    file's size taken after it (both runtimes): following now starts
+    where that read ended. The fake runtime's same gap made
+    `sessions_reach_the_pod` flaky (1 in 100); widened on purpose, the
+    old code failed every time.
 
 ### To do, in order
 

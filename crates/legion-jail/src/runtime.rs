@@ -1426,9 +1426,15 @@ impl legion_runtime::Runtime for JailRuntime {
     ) -> Result<BoxStream<'static, Result<Chunk>>> {
         let rec = self.record(id)?;
         let path = self.container_dir(id).join(LOG);
-        let first = log::read_all(&path, tail).map_err(internal)?;
-        let offset = std::fs::metadata(&path).map_or(0, |m| m.len());
-        let inode = log::inode(&path);
+        // Where the first read ended, in the file it read: a line written
+        // meanwhile, or a rotation, is then followed, not lost.
+        let (first, offset, inode) = loop {
+            let inode = log::inode(&path);
+            let (first, offset) = log::read_all_at(&path, tail).map_err(internal)?;
+            if log::inode(&path) == inode {
+                break (first, offset, inode);
+            }
+        };
         let initial = futures::stream::iter(first.into_iter().map(Ok));
         if !follow {
             return Ok(initial.boxed());

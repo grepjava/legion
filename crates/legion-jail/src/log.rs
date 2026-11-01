@@ -206,8 +206,15 @@ pub fn inode(path: &Path) -> u64 {
 
 /// Everything kept, oldest first, or the last `tail` lines of it.
 pub fn read_all(path: &Path, tail: Option<usize>) -> std::io::Result<Vec<Chunk>> {
+    Ok(read_all_at(path, tail)?.0)
+}
+
+/// The same, and where in `path` what it read ends: following from there
+/// misses nothing written meanwhile.
+pub fn read_all_at(path: &Path, tail: Option<usize>) -> std::io::Result<(Vec<Chunk>, u64)> {
     let (mut chunks, _) = read_from(&rotated(path), 0)?;
-    chunks.extend(read_from(path, 0)?.0);
+    let (more, at) = read_from(path, 0)?;
+    chunks.extend(more);
     if let Some(n) = tail {
         // Lines end with a full record: keep the pieces of the last n.
         let mut ends = 0;
@@ -223,7 +230,7 @@ pub fn read_all(path: &Path, tail: Option<usize>) -> std::io::Result<Vec<Chunk>>
         }
         chunks.drain(..start);
     }
-    Ok(chunks)
+    Ok((chunks, at))
 }
 
 #[cfg(test)]
@@ -261,6 +268,40 @@ mod tests {
         assert_eq!(
             all.iter().map(|c| c.data.len()).sum::<usize>(),
             5 + PIECE + 10 + 1
+        );
+    }
+
+    /// Following starts where the first read ended, not at the file's
+    /// size taken after it: what is written between comes too.
+    #[test]
+    fn following_starts_where_reading_ended() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("log");
+        let mut w = Writer::open(&p, 1 << 20).unwrap();
+        w.write(
+            Output::Stdout,
+            b"one
+",
+        )
+        .unwrap();
+        w.flush().unwrap();
+        let (first, at) = read_all_at(&p, None).unwrap();
+        assert_eq!(
+            text(&first),
+            "one
+"
+        );
+        w.write(
+            Output::Stdout,
+            b"two
+",
+        )
+        .unwrap();
+        w.flush().unwrap();
+        assert_eq!(
+            text(&read_from(&p, at).unwrap().0),
+            "two
+"
         );
     }
 

@@ -741,7 +741,10 @@ impl Runtime for FakeRuntime {
         tail: Option<usize>,
     ) -> Result<BoxStream<'static, Result<Chunk>>> {
         let name = self.get(id)?.spec.name;
+        // What was written and how much, at once: a line written between
+        // would be neither.
         let mut written = self.state().logs.get(&name).cloned().unwrap_or_default();
+        let from = written.len();
         if let Some(n) = tail {
             written = written.split_off(written.len().saturating_sub(n));
         }
@@ -752,7 +755,6 @@ impl Runtime for FakeRuntime {
         // Then what comes later, until the container stops.
         let state = self.state_handle();
         let id = id.to_owned();
-        let from = self.state().logs.get(&name).map_or(0, Vec::len);
         let later = futures::stream::unfold(from, move |at| {
             let state = state.clone();
             let id = id.clone();
