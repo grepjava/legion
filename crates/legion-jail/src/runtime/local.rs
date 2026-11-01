@@ -506,7 +506,7 @@ fn work_dir_in(root: &Path, dir: &str) -> Result<PathBuf> {
     // Hops through links before giving up, as the kernel does.
     const MAX_LINKS: usize = 40;
     let mut rest: Vec<OsString> = Vec::new();
-    let mut push = |rest: &mut Vec<OsString>, p: &Path| {
+    let push = |rest: &mut Vec<OsString>, p: &Path| {
         // Kept reversed: the next component is last.
         let mut parts: Vec<OsString> = p
             .components()
