@@ -190,7 +190,11 @@ pub(super) fn shell_size(model: &Model, view: &View, area: Rect) -> Option<(u16,
         height: area.height - 6,
         ..area
     };
-    let row_count = if view.zoom { 0 } else { rows(model, view).len() };
+    let row_count = if view.zoom {
+        0
+    } else {
+        rows(model, view).len()
+    };
     let lower = split(view, row_count, body).1?;
     let inner = panel(Line::default()).inner(lower);
     Some((inner.height.max(1), inner.width.max(1)))
@@ -284,7 +288,9 @@ fn color(c: vt100::Color) -> Option<Color> {
 fn upper_body(f: &mut Frame, model: &Model, view: &View, rows: Vec<TableRow>, body: Rect) {
     let width = f.area().width;
     if shows_detail(view, width) {
-        let selected = rows.get(view.selected[view.index()]).and_then(|r| r.key.clone());
+        let selected = rows
+            .get(view.selected[view.index()])
+            .and_then(|r| r.key.clone());
         let side = (width / 3).clamp(40, 70);
         let [table, detail_area] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(side)]).areas(body);

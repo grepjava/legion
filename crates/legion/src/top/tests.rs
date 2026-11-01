@@ -826,19 +826,21 @@ fn renders_max_scale_cluster_of_256_nodes_and_20000_tasks() {
 
     let mut v = View::default();
     let s = screen(&m, &v);
-    assert!(s.contains("256/256 nodes ready") && s.contains("20000 running"), "{s}");
-    // Node n-000 gets 79 tasks (20000 = 256 * 78 + 32).
     assert!(
-        line(&s, "n-000").starts_with("n-000 ● ready active worker 79 0.79/4 79Mi/8Gi")
+        s.contains("256/256 nodes ready") && s.contains("20000 running"),
+        "{s}"
     );
+    // Node n-000 gets 79 tasks (20000 = 256 * 78 + 32).
+    assert!(line(&s, "n-000").starts_with("n-000 ● ready active worker 79 0.79/4 79Mi/8Gi"));
 
     typed(&mut v, &m, "2");
     let s = screen(&m, &v);
-    assert!(
-        line(&s, "svc-000").starts_with("shop svc-000 replicated 200/200 200% 200Mi nginx:1")
-    );
+    assert!(line(&s, "svc-000").starts_with("shop svc-000 replicated 200/200 200% 200Mi nginx:1"));
 
     typed(&mut v, &m, "3G");
     let s = screen_of(&m, &v, 170);
-    assert!(s.contains("t-19999") && s.contains("task shop/t-19999"), "{s}");
+    assert!(
+        s.contains("t-19999") && s.contains("task shop/t-19999"),
+        "{s}"
+    );
 }

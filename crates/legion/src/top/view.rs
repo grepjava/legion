@@ -18,9 +18,7 @@ use serde::Deserialize;
 
 use super::draw::{BAD, OK, WARN, bytes, dimmed, fg, meter, trim};
 use super::logs::Logs;
-use super::model::{
-    Key, Model, containers, key, kind_word, owner, spec, status, task_state, word,
-};
+use super::model::{Key, Model, containers, key, kind_word, owner, spec, status, task_state, word};
 use super::shell::{self, Shell};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -913,8 +911,12 @@ fn workload_rows(model: &Model) -> Vec<TableRow> {
         }
     }
     let used_by = |kind: Kind, o: &Object| {
-        used.get(&(kind, o.metadata.namespace.as_str(), o.metadata.name.as_str()))
-            .copied()
+        used.get(&(
+            kind,
+            o.metadata.namespace.as_str(),
+            o.metadata.name.as_str(),
+        ))
+        .copied()
     };
     let services = model.of(Kind::Service).map(|s| {
         let st: ServiceStatus = status(s);
