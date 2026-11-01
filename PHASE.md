@@ -1448,6 +1448,8 @@ warnings). Its amd64 tarball is made from the port's staged build.
 
 The port passed `poudriere testport` on 15.1 amd64, and v0.1.7 built and
 passed its unit tests on 15.1 arm64; v0.1.7's GitHub release is
-published. Waiting on the user: the port's submission, once their FreeBSD
-Bugzilla account exists.
+published. v0.1.8, tagged on 2026-11-01, has the review fixes (above),
+several of them for security, so the port moves to it before it is
+submitted; its crates are v0.1.7's. Waiting on the user: the port's
+submission, once their FreeBSD Bugzilla account exists.
 
