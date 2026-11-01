@@ -1405,6 +1405,25 @@ real, in the order agreed with the user.
 - **A node's role is its certificate's.** Nodes registered as workers
   whatever they were, so `legion list nodes` showed managers as workers
   and `node.role` constraints never matched a manager.
+- **Review fixes** (2026-11-01, 1c51be2), from a review the user pasted.
+  Each finding was checked against the code first; four were already
+  fixed or wrong (exec probes leaking processes, closed shells leaking
+  PTYs, ALT keys and mouse in `top`'s shell, the fake pf rejecting port
+  lists), one is meant (`/dev/shm` linked only with a new devfs), and two
+  are kept by choice (`X-Forwarded-For` appended to, as proxies do;
+  compose files reading outside their directory, as the user's own
+  files). Fixed: users' forwarded requests checked again by the leader;
+  quotas for grown claims; workers revoked when their Node is deleted
+  (`removed-nodes`); certificate lifetimes bounded by the CA's;
+  `resolv.conf`, passwd and image layouts read without following links
+  or special files; the shim's leaked descriptor; ACME and registry
+  clients' schemes, sizes and timeouts; data asked of the leader when a
+  follower lacks it; usage reports kept to a task's node; key files
+  written through temporaries of their own; plugin options on unmount;
+  `logs -f` across rotations; IPv6 advertised addresses; long task names;
+  a 1 MiB object limit; the ingress handshake timeout; and an update's
+  old failures taken for new by a new leader. Tested on Windows and
+  FreeBSD 15.1, the jail live tests included.
 
 ### To do, in order
 
@@ -1427,6 +1446,8 @@ certificates from ACME; its `Makefile.crates` is made from `Cargo.lock`
 check-plist, stage-qa, packaged and portlint clean but its two known
 warnings). Its amd64 tarball is made from the port's staged build.
 
-Waiting on the user: an aarch64 tarball (no aarch64 host), a poudriere
-run and the port's submission.
+The port passed `poudriere testport` on 15.1 amd64, and v0.1.7 built and
+passed its unit tests on 15.1 arm64; v0.1.7's GitHub release is
+published. Waiting on the user: the port's submission, once their FreeBSD
+Bugzilla account exists.
 
