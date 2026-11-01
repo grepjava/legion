@@ -1424,6 +1424,12 @@ real, in the order agreed with the user.
   a 1 MiB object limit; the ingress handshake timeout; and an update's
   old failures taken for new by a new leader. Tested on Windows and
   FreeBSD 15.1, the jail live tests included.
+  A second review of these confirmed them and found two small things,
+  fixed after v0.1.8 (f1b5200): a follower checked a user's rights on its
+  own copy before forwarding, refusing for a moment a RoleBinding the
+  leader already had (now only the manager serving a request checks
+  them), and a Node delete refused for a stale version still recorded
+  the node as removed (now checked first).
 
 ### To do, in order
 
