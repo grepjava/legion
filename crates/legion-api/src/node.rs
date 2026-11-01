@@ -180,6 +180,14 @@ pub struct Platform {
     pub no_limits: bool,
 }
 
+impl Platform {
+    /// What decides which images run: the OS, the architecture, and
+    /// whether Linux ones do too.
+    pub fn runs(&self) -> (&str, &str, bool) {
+        (&self.os, &self.arch, self.linux)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capacity {
     pub cpu: Cpu,

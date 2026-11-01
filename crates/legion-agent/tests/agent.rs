@@ -891,6 +891,19 @@ async fn startup_failures() {
         "{}",
         status.message
     );
+    assert_eq!(status.wrong_platform, None);
+    // An image for another platform: rejected, with the node's platform.
+    h.rt.foreign_image("amd:1");
+    let foreign = h
+        .task("f-1", r#"containers: [{ name: app, image: "amd:1" }]"#)
+        .await;
+    let status = h.wait_state(&foreign, TaskState::Rejected).await;
+    assert!(
+        status.message.contains("no image for"),
+        "{}",
+        status.message
+    );
+    assert!(status.wrong_platform.is_some());
 
     h.rt.add_image("web:1");
     h.rt.set_init_exit_code(2);

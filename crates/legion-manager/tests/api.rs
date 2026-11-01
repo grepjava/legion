@@ -993,6 +993,15 @@ async fn a_removed_worker_stays_out_until_it_joins_again() {
         .unwrap_err();
     assert_eq!(stale.code(), Code::Aborted, "{stale}");
     heartbeat(old.clone()).await.unwrap();
+    // A stream open before the removal ends with it.
+    let mut open = old
+        .clone()
+        .endpoints(EndpointsRequest {
+            node: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
     admin
         .delete(DeleteRequest {
             r#ref: w1(),
@@ -1005,6 +1014,17 @@ async fn a_removed_worker_stays_out_until_it_joins_again() {
         Err(e) => panic!("{e}"),
         Ok(_) => panic!("allowed"),
     };
+    let ended = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match open.message().await {
+                Ok(Some(_)) => continue,
+                other => return other,
+            }
+        }
+    })
+    .await
+    .expect("the stream ends");
+    assert_eq!(ended.unwrap_err().code(), Code::PermissionDenied);
     let why = refused(heartbeat(old.clone()).await.map(|_| ()));
     assert!(why.contains("node w1 was removed"), "{why}");
     let (_, csr_pem) = legion_pki::request().unwrap();

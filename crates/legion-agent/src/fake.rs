@@ -41,6 +41,8 @@ struct State {
     images: BTreeSet<String>,
     /// Pulls of these fail.
     unpullable: BTreeSet<String>,
+    /// Images for another platform than this node's.
+    foreign: BTreeSet<String>,
     /// Images pulled only with this account (username, password), and who
     /// pulled them.
     private: BTreeMap<String, ((String, String), BTreeSet<String>)>,
@@ -188,6 +190,11 @@ impl FakeRuntime {
 
     pub fn fail_pulls_of(&self, reference: &str) {
         self.state().unpullable.insert(reference.to_owned());
+    }
+
+    /// Pulls of `reference` find nothing for this node's platform.
+    pub fn foreign_image(&self, reference: &str) {
+        self.state().foreign.insert(reference.to_owned());
     }
 
     pub fn ignore_vnet(&self) {
@@ -404,6 +411,12 @@ impl Runtime for FakeRuntime {
         };
         if s.unpullable.contains(reference) {
             return Err(denied());
+        }
+        if s.foreign.contains(reference) {
+            return Err(Error::Platform {
+                image: reference.to_owned(),
+                message: "no image for freebsd/arm64 (offered: freebsd/amd64)".into(),
+            });
         }
         if let Some(((username, password), users)) = s.private.get_mut(reference) {
             if !logins

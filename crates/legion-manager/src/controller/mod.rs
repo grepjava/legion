@@ -147,7 +147,11 @@ fn read(store: &Store) -> Result<State, legion_store::Error> {
         .into_iter()
         .filter_map(|o| {
             let spec = parsed(&o)?;
-            Some(Service { object: o, spec })
+            Some(Service {
+                object: o,
+                spec,
+                refused: Default::default(),
+            })
         })
         .collect();
     let jobs = Jobs {

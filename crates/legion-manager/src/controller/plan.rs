@@ -55,6 +55,10 @@ impl Action {
 pub struct Service {
     pub object: Object,
     pub spec: ServiceSpec,
+    /// Platforms (`Platform::runs`) its tasks of its images were rejected
+    /// on, as the images offer nothing for them: kept off nodes of them.
+    /// Set by [`plan`].
+    pub refused: BTreeSet<(String, String, bool)>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +212,7 @@ pub fn plan(
     memory.began.get_or_insert(now);
     let (tasks, orphaned) = orphan(tasks, nodes, &mut plan);
     let tasks = tasks.as_slice();
+    let services: &[Service] = &refused(services, tasks);
     let first = plan.actions.len();
     let live: BTreeSet<&str> = tasks.iter().map(Task::uid).collect();
     memory
@@ -249,6 +254,7 @@ pub fn plan(
 
     // Jobs own tasks as services do; the scheduler sees them alike.
     let job_owners: Vec<Service> = jobs.jobs.iter().map(Job::owner).collect();
+    let job_owners = refused(&job_owners, tasks);
     for (j, owner) in jobs.jobs.iter().zip(&job_owners) {
         let mine: Vec<&Task> = tasks.iter().filter(|t| owner.owns(t)).collect();
         jobs::job(
@@ -287,6 +293,31 @@ pub fn plan(
     plan.actions
         .extend(later.into_iter().filter(|a| !orphaned.contains(&a.key())));
     plan
+}
+
+/// `services` with the platforms each one's images were found not to run
+/// on: tasks of its current images rejected so, on nodes of them as they
+/// were then (a node may run more since).
+fn refused(services: &[Service], tasks: &[Task]) -> Vec<Service> {
+    services
+        .iter()
+        .map(|s| {
+            let images = s.spec.pod.images();
+            let refused = tasks
+                .iter()
+                .filter(|t| s.owns(t) && t.spec.pod.images() == images)
+                .filter_map(|t| t.status.wrong_platform.as_ref())
+                .map(|p| {
+                    let (os, arch, linux) = p.runs();
+                    (os.to_owned(), arch.to_owned(), linux)
+                })
+                .collect();
+            Service {
+                refused,
+                ..s.clone()
+            }
+        })
+        .collect()
 }
 
 /// Tasks on a node that is down are lost: they are marked orphaned and told
@@ -1184,6 +1215,10 @@ fn eligible(
     }
     if n.status.platform.no_limits && s.spec.pod.limited() {
         return Err("no limits (kern.racct.enable)");
+    }
+    let (os, arch, linux) = n.status.platform.runs();
+    if s.refused.contains(&(os.to_owned(), arch.to_owned(), linux)) {
+        return Err("no image for its platform");
     }
     let namespace = &s.object.metadata.namespace;
     // A task starting now would hold the data where it no longer stays.

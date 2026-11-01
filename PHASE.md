@@ -1443,6 +1443,23 @@ real, in the order agreed with the user.
   ports or labels); a directory-mode layer cut short was taken as whole
   (made aside, renamed when done); request metrics leaked each answered
   call's `Open` through `mem::forget`.
+- **Open issues closed** (2026-11-01), for v0.1.9:
+  - The third review's fixes had three regressions, all fixed with tests:
+    recovery left a key in the clear when its sealed form was already in
+    place (the marker now names the form, and the other form goes for
+    every key); the reseal's `.next` files were the worker renewal's
+    (now `.reseal`); and a Job's endpoint entry took a same-named
+    Service's DNS name (DNS and balancing skip Jobs).
+  - A removed worker's open streams (assignments, endpoints, peers,
+    policies, routes, session offers) now check every 5 s and end.
+  - Mixed amd64/arm64 clusters: images report a wrong platform as such
+    (also a single-platform image of another architecture, not checked
+    before); the agent rejects the task with its platform, and the
+    scheduler keeps the owner's tasks of the same images off nodes of that
+    platform as it was then (a node given `--linux` since may try).
+  - jailer's report: a build step's working directory through a link
+    (FreeBSD's `/home`) was refused; it now resolves inside the root, as
+    the jail does. Mount targets stay strict.
 
 ### To do, in order
 

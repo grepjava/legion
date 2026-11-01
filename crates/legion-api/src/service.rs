@@ -220,6 +220,15 @@ fn default_stop_grace() -> Duration {
 }
 
 impl PodSpec {
+    /// The images its containers run, init containers first.
+    pub fn images(&self) -> Vec<&str> {
+        self.init_containers
+            .iter()
+            .chain(&self.containers)
+            .map(|c| c.image.as_str())
+            .collect()
+    }
+
     pub fn admit(&mut self, path: &str) -> Result<(), Invalid> {
         if self.containers.is_empty() {
             return Err(Invalid::new(

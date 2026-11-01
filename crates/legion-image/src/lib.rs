@@ -30,6 +30,10 @@ pub enum Error {
     },
     #[error("{0}")]
     Unsupported(String),
+    /// No image for this node's platform: one for another may run on
+    /// other nodes.
+    #[error("{0}")]
+    Platform(String),
     #[error("extracting a layer: {0}")]
     Extract(String),
     #[error(transparent)]

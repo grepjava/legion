@@ -140,9 +140,10 @@ VM a bridged network on the LAN of the other local nodes rather than the
 hypervisor's user-mode NAT. Managers must reach each other directly.
 
 amd64 and arm64 nodes may share a cluster. The manager does not read
-images, so a service whose image is published for one architecture only
-needs a constraint such as `node.platform.arch == amd64`, or a task placed
-on a node of the other fails to start.
+images: a task placed on a node whose architecture the image does not
+offer is rejected, and the service's tasks then stay off nodes of that
+architecture. A constraint such as `node.platform.arch == amd64` keeps
+them off from the start.
 
 Compose files deploy as stacks. Each stack gets a namespace of its name, in
 which services find each other by their compose names; what Legion cannot

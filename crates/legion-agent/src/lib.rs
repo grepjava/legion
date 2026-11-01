@@ -180,6 +180,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 guarding: Arc::new(policing::Guarding::new()),
                 memory: Arc::default(),
                 no_limits: false,
+                platform: Default::default(),
                 drain: config.drain,
             },
             resync: config.resync,
@@ -221,6 +222,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             );
         }
         status.platform.no_limits = ctx.no_limits;
+        ctx.platform = status.platform.clone();
         let modules = task::blocking(&ctx.sys, |sys| {
             MODULES
                 .iter()
@@ -517,7 +519,7 @@ async fn dns(
     mut endpoints: watch::Receiver<Endpoints>,
     gateway: Ipv4Addr,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    use legion_net::dns::{self, ServiceAddrs, Zone};
+    use legion_net::dns::{self, Zone};
 
     let addr = SocketAddr::from((gateway, 53));
     let (udp, tcp) = match (
@@ -544,13 +546,7 @@ async fn dns(
     Some(tokio::spawn(async move {
         let follow = async move {
             while endpoints.changed().await.is_ok() {
-                let zone = Zone::new(endpoints.borrow_and_update().iter().map(|e| ServiceAddrs {
-                    namespace: e.namespace.clone(),
-                    name: e.name.clone(),
-                    vip: e.vip,
-                    tasks: e.ready.clone(),
-                    ordinals: e.ordinals.iter().map(|(n, ip)| (*n, *ip)).collect(),
-                }));
+                let zone = zone(&endpoints.borrow_and_update());
                 tx.send_replace(Arc::new(zone));
             }
         };
@@ -558,6 +554,19 @@ async fn dns(
             () = dns::serve(udp, tcp, rx, upstream) => {}
             () = follow => {}
         }
+    }))
+}
+
+/// The cluster's names: the Services'. Jobs' entries are for network
+/// policy only, and would take a Service's name from it.
+fn zone(endpoints: &Endpoints) -> legion_net::dns::Zone {
+    use legion_net::dns::{ServiceAddrs, Zone};
+    Zone::new(endpoints.iter().filter(|e| !e.job).map(|e| ServiceAddrs {
+        namespace: e.namespace.clone(),
+        name: e.name.clone(),
+        vip: e.vip,
+        tasks: e.ready.clone(),
+        ordinals: e.ordinals.iter().map(|(n, ip)| (*n, *ip)).collect(),
     }))
 }
 
@@ -725,6 +734,7 @@ async fn load_balancing(
         let services: Vec<Service> = endpoints
             .borrow_and_update()
             .iter()
+            .filter(|e| !e.job)
             .map(|e| Service {
                 uid: e.uid.clone(),
                 vip: e.vip,
@@ -1091,5 +1101,44 @@ async fn forward_events<R: Runtime, C>(ctx: Ctx<R, C>, tx: mpsc::Sender<Forwarde
         }
         first = false;
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    /// A Job named as a Service takes no name from it.
+    #[test]
+    fn jobs_have_no_names() {
+        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        let entry = |job: bool, vip: Option<Ipv4Addr>, addrs: &[&str]| ServiceEndpoints {
+            namespace: "shop".into(),
+            name: "web".into(),
+            uid: format!("{job}"),
+            labels: BTreeMap::new(),
+            vip,
+            ports: Vec::new(),
+            ready: if job {
+                Vec::new()
+            } else {
+                addrs.iter().map(|a| ip(a)).collect()
+            },
+            alive: addrs.iter().map(|a| ip(a)).collect(),
+            ordinals: BTreeMap::new(),
+            job,
+        };
+        let zone = zone(&vec![
+            entry(false, Some(ip("10.201.0.1")), &["10.200.0.2"]),
+            entry(true, None, &["10.200.0.9"]),
+        ]);
+        let found = |name: &str| match zone.lookup(name) {
+            legion_net::dns::Lookup::Found(a) => a.to_vec(),
+            _ => panic!("{name} not found"),
+        };
+        assert_eq!(found("web.shop.legion"), [ip("10.201.0.1")]);
+        assert_eq!(found("tasks.web.shop.legion"), [ip("10.200.0.2")]);
     }
 }

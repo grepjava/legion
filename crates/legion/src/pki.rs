@@ -34,8 +34,9 @@ const SEALABLE: [&str; 4] = ["ca.key", "node.key", "store.key", WIREGUARD_KEY];
 /// sealed them.
 const WIREGUARD_KEY: &str = "wireguard.key";
 
-/// Marks a reseal whose keys are all written aside (`<file>.next`): it is
-/// carried through, never undone. Without it, what is aside is dropped.
+/// Marks a reseal whose keys are all written aside (`<file>.reseal`), and
+/// says to which form, `sealed` or `plain`: it is carried through, never
+/// undone. Without it, what is aside is dropped.
 const RESEALING: &str = "reseal";
 
 impl Pki {
@@ -52,10 +53,11 @@ impl Pki {
         pki
     }
 
-    /// Where a key's new form is written aside during a reseal.
+    /// Where a key's new form is written aside during a reseal (not
+    /// `.next`, a worker's renewal's).
     fn next_path(path: &Path) -> PathBuf {
         let mut next = path.as_os_str().to_owned();
-        next.push(".next");
+        next.push(".reseal");
         PathBuf::from(next)
     }
 
@@ -65,25 +67,32 @@ impl Pki {
     }
 
     /// Carries a reseal through, if one was begun (each key's form aside
-    /// put in place, its other form dropped), or drops what an attempt
-    /// left aside.
+    /// put in place, its other form dropped, also for a key put in place
+    /// before the reseal was cut short), or drops what an attempt left
+    /// aside.
     pub fn settle(&self) -> anyhow::Result<()> {
-        let begun = self.resealing();
+        let sealing = read(&self.path(RESEALING))?.map(|to| to.trim() == "sealed");
         for f in SEALABLE {
-            for (to, other) in [
+            let forms = [
                 (self.sealed_path(f), self.path(f)),
                 (self.path(f), self.sealed_path(f)),
-            ] {
-                let next = Self::next_path(&to);
-                if !next.exists() {
-                    continue;
+            ];
+            match sealing {
+                Some(sealing) => {
+                    let (to, other) = &forms[usize::from(!sealing)];
+                    let next = Self::next_path(to);
+                    if next.exists() {
+                        std::fs::rename(&next, to)
+                            .with_context(|| format!("writing {}", to.display()))?;
+                    }
+                    if to.exists() {
+                        remove(other)?;
+                    }
                 }
-                if begun {
-                    std::fs::rename(&next, &to)
-                        .with_context(|| format!("writing {}", to.display()))?;
-                    remove(&other)?;
-                } else {
-                    remove(&next)?;
+                None => {
+                    for (to, _) in &forms {
+                        remove(&Self::next_path(to))?;
+                    }
                 }
             }
         }
@@ -180,7 +189,8 @@ impl Pki {
                     None => write_private(&Self::next_path(&self.path(f)), text)?,
                 }
             }
-            write(&self.path(RESEALING), "", 0o600)
+            let to = if lock.is_some() { "sealed" } else { "plain" };
+            write(&self.path(RESEALING), to, 0o600)
         };
         if let Err(e) = aside() {
             let _ = remove(&self.path(RESEALING));
@@ -702,6 +712,38 @@ mod tests {
         );
     }
 
+    /// Sealing cut short after a key was put in place, before its clear
+    /// form went: carried through, the clear form goes. A worker renewal's
+    /// own files are not the reseal's.
+    #[test]
+    fn a_seal_cut_short_leaves_no_key_in_the_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let pki = Pki::new(dir.path());
+        pki.store_key().unwrap();
+        pki.wireguard_key(dir.path(), || Ok("wg".to_owned()))
+            .unwrap();
+        let renewal = pki.path(NEXT_KEY);
+        write_private(&renewal, "renewed").unwrap();
+
+        let key = legion_store::StoreKey::generate();
+        for f in ["store.key", WIREGUARD_KEY] {
+            let text = pki.read_secret(f).unwrap().unwrap();
+            let bytes = legion_store::seal(&key, f, text.as_bytes()).unwrap();
+            write_bytes(&Pki::next_path(&pki.sealed_path(f)), &bytes, 0o600).unwrap();
+        }
+        write(&pki.path(RESEALING), "sealed", 0o600).unwrap();
+        let store = pki.sealed_path("store.key");
+        std::fs::rename(Pki::next_path(&store), &store).unwrap();
+
+        let reopened = Pki::new(dir.path());
+        for f in ["store.key", WIREGUARD_KEY] {
+            assert!(!reopened.path(f).exists(), "{f} in the clear");
+            assert!(reopened.sealed_path(f).exists(), "{f} sealed");
+        }
+        assert!(reopened.unlock(key).is_ok());
+        assert_eq!(std::fs::read_to_string(&renewal).unwrap(), "renewed");
+    }
+
     /// A new unlock key that fails to seal every key changes nothing, to
     /// try again; one cut short once all are written aside is carried
     /// through: the keys are never under two unlock keys.
@@ -733,7 +775,7 @@ mod tests {
             let bytes = legion_store::seal(&new, f, text.as_bytes()).unwrap();
             write_bytes(&Pki::next_path(&pki.sealed_path(f)), &bytes, 0o600).unwrap();
         }
-        write(&pki.path(RESEALING), "", 0o600).unwrap();
+        write(&pki.path(RESEALING), "sealed", 0o600).unwrap();
         let store = pki.sealed_path("store.key");
         std::fs::rename(Pki::next_path(&store), &store).unwrap();
         let reopened = Pki::new(dir.path());

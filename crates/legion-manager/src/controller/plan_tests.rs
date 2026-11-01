@@ -139,7 +139,11 @@ impl World {
                 o.metadata.uid = format!("{index:016x}");
                 o.metadata.version = index;
                 o.metadata.generation = 1;
-                self.services.push(Service { object: o, spec });
+                self.services.push(Service {
+                    object: o,
+                    spec,
+                    refused: Default::default(),
+                });
             }
         }
     }
@@ -2854,4 +2858,74 @@ fn a_new_volume_asked_to_be_on_a_node_takes_its_first_task_there() {
     w.settle();
     assert_eq!(w.placed("db"), ["n2"]);
     assert_eq!(w.volume_node("pgdata"), "n2", "bound by its first task");
+}
+
+/// A task rejected because its image offers nothing for its node's
+/// platform keeps the service's tasks off nodes of that platform, until
+/// the service runs other images.
+#[test]
+fn images_for_another_platform_stay_off_its_nodes() {
+    let mut w = World::new();
+    for (name, arch) in [("amd", "amd64"), ("arm", "arm64")] {
+        w.node(name, &[]);
+        w.node_mut(name).status.platform.os = "freebsd".into();
+        w.node_mut(name).status.platform.arch = arch.into();
+    }
+    w.service("web", &web("web:1", ""));
+    w.settle();
+    assert_eq!(w.placed("web"), ["amd", "arm"]);
+
+    let on_arm = w
+        .tasks
+        .iter()
+        .find(|t| t.spec.node == "arm")
+        .map(|t| t.object.metadata.name.clone())
+        .unwrap();
+    let version = w.next();
+    let t = w
+        .tasks
+        .iter_mut()
+        .find(|t| t.object.metadata.name == on_arm)
+        .unwrap();
+    t.status = TaskStatus {
+        state: TaskState::Rejected,
+        message: "pulling web:1: no image for freebsd/arm64".into(),
+        wrong_platform: Some(legion_api::node::Platform {
+            os: "freebsd".into(),
+            arch: "arm64".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    t.object.status = serde_json::to_value(&t.status).unwrap();
+    t.object.metadata.version = version;
+    w.settle();
+    w.now += Duration::from_secs(10);
+    w.settle();
+    assert_eq!(w.placed("web"), ["amd", "amd"]);
+    let scaled = |n: u32| web("web:1", "").replace("replicas: 2", &format!("replicas: {n}"));
+    w.service("web", &scaled(3));
+    w.settle();
+    assert_eq!(w.placed("web"), ["amd", "amd", "amd"]);
+    // The platform as it was: a node that runs Linux images now may try.
+    w.node_mut("arm").status.platform.linux = true;
+    w.service("web", &scaled(4));
+    w.settle();
+    assert_eq!(w.placed("web"), ["amd", "amd", "amd", "arm"]);
+    w.node_mut("arm").status.platform.linux = false;
+    w.service("web", &web("web:1", ""));
+    w.settle();
+
+    // Other images may run there.
+    w.service("web", &web("web:2", ""));
+    w.now += Duration::from_secs(60);
+    w.settle();
+    w.now += Duration::from_secs(60);
+    w.settle();
+    assert_eq!(w.images("web"), ["web:2", "web:2"]);
+    assert!(
+        w.placed("web").contains(&"arm".to_owned()),
+        "{:?}",
+        w.placed("web")
+    );
 }

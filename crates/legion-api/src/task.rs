@@ -191,4 +191,8 @@ pub struct TaskStatus {
     pub restarts: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    /// Rejected as its images offer nothing for the node's platform, as it
+    /// was then: the scheduler keeps the owner's tasks off nodes of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrong_platform: Option<crate::node::Platform>,
 }

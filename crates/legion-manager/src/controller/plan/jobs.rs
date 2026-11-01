@@ -80,6 +80,7 @@ impl Job {
                 update: Default::default(),
                 max_unavailable: None,
             },
+            refused: Default::default(),
         }
     }
 }

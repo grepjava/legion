@@ -152,7 +152,7 @@ pub fn select_for_arch<'a>(
                 .map(|p| format!("{}/{}", p.os, p.architecture))
                 .collect();
             let wanted: Vec<String> = oses.iter().map(|os| format!("{os}/{arch}")).collect();
-            Error::Unsupported(format!(
+            Error::Platform(format!(
                 "no image for {} (offered: {})",
                 wanted.join(" or "),
                 if offered.is_empty() {

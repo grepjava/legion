@@ -230,7 +230,9 @@ impl JailRuntime {
         } else {
             step.work_dir
         };
-        target(step.root, work_dir, false)?;
+        // As the jail will see it: links resolve inside the root (FreeBSD's
+        // /home is one), and what is missing is made.
+        work_dir_in(step.root, work_dir)?;
         undo.resolver = (step.network == StepNetwork::Host)
             .then(|| Resolver::lend(step.root))
             .transpose()?
@@ -497,6 +499,69 @@ impl Drop for Resolver {
     }
 }
 
+/// A step's working directory `dir` under `root`, resolved as a process
+/// in the jail would: links are followed inside the root (an absolute one
+/// starts again from it, `..` stops at it); directories missing are made.
+fn work_dir_in(root: &Path, dir: &str) -> Result<PathBuf> {
+    // Hops through links before giving up, as the kernel does.
+    const MAX_LINKS: usize = 40;
+    let mut rest: Vec<OsString> = Vec::new();
+    let mut push = |rest: &mut Vec<OsString>, p: &Path| {
+        // Kept reversed: the next component is last.
+        let mut parts: Vec<OsString> = p
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(n) => Some(n.to_owned()),
+                Component::ParentDir => Some(OsString::from("..")),
+                _ => None,
+            })
+            .collect();
+        parts.reverse();
+        rest.extend(parts);
+    };
+    push(&mut rest, Path::new(dir));
+    let mut at: Vec<OsString> = Vec::new();
+    let mut links = 0;
+    while let Some(name) = rest.pop() {
+        if name == ".." {
+            at.pop();
+            continue;
+        }
+        let path: PathBuf = std::iter::once(root.as_os_str().to_owned())
+            .chain(at.iter().cloned())
+            .chain([name.clone()])
+            .collect();
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_symlink() => {
+                links += 1;
+                if links > MAX_LINKS {
+                    return Err(api(400, format!("working directory {dir}: too many links")));
+                }
+                let to = std::fs::read_link(&path).map_err(internal)?;
+                if to.is_absolute() {
+                    at.clear();
+                }
+                push(&mut rest, &to);
+            }
+            Ok(m) if m.is_dir() => at.push(name),
+            Ok(_) => {
+                return Err(api(
+                    400,
+                    format!("working directory {dir} is not a directory"),
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&path).map_err(internal)?;
+                at.push(name);
+            }
+            Err(e) => return Err(internal(e)),
+        }
+    }
+    Ok(std::iter::once(root.as_os_str().to_owned())
+        .chain(at)
+        .collect())
+}
+
 /// Whether `path`, under `root`, is a file reached through no link.
 fn unlinked(root: &Path, path: &Path) -> bool {
     let Ok(rest) = path.strip_prefix(root) else {
@@ -518,6 +583,31 @@ fn unlinked(root: &Path, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A step's working directory through a link (FreeBSD's /home) is
+    /// where the jail will find it, links resolved inside the root.
+    #[cfg(unix)]
+    #[test]
+    fn working_directories_follow_links_inside_the_root() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        std::fs::create_dir_all(root.join("usr/home")).unwrap();
+        std::os::unix::fs::symlink("usr/home", root.join("home")).unwrap();
+        std::os::unix::fs::symlink("/usr/home", root.join("abs")).unwrap();
+        std::os::unix::fs::symlink("../../..", root.join("usr/home/up")).unwrap();
+        std::os::unix::fs::symlink("loop", root.join("loop")).unwrap();
+
+        let made = work_dir_in(root, "/home/app").unwrap();
+        assert_eq!(made, root.join("usr/home/app"));
+        assert!(made.is_dir());
+        assert_eq!(work_dir_in(root, "/abs/app").unwrap(), made);
+        // `..` stops at the root, through links too.
+        assert_eq!(work_dir_in(root, "/../home/app").unwrap(), made);
+        assert_eq!(work_dir_in(root, "/home/up/etc").unwrap(), root.join("etc"));
+        assert!(work_dir_in(root, "/loop").is_err());
+        std::fs::write(root.join("file"), "").unwrap();
+        assert!(work_dir_in(root, "/file").is_err());
+    }
 
     #[test]
     fn a_step_jail_is_a_member_that_may_change_flags() {

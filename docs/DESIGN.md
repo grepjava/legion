@@ -255,11 +255,15 @@ Filter, then score, per task:
 1. **Filters**: node is `ready` and `active` (not drained or paused); platform
    constraints hold (`node.platform.arch`, `node.platform.linux == true` for
    Linux images: the manager does not read images, 6.6). For the same
-   reason it does not know an image's architectures: in a cluster of amd64
-   and arm64 nodes, a service whose image is published for one of them
-   needs `node.platform.arch == amd64` (or `arm64`), or a task placed on
-   the other fails to start. Reading the image's platforms at admission and
-   filtering on them is planned;
+   reason it learns an image's architectures from the nodes: a task whose
+   image offers nothing for its node's platform (OS, architecture, Linux
+   ABI) is rejected with that platform, as it was then, in
+   `wrongPlatform`, and the owner's tasks of the same images stay off
+   nodes of it (`no image for its platform`) while such a task is in its
+   history; a node that runs more since (`--linux`) may try again. In a cluster of amd64
+   and arm64 nodes a service published for one learns this from one
+   rejected task; `node.platform.arch == amd64` (or `arm64`) avoids even
+   that one;
    resource **requests** fit in allocatable capacity; constraints match node
    labels; the task tolerates every taint on the node; required anti-affinity
    holds; host-mode published ports are free; stateful tasks go to the node
@@ -813,7 +817,7 @@ over TCP.
   non-default isolations and every policy to the agents (`Policies`), and
   the endpoints now carry each service's labels, and each Job's running
   tasks (no VIP, ports or labels: its namespace's tasks, for isolation and
-  peers naming no labels, balanced to by nothing). On each pod's host end
+  peers naming no labels; no names, balanced to by nothing). On each pod's host end
   the agent allows in: the nodes (this gateway and the mesh range: probes,
   other hosts, published ports reached through another node), traffic a
   published port's or VIP's `rdr` translated here (`tagged LSVC`), and a
@@ -1513,7 +1517,7 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
   dispatcher call, renewals included, refuses a worker certificate of
   that node issued before then. Joining again with a token gives a new
   certificate, issued after, which is let in. Streams the worker opened
-  before its removal run until they reconnect. Managers are removed from
+  before its removal check every 5 s and end with the refusal. Managers are removed from
   the Raft membership instead, and users by their RoleBindings.
 - **Join tokens**: `LGN-1-<ca-digest>-<secret>`, with separate tokens for workers and
   managers, and rotation on demand. The digest lets a joining node verify the
@@ -1559,10 +1563,11 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
   ChaCha20-Poly1305,
   bound to the file's name), and removes them in the clear; it rechecks
   every 5 s, so a rotation reseals and `disable` writes them in the clear
-  again. A reseal writes every key's new form aside (`<file>.next`) first,
+  again. A reseal writes every key's new form aside (`<file>.reseal`) first,
   failing with nothing changed (and tried again); then a marker
-  (`pki/reseal`) and the renames, which a restart, or the next check,
-  carries through: the keys are never sealed under two unlock keys. A manager that starts with sealed keys serves only `Unlock`, in
+  (`pki/reseal`, naming the form) and the renames and removals, which a
+  restart, or the next check, carries through: the keys are never sealed
+  under two unlock keys, nor left in the clear beside their sealed form. A manager that starts with sealed keys serves only `Unlock`, in
   the clear and to its own host (loopback) only, as it has no
   credentials yet; `legion unlock` (the key on stdin or `--key-file`)
   gives it the key, which must open its sealed keys, and it starts as

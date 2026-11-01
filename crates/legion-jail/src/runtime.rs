@@ -1029,9 +1029,15 @@ impl legion_runtime::Runtime for JailRuntime {
         mark_used(&mut *self.used.lock().await, reference);
         let pulled = self.images.pull(reference, creds.as_ref(), user).await;
         mark_used(&mut *self.used.lock().await, reference);
-        pulled.map(drop).map_err(|e| Error::Pull {
-            image: reference.to_owned(),
-            message: e.to_string(),
+        pulled.map(drop).map_err(|e| match e {
+            legion_image::Error::Platform(message) => Error::Platform {
+                image: reference.to_owned(),
+                message,
+            },
+            e => Error::Pull {
+                image: reference.to_owned(),
+                message: e.to_string(),
+            },
         })
     }
 

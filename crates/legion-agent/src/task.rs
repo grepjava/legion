@@ -66,6 +66,8 @@ pub(crate) struct Ctx<R, C> {
     pub memory: Arc<crate::memory::Limits>,
     /// rctl cannot hold limits here (`kern.racct.enable` is not 1).
     pub no_limits: bool,
+    /// What the node registers as its platform, for tasks rejected for it.
+    pub platform: legion_api::node::Platform,
     /// How long a ready task told to stop keeps running first.
     pub drain: std::time::Duration,
 }
@@ -102,6 +104,7 @@ impl<R, C> Clone for Ctx<R, C> {
             guarding: self.guarding.clone(),
             memory: self.memory.clone(),
             no_limits: self.no_limits,
+            platform: self.platform.clone(),
             drain: self.drain,
         }
     }
@@ -165,6 +168,8 @@ enum Abort {
     Failed(String),
     /// The node cannot run the task at all.
     Rejected(String),
+    /// Nor can any of its platform: the images offer none for it.
+    WrongPlatform(String),
     /// Stopped while starting.
     Stopped,
 }
@@ -229,6 +234,11 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 }
                 Err(Abort::Rejected(why)) => {
                     teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
+                    return self.finish(TaskState::Rejected, why, None).await;
+                }
+                Err(Abort::WrongPlatform(why)) => {
+                    teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
+                    self.status.wrong_platform = Some(self.ctx.platform.clone());
                     return self.finish(TaskState::Rejected, why, None).await;
                 }
             },
@@ -346,7 +356,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                             refused: None,
                         });
                     }
-                    Err(Abort::Failed(why) | Abort::Rejected(why)) => {
+                    Err(Abort::Failed(why) | Abort::Rejected(why) | Abort::WrongPlatform(why)) => {
                         tracing::warn!("adopting the pod's network: {why}");
                     }
                     Err(Abort::Stopped) => {}
@@ -384,7 +394,12 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 tracing::info!(%image, "pulling");
                 rt.pull(image, &namespace, logins.as_deref().unwrap_or_default())
                     .await
-                    .map_err(|e| Abort::Failed(format!("pulling {image}: {e}")))?;
+                    .map_err(|e| match e {
+                        legion_runtime::Error::Platform { .. } => {
+                            Abort::WrongPlatform(e.to_string())
+                        }
+                        e => Abort::Failed(format!("pulling {image}: {e}")),
+                    })?;
             }
             if self.stop_requested() {
                 return Err(Abort::Stopped);

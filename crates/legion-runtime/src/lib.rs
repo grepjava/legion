@@ -88,6 +88,10 @@ pub enum Error {
     Failed(String),
     #[error("pulling {image}: {message}")]
     Pull { image: String, message: String },
+    /// The image offers nothing for this node's platform (OS and
+    /// architecture); nodes of another may run it.
+    #[error("pulling {image}: {message}")]
+    Platform { image: String, message: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

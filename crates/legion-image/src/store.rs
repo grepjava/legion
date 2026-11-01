@@ -637,12 +637,19 @@ impl Store {
         let config_bytes = std::fs::read(&config_path)?;
         let config: ImageConfig = serde_json::from_slice(&config_bytes)
             .map_err(|e| Error::Unsupported(format!("the image config: {e}")))?;
-        if !config.os.is_empty() && !self.oses.contains(&config.os.as_str()) {
-            return Err(Error::Unsupported(format!(
+        let arch = oci::arch();
+        if (!config.os.is_empty() && !self.oses.contains(&config.os.as_str()))
+            || (!config.architecture.is_empty() && config.architecture != arch)
+        {
+            return Err(Error::Platform(format!(
                 "{r} is an image for {}/{}; this node runs {} images",
                 config.os,
                 config.architecture,
-                self.oses.join(" and ")
+                self.oses
+                    .iter()
+                    .map(|os| format!("{os}/{arch}"))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
             )));
         }
         if config.rootfs.diff_ids.len() != manifest.layers.len() {

@@ -12,7 +12,9 @@
 //! secrets and configs and claims the volumes its tasks use.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
 use std::net::Ipv4Addr;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -134,6 +136,27 @@ impl DispatcherService {
             crate::removed::check(self.store(), &id.name, issued)?;
         }
         Ok(caller)
+    }
+
+    /// Resolves once the calling worker's node is removed, for its streams
+    /// to end: never for other callers.
+    fn removal<T>(&self, req: &Request<T>) -> Result<Removal, Status> {
+        let worker = crate::tls::caller(req, self.tls)?
+            .filter(|id| id.role == Role::Worker)
+            .map(|id| id.name);
+        let issued = crate::tls::caller_issued(req, self.tls)?;
+        let store = self.store().clone();
+        Ok(Box::pin(async move {
+            let (Some(node), Some(issued)) = (worker, issued) else {
+                return std::future::pending().await;
+            };
+            loop {
+                tokio::time::sleep(REVOCATION_CHECK).await;
+                if let Err(e) = crate::removed::check(&store, &node, issued) {
+                    return e;
+                }
+            }
+        }))
     }
 
     fn node<T>(&self, req: &Request<T>, named: &str) -> Result<String, Status> {
@@ -584,6 +607,7 @@ impl Dispatcher for DispatcherService {
         req: Request<AssignmentsRequest>,
     ) -> Result<Response<Self::AssignmentsStream>, Status> {
         let node = self.node(&req, &req.get_ref().node)?;
+        let removal = self.removal(&req)?;
         let (tx, rx) = watch::channel(None);
         tokio::spawn(follow_assignments(
             self.store().clone(),
@@ -591,12 +615,17 @@ impl Dispatcher for DispatcherService {
             tx,
             self.api.closing.clone(),
         ));
-        Ok(Response::new(stream(&self.api.closing, rx, |set| {
-            let list: Vec<&Assignment> = set.values().collect();
-            AssignmentsUpdate {
-                assignments_json: serde_json::to_vec(&list).expect("assignments serialize"),
-            }
-        })))
+        Ok(Response::new(stream(
+            &self.api.closing,
+            removal,
+            rx,
+            |set| {
+                let list: Vec<&Assignment> = set.values().collect();
+                AssignmentsUpdate {
+                    assignments_json: serde_json::to_vec(&list).expect("assignments serialize"),
+                }
+            },
+        )))
     }
 
     type EndpointsStream = ReceiverStream<Result<EndpointsUpdate, Status>>;
@@ -606,14 +635,18 @@ impl Dispatcher for DispatcherService {
         req: Request<EndpointsRequest>,
     ) -> Result<Response<Self::EndpointsStream>, Status> {
         self.node(&req, &req.get_ref().node)?;
+        let removal = self.removal(&req)?;
         let mut rx = self.endpoints.clone();
         // The current set first, if there is one.
         rx.mark_changed();
-        Ok(Response::new(stream(&self.api.closing, rx, |set| {
-            EndpointsUpdate {
+        Ok(Response::new(stream(
+            &self.api.closing,
+            removal,
+            rx,
+            |set| EndpointsUpdate {
                 endpoints_json: serde_json::to_vec(set).expect("endpoints serialize"),
-            }
-        })))
+            },
+        )))
     }
 
     type PeersStream = ReceiverStream<Result<PeersUpdate, Status>>;
@@ -623,13 +656,17 @@ impl Dispatcher for DispatcherService {
         req: Request<PeersRequest>,
     ) -> Result<Response<Self::PeersStream>, Status> {
         self.node(&req, &req.get_ref().node)?;
+        let removal = self.removal(&req)?;
         let mut rx = self.peers.clone();
         rx.mark_changed();
-        Ok(Response::new(stream(&self.api.closing, rx, |set| {
-            PeersUpdate {
+        Ok(Response::new(stream(
+            &self.api.closing,
+            removal,
+            rx,
+            |set| PeersUpdate {
                 peers_json: serde_json::to_vec(set).expect("peers serialize"),
-            }
-        })))
+            },
+        )))
     }
 
     type PoliciesStream = ReceiverStream<Result<PoliciesUpdate, Status>>;
@@ -639,13 +676,17 @@ impl Dispatcher for DispatcherService {
         req: Request<PoliciesRequest>,
     ) -> Result<Response<Self::PoliciesStream>, Status> {
         self.node(&req, &req.get_ref().node)?;
+        let removal = self.removal(&req)?;
         let mut rx = self.policies.clone();
         rx.mark_changed();
-        Ok(Response::new(stream(&self.api.closing, rx, |set| {
-            PoliciesUpdate {
+        Ok(Response::new(stream(
+            &self.api.closing,
+            removal,
+            rx,
+            |set| PoliciesUpdate {
                 policies_json: serde_json::to_vec(set).expect("policies serialize"),
-            }
-        })))
+            },
+        )))
     }
 
     type RoutesStream = ReceiverStream<Result<RoutesUpdate, Status>>;
@@ -655,13 +696,17 @@ impl Dispatcher for DispatcherService {
         req: Request<RoutesRequest>,
     ) -> Result<Response<Self::RoutesStream>, Status> {
         self.node(&req, &req.get_ref().node)?;
+        let removal = self.removal(&req)?;
         let mut rx = self.routes.clone();
         rx.mark_changed();
-        Ok(Response::new(stream(&self.api.closing, rx, |set| {
-            RoutesUpdate {
+        Ok(Response::new(stream(
+            &self.api.closing,
+            removal,
+            rx,
+            |set| RoutesUpdate {
                 routes_json: serde_json::to_vec(set).expect("routes serialize"),
-            }
-        })))
+            },
+        )))
     }
 
     async fn report(
@@ -780,12 +825,13 @@ impl Dispatcher for DispatcherService {
     ) -> Result<Response<Self::SessionsStream>, Status> {
         use tokio_stream::StreamExt;
         let node = self.node(&req, &req.get_ref().node)?;
+        let mut removal = self.removal(&req)?;
         let mut offers = self.api.sessions.follow(&node);
         // Relayed so the stream ends when the manager shuts down.
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let mut closing = self.api.closing.clone();
         tokio::spawn(async move {
-            loop {
+            let end = loop {
                 tokio::select! {
                     offer = offers.next() => match offer {
                         Some(o) => if tx.send(o).await.is_err() {
@@ -794,12 +840,13 @@ impl Dispatcher for DispatcherService {
                         None => return,
                     },
                     _ = tx.closed() => return,
-                    () = crate::session::shutdown(&mut closing) => break,
+                    e = &mut removal => break e,
+                    () = crate::session::shutdown(&mut closing) => {
+                        break Status::unavailable("manager shutting down");
+                    }
                 }
-            }
-            let _ = tx
-                .send(Err(Status::unavailable("manager shutting down")))
-                .await;
+            };
+            let _ = tx.send(Err(end)).await;
         });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
@@ -836,11 +883,18 @@ impl Dispatcher for DispatcherService {
     }
 }
 
+/// How often a worker's streams check that its node was not removed.
+const REVOCATION_CHECK: Duration = Duration::from_secs(5);
+
+/// Resolves, with the refusal, when the caller's node is removed.
+type Removal = Pin<Box<dyn Future<Output = Status> + Send>>;
+
 /// A response stream with `item` of each new value of `rx`, once it has
-/// one, until its sender is gone, the client goes away or the manager shuts
-/// down.
+/// one, until its sender is gone, the client goes away, the manager shuts
+/// down or the caller's node is removed.
 fn stream<S, T>(
     closing: &watch::Receiver<bool>,
+    mut removal: Removal,
     mut rx: watch::Receiver<Option<S>>,
     item: impl Fn(&S) -> T + Send + 'static,
 ) -> ReceiverStream<Result<T, Status>>
@@ -852,13 +906,16 @@ where
     let (tx, out) = tokio::sync::mpsc::channel(1);
     let mut closing = closing.clone();
     tokio::spawn(async move {
-        loop {
+        let end = loop {
             tokio::select! {
                 changed = rx.changed() => if changed.is_err() {
                     return;
                 },
                 _ = tx.closed() => return,
-                _ = closing.wait_for(|c| *c) => break,
+                e = &mut removal => break e,
+                _ = closing.wait_for(|c| *c) => {
+                    break Status::unavailable("manager shutting down");
+                }
             }
             let next = rx.borrow_and_update().as_ref().map(&item);
             if let Some(next) = next
@@ -866,10 +923,8 @@ where
             {
                 return;
             }
-        }
-        let _ = tx
-            .send(Err(Status::unavailable("manager shutting down")))
-            .await;
+        };
+        let _ = tx.send(Err(end)).await;
     });
     ReceiverStream::new(out)
 }
