@@ -158,6 +158,9 @@ pub struct Memory {
     pub usage: BTreeMap<String, (String, legion_api::dispatch::TaskUsage)>,
     /// The autoscaler's recent recommendations, by service uid.
     pub recommended: BTreeMap<String, Vec<(Instant, u32)>>,
+    /// This leader's first pass: tasks failed by then were judged by the
+    /// leader before, which knew how long they ran.
+    pub began: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -202,6 +205,7 @@ pub fn plan(
     now: Instant,
 ) -> Plan {
     let mut plan = Plan::default();
+    memory.began.get_or_insert(now);
     let (tasks, orphaned) = orphan(tasks, nodes, &mut plan);
     let tasks = tasks.as_slice();
     let first = plan.actions.len();
@@ -965,6 +969,8 @@ fn track_update(
                 memory.failed_at.get(t.uid()),
             ) {
                 (Some(ran), Some(failed)) => *failed < *ran + monitor,
+                // Failed before this leader's time: not news.
+                (None, Some(failed)) => memory.began.is_none_or(|b| *failed > b),
                 _ => true,
             }
     });
@@ -1038,6 +1044,22 @@ fn slot_of(t: &Task) -> Slot {
 /// A new task for `slot`, named `<service>-<slot>-<n>` with `n` counting up
 /// within the slot, past every task it has had (`last`, from the service's
 /// status, remembers deleted ones).
+/// `<service>-<slot>-<n>`. Past the 63 bytes a name may have, the front
+/// is cut and a hash of what was cut off keeps it apart from other
+/// services' and slots' (long names once took each other's).
+fn task_name(svc: &str, slot: &str, n: u64) -> String {
+    let base = format!("{svc}-{slot}");
+    let suffix = format!("-{n}");
+    if base.len() + suffix.len() <= 63 {
+        return format!("{base}{suffix}");
+    }
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(base.as_bytes());
+    let hash: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+    let keep = 63 - suffix.len() - hash.len() - 1;
+    format!("{}-{hash}{suffix}", base[..keep].trim_end_matches('-'))
+}
+
 fn new_task(s: &Service, slot: &Slot, history: &[&Task], last: &BTreeMap<String, u64>) -> Task {
     let svc = &s.object.metadata.name;
     let n = history
@@ -1051,9 +1073,7 @@ fn new_task(s: &Service, slot: &Slot, history: &[&Task], last: &BTreeMap<String,
         Slot::Replica(r) => (r.to_string(), Some(*r), String::new()),
         Slot::Node(node) => (node.clone(), None, node.clone()),
     };
-    let suffix = format!("-{slot_part}-{n}");
-    let keep = 63usize.saturating_sub(suffix.len()).min(svc.len());
-    let name = format!("{}{suffix}", svc[..keep].trim_end_matches('-'));
+    let name = task_name(svc, &slot_part, n);
     let spec = TaskSpec {
         service: svc.clone(),
         service_uid: s.object.metadata.uid.clone(),
@@ -1400,6 +1420,26 @@ fn schedule(
                     .push(Action::Update(o, orig.object.metadata.version));
             }
             Some(_) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_task_names_stay_apart() {
+        assert_eq!(task_name("web", "2", 7), "web-2-7");
+        let long = |end: &str| format!("{}{end}", "s".repeat(58));
+        let (a, b) = (task_name(&long("a"), "1", 1), task_name(&long("b"), "1", 1));
+        assert_ne!(a, b);
+        // A node's name as the slot, as global services have.
+        let node = "n".repeat(63);
+        let c = task_name("web", &node, 12);
+        for name in [&a, &b, &c] {
+            legion_api::validate_name(name).unwrap();
+            assert_eq!(task_number(name), Some(if *name == c { 12 } else { 1 }));
         }
     }
 }

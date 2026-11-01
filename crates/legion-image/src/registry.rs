@@ -55,6 +55,8 @@ impl Client {
         let http = reqwest::Client::builder()
             .user_agent(concat!("legion/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(std::time::Duration::from_secs(30))
+            // A registry gone quiet, mid-answer.
+            .read_timeout(std::time::Duration::from_secs(120))
             .build()
             .map_err(|e| Error::Registry(format!("making the HTTP client: {e}")))?;
         Ok(Client {
@@ -384,6 +386,14 @@ impl Client {
                 "{r}: auth challenge without realm: {challenge}"
             )));
         };
+        // The login goes to the realm: in the clear only to a registry
+        // spoken to in the clear.
+        let realm_plain = realm.starts_with("http://") && self.plain.contains(&r.registry);
+        if !realm.starts_with("https://") && !realm_plain {
+            return Err(Error::Registry(format!(
+                "{r}: the registry sends logins to {realm}, which is not https"
+            )));
+        }
         let default_scope = if push {
             format!("repository:{}:pull,push", r.repository)
         } else {
@@ -478,8 +488,14 @@ impl Client {
         };
         let manifest = doc.into_manifest()?;
         let tmp = tempfile::NamedTempFile::new()?;
-        self.blob(r, &manifest.config.digest, tmp.path(), creds)
-            .await?;
+        self.blob(
+            r,
+            &manifest.config.digest,
+            manifest.config.size,
+            tmp.path(),
+            creds,
+        )
+        .await?;
         let config: ImageConfig = serde_json::from_slice(&std::fs::read(tmp.path())?)
             .map_err(|e| Error::Unsupported(format!("{r}: the image config: {e}")))?;
         Ok(vec![Descriptor {
@@ -500,17 +516,26 @@ impl Client {
         target: &str,
         creds: Option<&Credentials>,
     ) -> Result<(String, Vec<u8>), Error> {
-        let bytes = self
+        let resp = self
             .get(
                 r,
                 &format!("manifests/{target}"),
                 &oci::MANIFEST_TYPES,
                 creds,
             )
-            .await?
-            .bytes()
-            .await
-            .map_err(|e| Error::Registry(format!("{r}: {e}")))?;
+            .await?;
+        let mut bytes = Vec::new();
+        let mut body = resp.bytes_stream();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|e| Error::Registry(format!("{r}: {e}")))?;
+            if bytes.len() + chunk.len() > MAX_MANIFEST {
+                return Err(Error::Registry(format!(
+                    "{r}: a manifest over {} MiB",
+                    MAX_MANIFEST >> 20
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
         let digest = sha256(&bytes);
         if target.starts_with("sha256:") && digest != target {
             return Err(Error::Digest {
@@ -519,14 +544,16 @@ impl Client {
                 got: digest,
             });
         }
-        Ok((digest, bytes.to_vec()))
+        Ok((digest, bytes))
     }
 
-    /// Writes the blob `digest` to `dest`, checking it.
+    /// Writes the blob `digest` to `dest`, checking it. A blob longer than
+    /// `size`, its descriptor's, is cut off (0: not known).
     pub async fn blob(
         &self,
         r: &Reference,
         digest: &str,
+        size: u64,
         dest: &Path,
         creds: Option<&Credentials>,
     ) -> Result<(), Error> {
@@ -534,8 +561,15 @@ impl Client {
         let mut file = tokio::fs::File::create(dest).await?;
         let mut hash = Sha256::new();
         let mut body = resp.bytes_stream();
+        let mut written = 0u64;
         while let Some(chunk) = body.next().await {
             let chunk = chunk.map_err(|e| Error::Registry(format!("{r}: {digest}: {e}")))?;
+            written += chunk.len() as u64;
+            if size > 0 && written > size {
+                return Err(Error::Registry(format!(
+                    "{r}: {digest}: longer than its {size} bytes"
+                )));
+            }
             hash.update(&chunk);
             file.write_all(&chunk).await?;
         }
@@ -551,6 +585,9 @@ impl Client {
         Ok(())
     }
 }
+
+/// The largest manifest or index taken, as most registries limit them.
+const MAX_MANIFEST: usize = 4 << 20;
 
 pub fn sha256(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))

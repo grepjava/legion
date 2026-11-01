@@ -6,11 +6,10 @@ stacks) and adds the Kubernetes capabilities that matter most in practice:
 pods, real probes, namespaces, stateful workloads, network policy. Workloads run
 as jails, from OCI images, which Legion pulls into ZFS and runs itself.
 
-Status: draft v0.4, 2026-10-26. All phase-0 spikes (S1–S6) have been run on
-FreeBSD 15.1; results are in section 10 and are reflected throughout. Phase 1
-has started: the workspace has `legion-api`, `legion-store`, `legion-proto`,
-`legion-manager` and the `legion` binary (sections 3.7 and 3.8). Other crates
-are added as their phase starts.
+Status: phases 1 to 5 are built (section 11), and Legion is released (v0.1.7,
+2026-11-01) and being hardened. The phase-0 spikes' results are in section 10.
+Sections marked "built" describe the code as it is; the rest is the plan it
+was built from, kept where it still explains a choice.
 
 ---
 
@@ -239,12 +238,12 @@ preconditions. Rules:
 
 | Component | Responsibility |
 |-----------|----------------|
-| **Session** | Connects to the leader, receives the assignment set, reports task state. Persists the last assignment set in a local `redb` so running tasks survive a manager outage and agent restarts. |
+| **Session** | Follows its assignments and the cluster's endpoints through any manager's dispatcher, failing over between managers, and reports task state. Nothing is persisted: running pods keep running through a manager outage on the last assignments received, and after an agent restart the runtime's pods are adopted again from their labels. |
 | **Executor** | Runs each task through the jail runtime (section 6): pulls images into ZFS, builds an infra jail plus child container jails on clones of their images, runs init containers in order, starts containers under their supervisors, reads their output and events. Every container carries `legion.task.id` and `legion.node.id` labels, so the agent can always reconcile the runtime's view against assignments. |
 | **Network** | Creates epairs, attaches them to the node bridge, moves the jail end into the pod's VNET, programs routes, WireGuard peers and pf anchors. See section 5. |
 | **Volumes** | Creates, mounts and snapshots ZFS datasets; mounts them into containers (nullfs). A ZFS `Volume` is `<pool>/legion/volumes/<ns>/<name>`, created on first use with its size as quota and bound to that node in its status. NFS, iSCSI and plugin volumes are mounted from elsewhere, and iSCSI and unshared plugin ones bound to a node only while it uses them (6.7). Pod `tmpfs` volumes live and die with the pod. |
 | **Secrets** | Writes secrets and configs to a per-task tmpfs (`<run dir>/tasks/<task uid>`) and bind-mounts each file read-only into the container that names it. Files never touch disk. Values used as environment variables are passed to the runtime, which keeps them in the container's record under the data directory; files are the safer form. Values are read when the pod starts. |
-| **Resources** | Applies rctl rules to **each container's own jail** (memory, CPU percentage, process and open-file limits) and `cpuset` pinning. Removes the rules when the task ends; rctl keys rules by jail name and keeps them after the jail is gone. Reads usage with `rctl -u` for metrics and autoscaling. See 6.3. |
+| **Resources** | Applies rctl rules to **each container's own jail** (memory, CPU percentage, process and open-file limits). Pinning to CPUs (`cpuset`) is not offered for pods yet. Removes the rules when the task ends; rctl keys rules by jail name and keeps them after the jail is gone. Reads usage with `rctl -u` for metrics and autoscaling. See 6.3. |
 | **Sessions** | Runs the `logs`, `exec` and `port-forward` sessions managers offer it: the container's log, an exec in its jail (stdin, a terminal and its size), or a TCP connection to the pod's address. See 3.8. |
 | **Probes** | Startup, liveness and readiness probes. TCP, HTTP and gRPC probes run from the host, which can reach every local pod IP on `legion0`; exec probes run in the container. One prober per running container reports only transitions to the task's worker: a failed startup or liveness probe stops the container and the restart policy decides what follows; readiness sets the Task's `ready`. HTTP passes on 2xx and 3xx; gRPC uses `grpc.health.v1.Health/Check`. |
 | **DNS** | Resolver on each node's bridge gateway address (`hickory-dns`). Answers cluster names, forwards everything else to the host's resolvers. |
@@ -419,8 +418,8 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
 
 - **One gRPC port per manager** (default `7470`) serves three services:
   `Objects` (Apply, Get, List, Delete, Watch), `Cluster` (Init, Status) and
-  `Raft` (the transport between managers). It listens on `127.0.0.1` by
-  default. Since phase 2 every connection is mutual TLS with certificates
+  `Raft` (the transport between managers). It listens on every address
+  (`0.0.0.0:7470`) by default, `--listen` choosing another. Since phase 2 every connection is mutual TLS with certificates
   from the cluster CA (§9); the API takes admins and managers, Raft only
   managers.
 - **Wire format.** The object envelope is a protobuf message; spec and status
@@ -1507,8 +1506,13 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
   (`legion_proto::tls::Credentials`, rustls with a certificate resolver on
   both sides) rather than through tonic's fixed configuration, so each
   handshake after a renewal presents the new certificate and open
-  connections carry on. There is no revocation: a removed node's
-  certificate, renewals included, stays valid until it expires.
+  connections carry on. Removing a worker revokes it: deleting its Node
+  records when (`Config legion-system/removed-nodes`), and every
+  dispatcher call, renewals included, refuses a worker certificate of
+  that node issued before then. Joining again with a token gives a new
+  certificate, issued after, which is let in. Streams the worker opened
+  before its removal run until they reconnect. Managers are removed from
+  the Raft membership instead, and users by their RoleBindings.
 - **Join tokens**: `LGN-1-<ca-digest>-<secret>`, with separate tokens for workers and
   managers, and rotation on demand. The digest lets a joining node verify the
   cluster it reaches before sending anything. Built: the joining node reads
@@ -1633,7 +1637,7 @@ WireGuard and bridge, with tasks as VNET jails attached to the node bridges.
 | Legion's own runtime and registry client have less mileage than Podman's | Images or containers that misbehave in ways the tests miss | OCI conformance where it matters (whiteouts, digests, platforms), tested against Docker Hub and Podman-built images; exit tests of every phase on real jails |
 | A jail that does not get its profile | Silent security gaps | The agent reads every container jail's parameters back after start and refuses the pod (§9) |
 | pf is not a full load balancer (no weights, no health checks) | Uneven load, rough failover | Table-only updates for soft drain; source-hash option; kill-by-key for dead backends; userspace proxy fallback per service if needed |
-| `pcpu` throttling is bursty | Latency spikes for CPU-limited tasks | Document; prefer `cpuset` for latency-sensitive services |
+| `pcpu` throttling is bursty | Latency spikes for CPU-limited tasks | Document; offer `cpuset` pinning for latency-sensitive services |
 | Small FreeBSD OCI image ecosystem | Adoption | Good base images and build docs; Linux images in phase 5 |
 | Rust rewrite effort | Schedule | Phase 1 is deliberately single-node; reuse SwarmKit's designs and tests as references |
 | Double-NAT on routing mesh hides client IP | Logging and access control | `publish: host` and PROXY protocol support in ingress |

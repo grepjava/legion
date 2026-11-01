@@ -845,7 +845,8 @@ async fn nodes_registering_at_once_get_their_own_subnets() {
     assert_eq!(distinct.len(), 8, "{subnets:?}");
     // Registering again keeps the subnet.
     assert_eq!(register(clients[3].clone()).await, subnets[&3]);
-    // So does a node deleted and registering again: the network is not full.
+    // So does a node deleted and joining again, with a new certificate:
+    // the network is not full.
     first
         .objects()
         .await
@@ -855,7 +856,10 @@ async fn nodes_registering_at_once_get_their_own_subnets() {
         })
         .await
         .unwrap();
-    assert_eq!(register(clients[3].clone()).await, subnets[&3]);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let w3 = creds(&ca, "w3", Role::Worker);
+    let rejoined = DispatcherClient::new(first.channel(Some(&w3)).await.unwrap());
+    assert_eq!(register(rejoined).await, subnets[&3]);
     assert_eq!(node_state(&first, "w3").as_deref(), Some("ready"));
 }
 
@@ -936,6 +940,73 @@ async fn nodes_register_with_their_certificates_role() {
     assert_eq!(node_role(&first, "m2").as_deref(), Some("worker"));
     register(m2, "").await;
     assert_eq!(node_role(&first, "m2").as_deref(), Some("manager"));
+}
+
+/// Deleting a worker's Node takes the worker out: its certificate is
+/// refused, renewals included, until it joins again for a new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_worker_stays_out_until_it_joins_again() {
+    let ca = Ca::generate().unwrap();
+    let m = Running::start_with(Some(&ca)).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let worker = |creds: ClientTlsConfig| {
+        let m = &m;
+        async move { DispatcherClient::new(m.channel(Some(&creds)).await.unwrap()) }
+    };
+    let heartbeat = |mut d: DispatcherClient<Channel>| async move {
+        d.heartbeat(HeartbeatRequest {
+            node: String::new(),
+            usage: Vec::new(),
+        })
+        .await
+    };
+    let old = worker(creds(&ca, "w1", Role::Worker)).await;
+    eventually(|| {
+        let mut d = old.clone();
+        async move {
+            d.register(RegisterRequest {
+                node: String::new(),
+                status_json: br#"{"state":"ready"}"#.to_vec(),
+                role: String::new(),
+            })
+            .await
+        }
+    })
+    .await;
+    heartbeat(old.clone()).await.unwrap();
+
+    let mut admin = m.objects().await;
+    admin
+        .delete(DeleteRequest {
+            r#ref: Some(ObjectRef {
+                kind: "Node".into(),
+                namespace: String::new(),
+                name: "w1".into(),
+            }),
+            expected_version: None,
+        })
+        .await
+        .unwrap();
+    let refused = |r: Result<_, tonic::Status>| match r {
+        Err(e) if e.code() == Code::PermissionDenied => e.message().to_owned(),
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("allowed"),
+    };
+    let why = refused(heartbeat(old.clone()).await.map(|_| ()));
+    assert!(why.contains("node w1 was removed"), "{why}");
+    let (_, csr_pem) = legion_pki::request().unwrap();
+    refused(
+        old.clone()
+            .renew(RenewRequest { csr_pem })
+            .await
+            .map(|_| ()),
+    );
+
+    // Issued after the removal, as joining again gives it.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let new = worker(creds(&ca, "w1", Role::Worker)).await;
+    heartbeat(new).await.unwrap();
+    m.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1279,6 +1350,51 @@ async fn usage_shows_what_the_caller_may_read() {
     let mine = usage(alice.clone(), "").await.unwrap().into_inner();
     assert_eq!(seen(mine), [row("a", 25.0)]);
     denied(usage(alice, "b").await);
+}
+
+/// A manager forwards a user's request with the user's name, and the leader
+/// checks the user's rights again rather than granting the manager's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_leader_checks_users_a_manager_forwards() {
+    let ca = Ca::generate().unwrap();
+    let m = Running::start_with(Some(&ca)).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let admin = m.objects().await;
+    eventually(|| {
+        let mut admin = admin.clone();
+        async move { admin.apply(binding("a", "alice", "view")).await }
+    })
+    .await;
+    let manager = ObjectsClient::new(
+        m.channel(Some(&creds(&ca, "m2", Role::Manager)))
+            .await
+            .unwrap(),
+    );
+    let as_alice = |kind: &str, namespace: &str| {
+        let mut req = tonic::Request::new(get(kind, namespace, "web"));
+        req.metadata_mut()
+            .insert("legion-forwarded", "1".parse().unwrap());
+        req.metadata_mut()
+            .insert("legion-forwarded-for", "alice".parse().unwrap());
+        req
+    };
+    // Alice may not read in b, nor read Secrets in a; the manager may.
+    let why = denied(manager.clone().get(as_alice("Service", "b")).await);
+    assert!(
+        why.contains("user alice has no role in namespace b"),
+        "{why}"
+    );
+    denied(manager.clone().get(as_alice("Secret", "a")).await);
+    let code = |r: Result<tonic::Response<Object>, tonic::Status>| r.err().map(|e| e.code());
+    assert_eq!(
+        code(manager.clone().get(as_alice("Service", "a")).await),
+        Some(Code::NotFound)
+    );
+    assert_eq!(
+        code(manager.clone().get(get("Secret", "b", "web")).await),
+        Some(Code::NotFound)
+    );
+    m.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1678,6 +1794,11 @@ async fn namespace_quotas_refuse_what_would_not_fit() {
     }
     try_apply(db(2, Some("1Gi"))).await.unwrap();
     refused(try_apply(extra).await);
+    // Growing the claim grows the Volumes, so it counts at its new size.
+    assert_eq!(
+        refused(try_apply(db(2, Some("2Gi"))).await),
+        "over the quota of namespace store: storage 4Gi of 3Gi"
+    );
     m.stop().await;
 }
 

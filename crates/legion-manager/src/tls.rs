@@ -41,6 +41,24 @@ pub(crate) fn caller<T>(req: &Request<T>, tls: bool) -> Result<Option<Identity>,
         .map_err(|e| Status::unauthenticated(e.to_string()))
 }
 
+/// When the caller's certificate was issued; `None` without TLS.
+pub(crate) fn caller_issued<T>(
+    req: &Request<T>,
+    tls: bool,
+) -> Result<Option<std::time::SystemTime>, Status> {
+    if !tls {
+        return Ok(None);
+    }
+    let certs = req.peer_certs();
+    let cert = certs
+        .as_ref()
+        .and_then(|c| c.first())
+        .ok_or_else(|| Status::unauthenticated("a client certificate is required"))?;
+    legion_pki::issued_at(cert)
+        .map(Some)
+        .map_err(|e| Status::unauthenticated(e.to_string()))
+}
+
 /// An interceptor that lets only callers with one of `roles` through.
 pub(crate) fn only(
     roles: &'static [Role],

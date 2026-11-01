@@ -124,8 +124,20 @@ impl DispatcherService {
 
     /// The node a request acts for. Workers act for themselves; managers
     /// for the node they name, or themselves.
-    fn node<T>(&self, req: &Request<T>, named: &str) -> Result<String, Status> {
+    /// The caller, refused if it is a worker whose node was removed after
+    /// its certificate was issued.
+    fn caller<T>(&self, req: &Request<T>) -> Result<Option<Identity>, Status> {
         let caller = crate::tls::caller(req, self.tls)?;
+        if let Some(id) = caller.as_ref().filter(|id| id.role == Role::Worker)
+            && let Some(issued) = crate::tls::caller_issued(req, self.tls)?
+        {
+            crate::removed::check(self.store(), &id.name, issued)?;
+        }
+        Ok(caller)
+    }
+
+    fn node<T>(&self, req: &Request<T>, named: &str) -> Result<String, Status> {
+        let caller = self.caller(req)?;
         let node = match caller {
             None if named.is_empty() => {
                 return Err(Status::invalid_argument("node is required"));
@@ -691,7 +703,7 @@ impl Dispatcher for DispatcherService {
     }
 
     async fn renew(&self, req: Request<RenewRequest>) -> Result<Response<RenewResponse>, Status> {
-        let id = match crate::tls::caller(&req, self.tls)? {
+        let id = match self.caller(&req)? {
             Some(id) if id.role == Role::Worker => id,
             Some(id) => {
                 return Err(Status::permission_denied(format!(
@@ -711,50 +723,25 @@ impl Dispatcher for DispatcherService {
 
     async fn data(&self, req: Request<DataRequest>) -> Result<Response<DataResponse>, Status> {
         let node = self.node(&req, &req.get_ref().node)?;
-        let r = req.into_inner();
-        let kind: Kind = r.kind.parse().map_err(invalid)?;
-        if !matches!(kind, Kind::Secret | Kind::Config) {
-            return Err(Status::invalid_argument("kind is Secret or Config"));
-        }
-        let wanted = (kind, r.name.clone());
-        let used = self
-            .tasks_of(&node, &r.namespace)?
-            .iter()
-            .any(|a| a.spec.pod.data_refs().contains(&wanted));
-        let route =
-            !used && kind == Kind::Secret && self.route_certificate(&r.namespace, &r.name)?;
-        if route && !self.serves_routes(&node)? {
-            return Err(Status::permission_denied(format!(
-                "node {node} is not marked to serve HTTPS routes: other nodes are \
-                 (`legion node label {node} {}=true`)",
-                legion_api::node::LABEL_INGRESS
-            )));
-        }
-        if !used && !route {
-            return Err(Status::permission_denied(format!(
-                "no task of node {node} uses {} {}/{}",
-                kind.as_str().to_lowercase(),
-                r.namespace,
-                r.name
-            )));
-        }
-        let value = match self.get(&ObjectKey::new(kind, &r.namespace, &r.name))? {
-            Some(o) => {
-                let spec: DataSpec = serde_json::from_value(o.spec).map_err(internal)?;
-                Some(spec.bytes().map_err(internal)?)
-            }
-            None => None,
+        // A follower may not have the task, or the data, the leader has
+        // already: what it refuses or lacks, the leader is asked for.
+        let leader = self.leader(&req)?;
+        let mut r = req.into_inner();
+        let local = self.data_local(&node, &r);
+        let ask_leader = match &local {
+            Ok(found) => found.value.is_none(),
+            Err(e) => e.code() == tonic::Code::PermissionDenied,
         };
-        // Every node may read a route's certificate, so a route must not
-        // hand them any other Secret of its namespace.
-        if route && value.as_deref().is_some_and(|v| !certificate_and_key(v)) {
-            return Err(Status::permission_denied(format!(
-                "secret {}/{} is named by a route but is not a PEM certificate and key",
-                r.namespace, r.name
-            )));
+        match leader {
+            Some(mut leader) if ask_leader => {
+                r.node = node;
+                leader.data(forwarded(r)).await
+            }
+            _ => local.map(Response::new),
         }
-        Ok(Response::new(DataResponse { value }))
     }
+
+    type SessionsStream = ReceiverStream<Result<SessionOffer, Status>>;
 
     async fn heartbeat(
         &self,
@@ -786,8 +773,6 @@ impl Dispatcher for DispatcherService {
             managers: self.managers(),
         }))
     }
-
-    type SessionsStream = ReceiverStream<Result<SessionOffer, Status>>;
 
     async fn sessions(
         &self,
@@ -828,7 +813,8 @@ impl Dispatcher for DispatcherService {
         use legion_proto::v1::session_frame::Frame;
         use tokio_stream::StreamExt;
         // A worker attaches only to its own node's sessions.
-        let node = crate::tls::caller(&req, self.tls)?
+        let node = self
+            .caller(&req)?
             .filter(|id| id.role == Role::Worker)
             .map(|id| id.name);
         let mut from_agent = req.into_inner();
@@ -944,6 +930,54 @@ async fn follow_assignments(
             }
             tx.send_if_modified(|old| replace(old, Some(&current)));
         }
+    }
+}
+
+impl DispatcherService {
+    /// [`Dispatcher::data`] from this manager's replica.
+    fn data_local(&self, node: &str, r: &DataRequest) -> Result<DataResponse, Status> {
+        let kind: Kind = r.kind.parse().map_err(invalid)?;
+        if !matches!(kind, Kind::Secret | Kind::Config) {
+            return Err(Status::invalid_argument("kind is Secret or Config"));
+        }
+        let wanted = (kind, r.name.clone());
+        let used = self
+            .tasks_of(node, &r.namespace)?
+            .iter()
+            .any(|a| a.spec.pod.data_refs().contains(&wanted));
+        let route =
+            !used && kind == Kind::Secret && self.route_certificate(&r.namespace, &r.name)?;
+        if route && !self.serves_routes(node)? {
+            return Err(Status::permission_denied(format!(
+                "node {node} is not marked to serve HTTPS routes: other nodes are \
+                 (`legion node label {node} {}=true`)",
+                legion_api::node::LABEL_INGRESS
+            )));
+        }
+        if !used && !route {
+            return Err(Status::permission_denied(format!(
+                "no task of node {node} uses {} {}/{}",
+                kind.as_str().to_lowercase(),
+                r.namespace,
+                r.name
+            )));
+        }
+        let value = match self.get(&ObjectKey::new(kind, &r.namespace, &r.name))? {
+            Some(o) => {
+                let spec: DataSpec = serde_json::from_value(o.spec).map_err(internal)?;
+                Some(spec.bytes().map_err(internal)?)
+            }
+            None => None,
+        };
+        // Every node may read a route's certificate, so a route must not
+        // hand them any other Secret of its namespace.
+        if route && value.as_deref().is_some_and(|v| !certificate_and_key(v)) {
+            return Err(Status::permission_denied(format!(
+                "secret {}/{} is named by a route but is not a PEM certificate and key",
+                r.namespace, r.name
+            )));
+        }
+        Ok(DataResponse { value })
     }
 }
 

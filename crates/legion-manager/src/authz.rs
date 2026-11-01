@@ -1,6 +1,7 @@
 //! RBAC (DESIGN.md §4.2): what an API caller may do. The manager a request
-//! reaches first decides, before forwarding it; the leader then sees the
-//! forwarding manager, which may do everything.
+//! reaches first decides, before forwarding it, and forwards a user's
+//! request with the user's name, so the leader decides again on its own
+//! state, which a follower's may trail.
 //!
 //! The cluster admin and managers may do everything. A user may act only
 //! in namespaces where a RoleBinding names them, as far as its role goes,
@@ -41,13 +42,28 @@ pub(crate) enum Caller {
     User(String),
 }
 
+/// Metadata naming the user a manager forwards a request for, so the
+/// leader checks the user's rights again on its own, newer, state.
+pub(crate) const FORWARDED_FOR: &str = "legion-forwarded-for";
+
 impl Caller {
     pub fn of<T>(req: &Request<T>, tls: bool) -> Result<Caller, Status> {
         match crate::tls::caller(req, tls)? {
             None => Ok(Caller::All),
             Some(Identity {
-                role: Role::Admin | Role::Manager,
+                role: Role::Manager,
                 ..
+            }) => match req.metadata().get(FORWARDED_FOR) {
+                Some(user) => {
+                    let user = user.to_str().map_err(|_| {
+                        Status::invalid_argument("a forwarded user name is not text")
+                    })?;
+                    Ok(Caller::User(user.to_owned()))
+                }
+                None => Ok(Caller::All),
+            },
+            Some(Identity {
+                role: Role::Admin, ..
             }) => Ok(Caller::All),
             Some(Identity {
                 role: Role::User,

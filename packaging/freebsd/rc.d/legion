@@ -48,8 +48,8 @@ legion_precmd()
 		warn "kern.racct.enable is not 1: containers' CPU and memory limits will not hold" \
 		    "(set kern.racct.enable=1 in /boot/loader.conf and reboot)"
 	fi
-	install -d -m 700 ${legion_data_dir}
-	install -d -m 700 ${legion_run_dir}
+	install -d -m 700 "${legion_data_dir}"
+	install -d -m 700 "${legion_run_dir}"
 }
 
 run_rc_command "$1"

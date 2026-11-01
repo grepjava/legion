@@ -431,7 +431,12 @@ async fn tampered_layers_are_refused() {
             .pull(&format!("{addr}/team/{repo}:1"), None, "t")
             .await
             .unwrap_err();
-        assert!(matches!(e, Error::Digest { .. }), "{repo}: {e}");
+        // The tampered blob is also longer than its descriptor says, which
+        // stops it before its digest is known.
+        assert!(
+            matches!(e, Error::Digest { .. }) || e.to_string().contains("longer than its"),
+            "{repo}: {e}"
+        );
     }
     assert_eq!(
         sys.zfs_list("tank/legion/images").unwrap().len(),
@@ -498,4 +503,18 @@ async fn imports_an_oci_layout() {
     drop(b);
     let e = s.load(&not_oci, None).await.unwrap_err();
     assert!(e.to_string().contains("oci-archive"), "{e}");
+
+    // A layout's files are taken only as plain files, not through links,
+    // which an archive could point at the host's files.
+    #[cfg(unix)]
+    {
+        let elsewhere = t.path().join("layer");
+        let at = blobs.join(&layer_digest[7..]);
+        std::fs::rename(&at, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &at).unwrap();
+        assert!(s.remove("localhost/built:1").await.unwrap());
+        assert!(s.remove("localhost/other:2").await.unwrap());
+        let e = s.import(dir.path(), "localhost/built:1").await.unwrap_err();
+        assert!(e.to_string().contains("not a plain file"), "{e}");
+    }
 }

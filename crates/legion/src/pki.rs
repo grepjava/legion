@@ -493,20 +493,32 @@ fn write(path: &Path, contents: &str, mode: u32) -> anyhow::Result<()> {
     write_bytes(path, contents.as_bytes(), mode)
 }
 
+/// Writes `path` whole or not at all, through `<path>.new`. That file is
+/// made new, so neither a leftover of another write (with other
+/// permissions) nor a link someone put there is written through.
 fn write_bytes(path: &Path, contents: &[u8], mode: u32) -> anyhow::Result<()> {
-    let tmp = path.with_extension("new");
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".new");
+    let tmp = std::path::PathBuf::from(tmp);
+    remove(&tmp)?;
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(mode);
     }
-    #[cfg(not(unix))]
-    let _ = mode;
     let mut f = options
         .open(&tmp)
         .with_context(|| format!("writing {}", tmp.display()))?;
+    // The mode as asked, whatever the umask took away or left.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
     std::io::Write::write_all(&mut f, contents)?;
     f.sync_all()?;
     std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
@@ -515,6 +527,27 @@ fn write_bytes(path: &Path, contents: &[u8], mode: u32) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A key is written private even over a leftover `.new` file that is
+    /// not, as an interrupted write of a certificate once left.
+    #[cfg(unix)]
+    #[test]
+    fn keys_are_written_private_over_leftovers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("node.key");
+        let leftover = dir.path().join("node.key.new");
+        std::fs::write(&leftover, "old").unwrap();
+        std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&key, "secret").unwrap();
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&key).unwrap(), "secret");
+        assert!(!leftover.exists());
+        // The certificate beside it has a temporary file of its own.
+        write_public(&dir.path().join("node.crt"), "cert").unwrap();
+        assert_eq!(std::fs::read_to_string(&key).unwrap(), "secret");
+    }
 
     #[test]
     fn creates_then_reuses() {

@@ -1422,6 +1422,7 @@ impl legion_runtime::Runtime for JailRuntime {
         let path = self.container_dir(id).join(LOG);
         let first = log::read_all(&path, tail).map_err(internal)?;
         let offset = std::fs::metadata(&path).map_or(0, |m| m.len());
+        let inode = log::inode(&path);
         let initial = futures::stream::iter(first.into_iter().map(Ok));
         if !follow {
             return Ok(initial.boxed());
@@ -1429,7 +1430,8 @@ impl legion_runtime::Runtime for JailRuntime {
         let sys = self.sys.clone();
         let dir = self.dir.clone();
         let boot = self.boot;
-        let more = futures::stream::unfold((path, offset, false), move |(path, offset, last)| {
+        let start = (path, offset, inode, false);
+        let more = futures::stream::unfold(start, move |(path, offset, inode, last)| {
             let (sys, dir, rec) = (sys.clone(), dir.clone(), rec.clone());
             async move {
                 if last {
@@ -1439,15 +1441,17 @@ impl legion_runtime::Runtime for JailRuntime {
                     let over = jail_names(&*sys)
                         .and_then(|j| status(&dir, &rec, boot, &j))
                         .map_or(true, |s| matches!(s, Status::Exited(_)));
-                    let len = std::fs::metadata(&path).map_or(0, |m| m.len());
-                    let from = if len < offset { 0 } else { offset };
-                    let (chunks, at) = match log::read_from(&path, from) {
+                    // The log may have been rotated since: read_since
+                    // finishes the old file before the new.
+                    let (chunks, at, inode) = match log::read_since(&path, offset, inode) {
                         Ok(r) => r,
-                        Err(e) => return Some((vec![Err(Error::Io(e))], (path, from, true))),
+                        Err(e) => {
+                            return Some((vec![Err(Error::Io(e))], (path, offset, inode, true)));
+                        }
                     };
                     if !chunks.is_empty() || over {
                         let chunks = chunks.into_iter().map(Ok).collect();
-                        return Some((chunks, (path, at, over)));
+                        return Some((chunks, (path, at, inode, over)));
                     }
                     tokio::time::sleep(TICK).await;
                 }

@@ -297,9 +297,10 @@ mod imp {
         };
         // SAFETY: the command's stdio: no input, output to the pipes.
         unsafe {
-            let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
-            if null >= 0 {
+            let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+            if null > 0 {
                 libc::dup2(null, 0);
+                libc::close(null);
             }
             libc::dup2(out[0], 1);
             libc::dup2(out[1], 2);
@@ -350,6 +351,25 @@ mod imp {
         }
     }
 
+    /// The text of `path` if it is a plain file of at most 1 MiB.
+    fn image_file(path: &str) -> Option<String> {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        const MAX: u64 = 1 << 20;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .ok()?;
+        let meta = f.metadata().ok()?;
+        if !meta.is_file() || meta.len() > MAX {
+            return None;
+        }
+        let mut text = String::new();
+        f.take(MAX).read_to_string(&mut text).ok()?;
+        Some(text)
+    }
+
     fn cstring(s: &str) -> Result<CString, String> {
         CString::new(s).map_err(|_| format!("a NUL in {s:?}"))
     }
@@ -368,8 +388,10 @@ mod imp {
                 libc::ioctl(0, libc::TIOCSCTTY, 0);
             }
         }
-        // In the jail, so these are the image's own.
-        let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+        // In the jail, so these are the image's own, and only plain files
+        // of a sane size: a FIFO would hang the start, `/dev/zero` fill
+        // memory.
+        let read = |p: &str| image_file(p).unwrap_or_default();
         let user = crate::users::resolve(&rec.user, &read("/etc/passwd"), &read("/etc/group"))?;
         let groups: Vec<libc::gid_t> = user.groups.iter().map(|&g| g as _).collect();
         // SAFETY: dropping privileges: groups, then gid, then uid.

@@ -83,6 +83,8 @@ struct State {
     plugins: BTreeSet<String>,
     /// Every program run, with its arguments.
     ran: Vec<String>,
+    /// What each program run got on its standard input, in order.
+    ran_input: Vec<String>,
     /// devfs links: path, target. They go with their devfs's unmount.
     links: BTreeMap<String, String>,
     default_interface: Option<String>,
@@ -410,6 +412,16 @@ impl FakeSys {
     /// The programs run so far, each with its arguments.
     pub fn programs_run(&self) -> Vec<String> {
         self.state().ran.clone()
+    }
+
+    /// The programs run so far, each with what it got on standard input.
+    pub fn programs_run_with_input(&self) -> Vec<(String, String)> {
+        let s = self.state();
+        s.ran
+            .iter()
+            .cloned()
+            .zip(s.ran_input.iter().cloned())
+            .collect()
     }
 }
 
@@ -1423,8 +1435,9 @@ must destroy them to overwrite it"
         Ok(())
     }
 
-    fn run_program(&self, program: &str, args: &[&str], _input: &str) -> Result<String> {
+    fn run_program(&self, program: &str, args: &[&str], input: &str) -> Result<String> {
         let mut s = self.state();
+        s.ran_input.push(input.to_owned());
         s.ran.push(
             std::iter::once(program)
                 .chain(args.iter().copied())

@@ -18,6 +18,7 @@ pub mod metrics;
 mod migrate;
 mod quota;
 mod raft_net;
+mod removed;
 pub mod requests;
 mod security;
 mod session;

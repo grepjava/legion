@@ -442,6 +442,7 @@ fn remove_made(at: &Path, first: &Path) {
 /// The host's resolver file lent to a root that has none (or an empty
 /// one) while a step runs; the root's own comes back when dropped.
 struct Resolver {
+    root: PathBuf,
     path: PathBuf,
     /// The first directory or file made for it, if any was.
     made: Option<PathBuf>,
@@ -464,6 +465,7 @@ impl Resolver {
         let path = target(root, HOST, true)?;
         std::fs::write(&path, host).map_err(internal)?;
         Ok(Some(Resolver {
+            root: root.to_path_buf(),
             path,
             made,
             was_empty: was.is_some(),
@@ -473,11 +475,19 @@ impl Resolver {
 
 impl Drop for Resolver {
     fn drop(&mut self) {
-        if self.was_empty {
-            let _ = std::fs::write(&self.path, b"");
+        // The step may have made `/etc` or the file a link, maybe to the
+        // host's own: then the root's is left as the step made it.
+        if !unlinked(&self.root, &self.path) {
             return;
         }
         let _ = std::fs::remove_file(&self.path);
+        if self.was_empty {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&self.path);
+            return;
+        }
         // And `/etc`, if it was made for it.
         if let (Some(first), Some(parent)) = (&self.made, self.path.parent())
             && *first != self.path
@@ -485,6 +495,24 @@ impl Drop for Resolver {
             remove_made(parent, first);
         }
     }
+}
+
+/// Whether `path`, under `root`, is a file reached through no link.
+fn unlinked(root: &Path, path: &Path) -> bool {
+    let Ok(rest) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut cur = root.to_path_buf();
+    let mut parts = rest.components().peekable();
+    while let Some(part) = parts.next() {
+        cur.push(part);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if parts.peek().is_none() => return m.is_file(),
+            Ok(m) if m.is_dir() => {}
+            _ => return false,
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -576,5 +604,35 @@ mod tests {
         // The image's own is left alone.
         std::fs::write(root.join("etc/resolv.conf"), b"nameserver 10.0.0.1\n").unwrap();
         assert!(Resolver::lend(root).unwrap().is_none());
+    }
+
+    /// A step that makes `/etc` or the file a link does not have what is
+    /// behind the link emptied or removed when the resolver is taken back.
+    #[test]
+    fn taking_the_resolver_back_follows_no_link() {
+        let t = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let theirs = host.path().join("resolv.conf");
+        for was_empty in [true, false] {
+            for link_etc in [true, false] {
+                let root = t.path().join(format!("{was_empty}-{link_etc}"));
+                std::fs::create_dir_all(root.join("etc")).unwrap();
+                std::fs::write(&theirs, b"host's\n").unwrap();
+                let r = Resolver {
+                    root: root.clone(),
+                    path: root.join("etc/resolv.conf"),
+                    made: None,
+                    was_empty,
+                };
+                if link_etc {
+                    std::fs::remove_dir_all(root.join("etc")).unwrap();
+                    std::os::unix::fs::symlink(host.path(), root.join("etc")).unwrap();
+                } else {
+                    std::os::unix::fs::symlink(&theirs, root.join("etc/resolv.conf")).unwrap();
+                }
+                drop(r);
+                assert_eq!(std::fs::read(&theirs).unwrap(), b"host's\n");
+            }
+        }
     }
 }

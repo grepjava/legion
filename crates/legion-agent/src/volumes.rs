@@ -97,6 +97,10 @@ enum Attached {
         plugin: String,
         dir: String,
         shared: bool,
+        /// Handed to `unmount` as to `mount`; records written before
+        /// they were kept have none.
+        #[serde(default)]
+        options: BTreeMap<String, String>,
     },
 }
 
@@ -255,6 +259,7 @@ async fn volume<C: Control>(
                     plugin: path_str(&program).map_err(failed)?,
                     dir: dir.clone(),
                     shared: plugin.shared,
+                    options: plugin.options.clone(),
                 },
             )
             .map_err(failed)?;
@@ -466,10 +471,15 @@ pub(crate) async fn release<C: Control>(
                 namespace,
                 volume,
                 shared,
+                options,
             } => {
                 let (plugin, dir) = (plugin.clone(), dir.clone());
-                let input =
-                    serde_json::json!({"namespace": namespace, "volume": volume}).to_string();
+                let input = serde_json::json!({
+                    "namespace": namespace,
+                    "volume": volume,
+                    "options": options,
+                })
+                .to_string();
                 crate::task::blocking(sys, move |sys| unmount_plugin(sys, &plugin, &dir, &input))
                     .await?;
                 !shared

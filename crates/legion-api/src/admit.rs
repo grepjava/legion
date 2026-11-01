@@ -73,8 +73,29 @@ impl Spec for NamespaceSpec {
 }
 
 /// Validates `obj` and replaces its spec with the normalised form.
+/// The most an object's labels and spec take, as JSON. Every manager
+/// holds every object, and watches keep thousands of changes in memory;
+/// a Secret's largest value fits, encoded.
+pub const MAX_OBJECT: usize = 1 << 20;
+
 pub fn admit(obj: &mut Object) -> Result<(), Error> {
     obj.validate()?;
+    let labels: usize = obj
+        .metadata
+        .labels
+        .iter()
+        .map(|(k, v)| k.len() + v.len() + 6)
+        .sum();
+    let size = labels + serde_json::to_vec(&obj.spec).map_or(0, |v| v.len());
+    if size > MAX_OBJECT {
+        return Err(Error::Spec {
+            kind: obj.kind,
+            invalid: Invalid::new(
+                "",
+                format!("{size} bytes of labels and spec is above the {MAX_OBJECT}-byte limit"),
+            ),
+        });
+    }
     let spec = std::mem::take(&mut obj.spec);
     let normalised = match obj.kind {
         Kind::Namespace => normalise::<NamespaceSpec>(spec),
@@ -183,5 +204,33 @@ pub(crate) fn check_absolute(path: &str, p: &str) -> Result<(), Invalid> {
             path,
             format!("{p:?} must be an absolute path without `..`"),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn objects_have_a_size_limit() {
+        let secret = |data: String, labels: usize| {
+            let mut o = Object::new(
+                Kind::Secret,
+                "shop",
+                "key",
+                serde_json::json!({ "text": data }),
+            );
+            for n in 0..labels {
+                o.metadata.labels.insert(format!("l{n}"), "v".repeat(60));
+            }
+            o
+        };
+        // The largest Secret fits.
+        admit(&mut secret("x".repeat(crate::data::MAX_DATA), 0)).unwrap();
+        // Labels count.
+        let why = admit(&mut secret(String::new(), 20_000))
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("above the 1048576-byte limit"), "{why}");
     }
 }

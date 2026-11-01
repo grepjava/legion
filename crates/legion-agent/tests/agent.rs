@@ -1680,6 +1680,18 @@ async fn network_volumes() {
                 .contains(&format!("{plugin} unmount {objects}"))
     })
     .await;
+    // Told the volume's options, as it was when mounting.
+    let unmounted = h
+        .sys
+        .programs_run_with_input()
+        .into_iter()
+        .find(|(ran, _)| *ran == format!("{plugin} unmount {objects}"))
+        .unwrap();
+    assert!(
+        unmounted.1.contains(r#""options":{"bucket":"shop"}"#),
+        "{}",
+        unmounted.1
+    );
     assert_eq!(h.sys.iscsi_targets(), [iqn]);
     assert!(h.sys.mount_source(block).is_some());
     assert_eq!(

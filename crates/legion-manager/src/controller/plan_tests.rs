@@ -626,6 +626,28 @@ fn a_failing_update_pauses() {
     assert_eq!(w.update("web").0, "updating");
 }
 
+/// A task of the update that failed after its monitor window does not
+/// stop the update, also once another leader takes over, which never saw
+/// it run.
+#[test]
+fn a_new_leader_takes_no_old_failure_for_news() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.service("web", &web("web:1", "delay: 60s"));
+    w.settle();
+    w.service("web", &web("web:2", "delay: 60s"));
+    w.settle();
+    let new = w.running_with("web", "web:2");
+    w.now += Duration::from_secs(10);
+    w.settle();
+    w.fail(&new);
+    w.settle();
+    assert_eq!(w.update("web").0, "updating");
+    w.memory = Memory::default();
+    w.settle();
+    assert_eq!(w.update("web").0, "updating", "{:?}", w.update("web"));
+}
+
 #[test]
 fn a_failing_update_rolls_back() {
     let mut w = World::new();

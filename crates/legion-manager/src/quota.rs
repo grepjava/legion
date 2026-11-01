@@ -135,8 +135,11 @@ fn usage(
             continue;
         }
         for n in 0..s.replicas.unwrap_or(1) {
+            // The controller resizes a claim's Volume to the claim, so a
+            // claim grown past its Volume counts at its new size.
             for (claim, src) in s.pod.claims() {
-                all.entry(claim_volume(claim, name, n)).or_insert(src.size);
+                let size = all.entry(claim_volume(claim, name, n)).or_insert(src.size);
+                *size = (*size).max(src.size);
             }
         }
     }

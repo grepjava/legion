@@ -12,6 +12,7 @@ base64.workspace = true
 bytes.workspace = true
 http.workspace = true
 http-body.workspace = true
+http-body-util.workspace = true
 hyper-rustls.workspace = true
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2", "tokio"] }
 instant-acme.workspace = true
@@ -35,7 +36,6 @@ tower-service.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-http-body-util.workspace = true
 hyper = { workspace = true, features = ["http1", "server"] }
 rcgen.workspace = true
 legion-pki.workspace = true

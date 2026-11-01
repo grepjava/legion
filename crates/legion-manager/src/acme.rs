@@ -371,7 +371,7 @@ impl Accounts {
             Some(json) => {
                 let credentials: AccountCredentials = serde_json::from_slice(&json)
                     .map_err(|e| format!("the account in {key}: {e}"))?;
-                Account::builder_with_http(http()?)
+                Account::builder_with_http(http(&acme.directory)?)
                     .from_credentials(credentials)
                     .await
                     .map_err(|e| format!("the account in {key}: {e}"))?
@@ -379,7 +379,7 @@ impl Accounts {
             None => {
                 let contact = acme.email.as_ref().map(|e| format!("mailto:{e}"));
                 let contact: Vec<&str> = contact.iter().map(String::as_str).collect();
-                let (account, credentials) = Account::builder_with_http(http()?)
+                let (account, credentials) = Account::builder_with_http(http(&acme.directory)?)
                     .create(
                         &NewAccount {
                             contact: &contact,
@@ -413,9 +413,13 @@ fn account_name(acme: &RouteAcme) -> String {
     format!("acme-account-{hex}")
 }
 
-/// HTTPS to the authority, trusting what this host trusts; plain HTTP is
-/// only allowed to loopback directories, by admission.
-fn http() -> Result<Box<dyn HttpClient>, String> {
+/// What an authority may answer at most, in bytes.
+const MAX_ANSWER: usize = 1 << 20;
+
+/// HTTPS to the authority, trusting what this host trusts. Plain HTTP only
+/// when the directory itself is (admission allows that to loopback alone),
+/// so an authority cannot send the manager elsewhere in the clear.
+fn http(directory: &str) -> Result<Box<dyn HttpClient>, String> {
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_provider_and_platform_verifier(tokio_rustls::rustls::crypto::ring::default_provider())
         .map_err(|e| format!("TLS to the authority: {e}"))?
@@ -425,7 +429,57 @@ fn http() -> Result<Box<dyn HttpClient>, String> {
         .build();
     let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
         .build::<_, BodyWrapper<bytes::Bytes>>(https);
-    Ok(Box::new(client))
+    Ok(Box::new(Authority {
+        client,
+        plain: directory.starts_with("http://"),
+    }))
+}
+
+type HyperClient = hyper_util::client::legacy::Client<
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    BodyWrapper<bytes::Bytes>,
+>;
+
+/// [`http`]'s client: the schemes allowed, and answers of bounded size.
+struct Authority {
+    client: HyperClient,
+    plain: bool,
+}
+
+impl HttpClient for Authority {
+    fn request(
+        &self,
+        req: http::Request<BodyWrapper<bytes::Bytes>>,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<instant_acme::BytesResponse, instant_acme::Error>> + Send>,
+    > {
+        let allowed = match req.uri().scheme_str() {
+            Some("https") => true,
+            Some("http") => self.plain,
+            _ => false,
+        };
+        if !allowed {
+            let why = format!("the authority sent the manager to {}", req.uri());
+            return Box::pin(async move { Err(instant_acme::Error::Other(why.into())) });
+        }
+        let answer = self.client.request(req);
+        Box::pin(async move {
+            use http_body_util::BodyExt;
+            let (parts, body) = answer
+                .await
+                .map_err(|e| instant_acme::Error::Other(Box::new(e)))?
+                .into_parts();
+            let body = http_body_util::Limited::new(body, MAX_ANSWER)
+                .collect()
+                .await
+                .map_err(instant_acme::Error::Other)?
+                .to_bytes();
+            Ok(instant_acme::BytesResponse {
+                parts,
+                body: Box::new(body),
+            })
+        })
+    }
 }
 
 /// The value of a Secret, if there is one.

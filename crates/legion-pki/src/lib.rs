@@ -175,6 +175,13 @@ impl Ca {
 }
 
 fn leaf_params(id: &Identity, lifetime: Duration) -> Result<CertificateParams> {
+    // Past its CA's it is worthless, and far past it no date can say it.
+    if lifetime > CA_LIFETIME {
+        return Err(Error::Invalid(format!(
+            "a certificate may live {} days at most",
+            CA_LIFETIME.as_secs() / 86_400
+        )));
+    }
     let mut params = CertificateParams::default();
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, id.name.as_str());
@@ -256,6 +263,14 @@ pub fn identity(cert_der: &[u8]) -> Result<Identity> {
         .and_then(|o| Role::parse(&o))
         .ok_or_else(|| Error::Invalid(format!("certificate of {name} has no Legion role")))?;
     Ok(Identity { name, role })
+}
+
+/// When a certificate (DER) was issued: it is valid from a little before.
+pub fn issued_at(cert_der: &[u8]) -> Result<SystemTime> {
+    let (_, cert) = X509Certificate::from_der(cert_der)
+        .map_err(|e| Error::Invalid(format!("unreadable certificate: {e}")))?;
+    let from = cert.validity().not_before.timestamp().max(0) as u64;
+    Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(from) + BACKDATE)
 }
 
 /// When the first certificate in `pem` expires, and how long it was issued for.
@@ -482,6 +497,19 @@ mod tests {
         assert!(!needs_renewal(&issued.cert_pem, now + CERT_LIFETIME / 2));
         assert!(needs_renewal(&issued.cert_pem, not_after - lifetime / 3));
         assert!(needs_renewal("garbage", now));
+    }
+
+    #[test]
+    fn lifetimes_end_with_the_ca() {
+        let ca = Ca::generate().unwrap();
+        let id = Identity::new("alice", Role::User);
+        let (_, csr) = request().unwrap();
+        ca.sign(&csr, &id, CA_LIFETIME).unwrap();
+        let days = |d: u64| Duration::from_secs(d * 86_400);
+        let why = ca.sign(&csr, &id, days(4_000)).unwrap_err().to_string();
+        assert_eq!(why, "a certificate may live 3650 days at most");
+        // Once it panicked, past the year 9999.
+        ca.sign(&csr, &id, days(u64::from(u32::MAX))).unwrap_err();
     }
 
     #[test]

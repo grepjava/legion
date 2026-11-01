@@ -42,6 +42,8 @@ use tokio_rustls::rustls::sign::CertifiedKey;
 
 type Body = BoxBody<Bytes, hyper::Error>;
 
+/// How long a client has for its TLS handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a backend has to accept the connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -119,10 +121,14 @@ async fn run(
         tokio::spawn(async move {
             match tls {
                 None => connection(stream, proxy, client).await,
-                Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(stream) => connection(stream, proxy, client).await,
-                    Err(e) => tracing::debug!(%client, "ingress TLS handshake: {e}"),
-                },
+                // A client that never finishes its handshake is let go.
+                Some(acceptor) => {
+                    match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                        Ok(Ok(stream)) => connection(stream, proxy, client).await,
+                        Ok(Err(e)) => tracing::debug!(%client, "ingress TLS handshake: {e}"),
+                        Err(_) => tracing::debug!(%client, "ingress TLS handshake timed out"),
+                    }
+                }
             }
         });
     }

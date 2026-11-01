@@ -481,15 +481,27 @@ fn spawn_agent<R: legion_agent::Runtime>(
     (task, metrics)
 }
 
+/// The host of `advertise`: `host:port`, `[v6]:port` or a bare address
+/// (a v6 one has colons of its own).
+fn host_of(advertise: &str) -> String {
+    if let Ok(addr) = advertise.parse::<std::net::SocketAddr>() {
+        return addr.ip().to_string();
+    }
+    if advertise.parse::<std::net::IpAddr>().is_ok() {
+        return advertise.to_owned();
+    }
+    advertise
+        .rsplit_once(':')
+        .map_or(advertise, |(h, _)| h)
+        .to_owned()
+}
+
 /// What the node registers with: `advertise` is `host:port` or a host.
 fn status(hostname: String, advertise: &str) -> NodeStatus {
     NodeStatus {
         state: NodeState::Ready,
         hostname,
-        addr: advertise
-            .rsplit_once(':')
-            .map_or(advertise, |(h, _)| h)
-            .to_owned(),
+        addr: host_of(advertise),
         platform: Platform {
             os: std::env::consts::OS.to_owned(),
             arch: oci_arch().to_owned(),
@@ -611,6 +623,19 @@ pub fn restore(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advertised_hosts() {
+        for (advertise, host) in [
+            ("10.0.0.1:7470", "10.0.0.1"),
+            ("10.0.0.1", "10.0.0.1"),
+            ("[fd00::1]:7470", "fd00::1"),
+            ("fd00::1", "fd00::1"),
+            ("node.example:7470", "node.example"),
+        ] {
+            assert_eq!(host_of(advertise), host, "{advertise}");
+        }
+    }
 
     #[test]
     fn advertised_addresses() {

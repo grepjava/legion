@@ -170,6 +170,40 @@ pub fn read_from(path: &Path, offset: u64) -> std::io::Result<(Vec<Chunk>, u64)>
     Ok((out, at))
 }
 
+/// What `path` gained since `offset` in the file numbered `inode`, also
+/// across a rotation: then the rest of the rotated file, and the new one
+/// from its start. The chunks, and the offset and inode to go on from.
+#[cfg(unix)]
+pub fn read_since(path: &Path, offset: u64, inode: u64) -> std::io::Result<(Vec<Chunk>, u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let now = match std::fs::metadata(path) {
+        Ok(m) => m.ino(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), offset, inode));
+        }
+        Err(e) => return Err(e),
+    };
+    if now == inode {
+        let (chunks, at) = read_from(path, offset)?;
+        return Ok((chunks, at, now));
+    }
+    let old = rotated(path);
+    let mut chunks = match std::fs::metadata(&old) {
+        Ok(m) if m.ino() == inode => read_from(&old, offset)?.0,
+        _ => Vec::new(),
+    };
+    let (more, at) = read_from(path, 0)?;
+    chunks.extend(more);
+    Ok((chunks, at, now))
+}
+
+/// The inode of `path`, 0 if there is none.
+#[cfg(unix)]
+pub fn inode(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).map_or(0, |m| m.ino())
+}
+
 /// Everything kept, oldest first, or the last `tail` lines of it.
 pub fn read_all(path: &Path, tail: Option<usize>) -> std::io::Result<Vec<Chunk>> {
     let (mut chunks, _) = read_from(&rotated(path), 0)?;
@@ -244,6 +278,42 @@ mod tests {
         assert!(!all.contains("line 0\n"), "{all}");
         let size = |p: &Path| std::fs::metadata(p).unwrap().len();
         assert!(size(&p) <= 140 && size(&rotated(&p)) <= 140);
+    }
+
+    /// A follower misses nothing across a rotation: the rest of the old
+    /// file, then the new one from its start.
+    #[cfg(unix)]
+    #[test]
+    fn following_across_a_rotation() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("log");
+        let mut w = Writer::open(&p, 60).unwrap();
+        w.write(
+            Output::Stdout,
+            b"one
+",
+        )
+        .unwrap();
+        let (seen, at, ino) = read_since(&p, 0, inode(&p)).unwrap();
+        assert_eq!(
+            text(&seen),
+            "one
+"
+        );
+        // Unread lines, then enough for a rotation, then more after it.
+        let mut written = String::new();
+        for i in 0..3 {
+            let line = format!(
+                "line {i}
+"
+            );
+            w.write(Output::Stdout, line.as_bytes()).unwrap();
+            written.push_str(&line);
+        }
+        assert_ne!(inode(&p), ino, "rotated");
+        let (seen, _, now) = read_since(&p, at, ino).unwrap();
+        assert_eq!(text(&seen), written);
+        assert_eq!(now, inode(&p));
     }
 
     #[test]

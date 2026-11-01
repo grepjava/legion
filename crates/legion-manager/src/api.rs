@@ -188,6 +188,9 @@ impl ApiService {
             check_namespace(&desired.metadata.name)?;
         }
         legion_api::admit(&mut desired).map_err(invalid)?;
+        // What it compares with, and the quotas and policies it checks,
+        // must be the latest, not what this replica has applied so far.
+        self.consistent().await?;
         let key = desired.key();
         let _counting = match crate::quota::counts(desired.kind) {
             true => Some(self.quota_lock.lock().await),
@@ -310,6 +313,17 @@ pub(crate) fn forwarded<T>(inner: T) -> Request<T> {
     req
 }
 
+/// [`forwarded`], for `caller`: a user's name goes with it.
+fn forwarded_for<T>(inner: T, caller: &Caller) -> Result<Request<T>, Status> {
+    let mut req = forwarded(inner);
+    if let Caller::User(name) = caller {
+        let name = tonic::metadata::MetadataValue::try_from(name.as_str())
+            .map_err(|_| Status::invalid_argument("a user name is not a header value"))?;
+        req.metadata_mut().insert(crate::authz::FORWARDED_FOR, name);
+    }
+    Ok(req)
+}
+
 impl ApiService {
     pub(crate) fn caller<T>(&self, req: &Request<T>) -> Result<Caller, Status> {
         Caller::of(req, self.peer_tls.is_some())
@@ -351,7 +365,10 @@ impl Objects for ApiService {
                 .check(&self.store, Verb::Write, kind, &namespace)?;
         }
         match self.route(&req)? {
-            Route::Leader(mut c) => c.apply(forwarded(req.into_inner())).await,
+            Route::Leader(mut c) => {
+                let caller = self.caller(&req)?;
+                c.apply(forwarded_for(req.into_inner(), &caller)?).await
+            }
             Route::Local => Ok(Response::new(self.apply_local(req.into_inner()).await?)),
         }
     }
@@ -359,10 +376,10 @@ impl Objects for ApiService {
     async fn get(&self, req: Request<ObjectRef>) -> Result<Response<pb::Object>, Status> {
         check_namespace(&req.get_ref().namespace)?;
         let key = parse_ref(Some(req.get_ref().clone()))?;
-        self.caller(&req)?
-            .check(&self.store, Verb::Read, key.kind, &key.namespace)?;
+        let caller = self.caller(&req)?;
+        caller.check(&self.store, Verb::Read, key.kind, &key.namespace)?;
         if let Route::Leader(mut c) = self.route(&req)? {
-            return c.get(forwarded(req.into_inner())).await;
+            return c.get(forwarded_for(req.into_inner(), &caller)?).await;
         }
         let key = parse_ref(Some(req.into_inner()))?;
         self.consistent().await?;
@@ -381,7 +398,7 @@ impl Objects for ApiService {
             caller.check(&self.store, Verb::Read, kind, &namespace)?;
         }
         let mut listed = match self.route(&req)? {
-            Route::Leader(mut c) => c.list(forwarded(req.into_inner())).await?,
+            Route::Leader(mut c) => c.list(forwarded_for(req.into_inner(), &caller)?).await?,
             Route::Local => Response::new(self.list_local(req.into_inner()).await?),
         };
         // Across namespaces, a user sees those they may read in.
@@ -399,10 +416,10 @@ impl Objects for ApiService {
         req: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
         let key = parse_ref(req.get_ref().r#ref.clone())?;
-        self.caller(&req)?
-            .check(&self.store, Verb::Write, key.kind, &key.namespace)?;
+        let caller = self.caller(&req)?;
+        caller.check(&self.store, Verb::Write, key.kind, &key.namespace)?;
         if let Route::Leader(mut c) = self.route(&req)? {
-            return c.delete(forwarded(req.into_inner())).await;
+            return c.delete(forwarded_for(req.into_inner(), &caller)?).await;
         }
         let req = req.into_inner();
         let key = parse_ref(req.r#ref)?;
@@ -410,6 +427,10 @@ impl Objects for ApiService {
         let precondition = req
             .expected_version
             .map_or(Precondition::None, Precondition::Version);
+        // A node removed stays out: its certificate is refused from now.
+        if key.kind == Kind::Node && self.store.get(&key).map_err(internal)?.is_some() {
+            crate::removed::record(self, &key.name).await?;
+        }
         match self
             .write(Command::Delete {
                 key: key.clone(),
@@ -582,7 +603,9 @@ impl Cluster for ApiService {
                 &addr,
                 self.peer_tls.as_ref(),
             ));
-            c.usage(forwarded(req.into_inner())).await?.into_inner()
+            c.usage(forwarded_for(req.into_inner(), &caller)?)
+                .await?
+                .into_inner()
         } else {
             let mut nodes: BTreeMap<String, Vec<pb::TaskUsage>> = BTreeMap::new();
             for (key, (node, u)) in self.usage.fresh() {

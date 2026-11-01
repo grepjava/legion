@@ -107,7 +107,7 @@ impl Source<'_> {
                 creds,
             } => client.manifest(reference, *creds, oses).await,
             Source::Layout(dir) => {
-                let mut doc = Document::parse(&std::fs::read(dir.join("index.json"))?)?;
+                let mut doc = Document::parse(&std::fs::read(plain(dir, "index.json")?)?)?;
                 let mut digest = String::new();
                 // An index, possibly of indexes, down to a manifest.
                 for _ in 0..3 {
@@ -119,7 +119,7 @@ impl Source<'_> {
                         many => oci::select(many, oses)?,
                     };
                     digest = chosen.digest.clone();
-                    let bytes = std::fs::read(blob_path(dir, &digest)?)?;
+                    let bytes = std::fs::read(layout_blob(dir, &digest)?)?;
                     check(&bytes, &digest, "manifest")?;
                     doc = Document::parse(&bytes)?;
                 }
@@ -128,15 +128,15 @@ impl Source<'_> {
         }
     }
 
-    async fn blob(&self, digest: &str, dest: &Path) -> Result<(), Error> {
+    async fn blob(&self, digest: &str, size: u64, dest: &Path) -> Result<(), Error> {
         match self {
             Source::Registry {
                 client,
                 reference,
                 creds,
-            } => client.blob(reference, digest, dest, *creds).await,
+            } => client.blob(reference, digest, size, dest, *creds).await,
             Source::Layout(dir) => {
-                let from = blob_path(dir, digest)?;
+                let from = layout_blob(dir, digest)?;
                 let dest = dest.to_owned();
                 let digest = digest.to_owned();
                 blocking(move || {
@@ -172,6 +172,33 @@ impl std::io::Write for HashWriter<'_> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.0.flush()
     }
+}
+
+/// `name` in layout `dir`, if it is a plain file reached through no link:
+/// a layout from an archive may hold links to the host's files, or to
+/// devices that never end.
+fn plain(dir: &Path, name: &str) -> Result<PathBuf, Error> {
+    let mut path = dir.to_path_buf();
+    let mut parts = Path::new(name).components().peekable();
+    while let Some(part) = parts.next() {
+        path.push(part);
+        let meta = std::fs::symlink_metadata(&path)?;
+        let ok = match parts.peek() {
+            Some(_) => meta.is_dir(),
+            None => meta.is_file(),
+        };
+        if !ok {
+            return Err(Error::Unsupported(format!(
+                "{name} in the image layout is not a plain file or directory"
+            )));
+        }
+    }
+    Ok(path)
+}
+
+/// A blob of layout `dir`, as [`plain`].
+fn layout_blob(dir: &Path, digest: &str) -> Result<PathBuf, Error> {
+    plain(dir, &format!("blobs/sha256/{}", hex_of(digest)?))
 }
 
 fn blob_path(dir: &Path, digest: &str) -> Result<PathBuf, Error> {
@@ -562,7 +589,7 @@ impl Store {
         let name = match reference {
             Some(r) => r.to_owned(),
             None => {
-                let doc = Document::parse(&std::fs::read(&index)?)?;
+                let doc = Document::parse(&std::fs::read(plain(tmp.path(), "index.json")?)?)?;
                 doc.manifests
                     .unwrap_or_default()
                     .iter()
@@ -604,7 +631,9 @@ impl Store {
             .prefix("pull")
             .tempdir_in(self.dir.join("tmp"))?;
         let config_path = tmp.path().join("config.json");
-        source.blob(&manifest.config.digest, &config_path).await?;
+        source
+            .blob(&manifest.config.digest, manifest.config.size, &config_path)
+            .await?;
         let config_bytes = std::fs::read(&config_path)?;
         let config: ImageConfig = serde_json::from_slice(&config_bytes)
             .map_err(|e| Error::Unsupported(format!("the image config: {e}")))?;
@@ -655,7 +684,7 @@ impl Store {
             let need_blob = kept.as_ref().is_some_and(|k| !k.exists());
             if !have || need_blob {
                 let blob = tmp.path().join(format!("{i}.blob"));
-                source.blob(&desc.digest, &blob).await?;
+                source.blob(&desc.digest, desc.size, &blob).await?;
                 if let Some(k) = kept.as_ref().filter(|k| !k.exists()) {
                     std::fs::copy(&blob, k)?;
                 }
