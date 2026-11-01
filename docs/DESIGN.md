@@ -76,7 +76,10 @@ One binary, `legion`, with two roles:
   It always runs the **agent**. On manager nodes it also runs the **manager**.
   The agent follows its work through the dispatcher in either case, on a
   manager node through its own manager first.
-- `legion <command>` is the CLI. It talks gRPC over mTLS to any manager.
+- `legion <command>` is the CLI. It talks gRPC over mTLS to any manager:
+  `--server` or `LEGION_SERVER`, by default `127.0.0.1:7470`. A worker serves
+  no API, so on a worker the CLI must name a manager, or it is refused
+  (`Connection refused`).
 
 ```
                  ┌──────────────── manager nodes (3 or 5) ────────────────┐
@@ -252,7 +255,12 @@ Filter, then score, per task:
 
 1. **Filters**: node is `ready` and `active` (not drained or paused); platform
    constraints hold (`node.platform.arch`, `node.platform.linux == true` for
-   Linux images: the manager does not read images, 6.6);
+   Linux images: the manager does not read images, 6.6). For the same
+   reason it does not know an image's architectures: in a cluster of amd64
+   and arm64 nodes, a service whose image is published for one of them
+   needs `node.platform.arch == amd64` (or `arm64`), or a task placed on
+   the other fails to start. Reading the image's platforms at admission and
+   filtering on them is planned;
    resource **requests** fit in allocatable capacity; constraints match node
    labels; the task tolerates every taint on the node; required anti-affinity
    holds; host-mode published ports are free; stateful tasks go to the node
@@ -363,6 +371,21 @@ Built and tested in spike S4 (`crates/legion-store`).
   ms apart never kept a leader (the phase 2 exit test). Writes and
   linearizable reads give up after 30 s without a quorum, with an error
   saying the write may still apply, rather than hang.
+- **Losing managers.** A cluster keeps working while a majority of its
+  managers is up: one of 1, two of 3, three of 5. Losing the leader with a
+  majority left elects another in 5 to 10 s, and agents fail over to the
+  managers they learned from heartbeat replies. Two managers tolerate no
+  loss, as both are a majority, so they are less available than one. Below
+  a majority, or with the only manager down, the cluster is frozen: no API
+  (the CLI fails), no scheduling, no replacing tasks on down nodes, no
+  autoscaling and no certificate renewals. Agents keep running their
+  pods on the last assignments and endpoints they received, with their pf
+  rules and WireGuard peers in place, and retry a manager every 500 ms.
+  When the manager returns it reads its state from disk and the agents
+  reconcile with it. A manager whose disk is lost is rebuilt from a backup
+  (below). There is no promotion of a worker: a worker becomes a manager
+  by having its Node deleted and joining again with a manager token, from
+  an empty data directory.
 - **Backup and restore** (phase 4). `legion backup -o FILE` (cluster
   admin) has the leader read every object at one linearizable version,
   with the managers' ids and addresses, and streams it as JSON (file mode
@@ -676,7 +699,12 @@ default `10.88.0.0/16`, on a host that also runs Podman, for example).
   Two nodes behind different NATs do not reach each other (no relay),
   nor does a manager behind NAT serve Raft; those join through a site
   tunnel or VPN and advertise their address there, as the phase 2 exit
-  test does for a remote server.
+  test does for a remote server. A FreeBSD virtual machine on a desktop
+  (QEMU, UTM or VirtualBox on macOS, say) is such a worker: on a bridged
+  network it sits on the LAN beside the other local nodes and reaches them
+  directly; on the hypervisor's default user-mode NAT it sits behind a
+  second NAT and reaches the LAN's nodes only through it. It is not a
+  manager, being behind NAT and away whenever the host sleeps.
 - **Bridge sysctls**: `net.link.bridge.pfil_*` are per-VNET, and Legion runs
   in the host VNET, so they apply to every bridge on the host, other
   container runtimes' included. Load balancing needs none of them (the hairpin NAT rule in 5.4
@@ -1616,8 +1644,10 @@ WireGuard and bridge, with tasks as VNET jails attached to the node bridges.
 ## 13. Open questions
 
 1. Do we want a built-in image registry (a system service backed by ZFS) for air-gapped clusters?
-2. Package distribution: FreeBSD ports/pkg from the start, or release tarballs until phase 2?
-   Built: release tarballs (`packaging/freebsd/release.sh`, with an rc.d
-   script); a port is left for when the flags have settled.
+2. ~~Package distribution~~ Decided: both. Release tarballs for amd64
+   (`packaging/freebsd/release.sh`, with an rc.d script) are on GitHub,
+   and the port `sysutils/legion` (`packaging/freebsd/port`, amd64 and
+   aarch64) passes `poudriere testport` on 15.1 amd64 and builds on 15.1
+   arm64. It is to be submitted to the ports tree.
 3. ~~Licence~~ Decided: BSD-2-Clause, which fits the FreeBSD ecosystem.
 4. ~~Manage the system Podman's containers~~ Decided: no; Legion runs its own jails and leaves other runtimes alone.

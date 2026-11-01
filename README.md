@@ -17,9 +17,9 @@ IPv6, network volumes) are done; it is being hardened for real use.
 
 ## Install
 
-On FreeBSD 15, from a release tarball (or one made with
-`packaging/freebsd/release.sh`; a port is in `packaging/freebsd/port`), as
-root:
+On FreeBSD 15, from a release tarball (amd64; or one made with
+`packaging/freebsd/release.sh`, which also builds on arm64; a port for
+both is in `packaging/freebsd/port`), as root:
 
 ```sh
 tar -xf legion-<version>-freebsd15-amd64.tar.xz --strip-components 1 -C /usr/local
@@ -110,6 +110,33 @@ legion join-token manager            # or worker; on a member
 legion join <token> --manager 10.0.0.1:7470    # on the new node, then
 service legion start                           # or legion daemon
 ```
+
+Only managers serve the API, so on a worker the CLI needs a manager's
+address: `--server 10.0.0.1:7470`, or `LEGION_SERVER` in the shell's
+profile. Without it the CLI tries `127.0.0.1:7470` and the connection is
+refused.
+
+The cluster runs while a majority of its managers is up. One manager is
+a single point of control: while it is down, pods keep running and
+serving, but nothing can be deployed, scaled, rescheduled or renewed, and
+the CLI fails, until it is back. Three managers survive losing any one
+(the others elect a new leader in 5 to 10 s, and agents fail over), five
+survive two. Two are worse than one, as losing either stops the cluster.
+Managers exchange heartbeats every second, so they belong near each other
+(round trips well under a second). A worker becomes a manager by being
+removed and joining again with a manager token. Whatever the count, keep
+a `legion backup` and each manager's `<data-dir>/pki` off the cluster.
+
+A worker may sit behind NAT, such as a FreeBSD virtual machine on a desktop:
+it reaches the managers and keeps its WireGuard path open with keepalives.
+Two nodes behind different NATs cannot reach each other, so give such a
+VM a bridged network on the LAN of the other local nodes rather than the
+hypervisor's user-mode NAT. Managers must reach each other directly.
+
+amd64 and arm64 nodes may share a cluster. The manager does not read
+images, so a service whose image is published for one architecture only
+needs a constraint such as `node.platform.arch == amd64`, or a task placed
+on a node of the other fails to start.
 
 Compose files deploy as stacks. Each stack gets a namespace of its name, in
 which services find each other by their compose names; what Legion cannot
