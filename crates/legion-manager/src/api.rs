@@ -357,30 +357,29 @@ impl ApiService {
 #[tonic::async_trait]
 impl Objects for ApiService {
     async fn apply(&self, req: Request<ApplyRequest>) -> Result<Response<ApplyResponse>, Status> {
+        // A user's rights are checked where the request is served: a
+        // follower forwards them, its own copy may lag a new RoleBinding.
+        let caller = self.caller(&req)?;
+        if let Route::Leader(mut c) = self.route(&req)? {
+            return c.apply(forwarded_for(req.into_inner(), &caller)?).await;
+        }
         if let Some(o) = &req.get_ref().object {
             let kind = parse_kind(&o.kind)?;
             let mut namespace = o.namespace.clone();
             default_namespace(kind, &mut namespace);
-            self.caller(&req)?
-                .check(&self.store, Verb::Write, kind, &namespace)?;
+            caller.check(&self.store, Verb::Write, kind, &namespace)?;
         }
-        match self.route(&req)? {
-            Route::Leader(mut c) => {
-                let caller = self.caller(&req)?;
-                c.apply(forwarded_for(req.into_inner(), &caller)?).await
-            }
-            Route::Local => Ok(Response::new(self.apply_local(req.into_inner()).await?)),
-        }
+        Ok(Response::new(self.apply_local(req.into_inner()).await?))
     }
 
     async fn get(&self, req: Request<ObjectRef>) -> Result<Response<pb::Object>, Status> {
         check_namespace(&req.get_ref().namespace)?;
         let key = parse_ref(Some(req.get_ref().clone()))?;
         let caller = self.caller(&req)?;
-        caller.check(&self.store, Verb::Read, key.kind, &key.namespace)?;
         if let Route::Leader(mut c) = self.route(&req)? {
             return c.get(forwarded_for(req.into_inner(), &caller)?).await;
         }
+        caller.check(&self.store, Verb::Read, key.kind, &key.namespace)?;
         let key = parse_ref(Some(req.into_inner()))?;
         self.consistent().await?;
         match self.store.get(&key).map_err(internal)? {
@@ -392,15 +391,15 @@ impl Objects for ApiService {
     async fn list(&self, req: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
         let caller = self.caller(&req)?;
         let kind = parse_kind(&req.get_ref().kind)?;
+        if let Route::Leader(mut c) = self.route(&req)? {
+            return c.list(forwarded_for(req.into_inner(), &caller)?).await;
+        }
         if !req.get_ref().namespace.is_empty() || kind.is_cluster_scoped() {
             let mut namespace = req.get_ref().namespace.clone();
             default_namespace(kind, &mut namespace);
             caller.check(&self.store, Verb::Read, kind, &namespace)?;
         }
-        let mut listed = match self.route(&req)? {
-            Route::Leader(mut c) => c.list(forwarded_for(req.into_inner(), &caller)?).await?,
-            Route::Local => Response::new(self.list_local(req.into_inner()).await?),
-        };
+        let mut listed = Response::new(self.list_local(req.into_inner()).await?);
         // Across namespaces, a user sees those they may read in.
         if caller != Caller::All {
             listed
@@ -417,10 +416,10 @@ impl Objects for ApiService {
     ) -> Result<Response<DeleteResponse>, Status> {
         let key = parse_ref(req.get_ref().r#ref.clone())?;
         let caller = self.caller(&req)?;
-        caller.check(&self.store, Verb::Write, key.kind, &key.namespace)?;
         if let Route::Leader(mut c) = self.route(&req)? {
             return c.delete(forwarded_for(req.into_inner(), &caller)?).await;
         }
+        caller.check(&self.store, Verb::Write, key.kind, &key.namespace)?;
         let req = req.into_inner();
         let key = parse_ref(req.r#ref)?;
         check_namespace(&key.namespace)?;
@@ -428,8 +427,18 @@ impl Objects for ApiService {
             .expected_version
             .map_or(Precondition::None, Precondition::Version);
         // A node removed stays out: its certificate is refused from now.
-        if key.kind == Kind::Node && self.store.get(&key).map_err(internal)?.is_some() {
-            crate::removed::record(self, &key.name).await?;
+        // Only once the delete would go through, not for a stale version.
+        if key.kind == Kind::Node {
+            self.consistent().await?;
+            if let Some(node) = self.store.get(&key).map_err(internal)? {
+                if req
+                    .expected_version
+                    .is_some_and(|v| v != node.metadata.version)
+                {
+                    return Err(conflict(&key, Some(&node)));
+                }
+                crate::removed::record(self, &key.name).await?;
+            }
         }
         match self
             .write(Command::Delete {
@@ -593,20 +602,19 @@ impl Cluster for ApiService {
     ) -> Result<Response<pb::UsageResponse>, Status> {
         let caller = self.caller(&req)?;
         let namespace = req.get_ref().namespace.clone();
-        if !namespace.is_empty() {
-            check_namespace(&namespace)?;
-            caller.check(&self.store, Verb::Read, Kind::Task, &namespace)?;
-        }
-        // Only the leader hears heartbeats.
-        let mut usage = if let Some(addr) = self.leader_addr(&req)? {
+        check_namespace(&namespace)?;
+        // Only the leader hears heartbeats; it checks the user's rights.
+        if let Some(addr) = self.leader_addr(&req)? {
             let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
                 &addr,
                 self.peer_tls.as_ref(),
             ));
-            c.usage(forwarded_for(req.into_inner(), &caller)?)
-                .await?
-                .into_inner()
-        } else {
+            return c.usage(forwarded_for(req.into_inner(), &caller)?).await;
+        }
+        if !namespace.is_empty() {
+            caller.check(&self.store, Verb::Read, Kind::Task, &namespace)?;
+        }
+        let mut usage = {
             let mut nodes: BTreeMap<String, Vec<pb::TaskUsage>> = BTreeMap::new();
             for (key, (node, u)) in self.usage.fresh() {
                 let Some((ns, task)) = key.split_once('/') else {

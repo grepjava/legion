@@ -976,13 +976,26 @@ async fn a_removed_worker_stays_out_until_it_joins_again() {
     heartbeat(old.clone()).await.unwrap();
 
     let mut admin = m.objects().await;
+    let w1 = || {
+        Some(ObjectRef {
+            kind: "Node".into(),
+            namespace: String::new(),
+            name: "w1".into(),
+        })
+    };
+    // A delete refused for a stale version removes nothing.
+    let stale = admin
+        .delete(DeleteRequest {
+            r#ref: w1(),
+            expected_version: Some(u64::MAX),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), Code::Aborted, "{stale}");
+    heartbeat(old.clone()).await.unwrap();
     admin
         .delete(DeleteRequest {
-            r#ref: Some(ObjectRef {
-                kind: "Node".into(),
-                namespace: String::new(),
-                name: "w1".into(),
-            }),
+            r#ref: w1(),
             expected_version: None,
         })
         .await
