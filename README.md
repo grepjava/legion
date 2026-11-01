@@ -9,6 +9,12 @@ which it pulls into ZFS and runs itself. The plan and its rationale are in
 Kubernetes, CBSD and BastilleBSD is in [docs/COMPARISON.md](docs/COMPARISON.md), and how to build
 and ship images for it in [docs/IMAGES.md](docs/IMAGES.md).
 
+Images are built with [jailer](https://github.com/grepjava/jailer), its
+companion: it builds FreeBSD jail images from Containerfiles with nothing
+but the base system, runs them in a jail set up as a Legion node sets one
+up (it shares Legion's runtime and image store), and publishes them to any
+OCI registry. Legion also runs images made by buildah or Podman.
+
 Status: phases 1 (single node), 2 (cluster), 3 (K8s-lite: namespaces, RBAC,
 network policy, quotas, jobs, security profiles, metrics), 4 (stateful
 services and operations) and 5 (Legion's own jail runtime, Linux images,
