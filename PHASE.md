@@ -1423,7 +1423,9 @@ v0.1.4, and IMAGES.md installs that release. v0.1.7, tagged on
 config with other layer blobs, the API's request metrics, the WireGuard
 key under autolock, ingress HTTP/2 and connection reuse, and ingress
 certificates from ACME; its `Makefile.crates` is made from `Cargo.lock`
-(adding instant-acme).
+(adding instant-acme), and the port's `distinfo` for it (built,
+check-plist, stage-qa, packaged and portlint clean but its two known
+warnings). Its amd64 tarball is made from the port's staged build.
 
 Waiting on the user: an aarch64 tarball (no aarch64 host), a poudriere
 run and the port's submission.
