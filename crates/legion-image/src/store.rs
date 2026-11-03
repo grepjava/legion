@@ -571,7 +571,12 @@ impl Store {
         let tmp = tempfile::Builder::new()
             .prefix("load")
             .tempdir_in(self.dir.join("tmp"))?;
-        let out = std::process::Command::new("tar")
+        let mut tar = std::process::Command::new("tar");
+        // As root bsdtar sets the archive's file flags, which would keep
+        // the files from going with the directory.
+        #[cfg(target_os = "freebsd")]
+        tar.arg("--no-fflags");
+        let out = tar
             .arg("-xf")
             .arg(archive)
             .arg("-C")

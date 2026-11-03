@@ -37,9 +37,16 @@ impl FromStr for Cpu {
 }
 
 fn cpu_from_cores(cores: f64) -> Option<Cpu> {
-    let millis = cores * 1000.0;
-    (cores.is_finite() && cores >= 0.0 && millis.fract().abs() < 1e-6 && millis < u64::MAX as f64)
-        .then(|| Cpu(millis.round() as u64))
+    thousandths(cores).map(Cpu)
+}
+
+/// `x` in whole thousandths, if it has no finer part. Measured from the
+/// nearest whole number, not by `fract`: `2.01 * 1000.0` is
+/// `2009.9999999999998`.
+fn thousandths(x: f64) -> Option<u64> {
+    let t = x * 1000.0;
+    (x.is_finite() && x >= 0.0 && (t - t.round()).abs() < 1e-6 && t < u64::MAX as f64)
+        .then(|| t.round() as u64)
 }
 
 impl fmt::Display for Cpu {
@@ -237,8 +244,7 @@ quantity_serde!(
     Duration,
     "a duration such as `5s`",
     |n| n.checked_mul(1000).map(Duration),
-    |x| (x.is_finite() && x >= 0.0 && (x * 1000.0).fract().abs() < 1e-6)
-        .then(|| Duration((x * 1000.0).round() as u64))
+    |x| thousandths(x).map(Duration)
 );
 
 #[cfg(test)]
@@ -256,6 +262,17 @@ mod tests {
         assert_eq!(Cpu(2000).to_string(), "2");
         assert_eq!(serde_json::from_str::<Cpu>("0.25").unwrap(), Cpu(250));
         assert_eq!(serde_json::from_str::<Cpu>("1").unwrap(), Cpu(1000));
+        // Decimals binary floating point holds only nearly.
+        for (s, m) in [
+            ("2.01", 2010),
+            ("1.001", 1001),
+            ("2.03", 2030),
+            ("4.02", 4020),
+        ] {
+            assert_eq!(s.parse::<Cpu>().unwrap(), Cpu(m), "{s}");
+            assert_eq!(serde_json::from_str::<Cpu>(s).unwrap(), Cpu(m), "{s}");
+        }
+        assert!(serde_json::from_str::<Cpu>("1e300").is_err());
     }
 
     #[test]
@@ -288,5 +305,10 @@ mod tests {
             serde_json::from_str::<Duration>("1.5").unwrap(),
             Duration(1500)
         );
+        assert_eq!(
+            serde_json::from_str::<Duration>("2.01").unwrap(),
+            Duration(2010)
+        );
+        assert!(serde_json::from_str::<Duration>("1e300").is_err());
     }
 }

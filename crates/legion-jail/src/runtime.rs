@@ -90,15 +90,17 @@ pub struct JailRuntime {
     used: Used,
 }
 
-/// Attached execs by id. Each is removed when its exit code is taken, when
-/// its caller lets go, or [`EXEC_KEPT`] after its process ended.
+/// Attached execs by id. Each is removed when its caller lets go, or once
+/// nothing of it has run for [`EXEC_KEPT`] after its process ended.
 type Execs = Arc<Mutex<HashMap<String, Session>>>;
 
 /// How long an ended exec's exit code waits for its caller.
 const EXEC_KEPT: Duration = Duration::from_secs(60);
 
 /// Reaps an attached exec's process, then publishes its exit code and
-/// forgets the session once its caller has had time to take it.
+/// forgets the session once its caller has had time to take it, and what
+/// the process started has ended: until then, the caller's letting go
+/// still has to stop that.
 fn reap(
     mut child: tokio::process::Child,
     code: watch::Sender<Option<i32>>,
@@ -121,8 +123,23 @@ fn reap(
         };
         let got = status.ok().and_then(|s| s.code()).unwrap_or(255);
         let _ = code.send(Some(got));
-        tokio::time::sleep(EXEC_KEPT).await;
-        execs.lock().expect("execs").remove(&exec_id);
+        loop {
+            tokio::time::sleep(EXEC_KEPT).await;
+            let held = execs
+                .lock()
+                .expect("execs")
+                .get(&exec_id)
+                .map(|s| (s.group, s.jid));
+            match held {
+                // Let go already.
+                None => return,
+                Some((Some(group), jid)) if signal_group(group, jid, "0").await => continue,
+                Some(_) => {
+                    execs.lock().expect("execs").remove(&exec_id);
+                    return;
+                }
+            }
+        }
     });
 }
 
@@ -1435,7 +1452,8 @@ impl legion_runtime::Runtime for JailRuntime {
             .map_err(|_| api(500, "the exec session did not end"))?
             .map_err(internal)?
             .expect("some");
-        self.execs.lock().expect("execs").remove(exec_id);
+        // Kept: what the command started may still run, and letting go of
+        // the session stops it.
         Ok(got)
     }
 

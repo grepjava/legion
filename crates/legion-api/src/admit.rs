@@ -196,13 +196,18 @@ pub(crate) fn check_name(path: &str, name: &str) -> Result<(), Invalid> {
     crate::validate_name(name).map_err(|e| Invalid::new(path, e.to_string()))
 }
 
+/// An absolute path in its one plain spelling, so two that name the same
+/// place compare equal: no `..`, `.` or empty parts, no trailing `/`.
 pub(crate) fn check_absolute(path: &str, p: &str) -> Result<(), Invalid> {
-    if p.starts_with('/') && !p.split('/').any(|c| c == "..") {
+    let plain = p == "/"
+        || p.strip_prefix('/')
+            .is_some_and(|rest| rest.split('/').all(|c| !matches!(c, "" | "." | "..")));
+    if plain {
         Ok(())
     } else {
         Err(Invalid::new(
             path,
-            format!("{p:?} must be an absolute path without `..`"),
+            format!("{p:?} must be an absolute path without `..`, `.`, `//` or a trailing `/`"),
         ))
     }
 }
@@ -232,5 +237,17 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(why.contains("above the 1048576-byte limit"), "{why}");
+    }
+
+    #[test]
+    fn absolute_paths_have_one_spelling() {
+        for good in ["/", "/data", "/etc/app.conf", "/a..b/.c"] {
+            check_absolute("p", good).unwrap();
+        }
+        for bad in [
+            "", "data", "/data/", "//data", "/a//b", "/a/./b", "/.", "/a/..", "/a/../b",
+        ] {
+            assert!(check_absolute("p", bad).is_err(), "{bad:?}");
+        }
     }
 }

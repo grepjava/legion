@@ -146,7 +146,9 @@ fn is_host(s: &str) -> bool {
     let Some(port) = port else {
         return false;
     };
-    let port_ok = port.is_empty() || (port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit()));
+    // Digits only: `u16`'s parse takes a leading `+` too.
+    let port_ok = port.is_empty()
+        || (port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok_and(|p| p > 0));
     let host_ok = s.starts_with('[')
         || (!host.is_empty()
             && host.split('.').all(|l| {
@@ -272,6 +274,10 @@ mod tests {
             "-x.io/app",
             "x.io:/app",
             "x.io:http/app",
+            "x.io:0/app",
+            "x.io:65536/app",
+            "x.io:99999/app",
+            "x.io:+5000/app",
             "[::1/app",
             "[nope]:5000/app",
         ] {

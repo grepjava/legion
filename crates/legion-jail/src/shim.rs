@@ -295,15 +295,26 @@ mod imp {
             Ok(p) => p,
             Err(e) => fail(e),
         };
-        // SAFETY: the command's stdio: no input, output to the pipes.
+        // SAFETY: the command's stdio: no input, output to the pipes. Each
+        // is first moved above 2, as one started with stdio closed may
+        // have been given 0, 1 or 2: `dup2` onto itself would leave it
+        // close-on-exec, and one onto another's number would close that.
         unsafe {
-            let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
-            if null > 0 {
+            let above = |fd: libc::c_int| match fd {
+                0..=2 => libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3),
+                fd => fd,
+            };
+            let null = above(libc::open(
+                c"/dev/null".as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            ));
+            let (stdout, stderr) = (above(out[0]), above(out[1]));
+            if null >= 0 {
                 libc::dup2(null, 0);
                 libc::close(null);
             }
-            libc::dup2(out[0], 1);
-            libc::dup2(out[1], 2);
+            libc::dup2(stdout, 1);
+            libc::dup2(stderr, 2);
         }
         prepared.exec();
         fail(format!("{}: {}", rec.argv[0], errno()))

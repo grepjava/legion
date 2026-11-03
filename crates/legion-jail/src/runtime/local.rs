@@ -450,6 +450,8 @@ struct Resolver {
     made: Option<PathBuf>,
     /// The root's file was there, empty.
     was_empty: bool,
+    /// What was lent: a file that no longer holds it is the step's own.
+    lent: Vec<u8>,
 }
 
 impl Resolver {
@@ -457,7 +459,17 @@ impl Resolver {
         const HOST: &str = "/etc/resolv.conf";
         let path = root.join("etc/resolv.conf");
         let was = std::fs::symlink_metadata(&path).ok();
-        if was.as_ref().is_some_and(|m| m.is_symlink() || m.len() > 0) {
+        // The root's own, a link, or no file at all (a FIFO would hold
+        // the write up): left alone.
+        if was
+            .as_ref()
+            .is_some_and(|m| !m.file_type().is_file() || m.len() > 0)
+        {
+            return Ok(None);
+        }
+        // Nor lent through a linked `/etc` (`/etc -> usr/etc`): it might
+        // lead out of the root, and the step runs without it.
+        if std::fs::symlink_metadata(root.join("etc")).is_ok_and(|m| m.file_type().is_symlink()) {
             return Ok(None);
         }
         let Ok(host) = std::fs::read(HOST) else {
@@ -465,12 +477,13 @@ impl Resolver {
         };
         let made = first_missing(root, HOST);
         let path = target(root, HOST, true)?;
-        std::fs::write(&path, host).map_err(internal)?;
+        std::fs::write(&path, &host).map_err(internal)?;
         Ok(Some(Resolver {
             root: root.to_path_buf(),
             path,
             made,
             was_empty: was.is_some(),
+            lent: host,
         }))
     }
 }
@@ -480,6 +493,10 @@ impl Drop for Resolver {
         // The step may have made `/etc` or the file a link, maybe to the
         // host's own: then the root's is left as the step made it.
         if !unlinked(&self.root, &self.path) {
+            return;
+        }
+        // One the step wrote is the step's.
+        if std::fs::read(&self.path).ok().as_ref() != Some(&self.lent) {
             return;
         }
         let _ = std::fs::remove_file(&self.path);
@@ -694,6 +711,36 @@ mod tests {
         // The image's own is left alone.
         std::fs::write(root.join("etc/resolv.conf"), b"nameserver 10.0.0.1\n").unwrap();
         assert!(Resolver::lend(root).unwrap().is_none());
+        // One the step writes is the step's, whether there was none or an
+        // empty one.
+        for was_empty in [false, true] {
+            std::fs::remove_file(root.join("etc/resolv.conf")).unwrap();
+            if was_empty {
+                std::fs::write(root.join("etc/resolv.conf"), b"").unwrap();
+            }
+            let r = Resolver::lend(root).unwrap().unwrap();
+            std::fs::write(root.join("etc/resolv.conf"), b"nameserver 10.9.9.9\n").unwrap();
+            drop(r);
+            assert_eq!(
+                std::fs::read(root.join("etc/resolv.conf")).unwrap(),
+                b"nameserver 10.9.9.9\n"
+            );
+        }
+        // Nothing lent to a FIFO (the write would wait for a reader) or
+        // through a linked `/etc`.
+        std::fs::remove_file(root.join("etc/resolv.conf")).unwrap();
+        let fifo =
+            std::ffi::CString::new(root.join("etc/resolv.conf").as_os_str().as_encoded_bytes())
+                .unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(Resolver::lend(root).unwrap().is_none());
+        std::fs::remove_file(root.join("etc/resolv.conf")).unwrap();
+        std::fs::create_dir_all(root.join("usr/etc")).unwrap();
+        std::fs::remove_dir(root.join("etc")).unwrap();
+        std::os::unix::fs::symlink("usr/etc", root.join("etc")).unwrap();
+        assert!(Resolver::lend(root).unwrap().is_none());
+        assert!(!root.join("usr/etc/resolv.conf").exists());
     }
 
     /// A step that makes `/etc` or the file a link does not have what is
@@ -713,6 +760,7 @@ mod tests {
                     path: root.join("etc/resolv.conf"),
                     made: None,
                     was_empty,
+                    lent: b"lent\n".to_vec(),
                 };
                 if link_etc {
                     std::fs::remove_dir_all(root.join("etc")).unwrap();

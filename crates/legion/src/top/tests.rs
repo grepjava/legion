@@ -309,6 +309,28 @@ fn ended_tasks_only_on_asking() {
 }
 
 #[test]
+fn letters_with_ctrl_or_alt_do_nothing() {
+    let m = cluster();
+    let mut v = View::default();
+    typed(&mut v, &m, "2jj");
+    assert_eq!(ctrl(&mut v, &m, 'u'), None);
+    let alt = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT);
+    assert_eq!(v.key(&m, alt), None);
+    assert!(matches!(
+        typed(&mut v, &m, "u"),
+        Some(Request::Suspend { .. })
+    ));
+    // Nor do they answer a question.
+    let mut v = View::default();
+    typed(&mut v, &m, "2r");
+    assert_eq!(ctrl(&mut v, &m, 'y'), None);
+    assert!(matches!(
+        typed(&mut v, &m, "y"),
+        Some(Request::Rollback { .. })
+    ));
+}
+
+#[test]
 fn keys_act_on_the_selected_row() {
     let m = cluster();
     let mut v = View::default();

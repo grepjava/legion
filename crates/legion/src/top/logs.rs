@@ -86,11 +86,12 @@ fn clean(line: &str) -> String {
                 let n = 8 - out.chars().count() % 8;
                 out.extend(std::iter::repeat_n(' ', n));
             }
-            // ESC [ … a letter, or ESC and one more.
+            // ESC [ … its final byte (`@` to `~`, as ECMA-48 has it), or
+            // ESC and one more.
             '\u{1b}' => {
                 if chars.next() == Some('[') {
                     for c in chars.by_ref() {
-                        if c.is_ascii_alphabetic() || c == '~' {
+                        if ('@'..='~').contains(&c) {
                             break;
                         }
                     }
@@ -101,4 +102,25 @@ fn clean(line: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean;
+
+    #[test]
+    fn escapes_end_at_their_final_byte() {
+        assert_eq!(clean("\u{1b}[31mred\u{1b}[0m"), "red");
+        // Final bytes that are not letters: `@` (insert), `` ` ``, `{`, `|`.
+        for seq in [
+            "\u{1b}[2@",
+            "\u{1b}[5`",
+            "\u{1b}[1{",
+            "\u{1b}[3|",
+            "\u{1b}[2~",
+        ] {
+            assert_eq!(clean(&format!("{seq}kept text")), "kept text", "{seq:?}");
+        }
+        assert_eq!(clean("a\tb"), "a       b");
+    }
 }

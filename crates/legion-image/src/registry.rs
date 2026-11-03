@@ -99,6 +99,15 @@ impl Client {
         }
     }
 
+    /// Whether `url` is on the registry itself (same scheme, host and
+    /// port), where its credentials may go.
+    fn own_origin(&self, r: &Reference, url: &str) -> bool {
+        let origin = format!("{}://{}", self.scheme(r), r.host());
+        url.to_ascii_lowercase()
+            .strip_prefix(&origin)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', '?']))
+    }
+
     /// GET, answering one authentication challenge.
     async fn get(
         &self,
@@ -271,7 +280,9 @@ impl Client {
             .header(CONTENT_TYPE, "application/octet-stream")
             .header(CONTENT_LENGTH, bytes.len())
             .body(bytes);
-        if let Some(a) = auth_header {
+        // An upload elsewhere (object storage, say) is authorised by its
+        // URL: the registry's credentials stay with the registry.
+        if let Some(a) = auth_header.filter(|_| self.own_origin(r, &put_url)) {
             put_req = put_req.header(AUTHORIZATION, a);
         }
         let put_resp = put_req
@@ -660,5 +671,30 @@ mod tests {
         assert_eq!(scope(&r, None, true), "repository:me/app:pull,push");
         assert_eq!(scope(&r, pull, false), "repository:me/app:pull");
         assert_eq!(scope(&r, None, false), "repository:me/app:pull");
+    }
+
+    #[test]
+    fn credentials_stay_with_the_registry() {
+        let c = Client::new().unwrap();
+        let r = Reference::parse("r.example:5000/me/app:1").unwrap();
+        for own in [
+            "https://r.example:5000/v2/me/app/blobs/uploads/1?x=y",
+            "HTTPS://R.example:5000/v2/",
+            "https://r.example:5000",
+        ] {
+            assert!(c.own_origin(&r, own), "{own}");
+        }
+        for other in [
+            "http://r.example:5000/v2/me/app/blobs/uploads/1",
+            "https://r.example/v2/",
+            "https://r.example:50001/v2/",
+            "https://r.example:5000.evil/v2/",
+            "https://bucket.s3.example/upload?sig=1",
+        ] {
+            assert!(!c.own_origin(&r, other), "{other}");
+        }
+        let c = c.plain_http("r.example:5000");
+        assert!(c.own_origin(&r, "http://r.example:5000/v2/"));
+        assert!(!c.own_origin(&r, "https://r.example:5000/v2/"));
     }
 }

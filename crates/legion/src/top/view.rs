@@ -375,6 +375,14 @@ impl View {
             self.quit = true;
             return None;
         }
+        // A letter with Ctrl or Alt is not that letter: it neither
+        // answers, nor acts, nor moves.
+        let modified = matches!(k.code, KeyCode::Char(_))
+            && k.modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if self.prompt.is_some() && modified {
+            return None;
+        }
         if let Some(prompt) = self.prompt.take() {
             return self.answer(prompt, k);
         }
@@ -397,6 +405,9 @@ impl View {
         self.notice = None;
         if let Some(done) = self.pane_key(k) {
             return done;
+        }
+        if modified {
+            return None;
         }
         let rows = rows(model, self);
         let count = rows.len();

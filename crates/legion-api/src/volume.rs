@@ -160,24 +160,35 @@ impl Spec for VolumeSpec {
             }
         }
         if let Some(n) = &self.nfs {
-            if n.server.is_empty() || n.server.contains([':', '/', ' ']) && !is_ipv6(&n.server) {
+            if n.server.is_empty()
+                || n.server.starts_with('-')
+                || !plain(&n.server)
+                || n.server.contains([':', '/']) && !is_ipv6(&n.server)
+            {
                 return Err(Invalid::new("nfs.server", "a host name or address"));
             }
             if !n.path.starts_with('/') {
                 return Err(Invalid::new("nfs.path", "must be absolute"));
+            }
+            if !plain(&n.path) {
+                return Err(Invalid::new("nfs.path", "no spaces or control characters"));
             }
             if let Some(o) = n.options.iter().find(|o| !option_word(o)) {
                 return Err(Invalid::new("nfs.options", format!("bad option {o:?}")));
             }
         }
         if let Some(i) = &self.iscsi {
-            if i.portal.is_empty() || i.portal.contains([' ', '/']) {
+            if i.portal.is_empty()
+                || i.portal.starts_with('-')
+                || !plain(&i.portal)
+                || i.portal.contains('/')
+            {
                 return Err(Invalid::new("iscsi.portal", "host or host:port"));
             }
             if !(i.target.starts_with("iqn.")
                 || i.target.starts_with("eui.")
                 || i.target.starts_with("naa."))
-                || i.target.contains(' ')
+                || !plain(&i.target)
             {
                 return Err(Invalid::new(
                     "iscsi.target",
@@ -191,6 +202,12 @@ impl Spec for VolumeSpec {
         }
         Ok(())
     }
+}
+
+/// No whitespace or control characters: it goes on a command line, and
+/// comes back in `mount`'s whitespace-separated output.
+fn plain(s: &str) -> bool {
+    !s.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 fn is_ipv6(s: &str) -> bool {
@@ -304,6 +321,29 @@ mod tests {
             ),
             (
                 "driver: iscsi\niscsi: { portal: a, target: x }",
+                "iscsi.target",
+            ),
+            // Nothing a command line or `mount`'s output would misread.
+            ("driver: nfs\nnfs: { server: '-a', path: /x }", "nfs.server"),
+            (
+                "driver: nfs\nnfs: { server: \"a\\tb\", path: /x }",
+                "nfs.server",
+            ),
+            (
+                "driver: nfs\nnfs: { server: a, path: \"/x\\ny\" }",
+                "nfs.path",
+            ),
+            ("driver: nfs\nnfs: { server: a, path: '/x y' }", "nfs.path"),
+            (
+                "driver: iscsi\niscsi: { portal: '-d', target: iqn.x }",
+                "iscsi.portal",
+            ),
+            (
+                "driver: iscsi\niscsi: { portal: \"a\\tb\", target: iqn.x }",
+                "iscsi.portal",
+            ),
+            (
+                "driver: iscsi\niscsi: { portal: a, target: \"iqn.x\\ty\" }",
                 "iscsi.target",
             ),
             (
