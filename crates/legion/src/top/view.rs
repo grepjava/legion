@@ -7,7 +7,7 @@ use legion_api::data::DataSpec;
 use legion_api::job::{CronJobStatus, JobState, JobStatus};
 use legion_api::node::{NodeSpec, NodeState, NodeStatus};
 use legion_api::route::RouteSpec;
-use legion_api::service::ServiceStatus;
+use legion_api::service::{ServiceStatus, UpdateState};
 use legion_api::task::{TaskSpec, TaskState};
 use legion_api::volume::{VolumeSpec, VolumeStatus};
 use legion_api::{Kind, Object};
@@ -401,6 +401,8 @@ impl View {
         let rows = rows(model, self);
         let count = rows.len();
         let i = self.index();
+        // Rows may have gone since the selection was made.
+        self.selected[i] = self.selected[i].min(count.saturating_sub(1));
         let selected = rows.into_iter().nth(self.selected[i]).and_then(|r| r.key);
         if let KeyCode::Char(c) = k.code
             && let Some(key) = &selected
@@ -921,6 +923,15 @@ fn workload_rows(model: &Model) -> Vec<TableRow> {
     let services = model.of(Kind::Service).map(|s| {
         let st: ServiceStatus = status(s);
         let [cpu, memory] = usage_cells(used_by(Kind::Service, s));
+        let warn = st.update.as_ref().is_some_and(|u| {
+            matches!(
+                u.state,
+                UpdateState::Paused
+                    | UpdateState::RollingBack
+                    | UpdateState::RollbackPaused
+                    | UpdateState::RolledBack
+            )
+        });
         let update = st
             .update
             .as_ref()
@@ -931,9 +942,10 @@ fn workload_rows(model: &Model) -> Vec<TableRow> {
             format!("{}/{}", st.ready, st.desired),
             if short { fg(WARN) } else { fg(OK) },
         );
-        let state = match update.as_str() {
-            "rollingback" | "rolledback" | "paused" | "rollbackpaused" => colored(update, fg(WARN)),
-            _ => text(update),
+        let state = if warn {
+            colored(update, fg(WARN))
+        } else {
+            text(update)
         };
         TableRow::new(
             vec![

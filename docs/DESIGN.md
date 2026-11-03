@@ -208,7 +208,8 @@ preconditions. Rules:
   function) own tasks as Services do, so scheduling, quotas, draining and
   lost nodes treat them alike; their tasks carry `job: true` and the label
   `legion.job`, and are no Service's endpoints. A replicated Job has
-  completion slots `1..completions`, `parallelism` (1) running at once; a
+  completion slots `1..completions`, `parallelism` (1) running at once
+  (each at most 65536, as are `replicas` and `autoscale.max`); a
   global one a slot per eligible node, plus those it completed on. A slot
   is done when a task in it completes. A failed task is retried in its
   slot as a new task, after 10 s doubling per failure in a row (at most
@@ -571,7 +572,7 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
 | Disruption budgets | `maxUnavailable` on the service, honoured by drain and updates. | 3 |
 | Stateful services | `mode: stateful`: stable names `<svc>-<n>`, per-ordinal ZFS volumes from claims, ordered rollout (3.3). Data moves between nodes with `zfs send/recv`. | 4 |
 | Ingress | `Route` objects (host, path prefix, service, port) served by an HTTP proxy in every agent that enables it (5.8). | 4 |
-| Autoscaling | CPU and memory targets read from rctl; no separate metrics server. Every 15 s an agent's heartbeat carries what each running task's app containers use together (rctl `pcpu` and `memoryuse`); the leader keeps the reports in memory for a minute, believing each only from the task's own node. Each pass, a service with `autoscale` wants `ceil(measured × use / target)` replicas over its ready tasks with a report, for the target asking most, between `min` and `max`, and keeps its count while use is within a tenth of every target; ready tasks without a report count as idle for growing and on target for shrinking. Passes are far more frequent than reports, so the count follows from the reports alone. It grows at once and shrinks only to the most recommended over the last `downDelay` (5 min); a new leader waits that long before shrinking. Admission needs a target, `1 ≤ min ≤ max`, and every container requesting what a target measures; quotas count `max` tasks, so the service fits whatever it scales to. | 4 |
+| Autoscaling | CPU and memory targets read from rctl; no separate metrics server. Every 15 s an agent's heartbeat carries what each running task's app containers use together (rctl `pcpu` and `memoryuse`); the leader keeps the reports in memory for a minute, believing each only from the task's own node. Each pass, a service with `autoscale` wants `ceil(measured × use / target)` replicas over its ready tasks with a report, for the target asking most, between `min` and `max`, and keeps its count while use is within a tenth of every target; ready tasks without a report count as idle for growing and on target for shrinking. Passes are far more frequent than reports, so the count follows from the reports alone. It grows at once and shrinks only to the most recommended over the last `downDelay` (5 min); a new leader waits that long before shrinking. Admission needs a target, `1 ≤ min ≤ max ≤ 65536`, `replicas` (if set) between them, and every container requesting what a target measures; quotas count `max` tasks, so the service fits whatever it scales to. | 4 |
 | `apply` / `diff` | Server-side apply with field ownership kept simple: last applier wins per object. | 1 |
 | `logs`, `exec`, `port-forward` | Streamed through the manager to the agent, under RBAC (3.8). | 3 |
 

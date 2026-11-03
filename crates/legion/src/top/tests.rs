@@ -844,3 +844,60 @@ fn renders_max_scale_cluster_of_256_nodes_and_20000_tasks() {
         "{s}"
     );
 }
+
+#[test]
+fn failed_updates_are_highlighted() {
+    for (state, warn) in [
+        ("updating", false),
+        ("completed", false),
+        ("paused", true),
+        ("rolling-back", true),
+        ("rollback-paused", true),
+        ("rolled-back", true),
+    ] {
+        let mut m = cluster();
+        let mut s = service(10, 1, 2);
+        s.status["update"] = serde_json::json!({
+            "state": state, "generation": 1,
+            "previous": { "pod": { "containers": [{ "name": "web", "image": "nginx:1" }] } },
+        });
+        m.changed(true, s, 0);
+        let mut v = View::default();
+        typed(&mut v, &m, "2");
+        let mut t = Terminal::new(TestBackend::new(130, 20)).unwrap();
+        t.draw(|f| draw::render(f, &m, &v)).unwrap();
+        let buf = t.backend().buffer();
+        let at = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                (x..(x + state.len() as u16).min(buf.area.width))
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    == state
+            })
+            .unwrap_or_else(|| panic!("no {state}"));
+        assert_eq!(buf[at].fg == draw::WARN, warn, "{state}");
+    }
+}
+
+#[test]
+fn the_selection_follows_rows_that_went() {
+    let mut m = cluster();
+    let mut v = View::default();
+    typed(&mut v, &m, "3↓");
+    assert_eq!(v.selected[2], 1);
+    let gone = m
+        .of(Kind::Task)
+        .find(|t| t.metadata.name == "web-2-1")
+        .unwrap()
+        .clone();
+    m.changed(false, gone, 0);
+    // The details show the row left, and a key acts on it at once.
+    let s = screen_of(&m, &v, 170);
+    assert!(
+        !s.contains("Nothing selected.") && s.contains("task shop/web-1-1"),
+        "{s}"
+    );
+    typed(&mut v, &m, "↓");
+    assert_eq!(v.selected[2], 0);
+}

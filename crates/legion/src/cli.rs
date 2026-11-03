@@ -849,11 +849,7 @@ async fn connect(server: &str, identity: &Path) -> anyhow::Result<Channel> {
     let bundle = legion_pki::Bundle::parse(&pem)
         .with_context(|| format!("reading credentials from {}", identity.display()))?;
     let tls = legion_manager::client_config(&bundle.ca_pem, &bundle.cert_pem, &bundle.key_pem);
-    let addr = server
-        .strip_prefix("https://")
-        .or_else(|| server.strip_prefix("http://"))
-        .unwrap_or(server);
-    let url = format!("https://{addr}");
+    let url = format!("https://{}", host_port(server));
     Channel::from_shared(url.clone())
         .with_context(|| format!("bad server address {server:?}"))?
         .tls_config(tls)?
@@ -1211,6 +1207,14 @@ fn print_status(s: &StatusResponse) {
 
 /// `legion unlock`: sends a locked manager on this host its unlock key, in
 /// the clear, as the manager has no credentials to offer until unlocked.
+/// `--server` as `host:port`, with any scheme given dropped.
+fn host_port(server: &str) -> &str {
+    server
+        .strip_prefix("https://")
+        .or_else(|| server.strip_prefix("http://"))
+        .unwrap_or(server)
+}
+
 pub async fn unlock(server: &str, key_file: Option<&Path>) -> anyhow::Result<()> {
     let key = match key_file {
         Some(f) => {
@@ -1222,7 +1226,7 @@ pub async fn unlock(server: &str, key_file: Option<&Path>) -> anyhow::Result<()>
             key
         }
     };
-    let channel = Channel::from_shared(format!("http://{server}"))?
+    let channel = Channel::from_shared(format!("http://{}", host_port(server)))?
         .connect()
         .await
         .with_context(|| format!("reaching the manager at {server}"))?;
@@ -1239,6 +1243,17 @@ pub async fn unlock(server: &str, key_file: Option<&Path>) -> anyhow::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_server_may_name_its_scheme() {
+        for server in [
+            "127.0.0.1:7470",
+            "http://127.0.0.1:7470",
+            "https://127.0.0.1:7470",
+        ] {
+            assert_eq!(host_port(server), "127.0.0.1:7470");
+        }
+    }
 
     #[test]
     fn label_changes() {

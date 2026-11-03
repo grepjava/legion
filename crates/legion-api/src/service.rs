@@ -72,6 +72,7 @@ impl Autoscale {
                 ),
             ));
         }
+        check_count(&field(path, "max"), self.max)?;
         if self.cpu.is_none() && self.memory.is_none() {
             return Err(Invalid::new(path, "set a cpu or memory target"));
         }
@@ -99,6 +100,22 @@ impl Autoscale {
         }
         Ok(())
     }
+}
+
+/// The most tasks a count may ask for (`replicas`, `autoscale.max`, a Job's
+/// `completions` and `parallelism`): 256 nodes of at most 256 pod addresses
+/// each never run more at once.
+pub const MAX_REPLICAS: u32 = 1 << 16;
+
+/// Refuses a count above [`MAX_REPLICAS`].
+pub(crate) fn check_count(path: &str, n: u32) -> Result<(), Invalid> {
+    if n > MAX_REPLICAS {
+        return Err(Invalid::new(
+            path,
+            format!("{n} is above the limit of {MAX_REPLICAS}"),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -168,6 +185,9 @@ impl Spec for ServiceSpec {
                 }
             }
         }
+        if let Some(n) = self.replicas {
+            check_count("replicas", n)?;
+        }
         self.pod.admit("pod")?;
         if self.mode != ServiceMode::Stateful
             && let Some((name, _)) = self.pod.claims().next()
@@ -186,6 +206,17 @@ impl Spec for ServiceSpec {
                 ));
             }
             a.admit("autoscale", &self.pod)?;
+            if let Some(n) = self.replicas
+                && !(a.min..=a.max).contains(&n)
+            {
+                return Err(Invalid::new(
+                    "replicas",
+                    format!(
+                        "{n}: where an autoscaled service starts, between min {} and max {}",
+                        a.min, a.max
+                    ),
+                ));
+            }
         }
         if let Some(endpoint) = &mut self.endpoint {
             endpoint.admit("endpoint", &self.pod)?;
@@ -372,8 +403,15 @@ impl PodSpec {
         let sum = |cs: &[Container]| {
             cs.iter()
                 .fold(PodRequests::default(), |acc, c| PodRequests {
-                    cpu: Cpu(acc.cpu.0 + c.resources.requests.cpu.unwrap_or_default().0),
-                    memory: Bytes(acc.memory.0 + c.resources.requests.memory.unwrap_or_default().0),
+                    cpu: Cpu(acc
+                        .cpu
+                        .0
+                        .saturating_add(c.resources.requests.cpu.unwrap_or_default().0)),
+                    memory: Bytes(
+                        acc.memory
+                            .0
+                            .saturating_add(c.resources.requests.memory.unwrap_or_default().0),
+                    ),
                 })
         };
         let main = sum(&self.containers);

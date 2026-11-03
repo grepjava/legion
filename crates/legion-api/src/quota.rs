@@ -42,16 +42,24 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// Adds `n` tasks requesting `r` each.
+    /// Adds `n` tasks requesting `r` each; saturates, so a sum past
+    /// `u64` reads as over any quota.
     pub fn add_tasks(&mut self, r: PodRequests, n: u32) {
-        self.cpu = Cpu(self.cpu.0 + r.cpu.0 * u64::from(n));
-        self.memory = Bytes(self.memory.0 + r.memory.0 * u64::from(n));
-        self.tasks += n;
+        self.cpu = Cpu(self
+            .cpu
+            .0
+            .saturating_add(r.cpu.0.saturating_mul(u64::from(n))));
+        self.memory = Bytes(
+            self.memory
+                .0
+                .saturating_add(r.memory.0.saturating_mul(u64::from(n))),
+        );
+        self.tasks = self.tasks.saturating_add(n);
     }
 
     pub fn add_volume(&mut self, size: Option<Bytes>) {
-        self.volumes += 1;
-        self.storage = Bytes(self.storage.0 + size.map_or(0, |b| b.0));
+        self.volumes = self.volumes.saturating_add(1);
+        self.storage = Bytes(self.storage.0.saturating_add(size.map_or(0, |b| b.0)));
     }
 }
 
@@ -144,6 +152,24 @@ mod tests {
             cpu: Cpu(cpu),
             memory: Bytes(mem),
         }
+    }
+
+    #[test]
+    fn sums_saturate() {
+        let q: Quota = serde_yaml_ng::from_str("{ memory: 1Gi, storage: 1Gi }").unwrap();
+        let before = Usage::default();
+        let mut after = before;
+        after.add_tasks(pod(1, (1 << 63) + 1), 2);
+        after.add_volume(Some(Bytes(u64::MAX)));
+        after.add_volume(Some(Bytes(2)));
+        assert_eq!(after.memory, Bytes(u64::MAX));
+        assert_eq!(after.storage, Bytes(u64::MAX));
+        let over: Vec<_> = q
+            .exceeded(&before, &after)
+            .iter()
+            .map(|e| e.resource)
+            .collect();
+        assert_eq!(over, ["memory", "storage"]);
     }
 
     #[test]

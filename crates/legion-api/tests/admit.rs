@@ -90,6 +90,19 @@ fn design_example_is_admitted() {
 }
 
 #[test]
+fn pod_requests_saturate() {
+    let o = admitted(&service(
+        "  pod:
+    containers:
+      - { name: a, image: a:1, resources: { requests: { memory: \"9223372036854775808\" } } }
+      - { name: b, image: b:1, resources: { requests: { memory: \"9223372036854775809\" } } }
+",
+    ));
+    let spec: ServiceSpec = parse(&o.spec).unwrap();
+    assert_eq!(spec.pod.requests().memory.0, u64::MAX);
+}
+
+#[test]
 fn admission_is_idempotent() {
     let once = admitted(DESIGN_EXAMPLE);
     let mut twice = once.clone();
@@ -186,6 +199,28 @@ fn errors_name_the_field() {
         (
             "  mode: stateful\n  update: { order: start-first }\n  pod:\n    containers: [{ name: web, image: web:1 }]\n",
             "spec.update.order: a stateful task's volumes are its own",
+        ),
+        (
+            "  replicas: 65537
+  pod:
+    containers: [{ name: web, image: web:1 }]
+",
+            "spec.replicas: 65537 is above the limit of 65536",
+        ),
+        (
+            "  autoscale: { min: 1, max: 4294967295, cpu: 50 }
+  pod:
+    containers: [{ name: web, image: web:1, resources: { requests: { cpu: 1 } } }]
+",
+            "spec.autoscale.max: 4294967295 is above the limit",
+        ),
+        (
+            "  replicas: 9
+  autoscale: { min: 2, max: 5, cpu: 50 }
+  pod:
+    containers: [{ name: web, image: web:1, resources: { requests: { cpu: 1 } } }]
+",
+            "spec.replicas: 9: where an autoscaled service starts, between min 2 and max 5",
         ),
     ];
     for (spec, want) in cases {
@@ -316,6 +351,20 @@ fn jobs() {
 {POD}"
             ),
             "spec.completions: must be at least 1",
+        ),
+        (
+            format!(
+                "  completions: 4294967295
+{POD}"
+            ),
+            "spec.completions: 4294967295 is above the limit of 65536",
+        ),
+        (
+            format!(
+                "  parallelism: 65537
+{POD}"
+            ),
+            "spec.parallelism: 65537 is above the limit",
         ),
         (
             format!(

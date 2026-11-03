@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::admit::{Invalid, Spec, field};
 use crate::quantity::Duration;
-use crate::service::{Placement, PodSpec, RestartCondition};
+use crate::service::{Placement, PodSpec, RestartCondition, check_count};
 
 /// Label on a Job's tasks naming the Job.
 pub const LABEL_JOB: &str = "legion.job";
@@ -67,9 +67,11 @@ impl JobSpec {
                     ("completions", &mut self.completions),
                     ("parallelism", &mut self.parallelism),
                 ] {
-                    if *v.get_or_insert(1) == 0 {
+                    let n = *v.get_or_insert(1);
+                    if n == 0 {
                         return Err(Invalid::new(field(path, name), "must be at least 1"));
                     }
+                    check_count(&field(path, name), n)?;
                 }
             }
             JobMode::Global => {

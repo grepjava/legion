@@ -288,9 +288,8 @@ fn color(c: vt100::Color) -> Option<Color> {
 fn upper_body(f: &mut Frame, model: &Model, view: &View, rows: Vec<TableRow>, body: Rect) {
     let width = f.area().width;
     if shows_detail(view, width) {
-        let selected = rows
-            .get(view.selected[view.index()])
-            .and_then(|r| r.key.clone());
+        let at = view.selected[view.index()].min(rows.len().saturating_sub(1));
+        let selected = rows.get(at).and_then(|r| r.key.clone());
         let side = (width / 3).clamp(40, 70);
         let [table, detail_area] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(side)]).areas(body);
