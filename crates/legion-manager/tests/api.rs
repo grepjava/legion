@@ -754,6 +754,25 @@ async fn nodes_join_with_tokens() {
     legion_manager::join(&first.addr, &rotated, "w2", 0, "")
         .await
         .unwrap();
+    // A token certifies no node already in the cluster, under its name.
+    let w5 = DispatcherClient::new(
+        first
+            .channel(Some(&creds(&ca, "w5", Role::Worker)))
+            .await
+            .unwrap(),
+    );
+    w5.clone()
+        .register(RegisterRequest {
+            node: String::new(),
+            status_json: br#"{"state":"ready"}"#.to_vec(),
+            role: String::new(),
+        })
+        .await
+        .unwrap();
+    let err = legion_manager::join(&first.addr, &rotated, "w5", 0, "")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("w5 is in the cluster"), "{err}");
     let other = Ca::generate().unwrap();
     let foreign = format!("LGN-1-{}-x", other.digest());
     let err = legion_manager::join(&first.addr, &foreign, "w3", 0, "")
@@ -1089,6 +1108,19 @@ async fn a_removed_worker_stays_out_until_it_joins_again() {
         .unwrap()
         .as_secs();
     manager.clone().heartbeat(forwarded_for(now)).await.unwrap();
+
+    // A worker a manager forwards for registers as a worker, even named
+    // as that manager is and asking for more.
+    let mut req = tonic::Request::new(RegisterRequest {
+        node: "m9".into(),
+        status_json: br#"{"state":"ready"}"#.to_vec(),
+        role: "manager".into(),
+    });
+    let md = req.metadata_mut();
+    md.insert("legion-forwarded-worker", "m9".parse().unwrap());
+    md.insert("legion-forwarded-issued", now.into());
+    manager.clone().register(req).await.unwrap();
+    assert_eq!(node_role(&m, "m9").as_deref(), Some("worker"));
     m.stop().await;
 }
 
@@ -2262,4 +2294,185 @@ async fn a_restored_manager_leads_alone_and_ignores_the_old_cluster() {
     for m in managers {
         m.stop().await;
     }
+}
+
+/// Deleting a task that has not ended stops it: it stays until its agent
+/// reports it gone, and its slot gets no other task before then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deleting_a_running_task_stops_it_first() {
+    let m = Running::start().await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let d = DispatcherClient::new(m.channel(None).await.unwrap());
+    let register = || {
+        let mut d = d.clone();
+        async move {
+            d.register(RegisterRequest {
+                node: "w1".into(),
+                status_json: br#"{"state":"ready"}"#.to_vec(),
+                ..Default::default()
+            })
+            .await
+        }
+    };
+    eventually(register).await;
+    let beating = {
+        let d = d.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = d
+                    .clone()
+                    .heartbeat(HeartbeatRequest {
+                        node: "w1".into(),
+                        usage: Vec::new(),
+                    })
+                    .await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
+    apply_json(
+        &m,
+        "Service",
+        "web",
+        serde_json::json!({
+            "replicas": 1,
+            "pod": { "containers": [{ "name": "web", "image": "web:1" }] },
+        }),
+    )
+    .await;
+    let tasks = |m: &Running| {
+        m.store
+            .list(legion_api::Kind::Task, Some("default"))
+            .unwrap()
+            .objects
+    };
+    until("the task is assigned", || {
+        tasks(&m).iter().any(|t| t.spec["node"] == "w1")
+    })
+    .await;
+    let task = tasks(&m).remove(0);
+    let report = |state: &str| ReportRequest {
+        node: "w1".into(),
+        namespace: "default".into(),
+        name: task.metadata.name.clone(),
+        uid: task.metadata.uid.clone(),
+        status_json: format!(r#"{{"state":"{state}"}}"#).into_bytes(),
+    };
+    d.clone().report(report("running")).await.unwrap();
+    let key = task.key();
+    until("it runs", || {
+        m.store.get(&key).unwrap().unwrap().status["state"] == "running"
+    })
+    .await;
+
+    let objects = m.objects().await;
+    let delete = || {
+        let mut objects = objects.clone();
+        let r#ref = Some(get("Task", "default", &task.metadata.name));
+        async move {
+            objects
+                .delete(DeleteRequest {
+                    r#ref,
+                    ..Default::default()
+                })
+                .await
+        }
+    };
+    delete().await.unwrap();
+    let stopping = m.store.get(&key).unwrap().expect("still there");
+    assert_eq!(stopping.spec["desiredState"], "shutdown");
+    // Deleting it again changes nothing.
+    delete().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let now = tasks(&m);
+    assert_eq!(now.len(), 1, "no replacement while it stops: {now:?}");
+
+    d.clone().report(report("shutdown")).await.unwrap();
+    until("a replacement once it has stopped", || tasks(&m).len() == 2).await;
+    // Ended, it goes when deleted.
+    delete().await.unwrap();
+    assert!(m.store.get(&key).unwrap().is_none());
+    beating.abort();
+    m.stop().await;
+}
+
+/// A Volume in use keeps its storage: an agent would not see the change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_volume_in_use_keeps_its_storage() {
+    let m = Running::start().await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let lun = |target: &str| {
+        serde_json::json!({
+            "driver": "iscsi",
+            "iscsi": { "portal": "192.0.2.5", "target": target, "lun": 0 },
+        })
+    };
+    let objects = m.objects().await;
+    let try_apply = |spec: serde_json::Value| {
+        let objects = objects.clone();
+        async move {
+            objects
+                .clone()
+                .apply(object("Volume", "default", "lun", spec))
+                .await
+        }
+    };
+    apply_json(&m, "Volume", "lun", lun("iqn.2026-11.test:a")).await;
+    // Unused, it may name another LUN.
+    try_apply(lun("iqn.2026-11.test:b")).await.unwrap();
+
+    // Held by a node: no.
+    let key = legion_api::ObjectKey::new(legion_api::Kind::Volume, "default", "lun");
+    let mut held = m.store.get(&key).unwrap().unwrap();
+    held.status = serde_json::json!({ "node": "w1" });
+    m.store
+        .raft
+        .client_write(legion_store::Command::Put {
+            object: held.clone(),
+            precondition: legion_store::Precondition::None,
+        })
+        .await
+        .unwrap();
+    let err = try_apply(lun("iqn.2026-11.test:c")).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+    assert!(err.message().contains("held by node w1"), "{err}");
+
+    // Mounted by a task that has not ended: no either.
+    held.status = serde_json::Value::Null;
+    m.store
+        .raft
+        .client_write(legion_store::Command::Put {
+            object: held,
+            precondition: legion_store::Precondition::None,
+        })
+        .await
+        .unwrap();
+    apply_json(
+        &m,
+        "Service",
+        "db",
+        serde_json::json!({
+            "replicas": 1,
+            "pod": {
+                "containers": [{
+                    "name": "db", "image": "db:1",
+                    "volumeMounts": [{ "name": "data", "path": "/data" }],
+                }],
+                "volumes": [{ "name": "data", "volume": { "name": "lun" } }],
+            },
+        }),
+    )
+    .await;
+    until("its task", || {
+        !m.store
+            .list(legion_api::Kind::Task, Some("default"))
+            .unwrap()
+            .objects
+            .is_empty()
+    })
+    .await;
+    let err = try_apply(lun("iqn.2026-11.test:c")).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+    assert!(err.message().contains("mounted by task"), "{err}");
+    m.stop().await;
 }

@@ -77,30 +77,41 @@ pub(crate) async fn issue_after(store: &Store, node: &str) -> Result<(), Status>
 }
 
 /// Records that `node` is being removed, now. Run before its Node goes, so
-/// the node cannot come back in between. Returns the time recorded, for
-/// [`forget`].
-pub(crate) async fn record(api: &ApiService, node: &str) -> Result<u64, Status> {
+/// the node cannot come back in between. Returns what [`forget`] needs to
+/// undo it.
+pub(crate) async fn record(api: &ApiService, node: &str) -> Result<Recorded, Status> {
     change(api, |removed| {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        removed.insert(node.to_owned(), now);
-        Some(now)
+        let before = removed.insert(node.to_owned(), now);
+        Some(Recorded { at: now, before })
     })
     .await
-    .map(|at| at.expect("always recorded"))
+    .map(|r| r.expect("always recorded"))
 }
 
-/// Undoes [`record`] of `node` at `at` for a removal that did not happen,
-/// unless it was recorded again since.
-pub(crate) async fn forget(api: &ApiService, node: &str, at: u64) -> Result<(), Status> {
+/// A removal [`record`] wrote: when, and the earlier one it replaced.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Recorded {
+    at: u64,
+    before: Option<u64>,
+}
+
+/// Undoes [`record`] of `node` for a removal that did not happen, unless
+/// it was recorded again since: an earlier removal stands, so certificates
+/// from before it stay refused.
+pub(crate) async fn forget(api: &ApiService, node: &str, r: Recorded) -> Result<(), Status> {
     change(api, |removed| {
-        if removed.get(node) != Some(&at) {
+        if removed.get(node) != Some(&r.at) {
             return None;
         }
-        removed.remove(node);
-        Some(at)
+        match r.before {
+            Some(before) => removed.insert(node.to_owned(), before),
+            None => removed.remove(node),
+        };
+        Some(())
     })
     .await
     .map(drop)

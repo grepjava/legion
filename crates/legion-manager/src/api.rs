@@ -237,6 +237,9 @@ impl ApiService {
                     ApplyResult::Created,
                 ),
             };
+            if let Some(cur) = &current {
+                check_storage(&self.store, cur, &object)?;
+            }
             crate::quota::check(&self.store, &object)?;
             crate::security::check(&self.store, &object)?;
             if req.dry_run {
@@ -273,6 +276,50 @@ impl ApiService {
             "{key} is changing too fast; retry"
         )))
     }
+}
+
+/// Refuses a Volume another storage while it is in use: a node holds it
+/// (its dataset, or the LUN or plugin volume it has attached) or a task
+/// that has not ended mounts it. Agents keep what they mounted, so the
+/// change would not reach them.
+fn check_storage(store: &Store, cur: &Object, next: &Object) -> Result<(), Status> {
+    use legion_api::task::{TaskSpec, TaskStatus};
+    use legion_api::volume::{VolumeSpec, VolumeStatus};
+    if cur.kind != Kind::Volume {
+        return Ok(());
+    }
+    let (before, after): (VolumeSpec, VolumeSpec) = (
+        legion_api::parse(&cur.spec).map_err(internal)?,
+        legion_api::parse(&next.spec).map_err(invalid)?,
+    );
+    if before.same_storage(&after) {
+        return Ok(());
+    }
+    let key = cur.key();
+    let refuse = |why: String| {
+        Err(Status::failed_precondition(format!(
+            "{key} {why}: its driver and source change only once nothing uses it"
+        )))
+    };
+    let status: VolumeStatus = serde_json::from_value(cur.status.clone()).unwrap_or_default();
+    if !status.node.is_empty() {
+        return refuse(format!("is held by node {}", status.node));
+    }
+    let tasks = store
+        .list(Kind::Task, Some(&cur.metadata.namespace))
+        .map_err(internal)?;
+    for t in &tasks.objects {
+        let (Ok(spec), Ok(state)) = (
+            serde_json::from_value::<TaskSpec>(t.spec.clone()),
+            serde_json::from_value::<TaskStatus>(t.status.clone()),
+        ) else {
+            continue;
+        };
+        if !state.state.is_terminal() && spec.uses_volume(&cur.metadata.name) {
+            return refuse(format!("is mounted by task {}", t.metadata.name));
+        }
+    }
+    Ok(())
 }
 
 fn default_namespace(kind: Kind, namespace: &mut String) {
@@ -337,6 +384,59 @@ fn forwarded_for<T>(inner: T, caller: &Caller) -> Result<Request<T>, Status> {
 impl ApiService {
     pub(crate) fn caller<T>(&self, req: &Request<T>) -> Result<Caller, Status> {
         Caller::of(req, self.peer_tls.is_some())
+    }
+
+    /// Deleting a Task that has not ended asks it to stop instead: its
+    /// pod may still run, and its owner replaces it only once the agent
+    /// has torn it down (a stateful task's volumes are then free). The
+    /// stopped task is then deleted as any other, or with its owner.
+    /// Returns the version written, or `None` for a task to delete now.
+    async fn stop_task(
+        &self,
+        key: &ObjectKey,
+        expected: Option<u64>,
+    ) -> Result<Option<u64>, Status> {
+        use legion_api::task::{DesiredState, TaskSpec, TaskStatus};
+        for _ in 0..APPLY_ATTEMPTS {
+            let Some(mut task) = self.store.get(key).map_err(internal)? else {
+                return Ok(None);
+            };
+            if expected.is_some_and(|v| v != task.metadata.version) {
+                return Err(conflict(key, Some(&task)));
+            }
+            let status: TaskStatus =
+                serde_json::from_value(task.status.clone()).unwrap_or_default();
+            if status.state.is_terminal() {
+                return Ok(None);
+            }
+            let mut spec: TaskSpec = serde_json::from_value(task.spec.clone()).map_err(internal)?;
+            if spec.desired_state == DesiredState::Shutdown {
+                return Ok(Some(task.metadata.version));
+            }
+            spec.desired_state = DesiredState::Shutdown;
+            task.spec = serde_json::to_value(&spec).map_err(internal)?;
+            let precondition = Precondition::Version(task.metadata.version);
+            match self
+                .write(Command::Put {
+                    object: task,
+                    precondition,
+                })
+                .await?
+            {
+                Outcome::Written(o) => return Ok(Some(o.metadata.version)),
+                Outcome::Conflict { .. } if expected.is_none() => continue,
+                Outcome::Conflict { .. } => {
+                    return Err(conflict(
+                        key,
+                        self.store.get(key).map_err(internal)?.as_ref(),
+                    ));
+                }
+                other => return Err(Status::internal(format!("unexpected outcome {other:?}"))),
+            }
+        }
+        Err(Status::aborted(format!(
+            "{key} is changing too fast; retry"
+        )))
     }
 
     async fn list_local(&self, req: ListRequest) -> Result<ListResponse, Status> {
@@ -437,6 +537,11 @@ impl Objects for ApiService {
         let req = req.into_inner();
         let key = parse_ref(req.r#ref)?;
         check_namespace(&key.namespace)?;
+        if key.kind == Kind::Task
+            && let Some(version) = self.stop_task(&key, req.expected_version).await?
+        {
+            return Ok(Response::new(DeleteResponse { version }));
+        }
         let precondition = req
             .expected_version
             .map_or(Precondition::None, Precondition::Version);
@@ -462,8 +567,10 @@ impl Objects for ApiService {
                 precondition,
             })
             .await?;
-        if let (Outcome::Conflict { .. }, Some(at)) = (&deleted, removing) {
-            crate::removed::forget(self, &key.name, at).await?;
+        // Not when the Node is gone: another delete took it meanwhile, and
+        // the removal stands.
+        if let (Outcome::Conflict { current: Some(_) }, Some(r)) = (&deleted, removing) {
+            crate::removed::forget(self, &key.name, r).await?;
         }
         match deleted {
             Outcome::Deleted { version } => Ok(Response::new(DeleteResponse { version })),
@@ -504,6 +611,8 @@ impl Objects for ApiService {
                 let next = tokio::select! {
                     next = watcher.next() => Some(next),
                     _ = closing.wait_for(|c| *c) => None,
+                    // Gone, though nothing it may see has happened since.
+                    () = tx.closed() => return,
                 };
                 // A client too slow to take this ends with the stream.
                 let Some(next) = next else {

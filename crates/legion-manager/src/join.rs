@@ -175,6 +175,20 @@ impl Issuer {
             .ok_or_else(|| Status::permission_denied("invalid or rotated join token"))?;
         legion_api::validate_name(&req.name)
             .map_err(|e| Status::invalid_argument(format!("node name: {e}")))?;
+        // A node's name is who it is: a token certifies a new node, never
+        // one in the cluster (which is removed first to join again).
+        let node = ObjectKey::new(Kind::Node, "", &req.name);
+        if self
+            .store
+            .get(&node)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .is_some()
+        {
+            return Err(Status::already_exists(format!(
+                "node {0} is in the cluster; delete its Node (`legion delete node {0}`) to join                  it again",
+                req.name
+            )));
+        }
         let id = Identity::new(&req.name, role);
         crate::removed::issue_after(&self.store, &req.name).await?;
         let cert_pem = self

@@ -119,6 +119,15 @@ impl VolumeSpec {
             },
         }
     }
+
+    /// Whether `other` names the same storage: the driver and its source.
+    /// A ZFS volume's size and node may change under its tasks; these not.
+    pub fn same_storage(&self, other: &VolumeSpec) -> bool {
+        self.driver == other.driver
+            && self.nfs == other.nfs
+            && self.iscsi == other.iscsi
+            && self.plugin == other.plugin
+    }
 }
 
 impl Spec for VolumeSpec {

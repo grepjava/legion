@@ -310,6 +310,7 @@ impl DispatcherService {
         name: &str,
         role: NodeRole,
         status: NodeStatus,
+        issued: Option<SystemTime>,
     ) -> Result<RegisterResponse, Status> {
         let key = ObjectKey::new(Kind::Node, "", name);
         // A node that registers is alive.
@@ -322,6 +323,11 @@ impl DispatcherService {
         for _ in 0..ATTEMPTS {
             let existing = self.get(&key)?;
             if existing.is_none() {
+                // Its Node deleted since its certificate was checked: the
+                // removal, recorded first, is in this replica's store now.
+                if let Some(issued) = issued {
+                    crate::removed::check(self.store(), name, issued)?;
+                }
                 // The Node comes before its subnet's reservation, so a
                 // reservation without a Node is never one being made and
                 // may be reused. Its state is unknown, and it takes no
@@ -633,13 +639,21 @@ impl Dispatcher for DispatcherService {
         req: Request<RegisterRequest>,
     ) -> Result<Response<RegisterResponse>, Status> {
         let node = self.node(&req, &req.get_ref().node)?;
-        let role = registering_role(
-            crate::tls::caller(&req, self.tls)?,
-            &node,
-            &req.get_ref().role,
-        );
+        // A worker a manager forwards for is a worker, whatever its name.
+        let forwarded = self.forwarded_worker(&req)?;
+        let role = match forwarded {
+            Some(_) => NodeRole::Worker,
+            None => registering_role(
+                crate::tls::caller(&req, self.tls)?,
+                &node,
+                &req.get_ref().role,
+            ),
+        };
+        let worker = match forwarded {
+            Some(w) => Some(w),
+            None => self.worker(&req)?,
+        };
         if let Some(mut leader) = self.leader(&req)? {
-            let worker = self.worker(&req)?;
             let mut inner = req.into_inner();
             inner.node = node;
             inner.role = role.as_str().to_owned();
@@ -647,8 +661,9 @@ impl Dispatcher for DispatcherService {
         }
         let status: NodeStatus =
             serde_json::from_slice(&req.get_ref().status_json).map_err(invalid)?;
+        let issued = worker.map(|(_, issued)| issued);
         Ok(Response::new(
-            self.register_local(&node, role, status).await?,
+            self.register_local(&node, role, status, issued).await?,
         ))
     }
 

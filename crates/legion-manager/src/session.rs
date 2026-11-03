@@ -54,6 +54,19 @@ struct Pending {
     attached: oneshot::Sender<Attachment>,
 }
 
+/// An offered session's entry in [`HubState::pending`], removed when
+/// dropped (an agent attaching has removed it already).
+struct Waiting<'a> {
+    hub: &'a Hub,
+    id: String,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.hub.inner.lock().unwrap().pending.remove(&self.id);
+    }
+}
+
 /// An agent's end of a session.
 pub(crate) struct Attachment {
     pub(crate) from_agent: Streaming<SessionFrame>,
@@ -101,21 +114,18 @@ impl Hub {
                 "the agent of node {node} is not connected to this manager"
             ))
         })?;
-        let forget = |hub: &Hub| hub.inner.lock().unwrap().pending.remove(&id);
+        // However this ends, given up on included, the offer goes.
+        let _waiting = Waiting { hub: self, id };
         if agent.send(Ok(offer)).await.is_err() {
-            forget(self);
             return Err(Status::unavailable(format!(
                 "the agent of node {node} went away"
             )));
         }
         match tokio::time::timeout(ATTACH_TIMEOUT, wait).await {
             Ok(Ok(a)) => Ok(a),
-            _ => {
-                forget(self);
-                Err(Status::unavailable(format!(
-                    "the agent of node {node} did not take the session"
-                )))
-            }
+            _ => Err(Status::unavailable(format!(
+                "the agent of node {node} did not take the session"
+            ))),
         }
     }
 
@@ -344,70 +354,89 @@ async fn relay(
         mut from_agent,
         to_agent,
     } = agent;
-    let mut user_sending = true;
-    let mut shutting_down = false;
-    loop {
-        tokio::select! {
-            frame = from_user.next(), if user_sending => match frame {
-                Some(Ok(SessionFrame { frame: Some(f @ (Frame::Input(_) | Frame::InputClosed(_) | Frame::Resize(_))) })) => {
-                    if to_agent.send(Ok(SessionFrame { frame: Some(f) })).await.is_err() {
-                        break;
+    // Each way runs on its own, so one side not reading holds up only
+    // what goes to it.
+    let up = async {
+        while let Some(frame) = from_user.next().await {
+            match frame {
+                Ok(SessionFrame {
+                    frame: Some(f @ (Frame::Input(_) | Frame::InputClosed(_) | Frame::Resize(_))),
+                }) => {
+                    if to_agent
+                        .send(Ok(SessionFrame { frame: Some(f) }))
+                        .await
+                        .is_err()
+                    {
+                        return;
                     }
                 }
-                Some(Ok(_)) => {
+                Ok(_) => {
                     let _ = to_user
                         .send(Err(Status::invalid_argument(
                             "after `open`, a client sends only input and resizes",
                         )))
                         .await;
-                    break;
+                    return;
                 }
                 // The user is gone.
-                Some(Err(_)) => break,
-                // The user has no more to send, which closes input.
-                None => {
-                    user_sending = false;
-                    let closed = SessionFrame { frame: Some(Frame::InputClosed(InputClosed {})) };
-                    if to_agent.send(Ok(closed)).await.is_err() {
-                        break;
-                    }
-                }
-            },
-            frame = from_agent.next() => match frame {
-                Some(Ok(SessionFrame { frame: Some(Frame::Error(e)) })) => {
+                Err(_) => return,
+            }
+        }
+        // The user has no more to send, which closes input; output goes on.
+        let closed = SessionFrame {
+            frame: Some(Frame::InputClosed(InputClosed {})),
+        };
+        if to_agent.send(Ok(closed)).await.is_ok() {
+            std::future::pending::<()>().await;
+        }
+    };
+    let down = async {
+        while let Some(frame) = from_agent.next().await {
+            match frame {
+                Ok(SessionFrame {
+                    frame: Some(Frame::Error(e)),
+                }) => {
                     let _ = to_user
                         .send(Err(Status::new(tonic::Code::from_i32(e.code), e.message)))
                         .await;
-                    break;
+                    return;
                 }
-                Some(Ok(f @ SessionFrame { frame: Some(Frame::ExitCode(_)) })) => {
+                Ok(
+                    f @ SessionFrame {
+                        frame: Some(Frame::ExitCode(_)),
+                    },
+                ) => {
                     let _ = to_user.send(Ok(f)).await;
-                    break;
+                    return;
                 }
-                Some(Ok(f @ SessionFrame { frame: Some(Frame::Stdout(_) | Frame::Stderr(_)) })) => {
+                Ok(
+                    f @ SessionFrame {
+                        frame: Some(Frame::Stdout(_) | Frame::Stderr(_)),
+                    },
+                ) => {
                     if to_user.send(Ok(f)).await.is_err() {
-                        break;
+                        return;
                     }
                 }
-                Some(Ok(_)) => {}
-                Some(Err(status)) => {
+                Ok(_) => {}
+                Err(status) => {
                     let _ = to_user
                         .send(Err(Status::unavailable(format!(
                             "lost the agent: {}",
                             status.message()
                         ))))
                         .await;
-                    break;
+                    return;
                 }
-                None => break,
-            },
-            _ = to_user.closed() => break,
-            () = shutdown(&mut closing) => {
-                shutting_down = true;
-                break;
             }
         }
-    }
+    };
+    let shutting_down = tokio::select! {
+        () = up => false,
+        () = down => false,
+        () = to_user.closed() => false,
+        () = shutdown(&mut closing) => true,
+    };
     if shutting_down {
         let _ = to_user
             .send(Err(Status::unavailable("manager shutting down")))
@@ -429,6 +458,27 @@ fn internal(e: impl std::fmt::Display) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An offer given up on before the agent attaches leaves nothing
+    /// behind.
+    #[tokio::test]
+    async fn an_abandoned_offer_goes() {
+        let hub = Arc::new(Hub::default());
+        let mut offers = hub.follow("n1");
+        let offer = SessionOffer {
+            id: "s1".into(),
+            ..Default::default()
+        };
+        let waiting = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.offer("n1", offer).await.map(drop) })
+        };
+        offers.next().await.expect("offered").unwrap();
+        assert!(hub.inner.lock().unwrap().pending.contains_key("s1"));
+        waiting.abort();
+        let _ = waiting.await;
+        assert!(hub.inner.lock().unwrap().pending.is_empty());
+    }
 
     #[test]
     fn container_names() {
