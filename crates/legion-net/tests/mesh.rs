@@ -11,14 +11,15 @@
 //! target/debug/deps/mesh-<hash> --ignored --nocapture
 //! ```
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::process::Command;
 use std::time::Duration;
 
-use legion_net::PodNetwork;
 use legion_net::lb::{self, Exits, LoadBalancer, Port, Proto, Service};
 use legion_net::mesh::{self, Mesh, Peer};
+use legion_net::policy::{self, Allow, Guard, Policy};
+use legion_net::{PodNetwork, host_interface};
 use legion_sys::{CommandOutput, Host, Ipv4Net, Runner, Shell, Sys};
 
 const SWITCH: &str = "lmesh-sw";
@@ -139,6 +140,9 @@ fn pods_across_nodes() {
     for j in NODES.iter().chain([&SWITCH]) {
         assert!(!sh(&format!("jls -j {j}")).0, "{j} exists already");
     }
+    // A node of a real cluster may run here too: its own interfaces stay.
+    let before = must("ifconfig -l");
+    let before: BTreeSet<&str> = before.split_whitespace().collect();
     let mut lab = Lab { links: Vec::new() };
 
     // The switch: a bridge, and the outside client's address on it.
@@ -258,7 +262,7 @@ fn pods_across_nodes() {
 
     // Pods: a client and a server on node 1, a server on node 2, none on
     // node 3. Servers answer with their name.
-    let mut ips = std::collections::BTreeMap::new();
+    let mut ips = BTreeMap::new();
     for (node, pod, id) in [
         (0, "c", "00000000000000c1"),
         (0, "w1", "00000000000000a1"),
@@ -359,6 +363,77 @@ fn pods_across_nodes() {
     let got = connect(&outside, "192.168.252.3", PUBLISHED, 2);
     assert!(got.iter().all(Option::is_some), "{got:?}");
 
+    // w2's egress limited, its namespace open and then letting c in: it
+    // still answers what reaches it over the mesh, from another node's pod
+    // and from another node's own address, as published ports do.
+    let n2 = &nodes[1];
+    for knob in ["pfil_member", "pfil_local_phys"] {
+        must(&format!(
+            "jexec {} sysctl net.link.bridge.{knob}=1",
+            n2.jail
+        ));
+    }
+    let w2_guard = |open: bool| Guard {
+        interface: host_interface("00000000000000a2"),
+        ip: w2,
+        open,
+        allowed: if open {
+            vec![]
+        } else {
+            vec![Allow {
+                table: "tc".into(),
+                ports: vec![(Proto::Tcp, 8080)],
+            }]
+        },
+        vips: vec![],
+        egress: Some(vec![]),
+    };
+    let tables = BTreeMap::from([("tc".to_owned(), vec![c])]);
+    let mut policy = Policy::default();
+    let w2s = w2.to_string();
+    for open in [true, false] {
+        policy
+            .apply(
+                &n2.sys,
+                &[w2_guard(open)],
+                &tables,
+                n2.net.gateway(),
+                "10.201.0.0/16".parse().unwrap(),
+            )
+            .unwrap();
+        let rules = || {
+            sh(&format!(
+                "jexec {} pfctl -a {} -vsr; jexec {} pfctl -ss",
+                n2.jail,
+                policy::ANCHOR,
+                n2.jail
+            ))
+            .1
+        };
+        let got = connect(&client, &w2s, 8080, 2);
+        assert!(
+            got.iter().all(|g| g.as_deref() == Some("w2")),
+            "open {open}, from c: {got:?}\n{}",
+            rules()
+        );
+        let got = connect(&format!("jexec {}", nodes[2].jail), &w2s, 8080, 2);
+        assert!(
+            got.iter().all(|g| g.as_deref() == Some("w2")),
+            "open {open}, from node 3: {got:?}\n{}",
+            rules()
+        );
+        let got = connect(&outside, "192.168.252.3", PUBLISHED, 6);
+        assert!(
+            got.iter().all(Option::is_some) && names(&got).contains("w2"),
+            "open {open}, published on node 3: {got:?}\n{}",
+            rules()
+        );
+        // Egress itself stays limited.
+        let (ok, _) = n2.pod("w2", &format!("nc -z -w 2 {} 8080", ips["w1"]));
+        assert!(!ok, "open {open}: w2 reached w1");
+    }
+    n2.sys.pf_flush_anchor(policy::ANCHOR).unwrap();
+
     // Node 2 leaves the mesh: its pods are out of reach; back, they are
     // reachable again.
     let without: Vec<Peer> = peers
@@ -391,6 +466,7 @@ fn pods_across_nodes() {
     assert!(
         !left
             .split_whitespace()
+            .filter(|i| !before.contains(i))
             .any(|i| i.starts_with("epair") || i.starts_with("lp") || i.starts_with("wg")),
         "{left}"
     );
