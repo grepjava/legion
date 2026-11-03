@@ -103,6 +103,12 @@ rdr-anchor "legion/*"
 anchor "legion/*"
 ```
 
+The anchors decide only what network policy names; the rest of the
+ruleset must pass the cluster's traffic (WireGuard on UDP 51820, and
+`legion0`, `wg0` and the pods' `lp*` interfaces) keeping state with pf's
+default floating state policy, as a final `pass all` does. A ruleset that
+blocks by default, or sets `state-policy if-bound`, is not supported.
+
 More nodes join with a token. A manager advertises the address of its
 default route to the others (or `--listen`'s, when that names one), and a
 worker the address it reaches its managers from; `--advertise` chooses

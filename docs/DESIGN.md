@@ -732,7 +732,12 @@ this was verified in a 3-node lab (S3).
   `pass`, so they create states whatever the host's filter policy, and
   killing a dead backend's states makes the client's next packet fail fast.
   (A default-block policy for pod traffic belongs with network policy,
-  §5.6.)
+  §5.6.) The filter anchor only refuses and lets through what policy
+  names; the host's ruleset must pass the rest keeping floating state (a
+  final `pass all`): open pods' traffic from other nodes, and the replies
+  of egress-limited pods to it, pass on those states. A default-block or
+  `if-bound` host ruleset is not supported (checked by the mesh live test
+  with egress limits, 2026-11-03).
 - One pf table per service holding its **ready** endpoints, cluster-wide.
 - East-west traffic (task to VIP):
   `rdr on legion0 proto tcp to <VIP> port 80 tag LSVC -> <svc_web> port 8080 round-robin`.

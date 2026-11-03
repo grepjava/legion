@@ -207,7 +207,8 @@ async fn write_framed(stream: &mut TcpStream, msg: &[u8]) -> std::io::Result<()>
 }
 
 /// The response to one query message: from the zone, or relayed. `None`
-/// drops it (unparsable, or no upstream answered).
+/// drops it (unparsable, a response rather than a query, or no upstream
+/// answered).
 pub async fn answer(
     query: &[u8],
     zone: &Zone,
@@ -217,10 +218,12 @@ pub async fn answer(
     let Ok(msg) = Message::from_vec(query) else {
         return None;
     };
-    if msg.metadata.message_type != MessageType::Query
-        || msg.metadata.op_code != OpCode::Query
-        || msg.queries.len() != 1
-    {
+    // A response sent here is answered by nobody: relayed, it would go
+    // upstream as if this resolver had asked.
+    if msg.metadata.message_type != MessageType::Query {
+        return None;
+    }
+    if msg.metadata.op_code != OpCode::Query || msg.queries.len() != 1 {
         return relay(query, upstream, tcp).await;
     }
     let q = &msg.queries[0];
@@ -479,6 +482,17 @@ mod tests {
         tx.send(Arc::new(Zone::default())).unwrap();
         let r = ask("web.shop.legion.", RecordType::A).await;
         assert_eq!(r.metadata.response_code, ResponseCode::NXDomain);
+
+        // A response is not relayed, for our names or others.
+        for name in ["example.com.", "web.shop.legion."] {
+            let mut m = Message::from_vec(&query(name, RecordType::A)).unwrap();
+            m.metadata.message_type = MessageType::Response;
+            let bytes = m.to_vec().unwrap();
+            assert!(
+                answer(&bytes, &zone(), &[up], false).await.is_none(),
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]

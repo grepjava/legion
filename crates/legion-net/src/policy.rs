@@ -133,9 +133,16 @@ pub fn rules(guards: &[Guard], gateway: Ipv4Addr, services: Ipv4Net) -> String {
             let _ = writeln!(r, "block drop quick on {lp} inet6 all");
             continue;
         };
+        // Neighbour discovery, before the checks by address: from the pod
+        // only from its own addresses, link-local or not. (What an
+        // advertisement claims inside, pf cannot see, as with ARP.)
         let _ = writeln!(
             r,
-            "pass quick on {lp} inet6 proto icmp6 icmp6-type {{ neighbrsol, neighbradv }} no state"
+            "pass in quick on {lp} inet6 proto icmp6 from {{ fe80::/10, {ip6} }} to any icmp6-type {{ neighbrsol, neighbradv }} no state"
+        );
+        let _ = writeln!(
+            r,
+            "pass out quick on {lp} inet6 proto icmp6 icmp6-type {{ neighbrsol, neighbradv }} no state"
         );
         let inet6 = Family {
             name: "inet6",
@@ -378,6 +385,7 @@ mod tests {
                 "pass in quick on lp000000000009 inet proto tcp from 10.200.0.9 to <tdb> port 5432 keep state (if-bound)",
                 "pass in quick on lp000000000009 inet from 10.200.0.9 to 192.0.2.0/24 keep state (if-bound)",
                 "block drop in quick on lp000000000009 inet all",
+                "pass in quick on lp000000000009 inet6 proto icmp6 from { fe80::/10, fd00:10:200::9 } to any icmp6-type { neighbrsol, neighbradv } no state",
                 "block drop in quick on lp000000000009 inet6 from ! fd00:10:200::9",
                 "block drop in quick on lp000000000009 inet6 to fd00:10:201::/96",
                 "pass in quick on lp000000000009 inet6 proto { udp, tcp } from fd00:10:200::9 to fd00:10:200::1 port 53 keep state (if-bound)",
@@ -415,7 +423,8 @@ mod tests {
              pass in quick on wg0 inet from <n0123> to 10.200.0.7 keep state\n\
              pass in quick on wg0 inet proto tcp from <p4567> to 10.200.0.7 port 5432 keep state\n\
              block drop in quick on wg0 inet from 10.200.0.0/16 to 10.200.0.7\n\
-             pass quick on lp000000000007 inet6 proto icmp6 icmp6-type { neighbrsol, neighbradv } no state\n\
+             pass in quick on lp000000000007 inet6 proto icmp6 from { fe80::/10, fd00:10:200::7 } to any icmp6-type { neighbrsol, neighbradv } no state\n\
+             pass out quick on lp000000000007 inet6 proto icmp6 icmp6-type { neighbrsol, neighbradv } no state\n\
              block drop in quick on lp000000000007 inet6 from ! fd00:10:200::7\n\
              pass in quick on lp000000000007 inet6 proto tcp from fd00:10:200::7 to fd00:10:201::3 port 80 keep state (if-bound)\n\
              block drop in quick on lp000000000007 inet6 to fd00:10:201::/96\n\
@@ -434,7 +443,8 @@ mod tests {
              pass in quick on lp000000000008 inet from 10.200.0.8 keep state (if-bound)\n\
              pass out quick on wg0 inet from 10.200.0.8 keep state\n\
              pass out quick on lp000000000008 inet keep state (if-bound)\n\
-             pass quick on lp000000000008 inet6 proto icmp6 icmp6-type { neighbrsol, neighbradv } no state\n\
+             pass in quick on lp000000000008 inet6 proto icmp6 from { fe80::/10, fd00:10:200::8 } to any icmp6-type { neighbrsol, neighbradv } no state\n\
+             pass out quick on lp000000000008 inet6 proto icmp6 icmp6-type { neighbrsol, neighbradv } no state\n\
              block drop in quick on lp000000000008 inet6 from ! fd00:10:200::8\n\
              block drop in quick on lp000000000008 inet6 to fd00:10:201::/96\n\
              pass in quick on lp000000000008 inet6 from fd00:10:200::8 keep state (if-bound)\n\

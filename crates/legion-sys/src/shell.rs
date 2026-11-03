@@ -98,14 +98,26 @@ impl Runner for Host {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        if let Some(input) = stdin {
-            child
-                .stdin
-                .take()
-                .expect("piped stdin")
-                .write_all(input.as_bytes())?;
+        // Written beside the reading, so a child that answers as it reads
+        // cannot block on a full pipe; and waited for whatever the write
+        // gave, so a child that stops reading early is reaped and its
+        // complaint kept.
+        let input = stdin.map(|i| (child.stdin.take().expect("piped stdin"), i));
+        let (out, written) = std::thread::scope(|scope| {
+            // The pipe closes as the writer ends: the child sees the end.
+            let writer =
+                input.map(|(mut pipe, i)| scope.spawn(move || pipe.write_all(i.as_bytes())));
+            let out = child.wait_with_output();
+            let written = writer.map_or(Ok(()), |w| w.join().expect("stdin writer"));
+            (out, written)
+        });
+        let out = out?;
+        match written {
+            Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe || out.status.success() => {
+                return Err(e);
+            }
+            _ => {}
         }
-        let out = child.wait_with_output()?;
         Ok(CommandOutput {
             success: out.status.success(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -998,6 +1010,16 @@ impl<R: Runner> Sys for Shell<R> {
     }
 
     fn mount_fs(&self, fstype: &str, source: &str, target: &str, options: &str) -> Result<()> {
+        // mount(8) hands the source to the file system's own mount
+        // program, whose options a leading `-` would be (`--` does not
+        // reach it); and `mount -p`, which [`Sys::mounts`] reads, splits
+        // its lines at whitespace.
+        if source.starts_with('-') || source.chars().any(|c| c.is_control()) {
+            return Err(Error::Failed {
+                command: describe("mount", &args(["-t", fstype, source, target])),
+                message: "the source starts with `-` or holds a control character".into(),
+            });
+        }
         let mut a = args(["-t", fstype]);
         if !options.is_empty() {
             a.extend(args(["-o", options]));
@@ -1353,6 +1375,37 @@ mod tests {
 	      peer 224.0.0.18 peer6 ff02::12
 	status: active
 ";
+
+    #[cfg(unix)]
+    #[test]
+    fn host_runs_with_input() {
+        // Read to the end: the input closes.
+        let out = Host.run("wc", &args(["-c"]), Some("hello")).unwrap();
+        assert_eq!((out.success, out.stdout.trim()), (true, "5"));
+        // Answering as it reads, more than a pipe holds.
+        let big = "x".repeat(1 << 20);
+        let out = Host.run("cat", &[], Some(&big)).unwrap();
+        assert_eq!(out.stdout.len(), big.len());
+        // Gone before reading it all: reaped, its complaint kept.
+        let script = args(["-c", "echo refused >&2; exit 3"]);
+        let out = Host.run("sh", &script, Some(&big)).unwrap();
+        assert!(!out.success);
+        assert_eq!(out.stderr.trim(), "refused");
+    }
+
+    #[test]
+    fn mount_sources_are_not_options() {
+        let sh = Script::shell(vec![]);
+        for source in ["-a:/export", "files:/ex\tport", "files:/ex\nport"] {
+            assert!(
+                matches!(
+                    sh.mount_fs("nfs", source, "/var/run/legion/v", ""),
+                    Err(Error::Failed { .. })
+                ),
+                "{source:?}"
+            );
+        }
+    }
 
     #[test]
     fn ether() {
