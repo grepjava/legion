@@ -6,6 +6,7 @@
 //! count as the Volumes they will make, before the controller makes them.
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 
 use legion_api::admit::NamespaceSpec;
 use legion_api::job::{CronJobSpec, JobSpec};
@@ -15,6 +16,8 @@ use legion_api::service::{PodSpec, ServiceMode, ServiceSpec, claim_volume};
 use legion_api::volume::{VolumeDriver, VolumeSpec};
 use legion_api::{CLUSTER_SCOPE, Kind, Object, ObjectKey};
 use legion_store::Store;
+
+use crate::controller::plan::LABEL_SERVICE;
 use tonic::Status;
 
 /// Whether quotas count objects of `kind`.
@@ -62,11 +65,11 @@ pub(crate) fn check(store: &Store, desired: &Object) -> Result<(), Status> {
         .into_iter()
         .filter_map(|o| Some((o.metadata.name, legion_api::parse(&o.spec).ok()?)))
         .collect();
-    let volumes: Vec<(String, Option<Bytes>)> = list(Kind::Volume)?
+    let volumes: Vec<CountedVolume> = list(Kind::Volume)?
         .into_iter()
         .filter_map(|o| {
             let v: VolumeSpec = legion_api::parse(&o.spec).ok()?;
-            Some((o.metadata.name, v.size))
+            Some(counted(&o, &v))
         })
         .collect();
     let mut services_after = services.clone();
@@ -88,8 +91,8 @@ pub(crate) fn check(store: &Store, desired: &Object) -> Result<(), Status> {
                     "namespace {namespace} has a storage quota: the volume needs a size"
                 )));
             }
-            volumes_after.retain(|(n, _)| n != name);
-            volumes_after.push((name.clone(), spec.size));
+            volumes_after.retain(|(n, ..)| n != name);
+            volumes_after.push(counted(desired, &spec));
         }
         _ => unreachable!("counted kinds"),
     }
@@ -120,30 +123,51 @@ fn quota_of(store: &Store, namespace: &str) -> Result<Option<Quota>, Status> {
     Ok(spec.quota)
 }
 
+/// A Volume as quotas count it: its name, its size, and the stateful
+/// service whose claims the controller resizes it to, if any.
+type CountedVolume = (String, Option<Bytes>, Option<String>);
+
+fn counted(o: &Object, v: &VolumeSpec) -> CountedVolume {
+    // As the controller resizes them: its own ZFS ones.
+    let owner = o
+        .metadata
+        .labels
+        .get(LABEL_SERVICE)
+        .filter(|_| v.driver == VolumeDriver::Zfs)
+        .cloned();
+    (o.metadata.name.clone(), v.size, owner)
+}
+
 /// What a namespace's Services and Volumes take: the services' tasks, and
 /// the Volumes, with those stateful services' claims would make.
-fn usage(
-    services: &[(String, ServiceSpec)],
-    volumes: &[(String, Option<Bytes>)],
-    nodes: u32,
-) -> Usage {
+fn usage(services: &[(String, ServiceSpec)], volumes: &[CountedVolume], nodes: u32) -> Usage {
     let mut u = Usage::default();
-    let mut all: BTreeMap<String, Option<Bytes>> = volumes.iter().cloned().collect();
+    let mut all: BTreeMap<String, (Option<Bytes>, Option<String>)> = volumes
+        .iter()
+        .map(|(name, size, owner)| (name.clone(), (*size, owner.clone())))
+        .collect();
     for (name, s) in services {
         add_service(&mut u, s, nodes);
         if s.mode != ServiceMode::Stateful {
             continue;
         }
         for n in 0..s.replicas.unwrap_or(1) {
-            // The controller resizes a claim's Volume to the claim, so a
-            // claim grown past its Volume counts at its new size.
+            // The controller resizes a claim's own Volume to the claim, so
+            // it counts at the claim's size.
             for (claim, src) in s.pod.claims() {
-                let size = all.entry(claim_volume(claim, name, n)).or_insert(src.size);
-                *size = (*size).max(src.size);
+                match all.entry(claim_volume(claim, name, n)) {
+                    Entry::Vacant(e) => {
+                        e.insert((src.size, Some(name.clone())));
+                    }
+                    Entry::Occupied(mut e) if e.get().1.as_ref() == Some(name) => {
+                        e.get_mut().0 = src.size;
+                    }
+                    Entry::Occupied(_) => {}
+                }
             }
         }
     }
-    for size in all.values() {
+    for (size, _) in all.values() {
         u.add_volume(*size);
     }
     u
@@ -159,16 +183,24 @@ fn needs_requests(quota: &Quota, pod: &PodSpec, namespace: &str) -> Result<(), S
             "namespace {namespace} has a storage quota: claim {name} needs a size"
         )));
     }
-    let r = pod.requests();
-    for (limited, missing, what) in [
-        (quota.cpu.is_some(), r.cpu.0 == 0, "cpu"),
-        (quota.memory.is_some(), r.memory.0 == 0, "memory"),
-    ] {
-        if limited && missing {
-            return Err(Status::failed_precondition(format!(
-                "namespace {namespace} has a {what} quota: \
-                 the pod's containers must request {what} (resources.requests.{what})"
-            )));
+    // Every container: one asking nothing would run outside the quota.
+    for c in pod.containers() {
+        let r = &c.resources.requests;
+        for (limited, missing, what) in [
+            (quota.cpu.is_some(), r.cpu.is_none_or(|n| n.0 == 0), "cpu"),
+            (
+                quota.memory.is_some(),
+                r.memory.is_none_or(|n| n.0 == 0),
+                "memory",
+            ),
+        ] {
+            if limited && missing {
+                return Err(Status::failed_precondition(format!(
+                    "namespace {namespace} has a {what} quota: container {} \
+                     must request {what} (resources.requests.{what})",
+                    c.name
+                )));
+            }
         }
     }
     Ok(())
@@ -189,4 +221,51 @@ fn add_service(u: &mut Usage, s: &ServiceSpec, nodes: u32) {
 
 fn internal(e: impl std::fmt::Display) -> Status {
     Status::internal(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(yaml: &str) -> ServiceSpec {
+        let value: serde_json::Value = serde_yaml_ng::from_str(yaml).unwrap();
+        legion_api::parse(&value).unwrap()
+    }
+
+    #[test]
+    fn every_container_requests_what_a_quota_holds() {
+        let quota = Quota {
+            cpu: Some(legion_api::quantity::Cpu(4000)),
+            ..Default::default()
+        };
+        let pod = |yaml: &str| spec(&format!("pod: {yaml}")).pod;
+        let one = pod(
+            "{ containers: [{ name: a, image: a, resources: { requests: { cpu: \"1m\" } } }] }",
+        );
+        needs_requests(&quota, &one, "shop").unwrap();
+        let two = pod(
+            "{ containers: [{ name: a, image: a, resources: { requests: { cpu: \"1m\" } } }, { name: b, image: b }] }",
+        );
+        let why = needs_requests(&quota, &two, "shop").unwrap_err();
+        assert!(
+            why.message().contains("container b must request cpu"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn claims_count_at_the_size_the_controller_gives_their_volumes() {
+        let gb = |n: u64| Some(Bytes(n * 1_000_000_000));
+        let db = spec(
+            "mode: stateful\nreplicas: 2\npod: { containers: [{ name: db, image: pg }], volumes: [{ name: data, claim: { size: 1G } }] }",
+        );
+        let services = [("db".to_owned(), db)];
+        // Its own Volume shrinks to the claim; one it does not own stays.
+        let volumes = [
+            ("data-db-0".to_owned(), gb(3), Some("db".to_owned())),
+            ("data-db-1".to_owned(), gb(5), None),
+        ];
+        let u = usage(&services, &volumes, 1);
+        assert_eq!(u.storage, Bytes(6_000_000_000));
+    }
 }

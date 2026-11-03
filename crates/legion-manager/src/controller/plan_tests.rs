@@ -2364,9 +2364,10 @@ fn stateful_services_shrink_from_the_top_one_at_a_time() {
     assert_eq!(w.wanted("db"), ["db-0-1"]);
     // The Volumes stay, for the data in them; growing again finds them.
     assert_eq!(w.volumes.len(), 3);
+    // Under names their ordinals' tasks have not had.
     w.service("db", STATEFUL);
     w.settle();
-    assert_eq!(w.wanted("db"), ["db-0-1", "db-1-1", "db-2-1"]);
+    assert_eq!(w.wanted("db"), ["db-0-1", "db-1-2", "db-2-2"]);
     assert_eq!(w.volumes.len(), 3);
 
     // Gone, the service leaves them too; a resized claim resizes them.
@@ -3119,4 +3120,242 @@ fn images_for_another_platform_stay_off_its_nodes() {
         "{:?}",
         w.placed("web")
     );
+}
+
+#[test]
+fn a_stateful_update_does_not_wait_on_an_unready_ordinal_below() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.service("db", STATEFUL);
+    w.settle();
+    // Ordinal 1 runs but is not ready: ordinal 2's new task could not
+    // start, so ordinal 2 keeps its old one, and ordinal 1 goes first.
+    let version = w.next();
+    let t = w
+        .tasks
+        .iter_mut()
+        .find(|t| t.object.metadata.name == "db-1-1")
+        .unwrap();
+    t.status.ready = false;
+    t.object.status = serde_json::to_value(&t.status).unwrap();
+    t.object.metadata.version = version;
+    w.service("db", &STATEFUL.replace("pg:17", "pg:18"));
+    w.agents = false;
+    w.step();
+    assert_eq!(w.wanted("db"), ["db-0-1", "db-2-1"], "db-1-1 stops");
+    w.agents = true;
+    w.settle();
+    assert_eq!(w.images("db"), ["pg:18", "pg:18", "pg:18"]);
+    assert_eq!(w.running(), ["db-0-2", "db-1-2", "db-2-2"]);
+}
+
+#[test]
+fn a_drain_waits_for_data_held_on_the_node() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    let iscsi =
+        serde_json::json!({ "driver": "iscsi", "iscsi": { "portal": "a", "target": "iqn.x" } });
+    w.volume_of("block", iscsi.clone(), "n2");
+    // Started first, the replacement could never have the volume n2
+    // holds: the task stops first all the same.
+    w.service(
+        "db",
+        "replicas: 1
+update: { order: start-first }
+pod: { containers: [{ name: db, image: \"pg:17\" }], volumes: [{ name: data, volume: { name: block } }] }",
+    );
+    w.settle();
+    assert_eq!(w.placed("db"), ["n2"]);
+    w.availability("n2", Availability::Drain);
+    w.settle();
+    assert!(w.placed("db").is_empty());
+    w.volume_of("block", iscsi, "");
+    w.settle();
+    assert_eq!(w.placed("db"), ["n1"]);
+
+    // Data that stays on its node keeps its task there until moved.
+    w.volume("files", "n1");
+    w.service(
+        "web",
+        "replicas: 1
+pod: { containers: [{ name: web, image: \"web:1\" }], volumes: [{ name: f, volume: { name: files } }] }",
+    );
+    w.settle();
+    assert_eq!(w.placed("web"), ["n1"]);
+    w.availability("n2", Availability::Active);
+    w.availability("n1", Availability::Drain);
+    w.settle();
+    assert_eq!(w.placed("web"), ["n1"]);
+    assert_eq!(w.wanted("web"), ["web-1-1"]);
+}
+
+#[test]
+fn an_overtaken_update_leaves_room_for_the_next() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    let spec = |image: &str| {
+        format!(
+            "replicas: 1
+update: {{ order: start-first }}
+pod: {{ containers: [{{ name: web, image: \"{image}\", resources: {{ requests: {{ cpu: \"2\" }} }} }}] }}"
+        )
+    };
+    w.service("web", &spec("web:1"));
+    w.settle();
+    // n1 has room for two: the old task and one new one.
+    w.agents = false;
+    w.service("web", &spec("web:2"));
+    w.step();
+    w.service("web", &spec("web:3"));
+    w.step();
+    w.agents = true;
+    w.settle();
+    assert_eq!(w.running(), ["web-1-3"]);
+    assert_eq!(w.images("web"), ["web:3"]);
+}
+
+#[test]
+fn going_back_to_a_rolled_back_spec_is_a_new_update() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    let spec = format!("{STATEFUL}\nupdate: {{ snapshot: true, failureAction: rollback }}");
+    w.service("db", &spec);
+    w.settle();
+    w.service("db", &spec.replace("pg:17", "pg:18"));
+    w.settle();
+    w.fail("db-0-2");
+    for _ in 0..12 {
+        w.now += Duration::from_secs(1);
+        w.settle();
+    }
+    assert_eq!(w.update("db").0, "rolled-back");
+    // pg:18 again: an update, with a snapshot of its own, not a rollback
+    // to the one the rollback dropped.
+    w.now += Duration::from_secs(60);
+    w.service("db", &spec.replace("pg:17", "pg:18"));
+    w.settle();
+    let u = w.status("db").update.unwrap();
+    assert_eq!(u.state.as_str(), "updating");
+    let snapshot = u.snapshot.unwrap();
+    assert_ne!(snapshot, "legion-update-2");
+    let steps: Vec<_> = w
+        .tasks
+        .iter()
+        .filter(|t| t.status.state == TaskState::Running)
+        .map(|t| t.spec.snapshot.clone().unwrap())
+        .collect();
+    assert!(!steps.is_empty());
+    assert!(steps.iter().all(|s| !s.restore && s.name == snapshot));
+}
+
+#[test]
+fn a_replaced_run_goes_though_its_status_changed() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.cron_job("report", &report("concurrencyPolicy: replace"));
+    w.settle();
+    w.advance(4 * 60);
+    w.settle();
+    let first = run("2026-10-28T09:35:00Z");
+    assert_eq!(w.job_names(), std::slice::from_ref(&first));
+    // Its task fails as the next run comes due: the pass that replaces
+    // the Job also has its status to write.
+    w.fail(&format!("{first}-1-1"));
+    w.advance(5 * 60);
+    w.settle();
+    assert_eq!(w.job_names(), [run("2026-10-28T09:40:00Z")]);
+}
+
+#[test]
+fn a_global_job_finishes_without_a_node_that_never_ran_it() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.node_mut("n1").status.allocatable.cpu = Cpu(1000);
+    w.job(
+        "scan",
+        "mode: global\npod: { containers: [{ name: s, image: \"s:1\", resources: { requests: { cpu: \"2\" } } }] }",
+    );
+    w.settle();
+    assert_eq!(w.running(), ["scan-n2-1"]);
+    // n1 takes no new task now: its task, never placed, is not kept.
+    w.availability("n1", Availability::Pause);
+    w.end("scan-n2-1", TaskState::Complete);
+    w.settle();
+    assert_eq!(w.job_status("scan").state.as_str(), "complete");
+}
+
+#[test]
+fn stateful_data_leaves_a_node_whose_taints_evict_its_tasks() {
+    use legion_api::volume::MigrationPhase::*;
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.service("db", &STATEFUL.replace("replicas: 3", "replicas: 1"));
+    w.settle();
+    let from = w.placed_task("db-0-1").spec.node.clone();
+    let to = if from == "n1" { "n2" } else { "n1" };
+    w.taint(&from, "broken", TaintEffect::NoExecute);
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some((to.to_owned(), Copying)));
+    w.migrate();
+    w.settle();
+    w.migrate();
+    w.settle();
+    assert_eq!(w.volume_node("data-db-0"), to);
+    assert_eq!(w.placed("db"), [to]);
+}
+
+#[test]
+fn stateful_data_moves_where_its_task_has_room() {
+    use legion_api::volume::MigrationPhase::*;
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.node("n3", &[]);
+    w.node_mut("n2").status.allocatable.cpu = Cpu(1000);
+    let spec = STATEFUL.replace("replicas: 3", "replicas: 1").replace(
+        "image: \"pg:17\"",
+        "image: \"pg:17\", resources: { requests: { cpu: \"3\" } }",
+    );
+    w.service("db", &spec);
+    w.settle();
+    assert_eq!(w.placed("db"), ["n1"]);
+    // n2 comes first, but has no room for the task: n3 has.
+    w.availability("n1", Availability::Drain);
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some(("n3".to_owned(), Copying)));
+}
+
+#[test]
+fn tasks_sharing_a_volume_new_to_any_node_go_to_one_node() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.volume("files", "");
+    w.agents = false;
+    w.service(
+        "web",
+        "replicas: 2
+pod: { containers: [{ name: web, image: \"web:1\" }], volumes: [{ name: f, volume: { name: files } }] }",
+    );
+    w.step();
+    let nodes: Vec<&str> = w.tasks.iter().map(|t| t.spec.node.as_str()).collect();
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(nodes[0], nodes[1], "{:?}", w.tasks());
+}
+
+#[test]
+fn replicas_scaled_away_and_back_have_new_names() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.service("web", &format!("replicas: 3\n{POD}"));
+    w.settle();
+    w.service("web", &format!("replicas: 1\n{POD}"));
+    w.settle();
+    assert_eq!(w.running(), ["web-1-1"]);
+    w.service("web", &format!("replicas: 3\n{POD}"));
+    w.settle();
+    assert_eq!(w.running(), ["web-1-1", "web-2-2", "web-3-2"]);
 }

@@ -301,6 +301,16 @@ pub fn plan(
     let later = plan.actions.split_off(first);
     plan.actions
         .extend(later.into_iter().filter(|a| !orphaned.contains(&a.key())));
+    // An object deleted is not also written: that would only have the
+    // delete, of the version read, conflict.
+    let deleted: BTreeSet<ObjectKey> = plan
+        .actions
+        .iter()
+        .filter(|a| matches!(a, Action::Delete(..)))
+        .map(Action::key)
+        .collect();
+    plan.actions
+        .retain(|a| !matches!(a, Action::Update(o, _) if deleted.contains(&o.key())));
     plan
 }
 
@@ -614,6 +624,14 @@ fn service(
             && (on_node(t, &|n| n.spec.availability == Availability::Drain)
                 || (on_node(t, &|_| true) && migrate::leaving(t, volumes)))
     };
+    // Mounting a Volume whose data stays on its node, or that its node
+    // holds, which no other node has until the task lets go.
+    let pinned = |t: &Task| {
+        t.spec
+            .volumes()
+            .iter()
+            .any(|v| home(volumes, &t.object.metadata.namespace, v) == Some(t.spec.node.as_str()))
+    };
     for t in tasks.iter().filter(|t| evicted(t)) {
         plan.actions.push(stop(t));
     }
@@ -648,6 +666,16 @@ fn service(
         let since = memory.running_at.get(t.uid()).copied().unwrap_or(now);
         since + delay > now
     };
+    // A stateful service starts a task only once every lower ordinal has a
+    // ready one, and updates from its highest ordinal down.
+    let ready_below = |slot: &Slot| {
+        !stateful
+            || wanted
+                .iter()
+                .take_while(|w| *w != slot)
+                .all(|w| by_slot.get(w).is_some_and(|l| l.iter().any(|t| up(t))))
+    };
+
     let parallelism = match s.spec.update.parallelism {
         0 => usize::MAX,
         n => n as usize,
@@ -658,9 +686,12 @@ fn service(
             continue;
         };
         // Between an old task stopping and its replacement starting, or a
-        // new one failing and its retry, nothing runs in the slot.
+        // new one failing and its retry, nothing runs in the slot. A
+        // stateful slot that waits for a lower ordinal is not under way:
+        // the lower one gets the budget.
         let gap = !list.iter().any(|t| t.active())
-            && list.last().is_some_and(|t| !current_pod(t) || t.failed());
+            && list.last().is_some_and(|t| !current_pod(t) || t.failed())
+            && ready_below(slot);
         if gap || list.iter().any(|t| t.stopping()) {
             in_flight += 1;
         } else if let Some(t) = list
@@ -683,15 +714,6 @@ fn service(
         parallelism.saturating_sub(in_flight)
     };
 
-    // A stateful service starts a task only once every lower ordinal has a
-    // ready one, and updates from its highest ordinal down.
-    let ready_below = |slot: &Slot| {
-        !stateful
-            || wanted
-                .iter()
-                .take_while(|w| *w != slot)
-                .all(|w| by_slot.get(w).is_some_and(|l| l.iter().any(|t| up(t))))
-    };
     let mut order: Vec<&Slot> = wanted.iter().collect();
     if stateful {
         order.reverse();
@@ -743,7 +765,12 @@ fn service(
         // A stateful task's replacement needs its volumes, and so does one
         // whose data is moving: it can only start once they have, so the
         // task waits for them to be copied, then stops first.
-        let bound = stateful || moving.iter().any(|t| migrate::leaving(t, volumes));
+        // So is one whose data stays on its node or is held there: a
+        // replacement elsewhere cannot have it until the task lets go.
+        let bound = stateful
+            || moving
+                .iter()
+                .any(|t| migrate::leaving(t, volumes) || pinned(t));
         let copied = !bound || moving.iter().all(|t| migrate::copied(t, volumes));
 
         // Never more than one current task per slot.
@@ -758,9 +785,19 @@ fn service(
                 for old in outdated.iter().chain(&moving) {
                     plan.actions.push(stop(old));
                 }
-            } else if bound && !moving.is_empty() && !new.placed() && copied && may_stop(&moving) {
-                for old in &moving {
-                    plan.actions.push(stop(old));
+            } else {
+                if outdated.iter().any(|t| up(t)) {
+                    // One of an update overtaken by another and not ready
+                    // only holds room the new one may need: the ready one
+                    // stays.
+                    for old in outdated.iter().filter(|t| !up(t)) {
+                        plan.actions.push(stop(old));
+                    }
+                }
+                if bound && !moving.is_empty() && !new.placed() && copied && may_stop(&moving) {
+                    for old in &moving {
+                        plan.actions.push(stop(old));
+                    }
                 }
             }
         } else if !moving.is_empty() {
@@ -785,9 +822,10 @@ fn service(
             }
         } else if !outdated.is_empty() {
             // The budget goes to what moves: a stateful slot the
-            // disruption budget holds back leaves it to one that is not
-            // ready anyway, below.
-            if budget > 0 {
+            // disruption budget holds back, or whose new task could not
+            // start before a lower ordinal is ready, leaves it to one
+            // below.
+            if budget > 0 && ready_below(slot) {
                 if !start_first && may_stop(&outdated) {
                     budget -= 1;
                     for old in &outdated {
@@ -851,13 +889,12 @@ fn service(
         }
     }
 
-    // A node's slot keeps its number while the node exists, though no
-    // longer wanted: its old pod may still be there when it is again.
-    if s.spec.mode == ServiceMode::Global {
-        for (key, n) in &previous.last_tasks {
-            if nodes.iter().any(|node| node.name() == key) {
-                last_tasks.entry(key.clone()).or_insert(*n);
-            }
+    // A slot keeps its number though no longer wanted, so its next task's
+    // name is one no task of it had: a replica's for good, a node's while
+    // the node exists (its old pod may still be there when it is again).
+    for (key, n) in &previous.last_tasks {
+        if s.spec.mode != ServiceMode::Global || nodes.iter().any(|node| node.name() == key) {
+            last_tasks.entry(key.clone()).or_insert(*n);
         }
     }
 
@@ -990,7 +1027,12 @@ fn track_update(
     if let Some(old) = previous.spec.as_ref()
         && old.pod != s.spec.pod
     {
-        let back = update.as_ref().is_some_and(|u| u.previous == s.spec);
+        // Back to the spec before the update, unless that update was rolled
+        // back: going to the spec it rolled back from is a new update,
+        // whose snapshot the rollback has dropped.
+        let back = update
+            .as_ref()
+            .is_some_and(|u| u.previous == s.spec && u.state != UpdateState::RolledBack);
         let message = match &update {
             Some(u) if back && u.state == UpdateState::RollingBack => u.message.clone(),
             _ => String::new(),
@@ -1372,6 +1414,9 @@ fn schedule(
         .chain(created.into_iter().map(|t| (t, None)))
         .collect();
 
+    // Volumes one node at a time may have, not yet on one, that a task
+    // placed in this pass took: other tasks of theirs go to the same node.
+    let mut taken: BTreeMap<(String, String), String> = BTreeMap::new();
     for (mut t, original) in pending {
         let Some(s) = services.iter().find(|s| s.owns(&t)) else {
             continue;
@@ -1408,6 +1453,14 @@ fn schedule(
             }
             if let Err(why) = eligible(n, s, volumes, &t.spec.volumes()) {
                 *reasons.entry(why).or_default() += 1;
+                continue;
+            }
+            if t.spec.volumes().into_iter().any(|v| {
+                taken
+                    .get(&(namespace.clone(), v))
+                    .is_some_and(|node| node != name)
+            }) {
+                *reasons.entry("volume on another node").or_default() += 1;
                 continue;
             }
             let l = load.get(name).cloned().unwrap_or_default();
@@ -1447,6 +1500,16 @@ fn schedule(
             Some((name, _)) => {
                 t.spec.node = name.to_owned();
                 load.entry(name.to_owned()).or_default().add(&t);
+                for v in t.spec.volumes() {
+                    let key = (namespace.clone(), v);
+                    if volumes
+                        .get(&key)
+                        .is_some_and(|v| v.spec.access() != Access::Shared)
+                        && home(volumes, &key.0, &key.1).is_none()
+                    {
+                        taken.insert(key, name.to_owned());
+                    }
+                }
                 used.insert(namespace, after);
                 TaskStatus {
                     state: TaskState::Assigned,

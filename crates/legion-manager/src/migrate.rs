@@ -20,7 +20,7 @@ use legion_proto::v1::{
 };
 use legion_store::{Command, NodeId, Outcome, Precondition, Store};
 use tokio::sync::watch;
-use tokio::task::{AbortHandle, JoinSet};
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_stream::{Stream, StreamExt};
 
@@ -69,25 +69,54 @@ pub(crate) async fn run(
     }
 }
 
+/// How a migrator task ended.
+enum Ended {
+    /// Its phase is done; for a full copy, the new node holds one.
+    Done,
+    /// Called off: the new node's copy, if any, was dropped.
+    CalledOff,
+}
+
 async fn lead(store: &Store, hub: &Arc<Hub>) {
-    let mut running: HashMap<ObjectKey, (Migration, AbortHandle)> = HashMap::new();
-    let mut tasks: JoinSet<(ObjectKey, Migration, Result<(), String>)> = JoinSet::new();
+    // Each Volume's task, with what it moves and, until called off, the
+    // word to stop.
+    let mut running: HashMap<ObjectKey, (Migration, Option<watch::Sender<bool>>)> = HashMap::new();
+    let mut tasks: JoinSet<(ObjectKey, Migration, Result<Ended, String>)> = JoinSet::new();
     let mut failed: HashMap<ObjectKey, Instant> = HashMap::new();
+    // Full copies made on new nodes, of migrations not yet finished: one
+    // called off while no task runs for it still has its copy dropped.
+    let mut copies: HashMap<ObjectKey, Migration> = HashMap::new();
     loop {
         while let Some(done) = tasks.try_join_next() {
             let Ok((key, m, result)) = done else { continue };
             running.remove(&key);
-            if let Err(e) = result {
-                tracing::warn!(volume = %key, to = %m.to, "moving the volume: {e}");
-                failed.insert(key.clone(), Instant::now());
-                note(store, &key, &m, &e).await;
+            match result {
+                Ok(Ended::Done) if m.phase == MigrationPhase::Finishing => {
+                    copies.remove(&key);
+                }
+                Ok(Ended::Done) => {
+                    copies.insert(key, m);
+                }
+                Ok(Ended::CalledOff) => {
+                    copies.remove(&key);
+                }
+                Err(e) => {
+                    tracing::warn!(volume = %key, to = %m.to, "moving the volume: {e}");
+                    failed.insert(key.clone(), Instant::now());
+                    note(store, &key, &m, &e).await;
+                    // The new node may hold part of a copy, or one not
+                    // dropped.
+                    copies.entry(key).or_insert(m);
+                }
             }
         }
+        // Nothing is called off on a failed read.
         let volumes = match store.list(Kind::Volume, None) {
             Ok(l) => l.objects,
             Err(e) => {
                 tracing::warn!("reading volumes: {e}");
-                Vec::new()
+                tokio::time::sleep(PERIOD).await;
+                continue;
             }
         };
         let statuses: HashMap<ObjectKey, VolumeStatus> = volumes
@@ -97,13 +126,31 @@ async fn lead(store: &Store, hub: &Arc<Hub>) {
                 (v.key(), status)
             })
             .collect();
-        running.retain(|key, (m, handle)| {
-            let wanted = !called_off(m, statuses.get(key));
-            if !wanted {
+        for (key, (m, cancel)) in &mut running {
+            if cancel.is_some() && called_off(m, statuses.get(key)) {
                 tracing::info!(volume = %key, to = %m.to, "migration called off");
-                handle.abort();
+                // The task drops the copy, and holds the Volume until then.
+                let _ = cancel.take().expect("checked").send(true);
             }
-            wanted
+        }
+        copies.retain(|key, m| {
+            if running.contains_key(key)
+                || failed.get(key).is_some_and(|t| t.elapsed() < RETRY)
+                || !called_off(m, statuses.get(key))
+            {
+                return true;
+            }
+            if stale_copy(m, statuses.get(key)) {
+                let (hub, k, gone) = (hub.clone(), key.clone(), m.clone());
+                tasks.spawn(async move {
+                    let result = drop_copy(&hub, &k.namespace, &k.name, &gone.to)
+                        .await
+                        .map(|()| Ended::CalledOff);
+                    (k, gone, result)
+                });
+                running.insert(key.clone(), (m.clone(), None));
+            }
+            false
         });
         for v in volumes {
             let key = v.key();
@@ -119,14 +166,40 @@ async fn lead(store: &Store, hub: &Arc<Hub>) {
             }
             let (store, hub) = (store.clone(), hub.clone());
             let (k, started) = (key.clone(), m.clone());
-            let handle = tasks.spawn(async move {
-                let result = advance(&store, &hub, &v, &status.node, &started).await;
+            let (cancel, mut cancelled) = watch::channel(false);
+            tasks.spawn(async move {
+                let result = tokio::select! {
+                    r = advance(&store, &hub, &v, &status.node, &started) => r.map(|()| Ended::Done),
+                    _ = cancelled.changed() => {
+                        // What the new node received is of no use now.
+                        let (namespace, name) = (&v.metadata.namespace, &v.metadata.name);
+                        let now: Option<VolumeStatus> = store
+                            .get(&k)
+                            .ok()
+                            .flatten()
+                            .map(|o| serde_json::from_value(o.status).unwrap_or_default());
+                        if stale_copy(&started, now.as_ref()) {
+                            drop_copy(&hub, namespace, name, &started.to)
+                                .await
+                                .map(|()| Ended::CalledOff)
+                        } else {
+                            Ok(Ended::CalledOff)
+                        }
+                    }
+                };
                 (k, started, result)
             });
-            running.insert(key, (m, handle));
+            running.insert(key, (m, Some(cancel)));
         }
         tokio::time::sleep(PERIOD).await;
     }
+}
+
+/// Whether the new node of a migration called off holds a copy of the
+/// Volume no one wants: the Volume is still there, neither on that node
+/// nor on its way to it.
+fn stale_copy(m: &Migration, now: Option<&VolumeStatus>) -> bool {
+    now.is_some_and(|s| s.node != m.to && s.migration.as_ref().is_none_or(|n| n.to != m.to))
 }
 
 /// Whether a migration under way was called off, by the Volume's status
@@ -460,8 +533,18 @@ mod tests {
         // Ended, sent elsewhere, or gone.
         assert!(called_off(&copying, Some(&status("n1", None))));
         let n3 = m("n3", MigrationPhase::Copying);
-        assert!(called_off(&copying, Some(&status("n1", Some(n3)))));
+        assert!(called_off(&copying, Some(&status("n1", Some(n3.clone())))));
         assert!(called_off(&copying, None));
+
+        // What n2 received is dropped once nothing has the Volume go
+        // there or be there; not that of a Volume gone, which may be
+        // anywhere.
+        assert!(stale_copy(&copying, Some(&status("n1", None))));
+        assert!(stale_copy(&copying, Some(&status("n1", Some(n3)))));
+        assert!(!stale_copy(&copying, Some(&status("n2", None))));
+        let back = m("n2", MigrationPhase::Copying);
+        assert!(!stale_copy(&copying, Some(&status("n1", Some(back)))));
+        assert!(!stale_copy(&copying, None));
     }
 
     #[tokio::test]

@@ -13,10 +13,12 @@
 use std::collections::BTreeMap;
 
 use legion_api::node::{Availability, NodeState};
-use legion_api::service::{ServiceMode, claim_volume};
+use legion_api::service::{ServiceMode, TaintEffect, claim_volume};
 use legion_api::volume::{Access, Migration, MigrationPhase, VolumeStatus};
 
-use super::{Action, Node, Plan, Service, Task, Volume, Volumes, eligible, shared_volumes};
+use super::{
+    Action, LABEL_SERVICE, Node, Plan, Service, Task, Volume, Volumes, eligible, shared_volumes,
+};
 
 pub(super) fn migrations(
     services: &[Service],
@@ -33,6 +35,26 @@ pub(super) fn migrations(
             n.status.state == NodeState::Ready && n.spec.availability == Availability::Active
         })
     };
+    // A node a stateful service's tasks must leave: draining, or with a
+    // taint that evicts them.
+    let leaves = |s: &Service, name: &str| {
+        draining(name) || node(name).is_some_and(|n| n.repels(s, TaintEffect::NoExecute))
+    };
+    let stateful = |v: &Volume| {
+        services.iter().find(|s| {
+            s.spec.mode == ServiceMode::Stateful
+                && s.object.metadata.namespace == v.object.metadata.namespace
+                && v.object.metadata.labels.get(LABEL_SERVICE) == Some(&s.object.metadata.name)
+        })
+    };
+    // Requests placed on each node.
+    let mut load: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
+    for t in tasks.iter().filter(|t| t.placed()) {
+        let r = t.spec.pod.requests();
+        let l = load.entry(t.spec.node.as_str()).or_default();
+        l.0 = l.0.saturating_add(r.cpu.0);
+        l.1 = l.1.saturating_add(r.memory.0);
+    }
 
     // A volume used one node at a time stays with its node until the node
     // lets go of it, or is removed: removing a node is the word that it
@@ -55,7 +77,9 @@ pub(super) fn migrations(
         let Some(m) = &v.status.migration else {
             continue;
         };
-        let wanted = requested(v) == Some(m.to.as_str()) || draining(&v.status.node);
+        let wanted = requested(v) == Some(m.to.as_str())
+            || draining(&v.status.node)
+            || stateful(v).is_some_and(|s| leaves(s, &v.status.node));
         let next = if !usable(&m.to) || (m.phase != MigrationPhase::Finishing && !wanted) {
             None
         } else if m.phase == MigrationPhase::Copied
@@ -139,7 +163,7 @@ pub(super) fn migrations(
                 .filter(|v| {
                     v.status.migration.is_none()
                         && !v.status.node.is_empty()
-                        && draining(&v.status.node)
+                        && leaves(s, &v.status.node)
                 })
                 .collect();
             let Some(from) = stuck.first().map(|v| v.status.node.as_str()) else {
@@ -159,18 +183,22 @@ pub(super) fn migrations(
                     None => None,
                 };
                 going.or_else(|| {
-                    Some(v.status.node.as_str()).filter(|node| !node.is_empty() && !draining(node))
+                    Some(v.status.node.as_str()).filter(|node| !node.is_empty() && !leaves(s, node))
                 })
             });
             let to = match together {
                 Some(to) if usable(to) => to,
                 Some(_) => continue,
-                None => match target(s, from, nodes, volumes, &homes) {
+                None => match target(s, from, nodes, volumes, &homes, &load) {
                     Some(to) => to,
                     None => continue,
                 },
             };
             *homes.entry(to.to_owned()).or_default() += 1;
+            let r = s.spec.pod.requests();
+            let l = load.entry(to).or_default();
+            l.0 = l.0.saturating_add(r.cpu.0);
+            l.1 = l.1.saturating_add(r.memory.0);
             for v in stuck.iter().filter(|v| v.status.node == from) {
                 let m = Migration {
                     to: to.to_owned(),
@@ -192,18 +220,29 @@ fn requested(v: &Volume) -> Option<&str> {
 }
 
 /// Where an ordinal of `s` moves from `from`: a node its tasks may run on,
-/// home to the fewest of its ordinals (`homes`).
+/// with room for its requests beside what is placed there (`load`, CPU
+/// and memory), home to the fewest of its ordinals (`homes`).
 fn target<'a>(
     s: &Service,
     from: &str,
     nodes: &'a [Node],
     volumes: &Volumes,
     homes: &BTreeMap<String, usize>,
+    load: &BTreeMap<&str, (u64, u64)>,
 ) -> Option<&'a str> {
     let mounts = shared_volumes(s);
+    let r = s.spec.pod.requests();
+    let fits = |n: &Node| {
+        let (cpu, memory) = load.get(n.name()).copied().unwrap_or_default();
+        let alloc = n.status.allocatable;
+        let fits = |load: u64, request: u64, alloc: u64| {
+            alloc == 0 || load.checked_add(request).is_some_and(|sum| sum <= alloc)
+        };
+        fits(cpu, r.cpu.0, alloc.cpu.0) && fits(memory, r.memory.0, alloc.memory.0)
+    };
     nodes
         .iter()
-        .filter(|n| n.name() != from && eligible(n, s, volumes, &mounts).is_ok())
+        .filter(|n| n.name() != from && eligible(n, s, volumes, &mounts).is_ok() && fits(n))
         .min_by_key(|n| (homes.get(n.name()).copied().unwrap_or(0), n.name()))
         .map(Node::name)
 }
