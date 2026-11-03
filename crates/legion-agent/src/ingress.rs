@@ -341,9 +341,15 @@ impl Proxy {
         };
 
         let headers = req.headers_mut();
-        let forwarded = match headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            Some(earlier) => format!("{earlier}, {}", client.ip()),
-            None => client.ip().to_string(),
+        // Earlier proxies' addresses, on as many header lines as they came.
+        let forwarded: Vec<&str> = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        let forwarded = match forwarded.is_empty() {
+            true => client.ip().to_string(),
+            false => format!("{}, {}", forwarded.join(", "), client.ip()),
         };
         if let Ok(v) = HeaderValue::from_str(&forwarded) {
             headers.insert("x-forwarded-for", v);
@@ -510,6 +516,36 @@ mod tests {
         let status = resp.status();
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8_lossy(&body).trim().to_owned())
+    }
+
+    #[tokio::test]
+    async fn every_forwarded_for_line_is_kept() {
+        let web = backend("web").await;
+        let (_routes_tx, routes) =
+            watch::channel(vec![route("www", "shop.example.org", "/", "web")]);
+        let (_endpoints_tx, endpoints) =
+            watch::channel(vec![service("web", web, vec![Ipv4Addr::LOCALHOST])]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, routes, endpoints));
+
+        let stream = TcpStream::connect(proxy).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let req = Request::get("/")
+            .header(HOST, "shop.example.org")
+            .header("x-forwarded-for", "10.0.0.1, 10.0.0.2")
+            .header("x-forwarded-for", "10.0.0.3")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            String::from_utf8_lossy(&body).contains("xff=10.0.0.1, 10.0.0.2, 10.0.0.3, 127.0.0.1 "),
+            "{body:?}"
+        );
     }
 
     #[tokio::test]

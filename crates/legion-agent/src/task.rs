@@ -175,6 +175,9 @@ enum Abort {
     WrongPlatform(String),
     /// Stopped while starting.
     Stopped,
+    /// The agent shuts down while starting: the pod is left as it is, for
+    /// the next agent to remove as incomplete.
+    Closing,
 }
 
 struct Worker<R, C> {
@@ -196,9 +199,6 @@ pub(crate) struct Ended {
     pub state: TaskState,
     pub unsent: Option<TaskStatus>,
 }
-
-/// The agent shuts down: a worker leaves the pod as it is.
-struct Closing;
 
 pub(crate) async fn run<R: Runtime, C: Control>(
     ctx: Ctx<R, C>,
@@ -247,11 +247,13 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             return self.finish(TaskState::Rejected, why.into(), None).await;
         }
         let (pod, adopted) = match self.adopt().await {
-            Err(Closing) => return,
+            Err(Abort::Stopped) => return self.stop().await,
+            Err(_) => return,
             Ok(Some(pod)) => (pod, true),
             Ok(None) => match self.start().await {
                 Ok(pod) => (pod, false),
                 Err(Abort::Stopped) => return self.stop().await,
+                Err(Abort::Closing) => return,
                 Err(Abort::Failed(why)) => {
                     if !self.remove_pod().await {
                         return;
@@ -309,17 +311,25 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 Ok(()) => return true,
                 Err(e) => tracing::warn!("removing the pod: {e}; trying again in {wait:?}"),
             }
-            let pause = tokio::time::sleep(wait);
-            tokio::pin!(pause);
-            loop {
-                tokio::select! {
-                    () = &mut pause => break,
-                    msg = self.rx.recv() => if msg.is_none() {
-                        return false;
-                    },
-                }
+            if !self.pause(wait).await {
+                return false;
             }
             wait = (wait * 2).min(TEARDOWN_RETRY);
+        }
+    }
+
+    /// Waits before trying again; false if the agent shuts down meanwhile.
+    /// Messages are dropped: what is retried decides the task's end.
+    async fn pause(&mut self, wait: Duration) -> bool {
+        let pause = tokio::time::sleep(wait);
+        tokio::pin!(pause);
+        loop {
+            tokio::select! {
+                () = &mut pause => return true,
+                msg = self.rx.recv() => if msg.is_none() {
+                    return false;
+                },
+            }
         }
     }
 
@@ -364,14 +374,14 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         false
     }
 
-    /// Resolves once a stop arrives; other messages are dropped, as in
-    /// [`Self::stop_requested`].
-    async fn stopped(&mut self) {
+    /// Resolves once a stop arrives, or the agent shuts down; other
+    /// messages are dropped, as in [`Self::stop_requested`].
+    async fn stopped(&mut self) -> Abort {
         loop {
             match self.rx.recv().await {
-                Some(Msg::Stop) => return,
+                Some(Msg::Stop) => return Abort::Stopped,
                 Some(_) => {}
-                None => std::future::pending().await,
+                None => return Abort::Closing,
             }
         }
     }
@@ -381,13 +391,21 @@ impl<R: Runtime, C: Control> Worker<R, C> {
     /// agent went between the two), whose infra container has stopped, or
     /// whose address is not known to be its own (the agent went before
     /// reporting it) is removed instead, and started again from scratch.
-    async fn adopt(&mut self) -> Result<Option<Pod>, Closing> {
-        let found = match self.ctx.runtime.list(&[(LABEL_TASK, &self.a.uid)]).await {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!("listing containers: {e}");
-                return Ok(None);
+    /// Errs only as stopped, or closing.
+    async fn adopt(&mut self) -> Result<Option<Pod>, Abort> {
+        // Not knowing is no reason to start over: a pod still running would
+        // be in the way of the new one, and go with its failure.
+        let mut wait = Duration::from_secs(1);
+        let found = loop {
+            match self.ctx.runtime.list(&[(LABEL_TASK, &self.a.uid)]).await {
+                Ok(f) => break f,
+                Err(e) => tracing::warn!("listing containers: {e}; trying again in {wait:?}"),
             }
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                abort = self.stopped() => return Err(abort),
+            }
+            wait = (wait * 2).min(TEARDOWN_RETRY);
         };
         if found.is_empty() {
             return Ok(None);
@@ -432,13 +450,14 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                         tracing::warn!("adopting the pod's network: {why}");
                     }
                     Err(Abort::Stopped) => {}
+                    Err(Abort::Closing) => return Err(Abort::Closing),
                 }
             }
         }
         tracing::info!("removing an incomplete pod left by a previous run");
         match self.remove_pod().await {
             true => Ok(None),
-            false => Err(Closing),
+            false => Err(Abort::Closing),
         }
     }
 
@@ -545,7 +564,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 code = rt.wait(&id) => code.map_err(|e| {
                     Abort::Failed(format!("waiting for init container {}: {e}", c.name))
                 })?,
-                () = self.stopped() => return Err(Abort::Stopped),
+                abort = self.stopped() => return Err(abort),
             };
             if code != 0 {
                 // The pod and its output go with the failure: keep the end.
@@ -665,7 +684,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         };
         let guarded = tokio::select! {
             r = tokio::time::timeout(GUARD_WAIT, wait) => r.unwrap_or(false),
-            () = self.stopped() => return Err(Abort::Stopped),
+            abort = self.stopped() => return Err(abort),
         };
         if guarded {
             return Ok(());
@@ -783,7 +802,8 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             return;
         };
         m.run += 1;
-        m.ready = c.probes.readiness.is_none();
+        // Ready once started, with no readiness probe to pass.
+        m.ready = c.probes.readiness.is_none() && c.probes.startup.is_none();
         m.unhealthy = None;
         let ip = self
             .status
@@ -819,7 +839,18 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             return;
         };
         match r.outcome {
-            Outcome::Started => tracing::info!(container = %m.name, "started"),
+            Outcome::Started => {
+                tracing::info!(container = %m.name, "started");
+                let gated = self
+                    .pod()
+                    .containers
+                    .iter()
+                    .any(|c| c.name == m.name && c.probes.readiness.is_some());
+                if !gated {
+                    m.ready = true;
+                    self.update_ready(pod).await;
+                }
+            }
             Outcome::Ready(ready) => {
                 tracing::info!(container = %m.name, ready, "readiness changed");
                 m.ready = ready;
@@ -1132,22 +1163,6 @@ pub(crate) async fn teardown<R: Runtime, C: Control>(
     grace: Duration,
     keep: bool,
 ) -> Result<(), String> {
-    // The epair goes first: destroying its host end removes both ends, even
-    // while the other is still in the jail.
-    let mut network = Ok(());
-    if let Some(net) = ctx.net.get().cloned() {
-        let id = uid.to_owned();
-        network = blocking(&ctx.sys, move |sys| net.detach(sys, &id))
-            .await
-            .map_err(|e| format!("removing the pod network: {e}"));
-    }
-    if network.is_ok() {
-        ctx.ips
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(uid);
-        ctx.guarding.detach(uid);
-    }
     let found = ctx
         .runtime
         .list(&[(LABEL_TASK, uid)])
@@ -1184,6 +1199,23 @@ pub(crate) async fn teardown<R: Runtime, C: Control>(
             tracing::warn!("stopping the infra container: {e}");
         }
         jails.push(infra.clone());
+    }
+    // The network goes once the containers have stopped, which they may
+    // need it for; destroying the epair's host end removes both ends, even
+    // while the other is still in a jail. Its address is free only then.
+    let mut network = Ok(());
+    if let Some(net) = ctx.net.get().cloned() {
+        let id = uid.to_owned();
+        network = blocking(&ctx.sys, move |sys| net.detach(sys, &id))
+            .await
+            .map_err(|e| format!("removing the pod network: {e}"));
+    }
+    if network.is_ok() {
+        ctx.ips
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(uid);
+        ctx.guarding.detach(uid);
     }
     let mut left = Vec::new();
     for c in &found {

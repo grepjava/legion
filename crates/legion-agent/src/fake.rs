@@ -45,6 +45,8 @@ struct State {
     unstartable: BTreeSet<String>,
     /// Removing containers fails.
     unremovable: bool,
+    /// Listing containers fails.
+    unlistable: bool,
     /// Images for another platform than this node's.
     foreign: BTreeSet<String>,
     /// Images pulled only with this account (username, password), and who
@@ -204,6 +206,11 @@ impl FakeRuntime {
     /// Removing containers fails, or no longer does.
     pub fn fail_removes(&self, fail: bool) {
         self.state().unremovable = fail;
+    }
+
+    /// Listing containers fails, or no longer does.
+    pub fn fail_lists(&self, fail: bool) {
+        self.state().unlistable = fail;
     }
 
     /// Pulls of `reference` find nothing for this node's platform.
@@ -798,9 +805,11 @@ impl Runtime for FakeRuntime {
     }
 
     async fn list(&self, labels: &[(&str, &str)]) -> Result<Vec<ContainerSummary>> {
-        Ok(self
-            .state()
-            .containers
+        let s = self.state();
+        if s.unlistable {
+            return Err(api(500, "failed to list"));
+        }
+        Ok(s.containers
             .iter()
             .filter(|(_, c)| {
                 labels

@@ -90,6 +90,9 @@ enum Attached {
         namespace: String,
         volume: String,
         target: String,
+        /// Records written before it was kept have none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lun: Option<u32>,
     },
     Plugin {
         namespace: String,
@@ -237,23 +240,25 @@ async fn ready(
     }
     let task_dir = task_volume(p.files_dir, &a.uid, &v.name);
     match spec.driver {
+        // Under the lock: two tasks here starting on one Volume would race
+        // to create and mount it, and to drop a move's snapshots.
         VolumeDriver::Zfs => {
-            drop(guard);
             let dataset = dataset.ok_or_else(|| {
                 Error::Rejected(format!(
                     "volume {name}: this node has no ZFS dataset for volumes"
                 ))
             })?;
             let step = a.spec.snapshot.clone().filter(|_| v.claim.is_some());
-            crate::task::blocking(sys, move |sys| {
+            let result = crate::task::blocking(sys, move |sys| {
                 let path = zfs(sys, &dataset, &spec)?;
                 if let Some(step) = &step {
                     snapshot(sys, &dataset, step)?;
                 }
                 Ok(path)
             })
-            .await
-            .map_err(failed)
+            .await;
+            drop(guard);
+            result.map_err(failed)
         }
         VolumeDriver::Nfs => {
             drop(guard);
@@ -266,6 +271,25 @@ async fn ready(
             let iscsi = spec
                 .iscsi
                 .ok_or_else(|| failed("no iscsi section".into()))?;
+            // The node mounts it once for all its tasks: only from the
+            // source they mounted it from. A mount none of them records is
+            // a leftover, of whatever source, and goes.
+            let recorded: Vec<Attached> = files::present(p.files_dir)
+                .into_iter()
+                .flat_map(|task| attached(&files::task_dir(p.files_dir, &task)).unwrap_or_default())
+                .filter(|entry| entry.volume() == (namespace, name))
+                .collect();
+            for entry in &recorded {
+                if let Attached::Iscsi { target, lun, .. } = entry
+                    && (*target != iscsi.target || lun.is_some_and(|l| l != iscsi.lun))
+                {
+                    return Err(failed(format!(
+                        "mounted on this node from {target}{} for other tasks; its new source is used once they have ended",
+                        lun.map_or(String::new(), |l| format!(" LUN {l}"))
+                    )));
+                }
+            }
+            let fresh = recorded.is_empty();
             record(
                 p.files_dir,
                 &a.uid,
@@ -273,12 +297,13 @@ async fn ready(
                     namespace: namespace.to_owned(),
                     volume: name.to_owned(),
                     target: iscsi.target.clone(),
+                    lun: Some(iscsi.lun),
                 },
             )
             .map_err(failed)?;
             let dir = node_mount(p.volumes_dir, namespace, name);
             let result =
-                crate::task::blocking(sys, move |sys| mount_iscsi(sys, &iscsi, &dir)).await;
+                crate::task::blocking(sys, move |sys| mount_iscsi(sys, &iscsi, &dir, fresh)).await;
             drop(guard);
             result.map_err(failed)
         }
@@ -385,11 +410,22 @@ fn mount_nfs(sys: &dyn Sys, nfs: &NfsSource, dir: &Path) -> Result<String, Strin
     Ok(path)
 }
 
-fn mount_iscsi(sys: &dyn Sys, iscsi: &IscsiSource, dir: &Path) -> Result<String, String> {
+/// Mounts the LUN at `dir`, unless there already; a mount there is not
+/// taken as the LUN's if `fresh` (no task here records it).
+fn mount_iscsi(
+    sys: &dyn Sys,
+    iscsi: &IscsiSource,
+    dir: &Path,
+    fresh: bool,
+) -> Result<String, String> {
     let e = |e: legion_sys::Error| e.to_string();
     let path = path_str(dir)?;
     if sys.mounts(&path).map_err(e)?.contains(&path) {
-        return Ok(path);
+        if !fresh {
+            return Ok(path);
+        }
+        tracing::info!(%path, "unmounting a volume mount no task records");
+        sys.unmount(&path).map_err(e)?;
     }
     sys.kld_load("iscsi").map_err(e)?;
     let session = |sys: &dyn Sys| -> Result<_, String> {
@@ -590,20 +626,27 @@ async fn release_one<C: Control>(
 }
 
 fn unmount_plugin(sys: &dyn Sys, program: &str, dir: &str, input: &str) -> Result<(), String> {
+    let mounted = |sys: &dyn Sys| -> Result<bool, String> {
+        Ok(sys
+            .mounts(dir)
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|m| m == dir))
+    };
     match sys.run_program(program, &["unmount", dir], input) {
         Ok(_) => {}
         // Gone from the node: unmount it ourselves.
         Err(legion_sys::Error::NotFound(_)) => {
             tracing::warn!(program, "volume plugin missing; unmounting {dir} directly");
         }
+        // Nothing to unmount (its mount failed, or an unmount went
+        // through before), which a plugin may well refuse: done.
+        Err(e) if !mounted(sys)? => {
+            tracing::warn!(program, "unmounting {dir}: {e}; nothing is mounted there");
+        }
         Err(e) => return Err(e.to_string()),
     }
-    if sys
-        .mounts(dir)
-        .map_err(|e| e.to_string())?
-        .iter()
-        .any(|m| m == dir)
-    {
+    if mounted(sys)? {
         sys.unmount(dir).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -708,6 +751,7 @@ mod tests {
             namespace: "shop".into(),
             volume: volume.into(),
             target: "iqn.2026-10.lan.legion:block".into(),
+            lun: Some(0),
         };
         write_attached(dir.path(), &[entry("a"), entry("b")]).unwrap();
         write_attached(dir.path(), &[entry("b")]).unwrap();

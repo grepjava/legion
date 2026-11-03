@@ -1183,6 +1183,55 @@ restartPolicy: { condition: any, delay: 0s }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pod_is_adopted_after_listing_fails_for_a_while() {
+    let mut h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task("app-1", r#"containers: [{ name: app, image: "app:1" }]"#)
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    let created = h.rt.created();
+
+    h.stop_agent().await;
+    h.rt.fail_lists(true);
+    h.start_agent();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    h.rt.fail_lists(false);
+    // Not knowing what runs, the new agent waited: the pod is adopted, not
+    // made again over the running one.
+    eventually("adopted", || {
+        h.running().len() == 2 && h.rt.created() == created
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(h.rt.created(), created, "no container recreated");
+    let st = h.status(&key);
+    assert_eq!(st.state, TaskState::Running, "{st:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_agent_stops_promptly_while_a_pod_waits_for_its_guard() {
+    let mut h = Harness::new().await;
+    h.rt.add_image("app:1");
+    h.sys.break_anchor(legion_net::policy::ANCHOR, true);
+    let key = h
+        .task("app-1", r#"containers: [{ name: app, image: "app:1" }]"#)
+        .await;
+    eventually("waiting for the guard", || {
+        h.status(&key).message == "loading the pod's network policy"
+    })
+    .await;
+    let started = std::time::Instant::now();
+    h.stop_agent().await;
+    // Not held up until the workers are given up on.
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pod_left_before_its_containers_started_starts_over() {
     let mut h = Harness::new().await;
     h.rt.add_image("app:1");
@@ -1373,6 +1422,30 @@ async fn liveness_restarts_the_container() {
             .find(|(n, ..)| n == "shop_app-1_app")
             .unwrap();
     assert!(running && starts >= 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_container_with_only_a_startup_probe_is_ready_once_started() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    h.rt.set_exec("shop_app-1_app", 1);
+    let key = h
+        .task(
+            "app-1",
+            r#"
+containers:
+  - name: app
+    image: "app:1"
+    probes:
+      startup: { exec: { command: [/started] }, period: 20ms, failureThreshold: 1000 }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!h.status(&key).ready, "not ready while starting");
+    h.rt.set_exec("shop_app-1_app", 0);
+    eventually("ready once started", || h.status(&key).ready).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1989,6 +2062,60 @@ async fn volumes_on_luns_of_one_target() {
         h.sys.iscsi_targets().is_empty() && volume_node("lun1").is_empty()
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mounted_lun_is_used_only_from_its_source() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let (old, new) = ("iqn.2026-10.lan.legion:old", "iqn.2026-10.lan.legion:new");
+    h.sys.add_iscsi_target(old, &[(0, "da0", Some("ufs"))]);
+    h.sys.add_iscsi_target(new, &[(0, "da1", Some("ufs"))]);
+    let iscsi = |target: &str| serde_json::json!({ "driver": "iscsi", "iscsi": { "portal": "192.0.2.9", "target": target } });
+    h.write(
+        Object::new(Kind::Volume, "shop", "block", iscsi(old)),
+        Precondition::MustNotExist,
+    )
+    .await;
+    let pod = "containers: [{ name: app, image: \"app:1\", volumeMounts: [{ name: v, path: /v }] }]\n\
+               volumes: [{ name: v, volume: { name: block } }]";
+    let block = h
+        ._dir
+        .path()
+        .join("volumes")
+        .join("iscsi")
+        .join("shop")
+        .join("block");
+    let block = block.to_str().unwrap().to_owned();
+    let one = h.task("app-1", pod).await;
+    h.wait_state(&one, TaskState::Running).await;
+    assert_eq!(h.sys.mount_source(&block).as_deref(), Some("ufs /dev/da0"));
+
+    // The Volume names another target while the node still mounts the old
+    // one for a task: a new task is not handed the old LUN.
+    let key = ObjectKey::new(Kind::Volume, "shop", "block");
+    let mut v = h.store.get(&key).unwrap().unwrap();
+    v.spec = iscsi(new);
+    h.write(v, Precondition::None).await;
+    let two = h.task("app-2", pod).await;
+    let st = h.wait_state(&two, TaskState::Failed).await;
+    assert!(
+        st.message
+            .contains(&format!("mounted on this node from {old} LUN 0")),
+        "{}",
+        st.message
+    );
+    assert_eq!(h.sys.mount_source(&block).as_deref(), Some("ufs /dev/da0"));
+
+    // Once the old one's task is gone, the new target is mounted.
+    h.delete(&one).await;
+    eventually("the old LUN is let go", || {
+        h.sys.mount_source(&block).is_none() && !h.sys.iscsi_targets().contains(&old.to_owned())
+    })
+    .await;
+    let three = h.task("app-3", pod).await;
+    h.wait_state(&three, TaskState::Running).await;
+    assert_eq!(h.sys.mount_source(&block).as_deref(), Some("ufs /dev/da1"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -433,7 +433,8 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         let mut ended: BTreeSet<String> = BTreeSet::new();
         // Uids whose leftover containers are being removed.
         let mut cleaning: BTreeSet<String> = BTreeSet::new();
-        let mut cleanups: JoinSet<String> = JoinSet::new();
+        // Each says whether all of it went.
+        let mut cleanups: JoinSet<(String, bool)> = JoinSet::new();
         let mut tick = tokio::time::interval(self.resync);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -493,8 +494,14 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                     }
                 }
                 Some(done) = cleanups.join_next() => {
-                    if let Ok(uid) = done {
+                    if let Ok((uid, gone)) = done {
                         cleaning.remove(&uid);
+                        // A task that waited for it starts now, not at the
+                        // next resync.
+                        if gone && assignments.borrow().contains_key(&uid) {
+                            let current = assignments.borrow().clone();
+                            reconcile(&ctx, &current, &mut workers, &mut running, &mut uids, &mut ended, &mut cleaning, &mut cleanups).await;
+                        }
                     }
                 }
             }
@@ -988,7 +995,7 @@ async fn reconcile<R: Runtime, C: Control>(
     uids: &mut HashMap<tokio::task::Id, String>,
     ended: &mut BTreeSet<String>,
     cleaning: &mut BTreeSet<String>,
-    cleanups: &mut JoinSet<String>,
+    cleanups: &mut JoinSet<(String, bool)>,
 ) {
     ended.retain(|uid| assignments.contains_key(uid));
     for (uid, a) in assignments {
@@ -1041,10 +1048,20 @@ async fn reconcile<R: Runtime, C: Control>(
     let with_files = tokio::task::spawn_blocking(move || files::present(&root))
         .await
         .unwrap_or_default();
+    // An address still held: the pod's network was not removed with the
+    // rest of it.
+    let addressed: Vec<String> = ctx
+        .ips
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .cloned()
+        .collect();
     let orphans: BTreeSet<String> = found
         .iter()
         .filter_map(|c| c.labels.get(LABEL_TASK).cloned())
         .chain(with_files)
+        .chain(addressed)
         .filter(|uid| !workers.contains_key(uid) && !cleaning.contains(uid))
         .collect();
     for uid in orphans {
@@ -1057,10 +1074,11 @@ async fn reconcile<R: Runtime, C: Control>(
         let keep = assignments.contains_key(&uid);
         cleanups.spawn(async move {
             // Found again by a reconcile while anything is left.
-            if let Err(e) = task::teardown(&ctx, &uid, grace, keep).await {
+            let gone = task::teardown(&ctx, &uid, grace, keep).await;
+            if let Err(e) = &gone {
                 tracing::warn!(uid, "removing what is left: {e}");
             }
-            uid
+            (uid, gone.is_ok())
         });
     }
 

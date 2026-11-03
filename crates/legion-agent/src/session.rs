@@ -233,11 +233,11 @@ async fn attached_exec<R: Runtime>(
     }
     // Output, then the exit code, in a task of its own.
     let mut output = attached.output;
-    let out = {
+    let mut out = {
         let tx = tx.clone();
         let runtime = runtime.clone();
         let exec_id = exec_id.clone();
-        tokio::spawn(async move {
+        Aborting(tokio::spawn(async move {
             while let Some(chunk) = output.next().await {
                 if tx
                     .send(output_frame(chunk.map_err(runtime_status)?))
@@ -253,7 +253,7 @@ async fn attached_exec<R: Runtime>(
                 .map_err(runtime_status)?;
             let _ = tx.send(frame(Frame::ExitCode(code))).await;
             Ok(())
-        })
+        }))
     };
     // Input to the process: `None` closes its stdin. The writer goes when
     // the session does, even while a write waits on a process not reading.
@@ -272,30 +272,30 @@ async fn attached_exec<R: Runtime>(
             }
         });
     }
-    let mut out = std::pin::pin!(out);
     loop {
-        tokio::select! {
-            done = &mut out => return done.unwrap_or(Ok(())),
+        let data: Option<Bytes> = tokio::select! {
+            done = &mut out.0 => return done.unwrap_or(Ok(())),
             f = inbound.next() => match f {
                 Some(Ok(SessionFrame { frame: Some(f) })) => match f {
-                    Frame::Input(data) => {
-                        let _ = input.send(Some(data.into())).await;
-                    }
-                    Frame::InputClosed(_) => {
-                        let _ = input.send(None).await;
-                    }
+                    Frame::Input(data) => Some(data.into()),
+                    Frame::InputClosed(_) => None,
                     Frame::Resize(size) if opts.tty => {
                         resize(runtime.as_ref(), &exec_id, size.width, size.height).await;
+                        continue;
                     }
-                    _ => {}
+                    _ => continue,
                 },
-                Some(Ok(_)) => {}
+                Some(Ok(_)) => continue,
                 // The user is gone; the process loses its streams.
-                _ => {
-                    out.abort();
-                    return Ok(());
-                }
+                _ => return Ok(()),
             },
+        };
+        // Input waits for a process slow to read it, but not past its end
+        // or the user's.
+        tokio::select! {
+            _ = input.send(data) => {}
+            done = &mut out.0 => return done.unwrap_or(Ok(())),
+            () = tx.closed() => return Ok(()),
         }
     }
 }
@@ -336,9 +336,9 @@ async fn forward(
             }
         };
     let (mut read, mut write) = stream.into_split();
-    let from_pod = {
+    let mut from_pod = {
         let tx = tx.clone();
-        tokio::spawn(async move {
+        Aborting(tokio::spawn(async move {
             let mut buf = vec![0u8; 16 * 1024];
             loop {
                 match read.read(&mut buf).await {
@@ -352,17 +352,22 @@ async fn forward(
                     Err(e) => return Err(Status::unavailable(format!("reading from {addr}: {e}"))),
                 }
             }
-        })
+        }))
     };
-    let mut from_pod = std::pin::pin!(from_pod);
     let mut sending = true;
     loop {
         tokio::select! {
-            done = &mut from_pod => return done.unwrap_or(Ok(())),
+            done = &mut from_pod.0 => return done.unwrap_or(Ok(())),
             f = inbound.next() => match f {
                 Some(Ok(SessionFrame { frame: Some(Frame::Input(data)) })) if sending => {
-                    if write.write_all(&data).await.is_err() {
-                        sending = false;
+                    // A pod slow to read holds up the user's input, not
+                    // what it sends back.
+                    tokio::select! {
+                        written = write.write_all(&data) => if written.is_err() {
+                            sending = false;
+                        },
+                        done = &mut from_pod.0 => return done.unwrap_or(Ok(())),
+                        () = tx.closed() => return Ok(()),
                     }
                 }
                 Some(Ok(SessionFrame { frame: Some(Frame::InputClosed(_)) })) => {
@@ -370,12 +375,18 @@ async fn forward(
                     sending = false;
                 }
                 Some(Ok(_)) => {}
-                _ => {
-                    from_pod.abort();
-                    return Ok(());
-                }
+                _ => return Ok(()),
             },
         }
+    }
+}
+
+/// A spawned task that goes when its session does, however that ends.
+struct Aborting<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for Aborting<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
