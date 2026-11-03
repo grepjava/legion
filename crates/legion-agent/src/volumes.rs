@@ -337,10 +337,14 @@ fn record(files_dir: &Path, uid: &str, entry: Attached) -> Result<(), String> {
     write_attached(&dir, &all)
 }
 
+/// Writes the record whole or not at all: a half-written one, as an agent
+/// stopped midway would leave, could not be read to undo any of it.
 fn write_attached(dir: &Path, all: &[Attached]) -> Result<(), String> {
     let path = dir.join(ATTACHED);
+    let next = dir.join(format!("{ATTACHED}.next"));
     let text = serde_json::to_vec(all).map_err(|e| e.to_string())?;
-    std::fs::write(&path, text).map_err(|e| format!("writing {}: {e}", path.display()))
+    std::fs::write(&next, text).map_err(|e| format!("writing {}: {e}", next.display()))?;
+    std::fs::rename(&next, &path).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
 /// What the task with directory `dir` attached.
@@ -573,7 +577,10 @@ async fn release_one<C: Control>(
             true
         }
     };
-    if single && !in_use(entry) {
+    // Not while this task mounts it again further on, as a pod naming the
+    // same plugin volume twice does.
+    let again = rest.iter().any(|a| a.volume() == entry.volume());
+    if single && !in_use(entry) && !again {
         control
             .release_volume(namespace, volume, p.node)
             .await
@@ -688,4 +695,28 @@ pub(crate) fn mounts(c: &legion_api::service::Container, sources: &Sources) -> V
             Some(Mount::nullfs(source, &m.path, m.read_only))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_are_replaced_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = |volume: &str| Attached::Iscsi {
+            namespace: "shop".into(),
+            volume: volume.into(),
+            target: "iqn.2026-10.lan.legion:block".into(),
+        };
+        write_attached(dir.path(), &[entry("a"), entry("b")]).unwrap();
+        write_attached(dir.path(), &[entry("b")]).unwrap();
+        assert_eq!(attached(dir.path()).unwrap(), [entry("b")]);
+        // Nothing but the record is left.
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [ATTACHED]);
+    }
 }

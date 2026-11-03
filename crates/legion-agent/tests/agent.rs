@@ -2,11 +2,16 @@
 //! the runtime and the system faked in memory.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use legion_agent::fake::FakeRuntime;
 use legion_agent::runtime::Output;
-use legion_agent::{Agent, AgentConfig, GrpcControl, WireGuardConfig, WireGuardKey};
+use legion_agent::{
+    Agent, AgentConfig, Assignments, Control, ControlError, Endpoints, GrpcControl, Offer, Peers,
+    Registration, VolumeClaim, WireGuardConfig, WireGuardKey,
+};
+use legion_api::dispatch::{Policies, Routes, TaskUsage};
 use legion_api::node::{NodeState, NodeStatus};
 use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
 use legion_api::{Kind, Object, ObjectKey, Spec};
@@ -23,6 +28,96 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 const NODE: &str = "n1";
+
+/// The manager, as the agent reaches it; its reports can be made to fail.
+struct Flaky {
+    inner: GrpcControl,
+    fail_reports: Arc<AtomicBool>,
+}
+
+impl Control for Flaky {
+    async fn register(
+        &self,
+        name: &str,
+        status: &NodeStatus,
+    ) -> Result<Registration, ControlError> {
+        self.inner.register(name, status).await
+    }
+
+    fn assignments(&self, node: &str) -> tokio::sync::watch::Receiver<Assignments> {
+        self.inner.assignments(node)
+    }
+
+    fn endpoints(&self) -> tokio::sync::watch::Receiver<Endpoints> {
+        self.inner.endpoints()
+    }
+
+    fn peers(&self) -> tokio::sync::watch::Receiver<Peers> {
+        self.inner.peers()
+    }
+
+    fn policies(&self) -> tokio::sync::watch::Receiver<Option<Policies>> {
+        self.inner.policies()
+    }
+
+    fn routes(&self) -> tokio::sync::watch::Receiver<Routes> {
+        self.inner.routes()
+    }
+
+    async fn report(
+        &self,
+        key: &ObjectKey,
+        uid: &str,
+        status: &TaskStatus,
+    ) -> Result<(), ControlError> {
+        if self.fail_reports.load(Ordering::SeqCst) {
+            return Err(ControlError::Other("refused".into()));
+        }
+        self.inner.report(key, uid, status).await
+    }
+
+    async fn claim_volume(
+        &self,
+        namespace: &str,
+        name: &str,
+        node: &str,
+        dataset: &str,
+    ) -> Result<VolumeClaim, ControlError> {
+        self.inner
+            .claim_volume(namespace, name, node, dataset)
+            .await
+    }
+
+    async fn release_volume(
+        &self,
+        namespace: &str,
+        name: &str,
+        node: &str,
+    ) -> Result<(), ControlError> {
+        self.inner.release_volume(namespace, name, node).await
+    }
+
+    async fn data(
+        &self,
+        namespace: &str,
+        kind: Kind,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, ControlError> {
+        self.inner.data(namespace, kind, name).await
+    }
+
+    async fn heartbeat(
+        &self,
+        node: &str,
+        usage: Vec<(String, TaskUsage)>,
+    ) -> Result<Duration, ControlError> {
+        self.inner.heartbeat(node, usage).await
+    }
+
+    fn sessions(&self, node: &str) -> tokio::sync::mpsc::Receiver<Offer> {
+        self.inner.sessions(node)
+    }
+}
 const INFRA: &str = "docker.io/freebsd/freebsd-runtime:15.1";
 
 struct Harness {
@@ -40,6 +135,8 @@ struct Harness {
     drain: Duration,
     /// Whether the agent joins the WireGuard mesh.
     mesh: bool,
+    /// Whether the agent's reports fail.
+    fail_reports: Arc<AtomicBool>,
 }
 
 impl Harness {
@@ -98,6 +195,7 @@ impl Harness {
             metrics: None,
             drain: Duration::ZERO,
             mesh,
+            fail_reports: Arc::default(),
         };
         h.start_agent();
         h
@@ -121,7 +219,10 @@ impl Harness {
             config,
             self.rt.clone(),
             self.sys.clone() as Arc<dyn Sys>,
-            Arc::new(GrpcControl::new(NODE, vec![self.addr.clone()], None).unwrap()),
+            Arc::new(Flaky {
+                inner: GrpcControl::new(NODE, vec![self.addr.clone()], None).unwrap(),
+                fail_reports: self.fail_reports.clone(),
+            }),
         );
         self.metrics = Some(agent.metrics());
         let (tx, rx) = oneshot::channel();
@@ -486,6 +587,82 @@ restartPolicy: { condition: any, delay: 0s }
         st.message.contains("restarting container a")
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reports_the_manager_did_not_take_are_sent_again() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    // Refused while the pod starts: running, it says so once it can.
+    h.fail_reports.store(true, Ordering::SeqCst);
+    let key = h
+        .task_of(
+            "app-1",
+            r#"
+containers: [{ name: app, image: "app:1" }]
+restartPolicy: { condition: none }
+"#,
+            true,
+        )
+        .await;
+    eventually("running", || h.running().len() == 2).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.status(&key).state, TaskState::Assigned);
+    h.fail_reports.store(false, Ordering::SeqCst);
+    h.wait_state(&key, TaskState::Running).await;
+
+    // And its end, after its worker is gone.
+    h.fail_reports.store(true, Ordering::SeqCst);
+    h.rt.exit("shop_app-1_app", 0);
+    h.nothing_left().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.status(&key).state, TaskState::Running);
+    h.fail_reports.store(false, Ordering::SeqCst);
+    h.wait_state(&key, TaskState::Complete).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_task_stops_only_once_its_containers_are_gone() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task("app-1", r#"containers: [{ name: app, image: "app:1" }]"#)
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    h.rt.fail_removes(true);
+    h.shut_down(&key).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(h.status(&key).state, TaskState::Running, "reported stopped");
+    assert!(!h.rt.containers().is_empty());
+    h.rt.fail_removes(false);
+    h.wait_state(&key, TaskState::Shutdown).await;
+    h.nothing_left().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_adopted_container_keeps_its_attempts() {
+    let mut h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task(
+            "app-1",
+            r#"
+containers: [{ name: app, image: "app:1" }]
+restartPolicy: { condition: on-failure, maxAttempts: 1, delay: 0s }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    h.rt.exit("shop_app-1_app", 1);
+    eventually("restart counted", || h.status(&key).restarts == 1).await;
+    eventually("restarted", || h.running().len() == 2).await;
+
+    // Its one attempt used, before and after the agent restarts.
+    h.stop_agent().await;
+    h.start_agent();
+    h.rt.exit("shop_app-1_app", 1);
+    let status = h.wait_state(&key, TaskState::Failed).await;
+    assert_eq!(status.restarts, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

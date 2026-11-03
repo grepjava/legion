@@ -46,6 +46,18 @@ impl Files {
 }
 
 /// A task's directory, the mount point of its tmpfs.
+/// Whether two absolute paths name the same place, however spelt
+/// (`/etc/`, `//etc`, `/./etc`).
+fn same_path(a: &str, b: &str) -> bool {
+    let parts = |p: &str| -> Vec<String> {
+        p.split('/')
+            .filter(|c| !matches!(*c, "" | "."))
+            .map(str::to_owned)
+            .collect()
+    };
+    parts(a) == parts(b)
+}
+
 pub(crate) fn task_dir(root: &Path, uid: &str) -> PathBuf {
     root.join(uid)
 }
@@ -117,10 +129,12 @@ pub(crate) async fn prepare<C: Control>(
     let dir = task_dir(root, &a.uid);
     for c in pod.containers() {
         let mut m = mounts(c, &dir);
+        // By parts: a spec admitted before paths had one spelling may say
+        // `/etc/`.
         let own = m.iter().any(|m| m.destination == RESOLV_CONF)
             || c.volume_mounts
                 .iter()
-                .any(|v| v.path == RESOLV_CONF || v.path == "/etc");
+                .any(|v| same_path(&v.path, RESOLV_CONF) || same_path(&v.path, "/etc"));
         if resolv_conf.is_some() && !own {
             let source = dir.join("resolv.conf");
             m.push(Mount::nullfs(&source.to_string_lossy(), RESOLV_CONF, true));
@@ -205,5 +219,19 @@ pub(crate) fn present(root: &Path) -> Vec<String> {
             .filter_map(|e| e.ok()?.file_name().into_string().ok())
             .collect(),
         Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_path;
+
+    #[test]
+    fn paths_compare_by_parts() {
+        for etc in ["/etc", "/etc/", "//etc", "/./etc/"] {
+            assert!(same_path(etc, "/etc"), "{etc}");
+        }
+        assert!(!same_path("/etc2", "/etc"));
+        assert!(!same_path("/etc/resolv.conf", "/etc"));
     }
 }

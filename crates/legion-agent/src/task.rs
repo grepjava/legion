@@ -29,6 +29,9 @@ use crate::{files, logins, output, volumes};
 /// failed load every few seconds.
 const GUARD_WAIT: Duration = Duration::from_secs(60);
 
+/// The longest a worker waits before trying again to remove a pod.
+const TEARDOWN_RETRY: Duration = Duration::from_secs(30);
+
 /// What the agent tells a worker.
 #[derive(Debug)]
 pub(crate) enum Msg {
@@ -181,15 +184,27 @@ struct Worker<R, C> {
     rx: mpsc::Receiver<Msg>,
     /// The pod's readiness, reported while running.
     ready: bool,
+    /// The manager has not taken the status last reported.
+    unsent: bool,
     probe_tx: mpsc::UnboundedSender<probe::Report>,
     probe_rx: mpsc::UnboundedReceiver<probe::Report>,
 }
+
+/// How a worker ended: the state it last reported, and that status if the
+/// manager has not taken it, for the agent to report again.
+pub(crate) struct Ended {
+    pub state: TaskState,
+    pub unsent: Option<TaskStatus>,
+}
+
+/// The agent shuts down: a worker leaves the pod as it is.
+struct Closing;
 
 pub(crate) async fn run<R: Runtime, C: Control>(
     ctx: Ctx<R, C>,
     a: Assignment,
     rx: mpsc::Receiver<Msg>,
-) -> TaskState {
+) -> Ended {
     let status = a.status.clone();
     let (probe_tx, probe_rx) = mpsc::unbounded_channel();
     let mut w = Worker {
@@ -198,13 +213,17 @@ pub(crate) async fn run<R: Runtime, C: Control>(
         status,
         rx,
         ready: false,
+        unsent: false,
         probe_tx,
         probe_rx,
     };
     let span = tracing::info_span!("task", task = %w.a.key, uid = %w.a.uid);
     w.main().instrument(span).await;
     // What it last reported.
-    w.status.state
+    Ended {
+        state: w.status.state,
+        unsent: w.unsent.then(|| w.status.clone()),
+    }
 }
 
 impl<R: Runtime, C: Control> Worker<R, C> {
@@ -213,37 +232,48 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             return self.stop().await;
         }
         if let Some(why) = pod::unsupported(&self.a.spec.pod) {
-            teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
+            if !self.remove_pod().await {
+                return;
+            }
             return self.finish(TaskState::Rejected, why, None).await;
         }
         // The scheduler places such a pod elsewhere; one assigned before
         // this node said so is not run without its limits.
         if self.ctx.no_limits && self.a.spec.pod.limited() {
-            teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
+            if !self.remove_pod().await {
+                return;
+            }
             let why = "this node cannot hold the pod's limits: kern.racct.enable is not 1";
             return self.finish(TaskState::Rejected, why.into(), None).await;
         }
-        let pod = match self.adopt().await {
-            Some(pod) => pod,
-            None => match self.start().await {
-                Ok(pod) => pod,
+        let (pod, adopted) = match self.adopt().await {
+            Err(Closing) => return,
+            Ok(Some(pod)) => (pod, true),
+            Ok(None) => match self.start().await {
+                Ok(pod) => (pod, false),
                 Err(Abort::Stopped) => return self.stop().await,
                 Err(Abort::Failed(why)) => {
-                    teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
+                    if !self.remove_pod().await {
+                        return;
+                    }
                     return self.finish(TaskState::Failed, why, None).await;
                 }
                 Err(Abort::Rejected(why)) => {
-                    teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
+                    if !self.remove_pod().await {
+                        return;
+                    }
                     return self.finish(TaskState::Rejected, why, None).await;
                 }
                 Err(Abort::WrongPlatform(why)) => {
-                    teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
+                    if !self.remove_pod().await {
+                        return;
+                    }
                     self.status.wrong_platform = Some(self.ctx.platform.clone());
                     return self.finish(TaskState::Rejected, why, None).await;
                 }
             },
         };
-        self.monitor(pod).await;
+        self.monitor(pod, adopted).await;
     }
 
     fn grace(&self) -> Duration {
@@ -258,7 +288,39 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         self.status.state = state;
         self.status.message = message.into();
         self.status.ready = state == TaskState::Running && self.ready;
-        report(&self.ctx, &self.a, &self.status).await;
+        self.unsent = !report(&self.ctx, &self.a, &self.status).await;
+    }
+
+    /// Reports again what the manager did not take, if anything.
+    async fn resend(&mut self) {
+        if self.unsent {
+            self.unsent = !report(&self.ctx, &self.a, &self.status).await;
+        }
+    }
+
+    /// Tears the pod down, again and again until all of it is gone: only
+    /// then may the task be reported ended, for what it held (its volumes
+    /// above all) is free once it has. False if the agent shuts down
+    /// meanwhile, leaving the rest to the next.
+    async fn remove_pod(&mut self) -> bool {
+        let mut wait = Duration::from_secs(1);
+        loop {
+            match teardown(&self.ctx, &self.a.uid, self.grace(), true).await {
+                Ok(()) => return true,
+                Err(e) => tracing::warn!("removing the pod: {e}; trying again in {wait:?}"),
+            }
+            let pause = tokio::time::sleep(wait);
+            tokio::pin!(pause);
+            loop {
+                tokio::select! {
+                    () = &mut pause => break,
+                    msg = self.rx.recv() => if msg.is_none() {
+                        return false;
+                    },
+                }
+            }
+            wait = (wait * 2).min(TEARDOWN_RETRY);
+        }
     }
 
     async fn finish(&mut self, state: TaskState, message: String, exit_code: Option<i32>) {
@@ -282,7 +344,9 @@ impl<R: Runtime, C: Control> Worker<R, C> {
     }
 
     async fn stop(&mut self) {
-        teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
+        if !self.remove_pod().await {
+            return;
+        }
         if !self.status.state.is_terminal() {
             self.finish(TaskState::Shutdown, "stopped".into(), None)
                 .await;
@@ -317,17 +381,23 @@ impl<R: Runtime, C: Control> Worker<R, C> {
     /// agent went between the two), whose infra container has stopped, or
     /// whose address is not known to be its own (the agent went before
     /// reporting it) is removed instead, and started again from scratch.
-    async fn adopt(&mut self) -> Option<Pod> {
+    async fn adopt(&mut self) -> Result<Option<Pod>, Closing> {
         let found = match self.ctx.runtime.list(&[(LABEL_TASK, &self.a.uid)]).await {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!("listing containers: {e}");
-                return None;
+                return Ok(None);
             }
         };
         if found.is_empty() {
-            return None;
+            return Ok(None);
         }
+        // Restarts are counted for the pod, not each container: those of
+        // its one container, then.
+        let restarts = match self.pod().containers.len() {
+            1 => self.status.restarts,
+            _ => 0,
+        };
         let role = |c: &crate::runtime::ContainerSummary| {
             c.labels.get(LABEL_ROLE).and_then(|r| Role::parse(r))
         };
@@ -344,17 +414,19 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 }) else {
                     break;
                 };
-                members.push(Member::new(&spec.name, &c.id, c.state == "running"));
+                let mut m = Member::new(&spec.name, &c.id, c.state == "running");
+                m.attempts = restarts;
+                members.push(m);
             }
             if members.len() == self.pod().containers.len() {
                 match self.attach(&infra.id, true).await {
                     Ok(()) => {
                         tracing::info!("adopted running pod");
-                        return Some(Pod {
+                        return Ok(Some(Pod {
                             infra: infra.id.clone(),
                             members,
                             refused: None,
-                        });
+                        }));
                     }
                     Err(Abort::Failed(why) | Abort::Rejected(why) | Abort::WrongPlatform(why)) => {
                         tracing::warn!("adopting the pod's network: {why}");
@@ -364,8 +436,10 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             }
         }
         tracing::info!("removing an incomplete pod left by a previous run");
-        teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
-        None
+        match self.remove_pod().await {
+            true => Ok(None),
+            false => Err(Closing),
+        }
     }
 
     async fn start(&mut self) -> Result<Pod, Abort> {
@@ -765,12 +839,12 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         }
     }
 
-    async fn monitor(&mut self, mut pod: Pod) {
+    async fn monitor(&mut self, mut pod: Pod, adopted: bool) {
         // Limits are reapplied for adopted containers, in case they were
         // lost (rules of a jail removed by hand, a host reboot), and their
-        // probes start over.
+        // probes start over; a pod just started has had both.
         for i in 0..pod.members.len() {
-            if !pod.members[i].running {
+            if !adopted || !pod.members[i].running {
                 continue;
             }
             let (name, id) = (pod.members[i].name.clone(), pod.members[i].id.clone());
@@ -818,11 +892,15 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         }
         loop {
             if let Some(why) = pod.refused.take() {
-                teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
+                if !self.remove_pod().await {
+                    return;
+                }
                 return self.finish(TaskState::Rejected, why, None).await;
             }
             if let Some((state, message, code)) = finished(&pod) {
-                teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
+                if !self.remove_pod().await {
+                    return;
+                }
                 return self.finish(state, message, code).await;
             }
             let next_restart = pod.members.iter().filter_map(|m| m.restart_at).min();
@@ -835,7 +913,9 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                         return self.stop().await;
                     }
                     Some(Msg::Died { id, .. }) if id == pod.infra => {
-                        teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
+                        if !self.remove_pod().await {
+                            return;
+                        }
                         return self
                             .finish(TaskState::Failed, "the infra container exited".into(), None)
                             .await;
@@ -860,7 +940,9 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                     }
                     Some(Msg::Resync) => {
                         if !self.is_running(&pod.infra).await {
-                            teardown(&self.ctx, &self.a.uid, self.grace(), true).await;
+                            if !self.remove_pod().await {
+                                return;
+                            }
                             return self
                                 .finish(TaskState::Failed, "the infra container exited".into(), None)
                                 .await;
@@ -871,6 +953,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                                 self.exited(&mut pod, i, code).await;
                             }
                         }
+                        self.resend().await;
                     }
                 },
                 Some(r) = self.probe_rx.recv() => self.probed(&mut pod, r).await,
@@ -1039,34 +1122,37 @@ async fn sleep_until(t: Option<Instant>) {
 }
 
 /// Removes every container of the task and their rctl rules, keeping their
-/// output first if `keep` (see [`crate::output`]). Failures are logged; the
-/// next reconcile retries whatever is left.
+/// output first if `keep` (see [`crate::output`]), then lets go of its
+/// volumes and files. An error says what is left: what the pod mounts is
+/// let go of only once no container is, and its address (and guard) only
+/// once its network is gone. Callers try again.
 pub(crate) async fn teardown<R: Runtime, C: Control>(
     ctx: &Ctx<R, C>,
     uid: &str,
     grace: Duration,
     keep: bool,
-) {
+) -> Result<(), String> {
     // The epair goes first: destroying its host end removes both ends, even
     // while the other is still in the jail.
+    let mut network = Ok(());
     if let Some(net) = ctx.net.get().cloned() {
         let id = uid.to_owned();
-        if let Err(e) = blocking(&ctx.sys, move |sys| net.detach(sys, &id)).await {
-            tracing::warn!(uid, "removing the pod network: {e}");
-        }
+        network = blocking(&ctx.sys, move |sys| net.detach(sys, &id))
+            .await
+            .map_err(|e| format!("removing the pod network: {e}"));
     }
-    ctx.ips
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(uid);
-    ctx.guarding.detach(uid);
-    let found = match ctx.runtime.list(&[(LABEL_TASK, uid)]).await {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(uid, "listing containers for teardown: {e}");
-            return;
-        }
-    };
+    if network.is_ok() {
+        ctx.ips
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(uid);
+        ctx.guarding.detach(uid);
+    }
+    let found = ctx
+        .runtime
+        .list(&[(LABEL_TASK, uid)])
+        .await
+        .map_err(|e| format!("listing containers: {e}"))?;
     let infra = found
         .iter()
         .find(|c| c.labels.get(LABEL_ROLE).map(String::as_str) == Some(Role::Infra.as_str()))
@@ -1099,12 +1185,16 @@ pub(crate) async fn teardown<R: Runtime, C: Control>(
         }
         jails.push(infra.clone());
     }
+    let mut left = Vec::new();
     for c in &found {
         if let Err(e) = ctx.runtime.remove(&c.id).await
             && !e.is_not_found()
         {
-            tracing::warn!(container = %c.name(), "removing: {e}");
+            left.push(format!("{}: {e}", c.name()));
         }
+    }
+    if !left.is_empty() {
+        return Err(format!("removing containers: {}", left.join("; ")));
     }
     let result = blocking(&ctx.sys, move |sys| {
         jails.iter().try_for_each(|j| sys.rctl_remove_jail(j))
@@ -1114,32 +1204,37 @@ pub(crate) async fn teardown<R: Runtime, C: Control>(
         tracing::warn!(uid, "removing limits: {e}");
     }
     // Volumes first: what they record is in the task's directory.
-    if let Err(e) = volumes::release(ctx.control.as_ref(), &ctx.sys, &ctx.places(), uid).await {
-        tracing::warn!(uid, "letting go of volumes: {e}");
-        return;
-    }
+    volumes::release(ctx.control.as_ref(), &ctx.sys, &ctx.places(), uid)
+        .await
+        .map_err(|e| format!("letting go of volumes: {e}"))?;
     let (root, id) = (ctx.files_dir.clone(), uid.to_owned());
-    if let Err(e) = blocking(&ctx.sys, move |sys| files::release(sys, &root, &id)).await {
-        tracing::warn!(uid, "removing secrets and configs: {e}");
-    }
+    blocking(&ctx.sys, move |sys| files::release(sys, &root, &id))
+        .await
+        .map_err(|e| format!("removing secrets and configs: {e}"))?;
+    network
 }
 
 /// Retries reports the manager cannot take right now for a short while;
-/// the next state change or resync reports again anyway.
-async fn report<R, C: Control>(ctx: &Ctx<R, C>, a: &Assignment, status: &TaskStatus) {
+/// false if it still has not, for a resync to report again.
+pub(crate) async fn report<R, C: Control>(
+    ctx: &Ctx<R, C>,
+    a: &Assignment,
+    status: &TaskStatus,
+) -> bool {
     for attempt in 0..10 {
         match ctx.control.report(&a.key, &a.uid, status).await {
-            Ok(()) => return,
+            Ok(()) => return true,
             Err(ControlError::Unavailable(e)) if attempt < 9 => {
                 tracing::debug!("reporting status: {e}; retrying");
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
             Err(e) => {
                 tracing::warn!(task = %a.key, "reporting status: {e}");
-                return;
+                return false;
             }
         }
     }
+    false
 }
 
 /// Runs a [`Sys`] call on the blocking pool.

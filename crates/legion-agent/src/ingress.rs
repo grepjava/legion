@@ -313,6 +313,7 @@ impl Proxy {
             .headers()
             .get(HOST)
             .and_then(|h| h.to_str().ok())
+            .filter(|h| !h.is_empty())
             .or_else(|| req.uri().host())
             .unwrap_or_default();
         let host = host

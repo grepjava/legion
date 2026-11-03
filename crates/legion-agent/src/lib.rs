@@ -7,7 +7,7 @@
 //! container event, and periodically in case an event was missed. Pods
 //! outlive the agent: when it restarts, workers adopt the running pods.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use legion_api::node::NodeStatus;
-use legion_api::task::{DesiredState, TaskState};
+use legion_api::task::{DesiredState, TaskStatus};
 use legion_sys::Sys;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -422,7 +422,11 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         let (events_tx, mut events) = mpsc::channel(256);
         let forwarder = tokio::spawn(forward_events(ctx.clone(), events_tx));
         let mut workers: BTreeMap<String, Worker> = BTreeMap::new();
-        let mut running: JoinSet<(String, TaskState)> = JoinSet::new();
+        let mut running: JoinSet<(String, task::Ended)> = JoinSet::new();
+        // Each worker's uid by its task: a worker that panics says none.
+        let mut uids: HashMap<tokio::task::Id, String> = HashMap::new();
+        // Ends the manager did not take, reported again each resync.
+        let mut unsent: BTreeMap<String, TaskStatus> = BTreeMap::new();
         // Tasks whose workers ended having reported an end: assignments may
         // still carry an older state for a while, and must not start them
         // again.
@@ -442,7 +446,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                         break;
                     }
                     let current = assignments.borrow_and_update().clone();
-                    reconcile(&ctx, &current, &mut workers, &mut running, &mut ended, &mut cleaning, &mut cleanups).await;
+                    reconcile(&ctx, &current, &mut workers, &mut running, &mut uids, &mut ended, &mut cleaning, &mut cleanups).await;
                 }
                 Some(event) = events.recv() => match event {
                     Forwarded::Event { uid, msg } => {
@@ -458,21 +462,34 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 },
                 _ = tick.tick() => {
                     let current = assignments.borrow().clone();
-                    reconcile(&ctx, &current, &mut workers, &mut running, &mut ended, &mut cleaning, &mut cleanups).await;
+                    reconcile(&ctx, &current, &mut workers, &mut running, &mut uids, &mut ended, &mut cleaning, &mut cleanups).await;
                     for w in workers.values() {
                         let _ = w.tx.try_send(Msg::Resync);
                     }
+                    resend(&ctx, &current, &mut unsent).await;
                 }
-                Some(done) = running.join_next() => {
+                Some(done) = running.join_next_with_id() => {
                     match done {
-                        Ok((uid, state)) => {
+                        Ok((id, (uid, end))) => {
+                            uids.remove(&id);
                             workers.remove(&uid);
-                            if state.is_terminal() {
-                                ended.insert(uid);
+                            if end.state.is_terminal() {
+                                ended.insert(uid.clone());
+                            }
+                            if let Some(status) = end.unsent {
+                                unsent.insert(uid, status);
                             }
                         }
-                        Err(e) if e.is_panic() => tracing::error!("task worker panicked: {e}"),
-                        Err(_) => {}
+                        // Gone from the workers, the next reconcile starts
+                        // another, or removes what is left.
+                        Err(e) => {
+                            if e.is_panic() {
+                                tracing::error!("task worker panicked: {e}");
+                            }
+                            if let Some(uid) = uids.remove(&e.id()) {
+                                workers.remove(&uid);
+                            }
+                        }
                     }
                 }
                 Some(done) = cleanups.join_next() => {
@@ -962,11 +979,13 @@ async fn register<R, C: Control>(ctx: &Ctx<R, C>, status: &NodeStatus) -> contro
 /// Starts workers for new tasks (not those whose workers ended), stops
 /// workers for tasks that went away or should stop, and removes containers
 /// no task accounts for.
+#[allow(clippy::too_many_arguments)]
 async fn reconcile<R: Runtime, C: Control>(
     ctx: &Ctx<R, C>,
     assignments: &control::Assignments,
     workers: &mut BTreeMap<String, Worker>,
-    running: &mut JoinSet<(String, TaskState)>,
+    running: &mut JoinSet<(String, task::Ended)>,
+    uids: &mut HashMap<tokio::task::Id, String>,
     ended: &mut BTreeSet<String>,
     cleaning: &mut BTreeSet<String>,
     cleanups: &mut JoinSet<String>,
@@ -982,14 +1001,18 @@ async fn reconcile<R: Runtime, C: Control>(
                 }
             }
             // A task to shut down that never reached an end state still
-            // needs its pod removed and its state reported.
-            None if wanted || (a.spec.desired_state == DesiredState::Shutdown && !terminal) => {
+            // needs its pod removed and its state reported. Not while what
+            // is left of it is being removed: the next reconcile, then.
+            None if (wanted || (a.spec.desired_state == DesiredState::Shutdown && !terminal))
+                && !cleaning.contains(uid) =>
+            {
                 let (tx, rx) = mpsc::channel(64);
                 let (worker_ctx, a, key) = (ctx.clone(), a.clone(), uid.clone());
-                running.spawn(async move {
-                    let state = task::run(worker_ctx, a, rx).await;
-                    (key, state)
+                let handle = running.spawn(async move {
+                    let end = task::run(worker_ctx, a, rx).await;
+                    (key, end)
                 });
+                uids.insert(handle.id(), uid.clone());
                 workers.insert(
                     uid.clone(),
                     Worker {
@@ -1033,7 +1056,10 @@ async fn reconcile<R: Runtime, C: Control>(
         let ctx = ctx.clone();
         let keep = assignments.contains_key(&uid);
         cleanups.spawn(async move {
-            task::teardown(&ctx, &uid, grace, keep).await;
+            // Found again by a reconcile while anything is left.
+            if let Err(e) = task::teardown(&ctx, &uid, grace, keep).await {
+                tracing::warn!(uid, "removing what is left: {e}");
+            }
             uid
         });
     }
@@ -1056,6 +1082,27 @@ async fn reconcile<R: Runtime, C: Control>(
             }
         });
         let _ = removed.await;
+    }
+}
+
+/// Reports again the ends the manager did not take, once each, for tasks
+/// still assigned.
+async fn resend<R: Runtime, C: Control>(
+    ctx: &Ctx<R, C>,
+    assignments: &control::Assignments,
+    unsent: &mut BTreeMap<String, TaskStatus>,
+) {
+    unsent.retain(|uid, _| assignments.contains_key(uid));
+    let mut taken = Vec::new();
+    for (uid, status) in unsent.iter() {
+        let a = &assignments[uid];
+        match ctx.control.report(&a.key, &a.uid, status).await {
+            Ok(()) => taken.push(uid.clone()),
+            Err(e) => tracing::debug!(task = %a.key, "reporting its end again: {e}"),
+        }
+    }
+    for uid in taken {
+        unsent.remove(&uid);
     }
 }
 

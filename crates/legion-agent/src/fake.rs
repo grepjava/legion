@@ -43,6 +43,8 @@ struct State {
     unpullable: BTreeSet<String>,
     /// Containers, by name, that fail to start.
     unstartable: BTreeSet<String>,
+    /// Removing containers fails.
+    unremovable: bool,
     /// Images for another platform than this node's.
     foreign: BTreeSet<String>,
     /// Images pulled only with this account (username, password), and who
@@ -197,6 +199,11 @@ impl FakeRuntime {
     /// Starting the container `name` fails from now on.
     pub fn fail_starts_of(&self, name: &str) {
         self.state().unstartable.insert(name.to_owned());
+    }
+
+    /// Removing containers fails, or no longer does.
+    pub fn fail_removes(&self, fail: bool) {
+        self.state().unremovable = fail;
     }
 
     /// Pulls of `reference` find nothing for this node's platform.
@@ -545,6 +552,9 @@ impl Runtime for FakeRuntime {
         let mut s = self.state();
         if !s.containers.contains_key(id) {
             return Err(api(404, "no such container"));
+        }
+        if s.unremovable {
+            return Err(api(500, "device busy"));
         }
         self.die(&mut s, id, 137);
         s.containers.remove(id);
