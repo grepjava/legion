@@ -596,6 +596,17 @@ async fn standalone_containers_and_build_steps() {
     rt.stop(&app, Duration::from_secs(5)).await.unwrap();
     assert!(!rt.inspect(&app).await.unwrap().state.running);
 
+    // A command that cannot run fails its start with the reason, from the
+    // supervisor's status pipe; removed straight after, its directory goes
+    // even while the supervisor is ending.
+    let mut spec = standalone("missing", "");
+    spec.entrypoint = vec!["/nonexistent".into()];
+    let missing = rt.create(&spec).await.unwrap();
+    let err = rt.start(&missing).await.unwrap_err().to_string();
+    assert!(err.contains("/nonexistent"), "{err}");
+    rt.remove(&missing).await.unwrap();
+    assert!(!dir.join("jails").join(&missing).exists());
+
     // On this process's output: its exit code, recorded too, and its jail
     // gone after.
     let once = rt.create(&standalone("once", "exit 7")).await.unwrap();

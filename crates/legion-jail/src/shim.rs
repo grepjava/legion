@@ -278,6 +278,18 @@ mod imp {
     /// # Safety
     /// Only in a child just forked from a single-threaded process.
     unsafe fn child(rec: &Record, jid: i32, out: &[RawFd; 2], status: RawFd) -> ! {
+        // One started with stdio closed may have been given 0, 1 or 2 for
+        // any of its descriptors: each is moved above 2 before the
+        // command's stdio is set up, as `dup2` onto itself would leave it
+        // close-on-exec and one onto another's number would close that.
+        let above = |fd: libc::c_int| match fd {
+            // SAFETY: duplicating an open descriptor.
+            0..=2 => unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) },
+            fd => fd,
+        };
+        // The status pipe too: the command's stdio would replace it, and a
+        // failed exec would then report to the command's output.
+        let status = above(status);
         let fail = |msg: String| -> ! {
             // SAFETY: writing the reason to the status pipe, then leaving.
             unsafe {
@@ -295,15 +307,8 @@ mod imp {
             Ok(p) => p,
             Err(e) => fail(e),
         };
-        // SAFETY: the command's stdio: no input, output to the pipes. Each
-        // is first moved above 2, as one started with stdio closed may
-        // have been given 0, 1 or 2: `dup2` onto itself would leave it
-        // close-on-exec, and one onto another's number would close that.
+        // SAFETY: the command's stdio: no input, output to the pipes.
         unsafe {
-            let above = |fd: libc::c_int| match fd {
-                0..=2 => libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3),
-                fd => fd,
-            };
             let null = above(libc::open(
                 c"/dev/null".as_ptr(),
                 libc::O_RDONLY | libc::O_CLOEXEC,

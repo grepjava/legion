@@ -58,6 +58,9 @@ const SHM: &str = "/.legion-shm";
 
 /// How often state is looked at for exits.
 const TICK: Duration = Duration::from_millis(200);
+/// How long a removal waits for a stopped container's supervisor to end:
+/// past the 5 s it gives the container's output after the end.
+const SUPERVISOR_GONE: Duration = Duration::from_secs(6);
 /// How often unused images are looked for, and how long one stays after
 /// its last container (or its pull, or the agent's start) before it goes.
 const PRUNE_EVERY: Duration = Duration::from_secs(600);
@@ -1228,6 +1231,16 @@ impl legion_runtime::Runtime for JailRuntime {
                 Err(e) => return Err(internal(e)),
             }
         } else {
+            // Its supervisor may outlive the stop a little, its last output
+            // and exit.json still to write: the directory goes once it has.
+            if let Some(run) = Files::read(&self.dir, &rec)?.run
+                && run.boot == self.boot
+            {
+                let deadline = tokio::time::Instant::now() + SUPERVISOR_GONE;
+                while alive(run.shim) && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
             self.unmount(&rec)?;
             // A jail just removed may be dying a while yet, its TCP
             // connections in TIME_WAIT holding it and so its root, which
@@ -1523,9 +1536,14 @@ impl legion_runtime::Runtime for JailRuntime {
                     return None;
                 }
                 loop {
-                    let over = Files::read(&dir, &rec)
-                        .and_then(|f| status(&dir, &rec, f, boot, &jail_names(&*sys)?))
-                        .map_or(true, |s| matches!(s, Status::Exited(_)));
+                    // jls runs off the async workers: this looks every tick.
+                    let (sys, dir, rec) = (sys.clone(), dir.clone(), rec.clone());
+                    let over = blocking(move || {
+                        Files::read(&dir, &rec)
+                            .and_then(|f| status(&dir, &rec, f, boot, &jail_names(&*sys)?))
+                    })
+                    .await
+                    .map_or(true, |s| matches!(s, Status::Exited(_)));
                     // The log may have been rotated since: read_since
                     // finishes the old file before the new.
                     let (chunks, at, inode) = match log::read_since(&path, offset, inode) {
