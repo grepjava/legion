@@ -145,8 +145,30 @@ pub(super) fn migrations(
             let Some(from) = stuck.first().map(|v| v.status.node.as_str()) else {
                 continue;
             };
-            let Some(to) = target(s, from, nodes, volumes, &homes) else {
-                continue;
+            // Where the ordinal's other Volumes go or are, if not off a
+            // draining node: these join them, or wait until they may.
+            let together = s.spec.pod.claims().find_map(|(claim, _)| {
+                let key = (namespace.to_owned(), claim_volume(claim, svc, n));
+                let v = volumes.get(&key)?;
+                if stuck.iter().any(|st| std::ptr::eq(*st, v)) {
+                    return None;
+                }
+                let going = match &v.status.migration {
+                    Some(m) => Some(m.to.as_str()),
+                    None if started.contains(&key) => requested(v),
+                    None => None,
+                };
+                going.or_else(|| {
+                    Some(v.status.node.as_str()).filter(|node| !node.is_empty() && !draining(node))
+                })
+            });
+            let to = match together {
+                Some(to) if usable(to) => to,
+                Some(_) => continue,
+                None => match target(s, from, nodes, volumes, &homes) {
+                    Some(to) => to,
+                    None => continue,
+                },
             };
             *homes.entry(to.to_owned()).or_default() += 1;
             for v in stuck.iter().filter(|v| v.status.node == from) {

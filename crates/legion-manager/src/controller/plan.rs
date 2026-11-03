@@ -231,6 +231,15 @@ pub fn plan(
         memory.running_at.entry(t.uid().to_owned()).or_insert(now);
     }
 
+    // A service gone takes its autoscaling history with it.
+    let service_uids: BTreeSet<&str> = services
+        .iter()
+        .map(|s| s.object.metadata.uid.as_str())
+        .collect();
+    memory
+        .recommended
+        .retain(|uid, _| service_uids.contains(uid.as_str()));
+
     migrate::migrations(services, tasks, nodes, volumes, &mut plan);
     let mut addresses = addresses(services);
     let mut created: Vec<Task> = Vec::new();
@@ -731,6 +740,11 @@ fn service(
             ok
         };
         let start_first = s.spec.update.order == UpdateOrder::StartFirst;
+        // A stateful task's replacement needs its volumes, and so does one
+        // whose data is moving: it can only start once they have, so the
+        // task waits for them to be copied, then stops first.
+        let bound = stateful || moving.iter().any(|t| migrate::leaving(t, volumes));
+        let copied = !bound || moving.iter().all(|t| migrate::copied(t, volumes));
 
         // Never more than one current task per slot.
         for extra in current.iter().skip(1) {
@@ -738,23 +752,27 @@ fn service(
         }
         if let Some(new) = current.first() {
             // Started first: the old task goes once the new one is ready.
+            // One that cannot be placed before the data has moved has the
+            // old task stop once it is copied.
             if new.status.state == TaskState::Running && new.status.ready {
                 for old in outdated.iter().chain(&moving) {
+                    plan.actions.push(stop(old));
+                }
+            } else if bound && !moving.is_empty() && !new.placed() && copied && may_stop(&moving) {
+                for old in &moving {
                     plan.actions.push(stop(old));
                 }
             }
         } else if !moving.is_empty() {
             // Off a draining node: stopped first if the budget allows,
             // else replaced first, as a failed replacement is, after its
-            // backoff. A stateful task's replacement needs its volumes, so
-            // it waits for the budget, and for them to be copied to where
-            // they go.
-            let copied = !stateful || moving.iter().all(|t| migrate::copied(t, volumes));
-            if copied && !start_first && may_stop(&moving) {
+            // backoff. One bound to its data waits for the budget, and for
+            // the data to be copied to where it goes.
+            if copied && (bound || !start_first) && may_stop(&moving) {
                 for old in &moving {
                     plan.actions.push(stop(old));
                 }
-            } else if !stateful {
+            } else if !bound {
                 let failures = list.iter().rev().take_while(|t| t.failed()).count();
                 let due = list.last().map_or(now, |last| {
                     backoff(last, failures, policy.delay.as_std(), memory, now)
@@ -766,13 +784,17 @@ fn service(
                 }
             }
         } else if !outdated.is_empty() {
+            // The budget goes to what moves: a stateful slot the
+            // disruption budget holds back leaves it to one that is not
+            // ready anyway, below.
             if budget > 0 {
-                budget -= 1;
                 if !start_first && may_stop(&outdated) {
+                    budget -= 1;
                     for old in &outdated {
                         plan.actions.push(stop(old));
                     }
                 } else if !stateful {
+                    budget -= 1;
                     created.push(new_task(slot, list));
                 }
             }
@@ -1390,8 +1412,12 @@ fn schedule(
             }
             let l = load.get(name).cloned().unwrap_or_default();
             let alloc = n.status.allocatable;
-            if (alloc.cpu.0 > 0 && l.cpu + requests.cpu.0 > alloc.cpu.0)
-                || (alloc.memory.0 > 0 && l.memory + requests.memory.0 > alloc.memory.0)
+            // A sum past u64 fits nowhere.
+            let exceeds = |load: u64, request: u64, alloc: u64| {
+                alloc > 0 && load.checked_add(request).is_none_or(|sum| sum > alloc)
+            };
+            if exceeds(l.cpu, requests.cpu.0, alloc.cpu.0)
+                || exceeds(l.memory, requests.memory.0, alloc.memory.0)
             {
                 *reasons.entry("insufficient resources").or_default() += 1;
                 continue;
@@ -1410,8 +1436,8 @@ fn schedule(
                 n.repels(s, TaintEffect::PreferNoSchedule),
                 groups,
                 on(name),
-                l.cpu * 1000 / alloc.cpu.0.max(1),
-                l.memory * 1000 / alloc.memory.0.max(1),
+                l.cpu.saturating_mul(1000) / alloc.cpu.0.max(1),
+                l.memory.saturating_mul(1000) / alloc.memory.0.max(1),
             );
             if best.as_ref().is_none_or(|(_, b)| score < *b) {
                 best = Some((name, score));

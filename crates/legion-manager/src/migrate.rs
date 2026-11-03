@@ -20,11 +20,11 @@ use legion_proto::v1::{
 };
 use legion_store::{Command, NodeId, Outcome, Precondition, Store};
 use tokio::sync::watch;
-use tokio::task::JoinSet;
+use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::Instant;
-use tokio_stream::StreamExt;
+use tokio_stream::{Stream, StreamExt};
 
-use crate::session::{Attachment, Hub};
+use crate::session::Hub;
 
 /// How often the Volumes are looked at.
 const PERIOD: Duration = Duration::from_secs(1);
@@ -70,7 +70,7 @@ pub(crate) async fn run(
 }
 
 async fn lead(store: &Store, hub: &Arc<Hub>) {
-    let mut running: HashMap<ObjectKey, Migration> = HashMap::new();
+    let mut running: HashMap<ObjectKey, (Migration, AbortHandle)> = HashMap::new();
     let mut tasks: JoinSet<(ObjectKey, Migration, Result<(), String>)> = JoinSet::new();
     let mut failed: HashMap<ObjectKey, Instant> = HashMap::new();
     loop {
@@ -90,9 +90,24 @@ async fn lead(store: &Store, hub: &Arc<Hub>) {
                 Vec::new()
             }
         };
+        let statuses: HashMap<ObjectKey, VolumeStatus> = volumes
+            .iter()
+            .map(|v| {
+                let status = serde_json::from_value(v.status.clone()).unwrap_or_default();
+                (v.key(), status)
+            })
+            .collect();
+        running.retain(|key, (m, handle)| {
+            let wanted = !called_off(m, statuses.get(key));
+            if !wanted {
+                tracing::info!(volume = %key, to = %m.to, "migration called off");
+                handle.abort();
+            }
+            wanted
+        });
         for v in volumes {
             let key = v.key();
-            let status: VolumeStatus = serde_json::from_value(v.status.clone()).unwrap_or_default();
+            let status = statuses[&key].clone();
             let Some(m) = status.migration.clone() else {
                 continue;
             };
@@ -102,15 +117,27 @@ async fn lead(store: &Store, hub: &Arc<Hub>) {
             {
                 continue;
             }
-            running.insert(key.clone(), m.clone());
             let (store, hub) = (store.clone(), hub.clone());
-            tasks.spawn(async move {
-                let result = advance(&store, &hub, &v, &status.node, &m).await;
-                (key, m, result)
+            let (k, started) = (key.clone(), m.clone());
+            let handle = tasks.spawn(async move {
+                let result = advance(&store, &hub, &v, &status.node, &started).await;
+                (k, started, result)
             });
+            running.insert(key, (m, handle));
         }
         tokio::time::sleep(PERIOD).await;
     }
+}
+
+/// Whether a migration under way was called off, by the Volume's status
+/// now: the controller ended it or sent the Volume elsewhere, or the
+/// Volume is gone. One this migrator finished (the Volume is on its new
+/// node) is not: its old copy is still to drop.
+fn called_off(m: &Migration, now: Option<&VolumeStatus>) -> bool {
+    !now.is_some_and(|s| match &s.migration {
+        Some(now) => now.to == m.to,
+        None => s.node == m.to,
+    })
 }
 
 /// Moves a migration through its phase: the transfer, then the write.
@@ -189,7 +216,14 @@ async fn transfer(
         .offer(from, open(Action::VolumeSend(VolumeSend { volume, last })))
         .await
         .map_err(|e| e.message().to_owned())?;
-    let result = pipe(&mut sender, &mut receiver, from, to).await;
+    let result = pipe(
+        &mut sender.from_agent,
+        &mut receiver.from_agent,
+        &receiver.to_agent,
+        from,
+        to,
+    )
+    .await;
     // Not waited on: a receiver that stopped reading goes with the session.
     if let Err(e) = &result {
         let _ = receiver
@@ -202,50 +236,88 @@ async fn transfer(
     result
 }
 
+/// What an agent sends in a session.
+trait Frames: Stream<Item = Result<SessionFrame, tonic::Status>> + Unpin + Send {}
+impl<S: Stream<Item = Result<SessionFrame, tonic::Status>> + Unpin + Send + ?Sized> Frames for S {}
+
+/// Where an agent's session input goes.
+type ToAgent = tokio::sync::mpsc::Sender<Result<SessionFrame, tonic::Status>>;
+
 /// The sender's output as the receiver's input, until the receiver has
 /// taken all of it.
 async fn pipe(
-    sender: &mut Attachment,
-    receiver: &mut Attachment,
+    sender: &mut (impl Frames + ?Sized),
+    received: &mut (impl Frames + ?Sized),
+    receiver: &ToAgent,
     from: &str,
     to: &str,
 ) -> Result<(), String> {
-    let idle = |node: &str| format!("node {node}: nothing moved for {}s", IDLE.as_secs());
     loop {
         tokio::select! {
-            f = tokio::time::timeout(IDLE, sender.from_agent.next()) => {
+            f = tokio::time::timeout(IDLE, sender.next()) => {
                 match f.map_err(|_| idle(from))? {
                     Some(Ok(SessionFrame { frame: Some(Frame::Stdout(data)) })) => {
-                        // A receiver that stops taking data holds this up,
-                        // so it is timed, and its own frames still heard.
-                        let input = receiver.to_agent.send(Ok(frame(Frame::Input(data))));
-                        tokio::select! {
-                            sent = tokio::time::timeout(IDLE, input) => match sent {
-                                Ok(Ok(())) => {}
-                                Ok(Err(_)) => return Err(format!("node {to} went away")),
-                                Err(_) => return Err(idle(to)),
-                            },
-                            f = receiver.from_agent.next() => other(f, to)?,
-                        }
+                        forward(received, receiver, Frame::Input(data), to).await?;
                     }
                     Some(Ok(SessionFrame { frame: Some(Frame::ExitCode(0)) })) => {
-                        let closed = receiver.to_agent.send(Ok(frame(Frame::InputClosed(InputClosed {}))));
-                        let _ = tokio::time::timeout(IDLE, closed).await;
+                        forward(received, receiver, Frame::InputClosed(InputClosed {}), to).await?;
                         break;
                     }
                     f => other(f, from)?,
                 }
             }
-            f = receiver.from_agent.next() => other(f, to)?,
+            f = received.next() => early(f, to)?,
         }
     }
-    finished(receiver, to).await
+    finished(received, to).await
+}
+
+fn idle(node: &str) -> String {
+    format!("node {node}: nothing moved for {}s", IDLE.as_secs())
+}
+
+/// Sends `f` to the receiver. A receiver that stops taking data holds this
+/// up, so it is timed, and the receiver's own frames are heard meanwhile;
+/// the send itself is never given up for them, or its data would be lost.
+async fn forward(
+    received: &mut (impl Frames + ?Sized),
+    receiver: &ToAgent,
+    f: Frame,
+    to: &str,
+) -> Result<(), String> {
+    let send = tokio::time::timeout(IDLE, receiver.send(Ok(frame(f))));
+    tokio::pin!(send);
+    loop {
+        tokio::select! {
+            sent = &mut send => {
+                return match sent {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(_)) => Err(format!("node {to} went away")),
+                    Err(_) => Err(idle(to)),
+                };
+            }
+            f = received.next() => early(f, to)?,
+        }
+    }
+}
+
+/// A frame from the receiver while data still flows: any exit, even 0,
+/// comes before it has all of it.
+fn early(f: Option<Result<SessionFrame, tonic::Status>>, node: &str) -> Result<(), String> {
+    match f {
+        Some(Ok(SessionFrame {
+            frame: Some(Frame::ExitCode(code)),
+        })) => Err(format!(
+            "node {node} exited with {code} before it had all the data"
+        )),
+        f => other(f, node),
+    }
 }
 
 /// Waits for an agent's exit code.
-async fn finished(a: &mut Attachment, node: &str) -> Result<(), String> {
+async fn finished(a: &mut (impl Frames + ?Sized), node: &str) -> Result<(), String> {
     loop {
-        let f = tokio::time::timeout(IDLE, a.from_agent.next())
+        let f = tokio::time::timeout(IDLE, a.next())
             .await
             .map_err(|_| format!("node {node} did not finish"))?;
         match f {
@@ -295,7 +367,7 @@ async fn drop_copy(
         )
         .await
         .map_err(|e| e.message().to_owned())?;
-    finished(&mut a, node).await
+    finished(&mut a.from_agent, node).await
 }
 
 /// Notes why an attempt failed in the migration, if it is still the same.
@@ -350,4 +422,93 @@ async fn update(
 
 fn frame(f: Frame) -> SessionFrame {
     SessionFrame { frame: Some(f) }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    use super::*;
+
+    fn ok(f: Frame) -> Result<SessionFrame, tonic::Status> {
+        Ok(frame(f))
+    }
+
+    #[test]
+    fn migrations_called_off() {
+        let m = |to: &str, phase| Migration {
+            to: to.into(),
+            phase,
+            message: String::new(),
+        };
+        let copying = m("n2", MigrationPhase::Copying);
+        let status = |node: &str, migration| VolumeStatus {
+            node: node.into(),
+            dataset: String::new(),
+            migration,
+        };
+        // Still on, or moved on to its next phase.
+        assert!(!called_off(
+            &copying,
+            Some(&status("n1", Some(copying.clone())))
+        ));
+        let copied = m("n2", MigrationPhase::Copied);
+        assert!(!called_off(&copying, Some(&status("n1", Some(copied)))));
+        // Done: the Volume is on n2.
+        assert!(!called_off(&copying, Some(&status("n2", None))));
+        // Ended, sent elsewhere, or gone.
+        assert!(called_off(&copying, Some(&status("n1", None))));
+        let n3 = m("n3", MigrationPhase::Copying);
+        assert!(called_off(&copying, Some(&status("n1", Some(n3)))));
+        assert!(called_off(&copying, None));
+    }
+
+    #[tokio::test]
+    async fn no_data_is_lost_while_the_receiver_talks() {
+        let chunks: Vec<Vec<u8>> = (0..50u8).map(|i| vec![i; 3]).collect();
+        let mut sent: Vec<_> = chunks
+            .iter()
+            .cloned()
+            .map(|c| ok(Frame::Stdout(c)))
+            .collect();
+        sent.push(ok(Frame::ExitCode(0)));
+        let mut sender = tokio_stream::iter(sent);
+        // The receiver takes its input slowly, through a full channel, and
+        // has something to say about every piece.
+        let (input, mut taken) = mpsc::channel::<Result<SessionFrame, tonic::Status>>(1);
+        let (says, said) = mpsc::channel(64);
+        let receiving = tokio::spawn(async move {
+            let mut got = Vec::new();
+            while let Some(Ok(f)) = taken.recv().await {
+                let _ = says.send(ok(Frame::Stderr(b"progress".to_vec()))).await;
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                match f.frame {
+                    Some(Frame::Input(data)) => got.push(data),
+                    Some(Frame::InputClosed(_)) => {
+                        let _ = says.send(ok(Frame::ExitCode(0))).await;
+                        break;
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            got
+        });
+        let mut said = ReceiverStream::new(said);
+        pipe(&mut sender, &mut said, &input, "n1", "n2")
+            .await
+            .unwrap();
+        assert_eq!(receiving.await.unwrap(), chunks);
+    }
+
+    #[tokio::test]
+    async fn a_receiver_that_ends_early_fails_the_transfer() {
+        let mut sender = tokio_stream::pending::<Result<SessionFrame, tonic::Status>>();
+        let (input, _taken) = mpsc::channel(1);
+        let mut said = tokio_stream::iter(vec![ok(Frame::ExitCode(0))]);
+        let err = pipe(&mut sender, &mut said, &input, "n1", "n2")
+            .await
+            .unwrap_err();
+        assert!(err.contains("before it had all the data"), "{err}");
+    }
 }

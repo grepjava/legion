@@ -1342,6 +1342,30 @@ pod: { containers: [{ name: db, image: \"pg:17\" }], volumes: [{ name: data, vol
 }
 
 #[test]
+fn requests_past_any_sum_fit_nowhere() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.service(
+        "small",
+        "replicas: 1
+pod: { containers: [{ name: s, image: \"s:1\", resources: { requests: { memory: \"1\" } } }] }",
+    );
+    w.settle();
+    w.service(
+        "huge",
+        "replicas: 1
+pod: { containers: [{ name: h, image: \"h:1\", resources: { requests: { memory: \"18446744073709551615\" } } }] }",
+    );
+    w.settle();
+    let huge = w.tasks.iter().find(|t| t.spec.service == "huge").unwrap();
+    assert_eq!(huge.status.state, TaskState::Pending);
+    assert_eq!(
+        huge.status.message,
+        "no node can run it: 1 insufficient resources"
+    );
+}
+
+#[test]
 fn placement_reports_why_a_task_cannot_run() {
     let mut w = World::new();
     w.node("n1", &[("disk", "hdd")]);
@@ -2391,6 +2415,51 @@ fn stateful_updates_go_from_the_highest_ordinal_down() {
 }
 
 #[test]
+fn a_stateful_update_reaches_an_unready_ordinal_the_budget_holds_back_above() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    let spec = format!(
+        "{STATEFUL}
+maxUnavailable: 1"
+    );
+    w.service("db", &spec);
+    w.settle();
+    // Ordinal 0 runs but is not ready: the budget is spent, so nothing up
+    // may stop, but it may be replaced, and then the rest follows.
+    let version = w.next();
+    let t = w
+        .tasks
+        .iter_mut()
+        .find(|t| t.object.metadata.name == "db-0-1")
+        .unwrap();
+    t.status.ready = false;
+    t.object.status = serde_json::to_value(&t.status).unwrap();
+    t.object.metadata.version = version;
+    w.service("db", &spec.replace("pg:17", "pg:18"));
+    w.settle();
+    let mut images: Vec<(String, String)> = w
+        .tasks
+        .iter()
+        .filter(|t| t.status.state == TaskState::Running)
+        .map(|t| {
+            (
+                t.object.metadata.name.clone(),
+                t.spec.pod.containers[0].image.clone(),
+            )
+        })
+        .collect();
+    images.sort();
+    assert_eq!(
+        images,
+        [
+            ("db-0-2".to_owned(), "pg:18".to_owned()),
+            ("db-1-2".to_owned(), "pg:18".to_owned()),
+            ("db-2-2".to_owned(), "pg:18".to_owned()),
+        ]
+    );
+}
+
+#[test]
 fn stateful_updates_snapshot_and_their_rollbacks_restore() {
     let mut w = World::new();
     w.node("n1", &[]);
@@ -2691,6 +2760,18 @@ fn autoscaling_grows_at_once_and_shrinks_after_the_delay() {
 }
 
 #[test]
+fn a_deleted_service_leaves_no_autoscaling_history() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.service("web", SCALED);
+    w.settle();
+    assert!(!w.memory.recommended.is_empty());
+    w.services.clear();
+    w.settle();
+    assert!(w.memory.recommended.is_empty());
+}
+
+#[test]
 fn autoscaling_counts_only_reports_it_can_believe() {
     let mut w = World::new();
     w.node("n1", &[]);
@@ -2849,6 +2930,75 @@ fn a_volume_moves_where_it_is_asked_to_be_with_its_task() {
     w.availability(&from, Availability::Active);
     w.settle();
     assert_eq!(w.migration("data-db-0"), Some((from.clone(), Copying)));
+}
+
+#[test]
+fn a_service_moves_with_its_volume_whatever_its_update_order() {
+    use legion_api::volume::MigrationPhase::*;
+    for order in ["stop-first", "start-first"] {
+        let mut w = World::new();
+        w.node("n1", &[]);
+        w.node("n2", &[]);
+        w.volume("files", "n1");
+        w.service(
+            "web",
+            &format!(
+                "replicas: 1
+pod: {{ containers: [{{ name: w, image: \"w:1\" }}], volumes: [{{ name: f, volume: {{ name: files }} }}] }}
+update: {{ order: {order} }}"
+            ),
+        );
+        w.settle();
+        assert_eq!(w.placed("web"), ["n1"]);
+
+        // It runs while its data is copied, and no replacement waits for it.
+        w.ask("files", Some("n2"));
+        w.settle();
+        assert_eq!(
+            w.migration("files"),
+            Some(("n2".to_owned(), Copying)),
+            "{order}"
+        );
+        assert_eq!(w.wanted("web"), ["web-1-1"], "{order}");
+        assert_eq!(w.placed("web"), ["n1"], "{order}");
+        // Copied: it stops, the rest follows, and its next task runs there.
+        w.migrate();
+        w.settle();
+        assert_eq!(
+            w.migration("files"),
+            Some(("n2".to_owned(), Finishing)),
+            "{order}"
+        );
+        w.migrate();
+        w.settle();
+        assert_eq!(w.volume_node("files"), "n2", "{order}");
+        assert_eq!(w.placed("web"), ["n2"], "{order}");
+    }
+}
+
+#[test]
+fn an_ordinals_volumes_move_to_the_same_node() {
+    use legion_api::volume::MigrationPhase::*;
+    let mut w = World::new();
+    for n in ["n1", "n2", "n3"] {
+        w.node(n, &[]);
+    }
+    let two = STATEFUL.replace("replicas: 3", "replicas: 1").replace(
+        "volumes: [{ name: data, claim: { size: 1G } }]",
+        "volumes: [{ name: data, claim: { size: 1G } }, { name: wal, claim: { size: 1G } }]",
+    );
+    w.service("db", &two);
+    w.settle();
+    let home = w.placed_task("db-0-1").spec.node.clone();
+    let to = if home == "n3" { "n2" } else { "n3" };
+    // One asked elsewhere, then its node drains: the other follows it,
+    // not to the node with the fewest ordinals.
+    w.ask("data-db-0", Some(to));
+    w.settle();
+    w.availability(&home, Availability::Drain);
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some((to.to_owned(), Copying)));
+    assert_eq!(w.migration("wal-db-0"), Some((to.to_owned(), Copying)));
 }
 
 #[test]
