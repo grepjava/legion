@@ -111,6 +111,9 @@ impl ApiService {
             ));
             return c.join(forwarded(req.into_inner())).await;
         }
+        // The tokens and removals it checks are the latest: a worker's join
+        // writes nothing that would fail on a deposed leader.
+        self.consistent().await?;
         Ok(Response::new(self.issuer()?.join(req.into_inner()).await?))
     }
 
@@ -152,7 +155,12 @@ impl ApiService {
         }
     }
 
-    async fn consistent(&self) -> Result<(), Status> {
+    /// Whether this manager leads, as far as it knows.
+    pub(crate) fn leads(&self) -> bool {
+        self.store.raft.metrics().borrow().current_leader == Some(self.id)
+    }
+
+    pub(crate) async fn consistent(&self) -> Result<(), Status> {
         tokio::time::timeout(crate::COMMIT_TIMEOUT, self.store.raft.ensure_linearizable())
             .await
             .map_err(|_| crate::no_quorum())?
@@ -433,7 +441,10 @@ impl Objects for ApiService {
             .expected_version
             .map_or(Precondition::None, Precondition::Version);
         // A node removed stays out: its certificate is refused from now.
-        // Only once the delete would go through, not for a stale version.
+        // Only once the delete would go through, not for a stale version;
+        // if it then does not (the Node changed meanwhile), the node is
+        // let back in.
+        let mut removing = None;
         if key.kind == Kind::Node
             && let Some(node) = self.store.get(&key).map_err(internal)?
         {
@@ -443,15 +454,18 @@ impl Objects for ApiService {
             {
                 return Err(conflict(&key, Some(&node)));
             }
-            crate::removed::record(self, &key.name).await?;
+            removing = Some(crate::removed::record(self, &key.name).await?);
         }
-        match self
+        let deleted = self
             .write(Command::Delete {
                 key: key.clone(),
                 precondition,
             })
-            .await?
-        {
+            .await?;
+        if let (Outcome::Conflict { .. }, Some(at)) = (&deleted, removing) {
+            crate::removed::forget(self, &key.name, at).await?;
+        }
+        match deleted {
             Outcome::Deleted { version } => Ok(Response::new(DeleteResponse { version })),
             Outcome::NotFound => Err(not_found(&key)),
             Outcome::Conflict { .. } => Err(conflict(

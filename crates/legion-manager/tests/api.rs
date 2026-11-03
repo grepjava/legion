@@ -14,9 +14,10 @@ use legion_proto::v1::pods_client::PodsClient;
 use legion_proto::v1::session_frame::Frame;
 use legion_proto::v1::session_open::Action;
 use legion_proto::v1::{
-    ApplyRequest, ApplyResult, AssignmentsRequest, DataRequest, DeleteRequest, EndpointsRequest,
-    HeartbeatRequest, InitRequest, JoinTokenRequest, ListRequest, Object, ObjectRef, PeersRequest,
-    RegisterRequest, RenewRequest, ReportRequest, StatusRequest, WatchRequest, watch_event,
+    ApplyRequest, ApplyResult, AssignmentsRequest, ClaimVolumeRequest, DataRequest, DeleteRequest,
+    EndpointsRequest, HeartbeatRequest, InitRequest, JoinTokenRequest, ListRequest, Object,
+    ObjectRef, PeersRequest, RegisterRequest, RenewRequest, ReportRequest, StatusRequest,
+    WatchRequest, watch_event,
 };
 use legion_proto::v1::{ExecOptions, LogsOptions, SessionFrame, SessionOpen};
 use legion_store::Store;
@@ -977,6 +978,10 @@ async fn a_removed_worker_stays_out_until_it_joins_again() {
         })
         .await
     };
+    let old_issued = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let old = worker(creds(&ca, "w1", Role::Worker)).await;
     eventually(|| {
         let mut d = old.clone();
@@ -1052,10 +1057,38 @@ async fn a_removed_worker_stays_out_until_it_joins_again() {
             .map(|_| ()),
     );
 
+    // A manager forwarding for it is refused too: the leader checks the
+    // certificate it names against what it knows, whatever the forwarding
+    // manager's replica held.
+    let manager = worker(creds(&ca, "m9", Role::Manager)).await;
+    let forwarded_for = |issued: u64| {
+        let mut req = tonic::Request::new(HeartbeatRequest {
+            node: "w1".into(),
+            usage: Vec::new(),
+        });
+        let md = req.metadata_mut();
+        md.insert("legion-forwarded-worker", "w1".parse().unwrap());
+        md.insert("legion-forwarded-issued", issued.into());
+        req
+    };
+    let why = refused(
+        manager
+            .clone()
+            .heartbeat(forwarded_for(old_issued))
+            .await
+            .map(|_| ()),
+    );
+    assert!(why.contains("node w1 was removed"), "{why}");
+
     // Issued after the removal, as joining again gives it.
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let new = worker(creds(&ca, "w1", Role::Worker)).await;
     heartbeat(new).await.unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    manager.clone().heartbeat(forwarded_for(now)).await.unwrap();
     m.stop().await;
 }
 
@@ -1130,6 +1163,46 @@ async fn workers_follow_their_work_through_any_manager() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::PermissionDenied, "{err}");
+
+    // A renewal through the follower is signed by the leader, for the
+    // worker.
+    let (_, csr_pem) = legion_pki::request().unwrap();
+    let cert_pem = d1
+        .clone()
+        .renew(RenewRequest { csr_pem })
+        .await
+        .unwrap()
+        .into_inner()
+        .cert_pem;
+    let renewed = legion_pki::Bundle {
+        cert_pem,
+        key_pem: String::new(),
+        ca_pem: String::new(),
+    }
+    .identity()
+    .unwrap();
+    assert_eq!(renewed, Identity::new("w1", Role::Worker));
+
+    // Releasing a volume no task of the node uses tells it nothing of it.
+    apply_json(&first, "Volume", "vol", serde_json::json!({})).await;
+    let released = d1
+        .clone()
+        .claim_volume(ClaimVolumeRequest {
+            node: String::new(),
+            namespace: "default".into(),
+            name: "vol".into(),
+            dataset: String::new(),
+            release: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let released: legion_api::dispatch::VolumeClaim =
+        serde_json::from_slice(&released.claim_json).unwrap();
+    assert!(
+        !matches!(released, legion_api::dispatch::VolumeClaim::Claimed(_)),
+        "{released:?}"
+    );
 
     // Heartbeats keep the node up while the test runs.
     let beating = tokio::spawn({
@@ -1281,6 +1354,22 @@ async fn workers_follow_their_work_through_any_manager() {
         node_state(&first, "w1").as_deref() == Some("down")
     })
     .await;
+    // Its task lost with it, the node may no longer read the task's
+    // secrets, from either manager.
+    let orphaned = |m: &Running| {
+        m.store
+            .get(&key)
+            .unwrap()
+            .is_some_and(|t| t.status["state"] == "orphaned")
+    };
+    until("the task is orphaned on both managers", || {
+        orphaned(&first) && orphaned(&follower)
+    })
+    .await;
+    assert_eq!(
+        data("token").await.unwrap_err().code(),
+        Code::PermissionDenied
+    );
     let beat = d1
         .clone()
         .heartbeat(HeartbeatRequest::default())

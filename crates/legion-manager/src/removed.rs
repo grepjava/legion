@@ -77,15 +77,46 @@ pub(crate) async fn issue_after(store: &Store, node: &str) -> Result<(), Status>
 }
 
 /// Records that `node` is being removed, now. Run before its Node goes, so
-/// the node cannot come back in between.
-pub(crate) async fn record(api: &ApiService, node: &str) -> Result<(), Status> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+/// the node cannot come back in between. Returns the time recorded, for
+/// [`forget`].
+pub(crate) async fn record(api: &ApiService, node: &str) -> Result<u64, Status> {
+    change(api, |removed| {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        removed.insert(node.to_owned(), now);
+        Some(now)
+    })
+    .await
+    .map(|at| at.expect("always recorded"))
+}
+
+/// Undoes [`record`] of `node` at `at` for a removal that did not happen,
+/// unless it was recorded again since.
+pub(crate) async fn forget(api: &ApiService, node: &str, at: u64) -> Result<(), Status> {
+    change(api, |removed| {
+        if removed.get(node) != Some(&at) {
+            return None;
+        }
+        removed.remove(node);
+        Some(at)
+    })
+    .await
+    .map(drop)
+}
+
+/// Writes the removals as `edit` leaves them, retried on conflicts; `edit`
+/// returning `None` writes nothing.
+async fn change<T>(
+    api: &ApiService,
+    mut edit: impl FnMut(&mut BTreeMap<String, u64>) -> Option<T>,
+) -> Result<Option<T>, Status> {
     for _ in 0..10 {
         let (mut removed, version) = read(&api.store)?;
-        removed.insert(node.to_owned(), now);
+        let Some(done) = edit(&mut removed) else {
+            return Ok(None);
+        };
         let spec = DataSpec {
             data: None,
             text: Some(serde_json::to_string(&removed).expect("serializes")),
@@ -104,7 +135,7 @@ pub(crate) async fn record(api: &ApiService, node: &str) -> Result<(), Status> {
             })
             .await?
         {
-            Outcome::Written(_) => return Ok(()),
+            Outcome::Written(_) => return Ok(Some(done)),
             Outcome::Conflict { .. } => continue,
             other => return Err(Status::internal(format!("unexpected outcome {other:?}"))),
         }

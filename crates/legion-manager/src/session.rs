@@ -184,6 +184,12 @@ impl Pods for PodsService {
             }
             None => return Err(Status::invalid_argument("the session needs an action")),
         };
+        // A follower serves sessions from its own replica (its agents
+        // attach to it), which may lag the leader; the leader makes sure it
+        // still leads and has applied what it committed.
+        if self.api.leads() {
+            self.api.consistent().await?;
+        }
         caller.check(&self.api.store, verb, Kind::Task, &open.namespace)?;
         let task = self.task(&open, verb == Verb::Read)?;
         let spec: TaskSpec = legion_api::parse(&task.spec).map_err(internal)?;

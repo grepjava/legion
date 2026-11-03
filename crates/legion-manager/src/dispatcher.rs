@@ -16,7 +16,7 @@ use std::future::Future;
 use std::net::Ipv4Addr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use legion_api::data::DataSpec;
 use legion_api::dispatch::{
@@ -53,6 +53,12 @@ pub const HEARTBEAT_PERIOD: Duration = Duration::from_secs(2);
 
 /// Silent periods after which a node is down.
 const MISSED_HEARTBEATS: u32 = 8;
+/// The worker a manager forwards a request for, and when the worker's
+/// certificate was issued (seconds since the epoch): the leader checks it
+/// against removals its replica may have and the forwarding manager's not
+/// yet.
+const FORWARDED_WORKER: &str = "legion-forwarded-worker";
+const FORWARDED_ISSUED: &str = "legion-forwarded-issued";
 /// Heartbeats missed before a node is suspect: its tasks leave the
 /// services' endpoints, so other nodes stop sending them connections,
 /// long before it is down and they are replaced.
@@ -159,6 +165,36 @@ impl DispatcherService {
         }))
     }
 
+    /// The calling worker and when its certificate was issued, for
+    /// [`to_leader`].
+    fn worker<T>(&self, req: &Request<T>) -> Result<Worker, Status> {
+        let id = crate::tls::caller(req, self.tls)?.filter(|id| id.role == Role::Worker);
+        Ok(match (id, crate::tls::caller_issued(req, self.tls)?) {
+            (Some(id), Some(issued)) => Some((id.name, issued)),
+            _ => None,
+        })
+    }
+
+    /// The worker a manager forwarded the request for, as [`to_leader`]
+    /// names it: only a manager is taken at its word.
+    fn forwarded_worker<T>(&self, req: &Request<T>) -> Result<Worker, Status> {
+        let header = |name| req.metadata().get(name).and_then(|v| v.to_str().ok());
+        let (Some(name), Some(issued)) = (header(FORWARDED_WORKER), header(FORWARDED_ISSUED))
+        else {
+            return Ok(None);
+        };
+        if !crate::tls::caller(req, self.tls)?.is_some_and(|id| id.role == Role::Manager) {
+            return Ok(None);
+        }
+        let secs: u64 = issued
+            .parse()
+            .map_err(|_| Status::invalid_argument("unreadable forwarded issue time"))?;
+        Ok(Some((
+            name.to_owned(),
+            UNIX_EPOCH + Duration::from_secs(secs),
+        )))
+    }
+
     fn node<T>(&self, req: &Request<T>, named: &str) -> Result<String, Status> {
         let caller = self.caller(req)?;
         let node = match caller {
@@ -183,6 +219,14 @@ impl DispatcherService {
             },
         };
         legion_api::validate_name(&node).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        if let Some((worker, issued)) = self.forwarded_worker(req)? {
+            if worker != node {
+                return Err(Status::permission_denied(format!(
+                    "forwarded for {worker}, acting for {node}"
+                )));
+            }
+            crate::removed::check(self.store(), &worker, issued)?;
+        }
         Ok(node)
     }
 
@@ -208,7 +252,8 @@ impl DispatcherService {
         self.store().get(key).map_err(internal)
     }
 
-    /// The node's tasks in `namespace`.
+    /// The node's tasks in `namespace` that have not ended: those kept for
+    /// the record give it no claim on their data or volumes.
     fn tasks_of(&self, node: &str, namespace: &str) -> Result<Vec<Assignment>, Status> {
         Ok(self
             .store()
@@ -217,6 +262,7 @@ impl DispatcherService {
             .objects
             .iter()
             .filter_map(|o| assignment(o, node))
+            .filter(|a| !a.status.state.is_terminal())
             .collect())
     }
 
@@ -479,7 +525,8 @@ impl DispatcherService {
     }
 
     /// Unbinds a volume used one node at a time from `node`, which has let
-    /// go of it; one bound elsewhere, or to nothing, is left alone.
+    /// go of it; one bound elsewhere, or to nothing, is left alone, and its
+    /// spec not told: `node` need not have a task using it.
     async fn release_local(
         &self,
         node: &str,
@@ -495,7 +542,7 @@ impl DispatcherService {
             let status: VolumeStatus =
                 serde_json::from_value(volume.status.clone()).unwrap_or_default();
             if spec.access() != Access::Single || status.node != node {
-                return Ok(VolumeClaim::Claimed(Box::new(spec)));
+                return Ok(VolumeClaim::Elsewhere(String::new()));
             }
             volume.status = serde_json::to_value(VolumeStatus::default()).map_err(internal)?;
             let version = volume.metadata.version;
@@ -592,10 +639,11 @@ impl Dispatcher for DispatcherService {
             &req.get_ref().role,
         );
         if let Some(mut leader) = self.leader(&req)? {
+            let worker = self.worker(&req)?;
             let mut inner = req.into_inner();
             inner.node = node;
             inner.role = role.as_str().to_owned();
-            return leader.register(forwarded(inner)).await;
+            return leader.register(to_leader(inner, &worker)?).await;
         }
         let status: NodeStatus =
             serde_json::from_slice(&req.get_ref().status_json).map_err(invalid)?;
@@ -719,9 +767,10 @@ impl Dispatcher for DispatcherService {
     ) -> Result<Response<ReportResponse>, Status> {
         let node = self.node(&req, &req.get_ref().node)?;
         if let Some(mut leader) = self.leader(&req)? {
+            let worker = self.worker(&req)?;
             let mut inner = req.into_inner();
             inner.node = node;
-            return leader.report(forwarded(inner)).await;
+            return leader.report(to_leader(inner, &worker)?).await;
         }
         let r = req.into_inner();
         let key = ObjectKey::new(Kind::Task, &r.namespace, &r.name);
@@ -738,9 +787,10 @@ impl Dispatcher for DispatcherService {
     ) -> Result<Response<ClaimVolumeResponse>, Status> {
         let node = self.node(&req, &req.get_ref().node)?;
         if let Some(mut leader) = self.leader(&req)? {
+            let worker = self.worker(&req)?;
             let mut inner = req.into_inner();
             inner.node = node;
-            return leader.claim_volume(forwarded(inner)).await;
+            return leader.claim_volume(to_leader(inner, &worker)?).await;
         }
         let r = req.into_inner();
         let claim = self
@@ -752,8 +802,13 @@ impl Dispatcher for DispatcherService {
     }
 
     async fn renew(&self, req: Request<RenewRequest>) -> Result<Response<RenewResponse>, Status> {
+        let forwarded_for = self.forwarded_worker(&req)?;
         let id = match self.caller(&req)? {
             Some(id) if id.role == Role::Worker => id,
+            Some(id) if id.role == Role::Manager && forwarded_for.is_some() => {
+                let (name, _) = forwarded_for.as_ref().expect("checked");
+                Identity::new(name, Role::Worker)
+            }
             Some(id) => {
                 return Err(Status::permission_denied(format!(
                     "{id}: only workers renew here; managers issue their own"
@@ -765,6 +820,21 @@ impl Dispatcher for DispatcherService {
                 ));
             }
         };
+        // Signed where every removal is known: by the leader, once it has
+        // applied what it committed. A follower may not know of one yet,
+        // and a certificate it issued then would postdate it.
+        if let Some(mut leader) = self.leader(&req)? {
+            let worker = self.worker(&req)?;
+            return leader.renew(to_leader(req.into_inner(), &worker)?).await;
+        }
+        self.api.consistent().await?;
+        let issued = match &forwarded_for {
+            Some((_, issued)) => Some(*issued),
+            None => crate::tls::caller_issued(&req, self.tls)?,
+        };
+        if let Some(issued) = issued {
+            crate::removed::check(self.store(), &id.name, issued)?;
+        }
         let cert_pem = self.api.renew(&req.get_ref().csr_pem, &id)?;
         tracing::info!(%id, "renewed a worker's certificate");
         Ok(Response::new(RenewResponse { cert_pem }))
@@ -775,6 +845,7 @@ impl Dispatcher for DispatcherService {
         // A follower may not have the task, or the data, the leader has
         // already: what it refuses or lacks, the leader is asked for.
         let leader = self.leader(&req)?;
+        let worker = self.worker(&req)?;
         let mut r = req.into_inner();
         let local = self.data_local(&node, &r);
         let ask_leader = match &local {
@@ -784,7 +855,7 @@ impl Dispatcher for DispatcherService {
         match leader {
             Some(mut leader) if ask_leader => {
                 r.node = node;
-                leader.data(forwarded(r)).await
+                leader.data(to_leader(r, &worker)?).await
             }
             _ => local.map(Response::new),
         }
@@ -798,9 +869,10 @@ impl Dispatcher for DispatcherService {
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let node = self.node(&req, &req.get_ref().node)?;
         if let Some(mut leader) = self.leader(&req)? {
+            let worker = self.worker(&req)?;
             let usage = req.into_inner().usage;
             return leader
-                .heartbeat(forwarded(HeartbeatRequest { node, usage }))
+                .heartbeat(to_leader(HeartbeatRequest { node, usage }, &worker)?)
                 .await;
         }
         let reported = req.into_inner().usage;
@@ -1378,6 +1450,27 @@ fn replace<T: PartialEq + Clone>(old: &mut Option<T>, new: Option<&T>) -> bool {
         *old = new.cloned();
         true
     }
+}
+
+/// A calling worker, and when its certificate was issued.
+type Worker = Option<(String, SystemTime)>;
+
+/// `inner` for the leader, as [`forwarded`], naming the worker it is for.
+fn to_leader<U>(inner: U, worker: &Worker) -> Result<Request<U>, Status> {
+    let mut req = forwarded(inner);
+    if let Some((name, issued)) = worker {
+        let secs = issued
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let name = name
+            .parse()
+            .map_err(|_| Status::invalid_argument("a node name is not a header value"))?;
+        let md = req.metadata_mut();
+        md.insert(FORWARDED_WORKER, name);
+        md.insert(FORWARDED_ISSUED, secs.into());
+    }
+    Ok(req)
 }
 
 fn assignment(o: &Object, node: &str) -> Option<Assignment> {
