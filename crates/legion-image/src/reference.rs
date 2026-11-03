@@ -48,7 +48,12 @@ impl Reference {
         }
         let (registry, repository) = match name.split_once('/') {
             Some((first, rest)) if first.contains(['.', ':']) || first == "localhost" => {
-                (first.to_owned(), rest.to_owned())
+                if !is_host(first) {
+                    return Err(bad("bad registry"));
+                }
+                // Host names are case-blind; logins and plain-HTTP
+                // registries are matched against the lowercase name.
+                (first.to_ascii_lowercase(), rest.to_owned())
             }
             _ => (DOCKER_HUB.to_owned(), name.to_owned()),
         };
@@ -121,6 +126,36 @@ impl Reference {
             Self::parse(&format!("localhost/{s}"))
         }
     }
+}
+
+/// `host[:port]`: dot-separated labels of letters, digits and inner `-`,
+/// or a bracketed IPv6 address.
+fn is_host(s: &str) -> bool {
+    let (host, port) = match s.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some((addr, rest)) if addr.parse::<std::net::Ipv6Addr>().is_ok() => {
+                ("", rest.strip_prefix(':').or(rest.is_empty().then_some("")))
+            }
+            _ => return false,
+        },
+        None => match s.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (s, Some("")),
+        },
+    };
+    let Some(port) = port else {
+        return false;
+    };
+    let port_ok = port.is_empty() || (port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit()));
+    let host_ok = s.starts_with('[')
+        || (!host.is_empty()
+            && host.split('.').all(|l| {
+                !l.is_empty()
+                    && !l.starts_with('-')
+                    && !l.ends_with('-')
+                    && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            }));
+    port_ok && host_ok && !s.ends_with(':')
 }
 
 /// The registry a Docker config's `auths` key names, as a [`Reference`]
@@ -230,8 +265,31 @@ mod tests {
             "x@sha256:abc",
             "x@md5:aa",
             "a//b",
+            "./app",
+            "../app",
+            ":/app",
+            "a..b/app",
+            "-x.io/app",
+            "x.io:/app",
+            "x.io:http/app",
+            "[::1/app",
+            "[nope]:5000/app",
         ] {
             assert!(Reference::parse(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn registries_are_hosts_in_lowercase() {
+        assert_eq!(canonical("GHCR.IO/org/app:1"), "ghcr.io/org/app:1");
+        assert_eq!(
+            Reference::parse("Registry.Example.com:5000/v2/app")
+                .unwrap()
+                .registry,
+            registry_of("Registry.Example.com:5000/v2/")
+        );
+        assert_eq!(canonical("[::1]:5000/app"), "[::1]:5000/app:latest");
+        assert_eq!(canonical("[fd00::1]/app"), "[fd00::1]/app:latest");
+        assert_eq!(canonical("127.0.0.1:5000/app"), "127.0.0.1:5000/app:latest");
     }
 }

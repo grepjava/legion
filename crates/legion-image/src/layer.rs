@@ -97,7 +97,13 @@ pub fn whiteouts(tar: &Path) -> Result<Vec<Whiteout>, Error> {
         if name == OPAQUE {
             out.push(Whiteout::Opaque(dir));
         } else if let Some(hidden) = name.strip_prefix(WHITEOUT) {
-            out.push(Whiteout::Remove(dir.join(hidden)));
+            // `.wh.` and `.wh..` name no entry but would hide `dir` itself.
+            if matches!(
+                Path::new(hidden).components().collect::<Vec<_>>()[..],
+                [Component::Normal(_)]
+            ) {
+                out.push(Whiteout::Remove(dir.join(hidden)));
+            }
         }
     }
     Ok(out)
@@ -452,6 +458,9 @@ mod tests {
                 ("usr/share/misc/new", "n"),
                 ("./etc/added", "+"),
                 ("nothing/.wh.here", ""),
+                ("etc/.wh.", ""),
+                ("etc/.wh..", ""),
+                (".wh.", ""),
             ],
         );
         assert_eq!(whiteouts(&top).unwrap().len(), 4);

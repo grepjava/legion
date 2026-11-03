@@ -107,8 +107,10 @@ impl Source<'_> {
                 creds,
             } => client.manifest(reference, *creds, oses).await,
             Source::Layout(dir) => {
-                let mut doc = Document::parse(&std::fs::read(plain(dir, "index.json")?)?)?;
-                let mut digest = String::new();
+                let index = std::fs::read(plain(dir, "index.json")?)?;
+                let mut doc = Document::parse(&index)?;
+                // A manifest where the index should be is its own digest.
+                let mut digest = sha256(&index);
                 // An index, possibly of indexes, down to a manifest.
                 for _ in 0..3 {
                     let Some(manifests) = &doc.manifests else {
@@ -1031,6 +1033,10 @@ impl Store {
         let mut archive = tar::Builder::new(File::create(out)?);
         archive.append_dir_all(".", tmp.path())?;
         archive.finish()?;
+        // The image as exported: packed again, it is another config and
+        // manifest.
+        image.id = manifest.config.digest;
+        image.digest = index.manifests.unwrap_or_default().remove(0).digest;
         Ok(image)
     }
 

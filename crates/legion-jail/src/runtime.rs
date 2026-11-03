@@ -28,7 +28,7 @@ use legion_runtime::{
     ContainerSummary, Error, Event, ExecOutput, Login, Output, Result,
 };
 use legion_sys::Sys;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::log;
 use crate::state::{self, EXIT, Exit, LOG, RECORD, RUN, Record, Run, SHIM_LOG};
@@ -102,16 +102,24 @@ const EXEC_KEPT: Duration = Duration::from_secs(60);
 fn reap(
     mut child: tokio::process::Child,
     code: watch::Sender<Option<i32>>,
+    mut signals: mpsc::UnboundedReceiver<libc::c_int>,
     execs: Execs,
     exec_id: String,
 ) {
     tokio::spawn(async move {
-        let got = child
-            .wait()
-            .await
-            .ok()
-            .and_then(|s| s.code())
-            .unwrap_or(255);
+        let status = loop {
+            tokio::select! {
+                s = child.wait() => break s,
+                Some(signal) = signals.recv() => {
+                    // Its pid is ours until it is reaped, so no one else's.
+                    if let Some(pid) = child.id() {
+                        // SAFETY: signalling our own unreaped child.
+                        unsafe { libc::kill(pid as libc::pid_t, signal) };
+                    }
+                }
+            }
+        };
+        let got = status.ok().and_then(|s| s.code()).unwrap_or(255);
         let _ = code.send(Some(got));
         tokio::time::sleep(EXEC_KEPT).await;
         execs.lock().expect("execs").remove(&exec_id);
@@ -150,6 +158,10 @@ struct Session {
     group: Option<u32>,
     /// The container's jail, which the command and all it starts are in.
     jid: u32,
+    /// Signals for the command itself, which the shim is until it execs:
+    /// on the host until it enters the jail, and with a terminal not yet
+    /// leading its group.
+    signal: mpsc::UnboundedSender<libc::c_int>,
     /// The terminal's controlling side, for resizing.
     #[cfg(unix)]
     master: Option<Arc<Pty>>,
@@ -456,8 +468,9 @@ impl JailRuntime {
     }
 
     fn status(&self, rec: &Record) -> Result<Status> {
+        let files = Files::read(&self.dir, rec)?;
         let jails = jail_names(&*self.sys)?;
-        status(&self.dir, rec, self.boot, &jails)
+        status(&self.dir, rec, files, self.boot, &jails)
     }
 
     /// The jail id of a running member, for exec.
@@ -505,17 +518,35 @@ fn jail_names(sys: &dyn Sys) -> Result<std::collections::BTreeSet<String>> {
         .collect())
 }
 
+/// What a container's files say of its run, read before the jails are
+/// listed: a pod's jail is made before its run is written, so a run read
+/// first whose jail the listing lacks is over, not just starting.
+struct Files {
+    exit: Option<Exit>,
+    run: Option<Run>,
+}
+
+impl Files {
+    fn read(dir: &Path, rec: &Record) -> Result<Files> {
+        let cdir = dir.join(&rec.id);
+        Ok(Files {
+            exit: state::read(&cdir, EXIT).map_err(internal)?,
+            run: state::read(&cdir, RUN).map_err(internal)?,
+        })
+    }
+}
+
 fn status(
     dir: &Path,
     rec: &Record,
+    files: Files,
     boot: u64,
     jails: &std::collections::BTreeSet<String>,
 ) -> Result<Status> {
-    let cdir = dir.join(&rec.id);
-    if let Some(exit) = state::read::<Exit>(&cdir, EXIT).map_err(internal)? {
+    if let Some(exit) = files.exit {
         return Ok(Status::Exited(exit));
     }
-    let Some(run) = state::read::<Run>(&cdir, RUN).map_err(internal)? else {
+    let Some(run) = files.run else {
         return Ok(Status::Created);
     };
     let here = jails.contains(&rec.jail);
@@ -527,6 +558,11 @@ fn status(
         };
     if running {
         return Ok(Status::Running(run));
+    }
+    // A supervisor writes the end before it exits: it may have since the
+    // first look.
+    if let Some(exit) = state::read::<Exit>(&dir.join(&rec.id), EXIT).map_err(internal)? {
+        return Ok(Status::Exited(exit));
     }
     // A pod jail removed, or a supervisor gone without a word (a reboot).
     Ok(Status::Exited(Exit {
@@ -545,11 +581,16 @@ async fn watch_exits(sys: Arc<dyn Sys>, dir: PathBuf, boot: u64, events: broadca
         let sys2 = sys.clone();
         let now =
             tokio::task::spawn_blocking(move || -> Result<Vec<(Record, Status, Option<Run>)>> {
+                let mut read = Vec::new();
+                for rec in records(&dir2)? {
+                    let files = Files::read(&dir2, &rec)?;
+                    read.push((rec, files));
+                }
                 let jails = jail_names(&*sys2)?;
                 let mut out = Vec::new();
-                for rec in records(&dir2)? {
-                    let s = status(&dir2, &rec, boot, &jails)?;
-                    let run = state::read::<Run>(&dir2.join(&rec.id), RUN).ok().flatten();
+                for (rec, files) in read {
+                    let run = files.run.clone();
+                    let s = status(&dir2, &rec, files, boot, &jails)?;
                     out.push((rec, s, run));
                 }
                 Ok(out)
@@ -1138,8 +1179,14 @@ impl legion_runtime::Runtime for JailRuntime {
             Ok(()) | Err(legion_sys::Error::NotFound(_)) => {}
             Err(e) => return Err(internal(e)),
         }
-        if !self.wait_over(&rec, Duration::from_secs(10)).await? {
-            // The supervisor is gone: record the end for it.
+        // Unless the supervisor recorded the end, it is gone (it may have
+        // been before the stop, its exit then only the made-up 255): record
+        // the end for it.
+        self.wait_over(&rec, Duration::from_secs(10)).await?;
+        if state::read::<Exit>(&self.container_dir(id), EXIT)
+            .map_err(internal)?
+            .is_none()
+        {
             state::write(
                 &self.container_dir(id),
                 EXIT,
@@ -1252,6 +1299,7 @@ impl legion_runtime::Runtime for JailRuntime {
         let mut command = self.shim_command(&refs);
         let exec_id = new_id();
         let (code_tx, code_rx) = watch::channel(None);
+        let (signal, signals) = mpsc::unbounded_channel();
         if tty {
             #[cfg(unix)]
             {
@@ -1267,7 +1315,7 @@ impl legion_runtime::Runtime for JailRuntime {
                 let child = command.spawn().map_err(internal)?;
                 drop(slave);
                 let group = child.id();
-                reap(child, code_tx, self.execs.clone(), exec_id.clone());
+                reap(child, code_tx, signals, self.execs.clone(), exec_id.clone());
                 // One descriptor for all three, so dropping them closes it.
                 let master = Pty::new(master).map_err(internal)?;
                 let reader = PtyReader(master.clone());
@@ -1278,6 +1326,7 @@ impl legion_runtime::Runtime for JailRuntime {
                         code: code_rx,
                         group,
                         jid,
+                        signal,
                         master: Some(master),
                     },
                 );
@@ -1316,13 +1365,14 @@ impl legion_runtime::Runtime for JailRuntime {
         let err = child.stderr.take().expect("piped");
         let input = child.stdin.take();
         let group = child.id();
-        reap(child, code_tx, self.execs.clone(), exec_id.clone());
+        reap(child, code_tx, signals, self.execs.clone(), exec_id.clone());
         self.execs.lock().expect("execs").insert(
             exec_id.clone(),
             Session {
                 code: code_rx,
                 group,
                 jid,
+                signal,
                 #[cfg(unix)]
                 master: None,
             },
@@ -1393,7 +1443,8 @@ impl legion_runtime::Runtime for JailRuntime {
     /// a terminal would be, and killed if any outlast
     /// [`EXEC_HANGUP_GRACE`]: no one is left to read them. That is the
     /// command's process group in the container's jail, which the command
-    /// itself may have left already. Dropping the session drops a
+    /// itself may have left already, and the command itself, which may not
+    /// be in the jail or its group yet. Dropping the session drops a
     /// terminal's last descriptor.
     async fn exec_release(&self, exec_id: &str) {
         let Some(session) = self.execs.lock().expect("execs").remove(exec_id) else {
@@ -1402,18 +1453,22 @@ impl legion_runtime::Runtime for JailRuntime {
         let (Some(group), jid) = (session.group, session.jid) else {
             return;
         };
+        let (signal, mut code) = (session.signal.clone(), session.code.clone());
         drop(session);
-        if !signal_group(group, jid, "HUP").await {
+        let _ = signal.send(libc::SIGHUP);
+        let grouped = signal_group(group, jid, "HUP").await;
+        if !grouped && code.borrow().is_some() {
             return;
         }
         tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + EXEC_HANGUP_GRACE;
             while tokio::time::Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(250)).await;
-                if !signal_group(group, jid, "0").await {
+                if code.borrow_and_update().is_some() && !signal_group(group, jid, "0").await {
                     return;
                 }
             }
+            let _ = signal.send(libc::SIGKILL);
             signal_group(group, jid, "KILL").await;
         });
     }
@@ -1450,8 +1505,8 @@ impl legion_runtime::Runtime for JailRuntime {
                     return None;
                 }
                 loop {
-                    let over = jail_names(&*sys)
-                        .and_then(|j| status(&dir, &rec, boot, &j))
+                    let over = Files::read(&dir, &rec)
+                        .and_then(|f| status(&dir, &rec, f, boot, &jail_names(&*sys)?))
                         .map_or(true, |s| matches!(s, Status::Exited(_)));
                     // The log may have been rotated since: read_since
                     // finishes the old file before the new.
@@ -1478,13 +1533,17 @@ impl legion_runtime::Runtime for JailRuntime {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
+        let mut read = Vec::new();
+        for rec in records(&self.dir)? {
+            if labelled(&rec.labels, &wanted) {
+                let files = Files::read(&self.dir, &rec)?;
+                read.push((rec, files));
+            }
+        }
         let jails = jail_names(&*self.sys)?;
         let mut out = Vec::new();
-        for rec in records(&self.dir)? {
-            if !labelled(&rec.labels, &wanted) {
-                continue;
-            }
-            let s = status(&self.dir, &rec, self.boot, &jails)?;
+        for (rec, files) in read {
+            let s = status(&self.dir, &rec, files, self.boot, &jails)?;
             let (pid, exit_code) = match &s {
                 Status::Running(r) => (r.pid, 0),
                 Status::Exited(e) => (0, e.code),

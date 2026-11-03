@@ -512,6 +512,19 @@ async fn imports_an_oci_layout() {
     assert_eq!(image.layers.len(), 1);
     assert!(s.get("localhost/built:1").unwrap().is_some());
 
+    // A layout whose index.json is the manifest itself.
+    let direct = tempfile::tempdir().unwrap();
+    let direct_blobs = direct.path().join("blobs/sha256");
+    std::fs::create_dir_all(&direct_blobs).unwrap();
+    for e in std::fs::read_dir(&blobs).unwrap() {
+        let e = e.unwrap();
+        std::fs::copy(e.path(), direct_blobs.join(e.file_name())).unwrap();
+    }
+    std::fs::write(direct.path().join("index.json"), &manifest).unwrap();
+    let image = s.import(direct.path(), "localhost/direct:1").await.unwrap();
+    assert_eq!(image.digest, m);
+    assert!(s.remove("localhost/direct:1").await.unwrap());
+
     // The same layout as an archive, named by its index.
     let archive = t.path().join("built.tar");
     let mut b = tar::Builder::new(std::fs::File::create(&archive).unwrap());

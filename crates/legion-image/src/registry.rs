@@ -68,7 +68,7 @@ impl Client {
 
     /// Talks to `registry` (`host[:port]`) over plain HTTP.
     pub fn plain_http(mut self, registry: &str) -> Client {
-        self.plain.insert(registry.to_owned());
+        self.plain.insert(registry.to_ascii_lowercase());
         self
     }
 
@@ -394,12 +394,7 @@ impl Client {
                 "{r}: the registry sends logins to {realm}, which is not https"
             )));
         }
-        let default_scope = if push {
-            format!("repository:{}:pull,push", r.repository)
-        } else {
-            format!("repository:{}:pull", r.repository)
-        };
-        let scope = params.get("scope").cloned().unwrap_or(default_scope);
+        let scope = scope(r, params.get("scope").map(String::as_str), push);
         let mut req = self.http.get(realm).query(&[("scope", scope.as_str())]);
         if let Some(service) = params.get("service") {
             req = req.query(&[("service", service.as_str())]);
@@ -602,6 +597,17 @@ fn denied(r: &Reference, creds: Option<&Credentials>) -> Error {
     })
 }
 
+/// The scope a token is asked for: the challenge's for a pull, but always
+/// `pull,push` for a push, since its token is cached for the uploads after
+/// it and a `HEAD` on a blob is challenged for `pull` only.
+fn scope(r: &Reference, challenged: Option<&str>, push: bool) -> String {
+    match challenged {
+        _ if push => format!("repository:{}:pull,push", r.repository),
+        Some(scope) => scope.to_owned(),
+        None => format!("repository:{}:pull", r.repository),
+    }
+}
+
 /// `realm="...",service="...",scope="..."`.
 fn parse_challenge(s: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
@@ -644,5 +650,15 @@ mod tests {
         let p = parse_challenge(r#"realm=https://r/t, service="a,b""#);
         assert_eq!(p["realm"], "https://r/t");
         assert_eq!(p["service"], "a,b");
+    }
+
+    #[test]
+    fn a_push_asks_to_push_whatever_the_challenge() {
+        let r = Reference::parse("r.example/me/app:1").unwrap();
+        let pull = Some("repository:me/app:pull");
+        assert_eq!(scope(&r, pull, true), "repository:me/app:pull,push");
+        assert_eq!(scope(&r, None, true), "repository:me/app:pull,push");
+        assert_eq!(scope(&r, pull, false), "repository:me/app:pull");
+        assert_eq!(scope(&r, None, false), "repository:me/app:pull");
     }
 }

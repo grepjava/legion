@@ -420,11 +420,20 @@ async fn what_a_push_reads_stays_while_it_runs() {
 
     // An export, too, holds what it reads.
     let archive = t.path().join("plain.tar");
-    plain
+    let exported = plain
         .export(&target.to_string(), &archive, None)
         .await
         .unwrap();
     assert!(archive.exists());
+    // What it returns is what it wrote, packed again.
+    let loaded = directory_store(&t.path().join("unpacked"), client())
+        .load(&archive, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (exported.id.as_str(), exported.digest.as_str()),
+        (loaded.id.as_str(), loaded.digest.as_str())
+    );
 
     // What it packs again, it does not write over where it is already
     // (another push may be reading it): made read-only, it is left alone.
