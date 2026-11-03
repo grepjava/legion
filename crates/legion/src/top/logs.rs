@@ -5,6 +5,9 @@ use std::collections::VecDeque;
 
 /// The most lines kept; older ones go.
 const KEPT: usize = 5000;
+/// The longest line kept whole: output without newlines comes as lines of
+/// this many bytes rather than growing without end.
+const LONGEST: usize = 64 * 1024;
 
 pub(super) struct Logs {
     /// Whose: `shop/web-1-1`, with `/container` when one was chosen.
@@ -34,12 +37,22 @@ impl Logs {
     pub(super) fn push(&mut self, stderr: bool, data: &[u8]) {
         let partial = &mut self.partial[usize::from(stderr)];
         partial.push_str(&String::from_utf8_lossy(data));
-        let Some(end) = partial.rfind('\n') else {
-            return;
-        };
-        let done: String = partial.drain(..=end).collect();
-        let lines: Vec<String> = done.lines().map(clean).collect();
-        self.add(stderr, lines);
+        let mut lines = Vec::new();
+        if let Some(end) = partial.rfind('\n') {
+            let done: String = partial.drain(..=end).collect();
+            lines.extend(done.lines().map(clean));
+        }
+        while partial.len() > LONGEST {
+            let mut cut = LONGEST;
+            while !partial.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let head: String = partial.drain(..cut).collect();
+            lines.push(clean(&head));
+        }
+        if !lines.is_empty() {
+            self.add(stderr, lines);
+        }
     }
 
     /// No more come, and why.
@@ -62,7 +75,7 @@ impl Logs {
         while self.lines.len() > KEPT {
             self.lines.pop_front();
         }
-        self.back = self.back.min(self.lines.len());
+        self.back = self.back.min(self.lines.len().saturating_sub(1));
     }
 
     /// Back (or forward, when negative) by `n` lines; at the newest it
@@ -86,17 +99,26 @@ fn clean(line: &str) -> String {
                 let n = 8 - out.chars().count() % 8;
                 out.extend(std::iter::repeat_n(' ', n));
             }
-            // ESC [ … its final byte (`@` to `~`, as ECMA-48 has it), or
+            // ESC [ … its final byte (`@` to `~`, as ECMA-48 has it); ESC ]
+            // (a title, a link) and the other strings to BEL or ESC \; or
             // ESC and one more.
-            '\u{1b}' => {
-                if chars.next() == Some('[') {
+            '\u{1b}' => match chars.next() {
+                Some('[') => {
                     for c in chars.by_ref() {
                         if ('@'..='~').contains(&c) {
                             break;
                         }
                     }
                 }
-            }
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' || (c == '\u{1b}' && chars.next().is_some()) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
             c if c.is_control() => {}
             c => out.push(c),
         }
@@ -106,7 +128,7 @@ fn clean(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::clean;
+    use super::*;
 
     #[test]
     fn escapes_end_at_their_final_byte() {
@@ -122,5 +144,30 @@ mod tests {
             assert_eq!(clean(&format!("{seq}kept text")), "kept text", "{seq:?}");
         }
         assert_eq!(clean("a\tb"), "a       b");
+        // Strings: a title ended by BEL, a link ended by ESC \.
+        assert_eq!(clean("\u{1b}]0;title\u{7}after"), "after");
+        assert_eq!(
+            clean("\u{1b}]8;;http://x\u{1b}\\link\u{1b}]8;;\u{1b}\\"),
+            "link"
+        );
+    }
+
+    #[test]
+    fn scrolled_back_at_the_cap_keeps_lines_in_view() {
+        let mut logs = Logs::new("shop/web".into());
+        logs.push(false, "a\n".repeat(KEPT).as_bytes());
+        logs.back = KEPT - 1;
+        logs.push(false, b"more\n");
+        assert_eq!(logs.back, KEPT - 1);
+    }
+
+    #[test]
+    fn lines_without_newlines_are_cut() {
+        let mut logs = Logs::new("shop/web".into());
+        logs.push(false, &vec![b'x'; LONGEST * 2 + 10]);
+        assert_eq!(logs.lines.len(), 2);
+        logs.end("done".into());
+        assert_eq!(logs.lines.len(), 3);
+        assert_eq!(logs.lines[2].1.len(), 10);
     }
 }

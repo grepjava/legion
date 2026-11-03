@@ -109,10 +109,15 @@ impl Spec for RouteSpec {
                 ),
             ));
         }
-        if !self.path.starts_with('/') || self.path.contains(['?', '#']) {
+        // A request's path is printable ASCII, other bytes percent-encoded:
+        // a route with anything else would match nothing.
+        if !self.path.starts_with('/')
+            || self.path.contains(['?', '#'])
+            || !self.path.bytes().all(|b| b.is_ascii_graphic())
+        {
             return Err(Invalid::new(
                 "path",
-                "a path starting with / and without ? or #",
+                "a path starting with /, of printable ASCII without spaces, ? or #",
             ));
         }
         if self.path.len() > 1 {
@@ -237,6 +242,9 @@ mod tests {
             ("*.", "/"),
             ("shop.example.org", "shop"),
             ("shop.example.org", "/a?b"),
+            ("shop.example.org", "/a b"),
+            ("shop.example.org", "/a\tb"),
+            ("shop.example.org", "/caf\u{e9}"),
         ] {
             let mut r = RouteSpec {
                 host: host.into(),

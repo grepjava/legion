@@ -231,8 +231,12 @@ fn shows_every_kind_with_its_use() {
 #[test]
 fn details_and_yaml_of_the_selected_object() {
     let m = cluster();
-    let mut v = View::default();
-    // Wide enough, the details show beside the table.
+    // Wide enough, the details show beside the table (the screen's width
+    // is noted as the loop does).
+    let mut v = View {
+        wide: true,
+        ..View::default()
+    };
     let s = screen_of(&m, &v, 170);
     assert!(s.contains("node n1") && s.contains("allocatable"), "{s}");
     typed(&mut v, &m, "i");
@@ -534,10 +538,14 @@ GET /a",
     let s = screen_sized(&m, &v, 130, 30);
     assert!(s.contains("line 30") && s.contains("following"), "{s}");
 
-    // z puts them over the table; the table's keys still work.
+    // z puts them over the table, whose keys then wait: nothing acts on
+    // rows out of sight.
     typed(&mut v, &m, "z");
     let s = screen_sized(&m, &v, 130, 30);
     assert!(!s.contains("web-2-1"), "{s}");
+    assert_eq!(typed(&mut v, &m, "jD"), None);
+    assert!(v.prompt.is_none());
+    assert_eq!(v.selected, View::default().selected);
     typed(&mut v, &m, "z");
 
     v.logs.as_mut().unwrap().push(false, b"no newline");
@@ -688,6 +696,10 @@ fn changes_are_logged_and_old_ones_ignored() {
     // Replayed from before the listing: nothing changes.
     m.changed(true, task("web-1-1", 2, "n1", "failed", false), at);
     m.changed(false, service(1, 0, 0), at);
+    // Gone before it was ever seen: no news either.
+    let mut gone = service(25, 0, 0);
+    gone.metadata.name = "never-seen".into();
+    m.changed(false, gone, at);
     let log: Vec<&str> = m.log.iter().rev().map(|(_, s)| s.as_str()).collect();
     assert_eq!(
         log,
@@ -922,4 +934,49 @@ fn the_selection_follows_rows_that_went() {
     );
     typed(&mut v, &m, "↓");
     assert_eq!(v.selected[2], 0);
+}
+
+#[test]
+fn details_toggle_from_what_shows() {
+    let m = cluster();
+    // Narrow: hidden at first, so i shows them.
+    let mut v = View::default();
+    typed(&mut v, &m, "i");
+    assert_eq!(v.detail, Some(true));
+    let mut v = View {
+        wide: true,
+        ..View::default()
+    };
+    typed(&mut v, &m, "i");
+    assert_eq!(v.detail, Some(false));
+}
+
+#[test]
+fn init_containers_have_logs_but_no_shell() {
+    let mut m = cluster();
+    let mut t = task("web-1-1", 30, "n1", "running", true);
+    t.spec["pod"]["initContainers"] = serde_json::json!([{ "name": "seed", "image": "seed:1" }]);
+    m.changed(true, t, 0);
+    let mut v = View::default();
+    assert_eq!(typed(&mut v, &m, "3l"), None);
+    assert_eq!(
+        line(&screen(&m, &v), "which container"),
+        "Logs of which container? 1 web 2 seed Esc cancels"
+    );
+    assert_eq!(
+        typed(&mut v, &m, "2"),
+        Some(Request::Logs {
+            namespace: "shop".into(),
+            name: "web-1-1".into(),
+            container: Some("seed".into())
+        })
+    );
+    assert_eq!(
+        typed(&mut v, &m, "x"),
+        Some(Request::Exec {
+            namespace: "shop".into(),
+            task: "web-1-1".into(),
+            container: None
+        })
+    );
 }

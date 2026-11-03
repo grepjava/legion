@@ -14,7 +14,7 @@ mod shell;
 mod tests;
 mod view;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
@@ -101,6 +101,9 @@ pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<
         {
             s.set_size(rows, cols);
             let _ = input.try_send(crate::session::resize(cols, rows));
+        }
+        if let Ok(size) = terminal.size() {
+            view.wide = draw::wide(size.width);
         }
         if let Err(e) = terminal.draw(|f| draw::render(f, &model, &view)) {
             break Err(e.into());
@@ -498,7 +501,8 @@ async fn follow_once(
     namespace: &Option<String>,
     tx: &mpsc::UnboundedSender<Msg>,
 ) -> Result<(), String> {
-    let (listed, hidden, from) = list(objects, namespace).await?;
+    let (listed, hidden, versions) = list(objects, namespace).await?;
+    let from = versions.values().copied().min().unwrap_or_default();
     if tx.send(Msg::Listed(listed, hidden)).is_err() {
         return Ok(());
     }
@@ -519,6 +523,14 @@ async fn follow_once(
         let put = ev.r#type() == watch_event::Type::Put;
         let Some(o) = ev.object else { continue };
         let o = Object::try_from(o).map_err(|e| e.to_string())?;
+        // The watch starts at the oldest listing: what a newer one of its
+        // kind already holds (or held and lost) is no news.
+        if versions
+            .get(&o.kind)
+            .is_some_and(|&v| o.metadata.version <= v)
+        {
+            continue;
+        }
         if tx.send(Msg::Changed(put, o)).is_err() {
             return Ok(());
         }
@@ -526,14 +538,14 @@ async fn follow_once(
 }
 
 /// Every object the caller may list, the kinds they may not, and the
-/// version to watch from: the oldest listing's.
+/// version each kind was listed at.
 async fn list(
     objects: &mut ObjectsClient<Channel>,
     namespace: &Option<String>,
-) -> Result<(Vec<Object>, BTreeSet<Kind>, u64), String> {
+) -> Result<(Vec<Object>, BTreeSet<Kind>, BTreeMap<Kind, u64>), String> {
     let mut listed = Vec::new();
     let mut hidden = BTreeSet::new();
-    let mut from = None::<u64>;
+    let mut versions = BTreeMap::new();
     for kind in Kind::ALL {
         let namespace = if kind.is_cluster_scoped() {
             String::new()
@@ -548,7 +560,7 @@ async fn list(
         match objects.list(req).await {
             Ok(r) => {
                 let r = r.into_inner();
-                from = Some(from.map_or(r.version, |v| v.min(r.version)));
+                versions.insert(kind, r.version);
                 for o in r.objects {
                     listed.push(Object::try_from(o).map_err(|e| e.to_string())?);
                 }
@@ -559,10 +571,10 @@ async fn list(
             Err(s) => return Err(s.message().to_owned()),
         }
     }
-    let Some(from) = from else {
+    if versions.is_empty() {
         return Err("your role bindings let you read nothing".into());
-    };
-    Ok((listed, hidden, from))
+    }
+    Ok((listed, hidden, versions))
 }
 
 /// `--once`: every tab as text, as `top -b` would.

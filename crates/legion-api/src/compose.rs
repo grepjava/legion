@@ -67,20 +67,31 @@ pub fn convert(yaml: &str, stack: &str, namespace: &str, inputs: &Inputs) -> Res
         }
     }
 
-    let mut objects = Vec::new();
+    let mut objects: Vec<Object> = Vec::new();
+    // Two entries whose names normalize alike would be one object.
+    let mut made = |section: &str, name: &str, o: Object| {
+        if objects.iter().any(|m| m.key() == o.key()) {
+            return Err(format!(
+                "{section}.{name}: another entry is also named {}",
+                o.metadata.name
+            ));
+        }
+        objects.push(o);
+        Ok::<_, String>(())
+    };
     for (name, v) in entries(top.get("volumes")) {
         if let Some(o) = c.volume(name, v)? {
-            objects.push(o);
+            made("volumes", name, o)?;
         }
     }
     for (name, v) in entries(top.get("secrets")) {
         if let Some(o) = c.data(Kind::Secret, name, v)? {
-            objects.push(o);
+            made("secrets", name, o)?;
         }
     }
     for (name, v) in entries(top.get("configs")) {
         if let Some(o) = c.data(Kind::Config, name, v)? {
-            objects.push(o);
+            made("configs", name, o)?;
         }
     }
     let networks = entries(top.get("networks")).count();
@@ -137,6 +148,18 @@ struct Converter<'a> {
 impl Converter<'_> {
     fn warn(&mut self, w: String) {
         self.warnings.push(w);
+    }
+
+    /// A name for a pod's next tmpfs volume, `tmpfs-<n>`, that neither the
+    /// pod's other volumes nor a top-level volume has.
+    fn tmpfs_name(&self, volumes: &[Value]) -> String {
+        (volumes.len()..)
+            .map(|i| format!("tmpfs-{i}"))
+            .find(|n| {
+                !volumes.iter().any(|v| v["name"] == json!(n))
+                    && !self.volumes.values().any(|v| v == n)
+            })
+            .expect("a free name")
     }
 
     fn object(&self, kind: Kind, name: &str, spec: Value) -> Object {
@@ -417,7 +440,7 @@ impl Converter<'_> {
                 "tmpfs" => {
                     for target in strings(val) {
                         let target = target.split(':').next().unwrap_or_default().to_owned();
-                        let vname = format!("tmpfs-{}", volumes.len());
+                        let vname = self.tmpfs_name(&volumes);
                         volumes.push(json!({ "name": vname, "tmpfs": {} }));
                         mounts.push(json!({ "name": vname, "path": target }));
                     }
@@ -653,7 +676,7 @@ impl Converter<'_> {
                 mounts.push(json!({ "name": name, "path": target, "readOnly": read_only }));
             }
             "tmpfs" => {
-                let vname = format!("tmpfs-{}", volumes.len());
+                let vname = self.tmpfs_name(volumes);
                 let tmpfs = match size {
                     Some(size) => json!({ "size": docker_bytes(&size, at)? }),
                     None => json!({}),
@@ -925,7 +948,11 @@ fn docker_bytes(v: &Value, at: &str) -> Result<String, String> {
     let n: f64 = s[..digits]
         .parse()
         .map_err(|_| format!("{at}: {s:?}: expected a size such as 512M"))?;
-    let unit: u64 = match s[digits..].trim_end_matches('b') {
+    // `512m`, `512mb` and `512mib` alike, as Docker reads them.
+    let suffix = s[digits..].trim_start();
+    let suffix = suffix.strip_suffix('b').unwrap_or(suffix);
+    let suffix = suffix.strip_suffix('i').unwrap_or(suffix);
+    let unit: u64 = match suffix {
         "" => 1,
         "k" => 1 << 10,
         "m" => 1 << 20,

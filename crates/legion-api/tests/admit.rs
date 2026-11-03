@@ -222,6 +222,40 @@ fn errors_name_the_field() {
 ",
             "spec.replicas: 9: where an autoscaled service starts, between min 2 and max 5",
         ),
+        (
+            "  autoscale: { min: 1, max: 5, cpu: 50 }
+  pod:
+    containers: [{ name: web, image: web:1, resources: { requests: { cpu: 0 } } }]
+",
+            "spec.autoscale.cpu: container \"web\" requests no cpu above zero",
+        ),
+        (
+            "  pod:
+    containers: [{ name: dns, image: dns:1, ports: [{ name: dns, containerPort: 53, protocol: udp }] }]
+  endpoint: { ports: [{ port: 53, targetPort: dns }] }
+",
+            "spec.endpoint.ports[0].targetPort: no container port named `dns` for tcp in the pod",
+        ),
+        (
+            "  pod:
+    initContainers: [{ name: seed, image: web:1, ports: [{ name: http, containerPort: 80 }] }]
+    containers: [{ name: web, image: web:1, probes: { readiness: { tcp: { port: http } } } }]
+",
+            "spec.pod.containers[0].probes.readiness.tcp.port: no container port named `http`",
+        ),
+        (
+            "  pod:
+    containers: [{ name: web, image: web:1, resources: { limits: { memory: 0 } } }]
+",
+            "spec.pod.containers[0].resources.limits.memory: must be above zero",
+        ),
+        (
+            "  pod:
+    containers: [{ name: web, image: web:1 }]
+    volumes: [{ name: scratch, tmpfs: { size: 0 } }]
+",
+            "spec.pod.volumes[0].tmpfs.size: must be above zero",
+        ),
     ];
     for (spec, want) in cases {
         let got = rejected(&service(spec));
@@ -436,4 +470,16 @@ fn cron_jobs() {
         ),
     ));
     assert!(e.contains("at most 52 characters"), "{e}");
+}
+
+#[test]
+fn ports_from_signed_integers() {
+    use serde::Deserialize;
+    use serde::de::value::{Error as DeError, I64Deserializer};
+    // Formats that hand out positive integers as i64 still give ports.
+    let port = |n| PortRef::deserialize(I64Deserializer::<DeError>::new(n));
+    assert_eq!(port(8080).unwrap(), PortRef::Number(8080));
+    assert!(port(0).is_err());
+    assert!(port(-1).is_err());
+    assert!(port(65536).is_err());
 }

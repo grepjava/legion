@@ -41,8 +41,10 @@ const MONTHS: [&str; 12] = [
 ];
 const WEEKDAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 
-/// How far ahead [`Schedule::next_after`] looks: past any leap-day cycle.
-const HORIZON_DAYS: i64 = 366 * 8;
+/// How far ahead [`Schedule::next_after`] looks: 400 Gregorian years, after
+/// which the calendar repeats, so a schedule due at all is found from any
+/// time.
+const HORIZON_DAYS: i64 = 146_097;
 
 impl FromStr for Schedule {
     type Err = Error;
@@ -131,7 +133,10 @@ fn field(s: &str, what: &str, lo: u32, hi: u32, names: &[&str]) -> Result<u64, E
         let mut v = from;
         while v <= to {
             bits |= 1 << v;
-            v += step.unwrap_or(1);
+            match v.checked_add(step.unwrap_or(1)) {
+                Some(next) => v = next,
+                None => break,
+            }
         }
     }
     Ok(bits)
@@ -209,6 +214,20 @@ mod tests {
     fn next(schedule: &str, after: &str) -> String {
         let s: Schedule = schedule.parse().unwrap();
         clock::format(s.next_after(at(after)).unwrap())
+    }
+
+    #[test]
+    fn huge_steps_and_rare_leap_days() {
+        // A step past u32::MAX - from neither overflows nor wraps to 0.
+        let s: Schedule = "5/4294967295 * * * *".parse().unwrap();
+        assert_eq!(s.minutes, 1 << 5);
+        let s: Schedule = "0 0 1/4294967295 * *".parse().unwrap();
+        assert_eq!(s.days, 1 << 1);
+        // February 29th on a weekend: 2032, then not until 2048.
+        assert_eq!(
+            next("0 0 29 2 */6", "2032-03-01T00:00:00Z"),
+            "2048-02-29T00:00:00Z"
+        );
     }
 
     #[test]

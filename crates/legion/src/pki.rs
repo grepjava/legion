@@ -412,23 +412,28 @@ pub async fn renew_manager(
     credentials: Arc<Credentials>,
 ) {
     loop {
-        let wait = if legion_pki::needs_renewal(&credentials.cert_and_key().0, SystemTime::now()) {
+        let now = SystemTime::now();
+        let node_due = legion_pki::needs_renewal(&credentials.cert_and_key().0, now);
+        let wait = if node_due || admin_due(&data_dir, now) {
             let renewed = pki
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .ensure(&node, &data_dir)
                 .and_then(|tls| {
+                    if !node_due {
+                        return Ok(());
+                    }
                     credentials
                         .renew(&tls.cert_pem, &tls.key_pem)
                         .map_err(|e| anyhow::anyhow!(e))
                 });
             match renewed {
                 Ok(()) => {
-                    tracing::info!("renewed this manager's certificate");
+                    tracing::info!("renewed this manager's credentials");
                     RENEWAL_CHECK
                 }
                 Err(e) => {
-                    tracing::warn!("renewing this manager's certificate: {e:#}");
+                    tracing::warn!("renewing this manager's credentials: {e:#}");
                     RENEWAL_RETRY
                 }
             }
@@ -437,6 +442,17 @@ pub async fn renew_manager(
         };
         tokio::time::sleep(wait).await;
     }
+}
+
+/// The admin bundle is missing or needs renewing. It may have been issued
+/// at another time than the node's certificate (written again after it was
+/// removed, say), so it is checked on its own.
+fn admin_due(data_dir: &Path, now: SystemTime) -> bool {
+    !read(&data_dir.join(ADMIN_BUNDLE))
+        .ok()
+        .flatten()
+        .and_then(|pem| Bundle::parse(&pem).ok())
+        .is_some_and(|b| !legion_pki::needs_renewal(&b.cert_pem, now))
 }
 
 /// Keeps a worker's certificate current: past two thirds of its life, it
@@ -662,6 +678,19 @@ mod tests {
         let healed = pki.ensure("n2", dir.path()).unwrap();
         assert_ne!(healed.cert_pem, renamed.cert_pem);
         assert!(Credentials::new(&healed.ca_pem, &healed.cert_pem, &healed.key_pem).is_ok());
+    }
+
+    #[test]
+    fn admin_bundle_renewed_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        assert!(admin_due(dir.path(), now), "missing");
+        Pki::new(dir.path()).ensure("n1", dir.path()).unwrap();
+        assert!(!admin_due(dir.path(), now));
+        assert!(
+            admin_due(dir.path(), now + CERT_LIFETIME),
+            "past its renewal"
+        );
     }
 
     #[test]

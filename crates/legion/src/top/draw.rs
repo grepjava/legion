@@ -114,9 +114,14 @@ fn title(s: impl Into<String>) -> Line<'static> {
     ))
 }
 
+/// Whether the terminal has room for the detail panel unless asked.
+pub(super) fn wide(width: u16) -> bool {
+    width >= 150
+}
+
 /// Whether the detail panel shows: as asked, else when there is room.
 fn shows_detail(view: &View, width: u16) -> bool {
-    view.tab != Tab::Log && view.detail.unwrap_or(width >= 150)
+    view.tab != Tab::Log && view.detail.unwrap_or(wide(width))
 }
 
 /// Draws the whole screen.

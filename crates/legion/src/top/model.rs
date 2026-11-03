@@ -87,7 +87,8 @@ impl Model {
         let what = if put {
             describe(before, &o)
         } else {
-            (o.kind != Kind::Task).then(|| format!("{} deleted", name(&o)))
+            // Gone before it was seen: no news.
+            (o.kind != Kind::Task && before.is_some()).then(|| format!("{} deleted", name(&o)))
         };
         if let Some(what) = what {
             self.log.push_front((at, what));
@@ -227,20 +228,25 @@ pub(super) fn owner(t: &Object) -> Option<(Kind, &str)> {
 }
 
 /// The containers of an object's pod, by name: a task's, service's or
-/// Job's.
-pub(super) fn containers(o: &Object) -> Vec<String> {
+/// Job's; then, with `init`, its init containers.
+pub(super) fn containers(o: &Object, init: bool) -> Vec<String> {
     let pod = match o.kind {
         Kind::CronJob => &o.spec["job"]["pod"],
         _ => &o.spec["pod"],
     };
-    pod["containers"]
-        .as_array()
-        .map(|cs| {
-            cs.iter()
-                .filter_map(|c| c["name"].as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default()
+    let names = |key: &str| {
+        pod[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c["name"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    let mut all = names("containers");
+    if init {
+        all.extend(names("initContainers"));
+    }
+    all
 }
 
 /// What changed in `o`, worth a line in the log.

@@ -242,6 +242,16 @@ fn errors_name_the_place() {
             "Service/shop/a:",
         ),
         ("volumes: {}", "services: the compose file has none"),
+        (
+            "services: { a: { image: a } }
+volumes: { app_data: {}, app-data: {} }",
+            "another entry is also named app-data",
+        ),
+        (
+            "services: { a: { image: a } }
+secrets: { db_pw: { content: x }, db-pw: { content: y } }",
+            "another entry is also named db-pw",
+        ),
     ] {
         let err = convert_with(yaml, &[]).unwrap_err();
         assert!(err.contains(error), "{yaml}: {err}");
@@ -259,6 +269,36 @@ fn helpers() {
         (1u64 << 30).to_string()
     );
     assert_eq!(docker_bytes(&json!("100kb"), "").unwrap(), "102400");
+    assert_eq!(docker_bytes(&json!("100KiB"), "").unwrap(), "102400");
+    assert_eq!(
+        docker_bytes(&json!("2 mib"), "").unwrap(),
+        (2u64 << 20).to_string()
+    );
     assert_eq!(docker_bytes(&json!(2048), "").unwrap(), "2048");
     assert!(docker_bytes(&json!("1x"), "").is_err());
+}
+
+#[test]
+fn tmpfs_names_miss_named_volumes() {
+    let stack = convert_with(
+        "services:
+  a:
+    image: a
+    tmpfs: /run
+    volumes: [\"tmpfs-0:/data\"]
+volumes:
+  tmpfs-0: {}
+",
+        &[],
+    )
+    .unwrap();
+    let a = spec(&stack, "a");
+    let mounts: Vec<_> = a.pod.containers[0]
+        .volume_mounts
+        .iter()
+        .map(|m| (m.name.as_str(), m.path.as_str()))
+        .collect();
+    assert_eq!(mounts, [("tmpfs-1", "/run"), ("tmpfs-0", "/data")]);
+    let data = a.pod.volumes.iter().find(|v| v.name == "tmpfs-0").unwrap();
+    assert!(data.volume.is_some(), "{:?}", a.pod.volumes);
 }

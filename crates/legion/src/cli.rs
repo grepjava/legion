@@ -317,6 +317,20 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             if path.exists() {
                 bail!("{} exists; choose another with -o", path.display());
             }
+            // The binding first: a role it refuses leaves no credentials
+            // behind to block trying again.
+            match (role, namespace) {
+                (Some(role), Some(namespace)) => {
+                    if legion_api::rbac::NamespaceRole::parse(&role).is_none() {
+                        bail!("--role {role:?}: one of view, edit and admin");
+                    }
+                    let spec = serde_json::json!({ "user": name, "role": role });
+                    let binding = Object::new(Kind::RoleBinding, &namespace, &name, spec);
+                    apply(&mut objects, &binding).await?;
+                }
+                (None, None) => {}
+                _ => bail!("--role and --namespace go together"),
+            }
             let (key_pem, csr_pem) = legion_pki::request()?;
             let issued = cluster
                 .issue_user(pb::IssueUserRequest {
@@ -332,15 +346,15 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 ca_pem: issued.ca_pem,
             };
             crate::pki::write_private(&path, &bundle.to_pem())?;
+            // As issued, to the nearest day: 0 asks for the default.
+            let days = legion_pki::validity(&bundle.cert_pem)
+                .map_or(u64::from(days), |(_, life)| {
+                    (life.as_secs() + 43_200) / 86_400
+                });
             println!(
                 "wrote {}: user {name}'s credentials for {days} days; hand it to them for --identity",
                 path.display()
             );
-            if let (Some(role), Some(namespace)) = (role, namespace) {
-                let spec = serde_json::json!({ "user": name, "role": role });
-                let binding = Object::new(Kind::RoleBinding, &namespace, &name, spec);
-                apply(&mut objects, &binding).await?;
-            }
         }
         Command::Apply { files } => {
             for file in files {

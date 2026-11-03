@@ -84,14 +84,14 @@ impl Autoscale {
             for c in &pod.containers {
                 let requests = &c.resources.requests;
                 let set = match name {
-                    "cpu" => requests.cpu.is_some(),
-                    _ => requests.memory.is_some(),
+                    "cpu" => requests.cpu.is_some_and(|c| c.0 > 0),
+                    _ => requests.memory.is_some_and(|m| m.0 > 0),
                 };
                 if !set {
                     return Err(Invalid::new(
                         field(path, name),
                         format!(
-                            "container {:?} requests no {name}; the target is a share of the request",
+                            "container {:?} requests no {name} above zero; the target is a share of the request",
                             c.name
                         ),
                     ));
@@ -328,7 +328,7 @@ impl PodSpec {
             }
         }
 
-        // Probes may name any port in the pod.
+        // Probes may name any app container's tcp port in the pod.
         for (i, c) in self.containers.iter().enumerate() {
             let p = field(&index(path, "containers", i), "probes");
             for (name, probe) in c.probes.iter() {
@@ -385,14 +385,25 @@ impl PodSpec {
             .filter_map(|v| Some((v.name.as_str(), v.claim.as_ref()?)))
     }
 
-    /// Resolves a port reference against the pod's container ports.
+    /// Resolves a port reference against the pod's container ports. A
+    /// number needs no declared port, as in Swarm; a name is one of the
+    /// app containers', as init containers have ended before any traffic.
     pub fn resolve_port(&self, port: &PortRef) -> Option<u16> {
+        self.resolve_port_as(port, None)
+    }
+
+    /// [`Self::resolve_port`], a name only of a port of `protocol` if given.
+    pub fn resolve_port_as(&self, port: &PortRef, protocol: Option<Protocol>) -> Option<u16> {
         match port {
             PortRef::Number(n) => Some(*n),
             PortRef::Name(name) => self
-                .containers()
+                .containers
+                .iter()
                 .flat_map(|c| &c.ports)
-                .find(|p| p.name.as_deref() == Some(name.as_str()))
+                .find(|p| {
+                    p.name.as_deref() == Some(name.as_str())
+                        && protocol.is_none_or(|want| p.protocol == want)
+                })
                 .map(|p| p.container_port),
         }
     }
@@ -646,7 +657,10 @@ impl<'de> Deserialize<'de> for PortRef {
                     .ok_or_else(|| E::custom(format!("port {n} is not in 1-65535")))
             }
             fn visit_i64<E: de::Error>(self, n: i64) -> Result<PortRef, E> {
-                Err(E::custom(format!("port {n} is not in 1-65535")))
+                match u64::try_from(n) {
+                    Ok(n) => self.visit_u64(n),
+                    Err(_) => Err(E::custom(format!("port {n} is not in 1-65535"))),
+                }
             }
             fn visit_str<E: de::Error>(self, s: &str) -> Result<PortRef, E> {
                 match s.parse() {
@@ -700,6 +714,17 @@ impl Resources {
                 field(path, "requests.memory"),
                 format!("request {r} is above the limit {l}"),
             ));
+        }
+        for (name, zero) in [
+            ("cpu", self.limits.cpu == Some(Cpu(0))),
+            ("memory", self.limits.memory == Some(Bytes(0))),
+        ] {
+            if zero {
+                return Err(Invalid::new(
+                    field(path, &format!("limits.{name}")),
+                    "must be above zero",
+                ));
+            }
         }
         for (name, v) in [
             ("maxproc", self.limits.maxproc),
@@ -889,10 +914,10 @@ impl Probe {
             self.grpc.as_ref().map(|g| ("grpc.port", &g.port)),
         ];
         for (name, port) in port.into_iter().flatten() {
-            if pod.resolve_port(port).is_none() {
+            if pod.resolve_port_as(port, Some(Protocol::Tcp)).is_none() {
                 return Err(Invalid::new(
                     field(path, name),
-                    format!("no container port named `{port}` in the pod"),
+                    format!("no container port named `{port}` for tcp in the pod"),
                 ));
             }
         }
@@ -981,6 +1006,10 @@ impl PodVolume {
         check_name(&field(path, "name"), &self.name)?;
         match (&self.volume, &self.tmpfs, &self.claim) {
             (Some(v), None, None) => check_name(&field(path, "volume.name"), &v.name),
+            (None, Some(t), None) if t.size == Some(Bytes(0)) => Err(Invalid::new(
+                field(path, "tmpfs.size"),
+                "must be above zero",
+            )),
             (None, Some(_), None) => Ok(()),
             (None, None, Some(c)) if c.size == Some(Bytes(0)) => Err(Invalid::new(
                 field(path, "claim.size"),
@@ -1238,10 +1267,13 @@ impl Endpoint {
                 .target_port
                 .get_or_insert(PortRef::Number(port.port))
                 .clone();
-            if pod.resolve_port(&target).is_none() {
+            if pod.resolve_port_as(&target, Some(port.protocol)).is_none() {
                 return Err(Invalid::new(
                     field(&p, "targetPort"),
-                    format!("no container port named `{target}` in the pod"),
+                    format!(
+                        "no container port named `{target}` for {} in the pod",
+                        port.protocol
+                    ),
                 ));
             }
             match (port.publish, port.published_port) {

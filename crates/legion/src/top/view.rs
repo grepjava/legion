@@ -243,6 +243,8 @@ pub struct View {
     pub(super) notice: Option<String>,
     /// The detail panel: shown or not, or as the width allows.
     pub(super) detail: Option<bool>,
+    /// The terminal is wide enough for the detail panel by default.
+    pub(super) wide: bool,
     /// An object's YAML over everything, scrolled this far.
     pub(super) yaml: Option<(Key, u16)>,
     pub(super) help: bool,
@@ -266,6 +268,7 @@ impl Default for View {
             prompt: None,
             notice: None,
             detail: None,
+            wide: false,
             yaml: None,
             help: false,
             logs: None,
@@ -409,6 +412,15 @@ impl View {
         if modified {
             return None;
         }
+        // A zoomed pane hides the table: nothing acts on rows unseen.
+        if self.zoom && (self.logs.is_some() || self.shell.is_some()) {
+            match k.code {
+                KeyCode::Char('q') => self.quit = true,
+                KeyCode::Char('?') => self.help = true,
+                _ => {}
+            }
+            return None;
+        }
         let rows = rows(model, self);
         let count = rows.len();
         let i = self.index();
@@ -446,7 +458,7 @@ impl View {
             KeyCode::End | KeyCode::Char('G') => *sel = last,
             KeyCode::Char('h') => self.history = !self.history,
             KeyCode::Char('?') => self.help = true,
-            KeyCode::Char('i') => self.detail = Some(!self.detail.unwrap_or(true)),
+            KeyCode::Char('i') => self.detail = Some(!self.detail.unwrap_or(self.wide)),
             KeyCode::Char('y') => self.yaml = selected.map(|k| (k, 0)),
             KeyCode::Char('/') => {
                 let before = self.filter[i].clone();
@@ -605,9 +617,10 @@ impl View {
         });
     }
 
-    /// Logs or a shell in the one container, or asks which.
+    /// Logs or a shell in the one container, or asks which. Init
+    /// containers have logs too, but have ended before a shell could start.
     fn container(&mut self, o: &Object, pick: Pick, ask: &str) -> Option<Request> {
-        let options = containers(o);
+        let options = containers(o, matches!(pick, Pick::Logs { .. }));
         if options.len() > 1 {
             self.prompt = Some(Prompt::Choose {
                 ask: ask.into(),
