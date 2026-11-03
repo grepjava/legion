@@ -254,6 +254,9 @@ fn start(
             }
             active += 1;
         }
+        // One still stopping runs until it has: it holds its slot (and
+        // what it mounts) and counts against `parallelism`.
+        active += list.iter().filter(|t| t.stopping()).count();
     }
     let mut budget = match j.spec.mode {
         JobMode::Replicated => (j.spec.parallelism() as usize).saturating_sub(active),
@@ -266,7 +269,7 @@ fn start(
         let list: &[&Task] = by_slot.get(slot).map_or(&[], Vec::as_slice);
         let busy = list
             .iter()
-            .any(|t| t.active() || t.status.state == TaskState::Complete);
+            .any(|t| !t.status.state.is_terminal() || t.status.state == TaskState::Complete);
         if busy {
             continue;
         }

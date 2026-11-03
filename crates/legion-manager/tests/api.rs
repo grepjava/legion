@@ -249,6 +249,23 @@ async fn single_manager_crud_and_watch() {
         .into_inner();
     assert_eq!(same.result(), ApplyResult::Unchanged);
 
+    // Status is the cluster's: what a caller sends with an object is dropped.
+    let mut forged = service("forged", 1);
+    forged.status_json = br#"{"update":{"state":"completed"}}"#.to_vec();
+    api.apply(apply(forged)).await.unwrap();
+    let key = legion_api::ObjectKey::new(legion_api::Kind::Service, "default", "forged");
+    assert!(m.store.get(&key).unwrap().unwrap().status.is_null());
+    api.delete(DeleteRequest {
+        r#ref: Some(ObjectRef {
+            kind: "Service".into(),
+            namespace: "default".into(),
+            name: "forged".into(),
+        }),
+        expected_version: None,
+    })
+    .await
+    .unwrap();
+
     // Invalid specs are rejected with the field at fault.
     let mut bad = service("web", 1);
     bad.spec_json = br#"{"pod":{"containers":[{"name":"web"}]}}"#.to_vec();

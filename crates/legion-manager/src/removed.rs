@@ -53,6 +53,29 @@ pub(crate) fn check(store: &Store, node: &str, issued: SystemTime) -> Result<(),
     Ok(())
 }
 
+/// Waits, if `node` was removed this very second, until a certificate
+/// issued now would postdate that ([`check`] counts whole seconds).
+pub(crate) async fn issue_after(store: &Store, node: &str) -> Result<(), Status> {
+    let (removed, _) = read(store)?;
+    let Some(&at) = removed.get(node) else {
+        return Ok(());
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let after = std::time::Duration::from_secs(at + 1);
+    match after.checked_sub(now) {
+        None => Ok(()),
+        Some(wait) if wait <= std::time::Duration::from_secs(2) => {
+            tokio::time::sleep(wait).await;
+            Ok(())
+        }
+        Some(_) => Err(Status::unavailable(format!(
+            "node {node} was removed at a time still ahead of this manager's clock; retry"
+        ))),
+    }
+}
+
 /// Records that `node` is being removed, now. Run before its Node goes, so
 /// the node cannot come back in between.
 pub(crate) async fn record(api: &ApiService, node: &str) -> Result<(), Status> {

@@ -1132,6 +1132,26 @@ fn tasks_of_a_lost_node_move() {
 }
 
 #[test]
+fn tasks_of_a_removed_node_move() {
+    let mut w = World::new();
+    for n in ["n1", "n2"] {
+        w.node(n, &[]);
+    }
+    w.service("web", &format!("replicas: 2\n{POD}"));
+    w.settle();
+    assert_eq!(w.placed("web"), ["n1", "n2"]);
+
+    // Ready when removed: nothing will hear from it again, so its task
+    // is lost as on a node that is down.
+    w.nodes.retain(|n| n.object.metadata.name != "n2");
+    w.settle();
+    let old = w.tasks.iter().find(|t| t.spec.node == "n2").unwrap();
+    assert_eq!(old.status.state, TaskState::Orphaned);
+    assert_eq!(old.status.message, "node n2 was removed");
+    assert_eq!(w.placed("web"), ["n1", "n1"]);
+}
+
+#[test]
 fn lost_tasks_are_replaced_whatever_the_restart_policy() {
     let mut w = World::new();
     w.node("n1", &[]);
@@ -1896,6 +1916,27 @@ fn a_drained_node_moves_a_job_task_without_a_failure() {
         ["backup-1-1 shutdown n1", "backup-1-2 running n2"]
     );
     assert_eq!(w.job_status("backup").failed, 0);
+}
+
+#[test]
+fn a_stopping_job_task_holds_its_slot() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.job("backup", &job(""));
+    w.settle();
+    w.node("n2", &[]);
+    w.availability("n1", Availability::Drain);
+    // Its agent takes its time to stop it: no second task meanwhile.
+    w.agents = false;
+    w.settle();
+    assert_eq!(w.tasks(), ["backup-1-1 running n1"]);
+    assert_eq!(w.tasks[0].spec.desired_state, DesiredState::Shutdown);
+    w.agents = true;
+    w.settle();
+    assert_eq!(
+        w.tasks(),
+        ["backup-1-1 shutdown n1", "backup-1-2 running n2"]
+    );
 }
 
 #[test]

@@ -266,6 +266,13 @@ impl DispatcherService {
         status: NodeStatus,
     ) -> Result<RegisterResponse, Status> {
         let key = ObjectKey::new(Kind::Node, "", name);
+        // A node that registers is alive.
+        let alive = || {
+            self.seen
+                .lock()
+                .unwrap()
+                .insert(name.to_owned(), Instant::now());
+        };
         for _ in 0..ATTEMPTS {
             let existing = self.get(&key)?;
             if existing.is_none() {
@@ -310,6 +317,7 @@ impl DispatcherService {
                 serde_json::to_value(spec).map_err(internal)?
             };
             if node.status == status && node.spec == spec {
+                alive();
                 return Ok(response);
             }
             node.status = status;
@@ -317,11 +325,7 @@ impl DispatcherService {
             let precondition = Precondition::Version(node.metadata.version);
             match self.write(node, precondition).await? {
                 Outcome::Written(_) => {
-                    // A node that registers is alive.
-                    self.seen
-                        .lock()
-                        .unwrap()
-                        .insert(name.to_owned(), Instant::now());
+                    alive();
                     return Ok(response);
                 }
                 Outcome::Conflict { .. } => continue,
@@ -1061,14 +1065,15 @@ async fn follow_cluster(store: Store, out: Followed, mut closing: watch::Receive
     loop {
         let mut objects: BTreeMap<Kind, BTreeMap<ObjectKey, Object>> = BTreeMap::new();
         let mut since = u64::MAX;
+        let mut listed = BTreeMap::new();
         let mut failed = None;
         for kind in FOLLOWED {
             match store.list(kind, None) {
                 Ok(l) => {
                     // Changes after the oldest listing, so none is missed;
-                    // replaying some a newer listing already holds is
-                    // harmless.
+                    // those a newer listing already holds are skipped below.
                     since = since.min(l.version);
+                    listed.insert(kind, l.version);
                     objects.insert(kind, l.objects.into_iter().map(|o| (o.key(), o)).collect());
                 }
                 Err(e) => failed = Some(e),
@@ -1149,6 +1154,10 @@ async fn follow_cluster(store: Store, out: Followed, mut closing: watch::Receive
             let Some(m) = objects.get_mut(&kind) else {
                 continue;
             };
+            // Older than its kind's listing, it would undo a newer state.
+            if listed.get(&kind).is_some_and(|&v| o.metadata.version <= v) {
+                continue;
+            }
             if put {
                 m.insert(o.key(), o);
             } else {
@@ -1237,16 +1246,16 @@ async fn pause(closing: &mut watch::Receiver<bool>) -> bool {
 
 /// The ready tasks of each service: running, ready, with an address, of
 /// the service as it is now (not an earlier one of the same name), and on
-/// a node not suspect (or down).
+/// a node neither suspect, down nor removed.
 fn endpoints(
     services: &BTreeMap<ObjectKey, Object>,
     tasks: &BTreeMap<ObjectKey, Object>,
     nodes: &BTreeMap<ObjectKey, Object>,
 ) -> Endpoints {
-    let silent: BTreeSet<&str> = nodes
+    let heard: BTreeSet<&str> = nodes
         .values()
         .filter(|n| {
-            matches!(
+            !matches!(
                 serde_json::from_value::<NodeStatus>(n.status.clone()).map(|s| s.state),
                 Ok(NodeState::Suspect | NodeState::Down)
             )
@@ -1284,7 +1293,7 @@ fn endpoints(
         entry.1.push(ip);
         if spec.desired_state == DesiredState::Running
             && status.ready
-            && !silent.contains(spec.node.as_str())
+            && heard.contains(spec.node.as_str())
         {
             entry.0.push(ip);
             if let Some(n) = ordinal {

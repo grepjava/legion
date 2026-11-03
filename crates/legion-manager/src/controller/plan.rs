@@ -320,28 +320,32 @@ fn refused(services: &[Service], tasks: &[Task]) -> Vec<Service> {
         .collect()
 }
 
-/// Tasks on a node that is down are lost: they are marked orphaned and told
-/// to stop, so they leave the endpoints, their slots get new tasks
-/// elsewhere, and a node that comes back removes their pods. Returns the
-/// tasks as they are after these writes, and the orphaned ones' keys.
+/// Tasks on a node that is down, or removed, are lost: they are marked
+/// orphaned and told to stop, so they leave the endpoints, their slots get
+/// new tasks elsewhere, and a node that comes back removes their pods.
+/// Returns the tasks as they are after these writes, and the orphaned ones'
+/// keys.
 fn orphan(tasks: &[Task], nodes: &[Node], plan: &mut Plan) -> (Vec<Task>, BTreeSet<ObjectKey>) {
-    let down: BTreeSet<&str> = nodes
-        .iter()
-        .filter(|n| n.status.state == NodeState::Down)
-        .map(Node::name)
-        .collect();
+    let state: BTreeMap<&str, NodeState> =
+        nodes.iter().map(|n| (n.name(), n.status.state)).collect();
     let mut keys = BTreeSet::new();
     let tasks = tasks
         .iter()
         .map(|t| {
-            if t.status.state.is_terminal() || !down.contains(t.spec.node.as_str()) {
+            if t.status.state.is_terminal() || t.spec.node.is_empty() {
                 return t.clone();
             }
+            let why = match state.get(t.spec.node.as_str()) {
+                Some(NodeState::Down) => "is down",
+                // Its certificate is refused: nothing will hear from it.
+                None => "was removed",
+                Some(_) => return t.clone(),
+            };
             let mut t = t.clone();
             t.spec.desired_state = DesiredState::Shutdown;
             t.status = TaskStatus {
                 state: TaskState::Orphaned,
-                message: format!("node {} is down", t.spec.node),
+                message: format!("node {} {why}", t.spec.node),
                 ..Default::default()
             };
             t.object.spec = serde_json::to_value(&t.spec).expect("serialises");
@@ -1278,8 +1282,8 @@ struct Load {
 impl Load {
     fn add(&mut self, t: &Task) {
         let r = t.spec.pod.requests();
-        self.cpu += r.cpu.0;
-        self.memory += r.memory.0;
+        self.cpu = self.cpu.saturating_add(r.cpu.0);
+        self.memory = self.memory.saturating_add(r.memory.0);
         let (ns, svc) = t.owner();
         *self
             .per_service

@@ -176,6 +176,7 @@ impl Issuer {
         legion_api::validate_name(&req.name)
             .map_err(|e| Status::invalid_argument(format!("node name: {e}")))?;
         let id = Identity::new(&req.name, role);
+        crate::removed::issue_after(&self.store, &req.name).await?;
         let cert_pem = self
             .ca
             .sign(&req.csr_pem, &id, CERT_LIFETIME)

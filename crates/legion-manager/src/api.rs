@@ -188,9 +188,6 @@ impl ApiService {
             check_namespace(&desired.metadata.name)?;
         }
         legion_api::admit(&mut desired).map_err(invalid)?;
-        // What it compares with, and the quotas and policies it checks,
-        // must be the latest, not what this replica has applied so far.
-        self.consistent().await?;
         let key = desired.key();
         let _counting = match crate::quota::counts(desired.kind) {
             true => Some(self.quota_lock.lock().await),
@@ -221,8 +218,13 @@ impl ApiService {
                         ApplyResult::Updated,
                     )
                 }
+                // Status is the cluster's: controllers trust it, so a
+                // caller's own never goes in.
                 None => (
-                    desired.clone(),
+                    Object {
+                        status: serde_json::Value::Null,
+                        ..desired.clone()
+                    },
                     Precondition::MustNotExist,
                     ApplyResult::Created,
                 ),
@@ -333,7 +335,6 @@ impl ApiService {
         let kind = parse_kind(&req.kind)?;
         check_namespace(&req.namespace)?;
         let namespace = (!req.namespace.is_empty()).then_some(req.namespace.as_str());
-        self.consistent().await?;
         let listing = self.store.list(kind, namespace).map_err(internal)?;
         let selector: BTreeMap<_, _> = req.match_labels.into_iter().collect();
         let objects = listing
@@ -363,6 +364,9 @@ impl Objects for ApiService {
         if let Route::Leader(mut c) = self.route(&req)? {
             return c.apply(forwarded_for(req.into_inner(), &caller)?).await;
         }
+        // The rights it checks, what it compares with, and the quotas and
+        // policies, must be the latest, not what this replica has applied.
+        self.consistent().await?;
         if let Some(o) = &req.get_ref().object {
             let kind = parse_kind(&o.kind)?;
             let mut namespace = o.namespace.clone();
@@ -379,9 +383,9 @@ impl Objects for ApiService {
         if let Route::Leader(mut c) = self.route(&req)? {
             return c.get(forwarded_for(req.into_inner(), &caller)?).await;
         }
+        self.consistent().await?;
         caller.check(&self.store, Verb::Read, key.kind, &key.namespace)?;
         let key = parse_ref(Some(req.into_inner()))?;
-        self.consistent().await?;
         match self.store.get(&key).map_err(internal)? {
             Some(o) => Ok(Response::new((&o).into())),
             None => Err(not_found(&key)),
@@ -394,6 +398,7 @@ impl Objects for ApiService {
         if let Route::Leader(mut c) = self.route(&req)? {
             return c.list(forwarded_for(req.into_inner(), &caller)?).await;
         }
+        self.consistent().await?;
         if !req.get_ref().namespace.is_empty() || kind.is_cluster_scoped() {
             let mut namespace = req.get_ref().namespace.clone();
             default_namespace(kind, &mut namespace);
@@ -419,6 +424,7 @@ impl Objects for ApiService {
         if let Route::Leader(mut c) = self.route(&req)? {
             return c.delete(forwarded_for(req.into_inner(), &caller)?).await;
         }
+        self.consistent().await?;
         caller.check(&self.store, Verb::Write, key.kind, &key.namespace)?;
         let req = req.into_inner();
         let key = parse_ref(req.r#ref)?;
@@ -428,17 +434,16 @@ impl Objects for ApiService {
             .map_or(Precondition::None, Precondition::Version);
         // A node removed stays out: its certificate is refused from now.
         // Only once the delete would go through, not for a stale version.
-        if key.kind == Kind::Node {
-            self.consistent().await?;
-            if let Some(node) = self.store.get(&key).map_err(internal)? {
-                if req
-                    .expected_version
-                    .is_some_and(|v| v != node.metadata.version)
-                {
-                    return Err(conflict(&key, Some(&node)));
-                }
-                crate::removed::record(self, &key.name).await?;
+        if key.kind == Kind::Node
+            && let Some(node) = self.store.get(&key).map_err(internal)?
+        {
+            if req
+                .expected_version
+                .is_some_and(|v| v != node.metadata.version)
+            {
+                return Err(conflict(&key, Some(&node)));
             }
+            crate::removed::record(self, &key.name).await?;
         }
         match self
             .write(Command::Delete {
@@ -486,10 +491,9 @@ impl Objects for ApiService {
                     next = watcher.next() => Some(next),
                     _ = closing.wait_for(|c| *c) => None,
                 };
+                // A client too slow to take this ends with the stream.
                 let Some(next) = next else {
-                    let _ = tx
-                        .send(Err(Status::unavailable("manager shutting down")))
-                        .await;
+                    let _ = tx.try_send(Err(Status::unavailable("manager shutting down")));
                     return;
                 };
                 let item = match next {
@@ -512,8 +516,13 @@ impl Objects for ApiService {
                     Err(e) => Err(Status::aborted(e.to_string())),
                 };
                 let last = item.is_err();
-                // The client went away.
-                if tx.send(item).await.is_err() || last {
+                // The client went away, or stopped reading as the manager
+                // shuts down: either way the stream ends.
+                let sent = tokio::select! {
+                    sent = tx.send(item) => sent.is_ok(),
+                    _ = closing.wait_for(|c| *c) => false,
+                };
+                if !sent || last {
                     return;
                 }
             }
@@ -565,6 +574,7 @@ impl Cluster for ApiService {
             ));
             return c.join_token(forwarded(req.into_inner())).await;
         }
+        self.consistent().await?;
         let req = req.into_inner();
         let role = Role::parse(&req.role)
             .filter(|r| matches!(r, Role::Manager | Role::Worker))
@@ -587,6 +597,7 @@ impl Cluster for ApiService {
             ));
             return c.autolock(forwarded(req.into_inner())).await;
         }
+        self.consistent().await?;
         let key = crate::autolock::apply(self, &req.into_inner().action).await?;
         Ok(Response::new(pb::AutolockResponse {
             key: key
@@ -611,6 +622,7 @@ impl Cluster for ApiService {
             ));
             return c.usage(forwarded_for(req.into_inner(), &caller)?).await;
         }
+        self.consistent().await?;
         if !namespace.is_empty() {
             caller.check(&self.store, Verb::Read, Kind::Task, &namespace)?;
         }

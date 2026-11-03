@@ -190,14 +190,14 @@ async fn transfer(
         .await
         .map_err(|e| e.message().to_owned())?;
     let result = pipe(&mut sender, &mut receiver, from, to).await;
+    // Not waited on: a receiver that stopped reading goes with the session.
     if let Err(e) = &result {
         let _ = receiver
             .to_agent
-            .send(Ok(frame(Frame::Error(SessionError {
+            .try_send(Ok(frame(Frame::Error(SessionError {
                 code: tonic::Code::Aborted as i32,
                 message: e.clone(),
-            }))))
-            .await;
+            }))));
     }
     result
 }
@@ -210,36 +210,33 @@ async fn pipe(
     from: &str,
     to: &str,
 ) -> Result<(), String> {
-    let idle = || format!("no data for {}s", IDLE.as_secs());
+    let idle = |node: &str| format!("node {node}: nothing moved for {}s", IDLE.as_secs());
     loop {
         tokio::select! {
             f = tokio::time::timeout(IDLE, sender.from_agent.next()) => {
-                match f.map_err(|_| idle())? {
+                match f.map_err(|_| idle(from))? {
                     Some(Ok(SessionFrame { frame: Some(Frame::Stdout(data)) })) => {
-                        if receiver.to_agent.send(Ok(frame(Frame::Input(data)))).await.is_err() {
-                            return Err(format!("node {to} went away"));
+                        // A receiver that stops taking data holds this up,
+                        // so it is timed, and its own frames still heard.
+                        let input = receiver.to_agent.send(Ok(frame(Frame::Input(data))));
+                        tokio::select! {
+                            sent = tokio::time::timeout(IDLE, input) => match sent {
+                                Ok(Ok(())) => {}
+                                Ok(Err(_)) => return Err(format!("node {to} went away")),
+                                Err(_) => return Err(idle(to)),
+                            },
+                            f = receiver.from_agent.next() => other(f, to)?,
                         }
                     }
                     Some(Ok(SessionFrame { frame: Some(Frame::ExitCode(0)) })) => {
-                        let _ = receiver.to_agent.send(Ok(frame(Frame::InputClosed(InputClosed {})))).await;
+                        let closed = receiver.to_agent.send(Ok(frame(Frame::InputClosed(InputClosed {}))));
+                        let _ = tokio::time::timeout(IDLE, closed).await;
                         break;
                     }
-                    Some(Ok(SessionFrame { frame: Some(Frame::Error(e)) })) => {
-                        return Err(format!("node {from}: {}", e.message));
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(e)) => return Err(format!("node {from}: {}", e.message())),
-                    None => return Err(format!("node {from} went away")),
+                    f => other(f, from)?,
                 }
             }
-            f = receiver.from_agent.next() => match f {
-                Some(Ok(SessionFrame { frame: Some(Frame::Error(e)) })) => {
-                    return Err(format!("node {to}: {}", e.message));
-                }
-                Some(Ok(_)) => {}
-                Some(Err(e)) => return Err(format!("node {to}: {}", e.message())),
-                None => return Err(format!("node {to} went away")),
-            },
+            f = receiver.from_agent.next() => other(f, to)?,
         }
     }
     finished(receiver, to).await
@@ -255,13 +252,24 @@ async fn finished(a: &mut Attachment, node: &str) -> Result<(), String> {
             Some(Ok(SessionFrame {
                 frame: Some(Frame::ExitCode(0)),
             })) => return Ok(()),
-            Some(Ok(SessionFrame {
-                frame: Some(Frame::Error(e)),
-            })) => return Err(format!("node {node}: {}", e.message)),
-            Some(Ok(_)) => {}
-            Some(Err(e)) => return Err(format!("node {node}: {}", e.message())),
-            None => return Err(format!("node {node} went away")),
+            f => other(f, node)?,
         }
+    }
+}
+
+/// A frame from `node` that carries no data: an error, a failed exit or
+/// the end of its stream stops the transfer.
+fn other(f: Option<Result<SessionFrame, tonic::Status>>, node: &str) -> Result<(), String> {
+    match f {
+        Some(Ok(SessionFrame {
+            frame: Some(Frame::Error(e)),
+        })) => Err(format!("node {node}: {}", e.message)),
+        Some(Ok(SessionFrame {
+            frame: Some(Frame::ExitCode(code)),
+        })) if code != 0 => Err(format!("node {node}: exited with {code}")),
+        Some(Ok(_)) => Ok(()),
+        Some(Err(e)) => Err(format!("node {node}: {}", e.message())),
+        None => Err(format!("node {node} went away")),
     }
 }
 
