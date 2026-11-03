@@ -367,24 +367,29 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         // Nothing is reconciled before the first complete set of
         // assignments: against an empty one, every running pod would look
         // like an orphan.
-        tokio::select! {
-            loaded = assignments.changed() => if loaded.is_err() {
-                tracing::warn!("assignments ended");
-                heartbeats.abort();
-                sessions.abort();
-                for i in &ingress {
-                    i.abort();
+        let loaded = tokio::select! {
+            loaded = assignments.changed() => {
+                if loaded.is_err() {
+                    tracing::warn!("assignments ended");
                 }
-                return;
-            },
-            _ = &mut shutdown => {
-                heartbeats.abort();
-                sessions.abort();
-                for i in &ingress {
-                    i.abort();
-                }
-                return;
+                loaded.is_ok()
             }
+            _ = &mut shutdown => false,
+        };
+        if !loaded {
+            heartbeats.abort();
+            sessions.abort();
+            for i in &ingress {
+                i.abort();
+            }
+            if let Some(dns) = dns {
+                dns.abort();
+            }
+            lb.abort();
+            if let Some(mesh) = mesh {
+                mesh.abort();
+            }
+            return;
         }
         // Addresses held by tasks that may still run, so new pods do not
         // take them.
@@ -785,7 +790,7 @@ async fn load_balancing(
             Err(e) => {
                 tracing::warn!("programming pf for services: {e}; retrying");
                 // Start over: the anchor's state is unknown.
-                balancer = LoadBalancer::default();
+                balancer.forget();
                 true
             }
         };
@@ -850,7 +855,7 @@ async fn policing_loop(
             attached.mark_unchanged();
             continue;
         };
-        let mut pods: BTreeMap<String, policing::LocalPod> = assignments
+        let assigned: BTreeMap<String, policing::LocalPod> = assignments
             .borrow_and_update()
             .iter()
             .filter(|(_, a)| !a.status.state.is_terminal())
@@ -859,8 +864,7 @@ async fn policing_loop(
                 Some((uid.clone(), policing::LocalPod::of(a, ip)))
             })
             .collect();
-        // A worker's address is the current one.
-        pods.extend(attached.borrow_and_update().clone());
+        let pods = policing::local_pods(assigned, &attached.borrow_and_update());
         let guarded: BTreeMap<String, Ipv4Addr> =
             pods.iter().map(|(uid, p)| (uid.clone(), p.ip)).collect();
         let pods: Vec<policing::LocalPod> = pods.into_values().collect();

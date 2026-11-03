@@ -41,6 +41,8 @@ struct State {
     images: BTreeSet<String>,
     /// Pulls of these fail.
     unpullable: BTreeSet<String>,
+    /// Containers, by name, that fail to start.
+    unstartable: BTreeSet<String>,
     /// Images for another platform than this node's.
     foreign: BTreeSet<String>,
     /// Images pulled only with this account (username, password), and who
@@ -190,6 +192,11 @@ impl FakeRuntime {
 
     pub fn fail_pulls_of(&self, reference: &str) {
         self.state().unpullable.insert(reference.to_owned());
+    }
+
+    /// Starting the container `name` fails from now on.
+    pub fn fail_starts_of(&self, name: &str) {
+        self.state().unstartable.insert(name.to_owned());
     }
 
     /// Pulls of `reference` find nothing for this node's platform.
@@ -472,6 +479,9 @@ impl Runtime for FakeRuntime {
             .ok_or_else(|| api(404, "no such container"))?;
         if c.running {
             return Ok(());
+        }
+        if s.unstartable.contains(&c.spec.name) {
+            return Err(api(500, "failed to start"));
         }
         let jail = match c.spec.annotations.get(ANNOTATION_PARENT) {
             Some(parent) => {

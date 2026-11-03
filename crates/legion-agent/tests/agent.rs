@@ -464,6 +464,31 @@ restartPolicy: { condition: on-failure, maxAttempts: 2, delay: 0s }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_restart_is_reported_while_the_pod_runs_on() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task(
+            "app-1",
+            r#"
+containers: [{ name: a, image: "app:1" }, { name: b, image: "app:1" }]
+restartPolicy: { condition: any, delay: 0s }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    h.rt.fail_starts_of("shop_app-1_a");
+    h.rt.exit("shop_app-1_a", 1);
+    // b runs on; the manager learns why a does not.
+    eventually("the failed restart reported", || {
+        let st = h.status(&key);
+        assert_eq!(st.state, TaskState::Running, "{st:?}");
+        st.message.contains("restarting container a")
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn without_racct_pods_with_limits_are_refused() {
     let mut h = Harness::new().await;
     h.stop_agent().await;
@@ -1851,6 +1876,27 @@ async fn network_volume_problems() {
     let key = h.task("a-3", &pod("odd")).await;
     let st = h.wait_state(&key, TaskState::Failed).await;
     assert!(st.message.contains("no volume plugin"), "{}", st.message);
+    // Claimed, then found wanting before anything was attached: the
+    // node lets go of it all the same.
+    h.write(
+        Object::new(
+            Kind::Volume,
+            "shop",
+            "bare",
+            serde_json::json!({ "driver": "iscsi" }),
+        ),
+        Precondition::MustNotExist,
+    )
+    .await;
+    let key = h.task("a-4", &pod("bare")).await;
+    let st = h.wait_state(&key, TaskState::Failed).await;
+    assert!(st.message.contains("no iscsi section"), "{}", st.message);
+    let bare = ObjectKey::new(Kind::Volume, "shop", "bare");
+    eventually("bare let go of", || {
+        let v = h.store.get(&bare).unwrap().unwrap();
+        v.status["node"].as_str().unwrap_or_default().is_empty()
+    })
+    .await;
     assert!(h.rt.containers().is_empty());
 }
 

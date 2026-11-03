@@ -952,7 +952,13 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 let message = format!("restarting container {}: {e}", m.name);
                 m.done = Some((-1, message.clone()));
                 tracing::warn!("{message}");
-                self.status.message = message;
+                if pod.members.iter().any(|m| m.running) {
+                    // The task runs on without it: the manager learns why.
+                    self.ready = pod.ready();
+                    self.report(TaskState::Running, message).await;
+                } else {
+                    self.status.message = message;
+                }
             }
         }
     }

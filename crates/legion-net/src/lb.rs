@@ -257,6 +257,14 @@ impl LoadBalancer {
         self.backends = backends;
         Ok(())
     }
+
+    /// Forgets what the anchor holds, after a pass failed, so the next
+    /// sets it all again; the backends stay, so their connections are
+    /// still killed once they go.
+    pub fn forget(&mut self) {
+        self.loaded = None;
+        self.tables.clear();
+    }
 }
 
 /// The hooks the host's main ruleset lacks.
@@ -395,6 +403,8 @@ mod tests {
             let r = lb.apply(&sys, &one, subnet, Exits::default());
             assert!(r.is_err(), "{command} did not fail");
             assert_eq!(sys.states().len(), 1, "after {command} failed");
+            // As the agent does after a failed pass.
+            lb.forget();
         }
         // The next pass still knows .2 went.
         lb.apply(&sys, &one, subnet, Exits::default()).unwrap();

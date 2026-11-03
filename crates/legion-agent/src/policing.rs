@@ -92,6 +92,23 @@ impl Guarding {
     }
 }
 
+/// The pods to guard: those the assignments carry, at the addresses
+/// they reported, and those attached here, at their current ones. An
+/// attached pod's address wins: a task that ended here freed its address
+/// before the assignments say so, and a new pod may hold it by then.
+pub fn local_pods(
+    assigned: BTreeMap<String, LocalPod>,
+    attached: &BTreeMap<String, LocalPod>,
+) -> BTreeMap<String, LocalPod> {
+    let held: BTreeSet<Ipv4Addr> = attached.values().map(|p| p.ip).collect();
+    let mut pods: BTreeMap<String, LocalPod> = assigned
+        .into_iter()
+        .filter(|(uid, p)| attached.contains_key(uid) || !held.contains(&p.ip))
+        .collect();
+    pods.extend(attached.clone());
+    pods
+}
+
 /// Each local pod's guard, and the source tables they name.
 pub fn guards(
     pods: &[LocalPod],
@@ -358,6 +375,37 @@ mod tests {
 
     fn ip(s: &str) -> Ipv4Addr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn an_attached_pod_takes_its_address_from_an_ended_task() {
+        let pod = |uid: &str, ip_: &str| LocalPod {
+            interface: legion_net::host_interface(uid),
+            ip: ip(ip_),
+            namespace: "shop".into(),
+            service: "web".into(),
+        };
+        // a ended and freed .5, which b now holds; c still runs; d's
+        // worker knows better than its assignment.
+        let assigned = BTreeMap::from([
+            ("a".to_owned(), pod("a", "10.200.0.5")),
+            ("c".to_owned(), pod("c", "10.200.0.6")),
+            ("d".to_owned(), pod("d", "10.200.0.9")),
+        ]);
+        let attached = BTreeMap::from([
+            ("b".to_owned(), pod("b", "10.200.0.5")),
+            ("d".to_owned(), pod("d", "10.200.0.7")),
+        ]);
+        let pods = local_pods(assigned, &attached);
+        let ips: Vec<(&str, Ipv4Addr)> = pods.iter().map(|(u, p)| (u.as_str(), p.ip)).collect();
+        assert_eq!(
+            ips,
+            [
+                ("b", ip("10.200.0.5")),
+                ("c", ip("10.200.0.6")),
+                ("d", ip("10.200.0.7")),
+            ]
+        );
     }
 
     fn svc(ns: &str, name: &str, app: &str, vip: &str, alive: &[&str]) -> ServiceEndpoints {

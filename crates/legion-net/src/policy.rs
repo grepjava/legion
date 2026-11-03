@@ -19,10 +19,10 @@
 //! node's resolver; replies to what reached it pass as their connection's
 //! state. What the host sends the pod (probes, VIP traffic the hairpin
 //! rule NATed to the gateway, published ports' translated traffic) makes
-//! no state on the host end, as pf does not see it there: for a pod with
-//! egress limited, it is passed out on the bridge keeping a floating
-//! state, which the pod's replies match. Other nodes' traffic already
-//! floats from the mesh.
+//! no state on the host end, as pf does not see it there; neither does
+//! what the host routes in from the mesh. For a pod with egress limited,
+//! both are passed out on the bridge keeping a floating state, which the
+//! pod's replies match.
 //!
 //! What reaches a pod is checked here, on its node, by source: the nodes
 //! (probes, other hosts, published ports reached through another node),
@@ -52,6 +52,10 @@ use crate::mesh::{INTERFACE as MESH, UNDERLAY, UNDERLAY6};
 use crate::{BRIDGE, CLUSTER_POD_CIDR, CLUSTER_POD_CIDR6, SERVICE_CIDR6, v6};
 
 pub const ANCHOR: &str = "legion/policy";
+
+/// The tag of traffic from other nodes' pods to a pod whose egress is
+/// limited, given on the mesh.
+const MESH_TAG: &str = "LMESH";
 
 /// Sources that may reach a pod: a table, on some ports (all if empty).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,18 +202,34 @@ fn guard_rules(r: &mut String, g: &Guard, f: &Family) {
                 }
             }
             let _ = writeln!(r, "block drop in quick on {lp} {af} all");
-            // Replies to what the host sends it, which passes the host end
-            // unseen: a floating state where pf does see it.
+            // Replies to what the host sends it or routes to it, which
+            // passes the host end unseen: a floating state where pf does
+            // see it, made going out, so the replies coming in match it.
+            // (A state made in on the mesh does not: it matches replies
+            // only as they go out again.) Pods cannot send from the nodes'
+            // addresses; other nodes' pods' traffic is told by the tag the
+            // mesh gave it, as their sources are the same range as this
+            // node's pods', whose bridged frames pf also sees here.
             let _ = writeln!(
                 r,
-                "pass out quick on {BRIDGE} {af} from {gateway} to {ip} keep state"
+                "pass out quick on {BRIDGE} {af} from {} to {ip} keep state",
+                f.nodes
             );
-            let _ = writeln!(
-                r,
-                "pass out quick on {BRIDGE} {af} to {ip} tagged {TAG} keep state"
-            );
+            for tag in [TAG, MESH_TAG] {
+                let _ = writeln!(
+                    r,
+                    "pass out quick on {BRIDGE} {af} to {ip} tagged {tag} keep state"
+                );
+            }
         }
     }
+    // Traffic from other nodes' pods is tagged where it comes in, for the
+    // bridge's rules above.
+    let tag = if g.egress.is_some() {
+        format!(" tag {MESH_TAG}")
+    } else {
+        String::new()
+    };
     // Its state there is bound to its host end; what it starts toward
     // other nodes needs one on the mesh as well, which its replies
     // match before the refusals below.
@@ -217,6 +237,13 @@ fn guard_rules(r: &mut String, g: &Guard, f: &Family) {
     // To the pod.
     if g.open {
         let _ = writeln!(r, "pass out quick on {lp} {af} {state}");
+        if g.egress.is_some() {
+            let _ = writeln!(
+                r,
+                "pass in quick on {MESH} {af} from {} to {ip}{tag} keep state",
+                f.pods
+            );
+        }
         return;
     }
     let _ = writeln!(r, "pass out quick on {lp} {af} tagged {TAG} {state}");
@@ -241,13 +268,13 @@ fn guard_rules(r: &mut String, g: &Guard, f: &Family) {
         if a.ports.is_empty() {
             let _ = writeln!(
                 r,
-                "pass in quick on {MESH} {af} from {from} to {ip} keep state"
+                "pass in quick on {MESH} {af} from {from} to {ip}{tag} keep state"
             );
         }
         for (proto, port) in &a.ports {
             let _ = writeln!(
                 r,
-                "pass in quick on {MESH} {af} proto {} from {from} to {ip} port {port} keep state",
+                "pass in quick on {MESH} {af} proto {} from {from} to {ip} port {port}{tag} keep state",
                 proto.as_str()
             );
         }
@@ -364,7 +391,7 @@ mod tests {
                 },
             ]),
         };
-        let r = rules(&[g], ip("10.200.0.1"), services);
+        let r = rules(std::slice::from_ref(&g), ip("10.200.0.1"), services);
         let from_pod: Vec<&str> = r
             .lines()
             .filter(|l| l.contains("in quick on lp000000000009"))
@@ -387,12 +414,32 @@ mod tests {
         );
         // What the host sends it keeps a state its replies match.
         for rule in [
-            "pass out quick on legion0 inet from 10.200.0.1 to 10.200.0.9 keep state",
+            "pass out quick on legion0 inet from { 10.200.0.1, 100.64.0.0/16 } to 10.200.0.9 keep state",
             "pass out quick on legion0 inet to 10.200.0.9 tagged LSVC keep state",
-            "pass out quick on legion0 inet6 from fd00:10:200::1 to fd00:10:200::9 keep state",
+            "pass out quick on legion0 inet to 10.200.0.9 tagged LMESH keep state",
+            "pass out quick on legion0 inet6 from { fd00:10:200::1, fd00:100:64::/96 } to fd00:10:200::9 keep state",
+            // Other nodes' pods' traffic is tagged for it, open namespace
+            // or not.
+            "pass in quick on wg0 inet from 10.200.0.0/16 to 10.200.0.9 tag LMESH keep state",
         ] {
             assert!(r.contains(rule), "{rule}");
         }
+        let closed = Guard {
+            open: false,
+            allowed: vec![Allow {
+                table: "n0123".into(),
+                ports: vec![(Proto::Tcp, 80)],
+            }],
+            ..g
+        };
+        let r = rules(&[closed], ip("10.200.0.1"), services);
+        for rule in [
+            "pass in quick on wg0 inet proto tcp from <n0123> to 10.200.0.9 port 80 tag LMESH keep state",
+            "block drop in quick on wg0 inet from 10.200.0.0/16 to 10.200.0.9",
+        ] {
+            assert!(r.contains(rule), "{rule}");
+        }
+        assert!(!r.contains("from 10.200.0.0/16 to 10.200.0.9 tag"));
         // Not for a pod whose egress is free: its own rule passes replies.
         assert!(!rules(&guards(), ip("10.200.0.1"), services).contains("on legion0"));
     }

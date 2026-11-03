@@ -46,7 +46,7 @@ use std::time::Duration;
 
 use legion_api::service::{PodVolume, UPDATE_SNAPSHOT};
 use legion_api::task::VolumeSnapshot;
-use legion_api::volume::{IscsiSource, NfsSource, VolumeDriver, VolumeSpec};
+use legion_api::volume::{Access, IscsiSource, NfsSource, VolumeDriver, VolumeSpec};
 use legion_sys::Sys;
 use serde::{Deserialize, Serialize};
 
@@ -190,6 +190,45 @@ async fn volume<C: Control>(
         }
         Err(e) => return Err(failed(e.to_string())),
     };
+    let single = spec.access() == Access::Single;
+    let result = ready(sys, p, a, v, name, dataset, spec, guard).await;
+    if result.is_err() && single {
+        unclaim(control, p, &a.uid, namespace, name).await;
+    }
+    result
+}
+
+/// Lets go of a volume used one node at a time that the task `uid` claimed
+/// but did not record, as the teardown lets go only of what is recorded;
+/// unless another task here has it.
+async fn unclaim<C: Control>(control: &C, p: &Places<'_>, uid: &str, namespace: &str, name: &str) {
+    let _guard = p.lock.lock().await;
+    let held = files::present(p.files_dir)
+        .into_iter()
+        .flat_map(|task| attached(&files::task_dir(p.files_dir, &task)).unwrap_or_default())
+        .any(|entry| entry.volume() == (namespace, name));
+    if held {
+        return;
+    }
+    if let Err(e) = control.release_volume(namespace, name, p.node).await {
+        tracing::warn!(%uid, "letting go of volume {name}: {e}");
+    }
+}
+
+/// Makes a claimed volume ready by its driver.
+#[allow(clippy::too_many_arguments)]
+async fn ready(
+    sys: &Arc<dyn Sys>,
+    p: &Places<'_>,
+    a: &Assignment,
+    v: &PodVolume,
+    name: &str,
+    dataset: Option<String>,
+    spec: VolumeSpec,
+    guard: tokio::sync::MutexGuard<'_, ()>,
+) -> Result<String, Error> {
+    let namespace = a.key.namespace.as_str();
+    let failed = |e: String| Error::Failed(format!("volume {name}: {e}"));
     if v.claim.is_some() && spec.driver != VolumeDriver::Zfs {
         return Err(Error::Rejected(format!(
             "volume {name}: a claim is for a ZFS volume, not {}",
@@ -295,8 +334,12 @@ fn record(files_dir: &Path, uid: &str, entry: Attached) -> Result<(), String> {
     if !all.contains(&entry) {
         all.push(entry);
     }
+    write_attached(&dir, &all)
+}
+
+fn write_attached(dir: &Path, all: &[Attached]) -> Result<(), String> {
     let path = dir.join(ATTACHED);
-    let text = serde_json::to_vec(&all).map_err(|e| e.to_string())?;
+    let text = serde_json::to_vec(all).map_err(|e| e.to_string())?;
     std::fs::write(&path, text).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
@@ -461,60 +504,82 @@ pub(crate) async fn release<C: Control>(
         .filter(|other| other != uid)
         .flat_map(|other| attached(&files::task_dir(p.files_dir, &other)).unwrap_or_default())
         .collect();
-    let in_use = |entry: &Attached| others.iter().any(|o| o.volume() == entry.volume());
     for (i, entry) in mine.iter().enumerate() {
-        let (namespace, volume) = entry.volume();
-        let single = match entry {
-            Attached::Plugin {
-                plugin,
-                dir,
-                namespace,
-                volume,
-                shared,
-                options,
-            } => {
-                let (plugin, dir) = (plugin.clone(), dir.clone());
-                let input = serde_json::json!({
-                    "namespace": namespace,
-                    "volume": volume,
-                    "options": options,
-                })
-                .to_string();
-                crate::task::blocking(sys, move |sys| unmount_plugin(sys, &plugin, &dir, &input))
-                    .await?;
-                !shared
+        if let Err(e) = release_one(control, sys, p, entry, &others, &mine[i + 1..]).await {
+            // What is undone already stays undone, and goes from the
+            // record: another task here would still count it in use.
+            if i > 0 {
+                write_attached(&dir, &mine[i..])?;
             }
-            Attached::Iscsi { target, .. } => {
-                if !in_use(entry) {
-                    let path = path_str(&node_mount(p.volumes_dir, namespace, volume))?;
-                    let on_target = |a: &Attached| matches!(a, Attached::Iscsi { target: t, .. } if t == target);
-                    let last = !others.iter().chain(&mine[i + 1..]).any(on_target);
-                    let target = target.clone();
-                    crate::task::blocking(sys, move |sys| {
-                        let e = |e: legion_sys::Error| e.to_string();
-                        if sys.mounts(&path).map_err(e)?.contains(&path) {
-                            sys.unmount(&path).map_err(e)?;
-                        }
-                        if last {
-                            tracing::info!(%target, "logging out of the iSCSI target");
-                            sys.iscsi_detach(&target).map_err(e)?;
-                        }
-                        Ok::<(), String>(())
-                    })
-                    .await?;
-                }
-                true
-            }
-        };
-        if single && !in_use(entry) {
-            control
-                .release_volume(namespace, volume, p.node)
-                .await
-                .map_err(|e| format!("letting go of volume {volume}: {e}"))?;
+            return Err(e);
         }
     }
     let path = dir.join(ATTACHED);
     std::fs::remove_file(&path).map_err(|e| format!("removing {}: {e}", path.display()))
+}
+
+/// Undoes one thing a task attached; `others` is what the node's other
+/// tasks attached, `rest` what this one attached after it.
+async fn release_one<C: Control>(
+    control: &C,
+    sys: &Arc<dyn Sys>,
+    p: &Places<'_>,
+    entry: &Attached,
+    others: &[Attached],
+    rest: &[Attached],
+) -> Result<(), String> {
+    let in_use = |entry: &Attached| others.iter().any(|o| o.volume() == entry.volume());
+    let (namespace, volume) = entry.volume();
+    let single = match entry {
+        Attached::Plugin {
+            plugin,
+            dir,
+            namespace,
+            volume,
+            shared,
+            options,
+        } => {
+            let (plugin, dir) = (plugin.clone(), dir.clone());
+            let input = serde_json::json!({
+                "namespace": namespace,
+                "volume": volume,
+                "options": options,
+            })
+            .to_string();
+            crate::task::blocking(sys, move |sys| unmount_plugin(sys, &plugin, &dir, &input))
+                .await?;
+            !shared
+        }
+        Attached::Iscsi { target, .. } => {
+            if !in_use(entry) {
+                let path = path_str(&node_mount(p.volumes_dir, namespace, volume))?;
+                let on_target =
+                    |a: &Attached| matches!(a, Attached::Iscsi { target: t, .. } if t == target);
+                let last = !others.iter().chain(rest).any(on_target);
+                let target = target.clone();
+                crate::task::blocking(sys, move |sys| {
+                    let e = |e: legion_sys::Error| e.to_string();
+                    if sys.mounts(&path).map_err(e)?.contains(&path) {
+                        sys.unmount(&path).map_err(e)?;
+                    }
+                    if last {
+                        tracing::info!(%target, "logging out of the iSCSI target");
+                        sys.iscsi_detach(&target).map_err(e)?;
+                    }
+                    Ok::<(), String>(())
+                })
+                .await?;
+            }
+            true
+        }
+    };
+    if single && !in_use(entry) {
+        control
+            .release_volume(namespace, volume, p.node)
+            .await
+            .map_err(|e| format!("letting go of volume {volume}: {e}"))?;
+    }
+    Ok(())
 }
 
 fn unmount_plugin(sys: &dyn Sys, program: &str, dir: &str, input: &str) -> Result<(), String> {
