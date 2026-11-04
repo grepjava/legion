@@ -189,6 +189,9 @@ struct Worker<R, C> {
     ready: bool,
     /// The manager has not taken the status last reported.
     unsent: bool,
+    /// A stop arrived: it is sent once, so one taken while waiting for
+    /// something else still counts.
+    stopping: bool,
     probe_tx: mpsc::UnboundedSender<probe::Report>,
     probe_rx: mpsc::UnboundedReceiver<probe::Report>,
 }
@@ -214,6 +217,7 @@ pub(crate) async fn run<R: Runtime, C: Control>(
         rx,
         ready: false,
         unsent: false,
+        stopping: false,
         probe_tx,
         probe_rx,
     };
@@ -250,6 +254,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             Err(Abort::Stopped) => return self.stop().await,
             Err(_) => return,
             Ok(Some(pod)) => (pod, true),
+            Ok(None) if self.stopping => return self.stop().await,
             Ok(None) => match self.start().await {
                 Ok(pod) => (pod, false),
                 Err(Abort::Stopped) => return self.stop().await,
@@ -319,15 +324,18 @@ impl<R: Runtime, C: Control> Worker<R, C> {
     }
 
     /// Waits before trying again; false if the agent shuts down meanwhile.
-    /// Messages are dropped: what is retried decides the task's end.
+    /// What is retried decides the task's end, but a stop is kept for what
+    /// comes after.
     async fn pause(&mut self, wait: Duration) -> bool {
         let pause = tokio::time::sleep(wait);
         tokio::pin!(pause);
         loop {
             tokio::select! {
                 () = &mut pause => return true,
-                msg = self.rx.recv() => if msg.is_none() {
-                    return false;
+                msg = self.rx.recv() => match msg {
+                    None => return false,
+                    Some(Msg::Stop) => self.stopping = true,
+                    Some(_) => {}
                 },
             }
         }
@@ -368,15 +376,18 @@ impl<R: Runtime, C: Control> Worker<R, C> {
     fn stop_requested(&mut self) -> bool {
         while let Ok(msg) = self.rx.try_recv() {
             if matches!(msg, Msg::Stop) {
-                return true;
+                self.stopping = true;
             }
         }
-        false
+        self.stopping
     }
 
     /// Resolves once a stop arrives, or the agent shuts down; other
     /// messages are dropped, as in [`Self::stop_requested`].
     async fn stopped(&mut self) -> Abort {
+        if self.stopping {
+            return Abort::Stopped;
+        }
         loop {
             match self.rx.recv().await {
                 Some(Msg::Stop) => return Abort::Stopped,
@@ -434,6 +445,12 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 };
                 let mut m = Member::new(&spec.name, &c.id, c.state == "running");
                 m.attempts = restarts;
+                // Its exit was counted, and its restart due, as the agent
+                // before went: it is restarted, not counted again.
+                if !m.running && restart_pending(&self.status.message, &spec.name) {
+                    let delay = self.pod().restart_policy.delay.as_std();
+                    m.restart_at = Some(Instant::now() + delay);
+                }
                 members.push(m);
             }
             if members.len() == self.pod().containers.len() {
@@ -449,16 +466,18 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                     Err(Abort::Failed(why) | Abort::Rejected(why) | Abort::WrongPlatform(why)) => {
                         tracing::warn!("adopting the pod's network: {why}");
                     }
-                    Err(Abort::Stopped) => {}
+                    Err(Abort::Stopped) => self.stopping = true,
                     Err(Abort::Closing) => return Err(Abort::Closing),
                 }
             }
         }
         tracing::info!("removing an incomplete pod left by a previous run");
-        match self.remove_pod().await {
-            true => Ok(None),
-            false => Err(Abort::Closing),
+        if !self.remove_pod().await {
+            return Err(Abort::Closing);
         }
+        // Its jail is gone; its address is taken again if still free.
+        self.status.jid = None;
+        Ok(None)
     }
 
     async fn start(&mut self) -> Result<Pod, Abort> {
@@ -901,7 +920,10 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         if pod.refused.is_none() {
             // Containers found stopped on adoption count as exits now.
             for i in 0..pod.members.len() {
-                if !pod.members[i].running && pod.members[i].done.is_none() {
+                if !pod.members[i].running
+                    && pod.members[i].done.is_none()
+                    && pod.members[i].restart_at.is_none()
+                {
                     let code = self.exit_code(&pod.members[i].id).await;
                     self.exited(&mut pod, i, code).await;
                 }
@@ -922,6 +944,10 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             }
         }
         loop {
+            if self.stopping {
+                self.drain().await;
+                return self.stop().await;
+            }
             if let Some(why) = pod.refused.take() {
                 if !self.remove_pod().await {
                     return;
@@ -1021,7 +1047,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         if wants && allowed {
             m.attempts += 1;
             m.restart_at = Some(Instant::now() + policy.delay.as_std());
-            let message = format!("{what}; restarting in {}", policy.delay);
+            let message = format!("{what}{RESTARTING}{}", policy.delay);
             tracing::info!("{message}");
             self.status.restarts += 1;
             self.ready = pod.ready();
@@ -1129,6 +1155,19 @@ async fn last_output<R: Runtime>(rt: &R, id: &str) -> String {
     }
 }
 
+/// What a status message says of a container whose restart is due.
+const RESTARTING: &str = "; restarting in ";
+
+/// The status reported says the container `name` exited and is to be
+/// restarted: that exit is counted.
+fn restart_pending(message: &str, name: &str) -> bool {
+    let named = message
+        .strip_prefix("container ")
+        .and_then(|m| m.strip_prefix(name))
+        .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with(':'));
+    named && message.contains(RESTARTING)
+}
+
 fn finished(pod: &Pod) -> Option<(TaskState, String, Option<i32>)> {
     let done: Vec<&(i32, String)> = pod
         .members
@@ -1172,9 +1211,6 @@ pub(crate) async fn teardown<R: Runtime, C: Control>(
         .iter()
         .find(|c| c.labels.get(LABEL_ROLE).map(String::as_str) == Some(Role::Infra.as_str()))
         .map(|c| c.id.clone());
-    if let Some(infra) = &infra {
-        ctx.memory.removed(infra);
-    }
     let mut jails = Vec::new();
     for c in found.iter().filter(|c| Some(&c.id) != infra.as_ref()) {
         if c.state == "running"
@@ -1227,6 +1263,11 @@ pub(crate) async fn teardown<R: Runtime, C: Control>(
     }
     if !left.is_empty() {
         return Err(format!("removing containers: {}", left.join("; ")));
+    }
+    // Watched until gone: a container a failed stop left running keeps
+    // its limit.
+    if let Some(infra) = &infra {
+        ctx.memory.removed(infra);
     }
     let result = blocking(&ctx.sys, move |sys| {
         jails.iter().try_for_each(|j| sys.rctl_remove_jail(j))

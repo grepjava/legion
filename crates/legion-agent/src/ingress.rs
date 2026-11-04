@@ -340,7 +340,11 @@ impl Proxy {
             Err((status, why)) => return reply(status, &why),
         };
 
+        // Only HTTP/1.1 upgrades: HTTP/2 has none (nor a 101 to answer).
+        let wants_upgrade = req.version() == hyper::Version::HTTP_11
+            && req.headers().contains_key(hyper::header::UPGRADE);
         let headers = req.headers_mut();
+        hop_by_hop(headers, wants_upgrade);
         // Earlier proxies' addresses, on as many header lines as they came.
         let forwarded: Vec<&str> = headers
             .get_all("x-forwarded-for")
@@ -374,10 +378,7 @@ impl Proxy {
             Err(e) => return reply(StatusCode::BAD_REQUEST, &format!("{pq}: {e}")),
         };
 
-        let upgrade = req
-            .headers()
-            .contains_key(hyper::header::UPGRADE)
-            .then(|| hyper::upgrade::on(&mut req));
+        let upgrade = wants_upgrade.then(|| hyper::upgrade::on(&mut req));
         let mut resp = match self.client.request(req).await {
             Ok(r) => r,
             Err(e) if timed_out(&e) => {
@@ -405,6 +406,8 @@ impl Proxy {
                 let (mut c, mut b) = (TokioIo::new(c), TokioIo::new(b));
                 let _ = tokio::io::copy_bidirectional(&mut c, &mut b).await;
             });
+        } else {
+            hop_by_hop(resp.headers_mut(), false);
         }
         resp.map(BodyExt::boxed)
     }
@@ -416,6 +419,38 @@ fn timed_out(e: &(dyn std::error::Error + 'static)) -> bool {
         e.downcast_ref::<std::io::Error>()
             .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
     })
+}
+
+/// Drops the headers meant for one connection alone (RFC 9110 §7.6.1):
+/// those `Connection` names, and the usual ones. The client's would reach
+/// the backend otherwise, and could have it drop the `X-Forwarded-*` the
+/// proxy adds; the backend's would reach the client. An upgrade keeps what
+/// it needs.
+fn hop_by_hop(headers: &mut hyper::HeaderMap, upgrade: bool) {
+    use hyper::header::{CONNECTION, TE, TRAILER, TRANSFER_ENCODING, UPGRADE};
+    let named: Vec<String> = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|n| n.trim().to_ascii_lowercase())
+        .filter(|n| !n.is_empty() && !(upgrade && n == "upgrade"))
+        .collect();
+    for name in &named {
+        headers.remove(name.as_str());
+    }
+    for name in ["keep-alive", "proxy-connection"] {
+        headers.remove(name);
+    }
+    for name in [TE, TRAILER, TRANSFER_ENCODING] {
+        headers.remove(name);
+    }
+    if !upgrade {
+        headers.remove(CONNECTION);
+        headers.remove(UPGRADE);
+    } else {
+        headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+    }
 }
 
 #[cfg(test)]
@@ -449,13 +484,19 @@ mod tests {
                                     .get(k)
                                     .map_or("-".to_owned(), |v| v.to_str().unwrap().to_owned())
                             };
-                            let body = format!(
+                            let mut body = format!(
                                 "{name} {} host={} xff={} xfh={}",
                                 req.uri(),
                                 h("host"),
                                 h("x-forwarded-for"),
                                 h("x-forwarded-host")
                             );
+                            // Only when there, as they should not be.
+                            for k in ["connection", "keep-alive"] {
+                                if req.headers().contains_key(k) {
+                                    body.push_str(&format!(" {k}={}", h(k)));
+                                }
+                            }
                             Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(body))))
                         });
                     let _ = hyper::server::conn::http1::Builder::new()
@@ -545,6 +586,46 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&body).contains("xff=10.0.0.1, 10.0.0.2, 10.0.0.3, 127.0.0.1 "),
             "{body:?}"
+        );
+    }
+
+    /// What the client means for its connection to the proxy alone does
+    /// not reach the backend: above all no header it names to drop the
+    /// proxy's own.
+    #[tokio::test]
+    async fn connection_headers_stay_with_their_connection() {
+        let web = backend("web").await;
+        let (_routes_tx, routes) =
+            watch::channel(vec![route("www", "shop.example.org", "/", "web")]);
+        let (_endpoints_tx, endpoints) =
+            watch::channel(vec![service("web", web, vec![Ipv4Addr::LOCALHOST])]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, routes, endpoints));
+
+        let stream = TcpStream::connect(proxy).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let req = Request::get("/")
+            .header(HOST, "shop.example.org")
+            .header(
+                "connection",
+                "keep-alive, X-Forwarded-For, x-forwarded-host",
+            )
+            .header("keep-alive", "timeout=5")
+            .header("x-forwarded-for", "10.9.9.9")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        // The client's own forwarded-for was named, so it goes; the
+        // proxy's stay.
+        assert_eq!(
+            body,
+            "web / host=shop.example.org xff=127.0.0.1 xfh=shop.example.org"
         );
     }
 

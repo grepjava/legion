@@ -82,11 +82,12 @@ pub(crate) async fn enforce(sys: Arc<dyn Sys>, limits: Arc<Limits>, every: Durat
                     mib(limit)
                 );
                 tracing::warn!(%jail, pid, "{why}; killing its largest process");
-                match sys.kill(pid) {
-                    Ok(()) => {
-                        lock(&l.kills).insert(jail, why);
-                    }
-                    Err(e) => tracing::warn!(%jail, pid, "killing: {e}"),
+                // Said first: the exit it causes may be seen before the
+                // kill returns.
+                lock(&l.kills).insert(jail.clone(), why);
+                if let Err(e) = sys.kill(pid) {
+                    tracing::warn!(%jail, pid, "killing: {e}");
+                    lock(&l.kills).remove(&jail);
                 }
             }
             Ok::<_, legion_sys::Error>(())

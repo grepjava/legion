@@ -284,6 +284,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             Arc::new(transfer::Volumes {
                 sys: ctx.sys.clone(),
                 zfs_root: ctx.zfs_root.clone(),
+                lock: ctx.volume_lock.clone(),
             }),
             ctx.control.sessions(&ctx.node),
         ));
@@ -863,16 +864,26 @@ async fn policing_loop(
     let mut attached = guarding.attached();
     let mut policy = Policy::default();
     let mut retry = false;
+    // Guards name their pods' services by the endpoints' labels: none are
+    // loaded before the endpoints are known, or a policy selecting a pod's
+    // service would miss it, and leave its egress open. Rules an agent
+    // before this one loaded stay until then.
+    let mut endpoints_known = false;
     loop {
         let wait = Duration::from_secs(if retry { 5 } else { 60 });
         tokio::select! {
-            r = endpoints.changed() => if r.is_err() { return },
+            r = endpoints.changed() => match r {
+                Ok(()) => endpoints_known = true,
+                Err(_) => return,
+            },
             r = policies.changed() => if r.is_err() { return },
             r = assignments.changed() => if r.is_err() { return },
             r = attached.changed() => if r.is_err() { return },
             () = tokio::time::sleep(wait) => {}
         }
-        let Some(current) = policies.borrow_and_update().clone() else {
+        endpoints_known |= endpoints.has_changed().unwrap_or(false);
+        let current = policies.borrow_and_update().clone();
+        let Some(current) = current.filter(|_| endpoints_known) else {
             // Seen, or their changes would wake the loop at once again.
             endpoints.mark_unchanged();
             assignments.mark_unchanged();

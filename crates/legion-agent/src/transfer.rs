@@ -14,7 +14,7 @@ use futures::StreamExt;
 use legion_proto::v1::session_frame::Frame;
 use legion_proto::v1::{SessionFrame, VolumeReceive, VolumeSend};
 use legion_sys::Sys;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tonic::{Status, Streaming};
 
 /// The snapshot of the full copy, and of the last part.
@@ -28,6 +28,10 @@ const CHUNK: usize = 64 << 10;
 pub(crate) struct Volumes {
     pub sys: Arc<dyn Sys>,
     pub zfs_root: Option<String>,
+    /// The node's volume lock, held by tasks making their volumes ready:
+    /// held here too while snapshots and datasets change, but not while
+    /// data streams, which may take long.
+    pub lock: Arc<Mutex<()>>,
 }
 
 impl Volumes {
@@ -48,10 +52,10 @@ pub(crate) async fn send(
     tx: &mpsc::Sender<SessionFrame>,
 ) -> Result<(), Status> {
     let ds = v.dataset(namespace, &opts.volume)?;
-    let out = tx.clone();
+    let (out, lock) = (tx.clone(), v.lock.clone());
     crate::task::blocking(&v.sys, move |sys| -> Result<(), String> {
         let mut out = FrameWriter::new(out);
-        give(sys, &ds, opts.last, &mut out)?;
+        give(sys, &lock, &ds, opts.last, &mut out)?;
         out.flush().map_err(|e| e.to_string())
     })
     .await
@@ -72,8 +76,9 @@ pub(crate) async fn receive(
 ) -> Result<(), Status> {
     let ds = v.dataset(namespace, &opts.volume)?;
     let (data, rx) = mpsc::channel::<Result<Vec<u8>, String>>(16);
+    let lock = v.lock.clone();
     let work = crate::task::blocking(&v.sys, move |sys| {
-        take(sys, &ds, opts.last, &mut FrameReader::new(rx))
+        take(sys, &lock, &ds, opts.last, &mut FrameReader::new(rx))
     });
     // Input until it closes; anything else ends the stream early, which
     // makes the receive fail.
@@ -107,19 +112,31 @@ pub(crate) async fn receive(
 
 /// Snapshots dataset `ds` and writes it to `out`: all of it, or with
 /// `last` what changed since the full copy.
-fn give(sys: &dyn Sys, ds: &str, last: bool, out: &mut dyn Write) -> Result<(), String> {
+fn give(
+    sys: &dyn Sys,
+    lock: &Mutex<()>,
+    ds: &str,
+    last: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
     let snap = |n: &str| format!("{ds}@{n}");
     // A snapshot left by an earlier attempt goes first.
     let fresh = |n: &str| {
         let _ = sys.zfs_destroy(&snap(n), false);
         sys.zfs_snapshot(&snap(n)).map_err(|e| e.to_string())
     };
+    {
+        let _guard = lock.blocking_lock();
+        if last {
+            fresh(LAST)?;
+        } else {
+            let _ = sys.zfs_destroy(&snap(LAST), false);
+            fresh(FULL)?;
+        }
+    }
     if last {
-        fresh(LAST)?;
         sys.zfs_send(&snap(LAST), Some(FULL), out)
     } else {
-        let _ = sys.zfs_destroy(&snap(LAST), false);
-        fresh(FULL)?;
         sys.zfs_send(&snap(FULL), None, out)
     }
     .map_err(|e| e.to_string())
@@ -127,7 +144,14 @@ fn give(sys: &dyn Sys, ds: &str, last: bool, out: &mut dyn Write) -> Result<(), 
 
 /// Takes into dataset `ds` what `give` wrote; after the last part, mounts
 /// it.
-fn take(sys: &dyn Sys, ds: &str, last: bool, input: &mut dyn Read) -> Result<(), String> {
+fn take(
+    sys: &dyn Sys,
+    lock: &Mutex<()>,
+    ds: &str,
+    last: bool,
+    input: &mut dyn Read,
+) -> Result<(), String> {
+    let guard = lock.blocking_lock();
     if let Some((parent, _)) = ds.rsplit_once('/') {
         sys.zfs_create(parent, &[]).map_err(|e| e.to_string())?;
     }
@@ -155,8 +179,10 @@ fn take(sys: &dyn Sys, ds: &str, last: bool, input: &mut dyn Read) -> Result<(),
                 .map_err(|e| e.to_string())?;
         }
     }
+    drop(guard);
     sys.zfs_receive(ds, input).map_err(|e| e.to_string())?;
     if last {
+        let _guard = lock.blocking_lock();
         sys.zfs_mount(ds).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -170,7 +196,9 @@ pub(crate) async fn drop_copy(
     tx: &mpsc::Sender<SessionFrame>,
 ) -> Result<(), Status> {
     let ds = v.dataset(namespace, volume)?;
+    let lock = v.lock.clone();
     crate::task::blocking(&v.sys, move |sys| -> Result<(), String> {
+        let _guard = lock.blocking_lock();
         let found = sys.zfs_list(&ds).map_err(|e| e.to_string())?;
         if found.iter().any(|d| d.name == ds) {
             sys.zfs_destroy(&ds, true).map_err(|e| e.to_string())?;
@@ -273,8 +301,12 @@ mod tests {
 
     fn sent(sys: &FakeSys, last: bool) -> Vec<u8> {
         let mut out = Vec::new();
-        give(sys, DS, last, &mut out).unwrap();
+        give(sys, &Mutex::new(()), DS, last, &mut out).unwrap();
         out
+    }
+
+    fn taken(sys: &FakeSys, last: bool, data: &[u8]) {
+        take(sys, &Mutex::new(()), DS, last, &mut &data[..]).unwrap();
     }
 
     /// The last part may be taken twice, as when the manager did not take
@@ -286,12 +318,12 @@ mod tests {
         from.zfs_create(DS, &[]).unwrap();
         to.zfs_create("tank/legion/volumes", &[]).unwrap();
         from.write_dataset(DS, b"one");
-        take(&to, DS, false, &mut &sent(&from, false)[..]).unwrap();
+        taken(&to, false, &sent(&from, false));
 
         from.write_dataset(DS, b"two");
-        take(&to, DS, true, &mut &sent(&from, true)[..]).unwrap();
+        taken(&to, true, &sent(&from, true));
         from.write_dataset(DS, b"three");
-        take(&to, DS, true, &mut &sent(&from, true)[..]).unwrap();
+        taken(&to, true, &sent(&from, true));
         assert_eq!(to.dataset_contents(DS).unwrap(), b"three");
         assert_eq!(to.zfs_snapshots(DS).unwrap(), [FULL, LAST]);
 

@@ -60,7 +60,9 @@ pub trait Control: Send + Sync + 'static {
     /// first complete set, which may be empty too.
     fn assignments(&self, node: &str) -> watch::Receiver<Assignments>;
 
-    /// Every service's endpoints, kept current; empty until first known.
+    /// Every service's endpoints, kept current. As with
+    /// [`Self::assignments`], the initial value is empty and not marked
+    /// changed; the first change is the first complete set.
     fn endpoints(&self) -> watch::Receiver<Endpoints>;
 
     /// Every node of the WireGuard mesh, this one included, kept current;
@@ -377,11 +379,16 @@ async fn follow_sessions(
             return;
         }
     };
-    let client = DispatcherClient::new(channel);
+    let client = DispatcherClient::new(channel)
+        .max_decoding_message_size(MAX_MESSAGE)
+        .max_encoding_message_size(MAX_MESSAGE);
     loop {
         let mut c = client.clone();
         let opened = tokio::select! {
-            o = c.sessions(SessionsRequest { node: node.clone() }) => o,
+            o = tokio::time::timeout(
+                CALL_TIMEOUT,
+                c.sessions(SessionsRequest { node: node.clone() }),
+            ) => o.unwrap_or_else(|_| Err(tonic::Status::deadline_exceeded("timed out"))),
             _ = tx.closed() => return,
         };
         match opened {
@@ -514,6 +521,9 @@ impl Control for GrpcControl {
     fn endpoints(&self) -> watch::Receiver<Endpoints> {
         let (tx, rx) = watch::channel(Endpoints::new());
         let node = self.node.clone();
+        // The first is published even if empty: a change tells receivers
+        // the endpoints are known (see `Control::endpoints`).
+        let first = std::sync::atomic::AtomicBool::new(true);
         tokio::spawn(self.clone().follow(
             tx,
             move |mut c| {
@@ -521,7 +531,13 @@ impl Control for GrpcControl {
                 async move { c.endpoints(EndpointsRequest { node }).await }
             },
             |m: legion_proto::v1::EndpointsUpdate| decode(&m.endpoints_json),
-            publish_changed,
+            move |tx: &watch::Sender<Endpoints>, set| {
+                if first.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    tx.send_replace(set);
+                } else {
+                    publish_changed(tx, set);
+                }
+            },
         ));
         rx
     }

@@ -1232,6 +1232,60 @@ async fn the_agent_stops_promptly_while_a_pod_waits_for_its_guard() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_while_an_incomplete_pod_goes_is_kept() {
+    let mut h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task("app-1", r#"containers: [{ name: app, image: "app:1" }]"#)
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    let created = h.rt.created();
+
+    // The new agent finds the pod incomplete and cannot remove it yet; the
+    // task is stopped meanwhile.
+    h.stop_agent().await;
+    h.rt.unstart("shop_app-1_app");
+    h.rt.fail_removes(true);
+    h.start_agent();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    h.shut_down(&key).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    h.rt.fail_removes(false);
+    // Stopped, not started again once the old pod is gone.
+    h.wait_state(&key, TaskState::Shutdown).await;
+    h.nothing_left().await;
+    assert_eq!(h.rt.created(), created, "a new pod was made");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exit_counted_before_an_agent_restart_is_not_counted_again() {
+    let mut h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task(
+            "app-1",
+            r#"
+containers: [{ name: app, image: "app:1" }]
+restartPolicy: { condition: on-failure, maxAttempts: 1, delay: 1h }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    h.rt.exit("shop_app-1_app", 1);
+    eventually("restart counted", || h.status(&key).restarts == 1).await;
+
+    // The agent goes while the restart waits: the next one does not take
+    // the same exit for a second, past the one attempt allowed.
+    h.stop_agent().await;
+    h.start_agent();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let st = h.status(&key);
+    assert_eq!(st.state, TaskState::Running, "{st:?}");
+    assert_eq!(st.restarts, 1, "{st:?}");
+    assert!(st.message.contains("restarting in"), "{st:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pod_left_before_its_containers_started_starts_over() {
     let mut h = Harness::new().await;
     h.rt.add_image("app:1");
