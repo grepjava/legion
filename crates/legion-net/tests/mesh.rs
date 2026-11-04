@@ -124,6 +124,44 @@ fn connect(client: &str, addr: &str, port: u16, times: usize) -> Vec<Option<Stri
         .collect()
 }
 
+/// The pods' server, which the test runs in each server pod as this same
+/// program: it answers every connection to port 8080, on both families,
+/// with its name. Its listening sockets stay open throughout. (`nc -l` in
+/// a loop does not do: it keeps its listening socket while it serves, and
+/// a connection queued on it meanwhile is dropped when it exits.)
+#[test]
+#[ignore = "the pods' server, run by pods_across_nodes"]
+fn serve() {
+    use std::io::Write;
+    let Ok(name) = std::env::var("LEGION_MESH_SERVE") else {
+        return;
+    };
+    let listeners: Vec<_> = ["0.0.0.0:8080", "[::]:8080"]
+        .into_iter()
+        .map(|a| std::net::TcpListener::bind(a).unwrap())
+        .collect();
+    let threads: Vec<_> = listeners
+        .into_iter()
+        .map(|l| {
+            let name = name.clone();
+            std::thread::spawn(move || {
+                for c in l.incoming() {
+                    let Ok(mut c) = c else { continue };
+                    let name = name.clone();
+                    std::thread::spawn(move || {
+                        let _ = writeln!(c, "{name}");
+                        let _ = c.shutdown(std::net::Shutdown::Write);
+                        let _ = std::io::copy(&mut c, &mut std::io::sink());
+                    });
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+}
+
 fn names(got: &[Option<String>]) -> BTreeSet<&str> {
     got.iter().flatten().map(String::as_str).collect()
 }
@@ -278,20 +316,28 @@ fn pods_across_nodes() {
         n.net.attach(&n.sys, id, pod, ip).unwrap();
         ips.insert(pod, ip);
         if pod != "c" {
-            // Background processes must not hold on to sh()'s pipes. Two
-            // listeners a family (nc sets SO_REUSEPORT): while one starts
-            // over after a connection, the other takes the next.
-            for family in ["-4", "-4", "-6", "-6"] {
-                n.pod(
-                    pod,
-                    &format!(
-                        "sh -c 'while :; do echo {pod} | nc {family} -N -l 8080; done >/dev/null 2>&1 </dev/null &'"
-                    ),
-                );
-            }
+            // This program again, as the pod's server (see `serve`). The
+            // pods share the host's filesystem, so its path holds there.
+            // Background processes must not hold on to sh()'s pipes.
+            let me = std::env::current_exe().unwrap();
+            n.pod(
+                pod,
+                &format!(
+                    "sh -c 'LEGION_MESH_SERVE={pod} {} --ignored --exact serve --test-threads=1 >/dev/null 2>&1 </dev/null &'",
+                    me.display()
+                ),
+            );
+            let listening = (0..100).any(|_| {
+                let (_, out) = n.pod(pod, "sockstat -46l -P tcp -p 8080");
+                if out.lines().filter(|l| l.contains(":8080")).count() == 2 {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                false
+            });
+            assert!(listening, "{pod} serves");
         }
     }
-    std::thread::sleep(Duration::from_millis(500));
     let (c, w2) = (ips["c"], ips["w2"]);
 
     // Pod to pod across nodes, and node to node over the underlay.
