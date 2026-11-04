@@ -75,15 +75,21 @@ async fn run<R: Runtime>(
     let open = o.open.unwrap_or_default();
     let result = match open.action {
         Some(Action::Logs(opts)) => {
-            match container(runtime.as_ref(), &node, &o.task_uid, &open.container).await {
-                Ok(c) => logs(runtime.as_ref(), &c, opts, &tx, &mut inbound).await,
+            let found = match container(runtime.as_ref(), &node, &o.task_uid, &open.container).await
+            {
+                // Removed between listing it and opening its output (a
+                // teardown keeps the output first): read what was kept.
+                Ok(c) => logs(runtime.as_ref(), &c, &opts, &tx, &mut inbound).await,
+                Err(e) => Err(e),
+            };
+            match found {
                 Err(e) if e.code() == tonic::Code::NotFound => {
                     match saved(kept, &o.task_uid, &open.container, opts.tail).await {
                         Some(lines) => send_all(lines, &tx).await,
                         None => Err(e),
                     }
                 }
-                Err(e) => Err(e),
+                r => r,
             }
         }
         Some(Action::Exec(opts)) => {
@@ -149,11 +155,13 @@ async fn container<R: Runtime>(
 async fn logs<R: Runtime>(
     runtime: &R,
     id: &str,
-    opts: LogsOptions,
+    opts: &LogsOptions,
     tx: &mpsc::Sender<SessionFrame>,
     inbound: &mut Streaming<SessionFrame>,
 ) -> Result<(), Status> {
     let tail = opts.tail.map(|n| n as usize);
+    // Only an error opening the output is NotFound: one while streaming it
+    // is not, or the kept copy would follow lines already sent.
     let mut output = runtime
         .logs(id, opts.follow, tail)
         .await
@@ -164,6 +172,8 @@ async fn logs<R: Runtime>(
                 Some(Ok(c)) => if tx.send(output_frame(c)).await.is_err() {
                     return Ok(());
                 },
+                // Removed while streaming: its output has ended.
+                Some(Err(e)) if e.is_not_found() => return Ok(()),
                 Some(Err(e)) => return Err(runtime_status(e)),
                 None => return Ok(()),
             },

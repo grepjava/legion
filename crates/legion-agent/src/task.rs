@@ -419,6 +419,16 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             wait = (wait * 2).min(TEARDOWN_RETRY);
         };
         if found.is_empty() {
+            // A start the agent before went during, ahead of the first
+            // container, leaves the task's files and volumes: they go
+            // first, or the new start would find them as another's.
+            if !files::task_dir(&self.ctx.files_dir, &self.a.uid).exists() {
+                return Ok(None);
+            }
+            tracing::info!("removing what a start left by a previous run");
+            if !self.remove_pod().await {
+                return Err(Abort::Closing);
+            }
             return Ok(None);
         }
         // Restarts are counted for the pod, not each container: those of
@@ -585,11 +595,13 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 })?,
                 abort = self.stopped() => return Err(abort),
             };
+            let oom = self.ctx.memory.killed(&pod::child_jail(&infra, &id));
             if code != 0 {
                 // The pod and its output go with the failure: keep the end.
                 let tail = last_output(rt.as_ref(), &id).await;
+                let why = oom.map(|why| format!(": {why};")).unwrap_or_default();
                 return Err(Abort::Failed(format!(
-                    "init container {} exited with {code}{tail}",
+                    "init container {}{why} exited with {code}{tail}",
                     c.name
                 )));
             }
@@ -1092,8 +1104,9 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 let message = format!("restarting container {}: {e}", m.name);
                 m.done = Some((-1, message.clone()));
                 tracing::warn!("{message}");
-                if pod.members.iter().any(|m| m.running) {
-                    // The task runs on without it: the manager learns why.
+                if finished(pod).is_none() {
+                    // The task runs on without it (other containers run or
+                    // wait to restart): the manager learns why.
                     self.ready = pod.ready();
                     self.report(TaskState::Running, message).await;
                 } else {

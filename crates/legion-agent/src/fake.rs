@@ -69,6 +69,9 @@ struct State {
     execs: usize,
     /// Output so far, by container name.
     logs: BTreeMap<String, Vec<Chunk>>,
+    /// Containers, by name, whose output is not found, as if removed just
+    /// after being listed.
+    logs_gone: BTreeSet<String>,
     /// Attached execs: their exit code once done, and terminal size.
     sessions: BTreeMap<String, Session>,
     /// One for each exec's stdin given out, gone once it is dropped.
@@ -201,6 +204,12 @@ impl FakeRuntime {
     /// Starting the container `name` fails from now on.
     pub fn fail_starts_of(&self, name: &str) {
         self.state().unstartable.insert(name.to_owned());
+    }
+
+    /// Opening the output of the container `name` finds no container, as
+    /// when it is removed between being listed and its output asked for.
+    pub fn lose_logs_of(&self, name: &str) {
+        self.state().logs_gone.insert(name.to_owned());
     }
 
     /// Removing containers fails, or no longer does.
@@ -768,6 +777,9 @@ impl Runtime for FakeRuntime {
         tail: Option<usize>,
     ) -> Result<BoxStream<'static, Result<Chunk>>> {
         let name = self.get(id)?.spec.name;
+        if self.state().logs_gone.contains(&name) {
+            return Err(api(404, "no such container"));
+        }
         // What was written and how much, at once: a line written between
         // would be neither.
         let mut written = self.state().logs.get(&name).cloned().unwrap_or_default();

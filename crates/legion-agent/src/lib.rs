@@ -881,11 +881,15 @@ async fn policing_loop(
             r = attached.changed() => if r.is_err() { return },
             () = tokio::time::sleep(wait) => {}
         }
-        endpoints_known |= endpoints.has_changed().unwrap_or(false);
+        // Marked seen only when counted as known: a snapshot arriving
+        // between a check and a separate mark would be lost.
+        if endpoints.has_changed().unwrap_or(false) {
+            endpoints.mark_unchanged();
+            endpoints_known = true;
+        }
         let current = policies.borrow_and_update().clone();
         let Some(current) = current.filter(|_| endpoints_known) else {
             // Seen, or their changes would wake the loop at once again.
-            endpoints.mark_unchanged();
             assignments.mark_unchanged();
             attached.mark_unchanged();
             continue;

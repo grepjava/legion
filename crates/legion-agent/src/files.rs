@@ -26,6 +26,18 @@ use crate::control::{Assignment, Control};
 /// Room on a task's tmpfs beyond its files.
 const SLACK: u64 = 1 << 20;
 
+/// What a file takes at most on a tmpfs: whole pages, of up to this.
+const PAGE: u64 = 16 << 10;
+
+/// The size of a tmpfs for files of these lengths: tmpfs counts each in
+/// whole pages, so many small files take far more than their bytes.
+fn tmpfs_size(lengths: impl Iterator<Item = usize>) -> u64 {
+    lengths
+        .map(|n| (n as u64).div_ceil(PAGE).max(1) * PAGE)
+        .sum::<u64>()
+        + SLACK
+}
+
 /// What a pod's containers get, by container name.
 #[derive(Debug, Default)]
 pub(crate) struct Files {
@@ -141,7 +153,12 @@ pub(crate) async fn prepare<C: Control>(
         }
         files.mounts.insert(c.name.clone(), m);
     }
-    let size = values.values().map(|v| v.len() as u64).sum::<u64>() + SLACK;
+    let size = tmpfs_size(
+        values
+            .values()
+            .map(Vec::len)
+            .chain(resolv_conf.as_ref().map(String::len)),
+    );
     let write = move |sys: &dyn Sys| -> Result<(), String> {
         let path = dir.to_str().ok_or("the files directory is not UTF-8")?;
         std::fs::create_dir_all(&dir).map_err(|e| format!("creating {path}: {e}"))?;
@@ -224,7 +241,20 @@ pub(crate) fn present(root: &Path) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::same_path;
+    use super::{PAGE, SLACK, same_path, tmpfs_size};
+
+    #[test]
+    fn a_tmpfs_holds_each_file_in_whole_pages() {
+        // Many small files: their pages, not their bytes.
+        let small = tmpfs_size(std::iter::repeat_n(10, 300));
+        assert_eq!(small, 300 * PAGE + SLACK);
+        assert_eq!(tmpfs_size([0].into_iter()), PAGE + SLACK);
+        assert_eq!(
+            tmpfs_size([PAGE as usize + 1].into_iter()),
+            2 * PAGE + SLACK
+        );
+        assert_eq!(tmpfs_size(std::iter::empty()), SLACK);
+    }
 
     #[test]
     fn paths_compare_by_parts() {

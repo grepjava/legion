@@ -590,6 +590,34 @@ restartPolicy: { condition: any, delay: 0s }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_restart_is_reported_while_another_container_waits_to_restart() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task(
+            "app-1",
+            r#"
+containers: [{ name: a, image: "app:1" }, { name: b, image: "app:1" }]
+restartPolicy: { condition: any, delay: 2s }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    h.rt.fail_starts_of("shop_app-1_a");
+    h.rt.exit("shop_app-1_a", 1);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // b waits a second longer than a to restart: nothing of the pod runs
+    // when a's restart fails, yet the task goes on.
+    h.rt.exit("shop_app-1_b", 1);
+    eventually("the failed restart reported", || {
+        let st = h.status(&key);
+        assert_eq!(st.state, TaskState::Running, "{st:?}");
+        st.message.contains("restarting container a:")
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reports_the_manager_did_not_take_are_sent_again() {
     let h = Harness::new().await;
     h.rt.add_image("app:1");
@@ -786,6 +814,51 @@ restartPolicy: { condition: none }
         status
             .message
             .contains("db: out of memory: used 300 MiB of its 256 MiB limit; exited with 137"),
+        "{}",
+        status.message
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_init_container_killed_for_memory_says_so() {
+    let h = Harness::new().await;
+    h.rt.add_image("db:1");
+    h.rt.hold_init(true);
+    let key = h
+        .task(
+            "db-1",
+            r#"
+initContainers: [{ name: load, image: "db:1", resources: { limits: { memory: 256Mi } } }]
+containers: [{ name: db, image: "db:1" }]
+restartPolicy: { condition: none }
+"#,
+        )
+        .await;
+    eventually("the init container", || {
+        h.running() == ["shop_db-1", "shop_db-1_load"]
+    })
+    .await;
+    let infra = h.rt.id_of("shop_db-1").unwrap();
+    let load = h.rt.id_of("shop_db-1_load").unwrap();
+    let jail = format!("{infra}.{load}");
+    h.sys.set_memory(
+        &jail,
+        JailMemory {
+            bytes: 300 << 20,
+            largest: Some((4343, 120 << 20)),
+        },
+    );
+    eventually("the largest process killed", || {
+        h.sys.kills().contains(&4343)
+    })
+    .await;
+    h.sys.set_memory(&jail, JailMemory::default());
+    h.rt.exit("shop_db-1_load", 137);
+    let status = h.wait_state(&key, TaskState::Failed).await;
+    assert!(
+        status.message.contains(
+            "init container load: out of memory: used 300 MiB of its 256 MiB limit; exited with 137"
+        ),
         "{}",
         status.message
     );
@@ -1693,6 +1766,51 @@ containers:
     h.wait_state(&key, TaskState::Shutdown).await;
     assert!(h.sys.tmpfs_mounts().is_empty());
     assert!(!dir.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn files_a_start_left_before_any_container_go_first() {
+    let mut h = Harness::new().await;
+    h.rt.add_image("app:1");
+    h.write(
+        Object::new(
+            Kind::Secret,
+            "shop",
+            "db-password",
+            serde_json::json!({ "text": "s3cret" }),
+        ),
+        Precondition::MustNotExist,
+    )
+    .await;
+    h.stop_agent().await;
+    let key = h
+        .task(
+            "app-1",
+            r#"
+containers: [{ name: app, image: "app:1", secrets: [{ name: db-password }] }]
+"#,
+        )
+        .await;
+    // The agent before went while starting it, its files written and no
+    // container yet: a tmpfs too small for them again, and a file of a
+    // volume it had recorded.
+    let uid = h.store.get(&key).unwrap().unwrap().metadata.uid;
+    let dir = h.files_dir().join(&uid);
+    std::fs::create_dir_all(dir.join("secrets")).unwrap();
+    h.sys
+        .mount_tmpfs(dir.to_str().unwrap(), Some(1), 0o700)
+        .unwrap();
+    std::fs::write(dir.join("secrets").join("db-password"), "old").unwrap();
+    std::fs::write(dir.join("stale"), "left").unwrap();
+    h.start_agent();
+    h.wait_state(&key, TaskState::Running).await;
+    assert!(!dir.join("stale").exists(), "what the start left goes");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("secrets").join("db-password")).unwrap(),
+        "s3cret"
+    );
+    let size = h.sys.tmpfs_mounts()[dir.to_str().unwrap()];
+    assert!(size.is_some_and(|s| s > 1), "{size:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2681,4 +2799,40 @@ restartPolicy: { condition: none }
     assert!(kept.join("app").exists());
     h.delete(&key).await;
     eventually("output removed", || !kept.exists()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn output_asked_for_as_its_container_goes_is_read_from_what_was_kept() {
+    let h = Harness::new().await;
+    h.rt.add_image("job:1");
+    let key = h
+        .task(
+            "web-1",
+            r#"
+containers: [{ name: app, image: "job:1" }]
+restartPolicy: { condition: none }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    h.rt.log("shop_web-1_app", Output::Stdout, "done\n");
+    // The teardown keeps the output, then cannot remove the container: it
+    // is still listed, as while a teardown is between the two.
+    h.rt.fail_removes(true);
+    h.rt.exit("shop_web-1_app", 0);
+    let uid = h.store.get(&key).unwrap().unwrap().metadata.uid;
+    let kept = h.logs_dir().join(&uid).join("app");
+    eventually("the output kept", || kept.exists()).await;
+    assert!(h.rt.id_of("shop_web-1_app").is_some());
+    // Removed after being listed, before its output is opened.
+    h.rt.lose_logs_of("shop_web-1_app");
+    let mut s = Session::open(&h, open("web-1", logs(false, None)))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.rest().await,
+        (vec![Frame::Stdout(b"done\n".to_vec())], None)
+    );
+    h.rt.fail_removes(false);
+    h.wait_state(&key, TaskState::Complete).await;
 }
