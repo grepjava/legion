@@ -4,8 +4,9 @@
 //! child of the infra jail when `parentJail` is set), a stopped container's
 //! jail goes away, stopping the infra jail kills the pod, and every death
 //! is reported as a `died` event carrying the container's labels. To keep
-//! the agent honest it is less kind than the jail runtime: starting a
-//! container clears its jail's rctl rules (an OCI runtime may), and a
+//! the agent honest it is less kind than the jail runtime: the rctl rules
+//! a container's jail has as it starts are recorded, for checking they
+//! were there before it ran, and a
 //! child jail gets loose parameters (raw sockets, chflags,
 //! `enforce_statfs=1`), then those of the `legion.jail` annotation, unless
 //! [`FakeRuntime::skip_jail_hook`]. Exec runs nothing: each container answers with the exit code
@@ -81,6 +82,19 @@ struct State {
     /// The network policy anchor's rules as each container (by name) last
     /// started.
     policy_at_start: BTreeMap<String, String>,
+    /// The rctl rules of each container's (by name) jail as it last
+    /// started.
+    rules_at_start: BTreeMap<String, Vec<String>>,
+    /// The code a stop leaves, by container name, as of a process that
+    /// catches SIGTERM; 143 for the rest.
+    stop_codes: BTreeMap<String, i32>,
+    /// Containers, by name, whose stops fail, leaving them running.
+    unstoppable: BTreeSet<String>,
+    /// How long stops of containers, by name, take, as a grace period
+    /// would.
+    stop_delays: BTreeMap<String, Duration>,
+    /// Containers, by name, whose removal fails.
+    unremovable_names: BTreeSet<String>,
 }
 
 /// An attached exec's view of its session.
@@ -212,6 +226,37 @@ impl FakeRuntime {
         self.state().logs_gone.insert(name.to_owned());
     }
 
+    /// A stop of the container `name` leaves `code`, as a process that
+    /// catches SIGTERM and exits with it.
+    pub fn stop_with(&self, name: &str, code: i32) {
+        self.state().stop_codes.insert(name.to_owned(), code);
+    }
+
+    /// Stopping the container `name` fails, or no longer does.
+    pub fn fail_stops_of(&self, name: &str, fail: bool) {
+        let mut s = self.state();
+        if fail {
+            s.unstoppable.insert(name.to_owned());
+        } else {
+            s.unstoppable.remove(name);
+        }
+    }
+
+    /// Stopping the container `name` takes `delay` before it ends.
+    pub fn stop_slowly(&self, name: &str, delay: Duration) {
+        self.state().stop_delays.insert(name.to_owned(), delay);
+    }
+
+    /// Removing the container `name` fails, or no longer does.
+    pub fn fail_removes_of(&self, name: &str, fail: bool) {
+        let mut s = self.state();
+        if fail {
+            s.unremovable_names.insert(name.to_owned());
+        } else {
+            s.unremovable_names.remove(name);
+        }
+    }
+
     /// Removing containers fails, or no longer does.
     pub fn fail_removes(&self, fail: bool) {
         self.state().unremovable = fail;
@@ -308,6 +353,16 @@ impl FakeRuntime {
     /// started, for checking that a pod was guarded before it ran.
     pub fn policy_at_start(&self, name: &str) -> Option<String> {
         self.state().policy_at_start.get(name).cloned()
+    }
+
+    /// The rctl rules the jail of the container `name` had as it last
+    /// started, for checking that its limits held from its first process.
+    pub fn rules_at_start(&self, name: &str) -> Vec<String> {
+        self.state()
+            .rules_at_start
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Containers created so far, removed ones included.
@@ -535,9 +590,14 @@ impl Runtime for FakeRuntime {
                 id.to_owned()
             }
         };
-        // As an OCI runtime may: a new jail starts with only the container's
-        // own OCI limits, none here.
-        let _ = legion_sys::Sys::rctl_remove_jail(self.sys.as_ref(), &jail);
+        let rules = self
+            .sys
+            .rctl_rules()
+            .iter()
+            .filter(|r| r.jail == jail)
+            .map(ToString::to_string)
+            .collect();
+        s.rules_at_start.insert(c.spec.name.clone(), rules);
         let policy = self
             .sys
             .anchor(legion_net::policy::ANCHOR)
@@ -556,11 +616,24 @@ impl Runtime for FakeRuntime {
     }
 
     async fn stop(&self, id: &str, _timeout: Duration) -> Result<()> {
+        let delay = {
+            let s = self.state();
+            let name = s.containers.get(id).map(|c| c.spec.name.clone());
+            name.and_then(|n| s.stop_delays.get(&n).copied())
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         let mut s = self.state();
         if !s.containers.contains_key(id) {
             return Err(api(404, "no such container"));
         }
-        self.die(&mut s, id, 143);
+        let name = s.containers[id].spec.name.clone();
+        if s.unstoppable.contains(&name) {
+            return Err(api(500, "it would not stop"));
+        }
+        let code = s.stop_codes.get(&name).copied().unwrap_or(143);
+        self.die(&mut s, id, code);
         Ok(())
     }
 
@@ -569,7 +642,7 @@ impl Runtime for FakeRuntime {
         if !s.containers.contains_key(id) {
             return Err(api(404, "no such container"));
         }
-        if s.unremovable {
+        if s.unremovable || s.unremovable_names.contains(&s.containers[id].spec.name) {
             return Err(api(500, "device busy"));
         }
         self.die(&mut s, id, 137);

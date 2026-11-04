@@ -33,6 +33,8 @@ const NODE: &str = "n1";
 struct Flaky {
     inner: GrpcControl,
     fail_reports: Arc<AtomicBool>,
+    /// Releases of volumes to fail, before they go through again.
+    fail_releases: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Control for Flaky {
@@ -94,6 +96,26 @@ impl Control for Flaky {
         name: &str,
         node: &str,
     ) -> Result<(), ControlError> {
+        // One failure taken per call while any are left (not fetch_update:
+        // renamed in newer toolchains).
+        let mut left = self.fail_releases.load(Ordering::SeqCst);
+        let failing = loop {
+            if left == 0 {
+                break false;
+            }
+            match self.fail_releases.compare_exchange(
+                left,
+                left - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break true,
+                Err(now) => left = now,
+            }
+        };
+        if failing {
+            return Err(ControlError::Unavailable("the manager is away".into()));
+        }
         self.inner.release_volume(namespace, name, node).await
     }
 
@@ -137,6 +159,8 @@ struct Harness {
     mesh: bool,
     /// Whether the agent's reports fail.
     fail_reports: Arc<AtomicBool>,
+    /// Releases of volumes still to fail.
+    fail_releases: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Harness {
@@ -196,6 +220,7 @@ impl Harness {
             drain: Duration::ZERO,
             mesh,
             fail_reports: Arc::default(),
+            fail_releases: Arc::default(),
         };
         h.start_agent();
         h
@@ -222,6 +247,7 @@ impl Harness {
             Arc::new(Flaky {
                 inner: GrpcControl::new(NODE, vec![self.addr.clone()], None).unwrap(),
                 fail_reports: self.fail_reports.clone(),
+                fail_releases: self.fail_releases.clone(),
             }),
         );
         self.metrics = Some(agent.metrics());
@@ -2900,4 +2926,225 @@ restartPolicy: { condition: none }
     );
     h.rt.fail_removes(false);
     h.wait_state(&key, TaskState::Complete).await;
+}
+
+/// Limits are on a container's jail before it starts, each time it does:
+/// its first process runs within them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn limits_hold_from_a_containers_first_process() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task(
+            "app-1",
+            r#"
+initContainers: [{ name: setup, image: "app:1", resources: { limits: { maxproc: 8 } } }]
+containers:
+  - name: app
+    image: "app:1"
+    resources: { limits: { memory: 64Mi } }
+restartPolicy: { condition: any, delay: 0s }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    let infra = h.rt.id_of("shop_app-1").unwrap();
+    let setup = h.rt.id_of("shop_app-1_setup").unwrap();
+    let app = h.rt.id_of("shop_app-1_app").unwrap();
+    assert_eq!(
+        h.rt.rules_at_start("shop_app-1_setup"),
+        [format!("jail:{infra}.{setup}:maxproc:deny=8")]
+    );
+    let rule = format!("jail:{infra}.{app}:memoryuse:sigkill=67108864/process");
+    assert_eq!(
+        h.rt.rules_at_start("shop_app-1_app"),
+        std::slice::from_ref(&rule)
+    );
+
+    // Lost meanwhile (removed by hand, say): set again before the restart.
+    h.sys.rctl_remove_jail(&format!("{infra}.{app}")).unwrap();
+    h.rt.exit("shop_app-1_app", 1);
+    eventually("restarted", || h.status(&key).restarts >= 1).await;
+    eventually("running again", || {
+        h.running().contains(&"shop_app-1_app".to_owned())
+    })
+    .await;
+    assert_eq!(h.rt.rules_at_start("shop_app-1_app"), [rule]);
+}
+
+/// A container stopped for failing its liveness probe failed, whatever
+/// code it then exits with: restarted on failure, and the task failed once
+/// its attempts are spent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_container_stopped_unhealthy_failed_though_it_exits_0() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    h.rt.stop_with("shop_app-1_app", 0);
+    let key = h
+        .task(
+            "app-1",
+            r#"
+restartPolicy: { condition: on-failure, maxAttempts: 1, delay: 0s }
+containers:
+  - name: app
+    image: "app:1"
+    probes:
+      liveness: { exec: { command: [/alive] }, period: 20ms, failureThreshold: 2 }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    h.rt.set_exec("shop_app-1_app", 1);
+    let st = h.wait_state(&key, TaskState::Failed).await;
+    assert_eq!(st.restarts, 1);
+    assert!(st.message.contains("liveness"), "{}", st.message);
+}
+
+/// An unhealthy container leaves the endpoints as its stop begins, not
+/// once its grace period is over; a stop that fails is tried again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unhealthy_container_is_unready_while_it_stops_and_stopped_in_the_end() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    // Liveness alone: no readiness probe to take it out first.
+    let key = h
+        .task(
+            "app-1",
+            r#"
+restartPolicy: { condition: any, delay: 0s }
+containers:
+  - name: app
+    image: "app:1"
+    probes:
+      liveness: { exec: { command: [/alive] }, period: 20ms, failureThreshold: 2 }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    eventually("ready", || h.status(&key).ready).await;
+
+    h.rt.stop_slowly("shop_app-1_app", Duration::from_secs(3));
+    h.rt.set_exec("shop_app-1_app", 1);
+    let begun = tokio::time::Instant::now();
+    eventually("not ready", || !h.status(&key).ready).await;
+    assert!(
+        begun.elapsed() < Duration::from_secs(2),
+        "unready only after the stop"
+    );
+    eventually("restarted", || h.status(&key).restarts >= 1).await;
+    h.rt.stop_slowly("shop_app-1_app", Duration::ZERO);
+    h.rt.set_exec("shop_app-1_app", 0);
+    eventually("ready after the restart", || h.status(&key).ready).await;
+
+    // Its stop fails: it runs on, unready, until a stop goes through.
+    h.rt.fail_stops_of("shop_app-1_app", true);
+    let restarts = h.status(&key).restarts;
+    h.rt.set_exec("shop_app-1_app", 1);
+    eventually("not ready", || !h.status(&key).ready).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.status(&key).restarts, restarts);
+    h.rt.fail_stops_of("shop_app-1_app", false);
+    eventually("stopped and restarted", || {
+        h.status(&key).restarts > restarts
+    })
+    .await;
+}
+
+/// A teardown that could not remove a container tries again, and then
+/// still removes that container's limits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn limits_go_with_a_container_removed_on_a_later_try() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    h.rt.add_image("side:1");
+    let key = h
+        .task(
+            "app-1",
+            r#"
+containers:
+  - name: app
+    image: "app:1"
+    resources: { limits: { memory: 64Mi } }
+  - name: side
+    image: "side:1"
+    resources: { limits: { maxproc: 8 } }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    assert_eq!(h.sys.rctl_rules().len(), 2);
+    h.rt.fail_removes_of("shop_app-1_side", true);
+    h.shut_down(&key).await;
+    eventually("all but side removed", || {
+        let left: Vec<String> = h.rt.containers().into_iter().map(|(n, ..)| n).collect();
+        left == ["shop_app-1", "shop_app-1_side"]
+    })
+    .await;
+    h.rt.fail_removes_of("shop_app-1_side", false);
+    h.wait_state(&key, TaskState::Shutdown).await;
+    assert!(h.rt.containers().is_empty());
+    assert!(h.sys.rctl_rules().is_empty(), "{:?}", h.sys.rctl_rules());
+}
+
+/// A task whose start an agent restart found begun reports no address
+/// another pod has, before its new start attaches it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pod_started_over_reports_no_address_of_anothers() {
+    let mut h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let pod = "containers: [{ name: app, image: \"app:1\" }]";
+    let b = h.task("b-1", pod).await;
+    let st = h.wait_state(&b, TaskState::Running).await;
+    let ip = st.ip.clone().unwrap();
+
+    // A's start went with the agent, before any container, and its status
+    // names B's address.
+    h.stop_agent().await;
+    let a = h
+        .task("a-1", "containers: [{ name: app, image: \"gone:1\" }]")
+        .await;
+    let mut o = h.store.get(&a).unwrap().unwrap();
+    o.status = serde_json::json!({ "state": "preparing", "ip": ip });
+    let uid = o.metadata.uid.clone();
+    h.write(o, Precondition::None).await;
+    std::fs::create_dir_all(h.files_dir().join(&uid)).unwrap();
+    h.rt.fail_pulls_of("gone:1");
+    h.start_agent();
+    let st = h.wait_state(&a, TaskState::Failed).await;
+    assert_ne!(st.ip.as_deref(), Some(ip.as_str()));
+    assert_eq!(h.status(&b).ip.as_deref(), Some(ip.as_str()));
+}
+
+/// A volume used one node at a time, claimed by a start that failed before
+/// attaching any of it, is let go of even if the first try fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claim_a_failed_start_made_is_let_go_of_in_the_end() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    // An iSCSI volume without its target: claimed, then refused.
+    h.write(
+        Object::new(
+            Kind::Volume,
+            "shop",
+            "block",
+            serde_json::json!({ "driver": "iscsi" }),
+        ),
+        Precondition::MustNotExist,
+    )
+    .await;
+    h.fail_releases.store(1, Ordering::SeqCst);
+    let pod = "containers: [{ name: app, image: \"app:1\", volumeMounts: [{ name: v, path: /v }] }]\n\
+               volumes: [{ name: v, volume: { name: block } }]";
+    let key = h.task("app-1", pod).await;
+    let st = h.wait_state(&key, TaskState::Failed).await;
+    assert!(st.message.contains("no iscsi section"), "{}", st.message);
+    let node = || {
+        let v = h
+            .store
+            .get(&ObjectKey::new(Kind::Volume, "shop", "block"))
+            .unwrap()
+            .unwrap();
+        v.status["node"].as_str().unwrap_or_default().to_owned()
+    };
+    eventually("let go", || node().is_empty()).await;
 }

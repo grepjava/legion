@@ -86,6 +86,10 @@ pub(crate) struct Places<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "driver", rename_all = "lowercase")]
 enum Attached {
+    /// Claimed for the node, one node at a time, before any of it is
+    /// attached: let go of by the teardown, should the start fail before
+    /// it records more, or the agent go.
+    Claimed { namespace: String, volume: String },
     Iscsi {
         namespace: String,
         volume: String,
@@ -110,7 +114,8 @@ enum Attached {
 impl Attached {
     fn volume(&self) -> (&str, &str) {
         match self {
-            Attached::Iscsi {
+            Attached::Claimed { namespace, volume }
+            | Attached::Iscsi {
                 namespace, volume, ..
             }
             | Attached::Plugin {
@@ -193,29 +198,21 @@ async fn volume<C: Control>(
         }
         Err(e) => return Err(failed(e.to_string())),
     };
-    let single = spec.access() == Access::Single;
-    let result = ready(sys, p, a, v, name, dataset, spec, guard).await;
-    if result.is_err() && single {
-        unclaim(control, p, &a.uid, namespace, name).await;
+    // Recorded before anything can fail: the teardown, which lets go only
+    // of what is recorded, then lets go of it, trying again until it can.
+    if spec.access() == Access::Single {
+        let claimed = Attached::Claimed {
+            namespace: namespace.to_owned(),
+            volume: name.to_owned(),
+        };
+        if let Err(e) = record(p.files_dir, &a.uid, claimed) {
+            if let Err(r) = control.release_volume(namespace, name, p.node).await {
+                tracing::warn!(uid = %a.uid, "letting go of volume {name}: {r}");
+            }
+            return Err(failed(e));
+        }
     }
-    result
-}
-
-/// Lets go of a volume used one node at a time that the task `uid` claimed
-/// but did not record, as the teardown lets go only of what is recorded;
-/// unless another task here has it.
-async fn unclaim<C: Control>(control: &C, p: &Places<'_>, uid: &str, namespace: &str, name: &str) {
-    let _guard = p.lock.lock().await;
-    let held = files::present(p.files_dir)
-        .into_iter()
-        .flat_map(|task| attached(&files::task_dir(p.files_dir, &task)).unwrap_or_default())
-        .any(|entry| entry.volume() == (namespace, name));
-    if held {
-        return;
-    }
-    if let Err(e) = control.release_volume(namespace, name, p.node).await {
-        tracing::warn!(%uid, "letting go of volume {name}: {e}");
-    }
+    ready(sys, p, a, v, name, dataset, spec, guard).await
 }
 
 /// Makes a claimed volume ready by its driver.
@@ -278,6 +275,8 @@ async fn ready(
                 .into_iter()
                 .flat_map(|task| attached(&files::task_dir(p.files_dir, &task)).unwrap_or_default())
                 .filter(|entry| entry.volume() == (namespace, name))
+                // A claim alone mounts nothing.
+                .filter(|entry| !matches!(entry, Attached::Claimed { .. }))
                 .collect();
             for entry in &recorded {
                 if let Attached::Iscsi { target, lun, .. } = entry
@@ -568,9 +567,17 @@ async fn release_one<C: Control>(
     others: &[Attached],
     rest: &[Attached],
 ) -> Result<(), String> {
+    // Held by another task here: one that only claimed it holds the claim,
+    // not the node's mount.
     let in_use = |entry: &Attached| others.iter().any(|o| o.volume() == entry.volume());
+    let mounted = |entry: &Attached| {
+        others
+            .iter()
+            .any(|o| o.volume() == entry.volume() && !matches!(o, Attached::Claimed { .. }))
+    };
     let (namespace, volume) = entry.volume();
     let single = match entry {
+        Attached::Claimed { .. } => true,
         Attached::Plugin {
             plugin,
             dir,
@@ -591,7 +598,7 @@ async fn release_one<C: Control>(
             !shared
         }
         Attached::Iscsi { target, .. } => {
-            if !in_use(entry) {
+            if !mounted(entry) {
                 let path = path_str(&node_mount(p.volumes_dir, namespace, volume))?;
                 let on_target =
                     |a: &Attached| matches!(a, Attached::Iscsi { target: t, .. } if t == target);

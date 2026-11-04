@@ -218,8 +218,20 @@ pub(crate) struct Restarts {
     pub attempts: u32,
     /// Its exit counted and its restart due.
     pub pending: bool,
-    /// Exit code, and what happened, once it has finished for good.
-    pub done: Option<(i32, String)>,
+    /// How it finished for good, once it has.
+    pub done: Option<Done>,
+}
+
+/// How a container finished for good.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Done {
+    /// Its exit code.
+    pub code: i32,
+    /// What happened, for the task's status.
+    pub what: String,
+    /// It failed: a code other than 0, or a run ended for it (a failed
+    /// probe, a memory kill), whatever code that left.
+    pub failed: bool,
 }
 
 /// Where a task's restarts are kept: beside its files, gone with them.

@@ -435,6 +435,9 @@ fn hop_by_hop(headers: &mut hyper::HeaderMap, upgrade: bool) {
         .flat_map(|v| v.split(','))
         .map(|n| n.trim().to_ascii_lowercase())
         .filter(|n| !n.is_empty() && !(upgrade && n == "upgrade"))
+        // Never hop-by-hop: the backend needs it to know the site asked
+        // for, and an HTTP/1.1 request names it nowhere else.
+        .filter(|n| n != "host")
         .collect();
     for name in &named {
         headers.remove(name.as_str());
@@ -612,7 +615,7 @@ mod tests {
             .header(HOST, "shop.example.org")
             .header(
                 "connection",
-                "keep-alive, X-Forwarded-For, x-forwarded-host",
+                "keep-alive, X-Forwarded-For, x-forwarded-host, Host",
             )
             .header("keep-alive", "timeout=5")
             .header("x-forwarded-for", "10.9.9.9")
@@ -622,7 +625,7 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let body = String::from_utf8_lossy(&body);
         // The client's own forwarded-for was named, so it goes; the
-        // proxy's stay.
+        // proxy's stay, and so does the host, named or not.
         assert_eq!(
             body,
             "web / host=shop.example.org xff=127.0.0.1 xfh=shop.example.org"

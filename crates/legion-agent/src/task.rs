@@ -122,8 +122,8 @@ struct Member {
     /// Restarts so far, for `maxAttempts`.
     attempts: u32,
     restart_at: Option<Instant>,
-    /// Exit code, and what happened, once it has finished for good.
-    done: Option<(i32, String)>,
+    /// How it finished for good, once it has.
+    done: Option<files::Done>,
     /// Counts the container's runs, to tell current probe reports from
     /// stale ones.
     run: u64,
@@ -429,6 +429,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             if !self.remove_pod().await {
                 return Err(Abort::Closing);
             }
+            self.keep_address();
             return Ok(None);
         }
         // Restarts are counted for the pod, not each container: those of
@@ -503,7 +504,33 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         }
         // Its jail is gone; its address is taken again if still free.
         self.status.jid = None;
+        self.keep_address();
         Ok(None)
+    }
+
+    /// After a teardown freed the task's address: holds it again for the
+    /// start to come if no other pod has taken it meanwhile, or forgets it,
+    /// so a status reported before the start attaches the pod never names
+    /// another pod's address.
+    fn keep_address(&mut self) {
+        let Some(ip) = self
+            .status
+            .ip
+            .as_deref()
+            .and_then(|s| s.parse::<Ipv4Addr>().ok())
+        else {
+            self.status.ip = None;
+            return;
+        };
+        let mut ips = self.ctx.ips.lock().unwrap_or_else(|e| e.into_inner());
+        if ips
+            .iter()
+            .any(|(uid, other)| *other == ip && *uid != self.a.uid)
+        {
+            self.status.ip = None;
+        } else {
+            ips.insert(self.a.uid.clone(), ip);
+        }
     }
 
     async fn start(&mut self) -> Result<Pod, Abort> {
@@ -597,10 +624,10 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 .create(&spec)
                 .await
                 .map_err(|e| Abort::Failed(format!("creating init container {}: {e}", c.name)))?;
+            self.limit(c, &infra, &id).await.map_err(Abort::Failed)?;
             rt.start(&id)
                 .await
                 .map_err(|e| Abort::Failed(format!("starting init container {}: {e}", c.name)))?;
-            self.limit(c, &infra, &id).await.map_err(Abort::Failed)?;
             self.check_jail(c, &infra, &id, false)
                 .await
                 .map_err(Abort::Rejected)?;
@@ -636,10 +663,10 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 .create(&spec)
                 .await
                 .map_err(|e| Abort::Failed(format!("creating container {}: {e}", c.name)))?;
+            self.limit(c, &infra, &id).await.map_err(Abort::Failed)?;
             rt.start(&id)
                 .await
                 .map_err(|e| Abort::Failed(format!("starting container {}: {e}", c.name)))?;
-            self.limit(c, &infra, &id).await.map_err(Abort::Failed)?;
             self.check_jail(c, &infra, &id, false)
                 .await
                 .map_err(Abort::Rejected)?;
@@ -774,12 +801,13 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         blocking(&self.ctx.sys, check).await
     }
 
-    /// Sets rctl limits on a container's jail. This runs after every start:
-    /// a runtime may clear a jail's rules when it creates the jail, and
-    /// Legion's rules must hold for every run. Adding a rule
-    /// again replaces it, so repeating this is harmless. A container whose
-    /// limits could not be set must not run without them: the error is
-    /// the caller's to fail or refuse the pod with.
+    /// Sets rctl limits on a container's jail, before every start: rctl
+    /// keeps a rule for a jail name before any jail has it, and applies it
+    /// as the jail is made, so the container's first process runs within
+    /// them. Adding a rule again replaces it, so repeating this is
+    /// harmless. A container whose limits could not be set must not run
+    /// without them: the error is the caller's to fail or refuse the pod
+    /// with.
     async fn limit(
         &self,
         c: &legion_api::service::Container,
@@ -909,10 +937,12 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 m.ready = false;
                 m.unhealthy = Some(why);
                 let id = m.id.clone();
-                if let Err(e) = self.ctx.runtime.stop(&id, self.grace()).await {
-                    tracing::warn!("stopping an unhealthy container: {e}");
-                }
+                // Out of the endpoints before its grace period, not after.
                 self.update_ready(pod).await;
+                if let Err(e) = self.ctx.runtime.stop(&id, self.grace()).await {
+                    // No probe is left to ask again: resyncs do.
+                    tracing::warn!("stopping an unhealthy container: {e}; trying again later");
+                }
             }
         }
     }
@@ -1033,9 +1063,18 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                                 .await;
                         }
                         for i in 0..pod.members.len() {
-                            if pod.members[i].running && !self.is_running(&pod.members[i].id).await {
-                                let code = self.exit_code(&pod.members[i].id).await;
+                            if !pod.members[i].running {
+                                continue;
+                            }
+                            let id = pod.members[i].id.clone();
+                            if !self.is_running(&id).await {
+                                let code = self.exit_code(&id).await;
                                 self.exited(&mut pod, i, code).await;
+                            } else if pod.members[i].unhealthy.is_some() {
+                                // Its stop failed: tried again.
+                                if let Err(e) = self.ctx.runtime.stop(&id, self.grace()).await {
+                                    tracing::warn!("stopping an unhealthy container: {e}");
+                                }
                             }
                         }
                         self.resend().await;
@@ -1061,14 +1100,18 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         m.running = false;
         m.prober = None;
         let oom = self.ctx.memory.killed(&pod::child_jail(&pod.infra, &m.id));
-        let what = match (m.unhealthy.take(), oom) {
+        let unhealthy = m.unhealthy.take();
+        // A run ended for it failed, even if what it ran then exited 0, as
+        // one stopped by a failed probe may well.
+        let failed = code != 0 || unhealthy.is_some() || oom.is_some();
+        let what = match (unhealthy, oom) {
             (Some(why), _) => format!("container {}: {why}", m.name),
             (None, Some(why)) => format!("container {}: {why}; exited with {code}", m.name),
             (None, None) => format!("container {} exited with {code}", m.name),
         };
         let wants = match policy.condition {
             RestartCondition::Any => true,
-            RestartCondition::OnFailure => code != 0,
+            RestartCondition::OnFailure => failed,
             RestartCondition::None => false,
         };
         let allowed = policy.max_attempts == 0 || m.attempts < policy.max_attempts;
@@ -1083,30 +1126,34 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             self.report(TaskState::Running, message).await;
         } else {
             tracing::info!(code, "container finished: {what}");
-            m.done = Some((code, what));
+            m.done = Some(files::Done { code, what, failed });
             self.keep_restarts(pod).await;
             self.update_ready(pod).await;
         }
     }
 
     async fn restart(&mut self, pod: &mut Pod, i: usize) {
+        pod.members[i].restart_at = None;
+        let (name, id) = (pod.members[i].name.clone(), pod.members[i].id.clone());
+        let spec = self
+            .pod()
+            .containers
+            .iter()
+            .find(|c| c.name == name)
+            .cloned();
+        // Its limits before it runs again: a run without them is refused.
+        if let Some(c) = &spec
+            && let Err(why) = self.limit(c, &pod.infra, &id).await
+        {
+            pod.refused = Some(why);
+            return;
+        }
         let m = &mut pod.members[i];
-        m.restart_at = None;
         match self.ctx.runtime.start(&m.id).await {
             Ok(()) => {
                 m.running = true;
-                let (name, id) = (m.name.clone(), m.id.clone());
-                if let Some(c) = self
-                    .pod()
-                    .containers
-                    .iter()
-                    .find(|c| c.name == name)
-                    .cloned()
-                {
-                    let checked = match self.limit(&c, &pod.infra, &id).await {
-                        Ok(()) => self.check_jail(&c, &pod.infra, &id, false).await,
-                        Err(why) => Err(why),
-                    };
+                if let Some(c) = spec {
+                    let checked = self.check_jail(&c, &pod.infra, &id, false).await;
                     if let Err(why) = checked {
                         // Torn down as the monitor's next turn finds it,
                         // never reported running again.
@@ -1121,7 +1168,11 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             }
             Err(e) => {
                 let message = format!("restarting container {}: {e}", m.name);
-                m.done = Some((-1, message.clone()));
+                m.done = Some(files::Done {
+                    code: -1,
+                    what: message.clone(),
+                    failed: true,
+                });
                 tracing::warn!("{message}");
                 self.keep_restarts(pod).await;
                 if finished(pod).is_none() {
@@ -1226,18 +1277,18 @@ fn restart_pending(message: &str, name: &str) -> bool {
 }
 
 fn finished(pod: &Pod) -> Option<(TaskState, String, Option<i32>)> {
-    let done: Vec<&(i32, String)> = pod
+    let done: Vec<&files::Done> = pod
         .members
         .iter()
         .map(|m| m.done.as_ref())
         .collect::<Option<_>>()?;
-    match done.into_iter().find(|(c, _)| *c != 0) {
+    match done.into_iter().find(|d| d.failed) {
         None => Some((
             TaskState::Complete,
             "all containers exited successfully".into(),
             Some(0),
         )),
-        Some((code, what)) => Some((TaskState::Failed, what.clone(), Some(*code))),
+        Some(d) => Some((TaskState::Failed, d.what.clone(), Some(d.code))),
     }
 }
 
@@ -1268,15 +1319,11 @@ pub(crate) async fn teardown<R: Runtime, C: Control>(
         .iter()
         .find(|c| c.labels.get(LABEL_ROLE).map(String::as_str) == Some(Role::Infra.as_str()))
         .map(|c| c.id.clone());
-    let mut jails = Vec::new();
     for c in found.iter().filter(|c| Some(&c.id) != infra.as_ref()) {
         if c.state == "running"
             && let Err(e) = ctx.runtime.stop(&c.id, grace).await
         {
             tracing::warn!(container = %c.name(), "stopping: {e}");
-        }
-        if let Some(infra) = &infra {
-            jails.push(pod::child_jail(infra, &c.id));
         }
     }
     if let Some(root) = ctx.logs_dir.as_ref().filter(|_| keep) {
@@ -1287,11 +1334,10 @@ pub(crate) async fn teardown<R: Runtime, C: Control>(
             .collect();
         output::save(ctx.runtime.as_ref(), root, uid, &containers).await;
     }
-    if let Some(infra) = &infra {
-        if let Err(e) = ctx.runtime.stop(infra, Duration::from_secs(1)).await {
-            tracing::warn!("stopping the infra container: {e}");
-        }
-        jails.push(infra.clone());
+    if let Some(infra) = &infra
+        && let Err(e) = ctx.runtime.stop(infra, Duration::from_secs(1)).await
+    {
+        tracing::warn!("stopping the infra container: {e}");
     }
     // The network goes once the containers have stopped, which they may
     // need it for; destroying the epair's host end removes both ends, even
@@ -1310,12 +1356,31 @@ pub(crate) async fn teardown<R: Runtime, C: Control>(
             .remove(uid);
         ctx.guarding.detach(uid);
     }
+    // The infra container last, once the rest are gone: a teardown tried
+    // again finds it, and with it the jails whose limits are still to go.
     let mut left = Vec::new();
-    for c in &found {
-        if let Err(e) = ctx.runtime.remove(&c.id).await
-            && !e.is_not_found()
-        {
-            left.push(format!("{}: {e}", c.name()));
+    let members = found.iter().filter(|c| Some(&c.id) != infra.as_ref());
+    for c in members.chain(found.iter().filter(|c| Some(&c.id) == infra.as_ref())) {
+        if Some(&c.id) == infra.as_ref() && !left.is_empty() {
+            break;
+        }
+        match ctx.runtime.remove(&c.id).await {
+            Err(e) if !e.is_not_found() => {
+                left.push(format!("{}: {e}", c.name()));
+                continue;
+            }
+            _ => {}
+        }
+        // Its limits go with it, as a teardown tried again no longer
+        // finds it.
+        let jail = match &infra {
+            Some(infra) if *infra == c.id => infra.clone(),
+            Some(infra) => pod::child_jail(infra, &c.id),
+            None => continue,
+        };
+        let removed = blocking(&ctx.sys, move |sys| sys.rctl_remove_jail(&jail)).await;
+        if let Err(e) = removed {
+            tracing::warn!(uid, "removing limits: {e}");
         }
     }
     if !left.is_empty() {
@@ -1325,13 +1390,6 @@ pub(crate) async fn teardown<R: Runtime, C: Control>(
     // its limit.
     if let Some(infra) = &infra {
         ctx.memory.removed(infra);
-    }
-    let result = blocking(&ctx.sys, move |sys| {
-        jails.iter().try_for_each(|j| sys.rctl_remove_jail(j))
-    })
-    .await;
-    if let Err(e) = result {
-        tracing::warn!(uid, "removing limits: {e}");
     }
     // Volumes first: what they record is in the task's directory.
     volumes::release(ctx.control.as_ref(), &ctx.sys, &ctx.places(), uid)
