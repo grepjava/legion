@@ -35,7 +35,13 @@ tower-layer.workspace = true
 tower-service.workspace = true
 tracing.workspace = true
 
+[features]
+# Pause points for tests that drive races; never in a release build.
+test-hooks = []
+
 [dev-dependencies]
+# Its own integration tests get the pause points.
+legion-manager = { path = ".", features = ["test-hooks"] }
 hyper = { workspace = true, features = ["http1", "server"] }
 rcgen.workspace = true
 legion-pki.workspace = true

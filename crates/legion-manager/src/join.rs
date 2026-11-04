@@ -184,7 +184,7 @@ impl Issuer {
         let node = ObjectKey::new(Kind::Node, "", &req.name);
         let in_cluster = || {
             Status::already_exists(format!(
-                "node {0} is in the cluster; delete its Node (`legion delete node {0}`) to join                  it again",
+                "node {0} is in the cluster; delete its Node (`legion delete node {0}`) to join it again",
                 req.name
             ))
         };
@@ -197,54 +197,25 @@ impl Issuer {
         if registered(&self.store)? {
             return Err(in_cluster());
         }
+        if role == Role::Manager && (req.node_id == 0 || req.advertise.is_empty()) {
+            return Err(Status::invalid_argument(
+                "a manager joins with its node id and advertised address",
+            ));
+        }
         let id = Identity::new(&req.name, role);
-        let certify = || {
-            self.ca
-                .sign(&req.csr_pem, &id, CERT_LIFETIME)
-                .map_err(|e| Status::invalid_argument(format!("certificate request: {e}")))
-        };
         // A bad request is refused before anything is written.
-        certify()?;
-        let cert_pem = self
-            .certify_alone(
-                api,
-                &req.name,
-                certify,
-                || registered(&self.store),
-                in_cluster,
-            )
-            .await?;
+        self.ca
+            .sign(&req.csr_pem, &id, CERT_LIFETIME)
+            .map_err(|e| Status::invalid_argument(format!("certificate request: {e}")))?;
+        // Run to the end even if the caller goes: stopped between its
+        // writes, it would leave the name's earlier certificates refused
+        // for a join that did not happen.
+        let (issuer, api, task_req) = (self.clone(), api.clone(), req.clone());
+        let cert_pem = tokio::spawn(async move { issuer.admit(&api, &task_req, role).await })
+            .await
+            .map_err(|e| Status::internal(e.to_string()))??;
         let mut ca_key_pem = String::new();
         if role == Role::Manager {
-            if req.node_id == 0 || req.advertise.is_empty() {
-                return Err(Status::invalid_argument(
-                    "a manager joins with its node id and advertised address",
-                ));
-            }
-            // Raft takes one membership change at a time: wait for the one
-            // in flight (another manager joining or being promoted), which
-            // takes a few round trips.
-            let deadline = tokio::time::Instant::now() + MEMBERSHIP_WAIT;
-            loop {
-                let node = BasicNode {
-                    addr: req.advertise.clone(),
-                };
-                let add = self.store.raft.add_learner(req.node_id, node, false);
-                let added = tokio::time::timeout(crate::COMMIT_TIMEOUT, add)
-                    .await
-                    .map_err(|_| crate::no_quorum())?;
-                match added {
-                    Ok(_) => break,
-                    Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(
-                        ChangeMembershipError::InProgress(_),
-                    ))) if tokio::time::Instant::now() < deadline => {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                    }
-                    Err(e) => {
-                        return Err(Status::unavailable(format!("adding the manager: {e}")));
-                    }
-                }
-            }
             ca_key_pem = self.ca.key_pem().to_owned();
         }
         tracing::info!(%id, node_id = req.node_id, advertise = %req.advertise, "node joined");
@@ -258,6 +229,73 @@ impl Issuer {
 }
 
 impl Issuer {
+    /// Certifies the node `req` joins, alone, and adds a manager to Raft
+    /// as a learner; undoes the certifying's record if that fails.
+    async fn admit(
+        &self,
+        api: &crate::api::ApiService,
+        req: &JoinRequest,
+        role: Role,
+    ) -> Result<String, Status> {
+        let node = ObjectKey::new(Kind::Node, "", &req.name);
+        let in_cluster = || {
+            Status::already_exists(format!(
+                "node {0} is in the cluster; delete its Node (`legion delete node {0}`) to join it again",
+                req.name
+            ))
+        };
+        let registered = || {
+            self.store
+                .get(&node)
+                .map(|n| n.is_some())
+                .map_err(|e| Status::internal(e.to_string()))
+        };
+        let id = Identity::new(&req.name, role);
+        let certify = || {
+            self.ca
+                .sign(&req.csr_pem, &id, CERT_LIFETIME)
+                .map_err(|e| Status::invalid_argument(format!("certificate request: {e}")))
+        };
+        let (cert_pem, recorded) = self
+            .certify_alone(api, &req.name, certify, registered, in_cluster)
+            .await?;
+        if role == Role::Manager
+            && let Err(e) = self.add_learner(req).await
+        {
+            undo(api, &req.name, recorded).await;
+            return Err(e);
+        }
+        Ok(cert_pem)
+    }
+
+    /// Adds the manager `req` joins to Raft as a learner.
+    async fn add_learner(&self, req: &JoinRequest) -> Result<(), Status> {
+        // Raft takes one membership change at a time: wait for the one in
+        // flight (another manager joining or being promoted), which takes
+        // a few round trips.
+        let deadline = tokio::time::Instant::now() + MEMBERSHIP_WAIT;
+        loop {
+            let node = BasicNode {
+                addr: req.advertise.clone(),
+            };
+            let add = self.store.raft.add_learner(req.node_id, node, false);
+            let added = tokio::time::timeout(crate::COMMIT_TIMEOUT, add)
+                .await
+                .map_err(|_| crate::no_quorum())?;
+            match added {
+                Ok(_) => return Ok(()),
+                Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(
+                    ChangeMembershipError::InProgress(_),
+                ))) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => {
+                    return Err(Status::unavailable(format!("adding the manager: {e}")));
+                }
+            }
+        }
+    }
+
     /// The certificate `certify` makes for `node`, the only one of it in
     /// use: every earlier one, from a join whose node has not registered
     /// (two joins of a name before either registers would each get one),
@@ -267,6 +305,9 @@ impl Issuer {
     /// second later, covers it; one issued later than that is not handed
     /// out. Refused if the name is joined again or removed meanwhile, or
     /// registered by then (`in_cluster`).
+    /// Its record is undone if it fails (or the name turns out to be in
+    /// the cluster); returned with the certificate, for the caller to undo
+    /// if what follows fails.
     async fn certify_alone(
         &self,
         api: &crate::api::ApiService,
@@ -274,33 +315,65 @@ impl Issuer {
         certify: impl Fn() -> Result<String, Status>,
         registered: impl Fn() -> Result<bool, Status>,
         in_cluster: impl Fn() -> Status,
-    ) -> Result<String, Status> {
-        for _ in 0..3 {
-            let recorded = crate::removed::supersede(api, node).await?;
-            crate::removed::issue_after(&self.store, node).await?;
-            let cert_pem = certify()?;
-            let issued = issued_second(&cert_pem)?;
-            if issued != recorded.at() + 1 {
-                // Too late: the next record refuses it.
-                continue;
+    ) -> Result<(String, crate::removed::Recorded), Status> {
+        // What undoes every record made so far: a retry's record replaces
+        // the one before it.
+        let mut made: Option<crate::removed::Recorded> = None;
+        let certified = async {
+            for _ in 0..3 {
+                let recorded = crate::removed::supersede(api, node).await?;
+                let recorded = match made {
+                    Some(earlier) => recorded.after(earlier),
+                    None => recorded,
+                };
+                made = Some(recorded);
+                crate::removed::issue_after(&self.store, node).await?;
+                let cert_pem = certify()?;
+                let issued = issued_second(&cert_pem)?;
+                if issued != recorded.at() + 1 {
+                    // Too late: the next record refuses it.
+                    continue;
+                }
+                api.consistent().await?;
+                if crate::removed::at(&self.store, node)? != Some(recorded.at()) {
+                    return Err(Status::aborted(format!(
+                        "node {node} is joining again or being removed; retry"
+                    )));
+                }
+                // Registered by an earlier join's node between the check
+                // and the record: that node keeps its name.
+                if registered()? {
+                    return Err(in_cluster());
+                }
+                return Ok((cert_pem, recorded));
             }
-            api.consistent().await?;
-            if crate::removed::at(&self.store, node)? != Some(recorded.at()) {
-                return Err(Status::aborted(format!(
-                    "node {node} is joining again or being removed; retry"
-                )));
-            }
-            // Registered by an earlier join's node between the check and
-            // the record: that node keeps its name.
-            if registered()? {
-                crate::removed::forget(api, node, recorded).await?;
-                return Err(in_cluster());
-            }
-            return Ok(cert_pem);
+            Err(Status::unavailable(format!(
+                "certifying node {node} keeps taking too long; retry"
+            )))
         }
-        Err(Status::unavailable(format!(
-            "certifying node {node} keeps taking too long; retry"
-        )))
+        .await;
+        if certified.is_err()
+            && let Some(recorded) = made
+        {
+            undo(api, node, recorded).await;
+        }
+        certified
+    }
+}
+
+/// Undoes a join's record of `node`, which certified nothing, tried a few
+/// times; a failure leaves the name's earlier certificates refused, for
+/// them to join again.
+async fn undo(api: &crate::api::ApiService, node: &str, recorded: crate::removed::Recorded) {
+    const TRIES: u32 = 3;
+    for tried in 1..=TRIES {
+        match crate::removed::forget(api, node, recorded).await {
+            Ok(()) => return,
+            Err(e) if tried == TRIES => {
+                tracing::warn!(node, error = %e, "could not undo a failed join's record of the node");
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(250 * u64::from(tried))).await,
+        }
     }
 }
 

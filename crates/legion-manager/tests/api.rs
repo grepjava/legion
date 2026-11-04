@@ -278,7 +278,10 @@ async fn single_manager_crud_and_watch() {
     forged.status_json = br#"{"update":{"state":"completed"}}"#.to_vec();
     api.apply(apply(forged)).await.unwrap();
     let key = legion_api::ObjectKey::new(legion_api::Kind::Service, "default", "forged");
-    assert!(m.store.get(&key).unwrap().unwrap().status.is_null());
+    // The Service controller may write a status of its own meanwhile; the
+    // forged update is never part of it.
+    let status = m.store.get(&key).unwrap().unwrap().status;
+    assert!(status.get("update").is_none(), "{status}");
     api.delete(DeleteRequest {
         r#ref: Some(ObjectRef {
             kind: "Service".into(),
@@ -450,7 +453,26 @@ async fn form_cluster(managers: &[Running]) {
         .nodes()
         .map(|(id, _)| *id)
         .collect();
-    leader_raft.change_membership(ids, false).await.unwrap();
+    leader_raft
+        .change_membership(ids.clone(), false)
+        .await
+        .unwrap();
+    // Every manager knows the cluster before the test talks to it: one
+    // that has not yet heard the membership says it is in none.
+    for m in managers {
+        m.store
+            .raft
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |x| {
+                    x.current_leader.is_some()
+                        && x.membership_config.membership().voter_ids().count() == ids.len()
+                },
+                "know the leader and every voter",
+            )
+            .await
+            .unwrap();
+    }
 }
 
 /// A log of objects near the size limit, more of them than one message
@@ -508,7 +530,8 @@ async fn a_new_manager_catches_up_on_a_log_of_large_objects() {
     let applied = leader.metrics().borrow().last_applied;
     let mut caught_up = second.store.raft.metrics();
     tokio::time::timeout(
-        Duration::from_secs(30),
+        // Some 70 MB to apply: generous for a small, slow test host.
+        Duration::from_secs(180),
         caught_up.wait_for(|m| m.last_applied >= applied),
     )
     .await
@@ -811,9 +834,21 @@ async fn nodes_join_with_tokens() {
     // A worker gets a worker certificate and no CA key.
     let worker_token = token("worker", false).await;
     assert_ne!(worker_token, manager_token);
-    let worker = legion_manager::join(&second.addr, &worker_token, "w1", 0, "")
-        .await
-        .unwrap();
+    // Through a follower, which may not know the leader for a moment.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let worker = loop {
+        match legion_manager::join(&second.addr, &worker_token, "w1", 0, "").await {
+            Ok(j) => break j,
+            Err(e)
+                if e.downcast_ref::<tonic::Status>()
+                    .is_some_and(|s| s.code() == Code::Unavailable)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
     assert_eq!(worker.role, Role::Worker);
     assert!(worker.tls.ca_key_pem.is_none());
     let bundle = legion_pki::Bundle {
@@ -1119,6 +1154,203 @@ async fn a_name_joined_twice_keeps_only_the_newest_certificate() {
         .unwrap_err();
     assert!(err.to_string().contains("w7 is in the cluster"), "{err}");
     register(dispatcher(&second.tls).await).await.unwrap();
+    m.stop().await;
+}
+
+/// A join of a name that fails certifies nothing, and refuses nothing:
+/// the certificate an earlier join gave the name stays good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_join_leaves_the_names_certificate_good() {
+    let ca = Ca::generate().unwrap();
+    let m = Running::start_with(Some(&ca)).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let token = |role: &str| {
+        let m = &m;
+        let role = role.to_owned();
+        async move {
+            m.cluster()
+                .await
+                .join_token(JoinTokenRequest {
+                    role,
+                    rotate: false,
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .token
+        }
+    };
+    let joined = legion_manager::join(&m.addr, &token("worker").await, "w8", 0, "")
+        .await
+        .unwrap();
+    // A manager joins with its Raft id and address: without, it is
+    // refused, and the name's record is left as it was.
+    let err = legion_manager::join(&m.addr, &token("manager").await, "w8", 0, "")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("node id"), "{err}");
+    let creds = client_config(
+        &joined.tls.ca_pem,
+        &joined.tls.cert_pem,
+        &joined.tls.key_pem,
+    );
+    DispatcherClient::new(m.channel(Some(&creds)).await.unwrap())
+        .register(RegisterRequest {
+            node: String::new(),
+            status_json: br#"{"state":"ready"}"#.to_vec(),
+            role: String::new(),
+        })
+        .await
+        .unwrap();
+    m.stop().await;
+}
+
+/// The Delete request for Node `name`.
+fn delete_node(name: &str) -> DeleteRequest {
+    DeleteRequest {
+        r#ref: Some(ObjectRef {
+            kind: "Node".into(),
+            namespace: String::new(),
+            name: name.into(),
+        }),
+        expected_version: None,
+    }
+}
+
+/// A second registration of a worker, checked before the worker is removed
+/// and making its Node after, does not bring it back: refused, and the Node
+/// it made goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_registration_checked_before_a_removal_does_not_bring_the_node_back() {
+    let ca = Ca::generate().unwrap();
+    let m = Running::start_with(Some(&ca)).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let w = DispatcherClient::new(
+        m.channel(Some(&creds(&ca, "w9", Role::Worker)))
+            .await
+            .unwrap(),
+    );
+    let register = |mut d: DispatcherClient<Channel>| async move {
+        d.register(RegisterRequest {
+            node: String::new(),
+            status_json: br#"{"state":"ready"}"#.to_vec(),
+            role: String::new(),
+        })
+        .await
+    };
+    let mut paused = legion_manager::hooks::arm("register-create", "w9");
+    let late = tokio::spawn(register(w.clone()));
+    paused.reached().await;
+    // The other registration goes through, and then the node is removed.
+    register(w.clone()).await.unwrap();
+    assert_eq!(node_state(&m, "w9").as_deref(), Some("ready"));
+    m.objects().await.delete(delete_node("w9")).await.unwrap();
+    paused.release();
+    let err = late.await.unwrap().unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied, "{err}");
+    let key = legion_api::ObjectKey::new(legion_api::Kind::Node, "", "w9");
+    assert!(m.store.get(&key).unwrap().is_none(), "the node came back");
+    m.stop().await;
+}
+
+/// A renewal checked before its node is removed, and signed after, gives
+/// no certificate: one signed the second after the removal would pass it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_renewal_signed_after_its_node_is_removed_is_not_handed_out() {
+    let ca = Ca::generate().unwrap();
+    let m = Running::start_with(Some(&ca)).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let mut w = DispatcherClient::new(
+        m.channel(Some(&creds(&ca, "w10", Role::Worker)))
+            .await
+            .unwrap(),
+    );
+    w.register(RegisterRequest {
+        node: String::new(),
+        status_json: br#"{"state":"ready"}"#.to_vec(),
+        role: String::new(),
+    })
+    .await
+    .unwrap();
+    let mut paused = legion_manager::hooks::arm("renew-checked", "w10");
+    let (_, csr_pem) = legion_pki::request().unwrap();
+    let renewing = tokio::spawn({
+        let mut w = w.clone();
+        async move { w.renew(RenewRequest { csr_pem }).await }
+    });
+    paused.reached().await;
+    m.objects().await.delete(delete_node("w10")).await.unwrap();
+    // Signed in a later second than the removal.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    paused.release();
+    let err = renewing.await.unwrap().unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied, "{err}");
+    assert!(err.message().contains("while renewing"), "{err}");
+    m.stop().await;
+}
+
+/// A session with a task stopped before it was placed, asked for by the
+/// task's own name, is refused at once: its node never had it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_with_a_task_never_placed_is_refused() {
+    let m = Running::start().await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    apply_json(
+        &m,
+        "Service",
+        "web",
+        serde_json::json!({
+            "replicas": 1,
+            "pod": { "containers": [{ "name": "app", "image": "app:1" }] },
+        }),
+    )
+    .await;
+    let key = legion_api::ObjectKey::new(legion_api::Kind::Service, "default", "web");
+    let web = m.store.get(&key).unwrap().unwrap();
+    let mut task = legion_api::Object::new(
+        legion_api::Kind::Task,
+        "default",
+        "web-1-9",
+        serde_json::json!({
+            "service": "web",
+            "serviceUid": web.metadata.uid,
+            "serviceGeneration": web.metadata.generation,
+            "slot": 1,
+            "node": "n1",
+            "desiredState": "shutdown",
+            "pod": { "containers": [{ "name": "app", "image": "app:1" }] },
+        }),
+    );
+    task.status = serde_json::json!({
+        "state": "shutdown",
+        "message": legion_manager::controller::plan::NEVER_PLACED,
+    });
+    m.store
+        .raft
+        .client_write(legion_store::Command::Put {
+            object: task,
+            precondition: legion_store::Precondition::None,
+        })
+        .await
+        .unwrap();
+    let open = SessionFrame {
+        frame: Some(Frame::Open(SessionOpen {
+            namespace: "default".into(),
+            task: "web-1-9".into(),
+            container: String::new(),
+            action: Some(Action::Logs(LogsOptions::default())),
+        })),
+    };
+    let mut pods = PodsClient::new(m.channel(None).await.unwrap());
+    let refused = tokio::time::timeout(
+        Duration::from_secs(5),
+        pods.session(tokio_stream::iter([open])),
+    )
+    .await
+    .expect("refused at once, not offered to the node")
+    .unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+    assert!(refused.message().contains("never ran"), "{refused}");
     m.stop().await;
 }
 
@@ -2815,6 +3047,111 @@ async fn a_volume_in_use_keeps_its_storage() {
     })
     .await;
     let err = try_apply(lun("iqn.2026-11.test:c")).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+    assert!(err.message().contains("mounted by task"), "{err}");
+    m.stop().await;
+}
+
+/// A Volume in use is not deleted: it would come back unheld, for another
+/// node to attach while the first still writes to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_volume_in_use_is_not_deleted() {
+    use legion_api::{Kind, Object as Stored, ObjectKey};
+    let m = Running::start().await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let objects = m.objects().await;
+    let delete = |name: &str| {
+        let mut objects = objects.clone();
+        let name = name.to_owned();
+        async move {
+            objects
+                .delete(DeleteRequest {
+                    r#ref: Some(ObjectRef {
+                        kind: "Volume".into(),
+                        namespace: "default".into(),
+                        name,
+                    }),
+                    expected_version: None,
+                })
+                .await
+        }
+    };
+    let put = |object: Stored| {
+        let raft = m.store.raft.clone();
+        async move {
+            raft.client_write(legion_store::Command::Put {
+                object,
+                precondition: legion_store::Precondition::None,
+            })
+            .await
+            .unwrap();
+        }
+    };
+    let hold = |name: &str, node: &str| {
+        let key = ObjectKey::new(Kind::Volume, "default", name);
+        let mut v = m.store.get(&key).unwrap().unwrap();
+        v.status = serde_json::json!({ "node": node });
+        v
+    };
+    let lun = serde_json::json!({
+        "driver": "iscsi",
+        "iscsi": { "portal": "192.0.2.5", "target": "iqn.2026-11.test:a", "lun": 0 },
+    });
+
+    // A LUN held by a node of the cluster stays.
+    put(Stored::new(Kind::Node, "", "w1", serde_json::json!({}))).await;
+    apply_json(&m, "Volume", "lun", lun.clone()).await;
+    put(hold("lun", "w1")).await;
+    let err = delete("lun").await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+    assert!(err.message().contains("held by node w1"), "{err}");
+    let key = ObjectKey::new(Kind::Volume, "default", "lun");
+    assert!(m.store.get(&key).unwrap().is_some());
+
+    // Once that node is removed, it may go.
+    m.store
+        .raft
+        .client_write(legion_store::Command::Delete {
+            key: ObjectKey::new(Kind::Node, "", "w1"),
+            precondition: legion_store::Precondition::None,
+        })
+        .await
+        .unwrap();
+    delete("lun").await.unwrap();
+
+    // A ZFS volume keeps its node, and goes once nothing mounts it.
+    apply_json(&m, "Volume", "data", serde_json::json!({})).await;
+    put(Stored::new(Kind::Node, "", "w2", serde_json::json!({}))).await;
+    put(hold("data", "w2")).await;
+    delete("data").await.unwrap();
+
+    // Mounted by a task that has not ended, no volume goes.
+    apply_json(&m, "Volume", "lun", lun).await;
+    apply_json(
+        &m,
+        "Service",
+        "db",
+        serde_json::json!({
+            "replicas": 1,
+            "pod": {
+                "containers": [{
+                    "name": "db", "image": "db:1",
+                    "volumeMounts": [{ "name": "data", "path": "/data" }],
+                }],
+                "volumes": [{ "name": "data", "volume": { "name": "lun" } }],
+            },
+        }),
+    )
+    .await;
+    until("its task", || {
+        !m.store
+            .list(Kind::Task, Some("default"))
+            .unwrap()
+            .objects
+            .is_empty()
+    })
+    .await;
+    let err = delete("lun").await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
     assert!(err.message().contains("mounted by task"), "{err}");
     m.stop().await;

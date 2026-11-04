@@ -89,8 +89,14 @@ struct Wanted {
     /// The first route's.
     acme: RouteAcme,
     routes: Vec<ObjectKey>,
-    /// The most failed of its routes'.
+    /// Each route's generation, as seen: its status is for that.
+    generations: BTreeMap<ObjectKey, u64>,
+    /// The most failed of its routes', with no backoff if one of them has
+    /// changed since it failed.
     status: AcmeStatus,
+    /// A route of the namespace with a certificate of its own in the
+    /// Secret, which is not written over.
+    manual: Option<String>,
 }
 
 /// What is to be done about a [`Wanted`].
@@ -199,8 +205,17 @@ async fn pass(store: &Store, accounts: &mut Accounts, now: SystemTime) -> Durati
         if let Some(at) = status.retry_at.as_deref().and_then(clock::parse) {
             until(UNIX_EPOCH + Duration::from_secs(at.max(0) as u64));
         }
-        if let Err(e) = set_status(store, &w.routes, |s| *s = status.clone()).await {
-            tracing::warn!("writing a route's status: {e}");
+        for key in &w.routes {
+            let generation = w.generations.get(key).copied().unwrap_or_default();
+            let status = AcmeStatus {
+                generation,
+                ..status.clone()
+            };
+            if let Err(e) =
+                set_status(store, std::slice::from_ref(key), |s| *s = status.clone()).await
+            {
+                tracing::warn!("writing a route's status: {e}");
+            }
         }
     }
     next
@@ -259,7 +274,19 @@ fn wanted_of(routes: Vec<Object>) -> (Vec<Wanted>, Vec<ObjectKey>) {
             .iter()
             .map(|(o, spec)| (o.metadata.namespace.as_str(), spec.host.as_str())),
     );
+    // Secrets routes hold certificates of their own in.
+    let manual: BTreeMap<(String, String), String> = routes
+        .iter()
+        .filter_map(|(o, spec)| {
+            let tls = spec.tls.as_ref().filter(|t| t.acme.is_none())?;
+            Some((
+                (o.metadata.namespace.clone(), tls.secret.clone()),
+                o.metadata.name.clone(),
+            ))
+        })
+        .collect();
     let mut by_secret: BTreeMap<(String, String), Wanted> = BTreeMap::new();
+    let mut edited = BTreeSet::new();
     let mut stale = Vec::new();
     for (o, spec) in routes {
         let status: RouteStatus = serde_json::from_value(o.status.clone()).unwrap_or_default();
@@ -275,23 +302,39 @@ fn wanted_of(routes: Vec<Object>) -> (Vec<Wanted>, Vec<ObjectKey>) {
         };
         let status = status.acme.unwrap_or_default();
         let namespace = o.metadata.namespace.clone();
-        let w = by_secret
-            .entry((namespace.clone(), secret.clone()))
-            .or_insert_with(|| Wanted {
-                namespace,
-                secret,
-                hosts: BTreeSet::new(),
-                acme,
-                routes: Vec::new(),
-                status: status.clone(),
-            });
+        let by = (namespace.clone(), secret.clone());
+        // Changed since its status was written (a status from before
+        // generations were kept says nothing).
+        if status.generation != 0 && status.generation != o.metadata.generation {
+            edited.insert(by.clone());
+        }
+        let w = by_secret.entry(by.clone()).or_insert_with(|| Wanted {
+            namespace,
+            secret,
+            hosts: BTreeSet::new(),
+            acme,
+            routes: Vec::new(),
+            generations: BTreeMap::new(),
+            status: status.clone(),
+            manual: manual.get(&by).cloned(),
+        });
         // The routes' statuses agree once written; until then, as one
         // added since has none, the most failed holds: its backoff stands.
         if status.failures > w.status.failures {
             w.status = status;
         }
         w.hosts.insert(spec.host);
+        w.generations.insert(o.key(), o.metadata.generation);
         w.routes.push(o.key());
+    }
+    // A route changed since the failure, as to fix it, is tried at once.
+    for by in edited {
+        if let Some(w) = by_secret.get_mut(&by) {
+            w.status = AcmeStatus {
+                not_after: w.status.not_after.take(),
+                ..Default::default()
+            };
+        }
     }
     (by_secret.into_values().collect(), stale)
 }
@@ -319,6 +362,12 @@ fn due(store: &Store, w: &Wanted, now: SystemTime) -> Result<(Due, Option<u64>),
 }
 
 fn due_of(data: Option<Vec<u8>>, w: &Wanted, now: SystemTime) -> Due {
+    if let Some(route) = &w.manual {
+        return Due::Refused(format!(
+            "Secret {}/{} is route {route}'s own certificate, so it is not written over",
+            w.namespace, w.secret
+        ));
+    }
     if let Some(data) = &data
         && !data
             .windows(CERTIFICATE.len())
@@ -829,6 +878,75 @@ mod tests {
         assert!(w.status.retry_at.is_some());
         assert_eq!(w.hosts.len(), 2);
         assert_eq!(stale, vec![ObjectKey::new(Kind::Route, "shop", "c")]);
+    }
+
+    #[test]
+    fn a_route_changed_since_it_failed_is_tried_at_once() {
+        let route = |generation: u64, failed_at: u64| {
+            let mut o = Object::new(
+                Kind::Route,
+                "shop",
+                "www",
+                serde_json::json!({
+                    "host": "www.example.org", "service": "web",
+                    "tls": {"secret": "cert", "acme": {}},
+                }),
+            );
+            o.metadata.generation = generation;
+            o.status = serde_json::json!({"acme": {
+                "failures": 3, "retryAt": "2026-11-04T10:00:00Z", "generation": failed_at,
+            }});
+            o
+        };
+        let (wanted, _) = wanted_of(vec![route(2, 2)]);
+        assert_eq!(wanted[0].status.failures, 3);
+        assert!(wanted[0].status.retry_at.is_some());
+        // Edited since: as to fix what failed.
+        let (wanted, _) = wanted_of(vec![route(3, 2)]);
+        assert_eq!(wanted[0].status.failures, 0);
+        assert_eq!(wanted[0].status.retry_at, None);
+        assert_eq!(
+            wanted[0].generations.values().copied().collect::<Vec<_>>(),
+            [3]
+        );
+        // A status from before generations were kept holds.
+        let (wanted, _) = wanted_of(vec![route(3, 0)]);
+        assert_eq!(wanted[0].status.failures, 3);
+    }
+
+    #[test]
+    fn a_secret_a_route_brings_its_own_certificate_in_is_not_ordered_into() {
+        let route = |name: &str, host: &str, tls: serde_json::Value| {
+            Object::new(
+                Kind::Route,
+                "shop",
+                name,
+                serde_json::json!({"host": host, "service": "web", "tls": tls}),
+            )
+        };
+        let (wanted, _) = wanted_of(vec![
+            route(
+                "auto",
+                "a.example.org",
+                serde_json::json!({"secret": "shared", "acme": {}}),
+            ),
+            route(
+                "own",
+                "b.example.org",
+                serde_json::json!({"secret": "shared"}),
+            ),
+            route(
+                "alone",
+                "c.example.org",
+                serde_json::json!({"secret": "c", "acme": {}}),
+            ),
+        ]);
+        let by = |secret: &str| wanted.iter().find(|w| w.secret == secret).unwrap();
+        match due_of(None, by("shared"), SystemTime::now()) {
+            Due::Refused(why) => assert!(why.contains("route own's own certificate"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(due_of(None, by("c"), SystemTime::now()), Due::Now);
     }
 
     #[test]

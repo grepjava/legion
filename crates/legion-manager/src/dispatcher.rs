@@ -322,12 +322,30 @@ impl DispatcherService {
         };
         for _ in 0..ATTEMPTS {
             let existing = self.get(&key)?;
-            if existing.is_none() {
-                // Its Node deleted since its certificate was checked: the
-                // removal, recorded first, is in this replica's store now.
-                if let Some(issued) = issued {
-                    crate::removed::check(self.store(), name, issued)?;
+            // Its Node deleted since its certificate was checked: the
+            // removal, recorded first, is in this replica's store now. Asked
+            // on every pass, as a Node may be back by then: made by another
+            // registration of the node, checked before the removal and
+            // written after it. Still unknown, nothing else has taken it
+            // over, and it goes again.
+            if let Some(issued) = issued
+                && let Err(refused) = crate::removed::check(self.store(), name, issued)
+            {
+                if let Some(node) = &existing
+                    && serde_json::from_value::<NodeStatus>(node.status.clone())
+                        .is_ok_and(|s| s.state == NodeState::Unknown)
+                {
+                    let _ = self
+                        .api
+                        .write(Command::Delete {
+                            key: key.clone(),
+                            precondition: Precondition::Version(node.metadata.version),
+                        })
+                        .await;
                 }
+                return Err(refused);
+            }
+            if existing.is_none() {
                 // The Node comes before its subnet's reservation, so a
                 // reservation without a Node is never one being made and
                 // may be reused. Its state is unknown, and it takes no
@@ -339,6 +357,8 @@ impl DispatcherService {
                 let spec = serde_json::to_value(spec).map_err(internal)?;
                 let mut node = Object::new(Kind::Node, "", name, spec);
                 node.status = serde_json::to_value(NodeStatus::default()).map_err(internal)?;
+                #[cfg(feature = "test-hooks")]
+                crate::hooks::pause("register-create", name).await;
                 match self.write(node, Precondition::MustNotExist).await? {
                     Outcome::Written(_) | Outcome::Conflict { .. } => continue,
                     other => return Err(unexpected(other)),
@@ -853,10 +873,25 @@ impl Dispatcher for DispatcherService {
             Some((_, issued)) => Some(*issued),
             None => crate::tls::caller_issued(&req, self.tls)?,
         };
+        // The removal checked against is the one compared with after
+        // signing: read once, so none can come between the two.
+        let checked = crate::removed::at(self.store(), &id.name)?;
         if let Some(issued) = issued {
-            crate::removed::check(self.store(), &id.name, issued)?;
+            crate::removed::check_against(checked, &id.name, issued)?;
         }
+        #[cfg(feature = "test-hooks")]
+        crate::hooks::pause("renew-checked", &id.name).await;
         let cert_pem = self.api.renew(&req.get_ref().csr_pem, &id)?;
+        // A removal recorded since the check may predate the new
+        // certificate by a second, and not refuse it: not handed out then.
+        // One recorded later refuses it.
+        self.api.consistent().await?;
+        if crate::removed::at(self.store(), &id.name)? != checked {
+            return Err(Status::permission_denied(format!(
+                "node {} was removed from the cluster, or joined again, while renewing; to come back it joins again",
+                id.name
+            )));
+        }
         tracing::info!(%id, "renewed a worker's certificate");
         Ok(Response::new(RenewResponse { cert_pem }))
     }

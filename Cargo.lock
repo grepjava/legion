@@ -1628,6 +1628,7 @@ dependencies = [
  "hyper-util",
  "instant-acme",
  "legion-api",
+ "legion-manager",
  "legion-net",
  "legion-pki",
  "legion-proto",

@@ -336,7 +336,6 @@ fn check_host(store: &Store, next: &Object) -> Result<(), Status> {
 /// that has not ended mounts it. Agents keep what they mounted, so the
 /// change would not reach them.
 fn check_storage(store: &Store, cur: &Object, next: &Object) -> Result<(), Status> {
-    use legion_api::task::{TaskSpec, TaskStatus};
     use legion_api::volume::{VolumeSpec, VolumeStatus};
     if cur.kind != Kind::Volume {
         return Ok(());
@@ -358,6 +357,15 @@ fn check_storage(store: &Store, cur: &Object, next: &Object) -> Result<(), Statu
     if !status.node.is_empty() {
         return refuse(format!("is held by node {}", status.node));
     }
+    if let Some(task) = mounted_by(store, cur)? {
+        return refuse(format!("is mounted by task {task}"));
+    }
+    Ok(())
+}
+
+/// A task that has not ended and mounts the Volume `cur`, if any.
+fn mounted_by(store: &Store, cur: &Object) -> Result<Option<String>, Status> {
+    use legion_api::task::{TaskSpec, TaskStatus};
     let tasks = store
         .list(Kind::Task, Some(&cur.metadata.namespace))
         .map_err(internal)?;
@@ -369,10 +377,46 @@ fn check_storage(store: &Store, cur: &Object, next: &Object) -> Result<(), Statu
             continue;
         };
         if !state.state.is_terminal() && spec.uses_volume(&cur.metadata.name) {
-            return refuse(format!("is mounted by task {}", t.metadata.name));
+            return Ok(Some(t.metadata.name.clone()));
         }
     }
-    Ok(())
+    Ok(None)
+}
+
+/// Refuses to delete a Volume in use, and returns the version checked, for
+/// the delete to be made on: a task that has not ended mounts it, or a
+/// node still in the cluster holds the LUN or plugin volume it attached.
+/// Deleted then, it would come back unheld, for another node to attach
+/// while the first still writes to it. (A ZFS volume's node keeps its
+/// dataset whatever its tasks do, and the Volume may go once they have.)
+fn check_volume_delete(store: &Store, key: &ObjectKey) -> Result<Option<u64>, Status> {
+    use legion_api::volume::{Access, VolumeSpec, VolumeStatus};
+    let Some(cur) = store.get(key).map_err(internal)? else {
+        return Ok(None);
+    };
+    let refuse = |why: String| {
+        Err(Status::failed_precondition(format!(
+            "{key} {why}: it is deleted only once nothing uses it"
+        )))
+    };
+    if let Some(task) = mounted_by(store, &cur)? {
+        return refuse(format!("is mounted by task {task}"));
+    }
+    let spec: VolumeSpec = legion_api::parse(&cur.spec).map_err(internal)?;
+    let status: VolumeStatus = serde_json::from_value(cur.status.clone()).unwrap_or_default();
+    if spec.access() == Access::Single
+        && !status.node.is_empty()
+        && store
+            .get(&ObjectKey::new(Kind::Node, CLUSTER_SCOPE, &status.node))
+            .map_err(internal)?
+            .is_some()
+    {
+        return refuse(format!(
+            "is held by node {}, which lets go of it once its tasks have ended (or remove the node)",
+            status.node
+        ));
+    }
+    Ok(Some(cur.metadata.version))
 }
 
 fn default_namespace(kind: Kind, namespace: &mut String) {
@@ -640,9 +684,17 @@ impl Objects for ApiService {
         {
             return Ok(Response::new(DeleteResponse { version }));
         }
-        let precondition = req
+        let mut precondition = req
             .expected_version
             .map_or(Precondition::None, Precondition::Version);
+        // Deleted on the version checked: a node claiming it meanwhile
+        // changes the version, and the delete is refused as a conflict.
+        if key.kind == Kind::Volume
+            && let Some(checked) = check_volume_delete(&self.store, &key)?
+            && req.expected_version.is_none_or(|v| v == checked)
+        {
+            precondition = Precondition::Version(checked);
+        }
         let deleted = if key.kind == Kind::Node {
             // Run to the end even if the caller goes: stopped between its
             // writes, it would leave a live node refused.

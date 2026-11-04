@@ -37,8 +37,16 @@ fn read(store: &Store) -> Result<(BTreeMap<String, u64>, Option<u64>), Status> {
 
 /// Refuses a worker certificate of `node` issued before the node was removed.
 pub(crate) fn check(store: &Store, node: &str, issued: SystemTime) -> Result<(), Status> {
-    let (removed, _) = read(store)?;
-    let Some(&at) = removed.get(node) else {
+    check_against(at(store, node)?, node, issued)
+}
+
+/// [`check`] against `removed`, the node's removal as read.
+pub(crate) fn check_against(
+    removed: Option<u64>,
+    node: &str,
+    issued: SystemTime,
+) -> Result<(), Status> {
+    let Some(at) = removed else {
         return Ok(());
     };
     let issued = issued
@@ -133,6 +141,20 @@ impl Recorded {
     pub(crate) fn at(&self) -> u64 {
         self.at
     }
+
+    /// This record, made right after `earlier` (a retry's), undone to what
+    /// came before both: unless another record came between them, which
+    /// stands.
+    pub(crate) fn after(self, earlier: Recorded) -> Recorded {
+        if self.before == Some(earlier.at) {
+            Recorded {
+                at: self.at,
+                before: earlier.before,
+            }
+        } else {
+            self
+        }
+    }
 }
 
 /// Undoes [`record`] of `node` for a removal that did not happen, unless
@@ -190,4 +212,30 @@ async fn change<T>(
     Err(Status::aborted(format!(
         "{NAME} is changing too fast; retry"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Recorded;
+
+    #[test]
+    fn a_retry_undoes_to_before_both_records_unless_another_came_between() {
+        let first = Recorded {
+            at: 10,
+            before: Some(4),
+        };
+        let retry = Recorded {
+            at: 11,
+            before: Some(10),
+        };
+        let undo = retry.after(first);
+        assert_eq!((undo.at, undo.before), (11, Some(4)));
+        // Another join recorded 11 between: the retry undoes to that.
+        let retry = Recorded {
+            at: 12,
+            before: Some(11),
+        };
+        let undo = retry.after(first);
+        assert_eq!((undo.at, undo.before), (12, Some(11)));
+    }
 }

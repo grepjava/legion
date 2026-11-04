@@ -13,6 +13,8 @@ mod authz;
 pub mod autolock;
 pub mod controller;
 mod dispatcher;
+#[cfg(feature = "test-hooks")]
+pub mod hooks;
 pub mod join;
 pub mod metrics;
 mod migrate;

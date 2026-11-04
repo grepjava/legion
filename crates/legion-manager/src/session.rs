@@ -221,19 +221,7 @@ impl Pods for PodsService {
         let status: TaskStatus = serde_json::from_value(task.status.clone()).unwrap_or_default();
         open.task = task.metadata.name.clone();
         open.container = container(&spec, &open.container, &open.task)?;
-        if spec.node.is_empty() || status.state == TaskState::Pending {
-            return Err(Status::failed_precondition(format!(
-                "task {} is not on a node yet",
-                open.task
-            )));
-        }
-        // Refused by its node, it never had a pod to show.
-        if status.state == TaskState::Rejected {
-            return Err(Status::failed_precondition(format!(
-                "task {} was rejected: {}",
-                open.task, status.message
-            )));
-        }
+        been_on_node(&spec, &status, &open.task)?;
         let interactive = !matches!(open.action, Some(Action::Logs(_)));
         if interactive && status.state != TaskState::Running {
             return Err(Status::failed_precondition(format!(
@@ -330,6 +318,29 @@ impl PodsService {
             Status::failed_precondition(format!("{owner} {} has no running task", open.task))
         })
     }
+}
+
+/// Refuses a session with `task` if its node never had its pod: not
+/// placed yet, stopped before it was, or rejected by the node.
+fn been_on_node(spec: &TaskSpec, status: &TaskStatus, task: &str) -> Result<(), Status> {
+    if spec.node.is_empty() || status.state == TaskState::Pending {
+        return Err(Status::failed_precondition(format!(
+            "task {task} is not on a node yet"
+        )));
+    }
+    if !on_node(spec, status) {
+        return Err(Status::failed_precondition(format!(
+            "task {task} was {}, so it never ran",
+            crate::controller::plan::NEVER_PLACED
+        )));
+    }
+    if status.state == TaskState::Rejected {
+        return Err(Status::failed_precondition(format!(
+            "task {task} was rejected: {}",
+            status.message
+        )));
+    }
+    Ok(())
 }
 
 /// Whether a task has been on its node, whose agent has its pod or logs:
@@ -560,6 +571,11 @@ mod tests {
         assert!(on_node(&spec, &ended(TaskState::Complete, "")));
         let never = ended(TaskState::Shutdown, crate::controller::plan::NEVER_PLACED);
         assert!(!on_node(&spec, &never));
+        // Asked for by its own name, it is refused all the same.
+        let err = been_on_node(&spec, &never, "web-n1-1").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("never ran"), "{err}");
+        been_on_node(&spec, &ended(TaskState::Shutdown, ""), "web-n1-1").unwrap();
         spec.node.clear();
         assert!(!on_node(&spec, &ended(TaskState::Shutdown, "")));
     }

@@ -85,6 +85,14 @@ pub struct AcmeStatus {
     /// When the next attempt is, after a failure (RFC 3339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_at: Option<String>,
+    /// The generation of the route this status is for: a route changed
+    /// since its last failure is tried again without waiting.
+    #[serde(default, skip_serializing_if = "is_zero_generation")]
+    pub generation: u64,
+}
+
+fn is_zero_generation(n: &u64) -> bool {
+    *n == 0
 }
 
 fn is_zero(n: &u32) -> bool {
