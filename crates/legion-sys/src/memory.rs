@@ -113,6 +113,9 @@ pub(crate) fn count(
     page: u64,
 ) -> JailMemory {
     let mut counted: HashMap<u64, Seen> = HashMap::new();
+    // The pages the jail's mappings of each object span: no more of its
+    // resident pages are the jail's (a window onto a larger segment).
+    let mut spans: HashMap<u64, u64> = HashMap::new();
     let mut ranges: BTreeMap<Range, Seen> = BTreeMap::new();
     for (pid, map) in processes {
         let pid = *pid;
@@ -124,8 +127,10 @@ pub(crate) fn count(
                 let mut handle = m.object;
                 // A chain is short; the bound only guards against a cycle
                 // read across a change.
+                let span = (m.end.saturating_sub(m.start)).div_ceil(page.max(1));
                 for _ in 0..64 {
                     let Some(o) = objects.get(&handle) else { break };
+                    *spans.entry(handle).or_default() += span;
                     counted
                         .entry(handle)
                         .and_modify(|s| s.by(pid))
@@ -175,6 +180,9 @@ pub(crate) fn count(
                     shared: false,
                 });
         }
+    }
+    for (handle, s) in &mut counted {
+        s.pages = s.pages.min(spans.get(handle).copied().unwrap_or(0));
     }
     let mut pages = 0;
     let mut own: BTreeMap<u32, u64> = processes.iter().map(|(pid, _)| (*pid, 0)).collect();
@@ -515,6 +523,26 @@ mod tests {
         let m = count(&processes, &objects, 4096);
         assert_eq!(m.bytes, (10 + 20 + 5 + 3) * 4096);
         assert_eq!(m.largest, Some((1, 5 * 4096)));
+    }
+
+    #[test]
+    fn a_window_onto_a_larger_object_counts_the_window() {
+        // 1 GiB resident in a segment made elsewhere, 16 MiB of it mapped.
+        let mut objects = HashMap::new();
+        objects.insert(
+            1,
+            Object {
+                backing: 0,
+                resident: 1024 * MIB,
+            },
+        );
+        let window = Mapping {
+            end: 0x1000 + 16 * MIB * 4096,
+            ..anon(1, 16 * MIB)
+        };
+        let m = count(&[(1, vec![window])], &objects, 4096);
+        assert_eq!(m.bytes, 16 << 20);
+        assert_eq!(m.largest, Some((1, 16 << 20)));
     }
 
     #[test]

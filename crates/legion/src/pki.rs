@@ -319,6 +319,24 @@ impl Pki {
         Ok((id.name, bundle))
     }
 
+    /// The name this manager's certificate was issued to, if it has one:
+    /// a joined manager's may be a `--node-name` given only to `join`.
+    pub fn manager_name(&self) -> anyhow::Result<Option<String>> {
+        let Some(cert_pem) = read(&self.path("node.crt"))? else {
+            return Ok(None);
+        };
+        let id = Bundle {
+            cert_pem,
+            key_pem: String::new(),
+            ca_pem: String::new(),
+        }
+        .identity();
+        Ok(id
+            .ok()
+            .filter(|id| id.role == Role::Manager)
+            .map(|id| id.name))
+    }
+
     /// Replaces a worker's certificate and key. Both are written beside
     /// the old ones first and then renamed over them, the key first, so a
     /// crash leaves either the old pair or the new one complete beside it,
@@ -695,6 +713,15 @@ mod tests {
         let healed = pki.ensure("n2", dir.path()).unwrap();
         assert_ne!(healed.cert_pem, renamed.cert_pem);
         assert!(Credentials::new(&healed.ca_pem, &healed.cert_pem, &healed.key_pem).is_ok());
+    }
+
+    #[test]
+    fn a_manager_knows_the_name_it_was_issued() {
+        let dir = tempfile::tempdir().unwrap();
+        let pki = Pki::new(dir.path());
+        assert_eq!(pki.manager_name().unwrap(), None);
+        pki.ensure("custom", dir.path()).unwrap();
+        assert_eq!(pki.manager_name().unwrap().as_deref(), Some("custom"));
     }
 
     #[test]

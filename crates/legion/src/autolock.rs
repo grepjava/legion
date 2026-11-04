@@ -30,7 +30,7 @@ impl Unlock for Unlocker {
         req: Request<UnlockRequest>,
     ) -> Result<Response<UnlockResponse>, Status> {
         // The key travels in the clear: only from this host.
-        if !req.remote_addr().is_some_and(|a| a.ip().is_loopback()) {
+        if !req.remote_addr().is_some_and(from_this_host) {
             return Err(Status::permission_denied(
                 "unlock this manager from its own host",
             ));
@@ -43,6 +43,12 @@ impl Unlock for Unlocker {
         let _ = self.unlocked.send(key).await;
         Ok(Response::new(UnlockResponse {}))
     }
+}
+
+/// A loopback peer, IPv4 on a dual-stack listener (`::ffff:127.0.0.1`)
+/// included.
+fn from_this_host(peer: SocketAddr) -> bool {
+    peer.ip().to_canonical().is_loopback()
 }
 
 /// How long the unlock server's connections get to close once unlocked.
@@ -109,5 +115,20 @@ pub async fn follow(store: Store, pki: Arc<Mutex<Pki>>) {
             Err(e) => tracing::warn!("autolock: reading the unlock key: {e}"),
         }
         tokio::time::sleep(PERIOD).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_peers_on_either_family_are_this_host() {
+        let peer = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert!(from_this_host(peer("127.0.0.1:1")));
+        assert!(from_this_host(peer("[::1]:1")));
+        assert!(from_this_host(peer("[::ffff:127.0.0.1]:1")));
+        assert!(!from_this_host(peer("[::ffff:10.0.0.1]:1")));
+        assert!(!from_this_host(peer("10.0.0.1:1")));
     }
 }

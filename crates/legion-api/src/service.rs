@@ -506,6 +506,13 @@ impl Container {
             let p = index(path, "ports", i);
             if let Some(name) = &port.name {
                 check_name(&field(&p, "name"), name)?;
+                // A reference to it would read as a port number.
+                if name.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(Invalid::new(
+                        field(&p, "name"),
+                        "must not be all digits, as a number names a port by its number",
+                    ));
+                }
             }
             if port.container_port == 0 {
                 return Err(Invalid::new(field(&p, "containerPort"), "must be 1-65535"));

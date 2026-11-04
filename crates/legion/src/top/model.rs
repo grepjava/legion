@@ -95,6 +95,8 @@ impl Model {
             self.log.truncate(LOG);
         }
         if put {
+            // Readable now: a role binding granted since the listing.
+            self.hidden.remove(&o.kind);
             self.objects.insert(k, o);
         } else {
             self.objects.remove(&k);

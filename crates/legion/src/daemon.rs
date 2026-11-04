@@ -53,10 +53,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         let key = crate::autolock::wait(opts.listen, &opts.data_dir).await?;
         pki = pki.unlock(key)?;
     }
-    let node = match &opts.node_name {
-        Some(n) => n.clone(),
-        None => node_name(&hostname)?,
-    };
+    let node = manager_node(opts.node_name.as_deref(), &pki, &hostname)?;
     legion_api::validate_name(&node).context("node name")?;
     let tls = pki
         .ensure(&node, &opts.data_dir)
@@ -542,6 +539,22 @@ fn hostname() -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
+/// A manager's node name: the one given, else the one its certificate was
+/// issued to (`join --node-name` names it once), else the hostname's.
+fn manager_node(
+    given: Option<&str>,
+    pki: &crate::pki::Pki,
+    hostname: &str,
+) -> anyhow::Result<String> {
+    match given {
+        Some(n) => Ok(n.to_owned()),
+        None => match pki.manager_name()? {
+            Some(n) => Ok(n),
+            None => node_name(hostname),
+        },
+    }
+}
+
 /// The first label of the hostname, as a valid object name.
 fn node_name(hostname: &str) -> anyhow::Result<String> {
     let label = hostname
@@ -694,5 +707,15 @@ mod tests {
     fn node_names() {
         assert_eq!(node_name("Web01.example.org").unwrap(), "web01");
         assert!(node_name("under_score").is_err());
+    }
+
+    #[test]
+    fn a_manager_keeps_the_name_it_joined_as() {
+        let dir = tempfile::tempdir().unwrap();
+        let pki = crate::pki::Pki::new(dir.path());
+        assert_eq!(manager_node(None, &pki, "host.example").unwrap(), "host");
+        pki.ensure("custom", dir.path()).unwrap();
+        assert_eq!(manager_node(None, &pki, "host.example").unwrap(), "custom");
+        assert_eq!(manager_node(Some("other"), &pki, "host").unwrap(), "other");
     }
 }

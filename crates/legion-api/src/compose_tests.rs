@@ -338,6 +338,38 @@ volumes:
 }
 
 #[test]
+fn x_legion_replaces_the_variant_it_sets() {
+    let stack = convert_with(
+        r#"services:
+  a:
+    image: a
+    healthcheck: { test: ["CMD", "true"] }
+    environment: { X: one }
+    volumes: ["data:/data"]
+    x-legion:
+      pod:
+        containers:
+          - name: a
+            env: [{ name: X, secret: x }]
+            probes: { liveness: { http: { port: 80 } } }
+        volumes: [{ name: data, tmpfs: {} }]
+volumes:
+  data: {}
+"#,
+        &[],
+    )
+    .unwrap();
+    let a = spec(&stack, "a");
+    let c = &a.pod.containers[0];
+    let x = c.env.iter().find(|e| e.name == "X").unwrap();
+    assert_eq!((x.value.as_deref(), x.secret.as_deref()), (None, Some("x")));
+    let live = c.probes.liveness.as_ref().unwrap();
+    assert!(live.http.is_some() && live.exec.is_none(), "{live:?}");
+    let data = a.pod.volumes.iter().find(|v| v.name == "data").unwrap();
+    assert!(data.tmpfs.is_some() && data.volume.is_none(), "{data:?}");
+}
+
+#[test]
 fn ports_on_one_target_keep_their_own_vip_ports() {
     let ports = |ports: &str| {
         let stack = convert_with(
@@ -364,6 +396,15 @@ fn ports_on_one_target_keep_their_own_vip_ports() {
     assert_eq!(ports("[\"8080:80\", \"80\"]").unwrap(), [(80, Some(8080))]);
     assert_eq!(ports("[\"80\", \"8080:80\"]").unwrap(), [(80, Some(8080))]);
     assert_eq!(ports("[\"80\", \"80:80\"]").unwrap(), [(80, Some(80))]);
+    // One published on its target keeps it, in either order.
+    assert_eq!(
+        ports("[\"8080:80\", \"80:80\"]").unwrap(),
+        [(80, Some(80)), (8080, Some(8080))]
+    );
+    assert_eq!(
+        ports("[\"80:80\", \"8080:80\"]").unwrap(),
+        [(80, Some(80)), (8080, Some(8080))]
+    );
     assert_eq!(
         ports("[\"80\", \"8080:80\", \"8081:80\"]").unwrap(),
         [(80, Some(8080)), (8081, Some(8081))]

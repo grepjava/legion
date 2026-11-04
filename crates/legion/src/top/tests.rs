@@ -761,6 +761,20 @@ fn what_the_caller_may_not_read_says_so() {
     assert_eq!(m.of(Kind::Service).count(), 1);
 }
 
+/// A kind hidden at the listing shows once the watch brings one: the
+/// caller's role bindings let it read that kind now.
+#[test]
+fn a_kind_shows_once_the_watch_brings_one() {
+    let mut m = Model::new(Some("shop".into()));
+    m.listed(vec![service(3, 1, 1)], BTreeSet::from([Kind::Node]));
+    let v = View::default();
+    assert!(screen(&m, &v).contains("do not let you read node"));
+    m.changed(true, node("n1", 4, "ready", "active"), 0);
+    let s = screen(&m, &v);
+    assert!(!s.contains("do not let you read node"), "{s}");
+    assert!(!m.hidden.contains(&Kind::Node));
+}
+
 #[test]
 fn a_problem_shows_until_listed_again() {
     let mut m = cluster();

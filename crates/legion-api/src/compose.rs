@@ -417,23 +417,37 @@ impl Converter<'_> {
                 "ports" => {
                     // The VIP port is the target where it is free, as two
                     // can't share one. Else, for `8081:80` beside `8080:80`,
-                    // the published port; `80` beside it adds nothing.
+                    // the published port; `80` beside it adds nothing. One
+                    // published on its target (`80:80`) keeps the target,
+                    // whatever the order.
                     let same = |a: &Value, b: &Value| {
                         a["port"] == b["port"] && a["protocol"] == b["protocol"]
                     };
                     let mut moved = Vec::new();
+                    let mut ats: Vec<String> = Vec::new();
                     for (i, p) in val.as_array().into_iter().flatten().enumerate() {
                         let at = format!("{at}[{i}]");
                         let (port, published) = self.port(p, &at)?;
                         add_port(&mut container_ports, &port);
                         let bare = |v: &Value| v.get("publishedPort").is_none();
-                        match service_ports.iter_mut().find(|o| same(o, &published)) {
+                        let on_target = |v: &Value| v.get("publishedPort") == v.get("port");
+                        match service_ports.iter().position(|o| same(o, &published)) {
                             // `80` beside `8080:80`, in either order, is the
                             // published one alone.
                             Some(_) if bare(&published) => {}
-                            Some(o) if bare(o) => *o = published,
+                            Some(n) if bare(&service_ports[n]) => {
+                                service_ports[n] = published;
+                                ats[n] = at;
+                            }
+                            Some(n) if on_target(&published) && !on_target(&service_ports[n]) => {
+                                let old = std::mem::replace(&mut service_ports[n], published);
+                                moved.push((std::mem::replace(&mut ats[n], at), old));
+                            }
                             Some(_) => moved.push((at, published)),
-                            None => service_ports.push(published),
+                            None => {
+                                service_ports.push(published);
+                                ats.push(at);
+                            }
                         }
                     }
                     for (at, mut published) in moved {
@@ -1037,10 +1051,26 @@ fn healthcheck(v: &Value, at: &str) -> Result<Option<Value>, String> {
     Ok(Some(probe))
 }
 
+/// Fields of which an object sets exactly one: a probe's check, a pod
+/// volume's source, an environment variable's value. No other object has two
+/// of one group, so a group is told by its keys alone.
+const ONE_OF: [&[&str]; 3] = [
+    &["http", "tcp", "grpc", "exec"],
+    &["volume", "tmpfs", "claim"],
+    &["value", "secret", "config"],
+];
+
 /// Merges `extra` into `base`: mappings key by key, anything else replaced.
+/// Setting one of a group of exclusive fields drops the others: an `http`
+/// check given for a converted `healthcheck` replaces its `exec`.
 fn merge(base: &mut Value, extra: &Value) {
     match (base, extra) {
         (Value::Object(b), Value::Object(e)) => {
+            for group in ONE_OF {
+                if group.iter().any(|k| e.contains_key(*k)) {
+                    b.retain(|k, _| !group.contains(&k.as_str()) || e.contains_key(k));
+                }
+            }
             for (k, v) in e {
                 merge(b.entry(k.clone()).or_insert(Value::Null), v);
             }

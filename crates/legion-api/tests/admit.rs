@@ -262,6 +262,12 @@ fn errors_name_the_field() {
 ",
             "spec.pod.volumes[0].tmpfs.size: must be above zero",
         ),
+        (
+            "  pod:
+    containers: [{ name: web, image: web:1, ports: [{ name: \"8080\", containerPort: 80 }] }]
+",
+            "spec.pod.containers[0].ports[0].name: must not be all digits",
+        ),
     ];
     for (spec, want) in cases {
         let got = rejected(&service(spec));
