@@ -88,10 +88,11 @@ impl JobSpec {
                 }
             }
         }
-        if self.active_deadline.is_some_and(|d| d.0 == 0) {
+        // The controller counts whole seconds.
+        if self.active_deadline.is_some_and(|d| d.0 < 1000) {
             return Err(Invalid::new(
                 field(path, "activeDeadline"),
-                "must be longer than 0s",
+                "must be at least 1s",
             ));
         }
         let pod = field(path, "pod");
@@ -141,6 +142,10 @@ pub struct JobStatus {
     pub succeeded: u32,
     #[serde(default)]
     pub failed: u32,
+    /// The number of the newest task of each slot (completion number or
+    /// node), so a deleted task's name is never given to another.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub last_tasks: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -214,6 +219,9 @@ impl Spec for CronJobSpec {
         self.schedule
             .parse::<crate::cron::Schedule>()
             .map_err(|e| Invalid::new("schedule", e.to_string()))?;
+        if self.starting_deadline.is_some_and(|d| d.0 < 1000) {
+            return Err(Invalid::new("startingDeadline", "must be at least 1s"));
+        }
         self.job.admit_at("job")
     }
 }

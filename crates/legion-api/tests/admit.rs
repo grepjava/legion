@@ -157,6 +157,12 @@ fn errors_name_the_field() {
             "spec.pod.containers[0].probes.liveness: set exactly one of",
         ),
         (
+            "  pod:
+    containers: [{ name: web, image: web:1, ports: [{ name: http, containerPort: 80 }], probes: { liveness: { http: { path: \"/live now\", port: http } } } }]
+",
+            "spec.pod.containers[0].probes.liveness.http.path: must start with `/`, of printable ASCII",
+        ),
+        (
             "  pod:\n    containers: [{ name: web, image: web:1, volumeMounts: [{ name: data, path: /data }] }]\n",
             "spec.pod.containers[0].volumeMounts[0].name: no pod volume named \"data\"",
         ),
@@ -416,6 +422,13 @@ fn jobs() {
             "spec.activeDeadline",
         ),
         (
+            format!(
+                "  activeDeadline: 500ms
+{POD}"
+            ),
+            "spec.activeDeadline: must be at least 1s",
+        ),
+        (
             "  pod: { containers: [] }
 "
             .to_owned(),
@@ -470,6 +483,19 @@ fn cron_jobs() {
         ),
     ));
     assert!(e.contains("at most 52 characters"), "{e}");
+    let e = rejected(&cron_job(
+        "nightly",
+        &format!(
+            "  schedule: \"@daily\"
+  startingDeadline: 900ms
+  job:
+  {POD}"
+        ),
+    ));
+    assert!(
+        e.contains("spec.startingDeadline: must be at least 1s"),
+        "{e}"
+    );
 }
 
 #[test]
@@ -482,4 +508,39 @@ fn ports_from_signed_integers() {
     assert!(port(0).is_err());
     assert!(port(-1).is_err());
     assert!(port(65536).is_err());
+}
+
+#[test]
+fn the_size_limit_holds_with_defaults_filled_in() {
+    // Probes grow with their defaults: under the limit as sent,
+    // over it as stored, so refused rather than stored unrestorable.
+    let service = |n: usize| -> Object {
+        let containers: Vec<_> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("c{i:06}"),
+                    "image": "i",
+                    "probes": { "readiness": { "tcp": { "port": 80 } } },
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "legion/v1",
+            "kind": "Service",
+            "metadata": { "name": "web", "namespace": "shop" },
+            "spec": { "pod": { "containers": containers } },
+        }))
+        .unwrap()
+    };
+    let size = |o: &Object| serde_json::to_vec(&o.spec).unwrap().len();
+    let (mut a, mut b) = (service(100), service(200));
+    let sent = (size(&b) - size(&a)) / 100;
+    admit(&mut a).unwrap();
+    admit(&mut b).unwrap();
+    let stored = (size(&b) - size(&a)) / 100;
+    assert!(stored > sent + sent / 2, "{sent} grows to {stored} only");
+    let mut big = service(legion_api::admit::MAX_OBJECT / sent - 100);
+    assert!(size(&big) < legion_api::admit::MAX_OBJECT);
+    let e = admit(&mut big).expect_err("admitted").to_string();
+    assert!(e.contains("limit"), "{e}");
 }

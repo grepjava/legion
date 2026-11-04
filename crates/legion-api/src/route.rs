@@ -1,7 +1,7 @@
 //! `Route`: HTTP requests for a host and path, sent to a service's ready
 //! tasks by every node's ingress proxy (DESIGN.md §5.8).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -99,7 +99,7 @@ impl Spec for RouteSpec {
     fn admit(&mut self) -> Result<(), Invalid> {
         let name = self.host.strip_prefix("*.").unwrap_or(&self.host);
         let labels: Vec<&str> = name.split('.').collect();
-        if name.len() > 253 || labels.iter().any(|l| crate::validate_name(l).is_err()) {
+        if self.host.len() > 253 || labels.iter().any(|l| crate::validate_name(l).is_err()) {
             return Err(Invalid::new(
                 "host",
                 format!(
@@ -120,9 +120,9 @@ impl Spec for RouteSpec {
                 "a path starting with /, of printable ASCII without spaces, ? or #",
             ));
         }
-        if self.path.len() > 1 {
-            self.path = self.path.trim_end_matches('/').to_owned();
-        }
+        // `/shop/` is `/shop`, and `//` is `/`.
+        let trimmed = self.path.trim_end_matches('/');
+        self.path = if trimmed.is_empty() { "/" } else { trimmed }.to_owned();
         check_name("service", &self.service)?;
         if self.port == Some(0) {
             return Err(Invalid::new("port", "a port above 0"));
@@ -133,7 +133,8 @@ impl Spec for RouteSpec {
                 if self.host.starts_with("*.") {
                     return Err(Invalid::new(
                         "tls.acme",
-                        "a `*.` host needs a DNS challenge, which Legion does not answer;                          give the certificate in the Secret",
+                        "a `*.` host needs a DNS challenge, which Legion does not answer; \
+                         give the certificate in the Secret",
                     ));
                 }
                 if !directory_allowed(&acme.directory) {
@@ -157,7 +158,7 @@ impl Spec for RouteSpec {
 }
 
 /// An ACME directory is fetched over HTTPS; plain HTTP only from the
-/// manager itself, for tests.
+/// manager's own loopback, which managers reach only when testing.
 fn directory_allowed(url: &str) -> bool {
     if url
         .strip_prefix("https://")
@@ -174,6 +175,44 @@ fn directory_allowed(url: &str) -> bool {
         _ => authority,
     };
     matches!(host, "127.0.0.1" | "[::1]" | "localhost")
+}
+
+/// Whether routes for hosts `a` and `b` may take the same requests: the
+/// same host, or a `*.` host and one it covers. A host, and a `*.` host
+/// with those under it, belong to the routes of one namespace.
+pub fn hosts_overlap(a: &str, b: &str) -> bool {
+    let covers = |wild: &str, host: &str| {
+        wild.strip_prefix("*.")
+            .is_some_and(|domain| host.split_once('.').is_some_and(|(_, rest)| rest == domain))
+    };
+    a == b || covers(a, b) || covers(b, a)
+}
+
+/// The hosts that routes of more than one namespace claim, of routes given
+/// as (namespace, host). Admission refuses such a route, but routes from
+/// before it may be left; no namespace's route is served for them.
+pub fn contested<'a>(routes: impl IntoIterator<Item = (&'a str, &'a str)>) -> BTreeSet<String> {
+    let mut by_host: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (namespace, host) in routes {
+        by_host.entry(host).or_default().insert(namespace);
+    }
+    let mut contested = BTreeSet::new();
+    for (host, namespaces) in &by_host {
+        if namespaces.len() > 1 {
+            contested.insert(host.to_string());
+        }
+        let Some((_, domain)) = host.split_once('.').filter(|_| !host.starts_with("*.")) else {
+            continue;
+        };
+        let wild = format!("*.{domain}");
+        if let Some(others) = by_host.get(wild.as_str())
+            && namespaces.union(others).nth(1).is_some()
+        {
+            contested.insert(host.to_string());
+            contested.insert(wild);
+        }
+    }
+    contested
 }
 
 impl RouteSpec {
@@ -228,10 +267,42 @@ mod tests {
         assert!(shop.matches("shop.example.org", "/shopping").is_none());
         assert!(shop.matches("www.example.org", "/shop").is_none());
 
+        // Only slashes is the root, and admitting it again changes nothing.
+        let mut root = route("shop.example.org", "//");
+        assert_eq!(root.path, "/");
+        root.admit().unwrap();
+        assert_eq!(root.path, "/");
+        assert!(root.matches("shop.example.org", "/x").is_some());
+
         let any = route("*.example.org", "/");
         assert_eq!(any.matches("www.example.org", "/x"), Some((false, 1)));
         assert!(any.matches("example.org", "/").is_none());
         assert!(any.matches("a.b.example.org", "/").is_none());
+    }
+
+    #[test]
+    fn hosts_of_one_namespace() {
+        assert!(hosts_overlap("a.example.org", "a.example.org"));
+        assert!(hosts_overlap("*.example.org", "a.example.org"));
+        assert!(hosts_overlap("a.example.org", "*.example.org"));
+        assert!(!hosts_overlap("*.example.org", "a.b.example.org"));
+        assert!(!hosts_overlap("*.example.org", "example.org"));
+        assert!(!hosts_overlap("a.example.org", "b.example.org"));
+
+        let routes = [
+            ("shop", "shop.example.org"),
+            ("shop", "*.example.org"),
+            ("blog", "blog.example.org"),
+            ("blog", "blog.example.net"),
+            ("evil", "blog.example.net"),
+            ("api", "api.example.com"),
+            ("api", "*.example.com"),
+        ];
+        let contested: Vec<String> = contested(routes).into_iter().collect();
+        assert_eq!(
+            contested,
+            ["*.example.org", "blog.example.net", "blog.example.org"]
+        );
     }
 
     #[test]
@@ -245,6 +316,11 @@ mod tests {
             ("shop.example.org", "/a b"),
             ("shop.example.org", "/a\tb"),
             ("shop.example.org", "/caf\u{e9}"),
+            // 253 characters after the `*.`, 255 with it.
+            (
+                format!("*.{}.{}", vec!["a".repeat(63); 3].join("."), "a".repeat(61)).as_str(),
+                "/",
+            ),
         ] {
             let mut r = RouteSpec {
                 host: host.into(),

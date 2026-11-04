@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio_rustls::rustls::client::ResolvesClientCert;
 use tokio_rustls::rustls::crypto::CryptoProvider;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use tokio_rustls::rustls::sign::CertifiedKey;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig, SignatureScheme};
@@ -82,19 +82,33 @@ fn provider() -> Arc<CryptoProvider> {
 }
 
 /// The certificate with the CA after it, and the key, checked to belong
-/// to the certificate.
+/// to the certificate, and the certificate checked to be the CA's.
 fn certified(
-    provider: &CryptoProvider,
+    provider: &Arc<CryptoProvider>,
     ca_pem: &str,
     cert_pem: &str,
     key_pem: &str,
 ) -> Result<CertifiedKey, Error> {
-    let mut certs = Vec::new();
-    for pem in [cert_pem, ca_pem] {
-        for cert in CertificateDer::pem_slice_iter(pem.as_bytes()) {
-            certs.push(cert?);
-        }
+    let mut certs =
+        CertificateDer::pem_slice_iter(cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>()?;
+    let Some(leaf) = certs.first().cloned() else {
+        return Err("no certificate".into());
+    };
+    let mut roots = RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
+        let cert = cert?;
+        roots.add(cert.clone())?;
+        certs.push(cert);
     }
+    // Checked as of when it was issued: whether it has expired is for the
+    // peers to say, its issuer is not.
+    let issued = legion_pki::issued_at(&leaf)?
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+        .build()?
+        .verify_client_cert(&leaf, &certs[1..], UnixTime::since_unix_epoch(issued))
+        .map_err(|e| format!("the certificate is not the cluster CA's: {e}"))?;
     let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
     let key = provider.key_provider.load_private_key(key)?;
     let certified = CertifiedKey::new(certs, key);
@@ -182,8 +196,14 @@ impl Credentials {
     ) -> ReceiverStream<Result<tokio_rustls::server::TlsStream<TcpStream>, std::io::Error>> {
         let (tx, rx) = mpsc::channel(64);
         let acceptor = TlsAcceptor::from(self.server.clone());
+        let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_HANDSHAKES));
         tokio::spawn(async move {
             loop {
+                // A flood of connections waits in the backlog, not in tasks.
+                let permit = tokio::select! {
+                    p = handshakes.clone().acquire_owned() => p.expect("never closed"),
+                    _ = tx.closed() => return,
+                };
                 let accepted = tokio::select! {
                     a = listener.accept() => a,
                     _ = tx.closed() => return,
@@ -200,7 +220,10 @@ impl Credentials {
                 let _ = tcp.set_nodelay(true);
                 let (acceptor, tx) = (acceptor.clone(), tx.clone());
                 tokio::spawn(async move {
-                    match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
+                    let handshake =
+                        tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await;
+                    drop(permit);
+                    match handshake {
                         Ok(Ok(tls)) => {
                             let _ = tx.send(Ok(tls)).await;
                         }
@@ -213,6 +236,9 @@ impl Credentials {
         ReceiverStream::new(rx)
     }
 }
+
+/// TLS handshakes a listener runs at once.
+const MAX_HANDSHAKES: usize = 256;
 
 /// How long a client has to finish its TLS handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -285,5 +311,20 @@ mod tests {
         creds.renew(&next.cert_pem, &next.key_pem).unwrap();
         assert_eq!(creds.cert_and_key(), (next.cert_pem, next.key_pem));
         assert!(Credentials::new(ca.cert_pem(), &first.cert_pem, "not a key").is_err());
+    }
+
+    #[test]
+    fn credentials_take_the_cas_certificates_only() {
+        let ca = Ca::generate().unwrap();
+        let other = Ca::generate().unwrap();
+        let id = Identity::new("w1", Role::Worker);
+        let ours = ca.issue(&id, legion_pki::CERT_LIFETIME).unwrap();
+        let theirs = other.issue(&id, legion_pki::CERT_LIFETIME).unwrap();
+        assert!(Credentials::new(ca.cert_pem(), &theirs.cert_pem, &theirs.key_pem).is_err());
+        // No certificate at all: not the CA's own taken in its place.
+        assert!(Credentials::new(ca.cert_pem(), "", &ours.key_pem).is_err());
+        let creds = Credentials::new(ca.cert_pem(), &ours.cert_pem, &ours.key_pem).unwrap();
+        assert!(creds.renew(&theirs.cert_pem, &theirs.key_pem).is_err());
+        assert_eq!(creds.cert_and_key().0, ours.cert_pem);
     }
 }

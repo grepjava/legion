@@ -68,31 +68,35 @@ pub fn convert(yaml: &str, stack: &str, namespace: &str, inputs: &Inputs) -> Res
     }
 
     let mut objects: Vec<Object> = Vec::new();
-    // Two entries whose names normalize alike would be one object.
-    let mut made = |section: &str, name: &str, o: Object| {
-        if objects.iter().any(|m| m.key() == o.key()) {
-            return Err(format!(
-                "{section}.{name}: another entry is also named {}",
-                o.metadata.name
-            ));
+    // Two entries whose names normalize alike would be one object, made
+    // twice or made and also taken as an external one. Two external ones
+    // may name the same object.
+    let mut named: BTreeMap<(Kind, String), bool> = BTreeMap::new();
+    let mut made = |section: &str, key: &str, kind: Kind, name: &str, o: Option<Object>| {
+        let mine = o.is_some();
+        match named.get(&(kind, name.to_owned())) {
+            Some(&other) if mine || other => {
+                return Err(format!(
+                    "{section}.{key}: another entry is also named {name}"
+                ));
+            }
+            _ => {}
         }
-        objects.push(o);
+        named.insert((kind, name.to_owned()), mine);
+        objects.extend(o);
         Ok::<_, String>(())
     };
-    for (name, v) in entries(top.get("volumes")) {
-        if let Some(o) = c.volume(name, v)? {
-            made("volumes", name, o)?;
-        }
+    for (key, v) in entries(top.get("volumes")) {
+        let o = c.volume(key, v)?;
+        made("volumes", key, Kind::Volume, &c.volumes[key], o)?;
     }
-    for (name, v) in entries(top.get("secrets")) {
-        if let Some(o) = c.data(Kind::Secret, name, v)? {
-            made("secrets", name, o)?;
-        }
+    for (key, v) in entries(top.get("secrets")) {
+        let o = c.data(Kind::Secret, key, v)?;
+        made("secrets", key, Kind::Secret, &c.secrets[key], o)?;
     }
-    for (name, v) in entries(top.get("configs")) {
-        if let Some(o) = c.data(Kind::Config, name, v)? {
-            made("configs", name, o)?;
-        }
+    for (key, v) in entries(top.get("configs")) {
+        let o = c.data(Kind::Config, key, v)?;
+        made("configs", key, Kind::Config, &c.configs[key], o)?;
     }
     let networks = entries(top.get("networks")).count();
     let services = entries(top.get("services")).collect::<Vec<_>>();
@@ -279,11 +283,9 @@ impl Converter<'_> {
             match k {
                 "external" | "name" | "labels" => {}
                 "driver" if val.as_str() == Some("local") => {}
-                "x-legion" => {
-                    if let Some(size) = val.get("size") {
-                        spec["size"] = size.clone();
-                    }
-                }
+                // Everything a Volume says that compose can't: size,
+                // driver, node, nfs, iscsi, plugin.
+                "x-legion" => merge(&mut spec, val),
                 k => self.warn(format!("{path}.{k}: not supported, ignored")),
             }
         }
@@ -413,9 +415,35 @@ impl Converter<'_> {
                 }
                 "environment" => {} // after env_file, which it overrides
                 "ports" => {
+                    // The VIP port is the target where it is free, as two
+                    // can't share one. Else, for `8081:80` beside `8080:80`,
+                    // the published port; `80` beside it adds nothing.
+                    let same = |a: &Value, b: &Value| {
+                        a["port"] == b["port"] && a["protocol"] == b["protocol"]
+                    };
+                    let mut moved = Vec::new();
                     for (i, p) in val.as_array().into_iter().flatten().enumerate() {
-                        let (port, published) = self.port(p, &format!("{at}[{i}]"))?;
+                        let at = format!("{at}[{i}]");
+                        let (port, published) = self.port(p, &at)?;
                         add_port(&mut container_ports, &port);
+                        if service_ports.iter().any(|o| same(o, &published)) {
+                            moved.push((at, published));
+                        } else {
+                            service_ports.push(published);
+                        }
+                    }
+                    for (at, mut published) in moved {
+                        if published.get("publishedPort").is_none() {
+                            continue;
+                        }
+                        published["port"] = published["publishedPort"].clone();
+                        if service_ports.iter().any(|o| same(o, &published)) {
+                            return Err(format!(
+                                "{at}: the service's port {}/{} is another entry's too",
+                                published["port"],
+                                scalar(&published["protocol"])
+                            ));
+                        }
                         service_ports.push(published);
                     }
                 }
@@ -682,7 +710,7 @@ impl Converter<'_> {
                     None => json!({}),
                 };
                 volumes.push(json!({ "name": vname, "tmpfs": tmpfs }));
-                mounts.push(json!({ "name": vname, "path": target }));
+                mounts.push(json!({ "name": vname, "path": target, "readOnly": read_only }));
             }
             "bind" => self.warn(format!(
                 "{at}: bind mounts of host paths are not supported, {target} is not mounted"
@@ -1016,8 +1044,26 @@ fn merge(base: &mut Value, extra: &Value) {
                 merge(b.entry(k.clone()).or_insert(Value::Null), v);
             }
         }
+        // Lists of named entries, as containers and volumes, merge by name:
+        // `containers: [{ name: web, security: ... }]` adds to `web`.
+        (Value::Array(b), Value::Array(e)) if named(b) && named(e) => {
+            for v in e {
+                match b.iter_mut().find(|o| o["name"] == v["name"]) {
+                    Some(o) => merge(o, v),
+                    None => b.push(v.clone()),
+                }
+            }
+        }
         (b, e) => *b = e.clone(),
     }
+}
+
+/// Every entry is a mapping with a `name`.
+fn named(list: &[Value]) -> bool {
+    !list.is_empty()
+        && list
+            .iter()
+            .all(|v| v.get("name").is_some_and(Value::is_string))
 }
 
 #[cfg(test)]

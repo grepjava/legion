@@ -63,6 +63,23 @@ impl Backup {
         if self.version == 0 {
             return Err(Error::Db("the backup holds no cluster".into()));
         }
+        // What the store would hold at `version`: each object once, none
+        // written after it, or later writes would reuse its versions.
+        let mut keys = BTreeSet::new();
+        for o in &self.objects {
+            let key = o.key().to_string();
+            o.validate()
+                .map_err(|e| Error::Db(format!("{key} in the backup: {e}")))?;
+            if o.metadata.version == 0 || o.metadata.version > self.version {
+                return Err(Error::Db(format!(
+                    "{key} is at version {}, not in 1-{} as the backup is",
+                    o.metadata.version, self.version
+                )));
+            }
+            if !keys.insert(key.clone()) {
+                return Err(Error::Db(format!("{key} is in the backup twice")));
+            }
+        }
         Ok(())
     }
 }
@@ -115,7 +132,26 @@ pub fn restore(
             path.display()
         )));
     }
-    let db = Arc::new(redb::Database::create(&path).map_err(Error::db)?);
+    // Written beside it and renamed into place once complete, so a failed
+    // restore leaves no store a daemon would start from.
+    let new = dir.join("store.redb.new");
+    match std::fs::remove_file(&new) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::Db(format!("{}: {e}", new.display()))),
+    }
+    write(&new, id, addr, backup, key)?;
+    std::fs::rename(&new, &path).map_err(|e| Error::Db(format!("{}: {e}", path.display())))
+}
+
+fn write(
+    path: &Path,
+    id: NodeId,
+    addr: &str,
+    backup: &Backup,
+    key: Option<&StoreKey>,
+) -> Result<(), Error> {
+    let db = Arc::new(redb::Database::create(path).map_err(Error::db)?);
     let codec = Arc::new(Codec::new(key));
     LogStore::open_with(db.clone(), codec.clone())?;
     StateMachine::open_with(db.clone(), codec.clone())?;

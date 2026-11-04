@@ -244,6 +244,10 @@ pub struct VolumeStatus {
     /// The data moving to another node (DESIGN.md §4.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration: Option<Migration>,
+    /// Nodes still holding a copy of the data it moved away from: the
+    /// migrator has each drop it, and forgets the node once it has.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leftovers: Vec<String>,
 }
 
 /// A Volume's data moving to another node: copied whole while its tasks

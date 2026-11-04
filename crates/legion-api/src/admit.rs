@@ -86,15 +86,18 @@ pub fn admit(obj: &mut Object) -> Result<(), Error> {
         .iter()
         .map(|(k, v)| k.len() + v.len() + 6)
         .sum();
-    let size = labels + serde_json::to_vec(&obj.spec).map_or(0, |v| v.len());
-    if size > MAX_OBJECT {
-        return Err(Error::Spec {
+    let too_big = |obj: &Object| {
+        let size = labels + serde_json::to_vec(&obj.spec).map_or(0, |v| v.len());
+        (size > MAX_OBJECT).then(|| Error::Spec {
             kind: obj.kind,
             invalid: Invalid::new(
                 "",
                 format!("{size} bytes of labels and spec is above the {MAX_OBJECT}-byte limit"),
             ),
-        });
+        })
+    };
+    if let Some(e) = too_big(obj) {
+        return Err(e);
     }
     let spec = std::mem::take(&mut obj.spec);
     let normalised = match obj.kind {
@@ -132,7 +135,12 @@ pub fn admit(obj: &mut Object) -> Result<(), Error> {
         kind: obj.kind,
         invalid,
     })?;
-    Ok(())
+    // Again with the defaults filled in, as it is stored: what is stored
+    // is admitted again on restore.
+    match too_big(obj) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// A Job's pod restarts nothing in place unless asked: its restart

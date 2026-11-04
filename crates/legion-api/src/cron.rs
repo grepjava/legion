@@ -88,7 +88,13 @@ impl FromStr for Schedule {
 }
 
 /// A field as a bit set over `lo..=hi`. `names` spell values from `lo`.
+///
+/// Days of the week run 0-7 with 7 Sunday again; `*` and `a/step` end at
+/// Saturday, so `mon/2` is Monday, Wednesday and Friday, and a range may end
+/// on Sunday (`fri-sun`).
 fn field(s: &str, what: &str, lo: u32, hi: u32, names: &[&str]) -> Result<u64, Error> {
+    let week = names.len() == WEEKDAYS.len() && names[0] == WEEKDAYS[0];
+    let end = if week { 6 } else { hi };
     let bad = |why: String| Error(format!("{what} {s:?}: {why}"));
     let value = |v: &str| -> Result<u32, Error> {
         if let Some(i) = names.iter().position(|n| n.eq_ignore_ascii_case(v)) {
@@ -116,11 +122,14 @@ fn field(s: &str, what: &str, lo: u32, hi: u32, names: &[&str]) -> Result<u64, E
             None => (item, None),
         };
         let (from, to) = match range {
-            "*" => (lo, hi),
+            "*" => (lo, end),
             r => match r.split_once('-') {
-                Some((a, b)) => (value(a)?, value(b)?),
+                Some((a, b)) => match (value(a)?, value(b)?) {
+                    (a, 0) if week && a > 0 => (a, 7),
+                    range => range,
+                },
                 // `5/15`: from 5 to the end, every 15.
-                None if step.is_some() => (value(r)?, hi),
+                None if step.is_some() => (value(r)?, end),
                 None => {
                     let v = value(r)?;
                     (v, v)
@@ -214,6 +223,19 @@ mod tests {
     fn next(schedule: &str, after: &str) -> String {
         let s: Schedule = schedule.parse().unwrap();
         clock::format(s.next_after(at(after)).unwrap())
+    }
+
+    #[test]
+    fn weekday_steps_and_ranges_end_on_sunday() {
+        let days = |s: &str| s.parse::<Schedule>().unwrap().weekdays;
+        // Monday, Wednesday, Friday: not Sunday as 7 too.
+        assert_eq!(days("0 0 * * mon/2"), 0b010_1010);
+        assert_eq!(days("0 0 * * 1/2"), 0b010_1010);
+        assert_eq!(days("0 0 * * */2"), 0b101_0101);
+        assert_eq!(days("0 0 * * fri-sun"), 0b110_0001);
+        assert_eq!(days("0 0 * * mon-sun"), 0x7f);
+        assert_eq!(days("0 0 * * 5-7"), 0b110_0001);
+        assert!("0 0 * * 5-0".parse::<Schedule>().is_ok());
     }
 
     #[test]

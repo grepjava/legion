@@ -133,6 +133,22 @@ async fn a_manager_restarts_the_cluster_from_its_own_store() {
     let mut other = own.clone();
     other.format += 1;
     assert!(other.check().is_err());
+    // Objects the backup's version can't hold.
+    let mut later = own.clone();
+    later.objects[0].metadata.version = own.version + 1;
+    assert!(later.check().is_err());
+    let mut twice = own.clone();
+    twice.objects.push(own.objects[0].clone());
+    assert!(twice.check().is_err());
+    // Objects the store would refuse.
+    let mut named = own.clone();
+    named.objects[0].metadata.name = "Not A Name".into();
+    assert!(named.check().is_err());
+    // A refused restore leaves no store behind, nor a partial one.
+    assert!(restore(&dir, 1, "n1:7470", &named, None).is_err());
+    assert!(!dir.join("store.redb").exists());
+    assert!(!dir.join("store.redb.new").exists());
+    assert!(own.check().is_ok());
     let none = Backup {
         version: 0,
         managers: BTreeMap::new(),

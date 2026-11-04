@@ -380,8 +380,13 @@ fn blocks(pem: &str) -> Vec<(String, Vec<u8>)> {
             .and_then(|l| l.strip_suffix("-----"))
         {
             current = Some((label.to_owned(), String::new()));
-        } else if line.starts_with("-----END ") {
+        } else if let Some(end) = line
+            .strip_prefix("-----END ")
+            .and_then(|l| l.strip_suffix("-----"))
+        {
+            // A block ended under another label is no block.
             if let Some((label, b64)) = current.take()
+                && label == end
                 && let Some(der) = base64_decode(&b64)
             {
                 out.push((label, der));
@@ -545,6 +550,10 @@ mod tests {
             Identity::new("admin", Role::Admin)
         );
         assert!(Bundle::parse(ca.cert_pem()).is_err());
+        // The CA's block ended as a key: no CA, so no bundle.
+        let ca_pem = b.ca_pem.replace("END CERTIFICATE", "END PRIVATE KEY");
+        let mismatched = format!("{}{}{ca_pem}", b.cert_pem, b.key_pem);
+        assert!(Bundle::parse(&mismatched).is_err());
     }
 
     #[test]

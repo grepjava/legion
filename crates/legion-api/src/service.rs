@@ -875,12 +875,16 @@ impl Probe {
                 "set exactly one of `http`, `tcp`, `grpc` and `exec`",
             ));
         }
+        // Sent as the request's target, which a query may follow but
+        // nothing unprintable, nor a fragment.
         if let Some(http) = &self.http
-            && !http.path.starts_with('/')
+            && (!http.path.starts_with('/')
+                || http.path.contains('#')
+                || !http.path.bytes().all(|b| b.is_ascii_graphic()))
         {
             return Err(Invalid::new(
                 field(path, "http.path"),
-                "must start with `/`",
+                "must start with `/`, of printable ASCII without spaces or #",
             ));
         }
         if let Some(exec) = &self.exec

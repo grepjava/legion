@@ -302,3 +302,114 @@ volumes:
     let data = a.pod.volumes.iter().find(|v| v.name == "tmpfs-0").unwrap();
     assert!(data.volume.is_some(), "{:?}", a.pod.volumes);
 }
+
+#[test]
+fn x_legion_merges_named_entries_and_volume_fields() {
+    let stack = convert_with(
+        "services:
+  a:
+    image: a
+    ports: [\"8080:80\", \"8081:80\"]
+    x-legion: { pod: { containers: [{ name: a, workingDir: /srv }] } }
+volumes:
+  shared:
+    x-legion: { driver: nfs, nfs: { server: files, path: /export } }
+",
+        &[],
+    )
+    .unwrap();
+    let a = spec(&stack, "a");
+    // Merged into the converted container, not replacing it.
+    assert_eq!(a.pod.containers.len(), 1);
+    assert_eq!(a.pod.containers[0].image, "a");
+    assert_eq!(a.pod.containers[0].working_dir.as_deref(), Some("/srv"));
+    // Two published ports on one target: the second VIP port is its own.
+    let ports = &a.endpoint.as_ref().unwrap().ports;
+    let ports: Vec<_> = ports.iter().map(|p| (p.port, p.published_port)).collect();
+    assert_eq!(ports, [(80, Some(8080)), (8081, Some(8081))]);
+    let v = stack
+        .objects
+        .iter()
+        .find(|o| o.kind == Kind::Volume)
+        .unwrap();
+    let v: crate::volume::VolumeSpec = crate::parse(&v.spec).unwrap();
+    assert_eq!(v.driver, crate::volume::VolumeDriver::Nfs);
+    assert_eq!(v.nfs.unwrap().server, "files");
+}
+
+#[test]
+fn ports_on_one_target_keep_their_own_vip_ports() {
+    let ports = |ports: &str| {
+        let stack = convert_with(
+            &format!(
+                "services:
+  a:
+    image: a
+    ports: {ports}
+"
+            ),
+            &[],
+        )?;
+        let a = spec(&stack, "a");
+        Ok::<_, String>(
+            a.endpoint
+                .unwrap()
+                .ports
+                .iter()
+                .map(|p| (p.port, p.published_port))
+                .collect::<Vec<_>>(),
+        )
+    };
+    // `80` beside `8080:80` adds nothing.
+    assert_eq!(ports("[\"8080:80\", \"80\"]").unwrap(), [(80, Some(8080))]);
+    // `8081` keeps its own VIP port; `8081:80` can't have it.
+    let e = ports("[\"8080:80\", \"8081:80\", \"8081\"]").unwrap_err();
+    assert!(e.contains("ports[1]: the service's port 8081/tcp"), "{e}");
+    assert_eq!(
+        ports("[\"8080:80\", \"8082:80\", \"8081\"]").unwrap(),
+        [(80, Some(8080)), (8081, None), (8082, Some(8082))]
+    );
+}
+
+#[test]
+fn external_names_are_not_made_too() {
+    let e = convert_with(
+        "services:
+  a: { image: a }
+volumes:
+  db_data: { external: true }
+  db-data: {}
+",
+        &[],
+    )
+    .unwrap_err();
+    assert!(e.contains("another entry is also named db-data"), "{e}");
+    // Two external ones may name one Volume.
+    assert!(
+        convert_with(
+            "services:
+  a: { image: a }
+volumes:
+  x: { external: true, name: shared }
+  y: { external: true, name: shared }
+",
+            &[],
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn read_only_tmpfs_mounts_stay_read_only() {
+    let stack = convert_with(
+        "services:
+  a:
+    image: a
+    volumes: [{ type: tmpfs, target: /cache, read_only: true }]
+",
+        &[],
+    )
+    .unwrap();
+    let a = spec(&stack, "a");
+    assert!(a.pod.containers[0].volume_mounts[0].read_only);
+}

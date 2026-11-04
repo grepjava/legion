@@ -143,18 +143,41 @@ impl Watcher {
                 Err(broadcast::error::RecvError::Lagged(_)) => return Err(WatchError::Lagged),
                 Err(broadcast::error::RecvError::Closed) => return Err(WatchError::Closed),
             };
-            if let Event::Reset(v) = ev {
-                return Err(WatchError::Reset(v));
-            }
             // A change is committed before it is published, so a reader can
             // list it and then subscribe in time to receive it live as well.
+            // So can a snapshot: a watcher from at or past it has listed the
+            // state it installed.
             if ev.version() <= self.last {
                 continue;
+            }
+            if let Event::Reset(v) = ev {
+                return Err(WatchError::Reset(v));
             }
             if ev.matches(self.kind) {
                 self.last = ev.version();
                 return Ok(ev);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn put(version: u64) -> Event {
+        let mut o = Object::new(Kind::Config, "default", "c", serde_json::json!({}));
+        o.metadata.version = version;
+        Event::Put(o)
+    }
+
+    #[tokio::test]
+    async fn a_reset_a_watcher_has_listed_past_is_skipped() {
+        let hub = Hub::new(0);
+        let mut before = hub.watch(4, None).unwrap();
+        let mut after = hub.watch(5, None).unwrap();
+        hub.publish([Event::Reset(5), put(6)]);
+        assert_eq!(before.next().await, Err(WatchError::Reset(5)));
+        assert_eq!(after.next().await.unwrap().version(), 6);
     }
 }
