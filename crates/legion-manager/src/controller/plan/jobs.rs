@@ -137,9 +137,9 @@ pub(super) fn job(
                     .iter()
                     .filter(|(slot, list)| {
                         // Placed: one waiting to be is never, there.
-                        list.iter().any(|t| {
-                            (t.active() && t.placed()) || t.status.state == TaskState::Failed
-                        }) && super::kept_global(slot, list, nodes, owner, volumes)
+                        list.iter()
+                            .any(|t| (t.active() && t.placed()) || t.failed())
+                            && super::kept_global(slot, list, nodes, owner, volumes)
                     })
                     .map(|(slot, _)| slot.clone()),
             );
@@ -284,6 +284,14 @@ fn start(
     for slot in wanted {
         if budget == 0 {
             break;
+        }
+        // A node kept for its failed task gets the retry once it opens.
+        if let Slot::Node(name) = slot
+            && !nodes.iter().any(|n| {
+                n.name() == name && eligible(n, owner, volumes, &shared_volumes(owner)).is_ok()
+            })
+        {
+            continue;
         }
         let list: &[&Task] = by_slot.get(slot).map_or(&[], Vec::as_slice);
         let busy = list

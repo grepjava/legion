@@ -3671,3 +3671,153 @@ fn an_unready_replacement_on_a_draining_node_is_not_joined_by_a_third() {
     w.settle();
     assert_eq!(w.images("web"), ["web:2"]);
 }
+
+#[test]
+fn stateful_data_asked_onto_a_node_that_evicts_it_stays_away() {
+    use legion_api::volume::MigrationPhase::*;
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.service("db", &STATEFUL.replace("replicas: 3", "replicas: 1"));
+    w.settle();
+    let from = w.placed_task("db-0-1").spec.node.clone();
+    let to = if from == "n1" { "n2" } else { "n1" };
+    // Asked to be where it is, whose taints then evict its task: it
+    // leaves, and does not come back while they do.
+    w.ask("data-db-0", Some(&from));
+    w.taint(&from, "broken", TaintEffect::NoExecute);
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some((to.to_owned(), Copying)));
+    w.migrate();
+    w.settle();
+    w.migrate();
+    w.settle();
+    assert_eq!(w.volume_node("data-db-0"), to);
+    assert_eq!(w.migration("data-db-0"), None);
+    assert_eq!(w.placed("db"), [to]);
+}
+
+#[test]
+fn stateful_data_moving_to_a_node_that_starts_to_evict_it_stays() {
+    use legion_api::volume::MigrationPhase::*;
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.service("db", &STATEFUL.replace("replicas: 3", "replicas: 1"));
+    w.settle();
+    let from = w.placed_task("db-0-1").spec.node.clone();
+    let to = if from == "n1" { "n2" } else { "n1" };
+    w.ask("data-db-0", Some(to));
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some((to.to_owned(), Copying)));
+    // Its task could not run there: the copy is dropped, and none starts.
+    w.taint(to, "broken", TaintEffect::NoExecute);
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), None);
+    assert_eq!(w.volume_node("data-db-0"), from);
+    assert_eq!(w.placed("db"), [from]);
+}
+
+#[test]
+fn a_volume_on_a_draining_node_follows_a_new_ask() {
+    use legion_api::volume::MigrationPhase::*;
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.node("n3", &[]);
+    w.volume("logs", "n1");
+    w.availability("n1", Availability::Drain);
+    w.ask("logs", Some("n2"));
+    w.settle();
+    assert_eq!(w.migration("logs"), Some(("n2".to_owned(), Copying)));
+    // Not a stateful service's: the drain does not hold it to n2.
+    w.ask("logs", Some("n3"));
+    w.settle();
+    assert_eq!(w.migration("logs"), Some(("n3".to_owned(), Copying)));
+}
+
+#[test]
+fn a_global_job_waits_for_a_closed_node_whose_task_was_rejected() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.job("scan", &job("mode: global\nbackoffLimit: 3"));
+    w.settle();
+    assert_eq!(w.running(), ["scan-n1-1", "scan-n2-1"]);
+    // Rejected (a pull that failed, say) as n1 closes: retried once n1
+    // opens, and not before.
+    w.availability("n1", Availability::Pause);
+    w.end("scan-n1-1", TaskState::Rejected);
+    w.end("scan-n2-1", TaskState::Complete);
+    w.settle();
+    w.now += Duration::from_secs(60);
+    w.settle();
+    assert_eq!(w.job_status("scan").state.as_str(), "running");
+    assert!(
+        !w.tasks().iter().any(|t| t.starts_with("scan-n1-2")),
+        "{:?}",
+        w.tasks()
+    );
+    w.availability("n1", Availability::Active);
+    w.now += Duration::from_secs(60);
+    w.settle();
+    assert_eq!(w.running(), ["scan-n1-2"]);
+    w.end("scan-n1-2", TaskState::Complete);
+    w.settle();
+    assert_eq!(w.job_status("scan").state.as_str(), "complete");
+}
+
+#[test]
+fn a_global_job_does_not_wait_for_a_closed_node_without_its_platform() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.job("scan", &job("mode: global\nbackoffLimit: 3"));
+    w.settle();
+    w.availability("n1", Availability::Pause);
+    let platform = w.node_mut("n1").status.platform.clone();
+    let version = w.next();
+    let t = w
+        .tasks
+        .iter_mut()
+        .find(|t| t.object.metadata.name == "scan-n1-1")
+        .unwrap();
+    t.status = TaskStatus {
+        state: TaskState::Rejected,
+        message: "no image for its platform".into(),
+        wrong_platform: Some(platform),
+        ..Default::default()
+    };
+    t.object.status = serde_json::to_value(&t.status).unwrap();
+    t.object.metadata.version = version;
+    w.end("scan-n2-1", TaskState::Complete);
+    w.settle();
+    assert_eq!(w.job_status("scan").state.as_str(), "complete");
+}
+
+#[test]
+fn a_global_task_never_placed_on_a_node_that_closes_goes() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.node_mut("n1").status.allocatable.cpu = Cpu(1000);
+    w.service(
+        "agent",
+        "mode: global\npod: { containers: [{ name: a, image: \"a:1\", resources: { requests: { cpu: \"2\" } } }] }",
+    );
+    w.settle();
+    assert_eq!(w.placed("agent"), ["n2"]);
+    assert!(
+        w.tasks()
+            .iter()
+            .any(|t| t.starts_with("agent-n1-1 pending"))
+    );
+    w.availability("n1", Availability::Pause);
+    w.settle();
+    assert!(
+        w.tasks().contains(&"agent-n1-1 shutdown n1".to_owned()),
+        "{:?}",
+        w.tasks()
+    );
+    assert_eq!(w.placed("agent"), ["n2"]);
+}

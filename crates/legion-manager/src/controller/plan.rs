@@ -586,13 +586,21 @@ fn service(
         .iter()
         .any(|(_, list)| list.iter().any(|t| t.stopping()));
     for (slot, list) in unwanted {
+        // Kept, with its history; one waiting to be placed never is there,
+        // and goes.
         if kept_global(slot, list, nodes, s, volumes) {
-            let current = |t: &Task| t.active() && t.spec.pod == s.spec.pod;
+            for t in list.iter().filter(|t| t.active() && !t.placed()) {
+                plan.actions.push(stop(t));
+            }
+            let current = |t: &Task| t.active() && t.placed() && t.spec.pod == s.spec.pod;
             if list
                 .iter()
                 .any(|t| current(t) && t.status.state == TaskState::Running && t.status.ready)
             {
-                for t in list.iter().filter(|t| t.active() && !current(t)) {
+                for t in list
+                    .iter()
+                    .filter(|t| t.active() && t.placed() && !current(t))
+                {
                     plan.actions.push(stop(t));
                 }
             }
@@ -1260,7 +1268,9 @@ fn kept_global(
         return false;
     };
     let namespace = &s.object.metadata.namespace;
+    let (os, arch, linux) = n.status.platform.runs();
     matches!(n.status.state, NodeState::Ready | NodeState::Suspect)
+        && !s.refused.contains(&(os.to_owned(), arch.to_owned(), linux))
         && n.spec.availability != Availability::Drain
         && !n.repels(s, TaintEffect::NoExecute)
         && !(n.status.platform.no_limits && s.spec.pod.limited())

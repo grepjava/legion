@@ -6,8 +6,9 @@
 //! migration is `finishing`: the migrator sends what changed and hands the
 //! Volume to the new node, where the slot's next task goes.
 //!
-//! A migration whose new node is no longer ready and active is dropped,
-//! and so is one not yet finishing whose old node is no longer draining;
+//! A migration whose new node is no longer ready and active, or now evicts
+//! the stateful service's tasks, is dropped, and so is one not yet
+//! finishing that nothing calls for any more;
 //! the next pass starts another if one is still needed. What the dropped
 //! one's new node received is left over, for the migrator to drop.
 
@@ -48,6 +49,10 @@ pub(super) fn migrations(
                 && v.object.metadata.labels.get(LABEL_SERVICE) == Some(&s.object.metadata.name)
         })
     };
+    // A node a Volume may go to: ready and active, and not one its
+    // stateful service's tasks must leave, which it would only leave again.
+    let usable_for =
+        |v: &Volume, to: &str| usable(to) && !stateful(v).is_some_and(|s| leaves(s, to));
     // Requests placed on each node.
     let mut load: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
     for t in tasks.iter().filter(|t| t.placed()) {
@@ -73,15 +78,16 @@ pub(super) fn migrations(
     }
 
     // Advance or drop the migrations under way. One not yet finishing goes
-    // when neither a drain nor the Volume's `node` calls for it any more.
+    // when neither the Volume's `node` nor its stateful service leaving its
+    // node calls for it any more: only a stateful Volume leaves a draining
+    // node, so one asked elsewhere follows the ask.
     for ((namespace, name), v) in volumes {
         let Some(m) = &v.status.migration else {
             continue;
         };
         let wanted = requested(v) == Some(m.to.as_str())
-            || draining(&v.status.node)
             || stateful(v).is_some_and(|s| leaves(s, &v.status.node));
-        let next = if !usable(&m.to) || (m.phase != MigrationPhase::Finishing && !wanted) {
+        let next = if !usable_for(v, &m.to) || (m.phase != MigrationPhase::Finishing && !wanted) {
             None
         } else if m.phase == MigrationPhase::Copied
             && !tasks.iter().any(|t| {
@@ -105,7 +111,7 @@ pub(super) fn migrations(
     for (key, v) in volumes {
         if let Some(to) = requested(v)
             && v.status.migration.is_none()
-            && usable(to)
+            && usable_for(v, to)
         {
             let m = Migration {
                 to: to.to_owned(),
@@ -188,7 +194,7 @@ pub(super) fn migrations(
                 })
             });
             let to = match together {
-                Some(to) if usable(to) => to,
+                Some(to) if usable(to) && !leaves(s, to) => to,
                 Some(_) => continue,
                 None => match target(s, from, nodes, volumes, &homes, &load) {
                     Some(to) => to,
