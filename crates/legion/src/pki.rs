@@ -99,6 +99,15 @@ impl Pki {
         remove(&self.path(RESEALING))
     }
 
+    /// `settle`, if a reseal was cut short: what is left aside otherwise
+    /// is only cleaned up, and need not stop a key being read or written.
+    fn settle_cut_short(&self) -> anyhow::Result<()> {
+        if self.resealing() {
+            self.settle()?;
+        }
+        Ok(())
+    }
+
     fn path(&self, name: &str) -> PathBuf {
         self.dir.join(name)
     }
@@ -116,6 +125,9 @@ impl Pki {
     /// The same, with its sealed keys opened by `key`; fails if `key` does
     /// not open them.
     pub fn unlock(self, key: legion_store::StoreKey) -> anyhow::Result<Pki> {
+        // A reseal cut short is carried through first: its keys are
+        // the ones to open.
+        self.settle_cut_short()?;
         for f in SEALABLE {
             let path = self.sealed_path(f);
             if let Ok(sealed) = std::fs::read(&path) {
@@ -134,8 +146,10 @@ impl Pki {
         self.lock.as_ref()
     }
 
-    /// A private key, opened if sealed.
+    /// A private key, opened if sealed. A reseal cut short is carried
+    /// through first, so the key is read in the form the lock says.
     fn read_secret(&self, name: &str) -> anyhow::Result<Option<String>> {
+        self.settle_cut_short()?;
         let sealed = self.sealed_path(name);
         match (std::fs::read(&sealed), &self.lock) {
             (Ok(bytes), Some(key)) => {
@@ -151,8 +165,11 @@ impl Pki {
     }
 
     /// Writes a private key, sealed while autolock is on; then drops the
-    /// other form, so a crash between leaves both rather than neither.
+    /// other form, so a crash between leaves both rather than neither. A
+    /// reseal cut short is carried through first: else it would later put
+    /// the key it wrote aside over this one.
     fn write_secret(&self, name: &str, text: &str) -> anyhow::Result<()> {
+        self.settle_cut_short()?;
         let (plain, sealed) = (self.path(name), self.sealed_path(name));
         match &self.lock {
             Some(key) => {
@@ -755,8 +772,8 @@ mod tests {
         write_private(&renewal, "renewed").unwrap();
 
         let key = legion_store::StoreKey::generate();
-        for f in ["store.key", WIREGUARD_KEY] {
-            let text = pki.read_secret(f).unwrap().unwrap();
+        let texts = ["store.key", WIREGUARD_KEY].map(|f| (f, pki.read_secret(f).unwrap().unwrap()));
+        for (f, text) in texts {
             let bytes = legion_store::seal(&key, f, text.as_bytes()).unwrap();
             write_bytes(&Pki::next_path(&pki.sealed_path(f)), &bytes, 0o600).unwrap();
         }
@@ -799,8 +816,8 @@ mod tests {
         std::fs::remove_dir(&blocked).unwrap();
 
         // Written aside, then cut short with one key in place.
-        for f in ["store.key", WIREGUARD_KEY] {
-            let text = pki.read_secret(f).unwrap().unwrap();
+        let texts = ["store.key", WIREGUARD_KEY].map(|f| (f, pki.read_secret(f).unwrap().unwrap()));
+        for (f, text) in texts {
             let bytes = legion_store::seal(&new, f, text.as_bytes()).unwrap();
             write_bytes(&Pki::next_path(&pki.sealed_path(f)), &bytes, 0o600).unwrap();
         }
@@ -817,6 +834,36 @@ mod tests {
                 .unwrap(),
             "wg"
         );
+    }
+
+    /// A reseal whose settling failed, the new lock already in use: a key
+    /// written then (a renewal, say) is not undone by the key written
+    /// aside before it, nor is a key read from the form being left.
+    #[test]
+    fn a_key_written_while_a_reseal_is_unsettled_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pki = Pki::new(dir.path());
+        private_dir(&pki.dir).unwrap();
+        pki.write_secret("node.key", "old").unwrap();
+        let new = legion_store::StoreKey::generate();
+        let bytes = legion_store::seal(&new, "node.key", b"old").unwrap();
+        write_bytes(&Pki::next_path(&pki.sealed_path("node.key")), &bytes, 0o600).unwrap();
+        write(&pki.path(RESEALING), "sealed", 0o600).unwrap();
+        pki.lock = Some(new.clone());
+
+        pki.write_secret("node.key", "renewed").unwrap();
+        let reopened = Pki::new(dir.path()).unlock(new.clone()).unwrap();
+        assert_eq!(
+            reopened.read_secret("node.key").unwrap().unwrap(),
+            "renewed"
+        );
+
+        // Unsealing, cut short: the clear form is still aside.
+        write_private(&Pki::next_path(&pki.path("node.key")), "renewed").unwrap();
+        write(&pki.path(RESEALING), "plain", 0o600).unwrap();
+        pki.lock = None;
+        assert_eq!(pki.read_secret("node.key").unwrap().unwrap(), "renewed");
+        assert!(!pki.sealed_path("node.key").exists());
     }
 
     #[test]

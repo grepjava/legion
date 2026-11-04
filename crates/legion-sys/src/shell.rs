@@ -294,6 +294,23 @@ fn carp_addr(shown: &str, addr: Ipv4Addr) -> Option<u8> {
     })
 }
 
+/// The IPv4 addresses on virtual host `vhid`.
+fn carp_vhid_addrs(shown: &str, vhid: u8) -> Vec<Ipv4Addr> {
+    shown
+        .lines()
+        .filter_map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            if words.first() != Some(&"inet") {
+                return None;
+            }
+            let at = words.iter().position(|w| *w == "vhid")?;
+            (words.get(at + 1)?.parse::<u8>().ok()? == vhid)
+                .then(|| words.get(1)?.parse().ok())
+                .flatten()
+        })
+        .collect()
+}
+
 /// The state in a `carp: MASTER vhid 7 advbase 1 advskew 0` line.
 fn parse_carp_state(shown: &str, vhid: u8) -> Option<CarpState> {
     shown.lines().find_map(|line| {
@@ -573,6 +590,15 @@ impl<R: Runner> Sys for Shell<R> {
             "pass".into(),
             carp.password.clone(),
         ]);
+        // Another address on this virtual host (an earlier one, left by a
+        // manager that ended without releasing it) goes: `alias` would
+        // add this one beside it.
+        for old in carp_vhid_addrs(&shown, carp.vhid) {
+            if old != carp.addr {
+                let old = args([interface, "inet", &old.to_string(), "-alias"]);
+                self.run("ifconfig", &old)?;
+            }
+        }
         let on = carp_addr(&shown, carp.addr);
         if on != Some(carp.vhid) {
             if on.is_some() {
@@ -1525,6 +1551,37 @@ mod tests {
         let carp = Carp {
             vhid: 8,
             addr: Ipv4Addr::new(10, 77, 0, 100),
+            password: "s3cret".into(),
+            advskew: 0,
+        };
+        sh.carp_set("epair0a", &carp, None).unwrap();
+    }
+
+    #[test]
+    fn other_addresses_leave_the_virtual_host() {
+        let shown = CARP_SHOWN.replace(
+            "	groups: epair",
+            "	inet 10.77.0.101 netmask 0xffffffff broadcast 10.77.0.101 vhid 7
+	groups: epair",
+        );
+        assert_eq!(
+            carp_vhid_addrs(&shown, 7),
+            [Ipv4Addr::new(10, 77, 0, 100), Ipv4Addr::new(10, 77, 0, 101)]
+        );
+        assert!(carp_vhid_addrs(&shown, 8).is_empty());
+        let sh = Script::shell(vec![
+            ("ifconfig epair0a", ok(&shown)),
+            ("ifconfig epair0a inet 10.77.0.100 -alias", ok("")),
+            ("ifconfig epair0a inet 10.77.0.101 -alias", ok("")),
+            ("kldstat -q -m carp", ok("")),
+            (
+                "ifconfig epair0a vhid 7 advskew 0 pass s3cret alias 10.77.0.102/32",
+                ok(""),
+            ),
+        ]);
+        let carp = Carp {
+            vhid: 7,
+            addr: Ipv4Addr::new(10, 77, 0, 102),
             password: "s3cret".into(),
             advskew: 0,
         };

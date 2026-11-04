@@ -761,16 +761,18 @@ async fn load_balancing(
             }
         }
         first = false;
+        // Jobs too, unbalanced (no VIP, no ports): only so their tasks'
+        // connections are left alone.
         let services: Vec<Service> = endpoints
             .borrow_and_update()
             .iter()
-            .filter(|e| !e.job)
             .map(|e| Service {
                 uid: e.uid.clone(),
-                vip: e.vip,
+                vip: e.vip.filter(|_| !e.job),
                 ports: e
                     .ports
                     .iter()
+                    .filter(|_| !e.job)
                     .map(|p| Port {
                         proto: match p.protocol {
                             legion_api::service::Protocol::Tcp => Proto::Tcp,

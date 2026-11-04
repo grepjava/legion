@@ -245,11 +245,19 @@ impl LoadBalancer {
             }
         }
 
-        // Backends that no longer run anywhere.
+        // Backends that no longer run anywhere. A task of any service,
+        // balanced or not, keeps its connections: one that stopped being
+        // balanced still runs, and an address freed is soon another
+        // task's. Those stay tracked, to go once they stop running.
+        let live: BTreeSet<IpAddr> = services
+            .iter()
+            .flat_map(|s| dual(&s.alive).into_iter().chain(dual(&s.ready)))
+            .collect();
         let backends: BTreeSet<IpAddr> = services
             .iter()
             .filter(|s| s.balanced())
             .flat_map(|s| dual(&s.alive).into_iter().chain(dual(&s.ready)))
+            .chain(self.backends.intersection(&live).copied())
             .collect();
         let gone: BTreeSet<IpAddr> = self.backends.difference(&backends).copied().collect();
         self.tables = tables;
@@ -434,6 +442,60 @@ mod tests {
         }
         // The next pass still knows .2 went.
         lb.apply(&sys, &one, subnet, Exits::default()).unwrap();
+        assert!(sys.states().is_empty());
+    }
+
+    #[test]
+    fn connections_of_tasks_still_running_unbalanced_are_kept() {
+        let sys = FakeSys::new();
+        let subnet = "10.200.0.0/24".parse().unwrap();
+        let mut lb = LoadBalancer::default();
+        let state = |id: &str, addr: &str| PfState {
+            id: id.into(),
+            addrs: dual(&[ip(addr), ip("10.200.0.9")]),
+        };
+        let unbalanced = |uid: &str, alive: &[&str]| Service {
+            uid: uid.into(),
+            vip: None,
+            ports: Vec::new(),
+            ready: alive.iter().map(|a| ip(a)).collect(),
+            alive: alive.iter().map(|a| ip(a)).collect(),
+        };
+        lb.apply(
+            &sys,
+            &[web(&["10.200.0.2", "10.200.0.3"], &[])],
+            subnet,
+            Exits::default(),
+        )
+        .unwrap();
+        sys.add_state(state("a", "10.200.0.2"));
+        sys.add_state(state("b", "10.200.0.3"));
+
+        // The service turns headless; its tasks run on. And .3's address,
+        // freed, goes to a job's task.
+        let now = [
+            unbalanced("0000000000000007", &["10.200.0.2"]),
+            unbalanced("0000000000000008", &["10.200.0.3"]),
+        ];
+        lb.apply(&sys, &now, subnet, Exits::default()).unwrap();
+        assert_eq!(sys.states().len(), 2);
+
+        // Once they stop running, their connections go.
+        lb.apply(
+            &sys,
+            &[unbalanced("0000000000000008", &["10.200.0.3"])],
+            subnet,
+            Exits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            sys.states()
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            ["b"]
+        );
+        lb.apply(&sys, &[], subnet, Exits::default()).unwrap();
         assert!(sys.states().is_empty());
     }
 

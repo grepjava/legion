@@ -228,6 +228,21 @@ fn shows_every_kind_with_its_use() {
     assert!(!secret.spec.to_string().contains("czNjcmV0"));
 }
 
+/// The YAML of an object deleted while open shows no more, and keys go to
+/// the table again.
+#[test]
+fn yaml_of_a_deleted_object_lets_keys_through() {
+    let mut m = cluster();
+    let mut v = View::default();
+    typed(&mut v, &m, "y");
+    assert!(screen(&m, &v).contains("node n1 — YAML"));
+    m.changed(false, node("n1", 1, "ready", "active"), 0);
+    typed(&mut v, &m, "j");
+    assert!(v.yaml.is_none());
+    typed(&mut v, &m, "?");
+    assert!(v.help, "? was taken by the YAML gone");
+}
+
 #[test]
 fn details_and_yaml_of_the_selected_object() {
     let m = cluster();

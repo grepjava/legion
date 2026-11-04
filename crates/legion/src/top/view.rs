@@ -393,7 +393,11 @@ impl View {
             self.help = false;
             return None;
         }
-        if let Some((key, scroll)) = self.yaml.take() {
+        // Not once its object is gone: nothing shows it then, and keys
+        // act on the table it no longer hides.
+        if let Some((key, scroll)) = self.yaml.take()
+            && model.get(&key).is_some()
+        {
             let scroll = match k.code {
                 KeyCode::Down | KeyCode::Char('j') => scroll.saturating_add(1),
                 KeyCode::Up | KeyCode::Char('k') => scroll.saturating_sub(1),
