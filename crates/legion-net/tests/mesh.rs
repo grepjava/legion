@@ -278,8 +278,10 @@ fn pods_across_nodes() {
         n.net.attach(&n.sys, id, pod, ip).unwrap();
         ips.insert(pod, ip);
         if pod != "c" {
-            // Background processes must not hold on to sh()'s pipes.
-            for family in ["-4", "-6"] {
+            // Background processes must not hold on to sh()'s pipes. Two
+            // listeners a family (nc sets SO_REUSEPORT): while one starts
+            // over after a connection, the other takes the next.
+            for family in ["-4", "-4", "-6", "-6"] {
                 n.pod(
                     pod,
                     &format!(
@@ -365,7 +367,8 @@ fn pods_across_nodes() {
 
     // w2's egress limited, its namespace open and then letting c in: it
     // still answers what reaches it over the mesh, from another node's pod
-    // and from another node's own address, as published ports do.
+    // and from another node's own address, as published ports and ingress
+    // proxies elsewhere do.
     let n2 = &nodes[1];
     for knob in ["pfil_member", "pfil_local_phys"] {
         must(&format!(
@@ -410,24 +413,31 @@ fn pods_across_nodes() {
             ))
             .1
         };
-        let got = connect(&client, &w2s, 8080, 2);
-        assert!(
-            got.iter().all(|g| g.as_deref() == Some("w2")),
-            "open {open}, from c: {got:?}\n{}",
-            rules()
-        );
-        let got = connect(&format!("jexec {}", nodes[2].jail), &w2s, 8080, 2);
-        assert!(
-            got.iter().all(|g| g.as_deref() == Some("w2")),
-            "open {open}, from node 3: {got:?}\n{}",
-            rules()
-        );
-        let got = connect(&outside, "192.168.252.3", PUBLISHED, 6);
-        assert!(
-            got.iter().all(Option::is_some) && names(&got).contains("w2"),
-            "open {open}, published on node 3: {got:?}\n{}",
-            rules()
-        );
+        // Node 3 connects from its underlay address, as an ingress proxy
+        // there does; its published port reaches w2 NATed to that address.
+        for (family, to, published) in [
+            ("", w2s.clone(), "192.168.252.3".to_owned()),
+            (" over IPv6", w2_6.to_string(), format!("{LAN6}::3")),
+        ] {
+            let got = connect(&client, &to, 8080, 2);
+            assert!(
+                got.iter().all(|g| g.as_deref() == Some("w2")),
+                "open {open}, from c{family}: {got:?}\n{}",
+                rules()
+            );
+            let got = connect(&format!("jexec {}", nodes[2].jail), &to, 8080, 2);
+            assert!(
+                got.iter().all(|g| g.as_deref() == Some("w2")),
+                "open {open}, from node 3{family}: {got:?}\n{}",
+                rules()
+            );
+            let got = connect(&outside, &published, PUBLISHED, 6);
+            assert!(
+                got.iter().all(Option::is_some) && names(&got).contains("w2"),
+                "open {open}, published on node 3{family}: {got:?}\n{}",
+                rules()
+            );
+        }
         // Egress itself stays limited.
         let (ok, _) = n2.pod("w2", &format!("nc -z -w 2 {} 8080", ips["w1"]));
         assert!(!ok, "open {open}: w2 reached w1");

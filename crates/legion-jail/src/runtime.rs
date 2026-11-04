@@ -13,7 +13,7 @@
 //! its own on the host's network (`ip4`/`ip6` inherited), set up as a pod's
 //! member is. Legion's agent never makes one; jailer runs images so.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -91,6 +91,8 @@ pub struct JailRuntime {
     events: broadcast::Sender<Event>,
     execs: Execs,
     used: Used,
+    /// Names of containers being made, not yet recorded.
+    creating: Arc<Mutex<BTreeSet<String>>>,
 }
 
 /// Attached execs by id. Each is removed when its caller lets go, or once
@@ -459,6 +461,7 @@ impl JailRuntime {
             events,
             execs: Arc::default(),
             used: Used::default(),
+            creating: Arc::default(),
         };
         tokio::spawn(watch_exits(
             rt.sys.clone(),
@@ -621,11 +624,13 @@ async fn watch_exits(sys: Arc<dyn Sys>, dir: PathBuf, boot: u64, events: broadca
                 let mut next = BTreeMap::new();
                 for (rec, s, run) in now {
                     let now = (s, run);
+                    // One not seen before ended since the last look: it
+                    // was made, started and ended within one.
                     if let Status::Exited(exit) = &now.0
                         && !first
                         && seen
                             .get(&rec.id)
-                            .is_some_and(|before| exited_since(before, &now))
+                            .is_none_or(|before| exited_since(before, &now))
                     {
                         let _ = events.send(died(&rec, exit.code));
                     }
@@ -715,6 +720,30 @@ fn died(rec: &Record, code: i32) -> Event {
 
 fn labelled(labels: &BTreeMap<String, String>, wanted: &[(String, String)]) -> bool {
     wanted.iter().all(|(k, v)| labels.get(k) == Some(v))
+}
+
+/// A container name [`JailRuntime::create`] is making, freed when dropped.
+struct Creating {
+    names: Arc<Mutex<BTreeSet<String>>>,
+    name: String,
+}
+
+impl Creating {
+    fn claim(names: &Arc<Mutex<BTreeSet<String>>>, name: &str) -> Result<Creating> {
+        if !names.lock().unwrap().insert(name.to_owned()) {
+            return Err(api(409, format!("the container name {name:?} is in use")));
+        }
+        Ok(Creating {
+            names: names.clone(),
+            name: name.to_owned(),
+        })
+    }
+}
+
+impl Drop for Creating {
+    fn drop(&mut self) {
+        self.names.lock().unwrap().remove(&self.name);
+    }
 }
 
 impl JailRuntime {
@@ -1103,29 +1132,43 @@ impl legion_runtime::Runtime for JailRuntime {
     }
 
     async fn create(&self, spec: &ContainerSpec) -> Result<String> {
+        // Held until the record is written, so that two creates of one name
+        // cannot both find it free.
+        let _name = Creating::claim(&self.creating, &spec.name)?;
         let rec = self.make_record(spec)?;
         let dir = self.container_dir(&rec.id);
         std::fs::create_dir_all(&dir).map_err(internal)?;
+        // What a create that fails made goes: a clone, or a copy of the
+        // image's files, flagged ones too.
+        let undo = |e| {
+            if !rec.is_pod() {
+                let _ = self
+                    .images
+                    .cleanup_rootfs(&rec.root, rec.dataset.as_deref());
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            e
+        };
         if !rec.is_pod() {
             let image = self
                 .images
                 .get(&rec.image)
-                .map_err(image_error)?
-                .ok_or_else(|| api(404, format!("{}: image not known", rec.image)))?;
+                .map_err(image_error)
+                .and_then(|i| i.ok_or_else(|| api(404, format!("{}: image not known", rec.image))))
+                .map_err(undo)?;
             let images = self.images.clone();
             let (root, ds) = (rec.root.clone(), rec.dataset.clone());
-            let made = blocking(move || {
+            blocking(move || {
                 images
                     .prepare_rootfs(&image, &root, ds.as_deref())
                     .map_err(image_error)
             })
-            .await;
-            if let Err(e) = made {
-                let _ = std::fs::remove_dir_all(&dir);
-                return Err(e);
-            }
+            .await
+            .map_err(undo)?;
         }
-        state::write(&dir, RECORD, &rec).map_err(internal)?;
+        state::write(&dir, RECORD, &rec)
+            .map_err(internal)
+            .map_err(undo)?;
         Ok(rec.id)
     }
 
@@ -1135,8 +1178,10 @@ impl legion_runtime::Runtime for JailRuntime {
             return Ok(());
         }
         let dir = self.container_dir(id);
-        state::remove(&dir, EXIT).map_err(internal)?;
+        // The run before the end: one looking between the two sees the
+        // container ended, not ended at once with the made-up 255.
         state::remove(&dir, RUN).map_err(internal)?;
+        state::remove(&dir, EXIT).map_err(internal)?;
         if let Some(parent) = &rec.parent {
             let pod = self.record(parent)?;
             if !matches!(self.status(&pod)?, Status::Running(_)) {
@@ -1859,6 +1904,74 @@ mod tests {
         rt.remove("c2").await.unwrap();
         assert!(sys.zfs_list("tank/jails/c2").unwrap().is_empty());
         assert!(!t.path().join("state/c2").exists());
+    }
+
+    #[tokio::test]
+    async fn a_container_made_and_ended_between_looks_is_told_of() {
+        let t = tempfile::tempdir().unwrap();
+        let sys = Arc::new(legion_sys::FakeSys::new());
+        let (tx, mut events) = broadcast::channel(8);
+        let watching = tokio::spawn(watch_exits(sys, t.path().to_owned(), 1, tx));
+        tokio::time::sleep(TICK * 2).await;
+        let dir = t.path().join("c3");
+        let rec = Record {
+            id: "c3".into(),
+            name: "c3".into(),
+            image: String::new(),
+            created: 0,
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            parent: None,
+            standalone: true,
+            jail: "c3".into(),
+            root: dir.join("root"),
+            dataset: None,
+            argv: vec!["/bin/true".into()],
+            env: Vec::new(),
+            user: String::new(),
+            work_dir: "/".into(),
+            hostname: "c3".into(),
+            mounts: Vec::new(),
+            params: Vec::new(),
+            stop_signal: 15,
+            stop_timeout: 10,
+            linux: false,
+            cpuset: None,
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = Run {
+            shim: 0,
+            pid: 0,
+            jid: 1,
+            started: 1,
+            boot: 1,
+        };
+        state::write(&dir, RUN, &run).unwrap();
+        let exit = Exit {
+            code: 7,
+            finished: 1,
+            error: None,
+        };
+        state::write(&dir, EXIT, &exit).unwrap();
+        // Its record last: no look finds it before it ended.
+        state::write(&dir, RECORD, &rec).unwrap();
+        let e = tokio::time::timeout(TICK * 10, events.recv())
+            .await
+            .expect("no died event")
+            .unwrap();
+        assert_eq!((e.action.as_str(), e.actor.id.as_str()), ("died", "c3"));
+        assert_eq!(e.actor.attributes["containerExitCode"], "7");
+        watching.abort();
+    }
+
+    #[test]
+    fn a_name_is_made_once_at_a_time() {
+        let names = Arc::default();
+        let first = Creating::claim(&names, "web").unwrap();
+        assert!(Creating::claim(&names, "web").is_err());
+        let _other = Creating::claim(&names, "db").unwrap();
+        drop(first);
+        Creating::claim(&names, "web").unwrap();
     }
 
     #[test]

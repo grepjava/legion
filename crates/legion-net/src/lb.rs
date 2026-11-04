@@ -220,22 +220,29 @@ impl LoadBalancer {
         subnet: Ipv4Net,
         exits: Exits,
     ) -> legion_sys::Result<()> {
+        let mut tables = BTreeMap::new();
+        for s in services.iter().filter(|s| s.balanced()) {
+            tables.insert(s.table(), dual(&s.ready));
+        }
+        // Tables first: a new service's rules would otherwise send its
+        // first connections to a table not filled yet.
+        for (table, ready) in &tables {
+            if self.tables.get(table) != Some(ready) {
+                sys.pf_table_replace(ANCHOR, table, ready)?;
+                self.tables.insert(table.clone(), ready.clone());
+            }
+        }
         let rules = rules(services, subnet, exits);
         if self.loaded.as_ref() != Some(&rules) {
             sys.pf_load_anchor(ANCHOR, &rules)?;
             self.loaded = Some(rules);
-            // Contents are set below for every table the rules use.
+            // Loading rules may drop tables they did not name before; set
+            // every one again, and next time the ones that failed.
             self.tables.clear();
-        }
-
-        let mut tables = BTreeMap::new();
-        for s in services.iter().filter(|s| s.balanced()) {
-            let ready = dual(&s.ready);
-            let table = s.table();
-            if self.tables.get(&table) != Some(&ready) {
-                sys.pf_table_replace(ANCHOR, &table, &ready)?;
+            for (table, ready) in &tables {
+                sys.pf_table_replace(ANCHOR, table, ready)?;
+                self.tables.insert(table.clone(), ready.clone());
             }
-            tables.insert(table, ready);
         }
 
         // Backends that no longer run anywhere.
@@ -383,6 +390,25 @@ mod tests {
             "{host}nat-anchor \"legion/*\" all\nrdr-anchor \"legion/*\" all\nanchor \"legion/*\" all\n"
         );
         assert!(missing_hooks(&hooked).is_empty());
+    }
+
+    #[test]
+    fn tables_are_filled_before_the_rules_use_them() {
+        let sys = FakeSys::new();
+        let subnet = "10.200.0.0/24".parse().unwrap();
+        let mut lb = LoadBalancer::default();
+        sys.break_anchor(ANCHOR, true);
+        let r = lb.apply(&sys, &[web(&["10.200.0.2"], &[])], subnet, Exits::default());
+        assert!(r.is_err());
+        assert!(
+            sys.pf_table_show(ANCHOR, "s0000000000000007")
+                .unwrap()
+                .contains(&ip("10.200.0.2").into())
+        );
+        sys.break_anchor(ANCHOR, false);
+        lb.apply(&sys, &[web(&["10.200.0.2"], &[])], subnet, Exits::default())
+            .unwrap();
+        assert!(sys.anchor(ANCHOR).is_some());
     }
 
     #[test]

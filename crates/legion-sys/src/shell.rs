@@ -166,12 +166,20 @@ impl<R: Runner> Shell<R> {
     }
 }
 
+/// Which end of a [`stream`]ed command is the stream; the other is null.
+#[derive(Clone, Copy, PartialEq)]
+enum Streamed {
+    Input,
+    Output,
+}
+
 /// Runs a command whose input or output is a stream: `pump` moves it
 /// while the command runs, then the command must succeed. A pump that
 /// fails stops the command.
 fn stream(
     program: &str,
     args: &[String],
+    streamed: Streamed,
     pump: impl FnOnce(&mut std::process::Child) -> std::io::Result<()>,
 ) -> Result<()> {
     use std::io::Read;
@@ -179,8 +187,16 @@ fn stream(
     tracing::debug!(%command, "run");
     let mut child = Command::new(program)
         .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdin(if streamed == Streamed::Input {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(if streamed == Streamed::Output {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|source| Error::Spawn {
@@ -358,7 +374,14 @@ impl<R: Runner> Sys for Shell<R> {
             format!("name={jail}")
         };
         let mut a = vec!["-m".to_owned(), target];
-        a.extend(params.iter().map(|(k, v)| format!("{k}={v}")));
+        // A boolean bare, as `jail_create` gives it.
+        a.extend(params.iter().map(|(k, v)| {
+            if v.is_empty() {
+                (*k).to_owned()
+            } else {
+                format!("{k}={v}")
+            }
+        }));
         self.run("jail", &a).map(drop)
     }
 
@@ -936,17 +959,22 @@ impl<R: Runner> Sys for Shell<R> {
             a.extend(["-i".to_owned(), format!("@{since}")]);
         }
         a.push(snapshot.to_owned());
-        stream("zfs", &a, |child| {
+        stream("zfs", &a, Streamed::Output, |child| {
             let mut from = child.stdout.take().expect("piped stdout");
             std::io::copy(&mut from, out).map(drop)
         })
     }
 
     fn zfs_receive(&self, dataset: &str, input: &mut dyn std::io::Read) -> Result<()> {
-        stream("zfs", &args(["receive", "-F", "-u", dataset]), |child| {
-            let mut to = child.stdin.take().expect("piped stdin");
-            std::io::copy(input, &mut to).map(drop)
-        })
+        stream(
+            "zfs",
+            &args(["receive", "-F", "-u", dataset]),
+            Streamed::Input,
+            |child| {
+                let mut to = child.stdin.take().expect("piped stdin");
+                std::io::copy(input, &mut to).map(drop)
+            },
+        )
     }
 
     fn zfs_mount(&self, dataset: &str) -> Result<()> {

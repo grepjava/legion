@@ -112,9 +112,13 @@ pub fn read<T: for<'de> Deserialize<'de>>(dir: &Path, name: &str) -> std::io::Re
     }
 }
 
-/// Writes `name` in `dir` whole or not at all.
+/// Writes `name` in `dir` whole or not at all. Each write has a file of
+/// its own to rename: the supervisor and the runtime may both write a
+/// container's end.
 pub fn write<T: Serialize>(dir: &Path, name: &str, value: &T) -> std::io::Result<()> {
-    let tmp = dir.join(format!(".{name}.tmp"));
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.{}-{n}.tmp", std::process::id()));
     std::fs::write(
         &tmp,
         serde_json::to_vec(value).map_err(std::io::Error::other)?,
@@ -156,14 +160,15 @@ pub fn boot_time() -> u64 {
 }
 
 /// A signal by name (`SIGQUIT`, `QUIT`) or number, as images give their
-/// stop signal.
+/// stop signal. Numbers name a signal only from 1 to FreeBSD's last, 128:
+/// 0 would only check the process is there.
 pub fn signal(s: &str) -> Option<i32> {
     let s = s.trim();
     if s.is_empty() {
         return None;
     }
-    if let Ok(n) = s.parse() {
-        return Some(n);
+    if let Ok(n) = s.parse::<i32>() {
+        return (1..=128).contains(&n).then_some(n);
     }
     let name = s.strip_prefix("SIG").unwrap_or(s);
     // FreeBSD's numbers (signal(3)).
@@ -190,8 +195,33 @@ mod tests {
         assert_eq!(signal("SIGQUIT"), Some(3));
         assert_eq!(signal("TERM"), Some(15));
         assert_eq!(signal("9"), Some(9));
+        assert_eq!(signal("0"), None);
+        assert_eq!(signal("-1"), None);
+        assert_eq!(signal("99999"), None);
         assert_eq!(signal(""), None);
         assert_eq!(signal("SIGNOPE"), None);
+    }
+
+    #[test]
+    fn writers_of_one_file_do_not_trip_each_other() {
+        let t = tempfile::tempdir().unwrap();
+        std::thread::scope(|scope| {
+            for code in 0..8 {
+                let dir = t.path();
+                scope.spawn(move || {
+                    for _ in 0..50 {
+                        let e = Exit {
+                            code,
+                            finished: 1,
+                            error: None,
+                        };
+                        write(dir, EXIT, &e).unwrap();
+                    }
+                });
+            }
+        });
+        assert!(read::<Exit>(t.path(), EXIT).unwrap().is_some());
+        assert_eq!(std::fs::read_dir(t.path()).unwrap().count(), 1);
     }
 
     #[test]
