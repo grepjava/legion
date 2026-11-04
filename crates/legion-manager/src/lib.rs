@@ -64,6 +64,9 @@ pub struct ManagerConfig {
     /// The key the store seals its values with; `None` writes them in the
     /// clear (tests).
     pub store_key: Option<legion_store::StoreKey>,
+    /// Whether routes may name an ACME directory over plain HTTP on this
+    /// host's loopback: only tests run an authority there.
+    pub acme_loopback: bool,
 }
 
 impl ManagerConfig {
@@ -79,6 +82,7 @@ impl ManagerConfig {
             controllers: true,
             vip: None,
             store_key: None,
+            acme_loopback: false,
         }
     }
 }
@@ -124,6 +128,7 @@ pub struct Manager {
     ca_key_pem: Option<String>,
     heartbeat: std::time::Duration,
     controllers: bool,
+    acme_loopback: bool,
     vip: Option<(std::sync::Arc<dyn legion_sys::Sys>, vip::VipConfig)>,
     /// The store as metrics read it, emptied before the store shuts down.
     metrics: metrics::Slot,
@@ -159,6 +164,7 @@ impl Manager {
             ca_key_pem: config.tls.and_then(|t| t.ca_key_pem),
             heartbeat: config.heartbeat,
             controllers: config.controllers,
+            acme_loopback: config.acme_loopback,
             vip: config.vip,
             metrics: std::sync::Arc::new(std::sync::RwLock::new(Some(store.clone()))),
             requests: Default::default(),
@@ -206,9 +212,14 @@ impl Manager {
                 closing.clone(),
             ))
         });
-        let acme = self
-            .controllers
-            .then(|| tokio::spawn(acme::run(self.store.clone(), self.id, closing.clone())));
+        let acme = self.controllers.then(|| {
+            tokio::spawn(acme::run(
+                self.store.clone(),
+                self.id,
+                self.acme_loopback,
+                closing.clone(),
+            ))
+        });
         let issuer = match (&self.credentials, &self.ca_key_pem) {
             (Some(c), Some(key)) => Some(join::Issuer {
                 ca: std::sync::Arc::new(legion_pki::Ca::load(c.ca_pem(), key)?),

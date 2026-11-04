@@ -1470,6 +1470,41 @@ async fn usage_shows_what_the_caller_may_read() {
     .await;
     let w1 = creds(&ca, "w1", Role::Worker);
     let d1 = DispatcherClient::new(m.channel(Some(&w1)).await.unwrap());
+    // Usage is believed only of a node's own tasks: w1 runs web in a and b.
+    eventually(|| {
+        let mut d = d1.clone();
+        async move {
+            d.register(RegisterRequest {
+                node: String::new(),
+                status_json: br#"{"state":"ready"}"#.to_vec(),
+                ..Default::default()
+            })
+            .await
+        }
+    })
+    .await;
+    for namespace in ["a", "b"] {
+        let object = Object {
+            namespace: namespace.into(),
+            ..service("web", 1)
+        };
+        eventually(|| {
+            let mut admin = admin.clone();
+            let object = object.clone();
+            async move { admin.apply(apply(object)).await }
+        })
+        .await;
+    }
+    until("web runs on w1 in both namespaces", || {
+        ["a", "b"].iter().all(|ns| {
+            let key = legion_api::ObjectKey::new(legion_api::Kind::Task, ns, "web-1-1");
+            m.store
+                .get(&key)
+                .unwrap()
+                .is_some_and(|t| t.spec["node"] == "w1")
+        })
+    })
+    .await;
     let task = |namespace: &str, cpu_percent| legion_proto::v1::TaskUsage {
         namespace: namespace.into(),
         task: "web-1-1".into(),
@@ -2396,6 +2431,82 @@ async fn deleting_a_running_task_stops_it_first() {
     m.stop().await;
 }
 
+/// A task its node rejected never had a pod: no session opens on it, even
+/// named directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_task_has_no_sessions() {
+    let m = Running::start().await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let d = DispatcherClient::new(m.channel(None).await.unwrap());
+    let register = || {
+        let mut d = d.clone();
+        async move {
+            d.register(RegisterRequest {
+                node: "w1".into(),
+                status_json: br#"{"state":"ready"}"#.to_vec(),
+                ..Default::default()
+            })
+            .await
+        }
+    };
+    eventually(register).await;
+    apply_json(
+        &m,
+        "Service",
+        "web",
+        serde_json::json!({
+            "replicas": 1,
+            "pod": { "containers": [{ "name": "web", "image": "web:1" }] },
+        }),
+    )
+    .await;
+    let assigned = || {
+        m.store
+            .list(legion_api::Kind::Task, Some("default"))
+            .unwrap()
+            .objects
+            .into_iter()
+            .find(|t| t.spec["node"] == "w1")
+    };
+    until("the task is assigned", || assigned().is_some()).await;
+    let task = assigned().unwrap();
+    d.clone()
+        .report(ReportRequest {
+            node: "w1".into(),
+            namespace: "default".into(),
+            name: task.metadata.name.clone(),
+            uid: task.metadata.uid.clone(),
+            status_json: br#"{"state":"rejected","message":"no such image"}"#.to_vec(),
+        })
+        .await
+        .unwrap();
+    let key = task.key();
+    until("it is rejected", || {
+        m.store.get(&key).unwrap().unwrap().status["state"] == "rejected"
+    })
+    .await;
+
+    let open = SessionFrame {
+        frame: Some(Frame::Open(SessionOpen {
+            namespace: "default".into(),
+            task: task.metadata.name.clone(),
+            container: String::new(),
+            action: Some(Action::Logs(LogsOptions::default())),
+        })),
+    };
+    let refused = PodsClient::new(m.channel(None).await.unwrap())
+        .session(tokio_stream::iter([open]))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    assert!(
+        refused.message().contains("was rejected: no such image"),
+        "{}",
+        refused.message()
+    );
+    m.stop().await;
+}
+
 /// A Volume in use keeps its storage: an agent would not see the change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_volume_in_use_keeps_its_storage() {
@@ -2474,5 +2585,55 @@ async fn a_volume_in_use_keeps_its_storage() {
     let err = try_apply(lun("iqn.2026-11.test:c")).await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
     assert!(err.message().contains("mounted by task"), "{err}");
+    m.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_is_routed_by_one_namespace() {
+    let m = Running::start().await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let mut objects = m.objects().await;
+    let route = |namespace: &str, name: &str, host: &str| {
+        object(
+            "Route",
+            namespace,
+            name,
+            serde_json::json!({ "host": host, "service": "web" }),
+        )
+    };
+    objects
+        .apply(route("shop", "www", "shop.example.org"))
+        .await
+        .unwrap();
+    // Its own namespace may route it again, on another path too.
+    objects
+        .apply(object(
+            "Route",
+            "shop",
+            "api",
+            serde_json::json!({ "host": "shop.example.org", "path": "/api", "service": "api" }),
+        ))
+        .await
+        .unwrap();
+    // Another may not: not the host, nor a `*.` host over it, nor a host
+    // under one of theirs.
+    for host in ["shop.example.org", "*.example.org"] {
+        let err = objects.apply(route("evil", "www", host)).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+        assert!(err.message().contains("namespace shop"), "{err}");
+    }
+    objects
+        .apply(route("shop", "any", "*.example.net"))
+        .await
+        .unwrap();
+    let err = objects
+        .apply(route("evil", "www", "www.example.net"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+    objects
+        .apply(route("evil", "www", "evil.example.org"))
+        .await
+        .unwrap();
     m.stop().await;
 }

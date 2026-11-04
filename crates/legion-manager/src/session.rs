@@ -27,7 +27,7 @@ use crate::api::{ApiService, check_namespace};
 use crate::authz::Verb;
 
 /// How long an agent has to attach to a session offered to it.
-const ATTACH_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const ATTACH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How long a client has to send its `open` frame.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -90,6 +90,15 @@ impl Hub {
         node: &str,
         offer: SessionOffer,
     ) -> Result<Attachment, Status> {
+        self.offer_within(node, offer, ATTACH_TIMEOUT).await
+    }
+
+    async fn offer_within(
+        self: &Arc<Self>,
+        node: &str,
+        offer: SessionOffer,
+        limit: Duration,
+    ) -> Result<Attachment, Status> {
         let id = offer.id.clone();
         let (attached, wait) = oneshot::channel();
         let agent = {
@@ -116,17 +125,23 @@ impl Hub {
         })?;
         // However this ends, given up on included, the offer goes.
         let _waiting = Waiting { hub: self, id };
-        if agent.send(Ok(offer)).await.is_err() {
-            return Err(Status::unavailable(format!(
-                "the agent of node {node} went away"
-            )));
-        }
-        match tokio::time::timeout(ATTACH_TIMEOUT, wait).await {
-            Ok(Ok(a)) => Ok(a),
-            _ => Err(Status::unavailable(format!(
-                "the agent of node {node} did not take the session"
-            ))),
-        }
+        // The time counts from the offer, its queueing included: an agent
+        // that stopped taking offers has a full queue.
+        let offered = async {
+            agent
+                .send(Ok(offer))
+                .await
+                .map_err(|_| Status::unavailable(format!("the agent of node {node} went away")))?;
+            wait.await
+                .map_err(|_| Status::unavailable(format!("the agent of node {node} went away")))
+        };
+        tokio::time::timeout(limit, offered)
+            .await
+            .unwrap_or_else(|_| {
+                Err(Status::unavailable(format!(
+                    "the agent of node {node} did not take the session"
+                )))
+            })
     }
 
     /// An agent attaching to session `id`; `node` is the node it acts for,
@@ -212,6 +227,13 @@ impl Pods for PodsService {
                 open.task
             )));
         }
+        // Refused by its node, it never had a pod to show.
+        if status.state == TaskState::Rejected {
+            return Err(Status::failed_precondition(format!(
+                "task {} was rejected: {}",
+                open.task, status.message
+            )));
+        }
         let interactive = !matches!(open.action, Some(Action::Logs(_)));
         if interactive && status.state != TaskState::Running {
             return Err(Status::failed_precondition(format!(
@@ -229,7 +251,13 @@ impl Pods for PodsService {
             task_uid: task.metadata.uid.clone(),
             pod_ip: status.ip.unwrap_or_default(),
         };
-        let attachment = self.api.sessions.offer(&spec.node, offer).await?;
+        let mut closing = self.api.closing.clone();
+        let attachment = tokio::select! {
+            a = self.api.sessions.offer(&spec.node, offer) => a?,
+            _ = closing.wait_for(|c| *c) => {
+                return Err(Status::unavailable("the manager is shutting down"));
+            }
+        };
         let (to_user, rx) = mpsc::channel(16);
         tokio::spawn(relay(
             from_user,
@@ -435,6 +463,8 @@ async fn relay(
         () = up => false,
         () = down => false,
         () = to_user.closed() => false,
+        // The attach ended on the manager's side: its node was removed.
+        () = to_agent.closed() => false,
         () = shutdown(&mut closing) => true,
     };
     if shutting_down {
@@ -477,6 +507,32 @@ mod tests {
         assert!(hub.inner.lock().unwrap().pending.contains_key("s1"));
         waiting.abort();
         let _ = waiting.await;
+        assert!(hub.inner.lock().unwrap().pending.is_empty());
+    }
+
+    /// An agent that stops taking offers fails them in time, though its
+    /// queue is full.
+    #[tokio::test]
+    async fn a_full_queue_fails_the_offer_in_time() {
+        let hub = Arc::new(Hub::default());
+        let _offers = hub.follow("n1");
+        let mut waiting = Vec::new();
+        for i in 0..20 {
+            let hub = hub.clone();
+            let offer = SessionOffer {
+                id: format!("s{i}"),
+                ..Default::default()
+            };
+            waiting.push(tokio::spawn(async move {
+                hub.offer_within("n1", offer, Duration::from_millis(200))
+                    .await
+                    .map(drop)
+            }));
+        }
+        for w in waiting {
+            let err = w.await.unwrap().unwrap_err();
+            assert_eq!(err.code(), tonic::Code::Unavailable);
+        }
         assert!(hub.inner.lock().unwrap().pending.is_empty());
     }
 

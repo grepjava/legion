@@ -638,6 +638,11 @@ impl Dispatcher for DispatcherService {
         &self,
         req: Request<RegisterRequest>,
     ) -> Result<Response<RegisterResponse>, Status> {
+        let leader = self.leader(&req)?;
+        if leader.is_none() {
+            // What is checked below, a removal included, is then current.
+            self.api.consistent().await?;
+        }
         let node = self.node(&req, &req.get_ref().node)?;
         // A worker a manager forwards for is a worker, whatever its name.
         let forwarded = self.forwarded_worker(&req)?;
@@ -653,7 +658,7 @@ impl Dispatcher for DispatcherService {
             Some(w) => Some(w),
             None => self.worker(&req)?,
         };
-        if let Some(mut leader) = self.leader(&req)? {
+        if let Some(mut leader) = leader {
             let mut inner = req.into_inner();
             inner.node = node;
             inner.role = role.as_str().to_owned();
@@ -780,8 +785,12 @@ impl Dispatcher for DispatcherService {
         &self,
         req: Request<ReportRequest>,
     ) -> Result<Response<ReportResponse>, Status> {
+        let leader = self.leader(&req)?;
+        if leader.is_none() {
+            self.api.consistent().await?;
+        }
         let node = self.node(&req, &req.get_ref().node)?;
-        if let Some(mut leader) = self.leader(&req)? {
+        if let Some(mut leader) = leader {
             let worker = self.worker(&req)?;
             let mut inner = req.into_inner();
             inner.node = node;
@@ -800,8 +809,12 @@ impl Dispatcher for DispatcherService {
         &self,
         req: Request<ClaimVolumeRequest>,
     ) -> Result<Response<ClaimVolumeResponse>, Status> {
+        let leader = self.leader(&req)?;
+        if leader.is_none() {
+            self.api.consistent().await?;
+        }
         let node = self.node(&req, &req.get_ref().node)?;
-        if let Some(mut leader) = self.leader(&req)? {
+        if let Some(mut leader) = leader {
             let worker = self.worker(&req)?;
             let mut inner = req.into_inner();
             inner.node = node;
@@ -856,24 +869,21 @@ impl Dispatcher for DispatcherService {
     }
 
     async fn data(&self, req: Request<DataRequest>) -> Result<Response<DataResponse>, Status> {
-        let node = self.node(&req, &req.get_ref().node)?;
-        // A follower may not have the task, or the data, the leader has
-        // already: what it refuses or lacks, the leader is asked for.
+        // Served by the leader once it has applied what it committed: a
+        // follower may still hold a task, a route or the worker's Node the
+        // leader has already removed, and hand out their Secrets.
         let leader = self.leader(&req)?;
-        let worker = self.worker(&req)?;
-        let mut r = req.into_inner();
-        let local = self.data_local(&node, &r);
-        let ask_leader = match &local {
-            Ok(found) => found.value.is_none(),
-            Err(e) => e.code() == tonic::Code::PermissionDenied,
-        };
-        match leader {
-            Some(mut leader) if ask_leader => {
-                r.node = node;
-                leader.data(to_leader(r, &worker)?).await
-            }
-            _ => local.map(Response::new),
+        if leader.is_none() {
+            self.api.consistent().await?;
         }
+        let node = self.node(&req, &req.get_ref().node)?;
+        if let Some(mut leader) = leader {
+            let worker = self.worker(&req)?;
+            let mut r = req.into_inner();
+            r.node = node;
+            return leader.data(to_leader(r, &worker)?).await;
+        }
+        Ok(Response::new(self.data_local(&node, req.get_ref())?))
     }
 
     type SessionsStream = ReceiverStream<Result<SessionOffer, Status>>;
@@ -891,6 +901,17 @@ impl Dispatcher for DispatcherService {
                 .await;
         }
         let reported = req.into_inner().usage;
+        // Believed only of tasks placed on the node.
+        let runs_on = |task: &str| {
+            let Some((namespace, name)) = task.split_once('/') else {
+                return false;
+            };
+            let key = ObjectKey::new(Kind::Task, namespace, name);
+            self.get(&key)
+                .ok()
+                .flatten()
+                .is_some_and(|t| t.spec.get("node").and_then(|n| n.as_str()) == Some(node.as_str()))
+        };
         self.api.usage.record(
             &node,
             reported.into_iter().map(|u| {
@@ -902,6 +923,7 @@ impl Dispatcher for DispatcherService {
                     },
                 )
             }),
+            runs_on,
         );
         self.seen.lock().unwrap().insert(node, Instant::now());
         Ok(Response::new(HeartbeatResponse {
@@ -955,22 +977,39 @@ impl Dispatcher for DispatcherService {
             .caller(&req)?
             .filter(|id| id.role == Role::Worker)
             .map(|id| id.name);
+        let mut removal = self.removal(&req)?;
         let mut from_agent = req.into_inner();
-        let id = match from_agent.next().await {
-            Some(Ok(SessionFrame {
+        let first = tokio::time::timeout(crate::session::ATTACH_TIMEOUT, from_agent.next()).await;
+        let id = match first {
+            Ok(Some(Ok(SessionFrame {
                 frame: Some(Frame::Attach(id)),
-            })) => id,
+            }))) => id,
             _ => {
                 return Err(Status::invalid_argument(
                     "an attach starts with the session's id",
                 ));
             }
         };
-        Ok(Response::new(self.api.sessions.attach(
-            node.as_deref(),
-            &id,
-            from_agent,
-        )?))
+        let mut to_agent = self.api.sessions.attach(node.as_deref(), &id, from_agent)?;
+        // Relayed so the session ends when the node is removed, as its other
+        // streams do.
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            let end = loop {
+                tokio::select! {
+                    frame = to_agent.next() => match frame {
+                        Some(f) => if tx.send(f).await.is_err() {
+                            return;
+                        },
+                        None => return,
+                    },
+                    _ = tx.closed() => return,
+                    e = &mut removal => break e,
+                }
+            };
+            let _ = tx.send(Err(end)).await;
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 
@@ -1257,23 +1296,39 @@ async fn follow_cluster(store: Store, out: Followed, mut closing: watch::Receive
 
 /// Every route, with the challenges the leader is having validated for it
 /// (DESIGN.md §5.8). The ACME settings stay behind: proxies do not need
-/// them, and those before them refuse a `tls` they do not know.
+/// them, and those before them refuse a `tls` they do not know. Routes for
+/// a host of more than one namespace, left from before admission refused
+/// them, are left out: no namespace gets the others' requests or
+/// certificate.
 fn routes(routes: &BTreeMap<ObjectKey, Object>) -> Routes {
-    routes
+    let parsed: Vec<(&Object, legion_api::route::RouteSpec)> = routes
         .values()
-        .filter_map(|r| {
-            let mut spec: legion_api::route::RouteSpec = legion_api::parse(&r.spec).ok()?;
-            if let Some(tls) = &mut spec.tls {
-                tls.acme = None;
-            }
+        .filter_map(|r| Some((r, legion_api::parse(&r.spec).ok()?)))
+        .collect();
+    let contested = legion_api::route::contested(
+        parsed
+            .iter()
+            .map(|(r, spec)| (r.metadata.namespace.as_str(), spec.host.as_str())),
+    );
+    parsed
+        .into_iter()
+        .filter(|(_, spec)| !contested.contains(&spec.host))
+        .map(|(r, mut spec)| {
+            // Challenges only for a route still asking for ACME: one that
+            // no longer does may keep an old status a while.
+            let acme = spec.tls.as_mut().and_then(|t| t.acme.take()).is_some();
             let status: legion_api::route::RouteStatus =
                 serde_json::from_value(r.status.clone()).unwrap_or_default();
-            Some(NamespacedRoute {
+            NamespacedRoute {
                 namespace: r.metadata.namespace.clone(),
                 name: r.metadata.name.clone(),
                 spec,
-                challenges: status.acme.map(|a| a.challenges).unwrap_or_default(),
-            })
+                challenges: status
+                    .acme
+                    .filter(|_| acme)
+                    .map(|a| a.challenges)
+                    .unwrap_or_default(),
+            }
         })
         .collect()
 }
@@ -1610,15 +1665,46 @@ mod tests {
             "plain",
             serde_json::json!({"host": "plain.example.org", "service": "web"}),
         );
-        let out = routes(&[r, plain].into_iter().map(|o| (o.key(), o)).collect());
-        let (plain, www) = (&out[0], &out[1]);
+        let out = routes(
+            &[r, plain.clone()]
+                .into_iter()
+                .map(|o| (o.key(), o))
+                .collect(),
+        );
+        let (plain_out, www) = (&out[0], &out[1]);
         assert_eq!(www.spec.tls.as_ref().unwrap().secret, "cert");
         assert_eq!(www.spec.tls.as_ref().unwrap().acme, None);
         assert_eq!(www.challenges["tok"], "tok.thumb");
-        assert!(plain.challenges.is_empty());
+        assert!(plain_out.challenges.is_empty());
         // What older agents read: no `acme`, which they would refuse.
         let json = serde_json::to_string(&out).unwrap();
         assert!(!json.contains("acme") && !json.contains("ops@"), "{json}");
+
+        // ACME dropped from the route, its old challenges stay behind.
+        let mut dropped = Object::new(
+            Kind::Route,
+            "shop",
+            "www",
+            serde_json::json!({
+                "host": "shop.example.org",
+                "service": "web",
+                "tls": {"secret": "cert"},
+            }),
+        );
+        dropped.status = serde_json::json!({"acme": {"challenges": {"tok": "tok.thumb"}}});
+        let out = routes(&[(dropped.key(), dropped)].into_iter().collect());
+        assert!(out[0].challenges.is_empty(), "{out:?}");
+
+        // A host two namespaces route, from before admission refused that,
+        // goes out for neither.
+        let theirs = Object::new(
+            Kind::Route,
+            "evil",
+            "www",
+            serde_json::json!({"host": "plain.example.org", "service": "web"}),
+        );
+        let out = routes(&[plain, theirs].into_iter().map(|o| (o.key(), o)).collect());
+        assert!(out.is_empty(), "{out:?}");
     }
 
     /// A Job's running tasks go out as its namespace's, with no VIP, ports

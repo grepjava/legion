@@ -30,15 +30,21 @@ struct Report {
 }
 
 impl Usage {
-    /// What `node` reports of its tasks, by `namespace/task`.
-    pub fn record(&self, node: &str, reported: impl IntoIterator<Item = (String, TaskUsage)>) {
+    /// What `node` reports of its tasks, by `namespace/task`: only those
+    /// `runs_on` says are on `node`, and only usage that is a number of
+    /// both kinds, so no node speaks for another's tasks or feeds the
+    /// autoscaler nonsense.
+    pub fn record(
+        &self,
+        node: &str,
+        reported: impl IntoIterator<Item = (String, TaskUsage)>,
+        runs_on: impl Fn(&str) -> bool,
+    ) {
         let now = Instant::now();
         let mut tasks = self.tasks.lock().unwrap();
         tasks.retain(|_, r| now.duration_since(r.at) < FRESH);
         for (task, usage) in reported.into_iter().take(MAX_REPORTED) {
-            // A task runs on one node, whose report another's does not
-            // replace while it is fresh.
-            if tasks.get(&task).is_some_and(|r| r.node != node) {
+            if !usage.cpu.is_finite() || usage.cpu < 0.0 || !runs_on(&task) {
                 continue;
             }
             let report = Report {
@@ -72,16 +78,24 @@ mod tests {
     fn a_tasks_node_is_not_spoken_for_by_another() {
         let u = Usage::default();
         let used = |cpu| TaskUsage { cpu, memory: 1 };
-        u.record("w1", [("a/web-1".to_owned(), used(10.0))]);
-        u.record("w2", [("a/web-1".to_owned(), used(99.0))]);
-        u.record("w1", [("a/web-1".to_owned(), used(20.0))]);
+        // a/web-1 runs on w1.
+        let on = |node: &'static str| move |task: &str| task != "a/web-1" || node == "w1";
+        u.record("w2", [("a/web-1".to_owned(), used(99.0))], on("w2"));
+        u.record("w1", [("a/web-1".to_owned(), used(10.0))], on("w1"));
+        u.record("w2", [("a/web-1".to_owned(), used(99.0))], on("w2"));
         let fresh = u.fresh();
         assert_eq!(fresh["a/web-1"].0, "w1");
-        assert_eq!(fresh["a/web-1"].1.cpu, 20.0);
+        assert_eq!(fresh["a/web-1"].1.cpu, 10.0);
+        // Usage that is no number of percent is not believed.
+        for cpu in [f64::NAN, f64::INFINITY, -1.0] {
+            u.record("w1", [("a/web-1".to_owned(), used(cpu))], on("w1"));
+        }
+        assert_eq!(u.fresh()["a/web-1"].1.cpu, 10.0);
         // And a heartbeat reports on so many tasks at most.
         u.record(
             "w3",
             (0..2 * MAX_REPORTED).map(|n| (format!("b/t-{n}"), used(1.0))),
+            on("w3"),
         );
         assert_eq!(u.fresh().len(), 1 + MAX_REPORTED);
     }

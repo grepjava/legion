@@ -52,6 +52,8 @@ impl Running {
                 election_timeout_max: 400,
                 ..default_raft_config()
             },
+            // The authority the tests run is on the loopback.
+            acme_loopback: true,
             ..ManagerConfig::new(dir.path(), &addr)
         })
         .await

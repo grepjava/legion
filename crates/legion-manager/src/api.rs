@@ -45,7 +45,8 @@ pub struct ApiService {
     pub(crate) peer_tls: Option<std::sync::Arc<crate::Credentials>>,
     /// Certifies joining nodes; managers without the CA key cannot.
     pub(crate) issuer: Option<crate::join::Issuer>,
-    /// Held from quota check to write, so two applies cannot both fit.
+    /// Held from quota or route host check to write, so two applies cannot
+    /// both pass.
     pub(crate) quota_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// The agents connected to this manager, for sessions with their tasks.
     pub(crate) sessions: std::sync::Arc<crate::session::Hub>,
@@ -55,7 +56,8 @@ pub struct ApiService {
 
 enum Route {
     Local,
-    Leader(ObjectsClient<Channel>),
+    /// A client for the leader, and its address as routing saw it.
+    Leader(ObjectsClient<Channel>, String),
 }
 
 /// The reserved namespace holds Legion's own records; no caller sees it.
@@ -74,14 +76,9 @@ impl ApiService {
     pub(crate) fn leader_addr<T>(&self, req: &Request<T>) -> Result<Option<String>, Status> {
         match self.route(req)? {
             Route::Local => Ok(None),
-            Route::Leader(_) => {
-                let m = self.store.raft.metrics().borrow().clone();
-                let leader = m.current_leader.expect("routed to a leader");
-                Ok(m.membership_config
-                    .membership()
-                    .get_node(&leader)
-                    .map(|n| n.addr.clone()))
-            }
+            // The address of the leader routing found, not read again: an
+            // election may have cleared it since.
+            Route::Leader(_, addr) => Ok(Some(addr)),
         }
     }
 
@@ -138,6 +135,7 @@ impl ApiService {
                     ObjectsClient::new(connect_lazy(&addr, self.peer_tls.as_ref()))
                         .max_decoding_message_size(MAX_MESSAGE)
                         .max_encoding_message_size(MAX_MESSAGE),
+                    addr,
                 ))
             }
             None if metrics
@@ -197,7 +195,15 @@ impl ApiService {
         }
         legion_api::admit(&mut desired).map_err(invalid)?;
         let key = desired.key();
-        let _counting = match crate::quota::counts(desired.kind) {
+        // Applies that check other objects than their own (quotas, a
+        // route's host) take turns, so two cannot pass on the same state;
+        // so do those of what they are checked against (a Namespace's
+        // quota and security) and of Jobs, checked against those.
+        let _counting = match crate::quota::counts(desired.kind)
+            || matches!(
+                desired.kind,
+                Kind::Route | Kind::Namespace | Kind::Job | Kind::CronJob
+            ) {
             true => Some(self.quota_lock.lock().await),
             false => None,
         };
@@ -242,6 +248,7 @@ impl ApiService {
             }
             crate::quota::check(&self.store, &object)?;
             crate::security::check(&self.store, &object)?;
+            check_host(&self.store, &object)?;
             if req.dry_run {
                 return Ok(ApplyResponse {
                     object: Some((&object).into()),
@@ -276,6 +283,33 @@ impl ApiService {
             "{key} is changing too fast; retry"
         )))
     }
+}
+
+/// Refuses a route a host that routes of another namespace have, or that
+/// covers or is covered by one of theirs: whoever routes a host gets its
+/// requests, its certificate and its ACME orders.
+fn check_host(store: &Store, next: &Object) -> Result<(), Status> {
+    use legion_api::route::{RouteSpec, hosts_overlap};
+    if next.kind != Kind::Route {
+        return Ok(());
+    }
+    let spec: RouteSpec = legion_api::parse(&next.spec).map_err(invalid)?;
+    let routes = store.list(Kind::Route, None).map_err(internal)?.objects;
+    for r in routes {
+        if r.metadata.namespace == next.metadata.namespace {
+            continue;
+        }
+        let Ok(theirs) = legion_api::parse::<RouteSpec>(&r.spec) else {
+            continue;
+        };
+        if hosts_overlap(&spec.host, &theirs.host) {
+            return Err(Status::failed_precondition(format!(
+                "host {}: namespace {} routes {}, and a host belongs to one namespace",
+                spec.host, r.metadata.namespace, theirs.host
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Refuses a Volume another storage while it is in use: a node holds it
@@ -391,6 +425,51 @@ impl ApiService {
     /// has torn it down (a stateful task's volumes are then free). The
     /// stopped task is then deleted as any other, or with its owner.
     /// Returns the version written, or `None` for a task to delete now.
+    /// Deletes a Node, recording first that the node is removed: its
+    /// certificate is refused from then, so it cannot come back between
+    /// the two writes. Only once the delete would go through, not for a
+    /// stale version; if it then does not (the Node changed meanwhile, or
+    /// the write failed and the Node is still there), the node is let back
+    /// in.
+    async fn remove_node(
+        &self,
+        key: &ObjectKey,
+        expected_version: Option<u64>,
+    ) -> Result<Outcome, Status> {
+        let precondition = expected_version.map_or(Precondition::None, Precondition::Version);
+        let Some(node) = self.store.get(key).map_err(internal)? else {
+            return Ok(Outcome::NotFound);
+        };
+        if expected_version.is_some_and(|v| v != node.metadata.version) {
+            return Ok(Outcome::Conflict {
+                current: Some(node.metadata.version),
+            });
+        }
+        let recorded = crate::removed::record(self, &key.name).await?;
+        let deleted = self
+            .write(Command::Delete {
+                key: key.clone(),
+                precondition,
+            })
+            .await;
+        // Not when the Node is gone: this delete or another took it, and
+        // the removal stands.
+        let stays = match &deleted {
+            Ok(Outcome::Conflict { current: Some(_) }) => true,
+            Ok(_) => false,
+            // The delete may have gone through before the error: only what
+            // the store holds once current says.
+            Err(_) => {
+                self.consistent().await?;
+                self.store.get(key).map_err(internal)?.is_some()
+            }
+        };
+        if stays {
+            crate::removed::forget(self, &key.name, recorded).await?;
+        }
+        deleted
+    }
+
     async fn stop_task(
         &self,
         key: &ObjectKey,
@@ -469,7 +548,7 @@ impl Objects for ApiService {
         // A user's rights are checked where the request is served: a
         // follower forwards them, its own copy may lag a new RoleBinding.
         let caller = self.caller(&req)?;
-        if let Route::Leader(mut c) = self.route(&req)? {
+        if let Route::Leader(mut c, _) = self.route(&req)? {
             return c.apply(forwarded_for(req.into_inner(), &caller)?).await;
         }
         // The rights it checks, what it compares with, and the quotas and
@@ -488,7 +567,7 @@ impl Objects for ApiService {
         check_namespace(&req.get_ref().namespace)?;
         let key = parse_ref(Some(req.get_ref().clone()))?;
         let caller = self.caller(&req)?;
-        if let Route::Leader(mut c) = self.route(&req)? {
+        if let Route::Leader(mut c, _) = self.route(&req)? {
             return c.get(forwarded_for(req.into_inner(), &caller)?).await;
         }
         self.consistent().await?;
@@ -503,7 +582,7 @@ impl Objects for ApiService {
     async fn list(&self, req: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
         let caller = self.caller(&req)?;
         let kind = parse_kind(&req.get_ref().kind)?;
-        if let Route::Leader(mut c) = self.route(&req)? {
+        if let Route::Leader(mut c, _) = self.route(&req)? {
             return c.list(forwarded_for(req.into_inner(), &caller)?).await;
         }
         self.consistent().await?;
@@ -529,7 +608,7 @@ impl Objects for ApiService {
     ) -> Result<Response<DeleteResponse>, Status> {
         let key = parse_ref(req.get_ref().r#ref.clone())?;
         let caller = self.caller(&req)?;
-        if let Route::Leader(mut c) = self.route(&req)? {
+        if let Route::Leader(mut c, _) = self.route(&req)? {
             return c.delete(forwarded_for(req.into_inner(), &caller)?).await;
         }
         self.consistent().await?;
@@ -545,33 +624,21 @@ impl Objects for ApiService {
         let precondition = req
             .expected_version
             .map_or(Precondition::None, Precondition::Version);
-        // A node removed stays out: its certificate is refused from now.
-        // Only once the delete would go through, not for a stale version;
-        // if it then does not (the Node changed meanwhile), the node is
-        // let back in.
-        let mut removing = None;
-        if key.kind == Kind::Node
-            && let Some(node) = self.store.get(&key).map_err(internal)?
-        {
-            if req
-                .expected_version
-                .is_some_and(|v| v != node.metadata.version)
-            {
-                return Err(conflict(&key, Some(&node)));
-            }
-            removing = Some(crate::removed::record(self, &key.name).await?);
-        }
-        let deleted = self
-            .write(Command::Delete {
+        let deleted = if key.kind == Kind::Node {
+            // Run to the end even if the caller goes: stopped between its
+            // writes, it would leave a live node refused.
+            let api = self.clone();
+            let key = key.clone();
+            tokio::spawn(async move { api.remove_node(&key, req.expected_version).await })
+                .await
+                .map_err(internal)??
+        } else {
+            self.write(Command::Delete {
                 key: key.clone(),
                 precondition,
             })
-            .await?;
-        // Not when the Node is gone: another delete took it meanwhile, and
-        // the removal stands.
-        if let (Outcome::Conflict { current: Some(_) }, Some(r)) = (&deleted, removing) {
-            crate::removed::forget(self, &key.name, r).await?;
-        }
+            .await?
+        };
         match deleted {
             Outcome::Deleted { version } => Ok(Response::new(DeleteResponse { version })),
             Outcome::NotFound => Err(not_found(&key)),
