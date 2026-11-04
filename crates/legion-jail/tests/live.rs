@@ -621,6 +621,46 @@ async fn standalone_containers_and_build_steps() {
         .await
         .unwrap();
     assert_eq!(code, 137);
+    // On this process's terminal, it stays in this process's session, as
+    // a shell's foreground child does, rather than leading one that cannot
+    // have the terminal.
+    // SAFETY: a plain system call.
+    let sid = unsafe { libc::getsid(0) };
+    let code = rt
+        .exec_inherit(
+            &app,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("[ $(ps -o sid= -p $$) = {sid} ]"),
+            ],
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 0, "the exec left this process's session");
+    // Dropped, an exec takes what it started with it.
+    let starts = [
+        "/bin/sh".into(),
+        "-c".into(),
+        "sleep 301 & echo $! > /started.pid; wait".into(),
+    ];
+    let started = rt.exec_inherit(&app, &starts, false, false);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), started)
+            .await
+            .is_err()
+    );
+    let gone = [
+        "/bin/sh".into(),
+        "-c".into(),
+        "! kill -0 $(cat /started.pid)".into(),
+    ];
+    until("the exec's child to go with it", async || {
+        rt.exec(&app, &gone).await.unwrap().exit_code == 0
+    })
+    .await;
     rt.stop(&app, Duration::from_secs(5)).await.unwrap();
     assert!(!rt.inspect(&app).await.unwrap().state.running);
 

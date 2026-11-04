@@ -20,16 +20,50 @@ pub fn main(args: &[String]) -> i32 {
             Ok(jid) => imp::supervise(Path::new(dir), jid),
             Err(_) => usage(),
         },
-        [cmd, dir, jid, tty, argv @ ..] if cmd == "exec" && !argv.is_empty() => match jid.parse() {
-            Ok(jid) => imp::exec(Path::new(dir), jid, tty == "1", argv),
-            Err(_) => usage(),
-        },
+        [cmd, dir, jid, tty, argv @ ..] if cmd == "exec" && !argv.is_empty() => {
+            match (jid.parse(), Terminal::parse(tty)) {
+                (Ok(jid), Some(tty)) => imp::exec(Path::new(dir), jid, tty, argv),
+                _ => usage(),
+            }
+        }
         _ => usage(),
     }
 }
 
+/// The terminal an `exec` runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Terminal {
+    /// None.
+    None,
+    /// A new one, on stdin: the command leads a session with it as its
+    /// controlling terminal.
+    Own,
+    /// The caller's, inherited: the command stays in the caller's session
+    /// and group, as a shell's foreground child does.
+    Caller,
+}
+
+impl Terminal {
+    pub fn arg(self) -> &'static str {
+        match self {
+            Terminal::None => "0",
+            Terminal::Own => "1",
+            Terminal::Caller => "2",
+        }
+    }
+
+    pub fn parse(arg: &str) -> Option<Self> {
+        match arg {
+            "0" => Some(Terminal::None),
+            "1" => Some(Terminal::Own),
+            "2" => Some(Terminal::Caller),
+            _ => None,
+        }
+    }
+}
+
 fn usage() -> i32 {
-    eprintln!("usage: jail-shim supervise <dir> <jid> | exec <dir> <jid> <tty> <command...>");
+    eprintln!("usage: jail-shim supervise <dir> <jid> | exec <dir> <jid> <0|1|2> <command...>");
     2
 }
 
@@ -42,7 +76,7 @@ mod imp {
         1
     }
 
-    pub fn exec(_: &Path, _: i32, _: bool, _: &[String]) -> i32 {
+    pub fn exec(_: &Path, _: i32, _: super::Terminal, _: &[String]) -> i32 {
         eprintln!("jails need FreeBSD");
         1
     }
@@ -325,7 +359,7 @@ mod imp {
         fail(format!("{}: {}", rec.argv[0], errno()))
     }
 
-    pub fn exec(dir: &Path, jid: i32, tty: bool, argv: &[String]) -> i32 {
+    pub fn exec(dir: &Path, jid: i32, tty: super::Terminal, argv: &[String]) -> i32 {
         let mut rec: Record = match state::read(dir, RECORD) {
             Ok(Some(r)) => r,
             _ => {
@@ -334,10 +368,10 @@ mod imp {
             }
         };
         rec.argv = argv.to_vec();
-        if tty && !rec.env.iter().any(|e| e.starts_with("TERM=")) {
+        if tty != super::Terminal::None && !rec.env.iter().any(|e| e.starts_with("TERM=")) {
             rec.env.push("TERM=xterm".to_owned());
         }
-        let prepared = match enter(&rec, jid, tty) {
+        let prepared = match enter(&rec, jid, tty == super::Terminal::Own) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("{e}");
@@ -391,15 +425,16 @@ mod imp {
     }
 
     /// Into jail `jid` as the container's user, in its working directory;
-    /// the command to exec and its environment. With `tty`, the process
-    /// leads a new session with stdin as its terminal.
-    fn enter(rec: &Record, jid: i32, tty: bool) -> Result<Prepared, String> {
+    /// the command to exec and its environment. With `session`, the
+    /// process leads a new session with stdin, a terminal of its own, as
+    /// its controlling terminal.
+    fn enter(rec: &Record, jid: i32, session: bool) -> Result<Prepared, String> {
         // SAFETY: plain system calls.
         unsafe {
             if libc::jail_attach(jid) != 0 {
                 return Err(format!("entering jail {jid}: {}", errno()));
             }
-            if tty {
+            if session {
                 libc::setsid();
                 libc::ioctl(0, libc::TIOCSCTTY, 0);
             }

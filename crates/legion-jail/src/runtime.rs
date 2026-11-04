@@ -32,6 +32,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::log;
+use crate::shim::Terminal;
 use crate::state::{self, EXIT, Exit, LOG, RECORD, RUN, Record, Run, SHIM_LOG};
 
 use crate::{
@@ -175,6 +176,49 @@ impl Drop for KillGroup {
         if let Some(pgid) = self.0.and_then(|p| libc::pid_t::try_from(p).ok()) {
             // SAFETY: a plain system call; a group already gone is fine.
             unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// How long a supervisor has to say it started its container.
+const SUPERVISOR_ANSWERS: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(30)
+};
+
+/// Undoes a start that fails or is dropped: the supervisor that has not
+/// answered is killed first, with what it started, so it cannot take its
+/// command killed with the jail for one started, and record a run; then
+/// the jail goes, and the mounts.
+struct UndoStart<'a> {
+    rt: &'a JailRuntime,
+    rec: &'a Record,
+    jailed: bool,
+    supervisor: Option<tokio::process::Child>,
+    armed: bool,
+}
+
+impl Drop for UndoStart<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Not yet reaped while it is held here: its id is no one else's.
+        if let Some(child) = self.supervisor.take() {
+            if let Some(pgid) = child.id().and_then(|p| libc::pid_t::try_from(p).ok()) {
+                // SAFETY: a plain system call, on the supervisor's own group.
+                unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            }
+            // Reaped by tokio once it has gone.
+            drop(child);
+        }
+        if self.jailed {
+            let _ = self.rt.sys.jail_remove(&self.rec.jail);
+            let _ = state::remove(&self.rt.container_dir(&self.rec.id), RUN);
+        }
+        if !self.rec.is_pod() {
+            let _ = self.rt.unmount(self.rec);
         }
     }
 }
@@ -670,39 +714,57 @@ fn exited_since(before: &(Status, Option<Run>), now: &(Status, Option<Run>)) -> 
 /// the layers nothing uses.
 async fn prune_images(images: Arc<Store>, dir: PathBuf, used: Used) {
     loop {
-        let now = tokio::time::Instant::now();
-        let in_use: std::collections::BTreeSet<String> = match records(&dir) {
-            Ok(r) => r
-                .iter()
-                .filter_map(|r| Reference::parse(&r.image).ok())
-                .map(|r| r.to_string())
-                .collect(),
-            Err(e) => {
-                tracing::warn!("jail runtime: listing containers for pruning: {e}");
-                tokio::time::sleep(PRUNE_EVERY).await;
-                continue;
-            }
-        };
-        let mut last_used = used.lock().await;
-        let known = images.images().unwrap_or_default();
-        for image in &known {
-            for name in &image.references {
-                let since = last_used.entry(name.clone()).or_insert(now);
-                if in_use.contains(name) {
-                    *since = now;
-                } else if now.duration_since(*since) >= UNUSED_FOR {
-                    match images.remove(name).await {
-                        Ok(_) => tracing::info!(image = %name, "removed unused image"),
-                        Err(e) => tracing::warn!(image = %name, "removing an unused image: {e}"),
+        prune_pass(&images, &dir, &used, tokio::time::Instant::now()).await;
+        tokio::time::sleep(PRUNE_EVERY).await;
+    }
+}
+
+/// One pass of [`prune_images`], at `now`.
+async fn prune_pass(images: &Store, dir: &Path, used: &Used, now: tokio::time::Instant) {
+    let in_use: BTreeSet<String> = match records(dir) {
+        Ok(r) => r
+            .iter()
+            .filter_map(|r| Reference::parse(&r.image).ok())
+            .map(|r| r.to_string())
+            .collect(),
+        Err(e) => {
+            tracing::warn!("jail runtime: listing containers for pruning: {e}");
+            return;
+        }
+    };
+    let mut last_used = used.lock().await;
+    let known = images.images().unwrap_or_default();
+    let mut removed = BTreeSet::new();
+    for image in &known {
+        for name in &image.references {
+            let since = last_used.entry(name.clone()).or_insert(now);
+            if in_use.contains(name) {
+                *since = now;
+            } else if now.duration_since(*since) >= UNUSED_FOR {
+                match images.remove(name).await {
+                    Ok(_) => {
+                        tracing::info!(image = %name, "removed unused image");
+                        removed.insert(name);
                     }
+                    Err(e) => tracing::warn!(image = %name, "removing an unused image: {e}"),
                 }
             }
         }
-        let names: std::collections::BTreeSet<&String> =
-            known.iter().flat_map(|i| &i.references).collect();
-        last_used.retain(|n, _| names.contains(n));
-        drop(last_used);
-        tokio::time::sleep(PRUNE_EVERY).await;
+    }
+    // What went is forgotten with what is not there: an image of that
+    // name loaded again is new, not unused for as long.
+    let names: BTreeSet<&String> = known
+        .iter()
+        .flat_map(|i| &i.references)
+        .filter(|n| !removed.contains(n))
+        .collect();
+    last_used.retain(|n, _| names.contains(n));
+    drop(last_used);
+    // Then the layers and blobs nothing uses, even with no image removed:
+    // those a tag moved off, a removal that found a layer busy, or a pull
+    // that failed part way left.
+    if let Err(e) = images.prune().await {
+        tracing::warn!("jail runtime: pruning image layers: {e}");
     }
 }
 
@@ -1012,7 +1074,15 @@ impl JailRuntime {
 
     /// Starts the member's supervisor in its new jail and waits for its
     /// answer.
-    async fn supervise(&self, rec: &Record, jid: u32) -> Result<()> {
+    /// Starts `rec`'s supervisor for jail `jid` and waits for its answer.
+    /// The supervisor is in `slot` while it is to be killed should this
+    /// fail: while it has not answered, here and if this is dropped.
+    async fn supervise(
+        &self,
+        rec: &Record,
+        jid: u32,
+        slot: &mut Option<tokio::process::Child>,
+    ) -> Result<()> {
         use tokio::io::AsyncBufReadExt;
         let dir = self.container_dir(&rec.id);
         let shim_log = std::fs::File::create(dir.join(SHIM_LOG)).map_err(internal)?;
@@ -1026,16 +1096,26 @@ impl JailRuntime {
             .stderr(shim_log);
         #[cfg(unix)]
         cmd.process_group(0);
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| internal(format!("starting the supervisor: {e}")))?;
+        let child = slot.insert(
+            cmd.spawn()
+                .map_err(|e| internal(format!("starting the supervisor: {e}")))?,
+        );
         let stdout = child.stdout.take().expect("piped");
         let mut line = String::new();
         let read = tokio::time::timeout(
-            Duration::from_secs(30),
+            SUPERVISOR_ANSWERS,
             tokio::io::BufReader::new(stdout).read_line(&mut line),
         )
         .await;
+        if read.is_err() {
+            // Killed by the caller's undoing, before the jail goes: its
+            // command killed then must not pass for one started.
+            return Err(api(
+                500,
+                format!("starting {}: the supervisor did not answer", rec.name),
+            ));
+        }
+        let mut child = slot.take().expect("put there");
         // Reaped when it ends, while this agent runs; init reaps it after.
         tokio::spawn(async move {
             let _ = child.wait().await;
@@ -1045,10 +1125,9 @@ impl JailRuntime {
             tracing::debug!(container = %rec.name, pid, "started");
             return Ok(());
         }
-        let why = match (read, line.strip_prefix("err ")) {
-            (_, Some(why)) => why.to_owned(),
-            (Err(_), _) => "the supervisor did not answer".to_owned(),
-            _ => {
+        let why = match line.strip_prefix("err ") {
+            Some(why) => why.to_owned(),
+            None => {
                 let log = std::fs::read_to_string(dir.join(SHIM_LOG)).unwrap_or_default();
                 format!("the supervisor ended: {}", log.trim())
             }
@@ -1206,18 +1285,21 @@ impl legion_runtime::Runtime for JailRuntime {
         if jail_names(&*self.sys)?.contains(&rec.jail) {
             let _ = self.sys.jail_remove(&rec.jail);
         }
-        // A start that fails leaves nothing mounted, so the next one mounts
-        // afresh (a Linux member's `/dev/shm` is made with its devfs).
-        let undo = |e| {
-            if !rec.is_pod() {
-                let _ = self.unmount(&rec);
-            }
-            e
+        // A start that fails, or is dropped, leaves nothing mounted, so the
+        // next one mounts afresh (a Linux member's `/dev/shm` is made with
+        // its devfs).
+        let mut undo = UndoStart {
+            rt: self,
+            rec: &rec,
+            jailed: false,
+            supervisor: None,
+            armed: true,
         };
         if !rec.is_pod() {
-            self.mount(&rec).map_err(undo)?;
+            self.mount(&rec)?;
         }
-        let jid = self.create_jail(&rec).map_err(undo)?;
+        let jid = self.create_jail(&rec)?;
+        undo.jailed = true;
         if rec.is_pod() {
             let run = Run {
                 shim: 0,
@@ -1226,12 +1308,11 @@ impl legion_runtime::Runtime for JailRuntime {
                 started: state::now(),
                 boot: self.boot,
             };
-            return state::write(&dir, RUN, &run).map_err(internal);
+            state::write(&dir, RUN, &run).map_err(internal)?;
+        } else {
+            self.supervise(&rec, jid, &mut undo.supervisor).await?;
         }
-        if let Err(e) = self.supervise(&rec, jid).await {
-            let _ = self.sys.jail_remove(&rec.jail);
-            return Err(undo(e));
-        }
+        undo.armed = false;
         Ok(())
     }
 
@@ -1342,7 +1423,7 @@ impl legion_runtime::Runtime for JailRuntime {
             "exec".into(),
             dir.into_os_string(),
             jid.to_string().into(),
-            "0".into(),
+            Terminal::None.arg().into(),
         ];
         args.extend(cmd.iter().map(OsString::from));
         let refs: Vec<&std::ffi::OsStr> = args.iter().map(OsString::as_os_str).collect();
@@ -1400,7 +1481,9 @@ impl legion_runtime::Runtime for JailRuntime {
             "exec".into(),
             dir.into_os_string(),
             jid.to_string().into(),
-            if tty { "1" } else { "0" }.into(),
+            if tty { Terminal::Own } else { Terminal::None }
+                .arg()
+                .into(),
         ];
         args.extend(cmd.iter().map(OsString::from));
         let refs: Vec<&std::ffi::OsStr> = args.iter().map(OsString::as_os_str).collect();
@@ -2044,5 +2127,185 @@ mod tests {
         assert!(target(&root, "/escape/x", false).is_err());
         assert!(!t.path().join("x").exists());
         assert!(target(&root, "/a/../../b", false).is_err());
+    }
+
+    /// A record of a container `id` rooted under `state`, which runs
+    /// nothing real.
+    fn plain_record(state: &Path, id: &str) -> Record {
+        Record {
+            id: id.into(),
+            name: id.into(),
+            image: String::new(),
+            created: 0,
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            parent: None,
+            standalone: true,
+            jail: id.into(),
+            root: state.join(id).join("root"),
+            dataset: None,
+            argv: vec!["/bin/true".into()],
+            env: Vec::new(),
+            user: String::new(),
+            work_dir: "/".into(),
+            hostname: id.into(),
+            mounts: Vec::new(),
+            params: Vec::new(),
+            stop_signal: 15,
+            stop_timeout: 10,
+            linux: false,
+            cpuset: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_supervisor_that_does_not_answer_is_killed_before_its_jail_goes() {
+        use legion_runtime::Runtime as _;
+        let t = tempfile::tempdir().unwrap();
+        let sys = Arc::new(legion_sys::FakeSys::new());
+        let images = Store::open_directory(
+            sys.clone(),
+            &t.path().join("images"),
+            legion_image::Client::new().unwrap(),
+        )
+        .unwrap();
+        // A supervisor that never answers, and would go on, later, as one
+        // whose command was killed before its exec takes it to have
+        // started: it writes `late`.
+        let shim: Vec<OsString> = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            r#"echo $$ > "$2/sup.pid"; sleep 4; echo late > "$2/late"; sleep 600"#.into(),
+            "sh".into(),
+        ];
+        let state_dir = t.path().join("state");
+        let rt = JailRuntime::new(
+            sys.clone(),
+            Arc::new(images),
+            Config {
+                state_dir: state_dir.clone(),
+                dataset: None,
+                shim,
+                prune_images: false,
+            },
+        )
+        .unwrap();
+        let mounted = |rec: &Record| sys.mounts(&rec.root.to_string_lossy()).unwrap();
+        let tidy = |dir: &Path| {
+            if let Ok(pid) = std::fs::read_to_string(dir.join("sup.pid"))
+                && let Ok(pid) = pid.trim().parse::<libc::pid_t>()
+            {
+                // SAFETY: a plain system call, on the test's own process.
+                unsafe { libc::killpg(pid, libc::SIGKILL) };
+            }
+        };
+        for (id, dropped) in [("timed-out", false), ("dropped", true)] {
+            let rec = plain_record(&state_dir, id);
+            std::fs::create_dir_all(&rec.root).unwrap();
+            let dir = state_dir.join(id);
+            state::write(&dir, RECORD, &rec).unwrap();
+            if dropped {
+                // The caller stops waiting before the supervisor answers.
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(500), rt.start(id))
+                        .await
+                        .is_err()
+                );
+            } else {
+                let e = rt.start(id).await.unwrap_err();
+                assert!(e.to_string().contains("did not answer"), "{e}");
+            }
+            assert!(dir.join("sup.pid").exists(), "{id}: the supervisor ran");
+            assert_eq!(mounted(&rec), Vec::<String>::new(), "{id}");
+            assert!(!jail_names(&*sys).unwrap().contains(id), "{id}");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let late = dir.join("late").exists();
+            tidy(&dir);
+            assert!(!late, "{id}: the supervisor outlived the start");
+            assert!(state::read::<Run>(&dir, RUN).unwrap().is_none(), "{id}");
+        }
+    }
+
+    /// An OCI layout of one plain-tar layer holding `file`, named `name`.
+    fn layout(at: &Path, file: &str, name: &str) {
+        use sha2::Digest as _;
+        let digest = |b: &[u8]| format!("sha256:{:x}", sha2::Sha256::digest(b));
+        let blobs = at.join("blobs/sha256");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let put = |data: &[u8]| {
+            let d = digest(data);
+            std::fs::write(blobs.join(&d[7..]), data).unwrap();
+            d
+        };
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_ustar();
+        h.set_mode(0o644);
+        h.set_size(file.len() as u64);
+        b.append_data(&mut h, file, file.as_bytes()).unwrap();
+        let layer = b.into_inner().unwrap();
+        let config = serde_json::to_vec(&serde_json::json!({"os": "freebsd",
+            "config": {"Cmd": ["/bin/sh"]}, "rootfs": {"diff_ids": [digest(&layer)]}}))
+        .unwrap();
+        let config = put(&config);
+        let layer = put(&layer);
+        let manifest = serde_json::to_vec(&serde_json::json!({"schemaVersion": 2,
+            "config": {"digest": config}, "layers": [{"digest": layer}]}))
+        .unwrap();
+        let manifest = put(&manifest);
+        std::fs::write(
+            at.join("index.json"),
+            serde_json::to_vec(&serde_json::json!({"schemaVersion": 2,
+                "manifests": [{"digest": manifest,
+                    "annotations": {"org.opencontainers.image.ref.name": name}}]}))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pruning_forgets_what_it_removed_and_takes_layers_left_unused() {
+        let t = tempfile::tempdir().unwrap();
+        let sys = Arc::new(legion_sys::FakeSys::new());
+        let images = Store::open_directory(
+            sys.clone(),
+            &t.path().join("images"),
+            legion_image::Client::new().unwrap(),
+        )
+        .unwrap();
+        let state_dir = t.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let used = Used::default();
+        let name = Reference::parse("localhost/app:1").unwrap().to_string();
+        let (one, two) = (t.path().join("one"), t.path().join("two"));
+        layout(&one, "etc/one", &name);
+        layout(&two, "etc/two", &name);
+        let first = images.import(&one, &name).await.unwrap();
+
+        // The tag moves to another image: the first one's layer is used by
+        // nothing, and goes with the next pass, though no image is removed.
+        let t0 = tokio::time::Instant::now();
+        images.import(&two, &name).await.unwrap();
+        prune_pass(&images, &state_dir, &used, t0).await;
+        assert!(images.get(&name).unwrap().is_some());
+        let left = images.prune().await.unwrap();
+        assert!(
+            !left.iter().any(|l| first.layers.contains(l)),
+            "{left:?} was left for a later prune"
+        );
+
+        // Unused for long enough: removed, and forgotten, so the same name
+        // loaded again is newly used, not removed at the next pass.
+        prune_pass(&images, &state_dir, &used, t0 + UNUSED_FOR).await;
+        assert!(images.get(&name).unwrap().is_none());
+        assert!(!used.lock().await.contains_key(&name));
+        images.import(&one, &name).await.unwrap();
+        prune_pass(
+            &images,
+            &state_dir,
+            &used,
+            t0 + UNUSED_FOR + Duration::from_secs(1),
+        )
+        .await;
+        assert!(images.get(&name).unwrap().is_some());
     }
 }

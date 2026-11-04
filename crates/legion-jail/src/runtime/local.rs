@@ -8,10 +8,11 @@ use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use super::{
-    JailRuntime, Status, api, confine, cpu_list, exit_code, internal, jail_names, new_id, records,
-    target,
+    JailRuntime, KillGroup, Status, api, confine, cpu_list, exit_code, internal, jail_names,
+    new_id, records, target,
 };
 use crate::DEVFS_RULESET;
+use crate::shim::Terminal;
 use crate::state::{self, EXIT, Exit, RECORD, RUN, Record, Run};
 use legion_runtime::Result;
 
@@ -155,10 +156,20 @@ impl JailRuntime {
     ) -> Result<i32> {
         let (rec, jid) = self.running_jid(id)?;
         let mut command = self.shim_exec(&rec, jid, cmd, stdin, tty);
-        // Gone with its caller, as an attached run's command is.
+        // Gone with its caller, as an attached run's command is. Unless it
+        // reads the caller's terminal (where only the foreground group
+        // may), in a group of its own, so what it started goes too.
         command.kill_on_drop(true);
-        let status = command.status().await.map_err(internal)?;
-        Ok(exit_code(status))
+        let own_group = !stdin && !tty;
+        if own_group {
+            command.process_group(0);
+        }
+        let mut child = command.spawn().map_err(internal)?;
+        let group = KillGroup(own_group.then(|| child.id()).flatten());
+        let status = child.wait().await;
+        // Reaped now, so its group's id may be another's soon.
+        group.disarm();
+        Ok(exit_code(status.map_err(internal)?))
     }
 
     /// The supervisor's `exec` of `argv` in `rec`'s jail, on this
@@ -186,7 +197,15 @@ impl JailRuntime {
             "exec".into(),
             dir.as_os_str().to_owned(),
             jid.to_string().into(),
-            if tty { "1" } else { "0" }.into(),
+            // The caller's terminal, not one of its own: a new session
+            // could not have it as its controlling terminal.
+            if tty {
+                Terminal::Caller
+            } else {
+                Terminal::None
+            }
+            .arg()
+            .into(),
         ];
         args.extend(argv.iter().map(OsString::from));
         let refs: Vec<&std::ffi::OsStr> = args.iter().map(OsString::as_os_str).collect();
