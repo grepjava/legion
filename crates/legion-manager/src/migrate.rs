@@ -7,7 +7,7 @@
 //! [`crate::session`]), which joins them, so nodes need no port of their
 //! own. A failed attempt is noted in the migration and tried again.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -69,45 +69,25 @@ pub(crate) async fn run(
     }
 }
 
-/// How a migrator task ended.
-enum Ended {
-    /// Its phase is done; for a full copy, the new node holds one.
-    Done,
-    /// Called off: the new node's copy, if any, was dropped.
-    CalledOff,
-}
-
 async fn lead(store: &Store, hub: &Arc<Hub>) {
     // Each Volume's task, with what it moves and, until called off, the
-    // word to stop.
+    // word to stop. What a migration called off left on its new node is
+    // among the Volume's leftovers, written by the controller.
     let mut running: HashMap<ObjectKey, (Migration, Option<watch::Sender<bool>>)> = HashMap::new();
-    let mut tasks: JoinSet<(ObjectKey, Migration, Result<Ended, String>)> = JoinSet::new();
+    let mut tasks: JoinSet<(ObjectKey, Migration, Result<(), String>)> = JoinSet::new();
     let mut failed: HashMap<ObjectKey, Instant> = HashMap::new();
-    // Full copies made on new nodes, of migrations not yet finished: one
-    // called off while no task runs for it still has its copy dropped.
-    let mut copies: HashMap<ObjectKey, Migration> = HashMap::new();
+    // Old copies being dropped, and when a drop last failed.
+    let mut drops: JoinSet<(ObjectKey, String, Result<(), String>)> = JoinSet::new();
+    let mut dropping: HashSet<(ObjectKey, String)> = HashSet::new();
+    let mut drop_failed: HashMap<(ObjectKey, String), Instant> = HashMap::new();
     loop {
         while let Some(done) = tasks.try_join_next() {
             let Ok((key, m, result)) = done else { continue };
             running.remove(&key);
-            match result {
-                Ok(Ended::Done) if m.phase == MigrationPhase::Finishing => {
-                    copies.remove(&key);
-                }
-                Ok(Ended::Done) => {
-                    copies.insert(key, m);
-                }
-                Ok(Ended::CalledOff) => {
-                    copies.remove(&key);
-                }
-                Err(e) => {
-                    tracing::warn!(volume = %key, to = %m.to, "moving the volume: {e}");
-                    failed.insert(key.clone(), Instant::now());
-                    note(store, &key, &m, &e).await;
-                    // The new node may hold part of a copy, or one not
-                    // dropped.
-                    copies.entry(key).or_insert(m);
-                }
+            if let Err(e) = result {
+                tracing::warn!(volume = %key, to = %m.to, "moving the volume: {e}");
+                failed.insert(key.clone(), Instant::now());
+                note(store, &key, &m, &e).await;
             }
         }
         // Nothing is called off on a failed read.
@@ -129,29 +109,54 @@ async fn lead(store: &Store, hub: &Arc<Hub>) {
         for (key, (m, cancel)) in &mut running {
             if cancel.is_some() && called_off(m, statuses.get(key)) {
                 tracing::info!(volume = %key, to = %m.to, "migration called off");
-                // The task drops the copy, and holds the Volume until then.
                 let _ = cancel.take().expect("checked").send(true);
             }
         }
-        copies.retain(|key, m| {
-            if running.contains_key(key)
-                || failed.get(key).is_some_and(|t| t.elapsed() < RETRY)
-                || !called_off(m, statuses.get(key))
-            {
-                return true;
+        // Old copies of Volumes that moved, dropped until they are.
+        while let Some(done) = drops.try_join_next() {
+            let Ok((key, node, result)) = done else {
+                continue;
+            };
+            dropping.remove(&(key.clone(), node.clone()));
+            match result {
+                Ok(()) => forget(store, &key, &node).await,
+                Err(e) => {
+                    tracing::warn!(volume = %key, node, "dropping the old copy: {e}");
+                    drop_failed.insert((key, node), Instant::now());
+                }
             }
-            if stale_copy(m, statuses.get(key)) {
-                let (hub, k, gone) = (hub.clone(), key.clone(), m.clone());
-                tasks.spawn(async move {
-                    let result = drop_copy(&hub, &k.namespace, &k.name, &gone.to)
-                        .await
-                        .map(|()| Ended::CalledOff);
-                    (k, gone, result)
+        }
+        let nodes: Option<HashSet<String>> = store
+            .list(Kind::Node, None)
+            .map(|l| l.objects.into_iter().map(|o| o.metadata.name).collect())
+            .map_err(|e| tracing::warn!("reading nodes: {e}"))
+            .ok();
+        // No drop while the Volume's data moves: it could be where the
+        // data goes.
+        for (key, status) in statuses.iter().filter(|(_, s)| !s.leftovers.is_empty()) {
+            let Some(nodes) = &nodes else { break };
+            if running.contains_key(key) {
+                continue;
+            }
+            let (to_drop, to_forget) = leftovers(status, nodes);
+            for node in to_forget {
+                forget(store, key, &node).await;
+            }
+            for node in to_drop {
+                let at = (key.clone(), node.clone());
+                if dropping.contains(&at)
+                    || drop_failed.get(&at).is_some_and(|t| t.elapsed() < RETRY)
+                {
+                    continue;
+                }
+                let (hub, k) = (hub.clone(), key.clone());
+                drops.spawn(async move {
+                    let result = drop_copy(&hub, &k.namespace, &k.name, &node).await;
+                    (k, node, result)
                 });
-                running.insert(key.clone(), (m.clone(), None));
+                dropping.insert(at);
             }
-            false
-        });
+        }
         for v in volumes {
             let key = v.key();
             let status = statuses[&key].clone();
@@ -161,6 +166,7 @@ async fn lead(store: &Store, hub: &Arc<Hub>) {
             if m.phase == MigrationPhase::Copied
                 || running.contains_key(&key)
                 || failed.get(&key).is_some_and(|t| t.elapsed() < RETRY)
+                || moves_through_a_drop(&key, &status.node, &m, &dropping)
             {
                 continue;
             }
@@ -169,23 +175,9 @@ async fn lead(store: &Store, hub: &Arc<Hub>) {
             let (cancel, mut cancelled) = watch::channel(false);
             tasks.spawn(async move {
                 let result = tokio::select! {
-                    r = advance(&store, &hub, &v, &status.node, &started) => r.map(|()| Ended::Done),
-                    _ = cancelled.changed() => {
-                        // What the new node received is of no use now.
-                        let (namespace, name) = (&v.metadata.namespace, &v.metadata.name);
-                        let now: Option<VolumeStatus> = store
-                            .get(&k)
-                            .ok()
-                            .flatten()
-                            .map(|o| serde_json::from_value(o.status).unwrap_or_default());
-                        if stale_copy(&started, now.as_ref()) {
-                            drop_copy(&hub, namespace, name, &started.to)
-                                .await
-                                .map(|()| Ended::CalledOff)
-                        } else {
-                            Ok(Ended::CalledOff)
-                        }
-                    }
+                    r = advance(&store, &hub, &v, &status.node, &started) => r,
+                    // What the new node received is a leftover now.
+                    _ = cancelled.changed() => Ok(()),
                 };
                 (k, started, result)
             });
@@ -195,11 +187,42 @@ async fn lead(store: &Store, hub: &Arc<Hub>) {
     }
 }
 
-/// Whether the new node of a migration called off holds a copy of the
-/// Volume no one wants: the Volume is still there, neither on that node
-/// nor on its way to it.
-fn stale_copy(m: &Migration, now: Option<&VolumeStatus>) -> bool {
-    now.is_some_and(|s| s.node != m.to && s.migration.as_ref().is_none_or(|n| n.to != m.to))
+/// Whether a migration would send or receive a Volume on a node still
+/// dropping an old copy of it: the drop could take what arrives, so the
+/// migration waits for it.
+fn moves_through_a_drop(
+    key: &ObjectKey,
+    from: &str,
+    m: &Migration,
+    dropping: &HashSet<(ObjectKey, String)>,
+) -> bool {
+    [from, m.to.as_str()]
+        .iter()
+        .any(|node| dropping.contains(&(key.clone(), (*node).to_owned())))
+}
+
+/// A moved Volume's leftover copies to drop, and those to forget without
+/// a drop: on a node the Volume is on or moving to again, where the copy
+/// is its data or is replaced, and on a node removed, with its data.
+fn leftovers(status: &VolumeStatus, nodes: &HashSet<String>) -> (Vec<String>, Vec<String>) {
+    status.leftovers.iter().cloned().partition(|n| {
+        *n != status.node
+            && status.migration.as_ref().is_none_or(|m| m.to != *n)
+            && nodes.contains(n)
+    })
+}
+
+/// Takes a node off a Volume's leftovers.
+async fn forget(store: &Store, key: &ObjectKey, node: &str) {
+    let r = update(store, key, |s| {
+        let before = s.leftovers.len();
+        s.leftovers.retain(|n| n != node);
+        s.leftovers.len() != before
+    })
+    .await;
+    if let Err(e) = r {
+        tracing::debug!(volume = %key, node, "forgetting an old copy: {e}");
+    }
 }
 
 /// Whether a migration under way was called off, by the Volume's status
@@ -231,10 +254,16 @@ async fn advance(
             return false;
         }
         if last {
+            let mut leftovers = std::mem::take(&mut s.leftovers);
+            leftovers.retain(|n| *n != m.to);
+            if !leftovers.iter().any(|n| n == from) {
+                leftovers.push(from.to_owned());
+            }
             *s = VolumeStatus {
                 node: m.to.clone(),
                 dataset: String::new(),
                 migration: None,
+                leftovers,
             };
         } else {
             s.migration = Some(Migration {
@@ -247,10 +276,8 @@ async fn advance(
     })
     .await?;
     if moved && last {
+        // The old copy is a leftover now, dropped by the migrator's round.
         tracing::info!(volume = %key, from, to = %m.to, "volume moved");
-        if let Err(e) = drop_copy(hub, namespace, volume, from).await {
-            tracing::warn!(volume = %key, node = from, "dropping the old copy: {e}");
-        }
     }
     Ok(())
 }
@@ -520,6 +547,7 @@ mod tests {
             node: node.into(),
             dataset: String::new(),
             migration,
+            leftovers: Vec::new(),
         };
         // Still on, or moved on to its next phase.
         assert!(!called_off(
@@ -533,18 +561,55 @@ mod tests {
         // Ended, sent elsewhere, or gone.
         assert!(called_off(&copying, Some(&status("n1", None))));
         let n3 = m("n3", MigrationPhase::Copying);
-        assert!(called_off(&copying, Some(&status("n1", Some(n3.clone())))));
+        assert!(called_off(&copying, Some(&status("n1", Some(n3)))));
         assert!(called_off(&copying, None));
+    }
 
-        // What n2 received is dropped once nothing has the Volume go
-        // there or be there; not that of a Volume gone, which may be
-        // anywhere.
-        assert!(stale_copy(&copying, Some(&status("n1", None))));
-        assert!(stale_copy(&copying, Some(&status("n1", Some(n3)))));
-        assert!(!stale_copy(&copying, Some(&status("n2", None))));
-        let back = m("n2", MigrationPhase::Copying);
-        assert!(!stale_copy(&copying, Some(&status("n1", Some(back)))));
-        assert!(!stale_copy(&copying, None));
+    #[test]
+    fn a_migration_waits_for_drops_where_it_moves() {
+        let key = ObjectKey {
+            kind: Kind::Volume,
+            namespace: "default".into(),
+            name: "data".into(),
+        };
+        let back = Migration {
+            to: "a".into(),
+            phase: MigrationPhase::Copying,
+            message: String::new(),
+        };
+        let dropping = |node: &str| HashSet::from([(key.clone(), node.to_owned())]);
+        // Moved a to b, and a still drops its old copy: b to a waits, or
+        // the drop could take what a receives.
+        assert!(moves_through_a_drop(&key, "b", &back, &dropping("a")));
+        assert!(moves_through_a_drop(&key, "b", &back, &dropping("b")));
+        // A drop elsewhere, or of another Volume, holds nothing up.
+        assert!(!moves_through_a_drop(&key, "b", &back, &dropping("c")));
+        let other = ObjectKey {
+            name: "logs".into(),
+            ..key.clone()
+        };
+        let elsewhere = HashSet::from([(other, "a".to_owned())]);
+        assert!(!moves_through_a_drop(&key, "b", &back, &elsewhere));
+    }
+
+    #[test]
+    fn old_copies_are_dropped_where_nothing_else_wants_them() {
+        let nodes: HashSet<String> = ["n1", "n2", "n3"].map(String::from).into();
+        let status = VolumeStatus {
+            node: "n2".into(),
+            dataset: String::new(),
+            migration: Some(Migration {
+                to: "n3".into(),
+                phase: MigrationPhase::Copying,
+                message: String::new(),
+            }),
+            leftovers: ["n1", "n2", "n3", "gone"].map(String::from).into(),
+        };
+        // n1's copy is dropped; n2 holds the Volume, n3 receives it again,
+        // and the removed node took its copy with it.
+        let (to_drop, to_forget) = leftovers(&status, &nodes);
+        assert_eq!(to_drop, ["n1"]);
+        assert_eq!(to_forget, ["n2", "n3", "gone"]);
     }
 
     #[tokio::test]

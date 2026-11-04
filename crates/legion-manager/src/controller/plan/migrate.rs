@@ -8,7 +8,8 @@
 //!
 //! A migration whose new node is no longer ready and active is dropped,
 //! and so is one not yet finishing whose old node is no longer draining;
-//! the next pass starts another if one is still needed.
+//! the next pass starts another if one is still needed. What the dropped
+//! one's new node received is left over, for the migrator to drop.
 
 use std::collections::BTreeMap;
 
@@ -247,10 +248,22 @@ fn target<'a>(
         .map(Node::name)
 }
 
+/// Writes a Volume's migration. One dropped or sent elsewhere leaves its
+/// new node whatever it received, a leftover the migrator drops; kept in
+/// the status, so a new leader drops it too.
 fn write(v: &Volume, migration: Option<Migration>, plan: &mut Plan) {
+    let mut leftovers = v.status.leftovers.clone();
+    if let Some(was) = &v.status.migration
+        && migration.as_ref().is_none_or(|m| m.to != was.to)
+        && was.to != v.status.node
+        && !leftovers.contains(&was.to)
+    {
+        leftovers.push(was.to.clone());
+    }
     let mut o = v.object.clone();
     o.status = serde_json::to_value(VolumeStatus {
         migration,
+        leftovers,
         ..v.status.clone()
     })
     .expect("serialises");

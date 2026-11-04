@@ -209,6 +209,21 @@ pub(super) fn job(
         );
     }
 
+    // Each slot's newest task number, so a task deleted leaves its name
+    // unused.
+    let mine = created
+        .iter()
+        .filter(|t| t.spec.service_uid == j.object.metadata.uid);
+    for t in tasks.iter().copied().chain(mine) {
+        if let Some(n) = super::task_number(&t.object.metadata.name) {
+            let last = status
+                .last_tasks
+                .entry(super::slot_of(t).key())
+                .or_default();
+            *last = (*last).max(n);
+        }
+    }
+
     status.active = tasks.iter().filter(|t| t.active()).count() as u32
         + created
             .iter()
@@ -283,7 +298,7 @@ fn start(
             continue;
         }
         budget -= 1;
-        let mut t = super::new_task(owner, slot, list, &BTreeMap::new());
+        let mut t = super::new_task(owner, slot, list, &j.status.last_tasks);
         t.spec.job = true;
         let labels = &mut t.object.metadata.labels;
         labels.remove(super::LABEL_SERVICE);

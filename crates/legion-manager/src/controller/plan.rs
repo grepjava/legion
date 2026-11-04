@@ -13,7 +13,7 @@ use legion_api::node::{Availability, NodeSpec, NodeState, NodeStatus};
 use legion_api::quota::{Quota, Usage};
 use legion_api::service::FailureAction;
 use legion_api::service::{
-    Constraint, EndpointMode, NodeAttribute, PUBLISHED_PORTS, Publish, PublishedPort,
+    Constraint, EndpointMode, NodeAttribute, PUBLISHED_PORTS, PodSpec, Publish, PublishedPort,
     RestartCondition, SERVICE_NET, SERVICE_PREFIX, ServiceMode, ServiceSpec, ServiceStatus,
     TaintEffect, UpdateOrder, UpdateState, UpdateStatus, claim_volume, update_snapshot,
 };
@@ -1361,6 +1361,21 @@ impl Load {
 /// node, then requested CPU and memory in thousandths.
 type Score = (bool, Vec<u32>, u32, u64, u64);
 
+/// A container of `pod` that requests nothing of what `quota` limits, CPU
+/// or memory, and which.
+fn unrequested<'a>(quota: &Quota, pod: &'a PodSpec) -> Option<(&'a str, &'static str)> {
+    pod.containers().find_map(|c| {
+        let r = &c.resources.requests;
+        if quota.cpu.is_some() && r.cpu.is_none_or(|n| n.0 == 0) {
+            Some((c.name.as_str(), "cpu"))
+        } else if quota.memory.is_some() && r.memory.is_none_or(|n| n.0 == 0) {
+            Some((c.name.as_str(), "memory"))
+        } else {
+            None
+        }
+    })
+}
+
 /// Places pending tasks: hold those their namespace's quota has no room
 /// for, filter nodes (eligible, requests fit), then prefer a node without
 /// an untolerated `PreferNoSchedule` taint, then one whose group under
@@ -1414,9 +1429,25 @@ fn schedule(
         .chain(created.into_iter().map(|t| (t, None)))
         .collect();
 
-    // Volumes one node at a time may have, not yet on one, that a task
-    // placed in this pass took: other tasks of theirs go to the same node.
+    // Volumes one node at a time may have, not yet on one, that a placed
+    // task took, in this pass or before its node claimed them: other
+    // tasks of theirs go to the same node.
     let mut taken: BTreeMap<(String, String), String> = BTreeMap::new();
+    let take = |taken: &mut BTreeMap<_, _>, t: &Task| {
+        for v in t.spec.volumes() {
+            let key = (t.object.metadata.namespace.clone(), v);
+            if volumes
+                .get(&key)
+                .is_some_and(|v| v.spec.access() != Access::Shared)
+                && home(volumes, &key.0, &key.1).is_none()
+            {
+                taken.insert(key, t.spec.node.clone());
+            }
+        }
+    };
+    for t in tasks.iter().filter(|t| t.placed()) {
+        take(&mut taken, t);
+    }
     for (mut t, original) in pending {
         let Some(s) = services.iter().find(|s| s.owns(&t)) else {
             continue;
@@ -1430,6 +1461,11 @@ fn schedule(
             .get(&namespace)
             .map(|q| q.exceeded(&before, &after))
             .unwrap_or_default();
+        // One asking for nothing a quota limits would run outside it: from
+        // before the quota, or past admission while it was set.
+        let unasked = quotas
+            .get(&namespace)
+            .and_then(|q| unrequested(q, &t.spec.pod));
         let owner = (s.key().0.to_owned(), s.key().1.to_owned());
         let on = |node: &str| {
             load.get(node)
@@ -1446,7 +1482,10 @@ fn schedule(
             .collect();
         let mut reasons: BTreeMap<&str, usize> = BTreeMap::new();
         let mut best: Option<(&str, Score)> = None;
-        for n in nodes.iter().filter(|_| over.is_empty()) {
+        for n in nodes
+            .iter()
+            .filter(|_| over.is_empty() && unasked.is_none())
+        {
             let name = n.object.metadata.name.as_str();
             if !t.spec.node.is_empty() && t.spec.node != name {
                 continue;
@@ -1500,22 +1539,21 @@ fn schedule(
             Some((name, _)) => {
                 t.spec.node = name.to_owned();
                 load.entry(name.to_owned()).or_default().add(&t);
-                for v in t.spec.volumes() {
-                    let key = (namespace.clone(), v);
-                    if volumes
-                        .get(&key)
-                        .is_some_and(|v| v.spec.access() != Access::Shared)
-                        && home(volumes, &key.0, &key.1).is_none()
-                    {
-                        taken.insert(key, name.to_owned());
-                    }
-                }
+                take(&mut taken, &t);
                 used.insert(namespace, after);
                 TaskStatus {
                     state: TaskState::Assigned,
                     ..Default::default()
                 }
             }
+            None if let Some((container, what)) = unasked => TaskStatus {
+                state: TaskState::Pending,
+                message: format!(
+                    "namespace {namespace} has a {what} quota: container {container} must \
+                     request {what}"
+                ),
+                ..Default::default()
+            },
             None if !over.is_empty() => TaskStatus {
                 state: TaskState::Pending,
                 message: format!(

@@ -156,6 +156,7 @@ impl World {
             node: node.into(),
             dataset: format!("tank/legion/volumes/shop/{name}"),
             migration: None,
+            leftovers: Vec::new(),
         };
         o.status = serde_json::to_value(&status).unwrap();
         self.volumes.insert(
@@ -1541,7 +1542,7 @@ pod: { containers: [{ name: web, image: \"web:1\", resources: { requests: { cpu:
     w.service(
         "agent",
         "mode: global
-pod: { containers: [{ name: a, image: \"a:1\" }] }",
+pod: { containers: [{ name: a, image: \"a:1\", resources: { requests: { cpu: 100m } } }] }",
     );
     w.settle();
     // Two of web fit the CPU, one of agent the task count; the rest wait,
@@ -1562,7 +1563,7 @@ pod: { containers: [{ name: a, image: \"a:1\" }] }",
     };
     assert_eq!(
         message(&w, "web-3-1"),
-        "over the quota of namespace shop: cpu 1200m of 1, tasks 4 of 3"
+        "over the quota of namespace shop: cpu 1300m of 1, tasks 4 of 3"
     );
     assert_eq!(
         message(&w, "agent-n2-1"),
@@ -1783,6 +1784,22 @@ fn a_job_retries_until_its_backoff_limit() {
     w.advance(600);
     w.settle();
     assert!(w.running().is_empty(), "a failed Job runs no more");
+}
+
+#[test]
+fn a_jobs_deleted_tasks_leave_their_names_unused() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.job("flaky", &job("backoffLimit: 3"));
+    w.settle();
+    w.fail("flaky-1-1");
+    w.settle();
+    // An operator deletes the failed task before its retry.
+    w.tasks.retain(|t| t.object.metadata.name != "flaky-1-1");
+    w.advance(10);
+    w.settle();
+    assert_eq!(w.running(), ["flaky-1-2"]);
+    assert_eq!(w.job_status("flaky").last_tasks["1"], 2);
 }
 
 #[test]
@@ -2669,6 +2686,21 @@ fn migrations_stop_when_no_longer_needed_or_possible() {
     w.settle();
     assert_eq!(w.migration("data-db-0"), None);
     assert_eq!(w.wanted("db"), ["db-0-1"]);
+    // What the new node received is left over, for the migrator to drop
+    // whichever manager leads.
+    let leftovers = |w: &World| {
+        w.volumes[&("shop".to_owned(), "data-db-0".to_owned())]
+            .status
+            .leftovers
+            .clone()
+    };
+    assert_eq!(leftovers(&w), [to]);
+    w.volumes
+        .get_mut(&("shop".to_owned(), "data-db-0".to_owned()))
+        .unwrap()
+        .status
+        .leftovers
+        .clear();
 
     // The new node lost, the copy is dropped; with no other node, none
     // starts, and the task runs on.
@@ -2678,6 +2710,34 @@ fn migrations_stop_when_no_longer_needed_or_possible() {
     w.settle();
     assert_eq!(w.migration("data-db-0"), None);
     assert_eq!(w.placed_task("db-0-1").status.state, TaskState::Running);
+    assert_eq!(leftovers(&w), [to]);
+}
+
+#[test]
+fn tasks_asking_nothing_a_quota_limits_wait() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    // Applied before the namespace had a quota.
+    w.service(
+        "web",
+        "replicas: 2
+pod: { containers: [{ name: web, image: \"web:1\", resources: { requests: { cpu: 100m } } }] }",
+    );
+    w.settle();
+    assert_eq!(w.running().len(), 2);
+    let quota = |y: &str| serde_yaml_ng::from_str(y).unwrap();
+    w.quotas.insert("shop".into(), quota("{ memory: 1Gi }"));
+    // What runs stays; a replacement asks no memory, so waits.
+    w.fail("web-1-1");
+    w.settle();
+    w.now += Duration::from_secs(60);
+    w.settle();
+    assert_eq!(w.running(), ["web-2-1"]);
+    let t = w.tasks.iter().find(|t| t.object.metadata.name == "web-1-2");
+    assert_eq!(
+        t.unwrap().status.message,
+        "namespace shop has a memory quota: container web must request memory"
+    );
 }
 
 impl World {
@@ -3339,6 +3399,36 @@ fn tasks_sharing_a_volume_new_to_any_node_go_to_one_node() {
         "web",
         "replicas: 2
 pod: { containers: [{ name: web, image: \"web:1\" }], volumes: [{ name: f, volume: { name: files } }] }",
+    );
+    w.step();
+    let nodes: Vec<&str> = w.tasks.iter().map(|t| t.spec.node.as_str()).collect();
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(nodes[0], nodes[1], "{:?}", w.tasks());
+}
+
+#[test]
+fn a_task_joins_one_placed_before_its_volume_was_claimed() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.volume("files", "");
+    w.agents = false;
+    let pod = "pod: { containers: [{ name: web, image: \"web:1\" }], volumes: [{ name: f, volume: { name: files } }] }";
+    w.service(
+        "web",
+        &format!(
+            "replicas: 1
+{pod}"
+        ),
+    );
+    w.step();
+    // The first task's node has not claimed the Volume yet.
+    w.service(
+        "web",
+        &format!(
+            "replicas: 2
+{pod}"
+        ),
     );
     w.step();
     let nodes: Vec<&str> = w.tasks.iter().map(|t| t.spec.node.as_str()).collect();
