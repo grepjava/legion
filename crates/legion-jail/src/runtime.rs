@@ -614,6 +614,27 @@ impl Files {
     }
 }
 
+/// A container's environment: the image's, then the spec's over it, then
+/// `HOSTNAME`, unless the spec sets it. Each name once: the first of a
+/// name is what `getenv` finds, the last what a shell keeps.
+fn container_env(image: &[String], spec: &BTreeMap<String, String>, hostname: &str) -> Vec<String> {
+    let name = |e: &String| e.split('=').next().unwrap_or("").to_owned();
+    let mut seen = BTreeSet::new();
+    let mut env: Vec<String> = image
+        .iter()
+        .filter(|e| {
+            let k = name(e);
+            !spec.contains_key(&k) && k != "HOSTNAME" && seen.insert(k)
+        })
+        .cloned()
+        .collect();
+    env.extend(spec.iter().map(|(k, v)| format!("{k}={v}")));
+    if !spec.contains_key("HOSTNAME") {
+        env.push(format!("HOSTNAME={hostname}"));
+    }
+    env
+}
+
 fn status(
     dir: &Path,
     rec: &Record,
@@ -877,18 +898,8 @@ impl JailRuntime {
         } else {
             cfg.entrypoint.iter().chain(&cfg.cmd).cloned().collect()
         };
-        let mut env: Vec<String> = cfg
-            .env
-            .iter()
-            .filter(|e| {
-                let k = e.split('=').next().unwrap_or("");
-                !spec.env.contains_key(k)
-            })
-            .cloned()
-            .collect();
-        env.extend(spec.env.iter().map(|(k, v)| format!("{k}={v}")));
         let hostname = spec.hostname.clone().unwrap_or_else(|| spec.name.clone());
-        env.push(format!("HOSTNAME={hostname}"));
+        let env = container_env(&cfg.env, &spec.env, &hostname);
         let (jail, root, dataset) = match (&parent, pod) {
             (_, true) => (id.clone(), PathBuf::from(POD_ROOT), None),
             (Some(p), false) => {
@@ -1329,8 +1340,15 @@ impl legion_runtime::Runtime for JailRuntime {
         }
         #[cfg(unix)]
         if alive(run.shim) {
-            // SAFETY: the supervisor sends the container's stop signal.
-            unsafe { libc::kill(run.shim as libc::pid_t, libc::SIGTERM) };
+            // The supervisor sends the container's stop signal; an attached
+            // run's command, its own supervisor, is sent it.
+            let signal = if run.shim == run.pid {
+                rec.stop_signal
+            } else {
+                libc::SIGTERM
+            };
+            // SAFETY: a signal to a process of ours.
+            unsafe { libc::kill(run.shim as libc::pid_t, signal) };
         }
         if self.wait_over(&rec, timeout).await? {
             return Ok(());
@@ -1858,6 +1876,24 @@ mod tests {
         assert_eq!(exit_code(ExitStatus::from_raw(3 << 8)), 3);
         assert_eq!(exit_code(ExitStatus::from_raw(libc::SIGTERM)), 143);
         assert_eq!(exit_code(ExitStatus::from_raw(libc::SIGKILL)), 137);
+    }
+
+    #[test]
+    fn each_name_is_in_the_environment_once() {
+        let image: Vec<String> = ["PATH=/bin", "HOSTNAME=builder", "A=1", "A=2", "B=image"]
+            .map(String::from)
+            .to_vec();
+        let spec = BTreeMap::from([("B".to_owned(), "spec".to_owned())]);
+        assert_eq!(
+            container_env(&image, &spec, "web-1"),
+            ["PATH=/bin", "A=1", "B=spec", "HOSTNAME=web-1"]
+        );
+        // One the spec sets is kept as it set it.
+        let spec = BTreeMap::from([("HOSTNAME".to_owned(), "mine".to_owned())]);
+        assert_eq!(
+            container_env(&image, &spec, "web-1"),
+            ["PATH=/bin", "A=1", "B=image", "HOSTNAME=mine"]
+        );
     }
 
     #[test]

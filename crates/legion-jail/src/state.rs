@@ -68,6 +68,8 @@ pub struct Mount {
 /// A started process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Run {
+    /// The supervisor; for an attached run, which has none, its command,
+    /// as `pid` is.
     pub shim: u32,
     pub pid: u32,
     pub jid: u32,

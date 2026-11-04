@@ -770,3 +770,36 @@ async fn an_export_keeps_the_config_as_pulled() {
     let loaded = other.load(&out, None).await.unwrap();
     assert_eq!(loaded.id, pulled.id);
 }
+
+#[tokio::test]
+async fn a_blob_for_a_layer_already_here_is_checked_before_it_is_kept() {
+    let base = layer(&[("etc/base", "b")]);
+    let other = layer(&[("etc/other", "o")]);
+    let registry = Arc::new(Mutex::new(Registry::default()));
+    {
+        let mut r = registry.lock().unwrap();
+        r.image("team/app", "1", "freebsd", std::slice::from_ref(&base));
+        // Another blob, named as the base layer's contents.
+        r.image(
+            "team/forged",
+            "1",
+            "freebsd",
+            &[(other.0.clone(), base.1.clone())],
+        );
+    }
+    let addr = serve(registry).await;
+    let t = tempfile::tempdir().unwrap();
+    let sys = Arc::new(FakeSys::new());
+    let s = store(&sys, &t.path().join("a"), &addr).keep_blobs();
+    s.pull(&format!("{addr}/team/app:1"), None, "a")
+        .await
+        .unwrap();
+    let e = s
+        .pull(&format!("{addr}/team/forged:1"), None, "a")
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("diff_id"), "{e}");
+    let forged = s.blob_path(&digest(&other.0)).unwrap();
+    assert!(!forged.exists(), "the forged blob was kept");
+    assert!(s.get(&format!("{addr}/team/forged:1")).unwrap().is_none());
+}

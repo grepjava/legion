@@ -727,17 +727,24 @@ impl Store {
             if !have || need_blob {
                 let blob = tmp.path().join(format!("{i}.blob"));
                 source.blob(&desc.digest, desc.size, &blob).await?;
+                // Kept only once it is the layer the config names: a blob
+                // for a layer already here is checked all the same, as
+                // pushes and exports serve it for that layer.
+                let tar = (!have).then(|| tmp.path().join(format!("{i}.tar")));
+                {
+                    let (blob, tar) = (blob.clone(), tar.clone());
+                    let diff_id = config.rootfs.diff_ids[i].clone();
+                    blocking(move || match &tar {
+                        Some(tar) => layer::decompress(&blob, &diff_id, tar),
+                        None => layer::verify(&blob, &diff_id),
+                    })
+                    .await?;
+                }
                 if let Some(k) = &kept {
                     self.copy_blob(&blob, k)?;
                 }
-                if !have {
-                    let tar = tmp.path().join(format!("{i}.tar"));
-                    let diff_id = config.rootfs.diff_ids[i].clone();
-                    {
-                        let (blob, tar) = (blob.clone(), tar.clone());
-                        blocking(move || layer::decompress(&blob, &diff_id, &tar)).await?;
-                    }
-                    let _ = std::fs::remove_file(&blob);
+                let _ = std::fs::remove_file(&blob);
+                if let Some(tar) = tar {
                     self.add_layer(parent.as_deref(), &hex, tar).await?;
                     tracing::info!(image = %r, layer = %hex, "layer added");
                 }

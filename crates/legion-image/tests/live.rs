@@ -139,12 +139,19 @@ async fn whiteouts_and_replacements_of_flagged_files() {
         ("locked/gone", "g", None),
         ("sealed/", "", Some("schg")),
         ("sealed/old", "o", None),
+        // Listed again by the upper layer: without flags, as a tool not
+        // knowing them lists an ancestor, and with flags of its own.
+        ("empty/", "", Some("schg")),
+        ("retagged/", "", Some("nodump")),
     ]);
     let upper = layer(&[
         ("etc/.wh.gone", "", None),
         ("etc/replaced", "new", None),
         ("locked/.wh.gone", "", None),
         ("sealed/.wh..wh..opq", "", None),
+        ("empty/", "", None),
+        ("empty/added", "a", None),
+        ("retagged/", "", Some("schg")),
     ]);
     let diff_ids = [digest(&lower), digest(&upper)];
     let cfg = put(
@@ -207,6 +214,22 @@ async fn whiteouts_and_replacements_of_flagged_files() {
         dirs.lines().filter(|l| l.contains("schg")).count(),
         2,
         "{dirs}"
+    );
+    // The one listed without flags keeps its own; the one listed with
+    // flags has the layer's.
+    assert!(mnt.join("empty/added").exists());
+    let relisted = sh(&format!("ls -lod {0}/empty {0}/retagged", mnt.display()));
+    assert!(
+        relisted
+            .lines()
+            .any(|l| l.ends_with("empty") && l.contains("schg")),
+        "{relisted}"
+    );
+    assert!(
+        relisted
+            .lines()
+            .any(|l| l.ends_with("retagged") && l.contains("schg") && !l.contains("nodump")),
+        "{relisted}"
     );
     sys.zfs_destroy(&format!("{base}/ctr/c1"), false).unwrap();
     store.remove("localhost/flags:1").await.unwrap();

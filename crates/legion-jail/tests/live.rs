@@ -692,6 +692,96 @@ async fn standalone_containers_and_build_steps() {
     assert_eq!(rt.run_attached(&killed, false, false).await.unwrap(), 137);
     assert_eq!(rt.inspect(&killed).await.unwrap().state.exit_code, 137);
     rt.remove(&killed).await.unwrap();
+    // `HOSTNAME` once, as a direct exec of env sees each entry (a shell
+    // shows only the last): an image that bakes one in is run with the
+    // container's hostname, or the spec's own if it sets one.
+    let base_image = images.get(IMAGE).unwrap().expect("pulled");
+    let mut config = base_image.config.clone();
+    config.config.env.push("HOSTNAME=baked-at-build".into());
+    let baked = "localhost/baked:1";
+    images
+        .register_built_image(
+            &images.pin().unwrap(),
+            &legion_image::Reference::parse(baked).unwrap(),
+            config,
+            base_image.layers.clone(),
+            base_image.layer_descriptors.clone(),
+        )
+        .await
+        .unwrap();
+    for (set, want) in [(None, "real-name"), (Some("x"), "x")] {
+        let spec = ContainerSpec {
+            name: "envy".into(),
+            image: baked.into(),
+            hostname: Some("real-name".into()),
+            entrypoint: vec!["/usr/bin/env".into()],
+            env: set
+                .map(|h| BTreeMap::from([("HOSTNAME".to_owned(), h.to_owned())]))
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        let id = rt.create(&spec).await.unwrap();
+        rt.start(&id).await.unwrap();
+        until("env's end", async || {
+            !rt.inspect(&id).await.unwrap().state.running
+        })
+        .await;
+        let out = output(&rt, &id).await;
+        let hosts: Vec<&str> = out.lines().filter(|l| l.starts_with("HOSTNAME=")).collect();
+        assert_eq!(hosts, [format!("HOSTNAME={want}").as_str()], "{out}");
+        rt.remove(&id).await.unwrap();
+    }
+    images.remove(baked).await.unwrap();
+    // Stopped while it runs, from another task with a runtime of its own
+    // (as another `jailer stop` is): its command is sent the stop signal,
+    // not this process a SIGTERM, and ends as it chooses; the run then
+    // returns, and the caller's cleanup (as `--rm`) leaves nothing.
+    let trapped = rt
+        .create(&standalone(
+            "trapped",
+            "trap \"exit 7\" TERM; sleep 60 & wait",
+        ))
+        .await
+        .unwrap();
+    let stopper = {
+        let other = runtime(&sys, &images, dir.as_path(), &base);
+        let id = trapped.clone();
+        let sys = sys.clone();
+        tokio::spawn(async move {
+            // Its trap set: the shell has started `sleep` (a stop before
+            // that ends it as TERM does any shell).
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let running = other.inspect(&id).await.unwrap().state.running;
+                let sleeping = running
+                    && sys.jail_get(&id, &["jid"]).is_ok_and(|p| {
+                        std::process::Command::new("pgrep")
+                            .args(["-j", &p["jid"], "-x", "sleep"])
+                            .output()
+                            .is_ok_and(|o| o.status.success())
+                    });
+                if sleeping {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "timed out waiting for its sleep");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let begun = Instant::now();
+            other.stop(&id, Duration::from_secs(20)).await.unwrap();
+            begun.elapsed()
+        })
+    };
+    let code = rt.run_attached(&trapped, false, false).await;
+    let took = stopper.await.unwrap();
+    assert_eq!(code.unwrap(), 7);
+    assert!(took < Duration::from_secs(5), "stop took {took:?}");
+    assert_eq!(rt.inspect(&trapped).await.unwrap().state.exit_code, 7);
+    rt.remove(&trapped).await.unwrap();
+    assert!(rt.find(&trapped).is_err());
+    assert!(!dir.join("jails").join(&trapped).exists());
+    assert!(!sys.jails().unwrap().iter().any(|j| j.name == trapped));
+    let left: Vec<String> = sys.mounts(&dir.as_path().to_string_lossy()).unwrap();
+    assert!(!left.iter().any(|m| m.contains(&trapped)), "{left:?}");
     // A create whose future is dropped while it makes the root is made
     // all the same, and listed, so that it can be removed.
     let spec = standalone("dropped", "true");

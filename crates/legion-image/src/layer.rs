@@ -36,7 +36,20 @@ pub fn decompress(blob: &Path, diff_id: &str, tar: &Path) -> Result<(), Error> {
     decompress_at_most(blob, diff_id, tar, MAX_LAYER)
 }
 
+/// Checks that `blob` decompresses to the tar `diff_id` names, as
+/// [`decompress`] does, keeping nothing.
+pub fn verify(blob: &Path, diff_id: &str) -> Result<(), Error> {
+    unpack(blob, diff_id, std::io::sink(), MAX_LAYER)
+}
+
 fn decompress_at_most(blob: &Path, diff_id: &str, tar: &Path, max: u64) -> Result<(), Error> {
+    let mut out = std::io::BufWriter::new(File::create(tar)?);
+    unpack(blob, diff_id, &mut out, max)?;
+    out.flush()?;
+    Ok(())
+}
+
+fn unpack(blob: &Path, diff_id: &str, mut out: impl Write, max: u64) -> Result<(), Error> {
     let mut input = BufReader::new(File::open(blob)?);
     let mut magic = [0u8; 4];
     let n = read_full(&mut input, &mut magic)?;
@@ -50,7 +63,6 @@ fn decompress_at_most(blob: &Path, diff_id: &str, tar: &Path, max: u64) -> Resul
         _ => Box::new(head),
     };
     let mut reader = reader.take(max + 1);
-    let mut out = std::io::BufWriter::new(File::create(tar)?);
     let mut hash = Sha256::new();
     let mut buf = vec![0u8; 1 << 16];
     loop {
@@ -67,7 +79,6 @@ fn decompress_at_most(blob: &Path, diff_id: &str, tar: &Path, max: u64) -> Resul
         hash.update(&buf[..n]);
         out.write_all(&buf[..n])?;
     }
-    out.flush()?;
     let got = format!("sha256:{:x}", hash.finalize());
     if got != diff_id {
         return Err(Error::Digest {
@@ -302,8 +313,9 @@ pub fn apply(tar: &Path, root: &Path) -> Result<(), Error> {
     apply_whiteouts(root, &whiteouts(tar)?)?;
     // bsdtar can neither write into a directory with file flags (`schg`)
     // that a lower layer made nor restore its times, so their flags are
-    // cleared first. A directory the layer lists takes the layer's flags;
-    // one it only writes into gets its own back.
+    // cleared first. A directory the layer lists with flags takes the
+    // layer's; one it lists without, or only writes into, gets its own
+    // back.
     let flagged = flagged_dirs(tar, root)?;
     for (dir, _, _) in &flagged {
         set_flags(dir, 0)?;
@@ -326,8 +338,12 @@ fn flagged_dirs(tar: &Path, root: &Path) -> Result<Vec<(PathBuf, libc::c_ulong, 
     let mut found: BTreeMap<PathBuf, (libc::c_ulong, bool)> = BTreeMap::new();
     let mut archive = tar::Archive::new(BufReader::new(File::open(tar)?));
     for entry in archive.entries()? {
-        let entry = entry?;
+        let mut entry = entry?;
         let is_dir = entry.header().entry_type().is_dir();
+        // Listed with flags of its own, which bsdtar sets; listed without
+        // (an ancestor a tool not knowing flags lists), it keeps its own,
+        // as bsdtar keeps them.
+        let flags_listed = is_dir && carries_flags(&mut entry)?;
         let rel = entry.path()?.into_owned();
         let parts: Vec<_> = rel
             .components()
@@ -349,7 +365,7 @@ fn flagged_dirs(tar: &Path, root: &Path) -> Result<Vec<(PathBuf, libc::c_ulong, 
                         let e = found
                             .entry(path.clone())
                             .or_insert((m.st_flags().into(), false));
-                        e.1 |= last;
+                        e.1 |= last && flags_listed;
                     }
                 }
                 _ => break,
@@ -357,6 +373,20 @@ fn flagged_dirs(tar: &Path, root: &Path) -> Result<Vec<(PathBuf, libc::c_ulong, 
         }
     }
     Ok(found.into_iter().map(|(p, (f, l))| (p, f, l)).collect())
+}
+
+/// Whether a tar entry carries file flags (`SCHILY.fflags`).
+#[cfg(target_os = "freebsd")]
+fn carries_flags<R: Read>(entry: &mut tar::Entry<R>) -> Result<bool, Error> {
+    let Some(pax) = entry.pax_extensions()? else {
+        return Ok(false);
+    };
+    for ext in pax {
+        if ext?.key_bytes() == b"SCHILY.fflags" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(not(target_os = "freebsd"))]

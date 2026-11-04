@@ -119,23 +119,31 @@ impl JailRuntime {
                 return Err(e);
             }
         };
-        let me = std::process::id();
-        let run = Run {
-            shim: me,
-            pid: me,
-            jid,
-            started: state::now(),
-            boot: self.boot,
-        };
         let mut undo = UndoAttached {
             rt: self,
             rec: &rec,
             done: false,
         };
-        state::write(&dir, RUN, &run).map_err(internal)?;
         let mut cmd = self.shim_exec(&rec, jid, &rec.argv, stdin, tty);
         cmd.kill_on_drop(true);
-        let status = cmd.status().await;
+        let status = match cmd.spawn() {
+            Ok(mut child) => {
+                // The supervisor's exec becomes the command, which is so
+                // its own supervisor: a stop sends it the stop signal, not
+                // this process a SIGTERM.
+                let pid = child.id().unwrap_or_default();
+                let run = Run {
+                    shim: pid,
+                    pid,
+                    jid,
+                    started: state::now(),
+                    boot: self.boot,
+                };
+                state::write(&dir, RUN, &run).map_err(internal)?;
+                child.wait().await
+            }
+            Err(e) => Err(e),
+        };
         let (code, error) = match &status {
             Ok(s) => (exit_code(*s), None),
             Err(e) => (127, Some(e.to_string())),
