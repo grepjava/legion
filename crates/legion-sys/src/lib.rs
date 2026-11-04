@@ -105,7 +105,8 @@ pub trait Sys: Send + Sync {
     // CARP (host only).
 
     /// Puts `carp.addr` on `interface` as CARP virtual host `carp.vhid`
-    /// (loading `carp`), or, when it is there, sets its skew; `state`
+    /// (loading `carp`; moving the address off another virtual host it is
+    /// on), or, when it is there, sets its skew and password; `state`
     /// forces the virtual host master or backup.
     fn carp_set(&self, interface: &str, carp: &Carp, state: Option<CarpState>) -> Result<()>;
     /// The state of virtual host `vhid` on `interface`; `None` if absent.
@@ -134,6 +135,8 @@ pub trait Sys: Send + Sync {
 
     // rctl (host only).
 
+    /// Adds the rule; one for the same jail and resource has its amount
+    /// replaced.
     fn rctl_add(&self, rule: &RctlRule) -> Result<()>;
     /// Removes every rule for `jail`; none is not an error.
     fn rctl_remove_jail(&self, jail: &str) -> Result<()>;

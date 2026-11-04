@@ -426,8 +426,18 @@ fn users_get_their_roles() {
     assert!(!failed.status.success());
     let binding = legion(&d, &["get", "rolebinding", "bob", "-n", "shop"]);
     assert!(!binding.status.success(), "the binding stayed");
-    // And one that was there before is put back as it was.
+    // And one that was there before is put back as it was, labels too.
+    let labelled = dir.join("alice-binding.yaml");
+    std::fs::write(
+        &labelled,
+        "apiVersion: legion/v1\nkind: RoleBinding\n\
+         metadata: { name: alice, namespace: shop, labels: { team: payments } }\n\
+         spec: { user: alice, role: edit }\n",
+    )
+    .unwrap();
+    ok(&d, &["apply", "-f", labelled.to_str().unwrap()]);
     let kept = ok(&d, &["get", "rolebinding", "alice", "-n", "shop"]);
+    assert!(kept.contains("team: payments"), "{kept}");
     let failed = legion(
         &d,
         &[
@@ -445,7 +455,27 @@ fn users_get_their_roles() {
     assert!(!failed.status.success());
     let back = ok(&d, &["get", "rolebinding", "alice", "-n", "shop"]);
     assert!(back.contains("role: edit"), "{back}");
+    assert!(back.contains("team: payments"), "{back}");
     assert!(kept.contains("role: edit"), "{kept}");
+    // A new role for a bound user keeps the binding's labels.
+    let second = dir.join("alice-admin.pem");
+    ok(
+        &d,
+        &[
+            "user",
+            "create",
+            "alice",
+            "--role",
+            "admin",
+            "-n",
+            "shop",
+            "-o",
+            second.to_str().unwrap(),
+        ],
+    );
+    let rebound = ok(&d, &["get", "rolebinding", "alice", "-n", "shop"]);
+    assert!(rebound.contains("role: admin"), "{rebound}");
+    assert!(rebound.contains("team: payments"), "{rebound}");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

@@ -341,7 +341,7 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                         bail!("--role {role:?}: one of view, edit and admin");
                     }
                     let spec = serde_json::json!({ "user": name, "role": role });
-                    let binding = Object::new(Kind::RoleBinding, &namespace, &name, spec);
+                    let mut binding = Object::new(Kind::RoleBinding, &namespace, &name, spec);
                     let before = match objects.get((&binding.key()).into()).await {
                         Ok(o) => Some(Object::try_from(o.into_inner())?),
                         Err(s) if s.code() == tonic::Code::NotFound => None,
@@ -349,6 +349,10 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                             return Err(s).with_context(|| format!("reading {}", binding.key()));
                         }
                     };
+                    // An apply sets the labels too: a binding there keeps its.
+                    if let Some(before) = &before {
+                        binding.metadata.labels = before.metadata.labels.clone();
+                    }
                     apply(&mut objects, &binding).await?;
                     bound = Some((binding, before));
                 }
@@ -380,12 +384,13 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 (Err(e), Some((binding, before))) => {
                     let undone = match before {
                         Some(before) => {
-                            let back = Object::new(
+                            let mut back = Object::new(
                                 Kind::RoleBinding,
                                 &before.metadata.namespace,
                                 &before.metadata.name,
                                 before.spec,
                             );
+                            back.metadata.labels = before.metadata.labels;
                             apply(&mut objects, &back).await
                         }
                         None => delete(&mut objects, &binding).await,

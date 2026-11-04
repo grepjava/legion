@@ -563,18 +563,28 @@ impl<R: Runner> Sys for Shell<R> {
 
     fn carp_set(&self, interface: &str, carp: &Carp, state: Option<CarpState>) -> Result<()> {
         let shown = self.run("ifconfig", &args([interface]))?;
+        // The password too, so a changed one reaches a virtual host that
+        // is there already.
         let mut a = args([interface, "vhid"]);
         a.extend([
             carp.vhid.to_string(),
             "advskew".into(),
             carp.advskew.to_string(),
+            "pass".into(),
+            carp.password.clone(),
         ]);
-        if carp_addr(&shown, carp.addr).is_none() {
+        let on = carp_addr(&shown, carp.addr);
+        if on != Some(carp.vhid) {
+            if on.is_some() {
+                // On another virtual host: it moves to this one.
+                let old = args([interface, "inet", &carp.addr.to_string(), "-alias"]);
+                self.run("ifconfig", &old)?;
+            }
             // In a jail even `kldload -n` of a loaded module is refused.
             if self.run("kldstat", &args(["-q", "-m", "carp"])).is_err() {
                 self.kld_load("carp")?;
             }
-            a.extend(["pass".into(), carp.password.clone(), "alias".into()]);
+            a.push("alias".into());
             a.push(format!("{}/32", carp.addr));
         }
         if let Some(state) = state.filter(|s| *s != CarpState::Init) {
@@ -1472,7 +1482,10 @@ mod tests {
                 ok(""),
             ),
             ("ifconfig epair0a", ok(CARP_SHOWN)),
-            ("ifconfig epair0a vhid 7 advskew 0 state master", ok("")),
+            (
+                "ifconfig epair0a vhid 7 advskew 0 pass s3cret state master",
+                ok(""),
+            ),
             ("ifconfig epair0a", ok(&master)),
             ("ifconfig epair0a", ok(CARP_SHOWN)),
             ("ifconfig epair0a", ok(CARP_SHOWN)),
@@ -1496,6 +1509,26 @@ mod tests {
         assert_eq!(sh.carp_state("epair0a", 8).unwrap(), None);
         sh.carp_remove("epair0a", carp.addr).unwrap();
         sh.carp_remove("epair0a", carp.addr).unwrap();
+    }
+
+    #[test]
+    fn carp_address_moves_between_virtual_hosts() {
+        let sh = Script::shell(vec![
+            ("ifconfig epair0a", ok(CARP_SHOWN)),
+            ("ifconfig epair0a inet 10.77.0.100 -alias", ok("")),
+            ("kldstat -q -m carp", ok("")),
+            (
+                "ifconfig epair0a vhid 8 advskew 0 pass s3cret alias 10.77.0.100/32",
+                ok(""),
+            ),
+        ]);
+        let carp = Carp {
+            vhid: 8,
+            addr: Ipv4Addr::new(10, 77, 0, 100),
+            password: "s3cret".into(),
+            advskew: 0,
+        };
+        sh.carp_set("epair0a", &carp, None).unwrap();
     }
 
     #[test]

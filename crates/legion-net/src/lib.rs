@@ -294,8 +294,11 @@ impl PodNetwork {
             .find(|ip| !used.contains(ip))
     }
 
+    /// Whether `ip` is one [`Self::allocate`] could give: in the subnet,
+    /// and not its network, gateway or broadcast address.
     pub fn contains(&self, ip: Ipv4Addr) -> bool {
-        self.subnet.contains(ip) && ip != self.gateway() && ip != self.broadcast()
+        let n = u32::from(ip);
+        u32::from(self.gateway()) < n && n < u32::from(self.broadcast())
     }
 
     /// Gives the pod in `jail` the address `ip`: an epair whose host end
@@ -466,6 +469,9 @@ mod tests {
         assert_eq!(net.allocate(&full), None);
         assert!(net.contains(ip("10.200.3.9")));
         assert!(!net.contains(ip("10.200.3.255")) && !net.contains(ip("10.200.4.9")));
+        assert!(!net.contains(ip("10.200.3.0")) && !net.contains(ip("10.200.3.1")));
+        assert!(net.contains(ip("10.200.3.2")) && net.contains(ip("10.200.3.254")));
+        assert!(!net.contains(ip("10.200.2.255")));
         assert_eq!(host_interface("00000000000004d2"), "lp0000000004d2");
     }
 

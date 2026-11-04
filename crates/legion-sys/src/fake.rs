@@ -790,11 +790,14 @@ impl Sys for FakeSys {
     fn carp_set(&self, interface: &str, carp: &Carp, state: Option<CarpState>) -> Result<()> {
         let mut s = self.state();
         s.modules.insert("carp".into());
+        // The address leaves another virtual host it is on.
+        s.carp
+            .retain(|(i, v), (c, _)| !(i == interface && *v != carp.vhid && c.addr == carp.addr));
         let entry = s
             .carp
             .entry((interface.to_owned(), carp.vhid))
             .or_insert_with(|| (carp.clone(), CarpState::Backup));
-        entry.0.advskew = carp.advskew;
+        entry.0 = carp.clone();
         if let Some(state) = state.filter(|s| *s != CarpState::Init) {
             entry.1 = state;
         }
@@ -878,8 +881,14 @@ impl Sys for FakeSys {
         if s.failing.remove("rctl -a") {
             return Err(fail("rctl -a", "Operation not permitted"));
         }
-        if !s.rctl.contains(rule) {
-            s.rctl.push(rule.clone());
+        // As rctl: a rule for the jail's resource replaces its amount.
+        match s
+            .rctl
+            .iter_mut()
+            .find(|r| r.jail == rule.jail && r.resource == rule.resource)
+        {
+            Some(r) => r.amount = rule.amount,
+            None => s.rctl.push(rule.clone()),
         }
         Ok(())
     }
@@ -1662,6 +1671,38 @@ mod tests {
     }
 
     #[test]
+    fn carp_hosts_take_the_whole_setting() {
+        let sys = FakeSys::new();
+        let mut carp = Carp {
+            vhid: 7,
+            addr: Ipv4Addr::new(192, 0, 2, 100),
+            password: "one".into(),
+            advskew: 100,
+        };
+        sys.carp_set("re0", &carp, None).unwrap();
+        carp.password = "two".into();
+        carp.advskew = 0;
+        sys.carp_set("re0", &carp, None).unwrap();
+        assert_eq!(sys.carp("re0", 7).unwrap().0, carp);
+        // The address moves to another virtual host.
+        carp.vhid = 8;
+        sys.carp_set("re0", &carp, Some(CarpState::Master)).unwrap();
+        assert!(sys.carp("re0", 7).is_none());
+        assert_eq!(sys.carp("re0", 8), Some((carp.clone(), CarpState::Master)));
+        // Another interface's virtual host stays.
+        sys.carp_set(
+            "re1",
+            &Carp {
+                vhid: 7,
+                ..carp.clone()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(sys.carp("re0", 8).is_some() && sys.carp("re1", 7).is_some());
+    }
+
+    #[test]
     fn rctl_pf_zfs() {
         let sys = FakeSys::new();
         let rule = RctlRule {
@@ -1671,7 +1712,16 @@ mod tests {
         };
         sys.rctl_add(&rule).unwrap();
         sys.rctl_add(&rule).unwrap();
-        assert_eq!(sys.rctl_rules(), [rule]);
+        assert_eq!(sys.rctl_rules(), std::slice::from_ref(&rule));
+        // A new amount replaces the old, as rctl does.
+        let raised = RctlRule {
+            amount: 128,
+            ..rule.clone()
+        };
+        sys.rctl_add(&raised).unwrap();
+        assert_eq!(sys.rctl_rules(), [raised]);
+        sys.rctl_add(&rule).unwrap();
+        assert_eq!(sys.rctl_rules(), std::slice::from_ref(&rule));
         sys.rctl_remove_jail("infra1.web").unwrap();
         sys.rctl_remove_jail("infra1.web").unwrap();
         assert!(sys.rctl_rules().is_empty());
