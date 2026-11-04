@@ -50,9 +50,23 @@ pub(crate) struct Objects(ObjectsClient<Channel>);
 
 type Answer<T> = Result<tonic::Response<T>, tonic::Status>;
 
+/// The Objects API, taking objects as large as managers send.
+pub(crate) fn objects_client(channel: Channel) -> ObjectsClient<Channel> {
+    ObjectsClient::new(channel)
+        .max_decoding_message_size(legion_manager::MAX_MESSAGE)
+        .max_encoding_message_size(legion_manager::MAX_MESSAGE)
+}
+
+/// The Cluster API, likewise.
+pub(crate) fn cluster_client(channel: Channel) -> ClusterClient<Channel> {
+    ClusterClient::new(channel)
+        .max_decoding_message_size(legion_manager::MAX_MESSAGE)
+        .max_encoding_message_size(legion_manager::MAX_MESSAGE)
+}
+
 impl Objects {
     pub(crate) fn new(channel: Channel) -> Self {
-        Objects(ObjectsClient::new(channel))
+        Objects(objects_client(channel))
     }
 
     async fn apply(&mut self, req: ApplyRequest) -> Answer<pb::ApplyResponse> {
@@ -198,8 +212,8 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
         return print_converted(&file, &stack, namespace);
     }
     let channel = connect(server, identity).await?;
-    let mut objects = Objects(ObjectsClient::new(channel.clone()));
-    let mut cluster = ClusterClient::new(channel.clone());
+    let mut objects = Objects::new(channel.clone());
+    let mut cluster = cluster_client(channel.clone());
     match command {
         Command::Daemon { .. } => unreachable!("handled in main"),
         Command::Init => {
@@ -317,8 +331,10 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             if path.exists() {
                 bail!("{} exists; choose another with -o", path.display());
             }
-            // The binding first: a role it refuses leaves no credentials
-            // behind to block trying again.
+            // The binding first: a binding refused leaves no credentials
+            // behind to block trying again. Credentials that fail put the
+            // binding back as it was.
+            let mut bound = None;
             match (role, namespace) {
                 (Some(role), Some(namespace)) => {
                     if legion_api::rbac::NamespaceRole::parse(&role).is_none() {
@@ -326,26 +342,60 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                     }
                     let spec = serde_json::json!({ "user": name, "role": role });
                     let binding = Object::new(Kind::RoleBinding, &namespace, &name, spec);
+                    let before = match objects.get((&binding.key()).into()).await {
+                        Ok(o) => Some(Object::try_from(o.into_inner())?),
+                        Err(s) if s.code() == tonic::Code::NotFound => None,
+                        Err(s) => {
+                            return Err(s).with_context(|| format!("reading {}", binding.key()));
+                        }
+                    };
                     apply(&mut objects, &binding).await?;
+                    bound = Some((binding, before));
                 }
                 (None, None) => {}
                 _ => bail!("--role and --namespace go together"),
             }
-            let (key_pem, csr_pem) = legion_pki::request()?;
-            let issued = cluster
-                .issue_user(pb::IssueUserRequest {
-                    name: name.clone(),
-                    csr_pem,
-                    days,
-                })
-                .await?
-                .into_inner();
-            let bundle = legion_pki::Bundle {
-                cert_pem: issued.cert_pem,
-                key_pem,
-                ca_pem: issued.ca_pem,
+            let made = async {
+                let (key_pem, csr_pem) = legion_pki::request()?;
+                let issued = cluster
+                    .issue_user(pb::IssueUserRequest {
+                        name: name.clone(),
+                        csr_pem,
+                        days,
+                    })
+                    .await?
+                    .into_inner();
+                let bundle = legion_pki::Bundle {
+                    cert_pem: issued.cert_pem,
+                    key_pem,
+                    ca_pem: issued.ca_pem,
+                };
+                crate::pki::write_private(&path, &bundle.to_pem())?;
+                anyhow::Ok(bundle)
+            }
+            .await;
+            let bundle = match (made, bound) {
+                (Ok(bundle), _) => bundle,
+                (Err(e), None) => return Err(e),
+                (Err(e), Some((binding, before))) => {
+                    let undone = match before {
+                        Some(before) => {
+                            let back = Object::new(
+                                Kind::RoleBinding,
+                                &before.metadata.namespace,
+                                &before.metadata.name,
+                                before.spec,
+                            );
+                            apply(&mut objects, &back).await
+                        }
+                        None => delete(&mut objects, &binding).await,
+                    };
+                    if let Err(u) = undone {
+                        eprintln!("{}: not put back: {u:#}", binding.key());
+                    }
+                    return Err(e);
+                }
             };
-            crate::pki::write_private(&path, &bundle.to_pem())?;
             // As issued, to the nearest day: 0 asks for the default.
             let days = legion_pki::validity(&bundle.cert_pem)
                 .map_or(u64::from(days), |(_, life)| {

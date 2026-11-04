@@ -71,6 +71,11 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         None => None,
     };
     let store_key = pki.store_key().context("the store's key")?;
+    // Before the store opens: failing these leaves nothing to close.
+    let listener = tokio::net::TcpListener::bind(opts.listen)
+        .await
+        .with_context(|| format!("listening on {}", opts.listen))?;
+    let metrics_listener = bind_metrics(&opts).await?;
     let manager = legion_manager::Manager::open(legion_manager::ManagerConfig {
         tls: Some(tls),
         vip,
@@ -108,25 +113,34 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         opts.data_dir.clone(),
         credentials,
     ));
-    let listener = tokio::net::TcpListener::bind(opts.listen)
-        .await
-        .with_context(|| format!("listening on {}", opts.listen))?;
     tracing::info!(listen = %opts.listen, node_id = manager.id(), "serving");
-    let metrics_listener = bind_metrics(&opts).await?;
 
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let agent = if let Some(wireguard) = wireguard {
-        Some(
-            start_agent(
-                &opts,
-                &node,
-                status(hostname, &advertise),
-                control,
-                wireguard,
-                stopped,
-            )
-            .await?,
+        let started = start_agent(
+            &opts,
+            &node,
+            status(hostname, &advertise),
+            control,
+            wireguard,
+            stopped,
         )
+        .await;
+        match started {
+            Ok(agent) => Some(agent),
+            Err(e) => {
+                // Close the store as a stop does, its handles first.
+                let closed = async move {
+                    autolock.abort();
+                    let _ = autolock.await;
+                    renewal.abort();
+                };
+                if let Err(close) = manager.serve(listener, closed).await {
+                    tracing::warn!("closing the store: {close}");
+                }
+                return Err(e);
+            }
+        }
     } else {
         tracing::info!("agent disabled; this daemon runs the manager only");
         None
@@ -504,7 +518,7 @@ fn status(hostname: String, advertise: &str) -> NodeStatus {
         addr: host_of(advertise),
         platform: Platform {
             os: std::env::consts::OS.to_owned(),
-            arch: oci_arch().to_owned(),
+            arch: legion_image::oci::arch().to_owned(),
             // Set by the agent's start.
             linux: false,
             no_limits: false,
@@ -539,15 +553,6 @@ fn node_name(hostname: &str) -> anyhow::Result<String> {
         bail!("hostname {hostname:?} does not make a valid node name; pass --node-name");
     }
     Ok(label)
-}
-
-/// OCI architecture names, which images are published under.
-fn oci_arch() -> &'static str {
-    match std::env::consts::ARCH {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        other => other,
-    }
 }
 
 fn physical_memory() -> Option<u64> {
@@ -613,6 +618,35 @@ pub fn restore(
         backup.objects.len(),
         backup.version
     );
+    // The private keys sealed as the restored store says, so that the next
+    // start takes its unlock key (or none), not the one before.
+    let wanted = backup
+        .objects
+        .iter()
+        .find(|o| {
+            o.kind == legion_api::Kind::Secret
+                && o.metadata.namespace == legion_manager::SYSTEM_NAMESPACE
+                && o.metadata.name == "autolock"
+        })
+        .map(|o| {
+            let text = o
+                .spec
+                .get("key")
+                .and_then(|k| k.as_str())
+                .unwrap_or_default();
+            legion_manager::autolock::parse(text).map_err(|e| anyhow::anyhow!(e))
+        })
+        .transpose()?;
+    if wanted.as_ref() != pki.lock() {
+        let sealing = wanted.is_some();
+        pki.reseal(wanted)
+            .context("sealing the private keys as the backup says")?;
+        if sealing {
+            println!("the private keys are sealed with the backup's unlock key");
+        } else {
+            println!("autolock is off in the backup: the private keys are in the clear");
+        }
+    }
     if let Some(aside) = aside {
         println!("the old store is at {}", aside.display());
     }

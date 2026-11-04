@@ -407,6 +407,45 @@ fn users_get_their_roles() {
     // Never overwritten.
     let again = legion(&d, &["user", "create", "alice", "-o", pem_arg]);
     assert!(!again.status.success());
+    // Credentials that can't be written take their binding back.
+    let nowhere = dir.join("missing").join("bob.pem");
+    let failed = legion(
+        &d,
+        &[
+            "user",
+            "create",
+            "bob",
+            "--role",
+            "view",
+            "-n",
+            "shop",
+            "-o",
+            nowhere.to_str().unwrap(),
+        ],
+    );
+    assert!(!failed.status.success());
+    let binding = legion(&d, &["get", "rolebinding", "bob", "-n", "shop"]);
+    assert!(!binding.status.success(), "the binding stayed");
+    // And one that was there before is put back as it was.
+    let kept = ok(&d, &["get", "rolebinding", "alice", "-n", "shop"]);
+    let failed = legion(
+        &d,
+        &[
+            "user",
+            "create",
+            "alice",
+            "--role",
+            "admin",
+            "-n",
+            "shop",
+            "-o",
+            nowhere.to_str().unwrap(),
+        ],
+    );
+    assert!(!failed.status.success());
+    let back = ok(&d, &["get", "rolebinding", "alice", "-n", "shop"]);
+    assert!(back.contains("role: edit"), "{back}");
+    assert!(kept.contains("role: edit"), "{kept}");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -737,6 +776,40 @@ fn autolock_seals_the_keys_and_a_restart_waits_for_the_unlock_key() {
     let dir = d.kill();
     let d = start_daemon_in(dir, server);
     assert!(ok(&d, &["get", "namespace", "kept"]).contains("name: kept"));
+}
+
+#[test]
+fn a_restore_seals_the_keys_as_its_backup_says() {
+    let d = start_daemon();
+    ok(&d, &["init"]);
+    let backups = tempfile::tempdir().unwrap();
+    let file = backups.path().join("backup.json");
+    ok(&d, &["backup", "-o", file.to_str().unwrap()]);
+    let key = ok(&d, &["autolock", "enable"]).trim().to_owned();
+    wait_sealed(&d, true);
+    let key_file = backups.path().join("unlock");
+    std::fs::write(&key_file, &key).unwrap();
+
+    // Taken with autolock off: restored, a restart needs no key.
+    let server = d.server.clone();
+    let dir = d.kill();
+    let out = Command::new(LEGION)
+        .arg("restore")
+        .arg("--data-dir")
+        .arg(dir.path())
+        .arg("--unlock-key-file")
+        .arg(&key_file)
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!dir.path().join("pki/store.key.sealed").exists());
+    let d = start_daemon_in(dir, server);
+    assert!(ok(&d, &["autolock", "show"]).contains("autolock is off"));
 }
 
 #[test]

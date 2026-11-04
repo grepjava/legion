@@ -19,7 +19,6 @@ use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 use legion_api::{Kind, Object};
-use legion_proto::v1::cluster_client::ClusterClient;
 use legion_proto::v1::objects_client::ObjectsClient;
 use legion_proto::v1::{
     self as pb, ListRequest, ObjectRef, StatusRequest, WatchRequest, watch_event,
@@ -483,7 +482,7 @@ async fn act(mut objects: crate::cli::Objects, request: Request) -> String {
 
 /// Lists, then follows the watch; again from the start when it breaks.
 async fn follow(channel: Channel, namespace: Option<String>, tx: mpsc::UnboundedSender<Msg>) {
-    let mut objects = ObjectsClient::new(channel);
+    let mut objects = crate::cli::objects_client(channel);
     loop {
         let why = match follow_once(&mut objects, &namespace, &tx).await {
             Ok(()) => return,
@@ -579,13 +578,13 @@ async fn list(
 
 /// `--once`: every tab as text, as `top -b` would.
 pub async fn once(channel: Channel, namespace: Option<String>) -> anyhow::Result<()> {
-    let mut objects = ObjectsClient::new(channel.clone());
+    let mut objects = crate::cli::objects_client(channel.clone());
     let (listed, hidden, _) = list(&mut objects, &namespace)
         .await
         .map_err(anyhow::Error::msg)?;
     let mut model = Model::new(namespace.clone());
     model.listed(listed, hidden);
-    let mut cluster = ClusterClient::new(channel);
+    let mut cluster = crate::cli::cluster_client(channel);
     model.cluster = cluster
         .status(StatusRequest {})
         .await
@@ -616,7 +615,7 @@ pub async fn once(channel: Channel, namespace: Option<String>) -> anyhow::Result
 
 /// Asks for usage and the managers' state every [`POLL`].
 async fn poll(channel: Channel, namespace: Option<String>, tx: mpsc::UnboundedSender<Msg>) {
-    let mut cluster = ClusterClient::new(channel);
+    let mut cluster = crate::cli::cluster_client(channel);
     let mut tick = tokio::time::interval(POLL);
     loop {
         tick.tick().await;

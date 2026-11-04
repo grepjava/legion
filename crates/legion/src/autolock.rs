@@ -45,6 +45,9 @@ impl Unlock for Unlocker {
     }
 }
 
+/// How long the unlock server's connections get to close once unlocked.
+const DRAIN: Duration = Duration::from_secs(2);
+
 /// Serves `Unlock` on `listen` until a key opens this manager's sealed
 /// keys; returns it.
 pub async fn wait(listen: SocketAddr, data_dir: &Path) -> anyhow::Result<StoreKey> {
@@ -71,7 +74,12 @@ pub async fn wait(listen: SocketAddr, data_dir: &Path) -> anyhow::Result<StoreKe
         () = crate::shutdown_signal() => anyhow::bail!("stopped while locked"),
     };
     let _ = done_tx.send(());
-    let _ = server.await;
+    // A connection still open would hold the graceful stop, and the
+    // manager's listener after it, for good.
+    let abort = server.abort_handle();
+    if tokio::time::timeout(DRAIN, server).await.is_err() {
+        abort.abort();
+    }
     tracing::info!("unlocked");
     Ok(key)
 }

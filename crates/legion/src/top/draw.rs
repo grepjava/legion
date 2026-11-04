@@ -241,7 +241,14 @@ fn shell(f: &mut Frame, shell: &Shell, area: Rect) {
             }
             let at = &mut buf[(inner.x + col, inner.y + row)];
             let text = cell.contents();
-            at.set_symbol(if text.is_empty() { " " } else { text });
+            // A wide character with no room for its second half would be
+            // drawn over the border.
+            let clipped = cell.is_wide() && col + 1 >= inner.width;
+            at.set_symbol(if text.is_empty() || clipped {
+                " "
+            } else {
+                text
+            });
             at.set_style(cell_style(cell));
         }
     }

@@ -980,3 +980,32 @@ fn init_containers_have_logs_but_no_shell() {
         })
     );
 }
+
+#[test]
+fn a_wide_character_at_the_shells_edge_leaves_the_border() {
+    let m = cluster();
+    let mut v = View::default();
+    let exec = typed(&mut v, &m, "3x").unwrap();
+    v.show_shell(&exec);
+    let area = ratatui::layout::Rect::new(0, 0, 130, 30);
+    let (rows, cols) = draw::shell_size(&m, &v, area).unwrap();
+    let sh = v.shell.as_mut().unwrap();
+    // Wider than the pane, as just after the terminal shrank.
+    sh.set_size(rows, cols + 2);
+    sh.output(format!("\x1b[1;{cols}H\u{4e2d}x").as_bytes());
+    let mut t = Terminal::new(TestBackend::new(130, 30)).unwrap();
+    t.draw(|f| draw::render(f, &m, &v)).unwrap();
+    let buf = t.backend().buffer();
+    let pane = (0..30)
+        .find(|&y| {
+            (0..130)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+                .contains("Shell in")
+        })
+        .unwrap();
+    // The pane's last column, at x = cols, holds no half of it; the border
+    // after it stays.
+    assert_eq!(buf[(cols, pane + 1)].symbol(), " ");
+    assert_eq!(buf[(129, pane + 1)].symbol(), "│");
+}

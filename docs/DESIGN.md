@@ -1497,7 +1497,10 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
   uses the restored spec's update settings), networks (not separated
   until §5.6), and every key Legion does not map. `--strict` refuses them.
 - `x-legion` on a service is merged into the generated spec (mappings key by
-  key, lists replaced): probes, init containers, tolerations and so on.
+  key; lists of named entries, such as containers and volumes, entry by
+  entry by name; other lists replaced): probes, init containers,
+  tolerations and so on. A top-level volume's `x-legion` is merged the same
+  way into its Volume spec.
 - `deploy --prune` deletes the stack's Services the file no longer has;
   `stack rm` deletes its Services, Secrets and Configs and keeps Volumes.
 
