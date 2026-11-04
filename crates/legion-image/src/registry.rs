@@ -454,13 +454,19 @@ impl Client {
         creds: Option<&Credentials>,
         oses: &[&str],
     ) -> Result<(String, Manifest), Error> {
-        let (digest, doc) = self.document(r, r.target(), creds).await?;
-        if let Some(manifests) = &doc.manifests {
-            let chosen = oci::select(manifests, oses)?.digest.clone();
-            let (digest, doc) = self.document(r, &chosen, creds).await?;
-            return Ok((digest, doc.into_manifest()?));
+        let (mut digest, mut doc) = self.document(r, r.target(), creds).await?;
+        // An index, possibly of indexes, down to a manifest.
+        for _ in 0..oci::INDEX_DEPTH {
+            let Some(manifests) = &doc.manifests else {
+                return Ok((digest, doc.into_manifest()?));
+            };
+            let chosen = oci::choose(manifests, oses)?.digest.clone();
+            (digest, doc) = self.document(r, &chosen, creds).await?;
         }
-        Ok((digest, doc.into_manifest()?))
+        match doc.manifests {
+            None => Ok((digest, doc.into_manifest()?)),
+            Some(_) => Err(Error::Unsupported("indexes nested too deep".to_owned())),
+        }
     }
 
     /// The manifest or index `target` names in `r`'s repository, and its

@@ -132,6 +132,18 @@ pub fn select<'a>(manifests: &'a [Descriptor], oses: &[&str]) -> Result<&'a Desc
     select_for_arch(manifests, oses, arch())
 }
 
+/// The entry of an index to follow: as [`select`] picks it, or the only
+/// entry when that names no platform (the image config then says it).
+pub fn choose<'a>(manifests: &'a [Descriptor], oses: &[&str]) -> Result<&'a Descriptor, Error> {
+    match manifests {
+        [one] if one.platform.is_none() => Ok(one),
+        many => select(many, oses),
+    }
+}
+
+/// How deep indexes of indexes are followed down to a manifest.
+pub const INDEX_DEPTH: usize = 3;
+
 pub fn select_for_arch<'a>(
     manifests: &'a [Descriptor],
     oses: &[&str],

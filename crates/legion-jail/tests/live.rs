@@ -185,6 +185,15 @@ async fn pods_of_jails() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "bar\n0\nweb-0\nlo0\n");
     let out = rt.exec(&app, &["/nonexistent".into()]).await.unwrap();
     assert_ne!(out.exit_code, 0);
+    // One a signal ends: 128 and the signal, as a shell gives it.
+    let out = rt
+        .exec(
+            &app,
+            &["/bin/sh".into(), "-c".into(), "kill -TERM $$".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.exit_code, 143, "{out:?}");
     // With a terminal.
     let mut attached = rt
         .exec_attach(
@@ -367,6 +376,15 @@ async fn pods_of_jails() {
     rt.stop(&stubborn, Duration::from_secs(1)).await.unwrap();
     assert!(t.elapsed() >= Duration::from_secs(1));
     assert_eq!(rt.inspect(&stubborn).await.unwrap().state.exit_code, 137);
+
+    // With its pod stopped, a member's start is refused, and its last
+    // exit stays.
+    rt.stop(&app, Duration::from_secs(5)).await.unwrap();
+    rt.stop(&pod, Duration::from_secs(5)).await.unwrap();
+    let e = rt.start(&job).await.unwrap_err();
+    assert!(e.to_string().contains("not running"), "{e}");
+    let i = rt.inspect(&job).await.unwrap();
+    assert_eq!((i.state.running, i.state.exit_code), (false, 3));
 
     // Removal leaves nothing behind.
     for id in [&app, &job, &bad, &bad2, &stubborn, &pod] {
@@ -593,6 +611,16 @@ async fn standalone_containers_and_build_steps() {
         .await
         .unwrap();
     assert_eq!(code, 5);
+    let code = rt
+        .exec_inherit(
+            &app,
+            &["/bin/sh".into(), "-c".into(), "kill -KILL $$".into()],
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 137);
     rt.stop(&app, Duration::from_secs(5)).await.unwrap();
     assert!(!rt.inspect(&app).await.unwrap().state.running);
 
@@ -616,6 +644,24 @@ async fn standalone_containers_and_build_steps() {
     assert!(!sys.jails().unwrap().iter().any(|j| j.name == once));
     // And again.
     assert_eq!(rt.run_attached(&once, false, false).await.unwrap(), 7);
+    // Ended by a signal: 128 and the signal, recorded so too.
+    let killed = rt
+        .create(&standalone("killed", "kill -KILL $$"))
+        .await
+        .unwrap();
+    assert_eq!(rt.run_attached(&killed, false, false).await.unwrap(), 137);
+    assert_eq!(rt.inspect(&killed).await.unwrap().state.exit_code, 137);
+    rt.remove(&killed).await.unwrap();
+    // A create whose future is dropped while it makes the root is made
+    // all the same, and listed, so that it can be removed.
+    let spec = standalone("dropped", "true");
+    let dropped = rt.create(&spec);
+    assert!(tokio::time::timeout(Duration::ZERO, dropped).await.is_err());
+    until("the dropped create's record", async || {
+        rt.find("dropped").is_ok()
+    })
+    .await;
+    rt.remove(&rt.find("dropped").unwrap()).await.unwrap();
     // Its future dropped while it runs: the same, and recorded as ended.
     let long = rt.create(&standalone("long", "sleep 60")).await.unwrap();
     let attached = rt.run_attached(&long, false, false);

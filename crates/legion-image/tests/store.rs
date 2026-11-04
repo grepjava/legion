@@ -115,6 +115,15 @@ impl Registry {
             oci::OCI_INDEX,
         );
     }
+
+    /// Tags as `tag` an index whose one entry, naming no platform, is the
+    /// index `inner` is tagged with.
+    fn wrapped(&mut self, repo: &str, tag: &str, inner: &str) {
+        let data = self.files[&format!("{repo}/manifests/{inner}")].0.clone();
+        let index = json!({"schemaVersion": 2, "mediaType": oci::OCI_INDEX,
+                           "manifests": [{"mediaType": oci::OCI_INDEX, "digest": digest(&data), "size": data.len()}]});
+        self.doc(repo, Some(tag), index, oci::OCI_INDEX);
+    }
 }
 
 const TOKEN: &str = "t0ken";
@@ -310,7 +319,25 @@ async fn pulls_share_layers_and_removal_waits_for_containers() {
     sys.zfs_destroy("tank/legion/ctr/c1", false).unwrap();
     assert_eq!(s.prune().await.unwrap(), [hex[1].clone()]);
     assert_eq!(layers(&sys), 2);
+    // A layer's temporary clone, as an export reads it, stays with the
+    // layer it is cloned from.
+    let tmp = "tank/legion/images/tmp-s1-mount1";
+    sys.zfs_clone(
+        &format!("tank/legion/images/{}@layer", second.layers[1]),
+        tmp,
+        &[],
+    )
+    .unwrap();
     s.remove(&format!("{addr}/team/other:1")).await.unwrap();
+    assert!(!sys.zfs_list(tmp).unwrap().is_empty(), "the clone stays");
+    assert!(
+        !sys.zfs_list(&format!("tank/legion/images/{}", second.layers[1]))
+            .unwrap()
+            .is_empty(),
+        "so does its layer"
+    );
+    sys.zfs_destroy(tmp, false).unwrap();
+    s.prune().await.unwrap();
     assert_eq!(layers(&sys), 0);
 
     // Only images for this node's OS.
@@ -346,6 +373,39 @@ async fn pulls_share_layers_and_removal_waits_for_containers() {
 
 /// Layers as directories are made aside and renamed whole: what an
 /// interrupted pull left is made again, never taken for a layer.
+#[tokio::test]
+async fn indexes_of_indexes_and_entries_without_a_platform_are_followed() {
+    let base = layer(&[("etc/base", "b")]);
+    let registry = Arc::new(Mutex::new(Registry::default()));
+    {
+        let mut r = registry.lock().unwrap();
+        r.image("team/app", "1", "freebsd", std::slice::from_ref(&base));
+        r.wrapped("team/app", "wrapped", "1");
+        r.wrapped("team/app", "twice", "wrapped");
+        r.wrapped("team/app", "deep", "twice");
+    }
+    let addr = serve(registry.clone()).await;
+    let t = tempfile::tempdir().unwrap();
+    let sys = Arc::new(FakeSys::new());
+    let s = store(&sys, t.path(), &addr);
+    let direct = s
+        .pull(&format!("{addr}/team/app:1"), None, "t")
+        .await
+        .unwrap();
+    for tag in ["wrapped", "twice"] {
+        let image = s
+            .pull(&format!("{addr}/team/app:{tag}"), None, "t")
+            .await
+            .unwrap();
+        assert_eq!(image.id, direct.id, "{tag}");
+    }
+    let e = s
+        .pull(&format!("{addr}/team/app:deep"), None, "t")
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("nested too deep"), "{e}");
+}
+
 #[tokio::test]
 async fn an_interrupted_layer_is_made_again() {
     let base = layer(&[("etc/base", "b")]);

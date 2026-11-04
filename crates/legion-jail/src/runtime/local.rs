@@ -8,7 +8,8 @@ use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use super::{
-    JailRuntime, Status, api, confine, cpu_list, internal, jail_names, new_id, records, target,
+    JailRuntime, Status, api, confine, cpu_list, exit_code, internal, jail_names, new_id, records,
+    target,
 };
 use crate::DEVFS_RULESET;
 use crate::state::{self, EXIT, Exit, RECORD, RUN, Record, Run};
@@ -103,13 +104,14 @@ impl JailRuntime {
             }
         }
         let dir = self.container_dir(id);
-        state::remove(&dir, EXIT).map_err(internal)?;
+        // The run before the end, as `start` clears them.
         state::remove(&dir, RUN).map_err(internal)?;
+        state::remove(&dir, EXIT).map_err(internal)?;
         if jail_names(&*self.sys)?.contains(&rec.jail) {
             let _ = self.sys.jail_remove(&rec.jail);
         }
-        self.mount(&rec)?;
-        let jid = match self.create_jail(&rec) {
+        // What a failed start mounted goes, as `start` leaves it.
+        let jid = match self.mount(&rec).and_then(|()| self.create_jail(&rec)) {
             Ok(j) => j,
             Err(e) => {
                 let _ = self.unmount(&rec);
@@ -134,7 +136,7 @@ impl JailRuntime {
         cmd.kill_on_drop(true);
         let status = cmd.status().await;
         let (code, error) = match &status {
-            Ok(s) => (s.code().unwrap_or(255), None),
+            Ok(s) => (exit_code(*s), None),
             Err(e) => (127, Some(e.to_string())),
         };
         undo.finish(code, error)?;
@@ -152,12 +154,11 @@ impl JailRuntime {
         tty: bool,
     ) -> Result<i32> {
         let (rec, jid) = self.running_jid(id)?;
-        let status = self
-            .shim_exec(&rec, jid, cmd, stdin, tty)
-            .status()
-            .await
-            .map_err(internal)?;
-        Ok(status.code().unwrap_or(255))
+        let mut command = self.shim_exec(&rec, jid, cmd, stdin, tty);
+        // Gone with its caller, as an attached run's command is.
+        command.kill_on_drop(true);
+        let status = command.status().await.map_err(internal)?;
+        Ok(exit_code(status))
     }
 
     /// The supervisor's `exec` of `argv` in `rec`'s jail, on this
@@ -303,7 +304,7 @@ impl JailRuntime {
         let mut cmd = self.shim_exec_in(dir, jid, step.argv, false, false);
         cmd.kill_on_drop(true);
         let status = cmd.status().await.map_err(internal)?;
-        Ok(status.code().unwrap_or(255))
+        Ok(exit_code(status))
     }
 }
 

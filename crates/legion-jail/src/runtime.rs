@@ -28,6 +28,7 @@ use legion_runtime::{
     ContainerSummary, Error, Event, ExecOutput, Login, Output, Result,
 };
 use legion_sys::Sys;
+use tokio::io::AsyncReadExt;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::log;
@@ -126,7 +127,7 @@ fn reap(
                 }
             }
         };
-        let got = status.ok().and_then(|s| s.code()).unwrap_or(255);
+        let got = status.map(exit_code).unwrap_or(255);
         let _ = code.send(Some(got));
         loop {
             tokio::time::sleep(EXEC_KEPT).await;
@@ -146,6 +147,16 @@ fn reap(
             }
         }
     });
+}
+
+/// A command's exit code as a shell gives it: 128 and the signal for one
+/// a signal ended, as the supervisor records a container's.
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .code()
+        .or_else(|| status.signal().map(|s| 128 + s))
+        .unwrap_or(255)
 }
 
 /// Kills a process group when dropped, unless disarmed: a command run
@@ -1134,42 +1145,44 @@ impl legion_runtime::Runtime for JailRuntime {
     async fn create(&self, spec: &ContainerSpec) -> Result<String> {
         // Held until the record is written, so that two creates of one name
         // cannot both find it free.
-        let _name = Creating::claim(&self.creating, &spec.name)?;
+        let name = Creating::claim(&self.creating, &spec.name)?;
         let rec = self.make_record(spec)?;
         let dir = self.container_dir(&rec.id);
-        std::fs::create_dir_all(&dir).map_err(internal)?;
-        // What a create that fails made goes: a clone, or a copy of the
-        // image's files, flagged ones too.
-        let undo = |e| {
+        let images = self.images.clone();
+        // On a blocking thread to the end, even if the caller stops
+        // waiting: what it makes is then either recorded or gone, never
+        // left where nothing lists it.
+        blocking(move || {
+            let _name = name;
+            std::fs::create_dir_all(&dir).map_err(internal)?;
+            // What a create that fails made goes: a clone, or a copy of
+            // the image's files, flagged ones too.
+            let undo = |e| {
+                if !rec.is_pod() {
+                    let _ = images.cleanup_rootfs(&rec.root, rec.dataset.as_deref());
+                }
+                let _ = std::fs::remove_dir_all(&dir);
+                e
+            };
             if !rec.is_pod() {
-                let _ = self
-                    .images
-                    .cleanup_rootfs(&rec.root, rec.dataset.as_deref());
-            }
-            let _ = std::fs::remove_dir_all(&dir);
-            e
-        };
-        if !rec.is_pod() {
-            let image = self
-                .images
-                .get(&rec.image)
-                .map_err(image_error)
-                .and_then(|i| i.ok_or_else(|| api(404, format!("{}: image not known", rec.image))))
-                .map_err(undo)?;
-            let images = self.images.clone();
-            let (root, ds) = (rec.root.clone(), rec.dataset.clone());
-            blocking(move || {
-                images
-                    .prepare_rootfs(&image, &root, ds.as_deref())
+                let image = images
+                    .get(&rec.image)
                     .map_err(image_error)
-            })
-            .await
-            .map_err(undo)?;
-        }
-        state::write(&dir, RECORD, &rec)
-            .map_err(internal)
-            .map_err(undo)?;
-        Ok(rec.id)
+                    .and_then(|i| {
+                        i.ok_or_else(|| api(404, format!("{}: image not known", rec.image)))
+                    })
+                    .map_err(undo)?;
+                images
+                    .prepare_rootfs(&image, &rec.root, rec.dataset.as_deref())
+                    .map_err(image_error)
+                    .map_err(undo)?;
+            }
+            state::write(&dir, RECORD, &rec)
+                .map_err(internal)
+                .map_err(undo)?;
+            Ok(rec.id.clone())
+        })
+        .await
     }
 
     async fn start(&self, id: &str) -> Result<()> {
@@ -1177,17 +1190,18 @@ impl legion_runtime::Runtime for JailRuntime {
         if matches!(self.status(&rec)?, Status::Running(_)) {
             return Ok(());
         }
-        let dir = self.container_dir(id);
-        // The run before the end: one looking between the two sees the
-        // container ended, not ended at once with the made-up 255.
-        state::remove(&dir, RUN).map_err(internal)?;
-        state::remove(&dir, EXIT).map_err(internal)?;
+        // Refused before anything is cleared: the last run's exit stays.
         if let Some(parent) = &rec.parent {
             let pod = self.record(parent)?;
             if !matches!(self.status(&pod)?, Status::Running(_)) {
                 return Err(api(409, format!("pod {parent} is not running")));
             }
         }
+        let dir = self.container_dir(id);
+        // The run before the end: one looking between the two sees the
+        // container ended, not ended at once with the made-up 255.
+        state::remove(&dir, RUN).map_err(internal)?;
+        state::remove(&dir, EXIT).map_err(internal)?;
         // A jail left from a run whose supervisor died.
         if jail_names(&*self.sys)?.contains(&rec.jail) {
             let _ = self.sys.jail_remove(&rec.jail);
@@ -1341,16 +1355,35 @@ impl legion_runtime::Runtime for JailRuntime {
             .stderr(std::process::Stdio::piped())
             .process_group(0)
             .kill_on_drop(true);
-        let child = command.spawn().map_err(internal)?;
+        let mut child = command.spawn().map_err(internal)?;
         let group = KillGroup(child.id());
-        let out = child.wait_with_output().await;
+        // The output to its end before the command is reaped: until then
+        // its id, and its group's, are no one else's, even if what it
+        // started holds the output open after it ends.
+        let (mut stdout, mut stderr) = (child.stdout.take(), child.stderr.take());
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let read = tokio::try_join!(
+            async {
+                match &mut stdout {
+                    Some(s) => s.read_to_end(&mut out).await.map(drop),
+                    None => Ok(()),
+                }
+            },
+            async {
+                match &mut stderr {
+                    Some(s) => s.read_to_end(&mut err).await.map(drop),
+                    None => Ok(()),
+                }
+            },
+        );
+        read.map_err(internal)?;
+        let status = child.wait().await;
         // Reaped now, so its id may be another's soon.
         group.disarm();
-        let out = out.map_err(internal)?;
         Ok(ExecOutput {
-            exit_code: out.status.code().unwrap_or(255),
-            stdout: out.stdout,
-            stderr: out.stderr,
+            exit_code: exit_code(status.map_err(internal)?),
+            stdout: out,
+            stderr: err,
         })
     }
 
@@ -1679,7 +1712,6 @@ where
     R: tokio::io::AsyncRead + Send + Unpin + 'static,
 {
     futures::stream::unfold(Some(reader), |reader| async move {
-        use tokio::io::AsyncReadExt;
         let mut reader = reader?;
         let mut buf = vec![0u8; 16 << 10];
         match reader.read(&mut buf).await {
@@ -1733,6 +1765,17 @@ fn pty() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_codes_are_a_shells() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+        // Raw wait statuses: an exit code in the second byte, a signal in
+        // the first.
+        assert_eq!(exit_code(ExitStatus::from_raw(3 << 8)), 3);
+        assert_eq!(exit_code(ExitStatus::from_raw(libc::SIGTERM)), 143);
+        assert_eq!(exit_code(ExitStatus::from_raw(libc::SIGKILL)), 137);
+    }
 
     #[test]
     fn exits_are_told_apart_by_their_run() {
@@ -1820,6 +1863,9 @@ mod tests {
         // The volume's source is missing: the devfs and Linux file systems
         // mounted before it go again.
         assert!(rt.start("c1").await.is_err());
+        assert_eq!(mounted(), Vec::<String>::new());
+        // So does an attached run's.
+        assert!(rt.run_attached("c1", false, false).await.is_err());
         assert_eq!(mounted(), Vec::<String>::new());
         // `/proc` is a link, refused after the devfs is mounted and before
         // `/dev/shm` is made in it: that devfs goes too, so the next mount

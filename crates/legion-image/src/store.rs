@@ -114,20 +114,19 @@ impl Source<'_> {
                 // A manifest where the index should be is its own digest.
                 let mut digest = sha256(&index);
                 // An index, possibly of indexes, down to a manifest.
-                for _ in 0..3 {
+                for _ in 0..oci::INDEX_DEPTH {
                     let Some(manifests) = &doc.manifests else {
                         return Ok((digest, doc.into_manifest()?));
                     };
-                    let chosen = match manifests.as_slice() {
-                        [one] => one,
-                        many => oci::select(many, oses)?,
-                    };
-                    digest = chosen.digest.clone();
+                    digest = oci::choose(manifests, oses)?.digest.clone();
                     let bytes = std::fs::read(layout_blob(dir, &digest)?)?;
                     check(&bytes, &digest, "manifest")?;
                     doc = Document::parse(&bytes)?;
                 }
-                Err(Error::Unsupported("indexes nested too deep".to_owned()))
+                match doc.manifests {
+                    None => Ok((digest, doc.into_manifest()?)),
+                    Some(_) => Err(Error::Unsupported("indexes nested too deep".to_owned())),
+                }
             }
         }
     }
@@ -1314,10 +1313,19 @@ impl Store {
                     // a pin names a layer before the layer is made.
                     let listed = sys.zfs_list(&root)?;
                     let pinned = live_pins(&dir)?;
+                    // Temporary clones of layers (`tmp-*`, see
+                    // `with_layer_mounted`) are being read: they go with
+                    // their temp area (`clean_tmp`), and the layers they
+                    // are cloned from stay while they exist.
                     let mut unused: Vec<String> = listed
                         .into_iter()
                         .filter_map(|d| d.name.strip_prefix(&prefix).map(str::to_owned))
-                        .filter(|n| !n.contains('/') && !used.contains(n) && !pinned.contains(n))
+                        .filter(|n| {
+                            !n.contains('/')
+                                && !n.starts_with(TMP_CLONE)
+                                && !used.contains(n)
+                                && !pinned.contains(n)
+                        })
                         .collect();
                     // A layer goes once nothing is cloned from it: retry those that
                     // the layers above them held until nothing changes.
@@ -1451,8 +1459,12 @@ fn clone_name(layers: &str, area: &Path, name: &str) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    format!("{layers}/tmp-{area}-{name}")
+    format!("{layers}/{TMP_CLONE}{area}-{name}")
 }
+
+/// How the names of layers' temporary clones start; layers are named by
+/// their hex chain id, so none does.
+const TMP_CLONE: &str = "tmp-";
 
 /// Whether an open store holds the lock file at `path`. Without flock,
 /// any is taken to be.
