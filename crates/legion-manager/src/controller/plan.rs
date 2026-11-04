@@ -264,9 +264,10 @@ pub fn plan(
     // Jobs own tasks as services do; the scheduler sees them alike.
     let job_owners: Vec<Service> = jobs.jobs.iter().map(Job::owner).collect();
     let job_owners = refused(&job_owners, tasks);
-    for (j, owner) in jobs.jobs.iter().zip(&job_owners) {
+    let mut jobs_after = jobs.jobs.clone();
+    for ((j, owner), after) in jobs.jobs.iter().zip(&job_owners).zip(&mut jobs_after) {
         let mine: Vec<&Task> = tasks.iter().filter(|t| owner.owns(t)).collect();
-        jobs::job(
+        after.status = jobs::job(
             j,
             owner,
             &mine,
@@ -280,7 +281,7 @@ pub fn plan(
         );
     }
     for c in &jobs.cron_jobs {
-        jobs::cron_job(c, &jobs.jobs, now, jobs.wall, &mut plan);
+        jobs::cron_job(c, &jobs_after, now, jobs.wall, &mut plan);
     }
     jobs::abandoned(jobs, &mut plan);
     let owners: Vec<&Service> = services.iter().chain(&job_owners).collect();
@@ -798,14 +799,23 @@ fn service(
                     for old in &moving {
                         plan.actions.push(stop(old));
                     }
+                } else if !bound {
+                    // Off a draining node and not ready: nothing to wait
+                    // for.
+                    for old in moving.iter().filter(|t| !up(t)) {
+                        plan.actions.push(stop(old));
+                    }
                 }
             }
         } else if !moving.is_empty() {
             // Off a draining node: stopped first if the budget allows,
             // else replaced first, as a failed replacement is, after its
             // backoff. One bound to its data waits for the budget, and for
-            // the data to be copied to where it goes.
-            if copied && (bound || !start_first) && may_stop(&moving) {
+            // the data to be copied to where it goes. Started first only
+            // to keep a ready task: one not ready (an update's new task,
+            // say, beside a ready old one) stops first all the same.
+            let ready = moving.iter().any(|t| up(t));
+            if copied && (bound || !start_first || !ready) && may_stop(&moving) {
                 for old in &moving {
                     plan.actions.push(stop(old));
                 }
@@ -1027,16 +1037,16 @@ fn track_update(
     if let Some(old) = previous.spec.as_ref()
         && old.pod != s.spec.pod
     {
-        // Back to the spec before the update, unless that update was rolled
-        // back: going to the spec it rolled back from is a new update,
-        // whose snapshot the rollback has dropped.
-        let back = update
-            .as_ref()
-            .is_some_and(|u| u.previous == s.spec && u.state != UpdateState::RolledBack);
-        let message = match &update {
-            Some(u) if back && u.state == UpdateState::RollingBack => u.message.clone(),
-            _ => String::new(),
-        };
+        // Back to the spec before a forward update. Going to the spec a
+        // rollback undoes, under way or done, is a new update: the
+        // rollback's tasks have returned to its snapshot, or drop it.
+        let back = update.as_ref().is_some_and(|u| {
+            u.previous == s.spec
+                && matches!(
+                    u.state,
+                    UpdateState::Updating | UpdateState::Paused | UpdateState::Completed
+                )
+        });
         // A rollback returns to the snapshot of the update it undoes.
         let snapshot = match &update {
             Some(u) if back => u.snapshot.clone(),
@@ -1049,7 +1059,7 @@ fn track_update(
             } else {
                 UpdateState::Updating
             },
-            message,
+            message: String::new(),
             generation: s.object.metadata.generation,
             previous: old.clone(),
             snapshot,
@@ -1091,13 +1101,16 @@ fn track_update(
             u.message = format!("update paused: {why}");
         }
         (_, FailureAction::Rollback) => {
-            // The spec goes back as it was; the status keeps the spec seen
-            // last, so the next pass sees the change as a rollback.
+            // The spec goes back as it was, and the status with it: the
+            // rollback is under way, from the spec it undoes, and the next
+            // pass sees no change to track.
             u.state = UpdateState::RollingBack;
             u.message = format!("rolled back: {why}");
+            let back = std::mem::replace(&mut u.previous, s.spec.clone());
             let mut o = s.object.clone();
-            o.spec = serde_json::to_value(&u.previous).expect("serialises");
+            o.spec = serde_json::to_value(&back).expect("serialises");
             let mut status = previous.clone();
+            status.spec = Some(back);
             status.update = update;
             o.status = serde_json::to_value(&status).expect("serialises");
             plan.actions
@@ -1132,6 +1145,11 @@ fn backoff(
 fn task_number(name: &str) -> Option<u64> {
     name.rsplit('-').next()?.parse().ok()
 }
+
+/// The message of a task stopped before it was placed: one a global
+/// service or job names its node for from the start, though it never ran
+/// there.
+pub const NEVER_PLACED: &str = "stopped before it was scheduled";
 
 fn slot_of(t: &Task) -> Slot {
     match t.spec.slot {
@@ -1412,7 +1430,7 @@ fn schedule(
         let mut o = t.object.clone();
         o.status = serde_json::to_value(TaskStatus {
             state: TaskState::Shutdown,
-            message: "stopped before it was scheduled".into(),
+            message: NEVER_PLACED.into(),
             ..Default::default()
         })
         .expect("serialises");

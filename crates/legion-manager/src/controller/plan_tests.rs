@@ -3449,3 +3449,225 @@ fn replicas_scaled_away_and_back_have_new_names() {
     w.settle();
     assert_eq!(w.running(), ["web-1-1", "web-2-2", "web-3-2"]);
 }
+
+#[test]
+fn going_forward_again_during_a_rollback_is_a_new_update() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    let spec = format!("{STATEFUL}\nupdate: {{ snapshot: true, failureAction: rollback }}");
+    w.service("db", &spec);
+    w.settle();
+    w.service("db", &spec.replace("pg:17", "pg:18"));
+    w.settle();
+    w.fail("db-0-2");
+    w.settle();
+    w.settle();
+    assert_eq!(w.update("db").0, "rolling-back");
+    // pg:18 again before the rollback is over: an update with a snapshot
+    // of its own, not a rollback that restores the old one.
+    w.service("db", &spec.replace("pg:17", "pg:18"));
+    w.settle();
+    let u = w.status("db").update.unwrap();
+    assert_eq!(u.state.as_str(), "updating");
+    let snapshot = u.snapshot.unwrap();
+    assert_ne!(snapshot, "legion-update-2");
+    for _ in 0..12 {
+        w.now += Duration::from_secs(1);
+        w.settle();
+    }
+    let steps: Vec<_> = w
+        .tasks
+        .iter()
+        .filter(|t| {
+            t.status.state == TaskState::Running && t.spec.pod.containers[0].image == "pg:18"
+        })
+        .map(|t| t.spec.snapshot.clone().unwrap())
+        .collect();
+    // Those the rollback had not reached yet stay; none restores.
+    assert_eq!(steps.len(), 3, "{steps:?}");
+    assert!(steps.iter().all(|s| !s.restore), "{steps:?}");
+    assert!(steps.iter().any(|s| s.name == snapshot), "{steps:?}");
+    assert_eq!(w.update("db").0, "completed");
+}
+
+/// One pass whose write of the CronJob's status is lost, as a version
+/// conflict loses it; the rest goes in.
+fn pass_losing_cron_status(w: &mut World) {
+    let p = plan(
+        &w.services,
+        &w.jobs,
+        &w.tasks,
+        &w.nodes,
+        &w.volumes,
+        &w.quotas,
+        &mut w.memory,
+        w.now,
+    );
+    let actions = p
+        .actions
+        .into_iter()
+        .filter(|a| !matches!(a, Action::Update(o, _) if o.kind == Kind::CronJob))
+        .collect();
+    w.apply(actions);
+}
+
+#[test]
+fn a_run_made_by_a_pass_whose_status_was_lost_goes_on() {
+    for policy in ["replace", "forbid", "allow"] {
+        let mut w = World::new();
+        w.node("n1", &[]);
+        w.cron_job("report", &report(&format!("concurrencyPolicy: {policy}")));
+        w.settle();
+        w.advance(4 * 60);
+        pass_losing_cron_status(&mut w);
+        let first = run("2026-10-28T09:35:00Z");
+        assert_eq!(w.job_names(), std::slice::from_ref(&first), "{policy}");
+        let uid = w.jobs.jobs[0].object.metadata.uid.clone();
+        w.settle();
+        // The same Job, neither replaced nor called skipped.
+        assert_eq!(w.job_names(), std::slice::from_ref(&first), "{policy}");
+        assert_eq!(w.jobs.jobs[0].object.metadata.uid, uid, "{policy}");
+        let st = w.cron_status("report");
+        assert_eq!(st.message, "", "{policy}");
+        assert_eq!(st.last_job, first, "{policy}");
+        assert_eq!(st.last_schedule.as_deref(), Some("2026-10-28T09:35:00Z"));
+    }
+}
+
+#[test]
+fn a_run_due_as_the_last_one_finishes_is_not_skipped() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.cron_job("report", &report("concurrencyPolicy: forbid"));
+    w.settle();
+    w.advance(4 * 60);
+    w.settle();
+    let first = run("2026-10-28T09:35:00Z");
+    // Its task completes, and the pass that sees it is also the one the
+    // next run is due in.
+    w.end(&format!("{first}-1-1"), TaskState::Complete);
+    w.advance(5 * 60);
+    w.settle();
+    let second = run("2026-10-28T09:40:00Z");
+    assert!(
+        w.job_names().contains(&second),
+        "{:?}",
+        w.cron_status("report")
+    );
+    assert_eq!(w.cron_status("report").message, "");
+}
+
+#[test]
+fn a_global_job_waits_for_a_closed_node_whose_task_failed() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.job("scan", &job("mode: global\nbackoffLimit: 3"));
+    w.settle();
+    assert_eq!(w.running(), ["scan-n1-1", "scan-n2-1"]);
+    // n1 takes no new task as its task fails with retries left, and n2's
+    // completes: the Job is not done on n1.
+    w.availability("n1", Availability::Pause);
+    w.fail("scan-n1-1");
+    w.end("scan-n2-1", TaskState::Complete);
+    w.settle();
+    w.now += Duration::from_secs(60);
+    w.settle();
+    assert_eq!(w.job_status("scan").state.as_str(), "running");
+    // Open again, n1 runs it again, and the Job completes.
+    w.availability("n1", Availability::Active);
+    w.now += Duration::from_secs(60);
+    w.settle();
+    assert_eq!(w.running(), ["scan-n1-2"]);
+    w.end("scan-n1-2", TaskState::Complete);
+    w.settle();
+    assert_eq!(w.job_status("scan").state.as_str(), "complete");
+}
+
+impl World {
+    /// The task `name` runs but is not ready, as its agent would report.
+    fn unready(&mut self, name: &str) {
+        let version = self.next();
+        let t = self
+            .tasks
+            .iter_mut()
+            .find(|t| t.object.metadata.name == name)
+            .unwrap();
+        t.status.ready = false;
+        t.object.status = serde_json::to_value(&t.status).unwrap();
+        t.object.metadata.version = version;
+    }
+
+    /// The tasks told to run, with their nodes, sorted.
+    fn told_to_run(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|t| {
+                t.spec.desired_state == DesiredState::Running && !t.status.state.is_terminal()
+            })
+            .map(|t| format!("{} {}", t.object.metadata.name, t.spec.node))
+            .collect();
+        v.sort();
+        v
+    }
+}
+
+#[test]
+fn a_start_first_drain_stops_an_unready_task_first() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.availability("n2", Availability::Pause);
+    w.service(
+        "web",
+        &format!("replicas: 1\nupdate: {{ order: start-first }}\n{POD}"),
+    );
+    w.settle();
+    w.availability("n2", Availability::Active);
+    assert_eq!(w.told_to_run(), ["web-1-1 n1"]);
+    // Not ready, it keeps nothing available: it stops as a stop-first
+    // drain would stop it, and its replacement takes over.
+    w.unready("web-1-1");
+    w.availability("n1", Availability::Drain);
+    w.agents = false;
+    w.step();
+    assert!(w.told_to_run().is_empty(), "{:?}", w.told_to_run());
+    w.agents = true;
+    w.settle();
+    assert_eq!(w.told_to_run(), ["web-1-2 n2"]);
+}
+
+#[test]
+fn an_unready_replacement_on_a_draining_node_is_not_joined_by_a_third() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.availability("n2", Availability::Pause);
+    let spec = |image: &str| {
+        format!(
+            "replicas: 1\nupdate: {{ order: start-first }}\npod: {{ containers: [{{ name: web, image: \"{image}\" }}] }}"
+        )
+    };
+    w.service("web", &spec("web:1"));
+    w.settle();
+    // The update's task goes to n2, and runs there unready.
+    w.availability("n2", Availability::Active);
+    w.availability("n1", Availability::Pause);
+    w.agents = false;
+    w.service("web", &spec("web:2"));
+    w.step();
+    w.agents = true;
+    w.agents();
+    w.agents = false;
+    w.unready("web-1-2");
+    assert_eq!(w.told_to_run(), ["web-1-1 n1", "web-1-2 n2"]);
+    // n2 drains: the unready one goes, and the old one stays ready.
+    w.availability("n1", Availability::Active);
+    w.availability("n2", Availability::Drain);
+    w.step();
+    assert_eq!(w.told_to_run(), ["web-1-1 n1"]);
+    w.agents = true;
+    w.settle();
+    assert_eq!(w.images("web"), ["web:2"]);
+}

@@ -86,7 +86,7 @@ impl Job {
 }
 
 /// Plans one Job: its tasks (new ones into `created`, for the scheduler)
-/// and its status.
+/// and its status, which it returns.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn job(
     j: &Job,
@@ -99,7 +99,7 @@ pub(super) fn job(
     wall: i64,
     plan: &mut Plan,
     created: &mut Vec<Task>,
-) {
+) -> JobStatus {
     let mut status = j.status.clone();
     let started = status
         .started
@@ -123,7 +123,8 @@ pub(super) fn job(
     let wanted: Vec<Slot> = match j.spec.mode {
         JobMode::Replicated => (1..=j.spec.completions()).map(Slot::Replica).collect(),
         // Nodes that may run it now, those it already completed on, and
-        // those that take no new task but keep the one placed there.
+        // those that take no new task but keep the one placed there, or
+        // one that failed there, to be retried once they open.
         JobMode::Global => {
             let mut slots: BTreeSet<Slot> = nodes
                 .iter()
@@ -136,8 +137,9 @@ pub(super) fn job(
                     .iter()
                     .filter(|(slot, list)| {
                         // Placed: one waiting to be is never, there.
-                        list.iter().any(|t| t.active() && t.placed())
-                            && super::kept_global(slot, list, nodes, owner, volumes)
+                        list.iter().any(|t| {
+                            (t.active() && t.placed()) || t.status.state == TaskState::Failed
+                        }) && super::kept_global(slot, list, nodes, owner, volumes)
                     })
                     .map(|(slot, _)| slot.clone()),
             );
@@ -236,6 +238,7 @@ pub(super) fn job(
         plan.actions
             .push(Action::Update(o, j.object.metadata.version));
     }
+    status
 }
 
 /// Moves tasks off nodes they may no longer run on, or once the data they
@@ -309,7 +312,8 @@ fn start(
 }
 
 /// Plans one CronJob: the Job of a run that is due, the history, and its
-/// status.
+/// status. `jobs` are as this pass leaves them: a Job that finished in it
+/// no longer runs.
 pub(super) fn cron_job(c: &CronJob, jobs: &[Job], now: Instant, wall: i64, plan: &mut Plan) {
     let Some(schedule) = c.spec.parsed_schedule() else {
         return;
@@ -339,7 +343,17 @@ pub(super) fn cron_job(c: &CronJob, jobs: &[Job], now: Instant, wall: i64, plan:
             .iter()
             .filter(|j| !j.status.state.is_finished())
             .collect();
-        status.message = if c.spec.suspend {
+        let job = new_job(c, due);
+        status.message = if mine
+            .iter()
+            .any(|j| j.object.metadata.name == job.metadata.name)
+        {
+            // Made by a pass whose status write was lost: the run is under
+            // way (or over), not to be skipped or replaced.
+            status.last_job = job.metadata.name.clone();
+            created = Some(job.metadata.name.clone());
+            String::new()
+        } else if c.spec.suspend {
             format!("suspended: skipped the run due at {when}")
         } else if c
             .spec
@@ -367,7 +381,6 @@ pub(super) fn cron_job(c: &CronJob, jobs: &[Job], now: Instant, wall: i64, plan:
                         .push(Action::Delete(j.object.key(), j.object.metadata.version));
                 }
             }
-            let job = new_job(c, due);
             status.last_job = job.metadata.name.clone();
             created = Some(job.metadata.name.clone());
             plan.actions.push(Action::Create(job));
