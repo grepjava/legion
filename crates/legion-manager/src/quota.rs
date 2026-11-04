@@ -153,14 +153,16 @@ fn usage(services: &[(String, ServiceSpec)], volumes: &[CountedVolume], nodes: u
         }
         for n in 0..s.replicas.unwrap_or(1) {
             // The controller resizes a claim's own Volume to the claim, so
-            // it counts at the claim's size.
+            // it counts at the claim's size; at its own until then, when
+            // larger: a size applied to the Volume holds until the
+            // controller's next pass, and a node may give it all.
             for (claim, src) in s.pod.claims() {
                 match all.entry(claim_volume(claim, name, n)) {
                     Entry::Vacant(e) => {
                         e.insert((src.size, Some(name.clone())));
                     }
                     Entry::Occupied(mut e) if e.get().1.as_ref() == Some(name) => {
-                        e.get_mut().0 = src.size;
+                        e.get_mut().0 = e.get().0.max(src.size);
                     }
                     Entry::Occupied(_) => {}
                 }
@@ -260,9 +262,17 @@ mod tests {
             "mode: stateful\nreplicas: 2\npod: { containers: [{ name: db, image: pg }], volumes: [{ name: data, claim: { size: 1G } }] }",
         );
         let services = [("db".to_owned(), db)];
-        // Its own Volume shrinks to the claim; one it does not own stays.
+        // Its own Volume grows to the claim, and counts as it is until it
+        // shrinks to it (a size applied to it is given until then); one it
+        // does not own stays as it is.
         let volumes = [
             ("data-db-0".to_owned(), gb(3), Some("db".to_owned())),
+            ("data-db-1".to_owned(), gb(5), None),
+        ];
+        let u = usage(&services, &volumes, 1);
+        assert_eq!(u.storage, Bytes(8_000_000_000));
+        let volumes = [
+            ("data-db-0".to_owned(), None, Some("db".to_owned())),
             ("data-db-1".to_owned(), gb(5), None),
         ];
         let u = usage(&services, &volumes, 1);

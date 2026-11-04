@@ -676,6 +676,12 @@ impl Objects for ApiService {
         req: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
         let caller = self.caller(&req)?;
+        // Rights are checked against this replica's store, as each event
+        // goes out: first brought up to what the leader has committed, so
+        // a RoleBinding revoked there is revoked here before any of the
+        // history is served. From then on the store is applied in order,
+        // so no event comes out ahead of a revocation committed before it.
+        self.consistent().await?;
         let req = req.into_inner();
         let kind = if req.kind.is_empty() {
             None

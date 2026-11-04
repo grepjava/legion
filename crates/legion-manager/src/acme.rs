@@ -128,7 +128,7 @@ async fn pass(store: &Store, accounts: &mut Accounts, now: SystemTime) -> Durati
         next = next.min(at.duration_since(now).unwrap_or_default());
     };
     for w in wanted {
-        let due = match due(store, &w, now) {
+        let (due, seen) = match due(store, &w, now) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(secret = %format!("{}/{}", w.namespace, w.secret), "{e}");
@@ -163,8 +163,20 @@ async fn pass(store: &Store, accounts: &mut Accounts, now: SystemTime) -> Durati
                         legion_pki::validity(&pem).map_err(|e| e.to_string())?;
                     Ok((pem, not_after, not_after - lifetime / 3))
                 }) {
+                    Ok(_) if !still_wanted(store, &w) => {
+                        // The routes changed while it was ordered: a host
+                        // may be another namespace's now. The next pass
+                        // looks again.
+                        tracing::info!(
+                            hosts = ?w.hosts,
+                            secret = %format!("{}/{}", w.namespace, w.secret),
+                            "ACME certificate no longer wanted as ordered; not written"
+                        );
+                        continue;
+                    }
                     Ok((pem, not_after, renew_at)) => {
-                        match put_secret(store, &w.namespace, &w.secret, pem.as_bytes()).await {
+                        match put_secret(store, &w.namespace, &w.secret, pem.as_bytes(), seen).await
+                        {
                             Ok(()) => {
                                 tracing::info!(
                                     hosts = ?w.hosts,
@@ -284,18 +296,38 @@ fn wanted_of(routes: Vec<Object>) -> (Vec<Wanted>, Vec<ObjectKey>) {
     (by_secret.into_values().collect(), stale)
 }
 
-fn due(store: &Store, w: &Wanted, now: SystemTime) -> Result<Due, String> {
+/// Whether `w`'s routes still ask for a certificate for all its hosts in
+/// its Secret, as they did when it was ordered.
+fn still_wanted(store: &Store, w: &Wanted) -> bool {
+    let Ok((now, _)) = wanted(store) else {
+        return false;
+    };
+    now.iter()
+        .any(|n| n.namespace == w.namespace && n.secret == w.secret && w.hosts.is_subset(&n.hosts))
+}
+
+/// What is to be done about `w`, and the version of its Secret this saw
+/// (none if there is none), which a certificate ordered then may replace.
+fn due(store: &Store, w: &Wanted, now: SystemTime) -> Result<(Due, Option<u64>), String> {
     let key = ObjectKey::new(Kind::Secret, &w.namespace, &w.secret);
-    let data = read_data(store, &key)?;
+    let (data, seen) = match read_secret(store, &key)? {
+        Some((data, version)) => (Some(data), Some(version)),
+        None => (None, None),
+    };
+    let due = due_of(data, w, now);
+    Ok((due, seen))
+}
+
+fn due_of(data: Option<Vec<u8>>, w: &Wanted, now: SystemTime) -> Due {
     if let Some(data) = &data
         && !data
             .windows(CERTIFICATE.len())
             .any(|w| w == CERTIFICATE.as_bytes())
     {
-        return Ok(Due::Refused(format!(
+        return Due::Refused(format!(
             "Secret {}/{} holds no certificate, so it is not written over",
             w.namespace, w.secret
-        )));
+        ));
     }
     if let Some(pem) = data.and_then(|b| String::from_utf8(b).ok())
         && let Ok(names) = legion_pki::dns_names(&pem)
@@ -304,16 +336,16 @@ fn due(store: &Store, w: &Wanted, now: SystemTime) -> Result<Due, String> {
     {
         let renew_at = not_after - lifetime / 3;
         if now < renew_at {
-            return Ok(Due::No {
+            return Due::No {
                 not_after,
                 renew_at,
-            });
+            };
         }
     }
     let retry_at = w.status.retry_at.as_deref().and_then(clock::parse);
     match retry_at.map(|at| UNIX_EPOCH + Duration::from_secs(at.max(0) as u64)) {
-        Some(at) if at > now => Ok(Due::Later(at)),
-        _ => Ok(Due::Now),
+        Some(at) if at > now => Due::Later(at),
+        _ => Due::Now,
     }
 }
 
@@ -441,7 +473,7 @@ impl Accounts {
                         .await
                         .map_err(|e| format!("creating an account at {}: {e}", acme.directory))?;
                 let json = serde_json::to_vec(&credentials).expect("credentials serialize");
-                put_secret(store, SYSTEM_NAMESPACE, &key.name, &json).await?;
+                put_secret(store, SYSTEM_NAMESPACE, &key.name, &json, None).await?;
                 account
             }
         };
@@ -647,39 +679,50 @@ impl HttpClient for Authority {
 
 /// The value of a Secret, if there is one.
 fn read_data(store: &Store, key: &ObjectKey) -> Result<Option<Vec<u8>>, String> {
+    Ok(read_secret(store, key)?.map(|(data, _)| data))
+}
+
+/// The value of a Secret and its version, if there is one.
+fn read_secret(store: &Store, key: &ObjectKey) -> Result<Option<(Vec<u8>, u64)>, String> {
     let Some(o) = store.get(key).map_err(|e| e.to_string())? else {
         return Ok(None);
     };
+    let version = o.metadata.version;
     let spec: DataSpec = serde_json::from_value(o.spec).map_err(|e| format!("{key}: {e}"))?;
-    spec.bytes().map(Some).map_err(|e| format!("{key}: {e}"))
+    let data = spec.bytes().map_err(|e| format!("{key}: {e}"))?;
+    Ok(Some((data, version)))
 }
 
-/// Writes `value` into a Secret, created if need be.
+/// Writes `value` into a Secret as it was at version `seen`, or created
+/// if it was not there: one changed since is not written over.
 async fn put_secret(
     store: &Store,
     namespace: &str,
     name: &str,
     value: &[u8],
+    seen: Option<u64>,
 ) -> Result<(), String> {
+    const CHANGED: &str = "it changed in the meantime, so it is not written over";
     let key = ObjectKey::new(Kind::Secret, namespace, name);
     let spec = serde_json::to_value(DataSpec {
         data: Some(STANDARD.encode(value)),
         text: None,
     })
     .expect("serializes");
-    let (object, precondition) = match store.get(&key).map_err(|e| e.to_string())? {
-        Some(mut o) => {
-            let version = o.metadata.version;
+    let (object, precondition) = match (seen, store.get(&key).map_err(|e| e.to_string())?) {
+        (Some(version), Some(mut o)) if o.metadata.version == version => {
             o.spec = spec;
             (o, Precondition::Version(version))
         }
-        None => (
+        (None, None) => (
             Object::new(Kind::Secret, namespace, name, spec),
             Precondition::MustNotExist,
         ),
+        _ => return Err(CHANGED.into()),
     };
     match write(store, object, precondition).await? {
         Outcome::Written(_) => Ok(()),
+        Outcome::Conflict { .. } => Err(CHANGED.into()),
         other => Err(format!("{key}: {other:?}")),
     }
 }

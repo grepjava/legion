@@ -2627,6 +2627,44 @@ async fn a_follower_opens_sessions_only_as_the_leader_has_it() {
     follower.stop().await;
 }
 
+/// A watch checks rights against the follower's store as each event goes
+/// out: one cut off from the leader may lack a revocation, so serves none
+/// of its history, just as it reads nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_cut_off_from_the_leader_opens_no_watch() {
+    let mut managers = Vec::new();
+    for _ in 0..3 {
+        managers.push(Running::start().await);
+    }
+    form_cluster(&managers).await;
+    let leader = managers[0].objects().await;
+    eventually(|| {
+        let mut leader = leader.clone();
+        async move { leader.apply(apply(service("web", 1))).await }
+    })
+    .await;
+    async fn watch(m: &Running) -> Result<(), tonic::Status> {
+        m.objects()
+            .await
+            .watch(WatchRequest {
+                kind: "Service".into(),
+                from_version: 0,
+            })
+            .await
+            .map(drop)
+    }
+    // Caught up, it watches.
+    eventually(|| watch(&managers[2])).await;
+
+    let follower = managers.pop().unwrap();
+    for m in managers {
+        m.stop().await;
+    }
+    let refused = watch(&follower).await.unwrap_err();
+    assert_eq!(refused.code(), Code::Unavailable, "{refused}");
+    follower.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_rejected_task_has_no_sessions() {
     let m = Running::start().await;

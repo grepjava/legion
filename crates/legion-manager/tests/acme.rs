@@ -17,7 +17,7 @@ use legion_api::{Kind, ObjectKey};
 use legion_manager::{Manager, ManagerConfig, default_raft_config};
 use legion_proto::v1::cluster_client::ClusterClient;
 use legion_proto::v1::objects_client::ObjectsClient;
-use legion_proto::v1::{ApplyRequest, InitRequest, Object};
+use legion_proto::v1::{ApplyRequest, DeleteRequest, InitRequest, Object, ObjectRef};
 use legion_store::Store;
 use rcgen::{CertificateParams, Issuer, KeyPair};
 use serde_json::{Value, json};
@@ -236,6 +236,12 @@ impl Authority {
 
     fn accounts(&self) -> u32 {
         self.state.lock().unwrap().accounts
+    }
+
+    /// How many certificates it has issued.
+    fn issued(&self) -> usize {
+        let state = self.state.lock().unwrap();
+        state.orders.iter().filter(|o| o.cert.is_some()).count()
     }
 
     async fn handle(&self, req: Request<hyper::body::Incoming>) -> Response<Full<Bytes>> {
@@ -575,5 +581,98 @@ async fn failed_orders_are_tried_again_later() {
     // Not tried again before then.
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(authority.orders().len(), 1);
+    m.stop().await;
+}
+
+/// Held while a challenge is checked: says so, then waits to be let go.
+type Hold = Arc<Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>>;
+
+/// Arms `hold` for the next challenge checked: returns when it is being
+/// checked, and what lets it go.
+fn arm(hold: &Hold) -> (impl Future<Output = ()>, std::sync::mpsc::Sender<()>) {
+    let (asked_tx, asked) = std::sync::mpsc::channel();
+    let (go, go_rx) = std::sync::mpsc::channel();
+    *hold.lock().unwrap() = Some((asked_tx, go_rx));
+    let asked = async move {
+        tokio::task::spawn_blocking(move || asked.recv_timeout(Duration::from_secs(20)))
+            .await
+            .unwrap()
+            .expect("a challenge checked");
+    };
+    (asked, go)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_changes_during_an_order_is_not_written_over() {
+    let store: Arc<Mutex<Option<Store>>> = Default::default();
+    let hold: Hold = Default::default();
+    let (looked, held) = (store.clone(), hold.clone());
+    let authority = Authority::start(Box::new(move |host, token| {
+        let answer = served(looked.lock().unwrap().as_ref()?, host, token);
+        if let Some((asked, go)) = held.lock().unwrap().take() {
+            asked.send(()).unwrap();
+            let _ = go.recv_timeout(Duration::from_secs(20));
+        }
+        answer
+    }))
+    .await;
+    let m = Running::start().await;
+    *store.lock().unwrap() = Some(m.store.clone());
+    let dir = authority.directory();
+    let objects = ObjectsClient::new(m.channel().await);
+
+    // A Secret written while the certificate is ordered stays as written.
+    let (asked, go) = arm(&hold);
+    m.apply_route("www", route("shop.example.org", "/", &dir))
+        .await;
+    asked.await;
+    objects
+        .clone()
+        .apply(ApplyRequest {
+            object: Some(Object {
+                kind: "Secret".into(),
+                name: "shop-cert".into(),
+                spec_json: br#"{"text": "hunter2"}"#.to_vec(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    go.send(()).unwrap();
+    until("the certificate issued", || authority.issued() == 1).await;
+    until("the Secret left alone", || {
+        m.status("www")
+            .acme
+            .and_then(|a| a.error)
+            .is_some_and(|e| e.contains("so it is not written over"))
+    })
+    .await;
+    assert_eq!(m.secret("default", "shop-cert").unwrap(), "hunter2");
+
+    // Nor is one written for a route gone while it was ordered.
+    let (asked, go) = arm(&hold);
+    let mut blog = route("blog.example.org", "/", &dir);
+    blog["tls"]["secret"] = json!("blog-cert");
+    m.apply_route("blog", blog).await;
+    asked.await;
+    objects
+        .clone()
+        .delete(DeleteRequest {
+            r#ref: Some(ObjectRef {
+                kind: "Route".into(),
+                namespace: "default".into(),
+                name: "blog".into(),
+            }),
+            expected_version: None,
+        })
+        .await
+        .unwrap();
+    go.send(()).unwrap();
+    until("the certificate issued", || authority.issued() == 2).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(m.secret("default", "blog-cert").is_none());
+
+    store.lock().unwrap().take();
     m.stop().await;
 }
