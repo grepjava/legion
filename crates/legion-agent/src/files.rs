@@ -210,6 +210,45 @@ fn write_file(path: &Path, value: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// What the agent keeps of a container's restarts, to go on with after it
+/// restarts itself: a pod's containers are counted each on its own.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Restarts {
+    /// Restarts so far, for `maxAttempts`.
+    pub attempts: u32,
+    /// Its exit counted and its restart due.
+    pub pending: bool,
+    /// Exit code, and what happened, once it has finished for good.
+    pub done: Option<(i32, String)>,
+}
+
+/// Where a task's restarts are kept: beside its files, gone with them.
+fn restarts_path(root: &Path, uid: &str) -> PathBuf {
+    task_dir(root, uid).join("restarts.json")
+}
+
+/// Keeps a task's restarts, by container name.
+pub(crate) fn save_restarts(
+    root: &Path,
+    uid: &str,
+    restarts: &BTreeMap<String, Restarts>,
+) -> std::io::Result<()> {
+    let path = restarts_path(root, uid);
+    std::fs::create_dir_all(task_dir(root, uid))?;
+    let tmp = path.with_file_name(".restarts.json.new");
+    std::fs::write(&tmp, serde_json::to_vec(restarts).expect("serialises"))?;
+    std::fs::rename(&tmp, &path)
+}
+
+/// The restarts kept for a task; none if there are none, or they can't be
+/// read.
+pub(crate) fn load_restarts(root: &Path, uid: &str) -> BTreeMap<String, Restarts> {
+    std::fs::read(restarts_path(root, uid))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
 /// Removes a task's files: unmounts its tmpfs and deletes the directory.
 /// Its containers must be gone, or their mounts would keep the files busy.
 pub(crate) fn release(sys: &dyn Sys, root: &Path, uid: &str) -> Result<(), String> {

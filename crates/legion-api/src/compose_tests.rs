@@ -362,6 +362,12 @@ fn ports_on_one_target_keep_their_own_vip_ports() {
     };
     // `80` beside `8080:80` adds nothing.
     assert_eq!(ports("[\"8080:80\", \"80\"]").unwrap(), [(80, Some(8080))]);
+    assert_eq!(ports("[\"80\", \"8080:80\"]").unwrap(), [(80, Some(8080))]);
+    assert_eq!(ports("[\"80\", \"80:80\"]").unwrap(), [(80, Some(80))]);
+    assert_eq!(
+        ports("[\"80\", \"8080:80\", \"8081:80\"]").unwrap(),
+        [(80, Some(8080)), (8081, Some(8081))]
+    );
     // `8081` keeps its own VIP port; `8081:80` can't have it.
     let e = ports("[\"8080:80\", \"8081:80\", \"8081\"]").unwrap_err();
     assert!(e.contains("ports[1]: the service's port 8081/tcp"), "{e}");

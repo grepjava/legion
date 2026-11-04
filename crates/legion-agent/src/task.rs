@@ -432,10 +432,16 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             return Ok(None);
         }
         // Restarts are counted for the pod, not each container: those of
-        // its one container, then.
+        // its one container, then, unless they were kept for each.
         let restarts = match self.pod().containers.len() {
             1 => self.status.restarts,
             _ => 0,
+        };
+        let kept = {
+            let (root, uid) = (self.ctx.files_dir.clone(), self.a.uid.clone());
+            tokio::task::spawn_blocking(move || files::load_restarts(&root, &uid))
+                .await
+                .unwrap_or_default()
         };
         let role = |c: &crate::runtime::ContainerSummary| {
             c.labels.get(LABEL_ROLE).and_then(|r| Role::parse(r))
@@ -454,10 +460,20 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                     break;
                 };
                 let mut m = Member::new(&spec.name, &c.id, c.state == "running");
-                m.attempts = restarts;
+                let k = kept.get(&spec.name);
+                m.attempts = k.map_or(restarts, |k| k.attempts);
+                // Finished for good: not restarted, nor its exit counted
+                // again.
+                if !m.running {
+                    m.done = k.and_then(|k| k.done.clone());
+                }
                 // Its exit was counted, and its restart due, as the agent
                 // before went: it is restarted, not counted again.
-                if !m.running && restart_pending(&self.status.message, &spec.name) {
+                if !m.running
+                    && m.done.is_none()
+                    && (k.is_some_and(|k| k.pending)
+                        || restart_pending(&self.status.message, &spec.name))
+                {
                     let delay = self.pod().restart_policy.delay.as_std();
                     m.restart_at = Some(Instant::now() + delay);
                 }
@@ -1063,10 +1079,12 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             tracing::info!("{message}");
             self.status.restarts += 1;
             self.ready = pod.ready();
+            self.keep_restarts(pod).await;
             self.report(TaskState::Running, message).await;
         } else {
             tracing::info!(code, "container finished: {what}");
             m.done = Some((code, what));
+            self.keep_restarts(pod).await;
             self.update_ready(pod).await;
         }
     }
@@ -1098,12 +1116,14 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 }
                 self.probe(&mut pod.members[i]);
                 self.ready = pod.ready();
+                self.keep_restarts(pod).await;
                 self.report(TaskState::Running, "").await;
             }
             Err(e) => {
                 let message = format!("restarting container {}: {e}", m.name);
                 m.done = Some((-1, message.clone()));
                 tracing::warn!("{message}");
+                self.keep_restarts(pod).await;
                 if finished(pod).is_none() {
                     // The task runs on without it (other containers run or
                     // wait to restart): the manager learns why.
@@ -1113,6 +1133,30 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                     self.status.message = message;
                 }
             }
+        }
+    }
+
+    /// Keeps each container's restarts where the next agent finds them
+    /// should this one go: an agent restart does not start a container
+    /// over that finished, nor give it its attempts again.
+    async fn keep_restarts(&self, pod: &Pod) {
+        let restarts: std::collections::BTreeMap<String, files::Restarts> = pod
+            .members
+            .iter()
+            .map(|m| {
+                let r = files::Restarts {
+                    attempts: m.attempts,
+                    pending: m.restart_at.is_some(),
+                    done: m.done.clone(),
+                };
+                (m.name.clone(), r)
+            })
+            .collect();
+        let (root, uid) = (self.ctx.files_dir.clone(), self.a.uid.clone());
+        let saved =
+            tokio::task::spawn_blocking(move || files::save_restarts(&root, &uid, &restarts)).await;
+        if let Ok(Err(e)) = saved {
+            tracing::warn!("keeping the containers' restarts: {e}");
         }
     }
 

@@ -426,16 +426,17 @@ impl Converter<'_> {
                         let at = format!("{at}[{i}]");
                         let (port, published) = self.port(p, &at)?;
                         add_port(&mut container_ports, &port);
-                        if service_ports.iter().any(|o| same(o, &published)) {
-                            moved.push((at, published));
-                        } else {
-                            service_ports.push(published);
+                        let bare = |v: &Value| v.get("publishedPort").is_none();
+                        match service_ports.iter_mut().find(|o| same(o, &published)) {
+                            // `80` beside `8080:80`, in either order, is the
+                            // published one alone.
+                            Some(_) if bare(&published) => {}
+                            Some(o) if bare(o) => *o = published,
+                            Some(_) => moved.push((at, published)),
+                            None => service_ports.push(published),
                         }
                     }
                     for (at, mut published) in moved {
-                        if published.get("publishedPort").is_none() {
-                            continue;
-                        }
                         published["port"] = published["publishedPort"].clone();
                         if service_ports.iter().any(|o| same(o, &published)) {
                             return Err(format!(

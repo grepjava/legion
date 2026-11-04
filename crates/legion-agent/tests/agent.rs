@@ -694,6 +694,71 @@ restartPolicy: { condition: on-failure, maxAttempts: 1, delay: 0s }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_container_of_an_adopted_pod_keeps_its_attempts() {
+    let mut h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task(
+            "app-1",
+            r#"
+containers: [{ name: a, image: "app:1" }, { name: b, image: "app:1" }]
+restartPolicy: { condition: on-failure, maxAttempts: 1, delay: 0s }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    h.rt.exit("shop_app-1_a", 1);
+    eventually("restart counted", || h.status(&key).restarts == 1).await;
+    eventually("restarted", || h.running().len() == 3).await;
+
+    // a's one attempt used, before and after the agent restarts: its next
+    // exit is its last, while b runs on.
+    h.stop_agent().await;
+    h.start_agent();
+    h.wait_state(&key, TaskState::Running).await;
+    h.rt.exit("shop_app-1_a", 1);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let st = h.status(&key);
+    assert_eq!(st.restarts, 1, "{st:?}");
+    assert_eq!(h.running().len(), 2, "{st:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_container_finished_for_good_stays_so_after_an_agent_restart() {
+    let mut h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task(
+            "app-1",
+            r#"
+containers: [{ name: a, image: "app:1" }, { name: b, image: "app:1" }]
+restartPolicy: { condition: on-failure, maxAttempts: 1, delay: 0s }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    h.rt.exit("shop_app-1_a", 1);
+    eventually("restart counted", || h.status(&key).restarts == 1).await;
+    eventually("restarted", || h.running().len() == 3).await;
+    h.rt.exit("shop_app-1_a", 1);
+    // Its attempts used up: a stays down, b runs on.
+    eventually("a finished", || h.running().len() == 2).await;
+
+    // The next agent does not start it over.
+    h.stop_agent().await;
+    h.start_agent();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let st = h.status(&key);
+    assert_eq!(st.state, TaskState::Running, "{st:?}");
+    assert_eq!(st.restarts, 1, "{st:?}");
+    assert_eq!(h.running().len(), 2, "{st:?}");
+    // Its end still counts once b's comes.
+    h.rt.exit("shop_app-1_b", 0);
+    let st = h.wait_state(&key, TaskState::Failed).await;
+    assert!(st.message.contains("container a exited with 1"), "{st:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn without_racct_pods_with_limits_are_refused() {
     let mut h = Harness::new().await;
     h.stop_agent().await;
