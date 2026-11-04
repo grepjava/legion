@@ -90,20 +90,43 @@ impl Running {
         Running::serve(dir, listener, Some(joined.tls), Some(admin)).await
     }
 
+    /// With the Raft timing of a real cluster rather than the tests' quick
+    /// one, for calls that take longer than its heartbeat.
+    async fn start_real_timing() -> Running {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init();
+        let dir = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Running::serve_with(dir, listener, None, None, default_raft_config()).await
+    }
+
     async fn serve(
         dir: TempDir,
         listener: TcpListener,
         tls: Option<Tls>,
         admin: Option<ClientTlsConfig>,
     ) -> Running {
+        let raft = openraft::Config {
+            heartbeat_interval: 50,
+            election_timeout_min: 200,
+            election_timeout_max: 400,
+            ..default_raft_config()
+        };
+        Running::serve_with(dir, listener, tls, admin, raft).await
+    }
+
+    async fn serve_with(
+        dir: TempDir,
+        listener: TcpListener,
+        tls: Option<Tls>,
+        admin: Option<ClientTlsConfig>,
+        raft: openraft::Config,
+    ) -> Running {
         let addr = listener.local_addr().unwrap().to_string();
         let manager = Manager::open(ManagerConfig {
-            raft: openraft::Config {
-                heartbeat_interval: 50,
-                election_timeout_min: 200,
-                election_timeout_max: 400,
-                ..default_raft_config()
-            },
+            raft,
             tls,
             heartbeat: HEARTBEAT,
             ..ManagerConfig::new(dir.path(), &addr)
@@ -428,6 +451,75 @@ async fn form_cluster(managers: &[Running]) {
         .map(|(id, _)| *id)
         .collect();
     leader_raft.change_membership(ids, false).await.unwrap();
+}
+
+/// A log of objects near the size limit, more of them than one message
+/// holds: a manager that joins later still catches up, in smaller batches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_manager_catches_up_on_a_log_of_large_objects() {
+    let first = Running::start_real_timing().await;
+    form_cluster(std::slice::from_ref(&first)).await;
+    let api = first.objects().await;
+    let text = "x".repeat(500_000);
+    let mut writes = tokio::task::JoinSet::new();
+    for n in 0..140 {
+        let config = Object {
+            kind: "Config".into(),
+            name: format!("big{n}"),
+            spec_json: serde_json::to_vec(&serde_json::json!({ "text": text })).unwrap(),
+            ..Default::default()
+        };
+        let api = api.clone();
+        writes.spawn(async move {
+            eventually(|| {
+                let mut api = api.clone();
+                let config = config.clone();
+                async move { api.apply(apply(config)).await }
+            })
+            .await
+        });
+    }
+    while let Some(written) = writes.join_next().await {
+        written.unwrap();
+    }
+    let second = Running::start_real_timing().await;
+    let id = second
+        .cluster()
+        .await
+        .status(StatusRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .node_id;
+    let leader = first.store.raft.clone();
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        leader.add_learner(
+            id,
+            BasicNode {
+                addr: second.addr.clone(),
+            },
+            true,
+        ),
+    )
+    .await
+    .expect("the learner catches up")
+    .unwrap();
+    let applied = leader.metrics().borrow().last_applied;
+    let mut caught_up = second.store.raft.metrics();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        caught_up.wait_for(|m| m.last_applied >= applied),
+    )
+    .await
+    .expect("the learner applies the log")
+    .unwrap();
+    let key = legion_api::ObjectKey::new(legion_api::Kind::Config, "default", "big139");
+    assert!(second.store.get(&key).unwrap().is_some());
+    drop(leader);
+    drop(caught_up);
+    second.stop().await;
+    first.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -977,6 +1069,57 @@ async fn nodes_register_with_their_certificates_role() {
     assert_eq!(node_role(&first, "m2").as_deref(), Some("worker"));
     register(m2, "").await;
     assert_eq!(node_role(&first, "m2").as_deref(), Some("manager"));
+}
+
+/// A name joined twice before its node registers is certified once: the
+/// earlier certificate is refused from the second join on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_name_joined_twice_keeps_only_the_newest_certificate() {
+    let ca = Ca::generate().unwrap();
+    let m = Running::start_with(Some(&ca)).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let token = m
+        .cluster()
+        .await
+        .join_token(JoinTokenRequest {
+            role: "worker".into(),
+            rotate: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    let first = legion_manager::join(&m.addr, &token, "w7", 0, "")
+        .await
+        .unwrap();
+    let second = legion_manager::join(&m.addr, &token, "w7", 0, "")
+        .await
+        .unwrap();
+    let dispatcher = |tls: &Tls| {
+        let creds = client_config(&tls.ca_pem, &tls.cert_pem, &tls.key_pem);
+        let m = &m;
+        async move { DispatcherClient::new(m.channel(Some(&creds)).await.unwrap()) }
+    };
+    let register = |mut d: DispatcherClient<Channel>| async move {
+        d.register(RegisterRequest {
+            node: String::new(),
+            status_json: br#"{"state":"ready"}"#.to_vec(),
+            role: String::new(),
+        })
+        .await
+    };
+    let err = register(dispatcher(&first.tls).await).await.unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied, "{err}");
+    assert!(err.message().contains("joined again"), "{err}");
+    register(dispatcher(&second.tls).await).await.unwrap();
+    assert_eq!(node_role(&m, "w7").as_deref(), Some("worker"));
+    // Registered, the name takes no more joins, and its node stays in.
+    let err = legion_manager::join(&m.addr, &token, "w7", 0, "")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("w7 is in the cluster"), "{err}");
+    register(dispatcher(&second.tls).await).await.unwrap();
+    m.stop().await;
 }
 
 /// Deleting a worker's Node takes the worker out: its certificate is
@@ -2433,6 +2576,57 @@ async fn deleting_a_running_task_stops_it_first() {
 
 /// A task its node rejected never had a pod: no session opens on it, even
 /// named directly.
+/// A follower authorizes a session on what the leader has committed: it
+/// sees a Service written just before, and cut off from the leader it
+/// refuses sessions rather than going by what its replica last held (a
+/// RoleBinding revoked since, say).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_opens_sessions_only_as_the_leader_has_it() {
+    let mut managers = Vec::new();
+    for _ in 0..3 {
+        managers.push(Running::start().await);
+    }
+    form_cluster(&managers).await;
+    let open = |task: &str| SessionFrame {
+        frame: Some(Frame::Open(SessionOpen {
+            namespace: "default".into(),
+            task: task.into(),
+            container: String::new(),
+            action: Some(Action::Logs(LogsOptions::default())),
+        })),
+    };
+    async fn session(m: &Running, open: SessionFrame) -> tonic::Status {
+        PodsClient::new(m.channel(None).await.unwrap())
+            .session(tokio_stream::iter([open]))
+            .await
+            .map(drop)
+            .unwrap_err()
+    }
+    let leader = managers[0].objects().await;
+    for n in 0..5 {
+        let name = format!("web{n}");
+        eventually(|| {
+            let mut leader = leader.clone();
+            let name = name.clone();
+            async move { leader.apply(apply(service(&name, 1))).await }
+        })
+        .await;
+        // At once on the follower: the Service is there (no task runs on
+        // a node, there being none), never unknown.
+        let refused = session(&managers[2], open(&name)).await;
+        assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+    }
+
+    // The leader and the other follower gone, the last one is cut off.
+    let follower = managers.pop().unwrap();
+    for m in managers {
+        m.stop().await;
+    }
+    let refused = session(&follower, open("web0")).await;
+    assert_eq!(refused.code(), Code::Unavailable, "{refused}");
+    follower.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_rejected_task_has_no_sessions() {
     let m = Running::start().await;

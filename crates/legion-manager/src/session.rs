@@ -210,11 +210,11 @@ impl Pods for PodsService {
             None => return Err(Status::invalid_argument("the session needs an action")),
         };
         // A follower serves sessions from its own replica (its agents
-        // attach to it), which may lag the leader; the leader makes sure it
-        // still leads and has applied what it committed.
-        if self.api.leads() {
-            self.api.consistent().await?;
-        }
+        // attach to it), which may lag the leader or be cut off from it:
+        // RoleBindings revoked there still let the caller in. So the
+        // replica first catches up with the leader, which confirms it
+        // still leads; cut off, the session is refused.
+        self.api.consistent().await?;
         caller.check(&self.api.store, verb, Kind::Task, &open.namespace)?;
         let task = self.task(&open, verb == Verb::Read)?;
         let spec: TaskSpec = legion_api::parse(&task.spec).map_err(internal)?;
@@ -288,11 +288,10 @@ impl PodsService {
             .filter_map(|t| {
                 let spec = legion_api::parse::<TaskSpec>(&t.spec).ok()?;
                 (spec.service == open.task).then_some(())?;
-                let state = serde_json::from_value::<TaskStatus>(t.status.clone())
-                    .unwrap_or_default()
-                    .state;
-                let on_node = !spec.node.is_empty();
-                Some((t, spec.job, state, on_node))
+                let status =
+                    serde_json::from_value::<TaskStatus>(t.status.clone()).unwrap_or_default();
+                let on_node = on_node(&spec, &status);
+                Some((t, spec.job, status.state, on_node))
             })
             .collect();
         let exists = |kind| {
@@ -331,6 +330,14 @@ impl PodsService {
             Status::failed_precondition(format!("{owner} {} has no running task", open.task))
         })
     }
+}
+
+/// Whether a task has been on its node, whose agent has its pod or logs:
+/// a global one names its node before it is placed there.
+fn on_node(spec: &TaskSpec, status: &TaskStatus) -> bool {
+    !spec.node.is_empty()
+        && !(status.state == TaskState::Shutdown
+            && status.message == crate::controller::plan::NEVER_PLACED)
 }
 
 /// The container `asked` for, which may be left out when the pod has only
@@ -534,6 +541,27 @@ mod tests {
             assert_eq!(err.code(), tonic::Code::Unavailable);
         }
         assert!(hub.inner.lock().unwrap().pending.is_empty());
+    }
+
+    #[test]
+    fn a_global_task_stopped_before_it_was_placed_was_never_on_its_node() {
+        let mut spec: TaskSpec = serde_json::from_value(serde_json::json!({
+            "service": "web", "serviceUid": "u", "serviceGeneration": 1,
+            "node": "n1",
+            "pod": { "containers": [{ "name": "app", "image": "i" }] },
+        }))
+        .unwrap();
+        let ended = |state, message: &str| TaskStatus {
+            state,
+            message: message.into(),
+            ..Default::default()
+        };
+        assert!(on_node(&spec, &ended(TaskState::Shutdown, "")));
+        assert!(on_node(&spec, &ended(TaskState::Complete, "")));
+        let never = ended(TaskState::Shutdown, crate::controller::plan::NEVER_PLACED);
+        assert!(!on_node(&spec, &never));
+        spec.node.clear();
+        assert!(!on_node(&spec, &ended(TaskState::Shutdown, "")));
     }
 
     #[test]

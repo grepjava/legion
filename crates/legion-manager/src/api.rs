@@ -111,7 +111,9 @@ impl ApiService {
         // The tokens and removals it checks are the latest: a worker's join
         // writes nothing that would fail on a deposed leader.
         self.consistent().await?;
-        Ok(Response::new(self.issuer()?.join(req.into_inner()).await?))
+        Ok(Response::new(
+            self.issuer()?.join(self, req.into_inner()).await?,
+        ))
     }
 
     /// Where a leader-only request should run.
@@ -153,16 +155,33 @@ impl ApiService {
         }
     }
 
-    /// Whether this manager leads, as far as it knows.
-    pub(crate) fn leads(&self) -> bool {
-        self.store.raft.metrics().borrow().current_leader == Some(self.id)
-    }
-
+    /// Waits until this manager's store holds all the leader has committed
+    /// (a linearizable read from then on). The leader checks it still
+    /// leads; a follower, whose replica may lag or be cut off, asks the
+    /// leader how far that is and waits to have applied as much.
     pub(crate) async fn consistent(&self) -> Result<(), Status> {
-        tokio::time::timeout(crate::COMMIT_TIMEOUT, self.store.raft.ensure_linearizable())
+        tokio::time::timeout(crate::COMMIT_TIMEOUT, self.linearize())
             .await
             .map_err(|_| crate::no_quorum())?
-            .map(|_| ())
+    }
+
+    async fn linearize(&self) -> Result<(), Status> {
+        let Some(leader) = self.leader_addr(&Request::new(()))? else {
+            return self
+                .store
+                .raft
+                .ensure_linearizable()
+                .await
+                .map(|_| ())
+                .map_err(|e| Status::unavailable(e.to_string()));
+        };
+        let index = crate::raft_net::read_index(&leader, self.peer_tls.as_ref()).await?;
+        self.store
+            .raft
+            .wait(None)
+            .applied_index_at_least(index, "the leader's read index")
+            .await
+            .map(drop)
             .map_err(|e| Status::unavailable(e.to_string()))
     }
 

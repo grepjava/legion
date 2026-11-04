@@ -273,6 +273,11 @@ pub fn issued_at(cert_der: &[u8]) -> Result<SystemTime> {
     Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(from) + BACKDATE)
 }
 
+/// [`issued_at`] of the first certificate in `pem`.
+pub fn issued(cert_pem: &str) -> Result<SystemTime> {
+    issued_at(&first_cert_der(cert_pem)?)
+}
+
 /// When the first certificate in `pem` expires, and how long it was issued for.
 pub fn validity(cert_pem: &str) -> Result<(SystemTime, Duration)> {
     let der = first_cert_der(cert_pem)?;

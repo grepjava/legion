@@ -8,6 +8,10 @@ service Raft {
   rpc AppendEntries(RaftPayload) returns (RaftPayload);
   rpc Vote(RaftPayload) returns (RaftPayload);
   rpc InstallSnapshot(RaftPayload) returns (RaftPayload);
+  // Asked of the leader by a follower about to read its own replica.
+  // Request: empty. Response: Result<Option<u64>, String>, the index of the
+  // log a read must have applied to see all the leader has committed.
+  rpc ReadIndex(RaftPayload) returns (RaftPayload);
 }
 
 // Request: the openraft request. Response: Result<response, RaftError>.

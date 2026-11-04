@@ -10,7 +10,8 @@ use legion_proto::v1::raft_client::RaftClient;
 use legion_proto::v1::raft_server;
 use legion_store::{NodeId, Store, TypeConfig};
 use openraft::error::{
-    InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable,
+    InstallSnapshotError, NetworkError, PayloadTooLarge, RPCError, RaftError, RemoteError,
+    Unreachable,
 };
 use openraft::network::RPCOption;
 use openraft::raft::{
@@ -27,6 +28,15 @@ use tonic::{Request, Response, Status};
 
 /// Largest gRPC message a manager accepts, for log batches and snapshot chunks.
 pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
+
+/// Largest log batch a leader sends in one call, once encoded. openraft
+/// batches up to `max_payload_entries` whatever their size, and objects of
+/// up to a MiB each would pass [`MAX_MESSAGE`] together, which the peer
+/// refuses, and no smaller batch would follow. Each call must also finish
+/// within the heartbeat interval (openraft's timeout for it). A batch above
+/// this is sent again in fewer entries; one entry alone goes whatever its
+/// size.
+pub(crate) const MAX_BATCH: usize = 4 * 1024 * 1024;
 
 /// Hands openraft one lazily connected channel per peer.
 #[derive(Default)]
@@ -96,6 +106,20 @@ impl PeerClient {
         E: std::error::Error + DeserializeOwned,
     {
         let json = serde_json::to_vec(req).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        self.send(method, json, option).await
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn send<Resp, E>(
+        &mut self,
+        method: Method,
+        json: Vec<u8>,
+        option: &RPCOption,
+    ) -> Result<Resp, RpcErr<E>>
+    where
+        Resp: DeserializeOwned,
+        E: std::error::Error + DeserializeOwned,
+    {
         let mut request = Request::new(RaftPayload { json });
         request.set_timeout(option.hard_ttl());
         let response = match method {
@@ -108,6 +132,18 @@ impl PeerClient {
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         result.map_err(|e| RemoteError::new(self.target, e).into())
     }
+}
+
+/// How many of a batch of `entries` encoding to `size` bytes to send
+/// instead, to stay within `limit`: in proportion, and always fewer, so a
+/// batch of entries larger than the average shrinks again on the next try;
+/// `None` for a batch that fits or one entry.
+fn fewer_entries(entries: usize, size: usize, limit: usize) -> Option<u64> {
+    if size <= limit || entries <= 1 {
+        return None;
+    }
+    let fit = (entries as u128 * limit as u128 / size as u128) as usize;
+    Some(fit.clamp(1, entries - 1) as u64)
 }
 
 enum Method {
@@ -132,7 +168,28 @@ impl RaftNetwork<TypeConfig> for PeerClient {
         rpc: AppendEntriesRequest<TypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RpcErr<openraft::error::Infallible>> {
-        self.call(Method::Append, &rpc, &option).await
+        // From the start: encoding a large batch takes its share too.
+        let deadline = tokio::time::Instant::now() + option.hard_ttl().mul_f64(0.8);
+        let json =
+            serde_json::to_vec(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        let entries = rpc.entries.len();
+        if let Some(hint) = fewer_entries(entries, json.len(), MAX_BATCH) {
+            return Err(RPCError::PayloadTooLarge(
+                PayloadTooLarge::new_entries_hint(hint),
+            ));
+        }
+        if entries <= 1 {
+            return self.send(Method::Append, json, &option).await;
+        }
+        // openraft gives each call the heartbeat interval and, past it,
+        // sends the same batch again: on a link too slow for it, never
+        // anything. A batch that runs out of time goes again in half.
+        match tokio::time::timeout_at(deadline, self.send(Method::Append, json, &option)).await {
+            Ok(result) => result,
+            Err(_) => Err(RPCError::PayloadTooLarge(
+                PayloadTooLarge::new_entries_hint((entries / 2) as u64),
+            )),
+        }
     }
 
     async fn install_snapshot(
@@ -207,5 +264,56 @@ impl raft_server::Raft for RaftService {
         let rpc: InstallSnapshotRequest<TypeConfig> = decode(req)?;
         self.known(&rpc.vote)?;
         encode(self.store.raft.install_snapshot(rpc).await)
+    }
+
+    async fn read_index(&self, _: Request<RaftPayload>) -> Result<Response<RaftPayload>, Status> {
+        // Confirmed with a quorum: a deposed leader answers with an error.
+        let read: Result<Option<u64>, String> = self
+            .store
+            .raft
+            .get_read_log_id()
+            .await
+            .map(|(read, _)| read.map(|l| l.index))
+            .map_err(|e| e.to_string());
+        encode(read)
+    }
+}
+
+/// The read index of the leader at `addr` ([`raft_server::Raft::read_index`]).
+pub(crate) async fn read_index(
+    addr: &str,
+    tls: Option<&Arc<Credentials>>,
+) -> Result<Option<u64>, Status> {
+    let mut client = RaftClient::new(connect_lazy(addr, tls));
+    let payload = client
+        .read_index(RaftPayload::default())
+        .await?
+        .into_inner();
+    let read: Result<Option<u64>, String> = serde_json::from_slice(&payload.json)
+        .map_err(|e| Status::internal(format!("the leader's read index: {e}")))?;
+    read.map_err(|e| Status::unavailable(format!("the leader's read index: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fewer_entries;
+
+    #[test]
+    fn batches_above_the_limit_shrink_until_one_entry() {
+        assert_eq!(fewer_entries(300, 100, 100), None);
+        assert_eq!(fewer_entries(1, 1000, 100), None);
+        // 70 entries of a MiB against 8 MiB: 8 of them.
+        assert_eq!(fewer_entries(70, 70 << 20, 8 << 20), Some(8));
+        // Just over the limit still drops one.
+        assert_eq!(fewer_entries(10, 101, 100), Some(9));
+        // Far over: one.
+        assert_eq!(fewer_entries(2, 10_000, 100), Some(1));
+        // A shrinking batch always reaches one entry.
+        let (mut n, per) = (300usize, 3usize << 20);
+        while let Some(h) = fewer_entries(n, n * per, 8 << 20) {
+            assert!((h as usize) < n);
+            n = h as usize;
+        }
+        assert!(n * per <= 8 << 20 || n == 1);
     }
 }

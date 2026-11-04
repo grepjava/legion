@@ -596,17 +596,10 @@ impl DispatcherService {
                 };
                 let seen = self.seen.lock().unwrap().get(&node.metadata.name).copied();
                 let silent = now.duration_since(seen.unwrap_or(since).max(since));
-                let state = match seen {
-                    _ if silent >= grace => NodeState::Down,
-                    Some(_) if silent >= suspect => NodeState::Suspect,
-                    Some(_) => NodeState::Ready,
-                    // Not heard from yet under this leader, within grace:
-                    // after an election, nodes take a moment to find it.
-                    None => continue,
-                };
-                if status.state == state {
+                let Some(state) = heard(status.state, seen.is_some(), silent, suspect, grace)
+                else {
                     continue;
-                }
+                };
                 let name = node.metadata.name.clone();
                 status.state = state;
                 let mut node = node;
@@ -1642,8 +1635,64 @@ fn unexpected(outcome: Outcome) -> Status {
     Status::internal(format!("unexpected outcome {outcome:?}"))
 }
 
+/// The state a node's heartbeats give it, if it changes: `heard` from under
+/// this leader, last `silent` ago. A node still registering (its state
+/// unknown until its subnet is reserved) keeps it whatever its name was
+/// heard from before (an earlier node of that name): Ready, it would take
+/// tasks without a subnet.
+fn heard(
+    state: NodeState,
+    heard: bool,
+    silent: Duration,
+    suspect: Duration,
+    grace: Duration,
+) -> Option<NodeState> {
+    if state == NodeState::Unknown {
+        return None;
+    }
+    let now = match heard {
+        _ if silent >= grace => NodeState::Down,
+        true if silent >= suspect => NodeState::Suspect,
+        true => NodeState::Ready,
+        // Not heard from yet under this leader, within grace: after an
+        // election, nodes take a moment to find it.
+        false => return None,
+    };
+    (now != state).then_some(now)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_node_still_registering_is_not_made_ready() {
+        use super::{Duration, NodeState, heard};
+        let ms = Duration::from_millis;
+        let (suspect, grace) = (ms(300), ms(800));
+        // Heard from recently, under an earlier node of the name.
+        assert_eq!(
+            heard(NodeState::Unknown, true, ms(10), suspect, grace),
+            None
+        );
+        assert_eq!(
+            heard(NodeState::Unknown, true, ms(900), suspect, grace),
+            None
+        );
+        assert_eq!(
+            heard(NodeState::Down, true, ms(10), suspect, grace),
+            Some(NodeState::Ready)
+        );
+        assert_eq!(
+            heard(NodeState::Ready, true, ms(400), suspect, grace),
+            Some(NodeState::Suspect)
+        );
+        assert_eq!(
+            heard(NodeState::Ready, false, ms(900), suspect, grace),
+            Some(NodeState::Down)
+        );
+        assert_eq!(heard(NodeState::Ready, false, ms(10), suspect, grace), None);
+        assert_eq!(heard(NodeState::Ready, true, ms(10), suspect, grace), None);
+    }
+
     use super::*;
 
     #[test]

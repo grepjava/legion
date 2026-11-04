@@ -47,7 +47,7 @@ pub(crate) fn check(store: &Store, node: &str, issued: SystemTime) -> Result<(),
         .as_secs();
     if issued <= at {
         return Err(Status::permission_denied(format!(
-            "node {node} was removed from the cluster; to come back it joins again"
+            "node {node} was removed from the cluster, or joined again, since this certificate was issued; to come back it joins again"
         )));
     }
     Ok(())
@@ -85,11 +85,40 @@ pub(crate) async fn record(api: &ApiService, node: &str) -> Result<Recorded, Sta
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let before = removed.insert(node.to_owned(), now);
-        Some(Recorded { at: now, before })
+        // Never earlier than a removal recorded before (a join's may be a
+        // second ahead): what that one refused stays refused.
+        let before = removed.get(node).copied();
+        let at = before.map_or(now, |b| now.max(b));
+        removed.insert(node.to_owned(), at);
+        Some(Recorded { at, before })
     })
     .await
     .map(|r| r.expect("always recorded"))
+}
+
+/// Refuses every certificate of `node` issued so far, for a join to
+/// certify it anew: a node that joined and has not registered yet, or
+/// joins again, leaves only the newest certificate in use. Recorded after
+/// any earlier record, even within a second, so the certificate a join
+/// issues the second after (see [`Recorded::at`]) is refused by the next.
+pub(crate) async fn supersede(api: &ApiService, node: &str) -> Result<Recorded, Status> {
+    change(api, |removed| {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let before = removed.get(node).copied();
+        let at = before.map_or(now, |b| now.max(b + 1));
+        removed.insert(node.to_owned(), at);
+        Some(Recorded { at, before })
+    })
+    .await
+    .map(|r| r.expect("always recorded"))
+}
+
+/// When `node`'s certificates were last refused up to, if ever.
+pub(crate) fn at(store: &Store, node: &str) -> Result<Option<u64>, Status> {
+    Ok(read(store)?.0.get(node).copied())
 }
 
 /// A removal [`record`] wrote: when, and the earlier one it replaced.
@@ -97,6 +126,13 @@ pub(crate) async fn record(api: &ApiService, node: &str) -> Result<Recorded, Sta
 pub(crate) struct Recorded {
     at: u64,
     before: Option<u64>,
+}
+
+impl Recorded {
+    /// The second certificates of the node were refused up to, inclusive.
+    pub(crate) fn at(&self) -> u64 {
+        self.at
+    }
 }
 
 /// Undoes [`record`] of `node` for a removal that did not happen, unless

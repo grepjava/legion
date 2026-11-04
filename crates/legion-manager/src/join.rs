@@ -162,7 +162,11 @@ impl Issuer {
 
     /// Checks the token and certifies the node. Leader only: a manager
     /// joins Raft as a learner.
-    pub async fn join(&self, req: JoinRequest) -> Result<JoinResponse, Status> {
+    pub async fn join(
+        &self,
+        api: &crate::api::ApiService,
+        req: JoinRequest,
+    ) -> Result<JoinResponse, Status> {
         let token = Token::parse(&req.token).map_err(Status::invalid_argument)?;
         if token.ca_digest != self.ca.digest() {
             return Err(Status::permission_denied(
@@ -178,23 +182,38 @@ impl Issuer {
         // A node's name is who it is: a token certifies a new node, never
         // one in the cluster (which is removed first to join again).
         let node = ObjectKey::new(Kind::Node, "", &req.name);
-        if self
-            .store
-            .get(&node)
-            .map_err(|e| Status::internal(e.to_string()))?
-            .is_some()
-        {
-            return Err(Status::already_exists(format!(
+        let in_cluster = || {
+            Status::already_exists(format!(
                 "node {0} is in the cluster; delete its Node (`legion delete node {0}`) to join                  it again",
                 req.name
-            )));
+            ))
+        };
+        let registered = |store: &Store| {
+            store
+                .get(&node)
+                .map(|n| n.is_some())
+                .map_err(|e| Status::internal(e.to_string()))
+        };
+        if registered(&self.store)? {
+            return Err(in_cluster());
         }
         let id = Identity::new(&req.name, role);
-        crate::removed::issue_after(&self.store, &req.name).await?;
+        let certify = || {
+            self.ca
+                .sign(&req.csr_pem, &id, CERT_LIFETIME)
+                .map_err(|e| Status::invalid_argument(format!("certificate request: {e}")))
+        };
+        // A bad request is refused before anything is written.
+        certify()?;
         let cert_pem = self
-            .ca
-            .sign(&req.csr_pem, &id, CERT_LIFETIME)
-            .map_err(|e| Status::invalid_argument(format!("certificate request: {e}")))?;
+            .certify_alone(
+                api,
+                &req.name,
+                certify,
+                || registered(&self.store),
+                in_cluster,
+            )
+            .await?;
         let mut ca_key_pem = String::new();
         if role == Role::Manager {
             if req.node_id == 0 || req.advertise.is_empty() {
@@ -236,6 +255,62 @@ impl Issuer {
             ca_key_pem,
         })
     }
+}
+
+impl Issuer {
+    /// The certificate `certify` makes for `node`, the only one of it in
+    /// use: every earlier one, from a join whose node has not registered
+    /// (two joins of a name before either registers would each get one),
+    /// is refused from now, and so is this one once the name joins again.
+    /// A join's record of the name comes first, and its certificate is
+    /// issued in the very next second, so the next record, at least a
+    /// second later, covers it; one issued later than that is not handed
+    /// out. Refused if the name is joined again or removed meanwhile, or
+    /// registered by then (`in_cluster`).
+    async fn certify_alone(
+        &self,
+        api: &crate::api::ApiService,
+        node: &str,
+        certify: impl Fn() -> Result<String, Status>,
+        registered: impl Fn() -> Result<bool, Status>,
+        in_cluster: impl Fn() -> Status,
+    ) -> Result<String, Status> {
+        for _ in 0..3 {
+            let recorded = crate::removed::supersede(api, node).await?;
+            crate::removed::issue_after(&self.store, node).await?;
+            let cert_pem = certify()?;
+            let issued = issued_second(&cert_pem)?;
+            if issued != recorded.at() + 1 {
+                // Too late: the next record refuses it.
+                continue;
+            }
+            api.consistent().await?;
+            if crate::removed::at(&self.store, node)? != Some(recorded.at()) {
+                return Err(Status::aborted(format!(
+                    "node {node} is joining again or being removed; retry"
+                )));
+            }
+            // Registered by an earlier join's node between the check and
+            // the record: that node keeps its name.
+            if registered()? {
+                crate::removed::forget(api, node, recorded).await?;
+                return Err(in_cluster());
+            }
+            return Ok(cert_pem);
+        }
+        Err(Status::unavailable(format!(
+            "certifying node {node} keeps taking too long; retry"
+        )))
+    }
+}
+
+/// The second the certificate in `pem` was issued.
+fn issued_second(pem: &str) -> Result<u64, Status> {
+    let at = legion_pki::issued(pem).map_err(|e| Status::internal(e.to_string()))?;
+    Ok(at
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs())
 }
 
 async fn write(
@@ -297,11 +372,15 @@ pub(crate) async fn promote_learners(raft: Raft, mut closing: tokio::sync::watch
             continue;
         }
         tracing::info!(?ready, "promoting caught-up managers to voters");
-        if let Err(e) = raft
-            .change_membership(ChangeMembers::AddVoterIds(ready), false)
-            .await
-        {
-            tracing::warn!("promoting managers: {e}");
+        // Without a quorum (the manager promoted stopped meanwhile) the
+        // change waits for one: not past shutdown, which waits for this.
+        tokio::select! {
+            changed = raft.change_membership(ChangeMembers::AddVoterIds(ready), false) => {
+                if let Err(e) = changed {
+                    tracing::warn!("promoting managers: {e}");
+                }
+            }
+            _ = closing.wait_for(|c| *c) => return,
         }
     }
 }
