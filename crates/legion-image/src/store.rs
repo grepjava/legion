@@ -86,6 +86,8 @@ pub struct Store {
     /// Whether pulled blobs are kept in `<dir>/blobs/sha256`.
     keep_blobs: bool,
     roots: Option<GcRoots>,
+    /// This store's own directory under `<dir>/tmp`.
+    tmp: TempArea,
 }
 
 enum Source<'a> {
@@ -295,9 +297,16 @@ impl Store {
         dir: &Path,
         client: Client,
     ) -> Result<Store, Error> {
-        let _ = std::fs::remove_dir_all(dir.join("tmp"));
         std::fs::create_dir_all(dir.join("tmp"))?;
         std::fs::create_dir_all(dir.join("mnt"))?;
+        // Leftovers from a killed pull or export; another process's
+        // (`legion image load` beside the daemon) stay. Held across both,
+        // so another store opening meanwhile never finds this one's area
+        // before its lock is.
+        let opening = lock_file(&dir.join("tmp.lock"))?;
+        clean_tmp(&*sys, &mode, &dir.join("tmp"));
+        let tmp = TempArea::new(&dir.join("tmp"))?;
+        drop(opening);
         Ok(Store {
             sys,
             mode,
@@ -307,6 +316,7 @@ impl Store {
             oses: vec!["freebsd"],
             keep_blobs: false,
             roots: None,
+            tmp,
         })
     }
 
@@ -358,6 +368,27 @@ impl Store {
 
     fn index_path(&self) -> PathBuf {
         self.dir.join("index.json")
+    }
+
+    /// Writes `bytes` as the blob at `dest` unless it is there, through a
+    /// file in the store's tmp ([`put_blob`]).
+    fn write_blob(&self, bytes: &[u8], dest: &Path) -> Result<(), Error> {
+        if dest.exists() {
+            return Ok(());
+        }
+        let tmp = tempfile::NamedTempFile::new_in(&self.tmp.dir)?;
+        std::fs::write(tmp.path(), bytes)?;
+        put_blob(tmp.path(), dest)
+    }
+
+    /// [`Self::write_blob`] with the file `from`'s contents.
+    fn copy_blob(&self, from: &Path, dest: &Path) -> Result<(), Error> {
+        if dest.exists() {
+            return Ok(());
+        }
+        let tmp = tempfile::NamedTempFile::new_in(&self.tmp.dir)?;
+        std::fs::copy(from, tmp.path())?;
+        put_blob(tmp.path(), dest)
     }
 
     /// Where the store keeps the blob `digest`.
@@ -507,13 +538,13 @@ impl Store {
         };
         let tmp = tempfile::Builder::new()
             .prefix("mount")
-            .tempdir_in(self.dir.join("tmp"))?;
+            .tempdir_in(&self.tmp.dir)?;
         let name = tmp
             .path()
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let ds = format!("{layers}/tmp-{}-{name}", std::process::id());
+        let ds = clone_name(layers, &self.tmp.dir, &name);
         let mountpoint = tmp.path().to_string_lossy().into_owned();
         self.sys.zfs_clone(
             &format!("{layers}/{chain_hex}@{SNAPSHOT}"),
@@ -570,7 +601,7 @@ impl Store {
         let _held = self.lock().await?;
         let tmp = tempfile::Builder::new()
             .prefix("load")
-            .tempdir_in(self.dir.join("tmp"))?;
+            .tempdir_in(&self.tmp.dir)?;
         let mut tar = std::process::Command::new("tar");
         // As root bsdtar sets the archive's file flags, which would keep
         // the files from going with the directory.
@@ -636,7 +667,7 @@ impl Store {
         let (digest, manifest) = source.manifest(&self.oses).await?;
         let tmp = tempfile::Builder::new()
             .prefix("pull")
-            .tempdir_in(self.dir.join("tmp"))?;
+            .tempdir_in(&self.tmp.dir)?;
         let config_path = tmp.path().join("config.json");
         source
             .blob(&manifest.config.digest, manifest.config.size, &config_path)
@@ -668,9 +699,7 @@ impl Store {
         }
         if self.keep_blobs {
             let kept = self.blob_dest(&manifest.config.digest)?;
-            if !kept.exists() {
-                std::fs::write(&kept, &config_bytes)?;
-            }
+            self.write_blob(&config_bytes, &kept)?;
         }
         let chains = chain_ids(&config.rootfs.diff_ids);
         let mut layers = Vec::new();
@@ -699,8 +728,8 @@ impl Store {
             if !have || need_blob {
                 let blob = tmp.path().join(format!("{i}.blob"));
                 source.blob(&desc.digest, desc.size, &blob).await?;
-                if let Some(k) = kept.as_ref().filter(|k| !k.exists()) {
-                    std::fs::copy(&blob, k)?;
+                if let Some(k) = &kept {
+                    self.copy_blob(&blob, k)?;
                 }
                 if !have {
                     let tar = tmp.path().join(format!("{i}.tar"));
@@ -785,10 +814,16 @@ impl Store {
             i.references.retain(|n| *n != name);
             i.private.remove(&name);
         }
+        let mut public = false;
         let i = match images.iter().position(same) {
             Some(i) => {
+                // Already pulled without credentials as this: it stays
+                // public.
+                public =
+                    images[i].references.contains(&name) && !images[i].private.contains_key(&name);
                 if !image.layer_descriptors.is_empty() {
                     images[i].layer_descriptors = image.layer_descriptors;
+                    images[i].annotations = image.annotations;
                 }
                 i
             }
@@ -802,9 +837,10 @@ impl Store {
             i.references.push(name.clone());
         }
         match private {
-            Some(user) => {
+            Some(user) if !public => {
                 i.private.entry(name).or_default().insert(user.to_owned());
             }
+            Some(_) => {}
             None => {
                 i.private.remove(&name);
             }
@@ -828,10 +864,9 @@ impl Store {
         artifact: &layer::LayerArtifact,
     ) -> Result<Descriptor, Error> {
         pin.add(&[chain_hex, hex_of(&artifact.blob_digest)?])?;
-        let kept = self.blob_dest(&artifact.blob_digest)?;
-        if !kept.exists() {
-            std::fs::copy(gz, &kept)?;
-        }
+        self.copy_blob(gz, &self.blob_dest(&artifact.blob_digest)?)?;
+        // Another build or a pull may be making the same layer.
+        let _held = self.lock().await?;
         if !self.has_layer(chain_hex)? {
             self.add_layer(parent, chain_hex, tar.to_owned()).await?;
         }
@@ -880,7 +915,7 @@ impl Store {
         let config_bytes = serde_json::to_vec_pretty(&config)?;
         let config_digest = sha256(&config_bytes);
         pin.add(&[hex_of(&config_digest)?])?;
-        std::fs::write(self.blob_dest(&config_digest)?, &config_bytes)?;
+        self.write_blob(&config_bytes, &self.blob_dest(&config_digest)?)?;
         let mut manifest = Manifest::new(
             Descriptor {
                 media_type: OCI_CONFIG.to_owned(),
@@ -895,7 +930,7 @@ impl Store {
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         let manifest_digest = sha256(&manifest_bytes);
         pin.add(&[hex_of(&manifest_digest)?])?;
-        std::fs::write(self.blob_dest(&manifest_digest)?, &manifest_bytes)?;
+        self.write_blob(&manifest_bytes, &self.blob_dest(&manifest_digest)?)?;
         let image = Image {
             id: config_digest,
             digest: manifest_digest,
@@ -915,9 +950,11 @@ impl Store {
     pub fn pin(&self) -> Result<Pin, Error> {
         let dir = self.dir.join("pins");
         std::fs::create_dir_all(&dir)?;
-        let (file, path) = tempfile::Builder::new()
+        // Made and locked in the store's own area, then moved in: a prune
+        // never finds it in `pins` unlocked.
+        let (file, made) = tempfile::Builder::new()
             .prefix("pin")
-            .tempfile_in(&dir)?
+            .tempfile_in(&self.tmp.dir)?
             .keep()
             .map_err(|e| e.error)?;
         #[cfg(unix)]
@@ -925,8 +962,14 @@ impl Store {
             use std::os::fd::AsRawFd;
             // SAFETY: flock on a descriptor we own; released when it closes.
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                let _ = std::fs::remove_file(&made);
                 return Err(std::io::Error::last_os_error().into());
             }
+        }
+        let path = dir.join(made.file_name().unwrap_or_default());
+        if let Err(e) = std::fs::rename(&made, &path) {
+            let _ = std::fs::remove_file(&made);
+            return Err(e.into());
         }
         Ok(Pin { path, file })
     }
@@ -979,7 +1022,7 @@ impl Store {
 
         let tmp = tempfile::Builder::new()
             .prefix("export")
-            .tempdir_in(self.dir.join("tmp"))?;
+            .tempdir_in(&self.tmp.dir)?;
         let blobs = tmp.path().join("blobs").join("sha256");
         std::fs::create_dir_all(&blobs)?;
         std::fs::write(
@@ -1168,7 +1211,7 @@ impl Store {
                 .ok_or_else(|| Error::Unsupported("an image without layers".to_owned()))?;
             let tmp = tempfile::Builder::new()
                 .prefix("pack")
-                .tempdir_in(self.dir.join("tmp"))?;
+                .tempdir_in(&self.tmp.dir)?;
             let (tar, gz) = (
                 tmp.path().join("layer.tar"),
                 tmp.path().join("layer.tar.gz"),
@@ -1193,15 +1236,18 @@ impl Store {
             }];
         }
         let descriptors = image.layer_descriptors.clone();
-        let config_bytes = serde_json::to_vec_pretty(&image.config)?;
+        // The config as it was pulled or built, where the store kept it: a
+        // copy made again from the parsed one may differ in its bytes.
+        let config_bytes = match kept.then(|| self.blob_path(&image.id)) {
+            Some(Ok(path)) => match std::fs::read(&path) {
+                Ok(bytes) if sha256(&bytes) == image.id => bytes,
+                _ => serde_json::to_vec_pretty(&image.config)?,
+            },
+            _ => serde_json::to_vec_pretty(&image.config)?,
+        };
         let config_digest = sha256(&config_bytes);
         pin.add(&[hex_of(&config_digest)?])?;
-        let kept = self.blob_dest(&config_digest)?;
-        if !kept.exists() {
-            let tmp = tempfile::NamedTempFile::new_in(self.dir.join("tmp"))?;
-            std::fs::write(tmp.path(), &config_bytes)?;
-            put_blob(tmp.path(), &kept)?;
-        }
+        self.write_blob(&config_bytes, &self.blob_dest(&config_digest)?)?;
         let mut manifest = Manifest::new(
             Descriptor {
                 media_type: OCI_CONFIG.to_owned(),
@@ -1341,6 +1387,131 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// A store's own directory under `<dir>/tmp`, with a file in it locked
+/// while the store is open, so that stores other processes open on the
+/// same directory leave what it is working on alone.
+struct TempArea {
+    dir: PathBuf,
+    lock: Option<File>,
+}
+
+const AREA_LOCK: &str = ".lock";
+
+impl TempArea {
+    fn new(tmp: &Path) -> Result<TempArea, Error> {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("s{}-", std::process::id()))
+            .tempdir_in(tmp)?
+            .keep();
+        let lock = lock_file(&dir.join(AREA_LOCK))?;
+        Ok(TempArea {
+            dir,
+            lock: Some(lock),
+        })
+    }
+}
+
+impl Drop for TempArea {
+    fn drop(&mut self) {
+        drop(self.lock.take());
+        let _ = remove_unmounted(&self.dir);
+    }
+}
+
+/// Removes what stores no longer open left in `tmp`: areas whose lock is
+/// free, and anything else (older versions worked in `tmp` itself). Layer
+/// clones such a store left mounted in its area are destroyed first;
+/// anything still mounted stays.
+fn clean_tmp(sys: &dyn Sys, mode: &StorageMode, tmp: &Path) {
+    let Ok(listed) = std::fs::read_dir(tmp) else {
+        return;
+    };
+    for e in listed.flatten() {
+        let area = e.path();
+        if held(&area.join(AREA_LOCK)) {
+            continue;
+        }
+        if let (StorageMode::Zfs(layers), Ok(inner)) = (mode, std::fs::read_dir(&area)) {
+            for m in inner.flatten() {
+                if mounted_on(&m.path()) {
+                    let name = m.file_name().to_string_lossy().into_owned();
+                    let _ = sys.zfs_destroy(&clone_name(layers, &area, &name), true);
+                }
+            }
+        }
+        let _ = remove_unmounted(&area);
+    }
+}
+
+/// The dataset of a layer's temporary clone mounted at `<area>/<name>`.
+fn clone_name(layers: &str, area: &Path, name: &str) -> String {
+    let area = area
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("{layers}/tmp-{area}-{name}")
+}
+
+/// Whether an open store holds the lock file at `path`. Without flock,
+/// any is taken to be.
+fn held(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let Ok(file) = File::open(path) else {
+            return false;
+        };
+        // SAFETY: flock on a descriptor we own; released when it closes.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
+    }
+}
+
+/// Whether another file system is mounted on the directory `path`.
+fn mounted_on(path: &Path) -> bool {
+    match (std::fs::symlink_metadata(path), path.parent()) {
+        (Ok(m), Some(parent)) if m.is_dir() => {
+            std::fs::symlink_metadata(parent).is_ok_and(|p| device(&p) != device(&m))
+        }
+        _ => false,
+    }
+}
+
+/// Removes the tree at `path`, except what another file system is mounted
+/// on in it (and so the directories that hold that).
+fn remove_unmounted(path: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    remove_on(path, &meta, device(&meta))
+}
+
+fn remove_on(path: &Path, meta: &std::fs::Metadata, dev: u64) -> std::io::Result<()> {
+    if !meta.is_dir() {
+        return std::fs::remove_file(path);
+    }
+    if device(meta) != dev {
+        return Ok(());
+    }
+    for e in std::fs::read_dir(path)? {
+        let e = e?;
+        let _ = remove_on(&e.path(), &e.metadata()?, dev);
+    }
+    std::fs::remove_dir(path)
+}
+
+#[cfg(unix)]
+fn device(m: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::dev(m)
+}
+
+#[cfg(not(unix))]
+fn device(_: &std::fs::Metadata) -> u64 {
+    0
 }
 
 /// Puts the file `from`, in the store's `tmp`, at the blob path `dest`,

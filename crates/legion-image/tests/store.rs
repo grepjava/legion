@@ -423,6 +423,9 @@ async fn private_images_are_for_those_who_pulled_them() {
     let open = format!("{addr}/team/open:1");
     s.pull(&open, None, "a").await.unwrap();
     assert!(s.usable(&open, "c").unwrap().is_some());
+    // Pulled again with someone's login, it is still anyone's.
+    s.pull(&open, Some(&creds), "b").await.unwrap();
+    assert!(s.usable(&open, "c").unwrap().is_some());
     // The same image under a public name stays private under its own.
     assert_eq!(s.images().unwrap().len(), 1);
     assert!(s.usable(&secret, "c").unwrap().is_none());
@@ -561,4 +564,149 @@ async fn imports_an_oci_layout() {
         let e = s.import(dir.path(), "localhost/built:1").await.unwrap_err();
         assert!(e.to_string().contains("not a plain file"), "{e}");
     }
+}
+
+#[test]
+fn another_store_on_the_directory_leaves_its_work_alone() {
+    let t = tempfile::tempdir().unwrap();
+    let open = || {
+        Store::open_directory(
+            Arc::new(FakeSys::new()) as Arc<dyn Sys>,
+            t.path(),
+            Client::new().unwrap(),
+        )
+        .unwrap()
+    };
+    let tmp = t.path().join("tmp");
+    let daemon = open();
+    let areas = || {
+        let mut a: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        a.sort();
+        a
+    };
+    let [own] = &areas()[..] else {
+        panic!("{:?}", areas())
+    };
+    let own = own.clone();
+    std::fs::write(own.join("pulling"), "half").unwrap();
+    // What a killed store left: an area of its own, and older versions'
+    // work in tmp itself.
+    let dead = tmp.join("s1-dead");
+    std::fs::create_dir(&dead).unwrap();
+    std::fs::write(dead.join(".lock"), "").unwrap();
+    std::fs::write(dead.join("pulling"), "half").unwrap();
+    std::fs::create_dir(tmp.join("pull123")).unwrap();
+
+    let load = open();
+    assert!(own.join("pulling").exists(), "the daemon's pull is left");
+    #[cfg(unix)]
+    {
+        assert!(!dead.exists());
+        assert!(!tmp.join("pull123").exists());
+    }
+    drop(load);
+    assert!(own.join("pulling").exists());
+    drop(daemon);
+    assert!(!own.exists(), "a store's area goes with it");
+}
+
+#[test]
+fn stores_opening_together_keep_each_others_areas() {
+    let t = tempfile::tempdir().unwrap();
+    let n = 8;
+    let barrier = std::sync::Barrier::new(n);
+    std::thread::scope(|scope| {
+        for _ in 0..n {
+            scope.spawn(|| {
+                for _ in 0..10 {
+                    barrier.wait();
+                    let s = Store::open_directory(
+                        Arc::new(FakeSys::new()) as Arc<dyn Sys>,
+                        t.path(),
+                        Client::new().unwrap(),
+                    )
+                    .unwrap();
+                    barrier.wait();
+                    // Every store's area, with its lock, outlived the others'
+                    // opening.
+                    let areas: Vec<_> = std::fs::read_dir(t.path().join("tmp"))
+                        .unwrap()
+                        .map(|e| e.unwrap().file_name())
+                        .collect();
+                    assert_eq!(areas.len(), n, "{areas:?}");
+                    let pin = s.pin().unwrap();
+                    pin.add(&["x"]).unwrap();
+                    barrier.wait();
+                    drop(pin);
+                    drop(s);
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn a_pin_is_made_in_the_stores_area_then_moved_to_pins() {
+    let t = tempfile::tempdir().unwrap();
+    let s = Store::open_directory(
+        Arc::new(FakeSys::new()) as Arc<dyn Sys>,
+        t.path(),
+        Client::new().unwrap(),
+    )
+    .unwrap();
+    let pin = s.pin().unwrap();
+    pin.add(&["abc"]).unwrap();
+    let pins: Vec<_> = std::fs::read_dir(t.path().join("pins"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    let [p] = &pins[..] else { panic!("{pins:?}") };
+    assert_eq!(std::fs::read_to_string(p).unwrap(), "abc\n");
+    let [area] = &std::fs::read_dir(t.path().join("tmp"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!()
+    };
+    let left: Vec<_> = std::fs::read_dir(area)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left, [".lock"]);
+    drop(pin);
+    assert!(
+        std::fs::read_dir(t.path().join("pins"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn an_export_keeps_the_config_as_pulled() {
+    let base = layer(&[("etc/base", "b")]);
+    let registry = Arc::new(Mutex::new(Registry::default()));
+    registry
+        .lock()
+        .unwrap()
+        .image("team/app", "1", "freebsd", std::slice::from_ref(&base));
+    let addr = serve(registry).await;
+    let t = tempfile::tempdir().unwrap();
+    let sys = Arc::new(FakeSys::new());
+    let s = store(&sys, &t.path().join("a"), &addr).keep_blobs();
+    let pulled = s
+        .pull(&format!("{addr}/team/app:1"), None, "a")
+        .await
+        .unwrap();
+    let out = t.path().join("app.tar");
+    s.export(&pulled.id, &out, Some("app:1")).await.unwrap();
+    // The registry's config is compact JSON: written again from the parsed
+    // config it would be another image.
+    let other = store(&sys, &t.path().join("b"), &addr).keep_blobs();
+    let loaded = other.load(&out, None).await.unwrap();
+    assert_eq!(loaded.id, pulled.id);
 }

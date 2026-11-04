@@ -13,6 +13,9 @@ use sha2::{Digest, Sha256};
 use crate::Error;
 
 const WHITEOUT: &str = ".wh.";
+/// The most a layer may hold uncompressed, so a small blob cannot fill the
+/// disk before its digest is checked.
+pub const MAX_LAYER: u64 = 64 << 30;
 const OPAQUE: &str = ".wh..wh..opq";
 
 /// A layer packed and compressed for a manifest.
@@ -27,13 +30,18 @@ pub struct LayerArtifact {
 }
 
 /// Decompresses `blob` (gzip, zstd or plain tar, told by its first bytes)
-/// into `tar`, checking the result against `diff_id`.
+/// into `tar`, checking the result against `diff_id`; refused past
+/// [`MAX_LAYER`].
 pub fn decompress(blob: &Path, diff_id: &str, tar: &Path) -> Result<(), Error> {
+    decompress_at_most(blob, diff_id, tar, MAX_LAYER)
+}
+
+fn decompress_at_most(blob: &Path, diff_id: &str, tar: &Path, max: u64) -> Result<(), Error> {
     let mut input = BufReader::new(File::open(blob)?);
     let mut magic = [0u8; 4];
     let n = read_full(&mut input, &mut magic)?;
     let head = std::io::Cursor::new(magic[..n].to_vec()).chain(input);
-    let mut reader: Box<dyn Read> = match magic {
+    let reader: Box<dyn Read> = match magic {
         [0x1f, 0x8b, ..] => Box::new(flate2::read::MultiGzDecoder::new(head)),
         [0x28, 0xb5, 0x2f, 0xfd] => Box::new(
             ruzstd::decoding::StreamingDecoder::new(head)
@@ -41,6 +49,7 @@ pub fn decompress(blob: &Path, diff_id: &str, tar: &Path) -> Result<(), Error> {
         ),
         _ => Box::new(head),
     };
+    let mut reader = reader.take(max + 1);
     let mut out = std::io::BufWriter::new(File::create(tar)?);
     let mut hash = Sha256::new();
     let mut buf = vec![0u8; 1 << 16];
@@ -48,6 +57,12 @@ pub fn decompress(blob: &Path, diff_id: &str, tar: &Path) -> Result<(), Error> {
         let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
+        }
+        if reader.limit() == 0 {
+            return Err(Error::Unsupported(format!(
+                "a layer of more than {} GiB uncompressed",
+                max >> 30
+            )));
         }
         hash.update(&buf[..n]);
         out.write_all(&buf[..n])?;
@@ -111,12 +126,12 @@ pub fn whiteouts(tar: &Path) -> Result<Vec<Whiteout>, Error> {
 
 /// `rel` under `root`, or `None` if it reaches outside it or through a
 /// symlink (which a lower layer's directory cannot be, so there is nothing
-/// of it to remove).
+/// of it to remove). A leading `/` is the root, as bsdtar takes it.
 fn inside(root: &Path, rel: &Path) -> Result<Option<PathBuf>, Error> {
     let mut path = root.to_path_buf();
     let mut parts = rel
         .components()
-        .filter(|c| *c != Component::CurDir)
+        .filter(|c| !matches!(c, Component::CurDir | Component::RootDir))
         .peekable();
     while let Some(c) = parts.next() {
         let Component::Normal(name) = c else {
@@ -142,7 +157,10 @@ pub fn apply_whiteouts(root: &Path, whiteouts: &[Whiteout]) -> Result<(), Error>
         match w {
             Whiteout::Remove(rel) => {
                 if let Some(p) = inside(root, rel)? {
-                    remove_tree(&p)?;
+                    match p.parent() {
+                        Some(parent) => unflagged(parent, || remove_tree(&p))?,
+                        None => remove_tree(&p)?,
+                    }
                 }
             }
             Whiteout::Opaque(rel) => {
@@ -150,11 +168,12 @@ pub fn apply_whiteouts(root: &Path, whiteouts: &[Whiteout]) -> Result<(), Error>
                     continue;
                 };
                 match std::fs::symlink_metadata(&dir) {
-                    Ok(m) if m.is_dir() => {
+                    Ok(m) if m.is_dir() => unflagged(&dir, || {
                         for e in std::fs::read_dir(&dir)? {
                             remove_tree(&e?.path())?;
                         }
-                    }
+                        Ok(())
+                    })?,
                     _ => {}
                 }
             }
@@ -180,6 +199,48 @@ pub fn remove_tree(path: &Path) -> Result<(), Error> {
     } else {
         std::fs::remove_file(path)?;
     }
+    Ok(())
+}
+
+/// Runs `f` with the directory `dir`'s file flags cleared (an immutable
+/// directory refuses unlinking what it holds), and sets them again after.
+#[cfg(target_os = "freebsd")]
+fn unflagged(dir: &Path, f: impl FnOnce() -> Result<(), Error>) -> Result<(), Error> {
+    use std::os::freebsd::fs::MetadataExt;
+    let flags = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m.st_flags(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return f(),
+        Err(e) => return Err(e.into()),
+    };
+    if flags == 0 {
+        return f();
+    }
+    set_flags(dir, 0)?;
+    let out = f();
+    set_flags(dir, flags.into())?;
+    out
+}
+
+#[cfg(not(target_os = "freebsd"))]
+fn unflagged(_: &Path, f: impl FnOnce() -> Result<(), Error>) -> Result<(), Error> {
+    f()
+}
+
+#[cfg(target_os = "freebsd")]
+fn set_flags(path: &Path, flags: libc::c_ulong) -> Result<(), Error> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| Error::Unsupported(format!("a NUL in {}", path.display())))?;
+    // SAFETY: `c` is a valid NUL-terminated path; lchflags does not follow
+    // a final symlink.
+    if unsafe { libc::lchflags(c.as_ptr(), flags) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "freebsd"))]
+fn set_flags(_: &Path, _: u64) -> Result<(), Error> {
     Ok(())
 }
 
@@ -239,7 +300,68 @@ fn extract_command(tar: &Path, root: &Path) -> Command {
 /// Applies an uncompressed layer to `root`.
 pub fn apply(tar: &Path, root: &Path) -> Result<(), Error> {
     apply_whiteouts(root, &whiteouts(tar)?)?;
-    extract(tar, root)
+    // bsdtar can neither write into a directory with file flags (`schg`)
+    // that a lower layer made nor restore its times, so their flags are
+    // cleared first. A directory the layer lists takes the layer's flags;
+    // one it only writes into gets its own back.
+    let flagged = flagged_dirs(tar, root)?;
+    for (dir, _, _) in &flagged {
+        set_flags(dir, 0)?;
+    }
+    let out = extract(tar, root);
+    for (dir, flags, listed) in &flagged {
+        if !listed || out.is_err() {
+            set_flags(dir, *flags)?;
+        }
+    }
+    out
+}
+
+/// The directories under `root` with file flags that the layer `tar`
+/// lists or writes into: each with its flags and whether it is listed.
+#[cfg(target_os = "freebsd")]
+fn flagged_dirs(tar: &Path, root: &Path) -> Result<Vec<(PathBuf, libc::c_ulong, bool)>, Error> {
+    use std::collections::BTreeMap;
+    use std::os::freebsd::fs::MetadataExt;
+    let mut found: BTreeMap<PathBuf, (libc::c_ulong, bool)> = BTreeMap::new();
+    let mut archive = tar::Archive::new(BufReader::new(File::open(tar)?));
+    for entry in archive.entries()? {
+        let entry = entry?;
+        let is_dir = entry.header().entry_type().is_dir();
+        let rel = entry.path()?.into_owned();
+        let parts: Vec<_> = rel
+            .components()
+            .filter(|c| !matches!(c, Component::CurDir | Component::RootDir))
+            .collect();
+        let mut path = root.to_path_buf();
+        for (i, c) in parts.iter().enumerate() {
+            let Component::Normal(name) = c else {
+                break;
+            };
+            path.push(name);
+            let last = i + 1 == parts.len();
+            if last && !is_dir {
+                break;
+            }
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.is_dir() => {
+                    if m.st_flags() != 0 {
+                        let e = found
+                            .entry(path.clone())
+                            .or_insert((m.st_flags().into(), false));
+                        e.1 |= last;
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
+    Ok(found.into_iter().map(|(p, (f, l))| (p, f, l)).collect())
+}
+
+#[cfg(not(target_os = "freebsd"))]
+fn flagged_dirs(_: &Path, _: &Path) -> Result<Vec<(PathBuf, u64, bool)>, Error> {
+    Ok(Vec::new())
 }
 
 /// Archives the tree at `root` into `tar` with bsdtar, keeping owners as
@@ -481,6 +603,45 @@ mod tests {
         assert!(!has("nothing"));
         let names: Vec<_> = walk(&root);
         assert!(names.iter().all(|n| !n.contains(".wh.")), "{names:?}");
+    }
+
+    #[test]
+    fn a_layer_too_big_uncompressed_is_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let tar = layer(t.path(), "l.tar", &[("a", &"x".repeat(8192))]);
+        let id = digest(&tar);
+        let out = t.path().join("out.tar");
+        let size = std::fs::metadata(&tar).unwrap().len();
+        decompress_at_most(&gzip(&tar), &id, &out, size).unwrap();
+        let e = decompress_at_most(&gzip(&tar), &id, &out, size - 1).unwrap_err();
+        assert!(matches!(e, Error::Unsupported(_)), "{e}");
+    }
+
+    #[test]
+    fn a_whiteout_from_the_root_is_inside() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let base = layer(t.path(), "base.tar", &[("etc/", ""), ("etc/old", "o")]);
+        apply(&base, &root).unwrap();
+        // The tar crate refuses to write a leading `/`: set the name itself.
+        let top = t.path().join("top.tar");
+        let mut b = tar::Builder::new(File::create(&top).unwrap());
+        let mut h = tar::Header::new_ustar();
+        let name = b"/etc/.wh.old";
+        h.as_old_mut().name[..name.len()].copy_from_slice(name);
+        h.set_mode(0o644);
+        h.set_size(0);
+        h.set_cksum();
+        b.append(&h, std::io::empty()).unwrap();
+        b.finish().unwrap();
+        drop(b);
+        assert_eq!(
+            whiteouts(&top).unwrap(),
+            vec![Whiteout::Remove(PathBuf::from("/etc/old"))]
+        );
+        apply(&top, &root).unwrap();
+        assert!(!root.join("etc/old").exists());
     }
 
     fn walk(dir: &Path) -> Vec<String> {

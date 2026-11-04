@@ -92,8 +92,8 @@ fn digest(b: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(b))
 }
 
-/// An uncompressed layer: files with contents and file flags, and
-/// whiteouts (names starting `.wh.`).
+/// An uncompressed layer: files with contents and file flags, directories
+/// (names ending `/`), and whiteouts (names starting `.wh.`).
 fn layer(files: &[(&str, &str, Option<&str>)]) -> Vec<u8> {
     let mut b = tar::Builder::new(Vec::new());
     for (p, data, flags) in files {
@@ -102,7 +102,12 @@ fn layer(files: &[(&str, &str, Option<&str>)]) -> Vec<u8> {
                 .unwrap();
         }
         let mut h = tar::Header::new_ustar();
-        h.set_mode(0o644);
+        if p.ends_with('/') {
+            h.set_entry_type(tar::EntryType::Directory);
+            h.set_mode(0o755);
+        } else {
+            h.set_mode(0o644);
+        }
         h.set_size(data.len() as u64);
         b.append_data(&mut h, p, data.as_bytes()).unwrap();
     }
@@ -125,9 +130,22 @@ async fn whiteouts_and_replacements_of_flagged_files() {
     let lower = layer(&[
         ("etc/gone", "g", Some("schg")),
         ("etc/replaced", "old", Some("schg")),
-        ("etc/kept", "k", Some("uarch")),
+        // Not `uarch`: bsdtar (libarchive 3.8) neither archives nor sets
+        // it, and ZFS sets it on every file it writes anyway.
+        ("etc/kept", "k", Some("nodump")),
+        // Immutable directories: what a whiteout removes from them goes,
+        // and they stay immutable.
+        ("locked/", "", Some("schg")),
+        ("locked/gone", "g", None),
+        ("sealed/", "", Some("schg")),
+        ("sealed/old", "o", None),
     ]);
-    let upper = layer(&[("etc/.wh.gone", "", None), ("etc/replaced", "new", None)]);
+    let upper = layer(&[
+        ("etc/.wh.gone", "", None),
+        ("etc/replaced", "new", None),
+        ("locked/.wh.gone", "", None),
+        ("sealed/.wh..wh..opq", "", None),
+    ]);
     let diff_ids = [digest(&lower), digest(&upper)];
     let cfg = put(
         &serde_json::to_vec(&json!({"os": "freebsd", "rootfs": {"diff_ids": diff_ids}})).unwrap(),
@@ -179,8 +197,16 @@ async fn whiteouts_and_replacements_of_flagged_files() {
     assert!(
         flags
             .lines()
-            .any(|l| l.ends_with("kept") && l.contains("uarch")),
+            .any(|l| l.ends_with("kept") && l.contains("nodump")),
         "{flags}"
+    );
+    assert!(!mnt.join("locked/gone").exists());
+    assert!(!mnt.join("sealed/old").exists());
+    let dirs = sh(&format!("ls -lod {0}/locked {0}/sealed", mnt.display()));
+    assert_eq!(
+        dirs.lines().filter(|l| l.contains("schg")).count(),
+        2,
+        "{dirs}"
     );
     sys.zfs_destroy(&format!("{base}/ctr/c1"), false).unwrap();
     store.remove("localhost/flags:1").await.unwrap();
@@ -202,9 +228,22 @@ fn flagged_layout() -> tempfile::TempDir {
     let lower = layer(&[
         ("etc/gone", "g", Some("schg")),
         ("etc/replaced", "old", Some("schg")),
-        ("etc/kept", "k", Some("uarch")),
+        // Not `uarch`: bsdtar (libarchive 3.8) neither archives nor sets
+        // it, and ZFS sets it on every file it writes anyway.
+        ("etc/kept", "k", Some("nodump")),
+        // Immutable directories: what a whiteout removes from them goes,
+        // and they stay immutable.
+        ("locked/", "", Some("schg")),
+        ("locked/gone", "g", None),
+        ("sealed/", "", Some("schg")),
+        ("sealed/old", "o", None),
     ]);
-    let upper = layer(&[("etc/.wh.gone", "", None), ("etc/replaced", "new", None)]);
+    let upper = layer(&[
+        ("etc/.wh.gone", "", None),
+        ("etc/replaced", "new", None),
+        ("locked/.wh.gone", "", None),
+        ("sealed/.wh..wh..opq", "", None),
+    ]);
     let diff_ids = [digest(&lower), digest(&upper)];
     let cfg = put(
         &serde_json::to_vec(&json!({"os": "freebsd", "rootfs": {"diff_ids": diff_ids}})).unwrap(),
@@ -256,7 +295,7 @@ async fn rootfs_copies_built_layers_and_exports_on_zfs() {
         assert!(
             flags
                 .lines()
-                .any(|l| l.ends_with("kept") && l.contains("uarch")),
+                .any(|l| l.ends_with("kept") && l.contains("nodump")),
             "{flags}"
         );
     };

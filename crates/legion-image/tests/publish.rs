@@ -450,11 +450,13 @@ async fn what_a_push_reads_stays_while_it_runs() {
         .await
         .unwrap();
     assert_eq!(blobs(plain.dir()), packed);
-    assert_eq!(
-        std::fs::read_dir(plain.dir().join("tmp")).unwrap().count(),
-        0,
-        "nothing left in the store's tmp"
-    );
+    let left: Vec<_> = std::fs::read_dir(plain.dir().join("tmp"))
+        .unwrap()
+        .flat_map(|area| std::fs::read_dir(area.unwrap().path()).unwrap())
+        .map(|e| e.unwrap().file_name())
+        .filter(|n| n != ".lock")
+        .collect();
+    assert!(left.is_empty(), "nothing left in the store's tmp: {left:?}");
 }
 
 #[tokio::test]
