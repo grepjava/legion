@@ -869,6 +869,62 @@ fn no_replacement_when_the_policy_says_none() {
     assert!(w.wake().is_none());
 }
 
+/// A task that completed under a policy that keeps it so still runs a new
+/// pod: an update is not a restart.
+#[test]
+fn an_update_reaches_a_slot_whose_task_completed() {
+    for condition in ["on-failure", "none"] {
+        let mut w = World::new();
+        w.node("n1", &[]);
+        let spec = |image: &str| {
+            format!(
+                "replicas: 2\npod: {{ containers: [{{ name: web, image: \"{image}\" }}], restartPolicy: {{ condition: {condition}, delay: 0s }} }}"
+            )
+        };
+        w.service("web", &spec("web:1"));
+        w.settle();
+        w.end("web-1-1", TaskState::Complete);
+        w.settle();
+        assert_eq!(
+            w.images("web"),
+            ["web:1"],
+            "{condition}: completed stays so"
+        );
+
+        w.service("web", &spec("web:2"));
+        w.now += Duration::from_secs(60);
+        w.settle();
+        w.now += Duration::from_secs(60);
+        w.settle();
+        assert_eq!(w.images("web"), ["web:2", "web:2"], "{condition}");
+    }
+}
+
+/// A new task that failed for good under `none` is not under way: with
+/// `failureAction: continue` the update goes on to the other slots.
+#[test]
+fn a_new_task_failed_for_good_does_not_hold_the_update() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    let spec = |image: &str| {
+        format!(
+            "replicas: 2\npod: {{ containers: [{{ name: web, image: \"{image}\" }}], restartPolicy: {{ condition: none }} }}\nupdate: {{ failureAction: continue, delay: 10s }}"
+        )
+    };
+    w.service("web", &spec("web:1"));
+    w.settle();
+    w.service("web", &spec("web:2"));
+    w.settle();
+    assert_eq!(w.images("web"), ["web:1", "web:2"], "one slot at a time");
+    let new = w.running_with("web", "web:2");
+    w.fail(&new);
+    for _ in 0..3 {
+        w.now += Duration::from_secs(60);
+        w.settle();
+    }
+    assert_eq!(w.images("web"), ["web:2"], "the other slot updated");
+}
+
 #[test]
 fn rolling_update_stop_first() {
     let mut w = World::new();
@@ -1412,6 +1468,57 @@ fn deleting_a_service_removes_its_tasks() {
     assert!(w.tasks.is_empty());
 }
 
+/// A service deleted and created again while its old tasks still stop
+/// waits for them: their names stay taken, and a stateful one's data is
+/// theirs until they let go.
+#[test]
+fn a_service_created_again_waits_for_its_old_tasks() {
+    for spec in [
+        STATEFUL.replace("replicas: 3", "replicas: 1"),
+        format!("replicas: 1\n{POD}"),
+    ] {
+        let mut w = World::new();
+        w.node("n1", &[]);
+        w.service("db", &spec);
+        w.settle();
+        let old = w.running();
+        assert_eq!(old.len(), 1);
+        w.agents = false;
+        w.delete_service("db");
+        w.settle();
+        w.service("db", &spec);
+        w.settle();
+        assert_eq!(w.tasks(), [format!("{} running n1", old[0])], "{spec}");
+        w.agents = true;
+        w.settle();
+        let new = w.running();
+        assert_eq!(new.len(), 1, "{:?}", w.tasks());
+        assert_ne!(new, old, "a name of its own");
+        let uid = &w.services[0].object.metadata.uid;
+        assert!(w.tasks.iter().all(|t| &t.spec.service_uid == uid));
+    }
+}
+
+/// A Service and a Job of one name share no task names, and spread
+/// without counting each other's tasks.
+#[test]
+fn a_service_and_a_job_of_one_name_keep_apart() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.job("web", &job(""));
+    w.settle();
+    assert_eq!(w.tasks(), ["web-1-1 running n1"]);
+    // The Job's task on n1 is no task of the service's there.
+    w.service("web", &format!("replicas: 1\n{POD}"));
+    w.settle();
+    assert_eq!(
+        w.tasks(),
+        ["web-1-1 running n1", "web-1-2 running n1"],
+        "a name of its own, and placed as if alone"
+    );
+}
+
 #[test]
 fn unscheduled_tasks_stop_without_an_agent() {
     let mut w = World::new();
@@ -1942,6 +2049,38 @@ fn a_global_job_runs_once_per_node() {
     assert!(w.running().is_empty());
 }
 
+/// A drained node leaves a global Job's nodes, whether or not its task
+/// there failed before: the Job ends with the others.
+#[test]
+fn a_global_job_leaves_a_drained_node_whatever_its_history() {
+    for failed_first in [false, true] {
+        let mut w = World::new();
+        w.node("n1", &[]);
+        w.node("n2", &[]);
+        w.job("scan", &job("mode: global"));
+        w.settle();
+        let mut on_n1 = "scan-n1-1";
+        if failed_first {
+            w.fail("scan-n1-1");
+            w.settle();
+            w.advance(60);
+            w.settle();
+            on_n1 = "scan-n1-2";
+        }
+        assert!(w.running().contains(&on_n1.to_owned()), "{:?}", w.tasks());
+        w.availability("n1", Availability::Drain);
+        w.settle();
+        w.end("scan-n2-1", TaskState::Complete);
+        w.settle();
+        let st = w.job_status("scan");
+        assert_eq!(
+            (st.state.as_str(), st.succeeded),
+            ("complete", 1),
+            "failed first: {failed_first}"
+        );
+    }
+}
+
 #[test]
 fn a_drained_node_moves_a_job_task_without_a_failure() {
     let mut w = World::new();
@@ -1995,6 +2134,41 @@ fn a_job_task_lets_its_data_move_without_a_failure() {
     assert_eq!(w.tasks(), ["backup-1-1 running n1"]);
     // Moved: the task runs on while the data is copied, then makes way,
     // and its next runs where the data went.
+    w.ask("scratch", Some("n2"));
+    w.settle();
+    assert_eq!(w.tasks(), ["backup-1-1 running n1"]);
+    for _ in 0..2 {
+        w.migrate();
+        w.settle();
+    }
+    assert_eq!(w.volume_node("scratch"), "n2");
+    assert_eq!(
+        w.tasks(),
+        ["backup-1-1 shutdown n1", "backup-1-2 running n2"]
+    );
+    assert_eq!(w.job_status("backup").failed, 0);
+}
+
+/// A drain stops a job task bound to data on its node only once the data
+/// has been copied away, as it does a service's.
+#[test]
+fn a_drained_job_task_waits_for_its_data_to_be_copied() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.volume("scratch", "");
+    w.ask("scratch", Some("n1"));
+    w.job(
+        "backup",
+        "pod: { containers: [{ name: dump, image: \"tools:1\" }], volumes: [{ name: s, volume: { name: scratch } }] }",
+    );
+    w.settle();
+    assert_eq!(w.tasks(), ["backup-1-1 running n1"]);
+    // Its data stays on n1: nowhere else could run it.
+    w.availability("n1", Availability::Drain);
+    w.settle();
+    assert_eq!(w.tasks(), ["backup-1-1 running n1"]);
+    // Moved: it runs on while the data is copied, then makes way.
     w.ask("scratch", Some("n2"));
     w.settle();
     assert_eq!(w.tasks(), ["backup-1-1 running n1"]);
@@ -2918,6 +3092,43 @@ fn autoscale_admission() {
     }
 }
 
+/// Mid-update, tasks of the old pod that requested no memory are not
+/// counted against what the new pod requests.
+#[test]
+fn autoscaling_counts_use_only_against_tasks_requesting_it() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.service(
+        "web",
+        "autoscale: { min: 4, max: 8, memory: 70, downDelay: 60s }
+pod:
+  containers:
+    - { name: web, image: web, resources: { requests: { cpu: 500m, memory: 100Mi } } }",
+    );
+    w.settle();
+    assert_eq!(w.running().len(), 4);
+    // Three still run the old pod, which asked no memory.
+    for t in w.tasks.iter_mut().take(3) {
+        t.spec.pod.containers[0].resources.requests.memory = None;
+        t.object.spec = serde_json::to_value(&t.spec).unwrap();
+    }
+    w.report("web", 10.0, 50 << 20);
+    let p = plan(
+        &w.services,
+        &w.jobs,
+        &w.tasks,
+        &w.nodes,
+        &w.volumes,
+        &w.quotas,
+        &mut w.memory,
+        w.now,
+    );
+    w.apply(p.actions);
+    let a = w.scaled("web");
+    assert_eq!(a.memory, Some(50));
+    assert_eq!(a.replicas, 4);
+}
+
 impl World {
     /// Asks for a Volume's data to be on `node`, as an apply would.
     fn ask(&mut self, volume: &str, node: Option<&str>) {
@@ -3820,4 +4031,87 @@ fn a_global_task_never_placed_on_a_node_that_closes_goes() {
         w.tasks()
     );
     assert_eq!(w.placed("agent"), ["n2"]);
+}
+
+#[test]
+fn stateful_data_leaving_a_draining_node_follows_a_new_ask() {
+    use legion_api::volume::MigrationPhase::*;
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.node("n3", &[]);
+    w.service("db", &STATEFUL.replace("replicas: 3", "replicas: 1"));
+    w.settle();
+    let from = w.placed_task("db-0-1").spec.node.clone();
+    w.availability(&from, Availability::Drain);
+    w.settle();
+    let (chosen, _) = w.migration("data-db-0").unwrap();
+    let other = ["n1", "n2", "n3"]
+        .into_iter()
+        .find(|n| *n != from && *n != chosen)
+        .unwrap();
+    // The drain chose a node; asked for another that can take it, the
+    // Volume goes there instead.
+    w.ask("data-db-0", Some(other));
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some((other.to_owned(), Copying)));
+}
+
+#[test]
+fn stateful_data_goes_only_where_its_task_may_run() {
+    use legion_api::volume::MigrationPhase::*;
+    let mut w = World::new();
+    w.node("n1", &[("disk", "ssd")]);
+    w.node("n2", &[]);
+    w.node("n3", &[("disk", "ssd")]);
+    w.availability("n3", Availability::Pause);
+    let spec = format!(
+        "{}\nplacement: {{ constraints: [\"node.labels.disk == ssd\"] }}",
+        STATEFUL.replace("replicas: 3", "replicas: 1")
+    );
+    w.service("db", &spec);
+    w.settle();
+    assert_eq!(w.placed("db"), ["n1"]);
+    // Asked onto a node its constraints keep it off: nothing moves.
+    w.ask("data-db-0", Some("n2"));
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), None);
+    assert_eq!(w.placed("db"), ["n1"]);
+    // Moving to one that then takes no new tasks: the copy is dropped.
+    w.availability("n3", Availability::Active);
+    w.ask("data-db-0", Some("n3"));
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some(("n3".to_owned(), Copying)));
+    w.taint("n3", "full", TaintEffect::NoSchedule);
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), None);
+    assert_eq!(w.volume_node("data-db-0"), "n1");
+    assert_eq!(w.placed("db"), ["n1"]);
+}
+
+#[test]
+fn a_move_whose_old_node_is_removed_keeps_the_copy() {
+    use legion_api::volume::MigrationPhase::*;
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.service("db", &STATEFUL.replace("replicas: 3", "replicas: 1"));
+    w.settle();
+    let from = w.placed_task("db-0-1").spec.node.clone();
+    let to = if from == "n1" { "n2" } else { "n1" };
+    w.ask("data-db-0", Some(to));
+    w.settle();
+    w.migrate();
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some((to.to_owned(), Finishing)));
+    // Down, it may come back with the latest data: the move waits.
+    w.state(&from, NodeState::Down);
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some((to.to_owned(), Finishing)));
+    // Removed, its data went with it: the full copy is the Volume.
+    w.nodes.retain(|n| n.object.metadata.name != from);
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), None);
+    assert_eq!(w.volume_node("data-db-0"), to);
+    assert_eq!(w.placed("db"), [to]);
 }

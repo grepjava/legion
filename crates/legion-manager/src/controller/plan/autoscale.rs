@@ -64,31 +64,48 @@ pub(super) fn replicas(
     if measured.is_empty() {
         status.message = "no use reported for the service's ready tasks".into();
     } else {
-        // Both in thousandths: of a CPU, and of a byte.
-        let (mut cpu, mut cpu_requested, mut mem, mut mem_requested) = (0.0, 0.0, 0.0, 0.0);
-        for (t, u) in &measured {
-            cpu += u.cpu * 10.0;
-            mem += u.memory as f64;
-            for c in &t.spec.pod.containers {
-                let r = &c.resources.requests;
-                cpu_requested += r.cpu.map_or(0, |c| c.millis()) as f64;
-                mem_requested += r.memory.map_or(0, |m| m.0) as f64;
-            }
-        }
+        // Both in thousandths: of a CPU, and of a byte. Each target counts
+        // the tasks whose pod requests that resource: one that does not
+        // (the old pod, during an update that adds the request) counts as
+        // one without a report.
+        let request = |t: &Task, cpu: bool| -> f64 {
+            t.spec
+                .pod
+                .containers
+                .iter()
+                .map(|c| {
+                    let r = &c.resources.requests;
+                    if cpu {
+                        r.cpu.map_or(0, |c| c.millis()) as f64
+                    } else {
+                        r.memory.map_or(0, |m| m.0) as f64
+                    }
+                })
+                .sum()
+        };
         let mut wanted = Vec::new();
-        for (target, used, requested, out) in [
-            (a.cpu, cpu, cpu_requested, &mut status.cpu),
-            (a.memory, mem, mem_requested, &mut status.memory),
+        for (target, cpu, out) in [
+            (a.cpu, true, &mut status.cpu),
+            (a.memory, false, &mut status.memory),
         ] {
             let Some(target) = target else { continue };
+            let (mut used, mut requested, mut n) = (0.0, 0.0, 0usize);
+            for (t, u) in &measured {
+                let r = request(t, cpu);
+                if r > 0.0 {
+                    used += if cpu { u.cpu * 10.0 } else { u.memory as f64 };
+                    requested += r;
+                    n += 1;
+                }
+            }
             if requested <= 0.0 {
                 continue;
             }
             let percent = 100.0 * used / requested;
             *out = Some(percent.round() as u32);
             let ratio = percent / f64::from(target);
-            let n = measured.len() as f64;
-            let missing = (ready.len() - measured.len()) as f64;
+            let missing = (ready.len() - n) as f64;
+            let n = n as f64;
             wanted.push(if (ratio - 1.0).abs() <= TOLERANCE {
                 current
             } else if ratio > 1.0 {

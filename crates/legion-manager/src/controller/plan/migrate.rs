@@ -6,11 +6,13 @@
 //! migration is `finishing`: the migrator sends what changed and hands the
 //! Volume to the new node, where the slot's next task goes.
 //!
-//! A migration whose new node is no longer ready and active, or now evicts
-//! the stateful service's tasks, is dropped, and so is one not yet
-//! finishing that nothing calls for any more;
+//! A migration whose new node is no longer ready and active, or for a
+//! stateful service's Volume one its tasks may not run on, is dropped, and
+//! so is one not yet finishing that nothing calls for any more;
 //! the next pass starts another if one is still needed. What the dropped
-//! one's new node received is left over, for the migrator to drop.
+//! one's new node received is left over, for the migrator to drop. One
+//! whose old node is removed after the full copy ends there: that copy is
+//! the Volume. One whose old node is down waits for it.
 
 use std::collections::BTreeMap;
 
@@ -49,10 +51,17 @@ pub(super) fn migrations(
                 && v.object.metadata.labels.get(LABEL_SERVICE) == Some(&s.object.metadata.name)
         })
     };
-    // A node a Volume may go to: ready and active, and not one its
-    // stateful service's tasks must leave, which it would only leave again.
-    let usable_for =
-        |v: &Volume, to: &str| usable(to) && !stateful(v).is_some_and(|s| leaves(s, to));
+    // A node a stateful service's ordinal may live on: one its tasks may
+    // run on, by the node alone (where its other data is aside).
+    let holds =
+        |s: &Service, to: &str| node(to).is_some_and(|n| eligible(n, s, volumes, &[]).is_ok());
+    // A node a Volume may go to: ready and active, and for a stateful
+    // service's, one its tasks may run on. Data moved where its task cannot
+    // follow would only stop it, or leave again.
+    let usable_for = |v: &Volume, to: &str| match stateful(v) {
+        Some(s) => holds(s, to),
+        None => usable(to),
+    };
     // Requests placed on each node.
     let mut load: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
     for t in tasks.iter().filter(|t| t.placed()) {
@@ -79,14 +88,43 @@ pub(super) fn migrations(
 
     // Advance or drop the migrations under way. One not yet finishing goes
     // when neither the Volume's `node` nor its stateful service leaving its
-    // node calls for it any more: only a stateful Volume leaves a draining
-    // node, so one asked elsewhere follows the ask.
+    // node calls for it any more. An ask for another node that can take
+    // the Volume wins over a drain's choice: the Volume leaves either way.
     for ((namespace, name), v) in volumes {
         let Some(m) = &v.status.migration else {
             continue;
         };
-        let wanted = requested(v) == Some(m.to.as_str())
-            || stateful(v).is_some_and(|s| leaves(s, &v.status.node));
+        // The node it moves from was removed, and its data with it, after
+        // the full copy: that copy is the Volume now. A node down, not
+        // removed, is waited for; it still has the latest data.
+        if matches!(m.phase, MigrationPhase::Copied | MigrationPhase::Finishing)
+            && !v.status.node.is_empty()
+            && node(&v.status.node).is_none()
+            && node(&m.to).is_some()
+        {
+            let mut o = v.object.clone();
+            o.status = serde_json::to_value(VolumeStatus {
+                node: m.to.clone(),
+                dataset: String::new(),
+                migration: None,
+                leftovers: v
+                    .status
+                    .leftovers
+                    .iter()
+                    .filter(|n| **n != m.to)
+                    .cloned()
+                    .collect(),
+            })
+            .expect("serialises");
+            plan.actions
+                .push(Action::Update(o, v.object.metadata.version));
+            continue;
+        }
+        let wanted = match requested(v) {
+            Some(to) if to == m.to => true,
+            Some(to) if usable_for(v, to) => false,
+            _ => stateful(v).is_some_and(|s| leaves(s, &v.status.node)),
+        };
         let next = if !usable_for(v, &m.to) || (m.phase != MigrationPhase::Finishing && !wanted) {
             None
         } else if m.phase == MigrationPhase::Copied
@@ -194,7 +232,7 @@ pub(super) fn migrations(
                 })
             });
             let to = match together {
-                Some(to) if usable(to) && !leaves(s, to) => to,
+                Some(to) if holds(s, to) => to,
                 Some(_) => continue,
                 None => match target(s, from, nodes, volumes, &homes, &load) {
                     Some(to) => to,

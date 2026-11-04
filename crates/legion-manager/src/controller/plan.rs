@@ -245,12 +245,14 @@ pub fn plan(
     let mut created: Vec<Task> = Vec::new();
     for s in services {
         let mine: Vec<&Task> = tasks.iter().filter(|t| s.owns(t)).collect();
+        let before = predecessors(s, tasks);
         let addrs = addresses
             .remove(s.object.metadata.uid.as_str())
             .unwrap_or_default();
         service(
             s,
             &mine,
+            &before,
             nodes,
             volumes,
             memory,
@@ -267,10 +269,12 @@ pub fn plan(
     let mut jobs_after = jobs.jobs.clone();
     for ((j, owner), after) in jobs.jobs.iter().zip(&job_owners).zip(&mut jobs_after) {
         let mine: Vec<&Task> = tasks.iter().filter(|t| owner.owns(t)).collect();
+        let before = predecessors(owner, tasks);
         after.status = jobs::job(
             j,
             owner,
             &mine,
+            &before,
             nodes,
             volumes,
             memory,
@@ -522,10 +526,29 @@ fn addresses(services: &[Service]) -> BTreeMap<&str, Addresses> {
     out
 }
 
+/// Tasks of another owner of `s`'s name (the one `s` replaced, deleted
+/// and created again, or a Job or Service sharing the name) still there. Their names stay taken, and those of `s`'s kind that have
+/// not ended hold their slot: what they mount is still theirs.
+fn predecessors<'a>(s: &Service, tasks: &'a [Task]) -> Vec<&'a Task> {
+    tasks
+        .iter()
+        .filter(|t| t.owner() == s.key() && !s.owns(t))
+        .collect()
+}
+
+/// Whether a predecessor's task (see [`predecessors`]) of the owner's kind
+/// still runs in `slot`, or has yet to stop.
+fn held(before: &[&Task], job: bool, slot: &Slot) -> bool {
+    before
+        .iter()
+        .any(|t| t.spec.job == job && !t.status.state.is_terminal() && slot_of(t) == *slot)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn service(
     s: &Service,
     tasks: &[&Task],
+    before: &[&Task],
     nodes: &[Node],
     volumes: &Volumes,
     memory: &mut Memory,
@@ -685,6 +708,21 @@ fn service(
                 .all(|w| by_slot.get(w).is_some_and(|l| l.iter().any(|t| up(t))))
     };
 
+    // Whether a slot with nothing running gets a task: not once its last
+    // ended for good under the restart policy. One that ran another pod
+    // (an update since, or a rollback) is replaced whatever the policy.
+    let policy = &s.spec.pod.restart_policy;
+    let replaces = |list: &[&Task]| match list.last() {
+        None => true,
+        Some(last) => match last.status.state {
+            TaskState::Complete => policy.condition == RestartCondition::Any || !current_pod(last),
+            TaskState::Shutdown | TaskState::Orphaned => true,
+            _ => {
+                last.failed() && (policy.condition != RestartCondition::None || !current_pod(last))
+            }
+        },
+    };
+
     let parallelism = match s.spec.update.parallelism {
         0 => usize::MAX,
         n => n as usize,
@@ -697,9 +735,11 @@ fn service(
         // Between an old task stopping and its replacement starting, or a
         // new one failing and its retry, nothing runs in the slot. A
         // stateful slot that waits for a lower ordinal is not under way:
-        // the lower one gets the budget.
+        // the lower one gets the budget, and one whose last task ended for
+        // good is not under way either.
         let gap = !list.iter().any(|t| t.active())
             && list.last().is_some_and(|t| !current_pod(t) || t.failed())
+            && replaces(list)
             && ready_below(slot);
         if gap || list.iter().any(|t| t.stopping()) {
             in_flight += 1;
@@ -740,7 +780,9 @@ fn service(
         Some(VolumeSnapshot { name, restore })
     });
     let new_task = |slot: &Slot, list: &[&Task]| {
-        let mut t = new_task(s, slot, list, &previous.last_tasks);
+        let mut history = list.to_vec();
+        history.extend(before.iter().filter(|t| slot_of(t) == *slot));
+        let mut t = new_task(s, slot, &history, &previous.last_tasks);
         if step.is_some() {
             t.spec.snapshot = step.clone();
             t.object.spec = serde_json::to_value(&t.spec).expect("spec serialises");
@@ -748,7 +790,6 @@ fn service(
         t
     };
 
-    let policy = &s.spec.pod.restart_policy;
     for slot in order {
         let list: &[&Task] = by_slot.get(slot).map_or(&[], Vec::as_slice);
         let (moving, staying): (Vec<&Task>, Vec<&Task>) = list
@@ -854,25 +895,13 @@ fn service(
                     created.push(new_task(slot, list));
                 }
             }
-        } else if list.iter().any(|t| t.stopping()) {
-            // Wait for the stopping task (stop-first update, drain) to end.
+        } else if list.iter().any(|t| t.stopping()) || held(before, false, slot) {
+            // Wait for the stopping task (stop-first update, drain, or one
+            // of the service this one replaced) to end.
         } else {
             // Nothing runs in the slot: start a task, unless the last one
-            // ended for good or the next try is not due yet. One that failed
-            // running another pod (an update rolled back) is replaced
-            // whatever the restart policy.
-            let replace = match list.last() {
-                None => true,
-                Some(last) => match last.status.state {
-                    TaskState::Complete => policy.condition == RestartCondition::Any,
-                    TaskState::Shutdown | TaskState::Orphaned => true,
-                    _ => {
-                        last.failed()
-                            && (policy.condition != RestartCondition::None || !current_pod(last))
-                    }
-                },
-            };
-            if replace && ready_below(slot) {
+            // ended for good or the next try is not due yet.
+            if replaces(list) && ready_below(slot) {
                 let failures = list.iter().rev().take_while(|t| t.failed()).count();
                 let due = list.last().map_or(now, |last| {
                     backoff(last, failures, policy.delay.as_std(), memory, now)
@@ -1363,12 +1392,13 @@ fn group<'a>(n: &'a Node, keys: &[&str]) -> Vec<Option<&'a String>> {
         .collect()
 }
 
-/// Requests placed on a node, and its tasks per service.
+/// Requests placed on a node, and its tasks per owner (Service or Job, by
+/// uid: one of each may share a name).
 #[derive(Debug, Default, Clone)]
 struct Load {
     cpu: u64,
     memory: u64,
-    per_service: BTreeMap<(String, String), u32>,
+    per_service: BTreeMap<String, u32>,
 }
 
 impl Load {
@@ -1376,10 +1406,9 @@ impl Load {
         let r = t.spec.pod.requests();
         self.cpu = self.cpu.saturating_add(r.cpu.0);
         self.memory = self.memory.saturating_add(r.memory.0);
-        let (ns, svc) = t.owner();
         *self
             .per_service
-            .entry((ns.to_owned(), svc.to_owned()))
+            .entry(t.spec.service_uid.clone())
             .or_default() += 1;
     }
 }
@@ -1494,10 +1523,10 @@ fn schedule(
         let unasked = quotas
             .get(&namespace)
             .and_then(|q| unrequested(q, &t.spec.pod));
-        let owner = (s.key().0.to_owned(), s.key().1.to_owned());
+        let owner = &s.object.metadata.uid;
         let on = |node: &str| {
             load.get(node)
-                .and_then(|l| l.per_service.get(&owner))
+                .and_then(|l| l.per_service.get(owner))
                 .copied()
                 .unwrap_or(0)
         };

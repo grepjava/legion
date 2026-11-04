@@ -92,6 +92,7 @@ pub(super) fn job(
     j: &Job,
     owner: &Service,
     tasks: &[&Task],
+    before: &[&Task],
     nodes: &[Node],
     volumes: &Volumes,
     memory: &Memory,
@@ -207,7 +208,7 @@ pub(super) fn job(
         }
     } else {
         start(
-            j, owner, &wanted, &by_slot, nodes, volumes, memory, now, plan, created,
+            j, owner, &wanted, &by_slot, before, nodes, volumes, memory, now, plan, created,
         );
     }
 
@@ -251,6 +252,7 @@ fn start(
     owner: &Service,
     wanted: &[Slot],
     by_slot: &BTreeMap<Slot, Vec<&Task>>,
+    before: &[&Task],
     nodes: &[Node],
     volumes: &Volumes,
     memory: &Memory,
@@ -262,12 +264,21 @@ fn start(
     let mut active = 0usize;
     for (slot, list) in by_slot {
         for t in list.iter().filter(|t| t.active()) {
-            let leaving = nodes.iter().any(|n| {
-                n.name() == t.spec.node
-                    && (n.spec.availability == Availability::Drain
-                        || n.repels(owner, TaintEffect::NoExecute))
-            }) || (super::migrate::leaving(t, volumes)
-                && super::migrate::copied(t, volumes));
+            let on_node =
+                |f: &dyn Fn(&Node) -> bool| nodes.iter().any(|n| n.name() == t.spec.node && f(n));
+            // As a service's: one bound to data on its node (moving off it,
+            // or staying there) leaves a draining node only once the data
+            // has been copied to where it goes; its replacement could run
+            // nowhere else before.
+            let bound = super::migrate::leaving(t, volumes)
+                || t.spec.volumes().iter().any(|v| {
+                    super::home(volumes, &t.object.metadata.namespace, v)
+                        == Some(t.spec.node.as_str())
+                });
+            let moves = on_node(&|n| n.spec.availability == Availability::Drain)
+                || super::migrate::leaving(t, volumes);
+            let leaving = on_node(&|n| n.repels(owner, TaintEffect::NoExecute))
+                || (moves && (!bound || super::migrate::copied(t, volumes)));
             if leaving || !wanted_set.contains(slot) {
                 plan.actions.push(stop(t));
             }
@@ -297,7 +308,8 @@ fn start(
         let busy = list
             .iter()
             .any(|t| !t.status.state.is_terminal() || t.status.state == TaskState::Complete);
-        if busy {
+        // A task of the Job this one replaced still holds the slot.
+        if busy || super::held(before, true, slot) {
             continue;
         }
         let failures = list.iter().rev().take_while(|t| t.failed()).count();
@@ -309,7 +321,9 @@ fn start(
             continue;
         }
         budget -= 1;
-        let mut t = super::new_task(owner, slot, list, &j.status.last_tasks);
+        let mut history = list.to_vec();
+        history.extend(before.iter().filter(|t| super::slot_of(t) == *slot));
+        let mut t = super::new_task(owner, slot, &history, &j.status.last_tasks);
         t.spec.job = true;
         let labels = &mut t.object.metadata.labels;
         labels.remove(super::LABEL_SERVICE);
