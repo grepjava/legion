@@ -109,9 +109,9 @@ impl Running {
         admin: Option<ClientTlsConfig>,
     ) -> Running {
         let raft = openraft::Config {
-            heartbeat_interval: 50,
-            election_timeout_min: 200,
-            election_timeout_max: 400,
+            heartbeat_interval: 200,
+            election_timeout_min: 1500,
+            election_timeout_max: 3000,
             ..default_raft_config()
         };
         Running::serve_with(dir, listener, tls, admin, raft).await
