@@ -9,6 +9,9 @@
 //! jail -r lsys
 //! ```
 //!
+//! `carp_virtual_hosts` runs in one too, with `carp` loaded on the host
+//! first, as a jail may not load it.
+//!
 //! `rctl_on_child_jail` and `jail_memory` run on the host (rctl is not
 //! available in jails); they only touch jails they create. `zfs_datasets` runs when
 //! `LEGION_SYS_ZFS_ROOT` names a dataset it may create children under.
@@ -16,7 +19,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::Command;
 
-use legion_sys::{Destination, IfConfig, Ipv4Net, RctlRule, Resource, Shell, Sys};
+use legion_sys::{Carp, CarpState, Destination, IfConfig, Ipv4Net, RctlRule, Resource, Shell, Sys};
 
 fn sh(cmd: &str) -> String {
     let out = Command::new("/bin/sh").args(["-c", cmd]).output().unwrap();
@@ -191,6 +194,68 @@ fn network_and_pf() {
     );
     sys.interface_destroy("lsys0").unwrap();
     assert!(sys.interface_destroy("lsys0").is_err());
+}
+
+/// A virtual host's address replaced, moved and removed on a real
+/// interface: nothing of the old one stays, in the address or the host.
+#[test]
+#[ignore = "needs root inside a throwaway VNET jail, carp loaded"]
+fn carp_virtual_hosts() {
+    assert!(
+        jailed(),
+        "refusing to change the host's network; run inside a VNET jail"
+    );
+    let sys = Shell::new();
+    let a = sh("ifconfig epair create").trim().to_owned();
+    let b = format!("{}b", a.trim_end_matches('a'));
+    sh(&format!(
+        "ifconfig {b} up && ifconfig {a} inet 10.79.0.1/24 up"
+    ));
+    let first = Ipv4Addr::new(10, 79, 0, 100);
+    let second = Ipv4Addr::new(10, 79, 0, 101);
+    let carp = |vhid, addr, password: &str| Carp {
+        vhid,
+        addr,
+        password: password.to_owned(),
+        advskew: 0,
+    };
+    let shown = || sh(&format!("ifconfig {a}"));
+    let has = |addr: Ipv4Addr, vhid: u8| {
+        shown()
+            .lines()
+            .any(|l| l.contains(&format!("inet {addr} ")) && l.contains(&format!("vhid {vhid}")))
+    };
+    let master = Some(CarpState::Master);
+
+    sys.carp_set(&a, &carp(7, first, "one"), master).unwrap();
+    // A new virtual host is a backup until it hears no master.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while sys.carp_state(&a, 7).unwrap() != master {
+        assert!(std::time::Instant::now() < deadline, "{}", shown());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(has(first, 7), "{}", shown());
+
+    // Again, with another password: still the one address.
+    sys.carp_set(&a, &carp(7, first, "two"), None).unwrap();
+    assert_eq!(shown().matches(&format!("inet {first} ")).count(), 1);
+
+    // Another address on the same virtual host replaces it.
+    sys.carp_set(&a, &carp(7, second, "two"), master).unwrap();
+    assert!(has(second, 7), "{}", shown());
+    assert!(!shown().contains(&format!("inet {first} ")), "{}", shown());
+
+    // Moved to another virtual host, the first goes with its last address.
+    sys.carp_set(&a, &carp(8, second, "two"), master).unwrap();
+    assert!(has(second, 8), "{}", shown());
+    assert_eq!(sys.carp_state(&a, 7).unwrap(), None, "{}", shown());
+
+    // Removed, nothing is left, and removing again is fine.
+    sys.carp_remove(&a, second).unwrap();
+    assert_eq!(sys.carp_state(&a, 8).unwrap(), None, "{}", shown());
+    assert!(!shown().contains("vhid"), "{}", shown());
+    sys.carp_remove(&a, second).unwrap();
+    sh(&format!("ifconfig {a} destroy"));
 }
 
 #[test]
