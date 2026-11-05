@@ -1495,7 +1495,9 @@ submitted; its crates are v0.1.7's. v0.1.8 stayed a tag: v0.1.9, tagged
 on 2026-11-01, carries it with the later reviews' fixes and the open
 issues closed (above), and is the release the port submits; the port at
 v0.1.9 passed `poudriere testport` on 15.1 amd64 (build 18.5 min), and
-both nodes of the two-node cluster run it. Waiting on
-the user: the port's submission, once their FreeBSD Bugzilla account
-exists.
+both nodes of the two-node cluster run it. v0.1.10, tagged on 2026-11-05,
+has the fourth to eleventh reviews' fixes and is for jailer to move to; the
+port's `distinfo` is made for it, and its crates are v0.1.9's, but it has
+not been through `poudriere testport` yet. Waiting on the user: the
+port's submission, once their FreeBSD Bugzilla account exists.
 
