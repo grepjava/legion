@@ -13,7 +13,8 @@ use legion_api::{Kind, Object, Spec};
 use tokio::time::Instant;
 
 use super::plan::{
-    Action, CronJob, HISTORY, Job, Jobs, Memory, Node, Quotas, Service, Task, Volume, Volumes, plan,
+    Action, CronJob, HISTORY, Job, Jobs, Memory, Namespaces, Node, Service, Task, Volume, Volumes,
+    plan,
 };
 
 struct World {
@@ -22,7 +23,7 @@ struct World {
     tasks: Vec<Task>,
     nodes: Vec<Node>,
     volumes: Volumes,
-    quotas: Quotas,
+    namespaces: Namespaces,
     index: u64,
     memory: Memory,
     now: Instant,
@@ -41,7 +42,7 @@ impl World {
             tasks: vec![],
             nodes: vec![],
             volumes: Volumes::new(),
-            quotas: Quotas::new(),
+            namespaces: Namespaces::default(),
             index: 0,
             memory: Memory::default(),
             now: Instant::now(),
@@ -218,7 +219,7 @@ impl World {
             &self.tasks,
             &self.nodes,
             &self.volumes,
-            &self.quotas,
+            &self.namespaces,
             &mut self.memory,
             self.now,
         );
@@ -431,7 +432,7 @@ impl World {
                 &self.tasks,
                 &self.nodes,
                 &self.volumes,
-                &self.quotas,
+                &self.namespaces,
                 &mut self.memory,
                 self.now,
             );
@@ -467,7 +468,7 @@ impl World {
             &self.tasks,
             &self.nodes,
             &self.volumes,
-            &self.quotas,
+            &self.namespaces,
             &mut self.memory,
             self.now,
         )
@@ -943,7 +944,7 @@ fn rolling_update_stop_first() {
         &w.tasks,
         &w.nodes,
         &w.volumes,
-        &w.quotas,
+        &w.namespaces,
         &mut w.memory,
         w.now,
     );
@@ -984,7 +985,7 @@ fn rolling_update_start_first() {
         &w.tasks,
         &w.nodes,
         &w.volumes,
-        &w.quotas,
+        &w.namespaces,
         &mut w.memory,
         w.now,
     );
@@ -1639,7 +1640,8 @@ fn a_namespace_quota_holds_tasks() {
     w.node("n1", &[]);
     w.node("n2", &[]);
     let quota = |y: &str| serde_yaml_ng::from_str(y).unwrap();
-    w.quotas
+    w.namespaces
+        .quotas
         .insert("shop".into(), quota("{ cpu: 1, tasks: 3 }"));
     w.service(
         "web",
@@ -1678,13 +1680,16 @@ pod: { containers: [{ name: a, image: \"a:1\", resources: { requests: { cpu: 100
     );
 
     // A larger quota lets them run.
-    w.quotas
+    w.namespaces
+        .quotas
         .insert("shop".into(), quota("{ cpu: 2, tasks: 5 }"));
     w.settle();
     assert_eq!(w.running().len(), 5);
 
     // A smaller one stops nothing, but a replacement waits for room.
-    w.quotas.insert("shop".into(), quota("{ tasks: 4 }"));
+    w.namespaces
+        .quotas
+        .insert("shop".into(), quota("{ tasks: 4 }"));
     w.settle();
     assert_eq!(w.running().len(), 5);
     w.fail("web-1-1");
@@ -2341,7 +2346,7 @@ impl World {
                 &self.tasks,
                 &self.nodes,
                 &self.volumes,
-                &self.quotas,
+                &self.namespaces,
                 &mut self.memory,
                 self.now,
             );
@@ -2411,7 +2416,7 @@ fn a_budget_spent_elsewhere_drains_start_first() {
         &w.tasks,
         &w.nodes,
         &w.volumes,
-        &w.quotas,
+        &w.namespaces,
         &mut w.memory,
         w.now,
     );
@@ -2900,7 +2905,9 @@ pod: { containers: [{ name: web, image: \"web:1\", resources: { requests: { cpu:
     w.settle();
     assert_eq!(w.running().len(), 2);
     let quota = |y: &str| serde_yaml_ng::from_str(y).unwrap();
-    w.quotas.insert("shop".into(), quota("{ memory: 1Gi }"));
+    w.namespaces
+        .quotas
+        .insert("shop".into(), quota("{ memory: 1Gi }"));
     // What runs stays; a replacement asks no memory, so waits.
     w.fail("web-1-1");
     w.settle();
@@ -3119,7 +3126,7 @@ pod:
         &w.tasks,
         &w.nodes,
         &w.volumes,
-        &w.quotas,
+        &w.namespaces,
         &mut w.memory,
         w.now,
     );
@@ -3710,7 +3717,7 @@ fn pass_losing_cron_status(w: &mut World) {
         &w.tasks,
         &w.nodes,
         &w.volumes,
-        &w.quotas,
+        &w.namespaces,
         &mut w.memory,
         w.now,
     );
@@ -4114,4 +4121,145 @@ fn a_move_whose_old_node_is_removed_keeps_the_copy() {
     assert_eq!(w.migration("data-db-0"), None);
     assert_eq!(w.volume_node("data-db-0"), to);
     assert_eq!(w.placed("db"), [to]);
+}
+
+/// What `security.allow` of namespace shop lets its containers loosen.
+fn allow(w: &mut World, yaml: &str) {
+    w.namespaces
+        .security
+        .insert("shop".into(), serde_yaml_ng::from_str(yaml).unwrap());
+}
+
+const NO_RAW_SOCKETS: &str = "namespace shop does not allow its containers' jails rawSockets";
+
+/// Admitted while its namespace allowed raw sockets: once it no longer
+/// does, nothing new of it starts, while what runs is left.
+#[test]
+fn a_namespace_tightened_since_admission_starts_nothing_new_it_refuses() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    allow(&mut w, "allow: [rawSockets]");
+    let ping = |n: u32| {
+        format!(
+            "replicas: {n}\npod: {{ containers: [{{ name: p, image: \"ping:1\", \
+             security: {{ allow: [rawSockets] }} }}] }}"
+        )
+    };
+    w.service("ping", &ping(2));
+    w.settle();
+    assert_eq!(w.running().len(), 2);
+
+    allow(&mut w, "{}");
+    w.settle();
+    assert_eq!(w.running().len(), 2, "what runs is left");
+    w.service("ping", &ping(3));
+    w.job(
+        "probe",
+        "pod: { containers: [{ name: p, image: \"ping:1\", security: { allow: [rawSockets] } }] }",
+    );
+    w.settle();
+    assert_eq!(w.running().len(), 2);
+    let pending: Vec<(&str, &str)> = w
+        .tasks
+        .iter()
+        .filter(|t| t.status.state == TaskState::Pending)
+        .map(|t| (t.object.metadata.name.as_str(), t.status.message.as_str()))
+        .collect();
+    assert_eq!(
+        pending,
+        [("ping-3-1", NO_RAW_SOCKETS), ("probe-1-1", NO_RAW_SOCKETS)]
+    );
+
+    // Allowed again, they start.
+    allow(&mut w, "allow: [rawSockets]");
+    w.settle();
+    assert_eq!(w.running().len(), 4);
+}
+
+/// A run due while its namespace no longer allows what its Job loosens is
+/// skipped, as a late one is, and not tried again before the next.
+#[test]
+fn a_cron_job_skips_runs_its_namespace_no_longer_allows() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    allow(&mut w, "allow: [rawSockets]");
+    w.cron_job(
+        "report",
+        "schedule: \"*/5 * * * *\"\njob:\n  pod: { containers: [{ name: r, image: \"tools:1\", \
+         security: { allow: [rawSockets] } }] }",
+    );
+    w.settle();
+    w.advance(4 * 60);
+    w.settle();
+    let first = run("2026-10-28T09:35:00Z");
+    assert_eq!(w.job_names(), std::slice::from_ref(&first));
+    complete_job(&mut w, &first);
+
+    allow(&mut w, "{}");
+    w.advance(5 * 60);
+    w.settle();
+    assert_eq!(w.job_names(), std::slice::from_ref(&first), "no new run");
+    let st = w.cron_status("report");
+    assert_eq!(st.last_schedule.as_deref(), Some("2026-10-28T09:40:00Z"));
+    assert_eq!(
+        st.message,
+        format!("skipped the run due at 2026-10-28T09:40:00Z: {NO_RAW_SOCKETS}")
+    );
+    assert_eq!(w.wake(), Some(w.now + Duration::from_secs(5 * 60)));
+
+    // Allowed again, the next run is made.
+    allow(&mut w, "allow: [rawSockets]");
+    w.advance(5 * 60);
+    w.settle();
+    assert_eq!(w.job_names(), [first.clone(), run("2026-10-28T09:45:00Z")]);
+}
+
+/// Placed but not started when its namespace stops allowing what it
+/// loosens: it is stopped, and its replacement waits. One already starting
+/// (its init containers run) is left, as a running one is.
+#[test]
+fn a_task_not_yet_started_when_its_namespace_tightens_does_not_start() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    allow(&mut w, "allow: [rawSockets]");
+    w.agents = false;
+    w.service(
+        "ping",
+        "replicas: 2\npod: { containers: [{ name: p, image: \"ping:1\", \
+         security: { allow: [rawSockets] } }] }",
+    );
+    w.settle();
+    assert_eq!(w.tasks(), ["ping-1-1 assigned n1", "ping-2-1 assigned n1"]);
+    let t = w
+        .tasks
+        .iter_mut()
+        .find(|t| t.object.metadata.name == "ping-2-1")
+        .unwrap();
+    t.status.state = TaskState::Starting;
+    t.object.status = serde_json::to_value(&t.status).unwrap();
+
+    allow(&mut w, "{}");
+    w.settle();
+    let desired = |w: &World, name: &str| {
+        let t = w.tasks.iter().find(|t| t.object.metadata.name == name);
+        t.unwrap().spec.desired_state
+    };
+    assert_eq!(desired(&w, "ping-1-1"), DesiredState::Shutdown);
+    assert_eq!(desired(&w, "ping-2-1"), DesiredState::Running);
+
+    w.agents = true;
+    w.settle();
+    assert_eq!(
+        w.tasks(),
+        [
+            "ping-1-1 shutdown n1",
+            "ping-1-2 pending ",
+            "ping-2-1 running n1"
+        ]
+    );
+    let t = w
+        .tasks
+        .iter()
+        .find(|t| t.object.metadata.name == "ping-1-2");
+    assert_eq!(t.unwrap().status.message, NO_RAW_SOCKETS);
 }

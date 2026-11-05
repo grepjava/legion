@@ -182,6 +182,20 @@ impl NamespaceSecurity {
             .filter(|l| !self.allow.contains(l))
             .collect()
     }
+
+    /// Why `namespace`, with this, refuses `pod`, if it does: admission and
+    /// the controller say it alike.
+    pub fn refusal(&self, namespace: &str, pod: &PodSpec) -> Option<String> {
+        let refused = self.refused(pod);
+        if refused.is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = refused.iter().map(|l| l.as_str()).collect();
+        Some(format!(
+            "namespace {namespace} does not allow its containers' jails {}",
+            names.join(", ")
+        ))
+    }
 }
 
 #[cfg(test)]

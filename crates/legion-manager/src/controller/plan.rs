@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use legion_api::node::{Availability, NodeSpec, NodeState, NodeStatus};
 use legion_api::quota::{Quota, Usage};
+use legion_api::security::NamespaceSecurity;
 use legion_api::service::FailureAction;
 use legion_api::service::{
     Constraint, EndpointMode, NodeAttribute, PUBLISHED_PORTS, PodSpec, Publish, PublishedPort,
@@ -98,6 +99,29 @@ fn home<'a>(volumes: &'a Volumes, namespace: &str, name: &str) -> Option<&'a str
 
 /// Namespace quotas, by namespace.
 pub type Quotas = BTreeMap<String, Quota>;
+
+/// What namespaces set for what runs in them, as they are now: what was
+/// admitted under an older setting is held to the current one before it
+/// starts anything new.
+#[derive(Debug, Clone, Default)]
+pub struct Namespaces {
+    pub quotas: Quotas,
+    /// What each namespace lets its containers loosen in their jails; none
+    /// for a namespace not listed.
+    pub security: BTreeMap<String, NamespaceSecurity>,
+}
+
+impl Namespaces {
+    /// Why `namespace` refuses to start `pod` now: the loosenings it no
+    /// longer allows.
+    pub(super) fn refuses(&self, namespace: &str, pod: &PodSpec) -> Option<String> {
+        let none = NamespaceSecurity::default();
+        self.security
+            .get(namespace)
+            .unwrap_or(&none)
+            .refusal(namespace, pod)
+    }
+}
 
 impl Node {
     fn name(&self) -> &str {
@@ -204,7 +228,7 @@ pub fn plan(
     tasks: &[Task],
     nodes: &[Node],
     volumes: &Volumes,
-    quotas: &Quotas,
+    namespaces: &Namespaces,
     memory: &mut Memory,
     now: Instant,
 ) -> Plan {
@@ -285,7 +309,7 @@ pub fn plan(
         );
     }
     for c in &jobs.cron_jobs {
-        jobs::cron_job(c, &jobs_after, now, jobs.wall, &mut plan);
+        jobs::cron_job(c, &jobs_after, namespaces, now, jobs.wall, &mut plan);
     }
     jobs::abandoned(jobs, &mut plan);
     let owners: Vec<&Service> = services.iter().chain(&job_owners).collect();
@@ -299,7 +323,29 @@ pub fn plan(
         }
     }
 
-    schedule(&owners, tasks, created, nodes, volumes, quotas, &mut plan);
+    // Placed while its namespace allowed how its jails are loosened, and no
+    // process of it started yet (an agent reports Starting once it runs
+    // init containers): it does not start, and its replacement waits in the
+    // scheduler like any new task. What runs is left.
+    let touched: BTreeSet<ObjectKey> = plan.actions.iter().map(Action::key).collect();
+    for t in tasks.iter().filter(|t| {
+        t.active()
+            && matches!(
+                t.status.state,
+                TaskState::Assigned | TaskState::Accepted | TaskState::Preparing
+            )
+            && !touched.contains(&t.object.key())
+            && owners.iter().any(|s| s.owns(t))
+            && namespaces
+                .refuses(&t.object.metadata.namespace, &t.spec.pod)
+                .is_some()
+    }) {
+        plan.actions.push(stop(t));
+    }
+
+    schedule(
+        &owners, tasks, created, nodes, volumes, namespaces, &mut plan,
+    );
 
     // An orphaned task is written once per pass; what else was planned for
     // it waits for the next one.
@@ -1449,9 +1495,10 @@ fn schedule(
     created: Vec<Task>,
     nodes: &[Node],
     volumes: &Volumes,
-    quotas: &Quotas,
+    namespaces: &Namespaces,
     plan: &mut Plan,
 ) {
+    let quotas = &namespaces.quotas;
     let mut load: BTreeMap<String, Load> = BTreeMap::new();
     let mut used: BTreeMap<String, Usage> = BTreeMap::new();
     for t in tasks.iter().filter(|t| t.placed()) {
@@ -1523,6 +1570,9 @@ fn schedule(
         let unasked = quotas
             .get(&namespace)
             .and_then(|q| unrequested(q, &t.spec.pod));
+        // Admitted under the namespace's security as it was: one that no
+        // longer allows how its jails are loosened starts none of them.
+        let denied = namespaces.refuses(&namespace, &t.spec.pod);
         let owner = &s.object.metadata.uid;
         let on = |node: &str| {
             load.get(node)
@@ -1541,7 +1591,7 @@ fn schedule(
         let mut best: Option<(&str, Score)> = None;
         for n in nodes
             .iter()
-            .filter(|_| over.is_empty() && unasked.is_none())
+            .filter(|_| over.is_empty() && unasked.is_none() && denied.is_none())
         {
             let name = n.object.metadata.name.as_str();
             if !t.spec.node.is_empty() && t.spec.node != name {
@@ -1603,6 +1653,11 @@ fn schedule(
                     ..Default::default()
                 }
             }
+            None if let Some(why) = denied => TaskStatus {
+                state: TaskState::Pending,
+                message: why,
+                ..Default::default()
+            },
             None if let Some((container, what)) = unasked => TaskStatus {
                 state: TaskState::Pending,
                 message: format!(

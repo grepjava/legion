@@ -5,7 +5,6 @@
 
 use legion_api::admit::NamespaceSpec;
 use legion_api::job::{CronJobSpec, JobSpec};
-use legion_api::security::Loosening;
 use legion_api::service::ServiceSpec;
 use legion_api::{CLUSTER_SCOPE, Kind, Object, ObjectKey};
 use legion_store::Store;
@@ -32,16 +31,12 @@ pub(crate) fn check(store: &Store, desired: &Object) -> Result<(), Status> {
         }
         None => Default::default(),
     };
-    let refused = allowed.refused(&pod);
-    if refused.is_empty() {
-        return Ok(());
+    match allowed.refusal(namespace, &pod) {
+        None => Ok(()),
+        Some(why) => Err(Status::permission_denied(format!(
+            "{why} (the cluster admin sets spec.security.allow on the Namespace)"
+        ))),
     }
-    let names: Vec<&str> = refused.iter().map(|l| Loosening::as_str(*l)).collect();
-    Err(Status::permission_denied(format!(
-        "namespace {namespace} does not allow its containers' jails {} \
-         (the cluster admin sets spec.security.allow on the Namespace)",
-        names.join(", ")
-    )))
 }
 
 fn internal(e: impl std::fmt::Display) -> Status {

@@ -335,8 +335,16 @@ fn start(
 
 /// Plans one CronJob: the Job of a run that is due, the history, and its
 /// status. `jobs` are as this pass leaves them: a Job that finished in it
-/// no longer runs.
-pub(super) fn cron_job(c: &CronJob, jobs: &[Job], now: Instant, wall: i64, plan: &mut Plan) {
+/// no longer runs. A run whose Job `namespaces` would not let start, as
+/// they are now, is skipped like one that is late.
+pub(super) fn cron_job(
+    c: &CronJob,
+    jobs: &[Job],
+    namespaces: &super::Namespaces,
+    now: Instant,
+    wall: i64,
+    plan: &mut Plan,
+) {
     let Some(schedule) = c.spec.parsed_schedule() else {
         return;
     };
@@ -377,6 +385,8 @@ pub(super) fn cron_job(c: &CronJob, jobs: &[Job], now: Instant, wall: i64, plan:
             String::new()
         } else if c.spec.suspend {
             format!("suspended: skipped the run due at {when}")
+        } else if let Some(why) = namespaces.refuses(namespace, &c.spec.job.pod) {
+            format!("skipped the run due at {when}: {why}")
         } else if c
             .spec
             .starting_deadline

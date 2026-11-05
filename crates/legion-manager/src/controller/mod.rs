@@ -19,7 +19,7 @@ use legion_store::{Command, NodeId, Outcome, Precondition, Store};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use plan::{Action, CronJob, Job, Jobs, Memory, Node, Quotas, Service, Task, Volume, Volumes};
+use plan::{Action, CronJob, Job, Jobs, Memory, Namespaces, Node, Service, Task, Volume, Volumes};
 
 /// Changes arriving within this window are handled in one pass.
 const DEBOUNCE: Duration = Duration::from_millis(50);
@@ -113,7 +113,7 @@ async fn lead(store: &Store, usage: &crate::usage::Usage) {
 
 /// One reconcile pass; returns when the next one is due at the latest.
 async fn pass(store: &Store, memory: &mut Memory) -> Option<Instant> {
-    let (services, jobs, tasks, nodes, volumes, quotas) = match read(store) {
+    let (services, jobs, tasks, nodes, volumes, namespaces) = match read(store) {
         Ok(state) => state,
         Err(e) => {
             tracing::warn!("reading the store: {e}");
@@ -126,7 +126,7 @@ async fn pass(store: &Store, memory: &mut Memory) -> Option<Instant> {
         &tasks,
         &nodes,
         &volumes,
-        &quotas,
+        &namespaces,
         memory,
         Instant::now(),
     );
@@ -138,7 +138,14 @@ async fn pass(store: &Store, memory: &mut Memory) -> Option<Instant> {
     plan.wake
 }
 
-type State = (Vec<Service>, Jobs, Vec<Task>, Vec<Node>, Volumes, Quotas);
+type State = (
+    Vec<Service>,
+    Jobs,
+    Vec<Task>,
+    Vec<Node>,
+    Volumes,
+    Namespaces,
+);
 
 fn read(store: &Store) -> Result<State, legion_store::Error> {
     let services = store
@@ -231,16 +238,17 @@ fn read(store: &Store) -> Result<State, legion_store::Error> {
             ))
         })
         .collect();
-    let quotas = store
-        .list(Kind::Namespace, None)?
-        .objects
-        .into_iter()
-        .filter_map(|o| {
-            let spec: legion_api::admit::NamespaceSpec = parsed(&o)?;
-            Some((o.metadata.name, spec.quota?))
-        })
-        .collect();
-    Ok((services, jobs, tasks, nodes, volumes, quotas))
+    let mut namespaces = Namespaces::default();
+    for o in store.list(Kind::Namespace, None)?.objects {
+        let Some(spec) = parsed::<legion_api::admit::NamespaceSpec>(&o) else {
+            continue;
+        };
+        if let Some(q) = spec.quota {
+            namespaces.quotas.insert(o.metadata.name.clone(), q);
+        }
+        namespaces.security.insert(o.metadata.name, spec.security);
+    }
+    Ok((services, jobs, tasks, nodes, volumes, namespaces))
 }
 
 fn status_of<T: serde::de::DeserializeOwned + Default>(o: &Object) -> T {
