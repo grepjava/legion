@@ -67,6 +67,27 @@ fn usage() -> i32 {
     2
 }
 
+/// An environment entry as an error may name it: by its name alone.
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+fn env_entry(entry: &str) -> String {
+    match entry.split_once('=') {
+        Some((name, _)) if !name.contains('\0') => format!("environment variable {name}"),
+        _ => "an environment variable".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn an_environment_entry_is_named_without_its_value() {
+        let named = super::env_entry("TOKEN=s3cr\0et");
+        assert_eq!(named, "environment variable TOKEN");
+        for entry in ["s3cr\0et", "s3cr\0et=more"] {
+            assert_eq!(super::env_entry(entry), "an environment variable");
+        }
+    }
+}
+
 #[cfg(not(target_os = "freebsd"))]
 mod imp {
     use std::path::Path;
@@ -420,8 +441,10 @@ mod imp {
         Some(text)
     }
 
-    fn cstring(s: &str) -> Result<CString, String> {
-        CString::new(s).map_err(|_| format!("a NUL in {s:?}"))
+    /// `s`, called `what` if it cannot be: never shown, as it may hold a
+    /// Secret, and the error reaches the task's status.
+    fn cstring(s: &str, what: &str) -> Result<CString, String> {
+        CString::new(s).map_err(|_| format!("a NUL in {what}"))
     }
 
     /// Into jail `jid` as the container's user, in its working directory;
@@ -454,7 +477,7 @@ mod imp {
                 return Err(format!("becoming {}: {}", rec.user, errno()));
             }
         }
-        let wd = cstring(&rec.work_dir)?;
+        let wd = cstring(&rec.work_dir, "the working directory")?;
         // SAFETY: wd is a valid C string.
         if unsafe { libc::chdir(wd.as_ptr()) } != 0 {
             return Err(format!("working directory {}: {}", rec.work_dir, errno()));
@@ -480,16 +503,19 @@ mod imp {
                 .split(':')
                 .map(|d| format!("{}/{program}", if d.is_empty() { "." } else { d }))
                 .find(|p| executable(p))
-                .ok_or_else(|| format!("{program}: not found in {path_var}"))?
+                .ok_or_else(|| format!("{program}: not found in the PATH"))?
         };
         Ok(Prepared {
-            path: cstring(&path)?,
+            path: cstring(&path, "the command")?,
             argv: rec
                 .argv
                 .iter()
-                .map(|a| cstring(a))
+                .map(|a| cstring(a, "the command's arguments"))
                 .collect::<Result<_, _>>()?,
-            env: env.iter().map(|e| cstring(e)).collect::<Result<_, _>>()?,
+            env: env
+                .iter()
+                .map(|e| cstring(e, &super::env_entry(e)))
+                .collect::<Result<_, _>>()?,
         })
     }
 

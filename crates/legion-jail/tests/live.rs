@@ -749,6 +749,15 @@ async fn standalone_containers_and_build_steps() {
     let err = rt.start(&missing).await.unwrap_err().to_string();
     assert!(err.contains("/nonexistent"), "{err}");
     rt.remove(&missing).await.unwrap();
+
+    // An environment that cannot be passed on is named, not shown: its
+    // value may be a Secret, and the error reaches the task's status.
+    let mut spec = standalone("leaky", "exit 0");
+    spec.env.insert("TOKEN".into(), "s3cr\0et".into());
+    let leaky = rt.create(&spec).await.unwrap();
+    let err = rt.start(&leaky).await.unwrap_err().to_string();
+    assert!(err.contains("TOKEN") && !err.contains("s3cr"), "{err}");
+    rt.remove(&leaky).await.unwrap();
     assert!(!dir.join("jails").join(&missing).exists());
 
     // On this process's output: its exit code, recorded too, and its jail
