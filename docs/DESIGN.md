@@ -1600,7 +1600,12 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
   Job or CronJob that loosens more than its Namespace's
   `spec.security.allow` lists (the same names, plus `securelevel` for a
   level below 2 and `enforceStatfs` for 1). Namespaces are cluster-scoped,
-  so only the cluster admin decides. Compose's `cap_add: [NET_RAW]` asks
+  so only the cluster admin decides. A Namespace tightened later holds for
+  everything made from then on, from specs admitted earlier too: such a
+  task waits Pending with the reason, one not yet started is stopped, and a
+  CronJob's run is skipped. Tasks already running keep what they started
+  with, as tightening a Namespace should not end its workloads; what
+  replaces them waits like any other. Compose's `cap_add: [NET_RAW]` asks
   for raw sockets. How it is applied: the runtime creates each container's
   jail with the parameters of its `legion.jail` annotation (6.2). What a
   child may have only if its parent does (mlock, SysV IPC) is asked for on
