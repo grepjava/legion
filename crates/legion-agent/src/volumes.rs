@@ -39,13 +39,13 @@
 //! `<files dir>/<task uid>/volumes/<name>`, and is shared by the pod's
 //! containers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use legion_api::service::{PodVolume, UPDATE_SNAPSHOT};
-use legion_api::task::VolumeSnapshot;
+use legion_api::task::{TaskState, VolumeSnapshot};
 use legion_api::volume::{Access, IscsiSource, NfsSource, VolumeDriver, VolumeSpec};
 use legion_sys::Sys;
 use serde::{Deserialize, Serialize};
@@ -659,6 +659,75 @@ fn unmount_plugin(sys: &dyn Sys, program: &str, dir: &str, input: &str) -> Resul
     Ok(())
 }
 
+/// Sets `dataset`'s quota to the spec's size, if it is there and has another.
+fn keep_quota(sys: &dyn Sys, dataset: &str, spec: &VolumeSpec) -> Result<(), String> {
+    let found = sys.zfs_list(dataset).map_err(|e| e.to_string())?;
+    let Some(ds) = found.into_iter().find(|d| d.name == dataset) else {
+        return Ok(());
+    };
+    if ds.quota != spec.size.map(|b| b.0) {
+        let quota = spec.size.map_or("none".to_owned(), |b| b.0.to_string());
+        sys.zfs_set(dataset, "quota", &quota)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Brings the ZFS Volumes of tasks running here to their current sizes. A
+/// claim by the node holding a ZFS Volume only reads it. Volumes the task
+/// claimed one node at a time are passed over: they have no quota, and a
+/// claim could outlast their release.
+pub(crate) async fn keep_quotas<C: Control>(
+    control: &C,
+    sys: &Arc<dyn Sys>,
+    p: &Places<'_>,
+    assignments: &legion_api::dispatch::Assignments,
+) {
+    let Some(root) = p.zfs_root else { return };
+    let mut seen = BTreeSet::new();
+    for (uid, a) in assignments {
+        if a.status.state != TaskState::Running {
+            continue;
+        }
+        let Ok(held) = attached(&files::task_dir(p.files_dir, uid)) else {
+            continue;
+        };
+        let namespace = a.key.namespace.as_str();
+        for name in a
+            .spec
+            .pod
+            .volumes
+            .iter()
+            .filter_map(|v| a.spec.volume_name(v))
+        {
+            if held
+                .iter()
+                .any(|h| h.volume() == (namespace, name.as_str()))
+                || !seen.insert((namespace.to_owned(), name.clone()))
+            {
+                continue;
+            }
+            let dataset = dataset(root, namespace, &name);
+            let _guard = p.lock.lock().await;
+            match control
+                .claim_volume(namespace, &name, p.node, &dataset)
+                .await
+            {
+                Ok(VolumeClaim::Claimed(spec)) if spec.access() == Access::Local => {
+                    let kept =
+                        crate::task::blocking(sys, move |sys| keep_quota(sys, &dataset, &spec))
+                            .await;
+                    if let Err(e) = kept {
+                        tracing::warn!("volume {namespace}/{name}: setting its size: {e}");
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!("volume {namespace}/{name}: reading its size: {e}"),
+            }
+        }
+    }
+}
+
 /// Creates the dataset if needed, keeps its quota in line with the spec and
 /// returns where it is mounted.
 pub(crate) fn zfs(sys: &dyn Sys, dataset: &str, spec: &VolumeSpec) -> Result<String, String> {
@@ -668,16 +737,7 @@ pub(crate) fn zfs(sys: &dyn Sys, dataset: &str, spec: &VolumeSpec) -> Result<Str
         None => &[],
     };
     sys.zfs_create(dataset, props).map_err(|e| e.to_string())?;
-    let ds = sys
-        .zfs_list(dataset)
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .find(|d| d.name == dataset)
-        .ok_or_else(|| format!("{dataset} missing after creating it"))?;
-    if ds.quota != spec.size.map(|b| b.0) {
-        sys.zfs_set(dataset, "quota", &quota)
-            .map_err(|e| e.to_string())?;
-    }
+    keep_quota(sys, dataset, spec)?;
     // One received from another node may not be mounted yet.
     sys.zfs_mount(dataset).map_err(|e| e.to_string())?;
     // A move's two snapshots: the move is over, the Volume being used

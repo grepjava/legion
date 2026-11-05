@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use crate::runtime::ContainerSpec;
-use legion_api::security::{Allow, Security};
+use legion_api::security::{Allow, ENFORCE_STATFS, Security};
 use legion_api::service::{Container, PodSpec};
 use legion_sys::{RctlRule, Resource};
 
@@ -22,7 +22,7 @@ pub const ANNOTATION_PARENT: &str = "org.freebsd.parentJail";
 /// The jail parameters the runtime gives a container's jail when it makes
 /// it (see [`jail_params`]).
 pub const ANNOTATION_JAIL: &str = "legion.jail";
-const ANNOTATION_MLOCK: &str = "org.freebsd.jail.allow.mlock";
+pub(crate) const ANNOTATION_MLOCK: &str = "org.freebsd.jail.allow.mlock";
 const ANNOTATION_SYSV: [&str; 3] = [
     "org.freebsd.jail.sysvmsg",
     "org.freebsd.jail.sysvsem",
@@ -83,8 +83,11 @@ fn labels(node: &str, a: &Assignment, role: Role, container: &str) -> BTreeMap<S
 
 /// The infra container: an empty jail with its own VNET that the pod's
 /// containers run inside. A child jail may have only what its parent has,
-/// so it allows what any of the pod's containers needs from it: mlock,
-/// and SysV IPC, which those containers then share.
+/// so it allows what any of the pod's containers asks for: raw sockets,
+/// chflags, mlock, SysV IPC (which those containers then share) and the
+/// lowest `enforce_statfs`. Each container still has its own profile, and
+/// the infra jail runs nothing that could use these. `securelevel` needs
+/// nothing: it stays the default, under which a child may have any.
 pub fn infra_spec(node: &str, a: &Assignment, image: &str) -> ContainerSpec {
     let mut annotations = BTreeMap::from([(ANNOTATION_VNET.to_owned(), "new".to_owned())]);
     let allows = |x| {
@@ -100,6 +103,22 @@ pub fn infra_spec(node: &str, a: &Assignment, image: &str) -> ContainerSpec {
         for k in ANNOTATION_SYSV {
             annotations.insert(k.to_owned(), "new".to_owned());
         }
+    }
+    let mut params = Vec::new();
+    for (allow, param) in [
+        (Allow::RawSockets, "allow.raw_sockets"),
+        (Allow::Chflags, "allow.chflags"),
+    ] {
+        if allows(allow) {
+            params.push(format!("{param}=true"));
+        }
+    }
+    let lowest = a.spec.pod.containers().map(|c| c.security.enforce_statfs);
+    if let Some(lowest) = lowest.min().filter(|l| *l < ENFORCE_STATFS) {
+        params.push(format!("enforce_statfs={lowest}"));
+    }
+    if !params.is_empty() {
+        annotations.insert(ANNOTATION_JAIL.to_owned(), params.join(" "));
     }
     ContainerSpec {
         name: container_name(a, None),

@@ -9,7 +9,8 @@
 //! were there before it ran, and a
 //! child jail gets loose parameters (raw sockets, chflags,
 //! `enforce_statfs=1`), then those of the `legion.jail` annotation, unless
-//! [`FakeRuntime::skip_jail_hook`]. Exec runs nothing: each container answers with the exit code
+//! [`FakeRuntime::skip_jail_hook`]. As in the kernel, one that asks for more
+//! than its parent has does not start. Exec runs nothing: each container answers with the exit code
 //! set by [`FakeRuntime::set_exec`], 0 by default. An attached exec of
 //! `cat` echoes its stdin; any other command prints itself and the
 //! terminal size, if it has one. Logs are what [`FakeRuntime::log`] wrote.
@@ -28,8 +29,36 @@ use futures::stream::BoxStream;
 use legion_sys::FakeSys;
 use tokio::sync::broadcast;
 
-use crate::pod::{ANNOTATION_JAIL, ANNOTATION_PARENT, ANNOTATION_VNET, LABEL_ROLE, child_jail};
+use crate::pod::{
+    ANNOTATION_JAIL, ANNOTATION_MLOCK, ANNOTATION_PARENT, ANNOTATION_VNET, LABEL_ROLE, child_jail,
+};
 use crate::runtime::{Login, Runtime};
+
+/// What `child` asks for that `parent` does not have, which FreeBSD refuses.
+fn beyond_parent(parent: &ContainerSpec, child: &ContainerSpec) -> Option<&'static str> {
+    let params = |s: &ContainerSpec| -> BTreeMap<String, String> {
+        let asked = s.annotations.get(ANNOTATION_JAIL);
+        asked
+            .map(String::as_str)
+            .unwrap_or_default()
+            .split_whitespace()
+            .filter_map(|p| p.split_once('='))
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect()
+    };
+    let (theirs, ours) = (params(parent), params(child));
+    let has = |p: &BTreeMap<String, String>, k: &str| p.get(k).is_some_and(|v| v == "true");
+    let statfs = |p: &BTreeMap<String, String>| {
+        let level = p.get("enforce_statfs").and_then(|v| v.parse::<u8>().ok());
+        level.unwrap_or(legion_api::security::ENFORCE_STATFS)
+    };
+    let mlock = |s: &ContainerSpec| s.annotations.contains_key(ANNOTATION_MLOCK);
+    ["allow.raw_sockets", "allow.chflags"]
+        .into_iter()
+        .find(|k| has(&ours, k) && !has(&theirs, k))
+        .or((statfs(&ours) < statfs(&theirs)).then_some("enforce_statfs"))
+        .or((mlock(child) && !mlock(parent)).then_some("allow.mlock"))
+}
 
 pub struct FakeRuntime {
     sys: Arc<FakeSys>,
@@ -565,6 +594,10 @@ impl Runtime for FakeRuntime {
             Some(parent) => {
                 if !s.containers.get(parent).is_some_and(|p| p.running) {
                     return Err(api(500, format!("parent jail {parent} is not running")));
+                }
+                if let Some(param) = beyond_parent(&s.containers[parent].spec, &c.spec) {
+                    let why = format!("creating jail: {param}: Operation not permitted");
+                    return Err(api(500, why));
                 }
                 let name = child_jail(parent, id);
                 self.sys.add_jail(&name, false);

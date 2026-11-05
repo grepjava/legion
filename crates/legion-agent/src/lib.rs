@@ -416,6 +416,8 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             self.memory_check,
         ));
 
+        let quotas = tokio::spawn(quota_loop(ctx.clone(), assignments.clone(), self.resync));
+
         let (events_tx, mut events) = mpsc::channel(256);
         let forwarder = tokio::spawn(forward_events(ctx.clone(), events_tx));
         let mut workers: BTreeMap<String, Worker> = BTreeMap::new();
@@ -518,6 +520,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         lb.abort();
         policy.abort();
         memory.abort();
+        quotas.abort();
         if let Some(mesh) = mesh {
             mesh.abort();
         }
@@ -842,23 +845,8 @@ async fn policing_loop(
             && SERVICE_PREFIX == legion_net::SERVICE_CIDR.prefix
     );
 
-    // pf must see bridged traffic on the members (FreeBSD 15 does not by
-    // default), and frames for the host on the member they came in on as
-    // well as on the bridge: a pod's traffic to a VIP is checked there,
-    // before the VIP's translation. Host-wide: every bridge's members are
-    // filtered then, which a pass-by-default ruleset does not notice.
-    task::blocking(&sys, |sys| {
-        for name in [
-            "net.link.bridge.pfil_member",
-            "net.link.bridge.pfil_local_phys",
-        ] {
-            if let Err(e) = sys.sysctl_set(name, "1") {
-                tracing::warn!("setting {name}: {e}; network policy will not hold");
-            }
-        }
-    })
-    .await;
     let services = legion_sys::Ipv4Net::new(SERVICE_NET, SERVICE_PREFIX);
+    let mut filtering = false;
     let mut attached = guarding.attached();
     let mut policy = Policy::default();
     let mut retry = false;
@@ -902,6 +890,22 @@ async fn policing_loop(
             })
             .collect();
         let pods = policing::local_pods(assigned, &attached.borrow_and_update());
+        // Rules that traffic bypasses guard nothing: no pod counts as
+        // guarded, and none starts, until pf sees it.
+        if !filtering {
+            match task::blocking(&sys, filter_bridges).await {
+                Ok(()) => filtering = true,
+                Err(e) => {
+                    tracing::warn!("{e}; network policy will not hold, retrying");
+                    guarding.passed(policing::Pass {
+                        guarded: BTreeMap::new(),
+                        error: Some(e),
+                    });
+                    retry = true;
+                    continue;
+                }
+            }
+        }
         let guarded: BTreeMap<String, Ipv4Addr> =
             pods.iter().map(|(uid, p)| (uid.clone(), p.ip)).collect();
         let pods: Vec<policing::LocalPod> = pods.into_values().collect();
@@ -931,6 +935,38 @@ async fn policing_loop(
                 true
             }
         };
+    }
+}
+
+/// Has pf see bridged traffic on the members (FreeBSD 15 does not by
+/// default), and frames for the host on the member they came in on as well
+/// as on the bridge: a pod's traffic to a VIP is checked there, before the
+/// VIP's translation. Host-wide: every bridge's members are filtered then,
+/// which a pass-by-default ruleset does not notice.
+fn filter_bridges(sys: &dyn Sys) -> Result<(), String> {
+    for name in [
+        "net.link.bridge.pfil_member",
+        "net.link.bridge.pfil_local_phys",
+    ] {
+        sys.sysctl_set(name, "1")
+            .map_err(|e| format!("setting {name}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Keeps the datasets of the Volumes running tasks use at their Volumes'
+/// sizes, which may change under them.
+async fn quota_loop<R: Runtime, C: Control>(
+    ctx: Ctx<R, C>,
+    assignments: watch::Receiver<legion_api::dispatch::Assignments>,
+    every: Duration,
+) {
+    let mut tick = tokio::time::interval(every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let current = assignments.borrow().clone();
+        volumes::keep_quotas(ctx.control.as_ref(), &ctx.sys, &ctx.places(), &current).await;
     }
 }
 

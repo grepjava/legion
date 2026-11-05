@@ -942,9 +942,11 @@ impl Sys for FakeSys {
     }
 
     fn sysctl_set(&self, name: &str, value: &str) -> Result<()> {
-        self.state()
-            .sysctls
-            .insert(name.to_owned(), value.to_owned());
+        let mut s = self.state();
+        if s.failing.remove(&format!("sysctl {name}")) {
+            return Err(fail("sysctl", format!("{name}: refused")));
+        }
+        s.sysctls.insert(name.to_owned(), value.to_owned());
         Ok(())
     }
 

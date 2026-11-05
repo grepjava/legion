@@ -1094,6 +1094,62 @@ fn jail_profile(h: &Harness, pod: &str, container: &str) -> Vec<String> {
         .collect()
 }
 
+/// A child jail may have only what its parent has: the infra jail allows
+/// what any container asks for, and each container keeps its own profile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pods_infra_jail_allows_what_its_containers_ask_for() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let key = h
+        .task(
+            "app-1",
+            r#"
+initContainers:
+  - name: prepare
+    image: "app:1"
+    security: { allow: [chflags] }
+containers:
+  - { name: app, image: "app:1" }
+  - name: ping
+    image: "app:1"
+    security: { allow: [rawSockets], enforceStatfs: 1 }
+"#,
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    let infra = h.rt.spec("shop_app-1").unwrap().annotations;
+    assert_eq!(
+        infra["legion.jail"],
+        "allow.raw_sockets=true allow.chflags=true enforce_statfs=1"
+    );
+    assert_eq!(
+        jail_profile(&h, "shop_app-1", "app"),
+        [
+            "allow.chflags=false",
+            "allow.raw_sockets=false",
+            "enforce_statfs=2",
+            "securelevel=2"
+        ]
+    );
+    assert_eq!(
+        jail_profile(&h, "shop_app-1", "ping"),
+        [
+            "allow.chflags=false",
+            "allow.raw_sockets=true",
+            "enforce_statfs=1",
+            "securelevel=2"
+        ]
+    );
+
+    // A pod asking for nothing has an infra jail with nothing extra.
+    let key = h
+        .task("plain-1", "containers: [{ name: app, image: \"app:1\" }]\n")
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    let infra = h.rt.spec("shop_plain-1").unwrap().annotations;
+    assert!(!infra.contains_key("legion.jail"), "{infra:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn jails_are_locked_down() {
     let mut h = Harness::new().await;
@@ -1371,6 +1427,24 @@ async fn a_pod_is_adopted_after_listing_fails_for_a_while() {
     assert_eq!(h.rt.created(), created, "no container recreated");
     let st = h.status(&key);
     assert_eq!(st.state, TaskState::Running, "{st:?}");
+}
+
+/// Rules that traffic bypasses guard nothing: a pod waits until pf sees
+/// bridged traffic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pod_waits_until_pf_sees_bridged_traffic() {
+    let mut h = Harness::new().await;
+    h.rt.add_image("app:1");
+    h.stop_agent().await;
+    let name = "net.link.bridge.pfil_member";
+    h.sys.sysctl_set(name, "0").unwrap();
+    h.sys.fail_next(&format!("sysctl {name}"));
+    h.start_agent();
+    let key = h
+        .task("app-1", r#"containers: [{ name: app, image: "app:1" }]"#)
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    assert_eq!(h.sys.sysctl(name).as_deref(), Some("1"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1942,6 +2016,45 @@ volumes:
   - { name: data, volume: { name: data } }
   - { name: scratch, tmpfs: { size: 64Mi } }
 "#;
+
+/// A Volume's size may change under its tasks, in either direction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_running_tasks_volume_follows_its_size() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let volume = ObjectKey::new(Kind::Volume, "shop", "data");
+    h.write(
+        Object::new(
+            Kind::Volume,
+            "shop",
+            "data",
+            serde_json::json!({ "size": "1Gi" }),
+        ),
+        Precondition::MustNotExist,
+    )
+    .await;
+    let key = h.task("db-1", VOLUMES).await;
+    h.wait_state(&key, TaskState::Running).await;
+    let ds = "tank/legion/volumes/shop/data";
+    assert_eq!(h.sys.zfs_list(ds).unwrap()[0].quota, Some(1 << 30));
+    let created = h.rt.created();
+
+    for (size, quota) in [
+        (serde_json::json!("2Gi"), Some(2 << 30)),
+        (serde_json::json!(null), None),
+    ] {
+        let mut v = h.store.get(&volume).unwrap().unwrap();
+        v.spec["size"] = size;
+        let version = v.metadata.version;
+        h.write(v, Precondition::Version(version)).await;
+        eventually("the dataset's quota to follow", || {
+            h.sys.zfs_list(ds).unwrap()[0].quota == quota
+        })
+        .await;
+    }
+    assert_eq!(h.rt.created(), created, "no container recreated");
+    assert_eq!(h.status(&key).state, TaskState::Running);
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn volumes() {

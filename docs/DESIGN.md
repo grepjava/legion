@@ -1607,9 +1607,12 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
   with, as tightening a Namespace should not end its workloads; what
   replaces them waits like any other. Compose's `cap_add: [NET_RAW]` asks
   for raw sockets. How it is applied: the runtime creates each container's
-  jail with the parameters of its `legion.jail` annotation (6.2). What a
-  child may have only if its parent does (mlock, SysV IPC) is asked for on
-  the infra jail and the container; a pod's containers that allow SysV IPC
+  jail with the parameters of its `legion.jail` annotation (6.2). A child
+  may have only what its parent has, so what any container asks for (raw
+  sockets, `chflags`, mlock, SysV IPC, the lowest `enforce_statfs`) is
+  asked for on the infra jail too, each container keeping its own profile;
+  `securelevel` needs nothing, as the infra jail's stays the default, under
+  which a child may have any. A pod's containers that allow SysV IPC
   share the infra jail's namespace. After each start the agent reads the
   jail's parameters back and refuses the pod if they differ; an adopted
   pod's running jails are tightened in place instead, which the host may
