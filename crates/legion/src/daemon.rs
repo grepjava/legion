@@ -45,6 +45,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
     let hostname = hostname()?;
+    private_dir(&opts.data_dir)?;
     let mut pki = crate::pki::Pki::new(&opts.data_dir);
     if pki.role()? == legion_pki::Role::Worker {
         return run_worker(&opts, &pki, hostname).await;
@@ -263,8 +264,7 @@ pub async fn join(
         None => node_name(&hostname()?)?,
     };
     legion_api::validate_name(&node).context("node name")?;
-    std::fs::create_dir_all(data_dir)
-        .with_context(|| format!("creating {}", data_dir.display()))?;
+    private_dir(data_dir)?;
     let id = legion_manager::node_id(data_dir).map_err(|e| anyhow::anyhow!(e))?;
     // A manager needs one; a worker's is ignored.
     let advertise = match advertise {
@@ -664,6 +664,19 @@ pub fn restore(
         println!("the old store is at {}", aside.display());
     }
     println!("start the daemon; other managers join again from empty data directories");
+    Ok(())
+}
+
+/// Makes the node's data directory, its owner's alone whatever the umask
+/// or however it was started: it holds keys and containers' secrets.
+fn private_dir(dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("making {} private", dir.display()))?;
+    }
     Ok(())
 }
 
