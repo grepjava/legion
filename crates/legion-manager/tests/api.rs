@@ -2616,13 +2616,16 @@ async fn a_restored_manager_leads_alone_and_ignores_the_old_cluster() {
     }
 
     // Through a follower, which forwards to the leader.
-    let mut chunks = managers[2]
-        .cluster()
-        .await
-        .backup(legion_proto::v1::BackupRequest {})
-        .await
-        .unwrap()
-        .into_inner();
+    let third = &managers[2];
+    let mut chunks = eventually(|| async move {
+        third
+            .cluster()
+            .await
+            .backup(legion_proto::v1::BackupRequest {})
+            .await
+    })
+    .await
+    .into_inner();
     let mut json = Vec::new();
     while let Some(chunk) = chunks.message().await.unwrap() {
         json.extend(chunk.data);
@@ -2639,11 +2642,11 @@ async fn a_restored_manager_leads_alone_and_ignores_the_old_cluster() {
 
     // Restored at the same address while the other two carry on: they
     // must not pull it back into the old cluster with what they wrote.
-    follower
-        .clone()
-        .apply(apply(service("lost", 1)))
-        .await
-        .unwrap();
+    eventually(|| {
+        let mut follower = follower.clone();
+        async move { follower.apply(apply(service("lost", 1))).await }
+    })
+    .await;
     let first = managers.remove(0);
     let addr = first.addr.clone();
     let dir = first.stop_keeping().await;
