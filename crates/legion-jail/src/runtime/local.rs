@@ -16,6 +16,58 @@ use crate::shim::Terminal;
 use crate::state::{self, EXIT, Exit, RECORD, RUN, Record, Run};
 use legion_runtime::Result;
 
+/// Kills a process and its descendants when dropped, unless disarmed: for
+/// a command that shares its caller's group, which cannot be killed whole.
+struct KillTree(Option<u32>);
+
+impl KillTree {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for KillTree {
+    fn drop(&mut self) {
+        let Some(pid) = self.0 else { return };
+        let shown = std::process::Command::new("/bin/ps")
+            // Apart: what follows `=` is a header, to the argument's end.
+            .args(["-ax", "-o", "pid=", "-o", "ppid="])
+            .output();
+        let shown = shown.map(|o| o.stdout).unwrap_or_default();
+        let tree = process_tree(pid, &String::from_utf8_lossy(&shown));
+        // From the top, so nothing below it is started meanwhile.
+        for pid in tree
+            .into_iter()
+            .filter_map(|p| libc::pid_t::try_from(p).ok())
+        {
+            // SAFETY: a plain system call; a process already gone is fine.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// `pid` and its descendants, parents first, from lines of `<pid> <ppid>`.
+fn process_tree(pid: u32, shown: &str) -> Vec<u32> {
+    let parents: Vec<(u32, u32)> = shown
+        .lines()
+        .filter_map(|l| {
+            let mut words = l.split_whitespace();
+            Some((words.next()?.parse().ok()?, words.next()?.parse().ok()?))
+        })
+        .collect();
+    let mut tree = vec![pid];
+    let mut at = 0;
+    while let Some(&parent) = tree.get(at) {
+        at += 1;
+        for (child, _) in parents.iter().filter(|(_, p)| *p == parent) {
+            if !tree.contains(child) {
+                tree.push(*child);
+            }
+        }
+    }
+    tree
+}
+
 /// One `RUN` step of a build: a command in a jail on a directory, which
 /// is the build's file system as it stands.
 pub struct Step<'a> {
@@ -164,9 +216,10 @@ impl JailRuntime {
     ) -> Result<i32> {
         let (rec, jid) = self.running_jid(id)?;
         let mut command = self.shim_exec(&rec, jid, cmd, stdin, tty);
-        // Gone with its caller, as an attached run's command is. Unless it
-        // reads the caller's terminal (where only the foreground group
-        // may), in a group of its own, so what it started goes too.
+        // Gone with its caller, as an attached run's command is, and what
+        // it started too: by its group, or where it reads the caller's
+        // terminal (only the foreground group may, and job control must
+        // reach it and the caller alike) by its descendants.
         command.kill_on_drop(true);
         let own_group = !stdin && !tty;
         if own_group {
@@ -174,9 +227,11 @@ impl JailRuntime {
         }
         let mut child = command.spawn().map_err(internal)?;
         let group = KillGroup(own_group.then(|| child.id()).flatten());
+        let tree = KillTree((!own_group).then(|| child.id()).flatten());
         let status = child.wait().await;
-        // Reaped now, so its group's id may be another's soon.
+        // Reaped now, so its ids may be another's soon.
         group.disarm();
+        tree.disarm();
         Ok(exit_code(status.map_err(internal)?))
     }
 
@@ -628,6 +683,15 @@ fn unlinked(root: &Path, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_process_tree_is_what_descends_from_it() {
+        let shown = "  1  0\n 10  1\n 11 10\n 12 11\n 13  1\n 14 12\n junk\n";
+        assert_eq!(process_tree(10, shown), [10, 11, 12, 14]);
+        // Gone already: only itself, which a kill then misses harmlessly.
+        assert_eq!(process_tree(99, shown), [99]);
+        assert_eq!(process_tree(99, ""), [99]);
+    }
 
     /// A step's working directory through a link (FreeBSD's /home) is
     /// where the jail will find it, links resolved inside the root.

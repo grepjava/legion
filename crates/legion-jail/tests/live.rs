@@ -661,6 +661,20 @@ async fn standalone_containers_and_build_steps() {
         rt.exec(&app, &gone).await.unwrap().exit_code == 0
     })
     .await;
+    // And on this process's terminal or input, where it shares this
+    // process's group.
+    for (stdin, tty) in [(false, true), (true, false)] {
+        let started = rt.exec_inherit(&app, &starts, stdin, tty);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), started)
+                .await
+                .is_err()
+        );
+        until("the exec's child to go with it", async || {
+            rt.exec(&app, &gone).await.unwrap().exit_code == 0
+        })
+        .await;
+    }
     rt.stop(&app, Duration::from_secs(5)).await.unwrap();
     assert!(!rt.inspect(&app).await.unwrap().state.running);
 
