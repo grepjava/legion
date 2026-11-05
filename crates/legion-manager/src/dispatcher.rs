@@ -531,9 +531,16 @@ impl DispatcherService {
             {
                 return Ok(VolumeClaim::Elsewhere(m.to.clone()));
             }
+            let storage = spec.exclusive_storage();
             if status.node == node && status.dataset == dataset {
+                if let Some(storage) = &storage
+                    && let Some(other) = self.hold(storage, namespace, name, node).await?
+                {
+                    return Ok(VolumeClaim::Elsewhere(other));
+                }
                 return Ok(VolumeClaim::Claimed(Box::new(spec)));
             }
+            let before = (status.node.clone(), status.dataset.clone());
             volume.status = serde_json::to_value(VolumeStatus {
                 node: node.to_owned(),
                 dataset: dataset.to_owned(),
@@ -542,12 +549,190 @@ impl DispatcherService {
             .map_err(internal)?;
             let version = volume.metadata.version;
             match self.write(volume, Precondition::Version(version)).await? {
-                Outcome::Written(_) => return Ok(VolumeClaim::Claimed(Box::new(spec))),
+                Outcome::Written(_) => {
+                    // The storage behind it may be another Volume's: held
+                    // by that one, this one goes back as it was.
+                    if let Some(storage) = &storage
+                        && let Some(other) = self.hold(storage, namespace, name, node).await?
+                    {
+                        self.undo_claim(&key, node, before).await;
+                        return Ok(VolumeClaim::Elsewhere(other));
+                    }
+                    return Ok(VolumeClaim::Claimed(Box::new(spec)));
+                }
                 Outcome::Conflict { .. } => continue,
                 other => return Err(unexpected(other)),
             }
         }
         Err(Status::unavailable(format!("{key} keeps changing")))
+    }
+
+    /// Puts back who held `key` before `node`'s claim, which lost its
+    /// storage to another Volume: left in place, the claim would go on
+    /// holding that storage for a node that never got it.
+    async fn undo_claim(&self, key: &ObjectKey, node: &str, before: (String, String)) {
+        for _ in 0..ATTEMPTS {
+            let Ok(Some(mut volume)) = self.get(key) else {
+                return;
+            };
+            let mut status: VolumeStatus =
+                serde_json::from_value(volume.status.clone()).unwrap_or_default();
+            if status.node != node {
+                return;
+            }
+            (status.node, status.dataset) = before.clone();
+            let Ok(value) = serde_json::to_value(status) else {
+                return;
+            };
+            volume.status = value;
+            let version = volume.metadata.version;
+            match self.write(volume, Precondition::Version(version)).await {
+                Ok(Outcome::Conflict { .. }) => continue,
+                Ok(_) => return,
+                Err(e) => {
+                    tracing::warn!(%key, error = %e, "undoing a claim of storage another Volume holds");
+                    return;
+                }
+            }
+        }
+        tracing::warn!(%key, "undoing a claim of storage another Volume holds: it keeps changing");
+    }
+
+    /// Records `namespace/name`, held by `node`, as what holds `storage`
+    /// (a LUN or plugin volume one node at a time uses), unless another
+    /// Volume naming it holds it: that one's node then. The record is the
+    /// one place claims of the storage meet, so two Volumes naming it,
+    /// aliases, are never held at once; an entry stands only while its
+    /// Volume still names the storage and is held by its node, so a Volume
+    /// deleted, changed or let go of holds nothing. Volumes held before the
+    /// record was kept are found and recorded first.
+    async fn hold(
+        &self,
+        storage: &str,
+        namespace: &str,
+        name: &str,
+        node: &str,
+    ) -> Result<Option<String>, Status> {
+        let key = storage_key();
+        let mine = StorageHolder {
+            namespace: namespace.to_owned(),
+            volume: name.to_owned(),
+            node: node.to_owned(),
+        };
+        for _ in 0..ATTEMPTS {
+            let existing = self.get(&key)?;
+            let mut held: BTreeMap<String, StorageHolder> = match &existing {
+                Some(o) => serde_json::from_value(o.spec.clone()).map_err(internal)?,
+                None => BTreeMap::new(),
+            };
+            let recorded = held.get(storage).cloned();
+            let holder = match recorded.clone().filter(|h| self.holds(storage, h)) {
+                Some(h) => Some(h),
+                None => self.found_holder(storage, namespace, name)?,
+            };
+            let entry = match holder {
+                Some(h) if h.namespace != namespace || h.volume != name => {
+                    if recorded.as_ref() == Some(&h) {
+                        return Ok(Some(h.node));
+                    }
+                    h
+                }
+                _ if recorded.as_ref() == Some(&mine) => return Ok(None),
+                _ => mine.clone(),
+            };
+            let other = (entry != mine).then(|| entry.node.clone());
+            held.insert(storage.to_owned(), entry);
+            let spec = serde_json::to_value(&held).map_err(internal)?;
+            let precondition = existing.map_or(Precondition::MustNotExist, |o| {
+                Precondition::Version(o.metadata.version)
+            });
+            let object = Object::new(key.kind, &key.namespace, &key.name, spec);
+            match self.write(object, precondition).await? {
+                Outcome::Written(_) => return Ok(other),
+                Outcome::Conflict { .. } => continue,
+                other => return Err(unexpected(other)),
+            }
+        }
+        Err(Status::unavailable(format!("{key} keeps changing")))
+    }
+
+    /// Whether `h` still holds `storage`: its Volume names it and is held
+    /// by its node.
+    fn holds(&self, storage: &str, h: &StorageHolder) -> bool {
+        let key = ObjectKey::new(Kind::Volume, &h.namespace, &h.volume);
+        let Ok(Some(volume)) = self.get(&key) else {
+            return false;
+        };
+        let names = serde_json::from_value::<VolumeSpec>(volume.spec)
+            .ok()
+            .and_then(|s| s.exclusive_storage())
+            .is_some_and(|s| s == storage);
+        let status: VolumeStatus = serde_json::from_value(volume.status).unwrap_or_default();
+        names && !h.node.is_empty() && status.node == h.node
+    }
+
+    /// Another Volume naming `storage` that a node holds, though none is
+    /// recorded: one held before the record was kept, or one whose claim
+    /// is under way.
+    fn found_holder(
+        &self,
+        storage: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<StorageHolder>, Status> {
+        let volumes = self.store().list(Kind::Volume, None).map_err(internal)?;
+        Ok(volumes.objects.into_iter().find_map(|v| {
+            if v.metadata.namespace == namespace && v.metadata.name == name {
+                return None;
+            }
+            let spec: VolumeSpec = serde_json::from_value(v.spec).ok()?;
+            let status: VolumeStatus = serde_json::from_value(v.status).unwrap_or_default();
+            let held =
+                spec.exclusive_storage().as_deref() == Some(storage) && !status.node.is_empty();
+            held.then_some(StorageHolder {
+                namespace: v.metadata.namespace,
+                volume: v.metadata.name,
+                node: status.node,
+            })
+        }))
+    }
+
+    /// Forgets that `namespace/name` holds `storage`, once let go of; an
+    /// entry left behind holds nothing anyway.
+    async fn unhold(&self, storage: &str, namespace: &str, name: &str) {
+        let key = storage_key();
+        for _ in 0..ATTEMPTS {
+            let Ok(Some(existing)) = self.get(&key) else {
+                return;
+            };
+            let Ok(mut held) =
+                serde_json::from_value::<BTreeMap<String, StorageHolder>>(existing.spec.clone())
+            else {
+                return;
+            };
+            if !held
+                .get(storage)
+                .is_some_and(|h| h.namespace == namespace && h.volume == name)
+            {
+                return;
+            }
+            held.remove(storage);
+            let Ok(spec) = serde_json::to_value(&held) else {
+                return;
+            };
+            let object = Object::new(key.kind, &key.namespace, &key.name, spec);
+            match self
+                .write(object, Precondition::Version(existing.metadata.version))
+                .await
+            {
+                Ok(Outcome::Conflict { .. }) => continue,
+                Ok(_) => return,
+                Err(e) => {
+                    tracing::warn!(storage, error = %e, "forgetting a storage holder");
+                    return;
+                }
+            }
+        }
     }
 
     /// Unbinds a volume used one node at a time from `node`, which has let
@@ -573,7 +758,12 @@ impl DispatcherService {
             volume.status = serde_json::to_value(VolumeStatus::default()).map_err(internal)?;
             let version = volume.metadata.version;
             match self.write(volume, Precondition::Version(version)).await? {
-                Outcome::Written(_) => return Ok(VolumeClaim::Claimed(Box::new(spec))),
+                Outcome::Written(_) => {
+                    if let Some(storage) = spec.exclusive_storage() {
+                        self.unhold(&storage, namespace, name).await;
+                    }
+                    return Ok(VolumeClaim::Claimed(Box::new(spec)));
+                }
                 Outcome::Conflict { .. } => continue,
                 other => return Err(unexpected(other)),
             }
@@ -1658,6 +1848,23 @@ fn choose_subnet(
 }
 
 /// Node subnets by node name, in the reserved namespace.
+/// Which Volume holds each storage one node at a time uses, by
+/// [`VolumeSpec::exclusive_storage`].
+fn storage_key() -> ObjectKey {
+    ObjectKey::new(
+        Kind::Config,
+        crate::join::SYSTEM_NAMESPACE,
+        "exclusive-storage",
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct StorageHolder {
+    namespace: String,
+    volume: String,
+    node: String,
+}
+
 fn subnets_key() -> ObjectKey {
     ObjectKey::new(Kind::Config, crate::join::SYSTEM_NAMESPACE, "node-subnets")
 }

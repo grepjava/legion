@@ -221,7 +221,7 @@ impl ApiService {
         let _counting = match crate::quota::counts(desired.kind)
             || matches!(
                 desired.kind,
-                Kind::Route | Kind::Namespace | Kind::Job | Kind::CronJob
+                Kind::Route | Kind::Namespace | Kind::Job | Kind::CronJob | Kind::Volume
             ) {
             true => Some(self.quota_lock.lock().await),
             false => None,
@@ -268,6 +268,7 @@ impl ApiService {
             crate::quota::check(&self.store, &object)?;
             crate::security::check(&self.store, &object)?;
             check_host(&self.store, &object)?;
+            check_alias(&self.store, &object)?;
             if req.dry_run {
                 return Ok(ApplyResponse {
                     object: Some((&object).into()),
@@ -325,6 +326,38 @@ fn check_host(store: &Store, next: &Object) -> Result<(), Status> {
             return Err(Status::failed_precondition(format!(
                 "host {}: namespace {} routes {}, and a host belongs to one namespace",
                 spec.host, r.metadata.namespace, theirs.host
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a Volume naming storage one node at a time uses (an iSCSI LUN,
+/// a plugin's volume) that another Volume, in any namespace, names already:
+/// claims hold a Volume, and two of them could otherwise be held by two
+/// nodes mounting the one LUN. The other is not named: it may be in a
+/// namespace the caller cannot read. Claims check the same on their own.
+fn check_alias(store: &Store, next: &Object) -> Result<(), Status> {
+    use legion_api::volume::VolumeSpec;
+    if next.kind != Kind::Volume {
+        return Ok(());
+    }
+    let spec: VolumeSpec = legion_api::parse(&next.spec).map_err(invalid)?;
+    let Some(storage) = spec.exclusive_storage() else {
+        return Ok(());
+    };
+    let key = next.key();
+    for other in store.list(Kind::Volume, None).map_err(internal)?.objects {
+        if other.key() == key {
+            continue;
+        }
+        let Ok(theirs) = legion_api::parse::<VolumeSpec>(&other.spec) else {
+            continue;
+        };
+        if theirs.exclusive_storage().as_deref() == Some(storage.as_str()) {
+            return Err(Status::already_exists(format!(
+                "{key}: another Volume names this storage already, and it is used by one \
+                 node at a time; use that Volume"
             )));
         }
     }

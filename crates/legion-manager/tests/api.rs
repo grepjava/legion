@@ -416,7 +416,9 @@ fn creds(ca: &Ca, name: &str, role: Role) -> ClientTlsConfig {
     client_config(ca.cert_pem(), &issued.cert_pem, &issued.key_pem)
 }
 
-/// Makes `managers[0]` the first member and the others voters.
+/// Makes `managers[0]` the first member and the others voters. Leadership
+/// can move on a busy host as the cluster forms, so each change goes to
+/// whichever manager takes it.
 async fn form_cluster(managers: &[Running]) {
     managers[0]
         .cluster()
@@ -424,8 +426,8 @@ async fn form_cluster(managers: &[Running]) {
         .init(InitRequest {})
         .await
         .unwrap();
-    let leader_raft = managers[0].store.raft.clone();
-    for m in &managers[1..] {
+    let mut ids = Vec::new();
+    for m in managers {
         let id = m
             .cluster()
             .await
@@ -434,29 +436,37 @@ async fn form_cluster(managers: &[Running]) {
             .unwrap()
             .into_inner()
             .node_id;
-        leader_raft
-            .add_learner(
-                id,
-                BasicNode {
-                    addr: m.addr.clone(),
-                },
-                true,
-            )
-            .await
-            .unwrap();
+        ids.push(id);
     }
-    let ids: Vec<u64> = leader_raft
-        .metrics()
-        .borrow()
-        .membership_config
-        .membership()
-        .nodes()
-        .map(|(id, _)| *id)
-        .collect();
-    leader_raft
-        .change_membership(ids.clone(), false)
-        .await
-        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    for (m, id) in managers.iter().zip(&ids).skip(1) {
+        let node = BasicNode {
+            addr: m.addr.clone(),
+        };
+        'added: loop {
+            for leader in managers {
+                match leader.store.raft.add_learner(*id, node.clone(), true).await {
+                    Ok(_) => break 'added,
+                    Err(e) => assert!(tokio::time::Instant::now() < deadline, "{e}"),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    'changed: loop {
+        for leader in managers {
+            match leader
+                .store
+                .raft
+                .change_membership(ids.clone(), false)
+                .await
+            {
+                Ok(_) => break 'changed,
+                Err(e) => assert!(tokio::time::Instant::now() < deadline, "{e}"),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     // Every manager knows the cluster before the test talks to it: one
     // that has not yet heard the membership says it is in none.
     for m in managers {
@@ -834,21 +844,9 @@ async fn nodes_join_with_tokens() {
     // A worker gets a worker certificate and no CA key.
     let worker_token = token("worker", false).await;
     assert_ne!(worker_token, manager_token);
-    // Through a follower, which may not know the leader for a moment.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let worker = loop {
-        match legion_manager::join(&second.addr, &worker_token, "w1", 0, "").await {
-            Ok(j) => break j,
-            Err(e)
-                if e.downcast_ref::<tonic::Status>()
-                    .is_some_and(|s| s.code() == Code::Unavailable)
-                    && tokio::time::Instant::now() < deadline =>
-            {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(e) => panic!("{e}"),
-        }
-    };
+    let worker = legion_manager::join(&second.addr, &worker_token, "w1", 0, "")
+        .await
+        .unwrap();
     assert_eq!(worker.role, Role::Worker);
     assert!(worker.tls.ca_key_pem.is_none());
     let bundle = legion_pki::Bundle {
@@ -3154,6 +3152,317 @@ async fn a_volume_in_use_is_not_deleted() {
     let err = delete("lun").await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
     assert!(err.message().contains("mounted by task"), "{err}");
+    m.stop().await;
+}
+
+/// Two Volumes naming one LUN, in two namespaces, are never held by two
+/// nodes at once: each would mount the same UFS. A second one is refused,
+/// and one already there (from before the check) waits for the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lun_two_volumes_name_is_held_by_one_node() {
+    use legion_api::dispatch::VolumeClaim;
+    use legion_api::{Kind, Object as Stored, ObjectKey};
+    let m = Running::start().await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let d = DispatcherClient::new(m.channel(None).await.unwrap());
+    for node in ["w1", "w2"] {
+        let d = d.clone();
+        eventually(move || {
+            let mut d = d.clone();
+            async move {
+                d.register(RegisterRequest {
+                    node: node.into(),
+                    status_json: br#"{"state":"ready"}"#.to_vec(),
+                    ..Default::default()
+                })
+                .await
+            }
+        })
+        .await;
+    }
+    let beating = {
+        let d = d.clone();
+        tokio::spawn(async move {
+            loop {
+                for node in ["w1", "w2"] {
+                    let _ = d
+                        .clone()
+                        .heartbeat(HeartbeatRequest {
+                            node: node.into(),
+                            usage: Vec::new(),
+                        })
+                        .await;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
+    let put = |object: Stored| {
+        let raft = m.store.raft.clone();
+        async move {
+            raft.client_write(legion_store::Command::Put {
+                object,
+                precondition: legion_store::Precondition::None,
+            })
+            .await
+            .unwrap();
+        }
+    };
+    let lun = |portal: &str, target: &str| {
+        serde_json::json!({
+            "driver": "iscsi",
+            "iscsi": { "portal": portal, "target": target, "lun": 0 },
+        })
+    };
+    let objects = m.objects().await;
+    objects
+        .clone()
+        .apply(object("Namespace", "", "other", serde_json::json!({})))
+        .await
+        .unwrap();
+    apply_json(&m, "Volume", "a", lun("192.0.2.5", "iqn.2026-11.test:shop")).await;
+
+    // Another Volume for the same LUN, by another portal and in another
+    // namespace, is refused, and says nothing of the first.
+    let err = objects
+        .clone()
+        .apply(object(
+            "Volume",
+            "other",
+            "b",
+            lun("san.test:3260", "iqn.2026-11.TEST:Shop"),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::AlreadyExists, "{err}");
+    assert!(!err.message().contains("default/a"), "{err}");
+
+    // One there already, as before the check, and a task on each node
+    // using one of the two.
+    put(Stored::new(
+        Kind::Volume,
+        "other",
+        "b",
+        lun("san.test:3260", "iqn.2026-11.TEST:Shop"),
+    ))
+    .await;
+    for (namespace, task, node, volume) in
+        [("default", "ta", "w1", "a"), ("other", "tb", "w2", "b")]
+    {
+        let mut t = Stored::new(
+            Kind::Task,
+            namespace,
+            task,
+            serde_json::json!({
+                "service": task,
+                "serviceUid": "0000000000000000",
+                "serviceGeneration": 1,
+                "slot": 1,
+                "node": node,
+                "pod": {
+                    "containers": [{
+                        "name": "db", "image": "db:1",
+                        "volumeMounts": [{ "name": "data", "path": "/data" }],
+                    }],
+                    "volumes": [{ "name": "data", "volume": { "name": volume } }],
+                },
+            }),
+        );
+        t.status = serde_json::json!({ "state": "preparing" });
+        put(t).await;
+    }
+    let claim = |node: &str, namespace: &str, name: &str, release: bool| {
+        let mut d = d.clone();
+        let (node, namespace, name) = (node.to_owned(), namespace.to_owned(), name.to_owned());
+        async move {
+            let r = d
+                .claim_volume(ClaimVolumeRequest {
+                    node,
+                    namespace,
+                    name,
+                    dataset: String::new(),
+                    release,
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            serde_json::from_slice::<VolumeClaim>(&r.claim_json).unwrap()
+        }
+    };
+    let holder = |namespace: &str, name: &str| {
+        m.store
+            .get(&ObjectKey::new(Kind::Volume, namespace, name))
+            .unwrap()
+            .unwrap()
+            .status
+            .get("node")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_owned()
+    };
+
+    assert!(matches!(
+        claim("w1", "default", "a", false).await,
+        VolumeClaim::Claimed(_)
+    ));
+    let second = claim("w2", "other", "b", false).await;
+    assert!(
+        matches!(&second, VolumeClaim::Elsewhere(n) if n == "w1"),
+        "{second:?}"
+    );
+    assert_eq!(holder("other", "b"), "", "the refused claim is undone");
+    // The holder claims again, as after an agent restart: still its.
+    assert!(matches!(
+        claim("w1", "default", "a", false).await,
+        VolumeClaim::Claimed(_)
+    ));
+
+    // Let go of, the LUN may be the other's.
+    claim("w1", "default", "a", true).await;
+    assert!(matches!(
+        claim("w2", "other", "b", false).await,
+        VolumeClaim::Claimed(_)
+    ));
+    let first = claim("w1", "default", "a", false).await;
+    assert!(
+        matches!(&first, VolumeClaim::Elsewhere(n) if n == "w2"),
+        "{first:?}"
+    );
+    assert_eq!(holder("default", "a"), "");
+
+    beating.abort();
+    m.stop().await;
+}
+
+/// Two nodes claiming two Volumes of one LUN at once: one holds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aliases_claimed_at_once_are_held_once() {
+    use legion_api::dispatch::VolumeClaim;
+    use legion_api::{Kind, Object as Stored};
+    let m = Running::start().await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let d = DispatcherClient::new(m.channel(None).await.unwrap());
+    let nodes: Vec<String> = (1..=4).map(|n| format!("w{n}")).collect();
+    for node in &nodes {
+        let d = d.clone();
+        let node = node.clone();
+        eventually(move || {
+            let mut d = d.clone();
+            let node = node.clone();
+            async move {
+                d.register(RegisterRequest {
+                    node,
+                    status_json: br#"{"state":"ready"}"#.to_vec(),
+                    ..Default::default()
+                })
+                .await
+            }
+        })
+        .await;
+    }
+    let beating = {
+        let (d, nodes) = (d.clone(), nodes.clone());
+        tokio::spawn(async move {
+            loop {
+                for node in &nodes {
+                    let _ = d
+                        .clone()
+                        .heartbeat(HeartbeatRequest {
+                            node: node.clone(),
+                            usage: Vec::new(),
+                        })
+                        .await;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
+    for (i, node) in nodes.iter().enumerate() {
+        let volume = format!("v{i}");
+        for object in [
+            Stored::new(
+                Kind::Volume,
+                "default",
+                &volume,
+                serde_json::json!({
+                    "driver": "iscsi",
+                    "iscsi": { "portal": "192.0.2.5", "target": "iqn.2026-11.test:one", "lun": 3 },
+                }),
+            ),
+            Stored {
+                status: serde_json::json!({ "state": "preparing" }),
+                ..Stored::new(
+                    Kind::Task,
+                    "default",
+                    &format!("t{i}"),
+                    serde_json::json!({
+                            "service": format!("t{i}"),
+                            "serviceUid": "0000000000000000",
+                    "serviceGeneration": 1,
+                            "slot": 1,
+                            "node": node,
+                            "pod": {
+                                "containers": [{ "name": "db", "image": "db:1" }],
+                                "volumes": [{ "name": "data", "volume": { "name": volume } }],
+                            },
+                        }),
+                )
+            },
+        ] {
+            m.store
+                .raft
+                .client_write(legion_store::Command::Put {
+                    object,
+                    precondition: legion_store::Precondition::None,
+                })
+                .await
+                .unwrap();
+        }
+    }
+    for _ in 0..5 {
+        let mut claims = tokio::task::JoinSet::new();
+        for (i, node) in nodes.iter().enumerate() {
+            let mut d = d.clone();
+            let node = node.clone();
+            claims.spawn(async move {
+                let r = d
+                    .claim_volume(ClaimVolumeRequest {
+                        node,
+                        namespace: "default".into(),
+                        name: format!("v{i}"),
+                        dataset: String::new(),
+                        release: false,
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner();
+                (
+                    i,
+                    serde_json::from_slice::<VolumeClaim>(&r.claim_json).unwrap(),
+                )
+            });
+        }
+        let got = claims.join_all().await;
+        let held: Vec<usize> = got
+            .iter()
+            .filter(|(_, c)| matches!(c, VolumeClaim::Claimed(_)))
+            .map(|(i, _)| *i)
+            .collect();
+        assert_eq!(held.len(), 1, "{got:?}");
+        // Let the holder go for the next round.
+        let i = held[0];
+        d.clone()
+            .claim_volume(ClaimVolumeRequest {
+                node: nodes[i].clone(),
+                namespace: "default".into(),
+                name: format!("v{i}"),
+                dataset: String::new(),
+                release: true,
+            })
+            .await
+            .unwrap();
+    }
+    beating.abort();
     m.stop().await;
 }
 

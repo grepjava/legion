@@ -469,6 +469,9 @@ pub struct Joined {
 /// Joins the cluster at `addr` (`host:port` of any manager) as `name`.
 /// Managers pass their Raft id and the address other managers reach them
 /// at.
+/// How long a join waits out a cluster without a leader.
+const JOIN_PATIENCE: Duration = Duration::from_secs(15);
+
 pub async fn join(
     addr: &str,
     token: &str,
@@ -486,16 +489,27 @@ pub async fn join(
         .tls_config(tls)?
         .connect()
         .await?;
-    let resp = JoinClient::new(channel)
-        .join(JoinRequest {
-            token: token.to_string(),
-            name: name.to_owned(),
-            csr_pem,
-            node_id,
-            advertise: advertise.to_owned(),
-        })
-        .await?
-        .into_inner();
+    let request = JoinRequest {
+        token: token.to_string(),
+        name: name.to_owned(),
+        csr_pem,
+        node_id,
+        advertise: advertise.to_owned(),
+    };
+    // A cluster between leaders answers Unavailable for a moment; a failed
+    // try leaves nothing behind.
+    let deadline = tokio::time::Instant::now() + JOIN_PATIENCE;
+    let resp = loop {
+        match JoinClient::new(channel.clone()).join(request.clone()).await {
+            Err(s)
+                if s.code() == tonic::Code::Unavailable
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            answer => break answer?.into_inner(),
+        }
+    };
     let role = Role::parse(&resp.role).ok_or("the manager answered with an unknown role")?;
     if resp.ca_pem.trim() != ca_pem.trim() && legion_pki::digest(&resp.ca_pem)? != token.ca_digest {
         return Err("the manager answered with another CA".into());

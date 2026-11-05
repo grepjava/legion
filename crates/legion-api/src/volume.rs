@@ -128,6 +128,32 @@ impl VolumeSpec {
             && self.iscsi == other.iscsi
             && self.plugin == other.plugin
     }
+
+    /// What a Volume used by one node at a time stands for, alike for every
+    /// Volume naming the same storage: an iSCSI target's LUN, whichever
+    /// portal reaches it (target names are case-insensitive), or a plugin's
+    /// volume with its options. `None` for storage several nodes share, and
+    /// for ZFS, which is each Volume's own dataset.
+    pub fn exclusive_storage(&self) -> Option<String> {
+        if self.access() != Access::Single {
+            return None;
+        }
+        match self.driver {
+            VolumeDriver::Iscsi => self
+                .iscsi
+                .as_ref()
+                .map(|i| format!("iscsi {} {}", i.target.trim().to_ascii_lowercase(), i.lun)),
+            VolumeDriver::Plugin => self.plugin.as_ref().map(|p| {
+                let options: Vec<String> = p
+                    .options
+                    .iter()
+                    .map(|(k, v)| format!("{k:?}={v:?}"))
+                    .collect();
+                format!("plugin {:?} {}", p.name, options.join(" "))
+            }),
+            _ => None,
+        }
+    }
 }
 
 impl Spec for VolumeSpec {
@@ -302,6 +328,45 @@ mod tests {
         let p = admit("driver: plugin\nplugin: { name: s3fs, shared: true }").unwrap();
         assert_eq!(p.access(), Access::Shared);
         assert!(admit("driver: nfs\nnfs: { server: 'fd00::5', path: /x }").is_ok());
+    }
+
+    #[test]
+    fn storage_one_node_holds_is_known_however_it_is_reached() {
+        let lun = |portal: &str, target: &str, lun: u32| {
+            admit(&format!(
+                "driver: iscsi\niscsi: {{ portal: '{portal}', target: '{target}', lun: {lun} }}"
+            ))
+            .unwrap()
+            .exclusive_storage()
+        };
+        let a = lun("10.0.0.5:3260", "iqn.2026-10.lan:shop", 1);
+        assert!(a.is_some());
+        assert_eq!(
+            a,
+            lun("san.lan", "iqn.2026-10.LAN:Shop", 1),
+            "another portal"
+        );
+        assert_ne!(
+            a,
+            lun("10.0.0.5:3260", "iqn.2026-10.lan:shop", 2),
+            "another LUN"
+        );
+        let ceph = |pool: &str| {
+            admit(&format!(
+                "driver: plugin\nplugin: {{ name: ceph, options: {{ pool: {pool} }} }}"
+            ))
+            .unwrap()
+            .exclusive_storage()
+        };
+        assert_eq!(ceph("rbd"), ceph("rbd"));
+        assert_ne!(ceph("rbd"), ceph("other"));
+        for shared in [
+            "size: 1Gi",
+            "driver: nfs\nnfs: { server: files.lan, path: /export/shop }",
+            "driver: plugin\nplugin: { name: s3fs, shared: true }",
+        ] {
+            assert_eq!(admit(shared).unwrap().exclusive_storage(), None, "{shared}");
+        }
     }
 
     #[test]
