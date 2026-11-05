@@ -169,6 +169,53 @@ async fn pods_of_jails() {
     assert_eq!(params["securelevel"], "2", "{params:?}");
     assert_eq!(params["vnet"], "inherit", "{params:?}");
 
+    // A child jail may have only what its parent has: a pod's allows what
+    // one container asks for, and the other keeps its locked profile.
+    let open = "allow.raw_sockets=true allow.chflags=true enforce_statfs=1";
+    let loose_pod = rt
+        .create(&ContainerSpec {
+            name: "shop_loose".into(),
+            image: IMAGE.into(),
+            hostname: Some("loose-0".into()),
+            labels: labels("t2", "infra"),
+            annotations: BTreeMap::from([
+                ("org.freebsd.jail.vnet".to_owned(), "new".to_owned()),
+                ("legion.jail".to_owned(), open.to_owned()),
+            ]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    rt.start(&loose_pod).await.unwrap();
+    sys.jail_set(&loose_pod, &[("children.max", "4")]).unwrap();
+    let mut spec = member("shop_loose_open", &loose_pod, "sleep 300");
+    spec.labels = labels("t2", "app");
+    spec.annotations
+        .insert("legion.jail".into(), format!("{open} securelevel=2"));
+    let loose = rt.create(&spec).await.unwrap();
+    rt.start(&loose).await.unwrap();
+    let mut spec = member("shop_loose_locked", &loose_pod, "sleep 300");
+    spec.labels = labels("t2", "app");
+    let locked = rt.create(&spec).await.unwrap();
+    rt.start(&locked).await.unwrap();
+    let names = ["allow.raw_sockets", "allow.chflags", "enforce_statfs"];
+    let got = sys
+        .jail_get(&format!("{loose_pod}.{loose}"), &names)
+        .unwrap();
+    assert_eq!(got["allow.raw_sockets"], "true", "{got:?}");
+    assert_eq!(got["allow.chflags"], "true", "{got:?}");
+    assert_eq!(got["enforce_statfs"], "1", "{got:?}");
+    let got = sys
+        .jail_get(&format!("{loose_pod}.{locked}"), &names)
+        .unwrap();
+    assert_eq!(got["allow.raw_sockets"], "false", "{got:?}");
+    assert_eq!(got["allow.chflags"], "false", "{got:?}");
+    assert_eq!(got["enforce_statfs"], "2", "{got:?}");
+    for id in [&loose, &locked, &loose_pod] {
+        rt.stop(id, Duration::from_secs(1)).await.unwrap();
+        rt.remove(id).await.unwrap();
+    }
+
     // Exec, as the container: its environment, hostname, network.
     let out = rt
         .exec(
@@ -185,6 +232,21 @@ async fn pods_of_jails() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "bar\n0\nweb-0\nlo0\n");
     let out = rt.exec(&app, &["/nonexistent".into()]).await.unwrap();
     assert_ne!(out.exit_code, 0);
+    // Output past what is kept is read all the same: it ends well.
+    let noisy = "dd if=/dev/zero bs=1m count=3 2>/dev/null".to_owned();
+    let out = rt
+        .exec(&app, &["/bin/sh".into(), "-c".into(), noisy])
+        .await
+        .unwrap();
+    assert_eq!((out.exit_code, out.stdout.len()), (0, 1 << 20));
+    // What holds its environment is root's alone.
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&dir.join("jails")), 0o700);
+    assert_eq!(
+        mode(&dir.join("jails").join(&app).join("record.json")),
+        0o600
+    );
     // One a signal ends: 128 and the signal, as a shell gives it.
     let out = rt
         .exec(

@@ -121,11 +121,31 @@ pub fn write<T: Serialize>(dir: &Path, name: &str, value: &T) -> std::io::Result
     static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(".{name}.{}-{n}.tmp", std::process::id()));
-    std::fs::write(
-        &tmp,
-        serde_json::to_vec(value).map_err(std::io::Error::other)?,
+    let mut file = std::fs::OpenOptions::new();
+    file.write(true).create_new(true);
+    // Whatever the umask: a record holds its container's environment.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
+    std::io::Write::write_all(
+        &mut file.open(&tmp)?,
+        &serde_json::to_vec(value).map_err(std::io::Error::other)?,
     )?;
     std::fs::rename(tmp, dir.join(name))
+}
+
+/// Makes `dir` its owner's alone, as a umask or an earlier version may have
+/// left it open.
+pub fn private(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(dir)?.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 pub fn remove(dir: &Path, name: &str) -> std::io::Result<()> {
@@ -202,6 +222,19 @@ mod tests {
         assert_eq!(signal("99999"), None);
         assert_eq!(signal(""), None);
         assert_eq!(signal("SIGNOPE"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn records_and_their_directory_are_their_owners_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let t = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        private(t.path()).unwrap();
+        assert_eq!(mode(t.path()), 0o700);
+        write(t.path(), "r.json", &1).unwrap();
+        assert_eq!(mode(&t.path().join("r.json")), 0o600);
     }
 
     #[test]

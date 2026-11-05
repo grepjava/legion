@@ -180,6 +180,28 @@ impl Drop for KillGroup {
     }
 }
 
+/// How much of each of an exec's outputs is kept. It is held in the agent,
+/// outside the jail's limits, for a probe that may print without end.
+const EXEC_OUTPUT: usize = 1 << 20;
+
+/// The first `cap` bytes of `from`, reading it to its end: a command must
+/// not block on, or die of, output no one keeps.
+async fn read_capped(
+    from: &mut (impl tokio::io::AsyncRead + Unpin),
+    cap: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut kept = Vec::new();
+    let mut chunk = [0; 8192];
+    loop {
+        let n = from.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(kept);
+        }
+        let room = cap.saturating_sub(kept.len());
+        kept.extend_from_slice(&chunk[..n.min(room)]);
+    }
+}
+
 /// How long a supervisor has to say it started its container.
 const SUPERVISOR_ANSWERS: Duration = if cfg!(test) {
     Duration::from_secs(2)
@@ -505,6 +527,8 @@ impl JailRuntime {
     /// containers ending.
     pub fn new(sys: Arc<dyn Sys>, images: Arc<Store>, config: Config) -> std::io::Result<Self> {
         std::fs::create_dir_all(&config.state_dir)?;
+        // Records hold containers' environments, secrets among them.
+        state::private(&config.state_dir)?;
         let (events, _) = broadcast::channel(256);
         let rt = JailRuntime {
             sys,
@@ -1460,22 +1484,21 @@ impl legion_runtime::Runtime for JailRuntime {
         // its id, and its group's, are no one else's, even if what it
         // started holds the output open after it ends.
         let (mut stdout, mut stderr) = (child.stdout.take(), child.stderr.take());
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        let read = tokio::try_join!(
+        let (out, err) = tokio::try_join!(
             async {
                 match &mut stdout {
-                    Some(s) => s.read_to_end(&mut out).await.map(drop),
-                    None => Ok(()),
+                    Some(s) => read_capped(s, EXEC_OUTPUT).await,
+                    None => Ok(Vec::new()),
                 }
             },
             async {
                 match &mut stderr {
-                    Some(s) => s.read_to_end(&mut err).await.map(drop),
-                    None => Ok(()),
+                    Some(s) => read_capped(s, EXEC_OUTPUT).await,
+                    None => Ok(Vec::new()),
                 }
             },
-        );
-        read.map_err(internal)?;
+        )
+        .map_err(internal)?;
         let status = child.wait().await;
         // Reaped now, so its id may be another's soon.
         group.disarm();
@@ -1866,6 +1889,16 @@ fn pty() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_execs_output_is_kept_up_to_its_cap_and_read_to_its_end() {
+        let all = vec![7u8; 100_000];
+        let mut from = all.as_slice();
+        assert_eq!(read_capped(&mut from, 10_000).await.unwrap().len(), 10_000);
+        assert!(from.is_empty(), "the rest was not read");
+        let mut from = &all[..5];
+        assert_eq!(read_capped(&mut from, 10_000).await.unwrap().len(), 5);
+    }
 
     #[test]
     fn exit_codes_are_a_shells() {
