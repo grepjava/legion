@@ -153,12 +153,14 @@ where
 /// (`*.example.org` included), chosen by the client's SNI.
 #[derive(Debug, Default)]
 pub struct Certificates {
-    by_host: RwLock<BTreeMap<String, Arc<CertifiedKey>>>,
+    /// Each with the namespace whose Secret it came from.
+    by_host: RwLock<BTreeMap<String, (String, Arc<CertifiedKey>)>>,
 }
 
 impl Certificates {
-    /// Parses `pem`, a certificate chain and its private key, for `host`.
-    pub fn set(&self, host: &str, pem: &[u8]) -> Result<(), String> {
+    /// Parses `pem`, a certificate chain and its private key, for `host`,
+    /// from a Secret of `namespace`.
+    pub fn set(&self, host: &str, namespace: &str, pem: &[u8]) -> Result<(), String> {
         let certs = CertificateDer::pem_slice_iter(pem)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("certificates: {e}"))?;
@@ -175,25 +177,28 @@ impl Certificates {
         self.by_host
             .write()
             .unwrap()
-            .insert(host.to_owned(), Arc::new(certified));
+            .insert(host.to_owned(), (namespace.to_owned(), Arc::new(certified)));
         Ok(())
     }
 
-    /// Drops the certificates of hosts not in `hosts`.
-    pub fn retain(&self, hosts: &BTreeSet<String>) {
+    /// Drops the certificates of all but `wanted`, hosts with the namespace
+    /// serving each: a host that moved to another namespace must not go on
+    /// serving the old one's, which its new backend has no right to.
+    pub fn retain(&self, wanted: &BTreeSet<(String, String)>) {
         self.by_host
             .write()
             .unwrap()
-            .retain(|h, _| hosts.contains(h));
+            .retain(|host, (namespace, _)| wanted.contains(&(host.clone(), namespace.clone())));
     }
 
     fn get(&self, sni: &str) -> Option<Arc<CertifiedKey>> {
         let by_host = self.by_host.read().unwrap();
         let sni = sni.to_ascii_lowercase();
-        by_host.get(&sni).cloned().or_else(|| {
+        let found = by_host.get(&sni).or_else(|| {
             let (_, domain) = sni.split_once('.')?;
-            by_host.get(&format!("*.{domain}")).cloned()
-        })
+            by_host.get(&format!("*.{domain}"))
+        });
+        found.map(|(_, certified)| certified.clone())
     }
 }
 
@@ -206,7 +211,7 @@ impl ResolvesServerCert for Certificates {
 /// Keeps `certificates` holding those of the routes' Secrets, read with
 /// `read` (namespace, name) when routes change and every
 /// [`CERTIFICATES_PERIOD`]. One that cannot be read keeps what was read
-/// before.
+/// before, while its host stays in the namespace it was read for.
 pub async fn follow_certificates<F, Fut>(
     mut routes: watch::Receiver<Routes>,
     certificates: Arc<Certificates>,
@@ -224,10 +229,11 @@ pub async fn follow_certificates<F, Fut>(
                 Some((r.spec.host.clone(), r.namespace.clone(), tls.secret.clone()))
             })
             .collect();
-        certificates.retain(&wanted.iter().map(|(h, _, _)| h.clone()).collect());
+        let serving = wanted.iter().map(|(h, n, _)| (h.clone(), n.clone()));
+        certificates.retain(&serving.collect());
         for (host, namespace, secret) in wanted {
             let outcome = match read(namespace.clone(), secret.clone()).await {
-                Ok(Some(pem)) => certificates.set(&host, &pem),
+                Ok(Some(pem)) => certificates.set(&host, &namespace, &pem),
                 Ok(None) => Err("no such Secret".into()),
                 Err(e) => Err(e),
             };
@@ -920,6 +926,43 @@ mod tests {
         let resp = sender.send_request(req).await.map_err(|e| e.to_string())?;
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         Ok(String::from_utf8_lossy(&body).trim().to_owned())
+    }
+
+    /// Seen at once, as coalesced updates are: the host's old route gone
+    /// and a new one in another namespace, its Secret not there.
+    #[tokio::test]
+    async fn a_host_moved_to_another_namespace_keeps_no_certificate_of_the_old() {
+        let mut shop = route("www", "shop.example.org", "/", "web");
+        shop.spec.tls = Some(legion_api::route::RouteTls {
+            secret: "cert".into(),
+            acme: None,
+        });
+        let mut other = shop.clone();
+        other.namespace = "other".into();
+        let (routes_tx, routes) = watch::channel(vec![shop]);
+        let (pem, _) = certificate(&["shop.example.org"]);
+        let certificates: Arc<Certificates> = Arc::default();
+        let read = move |namespace: String, _: String| {
+            let found = (namespace == "shop").then(|| pem.clone().into_bytes());
+            async move { Ok(found) }
+        };
+        tokio::spawn(follow_certificates(routes, certificates.clone(), read));
+        for _ in 0..100 {
+            if certificates.get("shop.example.org").is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(certificates.get("shop.example.org").is_some());
+
+        routes_tx.send_replace(vec![other]);
+        for _ in 0..100 {
+            if certificates.get("shop.example.org").is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the old namespace's certificate is still served");
     }
 
     #[tokio::test]
