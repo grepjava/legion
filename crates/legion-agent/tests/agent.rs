@@ -3112,7 +3112,9 @@ async fn a_pod_started_over_reports_no_address_of_anothers() {
     h.start_agent();
     let st = h.wait_state(&a, TaskState::Failed).await;
     assert_ne!(st.ip.as_deref(), Some(ip.as_str()));
-    assert_eq!(h.status(&b).ip.as_deref(), Some(ip.as_str()));
+    let other = h.status(&b);
+    assert_eq!(other.state, TaskState::Running);
+    assert_eq!(other.ip.as_deref(), Some(ip.as_str()));
 }
 
 /// A volume used one node at a time, claimed by a start that failed before

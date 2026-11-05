@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use legion_api::node::NodeStatus;
-use legion_api::task::{DesiredState, TaskStatus};
+use legion_api::task::{DesiredState, TaskState, TaskStatus};
 use legion_sys::Sys;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -396,14 +396,10 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         // take them.
         {
             let mut ips = ctx.ips.lock().unwrap_or_else(|e| e.into_inner());
-            for (uid, a) in assignments.borrow().iter() {
-                if a.status.state.is_terminal() {
-                    continue;
-                }
-                if let Some(ip) = a.status.ip.as_deref().and_then(|s| s.parse().ok()) {
-                    ips.insert(uid.clone(), ip);
-                }
-            }
+            let assignments = assignments.borrow();
+            ips.extend(held_addresses(
+                assignments.iter().map(|(uid, a)| (uid, &a.status)),
+            ));
         }
 
         let policy = tokio::spawn(policing_loop(
@@ -1190,8 +1186,70 @@ async fn forward_events<R: Runtime, C>(ctx: Ctx<R, C>, tx: mpsc::Sender<Forwarde
     }
 }
 
+/// The addresses of tasks that may still run, as the agent starts. Of tasks
+/// naming one address, only those furthest along hold it: a status left by
+/// a start that went with the last agent must not take the address of a pod
+/// that is running, which adopting it would then remove.
+fn held_addresses<'a>(
+    tasks: impl Iterator<Item = (&'a String, &'a TaskStatus)>,
+) -> Vec<(String, Ipv4Addr)> {
+    let along = |s: &TaskStatus| match s.state {
+        TaskState::Running => 2u8,
+        TaskState::Starting => 1,
+        _ => 0,
+    };
+    let claims: Vec<(&String, Ipv4Addr, u8)> = tasks
+        .filter(|(_, s)| !s.state.is_terminal())
+        .filter_map(|(uid, s)| Some((uid, s.ip.as_deref()?.parse().ok()?, along(s))))
+        .collect();
+    let mut furthest: BTreeMap<Ipv4Addr, u8> = BTreeMap::new();
+    for (_, ip, along) in &claims {
+        let f = furthest.entry(*ip).or_default();
+        *f = (*f).max(*along);
+    }
+    claims
+        .into_iter()
+        .filter(|(_, ip, along)| furthest[ip] == *along)
+        .map(|(uid, ip, _)| (uid.clone(), ip))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_running_pod_keeps_its_address_from_a_stale_status() {
+        use legion_api::task::{TaskState, TaskStatus};
+        let status = |state, ip: &str| TaskStatus {
+            state,
+            ip: Some(ip.to_owned()),
+            ..Default::default()
+        };
+        let tasks = [
+            (
+                "stale".to_owned(),
+                status(TaskState::Preparing, "10.200.0.2"),
+            ),
+            (
+                "running".to_owned(),
+                status(TaskState::Running, "10.200.0.2"),
+            ),
+            (
+                "other".to_owned(),
+                status(TaskState::Preparing, "10.200.0.3"),
+            ),
+            ("gone".to_owned(), status(TaskState::Failed, "10.200.0.4")),
+        ];
+        let mut held = super::held_addresses(tasks.iter().map(|(u, s)| (u, s)));
+        held.sort();
+        assert_eq!(
+            held,
+            [
+                ("other".to_owned(), "10.200.0.3".parse().unwrap()),
+                ("running".to_owned(), "10.200.0.2".parse().unwrap()),
+            ]
+        );
+    }
+
     use std::collections::BTreeMap;
 
     use super::*;
