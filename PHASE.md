@@ -1496,8 +1496,10 @@ on 2026-11-01, carries it with the later reviews' fixes and the open
 issues closed (above), and is the release the port submits; the port at
 v0.1.9 passed `poudriere testport` on 15.1 amd64 (build 18.5 min), and
 both nodes of the two-node cluster run it. v0.1.10, tagged on 2026-11-05,
-has the fourth to eleventh reviews' fixes and is for jailer to move to; the
-port's `distinfo` is made for it, and its crates are v0.1.9's, but it has
-not been through `poudriere testport` yet. Waiting on the user: the
-port's submission, once their FreeBSD Bugzilla account exists.
+has the fourth to eleventh reviews' fixes. v0.1.11, tagged on 2026-11-06,
+has the twelfth and thirteenth's too, and is for jailer to move to: pods
+whose containers loosen their jails could not start on v0.1.10. The port's
+`distinfo` is made for v0.1.11, and its crates are v0.1.9's, but it has
+not been through `poudriere testport` since v0.1.9. Waiting on the user:
+the port's submission, once their FreeBSD Bugzilla account exists.
 
