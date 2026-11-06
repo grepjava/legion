@@ -519,6 +519,9 @@ async fn a_new_manager_catches_up_on_a_log_of_large_objects() {
     let api = first.objects().await;
     let text = "x".repeat(500_000);
     let mut writes = tokio::task::JoinSet::new();
+    // A few at a time: it's the log that is under test, and 70 MB at once on
+    // a busy host outlasts the commit timeout.
+    let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
     for n in 0..140 {
         let config = Object {
             kind: "Config".into(),
@@ -527,7 +530,9 @@ async fn a_new_manager_catches_up_on_a_log_of_large_objects() {
             ..Default::default()
         };
         let api = api.clone();
+        let limit = limit.clone();
         writes.spawn(async move {
+            let _turn = limit.acquire_owned().await.unwrap();
             eventually(|| {
                 let mut api = api.clone();
                 let config = config.clone();
