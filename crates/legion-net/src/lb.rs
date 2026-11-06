@@ -53,7 +53,7 @@ pub enum Proto {
 }
 
 impl Proto {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Proto::Tcp => "tcp",
             Proto::Udp => "udp",
@@ -284,23 +284,26 @@ impl LoadBalancer {
 
 /// The hooks the host's main ruleset lacks.
 pub fn missing_hooks(main_rules: &str) -> Vec<&'static str> {
+    missing_hooks_of(main_rules, "legion/*", HOOKS)
+}
+
+/// Those of `hooks`, the lines for `nat-anchor`, `rdr-anchor` and `anchor`
+/// of `anchor`, that the host's main ruleset lacks: for a tool beside Legion
+/// with anchors of its own.
+pub fn missing_hooks_of<'a>(main_rules: &str, anchor: &str, hooks: [&'a str; 3]) -> Vec<&'a str> {
+    let quoted = format!("\"{anchor}\"");
     let called = |kind: &str| {
         main_rules.lines().any(|l| {
             let l = l.trim();
-            l.starts_with(kind) && l.contains("\"legion/*\"")
+            l.starts_with(kind) && l.contains(&quoted)
         })
     };
-    let mut missing = Vec::new();
-    if !called("nat-anchor") {
-        missing.push(HOOKS[0]);
-    }
-    if !called("rdr-anchor") {
-        missing.push(HOOKS[1]);
-    }
-    if !called("anchor") {
-        missing.push(HOOKS[2]);
-    }
-    missing
+    ["nat-anchor", "rdr-anchor", "anchor"]
+        .into_iter()
+        .zip(hooks)
+        .filter(|(kind, _)| !called(kind))
+        .map(|(_, hook)| hook)
+        .collect()
 }
 
 #[cfg(test)]
