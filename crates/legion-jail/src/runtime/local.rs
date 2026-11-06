@@ -603,63 +603,18 @@ impl Drop for Resolver {
 /// in the jail would: links are followed inside the root (an absolute one
 /// starts again from it, `..` stops at it); directories missing are made.
 fn work_dir_in(root: &Path, dir: &str) -> Result<PathBuf> {
-    // Hops through links before giving up, as the kernel does.
-    const MAX_LINKS: usize = 40;
-    let mut rest: Vec<OsString> = Vec::new();
-    let push = |rest: &mut Vec<OsString>, p: &Path| {
-        // Kept reversed: the next component is last.
-        let mut parts: Vec<OsString> = p
-            .components()
-            .filter_map(|c| match c {
-                Component::Normal(n) => Some(n.to_owned()),
-                Component::ParentDir => Some(OsString::from("..")),
-                _ => None,
-            })
-            .collect();
-        parts.reverse();
-        rest.extend(parts);
-    };
-    push(&mut rest, Path::new(dir));
-    let mut at: Vec<OsString> = Vec::new();
-    let mut links = 0;
-    while let Some(name) = rest.pop() {
-        if name == ".." {
-            at.pop();
-            continue;
-        }
-        let path: PathBuf = std::iter::once(root.as_os_str().to_owned())
-            .chain(at.iter().cloned())
-            .chain([name.clone()])
-            .collect();
-        match std::fs::symlink_metadata(&path) {
-            Ok(m) if m.file_type().is_symlink() => {
-                links += 1;
-                if links > MAX_LINKS {
-                    return Err(api(400, format!("working directory {dir}: too many links")));
-                }
-                let to = std::fs::read_link(&path).map_err(internal)?;
-                if to.is_absolute() {
-                    at.clear();
-                }
-                push(&mut rest, &to);
-            }
-            Ok(m) if m.is_dir() => at.push(name),
-            Ok(_) => {
-                return Err(api(
-                    400,
-                    format!("working directory {dir} is not a directory"),
-                ));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&path).map_err(internal)?;
-                at.push(name);
-            }
-            Err(e) => return Err(internal(e)),
-        }
-    }
-    Ok(std::iter::once(root.as_os_str().to_owned())
-        .chain(at)
-        .collect())
+    crate::inroot::walk(root, dir, true, |path, found| match found {
+        Some(m) if m.is_dir() => Ok(()),
+        Some(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a directory",
+        )),
+        None => std::fs::create_dir(path),
+    })
+    .map_err(|e| match e.kind() {
+        std::io::ErrorKind::InvalidInput => api(400, format!("working directory {dir}: {e}")),
+        _ => internal(e),
+    })
 }
 
 /// Whether `path`, under `root`, is a file reached through no link.

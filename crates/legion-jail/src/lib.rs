@@ -2,6 +2,7 @@
 //! clones of their images, each process under a small supervisor, with no
 //! Podman or OCI runtime.
 
+pub mod inroot;
 pub mod log;
 #[cfg(unix)]
 mod runtime;
