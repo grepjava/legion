@@ -96,7 +96,8 @@ Linux hosts, an ecosystem of tools and charts, or proven production use.
 | Publishing on the node running the task | `publish: host` | `mode=host` | hostPort |
 | External load balancer integration | No | No | LoadBalancer Services (cloud or MetalLB) |
 | HTTP routing by host and path | `Route` objects, served by a proxy in the agent; HTTPS by SNI from Secrets | No | Ingress or Gateway API, with a controller (add-on) |
-| HTTP/2 to backends, automatic certificates (ACME) | No | Not applicable | Depends on the controller |
+| HTTP/2 to backends | No | Not applicable | Depends on the controller |
+| Automatic certificates (ACME) | Yes, for `Route` objects, from Let's Encrypt | Not applicable | Depends on the controller |
 | Namespace isolation by default | Yes (a namespace's tasks reach only each other, unless `open`) | Through separate networks | No (everything reaches everything) |
 | Network policy | Ingress and egress by namespace, labels, ports and CIDR; enforced by pf | No | NetworkPolicy, enforced by the CNI plugin |
 | Nodes behind NAT | Workers, reached through their keepalives; not two nodes behind different NATs | Needs reachable addresses | Depends on the CNI plugin |
@@ -159,9 +160,10 @@ planning soon:
 - Custom resources, operators, admission webhooks, Helm or the Kubernetes
   API (non-goals; see [DESIGN.md](DESIGN.md) §2).
 - Custom roles, pod affinity and anti-affinity, priorities and preemption.
-- Integration with external load balancers, and certificates from ACME.
-- Revoking certificates, and promoting or demoting managers after they
-  join.
+- Integration with external load balancers.
+- Revoking one certificate by itself: a worker's certificates stop working
+  when its node is removed, and a user's access goes with their RoleBindings.
+- Promoting or demoting managers after they join.
 - A relay for nodes that are both behind NAT, and IPv6 NAT to the outside.
 - Virtual machines as tasks: bhyve was tried but is not a runtime yet.
 

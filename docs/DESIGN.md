@@ -6,8 +6,8 @@ stacks) and adds the Kubernetes capabilities that matter most in practice:
 pods, real probes, namespaces, stateful workloads, network policy. Workloads run
 as jails, from OCI images, which Legion pulls into ZFS and runs itself.
 
-Status: phases 1 to 5 are built (section 11), and Legion is released (v0.1.7,
-2026-11-01) and being hardened. The phase-0 spikes' results are in section 10.
+Status: phases 1 to 5 are built (section 11), and Legion is released and being
+hardened. The phase-0 spikes' results are in section 10.
 Sections marked "built" describe the code as it is; the rest is the plan it
 was built from, kept where it still explains a choice.
 
