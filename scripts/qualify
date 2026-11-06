@@ -38,7 +38,8 @@
 #   helper CRATE TARGET NAME   an ignored test that is not a test of its own
 #   record NAME COMMAND...     run once from the project's root, its output kept
 #                        under `records` in the result; if it fails, so does
-#                        the run, as the result would name what nobody read
+#                        the run, as the result would name what nobody read;
+#                        so does output with nothing left to keep
 # NEEDs: kld:MODULE (loaded for the run, unloaded if the run loaded it),
 # env:NAME (must be set when qualify starts), optional (a skip is allowed).
 # A `vnet` test runs in a throwaway VNET jail, as it changes the network.
@@ -237,8 +238,10 @@ lines record > "$out/.records"
 : > "$out/records"
 while read -r name command; do
     value=$(sh -c "$command") || die "record $name: $command failed"
+    value=$(json "$value")
+    [ -n "$value" ] || die "record $name: $command gave nothing to keep"
     printf '%s    "%s": "%s"' "$(if [ -s "$out/records" ]; then printf ',\n'; fi)" \
-        "$(json "$name")" "$(json "$value")" >> "$out/records"
+        "$(json "$name")" "$value" >> "$out/records"
 done < "$out/.records"
 rm -f "$out/.records"
 
