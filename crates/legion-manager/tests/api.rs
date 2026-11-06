@@ -3011,7 +3011,21 @@ async fn a_volume_in_use_keeps_its_storage() {
     // Unused, it may name another LUN.
     try_apply(lun("iqn.2026-11.test:b")).await.unwrap();
 
-    // Held by a node: no.
+    // Held by a node: no. One the cluster knows, or the controller frees the
+    // Volume, as a removed node holds nothing.
+    m.store
+        .raft
+        .client_write(legion_store::Command::Put {
+            object: legion_api::Object::new(
+                legion_api::Kind::Node,
+                "",
+                "w1",
+                serde_json::json!({}),
+            ),
+            precondition: legion_store::Precondition::None,
+        })
+        .await
+        .unwrap();
     let key = legion_api::ObjectKey::new(legion_api::Kind::Volume, "default", "lun");
     let mut held = m.store.get(&key).unwrap().unwrap();
     held.status = serde_json::json!({ "node": "w1" });

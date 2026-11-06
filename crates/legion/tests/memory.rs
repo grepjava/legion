@@ -232,7 +232,15 @@ fn postgres_under_a_memory_limit() {
 
     step("one session taking 300 MiB");
     let kills = agent_kills(&lab);
-    let failed = sessions(&lab, &name, 1, "select length(repeat('x', 300000000))");
+    // Held for a while, as above: limits are read about once a second, so
+    // what is taken and let go within one goes unseen.
+    let failed = sessions(
+        &lab,
+        &name,
+        1,
+        "select pg_sleep(5) from (select repeat('x', 300000000) r offset 0) s \
+         where length(r) > 0",
+    );
     assert_eq!(failed, 1, "the session ran");
     wait("Postgres back", 120, ready);
     eprintln!(
