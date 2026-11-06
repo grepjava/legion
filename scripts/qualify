@@ -193,7 +193,11 @@ cleanup() {
     rmdir "$lock" 2> /dev/null
 }
 trap 'cleanup; touch "$out/done"' EXIT
-trap 'exit 3' INT TERM HUP
+# A step runs in the background, so a stop reaches the script at once.
+child=
+stop() { [ -z "$child" ] || sudo kill "$child" 2> /dev/null; exit 3; }
+trap stop INT TERM HUP
+step() { "$@" & child=$!; wait "$child"; rc=$?; child=; }
 
 echo running > "$out/state"
 snapshot "$out/before"
@@ -242,27 +246,26 @@ why() { # what happened; ooms before the step
 selected() { [ -z "$only" ] || printf '%s\n' "$1" | grep -Eq "$only"; }
 
 # Each run line is a shell command of the project's own manifest.
-lines run | {
-    while read -r name timeout cmd; do
-        selected "$name" || continue
-        start=$(date +%s)
-        killed=$(ooms)
-        echo "step $name" > "$out/state"
-        # shellcheck disable=SC2086
-        timeout -k 30 "$timeout" sh -c "$cmd" > "$out/$name.log" 2>&1 < /dev/null
-        rc=$?
-        took=$(($(date +%s) - start))
-        if [ "$rc" = 0 ]; then
-            record "$name" passed "" "$took"
-        elif [ "$rc" = 124 ]; then
-            record "$name" failed "timed out after ${timeout}s" "$took"
-            touch "$out/failed"
-        else
-            record "$name" failed "$(why "exit $rc" "$killed")" "$took"
-            touch "$out/failed"
-        fi
-    done
-}
+lines run > "$out/.runs"
+while read -r name timeout cmd; do
+    selected "$name" || continue
+    start=$(date +%s)
+    killed=$(ooms)
+    echo "step $name" > "$out/state"
+    # shellcheck disable=SC2086
+    step timeout -k 30 "$timeout" sh -c "$cmd" > "$out/$name.log" 2>&1 < /dev/null
+    took=$(($(date +%s) - start))
+    if [ "$rc" = 0 ]; then
+        record "$name" passed "" "$took"
+    elif [ "$rc" = 124 ]; then
+        record "$name" failed "timed out after ${timeout}s" "$took"
+        touch "$out/failed"
+    else
+        record "$name" failed "$(why "exit $rc" "$killed")" "$took"
+        touch "$out/failed"
+    fi
+done < "$out/.runs"
+rm -f "$out/.runs"
 
 binary() { # crate target
     if [ "$1" = . ]; then pkg=; else pkg="-p $1"; fi
@@ -324,8 +327,7 @@ while read -r crate target name where prof timeout needs; do
         run="jexec $jail $run"
     fi
     # shellcheck disable=SC2086
-    sudo env $envs $passthrough $require timeout -k 30 "$timeout" $run > "$log" 2>&1 < /dev/null
-    rc=$?
+    step sudo env $envs $passthrough $require timeout -k 30 "$timeout" $run > "$log" 2>&1 < /dev/null
     [ "$where" != vnet ] || sudo jail -r "$jail" 2> /dev/null
     took=$(($(date +%s) - start))
     why=$(grep -m 1 '^QUALIFY-SKIP:' "$log" | cut -d: -f2-)
