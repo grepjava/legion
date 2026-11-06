@@ -737,6 +737,16 @@ pub(crate) fn zfs(sys: &dyn Sys, dataset: &str, spec: &VolumeSpec) -> Result<Str
         None => &[],
     };
     sys.zfs_create(dataset, props).map_err(|e| e.to_string())?;
+    // A root with no mountpoint of its own leaves nothing to inherit, which
+    // can't be mounted: it goes where ZFS would put a dataset by default.
+    let listed = sys.zfs_list(dataset).map_err(|e| e.to_string())?;
+    if listed
+        .iter()
+        .any(|d| d.name == dataset && d.mountpoint.is_none())
+    {
+        sys.zfs_set(dataset, "mountpoint", &format!("/{dataset}"))
+            .map_err(|e| e.to_string())?;
+    }
     keep_quota(sys, dataset, spec)?;
     // One received from another node may not be mounted yet.
     sys.zfs_mount(dataset).map_err(|e| e.to_string())?;
@@ -810,6 +820,24 @@ pub(crate) fn mounts(c: &legion_api::service::Container, sources: &Sources) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_volume_under_a_root_with_no_mountpoint_still_mounts() {
+        let sys = legion_sys::FakeSys::new();
+        sys.zfs_create("tank/legion", &[("mountpoint", "none")])
+            .unwrap();
+        let dataset = dataset("tank/legion", "shop", "db");
+        let spec = VolumeSpec::default();
+        assert_eq!(
+            zfs(&sys, &dataset, &spec).unwrap(),
+            "/tank/legion/volumes/shop/db"
+        );
+        // Used again, as after a restart.
+        assert_eq!(
+            zfs(&sys, &dataset, &spec).unwrap(),
+            "/tank/legion/volumes/shop/db"
+        );
+    }
 
     #[test]
     fn records_are_replaced_whole() {

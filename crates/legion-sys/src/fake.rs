@@ -50,6 +50,8 @@ impl std::fmt::Debug for Hook {
 #[derive(Debug, Default)]
 struct State {
     modules: BTreeSet<String>,
+    /// Datasets with mountpoint none or legacy, their own or inherited.
+    no_mountpoint: BTreeSet<String>,
     /// Modules with no file to load them from; any other can be loaded.
     no_module: BTreeSet<String>,
     next_jid: u32,
@@ -1126,6 +1128,19 @@ impl Sys for FakeSys {
         for (k, v) in props {
             apply_prop(&mut ds, k, v)?;
         }
+        // No mountpoint is inherited, unless the dataset is given its own.
+        let inherited = (1..parts.len()).any(|n| s.no_mountpoint.contains(&parts[..n].join("/")));
+        let own = props.iter().find(|(k, _)| *k == "mountpoint");
+        match own {
+            Some((_, v)) if matches!(*v, "none" | "legacy") => {
+                s.no_mountpoint.insert(name.to_owned());
+            }
+            None if inherited => {
+                ds.mountpoint = None;
+                s.no_mountpoint.insert(name.to_owned());
+            }
+            _ => {}
+        }
         s.datasets.insert(name.to_owned(), ds);
         Ok(())
     }
@@ -1138,7 +1153,15 @@ impl Sys for FakeSys {
                 format!("cannot open '{name}': dataset does not exist"),
             )
         })?;
-        apply_prop(ds, prop, value)
+        apply_prop(ds, prop, value)?;
+        if prop == "mountpoint" {
+            if matches!(value, "none" | "legacy") {
+                s.no_mountpoint.insert(name.to_owned());
+            } else {
+                s.no_mountpoint.remove(name);
+            }
+        }
+        Ok(())
     }
 
     fn zfs_snapshot(&self, snapshot: &str) -> Result<()> {
@@ -1414,6 +1437,12 @@ must destroy them to overwrite it"
 
     fn zfs_mount(&self, dataset: &str) -> Result<()> {
         let mut s = self.state();
+        if s.no_mountpoint.contains(dataset) {
+            return Err(fail(
+                "zfs mount",
+                format!("cannot mount '{dataset}': no mountpoint set"),
+            ));
+        }
         let ds = s.datasets.get_mut(dataset).ok_or_else(|| {
             fail(
                 "zfs mount",

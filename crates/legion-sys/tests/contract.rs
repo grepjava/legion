@@ -93,6 +93,22 @@ fn zfs(sys: &dyn Sys, root: &str) {
     assert_eq!(got.mountpoint, None);
     assert_eq!(sys.zfs_list(&base).unwrap().len(), 3, "with its parents");
 
+    // No mountpoint is inherited, and can't be mounted until it has one.
+    let under = format!("{ds}/under");
+    sys.zfs_create(&under, &[]).unwrap();
+    assert_eq!(sys.zfs_list(&under).unwrap()[0].mountpoint, None);
+    let e = sys.zfs_mount(&under).unwrap_err().to_string();
+    assert!(e.contains("no mountpoint set"), "{e}");
+    let place = format!("/var/tmp/lcontract{}", std::process::id());
+    sys.zfs_set(&under, "mountpoint", &place).unwrap();
+    sys.zfs_mount(&under).unwrap();
+    assert_eq!(
+        sys.zfs_list(&under).unwrap()[0].mountpoint.as_deref(),
+        Some(place.as_str())
+    );
+    sys.zfs_destroy(&under, false).unwrap();
+    let _ = std::fs::remove_dir(&place);
+
     // Properties: ones it doesn't know, and values that make no sense.
     assert!(sys.zfs_set(&ds, "nonsense", "1").is_err());
     assert!(sys.zfs_set(&ds, "quota", "lots").is_err());
