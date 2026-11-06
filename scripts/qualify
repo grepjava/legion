@@ -210,8 +210,13 @@ sudo zfs create -o mountpoint=none "$zfs" || die "cannot create $zfs"
 sudo zfs create "$zfsmount" || die "cannot create $zfsmount"
 sudo mkdir -p "$lab"
 
-# Cargo's output, kept from filling a small disk.
-export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" CARGO_INCREMENTAL=0
+# Builds kept to what a small host can take: incremental files and full
+# debug info fill a disk, and on 2 GB two rustc jobs get killed for memory,
+# as file-backed swap can't page out fast enough.
+ram_mb=$(($(sysctl -n hw.physmem) / 1048576))
+[ "$ram_mb" -ge 4096 ] && jobs=2 || jobs=1
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$jobs}" CARGO_INCREMENTAL=0
+export CARGO_PROFILE_DEV_DEBUG=line-tables-only
 
 envs=$(lines env | while read -r k v; do
     v=$(printf '%s' "$v" | sed -e "s|@zfsmount@|$zfsmount|g" -e "s|@zfs@|$zfs|g" -e "s|@lab@|$lab|g")
@@ -219,6 +224,19 @@ envs=$(lines env | while read -r k v; do
 done)
 
 failed=0
+
+ooms() { dmesg | grep -cE 'failed to reclaim memory|out of swap space'; }
+
+# Why a step failed, for its record: a host out of memory says nothing
+# about the code, and must not read as if it did.
+why() { # what happened; ooms before the step
+    if [ "$(ooms)" -gt "$2" ]; then
+        echo "$1; the host ran out of memory, so this run is invalid"
+        touch "$out/invalid"
+    else
+        echo "$1"
+    fi
+}
 
 # Steps are named by their test; --only picks among them.
 selected() { [ -z "$only" ] || printf '%s\n' "$1" | grep -Eq "$only"; }
@@ -228,6 +246,7 @@ lines run | {
     while read -r name timeout cmd; do
         selected "$name" || continue
         start=$(date +%s)
+        killed=$(ooms)
         echo "step $name" > "$out/state"
         # shellcheck disable=SC2086
         timeout -k 30 "$timeout" sh -c "$cmd" > "$out/$name.log" 2>&1 < /dev/null
@@ -239,7 +258,7 @@ lines run | {
             record "$name" failed "timed out after ${timeout}s" "$took"
             touch "$out/failed"
         else
-            record "$name" failed "exit $rc" "$took"
+            record "$name" failed "$(why "exit $rc" "$killed")" "$took"
             touch "$out/failed"
         fi
     done
@@ -284,9 +303,10 @@ while read -r crate target name where prof timeout needs; do
     fi
     echo "step $name" > "$out/state"
     log=$out/$name.log
+    killed=$(ooms)
     bin=$(binary "$crate" "$target")
     if [ -z "$bin" ]; then
-        record "$name" failed "did not build" 0
+        record "$name" failed "$(why "did not build" "$killed")" 0
         touch "$out/failed"
         continue
     fi
@@ -313,7 +333,7 @@ while read -r crate target name where prof timeout needs; do
         record "$name" failed "timed out after ${timeout}s" "$took"
         touch "$out/failed"
     elif [ "$rc" != 0 ]; then
-        record "$name" failed "exit $rc" "$took"
+        record "$name" failed "$(why "exit $rc" "$killed")" "$took"
         touch "$out/failed"
     elif ! grep -q 'test result: ok\. 1 passed' "$log"; then
         record "$name" failed "ran no test" "$took"
@@ -354,7 +374,9 @@ fi
     printf '  "host": "%s",\n  "os": "%s",\n  "arch": "%s",\n' \
         "$(json "$(hostname)")" "$(json "$(freebsd-version -k)")" "$(uname -p)"
     printf '  "profile": "%s",\n  "started": "%s",\n  "selected": "%s",\n' "$profile" "$stamp" "$(json "$only")"
-    printf '  "failed": %s,\n  "tests": [\n' "$([ "$failed" = 1 ] && echo true || echo false)"
+    printf '  "failed": %s,\n  "invalid": %s,\n  "tests": [\n' \
+        "$([ "$failed" = 1 ] && echo true || echo false)" \
+        "$([ -e "$out/invalid" ] && echo true || echo false)"
     cat "$out/tests.json"
     printf '\n  ],\n  "leftovers": %s,\n  "foreign": %s\n}\n' \
         "$(wc -l < "$out/leftovers" | tr -d ' ')" "$(wc -l < "$out/foreign" | tr -d ' ')"
