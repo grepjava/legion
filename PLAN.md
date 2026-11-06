@@ -143,6 +143,9 @@ source and cancellation. Manager quorum stays a separate report.
 Goal: recovery and upgrade are procedures that have been drilled.
 
 1. Add a version handshake, so unsupported mixes are refused with a reason.
+   Then close the ACME gap, a route changed between the recheck and the write:
+   it needs a write conditional on several objects, a new Raft command that
+   nodes of two versions would apply differently without the handshake.
 2. Document and test backup of control state, keys and volumes separately.
 3. Interrupt a ZFS migration at each handoff stage, and test a full disk.
 4. Restore a representative application onto replacement hosts, and record
@@ -179,10 +182,6 @@ Benchmark reconciliation, watches, endpoint propagation, pf updates, image
 operations and mesh growth, publishing sizes and hardware. Optimize what
 measurement shows. Affinity, external load balancers, manager promotion,
 bhyve and NAT options wait for a concrete user need.
-
-## Small items to do at any point
-
-- Close the ACME gap: a route changed between the recheck and the write.
 
 ## Decisions needed
 
