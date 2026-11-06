@@ -478,6 +478,41 @@ impl State {
     }
 }
 
+impl FakeSys {
+    /// The jail parameters the fake takes, each with a value the kernel takes
+    /// too, as `tests/contract.rs` checks. Others are refused, as jail(8)
+    /// refuses them.
+    pub const JAIL_PARAMETERS: &[(&str, &str)] = &[
+        ("name", "x"),
+        ("path", "/"),
+        ("persist", ""),
+        ("host.hostname", "x"),
+        ("enforce_statfs", "2"),
+        ("vnet", ""),
+        ("ip4", "inherit"),
+        ("ip6", "inherit"),
+        ("devfs_ruleset", "4"),
+        ("children.max", "1"),
+        ("securelevel", "3"),
+        ("sysvmsg", "new"),
+        ("sysvsem", "new"),
+        ("sysvshm", "new"),
+        ("allow.chflags", "true"),
+        ("allow.mlock", "true"),
+        ("allow.raw_sockets", "true"),
+        ("allow.sysvipc", "true"),
+    ];
+
+    fn check_jail_parameters(command: &str, params: &[(&str, &str)]) -> Result<()> {
+        for (k, _) in params {
+            if !Self::JAIL_PARAMETERS.iter().any(|(known, _)| known == k) {
+                return Err(fail(command, format!("unknown parameter: {k}")));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Sys for FakeSys {
     fn kld_load(&self, module: &str) -> Result<()> {
         self.state().modules.insert(module.to_owned());
@@ -489,6 +524,7 @@ impl Sys for FakeSys {
     }
 
     fn jail_set(&self, jail: &str, params: &[(&str, &str)]) -> Result<()> {
+        Self::check_jail_parameters("jail -m", params)?;
         let mut s = self.state();
         let j = s
             .jails
@@ -511,6 +547,7 @@ impl Sys for FakeSys {
     fn jail_create(&self, params: &[(&str, &str)]) -> Result<u32> {
         let get = |k: &str| params.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
         let name = get("name").ok_or_else(|| fail("jail", "no name"))?;
+        Self::check_jail_parameters("jail", params)?;
         {
             let s = self.state();
             if s.jails.contains_key(name) {
@@ -991,6 +1028,10 @@ impl Sys for FakeSys {
         let mut s = self.state();
         if s.broken_anchors.contains(anchor) {
             return Err(fail("pfctl -f", "Device busy"));
+        }
+        check_pf_rules(rules)?;
+        for (table, addrs) in pf_tables(rules) {
+            s.tables.insert((anchor.to_owned(), table), addrs);
         }
         s.anchors.insert(anchor.to_owned(), rules.to_owned());
         Ok(())
@@ -1522,6 +1563,47 @@ must destroy them to overwrite it"
     }
 }
 
+/// As far as the fake goes with pf.conf: each line's keyword, and the order
+/// pfctl insists on, translation before filtering.
+fn check_pf_rules(rules: &str) -> Result<()> {
+    let mut filtering = false;
+    for line in rules.lines() {
+        let Some(word) = line.split_whitespace().next() else {
+            continue;
+        };
+        match word {
+            w if w.starts_with('#') => {}
+            "table" | "set" => {}
+            "nat" | "rdr" | "binat" | "nat-anchor" | "rdr-anchor" | "binat-anchor" => {
+                if filtering {
+                    return Err(fail("pfctl -f", "Rules must be in order"));
+                }
+            }
+            "pass" | "block" | "match" | "anchor" | "antispoof" => filtering = true,
+            _ => return Err(fail("pfctl -f", format!("syntax error: {line}"))),
+        }
+    }
+    Ok(())
+}
+
+/// The tables `rules` give addresses: `table <t> { 10.0.0.1 10.0.0.2 }`.
+fn pf_tables(rules: &str) -> Vec<(String, Vec<IpAddr>)> {
+    rules
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("table <")?;
+            let (name, rest) = rest.split_once('>')?;
+            let (_, addrs) = rest.split_once('{')?;
+            let addrs = addrs.split('}').next()?;
+            let addrs = addrs
+                .split([' ', ','])
+                .filter_map(|a| a.parse().ok())
+                .collect();
+            Some((name.to_owned(), addrs))
+        })
+        .collect()
+}
+
 fn apply_prop(ds: &mut Dataset, prop: &str, value: &str) -> Result<()> {
     match prop {
         "quota" => {
@@ -1539,7 +1621,10 @@ fn apply_prop(ds: &mut Dataset, prop: &str, value: &str) -> Result<()> {
                 v => Some(v.to_owned()),
             }
         }
-        _ => {}
+        "canmount" | "compression" | "readonly" | "recordsize" | "atime" | "exec" | "setuid" => {}
+        _ => {
+            return Err(fail("zfs set", format!("invalid property '{prop}'")));
+        }
     }
     Ok(())
 }

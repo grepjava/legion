@@ -4,7 +4,7 @@ scan crates/*/tests/*.rs
 
 # What Legion's tests make, in the before/after snapshots.
 own ^jail [^ ]+ /var/tmp/(l|q)
-own ^jail (lsys|lnet|lvip|ladopt)
+own ^jail (lsys|lnet|lvip|ladopt|lcontract)
 own ^mount .*/var/tmp/(l|q)
 own ^if (lsys|lnet|lvip|lbr)
 own ^anchor legion/
@@ -42,6 +42,9 @@ test legion-sys live jail_memory host shared 300
 test legion-sys live zfs_datasets host shared 300
 test legion-sys live carp_virtual_hosts vnet shared 120 kld:carp kld:if_epair
 test legion-sys live network_and_pf vnet shared 300 kld:if_bridge kld:if_epair kld:pf
+test legion-sys contract real_jails host shared 120
+test legion-sys contract real_zfs host shared 120
+test legion-sys contract real_pf vnet shared 120 kld:pf
 test legion-net live pods_on_the_bridge vnet shared 300 kld:if_bridge kld:if_epair kld:pf
 test legion-net live policy_on_the_bridge vnet shared 300 kld:if_bridge kld:if_epair kld:pf
 test legion-net mesh pods_across_nodes host shared 600 kld:if_bridge kld:if_epair kld:if_wg kld:pf
