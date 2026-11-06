@@ -237,8 +237,9 @@ fn unflagged(_: &Path, f: impl FnOnce() -> Result<(), Error>) -> Result<(), Erro
     f()
 }
 
+/// Sets `path`'s file flags, not following a last link.
 #[cfg(target_os = "freebsd")]
-fn set_flags(path: &Path, flags: libc::c_ulong) -> Result<(), Error> {
+pub fn set_flags(path: &Path, flags: libc::c_ulong) -> Result<(), Error> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| Error::Unsupported(format!("a NUL in {}", path.display())))?;
@@ -250,8 +251,9 @@ fn set_flags(path: &Path, flags: libc::c_ulong) -> Result<(), Error> {
     Ok(())
 }
 
+/// File flags are FreeBSD's: nothing to set elsewhere.
 #[cfg(not(target_os = "freebsd"))]
-fn set_flags(_: &Path, _: u64) -> Result<(), Error> {
+pub fn set_flags(_: &Path, _: u64) -> Result<(), Error> {
     Ok(())
 }
 
@@ -492,11 +494,29 @@ pub fn pack(root: &Path, tar_out: &Path, gz_out: &Path) -> Result<LayerArtifact,
 
 /// Compresses the layer `tar` to `gz` and names both by digest.
 pub fn compress(tar: &Path, gz: &Path) -> Result<LayerArtifact, Error> {
+    compress_with(
+        tar,
+        gz,
+        |out| {
+            Ok(flate2::write::GzEncoder::new(
+                out,
+                flate2::Compression::default(),
+            ))
+        },
+        |enc| enc.finish()?.flush(),
+    )
+}
+
+/// Compresses the layer `tar` to `out` with the encoder `encoder` makes,
+/// ended by `finish`, and names both by digest.
+pub fn compress_with<E: Write>(
+    tar: &Path,
+    out: &Path,
+    encoder: impl FnOnce(std::io::BufWriter<File>) -> std::io::Result<E>,
+    finish: impl FnOnce(E) -> std::io::Result<()>,
+) -> Result<LayerArtifact, Error> {
     let mut input = BufReader::new(File::open(tar)?);
-    let mut enc = flate2::write::GzEncoder::new(
-        std::io::BufWriter::new(File::create(gz)?),
-        flate2::Compression::default(),
-    );
+    let mut enc = encoder(std::io::BufWriter::new(File::create(out)?))?;
     let mut diff = Sha256::new();
     let mut buf = vec![0u8; 1 << 16];
     loop {
@@ -507,10 +527,10 @@ pub fn compress(tar: &Path, gz: &Path) -> Result<LayerArtifact, Error> {
         diff.update(&buf[..n]);
         enc.write_all(&buf[..n])?;
     }
-    enc.finish()?.flush()?;
+    finish(enc)?;
     let mut blob = Sha256::new();
     let mut size = 0u64;
-    let mut input = BufReader::new(File::open(gz)?);
+    let mut input = BufReader::new(File::open(out)?);
     loop {
         let n = input.read(&mut buf)?;
         if n == 0 {

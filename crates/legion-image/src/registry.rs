@@ -370,6 +370,79 @@ impl Client {
         }
     }
 
+    /// Refuses a realm `registry` sends logins to, unless it is https, or
+    /// plain HTTP for a registry spoken to in the clear.
+    pub fn check_realm(&self, registry: &str, realm: &str) -> Result<(), Error> {
+        let plain = realm.starts_with("http://") && self.plain.contains(registry);
+        if realm.starts_with("https://") || plain {
+            return Ok(());
+        }
+        Err(Error::Registry(format!(
+            "{registry}: the registry sends logins to {realm}, which is not https"
+        )))
+    }
+
+    /// Checks `creds` with `registry` (`docker.io`, `host:port`, or an
+    /// image reference's registry) as `docker login` does, without a
+    /// repository. A registry that asks for no login takes any.
+    pub async fn check_login(&self, registry: &str, creds: &Credentials) -> Result<(), Error> {
+        let name = crate::registry_of(registry);
+        let r = Reference {
+            registry: name.clone(),
+            ..Reference::parse(&format!("{name}/login"))?
+        };
+        let fail = |e: String| Error::Registry(format!("{name}: {e}"));
+        let root = format!("{}://{}/v2/", self.scheme(&r), r.host());
+        let resp = self
+            .http
+            .get(&root)
+            .send()
+            .await
+            .map_err(|e| fail(e.to_string()))?;
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        if resp.status() != StatusCode::UNAUTHORIZED {
+            return Err(fail(format!("HTTP {} from {root}", resp.status())));
+        }
+        let challenge = resp
+            .headers()
+            .get(WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let (kind, rest) = challenge.split_once(' ').unwrap_or((&challenge, ""));
+        let req = if kind.eq_ignore_ascii_case("basic") {
+            self.http.get(&root)
+        } else if kind.eq_ignore_ascii_case("bearer") {
+            let params = parse_challenge(rest);
+            let realm = params
+                .get("realm")
+                .ok_or_else(|| fail(format!("auth challenge without realm: {challenge}")))?;
+            self.check_realm(&name, realm)?;
+            let mut query = vec![("account", creds.username.as_str())];
+            if let Some(service) = params.get("service") {
+                query.push(("service", service));
+            }
+            self.http.get(realm).query(&query)
+        } else {
+            return Err(fail(format!("unknown auth challenge: {challenge}")));
+        };
+        let resp = req
+            .basic_auth(&creds.username, Some(&creds.password))
+            .send()
+            .await
+            .map_err(|e| fail(e.to_string()))?;
+        match resp.status() {
+            s if s.is_success() => Ok(()),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(fail(format!(
+                "login refused for {}: wrong username, password or token",
+                creds.username
+            ))),
+            s => Err(fail(format!("HTTP {s} logging in"))),
+        }
+    }
+
     /// The `Authorization` value answering a `WWW-Authenticate` challenge.
     async fn answer(
         &self,
@@ -397,14 +470,7 @@ impl Client {
                 "{r}: auth challenge without realm: {challenge}"
             )));
         };
-        // The login goes to the realm: in the clear only to a registry
-        // spoken to in the clear.
-        let realm_plain = realm.starts_with("http://") && self.plain.contains(&r.registry);
-        if !realm.starts_with("https://") && !realm_plain {
-            return Err(Error::Registry(format!(
-                "{r}: the registry sends logins to {realm}, which is not https"
-            )));
-        }
+        self.check_realm(&r.registry, realm)?;
         let scope = scope(r, params.get("scope").map(String::as_str), push);
         let mut req = self.http.get(realm).query(&[("scope", scope.as_str())]);
         if let Some(service) = params.get("service") {
