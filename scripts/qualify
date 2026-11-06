@@ -180,6 +180,23 @@ snapshot() {
     } | sort > "$1"
 }
 
+# What differs from the snapshot before, split into what the project owns
+# and what others on the host did meanwhile, which is noted and is not this
+# run's failure.
+compare() {
+    snapshot "$out/after"
+    own=$(lines own | paste -sd '|' -)
+    comm -13 "$out/before" "$out/after" > "$out/added"
+    comm -23 "$out/before" "$out/after" > "$out/removed"
+    if [ -n "$own" ]; then
+        grep -E "$own" "$out/added" > "$out/leftovers"
+        grep -vE "$own" "$out/added" > "$out/foreign"
+    else
+        : > "$out/leftovers"
+        cp "$out/added" "$out/foreign"
+    fi
+}
+
 cleanup() {
     sudo jail -r "$jail" 2> /dev/null
     sudo zfs destroy -r "$zfs" 2> /dev/null
@@ -190,12 +207,24 @@ cleanup() {
         sudo mdconfig -d -u "$md"
         sudo rm -f "/usr/swap-qualify$$"
     }
+    # A test stopped midway can't clean up after itself: what it left is for
+    # someone to remove, and they need to be told. Before the lock goes, so
+    # that it's this run's.
+    if [ -n "$stopped" ] && [ -e "$out/before" ]; then
+        compare
+        echo "stopped; left behind: $(wc -l < "$out/leftovers" | tr -d ' ')" > "$out/state"
+    fi
     rmdir "$lock" 2> /dev/null
 }
+stopped=
 trap 'cleanup; touch "$out/done"' EXIT
 # A step runs in the background, so a stop reaches the script at once.
 child=
-stop() { [ -z "$child" ] || sudo kill "$child" 2> /dev/null; exit 3; }
+stop() {
+    stopped=1
+    [ -z "$child" ] || { sudo kill "$child" 2> /dev/null; wait "$child"; }
+    exit 3
+}
 trap stop INT TERM HUP
 step() { "$@" & child=$!; wait "$child"; rc=$?; child=; }
 
@@ -353,20 +382,7 @@ sudo zfs destroy -r "$zfs" 2> /dev/null
 sudo zfs destroy -r "$zfsmount" 2> /dev/null
 sudo chflags -R 0 "$lab" 2> /dev/null
 sudo rm -rf "$lab"
-snapshot "$out/after"
-
-# What differs, split into what the project owns and what others on the
-# host did meanwhile, which is noted and is not this run's failure.
-own=$(lines own | paste -sd '|' -)
-comm -13 "$out/before" "$out/after" > "$out/added"
-comm -23 "$out/before" "$out/after" > "$out/removed"
-if [ -n "$own" ]; then
-    grep -E "$own" "$out/added" > "$out/leftovers"
-    grep -vE "$own" "$out/added" > "$out/foreign"
-else
-    : > "$out/leftovers"
-    cp "$out/added" "$out/foreign"
-fi
+compare
 [ ! -s "$out/leftovers" ] || touch "$out/failed"
 
 [ ! -e "$out/failed" ] || failed=1
