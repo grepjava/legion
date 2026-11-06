@@ -31,6 +31,7 @@ use tonic::transport::{Channel, ClientTlsConfig};
 
 /// Short, so node-down detection is quick to test.
 const HEARTBEAT: Duration = Duration::from_millis(200);
+const STEADY: Duration = Duration::from_secs(600);
 
 struct Running {
     addr: String,
@@ -90,6 +91,16 @@ impl Running {
         Running::serve(dir, listener, Some(joined.tls), Some(admin)).await
     }
 
+    /// With nodes that stay up however long the host stalls, for tests that
+    /// are not about nodes going down: on [`HEARTBEAT`], one busy moment
+    /// orphans their tasks.
+    async fn start_steady() -> Running {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raft = Running::quick_raft();
+        Running::serve_timed(dir, listener, None, None, raft, STEADY).await
+    }
+
     /// With the Raft timing of a real cluster rather than the tests' quick
     /// one, for calls that take longer than its heartbeat.
     async fn start_real_timing() -> Running {
@@ -108,13 +119,16 @@ impl Running {
         tls: Option<Tls>,
         admin: Option<ClientTlsConfig>,
     ) -> Running {
-        let raft = openraft::Config {
+        Running::serve_with(dir, listener, tls, admin, Running::quick_raft()).await
+    }
+
+    fn quick_raft() -> openraft::Config {
+        openraft::Config {
             heartbeat_interval: 200,
             election_timeout_min: 1500,
             election_timeout_max: 3000,
             ..default_raft_config()
-        };
-        Running::serve_with(dir, listener, tls, admin, raft).await
+        }
     }
 
     async fn serve_with(
@@ -124,11 +138,22 @@ impl Running {
         admin: Option<ClientTlsConfig>,
         raft: openraft::Config,
     ) -> Running {
+        Running::serve_timed(dir, listener, tls, admin, raft, HEARTBEAT).await
+    }
+
+    async fn serve_timed(
+        dir: TempDir,
+        listener: TcpListener,
+        tls: Option<Tls>,
+        admin: Option<ClientTlsConfig>,
+        raft: openraft::Config,
+        heartbeat: Duration,
+    ) -> Running {
         let addr = listener.local_addr().unwrap().to_string();
         let manager = Manager::open(ManagerConfig {
             raft,
             tls,
-            heartbeat: HEARTBEAT,
+            heartbeat,
             ..ManagerConfig::new(dir.path(), &addr)
         })
         .await
@@ -2711,7 +2736,7 @@ async fn a_restored_manager_leads_alone_and_ignores_the_old_cluster() {
 /// reports it gone, and its slot gets no other task before then.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deleting_a_running_task_stops_it_first() {
-    let m = Running::start().await;
+    let m = Running::start_steady().await;
     m.cluster().await.init(InitRequest {}).await.unwrap();
     let d = DispatcherClient::new(m.channel(None).await.unwrap());
     let register = || {
@@ -2726,21 +2751,6 @@ async fn deleting_a_running_task_stops_it_first() {
         }
     };
     eventually(register).await;
-    let beating = {
-        let d = d.clone();
-        tokio::spawn(async move {
-            loop {
-                let _ = d
-                    .clone()
-                    .heartbeat(HeartbeatRequest {
-                        node: "w1".into(),
-                        usage: Vec::new(),
-                    })
-                    .await;
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-    };
     apply_json(
         &m,
         "Service",
@@ -2803,7 +2813,6 @@ async fn deleting_a_running_task_stops_it_first() {
     // Ended, it goes when deleted.
     delete().await.unwrap();
     assert!(m.store.get(&key).unwrap().is_none());
-    beating.abort();
     m.stop().await;
 }
 
@@ -3165,7 +3174,7 @@ async fn a_volume_in_use_is_not_deleted() {
 async fn a_lun_two_volumes_name_is_held_by_one_node() {
     use legion_api::dispatch::VolumeClaim;
     use legion_api::{Kind, Object as Stored, ObjectKey};
-    let m = Running::start().await;
+    let m = Running::start_steady().await;
     m.cluster().await.init(InitRequest {}).await.unwrap();
     let d = DispatcherClient::new(m.channel(None).await.unwrap());
     for node in ["w1", "w2"] {
@@ -3183,23 +3192,6 @@ async fn a_lun_two_volumes_name_is_held_by_one_node() {
         })
         .await;
     }
-    let beating = {
-        let d = d.clone();
-        tokio::spawn(async move {
-            loop {
-                for node in ["w1", "w2"] {
-                    let _ = d
-                        .clone()
-                        .heartbeat(HeartbeatRequest {
-                            node: node.into(),
-                            usage: Vec::new(),
-                        })
-                        .await;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-    };
     let put = |object: Stored| {
         let raft = m.store.raft.clone();
         async move {
@@ -3333,7 +3325,6 @@ async fn a_lun_two_volumes_name_is_held_by_one_node() {
     );
     assert_eq!(holder("default", "a"), "");
 
-    beating.abort();
     m.stop().await;
 }
 
@@ -3342,7 +3333,7 @@ async fn a_lun_two_volumes_name_is_held_by_one_node() {
 async fn aliases_claimed_at_once_are_held_once() {
     use legion_api::dispatch::VolumeClaim;
     use legion_api::{Kind, Object as Stored};
-    let m = Running::start().await;
+    let m = Running::start_steady().await;
     m.cluster().await.init(InitRequest {}).await.unwrap();
     let d = DispatcherClient::new(m.channel(None).await.unwrap());
     let nodes: Vec<String> = (1..=4).map(|n| format!("w{n}")).collect();
@@ -3363,23 +3354,6 @@ async fn aliases_claimed_at_once_are_held_once() {
         })
         .await;
     }
-    let beating = {
-        let (d, nodes) = (d.clone(), nodes.clone());
-        tokio::spawn(async move {
-            loop {
-                for node in &nodes {
-                    let _ = d
-                        .clone()
-                        .heartbeat(HeartbeatRequest {
-                            node: node.clone(),
-                            usage: Vec::new(),
-                        })
-                        .await;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-    };
     for (i, node) in nodes.iter().enumerate() {
         let volume = format!("v{i}");
         for object in [
@@ -3465,7 +3439,6 @@ async fn aliases_claimed_at_once_are_held_once() {
             .await
             .unwrap();
     }
-    beating.abort();
     m.stop().await;
 }
 
