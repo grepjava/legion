@@ -358,6 +358,10 @@ struct JlsJail {
     parent: String,
 }
 
+/// How long a detached iSCSI session may take to go: 10 s.
+const DETACH_CHECKS: u32 = 100;
+const DETACH_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+
 impl<R: Runner> Sys for Shell<R> {
     fn kld_load(&self, module: &str) -> Result<()> {
         self.run("kldload", &args(["-n", module])).map(drop)
@@ -1145,10 +1149,28 @@ impl<R: Runner> Sys for Shell<R> {
     }
 
     fn iscsi_detach(&self, target: &str) -> Result<()> {
-        if !self.iscsi_sessions()?.iter().any(|s| s.target == target) {
+        let listed =
+            || -> Result<bool> { Ok(self.iscsi_sessions()?.iter().any(|s| s.target == target)) };
+        if !listed()? {
             return Ok(());
         }
-        self.run("iscsictl", &args(["-R", "-t", target])).map(drop)
+        // The kernel takes a session away after this returns, so it can be
+        // listed and be gone by the time it is removed. Whoever detaches goes
+        // on to release the volume, so it waits for that to be true.
+        match self.run("iscsictl", &args(["-R", "-t", target])) {
+            Err(Error::Failed { message, .. }) if message.contains("No such") => {}
+            other => drop(other?),
+        }
+        for _ in 0..DETACH_CHECKS {
+            if !listed()? {
+                return Ok(());
+            }
+            std::thread::sleep(DETACH_PAUSE);
+        }
+        Err(Error::Failed {
+            command: describe("iscsictl", &args(["-R", "-t", target])),
+            message: "the session is still there".to_owned(),
+        })
     }
 
     fn run_program(&self, program: &str, args: &[&str], input: &str) -> Result<String> {
@@ -1620,6 +1642,11 @@ mod tests {
             (&format!("iscsictl -A -p 127.0.0.1:3260 -t {spike}"), ok("")),
             ("iscsictl --libxo json -L -v", ok(sessions)),
             (&format!("iscsictl -R -t {spike}"), ok("")),
+            ("iscsictl --libxo json -L -v", ok(sessions)),
+            (
+                "iscsictl --libxo json -L -v",
+                ok(r#"{"__version": "1", "iscsictl": {}}"#),
+            ),
             (
                 "iscsictl --libxo json -L -v",
                 ok(r#"{"__version": "1", "iscsictl": {}}"#),
@@ -1775,6 +1802,26 @@ mod tests {
             ]
         );
         sh.unmount("/var/run/legion/tasks/t1").unwrap();
+    }
+
+    #[test]
+    fn a_session_gone_between_listing_and_removing_is_detached() {
+        let target = "iqn.t";
+        let listed = format!(
+            r#"{{"__version": "1", "iscsictl": {{"session": [{{"sessionId":2, "initiator": {{"name":"i","portal":"","alias":""}}, "target": {{"name":"{target}","portal":"127.0.0.1"}}, "state": "Connected", "failure": "", "devices": {{"lun": []}}}}]}}}}"#
+        );
+        let sh = Script::shell(vec![
+            ("iscsictl --libxo json -L -v", ok(&listed)),
+            (
+                "iscsictl -R -t iqn.t",
+                err("iscsictl: ISCSISREMOVE: No such process"),
+            ),
+            (
+                "iscsictl --libxo json -L -v",
+                ok(r#"{"__version": "1", "iscsictl": {}}"#),
+            ),
+        ]);
+        sh.iscsi_detach(target).unwrap();
     }
 
     #[test]
