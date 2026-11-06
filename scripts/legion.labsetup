@@ -1,0 +1,57 @@
+#!/bin/sh
+# What Legion's isolated tests need on a lab VM before they run, as root, from
+# scripts/lab run --setup: an NFS export and an iSCSI target on loopback, which
+# the storage tests only mount, and the guest of the bhyve test. Settings for
+# the tests go in /var/tmp/lab.env, which `run` reads.
+set -eux
+
+lvol=/var/tmp/lvol
+target=iqn.2026-10.lan.legion:lvol
+mkdir -p "$lvol/export" "$lvol/empty"
+
+# Legion never formats a LUN, so it must hold UFS already.
+makefs -t ffs -s 64m "$lvol/lun.img" "$lvol/empty"
+cat > /etc/ctl.conf << EOF
+portal-group pg0 {
+    discovery-auth-group no-authentication
+    listen 127.0.0.1
+}
+target "$target" {
+    auth-group no-authentication
+    portal-group pg0
+    lun 0 {
+        path $lvol/lun.img
+        size 64M
+    }
+}
+EOF
+service ctld onestart
+service iscsid onestart
+
+echo "$lvol/export -maproot=root 127.0.0.1" > /etc/exports
+service rpcbind onestart
+service mountd onestart
+service nfsd onestart
+
+# The guest of the bhyve test, on a volume of its own.
+kldload -n vmm
+sh /home/lab/tree/crates/legion-net/tests/bhyve-guest.sh /var/tmp/guest.img
+# The default volmode: volmode=dev gives no device on 15.1.
+zfs create -V 96m lpool/guest
+dd if=/var/tmp/guest.img of=/dev/zvol/lpool/guest bs=1m
+mkdir -p /var/tmp/lbhyve
+
+cat > /var/tmp/lab.env << EOF
+export LEGION_STORAGE_NFS=127.0.0.1:$lvol/export
+export LEGION_SYS_NFS=127.0.0.1:$lvol/export
+export LEGION_STORAGE_ISCSI='127.0.0.1 $target'
+export LEGION_SYS_ISCSI='127.0.0.1 $target'
+export LEGION_BHYVE_DISK=/dev/zvol/lpool/guest
+export LEGION_BHYVE_LAB=/var/tmp/lbhyve
+export LEGION_CLUSTER_LAB=/var/tmp/lcluster
+export LEGION_PG_IMAGE=/var/tmp/legion-pg.oci.tar
+export LEGION_CLUSTER_HOST=10.77.0.1
+export LEGION_CLUSTER_VMS='lab2=lab@10.77.0.2 lab3=lab@10.77.0.3'
+export LEGION_CLUSTER_KEY=/home/lab/.ssh/id_ed25519
+export LEGION_CLUSTER_LOSE=halt
+EOF

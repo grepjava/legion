@@ -242,6 +242,25 @@ fn guest_on_the_bridge() {
         sh(&cmd).0
     };
     let fetch = |to: &str| sh(&format!("jexec {pod} nc -w 2 -N {to} 80 </dev/null")).1;
+    // The guest says it is up before its listener runs, and starts that again
+    // after each connection: what must answer is given time to, which a guest
+    // in a VM needs. What must not answer is still checked at once.
+    let answers = |from: Option<&str>, to: &str, port: u16| {
+        (0..40).any(|_| {
+            reach(from, to, port) || {
+                std::thread::sleep(Duration::from_millis(500));
+                false
+            }
+        })
+    };
+    let serves = |to: &str| {
+        (0..40).any(|_| {
+            fetch(to).trim() == "from-the-guest" || {
+                std::thread::sleep(Duration::from_millis(500));
+                false
+            }
+        })
+    };
 
     // Open: the host and the pod reach the guest, directly and through
     // its VIP; the guest reaches the pod through the pod's.
@@ -253,10 +272,10 @@ fn guest_on_the_bridge() {
         let (ok, out) = sh(&cmd);
         assert!(ok, "{cmd}: {out}");
     }
-    assert!(reach(Some(&pod), &guest_ip.to_string(), 8080));
-    assert!(reach(Some(&pod), &guest6, 8080));
-    assert_eq!(fetch(&to_guest.to_string()).trim(), "from-the-guest");
-    assert_eq!(fetch(&to_guest6).trim(), "from-the-guest");
+    assert!(answers(Some(&pod), &guest_ip.to_string(), 8080));
+    assert!(answers(Some(&pod), &guest6, 8080));
+    assert!(serves(&to_guest.to_string()));
+    assert!(serves(&to_guest6));
     assert!(
         guest.probes("probe", 0, "from-the-pod"),
         "the guest to a VIP"
@@ -324,7 +343,7 @@ fn guest_on_the_bridge() {
         !reach(Some(&pod), &to_guest.to_string(), 80),
         "pod to its VIP"
     );
-    assert!(reach(None, &guest_ip.to_string(), 8080), "the host");
+    assert!(answers(None, &guest_ip.to_string(), 8080), "the host");
     assert!(
         guest.probes("probe", mark, "refused"),
         "the guest to a VIP, refused: {}",
@@ -335,12 +354,12 @@ fn guest_on_the_bridge() {
     let mark = guest.console().len();
     set(&[pod_ip], true);
     assert!(
-        reach(Some(&pod), &guest_ip.to_string(), 8080),
+        answers(Some(&pod), &guest_ip.to_string(), 8080),
         "pod to guest"
     );
-    assert!(reach(Some(&pod), &guest6, 8080), "pod to guest over IPv6");
-    assert_eq!(fetch(&to_guest.to_string()).trim(), "from-the-guest");
-    assert_eq!(fetch(&to_guest6).trim(), "from-the-guest");
+    assert!(answers(Some(&pod), &guest6, 8080), "pod to guest over IPv6");
+    assert!(serves(&to_guest.to_string()));
+    assert!(serves(&to_guest6));
     assert!(guest.probes("probe", mark, "from-the-pod"));
     assert!(guest.probes("probe6", mark, "from-the-pod"));
 

@@ -9,8 +9,11 @@
 #   scripts/lab down [VM...]     stop VMs; what they hold stays until a reset
 #   scripts/lab status           the base, the lock and each VM
 #   scripts/lab ssh VM [CMD]     a shell or command on a VM, as `lab`
-#   scripts/lab run --manifest FILE --profile P [--vm VM] [--only ERE]
-#                                reset VMs, copy this tree, run scripts/qualify
+#   scripts/lab run --manifest FILE --profile P [--vm VM] [--also VM]
+#                   [--only ERE] [--setup FILE] [--copy LOCAL:REMOTE]
+#                                reset VMs, copy this tree, run scripts/qualify;
+#                                --setup runs in the tree as root first, and
+#                                what it puts in /var/tmp/lab.env reaches the run
 #
 # VMs are lab1 to lab3, default all for up, reset and down. Each is an overlay
 # on one read-only base, so a reset takes seconds and nothing carries over.
@@ -427,7 +430,7 @@ status() {
 # Reset the VMs, copy the tree at HEAD, run qualify detached, follow it, bring
 # the results back. The exit status is qualify's verdict.
 run() {
-    local manifest= profile= only= vm=lab1 extra=
+    local manifest= profile= only= vm=lab1 extra= setup= copies=
     while [ $# -gt 0 ]; do
         case $1 in
         --manifest) manifest=${2:?}; shift 2 ;;
@@ -435,6 +438,8 @@ run() {
         --only) only=${2:?}; shift 2 ;;
         --vm) vm=${2:?}; shift 2 ;;
         --also) extra="$extra ${2:?}"; shift 2 ;;
+        --setup) setup=${2:?}; shift 2 ;;
+        --copy) copies="$copies ${2:?}"; shift 2 ;;
         *) die "unknown argument: $1" ;;
         esac
     done
@@ -442,6 +447,7 @@ run() {
     check_vm "$vm"
     git rev-parse --git-dir > /dev/null 2>&1 || die "not in a git tree"
     [ -r "$manifest" ] || die "no $manifest"
+    [ -z "$setup" ] || [ -r "$setup" ] || die "no $setup"
     # Mode bits mean nothing on a Windows drive seen from WSL.
     [ -z "$(git -c core.fileMode=false status --porcelain)" ] || die "the tree has changes: a record must name an exact commit"
     local rev project n dest state last= changed down=0 now failed
@@ -455,9 +461,19 @@ run() {
     git archive --format=tar HEAD | ssh_vm "$vm" 'mkdir -p ~/tree && tar xf - -C ~/tree' || die "no tree on $vm"
     git ls-files --error-unmatch scripts/qualify > /dev/null 2>&1 ||
         ssh_vm "$vm" 'mkdir -p ~/tree/scripts && cat > ~/tree/scripts/qualify' < "$here/qualify" || die "no runner on $vm"
+    local c
+    for c in $copies; do
+        [ -r "${c%%:*}" ] || die "no ${c%%:*}"
+        ssh_vm "$vm" "cat > ${c#*:}" < "${c%%:*}" || die "no copy of $c on $vm"
+    done
+    if [ -n "$setup" ]; then
+        say "setting up $vm"
+        ssh_vm "$vm" 'cd ~/tree && sudo sh -s' < "$setup" > "$root/setup.log" 2>&1 ||
+            { tail -15 "$root/setup.log" | cut -c1-120; die "setup failed on $vm"; }
+    fi
     local q="--manifest $manifest --profile $profile --pool lpool --out \$HOME/qualify/run"
     [ -z "$only" ] || q="$q --only '$only'"
-    ssh_vm "$vm" "cd ~/tree && echo $rev > .qualify-revision && find . -exec touch {} + && chmod +x scripts/qualify && . ~/.cargo/env && export QUALIFY_IMAGE=lab-$n CARGO_INCREMENTAL=0 && (nohup scripts/qualify $q > ~/qualify-run.out 2>&1 < /dev/null &)" || die "qualify did not start"
+    ssh_vm "$vm" "cd ~/tree && echo $rev > .qualify-revision && find . -exec touch {} + && chmod +x scripts/qualify && . ~/.cargo/env && { [ ! -r /var/tmp/lab.env ] || . /var/tmp/lab.env; } && export QUALIFY_IMAGE=lab-$n CARGO_INCREMENTAL=0 && (nohup scripts/qualify $q > ~/qualify-run.out 2>&1 < /dev/null &)" || die "qualify did not start"
     changed=$(date +%s)
     while :; do
         sleep 30
@@ -485,6 +501,7 @@ run() {
     [ "$failed" = 0 ] || [ "$failed" = false ]
 }
 
+main() {
 command=${1:-}
 [ $# -eq 0 ] || shift
 case $command in
@@ -504,5 +521,10 @@ ssh)
     ssh_vm "$v" "$@"
     ;;
 run) preconditions; run "$@" ;;
-*) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+*) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
+}
+
+# On one line: bash reads a script as it goes, so this runs whole even if the
+# file changes during a long run.
+main "$@"; exit $?

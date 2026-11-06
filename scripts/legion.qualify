@@ -60,7 +60,7 @@ test legion-sys live network_storage host isolated 300 env:LEGION_SYS_NFS env:LE
 test legion-net bhyve guest_on_the_bridge vnet isolated 900 kld:vmm env:LEGION_BHYVE_DISK env:LEGION_BHYVE_LAB
 
 # Several disposable hosts: the lab of crates/legion/tests/common.
-test legion cluster app_updates_and_survives_losing_a_node host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
+test legion cluster app_updates_and_survives_losing_a_node host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_CLUSTER_LOSE
 test legion stateful postgres_moves_between_nodes host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_PG_IMAGE
 test legion teams two_teams_share_a_cluster host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
 

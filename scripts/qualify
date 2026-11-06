@@ -36,6 +36,9 @@
 #   run NAME TIMEOUT COMMAND...
 #   test CRATE TARGET NAME host|vnet PROFILE TIMEOUT [NEED...]
 #   helper CRATE TARGET NAME   an ignored test that is not a test of its own
+#   record NAME COMMAND...     run once from the project's root, its output kept
+#                        under `records` in the result; if it fails, so does
+#                        the run, as the result would name what nobody read
 # NEEDs: kld:MODULE (loaded for the run, unloaded if the run loaded it),
 # env:NAME (must be set when qualify starts), optional (a skip is allowed).
 # A `vnet` test runs in a throwaway VNET jail, as it changes the network.
@@ -230,6 +233,15 @@ stop() {
 trap stop INT TERM HUP
 step() { "$@" & child=$!; wait "$child"; rc=$?; child=; }
 
+lines record > "$out/.records"
+: > "$out/records"
+while read -r name command; do
+    value=$(sh -c "$command") || die "record $name: $command failed"
+    printf '%s    "%s": "%s"' "$(if [ -s "$out/records" ]; then printf ',\n'; fi)" \
+        "$(json "$name")" "$(json "$value")" >> "$out/records"
+done < "$out/.records"
+rm -f "$out/.records"
+
 echo running > "$out/state"
 snapshot "$out/before"
 
@@ -345,20 +357,28 @@ while read -r crate target name where prof timeout needs; do
         continue
     fi
     bin=$(realpath "$bin")
-    passthrough=$(for need in $needs; do
-        case $need in env:*) n=${need#env:}; eval "printf '%s=%s ' \"$n\" \"\$$n\"" ;; esac
-    done)
+    # Through a file, as a value may hold a space (an iSCSI portal and target).
+    # timeout -f, below, as it otherwise waits for all descendants: pods a
+    # failed test left would hold the step to its limit. They are leftovers.
+    passed=$out/.passed
+    for need in $needs; do
+        case $need in env:*) n=${need#env:}; eval "printf \"export %s='%s'\\n\" \"$n\" \"\$$n\"" ;; esac
+    done > "$passed"
     require=
     [ -z "$required" ] || require=QUALIFY_REQUIRE_LIVE=1
     start=$(date +%s)
     run="$bin --ignored --exact $name --test-threads=1 --nocapture"
     if [ "$where" = vnet ]; then
-        sudo jail -c name="$jail" path=/ vnet persist children.max=4 allow.raw_sockets ||
+        vmm=
+        case " $needs " in *" kld:vmm "*) vmm=allow.vmm ;; esac
+        # shellcheck disable=SC2086
+        sudo jail -c name="$jail" path=/ vnet persist children.max=4 allow.raw_sockets $vmm ||
             { record "$name" failed "no VNET jail" 0; touch "$out/failed"; continue; }
         run="jexec $jail $run"
     fi
     # shellcheck disable=SC2086
-    step sudo env $envs $passthrough $require timeout -k 30 "$timeout" $run > "$log" 2>&1 < /dev/null
+    step sudo sh -c '. "$1"; shift; exec "$@"' sh "$passed" \
+        env $envs $require timeout -f -k 30 "$timeout" $run > "$log" 2>&1 < /dev/null
     [ "$where" != vnet ] || sudo jail -r "$jail" 2> /dev/null
     took=$(($(date +%s) - start))
     why=$(grep -m 1 '^QUALIFY-SKIP:' "$log" | cut -d: -f2-)
@@ -395,6 +415,7 @@ compare
         "$(json "$(hostname)")" "$(json "$(freebsd-version -k)")" "$(uname -p)"
     printf '  "vm": "%s",\n  "image": "%s",\n' \
         "$(json "$(sysctl -n kern.vm_guest)")" "$(json "${QUALIFY_IMAGE:-}")"
+    printf '  "records": {\n%s\n  },\n' "$(cat "$out/records")"
     printf '  "profile": "%s",\n  "started": "%s",\n  "selected": "%s",\n' "$profile" "$stamp" "$(json "$only")"
     printf '  "failed": %s,\n  "invalid": %s,\n  "tests": [\n' \
         "$([ "$failed" = 1 ] && echo true || echo false)" \

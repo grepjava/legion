@@ -14,9 +14,10 @@
 //! ```
 //!
 //! Each of `LEGION_CLUSTER_VMS` is `name=[user@]addr`, logging in as root
-//! unless a user is given, who must have sudo. The second must be a bhyve
-//! guest of this host called `name`: losing a node powers it off with
-//! `bhyvectl --destroy`, and it is left off.
+//! unless a user is given, who must have sudo. Losing a node stops the
+//! second, which is left off: with `LEGION_CLUSTER_LOSE=halt` it halts at once,
+//! without syncing; otherwise it must be a bhyve guest of this host called
+//! `name`, which `bhyvectl --destroy` powers off.
 //!
 //! The app is `tests/cluster/compose.yaml`: web (three replicas, published
 //! on port 30080) asks api (three replicas) for its name through api's
@@ -231,11 +232,16 @@ fn app_updates_and_survives_losing_a_node() {
     let load = Load::start(survivors.clone());
     std::thread::sleep(Duration::from_secs(2));
     let gone = Instant::now();
-    let out = Command::new("bhyvectl")
-        .args(["--destroy", &format!("--vm={}", lost.name)])
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "{}", text(&out.stderr));
+    if std::env::var("LEGION_CLUSTER_LOSE").as_deref() == Ok("halt") {
+        // The connection goes with the machine, so its status says nothing.
+        lab.ssh(lost, "halt -q -p");
+    } else {
+        let out = Command::new("bhyvectl")
+            .args(["--destroy", &format!("--vm={}", lost.name)])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out.stderr));
+    }
     wait("n3 down", 60, || lab.node_state("n3") == "down");
     wait("the app back on n1 and n2", 300, || {
         lab.app_ready()
