@@ -458,7 +458,8 @@ run() {
     local v
     for v in $vm $extra; do check_vm "$v"; reset_vm "$v"; done
     say "copying $project at $rev to $vm"
-    git archive --format=tar HEAD | ssh_vm "$vm" 'mkdir -p ~/tree && tar xf - -C ~/tree' || die "no tree on $vm"
+    # The commit named above: HEAD may have moved while waiting for the lab.
+    git archive --format=tar "$rev" | ssh_vm "$vm" 'mkdir -p ~/tree && tar xf - -C ~/tree' || die "no tree on $vm"
     git ls-files --error-unmatch scripts/qualify > /dev/null 2>&1 ||
         ssh_vm "$vm" 'mkdir -p ~/tree/scripts && cat > ~/tree/scripts/qualify' < "$here/qualify" || die "no runner on $vm"
     local c
