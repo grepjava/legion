@@ -4,7 +4,7 @@ scan crates/*/tests/*.rs
 
 # What Legion's tests make, in the before/after snapshots.
 own ^jail [^ ]+ /var/tmp/(l|q)
-own ^jail (lsys|lnet|lvip)
+own ^jail (lsys|lnet|lvip|ladopt)
 own ^mount .*/var/tmp/(l|q)
 own ^if (lsys|lnet|lvip|lbr)
 own ^anchor legion/
@@ -18,6 +18,8 @@ env LEGION_EXIT_LAB @lab@/exit
 env LEGION_EXIT_ZFS_ROOT @zfs@/exit
 env LEGION_STORAGE_LAB @lab@/storage
 env LEGION_STORAGE_ZFS_ROOT @zfs@/storage
+env LEGION_ADOPT_LAB @lab@/adopt
+env LEGION_ADOPT_ZFS_ROOT @zfs@/adopt
 
 run clippy 3600 cargo clippy --workspace --all-targets -- -D warnings
 run unit 3600 cargo test --workspace --no-fail-fast
@@ -44,6 +46,7 @@ test legion-net live pods_on_the_bridge vnet shared 300 kld:if_bridge kld:if_epa
 test legion-net live policy_on_the_bridge vnet shared 300 kld:if_bridge kld:if_epair kld:pf
 test legion-net mesh pods_across_nodes host shared 600 kld:if_bridge kld:if_epair kld:if_wg kld:pf
 test legion vip the_floating_address_follows_the_leader host shared 600 kld:carp kld:if_bridge kld:if_epair
+test legion adopt pods_outlive_the_daemon host shared 1800 kld:if_bridge kld:if_epair kld:if_wg kld:pf
 
 # A disposable host: these publish ports, or need servers set up first.
 test legion exit app_survives_failures host isolated 1800 kld:pf
