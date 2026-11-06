@@ -53,5 +53,5 @@ export LEGION_PG_IMAGE=/var/tmp/legion-pg.oci.tar
 export LEGION_CLUSTER_HOST=10.77.0.1
 export LEGION_CLUSTER_VMS='lab2=lab@10.77.0.2 lab3=lab@10.77.0.3'
 export LEGION_CLUSTER_KEY=/home/lab/.ssh/id_ed25519
-export LEGION_CLUSTER_LOSE=halt
+export LEGION_CLUSTER_LOSE=reboot
 EOF
