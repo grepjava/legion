@@ -3,6 +3,7 @@
 mod autolock;
 mod cli;
 mod daemon;
+mod doctor;
 mod metrics;
 mod pki;
 mod session;
@@ -161,6 +162,17 @@ enum Command {
     Unlock {
         #[arg(long)]
         key_file: Option<PathBuf>,
+    },
+    /// Check whether this host can run Legion, and say how to fix what it
+    /// can't. Needs no daemon and changes nothing; run it as root, as pf's
+    /// rules can't be read otherwise. Exits nonzero if a requirement is
+    /// missing or could not be read.
+    Doctor {
+        /// The dataset the daemon would use.
+        #[arg(long)]
+        zfs_root: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// Save every object of the cluster, read at one version, to a file.
     /// It holds Secrets and join tokens: keep it as safe as the managers'
@@ -529,6 +541,9 @@ async fn run() -> anyhow::Result<()> {
                     zfs_root,
                 },
         } => daemon::load_image(&file, name.as_deref(), &data_dir, &zfs_root).await,
+        Command::Doctor { zfs_root, json } => {
+            doctor::run(&legion_sys::Shell::new(), zfs_root.as_deref(), json)
+        }
         Command::Unlock { key_file } => cli::unlock(&args.server, key_file.as_deref()).await,
         command => cli::run(&args.server, &args.identity, command).await,
     }

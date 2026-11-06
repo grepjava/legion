@@ -36,6 +36,4 @@ pub const ANNOTATION_CPUSET: &str = "org.freebsd.jail.cpuset";
 /// devfs(8)'s ruleset for jails, a member's `/dev`.
 pub const DEVFS_RULESET: u32 = 4;
 
-/// Kernel modules Linux images need: the ABI and the file systems mounted
-/// for them (`/proc`, `/sys`, `/dev/fd`, `/dev/shm`).
-pub const LINUX_MODULES: [&str; 5] = ["linux64", "linprocfs", "linsysfs", "fdescfs", "tmpfs"];
+pub use legion_sys::check::LINUX_MODULES;

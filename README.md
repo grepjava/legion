@@ -96,7 +96,8 @@ serves). Pods reach each other and the host, and find services by
 name (`web`, `web.shop` or `web.shop.legion`) through the node's resolver
 on the bridge. Service VIPs,
 published ports and NAT for pods need the host's `/etc/pf.conf` to call
-Legion's anchors:
+Legion's anchors (`legion doctor`, as root, checks this and the rest of what
+a host needs, and changes nothing):
 
 ```
 nat-anchor "legion/*"

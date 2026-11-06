@@ -16,7 +16,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use crate::{
     Carp, CarpState, Dataset, Destination, Epair, Error, IfConfig, Ipv6Net, IscsiSession, Jail,
-    JailMemory, PfState, RctlRule, Result, Sys, WgPeer,
+    JailMemory, KldState, PfState, RctlRule, Result, Sys, WgPeer,
 };
 
 #[derive(Debug, Default)]
@@ -50,6 +50,8 @@ impl std::fmt::Debug for Hook {
 #[derive(Debug, Default)]
 struct State {
     modules: BTreeSet<String>,
+    /// Modules with no file to load them from; any other can be loaded.
+    no_module: BTreeSet<String>,
     next_jid: u32,
     next_epair: u32,
     next_ether: u32,
@@ -287,6 +289,18 @@ impl FakeSys {
         self.state().anchors.get(anchor).cloned()
     }
 
+    /// A module this host has no file for.
+    pub fn remove_module(&self, module: &str) {
+        let mut s = self.state();
+        s.modules.remove(module);
+        s.no_module.insert(module.to_owned());
+    }
+
+    /// A sysctl this kernel doesn't have.
+    pub fn remove_sysctl(&self, name: &str) {
+        self.state().sysctls.remove(name);
+    }
+
     pub fn modules(&self) -> BTreeSet<String> {
         self.state().modules.clone()
     }
@@ -517,6 +531,17 @@ impl Sys for FakeSys {
     fn kld_load(&self, module: &str) -> Result<()> {
         self.state().modules.insert(module.to_owned());
         Ok(())
+    }
+
+    fn kld_state(&self, module: &str) -> Result<KldState> {
+        let s = self.state();
+        Ok(if s.modules.contains(module) {
+            KldState::Loaded
+        } else if s.no_module.contains(module) {
+            KldState::Missing
+        } else {
+            KldState::Available
+        })
     }
 
     fn jails(&self) -> Result<Vec<Jail>> {
@@ -1004,7 +1029,11 @@ impl Sys for FakeSys {
     }
 
     fn pf_main_rules(&self) -> Result<String> {
-        Ok(self.state().main_rules.clone())
+        let mut s = self.state();
+        if s.failing.remove("pfctl -sn") {
+            return Err(fail("pfctl -sn", "pfctl: /dev/pf: Permission denied"));
+        }
+        Ok(s.main_rules.clone())
     }
 
     fn pf_states(&self) -> Result<Vec<PfState>> {

@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+# Disposable FreeBSD VMs for qualification, shared by Legion and jailer.
+#
+#   scripts/lab base [--jailer DIR --jailer-rev REV]   build the next base image
+#   scripts/lab up [VM...]       start VMs from a reset state and check them
+#   scripts/lab reset [VM...]    throw away what VMs hold and start them again
+#   scripts/lab down [VM...]     stop VMs; what they hold stays until a reset
+#   scripts/lab status           the base, the lock and each VM
+#   scripts/lab ssh VM [CMD]     a shell or command on a VM, as `lab`
+#   scripts/lab run --manifest FILE --profile P [--vm VM] [--only ERE]
+#                                reset VMs, copy this tree, run scripts/qualify
+#
+# VMs are lab1 to lab3, default all for up, reset and down. Each is an overlay
+# on one read-only base, so a reset takes seconds and nothing carries over.
+# Only this script touches the base and the VMs: ask Legion for changes, which
+# build as the next base version. Runs with Linux, QEMU and KVM, as in WSL2.
+#
+# The lab takes one lock, held by `run` from the reset to the results being
+# back, and by the others while they work. `run` waits for it; the others
+# fail. It is here and not QUALIFY_LOCK because that lock is inside a VM.
+#
+# Network: each VM has outbound NAT on vtnet0, SSH on 127.0.0.1:230N, and
+# 10.77.0.N on a private network between the VMs on vtnet1. Nothing is reachable
+# from outside this machine. The base holds the lab's private key for VM to VM
+# SSH, so it is never published and never leaves this machine.
+#
+# Everything fails on its own: no KVM, a VM not answering, an overlay of another
+# base, or a check after boot. A VM that fails its checks is stopped and marked
+# not clean, so a half-reset lab can't pass for a clean one.
+#
+# LEGION_LAB (~/legion-lab) is where the lab lives, LAB_MEM (4096) and LAB_CPUS
+# (2) size each VM, LAB_COPY (/mnt/d/legion-lab) is where bases are also kept,
+# LAB_STALL (7200) is how many seconds a run's step may show no change.
+
+set -u
+
+root=${LEGION_LAB:-$HOME/legion-lab}
+key=$root/lab_key
+mem=${LAB_MEM:-4096}
+cpus=${LAB_CPUS:-2}
+copy=${LAB_COPY:-/mnt/d/legion-lab}
+stall=${LAB_STALL:-7200}
+upstream=$root/base/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-zfs.qcow2
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+all_vms="lab1 lab2 lab3"
+root_size=64G
+pool_size=20G
+
+die() { echo "lab: $*" >&2; exit 2; }
+say() { echo "lab: $*"; }
+
+preconditions() {
+    [ "$(uname -s)" = Linux ] || die "needs Linux"
+    [ -r /dev/kvm ] && [ -w /dev/kvm ] || die "no usable /dev/kvm"
+    command -v qemu-system-x86_64 > /dev/null || die "no qemu-system-x86_64"
+    command -v qemu-img > /dev/null || die "no qemu-img"
+    mkdir -p "$root/base" "$root/vms" "$root/results" || die "cannot use $root"
+}
+
+check_vm() { case $1 in lab[1-3]) ;; *) die "unknown VM: $1" ;; esac; }
+number() { echo "${1#lab}"; }
+port() { echo $((2300 + $(number "$1"))); }
+
+lock() {
+    [ -z "${LAB_LOCKED:-}" ] || return 0
+    exec 9> "$root/lock" || die "cannot open the lock"
+    if ! flock -n 9; then
+        [ "$1" = wait ] || die "the lab is in use: $(cat "$root/lock.who" 2> /dev/null)"
+        say "waiting for the lab: $(cat "$root/lock.who" 2> /dev/null)"
+        flock 9 || die "cannot take the lock"
+    fi
+    echo "$(date -u +%FT%TZ) pid $$ $2" > "$root/lock.who"
+    export LAB_LOCKED=1
+}
+
+base_version() { readlink "$root/base/current" 2> /dev/null | sed 's/^lab-//; s/\.qcow2$//'; }
+
+current_base() {
+    local n
+    n=$(base_version)
+    [ -n "$n" ] || die "no base image: run scripts/lab base"
+    [ -r "$root/base/lab-$n.qcow2" ] && [ -r "$root/base/lab-$n-pool.qcow2" ] || die "base $n is incomplete"
+    [ ! -w "$root/base/lab-$n.qcow2" ] || die "base $n is writable, so it can't be trusted"
+    echo "$n"
+}
+
+# The process of a VM, if the pid file names one that is that VM's QEMU.
+vm_pid() {
+    local f=$root/vms/$1/pid p
+    [ -r "$f" ] || return 1
+    p=$(cat "$f")
+    tr '\0' ' ' < "/proc/$p/cmdline" 2> /dev/null | grep -q -- "-name $1 " && echo "$p"
+}
+
+ssh_to() {
+    local p=$1
+    shift
+    ssh -i "$key" -p "$p" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+        -o ServerAliveInterval=15 -o ServerAliveCountMax=8 lab@127.0.0.1 "$@"
+}
+ssh_vm() { local v=$1; shift; ssh_to "$(port "$v")" "$@"; }
+
+# Waits for SSH, watching QEMU and whether the console still moves.
+wait_ssh() {
+    local p=$1 pid=$2 log=$3 limit=$4 start now size last= same=0
+    start=$(date +%s)
+    while :; do
+        now=$(date +%s)
+        kill -0 "$pid" 2> /dev/null || { tail -15 "$log" | cut -c1-120; die "QEMU died"; }
+        ssh_to "$p" true 2> /dev/null && { say "SSH on $p after $((now - start)) s"; return 0; }
+        size=$(stat -c %s "$log")
+        if [ "$size" = "$last" ]; then same=$((same + 1)); else same=0; fi
+        last=$size
+        [ "$same" -lt 24 ] || { tail -15 "$log" | cut -c1-120; die "console stalled for 2 minutes on $p"; }
+        [ $((now - start)) -lt "$limit" ] || { tail -15 "$log" | cut -c1-120; die "no SSH on $p in $limit s"; }
+        sleep 5
+    done
+}
+
+start_qemu() {
+    local v=$1 n d=$root/vms/$1
+    n=$(number "$v")
+    # The lock's descriptor is closed: a daemon would hold it for ever.
+    qemu-system-x86_64 -name "$v" -enable-kvm -cpu host -m "$mem" -smp "$cpus" -display none \
+        -smbios type=1,serial="$v" \
+        -drive file="$d/disk.qcow2",if=virtio,format=qcow2 \
+        -drive file="$d/pool.qcow2",if=virtio,format=qcow2 \
+        -netdev user,id=n0,hostfwd=tcp:127.0.0.1:"$(port "$v")"-:22 \
+        -device virtio-net-pci,netdev=n0,mac=52:54:00:77:01:0"$n" \
+        -netdev socket,id=n1,mcast=230.0.77.1:23077,localaddr=127.0.0.1 \
+        -device virtio-net-pci,netdev=n1,mac=52:54:00:77:02:0"$n" \
+        -serial file:"$d/console.log" -pidfile "$d/pid" -daemonize 9>&- || die "QEMU refused $v"
+}
+
+stop_vm() {
+    local v=$1 p n=0
+    p=$(vm_pid "$v") || return 0
+    ssh_vm "$v" 'sudo shutdown -p now' > /dev/null 2>&1
+    while kill -0 "$p" 2> /dev/null && [ "$n" -lt 30 ]; do sleep 1; n=$((n + 1)); done
+    if kill -0 "$p" 2> /dev/null; then say "$v did not stop, killing it"; kill -9 "$p"; fi
+    rm -f "$root/vms/$v/pid"
+}
+
+kill_vm() {
+    local p
+    p=$(vm_pid "$1") || return 0
+    kill -9 "$p"
+    while kill -0 "$p" 2> /dev/null; do sleep 0.2; done
+    rm -f "$root/vms/$1/pid"
+}
+
+overlay_of() {
+    qemu-img info --output=json "$1" 2> /dev/null |
+        sed -n 's/.*"backing-filename": "\(.*\)",*$/\1/p' | head -1
+}
+
+# Nothing is clean until the checks after boot pass.
+reset_vm() {
+    local v=$1 n d=$root/vms/$1
+    n=$(current_base)
+    rm -f "$d/clean"
+    kill_vm "$v"
+    mkdir -p "$d" || die "cannot make $d"
+    rm -f "$d/disk.qcow2" "$d/pool.qcow2" "$d/console.log"
+    qemu-img create -q -f qcow2 -b "$root/base/lab-$n.qcow2" -F qcow2 "$d/disk.qcow2" || die "no overlay for $v"
+    qemu-img create -q -f qcow2 -b "$root/base/lab-$n-pool.qcow2" -F qcow2 "$d/pool.qcow2" || die "no pool overlay for $v"
+    start_qemu "$v"
+    check_booted "$v" "$n"
+    touch "$d/clean"
+    say "$v is clean on base $n"
+}
+
+check_booted() {
+    local v=$1 n=$2 d=$root/vms/$1 pid got
+    pid=$(vm_pid "$v") || die "$v did not start"
+    wait_ssh "$(port "$v")" "$pid" "$d/console.log" 180
+    got=$(ssh_vm "$v" 'echo "$(hostname -s) $(cat /etc/lab-base) $(zpool list -H -o health lpool) $(sysctl -n kern.racct.enable) $(sysctl -n net.inet.ip.forwarding) $(sudo -n pfctl -si 2> /dev/null | sed -n "s/^Status: \([A-Za-z]*\).*/\1/p") $(ifconfig vtnet1 | sed -n "s/.*inet \(10\.77\.0\.[0-9]*\).*/\1/p")"')
+    if [ "$got" != "$v $n ONLINE 1 1 Enabled 10.77.0.$(number "$v")" ]; then
+        kill_vm "$v"
+        die "$v failed its checks: got \"$got\""
+    fi
+}
+
+up_vm() {
+    local v=$1 n d=$root/vms/$1
+    n=$(current_base)
+    if [ ! -e "$d/disk.qcow2" ]; then reset_vm "$v"; return; fi
+    [ "$(overlay_of "$d/disk.qcow2")" = "$root/base/lab-$n.qcow2" ] ||
+        die "$v is an overlay of another base: reset it"
+    [ -e "$d/clean" ] || die "$v was never checked clean: reset it"
+    if vm_pid "$v" > /dev/null; then say "$v is running"; return; fi
+    start_qemu "$v"
+    check_booted "$v" "$n"
+    say "$v is up, holding what it held"
+}
+
+each() {
+    local f=$1 v
+    shift
+    [ $# -gt 0 ] || set -- $all_vms
+    for v in "$@"; do check_vm "$v"; "$f" "$v"; done
+}
+
+provision() {
+    cat << 'EOF'
+#!/bin/sh
+# Runs as root in the VM that becomes the base.
+set -eux
+[ "$(diskinfo vtbd1 | awk '{print $3}')" = 21474836480 ] || { echo "vtbd1 is not the pool disk"; exit 1; }
+zpool create -f -O compression=lz4 -m /lpool lpool vtbd1
+pw useradd labuser -m -s /bin/sh
+cat >> /boot/loader.conf << 'CONF'
+kern.racct.enable="1"
+autoboot_delay="1"
+CONF
+cat >> /etc/rc.conf << 'CONF'
+# A VM learns which it is from QEMU, so one base serves them all.
+lab_vm=$(/bin/kenv -q smbios.system.serial)
+hostname="$lab_vm"
+ifconfig_vtnet0="SYNCDHCP"
+ifconfig_vtnet1="inet 10.77.0.${lab_vm#lab}/24"
+gateway_enable="YES"
+pf_enable="YES"
+zfs_enable="YES"
+sshd_enable="YES"
+kld_list="pf if_bridge if_epair"
+CONF
+cat > /etc/pf.conf << 'CONF'
+# Lab node: hooks for Legion's legion/* and jailer's jailer/* anchors;
+# everything else passes.
+nat-anchor "legion/*"
+rdr-anchor "legion/*"
+nat-anchor "jailer/*"
+rdr-anchor "jailer/*"
+pass all
+anchor "legion/*"
+anchor "jailer/*"
+CONF
+pfctl -nf /etc/pf.conf
+cat >> /etc/hosts << 'CONF'
+10.77.0.1 lab1
+10.77.0.2 lab2
+10.77.0.3 lab3
+CONF
+kldload -n linux linux64 linprocfs linsysfs fdescfs pf if_bridge if_epair if_wg carp
+EOF
+}
+
+as_lab() {
+    cat << 'EOF'
+#!/bin/sh
+# Runs as lab in the VM that becomes the base.
+set -eux
+fetch -qo /tmp/rustup.sh https://sh.rustup.rs
+sh /tmp/rustup.sh -y --profile minimal --default-toolchain stable -c clippy -c rustfmt
+rm /tmp/rustup.sh
+. "$HOME/.cargo/env"
+grep -q cargo/env "$HOME/.profile" || echo '. "$HOME/.cargo/env"' >> "$HOME/.profile"
+rustc --version
+cargo clippy --version
+cargo fmt --version
+cat > "$HOME/.ssh/config" << 'CONF'
+Host lab1 lab2 lab3 10.77.0.*
+    IdentityFile ~/.ssh/id_ed25519
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+CONF
+chmod 600 "$HOME/.ssh/config" "$HOME/.ssh/id_ed25519"
+for t in "$HOME"/warm/*; do
+    (cd "$t" && cargo fetch --locked)
+done
+rm -rf "$HOME/warm"
+EOF
+}
+
+build_base() {
+    local jailer= jailer_rev= n s=$root/stage p=2300 pid
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --jailer) jailer=${2:?}; shift 2 ;;
+        --jailer-rev) jailer_rev=${2:?}; shift 2 ;;
+        *) die "unknown argument: $1" ;;
+        esac
+    done
+    [ -r "$upstream" ] || die "no $upstream"
+    command -v cloud-localds > /dev/null || die "no cloud-localds"
+    n=$(($(ls "$root"/base/lab-*-pool.qcow2 2> /dev/null | sed 's/.*lab-\([0-9]*\)-pool.*/\1/' | sort -n | tail -1) + 1))
+    say "building base $n"
+    [ -f "$key" ] || ssh-keygen -q -t ed25519 -N '' -C legion-lab -f "$key" || die "no lab key"
+    rm -rf "$s"
+    mkdir -p "$s" || die "cannot make $s"
+    cat > "$s/user-data" << EOF
+#cloud-config
+users:
+  - name: lab
+    gecos: lab
+    groups: wheel
+    shell: /bin/sh
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - $(cat "$key.pub")
+packages:
+  - sudo
+  - git
+  - ca_root_nss
+EOF
+    printf 'instance-id: lab-base-%s\nlocal-hostname: labbase\n' "$n" > "$s/meta-data"
+    cloud-localds "$s/seed.iso" "$s/user-data" "$s/meta-data" || die "no seed"
+    qemu-img create -q -f qcow2 -b "$upstream" -F qcow2 "$s/disk.qcow2" "$root_size" || die "no disk"
+    qemu-img create -q -f qcow2 "$s/pool.qcow2" "$pool_size" || die "no pool disk"
+    qemu-system-x86_64 -name labbase -enable-kvm -cpu host -m "$mem" -smp "$cpus" -display none \
+        -drive file="$s/disk.qcow2",if=virtio,format=qcow2 \
+        -drive file="$s/pool.qcow2",if=virtio,format=qcow2 \
+        -drive file="$s/seed.iso",if=virtio,format=raw,readonly=on \
+        -netdev user,id=n0,hostfwd=tcp:127.0.0.1:$p-:22 -device virtio-net-pci,netdev=n0 \
+        -serial file:"$s/console.log" -pidfile "$s/pid" -daemonize 9>&- || die "QEMU refused the base"
+    pid=$(cat "$s/pid")
+    trap 'kill -9 "$pid" 2> /dev/null' EXIT
+    say "first boot, which upgrades the system"
+    wait_ssh "$p" "$pid" "$s/console.log" 1800
+    say "SSL errors in the first boot: $(grep -ac 'SSL routines' "$s/console.log")"
+    provision | ssh_to "$p" 'sudo sh -s' || die "provisioning failed"
+    ssh_to "$p" 'mkdir -p ~/.ssh ~/warm/legion ~/warm/jailer && umask 077 && cat > ~/.ssh/id_ed25519' < "$key" || die "no key in the VM"
+    git -C "$here/.." archive --format=tar HEAD | ssh_to "$p" 'tar xf - -C ~/warm/legion' || die "no Legion tree"
+    if [ -n "$jailer" ]; then
+        git -C "$jailer" archive --format=tar "${jailer_rev:-HEAD}" | ssh_to "$p" 'tar xf - -C ~/warm/jailer' || die "no jailer tree"
+    else
+        ssh_to "$p" 'rmdir ~/warm/jailer'
+    fi
+    as_lab | ssh_to "$p" 'sh -s' || die "setting up lab failed"
+    ssh_to "$p" "sudo pkg clean -ay; echo $n | sudo tee /etc/lab-base; sync" || die "no base marker"
+    ssh_to "$p" 'sudo shutdown -p now' > /dev/null 2>&1
+    local w=0
+    while kill -0 "$pid" 2> /dev/null && [ "$w" -lt 120 ]; do sleep 1; w=$((w + 1)); done
+    kill -0 "$pid" 2> /dev/null && die "the base did not stop"
+    trap - EXIT
+    qemu-img convert -O qcow2 "$s/disk.qcow2" "$root/base/lab-$n.qcow2" || die "no base disk"
+    qemu-img convert -O qcow2 "$s/pool.qcow2" "$root/base/lab-$n-pool.qcow2" || die "no base pool"
+    chmod 444 "$root/base/lab-$n.qcow2" "$root/base/lab-$n-pool.qcow2"
+    (cd "$root/base" && sha256sum "lab-$n.qcow2" "lab-$n-pool.qcow2" > "lab-$n.sha256")
+    ln -sfn "lab-$n.qcow2" "$root/base/current"
+    if mkdir -p "$copy" 2> /dev/null; then
+        cp "$root/base/lab-$n.qcow2" "$root/base/lab-$n-pool.qcow2" "$root/base/lab-$n.sha256" "$copy/" || say "no copy in $copy"
+    else
+        say "no copy: $copy is not there"
+    fi
+    rm -rf "$s"
+    say "base $n built: $(cat "$root/base/lab-$n.sha256" | cut -c1-16 | tr '\n' ' ')"
+}
+
+status() {
+    local v s
+    say "base: $(base_version)"
+    say "lock: $(flock -n "$root/lock" true 2> /dev/null && echo free || cat "$root/lock.who" 2> /dev/null)"
+    for v in $all_vms; do
+        s=stopped
+        vm_pid "$v" > /dev/null && s=running
+        [ -e "$root/vms/$v/clean" ] || s="$s, not clean"
+        say "$v: $s"
+    done
+}
+
+# Reset the VMs, copy the tree at HEAD, run qualify detached, follow it, bring
+# the results back. The exit status is qualify's verdict.
+run() {
+    local manifest= profile= only= vm=lab1 extra=
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --manifest) manifest=${2:?}; shift 2 ;;
+        --profile) profile=${2:?}; shift 2 ;;
+        --only) only=${2:?}; shift 2 ;;
+        --vm) vm=${2:?}; shift 2 ;;
+        --also) extra="$extra ${2:?}"; shift 2 ;;
+        *) die "unknown argument: $1" ;;
+        esac
+    done
+    [ -n "$manifest" ] && [ -n "$profile" ] || die "run needs --manifest and --profile"
+    check_vm "$vm"
+    git rev-parse --git-dir > /dev/null 2>&1 || die "not in a git tree"
+    [ -r "$manifest" ] || die "no $manifest"
+    # Mode bits mean nothing on a Windows drive seen from WSL.
+    [ -z "$(git -c core.fileMode=false status --porcelain)" ] || die "the tree has changes: a record must name an exact commit"
+    local rev project n dest state last= changed down=0 now failed
+    rev=$(git rev-parse --short HEAD)
+    project=$(basename "$(git rev-parse --show-toplevel)")
+    lock wait "$project $rev"
+    n=$(current_base)
+    local v
+    for v in $vm $extra; do check_vm "$v"; reset_vm "$v"; done
+    say "copying $project at $rev to $vm"
+    git archive --format=tar HEAD | ssh_vm "$vm" 'mkdir -p ~/tree && tar xf - -C ~/tree' || die "no tree on $vm"
+    git ls-files --error-unmatch scripts/qualify > /dev/null 2>&1 ||
+        ssh_vm "$vm" 'mkdir -p ~/tree/scripts && cat > ~/tree/scripts/qualify' < "$here/qualify" || die "no runner on $vm"
+    local q="--manifest $manifest --profile $profile --pool lpool --out \$HOME/qualify/run"
+    [ -z "$only" ] || q="$q --only '$only'"
+    ssh_vm "$vm" "cd ~/tree && echo $rev > .qualify-revision && find . -exec touch {} + && chmod +x scripts/qualify && . ~/.cargo/env && export QUALIFY_IMAGE=lab-$n CARGO_INCREMENTAL=0 && (nohup scripts/qualify $q > ~/qualify-run.out 2>&1 < /dev/null &)" || die "qualify did not start"
+    changed=$(date +%s)
+    while :; do
+        sleep 30
+        now=$(date +%s)
+        vm_pid "$vm" > /dev/null || die "$vm died during the run: nothing from it counts"
+        if state=$(ssh_vm "$vm" 'test ! -e ~/qualify/run/done || echo finished; cat ~/qualify/run/state 2> /dev/null; true'); then
+            down=0
+        else
+            down=$((down + 1))
+            [ "$down" -lt 10 ] || die "$vm stopped answering: nothing from it counts"
+            continue
+        fi
+        [ "${state%%$'\n'*}" != finished ] || break
+        if [ "$state" != "$last" ]; then say "$(date +%T) $state"; last=$state; changed=$now; fi
+        [ $((now - changed)) -lt "$stall" ] || die "no change in $stall s on $vm: left running for a look"
+    done
+    dest=$root/results/$project/$rev-$(date -u +%Y%m%dT%H%M%SZ)
+    mkdir -p "$dest" || die "cannot make $dest"
+    ssh_vm "$vm" 'tar cf - -C ~/qualify/run . ; ' | tar xf - -C "$dest" || die "no results from $vm"
+    ssh_vm "$vm" 'cat ~/qualify-run.out' > "$dest/run.out"
+    [ -r "$dest/result.json" ] || die "$vm finished with no result: see $dest"
+    say "results in $dest"
+    failed=$(sed -n 's/^ *"failed": *\([0-9a-z]*\).*/\1/p' "$dest/result.json" | head -1)
+    say "failed: $failed"
+    [ "$failed" = 0 ] || [ "$failed" = false ]
+}
+
+command=${1:-}
+[ $# -eq 0 ] || shift
+case $command in
+base) preconditions; lock fail "base"; build_base "$@" ;;
+up) preconditions; lock fail "up"; each up_vm "$@" ;;
+reset) preconditions; lock fail "reset"; each reset_vm "$@" ;;
+down) preconditions; lock fail "down"; each stop_vm "$@" ;;
+status) preconditions; status ;;
+ssh)
+    v=${1:?}; shift; check_vm "$v"
+    vm_pid "$v" > /dev/null || die "$v is not running"
+    ssh_vm "$v" "$@"
+    ;;
+run) preconditions; run "$@" ;;
+*) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

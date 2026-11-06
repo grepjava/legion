@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::{
     Carp, CarpState, Dataset, Destination, Epair, Error, IfConfig, IpNet, Ipv6Net, IscsiSession,
-    Jail, JailMemory, PfState, RctlRule, Result, Sys, WgPeer,
+    Jail, JailMemory, KldState, PfState, RctlRule, Result, Sys, WgPeer,
 };
 
 /// Counts the memory of each jail's processes from the kernel's maps.
@@ -361,6 +361,27 @@ struct JlsJail {
 impl<R: Runner> Sys for Shell<R> {
     fn kld_load(&self, module: &str) -> Result<()> {
         self.run("kldload", &args(["-n", module])).map(drop)
+    }
+
+    fn kld_state(&self, module: &str) -> Result<KldState> {
+        // -n sees files and -m module names: a module compiled in, as tmpfs
+        // can be, has no file, and a file's modules may be named otherwise.
+        for how in ["-n", "-m"] {
+            if self
+                .output("kldstat", &args(["-q", how, module]), None)?
+                .success
+            {
+                return Ok(KldState::Loaded);
+            }
+        }
+        let path = self.sysctl_get("kern.module_path")?;
+        for dir in path.split(';').filter(|d| !d.is_empty()) {
+            let file = format!("{dir}/{module}.ko");
+            if self.output("test", &args(["-f", &file]), None)?.success {
+                return Ok(KldState::Available);
+            }
+        }
+        Ok(KldState::Missing)
     }
 
     fn jails(&self) -> Result<Vec<Jail>> {
@@ -1754,6 +1775,37 @@ mod tests {
             ]
         );
         sh.unmount("/var/run/legion/tasks/t1").unwrap();
+    }
+
+    #[test]
+    fn a_module_compiled_in_counts_as_loaded() {
+        let sh = Script::shell(vec![
+            ("kldstat -q -n tmpfs", err("")),
+            ("kldstat -q -m tmpfs", ok("")),
+        ]);
+        assert_eq!(sh.kld_state("tmpfs").unwrap(), KldState::Loaded);
+    }
+
+    #[test]
+    fn a_module_to_load_is_looked_for_along_the_module_path() {
+        let sh = Script::shell(vec![
+            ("kldstat -q -n x", err("")),
+            ("kldstat -q -m x", err("")),
+            (
+                "sysctl -n kern.module_path",
+                ok("/boot/kernel;/boot/modules\n"),
+            ),
+            ("test -f /boot/kernel/x.ko", err("")),
+            ("test -f /boot/modules/x.ko", ok("")),
+        ]);
+        assert_eq!(sh.kld_state("x").unwrap(), KldState::Available);
+        let sh = Script::shell(vec![
+            ("kldstat -q -n y", err("")),
+            ("kldstat -q -m y", err("")),
+            ("sysctl -n kern.module_path", ok("/boot/kernel\n")),
+            ("test -f /boot/kernel/y.ko", err("")),
+        ]);
+        assert_eq!(sh.kld_state("y").unwrap(), KldState::Missing);
     }
 
     #[test]

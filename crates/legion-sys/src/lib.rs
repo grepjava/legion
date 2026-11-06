@@ -15,6 +15,7 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
+pub mod check;
 mod fake;
 pub mod live;
 mod memory;
@@ -41,12 +42,25 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Where a kernel module stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KldState {
+    /// In the kernel, loaded or compiled in.
+    Loaded,
+    /// Not in the kernel, with a file to load it from.
+    Available,
+    Missing,
+}
+
 /// The system operations, grouped by tool. Interface methods take an
 /// optional jail: `None` is the agent's own (host) network stack, `Some`
 /// a VNET jail's, reached with `ifconfig -j` / `route -j`.
 pub trait Sys: Send + Sync {
     /// Loads a kernel module unless it is loaded already (`kldload -n`).
     fn kld_load(&self, module: &str) -> Result<()>;
+    /// Whether a module is in the kernel, as a file or compiled in, or could
+    /// be loaded from `kern.module_path`. Loads nothing.
+    fn kld_state(&self, module: &str) -> Result<KldState>;
 
     // Jails.
 

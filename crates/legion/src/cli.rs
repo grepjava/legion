@@ -277,6 +277,7 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
         }
         Command::Join { .. }
         | Command::Restore { .. }
+        | Command::Doctor { .. }
         | Command::Unlock { .. }
         | Command::Image { .. } => {
             unreachable!("handled in main")

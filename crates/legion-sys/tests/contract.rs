@@ -11,7 +11,7 @@
 
 use std::net::IpAddr;
 
-use legion_sys::{Error, FakeSys, Shell, Sys};
+use legion_sys::{Error, FakeSys, KldState, Shell, Sys};
 
 fn jail(sys: &dyn Sys, name: &str, more: &[(&str, &str)]) -> legion_sys::Result<u32> {
     let mut params = vec![("name", name), ("path", "/"), ("persist", "")];
@@ -230,4 +230,66 @@ fn real_pf() {
         "refusing to change the host's pf; run inside a VNET jail"
     );
     pf(&Shell::new());
+}
+
+/// A module's state follows it into the kernel, and asking loads nothing.
+fn modules(sys: &dyn Sys, name: &str) {
+    assert_eq!(sys.kld_state(name).unwrap(), KldState::Available, "{name}");
+    assert_eq!(sys.kld_state(name).unwrap(), KldState::Available, "{name}");
+    sys.kld_load(name).unwrap();
+    assert_eq!(sys.kld_state(name).unwrap(), KldState::Loaded, "{name}");
+}
+
+#[test]
+fn fake_modules() {
+    modules(&FakeSys::new(), "pf");
+}
+
+/// Each module the checks ask about, loaded and unloaded, on a lab VM: it
+/// unloads pf, which nothing on a shared host could stand. One that can't be
+/// unloaded is compiled in or in use, and must then read as loaded.
+#[test]
+#[ignore = "needs root on a disposable lab VM"]
+fn real_modules() {
+    if !std::path::Path::new("/etc/lab-base").exists() {
+        return legion_sys::live::skip("needs a lab VM: it unloads kernel modules");
+    }
+    let sys = Shell::new();
+    let unload = |m: &str| {
+        std::process::Command::new("kldunload")
+            .arg(m)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    let mut cycled = Vec::new();
+    for m in [
+        "pf",
+        "if_bridge",
+        "if_epair",
+        "linux64",
+        "linprocfs",
+        "linsysfs",
+        "fdescfs",
+        "tmpfs",
+        "nullfs",
+    ] {
+        sys.kld_load(m).unwrap();
+        assert_eq!(sys.kld_state(m).unwrap(), KldState::Loaded, "{m}");
+        if unload(m) {
+            modules(&sys, m);
+            cycled.push(m);
+        } else {
+            println!("{m} stays in the kernel: compiled in or in use");
+        }
+    }
+    println!("cycled: {cycled:?}");
+    assert!(cycled.contains(&"linux64"), "{cycled:?}");
+    assert_eq!(sys.kld_state("no_such_module").unwrap(), KldState::Missing);
+    let pf = std::process::Command::new("pfctl")
+        .args(["-e", "-f", "/etc/pf.conf"])
+        .output()
+        .unwrap();
+    println!("pf back: {}", String::from_utf8_lossy(&pf.stderr));
 }

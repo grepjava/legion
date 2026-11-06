@@ -207,18 +207,14 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         let mut ctx = self.ctx;
         // rctl needs racct, a loader tunable: without it, limits cannot
         // hold, and pods with them go to other nodes.
-        let racct = task::blocking(&ctx.sys, |sys| sys.sysctl_get("kern.racct.enable")).await;
-        ctx.no_limits = match racct {
-            Ok(v) => v != "1",
-            Err(e) => {
-                tracing::warn!("reading kern.racct.enable: {e}");
-                true
-            }
-        };
+        let racct = task::blocking(&ctx.sys, legion_sys::check::racct).await;
+        ctx.no_limits = racct.state != legion_sys::check::State::Met;
         if ctx.no_limits {
             tracing::warn!(
-                "kern.racct.enable is not 1: containers' limits cannot hold here, so pods \
-                 with limits run on other nodes (set it in /boot/loader.conf and reboot)"
+                "{}: containers' limits cannot hold here, so pods with limits run on other \
+                 nodes ({})",
+                racct.detail,
+                racct.remedy.as_deref().unwrap_or("see legion doctor")
             );
         }
         status.platform.no_limits = ctx.no_limits;
