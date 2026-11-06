@@ -2,6 +2,8 @@
 # Disposable FreeBSD VMs for qualification, shared by Legion and jailer.
 #
 #   scripts/lab base [--jailer DIR --jailer-rev REV]   build the next base image
+#   scripts/lab base --patch FILE   the next base: the current one, with FILE
+#                                run in it as root, in minutes and not half an hour
 #   scripts/lab up [VM...]       start VMs from a reset state and check them
 #   scripts/lab reset [VM...]    throw away what VMs hold and start them again
 #   scripts/lab down [VM...]     stop VMs; what they hold stays until a reset
@@ -20,7 +22,8 @@
 # fail. It is here and not QUALIFY_LOCK because that lock is inside a VM.
 #
 # Network: each VM has outbound NAT on vtnet0, SSH on 127.0.0.1:230N, and
-# 10.77.0.N on a private network between the VMs on vtnet1. Nothing is reachable
+# 10.77.0.N on a private network between the VMs on vtnet1, carried by a small
+# hub on 127.0.0.1:2310. Nothing is reachable
 # from outside this machine. The base holds the lab's private key for VM to VM
 # SSH, so it is never published and never leaves this machine.
 #
@@ -118,9 +121,34 @@ wait_ssh() {
     done
 }
 
+# The private network: frames to every VM but the sender. QEMU's multicast
+# mode gives a VM its own frames back, and FreeBSD then never finishes checking
+# its addresses.
+start_hub() {
+    local f=$root/hub.pid
+    if [ -r "$f" ] && tr '\0' ' ' < "/proc/$(cat "$f")/cmdline" 2> /dev/null | grep -q legion-lab-hub; then
+        return 0
+    fi
+    command -v python3 > /dev/null || die "no python3 for the network hub"
+    setsid python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", 2310))
+while True:
+    frame, source = s.recvfrom(65536)
+    for port in (2311, 2312, 2313):
+        if port != source[1]:
+            s.sendto(frame, ("127.0.0.1", port))
+' legion-lab-hub < /dev/null > "$root/hub.log" 2>&1 9>&- &
+    echo $! > "$f"
+    sleep 0.5
+    kill -0 "$(cat "$f")" 2> /dev/null || die "the network hub did not start: $(cat "$root/hub.log")"
+}
+
 start_qemu() {
     local v=$1 n d=$root/vms/$1
     n=$(number "$v")
+    start_hub
     # The lock's descriptor is closed: a daemon would hold it for ever.
     qemu-system-x86_64 -name "$v" -enable-kvm -cpu host -m "$mem" -smp "$cpus" -display none \
         -smbios type=1,serial="$v" \
@@ -128,7 +156,7 @@ start_qemu() {
         -drive file="$d/pool.qcow2",if=virtio,format=qcow2 \
         -netdev user,id=n0,hostfwd=tcp:127.0.0.1:"$(port "$v")"-:22 \
         -device virtio-net-pci,netdev=n0,mac=52:54:00:77:01:0"$n" \
-        -netdev socket,id=n1,mcast=230.0.77.1:23077,localaddr=127.0.0.1 \
+        -netdev dgram,id=n1,local.type=inet,local.host=127.0.0.1,local.port=$((2310 + n)),remote.type=inet,remote.host=127.0.0.1,remote.port=2310 \
         -device virtio-net-pci,netdev=n1,mac=52:54:00:77:02:0"$n" \
         -serial file:"$d/console.log" -pidfile "$d/pid" -daemonize 9>&- || die "QEMU refused $v"
 }
@@ -208,6 +236,7 @@ provision() {
 # Runs as root in the VM that becomes the base.
 set -eux
 [ "$(diskinfo vtbd1 | awk '{print $3}')" = 21474836480 ] || { echo "vtbd1 is not the pool disk"; exit 1; }
+kldload -n linux linux64 linprocfs linsysfs fdescfs pf if_bridge if_epair if_wg carp
 zpool create -f -O compression=lz4 -m /lpool lpool vtbd1
 pw useradd labuser -m -s /bin/sh
 cat >> /boot/loader.conf << 'CONF'
@@ -243,7 +272,6 @@ cat >> /etc/hosts << 'CONF'
 10.77.0.2 lab2
 10.77.0.3 lab3
 CONF
-kldload -n linux linux64 linprocfs linsysfs fdescfs pf if_bridge if_epair if_wg carp
 EOF
 }
 
@@ -275,10 +303,36 @@ rm -rf "$HOME/warm"
 EOF
 }
 
+# The next base from the current one: what changes without a first boot.
+patch_base() {
+    local file=$1 old n s=$root/stage p=2300 pid
+    [ -r "$file" ] || die "no $file"
+    old=$(current_base)
+    n=$((old + 1))
+    say "building base $n from $old"
+    rm -rf "$s"
+    mkdir -p "$s" || die "cannot make $s"
+    qemu-img create -q -f qcow2 -b "$root/base/lab-$old.qcow2" -F qcow2 "$s/disk.qcow2" || die "no disk"
+    qemu-img create -q -f qcow2 -b "$root/base/lab-$old-pool.qcow2" -F qcow2 "$s/pool.qcow2" || die "no pool disk"
+    qemu-system-x86_64 -name labbase -enable-kvm -cpu host -m "$mem" -smp "$cpus" -display none \
+        -smbios type=1,serial=lab9 \
+        -drive file="$s/disk.qcow2",if=virtio,format=qcow2 \
+        -drive file="$s/pool.qcow2",if=virtio,format=qcow2 \
+        -netdev user,id=n0,hostfwd=tcp:127.0.0.1:$p-:22 -device virtio-net-pci,netdev=n0 \
+        -device virtio-net-pci \
+        -serial file:"$s/console.log" -pidfile "$s/pid" -daemonize 9>&- || die "QEMU refused the base"
+    pid=$(cat "$s/pid")
+    trap 'kill -9 "$pid" 2> /dev/null' EXIT
+    wait_ssh "$p" "$pid" "$s/console.log" 300
+    ssh_to "$p" 'sudo sh -s' < "$file" || die "the patch failed"
+    publish_base "$n" "$s" "$p" "$pid"
+}
+
 build_base() {
     local jailer= jailer_rev= n s=$root/stage p=2300 pid
     while [ $# -gt 0 ]; do
         case $1 in
+        --patch) patch_base "${2:?}"; return ;;
         --jailer) jailer=${2:?}; shift 2 ;;
         --jailer-rev) jailer_rev=${2:?}; shift 2 ;;
         *) die "unknown argument: $1" ;;
@@ -305,6 +359,7 @@ packages:
   - sudo
   - git
   - ca_root_nss
+  - curl
 EOF
     printf 'instance-id: lab-base-%s\nlocal-hostname: labbase\n' "$n" > "$s/meta-data"
     cloud-localds "$s/seed.iso" "$s/user-data" "$s/meta-data" || die "no seed"
@@ -330,9 +385,16 @@ EOF
         ssh_to "$p" 'rmdir ~/warm/jailer'
     fi
     as_lab | ssh_to "$p" 'sh -s' || die "setting up lab failed"
+    # First boot's identity would outrank the one a VM learns from QEMU.
+    ssh_to "$p" 'sudo rm -f /etc/rc.conf.d/hostname' || die "first boot's name stays"
+    publish_base "$n" "$s" "$p" "$pid"
+}
+
+# Marks the VM in the stage as base N, stops it and keeps its disks.
+publish_base() {
+    local n=$1 s=$2 p=$3 pid=$4 w=0
     ssh_to "$p" "sudo pkg clean -ay; echo $n | sudo tee /etc/lab-base; sync" || die "no base marker"
     ssh_to "$p" 'sudo shutdown -p now' > /dev/null 2>&1
-    local w=0
     while kill -0 "$pid" 2> /dev/null && [ "$w" -lt 120 ]; do sleep 1; w=$((w + 1)); done
     kill -0 "$pid" 2> /dev/null && die "the base did not stop"
     trap - EXIT
@@ -429,7 +491,12 @@ case $command in
 base) preconditions; lock fail "base"; build_base "$@" ;;
 up) preconditions; lock fail "up"; each up_vm "$@" ;;
 reset) preconditions; lock fail "reset"; each reset_vm "$@" ;;
-down) preconditions; lock fail "down"; each stop_vm "$@" ;;
+down)
+    preconditions; lock fail "down"; each stop_vm "$@"
+    for v in $all_vms; do vm_pid "$v" > /dev/null && exit 0; done
+    [ ! -r "$root/hub.pid" ] || kill "$(cat "$root/hub.pid")" 2> /dev/null
+    rm -f "$root/hub.pid"
+    ;;
 status) preconditions; status ;;
 ssh)
     v=${1:?}; shift; check_vm "$v"

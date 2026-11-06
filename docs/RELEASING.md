@@ -32,7 +32,10 @@ scripts/qualify --manifest scripts/legion.qualify --profile shared \
 ```
 
 Run `--profile isolated` on a disposable host and `--profile cluster` on the
-lab of `crates/legion/tests/common`. The `shared` profile is safe on a host
+lab of `crates/legion/tests/common`. `scripts/lab` gives disposable FreeBSD VMs
+for this, shared with jailer: `scripts/lab run --manifest scripts/legion.qualify
+--profile isolated` resets a VM, runs the commit at HEAD and brings the record
+back. A record's `vm` field says the host was a VM, and `image` which base. The `shared` profile is safe on a host
 that does other work; the other two publish ports or need several hosts.
 
 Keep each run's `result.json`. A release is ready when every test in the

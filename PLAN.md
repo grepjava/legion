@@ -186,10 +186,10 @@ bhyve and NAT options wait for a concrete user need.
 
 ## Decisions needed
 
-1. **Test hosts.** Phase 1 needs one disposable FreeBSD host and phase 4 at
-   least three. The current shared public host doesn't suit: it can't be
-   thrown away, and it's also used by jailer. Recommended: throwaway VMs from
-   a provider API, or bhyve on a dedicated machine, with jailer sharing them.
+1. **Test hosts.** Decided 6 November 2026: QEMU with KVM on the Windows PC,
+   under WSL2, through `scripts/lab`, shared with jailer. Three VMs on one
+   read-only base, reset for every run. Real hardware stays untested, and
+   records say the host was a VM.
 2. **arm64.** Decided 6 November 2026: amd64 is finished first. Until an
    arm64 host joins qualification, arm64 isn't called supported. It stays in
    the port and in CI's emulated unit tests, and was last built at v0.1.7.

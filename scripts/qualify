@@ -11,7 +11,9 @@
 #
 # Run it from the project's root. --check needs no FreeBSD: it compares the
 # manifest with the tests in the tree. A run needs passwordless sudo, and
-# holds $QUALIFY_LOCK (default /tmp/qualify-lock) so projects sharing a host
+# records kern.vm_guest, which is none on real hardware, and $QUALIFY_IMAGE if
+# the host came from an image. It holds $QUALIFY_LOCK (default
+# /tmp/qualify-lock) so projects sharing a host
 # take turns. It refuses to start with less than $QUALIFY_MIN_FREE_GB (10)
 # free. Run it detached, and watch DIR: `status` gets a line as each step
 # ends, and `done` appears at the end. DIR/result.json is the record, and
@@ -391,6 +393,8 @@ compare
         "$(json "$(git rev-parse HEAD 2> /dev/null || cat .qualify-revision 2> /dev/null || echo unknown)")"
     printf '  "host": "%s",\n  "os": "%s",\n  "arch": "%s",\n' \
         "$(json "$(hostname)")" "$(json "$(freebsd-version -k)")" "$(uname -p)"
+    printf '  "vm": "%s",\n  "image": "%s",\n' \
+        "$(json "$(sysctl -n kern.vm_guest)")" "$(json "${QUALIFY_IMAGE:-}")"
     printf '  "profile": "%s",\n  "started": "%s",\n  "selected": "%s",\n' "$profile" "$stamp" "$(json "$only")"
     printf '  "failed": %s,\n  "invalid": %s,\n  "tests": [\n' \
         "$([ "$failed" = 1 ] && echo true || echo false)" \
