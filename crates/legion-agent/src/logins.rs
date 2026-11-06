@@ -6,8 +6,6 @@
 
 use std::collections::BTreeMap;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use legion_api::Kind;
 use serde::Deserialize;
 
@@ -50,28 +48,12 @@ fn parse(value: &[u8]) -> Result<Vec<Login>, String> {
     auths
         .into_iter()
         .map(|(registry, e)| {
-            let (username, password) = match (e.auth, e.username, e.password) {
-                (Some(auth), _, _) if !auth.is_empty() => {
-                    let pair = STANDARD
-                        .decode(auth.trim())
-                        .ok()
-                        .and_then(|b| String::from_utf8(b).ok())
-                        .ok_or_else(|| {
-                            format!("{registry}: auth is not base64 of user:password")
-                        })?;
-                    let (u, p) = pair.split_once(':').ok_or_else(|| {
-                        format!("{registry}: auth is not base64 of user:password")
-                    })?;
-                    (u.to_owned(), p.to_owned())
-                }
-                (_, Some(u), Some(p)) => (u, p),
-                _ => {
-                    return Err(format!(
-                        "{registry}: no auth, or username and password (credential helpers \
-                         and identity tokens are not supported)"
-                    ));
-                }
-            };
+            let (username, password) = legion_api::login::decode(
+                e.auth.as_deref(),
+                e.username.as_deref(),
+                e.password.as_deref(),
+            )
+            .map_err(|why| format!("{registry}: {why}"))?;
             Ok(Login {
                 registry,
                 username,
@@ -84,6 +66,8 @@ fn parse(value: &[u8]) -> Result<Vec<Login>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
 
     #[test]
     fn docker_configs() {
