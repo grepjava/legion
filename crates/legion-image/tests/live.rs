@@ -24,7 +24,7 @@ fn sh(cmd: &str) -> String {
 fn root() -> Option<String> {
     let r = std::env::var("LEGION_IMAGE_ZFS_ROOT").ok();
     if r.is_none() {
-        eprintln!("LEGION_IMAGE_ZFS_ROOT not set; skipping");
+        legion_sys::live::skip("LEGION_IMAGE_ZFS_ROOT not set");
     }
     r
 }

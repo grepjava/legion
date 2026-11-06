@@ -1,0 +1,364 @@
+#!/bin/sh
+#
+# Runs a project's privileged tests on a FreeBSD host and records what
+# happened: each test passed, failed or skipped, with the reason, and what
+# it left behind. Shared by Legion and jailer; each project has a manifest.
+#
+#   scripts/qualify --check  --manifest FILE
+#   scripts/qualify --list   --manifest FILE --profile P
+#   scripts/qualify --manifest FILE --profile P --pool POOL [--out DIR]
+#                   [--only ERE]
+#
+# Run it from the project's root. --check needs no FreeBSD: it compares the
+# manifest with the tests in the tree. A run needs passwordless sudo, and
+# holds $QUALIFY_LOCK (default /tmp/qualify-lock) so projects sharing a host
+# take turns. It refuses to start with less than $QUALIFY_MIN_FREE_GB (10)
+# free. Run it detached, and watch DIR: `status` gets a line as each step
+# ends, and `done` appears at the end. DIR/result.json is the record, and
+# the exit status is 0 only if every required test passed and nothing the
+# project owns was left behind.
+#
+# Profiles say what a host may safely do, each including those before it:
+#   shared    a host others use, even a public one
+#   isolated  a disposable host: may publish ports or need servers set up
+#   cluster   disposable hosts, several of them
+# A test above the chosen profile is reported as not run. It never passes.
+#
+# Manifest lines, fields separated by blanks, # for comments:
+#   project NAME
+#   scan GLOB            files to look for ignored tests in
+#   own ERE              what the project owns in the before/after snapshots
+#   env NAME VALUE       for every test; @zfs@ (a dataset with no mountpoint),
+#                        @zfsmount@ (one mounted) and @lab@ (a directory) are
+#                        made for the run
+#   run NAME TIMEOUT COMMAND...
+#   test CRATE TARGET NAME host|vnet PROFILE TIMEOUT [NEED...]
+#   helper CRATE TARGET NAME   an ignored test that is not a test of its own
+# NEEDs: kld:MODULE (loaded for the run, unloaded if the run loaded it),
+# env:NAME (must be set when qualify starts), optional (a skip is allowed).
+# A `vnet` test runs in a throwaway VNET jail, as it changes the network.
+# CRATE `.` is the project's root package.
+#
+# A test skips by printing a line starting QUALIFY-SKIP: (Legion's tests do
+# so through legion_sys::live::skip). QUALIFY_REQUIRE_LIVE=1 is set for all
+# but `optional` tests, and turns such a skip into a failure.
+
+set -u
+
+die() { echo "qualify: $*" >&2; exit 2; }
+
+mode=run manifest= profile= pool= out= only=
+while [ $# -gt 0 ]; do
+    case $1 in
+    --check) mode=check; shift ;;
+    --list) mode=list; shift ;;
+    --manifest) manifest=${2:?}; shift 2 ;;
+    --profile) profile=${2:?}; shift 2 ;;
+    --pool) pool=${2:?}; shift 2 ;;
+    --out) out=${2:?}; shift 2 ;;
+    --only) only=${2:?}; shift 2 ;;
+    *) die "unknown argument: $1" ;;
+    esac
+done
+[ -n "$manifest" ] && [ -r "$manifest" ] || die "no readable --manifest"
+
+# The manifest's lines of one kind, without their first word.
+lines() { sed -e 's/#.*//' "$manifest" | awk -v k="$1" '$1 == k { sub(/^[ \t]*[^ \t]+[ \t]+/, ""); print }'; }
+
+rank() {
+    case $1 in
+    shared) echo 1 ;; isolated) echo 2 ;; cluster) echo 3 ;;
+    *) die "unknown profile: $1" ;;
+    esac
+}
+
+# Every ignored test in the tree, as `crate target name`.
+ignored() {
+    lines scan | while read -r glob; do
+        # shellcheck disable=SC2086
+        for f in $glob; do
+            [ -f "$f" ] || continue
+            target=$(basename "$f" .rs)
+            case $f in
+            crates/*/tests/*) crate=${f#crates/}; crate=${crate%%/*} ;;
+            *) crate=. ;;
+            esac
+            awk -v c="$crate" -v t="$target" '
+                /^[ \t]*#\[ignore/ { want = 1; next }
+                want && /fn [a-zA-Z_0-9]+/ {
+                    match($0, /fn [a-zA-Z_0-9]+/)
+                    print c, t, substr($0, RSTART + 3, RLENGTH - 3)
+                    want = 0
+                }' "$f"
+        done
+    done | sort -u
+}
+
+check() {
+    tmp=$(mktemp -d)
+    ignored > "$tmp/tree"
+    [ -s "$tmp/tree" ] || die "no ignored tests found: check the scan lines"
+    { lines test; lines helper; } | awk '{ print $1, $2, $3 }' | sort > "$tmp/listed"
+    bad=0
+    dup=$(uniq -d "$tmp/listed")
+    [ -z "$dup" ] || { echo "listed twice: $dup"; bad=1; }
+    missing=$(sort -u "$tmp/listed" | comm -13 - "$tmp/tree")
+    [ -z "$missing" ] || { echo "ignored tests not in the manifest:"; echo "$missing"; bad=1; }
+    stale=$(sort -u "$tmp/listed" | comm -23 - "$tmp/tree")
+    [ -z "$stale" ] || { echo "in the manifest, but no such ignored test:"; echo "$stale"; bad=1; }
+    lines test | while read -r _ _ name where prof timeout _; do
+        case $where in host | vnet) ;; *) echo "$name: where is $where"; exit 1 ;; esac
+        rank "$prof" > /dev/null
+        case $timeout in *[!0-9]* | '') echo "$name: timeout is $timeout"; exit 1 ;; esac
+    done || bad=1
+    rm -rf "$tmp"
+    [ "$bad" = 0 ] || exit 1
+    echo "manifest matches the tree: $(lines test | wc -l | tr -d ' ') tests, $(lines helper | wc -l | tr -d ' ') helpers"
+}
+
+check_first() { (check) > /dev/null || { (check); die "fix the manifest first"; }; }
+
+case $mode in
+check) check; exit 0 ;;
+list)
+    [ -n "$profile" ] || die "--list needs --profile"
+    want=$(rank "$profile")
+    lines test | while read -r c t name where prof timeout needs; do
+        [ "$(rank "$prof")" -le "$want" ] && state=run || state="not run, needs $prof"
+        echo "$c $t $name ($where): $state"
+    done
+    exit 0
+    ;;
+esac
+
+[ -n "$profile" ] && [ -n "$pool" ] || die "a run needs --profile and --pool"
+want=$(rank "$profile")
+check_first
+
+[ "$(uname -s)" = FreeBSD ] || die "not FreeBSD"
+sudo -n true 2> /dev/null || die "needs passwordless sudo"
+zpool list -H "$pool" > /dev/null 2>&1 || die "no pool $pool"
+[ -f Cargo.toml ] || die "run it from the project's root"
+free_gb=$(df -k . | awk 'NR == 2 { print int($4 / 1048576) }')
+[ "$free_gb" -ge "${QUALIFY_MIN_FREE_GB:-10}" ] || die "only ${free_gb}G free"
+
+project=$(lines project)
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+out=${out:-$HOME/qualify/$project-$stamp}
+mkdir -p "$out" || die "cannot make $out"
+[ ! -e "$out/result.json" ] || die "$out already holds a run"
+
+lock=${QUALIFY_LOCK:-/tmp/qualify-lock}
+echo "waiting for $lock" > "$out/state"
+until mkdir "$lock" 2> /dev/null; do sleep 30; done
+
+zfs=$pool/q$$
+zfsmount=$pool/q$$m
+lab=/var/tmp/q$$
+jail=q$$
+loaded=
+: > "$out/status"
+: > "$out/tests.json"
+
+json() { printf '%s' "$1" | tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+record() { # name result reason seconds
+    echo "$1 $2" >> "$out/status"
+    [ ! -s "$out/tests.json" ] || printf ',\n' >> "$out/tests.json"
+    printf '    {"name": "%s", "result": "%s", "reason": "%s", "seconds": %s}' \
+        "$(json "$1")" "$2" "$(json "$3")" "$4" >> "$out/tests.json"
+}
+
+snapshot() {
+    {
+        sudo jls name path | sed 's/^/jail /'
+        mount | sed 's/^/mount /'
+        sudo rctl | sed 's/^/rctl /'
+        ifconfig -l | tr ' ' '\n' | sed 's/^/if /'
+        sudo pfctl -sA 2> /dev/null | sed 's/^ */anchor /'
+        zfs list -H -o name -r "$pool" | sed 's/^/zfs /'
+    } | sort > "$1"
+}
+
+cleanup() {
+    sudo jail -r "$jail" 2> /dev/null
+    sudo zfs destroy -r "$zfs" 2> /dev/null
+    sudo zfs destroy -r "$zfsmount" 2> /dev/null
+    for m in $loaded; do sudo kldunload "$m" 2> /dev/null; done
+    [ -z "${md:-}" ] || {
+        sudo swapoff "/dev/$md"
+        sudo mdconfig -d -u "$md"
+        sudo rm -f "/usr/swap-qualify$$"
+    }
+    rmdir "$lock" 2> /dev/null
+}
+trap 'cleanup; touch "$out/done"' EXIT
+trap 'exit 3' INT TERM HUP
+
+echo running > "$out/state"
+snapshot "$out/before"
+
+# Small hosts link out of memory without swap.
+md=
+if [ -z "$(swapctl -l | tail -n +2)" ]; then
+    sudo dd if=/dev/zero of="/usr/swap-qualify$$" bs=1m count=4096 status=none
+    sudo chmod 600 "/usr/swap-qualify$$"
+    md=$(sudo mdconfig -a -t vnode -f "/usr/swap-qualify$$")
+    sudo swapon "/dev/$md"
+fi
+sudo zfs create -o mountpoint=none "$zfs" || die "cannot create $zfs"
+sudo zfs create "$zfsmount" || die "cannot create $zfsmount"
+sudo mkdir -p "$lab"
+
+# Cargo's output, kept from filling a small disk.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" CARGO_INCREMENTAL=0
+
+envs=$(lines env | while read -r k v; do
+    v=$(printf '%s' "$v" | sed -e "s|@zfsmount@|$zfsmount|g" -e "s|@zfs@|$zfs|g" -e "s|@lab@|$lab|g")
+    printf '%s=%s ' "$k" "$v"
+done)
+
+failed=0
+
+# Steps are named by their test; --only picks among them.
+selected() { [ -z "$only" ] || printf '%s\n' "$1" | grep -Eq "$only"; }
+
+# Each run line is a shell command of the project's own manifest.
+lines run | {
+    while read -r name timeout cmd; do
+        selected "$name" || continue
+        start=$(date +%s)
+        echo "step $name" > "$out/state"
+        # shellcheck disable=SC2086
+        timeout -k 30 "$timeout" sh -c "$cmd" > "$out/$name.log" 2>&1 < /dev/null
+        rc=$?
+        took=$(($(date +%s) - start))
+        if [ "$rc" = 0 ]; then
+            record "$name" passed "" "$took"
+        elif [ "$rc" = 124 ]; then
+            record "$name" failed "timed out after ${timeout}s" "$took"
+            touch "$out/failed"
+        else
+            record "$name" failed "exit $rc" "$took"
+            touch "$out/failed"
+        fi
+    done
+}
+
+binary() { # crate target
+    if [ "$1" = . ]; then pkg=; else pkg="-p $1"; fi
+    # shellcheck disable=SC2086
+    cargo test $pkg --test "$2" --no-run 2>&1 |
+        sed -n "s/.*Executable tests\/$2.rs (\(.*\))/\1/p" | head -n 1
+}
+
+lines test > "$out/.tests"
+while read -r crate target name where prof timeout needs; do
+    selected "$name" || continue
+    if [ "$(rank "$prof")" -gt "$want" ]; then
+        record "$name" "not-run" "needs the $prof profile" 0
+        continue
+    fi
+    required=1 unmet=
+    for need in $needs; do
+        case $need in
+        optional) required= ;;
+        env:*) eval "[ -n \"\${${need#env:}:-}\" ]" || unmet="$unmet ${need#env:}" ;;
+        kld:*)
+            m=${need#kld:}
+            if ! kldstat -q -m "$m" && ! kldstat -q -n "$m"; then
+                sudo kldload -n "$m" && loaded="$m $loaded" || unmet="$unmet $m"
+            fi
+            ;;
+        *) die "$name: unknown need $need" ;;
+        esac
+    done
+    if [ -n "$unmet" ]; then
+        if [ -n "$required" ]; then
+            record "$name" failed "missing:$unmet" 0
+            touch "$out/failed"
+        else
+            record "$name" skipped "missing:$unmet" 0
+        fi
+        continue
+    fi
+    echo "step $name" > "$out/state"
+    log=$out/$name.log
+    bin=$(binary "$crate" "$target")
+    if [ -z "$bin" ]; then
+        record "$name" failed "did not build" 0
+        touch "$out/failed"
+        continue
+    fi
+    bin=$(realpath "$bin")
+    passthrough=$(for need in $needs; do
+        case $need in env:*) n=${need#env:}; eval "printf '%s=%s ' \"$n\" \"\$$n\"" ;; esac
+    done)
+    require=
+    [ -z "$required" ] || require=QUALIFY_REQUIRE_LIVE=1
+    start=$(date +%s)
+    run="$bin --ignored --exact $name --test-threads=1 --nocapture"
+    if [ "$where" = vnet ]; then
+        sudo jail -c name="$jail" path=/ vnet persist children.max=4 allow.raw_sockets ||
+            { record "$name" failed "no VNET jail" 0; touch "$out/failed"; continue; }
+        run="jexec $jail $run"
+    fi
+    # shellcheck disable=SC2086
+    sudo env $envs $passthrough $require timeout -k 30 "$timeout" $run > "$log" 2>&1 < /dev/null
+    rc=$?
+    [ "$where" != vnet ] || sudo jail -r "$jail" 2> /dev/null
+    took=$(($(date +%s) - start))
+    why=$(grep -m 1 '^QUALIFY-SKIP:' "$log" | cut -d: -f2-)
+    if [ "$rc" = 124 ]; then
+        record "$name" failed "timed out after ${timeout}s" "$took"
+        touch "$out/failed"
+    elif [ "$rc" != 0 ]; then
+        record "$name" failed "exit $rc" "$took"
+        touch "$out/failed"
+    elif ! grep -q 'test result: ok\. 1 passed' "$log"; then
+        record "$name" failed "ran no test" "$took"
+        touch "$out/failed"
+    elif [ -n "$why" ]; then
+        record "$name" skipped "$why" "$took"
+    else
+        record "$name" passed "" "$took"
+    fi
+done < "$out/.tests"
+rm -f "$out/.tests"
+
+# Before the snapshot, so what is left is the tests' doing.
+sudo zfs destroy -r "$zfs" 2> /dev/null
+sudo zfs destroy -r "$zfsmount" 2> /dev/null
+sudo chflags -R 0 "$lab" 2> /dev/null
+sudo rm -rf "$lab"
+snapshot "$out/after"
+
+# What differs, split into what the project owns and what others on the
+# host did meanwhile, which is noted and is not this run's failure.
+own=$(lines own | paste -sd '|' -)
+comm -13 "$out/before" "$out/after" > "$out/added"
+comm -23 "$out/before" "$out/after" > "$out/removed"
+if [ -n "$own" ]; then
+    grep -E "$own" "$out/added" > "$out/leftovers"
+    grep -vE "$own" "$out/added" > "$out/foreign"
+else
+    : > "$out/leftovers"
+    cp "$out/added" "$out/foreign"
+fi
+[ ! -s "$out/leftovers" ] || touch "$out/failed"
+
+[ ! -e "$out/failed" ] || failed=1
+{
+    printf '{\n  "project": "%s",\n  "revision": "%s",\n' "$(json "$project")" \
+        "$(json "$(git rev-parse HEAD 2> /dev/null || cat .qualify-revision 2> /dev/null || echo unknown)")"
+    printf '  "host": "%s",\n  "os": "%s",\n  "arch": "%s",\n' \
+        "$(json "$(hostname)")" "$(json "$(freebsd-version -k)")" "$(uname -p)"
+    printf '  "profile": "%s",\n  "started": "%s",\n  "selected": "%s",\n' "$profile" "$stamp" "$(json "$only")"
+    printf '  "failed": %s,\n  "tests": [\n' "$([ "$failed" = 1 ] && echo true || echo false)"
+    cat "$out/tests.json"
+    printf '\n  ],\n  "leftovers": %s,\n  "foreign": %s\n}\n' \
+        "$(wc -l < "$out/leftovers" | tr -d ' ')" "$(wc -l < "$out/foreign" | tr -d ' ')"
+} > "$out/result.json"
+rm -f "$out/tests.json"
+echo finished > "$out/state"
+exit "$failed"

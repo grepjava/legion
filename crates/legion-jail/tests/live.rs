@@ -83,7 +83,7 @@ async fn until(what: &str, mut f: impl AsyncFnMut() -> bool) {
 #[ignore = "needs root, LEGION_JAIL_ZFS_ROOT and the network"]
 async fn pods_of_jails() {
     let Ok(root) = std::env::var("LEGION_JAIL_ZFS_ROOT") else {
-        eprintln!("LEGION_JAIL_ZFS_ROOT not set; skipping");
+        legion_sys::live::skip("LEGION_JAIL_ZFS_ROOT not set");
         return;
     };
     let base = format!("{root}/ljail{}", std::process::id());
@@ -485,7 +485,7 @@ async fn linux_images() {
         std::env::var("LEGION_JAIL_ZFS_ROOT"),
         std::env::var("LEGION_JAIL_LINUX"),
     ) else {
-        eprintln!("LEGION_JAIL_ZFS_ROOT or LEGION_JAIL_LINUX not set; skipping");
+        legion_sys::live::skip("LEGION_JAIL_ZFS_ROOT or LEGION_JAIL_LINUX not set");
         return;
     };
     let base = format!("{root}/llinux{}", std::process::id());
@@ -598,7 +598,7 @@ async fn standalone_containers_and_build_steps() {
     use legion_jail::{Step, StepMount, StepNetwork};
 
     let Ok(root) = std::env::var("LEGION_JAIL_ZFS_ROOT") else {
-        eprintln!("LEGION_JAIL_ZFS_ROOT not set; skipping");
+        legion_sys::live::skip("LEGION_JAIL_ZFS_ROOT not set");
         return;
     };
     let base = format!("{root}/lstand{}", std::process::id());

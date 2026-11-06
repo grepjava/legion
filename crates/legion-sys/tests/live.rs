@@ -431,7 +431,7 @@ fn jail_memory() {
 #[ignore = "needs root and LEGION_SYS_ZFS_ROOT"]
 fn zfs_datasets() {
     let Ok(root) = std::env::var("LEGION_SYS_ZFS_ROOT") else {
-        eprintln!("LEGION_SYS_ZFS_ROOT not set; skipping");
+        legion_sys::live::skip("LEGION_SYS_ZFS_ROOT not set");
         return;
     };
     let sys = Shell::new();
@@ -525,6 +525,12 @@ fn zfs_datasets() {
 #[test]
 #[ignore = "needs root, LEGION_SYS_NFS and LEGION_SYS_ISCSI"]
 fn network_storage() {
+    if std::env::var_os("LEGION_SYS_NFS").is_none()
+        || std::env::var_os("LEGION_SYS_ISCSI").is_none()
+    {
+        legion_sys::live::skip("LEGION_SYS_NFS or LEGION_SYS_ISCSI not set");
+        return;
+    }
     let sys = Shell::new();
     let dir = std::env::temp_dir().join(format!("lsysnet{}", std::process::id()));
     let (nfs_dir, ufs_dir) = (dir.join("nfs"), dir.join("ufs"));
