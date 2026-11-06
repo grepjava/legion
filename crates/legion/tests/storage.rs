@@ -254,4 +254,8 @@ fn pod_on_network_storage() {
         "the daemon ended with {status}; see {}",
         lab.join("daemon.log").display()
     );
+    // What the daemon keeps for the pods it leaves running goes with the test.
+    let tidy = "for i in legion0 wg0; do ifconfig $i destroy; done; \
+                pfctl -a legion/svc -F all; pfctl -a legion/policy -F all";
+    let _ = Command::new("sh").args(["-c", tidy]).output();
 }

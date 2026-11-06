@@ -6,7 +6,7 @@ scan crates/*/tests/*.rs
 own ^jail [^ ]+ /var/tmp/(l|q)
 own ^jail (lsys|lnet|lvip|ladopt|lcontract)
 own ^mount .*/var/tmp/(l|q)
-own ^if (lsys|lnet|lvip|lbr)
+own ^if (lsys|lnet|lvip|lbr|legion0|wg0)
 own ^anchor legion/
 own ^zfs [^/]+/(q[0-9]|l(jail|stand|linux|img))
 
