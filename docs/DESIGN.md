@@ -21,7 +21,7 @@ was built from, kept where it still explains a choice.
 | D2 | API surface | Own gRPC API and `legion` CLI. Compose files accepted via `legion stack deploy`. No Docker Engine/Swarm API compatibility. |
 | D3 | Networking | Legion owns jail networking (VNET, epair, bridge, routing, pf). The runtime (images, jails, processes) is Legion's too since phase 5 (section 6). |
 | D4 | Linux images | Nice-to-have, late phase, behind a node capability flag. |
-| D5 | Target OS | FreeBSD 15.x only, amd64 and arm64. |
+| D5 | Target OS | FreeBSD 15.x only. amd64 first; arm64 builds, and is supported once it is qualified. |
 | D6 | Kubernetes scope | Selected features, phased (section 4). No Kubernetes API compatibility. |
 | D7 | Storage | A ZFS pool is required on every node. `legion join` refuses a node without one. |
 
@@ -1678,7 +1678,8 @@ WireGuard and bridge, with tasks as VNET jails attached to the node bridges.
 2. ~~Package distribution~~ Decided: both. Release tarballs for amd64
    (`packaging/freebsd/release.sh`, with an rc.d script) are on GitHub,
    and the port `sysutils/legion` (`packaging/freebsd/port`, amd64 and
-   aarch64) passes `poudriere testport` on 15.1 amd64 and builds on 15.1
-   arm64. It is to be submitted to the ports tree.
+   aarch64) last passed `poudriere testport` on 15.1 amd64 at v0.1.9 and
+   last built on 15.1 arm64 at v0.1.7. It is to be submitted to the ports
+   tree.
 3. ~~Licence~~ Decided: BSD-2-Clause, which fits the FreeBSD ecosystem.
 4. ~~Manage the system Podman's containers~~ Decided: no; Legion runs its own jails and leaves other runtimes alone.

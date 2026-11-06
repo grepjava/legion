@@ -80,9 +80,9 @@ in `packaging/freebsd/port/distinfo`, with a new `TIMESTAMP`, and in the port's
 poudriere testport -j JAIL -p PORTS_TREE -o sysutils/legion
 ```
 
-Run it on 15.1 amd64 with the port from this tree overlaid, and build it on
-15.1 arm64. A release that skips this says so in its notes, along with the last
-version that passed.
+Run it on 15.1 amd64 with the port from this tree overlaid. Once arm64 is
+qualified, build it on 15.1 arm64 too. A release that skips this says so in its
+notes, along with the last version that passed.
 
 ## 6. Build the tarballs
 

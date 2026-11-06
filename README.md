@@ -24,8 +24,9 @@ IPv6, network volumes) are done; it is being hardened for real use.
 ## Install
 
 On FreeBSD 15, from a release tarball (amd64; or one made with
-`packaging/freebsd/release.sh`, which also builds on arm64; a port for
-both is in `packaging/freebsd/port`), as root:
+`packaging/freebsd/release.sh`, which also builds on arm64, though arm64
+is not qualified yet; a port for both is in `packaging/freebsd/port`), as
+root:
 
 ```sh
 tar -xf legion-<version>-freebsd15-amd64.tar.xz --strip-components 1 -C /usr/local
@@ -145,7 +146,8 @@ Two nodes behind different NATs cannot reach each other, so give such a
 VM a bridged network on the LAN of the other local nodes rather than the
 hypervisor's user-mode NAT. Managers must reach each other directly.
 
-amd64 and arm64 nodes may share a cluster. The manager does not read
+amd64 and arm64 nodes may share a cluster, though only amd64 is qualified
+so far. The manager does not read
 images: a task placed on a node whose architecture the image does not
 offer is rejected, and the service's tasks then stay off nodes of that
 architecture. A constraint such as `node.platform.arch == amd64` keeps

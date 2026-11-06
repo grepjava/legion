@@ -69,8 +69,8 @@ Goal: a pass means the test ran, on a named host, and left nothing behind.
    testport`, arm64, notes, tag. State which steps are automated.
 
 Exit: a release candidate has a recorded run with every test accounted for,
-on each supported platform. Agree the harness with jailer before step 1, so
-one serves both.
+on each supported platform, which for now means amd64 (see Decisions). Agree
+the harness with jailer before step 1, so one serves both.
 
 ### Phase 2: Doctor
 
@@ -182,9 +182,6 @@ bhyve and NAT options wait for a concrete user need.
 
 ## Small items to do at any point
 
-- Correct `docs/COMPARISON.md`, which lists ACME and certificate revocation
-  as missing, and `docs/DESIGN.md`, which names v0.1.7 as the release.
-- Update ROADMAP.MD's baseline to the current version.
 - Close the ACME gap: a route changed between the recheck and the write.
 
 ## Decisions needed
@@ -193,8 +190,9 @@ bhyve and NAT options wait for a concrete user need.
    least three. The current shared public host doesn't suit: it can't be
    thrown away, and it's also used by jailer. Recommended: throwaway VMs from
    a provider API, or bhyve on a dedicated machine, with jailer sharing them.
-2. **arm64.** It's in the port but was last built at v0.1.7. Either add an
-   arm64 host to qualification, or stop calling it supported until then.
+2. **arm64.** Decided 6 November 2026: amd64 is finished first. Until an
+   arm64 host joins qualification, arm64 isn't called supported. It stays in
+   the port and in CI's emulated unit tests, and was last built at v0.1.7.
 3. **Partitions.** Recommended default: fail-open, as today, since workloads
    surviving a control-plane outage is a stated goal. Add an opt-in fail-closed
    mode for workloads that must never run twice.
