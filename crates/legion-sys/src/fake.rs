@@ -38,6 +38,15 @@ pub struct FakeInterface {
     pub ether: Option<String>,
 }
 
+/// Run once, at a moment a test wants to look or to act.
+struct Hook(Box<dyn FnOnce() + Send>);
+
+impl std::fmt::Debug for Hook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Hook")
+    }
+}
+
 #[derive(Debug, Default)]
 struct State {
     modules: BTreeSet<String>,
@@ -95,6 +104,7 @@ struct State {
     carp: BTreeMap<(String, u8), (Carp, CarpState)>,
     /// Commands that fail once, the next time they run.
     failing: BTreeSet<String>,
+    before_clone: Option<Hook>,
     /// Mount points something still holds (a dying jail its root): a
     /// dataset mounted there is busy until the path is unmounted, by force.
     held: BTreeSet<String>,
@@ -334,6 +344,12 @@ impl FakeSys {
     /// `pfctl -ss`, `pfctl -k`, `rctl -a` and `zfs destroy -r`.
     pub fn fail_next(&self, command: &str) {
         self.state().failing.insert(command.to_owned());
+    }
+
+    /// Runs `f` as the next `zfs clone` starts: what is on disk then is what
+    /// a process killed there would leave.
+    pub fn before_clone(&self, f: impl FnOnce() + Send + 'static) {
+        self.state().before_clone = Some(Hook(Box::new(f)));
     }
 
     /// Holds the mount point `path`, as a dying jail holds its root: the
@@ -1124,6 +1140,10 @@ impl Sys for FakeSys {
     }
 
     fn zfs_clone(&self, snapshot: &str, dataset: &str, props: &[(&str, &str)]) -> Result<()> {
+        let hook = self.state().before_clone.take();
+        if let Some(Hook(f)) = hook {
+            f();
+        }
         let mut s = self.state();
         if !s.snapshots.contains_key(snapshot) {
             return Err(fail(

@@ -1265,7 +1265,10 @@ impl legion_runtime::Runtime for JailRuntime {
         let images = self.images.clone();
         // On a blocking thread to the end, even if the caller stops
         // waiting: what it makes is then either recorded or gone, never
-        // left where nothing lists it.
+        // left where nothing lists it. The record comes first for the same
+        // reason, should the process die: a record whose root was never
+        // made is a container created and not started, which a remove
+        // handles, while a clone with no record would stay for good.
         blocking(move || {
             let _name = name;
             std::fs::create_dir_all(&dir).map_err(internal)?;
@@ -1278,7 +1281,9 @@ impl legion_runtime::Runtime for JailRuntime {
                 let _ = std::fs::remove_dir_all(&dir);
                 e
             };
-            if !rec.is_pod() {
+            let image = if rec.is_pod() {
+                None
+            } else {
                 let image = images
                     .get(&rec.image)
                     .map_err(image_error)
@@ -1286,14 +1291,17 @@ impl legion_runtime::Runtime for JailRuntime {
                         i.ok_or_else(|| api(404, format!("{}: image not known", rec.image)))
                     })
                     .map_err(undo)?;
+                Some(image)
+            };
+            state::write(&dir, RECORD, &rec)
+                .map_err(internal)
+                .map_err(undo)?;
+            if let Some(image) = image {
                 images
                     .prepare_rootfs(&image, &rec.root, rec.dataset.as_deref())
                     .map_err(image_error)
                     .map_err(undo)?;
             }
-            state::write(&dir, RECORD, &rec)
-                .map_err(internal)
-                .map_err(undo)?;
             Ok(rec.id.clone())
         })
         .await
@@ -1405,6 +1413,11 @@ impl legion_runtime::Runtime for JailRuntime {
 
     async fn remove(&self, id: &str) -> Result<()> {
         let rec = self.record(id)?;
+        // A create nobody waits for any more may be recorded and still
+        // making the root, which would stay if removed from under it.
+        while self.creating.lock().unwrap().contains(&rec.name) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         self.stop(id, Duration::ZERO).await?;
         if rec.is_pod() {
             // Members first; then the pod's jail if it outlived them.
@@ -2329,6 +2342,90 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    /// A runtime keeping images and containers in the fake's ZFS, with one
+    /// image.
+    async fn on_zfs(t: &Path, sys: &Arc<legion_sys::FakeSys>) -> (JailRuntime, String) {
+        let images = Store::open(
+            sys.clone(),
+            "tank/images",
+            &t.join("images"),
+            legion_image::Client::new().unwrap(),
+        )
+        .unwrap();
+        let name = Reference::parse("localhost/app:1").unwrap().to_string();
+        let at = t.join("layout");
+        layout(&at, "etc/one", &name);
+        images.import(&at, &name).await.unwrap();
+        let rt = JailRuntime::new(
+            sys.clone(),
+            Arc::new(images),
+            Config {
+                state_dir: t.join("state"),
+                dataset: Some("tank/jails".into()),
+                shim: vec![t.join("no-shim").into()],
+                prune_images: false,
+            },
+        )
+        .unwrap();
+        (rt, name)
+    }
+
+    #[tokio::test]
+    async fn a_process_killed_while_a_root_is_made_leaves_a_record_of_it() {
+        use legion_runtime::Runtime as _;
+        let t = tempfile::tempdir().unwrap();
+        let sys = Arc::new(legion_sys::FakeSys::new());
+        let (rt, image) = on_zfs(t.path(), &sys).await;
+        let state_dir = t.path().join("state");
+        let (tx, seen) = std::sync::mpsc::channel();
+        let looked_in = state_dir.clone();
+        sys.before_clone(move || {
+            let found = records(&looked_in).unwrap();
+            tx.send(found.iter().map(|r| r.name.clone()).collect::<Vec<_>>())
+                .unwrap();
+        });
+        let spec = ContainerSpec {
+            name: "c1".into(),
+            image,
+            ..ContainerSpec::default()
+        };
+        let id = rt.create(&spec).await.unwrap();
+        assert_eq!(seen.recv().unwrap(), ["c1"], "nothing would list the clone");
+        // And one whose root was never made can be removed.
+        let rec = load(&state_dir, &id).unwrap().unwrap();
+        sys.zfs_destroy(rec.dataset.as_deref().unwrap(), true)
+            .unwrap();
+        rt.remove(&id).await.unwrap();
+        assert!(!state_dir.join(&id).exists());
+    }
+
+    #[tokio::test]
+    async fn a_remove_waits_for_a_create_still_making_the_root() {
+        use legion_runtime::Runtime as _;
+        let t = tempfile::tempdir().unwrap();
+        let sys = Arc::new(legion_sys::FakeSys::new());
+        let (rt, image) = on_zfs(t.path(), &sys).await;
+        let spec = ContainerSpec {
+            name: "c1".into(),
+            image,
+            ..ContainerSpec::default()
+        };
+        let id = rt.create(&spec).await.unwrap();
+        // As while a create is at work: recorded, its name still claimed.
+        let claim = Creating::claim(&rt.creating, "c1").unwrap();
+        let rt = Arc::new(rt);
+        let removing = tokio::spawn({
+            let (rt, id) = (rt.clone(), id.clone());
+            async move { rt.remove(&id).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!removing.is_finished(), "removed from under the create");
+        assert!(t.path().join("state").join(&id).exists());
+        drop(claim);
+        removing.await.unwrap().unwrap();
+        assert!(!t.path().join("state").join(&id).exists());
     }
 
     #[tokio::test]
