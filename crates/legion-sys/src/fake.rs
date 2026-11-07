@@ -109,6 +109,7 @@ struct State {
     /// Commands that fail once, the next time they run.
     failing: BTreeSet<String>,
     before_clone: Option<Hook>,
+    before_unmount: Option<Hook>,
     /// Mount points something still holds (a dying jail its root): a
     /// dataset mounted there is busy until the path is unmounted, by force.
     held: BTreeSet<String>,
@@ -366,6 +367,12 @@ impl FakeSys {
     /// a process killed there would leave.
     pub fn before_clone(&self, f: impl FnOnce() + Send + 'static) {
         self.state().before_clone = Some(Hook(Box::new(f)));
+    }
+
+    /// Runs `f` as the next unmount starts, as another process would that
+    /// got there first.
+    pub fn before_unmount(&self, f: impl FnOnce() + Send + 'static) {
+        self.state().before_unmount = Some(Hook(Box::new(f)));
     }
 
     /// Holds the mount point `path`, as a dying jail holds its root: the
@@ -1591,6 +1598,10 @@ must destroy them to overwrite it"
     }
 
     fn unmount(&self, path: &str) -> Result<()> {
+        let hook = self.state().before_unmount.take();
+        if let Some(Hook(f)) = hook {
+            f();
+        }
         let mut s = self.state();
         // Forced: what held it lets go.
         if s.held.remove(path) {

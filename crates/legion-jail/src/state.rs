@@ -166,6 +166,15 @@ pub fn remove(dir: &Path, name: &str) -> std::io::Result<()> {
     }
 }
 
+/// Records how a container ended, unless it has been removed meanwhile, by
+/// another process: there is then no one to tell.
+pub fn write_exit(dir: &Path, exit: &Exit) -> std::io::Result<()> {
+    match write(dir, EXIT, exit) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        written => written,
+    }
+}
+
 /// When the host booted, in Unix seconds (0 where unknown).
 #[cfg(target_os = "freebsd")]
 pub fn boot_time() -> u64 {
@@ -236,6 +245,19 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn the_end_of_a_container_removed_meanwhile_is_dropped() {
+        let t = tempfile::tempdir().unwrap();
+        let e = Exit {
+            code: 1,
+            finished: 2,
+            error: None,
+        };
+        write_exit(t.path(), &e).unwrap();
+        assert_eq!(read::<Exit>(t.path(), EXIT).unwrap(), Some(e.clone()));
+        write_exit(&t.path().join("gone"), &e).unwrap();
+    }
+
     #[test]
     fn records_and_their_directory_are_their_owners_alone() {
         use std::os::unix::fs::PermissionsExt;

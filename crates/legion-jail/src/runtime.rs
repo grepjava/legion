@@ -217,6 +217,14 @@ const START_ENDS: Duration = if cfg!(test) {
     Duration::from_secs(60)
 };
 
+/// How long a remove waits for another's to be over: it may wait for a
+/// supervisor and destroy a dataset.
+const REMOVE_ENDS: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(120)
+};
+
 /// Says a start is under way until dropped. Taken before the last run's
 /// files go, and dropped once `run.json` is there, or after what undoes a
 /// failed start, so that a stop waiting on it finds which of the two it was.
@@ -1089,8 +1097,15 @@ impl JailRuntime {
         // Deepest first; the root itself is the dataset's.
         mounted.sort_by_key(|m| std::cmp::Reverse(m.len()));
         for m in mounted {
-            if Path::new(&m) != rec.root {
-                self.sys.unmount(&m).map_err(internal)?;
+            if Path::new(&m) != rec.root
+                && let Err(e) = self.sys.unmount(&m)
+            {
+                // Unless an attached run ending, in another process, got
+                // there first.
+                let left = self.sys.mounts(&m).map_err(internal)?;
+                if left.contains(&m) {
+                    return Err(internal(e));
+                }
             }
         }
         Ok(())
@@ -1199,6 +1214,31 @@ impl JailRuntime {
             }
         };
         Err(api(500, format!("starting {}: {why}", rec.name)))
+    }
+
+    /// Has `rec` removed by one remover at a time, of any process: two would
+    /// trip over each other, a destroy finding its dataset busy or gone. The
+    /// lock on its directory goes with the file, or with a process that dies
+    /// holding it. `None` if another has removed it.
+    async fn remover(&self, rec: &Record) -> Result<Option<std::fs::File>> {
+        let dir = self.container_dir(&rec.id);
+        let deadline = tokio::time::Instant::now() + REMOVE_ENDS;
+        loop {
+            let held = match std::fs::File::open(&dir) {
+                Ok(held) => held,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(internal(e)),
+            };
+            match held.try_lock() {
+                Ok(()) => return Ok(Some(held)),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(e)) => return Err(internal(e)),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(api(409, format!("container {} is being removed", rec.id)));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// What every run starts with: it is marked as starting, and what is left
@@ -1459,9 +1499,8 @@ impl legion_runtime::Runtime for JailRuntime {
             .map_err(internal)?
             .is_none()
         {
-            state::write(
+            state::write_exit(
                 &self.container_dir(id),
-                EXIT,
                 &Exit {
                     code: 137,
                     finished: state::now(),
@@ -1480,6 +1519,9 @@ impl legion_runtime::Runtime for JailRuntime {
         while self.creating.lock().unwrap().contains(&rec.name) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        let Some(_remover) = self.remover(&rec).await? else {
+            return Ok(());
+        };
         self.stop(id, Duration::ZERO).await?;
         if rec.is_pod() {
             // Members first; then the pod's jail if it outlived them.
@@ -2251,6 +2293,71 @@ wait
         mark(std::process::id(), rt.boot);
         let err = rt.stop("c1", Duration::ZERO).await.unwrap_err();
         assert!(err.to_string().contains("still starting"), "{err}");
+    }
+
+    /// A remove waits its turn, and then finds nothing left to do.
+    #[tokio::test]
+    async fn a_remove_waits_for_another_and_is_done_with_it() {
+        use legion_runtime::Runtime as _;
+        let t = tempfile::tempdir().unwrap();
+        let sys = Arc::new(legion_sys::FakeSys::new());
+        let (rt, _) = with_shim(t.path(), sys, "exit 1\n");
+        let dir = rt.container_dir("c1");
+        let other = std::fs::File::open(&dir).unwrap();
+        other.lock().unwrap();
+        let (removed, ()) = tokio::join!(rt.remove("c1"), async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(dir.join(RECORD).exists(), "removed alongside the other");
+            std::fs::remove_dir_all(&dir).unwrap();
+            drop(other);
+        });
+        removed.unwrap();
+    }
+
+    /// One that stays is reported, and a remover gone is no reason to wait.
+    #[tokio::test]
+    async fn a_remove_that_never_ends_is_not_waited_for_ever() {
+        use legion_runtime::Runtime as _;
+        let t = tempfile::tempdir().unwrap();
+        let sys = Arc::new(legion_sys::FakeSys::new());
+        let (rt, _) = with_shim(t.path(), sys, "exit 1\n");
+        let dir = rt.container_dir("c1");
+        let other = std::fs::File::open(&dir).unwrap();
+        other.lock().unwrap();
+        let err = rt.remove("c1").await.unwrap_err();
+        assert!(err.to_string().contains("being removed"), "{err}");
+        assert!(dir.join(RECORD).exists());
+        drop(other);
+        rt.remove("c1").await.unwrap();
+        assert!(!dir.exists());
+    }
+
+    /// A mount another process took down first is no failure; one that stays
+    /// is.
+    #[tokio::test]
+    async fn a_mount_gone_meanwhile_is_not_a_failed_unmount() {
+        let t = tempfile::tempdir().unwrap();
+        let sys = Arc::new(legion_sys::FakeSys::new());
+        let (rt, rec) = with_shim(t.path(), sys.clone(), "exit 1\n");
+        let inside = rec.root.join("dev").to_string_lossy().into_owned();
+        sys.mount_devfs(&inside, 4).unwrap();
+        let other = sys.clone();
+        let path = inside.clone();
+        sys.before_unmount(move || other.unmount(&path).unwrap());
+        rt.unmount(&rec).unwrap();
+        assert_eq!(sys.mounts(&inside).unwrap(), Vec::<String>::new());
+    }
+
+    /// Removed by another process as it ends: an attached run's end is not
+    /// an error, with no one left to record it for.
+    #[tokio::test]
+    async fn an_attached_run_removed_as_it_ends_still_ends() {
+        let t = tempfile::tempdir().unwrap();
+        let sys = Arc::new(legion_sys::FakeSys::new());
+        let script =
+            "while [ -e \"$2/starting.json\" ]; do sleep 0.02; done\nrm -rf \"$2\"\nexit 3\n";
+        let (rt, _) = with_shim(t.path(), sys, script);
+        assert_eq!(rt.run_attached("c1", false, false).await.unwrap(), 3);
     }
 
     /// An attached run's supervisor is its command, so `run.json` is written

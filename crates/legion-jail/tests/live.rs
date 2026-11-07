@@ -762,6 +762,34 @@ async fn standalone_containers_and_build_steps() {
 
     // On this process's output: its exit code, recorded too, and its jail
     // gone after.
+    // A remove from another process, as a run that removes itself ends: each
+    // gets it done or finds it done. Two runtimes share nothing but the files.
+    let run_by = Arc::new(runtime(&sys, &images, dir.as_path(), &base));
+    let other = runtime(&sys, &images, dir.as_path(), &base);
+    for i in 0..8 {
+        let spec = standalone(&format!("race{i}"), "exec sleep 100");
+        let id = run_by.create(&spec).await.unwrap();
+        let run = tokio::spawn({
+            let (rt, id) = (run_by.clone(), id.clone());
+            async move {
+                rt.run_attached(&id, false, false).await.unwrap();
+                rt.remove(&id).await
+            }
+        });
+        until("the racing run", async || {
+            other.inspect(&id).await.is_ok_and(|c| c.state.running)
+        })
+        .await;
+        let removed = other.remove(&id).await;
+        let own = run.await.unwrap();
+        for result in [removed, own] {
+            if let Err(e) = result {
+                assert!(e.to_string().contains("no such container"), "try {i}: {e}");
+            }
+        }
+        assert!(other.inspect(&id).await.is_err(), "try {i}");
+    }
+
     let once = rt.create(&standalone("once", "exit 7")).await.unwrap();
     assert_eq!(rt.run_attached(&once, false, false).await.unwrap(), 7);
     let i = rt.inspect(&once).await.unwrap();

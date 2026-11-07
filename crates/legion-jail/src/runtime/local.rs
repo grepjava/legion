@@ -13,7 +13,7 @@ use super::{
 };
 use crate::DEVFS_RULESET;
 use crate::shim::Terminal;
-use crate::state::{self, EXIT, Exit, RECORD, RUN, Record, Run};
+use crate::state::{self, Exit, RECORD, RUN, Record, Run};
 use legion_runtime::Result;
 
 /// Kills a process and its descendants when dropped, unless disarmed: for
@@ -405,7 +405,7 @@ impl UndoAttached<'_> {
             finished: state::now(),
             error,
         };
-        state::write(&self.rt.container_dir(&self.rec.id), EXIT, &exit).map_err(internal)
+        state::write_exit(&self.rt.container_dir(&self.rec.id), &exit).map_err(internal)
     }
 }
 

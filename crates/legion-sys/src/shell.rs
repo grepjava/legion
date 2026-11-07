@@ -474,7 +474,16 @@ impl<R: Runner> Sys for Shell<R> {
             }
             return Err(failed("jls", &a, &out));
         }
-        self.run("jail", &args(["-r", out.stdout.trim()])).map(drop)
+        // It may have gone since `jls` found it.
+        let a = args(["-r", out.stdout.trim()]);
+        let out = self.output("jail", &a, None)?;
+        if !out.success {
+            if gone(&out.stderr) {
+                return Err(Error::NotFound(format!("jail {jail}")));
+            }
+            return Err(failed("jail", &a, &out));
+        }
+        Ok(())
     }
 
     fn jail_get(&self, jail: &str, params: &[&str]) -> Result<BTreeMap<String, String>> {
@@ -2242,6 +2251,18 @@ mod tests {
             ("jls -j gone jid", err("jls: jail \"gone\" not found")),
             // Captured on FreeBSD 15.1, just after the jail's removal.
             ("jls -j dying jid", err("jls: jail \"dying\" is dying")),
+            (
+                "jls -j ending jid",
+                ok("9
+"),
+            ),
+            ("jail -r 9", err("jail: \"9\" not found")),
+            (
+                "jls -j stuck jid",
+                ok("10
+"),
+            ),
+            ("jail -r 10", err("jail: 10: Operation not permitted")),
             ("mount -t nullfs -o ro /src /dst", ok("")),
             ("mount -t devfs devfs /r/dev", ok("")),
             ("devfs -m /r/dev ruleset 4", ok("")),
@@ -2259,6 +2280,9 @@ mod tests {
         sh.jail_remove("p.c").unwrap();
         assert!(matches!(sh.jail_remove("gone"), Err(Error::NotFound(_))));
         assert!(matches!(sh.jail_remove("dying"), Err(Error::NotFound(_))));
+        // Gone between finding it and removing it.
+        assert!(matches!(sh.jail_remove("ending"), Err(Error::NotFound(_))));
+        assert!(matches!(sh.jail_remove("stuck"), Err(Error::Failed { .. })));
         sh.mount_nullfs("/src", "/dst", true).unwrap();
         sh.mount_devfs("/r/dev", 4).unwrap();
     }
