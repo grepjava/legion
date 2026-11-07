@@ -50,8 +50,8 @@ export LEGION_BHYVE_DISK=/dev/zvol/lpool/guest
 export LEGION_BHYVE_LAB=/var/tmp/lbhyve
 export LEGION_CLUSTER_LAB=/var/tmp/lcluster
 export LEGION_PG_IMAGE=/var/tmp/legion-pg.oci.tar
-export LEGION_CLUSTER_HOST=10.77.0.1
-export LEGION_CLUSTER_VMS='lab2=lab@10.77.0.2 lab3=lab@10.77.0.3'
+export LEGION_CLUSTER_HOST=10.78.0.1
+export LEGION_CLUSTER_VMS='lab2=lab@10.78.0.2 lab3=lab@10.78.0.3'
 export LEGION_CLUSTER_KEY=/home/lab/.ssh/id_ed25519
 export LEGION_CLUSTER_LOSE=reboot
 EOF

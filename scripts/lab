@@ -25,7 +25,7 @@
 # fail. It is here and not QUALIFY_LOCK because that lock is inside a VM.
 #
 # Network: each VM has outbound NAT on vtnet0, SSH on 127.0.0.1:230N, and
-# 10.77.0.N on a private network between the VMs on vtnet1, carried by a small
+# 10.78.0.N on a private network between the VMs on vtnet1, carried by a small
 # hub on 127.0.0.1:2310. Nothing is reachable
 # from outside this machine. The base holds the lab's private key for VM to VM
 # SSH, so it is never published and never leaves this machine.
@@ -206,8 +206,8 @@ check_booted() {
     local v=$1 n=$2 d=$root/vms/$1 pid got
     pid=$(vm_pid "$v") || die "$v did not start"
     wait_ssh "$(port "$v")" "$pid" "$d/console.log" 180
-    got=$(ssh_vm "$v" 'echo "$(hostname -s) $(cat /etc/lab-base) $(zpool list -H -o health lpool) $(sysctl -n kern.racct.enable) $(sysctl -n net.inet.ip.forwarding) $(sudo -n pfctl -si 2> /dev/null | sed -n "s/^Status: \([A-Za-z]*\).*/\1/p") $(ifconfig vtnet1 | sed -n "s/.*inet \(10\.77\.0\.[0-9]*\).*/\1/p")"')
-    if [ "$got" != "$v $n ONLINE 1 1 Enabled 10.77.0.$(number "$v")" ]; then
+    got=$(ssh_vm "$v" 'echo "$(hostname -s) $(cat /etc/lab-base) $(zpool list -H -o health lpool) $(sysctl -n kern.racct.enable) $(sysctl -n net.inet.ip.forwarding) $(sudo -n pfctl -si 2> /dev/null | sed -n "s/^Status: \([A-Za-z]*\).*/\1/p") $(ifconfig vtnet1 | sed -n "s/.*inet \(10\.78\.0\.[0-9]*\).*/\1/p")"')
+    if [ "$got" != "$v $n ONLINE 1 1 Enabled 10.78.0.$(number "$v")" ]; then
         kill_vm "$v"
         die "$v failed its checks: got \"$got\""
     fi
@@ -251,7 +251,7 @@ cat >> /etc/rc.conf << 'CONF'
 lab_vm=$(/bin/kenv -q smbios.system.serial)
 hostname="$lab_vm"
 ifconfig_vtnet0="SYNCDHCP"
-ifconfig_vtnet1="inet 10.77.0.${lab_vm#lab}/24"
+ifconfig_vtnet1="inet 10.78.0.${lab_vm#lab}/24"
 gateway_enable="YES"
 pf_enable="YES"
 zfs_enable="YES"
@@ -271,9 +271,9 @@ anchor "jailer/*"
 CONF
 pfctl -nf /etc/pf.conf
 cat >> /etc/hosts << 'CONF'
-10.77.0.1 lab1
-10.77.0.2 lab2
-10.77.0.3 lab3
+10.78.0.1 lab1
+10.78.0.2 lab2
+10.78.0.3 lab3
 CONF
 EOF
 }
@@ -292,7 +292,7 @@ rustc --version
 cargo clippy --version
 cargo fmt --version
 cat > "$HOME/.ssh/config" << 'CONF'
-Host lab1 lab2 lab3 10.77.0.*
+Host lab1 lab2 lab3 10.78.0.*
     IdentityFile ~/.ssh/id_ed25519
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
