@@ -6,8 +6,8 @@ release rather than assume it. Replace `X.Y.Z` throughout.
 
 | Step | | Automated by |
 |---|---|---|
-| 1. Qualify | required | `scripts/qualify`, started by hand |
-| 2. Bump the version | required | manual |
+| 1. Bump the version | required | manual |
+| 2. Qualify | required | `scripts/qualify` or `scripts/lab`, started by hand |
 | 3. Tag | required | manual |
 | 4. Update the port's `distinfo` | required | manual |
 | 5. `poudriere testport` | required | manual |
@@ -20,7 +20,20 @@ CI runs the unit tests on Linux, and on FreeBSD 15.1 amd64 and emulated arm64,
 for every push. It runs none of the privileged tests, so a green CI is not a
 qualification.
 
-## 1. Qualify
+## 1. Bump the version
+
+This comes before the run that qualifies the release, as the record has to name
+the tagged commit: bump, push, run, and tag if the record is clean.
+
+Set `X.Y.Z` in:
+
+- `Cargo.toml` (`[workspace.package]`), then `cargo check` to update `Cargo.lock`;
+- `packaging/freebsd/port/Makefile` (`DISTVERSION`);
+- `PHASE.md`: a line on the release in its paragraph of tagged versions.
+
+Commit as `Version X.Y.Z, the port with it`, and push.
+
+## 2. Qualify
 
 On a FreeBSD host of the release's architecture, from a tree of the exact
 commit to be released:
@@ -31,14 +44,21 @@ scripts/qualify --manifest scripts/legion.qualify --profile shared \
     --pool POOL --out ~/qualify/X.Y.Z
 ```
 
-Run `--profile isolated` on a disposable host and `--profile cluster` on the
-lab of `crates/legion/tests/common`. `scripts/lab` gives disposable FreeBSD VMs
-for this, shared with jailer: `scripts/lab run --manifest scripts/legion.qualify
---profile isolated --setup scripts/legion.labsetup --copy
-IMAGE:/var/tmp/legion-pg.oci.tar` resets a VM, sets up the servers the tests
-need, runs the commit at HEAD and brings the record back. IMAGE is
-`crates/legion/tests/stateful/Containerfile` built and exported by jailer. A record's `vm` field says the host was a VM, and `image` which base. The `shared` profile is safe on a host
-that does other work; the other two publish ports or need several hosts.
+That `shared` profile is safe on a host that does other work; `isolated` and
+`cluster` publish ports or need several hosts, and each profile includes those
+before it. `scripts/lab` gives disposable FreeBSD VMs for them, shared with
+jailer, and one run covers everything:
+
+```sh
+scripts/lab run --manifest scripts/legion.qualify --profile cluster \
+    --vm lab1 --also lab2 --also lab3 --setup scripts/legion.labsetup \
+    --copy IMAGE:/var/tmp/legion-pg.oci.tar
+```
+
+It resets the VMs, sets up the servers the tests need, runs the commit at HEAD
+and brings the record back. IMAGE is `crates/legion/tests/stateful/Containerfile`
+built and exported by jailer. A record's `vm` field says the host was a VM, and
+`image` which base.
 
 Keep each run's `result.json`. A release is ready when every test in the
 manifest has a recorded result on each supported platform: passed, or not run
@@ -50,16 +70,6 @@ for a reason stated in the notes. Stop for any of these:
 
 A change after the run needs a new run. So does a run on a tree whose
 `.qualify-revision` is not the tagged commit.
-
-## 2. Bump the version
-
-Set `X.Y.Z` in:
-
-- `Cargo.toml` (`[workspace.package]`), then `cargo check` to update `Cargo.lock`;
-- `packaging/freebsd/port/Makefile` (`DISTVERSION`);
-- `PHASE.md`: a line on the release in its paragraph of tagged versions.
-
-Commit as `Version X.Y.Z, the port with it`, and push.
 
 ## 3. Tag
 
