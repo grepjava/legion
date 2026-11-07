@@ -717,31 +717,45 @@ impl Objects for ApiService {
         {
             return Ok(Response::new(DeleteResponse { version }));
         }
-        let mut precondition = req
-            .expected_version
-            .map_or(Precondition::None, Precondition::Version);
-        // Deleted on the version checked: a node claiming it meanwhile
-        // changes the version, and the delete is refused as a conflict.
-        if key.kind == Kind::Volume
-            && let Some(checked) = check_volume_delete(&self.store, &key)?
-            && req.expected_version.is_none_or(|v| v == checked)
-        {
-            precondition = Precondition::Version(checked);
-        }
-        let deleted = if key.kind == Kind::Node {
-            // Run to the end even if the caller goes: stopped between its
-            // writes, it would leave a live node refused.
-            let api = self.clone();
-            let key = key.clone();
-            tokio::spawn(async move { api.remove_node(&key, req.expected_version).await })
-                .await
-                .map_err(internal)??
-        } else {
-            self.write(Command::Delete {
-                key: key.clone(),
-                precondition,
-            })
-            .await?
+        let mut attempts = APPLY_ATTEMPTS;
+        let deleted = loop {
+            let mut precondition = req
+                .expected_version
+                .map_or(Precondition::None, Precondition::Version);
+            // Deleted on the version checked: a node claiming it meanwhile
+            // changes the version. The check is then made again, which
+            // refuses it, as a caller who named no version asked for nothing
+            // that changing the Volume made untrue.
+            if key.kind == Kind::Volume
+                && let Some(checked) = check_volume_delete(&self.store, &key)?
+                && req.expected_version.is_none_or(|v| v == checked)
+            {
+                precondition = Precondition::Version(checked);
+            }
+            #[cfg(feature = "test-hooks")]
+            crate::hooks::pause("volume-delete", &key.name).await;
+            let deleted = if key.kind == Kind::Node {
+                // Run to the end even if the caller goes: stopped between its
+                // writes, it would leave a live node refused.
+                let api = self.clone();
+                let key = key.clone();
+                tokio::spawn(async move { api.remove_node(&key, req.expected_version).await })
+                    .await
+                    .map_err(internal)??
+            } else {
+                self.write(Command::Delete {
+                    key: key.clone(),
+                    precondition,
+                })
+                .await?
+            };
+            attempts -= 1;
+            let again = matches!(deleted, Outcome::Conflict { .. })
+                && key.kind == Kind::Volume
+                && req.expected_version.is_none();
+            if !again || attempts == 0 {
+                break deleted;
+            }
         };
         match deleted {
             Outcome::Deleted { version } => Ok(Response::new(DeleteResponse { version })),

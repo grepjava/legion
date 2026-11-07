@@ -3081,6 +3081,79 @@ async fn a_volume_in_use_keeps_its_storage() {
     m.stop().await;
 }
 
+/// A Volume that changes while it is deleted is checked again: a change that
+/// doesn't matter is no reason to fail, and a node's claim still refuses it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_volume_changed_during_its_delete_is_checked_again() {
+    use legion_api::{Kind, Object as Stored, ObjectKey};
+    let m = Running::start().await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let lun = |target: &str| {
+        serde_json::json!({
+            "driver": "iscsi",
+            "iscsi": { "portal": "192.0.2.5", "target": target, "lun": 0 },
+        })
+    };
+    let put = |object: Stored| {
+        let raft = m.store.raft.clone();
+        async move {
+            raft.client_write(legion_store::Command::Put {
+                object,
+                precondition: legion_store::Precondition::None,
+            })
+            .await
+            .unwrap();
+        }
+    };
+    let status = |name: &str, status: serde_json::Value| {
+        let key = ObjectKey::new(Kind::Volume, "default", name);
+        let mut v = m.store.get(&key).unwrap().unwrap();
+        v.status = status;
+        v
+    };
+    let objects = m.objects().await;
+    let delete = |name: &str| {
+        let mut objects = objects.clone();
+        let name = name.to_owned();
+        tokio::spawn(async move {
+            objects
+                .delete(DeleteRequest {
+                    r#ref: Some(ObjectRef {
+                        kind: "Volume".into(),
+                        namespace: "default".into(),
+                        name,
+                    }),
+                    expected_version: None,
+                })
+                .await
+        })
+    };
+    put(Stored::new(Kind::Node, "", "w1", serde_json::json!({}))).await;
+
+    // A change that holds nothing: the delete goes through.
+    apply_json(&m, "Volume", "free", lun("iqn.2026-11.test:a")).await;
+    let mut paused = legion_manager::hooks::arm("volume-delete", "free");
+    let deleting = delete("free");
+    paused.reached().await;
+    put(status("free", serde_json::json!({}))).await;
+    paused.release();
+    deleting.await.unwrap().unwrap();
+
+    // A node's claim: refused for that, and the Volume stays.
+    apply_json(&m, "Volume", "claimed", lun("iqn.2026-11.test:b")).await;
+    let mut paused = legion_manager::hooks::arm("volume-delete", "claimed");
+    let deleting = delete("claimed");
+    paused.reached().await;
+    put(status("claimed", serde_json::json!({ "node": "w1" }))).await;
+    paused.release();
+    let err = deleting.await.unwrap().unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+    assert!(err.message().contains("held by node w1"), "{err}");
+    let key = ObjectKey::new(Kind::Volume, "default", "claimed");
+    assert!(m.store.get(&key).unwrap().is_some());
+    m.stop().await;
+}
+
 /// A Volume in use is not deleted: it would come back unheld, for another
 /// node to attach while the first still writes to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
