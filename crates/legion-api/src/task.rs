@@ -31,6 +31,11 @@ pub struct TaskSpec {
     pub node: String,
     #[serde(default)]
     pub desired_state: DesiredState,
+    /// Each image of the pod as written, and the digest it runs as
+    /// ([`crate::image::pinned`]). Empty where nothing was pinned, as for a
+    /// task made before, or while a node can't read this.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub images: std::collections::BTreeMap<String, String>,
     pub pod: PodSpec,
     /// What happens to a stateful task's claimed Volumes before it runs,
     /// for an update that snapshots them.
@@ -195,4 +200,40 @@ pub struct TaskStatus {
     /// was then: the scheduler keeps the owner's tasks off nodes of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wrong_platform: Option<crate::node::Platform>,
+    /// Each image as the task names it, and the manifest the node ran: for
+    /// an index, the one for its platform.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub images: std::collections::BTreeMap<String, String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A task with nothing pinned is written as before, so a node that
+    /// can't read the new fields still takes it; one from before reads.
+    #[test]
+    fn a_task_with_nothing_pinned_is_written_as_before() {
+        let old = serde_json::json!({
+            "service": "web",
+            "serviceUid": "u1",
+            "serviceGeneration": 1,
+            "pod": { "containers": [{ "name": "a", "image": "nginx:1" }] },
+        });
+        let mut spec: TaskSpec = serde_json::from_value(old.clone()).unwrap();
+        assert!(spec.images.is_empty());
+        let written = serde_json::to_value(&spec).unwrap();
+        assert!(written.get("images").is_none(), "{written}");
+        assert!(!written.to_string().contains("pullPolicy"), "{written}");
+        let status = serde_json::to_value(TaskStatus::default()).unwrap();
+        assert!(status.get("images").is_none(), "{status}");
+
+        spec.images
+            .insert("nginx:1".into(), "docker.io/library/nginx@sha256:aa".into());
+        let written = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            written["images"]["nginx:1"],
+            "docker.io/library/nginx@sha256:aa"
+        );
+    }
 }

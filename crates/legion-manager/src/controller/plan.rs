@@ -1041,6 +1041,8 @@ fn service(
         spec: Some(s.spec.clone()),
         update,
         autoscale,
+        // Written by the resolver, not by this pass.
+        images: previous.images.clone(),
     };
     let status = serde_json::to_value(&status).expect("status serialises");
     if s.object.status != status {
@@ -1145,6 +1147,11 @@ fn track_update(
             message: String::new(),
             generation: s.object.metadata.generation,
             previous: old.clone(),
+            previous_images: previous
+                .images
+                .as_ref()
+                .map(|i| i.resolved.clone())
+                .unwrap_or_default(),
             snapshot,
         });
     }
@@ -1284,6 +1291,7 @@ fn new_task(s: &Service, slot: &Slot, history: &[&Task], last: &BTreeMap<String,
         node,
         desired_state: DesiredState::Running,
         pod: s.spec.pod.clone(),
+        images: BTreeMap::new(),
         snapshot: None,
     };
     let mut object = Object::new(

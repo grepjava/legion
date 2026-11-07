@@ -476,6 +476,8 @@ pub struct Container {
     /// How its jail is loosened from Legion's defaults.
     #[serde(default, skip_serializing_if = "Security::is_default")]
     pub security: Security,
+    #[serde(default, skip_serializing_if = "crate::image::PullPolicy::is_default")]
+    pub pull_policy: crate::image::PullPolicy,
 }
 
 impl Container {
@@ -1473,6 +1475,9 @@ pub struct ServiceStatus {
     /// What the autoscaler decided, for a service with `autoscale`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autoscale: Option<AutoscaleStatus>,
+    /// The pod's images for the generation being run, as resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<crate::image::ImageStatus>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1504,6 +1509,9 @@ pub struct UpdateStatus {
     pub generation: u64,
     /// The spec updated from, which a rollback restores.
     pub previous: ServiceSpec,
+    /// Its images as they were resolved, which a rollback runs again.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub previous_images: BTreeMap<String, String>,
     /// The snapshot of the claimed Volumes the update's tasks take before
     /// they run (`update.snapshot`), and a rollback of it returns to.
     #[serde(default, skip_serializing_if = "Option::is_none")]

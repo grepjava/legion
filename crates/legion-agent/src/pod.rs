@@ -282,6 +282,7 @@ mod tests {
             secrets: vec![],
             configs: vec![],
             security: Default::default(),
+            pull_policy: Default::default(),
         };
         let rules: Vec<String> = rctl_rules(&c, "i.c")
             .iter()

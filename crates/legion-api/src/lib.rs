@@ -17,6 +17,7 @@ pub mod compose;
 pub mod cron;
 pub mod data;
 pub mod dispatch;
+pub mod image;
 pub mod job;
 pub mod login;
 pub mod metrics;

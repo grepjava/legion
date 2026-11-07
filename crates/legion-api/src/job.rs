@@ -146,6 +146,9 @@ pub struct JobStatus {
     /// node), so a deleted task's name is never given to another.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub last_tasks: std::collections::BTreeMap<String, u64>,
+    /// The pod's images, as resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<crate::image::ImageStatus>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
