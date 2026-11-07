@@ -33,7 +33,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::log;
 use crate::shim::Terminal;
-use crate::state::{self, EXIT, Exit, LOG, RECORD, RUN, Record, Run, SHIM_LOG};
+use crate::state::{self, EXIT, Exit, LOG, RECORD, RUN, Record, Run, SHIM_LOG, STARTING};
 
 use crate::{
     ANNOTATION_CPUSET, ANNOTATION_JAIL, ANNOTATION_MLOCK, ANNOTATION_PARENT, ANNOTATION_SYSV,
@@ -208,6 +208,37 @@ const SUPERVISOR_ANSWERS: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(30)
 };
+
+/// How long a stop waits for a start to be over: more than the supervisor
+/// has, as making the jail comes first.
+const START_ENDS: Duration = if cfg!(test) {
+    Duration::from_secs(3)
+} else {
+    Duration::from_secs(60)
+};
+
+/// Says a start is under way until dropped. Taken before the last run's
+/// files go, and dropped once `run.json` is there, or after what undoes a
+/// failed start, so that a stop waiting on it finds which of the two it was.
+struct Starting(PathBuf);
+
+impl Starting {
+    fn mark(rt: &JailRuntime, rec: &Record) -> Result<Self> {
+        let dir = rt.container_dir(&rec.id);
+        let mark = state::Starting {
+            pid: std::process::id(),
+            boot: rt.boot,
+        };
+        state::write(&dir, STARTING, &mark).map_err(internal)?;
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        let _ = state::remove(&self.0, STARTING);
+    }
+}
 
 /// Undoes a start that fails or is dropped: the supervisor that has not
 /// answered is killed first, with what it started, so it cannot take its
@@ -1170,6 +1201,42 @@ impl JailRuntime {
         Err(api(500, format!("starting {}: {why}", rec.name)))
     }
 
+    /// What every run starts with: it is marked as starting, and what is left
+    /// of the last one goes.
+    fn begin_run(&self, rec: &Record) -> Result<Starting> {
+        let starting = Starting::mark(self, rec)?;
+        let dir = self.container_dir(&rec.id);
+        // The run before the end: one looking between the two sees the
+        // container ended, not ended at once with the made-up 255.
+        state::remove(&dir, RUN).map_err(internal)?;
+        state::remove(&dir, EXIT).map_err(internal)?;
+        // A jail left from a run whose supervisor died.
+        if jail_names(&*self.sys)?.contains(&rec.jail) {
+            let _ = self.sys.jail_remove(&rec.jail);
+        }
+        Ok(starting)
+    }
+
+    /// Returns once no start of `rec` is under way, or it has its run. A
+    /// start that takes too long is an error: the stop would do nothing, and
+    /// the command start anyway.
+    async fn start_over(&self, rec: &Record) -> Result<()> {
+        let dir = self.container_dir(&rec.id);
+        let deadline = tokio::time::Instant::now() + START_ENDS;
+        loop {
+            let mark = state::read::<state::Starting>(&dir, STARTING).map_err(internal)?;
+            if mark.is_none_or(|m| m.boot != self.boot || !alive(m.pid))
+                || matches!(self.status(rec)?, Status::Running(_))
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(api(409, format!("container {} is still starting", rec.id)));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     async fn wait_over(&self, rec: &Record, within: Duration) -> Result<bool> {
         let deadline = tokio::time::Instant::now() + within;
         loop {
@@ -1320,14 +1387,8 @@ impl legion_runtime::Runtime for JailRuntime {
             }
         }
         let dir = self.container_dir(id);
-        // The run before the end: one looking between the two sees the
-        // container ended, not ended at once with the made-up 255.
-        state::remove(&dir, RUN).map_err(internal)?;
-        state::remove(&dir, EXIT).map_err(internal)?;
-        // A jail left from a run whose supervisor died.
-        if jail_names(&*self.sys)?.contains(&rec.jail) {
-            let _ = self.sys.jail_remove(&rec.jail);
-        }
+        // Before `undo`, so dropped after it.
+        let _starting = self.begin_run(&rec)?;
         // A start that fails, or is dropped, leaves nothing mounted, so the
         // next one mounts afresh (a Linux member's `/dev/shm` is made with
         // its devfs).
@@ -1361,6 +1422,7 @@ impl legion_runtime::Runtime for JailRuntime {
 
     async fn stop(&self, id: &str, timeout: Duration) -> Result<()> {
         let rec = self.record(id)?;
+        self.start_over(&rec).await?;
         let Status::Running(run) = self.status(&rec)? else {
             return Ok(());
         };
@@ -2052,6 +2114,163 @@ mod tests {
         // unmounts all as well.
         assert!(rt.start("c1").await.is_err());
         assert_eq!(mounted(), Vec::<String>::new());
+    }
+
+    /// A runtime whose supervisor is `script`, and a stopped container c1.
+    fn with_shim(t: &Path, sys: Arc<legion_sys::FakeSys>, script: &str) -> (JailRuntime, Record) {
+        let images = Store::open_directory(
+            sys.clone(),
+            &t.join("images"),
+            legion_image::Client::new().unwrap(),
+        )
+        .unwrap();
+        let shim = t.join("shim");
+        std::fs::write(&shim, script).unwrap();
+        let rt = JailRuntime::new(
+            sys,
+            Arc::new(images),
+            Config {
+                state_dir: t.join("state"),
+                dataset: None,
+                shim: vec!["/bin/sh".into(), shim.into()],
+                prune_images: false,
+            },
+        )
+        .unwrap();
+        let root = t.join("state/c1/root");
+        std::fs::create_dir_all(&root).unwrap();
+        let rec = Record {
+            id: "c1".into(),
+            name: "c1".into(),
+            image: String::new(),
+            created: 0,
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            parent: None,
+            standalone: true,
+            jail: "c1".into(),
+            root,
+            dataset: None,
+            argv: vec!["/bin/true".into()],
+            env: Vec::new(),
+            user: String::new(),
+            work_dir: "/".into(),
+            hostname: "c1".into(),
+            mounts: Vec::new(),
+            params: Vec::new(),
+            stop_signal: 15,
+            stop_timeout: 10,
+            linux: false,
+            cpuset: None,
+        };
+        state::write(&t.join("state/c1"), RECORD, &rec).unwrap();
+        (rt, rec)
+    }
+
+    /// A stop from another process finds no run while a start is under way.
+    /// Reporting that as stopped would leave the command running.
+    #[tokio::test]
+    async fn a_stop_during_a_start_stops_what_it_starts() {
+        use legion_runtime::Runtime as _;
+        let t = tempfile::tempdir().unwrap();
+        let sys = Arc::new(legion_sys::FakeSys::new());
+        let boot = state::boot_time();
+        let script = format!(
+            r#"dir=$2
+trap 'printf "{{\"code\":143,\"finished\":1}}" > "$dir/exit.json"; exit 0' TERM
+: > "$dir/supervising"
+sleep 0.5
+printf '{{"shim":%d,"pid":%d,"jid":%s,"started":1,"boot":{boot}}}' $$ $$ "$3" > "$dir/run.json"
+echo "ok $$"
+sleep 5 &
+wait
+"#
+        );
+        let (rt, rec) = with_shim(t.path(), sys, &script);
+        let dir = rt.container_dir("c1");
+        let stop = async {
+            while !dir.join("supervising").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(!dir.join(RUN).exists(), "too late to show anything");
+            rt.stop("c1", Duration::from_secs(5)).await
+        };
+        let (started, stopped) = tokio::join!(rt.start("c1"), stop);
+        started.unwrap();
+        stopped.unwrap();
+        let status = rt.status(&rec).unwrap();
+        assert!(matches!(status, Status::Exited(_)), "{status:?}");
+        assert!(!dir.join(STARTING).exists());
+    }
+
+    /// A failed start has nothing to stop, and a stop waiting on it says so.
+    #[tokio::test]
+    async fn a_stop_during_a_start_that_fails_has_nothing_to_do() {
+        use legion_runtime::Runtime as _;
+        let t = tempfile::tempdir().unwrap();
+        let sys = Arc::new(legion_sys::FakeSys::new());
+        let script = ": > \"$2/supervising\"\nsleep 0.3\necho 'err no such user'\n";
+        let (rt, rec) = with_shim(t.path(), sys.clone(), script);
+        let dir = rt.container_dir("c1");
+        let stop = async {
+            while !dir.join("supervising").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            rt.stop("c1", Duration::from_secs(5)).await
+        };
+        let (started, stopped) = tokio::join!(rt.start("c1"), stop);
+        assert!(started.is_err());
+        stopped.unwrap();
+        assert!(!dir.join(STARTING).exists());
+        assert!(!jail_names(&*sys).unwrap().contains(&rec.jail));
+    }
+
+    /// Only a start that may yet end is waited for, and not for ever.
+    #[tokio::test]
+    async fn a_stop_waits_only_for_a_live_start() {
+        use legion_runtime::Runtime as _;
+        let t = tempfile::tempdir().unwrap();
+        let sys = Arc::new(legion_sys::FakeSys::new());
+        let (rt, _) = with_shim(t.path(), sys, "exit 1\n");
+        let dir = rt.container_dir("c1");
+        let mark = |pid, boot| {
+            state::write(&dir, STARTING, &state::Starting { pid, boot }).unwrap();
+        };
+        // Left by a process gone, and by one from before a reboot.
+        let mut gone = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = gone.id();
+        gone.wait().unwrap();
+        mark(pid, rt.boot);
+        rt.stop("c1", Duration::ZERO).await.unwrap();
+        mark(std::process::id(), rt.boot + 1);
+        rt.stop("c1", Duration::ZERO).await.unwrap();
+        // One that never ends.
+        mark(std::process::id(), rt.boot);
+        let err = rt.stop("c1", Duration::ZERO).await.unwrap_err();
+        assert!(err.to_string().contains("still starting"), "{err}");
+    }
+
+    /// An attached run's supervisor is its command, so `run.json` is written
+    /// after it starts: marked until then, and not for the whole run.
+    #[tokio::test]
+    async fn an_attached_run_is_starting_until_it_has_its_run() {
+        let t = tempfile::tempdir().unwrap();
+        let sys = Arc::new(legion_sys::FakeSys::new());
+        let script = r#"dir=$2
+i=0
+while [ -e "$dir/starting.json" ]; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || exit 8
+    sleep 0.02
+done
+[ -e "$dir/run.json" ] || exit 9
+exit 0
+"#;
+        let (rt, _) = with_shim(t.path(), sys, script);
+        assert_eq!(rt.run_attached("c1", false, false).await.unwrap(), 0);
     }
 
     #[tokio::test]

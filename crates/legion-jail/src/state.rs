@@ -1,8 +1,8 @@
 //! What the runtime keeps of a container, one directory each under its
-//! state directory: `record.json` (made at create), `run.json` (written by
-//! the supervisor once the process runs), `exit.json` (written by the
-//! supervisor when it ends) and `log`. They outlive the agent, which finds
-//! its containers again from them.
+//! state directory: `record.json` (made at create), `starting.json` (there
+//! during a start), `run.json` (written by the supervisor once the process
+//! runs), `exit.json` (written by the supervisor when it ends) and `log`.
+//! They outlive the agent, which finds its containers again from them.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -91,7 +91,18 @@ pub struct Exit {
     pub error: Option<String>,
 }
 
+/// A start under way, for a stop from another process: it finds no run yet,
+/// and would otherwise report a command about to start as stopped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Starting {
+    /// Who is starting it: one gone left this behind.
+    pub pid: u32,
+    /// As in [`Run::boot`], as a pid means nothing across a reboot.
+    pub boot: u64,
+}
+
 pub const RECORD: &str = "record.json";
+pub const STARTING: &str = "starting.json";
 pub const RUN: &str = "run.json";
 pub const EXIT: &str = "exit.json";
 pub const LOG: &str = "log";

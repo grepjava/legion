@@ -8,8 +8,8 @@ use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use super::{
-    JailRuntime, KillGroup, Status, api, confine, cpu_list, exit_code, internal, jail_names,
-    new_id, records, target,
+    JailRuntime, KillGroup, Status, api, confine, cpu_list, exit_code, internal, new_id, records,
+    target,
 };
 use crate::DEVFS_RULESET;
 use crate::shim::Terminal;
@@ -157,12 +157,7 @@ impl JailRuntime {
             }
         }
         let dir = self.container_dir(id);
-        // The run before the end, as `start` clears them.
-        state::remove(&dir, RUN).map_err(internal)?;
-        state::remove(&dir, EXIT).map_err(internal)?;
-        if jail_names(&*self.sys)?.contains(&rec.jail) {
-            let _ = self.sys.jail_remove(&rec.jail);
-        }
+        let starting = self.begin_run(&rec)?;
         // What a failed start mounted goes, as `start` leaves it.
         let jid = match self.mount(&rec).and_then(|()| self.create_jail(&rec)) {
             Ok(j) => j,
@@ -192,6 +187,7 @@ impl JailRuntime {
                     boot: self.boot,
                 };
                 state::write(&dir, RUN, &run).map_err(internal)?;
+                drop(starting);
                 child.wait().await
             }
             Err(e) => Err(e),
