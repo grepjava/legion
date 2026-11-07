@@ -1603,8 +1603,10 @@ impl legion_runtime::Runtime for JailRuntime {
     }
 
     async fn wait(&self, id: &str) -> Result<i32> {
-        let rec = self.record(id)?;
         loop {
+            // Each time: one removed meanwhile, its files gone with it, would
+            // look created for ever.
+            let rec = self.record(id)?;
             match self.status(&rec)? {
                 Status::Exited(e) => return Ok(e.code),
                 _ => tokio::time::sleep(Duration::from_millis(100)).await,
@@ -2333,6 +2335,26 @@ wait
         assert!(err.to_string().contains("still starting"), "{err}");
         let err = rt.start_settled("c1").await.unwrap_err();
         assert!(err.to_string().contains("still starting"), "{err}");
+    }
+
+    /// A wait ends with what it waits for, not with a container that looks
+    /// created for ever once its files have gone.
+    #[tokio::test]
+    async fn a_wait_ends_when_the_container_is_removed() {
+        use legion_runtime::Runtime as _;
+        let t = tempfile::tempdir().unwrap();
+        let sys = Arc::new(legion_sys::FakeSys::new());
+        let (rt, _) = with_shim(t.path(), sys, "exit 1\n");
+        let (waited, removed) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), rt.wait("c1")),
+            async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                rt.remove("c1").await
+            }
+        );
+        removed.unwrap();
+        let err = waited.expect("still waiting").unwrap_err();
+        assert!(err.to_string().contains("no such container"), "{err}");
     }
 
     /// A remove waits its turn, and then finds nothing left to do.
