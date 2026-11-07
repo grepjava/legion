@@ -1,6 +1,7 @@
 //! What the runtime keeps of a container, one directory each under its
 //! state directory: `record.json` (made at create), `starting.json` (there
-//! during a start), `run.json` (written by the supervisor once the process
+//! during a start, and from a create that a run follows), `run.json`
+//! (written by the supervisor once the process
 //! runs), `exit.json` (written by the supervisor when it ends) and `log`.
 //! They outlive the agent, which finds its containers again from them.
 

@@ -790,6 +790,29 @@ async fn standalone_containers_and_build_steps() {
         assert!(other.inspect(&id).await.is_err(), "try {i}");
     }
 
+    // A stop from another process as soon as a run can be found, which is
+    // during its create: it ends the command, rather than miss it.
+    for i in 0..4 {
+        let name = format!("stopped{i}");
+        let spec = standalone(&name, "exec sleep 100");
+        let run = tokio::spawn({
+            let rt = run_by.clone();
+            async move {
+                let (id, held) = rt.create_for_run(&spec).await.unwrap();
+                let code = rt.run_attached(&id, false, false).await.unwrap();
+                drop(held);
+                (id, code)
+            }
+        });
+        until("the run's record", async || other.find(&name).is_ok()).await;
+        let id = other.find(&name).unwrap();
+        other.stop(&id, Duration::from_secs(10)).await.unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(30), run).await;
+        let (_, code) = ended.expect("it outlived its stop").unwrap();
+        assert_ne!(code, 0, "try {i}");
+        rt.remove(&id).await.unwrap();
+    }
+
     let once = rt.create(&standalone("once", "exit 7")).await.unwrap();
     assert_eq!(rt.run_attached(&once, false, false).await.unwrap(), 7);
     let i = rt.inspect(&once).await.unwrap();

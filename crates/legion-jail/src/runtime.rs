@@ -210,7 +210,9 @@ const SUPERVISOR_ANSWERS: Duration = if cfg!(test) {
 };
 
 /// How long a stop waits for a start to be over: more than the supervisor
-/// has, as making the jail comes first.
+/// has, as making the jail comes first. A create that a run follows counts
+/// too, and a copy of a large image may outlast this: the stop then fails, to
+/// be tried again.
 const START_ENDS: Duration = if cfg!(test) {
     Duration::from_secs(3)
 } else {
@@ -225,17 +227,24 @@ const REMOVE_ENDS: Duration = if cfg!(test) {
     Duration::from_secs(120)
 };
 
-/// Says a start is under way until dropped. Taken before the last run's
-/// files go, and dropped once `run.json` is there, or after what undoes a
-/// failed start, so that a stop waiting on it finds which of the two it was.
-struct Starting(PathBuf);
+/// Says a start is under way until dropped, for stops from any process.
+/// Taken before the last run's files go, and dropped once `run.json` is
+/// there, or after what undoes a failed start, so that a stop waiting on it
+/// finds which of the two it was.
+///
+/// [`JailRuntime::create_for_run`] returns one to hold across the start.
+#[must_use = "dropped, a stop no longer waits for the start"]
+pub struct Starting(PathBuf);
 
 impl Starting {
     fn mark(rt: &JailRuntime, rec: &Record) -> Result<Self> {
-        let dir = rt.container_dir(&rec.id);
+        Self::mark_in(rt.container_dir(&rec.id), rt.boot)
+    }
+
+    fn mark_in(dir: PathBuf, boot: u64) -> Result<Self> {
         let mark = state::Starting {
             pid: std::process::id(),
-            boot: rt.boot,
+            boot,
         };
         state::write(&dir, STARTING, &mark).map_err(internal)?;
         Ok(Self(dir))
@@ -904,6 +913,81 @@ impl Drop for Creating {
 }
 
 impl JailRuntime {
+    /// As [`Runtime::create`], for a container the caller starts at once,
+    /// with [`Runtime::start`] or [`JailRuntime::run_attached`]: most of a
+    /// run's time goes here, and a stop from another process would find
+    /// nothing running and let the command start after it. Holding what this
+    /// returns until the start is over makes that stop wait and stop it, or
+    /// fail if it takes too long. A plain create promises no start, and a
+    /// stop has nothing to wait for.
+    pub async fn create_for_run(&self, spec: &ContainerSpec) -> Result<(String, Starting)> {
+        let (id, starting) = self.make(spec, true).await?;
+        Ok((id, starting.expect("marked as asked")))
+    }
+
+    /// Waits as a stop does for a start of `id` to be over, for one who looks
+    /// at its state to decide: during a start it is not running yet.
+    pub async fn start_settled(&self, id: &str) -> Result<()> {
+        self.start_over(&self.record(id)?).await
+    }
+
+    async fn make(&self, spec: &ContainerSpec, run: bool) -> Result<(String, Option<Starting>)> {
+        // Held until the record is written, so that two creates of one name
+        // cannot both find it free.
+        let name = Creating::claim(&self.creating, &spec.name)?;
+        let rec = self.make_record(spec)?;
+        let dir = self.container_dir(&rec.id);
+        let images = self.images.clone();
+        let boot = self.boot;
+        // On a blocking thread to the end, even if the caller stops
+        // waiting: what it makes is then either recorded or gone, never
+        // left where nothing lists it. The record comes first for the same
+        // reason, should the process die: a record whose root was never
+        // made is a container created and not started, which a remove
+        // handles, while a clone with no record would stay for good.
+        blocking(move || {
+            let _name = name;
+            std::fs::create_dir_all(&dir).map_err(internal)?;
+            // What a create that fails made goes: a clone, or a copy of
+            // the image's files, flagged ones too.
+            let undo = |e| {
+                if !rec.is_pod() {
+                    let _ = images.cleanup_rootfs(&rec.root, rec.dataset.as_deref());
+                }
+                let _ = std::fs::remove_dir_all(&dir);
+                e
+            };
+            let image = if rec.is_pod() {
+                None
+            } else {
+                let image = images
+                    .get(&rec.image)
+                    .map_err(image_error)
+                    .and_then(|i| {
+                        i.ok_or_else(|| api(404, format!("{}: image not known", rec.image)))
+                    })
+                    .map_err(undo)?;
+                Some(image)
+            };
+            // Before the record: a stop finds the container by that.
+            let starting = run
+                .then(|| Starting::mark_in(dir.clone(), boot))
+                .transpose()
+                .map_err(undo)?;
+            state::write(&dir, RECORD, &rec)
+                .map_err(internal)
+                .map_err(undo)?;
+            if let Some(image) = image {
+                images
+                    .prepare_rootfs(&image, &rec.root, rec.dataset.as_deref())
+                    .map_err(image_error)
+                    .map_err(undo)?;
+            }
+            Ok((rec.id.clone(), starting))
+        })
+        .await
+    }
+
     fn make_record(&self, spec: &ContainerSpec) -> Result<Record> {
         let records = records(&self.dir)?;
         if records.iter().any(|r| r.name == spec.name) {
@@ -1364,54 +1448,7 @@ impl legion_runtime::Runtime for JailRuntime {
     }
 
     async fn create(&self, spec: &ContainerSpec) -> Result<String> {
-        // Held until the record is written, so that two creates of one name
-        // cannot both find it free.
-        let name = Creating::claim(&self.creating, &spec.name)?;
-        let rec = self.make_record(spec)?;
-        let dir = self.container_dir(&rec.id);
-        let images = self.images.clone();
-        // On a blocking thread to the end, even if the caller stops
-        // waiting: what it makes is then either recorded or gone, never
-        // left where nothing lists it. The record comes first for the same
-        // reason, should the process die: a record whose root was never
-        // made is a container created and not started, which a remove
-        // handles, while a clone with no record would stay for good.
-        blocking(move || {
-            let _name = name;
-            std::fs::create_dir_all(&dir).map_err(internal)?;
-            // What a create that fails made goes: a clone, or a copy of
-            // the image's files, flagged ones too.
-            let undo = |e| {
-                if !rec.is_pod() {
-                    let _ = images.cleanup_rootfs(&rec.root, rec.dataset.as_deref());
-                }
-                let _ = std::fs::remove_dir_all(&dir);
-                e
-            };
-            let image = if rec.is_pod() {
-                None
-            } else {
-                let image = images
-                    .get(&rec.image)
-                    .map_err(image_error)
-                    .and_then(|i| {
-                        i.ok_or_else(|| api(404, format!("{}: image not known", rec.image)))
-                    })
-                    .map_err(undo)?;
-                Some(image)
-            };
-            state::write(&dir, RECORD, &rec)
-                .map_err(internal)
-                .map_err(undo)?;
-            if let Some(image) = image {
-                images
-                    .prepare_rootfs(&image, &rec.root, rec.dataset.as_deref())
-                    .map_err(image_error)
-                    .map_err(undo)?;
-            }
-            Ok(rec.id.clone())
-        })
-        .await
+        Ok(self.make(spec, false).await?.0)
     }
 
     async fn start(&self, id: &str) -> Result<()> {
@@ -2289,9 +2326,12 @@ wait
         rt.stop("c1", Duration::ZERO).await.unwrap();
         mark(std::process::id(), rt.boot + 1);
         rt.stop("c1", Duration::ZERO).await.unwrap();
+        rt.start_settled("c1").await.unwrap();
         // One that never ends.
         mark(std::process::id(), rt.boot);
         let err = rt.stop("c1", Duration::ZERO).await.unwrap_err();
+        assert!(err.to_string().contains("still starting"), "{err}");
+        let err = rt.start_settled("c1").await.unwrap_err();
         assert!(err.to_string().contains("still starting"), "{err}");
     }
 
@@ -2725,6 +2765,78 @@ exit 0
             .unwrap();
         rt.remove(&id).await.unwrap();
         assert!(!state_dir.join(&id).exists());
+    }
+
+    /// A create that a run follows is marked from before anyone can find it,
+    /// and only that one: a stop has no start to wait for after a plain one.
+    #[tokio::test]
+    async fn a_create_for_a_run_is_starting_from_when_it_can_be_found() {
+        use legion_runtime::Runtime as _;
+        let t = tempfile::tempdir().unwrap();
+        let sys = Arc::new(legion_sys::FakeSys::new());
+        let (rt, image) = on_zfs(t.path(), &sys).await;
+        let state_dir = t.path().join("state");
+        let marked = |sys: &legion_sys::FakeSys| {
+            let (tx, seen) = std::sync::mpsc::channel();
+            let dir = state_dir.clone();
+            sys.before_clone(move || {
+                let found = records(&dir).unwrap().pop().unwrap();
+                tx.send(dir.join(found.id).join(STARTING).exists()).unwrap();
+            });
+            seen
+        };
+        let spec = |name: &str| ContainerSpec {
+            name: name.into(),
+            image: image.clone(),
+            ..ContainerSpec::default()
+        };
+
+        let seen = marked(&sys);
+        let (id, held) = rt.create_for_run(&spec("run")).await.unwrap();
+        assert!(seen.recv().unwrap(), "unmarked while the root was made");
+        assert!(state_dir.join(&id).join(STARTING).exists());
+        drop(held);
+        assert!(!state_dir.join(&id).join(STARTING).exists());
+        rt.stop(&id, Duration::ZERO).await.unwrap();
+        rt.remove(&id).await.unwrap();
+
+        let seen = marked(&sys);
+        let id = rt.create(&spec("plain")).await.unwrap();
+        assert!(!seen.recv().unwrap());
+        rt.stop(&id, Duration::ZERO).await.unwrap();
+    }
+
+    /// A stop that lands between the create and the start, as most do, stops
+    /// what starts: it would otherwise report it stopped, and it would run.
+    #[tokio::test]
+    async fn a_stop_after_a_create_for_a_run_stops_the_run() {
+        use legion_runtime::Runtime as _;
+        let t = tempfile::tempdir().unwrap();
+        let sys = Arc::new(legion_sys::FakeSys::new());
+        let (rt, image) = on_zfs(t.path(), &sys).await;
+        let rt = Arc::new(rt);
+        // A pod: it starts with no supervisor.
+        let spec = ContainerSpec {
+            name: "p1".into(),
+            image,
+            annotations: BTreeMap::from([(crate::ANNOTATION_VNET.to_owned(), "new".to_owned())]),
+            ..ContainerSpec::default()
+        };
+        let (id, held) = rt.create_for_run(&spec).await.unwrap();
+        let rec = rt.record(&id).unwrap();
+        assert!(rec.is_pod());
+        let stopping = tokio::spawn({
+            let (rt, id) = (rt.clone(), id.clone());
+            async move { rt.stop(&id, Duration::from_secs(1)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!stopping.is_finished(), "reported stopped before the start");
+        rt.start(&id).await.unwrap();
+        drop(held);
+        stopping.await.unwrap().unwrap();
+        let status = rt.status(&rec).unwrap();
+        assert!(!matches!(status, Status::Running(_)), "{status:?}");
+        assert!(!jail_names(&*sys).unwrap().contains(&rec.jail));
     }
 
     #[tokio::test]

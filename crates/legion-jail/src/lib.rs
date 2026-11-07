@@ -11,7 +11,7 @@ pub mod state;
 pub mod users;
 
 #[cfg(unix)]
-pub use runtime::{Config, JailRuntime, Step, StepMount, StepNetwork};
+pub use runtime::{Config, JailRuntime, Starting, Step, StepMount, StepNetwork};
 
 /// A container that is a pod's jail: `persist`, VNET, running nothing.
 pub const ANNOTATION_VNET: &str = "org.freebsd.jail.vnet";
