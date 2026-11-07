@@ -195,9 +195,10 @@ bhyve and NAT options wait for a concrete user need.
 3. **Partitions.** Recommended default: fail-open, as today, since workloads
    surviving a control-plane outage is a stated goal. Add an opt-in fail-closed
    mode for workloads that must never run twice.
-4. **Image resolution.** Recommended: the leader resolves a tag once at
-   deployment, using the namespace's pull secret, so every node gets one
-   digest. The cost is that managers need registry access. Agree an offline
-   rule for local images.
+4. **Image resolution.** Decided 7 November 2026: the leader resolves a tag
+   once at deployment, using the namespace's pull secret, so every node gets
+   one digest. The cost is that managers need registry access. A local image
+   (`localhost/`) has no registry to ask: it stays as named, and is loaded
+   onto the nodes that run it.
 5. **Port.** Submit the port once `testport` passes on the current release,
    or hold it until phase 1 qualifies a release.
