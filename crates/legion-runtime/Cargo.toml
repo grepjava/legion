@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 bytes.workspace = true
+legion-api.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"] }

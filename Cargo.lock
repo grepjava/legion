@@ -1702,6 +1702,7 @@ version = "0.1.13"
 dependencies = [
  "bytes",
  "futures",
+ "legion-api",
  "thiserror 2.0.21",
  "tokio",
 ]

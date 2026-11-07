@@ -1,10 +1,71 @@
 //! A registry login as Docker configs hold it, in `~/.docker/config.json`
 //! and Kubernetes' `dockerconfigjson` Secrets: for each registry an `auth`,
 //! base64 of `user:password`, or `username` and `password`. For the agent's
-//! pull secrets and jailer's logins alike.
+//! pull secrets, the manager's resolving of tags and jailer's logins alike.
+
+use std::collections::BTreeMap;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use serde::Deserialize;
+
+/// A registry account, from a pod's `imagePullSecrets`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Login {
+    /// As a Docker config's `auths` names it: `ghcr.io`,
+    /// `https://index.docker.io/v1/`.
+    pub registry: String,
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for Login {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Login")
+            .field("registry", &self.registry)
+            .field("username", &self.username)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Deserialize)]
+struct Entry {
+    #[serde(default)]
+    auth: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// Every login in a Docker config, `{"auths": {"<registry>": {...}}}`, or
+/// the older `.dockercfg` form, the `auths` map alone. One entry it can't
+/// read refuses the whole config.
+pub fn docker_config(value: &[u8]) -> Result<Vec<Login>, String> {
+    let not = |e: serde_json::Error| format!("not a Docker config: {e}");
+    let mut v: serde_json::Value = serde_json::from_slice(value).map_err(not)?;
+    let auths = match v.get_mut("auths") {
+        Some(a) => a.take(),
+        None => v,
+    };
+    let auths: BTreeMap<String, Entry> = serde_json::from_value(auths).map_err(not)?;
+    auths
+        .into_iter()
+        .map(|(registry, e)| {
+            let (username, password) = decode(
+                e.auth.as_deref(),
+                e.username.as_deref(),
+                e.password.as_deref(),
+            )
+            .map_err(|why| format!("{registry}: {why}"))?;
+            Ok(Login {
+                registry,
+                username,
+                password,
+            })
+        })
+        .collect()
+}
 
 /// The username and password of one entry. `auth` wins, as it does for
 /// Docker, when both forms are there. A caller reading a whole config may
@@ -36,7 +97,52 @@ pub fn decode(
 
 #[cfg(test)]
 mod tests {
-    use super::decode;
+    use super::*;
+
+    #[test]
+    fn docker_configs() {
+        let auth = STANDARD.encode("bot:s3cr:et");
+        let config = format!(
+            r#"{{"auths": {{"ghcr.io": {{"auth": "{auth}", "email": "x@y"}},
+                "https://index.docker.io/v1/": {{"username": "me", "password": "pw"}}}},
+                "credsStore": "desktop"}}"#
+        );
+        let logins = docker_config(config.as_bytes()).unwrap();
+        assert_eq!(
+            logins
+                .iter()
+                .map(|l| (&*l.registry, &*l.username, &*l.password))
+                .collect::<Vec<_>>(),
+            [
+                ("ghcr.io", "bot", "s3cr:et"),
+                ("https://index.docker.io/v1/", "me", "pw")
+            ]
+        );
+        let old = format!(r#"{{"quay.io": {{"auth": "{auth}"}}}}"#);
+        assert_eq!(
+            docker_config(old.as_bytes()).unwrap()[0].registry,
+            "quay.io"
+        );
+
+        for bad in [
+            "not json",
+            r#"{"auths": {"ghcr.io": {}}}"#,
+            r#"{"auths": {"ghcr.io": {"auth": "bm9jb2xvbg=="}}}"#,
+            r#"{"auths": {"ghcr.io": {"auth": "%%%"}}}"#,
+        ] {
+            assert!(docker_config(bad.as_bytes()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn logins_hide_passwords() {
+        let l = Login {
+            registry: "ghcr.io".into(),
+            username: "bot".into(),
+            password: "hunter2".into(),
+        };
+        assert!(!format!("{l:?}").contains("hunter2"));
+    }
 
     #[test]
     fn entries() {

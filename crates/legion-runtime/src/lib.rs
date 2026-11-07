@@ -109,23 +109,7 @@ impl Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A registry account, from a pod's `imagePullSecrets`.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Login {
-    /// As a Docker config's `auths` names it: `ghcr.io`,
-    /// `https://index.docker.io/v1/`.
-    pub registry: String,
-    pub username: String,
-    pub password: String,
-}
-
-impl std::fmt::Debug for Login {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Login")
-            .field("registry", &self.registry)
-            .field("username", &self.username)
-            .finish_non_exhaustive()
-    }
-}
+pub use legion_api::login::Login;
 
 /// A container to create.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
