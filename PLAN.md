@@ -99,6 +99,36 @@ Goal: what was deployed can be named exactly, and rollback restores it.
    for each task. Handle mixed-architecture clusters through the index.
 4. Make rollback use the recorded digest, not the tag.
 
+The shape:
+
+- **Resolving.** A task on the leader, beside the controller's pass, which
+  does no network I/O itself. For each Service or Job generation it asks the
+  registry what each reference in the pod names now, with the pod's
+  `imagePullSecrets`. It uses `Client::document`, so the digest is the one the
+  tag names: the manifest, or for a multi-architecture image the index, never
+  the config. The parsing of pull secrets moves from the agent to `legion-api`,
+  so both use one copy.
+- **Recording.** `ServiceStatus.images` holds, for a generation, each
+  reference as written and the `repository@sha256:...` it resolved to.
+  `UpdateStatus` keeps the previous generation's beside `previous`, so a
+  rollback returns to those digests and asks no registry.
+- **Tasks.** `TaskSpec.images` carries that map, and the agent looks each
+  image up there when it pulls and builds a container. `TaskSpec.pod` stays as
+  written: the controller compares it with the Service's to find outdated
+  tasks, so rewriting it would replace every task. A task from before this has
+  an empty map and runs as it did.
+- **Waiting.** The plan makes no task for a generation until it is resolved.
+  One that can't be says why in the Service's status, and retries; what runs
+  keeps running. A reference with a digest needs no registry, and a local one
+  stays as named.
+- **Pull policy.** Per container: `resolve`, the default, or `never`, which
+  uses what the node holds and asks no registry. A digest pinned at deployment
+  means a node pulls only what it lacks, so there is no `always`. A tag moved
+  since deployment changes nothing until the Service is deployed again.
+- **Per node.** `TaskStatus` reports the platform manifest each image ran as,
+  so a mixed cluster shows one index digest and its manifests. Status and logs
+  name references and digests, never credentials.
+
 Exit: a tag moved between two nodes' pulls can't produce an unnoticed mix,
 rollback still works after a tag changes, and private registry details stay
 out of status and logs. Tag a release so jailer can start its image handoff.
