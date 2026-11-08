@@ -60,6 +60,12 @@ replacement is a new task with a new uid, so the old one is never started
 again: an orphaned task is terminal, and the agent starts only tasks that
 aren't. Tested: `tasks_survive_losing_a_node`.
 
+Until it has stopped the old pod, the node reports the task as it is,
+running, over `orphaned`, and the reason it was orphaned leaves its status.
+The task stays told to stop, so it gets no connections, as endpoints take
+only tasks told to run, and the service counts its replacement, not it.
+Tested: `an_orphan_reported_running_by_its_returning_node_displaces_nothing`.
+
 ## Managers without a majority
 
 A cluster keeps working while a majority of its managers can reach each
@@ -128,10 +134,6 @@ during a split: its replacement waits for the volume.
 These follow from reading the code and need a test before they are
 promises either way:
 
-- **A status report from a node coming back** isn't checked against the
-  task's state, so the old node's "running" can replace `orphaned` until it
-  has stopped the pod. That briefly reports the old task's real state
-  again, but the reason it was orphaned is lost from its status.
 - **A bound volume's task replaced on the node coming back** may be placed
   there before the old pod's teardown has finished.
 - **A ZFS move** can reach its last step while a pod cut off on the old

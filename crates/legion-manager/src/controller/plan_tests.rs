@@ -266,6 +266,17 @@ impl World {
         v
     }
 
+    fn placed_task_on(&self, service: &str, node: &str) -> String {
+        self.tasks
+            .iter()
+            .find(|t| t.spec.service == service && t.spec.node == node)
+            .unwrap()
+            .object
+            .metadata
+            .name
+            .clone()
+    }
+
     fn placed_task(&self, name: &str) -> &Task {
         self.tasks
             .iter()
@@ -1299,6 +1310,48 @@ fn tasks_of_a_lost_node_move() {
     assert_eq!(w.placed("agent"), ["n1", "n2", "n3"]);
     assert!(w.tasks().contains(&"agent-n2-2 running n2".to_owned()));
     assert!(!w.placed("web").contains(&"n2".to_owned()));
+}
+
+/// A node back from a split reports its orphaned task running until it has
+/// stopped it (docs/PARTITIONS.md): the task stays told to stop, and its
+/// replacement runs on, counted once.
+#[test]
+fn an_orphan_reported_running_by_its_returning_node_displaces_nothing() {
+    let mut w = World::new();
+    for n in ["n1", "n2", "n3"] {
+        w.node(n, &[]);
+    }
+    w.service(
+        "web",
+        &format!(
+            "replicas: 3
+{POD}"
+        ),
+    );
+    w.settle();
+    let lost = w.placed_task_on("web", "n2");
+    w.state("n2", NodeState::Down);
+    w.settle();
+    let replaced = w.running();
+    assert!(!replaced.contains(&lost), "{replaced:?}");
+    assert_eq!(replaced.len(), 3);
+
+    w.state("n2", NodeState::Ready);
+    w.end(&lost, TaskState::Running);
+    w.agents = false;
+    w.step();
+    let old = w.placed_task(&lost);
+    assert_eq!(old.spec.desired_state, DesiredState::Shutdown);
+    let mut both = replaced.clone();
+    both.push(lost.clone());
+    both.sort();
+    assert_eq!(w.running(), both);
+    assert_eq!(w.status("web").running, 3);
+
+    w.agents = true;
+    w.settle();
+    assert_eq!(w.running(), replaced);
+    assert!(w.tasks().contains(&format!("{lost} shutdown n2")));
 }
 
 #[test]
