@@ -326,6 +326,41 @@ containers:
         assert_eq!(resolved["ghcr.io/me/app:2"], "ghcr.io/me/app@sha256:dd");
     }
 
+    /// A Service whose pod is the one an update replaced runs that one's
+    /// images again; any other pod is resolved afresh.
+    #[test]
+    fn a_rollback_runs_the_digests_from_before_its_update() {
+        let spec = |image: &str| -> ServiceSpec {
+            serde_json::from_value(serde_json::json!({
+                "pod": { "containers": [{ "name": "a", "image": image }] },
+            }))
+            .unwrap()
+        };
+        let before = BTreeMap::from([(
+            "nginx:1".to_owned(),
+            "docker.io/library/nginx@sha256:aa".to_owned(),
+        )]);
+        let mut o = Object::new(Kind::Service, "shop", "web", serde_json::json!({}));
+        o.status = serde_json::json!({
+            "update": {
+                "state": "rolling-back",
+                "generation": 2,
+                "previous": spec("nginx:1"),
+                "previousImages": before,
+            },
+        });
+        let old = pod_hash(&spec("nginx:1").pod);
+        let new = pod_hash(&spec("nginx:2").pod);
+        assert_eq!(rolled_back_to(&o, &old), Some(before));
+        assert_eq!(rolled_back_to(&o, &new), None);
+        // An update from before pins has none to run again.
+        o.status["update"]
+            .as_object_mut()
+            .unwrap()
+            .remove("previousImages");
+        assert_eq!(rolled_back_to(&o, &old), None);
+    }
+
     #[test]
     fn a_pod_hash_changes_with_the_pod_only() {
         let a = pod(r#"containers: [{ name: a, image: "nginx:1" }]"#);
