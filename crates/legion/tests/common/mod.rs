@@ -369,9 +369,7 @@ impl Lab {
     pub fn restart_vm(&self, i: usize, role: Role) {
         let vm = &self.vms[i];
         // STOP's last pkill finds nothing once the daemon stopped as asked.
-        let out = self.ssh(vm, &format!("{STOP}
-true
-"));
+        let out = self.ssh(vm, &format!("{STOP}\ntrue\n"));
         assert!(out.status.success(), "{}", text(&out.stderr));
         self.install(vm);
         let out = self.ssh(vm, &format!("set -e\n{}\n", self.vm_daemon(i, role)));
