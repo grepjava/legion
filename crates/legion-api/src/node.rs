@@ -112,6 +112,10 @@ pub struct NodeStatus {
     pub allocatable: Capacity,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub version: String,
+    /// What the agent speaks (`legion_api::protocol`); unset from builds
+    /// before the handshake, which speak protocol 1.
+    #[serde(default, skip_serializing_if = "crate::protocol::Protocol::is_unset")]
+    pub protocol: crate::protocol::Protocol,
     /// The agent runs a task's images by the digests they were pinned to
     /// (`TaskSpec::images`). Until every node does, tasks aren't pinned.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

@@ -534,6 +534,7 @@ fn status(hostname: String, advertise: &str) -> NodeStatus {
             memory: Bytes(physical_memory().unwrap_or(0)),
         },
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        protocol: legion_api::protocol::Protocol::current(),
         image_pins: true,
         // Assigned by the manager on registration.
         pod_cidr: None,

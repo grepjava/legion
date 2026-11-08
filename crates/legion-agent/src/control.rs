@@ -34,6 +34,11 @@ pub enum ControlError {
     /// retry later.
     #[error("manager unavailable: {0}")]
     Unavailable(String),
+    /// The manager and this node's builds do not work together
+    /// (`legion_api::protocol`), or the manager lacks a call this node
+    /// makes: one of them is to be upgraded.
+    #[error("{0}")]
+    Incompatible(String),
     #[error("{0}")]
     Other(String),
 }
@@ -43,6 +48,8 @@ pub enum ControlError {
 pub struct Registration {
     /// The node's pod subnet.
     pub pod_cidr: Ipv4Net,
+    /// What the manager speaks and works with.
+    pub manager: legion_api::protocol::Protocol,
 }
 
 pub trait Control: Send + Sync + 'static {
@@ -453,6 +460,7 @@ fn error(status: tonic::Status) -> ControlError {
         | Code::Cancelled
         | Code::Aborted
         | Code::FailedPrecondition => ControlError::Unavailable(status.message().to_owned()),
+        Code::Unimplemented => ControlError::Incompatible(status.message().to_owned()),
         _ => ControlError::Other(status.message().to_owned()),
     }
 }
@@ -493,6 +501,7 @@ impl Control for GrpcControl {
                 .pod_cidr
                 .parse()
                 .map_err(|e| ControlError::Other(format!("pod subnet {:?}: {e}", resp.pod_cidr)))?,
+            manager: legion_api::protocol::Protocol::said(resp.protocol, resp.oldest_protocol),
         })
     }
 

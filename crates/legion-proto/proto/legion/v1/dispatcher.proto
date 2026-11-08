@@ -76,6 +76,11 @@ message RegisterRequest {
 
 message RegisterResponse {
   string pod_cidr = 1;
+  // What the manager speaks, and the oldest it works with
+  // (legion_api::protocol); 0 from builds before the handshake, which
+  // speak protocol 1.
+  uint32 protocol = 2;
+  uint32 oldest_protocol = 3;
 }
 
 message AssignmentsRequest {

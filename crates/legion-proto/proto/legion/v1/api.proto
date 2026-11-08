@@ -200,6 +200,10 @@ message JoinRequest {
   // Managers only: the Raft id and the address other managers use.
   uint64 node_id = 4;
   string advertise = 5;
+  // What the joining build speaks, and the oldest it works with
+  // (legion_api::protocol); 0 from builds before the handshake.
+  uint32 protocol = 6;
+  uint32 oldest_protocol = 7;
 }
 
 message JoinResponse {
@@ -209,6 +213,9 @@ message JoinResponse {
   string ca_pem = 3;
   // Managers only: they issue certificates too.
   string ca_key_pem = 4;
+  // What the cluster's managers speak, and the oldest they work with.
+  uint32 protocol = 5;
+  uint32 oldest_protocol = 6;
 }
 
 message InitRequest {}

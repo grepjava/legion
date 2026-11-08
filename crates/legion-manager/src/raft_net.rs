@@ -1,10 +1,14 @@
 //! Raft transport between managers over gRPC. openraft's messages travel as
 //! JSON inside `RaftPayload`; the response carries the remote `Result`.
+//! Each call and answer says what its manager speaks
+//! (`legion_api::protocol`), and managers that cannot work together refuse
+//! each other: a manager upgraded too far ahead of the others stays out.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use legion_api::protocol::Protocol;
 use legion_proto::v1::RaftPayload;
 use legion_proto::v1::raft_client::RaftClient;
 use legion_proto::v1::raft_server;
@@ -38,19 +42,52 @@ pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 /// size.
 pub(crate) const MAX_BATCH: usize = 4 * 1024 * 1024;
 
+/// The header saying what a manager speaks: `speaks/oldest`.
+const PROTOCOL_HEADER: &str = "legion-protocol";
+
+fn say(m: &mut tonic::metadata::MetadataMap, protocol: Protocol) {
+    if let Ok(v) = format!("{}/{}", protocol.speaks, protocol.oldest).parse() {
+        m.insert(PROTOCOL_HEADER, v);
+    }
+}
+
+/// What a peer said it speaks; nothing said is protocol 1.
+fn heard(m: &tonic::metadata::MetadataMap) -> Protocol {
+    let said = m.get(PROTOCOL_HEADER).and_then(|v| v.to_str().ok());
+    let (speaks, oldest) = said
+        .and_then(|s| s.split_once('/'))
+        .map(|(s, o)| (s.parse().unwrap_or(0), o.parse().unwrap_or(0)))
+        .unwrap_or((0, 0));
+    Protocol::said(speaks, oldest)
+}
+
+/// Why peers were refused, each logged once.
+pub(crate) type Refusals = Arc<Mutex<HashSet<String>>>;
+
+fn refused(seen: &Refusals, why: &str) {
+    if seen.lock().unwrap().insert(why.to_owned()) {
+        tracing::error!("{why}");
+    }
+}
+
 /// Hands openraft one lazily connected channel per peer.
 #[derive(Default)]
 pub struct GrpcNetwork {
     channels: HashMap<(NodeId, String), Channel>,
     tls: Option<Arc<Credentials>>,
+    protocol: Protocol,
+    refusals: Refusals,
 }
 
 impl GrpcNetwork {
-    /// Calls peers with mutual TLS when `tls` is given.
-    pub fn new(tls: Option<Arc<Credentials>>) -> Self {
+    /// Calls peers with mutual TLS when `tls` is given, saying it speaks
+    /// `protocol`.
+    pub fn new(tls: Option<Arc<Credentials>>, protocol: Protocol) -> Self {
         GrpcNetwork {
             channels: HashMap::new(),
             tls,
+            protocol,
+            refusals: Refusals::default(),
         }
     }
 }
@@ -69,6 +106,8 @@ impl RaftNetworkFactory<TypeConfig> for GrpcNetwork {
             client: RaftClient::new(channel)
                 .max_decoding_message_size(MAX_MESSAGE)
                 .max_encoding_message_size(MAX_MESSAGE),
+            protocol: self.protocol,
+            refusals: self.refusals.clone(),
         }
     }
 }
@@ -87,6 +126,8 @@ pub(crate) fn connect_lazy(addr: &str, tls: Option<&Arc<Credentials>>) -> Channe
 pub struct PeerClient {
     target: NodeId,
     client: RaftClient<Channel>,
+    protocol: Protocol,
+    refusals: Refusals,
 }
 
 type RpcErr<E> = RPCError<NodeId, BasicNode, RaftError<NodeId, E>>;
@@ -122,12 +163,31 @@ impl PeerClient {
     {
         let mut request = Request::new(RaftPayload { json });
         request.set_timeout(option.hard_ttl());
+        say(request.metadata_mut(), self.protocol);
         let response = match method {
             Method::Append => self.client.append_entries(request).await,
             Method::Vote => self.client.vote(request).await,
             Method::Snapshot => self.client.install_snapshot(request).await,
         };
-        let payload = response.map_err(status_to_rpc)?.into_inner();
+        let peer = format!("manager {}", self.target);
+        let response = response.map_err(|s| {
+            if s.code() == tonic::Code::Unimplemented {
+                refused(
+                    &self.refusals,
+                    &format!("{peer} refused this one: {}", s.message()),
+                );
+            }
+            status_to_rpc(s)
+        })?;
+        // A peer from before the handshake answers anyone: refused here,
+        // it is unreachable, and counts toward no quorum.
+        if let Err(why) = self.protocol.works_with(heard(response.metadata()), &peer) {
+            refused(&self.refusals, &why);
+            return Err(RPCError::Unreachable(Unreachable::new(&io::Error::other(
+                why,
+            ))));
+        }
+        let payload = response.into_inner();
         let result: Result<Resp, RaftError<NodeId, E>> = serde_json::from_slice(&payload.json)
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         result.map_err(|e| RemoteError::new(self.target, e).into())
@@ -212,6 +272,10 @@ impl RaftNetwork<TypeConfig> for PeerClient {
 /// Serves Raft RPCs from peers into the local node.
 pub struct RaftService {
     pub store: Store,
+    /// What this manager speaks: calls from managers it cannot work with
+    /// are refused.
+    pub protocol: Protocol,
+    pub refusals: Refusals,
 }
 
 fn decode<T: DeserializeOwned>(req: Request<RaftPayload>) -> Result<T, Status> {
@@ -233,6 +297,28 @@ impl RaftService {
             from.map_or("?".into(), |f| f.to_string())
         )))
     }
+
+    /// Refuses calls from a manager whose build this one cannot work with
+    /// (it said `peer`).
+    fn compatible(&self, peer: Protocol, vote: &Vote<NodeId>) -> Result<(), Status> {
+        let from = vote
+            .leader_id()
+            .voted_for()
+            .map_or("?".into(), |f| f.to_string());
+        self.protocol
+            .works_with(peer, &format!("manager {from}"))
+            .map_err(|why| {
+                refused(&self.refusals, &why);
+                Status::unimplemented(why)
+            })
+    }
+
+    /// The answer, saying what this manager speaks.
+    fn answer<T: Serialize>(&self, result: T) -> Result<Response<RaftPayload>, Status> {
+        let mut response = encode(result)?;
+        say(response.metadata_mut(), self.protocol);
+        Ok(response)
+    }
 }
 
 fn encode<T: Serialize>(result: T) -> Result<Response<RaftPayload>, Status> {
@@ -246,24 +332,30 @@ impl raft_server::Raft for RaftService {
         &self,
         req: Request<RaftPayload>,
     ) -> Result<Response<RaftPayload>, Status> {
+        let peer = heard(req.metadata());
         let rpc: AppendEntriesRequest<TypeConfig> = decode(req)?;
         self.known(&rpc.vote)?;
-        encode(self.store.raft.append_entries(rpc).await)
+        self.compatible(peer, &rpc.vote)?;
+        self.answer(self.store.raft.append_entries(rpc).await)
     }
 
     async fn vote(&self, req: Request<RaftPayload>) -> Result<Response<RaftPayload>, Status> {
+        let peer = heard(req.metadata());
         let rpc: VoteRequest<NodeId> = decode(req)?;
         self.known(&rpc.vote)?;
-        encode(self.store.raft.vote(rpc).await)
+        self.compatible(peer, &rpc.vote)?;
+        self.answer(self.store.raft.vote(rpc).await)
     }
 
     async fn install_snapshot(
         &self,
         req: Request<RaftPayload>,
     ) -> Result<Response<RaftPayload>, Status> {
+        let peer = heard(req.metadata());
         let rpc: InstallSnapshotRequest<TypeConfig> = decode(req)?;
         self.known(&rpc.vote)?;
-        encode(self.store.raft.install_snapshot(rpc).await)
+        self.compatible(peer, &rpc.vote)?;
+        self.answer(self.store.raft.install_snapshot(rpc).await)
     }
 
     async fn read_index(&self, _: Request<RaftPayload>) -> Result<Response<RaftPayload>, Status> {

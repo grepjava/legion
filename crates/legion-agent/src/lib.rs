@@ -221,6 +221,9 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         }
         status.platform.no_limits = ctx.no_limits;
         ctx.platform = status.platform.clone();
+        if status.protocol.is_unset() {
+            status.protocol = legion_api::protocol::Protocol::current();
+        }
         let modules = task::blocking(&ctx.sys, |sys| {
             MODULES
                 .iter()
@@ -1046,11 +1049,30 @@ async fn heartbeats<R: Runtime, C: Control>(
 /// Registers the node, retrying until the manager takes it.
 async fn register<R, C: Control>(ctx: &Ctx<R, C>, status: &NodeStatus) -> control::Registration {
     let mut warned = false;
+    // Said again only when it changes.
+    let mut refused = String::new();
     loop {
-        match ctx.control.register(&ctx.node, status).await {
+        let r = ctx.control.register(&ctx.node, status).await;
+        // The manager may take the node and still be one it cannot work
+        // with: the node goes on asking until it is upgraded.
+        let r = r.and_then(|r| {
+            status
+                .protocol
+                .works_with(r.manager, "the manager")
+                .map(|()| r)
+                .map_err(ControlError::Incompatible)
+        });
+        match r {
             Ok(r) => {
                 tracing::info!(node = %ctx.node, "node registered");
                 return r;
+            }
+            Err(e @ ControlError::Incompatible(_)) => {
+                if e.to_string() != refused {
+                    tracing::error!(node = %ctx.node, "the node cannot join: {e}");
+                    refused = e.to_string();
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
             Err(e) => {
                 if !warned {

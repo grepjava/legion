@@ -40,7 +40,7 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 
 pub use dispatcher::HEARTBEAT_PERIOD;
-pub use join::{Joined, SYSTEM_NAMESPACE, join};
+pub use join::{Joined, SYSTEM_NAMESPACE, join, join_as};
 pub use legion_proto::tls::Credentials;
 pub use raft_net::{GrpcNetwork, MAX_MESSAGE};
 pub use tls::{Tls, client_config};
@@ -76,6 +76,9 @@ pub struct ManagerConfig {
     /// Registries (`host[:port]`) asked over plain HTTP when tags are
     /// resolved, as the operator set them: internal ones without TLS.
     pub insecure_registries: Vec<String>,
+    /// What this manager speaks and works with: this build's, but for
+    /// tests posing as another.
+    pub protocol: legion_api::protocol::Protocol,
 }
 
 impl ManagerConfig {
@@ -94,6 +97,7 @@ impl ManagerConfig {
             acme_loopback: false,
             registry_loopback: false,
             insecure_registries: Vec::new(),
+            protocol: legion_api::protocol::Protocol::current(),
         }
     }
 }
@@ -142,6 +146,7 @@ pub struct Manager {
     acme_loopback: bool,
     registry_loopback: bool,
     insecure_registries: Vec<String>,
+    protocol: legion_api::protocol::Protocol,
     vip: Option<(std::sync::Arc<dyn legion_sys::Sys>, vip::VipConfig)>,
     /// The store as metrics read it, emptied before the store shuts down.
     metrics: metrics::Slot,
@@ -160,7 +165,7 @@ impl Manager {
             .as_ref()
             .map(|t| Credentials::new(&t.ca_pem, &t.cert_pem, &t.key_pem))
             .transpose()?;
-        let network = GrpcNetwork::new(credentials.clone());
+        let network = GrpcNetwork::new(credentials.clone(), config.protocol);
         let key = config.store_key.as_ref();
         let store = Store::open_with(id, &config.data_dir, key, config.raft, network).await?;
         tracing::info!(
@@ -180,6 +185,7 @@ impl Manager {
             acme_loopback: config.acme_loopback,
             registry_loopback: config.registry_loopback,
             insecure_registries: config.insecure_registries,
+            protocol: config.protocol,
             vip: config.vip,
             metrics: std::sync::Arc::new(std::sync::RwLock::new(Some(store.clone()))),
             requests: Default::default(),
@@ -283,6 +289,7 @@ impl Manager {
             quota_lock: Default::default(),
             sessions,
             usage,
+            protocol: self.protocol,
         };
         let (dispatcher, dispatching) = dispatcher::DispatcherService::start(
             api.clone(),
@@ -291,6 +298,8 @@ impl Manager {
         );
         let raft = raft_net::RaftService {
             store: self.store.clone(),
+            protocol: self.protocol,
+            refusals: Default::default(),
         };
         let mut server =
             tonic::transport::Server::builder().layer(requests::Layer(self.requests.clone()));

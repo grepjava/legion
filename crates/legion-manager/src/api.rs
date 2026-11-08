@@ -4,6 +4,7 @@
 //! by the leader, so a follower forwards them once (marking the request so it
 //! is never forwarded twice). Watches are served from the local replica.
 
+use legion_api::protocol::Protocol;
 use std::collections::BTreeMap;
 
 use legion_api::{CLUSTER_SCOPE, Kind, Object, ObjectKey};
@@ -52,6 +53,8 @@ pub struct ApiService {
     pub(crate) sessions: std::sync::Arc<crate::session::Hub>,
     /// What tasks use, as heartbeats report it.
     pub(crate) usage: std::sync::Arc<crate::usage::Usage>,
+    /// What this manager speaks and works with.
+    pub(crate) protocol: legion_api::protocol::Protocol,
 }
 
 enum Route {
@@ -101,19 +104,28 @@ impl ApiService {
         &self,
         req: Request<pb::JoinRequest>,
     ) -> Result<Response<pb::JoinResponse>, Status> {
-        if let Some(addr) = self.leader_addr(&req)? {
+        // Refused here as by the leader, before anything is signed; answered
+        // with what both work with.
+        let mine = self.protocol;
+        let theirs = Protocol::said(req.get_ref().protocol, req.get_ref().oldest_protocol);
+        mine.works_with(theirs, &format!("node {}", req.get_ref().name))
+            .map_err(Status::unimplemented)?;
+        let mut answer = if let Some(addr) = self.leader_addr(&req)? {
             let mut c = legion_proto::v1::join_client::JoinClient::new(connect_lazy(
                 &addr,
                 self.peer_tls.as_ref(),
             ));
-            return c.join(forwarded(req.into_inner())).await;
-        }
-        // The tokens and removals it checks are the latest: a worker's join
-        // writes nothing that would fail on a deposed leader.
-        self.consistent().await?;
-        Ok(Response::new(
-            self.issuer()?.join(self, req.into_inner()).await?,
-        ))
+            c.join(forwarded(req.into_inner())).await?.into_inner()
+        } else {
+            // The tokens and removals it checks are the latest: a worker's
+            // join writes nothing that would fail on a deposed leader.
+            self.consistent().await?;
+            self.issuer()?.join(self, req.into_inner()).await?
+        };
+        let leader = Protocol::said(answer.protocol, answer.oldest_protocol);
+        answer.protocol = leader.speaks.min(mine.speaks);
+        answer.oldest_protocol = leader.oldest.max(mine.oldest);
+        Ok(Response::new(answer))
     }
 
     /// Where a leader-only request should run.

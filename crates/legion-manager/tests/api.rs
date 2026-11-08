@@ -91,6 +91,33 @@ impl Running {
         Running::serve(dir, listener, Some(joined.tls), Some(admin)).await
     }
 
+    /// A fresh manager that joins at `via` as this build, then serves as
+    /// one speaking `protocol`: one upgraded since it joined.
+    async fn join_then_serve_as(
+        via: &str,
+        token: &str,
+        name: &str,
+        admin: ClientTlsConfig,
+        protocol: legion_api::protocol::Protocol,
+    ) -> Running {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let id = legion_manager::node_id(dir.path()).unwrap();
+        let joined = legion_manager::join(via, token, name, id, &addr)
+            .await
+            .unwrap();
+        let config = ManagerConfig {
+            raft: Running::quick_raft(),
+            tls: Some(joined.tls),
+            heartbeat: HEARTBEAT,
+            registry_loopback: true,
+            protocol,
+            ..ManagerConfig::new(dir.path(), &addr)
+        };
+        Running::serve_config(dir, listener, config, Some(admin)).await
+    }
+
     /// With nodes that stay up however long the host stalls, for tests that
     /// are not about nodes going down: on [`HEARTBEAT`], one busy moment
     /// orphans their tasks.
@@ -150,15 +177,25 @@ impl Running {
         heartbeat: Duration,
     ) -> Running {
         let addr = listener.local_addr().unwrap().to_string();
-        let manager = Manager::open(ManagerConfig {
+        let config = ManagerConfig {
             raft,
             tls,
             heartbeat,
             registry_loopback: true,
             ..ManagerConfig::new(dir.path(), &addr)
-        })
-        .await
-        .unwrap();
+        };
+        Running::serve_config(dir, listener, config, admin).await
+    }
+
+    /// Serves `config` (its address is the listener's).
+    async fn serve_config(
+        dir: TempDir,
+        listener: TcpListener,
+        config: ManagerConfig,
+        admin: Option<ClientTlsConfig>,
+    ) -> Running {
+        let addr = listener.local_addr().unwrap().to_string();
+        let manager = Manager::open(config).await.unwrap();
         let store = manager.store().clone();
         let metrics = manager.metrics();
         let credentials = manager.credentials();
@@ -1578,6 +1615,169 @@ async fn a_removed_worker_stays_out_until_it_joins_again() {
     md.insert("legion-forwarded-issued", now.into());
     manager.clone().register(req).await.unwrap();
     assert_eq!(node_role(&m, "m9").as_deref(), Some("worker"));
+    m.stop().await;
+}
+
+/// A manager upgraded past what the others work with takes no part in the
+/// cluster: each refuses the other's Raft calls, so it neither catches up
+/// nor votes, and the others go on without it. One protocol ahead, it
+/// takes part.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_manager_upgraded_too_far_takes_no_part() {
+    use legion_api::protocol::{OLDEST, Protocol, SPEAKS};
+    let ca = Ca::generate().unwrap();
+    let first = Running::start_with(Some(&ca)).await;
+    first.cluster().await.init(InitRequest {}).await.unwrap();
+    let token = first
+        .cluster()
+        .await
+        .join_token(JoinTokenRequest {
+            role: "manager".into(),
+            rotate: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    let admin = creds(&ca, "admin", Role::Admin);
+    let ahead = Protocol {
+        speaks: SPEAKS + 2,
+        oldest: SPEAKS + 1,
+    };
+    let far = Running::join_then_serve_as(&first.addr, &token, "m2", admin.clone(), ahead).await;
+    let next = Protocol {
+        speaks: SPEAKS + 1,
+        oldest: OLDEST,
+    };
+    let near = Running::join_then_serve_as(&first.addr, &token, "m3", admin, next).await;
+    let voter = |id: u64| {
+        let m = first.store.raft.metrics().borrow().clone();
+        m.membership_config
+            .membership()
+            .voter_ids()
+            .any(|v| v == id)
+    };
+    let (far_id, near_id) = (
+        far.store.raft.metrics().borrow().id,
+        near.store.raft.metrics().borrow().id,
+    );
+    until("the near manager a voter", || voter(near_id)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!voter(far_id));
+    let applied = far.store.raft.metrics().borrow().last_applied;
+    assert!(applied.is_none(), "{applied:?}");
+    // The two that work together still write.
+    let api = near.objects().await;
+    eventually(|| {
+        let mut api = api.clone();
+        async move { api.apply(apply(service("after", 1))).await }
+    })
+    .await;
+    for m in [far, near, first] {
+        m.stop().await;
+    }
+}
+
+/// A manager or worker joins only if its build and the cluster's work
+/// together, and is told which goes first; refused, it is no member.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_build_the_cluster_cannot_work_with_is_refused_its_join() {
+    use legion_api::protocol::{OLDEST, Protocol, SPEAKS};
+    let ca = Ca::generate().unwrap();
+    let first = Running::start_with(Some(&ca)).await;
+    first.cluster().await.init(InitRequest {}).await.unwrap();
+    let token = first
+        .cluster()
+        .await
+        .join_token(JoinTokenRequest {
+            role: "manager".into(),
+            rotate: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    let members = async || {
+        first
+            .cluster()
+            .await
+            .status(StatusRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .members
+            .len()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let id = legion_manager::node_id(dir.path()).unwrap();
+    let ahead = Protocol {
+        speaks: SPEAKS + 2,
+        oldest: SPEAKS + 1,
+    };
+    let err = legion_manager::join_as(&first.addr, &token, "m2", id, "127.0.0.1:1", ahead)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(&format!(
+            "node m2 works with protocol {} and newer, and this one speaks {SPEAKS}: upgrade this one first",
+            SPEAKS + 1
+        )),
+        "{err}"
+    );
+    assert_eq!(members().await, 1);
+
+    // One protocol ahead, it joins.
+    let next = Protocol {
+        speaks: SPEAKS + 1,
+        oldest: OLDEST,
+    };
+    legion_manager::join_as(&first.addr, &token, "m2", id, "127.0.0.1:1", next)
+        .await
+        .unwrap();
+    first.stop().await;
+}
+
+/// A node registers only if its build and the manager's work together
+/// (`legion_api::protocol`): refused, it is told which goes first, and
+/// nothing of it is recorded; taken, it hears what the manager speaks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_of_a_build_the_manager_cannot_work_with_is_refused() {
+    let m = Running::start().await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let d = DispatcherClient::new(m.channel(None).await.unwrap());
+    let register = |node: &str, protocol: &str| {
+        let mut d = d.clone();
+        let req = RegisterRequest {
+            node: node.into(),
+            status_json: format!(r#"{{"state":"ready"{protocol}}}"#).into_bytes(),
+            ..Default::default()
+        };
+        async move { d.register(req).await }
+    };
+
+    let err = register("new", r#","protocol":{"speaks":3,"oldest":2}"#)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unimplemented, "{err}");
+    assert_eq!(
+        err.message(),
+        "node new works with protocol 2 and newer, and this one speaks 1: upgrade this one first"
+    );
+    assert_eq!(node_state(&m, "new"), None);
+
+    // One protocol ahead, or from before the handshake, it is taken.
+    for (node, protocol) in [
+        ("next", r#","protocol":{"speaks":2,"oldest":1}"#),
+        ("before", ""),
+    ] {
+        let answer = eventually(|| register(node, protocol)).await.into_inner();
+        assert_eq!(
+            (answer.protocol, answer.oldest_protocol),
+            (legion_api::protocol::SPEAKS, legion_api::protocol::OLDEST)
+        );
+        assert_eq!(node_state(&m, node).as_deref(), Some("ready"));
+    }
     m.stop().await;
 }
 

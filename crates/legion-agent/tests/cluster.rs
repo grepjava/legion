@@ -40,6 +40,9 @@ struct Node {
     agent: Option<(oneshot::Sender<()>, JoinHandle<()>)>,
     /// The node's way to the manager.
     link: Link,
+    /// What its agent says it speaks: this build's unless a test poses as
+    /// another.
+    protocol: legion_api::protocol::Protocol,
 }
 
 /// A TCP proxy between an agent and the manager that a test can cut, for a
@@ -141,24 +144,32 @@ impl Cluster {
             dir,
         };
         for n in 1..=nodes {
-            let sys = Arc::new(FakeSys::new());
-            sys.set_default_interface("re0");
-            let rt = Arc::new(FakeRuntime::new(sys.clone()));
-            rt.add_image(INFRA);
-            rt.add_image("web:1");
-            let link = Link::to(&c.addr).await;
-            c.nodes.push(Node {
-                name: format!("n{n}"),
-                rt,
-                sys,
-                agent: None,
-                link,
-            });
-            c.start_agent(n - 1);
+            let i = c.add_node(legion_api::protocol::Protocol::current()).await;
+            c.start_agent(i);
             // Registered in order, so node n has the pod subnet 10.200.n-1.
             c.eventually_node_ready(&format!("n{n}")).await;
         }
         c
+    }
+
+    /// Adds a node, its agent not started, whose agent says it speaks
+    /// `protocol`. Returns its index.
+    async fn add_node(&mut self, protocol: legion_api::protocol::Protocol) -> usize {
+        let sys = Arc::new(FakeSys::new());
+        sys.set_default_interface("re0");
+        let rt = Arc::new(FakeRuntime::new(sys.clone()));
+        rt.add_image(INFRA);
+        rt.add_image("web:1");
+        let link = Link::to(&self.addr).await;
+        self.nodes.push(Node {
+            name: format!("n{}", self.nodes.len() + 1),
+            rt,
+            sys,
+            agent: None,
+            link,
+            protocol,
+        });
+        self.nodes.len() - 1
     }
 
     fn start_agent(&mut self, i: usize) {
@@ -191,6 +202,7 @@ impl Cluster {
         let status = NodeStatus {
             state: NodeState::Ready,
             addr: format!("192.0.2.{}", i + 1),
+            protocol: node.protocol,
             ..Default::default()
         };
         let handle = tokio::spawn(agent.run(status, async move {
@@ -820,6 +832,43 @@ async fn stateful_data_moves_off_a_draining_node() {
         c.nodes[index(&from)].sys.zfs_list(ds).unwrap().is_empty()
     })
     .await;
+    c.stop().await;
+}
+
+/// A node whose build the manager cannot work with stays out, and its
+/// agent keeps asking, for when one of them is upgraded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_of_a_build_the_manager_cannot_work_with_stays_out() {
+    use legion_api::protocol::Protocol;
+    let mut c = Cluster::start(1).await;
+    c.apply(&WEB.replace("replicas: 3", "replicas: 2")).await;
+    let ahead = Protocol {
+        speaks: legion_api::protocol::SPEAKS + 2,
+        oldest: legion_api::protocol::SPEAKS + 1,
+    };
+    let i = c.add_node(ahead).await;
+    c.start_agent(i);
+    tokio::time::sleep(HEARTBEAT * 15).await;
+    assert!(
+        !c.list(Kind::Node)
+            .await
+            .iter()
+            .any(|n| n.metadata.name == "n2"),
+        "n2 recorded"
+    );
+    assert_eq!(c.placed().await, ["n1", "n1"]);
+    assert!(c.nodes[i].rt.containers().is_empty());
+    // Still asking, not ended.
+    assert!(!c.nodes[i].agent.as_ref().unwrap().1.is_finished());
+
+    // One protocol ahead, it joins and takes work.
+    c.stop_agent(i).await;
+    c.nodes[i].protocol = Protocol {
+        speaks: legion_api::protocol::SPEAKS + 1,
+        oldest: legion_api::protocol::OLDEST,
+    };
+    c.start_agent(i);
+    c.eventually_node_ready("n2").await;
     c.stop().await;
 }
 

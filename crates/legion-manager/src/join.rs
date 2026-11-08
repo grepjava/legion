@@ -14,6 +14,7 @@
 //! certificates in turn, and becomes a Raft learner; the leader promotes
 //! learners to voters once they have caught up.
 
+use legion_api::protocol::Protocol;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -210,6 +211,7 @@ impl Issuer {
         // Run to the end even if the caller goes: stopped between its
         // writes, it would leave the name's earlier certificates refused
         // for a join that did not happen.
+        let protocol = api.protocol;
         let (issuer, api, task_req) = (self.clone(), api.clone(), req.clone());
         let cert_pem = tokio::spawn(async move { issuer.admit(&api, &task_req, role).await })
             .await
@@ -224,6 +226,8 @@ impl Issuer {
             cert_pem,
             ca_pem: self.ca.cert_pem().to_owned(),
             ca_key_pem,
+            protocol: protocol.speaks,
+            oldest_protocol: protocol.oldest,
         })
     }
 }
@@ -479,6 +483,19 @@ pub async fn join(
     node_id: NodeId,
     advertise: &str,
 ) -> Result<Joined, crate::Error> {
+    join_as(addr, token, name, node_id, advertise, Protocol::current()).await
+}
+
+/// [`join`], saying it speaks `protocol`: for tests posing as another
+/// build.
+pub async fn join_as(
+    addr: &str,
+    token: &str,
+    name: &str,
+    node_id: NodeId,
+    advertise: &str,
+    protocol: Protocol,
+) -> Result<Joined, crate::Error> {
     let token = Token::parse(token)?;
     let ca_pem = fetch_ca(addr, &token.ca_digest).await?;
     let (key_pem, csr_pem) = legion_pki::request()?;
@@ -495,6 +512,8 @@ pub async fn join(
         csr_pem,
         node_id,
         advertise: advertise.to_owned(),
+        protocol: protocol.speaks,
+        oldest_protocol: protocol.oldest,
     };
     // A cluster between leaders answers Unavailable for a moment; a failed
     // try leaves nothing behind.
@@ -510,6 +529,11 @@ pub async fn join(
             answer => break answer?.into_inner(),
         }
     };
+    // A manager from before the handshake takes anyone: the node checks.
+    protocol.works_with(
+        Protocol::said(resp.protocol, resp.oldest_protocol),
+        "the cluster",
+    )?;
     let role = Role::parse(&resp.role).ok_or("the manager answered with an unknown role")?;
     if resp.ca_pem.trim() != ca_pem.trim() && legion_pki::digest(&resp.ca_pem)? != token.ca_digest {
         return Err("the manager answered with another CA".into());

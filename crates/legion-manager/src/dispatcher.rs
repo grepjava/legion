@@ -25,6 +25,7 @@ use legion_api::dispatch::{
     Peers, Policies, Routes, ServiceEndpoints, VolumeClaim,
 };
 use legion_api::node::{NodeSpec, NodeState, NodeStatus, Role as NodeRole};
+use legion_api::protocol::Protocol;
 use legion_api::service::{PortRef, ServiceSpec, ServiceStatus};
 use legion_api::task::{DesiredState, TaskSpec, TaskState, TaskStatus};
 use legion_api::volume::{Access, MigrationPhase, VolumeSpec, VolumeStatus};
@@ -383,6 +384,7 @@ impl DispatcherService {
             };
             let response = RegisterResponse {
                 pod_cidr: status.pod_cidr.clone().unwrap_or_default(),
+                ..Default::default()
             };
             let status = serde_json::to_value(&status).map_err(internal)?;
             // The role is the certificate's: a Node made before the role was
@@ -922,18 +924,31 @@ impl Dispatcher for DispatcherService {
             Some(w) => Some(w),
             None => self.worker(&req)?,
         };
+        // Refused by the manager it talks to as by the leader; answered
+        // with what both work with.
+        let status: NodeStatus =
+            serde_json::from_slice(&req.get_ref().status_json).map_err(invalid)?;
+        let mine = self.api.protocol;
+        mine.works_with(status.protocol, &format!("node {node}"))
+            .map_err(Status::unimplemented)?;
         if let Some(mut leader) = leader {
             let mut inner = req.into_inner();
             inner.node = node;
             inner.role = role.as_str().to_owned();
-            return leader.register(to_leader(inner, &worker)?).await;
+            let mut answer = leader
+                .register(to_leader(inner, &worker)?)
+                .await?
+                .into_inner();
+            let theirs = Protocol::said(answer.protocol, answer.oldest_protocol);
+            answer.protocol = theirs.speaks.min(mine.speaks);
+            answer.oldest_protocol = theirs.oldest.max(mine.oldest);
+            return Ok(Response::new(answer));
         }
-        let status: NodeStatus =
-            serde_json::from_slice(&req.get_ref().status_json).map_err(invalid)?;
         let issued = worker.map(|(_, issued)| issued);
-        Ok(Response::new(
-            self.register_local(&node, role, status, issued).await?,
-        ))
+        let mut answer = self.register_local(&node, role, status, issued).await?;
+        answer.protocol = mine.speaks;
+        answer.oldest_protocol = mine.oldest;
+        Ok(Response::new(answer))
     }
 
     type AssignmentsStream = ReceiverStream<Result<AssignmentsUpdate, Status>>;
