@@ -104,7 +104,29 @@ the word is taken on trust.
   another node hands the volume to that node. Tested:
   `a_move_whose_old_node_is_removed_keeps_the_copy`.
 - **The node's agent, if it is still running, keeps running its pods.** It
-  takes the refusal as a lost connection and retries forever.
+  takes the refusal as a lost connection and retries forever. Pods with
+  `onPartition: stop` are the exception: refused, the agent hears from no
+  manager, and stops them as it would cut off.
+
+### Before removing a node that holds data
+
+Removing a node lets its volumes used one node at a time start elsewhere
+without the node having released them. If the node is in fact still
+running, two pods can then write the same data: an iSCSI LUN attached on
+two hosts, or a ZFS volume whose old copy keeps taking writes nobody will
+read. Legion can't check this for you, so before `legion delete node` of a
+node that is down, rather than drained:
+
+1. List what it holds: `legion list volumes -A` shows each volume's
+   node.
+2. Make sure the node has stopped: power it off, or stop `legion` on it
+   (`service legion stop`) and check that `jls` lists none of its pods.
+   If you can't reach it, cut it off where you can, at its switch port or
+   its storage target, before you go on.
+3. Then delete the node. Its volumes go to the next tasks that need them.
+
+A node you drained first has already released its volumes, and needs none
+of this.
 
 The removal is recorded before the Node is deleted, so the node can't come
 back between the two writes. If the record's write fails without saying
