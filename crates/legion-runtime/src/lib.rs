@@ -20,6 +20,13 @@ pub trait Runtime: Send + Sync + 'static {
         reference: &str,
         user: &str,
     ) -> impl Future<Output = Result<bool>> + Send;
+    /// The digest of the manifest the node holds for `reference`, once
+    /// pulled or loaded: for an image of several platforms, the one for this
+    /// node's. `None` from a runtime that doesn't say.
+    fn image_digest(&self, reference: &str) -> impl Future<Output = Result<Option<String>>> + Send {
+        let _ = reference;
+        async { Ok(None) }
+    }
     /// Pulls `reference` for `user`, with the login in `logins` for its
     /// registry if there is one.
     fn pull(

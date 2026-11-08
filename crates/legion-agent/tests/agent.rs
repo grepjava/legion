@@ -1328,8 +1328,13 @@ async fn pinned_images_and_held_ones() {
             &[("web:1", digest)],
         )
         .await;
-    h.wait_state(&key, TaskState::Running).await;
+    let status = h.wait_state(&key, TaskState::Running).await;
     assert_eq!(h.rt.spec("shop_pin-1_app").unwrap().image, digest);
+    // What the node ran for it, under the name the pod gives it.
+    assert_eq!(
+        status.images["web:1"],
+        format!("sha256:manifest-of-{digest}")
+    );
 
     let held = r#"containers: [{ name: app, image: "local:1", pullPolicy: never }]"#;
     let key = h.task("held-1", held).await;

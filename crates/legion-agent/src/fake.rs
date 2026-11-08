@@ -517,6 +517,15 @@ impl Runtime for FakeRuntime {
                 .is_none_or(|(_, users)| users.contains(user)))
     }
 
+    /// A made-up digest, which names the reference it stands for.
+    async fn image_digest(&self, reference: &str) -> Result<Option<String>> {
+        Ok(self
+            .state()
+            .images
+            .contains(reference)
+            .then(|| format!("sha256:manifest-of-{reference}")))
+    }
+
     async fn pull(&self, reference: &str, user: &str, logins: &[Login]) -> Result<()> {
         let mut s = self.state();
         let denied = || Error::Pull {

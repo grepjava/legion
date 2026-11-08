@@ -587,6 +587,15 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 return Err(Abort::Stopped);
             }
         }
+        // What this node runs for each, by the name the pod gives it.
+        let mut ran = BTreeMap::new();
+        for c in self.pod().containers() {
+            let image = legion_api::image::pinned(&self.a.spec.images, &c.image);
+            if let Ok(Some(digest)) = rt.image_digest(image).await {
+                ran.insert(c.image.clone(), digest);
+            }
+        }
+        self.status.images = ran;
 
         let resolv_conf = self
             .ctx

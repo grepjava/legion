@@ -1421,6 +1421,14 @@ impl legion_runtime::Runtime for JailRuntime {
         Ok(usable)
     }
 
+    async fn image_digest(&self, reference: &str) -> Result<Option<String>> {
+        Ok(self
+            .images
+            .get(reference)
+            .map_err(image_error)?
+            .map(|i| i.digest))
+    }
+
     async fn pull(&self, reference: &str, user: &str, logins: &[Login]) -> Result<()> {
         let pull_error = |message: String| Error::Pull {
             image: reference.to_owned(),
