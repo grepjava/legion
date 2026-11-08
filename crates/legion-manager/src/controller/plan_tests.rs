@@ -640,8 +640,26 @@ fn tasks_run_the_digests_resolved_for_their_pod() {
     }
     assert_eq!(running(&w), pinned("web:2", two, 3));
 
+    // Rolled back: nothing until the resolver has run, and it takes the
+    // digests from before the update, whatever web:1 names now.
+    w.service("web", &spec("web:1", 3));
+    let rolled = {
+        let s = &w.services[0];
+        crate::images::rolled_back_to(&s.object, &crate::images::pod_hash(&s.spec.pod))
+    };
+    assert_eq!(
+        rolled,
+        Some(BTreeMap::from([("web:1".to_owned(), one.to_owned())]))
+    );
+    w.resolve("web", &[("web:1", one)]);
+    for _ in 0..10 {
+        w.now += Duration::from_secs(60);
+        w.settle();
+    }
+    assert_eq!(running(&w), pinned("web:1", one, 3), "rolled back");
+
     w.node_mut("b").status.image_pins = false;
-    w.service("web", &spec("web:2", 4));
+    w.service("web", &spec("web:1", 4));
     w.settle();
     let unpinned = running(&w)
         .into_iter()

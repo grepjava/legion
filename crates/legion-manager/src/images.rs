@@ -141,7 +141,7 @@ fn logins(store: &Store, namespace: &str, pod: &PodSpec) -> Result<Vec<Login>, S
 
 /// The images a Service ran before its update, when its pod is that one's
 /// again (a rollback): it runs them again, whatever its tags name now.
-fn rolled_back_to(o: &Object, hash: &str) -> Option<BTreeMap<String, String>> {
+pub(crate) fn rolled_back_to(o: &Object, hash: &str) -> Option<BTreeMap<String, String>> {
     let update: legion_api::service::UpdateStatus =
         serde_json::from_value(o.status.get("update")?.clone()).ok()?;
     (!update.previous_images.is_empty() && pod_hash(&update.previous.pod) == hash)

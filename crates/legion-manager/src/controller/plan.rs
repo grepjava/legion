@@ -1159,10 +1159,12 @@ fn track_update(
             message: String::new(),
             generation: s.object.metadata.generation,
             previous: old.clone(),
-            previous_images: previous
-                .images
-                .as_ref()
-                .map(|i| i.resolved.clone())
+            // From the tasks that ran it: the status has the new pod's
+            // images by now, as they were resolved before this pass.
+            previous_images: tasks
+                .iter()
+                .find(|t| t.spec.pod == old.pod)
+                .map(|t| t.spec.images.clone())
                 .unwrap_or_default(),
             snapshot,
         });
