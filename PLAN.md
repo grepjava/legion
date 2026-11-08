@@ -181,7 +181,9 @@ stopped, and a node cut off with its agent running is tested through a
 link that goes silent. A leader cut off from the majority answers no
 heartbeats, so agents attached to it know they are cut off. Item 5 is a
 stated procedure: what to check before removing a node that holds data.
-Left before the phase's tag: a full qualification run of all this.
+Qualified at fb6c909 on 8 November 2026: all 38 steps passed, the two
+handoff tests with jailer included, with nothing left behind. Not yet
+tagged.
 
 ### Phase 5: Drain barrier
 
