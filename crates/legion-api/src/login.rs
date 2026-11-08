@@ -95,6 +95,43 @@ pub fn decode(
     }
 }
 
+/// Every login in a Docker config that can be read, as a person's
+/// `~/.docker/config.json` holds them: an entry with nothing usable (Docker
+/// Desktop's with `credsStore`, or an identity token alone) is passed over,
+/// and a lone username or password is taken with the other empty, as
+/// configs written by hand have it. Only a file that isn't a Docker config
+/// is refused. For logins a person keeps; a pod's pull secrets are read
+/// with [`docker_config`], which refuses what it can't use.
+pub fn docker_config_lenient(value: &[u8]) -> Result<Vec<Login>, String> {
+    let not = |e: serde_json::Error| format!("not a Docker config: {e}");
+    let mut v: serde_json::Value = serde_json::from_slice(value).map_err(not)?;
+    let auths = match v.get_mut("auths") {
+        Some(a) => a.take(),
+        None => v,
+    };
+    let auths: BTreeMap<String, Entry> = serde_json::from_value(auths).map_err(not)?;
+    Ok(auths
+        .into_iter()
+        .filter_map(|(registry, e)| {
+            let lone = |one: &Option<String>, other: &Option<String>| {
+                one.clone()
+                    .or_else(|| other.as_ref().map(|_| String::new()))
+            };
+            let (username, password) = decode(
+                e.auth.as_deref(),
+                lone(&e.username, &e.password).as_deref(),
+                lone(&e.password, &e.username).as_deref(),
+            )
+            .ok()?;
+            Some(Login {
+                registry,
+                username,
+                password,
+            })
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +169,36 @@ mod tests {
         ] {
             assert!(docker_config(bad.as_bytes()).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_persons_config_keeps_what_it_can_use() {
+        let auth = STANDARD.encode("bot:pw");
+        let config = format!(
+            r#"{{"auths": {{
+                "https://index.docker.io/v1/": {{}},
+                "quay.io": {{"identitytoken": "t"}},
+                "ghcr.io": {{"auth": "{auth}"}},
+                "me.example": {{"username": "me"}},
+                "pw.example": {{"password": "secret"}},
+                "bad.example": {{"auth": "%%%"}}}},
+                "credsStore": "desktop"}}"#
+        );
+        // A pod's secret refuses it whole.
+        assert!(docker_config(config.as_bytes()).is_err());
+        let logins = docker_config_lenient(config.as_bytes()).unwrap();
+        assert_eq!(
+            logins
+                .iter()
+                .map(|l| (&*l.registry, &*l.username, &*l.password))
+                .collect::<Vec<_>>(),
+            [
+                ("ghcr.io", "bot", "pw"),
+                ("me.example", "me", ""),
+                ("pw.example", "", "secret"),
+            ]
+        );
+        assert!(docker_config_lenient(b"not json").is_err());
     }
 
     #[test]

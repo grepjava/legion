@@ -101,6 +101,16 @@ impl Reference {
             .unwrap_or("latest")
     }
 
+    /// The same image by `digest` (`sha256:<hex>`), with no tag: what a
+    /// deployment pins and a release record names.
+    pub fn by_digest(&self, digest: &str) -> Reference {
+        Reference {
+            tag: None,
+            digest: Some(digest.to_owned()),
+            ..self.clone()
+        }
+    }
+
     /// `localhost/...` names images built or loaded on the node, which no
     /// registry serves (Podman's convention).
     pub fn is_local(&self) -> bool {
@@ -193,6 +203,22 @@ impl fmt::Display for Reference {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_image_by_digest_drops_its_tag() {
+        let d = format!("sha256:{}", "a".repeat(64));
+        let r = Reference::parse("ghcr.io/me/app:1").unwrap();
+        assert_eq!(r.by_digest(&d).to_string(), format!("ghcr.io/me/app@{d}"));
+        let hub = Reference::parse("nginx").unwrap();
+        assert_eq!(
+            hub.by_digest(&d).to_string(),
+            format!("docker.io/library/nginx@{d}")
+        );
+        assert_eq!(
+            Reference::parse(&r.by_digest(&d).to_string()).unwrap(),
+            r.by_digest(&d)
+        );
+    }
 
     fn canonical(s: &str) -> String {
         Reference::parse(s).unwrap().to_string()

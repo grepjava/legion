@@ -122,12 +122,7 @@ pub async fn resolve<R: Registry>(
             .digest(&r, logins)
             .await
             .map_err(|e| format!("resolving {image}: {e}"))?;
-        let pinned = Reference {
-            tag: None,
-            digest: Some(digest),
-            ..r
-        };
-        resolved.insert(image, pinned.to_string());
+        resolved.insert(image, r.by_digest(&digest).to_string());
     }
     Ok(resolved)
 }

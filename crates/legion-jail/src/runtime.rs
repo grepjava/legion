@@ -233,6 +233,9 @@ const REMOVE_ENDS: Duration = if cfg!(test) {
 /// finds which of the two it was.
 ///
 /// [`JailRuntime::create_for_run`] returns one to hold across the start.
+/// Drop it before stopping or removing the container yourself: a stop
+/// waits for a start held by any process, this one too, and would wait a
+/// minute for your own and fail.
 #[must_use = "dropped, a stop no longer waits for the start"]
 pub struct Starting(PathBuf);
 
@@ -913,13 +916,15 @@ impl Drop for Creating {
 }
 
 impl JailRuntime {
-    /// As [`Runtime::create`], for a container the caller starts at once,
-    /// with [`Runtime::start`] or [`JailRuntime::run_attached`]: most of a
+    /// As [`legion_runtime::Runtime::create`], for a container the caller
+    /// starts at once, with [`legion_runtime::Runtime::start`] or
+    /// [`JailRuntime::run_attached`]: most of a
     /// run's time goes here, and a stop from another process would find
     /// nothing running and let the command start after it. Holding what this
     /// returns until the start is over makes that stop wait and stop it, or
     /// fail if it takes too long. A plain create promises no start, and a
-    /// stop has nothing to wait for.
+    /// stop has nothing to wait for. Drop it before stopping or removing the
+    /// container yourself, as [`Starting`] says.
     pub async fn create_for_run(&self, spec: &ContainerSpec) -> Result<(String, Starting)> {
         let (id, starting) = self.make(spec, true).await?;
         Ok((id, starting.expect("marked as asked")))
