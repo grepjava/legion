@@ -164,6 +164,9 @@ async fn pass(store: &Store, accounts: &mut Accounts, now: SystemTime) -> Durati
                 let ordered = tokio::time::timeout(ORDER_TIMEOUT, order(store, accounts, &w))
                     .await
                     .unwrap_or_else(|_| Err("the order took too long".into()));
+                // The routes calling for it as they are before it is checked
+                // again: the write holds only while they stay so.
+                let guard = guard(store, &w);
                 match ordered.and_then(|pem| {
                     let (not_after, lifetime) =
                         legion_pki::validity(&pem).map_err(|e| e.to_string())?;
@@ -181,8 +184,14 @@ async fn pass(store: &Store, accounts: &mut Accounts, now: SystemTime) -> Durati
                         continue;
                     }
                     Ok((pem, not_after, renew_at)) => {
-                        match put_secret(store, &w.namespace, &w.secret, pem.as_bytes(), seen).await
-                        {
+                        // Between the check and the write: where a route
+                        // changing went unseen before protocol 2.
+                        #[cfg(feature = "test-hooks")]
+                        crate::hooks::pause("acme-write", &w.secret).await;
+                        let written =
+                            put_secret(store, &w.namespace, &w.secret, pem.as_bytes(), seen, guard)
+                                .await;
+                        match written {
                             Ok(()) => {
                                 tracing::info!(
                                     hosts = ?w.hosts,
@@ -341,6 +350,23 @@ fn wanted_of(routes: Vec<Object>) -> (Vec<Wanted>, Vec<ObjectKey>) {
 
 /// Whether `w`'s routes still ask for a certificate for all its hosts in
 /// its Secret, as they did when it was ordered.
+/// The versions of the routes calling for `w`, for a write that holds only
+/// while they are unchanged; none while the managers' log may not hold
+/// such a write yet (protocol 2), or if they can't be read, which leaves
+/// the check to [`still_wanted`] alone.
+fn guard(store: &Store, w: &Wanted) -> Option<Vec<(ObjectKey, Option<u64>)>> {
+    if crate::upgrade::read(store) < 2 {
+        return None;
+    }
+    w.routes
+        .iter()
+        .map(|key| {
+            let version = store.get(key).ok()?.map(|o| o.metadata.version);
+            Some((key.clone(), version))
+        })
+        .collect()
+}
+
 fn still_wanted(store: &Store, w: &Wanted) -> bool {
     let Ok((now, _)) = wanted(store) else {
         return false;
@@ -522,7 +548,7 @@ impl Accounts {
                         .await
                         .map_err(|e| format!("creating an account at {}: {e}", acme.directory))?;
                 let json = serde_json::to_vec(&credentials).expect("credentials serialize");
-                put_secret(store, SYSTEM_NAMESPACE, &key.name, &json, None).await?;
+                put_secret(store, SYSTEM_NAMESPACE, &key.name, &json, None, None).await?;
                 account
             }
         };
@@ -743,13 +769,15 @@ fn read_secret(store: &Store, key: &ObjectKey) -> Result<Option<(Vec<u8>, u64)>,
 }
 
 /// Writes `value` into a Secret as it was at version `seen`, or created
-/// if it was not there: one changed since is not written over.
+/// if it was not there: one changed since is not written over, nor is it
+/// written once any of `guard` has moved from the version given.
 async fn put_secret(
     store: &Store,
     namespace: &str,
     name: &str,
     value: &[u8],
     seen: Option<u64>,
+    guard: Option<Vec<(ObjectKey, Option<u64>)>>,
 ) -> Result<(), String> {
     const CHANGED: &str = "it changed in the meantime, so it is not written over";
     let key = ObjectKey::new(Kind::Secret, namespace, name);
@@ -769,7 +797,18 @@ async fn put_secret(
         ),
         _ => return Err(CHANGED.into()),
     };
-    match write(store, object, precondition).await? {
+    let command = match guard {
+        Some(unchanged) => Command::Guarded {
+            object,
+            precondition,
+            unchanged,
+        },
+        None => Command::Put {
+            object,
+            precondition,
+        },
+    };
+    match propose(store, command).await? {
         Outcome::Written(_) => Ok(()),
         Outcome::Conflict { .. } => Err(CHANGED.into()),
         other => Err(format!("{key}: {other:?}")),
@@ -823,10 +862,17 @@ async fn write(
     object: Object,
     precondition: Precondition,
 ) -> Result<Outcome, String> {
-    let command = Command::Put {
-        object,
-        precondition,
-    };
+    propose(
+        store,
+        Command::Put {
+            object,
+            precondition,
+        },
+    )
+    .await
+}
+
+async fn propose(store: &Store, command: Command) -> Result<Outcome, String> {
     let out = tokio::time::timeout(crate::COMMIT_TIMEOUT, store.raft.client_write(command))
         .await
         .map_err(|_| crate::no_quorum().message().to_owned())?

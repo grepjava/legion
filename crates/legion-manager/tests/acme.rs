@@ -38,6 +38,11 @@ struct Running {
 
 impl Running {
     async fn start() -> Running {
+        Running::start_as(legion_api::protocol::Protocol::current()).await
+    }
+
+    /// A manager speaking `protocol`.
+    async fn start_as(protocol: legion_api::protocol::Protocol) -> Running {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_test_writer()
@@ -54,6 +59,7 @@ impl Running {
             },
             // The authority the tests run is on the loopback.
             acme_loopback: true,
+            protocol,
             ..ManagerConfig::new(dir.path(), &addr)
         })
         .await
@@ -675,4 +681,68 @@ async fn what_changes_during_an_order_is_not_written_over() {
 
     store.lock().unwrap().take();
     m.stop().await;
+}
+
+/// A route that changes between the last check and the certificate's write
+/// gets no certificate once the managers' log takes guarded writes
+/// (protocol 2): the write holds only while the routes calling for it are
+/// as they were. Before then, it did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_route_changed_as_its_certificate_is_written_gets_none() {
+    use legion_api::protocol::Protocol;
+    let one = Protocol {
+        speaks: 1,
+        oldest: 1,
+    };
+    for (protocol, written) in [(Protocol::current(), false), (one, true)] {
+        let store: Arc<Mutex<Option<Store>>> = Default::default();
+        let looked = store.clone();
+        let authority = Authority::start(Box::new(move |host, token| {
+            served(looked.lock().unwrap().as_ref()?, host, token)
+        }))
+        .await;
+        let m = Running::start_as(protocol).await;
+        *store.lock().unwrap() = Some(m.store.clone());
+        let floor = protocol.speaks.max(1);
+        until("the floor", || {
+            let key = ObjectKey::new(Kind::Config, legion_manager::SYSTEM_NAMESPACE, "protocol");
+            let now = m
+                .store
+                .get(&key)
+                .unwrap()
+                .and_then(|o| o.spec["text"].as_str().and_then(|t| t.parse().ok()))
+                .unwrap_or(1u32);
+            now == floor
+        })
+        .await;
+        let objects = ObjectsClient::new(m.channel().await);
+        let mut paused = legion_manager::hooks::arm("acme-write", "blog-cert");
+        let mut blog = route("blog.example.org", "/", &authority.directory());
+        blog["tls"]["secret"] = json!("blog-cert");
+        m.apply_route("blog", blog).await;
+        tokio::time::timeout(Duration::from_secs(30), paused.reached())
+            .await
+            .expect("the certificate about to be written");
+        objects
+            .clone()
+            .delete(DeleteRequest {
+                r#ref: Some(ObjectRef {
+                    kind: "Route".into(),
+                    namespace: "default".into(),
+                    name: "blog".into(),
+                }),
+                expected_version: None,
+            })
+            .await
+            .unwrap();
+        paused.release();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            m.secret("default", "blog-cert").is_some(),
+            written,
+            "speaking {protocol:?}"
+        );
+        store.lock().unwrap().take();
+        m.stop().await;
+    }
 }
