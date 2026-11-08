@@ -2,7 +2,7 @@
 //! only this crate's own tests turn on): a test arms a point for a key, and
 //! the next run through it stops there until the test lets it go.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use tokio::sync::oneshot;
@@ -58,4 +58,24 @@ pub(crate) async fn pause(point: &'static str, key: &str) {
         let _ = reached.send(());
         let _ = release.await;
     }
+}
+
+static LOST: Mutex<Option<HashSet<(&'static str, String)>>> = Mutex::new(None);
+
+/// Arms `point` for the next write through it for `key`: the write goes
+/// through, and its caller is told it failed, as when a reply is lost after
+/// the entry committed.
+pub fn lose_reply(point: &'static str, key: &str) {
+    LOST.lock()
+        .unwrap()
+        .get_or_insert_with(HashSet::new)
+        .insert((point, key.to_owned()));
+}
+
+/// Whether a test armed `point` for `key` to lose this write's reply.
+pub(crate) fn reply_lost(point: &'static str, key: &str) -> bool {
+    LOST.lock()
+        .unwrap()
+        .as_mut()
+        .is_some_and(|l| l.remove(&(point, key.to_owned())))
 }

@@ -1234,6 +1234,59 @@ async fn a_failed_join_leaves_the_names_certificate_good() {
     m.stop().await;
 }
 
+/// A record of the node whose write went through but whose reply was lost
+/// counts as written: a join goes on and its certificate is good, and a
+/// removal removes the node, rather than leave it refused while its Node
+/// stays (PLAN.md, phase 4: a supersede whose write outcome is unknown).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_whose_reply_was_lost_counts_as_written() {
+    let ca = Ca::generate().unwrap();
+    let m = Running::start_with(Some(&ca)).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let token = m
+        .cluster()
+        .await
+        .join_token(JoinTokenRequest {
+            role: "worker".into(),
+            rotate: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    legion_manager::hooks::lose_reply("removed-write", "w10");
+    let joined = legion_manager::join(&m.addr, &token, "w10", 0, "")
+        .await
+        .unwrap();
+    let creds = client_config(
+        &joined.tls.ca_pem,
+        &joined.tls.cert_pem,
+        &joined.tls.key_pem,
+    );
+    let register = || {
+        let creds = creds.clone();
+        let m = &m;
+        async move {
+            DispatcherClient::new(m.channel(Some(&creds)).await.unwrap())
+                .register(RegisterRequest {
+                    node: String::new(),
+                    status_json: br#"{"state":"ready"}"#.to_vec(),
+                    role: String::new(),
+                })
+                .await
+        }
+    };
+    register().await.unwrap();
+    assert_eq!(node_role(&m, "w10").as_deref(), Some("worker"));
+
+    legion_manager::hooks::lose_reply("removed-write", "w10");
+    m.objects().await.delete(delete_node("w10")).await.unwrap();
+    assert_eq!(node_role(&m, "w10"), None);
+    let err = register().await.unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied, "{err}");
+    m.stop().await;
+}
+
 /// The Delete request for Node `name`.
 fn delete_node(name: &str) -> DeleteRequest {
     DeleteRequest {

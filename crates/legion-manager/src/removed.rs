@@ -88,7 +88,7 @@ pub(crate) async fn issue_after(store: &Store, node: &str) -> Result<(), Status>
 /// the node cannot come back in between. Returns what [`forget`] needs to
 /// undo it.
 pub(crate) async fn record(api: &ApiService, node: &str) -> Result<Recorded, Status> {
-    change(api, |removed| {
+    change(api, node, |removed| {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -110,7 +110,7 @@ pub(crate) async fn record(api: &ApiService, node: &str) -> Result<Recorded, Sta
 /// any earlier record, even within a second, so the certificate a join
 /// issues the second after (see [`Recorded::at`]) is refused by the next.
 pub(crate) async fn supersede(api: &ApiService, node: &str) -> Result<Recorded, Status> {
-    change(api, |removed| {
+    change(api, node, |removed| {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -161,7 +161,7 @@ impl Recorded {
 /// it was recorded again since: an earlier removal stands, so certificates
 /// from before it stay refused.
 pub(crate) async fn forget(api: &ApiService, node: &str, r: Recorded) -> Result<(), Status> {
-    change(api, |removed| {
+    change(api, node, |removed| {
         if removed.get(node) != Some(&r.at) {
             return None;
         }
@@ -175,10 +175,14 @@ pub(crate) async fn forget(api: &ApiService, node: &str, r: Recorded) -> Result<
     .map(drop)
 }
 
-/// Writes the removals as `edit` leaves them, retried on conflicts; `edit`
-/// returning `None` writes nothing.
+/// Writes the removals as `edit` leaves them, for `node`, retried on
+/// conflicts; `edit` returning `None` writes nothing. A write whose outcome
+/// is unknown (no quorum in time, or leadership moved) may have gone
+/// through: once the store is current, the removals as written mean it did,
+/// so its caller can undo it, rather than leave a record it never heard of.
 async fn change<T>(
     api: &ApiService,
+    node: &str,
     mut edit: impl FnMut(&mut BTreeMap<String, u64>) -> Option<T>,
 ) -> Result<Option<T>, Status> {
     for _ in 0..10 {
@@ -197,13 +201,32 @@ async fn change<T>(
             serde_json::to_value(spec).expect("serializes"),
         );
         let precondition = version.map_or(Precondition::MustNotExist, Precondition::Version);
-        match api
+        let written = api
             .write(Command::Put {
                 object,
                 precondition,
             })
-            .await?
-        {
+            .await;
+        #[cfg(feature = "test-hooks")]
+        let written = match written {
+            Ok(Outcome::Written(_)) if crate::hooks::reply_lost("removed-write", node) => {
+                Err(Status::unavailable("the reply was lost (test-hooks)"))
+            }
+            w => w,
+        };
+        #[cfg(not(feature = "test-hooks"))]
+        let _ = node;
+        let written = match written {
+            Ok(w) => w,
+            Err(e) => {
+                api.consistent().await?;
+                if read(&api.store)?.0 == removed {
+                    return Ok(Some(done));
+                }
+                return Err(e);
+            }
+        };
+        match written {
             Outcome::Written(_) => return Ok(Some(done)),
             Outcome::Conflict { .. } => continue,
             other => return Err(Status::internal(format!("unexpected outcome {other:?}"))),
