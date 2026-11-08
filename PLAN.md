@@ -190,9 +190,10 @@ Goal: a tool can ask "is this node safe to stop?" and trust the answer.
 State, 8 November 2026: the drain status and `legion node drain --wait`
 are built (docs/DESIGN.md, Nodes). Its phases are `draining`, `blocked`
 and `completed`; there is no `failed`, as no condition found so far can't
-clear by itself. Not yet: why a running task waits (its budget, or its
-data), and the tests of interrupted transfers, a disconnected source and
-failover with a waiter, on the lab.
+clear by itself. A task still running says why: `data`, `budget` or
+`replacement`, as the planner decided that pass. Not yet: the tests of
+interrupted transfers, a disconnected source and failover with a waiter,
+on the lab.
 
 1. Add a persisted drain operation with `Draining`, `Blocked`, `Completed`
    and `Failed`, stable reason codes and per-workload progress. Reuse the
