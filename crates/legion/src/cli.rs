@@ -1379,6 +1379,12 @@ fn print_status(s: &StatusResponse) {
     );
     println!("term:     {}", s.term);
     println!("version:  {}", s.applied_version);
+    if s.protocol > 0 {
+        println!(
+            "protocol: {} (the managers' floor: {})",
+            s.protocol, s.protocol_floor
+        );
+    }
     if s.members.is_empty() {
         println!("members:  none (run `legion init`)");
     } else {

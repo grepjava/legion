@@ -1081,6 +1081,8 @@ impl ApiService {
             term: m.current_term,
             applied_version: self.store.applied_version().map_err(internal)?,
             members,
+            protocol: self.speaking.mine.speaks,
+            protocol_floor: crate::upgrade::read(&self.store),
         })
     }
 }

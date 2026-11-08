@@ -230,6 +230,10 @@ message StatusResponse {
   uint64 term = 4;
   uint64 applied_version = 5;
   repeated Member members = 6;
+  // The protocol this manager speaks, and the managers' floor as it last
+  // read it (legion_api::protocol); 0 from builds before the handshake.
+  uint32 protocol = 7;
+  uint32 protocol_floor = 8;
 }
 
 message Member {
