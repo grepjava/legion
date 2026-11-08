@@ -1505,7 +1505,11 @@ and the host checks shared with jailer, and is the first with every test in
 the manifest run, on the disposable VMs of `scripts/lab`. v0.1.14 has image
 identity: a deployment runs the digests its tags named when it was made, on
 every node, and a rollback runs the old ones; it fixes the stop and remove
-races jailer found. The port's `distinfo` is
+races jailer found. v0.1.15 has the partition contract
+(docs/PARTITIONS.md): `onPartition: stop` for pods that must not run twice,
+a leader cut off from the majority that answers no heartbeats, volumes held
+by orphaned tasks until their node says they stopped, and the drain status
+that `legion node drain --wait` follows. The port's `distinfo` is
 made for v0.1.13, and its crates are v0.1.9's, but it has not been through
 `poudriere testport` since v0.1.9. Waiting on the user: the port's
 submission, once their FreeBSD Bugzilla account exists.

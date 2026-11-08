@@ -1,6 +1,6 @@
 # Legion development roadmap
 
-Updated: 8 November 2026. Baseline: workspace version 0.1.14.
+Updated: 8 November 2026. Baseline: workspace version 0.1.15.
 
 This roadmap proposes future work based on a source review. It does not
 certify runtime behavior or replace the historical implementation tracker

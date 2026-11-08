@@ -1,6 +1,6 @@
 # Legion implementation plan
 
-Updated: 8 November 2026. Baseline: v0.1.14. Turns [ROADMAP.MD](ROADMAP.MD)
+Updated: 8 November 2026. Baseline: v0.1.15. Turns [ROADMAP.MD](ROADMAP.MD)
 into an order of work; what each milestone means stays there.
 
 The order: make test results trustworthy first, then settle what happens
