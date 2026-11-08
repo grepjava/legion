@@ -99,9 +99,11 @@ pub fn decode(
 /// `~/.docker/config.json` holds them: an entry with nothing usable (Docker
 /// Desktop's with `credsStore`, or an identity token alone) is passed over,
 /// and a lone username or password is taken with the other empty, as
-/// configs written by hand have it. Only a file that isn't a Docker config
-/// is refused. For logins a person keeps; a pod's pull secrets are read
-/// with [`docker_config`], which refuses what it can't use.
+/// configs written by hand have it. A config with settings and no logins,
+/// as Docker writes before any (`credsStore`, `proxies`), has none. Only a
+/// file that isn't a JSON object is refused. For logins a person keeps; a
+/// pod's pull secrets are read with [`docker_config`], which refuses what it
+/// can't use.
 pub fn docker_config_lenient(value: &[u8]) -> Result<Vec<Login>, String> {
     let not = |e: serde_json::Error| format!("not a Docker config: {e}");
     let mut v: serde_json::Value = serde_json::from_slice(value).map_err(not)?;
@@ -109,10 +111,14 @@ pub fn docker_config_lenient(value: &[u8]) -> Result<Vec<Login>, String> {
         Some(a) => a.take(),
         None => v,
     };
-    let auths: BTreeMap<String, Entry> = serde_json::from_value(auths).map_err(not)?;
+    // Without `auths`, the older form, whose other keys are settings: a
+    // value that is no entry is passed over, as an entry is that can't be
+    // used.
+    let auths: BTreeMap<String, serde_json::Value> = serde_json::from_value(auths).map_err(not)?;
     Ok(auths
         .into_iter()
         .filter_map(|(registry, e)| {
+            let e: Entry = serde_json::from_value(e).ok()?;
             let lone = |one: &Option<String>, other: &Option<String>| {
                 one.clone()
                     .or_else(|| other.as_ref().map(|_| String::new()))
@@ -199,6 +205,24 @@ mod tests {
             ]
         );
         assert!(docker_config_lenient(b"not json").is_err());
+        assert!(docker_config_lenient(b"{not json").is_err());
+        assert!(docker_config_lenient(b"[]").is_err());
+        // Settings and no logins, as Docker writes before any.
+        for none in [
+            "{}",
+            r#"{"auths": {}}"#,
+            r#"{"credsStore": "desktop"}"#,
+            r#"{"psFormat": "table {{.ID}}", "proxies": {"default": {"httpProxy": "http://p:3128"}}}"#,
+            r#"{"auths": {"ghcr.io": {}}, "credsStore": "desktop", "currentContext": "x"}"#,
+        ] {
+            assert_eq!(docker_config_lenient(none.as_bytes()), Ok(vec![]), "{none}");
+        }
+        // The older form still reads, beside settings.
+        let old = format!(r#"{{"quay.io": {{"auth": "{auth}"}}, "credsStore": "desktop"}}"#);
+        assert_eq!(
+            docker_config_lenient(old.as_bytes()).unwrap()[0].registry,
+            "quay.io"
+        );
     }
 
     #[test]
