@@ -178,8 +178,10 @@ after the read. Decision 3 is taken as recommended, and item 4 is
 built: `onPartition: stop` (docs/PARTITIONS.md). A volume used one node at
 a time stays held by an orphaned task until its node says the task
 stopped, and a node cut off with its agent running is tested through a
-link that goes silent. Left: an agent with only a cut-off manager, and
-item 5's statement for exclusive storage.
+link that goes silent. A leader cut off from the majority answers no
+heartbeats, so agents attached to it know they are cut off. Item 5 is a
+stated procedure: what to check before removing a node that holds data.
+Left before the phase's tag: a full qualification run of all this.
 
 ### Phase 5: Drain barrier
 

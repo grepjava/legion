@@ -82,11 +82,20 @@ Agents keep running their pods and retry. Tested: `minority_cannot_commit`
 and `leader_loss_and_rejoin` (the store), and
 `a_follower_cut_off_from_the_leader_opens_no_watch` (the API).
 
-Not tested: a leader cut off from the majority doesn't step down until it
-hears of a newer term. Until then it keeps running the controller, the image
-resolver, ACME, the volume migrator and the floating address. Their writes
-fail, after 30 s each, and nothing is known to go wrong from that, but no
-test shows it.
+A leader cut off from the majority doesn't step down until it hears of a
+newer term. Until then it keeps running the controller, the image resolver,
+ACME, the volume migrator and the floating address. Their writes fail,
+after 30 s each, and nothing is known to go wrong from that, but no test
+shows it.
+
+It does stop answering heartbeats. A leader answers one only if a majority
+of managers confirmed it leads within the shortest election timeout (5 s
+by default), the soonest the majority could elect another. Each period it
+asks them, and asks again for a heartbeat if they haven't answered lately.
+A follower forwards heartbeats to the leader, so one cut off from it
+answers none either. So an agent whose only manager is cut off from the
+majority knows it is cut off, as it would be from all of them. Tested:
+`a_leader_cut_off_from_a_majority_answers_no_heartbeats`.
 
 ## Removing a node
 
@@ -152,8 +161,9 @@ Where an old copy of a workload and its replacement can run at once today:
    runs. Removal is not fencing.
 4. **A node whose agent reaches only a cut-off manager.** Assignments are
    served from each manager's own copy of the store, so that agent keeps
-   what that copy says, and can't learn that its tasks were replaced.
-   Not tested.
+   what that copy says, and can't learn that its tasks were replaced. Its
+   heartbeats go unanswered, so pods with `onPartition: stop` stop, as on
+   any node cut off.
 
 A task bound to a volume used by one node at a time doesn't run twice
 during a split: its replacement waits for the volume.
@@ -211,9 +221,12 @@ planner), and `tasks_survive_losing_a_node` (agents in a real cluster).
 
 ## Not yet known
 
-Nothing found in the code is unaccounted for. No test yet leaves an agent
-with only a cut-off manager (the fourth way of running twice): that needs
-several managers and a link between them that can be cut.
+Nothing found in the code is unaccounted for. What isn't tested on several
+managers at once is the whole path: agents attached to a cut-off manager,
+and a new leader replacing their tasks. The parts are tested on their own:
+a cut-off leader answers no heartbeats, an agent whose heartbeats go
+unanswered stops its pods that must not run twice, and the managers wait
+before replacing them.
 
 ## What comes next
 
