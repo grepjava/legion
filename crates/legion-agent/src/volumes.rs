@@ -439,14 +439,21 @@ fn mount_iscsi(
         sys.iscsi_attach(&iscsi.portal, &iscsi.target).map_err(e)?;
     }
     let deadline = std::time::Instant::now() + ISCSI_WAIT;
-    let device = loop {
+    let (device, fs) = loop {
         let s = session(sys)?.ok_or("the iSCSI session went away")?;
         if s.connected()
             && let Some(device) = s.device(iscsi.lun)
         {
-            break format!("/dev/{device}");
-        }
-        if std::time::Instant::now() > deadline {
+            let device = format!("/dev/{device}");
+            // The session names its disk a moment before devfs has it.
+            match sys.fs_type(&device) {
+                Ok(fs) => break (device, fs),
+                Err(err)
+                    if err.to_string().contains("No such file or directory")
+                        && std::time::Instant::now() <= deadline => {}
+                Err(err) => return Err(e(err)),
+            }
+        } else if std::time::Instant::now() > deadline {
             let why = if !s.connected() {
                 format!(
                     "not connected after {}s ({}; is iscsid running?)",
@@ -464,7 +471,7 @@ fn mount_iscsi(
         }
         std::thread::sleep(Duration::from_millis(250));
     };
-    match sys.fs_type(&device).map_err(e)?.as_deref() {
+    match fs.as_deref() {
         Some("ufs") => {}
         Some(other) => {
             return Err(format!(

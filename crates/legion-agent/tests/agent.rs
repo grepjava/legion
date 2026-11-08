@@ -2288,6 +2288,8 @@ async fn network_volumes() {
     h.sys.add_iscsi_target(iqn, &[(0, "da0", Some("ufs"))]);
     // As the last node to use it left it, going down.
     h.sys.make_unclean("/dev/da0");
+    // Its device node comes a moment after the session names it.
+    h.sys.devices_late(3);
     let plugin = format!("{}/store", legion_agent::DEFAULT_PLUGIN_DIR);
     h.sys.add_plugin(&plugin);
     for (name, spec) in [

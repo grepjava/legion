@@ -557,8 +557,10 @@ fn network_storage() {
         let device = loop {
             let s = sys.iscsi_sessions().unwrap();
             let s = s.iter().find(|s| s.target == target).expect("a session");
+            // Named by the session a moment before devfs has it.
             if s.connected()
                 && let Some(d) = s.device(0)
+                && std::path::Path::new(&format!("/dev/{d}")).exists()
             {
                 break format!("/dev/{d}");
             }

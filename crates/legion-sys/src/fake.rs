@@ -91,6 +91,9 @@ struct State {
     /// Devices whose file system is unclean: mounted read-write only after
     /// a check.
     unclean: BTreeSet<String>,
+    /// Lookups of an attached iSCSI disk that find no device node yet, as
+    /// devfs makes it a moment after the session names it.
+    late_devices: u32,
     /// Programs that run as volume plugins: `mount <dir>` mounts something
     /// there, `unmount <dir>` unmounts it.
     plugins: BTreeSet<String>,
@@ -430,6 +433,13 @@ impl FakeSys {
                     .insert(format!("/dev/{device}"), (*fs).to_owned());
             }
         }
+    }
+
+    /// Makes the next `lookups` of an attached iSCSI disk's file system
+    /// find no device node, as devfs makes it a moment after the session
+    /// names it.
+    pub fn devices_late(&self, lookups: u32) {
+        self.state().late_devices = lookups;
     }
 
     /// Marks the file system on `device` (`/dev/da0`) unclean, as a crash
@@ -1510,13 +1520,20 @@ must destroy them to overwrite it"
     }
 
     fn fs_type(&self, device: &str) -> Result<Option<String>> {
-        let s = self.state();
+        let mut s = self.state();
         let attached = s
             .sessions
             .keys()
             .filter_map(|t| s.targets.get(t))
             .any(|luns| luns.values().any(|d| format!("/dev/{d}") == device));
         if !attached {
+            return Err(fail(
+                "fstyp",
+                format!("{device}: No such file or directory"),
+            ));
+        }
+        if s.late_devices > 0 {
+            s.late_devices -= 1;
             return Err(fail(
                 "fstyp",
                 format!("{device}: No such file or directory"),
