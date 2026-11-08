@@ -142,8 +142,9 @@ the rest: no task before its pod is resolved, and old tasks running while an
 update waits. Not shown on real hosts yet: a cluster of two architectures,
 as the lab is amd64 only. The live tests whose daemons reach Docker Hub
 (storage, exit, teams) now run their images by digest; the adopt test's
-daemon has no route out and uses `pullPolicy: never`. The tag waits for a
-full qualification run.
+daemon has no route out and uses `pullPolicy: never`. Released in
+v0.1.14, tagged on 8 November 2026 after a clean run of all 36 steps on
+`scripts/lab`.
 
 ### Phase 4: Multi-host and partitions
 
