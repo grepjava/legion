@@ -280,11 +280,22 @@ async fn pods_of_jails() {
     assert_eq!(rt.exec_exit_code(&attached.id).await.unwrap(), 0);
     // A command that writes and ends at once loses none of it, though its
     // terminal goes with it: once in a while it lost all of it.
-    for i in 0..20 {
+    // Before the fix, 300 lost the output within a few.
+    for i in 0..300 {
         let mut attached = rt
-            .exec_attach(&app, &["/bin/echo".into(), format!("run {i}")], false, true)
+            .exec_attach(
+                &app,
+                &[
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("test -t 0 && test -t 1 && echo isatty; echo run {i}"),
+                ],
+                false,
+                true,
+            )
             .await
             .unwrap();
+        let _ = rt.exec_resize(&attached.id, 100, 40).await;
         let mut seen = Vec::new();
         while let Some(c) = attached.output.next().await {
             seen.extend_from_slice(&c.unwrap().data);
