@@ -5,8 +5,9 @@
 //! Streams and reads are served from the local replica. Writes go to the
 //! leader, which a follower forwards them to, naming the node it acts for.
 //! Heartbeats go to the leader too: it alone tracks when each node was last
-//! heard from, and marks a node down after three silent periods. A new
-//! leader gives every node three periods from the moment it took over.
+//! heard from, and marks a node suspect after three silent periods and
+//! down after eight. A new leader gives every node eight periods from the
+//! moment it took over.
 //!
 //! A node sees only its own work: it reports on its own tasks, and reads the
 //! secrets and configs and claims the volumes its tasks use.

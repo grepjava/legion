@@ -57,7 +57,7 @@ pub struct ManagerConfig {
     /// `None` serves and calls plaintext: for tests.
     pub tls: Option<Tls>,
     /// How often agents send heartbeats; a node silent for three periods is
-    /// down. [`HEARTBEAT_PERIOD`] unless testing.
+    /// suspect, and for eight down. [`HEARTBEAT_PERIOD`] unless testing.
     pub heartbeat: std::time::Duration,
     /// Whether to run the controllers while leading; off only in tests that
     /// write tasks themselves.
