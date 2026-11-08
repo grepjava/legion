@@ -530,6 +530,8 @@ fn status(hostname: String, advertise: &str) -> NodeStatus {
         pod_cidr: None,
         // Filled in by the agent.
         wireguard: None,
+        // The leader's, kept by registration.
+        drain: None,
     }
 }
 

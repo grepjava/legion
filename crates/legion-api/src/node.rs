@@ -123,6 +123,55 @@ pub struct NodeStatus {
     /// How other nodes reach this one over the WireGuard mesh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wireguard: Option<WireGuard>,
+    /// Where its drain stands, written by the leader while the node's
+    /// availability is `drain`; registration keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain: Option<DrainStatus>,
+}
+
+/// Where a node's drain stands, as the leader last saw it: what still
+/// holds the node, each with a stable reason a tool can act on. Unknown
+/// never counts as released: a node that can't be reached, or a task
+/// orphaned there and not yet seen to stop, blocks the drain.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DrainStatus {
+    pub phase: DrainPhase,
+    /// Why it is blocked: `unreachable` (the node isn't ready, so what it
+    /// runs is unknown) or `unconfirmed` (a task orphaned there).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    /// What still holds the node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remaining: Vec<DrainItem>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DrainPhase {
+    /// Its tasks are moving off, and its data with them.
+    #[default]
+    Draining,
+    /// It can't go on by itself: see the reason.
+    Blocked,
+    /// Nothing runs on it and none of its data is moving: it may be
+    /// stopped.
+    Completed,
+}
+
+/// A task or Volume a drain waits for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DrainItem {
+    /// `Task` or `Volume`.
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    /// For a task: `running` (not yet told to stop: waiting its turn under
+    /// its service's disruption budget, or for its data to be copied),
+    /// `stopping`, or `unconfirmed` (orphaned, not yet seen to stop). For a
+    /// Volume: `copying` or `finishing`, as its data moves off.
+    pub reason: String,
 }
 
 /// A node's end of the WireGuard mesh.
