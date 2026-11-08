@@ -94,7 +94,13 @@ fn drain_line(node: &str, d: &legion_api::node::DrainStatus) -> String {
         let items: Vec<String> = d
             .remaining
             .iter()
-            .map(|r| format!("{} {}/{} {}", r.kind, r.namespace, r.name, r.reason))
+            .map(|r| {
+                let mut item = format!("{} {}/{} {}", r.kind, r.namespace, r.name, r.reason);
+                if !r.message.is_empty() {
+                    item.push_str(&format!(": {}", r.message));
+                }
+                item
+            })
             .collect();
         line.push_str(&format!(": {} left ({})", items.len(), items.join(", ")));
     }
@@ -1422,6 +1428,41 @@ pub async fn unlock(server: &str, key_file: Option<&Path>) -> anyhow::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_drain_line_says_what_is_left_and_why_a_move_failed() {
+        use legion_api::node::{DrainItem, DrainPhase, DrainStatus};
+        let item = |kind: &str, name: &str, reason: &str, message: &str| DrainItem {
+            kind: kind.into(),
+            namespace: "shop".into(),
+            name: name.into(),
+            reason: reason.into(),
+            message: message.into(),
+        };
+        let d = DrainStatus {
+            phase: DrainPhase::Draining,
+            reason: String::new(),
+            remaining: vec![
+                item("Task", "db-0-1", "data", ""),
+                item(
+                    "Volume",
+                    "data-db-0",
+                    "copying",
+                    "node n1: zfs send: Broken pipe",
+                ),
+            ],
+        };
+        assert_eq!(
+            drain_line("n1", &d),
+            "n1 draining: 2 left (Task shop/db-0-1 data, Volume shop/data-db-0 copying: node n1: zfs send: Broken pipe)"
+        );
+        let d = DrainStatus {
+            phase: DrainPhase::Blocked,
+            reason: "unreachable".into(),
+            remaining: vec![],
+        };
+        assert_eq!(drain_line("n1", &d), "n1 blocked (unreachable)");
+    }
 
     #[test]
     fn a_server_may_name_its_scheme() {

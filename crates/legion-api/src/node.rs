@@ -174,6 +174,10 @@ pub struct DrainItem {
     /// yet seen to stop). For a Volume: `copying` or `finishing`, as its
     /// data moves off.
     pub reason: String,
+    /// Why the last attempt failed, for a Volume whose move is tried
+    /// again (a transfer cut short, or a node not there to take part).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
 }
 
 /// A node's end of the WireGuard mesh.

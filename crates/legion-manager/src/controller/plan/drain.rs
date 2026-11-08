@@ -51,6 +51,7 @@ fn status(
             namespace: t.object.metadata.namespace.clone(),
             name: t.object.metadata.name.clone(),
             reason: reason.into(),
+            message: String::new(),
         });
     }
     for ((namespace, name), v) in volumes {
@@ -69,6 +70,7 @@ fn status(
             namespace: namespace.clone(),
             name: name.clone(),
             reason: reason.into(),
+            message: m.message.clone(),
         });
     }
     let reason = if n.status.state != NodeState::Ready {
