@@ -23,6 +23,7 @@ pub mod login;
 pub mod metrics;
 pub mod node;
 pub mod policy;
+pub mod protocol;
 pub mod quantity;
 pub mod quota;
 pub mod rbac;
