@@ -112,6 +112,7 @@ struct State {
     /// Commands that fail once, the next time they run.
     failing: BTreeSet<String>,
     before_clone: Option<Hook>,
+    before_send: Option<Hook>,
     before_unmount: Option<Hook>,
     /// Mount points something still holds (a dying jail its root): a
     /// dataset mounted there is busy until the path is unmounted, by force.
@@ -361,7 +362,9 @@ impl FakeSys {
     }
 
     /// Makes `command` fail the next time it runs. Only some honour it:
-    /// `pfctl -ss`, `pfctl -k`, `rctl -a` and `zfs destroy -r`.
+    /// `pfctl -ss`, `pfctl -k`, `rctl -a`, `zfs destroy -r`, `zfs send`
+    /// (after part of the stream, as one cut short) and `zfs receive`
+    /// (after taking the stream in).
     pub fn fail_next(&self, command: &str) {
         self.state().failing.insert(command.to_owned());
     }
@@ -370,6 +373,11 @@ impl FakeSys {
     /// a process killed there would leave.
     pub fn before_clone(&self, f: impl FnOnce() + Send + 'static) {
         self.state().before_clone = Some(Hook(Box::new(f)));
+    }
+
+    /// Runs `f` as the next `zfs send` starts.
+    pub fn before_send(&self, f: impl FnOnce() + Send + 'static) {
+        self.state().before_send = Some(Hook(Box::new(f)));
     }
 
     /// Runs `f` as the next unmount starts, as another process would that
@@ -1367,8 +1375,13 @@ impl Sys for FakeSys {
         since: Option<&str>,
         out: &mut dyn std::io::Write,
     ) -> Result<()> {
-        let (header, data) = {
-            let s = self.state();
+        let hook = self.state().before_send.take();
+        if let Some(Hook(f)) = hook {
+            f();
+        }
+        let (header, data, cut) = {
+            let mut s = self.state();
+            let cut = s.failing.remove("zfs send");
             let fail_send = |m: String| fail("zfs send", m);
             let (ds, name) = snapshot
                 .split_once('@')
@@ -1388,8 +1401,15 @@ impl Sys for FakeSys {
             (
                 format!("fakezfs {name} {}\n", since.unwrap_or("-")),
                 s.contents.get(snapshot).cloned().unwrap_or_default(),
+                cut,
             )
         };
+        if cut {
+            let _ = out
+                .write_all(header.as_bytes())
+                .and_then(|()| out.write_all(&data[..data.len() / 2]));
+            return Err(fail("zfs send", "Broken pipe".to_owned()));
+        }
         out.write_all(header.as_bytes())
             .and_then(|()| out.write_all(&data))
             .map_err(|e| fail("zfs send", e.to_string()))
@@ -1400,6 +1420,9 @@ impl Sys for FakeSys {
         input
             .read_to_end(&mut stream)
             .map_err(|e| fail("zfs receive", e.to_string()))?;
+        if self.state().failing.remove("zfs receive") {
+            return Err(fail("zfs receive", "I/O error".to_owned()));
+        }
         let bad = || fail("zfs receive", "invalid backup stream".to_owned());
         let end = stream.iter().position(|b| *b == b'\n').ok_or_else(bad)?;
         let header = String::from_utf8_lossy(&stream[..end]).into_owned();
