@@ -57,6 +57,30 @@ networks:
   front: {}
 "#;
 
+#[test]
+fn pull_policies() {
+    let stack = convert_with(
+        r#"
+services:
+  held: { image: "app:1", pull_policy: never }
+  fresh: { image: "app:1", pull_policy: always }
+  built: { image: "app:1", pull_policy: build }
+"#,
+        &[],
+    )
+    .unwrap();
+    let policy = |name: &str| spec(&stack, name).pod.containers[0].pull_policy;
+    assert_eq!(policy("held"), crate::image::PullPolicy::Never);
+    assert_eq!(policy("fresh"), crate::image::PullPolicy::Resolve);
+    assert_eq!(policy("built"), crate::image::PullPolicy::Resolve);
+    let warnings = stack.warnings.join("\n");
+    assert!(
+        warnings.contains("services.built.pull_policy: build not supported"),
+        "{warnings}"
+    );
+    assert!(!warnings.contains("services.fresh"), "{warnings}");
+}
+
 fn convert_with(yaml: &str, env: &[(&str, &str)]) -> Result<Stack, String> {
     let env: BTreeMap<String, String> = env
         .iter()

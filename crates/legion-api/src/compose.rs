@@ -368,6 +368,17 @@ impl Converter<'_> {
             let at = format!("{path}.{k}");
             match k.as_str() {
                 "image" => {}
+                "pull_policy" => match scalar(val).as_str() {
+                    "never" => {
+                        container.insert("pullPolicy".into(), json!("never"));
+                    }
+                    // Legion resolves the tag at deployment and pulls only
+                    // what a node lacks: "always" and "missing" alike.
+                    "always" | "missing" | "if_not_present" | "daily" | "weekly" => {}
+                    other => self.warn(format!(
+                        "{at}: {other} not supported (Legion does not build images), ignored"
+                    )),
+                },
                 "command" => {
                     container.insert("args".into(), json!(words(val, &at)?));
                 }
@@ -516,7 +527,7 @@ impl Converter<'_> {
                 "container_name" | "hostname" | "labels" | "logging" | "init" | "stop_signal"
                 | "tty" | "stdin_open" | "read_only" | "shm_size" | "dns" | "dns_search"
                 | "extra_hosts" | "domainname" | "mac_address" | "platform" | "profiles"
-                | "pull_policy" | "external_links" | "links" | "ulimits" | "sysctls" => {
+                | "external_links" | "links" | "ulimits" | "sysctls" => {
                     self.warn(format!("{at}: not supported, ignored"))
                 }
                 k if k.starts_with("x-") => {}
