@@ -418,6 +418,16 @@ async fn tasks_survive_losing_a_node() {
     c.start_agent(1);
     c.eventually_node_ready("n2").await;
     eventually("the lost pod removed", async || c.pods(1).is_empty()).await;
+    // And says the orphan stopped, so what waits for it can go on.
+    let orphaned = orphan.metadata.name.clone();
+    eventually("the orphan reported stopped", async || {
+        c.list(Kind::Task).await.iter().any(|t| {
+            t.metadata.name == orphaned
+                && t.status["state"] == "shutdown"
+                && t.status["message"] == "not running on its node once back"
+        })
+    })
+    .await;
     eventually("n2 balances over the tasks", async || {
         c.table(1, &uid) == now
     })

@@ -1127,6 +1127,27 @@ async fn reconcile<R: Runtime, C: Control>(
         });
     }
 
+    // A task the managers orphaned while this node was cut off, with no
+    // worker and nothing of it left here: say it stopped, as it has, so a
+    // volume it used goes on to the next (docs/PARTITIONS.md). One with
+    // something left says so once that is removed, at the next reconcile.
+    for (uid, a) in assignments {
+        if a.status.state == TaskState::Orphaned
+            && !workers.contains_key(uid)
+            && !cleaning.contains(uid)
+        {
+            let (ctx, a) = (ctx.clone(), a.clone());
+            tokio::spawn(async move {
+                let status = TaskStatus {
+                    state: TaskState::Shutdown,
+                    message: "not running on its node once back".into(),
+                    ..TaskStatus::default()
+                };
+                task::report(&ctx, &a, &status).await;
+            });
+        }
+    }
+
     // Kept output goes with its task.
     if let Some(root) = ctx.logs_dir.clone() {
         let known: BTreeSet<String> = assignments
