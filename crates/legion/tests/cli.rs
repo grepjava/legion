@@ -721,6 +721,121 @@ spec: {}
     assert!(said.contains("n2 blocked (unreachable)"), "{said}");
 }
 
+/// Joins another manager to `first`'s cluster and starts it, as voter.
+fn join_manager(first: &Daemon, name: &str) -> Daemon {
+    let token = ok(first, &["join-token", "manager"]).trim().to_owned();
+    let dir = tempfile::tempdir().unwrap();
+    let addr = free_addr();
+    let out = Command::new(LEGION)
+        .args(["join", &token, "--manager", &first.server, "--advertise"])
+        .arg(&addr)
+        .args(["--node-name", name, "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    start_daemon_in(dir, addr)
+}
+
+/// A drain waiter asking through a follower rides out the leader's loss:
+/// it keeps asking through the election, and hears the new leader.
+#[test]
+fn a_drain_waiter_survives_the_leaders_loss() {
+    let first = start_daemon();
+    ok(&first, &["init"]);
+    let mut managers = vec![first];
+    for name in ["m2", "m3"] {
+        let m = join_manager(&managers[0], name);
+        managers.push(m);
+    }
+    let voters = |d: &Daemon| ok(d, &["status"]).matches("voter").count();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while voters(&managers[0]) < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "{}",
+            ok(&managers[0], &["status"])
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let leads = |d: &Daemon| ok(d, &["status"]).contains("state:    Leader");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let leader = loop {
+        if let Some(i) = managers.iter().position(|m| leads(m)) {
+            break i;
+        }
+        assert!(Instant::now() < deadline, "no leader");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let (asked, other) = match leader {
+        0 => (1, 2),
+        1 => (0, 2),
+        _ => (0, 1),
+    };
+
+    let manifest = managers[asked]._dir.path().join("node.yaml");
+    std::fs::write(
+        &manifest,
+        "apiVersion: legion/v1
+kind: Node
+metadata: { name: n2 }
+spec: {}
+",
+    )
+    .unwrap();
+    ok(
+        &managers[asked],
+        &["apply", "-f", manifest.to_str().unwrap()],
+    );
+    let waiting = Command::new(LEGION)
+        .arg("--server")
+        .arg(&managers[asked].server)
+        .arg("--identity")
+        .arg(managers[asked]._dir.path().join("admin.pem"))
+        .args(["node", "drain", "n2", "--wait"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The node never came up: blocked, as the first leader wrote.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !ok(&managers[asked], &["get", "node", "n2", "-o", "json"]).contains("unreachable") {
+        assert!(Instant::now() < deadline, "no drain status");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // The leader goes; the waiter keeps asking while the others elect.
+    let gone = managers.remove(leader);
+    drop(gone);
+    let (asked, other) = (
+        asked - usize::from(asked > leader),
+        other - usize::from(other > leader),
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !legion(&managers[other], &["node", "activate", "n2"])
+        .status
+        .success()
+    {
+        assert!(Instant::now() < deadline, "no new leader");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let out = waiting.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no longer draining"), "{err}");
+    // And the new leader took the drain status away.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while ok(&managers[asked], &["get", "node", "n2", "-o", "json"]).contains("\"drain\"") {
+        assert!(Instant::now() < deadline, "drain status kept");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 #[test]
 fn a_volume_is_asked_to_move() {
     let d = start_daemon();
