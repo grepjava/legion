@@ -133,6 +133,17 @@ Exit: a tag moved between two nodes' pulls can't produce an unnoticed mix,
 rollback still works after a tag changes, and private registry details stay
 out of status and logs. Tag a release so jailer can start its image handoff.
 
+State, 8 November 2026: steps 1 to 4 are in, on main once qualified. For the
+exit, `a_deployment_runs_what_its_tags_named_then` (legion-manager's API
+tests) runs the resolver against a registry with a login: scaling keeps the
+digest after the tag moves, an update takes the new one, a rollback the old
+one, and the password appears in no status or task. The plan's tests cover
+the rest: no task before its pod is resolved, and old tasks running while an
+update waits. Not shown on real hosts yet: a cluster of two architectures,
+as the lab is amd64 only, and pins from a registry on a live node (the lab's
+tests pull public images, now by digest). The tag waits for a full
+qualification run.
+
 ### Phase 4: Multi-host and partitions
 
 Goal: a written contract for a split cluster, with tests showing it's true.
