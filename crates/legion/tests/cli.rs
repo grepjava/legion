@@ -663,6 +663,64 @@ fn a_manager_is_restored_from_a_backup_and_from_its_own_store() {
     assert_eq!(kept, 2, "both old stores kept");
 }
 
+/// `node drain --wait` follows the drain (PLAN.md, phase 5): a node never
+/// heard from blocks it, so the wait times out with 2 and says why; a
+/// drain cancelled meanwhile ends the wait with 1.
+#[test]
+fn a_drain_is_waited_for() {
+    let d = start_daemon();
+    ok(&d, &["init"]);
+    let manifest = d._dir.path().join("node.yaml");
+    std::fs::write(
+        &manifest,
+        "apiVersion: legion/v1
+kind: Node
+metadata: { name: n2 }
+spec: {}
+",
+    )
+    .unwrap();
+    ok(&d, &["apply", "-f", manifest.to_str().unwrap()]);
+
+    let out = legion(
+        &d,
+        &[
+            "node",
+            "drain",
+            "n2",
+            "--wait",
+            "--timeout",
+            "8",
+            "-o",
+            "json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let last: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(last["node"], "n2", "{last}");
+    assert_eq!(last["phase"], "blocked", "{last}");
+    assert_eq!(last["reason"], "unreachable", "{last}");
+
+    let waiting = Command::new(LEGION)
+        .arg("--server")
+        .arg(&d.server)
+        .arg("--identity")
+        .arg(d._dir.path().join("admin.pem"))
+        .args(["node", "drain", "n2", "--wait"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    ok(&d, &["node", "activate", "n2"]);
+    let out = waiting.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no longer draining"), "{err}");
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.contains("n2 blocked (unreachable)"), "{said}");
+}
+
 #[test]
 fn a_volume_is_asked_to_move() {
     let d = start_daemon();

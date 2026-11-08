@@ -363,7 +363,22 @@ pub enum ImageCommand {
 pub enum NodeCommand {
     /// Move the node's tasks elsewhere (and stateful tasks' Volumes with
     /// them), and place no new ones there.
-    Drain { node: String },
+    Drain {
+        node: String,
+        /// Wait until nothing runs on the node and none of its data is
+        /// moving, printing what is left as it changes. Exits 0 once the
+        /// drain completes, 2 if --timeout passes first, and 1 if the drain
+        /// is cancelled meanwhile (`legion node activate`).
+        #[arg(long)]
+        wait: bool,
+        /// With --wait: give up after this many seconds.
+        #[arg(long, requires = "wait")]
+        timeout: Option<u64>,
+        /// With --wait: `json` prints only the drain's last status, as the
+        /// node's `status.drain` has it, with the node's name.
+        #[arg(short, long, value_enum, default_value_t = cli::Format::Table, requires = "wait")]
+        output: cli::Format,
+    },
     /// Keep the node's tasks but place no new ones there.
     Pause { node: String },
     /// Undo a drain or a pause.

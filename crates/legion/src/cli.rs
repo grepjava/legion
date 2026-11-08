@@ -22,6 +22,85 @@ use crate::{Command, StackCommand, UserCommand};
 /// an election, or while a manager waits on a quorum (DESIGN.md §3.8).
 const RETRY_FOR: Duration = Duration::from_secs(30);
 
+/// Follows a node's drain until it completes (0), `deadline` passes (2),
+/// or the node is no longer draining (1): printing what is left as it
+/// changes, or with `json` only the last status. Read from whichever
+/// manager answers, so a new leader's word counts as the old one's did.
+async fn wait_for_drain(
+    mut objects: Objects,
+    r#ref: ObjectRef,
+    deadline: Option<tokio::time::Instant>,
+    json: bool,
+) -> anyhow::Result<i32> {
+    use legion_api::node::{Availability, DrainPhase, DrainStatus, NodeSpec, NodeStatus};
+    let name = r#ref.name.clone();
+    let mut last: Option<DrainStatus> = None;
+    loop {
+        let o = Object::try_from(objects.get(r#ref.clone()).await?.into_inner())
+            .map_err(|e| anyhow::anyhow!("node {name}: {e}"))?;
+        let spec: NodeSpec =
+            legion_api::parse(&o.spec).map_err(|e| anyhow::anyhow!("node {name}: {e}"))?;
+        let status: NodeStatus = serde_json::from_value(o.status).unwrap_or_default();
+        let done = |code: i32, drain: &Option<DrainStatus>| -> anyhow::Result<i32> {
+            if json {
+                let mut v = serde_json::to_value(drain)?;
+                if let Some(m) = v.as_object_mut() {
+                    m.insert("node".into(), name.clone().into());
+                }
+                println!("{v}");
+            }
+            Ok(code)
+        };
+        if spec.availability != Availability::Drain {
+            if !json {
+                eprintln!("node {name} is no longer draining");
+            }
+            return done(1, &status.drain);
+        }
+        if status.drain != last {
+            if let (Some(d), false) = (&status.drain, json) {
+                println!("{}", drain_line(&name, d));
+            }
+            last = status.drain.clone();
+        }
+        if last
+            .as_ref()
+            .is_some_and(|d| d.phase == DrainPhase::Completed)
+        {
+            return done(0, &last);
+        }
+        if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+            if !json {
+                eprintln!("node {name}: timed out waiting for the drain");
+            }
+            return done(2, &last);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// One line on where a drain stands: `n2 draining: 2 left (Task shop/web-2-1
+/// stopping, Volume shop/data copying)`.
+fn drain_line(node: &str, d: &legion_api::node::DrainStatus) -> String {
+    let phase = serde_json::to_value(d.phase)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let mut line = format!("{node} {phase}");
+    if !d.reason.is_empty() {
+        line.push_str(&format!(" ({})", d.reason));
+    }
+    if !d.remaining.is_empty() {
+        let items: Vec<String> = d
+            .remaining
+            .iter()
+            .map(|r| format!("{} {}/{} {}", r.kind, r.namespace, r.name, r.reason))
+            .collect();
+        line.push_str(&format!(": {} left ({})", items.len(), items.join(", ")));
+    }
+    line
+}
+
 /// Calls `call` again while it fails as unavailable, for up to
 /// [`RETRY_FOR`].
 async fn retrying<T, Fut>(mut call: impl FnMut() -> Fut) -> Result<T, tonic::Status>
@@ -506,9 +585,39 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 (key, false) => println!("{key} already has those labels"),
             }
         }
+        Command::Node {
+            command:
+                crate::NodeCommand::Drain {
+                    node,
+                    wait: true,
+                    timeout,
+                    output,
+                },
+        } => {
+            let r#ref = ObjectRef {
+                kind: Kind::Node.to_string(),
+                namespace: String::new(),
+                name: node.clone(),
+            };
+            let json = matches!(output, Format::Json);
+            let (key, changed) = objects
+                .set_spec(r#ref.clone(), "availability", "drain".into())
+                .await?;
+            if !json {
+                match changed {
+                    true => println!("{key} drain"),
+                    false => println!("{key} is already drain"),
+                }
+            }
+            let deadline = timeout.map(|s| tokio::time::Instant::now() + Duration::from_secs(s));
+            let code = wait_for_drain(objects.clone(), r#ref, deadline, json).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
         Command::Node { command } => {
             let (availability, node) = match command {
-                crate::NodeCommand::Drain { node } => ("drain", node),
+                crate::NodeCommand::Drain { node, .. } => ("drain", node),
                 crate::NodeCommand::Pause { node } => ("pause", node),
                 crate::NodeCommand::Activate { node } => ("active", node),
                 crate::NodeCommand::Label { .. } => unreachable!("handled above"),
