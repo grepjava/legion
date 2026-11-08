@@ -12,7 +12,9 @@
 //! the next pass starts another if one is still needed. What the dropped
 //! one's new node received is left over, for the migrator to drop. One
 //! whose old node is removed after the full copy ends there: that copy is
-//! the Volume. One whose old node is down waits for it.
+//! the Volume. One whose old node is down waits for it, and so does one
+//! whose task was orphaned there before the copy finished: until the node
+//! says the task stopped, its pod may still be writing.
 
 use std::collections::BTreeMap;
 
@@ -62,6 +64,7 @@ pub(super) fn migrations(
         Some(s) => holds(s, to),
         None => usable(to),
     };
+    let orphaned = super::held_by_orphans(tasks, nodes, volumes);
     // Requests placed on each node.
     let mut load: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
     for t in tasks.iter().filter(|t| t.placed()) {
@@ -131,6 +134,7 @@ pub(super) fn migrations(
             && !tasks.iter().any(|t| {
                 t.placed() && t.object.metadata.namespace == *namespace && t.spec.uses_volume(name)
             })
+            && !orphaned.contains(&(namespace.clone(), name.clone()))
         {
             Some(Migration {
                 phase: MigrationPhase::Finishing,

@@ -1483,6 +1483,7 @@ fn tasks_go_where_their_volume_is() {
     );
     w.settle();
     assert_eq!(w.placed("db"), ["n2"]);
+    let old = w.placed_task_on("db", "n2");
 
     // Its node lost, it waits for it.
     w.state("n2", NodeState::Down);
@@ -1497,7 +1498,21 @@ fn tasks_go_where_their_volume_is() {
         pending.status.message,
         "no node can run it: 1 not ready, 1 volume on another node"
     );
+    // Back, the node may still run the old pod on the volume: the next
+    // waits until the node says it stopped.
     w.state("n2", NodeState::Ready);
+    w.settle();
+    assert!(w.placed("db").is_empty());
+    let pending = w
+        .tasks
+        .iter()
+        .find(|t| t.status.state == TaskState::Pending)
+        .unwrap();
+    assert_eq!(
+        pending.status.message,
+        "no node can run it: 1 volume held by an orphaned task, 1 volume on another node"
+    );
+    w.end(&old, TaskState::Shutdown);
     w.settle();
     assert_eq!(w.placed("db"), ["n2"]);
 }
@@ -4259,6 +4274,40 @@ fn stateful_data_goes_only_where_its_task_may_run() {
     assert_eq!(w.migration("data-db-0"), None);
     assert_eq!(w.volume_node("data-db-0"), "n1");
     assert_eq!(w.placed("db"), ["n1"]);
+}
+
+/// A move copied while its task ran, whose node is lost before the task
+/// was seen to stop: the pod may still write there, so the move doesn't
+/// finish until the node is back and says the task stopped.
+#[test]
+fn a_move_waits_for_a_task_orphaned_before_it_was_seen_to_stop() {
+    use legion_api::volume::MigrationPhase::*;
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.service("db", &STATEFUL.replace("replicas: 3", "replicas: 1"));
+    w.settle();
+    let from = w.placed_task("db-0-1").spec.node.clone();
+    let to = if from == "n1" { "n2" } else { "n1" };
+    w.ask("data-db-0", Some(to));
+    w.settle();
+    w.migrate();
+    assert_eq!(w.migration("data-db-0"), Some((to.to_owned(), Copied)));
+    // Cut off before its agent stops the task.
+    w.agents = false;
+    w.state(&from, NodeState::Down);
+    w.step();
+    w.step();
+    assert_eq!(w.placed_task("db-0-1").status.state, TaskState::Orphaned);
+    assert_eq!(w.migration("data-db-0"), Some((to.to_owned(), Copied)));
+    w.state(&from, NodeState::Ready);
+    w.step();
+    assert_eq!(w.migration("data-db-0"), Some((to.to_owned(), Copied)));
+    // The node says it stopped: the move finishes.
+    w.agents = true;
+    w.end("db-0-1", TaskState::Shutdown);
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some((to.to_owned(), Finishing)));
 }
 
 #[test]

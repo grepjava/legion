@@ -1527,6 +1527,34 @@ fn unrequested<'a>(quota: &Quota, pod: &'a PodSpec) -> Option<(&'a str, &'static
     })
 }
 
+/// Volumes used one node at a time that a task orphaned on a node still in
+/// the cluster used: its pod may still run there, cut off, until the node
+/// is back and says it stopped, or is removed (docs/PARTITIONS.md). Until
+/// then no other task takes them, and no move of theirs finishes.
+pub(super) fn held_by_orphans(
+    tasks: &[Task],
+    nodes: &[Node],
+    volumes: &Volumes,
+) -> BTreeSet<(String, String)> {
+    tasks
+        .iter()
+        .filter(|t| {
+            t.status.state == TaskState::Orphaned && nodes.iter().any(|n| n.name() == t.spec.node)
+        })
+        .flat_map(|t| {
+            t.spec
+                .volumes()
+                .into_iter()
+                .map(|v| (t.object.metadata.namespace.clone(), v))
+        })
+        .filter(|k| {
+            volumes
+                .get(k)
+                .is_some_and(|v| v.spec.access() != Access::Shared)
+        })
+        .collect()
+}
+
 /// Places pending tasks: hold those their namespace's quota has no room
 /// for, filter nodes (eligible, requests fit), then prefer a node without
 /// an untolerated `PreferNoSchedule` taint, then one whose group under
@@ -1581,6 +1609,7 @@ fn schedule(
         .chain(created.into_iter().map(|t| (t, None)))
         .collect();
 
+    let orphaned = held_by_orphans(tasks, nodes, volumes);
     // Volumes one node at a time may have, not yet on one, that a placed
     // task took, in this pass or before its node claimed them: other
     // tasks of theirs go to the same node.
@@ -1655,6 +1684,16 @@ fn schedule(
                     .is_some_and(|node| node != name)
             }) {
                 *reasons.entry("volume on another node").or_default() += 1;
+                continue;
+            }
+            if t.spec
+                .volumes()
+                .into_iter()
+                .any(|v| orphaned.contains(&(namespace.clone(), v)))
+            {
+                *reasons
+                    .entry("volume held by an orphaned task")
+                    .or_default() += 1;
                 continue;
             }
             let l = load.get(name).cloned().unwrap_or_default();
