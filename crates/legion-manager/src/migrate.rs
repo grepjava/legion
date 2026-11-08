@@ -48,12 +48,33 @@ struct Failures {
     phase: MigrationPhase,
     count: u32,
     last: Instant,
+    /// The nodes of the move not ready at the last failure: once one is
+    /// back, the next attempt starts at once, the wait being for it.
+    away: Vec<String>,
 }
 
 impl Failures {
     fn of(&self, m: &Migration) -> bool {
         self.to == m.to && self.phase == m.phase
     }
+
+    /// Whether the next attempt waits still, with `ready` the nodes ready
+    /// now.
+    fn waiting(&self, ready: &HashSet<String>) -> bool {
+        self.last.elapsed() < backoff(self.count) && !self.away.iter().any(|n| ready.contains(n))
+    }
+}
+
+/// The nodes ready now; none if they can't be read.
+fn ready_nodes(store: &Store) -> HashSet<String> {
+    let Ok(list) = store.list(Kind::Node, None) else {
+        return HashSet::new();
+    };
+    list.objects
+        .into_iter()
+        .filter(|o| o.status["state"] == "ready")
+        .map(|o| o.metadata.name)
+        .collect()
 }
 /// How long a transfer may go without a frame.
 const IDLE: Duration = Duration::from_secs(120);
@@ -99,7 +120,8 @@ async fn lead(store: &Store, hub: &Arc<Hub>) {
     // word to stop. What a migration called off left on its new node is
     // among the Volume's leftovers, written by the controller.
     let mut running: HashMap<ObjectKey, (Migration, Option<watch::Sender<bool>>)> = HashMap::new();
-    let mut tasks: JoinSet<(ObjectKey, Migration, Result<(), String>)> = JoinSet::new();
+    // Each transfer's Volume, migration, node it moves from, and outcome.
+    let mut tasks: JoinSet<(ObjectKey, Migration, String, Result<(), String>)> = JoinSet::new();
     let mut failed: HashMap<ObjectKey, Failures> = HashMap::new();
     // Old copies being dropped, and when a drop last failed.
     let mut drops: JoinSet<(ObjectKey, String, Result<(), String>)> = JoinSet::new();
@@ -107,7 +129,9 @@ async fn lead(store: &Store, hub: &Arc<Hub>) {
     let mut drop_failed: HashMap<(ObjectKey, String), Instant> = HashMap::new();
     loop {
         while let Some(done) = tasks.try_join_next() {
-            let Ok((key, m, result)) = done else { continue };
+            let Ok((key, m, from, result)) = done else {
+                continue;
+            };
             running.remove(&key);
             match result {
                 Err(e) => {
@@ -116,12 +140,18 @@ async fn lead(store: &Store, hub: &Arc<Hub>) {
                         phase: m.phase,
                         count: 0,
                         last: Instant::now(),
+                        away: Vec::new(),
                     });
                     if !f.of(&m) {
                         (f.to, f.phase, f.count) = (m.to.clone(), m.phase, 0);
                     }
                     f.count += 1;
                     f.last = Instant::now();
+                    let ready = ready_nodes(store);
+                    f.away = [from, m.to.clone()]
+                        .into_iter()
+                        .filter(|n| !ready.contains(n))
+                        .collect();
                     let next = backoff(f.count);
                     tracing::warn!(volume = %key, to = %m.to, attempt = f.count, "moving the volume: {e}");
                     let why = format!("{e} (attempt {}; the next in {}s)", f.count, next.as_secs());
@@ -199,6 +229,8 @@ async fn lead(store: &Store, hub: &Arc<Hub>) {
                 dropping.insert(at);
             }
         }
+        // A move waiting on a node that is back goes at once.
+        let ready = ready_nodes(store);
         for v in volumes {
             let key = v.key();
             let status = statuses[&key].clone();
@@ -209,13 +241,13 @@ async fn lead(store: &Store, hub: &Arc<Hub>) {
                 || running.contains_key(&key)
                 || failed
                     .get(&key)
-                    .is_some_and(|f| f.of(&m) && f.last.elapsed() < backoff(f.count))
+                    .is_some_and(|f| f.of(&m) && f.waiting(&ready))
                 || moves_through_a_drop(&key, &status.node, &m, &dropping)
             {
                 continue;
             }
             let (store, hub) = (store.clone(), hub.clone());
-            let (k, started) = (key.clone(), m.clone());
+            let (k, started, from) = (key.clone(), m.clone(), status.node.clone());
             let (cancel, mut cancelled) = watch::channel(false);
             tasks.spawn(async move {
                 let result = tokio::select! {
@@ -223,7 +255,7 @@ async fn lead(store: &Store, hub: &Arc<Hub>) {
                     // What the new node received is a leftover now.
                     _ = cancelled.changed() => Ok(()),
                 };
-                (k, started, result)
+                (k, started, from, result)
             });
             running.insert(key, (m, Some(cancel)));
         }
@@ -584,6 +616,23 @@ mod tests {
         let waits: Vec<u64> = (1..=8).map(|n| backoff(n).as_secs()).collect();
         assert_eq!(waits, [5, 10, 20, 40, 80, 160, 300, 300]);
         assert_eq!(backoff(u32::MAX), RETRY_MAX);
+    }
+
+    #[test]
+    fn a_move_waiting_on_a_node_goes_once_it_is_back() {
+        let f = Failures {
+            to: "n2".into(),
+            phase: MigrationPhase::Copying,
+            count: 6,
+            last: Instant::now(),
+            away: vec!["n1".into()],
+        };
+        let ready = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect();
+        assert!(f.waiting(&ready(&["n2", "n3"])));
+        assert!(!f.waiting(&ready(&["n1", "n2"])));
+        // Failed with both nodes there: the wait is the backoff's.
+        let f = Failures { away: vec![], ..f };
+        assert!(f.waiting(&ready(&["n1", "n2"])));
     }
 
     #[test]

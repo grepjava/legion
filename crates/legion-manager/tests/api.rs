@@ -1647,56 +1647,111 @@ fn floor(m: &Running) -> u32 {
         .unwrap_or(1)
 }
 
+/// A manager without TLS on a free port, speaking `protocol`.
+async fn start_as(protocol: legion_api::protocol::Protocol) -> Running {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    serve_as(dir, listener, protocol).await
+}
+
+async fn serve_as(
+    dir: TempDir,
+    listener: TcpListener,
+    protocol: legion_api::protocol::Protocol,
+) -> Running {
+    let addr = listener.local_addr().unwrap().to_string();
+    let config = ManagerConfig {
+        raft: Running::quick_raft(),
+        heartbeat: HEARTBEAT,
+        registry_loopback: true,
+        protocol,
+        ..ManagerConfig::new(dir.path(), &addr)
+    };
+    Running::serve_config(dir, listener, config, None).await
+}
+
 /// The floor rises to what every manager speaks, and only then: a manager
-/// still on protocol 1 holds it there. Risen, a manager below it may no
-/// longer join, as the log may hold what it cannot apply.
+/// still on protocol 1, here the leader, holds it there until it is
+/// upgraded. Risen, a build below it may neither start on the data nor
+/// join, as the log may hold what it cannot apply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_floor_rises_once_every_manager_speaks_it() {
     use legion_api::protocol::{Protocol, SPEAKS};
     const { assert!(SPEAKS >= 2) };
-    let ca = Ca::generate().unwrap();
-    let token_of = async |m: &Running| {
-        m.cluster()
-            .await
-            .join_token(JoinTokenRequest {
-                role: "manager".into(),
-                rotate: false,
-            })
-            .await
-            .unwrap()
-            .into_inner()
-            .token
-    };
     let one = Protocol {
         speaks: 1,
         oldest: 1,
     };
-    let admin = creds(&ca, "admin", Role::Admin);
 
-    // One manager on protocol 1 holds the floor at 1.
-    let first = Running::start_with(Some(&ca)).await;
-    first.cluster().await.init(InitRequest {}).await.unwrap();
-    let token = token_of(&first).await;
-    let old = Running::join_then_serve_as(&first.addr, &token, "m2", admin.clone(), one).await;
-    let voters = || {
-        let m = first.store.raft.metrics().borrow().clone();
-        m.membership_config.membership().voter_ids().count()
-    };
-    until_within("both voters", Duration::from_secs(30), || voters() == 2).await;
+    // The cluster of a manager on protocol 1, which leads, and one on this
+    // build: the floor stays at 1.
+    let mut both = vec![start_as(one).await, start_as(Protocol::current()).await];
+    form_cluster(&both).await;
+    let (new, old) = (both.pop().unwrap(), both.pop().unwrap());
     tokio::time::sleep(Duration::from_secs(3)).await;
-    assert_eq!(floor(&first), 1);
-    old.stop().await;
-    first.stop().await;
+    assert_eq!(floor(&old), 1);
+    assert_eq!(floor(&new), 1);
 
-    // All on this build, it rises to what they speak.
+    // Upgraded in place, it rises.
+    let addr = old.addr.clone();
+    let dir = old.stop_keeping().await;
+    let listener = loop {
+        match TcpListener::bind(&addr).await {
+            Ok(l) => break l,
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    };
+    let upgraded = serve_as(dir, listener, Protocol::current()).await;
+    until_within("the floor raised", Duration::from_secs(30), || {
+        floor(&upgraded) == SPEAKS && floor(&new) == SPEAKS
+    })
+    .await;
+
+    // Then protocol 1 doesn't start on the data.
+    let addr = upgraded.addr.clone();
+    let dir = upgraded.stop_keeping().await;
+    let listener = loop {
+        match TcpListener::bind(&addr).await {
+            Ok(l) => break l,
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    };
+    let manager = Manager::open(ManagerConfig {
+        raft: Running::quick_raft(),
+        protocol: one,
+        ..ManagerConfig::new(dir.path(), &addr)
+    })
+    .await
+    .unwrap();
+    let err = manager
+        .serve(listener, async {})
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(&format!(
+            "the cluster's managers speak protocol {SPEAKS} and this build 1"
+        )),
+        "{err}"
+    );
+    new.stop().await;
+
+    // Nor joins: a cluster of this build alone has the floor at once.
+    let ca = Ca::generate().unwrap();
     let first = Running::start_with(Some(&ca)).await;
     first.cluster().await.init(InitRequest {}).await.unwrap();
-    let token = token_of(&first).await;
-    let second = Running::join(&first.addr, &token, "m2", admin).await;
     until("the floor raised", || floor(&first) == SPEAKS).await;
-    until("the floor everywhere", || floor(&second) == SPEAKS).await;
-
-    // Then a manager on protocol 1 is refused its join.
+    let token = first
+        .cluster()
+        .await
+        .join_token(JoinTokenRequest {
+            role: "manager".into(),
+            rotate: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
     let dir = tempfile::tempdir().unwrap();
     let id = legion_manager::node_id(dir.path()).unwrap();
     let err = legion_manager::join_as(&first.addr, &token, "m3", id, "127.0.0.1:1", one)
@@ -1709,7 +1764,6 @@ async fn the_floor_rises_once_every_manager_speaks_it() {
         )),
         "{err}"
     );
-    second.stop().await;
     first.stop().await;
 }
 
