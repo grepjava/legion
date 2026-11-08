@@ -265,7 +265,7 @@ fn parsed<T: legion_api::Spec>(o: &Object) -> Option<T> {
     }
 }
 
-async fn apply(store: &Store, action: Action) -> Result<(), String> {
+pub(crate) async fn apply(store: &Store, action: Action) -> Result<(), String> {
     let command = match action {
         Action::Create(object) => Command::Put {
             object,

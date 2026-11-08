@@ -37,6 +37,19 @@ pub struct Credentials {
     pub password: String,
 }
 
+impl Credentials {
+    /// The first of `logins` for `registry`, as a [`Reference`] names it.
+    pub fn for_registry(logins: &[legion_api::login::Login], registry: &str) -> Option<Self> {
+        logins
+            .iter()
+            .find(|l| crate::registry_of(&l.registry) == registry)
+            .map(|l| Credentials {
+                username: l.username.clone(),
+                password: l.password.clone(),
+            })
+    }
+}
+
 pub struct Client {
     http: reqwest::Client,
     /// Registries reached over plain HTTP (tests, and registries an

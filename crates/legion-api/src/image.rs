@@ -26,12 +26,13 @@ impl PullPolicy {
     }
 }
 
-/// The images of one generation of a pod, as the leader resolved them.
+/// A pod's images, as the leader resolved them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageStatus {
-    /// The owner's generation these are for.
-    pub generation: u64,
+    /// The pod they are for, as a hash of it: a change elsewhere in the
+    /// spec, such as the replica count, keeps them, as nothing was deployed.
+    pub pod: String,
     /// Each reference as written, and the same image by digest. A reference
     /// left as written (by digest already, local, or `never`) isn't here.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -42,9 +43,9 @@ pub struct ImageStatus {
 }
 
 impl ImageStatus {
-    /// Whether tasks of `generation` may be made with these.
-    pub fn ready_for(&self, generation: u64) -> bool {
-        self.generation == generation && self.message.is_empty()
+    /// Whether tasks of the pod hashed as `pod` may be made with these.
+    pub fn ready_for(&self, pod: &str) -> bool {
+        self.pod == pod && self.message.is_empty()
     }
 }
 
@@ -73,15 +74,15 @@ mod tests {
     }
 
     #[test]
-    fn images_are_ready_for_their_own_generation_once_resolved() {
+    fn images_are_ready_for_their_own_pod_once_resolved() {
         let mut s = ImageStatus {
-            generation: 3,
+            pod: "p1".into(),
             ..ImageStatus::default()
         };
-        assert!(s.ready_for(3));
-        assert!(!s.ready_for(4));
+        assert!(s.ready_for("p1"));
+        assert!(!s.ready_for("p2"));
         s.message = "registry unreachable".into();
-        assert!(!s.ready_for(3));
+        assert!(!s.ready_for("p1"));
     }
 
     #[test]

@@ -11,6 +11,7 @@ publish.workspace = true
 base64.workspace = true
 flate2 = "1.1"
 futures.workspace = true
+legion-api.workspace = true
 legion-sys.workspace = true
 libc.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "system-proxy", "stream", "json", "query"] }

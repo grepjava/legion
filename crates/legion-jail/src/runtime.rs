@@ -1424,13 +1424,7 @@ impl legion_runtime::Runtime for JailRuntime {
         let registry = Reference::parse(reference)
             .map_err(|e| pull_error(e.to_string()))?
             .registry;
-        let creds = logins
-            .iter()
-            .find(|l| legion_image::registry_of(&l.registry) == registry)
-            .map(|l| Credentials {
-                username: l.username.clone(),
-                password: l.password.clone(),
-            });
+        let creds = Credentials::for_registry(logins, &registry);
         // Before and after: an image pulled again must not go meanwhile.
         mark_used(&mut *self.used.lock().await, reference);
         let pulled = self.images.pull(reference, creds.as_ref(), user).await;

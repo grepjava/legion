@@ -15,6 +15,7 @@ pub mod controller;
 mod dispatcher;
 #[cfg(feature = "test-hooks")]
 pub mod hooks;
+pub mod images;
 pub mod join;
 pub mod metrics;
 mod migrate;
@@ -214,6 +215,9 @@ impl Manager {
                 closing.clone(),
             ))
         });
+        let resolver = self
+            .controllers
+            .then(|| tokio::spawn(images::run(self.store.clone(), self.id, closing.clone())));
         let acme = self.controllers.then(|| {
             tokio::spawn(acme::run(
                 self.store.clone(),
@@ -335,6 +339,9 @@ impl Manager {
         let _ = closing_tx.send(true);
         if let Some(controllers) = controllers {
             let _ = controllers.await;
+        }
+        if let Some(resolver) = resolver {
+            let _ = resolver.await;
         }
         if let Some(acme) = acme {
             let _ = acme.await;

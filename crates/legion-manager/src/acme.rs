@@ -727,7 +727,7 @@ impl HttpClient for Authority {
 }
 
 /// The value of a Secret, if there is one.
-fn read_data(store: &Store, key: &ObjectKey) -> Result<Option<Vec<u8>>, String> {
+pub(crate) fn read_data(store: &Store, key: &ObjectKey) -> Result<Option<Vec<u8>>, String> {
     Ok(read_secret(store, key)?.map(|(data, _)| data))
 }
 
