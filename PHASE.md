@@ -1502,7 +1502,10 @@ jails could not start on v0.1.10. v0.1.12, tagged on 2026-11-06, has the
 fourteenth's, and what jailer had its own copies of, now shared from
 Legion's crates, and is for jailer to move to. v0.1.13 has `legion doctor`
 and the host checks shared with jailer, and is the first with every test in
-the manifest run, on the disposable VMs of `scripts/lab`. The port's `distinfo` is
+the manifest run, on the disposable VMs of `scripts/lab`. v0.1.14 has image
+identity: a deployment runs the digests its tags named when it was made, on
+every node, and a rollback runs the old ones; it fixes the stop and remove
+races jailer found. The port's `distinfo` is
 made for v0.1.13, and its crates are v0.1.9's, but it has not been through
 `poudriere testport` since v0.1.9. Waiting on the user: the port's
 submission, once their FreeBSD Bugzilla account exists.
