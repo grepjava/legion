@@ -233,9 +233,14 @@ Goal: recovery and upgrade are procedures that have been drilled.
 State, 8 November 2026: item 1's handshake is built (docs/DESIGN.md,
 3.8, Versions): registrations, joins and Raft calls between builds that
 don't work together are refused, saying which to upgrade first, each
-shown by a test that fails without the check. Every build speaks
-protocol 1 so far. Not yet: the ACME gap, which is the first command to
-need protocol 2, and the leader knowing every manager speaks it.
+shown by a test that fails without the check. Builds speak
+protocol 2 now: the managers' log takes guarded writes once every
+manager speaks it, recorded as a floor that only rises
+(`the_floor_rises_once_every_manager_speaks_it`). The ACME gap is closed
+with one: a certificate is written only while the routes calling for it
+are unchanged (`a_route_changed_as_its_certificate_is_written_gets_none`,
+which shows the gap still open at protocol 1). Not yet: an upgrade drill
+from v0.1.15 on the lab.
 
 Exit: a supported upgrade path is tested. Snapshots are labelled
 crash-consistent, and a control-state backup isn't described as a backup of

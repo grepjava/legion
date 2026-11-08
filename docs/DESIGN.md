@@ -562,8 +562,12 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   (the `legion-protocol` header). Refused, a caller is told which side
   to upgrade first; an agent goes on asking, and a manager upgraded too
   far takes no part, neither catching up nor voting, while the others
-  go on. A protocol bump that changes the log adds its command only once
-  every manager speaks it.
+  go on. Once every manager has lately answered on a protocol, the
+  leader records it as the floor (`legion-system`'s Config `protocol`),
+  and only then may the log hold that protocol's commands (protocol 2:
+  guarded writes). The floor only rises: below it, a manager is refused
+  its join, its Raft calls and its start. So an upgrade can't be undone
+  once every manager has run the new build together.
 
 ## 4. Feature set
 
@@ -1007,7 +1011,11 @@ node and routes change without reloads.
   other tokens, go to the backend. Then it writes the chain and a new
   P-256 key into the Secret (creating it; one holding no certificate is
   left alone, as the status says, so a mistyped name cannot wipe
-  another Secret), and the proxies take it as any renewed Secret. The status says when the certificate expires, or
+  another Secret), and the proxies take it as any renewed Secret. The
+  write holds only while the routes calling for the certificate are as
+  they were when last checked (a guarded write, once the managers'
+  floor is protocol 2), so a host another namespace has taken meanwhile
+  gets none. The status says when the certificate expires, or
   why the last order failed and when the next is: after 10 minutes, then
   twice as long each time up to a day, which stays within Let's Encrypt's
   limits on failed validations. Each directory and email has an account,
