@@ -312,6 +312,21 @@ impl Harness {
         self.task_in("shop", name, pod, job).await
     }
 
+    /// A task whose images were pinned, as the controller makes them.
+    async fn task_pinned(&self, name: &str, pod: &str, pins: &[(&str, &str)]) -> ObjectKey {
+        let key = self.task(name, pod).await;
+        let mut o = self.store.get(&key).unwrap().unwrap();
+        let mut spec: TaskSpec = serde_json::from_value(o.spec.clone()).unwrap();
+        spec.images = pins
+            .iter()
+            .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+            .collect();
+        o.spec = serde_json::to_value(&spec).unwrap();
+        let version = o.metadata.version;
+        self.write(o, Precondition::Version(version)).await;
+        key
+    }
+
     async fn task_in(&self, namespace: &str, name: &str, pod: &str, job: bool) -> ObjectKey {
         let pod: serde_json::Value = serde_yaml_ng::from_str(pod).unwrap();
         let mut spec: TaskSpec = legion_api::parse(&serde_json::json!({
@@ -1298,6 +1313,36 @@ containers:
     }
     assert!(text.contains("# TYPE legion_container_cpu_seconds_total counter\n"));
     assert!(!text.contains("5120"), "{text}");
+}
+
+/// A task runs the digest its image was pinned to, wherever it lands; one
+/// with `pullPolicy: never` runs only what the node holds, and pulls nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_images_and_held_ones() {
+    let h = Harness::new().await;
+    let digest = "docker.io/library/web@sha256:aa";
+    let key = h
+        .task_pinned(
+            "pin-1",
+            r#"containers: [{ name: app, image: "web:1" }]"#,
+            &[("web:1", digest)],
+        )
+        .await;
+    h.wait_state(&key, TaskState::Running).await;
+    assert_eq!(h.rt.spec("shop_pin-1_app").unwrap().image, digest);
+
+    let held = r#"containers: [{ name: app, image: "local:1", pullPolicy: never }]"#;
+    let key = h.task("held-1", held).await;
+    let status = h.wait_state(&key, TaskState::Rejected).await;
+    assert!(
+        status.message.contains("pullPolicy is never"),
+        "{}",
+        status.message
+    );
+    h.rt.add_image("local:1");
+    let key = h.task("held-2", held).await;
+    h.wait_state(&key, TaskState::Running).await;
+    assert_eq!(h.rt.spec("shop_held-2_app").unwrap().image, "local:1");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

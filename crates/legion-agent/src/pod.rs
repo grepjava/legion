@@ -143,7 +143,7 @@ pub fn container_spec(
 ) -> ContainerSpec {
     ContainerSpec {
         name: container_name(a, Some(&c.name)),
-        image: c.image.clone(),
+        image: legion_api::image::pinned(&a.spec.images, &c.image).to_owned(),
         entrypoint: c.command.clone(),
         command: c.args.clone(),
         env: c

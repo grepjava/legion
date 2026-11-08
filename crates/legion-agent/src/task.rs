@@ -536,8 +536,20 @@ impl<R: Runtime, C: Control> Worker<R, C> {
     async fn start(&mut self) -> Result<Pod, Abort> {
         let rt = self.ctx.runtime.clone();
         self.report(TaskState::Preparing, "pulling images").await;
+        let pins = &self.a.spec.images;
         let images: BTreeSet<String> = std::iter::once(self.ctx.infra_image.clone())
-            .chain(self.pod().containers().map(|c| c.image.clone()))
+            .chain(
+                self.pod()
+                    .containers()
+                    .map(|c| legion_api::image::pinned(pins, &c.image).to_owned()),
+            )
+            .collect();
+        // Used as the node holds them: no registry is asked.
+        let held: BTreeSet<String> = self
+            .pod()
+            .containers()
+            .filter(|c| c.pull_policy == legion_api::image::PullPolicy::Never)
+            .map(|c| c.image.clone())
             .collect();
         let namespace = self.a.key.namespace.clone();
         // Read when an image needs pulling: a private image another
@@ -550,6 +562,11 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 .await
                 .map_err(|e| Abort::Failed(format!("checking image {image}: {e}")))?;
             if !usable {
+                if held.contains(image) {
+                    return Err(Abort::Rejected(format!(
+                        "image {image} is not on this node, and its pullPolicy is never"
+                    )));
+                }
                 if logins.is_none() {
                     let read = logins::read(self.ctx.control.as_ref(), &self.a)
                         .await
