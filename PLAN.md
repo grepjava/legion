@@ -165,6 +165,16 @@ Goal: a written contract for a split cluster, with tests showing it's true.
 Exit: tests show whether old and replacement workloads can run at once, the
 contract matches them, and reconnecting resurrects nothing obsolete.
 
+State, 8 November 2026: item 1 is done; the six multi-host tests and the
+mesh are in every full run. Item 2's record of the current behaviour is
+[docs/PARTITIONS.md](docs/PARTITIONS.md): what each side does, which tests
+show it, the four ways a workload can run twice today, and three cases only
+the code suggests, which need tests. Item 6 is closed: a removal's or a
+join's record whose write outcome is unknown is read back once the store is
+current (`a_record_whose_reply_was_lost_counts_as_written`, through a
+lost-reply fault in the `test-hooks` feature), except a write that commits
+after the read. Decision 3 is taken as recommended.
+
 ### Phase 5: Drain barrier
 
 Goal: a tool can ask "is this node safe to stop?" and trust the answer.
