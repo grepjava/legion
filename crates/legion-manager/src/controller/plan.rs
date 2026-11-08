@@ -181,6 +181,10 @@ impl Service {
 #[derive(Debug, Default)]
 pub struct Memory {
     pub failed_at: BTreeMap<String, Instant>,
+    /// When this leader first saw each orphaned task: one that must not run
+    /// twice is replaced only once its node has surely stopped it. A new
+    /// leader starts counting anew, which only waits longer.
+    pub orphaned_at: BTreeMap<String, Instant>,
     pub running_at: BTreeMap<String, Instant>,
     /// What tasks use, by `namespace/task`, with the node that reported
     /// it; the controller sets it before each pass.
@@ -245,6 +249,15 @@ pub fn plan(
         .retain(|uid, _| live.contains(uid.as_str()));
     for t in tasks.iter().filter(|t| t.failed()) {
         memory.failed_at.entry(t.uid().to_owned()).or_insert(now);
+    }
+    memory
+        .orphaned_at
+        .retain(|uid, _| live.contains(uid.as_str()));
+    for t in tasks
+        .iter()
+        .filter(|t| t.status.state == TaskState::Orphaned)
+    {
+        memory.orphaned_at.entry(t.uid().to_owned()).or_insert(now);
     }
     memory
         .running_at
@@ -1235,14 +1248,34 @@ fn backoff(
     memory: &Memory,
     now: Instant,
 ) -> Instant {
+    let fenced = fenced_until(last, memory, now);
     if failures == 0 {
-        return now;
+        return fenced.unwrap_or(now);
     }
     let base = delay.max(Duration::from_secs(1));
     let wait = base
         .saturating_mul(1 << (failures - 1).min(16))
         .min(MAX_BACKOFF);
-    memory.failed_at.get(last.uid()).copied().unwrap_or(now) + wait
+    let due = memory.failed_at.get(last.uid()).copied().unwrap_or(now) + wait;
+    fenced.map_or(due, |f| f.max(due))
+}
+
+/// Beyond a pod's stop grace period, what its replacement waits for the
+/// agent of a node cut off to have stopped it: the agent's check comes
+/// every half second, and the leader marks a node down up to a second late.
+const FENCE_MARGIN: Duration = Duration::from_secs(5);
+
+/// Until when an orphaned task that must not run twice (`onPartition:
+/// stop`) holds its slot: its node's agent, cut off as long as the leader
+/// took to mark the node down, stops it, within its stop grace period.
+fn fenced_until(last: &Task, memory: &Memory, now: Instant) -> Option<Instant> {
+    (last.status.state == TaskState::Orphaned
+        && last.spec.pod.on_partition == legion_api::service::OnPartition::Stop)
+        .then(|| {
+            memory.orphaned_at.get(last.uid()).copied().unwrap_or(now)
+                + last.spec.pod.stop_grace_period.as_std()
+                + FENCE_MARGIN
+        })
 }
 
 /// The `n` of a task named `<service>-<slot>-<n>`.

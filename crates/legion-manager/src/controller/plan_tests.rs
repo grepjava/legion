@@ -1354,6 +1354,39 @@ fn an_orphan_reported_running_by_its_returning_node_displaces_nothing() {
     assert!(w.tasks().contains(&format!("{lost} shutdown n2")));
 }
 
+/// A pod that must not run twice is replaced only once its node's agent,
+/// cut off, has surely stopped it: its stop grace period and a margin
+/// after it was orphaned.
+#[test]
+fn a_task_that_must_not_run_twice_is_replaced_after_its_node_stopped_it() {
+    let mut w = World::new();
+    for n in ["n1", "n2", "n3"] {
+        w.node(n, &[]);
+    }
+    w.service(
+        "web",
+        &format!(
+            "replicas: 3
+{}",
+            POD.replace("pod: {", "pod: { onPartition: stop, stopGracePeriod: 3s,")
+        ),
+    );
+    w.settle();
+    let lost = w.placed_task_on("web", "n2");
+    w.state("n2", NodeState::Down);
+    w.settle();
+    assert_eq!(w.placed_task(&lost).status.state, TaskState::Orphaned);
+    assert_eq!(w.running().len(), 2);
+    // 3 s of grace and 5 of margin.
+    w.now += Duration::from_secs(7);
+    w.settle();
+    assert_eq!(w.running().len(), 2);
+    w.now += Duration::from_secs(1);
+    w.settle();
+    assert_eq!(w.running().len(), 3);
+    assert!(!w.placed("web").contains(&"n2".to_owned()));
+}
+
 #[test]
 fn tasks_of_a_removed_node_move() {
     let mut w = World::new();

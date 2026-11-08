@@ -52,8 +52,6 @@ use crate::raft_net::{MAX_MESSAGE, connect_lazy};
 /// How often agents send heartbeats unless configured otherwise.
 pub const HEARTBEAT_PERIOD: Duration = Duration::from_secs(2);
 
-/// Silent periods after which a node is down.
-const MISSED_HEARTBEATS: u32 = 8;
 /// The worker a manager forwards a request for, and when the worker's
 /// certificate was issued (seconds since the epoch): the leader checks it
 /// against removals its replica may have and the forwarding manager's not
@@ -776,7 +774,7 @@ impl DispatcherService {
     /// they fall silent, and ready again when they are heard from.
     async fn monitor(self) {
         let mut closing = self.api.closing.clone();
-        let grace = self.period * MISSED_HEARTBEATS;
+        let grace = self.period * legion_api::node::DOWN_AFTER_HEARTBEATS;
         let suspect = self.period * SUSPECT_HEARTBEATS;
         let tick = self.period.min(Duration::from_secs(1));
         let mut leading_since: Option<Instant> = None;
