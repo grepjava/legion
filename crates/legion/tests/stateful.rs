@@ -147,8 +147,46 @@ impl Lab {
     /// Volume, which has left the node; then makes the node active again.
     fn move_off(&self, n: u64) -> (String, String) {
         let from = self.node_of(n);
-        self.ok(&["node", "drain", &from]);
         let volume = format!("pg-db-{n}");
+        // Waited for (PLAN.md, phase 5): completed only once nothing runs
+        // on the node and none of its data is moving.
+        let out = self.legion(
+            &[
+                "node",
+                "drain",
+                &from,
+                "--wait",
+                "--timeout",
+                "900",
+                "-o",
+                "json",
+            ],
+            &[],
+        );
+        assert!(
+            out.status.success(),
+            "drain --wait: {}{}",
+            text(&out.stdout),
+            text(&out.stderr)
+        );
+        let done: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(done["phase"], "completed", "{done}");
+        let ended = ["complete", "failed", "shutdown", "rejected"];
+        for t in self.list("tasks", "data") {
+            let state = t["status"]["state"].as_str().unwrap_or_default();
+            assert!(
+                t["spec"]["node"] != from.as_str() || ended.contains(&state),
+                "completed, yet on {from}: {t}"
+            );
+        }
+        for v in self.list("volumes", "data") {
+            if v["metadata"]["name"] == volume.as_str() {
+                assert!(
+                    v["status"]["node"] != from.as_str() && v["status"].get("migration").is_none(),
+                    "completed, yet its data is on {from}: {v}"
+                );
+            }
+        }
         let to = std::cell::RefCell::new(String::new());
         wait(&format!("db-{n} running off {from}"), 600, || {
             let Some(t) = self.ordinal(n) else {
