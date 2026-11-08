@@ -246,8 +246,26 @@ fn apply_command(
     cmd: Command,
 ) -> Result<(Outcome, Option<Event>), AnyError> {
     let mut table = txn.open_table(OBJECTS).map_err(any)?;
+    if let Command::Guarded { unchanged, .. } = &cmd {
+        for (other, expected) in unchanged {
+            let key_str = other.to_string();
+            let found = match table.get(key_str.as_str()).map_err(any)? {
+                Some(v) => Some(
+                    codec
+                        .decode::<Object>(OBJECTS_NAME, &key_str, v.value())
+                        .map_err(any)?
+                        .metadata
+                        .version,
+                ),
+                None => None,
+            };
+            if found != *expected {
+                return Ok((Outcome::Conflict { current: found }, None));
+            }
+        }
+    }
     let key = match &cmd {
-        Command::Put { object, .. } => object.key(),
+        Command::Put { object, .. } | Command::Guarded { object, .. } => object.key(),
         Command::Delete { key, .. } => key.clone(),
     };
     let key_str = key.to_string();
@@ -261,7 +279,9 @@ fn apply_command(
     };
     let current_version = current.as_ref().map(|o| o.metadata.version);
     let precondition = match &cmd {
-        Command::Put { precondition, .. } | Command::Delete { precondition, .. } => *precondition,
+        Command::Put { precondition, .. }
+        | Command::Delete { precondition, .. }
+        | Command::Guarded { precondition, .. } => *precondition,
     };
     let holds = match precondition {
         Precondition::None => true,
@@ -278,7 +298,7 @@ fn apply_command(
     }
 
     match cmd {
-        Command::Put { mut object, .. } => {
+        Command::Put { mut object, .. } | Command::Guarded { mut object, .. } => {
             let meta = &mut object.metadata;
             meta.version = index;
             match &current {

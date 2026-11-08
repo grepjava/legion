@@ -5,7 +5,7 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use legion_api::{Kind, ObjectKey};
+use legion_api::{Kind, Object, ObjectKey};
 use legion_store::{Command, Event, Outcome, Precondition, WatchError};
 use openraft::{BasicNode, SnapshotPolicy};
 
@@ -289,6 +289,63 @@ async fn object_versions_and_preconditions() {
         Outcome::NotFound
     );
     assert_eq!(store.get(&key).unwrap(), None);
+}
+
+/// A guarded put holds only while the objects it names are as seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_guarded_put_holds_only_while_what_it_names_is_unchanged() {
+    let mut c = Cluster::new(config());
+    let store = c.start(1).await;
+    c.initialize(&[1]).await;
+    c.leader(None).await;
+    let guarded = |object: Object, unchanged: Vec<(ObjectKey, Option<u64>)>| {
+        let store = store.clone();
+        async move {
+            store
+                .raft
+                .client_write(Command::Guarded {
+                    object,
+                    precondition: Precondition::None,
+                    unchanged,
+                })
+                .await
+                .unwrap()
+                .data
+        }
+    };
+    let Outcome::Written(route) = put(&store, service("route", 1), Precondition::None).await else {
+        panic!("create failed")
+    };
+    let (key, seen) = (route.key(), route.metadata.version);
+    let absent = service("absent", 1).key();
+
+    // As seen: written.
+    let out = guarded(
+        service("cert", 1),
+        vec![(key.clone(), Some(seen)), (absent.clone(), None)],
+    )
+    .await;
+    assert!(matches!(out, Outcome::Written(_)), "{out:?}");
+
+    // Changed, or come into being, since: a conflict, and nothing written.
+    let Outcome::Written(moved) = put(&store, service("route", 2), Precondition::None).await else {
+        panic!("update failed")
+    };
+    let out = guarded(service("cert", 2), vec![(key.clone(), Some(seen))]).await;
+    assert_eq!(
+        out,
+        Outcome::Conflict {
+            current: Some(moved.metadata.version)
+        }
+    );
+    put(&store, service("absent", 1), Precondition::None).await;
+    let out = guarded(service("cert", 3), vec![(absent, None)]).await;
+    assert!(
+        matches!(out, Outcome::Conflict { current: Some(_) }),
+        "{out:?}"
+    );
+    let cert = store.get(&service("cert", 1).key()).unwrap().unwrap();
+    assert_eq!(cert.spec["replicas"], 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

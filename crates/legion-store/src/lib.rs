@@ -54,6 +54,15 @@ pub enum Command {
         key: ObjectKey,
         precondition: Precondition,
     },
+    /// A put that holds only while each of `unchanged` is at the version
+    /// given (`None`: absent), else a conflict on the first that moved.
+    /// Protocol 2 (`legion_api::protocol`): managers propose it only once
+    /// every manager applies it.
+    Guarded {
+        object: Object,
+        precondition: Precondition,
+        unchanged: Vec<(ObjectKey, Option<u64>)>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
