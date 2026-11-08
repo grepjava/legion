@@ -192,6 +192,10 @@ struct Worker<R, C> {
     /// A stop arrived: it is sent once, so one taken while waiting for
     /// something else still counts.
     stopping: bool,
+    /// Set with a stop: a status report under way or after, but for the
+    /// end, gives way to it, as the managers may be out of reach (a pod that
+    /// must not run twice stops because they are), and is sent again later.
+    halt: tokio::sync::watch::Receiver<bool>,
     probe_tx: mpsc::UnboundedSender<probe::Report>,
     probe_rx: mpsc::UnboundedReceiver<probe::Report>,
 }
@@ -207,6 +211,7 @@ pub(crate) async fn run<R: Runtime, C: Control>(
     ctx: Ctx<R, C>,
     a: Assignment,
     rx: mpsc::Receiver<Msg>,
+    halt: tokio::sync::watch::Receiver<bool>,
 ) -> Ended {
     let status = a.status.clone();
     let (probe_tx, probe_rx) = mpsc::unbounded_channel();
@@ -218,6 +223,7 @@ pub(crate) async fn run<R: Runtime, C: Control>(
         ready: false,
         unsent: false,
         stopping: false,
+        halt,
         probe_tx,
         probe_rx,
     };
@@ -295,13 +301,37 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         self.status.state = state;
         self.status.message = message.into();
         self.status.ready = state == TaskState::Running && self.ready;
-        self.unsent = !report(&self.ctx, &self.a, &self.status).await;
+        // An end is the stop's own word, and waits.
+        if state.is_terminal() {
+            self.unsent = !report(&self.ctx, &self.a, &self.status).await;
+            return;
+        }
+        self.unsent = !self.report_unless_halted().await;
+    }
+
+    /// Reports the status unless a stop comes first, which then counts: true
+    /// if the manager took it.
+    async fn report_unless_halted(&mut self) -> bool {
+        let mut halt = self.halt.clone();
+        let sent = tokio::select! {
+            sent = report(&self.ctx, &self.a, &self.status) => Some(sent),
+            // Closed, the agent is shutting down, which stops nothing.
+            () = async {
+                if halt.wait_for(|h| *h).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            } => None,
+        };
+        if sent.is_none() {
+            self.stopping = true;
+        }
+        sent == Some(true)
     }
 
     /// Reports again what the manager did not take, if anything.
     async fn resend(&mut self) {
         if self.unsent {
-            self.unsent = !report(&self.ctx, &self.a, &self.status).await;
+            self.unsent = !self.report_unless_halted().await;
         }
     }
 
@@ -1028,7 +1058,8 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             }
         }
         loop {
-            if self.stopping {
+            // A stop may be queued behind other messages.
+            if self.stopping || *self.halt.borrow() {
                 self.drain().await;
                 return self.stop().await;
             }

@@ -158,6 +158,8 @@ pub struct Agent<R, C> {
 struct Worker {
     tx: mpsc::Sender<Msg>,
     stopping: bool,
+    /// Set with a stop, which a status report under way gives way to.
+    halt: tokio::sync::watch::Sender<bool>,
 }
 
 impl<R: Runtime, C: Control> Agent<R, C> {
@@ -263,7 +265,17 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             r = register(&ctx, &status) => r,
             _ = &mut shutdown => return,
         };
+        // When the last heartbeat the managers answered was sent, and their
+        // period: registered, the node was heard from just now. Until a
+        // heartbeat says the period, a second, shorter than any the
+        // managers use by default: a pod that must not run twice stops
+        // early rather than late.
+        let heard = Arc::new(std::sync::Mutex::new((
+            tokio::time::Instant::now(),
+            Duration::from_secs(1),
+        )));
         let heartbeats = tokio::spawn(heartbeats(
+            heard.clone(),
             ctx.control.clone(),
             ctx.node.clone(),
             metrics::AgentMetrics {
@@ -432,6 +444,8 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         let mut cleanups: JoinSet<(String, bool)> = JoinSet::new();
         let mut tick = tokio::time::interval(self.resync);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut fence = tokio::time::interval(Duration::from_millis(500));
+        fence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -456,6 +470,26 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                         }
                     }
                 },
+                _ = fence.tick() => {
+                    // Cut off as long as the leader takes to mark this node
+                    // down: its pods that must not run twice stop now, as
+                    // they are about to be replaced (docs/PARTITIONS.md).
+                    let (at, period) = *heard.lock().unwrap_or_else(|e| e.into_inner());
+                    if at.elapsed() >= period * legion_api::node::DOWN_AFTER_HEARTBEATS {
+                        let current = assignments.borrow();
+                        for (uid, w) in workers.iter_mut() {
+                            if !w.stopping
+                                && current.get(uid).is_some_and(|a| {
+                                    a.spec.pod.on_partition == legion_api::service::OnPartition::Stop
+                                })
+                            {
+                                tracing::warn!(uid, "cut off from the managers: stopping a pod that must not run twice");
+                                w.halt.send_replace(true);
+                                w.stopping = w.tx.try_send(Msg::Stop).is_ok();
+                            }
+                        }
+                    }
+                }
                 _ = tick.tick() => {
                     let current = assignments.borrow().clone();
                     reconcile(&ctx, &current, &mut workers, &mut running, &mut uids, &mut ended, &mut cleaning, &mut cleanups).await;
@@ -969,6 +1003,7 @@ async fn quota_loop<R: Runtime, C: Control>(
 /// Sends heartbeats for `node` as often as the managers ask, for as long
 /// as the agent runs, with its tasks' use every `usage_period`.
 async fn heartbeats<R: Runtime, C: Control>(
+    heard: Arc<std::sync::Mutex<(tokio::time::Instant, Duration)>>,
     control: Arc<C>,
     node: String,
     metrics: metrics::AgentMetrics<R>,
@@ -984,8 +1019,10 @@ async fn heartbeats<R: Runtime, C: Control>(
         } else {
             Vec::new()
         };
+        let sent = tokio::time::Instant::now();
         match control.heartbeat(&node, usage).await {
             Ok(p) => {
+                *heard.lock().unwrap_or_else(|e| e.into_inner()) = (sent, p);
                 if failing {
                     tracing::info!("heartbeats reach the managers again");
                     failing = false;
@@ -1049,6 +1086,7 @@ async fn reconcile<R: Runtime, C: Control>(
         match workers.get_mut(uid) {
             Some(w) => {
                 if !wanted && !w.stopping && a.spec.desired_state == DesiredState::Shutdown {
+                    w.halt.send_replace(true);
                     w.stopping = w.tx.send(Msg::Stop).await.is_ok();
                 }
             }
@@ -1059,9 +1097,10 @@ async fn reconcile<R: Runtime, C: Control>(
                 && !cleaning.contains(uid) =>
             {
                 let (tx, rx) = mpsc::channel(64);
+                let (halt, halted) = tokio::sync::watch::channel(false);
                 let (worker_ctx, a, key) = (ctx.clone(), a.clone(), uid.clone());
                 let handle = running.spawn(async move {
-                    let end = task::run(worker_ctx, a, rx).await;
+                    let end = task::run(worker_ctx, a, rx, halted).await;
                     (key, end)
                 });
                 uids.insert(handle.id(), uid.clone());
@@ -1070,6 +1109,7 @@ async fn reconcile<R: Runtime, C: Control>(
                     Worker {
                         tx,
                         stopping: false,
+                        halt,
                     },
                 );
             }
@@ -1078,6 +1118,7 @@ async fn reconcile<R: Runtime, C: Control>(
     }
     for (uid, w) in workers.iter_mut() {
         if !assignments.contains_key(uid) && !w.stopping {
+            w.halt.send_replace(true);
             w.stopping = w.tx.send(Msg::Stop).await.is_ok();
         }
     }

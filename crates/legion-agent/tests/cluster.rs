@@ -421,6 +421,70 @@ async fn a_node_cut_off_runs_on_until_it_is_back() {
     c.stop().await;
 }
 
+/// A node cut off with its agent running, whose pod must not run twice
+/// (`onPartition: stop`): the agent stops it before the managers place its
+/// replacement, and nothing starts it again once the node is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pod_that_must_not_run_twice_stops_before_it_is_replaced() {
+    let c = Cluster::start(3).await;
+    c.apply(&WEB.replace(
+        "  pod:
+",
+        "  pod:
+    onPartition: stop
+    stopGracePeriod: 1s
+",
+    ))
+    .await;
+    eventually("one task per node", async || {
+        c.placed().await == ["n1", "n2", "n3"]
+    })
+    .await;
+
+    c.nodes[1].link.cut();
+    let start = tokio::time::Instant::now();
+    let (mut stopped, mut replaced) = (None, None);
+    while replaced.is_none() {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "not replaced: {:?}",
+            c.list(Kind::Task).await
+        );
+        if stopped.is_none() && c.pods(1).is_empty() {
+            stopped = Some(start.elapsed());
+        }
+        let elsewhere = c
+            .list(Kind::Task)
+            .await
+            .iter()
+            .filter(|t| {
+                let node = t.spec["node"].as_str().unwrap_or_default();
+                !node.is_empty() && node != "n2" && t.status["state"] != "pending"
+            })
+            .count();
+        if elsewhere == 3 {
+            replaced = Some(start.elapsed());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let stopped = stopped.expect("the cut-off pod was never stopped");
+    assert!(
+        stopped < replaced.unwrap(),
+        "stopped {stopped:?}, replaced {replaced:?}"
+    );
+
+    c.nodes[1].link.mend();
+    c.eventually_node_ready("n2").await;
+    eventually("three running, none on n2", async || {
+        let placed = c.placed().await;
+        placed.len() == 3 && !placed.contains(&"n2".to_owned())
+    })
+    .await;
+    tokio::time::sleep(HEARTBEAT * 10).await;
+    assert!(c.pods(1).is_empty());
+    c.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tasks_survive_losing_a_node() {
     let mut c = Cluster::start(3).await;
