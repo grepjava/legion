@@ -30,7 +30,9 @@ Tested: `tasks_of_a_lost_node_move`, `a_global_task_stays_on_a_node_taking_no_ne
 and `lost_tasks_are_replaced_whatever_the_restart_policy` (the planner);
 `tasks_survive_losing_a_node` and
 `a_silent_node_loses_its_connections_before_its_tasks` (agents in a real
-cluster, with the agent process stopped rather than cut off).
+cluster, with the agent process stopped); and
+`a_node_cut_off_runs_on_until_it_is_back` (an agent kept running, cut off
+by a proxy that goes silent, as a split network does).
 
 **What happens to its tasks, by kind:**
 
@@ -48,7 +50,9 @@ cluster, with the agent process stopped rather than cut off).
 
 **What the agent does.** Nothing, on its own account. It keeps running every
 task it was last assigned, keeps its pf rules and WireGuard peers, and
-retries a manager every 500 ms. No lease or timeout makes it stop. An agent
+retries a manager every 500 ms. No lease or timeout makes it stop: tested
+by `a_node_cut_off_runs_on_until_it_is_back`, whose old pod runs on beside
+its replacement. An agent
 restarted while cut off starts reconciling only once it has a full set of
 assignments from a manager, so its pods keep running meanwhile.
 
@@ -116,7 +120,8 @@ Where an old copy of a workload and its replacement can run at once today:
 
 1. **Any task of a node cut off, but still running:** a replicated or
    global service's, or a Job's, from 16 s after the split until the node
-   is back. Both copies serve whoever can reach them.
+   is back. Both copies serve whoever can reach them. Tested:
+   `a_node_cut_off_runs_on_until_it_is_back`.
 2. **A task on a shared (NFS) volume**, the same way, with both copies
    writing the same files.
 3. **A removed node that is in fact still running**, for as long as it
@@ -151,10 +156,9 @@ planner), and `tasks_survive_losing_a_node` (agents in a real cluster).
 
 ## Not yet known
 
-Nothing found in the code is unaccounted for, but the tests stop an agent
-to cut its node off. None yet cuts off an agent that keeps running, or
-leaves an agent with only a cut-off manager (the fourth way of running
-twice). Those need the fault injection below.
+Nothing found in the code is unaccounted for. No test yet leaves an agent
+with only a cut-off manager (the fourth way of running twice): that needs
+several managers and a link between them that can be cut.
 
 ## What comes next
 
