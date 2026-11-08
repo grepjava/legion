@@ -193,9 +193,18 @@ State, 8 November 2026: the drain status and `legion node drain --wait`
 are built (docs/DESIGN.md, Nodes). Its phases are `draining`, `blocked`
 and `completed`; there is no `failed`, as no condition found so far can't
 clear by itself. A task still running says why: `data`, `budget` or
-`replacement`, as the planner decided that pass. Not yet: the tests of
-interrupted transfers, a disconnected source and failover with a waiter,
-on the lab.
+`replacement`, as the planner decided that pass. The exit's tests are in:
+stateless and stateful evacuation (planner tests, and the postgres test on
+the lab through `drain --wait`), a budget holding a stateful task
+(`a_drain_says_a_task_waits_for_its_budget`), a transfer cut short and a
+last part lost on its way in, each tried again with the failure in the
+drain status, and a source cut off mid-copy, blocking the drain until it
+is back (cluster tests, through fault hooks in the fake host), cancellation
+(`a_drain_is_waited_for`), and a waiter riding out the leader's loss among
+three managers (`a_drain_waiter_survives_the_leaders_loss`, which fails
+without the waiter's retries). A waiter whose own manager goes needs the
+managers' floating address, and that is not tested. Not yet run on the lab: the faults are
+injected on the fake host, as the lab has no way to cut a transfer.
 
 1. Add a persisted drain operation with `Draining`, `Blocked`, `Completed`
    and `Failed`, stable reason codes and per-workload progress. Reuse the

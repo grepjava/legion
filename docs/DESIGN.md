@@ -167,10 +167,16 @@ preconditions. Rules:
   stands to its `status.drain`: `draining`, `blocked` or `completed`, and
   what is left, each task and moving Volume with a reason. Unknown never
   counts as released: a node not heard from (`unreachable`), or a task
-  orphaned there and not yet seen to stop (`unconfirmed`), blocks it.
+  orphaned there and not yet seen to stop (`unconfirmed`), blocks it. A
+  Volume whose move is tried again says why the last attempt failed (a
+  transfer cut short, a part lost on its way in). A source cut off
+  mid-copy blocks the drain; its data stays its Volume, nothing takes its
+  place, and once back it sends again.
   `legion node drain <node> --wait [--timeout S] [-o json]` follows it,
   exiting 0 once completed, 2 on the timeout and 1 if the drain is
-  cancelled. The tasks of a node that is `down`
+  cancelled. It asks again through an election, so a waiter on a manager
+  that stays up rides out the leader's loss; point it at the managers'
+  floating address to ride out its own manager's. The tasks of a node that is `down`
   are marked `orphaned` and told to stop, in one write: they leave the
   endpoints, their slots run elsewhere at once (a global service's slot
   goes with the node, and keeps its task number for when the node is
