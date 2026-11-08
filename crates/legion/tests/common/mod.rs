@@ -411,8 +411,11 @@ pub fn clean(data: &str, run: &str) -> String {
          for i in $(ifconfig -l); do
              case $i in lp*|legion0|wg0) ifconfig $i destroy ;; esac
          done
-         pfctl -a legion/svc -F all >/dev/null 2>&1
-         pfctl -a legion/policy -F all >/dev/null 2>&1
+         # Each part on its own, as the agent does: `-F all` on an anchor
+         # fails on FreeBSD 15 partway, leaving its tables and the anchor.
+         for a in legion/svc legion/policy; do
+             for w in Tables nat rules; do pfctl -q -a $a -F $w >/dev/null 2>&1; done
+         done
          # Dying jails may hold mounts for a while: try again until none
          # are left, for up to 30 s.
          i=0; while mount -p | awk '{{print $2}}' | grep -qE '^({data}|{run})/' && [ $i -lt 30 ]; do
