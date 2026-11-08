@@ -53,8 +53,10 @@ pub struct ApiService {
     pub(crate) sessions: std::sync::Arc<crate::session::Hub>,
     /// What tasks use, as heartbeats report it.
     pub(crate) usage: std::sync::Arc<crate::usage::Usage>,
-    /// What this manager speaks and works with.
+    /// What this manager speaks and works with, with agents.
     pub(crate) protocol: legion_api::protocol::Protocol,
+    /// What it speaks and works with among managers: the floor counts.
+    pub(crate) speaking: crate::upgrade::Speaking,
 }
 
 enum Route {

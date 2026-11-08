@@ -26,6 +26,7 @@ pub mod requests;
 mod security;
 mod session;
 mod tls;
+mod upgrade;
 mod usage;
 pub mod vip;
 
@@ -147,6 +148,9 @@ pub struct Manager {
     registry_loopback: bool,
     insecure_registries: Vec<String>,
     protocol: legion_api::protocol::Protocol,
+    /// The protocol among managers, and what each was last heard to speak.
+    speaking: upgrade::Speaking,
+    heard: upgrade::Heard,
     vip: Option<(std::sync::Arc<dyn legion_sys::Sys>, vip::VipConfig)>,
     /// The store as metrics read it, emptied before the store shuts down.
     metrics: metrics::Slot,
@@ -165,7 +169,9 @@ impl Manager {
             .as_ref()
             .map(|t| Credentials::new(&t.ca_pem, &t.cert_pem, &t.key_pem))
             .transpose()?;
-        let network = GrpcNetwork::new(credentials.clone(), config.protocol);
+        let speaking = upgrade::Speaking::new(config.protocol);
+        let heard = upgrade::Heard::default();
+        let network = GrpcNetwork::new(credentials.clone(), speaking.clone(), heard.clone());
         let key = config.store_key.as_ref();
         let store = Store::open_with(id, &config.data_dir, key, config.raft, network).await?;
         tracing::info!(
@@ -186,6 +192,8 @@ impl Manager {
             registry_loopback: config.registry_loopback,
             insecure_registries: config.insecure_registries,
             protocol: config.protocol,
+            speaking,
+            heard,
             vip: config.vip,
             metrics: std::sync::Arc::new(std::sync::RwLock::new(Some(store.clone()))),
             requests: Default::default(),
@@ -223,8 +231,25 @@ impl Manager {
         listener: TcpListener,
         shutdown: impl Future<Output = ()> + Send,
     ) -> Result<(), Error> {
+        // The log may hold commands of the floor's protocol, which an older
+        // build cannot apply.
+        let floor = upgrade::read(&self.store);
+        let speaks = legion_api::protocol::Protocol::said(self.protocol.speaks, 0).speaks;
+        if floor > speaks {
+            return Err(format!(
+                "the cluster's managers speak protocol {floor} and this build {speaks}:                  run a build that speaks {floor} or newer"
+            )
+            .into());
+        }
         let (closing_tx, closing) = tokio::sync::watch::channel(false);
         let usage: std::sync::Arc<usage::Usage> = Default::default();
+        let floor = tokio::spawn(upgrade::run(
+            self.store.clone(),
+            self.id,
+            self.speaking.clone(),
+            self.heard.clone(),
+            closing.clone(),
+        ));
         let controllers = self.controllers.then(|| {
             tokio::spawn(controller::run(
                 self.store.clone(),
@@ -290,6 +315,7 @@ impl Manager {
             sessions,
             usage,
             protocol: self.protocol,
+            speaking: self.speaking.clone(),
         };
         let (dispatcher, dispatching) = dispatcher::DispatcherService::start(
             api.clone(),
@@ -298,7 +324,7 @@ impl Manager {
         );
         let raft = raft_net::RaftService {
             store: self.store.clone(),
-            protocol: self.protocol,
+            speaking: self.speaking.clone(),
             refusals: Default::default(),
         };
         let mut server =
@@ -381,6 +407,7 @@ impl Manager {
             let _ = vip.await;
         }
         let _ = promote.await;
+        let _ = floor.await;
         let _ = dispatching.await;
         tracing::info!("API stopped; shutting down the store");
         *self.metrics.write().unwrap_or_else(|e| e.into_inner()) = None;

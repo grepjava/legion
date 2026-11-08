@@ -1026,8 +1026,14 @@ fn node_state(m: &Running, name: &str) -> Option<String> {
     node.status["state"].as_str().map(str::to_owned)
 }
 
-async fn until(what: &str, mut f: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+async fn until(what: &str, f: impl FnMut() -> bool) {
+    until_within(what, Duration::from_secs(10), f).await
+}
+
+/// [`until`] with a longer wait: a joined manager's promotion to voter
+/// takes longer while the other tests load the host.
+async fn until_within(what: &str, wait: Duration, mut f: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + wait;
     while !f() {
         assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1618,6 +1624,86 @@ async fn a_removed_worker_stays_out_until_it_joins_again() {
     m.stop().await;
 }
 
+/// The managers' protocol floor, as recorded: 1 until raised.
+fn floor(m: &Running) -> u32 {
+    let key = legion_api::ObjectKey::new(
+        legion_api::Kind::Config,
+        legion_manager::SYSTEM_NAMESPACE,
+        "protocol",
+    );
+    m.store
+        .get(&key)
+        .unwrap()
+        .and_then(|o| o.spec["text"].as_str().and_then(|t| t.parse().ok()))
+        .unwrap_or(1)
+}
+
+/// The floor rises to what every manager speaks, and only then: a manager
+/// still on protocol 1 holds it there. Risen, a manager below it may no
+/// longer join, as the log may hold what it cannot apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_floor_rises_once_every_manager_speaks_it() {
+    use legion_api::protocol::{Protocol, SPEAKS};
+    const { assert!(SPEAKS >= 2) };
+    let ca = Ca::generate().unwrap();
+    let token_of = async |m: &Running| {
+        m.cluster()
+            .await
+            .join_token(JoinTokenRequest {
+                role: "manager".into(),
+                rotate: false,
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .token
+    };
+    let one = Protocol {
+        speaks: 1,
+        oldest: 1,
+    };
+    let admin = creds(&ca, "admin", Role::Admin);
+
+    // One manager on protocol 1 holds the floor at 1.
+    let first = Running::start_with(Some(&ca)).await;
+    first.cluster().await.init(InitRequest {}).await.unwrap();
+    let token = token_of(&first).await;
+    let old = Running::join_then_serve_as(&first.addr, &token, "m2", admin.clone(), one).await;
+    let voters = || {
+        let m = first.store.raft.metrics().borrow().clone();
+        m.membership_config.membership().voter_ids().count()
+    };
+    until_within("both voters", Duration::from_secs(30), || voters() == 2).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(floor(&first), 1);
+    old.stop().await;
+    first.stop().await;
+
+    // All on this build, it rises to what they speak.
+    let first = Running::start_with(Some(&ca)).await;
+    first.cluster().await.init(InitRequest {}).await.unwrap();
+    let token = token_of(&first).await;
+    let second = Running::join(&first.addr, &token, "m2", admin).await;
+    until("the floor raised", || floor(&first) == SPEAKS).await;
+    until("the floor everywhere", || floor(&second) == SPEAKS).await;
+
+    // Then a manager on protocol 1 is refused its join.
+    let dir = tempfile::tempdir().unwrap();
+    let id = legion_manager::node_id(dir.path()).unwrap();
+    let err = legion_manager::join_as(&first.addr, &token, "m3", id, "127.0.0.1:1", one)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(&format!(
+            "node m3 speaks protocol 1, older than {SPEAKS}, the oldest this one works with: upgrade it first"
+        )),
+        "{err}"
+    );
+    second.stop().await;
+    first.stop().await;
+}
+
 /// A manager upgraded past what the others work with takes no part in the
 /// cluster: each refuses the other's Raft calls, so it neither catches up
 /// nor votes, and the others go on without it. One protocol ahead, it
@@ -1661,7 +1747,10 @@ async fn a_manager_upgraded_too_far_takes_no_part() {
         far.store.raft.metrics().borrow().id,
         near.store.raft.metrics().borrow().id,
     );
-    until("the near manager a voter", || voter(near_id)).await;
+    until_within("the near manager a voter", Duration::from_secs(30), || {
+        voter(near_id)
+    })
+    .await;
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(!voter(far_id));
     let applied = far.store.raft.metrics().borrow().last_applied;
@@ -1756,22 +1845,29 @@ async fn a_node_of_a_build_the_manager_cannot_work_with_is_refused() {
         async move { d.register(req).await }
     };
 
-    let err = register("new", r#","protocol":{"speaks":3,"oldest":2}"#)
+    use legion_api::protocol::{OLDEST, SPEAKS};
+    let said = |speaks: u32, oldest: u32| {
+        format!(r#","protocol":{{"speaks":{speaks},"oldest":{oldest}}}"#)
+    };
+    let err = register("new", &said(SPEAKS + 2, SPEAKS + 1))
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::Unimplemented, "{err}");
     assert_eq!(
         err.message(),
-        "node new works with protocol 2 and newer, and this one speaks 1: upgrade this one first"
+        format!(
+            "node new works with protocol {} and newer, and this one speaks {SPEAKS}: upgrade this one first",
+            SPEAKS + 1
+        )
     );
     assert_eq!(node_state(&m, "new"), None);
 
     // One protocol ahead, or from before the handshake, it is taken.
     for (node, protocol) in [
-        ("next", r#","protocol":{"speaks":2,"oldest":1}"#),
-        ("before", ""),
+        ("next", said(SPEAKS + 1, OLDEST)),
+        ("before", String::new()),
     ] {
-        let answer = eventually(|| register(node, protocol)).await.into_inner();
+        let answer = eventually(|| register(node, &protocol)).await.into_inner();
         assert_eq!(
             (answer.protocol, answer.oldest_protocol),
             (legion_api::protocol::SPEAKS, legion_api::protocol::OLDEST)

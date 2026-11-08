@@ -203,6 +203,18 @@ impl Issuer {
                 "a manager joins with its node id and advertised address",
             ));
         }
+        // A manager applies the log, which may hold commands of the
+        // floor's protocol.
+        let protocol = match role {
+            Role::Manager => api.speaking.among_managers(),
+            _ => api.protocol,
+        };
+        protocol
+            .works_with(
+                Protocol::said(req.protocol, req.oldest_protocol),
+                &format!("node {}", req.name),
+            )
+            .map_err(Status::unimplemented)?;
         let id = Identity::new(&req.name, role);
         // A bad request is refused before anything is written.
         self.ca
@@ -211,7 +223,6 @@ impl Issuer {
         // Run to the end even if the caller goes: stopped between its
         // writes, it would leave the name's earlier certificates refused
         // for a join that did not happen.
-        let protocol = api.protocol;
         let (issuer, api, task_req) = (self.clone(), api.clone(), req.clone());
         let cert_pem = tokio::spawn(async move { issuer.admit(&api, &task_req, role).await })
             .await

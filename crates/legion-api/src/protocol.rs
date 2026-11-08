@@ -8,8 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The protocol this build speaks.
-pub const SPEAKS: u32 = 1;
+/// The protocol this build speaks. 2: the managers' log may hold guarded
+/// writes (`legion_store::Command::Guarded`).
+pub const SPEAKS: u32 = 2;
 /// The oldest protocol this build works with.
 pub const OLDEST: u32 = 1;
 

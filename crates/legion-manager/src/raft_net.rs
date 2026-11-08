@@ -28,6 +28,7 @@ use serde::de::DeserializeOwned;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::Credentials;
+use crate::upgrade::{Heard, Speaking};
 use tonic::{Request, Response, Status};
 
 /// Largest gRPC message a manager accepts, for log batches and snapshot chunks.
@@ -71,22 +72,23 @@ fn refused(seen: &Refusals, why: &str) {
 }
 
 /// Hands openraft one lazily connected channel per peer.
-#[derive(Default)]
 pub struct GrpcNetwork {
     channels: HashMap<(NodeId, String), Channel>,
     tls: Option<Arc<Credentials>>,
-    protocol: Protocol,
+    speaking: Speaking,
+    heard: Heard,
     refusals: Refusals,
 }
 
 impl GrpcNetwork {
     /// Calls peers with mutual TLS when `tls` is given, saying it speaks
-    /// `protocol`.
-    pub fn new(tls: Option<Arc<Credentials>>, protocol: Protocol) -> Self {
+    /// what `speaking` says, and noting in `heard` what peers answer.
+    pub(crate) fn new(tls: Option<Arc<Credentials>>, speaking: Speaking, heard: Heard) -> Self {
         GrpcNetwork {
             channels: HashMap::new(),
             tls,
-            protocol,
+            speaking,
+            heard,
             refusals: Refusals::default(),
         }
     }
@@ -106,7 +108,8 @@ impl RaftNetworkFactory<TypeConfig> for GrpcNetwork {
             client: RaftClient::new(channel)
                 .max_decoding_message_size(MAX_MESSAGE)
                 .max_encoding_message_size(MAX_MESSAGE),
-            protocol: self.protocol,
+            speaking: self.speaking.clone(),
+            heard: self.heard.clone(),
             refusals: self.refusals.clone(),
         }
     }
@@ -126,7 +129,8 @@ pub(crate) fn connect_lazy(addr: &str, tls: Option<&Arc<Credentials>>) -> Channe
 pub struct PeerClient {
     target: NodeId,
     client: RaftClient<Channel>,
-    protocol: Protocol,
+    speaking: Speaking,
+    heard: Heard,
     refusals: Refusals,
 }
 
@@ -163,7 +167,8 @@ impl PeerClient {
     {
         let mut request = Request::new(RaftPayload { json });
         request.set_timeout(option.hard_ttl());
-        say(request.metadata_mut(), self.protocol);
+        let mine = self.speaking.among_managers();
+        say(request.metadata_mut(), mine);
         let response = match method {
             Method::Append => self.client.append_entries(request).await,
             Method::Vote => self.client.vote(request).await,
@@ -181,7 +186,12 @@ impl PeerClient {
         })?;
         // A peer from before the handshake answers anyone: refused here,
         // it is unreachable, and counts toward no quorum.
-        if let Err(why) = self.protocol.works_with(heard(response.metadata()), &peer) {
+        let theirs = heard(response.metadata());
+        self.heard
+            .lock()
+            .unwrap()
+            .insert(self.target, (theirs, tokio::time::Instant::now()));
+        if let Err(why) = mine.works_with(theirs, &peer) {
             refused(&self.refusals, &why);
             return Err(RPCError::Unreachable(Unreachable::new(&io::Error::other(
                 why,
@@ -274,8 +284,8 @@ pub struct RaftService {
     pub store: Store,
     /// What this manager speaks: calls from managers it cannot work with
     /// are refused.
-    pub protocol: Protocol,
-    pub refusals: Refusals,
+    pub(crate) speaking: Speaking,
+    pub(crate) refusals: Refusals,
 }
 
 fn decode<T: DeserializeOwned>(req: Request<RaftPayload>) -> Result<T, Status> {
@@ -305,7 +315,8 @@ impl RaftService {
             .leader_id()
             .voted_for()
             .map_or("?".into(), |f| f.to_string());
-        self.protocol
+        self.speaking
+            .among_managers()
             .works_with(peer, &format!("manager {from}"))
             .map_err(|why| {
                 refused(&self.refusals, &why);
@@ -316,7 +327,7 @@ impl RaftService {
     /// The answer, saying what this manager speaks.
     fn answer<T: Serialize>(&self, result: T) -> Result<Response<RaftPayload>, Status> {
         let mut response = encode(result)?;
-        say(response.metadata_mut(), self.protocol);
+        say(response.metadata_mut(), self.speaking.among_managers());
         Ok(response)
     }
 }
