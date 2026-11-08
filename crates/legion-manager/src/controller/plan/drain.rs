@@ -14,8 +14,8 @@ use super::{Action, Node, Plan, Task, Volumes};
 
 pub(super) fn drains(tasks: &[Task], nodes: &[Node], volumes: &Volumes, plan: &mut Plan) {
     for n in nodes {
-        let wanted =
-            (n.spec.availability == Availability::Drain).then(|| status(n, tasks, volumes));
+        let wanted = (n.spec.availability == Availability::Drain)
+            .then(|| status(n, tasks, volumes, &plan.waits));
         if wanted == n.status.drain {
             continue;
         }
@@ -28,7 +28,13 @@ pub(super) fn drains(tasks: &[Task], nodes: &[Node], volumes: &Volumes, plan: &m
     }
 }
 
-fn status(n: &Node, tasks: &[Task], volumes: &Volumes) -> DrainStatus {
+/// `waits`: why the planner left a task running this pass, by uid.
+fn status(
+    n: &Node,
+    tasks: &[Task],
+    volumes: &Volumes,
+    waits: &std::collections::BTreeMap<String, &'static str>,
+) -> DrainStatus {
     let mut remaining = Vec::new();
     for t in tasks.iter().filter(|t| t.spec.node == n.name()) {
         let reason = if t.status.state == TaskState::Orphaned {
@@ -38,7 +44,7 @@ fn status(n: &Node, tasks: &[Task], volumes: &Volumes) -> DrainStatus {
         } else if t.spec.desired_state == DesiredState::Shutdown {
             "stopping"
         } else {
-            "running"
+            waits.get(t.uid()).copied().unwrap_or("running")
         };
         remaining.push(DrainItem {
             kind: "Task".into(),

@@ -202,6 +202,10 @@ pub struct Plan {
     pub actions: Vec<Action>,
     /// Call again by then, even if nothing changes.
     pub wake: Option<Instant>,
+    /// Why a task off a draining node runs on, by uid: `data` (copied
+    /// first), `budget` (the disruption budget), or `replacement` (started
+    /// first). For the drain's status.
+    pub waits: BTreeMap<String, &'static str>,
 }
 
 impl Plan {
@@ -929,6 +933,20 @@ fn service(
                     for old in moving.iter().filter(|t| !up(t)) {
                         plan.actions.push(stop(old));
                     }
+                    for old in moving.iter().filter(|t| up(t)) {
+                        plan.waits.insert(old.uid().to_owned(), "replacement");
+                    }
+                } else {
+                    let why = if !copied {
+                        "data"
+                    } else if new.placed() {
+                        "replacement"
+                    } else {
+                        "budget"
+                    };
+                    for old in &moving {
+                        plan.waits.insert(old.uid().to_owned(), why);
+                    }
                 }
             }
         } else if !moving.is_empty() {
@@ -939,11 +957,25 @@ fn service(
             // to keep a ready task: one not ready (an update's new task,
             // say, beside a ready old one) stops first all the same.
             let ready = moving.iter().any(|t| up(t));
-            if copied && (bound || !start_first || !ready) && may_stop(&moving) {
+            let stopping = copied && (bound || !start_first || !ready) && may_stop(&moving);
+            if stopping {
                 for old in &moving {
                     plan.actions.push(stop(old));
                 }
-            } else if !bound {
+            } else {
+                // Not bound, it is replaced first; bound, it waits.
+                let why = if !bound {
+                    "replacement"
+                } else if !copied {
+                    "data"
+                } else {
+                    "budget"
+                };
+                for old in &moving {
+                    plan.waits.insert(old.uid().to_owned(), why);
+                }
+            }
+            if !stopping && !bound {
                 let failures = list.iter().rev().take_while(|t| t.failed()).count();
                 let due = list.last().map_or(now, |last| {
                     backoff(last, failures, policy.delay.as_std(), memory, now)

@@ -167,10 +167,12 @@ pub struct DrainItem {
     pub kind: String,
     pub namespace: String,
     pub name: String,
-    /// For a task: `running` (not yet told to stop: waiting its turn under
-    /// its service's disruption budget, or for its data to be copied),
-    /// `stopping`, or `unconfirmed` (orphaned, not yet seen to stop). For a
-    /// Volume: `copying` or `finishing`, as its data moves off.
+    /// For a task still told to run: `budget` (its service's disruption
+    /// budget holds it), `data` (its data is copied first),
+    /// `replacement` (its replacement starts first), or `running` (not yet
+    /// planned). Told to stop: `stopping`, or `unconfirmed` (orphaned, not
+    /// yet seen to stop). For a Volume: `copying` or `finishing`, as its
+    /// data moves off.
     pub reason: String,
 }
 

@@ -2723,6 +2723,33 @@ fn a_disruption_budget_paces_drains() {
     }
 }
 
+/// A drain says why a task stays: the disruption budget spent on the other
+/// task leaving the node, it is replaced first.
+#[test]
+fn a_drain_says_a_task_waits_for_its_replacement() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.service(
+        "web",
+        &format!(
+            "replicas: 4
+{POD}
+maxUnavailable: 1"
+        ),
+    );
+    w.settle();
+    w.availability("n1", Availability::Drain);
+    w.agents = false;
+    w.step();
+    w.step();
+    let (phase, _, left) = w.drain("n1").unwrap();
+    assert_eq!(phase, "draining");
+    let mut reasons: Vec<&str> = left.iter().map(|l| l.rsplit(' ').next().unwrap()).collect();
+    reasons.sort();
+    assert_eq!(reasons, ["replacement", "stopping"], "{left:?}");
+}
+
 #[test]
 fn a_budget_spent_elsewhere_drains_start_first() {
     let mut w = World::new();
@@ -3104,7 +3131,7 @@ fn stateful_tasks_move_with_their_data_off_a_draining_node() {
             "draining".into(),
             String::new(),
             vec![
-                "Task db-0-1 running".to_owned(),
+                "Task db-0-1 data".to_owned(),
                 "Volume data-db-0 copying".to_owned()
             ]
         ))
