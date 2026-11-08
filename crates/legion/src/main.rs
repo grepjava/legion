@@ -77,6 +77,12 @@ enum Command {
         /// using volumes are rejected.
         #[arg(long)]
         zfs_root: Option<String>,
+        /// A registry, `host[:port]`, reached over plain HTTP rather than
+        /// HTTPS (repeatable): by managers resolving tags, and by this node
+        /// pulling. For internal registries without TLS: anyone on the
+        /// path can read and change what is pulled. Set it on every node.
+        #[arg(long = "insecure-registry", value_parser = registry_host)]
+        insecure_registries: Vec<String>,
         /// Workers: a manager to call, `host:port` (repeatable). Defaults to
         /// the managers recorded at join and learned since.
         #[arg(long = "manager")]
@@ -457,6 +463,18 @@ fn main() -> anyhow::Result<()> {
         .block_on(run())
 }
 
+/// A registry as `--insecure-registry` takes it: `host[:port]`, no scheme
+/// or path, as image references name registries.
+fn registry_host(s: &str) -> Result<String, String> {
+    let s = s.trim().to_ascii_lowercase();
+    if s.is_empty() || s.contains("://") || s.contains('/') {
+        return Err(format!(
+            "{s:?}: a registry is host[:port], as in an image reference"
+        ));
+    }
+    Ok(s)
+}
+
 async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.command {
@@ -479,6 +497,7 @@ async fn run() -> anyhow::Result<()> {
             ingress_tls_listen,
             linux,
             volume_plugins,
+            insecure_registries,
         } => {
             let vip = match (vip, vip_interface, vip_password_file) {
                 (Some(addr), Some(interface), Some(file)) => {
@@ -511,6 +530,7 @@ async fn run() -> anyhow::Result<()> {
                 ingress_tls_listen,
                 linux,
                 volume_plugins,
+                insecure_registries,
             })
             .await
         }
@@ -563,4 +583,21 @@ pub(crate) async fn shutdown_signal() {
     #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutting down");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::registry_host;
+
+    #[test]
+    fn an_insecure_registry_is_a_host_and_port() {
+        assert_eq!(
+            registry_host("Registry.lan:5000").as_deref(),
+            Ok("registry.lan:5000")
+        );
+        assert_eq!(registry_host("10.78.0.1").as_deref(), Ok("10.78.0.1"));
+        for bad in ["", "http://r.lan:5000", "r.lan:5000/v2", " "] {
+            assert!(registry_host(bad).is_err(), "{bad:?}");
+        }
+    }
 }

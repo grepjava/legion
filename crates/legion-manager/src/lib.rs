@@ -73,6 +73,9 @@ pub struct ManagerConfig {
     /// Whether registries on this host's loopback are asked over plain
     /// HTTP when tags are resolved: only tests run one there.
     pub registry_loopback: bool,
+    /// Registries (`host[:port]`) asked over plain HTTP when tags are
+    /// resolved, as the operator set them: internal ones without TLS.
+    pub insecure_registries: Vec<String>,
 }
 
 impl ManagerConfig {
@@ -90,6 +93,7 @@ impl ManagerConfig {
             store_key: None,
             acme_loopback: false,
             registry_loopback: false,
+            insecure_registries: Vec::new(),
         }
     }
 }
@@ -137,6 +141,7 @@ pub struct Manager {
     controllers: bool,
     acme_loopback: bool,
     registry_loopback: bool,
+    insecure_registries: Vec<String>,
     vip: Option<(std::sync::Arc<dyn legion_sys::Sys>, vip::VipConfig)>,
     /// The store as metrics read it, emptied before the store shuts down.
     metrics: metrics::Slot,
@@ -174,6 +179,7 @@ impl Manager {
             controllers: config.controllers,
             acme_loopback: config.acme_loopback,
             registry_loopback: config.registry_loopback,
+            insecure_registries: config.insecure_registries,
             vip: config.vip,
             metrics: std::sync::Arc::new(std::sync::RwLock::new(Some(store.clone()))),
             requests: Default::default(),
@@ -226,6 +232,7 @@ impl Manager {
                 self.store.clone(),
                 self.id,
                 self.registry_loopback,
+                self.insecure_registries.clone(),
                 closing.clone(),
             ))
         });

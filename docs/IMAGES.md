@@ -194,6 +194,21 @@ pod:
 kept private to the namespaces that pulled it: another namespace pulls it
 again, with its own login, and the registry decides.
 
+### From a registry without TLS
+
+Legion reaches registries over HTTPS. An internal one that serves plain
+HTTP has to be named on every node, managers included, as the managers
+resolve tags and the nodes pull:
+
+```sh
+sysrc legion_args+=" --insecure-registry registry.lan:5000"
+```
+
+The flag repeats, one registry each, named as image references name them
+(`host[:port]`). Anyone on the network path can read and change what is
+pulled from such a registry, logins included, so keep it to networks you
+trust.
+
 ### Without a registry
 
 Save the image as an OCI archive and load it on each node that may run

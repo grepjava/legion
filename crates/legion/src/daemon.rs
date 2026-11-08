@@ -33,6 +33,9 @@ pub struct Options {
     pub linux: bool,
     /// Where the volume plugins are, if not in the default place.
     pub volume_plugins: Option<PathBuf>,
+    /// Registries (`host[:port]`) reached over plain HTTP: by the managers
+    /// resolving tags, and by the node pulling.
+    pub insecure_registries: Vec<String>,
 }
 
 pub async fn run(opts: Options) -> anyhow::Result<()> {
@@ -78,6 +81,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         tls: Some(tls),
         vip,
         store_key: Some(store_key),
+        insecure_registries: opts.insecure_registries.clone(),
         ..legion_manager::ManagerConfig::new(&opts.data_dir, &advertise)
     })
     .await
@@ -408,8 +412,12 @@ fn image_store(
     sys: Arc<dyn legion_sys::Sys>,
     data_dir: &Path,
     zfs_root: &str,
+    insecure_registries: &[String],
 ) -> anyhow::Result<legion_image::Store> {
-    let client = legion_image::Client::new().map_err(|e| anyhow::anyhow!(e))?;
+    let client = insecure_registries.iter().fold(
+        legion_image::Client::new().map_err(|e| anyhow::anyhow!(e))?,
+        |c, r| c.plain_http(r),
+    );
     legion_image::Store::open(
         sys,
         &format!("{zfs_root}/images"),
@@ -426,7 +434,8 @@ pub async fn load_image(
     data_dir: &Path,
     zfs_root: &str,
 ) -> anyhow::Result<()> {
-    let store = image_store(Arc::new(legion_sys::Shell::new()), data_dir, zfs_root)?;
+    // Loading reaches no registry.
+    let store = image_store(Arc::new(legion_sys::Shell::new()), data_dir, zfs_root, &[])?;
     let image = store
         .load(file, name)
         .await
@@ -443,7 +452,7 @@ fn jail_runtime(
     let Some(zfs) = opts.zfs_root.as_deref() else {
         bail!("the agent keeps images and containers in ZFS: pass --zfs-root");
     };
-    let mut images = image_store(sys.clone(), &opts.data_dir, zfs)?;
+    let mut images = image_store(sys.clone(), &opts.data_dir, zfs, &opts.insecure_registries)?;
     if opts.linux {
         for m in legion_jail::LINUX_MODULES {
             sys.kld_load(m)

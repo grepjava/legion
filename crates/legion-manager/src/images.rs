@@ -71,10 +71,17 @@ impl Registry for Live {
 }
 
 /// Resolves pods whenever this manager leads, until `closing` turns true.
-/// With `loopback`, registries on this host are asked over plain HTTP.
-pub async fn run(store: Store, id: NodeId, loopback: bool, closing: watch::Receiver<bool>) {
+/// With `loopback`, registries on this host are asked over plain HTTP, as
+/// are the `insecure` ones (`host[:port]`).
+pub async fn run(
+    store: Store,
+    id: NodeId,
+    loopback: bool,
+    insecure: Vec<String>,
+    closing: watch::Receiver<bool>,
+) {
     let client = match legion_image::Client::new() {
-        Ok(c) => c,
+        Ok(c) => insecure.iter().fold(c, |c, r| c.plain_http(r)),
         Err(e) => {
             tracing::error!("image resolver: no registry client: {e}");
             return;
