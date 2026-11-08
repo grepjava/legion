@@ -765,7 +765,7 @@ fn a_drain_waiter_survives_the_leaders_loss() {
     let leads = |d: &Daemon| ok(d, &["status"]).contains("state:    Leader");
     let deadline = Instant::now() + Duration::from_secs(30);
     let leader = loop {
-        if let Some(i) = managers.iter().position(|m| leads(m)) {
+        if let Some(i) = managers.iter().position(&leads) {
             break i;
         }
         assert!(Instant::now() < deadline, "no leader");
