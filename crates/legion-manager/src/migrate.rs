@@ -5,7 +5,9 @@
 //! changes since, then it gives the Volume to the new node and has the old
 //! one drop its copy. Both agents attach to this manager's sessions (see
 //! [`crate::session`]), which joins them, so nodes need no port of their
-//! own. A failed attempt is noted in the migration and tried again.
+//! own. A failed attempt is noted in the migration and tried again, after
+//! longer each time it fails again: a node out of space would otherwise
+//! be sent the full copy every few seconds.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -28,8 +30,31 @@ use crate::session::Hub;
 
 /// How often the Volumes are looked at.
 const PERIOD: Duration = Duration::from_secs(1);
-/// How long after a failed attempt the next one starts.
+/// How long after a failed attempt the next one starts: then twice as
+/// long after each failure in a row, up to [`RETRY_MAX`].
 const RETRY: Duration = Duration::from_secs(5);
+const RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// How long after the `count`th failure in a row the next attempt starts.
+fn backoff(count: u32) -> Duration {
+    RETRY
+        .saturating_mul(2u32.saturating_pow(count.saturating_sub(1)))
+        .min(RETRY_MAX)
+}
+
+/// A migration's failures in a row, of one phase to one node.
+struct Failures {
+    to: String,
+    phase: MigrationPhase,
+    count: u32,
+    last: Instant,
+}
+
+impl Failures {
+    fn of(&self, m: &Migration) -> bool {
+        self.to == m.to && self.phase == m.phase
+    }
+}
 /// How long a transfer may go without a frame.
 const IDLE: Duration = Duration::from_secs(120);
 
@@ -75,7 +100,7 @@ async fn lead(store: &Store, hub: &Arc<Hub>) {
     // among the Volume's leftovers, written by the controller.
     let mut running: HashMap<ObjectKey, (Migration, Option<watch::Sender<bool>>)> = HashMap::new();
     let mut tasks: JoinSet<(ObjectKey, Migration, Result<(), String>)> = JoinSet::new();
-    let mut failed: HashMap<ObjectKey, Instant> = HashMap::new();
+    let mut failed: HashMap<ObjectKey, Failures> = HashMap::new();
     // Old copies being dropped, and when a drop last failed.
     let mut drops: JoinSet<(ObjectKey, String, Result<(), String>)> = JoinSet::new();
     let mut dropping: HashSet<(ObjectKey, String)> = HashSet::new();
@@ -84,10 +109,27 @@ async fn lead(store: &Store, hub: &Arc<Hub>) {
         while let Some(done) = tasks.try_join_next() {
             let Ok((key, m, result)) = done else { continue };
             running.remove(&key);
-            if let Err(e) = result {
-                tracing::warn!(volume = %key, to = %m.to, "moving the volume: {e}");
-                failed.insert(key.clone(), Instant::now());
-                note(store, &key, &m, &e).await;
+            match result {
+                Err(e) => {
+                    let f = failed.entry(key.clone()).or_insert(Failures {
+                        to: m.to.clone(),
+                        phase: m.phase,
+                        count: 0,
+                        last: Instant::now(),
+                    });
+                    if !f.of(&m) {
+                        (f.to, f.phase, f.count) = (m.to.clone(), m.phase, 0);
+                    }
+                    f.count += 1;
+                    f.last = Instant::now();
+                    let next = backoff(f.count);
+                    tracing::warn!(volume = %key, to = %m.to, attempt = f.count, "moving the volume: {e}");
+                    let why = format!("{e} (attempt {}; the next in {}s)", f.count, next.as_secs());
+                    note(store, &key, &m, &why).await;
+                }
+                Ok(()) => {
+                    failed.remove(&key);
+                }
             }
         }
         // Nothing is called off on a failed read.
@@ -165,7 +207,9 @@ async fn lead(store: &Store, hub: &Arc<Hub>) {
             };
             if m.phase == MigrationPhase::Copied
                 || running.contains_key(&key)
-                || failed.get(&key).is_some_and(|t| t.elapsed() < RETRY)
+                || failed
+                    .get(&key)
+                    .is_some_and(|f| f.of(&m) && f.last.elapsed() < backoff(f.count))
                 || moves_through_a_drop(&key, &status.node, &m, &dropping)
             {
                 continue;
@@ -533,6 +577,13 @@ mod tests {
 
     fn ok(f: Frame) -> Result<SessionFrame, tonic::Status> {
         Ok(frame(f))
+    }
+
+    #[test]
+    fn attempts_after_failures_wait_longer_each_time() {
+        let waits: Vec<u64> = (1..=8).map(|n| backoff(n).as_secs()).collect();
+        assert_eq!(waits, [5, 10, 20, 40, 80, 160, 300, 300]);
+        assert_eq!(backoff(u32::MAX), RETRY_MAX);
     }
 
     #[test]
