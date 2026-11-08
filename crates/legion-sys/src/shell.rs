@@ -951,7 +951,13 @@ impl<R: Runner> Sys for Shell<R> {
             a.extend(["-o".to_owned(), format!("{k}={v}")]);
         }
         a.push(name.to_owned());
-        self.run("zfs", &a).map(drop)
+        let out = self.output("zfs", &a, None)?;
+        // Made meanwhile by another, as two pods' first containers make
+        // their parent at once: `-p` holds a dataset that exists as made.
+        if out.success || out.stderr.contains("dataset already exists") {
+            return Ok(());
+        }
+        Err(failed("zfs", &a, &out))
     }
 
     fn zfs_set(&self, name: &str, prop: &str, value: &str) -> Result<()> {
@@ -2232,6 +2238,24 @@ mod tests {
         .unwrap();
         sh.zfs_destroy("tank/legion/volumes/shop/data", true)
             .unwrap();
+    }
+
+    /// Two creates of one parent at once: the one that loses finds it made,
+    /// which is what `-p` asks for. Another failure stays one.
+    #[test]
+    fn a_dataset_made_meanwhile_is_made() {
+        let sh = Script::shell(vec![
+            (
+                "zfs create -p -o mountpoint=none p/jails",
+                err("cannot create 'p/jails': dataset already exists"),
+            ),
+            (
+                "zfs create -p p/full",
+                err("cannot create 'p/full': out of space"),
+            ),
+        ]);
+        sh.zfs_create("p/jails", &[("mountpoint", "none")]).unwrap();
+        assert!(sh.zfs_create("p/full", &[]).is_err());
     }
 
     #[test]
