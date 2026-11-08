@@ -9,7 +9,9 @@ where none does yet, it says so. The design behind it is in
 Legion fails open. A workload keeps running when the control plane can't
 reach it, because surviving a control-plane outage is a stated goal. The
 cost is that a workload can run twice for a while, once on each side of a
-split. The cases are listed under [Running twice](#running-twice).
+split. The cases are listed under [Running twice](#running-twice). A pod
+that must never run twice says so, and fails closed instead: see
+[Pods that must not run twice](#pods-that-must-not-run-twice).
 
 ## A worker cut off from the managers
 
@@ -134,6 +136,37 @@ Where an old copy of a workload and its replacement can run at once today:
 A task bound to a volume used by one node at a time doesn't run twice
 during a split: its replacement waits for the volume.
 
+## Pods that must not run twice
+
+```yaml
+pod:
+  onPartition: stop        # the default is run
+  stopGracePeriod: 10s
+  containers: [...]
+```
+
+A pod with `onPartition: stop` fails closed. Its node's agent stops it once
+the managers haven't answered a heartbeat for as long as the leader takes
+to mark the node down: 8 heartbeat periods, 16 s by default, counted from
+when the agent sent the last heartbeat that was answered, so never later
+than the leader counts. The managers replace it only once its stop grace
+period and 5 s more have passed since they orphaned it. So the old pod is
+gone before its replacement is placed, as long as the two clocks run at
+the same rate. Cut off, such a pod doesn't run at all, which is the price:
+a node cut off from the managers but serving its clients stops serving
+them.
+
+A stop doesn't wait for the managers: a status report under way gives way
+to it, and is sent again once they answer. Tested:
+`a_task_that_must_not_run_twice_is_replaced_after_its_node_stopped_it`
+(the planner) and `a_pod_that_must_not_run_twice_stops_before_it_is_replaced`
+(agents in a real cluster, cut off by a silent link).
+
+A new leader starts the wait anew when it first sees the orphaned task,
+which only makes it longer. Not covered: an agent from before v0.1.15
+doesn't stop such a pod, so its replacement runs beside it, as with any
+other pod.
+
 ## A volume an orphaned task used
 
 An orphaned task's pod may still be running on its node, so a volume used
@@ -166,9 +199,7 @@ PLAN.md phase 4 turns this into tests and decisions:
 
 - Fault injection for asymmetric partitions and stale assignments, for the
   cases above that no test shows yet.
-- Decision 3, recommended: fail-open stays the default, with an opt-in
-  fail-closed mode for workloads that must never run twice. Such a
-  workload's agent stops it once cut off for longer than the managers take
-  to replace it, and the managers wait that long before they do.
+- Decision 3, taken as recommended: fail-open stays the default, and
+  `onPartition: stop` is the opt-in fail-closed mode, above.
 - Exclusive storage moves only on a confirmed release, or on removal, which
   the operator states means the node has stopped.
