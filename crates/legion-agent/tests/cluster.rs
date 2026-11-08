@@ -823,6 +823,200 @@ async fn stateful_data_moves_off_a_draining_node() {
     c.stop().await;
 }
 
+/// A node's drain status, as the leader last wrote it.
+async fn drain_of(c: &Cluster, node: &str) -> serde_json::Value {
+    c.list(Kind::Node)
+        .await
+        .into_iter()
+        .find(|n| n.metadata.name == node)
+        .map(|n| n.status["drain"].clone())
+        .unwrap_or_default()
+}
+
+/// The drain's item for the Volume, if it is one.
+fn volume_item<'a>(drain: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    drain["remaining"]
+        .as_array()?
+        .iter()
+        .find(|i| i["kind"] == "Volume" && i["name"] == name)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupted_transfer_is_tried_again_and_the_drain_waits_for_it() {
+    let c = Cluster::start(3).await;
+    c.apply(&DB.replace("MAX", "0")).await;
+    let task = async |c: &Cluster| {
+        c.list(Kind::Task)
+            .await
+            .into_iter()
+            .find(|t| t.status["state"] == "running")
+    };
+    eventually("db running", async || task(&c).await.is_some()).await;
+    let from = task(&c).await.unwrap().spec["node"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let index = |name: &str| c.nodes.iter().position(|n| n.name == name).unwrap();
+    let ds = "tank/legion/volumes/shop/data-db-0";
+    c.nodes[index(&from)].sys.write_dataset(ds, b"rows 1");
+    let volume = async |c: &Cluster| {
+        c.list(Kind::Volume)
+            .await
+            .into_iter()
+            .find(|v| v.metadata.name == "data-db-0")
+            .unwrap()
+    };
+
+    // The full copy is cut short: the drain says why, and goes on.
+    c.nodes[index(&from)].sys.fail_next("zfs send");
+    c.availability(&from, "drain").await;
+    eventually("the cut copy in the drain status", async || {
+        let d = drain_of(&c, &from).await;
+        d["phase"] == "draining"
+            && volume_item(&d, "data-db-0").is_some_and(|i| {
+                i["reason"] == "copying" && i["message"].as_str().is_some_and(|m| !m.is_empty())
+            })
+    })
+    .await;
+    eventually("copied on the next attempt", async || {
+        volume(&c).await.status["migration"]["phase"] == "copied"
+    })
+    .await;
+    let to = volume(&c).await.status["migration"]["to"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        c.nodes[index(&to)].sys.dataset_contents(ds).as_deref(),
+        Some(&b"rows 1"[..])
+    );
+    let d = drain_of(&c, &from).await;
+    assert_eq!(d["phase"], "draining", "{d}");
+    assert!(volume_item(&d, "data-db-0").is_some(), "{d}");
+
+    // The last part is lost on its way in: tried again too, and the task
+    // starts on its new node only with all of its data there.
+    c.nodes[index(&from)].sys.write_dataset(ds, b"rows 2");
+    c.nodes[index(&to)].sys.fail_next("zfs receive");
+    c.apply(&DB.replace("MAX", "1")).await;
+    eventually("the lost last part in the drain status", async || {
+        volume_item(&drain_of(&c, &from).await, "data-db-0").is_some_and(|i| {
+            i["reason"] == "finishing" && i["message"].as_str().is_some_and(|m| !m.is_empty())
+        })
+    })
+    .await;
+    eventually("the drain completed", async || {
+        drain_of(&c, &from).await["phase"] == "completed"
+    })
+    .await;
+    let d = drain_of(&c, &from).await;
+    assert!(d.get("remaining").is_none(), "{d}");
+    let v = volume(&c).await;
+    assert_eq!(v.status["node"], to.as_str());
+    assert!(v.status.get("migration").is_none(), "{}", v.status);
+    assert_eq!(
+        c.nodes[index(&to)].sys.dataset_contents(ds).as_deref(),
+        Some(&b"rows 2"[..])
+    );
+    eventually("db running on its new node", async || {
+        task(&c)
+            .await
+            .is_some_and(|t| t.spec["node"] == to.as_str())
+    })
+    .await;
+    c.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drain_whose_source_is_cut_off_mid_copy_waits_for_it() {
+    let c = Cluster::start(3).await;
+    c.apply(&DB.replace("MAX", "1")).await;
+    let running = async |c: &Cluster| {
+        c.list(Kind::Task)
+            .await
+            .into_iter()
+            .filter(|t| t.status["state"] == "running")
+            .collect::<Vec<_>>()
+    };
+    eventually("db running", async || !running(&c).await.is_empty()).await;
+    let from = running(&c).await[0].spec["node"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let i = c.nodes.iter().position(|n| n.name == from).unwrap();
+    let ds = "tank/legion/volumes/shop/data-db-0";
+    c.nodes[i].sys.write_dataset(ds, b"rows 1");
+
+    // The node is cut off as it starts sending.
+    let cut = c.nodes[i].link.cut.clone();
+    c.nodes[i].sys.before_send(move || {
+        cut.send_replace(true);
+    });
+    c.availability(&from, "drain").await;
+    eventually("the drain blocked on the unreachable node", async || {
+        let d = drain_of(&c, &from).await;
+        d["phase"] == "blocked" && d["reason"] == "unreachable"
+    })
+    .await;
+    // Its data is still there, and nothing of the database runs elsewhere
+    // or takes the copy as the Volume.
+    tokio::time::sleep(HEARTBEAT * 10).await;
+    let v = c
+        .list(Kind::Volume)
+        .await
+        .into_iter()
+        .find(|v| v.metadata.name == "data-db-0")
+        .unwrap();
+    assert_eq!(v.status["node"], from.as_str(), "{}", v.status);
+    assert_eq!(v.status["migration"]["phase"], "copying", "{}", v.status);
+    let elsewhere: Vec<_> = running(&c)
+        .await
+        .into_iter()
+        .filter(|t| t.spec["node"] != from.as_str())
+        .collect();
+    assert!(elsewhere.is_empty(), "{elsewhere:?}");
+    let dbs = |c: &Cluster| {
+        c.nodes[i]
+            .rt
+            .containers()
+            .into_iter()
+            .filter(|(n, running, _)| *running && n.ends_with("_db"))
+            .count()
+    };
+    // Running on, as a pod cut off does unless it must not run twice.
+    assert_eq!(dbs(&c), 1);
+
+    // Back, it sends again; the drain then ends as one never cut off does.
+    c.nodes[i].link.mend();
+    c.eventually_node_ready(&from).await;
+    eventually("the drain completed", async || {
+        drain_of(&c, &from).await["phase"] == "completed"
+    })
+    .await;
+    let v = c
+        .list(Kind::Volume)
+        .await
+        .into_iter()
+        .find(|v| v.metadata.name == "data-db-0")
+        .unwrap();
+    let to = v.status["node"].as_str().unwrap().to_owned();
+    assert_ne!(to, from);
+    let j = c.nodes.iter().position(|n| n.name == to).unwrap();
+    assert_eq!(
+        c.nodes[j].sys.dataset_contents(ds).as_deref(),
+        Some(&b"rows 1"[..])
+    );
+    assert_eq!(dbs(&c), 0);
+    eventually("db running on its new node", async || {
+        running(&c)
+            .await
+            .iter()
+            .any(|t| t.spec["node"] == to.as_str())
+    })
+    .await;
+    c.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stateful_data_moves_back_over_a_stale_copy() {
     let c = Cluster::start(2).await;
