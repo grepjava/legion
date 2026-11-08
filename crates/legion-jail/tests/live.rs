@@ -278,6 +278,21 @@ async fn pods_of_jails() {
     let seen = String::from_utf8_lossy(&seen);
     assert!(seen.contains("isatty") && seen.contains("hi"), "{seen}");
     assert_eq!(rt.exec_exit_code(&attached.id).await.unwrap(), 0);
+    // A command that writes and ends at once loses none of it, though its
+    // terminal goes with it: once in a while it lost all of it.
+    for i in 0..20 {
+        let mut attached = rt
+            .exec_attach(&app, &["/bin/echo".into(), format!("run {i}")], false, true)
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        while let Some(c) = attached.output.next().await {
+            seen.extend_from_slice(&c.unwrap().data);
+        }
+        let seen = String::from_utf8_lossy(&seen);
+        assert!(seen.contains(&format!("run {i}")), "run {i}: {seen:?}");
+        assert_eq!(rt.exec_exit_code(&attached.id).await.unwrap(), 0);
+    }
     let running = |what: &'static str| {
         let child = child.clone();
         move || {
