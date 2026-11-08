@@ -51,9 +51,9 @@ su -l lab -c "rm -rf ~/jailer && mkdir ~/jailer &&
     cd ~/jailer && cargo build --locked --bin jailer"
 test -x /home/lab/jailer/target/debug/jailer
 
-# The previous release, for the upgrade drill, at the revision
+# The previous release, v0.1.14, for the upgrade drill, at the revision
 # legion.qualify records: its version commit.
-previous_rev=929e87e05ae32fb769b3bceb8e88b12917e87cef
+previous_rev=6b3cb38ba8469b7ba92f0160fce158575837fd06
 su -l lab -c "rm -rf ~/legion-prev && mkdir ~/legion-prev &&
     fetch -qo - https://github.com/grepjava/legion/archive/$previous_rev.tar.gz |
         tar -xzf - -C ~/legion-prev --strip-components 1 &&

@@ -1509,7 +1509,12 @@ races jailer found. v0.1.15 has the partition contract
 (docs/PARTITIONS.md): `onPartition: stop` for pods that must not run twice,
 a leader cut off from the majority that answers no heartbeats, volumes held
 by orphaned tasks until their node says they stopped, and the drain status
-that `legion node drain --wait` follows. The port's `distinfo` is
+that `legion node drain --wait` follows, with what a transfer cut short or
+a source cut off does to it; and the version handshake: builds that can't
+work together refuse each other, and the managers record the protocol
+they all speak, after which the log may hold guarded writes, closing the
+ACME gap between a route's last check and its certificate's write. The
+port's `distinfo` is
 made for v0.1.13, and its crates are v0.1.9's, but it has not been through
 `poudriere testport` since v0.1.9. Waiting on the user: the port's
 submission, once their FreeBSD Bugzilla account exists.

@@ -282,12 +282,21 @@ fn apply(object: Object) -> ApplyRequest {
 }
 
 /// Retries while the cluster settles (leader election, forwarding target).
-async fn eventually<T, F, Fut>(mut f: F) -> T
+async fn eventually<T, F, Fut>(f: F) -> T
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, tonic::Status>>,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    eventually_within(Duration::from_secs(10), f).await
+}
+
+/// [`eventually`], for up to `wait`.
+async fn eventually_within<T, F, Fut>(wait: Duration, mut f: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, tonic::Status>>,
+{
+    let deadline = tokio::time::Instant::now() + wait;
     loop {
         match f().await {
             Ok(v) => return v,
@@ -3051,7 +3060,9 @@ async fn a_restored_manager_leads_alone_and_ignores_the_old_cluster() {
             let _ = m.store.raft.trigger().elect().await;
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
-        eventually(|| {
+        // Elections forced on both at once can split their votes for a
+        // while on a loaded host (it took over 10 s on the lab's VMs).
+        eventually_within(Duration::from_secs(30), || {
             let mut follower = follower.clone();
             async move { follower.apply(apply(service("lost", 2))).await }
         })
