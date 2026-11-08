@@ -38,6 +38,56 @@ struct Node {
     rt: Arc<FakeRuntime>,
     sys: Arc<FakeSys>,
     agent: Option<(oneshot::Sender<()>, JoinHandle<()>)>,
+    /// The node's way to the manager.
+    link: Link,
+}
+
+/// A TCP proxy between an agent and the manager that a test can cut, for a
+/// node cut off while its agent keeps running. Cut, it is silent, as a
+/// split network is: connections stay open and nothing passes, new ones
+/// included. Mended, those connections end, and new ones pass.
+struct Link {
+    addr: String,
+    cut: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Link {
+    async fn to(target: &str) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let cut = Arc::new(tokio::sync::watch::Sender::new(false));
+        let (target, watch) = (target.to_owned(), cut.clone());
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                let (target, mut cut) = (target.clone(), watch.subscribe());
+                tokio::spawn(async move {
+                    if *cut.borrow_and_update() {
+                        let _ = cut.wait_for(|c| !*c).await;
+                        return;
+                    }
+                    let Ok(mut outbound) = tokio::net::TcpStream::connect(&target).await else {
+                        return;
+                    };
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+                        _ = async { cut.wait_for(|c| *c).await.is_ok() } => {
+                            // Held, silent, until mended.
+                            let _ = cut.wait_for(|c| !*c).await;
+                        }
+                    }
+                });
+            }
+        });
+        Link { addr, cut }
+    }
+
+    fn cut(&self) {
+        self.cut.send_replace(true);
+    }
+
+    fn mend(&self) {
+        self.cut.send_replace(false);
+    }
 }
 
 struct Cluster {
@@ -96,11 +146,13 @@ impl Cluster {
             let rt = Arc::new(FakeRuntime::new(sys.clone()));
             rt.add_image(INFRA);
             rt.add_image("web:1");
+            let link = Link::to(&c.addr).await;
             c.nodes.push(Node {
                 name: format!("n{n}"),
                 rt,
                 sys,
                 agent: None,
+                link,
             });
             c.start_agent(n - 1);
             // Registered in order, so node n has the pod subnet 10.200.n-1.
@@ -128,7 +180,7 @@ impl Cluster {
             key: WireGuardKey::File(key_file),
             port: 51820,
         });
-        let control = GrpcControl::new(&node.name, vec![self.addr.clone()], None).unwrap();
+        let control = GrpcControl::new(&node.name, vec![node.link.addr.clone()], None).unwrap();
         let agent = Agent::new(
             config,
             node.rt.clone(),
@@ -316,6 +368,58 @@ spec:
   endpoint:
     ports: [{ port: 80, targetPort: http, publish: ingress, publishedPort: 30080 }]
 "#;
+
+/// A node cut off with its agent running (docs/PARTITIONS.md): its task is
+/// orphaned and replaced while the old pod runs on, as Legion fails open,
+/// and once the node is back its agent stops the pod and says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_cut_off_runs_on_until_it_is_back() {
+    let c = Cluster::start(3).await;
+    c.apply(WEB).await;
+    eventually("one task per node", async || {
+        c.placed().await == ["n1", "n2", "n3"]
+    })
+    .await;
+    let old = c
+        .list(Kind::Task)
+        .await
+        .into_iter()
+        .find(|t| t.spec["node"] == "n2")
+        .unwrap()
+        .metadata
+        .name;
+
+    c.nodes[1].link.cut();
+    eventually("n2's task orphaned and replaced", async || {
+        let placed = c.placed().await;
+        let tasks = c.list(Kind::Task).await;
+        placed.len() == 3
+            && !placed.contains(&"n2".to_owned())
+            && tasks
+                .iter()
+                .any(|t| t.metadata.name == old && t.status["state"] == "orphaned")
+    })
+    .await;
+    // Running twice: nothing could tell the old pod to stop.
+    assert_eq!(c.pods(1).len(), 1);
+    tokio::time::sleep(HEARTBEAT * 10).await;
+    assert_eq!(c.pods(1).len(), 1);
+
+    c.nodes[1].link.mend();
+    c.eventually_node_ready("n2").await;
+    eventually("the old pod stopped", async || c.pods(1).is_empty()).await;
+    eventually("the old task reported stopped", async || {
+        c.list(Kind::Task)
+            .await
+            .iter()
+            .any(|t| t.metadata.name == old && t.status["state"] == "shutdown")
+    })
+    .await;
+    let placed = c.placed().await;
+    assert_eq!(placed.len(), 3);
+    assert!(!placed.contains(&"n2".to_owned()), "{placed:?}");
+    c.stop().await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tasks_survive_losing_a_node() {
