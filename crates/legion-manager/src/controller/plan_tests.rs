@@ -3167,6 +3167,56 @@ fn stateful_tasks_move_with_their_data_off_a_draining_node() {
     );
 }
 
+/// A stateful task whose data is copied waits for its service's disruption
+/// budget, and its drain says so until the budget allows the stop.
+#[test]
+fn a_drain_says_a_task_waits_for_its_budget() {
+    use legion_api::volume::MigrationPhase::*;
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    let spec = |budget: u32| {
+        format!(
+            "{}\nmaxUnavailable: {budget}",
+            STATEFUL.replace("replicas: 3", "replicas: 1")
+        )
+    };
+    w.service("db", &spec(0));
+    w.settle();
+    let from = w.placed_task("db-0-1").spec.node.clone();
+    let to = if from == "n1" { "n2" } else { "n1" };
+
+    w.availability(&from, Availability::Drain);
+    w.settle();
+    w.migrate();
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some((to.to_owned(), Copied)));
+    assert_eq!(w.placed_task("db-0-1").status.state, TaskState::Running);
+    assert_eq!(
+        w.drain(&from),
+        Some((
+            "draining".into(),
+            String::new(),
+            vec![
+                "Task db-0-1 budget".to_owned(),
+                "Volume data-db-0 copying".to_owned()
+            ]
+        ))
+    );
+
+    // The budget raised, the task stops and its data follows.
+    w.service("db", &spec(1));
+    w.settle();
+    w.migrate();
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), None);
+    assert_eq!(w.placed_task("db-0-2").spec.node, to);
+    assert_eq!(
+        w.drain(&from),
+        Some(("completed".into(), String::new(), vec![]))
+    );
+}
+
 #[test]
 fn ordinals_drained_from_one_node_spread_over_the_others() {
     use legion_api::volume::MigrationPhase::*;
