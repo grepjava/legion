@@ -70,6 +70,9 @@ pub struct ManagerConfig {
     /// Whether routes may name an ACME directory over plain HTTP on this
     /// host's loopback: only tests run an authority there.
     pub acme_loopback: bool,
+    /// Whether registries on this host's loopback are asked over plain
+    /// HTTP when tags are resolved: only tests run one there.
+    pub registry_loopback: bool,
 }
 
 impl ManagerConfig {
@@ -86,6 +89,7 @@ impl ManagerConfig {
             vip: None,
             store_key: None,
             acme_loopback: false,
+            registry_loopback: false,
         }
     }
 }
@@ -132,6 +136,7 @@ pub struct Manager {
     heartbeat: std::time::Duration,
     controllers: bool,
     acme_loopback: bool,
+    registry_loopback: bool,
     vip: Option<(std::sync::Arc<dyn legion_sys::Sys>, vip::VipConfig)>,
     /// The store as metrics read it, emptied before the store shuts down.
     metrics: metrics::Slot,
@@ -168,6 +173,7 @@ impl Manager {
             heartbeat: config.heartbeat,
             controllers: config.controllers,
             acme_loopback: config.acme_loopback,
+            registry_loopback: config.registry_loopback,
             vip: config.vip,
             metrics: std::sync::Arc::new(std::sync::RwLock::new(Some(store.clone()))),
             requests: Default::default(),
@@ -215,9 +221,14 @@ impl Manager {
                 closing.clone(),
             ))
         });
-        let resolver = self
-            .controllers
-            .then(|| tokio::spawn(images::run(self.store.clone(), self.id, closing.clone())));
+        let resolver = self.controllers.then(|| {
+            tokio::spawn(images::run(
+                self.store.clone(),
+                self.id,
+                self.registry_loopback,
+                closing.clone(),
+            ))
+        });
         let acme = self.controllers.then(|| {
             tokio::spawn(acme::run(
                 self.store.clone(),

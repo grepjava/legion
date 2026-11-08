@@ -40,10 +40,30 @@ pub trait Registry: Send + Sync {
     ) -> impl Future<Output = Result<String, String>> + Send;
 }
 
-impl Registry for legion_image::Client {
+/// Registries, over HTTPS; with `loopback`, those on this host over plain
+/// HTTP, as tests run them.
+struct Live {
+    client: legion_image::Client,
+    loopback: bool,
+}
+
+impl Registry for Live {
     async fn digest(&self, reference: &Reference, logins: &[Login]) -> Result<String, String> {
         let creds = Credentials::for_registry(logins, &reference.registry);
-        self.document(reference, reference.target(), creds.as_ref())
+        let host = reference.host();
+        let local =
+            self.loopback && (host.starts_with("127.0.0.1:") || host.starts_with("localhost:"));
+        let plain;
+        let client = if local {
+            plain = legion_image::Client::new()
+                .map_err(|e| e.to_string())?
+                .plain_http(&reference.registry);
+            &plain
+        } else {
+            &self.client
+        };
+        client
+            .document(reference, reference.target(), creds.as_ref())
             .await
             .map(|(digest, _)| digest)
             .map_err(|e| e.to_string())
@@ -51,7 +71,8 @@ impl Registry for legion_image::Client {
 }
 
 /// Resolves pods whenever this manager leads, until `closing` turns true.
-pub async fn run(store: Store, id: NodeId, closing: watch::Receiver<bool>) {
+/// With `loopback`, registries on this host are asked over plain HTTP.
+pub async fn run(store: Store, id: NodeId, loopback: bool, closing: watch::Receiver<bool>) {
     let client = match legion_image::Client::new() {
         Ok(c) => c,
         Err(e) => {
@@ -59,8 +80,9 @@ pub async fn run(store: Store, id: NodeId, closing: watch::Receiver<bool>) {
             return;
         }
     };
+    let live = Live { client, loopback };
     crate::controller::while_leading(&store, id, closing, "image resolver", || {
-        lead(&store, &client)
+        lead(&store, &live)
     })
     .await
 }

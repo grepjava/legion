@@ -154,6 +154,7 @@ impl Running {
             raft,
             tls,
             heartbeat,
+            registry_loopback: true,
             ..ManagerConfig::new(dir.path(), &addr)
         })
         .await
@@ -3078,6 +3079,221 @@ async fn a_volume_in_use_keeps_its_storage() {
     let err = try_apply(lun("iqn.2026-11.test:c")).await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
     assert!(err.message().contains("mounted by task"), "{err}");
+    m.stop().await;
+}
+
+/// A registry on plain HTTP whose one repository, `shop/app`, serves the
+/// manifest in `served` for any tag, to `bot:hunter2` only.
+fn registry(served: std::sync::Arc<std::sync::Mutex<String>>) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let name = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut read = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            if read.read_line(&mut first).is_err() {
+                continue;
+            }
+            let mut auth = None;
+            loop {
+                let mut line = String::new();
+                if read.read_line(&mut line).is_err() || line.trim().is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':')
+                    && k.eq_ignore_ascii_case("authorization")
+                {
+                    auth = Some(v.trim().to_owned());
+                }
+            }
+            // "bot:hunter2"
+            let reply = if auth.as_deref() != Some("Basic Ym90Omh1bnRlcjI=") {
+                "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"r\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_owned()
+            } else if first.starts_with("GET /v2/shop/app/manifests/") {
+                let body = served.lock().unwrap().clone();
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.oci.image.manifest.v1+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            } else {
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_owned()
+            };
+            let _ = stream.write_all(reply.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    name
+}
+
+/// A manifest that differs by `v`, and its digest.
+fn manifest(v: &str) -> (String, String) {
+    let body = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": format!("sha256:{}", "c".repeat(64)),
+            "size": 2,
+        },
+        "layers": [],
+        "annotations": { "v": v },
+    })
+    .to_string();
+    let digest = legion_image::sha256(body.as_bytes());
+    (body, digest)
+}
+
+/// Each task made, as the env its pod has and the pin it runs.
+type Made = [(String, String)];
+
+/// What a deployment runs is the digest its tag named then, on every task:
+/// scaling keeps it after the tag moves, an update takes the tag's new
+/// digest, and a rollback the old one again. The login stays out of all of
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deployment_runs_what_its_tags_named_then() {
+    use legion_api::{Kind, Object as Stored};
+    let (one, d1) = manifest("1");
+    let (two, d2) = manifest("2");
+    let served = std::sync::Arc::new(std::sync::Mutex::new(one));
+    let reg = registry(served.clone());
+    let image = format!("{reg}/shop/app:1");
+    let pinned = |d: &str| format!("{reg}/shop/app@{d}");
+
+    let m = Running::start().await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let mut node = Stored::new(Kind::Node, "", "w1", serde_json::json!({}));
+    node.status = serde_json::json!({ "state": "ready", "imagePins": true });
+    m.store
+        .raft
+        .client_write(legion_store::Command::Put {
+            object: node,
+            precondition: legion_store::Precondition::None,
+        })
+        .await
+        .unwrap();
+    let login =
+        format!(r#"{{"auths": {{"{reg}": {{"username": "bot", "password": "hunter2"}}}}}}"#);
+    apply_json(&m, "Namespace", "shop", serde_json::json!({})).await;
+    let secret = Object {
+        kind: "Secret".into(),
+        namespace: "shop".into(),
+        name: "login".into(),
+        spec_json: serde_json::json!({ "text": login })
+            .to_string()
+            .into_bytes(),
+        ..Default::default()
+    };
+    let objects = m.objects().await;
+    objects.clone().apply(apply(secret)).await.unwrap();
+    let web = |replicas: u32, env: &str| {
+        let mut container = serde_json::json!({ "name": "a", "image": image });
+        if !env.is_empty() {
+            container["env"] = serde_json::json!([{ "name": "E", "value": env }]);
+        }
+        Object {
+            kind: "Service".into(),
+            namespace: "shop".into(),
+            name: "web".into(),
+            spec_json: serde_json::json!({
+                "replicas": replicas,
+                "update": { "order": "start-first" },
+                "pod": { "imagePullSecrets": ["login"], "containers": [container] },
+            })
+            .to_string()
+            .into_bytes(),
+            ..Default::default()
+        }
+    };
+    // The pins of every task made, by the env their pod has: a pin is fixed
+    // when a task is made, and with no agent the node goes down and they
+    // are shut down.
+    let tasks = || -> Vec<(String, String)> {
+        let mut v: Vec<_> = m
+            .store
+            .list(Kind::Task, None)
+            .unwrap()
+            .objects
+            .into_iter()
+            .map(|t| {
+                let env = t.spec["pod"]["containers"][0]["env"][0]["value"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let pin = t.spec["images"][&image]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                (env, pin)
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let until = |what: &str, want: &dyn Fn(&Made) -> bool| {
+        let what = what.to_owned();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let now = tasks();
+            if want(&now) {
+                return now;
+            }
+            assert!(std::time::Instant::now() < deadline, "{what}: {now:?}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    objects.clone().apply(apply(web(2, ""))).await.unwrap();
+    let all = |env: &'static str, pin: String, n: usize| {
+        move |t: &[(String, String)]| {
+            let made: Vec<_> = t.iter().filter(|(e, _)| e == env).collect();
+            made.len() >= n && made.iter().all(|(_, p)| *p == pin)
+        }
+    };
+    tokio::task::block_in_place(|| until("deployed", &all("", pinned(&d1), 2)));
+
+    // The tag moves; scaling deploys nothing.
+    *served.lock().unwrap() = two;
+    objects.clone().apply(apply(web(3, ""))).await.unwrap();
+    tokio::task::block_in_place(|| until("scaled", &all("", pinned(&d1), 3)));
+
+    // A new pod runs what the tag names now.
+    objects.clone().apply(apply(web(3, "x"))).await.unwrap();
+    let new = pinned(&d2);
+    tokio::task::block_in_place(|| {
+        until("updated", &|t| t.iter().any(|(e, p)| e == "x" && *p == new))
+    });
+
+    // Rolled back: the old pod's digest again, though the tag names the new.
+    // (With no agents its old tasks are current again, and none is made.)
+    let key = legion_api::ObjectKey::new(Kind::Service, "shop", "web");
+    let resolved = || {
+        m.store.get(&key).unwrap().unwrap().status["images"]["resolved"][&image]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert_eq!(resolved(), new);
+    objects.clone().apply(apply(web(3, ""))).await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while resolved() != pinned(&d1) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rolled back: {}",
+            resolved()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let status = m.store.get(&key).unwrap().unwrap().status.to_string();
+    assert!(!status.contains("hunter2"), "{status}");
+    for t in m.store.list(Kind::Task, None).unwrap().objects {
+        assert!(!t.spec.to_string().contains("hunter2"));
+    }
     m.stop().await;
 }
 
