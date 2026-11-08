@@ -1,8 +1,9 @@
 #!/bin/sh
 # What Legion's isolated tests need on a lab VM before they run, as root, from
 # scripts/lab run --setup: an NFS export and an iSCSI target on loopback, which
-# the storage tests only mount, and the guest of the bhyve test. Settings for
-# the tests go in /var/tmp/lab.env, which `run` reads.
+# the storage tests only mount, the guest of the bhyve test, and the jailer of
+# the handoff test. Settings for the tests go in /var/tmp/lab.env, which `run`
+# reads.
 set -eux
 
 lvol=/var/tmp/lvol
@@ -41,6 +42,15 @@ zfs create -V 96m lpool/guest
 dd if=/var/tmp/guest.img of=/dev/zvol/lpool/guest bs=1m
 mkdir -p /var/tmp/lbhyve
 
+# jailer for the handoff test, at the revision legion.qualify records, built
+# as the lab user: its crates come from the network, as its base pull does.
+jailer_rev=5426e1d655ec162f1fec24e83dc31dd93ec5adca
+su -l lab -c "rm -rf ~/jailer && mkdir ~/jailer &&
+    fetch -qo - https://github.com/grepjava/jailer/archive/$jailer_rev.tar.gz |
+        tar -xzf - -C ~/jailer --strip-components 1 &&
+    cd ~/jailer && cargo build --locked --bin jailer"
+test -x /home/lab/jailer/target/debug/jailer
+
 cat > /var/tmp/lab.env << EOF
 export LEGION_STORAGE_NFS=127.0.0.1:$lvol/export
 export LEGION_SYS_NFS=127.0.0.1:$lvol/export
@@ -50,6 +60,7 @@ export LEGION_BHYVE_DISK=/dev/zvol/lpool/guest
 export LEGION_BHYVE_LAB=/var/tmp/lbhyve
 export LEGION_CLUSTER_LAB=/var/tmp/lcluster
 export LEGION_PG_IMAGE=/var/tmp/legion-pg.oci.tar
+export LEGION_JAILER=/home/lab/jailer/target/debug/jailer
 export LEGION_CLUSTER_HOST=10.78.0.1
 export LEGION_CLUSTER_VMS='lab2=lab@10.78.0.2 lab3=lab@10.78.0.3'
 export LEGION_CLUSTER_KEY=/home/lab/.ssh/id_ed25519

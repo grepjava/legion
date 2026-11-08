@@ -343,6 +343,38 @@ impl Lab {
             .unwrap_or_default()
     }
 
+    /// Loads the OCI archive `tar` into every node's image store.
+    pub fn load_image(&self, tar: &str) {
+        let out = Command::new(LEGION)
+            .args(["image", "load", tar, "--zfs-root", ZFS_ROOT, "--data-dir"])
+            .arg(self.dir.join("data"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "loading the image here: {}",
+            text(&out.stderr)
+        );
+        let name = Path::new(tar).file_name().unwrap().to_str().unwrap();
+        let there = format!("/var/tmp/{name}");
+        for vm in &self.vms {
+            self.copy(vm, tar, &there);
+            let out = self.ssh(
+                vm,
+                &format!(
+                    "{REMOTE} image load {there} --zfs-root {ZFS_ROOT} \
+                     --data-dir {VM_DATA} && rm {there}"
+                ),
+            );
+            assert!(
+                out.status.success(),
+                "loading the image on {}: {}",
+                vm.name,
+                text(&out.stderr)
+            );
+        }
+    }
+
     /// The nodes running a service's tasks in a namespace.
     pub fn placed(&self, namespace: &str, service: &str) -> Vec<String> {
         let mut v: Vec<String> = self

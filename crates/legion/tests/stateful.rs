@@ -27,9 +27,7 @@
 
 mod common;
 
-use std::process::Command;
-
-use common::{Lab, Role, VM_DATA, ZFS_ROOT, text, wait};
+use common::{Lab, Role, text, wait};
 use serde_json::Value;
 
 /// The namespace, allowed the SysV shared memory Postgres needs, the
@@ -100,37 +98,6 @@ spec:
 "#;
 
 impl Lab {
-    /// Loads the OCI archive `tar` into every node's image store.
-    fn load_image(&self, tar: &str) {
-        let out = Command::new(common::LEGION)
-            .args(["image", "load", tar, "--zfs-root", ZFS_ROOT, "--data-dir"])
-            .arg(self.dir.join("data"))
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "loading the image here: {}",
-            text(&out.stderr)
-        );
-        for vm in &self.vms {
-            self.copy(vm, tar, "/var/tmp/legion-pg.oci.tar");
-            let out = self.ssh(
-                vm,
-                &format!(
-                    "{} image load /var/tmp/legion-pg.oci.tar --zfs-root {ZFS_ROOT} \
-                         --data-dir {VM_DATA} && rm /var/tmp/legion-pg.oci.tar",
-                    common::REMOTE
-                ),
-            );
-            assert!(
-                out.status.success(),
-                "loading the image on {}: {}",
-                vm.name,
-                text(&out.stderr)
-            );
-        }
-    }
-
     /// The running task of an ordinal of `db`.
     fn ordinal(&self, n: u64) -> Option<Value> {
         self.list("tasks", "data").into_iter().find(|t| {

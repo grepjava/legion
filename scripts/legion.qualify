@@ -1,5 +1,7 @@
 # Legion's manifest for scripts/qualify. See that script for the format.
 project legion
+# The jailer the handoff test ran, as scripts/legion.labsetup builds it.
+record jailer sed -n 's/^jailer_rev=//p' scripts/legion.labsetup
 scan crates/*/tests/*.rs
 
 # What Legion's tests make, in the before/after snapshots.
@@ -64,5 +66,8 @@ test legion cluster app_updates_and_survives_losing_a_node host cluster 3600 env
 test legion stateful postgres_moves_between_nodes host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_PG_IMAGE
 test legion teams two_teams_share_a_cluster host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
 
+test legion handoff a_jailer_archive_runs_as_exported host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_JAILER
+test legion handoff a_jailer_push_is_what_legion_runs host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_JAILER
 helper legion-net mesh serve
+helper legion handoff registry
 helper legion-store cluster write_throughput
