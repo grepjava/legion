@@ -374,10 +374,10 @@ impl DispatcherService {
                 continue;
             };
             let mut status = status.clone();
-            status.pod_cidr = match serde_json::from_value::<NodeStatus>(node.status.clone())
-                .ok()
-                .and_then(|s| s.pod_cidr)
-            {
+            let before = serde_json::from_value::<NodeStatus>(node.status.clone()).ok();
+            // The leader's word on a drain is not the agent's to change.
+            status.drain = before.as_ref().and_then(|s| s.drain.clone());
+            status.pod_cidr = match before.and_then(|s| s.pod_cidr) {
                 Some(cidr) => Some(cidr),
                 None => Some(self.reserve_subnet(name).await?.to_string()),
             };

@@ -25,6 +25,7 @@ use legion_api::{Kind, Object, ObjectKey};
 use tokio::time::Instant;
 
 mod autoscale;
+mod drain;
 mod jobs;
 mod migrate;
 pub use jobs::{CronJob, Job, Jobs};
@@ -376,6 +377,9 @@ pub fn plan(
         .collect();
     plan.actions
         .retain(|a| !matches!(a, Action::Update(o, _) if deleted.contains(&o.key())));
+    // Where drains stand, from the tasks as read: the next pass sees what
+    // this one did.
+    drain::drains(tasks, nodes, volumes, &mut plan);
     plan
 }
 

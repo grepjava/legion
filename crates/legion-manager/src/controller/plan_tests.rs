@@ -106,6 +106,26 @@ impl World {
             .unwrap()
     }
 
+    /// Where `node`'s drain stands: its phase, its reason, and each thing
+    /// left as `Kind name reason`.
+    fn drain(&self, node: &str) -> Option<(String, String, Vec<String>)> {
+        let n = self
+            .nodes
+            .iter()
+            .find(|n| n.object.metadata.name == node)
+            .unwrap();
+        let d = n.status.drain.as_ref()?;
+        let phase = serde_json::to_value(d.phase).unwrap();
+        Some((
+            phase.as_str().unwrap().to_owned(),
+            d.reason.clone(),
+            d.remaining
+                .iter()
+                .map(|r| format!("{} {} {}", r.kind, r.name, r.reason))
+                .collect(),
+        ))
+    }
+
     fn availability(&mut self, name: &str, a: Availability) {
         self.node_mut(name).spec.availability = a;
     }
@@ -395,6 +415,18 @@ impl World {
                                 assert_eq!(o.spec, c.object.spec, "only the status changes");
                                 c.status = serde_json::from_value(o.status.clone()).unwrap();
                                 c.object = o;
+                            }
+                        }
+                        Kind::Node => {
+                            let n = self
+                                .nodes
+                                .iter_mut()
+                                .find(|n| n.object.key() == o.key())
+                                .unwrap();
+                            if n.object.metadata.version == version {
+                                assert_eq!(o.spec, n.object.spec, "only the status changes");
+                                n.status = serde_json::from_value(o.status.clone()).unwrap();
+                                n.object = o;
                             }
                         }
                         k => panic!("unexpected update of {k}"),
@@ -1260,6 +1292,87 @@ fn draining_moves_replicated_tasks() {
         .collect();
     assert_eq!(running.len(), 2);
     assert!(running.iter().all(|t| t.spec.node == "n2"));
+}
+
+/// A drain says where it stands (PLAN.md, phase 5): what still runs, what
+/// is stopping, and completed only once nothing does; blocked while the
+/// node can't be heard, or a task orphaned there isn't seen to stop.
+#[test]
+fn a_drain_says_what_is_left() {
+    let mut w = World::new();
+    for n in ["n1", "n2", "n3"] {
+        w.node(n, &[]);
+    }
+    w.service(
+        "web",
+        &format!(
+            "replicas: 3
+{POD}"
+        ),
+    );
+    w.settle();
+    assert_eq!(w.drain("n2"), None);
+    let on_n2 = w.placed_task_on("web", "n2");
+
+    // Told to stop, the task is stopping until its agent says it stopped.
+    w.availability("n2", Availability::Drain);
+    w.agents = false;
+    w.step();
+    w.step();
+    assert_eq!(
+        w.drain("n2"),
+        Some((
+            "draining".into(),
+            String::new(),
+            vec![format!("Task {on_n2} stopping")]
+        ))
+    );
+    w.agents = true;
+    w.settle();
+    assert_eq!(
+        w.drain("n2"),
+        Some(("completed".into(), String::new(), vec![]))
+    );
+
+    // Back to active, the drain is gone.
+    w.availability("n2", Availability::Active);
+    w.settle();
+    assert_eq!(w.drain("n2"), None);
+
+    // A node lost while draining blocks it: what it runs is unknown, and
+    // stays so once back until it says its orphaned task stopped.
+    w.settle();
+    let on_n3 = w.placed_task_on("web", "n3");
+    w.agents = false;
+    w.state("n3", NodeState::Down);
+    w.availability("n3", Availability::Drain);
+    w.step();
+    w.step();
+    assert_eq!(
+        w.drain("n3"),
+        Some((
+            "blocked".into(),
+            "unreachable".into(),
+            vec![format!("Task {on_n3} unconfirmed")]
+        ))
+    );
+    w.state("n3", NodeState::Ready);
+    w.step();
+    assert_eq!(
+        w.drain("n3"),
+        Some((
+            "blocked".into(),
+            "unconfirmed".into(),
+            vec![format!("Task {on_n3} unconfirmed")]
+        ))
+    );
+    w.agents = true;
+    w.end(&on_n3, TaskState::Shutdown);
+    w.settle();
+    assert_eq!(
+        w.drain("n3"),
+        Some(("completed".into(), String::new(), vec![]))
+    );
 }
 
 #[test]
@@ -2985,6 +3098,17 @@ fn stateful_tasks_move_with_their_data_off_a_draining_node() {
     w.settle();
     assert_eq!(w.migration("data-db-0"), Some((free.to_owned(), Copying)));
     assert_eq!(w.wanted("db"), ["db-0-1", "db-1-1"]);
+    assert_eq!(
+        w.drain(&from),
+        Some((
+            "draining".into(),
+            String::new(),
+            vec![
+                "Task db-0-1 running".to_owned(),
+                "Volume data-db-0 copying".to_owned()
+            ]
+        ))
+    );
 
     // Copied, the task stops; with nothing using the Volume the last part
     // goes, and its next task waits for it.
@@ -3010,6 +3134,10 @@ fn stateful_tasks_move_with_their_data_off_a_draining_node() {
     );
     assert_eq!(w.placed_task("db-0-2").spec.node, free);
     assert_eq!(w.placed_task("db-0-2").status.state, TaskState::Running);
+    assert_eq!(
+        w.drain(&from),
+        Some(("completed".into(), String::new(), vec![]))
+    );
 }
 
 #[test]
