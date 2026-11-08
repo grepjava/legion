@@ -248,6 +248,26 @@ fn postgres_moves_between_nodes() {
     step("draining the primary's node moves the primary with its data");
     let (from, to) = lab.move_off(0);
     eprintln!("db-0 moved from {from} to {to}");
+    if to == replica {
+        // What the scheduler saw: why not the node without a db task.
+        for n in lab.list("nodes", "default") {
+            eprintln!("node {} {}", n["metadata"]["name"], n["status"]);
+        }
+        for v in lab.list("volumes", "data") {
+            eprintln!("volume {} {}", v["metadata"]["name"], v["status"]);
+        }
+        for t in lab.list("tasks", "data") {
+            eprintln!(
+                "task {}/{} on {} {} {} {}",
+                t["metadata"]["namespace"],
+                t["metadata"]["name"],
+                t["spec"]["node"],
+                t["spec"]["desiredState"],
+                t["status"]["state"],
+                t["status"]["message"]
+            );
+        }
+    }
     assert_ne!(to, replica, "to the node without a db task");
     assert_eq!(lab.rows(0), Some(1000), "the rows came along");
     assert_eq!(
