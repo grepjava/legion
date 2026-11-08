@@ -399,9 +399,63 @@ mod imp {
                 return 126;
             }
         };
+        if tty == super::Terminal::Own {
+            return run_and_drain(&prepared, &argv[0]);
+        }
         prepared.exec();
         eprintln!("{}: {}", argv[0], errno());
         127
+    }
+
+    /// With a terminal of its own, the command runs in a child while this
+    /// stays its session's leader: a leader's exit revokes the terminal,
+    /// and output not yet read from it with it, so a command that wrote and
+    /// ended at once could lose all it wrote. Waits for the command, lets
+    /// the reader take what it wrote (`tcdrain`, for at most a few seconds:
+    /// a reader gone takes nothing), and exits as the command did, a signal
+    /// as a shell gives it (128 and the signal).
+    fn run_and_drain(prepared: &Prepared, name: &str) -> i32 {
+        extern "C" fn wake(_: libc::c_int) {}
+        const TERMINAL: [libc::c_int; 3] = [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP];
+        // SAFETY: plain system calls; this process is single-threaded, so
+        // the child may run anything before its exec.
+        unsafe {
+            // The terminal's signals are the command's to take: they reach
+            // its group, this process included.
+            for s in TERMINAL {
+                libc::signal(s, libc::SIG_IGN);
+            }
+            let child = libc::fork();
+            if child < 0 {
+                eprintln!("fork: {}", errno());
+                return 126;
+            }
+            if child == 0 {
+                for s in TERMINAL {
+                    libc::signal(s, libc::SIG_DFL);
+                }
+                prepared.exec();
+                eprintln!("{name}: {}", errno());
+                libc::_exit(127);
+            }
+            let mut status = 0;
+            while libc::waitpid(child, &mut status, 0) < 0 {
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    return 1;
+                }
+            }
+            libc::signal(libc::SIGALRM, wake as *const () as libc::sighandler_t);
+            libc::alarm(5);
+            libc::tcdrain(1);
+            libc::alarm(0);
+            if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else if libc::WIFSIGNALED(status) {
+                128 + libc::WTERMSIG(status)
+            } else {
+                1
+            }
+        }
     }
 
     struct Prepared {
