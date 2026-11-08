@@ -550,6 +550,20 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   screen), `NO_COLOR`, and stopping once the terminal hangs up, which
   crossterm would otherwise read forever. `--once` prints the views as
   text and exits.
+- **Versions.** A build speaks one protocol, the meaning of what managers
+  and agents say to each other and of the commands in the managers' log,
+  and works with peers back to an oldest one (`legion_api::protocol`).
+  Two builds mix when each speaks at least the other's oldest, so an
+  upgrade goes one protocol at a time, every node through it before the
+  next; a peer that says nothing is from before the handshake (v0.1.15
+  and earlier) and speaks protocol 1. It is checked where builds meet: a
+  node's registration (in its status, recorded in its Node), a join
+  (refused before anything is signed), and every Raft call and answer
+  (the `legion-protocol` header). Refused, a caller is told which side
+  to upgrade first; an agent goes on asking, and a manager upgraded too
+  far takes no part, neither catching up nor voting, while the others
+  go on. A protocol bump that changes the log adds its command only once
+  every manager speaks it.
 
 ## 4. Feature set
 

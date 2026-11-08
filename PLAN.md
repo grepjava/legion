@@ -230,6 +230,13 @@ Goal: recovery and upgrade are procedures that have been drilled.
 4. Restore a representative application onto replacement hosts, and record
    measured recovery times.
 
+State, 8 November 2026: item 1's handshake is built (docs/DESIGN.md,
+3.8, Versions): registrations, joins and Raft calls between builds that
+don't work together are refused, saying which to upgrade first, each
+shown by a test that fails without the check. Every build speaks
+protocol 1 so far. Not yet: the ACME gap, which is the first command to
+need protocol 2, and the leader knowing every manager speaks it.
+
 Exit: a supported upgrade path is tested. Snapshots are labelled
 crash-consistent, and a control-state backup isn't described as a backup of
 volume contents.
