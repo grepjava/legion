@@ -8,6 +8,11 @@ use crate::admit::{Invalid, Spec, field, index};
 use crate::quantity::{Bytes, Cpu};
 use crate::service::TaintEffect;
 
+/// Heartbeat periods a node may be silent for before the leader marks it
+/// down and its tasks are orphaned. An agent cut off from the managers that
+/// long stops its pods that must not run twice (`onPartition: stop`).
+pub const DOWN_AFTER_HEARTBEATS: u32 = 8;
+
 /// Label (`true`) marking the nodes that serve HTTPS routes. While no node
 /// has it, any node may read routes' certificates; once one has it, only
 /// nodes with it may.

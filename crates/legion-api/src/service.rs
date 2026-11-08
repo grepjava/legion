@@ -244,6 +244,32 @@ pub struct PodSpec {
     /// Time between the stop signal and SIGKILL.
     #[serde(default = "default_stop_grace")]
     pub stop_grace_period: Duration,
+    /// What the pod does when its node is cut off from the managers
+    /// (docs/PARTITIONS.md).
+    #[serde(default, skip_serializing_if = "OnPartition::is_default")]
+    pub on_partition: OnPartition,
+}
+
+/// What a pod does when its node is cut off from the managers, who then
+/// replace it elsewhere.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnPartition {
+    /// It runs on, as workloads survive a control-plane outage: until the
+    /// node is back, it may run beside its replacement.
+    #[default]
+    Run,
+    /// Its node's agent stops it once cut off for as long as the managers
+    /// take to mark the node down, and the managers replace it only after
+    /// that and its stop grace period, so it never runs beside its
+    /// replacement. Cut off, it doesn't run at all.
+    Stop,
+}
+
+impl OnPartition {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 fn default_stop_grace() -> Duration {
