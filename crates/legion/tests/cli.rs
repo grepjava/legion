@@ -155,7 +155,7 @@ metadata:
 spec:
   replicas: 3
   pod:
-    containers: [{ name: web, image: web:1 }]
+    containers: [{ name: web, image: localhost/web:1 }]
 ---
 apiVersion: legion/v1
 kind: Service
@@ -220,7 +220,7 @@ spec: { pod: { containers: [{ name: db, image: postgres:17 }] } }
     }
     assert!(ok(&d, &["rollback", "web", "-n", "shop"]).contains("rolling back"));
     let yaml = ok(&d, &["get", "service", "web", "-n", "shop"]);
-    assert!(yaml.contains("image: web:1"), "{yaml}");
+    assert!(yaml.contains("image: localhost/web:1"), "{yaml}");
     let rolling = || ok(&d, &["list", "services", "-n", "shop"]).contains("rolling-back");
     while !rolling() {
         assert!(std::time::Instant::now() < deadline, "no rollback");

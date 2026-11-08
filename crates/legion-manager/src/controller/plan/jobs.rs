@@ -260,6 +260,10 @@ fn start(
     plan: &mut Plan,
     created: &mut Vec<Task>,
 ) {
+    // No task until the pod's images are resolved.
+    let Some(pins) = super::pins(&j.spec.pod, j.status.images.as_ref(), nodes) else {
+        return;
+    };
     let wanted_set: BTreeSet<&Slot> = wanted.iter().collect();
     let mut active = 0usize;
     for (slot, list) in by_slot {
@@ -323,7 +327,7 @@ fn start(
         budget -= 1;
         let mut history = list.to_vec();
         history.extend(before.iter().filter(|t| super::slot_of(t) == *slot));
-        let mut t = super::new_task(owner, slot, &history, &j.status.last_tasks);
+        let mut t = super::new_task(owner, slot, &history, &j.status.last_tasks, &pins);
         t.spec.job = true;
         let labels = &mut t.object.metadata.labels;
         labels.remove(super::LABEL_SERVICE);

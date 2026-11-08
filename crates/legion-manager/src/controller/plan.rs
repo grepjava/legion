@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
+use legion_api::image::ImageStatus;
 use legion_api::node::{Availability, NodeSpec, NodeState, NodeStatus};
 use legion_api::quota::{Quota, Usage};
 use legion_api::security::NamespaceSecurity;
@@ -606,6 +607,17 @@ fn service(
     let generation = s.object.metadata.generation;
     let previous: ServiceStatus =
         serde_json::from_value(s.object.status.clone()).unwrap_or_default();
+    // Nothing is planned until the pod's images are resolved: an update
+    // would otherwise stop old tasks it can't yet replace. Read alone, as
+    // the resolver may write them before this pass has written the rest.
+    let images: Option<ImageStatus> = s
+        .object
+        .status
+        .get("images")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let Some(pins) = pins(&s.spec.pod, images.as_ref(), nodes) else {
+        return;
+    };
     let mut update = match track_update(s, tasks, &previous, memory, plan) {
         Some(update) => update,
         None => return,
@@ -828,7 +840,7 @@ fn service(
     let new_task = |slot: &Slot, list: &[&Task]| {
         let mut history = list.to_vec();
         history.extend(before.iter().filter(|t| slot_of(t) == *slot));
-        let mut t = new_task(s, slot, &history, &previous.last_tasks);
+        let mut t = new_task(s, slot, &history, &previous.last_tasks, &pins);
         if step.is_some() {
             t.spec.snapshot = step.clone();
             t.object.spec = serde_json::to_value(&t.spec).expect("spec serialises");
@@ -1042,7 +1054,7 @@ fn service(
         update,
         autoscale,
         // Written by the resolver, not by this pass.
-        images: previous.images.clone(),
+        images,
     };
     let status = serde_json::to_value(&status).expect("status serialises");
     if s.object.status != status {
@@ -1267,7 +1279,33 @@ fn task_name(svc: &str, slot: &str, n: u64) -> String {
     format!("{}-{hash}{suffix}", base[..keep].trim_end_matches('-'))
 }
 
-fn new_task(s: &Service, slot: &Slot, history: &[&Task], last: &BTreeMap<String, u64>) -> Task {
+/// What a pod's tasks run each image as, by digest; `None` while its images
+/// are being resolved, when no task may be made for it. A pod with nothing to
+/// resolve, or a cluster with a node that can't run pins, runs them as named.
+pub(super) fn pins(
+    pod: &PodSpec,
+    images: Option<&ImageStatus>,
+    nodes: &[Node],
+) -> Option<BTreeMap<String, String>> {
+    // One that doesn't parse can't be pulled either: the node says so.
+    let wanted = crate::images::to_resolve(pod).unwrap_or_default();
+    // As the resolver asks: with no node, or one that can't run pins.
+    if wanted.is_empty() || nodes.is_empty() || !nodes.iter().all(|n| n.status.image_pins) {
+        return Some(BTreeMap::new());
+    }
+    let images = images?;
+    images
+        .ready_for(&crate::images::pod_hash(pod))
+        .then(|| images.resolved.clone())
+}
+
+fn new_task(
+    s: &Service,
+    slot: &Slot,
+    history: &[&Task],
+    last: &BTreeMap<String, u64>,
+    pins: &BTreeMap<String, String>,
+) -> Task {
     let svc = &s.object.metadata.name;
     let n = history
         .iter()
@@ -1291,7 +1329,7 @@ fn new_task(s: &Service, slot: &Slot, history: &[&Task], last: &BTreeMap<String,
         node,
         desired_state: DesiredState::Running,
         pod: s.spec.pod.clone(),
-        images: BTreeMap::new(),
+        images: pins.clone(),
         snapshot: None,
     };
     let mut object = Object::new(

@@ -144,6 +144,15 @@ fn logins(store: &Store, namespace: &str, pod: &PodSpec) -> Result<Vec<Login>, S
     Ok(out)
 }
 
+/// The images a Service ran before its update, when its pod is that one's
+/// again (a rollback): it runs them again, whatever its tags name now.
+fn rolled_back_to(o: &Object, hash: &str) -> Option<BTreeMap<String, String>> {
+    let update: legion_api::service::UpdateStatus =
+        serde_json::from_value(o.status.get("update")?.clone()).ok()?;
+    (!update.previous_images.is_empty() && pod_hash(&update.previous.pod) == hash)
+        .then_some(update.previous_images)
+}
+
 /// The pod of a Service or Job.
 fn pod_of(kind: Kind, o: &Object) -> Option<PodSpec> {
     match kind {
@@ -163,6 +172,20 @@ pub async fn pass<R: Registry>(
     registry: &R,
     failed: &mut BTreeMap<(ObjectKey, String), Instant>,
 ) {
+    // Pins are used once every node runs them; until then nothing is asked.
+    match store.list(Kind::Node, None) {
+        Ok(list) => {
+            let pins =
+                |o: &Object| o.status.get("imagePins").and_then(|v| v.as_bool()) == Some(true);
+            if list.objects.is_empty() || !list.objects.iter().all(pins) {
+                return;
+            }
+        }
+        Err(e) => {
+            tracing::warn!("image resolver: reading the store: {e}");
+            return;
+        }
+    }
     let mut owners = Vec::new();
     for kind in [Kind::Service, Kind::Job] {
         match store.list(kind, None) {
@@ -192,9 +215,10 @@ pub async fn pass<R: Registry>(
             continue;
         }
         let namespace = o.metadata.namespace.clone();
-        let outcome = match logins(store, &namespace, &pod) {
-            Ok(logins) => resolve(registry, &pod, &logins).await,
-            Err(e) => Err(e),
+        let outcome = match (rolled_back_to(&o, &hash), logins(store, &namespace, &pod)) {
+            (Some(before), _) => Ok(before),
+            (None, Ok(logins)) => resolve(registry, &pod, &logins).await,
+            (None, Err(e)) => Err(e),
         };
         let status = match outcome {
             Ok(resolved) => ImageStatus {

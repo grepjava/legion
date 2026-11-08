@@ -107,6 +107,10 @@ pub struct NodeStatus {
     pub allocatable: Capacity,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub version: String,
+    /// The agent runs a task's images by the digests they were pinned to
+    /// (`TaskSpec::images`). Until every node does, tasks aren't pinned.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub image_pins: bool,
     /// This node's part of the cluster pod network, e.g. `10.200.3.0/24`.
     /// Assigned once, when the node first registers.
     #[serde(default, skip_serializing_if = "Option::is_none")]

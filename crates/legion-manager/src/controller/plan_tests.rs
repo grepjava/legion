@@ -76,6 +76,29 @@ impl World {
         });
     }
 
+    /// Records `pins` as the resolver would, for the Service's pod as it is.
+    fn resolve(&mut self, service: &str, pins: &[(&str, &str)]) {
+        let version = self.next();
+        let s = self
+            .services
+            .iter_mut()
+            .find(|s| s.object.metadata.name == service)
+            .unwrap();
+        let images = legion_api::image::ImageStatus {
+            pod: crate::images::pod_hash(&s.spec.pod),
+            resolved: pins
+                .iter()
+                .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+                .collect(),
+            message: String::new(),
+        };
+        if !s.object.status.is_object() {
+            s.object.status = serde_json::json!({});
+        }
+        s.object.status["images"] = serde_json::to_value(images).unwrap();
+        s.object.metadata.version = version;
+    }
+
     fn node_mut(&mut self, name: &str) -> &mut Node {
         self.nodes
             .iter_mut()
@@ -554,6 +577,77 @@ fn web(image: &str, update: &str) -> String {
     format!(
         "replicas: 2\npod: {{ containers: [{{ name: web, image: \"{image}\" }}], restartPolicy: {{ delay: 0s }} }}\nupdate: {{ {update} }}"
     )
+}
+
+/// Tasks run their images by the digests resolved for their pod, and none is
+/// made before: an update waits for its own, its old tasks running meanwhile,
+/// and scaling keeps the pins. A node that can't run pins leaves every task
+/// as named.
+#[test]
+fn tasks_run_the_digests_resolved_for_their_pod() {
+    let mut w = World::new();
+    for n in ["a", "b"] {
+        w.node(n, &[]);
+        w.node_mut(n).status.image_pins = true;
+    }
+    let spec = |image: &str, replicas: u32| {
+        web(image, "").replace("replicas: 2", &format!("replicas: {replicas}"))
+    };
+    let running = |w: &World| -> Vec<(String, Option<String>)> {
+        let mut v: Vec<_> = w
+            .tasks
+            .iter()
+            .filter(|t| t.status.state == TaskState::Running)
+            .map(|t| {
+                let image = t.spec.pod.containers[0].image.clone();
+                let pin = t.spec.images.get(&image).cloned();
+                (image, pin)
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let one = "docker.io/library/web@sha256:11";
+    let two = "docker.io/library/web@sha256:22";
+
+    w.service("web", &spec("web:1", 2));
+    w.settle();
+    assert_eq!(running(&w), [], "made before its images were resolved");
+    w.resolve("web", &[("web:1", one)]);
+    w.settle();
+    let pinned =
+        |image: &str, pin: &str, n: usize| vec![(image.to_owned(), Some(pin.to_owned())); n];
+    assert_eq!(running(&w), pinned("web:1", one, 2));
+
+    w.service("web", &spec("web:1", 3));
+    w.settle();
+    assert_eq!(running(&w), pinned("web:1", one, 3), "scaled");
+
+    w.service("web", &spec("web:2", 3));
+    for _ in 0..5 {
+        w.now += Duration::from_secs(60);
+        w.settle();
+    }
+    assert_eq!(
+        running(&w),
+        pinned("web:1", one, 3),
+        "updated before its images"
+    );
+    w.resolve("web", &[("web:2", two)]);
+    for _ in 0..10 {
+        w.now += Duration::from_secs(60);
+        w.settle();
+    }
+    assert_eq!(running(&w), pinned("web:2", two, 3));
+
+    w.node_mut("b").status.image_pins = false;
+    w.service("web", &spec("web:2", 4));
+    w.settle();
+    let unpinned = running(&w)
+        .into_iter()
+        .filter(|(_, pin)| pin.is_none())
+        .count();
+    assert_eq!(unpinned, 1, "{:?}", running(&w));
 }
 
 #[test]
