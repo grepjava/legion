@@ -163,7 +163,14 @@ preconditions. Rules:
   service may snapshot its Volumes for an update (4.3).
 - **Nodes.** A drained node's tasks stop and move elsewhere; a paused node
   keeps its tasks but gets no new ones (`legion node drain|pause|activate
-  <node>` sets it). The tasks of a node that is `down`
+  <node>` sets it). While a node drains, the leader writes where the drain
+  stands to its `status.drain`: `draining`, `blocked` or `completed`, and
+  what is left, each task and moving Volume with a reason. Unknown never
+  counts as released: a node not heard from (`unreachable`), or a task
+  orphaned there and not yet seen to stop (`unconfirmed`), blocks it.
+  `legion node drain <node> --wait [--timeout S] [-o json]` follows it,
+  exiting 0 once completed, 2 on the timeout and 1 if the drain is
+  cancelled. The tasks of a node that is `down`
   are marked `orphaned` and told to stop, in one write: they leave the
   endpoints, their slots run elsewhere at once (a global service's slot
   goes with the node, and keeps its task number for when the node is
