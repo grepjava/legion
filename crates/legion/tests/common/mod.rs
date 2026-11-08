@@ -80,6 +80,9 @@ pub struct Lab {
     /// Run as root on every node once the lab's daemons have stopped and
     /// their pods are gone.
     pub teardown: String,
+    /// The `legion` the daemons run: the test's own unless set, as to an
+    /// earlier release for an upgrade.
+    pub binary: String,
 }
 
 impl Lab {
@@ -139,6 +142,7 @@ impl Lab {
             setup: POOL.to_owned(),
             flags: format!("--zfs-root {ZFS_ROOT}"),
             teardown: NO_POOL.to_owned(),
+            binary: LEGION.to_owned(),
         }
     }
 
@@ -228,14 +232,18 @@ impl Lab {
         assert!(status.success(), "copying {from} to {}", vm.name);
     }
 
-    /// Copies the test's `legion` to a VM, stripped: it is far smaller.
+    /// Copies the daemons' `legion` to a VM, stripped: it is far smaller.
     fn install(&self, vm: &Vm) {
-        let stripped = self.dir.join("legion");
+        let stripped = self.dir.join(if self.binary == LEGION {
+            "legion"
+        } else {
+            "legion-other"
+        });
         if !stripped.exists() {
             let status = Command::new("strip")
                 .arg("-o")
                 .arg(&stripped)
-                .arg(LEGION)
+                .arg(&self.binary)
                 .status()
                 .unwrap();
             assert!(status.success(), "stripping legion");
@@ -257,12 +265,32 @@ impl Lab {
                 .unwrap();
             assert!(status.success(), "setting this host up");
         }
+        self.run_host(extra);
+    }
+
+    /// Stops this host's daemon as a service stop does (its pods run on)
+    /// and starts it again on [`Self::binary`], keeping its data.
+    pub fn restart_host(&mut self, extra: &[&str]) {
+        if let Some(mut child) = self.daemon.take() {
+            let _ = Command::new("kill")
+                .args(["-INT", &child.id().to_string()])
+                .status();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while child.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "the host's daemon stops");
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+        self.run_host(extra);
+    }
+
+    fn run_host(&mut self, extra: &[&str]) {
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.dir.join("daemon.log"))
             .unwrap();
-        let child = Command::new(LEGION)
+        let child = Command::new(&self.binary)
             .args(["daemon", "--node-name", "n1"])
             .args(["--listen", &self.server(), "--advertise", &self.server()])
             .arg("--data-dir")
@@ -289,12 +317,9 @@ impl Lab {
         self.install(vm);
         let name = format!("n{}", i + 2);
         let addr = format!("{}:{PORT}", vm.addr);
-        let (join, daemon) = match role {
-            Role::Manager => (
-                format!("--advertise {addr}"),
-                format!("--listen {addr} --advertise {addr}"),
-            ),
-            Role::Worker => (String::new(), format!("--advertise {}", vm.addr)),
+        let join = match role {
+            Role::Manager => format!("--advertise {addr}"),
+            Role::Worker => String::new(),
         };
         let cmd = format!(
             "{STOP}
@@ -303,19 +328,53 @@ impl Lab {
              {setup}
              {REMOTE} join {token} --manager {server} --data-dir /var/db/legion-lab \
                  {join} --node-name {name}
-             daemon -o /var/log/legion-lab.log {REMOTE} daemon --node-name {name} \
-                 --data-dir /var/db/legion-lab --run-dir /var/run/legion-lab \
-                 {daemon} {flags} </dev/null >/dev/null 2>&1
+             {daemon}
 ",
             clean = clean(VM_DATA, VM_RUN),
             server = self.server(),
             setup = self.setup,
-            flags = self.flags,
+            daemon = self.vm_daemon(i, role),
         );
         let out = self.ssh(vm, &cmd);
         assert!(
             out.status.success(),
             "joining {}: {}{}",
+            vm.name,
+            text(&out.stdout),
+            text(&out.stderr)
+        );
+    }
+
+    /// The command starting VM `i`'s daemon, joined as `role`. A manager
+    /// listens on the API port; a worker only advertises where WireGuard
+    /// reaches it.
+    fn vm_daemon(&self, i: usize, role: Role) -> String {
+        let vm = &self.vms[i];
+        let addr = format!("{}:{PORT}", vm.addr);
+        let daemon = match role {
+            Role::Manager => format!("--listen {addr} --advertise {addr}"),
+            Role::Worker => format!("--advertise {}", vm.addr),
+        };
+        format!(
+            "daemon -o /var/log/legion-lab.log {REMOTE} daemon --node-name n{n} \
+                 --data-dir /var/db/legion-lab --run-dir /var/run/legion-lab \
+                 {daemon} {flags} </dev/null >/dev/null 2>&1",
+            n = i + 2,
+            flags = self.flags,
+        )
+    }
+
+    /// Stops VM `i`'s daemon as a service stop does (its pods run on) and
+    /// starts it again on [`Self::binary`], keeping its data.
+    pub fn restart_vm(&self, i: usize, role: Role) {
+        let vm = &self.vms[i];
+        let out = self.ssh(vm, STOP);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        self.install(vm);
+        let out = self.ssh(vm, &format!("set -e\n{}\n", self.vm_daemon(i, role)));
+        assert!(
+            out.status.success(),
+            "restarting {}: {}{}",
             vm.name,
             text(&out.stdout),
             text(&out.stderr)

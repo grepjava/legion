@@ -51,6 +51,15 @@ su -l lab -c "rm -rf ~/jailer && mkdir ~/jailer &&
     cd ~/jailer && cargo build --locked --bin jailer"
 test -x /home/lab/jailer/target/debug/jailer
 
+# The previous release, for the upgrade drill, at the revision
+# legion.qualify records: its version commit.
+previous_rev=929e87e05ae32fb769b3bceb8e88b12917e87cef
+su -l lab -c "rm -rf ~/legion-prev && mkdir ~/legion-prev &&
+    fetch -qo - https://github.com/grepjava/legion/archive/$previous_rev.tar.gz |
+        tar -xzf - -C ~/legion-prev --strip-components 1 &&
+    cd ~/legion-prev && cargo build --locked --bin legion"
+test -x /home/lab/legion-prev/target/debug/legion
+
 cat > /var/tmp/lab.env << EOF
 export LEGION_STORAGE_NFS=127.0.0.1:$lvol/export
 export LEGION_SYS_NFS=127.0.0.1:$lvol/export
@@ -61,6 +70,7 @@ export LEGION_BHYVE_LAB=/var/tmp/lbhyve
 export LEGION_CLUSTER_LAB=/var/tmp/lcluster
 export LEGION_PG_IMAGE=/var/tmp/legion-pg.oci.tar
 export LEGION_JAILER=/home/lab/jailer/target/debug/jailer
+export LEGION_PREVIOUS=/home/lab/legion-prev/target/debug/legion
 export LEGION_CLUSTER_HOST=10.78.0.1
 export LEGION_CLUSTER_VMS='lab2=lab@10.78.0.2 lab3=lab@10.78.0.3'
 export LEGION_CLUSTER_KEY=/home/lab/.ssh/id_ed25519

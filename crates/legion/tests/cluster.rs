@@ -278,3 +278,110 @@ fn app_updates_and_survives_losing_a_node() {
     });
     step("done");
 }
+
+/// What `node` says its agent speaks: 1 from a build before the handshake.
+fn speaks(lab: &Lab, node: &str) -> u64 {
+    lab.list("nodes", "")
+        .iter()
+        .find(|n| n["metadata"]["name"] == node)
+        .and_then(|n| n["status"]["protocol"]["speaks"].as_u64())
+        .unwrap_or(1)
+}
+
+/// The managers' protocol floor, as the manager at `server` reads it: 1
+/// from a build before the handshake.
+fn floor_at(lab: &Lab, server: &str) -> u64 {
+    let out = Command::new(common::LEGION)
+        .args(["--server", server, "--identity"])
+        .arg(lab.admin())
+        .arg("status")
+        .output()
+        .unwrap();
+    text(&out.stdout)
+        .lines()
+        .find_map(|l| l.split_once("the managers' floor: "))
+        .and_then(|(_, f)| f.trim_end_matches(')').parse().ok())
+        .unwrap_or(1)
+}
+
+/// The upgrade drill (PLAN.md, phase 6): three managers on the previous
+/// release (`LEGION_PREVIOUS`, its `legion`) run the app, and each node in
+/// turn is restarted on this build, as an operator upgrades. The app
+/// answers throughout; the managers' floor stays where the previous
+/// release left it until the last manager is upgraded, then rises; and the
+/// upgraded cluster updates the app.
+#[test]
+#[ignore = "needs root, the lab's VMs and ZFS on FreeBSD; see the module docs"]
+fn the_cluster_upgrades_one_node_at_a_time() {
+    let previous = std::env::var("LEGION_PREVIOUS").expect("set LEGION_PREVIOUS");
+    assert!(Path::new(&previous).is_file(), "{previous} is no file");
+    let mut lab = Lab::from_env();
+    lab.binary = previous;
+    let step = |what: &str| eprintln!("--- {what}");
+
+    step("three managers on the previous release");
+    lab.start_host(&[]);
+    lab.ok(&["init"]);
+    let token = lab.ok(&["join-token", "manager"]).trim().to_owned();
+    for i in 0..2 {
+        lab.join(i, &token, Role::Manager);
+    }
+    wait("three ready nodes", 120, || {
+        ["n1", "n2", "n3"]
+            .iter()
+            .all(|n| lab.node_state(n) == "ready")
+    });
+    for n in ["n1", "n2", "n3"] {
+        assert_eq!(speaks(&lab, n), 1, "{n} runs the previous release");
+    }
+    lab.deploy("1");
+    wait("the app", 600, || lab.app_ready());
+
+    step("upgrade n3, then n2, then n1");
+    let addrs: Vec<String> = lab.vms.iter().map(|v| v.addr.clone()).collect();
+    let load = Load::start(addrs.clone());
+    std::thread::sleep(Duration::from_secs(2));
+    lab.binary = common::LEGION.to_owned();
+    let new = legion_api::protocol::SPEAKS as u64;
+    for i in [1, 0] {
+        let name = format!("n{}", i + 2);
+        lab.restart_vm(i, Role::Manager);
+        wait(&format!("{name} on this build"), 120, || {
+            lab.node_state(&name) == "ready" && speaks(&lab, &name) == new
+        });
+        wait("the app", 300, || lab.app_ready());
+        let at = format!("{}:{}", lab.vms[i].addr, common::PORT);
+        std::thread::sleep(Duration::from_secs(5));
+        assert_eq!(floor_at(&lab, &at), 1, "the floor with n1 not upgraded");
+    }
+    lab.restart_host(&[]);
+    wait("n1 on this build", 120, || {
+        lab.node_state("n1") == "ready" && speaks(&lab, "n1") == new
+    });
+    wait("the floor raised", 60, || {
+        floor_at(&lab, &lab.server()) == new
+    });
+    wait("the app", 300, || lab.app_ready());
+    std::thread::sleep(Duration::from_secs(2));
+    let results = load.finish();
+    let failures: Vec<_> = results.iter().filter(|r| r.2.is_err()).collect();
+    eprintln!(
+        "{} requests during the upgrade, {} failed: {:?}",
+        results.len(),
+        failures.len(),
+        failures.iter().take(5).collect::<Vec<_>>()
+    );
+    assert!(failures.is_empty(), "requests failed during the upgrade");
+
+    step("the upgraded cluster updates the app");
+    lab.deploy("2");
+    wait("the update", 300, || {
+        lab.list("services", "shop").iter().any(|s| {
+            s["metadata"]["name"] == "web" && s["status"]["update"]["state"] == "completed"
+        }) && lab.app_ready()
+    });
+    for a in &addrs {
+        assert!(get(a).unwrap().starts_with("web 2 "));
+    }
+    step("done");
+}
