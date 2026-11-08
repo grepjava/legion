@@ -129,16 +129,32 @@ Where an old copy of a workload and its replacement can run at once today:
 A task bound to a volume used by one node at a time doesn't run twice
 during a split: its replacement waits for the volume.
 
+## A volume an orphaned task used
+
+An orphaned task's pod may still be running on its node, so a volume used
+one node at a time that the task used stays held by it until the node says
+the task stopped, or is removed. Until then no other task using the volume
+is placed (`volume held by an orphaned task`), and a ZFS move of it doesn't
+take its last step, as the pod may still be writing. Without this, a node
+coming back could start the next task on the volume before it had stopped
+the old pod, and a move whose task was cut off before it was seen to stop
+would send its last increment without the pod's latest writes.
+
+A node coming back says so either way. If it still has a worker for the
+task, the worker stops the pod and reports `shutdown`. If it has none, for
+example after its agent restarted, it removes whatever is left and reports
+`shutdown` with "not running on its node once back". An agent from before
+v0.1.15 doesn't do the second, so a volume it held waits until the node is
+removed. Tested: `tasks_go_where_their_volume_is` and
+`a_move_waits_for_a_task_orphaned_before_it_was_seen_to_stop` (the
+planner), and `tasks_survive_losing_a_node` (agents in a real cluster).
+
 ## Not yet known
 
-These follow from reading the code and need a test before they are
-promises either way:
-
-- **A bound volume's task replaced on the node coming back** may be placed
-  there before the old pod's teardown has finished.
-- **A ZFS move** can reach its last step while a pod cut off on the old
-  node still writes, as an orphaned task no longer counts as using the
-  volume. The last increment could then miss those writes.
+Nothing found in the code is unaccounted for, but the tests stop an agent
+to cut its node off. None yet cuts off an agent that keeps running, or
+leaves an agent with only a cut-off manager (the fourth way of running
+twice). Those need the fault injection below.
 
 ## What comes next
 
