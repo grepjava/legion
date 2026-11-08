@@ -75,6 +75,10 @@ pub(crate) struct DispatcherService {
     period: Duration,
     /// When the leader last heard from each node.
     seen: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Leading, when a majority of managers last confirmed it: the start of
+    /// the last check they answered. Heartbeats are answered only while it
+    /// is recent (see [`Self::heartbeat`]).
+    confirmed: Arc<Mutex<Option<Instant>>>,
     /// Every service's endpoints, once first listed.
     endpoints: watch::Receiver<Option<Endpoints>>,
     /// Every node of the mesh, once first listed.
@@ -101,6 +105,7 @@ impl DispatcherService {
             tls,
             period,
             seen: Arc::default(),
+            confirmed: Arc::default(),
             endpoints,
             peers,
             policies,
@@ -118,9 +123,11 @@ impl DispatcherService {
             service.api.closing.clone(),
         ));
         let monitor = tokio::spawn(service.clone().monitor());
+        let confirm = tokio::spawn(service.clone().confirm());
         let tasks = tokio::spawn(async move {
             let _ = follow.await;
             let _ = monitor.await;
+            let _ = confirm.await;
         });
         (service, tasks)
     }
@@ -772,6 +779,61 @@ impl DispatcherService {
 
     /// While this manager leads, marks nodes suspect and then down when
     /// they fall silent, and ready again when they are heard from.
+    /// While leading, has a majority of managers confirm it each period,
+    /// noting when one last did.
+    async fn confirm(self) {
+        let mut closing = self.api.closing.clone();
+        let every = self.period.min(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(every) => {}
+                _ = closing.wait_for(|c| *c) => return,
+            }
+            let raft = &self.store().raft;
+            if raft.metrics().borrow().current_leader != Some(self.api.id) {
+                *self.confirmed.lock().unwrap() = None;
+                continue;
+            }
+            self.confirm_now().await;
+        }
+    }
+
+    /// Has a majority of managers confirm this one leads, now: true if they
+    /// did within the lease.
+    async fn confirm_now(&self) -> bool {
+        let began = Instant::now();
+        let raft = &self.store().raft;
+        let confirmed = matches!(
+            tokio::time::timeout(self.lease(), raft.ensure_linearizable()).await,
+            Ok(Ok(_))
+        );
+        if confirmed {
+            let mut at = self.confirmed.lock().unwrap();
+            *at = Some(at.map_or(began, |at| at.max(began)));
+        }
+        confirmed
+    }
+
+    /// Whether a majority of managers confirmed this one leads within the
+    /// lease: lately, or now if not lately (a leader just elected).
+    async fn confirmed_lately(&self) -> bool {
+        let lease = self.lease();
+        let lately = self
+            .confirmed
+            .lock()
+            .unwrap()
+            .is_some_and(|at| at.elapsed() < lease);
+        lately || self.confirm_now().await
+    }
+
+    /// How long a majority's confirmation lets this manager answer
+    /// heartbeats as the leader: the shortest a majority waits before it
+    /// elects another, so an agent's last heartbeat answered comes before
+    /// any other leader could start counting its silence.
+    fn lease(&self) -> Duration {
+        Duration::from_millis(self.store().raft.config().election_timeout_min)
+    }
+
     async fn monitor(self) {
         let mut closing = self.api.closing.clone();
         let grace = self.period * legion_api::node::DOWN_AFTER_HEARTBEATS;
@@ -1116,6 +1178,16 @@ impl Dispatcher for DispatcherService {
             return leader
                 .heartbeat(to_leader(HeartbeatRequest { node, usage }, &worker)?)
                 .await;
+        }
+        // Answered only as a leader a majority of managers confirmed lately.
+        // One cut off from them may not know yet that another leads, which
+        // counts the node's silence; answered here, the node's agent would
+        // not know it is cut off, and would keep running pods that must not
+        // run twice (`onPartition: stop`, docs/PARTITIONS.md).
+        if !self.confirmed_lately().await {
+            return Err(Status::unavailable(
+                "this manager has not heard from a majority of managers lately; retry",
+            ));
         }
         let reported = req.into_inner().usage;
         // Believed only of tasks placed on the node.

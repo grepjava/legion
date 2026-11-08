@@ -2966,6 +2966,71 @@ async fn a_follower_cut_off_from_the_leader_opens_no_watch() {
     follower.stop().await;
 }
 
+/// A leader cut off from the other managers may not know yet that another
+/// leads, which counts its nodes' silence: it stops answering heartbeats,
+/// so their agents know they are cut off (docs/PARTITIONS.md).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_cut_off_from_a_majority_answers_no_heartbeats() {
+    let mut managers = Vec::new();
+    for _ in 0..3 {
+        managers.push(Running::start().await);
+    }
+    form_cluster(&managers).await;
+    let heartbeat = |m: &Running| {
+        let m = m.addr.clone();
+        async move {
+            let channel = tonic::transport::Channel::from_shared(format!("http://{m}"))
+                .unwrap()
+                .connect()
+                .await
+                .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
+            DispatcherClient::new(channel)
+                .heartbeat(HeartbeatRequest {
+                    node: "w1".into(),
+                    usage: Vec::new(),
+                })
+                .await
+                .map(drop)
+        }
+    };
+    let register = DispatcherClient::new(managers[0].channel(None).await.unwrap());
+    eventually(|| {
+        let mut d = register.clone();
+        async move {
+            d.register(RegisterRequest {
+                node: "w1".into(),
+                status_json: br#"{"state":"ready"}"#.to_vec(),
+                ..Default::default()
+            })
+            .await
+        }
+    })
+    .await;
+    eventually(|| heartbeat(&managers[0])).await;
+
+    let leader = managers.remove(0);
+    for m in managers {
+        m.stop().await;
+    }
+    // Within the shortest election timeout (1.5 s here), and a check.
+    let start = std::time::Instant::now();
+    let refused = loop {
+        match heartbeat(&leader).await {
+            Err(e) => break e,
+            Ok(()) => {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(4),
+                    "still answering"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    };
+    assert_eq!(refused.code(), Code::Unavailable, "{refused}");
+    assert!(refused.message().contains("majority"), "{refused}");
+    leader.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_rejected_task_has_no_sessions() {
     let m = Running::start().await;
