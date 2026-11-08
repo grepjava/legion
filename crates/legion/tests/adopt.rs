@@ -9,7 +9,8 @@
 //! of its own, `ladopt`, with its own bridge and pf, and its pods are that
 //! jail's children, so nothing reaches the host's interfaces or rules, and
 //! nothing is published. It has no route out, so the image is pulled from
-//! the host first, into a dataset then handed to the jail.
+//! the host first, into a dataset then handed to the jail, and the pod takes
+//! it with `pullPolicy: never`: the manager can't resolve the tag either.
 //!
 //! A jail can't do two things a node does. It can't set a devfs ruleset, so
 //! it has ruleset 4 as its own, which the kernel puts on every devfs mounted
@@ -65,6 +66,7 @@ spec:
     containers:
       - name: beat
         image: {IMAGE}
+        pullPolicy: never
         command: [/bin/sh, -c, 'n=0; while :; do n=$((n+1)); echo "beat $n"; sleep 1; done']
         probes:
           readiness:
