@@ -1020,6 +1020,18 @@ says why that went and what was kept of it.
   the registry decides (only the manifest and config are fetched, the
   layers are shared). Images pulled without a login, or loaded, are
   anyone's. The logins never reach the task's files.
+- **Identity**: the leading manager resolves each tag of a Service's or
+  Job's pod once per pod deployed, with the pod's pull secrets, to the
+  digest the tag names (the index for an image of several platforms, never
+  the config), and records it on the owner's status keyed by a hash of the
+  pod, so scaling keeps it. Tasks carry the digests (`TaskSpec.images`), the
+  pod staying as written, and none is made before they are resolved, so an
+  update waits with its old tasks running. A rollback runs the digests
+  recorded before its update (`UpdateStatus.previousImages`). Nodes say
+  they run pins (`NodeStatus.imagePins`), and until all do nothing is
+  resolved or pinned. Each task reports the manifest its node ran. A
+  container's `pullPolicy: never` asks no registry, and nor does a
+  reference by digest or a `localhost/` name.
 - **Layers**: each layer is decompressed (gzip, zstd or plain) and checked
   against its `diff_id` **before** anything is extracted: images share
   layers by chain id, so a layer claiming another's id would otherwise

@@ -144,6 +144,29 @@ pod:
 An image name without a registry means Docker Hub, as in Docker
 (`nginx:1.27` is `docker.io/library/nginx:1.27`).
 
+### What a deployment runs
+
+When a Service or Job is deployed, the leading manager asks the registry
+what each tag names, once, and every task of that deployment runs that
+digest, on whichever node it lands. A tag moved since changes nothing until
+the Service is deployed again; scaling it is not a deployment. The
+digests are on the Service's status (`legion get service web -n shop`,
+under `status.images`), and each task's status says which manifest its node
+ran, which for an image of several platforms is the one for that node's.
+A rollback runs the digests from before the update, whatever the tags name
+now.
+
+So the managers need to reach the registries, with the pod's
+`imagePullSecrets`. Until a deployment's images are resolved, no task of
+it starts, and its status says why; tasks of the one before keep running.
+A reference by digest (`nginx@sha256:...`) and a `localhost/` name are left
+as written. Pinning starts once every node runs a Legion that reads pins;
+until then, tasks run images by name, as before.
+
+A container's `pullPolicy: never` keeps its image to what each node holds
+under that name: no registry is asked, by the managers or the node, and a
+node without the image refuses the task.
+
 ### From a private registry
 
 Put a Docker login in a Secret of the pod's namespace, in the format
@@ -183,8 +206,12 @@ legion image load pg.tar --zfs-root zroot/legion   # on a node: the daemon's --z
 
 (Or `podman save --format oci-archive -o pg.tar localhost/pg:17`.)
 
-Name such images `localhost/...`: Legion never tries to pull those, so a
-node without the image fails the task instead of asking a registry.
+Name such images `localhost/...`, or give their containers
+`pullPolicy: never`: Legion never tries to pull those, so a node without the
+image fails the task instead of asking a registry. A cluster that can't
+reach a registry has to use one of the two, as resolving a tag needs the
+registry. The store finds an image by the name it was loaded under, not by
+digest, so deploying the loaded image by digest asks a registry too.
 (`localhost:5000/...`, with a port, is a registry on that port, and is
 pulled as any other.)
 Load the image on every node that may run the service, or keep the
