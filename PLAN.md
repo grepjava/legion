@@ -1,6 +1,6 @@
 # Legion implementation plan
 
-Updated: 8 November 2026. Baseline: v0.1.15. Turns [ROADMAP.MD](ROADMAP.MD)
+Updated: 9 November 2026. Baseline: v0.1.15. Turns [ROADMAP.MD](ROADMAP.MD)
 into an order of work; what each milestone means stays there.
 
 The order: make test results trustworthy first, then settle what happens
@@ -181,9 +181,8 @@ stopped, and a node cut off with its agent running is tested through a
 link that goes silent. A leader cut off from the majority answers no
 heartbeats, so agents attached to it know they are cut off. Item 5 is a
 stated procedure: what to check before removing a node that holds data.
-Qualified at fb6c909 on 8 November 2026: all 38 steps passed, the two
-handoff tests with jailer included, with nothing left behind. Not yet
-tagged.
+Released in v0.1.15, tagged on 9 November 2026 at 27ee1c1 after a clean
+run of all 39 steps on `scripts/lab`.
 
 ### Phase 5: Drain barrier
 
@@ -204,7 +203,11 @@ is back (cluster tests, through fault hooks in the fake host), cancellation
 three managers (`a_drain_waiter_survives_the_leaders_loss`, which fails
 without the waiter's retries). A waiter whose own manager goes needs the
 managers' floating address, and that is not tested. Not yet run on the lab: the faults are
-injected on the fake host, as the lab has no way to cut a transfer.
+injected on the fake host, as the lab has no way to cut a transfer. The
+slow lab found a drain reported `completed` while a stateful Volume's move,
+called off as its target went silent, had left the data behind: such a
+Volume now holds the drain (`waiting`) until it has moved
+(`a_drain_waits_for_data_whose_move_was_called_off`). Released in v0.1.15.
 
 1. Add a persisted drain operation with `Draining`, `Blocked`, `Completed`
    and `Failed`, stable reason codes and per-workload progress. Reuse the
@@ -239,8 +242,27 @@ manager speaks it, recorded as a floor that only rises
 (`the_floor_rises_once_every_manager_speaks_it`). The ACME gap is closed
 with one: a certificate is written only while the routes calling for it
 are unchanged (`a_route_changed_as_its_certificate_is_written_gets_none`,
-which shows the gap still open at protocol 1). Not yet: an upgrade drill
-from v0.1.15 on the lab.
+which shows the gap still open at protocol 1). The upgrade drill
+(`the_cluster_upgrades_one_node_at_a_time`) is in every full run: three
+managers on v0.1.14 serve an app while each node is restarted on the new
+build, the floor rising once the last is; then every node is restarted
+again, and no request may fail. Its first runs found three gaps, each
+fixed: the node resolver died with the daemon (now a process of its own,
+so lookups fail only once, while a node leaves v0.1.14); a restarted agent
+loaded its services' pf rules before it knew the endpoints, dropping
+published ports; and setting wg0's and the bridge's addresses again at
+each start dropped the routes through them for a moment. Released in
+v0.1.15.
+
+Item 2 is built (docs/DESIGN.md, What to back up): the control state's
+backup holds no volume's data, and says so; a manager is rebuilt on an
+empty disk from it and its keys alone, `pki`, `node-id` and `admin.pem`
+(`a_manager_is_rebuilt_on_a_new_disk_from_its_backup_and_keys`); and
+`legion volume backup` and `restore` take a Volume's data apart, as a
+crash-consistent snapshot, labelled so in the file and by the CLI, restored
+onto a node without the data, the Volume made only once all of it is there
+(`a_volume_backup_restores_onto_another_node`). Tested on the fake host;
+not yet on the lab's ZFS, which item 4's drill will do.
 
 Exit: a supported upgrade path is tested. Snapshots are labelled
 crash-consistent, and a control-state backup isn't described as a backup of
