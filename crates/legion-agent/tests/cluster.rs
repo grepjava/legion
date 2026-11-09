@@ -61,7 +61,7 @@ impl Link {
         let cut = Arc::new(tokio::sync::watch::Sender::new(false));
         let (target, watch) = (target.to_owned(), cut.clone());
         tokio::spawn(async move {
-            while let Ok((mut inbound, _)) = listener.accept().await {
+            while let Ok((inbound, _)) = listener.accept().await {
                 let (target, mut cut) = (target.clone(), watch.subscribe());
                 tokio::spawn(async move {
                     if *cut.borrow_and_update() {
