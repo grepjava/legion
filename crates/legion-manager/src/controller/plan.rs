@@ -383,7 +383,7 @@ pub fn plan(
         .retain(|a| !matches!(a, Action::Update(o, _) if deleted.contains(&o.key())));
     // Where drains stand, from the tasks as read: the next pass sees what
     // this one did.
-    drain::drains(tasks, nodes, volumes, &mut plan);
+    drain::drains(services, tasks, nodes, volumes, &mut plan);
     plan
 }
 

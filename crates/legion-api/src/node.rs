@@ -176,7 +176,8 @@ pub struct DrainItem {
     /// `replacement` (its replacement starts first), or `running` (not yet
     /// planned). Told to stop: `stopping`, or `unconfirmed` (orphaned, not
     /// yet seen to stop). For a Volume: `copying` or `finishing`, as its
-    /// data moves off.
+    /// data moves off, or `waiting` for its move to start (again, after
+    /// one called off as the node it went to stopped being ready).
     pub reason: String,
     /// Why the last attempt failed, for a Volume whose move is tried
     /// again (a transfer cut short, or a node not there to take part).

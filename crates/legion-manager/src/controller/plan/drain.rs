@@ -5,17 +5,42 @@
 //! released: a node that isn't ready, or a task orphaned there and not yet
 //! seen to stop, blocks the drain until it is known.
 
+use std::collections::BTreeSet;
+
 use legion_api::node::{Availability, DrainItem, DrainPhase, DrainStatus, NodeState};
+use legion_api::service::{ServiceMode, claim_volume};
 use legion_api::task::DesiredState;
 use legion_api::task::TaskState;
 use legion_api::volume::MigrationPhase;
 
-use super::{Action, Node, Plan, Task, Volumes};
+use super::{Action, Node, Plan, Service, Task, Volumes};
 
-pub(super) fn drains(tasks: &[Task], nodes: &[Node], volumes: &Volumes, plan: &mut Plan) {
+pub(super) fn drains(
+    services: &[Service],
+    tasks: &[Task],
+    nodes: &[Node],
+    volumes: &Volumes,
+    plan: &mut Plan,
+) {
+    // The Volumes of stateful services' wanted ordinals: on a draining
+    // node, each is moved off, so the drain waits for it even between one
+    // move called off (its target no longer ready) and the next.
+    let moved: BTreeSet<(String, String)> = services
+        .iter()
+        .filter(|s| s.spec.mode == ServiceMode::Stateful)
+        .flat_map(|s| {
+            let (namespace, svc) = s.key();
+            (0..s.spec.replicas.unwrap_or(1)).flat_map(move |n| {
+                s.spec
+                    .pod
+                    .claims()
+                    .map(move |(claim, _)| (namespace.to_owned(), claim_volume(claim, svc, n)))
+            })
+        })
+        .collect();
     for n in nodes {
         let wanted = (n.spec.availability == Availability::Drain)
-            .then(|| status(n, tasks, volumes, &plan.waits));
+            .then(|| status(n, tasks, volumes, &moved, &plan.waits));
         if wanted == n.status.drain {
             continue;
         }
@@ -33,6 +58,7 @@ fn status(
     n: &Node,
     tasks: &[Task],
     volumes: &Volumes,
+    moved: &BTreeSet<(String, String)>,
     waits: &std::collections::BTreeMap<String, &'static str>,
 ) -> DrainStatus {
     let mut remaining = Vec::new();
@@ -54,23 +80,27 @@ fn status(
             message: String::new(),
         });
     }
-    for ((namespace, name), v) in volumes {
-        let Some(m) = &v.status.migration else {
-            continue;
-        };
+    for (key, v) in volumes {
         if v.status.node != n.name() {
             continue;
         }
-        let reason = match m.phase {
-            MigrationPhase::Copying | MigrationPhase::Copied => "copying",
-            MigrationPhase::Finishing => "finishing",
+        let (reason, message) = match &v.status.migration {
+            Some(m) => (
+                match m.phase {
+                    MigrationPhase::Copying | MigrationPhase::Copied => "copying",
+                    MigrationPhase::Finishing => "finishing",
+                },
+                m.message.clone(),
+            ),
+            None if moved.contains(key) => ("waiting", String::new()),
+            None => continue,
         };
         remaining.push(DrainItem {
             kind: "Volume".into(),
-            namespace: namespace.clone(),
-            name: name.clone(),
+            namespace: key.0.clone(),
+            name: key.1.clone(),
             reason: reason.into(),
-            message: m.message.clone(),
+            message,
         });
     }
     let reason = if n.status.state != NodeState::Ready {

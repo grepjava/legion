@@ -3217,6 +3217,55 @@ fn a_drain_says_a_task_waits_for_its_budget() {
     );
 }
 
+/// A move called off as it finished, its target no longer ready, leaves the
+/// data on the draining node with its task gone: the drain waits for it
+/// still, and is not completed with the data behind.
+#[test]
+fn a_drain_waits_for_data_whose_move_was_called_off() {
+    use legion_api::volume::MigrationPhase::*;
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.service(
+        "db",
+        &format!(
+            "{}\nmaxUnavailable: 1",
+            STATEFUL.replace("replicas: 3", "replicas: 1")
+        ),
+    );
+    w.settle();
+    let from = w.placed_task("db-0-1").spec.node.clone();
+    let to = if from == "n1" { "n2" } else { "n1" };
+
+    w.availability(&from, Availability::Drain);
+    w.settle();
+    w.migrate();
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some((to.to_owned(), Finishing)));
+
+    // Its target goes silent before the last of the data is sent.
+    w.state(to, NodeState::Suspect);
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), None);
+    assert_eq!(w.volume_node("data-db-0"), from);
+    let (phase, _, remaining) = w.drain(&from).unwrap();
+    assert_eq!(phase, "draining", "{remaining:?}");
+    assert_eq!(remaining, ["Volume data-db-0 waiting"]);
+
+    // Back, the data moves and the drain ends.
+    w.state(to, NodeState::Ready);
+    w.settle();
+    w.migrate();
+    w.settle();
+    w.migrate();
+    w.settle();
+    assert_eq!(w.volume_node("data-db-0"), to);
+    assert_eq!(
+        w.drain(&from),
+        Some(("completed".into(), String::new(), vec![]))
+    );
+}
+
 #[test]
 fn ordinals_drained_from_one_node_spread_over_the_others() {
     use legion_api::volume::MigrationPhase::*;
