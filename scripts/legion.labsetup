@@ -27,6 +27,10 @@ target "$target" {
 }
 EOF
 service ctld onestart
+# Loaded here, waiting for it: iscsid's rc script loads it only if it is
+# not there, and a load under way (ctld's modules share its dependency)
+# made it fail with "already loaded", stopping the setup.
+kldload -n iscsi || { sleep 1; kldload -n iscsi; }
 service iscsid onestart
 
 echo "$lvol/export -maproot=root 127.0.0.1" > /etc/exports
