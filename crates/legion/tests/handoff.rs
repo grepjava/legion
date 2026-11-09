@@ -10,7 +10,8 @@
 //! - With data (jailer's ROADMAP, shared qualification; PLAN.md phases 4
 //!   and 5): a stateful task of a jailer image writes to its Volume, its
 //!   node is drained, and on the next node it runs the same manifest with
-//!   the same data, its first writer having stopped before the data moved.
+//!   the same data, its first writer having stopped before the data moved;
+//!   and again with the move's last part cut short and sent again.
 //!
 //! It drives real daemons, so it is ignored by default and run by hand on a
 //! FreeBSD host as root, with the lab of `tests/common` (see there), and with
@@ -34,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use common::{Lab, Role, text, wait};
+use common::{Lab, Role, ZFS_ROOT, kill_receiving, text, wait};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -437,8 +438,8 @@ done
 "#;
 
 /// A stateful Service of one task running the writer of `image` on a
-/// Volume of its own.
-fn keeper(image: &str) -> String {
+/// Volume of its own, with `more` of its spec's fields, indented to them.
+fn keeper(image: &str, more: &str) -> String {
     format!(
         "apiVersion: legion/v1
 kind: Service
@@ -446,13 +447,13 @@ metadata: {{ name: keep, namespace: handoff }}
 spec:
   mode: stateful
   replicas: 1
-  pod:
+{more}  pod:
     containers:
       - name: app
         image: {image}
         command: [/bin/sh, /writer]
         volumeMounts: [{{ name: data, path: /data }}]
-    volumes: [{{ name: data, claim: {{ size: 64Mi }} }}]
+    volumes: [{{ name: data, claim: {{ size: 256Mi }} }}]
 "
     )
 }
@@ -522,6 +523,27 @@ fn writers(log: &str) -> Vec<(String, Vec<String>)> {
     out
 }
 
+/// Checks the writer's log: the first task's lines, every one of them, up
+/// to its last, which says it stopped, then the moved task's, and no line
+/// of the first after that.
+fn one_writer_at_a_time(log: &str) {
+    let w = writers(log);
+    assert_eq!(w.len(), 2, "the first task, then the moved one\n{log}");
+    let (old, new) = (&w[0].1, &w[1].1);
+    assert_eq!(
+        old.last().map(String::as_str),
+        Some("stop"),
+        "the first task stopped before its data moved, and its last line came along\n{log}"
+    );
+    assert!(
+        old.len() > 10 && new.len() > 10,
+        "both wrote for a while\n{log}"
+    );
+    for (n, line) in old[..old.len() - 1].iter().enumerate() {
+        assert_eq!(*line, (n + 1).to_string(), "no line of it lost\n{log}");
+    }
+}
+
 #[test]
 fn a_log_tells_writers_apart() {
     let w = writers("a 1\na 2\na stop\nb 1\nb 2\n");
@@ -574,7 +596,7 @@ fn a_jailer_image_keeps_its_data_through_a_drain() {
     lab.load_image(tar.to_str().unwrap());
     lab.apply("namespace", NAMESPACE);
     let image = "localhost/handoff/keep:1";
-    lab.apply("keep", &keeper(image));
+    lab.apply("keep", &keeper(image, ""));
     let before = lab.one("keep", image, &manifest);
     assert_eq!(lab.id_in(&before), id, "the build jailer recorded");
     assert_eq!(text(&lab.file_in(&before, "/data/born")), id);
@@ -621,22 +643,7 @@ fn a_jailer_image_keeps_its_data_through_a_drain() {
     );
     // Lines from the moved task, then the whole log.
     std::thread::sleep(std::time::Duration::from_secs(3));
-    let log = text(&lab.file_in(&after, "/data/log"));
-    let w = writers(&log);
-    assert_eq!(w.len(), 2, "the first task, then the moved one\n{log}");
-    let (old, new) = (&w[0].1, &w[1].1);
-    assert_eq!(
-        old.last().map(String::as_str),
-        Some("stop"),
-        "the first task stopped before its data moved, and its last line came along\n{log}"
-    );
-    assert!(
-        old.len() > 10 && new.len() > 10,
-        "both wrote for a while\n{log}"
-    );
-    for (n, line) in old[..old.len() - 1].iter().enumerate() {
-        assert_eq!(*line, (n + 1).to_string(), "no line of it lost\n{log}");
-    }
+    one_writer_at_a_time(&text(&lab.file_in(&after, "/data/log")));
     assert!(
         lab.running("keep").len() == 1,
         "one task of the service runs"
@@ -844,4 +851,163 @@ fn answer(
         };
     }
     (NOT_FOUND, Vec::new(), Vec::new())
+}
+
+impl Lab {
+    /// The Volume of the writer's task.
+    fn keep_volume(&self) -> Value {
+        self.list("volumes", "handoff")
+            .into_iter()
+            .find(|v| v["metadata"]["name"] == "data-keep-0")
+            .unwrap_or_default()
+    }
+
+    /// Runs `args` in a task, which must work.
+    fn exec_in(&self, task: &Value, args: &[&str]) {
+        let name = task["metadata"]["name"].as_str().unwrap();
+        let mut all = vec!["exec", name, "-n", "handoff", "--"];
+        all.extend_from_slice(args);
+        let out = self.legion(&all, &[]);
+        assert!(
+            out.status.success(),
+            "{args:?} in {name}: {}",
+            text(&out.stderr)
+        );
+    }
+}
+
+/// As [`a_jailer_image_keeps_its_data_through_a_drain`], with the move cut
+/// short (PLAN.md phase 6, as `stateful.rs` cuts Postgres's): the full copy
+/// is made while the task runs, as its service lets none stop; then the
+/// task may stop, and the last part's `zfs receive` is killed as it
+/// receives. The part is sent again, and the moved task has every byte and
+/// every line. `n1` is paused, so the task and its move are on the VMs.
+#[test]
+#[ignore = "needs root and ZFS on FreeBSD, two more nodes and jailer; see the module docs"]
+fn a_jailer_image_keeps_its_data_through_a_cut_move() {
+    let mut lab = Lab::from_env();
+    let jailer = Jailer::new(&lab, &[]);
+    let step = |what: &str| eprintln!("--- {what}");
+
+    step("jailer builds a writer and exports it");
+    let rec = lab.dir.join("cut.json");
+    let id = unique("cut");
+    jailer.build_with(
+        &lab.dir,
+        "handoff/keep:1",
+        &id,
+        &rec,
+        &[("writer", WRITER)],
+        &[],
+    );
+    let tar = lab.dir.join("cut.oci.tar");
+    jailer.run(&[
+        "export",
+        "--record",
+        rec.to_str().unwrap(),
+        "handoff/keep:1",
+        tar.to_str().unwrap(),
+    ]);
+    let manifest = record(&rec).image.manifest;
+
+    step("a stateful service runs it on a VM; its task may not stop yet");
+    three_nodes(&mut lab, &[]);
+    lab.load_image(tar.to_str().unwrap());
+    lab.apply("namespace", NAMESPACE);
+    lab.ok(&["node", "pause", "n1"]);
+    let image = "localhost/handoff/keep:1";
+    lab.apply("keep", &keeper(image, "  maxUnavailable: 0\n"));
+    let before = lab.one("keep", image, &manifest);
+    assert_eq!(lab.id_in(&before), id, "the build jailer recorded");
+    let blob = lab.file_in(&before, "/data/blob");
+    let from = before["spec"]["node"].as_str().unwrap().to_owned();
+    let to = if from == "n2" { "n3" } else { "n2" };
+    eprintln!("keep on {from}, to move to {to}");
+    let ds = format!("{ZFS_ROOT}/volumes/handoff/data-keep-0");
+
+    step(&format!(
+        "draining {from}: the full copy, made as the task runs"
+    ));
+    lab.ok(&["node", "drain", &from]);
+    wait("the full copy", 600, || {
+        lab.keep_volume()["status"]["migration"]["phase"] == "copied"
+    });
+    assert_eq!(lab.keep_volume()["status"]["migration"]["to"], to);
+    assert_eq!(lab.running("keep").len(), 1, "the task runs on");
+
+    step("data the last part must carry, then the task may stop: its receive is cut");
+    // Enough that the last part takes a while to receive.
+    lab.exec_in(
+        &before,
+        &[
+            "dd",
+            "if=/dev/random",
+            "of=/data/ballast",
+            "bs=1m",
+            "count=64",
+        ],
+    );
+    let ballast = lab.file_in(&before, "/data/ballast");
+    assert_eq!(ballast.len(), 64 << 20);
+    let out = std::thread::scope(|s| {
+        let killer =
+            s.spawn(|| lab.on(to, &kill_receiving(&ds, &format!("zfs receive -F -u {ds}"))));
+        lab.apply("keep", &keeper(image, "  maxUnavailable: 1\n"));
+        killer.join().unwrap()
+    });
+    assert!(
+        out.status.success(),
+        "killing the last part's receive: {}",
+        text(&out.stderr)
+    );
+    let v = lab.keep_volume();
+    assert_eq!(v["status"]["node"], from.as_str(), "{v}");
+    assert_eq!(v["status"]["migration"]["phase"], "finishing", "{v}");
+
+    step("the part sent again, the move ends on the VM it was going to");
+    let out = lab.legion(
+        &[
+            "node",
+            "drain",
+            &from,
+            "--wait",
+            "--timeout",
+            "900",
+            "-o",
+            "json",
+        ],
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "drain --wait: {}{}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+    let done: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(done["phase"], "completed", "{done}");
+    let after = lab.one("keep", image, &manifest);
+    assert_eq!(after["spec"]["node"], to);
+    assert_eq!(lab.keep_volume()["status"]["node"], to);
+
+    step("the image and every byte the same; one writer at a time; nothing left over");
+    assert_eq!(lab.id_in(&after), id, "the build jailer recorded");
+    assert_eq!(text(&lab.file_in(&after, "/data/born")), id);
+    assert!(lab.file_in(&after, "/data/blob") == blob, "the first data");
+    assert!(
+        lab.file_in(&after, "/data/ballast") == ballast,
+        "the last part's data"
+    );
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    one_writer_at_a_time(&text(&lab.file_in(&after, "/data/log")));
+    assert_eq!(
+        lab.holds(to, "data-keep-0"),
+        ds,
+        "the move's snapshots gone"
+    );
+    wait("the old copy dropped", 300, || {
+        lab.holds(&from, "data-keep-0").is_empty()
+    });
+    lab.delete("keep");
+    step("done");
 }

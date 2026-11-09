@@ -450,6 +450,48 @@ impl Lab {
         v.sort();
         v
     }
+
+    /// Runs the script `cmd` as root on node `n2` or `n3`, a VM.
+    pub fn on(&self, node: &str, cmd: &str) -> Output {
+        self.ssh(&self.vms[vm(node)], cmd)
+    }
+
+    /// What node `n2` or `n3` holds of the Volume `name`: its datasets and
+    /// snapshots.
+    pub fn holds(&self, node: &str, name: &str) -> String {
+        let out = self.on(
+            node,
+            &format!("zfs list -H -o name -t all -r {ZFS_ROOT}/volumes 2>/dev/null | grep {name}"),
+        );
+        text(&out.stdout).trim().to_owned()
+    }
+}
+
+/// The VM a node joined from: `n2` is the first, `n3` the second.
+pub fn vm(node: &str) -> usize {
+    match node {
+        "n2" => 0,
+        "n3" => 1,
+        _ => panic!("{node} is no VM"),
+    }
+}
+
+/// Waits up to 300 s for the node's `zfs receive` of `ds`, then kills
+/// `what` (a pattern for `pkill -f`) and waits for the receive to end.
+/// Fails, saying so, if no receive came.
+pub fn kill_receiving(ds: &str, what: &str) -> String {
+    format!(
+        "i=0
+         until pgrep -qf 'zfs receive -F -u {ds}'; do
+             i=$((i + 1))
+             [ $i -lt 3000 ] || {{ echo 'no receive came' >&2; exit 3; }}
+             sleep 0.1
+         done
+         pkill -KILL -f '{what}'
+         i=0; while pgrep -qf 'zfs receive' && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+         ! pgrep -qf 'zfs receive'
+"
+    )
 }
 
 /// A script removing what a stopped daemon with these directories left:
