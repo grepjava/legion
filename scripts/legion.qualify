@@ -67,6 +67,7 @@ test legion-net bhyve guest_on_the_bridge vnet isolated 900 kld:vmm env:LEGION_B
 test legion cluster app_updates_and_survives_losing_a_node host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_CLUSTER_LOSE
 test legion stateful postgres_moves_between_nodes host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_PG_IMAGE
 test legion stateful a_move_cut_short_or_held_by_a_full_disk_loses_nothing host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_PG_IMAGE
+test legion stateful postgres_is_restored_onto_replacement_hosts host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_PG_IMAGE
 test legion teams two_teams_share_a_cluster host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
 test legion cluster the_cluster_upgrades_one_node_at_a_time host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_PREVIOUS
 

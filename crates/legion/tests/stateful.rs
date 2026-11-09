@@ -8,7 +8,8 @@
 //!
 //! Phase 6's test of interrupted moves (PLAN.md) is here too, on the same
 //! image: the primary's move, held by a full disk, then cut short as each
-//! part is received, loses nothing.
+//! part is received, loses nothing. So is its restore drill: the cluster
+//! rebuilt on replacement hosts from its backups, each stage timed.
 //!
 //! It drives real daemons, so it is ignored by default and run by hand on
 //! a FreeBSD host as root, with the lab of `tests/common` (see there), as
@@ -569,6 +570,245 @@ fn a_move_cut_short_or_held_by_a_full_disk_loses_nothing() {
     step("clean up");
     lab.ok(&["delete", "service", "db", "-n", "data"]);
     lab.waited("every task gone", 180, || {
+        lab.list("tasks", "data")
+            .iter()
+            .all(|t| t["status"]["state"] != "running")
+    });
+    step("done");
+}
+
+/// Copies `from` to `to` keeping modes, as an operator's `cp -Rp` does.
+fn kept(from: &std::path::Path, to: &std::path::Path) {
+    let out = std::process::Command::new("cp")
+        .arg("-Rp")
+        .arg(from)
+        .arg(to)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "copying {}: {}",
+        from.display(),
+        text(&out.stderr)
+    );
+}
+
+/// Phase 6's restore drill (PLAN.md, item 4): Postgres, a primary and a
+/// replica on two workers, is restored onto replacement hosts after every
+/// host is lost, from the three backups kept apart (docs/DESIGN.md, What
+/// to back up): the control state, the manager's keys, and the primary's
+/// Volume. The hosts are the same machines, each with every disk Legion
+/// used replaced: data directories and pools made anew. Each stage of the
+/// recovery is timed, and the times printed for the record. The primary
+/// comes back with what was written up to its backup, recovering as from
+/// a crash; the replica, given an empty Volume, copies the primary anew.
+#[test]
+#[ignore = "needs root and ZFS on FreeBSD, two more nodes and the image; see the module docs"]
+fn postgres_is_restored_onto_replacement_hosts() {
+    use std::time::Instant;
+    let image = std::env::var("LEGION_PG_IMAGE").expect("set LEGION_PG_IMAGE");
+    let mut lab = Lab::from_env();
+    let step = |what: &str| eprintln!("--- {what}");
+
+    step("a manager and two workers, each with a pool for volumes; the manager runs no Postgres");
+    lab.start_host(&[]);
+    lab.ok(&["init"]);
+    let worker = lab.ok(&["join-token", "worker"]).trim().to_owned();
+    lab.join(0, &worker, Role::Worker);
+    lab.join(1, &worker, Role::Worker);
+    let ready = |lab: &Lab| {
+        ["n1", "n2", "n3"]
+            .iter()
+            .all(|n| lab.node_state(n) == "ready")
+    };
+    wait("three ready nodes", 120, || ready(&lab));
+    lab.load_image(&image);
+    lab.ok(&["node", "pause", "n1"]);
+
+    step("Postgres, a primary and a replica, with rows and a ballast");
+    let app = lab.dir.join("app.yaml");
+    std::fs::write(&app, APP).unwrap();
+    lab.ok(&["apply", "-f", app.to_str().unwrap()]);
+    let both = |lab: &Lab| {
+        lab.list("services", "data")
+            .iter()
+            .any(|s| s["metadata"]["name"] == "db" && s["status"]["ready"] == 2)
+    };
+    wait("both ordinals ready", 600, || both(&lab));
+    lab.sql(
+        0,
+        "create table orders (id serial primary key, item text); \
+         insert into orders (item) select 'kept ' || i from generate_series(1, 1000) i; \
+         create table ballast as select md5(i::text) as v from generate_series(1, 1000000) i; \
+         checkpoint",
+    )
+    .expect("writing to the primary");
+    wait("the replica has the rows", 120, || {
+        lab.rows(1) == Some(1000)
+    });
+
+    step("the three backups, kept apart: control state, keys, the primary's data");
+    let safe = lab.dir.join("kept");
+    std::fs::create_dir_all(&safe).unwrap();
+    let control = safe.join("control.json");
+    lab.ok(&["backup", "-o", control.to_str().unwrap()]);
+    let data = lab.dir.join("data");
+    for k in ["pki", "node-id", "admin.pem"] {
+        kept(&data.join(k), &safe.join(k));
+    }
+    let volume = safe.join("pg-db-0.backup");
+    let started = Instant::now();
+    lab.ok(&[
+        "volume",
+        "backup",
+        "pg-db-0",
+        "-n",
+        "data",
+        "-o",
+        volume.to_str().unwrap(),
+    ]);
+    let backup_took = started.elapsed();
+    let size = std::fs::metadata(&volume).unwrap().len();
+    lab.sql(
+        0,
+        "insert into orders (item) select 'late ' || i from generate_series(1, 100) i",
+    )
+    .expect("writing after the backup");
+
+    step("every host lost: daemons killed, data directories and pools gone");
+    for vm in &lab.vms {
+        let out = lab.ssh(
+            vm,
+            &format!(
+                "pkill -KILL -f 'legion-lab daemon'\n{}{}",
+                common::clean(common::VM_DATA, common::VM_RUN),
+                common::NO_POOL
+            ),
+        );
+        assert!(
+            out.status.success(),
+            "losing {}: {}",
+            vm.name,
+            text(&out.stderr)
+        );
+    }
+    if let Some(mut daemon) = lab.daemon.take() {
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+    }
+    let d = lab.dir.display();
+    let out = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "{}{}",
+            common::clean(&format!("{d}/data"), &format!("{d}/run")),
+            common::NO_POOL
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "losing this host: {}",
+        text(&out.stderr)
+    );
+    assert!(!data.exists(), "the manager's disk is gone");
+
+    step("recovery, timed: the manager on a new disk, from its backup and its keys");
+    let t0 = Instant::now();
+    std::fs::create_dir_all(&data).unwrap();
+    for k in ["pki", "node-id", "admin.pem"] {
+        kept(&safe.join(k), &data.join(k));
+    }
+    let out = std::process::Command::new(common::LEGION)
+        .arg("restore")
+        .arg("--data-dir")
+        .arg(&data)
+        .arg(&control)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "legion restore: {}",
+        text(&out.stderr)
+    );
+    // A new pool, then the daemon.
+    lab.start_host(&[]);
+    wait("the restored objects served", 120, || {
+        lab.legion(&["get", "service", "db", "-n", "data"], &[])
+            .status
+            .success()
+    });
+    let manager_at = t0.elapsed();
+
+    step("what the lost hosts held is cleared: the service, the old nodes, their Volumes");
+    lab.ok(&["delete", "service", "db", "-n", "data"]);
+    lab.ok(&["delete", "node", "n2"]);
+    lab.ok(&["delete", "node", "n3"]);
+    for v in ["pg-db-0", "pg-db-1"] {
+        wait(&format!("{v} deleted"), 120, || {
+            let out = lab.legion(&["delete", "volume", v, "-n", "data"], &[]);
+            out.status.success() || text(&out.stderr).contains("not found")
+        });
+    }
+
+    step("new hosts join as the old nodes did, and get the image");
+    let worker = lab.ok(&["join-token", "worker"]).trim().to_owned();
+    lab.join(0, &worker, Role::Worker);
+    lab.join(1, &worker, Role::Worker);
+    wait("three ready nodes again", 120, || ready(&lab));
+    lab.load_image(&image);
+    let nodes_at = t0.elapsed();
+
+    step("the primary's data restored onto a node");
+    lab.ok(&[
+        "volume",
+        "restore",
+        volume.to_str().unwrap(),
+        "--node",
+        "n2",
+    ]);
+    let volume_at = t0.elapsed();
+
+    step("Postgres again: the primary recovers as from a crash, the replica copies it anew");
+    lab.ok(&["apply", "-f", app.to_str().unwrap()]);
+    wait("the primary serving", 600, || lab.rows(0).is_some());
+    let primary_at = t0.elapsed();
+    assert_eq!(lab.node_of(0), "n2", "where its data was restored");
+    assert_eq!(
+        lab.rows(0),
+        Some(1000),
+        "every row up to the backup, none after"
+    );
+    assert_eq!(
+        lab.sql(0, "select count(*) from ballast").as_deref(),
+        Some("1000000")
+    );
+    wait("both ordinals ready", 600, || both(&lab));
+    wait("the replica in step", 600, || lab.rows(1) == Some(1000));
+    let replica_at = t0.elapsed();
+    assert_ne!(lab.node_of(1), "n2", "spread over the workers");
+    lab.sql(0, "insert into orders (item) values ('after')")
+        .expect("writing to the restored primary");
+    wait("the replica streams", 120, || lab.rows(1) == Some(1001));
+
+    let s = |d: std::time::Duration| d.as_secs_f64();
+    eprintln!(
+        "recovery times: manager {:.1} s; nodes and image {:.1} s; volume ({} MiB) {:.1} s; \
+         primary serving {:.1} s; replica in step {:.1} s; total {:.1} s \
+         (the volume's backup took {:.1} s)",
+        s(manager_at),
+        s(nodes_at - manager_at),
+        size >> 20,
+        s(volume_at - nodes_at),
+        s(primary_at - volume_at),
+        s(replica_at - primary_at),
+        s(replica_at),
+        s(backup_took),
+    );
+
+    step("clean up");
+    lab.ok(&["delete", "service", "db", "-n", "data"]);
+    wait("every task gone", 180, || {
         lab.list("tasks", "data")
             .iter()
             .all(|t| t["status"]["state"] != "running")
