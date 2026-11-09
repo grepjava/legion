@@ -207,6 +207,11 @@ impl Pods for PodsService {
                     "volumes move between nodes only when the managers move them",
                 ));
             }
+            Some(Action::VolumeExport(_) | Action::VolumeImport(_)) => {
+                return Err(Status::invalid_argument(
+                    "a volume's data is backed up and restored with `legion volume backup` and `restore`",
+                ));
+            }
             None => return Err(Status::invalid_argument("the session needs an action")),
         };
         // A follower serves sessions from its own replica (its agents

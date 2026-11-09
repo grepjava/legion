@@ -146,6 +146,41 @@ message AutolockResponse {
   string key = 1;
 }
 
+// A Volume's data, apart from the control state's backup (DESIGN.md §4.3).
+service Volumes {
+  // A snapshot of the Volume taken as its tasks run (crash-consistent):
+  // first a header, the JSON of a `VolumeBackupHeader` (legion-api), then
+  // the snapshot's `zfs send` stream, in pieces of up to 1 MiB.
+  rpc Backup(VolumeBackupRequest) returns (stream BackupChunk);
+  // The client sends `start`, then the stream a backup gave, then closes.
+  // The data goes to `node`, and only once all of it is there is the
+  // Volume created, on that node; a Volume of that name must not exist.
+  rpc Restore(stream VolumeRestoreChunk) returns (VolumeRestoreResponse);
+}
+
+message VolumeBackupRequest {
+  string namespace = 1;
+  string name = 2;
+}
+
+message VolumeRestoreChunk {
+  oneof part {
+    VolumeRestoreStart start = 1;
+    bytes data = 2;
+  }
+}
+
+message VolumeRestoreStart {
+  string namespace = 1;
+  // The Volume's name; empty for the backup's.
+  string name = 2;
+  string node = 3;
+  // The backup's header, as `Backup` sent it.
+  string header_json = 4;
+}
+
+message VolumeRestoreResponse {}
+
 // What a locked manager serves, in the clear and to its own host only,
 // until it is given the unlock key.
 service Unlock {

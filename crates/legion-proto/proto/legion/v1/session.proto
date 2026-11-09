@@ -31,7 +31,25 @@ message SessionOpen {
     VolumeReceive volume_receive = 8;
     // Remove this node's copy of a Volume that has moved away.
     string volume_drop = 9;
+    // Managers only, a Volume's backup and its restore (DESIGN.md §4.3):
+    // the data goes to and comes from the user's stream.
+    VolumeExport volume_export = 10;
+    VolumeImport volume_import = 11;
   }
+}
+
+// Snapshots the Volume, as it is while its tasks run (crash-consistent),
+// sends all of it as `stdout` frames and drops the snapshot, ending with
+// `exit_code` 0.
+message VolumeExport {
+  string volume = 1;
+}
+
+// Takes what `VolumeExport` sent, from `input` frames until
+// `input_closed`, as the Volume's data on this node, which must have none,
+// mounts it and ends with `exit_code` 0.
+message VolumeImport {
+  string volume = 1;
 }
 
 // Snapshots the Volume and sends it as `stdout` frames, ending with

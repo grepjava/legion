@@ -108,6 +108,12 @@ async fn run<R: Runtime>(
         Some(Action::VolumeDrop(volume)) => {
             transfer::drop_copy(&volumes, &open.namespace, &volume, &tx).await
         }
+        Some(Action::VolumeExport(opts)) => {
+            transfer::export(&volumes, &open.namespace, opts, &tx).await
+        }
+        Some(Action::VolumeImport(opts)) => {
+            transfer::import(&volumes, &open.namespace, opts, &tx, &mut inbound).await
+        }
         None => Err(Status::invalid_argument("the session has no action")),
     };
     if let Err(e) = result {

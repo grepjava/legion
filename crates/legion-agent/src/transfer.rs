@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use legion_proto::v1::session_frame::Frame;
-use legion_proto::v1::{SessionFrame, VolumeReceive, VolumeSend};
+use legion_proto::v1::{SessionFrame, VolumeExport, VolumeImport, VolumeReceive, VolumeSend};
 use legion_sys::Sys;
 use tokio::sync::{Mutex, mpsc};
 use tonic::{Status, Streaming};
@@ -20,6 +20,9 @@ use tonic::{Status, Streaming};
 /// The snapshot of the full copy, and of the last part.
 pub const FULL: &str = "legion-move-1";
 pub const LAST: &str = "legion-move-2";
+/// The start of a backup's snapshot's name; each has its own, so two
+/// backups at once leave each other's alone.
+pub const BACKUP: &str = "legion-backup-";
 
 /// Bytes per frame.
 const CHUNK: usize = 64 << 10;
@@ -80,34 +83,138 @@ pub(crate) async fn receive(
     let work = crate::task::blocking(&v.sys, move |sys| {
         take(sys, &lock, &ds, opts.last, &mut FrameReader::new(rx))
     });
-    // Input until it closes; anything else ends the stream early, which
-    // makes the receive fail.
-    let feed = async move {
-        loop {
-            let next = match inbound.next().await {
-                Some(Ok(SessionFrame {
-                    frame: Some(Frame::Input(bytes)),
-                })) => Ok(bytes),
-                Some(Ok(SessionFrame {
-                    frame: Some(Frame::InputClosed(_)),
-                })) => return,
-                Some(Ok(SessionFrame {
-                    frame: Some(Frame::Error(e)),
-                })) => Err(format!("the sending node failed: {}", e.message)),
-                Some(Ok(_)) => continue,
-                Some(Err(e)) => Err(e.message().to_owned()),
-                None => Err("the stream ended early".to_owned()),
-            };
-            let stop = next.is_err();
-            if data.send(next).await.is_err() || stop {
-                return;
-            }
-        }
-    };
-    let (result, ()) = tokio::join!(work, feed);
+    let (result, ()) = tokio::join!(work, feed(inbound, data, "the sending node"));
     result.map_err(Status::internal)?;
     let _ = tx.send(frame(Frame::ExitCode(0))).await;
     Ok(())
+}
+
+/// Input until it closes, into `data`; anything else ends the stream
+/// early, which makes what reads it fail. `sender` names who sends it.
+async fn feed(
+    inbound: &mut Streaming<SessionFrame>,
+    data: mpsc::Sender<Result<Vec<u8>, String>>,
+    sender: &str,
+) {
+    loop {
+        let next = match inbound.next().await {
+            Some(Ok(SessionFrame {
+                frame: Some(Frame::Input(bytes)),
+            })) => Ok(bytes),
+            Some(Ok(SessionFrame {
+                frame: Some(Frame::InputClosed(_)),
+            })) => return,
+            Some(Ok(SessionFrame {
+                frame: Some(Frame::Error(e)),
+            })) => Err(format!("{sender} failed: {}", e.message)),
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => Err(e.message().to_owned()),
+            None => Err("the stream ended early".to_owned()),
+        };
+        let stop = next.is_err();
+        if data.send(next).await.is_err() || stop {
+            return;
+        }
+    }
+}
+
+/// Snapshots the Volume as its tasks run and sends all of it, for a
+/// backup; the snapshot goes once sent, or once sending fails.
+pub(crate) async fn export(
+    v: &Volumes,
+    namespace: &str,
+    opts: VolumeExport,
+    tx: &mpsc::Sender<SessionFrame>,
+) -> Result<(), Status> {
+    let ds = v.dataset(namespace, &opts.volume)?;
+    let (out, lock) = (tx.clone(), v.lock.clone());
+    crate::task::blocking(&v.sys, move |sys| -> Result<(), String> {
+        let mut out = FrameWriter::new(out);
+        backup(sys, &lock, &ds, &mut out)?;
+        out.flush().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(Status::internal)?;
+    let _ = tx.send(frame(Frame::ExitCode(0))).await;
+    Ok(())
+}
+
+/// Takes a backup's data as the Volume's on this node, which must have
+/// none, and mounts it.
+pub(crate) async fn import(
+    v: &Volumes,
+    namespace: &str,
+    opts: VolumeImport,
+    tx: &mpsc::Sender<SessionFrame>,
+    inbound: &mut Streaming<SessionFrame>,
+) -> Result<(), Status> {
+    let ds = v.dataset(namespace, &opts.volume)?;
+    let (target, lock) = (ds.clone(), v.lock.clone());
+    crate::task::blocking(&v.sys, move |sys| make_room(sys, &lock, &target))
+        .await
+        .map_err(Status::failed_precondition)?;
+    let (data, rx) = mpsc::channel::<Result<Vec<u8>, String>>(16);
+    let lock = v.lock.clone();
+    let work = crate::task::blocking(&v.sys, move |sys| {
+        restore(sys, &lock, &ds, &mut FrameReader::new(rx))
+    });
+    let (result, ()) = tokio::join!(work, feed(inbound, data, "the backup's sender"));
+    result.map_err(Status::internal)?;
+    let _ = tx.send(frame(Frame::ExitCode(0))).await;
+    Ok(())
+}
+
+/// Refuses a node that has data for `ds` already, and makes its parent.
+fn make_room(sys: &dyn Sys, lock: &Mutex<()>, ds: &str) -> Result<(), String> {
+    let _guard = lock.blocking_lock();
+    let found = sys.zfs_list(ds).map_err(|e| e.to_string())?;
+    if found.iter().any(|d| d.name == ds) {
+        return Err(format!("this node has data for the volume already ({ds})"));
+    }
+    match ds.rsplit_once('/') {
+        Some((parent, _)) => sys.zfs_create(parent, &[]).map_err(|e| e.to_string()),
+        None => Ok(()),
+    }
+}
+
+/// Snapshots `ds` under a name of its own, writes all of it to `out` and
+/// destroys the snapshot, whatever came of writing it.
+fn backup(sys: &dyn Sys, lock: &Mutex<()>, ds: &str, out: &mut dyn Write) -> Result<(), String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let snap = format!("{ds}@{BACKUP}{nanos}");
+    {
+        let _guard = lock.blocking_lock();
+        sys.zfs_snapshot(&snap).map_err(|e| e.to_string())?;
+    }
+    let sent = sys.zfs_send(&snap, None, out).map_err(|e| e.to_string());
+    let _guard = lock.blocking_lock();
+    let dropped = sys.zfs_destroy(&snap, false).map_err(|e| e.to_string());
+    sent.and(dropped)
+}
+
+/// Receives a backup's stream as `ds`, drops the backup's snapshot it
+/// brings and mounts it. What a failed receive left goes.
+fn restore(sys: &dyn Sys, lock: &Mutex<()>, ds: &str, input: &mut dyn Read) -> Result<(), String> {
+    if let Err(e) = sys.zfs_receive(ds, input) {
+        let _guard = lock.blocking_lock();
+        if sys
+            .zfs_list(ds)
+            .is_ok_and(|found| found.iter().any(|d| d.name == ds))
+        {
+            let _ = sys.zfs_destroy(ds, true);
+        }
+        return Err(e.to_string());
+    }
+    let _guard = lock.blocking_lock();
+    for s in sys.zfs_snapshots(ds).map_err(|e| e.to_string())? {
+        if s.starts_with(BACKUP) {
+            sys.zfs_destroy(&format!("{ds}@{s}"), false)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    sys.zfs_mount(ds).map_err(|e| e.to_string())
 }
 
 /// Snapshots dataset `ds` and writes it to `out`: all of it, or with
@@ -336,5 +443,46 @@ mod tests {
         sent(&other, false);
         crate::volumes::zfs(&other, DS, &VolumeSpec::default()).unwrap();
         assert_eq!(other.zfs_snapshots(DS).unwrap(), [FULL]);
+    }
+
+    /// A backup is the data at its snapshot, which goes once sent, as does
+    /// one whose sending failed; a move's snapshots are left alone.
+    #[test]
+    fn a_backup_restores_elsewhere_and_leaves_no_snapshot() {
+        let (from, to) = (FakeSys::new(), FakeSys::new());
+        from.zfs_create(DS, &[]).unwrap();
+        from.write_dataset(DS, b"rows 1");
+        sent(&from, false);
+        let mut out = Vec::new();
+        backup(&from, &Mutex::new(()), DS, &mut out).unwrap();
+        assert_eq!(from.zfs_snapshots(DS).unwrap(), [FULL]);
+
+        make_room(&to, &Mutex::new(()), DS).unwrap();
+        restore(&to, &Mutex::new(()), DS, &mut &out[..]).unwrap();
+        assert_eq!(to.dataset_contents(DS).unwrap(), b"rows 1");
+        assert!(to.zfs_snapshots(DS).unwrap().is_empty());
+
+        from.fail_next("zfs send");
+        assert!(backup(&from, &Mutex::new(()), DS, &mut Vec::new()).is_err());
+        assert_eq!(from.zfs_snapshots(DS).unwrap(), [FULL]);
+    }
+
+    /// A restore never writes over data a node has: it is refused, and a
+    /// receive cut short leaves nothing behind.
+    #[test]
+    fn a_restore_takes_only_a_node_without_the_data() {
+        let (from, to) = (FakeSys::new(), FakeSys::new());
+        from.zfs_create(DS, &[]).unwrap();
+        from.write_dataset(DS, b"rows 1");
+        let mut out = Vec::new();
+        backup(&from, &Mutex::new(()), DS, &mut out).unwrap();
+
+        let e = make_room(&from, &Mutex::new(()), DS).unwrap_err();
+        assert!(e.contains("has data for the volume already"), "{e}");
+
+        to.fail_next("zfs receive");
+        assert!(restore(&to, &Mutex::new(()), DS, &mut &out[..]).is_err());
+        assert!(to.zfs_list(DS).unwrap().iter().all(|d| d.name != DS));
+        make_room(&to, &Mutex::new(()), DS).unwrap();
     }
 }

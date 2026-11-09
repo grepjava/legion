@@ -299,6 +299,35 @@ pub enum MigrationPhase {
     Finishing,
 }
 
+/// What a Volume's backup says of itself, before its data: what to make
+/// the Volume again from, and what the data is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeBackupHeader {
+    /// [`VolumeBackupHeader::FORMAT`].
+    pub format: u32,
+    pub namespace: String,
+    pub name: String,
+    /// The Volume's labels: a stateful service's own its Volumes by them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    pub spec: VolumeSpec,
+    /// The node the data was on.
+    pub node: String,
+    /// When the snapshot was taken, in seconds since the Unix epoch.
+    pub taken: u64,
+    /// [`VolumeBackupHeader::CRASH_CONSISTENT`]: the snapshot is the
+    /// dataset at one instant, taken while its tasks ran, as after a power
+    /// cut. An application whose files must agree with each other (a
+    /// database) recovers as from a crash.
+    pub consistency: String,
+}
+
+impl VolumeBackupHeader {
+    pub const FORMAT: u32 = 1;
+    pub const CRASH_CONSISTENT: &str = "crash-consistent";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
