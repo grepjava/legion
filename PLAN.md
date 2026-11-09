@@ -262,7 +262,7 @@ empty disk from it and its keys alone, `pki`, `node-id` and `admin.pem`
 crash-consistent snapshot, labelled so in the file and by the CLI, restored
 onto a node without the data, the Volume made only once all of it is there
 (`a_volume_backup_restores_onto_another_node`). Tested on the fake host;
-not yet on the lab's ZFS, which item 4's drill will do.
+on the lab's ZFS since item 4's drill.
 
 Item 3 is done, 9 November 2026 (docs/DESIGN.md, Stateful migration):
 a move cut short at each stage loses nothing. On the fake host, a full
@@ -280,6 +280,28 @@ the full copy and its `zfs receive` during the last part, and ends with
 every row on the new node and nothing left of what was cut. Its first
 runs found a gap in the test proxy (a cut link passed data already read)
 and no Legion faults.
+
+Item 4 is done, 10 November 2026 (docs/DESIGN.md, What to back up, with
+the order of a restore): `postgres_is_restored_onto_replacement_hosts`,
+in the manifest run, loses every host of a cluster running Postgres (a
+primary and a replica on two workers): its daemons are killed and its
+data directories and pools destroyed. It is rebuilt on the same
+machines with new disks from the three backups kept apart: the control
+state, the manager's keys and the primary's Volume. This is also the
+volume restore's first run on real ZFS. The primary comes back with every
+row up to its backup and none written after, recovering as from a crash,
+and the replica copies it anew. Measured on the lab's 2-CPU VMs, from
+the restore's start (run 78caae5): the manager serving in 0.7 s; the two
+new hosts joined and given the Postgres image in 263 s; the 173 MiB
+Volume restored in 8.9 s (its backup took 12.3 s); the primary serving
+16 s later and the replica in step 223 s after that; 511 s in all. The
+image load and the replica's copy take most of it. The first run failed
+before any backup: the test forced a checkpoint as the replica caught up
+with a large write, and the replica, with no WAL kept for it, most likely
+never could. The test no longer does so, and it dumps Postgres's state
+if a wait times out.
+
+All four items are done.
 
 Exit: a supported upgrade path is tested. Snapshots are labelled
 crash-consistent, and a control-state backup isn't described as a backup of

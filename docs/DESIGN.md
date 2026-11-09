@@ -439,7 +439,17 @@ Built and tested in spike S4 (`crates/legion-store`).
   restored from the control state with its `pki` and `node-id` in place
   on an empty data directory (`a_manager_is_rebuilt_on_a_new_disk_from_its_backup_and_keys`), then each
   Volume restored onto a node with `legion volume restore`, which makes
-  the Volume as it was, on that node.
+  the Volume as it was, on that node. The order, drilled with Postgres
+  (`postgres_is_restored_onto_replacement_hosts`): the manager, from its
+  backup and keys; then what the restored state says of the lost hosts
+  is cleared: each Service whose Volumes are to be restored is deleted
+  (it would otherwise make an empty Volume for its ordinal once one is
+  deleted), then the lost Nodes (their tasks are orphaned), then their
+  Volumes (a Volume is deleted only once its node is gone); the new hosts
+  join with the restored join token and are given the images; each
+  backed-up Volume is restored onto a node; and the Services are applied
+  again, each ordinal finding its Volume by its labels. An ordinal with no
+  backup gets an empty Volume, which a replica fills from its primary.
 
 ---
 
