@@ -35,7 +35,7 @@ pub const TTL: u32 = 5;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// A service as DNS publishes it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ServiceAddrs {
     pub namespace: String,
     pub name: String,
@@ -126,6 +126,131 @@ pub fn resolv_conf_servers(text: &str) -> Vec<SocketAddr> {
 pub fn pod_resolv_conf(namespace: &str, server: Ipv4Addr) -> String {
     // ndots:2 sends `<svc>.<ns>` through the search list before going out.
     format!("search {namespace}.{DOMAIN} {DOMAIN}\nnameserver {server}\noptions ndots:2\n")
+}
+
+/// Binds UDP and TCP on `addr` so that another resolver may bind it too:
+/// the one taking over from this one, which then tells this one to go.
+/// Meanwhile both answer, from the same zone file.
+pub fn bind_shared(addr: SocketAddr) -> std::io::Result<(UdpSocket, TcpListener)> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = |kind: Type, protocol: Protocol| -> std::io::Result<Socket> {
+        let s = Socket::new(Domain::for_address(addr), kind, Some(protocol))?;
+        s.set_reuse_address(true)?;
+        share_port(&s)?;
+        s.set_nonblocking(true)?;
+        s.bind(&addr.into())?;
+        Ok(s)
+    };
+    let udp = socket(Type::DGRAM, Protocol::UDP)?;
+    let tcp = socket(Type::STREAM, Protocol::TCP)?;
+    tcp.listen(128)?;
+    Ok((
+        UdpSocket::from_std(udp.into())?,
+        TcpListener::from_std(tcp.into())?,
+    ))
+}
+
+/// Lets other sockets bind the same address and port: on FreeBSD with
+/// the load-balancing kind, as a plain shared UDP port gets each datagram
+/// to one socket only.
+#[cfg(unix)]
+fn share_port(s: &socket2::Socket) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "freebsd")]
+    let option = libc::SO_REUSEPORT_LB;
+    #[cfg(not(target_os = "freebsd"))]
+    let option = libc::SO_REUSEPORT;
+    let on: libc::c_int = 1;
+    // SAFETY: a valid socket and option value, of the size given.
+    let r = unsafe {
+        libc::setsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            option,
+            (&on as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn share_port(_: &socket2::Socket) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Writes the services a resolver answers for into `path`, whole: written
+/// aside, then moved over it.
+pub fn write_zone_file(path: &std::path::Path, services: &[ServiceAddrs]) -> std::io::Result<()> {
+    let json = serde_json::to_vec(services).map_err(std::io::Error::other)?;
+    let aside = path.with_extension("new");
+    std::fs::write(&aside, json)?;
+    std::fs::rename(&aside, path)
+}
+
+fn read_zone_file(path: &std::path::Path) -> Option<Zone> {
+    let json = std::fs::read(path).ok()?;
+    let services: Vec<ServiceAddrs> = serde_json::from_slice(&json).ok()?;
+    Some(Zone::new(services))
+}
+
+/// Serves DNS on `udp` and `tcp` from the zone file at `path`, read again
+/// whenever it changes, until the file is gone, or the address it serves
+/// is on no interface any more: whoever removes the node's files or its
+/// bridge means the resolver to go with them, and one left serving beside
+/// a later node's would answer from what that node never wrote.
+pub async fn serve_file(
+    udp: UdpSocket,
+    tcp: TcpListener,
+    path: std::path::PathBuf,
+    upstream: Vec<SocketAddr>,
+) {
+    // What it holds, compared whole: two writes within one tick of the
+    // file system's clock look unchanged by their times.
+    let read = |p: &std::path::Path| std::fs::read(p).ok();
+    let ip = udp.local_addr().map(|a| a.ip()).ok();
+    let here = move || {
+        ip.is_none_or(|ip| {
+            !matches!(
+                std::net::UdpSocket::bind((ip, 0)),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable
+            )
+        })
+    };
+    let mut last = read(&path);
+    let (tx, rx) = watch::channel(Arc::new(read_zone_file(&path).unwrap_or_default()));
+    let follow = async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if !here() {
+                tracing::info!("the address is gone; stopping");
+                return;
+            }
+            match read(&path) {
+                None if !path.exists() => {
+                    tracing::info!(path = %path.display(), "the zone file is gone; stopping");
+                    return;
+                }
+                now if now != last => {
+                    // Half written is not possible (it is moved into
+                    // place), but unreadable keeps what was read before.
+                    if let Some(zone) = read_zone_file(&path) {
+                        tx.send_replace(Arc::new(zone));
+                    }
+                    last = now;
+                }
+                _ => {}
+            }
+        }
+    };
+    tokio::select! {
+        () = serve(udp, tcp, rx, upstream) => {}
+        () = follow => {}
+    }
 }
 
 /// Serves DNS on `udp` and `tcp` until the zone's sender goes away.
@@ -493,6 +618,56 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// The resolver as a process of its own serves its zone file, follows
+    /// it as it is replaced, shares its address with the one taking over,
+    /// and stops once the file is gone.
+    #[tokio::test]
+    async fn a_resolver_serves_its_zone_file_until_it_is_gone() {
+        let dir = std::env::temp_dir().join(format!("legion-zone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("zone.json");
+        let web = |ip: Ipv4Addr| ServiceAddrs {
+            namespace: "shop".into(),
+            name: "web".into(),
+            vip: None,
+            tasks: vec![ip],
+            ordinals: vec![],
+        };
+        write_zone_file(&path, &[web(Ipv4Addr::new(10, 200, 0, 2))]).unwrap();
+        let (udp, tcp) = bind_shared("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = udp.local_addr().unwrap();
+        let serving = tokio::spawn(serve_file(udp, tcp, path.clone(), vec![]));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ask = async || {
+            client
+                .send_to(&query("web.shop.legion.", RecordType::A), addr)
+                .await
+                .unwrap();
+            let mut buf = vec![0; 4096];
+            let (n, _) = client.recv_from(&mut buf).await.unwrap();
+            addrs(&Message::from_vec(&buf[..n]).unwrap())
+        };
+        assert_eq!(ask().await, [Ipv4Addr::new(10, 200, 0, 2)]);
+
+        write_zone_file(&path, &[web(Ipv4Addr::new(10, 200, 0, 5))]).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while ask().await != [Ipv4Addr::new(10, 200, 0, 5)] {
+            assert!(tokio::time::Instant::now() < deadline, "the new zone");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // The one taking over binds beside it.
+        #[cfg(unix)]
+        drop(bind_shared(addr).unwrap());
+
+        std::fs::remove_file(&path).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("stops once the file is gone")
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -300,7 +300,7 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
     let mut objects = Objects::new(channel.clone());
     let mut cluster = cluster_client(channel.clone());
     match command {
-        Command::Daemon { .. } => unreachable!("handled in main"),
+        Command::Daemon { .. } | Command::NodeResolver { .. } => unreachable!("handled in main"),
         Command::Init => {
             let status = cluster.init(InitRequest {}).await?.into_inner();
             println!(

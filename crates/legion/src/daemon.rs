@@ -398,6 +398,16 @@ async fn start_agent(
     }
     config.ingress = opts.ingress_listen;
     config.ingress_tls = opts.ingress_tls_listen;
+    // Its own process, which pods' lookups need through a restart.
+    config.resolver = Some(legion_agent::ExternalResolver {
+        command: vec![
+            std::env::current_exe()
+                .context("finding this binary, for the node resolver")?
+                .into(),
+            "node-resolver".into(),
+        ],
+        dir: opts.run_dir.join("resolver"),
+    });
     config.wireguard = Some(WireGuardConfig {
         key: wireguard,
         port: legion_net::mesh::PORT,

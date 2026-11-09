@@ -6,6 +6,7 @@ mod daemon;
 mod doctor;
 mod metrics;
 mod pki;
+mod resolver;
 mod session;
 mod top;
 
@@ -46,6 +47,16 @@ struct Args {
 // Parsed once per run: the daemon's many flags cost nothing to keep inline.
 #[allow(clippy::large_enum_variant)]
 enum Command {
+    /// The node resolver, run by the agent (see `resolver.rs`).
+    #[command(hide = true)]
+    NodeResolver {
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+        #[arg(long)]
+        zone: PathBuf,
+        #[arg(long)]
+        pid: PathBuf,
+    },
     /// Run the node daemon: the manager, and on FreeBSD the agent.
     Daemon {
         #[arg(long, default_value = "/var/db/legion")]
@@ -493,6 +504,15 @@ fn registry_host(s: &str) -> Result<String, String> {
 async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.command {
+        Command::NodeResolver { listen, zone, pid } => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "info".into()),
+                )
+                .init();
+            resolver::run(listen, zone, &pid).await
+        }
         Command::Daemon {
             data_dir,
             run_dir,

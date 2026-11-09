@@ -32,7 +32,9 @@ mod output;
 pub mod pod;
 pub mod policing;
 mod probe;
+mod resolver;
 pub use legion_runtime as runtime;
+pub use resolver::ExternalResolver;
 mod session;
 mod task;
 pub mod transfer;
@@ -90,6 +92,9 @@ pub struct AgentConfig {
     pub ingress: Option<std::net::SocketAddr>,
     /// Where it listens for HTTPS, for routes with `tls`, if anywhere.
     pub ingress_tls: Option<std::net::SocketAddr>,
+    /// The node resolver as a process of its own, which outlives the
+    /// agent; without it, the agent serves DNS itself.
+    pub resolver: Option<ExternalResolver>,
 }
 
 /// Where volume plugins are by default.
@@ -140,6 +145,7 @@ impl AgentConfig {
             memory_check: Duration::from_secs(1),
             ingress: None,
             ingress_tls: None,
+            resolver: None,
         }
     }
 }
@@ -152,6 +158,7 @@ pub struct Agent<R, C> {
     ingress: Option<std::net::SocketAddr>,
     ingress_tls: Option<std::net::SocketAddr>,
     wireguard: Option<WireGuardConfig>,
+    resolver: Option<ExternalResolver>,
 }
 
 /// A running task worker.
@@ -191,6 +198,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             ingress: config.ingress,
             ingress_tls: config.ingress_tls,
             wireguard: config.wireguard,
+            resolver: config.resolver,
         }
     }
 
@@ -367,7 +375,10 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 )));
             }
         }
-        let dns = dns(endpoints.clone(), gateway).await;
+        let dns = match self.resolver.clone() {
+            Some(r) => external_dns(endpoints.clone(), gateway, r).await,
+            None => dns(endpoints.clone(), gateway).await,
+        };
         let lb = tokio::spawn(load_balancing(
             ctx.sys.clone(),
             endpoints.clone(),
@@ -622,13 +633,55 @@ async fn dns(
 /// The cluster's names: the Services'. Jobs' entries are for network
 /// policy only, and would take a Service's name from it.
 fn zone(endpoints: &Endpoints) -> legion_net::dns::Zone {
-    use legion_net::dns::{ServiceAddrs, Zone};
-    Zone::new(endpoints.iter().filter(|e| !e.job).map(|e| ServiceAddrs {
-        namespace: e.namespace.clone(),
-        name: e.name.clone(),
-        vip: e.vip,
-        tasks: e.ready.clone(),
-        ordinals: e.ordinals.iter().map(|(n, ip)| (*n, *ip)).collect(),
+    legion_net::dns::Zone::new(services(endpoints))
+}
+
+fn services(endpoints: &Endpoints) -> Vec<legion_net::dns::ServiceAddrs> {
+    endpoints
+        .iter()
+        .filter(|e| !e.job)
+        .map(|e| legion_net::dns::ServiceAddrs {
+            namespace: e.namespace.clone(),
+            name: e.name.clone(),
+            vip: e.vip,
+            tasks: e.ready.clone(),
+            ordinals: e.ordinals.iter().map(|(n, ip)| (*n, *ip)).collect(),
+        })
+        .collect()
+}
+
+/// Has the node resolver process serve the pod gateway, and keeps its zone
+/// file current. Until the first endpoints, the file stays as the last
+/// agent left it, which the resolver goes on answering from.
+async fn external_dns(
+    mut endpoints: watch::Receiver<Endpoints>,
+    gateway: Ipv4Addr,
+    r: ExternalResolver,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let addr = SocketAddr::from((gateway, 53));
+    let ensure = {
+        let r = r.clone();
+        tokio::task::spawn_blocking(move || resolver::ensure(&r, addr, env!("CARGO_PKG_VERSION")))
+    };
+    match ensure.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(%addr, "starting the node resolver: {e}");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(%addr, "starting the node resolver: {e}");
+            return None;
+        }
+    }
+    let zone = r.zone_file();
+    Some(tokio::spawn(async move {
+        while endpoints.changed().await.is_ok() {
+            let services = services(&endpoints.borrow_and_update());
+            if let Err(e) = legion_net::dns::write_zone_file(&zone, &services) {
+                tracing::warn!(path = %zone.display(), "writing the zone file: {e}");
+            }
+        }
     }))
 }
 
