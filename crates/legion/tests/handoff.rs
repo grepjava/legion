@@ -3,7 +3,8 @@
 //!
 //! - From a registry: jailer pushes to the registry this test serves (see
 //!   [`registry`]), and every task runs the digest jailer recorded, through
-//!   a scale, a redeployment after the tag moved, and a rollback.
+//!   a scale, a redeployment after the tag moved to a build in zstd, and a
+//!   rollback.
 //! - Offline: jailer exports an archive, every node loads it with
 //!   `legion image load`, and every task runs the manifest jailer recorded.
 //! - With data (jailer's ROADMAP, shared qualification; PLAN.md phases 4
@@ -110,12 +111,20 @@ impl Jailer {
 
     /// Builds `tag`, whose `/id` holds `id`, into the record `rec`.
     fn build(&self, dir: &Path, tag: &str, id: &str, rec: &Path) {
-        self.build_with(dir, tag, id, rec, &[]);
+        self.build_with(dir, tag, id, rec, &[], &[]);
     }
 
     /// As [`Self::build`], with each of `files`, a name and its text, put
-    /// at `/` and the name.
-    fn build_with(&self, dir: &Path, tag: &str, id: &str, rec: &Path, files: &[(&str, &str)]) {
+    /// at `/` and the name, and `flags` for the build.
+    fn build_with(
+        &self,
+        dir: &Path,
+        tag: &str,
+        id: &str,
+        rec: &Path,
+        files: &[(&str, &str)],
+        flags: &[&str],
+    ) {
         let ctx = dir.join(id);
         std::fs::create_dir_all(&ctx).unwrap();
         let mut containerfile =
@@ -126,14 +135,10 @@ impl Jailer {
         }
         std::fs::write(ctx.join("Containerfile"), containerfile).unwrap();
         std::fs::write(ctx.join("id"), id).unwrap();
-        self.run(&[
-            "build",
-            "-t",
-            tag,
-            "--record",
-            rec.to_str().unwrap(),
-            ctx.to_str().unwrap(),
-        ]);
+        let mut args = vec!["build", "-t", tag, "--record", rec.to_str().unwrap()];
+        args.extend_from_slice(flags);
+        args.push(ctx.to_str().unwrap());
+        self.run(&args);
     }
 }
 
@@ -359,13 +364,14 @@ fn a_jailer_push_is_what_legion_runs() {
     let image = format!("{addr}/handoff/app:1");
     let step = |what: &str| eprintln!("--- {what}");
 
-    // Builds and pushes a new image to `image`, as recorded in `name`.json.
+    // Builds with `flags` and pushes a new image to `image`, as recorded in
+    // `name`.json.
     let dir = lab.dir.clone();
-    let push = |name: &str| {
+    let push = |name: &str, flags: &[&str]| {
         let rec = dir.join(format!("{name}.json"));
         let id = unique(name);
         let tag = format!("handoff/{name}:1");
-        jailer.build(&dir, &tag, &id, &rec);
+        jailer.build_with(&dir, &tag, &id, &rec, &[], flags);
         jailer.run(&["push", "--record", rec.to_str().unwrap(), &tag, &image]);
         let r = record(&rec);
         let p = r.published.last().expect("the push is recorded");
@@ -376,7 +382,7 @@ fn a_jailer_push_is_what_legion_runs() {
     };
 
     step("jailer builds an image and pushes it");
-    let (pinned1, manifest1, id1) = push("first");
+    let (pinned1, manifest1, id1) = push("first", &[]);
 
     step("the cluster resolves the tag to what jailer pushed");
     lab.flags = format!("{} --insecure-registry {addr}", lab.flags);
@@ -385,9 +391,17 @@ fn a_jailer_push_is_what_legion_runs() {
     lab.apply("web", &service("web", &image, 2, ""));
     lab.runs("web", &image, 2, &manifest1, Some(&pinned1), &id1);
 
-    step("jailer pushes another build to the same tag");
-    let (pinned2, manifest2, id2) = push("second");
+    step("jailer pushes another build to the same tag, its layer in zstd");
+    let (pinned2, manifest2, id2) = push("second", &["--compression", "zstd"]);
     assert_ne!(manifest2, manifest1);
+    let held: Value =
+        serde_json::from_str(&jailer.run(&["manifest", "inspect", &pinned2])).unwrap();
+    let zstd = "application/vnd.oci.image.layer.v1.tar+zstd";
+    assert_eq!(
+        held["layers"].as_array().unwrap().last().unwrap()["mediaType"],
+        zstd,
+        "its own layer: {held}"
+    );
 
     step("scaling is not a deployment: a new task runs the first build");
     lab.apply("web", &service("web", &image, 3, ""));
@@ -532,10 +546,17 @@ fn a_jailer_image_keeps_its_data_through_a_drain() {
     let jailer = Jailer::new(&lab, &[]);
     let step = |what: &str| eprintln!("--- {what}");
 
-    step("jailer builds a writer and exports it");
+    step("jailer builds a writer, its layers in zstd, and exports it");
     let rec = lab.dir.join("keep.json");
     let id = unique("keep");
-    jailer.build_with(&lab.dir, "handoff/keep:1", &id, &rec, &[("writer", WRITER)]);
+    jailer.build_with(
+        &lab.dir,
+        "handoff/keep:1",
+        &id,
+        &rec,
+        &[("writer", WRITER)],
+        &["--compression", "zstd"],
+    );
     let tar = lab.dir.join("keep.oci.tar");
     jailer.run(&[
         "export",
