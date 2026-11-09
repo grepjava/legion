@@ -827,6 +827,19 @@ AAAA queries get the IPv6 twins of the same addresses (5.7).
 Answers too large for UDP set the truncation flag and the client retries
 over TCP.
 
+The resolver is a process of its own (`legion node-resolver`), as pods
+outlive the daemon through their shims: it answers from a zone file in the
+run directory (`resolver/zone.json`) that the agent rewrites as endpoints
+change, so pods' lookups go on while the daemon restarts or is upgraded,
+from the last zone written. The agent starts one if none of its build
+serves the gateway; one of another build is replaced: the new one binds
+the address beside it (`SO_REUSEPORT_LB`), says so in the pid file, and
+the agent stops the old one. A resolver stops by itself once its zone file
+is gone or its address is on no interface, so removing the node's files or
+its bridge takes it along. Through v0.1.14 the resolver ran in the daemon:
+upgrading a node from it loses that node's pods' lookups until the new
+daemon has registered, about five seconds (measured on the lab).
+
 ### 5.6 Network policy
 
 - Compose networks and namespaces become pf tables of member IPs.

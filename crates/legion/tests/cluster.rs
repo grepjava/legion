@@ -307,10 +307,13 @@ fn floor_at(lab: &Lab, server: &str) -> u64 {
 
 /// The upgrade drill (PLAN.md, phase 6): three managers on the previous
 /// release (`LEGION_PREVIOUS`, its `legion`) run the app, and each node in
-/// turn is restarted on this build, as an operator upgrades. The app
-/// answers throughout; the managers' floor stays where the previous
-/// release left it until the last manager is upgraded, then rises; and the
-/// upgraded cluster updates the app.
+/// turn is restarted on this build, as an operator upgrades. The managers'
+/// floor stays where the previous release left it until the last manager
+/// is upgraded, then rises. The previous release's node resolver lives in
+/// its daemon, so a node's pods may fail to look names up while that node
+/// restarts, and only then; restarted again on this build, whose resolver
+/// outlives the daemon, the app answers throughout. Then the upgraded
+/// cluster updates the app.
 #[test]
 #[ignore = "needs root, the lab's VMs and ZFS on FreeBSD; see the module docs"]
 fn the_cluster_upgrades_one_node_at_a_time() {
@@ -345,21 +348,27 @@ fn the_cluster_upgrades_one_node_at_a_time() {
     std::thread::sleep(Duration::from_secs(2));
     lab.binary = common::LEGION.to_owned();
     let new = legion_api::protocol::SPEAKS as u64;
+    // Each node's restart, from its daemon's stop to its being ready.
+    let mut restarts = Vec::new();
     for i in [1, 0] {
         let name = format!("n{}", i + 2);
+        let from = Instant::now();
         lab.restart_vm(i, Role::Manager);
         wait(&format!("{name} on this build"), 120, || {
             lab.node_state(&name) == "ready" && version(&lab, &name) == this
         });
+        restarts.push((from, Instant::now()));
         wait("the app", 300, || lab.app_ready());
         let at = format!("{}:{}", lab.vms[i].addr, common::PORT);
         std::thread::sleep(Duration::from_secs(5));
         assert_eq!(floor_at(&lab, &at), 1, "the floor with n1 not upgraded");
     }
+    let from = Instant::now();
     lab.restart_host(&[]);
     wait("n1 on this build", 120, || {
         lab.node_state("n1") == "ready" && version(&lab, "n1") == this
     });
+    restarts.push((from, Instant::now()));
     wait("the floor raised", 60, || {
         floor_at(&lab, &lab.server()) == new
     });
@@ -373,7 +382,46 @@ fn the_cluster_upgrades_one_node_at_a_time() {
         failures.len(),
         failures.iter().take(5).collect::<Vec<_>>()
     );
-    assert!(failures.is_empty(), "requests failed during the upgrade");
+    // A request is sent up to 5 s before its answer is recorded.
+    let slack = Duration::from_secs(10);
+    let outside: Vec<_> = failures
+        .iter()
+        .filter(|r| {
+            !restarts
+                .iter()
+                .any(|(from, to)| r.0 >= *from && r.0 <= *to + slack)
+        })
+        .collect();
+    assert!(
+        outside.is_empty(),
+        "requests failed outside a node's restart: {:?}",
+        outside.iter().take(5).collect::<Vec<_>>()
+    );
+
+    step("restart every node again on this build: no request fails");
+    let load = Load::start(addrs.clone());
+    std::thread::sleep(Duration::from_secs(2));
+    for i in [1, 0] {
+        let name = format!("n{}", i + 2);
+        lab.restart_vm(i, Role::Manager);
+        wait(&format!("{name} back"), 120, || {
+            lab.node_state(&name) == "ready"
+        });
+        wait("the app", 300, || lab.app_ready());
+    }
+    lab.restart_host(&[]);
+    wait("n1 back", 120, || lab.node_state("n1") == "ready");
+    wait("the app", 300, || lab.app_ready());
+    std::thread::sleep(Duration::from_secs(2));
+    let results = load.finish();
+    let failures: Vec<_> = results.iter().filter(|r| r.2.is_err()).collect();
+    eprintln!(
+        "{} requests through the restarts, {} failed: {:?}",
+        results.len(),
+        failures.len(),
+        failures.iter().take(5).collect::<Vec<_>>()
+    );
+    assert!(failures.is_empty(), "requests failed through the restarts");
 
     step("the upgraded cluster updates the app");
     lab.deploy("2");
