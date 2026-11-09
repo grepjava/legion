@@ -29,6 +29,7 @@ mod tls;
 mod upgrade;
 mod usage;
 pub mod vip;
+mod volumes;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -354,6 +355,12 @@ impl Manager {
             ))
             .add_service(tonic::service::interceptor::InterceptedService::new(
                 legion_proto::v1::pods_server::PodsServer::new(session::PodsService {
+                    api: api.clone(),
+                }),
+                tls::only(API, on),
+            ))
+            .add_service(tonic::service::interceptor::InterceptedService::new(
+                legion_proto::v1::volumes_server::VolumesServer::new(volumes::VolumesService {
                     api: api.clone(),
                 }),
                 tls::only(API, on),

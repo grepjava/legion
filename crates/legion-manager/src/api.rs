@@ -59,7 +59,7 @@ pub struct ApiService {
     pub(crate) speaking: crate::upgrade::Speaking,
 }
 
-enum Route {
+pub(crate) enum Route {
     Local,
     /// A client for the leader, and its address as routing saw it.
     Leader(ObjectsClient<Channel>, String),
@@ -131,7 +131,7 @@ impl ApiService {
     }
 
     /// Where a leader-only request should run.
-    fn route<T>(&self, req: &Request<T>) -> Result<Route, Status> {
+    pub(crate) fn route<T>(&self, req: &Request<T>) -> Result<Route, Status> {
         let metrics = self.store.raft.metrics().borrow().clone();
         match metrics.current_leader {
             Some(leader) if leader == self.id => Ok(Route::Local),
@@ -515,7 +515,7 @@ pub(crate) fn forwarded<T>(inner: T) -> Request<T> {
 }
 
 /// [`forwarded`], for `caller`: a user's name goes with it.
-fn forwarded_for<T>(inner: T, caller: &Caller) -> Result<Request<T>, Status> {
+pub(crate) fn forwarded_for<T>(inner: T, caller: &Caller) -> Result<Request<T>, Status> {
     let mut req = forwarded(inner);
     if let Caller::User(name) = caller {
         let name = tonic::metadata::MetadataValue::try_from(name.as_str())

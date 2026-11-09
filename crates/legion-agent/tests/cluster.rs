@@ -771,6 +771,129 @@ spec:
     volumes: [{ name: data, claim: { size: 1Gi } }]
 "#;
 
+/// A Volume's backup, restored onto another node under another name, is
+/// the data as it was; a restore never takes a name in use or a node that
+/// has the data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_volume_backup_restores_onto_another_node() {
+    use legion_api::volume::{VolumeBackupHeader, VolumeStatus};
+    use legion_proto::v1::volume_restore_chunk::Part;
+    use legion_proto::v1::volumes_client::VolumesClient;
+    use legion_proto::v1::{VolumeBackupRequest, VolumeRestoreChunk, VolumeRestoreStart};
+
+    let c = Cluster::start(3).await;
+    c.apply(&DB.replace("MAX", "1")).await;
+    let status = async |c: &Cluster, name: &str| {
+        c.list(Kind::Volume)
+            .await
+            .into_iter()
+            .find(|v| v.metadata.name == name)
+            .map(|v| serde_json::from_value::<VolumeStatus>(v.status).unwrap_or_default())
+    };
+    eventually("the volume on a node", async || {
+        status(&c, "data-db-0")
+            .await
+            .is_some_and(|s| !s.node.is_empty())
+    })
+    .await;
+    let from = status(&c, "data-db-0").await.unwrap().node;
+    let i = c.nodes.iter().position(|n| n.name == from).unwrap();
+    let ds = |name: &str| format!("tank/legion/volumes/shop/{name}");
+    eventually("db running", async || {
+        c.list(Kind::Task)
+            .await
+            .iter()
+            .any(|t| t.status["state"] == "running")
+    })
+    .await;
+    c.nodes[i].sys.write_dataset(&ds("data-db-0"), b"rows 1");
+
+    let channel = Channel::from_shared(format!("http://{}", c.addr))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut volumes = VolumesClient::new(channel);
+    let mut chunks = volumes
+        .backup(VolumeBackupRequest {
+            namespace: "shop".into(),
+            name: "data-db-0".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let header = chunks.message().await.unwrap().unwrap().data;
+    let parsed: VolumeBackupHeader = serde_json::from_slice(&header).unwrap();
+    assert_eq!(parsed.node, from);
+    assert_eq!(parsed.consistency, "crash-consistent");
+    let mut data = Vec::new();
+    while let Some(chunk) = chunks.message().await.unwrap() {
+        data.extend_from_slice(&chunk.data);
+    }
+    // Written after the backup: not in it.
+    c.nodes[i].sys.write_dataset(&ds("data-db-0"), b"rows 2");
+
+    let restore = |name: &str, node: &str| {
+        let start = VolumeRestoreStart {
+            namespace: String::new(),
+            name: name.to_owned(),
+            node: node.to_owned(),
+            header_json: String::from_utf8(header.clone()).unwrap(),
+        };
+        let parts: Vec<VolumeRestoreChunk> = std::iter::once(Part::Start(start))
+            .chain(data.chunks(1000).map(|d| Part::Data(d.to_vec())))
+            .map(|p| VolumeRestoreChunk { part: Some(p) })
+            .collect();
+        let mut volumes = volumes.clone();
+        async move { volumes.restore(tokio_stream::iter(parts)).await }
+    };
+    // Not over the Volume it came from, nor onto a node with that data.
+    let e = restore("", &from).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::AlreadyExists, "{e:?}");
+    let e = restore("data-copy", &from).await;
+    assert!(e.is_ok(), "{e:?}");
+    let to = c
+        .nodes
+        .iter()
+        .find(|n| n.name != from)
+        .unwrap()
+        .name
+        .clone();
+    let e = restore("data-copy", &to).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::AlreadyExists, "{e:?}");
+    // Data of that name on the node, of no Volume: left alone.
+    let j = c.nodes.iter().position(|n| n.name == to).unwrap();
+    c.nodes[j].sys.zfs_create(&ds("data-stray"), &[]).unwrap();
+    c.nodes[j].sys.write_dataset(&ds("data-stray"), b"stray");
+    let e = restore("data-stray", &to).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::FailedPrecondition, "{e:?}");
+    assert!(
+        e.message().contains("has data for the volume already"),
+        "{e:?}"
+    );
+    assert_eq!(
+        c.nodes[j]
+            .sys
+            .dataset_contents(&ds("data-stray"))
+            .as_deref(),
+        Some(&b"stray"[..])
+    );
+    assert!(status(&c, "data-stray").await.is_none());
+
+    restore("data-old", &to).await.unwrap();
+    assert_eq!(
+        c.nodes[j].sys.dataset_contents(&ds("data-old")).as_deref(),
+        Some(&b"rows 1"[..])
+    );
+    assert_eq!(status(&c, "data-old").await.unwrap().node, to);
+    // The Volume it came from is as it was, data and all.
+    assert_eq!(
+        c.nodes[i].sys.dataset_contents(&ds("data-db-0")).as_deref(),
+        Some(&b"rows 2"[..])
+    );
+    c.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stateful_data_moves_off_a_draining_node() {
     let c = Cluster::start(3).await;
