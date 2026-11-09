@@ -796,6 +796,11 @@ this was verified in a 3-node lab (S3).
   as Kubernetes users do with a preStop sleep. Found as the odd request
   timing out during the phase 2 exit test's rolling update. Job tasks and
   tasks never ready stop at once.
+- **An agent restarting** leaves the anchor as the agent before it loaded
+  it until the manager has sent the endpoints: loaded against none, it
+  would drop every VIP and published port while the pods behind them run
+  on. Found by the upgrade drill: a request to a published port arriving
+  as its node's daemon came back timed out.
 - **Dead backends**: the agent lists states and kills those whose translation
   targets the dead backend, by state key or ID (`pfctl -k key -k '<key>'`, or
   `pfctl_kill_states` via `libpfctl`). Killing by address does not work for

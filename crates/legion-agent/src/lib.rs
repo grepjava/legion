@@ -833,6 +833,14 @@ async fn load_balancing(
         );
     }
 
+    // Nothing is loaded before the endpoints are known: against the empty
+    // set a receiver starts with, the anchor would lose every VIP and
+    // published port, and an agent restarting under running pods would
+    // drop their connections until the manager answers. Rules an agent
+    // before this one loaded stay until then.
+    if endpoints.changed().await.is_err() {
+        return;
+    }
     let mut balancer = LoadBalancer::default();
     let mut retry = false;
     let mut first = true;

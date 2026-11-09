@@ -35,6 +35,9 @@ struct Flaky {
     fail_reports: Arc<AtomicBool>,
     /// Releases of volumes to fail, before they go through again.
     fail_releases: Arc<std::sync::atomic::AtomicUsize>,
+    /// Whether the endpoints are held back, as from a manager slow to
+    /// answer: a receiver taken meanwhile sees them once released.
+    hold_endpoints: Arc<AtomicBool>,
 }
 
 impl Control for Flaky {
@@ -51,7 +54,24 @@ impl Control for Flaky {
     }
 
     fn endpoints(&self) -> tokio::sync::watch::Receiver<Endpoints> {
-        self.inner.endpoints()
+        if !self.hold_endpoints.load(Ordering::SeqCst) {
+            return self.inner.endpoints();
+        }
+        let (tx, rx) = tokio::sync::watch::channel(Endpoints::new());
+        let mut inner = self.inner.endpoints();
+        let hold = self.hold_endpoints.clone();
+        tokio::spawn(async move {
+            while hold.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            while inner.changed().await.is_ok() {
+                let now = inner.borrow_and_update().clone();
+                if tx.send(now).is_err() {
+                    return;
+                }
+            }
+        });
+        rx
     }
 
     fn peers(&self) -> tokio::sync::watch::Receiver<Peers> {
@@ -161,6 +181,8 @@ struct Harness {
     fail_reports: Arc<AtomicBool>,
     /// Releases of volumes still to fail.
     fail_releases: Arc<std::sync::atomic::AtomicUsize>,
+    /// Whether the agent's endpoints are held back.
+    hold_endpoints: Arc<AtomicBool>,
 }
 
 impl Harness {
@@ -221,6 +243,7 @@ impl Harness {
             mesh,
             fail_reports: Arc::default(),
             fail_releases: Arc::default(),
+            hold_endpoints: Arc::default(),
         };
         h.start_agent();
         h
@@ -248,6 +271,7 @@ impl Harness {
                 inner: GrpcControl::new(NODE, vec![self.addr.clone()], None).unwrap(),
                 fail_reports: self.fail_reports.clone(),
                 fail_releases: self.fail_releases.clone(),
+                hold_endpoints: self.hold_endpoints.clone(),
             }),
         );
         self.metrics = Some(agent.metrics());
@@ -1450,6 +1474,36 @@ restartPolicy: { condition: any, delay: 0s }
         .await;
     let st = h.wait_state(&other, TaskState::Running).await;
     assert_eq!(st.ip.as_deref(), Some("10.200.0.3"));
+}
+
+/// A restarted agent leaves the services' pf rules an agent before it
+/// loaded until it knows the endpoints: against none, it would drop every
+/// VIP and published port of the pods still running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_agent_keeps_the_services_rules_until_it_knows_the_endpoints() {
+    let mut h = Harness::new().await;
+    eventually("the services' rules", || {
+        h.sys.anchor(legion_net::lb::ANCHOR).is_some()
+    })
+    .await;
+    h.stop_agent().await;
+    let earlier = "rdr pass on re0 inet proto tcp to (re0) port 30000 -> 10.200.0.2 port 8080\n";
+    h.sys
+        .pf_load_anchor(legion_net::lb::ANCHOR, earlier)
+        .unwrap();
+    h.hold_endpoints.store(true, Ordering::SeqCst);
+    h.start_agent();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(
+        h.sys.anchor(legion_net::lb::ANCHOR).as_deref(),
+        Some(earlier),
+        "the rules were replaced before the endpoints were known"
+    );
+    h.hold_endpoints.store(false, Ordering::SeqCst);
+    eventually("the rules of the endpoints known", || {
+        h.sys.anchor(legion_net::lb::ANCHOR).as_deref() != Some(earlier)
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
