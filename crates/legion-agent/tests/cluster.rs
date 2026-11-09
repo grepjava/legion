@@ -68,15 +68,19 @@ impl Link {
                         let _ = cut.wait_for(|c| !*c).await;
                         return;
                     }
-                    let Ok(mut outbound) = tokio::net::TcpStream::connect(&target).await else {
+                    let Ok(outbound) = tokio::net::TcpStream::connect(&target).await else {
                         return;
                     };
+                    let (a, b) = (inbound.into_split(), outbound.into_split());
+                    let (up, down) = (cut.clone(), cut.clone());
                     tokio::select! {
-                        _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
-                        _ = async { cut.wait_for(|c| *c).await.is_ok() } => {
+                        () = pass(a.0, b.1, up) => {}
+                        () = pass(b.0, a.1, down) => {}
+                        _ = async {
+                            let _ = cut.wait_for(|c| *c).await;
                             // Held, silent, until mended.
                             let _ = cut.wait_for(|c| !*c).await;
-                        }
+                        } => {}
                     }
                 });
             }
@@ -90,6 +94,32 @@ impl Link {
 
     fn mend(&self) {
         self.cut.send_replace(false);
+    }
+}
+
+/// Copies what `from` reads to `to` until either ends. Each read is looked
+/// at against the cut before it passes, so nothing written once the cut is
+/// made gets through: a cut racing the copy would otherwise let some by.
+async fn pass(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    mut cut: tokio::sync::watch::Receiver<bool>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0u8; 16 << 10];
+    loop {
+        let n = match from.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        if *cut.borrow_and_update() {
+            // Dropped, and the link silent until mended.
+            let _ = cut.wait_for(|c| !*c).await;
+            return;
+        }
+        if to.write_all(&buf[..n]).await.is_err() {
+            return;
+        }
     }
 }
 
