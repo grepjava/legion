@@ -431,12 +431,13 @@ Built and tested in spike S4 (`crates/legion-store`).
   (`legion backup`): every object, Secrets and join tokens among them,
   and the unlock key; **no volume's data**. The keys: each manager's
   `<data-dir>/pki` (the CA, its node's, its store's and its WireGuard
-  key), and the admins' `admin.pem`; a restore needs the CA's key to keep
+  key) and `<data-dir>/node-id`, and the admins' `admin.pem`; a restore needs the CA's key to keep
   the agents' certificates, and without autolock they are in the clear,
   so they are kept as safe as the CA. The volumes' data: `legion volume
   backup VOLUME -o FILE` per Volume (4.3), each a crash-consistent
   snapshot. A cluster rebuilt on new hosts takes all three: a manager
-  restored from the control state with its `pki` in place, then each
+  restored from the control state with its `pki` and `node-id` in place
+  on an empty data directory (`a_manager_is_rebuilt_on_a_new_disk_from_its_backup_and_keys`), then each
   Volume restored onto a node with `legion volume restore`, which makes
   the Volume as it was, on that node.
 

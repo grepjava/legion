@@ -1513,7 +1513,13 @@ that `legion node drain --wait` follows, with what a transfer cut short or
 a source cut off does to it; and the version handshake: builds that can't
 work together refuse each other, and the managers record the protocol
 they all speak, after which the log may hold guarded writes, closing the
-ACME gap between a route's last check and its certificate's write. The
+ACME gap between a route's last check and its certificate's write. It
+passed the upgrade drill from v0.1.14 on the lab, which found the node
+resolver dying with the daemon (now a process of its own), a restarted
+agent dropping published ports until it knew the endpoints, and wg0's
+address set again at each start, dropping its routes for a moment. It
+has `legion volume backup` and `restore`, crash-consistent snapshots of a
+Volume's data apart from the control state's backup, which holds none. The
 port's `distinfo` is
 made for v0.1.13, and its crates are v0.1.9's, but it has not been through
 `poudriere testport` since v0.1.9. Waiting on the user: the port's
