@@ -264,6 +264,23 @@ onto a node without the data, the Volume made only once all of it is there
 (`a_volume_backup_restores_onto_another_node`). Tested on the fake host;
 not yet on the lab's ZFS, which item 4's drill will do.
 
+Item 3 is done, 9 November 2026 (docs/DESIGN.md, Stateful migration):
+a move cut short at each stage loses nothing. On the fake host, a full
+disk holds the full copy, then the last part, until there is room or the
+full node is drained, which sends the Volume to a third node and drops
+the full node's copy (`a_full_disk_holds_a_move_until_there_is_room`);
+an old node cut off as the move finishes keeps the task from starting
+anywhere else; a new node gone silent sends the Volume elsewhere; and a
+manager lost as the last part lands has it sent again onto the full copy.
+On the lab's ZFS, in the manifest run,
+`a_move_cut_short_or_held_by_a_full_disk_loses_nothing` moves a Postgres
+primary held first by a quota (the drain status says `space quota
+exceeded`), then cut short by killing the receiving node's daemon during
+the full copy and its `zfs receive` during the last part, and ends with
+every row on the new node and nothing left of what was cut. Its first
+runs found a gap in the test proxy (a cut link passed data already read)
+and no Legion faults.
+
 Exit: a supported upgrade path is tested. Snapshots are labelled
 crash-consistent, and a control-state backup isn't described as a backup of
 volume contents.
