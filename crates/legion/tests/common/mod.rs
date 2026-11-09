@@ -476,6 +476,16 @@ pub fn clean(data: &str, run: &str) -> String {
          for a in legion/svc legion/policy; do
              for w in Tables nat rules; do pfctl -q -a $a -F $w >/dev/null 2>&1; done
          done
+         # A rule flushed while a state of its holds on keeps its anchor and
+         # tables until the state expires, minutes for a closing TCP one:
+         # kill the states of pods and VIPs, then give pf a moment to free
+         # what they held, for up to 30 s.
+         pfctl -ss -vv 2>/dev/null |
+             awk '/^[a-z]/ {{ m = ($0 ~ /10\\.20[01]\\.|fd00:10:20[01]:/) }} m && $1 == \"id:\" {{ print $2 }}' |
+             while read -r id; do pfctl -q -k id -k \"$id\" >/dev/null 2>&1; done
+         i=0; while pfctl -s Anchors -a legion 2>/dev/null | grep -qE 'legion/(svc|policy)' && [ $i -lt 30 ]; do
+             sleep 1; i=$((i + 1))
+         done
          # Dying jails may hold mounts for a while: try again until none
          # are left, for up to 30 s.
          i=0; while mount -p | awk '{{print $2}}' | grep -qE '^({data}|{run})/' && [ $i -lt 30 ]; do
