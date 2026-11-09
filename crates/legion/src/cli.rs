@@ -659,6 +659,33 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 (key, false) => println!("{key} is already asked to be on {node}"),
             }
         }
+        Command::Volume {
+            command:
+                crate::VolumeCommand::Backup {
+                    volume,
+                    output,
+                    namespace,
+                },
+        } => {
+            crate::volume_backup::backup(
+                channel.clone(),
+                namespace.unwrap_or_default(),
+                volume,
+                &output,
+            )
+            .await?;
+        }
+        Command::Volume {
+            command:
+                crate::VolumeCommand::Restore {
+                    file,
+                    node,
+                    namespace,
+                    name,
+                },
+        } => {
+            crate::volume_backup::restore(channel.clone(), &file, node, namespace, name).await?;
+        }
         Command::Rollback { service, namespace } => {
             println!(
                 "{}",

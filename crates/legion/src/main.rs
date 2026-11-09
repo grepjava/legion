@@ -9,6 +9,7 @@ mod pki;
 mod resolver;
 mod session;
 mod top;
+mod volume_backup;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -194,6 +195,7 @@ enum Command {
     /// Save every object of the cluster, read at one version, to a file.
     /// It holds Secrets and join tokens: keep it as safe as the managers'
     /// disks. The managers' keys are not in it; keep `<data-dir>/pki` too.
+    /// Nor is any volume's data: back each up with `legion volume backup`.
     Backup {
         #[arg(short, long)]
         output: PathBuf,
@@ -414,6 +416,30 @@ pub enum VolumeCommand {
         node: String,
         #[arg(short, long)]
         namespace: Option<String>,
+    },
+    /// Back up a Volume's data to a file: a snapshot taken as its tasks
+    /// run, so crash-consistent, as after a power cut. The cluster's
+    /// backup (`legion backup`) holds no volume's data.
+    Backup {
+        volume: String,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// Restore a Volume from a backup onto NODE, which must not have its
+    /// data. The Volume is made once all of it is there, and must not
+    /// exist: delete it first, or give another --name.
+    Restore {
+        file: PathBuf,
+        #[arg(long)]
+        node: String,
+        /// The namespace to restore into (default: the backup's).
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// The Volume's name (default: the backup's).
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
