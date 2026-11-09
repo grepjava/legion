@@ -1520,12 +1520,11 @@ agent dropping published ports until it knew the endpoints, and wg0's
 address set again at each start, dropping its routes for a moment. It
 has `legion volume backup` and `restore`, crash-consistent snapshots of a
 Volume's data apart from the control state's backup, which holds none.
-Since v0.1.15, on main: Phase 6's interrupted moves (PLAN.md, item 3),
-a Volume's move cut short at each stage or held by a full disk losing
-nothing, tested on the fake host and on the lab's ZFS with Postgres; and
-the restore drill (item 4): Postgres rebuilt on replacement hosts from
-its three backups, 511 s on the lab, every stage timed. Phase 6's items
-are all done. The
+v0.1.16 completes phase 6 of PLAN.md: a Volume's move cut short at each
+stage or held by a full disk loses nothing (item 3), tested on the fake
+host and on the lab's ZFS with Postgres and with a jailer image; and the
+restore drill (item 4) rebuilds Postgres on replacement hosts from its
+three backups, 511 s on the lab, every stage timed. The
 port's `distinfo` is
 made for v0.1.13, and its crates are v0.1.9's, but it has not been through
 `poudriere testport` since v0.1.9. Waiting on the user: the port's
