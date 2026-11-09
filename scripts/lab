@@ -95,7 +95,7 @@ vm_pid() {
     local f=$root/vms/$1/pid p
     [ -r "$f" ] || return 1
     p=$(cat "$f")
-    tr '\0' ' ' < "/proc/$p/cmdline" 2> /dev/null | grep -q -- "-name $1 " && echo "$p"
+    { tr '\0' ' ' < "/proc/$p/cmdline"; } 2> /dev/null | grep -q -- "-name $1 " && echo "$p"
 }
 
 ssh_to() {
@@ -129,7 +129,7 @@ wait_ssh() {
 # its addresses.
 start_hub() {
     local f=$root/hub.pid
-    if [ -r "$f" ] && tr '\0' ' ' < "/proc/$(cat "$f")/cmdline" 2> /dev/null | grep -q legion-lab-hub; then
+    if [ -r "$f" ] && { tr '\0' ' ' < "/proc/$(cat "$f")/cmdline"; } 2> /dev/null | grep -q legion-lab-hub; then
         return 0
     fi
     command -v python3 > /dev/null || die "no python3 for the network hub"
