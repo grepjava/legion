@@ -326,6 +326,57 @@ impl Lab {
             .unwrap_or_default()
     }
 
+    /// What the move's failure leaves to read: the Volume, and on each VM
+    /// its ZFS transfers, its copies and what its daemon said of moving.
+    fn dump(&self) {
+        eprintln!("volume: {}", self.pg_volume()["status"]);
+        for n in self.list("nodes", "default") {
+            eprintln!(
+                "node {}: {} {}",
+                n["metadata"]["name"], n["status"]["state"], n["status"]["drain"]
+            );
+        }
+        for node in ["n2", "n3"] {
+            let out = self.on(
+                node,
+                &format!(
+                    "pgrep -lf 'zfs (send|receive)'
+                     zfs list -H -o name -t all -r {ZFS_ROOT}/volumes
+                     grep -iE 'volume|session|transfer' /var/log/legion-lab.log | tail -25
+"
+                ),
+            );
+            eprintln!(
+                "=== {node}
+{}{}",
+                text(&out.stdout),
+                text(&out.stderr)
+            );
+        }
+        let host = std::fs::read_to_string(self.dir.join("daemon.log")).unwrap_or_default();
+        let moving: Vec<&str> = host
+            .lines()
+            .filter(|l| l.contains("volume") || l.contains("migrat"))
+            .collect();
+        eprintln!(
+            "=== n1
+{}",
+            moving[moving.len().saturating_sub(30)..].join(
+                "
+"
+            )
+        );
+    }
+
+    /// [`wait`], dumping the move's state if it times out.
+    fn waited(&self, what: &str, secs: u64, f: impl FnMut() -> bool) {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wait(what, secs, f)));
+        if let Err(e) = r {
+            self.dump();
+            std::panic::resume_unwind(e);
+        }
+    }
+
     /// What a node holds of ordinal 0's Volume: its datasets and snapshots.
     fn held(&self, node: &str) -> String {
         let out = self.on(
@@ -439,7 +490,7 @@ fn a_move_cut_short_or_held_by_a_full_disk_loses_nothing() {
             .and_then(|i| i["message"].as_str().map(str::to_owned))
             .filter(|m| m.contains("quota") || m.contains("space"))
     };
-    wait("the full disk in the drain status", 300, || {
+    lab.waited("the full disk in the drain status", 300, || {
         says_why().is_some()
     });
     eprintln!("drain status: {}", says_why().unwrap());
@@ -474,7 +525,7 @@ fn a_move_cut_short_or_held_by_a_full_disk_loses_nothing() {
     );
     assert_eq!(lab.held(to), "", "nothing of the copy cut short");
     lab.restart_vm(vm(to), Role::Manager);
-    wait("copied once the node is back", 600, || {
+    lab.waited("copied once the node is back", 600, || {
         lab.pg_volume()["status"]["migration"]["phase"] == "copied"
     });
     assert_eq!(lab.pg_volume()["status"]["migration"]["to"], to);
@@ -528,11 +579,11 @@ fn a_move_cut_short_or_held_by_a_full_disk_loses_nothing() {
         text(&out.stdout),
         text(&out.stderr)
     );
-    wait("db-0 running on its new node", 600, || {
+    lab.waited("db-0 running on its new node", 600, || {
         lab.ordinal(0).is_some_and(|t| t["spec"]["node"] == to)
     });
     assert_eq!(lab.pg_volume()["status"]["node"], to);
-    wait("the rows readable", 120, || lab.rows(0) == Some(3000));
+    lab.waited("the rows readable", 120, || lab.rows(0) == Some(3000));
     assert_eq!(
         lab.sql(0, "select count(*) from orders where item like 'after %'")
             .as_deref(),
@@ -548,11 +599,11 @@ fn a_move_cut_short_or_held_by_a_full_disk_loses_nothing() {
         Some("1000000 700000")
     );
     assert_eq!(lab.held(to), ds, "the move's snapshots gone");
-    wait("the old copy dropped", 300, || lab.held(&from).is_empty());
+    lab.waited("the old copy dropped", 300, || lab.held(&from).is_empty());
 
     step("clean up");
     lab.ok(&["delete", "service", "db", "-n", "data"]);
-    wait("every task gone", 180, || {
+    lab.waited("every task gone", 180, || {
         lab.list("tasks", "data")
             .iter()
             .all(|t| t["status"]["state"] != "running")
