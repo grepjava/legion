@@ -71,6 +71,7 @@ test legion cluster the_cluster_upgrades_one_node_at_a_time host cluster 3600 en
 
 test legion handoff a_jailer_archive_runs_as_exported host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_JAILER
 test legion handoff a_jailer_push_is_what_legion_runs host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_JAILER
+test legion handoff a_jailer_image_keeps_its_data_through_a_drain host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_JAILER
 helper legion-net mesh serve
 helper legion handoff registry
 helper legion-store cluster write_throughput

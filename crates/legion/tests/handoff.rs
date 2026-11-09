@@ -6,6 +6,10 @@
 //!   a scale, a redeployment after the tag moved, and a rollback.
 //! - Offline: jailer exports an archive, every node loads it with
 //!   `legion image load`, and every task runs the manifest jailer recorded.
+//! - With data (jailer's ROADMAP, shared qualification; PLAN.md phases 4
+//!   and 5): a stateful task of a jailer image writes to its Volume, its
+//!   node is drained, and on the next node it runs the same manifest with
+//!   the same data, its first writer having stopped before the data moved.
 //!
 //! It drives real daemons, so it is ignored by default and run by hand on a
 //! FreeBSD host as root, with the lab of `tests/common` (see there), and with
@@ -106,13 +110,21 @@ impl Jailer {
 
     /// Builds `tag`, whose `/id` holds `id`, into the record `rec`.
     fn build(&self, dir: &Path, tag: &str, id: &str, rec: &Path) {
+        self.build_with(dir, tag, id, rec, &[]);
+    }
+
+    /// As [`Self::build`], with each of `files`, a name and its text, put
+    /// at `/` and the name.
+    fn build_with(&self, dir: &Path, tag: &str, id: &str, rec: &Path, files: &[(&str, &str)]) {
         let ctx = dir.join(id);
         std::fs::create_dir_all(&ctx).unwrap();
-        std::fs::write(
-            ctx.join("Containerfile"),
-            "FROM docker.io/freebsd/freebsd-runtime:15.1\nCOPY id /id\n",
-        )
-        .unwrap();
+        let mut containerfile =
+            String::from("FROM docker.io/freebsd/freebsd-runtime:15.1\nCOPY id /id\n");
+        for (name, body) in files {
+            std::fs::write(ctx.join(name), body).unwrap();
+            containerfile.push_str(&format!("COPY {name} /{name}\n"));
+        }
+        std::fs::write(ctx.join("Containerfile"), containerfile).unwrap();
         std::fs::write(ctx.join("id"), id).unwrap();
         self.run(&[
             "build",
@@ -390,6 +402,225 @@ fn a_jailer_push_is_what_legion_runs() {
     lab.ok(&["rollback", "web", "-n", "handoff"]);
     lab.runs("web", &image, 3, &manifest1, Some(&pinned1), &id1);
     lab.delete("web");
+    step("done");
+}
+
+/// The writer of [`a_jailer_image_keeps_its_data_through_a_drain`]: the
+/// first start keeps the build it ran and some random data; every start
+/// then logs lines of its own until it is stopped, and logs that last.
+const WRITER: &str = r#"me=$(date +%s)-$$
+if [ ! -f /data/born ]; then
+  dd if=/dev/random of=/data/blob bs=64k count=4 2>/dev/null || exit 1
+  cat /id > /data/born
+fi
+trap 'echo "$me stop" >> /data/log; exit 0' TERM INT
+n=0
+while :; do
+  n=$((n + 1))
+  echo "$me $n" >> /data/log
+  sleep 0.2
+done
+"#;
+
+/// A stateful Service of one task running the writer of `image` on a
+/// Volume of its own.
+fn keeper(image: &str) -> String {
+    format!(
+        "apiVersion: legion/v1
+kind: Service
+metadata: {{ name: keep, namespace: handoff }}
+spec:
+  mode: stateful
+  replicas: 1
+  pod:
+    containers:
+      - name: app
+        image: {image}
+        command: [/bin/sh, /writer]
+        volumeMounts: [{{ name: data, path: /data }}]
+    volumes: [{{ name: data, claim: {{ size: 64Mi }} }}]
+"
+    )
+}
+
+impl Lab {
+    /// What `path` holds in a task, as bytes.
+    fn file_in(&self, task: &Value, path: &str) -> Vec<u8> {
+        let name = task["metadata"]["name"].as_str().unwrap();
+        let out = self.legion(&["exec", name, "-n", "handoff", "--", "cat", path], &[]);
+        assert!(
+            out.status.success(),
+            "reading {path} in {name}: {}",
+            text(&out.stderr)
+        );
+        out.stdout
+    }
+
+    /// The one running task of `service`, once it runs `manifest` for
+    /// `image` and has logged a line.
+    fn one(&self, service: &str, image: &str, manifest: &str) -> Value {
+        let mut found = None;
+        wait(&format!("{service} running {manifest}"), 600, || {
+            let tasks = self.running(service);
+            found = match tasks.as_slice() {
+                [t] if t["status"]["images"][image] == manifest => Some(t.clone()),
+                _ => None,
+            };
+            found.as_ref().is_some_and(|t| {
+                let name = t["metadata"]["name"].as_str().unwrap();
+                let out = self.legion(
+                    &[
+                        "exec",
+                        name,
+                        "-n",
+                        "handoff",
+                        "--",
+                        "test",
+                        "-s",
+                        "/data/log",
+                    ],
+                    &[],
+                );
+                out.status.success()
+            })
+        });
+        found.unwrap()
+    }
+}
+
+/// The writers in a log, in the order they first wrote, each with its
+/// lines; a writer that comes back after another wrote is an error.
+fn writers(log: &str) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for line in log.lines() {
+        let (me, what) = line.split_once(' ').unwrap_or_else(|| panic!("{line:?}"));
+        match out.last_mut() {
+            Some((last, lines)) if last == me => lines.push(what.to_owned()),
+            _ => {
+                assert!(
+                    out.iter().all(|(w, _)| w != me),
+                    "{me} wrote again after another writer: two writers\n{log}"
+                );
+                out.push((me.to_owned(), vec![what.to_owned()]));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn a_log_tells_writers_apart() {
+    let w = writers("a 1\na 2\na stop\nb 1\nb 2\n");
+    assert_eq!(w.len(), 2);
+    assert_eq!(
+        w[0],
+        ("a".into(), vec!["1".into(), "2".into(), "stop".into()])
+    );
+    assert_eq!(w[1].1.len(), 2);
+}
+
+#[test]
+#[should_panic(expected = "two writers")]
+fn a_writer_back_after_another_is_two_writers() {
+    writers("a 1\nb 1\na 2\n");
+}
+
+#[test]
+#[ignore = "needs root and ZFS on FreeBSD, two more nodes and jailer; see the module docs"]
+fn a_jailer_image_keeps_its_data_through_a_drain() {
+    let mut lab = Lab::from_env();
+    let jailer = Jailer::new(&lab, &[]);
+    let step = |what: &str| eprintln!("--- {what}");
+
+    step("jailer builds a writer and exports it");
+    let rec = lab.dir.join("keep.json");
+    let id = unique("keep");
+    jailer.build_with(&lab.dir, "handoff/keep:1", &id, &rec, &[("writer", WRITER)]);
+    let tar = lab.dir.join("keep.oci.tar");
+    jailer.run(&[
+        "export",
+        "--record",
+        rec.to_str().unwrap(),
+        "handoff/keep:1",
+        tar.to_str().unwrap(),
+    ]);
+    let r = record(&rec);
+    let manifest = r.image.manifest.clone();
+    assert_eq!(r.archives.last().unwrap().manifest, manifest);
+
+    step("a stateful service runs it, writing to its Volume");
+    three_nodes(&mut lab, &[]);
+    lab.load_image(tar.to_str().unwrap());
+    lab.apply("namespace", NAMESPACE);
+    let image = "localhost/handoff/keep:1";
+    lab.apply("keep", &keeper(image));
+    let before = lab.one("keep", image, &manifest);
+    assert_eq!(lab.id_in(&before), id, "the build jailer recorded");
+    assert_eq!(text(&lab.file_in(&before, "/data/born")), id);
+    let blob = lab.file_in(&before, "/data/blob");
+    assert_eq!(blob.len(), 256 * 1024);
+    let from = before["spec"]["node"].as_str().unwrap().to_owned();
+    // A few seconds of lines before the move.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    step(&format!("draining {from} moves the task and its data"));
+    let out = lab.legion(
+        &[
+            "node",
+            "drain",
+            &from,
+            "--wait",
+            "--timeout",
+            "900",
+            "-o",
+            "json",
+        ],
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "drain --wait: {}{}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+    let done: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(done["phase"], "completed", "{done}");
+    let after = lab.one("keep", image, &manifest);
+    let to = after["spec"]["node"].as_str().unwrap().to_owned();
+    assert_ne!(to, from, "the task left {from}");
+    assert_ne!(after["metadata"]["name"], before["metadata"]["name"]);
+    lab.ok(&["node", "activate", &from]);
+
+    step("the image and the data are the same; one writer at a time");
+    assert_eq!(lab.id_in(&after), id, "the build jailer recorded");
+    assert_eq!(text(&lab.file_in(&after, "/data/born")), id);
+    assert!(
+        lab.file_in(&after, "/data/blob") == blob,
+        "the data came along"
+    );
+    // Lines from the moved task, then the whole log.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let log = text(&lab.file_in(&after, "/data/log"));
+    let w = writers(&log);
+    assert_eq!(w.len(), 2, "the first task, then the moved one\n{log}");
+    let (old, new) = (&w[0].1, &w[1].1);
+    assert_eq!(
+        old.last().map(String::as_str),
+        Some("stop"),
+        "the first task stopped before its data moved, and its last line came along\n{log}"
+    );
+    assert!(
+        old.len() > 10 && new.len() > 10,
+        "both wrote for a while\n{log}"
+    );
+    for (n, line) in old[..old.len() - 1].iter().enumerate() {
+        assert_eq!(*line, (n + 1).to_string(), "no line of it lost\n{log}");
+    }
+    assert!(
+        lab.running("keep").len() == 1,
+        "one task of the service runs"
+    );
+    lab.delete("keep");
     step("done");
 }
 
