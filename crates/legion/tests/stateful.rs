@@ -507,7 +507,8 @@ fn a_move_cut_short_or_held_by_a_full_disk_loses_nothing() {
     let out = lab.on(
         to,
         &format!(
-            "zfs inherit quota {ZFS_ROOT}/volumes
+            "zfs set quota=none {ZFS_ROOT}/volumes || exit 4
+             [ \"$(zfs get -H -o value quota {ZFS_ROOT}/volumes)\" = none ] || exit 4
              {}",
             kill_receiving(&ds, "legion-lab daemon")
         ),
