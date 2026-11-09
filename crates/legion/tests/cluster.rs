@@ -279,13 +279,14 @@ fn app_updates_and_survives_losing_a_node() {
     step("done");
 }
 
-/// What `node` says its agent speaks: 1 from a build before the handshake.
-fn speaks(lab: &Lab, node: &str) -> u64 {
+/// The version `node`'s agent says it runs. (Not its protocol: a leader
+/// from before the handshake keeps no such field in what it writes.)
+fn version(lab: &Lab, node: &str) -> String {
     lab.list("nodes", "")
         .iter()
         .find(|n| n["metadata"]["name"] == node)
-        .and_then(|n| n["status"]["protocol"]["speaks"].as_u64())
-        .unwrap_or(1)
+        .and_then(|n| n["status"]["version"].as_str().map(str::to_owned))
+        .unwrap_or_default()
 }
 
 /// The managers' protocol floor, as the manager at `server` reads it: 1
@@ -331,8 +332,9 @@ fn the_cluster_upgrades_one_node_at_a_time() {
             .iter()
             .all(|n| lab.node_state(n) == "ready")
     });
+    let this = env!("CARGO_PKG_VERSION");
     for n in ["n1", "n2", "n3"] {
-        assert_eq!(speaks(&lab, n), 1, "{n} runs the previous release");
+        assert_ne!(version(&lab, n), this, "{n} runs the previous release");
     }
     lab.deploy("1");
     wait("the app", 600, || lab.app_ready());
@@ -347,7 +349,7 @@ fn the_cluster_upgrades_one_node_at_a_time() {
         let name = format!("n{}", i + 2);
         lab.restart_vm(i, Role::Manager);
         wait(&format!("{name} on this build"), 120, || {
-            lab.node_state(&name) == "ready" && speaks(&lab, &name) == new
+            lab.node_state(&name) == "ready" && version(&lab, &name) == this
         });
         wait("the app", 300, || lab.app_ready());
         let at = format!("{}:{}", lab.vms[i].addr, common::PORT);
@@ -356,7 +358,7 @@ fn the_cluster_upgrades_one_node_at_a_time() {
     }
     lab.restart_host(&[]);
     wait("n1 on this build", 120, || {
-        lab.node_state("n1") == "ready" && speaks(&lab, "n1") == new
+        lab.node_state("n1") == "ready" && version(&lab, "n1") == this
     });
     wait("the floor raised", 60, || {
         floor_at(&lab, &lab.server()) == new
