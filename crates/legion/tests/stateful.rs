@@ -326,6 +326,27 @@ impl Lab {
     /// its ZFS transfers, its copies and what its daemon said of moving.
     fn dump(&self) {
         eprintln!("volume: {}", self.pg_volume()["status"]);
+        for t in self.list("tasks", "data") {
+            let name = t["metadata"]["name"].as_str().unwrap_or_default();
+            eprintln!(
+                "task {name} on {} {} {} {}",
+                t["spec"]["node"],
+                t["spec"]["desiredState"],
+                t["status"]["state"],
+                t["status"]["message"]
+            );
+            if t["status"]["state"] == "running" {
+                let out = self.legion(&["logs", name, "-n", "data", "--tail", "20"], &[]);
+                eprintln!("{}{}", text(&out.stdout), text(&out.stderr));
+            }
+        }
+        eprintln!(
+            "replication: {:?}",
+            self.sql(
+                0,
+                "select client_addr, state, sent_lsn, replay_lsn from pg_stat_replication"
+            )
+        );
         for n in self.list("nodes", "default") {
             eprintln!(
                 "node {}: {} {}",
@@ -634,16 +655,17 @@ fn postgres_is_restored_onto_replacement_hosts() {
             .iter()
             .any(|s| s["metadata"]["name"] == "db" && s["status"]["ready"] == 2)
     };
-    wait("both ordinals ready", 600, || both(&lab));
+    lab.waited("both ordinals ready", 600, || both(&lab));
     lab.sql(
         0,
         "create table orders (id serial primary key, item text); \
          insert into orders (item) select 'kept ' || i from generate_series(1, 1000) i; \
-         create table ballast as select md5(i::text) as v from generate_series(1, 1000000) i; \
-         checkpoint",
+         create table ballast as select md5(i::text) as v from generate_series(1, 1000000) i",
     )
     .expect("writing to the primary");
-    wait("the replica has the rows", 120, || {
+    // No checkpoint: one at once would recycle WAL the replica, behind
+    // with the ballast, has yet to stream, and it would never catch up.
+    lab.waited("the replica has the rows", 300, || {
         lab.rows(1) == Some(1000)
     });
 
@@ -771,7 +793,7 @@ fn postgres_is_restored_onto_replacement_hosts() {
 
     step("Postgres again: the primary recovers as from a crash, the replica copies it anew");
     lab.ok(&["apply", "-f", app.to_str().unwrap()]);
-    wait("the primary serving", 600, || lab.rows(0).is_some());
+    lab.waited("the primary serving", 600, || lab.rows(0).is_some());
     let primary_at = t0.elapsed();
     assert_eq!(lab.node_of(0), "n2", "where its data was restored");
     assert_eq!(
@@ -783,13 +805,13 @@ fn postgres_is_restored_onto_replacement_hosts() {
         lab.sql(0, "select count(*) from ballast").as_deref(),
         Some("1000000")
     );
-    wait("both ordinals ready", 600, || both(&lab));
-    wait("the replica in step", 600, || lab.rows(1) == Some(1000));
+    lab.waited("both ordinals ready", 600, || both(&lab));
+    lab.waited("the replica in step", 600, || lab.rows(1) == Some(1000));
     let replica_at = t0.elapsed();
     assert_ne!(lab.node_of(1), "n2", "spread over the workers");
     lab.sql(0, "insert into orders (item) values ('after')")
         .expect("writing to the restored primary");
-    wait("the replica streams", 120, || lab.rows(1) == Some(1001));
+    lab.waited("the replica streams", 120, || lab.rows(1) == Some(1001));
 
     let s = |d: std::time::Duration| d.as_secs_f64();
     eprintln!(
