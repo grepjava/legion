@@ -113,6 +113,9 @@ struct State {
     failing: BTreeSet<String>,
     before_clone: Option<Hook>,
     before_send: Option<Hook>,
+    after_receive: Option<Hook>,
+    /// Bytes a receive may still write, if the pool is that full.
+    free: Option<u64>,
     before_unmount: Option<Hook>,
     /// Mount points something still holds (a dying jail its root): a
     /// dataset mounted there is busy until the path is unmounted, by force.
@@ -378,6 +381,19 @@ impl FakeSys {
     /// Runs `f` as the next `zfs send` starts.
     pub fn before_send(&self, f: impl FnOnce() + Send + 'static) {
         self.state().before_send = Some(Hook(Box::new(f)));
+    }
+
+    /// Runs `f` once the next `zfs receive` has taken its stream in, before
+    /// it returns: what the receiving node holds then is all of it.
+    pub fn after_receive(&self, f: impl FnOnce() + Send + 'static) {
+        self.state().after_receive = Some(Hook(Box::new(f)));
+    }
+
+    /// Leaves `free` bytes for what `zfs receive` writes, or with `None`
+    /// room for anything: a stream with more data fails as out of space,
+    /// leaving the dataset as it was, as a real receive does.
+    pub fn set_free_space(&self, free: Option<u64>) {
+        self.state().free = free;
     }
 
     /// Runs `f` as the next unmount starts, as another process would that
@@ -1433,6 +1449,17 @@ impl Sys for FakeSys {
             return Err(bad());
         };
         let mut s = self.state();
+        if s.free.is_some_and(|free| data.len() as u64 > free) {
+            let kind = if since == "-" {
+                "new filesystem"
+            } else {
+                "incremental"
+            };
+            return Err(fail(
+                "zfs receive",
+                format!("cannot receive {kind} stream: out of space"),
+            ));
+        }
         let parent = dataset.rsplit_once('/').map(|(p, _)| p);
         if let Some(parent) = parent
             && !s.datasets.contains_key(parent)
@@ -1461,7 +1488,15 @@ must destroy them to overwrite it"
                     quota: None,
                 },
             );
-        } else if !s.snapshots.contains_key(&format!("{dataset}@{since}")) {
+        } else if s
+            .snapshots
+            .iter()
+            .filter(|(d, _)| d.starts_with(&snap))
+            .max_by_key(|(_, n)| **n)
+            .is_none_or(|(d, _)| *d != format!("{dataset}@{since}"))
+        {
+            // As `zfs receive -F` does: an incremental stream goes onto
+            // the snapshot it was made from, which must be the newest.
             return Err(fail(
                 "zfs receive",
                 format!(
@@ -1472,6 +1507,11 @@ must destroy them to overwrite it"
         s.take_snapshot(&format!("{dataset}@{name}"));
         s.contents.insert(format!("{dataset}@{name}"), data.clone());
         s.contents.insert(dataset.to_owned(), data);
+        let hook = s.after_receive.take();
+        drop(s);
+        if let Some(Hook(f)) = hook {
+            f();
+        }
         Ok(())
     }
 

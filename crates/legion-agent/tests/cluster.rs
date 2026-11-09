@@ -100,6 +100,29 @@ struct Cluster {
     stop: Option<oneshot::Sender<()>>,
     server: JoinHandle<()>,
     dir: tempfile::TempDir,
+    heartbeat: Duration,
+}
+
+/// Serves a manager on `addr` with its data in `dir`.
+async fn serve_manager(
+    dir: &std::path::Path,
+    addr: &str,
+    heartbeat: Duration,
+) -> (oneshot::Sender<()>, JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let mut config = ManagerConfig::new(dir.join("manager"), addr);
+    config.heartbeat = heartbeat;
+    let manager = Manager::open(config).await.unwrap();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        manager
+            .serve(listener, async move {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    (stop, server)
 }
 
 impl Cluster {
@@ -109,20 +132,12 @@ impl Cluster {
 
     async fn start_with(nodes: usize, heartbeat: Duration) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let mut config = ManagerConfig::new(dir.path().join("manager"), &addr);
-        config.heartbeat = heartbeat;
-        let manager = Manager::open(config).await.unwrap();
-        let (stop, stopped) = oneshot::channel::<()>();
-        let server = tokio::spawn(async move {
-            manager
-                .serve(listener, async move {
-                    let _ = stopped.await;
-                })
-                .await
-                .unwrap();
-        });
+        // A free port, for the manager to have again once restarted.
+        let addr = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        let (stop, server) = serve_manager(dir.path(), &addr, heartbeat).await;
         let url = format!("http://{addr}");
         let channel = loop {
             if let Ok(c) = Channel::from_shared(url.clone()).unwrap().connect().await {
@@ -142,6 +157,7 @@ impl Cluster {
             stop: Some(stop),
             server,
             dir,
+            heartbeat,
         };
         for n in 1..=nodes {
             let i = c.add_node(legion_api::protocol::Protocol::current()).await;
@@ -220,6 +236,38 @@ impl Cluster {
                 .await
                 .expect("agent stops")
                 .unwrap();
+        }
+    }
+
+    /// Has the manager start shutting down: its controllers and migrator
+    /// stop at once, as a manager's do that is killed.
+    fn stop_manager(&mut self) {
+        self.stop.take().unwrap().send(()).unwrap();
+    }
+
+    /// Waits for the manager [`Self::stop_manager`] stopped to be gone,
+    /// then starts it again on its data, answering once it does.
+    async fn restart_manager(&mut self) {
+        let server = std::mem::replace(&mut self.server, tokio::spawn(async {}));
+        tokio::time::timeout(Duration::from_secs(15), server)
+            .await
+            .expect("manager stops")
+            .unwrap();
+        let (stop, server) = serve_manager(self.dir.path(), &self.addr, self.heartbeat).await;
+        (self.stop, self.server) = (Some(stop), server);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while self
+            .api
+            .clone()
+            .list(ListRequest {
+                kind: Kind::Node.to_string(),
+                ..Default::default()
+            })
+            .await
+            .is_err()
+        {
+            assert!(tokio::time::Instant::now() < deadline, "manager back");
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -1187,6 +1235,265 @@ async fn a_drain_whose_source_is_cut_off_mid_copy_waits_for_it() {
             .await
             .iter()
             .any(|t| t.spec["node"] == to.as_str())
+    })
+    .await;
+    c.stop().await;
+}
+
+/// The Volume of the database the migration tests move.
+const DS: &str = "tank/legion/volumes/shop/data-db-0";
+
+/// Starts the database, no task of it allowed to stop yet, and writes
+/// `rows 1` to its Volume; returns the index of its node.
+async fn db_with_rows(c: &Cluster) -> usize {
+    c.apply(&DB.replace("MAX", "0")).await;
+    eventually("db running", async || db_task(c).await.is_some()).await;
+    let node = db_task(c).await.unwrap().spec["node"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let i = c.nodes.iter().position(|n| n.name == node).unwrap();
+    c.nodes[i].sys.write_dataset(DS, b"rows 1");
+    i
+}
+
+/// The database's running task.
+async fn db_task(c: &Cluster) -> Option<Object> {
+    c.list(Kind::Task)
+        .await
+        .into_iter()
+        .find(|t| t.status["state"] == "running")
+}
+
+async fn db_volume(c: &Cluster) -> Object {
+    c.list(Kind::Volume)
+        .await
+        .into_iter()
+        .find(|v| v.metadata.name == "data-db-0")
+        .unwrap()
+}
+
+/// Waits for the full copy and returns the index of the node it went to.
+async fn copied(c: &Cluster) -> usize {
+    eventually("copied", async || {
+        db_volume(c).await.status["migration"]["phase"] == "copied"
+    })
+    .await;
+    let v = db_volume(c).await;
+    let to = v.status["migration"]["to"].as_str().unwrap();
+    c.nodes.iter().position(|n| n.name == to).unwrap()
+}
+
+/// Waits for the database to run on node `i` with its Volume, moved
+/// there, holding `rows`.
+async fn moved_to(c: &Cluster, i: usize, rows: &[u8]) {
+    let name = c.nodes[i].name.clone();
+    eventually(&format!("db running on {name}"), async || {
+        db_task(c)
+            .await
+            .is_some_and(|t| t.spec["node"] == name.as_str())
+    })
+    .await;
+    let v = db_volume(c).await;
+    assert_eq!(v.status["node"], name.as_str(), "{}", v.status);
+    assert!(v.status.get("migration").is_none(), "{}", v.status);
+    let sys = &c.nodes[i].sys;
+    assert_eq!(sys.dataset_contents(DS).as_deref(), Some(rows));
+    assert!(sys.snapshots().is_empty(), "{:?}", sys.snapshots());
+}
+
+/// A full disk where a Volume goes holds its move, which says so, until
+/// there is room. Nothing is lost: a receive out of space leaves no part
+/// copy, and the data stays whole where it was, its task running on until
+/// the full copy is in. Out of space for the last part, the task has
+/// stopped: it waits, down, for room, or for the full node to be drained,
+/// which sends the Volume elsewhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_disk_holds_a_move_until_there_is_room() {
+    let c = Cluster::start(3).await;
+    let from = db_with_rows(&c).await;
+    let name = c.nodes[from].name.clone();
+    let others: Vec<usize> = (0..3).filter(|&j| j != from).collect();
+    for &j in &others {
+        c.nodes[j].sys.set_free_space(Some(0));
+    }
+    let says = async |reason: &str| {
+        volume_item(&drain_of(&c, &name).await, "data-db-0").is_some_and(|i| {
+            i["reason"] == reason
+                && i["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("out of space"))
+        })
+    };
+
+    c.availability(&name, "drain").await;
+    eventually("the full disk in the drain status", async || {
+        says("copying").await
+    })
+    .await;
+    assert_eq!(db_volume(&c).await.status["node"], name.as_str());
+    assert_eq!(
+        db_task(&c).await.unwrap().spec["node"],
+        name.as_str(),
+        "the task runs on"
+    );
+    for &j in &others {
+        assert!(
+            c.nodes[j].sys.zfs_list(DS).unwrap().is_empty(),
+            "no part copy"
+        );
+    }
+
+    for &j in &others {
+        c.nodes[j].sys.set_free_space(None);
+    }
+    let to = copied(&c).await;
+    c.nodes[from].sys.write_dataset(DS, b"rows 2");
+    c.nodes[to].sys.set_free_space(Some(0));
+    c.apply(&DB.replace("MAX", "1")).await;
+    eventually(
+        "the full disk for the last part in the drain status",
+        async || says("finishing").await,
+    )
+    .await;
+    assert!(db_task(&c).await.is_none(), "stopped, and started nowhere");
+    assert_eq!(db_volume(&c).await.status["node"], name.as_str());
+    assert_eq!(
+        c.nodes[from].sys.dataset_contents(DS).as_deref(),
+        Some(&b"rows 2"[..])
+    );
+
+    // The full node drained too, the Volume goes to the third, all of it
+    // sent again from the node it leaves; the full node keeps nothing.
+    let third = (0..3).find(|&j| j != from && j != to).unwrap();
+    c.availability(&c.nodes[to].name, "drain").await;
+    moved_to(&c, third, b"rows 2").await;
+    eventually("the full node's copy dropped", async || {
+        c.nodes[to].sys.zfs_list(DS).unwrap().is_empty()
+    })
+    .await;
+    eventually("the drain completed", async || {
+        drain_of(&c, &name).await["phase"] == "completed"
+    })
+    .await;
+    c.stop().await;
+}
+
+/// The node a Volume leaves, cut off once its task has stopped and before
+/// it sends the last part, has the only copy of the latest data: the move
+/// waits for it, and the task starts nowhere else meanwhile, not even
+/// where the full copy is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_whose_old_node_is_cut_off_as_it_finishes_waits_for_it() {
+    let c = Cluster::start(3).await;
+    let from = db_with_rows(&c).await;
+    let name = c.nodes[from].name.clone();
+    c.availability(&name, "drain").await;
+    let to = copied(&c).await;
+
+    c.nodes[from].sys.write_dataset(DS, b"rows 2");
+    let cut = c.nodes[from].link.cut.clone();
+    c.nodes[from].sys.before_send(move || {
+        cut.send_replace(true);
+    });
+    c.apply(&DB.replace("MAX", "1")).await;
+    eventually("the drain blocked on the unreachable node", async || {
+        let d = drain_of(&c, &name).await;
+        d["phase"] == "blocked" && d["reason"] == "unreachable"
+    })
+    .await;
+    tokio::time::sleep(HEARTBEAT * 10).await;
+    let v = db_volume(&c).await;
+    assert_eq!(v.status["node"], name.as_str(), "{}", v.status);
+    assert_eq!(v.status["migration"]["phase"], "finishing", "{}", v.status);
+    assert!(
+        db_task(&c).await.is_none(),
+        "started with the full copy only"
+    );
+    assert_eq!(
+        c.nodes[to].sys.dataset_contents(DS).as_deref(),
+        Some(&b"rows 1"[..])
+    );
+
+    c.nodes[from].link.mend();
+    c.eventually_node_ready(&name).await;
+    moved_to(&c, to, b"rows 2").await;
+    eventually("the old copy dropped", async || {
+        c.nodes[from].sys.zfs_list(DS).unwrap().is_empty()
+    })
+    .await;
+    c.stop().await;
+}
+
+/// The node a Volume goes to, gone silent as the last part is sent, is no
+/// place for it any more: the move is called off and another starts, to
+/// a node that is there, from the old node, which has all of the data.
+/// The silent node's copy, stale, goes once it is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_whose_new_node_goes_silent_as_it_finishes_goes_elsewhere() {
+    let c = Cluster::start(3).await;
+    let from = db_with_rows(&c).await;
+    c.availability(&c.nodes[from].name, "drain").await;
+    let to = copied(&c).await;
+    let third = (0..3).find(|&j| j != from && j != to).unwrap();
+
+    c.nodes[from].sys.write_dataset(DS, b"rows 2");
+    let cut = c.nodes[to].link.cut.clone();
+    c.nodes[from].sys.before_send(move || {
+        cut.send_replace(true);
+    });
+    c.apply(&DB.replace("MAX", "1")).await;
+    moved_to(&c, third, b"rows 2").await;
+
+    c.nodes[to].link.mend();
+    eventually("the stale copy dropped", async || {
+        c.nodes[to].sys.zfs_list(DS).unwrap().is_empty()
+    })
+    .await;
+    eventually("the old copy dropped", async || {
+        c.nodes[from].sys.zfs_list(DS).unwrap().is_empty()
+    })
+    .await;
+    c.stop().await;
+}
+
+/// A manager lost once the last part is in, before it gives the Volume to
+/// its new node: the next has the part sent again, which the new node
+/// takes on the full copy as before, and the move ends as one never cut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_manager_lost_as_the_last_part_lands_has_it_sent_again() {
+    let mut c = Cluster::start(3).await;
+    let from = db_with_rows(&c).await;
+    c.availability(&c.nodes[from].name, "drain").await;
+    let to = copied(&c).await;
+
+    c.nodes[from].sys.write_dataset(DS, b"rows 2");
+    let (landed, has_landed) = std::sync::mpsc::channel();
+    let (go, may_go) = std::sync::mpsc::channel::<()>();
+    c.nodes[to].sys.after_receive(move || {
+        let _ = landed.send(());
+        let _ = may_go.recv();
+    });
+    c.apply(&DB.replace("MAX", "1")).await;
+    tokio::task::spawn_blocking(move || has_landed.recv_timeout(Duration::from_secs(60)))
+        .await
+        .unwrap()
+        .expect("the last part lands");
+    // All of it is there; the manager goes before it hears so.
+    assert_eq!(
+        c.nodes[to].sys.dataset_contents(DS).as_deref(),
+        Some(&b"rows 2"[..])
+    );
+    c.stop_manager();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    go.send(()).unwrap();
+    c.restart_manager().await;
+    let v = db_volume(&c).await;
+    assert_eq!(v.status["migration"]["phase"], "finishing", "{}", v.status);
+
+    moved_to(&c, to, b"rows 2").await;
+    eventually("the old copy dropped", async || {
+        c.nodes[from].sys.zfs_list(DS).unwrap().is_empty()
     })
     .await;
     c.stop().await;
