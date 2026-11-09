@@ -552,6 +552,59 @@ fn voters(d: &Daemon) -> usize {
 }
 
 #[test]
+fn a_manager_is_rebuilt_on_a_new_disk_from_its_backup_and_keys() {
+    let first = start_daemon();
+    ok(&first, &["init"]);
+    namespace(&first, "kept");
+    let backups = tempfile::tempdir().unwrap();
+    let file = backups.path().join("backup.json");
+    ok(&first, &["backup", "-o", file.to_str().unwrap()]);
+    let server = first.server.clone();
+    let lost = first.kill();
+
+    // The disk is lost; what was kept apart of it is the keys: the
+    // manager's `pki`, its `node-id` and the admins' credentials.
+    let new = tempfile::tempdir().unwrap();
+    copy_dir(&lost.path().join("pki"), &new.path().join("pki"));
+    for f in ["node-id", "admin.pem"] {
+        std::fs::copy(lost.path().join(f), new.path().join(f)).unwrap();
+    }
+    drop(lost);
+    let out = restore(new.path(), Some(&file));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let first = start_daemon_in(new, server);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !legion(&first, &["get", "namespace", "kept"])
+        .status
+        .success()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the rebuilt manager does not serve"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(voters(&first), 1);
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let target = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &target);
+        } else {
+            std::fs::copy(e.path(), &target).unwrap();
+        }
+    }
+}
+
+#[test]
 fn a_manager_is_restored_from_a_backup_and_from_its_own_store() {
     let first = start_daemon();
     ok(&first, &["init"]);
