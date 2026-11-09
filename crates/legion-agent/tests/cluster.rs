@@ -358,8 +358,11 @@ impl Cluster {
     }
 }
 
+/// Waits up to 60 s: a deadline for a hang, not a measure of speed. On the
+/// lab's two-CPU VMs, two of these three-node clusters at once took over
+/// 20 s to place their first tasks.
 async fn eventually<F: AsyncFnMut() -> bool>(what: &str, mut f: F) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !f().await {
         assert!(
             tokio::time::Instant::now() < deadline,
