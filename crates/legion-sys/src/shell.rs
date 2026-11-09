@@ -250,6 +250,35 @@ fn stale_inet6(shown: &str, keep: std::net::Ipv6Addr) -> Vec<std::net::Ipv6Addr>
         .collect()
 }
 
+/// Whether `ifconfig`'s output shows `want` on the interface, with its
+/// prefix: a netmask in hex, as FreeBSD prints it, or a CIDR suffix.
+fn has_inet(shown: &str, want: crate::Ipv4Net) -> bool {
+    shown
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("inet "))
+        .any(|rest| {
+            let mut words = rest.split_whitespace();
+            let Some(addr) = words.next() else {
+                return false;
+            };
+            let (addr, prefix) = match addr.split_once('/') {
+                Some((a, p)) => (a, p.parse::<u8>().ok()),
+                None => {
+                    let mask = match (words.next(), words.next()) {
+                        (Some("netmask"), Some(m)) => m.strip_prefix("0x"),
+                        _ => None,
+                    };
+                    let prefix = mask
+                        .and_then(|m| u32::from_str_radix(m, 16).ok())
+                        .filter(|m| m.leading_ones() + m.trailing_zeros() == 32)
+                        .map(|m| m.leading_ones() as u8);
+                    (addr, prefix)
+                }
+            };
+            addr.parse::<Ipv4Addr>().ok() == Some(want.addr) && prefix == Some(want.prefix)
+        })
+}
+
 /// Whether jls says the jail is gone: not there, or dying, which is a
 /// jail already removed whose last references (sockets timing out, its
 /// root's vnode) have yet to go.
@@ -577,7 +606,15 @@ impl<R: Runner> Sys for Shell<R> {
         let mut a = in_jail(jail);
         a.push(name.to_owned());
         if let Some(addr) = config.addr {
-            a.extend(["inet".to_owned(), addr.to_string()]);
+            // `inet` replaces the address even with itself, and routes
+            // through the interface go with the old one: a node's bridge
+            // and wg0, set again as the agent starts, would drop traffic
+            // to its pods and the mesh for that moment.
+            let mut show = in_jail(jail);
+            show.push(name.to_owned());
+            if !has_inet(&self.run("ifconfig", &show)?, addr) {
+                a.extend(["inet".to_owned(), addr.to_string()]);
+            }
         }
         if let Some(mtu) = config.mtu {
             a.extend(["mtu".to_owned(), mtu.to_string()]);
@@ -1935,10 +1972,18 @@ mod tests {
         let sh = Script::shell(vec![
             ("ifconfig bridge create", ok("bridge0\n")),
             ("ifconfig bridge0 name legion0", ok("legion0\n")),
+            (
+                "ifconfig legion0",
+                ok("legion0: flags=8843<UP,BROADCAST,RUNNING> metric 0 mtu 1500\n"),
+            ),
             ("ifconfig legion0 inet 10.200.3.1/24 mtu 1420 up", ok("")),
             ("ifconfig epair create", ok("epair0a\n")),
             ("ifconfig legion0 addm epair0a", ok("")),
             ("ifconfig epair0b vnet pod1", ok("")),
+            (
+                "ifconfig -j pod1 epair0b",
+                ok("epair0b: flags=8842<BROADCAST,RUNNING> metric 0 mtu 1500\n"),
+            ),
             (
                 "ifconfig -j pod1 epair0b inet 10.200.3.17/24 mtu 1420 up",
                 ok(""),
@@ -2016,6 +2061,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sh.interfaces(Some("pod1")).unwrap(), ["lo0", "epair0b"]);
+    }
+
+    /// An address the interface has already is not set again: `inet`
+    /// would replace it with itself, and the routes through the interface
+    /// would go with the old one.
+    #[test]
+    fn an_address_in_place_is_left_alone() {
+        let sh = Script::shell(vec![
+            (
+                "ifconfig wg0",
+                ok(
+                    "wg0: flags=10080c1<UP,RUNNING,NOARP,MULTICAST,LOWER_UP> metric 0 mtu 1420\n\
+                    \tinet 100.64.0.3 netmask 0xffc00000\n",
+                ),
+            ),
+            ("ifconfig wg0 mtu 1420 up", ok("")),
+        ]);
+        sh.interface_configure(
+            None,
+            "wg0",
+            &IfConfig {
+                addr: Some("100.64.0.3/10".parse().unwrap()),
+                mtu: Some(1420),
+                up: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn has_inet_reads_both_forms() {
+        let shown = "legion0: flags=8843<UP> metric 0 mtu 1420\n\
+                     \tinet 10.200.3.1 netmask 0xffffff00 broadcast 10.200.3.255\n\
+                     \tinet 10.9.0.1/16 broadcast 10.9.255.255\n";
+        let net = |s: &str| s.parse::<Ipv4Net>().unwrap();
+        assert!(has_inet(shown, net("10.200.3.1/24")));
+        assert!(has_inet(shown, net("10.9.0.1/16")));
+        // Another prefix, or another address, is not it.
+        assert!(!has_inet(shown, net("10.200.3.1/16")));
+        assert!(!has_inet(shown, net("10.200.3.2/24")));
+        assert!(!has_inet(
+            "lo9: flags=8049<UP> mtu 16384\n",
+            net("10.200.3.1/24")
+        ));
     }
 
     #[test]

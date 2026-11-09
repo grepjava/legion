@@ -800,7 +800,12 @@ this was verified in a 3-node lab (S3).
   it until the manager has sent the endpoints: loaded against none, it
   would drop every VIP and published port while the pods behind them run
   on. Found by the upgrade drill: a request to a published port arriving
-  as its node's daemon came back timed out.
+  as its node's daemon came back timed out. Likewise the bridge's and
+  `wg0`'s addresses are not set again when already there: `ifconfig … inet`
+  replaces an address even with itself, and the routes through the
+  interface (the mesh's to other nodes' pods) go with it for that moment.
+  A connection whose first packet fell in it kept the path pf chose then,
+  out the default route without the mesh's NAT, and timed out.
 - **Dead backends**: the agent lists states and kills those whose translation
   targets the dead backend, by state key or ID (`pfctl -k key -k '<key>'`, or
   `pfctl_kill_states` via `libpfctl`). Killing by address does not work for
