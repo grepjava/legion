@@ -3562,7 +3562,8 @@ async fn a_volume_in_use_keeps_its_storage() {
 }
 
 /// A registry on plain HTTP whose one repository, `shop/app`, serves the
-/// manifest in `served` for any tag, to `bot:hunter2` only.
+/// manifest in `served` for any tag but a signature's, to `bot:hunter2`
+/// only.
 fn registry(served: std::sync::Arc<std::sync::Mutex<String>>) -> String {
     use std::io::{BufRead, BufReader, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3591,7 +3592,7 @@ fn registry(served: std::sync::Arc<std::sync::Mutex<String>>) -> String {
             let reply = if auth.as_deref() != Some("Basic Ym90Omh1bnRlcjI=") {
                 "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"r\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     .to_owned()
-            } else if first.starts_with("GET /v2/shop/app/manifests/") {
+            } else if first.starts_with("GET /v2/shop/app/manifests/") && !first.contains(".sig ") {
                 let body = served.lock().unwrap().clone();
                 format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.oci.image.manifest.v1+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -4276,5 +4277,147 @@ async fn a_host_is_routed_by_one_namespace() {
         .apply(route("evil", "www", "evil.example.org"))
         .await
         .unwrap();
+    m.stop().await;
+}
+
+/// An `ImagePolicy` is checked as it is applied, and holds an image it
+/// covers that has no signature: the Service gets no tasks and says why,
+/// while one no policy covers runs as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_image_policy_holds_an_unsigned_image() {
+    use legion_api::{Kind, Object as Stored};
+    let (one, _) = manifest("1");
+    let reg = registry(std::sync::Arc::new(std::sync::Mutex::new(one)));
+    let image = format!("{reg}/shop/app:1");
+    let key = legion_image::cosign::PrivateKey::generate()
+        .public()
+        .to_pem();
+
+    let m = Running::start().await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let mut node = Stored::new(Kind::Node, "", "w1", serde_json::json!({}));
+    node.status = serde_json::json!({ "state": "ready", "imagePins": true });
+    m.store
+        .raft
+        .client_write(legion_store::Command::Put {
+            object: node,
+            precondition: legion_store::Precondition::None,
+        })
+        .await
+        .unwrap();
+    let objects = m.objects().await;
+    let policy = |images: serde_json::Value, keys: serde_json::Value| Object {
+        kind: "ImagePolicy".into(),
+        name: "shop".into(),
+        spec_json: serde_json::json!({ "images": images, "keys": keys })
+            .to_string()
+            .into_bytes(),
+        ..Default::default()
+    };
+    for (images, keys, want) in [
+        (
+            serde_json::json!(["shop/**"]),
+            serde_json::json!([key]),
+            "registry",
+        ),
+        (
+            serde_json::json!([format!("{reg}/shop/**")]),
+            serde_json::json!(["-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n"]),
+            "key",
+        ),
+    ] {
+        let err = objects
+            .clone()
+            .apply(apply(policy(images, keys)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+        assert!(err.message().contains(want), "{err}");
+    }
+    objects
+        .clone()
+        .apply(apply(policy(
+            serde_json::json!([format!("{reg}/shop/**")]),
+            serde_json::json!([key]),
+        )))
+        .await
+        .unwrap();
+
+    let login =
+        format!(r#"{{"auths": {{"{reg}": {{"username": "bot", "password": "hunter2"}}}}}}"#);
+    apply_json(&m, "Namespace", "shop", serde_json::json!({})).await;
+    let secret = Object {
+        kind: "Secret".into(),
+        namespace: "shop".into(),
+        name: "login".into(),
+        spec_json: serde_json::json!({ "text": login })
+            .to_string()
+            .into_bytes(),
+        ..Default::default()
+    };
+    objects.clone().apply(apply(secret)).await.unwrap();
+    let service = |name: &str, image: &str| Object {
+        kind: "Service".into(),
+        namespace: "shop".into(),
+        name: name.into(),
+        spec_json: serde_json::json!({
+            "replicas": 1,
+            "pod": {
+                "imagePullSecrets": ["login"],
+                "containers": [{ "name": "a", "image": image }],
+            },
+        })
+        .to_string()
+        .into_bytes(),
+        ..Default::default()
+    };
+    objects
+        .clone()
+        .apply(apply(service("web", &image)))
+        .await
+        .unwrap();
+    objects
+        .clone()
+        .apply(apply(service("free", "localhost/free:1")))
+        .await
+        .unwrap();
+
+    let status = |name: &str| {
+        let key = legion_api::ObjectKey::new(Kind::Service, "shop", name);
+        m.store.get(&key).unwrap().unwrap().status["images"].clone()
+    };
+    let tasks_of = |name: &str| {
+        m.store
+            .list(Kind::Task, None)
+            .unwrap()
+            .objects
+            .iter()
+            .filter(|t| t.spec["service"] == name)
+            .count()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !status("web")["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("is unsigned")
+        || tasks_of("free") == 0
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "web {} free {}",
+            status("web"),
+            tasks_of("free")
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let web = status("web");
+    assert_eq!(
+        web["message"],
+        format!("{image} is unsigned (policy shop)"),
+        "{web}"
+    );
+    assert!(web.get("resolved").is_none(), "{web}");
+    assert_eq!(tasks_of("web"), 0);
+    assert!(status("free").get("verified").is_none());
     m.stop().await;
 }

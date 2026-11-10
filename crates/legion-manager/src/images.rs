@@ -11,11 +11,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::time::Duration;
 
-use legion_api::image::{ImageStatus, PullPolicy};
+use legion_api::image::{ImagePolicySpec, ImageStatus, PolicyMode, PullPolicy, Verification};
 use legion_api::job::JobSpec;
 use legion_api::login::{Login, docker_config};
 use legion_api::service::{PodSpec, ServiceSpec};
 use legion_api::{Kind, Object, ObjectKey};
+use legion_image::cosign::{self, PublicKey, Verified, VerifyError};
 use legion_image::{Credentials, Reference};
 use legion_store::{NodeId, Store};
 use sha2::Digest;
@@ -38,6 +39,16 @@ pub trait Registry: Send + Sync {
         reference: &Reference,
         logins: &[Login],
     ) -> impl Future<Output = Result<String, String>> + Send;
+
+    /// Whether the image `digest` in `reference`'s repository carries a
+    /// good signature by one of `keys` (phase 7).
+    fn verify(
+        &self,
+        reference: &Reference,
+        digest: &str,
+        keys: &[PublicKey],
+        logins: &[Login],
+    ) -> impl Future<Output = Result<Verified, VerifyError>> + Send;
 }
 
 /// Registries, over HTTPS; with `loopback`, those on this host over plain
@@ -47,27 +58,171 @@ struct Live {
     loopback: bool,
 }
 
-impl Registry for Live {
-    async fn digest(&self, reference: &Reference, logins: &[Login]) -> Result<String, String> {
-        let creds = Credentials::for_registry(logins, &reference.registry);
+impl Live {
+    /// A plain-HTTP client for `reference`'s registry if it is on this host
+    /// under `loopback`; none for the shared client.
+    fn local_client(&self, reference: &Reference) -> Result<Option<legion_image::Client>, String> {
         let host = reference.host();
         let local =
             self.loopback && (host.starts_with("127.0.0.1:") || host.starts_with("localhost:"));
-        let plain;
-        let client = if local {
-            plain = legion_image::Client::new()
+        if !local {
+            return Ok(None);
+        }
+        Ok(Some(
+            legion_image::Client::new()
                 .map_err(|e| e.to_string())?
-                .plain_http(&reference.registry);
-            &plain
-        } else {
-            &self.client
-        };
-        client
+                .plain_http(&reference.registry),
+        ))
+    }
+}
+
+impl Registry for Live {
+    async fn digest(&self, reference: &Reference, logins: &[Login]) -> Result<String, String> {
+        let creds = Credentials::for_registry(logins, &reference.registry);
+        let local = self.local_client(reference)?;
+        local
+            .as_ref()
+            .unwrap_or(&self.client)
             .document(reference, reference.target(), creds.as_ref())
             .await
             .map(|(digest, _)| digest)
             .map_err(|e| e.to_string())
     }
+
+    async fn verify(
+        &self,
+        reference: &Reference,
+        digest: &str,
+        keys: &[PublicKey],
+        logins: &[Login],
+    ) -> Result<Verified, VerifyError> {
+        let creds = Credentials::for_registry(logins, &reference.registry);
+        let local = self
+            .local_client(reference)
+            .map_err(VerifyError::CannotFetch)?;
+        let client = local.as_ref().unwrap_or(&self.client);
+        cosign::verify(client, reference, digest, keys, creds.as_ref()).await
+    }
+}
+
+/// An `ImagePolicy`, its keys read.
+#[derive(Debug, Clone)]
+pub struct Policy {
+    pub name: String,
+    pub images: Vec<String>,
+    pub keys: Vec<PublicKey>,
+    pub mode: PolicyMode,
+}
+
+/// The cluster's `ImagePolicy` objects, by name. Keys are checked as a
+/// policy is applied; one that does not read here is left out, so a
+/// policy left with none passes nothing.
+fn policies(store: &Store) -> Result<Vec<Policy>, String> {
+    let list = store
+        .list(Kind::ImagePolicy, None)
+        .map_err(|e| e.to_string())?;
+    Ok(list
+        .objects
+        .iter()
+        .filter_map(|o| {
+            let spec: ImagePolicySpec = legion_api::parse(&o.spec).ok()?;
+            Some(Policy {
+                name: o.metadata.name.clone(),
+                images: spec.images,
+                keys: spec
+                    .keys
+                    .iter()
+                    .filter_map(|k| PublicKey::from_pem(k).ok())
+                    .collect(),
+                mode: spec.mode,
+            })
+        })
+        .collect())
+}
+
+/// Checks each of `pod`'s images that a policy covers, as it is to run
+/// (`resolved`, or as written), against every policy covering it. Returns
+/// the good signatures, the failures under policies that enforce (which
+/// hold the pod), and those under policies that warn.
+pub async fn check_signatures<R: Registry>(
+    registry: &R,
+    pod: &PodSpec,
+    resolved: &BTreeMap<String, String>,
+    policies: &[Policy],
+    logins: &[Login],
+) -> (BTreeMap<String, Verification>, Vec<String>, Vec<String>) {
+    let (mut verified, mut held, mut warned) = (BTreeMap::new(), Vec::new(), Vec::new());
+    // Each image once; `never` if any container pulls it so.
+    let mut images: BTreeMap<&str, PullPolicy> = BTreeMap::new();
+    for c in pod.containers() {
+        let pull = images.entry(c.image.as_str()).or_insert(c.pull_policy);
+        if c.pull_policy == PullPolicy::Never {
+            *pull = PullPolicy::Never;
+        }
+    }
+    for (image, pull) in images {
+        let Ok(written) = Reference::parse(image) else {
+            continue;
+        };
+        let name = format!("{}/{}", written.registry, written.repository);
+        let covering: Vec<&Policy> = policies
+            .iter()
+            .filter(|p| {
+                p.images
+                    .iter()
+                    .any(|pat| legion_api::image::matches(pat, &name))
+            })
+            .collect();
+        if covering.is_empty() {
+            continue;
+        }
+        let runs = Reference::parse(legion_api::image::pinned(resolved, image)).ok();
+        let digest = runs.as_ref().and_then(|r| r.digest.clone());
+        let mut good = None;
+        for policy in covering {
+            let failure = if written.is_local() {
+                Some(format!("{image} is local and has no signature"))
+            } else if let Some(digest) = &digest {
+                match registry
+                    .verify(&written, digest, &policy.keys, logins)
+                    .await
+                {
+                    Ok(v) => {
+                        good.get_or_insert(Verification {
+                            digest: digest.clone(),
+                            key: v.fingerprint,
+                        });
+                        None
+                    }
+                    Err(VerifyError::Unsigned) => Some(format!("{image} is unsigned")),
+                    Err(VerifyError::CannotFetch(e)) => {
+                        Some(format!("cannot check the signature of {image}: {e}"))
+                    }
+                    Err(VerifyError::Bad(e)) => Some(format!("bad signature on {image}: {e}")),
+                }
+            } else if pull == PullPolicy::Never {
+                Some(format!(
+                    "{image} runs whatever each node holds by that name (pullPolicy never), \
+                     which no signature covers: name it by digest"
+                ))
+            } else {
+                Some(format!("{image} was not resolved to a digest"))
+            };
+            if let Some(f) = failure {
+                let f = format!("{f} (policy {})", policy.name);
+                match policy.mode {
+                    PolicyMode::Enforce => held.push(f),
+                    PolicyMode::Warn => warned.push(f),
+                }
+                good = None;
+                break;
+            }
+        }
+        if let Some(v) = good {
+            verified.insert(image.to_owned(), v);
+        }
+    }
+    (verified, held, warned)
 }
 
 /// Resolves pods whenever this manager leads, until `closing` turns true.
@@ -220,6 +375,13 @@ pub async fn pass<R: Registry>(
             }
         }
     }
+    let policies = match policies(store) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("image resolver: reading the store: {e}");
+            return;
+        }
+    };
     let now = Instant::now();
     failed.retain(|_, at| now.duration_since(*at) < RETRY);
     for (kind, o) in owners {
@@ -239,24 +401,42 @@ pub async fn pass<R: Registry>(
             continue;
         }
         let namespace = o.metadata.namespace.clone();
-        let outcome = match (rolled_back_to(&o, &hash), logins(store, &namespace, &pod)) {
+        let logins = logins(store, &namespace, &pod);
+        let outcome = match (rolled_back_to(&o, &hash), &logins) {
             (Some(before), _) => Ok(before),
-            (None, Ok(logins)) => resolve(registry, &pod, &logins).await,
-            (None, Err(e)) => Err(e),
+            (None, Ok(logins)) => resolve(registry, &pod, logins).await,
+            (None, Err(e)) => Err(e.clone()),
+        };
+        // What runs is checked against the policies, a rollback's digests
+        // too: a policy made since applies to them.
+        let outcome = match outcome {
+            Ok(resolved) => {
+                let logins = logins.as_deref().unwrap_or_default();
+                let (verified, held, warned) =
+                    check_signatures(registry, &pod, &resolved, &policies, logins).await;
+                if held.is_empty() {
+                    Ok((resolved, verified, warned.join("; ")))
+                } else {
+                    Err(held.join("; "))
+                }
+            }
+            Err(e) => Err(e),
         };
         let status = match outcome {
-            Ok(resolved) => ImageStatus {
+            Ok((resolved, verified, warning)) => ImageStatus {
                 pod: hash.clone(),
                 resolved,
                 message: String::new(),
+                verified,
+                warning,
             },
             Err(message) => {
                 tracing::info!(owner = %key, "{message}");
                 failed.insert((key.clone(), hash.clone()), now);
                 ImageStatus {
                     pod: hash.clone(),
-                    resolved: BTreeMap::new(),
                     message,
+                    ..ImageStatus::default()
                 }
             }
         };
@@ -291,6 +471,183 @@ mod tests {
             }
             self.0.get(&key).cloned().unwrap_or(Err("not found".into()))
         }
+
+        async fn verify(
+            &self,
+            _: &Reference,
+            _: &str,
+            _: &[PublicKey],
+            _: &[Login],
+        ) -> Result<Verified, VerifyError> {
+            Err(VerifyError::Unsigned)
+        }
+    }
+
+    /// Signatures by digest: the fingerprint of the key that made each, or
+    /// a registry that cannot be read.
+    struct Signed {
+        by: BTreeMap<String, String>,
+        down: bool,
+    }
+
+    impl Registry for Signed {
+        async fn digest(&self, _: &Reference, _: &[Login]) -> Result<String, String> {
+            Ok(format!("sha256:{}", "a".repeat(64)))
+        }
+
+        async fn verify(
+            &self,
+            _: &Reference,
+            digest: &str,
+            keys: &[PublicKey],
+            _: &[Login],
+        ) -> Result<Verified, VerifyError> {
+            if self.down {
+                return Err(VerifyError::CannotFetch("503".into()));
+            }
+            match self.by.get(digest) {
+                None => Err(VerifyError::Unsigned),
+                Some(f) if keys.iter().any(|k| k.fingerprint() == f) => Ok(Verified {
+                    fingerprint: f.clone(),
+                }),
+                Some(_) => Err(VerifyError::Bad("no key of the policy made it".into())),
+            }
+        }
+    }
+
+    fn policy(name: &str, images: &[&str], keys: &[&PublicKey], mode: PolicyMode) -> Policy {
+        Policy {
+            name: name.into(),
+            images: images.iter().map(|s| s.to_string()).collect(),
+            keys: keys.iter().map(|k| (*k).clone()).collect(),
+            mode,
+        }
+    }
+
+    #[tokio::test]
+    async fn images_a_policy_covers_run_only_with_a_good_signature() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let good = cosign::PrivateKey::generate().public();
+        let other = cosign::PrivateKey::generate().public();
+        let p = pod(r#"
+containers:
+  - { name: a, image: "ghcr.io/me/app:1" }
+  - { name: b, image: "nginx:1" }
+"#);
+        let resolved = BTreeMap::from([
+            (
+                "ghcr.io/me/app:1".to_owned(),
+                format!("ghcr.io/me/app@{digest}"),
+            ),
+            (
+                "nginx:1".to_owned(),
+                format!("docker.io/library/nginx@{digest}"),
+            ),
+        ]);
+        let signed = Signed {
+            by: BTreeMap::from([(digest.clone(), good.fingerprint().to_owned())]),
+            down: false,
+        };
+        let enforce = [policy(
+            "me",
+            &["ghcr.io/me/*"],
+            &[&good],
+            PolicyMode::Enforce,
+        )];
+        let (verified, held, warned) =
+            check_signatures(&signed, &p, &resolved, &enforce, &[]).await;
+        assert!(held.is_empty() && warned.is_empty(), "{held:?} {warned:?}");
+        // nginx is no policy's: it runs as before, with no entry.
+        assert_eq!(
+            verified,
+            BTreeMap::from([(
+                "ghcr.io/me/app:1".to_owned(),
+                Verification {
+                    digest: digest.clone(),
+                    key: good.fingerprint().to_owned(),
+                }
+            )])
+        );
+
+        // Another key's policy: held, saying so.
+        let wrong = [policy(
+            "me",
+            &["ghcr.io/me/*"],
+            &[&other],
+            PolicyMode::Enforce,
+        )];
+        let (verified, held, _) = check_signatures(&signed, &p, &resolved, &wrong, &[]).await;
+        assert!(verified.is_empty());
+        assert_eq!(
+            held,
+            ["bad signature on ghcr.io/me/app:1: no key of the policy made it (policy me)"]
+        );
+        // Every policy covering an image must be met.
+        let both = [
+            policy("me", &["ghcr.io/me/*"], &[&good], PolicyMode::Enforce),
+            policy("all", &["ghcr.io/**"], &[&other], PolicyMode::Enforce),
+        ];
+        let (_, held, _) = check_signatures(&signed, &p, &resolved, &both, &[]).await;
+        assert_eq!(held.len(), 1, "{held:?}");
+
+        // Unsigned, and a registry that cannot be read.
+        let none = Signed {
+            by: BTreeMap::new(),
+            down: false,
+        };
+        let (_, held, _) = check_signatures(&none, &p, &resolved, &enforce, &[]).await;
+        assert_eq!(held, ["ghcr.io/me/app:1 is unsigned (policy me)"]);
+        let down = Signed {
+            by: signed.by.clone(),
+            down: true,
+        };
+        let (_, held, _) = check_signatures(&down, &p, &resolved, &enforce, &[]).await;
+        assert_eq!(
+            held,
+            ["cannot check the signature of ghcr.io/me/app:1: 503 (policy me)"]
+        );
+
+        // Under warn: it runs, and the status says why it would not.
+        let warn = [policy("me", &["ghcr.io/me/*"], &[&good], PolicyMode::Warn)];
+        let (verified, held, warned) = check_signatures(&none, &p, &resolved, &warn, &[]).await;
+        assert!(verified.is_empty() && held.is_empty());
+        assert_eq!(warned, ["ghcr.io/me/app:1 is unsigned (policy me)"]);
+    }
+
+    #[tokio::test]
+    async fn a_covered_image_by_digest_is_checked_and_a_local_one_refused() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let good = cosign::PrivateKey::generate().public();
+        let signed = Signed {
+            by: BTreeMap::from([(digest.clone(), good.fingerprint().to_owned())]),
+            down: false,
+        };
+        let policies = [policy(
+            "lab",
+            &["ghcr.io/me/**", "localhost/**"],
+            &[&good],
+            PolicyMode::Enforce,
+        )];
+        let by_digest = format!("ghcr.io/me/app@{digest}");
+        let p = pod(&format!(
+            r#"containers: [{{ name: a, image: "{by_digest}" }}]"#
+        ));
+        let (verified, held, _) =
+            check_signatures(&signed, &p, &BTreeMap::new(), &policies, &[]).await;
+        assert!(held.is_empty(), "{held:?}");
+        assert_eq!(verified[&by_digest].digest, digest);
+
+        let p = pod(r#"containers: [{ name: a, image: "localhost/app:1" }]"#);
+        let (_, held, _) = check_signatures(&signed, &p, &BTreeMap::new(), &policies, &[]).await;
+        assert_eq!(
+            held,
+            ["localhost/app:1 is local and has no signature (policy lab)"]
+        );
+
+        // `never` by tag runs what each node holds: no signature binds it.
+        let p = pod(r#"containers: [{ name: a, image: "ghcr.io/me/app:1", pullPolicy: never }]"#);
+        let (_, held, _) = check_signatures(&signed, &p, &BTreeMap::new(), &policies, &[]).await;
+        assert!(held[0].contains("pullPolicy never"), "{held:?}");
     }
 
     fn pod(yaml: &str) -> PodSpec {

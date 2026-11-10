@@ -90,7 +90,7 @@ impl World {
                 .iter()
                 .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
                 .collect(),
-            message: String::new(),
+            ..Default::default()
         };
         if !s.object.status.is_object() {
             s.object.status = serde_json::json!({});

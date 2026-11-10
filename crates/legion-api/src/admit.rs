@@ -113,6 +113,7 @@ pub fn admit(obj: &mut Object) -> Result<(), Error> {
         Kind::Task => return Err(Error::Managed(obj.kind)),
         Kind::RoleBinding => normalise::<crate::rbac::RoleBindingSpec>(spec),
         Kind::NetworkPolicy => normalise::<crate::policy::NetworkPolicySpec>(spec),
+        Kind::ImagePolicy => normalise::<crate::image::ImagePolicySpec>(spec),
         Kind::Job => normalise::<crate::job::JobSpec>(job_defaults(spec, &["pod"])),
         Kind::CronJob => {
             if obj.metadata.name.len() > crate::job::CRON_JOB_NAME_MAX {

@@ -1085,11 +1085,13 @@ fn parse_kind(s: &str) -> anyhow::Result<Kind> {
         return Ok(kind);
     }
     let singular = lower.strip_suffix('s').unwrap_or(&lower);
+    // `policies`, as `NetworkPolicy` and `ImagePolicy` are listed.
+    let ies = lower.strip_suffix("ies").map(|s| format!("{s}y"));
     Kind::ALL
         .into_iter()
         .find(|k| {
             let name = k.as_str().to_ascii_lowercase();
-            name == lower || name == singular
+            name == lower || name == singular || ies.as_deref() == Some(name.as_str())
         })
         .with_context(|| {
             let kinds: Vec<_> = Kind::ALL.iter().map(|k| k.as_str()).collect();

@@ -227,6 +227,9 @@ impl ApiService {
             check_namespace(&desired.metadata.name)?;
         }
         legion_api::admit(&mut desired).map_err(invalid)?;
+        if desired.kind == Kind::ImagePolicy {
+            check_policy_keys(&desired)?;
+        }
         let key = desired.key();
         // Applies that check other objects than their own (quotas, a
         // route's host) take turns, so two cannot pass on the same state;
@@ -436,6 +439,22 @@ fn mounted_by(store: &Store, cur: &Object) -> Result<Option<String>, Status> {
 /// Deleted then, it would come back unheld, for another node to attach
 /// while the first still writes to it. (A ZFS volume's node keeps its
 /// dataset whatever its tasks do, and the Volume may go once they have.)
+/// An `ImagePolicy`'s keys must each read as a P-256 public key: admission
+/// checks only that they are PEM, as the key reader lives in legion-image.
+fn check_policy_keys(policy: &Object) -> Result<(), Status> {
+    let spec: legion_api::image::ImagePolicySpec =
+        legion_api::parse(&policy.spec).map_err(internal)?;
+    for (i, k) in spec.keys.iter().enumerate() {
+        if let Err(e) = legion_image::cosign::PublicKey::from_pem(k) {
+            return Err(Status::invalid_argument(format!(
+                "ImagePolicy {}: spec.keys[{i}]: {e}",
+                policy.metadata.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn check_volume_delete(store: &Store, key: &ObjectKey) -> Result<Option<u64>, Status> {
     use legion_api::volume::{Access, VolumeSpec, VolumeStatus};
     let Some(cur) = store.get(key).map_err(internal)? else {
