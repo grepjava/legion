@@ -1531,7 +1531,13 @@ enforced or warned, an update held with its old tasks running while the
 registry can't be read; the signatures made and checked in one module,
 `legion_image::cosign`, which jailer signs with. jailer's handoff test
 found a covered image by digest or loaded could run before its check;
-it waits now. The
+it waits now. v0.1.18 completes phase 7: revocation (item 2), a user's
+sessions and watches ending within 5 s of their RoleBinding going, a
+follower opening worker streams only once caught up, and a removed
+manager leaving the Raft membership with its certificate refused; and
+the audit trail (item 3), changes, sessions and refusals kept in the
+replicated store where they first arrive, names only, listed with
+`legion audit`. CA rotation is an item of its own, to come. The
 port's `distinfo` is
 made for v0.1.13, and its crates are v0.1.9's, but it has not been through
 `poudriere testport` since v0.1.9. Waiting on the user: the port's
