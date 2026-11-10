@@ -269,6 +269,9 @@ message StatusResponse {
   // read it (legion_api::protocol); 0 from builds before the handshake.
   uint32 protocol = 7;
   uint32 protocol_floor = 8;
+  // This manager's node name, its certificate's; empty from builds before
+  // 0.1.18. The leader reads it to know each member by name.
+  string name = 9;
 }
 
 message Member {

@@ -36,6 +36,8 @@ const APPLY_ATTEMPTS: usize = 5;
 #[derive(Clone)]
 pub struct ApiService {
     pub(crate) id: NodeId,
+    /// This manager's node name, which `status` gives other managers.
+    pub(crate) name: String,
     /// `host:port` peers and forwarded requests reach this manager at.
     pub(crate) advertise: String,
     pub(crate) store: Store,
@@ -546,7 +548,15 @@ pub(crate) fn forwarded_for<T>(inner: T, caller: &Caller) -> Result<Request<T>, 
 
 impl ApiService {
     pub(crate) fn caller<T>(&self, req: &Request<T>) -> Result<Caller, Status> {
-        Caller::of(req, self.peer_tls.is_some())
+        let tls = self.peer_tls.is_some();
+        // A removed manager's certificate is refused, and so is what it
+        // forwards (PLAN.md phase 7); workers never reach the API.
+        if let Some(id) = crate::tls::caller(req, tls)?.filter(|id| id.role == Role::Manager)
+            && let Some(issued) = crate::tls::caller_issued(req, tls)?
+        {
+            crate::removed::check(&self.store, &id.name, issued)?;
+        }
+        Caller::of(req, tls)
     }
 
     /// Deleting a Task that has not ended asks it to stop instead: its
@@ -575,6 +585,12 @@ impl ApiService {
             });
         }
         let recorded = crate::removed::record(self, &key.name).await?;
+        // A manager leaves the Raft membership too, before its Node goes:
+        // it no longer votes, and its calls are refused (PLAN.md phase 7).
+        if let Err(e) = self.leave_membership(&key.name).await {
+            crate::removed::forget(self, &key.name, recorded).await?;
+            return Err(e);
+        }
         let deleted = self
             .write(Command::Delete {
                 key: key.clone(),
@@ -597,6 +613,37 @@ impl ApiService {
             crate::removed::forget(self, &key.name, recorded).await?;
         }
         deleted
+    }
+
+    /// Takes the manager named `name` out of the Raft membership, if it is
+    /// a member: never the last voter.
+    async fn leave_membership(&self, name: &str) -> Result<(), Status> {
+        use openraft::ChangeMembers;
+        let Some(id) = crate::managers::id_of(&self.store, name)? else {
+            return Ok(());
+        };
+        let m = self.store.raft.metrics().borrow().clone();
+        let membership = m.membership_config.membership();
+        let voters: std::collections::BTreeSet<NodeId> = membership.voter_ids().collect();
+        let change = if voters.contains(&id) {
+            if voters.len() == 1 {
+                return Err(Status::failed_precondition(format!(
+                    "manager {name} is the cluster's last voter: it cannot be removed"
+                )));
+            }
+            ChangeMembers::RemoveVoters([id].into())
+        } else if membership.nodes().any(|(n, _)| *n == id) {
+            ChangeMembers::RemoveNodes([id].into())
+        } else {
+            return Ok(());
+        };
+        tracing::info!(manager = name, id, "removing a manager from the membership");
+        let changed = self.store.raft.change_membership(change, false);
+        tokio::time::timeout(crate::COMMIT_TIMEOUT, changed)
+            .await
+            .map_err(|_| crate::no_quorum())?
+            .map_err(|e| Status::unavailable(format!("removing manager {name}: {e}")))?;
+        Ok(())
     }
 
     async fn stop_task(
@@ -1133,6 +1180,7 @@ impl ApiService {
             members,
             protocol: self.speaking.mine.speaks,
             protocol_floor: crate::upgrade::read(&self.store),
+            name: self.name.clone(),
         })
     }
 }

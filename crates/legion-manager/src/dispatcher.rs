@@ -139,11 +139,13 @@ impl DispatcherService {
 
     /// The node a request acts for. Workers act for themselves; managers
     /// for the node they name, or themselves.
-    /// The caller, refused if it is a worker whose node was removed after
+    /// The caller, refused if it is a worker or manager whose node was removed after
     /// its certificate was issued.
     fn caller<T>(&self, req: &Request<T>) -> Result<Option<Identity>, Status> {
         let caller = crate::tls::caller(req, self.tls)?;
-        if let Some(id) = caller.as_ref().filter(|id| id.role == Role::Worker)
+        if let Some(id) = caller
+            .as_ref()
+            .filter(|id| matches!(id.role, Role::Worker | Role::Manager))
             && let Some(issued) = crate::tls::caller_issued(req, self.tls)?
         {
             crate::removed::check(self.store(), &id.name, issued)?;

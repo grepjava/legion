@@ -249,6 +249,11 @@ pub fn digest(cert_pem: &str) -> Result<String> {
     Ok(digest_der(&first_cert_der(cert_pem)?))
 }
 
+/// The identity the first certificate in `cert_pem` names.
+pub fn identity_of_pem(cert_pem: &str) -> Result<Identity> {
+    identity(&first_cert_der(cert_pem)?)
+}
+
 /// The identity a certificate (DER) names.
 pub fn identity(cert_der: &[u8]) -> Result<Identity> {
     let (_, cert) = X509Certificate::from_der(cert_der)

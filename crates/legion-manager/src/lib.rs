@@ -17,6 +17,7 @@ mod dispatcher;
 pub mod hooks;
 pub mod images;
 pub mod join;
+mod managers;
 pub mod metrics;
 mod migrate;
 mod quota;
@@ -53,6 +54,9 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 pub struct ManagerConfig {
     pub data_dir: PathBuf,
+    /// The node name: the certificate's under TLS; without it (tests),
+    /// this, so the leader can still know the managers by name.
+    pub name: String,
     /// `host:port` other managers use to reach this one.
     pub advertise: String,
     pub raft: openraft::Config,
@@ -89,6 +93,7 @@ impl ManagerConfig {
     pub fn new(data_dir: impl Into<PathBuf>, advertise: impl Into<String>) -> ManagerConfig {
         ManagerConfig {
             data_dir: data_dir.into(),
+            name: String::new(),
             advertise: advertise.into(),
             raft: default_raft_config(),
             tls: None,
@@ -138,6 +143,8 @@ pub fn default_raft_config() -> openraft::Config {
 
 pub struct Manager {
     id: NodeId,
+    /// Its node name (see `ManagerConfig::name`).
+    name: String,
     advertise: String,
     store: Store,
     credentials: Option<std::sync::Arc<Credentials>>,
@@ -170,6 +177,12 @@ impl Manager {
             .as_ref()
             .map(|t| Credentials::new(&t.ca_pem, &t.cert_pem, &t.key_pem))
             .transpose()?;
+        let name = match &config.tls {
+            Some(t) => legion_pki::identity_of_pem(&t.cert_pem)
+                .map(|id| id.name)
+                .unwrap_or_default(),
+            None => config.name.clone(),
+        };
         let speaking = upgrade::Speaking::new(config.protocol);
         let heard = upgrade::Heard::default();
         let network = GrpcNetwork::new(credentials.clone(), speaking.clone(), heard.clone());
@@ -184,6 +197,7 @@ impl Manager {
         );
         Ok(Manager {
             id,
+            name,
             advertise: config.advertise,
             credentials,
             ca_key_pem: config.tls.and_then(|t| t.ca_key_pem),
@@ -307,6 +321,7 @@ impl Manager {
         });
         let api = api::ApiService {
             id: self.id,
+            name: self.name.clone(),
             advertise: self.advertise.clone(),
             store: self.store.clone(),
             closing,
@@ -318,6 +333,7 @@ impl Manager {
             protocol: self.protocol,
             speaking: self.speaking.clone(),
         };
+        let names = tokio::spawn(managers::run(api.clone(), api.closing.clone()));
         let (dispatcher, dispatching) = dispatcher::DispatcherService::start(
             api.clone(),
             self.credentials.is_some(),
@@ -415,6 +431,7 @@ impl Manager {
         }
         let _ = promote.await;
         let _ = floor.await;
+        let _ = names.await;
         let _ = dispatching.await;
         tracing::info!("API stopped; shutting down the store");
         *self.metrics.write().unwrap_or_else(|e| e.into_inner()) = None;

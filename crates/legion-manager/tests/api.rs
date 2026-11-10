@@ -63,7 +63,7 @@ impl Running {
         let tls = ca.map(|ca| {
             let node = ca
                 .issue(
-                    &Identity::new(&format!("m{addr}"), Role::Manager),
+                    &Identity::new(&manager_name(&addr), Role::Manager),
                     CERT_LIFETIME,
                 )
                 .unwrap();
@@ -182,6 +182,7 @@ impl Running {
             tls,
             heartbeat,
             registry_loopback: true,
+            name: manager_name(&addr),
             ..ManagerConfig::new(dir.path(), &addr)
         };
         Running::serve_config(dir, listener, config, admin).await
@@ -4664,4 +4665,144 @@ async fn a_follower_cut_off_from_the_leader_opens_no_worker_stream() {
     let refused = endpoints(&follower).await.unwrap_err();
     assert_eq!(refused.code(), Code::Unavailable, "{refused}");
     follower.stop().await;
+}
+
+/// Deleting a manager's Node removes the manager (PLAN.md phase 7): it
+/// leaves the Raft membership, so it votes no more and its Raft calls are
+/// refused, and its certificate is refused on the API, as a removed
+/// worker's is. The leader knows each manager by name from what it says.
+/// The cluster's last voter cannot be removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_manager_leaves_the_membership_and_is_refused() {
+    use legion_api::{Kind, Object as Stored};
+    let ca = Ca::generate().unwrap();
+    let first = Running::start_with(Some(&ca)).await;
+    first.cluster().await.init(InitRequest {}).await.unwrap();
+    let token = first
+        .cluster()
+        .await
+        .join_token(JoinTokenRequest {
+            role: "manager".into(),
+            rotate: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    let admin = creds(&ca, "admin", Role::Admin);
+    let second = Running::join(&first.addr, &token, "m2", admin.clone()).await;
+    let third = Running::join(&first.addr, &token, "m3", admin).await;
+    let status = || async {
+        first
+            .cluster()
+            .await
+            .status(StatusRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+    };
+    let voters =
+        |s: &legion_proto::v1::StatusResponse| s.members.iter().filter(|m| m.voter).count();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while voters(&status().await) != 3 {
+        assert!(tokio::time::Instant::now() < deadline, "three voters");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Each says its name: the leader records them all.
+    let first_name = status().await.name;
+    assert_eq!(first_name, manager_name(&first.addr));
+    let names = || {
+        let key = legion_api::ObjectKey::new(Kind::Config, "legion-system", "managers");
+        first
+            .store
+            .get(&key)
+            .unwrap()
+            .map(|o| o.spec["text"].as_str().unwrap_or_default().to_owned())
+            .unwrap_or_default()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !["\"m2\"", "\"m3\"", &format!("\"{first_name}\"")]
+        .iter()
+        .all(|n| names().contains(n))
+    {
+        assert!(tokio::time::Instant::now() < deadline, "names: {}", names());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Each manager's agent registers a Node of its name.
+    for name in [first_name.as_str(), "m2", "m3"] {
+        let mut node = Stored::new(Kind::Node, "", name, serde_json::json!({}));
+        node.status = serde_json::json!({ "state": "ready" });
+        first
+            .store
+            .raft
+            .client_write(legion_store::Command::Put {
+                object: node,
+                precondition: legion_store::Precondition::None,
+            })
+            .await
+            .unwrap();
+    }
+    // m3's certificate, as it had it before.
+    let old_m3 = creds(&ca, "m3", Role::Manager);
+    let node = |name: &str| DeleteRequest {
+        r#ref: Some(ObjectRef {
+            kind: "Node".into(),
+            namespace: String::new(),
+            name: name.into(),
+        }),
+        expected_version: None,
+    };
+    let mut objects = first.objects().await;
+    objects.delete(node("m3")).await.unwrap();
+    let s = status().await;
+    assert_eq!(voters(&s), 2, "{s:?}");
+    let third_id = third
+        .cluster()
+        .await
+        .status(StatusRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .node_id;
+    assert!(
+        !s.members.iter().any(|m| m.id == third_id),
+        "m3 is no member: {s:?}"
+    );
+    // Its certificate is refused, by the API and for what it forwards.
+    let mut as_m3 = ObjectsClient::new(first.channel(Some(&old_m3)).await.unwrap());
+    let why = denied(
+        as_m3
+            .list(ListRequest {
+                kind: "Service".into(),
+                ..Default::default()
+            })
+            .await,
+    );
+    assert!(why.contains("node m3 was removed"), "{why}");
+    // The two left go on.
+    eventually(|| {
+        let mut objects = objects.clone();
+        async move { objects.apply(apply(service("web", 1))).await }
+    })
+    .await;
+
+    // Down to one, which is the last voter: it stays.
+    objects.delete(node("m2")).await.unwrap();
+    assert_eq!(voters(&status().await), 1);
+    let refused = objects.delete(node(&first_name)).await.unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+    assert!(refused.message().contains("last voter"), "{refused}");
+    let key = legion_api::ObjectKey::new(Kind::Node, "", &first_name);
+    assert!(first.store.get(&key).unwrap().is_some(), "its Node stays");
+    // The cluster goes on.
+    objects.apply(apply(service("web", 2))).await.unwrap();
+    third.stop().await;
+    second.stop().await;
+    first.stop().await;
+}
+
+/// A test manager's node name, from the address it listens on: `m-<port>`.
+fn manager_name(addr: &str) -> String {
+    format!("m-{}", addr.rsplit(':').next().unwrap_or_default())
 }
