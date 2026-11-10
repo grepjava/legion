@@ -1524,7 +1524,14 @@ v0.1.16 completes phase 6 of PLAN.md: a Volume's move cut short at each
 stage or held by a full disk loses nothing (item 3), tested on the fake
 host and on the lab's ZFS with Postgres and with a jailer image; and the
 restore drill (item 4) rebuilds Postgres on replacement hosts from its
-three backups, 511 s on the lab, every stage timed. The
+three backups, 511 s on the lab, every stage timed. v0.1.17 has image
+signature policies (phase 7, item 1): an `ImagePolicy` runs an image it
+covers only with a good cosign key-pair signature by one of its keys,
+enforced or warned, an update held with its old tasks running while the
+registry can't be read; the signatures made and checked in one module,
+`legion_image::cosign`, which jailer signs with. jailer's handoff test
+found a covered image by digest or loaded could run before its check;
+it waits now. The
 port's `distinfo` is
 made for v0.1.13, and its crates are v0.1.9's, but it has not been through
 `poudriere testport` since v0.1.9. Waiting on the user: the port's
