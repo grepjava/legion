@@ -1105,3 +1105,35 @@ fn every_manager_seals_its_keys_once_autolock_is_on() {
     wait_sealed(&second, true);
     assert_eq!(ok(&first, &["autolock", "show"]).trim(), key);
 }
+
+/// `legion audit` lists what was changed and refused, newest last, and
+/// narrows it by actor, action or namespace (PLAN.md phase 7).
+#[test]
+fn the_audit_trail_lists_changes_and_narrows() {
+    let d = start_daemon();
+    ok(&d, &["init"]);
+    namespace(&d, "kept");
+    let events = || -> Vec<serde_json::Value> {
+        let out = ok(&d, &["audit", "--action", "apply", "-o", "json"]);
+        serde_json::from_str(&out).unwrap()
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let listed = loop {
+        let listed = events();
+        if !listed.is_empty() {
+            break listed;
+        }
+        assert!(Instant::now() < deadline, "no audit events");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let e = &listed[0];
+    assert_eq!(e["action"], "apply");
+    assert_eq!(e["target"]["kind"], "Namespace");
+    assert_eq!(e["target"]["name"], "kept");
+    assert_eq!(e["result"], "ok");
+    assert_eq!(e["actor"]["kind"], "admin");
+    let none = ok(&d, &["audit", "--actor", "nobody", "-o", "json"]);
+    assert_eq!(none.trim(), "[]");
+    let table = ok(&d, &["audit", "--since", "1h"]);
+    assert!(table.contains("Namespace/kept"), "{table}");
+}

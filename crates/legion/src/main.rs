@@ -95,6 +95,12 @@ enum Command {
         /// path can read and change what is pulled. Set it on every node.
         #[arg(long = "insecure-registry", value_parser = registry_host)]
         insecure_registries: Vec<String>,
+        /// Managers: how many days audit events are kept.
+        #[arg(long, default_value_t = 30)]
+        audit_retention_days: u64,
+        /// Managers: the most audit events kept; the oldest go first.
+        #[arg(long, default_value_t = 100_000)]
+        audit_max_events: u64,
         /// Workers: a manager to call, `host:port` (repeatable). Defaults to
         /// the managers recorded at join and learned since.
         #[arg(long = "manager")]
@@ -287,6 +293,36 @@ enum Command {
         service: String,
         #[arg(short, long)]
         namespace: Option<String>,
+    },
+    /// The audit trail, oldest first: who changed what, opened which
+    /// sessions, and what was refused (the cluster admin's only). Events
+    /// name objects, never what they hold.
+    Audit {
+        /// Only events this recent, e.g. `30m`, `24h`.
+        #[arg(long)]
+        since: Option<legion_api::quantity::Duration>,
+        /// Only this caller's, by the name in their certificate.
+        #[arg(long)]
+        actor: Option<String>,
+        /// Only this action: apply, delete, exec, logs, port-forward,
+        /// init, join, join-token, issue-user, volume-backup,
+        /// volume-restore, autolock.
+        #[arg(long)]
+        action: Option<String>,
+        /// Only objects in this namespace.
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// Only objects of this kind.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Only refusals.
+        #[arg(long)]
+        denied: bool,
+        /// At most this many events.
+        #[arg(long, default_value_t = 1000)]
+        limit: u32,
+        #[arg(short, long, value_enum, default_value_t = cli::Format::Table)]
+        output: cli::Format,
     },
     /// The cluster live in the terminal: nodes, services and Jobs, tasks,
     /// what they use, and what changes.
@@ -559,6 +595,8 @@ async fn run() -> anyhow::Result<()> {
             linux,
             volume_plugins,
             insecure_registries,
+            audit_retention_days,
+            audit_max_events,
         } => {
             let vip = match (vip, vip_interface, vip_password_file) {
                 (Some(addr), Some(interface), Some(file)) => {
@@ -592,6 +630,11 @@ async fn run() -> anyhow::Result<()> {
                 linux,
                 volume_plugins,
                 insecure_registries,
+                audit: legion_manager::AuditRetention {
+                    age: std::time::Duration::from_secs(audit_retention_days * 24 * 3600),
+                    events: audit_max_events,
+                    ..Default::default()
+                },
             })
             .await
         }

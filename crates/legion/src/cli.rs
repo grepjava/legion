@@ -316,6 +316,45 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             .await?;
             print_status(&status.into_inner())
         }
+        Command::Audit {
+            since,
+            actor,
+            action,
+            namespace,
+            kind,
+            denied,
+            limit,
+            output,
+        } => {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            let filter = legion_api::audit::Filter {
+                since_ms: since.map_or(0, |d| now_ms.saturating_sub(d.millis())),
+                actor: actor.unwrap_or_default(),
+                action: action.unwrap_or_default(),
+                namespace: namespace.unwrap_or_default(),
+                kind: kind.unwrap_or_default(),
+                result: denied.then_some(legion_api::audit::Outcome::Denied),
+            };
+            let answer = cluster
+                .audit(pb::AuditRequest {
+                    filter_json: serde_json::to_vec(&filter)?,
+                    limit,
+                })
+                .await?
+                .into_inner();
+            let events = answer
+                .events_json
+                .iter()
+                .map(|e| serde_json::from_slice(e))
+                .collect::<Result<Vec<legion_api::audit::AuditEvent>, _>>()
+                .context("reading the audit events")?;
+            print_audit(&events, output)?;
+            if answer.truncated {
+                eprintln!("more events matched than --limit {limit}: narrow it, or use --since");
+            }
+        }
         Command::JoinToken { role, rotate } => {
             let token = cluster
                 .join_token(pb::JoinTokenRequest { role, rotate })
@@ -1397,6 +1436,43 @@ fn print_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) {
     for row in rows {
         line(row.iter().map(String::as_str).collect());
     }
+}
+
+/// Audit events as a table, YAML or JSON.
+fn print_audit(events: &[legion_api::audit::AuditEvent], format: Format) -> anyhow::Result<()> {
+    match format {
+        Format::Json => println!("{}", serde_json::to_string_pretty(events)?),
+        Format::Yaml => print!("{}", serde_yaml_ng::to_string(events)?),
+        Format::Table => {
+            println!(
+                "TIME                  ACTOR               ACTION          TARGET                                   RESULT  MESSAGE"
+            );
+            for e in events {
+                let time = legion_api::clock::format((e.time_ms / 1000) as i64);
+                let actor = match e.actor.name.as_str() {
+                    "" => e.actor.kind.clone(),
+                    name => format!("{}:{name}", e.actor.kind),
+                };
+                let target = [
+                    e.target.kind.as_str(),
+                    e.target.namespace.as_str(),
+                    e.target.name.as_str(),
+                ]
+                .iter()
+                .filter(|s| !s.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join("/");
+                println!(
+                    "{time:<21} {actor:<19} {action:<15} {target:<40} {result:<7} {message}",
+                    action = e.action,
+                    result = e.result.as_str(),
+                    message = e.message,
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn print_status(s: &StatusResponse) {

@@ -36,6 +36,8 @@ pub struct Options {
     /// Registries (`host[:port]`) reached over plain HTTP: by the managers
     /// resolving tags, and by the node pulling.
     pub insecure_registries: Vec<String>,
+    /// How long the manager keeps audit events, and how many.
+    pub audit: legion_manager::AuditRetention,
 }
 
 pub async fn run(opts: Options) -> anyhow::Result<()> {
@@ -82,6 +84,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         vip,
         store_key: Some(store_key),
         insecure_registries: opts.insecure_registries.clone(),
+        audit: opts.audit,
         ..legion_manager::ManagerConfig::new(&opts.data_dir, &advertise)
     })
     .await
