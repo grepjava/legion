@@ -4421,3 +4421,180 @@ async fn an_image_policy_holds_an_unsigned_image() {
     assert!(status("free").get("verified").is_none());
     m.stop().await;
 }
+
+/// A user's session open when their RoleBinding goes ends with it, as a
+/// removed worker's streams do: the rights are checked again every few
+/// seconds, not only as it opens (PLAN.md phase 7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_users_session_ends_when_their_binding_goes() {
+    use legion_proto::v1::SessionsRequest;
+    use tokio_stream::StreamExt;
+    let ca = Ca::generate().unwrap();
+    let m = Running::start_with(Some(&ca)).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+
+    // A worker, w1, which stays ready while the test runs.
+    let w1 = DispatcherClient::new(
+        m.channel(Some(&creds(&ca, "w1", Role::Worker)))
+            .await
+            .unwrap(),
+    );
+    eventually(|| {
+        let mut d = w1.clone();
+        async move {
+            d.register(RegisterRequest {
+                node: String::new(),
+                status_json: br#"{"state":"ready"}"#.to_vec(),
+                role: String::new(),
+            })
+            .await
+        }
+    })
+    .await;
+    let beating = {
+        let mut d = w1.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = d
+                    .heartbeat(HeartbeatRequest {
+                        node: String::new(),
+                        usage: Vec::new(),
+                    })
+                    .await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+    };
+
+    // A task running on it, in a namespace alice may edit.
+    let mut admin = m.objects().await;
+    admin
+        .apply(object("Namespace", "", "shop", serde_json::json!({})))
+        .await
+        .unwrap();
+    admin.apply(binding("shop", "alice", "edit")).await.unwrap();
+    let mut task = legion_api::Object::new(
+        legion_api::Kind::Task,
+        "shop",
+        "web-1-1",
+        serde_json::json!({
+            "service": "web",
+            "serviceUid": "0000000000000001",
+            "serviceGeneration": 1,
+            "slot": 1,
+            "node": "w1",
+            "desiredState": "running",
+            "pod": { "containers": [{ "name": "app", "image": "app:1" }] },
+        }),
+    );
+    task.status = serde_json::json!({ "state": "running" });
+    m.store
+        .raft
+        .client_write(legion_store::Command::Put {
+            object: task,
+            precondition: legion_store::Precondition::None,
+        })
+        .await
+        .unwrap();
+
+    // alice execs into it; the worker takes the session and answers.
+    let mut offers = w1
+        .clone()
+        .sessions(SessionsRequest {
+            node: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let alice = PodsClient::new(
+        m.channel(Some(&creds(&ca, "alice", Role::User)))
+            .await
+            .unwrap(),
+    );
+    let open = SessionFrame {
+        frame: Some(Frame::Open(SessionOpen {
+            namespace: "shop".into(),
+            task: "web-1-1".into(),
+            container: String::new(),
+            action: Some(Action::Exec(ExecOptions {
+                command: vec!["sh".into()],
+                stdin: true,
+                tty: false,
+                ..Default::default()
+            })),
+        })),
+    };
+    // Her input stays open: the session lasts until something ends it.
+    let (_input, held) = tokio::sync::mpsc::channel::<SessionFrame>(1);
+    let input = tokio_stream::iter([open]).chain(tokio_stream::wrappers::ReceiverStream::new(held));
+    let mut opened = tokio::spawn({
+        let mut alice = alice.clone();
+        async move { alice.session(input).await }
+    });
+    let offer = tokio::select! {
+        o = offers.message() => o.unwrap().expect("an offer"),
+        r = &mut opened => panic!("the session ended before it was offered: {:?}", r.unwrap().err()),
+        () = tokio::time::sleep(Duration::from_secs(10)) => panic!("no offer"),
+    };
+    let (to_manager, from_worker) = tokio::sync::mpsc::channel::<SessionFrame>(4);
+    to_manager
+        .send(SessionFrame {
+            frame: Some(Frame::Attach(offer.id)),
+        })
+        .await
+        .unwrap();
+    let mut attached = w1
+        .clone()
+        .attach(tokio_stream::wrappers::ReceiverStream::new(from_worker))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut session = opened.await.unwrap().unwrap().into_inner();
+    to_manager
+        .send(SessionFrame {
+            frame: Some(Frame::Stdout(b"hello\n".to_vec())),
+        })
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(10), session.message())
+        .await
+        .expect("output reaches alice")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.frame, Some(Frame::Stdout(b"hello\n".to_vec())));
+
+    // Her binding goes: the session ends, saying why, and so does the
+    // worker's side of it.
+    admin
+        .delete(DeleteRequest {
+            r#ref: Some(get("RoleBinding", "shop", "alice")),
+            expected_version: None,
+        })
+        .await
+        .unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match session.message().await {
+                Ok(Some(_)) => continue,
+                other => return other,
+            }
+        }
+    })
+    .await
+    .expect("the session ends");
+    let why = denied(ended);
+    assert!(why.contains("alice"), "{why}");
+    let gone = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match attached.message().await {
+                Ok(Some(_)) => continue,
+                other => return other,
+            }
+        }
+    })
+    .await
+    .expect("the worker's side ends too");
+    assert!(!matches!(gone, Ok(Some(_))));
+    beating.abort();
+    m.stop().await;
+}

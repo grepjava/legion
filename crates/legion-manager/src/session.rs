@@ -238,6 +238,7 @@ impl Pods for PodsService {
                     .unwrap_or_default()
             )));
         }
+        let namespace = open.namespace.clone();
         let offer = SessionOffer {
             id: legion_pki::random_secret(),
             open: Some(open),
@@ -252,10 +253,22 @@ impl Pods for PodsService {
             }
         };
         let (to_user, rx) = mpsc::channel(16);
+        // The caller's rights are checked again every few seconds, as a
+        // removed worker's streams are: a session ends once they're gone.
+        let store = self.api.store.clone();
+        let revoked = async move {
+            loop {
+                tokio::time::sleep(crate::authz::REVOCATION_CHECK).await;
+                if let Err(e) = caller.check(&store, verb, Kind::Task, &namespace) {
+                    return e;
+                }
+            }
+        };
         tokio::spawn(relay(
             from_user,
             to_user,
             attachment,
+            revoked,
             self.api.closing.clone(),
         ));
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -393,12 +406,14 @@ fn container(spec: &TaskSpec, asked: &str, task: &str) -> Result<String, Status>
 }
 
 /// Carries input from the user to the agent and output back, until either
-/// side ends or the manager shuts down. Dropping the agent's streams ends
-/// the session there.
+/// side ends, `revoked` resolves (the user may no longer: it ends with why),
+/// or the manager shuts down. Dropping the agent's streams ends the session
+/// there.
 async fn relay(
     mut from_user: Streaming<SessionFrame>,
     to_user: mpsc::Sender<Result<SessionFrame, Status>>,
     agent: Attachment,
+    revoked: impl std::future::Future<Output = Status>,
     mut closing: tokio::sync::watch::Receiver<bool>,
 ) {
     let Attachment {
@@ -488,6 +503,10 @@ async fn relay(
         () = to_user.closed() => false,
         // The attach ended on the manager's side: its node was removed.
         () = to_agent.closed() => false,
+        e = revoked => {
+            let _ = to_user.send(Err(e)).await;
+            false
+        }
         () = shutdown(&mut closing) => true,
     };
     if shutting_down {

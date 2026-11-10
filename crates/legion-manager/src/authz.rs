@@ -1,14 +1,21 @@
-//! RBAC (DESIGN.md §4.2): what an API caller may do. The manager a request
-//! reaches first decides, before forwarding it, and forwards a user's
-//! request with the user's name, so the leader decides again on its own
-//! state, which a follower's may trail.
+//! RBAC (DESIGN.md §4.2): what an API caller may do. A follower forwards a
+//! user's request with the user's name and the leader decides, on its own
+//! state, which a follower's may trail; what a follower serves itself
+//! (watches, sessions) it serves once it has caught up with the leader.
 //!
 //! The cluster admin and managers may do everything. A user may act only
 //! in namespaces where a RoleBinding names them, as far as its role goes,
 //! and never on cluster-scoped objects. Rights live in the bindings, not
-//! the certificate, so deleting a binding takes them away at once.
+//! the certificate, so deleting a binding takes them away at once: a
+//! request after it is refused, and a stream open before it ends within
+//! [`REVOCATION_CHECK`].
 
 use std::fmt;
+use std::time::Duration;
+
+/// How often a stream checks again that its caller may still have it: a
+/// user's session or watch, a worker's streams.
+pub(crate) const REVOCATION_CHECK: Duration = Duration::from_secs(5);
 
 use legion_api::Kind;
 use legion_api::rbac::{NamespaceRole, RoleBindingSpec};

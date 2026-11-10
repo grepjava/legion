@@ -164,7 +164,7 @@ impl DispatcherService {
                 return std::future::pending().await;
             };
             loop {
-                tokio::time::sleep(REVOCATION_CHECK).await;
+                tokio::time::sleep(crate::authz::REVOCATION_CHECK).await;
                 if let Err(e) = crate::removed::check(&store, &node, issued) {
                     return e;
                 }
@@ -1318,7 +1318,6 @@ impl Dispatcher for DispatcherService {
 }
 
 /// How often a worker's streams check that its node was not removed.
-const REVOCATION_CHECK: Duration = Duration::from_secs(5);
 
 /// Resolves, with the refusal, when the caller's node is removed.
 type Removal = Pin<Box<dyn Future<Output = Status> + Send>>;
