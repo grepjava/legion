@@ -97,106 +97,121 @@ impl Volumes for VolumesService {
     type BackupStream = Chunks;
 
     async fn backup(&self, req: Request<VolumeBackupRequest>) -> Result<Response<Chunks>, Status> {
-        let caller = self.api.caller(&req)?;
-        if let Some(mut leader) = self.leader(&req)? {
-            let mut chunks = leader
-                .backup(forwarded_for(req.into_inner(), &caller)?)
-                .await?
-                .into_inner();
+        let audit = self.api.audit_point(
+            &req,
+            "volume-backup",
+            crate::audit::target("Volume", &req.get_ref().namespace, &req.get_ref().name),
+        );
+        let result = async {
+            let caller = self.api.caller(&req)?;
+            if let Some(mut leader) = self.leader(&req)? {
+                let mut chunks = leader
+                    .backup(forwarded_for(req.into_inner(), &caller)?)
+                    .await?
+                    .into_inner();
+                let (tx, rx) = mpsc::channel(4);
+                tokio::spawn(async move {
+                    while let Some(chunk) = chunks.next().await {
+                        let last = chunk.is_err();
+                        if tx.send(chunk).await.is_err() || last {
+                            return;
+                        }
+                    }
+                });
+                return Ok(Response::new(ReceiverStream::new(rx)));
+            }
+            let VolumeBackupRequest { namespace, name } = req.into_inner();
+            let namespace = if namespace.is_empty() {
+                "default".to_owned()
+            } else {
+                namespace
+            };
+            check_namespace(&namespace)?;
+            self.api.consistent().await?;
+            // Its data may be anything its tasks keep: as much as exec gives.
+            caller.check(&self.api.store, Verb::Write, Kind::Volume, &namespace)?;
+            let key = ObjectKey::new(Kind::Volume, &namespace, &name);
+            let (o, spec, status) = self.volume(&key)?.ok_or_else(|| {
+                Status::not_found(format!("no volume {name} in namespace {namespace}"))
+            })?;
+            if spec.driver != VolumeDriver::Zfs {
+                return Err(Status::failed_precondition(format!(
+                    "volume {name} is {}: its data is backed up where it is kept",
+                    spec.driver.as_str()
+                )));
+            }
+            if status.node.is_empty() {
+                return Err(Status::failed_precondition(format!(
+                    "volume {name} has no data yet: no task has used it"
+                )));
+            }
+            let header = VolumeBackupHeader {
+                format: VolumeBackupHeader::FORMAT,
+                namespace: namespace.clone(),
+                name: name.clone(),
+                labels: o.metadata.labels.clone(),
+                spec,
+                node: status.node.clone(),
+                taken: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+                consistency: VolumeBackupHeader::CRASH_CONSISTENT.to_owned(),
+            };
+            let header = serde_json::to_vec(&header).map_err(internal)?;
+            let Attachment { mut from_agent, .. } = self
+                .attach(
+                    &status.node,
+                    &namespace,
+                    Action::VolumeExport(VolumeExport {
+                        volume: name.clone(),
+                    }),
+                )
+                .await?;
+            tracing::info!(volume = %key, node = %status.node, "backing up a volume");
             let (tx, rx) = mpsc::channel(4);
             tokio::spawn(async move {
-                while let Some(chunk) = chunks.next().await {
-                    let last = chunk.is_err();
-                    if tx.send(chunk).await.is_err() || last {
-                        return;
-                    }
-                }
-            });
-            return Ok(Response::new(ReceiverStream::new(rx)));
-        }
-        let VolumeBackupRequest { namespace, name } = req.into_inner();
-        let namespace = if namespace.is_empty() {
-            "default".to_owned()
-        } else {
-            namespace
-        };
-        check_namespace(&namespace)?;
-        self.api.consistent().await?;
-        // Its data may be anything its tasks keep: as much as exec gives.
-        caller.check(&self.api.store, Verb::Write, Kind::Volume, &namespace)?;
-        let key = ObjectKey::new(Kind::Volume, &namespace, &name);
-        let (o, spec, status) = self.volume(&key)?.ok_or_else(|| {
-            Status::not_found(format!("no volume {name} in namespace {namespace}"))
-        })?;
-        if spec.driver != VolumeDriver::Zfs {
-            return Err(Status::failed_precondition(format!(
-                "volume {name} is {}: its data is backed up where it is kept",
-                spec.driver.as_str()
-            )));
-        }
-        if status.node.is_empty() {
-            return Err(Status::failed_precondition(format!(
-                "volume {name} has no data yet: no task has used it"
-            )));
-        }
-        let header = VolumeBackupHeader {
-            format: VolumeBackupHeader::FORMAT,
-            namespace: namespace.clone(),
-            name: name.clone(),
-            labels: o.metadata.labels.clone(),
-            spec,
-            node: status.node.clone(),
-            taken: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs()),
-            consistency: VolumeBackupHeader::CRASH_CONSISTENT.to_owned(),
-        };
-        let header = serde_json::to_vec(&header).map_err(internal)?;
-        let Attachment { mut from_agent, .. } = self
-            .attach(
-                &status.node,
-                &namespace,
-                Action::VolumeExport(VolumeExport {
-                    volume: name.clone(),
-                }),
-            )
-            .await?;
-        tracing::info!(volume = %key, node = %status.node, "backing up a volume");
-        let (tx, rx) = mpsc::channel(4);
-        tokio::spawn(async move {
-            if tx.send(Ok(BackupChunk { data: header })).await.is_err() {
-                return;
-            }
-            let end = loop {
-                let data = match from_agent.next().await {
-                    Some(Ok(SessionFrame {
-                        frame: Some(Frame::Stdout(data)),
-                    })) => data,
-                    Some(Ok(SessionFrame {
-                        frame: Some(Frame::ExitCode(0)),
-                    })) => return,
-                    Some(Ok(SessionFrame {
-                        frame: Some(Frame::Error(e)),
-                    })) => {
-                        break Status::unavailable(format!("the node failed: {}", e.message));
-                    }
-                    Some(Ok(_)) => continue,
-                    Some(Err(e)) => break e,
-                    None => break Status::unavailable("the node's stream ended early"),
-                };
-                if tx.send(Ok(BackupChunk { data })).await.is_err() {
+                if tx.send(Ok(BackupChunk { data: header })).await.is_err() {
                     return;
                 }
-            };
-            let _ = tx.send(Err(end)).await;
-        });
-        Ok(Response::new(ReceiverStream::new(rx)))
+                let end = loop {
+                    let data = match from_agent.next().await {
+                        Some(Ok(SessionFrame {
+                            frame: Some(Frame::Stdout(data)),
+                        })) => data,
+                        Some(Ok(SessionFrame {
+                            frame: Some(Frame::ExitCode(0)),
+                        })) => return,
+                        Some(Ok(SessionFrame {
+                            frame: Some(Frame::Error(e)),
+                        })) => {
+                            break Status::unavailable(format!("the node failed: {}", e.message));
+                        }
+                        Some(Ok(_)) => continue,
+                        Some(Err(e)) => break e,
+                        None => break Status::unavailable("the node's stream ended early"),
+                    };
+                    if tx.send(Ok(BackupChunk { data })).await.is_err() {
+                        return;
+                    }
+                };
+                let _ = tx.send(Err(end)).await;
+            });
+            Ok(Response::new(ReceiverStream::new(rx)))
+        }
+        .await;
+        self.api.audit_end(audit, result)
     }
 
     async fn restore(
         &self,
         req: Request<Streaming<VolumeRestoreChunk>>,
     ) -> Result<Response<VolumeRestoreResponse>, Status> {
+        let audit = self.api.audit_point(
+            &req,
+            "volume-restore",
+            crate::audit::target("Volume", "", ""),
+        );
+        let result = async {
         let caller = self.api.caller(&req)?;
         let leader = self.leader(&req)?;
         let mut from_user = req.into_inner();
@@ -362,6 +377,9 @@ impl Volumes for VolumesService {
                 "volume {name} was made in namespace {namespace} as it was restored; the data restored on {node} is under its name"
             ))),
         }
+    }
+        .await;
+        self.api.audit_end(audit, result)
     }
 }
 

@@ -12,6 +12,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 pub mod admit;
+pub mod audit;
 pub mod clock;
 pub mod compose;
 pub mod cron;

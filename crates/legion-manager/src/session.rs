@@ -185,6 +185,7 @@ impl Pods for PodsService {
         &self,
         req: Request<Streaming<SessionFrame>>,
     ) -> Result<Response<Frames>, Status> {
+        let actor = crate::audit::actor(&req, self.api.peer_tls.is_some());
         let caller = self.api.caller(&req)?;
         let mut from_user = req.into_inner();
         let open = match tokio::time::timeout(OPEN_TIMEOUT, from_user.next()).await {
@@ -214,64 +215,75 @@ impl Pods for PodsService {
             }
             None => return Err(Status::invalid_argument("the session needs an action")),
         };
-        // A follower serves sessions from its own replica (its agents
-        // attach to it), which may lag the leader or be cut off from it:
-        // RoleBindings revoked there still let the caller in. So the
-        // replica first catches up with the leader, which confirms it
-        // still leads; cut off, the session is refused.
-        self.api.consistent().await?;
-        caller.check(&self.api.store, verb, Kind::Task, &open.namespace)?;
-        let task = self.task(&open, verb == Verb::Read)?;
-        let spec: TaskSpec = legion_api::parse(&task.spec).map_err(internal)?;
-        let status: TaskStatus = serde_json::from_value(task.status.clone()).unwrap_or_default();
-        open.task = task.metadata.name.clone();
-        open.container = container(&spec, &open.container, &open.task)?;
-        been_on_node(&spec, &status, &open.task)?;
-        let interactive = !matches!(open.action, Some(Action::Logs(_)));
-        if interactive && status.state != TaskState::Running {
-            return Err(Status::failed_precondition(format!(
-                "task {} is {}, not running",
-                open.task,
-                serde_json::to_value(status.state)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .unwrap_or_default()
-            )));
-        }
-        let namespace = open.namespace.clone();
-        let offer = SessionOffer {
-            id: legion_pki::random_secret(),
-            open: Some(open),
-            task_uid: task.metadata.uid.clone(),
-            pod_ip: status.ip.unwrap_or_default(),
+        let action = match open.action {
+            Some(Action::Logs(_)) => "logs",
+            Some(Action::Port(_)) => "port-forward",
+            _ => "exec",
         };
-        let mut closing = self.api.closing.clone();
-        let attachment = tokio::select! {
-            a = self.api.sessions.offer(&spec.node, offer) => a?,
-            _ = closing.wait_for(|c| *c) => {
-                return Err(Status::unavailable("the manager is shutting down"));
+        let target = crate::audit::target("Task", &open.namespace, &open.task);
+        let opened = async {
+            // A follower serves sessions from its own replica (its agents
+            // attach to it), which may lag the leader or be cut off from it:
+            // RoleBindings revoked there still let the caller in. So the
+            // replica first catches up with the leader, which confirms it
+            // still leads; cut off, the session is refused.
+            self.api.consistent().await?;
+            caller.check(&self.api.store, verb, Kind::Task, &open.namespace)?;
+            let task = self.task(&open, verb == Verb::Read)?;
+            let spec: TaskSpec = legion_api::parse(&task.spec).map_err(internal)?;
+            let status: TaskStatus =
+                serde_json::from_value(task.status.clone()).unwrap_or_default();
+            open.task = task.metadata.name.clone();
+            open.container = container(&spec, &open.container, &open.task)?;
+            been_on_node(&spec, &status, &open.task)?;
+            let interactive = !matches!(open.action, Some(Action::Logs(_)));
+            if interactive && status.state != TaskState::Running {
+                return Err(Status::failed_precondition(format!(
+                    "task {} is {}, not running",
+                    open.task,
+                    serde_json::to_value(status.state)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                        .unwrap_or_default()
+                )));
             }
-        };
-        let (to_user, rx) = mpsc::channel(16);
-        // The caller's rights are checked again every few seconds, as a
-        // removed worker's streams are: a session ends once they're gone.
-        let store = self.api.store.clone();
-        let revoked = async move {
-            loop {
-                tokio::time::sleep(crate::authz::REVOCATION_CHECK).await;
-                if let Err(e) = caller.check(&store, verb, Kind::Task, &namespace) {
-                    return e;
+            let namespace = open.namespace.clone();
+            let offer = SessionOffer {
+                id: legion_pki::random_secret(),
+                open: Some(open),
+                task_uid: task.metadata.uid.clone(),
+                pod_ip: status.ip.unwrap_or_default(),
+            };
+            let mut closing = self.api.closing.clone();
+            let attachment = tokio::select! {
+                a = self.api.sessions.offer(&spec.node, offer) => a?,
+                _ = closing.wait_for(|c| *c) => {
+                    return Err(Status::unavailable("the manager is shutting down"));
                 }
-            }
-        };
-        tokio::spawn(relay(
-            from_user,
-            to_user,
-            attachment,
-            revoked,
-            self.api.closing.clone(),
-        ));
-        Ok(Response::new(ReceiverStream::new(rx)))
+            };
+            let (to_user, rx) = mpsc::channel(16);
+            // The caller's rights are checked again every few seconds, as a
+            // removed worker's streams are: a session ends once they're gone.
+            let store = self.api.store.clone();
+            let revoked = async move {
+                loop {
+                    tokio::time::sleep(crate::authz::REVOCATION_CHECK).await;
+                    if let Err(e) = caller.check(&store, verb, Kind::Task, &namespace) {
+                        return e;
+                    }
+                }
+            };
+            tokio::spawn(relay(
+                from_user,
+                to_user,
+                attachment,
+                revoked,
+                self.api.closing.clone(),
+            ));
+            Ok(Response::new(ReceiverStream::new(rx)))
+        }
+        .await;
+        self.api.audited(actor, action, target, opened)
     }
 }
 

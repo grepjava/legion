@@ -38,6 +38,8 @@ pub struct ApiService {
     pub(crate) id: NodeId,
     /// This manager's node name, which `status` gives other managers.
     pub(crate) name: String,
+    /// Where it records what it decides, for the audit trail.
+    pub(crate) audit: crate::audit::Audit,
     /// `host:port` peers and forwarded requests reach this manager at.
     pub(crate) advertise: String,
     pub(crate) store: Store,
@@ -547,6 +549,54 @@ pub(crate) fn forwarded_for<T>(inner: T, caller: &Caller) -> Result<Request<T>, 
 }
 
 impl ApiService {
+    /// What to audit of a request recorded where it first arrives (its
+    /// caller's name is not forwarded): nothing on a manager it was
+    /// forwarded to, which the first records.
+    pub(crate) fn audit_point<T>(
+        &self,
+        req: &Request<T>,
+        action: &'static str,
+        target: legion_api::audit::Target,
+    ) -> Option<(
+        legion_api::audit::Actor,
+        &'static str,
+        legion_api::audit::Target,
+    )> {
+        if req.metadata().contains_key(FORWARDED) {
+            return None;
+        }
+        let actor = crate::audit::actor(req, self.peer_tls.is_some());
+        Some((actor, action, target))
+    }
+
+    /// Records `result` at `point`, if any, and passes it on.
+    pub(crate) fn audit_end<T>(
+        &self,
+        point: Option<(
+            legion_api::audit::Actor,
+            &'static str,
+            legion_api::audit::Target,
+        )>,
+        result: Result<T, Status>,
+    ) -> Result<T, Status> {
+        match point {
+            Some((actor, action, target)) => self.audited(actor, action, target, result),
+            None => result,
+        }
+    }
+
+    /// Records `result` in the audit trail and passes it on.
+    pub(crate) fn audited<T>(
+        &self,
+        actor: legion_api::audit::Actor,
+        action: &str,
+        target: legion_api::audit::Target,
+        result: Result<T, Status>,
+    ) -> Result<T, Status> {
+        self.audit.record(actor, action, target, &result);
+        result
+    }
+
     pub(crate) fn caller<T>(&self, req: &Request<T>) -> Result<Caller, Status> {
         let tls = self.peer_tls.is_some();
         // A removed manager's certificate is refused, and so is what it
@@ -721,22 +771,37 @@ impl ApiService {
 #[tonic::async_trait]
 impl Objects for ApiService {
     async fn apply(&self, req: Request<ApplyRequest>) -> Result<Response<ApplyResponse>, Status> {
-        // A user's rights are checked where the request is served: a
-        // follower forwards them, its own copy may lag a new RoleBinding.
-        let caller = self.caller(&req)?;
-        if let Route::Leader(mut c, _) = self.route(&req)? {
-            return c.apply(forwarded_for(req.into_inner(), &caller)?).await;
+        // Audited where it first arrives, which knows the caller, with
+        // the answer the leader gave if it went there.
+        let target = req
+            .get_ref()
+            .object
+            .as_ref()
+            .map(|o| crate::audit::target(&o.kind, &o.namespace, &o.name))
+            .unwrap_or_default();
+        let audit = self.audit_point(&req, "apply", target);
+        let applied = async {
+            // A user's rights are checked where the request is served: a
+            // follower forwards them, its own copy may lag a new
+            // RoleBinding.
+            let caller = self.caller(&req)?;
+            if let Route::Leader(mut c, _) = self.route(&req)? {
+                return c.apply(forwarded_for(req.into_inner(), &caller)?).await;
+            }
+            // The rights it checks, what it compares with, and the quotas
+            // and policies, must be the latest, not what this replica has
+            // applied.
+            self.consistent().await?;
+            if let Some(o) = &req.get_ref().object {
+                let kind = parse_kind(&o.kind)?;
+                let mut namespace = o.namespace.clone();
+                default_namespace(kind, &mut namespace);
+                caller.check(&self.store, Verb::Write, kind, &namespace)?;
+            }
+            Ok(Response::new(self.apply_local(req.into_inner()).await?))
         }
-        // The rights it checks, what it compares with, and the quotas and
-        // policies, must be the latest, not what this replica has applied.
-        self.consistent().await?;
-        if let Some(o) = &req.get_ref().object {
-            let kind = parse_kind(&o.kind)?;
-            let mut namespace = o.namespace.clone();
-            default_namespace(kind, &mut namespace);
-            caller.check(&self.store, Verb::Write, kind, &namespace)?;
-        }
-        Ok(Response::new(self.apply_local(req.into_inner()).await?))
+        .await;
+        self.audit_end(audit, applied)
     }
 
     async fn get(&self, req: Request<ObjectRef>) -> Result<Response<pb::Object>, Status> {
@@ -783,69 +848,18 @@ impl Objects for ApiService {
         req: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
         let key = parse_ref(req.get_ref().r#ref.clone())?;
-        let caller = self.caller(&req)?;
-        if let Route::Leader(mut c, _) = self.route(&req)? {
-            return c.delete(forwarded_for(req.into_inner(), &caller)?).await;
-        }
-        self.consistent().await?;
-        caller.check(&self.store, Verb::Write, key.kind, &key.namespace)?;
-        let req = req.into_inner();
-        let key = parse_ref(req.r#ref)?;
-        check_namespace(&key.namespace)?;
-        if key.kind == Kind::Task
-            && let Some(version) = self.stop_task(&key, req.expected_version).await?
-        {
-            return Ok(Response::new(DeleteResponse { version }));
-        }
-        let mut attempts = APPLY_ATTEMPTS;
-        let deleted = loop {
-            let mut precondition = req
-                .expected_version
-                .map_or(Precondition::None, Precondition::Version);
-            // Deleted on the version checked: a node claiming it meanwhile
-            // changes the version. The check is then made again, which
-            // refuses it, as a caller who named no version asked for nothing
-            // that changing the Volume made untrue.
-            if key.kind == Kind::Volume
-                && let Some(checked) = check_volume_delete(&self.store, &key)?
-                && req.expected_version.is_none_or(|v| v == checked)
-            {
-                precondition = Precondition::Version(checked);
+        // Audited where it first arrives, as an apply is.
+        let target = crate::audit::target(key.kind.as_str(), &key.namespace, &key.name);
+        let audit = self.audit_point(&req, "delete", target);
+        let deleted = async {
+            let caller = self.caller(&req)?;
+            if let Route::Leader(mut c, _) = self.route(&req)? {
+                return c.delete(forwarded_for(req.into_inner(), &caller)?).await;
             }
-            #[cfg(feature = "test-hooks")]
-            crate::hooks::pause("volume-delete", &key.name).await;
-            let deleted = if key.kind == Kind::Node {
-                // Run to the end even if the caller goes: stopped between its
-                // writes, it would leave a live node refused.
-                let api = self.clone();
-                let key = key.clone();
-                tokio::spawn(async move { api.remove_node(&key, req.expected_version).await })
-                    .await
-                    .map_err(internal)??
-            } else {
-                self.write(Command::Delete {
-                    key: key.clone(),
-                    precondition,
-                })
-                .await?
-            };
-            attempts -= 1;
-            let again = matches!(deleted, Outcome::Conflict { .. })
-                && key.kind == Kind::Volume
-                && req.expected_version.is_none();
-            if !again || attempts == 0 {
-                break deleted;
-            }
-        };
-        match deleted {
-            Outcome::Deleted { version } => Ok(Response::new(DeleteResponse { version })),
-            Outcome::NotFound => Err(not_found(&key)),
-            Outcome::Conflict { .. } => Err(conflict(
-                &key,
-                self.store.get(&key).map_err(internal)?.as_ref(),
-            )),
-            other => Err(Status::internal(format!("unexpected outcome {other:?}"))),
+            self.delete_served(&caller, key, req).await
         }
+        .await;
+        self.audit_end(audit, deleted)
     }
 
     type WatchStream = ReceiverStream<Result<pb::WatchEvent, Status>>;
@@ -956,28 +970,103 @@ impl Objects for ApiService {
     }
 }
 
+impl ApiService {
+    /// A delete this manager, the leader, serves: see `Objects::delete`.
+    async fn delete_served(
+        &self,
+        caller: &Caller,
+        key: ObjectKey,
+        req: Request<DeleteRequest>,
+    ) -> Result<Response<DeleteResponse>, Status> {
+        self.consistent().await?;
+        caller.check(&self.store, Verb::Write, key.kind, &key.namespace)?;
+        let req = req.into_inner();
+        let key = parse_ref(req.r#ref)?;
+        check_namespace(&key.namespace)?;
+        if key.kind == Kind::Task
+            && let Some(version) = self.stop_task(&key, req.expected_version).await?
+        {
+            return Ok(Response::new(DeleteResponse { version }));
+        }
+        let mut attempts = APPLY_ATTEMPTS;
+        let deleted = loop {
+            let mut precondition = req
+                .expected_version
+                .map_or(Precondition::None, Precondition::Version);
+            // Deleted on the version checked: a node claiming it meanwhile
+            // changes the version. The check is then made again, which
+            // refuses it, as a caller who named no version asked for nothing
+            // that changing the Volume made untrue.
+            if key.kind == Kind::Volume
+                && let Some(checked) = check_volume_delete(&self.store, &key)?
+                && req.expected_version.is_none_or(|v| v == checked)
+            {
+                precondition = Precondition::Version(checked);
+            }
+            #[cfg(feature = "test-hooks")]
+            crate::hooks::pause("volume-delete", &key.name).await;
+            let deleted = if key.kind == Kind::Node {
+                // Run to the end even if the caller goes: stopped between its
+                // writes, it would leave a live node refused.
+                let api = self.clone();
+                let key = key.clone();
+                tokio::spawn(async move { api.remove_node(&key, req.expected_version).await })
+                    .await
+                    .map_err(internal)??
+            } else {
+                self.write(Command::Delete {
+                    key: key.clone(),
+                    precondition,
+                })
+                .await?
+            };
+            attempts -= 1;
+            let again = matches!(deleted, Outcome::Conflict { .. })
+                && key.kind == Kind::Volume
+                && req.expected_version.is_none();
+            if !again || attempts == 0 {
+                break deleted;
+            }
+        };
+        match deleted {
+            Outcome::Deleted { version } => Ok(Response::new(DeleteResponse { version })),
+            Outcome::NotFound => Err(not_found(&key)),
+            Outcome::Conflict { .. } => Err(conflict(
+                &key,
+                self.store.get(&key).map_err(internal)?.as_ref(),
+            )),
+            other => Err(Status::internal(format!("unexpected outcome {other:?}"))),
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl Cluster for ApiService {
     async fn init(&self, req: Request<InitRequest>) -> Result<Response<StatusResponse>, Status> {
-        self.caller(&req)?.require_all("initialise the cluster")?;
-        let raft = &self.store.raft;
-        if raft.is_initialized().await.map_err(internal)? {
-            return Err(Status::already_exists(
-                "this manager already belongs to a cluster",
-            ));
+        let audit = self.audit_point(&req, "init", Default::default());
+        let result = async {
+            self.caller(&req)?.require_all("initialise the cluster")?;
+            let raft = &self.store.raft;
+            if raft.is_initialized().await.map_err(internal)? {
+                return Err(Status::already_exists(
+                    "this manager already belongs to a cluster",
+                ));
+            }
+            let members = BTreeMap::from([(
+                self.id,
+                BasicNode {
+                    addr: self.advertise.clone(),
+                },
+            )]);
+            raft.initialize(members).await.map_err(internal)?;
+            raft.wait(Some(std::time::Duration::from_secs(10)))
+                .current_leader(self.id, "become leader of the new cluster")
+                .await
+                .map_err(internal)?;
+            Ok(Response::new(self.status()?))
         }
-        let members = BTreeMap::from([(
-            self.id,
-            BasicNode {
-                addr: self.advertise.clone(),
-            },
-        )]);
-        raft.initialize(members).await.map_err(internal)?;
-        raft.wait(Some(std::time::Duration::from_secs(10)))
-            .current_leader(self.id, "become leader of the new cluster")
-            .await
-            .map_err(internal)?;
-        Ok(Response::new(self.status()?))
+        .await;
+        self.audit_end(audit, result)
     }
 
     async fn status(
@@ -991,45 +1080,59 @@ impl Cluster for ApiService {
         &self,
         req: Request<pb::JoinTokenRequest>,
     ) -> Result<Response<pb::JoinTokenResponse>, Status> {
-        self.caller(&req)?.require_all("see join tokens")?;
-        if let Some(addr) = self.leader_addr(&req)? {
-            let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
-                &addr,
-                self.peer_tls.as_ref(),
-            ));
-            return c.join_token(forwarded(req.into_inner())).await;
+        let audit = self.audit_point(
+            &req,
+            "join-token",
+            crate::audit::target("JoinToken", "", &req.get_ref().role),
+        );
+        let result = async {
+            self.caller(&req)?.require_all("see join tokens")?;
+            if let Some(addr) = self.leader_addr(&req)? {
+                let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                    &addr,
+                    self.peer_tls.as_ref(),
+                ));
+                return c.join_token(forwarded(req.into_inner())).await;
+            }
+            self.consistent().await?;
+            let req = req.into_inner();
+            let role = Role::parse(&req.role)
+                .filter(|r| matches!(r, Role::Manager | Role::Worker))
+                .ok_or_else(|| Status::invalid_argument("the role is `manager` or `worker`"))?;
+            let token = self.issuer()?.token(role, req.rotate).await?;
+            Ok(Response::new(pb::JoinTokenResponse {
+                token: token.to_string(),
+            }))
         }
-        self.consistent().await?;
-        let req = req.into_inner();
-        let role = Role::parse(&req.role)
-            .filter(|r| matches!(r, Role::Manager | Role::Worker))
-            .ok_or_else(|| Status::invalid_argument("the role is `manager` or `worker`"))?;
-        let token = self.issuer()?.token(role, req.rotate).await?;
-        Ok(Response::new(pb::JoinTokenResponse {
-            token: token.to_string(),
-        }))
+        .await;
+        self.audit_end(audit, result)
     }
 
     async fn autolock(
         &self,
         req: Request<pb::AutolockRequest>,
     ) -> Result<Response<pb::AutolockResponse>, Status> {
-        self.caller(&req)?.require_all("change autolock")?;
-        if let Some(addr) = self.leader_addr(&req)? {
-            let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
-                &addr,
-                self.peer_tls.as_ref(),
-            ));
-            return c.autolock(forwarded(req.into_inner())).await;
+        let audit = self.audit_point(&req, "autolock", Default::default());
+        let result = async {
+            self.caller(&req)?.require_all("change autolock")?;
+            if let Some(addr) = self.leader_addr(&req)? {
+                let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                    &addr,
+                    self.peer_tls.as_ref(),
+                ));
+                return c.autolock(forwarded(req.into_inner())).await;
+            }
+            self.consistent().await?;
+            let key = crate::autolock::apply(self, &req.into_inner().action).await?;
+            Ok(Response::new(pb::AutolockResponse {
+                key: key
+                    .as_ref()
+                    .map(crate::autolock::encode)
+                    .unwrap_or_default(),
+            }))
         }
-        self.consistent().await?;
-        let key = crate::autolock::apply(self, &req.into_inner().action).await?;
-        Ok(Response::new(pb::AutolockResponse {
-            key: key
-                .as_ref()
-                .map(crate::autolock::encode)
-                .unwrap_or_default(),
-        }))
+        .await;
+        self.audit_end(audit, result)
     }
 
     async fn usage(
@@ -1082,6 +1185,65 @@ impl Cluster for ApiService {
             }
         }
         Ok(Response::new(usage))
+    }
+
+    async fn audit(
+        &self,
+        req: Request<pb::AuditRequest>,
+    ) -> Result<Response<pb::AuditResponse>, Status> {
+        self.caller(&req)?.require_all("read the audit trail")?;
+        // Any manager answers, once caught up with the leader.
+        self.consistent().await?;
+        let req = req.into_inner();
+        let filter: legion_api::audit::Filter = if req.filter_json.is_empty() {
+            Default::default()
+        } else {
+            serde_json::from_slice(&req.filter_json)
+                .map_err(|e| Status::invalid_argument(format!("the filter: {e}")))?
+        };
+        let limit = if req.limit == 0 {
+            1000
+        } else {
+            req.limit as usize
+        };
+        let (events, truncated) = crate::audit::list(&self.store, &filter, limit)?;
+        Ok(Response::new(pb::AuditResponse {
+            events_json: events
+                .iter()
+                .map(|e| serde_json::to_vec(e).expect("events serialize"))
+                .collect(),
+            truncated,
+        }))
+    }
+
+    async fn record_audit(
+        &self,
+        req: Request<pb::RecordAuditRequest>,
+    ) -> Result<Response<pb::RecordAuditResponse>, Status> {
+        // From another manager only: nobody else adds to the trail.
+        let tls = self.peer_tls.is_some();
+        if let Some(id) = crate::tls::caller(&req, tls)?
+            && id.role != Role::Manager
+        {
+            return Err(Status::permission_denied(format!(
+                "{id} may not add to the audit trail"
+            )));
+        }
+        self.caller(&req)?;
+        if self.leader_addr(&req)?.is_some() {
+            return Err(Status::unavailable("not the leader; hand the events to it"));
+        }
+        let events = req
+            .into_inner()
+            .events_json
+            .iter()
+            .map(|e| serde_json::from_slice(e))
+            .collect::<Result<Vec<legion_api::audit::AuditEvent>, _>>()
+            .map_err(|e| Status::invalid_argument(format!("an audit event: {e}")))?;
+        if !events.is_empty() {
+            crate::audit::write(self, &events).await?;
+        }
+        Ok(Response::new(pb::RecordAuditResponse {}))
     }
 
     type BackupStream = ReceiverStream<Result<pb::BackupChunk, Status>>;
@@ -1137,25 +1299,34 @@ impl Cluster for ApiService {
         &self,
         req: Request<pb::IssueUserRequest>,
     ) -> Result<Response<pb::IssueUserResponse>, Status> {
-        self.caller(&req)?.require_all("issue user certificates")?;
-        let req = req.into_inner();
-        legion_api::validate_name(&req.name)
-            .map_err(|e| Status::invalid_argument(format!("user name: {e}")))?;
-        let lifetime = match req.days {
-            0 => legion_pki::CERT_LIFETIME,
-            days => std::time::Duration::from_secs(u64::from(days) * 24 * 3600),
-        };
-        // Any manager with the CA key can sign: nothing is written.
-        let ca = &self.issuer()?.ca;
-        let id = legion_pki::Identity::new(&req.name, Role::User);
-        let cert_pem = ca
-            .sign(&req.csr_pem, &id, lifetime)
-            .map_err(|e| Status::invalid_argument(format!("certificate request: {e}")))?;
-        tracing::info!(%id, days = lifetime.as_secs() / 86_400, "issued a user certificate");
-        Ok(Response::new(pb::IssueUserResponse {
-            cert_pem,
-            ca_pem: ca.cert_pem().to_owned(),
-        }))
+        let audit = self.audit_point(
+            &req,
+            "issue-user",
+            crate::audit::target("User", "", &req.get_ref().name),
+        );
+        let result = async {
+            self.caller(&req)?.require_all("issue user certificates")?;
+            let req = req.into_inner();
+            legion_api::validate_name(&req.name)
+                .map_err(|e| Status::invalid_argument(format!("user name: {e}")))?;
+            let lifetime = match req.days {
+                0 => legion_pki::CERT_LIFETIME,
+                days => std::time::Duration::from_secs(u64::from(days) * 24 * 3600),
+            };
+            // Any manager with the CA key can sign: nothing is written.
+            let ca = &self.issuer()?.ca;
+            let id = legion_pki::Identity::new(&req.name, Role::User);
+            let cert_pem = ca
+                .sign(&req.csr_pem, &id, lifetime)
+                .map_err(|e| Status::invalid_argument(format!("certificate request: {e}")))?;
+            tracing::info!(%id, days = lifetime.as_secs() / 86_400, "issued a user certificate");
+            Ok(Response::new(pb::IssueUserResponse {
+                cert_pem,
+                ca_pem: ca.cert_pem().to_owned(),
+            }))
+        }
+        .await;
+        self.audit_end(audit, result)
     }
 }
 

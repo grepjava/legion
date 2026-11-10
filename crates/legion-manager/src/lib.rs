@@ -9,6 +9,7 @@
 
 pub mod acme;
 mod api;
+mod audit;
 mod authz;
 pub mod autolock;
 pub mod controller;
@@ -42,6 +43,7 @@ use legion_store::{NodeId, Store};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 
+pub use audit::Retention as AuditRetention;
 pub use dispatcher::HEARTBEAT_PERIOD;
 pub use join::{Joined, SYSTEM_NAMESPACE, join, join_as};
 pub use legion_proto::tls::Credentials;
@@ -85,6 +87,8 @@ pub struct ManagerConfig {
     /// What this manager speaks and works with: this build's, but for
     /// tests posing as another.
     pub protocol: legion_api::protocol::Protocol,
+    /// How long audit events are kept, and how many at most.
+    pub audit: audit::Retention,
 }
 
 impl ManagerConfig {
@@ -105,6 +109,7 @@ impl ManagerConfig {
             registry_loopback: false,
             insecure_registries: Vec::new(),
             protocol: legion_api::protocol::Protocol::current(),
+            audit: audit::Retention::default(),
         }
     }
 }
@@ -143,6 +148,8 @@ pub fn default_raft_config() -> openraft::Config {
 
 pub struct Manager {
     id: NodeId,
+    /// How long audit events are kept.
+    audit: audit::Retention,
     /// Its node name (see `ManagerConfig::name`).
     name: String,
     advertise: String,
@@ -197,6 +204,7 @@ impl Manager {
         );
         Ok(Manager {
             id,
+            audit: config.audit,
             name,
             advertise: config.advertise,
             credentials,
@@ -319,8 +327,11 @@ impl Manager {
                 closing.clone(),
             ))
         });
+        let (audit, audited) = audit::Audit::new(&self.name);
+        let audit_lost = audit.lost();
         let api = api::ApiService {
             id: self.id,
+            audit,
             name: self.name.clone(),
             advertise: self.advertise.clone(),
             store: self.store.clone(),
@@ -334,6 +345,13 @@ impl Manager {
             speaking: self.speaking.clone(),
         };
         let names = tokio::spawn(managers::run(api.clone(), api.closing.clone()));
+        let auditing = tokio::spawn(audit::run(
+            api.clone(),
+            audited,
+            audit_lost,
+            self.audit,
+            api.closing.clone(),
+        ));
         let (dispatcher, dispatching) = dispatcher::DispatcherService::start(
             api.clone(),
             self.credentials.is_some(),
@@ -432,6 +450,7 @@ impl Manager {
         let _ = promote.await;
         let _ = floor.await;
         let _ = names.await;
+        let _ = auditing.await;
         let _ = dispatching.await;
         tracing::info!("API stopped; shutting down the store");
         *self.metrics.write().unwrap_or_else(|e| e.into_inner()) = None;

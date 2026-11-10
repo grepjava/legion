@@ -425,7 +425,22 @@ pub(crate) struct JoinService {
 #[tonic::async_trait]
 impl legion_proto::v1::join_server::Join for JoinService {
     async fn join(&self, req: Request<JoinRequest>) -> Result<Response<JoinResponse>, Status> {
-        self.api.join(req).await
+        // A joining node has no certificate yet, only a token: it is named
+        // as it asks to be. Recorded where the join first arrives.
+        let point = self.api.audit_point(
+            &req,
+            "join",
+            crate::audit::target("Node", "", &req.get_ref().name),
+        );
+        let point = point.map(|(_, action, target)| {
+            let actor = legion_api::audit::Actor {
+                kind: "joining".into(),
+                name: req.get_ref().name.clone(),
+            };
+            (actor, action, target)
+        });
+        let joined = self.api.join(req).await;
+        self.api.audit_end(point, joined)
     }
 }
 

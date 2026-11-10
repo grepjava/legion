@@ -4995,3 +4995,198 @@ fn service_in(namespace: &str, name: &str) -> ApplyRequest {
     s.namespace = namespace.into();
     apply(s)
 }
+
+/// The audit events the leader keeps, as `legion audit` lists them.
+async fn audit_events(
+    m: &Running,
+    filter: serde_json::Value,
+) -> Vec<legion_api::audit::AuditEvent> {
+    let mut c = m.cluster().await;
+    c.audit(legion_proto::v1::AuditRequest {
+        filter_json: filter.to_string().into_bytes(),
+        limit: 0,
+    })
+    .await
+    .unwrap()
+    .into_inner()
+    .events_json
+    .iter()
+    .map(|e| serde_json::from_slice(e).unwrap())
+    .collect()
+}
+
+/// Changes, sessions and refusals are audited where the request first
+/// arrives, which knows the caller, a follower handing its events to the
+/// leader (PLAN.md phase 7): who, what, to which object and how it ended,
+/// never what it holds. Only the cluster admin reads the trail, and only a
+/// manager adds to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn changes_and_refusals_are_audited_without_their_contents() {
+    use legion_api::audit::Outcome;
+    let ca = Ca::generate().unwrap();
+    let first = Running::start_with(Some(&ca)).await;
+    first.cluster().await.init(InitRequest {}).await.unwrap();
+    let token = first
+        .cluster()
+        .await
+        .join_token(JoinTokenRequest {
+            role: "manager".into(),
+            rotate: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    let follower = Running::join(&first.addr, &token, "m2", creds(&ca, "admin", Role::Admin)).await;
+    let mut leader = first.objects().await;
+    leader
+        .apply(object("Namespace", "", "shop", serde_json::json!({})))
+        .await
+        .unwrap();
+
+    // Through the follower: the admin writes a Secret, alice is refused.
+    let mut admin = follower.objects().await;
+    eventually(|| {
+        let mut admin = admin.clone();
+        async move {
+            admin
+                .apply(object(
+                    "Secret",
+                    "shop",
+                    "db",
+                    serde_json::json!({ "text": "s3cret-value" }),
+                ))
+                .await
+        }
+    })
+    .await;
+    let mut alice = ObjectsClient::new(
+        follower
+            .channel(Some(&creds(&ca, "alice", Role::User)))
+            .await
+            .unwrap(),
+    );
+    denied(alice.apply(service_in("shop", "web")).await);
+    admin
+        .delete(DeleteRequest {
+            r#ref: Some(get("Secret", "shop", "db")),
+            expected_version: None,
+        })
+        .await
+        .unwrap();
+
+    // The leader has them, the follower's included.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let events = loop {
+        let events = audit_events(&first, serde_json::json!({ "namespace": "shop" })).await;
+        if events.len() >= 3 {
+            break events;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{events:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let wrote = events
+        .iter()
+        .find(|e| e.action == "apply" && e.target.kind == "Secret")
+        .expect("the Secret's apply");
+    assert_eq!(
+        (wrote.actor.kind.as_str(), wrote.actor.name.as_str()),
+        ("admin", "admin")
+    );
+    assert_eq!(
+        (wrote.target.namespace.as_str(), wrote.target.name.as_str()),
+        ("shop", "db")
+    );
+    assert_eq!(wrote.result, Outcome::Ok);
+    assert_eq!(wrote.manager, "m2", "recorded where it arrived");
+    let refused = events
+        .iter()
+        .find(|e| e.actor.name == "alice")
+        .expect("alice's refusal");
+    assert_eq!(refused.result, Outcome::Denied);
+    assert_eq!(refused.action, "apply");
+    assert!(refused.message.contains("alice"), "{refused:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| e.action == "delete" && e.result == Outcome::Ok),
+        "{events:?}"
+    );
+    // Names only: nothing of what the Secret held.
+    let all = audit_events(&first, serde_json::json!({})).await;
+    let text = serde_json::to_string(&all).unwrap();
+    assert!(!text.contains("s3cret-value"), "{text}");
+    // A filter narrows them.
+    let alices = audit_events(&first, serde_json::json!({ "actor": "alice" })).await;
+    assert!(alices.iter().all(|e| e.actor.name == "alice") && !alices.is_empty());
+
+    // Only the admin reads the trail; only a manager adds to it.
+    let as_alice = ClusterClient::new(
+        first
+            .channel(Some(&creds(&ca, "alice", Role::User)))
+            .await
+            .unwrap(),
+    );
+    denied(
+        as_alice
+            .clone()
+            .audit(legion_proto::v1::AuditRequest::default())
+            .await,
+    );
+    denied(
+        first
+            .cluster()
+            .await
+            .record_audit(legion_proto::v1::RecordAuditRequest::default())
+            .await,
+    );
+    follower.stop().await;
+    first.stop().await;
+}
+
+/// The leader drops the oldest events once there are more than the
+/// retention keeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_audit_trail_keeps_only_what_its_retention_allows() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let config = ManagerConfig {
+        raft: Running::quick_raft(),
+        heartbeat: HEARTBEAT,
+        name: manager_name(&addr),
+        audit: legion_manager::AuditRetention {
+            events: 2,
+            every: Duration::from_millis(500),
+            ..Default::default()
+        },
+        ..ManagerConfig::new(dir.path(), &addr)
+    };
+    let m = Running::serve_config(dir, listener, config, None).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    // One event a batch: each in its own second.
+    let mut objects = m.objects().await;
+    for i in 0..4 {
+        objects
+            .apply(object(
+                "Namespace",
+                "",
+                &format!("n{i}"),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let events = audit_events(&m, serde_json::json!({ "action": "apply" })).await;
+        let names: Vec<&str> = events.iter().map(|e| e.target.name.as_str()).collect();
+        if names == ["n2", "n3"] {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{names:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    m.stop().await;
+}

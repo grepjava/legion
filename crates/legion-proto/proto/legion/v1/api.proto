@@ -123,7 +123,32 @@ service Cluster {
   // node: the tasks of `namespace`, or of every namespace when empty, that
   // the caller may read.
   rpc Usage(UsageRequest) returns (UsageResponse);
+  // The audit events the filter matches, oldest first, at most `limit`
+  // (1000 when 0): the cluster admin's only (legion_api::audit).
+  rpc Audit(AuditRequest) returns (AuditResponse);
+  // Managers only: audit events a follower decided (the sessions it
+  // serves), for the leader to keep with its own.
+  rpc RecordAudit(RecordAuditRequest) returns (RecordAuditResponse);
 }
+
+message AuditRequest {
+  // legion_api::audit::Filter as JSON; empty for every event.
+  bytes filter_json = 1;
+  uint32 limit = 2;
+}
+
+message AuditResponse {
+  // Each a legion_api::audit::AuditEvent as JSON.
+  repeated bytes events_json = 1;
+  // More matched than `limit`: the newest are left out.
+  bool truncated = 2;
+}
+
+message RecordAuditRequest {
+  repeated bytes events_json = 1;
+}
+
+message RecordAuditResponse {}
 
 message UsageRequest {
   string namespace = 1;
