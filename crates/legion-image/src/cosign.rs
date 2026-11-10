@@ -56,6 +56,16 @@ impl PublicKey {
         &self.fingerprint
     }
 
+    /// Whether `signature`, base64 (standard) of a DER ECDSA signature, is
+    /// this key's over `message`'s exact bytes: an image signature's payload,
+    /// or anything else signed the same way (DSSE's encoding, for one).
+    pub fn verifies(&self, message: &[u8], signature: &str) -> bool {
+        B64.decode(signature.trim())
+            .ok()
+            .and_then(|der| Signature::from_der(&der).ok())
+            .is_some_and(|s| self.key.verify(message, &s).is_ok())
+    }
+
     pub fn to_pem(&self) -> String {
         p256::PublicKey::from(&self.key)
             .to_public_key_pem(LineEnding::LF)
@@ -178,15 +188,12 @@ pub fn check(
     digest: &str,
     repository: &Reference,
 ) -> Result<usize, String> {
+    // Malformed signatures are told apart from ones no key made.
     let der = B64
         .decode(signature.trim())
         .map_err(|_| "the signature is not base64".to_owned())?;
-    let signature =
-        Signature::from_der(&der).map_err(|_| "the signature is not a DER ECDSA signature")?;
-    let Some(index) = keys
-        .iter()
-        .position(|k| k.key.verify(payload, &signature).is_ok())
-    else {
+    Signature::from_der(&der).map_err(|_| "the signature is not a DER ECDSA signature")?;
+    let Some(index) = keys.iter().position(|k| k.verifies(payload, signature)) else {
         return Err("no key of the policy made it".to_owned());
     };
     let signed: serde_json::Value =
@@ -325,6 +332,18 @@ mod tests {
         assert!(PublicKey::from_pem(&pem).is_err());
         assert!(PrivateKey::from_pem(&public).is_err());
         assert!(PublicKey::from_pem("not a key").is_err());
+    }
+
+    #[test]
+    fn a_key_verifies_what_it_signed_and_nothing_else() {
+        let key = PrivateKey::generate();
+        let message = b"DSSEv1 28 application/vnd.in-toto+json 2 {}";
+        let sig = sign(message, &key);
+        assert!(key.public().verifies(message, &sig));
+        assert!(!key.public().verifies(b"another message", &sig));
+        assert!(!PrivateKey::generate().public().verifies(message, &sig));
+        assert!(!key.public().verifies(message, "not base64!"));
+        assert!(!key.public().verifies(message, "aGVsbG8="));
     }
 
     #[test]
