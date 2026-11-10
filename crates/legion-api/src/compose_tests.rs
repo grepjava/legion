@@ -484,3 +484,108 @@ fn read_only_tmpfs_mounts_stay_read_only() {
     let a = spec(&stack, "a");
     assert!(a.pod.containers[0].volume_mounts[0].read_only);
 }
+
+/// The keys `converts_a_stack` does not use, each as docs/COMPOSE.md says
+/// it is converted.
+#[test]
+fn the_rest_of_the_matrix() {
+    let stack = convert_with(
+        r#"services:
+  a:
+    image: a
+    entrypoint: ["/bin/sh", "-c"]
+    command: "echo hi"
+    working_dir: /srv
+    user: "www:www"
+    expose: ["9000", "9001/udp"]
+    ports:
+      - { target: 80, published: 8080, protocol: tcp, mode: host }
+    stop_grace_period: 20s
+    healthcheck: { test: ["CMD-SHELL", "test -f /ok"], timeout: 2s }
+    privileged: true
+    devices: ["/dev/tun0"]
+    network_mode: host
+    deploy:
+      mode: global
+      endpoint_mode: dnsrr
+      placement: { preferences: [{ spread: node.labels.zone }] }
+      resources: { limits: { pids: 50 } }
+      rollback_config: { parallelism: 2 }
+  b:
+    image: b
+    healthcheck: { test: "pg_isready -q" }
+    secrets: [token]
+    configs: [motd]
+secrets:
+  token: { environment: TOKEN }
+configs:
+  motd: { content: hello }
+"#,
+        &[("TOKEN", "t0ken")],
+    )
+    .unwrap();
+    let a = spec(&stack, "a");
+    let c = &a.pod.containers[0];
+    assert_eq!(c.command, ["/bin/sh", "-c"], "entrypoint");
+    assert_eq!(c.args, ["echo", "hi"], "command");
+    assert_eq!(c.working_dir.as_deref(), Some("/srv"));
+    assert_eq!(c.user.as_deref(), Some("www:www"));
+    let ports: Vec<(u16, crate::service::Protocol)> = c
+        .ports
+        .iter()
+        .map(|p| (p.container_port, p.protocol))
+        .collect();
+    assert!(
+        ports.contains(&(9000, crate::service::Protocol::Tcp))
+            && ports.contains(&(9001, crate::service::Protocol::Udp)),
+        "{ports:?}"
+    );
+    let endpoint = a.endpoint.as_ref().unwrap();
+    assert_eq!(endpoint.mode, crate::service::EndpointMode::Dnsrr);
+    let p = &endpoint.ports[0];
+    assert_eq!((p.port, p.published_port), (80, Some(8080)));
+    assert_eq!(p.publish, crate::service::Publish::Host);
+    assert_eq!(a.pod.stop_grace_period.0, 20_000);
+    let probe = c.probes.liveness.as_ref().unwrap();
+    assert_eq!(
+        probe.exec.as_ref().unwrap().command,
+        ["/bin/sh", "-c", "test -f /ok"]
+    );
+    assert_eq!(probe.timeout.0, 2_000);
+    assert_eq!(a.mode, crate::service::ServiceMode::Global);
+    assert_eq!(a.placement.preferences.len(), 1);
+    assert_eq!(c.resources.limits.maxproc, Some(50));
+
+    let b = spec(&stack, "b");
+    let probe = b.pod.containers[0].probes.liveness.as_ref().unwrap();
+    assert_eq!(
+        probe.exec.as_ref().unwrap().command,
+        ["/bin/sh", "-c", "pg_isready -q"]
+    );
+    assert_eq!(
+        (probe.period.0, probe.timeout.0),
+        (30_000, 30_000),
+        "Docker's defaults"
+    );
+    assert_eq!(
+        b.pod.containers[0].configs[0].target.as_deref(),
+        Some("/motd"),
+        "Swarm's default target"
+    );
+    let token = stack
+        .objects
+        .iter()
+        .find(|o| o.kind == Kind::Secret)
+        .unwrap();
+    assert_eq!(token.spec["data"], STANDARD.encode("t0ken"));
+
+    let warnings = stack.warnings.join("\n");
+    for expected in [
+        "services.a.privileged: not supported",
+        "services.a.devices: not supported",
+        "services.a.network_mode: not supported",
+        "services.a.deploy.rollback_config: not supported, ignored",
+    ] {
+        assert!(warnings.contains(expected), "{expected}\n{warnings}");
+    }
+}
