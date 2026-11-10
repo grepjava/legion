@@ -44,6 +44,8 @@ pub struct Job {
     pub object: Object,
     pub spec: JobSpec,
     pub status: JobStatus,
+    /// An `ImagePolicy` covers one of its images (see `Service::covered`).
+    pub covered: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +83,7 @@ impl Job {
                 max_unavailable: None,
             },
             refused: Default::default(),
+            covered: self.covered,
         }
     }
 }
@@ -261,7 +264,7 @@ fn start(
     created: &mut Vec<Task>,
 ) {
     // No task until the pod's images are resolved.
-    let Some(pins) = super::pins(&j.spec.pod, j.status.images.as_ref(), nodes) else {
+    let Some(pins) = super::pins(&j.spec.pod, j.status.images.as_ref(), nodes, j.covered) else {
         return;
     };
     let wanted_set: BTreeSet<&Slot> = wanted.iter().collect();

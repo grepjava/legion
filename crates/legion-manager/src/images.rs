@@ -140,6 +140,24 @@ fn policies(store: &Store) -> Result<Vec<Policy>, String> {
         .collect())
 }
 
+/// The repository `image` names, as policies match it: `registry/path`.
+fn repository(image: &str) -> Option<String> {
+    let r = Reference::parse(image).ok()?;
+    Some(format!("{}/{}", r.registry, r.repository))
+}
+
+/// Whether one of `pod`'s images is in a repository one of `patterns`
+/// (every ImagePolicy's) matches.
+pub fn covered(pod: &PodSpec, patterns: &[String]) -> bool {
+    pod.containers().any(|c| {
+        repository(&c.image).is_some_and(|name| {
+            patterns
+                .iter()
+                .any(|p| legion_api::image::matches(p, &name))
+        })
+    })
+}
+
 /// Checks each of `pod`'s images that a policy covers, as it is to run
 /// (`resolved`, or as written), against every policy covering it. Returns
 /// the good signatures, the failures under policies that enforce (which

@@ -148,16 +148,27 @@ type State = (
 );
 
 fn read(store: &Store) -> Result<State, legion_store::Error> {
+    // The patterns of every ImagePolicy: a pod they cover waits for the
+    // resolver's check of its signatures.
+    let patterns: Vec<String> = store
+        .list(Kind::ImagePolicy, None)?
+        .objects
+        .iter()
+        .filter_map(|o| legion_api::parse::<legion_api::image::ImagePolicySpec>(&o.spec).ok())
+        .flat_map(|p| p.images)
+        .collect();
     let services = store
         .list(Kind::Service, None)?
         .objects
         .into_iter()
         .filter_map(|o| {
-            let spec = parsed(&o)?;
+            let spec: legion_api::service::ServiceSpec = parsed(&o)?;
+            let covered = crate::images::covered(&spec.pod, &patterns);
             Some(Service {
                 object: o,
                 spec,
                 refused: Default::default(),
+                covered,
             })
         })
         .collect();
@@ -167,12 +178,14 @@ fn read(store: &Store) -> Result<State, legion_store::Error> {
             .objects
             .into_iter()
             .filter_map(|o| {
-                let spec = parsed(&o)?;
+                let spec: legion_api::job::JobSpec = parsed(&o)?;
                 let status = status_of(&o);
+                let covered = crate::images::covered(&spec.pod, &patterns);
                 Some(Job {
                     object: o,
                     spec,
                     status,
+                    covered,
                 })
             })
             .collect(),

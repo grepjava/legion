@@ -1134,7 +1134,11 @@ says why that went and what was kept of it.
   fails. The good signature is recorded with the resolved digests
   (`status.images.verified[image]`: the digest and the key's fingerprint,
   `sha256:` of its DER SubjectPublicKeyInfo), and scaling, restarts and a
-  lost node's replacement reuse it. Under `enforce`, an image unsigned,
+  lost node's replacement reuse it. A pod a policy covers gets no task
+  until the resolver has checked it, though it names nothing to resolve
+  (an image by digest, a local one) and though a node can't run pins,
+  when the resolver waits too: its signature is never skipped (the lab
+  found a local image run before the check said no). Under `enforce`, an image unsigned,
   badly signed, or whose signatures cannot be read (the registry down),
   holds the pod with no tasks, saying which (`status.images.message`), so
   an update waits with its old tasks running; it is tried again every

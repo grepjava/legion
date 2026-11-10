@@ -187,6 +187,7 @@ impl World {
                     object: o,
                     spec,
                     refused: Default::default(),
+                    covered: false,
                 });
             }
         }
@@ -324,6 +325,7 @@ impl World {
                     self.jobs.jobs.push(Job {
                         spec: legion_api::parse(&o.spec).unwrap(),
                         status: Default::default(),
+                        covered: false,
                         object: o,
                     });
                 }
@@ -709,6 +711,40 @@ fn tasks_run_the_digests_resolved_for_their_pod() {
         .filter(|(_, pin)| pin.is_none())
         .count();
     assert_eq!(unpinned, 1, "{:?}", running(&w));
+}
+
+/// A pod an `ImagePolicy` covers waits for the resolver's check though it
+/// has nothing to resolve (a local image here, or one by digest), and
+/// though a node can't run pins: its signature is never skipped.
+#[test]
+fn a_covered_pod_waits_for_its_signatures_to_be_checked() {
+    let mut w = World::new();
+    w.node("a", &[]);
+    w.node_mut("a").status.image_pins = false;
+    let running = |w: &World| {
+        w.tasks
+            .iter()
+            .filter(|t| t.status.state == TaskState::Running)
+            .count()
+    };
+    w.service("app", &web("localhost/app:1", ""));
+    w.services[0].covered = true;
+    for _ in 0..3 {
+        w.now += Duration::from_secs(60);
+        w.settle();
+    }
+    assert_eq!(running(&w), 0, "made before its signatures were checked");
+    // Checked: the resolver writes the pod's images, nothing to pin.
+    w.resolve("app", &[]);
+    w.settle();
+    assert_eq!(running(&w), 2);
+
+    // The same pod, no policy covering it, runs at once.
+    let mut w = World::new();
+    w.node("a", &[]);
+    w.service("app", &web("localhost/app:1", ""));
+    w.settle();
+    assert_eq!(running(&w), 2);
 }
 
 #[test]
@@ -2043,6 +2079,7 @@ impl World {
         self.jobs.jobs.push(Job {
             spec: legion_api::parse(&o.spec).unwrap(),
             status: Default::default(),
+            covered: false,
             object: o,
         });
     }

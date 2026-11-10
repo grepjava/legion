@@ -62,6 +62,9 @@ pub struct Service {
     /// on, as the images offer nothing for them: kept off nodes of them.
     /// Set by [`plan`].
     pub refused: BTreeSet<(String, String, bool)>,
+    /// An `ImagePolicy` covers one of its images: no task is made until the
+    /// resolver has checked them, though it has nothing to resolve.
+    pub covered: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -636,7 +639,7 @@ fn service(
         .status
         .get("images")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
-    let Some(pins) = pins(&s.spec.pod, images.as_ref(), nodes) else {
+    let Some(pins) = pins(&s.spec.pod, images.as_ref(), nodes, s.covered) else {
         return;
     };
     let mut update = match track_update(s, tasks, &previous, memory, plan) {
@@ -1352,12 +1355,21 @@ fn task_name(svc: &str, slot: &str, n: u64) -> String {
 
 /// What a pod's tasks run each image as, by digest; `None` while its images
 /// are being resolved, when no task may be made for it. A pod with nothing to
-/// resolve, or a cluster with a node that can't run pins, runs them as named.
+/// resolve, or a cluster with a node that can't run pins, runs them as named;
+/// but one an `ImagePolicy` covers (`covered`) waits for the resolver's check
+/// whatever it names, until then, so its signature is never skipped.
 pub(super) fn pins(
     pod: &PodSpec,
     images: Option<&ImageStatus>,
     nodes: &[Node],
+    covered: bool,
 ) -> Option<BTreeMap<String, String>> {
+    if covered {
+        let images = images?;
+        return images
+            .ready_for(&crate::images::pod_hash(pod))
+            .then(|| images.resolved.clone());
+    }
     // One that doesn't parse can't be pulled either: the node says so.
     let wanted = crate::images::to_resolve(pod).unwrap_or_default();
     // As the resolver asks: with no node, or one that can't run pins.
