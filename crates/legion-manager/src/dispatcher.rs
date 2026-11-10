@@ -151,6 +151,21 @@ impl DispatcherService {
         Ok(caller)
     }
 
+    /// For a stream the calling node opens: the node, checked as for any
+    /// call, and its removal (see [`Self::removal`]). A follower serves
+    /// streams from its own replica, so it first catches up with the leader:
+    /// a node removed there, whose removal this replica has yet to apply,
+    /// opens nothing here, and a follower cut off from the leader opens
+    /// nothing, the agent going to another manager.
+    async fn streaming<T>(
+        &self,
+        req: &Request<T>,
+        named: &str,
+    ) -> Result<(String, Removal), Status> {
+        self.api.consistent().await?;
+        Ok((self.node(req, named)?, self.removal(req)?))
+    }
+
     /// Resolves once the calling worker's node is removed, for its streams
     /// to end: never for other callers.
     fn removal<T>(&self, req: &Request<T>) -> Result<Removal, Status> {
@@ -957,8 +972,7 @@ impl Dispatcher for DispatcherService {
         &self,
         req: Request<AssignmentsRequest>,
     ) -> Result<Response<Self::AssignmentsStream>, Status> {
-        let node = self.node(&req, &req.get_ref().node)?;
-        let removal = self.removal(&req)?;
+        let (node, removal) = self.streaming(&req, &req.get_ref().node).await?;
         let (tx, rx) = watch::channel(None);
         tokio::spawn(follow_assignments(
             self.store().clone(),
@@ -985,8 +999,7 @@ impl Dispatcher for DispatcherService {
         &self,
         req: Request<EndpointsRequest>,
     ) -> Result<Response<Self::EndpointsStream>, Status> {
-        self.node(&req, &req.get_ref().node)?;
-        let removal = self.removal(&req)?;
+        let (_, removal) = self.streaming(&req, &req.get_ref().node).await?;
         let mut rx = self.endpoints.clone();
         // The current set first, if there is one.
         rx.mark_changed();
@@ -1006,8 +1019,7 @@ impl Dispatcher for DispatcherService {
         &self,
         req: Request<PeersRequest>,
     ) -> Result<Response<Self::PeersStream>, Status> {
-        self.node(&req, &req.get_ref().node)?;
-        let removal = self.removal(&req)?;
+        let (_, removal) = self.streaming(&req, &req.get_ref().node).await?;
         let mut rx = self.peers.clone();
         rx.mark_changed();
         Ok(Response::new(stream(
@@ -1026,8 +1038,7 @@ impl Dispatcher for DispatcherService {
         &self,
         req: Request<PoliciesRequest>,
     ) -> Result<Response<Self::PoliciesStream>, Status> {
-        self.node(&req, &req.get_ref().node)?;
-        let removal = self.removal(&req)?;
+        let (_, removal) = self.streaming(&req, &req.get_ref().node).await?;
         let mut rx = self.policies.clone();
         rx.mark_changed();
         Ok(Response::new(stream(
@@ -1046,8 +1057,7 @@ impl Dispatcher for DispatcherService {
         &self,
         req: Request<RoutesRequest>,
     ) -> Result<Response<Self::RoutesStream>, Status> {
-        self.node(&req, &req.get_ref().node)?;
-        let removal = self.removal(&req)?;
+        let (_, removal) = self.streaming(&req, &req.get_ref().node).await?;
         let mut rx = self.routes.clone();
         rx.mark_changed();
         Ok(Response::new(stream(
@@ -1241,8 +1251,7 @@ impl Dispatcher for DispatcherService {
         req: Request<SessionsRequest>,
     ) -> Result<Response<Self::SessionsStream>, Status> {
         use tokio_stream::StreamExt;
-        let node = self.node(&req, &req.get_ref().node)?;
-        let mut removal = self.removal(&req)?;
+        let (node, mut removal) = self.streaming(&req, &req.get_ref().node).await?;
         let mut offers = self.api.sessions.follow(&node);
         // Relayed so the stream ends when the manager shuts down.
         let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -1276,6 +1285,8 @@ impl Dispatcher for DispatcherService {
     ) -> Result<Response<Self::AttachStream>, Status> {
         use legion_proto::v1::session_frame::Frame;
         use tokio_stream::StreamExt;
+        // Caught up first, as every stream is (see `streaming`).
+        self.api.consistent().await?;
         // A worker attaches only to its own node's sessions.
         let node = self
             .caller(&req)?

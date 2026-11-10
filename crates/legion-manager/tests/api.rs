@@ -4612,3 +4612,56 @@ async fn a_users_session_ends_when_their_binding_goes() {
     beating.abort();
     m.stop().await;
 }
+
+/// A worker's streams are served from the follower's replica: one cut off
+/// from the leader may lack the node's removal, so opens none, and the
+/// agent goes to another manager (PLAN.md phase 7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_cut_off_from_the_leader_opens_no_worker_stream() {
+    let mut managers = Vec::new();
+    for _ in 0..3 {
+        managers.push(Running::start().await);
+    }
+    form_cluster(&managers).await;
+    let dispatcher = |m: &Running| {
+        let addr = m.addr.clone();
+        async move {
+            let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+                .unwrap()
+                .connect()
+                .await
+                .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
+            Ok::<_, tonic::Status>(DispatcherClient::new(channel))
+        }
+    };
+    eventually(|| async {
+        dispatcher(&managers[0])
+            .await?
+            .register(RegisterRequest {
+                node: "w1".into(),
+                status_json: br#"{"state":"ready"}"#.to_vec(),
+                role: String::new(),
+            })
+            .await
+    })
+    .await;
+    let endpoints = |m: &Running| {
+        let d = dispatcher(m);
+        async move {
+            d.await?
+                .endpoints(EndpointsRequest { node: "w1".into() })
+                .await
+                .map(drop)
+        }
+    };
+    // Caught up, it serves the stream.
+    eventually(|| endpoints(&managers[2])).await;
+
+    let follower = managers.pop().unwrap();
+    for m in managers {
+        m.stop().await;
+    }
+    let refused = endpoints(&follower).await.unwrap_err();
+    assert_eq!(refused.code(), Code::Unavailable, "{refused}");
+    follower.stop().await;
+}
