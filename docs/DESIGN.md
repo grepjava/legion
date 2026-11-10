@@ -1657,8 +1657,24 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
   dispatcher call, renewals included, refuses a worker certificate of
   that node issued before then. Joining again with a token gives a new
   certificate, issued after, which is let in. Streams the worker opened
-  before its removal check every 5 s and end with the refusal. Managers are removed from
-  the Raft membership instead, and users by their RoleBindings.
+  before its removal check every 5 s and end with the refusal; a
+  follower serves a worker's streams from its replica, so it first
+  catches up with the leader (one cut off opens none, and the agent goes
+  to another manager). **Revocation** (phase 7), the same for every
+  principal: a manager is removed by deleting its Node too. The leader
+  knows each manager by the name it gives (`Cluster.Status`, recorded in
+  `Config legion-system/managers` with its Raft id), so the manager
+  leaves the Raft membership first (never the last voter): it votes no
+  more and its Raft calls are refused, and its certificate, issued before
+  the removal, is refused by the API and the dispatcher, what it forwards
+  included. A removed manager held the CA key, so it could still certify
+  itself anew: only rotating the CA, not built yet, makes that sure. A
+  user is revoked by their RoleBindings: a request after a binding goes
+  is refused (a follower forwards it with the user's name and the leader
+  decides), and a session (exec, logs, port-forward) or watch open before
+  it ends within 5 s, saying why. A watch ends once a role it ran with is
+  lowered or taken, rather than go quiet on what the user may no longer
+  see. Users renew nothing: the dispatcher refuses their certificates.
 - **Join tokens**: `LGN-1-<ca-digest>-<secret>`, with separate tokens for workers and
   managers, and rotation on demand. The digest lets a joining node verify the
   cluster it reaches before sending anything. Built: the joining node reads

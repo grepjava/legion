@@ -330,6 +330,26 @@ the fake registries of the unit and API tests; jailer's handoff test
 (signed, by digest, unsigned then signed, another key, warn, registry
 down, a local image) runs it on the lab.
 
+Item 2, in progress (docs/DESIGN.md, Revocation). A survey of every
+principal across follower requests, renewal and open streams found
+three holes, each fixed and tested, the test failing without the fix:
+- a user's session (exec, logs, port-forward) outlived their RoleBinding:
+  it now ends within 5 s
+  (`a_users_session_ends_when_their_binding_goes`);
+- a user's watch went quiet on a namespace they lost, the client unable to
+  tell: it now ends saying why (`users_act_within_their_role_bindings`);
+- a manager could not be removed at all, though DESIGN.md said it was:
+  deleting its Node now takes it out of the Raft membership (never the
+  last voter) and refuses its certificate on the API and the dispatcher
+  (`a_removed_manager_leaves_the_membership_and_is_refused`). It held the
+  CA key, so only rotating the CA makes that sure; decided with the user
+  as a later item.
+And a gap: a worker's streams on a follower were checked against its own
+replica only. They now open once it has caught up with the leader
+(`a_follower_cut_off_from_the_leader_opens_no_worker_stream`). Still to
+test: a revoked user and a removed worker going through a real follower,
+and a removed worker's other streams.
+
 Exit: invalid or missing required signatures are refused under the policy.
 
 ### Phase 8: Joint qualification
