@@ -4806,3 +4806,192 @@ async fn a_removed_manager_leaves_the_membership_and_is_refused() {
 fn manager_name(addr: &str) -> String {
     format!("m-{}", addr.rsplit(':').next().unwrap_or_default())
 }
+
+/// Revocation through a real follower (PLAN.md phase 7): a user whose
+/// RoleBinding goes, and a worker whose Node goes, are refused by the
+/// follower too, for what it forwards (requests, renewals) and what it
+/// serves itself (streams, whichever it had open).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revocation_holds_through_a_follower() {
+    use legion_proto::v1::{PoliciesRequest, RoutesRequest};
+    let ca = Ca::generate().unwrap();
+    let first = Running::start_with(Some(&ca)).await;
+    first.cluster().await.init(InitRequest {}).await.unwrap();
+    let token = first
+        .cluster()
+        .await
+        .join_token(JoinTokenRequest {
+            role: "manager".into(),
+            rotate: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    let follower = Running::join(&first.addr, &token, "m2", creds(&ca, "admin", Role::Admin)).await;
+    let mut admin = first.objects().await;
+    admin
+        .apply(object("Namespace", "", "shop", serde_json::json!({})))
+        .await
+        .unwrap();
+    admin.apply(service_in("shop", "web")).await.unwrap();
+    admin.apply(binding("shop", "alice", "view")).await.unwrap();
+
+    // alice reads through the follower, and watches there.
+    let mut alice = ObjectsClient::new(
+        follower
+            .channel(Some(&creds(&ca, "alice", Role::User)))
+            .await
+            .unwrap(),
+    );
+    eventually(|| {
+        let mut alice = alice.clone();
+        async move { alice.get(get("Service", "shop", "web")).await }
+    })
+    .await;
+    let mut watching = alice
+        .watch(WatchRequest {
+            kind: "Service".into(),
+            from_version: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // w1 registers through the follower and opens its streams there.
+    let w1 = DispatcherClient::new(
+        follower
+            .channel(Some(&creds(&ca, "w1", Role::Worker)))
+            .await
+            .unwrap(),
+    );
+    eventually(|| {
+        let mut d = w1.clone();
+        async move {
+            d.register(RegisterRequest {
+                node: String::new(),
+                status_json: br#"{"state":"ready"}"#.to_vec(),
+                role: String::new(),
+            })
+            .await
+        }
+    })
+    .await;
+    let heartbeat = || {
+        let mut d = w1.clone();
+        async move {
+            d.heartbeat(HeartbeatRequest {
+                node: String::new(),
+                usage: Vec::new(),
+            })
+            .await
+        }
+    };
+    heartbeat().await.unwrap();
+    let mut assignments = w1
+        .clone()
+        .assignments(AssignmentsRequest {
+            node: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut peers = w1
+        .clone()
+        .peers(PeersRequest {
+            node: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut policies = w1
+        .clone()
+        .policies(PoliciesRequest {
+            node: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut routes = w1
+        .clone()
+        .routes(RoutesRequest {
+            node: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // Both revoked on the leader.
+    admin
+        .delete(DeleteRequest {
+            r#ref: Some(get("RoleBinding", "shop", "alice")),
+            expected_version: None,
+        })
+        .await
+        .unwrap();
+    admin
+        .delete(DeleteRequest {
+            r#ref: Some(get("Node", "", "w1")),
+            expected_version: None,
+        })
+        .await
+        .unwrap();
+
+    // The follower forwards alice's read, and the leader refuses it.
+    let why = denied(alice.get(get("Service", "shop", "web")).await);
+    assert!(why.contains("alice"), "{why}");
+    // What w1 calls through the follower is refused, renewals too.
+    let why = denied(heartbeat().await);
+    assert!(why.contains("node w1 was removed"), "{why}");
+    let (_, csr_pem) = legion_pki::request().unwrap();
+    denied(w1.clone().renew(RenewRequest { csr_pem }).await);
+    // And every stream either had open there ends, saying why.
+    async fn ends<T>(what: &str, s: &mut tonic::Streaming<T>) {
+        let ended = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match s.message().await {
+                    Ok(Some(_)) => continue,
+                    other => return other,
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what} ends"));
+        assert_eq!(
+            ended.err().map(|e| e.code()),
+            Some(Code::PermissionDenied),
+            "{what}"
+        );
+    }
+    ends("alice's watch", &mut watching).await;
+    ends("assignments", &mut assignments).await;
+    ends("peers", &mut peers).await;
+    ends("policies", &mut policies).await;
+    ends("routes", &mut routes).await;
+    // A new one opens nowhere.
+    let refused = w1
+        .clone()
+        .endpoints(EndpointsRequest {
+            node: String::new(),
+        })
+        .await;
+    denied(refused.map(drop));
+    // Users renew nothing: their certificates don't reach the dispatcher.
+    let mut as_user = DispatcherClient::new(
+        follower
+            .channel(Some(&creds(&ca, "bob", Role::User)))
+            .await
+            .unwrap(),
+    );
+    let (_, csr_pem) = legion_pki::request().unwrap();
+    denied(as_user.renew(RenewRequest { csr_pem }).await);
+    follower.stop().await;
+    first.stop().await;
+}
+
+/// `service` in another namespace.
+fn service_in(namespace: &str, name: &str) -> ApplyRequest {
+    let mut s = service(name, 1);
+    s.namespace = namespace.into();
+    apply(s)
+}

@@ -346,9 +346,13 @@ three holes, each fixed and tested, the test failing without the fix:
   as a later item.
 And a gap: a worker's streams on a follower were checked against its own
 replica only. They now open once it has caught up with the leader
-(`a_follower_cut_off_from_the_leader_opens_no_worker_stream`). Still to
-test: a revoked user and a removed worker going through a real follower,
-and a removed worker's other streams.
+(`a_follower_cut_off_from_the_leader_opens_no_worker_stream`). Through a
+real follower, a revoked user and a removed worker are refused, for what
+it forwards (reads, heartbeats, renewals) and what it serves (the user's
+watch and the worker's assignments, peers, policies and routes, each
+ending), and a user's certificate renews nothing
+(`revocation_holds_through_a_follower`). Item 2 is done but for CA
+rotation, its own item to come.
 
 Exit: invalid or missing required signatures are refused under the policy.
 
