@@ -194,7 +194,7 @@ pub fn check(
         .map_err(|_| "the signature is not base64".to_owned())?;
     Signature::from_der(&der).map_err(|_| "the signature is not a DER ECDSA signature")?;
     let Some(index) = keys.iter().position(|k| k.verifies(payload, signature)) else {
-        return Err("no key of the policy made it".to_owned());
+        return Err("made by none of the keys given".to_owned());
     };
     let signed: serde_json::Value =
         serde_json::from_slice(payload).map_err(|_| "the payload is not JSON".to_owned())?;
@@ -275,7 +275,10 @@ pub async fn verify(
         Err(e) => return Err(fetch(e)),
     };
     let tmp = tempfile::tempdir().map_err(|e| VerifyError::CannotFetch(e.to_string()))?;
-    let mut last = "no layer of it holds a signature".to_owned();
+    // Why none was good: a layer one of `keys` made says more (it signs
+    // something else, or another repository) than one none of them made.
+    let mut why = "no layer of it holds a signature".to_owned();
+    let mut by_a_key = false;
     for (i, layer) in layers.iter().enumerate() {
         let Some(signature) = layer.annotations.get(SIGNATURE_ANNOTATION) else {
             continue;
@@ -299,10 +302,16 @@ pub async fn verify(
                     fingerprint: keys[k].fingerprint().to_owned(),
                 });
             }
-            Err(why) => last = why,
+            Err(failed) => {
+                let keyed = keys.iter().any(|k| k.verifies(&payload, signature));
+                if keyed || !by_a_key {
+                    why = failed;
+                    by_a_key |= keyed;
+                }
+            }
         }
     }
-    Err(VerifyError::Bad(last))
+    Err(VerifyError::Bad(why))
 }
 
 #[cfg(test)]
@@ -375,7 +384,7 @@ mod tests {
         let err = |p: &[u8], s: &str, keys: &[PublicKey], d: &str, r: &Reference| {
             check(p, s, keys, d, r).unwrap_err()
         };
-        assert!(err(&payload, &sig, &[other.public()], DIGEST, &r).contains("no key"));
+        assert!(err(&payload, &sig, &[other.public()], DIGEST, &r).contains("none of the keys"));
         assert!(err(&payload, "!!", &keys, DIGEST, &r).contains("base64"));
         assert!(err(&payload, "aGVsbG8=", &keys, DIGEST, &r).contains("DER"));
         let other_digest = DIGEST.replace('a', "b");
@@ -384,7 +393,7 @@ mod tests {
         assert!(err(&payload, &sig, &keys, DIGEST, &mirror).contains("ghcr.io/me/app"));
         // The bytes signed, not the JSON they hold: spaces added break it.
         let spaced = text.replace(':', ": ").into_bytes();
-        assert!(err(&spaced, &sig, &keys, DIGEST, &r).contains("no key"));
+        assert!(err(&spaced, &sig, &keys, DIGEST, &r).contains("none of the keys"));
         // Something else the key signed is not an image signature.
         let note = br#"{"critical":{"type":"a note"}}"#;
         let signed_note = sign(note, &key);

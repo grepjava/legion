@@ -644,7 +644,7 @@ async fn signatures_are_verified_as_kept_in_the_registry() {
         &[(payload.clone(), Some(cosign::sign(&payload, &other)))],
     );
     match verify().await {
-        Err(VerifyError::Bad(why)) => assert!(why.contains("no key"), "{why}"),
+        Err(VerifyError::Bad(why)) => assert!(why.contains("none of the keys"), "{why}"),
         other => panic!("{other:?}"),
     }
 
@@ -674,6 +674,26 @@ async fn signatures_are_verified_as_kept_in_the_registry() {
     let other_image = elsewhere.replace('d', "e");
     match cosign::verify(&client, &r, &other_image, &keys, None).await {
         Err(VerifyError::Bad(why)) => assert!(why.contains("it signs"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+
+    // A mirror's signatures: the policy's key made one, for the image where
+    // it came from, and another key the last. Why it fails is the first.
+    let origin = Reference::parse(&format!("{addr}/origin/app:1")).unwrap();
+    let mirrored = cosign::payload(&origin, &digest);
+    keep_signatures(
+        &registry,
+        &digest,
+        &[
+            (mirrored.clone(), Some(cosign::sign(&mirrored, &key))),
+            (payload.clone(), Some(cosign::sign(&payload, &other))),
+        ],
+    );
+    match verify().await {
+        Err(VerifyError::Bad(why)) => {
+            assert!(why.contains("it signs the image in"), "{why}");
+            assert!(why.contains("origin/app"), "{why}");
+        }
         other => panic!("{other:?}"),
     }
 

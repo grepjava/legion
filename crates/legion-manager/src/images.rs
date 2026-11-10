@@ -510,7 +510,7 @@ mod tests {
                 Some(f) if keys.iter().any(|k| k.fingerprint() == f) => Ok(Verified {
                     fingerprint: f.clone(),
                 }),
-                Some(_) => Err(VerifyError::Bad("no key of the policy made it".into())),
+                Some(_) => Err(VerifyError::Bad("made by none of the keys given".into())),
             }
         }
     }
@@ -580,7 +580,7 @@ containers:
         assert!(verified.is_empty());
         assert_eq!(
             held,
-            ["bad signature on ghcr.io/me/app:1: no key of the policy made it (policy me)"]
+            ["bad signature on ghcr.io/me/app:1: made by none of the keys given (policy me)"]
         );
         // Every policy covering an image must be met.
         let both = [
