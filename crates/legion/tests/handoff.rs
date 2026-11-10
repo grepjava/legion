@@ -1391,6 +1391,11 @@ fn a_jailer_image_goes_from_build_to_recovery() {
         text(&out.stdout).trim().to_owned()
     };
     let jailer_version = version(&jailer.bin);
+    // jailer names the Legion crates it was built with, from its lock.
+    assert!(
+        jailer_version.contains(" (legion ") && !jailer_version.ends_with("(legion unknown)"),
+        "jailer names the Legion crates it was built with: {jailer_version}"
+    );
     let legion_version = version(common::LEGION);
     let tree = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.qualify-revision");
     let revision = std::fs::read_to_string(&tree)
@@ -1436,7 +1441,11 @@ fn a_jailer_image_goes_from_build_to_recovery() {
         "what was built is what was pushed"
     );
     let (digest, pinned) = (p.digest.clone(), p.pinned.clone());
-    jailer.run(&["verify", "--key", &public, &image]);
+    let said = jailer.run(&["verify", "--key", &public, &image]);
+    assert!(
+        said.contains(&format!("is signed by the key {key}")),
+        "jailer's check names the key Legion's policy will: {said}"
+    );
 
     step("Legion, under a policy enforcing jailer's key, runs it on a VM");
     lab.flags = format!("{} --insecure-registry {addr}", lab.flags);
