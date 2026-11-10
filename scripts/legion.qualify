@@ -59,6 +59,7 @@ test legion adopt pods_outlive_the_daemon host shared 1800 kld:if_bridge kld:if_
 test legion-sys contract real_modules host isolated 120
 test legion exit app_survives_failures host isolated 1800 kld:pf
 test legion memory postgres_under_a_memory_limit host isolated 1800 env:LEGION_CLUSTER_LAB env:LEGION_PG_IMAGE
+test legion linux linux_application_images host isolated 2400 env:LEGION_CLUSTER_LAB kld:linux64
 test legion storage pod_on_network_storage host isolated 900 env:LEGION_STORAGE_NFS env:LEGION_STORAGE_ISCSI
 test legion-sys live network_storage host isolated 300 env:LEGION_SYS_NFS env:LEGION_SYS_ISCSI
 test legion-net bhyve guest_on_the_bridge vnet isolated 900 kld:vmm env:LEGION_BHYVE_DISK env:LEGION_BHYVE_LAB
