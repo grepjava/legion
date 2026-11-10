@@ -12,6 +12,12 @@
 //!   node is drained, and on the next node it runs the same manifest with
 //!   the same data, its first writer having stopped before the data moved;
 //!   and again with the move's last part cut short and sent again.
+//! - Signed (PLAN.md phase 7): jailer signs what it pushes as cosign does,
+//!   and an ImagePolicy wanting its key runs it, by tag or by the digest
+//!   jailer recorded; it holds an unsigned image until jailer signs it, one
+//!   signed by another key, a loaded one, and an update whose signature the
+//!   registry cannot give, the old tasks running; under warn it runs an
+//!   unsigned image and says so.
 //!
 //! It drives real daemons, so it is ignored by default and run by hand on a
 //! FreeBSD host as root, with the lab of `tests/common` (see there), and with
@@ -657,11 +663,15 @@ fn a_jailer_image_keeps_its_data_through_a_drain() {
 struct Registry {
     addr: String,
     child: Child,
+    /// The file that takes the registry down, as [`Registry::down`] says.
+    down: PathBuf,
 }
 
 impl Registry {
     fn start(lab: &Lab) -> Registry {
         let file = lab.dir.join("registry.addr");
+        let down = PathBuf::from(format!("{}.down", file.display()));
+        let _ = std::fs::remove_file(&down);
         let log = std::fs::File::create(lab.dir.join("registry.log")).unwrap();
         let child = Command::new(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", "registry", "--test-threads=1"])
@@ -675,10 +685,23 @@ impl Registry {
         let mut r = Registry {
             addr: String::new(),
             child,
+            down,
         };
         wait("the registry", 30, || file.exists());
         r.addr = std::fs::read_to_string(&file).unwrap();
         r
+    }
+
+    /// With `Some("signatures")` the registry answers 503 for signature
+    /// manifests, with `Some("all")` for every request, and with `None` as
+    /// usual again; what it holds stays.
+    fn down(&self, mode: Option<&str>) {
+        match mode {
+            Some(m) => std::fs::write(&self.down, m).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&self.down);
+            }
+        }
     }
 }
 
@@ -701,13 +724,15 @@ struct Held {
 /// The test's registry, run by [`a_jailer_push_is_what_legion_runs`]:
 /// plain HTTP on `LEGION_HANDOFF_REGISTRY_HOST`, without authentication,
 /// taking monolithic uploads into memory. It writes the address it took to
-/// the file `LEGION_HANDOFF_REGISTRY`.
+/// the file `LEGION_HANDOFF_REGISTRY`, and is down as that file's name with
+/// `.down` says (see [`Registry::down`]).
 #[test]
 #[ignore = "the registry of a_jailer_push_is_what_legion_runs, run by it"]
 fn registry() {
     let Ok(file) = std::env::var("LEGION_HANDOFF_REGISTRY") else {
         return;
     };
+    DOWN.set(format!("{file}.down")).unwrap();
     let host = std::env::var("LEGION_HANDOFF_REGISTRY_HOST").unwrap();
     let listener = std::net::TcpListener::bind(format!("{host}:0")).unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -766,6 +791,9 @@ fn serve(stream: std::net::TcpStream, held: &Mutex<Held>) -> std::io::Result<()>
     }
 }
 
+/// The file whose text takes the registry down: `signatures` or `all`.
+static DOWN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// The status, headers and body for one request. A HEAD gets a GET's
 /// headers, its Content-Length included, and no body.
 fn answer(
@@ -778,6 +806,14 @@ fn answer(
     const NOT_FOUND: &str = "404 Not Found";
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let last = path.rsplit('/').next().unwrap_or("").to_owned();
+    let down = DOWN
+        .get()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    let signature = path.contains("/manifests/") && last.ends_with(".sig");
+    if down == "all" || (down == "signatures" && signature) {
+        return ("503 Service Unavailable", Vec::new(), Vec::new());
+    }
     let mut h = held.lock().unwrap();
     if path == "/v2/" {
         return ("200 OK", Vec::new(), Vec::new());
@@ -1009,5 +1045,250 @@ fn a_jailer_image_keeps_its_data_through_a_cut_move() {
         lab.holds(&from, "data-keep-0").is_empty()
     });
     lab.delete("keep");
+    step("done");
+}
+
+/// An ImagePolicy wanting one of `keys` (PEM) on the images `images` name.
+fn policy(name: &str, images: &[&str], keys: &[&str], mode: &str) -> String {
+    let images = images
+        .iter()
+        .map(|i| format!("\"{i}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut yaml = format!(
+        "apiVersion: legion/v1
+kind: ImagePolicy
+metadata: {{ name: {name} }}
+spec:
+  images: [{images}]
+  mode: {mode}
+  keys:
+"
+    );
+    for key in keys {
+        yaml.push_str("    - |\n");
+        for line in key.lines() {
+            yaml.push_str(&format!("      {line}\n"));
+        }
+    }
+    yaml
+}
+
+impl Lab {
+    /// What a service's status says of its images.
+    fn images(&self, service: &str) -> Value {
+        self.service(service)["status"]["images"].clone()
+    }
+
+    /// Waits for `service`'s pod to be held with a message starting `says`.
+    fn held(&self, service: &str, says: &str) {
+        wait(&format!("{service} held: {says}"), 180, || {
+            self.images(service)["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with(says))
+        });
+    }
+
+    /// Checks that `image` of `service` was verified on `digest` by `key`.
+    fn verified_by(&self, service: &str, image: &str, digest: &str, key: &str) {
+        let v = &self.images(service)["verified"][image];
+        assert_eq!(v["digest"], digest, "{v}");
+        assert_eq!(v["key"], key, "{v}");
+    }
+
+    /// Applies `yaml`, which must be refused with a message holding `says`.
+    fn refused(&self, name: &str, yaml: &str, says: &str) {
+        let path = self.dir.join(format!("{name}.yaml"));
+        std::fs::write(&path, yaml).unwrap();
+        let out = self.legion(&["apply", "-f", path.to_str().unwrap()], &[]);
+        let said = format!("{}{}", text(&out.stdout), text(&out.stderr));
+        assert!(!out.status.success(), "{name} was taken: {said}");
+        assert!(said.contains(says), "{name}: {said}");
+    }
+}
+
+/// jailer's signature, as Legion checks it (PLAN.md phase 7): an
+/// ImagePolicy wanting jailer's key runs what jailer signed, and holds what
+/// it did not, or what it cannot check, the old tasks running.
+#[test]
+#[ignore = "needs root and ZFS on FreeBSD, two more nodes and jailer; see the module docs"]
+fn a_jailer_signature_is_what_legion_checks() {
+    let mut lab = Lab::from_env();
+    let registry = Registry::start(&lab);
+    let addr = registry.addr.clone();
+    let jailer = Jailer::new(&lab, &[&addr]);
+    let step = |what: &str| eprintln!("--- {what}");
+
+    step("jailer makes two key pairs");
+    let path = |p: PathBuf| p.to_str().unwrap().to_owned();
+    for name in ["good", "other"] {
+        jailer.run(&["key", "generate", &path(lab.dir.join(name))]);
+    }
+    let good_key = path(lab.dir.join("good.key"));
+    let good_pub = path(lab.dir.join("good.pub"));
+    let other_key = path(lab.dir.join("other.key"));
+    let pem = std::fs::read_to_string(&good_pub).unwrap();
+    let key = legion_image::cosign::PublicKey::from_pem(&pem)
+        .unwrap()
+        .fingerprint()
+        .to_owned();
+
+    // Builds a new image and pushes it to `image`, signed with `sign` if
+    // given: its pinned reference, digest and id, as recorded.
+    let dir = lab.dir.clone();
+    let push = |name: &str, image: &str, sign: Option<&str>| {
+        let rec = dir.join(format!("{name}.json"));
+        let id = unique(name);
+        let tag = format!("handoff/{name}:1");
+        jailer.build(&dir, &tag, &id, &rec);
+        let mut args = vec!["push", "--record", rec.to_str().unwrap()];
+        if let Some(k) = sign {
+            args.extend(["--sign-key", k]);
+        }
+        args.extend([tag.as_str(), image]);
+        jailer.run(&args);
+        let r = record(&rec);
+        let p = r.published.last().expect("the push is recorded");
+        assert_eq!(p.reference, image);
+        (p.pinned.clone(), p.digest.clone(), id)
+    };
+
+    step("jailer pushes a signed image and checks its signature");
+    let image = format!("{addr}/handoff/app:1");
+    let (pinned1, digest1, id1) = push("signed", &image, Some(&good_key));
+    jailer.run(&["verify", "--key", &good_pub, &image]);
+
+    step("a policy without a registry, or with a bad key, is refused");
+    lab.flags = format!("{} --insecure-registry {addr}", lab.flags);
+    three_nodes(&mut lab, &["--insecure-registry", &addr]);
+    lab.apply("namespace", NAMESPACE);
+    lab.refused(
+        "nohost",
+        &policy("nohost", &["handoff/**"], &[&pem], "enforce"),
+        "handoff/**",
+    );
+    let bad = "-----BEGIN PUBLIC KEY-----\nbm90IGEga2V5\n-----END PUBLIC KEY-----\n";
+    lab.refused(
+        "badkey",
+        &policy("badkey", &[&format!("{addr}/**")], &[bad], "enforce"),
+        "key",
+    );
+
+    step("policies: jailer's key enforced on the registry and loaded images, warned elsewhere");
+    let enforced = [
+        format!("{addr}/handoff/**"),
+        "localhost/handoff/**".to_owned(),
+    ];
+    let enforced: Vec<&str> = enforced.iter().map(String::as_str).collect();
+    lab.apply(
+        "policy-signed",
+        &policy("signed", &enforced, &[&pem], "enforce"),
+    );
+    lab.apply(
+        "policy-warned",
+        &policy("warned", &[&format!("{addr}/warned/**")], &[&pem], "warn"),
+    );
+
+    step("the signed image runs, checked on the digest jailer signed");
+    lab.apply("web", &service("web", &image, 2, ""));
+    lab.runs("web", &image, 2, &digest1, Some(&pinned1), &id1);
+    lab.verified_by("web", &image, &digest1, &key);
+
+    step("so does the record's reference by digest");
+    lab.apply("pinned", &service("pinned", &pinned1, 1, ""));
+    lab.runs("pinned", &pinned1, 1, &digest1, None, &id1);
+    lab.verified_by("pinned", &pinned1, &digest1, &key);
+    lab.delete("pinned");
+
+    step("an unsigned push is held until jailer signs it");
+    let plain = format!("{addr}/handoff/plain:1");
+    let (pinned2, digest2, id2) = push("plain", &plain, None);
+    lab.apply("plain", &service("plain", &plain, 1, ""));
+    lab.held("plain", &format!("{plain} is unsigned"));
+    assert!(lab.running("plain").is_empty(), "no task of it runs");
+    jailer.run(&["sign", "--key", &good_key, &plain]);
+    lab.runs("plain", &plain, 1, &digest2, Some(&pinned2), &id2);
+    lab.verified_by("plain", &plain, &digest2, &key);
+    lab.delete("plain");
+
+    step("one signed by another key is refused, and stays refused");
+    let rogue = format!("{addr}/handoff/rogue:1");
+    push("rogue", &rogue, Some(&other_key));
+    lab.apply("rogue", &service("rogue", &rogue, 1, ""));
+    let refusal = format!("bad signature on {rogue}");
+    lab.held("rogue", &refusal);
+    // Past a retry.
+    std::thread::sleep(std::time::Duration::from_secs(40));
+    let images = lab.images("rogue");
+    assert!(
+        images["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with(&refusal)),
+        "{images}"
+    );
+    assert!(lab.running("rogue").is_empty(), "no task of it runs");
+    lab.delete("rogue");
+
+    step("under warn, an unsigned image runs, and the status says so");
+    let warned = format!("{addr}/warned/app:1");
+    let (pinned3, digest3, id3) = push("warned", &warned, None);
+    lab.apply("warned", &service("warned", &warned, 1, ""));
+    wait("the warned task", 600, || {
+        let tasks = lab.running("warned");
+        tasks.len() == 1 && tasks[0]["status"]["images"][&warned] == digest3.as_str()
+    });
+    let images = lab.images("warned");
+    assert_eq!(images["resolved"][&warned], pinned3.as_str(), "{images}");
+    assert!(images.get("message").is_none(), "{images}");
+    let unsigned = format!("{warned} is unsigned");
+    assert!(
+        images["warning"]
+            .as_str()
+            .is_some_and(|w| w.starts_with(&unsigned)),
+        "{images}"
+    );
+    assert!(images["verified"].get(&warned).is_none(), "{images}");
+    assert_eq!(lab.id_in(&lab.running("warned")[0]), id3);
+    lab.delete("warned");
+
+    step("an update whose signature the registry cannot give waits, the old tasks running");
+    let (pinned4, digest4, id4) = push("next", &image, Some(&good_key));
+    registry.down(Some("signatures"));
+    let deploy = |n: u32| format!("        env: [{{ name: DEPLOY, value: \"{n}\" }}]\n");
+    lab.apply("web", &service("web", &image, 2, &deploy(2)));
+    lab.held("web", &format!("cannot check the signature of {image}"));
+    let old = lab.running("web");
+    assert_eq!(old.len(), 2, "the old tasks run on");
+    for t in &old {
+        assert_eq!(t["status"]["images"][&image], digest1.as_str(), "{t}");
+    }
+
+    step("the registry back, the update goes through");
+    registry.down(None);
+    lab.runs("web", &image, 2, &digest4, Some(&pinned4), &id4);
+    lab.verified_by("web", &image, &digest4, &key);
+
+    step("with the registry down altogether, the next update waits too");
+    registry.down(Some("all"));
+    lab.apply("web", &service("web", &image, 2, &deploy(3)));
+    wait("web held", 180, || {
+        lab.images("web")["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty())
+    });
+    assert_eq!(lab.running("web").len(), 2, "the old tasks run on");
+    registry.down(None);
+    lab.runs("web", &image, 2, &digest4, Some(&pinned4), &id4);
+    lab.delete("web");
+
+    step("a loaded image the policy names has no signature to check");
+    let tar = lab.dir.join("signed.oci.tar");
+    jailer.run(&["export", "handoff/signed:1", tar.to_str().unwrap()]);
+    lab.load_image(tar.to_str().unwrap());
+    let local = "localhost/handoff/signed:1";
+    lab.apply("local", &service("local", local, 1, ""));
+    lab.held("local", &format!("{local} is local and has no signature"));
+    assert!(lab.running("local").is_empty(), "no task of it runs");
+    lab.delete("local");
     step("done");
 }
