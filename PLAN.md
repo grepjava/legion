@@ -319,6 +319,17 @@ Goal: an explicit policy on which images may run, and who did what.
 3. Add audit events naming actor, action, target and result, never secret
    contents, with a retention rule.
 
+State, 10 November 2026: item 1 is built (docs/DESIGN.md, Signatures),
+the shape agreed with jailer: cosign key-based signatures, as jailer
+makes them, checked by `ImagePolicy` as the leader resolves a pod, in
+`enforce` or `warn` mode; a registry that cannot be read holds an
+update, its old tasks running, and is tried again every 30 s. The code
+making and checking signatures is one module, `legion_image::cosign`,
+for both; jailer moves its signing onto it at the next tag. Tested on
+the fake registries of the unit and API tests; jailer's handoff test
+(signed, by digest, unsigned then signed, another key, warn, registry
+down, a local image) runs it on the lab.
+
 Exit: invalid or missing required signatures are refused under the policy.
 
 ### Phase 8: Joint qualification

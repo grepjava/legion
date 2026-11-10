@@ -1114,6 +1114,39 @@ says why that went and what was kept of it.
   resolved or pinned. Each task reports the manifest its node ran. A
   container's `pullPolicy: never` asks no registry, and nor does a
   reference by digest or a `localhost/` name.
+- **Signatures** (phase 7): an `ImagePolicy` (cluster-scoped, the admin's
+  only) names repository patterns, P-256 public keys and a mode,
+  `enforce` (the default) or `warn`. A pattern is `registry[:port]/path`,
+  matched against the repository as a reference normalises it (Hub as
+  `docker.io/library/x`): `*` within one segment, `**` across any number
+  of whole segments, none included; the registry is matched whole, so a
+  pattern names it, and a pattern holds no tag or digest. Apply refuses
+  a pattern without a registry and a key that does not read. As the
+  leader resolves a pod, each image a policy covers is checked, as it is
+  to run (the digest resolved, or written), against every policy covering
+  it: the signature must be one cosign makes with a key pair (a "simple
+  signing" payload, ECDSA P-256, kept as a layer of `<repo>:sha256-<hex>.sig`,
+  the base64 DER signature in its annotation), by one of the policy's
+  keys, over the exact payload bytes, of type `cosign container image
+  signature`, naming that digest (the index for an image of several
+  platforms, as signed) and that repository (`index.docker.io` read as
+  `docker.io`). So a signed image copied to another repository, a mirror,
+  fails. The good signature is recorded with the resolved digests
+  (`status.images.verified[image]`: the digest and the key's fingerprint,
+  `sha256:` of its DER SubjectPublicKeyInfo), and scaling, restarts and a
+  lost node's replacement reuse it. Under `enforce`, an image unsigned,
+  badly signed, or whose signatures cannot be read (the registry down),
+  holds the pod with no tasks, saying which (`status.images.message`), so
+  an update waits with its old tasks running; it is tried again every
+  30 s, and a signature added later is found. A local image, and one
+  pulled `never` by tag (which runs whatever each node holds), are held:
+  no signature binds them. Under `warn` the pod runs and
+  `status.images.warning` says what was found. A changed policy applies
+  from the next resolution (an update, a new pod, a rollback) and stops
+  nothing running. Images no policy covers run as before. The code
+  making and checking signatures is `legion_image::cosign`, which jailer
+  signs with. Not covered: cosign v3 bundles (OCI 1.1 referrers), the
+  transparency log, keyless signing and cosign's encrypted private keys.
 - **Layers**: each layer is decompressed (gzip, zstd or plain) and checked
   against its `diff_id` **before** anything is extracted: images share
   layers by chain id, so a layer claiming another's id would otherwise
