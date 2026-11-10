@@ -1675,6 +1675,27 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
   it ends within 5 s, saying why. A watch ends once a role it ran with is
   lowered or taken, rather than go quiet on what the user may no longer
   see. Users renew nothing: the dispatcher refuses their certificates.
+- **Audit** (phase 7): every change (apply, delete, init, join tokens,
+  issuing users, autolock, joins, volume backups and restores), every
+  session opened (exec, logs, port-forward), and every request refused
+  for rights becomes an event (`legion_api::audit`): when, who (as their
+  certificate names them; a joining node as it asks to be named), what,
+  to which object (kind, namespace, name), how it ended (`ok`, `denied`,
+  `error`, with the refusal's message) and which manager decided. Events
+  name objects and never hold their specs, so no Secret's or Config's
+  value. Reads and watches are not audited. An event is recorded where
+  the request first arrives, which knows the caller, with the answer the
+  leader gave if it went there; a forwarded request is not recorded
+  again. Once a second the leader writes what it and the followers
+  recorded as one Config in the system namespace (`audit-<ms>-…`, its
+  count in a label), a follower handing its own to the leader
+  (`Cluster.RecordAudit`, managers only); what can't be handed on yet is
+  held, up to 10 000 events, the oldest then dropped and counted in the
+  log. The leader drops batches older than the retention
+  (`--audit-retention-days`, 30) and the oldest while there are more
+  events than `--audit-max-events` (100 000). `legion audit` (the admin's
+  only, `Cluster.Audit`) lists them oldest first, narrowed by `--since`,
+  `--actor`, `--action`, `--namespace`, `--kind` or `--denied`.
 - **Join tokens**: `LGN-1-<ca-digest>-<secret>`, with separate tokens for workers and
   managers, and rotation on demand. The digest lets a joining node verify the
   cluster it reaches before sending anything. Built: the joining node reads

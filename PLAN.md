@@ -354,6 +354,19 @@ ending), and a user's certificate renews nothing
 (`revocation_holds_through_a_follower`). Item 2 is done but for CA
 rotation, its own item to come.
 
+Item 3 is built (docs/DESIGN.md, Audit), as decided with the user: kept
+in the replicated store, for changes, sessions and refusals, not reads.
+An event is recorded where the request first arrives, a follower handing
+its own to the leader; the leader keeps them 30 days and at most 100 000,
+both settable. `legion audit` lists them, narrowed. Tested: the admin's
+Secret written through a follower is recorded with the admin as actor
+and the follower as where it was decided, alice's refusal with its
+message, and nothing of what the Secret held
+(`changes_and_refusals_are_audited_without_their_contents`); the oldest
+go past the cap (`the_audit_trail_keeps_only_what_its_retention_allows`);
+the CLI lists and narrows (`the_audit_trail_lists_changes_and_narrows`).
+Each test fails without what it covers.
+
 Exit: invalid or missing required signatures are refused under the policy.
 
 ### Phase 8: Joint qualification
