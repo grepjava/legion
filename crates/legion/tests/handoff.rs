@@ -1278,6 +1278,11 @@ fn a_jailer_signature_is_what_legion_checks() {
     });
     assert_eq!(lab.running("web").len(), 2, "the old tasks run on");
     registry.down(None);
+    // The update builds the same image: the old tasks run its digest
+    // already, so first the hold has to go, at the next try.
+    wait("web no longer held", 180, || {
+        lab.images("web").get("message").is_none()
+    });
     lab.runs("web", &image, 2, &digest4, Some(&pinned4), &id4);
     lab.delete("web");
 
