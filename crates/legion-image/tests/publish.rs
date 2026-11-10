@@ -581,3 +581,110 @@ async fn one_config_with_other_layer_blobs_is_another_image() {
         ["localhost/app:zst", "localhost/app:gz"]
     );
 }
+
+/// Keeps signature layers for `digest` in `registry` as cosign does: each
+/// a payload blob, with the signature annotation if given.
+fn keep_signatures(registry: &Mutex<Registry>, digest: &str, layers: &[(Vec<u8>, Option<String>)]) {
+    use legion_image::cosign::{PAYLOAD_TYPE, SIGNATURE_ANNOTATION};
+    let mut r = registry.lock().unwrap();
+    let mut descriptors = Vec::new();
+    for (payload, signature) in layers {
+        let d = sha256(payload);
+        r.blobs.insert(d.clone(), payload.clone());
+        descriptors.push(Descriptor {
+            media_type: PAYLOAD_TYPE.to_owned(),
+            digest: d,
+            size: payload.len() as u64,
+            platform: None,
+            annotations: signature
+                .iter()
+                .map(|s| (SIGNATURE_ANNOTATION.to_owned(), s.clone()))
+                .collect(),
+        });
+    }
+    let config = b"{}".to_vec();
+    let config_digest = sha256(&config);
+    r.blobs.insert(config_digest.clone(), config.clone());
+    let manifest = oci::Manifest::new(
+        Descriptor {
+            media_type: "application/vnd.oci.image.config.v1+json".to_owned(),
+            digest: config_digest,
+            size: config.len() as u64,
+            platform: None,
+            annotations: BTreeMap::new(),
+        },
+        descriptors,
+    );
+    let tag = format!("{}.sig", digest.replacen(':', "-", 1));
+    r.manifests
+        .insert(tag, serde_json::to_vec(&manifest).unwrap());
+}
+
+/// An image's signatures, as Legion checks them before it runs the image:
+/// none kept, none good, one good among others, and none to be had.
+#[tokio::test]
+async fn signatures_are_verified_as_kept_in_the_registry() {
+    use legion_image::cosign::{self, PrivateKey, VerifyError};
+    let registry = Arc::new(Mutex::new(Registry::default()));
+    let addr = serve(registry.clone()).await;
+    let client = Client::new().unwrap().plain_http(&addr);
+    let r = Reference::parse(&format!("{addr}/me/app:1")).unwrap();
+    let digest = format!("sha256:{}", "c".repeat(64));
+    let key = PrivateKey::generate();
+    let other = PrivateKey::generate();
+    let keys = [key.public()];
+    let verify = || cosign::verify(&client, &r, &digest, &keys, None);
+
+    assert_eq!(verify().await, Err(VerifyError::Unsigned));
+
+    let payload = cosign::payload(&r, &digest);
+    keep_signatures(
+        &registry,
+        &digest,
+        &[(payload.clone(), Some(cosign::sign(&payload, &other)))],
+    );
+    match verify().await {
+        Err(VerifyError::Bad(why)) => assert!(why.contains("no key"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+
+    // Signing adds layers: one without the annotation, one not base64, one
+    // by another key, and the good one.
+    keep_signatures(
+        &registry,
+        &digest,
+        &[
+            (payload.clone(), None),
+            (payload.clone(), Some("not base64!".to_owned())),
+            (payload.clone(), Some(cosign::sign(&payload, &other))),
+            (payload.clone(), Some(cosign::sign(&payload, &key))),
+        ],
+    );
+    let good = verify().await.unwrap();
+    assert_eq!(good.fingerprint, key.public().fingerprint());
+
+    // Signed for another image, the same key's signature is no good here.
+    let elsewhere = format!("sha256:{}", "d".repeat(64));
+    let moved = cosign::payload(&r, &elsewhere);
+    keep_signatures(
+        &registry,
+        &elsewhere.replace('d', "e"),
+        &[(moved.clone(), Some(cosign::sign(&moved, &key)))],
+    );
+    let other_image = elsewhere.replace('d', "e");
+    match cosign::verify(&client, &r, &other_image, &keys, None).await {
+        Err(VerifyError::Bad(why)) => assert!(why.contains("it signs"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+
+    // A registry that does not answer.
+    let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let gone_addr = gone.local_addr().unwrap().to_string();
+    drop(gone);
+    let down = Reference::parse(&format!("{gone_addr}/me/app:1")).unwrap();
+    let client = Client::new().unwrap().plain_http(&gone_addr);
+    match cosign::verify(&client, &down, &digest, &keys, None).await {
+        Err(VerifyError::CannotFetch(_)) => {}
+        other => panic!("{other:?}"),
+    }
+}

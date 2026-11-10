@@ -11,9 +11,11 @@ publish.workspace = true
 base64.workspace = true
 flate2 = "1.1"
 futures.workspace = true
+getrandom = "0.3"
 legion-api.workspace = true
 legion-sys.workspace = true
 libc.workspace = true
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "system-proxy", "stream", "json", "query"] }
 ruzstd = "0.9"
 serde.workspace = true

@@ -3,6 +3,7 @@
 //! building images (jailer), pushing and exporting them, and keeping them
 //! without ZFS.
 
+pub mod cosign;
 pub mod layer;
 pub mod oci;
 mod reference;
