@@ -125,6 +125,47 @@ impl Caller {
     pub fn may(&self, store: &Store, verb: Verb, kind: Kind, namespace: &str) -> bool {
         self.check(store, verb, kind, namespace).is_ok()
     }
+
+    /// The role RoleBindings give a user in each namespace; `None` for a
+    /// caller who may do everything.
+    pub fn roles(&self, store: &Store) -> Result<Option<Roles>, Status> {
+        let Caller::User(name) = self else {
+            return Ok(None);
+        };
+        let bindings = store
+            .list(Kind::RoleBinding, None)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut roles = Roles::new();
+        for o in &bindings.objects {
+            let Ok(b) = legion_api::parse::<RoleBindingSpec>(&o.spec) else {
+                continue;
+            };
+            if b.user == *name {
+                let role = roles.entry(o.metadata.namespace.clone()).or_insert(b.role);
+                *role = (*role).max(b.role);
+            }
+        }
+        Ok(Some(roles))
+    }
+}
+
+/// A user's role in each namespace they have one in.
+pub(crate) type Roles = std::collections::BTreeMap<String, NamespaceRole>;
+
+/// Why a stream opened with rights `before` must end, now that they are
+/// `now`: the first namespace where the user's role was lowered or taken.
+pub(crate) fn lowered(user: &str, before: &Roles, now: &Roles) -> Option<Status> {
+    before.iter().find_map(|(namespace, was)| {
+        let is = now.get(namespace);
+        (is < Some(was)).then(|| {
+            Status::permission_denied(match is {
+                Some(role) => format!(
+                    "user {user}'s role in namespace {namespace} is now {role}, not {was}: watch again"
+                ),
+                None => format!("user {user} has no role in namespace {namespace} now"),
+            })
+        })
+    })
 }
 
 /// The role it takes to `verb` objects of `kind`.
@@ -154,6 +195,29 @@ fn role_in(store: &Store, namespace: &str, user: &str) -> Result<Option<Namespac
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_role_lowered_or_taken_ends_a_stream_and_a_raised_one_does_not() {
+        let roles = |r: &[(&str, NamespaceRole)]| -> Roles {
+            r.iter().map(|(n, r)| ((*n).to_owned(), *r)).collect()
+        };
+        use NamespaceRole::{Edit, View};
+        let before = roles(&[("a", Edit), ("b", View)]);
+        assert!(lowered("alice", &before, &before).is_none());
+        assert!(
+            lowered(
+                "alice",
+                &before,
+                &roles(&[("a", Edit), ("b", Edit), ("c", View)])
+            )
+            .is_none()
+        );
+        let why = lowered("alice", &before, &roles(&[("a", View), ("b", View)])).unwrap();
+        assert_eq!(why.code(), tonic::Code::PermissionDenied);
+        assert!(why.message().contains("namespace a is now view"), "{why}");
+        let why = lowered("alice", &before, &roles(&[("a", Edit)])).unwrap();
+        assert!(why.message().contains("no role in namespace b"), "{why}");
+    }
 
     #[test]
     fn roles_needed() {

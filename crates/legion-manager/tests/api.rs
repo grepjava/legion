@@ -2610,6 +2610,20 @@ async fn users_act_within_their_role_bindings() {
         .await
         .unwrap();
     denied(alice.get(get("Service", "a", "web")).await);
+    // Her watch, open since before, ends saying so, rather than go quiet
+    // on namespace a.
+    let ended = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match events.message().await {
+                Ok(Some(_)) => continue,
+                other => return other,
+            }
+        }
+    })
+    .await
+    .expect("alice's watch ends");
+    let why = denied(ended);
+    assert!(why.contains("no role in namespace a"), "{why}");
 
     // Only the cluster admin certifies users.
     let (key_pem, csr) = legion_pki::request().unwrap();

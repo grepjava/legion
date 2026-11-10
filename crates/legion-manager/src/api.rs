@@ -828,15 +828,46 @@ impl Objects for ApiService {
             .store
             .watch(req.from_version, kind)
             .map_err(|e| Status::aborted(e.to_string()))?;
+        // A user's rights as the watch opens, raised as they grow: once a
+        // role it ran with is lowered or taken, the watch ends saying so,
+        // rather than leave out what the user may no longer see, which the
+        // client could not tell from nothing happening. Checked as each
+        // event goes out and every few seconds.
+        let mut rights = caller.roles(&self.store)?;
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let mut closing = self.closing.clone();
         tokio::spawn(async move {
+            let mut lowered = |store: &Store| -> Option<Status> {
+                let (Caller::User(user), Some(before)) = (&caller, &mut rights) else {
+                    return None;
+                };
+                let now = match caller.roles(store) {
+                    Ok(now) => now.unwrap_or_default(),
+                    Err(e) => return Some(e),
+                };
+                if let Some(why) = crate::authz::lowered(user, before, &now) {
+                    return Some(why);
+                }
+                *before = now;
+                None
+            };
             loop {
+                // `Some(None)`: time to check the rights again.
                 let next = tokio::select! {
-                    next = watcher.next() => Some(next),
+                    next = watcher.next() => Some(Some(next)),
                     _ = closing.wait_for(|c| *c) => None,
                     // Gone, though nothing it may see has happened since.
                     () = tx.closed() => return,
+                    () = tokio::time::sleep(crate::authz::REVOCATION_CHECK) => Some(None),
+                };
+                if let Some(why) = lowered(&store) {
+                    let _ = tx.send(Err(why)).await;
+                    return;
+                }
+                let next = match next {
+                    Some(Some(next)) => Some(next),
+                    Some(None) => continue,
+                    None => None,
                 };
                 // A client too slow to take this ends with the stream.
                 let Some(next) = next else {
