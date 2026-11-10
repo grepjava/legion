@@ -1317,8 +1317,6 @@ impl Dispatcher for DispatcherService {
     }
 }
 
-/// How often a worker's streams check that its node was not removed.
-
 /// Resolves, with the refusal, when the caller's node is removed.
 type Removal = Pin<Box<dyn Future<Output = Status> + Send>>;
 
