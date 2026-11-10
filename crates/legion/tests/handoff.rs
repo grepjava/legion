@@ -18,6 +18,10 @@
 //!   signed by another key, a loaded one, and an update whose signature the
 //!   registry cannot give, the old tasks running; under warn it runs an
 //!   unsigned image and says so.
+//! - From build to recovery (PLAN.md phase 8, jailer's shared qualification):
+//!   one signed jailer image runs under a policy enforcing its key, through
+//!   a drain, a move cut short and a restore onto another host, on the
+//!   digest jailer recorded at every stage, its data the same.
 //!
 //! It drives real daemons, so it is ignored by default and run by hand on a
 //! FreeBSD host as root, with the lab of `tests/common` (see there), and with
@@ -1295,5 +1299,327 @@ fn a_jailer_signature_is_what_legion_checks() {
     lab.held("local", &format!("{local} is local and has no signature"));
     assert!(lab.running("local").is_empty(), "no task of it runs");
     lab.delete("local");
+    step("done");
+}
+
+/// Checks a writer's log through moves and a restore: `n` writers, each
+/// starting after the one before it stopped, every line of each there,
+/// except that the one at `backed_up` (counting from 0) has no last line
+/// saying it stopped: the backup the next writer was restored from was
+/// taken as it ran, so its lines end where the backup was taken.
+fn writers_in_turn(log: &str, n: usize, backed_up: usize) {
+    let w = writers(log);
+    assert_eq!(w.len(), n, "{n} writers, one after another\n{log}");
+    for (i, (me, lines)) in w.iter().enumerate() {
+        let numbered = if i == backed_up || i == n - 1 {
+            &lines[..]
+        } else {
+            assert_eq!(
+                lines.last().map(String::as_str),
+                Some("stop"),
+                "writer {i} ({me}) stopped before the next began\n{log}"
+            );
+            &lines[..lines.len() - 1]
+        };
+        assert!(
+            numbered.len() > 1,
+            "writer {i} ({me}) wrote for a while\n{log}"
+        );
+        for (k, line) in numbered.iter().enumerate() {
+            assert_eq!(
+                *line,
+                (k + 1).to_string(),
+                "no line of writer {i} lost\n{log}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_backup_taken_as_a_writer_ran_ends_its_lines() {
+    writers_in_turn("a 1\na 2\na stop\nb 1\nb 2\nb 3\nc 1\nc 2\n", 3, 1);
+}
+
+#[test]
+#[should_panic(expected = "stopped before the next began")]
+fn a_writer_cut_off_unbacked_is_refused() {
+    writers_in_turn("a 1\na 2\nb 1\nb 2\n", 2, 5);
+}
+
+impl Lab {
+    /// Checks that `service` is verified on `digest` by `key` for `image`,
+    /// and that each of its running tasks runs that digest.
+    fn carries(&self, service: &str, image: &str, digest: &str, key: &str, at: &str) {
+        self.verified_by(service, image, digest, key);
+        for t in self.running(service) {
+            assert_eq!(
+                t["status"]["images"][image], digest,
+                "{at}: the digest jailer recorded\n{t}"
+            );
+        }
+    }
+}
+
+/// Phase 8 of PLAN.md, jailer's shared qualification: one jailer image,
+/// one identity, from its build to its recovery. jailer builds a writer,
+/// signs it and pushes it; Legion runs it under an ImagePolicy enforcing
+/// jailer's key, drains its node, moves it back with the move's last part
+/// cut short, backs its Volume up, loses the host it is on and restores it
+/// onto another. At every stage the task runs the digest jailer recorded,
+/// the one the policy verified, and its data is the same, byte for byte.
+///
+/// A drain or a move keeps the verification the pod was given, for the
+/// same digest; a restore applies the Service again, and the policy checks
+/// the signature again before its task runs.
+#[test]
+#[ignore = "needs root and ZFS on FreeBSD, two more nodes and jailer; see the module docs"]
+fn a_jailer_image_goes_from_build_to_recovery() {
+    let mut lab = Lab::from_env();
+    let registry = Registry::start(&lab);
+    let addr = registry.addr.clone();
+    let jailer = Jailer::new(&lab, &[&addr]);
+    let step = |what: &str| eprintln!("--- {what}");
+
+    step("the versions: jailer, the Legion crates it was built with, and Legion");
+    let version = |bin: &str| {
+        let out = Command::new(bin).arg("--version").output().unwrap();
+        assert!(
+            out.status.success(),
+            "{bin} --version: {}",
+            text(&out.stderr)
+        );
+        text(&out.stdout).trim().to_owned()
+    };
+    let jailer_version = version(&jailer.bin);
+    let legion_version = version(common::LEGION);
+    let tree = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.qualify-revision");
+    let revision = std::fs::read_to_string(&tree)
+        .map(|r| r.trim().to_owned())
+        .unwrap_or_else(|_| "unrecorded".to_owned());
+    eprintln!("versions: {jailer_version}; {legion_version} at {revision}");
+
+    step("jailer makes a key pair, builds a writer, signs it and pushes it");
+    let path = |p: PathBuf| p.to_str().unwrap().to_owned();
+    jailer.run(&["key", "generate", &path(lab.dir.join("chain"))]);
+    let sign_key = path(lab.dir.join("chain.key"));
+    let public = path(lab.dir.join("chain.pub"));
+    let pem = std::fs::read_to_string(&public).unwrap();
+    let key = legion_image::cosign::PublicKey::from_pem(&pem)
+        .unwrap()
+        .fingerprint()
+        .to_owned();
+    let rec = lab.dir.join("chain.json");
+    let id = unique("chain");
+    jailer.build_with(
+        &lab.dir,
+        "handoff/chain:1",
+        &id,
+        &rec,
+        &[("writer", WRITER)],
+        &[],
+    );
+    let image = format!("{addr}/handoff/chain:1");
+    jailer.run(&[
+        "push",
+        "--record",
+        rec.to_str().unwrap(),
+        "--sign-key",
+        &sign_key,
+        "handoff/chain:1",
+        &image,
+    ]);
+    let r = record(&rec);
+    let p = r.published.last().expect("the push is recorded");
+    assert_eq!(p.reference, image);
+    assert_eq!(
+        p.digest, r.image.manifest,
+        "what was built is what was pushed"
+    );
+    let (digest, pinned) = (p.digest.clone(), p.pinned.clone());
+    jailer.run(&["verify", "--key", &public, &image]);
+
+    step("Legion, under a policy enforcing jailer's key, runs it on a VM");
+    lab.flags = format!("{} --insecure-registry {addr}", lab.flags);
+    three_nodes(&mut lab, &["--insecure-registry", &addr]);
+    lab.apply("namespace", NAMESPACE);
+    lab.apply(
+        "policy",
+        &policy(
+            "chain",
+            &[&format!("{addr}/handoff/**")],
+            &[&pem],
+            "enforce",
+        ),
+    );
+    // The task and its moves on the VMs, one of which the restore loses.
+    lab.ok(&["node", "pause", "n1"]);
+    let held = keeper(&image, "  maxUnavailable: 0\n");
+    let free = keeper(&image, "  maxUnavailable: 1\n");
+    lab.apply("keep", &free);
+    let first = lab.one("keep", &image, &digest);
+    assert_eq!(lab.images("keep")["resolved"][&image], pinned.as_str());
+    lab.carries("keep", &image, &digest, &key, "deployed");
+    assert_eq!(lab.id_in(&first), id, "the build jailer recorded");
+    assert_eq!(text(&lab.file_in(&first, "/data/born")), id);
+    let blob = lab.file_in(&first, "/data/blob");
+    assert_eq!(blob.len(), 256 * 1024);
+    let a = first["spec"]["node"].as_str().unwrap().to_owned();
+    let b = if a == "n2" { "n3" } else { "n2" }.to_owned();
+    eprintln!("keep on {a}; the other VM is {b}");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    let drain = |node: &str| {
+        let out = lab.legion(
+            &[
+                "node",
+                "drain",
+                node,
+                "--wait",
+                "--timeout",
+                "900",
+                "-o",
+                "json",
+            ],
+            &[],
+        );
+        assert!(
+            out.status.success(),
+            "drain --wait: {}{}",
+            text(&out.stdout),
+            text(&out.stderr)
+        );
+        let done: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(done["phase"], "completed", "{done}");
+    };
+
+    step(&format!("drained: {a} to {b}, its data along"));
+    drain(&a);
+    let second = lab.one("keep", &image, &digest);
+    assert_eq!(second["spec"]["node"], b.as_str());
+    lab.ok(&["node", "activate", &a]);
+    lab.carries("keep", &image, &digest, &key, "after the drain");
+    assert_eq!(lab.id_in(&second), id, "the build jailer recorded");
+    assert!(
+        lab.file_in(&second, "/data/blob") == blob,
+        "the data came along"
+    );
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    step(&format!(
+        "moved back, {b} to {a}, the move's last part cut short"
+    ));
+    let ds = format!("{ZFS_ROOT}/volumes/handoff/data-keep-0");
+    lab.apply("keep", &held);
+    lab.ok(&["node", "drain", &b]);
+    wait("the full copy", 600, || {
+        lab.keep_volume()["status"]["migration"]["phase"] == "copied"
+    });
+    assert_eq!(lab.keep_volume()["status"]["migration"]["to"], a.as_str());
+    assert_eq!(lab.running("keep").len(), 1, "the task runs on");
+    // Enough that the last part takes a while to receive.
+    lab.exec_in(
+        &second,
+        &[
+            "dd",
+            "if=/dev/random",
+            "of=/data/ballast",
+            "bs=1m",
+            "count=64",
+        ],
+    );
+    let ballast = lab.file_in(&second, "/data/ballast");
+    assert_eq!(ballast.len(), 64 << 20);
+    let out = std::thread::scope(|s| {
+        let killer =
+            s.spawn(|| lab.on(&a, &kill_receiving(&ds, &format!("zfs receive -F -u {ds}"))));
+        lab.apply("keep", &free);
+        killer.join().unwrap()
+    });
+    assert!(
+        out.status.success(),
+        "killing the last part's receive: {}",
+        text(&out.stderr)
+    );
+    drain(&b);
+    let third = lab.one("keep", &image, &digest);
+    assert_eq!(third["spec"]["node"], a.as_str());
+    assert_eq!(lab.keep_volume()["status"]["node"], a.as_str());
+    lab.ok(&["node", "activate", &b]);
+    lab.carries("keep", &image, &digest, &key, "after the cut move");
+    assert_eq!(lab.id_in(&third), id, "the build jailer recorded");
+    assert!(lab.file_in(&third, "/data/blob") == blob, "the first data");
+    assert!(
+        lab.file_in(&third, "/data/ballast") == ballast,
+        "the last part's data"
+    );
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    step(&format!("the Volume backed up as its task runs on {a}"));
+    let backup = lab.dir.join("data-keep-0.backup");
+    lab.ok(&[
+        "volume",
+        "backup",
+        "data-keep-0",
+        "-n",
+        "handoff",
+        "-o",
+        backup.to_str().unwrap(),
+    ]);
+
+    step(&format!(
+        "{a} lost: its daemon killed, its data directory and pool gone"
+    ));
+    let vm = &lab.vms[common::vm(&a)];
+    let out = lab.ssh(
+        vm,
+        &format!(
+            "pkill -KILL -f 'legion-lab daemon'\n{}{}",
+            common::clean(common::VM_DATA, common::VM_RUN),
+            common::NO_POOL
+        ),
+    );
+    assert!(out.status.success(), "losing {a}: {}", text(&out.stderr));
+
+    step(&format!(
+        "recovered: what {a} held cleared, the Volume restored onto {b}"
+    ));
+    lab.ok(&["delete", "service", "keep", "-n", "handoff"]);
+    lab.ok(&["delete", "node", &a]);
+    wait("data-keep-0 deleted", 120, || {
+        let out = lab.legion(&["delete", "volume", "data-keep-0", "-n", "handoff"], &[]);
+        out.status.success() || text(&out.stderr).contains("not found")
+    });
+    lab.ok(&["volume", "restore", backup.to_str().unwrap(), "--node", &b]);
+    lab.apply("keep", &free);
+    let fourth = lab.one("keep", &image, &digest);
+    assert_eq!(
+        fourth["spec"]["node"],
+        b.as_str(),
+        "where its data was restored"
+    );
+    lab.carries("keep", &image, &digest, &key, "after the restore");
+    assert_eq!(lab.images("keep")["resolved"][&image], pinned.as_str());
+
+    step("the image and every byte the same; each writer in turn");
+    assert_eq!(lab.id_in(&fourth), id, "the build jailer recorded");
+    assert_eq!(text(&lab.file_in(&fourth, "/data/born")), id);
+    assert!(lab.file_in(&fourth, "/data/blob") == blob, "the first data");
+    assert!(
+        lab.file_in(&fourth, "/data/ballast") == ballast,
+        "the cut move's data"
+    );
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    // The first task, the drained one, the moved one (backed up as it
+    // ran), and the restored one.
+    writers_in_turn(&text(&lab.file_in(&fourth, "/data/log")), 4, 2);
+
+    step(&format!("{a} back as a new host"));
+    let worker = lab.ok(&["join-token", "worker"]).trim().to_owned();
+    lab.join(common::vm(&a), &worker, Role::Worker);
+    wait(&format!("{a} ready again"), 120, || {
+        lab.node_state(&a) == "ready"
+    });
+    lab.delete("keep");
+    eprintln!("versions: {jailer_version}; {legion_version} at {revision}; image {digest}");
     step("done");
 }

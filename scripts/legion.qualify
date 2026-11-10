@@ -76,6 +76,7 @@ test legion handoff a_jailer_push_is_what_legion_runs host cluster 3600 env:LEGI
 test legion handoff a_jailer_image_keeps_its_data_through_a_drain host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_JAILER
 test legion handoff a_jailer_image_keeps_its_data_through_a_cut_move host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_JAILER
 test legion handoff a_jailer_signature_is_what_legion_checks host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_JAILER
+test legion handoff a_jailer_image_goes_from_build_to_recovery host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_JAILER
 helper legion-net mesh serve
 helper legion handoff registry
 helper legion-store cluster write_throughput
