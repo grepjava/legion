@@ -192,6 +192,14 @@ fn pf(sys: &dyn Sys) {
         .unwrap();
     sys.pf_load_anchor(anchor, kept).unwrap();
     assert_eq!(sys.pf_table_show(anchor, "p").unwrap(), [ip("10.99.0.5")]);
+    // Loaded with its addresses, it holds those, whatever it held before:
+    // the load balancer sets every table so when the rules change.
+    let listed = "table <p> persist { 10.99.0.6 fd00:99::6 }\n\
+                  pass quick on lo0 from <p> to any\n";
+    sys.pf_load_anchor(anchor, listed).unwrap();
+    let mut now = sys.pf_table_show(anchor, "p").unwrap();
+    now.sort();
+    assert_eq!(now, [ip("10.99.0.6"), ip("fd00:99::6")]);
 
     sys.pf_flush_anchor(anchor).unwrap();
     assert!(sys.pf_table_show(anchor, "t").unwrap().is_empty());
