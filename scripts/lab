@@ -480,7 +480,13 @@ run() {
         sleep 30
         now=$(date +%s)
         vm_pid "$vm" > /dev/null || die "$vm died during the run: nothing from it counts"
-        if state=$(ssh_vm "$vm" 'test ! -e ~/qualify/run/done || echo finished; cat ~/qualify/run/state 2> /dev/null; true'); then
+        # A qualify that is gone without `done` stopped early (a manifest
+        # it refused, say): said at once, not after the stall time.
+        if state=$(ssh_vm "$vm" 'if test -e ~/qualify/run/done; then echo finished
+            elif ! pgrep -qf "[s]cripts/qualify --manifest"; then
+                if test -e ~/qualify/run/done; then echo finished; else echo stopped; fi
+            fi
+            cat ~/qualify/run/state 2> /dev/null; true'); then
             down=0
         else
             down=$((down + 1))
@@ -488,6 +494,10 @@ run() {
             continue
         fi
         [ "${state%%$'\n'*}" != finished ] || break
+        if [ "${state%%$'\n'*}" = stopped ]; then
+            ssh_vm "$vm" 'tail -15 ~/qualify-run.out' | cut -c1-160
+            die "qualify stopped on $vm without finishing"
+        fi
         if [ "$state" != "$last" ]; then say "$(date +%T) $state"; last=$state; changed=$now; fi
         [ $((now - changed)) -lt "$stall" ] || die "no change in $stall s on $vm: left running for a look"
     done
