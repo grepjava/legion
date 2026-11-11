@@ -5190,3 +5190,78 @@ async fn the_audit_trail_keeps_only_what_its_retention_allows() {
     }
     m.stop().await;
 }
+
+/// PLAN.md phase 9: how long a change takes to reach its watchers, as
+/// there are more of them. One manager; `n` watches on Services, each on a
+/// connection of its own, as clients would; a Service applied, and the
+/// time until each watch has it. A measurement, not a check: run it built
+/// for release, and read what it prints.
+///
+/// ```sh
+/// cargo test -p legion-manager --release --test api watch_fan_out -- --ignored --nocapture
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement: run with --release --ignored --nocapture"]
+async fn watch_fan_out_by_watchers() {
+    let m = Running::start().await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let mut api = m.objects().await;
+    eventually(|| {
+        let mut api = api.clone();
+        async move { api.apply(apply(service("first", 1))).await }
+    })
+    .await;
+    eprintln!("watchers | to the first (ms) | to half | to all");
+    for n in [1usize, 10, 100, 500] {
+        let version = api
+            .list(ListRequest {
+                kind: "Service".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .version;
+        let mut streams = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut c = m.objects().await;
+            streams.push(
+                c.watch(WatchRequest {
+                    kind: "Service".into(),
+                    from_version: version,
+                })
+                .await
+                .unwrap()
+                .into_inner(),
+            );
+        }
+        let name = format!("watched-{n}");
+        let started = tokio::time::Instant::now();
+        let waits = streams.into_iter().map(|mut s| {
+            let name = name.clone();
+            tokio::spawn(async move {
+                while let Some(ev) = s.message().await.unwrap() {
+                    if ev.object.is_some_and(|o| o.name == name) {
+                        return started.elapsed();
+                    }
+                }
+                panic!("the watch ended");
+            })
+        });
+        let waits: Vec<_> = waits.collect();
+        api.apply(apply(service(&name, 1))).await.unwrap();
+        let mut took = Vec::with_capacity(n);
+        for w in waits {
+            took.push(w.await.unwrap());
+        }
+        took.sort();
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        eprintln!(
+            "{n:8} | {:17.2} | {:7.2} | {:6.2}",
+            ms(took[0]),
+            ms(took[n / 2]),
+            ms(took[n - 1])
+        );
+    }
+    m.stop().await;
+}
