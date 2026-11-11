@@ -8,8 +8,9 @@
 //!   it gets a whole one.
 //! - `maxproc: 20`: forks past the limit are refused, and the container's
 //!   main process runs on.
-//! - `openfiles: 64`: one process opening 100 files is refused each one
-//!   past the limit; 30 open fine.
+//! - `openfiles: 256`: the limit is the jail's, every process's open files
+//!   counted, the supervisor's too; one process opening 30 more opens them,
+//!   one opening 400 is refused each past the limit.
 //!
 //! The measurements are printed. It drives the real daemon on one node, so
 //! it is ignored by default and run by hand on a FreeBSD host as root, with
@@ -120,7 +121,7 @@ fn limits_hold_what_wants_more() {
         ),
         (
             "files",
-            service("files", "exec sleep 86400", "{ openfiles: 64 }"),
+            service("files", "exec sleep 86400", "{ openfiles: 256 }"),
         ),
     ];
     for (name, yaml) in &apps {
@@ -180,28 +181,35 @@ fn limits_hold_what_wants_more() {
     assert_eq!(t["metadata"]["name"], task.as_str(), "the task runs on");
     assert_eq!(t["status"]["restarts"], 0);
 
-    step("openfiles 64: one process opening 30 files, then 100");
-    let (task, _) = lab.jail("files");
+    step("openfiles 256: one process opening 30 files, then 400");
+    let (task, jail) = lab.jail("files");
+    // The jail's own, before: its processes' tables, the supervisor's too.
+    let resting = rctl_usage(&jail, "openfiles");
+    eprintln!("openfiles 256: the jail holds {resting} at rest");
+    assert!(resting < 200, "room left under the limit: {resting}");
     let open = |n: u32| {
         lab.sh_in(
             &task,
             &format!(
-                "mkdir -p /tmp/f && cd /tmp/f && touch $(seq -f f%g {n}) && \
-                 timeout 3 tail -q -f $(seq -f f%g {n}); echo status $?"
+                "mkdir -p /tmp/f && cd /tmp/f && touch $(seq -f f%g {n}) &&                  timeout 3 tail -q -f $(seq -f f%g {n}); echo status $?"
             ),
         )
     };
     let (_, out, err) = open(30);
-    eprintln!("openfiles 64, 30 files: {} {}", out.trim(), err.trim());
+    eprintln!("openfiles 256, 30 files: {} {}", out.trim(), err.trim());
     assert!(
         out.contains("status 124") && !err.contains("Too many open files"),
         "30 open until the timeout: {out} {err}"
     );
-    let (_, out, err) = open(100);
+    let (_, out, err) = open(400);
     let refused = err.matches("Too many open files").count();
-    eprintln!("openfiles 64, 100 files: {refused} refused; {}", out.trim());
+    eprintln!(
+        "openfiles 256, 400 files: {refused} refused, {} opened; {}",
+        400 - refused,
+        out.trim()
+    );
     assert!(
-        (30..=70).contains(&refused),
+        refused >= 150 && 400 - refused >= 30,
         "past the limit refused, the rest open: {refused}
 {err}"
     );
