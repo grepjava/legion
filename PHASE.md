@@ -1537,7 +1537,12 @@ follower opening worker streams only once caught up, and a removed
 manager leaving the Raft membership with its certificate refused; and
 the audit trail (item 3), changes, sessions and refusals kept in the
 replicated store where they first arrive, names only, listed with
-`legion audit`. CA rotation is an item of its own, to come. The
+`legion audit`. CA rotation is an item of its own, to come. It also
+carries phase 8's first part: jailer's image from build to recovery in one
+test, the Compose matrix (docs/COMPOSE.md), Linux application images, the
+examples in `examples/` and limits measured; and two fixes the lab found:
+static Linux programs run (`--linux` sets the fallback ELF brand), and a
+move whose target is only suspect keeps its full copy. The
 port's `distinfo` is
 made for v0.1.13, and its crates are v0.1.9's, but it has not been through
 `poudriere testport` since v0.1.9. Waiting on the user: the port's
