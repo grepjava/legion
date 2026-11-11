@@ -647,3 +647,33 @@ impl Lab {
         });
     }
 }
+
+impl Lab {
+    /// The jail of the container named `name` (`<namespace>_<task>_<container>`),
+    /// from this host's daemon's records.
+    pub fn jail_of(&self, name: &str) -> String {
+        for d in std::fs::read_dir(self.dir.join("data/jails")).unwrap() {
+            let path = d.unwrap().path().join("record.json");
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let r: Value = serde_json::from_slice(&bytes).unwrap();
+            if r["name"] == name {
+                return r["jail"].as_str().unwrap().to_owned();
+            }
+        }
+        panic!("no container {name}");
+    }
+}
+
+/// rctl's usage of `resource` (`memoryuse`, `cputime`, ...) for a jail.
+pub fn rctl_usage(jail: &str, resource: &str) -> u64 {
+    let out = Command::new("rctl")
+        .args(["-u", &format!("jail:{jail}")])
+        .output()
+        .unwrap();
+    text(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("{resource}="))?.trim().parse().ok())
+        .unwrap_or(0)
+}

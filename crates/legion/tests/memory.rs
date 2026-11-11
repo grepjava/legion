@@ -106,33 +106,6 @@ fn sessions(lab: &Lab, task: &str, n: usize, query: &str) -> usize {
     })
 }
 
-/// The jail of the container named `name`, from the daemon's records.
-fn jail_of(lab: &Lab, name: &str) -> String {
-    for d in std::fs::read_dir(lab.dir.join("data/jails")).unwrap() {
-        let path = d.unwrap().path().join("record.json");
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        let r: Value = serde_json::from_slice(&bytes).unwrap();
-        if r["name"] == name {
-            return r["jail"].as_str().unwrap().to_owned();
-        }
-    }
-    panic!("no container {name}");
-}
-
-/// rctl's `memoryuse` for a jail.
-fn rctl_memory(jail: &str) -> u64 {
-    let out = Command::new("rctl")
-        .args(["-u", &format!("jail:{jail}")])
-        .output()
-        .unwrap();
-    text(&out.stdout)
-        .lines()
-        .find_map(|l| l.strip_prefix("memoryuse=")?.trim().parse().ok())
-        .unwrap_or(0)
-}
-
 /// How often the daemon's log says the agent killed for memory.
 fn agent_kills(lab: &Lab) -> usize {
     std::fs::read_to_string(lab.dir.join("daemon.log"))
@@ -182,7 +155,7 @@ fn postgres_under_a_memory_limit() {
     wait("Postgres ready", 300, ready);
     let t = task(&lab).unwrap();
     let name = t["metadata"]["name"].as_str().unwrap().to_owned();
-    let jail = jail_of(&lab, &format!("data_{name}_pg"));
+    let jail = lab.jail_of(&format!("data_{name}_pg"));
 
     step("sixteen sessions reading 30 MiB of buffers");
     // Under a quarter of the buffers, so scans use the buffers themselves
@@ -206,7 +179,7 @@ fn postgres_under_a_memory_limit() {
         });
         // While they sleep, holding what they read.
         std::thread::sleep(std::time::Duration::from_secs(4));
-        rctl.set(rctl_memory(&jail));
+        rctl.set(common::rctl_usage(&jail, "memoryuse"));
         reading.join().unwrap()
     });
     eprintln!("rctl's memoryuse while reading: {} MiB", rctl.get() / MIB);
