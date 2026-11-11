@@ -89,3 +89,7 @@ test legion examples the_examples_run_as_their_readmes_say host cluster 3600 env
 helper legion-net mesh serve
 helper legion handoff registry
 helper legion-store cluster write_throughput
+# Measurements of Legion's own work on fake hosts (docs/MEASURE.md), taken
+# with --release wherever the tests build, not on the lab.
+helper legion-manager api watch_fan_out_by_watchers
+helper legion-agent cluster endpoint_propagation_by_nodes
