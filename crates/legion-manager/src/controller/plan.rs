@@ -5,7 +5,7 @@
 //! Every call looks at the whole state, so a lost write or a missed event
 //! only delays convergence until the next call.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
@@ -249,7 +249,8 @@ pub fn plan(
     memory.began.get_or_insert(now);
     let (tasks, orphaned) = orphan(tasks, nodes, &mut plan);
     let tasks = tasks.as_slice();
-    let services: &[Service] = &refused(services, tasks);
+    let by_owner = by_owner(tasks);
+    let services: &[Service] = &refused(services, &by_owner);
     let first = plan.actions.len();
     let live: BTreeSet<&str> = tasks.iter().map(Task::uid).collect();
     memory
@@ -290,8 +291,7 @@ pub fn plan(
     let mut addresses = addresses(services);
     let mut created: Vec<Task> = Vec::new();
     for s in services {
-        let mine: Vec<&Task> = tasks.iter().filter(|t| s.owns(t)).collect();
-        let before = predecessors(s, tasks);
+        let (mine, before) = owned(s, &by_owner);
         let addrs = addresses
             .remove(s.object.metadata.uid.as_str())
             .unwrap_or_default();
@@ -311,11 +311,10 @@ pub fn plan(
 
     // Jobs own tasks as services do; the scheduler sees them alike.
     let job_owners: Vec<Service> = jobs.jobs.iter().map(Job::owner).collect();
-    let job_owners = refused(&job_owners, tasks);
+    let job_owners = refused(&job_owners, &by_owner);
     let mut jobs_after = jobs.jobs.clone();
     for ((j, owner), after) in jobs.jobs.iter().zip(&job_owners).zip(&mut jobs_after) {
-        let mine: Vec<&Task> = tasks.iter().filter(|t| owner.owns(t)).collect();
-        let before = predecessors(owner, tasks);
+        let (mine, before) = owned(owner, &by_owner);
         after.status = jobs::job(
             j,
             owner,
@@ -335,9 +334,16 @@ pub fn plan(
     }
     jobs::abandoned(jobs, &mut plan);
     let owners: Vec<&Service> = services.iter().chain(&job_owners).collect();
+    // Whether a task's owner is here, by its uid: one look, not one for
+    // each owner.
+    let by_uid: HashMap<&str, (&str, &str)> = owners
+        .iter()
+        .map(|s| (s.object.metadata.uid.as_str(), s.key()))
+        .collect();
+    let owned_here = |t: &Task| by_uid.get(t.spec.service_uid.as_str()) == Some(&t.owner());
 
     // Tasks whose owner is gone: stop, then delete once stopped.
-    for t in tasks.iter().filter(|t| !owners.iter().any(|s| s.owns(t))) {
+    for t in tasks.iter().filter(|t| !owned_here(t)) {
         if t.active() {
             plan.actions.push(stop(t));
         } else if t.status.state.is_terminal() {
@@ -357,7 +363,7 @@ pub fn plan(
                 TaskState::Assigned | TaskState::Accepted | TaskState::Preparing
             )
             && !touched.contains(&t.object.key())
-            && owners.iter().any(|s| s.owns(t))
+            && owned_here(t)
             && namespaces
                 .refuses(&t.object.metadata.namespace, &t.spec.pod)
                 .is_some()
@@ -393,14 +399,15 @@ pub fn plan(
 /// `services` with the platforms each one's images were found not to run
 /// on: tasks of its current images rejected so, on nodes of them as they
 /// were then (a node may run more since).
-fn refused(services: &[Service], tasks: &[Task]) -> Vec<Service> {
+fn refused(services: &[Service], by_owner: &Owners) -> Vec<Service> {
     services
         .iter()
         .map(|s| {
             let images = s.spec.pod.images();
-            let refused = tasks
-                .iter()
-                .filter(|t| s.owns(t) && t.spec.pod.images() == images)
+            let refused = owned(s, by_owner)
+                .0
+                .into_iter()
+                .filter(|t| t.spec.pod.images() == images)
                 .filter_map(|t| t.status.wrong_platform.as_ref())
                 .map(|p| {
                     let (os, arch, linux) = p.runs();
@@ -597,17 +604,33 @@ fn addresses(services: &[Service]) -> BTreeMap<&str, Addresses> {
     out
 }
 
-/// Tasks of another owner of `s`'s name (the one `s` replaced, deleted
-/// and created again, or a Job or Service sharing the name) still there. Their names stay taken, and those of `s`'s kind that have
-/// not ended hold their slot: what they mount is still theirs.
-fn predecessors<'a>(s: &Service, tasks: &'a [Task]) -> Vec<&'a Task> {
-    tasks
-        .iter()
-        .filter(|t| t.owner() == s.key() && !s.owns(t))
-        .collect()
+/// Tasks by the name of their owner, in their order: what each owner's
+/// pass reads, gathered once rather than by every owner from all tasks
+/// (PLAN.md phase 9: that was most of a pass, growing as services times
+/// tasks).
+type Owners<'a> = HashMap<(&'a str, &'a str), Vec<&'a Task>>;
+
+fn by_owner(tasks: &[Task]) -> Owners<'_> {
+    let mut owners: Owners = HashMap::new();
+    for t in tasks {
+        owners.entry(t.owner()).or_default().push(t);
+    }
+    owners
 }
 
-/// Whether a predecessor's task (see [`predecessors`]) of the owner's kind
+/// The tasks `s` owns, and its predecessors': tasks of another owner of
+/// `s`'s name (the one `s` replaced, deleted and created again, or a Job or
+/// Service sharing the name) still there. Their names stay taken, and
+/// those of `s`'s kind that have not ended hold their slot: what they
+/// mount is still theirs.
+fn owned<'a>(s: &Service, owners: &Owners<'a>) -> (Vec<&'a Task>, Vec<&'a Task>) {
+    owners
+        .get(&s.key())
+        .map(|all| all.iter().partition(|t| s.owns(t)))
+        .unwrap_or_default()
+}
+
+/// Whether a predecessor's task (see [`owned`]) of the owner's kind
 /// still runs in `slot`, or has yet to stop.
 fn held(before: &[&Task], job: bool, slot: &Slot) -> bool {
     before
