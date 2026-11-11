@@ -677,3 +677,36 @@ pub fn rctl_usage(jail: &str, resource: &str) -> u64 {
         .find_map(|l| l.strip_prefix(&format!("{resource}="))?.trim().parse().ok())
         .unwrap_or(0)
 }
+
+impl Lab {
+    /// Prints the last `lines` lines holding any of `words` in every node's
+    /// daemon log, this host's first: what a failure leaves to read.
+    pub fn daemon_logs(&self, words: &[&str], lines: usize) {
+        let host = std::fs::read_to_string(self.dir.join("daemon.log")).unwrap_or_default();
+        let found: Vec<&str> = host
+            .lines()
+            .filter(|l| words.iter().any(|w| l.contains(w)))
+            .collect();
+        eprintln!(
+            "=== n1\n{}",
+            found[found.len().saturating_sub(lines)..].join("\n")
+        );
+        let pattern: Vec<String> = words.iter().map(|w| format!("-e '{w}'")).collect();
+        for (i, vm) in self.vms.iter().enumerate() {
+            let out = self.ssh(
+                vm,
+                &format!(
+                    "grep -F {} /var/log/legion-lab.log | tail -{lines}",
+                    pattern.join(" ")
+                ),
+            );
+            eprintln!(
+                "=== n{} ({})\n{}{}",
+                i + 2,
+                vm.name,
+                text(&out.stdout),
+                text(&out.stderr)
+            );
+        }
+    }
+}

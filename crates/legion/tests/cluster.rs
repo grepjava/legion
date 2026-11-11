@@ -196,6 +196,9 @@ fn app_updates_and_survives_losing_a_node() {
         failures.len(),
         failures.iter().take(5).collect::<Vec<_>>()
     );
+    if !failures.is_empty() {
+        lab.daemon_logs(&["WARN", "ERROR", "shop/web", "shop/api", "endpoint"], 60);
+    }
     assert!(failures.is_empty(), "requests failed during the update");
     assert_eq!(versions, BTreeSet::from(["1", "2"]));
     for a in &addrs {

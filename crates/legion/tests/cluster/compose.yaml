@@ -73,8 +73,13 @@ configs:
       reply() { printf 'HTTP/1.0 %s\r\nContent-Type: text/plain\r\n\r\n%s\n' "$$1" "$$2"; }
       case "$$path" in
         /healthz) reply "200 OK" ok ;;
-        /) api=$$(nc -N -w 2 api 7000 </dev/null) && [ -n "$$api" ] &&
-             reply "200 OK" "web $$VERSION $$(hostname) api $$api" ||
-             reply "503 Service Unavailable" "no api" ;;
+        /) t0=$$(date +%s)
+           api=$$(nc -N -w 2 api 7000 </dev/null); rc=$$?
+           if [ -n "$$api" ]; then
+             reply "200 OK" "web $$VERSION $$(hostname) api $$api"
+           else
+             # What went wrong, for a failure to say.
+             reply "503 Service Unavailable" "no api: nc exited $$rc after $$(( $$(date +%s) - t0 ))s in $$(hostname)"
+           fi ;;
         *) reply "404 Not Found" "" ;;
       esac
