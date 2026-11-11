@@ -4808,3 +4808,70 @@ fn a_task_not_yet_started_when_its_namespace_tightens_does_not_start() {
         .find(|t| t.object.metadata.name == "ping-1-2");
     assert_eq!(t.unwrap().status.message, NO_RAW_SOCKETS);
 }
+
+impl World {
+    /// One pass of the planner over the world as it is, timed: how long it
+    /// took and how many actions it planned.
+    fn timed_pass(&mut self) -> (std::time::Duration, usize) {
+        let started = std::time::Instant::now();
+        let p = plan(
+            &self.services,
+            &self.jobs,
+            &self.tasks,
+            &self.nodes,
+            &self.volumes,
+            &self.namespaces,
+            &mut self.memory,
+            self.now,
+        );
+        (started.elapsed(), p.actions.len())
+    }
+}
+
+/// PLAN.md phase 9: how long one planner pass takes as the cluster grows,
+/// settled and after one Service's update. A measurement, not a check:
+/// run it built for release, and read what it prints.
+///
+/// ```sh
+/// cargo test -p legion-manager --release --lib reconciliation_time -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "a measurement: run with --release --ignored --nocapture"]
+fn reconciliation_time_by_cluster_size() {
+    eprintln!("nodes services tasks | settled pass (ms) | after an update (ms, actions)");
+    for (nodes, services, replicas) in [(10, 50, 3), (50, 200, 3), (100, 500, 4), (200, 1000, 5)] {
+        let mut w = World::new();
+        for n in 0..nodes {
+            w.node(&format!("n{n}"), &[]);
+        }
+        for s in 0..services {
+            w.service(
+                &format!("svc{s}"),
+                &format!(
+                    "replicas: {replicas}\npod: {{ containers: [{{ name: app, image: \"app:1\", \
+                     resources: {{ requests: {{ cpu: 10m, memory: 16Mi }} }} }}] }}"
+                ),
+            );
+        }
+        w.settle();
+        let tasks = w.running().len();
+        assert_eq!(tasks, services * replicas, "all running");
+        // The best of five, as the first warms caches.
+        let settled = (0..5).map(|_| w.timed_pass()).min().unwrap();
+        assert_eq!(settled.1, 0, "a settled world plans nothing");
+        w.service(
+            "svc0",
+            &format!(
+                "replicas: {replicas}\npod: {{ containers: [{{ name: app, image: \"app:2\", \
+                 resources: {{ requests: {{ cpu: 10m, memory: 16Mi }} }} }}] }}"
+            ),
+        );
+        let updated = w.timed_pass();
+        eprintln!(
+            "{nodes:5} {services:8} {tasks:5} | {:17.2} | {:.2}, {}",
+            settled.0.as_secs_f64() * 1e3,
+            updated.0.as_secs_f64() * 1e3,
+            updated.1
+        );
+    }
+}
