@@ -1,0 +1,44 @@
+# A static site: two nginx tasks behind one VIP, published on port 30081 of
+# every node, the page and nginx's configuration from Configs.
+#
+#   legion stack deploy site -c examples/static-site/compose.yaml
+#
+# IMAGE is where the image is: `localhost/examples/nginx:1` once loaded
+# with `legion image load`, or a registry's reference after `jailer push`.
+services:
+  web:
+    image: "${IMAGE:-localhost/examples/nginx:1}"
+    command: [/usr/local/sbin/nginx, -c, /usr/local/etc/nginx/site.conf]
+    ports: ["30081:80"]
+    configs:
+      - { source: nginx-conf, target: /usr/local/etc/nginx/site.conf }
+      - { source: page, target: /srv/www/index.html }
+    healthcheck:
+      test: ["CMD", "fetch", "-qo", "/dev/null", "http://127.0.0.1/"]
+      interval: 5s
+      retries: 3
+    deploy:
+      replicas: 2
+      update_config: { parallelism: 1, order: start-first }
+      resources: { limits: { memory: 64M, pids: 32 } }
+configs:
+  nginx-conf:
+    content: |
+      daemon off;
+      worker_processes 2;
+      error_log /dev/stderr;
+      pid /tmp/nginx.pid;
+      events { worker_connections 128; }
+      http {
+        access_log off;
+        default_type text/html;
+        server {
+          listen 80;
+          root /srv/www;
+        }
+      }
+  page:
+    content: |
+      <!doctype html>
+      <title>Legion</title>
+      <h1>Served by nginx on FreeBSD, under Legion</h1>

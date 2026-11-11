@@ -1,0 +1,8 @@
+# Redis from FreeBSD's packages, for both of the counter's services: the
+# server, and redis-cli for the web tier. Build it with jailer:
+#
+#   jailer build -t examples/redis:1 examples/counter
+FROM docker.io/freebsd/freebsd-notoolchain:15.1
+RUN env ASSUME_ALWAYS_YES=yes pkg bootstrap -f >/dev/null \
+ && env ASSUME_ALWAYS_YES=yes pkg install -y redis >/dev/null \
+ && pkg clean -ay >/dev/null && rm -rf /var/db/pkg/repos /var/cache/pkg/*
