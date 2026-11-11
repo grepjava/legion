@@ -483,7 +483,7 @@ run() {
         # A qualify that is gone without `done` stopped early (a manifest
         # it refused, say): said at once, not after the stall time.
         if state=$(ssh_vm "$vm" 'if test -e ~/qualify/run/done; then echo finished
-            elif ! pgrep -qf "[s]cripts/qualify --manifest"; then
+            elif ! pgrep -qf "[s]cripts/qualify( |$)"; then
                 if test -e ~/qualify/run/done; then echo finished; else echo stopped; fi
             fi
             cat ~/qualify/run/state 2> /dev/null; true'); then
