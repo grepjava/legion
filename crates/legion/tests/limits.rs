@@ -1,6 +1,6 @@
 //! Resource limits measured (DESIGN.md §6.3; PLAN.md phase 8): what a
-//! container's `cpu`, `maxproc` and `openfiles` limits do to work that
-//! wants more, measured on one node, rctl's own counts read from the host.
+//! container's `cpu` and `maxproc` limits do to work that wants more,
+//! measured on one node, rctl's own counts read from the host.
 //! Memory is measured on Postgres in `tests/memory.rs`.
 //!
 //! - `cpu: 500m` on a busy loop: rctl throttles it by pausing it, so it
@@ -8,9 +8,11 @@
 //!   it gets a whole one.
 //! - `maxproc: 20`: forks past the limit are refused, and the container's
 //!   main process runs on.
-//! - `openfiles: 256`: the limit is the jail's, every process's open files
-//!   counted, the supervisor's too; one process opening 30 more opens them,
-//!   one opening 400 is refused each past the limit.
+//!
+//! `openfiles` is not measured: rctl counts each process's descriptor
+//! table, not the files open, so a fork takes a table's worth at once, and
+//! on the lab a limit of 256 with 40 open refused `tail` its casper helper
+//! (DESIGN.md §6.3).
 //!
 //! The measurements are printed. It drives the real daemon on one node, so
 //! it is ignored by default and run by hand on a FreeBSD host as root, with
@@ -119,10 +121,6 @@ fn limits_hold_what_wants_more() {
             "procs",
             service("procs", "exec sleep 86400", "{ maxproc: 20 }"),
         ),
-        (
-            "files",
-            service("files", "exec sleep 86400", "{ openfiles: 256 }"),
-        ),
     ];
     for (name, yaml) in &apps {
         let path = lab.dir.join(format!("{name}.yaml"));
@@ -181,37 +179,5 @@ fn limits_hold_what_wants_more() {
     assert_eq!(t["metadata"]["name"], task.as_str(), "the task runs on");
     assert_eq!(t["status"]["restarts"], 0);
 
-    step("openfiles 256: one process opening 30 files, then 400");
-    let (task, jail) = lab.jail("files");
-    // The jail's own, before: its processes' tables, the supervisor's too.
-    let resting = rctl_usage(&jail, "openfiles");
-    eprintln!("openfiles 256: the jail holds {resting} at rest");
-    assert!(resting < 200, "room left under the limit: {resting}");
-    let open = |n: u32| {
-        lab.sh_in(
-            &task,
-            &format!(
-                "mkdir -p /tmp/f && cd /tmp/f && touch $(seq -f f%g {n}) &&                  timeout 3 tail -q -f $(seq -f f%g {n}); echo status $?"
-            ),
-        )
-    };
-    let (_, out, err) = open(30);
-    eprintln!("openfiles 256, 30 files: {} {}", out.trim(), err.trim());
-    assert!(
-        out.contains("status 124") && !err.contains("Too many open files"),
-        "30 open until the timeout: {out} {err}"
-    );
-    let (_, out, err) = open(400);
-    let refused = err.matches("Too many open files").count();
-    eprintln!(
-        "openfiles 256, 400 files: {refused} refused, {} opened; {}",
-        400 - refused,
-        out.trim()
-    );
-    assert!(
-        refused >= 150 && 400 - refused >= 30,
-        "past the limit refused, the rest open: {refused}
-{err}"
-    );
     step("done");
 }
