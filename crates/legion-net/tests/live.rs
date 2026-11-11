@@ -436,3 +436,83 @@ fn policy_on_the_bridge() {
     }
     sys.interface_destroy(BRIDGE).unwrap();
 }
+
+/// Measurement (PLAN.md phase 9): what the load balancer's work in pf takes
+/// as services grow, each with a VIP, a port and three ready tasks. A node's
+/// first pass loads them all; a service added changes the rules, so the
+/// anchor is loaded again and every table set again; a task that becomes
+/// ready or stops being touches one table.
+#[test]
+#[ignore = "needs root inside a throwaway VNET jail"]
+fn pf_updates_by_services() {
+    use std::time::{Duration, Instant};
+    assert_eq!(
+        sh("sysctl -n security.jail.jailed").1.trim(),
+        "1",
+        "run inside a VNET jail"
+    );
+    let sys = Shell::new();
+    let net = PodNetwork::new("10.200.7.0/24".parse().unwrap());
+    net.ensure_bridge(&sys).unwrap();
+    sh("pfctl -e");
+    let hooks = legion_net::lb::HOOKS.join("\n") + "\n";
+    let (ok, out) = sh(&format!(
+        "printf '{}' | pfctl -f -",
+        hooks.replace('"', "\\\"")
+    ));
+    assert!(ok, "{out}");
+    let addr = |n: usize| Ipv4Addr::new(10, 200, 7, 2 + (n % 250) as u8);
+    let service = |i: usize, ready: Vec<Ipv4Addr>| Service {
+        uid: format!("{i:016x}"),
+        vip: Some(Ipv4Addr::new(10, 201, (i / 250) as u8, 1 + (i % 250) as u8)),
+        ports: vec![Port {
+            proto: Proto::Tcp,
+            port: 80,
+            target: 8080,
+            published: None,
+        }],
+        alive: ready.clone(),
+        ready,
+    };
+    let three = |i: usize| (0..3).map(|k| addr(i * 3 + k)).collect::<Vec<_>>();
+    let ms = |d: Duration| format!("{:.1} ms", d.as_secs_f64() * 1000.0);
+    println!("| Services | First pass | A service added | A task ready |");
+    println!("|---|---|---|---|");
+    for n in [10, 100, 500, 1000, 2000] {
+        sys.pf_flush_anchor(ANCHOR).unwrap();
+        let mut services: Vec<Service> = (0..n).map(|i| service(i, three(i))).collect();
+        let mut lb = LoadBalancer::default();
+        // pf's limits (tables, table entries) may refuse a size: said so,
+        // and the sizes after it not tried.
+        let mut timed = |services: &[Service]| {
+            let start = Instant::now();
+            lb.apply(&sys, services, net.subnet, Exits::default())
+                .map(|()| start.elapsed())
+        };
+        let first = match timed(&services) {
+            Ok(d) => d,
+            Err(e) => {
+                println!("| {n} | refused: {e} | | |");
+                break;
+            }
+        };
+        services.push(service(n, three(n)));
+        let added = match timed(&services) {
+            Ok(d) => d,
+            Err(e) => {
+                println!("| {n} | {} | refused: {e} | |", ms(first));
+                break;
+            }
+        };
+        services[0].ready.pop();
+        let ready = timed(&services).unwrap();
+        // What was asked is what pf holds.
+        let table = format!("s{n:016x}");
+        assert_eq!(sys.pf_table_show(ANCHOR, &table).unwrap().len(), 6);
+        let rules = sh(&format!("pfctl -a {ANCHOR} -sn")).1;
+        assert_eq!(rules.matches("rdr pass").count(), 2 * (n + 1), "{n}");
+        println!("| {n} | {} | {} | {} |", ms(first), ms(added), ms(ready));
+    }
+    sys.pf_flush_anchor(ANCHOR).unwrap();
+    sys.interface_destroy(BRIDGE).unwrap();
+}
