@@ -1861,3 +1861,73 @@ async fn once_nodes_are_marked_for_ingress_only_they_read_certificates() {
     );
     c.stop().await;
 }
+
+/// PLAN.md phase 9: how long a new task's address takes to be in every
+/// node's load balancing, as nodes are added. A Service published on
+/// every node scaled from one task to two; the time until the new task
+/// runs, and until every node's pf table for the Service holds it. Fake
+/// hosts, one manager: what Legion itself takes, without a kernel's. A
+/// measurement, not a check: run it built for release.
+///
+/// ```sh
+/// cargo test -p legion-agent --release --test cluster endpoint_propagation -- --ignored --nocapture
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement: run with --release --ignored --nocapture"]
+async fn endpoint_propagation_by_nodes() {
+    eprintln!("nodes | new task running (ms) | in every node's table (ms)");
+    for n in [3usize, 10, 30] {
+        let c = Cluster::start(n).await;
+        c.apply(&WEB.replace("replicas: 3", "replicas: 1")).await;
+        let running = async |c: &Cluster| {
+            c.list(Kind::Task)
+                .await
+                .into_iter()
+                .filter(|t| t.status["state"] == "running")
+                .filter_map(|t| t.status["ip"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        };
+        eventually("one task", async || running(&c).await.len() == 1).await;
+        let uid = c
+            .list(Kind::Service)
+            .await
+            .into_iter()
+            .find(|s| s.metadata.name == "web")
+            .unwrap()
+            .metadata
+            .uid;
+        let table = format!("s{uid}");
+        let first = running(&c).await;
+        let started = std::time::Instant::now();
+        c.apply(&WEB.replace("replicas: 3", "replicas: 2")).await;
+        let mut ip = None;
+        while ip.is_none() {
+            ip = running(&c).await.into_iter().find(|i| !first.contains(i));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let ran = started.elapsed();
+        let ip: std::net::IpAddr = ip.unwrap().parse().unwrap();
+        loop {
+            let everywhere = c.nodes.iter().all(|node| {
+                node.sys
+                    .pf_table_show(legion_net::lb::ANCHOR, &table)
+                    .is_ok_and(|t| t.contains(&ip))
+            });
+            if everywhere {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "never everywhere"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let everywhere = started.elapsed();
+        eprintln!(
+            "{n:5} | {:21.0} | {:.0}",
+            ran.as_secs_f64() * 1e3,
+            everywhere.as_secs_f64() * 1e3
+        );
+        c.stop().await;
+    }
+}
