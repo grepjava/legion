@@ -84,8 +84,16 @@ const ROWS: &[Row] = &[
     Row {
         name: "nginx",
         image: "docker.io/library/nginx:1.27-alpine",
-        what: "an HTTP server, worker processes",
-        command: &["nginx", "-g", "daemon off;"],
+        what: "an HTTP server, worker processes, accept_mutex on",
+        // The ABI's epoll refuses EPOLLEXCLUSIVE (EINVAL), which nginx asks
+        // for with several workers unless accept_mutex is on: its workers
+        // would exit, the master accepting what none answer.
+        command: &[
+            "/bin/sh",
+            "-c",
+            "sed -i 's/^events {/events { accept_mutex on;/' /etc/nginx/nginx.conf && \
+             exec nginx -g 'daemon off;'",
+        ],
         more: "",
         check: &["wget", "-q", "-O-", "http://127.0.0.1/"],
         expect: Expect::Works("Welcome to nginx!"),
