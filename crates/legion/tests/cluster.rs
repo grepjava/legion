@@ -28,8 +28,6 @@
 mod common;
 
 use std::collections::BTreeSet;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,11 +41,7 @@ const PUBLISHED: u16 = 30080;
 impl Lab {
     /// [`get`] of `addr`, sent from a VM.
     fn get_from(&self, vm: &Vm, addr: &str) -> Result<String, String> {
-        let out = self.ssh(
-            vm,
-            &format!("printf 'GET / HTTP/1.0\\r\\n\\r\\n' | nc -N -w 5 {addr} {PUBLISHED}"),
-        );
-        body(&text(&out.stdout)).map_err(|e| format!("from {}: {e}", vm.name))
+        self.http_get_from(vm, addr, PUBLISHED)
     }
 
     fn deploy(&self, version: &str) {
@@ -78,24 +72,7 @@ impl Lab {
 
 /// One HTTP/1.0 GET of `/` on a node's published port: the body of a 200.
 fn get(addr: &str) -> Result<String, String> {
-    let addr: SocketAddr = format!("{addr}:{PUBLISHED}").parse().unwrap();
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
-        .map_err(|e| format!("connect: {e}"))?;
-    s.set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| e.to_string())?;
-    write!(s, "GET / HTTP/1.0\r\n\r\n").map_err(|e| format!("write: {e}"))?;
-    let mut resp = String::new();
-    s.read_to_string(&mut resp)
-        .map_err(|e| format!("read: {e}"))?;
-    body(&resp)
-}
-
-/// The body of a 200 response.
-fn body(resp: &str) -> Result<String, String> {
-    match resp.split_once("\r\n\r\n") {
-        Some((head, body)) if head.contains(" 200 ") => Ok(body.trim().to_owned()),
-        _ => Err(format!("response {resp:?}")),
-    }
+    common::http_get(addr, PUBLISHED)
 }
 
 /// When each request was answered, the node asked, and the body or error.

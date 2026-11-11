@@ -45,146 +45,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+use common::jailer::{Jailer, record, unique};
 use common::{Lab, Role, ZFS_ROOT, kill_receiving, text, wait};
-use serde::Deserialize;
 use serde_json::Value;
-
-/// What this test reads of a jailer release record, schema 1 (jailer's
-/// docs/RELEASE-RECORD.md).
-#[derive(Deserialize)]
-struct Record {
-    schema: u32,
-    image: Built,
-    #[serde(default)]
-    published: Vec<Published>,
-    #[serde(default)]
-    archives: Vec<Archive>,
-}
-
-#[derive(Deserialize)]
-struct Built {
-    manifest: String,
-}
-
-#[derive(Deserialize)]
-struct Published {
-    reference: String,
-    digest: String,
-    pinned: String,
-}
-
-#[derive(Deserialize)]
-struct Archive {
-    manifest: String,
-}
-
-fn record(path: &Path) -> Record {
-    let r: Record = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    assert_eq!(r.schema, 1, "a record this test knows");
-    r
-}
-
-/// The jailer in `LEGION_JAILER`, with a state directory of its own in the
-/// lab directory, on plain directories.
-struct Jailer {
-    bin: String,
-    state: PathBuf,
-    /// Registries it talks to over plain HTTP.
-    plain: Vec<String>,
-}
-
-impl Jailer {
-    fn new(lab: &Lab, plain: &[&str]) -> Jailer {
-        let bin = std::env::var("LEGION_JAILER").expect("set LEGION_JAILER to a jailer binary");
-        assert!(Path::new(&bin).is_file(), "no jailer at {bin}");
-        Jailer {
-            bin,
-            state: lab.dir.join("jailer"),
-            plain: plain.iter().map(|p| p.to_string()).collect(),
-        }
-    }
-
-    fn run(&self, args: &[&str]) -> String {
-        let mut c = Command::new(&self.bin);
-        c.arg("--state-dir").arg(&self.state).arg("--no-zfs");
-        for p in &self.plain {
-            c.args(["--plain-http", p]);
-        }
-        let out = c.args(args).stdin(Stdio::null()).output().unwrap();
-        assert!(
-            out.status.success(),
-            "jailer {args:?}: {}{}",
-            text(&out.stdout),
-            text(&out.stderr)
-        );
-        text(&out.stdout)
-    }
-
-    /// Builds `tag`, whose `/id` holds `id`, into the record `rec`.
-    fn build(&self, dir: &Path, tag: &str, id: &str, rec: &Path) {
-        self.build_with(dir, tag, id, rec, &[], &[]);
-    }
-
-    /// As [`Self::build`], with each of `files`, a name and its text, put
-    /// at `/` and the name, and `flags` for the build.
-    fn build_with(
-        &self,
-        dir: &Path,
-        tag: &str,
-        id: &str,
-        rec: &Path,
-        files: &[(&str, &str)],
-        flags: &[&str],
-    ) {
-        let ctx = dir.join(id);
-        std::fs::create_dir_all(&ctx).unwrap();
-        let mut containerfile =
-            String::from("FROM docker.io/freebsd/freebsd-runtime:15.1\nCOPY id /id\n");
-        for (name, body) in files {
-            std::fs::write(ctx.join(name), body).unwrap();
-            containerfile.push_str(&format!("COPY {name} /{name}\n"));
-        }
-        std::fs::write(ctx.join("Containerfile"), containerfile).unwrap();
-        std::fs::write(ctx.join("id"), id).unwrap();
-        let mut args = vec!["build", "-t", tag, "--record", rec.to_str().unwrap()];
-        args.extend_from_slice(flags);
-        args.push(ctx.to_str().unwrap());
-        self.run(&args);
-    }
-}
-
-impl Drop for Jailer {
-    /// Its store holds base layers with `schg` files.
-    fn drop(&mut self) {
-        let d = self.state.display();
-        let _ = Command::new("/bin/sh")
-            .args(["-c", &format!("chflags -R 0 {d} 2>/dev/null; rm -rf {d}")])
-            .status();
-    }
-}
-
-/// An id no other build of this test has.
-fn unique(what: &str) -> String {
-    let t = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap();
-    format!("{what}-{}-{}", std::process::id(), t.as_nanos())
-}
-
-/// Two managers and a worker, as the other cluster tests have them.
-fn three_nodes(lab: &mut Lab, extra: &[&str]) {
-    lab.start_host(extra);
-    lab.ok(&["init"]);
-    let manager = lab.ok(&["join-token", "manager"]).trim().to_owned();
-    let worker = lab.ok(&["join-token", "worker"]).trim().to_owned();
-    lab.join(0, &worker, Role::Worker);
-    lab.join(1, &manager, Role::Manager);
-    wait("three ready nodes", 120, || {
-        ["n1", "n2", "n3"]
-            .iter()
-            .all(|n| lab.node_state(n) == "ready")
-    });
-}
 
 const NAMESPACE: &str = "apiVersion: legion/v1
 kind: Namespace
@@ -336,7 +199,7 @@ fn a_jailer_archive_runs_as_exported() {
     }
 
     step("every node loads both archives");
-    three_nodes(&mut lab, &[]);
+    lab.three_nodes(&[]);
     lab.load_image(local.to_str().unwrap());
     lab.load_image(named.to_str().unwrap());
     lab.apply("namespace", NAMESPACE);
@@ -397,7 +260,7 @@ fn a_jailer_push_is_what_legion_runs() {
 
     step("the cluster resolves the tag to what jailer pushed");
     lab.flags = format!("{} --insecure-registry {addr}", lab.flags);
-    three_nodes(&mut lab, &["--insecure-registry", &addr]);
+    lab.three_nodes(&["--insecure-registry", &addr]);
     lab.apply("namespace", NAMESPACE);
     lab.apply("web", &service("web", &image, 2, ""));
     lab.runs("web", &image, 2, &manifest1, Some(&pinned1), &id1);
@@ -602,7 +465,7 @@ fn a_jailer_image_keeps_its_data_through_a_drain() {
     assert_eq!(r.archives.last().unwrap().manifest, manifest);
 
     step("a stateful service runs it, writing to its Volume");
-    three_nodes(&mut lab, &[]);
+    lab.three_nodes(&[]);
     lab.load_image(tar.to_str().unwrap());
     lab.apply("namespace", NAMESPACE);
     let image = "localhost/handoff/keep:1";
@@ -951,7 +814,7 @@ fn a_jailer_image_keeps_its_data_through_a_cut_move() {
     let manifest = record(&rec).image.manifest;
 
     step("a stateful service runs it on a VM; its task may not stop yet");
-    three_nodes(&mut lab, &[]);
+    lab.three_nodes(&[]);
     lab.load_image(tar.to_str().unwrap());
     lab.apply("namespace", NAMESPACE);
     lab.ok(&["node", "pause", "n1"]);
@@ -1164,7 +1027,7 @@ fn a_jailer_signature_is_what_legion_checks() {
 
     step("a policy without a registry, or with a bad key, is refused");
     lab.flags = format!("{} --insecure-registry {addr}", lab.flags);
-    three_nodes(&mut lab, &["--insecure-registry", &addr]);
+    lab.three_nodes(&["--insecure-registry", &addr]);
     lab.apply("namespace", NAMESPACE);
     lab.refused(
         "nohost",
@@ -1449,7 +1312,7 @@ fn a_jailer_image_goes_from_build_to_recovery() {
 
     step("Legion, under a policy enforcing jailer's key, runs it on a VM");
     lab.flags = format!("{} --insecure-registry {addr}", lab.flags);
-    three_nodes(&mut lab, &["--insecure-registry", &addr]);
+    lab.three_nodes(&["--insecure-registry", &addr]);
     lab.apply("namespace", NAMESPACE);
     lab.apply(
         "policy",

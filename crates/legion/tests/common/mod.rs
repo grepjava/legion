@@ -16,6 +16,8 @@
 
 #![allow(dead_code)]
 
+pub mod jailer;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -592,5 +594,56 @@ pub fn wait(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
     while !f() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// One HTTP/1.0 GET of `/` on `addr` and `port`: the body of a 200.
+pub fn http_get(addr: &str, port: u16) -> Result<String, String> {
+    use std::io::Read;
+    let addr: std::net::SocketAddr = format!("{addr}:{port}").parse().unwrap();
+    let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+        .map_err(|e| format!("connect: {e}"))?;
+    s.set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
+    write!(s, "GET / HTTP/1.0\r\n\r\n").map_err(|e| format!("write: {e}"))?;
+    let mut resp = String::new();
+    s.read_to_string(&mut resp)
+        .map_err(|e| format!("read: {e}"))?;
+    http_body(&resp)
+}
+
+/// The body of a 200 response.
+pub fn http_body(resp: &str) -> Result<String, String> {
+    match resp.split_once("\r\n\r\n") {
+        Some((head, body)) if head.contains(" 200 ") => Ok(body.trim().to_owned()),
+        _ => Err(format!("response {resp:?}")),
+    }
+}
+
+impl Lab {
+    /// [`http_get`] of `addr` and `port`, sent from a VM: this host's own
+    /// published ports are reached from another.
+    pub fn http_get_from(&self, vm: &Vm, addr: &str, port: u16) -> Result<String, String> {
+        let out = self.ssh(
+            vm,
+            &format!("printf 'GET / HTTP/1.0\\r\\n\\r\\n' | nc -N -w 5 {addr} {port}"),
+        );
+        http_body(&text(&out.stdout)).map_err(|e| format!("from {}: {e}", vm.name))
+    }
+
+    /// Two managers and a worker: this host `n1` with `extra` flags, the
+    /// first VM a worker `n2`, the second a manager `n3`.
+    pub fn three_nodes(&mut self, extra: &[&str]) {
+        self.start_host(extra);
+        self.ok(&["init"]);
+        let manager = self.ok(&["join-token", "manager"]).trim().to_owned();
+        let worker = self.ok(&["join-token", "worker"]).trim().to_owned();
+        self.join(0, &worker, Role::Worker);
+        self.join(1, &manager, Role::Manager);
+        wait("three ready nodes", 120, || {
+            ["n1", "n2", "n3"]
+                .iter()
+                .all(|n| self.node_state(n) == "ready")
+        });
     }
 }
