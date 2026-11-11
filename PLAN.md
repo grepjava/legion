@@ -376,6 +376,45 @@ with jailer, recording both versions and their shared crate revisions.
 Alongside it, add tested FreeBSD application examples, the Linuxulator and
 Compose support matrices, and measured resource-limit behaviour.
 
+Built, agreed with jailer: one chain in Legion's handoff test, jailer
+adding no test of its own for it
+(`a_jailer_image_goes_from_build_to_recovery`). jailer builds a writer,
+signs it with a key it made and pushes it; Legion runs it under an
+ImagePolicy enforcing that key, drains its node, moves it back with the
+move's last part cut short, backs its Volume up, loses the host and
+restores it onto another. At each stage the task runs the digest jailer
+recorded and the policy verified, and its data is the same byte for byte;
+a drain or move keeps the verification, a restore checks the signature
+again. The record names both versions: `jailer --version` gives the
+Legion crates jailer was built with (jailer 1dfeaa6). It passed on the lab
+in 874 s, its first run.
+
+Alongside:
+- Compose: docs/COMPOSE.md, every key with the test that converts it and
+  the live one that runs it; the keys no test converted gained one.
+- Linux images: docs/LINUX.md, from `linux_application_images`, which
+  keeps the known failures failing as described. It found static Linux
+  programs refused, fixed (`--linux` sets the fallback ELF brand,
+  `legion_jail::enable_linux`, shared with jailer); nginx's workers
+  exiting on the ABI's refusal of EPOLLEXCLUSIVE (jailer found why),
+  served with `accept_mutex on`; Postgres needing signalfd and Node 22
+  spinning, which the ABI does not run.
+- Examples: `examples/`, a static site on nginx and a counter on Redis,
+  built from FreeBSD's packages with jailer and run on three nodes by
+  `the_examples_run_as_their_readmes_say`.
+- Limits: `limits_hold_what_wants_more` measures cpu (500m gave 0.47 of
+  a CPU) and maxproc (20 let 19 run); memory was measured on Postgres
+  (`postgres_under_a_memory_limit`). `openfiles` is not measured: rctl
+  counts descriptor tables, so a fork takes one whole (DESIGN.md 6.3).
+
+The lab found two more on the way: a move whose target was only suspect
+was dropped and its full copy sent again elsewhere (now kept), and a test
+stopped at its limit left its daemon beside the next test's (the test lab
+now kills it).
+
+Exit: the chain passes on the lab with both versions recorded, and the
+matrices, examples and limits run in the qualification.
+
 ### Phase 9: Measure
 
 Benchmark reconciliation, watches, endpoint propagation, pf updates, image
