@@ -1542,7 +1542,16 @@ carries phase 8's first part: jailer's image from build to recovery in one
 test, the Compose matrix (docs/COMPOSE.md), Linux application images, the
 examples in `examples/` and limits measured; and two fixes the lab found:
 static Linux programs run (`--linux` sets the fallback ELF brand), and a
-move whose target is only suspect keeps its full copy. The
+move whose target is only suspect keeps its full copy. v0.1.19 completes
+phase 9 (docs/MEASURE.md): reconciliation, watches, endpoint propagation,
+pf as services grow, image pulls and loads and the mesh as nodes join, each
+measured by a test that prints its table, those on FreeBSD in every
+qualification. Two were made faster for what they showed: a planner pass
+gathers tasks by owner once (5,000 tasks in 78 ms, from 383), and a change
+of load-balancing rules loads every table with them in one pfctl run (a
+service added at 1,000 services in 0.9 s, from 4.2). The Linux matrix's
+static program is BusyBox's musl build, as the default image is dynamic;
+jailer is pinned at the revision that pins v0.1.18. The
 port's `distinfo` is
 made for v0.1.13, and its crates are v0.1.9's, but it has not been through
 `poudriere testport` since v0.1.9. Waiting on the user: the port's
