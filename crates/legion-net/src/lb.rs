@@ -224,24 +224,40 @@ impl LoadBalancer {
         for s in services.iter().filter(|s| s.balanced()) {
             tables.insert(s.table(), dual(&s.ready));
         }
-        // Tables first: a new service's rules would otherwise send its
-        // first connections to a table not filled yet.
-        for (table, ready) in &tables {
-            if self.tables.get(table) != Some(ready) {
-                sys.pf_table_replace(ANCHOR, table, ready)?;
-                self.tables.insert(table.clone(), ready.clone());
-            }
-        }
         let rules = rules(services, subnet, exits);
         if self.loaded.as_ref() != Some(&rules) {
-            sys.pf_load_anchor(ANCHOR, &rules)?;
-            self.loaded = Some(rules);
-            // Loading rules may drop tables they did not name before; set
-            // every one again, and next time the ones that failed.
+            // The rules with every table and its addresses, in one load:
+            // pf takes it whole, so no rule sends connections to a table not
+            // filled yet. Setting each table on its own cost a pfctl run per
+            // service, 4 s at a thousand (docs/MEASURE.md).
+            self.loaded = None;
             self.tables.clear();
+            let mut text = String::new();
             for (table, ready) in &tables {
-                sys.pf_table_replace(ANCHOR, table, ready)?;
+                // An empty list is no pf syntax: such a table is emptied
+                // after the load.
+                if ready.is_empty() {
+                    let _ = writeln!(text, "table <{table}> persist");
+                } else {
+                    let addrs: Vec<String> = ready.iter().map(IpAddr::to_string).collect();
+                    let _ = writeln!(text, "table <{table}> persist {{ {} }}", addrs.join(" "));
+                }
+            }
+            text.push_str(&rules);
+            sys.pf_load_anchor(ANCHOR, &text)?;
+            self.loaded = Some(rules);
+            for (table, ready) in &tables {
+                if ready.is_empty() {
+                    sys.pf_table_replace(ANCHOR, table, ready)?;
+                }
                 self.tables.insert(table.clone(), ready.clone());
+            }
+        } else {
+            for (table, ready) in &tables {
+                if self.tables.get(table) != Some(ready) {
+                    sys.pf_table_replace(ANCHOR, table, ready)?;
+                    self.tables.insert(table.clone(), ready.clone());
+                }
             }
         }
 
@@ -387,22 +403,28 @@ mod tests {
     }
 
     #[test]
-    fn tables_are_filled_before_the_rules_use_them() {
+    fn tables_come_in_one_load_with_the_rules() {
         let sys = FakeSys::new();
         let subnet = "10.200.0.0/24".parse().unwrap();
         let mut lb = LoadBalancer::default();
+        // A load that fails leaves neither, and the next pass loads both.
         sys.break_anchor(ANCHOR, true);
         let r = lb.apply(&sys, &[web(&["10.200.0.2"], &[])], subnet, Exits::default());
         assert!(r.is_err());
-        assert!(
-            sys.pf_table_show(ANCHOR, "s0000000000000007")
-                .unwrap()
-                .contains(&ip("10.200.0.2").into())
-        );
+        assert!(sys.anchor(ANCHOR).is_none());
+        assert!(sys.pf_table_show(ANCHOR, "s0000000000000007").unwrap().is_empty());
         sys.break_anchor(ANCHOR, false);
         lb.apply(&sys, &[web(&["10.200.0.2"], &[])], subnet, Exits::default())
             .unwrap();
-        assert!(sys.anchor(ANCHOR).is_some());
+        let loaded = sys.anchor(ANCHOR).unwrap();
+        let table = loaded
+            .find("table <s0000000000000007> persist { 10.200.0.2 ")
+            .expect(&loaded);
+        assert!(table < loaded.find("rdr ").unwrap(), "{loaded}");
+        assert_eq!(
+            sys.pf_table_show(ANCHOR, "s0000000000000007").unwrap().len(),
+            2
+        );
     }
 
     #[test]
