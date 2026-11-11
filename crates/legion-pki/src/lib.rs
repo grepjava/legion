@@ -115,18 +115,20 @@ pub struct Ca {
 impl Ca {
     /// A new root CA.
     pub fn generate() -> Result<Ca> {
-        let key = KeyPair::generate()?;
-        let mut params = CertificateParams::default();
-        let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, "Legion cluster CA");
-        params.distinguished_name = dn;
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-        let now = SystemTime::now();
-        params.not_before = (now - BACKDATE).into();
-        params.not_after = (now + CA_LIFETIME).into();
+        let (key, params) = ca_params()?;
         let cert = params.self_signed(&key)?;
         Ca::load(&lf(cert.pem()), &lf(key.serialize_pem()))
+    }
+
+    /// A new root CA to rotate to, and its certificate cross-signed by this
+    /// one: presented alongside the new CA's certificates while the cluster
+    /// moves, it lets a peer that trusts only this CA verify them.
+    pub fn successor(&self) -> Result<(Ca, String)> {
+        let (key, params) = ca_params()?;
+        let cert = params.self_signed(&key)?;
+        let cross = params.signed_by(&key, &self.issuer)?;
+        let next = Ca::load(&lf(cert.pem()), &lf(key.serialize_pem()))?;
+        Ok((next, lf(cross.pem())))
     }
 
     /// A CA from its certificate and key.
@@ -247,6 +249,22 @@ fn first_cert_der(pem: &str) -> Result<Vec<u8>> {
 /// SHA-256 of the first certificate in `pem`, in hex.
 pub fn digest(cert_pem: &str) -> Result<String> {
     Ok(digest_der(&first_cert_der(cert_pem)?))
+}
+
+/// A new CA's key and certificate parameters: ten years, every CA named
+/// the same.
+fn ca_params() -> Result<(KeyPair, CertificateParams)> {
+    let key = KeyPair::generate()?;
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "Legion cluster CA");
+    params.distinguished_name = dn;
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let now = SystemTime::now();
+    params.not_before = (now - BACKDATE).into();
+    params.not_after = (now + CA_LIFETIME).into();
+    Ok((key, params))
 }
 
 /// Which of the CAs in `trust_pem` signed the first certificate in

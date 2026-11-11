@@ -464,7 +464,8 @@ mod tests {
     /// A rotation: both CAs trusted while nodes move, then only the new one.
     #[test]
     fn trust_follows_a_rotation() {
-        let (old, new) = (Ca::generate().unwrap(), Ca::generate().unwrap());
+        let old = Ca::generate().unwrap();
+        let (new, cross) = old.successor().unwrap();
         let w1 = Identity::new("w1", Role::Worker);
         let before = old.issue(&w1, legion_pki::CERT_LIFETIME).unwrap();
         let after = new.issue(&w1, legion_pki::CERT_LIFETIME).unwrap();
@@ -484,6 +485,14 @@ mod tests {
         let creds = Credentials::new(old.cert_pem(), &before.cert_pem, &before.key_pem).unwrap();
         assert!(accepts(&creds, &peer_old.cert_pem));
         assert!(!accepts(&creds, &peer_new.cert_pem));
+        // Presented with the cross-signed certificate, the new CA's are
+        // verified by a peer that trusts only the old CA.
+        let with_cross = creds.trust.verify_client_cert(
+            &der(&peer_new.cert_pem),
+            &[der(&cross)],
+            UnixTime::now(),
+        );
+        assert!(with_cross.is_ok(), "{with_cross:?}");
         // Not the new CA alone while this node's certificate is the old one's.
         assert!(creds.trust(new.cert_pem()).is_err());
         assert!(!accepts(&creds, &peer_new.cert_pem), "nothing changed");
