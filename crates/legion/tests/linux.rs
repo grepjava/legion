@@ -4,8 +4,10 @@
 //! doing real work through FreeBSD's Linux ABI. docs/LINUX.md is the table
 //! this test keeps true.
 //!
-//! Every image is tried and the matrix printed before anything is asserted,
-//! so one image failing still shows how the others did.
+//! Every image is tried, each in time of its own, and the matrix printed
+//! before anything is asserted, so one image failing still shows how the
+//! others did. Static Linux programs (`gosu`, in the Postgres image) run as
+//! the daemon sets `kern.elf64.fallback_brand` for them (DESIGN.md §6.6).
 //!
 //! It drives the real daemon on one node, so it is ignored by default and
 //! run by hand on a FreeBSD host as root, with the lab of `tests/common`
@@ -56,12 +58,11 @@ const ROWS: &[Row] = &[
         command: SLEEP,
         more: "",
         check: &[
-            "/bin/sh",
-            "-c",
-            "perl -MDigest::MD5=md5_hex -e 'print md5_hex(\"legion\"), qq(\\n)'",
+            "perl",
+            "-e",
+            "print join(q(,), map { $_ * 2 } grep { $_ % 2 } 1..9), qq(\n)",
         ],
-        // md5("legion")
-        expect: "23d6e2be089bed49550f30814e08ad60",
+        expect: "2,6,10,14,18",
     },
     Row {
         name: "nginx",
@@ -119,7 +120,7 @@ const ROWS: &[Row] = &[
     Row {
         name: "postgres",
         image: "docker.io/library/postgres:17-alpine",
-        what: "its entrypoint, su-exec, shared memory",
+        what: "its entrypoint, gosu (static Go), shared memory",
         command: &["docker-entrypoint.sh", "postgres"],
         more: "        env: [{ name: POSTGRES_HOST_AUTH_METHOD, value: trust }]
         security: { allow: [sysvipc] }
@@ -248,10 +249,17 @@ spec: { security: { allow: [sysvipc] } }
     }
 
     step("each one's check, in its task");
-    // Pulls come first, one image after another: time enough for them all.
-    let until = Instant::now() + Duration::from_secs(1500);
-    let results: Vec<(&Row, Result<String, String>)> =
-        ROWS.iter().map(|r| (r, try_row(&lab, r, until))).collect();
+    // Each row its own time: the pulls run at once, and a row that fails
+    // leaves the next its own.
+    let results: Vec<(&Row, Result<String, String>)> = ROWS
+        .iter()
+        .map(|r| {
+            (
+                r,
+                try_row(&lab, r, Instant::now() + Duration::from_secs(600)),
+            )
+        })
+        .collect();
     eprintln!("Linux images matrix:");
     for (row, result) in &results {
         match result {
