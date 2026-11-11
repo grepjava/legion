@@ -39,6 +39,8 @@ test legion-jail live pods_of_jails host shared 900
 test legion-jail live standalone_containers_and_build_steps host shared 900
 test legion-jail live linux_images host shared 900 kld:linux64
 test legion-image live pulls_from_docker_hub host shared 900
+# A measurement (PLAN.md phase 9, docs/MEASURE.md): its numbers in its log.
+test legion-image live image_pulls_and_loads_by_size host shared 1800
 test legion-image live rootfs_copies_built_layers_and_exports_on_zfs host shared 900
 test legion-image live whiteouts_and_replacements_of_flagged_files host shared 900
 test legion-sys live rctl_on_child_jail host shared 300

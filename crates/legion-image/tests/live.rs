@@ -390,3 +390,65 @@ async fn rootfs_copies_built_layers_and_exports_on_zfs() {
     );
     sys.zfs_destroy(&base, true).unwrap();
 }
+
+/// Measurement (PLAN.md phase 9): images pulled from Docker Hub, then
+/// exported, removed with their layers and loaded from the archive, then
+/// loaded again with their layers still there. A pull's time is mostly the
+/// network's; a load's is Legion's own, checking and unpacking onto ZFS.
+#[tokio::test]
+#[ignore = "needs root, LEGION_IMAGE_ZFS_ROOT and the network"]
+async fn image_pulls_and_loads_by_size() {
+    use std::time::{Duration, Instant};
+    let Some(root) = root() else { return };
+    let base = format!("{root}/limgm{}", std::process::id());
+    let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+    let sys = Arc::new(Shell::new());
+    let store = Store::open(
+        sys.clone() as Arc<dyn Sys>,
+        &format!("{base}/images"),
+        dir.path(),
+        Client::new().unwrap(),
+    )
+    .unwrap()
+    .with_linux(true)
+    .keep_blobs();
+    let secs = |d: Duration| format!("{:.1} s", d.as_secs_f64());
+    println!("| Image | Layers | Archive | Pull | Load | Load, layers there |");
+    println!("|---|---|---|---|---|---|");
+    for name in [
+        "docker.io/library/alpine:3.20",
+        "docker.io/freebsd/freebsd-runtime:15.1",
+        "docker.io/library/python:3.12-slim",
+        "docker.io/library/postgres:17-alpine",
+    ] {
+        let start = Instant::now();
+        let image = store.pull(name, None, "t").await.unwrap();
+        let pull = start.elapsed();
+        let archive = dir.path().join("image.tar");
+        store.export(name, &archive, None).await.unwrap();
+        let mib = std::fs::metadata(&archive).unwrap().len() as f64 / (1 << 20) as f64;
+        assert!(store.remove(name).await.unwrap());
+        assert_eq!(store.prune().await.unwrap().len(), image.layers.len());
+
+        let start = Instant::now();
+        let loaded = store.load(&archive, Some(name)).await.unwrap();
+        let load = start.elapsed();
+        assert_eq!(loaded.layers, image.layers, "{name}");
+        assert!(store.remove(name).await.unwrap());
+        // Its layers stay until a prune: a load finds them there.
+        let start = Instant::now();
+        store.load(&archive, Some(name)).await.unwrap();
+        let again = start.elapsed();
+        println!(
+            "| `{name}` | {} | {mib:.0} MiB | {} | {} | {} |",
+            image.layers.len(),
+            secs(pull),
+            secs(load),
+            secs(again)
+        );
+        assert!(store.remove(name).await.unwrap());
+        store.prune().await.unwrap();
+        std::fs::remove_file(&archive).unwrap();
+    }
+    sys.zfs_destroy(&base, true).unwrap();
+}
