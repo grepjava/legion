@@ -467,9 +467,10 @@ fn jail_runtime(
     };
     let mut images = image_store(sys.clone(), &opts.data_dir, zfs, &opts.insecure_registries)?;
     if opts.linux {
-        for m in legion_jail::LINUX_MODULES {
-            sys.kld_load(m)
-                .with_context(|| format!("loading {m}, for Linux images"))?;
+        let note = legion_jail::enable_linux(sys.as_ref())
+            .context("readying the host for Linux images")?;
+        if let Some(note) = note {
+            tracing::warn!("{note}");
         }
         images = images.with_linux(true);
     }

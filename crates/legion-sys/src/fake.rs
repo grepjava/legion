@@ -160,6 +160,11 @@ impl FakeSys {
         sys.state()
             .sysctls
             .insert("kern.racct.enable".into(), "1".into());
+        // No fallback ELF brand, as FreeBSD leaves it.
+        sys.state().sysctls.insert(
+            crate::check::FALLBACK_BRAND.into(),
+            crate::check::NO_BRAND.into(),
+        );
         sys
     }
 

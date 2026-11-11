@@ -37,3 +37,53 @@ pub const ANNOTATION_CPUSET: &str = "org.freebsd.jail.cpuset";
 pub const DEVFS_RULESET: u32 = 4;
 
 pub use legion_sys::check::LINUX_MODULES;
+
+/// Readies the host for Linux images: loads [`LINUX_MODULES`] and, where
+/// the host left `kern.elf64.fallback_brand` as FreeBSD does (none), sets
+/// it to Linux's, so static Linux programs run (`gosu`, Go's programs; see
+/// [`legion_sys::check::FALLBACK_BRAND`]). A host that chose another brand
+/// keeps it: the note returned says what won't run.
+pub fn enable_linux(sys: &dyn legion_sys::Sys) -> legion_sys::Result<Option<String>> {
+    use legion_sys::check::{FALLBACK_BRAND, LINUX_BRAND, NO_BRAND};
+    for m in LINUX_MODULES {
+        sys.kld_load(m)?;
+    }
+    let brand = sys.sysctl_get(FALLBACK_BRAND)?;
+    if brand == NO_BRAND {
+        sys.sysctl_set(FALLBACK_BRAND, LINUX_BRAND)?;
+        return Ok(None);
+    }
+    Ok((brand != LINUX_BRAND).then(|| {
+        format!(
+            "{FALLBACK_BRAND} is {brand}, set on this host: static Linux programs will not run              (set it to {LINUX_BRAND} for them)"
+        )
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use legion_sys::check::{FALLBACK_BRAND, LINUX_BRAND};
+    use legion_sys::{FakeSys, Sys};
+
+    #[test]
+    fn linux_is_enabled_unless_the_host_chose_another_brand() {
+        let sys = FakeSys::new();
+        assert_eq!(super::enable_linux(&sys).unwrap(), None);
+        assert_eq!(sys.sysctl_get(FALLBACK_BRAND).unwrap(), LINUX_BRAND);
+        // Again, as at the next start: nothing to say.
+        assert_eq!(super::enable_linux(&sys).unwrap(), None);
+
+        let sys = FakeSys::new();
+        sys.sysctl_set(FALLBACK_BRAND, "9").unwrap();
+        let note = super::enable_linux(&sys).unwrap().unwrap();
+        assert!(
+            note.contains("static Linux programs will not run"),
+            "{note}"
+        );
+        assert_eq!(
+            sys.sysctl_get(FALLBACK_BRAND).unwrap(),
+            "9",
+            "the host's choice kept"
+        );
+    }
+}

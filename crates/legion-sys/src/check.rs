@@ -12,6 +12,16 @@ use crate::{Error, KldState, Sys};
 /// for them (`/proc`, `/sys`, `/dev/fd`, `/dev/shm`).
 pub const LINUX_MODULES: [&str; 5] = ["linux64", "linprocfs", "linsysfs", "fdescfs", "tmpfs"];
 
+/// The ELF brand the kernel gives a program that says none. Dynamic Linux
+/// programs say Linux through their interpreter; static ones (Go's, such
+/// as `gosu` in many images) say nothing, and run only with this set to
+/// [`LINUX_BRAND`]. FreeBSD's own programs always say FreeBSD.
+pub const FALLBACK_BRAND: &str = "kern.elf64.fallback_brand";
+/// Linux's ELF brand (brandelf(1)'s `Linux`).
+pub const LINUX_BRAND: &str = "3";
+/// [`FALLBACK_BRAND`] as FreeBSD leaves it: none.
+pub const NO_BRAND: &str = "-1";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum State {
@@ -206,9 +216,36 @@ pub fn module(sys: &dyn Sys, name: &str) -> Finding {
     }
 }
 
-/// [`module`] for each of [`LINUX_MODULES`].
+/// [`module`] for each of [`LINUX_MODULES`], and [`linux_static`].
 pub fn linux_abi(sys: &dyn Sys) -> Vec<Finding> {
-    LINUX_MODULES.iter().map(|m| module(sys, m)).collect()
+    let mut found: Vec<Finding> = LINUX_MODULES.iter().map(|m| module(sys, m)).collect();
+    found.push(linux_static(sys));
+    found
+}
+
+/// Whether static Linux programs will run: [`FALLBACK_BRAND`] is Linux's,
+/// or unset, as enabling Linux images sets it then; another brand the host
+/// chose stays, and they won't.
+pub fn linux_static(sys: &dyn Sys) -> Finding {
+    const ID: &str = "linux.static";
+    match sys.sysctl_get(FALLBACK_BRAND) {
+        Ok(v) if v == LINUX_BRAND => Finding::met(ID, "static Linux programs run as Linux's"),
+        // Set to Linux's as Linux images are enabled (legion_jail::enable_linux).
+        Ok(v) if v == NO_BRAND => Finding::met(
+            ID,
+            format!("{FALLBACK_BRAND} unset: set to {LINUX_BRAND} as Linux images are enabled"),
+        ),
+        Ok(v) => Finding::unmet(
+            ID,
+            format!(
+                "{FALLBACK_BRAND} is {v}: static Linux programs (Go's among them) fail with                  \"Exec format error\""
+            ),
+            format!(
+                "add {FALLBACK_BRAND}={LINUX_BRAND} to /etc/sysctl.conf, and for now run:                  sysctl {FALLBACK_BRAND}={LINUX_BRAND}"
+            ),
+        ),
+        Err(e) => Finding::unknown(ID, FALLBACK_BRAND, &e),
+    }
 }
 
 /// Whether `dataset` is there for a tool to work under.
@@ -325,14 +362,19 @@ mod tests {
     fn linux_abi_is_what_the_runtime_loads() {
         let sys = FakeSys::new();
         sys.remove_module("linprocfs");
+        sys.sysctl_set(FALLBACK_BRAND, "9").unwrap();
         let found = linux_abi(&sys);
-        assert_eq!(found.len(), LINUX_MODULES.len());
+        assert_eq!(found.len(), LINUX_MODULES.len() + 1);
         let bad: Vec<_> = found
             .iter()
             .filter(|f| f.state != State::Met)
             .map(|f| f.id.as_str())
             .collect();
-        assert_eq!(bad, ["module.linprocfs"]);
+        assert_eq!(bad, ["module.linprocfs", "linux.static"]);
+        for ok in [LINUX_BRAND, NO_BRAND] {
+            sys.sysctl_set(FALLBACK_BRAND, ok).unwrap();
+            assert_eq!(linux_static(&sys).state, State::Met, "{ok}");
+        }
     }
 
     #[test]

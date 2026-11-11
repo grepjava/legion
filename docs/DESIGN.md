@@ -1365,7 +1365,17 @@ no FreeBSD build, through FreeBSD's Linux ABI (linux(4)):
   to a tmpfs (mode 1777) at `/.legion-shm` in its root.
 - musl and glibc programs both run without `kern.elf64.fallback_brand`:
   tested with `alpine:3.20` and `debian:bookworm-slim` from Docker Hub,
-  as `nobody`, on FreeBSD 15.1.
+  as `nobody`, on FreeBSD 15.1. Static Linux programs do not: they name
+  no interpreter, so nothing says they are Linux's, and the kernel
+  refuses them ("Exec format error"), as the lab found of `gosu`, a Go
+  program the official Postgres image starts through. So `--linux`
+  also sets `kern.elf64.fallback_brand=3` (Linux) where the host left it
+  unset (-1), as the Handbook advises for such programs; FreeBSD's own
+  programs always say FreeBSD, so it reaches only unbranded ones. A host
+  that chose another value keeps it, the daemon warns that static Linux
+  programs won't run, and `legion doctor` says so (`linux.static`). The
+  step is `legion_jail::enable_linux`, which jailer's `run --linux` can
+  share.
 - The supervisor reads the container's user from the image's
   `/etc/passwd` and `/etc/group` as text, for every image: Linux images
   have no `pwd.db`, and FreeBSD images keep the text files beside it.
