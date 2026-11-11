@@ -64,6 +64,20 @@ pub(super) fn migrations(
         Some(s) => holds(s, to),
         None => usable(to),
     };
+    // A node a migration under way keeps going to: as `usable_for`, but a
+    // node only suspect, a few heartbeats late, is not gone; its copy is
+    // kept for it, as the migrator retries until it answers or is down.
+    let keeps = |v: &Volume, to: &str| match node(to) {
+        Some(n) if n.status.state == NodeState::Suspect => {
+            let mut n = n.clone();
+            n.status.state = NodeState::Ready;
+            match stateful(v) {
+                Some(s) => eligible(&n, s, volumes, &[]).is_ok(),
+                None => n.spec.availability == Availability::Active,
+            }
+        }
+        _ => usable_for(v, to),
+    };
     let orphaned = super::held_by_orphans(tasks, nodes, volumes);
     // Requests placed on each node.
     let mut load: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
@@ -128,7 +142,7 @@ pub(super) fn migrations(
             Some(to) if usable_for(v, to) => false,
             _ => stateful(v).is_some_and(|s| leaves(s, &v.status.node)),
         };
-        let next = if !usable_for(v, &m.to) || (m.phase != MigrationPhase::Finishing && !wanted) {
+        let next = if !keeps(v, &m.to) || (m.phase != MigrationPhase::Finishing && !wanted) {
             None
         } else if m.phase == MigrationPhase::Copied
             && !tasks.iter().any(|t| {

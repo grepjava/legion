@@ -3254,9 +3254,11 @@ fn a_drain_says_a_task_waits_for_its_budget() {
     );
 }
 
-/// A move called off as it finished, its target no longer ready, leaves the
-/// data on the draining node with its task gone: the drain waits for it
-/// still, and is not completed with the data behind.
+/// A move's target only suspect, a few heartbeats late, keeps the move:
+/// its full copy is not sent again elsewhere. Called off as it finished,
+/// its target down, the data stays on the draining node with its task
+/// gone: the drain waits for it still, and is not completed with the data
+/// behind.
 #[test]
 fn a_drain_waits_for_data_whose_move_was_called_off() {
     use legion_api::volume::MigrationPhase::*;
@@ -3280,8 +3282,13 @@ fn a_drain_waits_for_data_whose_move_was_called_off() {
     w.settle();
     assert_eq!(w.migration("data-db-0"), Some((to.to_owned(), Finishing)));
 
-    // Its target goes silent before the last of the data is sent.
+    // Its target late with heartbeats before the last of the data is sent:
+    // the move waits for it.
     w.state(to, NodeState::Suspect);
+    w.settle();
+    assert_eq!(w.migration("data-db-0"), Some((to.to_owned(), Finishing)));
+    // Down: called off.
+    w.state(to, NodeState::Down);
     w.settle();
     assert_eq!(w.migration("data-db-0"), None);
     assert_eq!(w.volume_node("data-db-0"), from);
