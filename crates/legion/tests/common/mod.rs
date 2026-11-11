@@ -126,6 +126,20 @@ impl Lab {
     fn new(dir: PathBuf, host: String, vms: Vec<Vm>, key: String) -> Lab {
         if dir.exists() {
             let d = dir.display();
+            // A daemon an earlier test left on this directory, killed with
+            // it (a test stopped at its time limit runs no Drop): beside the
+            // next, it would answer on the same address.
+            Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &format!(
+                        // `[-]`: the pattern, not this shell's line holding it.
+                        "pkill -KILL -f -- '[-]-data-dir {d}/data' && \
+                         while pgrep -qf -- '[-]-data-dir {d}/data'; do sleep 0.2; done"
+                    ),
+                ])
+                .status()
+                .unwrap();
             let script = clean(&format!("{d}/data"), &format!("{d}/run"));
             Command::new("/bin/sh")
                 .args(["-c", &format!("{script}chflags -R 0 {d}; rm -rf {d}")])
