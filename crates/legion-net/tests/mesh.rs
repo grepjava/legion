@@ -527,3 +527,142 @@ fn pods_across_nodes() {
         "{left}"
     );
 }
+
+/// The jails and links of [`mesh_growth_by_nodes`], removed however it ends.
+struct Growth {
+    jails: Vec<String>,
+    links: Vec<(String, String)>,
+}
+
+impl Drop for Growth {
+    fn drop(&mut self) {
+        for (jail, link) in &self.links {
+            if !sh(&format!("jexec {jail} ifconfig {link} destroy")).0 {
+                sh(&format!("ifconfig {link} destroy"));
+            }
+        }
+        for j in self.jails.iter().rev() {
+            sh(&format!("jail -r {j}"));
+        }
+    }
+}
+
+/// Measurement (PLAN.md phase 9): nodes join a mesh one at a time, VNET
+/// jails on one switch as in [`pods_across_nodes`]. For each join: the new
+/// node setting every peer, every other node adding it, and the time until
+/// the new node has reached every other node over WireGuard.
+#[test]
+#[ignore = "needs root on a FreeBSD host"]
+fn mesh_growth_by_nodes() {
+    use std::time::Instant;
+    const MOST: usize = 24;
+    assert_eq!(must("id -u").trim(), "0", "run as root");
+    assert_eq!(
+        must("sysctl -n security.jail.jailed").trim(),
+        "0",
+        "run on the host: the nodes are jails"
+    );
+    let switch = "lmeshg-sw".to_owned();
+    assert!(!sh(&format!("jls -j {switch}")).0, "{switch} exists already");
+    let mut lab = Growth {
+        jails: vec![switch.clone()],
+        links: Vec::new(),
+    };
+    must(&format!("jail -c name={switch} path=/ vnet persist"));
+    let bridge = must(&format!("jexec {switch} ifconfig bridge create"));
+    let bridge = bridge.trim().to_owned();
+    must(&format!(
+        "jexec {switch} ifconfig {bridge} inet 192.168.253.254/24 up"
+    ));
+
+    let ms = |d: Duration| format!("{:.0} ms", d.as_secs_f64() * 1000.0);
+    println!("| Nodes | New node's peers set | Others add it (each, slowest) | Every node reached |");
+    println!("|---|---|---|---|");
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut peers: Vec<Peer> = Vec::new();
+    for n in 1..=MOST {
+        let jail = format!("lmeshg-n{n}");
+        assert!(!sh(&format!("jls -j {jail}")).0, "{jail} exists already");
+        must(&format!(
+            "jail -c name={jail} path=/ vnet persist allow.raw_sockets"
+        ));
+        lab.jails.push(jail.clone());
+        let created = must("ifconfig epair create");
+        let created = created.trim();
+        let (a, b) = (format!("lmgu{n}"), format!("lmgs{n}"));
+        must(&format!("ifconfig {created} name {a}"));
+        lab.links.push((jail.clone(), a.clone()));
+        must(&format!(
+            "ifconfig {}b name {b}",
+            created.strip_suffix('a').unwrap()
+        ));
+        must(&format!("ifconfig {a} vnet {jail}"));
+        must(&format!("ifconfig {b} vnet {switch}"));
+        must(&format!("jexec {switch} ifconfig {b} up"));
+        must(&format!("jexec {switch} ifconfig {bridge} addm {b}"));
+        must(&format!("jexec {jail} ifconfig lo0 up"));
+        must(&format!(
+            "jexec {jail} ifconfig {a} inet 192.168.253.{n}/24 up"
+        ));
+
+        let sys = Shell::with_runner(Jexec(jail.clone()));
+        let subnet: Ipv4Net = format!("10.200.{n}.0/24").parse().unwrap();
+        let net = PodNetwork::new(subnet);
+        net.ensure_bridge(&sys).unwrap();
+        let key = sys.wg_genkey().unwrap();
+        let mesh = Mesh {
+            subnet,
+            private_key: key.clone(),
+            port: mesh::PORT,
+        };
+        mesh.ensure(&sys).unwrap();
+        let peer = Peer {
+            public_key: sys.wg_pubkey(&key).unwrap(),
+            endpoint: Some(format!("192.168.253.{n}:{}", mesh::PORT)),
+            subnet,
+        };
+        let before = peers.clone();
+        peers.push(peer.clone());
+
+        // The new node, with every peer.
+        let start = Instant::now();
+        mesh.apply(&sys, &peers, &[]).unwrap();
+        let own = start.elapsed();
+        // Every other node, adding it.
+        let mut slowest = Duration::ZERO;
+        let start = Instant::now();
+        for other in &nodes {
+            let one = Instant::now();
+            other.mesh.apply(&other.sys, &peers, &before).unwrap();
+            slowest = slowest.max(one.elapsed());
+        }
+        let others = start.elapsed();
+        // The new node reaches each other node's mesh address.
+        let start = Instant::now();
+        for other in &nodes {
+            let to = mesh::underlay_addr(other.net.subnet).unwrap();
+            let reached = (0..30).any(|_| sh(&format!("jexec {jail} ping -c1 -t1 {to}")).0);
+            assert!(reached, "node {n} reaches {}", other.jail);
+        }
+        let reached = start.elapsed();
+        assert_eq!(sys.wg_peers(mesh::INTERFACE).unwrap().len(), n - 1);
+        if [2, 4, 8, 12, 16, 20, 24].contains(&n) {
+            let each = others.checked_div(n as u32 - 1).unwrap_or_default();
+            println!(
+                "| {n} | {} | {}, {} | {} |",
+                ms(own),
+                ms(each),
+                ms(slowest),
+                ms(reached)
+            );
+        }
+        nodes.push(Node {
+            jail,
+            sys,
+            net,
+            peer,
+            mesh,
+        });
+    }
+    drop(lab);
+}
