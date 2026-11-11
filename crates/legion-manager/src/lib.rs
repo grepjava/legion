@@ -300,7 +300,7 @@ impl Manager {
         });
         let issuer = match (&self.credentials, &self.ca_key_pem) {
             (Some(c), Some(key)) => Some(join::Issuer {
-                ca: std::sync::Arc::new(legion_pki::Ca::load(c.ca_pem(), key)?),
+                ca: std::sync::Arc::new(legion_pki::Ca::load(&c.ca_pem(), key)?),
                 store: self.store.clone(),
             }),
             _ => None,
