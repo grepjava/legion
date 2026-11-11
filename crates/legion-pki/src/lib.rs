@@ -249,6 +249,33 @@ pub fn digest(cert_pem: &str) -> Result<String> {
     Ok(digest_der(&first_cert_der(cert_pem)?))
 }
 
+/// Which of the CAs in `trust_pem` signed the first certificate in
+/// `cert_pem`, by its digest ([`Ca::digest`]); `None` for none of them.
+/// Checked by signature, not by name: every cluster CA has the same.
+pub fn issuer(cert_pem: &str, trust_pem: &str) -> Option<String> {
+    let leaf_der = first_cert_der(cert_pem).ok()?;
+    let (_, leaf) = X509Certificate::from_der(&leaf_der).ok()?;
+    blocks(trust_pem)
+        .into_iter()
+        .filter(|(label, _)| label == "CERTIFICATE")
+        .find(|(_, der)| {
+            X509Certificate::from_der(der).is_ok_and(|(_, ca)| {
+                leaf.issuer() == ca.subject()
+                    && leaf.verify_signature(Some(ca.public_key())).is_ok()
+            })
+        })
+        .map(|(_, der)| digest_der(&der))
+}
+
+/// Each certificate in `pem`, as PEM of its own, in order.
+pub fn split_certs(pem: &str) -> Vec<String> {
+    blocks(pem)
+        .into_iter()
+        .filter(|(label, _)| label == "CERTIFICATE")
+        .map(|(_, der)| cert_pem(&der))
+        .collect()
+}
+
 /// The identity the first certificate in `cert_pem` names.
 pub fn identity_of_pem(cert_pem: &str) -> Result<Identity> {
     identity(&first_cert_der(cert_pem)?)
@@ -544,6 +571,22 @@ mod tests {
             ["shop.example.org", "www.example.org"]
         );
         assert!(dns_names("garbage").is_err());
+    }
+
+    #[test]
+    fn the_issuer_is_found_by_signature() {
+        let (old, new) = (Ca::generate().unwrap(), Ca::generate().unwrap());
+        let id = Identity::new("w1", Role::Worker);
+        let cert = new.issue(&id, CERT_LIFETIME).unwrap().cert_pem;
+        let both = format!("{}{}", old.cert_pem(), new.cert_pem());
+        // Both CAs have the same name: only the signature tells.
+        assert_eq!(issuer(&cert, &both), Some(new.digest()));
+        assert_eq!(issuer(&cert, old.cert_pem()), None);
+        assert_eq!(issuer("not a certificate", &both), None);
+        assert_eq!(
+            split_certs(&both),
+            [old.cert_pem().to_owned(), new.cert_pem().to_owned()]
+        );
     }
 
     #[test]
