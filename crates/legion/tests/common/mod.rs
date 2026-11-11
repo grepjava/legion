@@ -174,6 +174,22 @@ impl Lab {
             .unwrap()
     }
 
+    /// [`Self::legion`], given `secs` to finish (timeout(1) stops it after
+    /// that): None if it didn't.
+    pub fn legion_within(&self, secs: u64, args: &[&str]) -> Option<Output> {
+        let out = Command::new("timeout")
+            .arg(secs.to_string())
+            .arg(LEGION)
+            .args(["--server", &self.server()])
+            .arg("--identity")
+            .arg(self.admin())
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        (out.status.code() != Some(124)).then_some(out)
+    }
+
     pub fn ok(&self, args: &[&str]) -> String {
         self.ok_as(&self.admin(), args)
     }

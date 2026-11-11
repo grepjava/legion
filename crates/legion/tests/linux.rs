@@ -4,10 +4,12 @@
 //! doing real work through FreeBSD's Linux ABI. docs/LINUX.md is the table
 //! this test keeps true.
 //!
-//! Every image is tried, each in time of its own, and the matrix printed
-//! before anything is asserted, so one image failing still shows how the
-//! others did. Static Linux programs (`gosu`, in the Postgres image) run as
-//! the daemon sets `kern.elf64.fallback_brand` for them (DESIGN.md §6.6).
+//! Every image is tried, each in time of its own and each check given
+//! [`CHECK_SECS`], and the matrix printed before anything is asserted, so
+//! one image failing still shows how the others did. Static Linux programs
+//! (`gosu`, BusyBox) run as the daemon sets `kern.elf64.fallback_brand` for
+//! them (DESIGN.md §6.6). What the ABI is known not to run stays in the
+//! table as such (Node 22, Postgres), and is checked to fail as it says.
 //!
 //! It drives the real daemon on one node, so it is ignored by default and
 //! run by hand on a FreeBSD host as root, with the lab of `tests/common`
@@ -26,8 +28,8 @@ use common::{Lab, text, wait};
 use serde_json::Value;
 
 /// One row of the matrix: a Service running `image` with `command` (and
-/// `more` of its container's fields), and a check run in its task, whose
-/// output must hold `expect`.
+/// `more` of its container's fields), a check run in its task, and what
+/// the row is to show.
 struct Row {
     name: &'static str,
     image: &'static str,
@@ -36,8 +38,23 @@ struct Row {
     command: &'static [&'static str],
     more: &'static str,
     check: &'static [&'static str],
-    expect: &'static str,
+    expect: Expect,
 }
+
+/// What a row shows. A failure FreeBSD's Linux ABI is known for is kept
+/// as one, so the table stays true when the ABI changes.
+#[derive(Clone, Copy)]
+enum Expect {
+    /// The check's output holds this.
+    Works(&'static str),
+    /// The check runs and never answers; why, for the table.
+    Hangs(&'static str),
+    /// The container stops, its log saying the first; why, the second.
+    Stops(&'static str, &'static str),
+}
+
+/// How long a check may take.
+const CHECK_SECS: u64 = 60;
 
 const SLEEP: &[&str] = &["/bin/sleep", "86400"];
 
@@ -49,7 +66,7 @@ const ROWS: &[Row] = &[
         command: SLEEP,
         more: "",
         check: &["/bin/sh", "-c", "uname -s; cat /etc/alpine-release"],
-        expect: "Linux\n3.20",
+        expect: Expect::Works("Linux\n3.20"),
     },
     Row {
         name: "ubuntu",
@@ -62,7 +79,7 @@ const ROWS: &[Row] = &[
             "-e",
             "print join(q(,), map { $_ * 2 } grep { $_ % 2 } 1..9), qq(\n)",
         ],
-        expect: "2,6,10,14,18",
+        expect: Expect::Works("2,6,10,14,18"),
     },
     Row {
         name: "nginx",
@@ -71,7 +88,7 @@ const ROWS: &[Row] = &[
         command: &["nginx", "-g", "daemon off;"],
         more: "",
         check: &["wget", "-q", "-O-", "http://127.0.0.1/"],
-        expect: "Welcome to nginx!",
+        expect: Expect::Works("Welcome to nginx!"),
     },
     Row {
         name: "redis",
@@ -84,7 +101,7 @@ const ROWS: &[Row] = &[
             "-c",
             "redis-cli set k legion >/dev/null && redis-cli get k",
         ],
-        expect: "legion",
+        expect: Expect::Works("legion"),
     },
     Row {
         name: "python",
@@ -100,41 +117,37 @@ const ROWS: &[Row] = &[
              print('py', ssl.OPENSSL_VERSION.split()[0], db.execute('select 6*7').fetchone()[0], \
              m.Pool(2).map(abs, [-1, -2]))",
         ],
-        expect: "py OpenSSL 42 [1, 2]",
+        expect: Expect::Works("py OpenSSL 42 [1, 2]"),
+    },
+    Row {
+        name: "busybox",
+        image: "docker.io/library/busybox:1.37",
+        what: "one static program",
+        command: SLEEP,
+        more: "",
+        check: &["/bin/busybox", "echo", "static"],
+        expect: Expect::Works("static"),
     },
     Row {
         name: "node",
         image: "docker.io/library/node:22-alpine",
-        what: "V8's JIT, libuv's threads",
+        what: "V8, libuv",
         command: SLEEP,
         more: "",
-        check: &[
-            "node",
-            "-e",
-            "const c = require('crypto'); \
-             require('fs').promises.readFile('/etc/hostname').then(() => \
-             console.log('node', c.createHash('sha256').update('x').digest('hex').length))",
-        ],
-        expect: "node 64",
+        check: &["node", "-e", "console.log(6 * 7)"],
+        expect: Expect::Hangs("its main thread spins from the start, running no script"),
     },
     Row {
         name: "postgres",
         image: "docker.io/library/postgres:17-alpine",
-        what: "its entrypoint, gosu (static Go), shared memory",
+        what: "its entrypoint, gosu (static Go)",
         command: &["docker-entrypoint.sh", "postgres"],
         more: "        env: [{ name: POSTGRES_HOST_AUTH_METHOD, value: trust }]
         security: { allow: [sysvipc] }
 ",
-        check: &[
-            "psql",
-            "-h",
-            "127.0.0.1",
-            "-U",
-            "postgres",
-            "-tAc",
-            "select 6*7",
-        ],
-        expect: "42",
+        check: &[],
+        // After gosu, a static program, ran it. Postgres 15 the same.
+        expect: Expect::Stops("signalfd() failed", "the ABI has no signalfd(2)"),
     },
 ];
 
@@ -173,42 +186,56 @@ fn task(lab: &Lab, service: &str) -> Option<Value> {
     })
 }
 
-/// How a row went: its check's output once it held what was expected, or
-/// what went wrong last.
+/// A task of `service`, running or not.
+fn any_task(lab: &Lab, service: &str) -> Option<Value> {
+    lab.list("tasks", "lx")
+        .into_iter()
+        .find(|t| t["spec"]["service"] == service)
+}
+
+/// How a row went: what showed it as expected, or what happened instead.
 fn try_row(lab: &Lab, row: &Row, until: Instant) -> Result<String, String> {
     let mut last = String::from("no running task");
     while Instant::now() < until {
-        if let Some(t) = task(lab, row.name) {
+        if let Expect::Stops(says, _) = row.expect {
+            if let Some(t) = any_task(lab, row.name) {
+                let name = t["metadata"]["name"].as_str().unwrap();
+                let log = lab
+                    .legion_within(CHECK_SECS, &["logs", name, "-n", "lx"])
+                    .map(|o| text(&o.stdout) + &text(&o.stderr))
+                    .unwrap_or_default();
+                if let Some(line) = log.lines().find(|l| l.contains(says)) {
+                    return Ok(line.trim().to_owned());
+                }
+                last = log.lines().last().unwrap_or("").to_owned();
+            }
+        } else if let Some(t) = task(lab, row.name) {
             let name = t["metadata"]["name"].as_str().unwrap();
             let mut args = vec!["exec", name, "-n", "lx", "--"];
             args.extend_from_slice(row.check);
-            let out = lab.legion(&args, &[]);
-            let said = text(&out.stdout);
-            if out.status.success() && said.contains(row.expect) {
-                return Ok(said.trim().to_owned());
+            match (lab.legion_within(CHECK_SECS, &args), row.expect) {
+                (None, Expect::Hangs(_)) => return Ok(format!("no answer in {CHECK_SECS} s")),
+                (None, _) => last = format!("no answer in {CHECK_SECS} s"),
+                (Some(out), expect) => {
+                    let said = text(&out.stdout);
+                    if let Expect::Works(holds) = expect
+                        && out.status.success()
+                        && said.contains(holds)
+                    {
+                        return Ok(said.trim().to_owned());
+                    }
+                    last = format!("{} {}", said.trim(), text(&out.stderr).trim());
+                    if let Expect::Hangs(_) = expect {
+                        return Err(format!("it answered: {last}"));
+                    }
+                }
             }
+        } else if let Some(t) = any_task(lab, row.name) {
             last = format!(
-                "{}{}{}",
-                said.trim(),
-                if said.trim().is_empty() { "" } else { "; " },
-                text(&out.stderr).trim()
+                "no running task: {} {}",
+                t["status"]["state"].as_str().unwrap_or("?"),
+                t["status"]["message"].as_str().unwrap_or("")
             );
-        } else {
-            let tasks: Vec<String> = lab
-                .list("tasks", "lx")
-                .into_iter()
-                .filter(|t| t["spec"]["service"] == row.name)
-                .map(|t| {
-                    format!(
-                        "{} {}",
-                        t["status"]["state"].as_str().unwrap_or("?"),
-                        t["status"]["message"].as_str().unwrap_or("")
-                    )
-                })
-                .collect();
-            if !tasks.is_empty() {
-                last = format!("no running task: {}", tasks.join("; "));
-            }
         }
         std::thread::sleep(Duration::from_secs(3));
     }
@@ -262,25 +289,28 @@ spec: { security: { allow: [sysvipc] } }
         .collect();
     eprintln!("Linux images matrix:");
     for (row, result) in &results {
-        match result {
-            Ok(out) => eprintln!(
-                "  works   {} ({}): {}",
-                row.image,
-                row.what,
-                out.replace('\n', " | ")
-            ),
-            Err(e) => eprintln!("  FAILS   {} ({}): {e}", row.image, row.what),
-        }
+        let shown = match (result, row.expect) {
+            (Ok(_), Expect::Works(_)) => "works",
+            (Ok(_), Expect::Hangs(why) | Expect::Stops(_, why)) => why,
+            (Err(_), _) => "NOT AS THE MATRIX SAYS",
+        };
+        let detail = match result {
+            Ok(s) | Err(s) => s.replace('\n', " | "),
+        };
+        eprintln!("  {} ({}): {shown}: {detail}", row.image, row.what);
     }
-    let failed: Vec<&str> = results
+    let unexpected: Vec<&str> = results
         .iter()
         .filter(|(_, r)| r.is_err())
         .map(|(row, _)| row.image)
         .collect();
-    assert!(failed.is_empty(), "failed: {failed:?}");
+    assert!(
+        unexpected.is_empty(),
+        "not as the matrix says: {unexpected:?}"
+    );
 
-    step("no task restarted");
-    for row in ROWS {
+    step("no task that works restarted");
+    for row in ROWS.iter().filter(|r| matches!(r.expect, Expect::Works(_))) {
         let t = task(&lab, row.name).unwrap();
         assert_eq!(t["status"]["restarts"], 0, "{}: {t}", row.name);
     }
