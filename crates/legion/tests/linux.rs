@@ -129,8 +129,10 @@ const ROWS: &[Row] = &[
     },
     Row {
         name: "busybox",
-        image: "docker.io/library/busybox:1.37",
-        what: "one static program",
+        // The musl build: the default busybox:1.37 is glibc, dynamic and
+        // noted as Linux's, so it runs whatever the fallback brand says.
+        image: "docker.io/library/busybox:1.37-musl",
+        what: "one static program (static PIE, no ABI note)",
         command: SLEEP,
         more: "",
         check: &["/bin/busybox", "echo", "static"],

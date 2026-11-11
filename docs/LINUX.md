@@ -16,15 +16,16 @@ failing as described fails the test, so this page is changed with it.
 | `ubuntu:24.04` | glibc, Perl | works |
 | `python:3.12-slim` | glibc, OpenSSL, SQLite, `multiprocessing` (processes, POSIX semaphores) | works |
 | `redis:7-alpine` | an event loop on epoll | works |
-| `busybox:1.37` | a static program | works, as `--linux` sets `kern.elf64.fallback_brand=3` |
+| `busybox:1.37-musl` | a static program (static PIE, no ABI note) | works, as `--linux` sets `kern.elf64.fallback_brand=3` |
 | `nginx:1.27-alpine` | an HTTP server with worker processes | works with `events { accept_mutex on; }` or `worker_processes 1`; see below |
 | `node:22-alpine` | V8, libuv | does not run: its main thread spins from the start, running no script |
 | `postgres:17-alpine` (and 15) | the image's entrypoint, `gosu` | does not run: `signalfd() failed`, as the ABI has no signalfd(2) |
 
 ## What the failures come from
 
-- **Static programs** (Go's, BusyBox, `gosu`) name no interpreter, so the
-  kernel can't tell they are Linux's and refuses them ("Exec format
+- **Static programs** (Go's, BusyBox's musl build, `gosu`) name no
+  interpreter and carry no ABI note, so the kernel can't tell they are
+  Linux's and refuses them ("Exec format
   error") unless `kern.elf64.fallback_brand` is 3. `--linux` sets it where
   the host left it unset; a host that chose another value keeps it, the
   daemon warns, and `legion doctor` reports `linux.static`.
