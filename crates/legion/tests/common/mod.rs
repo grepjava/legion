@@ -593,9 +593,19 @@ impl Drop for Lab {
                 format!("{}{}", clean(data, run), self.teardown)
             }
         };
+        // Each node's part timed, so a slow one shows in the test's log.
+        let timed = |what: &str, start: Instant| {
+            let secs = start.elapsed().as_secs();
+            if secs >= 60 {
+                eprintln!("--- teardown: {what} took {secs} s");
+            }
+        };
         for vm in &self.vms {
+            let start = Instant::now();
             let _ = self.ssh(vm, &format!("{STOP}{}", teardown(VM_DATA, VM_RUN)));
+            timed(&vm.name, start);
         }
+        let start = Instant::now();
         if let Some(mut child) = self.daemon.take() {
             let _ = Command::new("kill")
                 .args(["-INT", &child.id().to_string()])
@@ -612,6 +622,7 @@ impl Drop for Lab {
             let script = teardown(&format!("{d}/data"), &format!("{d}/run"));
             let _ = Command::new("/bin/sh").args(["-c", &script]).status();
         }
+        timed("this host", start);
     }
 }
 
