@@ -422,6 +422,22 @@ operations and mesh growth, publishing sizes and hardware. Optimize what
 measurement shows. Affinity, external load balancers, manager promotion,
 bhyve and NAT options wait for a concrete user need.
 
+Measured (docs/MEASURE.md, after 0.1.18), each by an ignored test that
+prints its table; those on FreeBSD run in every qualification. Two were
+optimized for what they showed:
+
+- Reconciliation: each owner read every task, and every task was checked
+  against every owner. Tasks are now gathered by owner once a pass: 5,000
+  tasks plan in 78 ms, from 383.
+- pf: a change of rules set each service's table with a pfctl run of its
+  own. The rules now come with every table in one load: a service added
+  at 1,000 services takes 0.9 s, from 4.2.
+
+Watches (500 within 33 ms), endpoint propagation (in every table by the
+time the task runs), image loads (unpacking is most of a large pull) and
+mesh joins (one peer per node, 108 ms to reach 23 others) showed nothing
+to fix.
+
 ## Decisions needed
 
 1. **Test hosts.** Decided 6 November 2026: QEMU with KVM on the Windows PC,
