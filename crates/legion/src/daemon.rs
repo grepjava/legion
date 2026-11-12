@@ -400,7 +400,7 @@ pub async fn join(
     let id = legion_manager::node_id(data_dir).map_err(|e| anyhow::anyhow!(e))?;
     // A manager needs one; a worker's is ignored.
     let advertise = match advertise {
-        Some(a) => a.to_owned(),
+        Some(a) => with_port(a, DEFAULT_PORT),
         None => reaching(manager)
             .map(|ip| SocketAddr::new(ip, DEFAULT_PORT).to_string())
             .unwrap_or_default(),
@@ -448,7 +448,7 @@ fn reaching(manager: &str) -> Option<IpAddr> {
 /// it names an address, or this host's address on its default route.
 fn manager_address(advertise: Option<&str>, listen: SocketAddr) -> String {
     if let Some(a) = advertise {
-        return a.to_owned();
+        return with_port(a, listen.port());
     }
     if !listen.ip().is_unspecified() {
         return listen.to_string();
@@ -641,6 +641,26 @@ fn spawn_agent<R: legion_agent::Runtime>(
         let _ = stopped.wait_for(|s| *s).await;
     }));
     (task, metrics)
+}
+
+/// `advertise` as `host:port`: as given if it has a port, else with
+/// `port` (a worker's `--advertise` is often a bare address, and a manager
+/// it becomes is reached at one with a port).
+fn with_port(advertise: &str, port: u16) -> String {
+    if advertise.parse::<SocketAddr>().is_ok() {
+        return advertise.to_owned();
+    }
+    if let Ok(ip) = advertise.parse::<std::net::IpAddr>() {
+        return SocketAddr::new(ip, port).to_string();
+    }
+    let bare = advertise.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<std::net::Ipv6Addr>() {
+        return SocketAddr::new(ip.into(), port).to_string();
+    }
+    match advertise.rsplit_once(':') {
+        Some((_, p)) if p.parse::<u16>().is_ok() => advertise.to_owned(),
+        _ => format!("{advertise}:{port}"),
+    }
 }
 
 /// The host of `advertise`: `host:port`, `[v6]:port` or a bare address
@@ -838,6 +858,21 @@ fn private_dir(dir: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advertised_addresses_get_a_port() {
+        for (advertise, want) in [
+            ("10.0.0.5", "10.0.0.5:7470"),
+            ("10.0.0.5:7000", "10.0.0.5:7000"),
+            ("fd00::5", "[fd00::5]:7470"),
+            ("[fd00::5]", "[fd00::5]:7470"),
+            ("[fd00::5]:7000", "[fd00::5]:7000"),
+            ("m1.example", "m1.example:7470"),
+            ("m1.example:7000", "m1.example:7000"),
+        ] {
+            assert_eq!(with_port(advertise, 7470), want, "{advertise}");
+        }
+    }
 
     #[test]
     fn advertised_hosts() {
