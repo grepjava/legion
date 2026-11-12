@@ -198,6 +198,8 @@ struct Worker<R, C> {
     halt: tokio::sync::watch::Receiver<bool>,
     probe_tx: mpsc::UnboundedSender<probe::Report>,
     probe_rx: mpsc::UnboundedReceiver<probe::Report>,
+    /// A VM pod's tap device, once its network is attached.
+    tap: Option<String>,
 }
 
 /// How a worker ended: the state it last reported, and that status if the
@@ -226,6 +228,7 @@ pub(crate) async fn run<R: Runtime, C: Control>(
         halt,
         probe_tx,
         probe_rx,
+        tap: None,
     };
     let span = tracing::info_span!("task", task = %w.a.key, uid = %w.a.uid);
     w.main().instrument(span).await;
@@ -713,6 +716,13 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         let apps: Vec<_> = self.pod().containers.clone();
         for c in &apps {
             let mut spec = pod::container_spec(&self.ctx.node, &self.a, c, Role::App, &infra);
+            if let Some(vm) = &c.vm {
+                let config = self.vm_config(vm)?;
+                spec.annotations.insert(
+                    legion_runtime::ANNOTATION_VM.to_owned(),
+                    serde_json::to_string(&config).expect("serialises"),
+                );
+            }
             spec.mounts.extend(volumes::mounts(c, &sources));
             files.apply(&c.name, &mut spec);
             let id = rt
@@ -781,9 +791,20 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             ip
         };
         let (uid, jail) = (self.a.uid.clone(), infra.to_owned());
-        blocking(&self.ctx.sys, move |sys| net.attach(sys, &uid, &jail, ip))
-            .await
-            .map_err(|e| Abort::Failed(format!("attaching the pod network: {e}")))?;
+        if self.pod().vm().is_some() {
+            // A VM's network is a tap on the bridge; the guest takes the
+            // address itself.
+            let tap = blocking(&self.ctx.sys, move |sys| net.attach_tap(sys, &uid))
+                .await
+                .map_err(|e| Abort::Failed(format!("attaching the VM's network: {e}")))?;
+            if tap.is_some() {
+                self.tap = tap;
+            }
+        } else {
+            blocking(&self.ctx.sys, move |sys| net.attach(sys, &uid, &jail, ip))
+                .await
+                .map_err(|e| Abort::Failed(format!("attaching the pod network: {e}")))?;
+        }
         self.status.ip = Some(ip.to_string());
         self.status.jid = match self.ctx.runtime.inspect(infra).await {
             Ok(i) if i.state.jid != 0 => Some(i.state.jid),
@@ -793,6 +814,40 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             .guarding
             .attach(&self.a.uid, crate::policing::LocalPod::of(&self.a, ip));
         Ok(())
+    }
+
+    /// A VM container's settings for the runtime: its CPUs and memory, its
+    /// tap and the pod's address as the guest is to configure it.
+    fn vm_config(&self, vm: &legion_api::service::Vm) -> Result<legion_runtime::VmConfig, Abort> {
+        let net = self.ctx.net.get().expect("network set at registration");
+        let ip: Ipv4Addr = self
+            .status
+            .ip
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| Abort::Failed("the VM's address is not known".into()))?;
+        let tap = self
+            .tap
+            .clone()
+            .ok_or_else(|| Abort::Failed("the VM's tap is not known".into()))?;
+        let six = net.addr6(ip);
+        Ok(legion_runtime::VmConfig {
+            cpus: vm.cpus,
+            memory: vm.memory.0,
+            uefi: vm.boot == legion_api::service::VmBoot::Uefi,
+            tap,
+            ip: format!("{ip}/{}", net.subnet.prefix),
+            gateway: net.gateway().to_string(),
+            ip6: six.map(|a| a.addr.to_string()),
+            gateway6: six.map(|_| net.gateway6().to_string()),
+            mtu: net.mtu,
+            dns: net.gateway().to_string(),
+            hostname: self
+                .a
+                .spec
+                .hostname()
+                .unwrap_or_else(|| self.a.key.name.clone()),
+        })
     }
 
     /// Waits until the pod's host end is guarded at its address, before

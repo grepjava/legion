@@ -484,6 +484,34 @@ async fn a_pod_whose_limits_cannot_be_set_does_not_run() {
     h.nothing_left().await;
 }
 
+/// A VM pod (DESIGN.md §6.8): its network is a tap on the bridge, named as
+/// any pod's host end, and its container takes its settings and the pod's
+/// address for the guest from the agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vm_pod_runs_on_a_tap() {
+    let h = Harness::new().await;
+    h.rt.add_image("guest:1");
+    let key = h
+        .task(
+            "vm-1",
+            "containers: [{ name: guest, image: \"guest:1\", vm: { cpus: 2, memory: 256Mi } }]",
+        )
+        .await;
+    let status = h.wait_state(&key, TaskState::Running).await;
+    let uid = h.store.get(&key).unwrap().unwrap().metadata.uid;
+    let host_end = legion_net::host_interface(&uid);
+    let end = h.sys.interface(&host_end).expect("the pod's host end");
+    assert!(end.peer.is_none(), "a tap, not an epair: {end:?}");
+    let spec = h.rt.spec("shop_vm-1_guest").unwrap();
+    let vm: legion_runtime::VmConfig =
+        serde_json::from_str(&spec.annotations[legion_runtime::ANNOTATION_VM]).unwrap();
+    assert!(vm.tap.starts_with("tap"), "{vm:?}");
+    assert_eq!((vm.cpus, vm.memory), (2, 256 << 20));
+    assert_eq!(Some(vm.ip.split('/').next().unwrap()), status.ip.as_deref());
+    assert_eq!(vm.gateway, "10.200.0.1");
+    assert!(!vm.uefi);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn runs_a_pod() {
     let h = Harness::new().await;
