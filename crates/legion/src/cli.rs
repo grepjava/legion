@@ -379,6 +379,22 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 output.display()
             );
         }
+        Command::Ca { action } => {
+            let r = cluster
+                .rotate_ca(pb::RotateCaRequest {
+                    start: action == "rotate",
+                })
+                .await?
+                .into_inner();
+            print!("{}", ca_status(&r));
+            if action == "rotate" {
+                eprintln!(
+                    "every node moves to the new CA by itself; the old one stays trusted \
+                     until all have. Users' certificates and copies of admin.pem from \
+                     before are refused then: issue them again (`legion user create`)"
+                );
+            }
+        }
         Command::Autolock { action } => {
             let key = cluster
                 .autolock(pb::AutolockRequest {
@@ -1534,6 +1550,46 @@ pub async fn unlock(server: &str, key_file: Option<&Path>) -> anyhow::Result<()>
         .map_err(|s| anyhow::anyhow!("{}", s.message()))?;
     println!("unlocked");
     Ok(())
+}
+
+/// Where the cluster's CA stands, as `legion ca status` shows it.
+fn ca_status(r: &pb::RotateCaResponse) -> String {
+    use std::fmt::Write;
+    let short = |d: &str| d.get(..16).unwrap_or(d).to_owned();
+    let mut out = String::new();
+    let _ = writeln!(out, "CA: {}", r.digest);
+    if r.previous_digest.is_empty() {
+        let _ = writeln!(out, "no rotation under way");
+    } else {
+        let behind = r.holders.iter().filter(|h| h.issuer != r.digest).count();
+        let _ = writeln!(
+            out,
+            "rotating from {} since {}: {} of {} on the new CA",
+            short(&r.previous_digest),
+            legion_api::clock::format((r.since_ms / 1000) as i64),
+            r.holders.len() - behind,
+            r.holders.len()
+        );
+    }
+    let _ = writeln!(out, "{:<24} {:<8} CA", "NAME", "KIND");
+    for h in &r.holders {
+        let ca = if h.issuer.is_empty() {
+            "unknown".to_owned()
+        } else if h.issuer == r.digest {
+            "new".to_owned()
+        } else if h.issuer == r.previous_digest {
+            "old".to_owned()
+        } else {
+            short(&h.issuer)
+        };
+        let ca = if r.previous_digest.is_empty() && ca == "new" {
+            "current".to_owned()
+        } else {
+            ca
+        };
+        let _ = writeln!(out, "{:<24} {:<8} {ca}", h.name, h.kind);
+    }
+    out
 }
 
 #[cfg(test)]

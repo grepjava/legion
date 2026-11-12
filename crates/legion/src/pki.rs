@@ -50,6 +50,9 @@ impl Pki {
         if let Err(e) = pki.settle() {
             tracing::warn!("autolock: finishing an interrupted reseal: {e:#}");
         }
+        if let Err(e) = pki.settle_ca() {
+            tracing::warn!("finishing an interrupted change of CA: {e:#}");
+        }
         pki
     }
 
@@ -284,6 +287,60 @@ impl Pki {
         self.path("ca.crt").exists()
     }
 
+    /// Takes up a new CA (a rotation begun): its key, and `trust_pem`, the
+    /// CAs to trust with the new one first, as `ca.crt`. Both are written
+    /// beside the old ones, the key first, and then put in place by
+    /// [`Self::settle_ca`], which a start after a crash carries through:
+    /// the key and the certificate it signs with always belong together.
+    pub fn write_ca(&self, trust_pem: &str, key_pem: &str) -> anyhow::Result<()> {
+        self.settle_cut_short()?;
+        private_dir(&self.dir)?;
+        let (plain, sealed) = self.next_ca_key();
+        match &self.lock {
+            Some(key) => {
+                // Sealed as `ca.key`, the name it ends up under.
+                let bytes = legion_store::seal(key, "ca.key", key_pem.as_bytes())?;
+                write_bytes(&sealed, &bytes, 0o600)?;
+            }
+            None => write_private(&plain, key_pem)?,
+        }
+        write_public(&self.path(NEXT_CA_CERT), trust_pem)?;
+        self.settle_ca()
+    }
+
+    /// The CAs to trust, the one that issues first, as `ca.crt`, the key
+    /// unchanged: as a rotation ends, or for a worker as it begins.
+    pub fn write_trust(&self, trust_pem: &str) -> anyhow::Result<()> {
+        write_public(&self.path("ca.crt"), trust_pem)
+    }
+
+    fn next_ca_key(&self) -> (PathBuf, PathBuf) {
+        (
+            self.path("ca.key.next"),
+            self.dir.join("ca.key.sealed.next"),
+        )
+    }
+
+    /// Puts a new CA written aside by [`Self::write_ca`] in place, the key
+    /// first; drops a key written without its certificate.
+    fn settle_ca(&self) -> anyhow::Result<()> {
+        let (plain, sealed) = self.next_ca_key();
+        let cert = self.path(NEXT_CA_CERT);
+        if !cert.exists() {
+            remove(&plain)?;
+            return remove(&sealed);
+        }
+        if sealed.exists() {
+            rename(&sealed, &self.sealed_path("ca.key"))?;
+            remove(&self.path("ca.key"))?;
+        }
+        if plain.exists() {
+            rename(&plain, &self.path("ca.key"))?;
+            remove(&self.sealed_path("ca.key"))?;
+        }
+        rename(&cert, &self.path("ca.crt"))
+    }
+
     /// Stores what joining a cluster gave the node.
     pub fn write_joined(&self, joined: &legion_manager::Joined) -> anyhow::Result<()> {
         private_dir(&self.dir)?;
@@ -367,8 +424,18 @@ impl Pki {
         if self.role()? != Role::Manager {
             anyhow::bail!("this node joined as a worker and holds no manager credentials");
         }
-        let ca = match (read(&self.path("ca.crt"))?, self.read_secret("ca.key")?) {
-            (Some(cert), Some(key)) => Ca::load(&cert, &key).context("loading the cluster CA")?,
+        self.settle_ca()?;
+        // `ca.crt` holds the CAs trusted, the one that issues first (two
+        // while the cluster's CA is rotated).
+        let (ca, trust) = match (read(&self.path("ca.crt"))?, self.read_secret("ca.key")?) {
+            (Some(trust), Some(key)) => {
+                let issuing = legion_pki::split_certs(&trust)
+                    .into_iter()
+                    .next()
+                    .context("ca.crt holds no certificate")?;
+                let ca = Ca::load(&issuing, &key).context("loading the cluster CA")?;
+                (ca, trust)
+            }
             (Some(_), None) => {
                 anyhow::bail!("{} has no CA key: a manager needs one", self.dir.display())
             }
@@ -377,7 +444,8 @@ impl Pki {
                 self.write_secret("ca.key", ca.key_pem())?;
                 write_public(&self.path("ca.crt"), ca.cert_pem())?;
                 tracing::info!(digest = %ca.digest(), "created a cluster CA");
-                ca
+                let trust = ca.cert_pem().to_owned();
+                (ca, trust)
             }
         };
 
@@ -405,20 +473,22 @@ impl Pki {
         };
 
         let admin = data_dir.join(ADMIN_BUNDLE);
+        // Of the CA that issues now, trusting what this manager trusts.
         let admin_ok = read(&admin)?
             .and_then(|pem| Bundle::parse(&pem).ok())
             .is_some_and(|b| {
-                b.ca_pem == ca.cert_pem()
+                b.ca_pem == trust
+                    && legion_pki::issuer(&b.cert_pem, ca.cert_pem()).is_some()
                     && !legion_pki::needs_renewal(&b.cert_pem, SystemTime::now())
             });
         if !admin_ok {
             let issued = ca.issue(&Identity::new("admin", Role::Admin), CERT_LIFETIME)?;
-            write_private(&admin, &Bundle::new(issued, ca.cert_pem()).to_pem())?;
+            write_private(&admin, &Bundle::new(issued, &trust).to_pem())?;
             tracing::info!(path = %admin.display(), "wrote the admin credentials");
         }
 
         Ok(legion_manager::Tls {
-            ca_pem: ca.cert_pem().to_owned(),
+            ca_pem: trust,
             cert_pem,
             key_pem,
             ca_key_pem: Some(ca.key_pem().to_owned()),
@@ -431,6 +501,9 @@ impl Pki {
 const RENEWAL_CHECK: Duration = Duration::from_secs(3600);
 /// After a failed renewal, how soon to try again.
 const RENEWAL_RETRY: Duration = Duration::from_secs(300);
+
+/// A new CA's certificate (with the others trusted), while it is written.
+const NEXT_CA_CERT: &str = "ca.crt.next";
 
 /// A worker's next certificate and key, while it is written.
 const NEXT_CERT: &str = "node.crt.next";
@@ -492,13 +565,29 @@ fn admin_due(data_dir: &Path, now: SystemTime) -> bool {
 
 /// Keeps a worker's certificate current: past two thirds of its life, it
 /// asks a manager to certify a new key under the same name, writes both
-/// and calls with them from then on. Runs until aborted.
+/// and calls with them from then on; and at once, of the new CA, when a
+/// CA rotation begins (`crate::ca`). Runs until aborted.
 pub async fn renew_worker(
     pki: Pki,
     credentials: Arc<Credentials>,
     control: legion_agent::GrpcControl,
 ) {
+    let mut advice = control.cluster_ca();
     loop {
+        let latest = advice.borrow_and_update().clone();
+        let mut rotation_failed = false;
+        if let Some(latest) = latest {
+            match crate::ca::worker_take_up(&latest, &pki, &credentials, &control).await {
+                Ok(true) => {
+                    tracing::info!(ca = %latest.issuer, "this worker is on the cluster's CA")
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!("CA rotation: {e:#}");
+                    rotation_failed = true;
+                }
+            }
+        }
         let wait = if legion_pki::needs_renewal(&credentials.cert_and_key().0, SystemTime::now()) {
             match renew_worker_once(&pki, &credentials, &control).await {
                 Ok(()) => {
@@ -513,11 +602,28 @@ pub async fn renew_worker(
         } else {
             RENEWAL_CHECK
         };
-        tokio::time::sleep(wait).await;
+        // A rotation cut short (a manager not yet on the new CA, say) is
+        // tried again soon.
+        let wait = if rotation_failed {
+            wait.min(ROTATION_RETRY)
+        } else {
+            wait
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            changed = advice.changed() => {
+                if changed.is_err() {
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
     }
 }
 
-async fn renew_worker_once(
+/// After a step of a CA rotation failed on a worker, how soon to try again.
+const ROTATION_RETRY: Duration = Duration::from_secs(10);
+
+pub(crate) async fn renew_worker_once(
     pki: &Pki,
     credentials: &Credentials,
     control: &legion_agent::GrpcControl,

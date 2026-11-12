@@ -1,6 +1,7 @@
 //! `legion`: the daemon (`legion daemon`) and the CLI that talks to it.
 
 mod autolock;
+mod ca;
 mod cli;
 mod daemon;
 mod doctor;
@@ -179,6 +180,16 @@ enum Command {
     /// `show` prints it.
     Autolock {
         #[arg(value_parser = ["enable", "disable", "rotate", "show"])]
+        action: String,
+    },
+    /// The cluster CA. `rotate` makes a new one: every manager signs with
+    /// it at once and every node gets a certificate of it, the old CA
+    /// trusted until all have, then no more. `status` says where the
+    /// cluster is: the CA that issues, and the CA of each manager's and
+    /// node's certificate. Users' certificates and copies of admin.pem
+    /// issued before are refused once the rotation ends: issue them again.
+    Ca {
+        #[arg(value_parser = ["rotate", "status"])]
         action: String,
     },
     /// Give a locked manager on this host its unlock key, read from

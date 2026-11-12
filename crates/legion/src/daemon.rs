@@ -112,6 +112,16 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         manager.store().clone(),
         pki.clone(),
     ));
+    let rotation = manager.authority().map(|authority| {
+        tokio::spawn(crate::ca::follow(
+            manager.store().clone(),
+            pki.clone(),
+            node.clone(),
+            opts.data_dir.clone(),
+            credentials.clone(),
+            authority,
+        ))
+    });
     let renewal = tokio::spawn(crate::pki::renew_manager(
         pki,
         node.clone(),
@@ -138,6 +148,10 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                 let closed = async move {
                     autolock.abort();
                     let _ = autolock.await;
+                    if let Some(r) = rotation {
+                        r.abort();
+                        let _ = r.await;
+                    }
                     renewal.abort();
                 };
                 if let Err(close) = manager.serve(listener, closed).await {
@@ -172,6 +186,10 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         // every handle is gone: it must end before serving does.
         autolock.abort();
         let _ = autolock.await;
+        if let Some(r) = rotation {
+            r.abort();
+            let _ = r.await;
+        }
         renewal.abort();
     };
     let served = manager
