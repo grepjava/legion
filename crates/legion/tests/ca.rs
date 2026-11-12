@@ -156,7 +156,9 @@ fn the_ca_rotates_with_every_node_on_it() {
         ("the user", &user),
     ] {
         wait(&format!("{who} refused"), 30, || {
-            !lab.legion_as(identity, &["list", "nodes"], &[]).status.success()
+            !lab.legion_as(identity, &["list", "nodes"], &[])
+                .status
+                .success()
         });
     }
     lab.ok(&["list", "nodes"]);

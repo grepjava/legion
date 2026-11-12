@@ -91,9 +91,11 @@ impl Running {
         let m = Running::serve(dir, listener, Some(joined.tls), Some(admin)).await;
         // Until the leader's first message reaches it, a new manager knows
         // of no cluster and refuses requests as one never initialised.
-        until_within("the joined manager knows the leader", Duration::from_secs(30), || {
-            m.store.raft.metrics().borrow().current_leader.is_some()
-        })
+        until_within(
+            "the joined manager knows the leader",
+            Duration::from_secs(30),
+            || m.store.raft.metrics().borrow().current_leader.is_some(),
+        )
         .await;
         m
     }
