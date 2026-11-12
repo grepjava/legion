@@ -1551,7 +1551,17 @@ gathers tasks by owner once (5,000 tasks in 78 ms, from 383), and a change
 of load-balancing rules loads every table with them in one pfctl run (a
 service added at 1,000 services in 0.9 s, from 4.2). The Linux matrix's
 static program is BusyBox's musl build, as the default image is dynamic;
-jailer is pinned at the revision that pins v0.1.18. The
+jailer is pinned at the revision that pins v0.1.18. It also carries:
+the cluster CA rotated in place (`legion ca rotate`), the new CA
+cross-signed by the old and finished once every manager and node is on
+it; Local volumes marked lost with their node and refilled with
+`legion volume restore --replace`; `legion node promote|demote`, a node
+changing role without leaving; affinity and anti-affinity between
+services, priorities and preemption; mesh relays for nodes behind NAT
+(`--mesh-nat`, `--mesh-relay`); a service's load-balancer address held
+with CARP by one ready node (`endpoint.loadBalancer`); VM pods, a
+container with `vm` booted with bhyve on the pod's network; and jailer's
+multi-arch index, each node running its own platform's image. The
 port's `distinfo` is
 made for v0.1.13, and its crates are v0.1.9's, but it has not been through
 `poudriere testport` since v0.1.9. Waiting on the user: the port's
