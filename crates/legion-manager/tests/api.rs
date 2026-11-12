@@ -88,7 +88,14 @@ impl Running {
             .await
             .unwrap();
         assert_eq!(joined.role, Role::Manager);
-        Running::serve(dir, listener, Some(joined.tls), Some(admin)).await
+        let m = Running::serve(dir, listener, Some(joined.tls), Some(admin)).await;
+        // Until the leader's first message reaches it, a new manager knows
+        // of no cluster and refuses requests as one never initialised.
+        until_within("the joined manager knows the leader", Duration::from_secs(30), || {
+            m.store.raft.metrics().borrow().current_leader.is_some()
+        })
+        .await;
+        m
     }
 
     /// A fresh manager that joins at `via` as this build, then serves as
