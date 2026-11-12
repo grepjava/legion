@@ -119,6 +119,10 @@ service Cluster {
   // manager seals its private keys with the key, and after a restart waits
   // for it (`Unlock`). Returns the key, empty once disabled.
   rpc Autolock(AutolockRequest) returns (AutolockResponse);
+  // The cluster CA and its rotation (DESIGN.md §9): with `start`, makes a
+  // new CA every node moves to, the old one trusted until all have; either
+  // way, says where the rotation is. The cluster admin's only.
+  rpc RotateCa(RotateCaRequest) returns (RotateCaResponse);
   // What tasks use, as their nodes last reported it (within a minute), by
   // node: the tasks of `namespace`, or of every namespace when empty, that
   // the caller may read.
@@ -169,6 +173,30 @@ message AutolockRequest {
 
 message AutolockResponse {
   string key = 1;
+}
+
+message RotateCaRequest {
+  bool start = 1;
+}
+
+message RotateCaResponse {
+  // The CA that issues certificates now.
+  string digest = 1;
+  // While a rotation runs, the CA before it, still trusted; empty after.
+  string previous_digest = 2;
+  // When the rotation began, in ms since the epoch; 0 when none runs.
+  uint64 since_ms = 3;
+  // Every manager and node, and the CA its certificate is of.
+  repeated CaHolder holders = 4;
+}
+
+message CaHolder {
+  string name = 1;
+  // "manager" or "node".
+  string kind = 2;
+  // The digest of the CA its certificate is of; empty when not known
+  // (a node not heard from since this leader leads, a manager not reached).
+  string issuer = 3;
 }
 
 // A Volume's data, apart from the control state's backup (DESIGN.md §4.3).
@@ -270,6 +298,8 @@ message JoinResponse {
   // "manager" or "worker", from the token.
   string role = 1;
   string cert_pem = 2;
+  // The CA that issues, then any other the cluster trusts while its CA is
+  // rotated.
   string ca_pem = 3;
   // Managers only: they issue certificates too.
   string ca_key_pem = 4;
@@ -297,6 +327,9 @@ message StatusResponse {
   // This manager's node name, its certificate's; empty from builds before
   // 0.1.18. The leader reads it to know each member by name.
   string name = 9;
+  // The digest of the CA this manager's certificate is of; empty from
+  // builds before CA rotation.
+  string ca_issuer = 10;
 }
 
 message Member {

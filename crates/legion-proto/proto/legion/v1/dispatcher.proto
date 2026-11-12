@@ -188,4 +188,10 @@ message HeartbeatResponse {
   uint32 period_ms = 1;
   // Every manager's address, for reaching another when this one fails.
   repeated string managers = 2;
+  // The CAs the cluster trusts, the issuing one first, and that one's
+  // digest: a node trusts them, and renews at once when its certificate
+  // is not of the issuing CA (a CA rotation, DESIGN.md §9). Empty from
+  // builds before.
+  string trust_pem = 3;
+  string issuer = 4;
 }
