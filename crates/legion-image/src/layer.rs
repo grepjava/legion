@@ -450,7 +450,12 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), Error> {
         let into = into?;
         // An extraction that fails early breaks the pipe, and the archive
         // fails after it: its error is the cause, so it comes first.
-        let extracting = String::from_utf8_lossy(&into.stderr).trim().to_owned();
+        // Named here: GNU tar calls it `.`, as it extracts with `-C`.
+        let extracting = format!(
+            "into {}: {}",
+            dst.display(),
+            String::from_utf8_lossy(&into.stderr).trim()
+        );
         return match (into.status.success(), archived.success()) {
             (true, true) => Ok(()),
             (true, false) => Err(Error::Extract(archiving(src, &errors))),
