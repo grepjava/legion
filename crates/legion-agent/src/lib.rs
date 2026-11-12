@@ -41,8 +41,8 @@ pub mod transfer;
 mod volumes;
 
 pub use control::{
-    Assignment, Assignments, Control, ControlError, EndpointPort, Endpoints, GrpcControl, Offer,
-    Peer, Peers, Registration, ServiceEndpoints, VolumeClaim,
+    Assignment, Assignments, CaAdvice, Control, ControlError, EndpointPort, Endpoints, GrpcControl,
+    Offer, Peer, Peers, Registration, ServiceEndpoints, VolumeClaim,
 };
 pub use runtime::Runtime;
 

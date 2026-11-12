@@ -180,6 +180,17 @@ pub struct GrpcControl {
     node: String,
     tls: Option<Arc<Credentials>>,
     conn: Arc<Mutex<Conn>>,
+    /// The cluster's CAs as the last heartbeat gave them.
+    ca: Arc<watch::Sender<Option<CaAdvice>>>,
+}
+
+/// The CAs the cluster trusts, the issuing one first, and that one's
+/// digest: what a node trusts, and the CA its certificate should be of
+/// (DESIGN.md §9, CA rotation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaAdvice {
+    pub trust_pem: String,
+    pub issuer: String,
 }
 
 struct Conn {
@@ -211,7 +222,14 @@ impl GrpcControl {
                 generation: 0,
                 channel,
             })),
+            ca: Arc::new(watch::channel(None).0),
         })
+    }
+
+    /// The cluster's CAs as heartbeats give them; `None` until one does
+    /// (managers before CA rotation give none).
+    pub fn cluster_ca(&self) -> watch::Receiver<Option<CaAdvice>> {
+        self.ca.subscribe()
     }
 
     /// The managers, starting with the one in use.
@@ -734,6 +752,17 @@ impl Control for GrpcControl {
             .call(|mut c| async move { c.heartbeat(req).await })
             .await?;
         self.set_managers(resp.managers);
+        if !resp.trust_pem.is_empty() && !resp.issuer.is_empty() {
+            let advice = CaAdvice {
+                trust_pem: resp.trust_pem,
+                issuer: resp.issuer,
+            };
+            self.ca.send_if_modified(|now| {
+                let changed = now.as_ref() != Some(&advice);
+                *now = Some(advice);
+                changed
+            });
+        }
         Ok(Duration::from_millis(resp.period_ms.max(100).into()))
     }
 }
