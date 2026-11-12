@@ -1544,6 +1544,18 @@ fn eligible(
         return Err("no image for its platform");
     }
     let namespace = &s.object.metadata.namespace;
+    // Its data went with a removed node: no node holds it, and one would
+    // start it empty.
+    let lost = mounts.iter().any(|v| {
+        volumes
+            .get(&(namespace.clone(), v.clone()))
+            .is_some_and(|v| !v.status.lost.is_empty())
+    });
+    if lost {
+        return Err(
+            "volume lost with its node (`legion volume restore --replace`, or delete it to start empty)",
+        );
+    }
     // A task starting now would hold the data where it no longer stays.
     let moving = mounts.iter().any(|v| {
         volumes

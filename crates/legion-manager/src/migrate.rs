@@ -340,6 +340,7 @@ async fn advance(
                 dataset: String::new(),
                 migration: None,
                 leftovers,
+                lost: String::new(),
             };
         } else {
             s.migration = Some(Migration {
@@ -648,6 +649,7 @@ mod tests {
             dataset: String::new(),
             migration,
             leftovers: Vec::new(),
+            lost: String::new(),
         };
         // Still on, or moved on to its next phase.
         assert!(!called_off(
@@ -704,6 +706,7 @@ mod tests {
                 message: String::new(),
             }),
             leftovers: ["n1", "n2", "n3", "gone"].map(String::from).into(),
+            lost: String::new(),
         };
         // n1's copy is dropped; n2 holds the Volume, n3 receives it again,
         // and the removed node took its copy with it.

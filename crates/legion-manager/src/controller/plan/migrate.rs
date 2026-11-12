@@ -131,6 +131,7 @@ pub(super) fn migrations(
                     .filter(|n| **n != m.to)
                     .cloned()
                     .collect(),
+                lost: String::new(),
             })
             .expect("serialises");
             plan.actions

@@ -235,6 +235,7 @@ impl Volumes for VolumesService {
             name,
             node,
             header_json,
+            replace,
         } = start;
         let header: VolumeBackupHeader = serde_json::from_str(&header_json)
             .map_err(|e| Status::invalid_argument(format!("the backup's header: {e}")))?;
@@ -259,11 +260,36 @@ impl Volumes for VolumesService {
         self.api.consistent().await?;
         caller.check(&self.api.store, Verb::Write, Kind::Volume, &namespace)?;
         let key = ObjectKey::new(Kind::Volume, &namespace, &name);
-        if self.volume(&key)?.is_some() {
-            return Err(Status::already_exists(format!(
-                "volume {name} exists in namespace {namespace}: delete it, or restore under another name"
-            )));
-        }
+        // Restored into, the Volume lost with its node: its version then,
+        // which the write after the data is in must still find.
+        let into = match (self.volume(&key)?, replace) {
+            (None, false) => None,
+            (None, true) => {
+                return Err(Status::not_found(format!(
+                    "volume {name} is not in namespace {namespace}: restore it without --replace"
+                )));
+            }
+            (Some((_, _, status)), false) => {
+                let hint = if status.lost.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; its data was lost with node {}: --replace restores into it",
+                        status.lost
+                    )
+                };
+                return Err(Status::already_exists(format!(
+                    "volume {name} exists in namespace {namespace}: delete it, or restore under another name{hint}"
+                )));
+            }
+            (Some((o, _, status)), true) if !status.lost.is_empty() => Some(o),
+            (Some((_, _, status)), true) => {
+                return Err(Status::failed_precondition(format!(
+                    "volume {name}'s data is on node {}: --replace restores only into a Volume lost with its node",
+                    if status.node.is_empty() { "none yet" } else { &status.node }
+                )));
+            }
+        };
         let ready = self
             .api
             .store
@@ -343,31 +369,50 @@ impl Volumes for VolumesService {
         }
 
         // The data is there: the Volume now, on that node. Asked for no
-        // node of its own, it stays where it was restored.
-        let mut spec = header.spec;
-        spec.node = None;
-        let mut object = Object::new(
-            Kind::Volume,
-            &namespace,
-            &name,
-            serde_json::to_value(&spec).map_err(internal)?,
-        );
-        object.metadata.labels = header.labels;
-        object.status = serde_json::to_value(VolumeStatus {
-            node: node.clone(),
-            ..Default::default()
-        })
-        .map_err(internal)?;
+        // node of its own, it stays where it was restored. Restored into
+        // a lost one, that one is kept as it is (its labels name its
+        // ordinal), on its new node.
+        let (object, precondition) = match into {
+            Some(mut o) => {
+                let mut spec: VolumeSpec = legion_api::parse(&o.spec).map_err(internal)?;
+                spec.node = None;
+                o.spec = serde_json::to_value(&spec).map_err(internal)?;
+                o.status = serde_json::to_value(VolumeStatus {
+                    node: node.clone(),
+                    ..Default::default()
+                })
+                .map_err(internal)?;
+                let version = o.metadata.version;
+                (o, Precondition::Version(version))
+            }
+            None => {
+                let mut spec = header.spec;
+                spec.node = None;
+                let mut object = Object::new(
+                    Kind::Volume,
+                    &namespace,
+                    &name,
+                    serde_json::to_value(&spec).map_err(internal)?,
+                );
+                object.metadata.labels = header.labels;
+                object.status = serde_json::to_value(VolumeStatus {
+                    node: node.clone(),
+                    ..Default::default()
+                })
+                .map_err(internal)?;
+                (object, Precondition::MustNotExist)
+            }
+        };
         match self
             .api
             .write(Command::Put {
                 object,
-                precondition: Precondition::MustNotExist,
+                precondition,
             })
             .await?
         {
             Outcome::Written(_) => {
-                tracing::info!(volume = %key, node, "volume restored");
+                tracing::info!(volume = %key, node, replace, "volume restored");
                 Ok(Response::new(VolumeRestoreResponse {}))
             }
             // Made meanwhile by someone else. The data restored stays: that
@@ -381,6 +426,81 @@ impl Volumes for VolumesService {
         .await;
         self.api.audit_end(audit, result)
     }
+}
+
+/// Marks the Volumes whose data was on `node` lost (`status.lost`), as
+/// the node is removed or a node joins under its name: no task uses them
+/// again until they are restored into or deleted. Local data only: what
+/// is kept apart from nodes (iSCSI, NFS, plugins) is not on the node.
+pub(crate) async fn mark_lost(api: &ApiService, node: &str) -> Result<(), Status> {
+    for _ in 0..5 {
+        let mut conflicted = false;
+        let volumes = api
+            .store
+            .list(Kind::Volume, None)
+            .map_err(internal)?
+            .objects;
+        for mut o in volumes {
+            let spec: VolumeSpec = match legion_api::parse(&o.spec) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let mut status: VolumeStatus =
+                serde_json::from_value(o.status.clone()).unwrap_or_default();
+            if spec.access() != legion_api::volume::Access::Local || !status.lost.is_empty() {
+                continue;
+            }
+            let held = status.node == node
+                || (status.node.is_empty() && spec.node.as_deref() == Some(node));
+            // A full copy made elsewhere carries on: the move's planner takes
+            // it for the Volume once the node is gone.
+            let copied = status.migration.as_ref().is_some_and(|m| {
+                m.to != node
+                    && matches!(
+                        m.phase,
+                        legion_api::volume::MigrationPhase::Copied
+                            | legion_api::volume::MigrationPhase::Finishing
+                    )
+            });
+            let held = held && !copied;
+            if !held {
+                // A copy it moved away from is gone with the node too.
+                if status.leftovers.iter().any(|n| n == node) {
+                    status.leftovers.retain(|n| n != node);
+                } else {
+                    continue;
+                }
+            } else {
+                status.lost = node.to_owned();
+                status.node.clear();
+                status.migration = None;
+                status.leftovers.retain(|n| n != node);
+            }
+            o.status = serde_json::to_value(&status).map_err(internal)?;
+            let version = o.metadata.version;
+            let key = o.key();
+            match api
+                .write(Command::Put {
+                    object: o,
+                    precondition: Precondition::Version(version),
+                })
+                .await?
+            {
+                Outcome::Written(_) if held => {
+                    tracing::warn!(volume = %key, node, "volume lost with its node")
+                }
+                Outcome::Written(_) => {}
+                Outcome::Conflict { .. } => conflicted = true,
+                other => return Err(Status::internal(format!("unexpected {other:?}"))),
+            }
+        }
+        if !conflicted {
+            return Ok(());
+        }
+    }
+    Err(Status::aborted(format!(
+        "the Volumes of node {node} kept changing; retry"
+    )))
 }
 
 fn internal(e: impl std::fmt::Display) -> Status {

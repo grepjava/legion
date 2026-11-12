@@ -202,6 +202,7 @@ impl World {
             dataset: format!("tank/legion/volumes/shop/{name}"),
             migration: None,
             leftovers: Vec::new(),
+            lost: String::new(),
         };
         o.status = serde_json::to_value(&status).unwrap();
         self.volumes.insert(

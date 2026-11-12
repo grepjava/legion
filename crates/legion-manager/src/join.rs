@@ -291,6 +291,9 @@ impl Issuer {
                 .map_err(|e| Status::internal(e.to_string()))
         };
         let id = Identity::new(&req.name, role);
+        // Volumes still bound to the name were a removed node's: lost,
+        // before a new node under it could be taken for where they are.
+        crate::volumes::mark_lost(&api.clone(), &req.name).await?;
         let ca = self.current()?;
         let certify = || {
             ca.sign(&req.csr_pem, &id, CERT_LIFETIME)

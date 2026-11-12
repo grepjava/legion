@@ -663,6 +663,9 @@ impl ApiService {
         };
         if stays {
             crate::removed::forget(self, &key.name, recorded).await?;
+        } else if let Err(e) = crate::volumes::mark_lost(self, &key.name).await {
+            // A node joining under the name marks them before it is let in.
+            tracing::warn!(node = %key.name, "marking its Volumes lost: {e}");
         }
         deleted
     }
