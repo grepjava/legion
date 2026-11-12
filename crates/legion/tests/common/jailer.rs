@@ -14,7 +14,10 @@ use super::{Lab, text};
 #[derive(Deserialize)]
 pub struct Record {
     pub schema: u32,
-    pub image: Built,
+    /// What was built; none in a record of an index of images pushed
+    /// elsewhere, which `manifest push` writes too. See [`Record::built`].
+    #[serde(default)]
+    pub image: Option<Built>,
     #[serde(default)]
     pub published: Vec<Published>,
     #[serde(default)]
@@ -39,6 +42,15 @@ pub struct Published {
 #[derive(Deserialize)]
 pub struct Archive {
     pub manifest: String,
+}
+
+impl Record {
+    /// What the record says was built, which a test that built must find.
+    pub fn built(&self) -> &Built {
+        self.image
+            .as_ref()
+            .expect("the record names the image built")
+    }
 }
 
 pub fn record(path: &Path) -> Record {

@@ -198,7 +198,8 @@ fn a_jailer_archive_runs_as_exported() {
     assert_eq!(r.archives.len(), 2);
     for a in &r.archives {
         assert_eq!(
-            a.manifest, r.image.manifest,
+            a.manifest,
+            r.built().manifest,
             "an archive keeps the manifest"
         );
     }
@@ -212,13 +213,13 @@ fn a_jailer_archive_runs_as_exported() {
     step("a localhost/ name runs as loaded, asking no registry");
     let local_name = "localhost/handoff/app:1";
     lab.apply("local", &service("local", local_name, 3, ""));
-    lab.runs("local", local_name, 3, &r.image.manifest, None, &id);
+    lab.runs("local", local_name, 3, &r.built().manifest, None, &id);
     lab.delete("local");
 
     step("a registry's name runs as loaded under pullPolicy: never");
     let never = "        pullPolicy: never\n";
     lab.apply("never", &service("never", registry_named, 3, never));
-    lab.runs("never", registry_named, 3, &r.image.manifest, None, &id);
+    lab.runs("never", registry_named, 3, &r.built().manifest, None, &id);
     lab.delete("never");
 
     step("without it, the registry is asked, and nothing starts");
@@ -255,9 +256,9 @@ fn a_jailer_push_is_what_legion_runs() {
         let r = record(&rec);
         let p = r.published.last().expect("the push is recorded");
         assert_eq!(p.reference, image);
-        assert_eq!(p.digest, r.image.manifest, "one platform: its manifest");
+        assert_eq!(p.digest, r.built().manifest, "one platform: its manifest");
         assert_eq!(p.pinned, format!("{addr}/handoff/app@{}", p.digest));
-        (p.pinned.clone(), r.image.manifest.clone(), id)
+        (p.pinned.clone(), r.built().manifest.clone(), id)
     };
 
     step("jailer builds an image and pushes it");
@@ -466,7 +467,7 @@ fn a_jailer_image_keeps_its_data_through_a_drain() {
         tar.to_str().unwrap(),
     ]);
     let r = record(&rec);
-    let manifest = r.image.manifest.clone();
+    let manifest = r.built().manifest.clone();
     assert_eq!(r.archives.last().unwrap().manifest, manifest);
 
     step("a stateful service runs it, writing to its Volume");
@@ -816,7 +817,7 @@ fn a_jailer_image_keeps_its_data_through_a_cut_move() {
         "handoff/keep:1",
         tar.to_str().unwrap(),
     ]);
-    let manifest = record(&rec).image.manifest;
+    let manifest = record(&rec).built().manifest.clone();
 
     step("a stateful service runs it on a VM; its task may not stop yet");
     lab.three_nodes(&[]);
@@ -1305,7 +1306,8 @@ fn a_jailer_image_goes_from_build_to_recovery() {
     let p = r.published.last().expect("the push is recorded");
     assert_eq!(p.reference, image);
     assert_eq!(
-        p.digest, r.image.manifest,
+        p.digest,
+        r.built().manifest,
         "what was built is what was pushed"
     );
     let (digest, pinned) = (p.digest.clone(), p.pinned.clone());
@@ -1688,7 +1690,7 @@ fn a_jailer_index_runs_each_nodes_platform() {
     step("jailer pushes one signed index of both and checks its signature");
     let image = format!("{addr}/handoff/arch:1");
     let (index, pinned, platforms) = push(&image, &[amd64, &arm64], &rec);
-    let amd64_manifest = record(&rec).image.manifest;
+    let amd64_manifest = record(&rec).built().manifest.clone();
     assert_eq!(platforms.len(), 2, "{platforms:?}");
     assert_eq!(platforms["freebsd/amd64"], amd64_manifest, "{platforms:?}");
     assert!(
