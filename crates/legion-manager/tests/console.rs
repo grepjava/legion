@@ -203,6 +203,13 @@ async fn the_console_calls_the_api_as_its_user() {
     if !legion_console::built() {
         assert_eq!(page.status, 503);
         assert!(page.text.contains("no console pages"), "{}", page.text);
+    } else {
+        // The app's page for any of its paths; its files by name.
+        assert_eq!(page.status, 200);
+        assert!(page.text.contains("<!doctype html>"), "{}", page.text);
+        let deep = call("GET", "/k/Task/shop/web-1", None).await;
+        assert_eq!((deep.status, deep.text.as_str()), (200, page.text.as_str()));
+        assert_eq!(call("GET", "/favicon.svg", None).await.status, 200);
     }
 
     // Alice's code, as `legion console login` asks for it, signs her in once.
