@@ -791,10 +791,18 @@ default `10.88.0.0/16`, on a host that also runs Podman, for example).
   or advertises another; otherwise the endpoint WireGuard learned from
   its packets, its NAT's, stands, also across agent restarts. So nodes
   with public addresses reach it within one keepalive of its joining.
-  Two nodes behind different NATs do not reach each other (no relay),
-  nor does a manager behind NAT serve Raft; those join through a site
-  tunnel or VPN and advertise their address there, as the phase 2 exit
-  test does for a remote server. A FreeBSD virtual machine on a desktop
+  Two nodes behind NATs that let no handshake in (a NAT mapping each
+  destination apart) never reach each other directly: started with
+  `--mesh-nat`, they reach each other through a relay, a node started
+  with `--mesh-relay` that every node reaches (a manager with a public
+  address, say). Each puts the other's addresses on its peer for the
+  relay, the relay with the lowest subnet when there are several, so all
+  pick the same; the relay forwards between its peers, as WireGuard picks
+  the peer for each packet by its addresses (`nodes_behind_nat_reach_each_other_through_a_relay`
+  shows two such nodes meet only through it). A manager behind NAT still
+  does not serve Raft; it joins through a site tunnel or VPN and
+  advertises its address there, as the phase 2 exit test does for a
+  remote server. A FreeBSD virtual machine on a desktop
   (QEMU, UTM or VirtualBox on macOS, say) is such a worker: on a bridged
   network it sits on the LAN beside the other local nodes and reaches them
   directly; on the hypervisor's default user-mode NAT it sits behind a
