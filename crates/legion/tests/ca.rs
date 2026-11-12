@@ -79,9 +79,9 @@ fn the_ca_rotates_with_every_node_on_it() {
 
     step("three nodes, a task on each, a user and the admin's credentials from before");
     lab.three_nodes(&[]);
-    let app = lab.dir.join("sleeper.yaml");
-    std::fs::write(&app, app()).unwrap();
-    lab.ok(&["apply", "-f", app.to_str().unwrap()]);
+    let file = lab.dir.join("sleeper.yaml");
+    std::fs::write(&file, app()).unwrap();
+    lab.ok(&["apply", "-f", file.to_str().unwrap()]);
     wait("a task on every node", 600, || {
         let r = running(&lab);
         let mut nodes: Vec<&str> = r.iter().map(|(_, n)| n.as_str()).collect();

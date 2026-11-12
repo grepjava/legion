@@ -917,6 +917,7 @@ async fn a_volume_backup_restores_onto_another_node() {
             name: name.to_owned(),
             node: node.to_owned(),
             header_json: String::from_utf8(header.clone()).unwrap(),
+            replace: false,
         };
         let parts: Vec<VolumeRestoreChunk> = std::iter::once(Part::Start(start))
             .chain(data.chunks(1000).map(|d| Part::Data(d.to_vec())))
@@ -969,6 +970,137 @@ async fn a_volume_backup_restores_onto_another_node() {
         c.nodes[i].sys.dataset_contents(&ds("data-db-0")).as_deref(),
         Some(&b"rows 2"[..])
     );
+    c.stop().await;
+}
+
+/// A node removed with a Volume's data on it: the Volume is lost, and its
+/// task waits rather than start on empty data, even on a node joining
+/// under that name; restored into from its backup, it runs again, the
+/// Service untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_volume_lost_with_its_node_is_restored_into() {
+    use legion_api::volume::VolumeStatus;
+    use legion_proto::v1::volume_restore_chunk::Part;
+    use legion_proto::v1::volumes_client::VolumesClient;
+    use legion_proto::v1::{
+        DeleteRequest, ObjectRef, VolumeBackupRequest, VolumeRestoreChunk, VolumeRestoreStart,
+    };
+
+    let mut c = Cluster::start(3).await;
+    c.apply(&DB.replace("MAX", "1")).await;
+    async fn status(c: &Cluster) -> VolumeStatus {
+        c.list(Kind::Volume)
+            .await
+            .into_iter()
+            .find(|v| v.metadata.name == "data-db-0")
+            .map(|v| serde_json::from_value(v.status).unwrap_or_default())
+            .unwrap_or_default()
+    }
+    async fn running_on(c: &Cluster) -> Option<String> {
+        c.list(Kind::Task)
+            .await
+            .into_iter()
+            .find(|t| t.status["state"] == "running" && t.spec["desiredState"] == "running")
+            .map(|t| t.spec["node"].as_str().unwrap_or_default().to_owned())
+    }
+    eventually("db running", async || running_on(&c).await.is_some()).await;
+    let from = status(&c).await.node;
+    let ds = "tank/legion/volumes/shop/data-db-0";
+    let i = c.nodes.iter().position(|n| n.name == from).unwrap();
+    c.nodes[i].sys.write_dataset(ds, b"rows 1");
+
+    let channel = Channel::from_shared(format!("http://{}", c.addr))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut volumes = VolumesClient::new(channel);
+    let mut chunks = volumes
+        .backup(VolumeBackupRequest {
+            namespace: "shop".into(),
+            name: "data-db-0".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let header = chunks.message().await.unwrap().unwrap().data;
+    let mut data = Vec::new();
+    while let Some(chunk) = chunks.message().await.unwrap() {
+        data.extend_from_slice(&chunk.data);
+    }
+    let restore = |node: &str, replace: bool| {
+        let start = VolumeRestoreStart {
+            namespace: String::new(),
+            name: String::new(),
+            node: node.to_owned(),
+            header_json: String::from_utf8(header.clone()).unwrap(),
+            replace,
+        };
+        let parts: Vec<VolumeRestoreChunk> = std::iter::once(Part::Start(start))
+            .chain(data.chunks(1000).map(|d| Part::Data(d.to_vec())))
+            .map(|p| VolumeRestoreChunk { part: Some(p) })
+            .collect();
+        let mut volumes = volumes.clone();
+        async move { volumes.restore(tokio_stream::iter(parts)).await }
+    };
+    // Not lost: nothing to restore into.
+    let to = c
+        .nodes
+        .iter()
+        .find(|n| n.name != from)
+        .unwrap()
+        .name
+        .clone();
+    let e = restore(&to, true).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::FailedPrecondition, "{e:?}");
+
+    // The node and its data gone: the Volume is lost, its task waits.
+    c.stop_agent(i).await;
+    c.api
+        .clone()
+        .delete(DeleteRequest {
+            r#ref: Some(ObjectRef {
+                kind: Kind::Node.to_string(),
+                namespace: String::new(),
+                name: from.clone(),
+            }),
+            expected_version: None,
+        })
+        .await
+        .unwrap();
+    eventually("the volume lost", async || status(&c).await.lost == from).await;
+    assert_eq!(status(&c).await.node, "");
+    eventually("its task waits, saying why", async || {
+        c.list(Kind::Task).await.iter().any(|t| {
+            t.status["state"] == "pending"
+                && t.status["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("volume lost with its node"))
+        })
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(running_on(&c).await, None, "nothing starts on empty data");
+
+    // A plain restore says how; --replace restores into it.
+    let e = restore(&to, false).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::AlreadyExists, "{e:?}");
+    assert!(e.message().contains("--replace"), "{e:?}");
+    restore(&to, true).await.unwrap();
+    let s = status(&c).await;
+    assert_eq!((s.node.as_str(), s.lost.as_str()), (to.as_str(), ""));
+    let j = c.nodes.iter().position(|n| n.name == to).unwrap();
+    assert_eq!(
+        c.nodes[j].sys.dataset_contents(ds).as_deref(),
+        Some(&b"rows 1"[..])
+    );
+    eventually("db running on its data", async || {
+        running_on(&c).await.as_deref() == Some(to.as_str())
+    })
+    .await;
+    // Restored into once: not lost now.
+    let e = restore(&to, true).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::FailedPrecondition, "{e:?}");
     c.stop().await;
 }
 

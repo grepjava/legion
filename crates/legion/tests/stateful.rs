@@ -762,16 +762,22 @@ fn postgres_is_restored_onto_replacement_hosts() {
     });
     let manager_at = t0.elapsed();
 
-    step("what the lost hosts held is cleared: the service, the old nodes, their Volumes");
-    lab.ok(&["delete", "service", "db", "-n", "data"]);
+    step("the lost hosts removed: their Volumes are lost with them, nothing starts on empty data");
     lab.ok(&["delete", "node", "n2"]);
     lab.ok(&["delete", "node", "n3"]);
-    for v in ["pg-db-0", "pg-db-1"] {
-        wait(&format!("{v} deleted"), 120, || {
-            let out = lab.legion(&["delete", "volume", v, "-n", "data"], &[]);
-            out.status.success() || text(&out.stderr).contains("not found")
-        });
-    }
+    let lost = |v: &str| {
+        lab.list("volumes", "data")
+            .into_iter()
+            .find(|o| o["metadata"]["name"] == v)
+            .and_then(|o| o["status"]["lost"].as_str().map(str::to_owned))
+            .unwrap_or_default()
+    };
+    wait("both Volumes lost", 60, || {
+        !lost("pg-db-0").is_empty() && !lost("pg-db-1").is_empty()
+    });
+    // The replica's data is copied anew from the primary: its Volume goes,
+    // to start empty. The Service stays as it was.
+    lab.ok(&["delete", "volume", "pg-db-1", "-n", "data"]);
 
     step("new hosts join as the old nodes did, and get the image");
     let worker = lab.ok(&["join-token", "worker"]).trim().to_owned();
@@ -780,19 +786,24 @@ fn postgres_is_restored_onto_replacement_hosts() {
     wait("three ready nodes again", 120, || ready(&lab));
     lab.load_image(&image);
     let nodes_at = t0.elapsed();
+    // A node under the lost one's name is not where its data is.
+    assert!(!lost("pg-db-0").is_empty(), "still lost on a new n2");
+    assert_eq!(lab.rows(0), None, "the primary waits for its data");
 
-    step("the primary's data restored onto a node");
+    step("the primary's data restored into its Volume, onto a node");
     lab.ok(&[
         "volume",
         "restore",
         volume.to_str().unwrap(),
         "--node",
         "n2",
+        "--replace",
     ]);
     let volume_at = t0.elapsed();
 
-    step("Postgres again: the primary recovers as from a crash, the replica copies it anew");
-    lab.ok(&["apply", "-f", app.to_str().unwrap()]);
+    step(
+        "Postgres again, the Service untouched: the primary recovers as from a crash, the replica copies it anew",
+    );
     lab.waited("the primary serving", 600, || lab.rows(0).is_some());
     let primary_at = t0.elapsed();
     assert_eq!(lab.node_of(0), "n2", "where its data was restored");
