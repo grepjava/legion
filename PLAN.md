@@ -352,7 +352,11 @@ it forwards (reads, heartbeats, renewals) and what it serves (the user's
 watch and the worker's assignments, peers, policies and routes, each
 ending), and a user's certificate renews nothing
 (`revocation_holds_through_a_follower`). Item 2 is done but for CA
-rotation, its own item to come.
+rotation, its own item to come. Built after 0.1.19 (docs/DESIGN.md, CA
+rotation): `legion ca rotate` moves every manager and node to a new CA
+with the old one trusted until all have, a cross-signed certificate
+bridging the two, and then refuses all the old CA issued; tested on the
+fake hosts and the lab.
 
 Item 3 is built (docs/DESIGN.md, Audit), as decided with the user: kept
 in the replicated store, for changes, sessions and refusals, not reads.

@@ -1686,13 +1686,39 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
   more and its Raft calls are refused, and its certificate, issued before
   the removal, is refused by the API and the dispatcher, what it forwards
   included. A removed manager held the CA key, so it could still certify
-  itself anew: only rotating the CA, not built yet, makes that sure. A
+  itself anew: rotating the CA (below) makes that sure. A
   user is revoked by their RoleBindings: a request after a binding goes
   is refused (a follower forwards it with the user's name and the leader
   decides), and a session (exec, logs, port-forward) or watch open before
   it ends within 5 s, saying why. A watch ends once a role it ran with is
   lowered or taken, rather than go quiet on what the user may no longer
   see. Users renew nothing: the dispatcher refuses their certificates.
+- **CA rotation** (`legion ca rotate`, the cluster admin's): the leader
+  makes a successor CA and its certificate cross-signed by the old one,
+  and records them with the old CA's certificate in the store
+  (`legion-system/cluster-ca`, a Secret no caller sees). Each manager
+  reads the record every 5 s and takes it up: the new CA written beside
+  the old in `pki` and put in place whole (key sealed under autolock),
+  `ca.crt` holding the new CA first, then the cross-signed certificate
+  and the old CA; it signs joins, renewals and users with the new CA from
+  then, issues itself and `admin.pem` new certificates, and trusts both
+  CAs. Until it has, it issues nothing and advises no node, so nothing of
+  the old CA is issued once the rotation began. Workers learn the CAs from
+  their heartbeats: they trust both, write them before renewing, and
+  renew at once. Throughout, a peer that trusts only the old CA (a node
+  not moved yet, an old `admin.pem`, a user's bundle) verifies the new
+  CA's certificates through the cross-signed one presented with them.
+  The leader ends the rotation once every Raft member (asked through
+  `Cluster.Status`) and every node (by its last heartbeat's certificate)
+  holds a certificate of the new CA: the old CA and the cross-signed
+  certificate leave the record, every node trusts the new CA alone, and
+  certificates of the old one are refused, users' and copies of
+  `admin.pem` included: they are issued again. A node down holds the end
+  back, `legion ca status` naming it: bring it back or remove it. Join
+  tokens name the new CA from the start; one shown before is refused,
+  saying why. A backup taken before restores the old CA with the rest.
+  Tested on the lab (`the_ca_rotates_with_every_node_on_it`): three nodes
+  with a task each move, the tasks untouched.
 - **Audit** (phase 7): every change (apply, delete, init, join tokens,
   issuing users, autolock, joins, volume backups and restores), every
   session opened (exec, logs, port-forward), and every request refused
