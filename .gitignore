@@ -1,1 +1,3 @@
 /target
+/crates/legion-console/web/node_modules
+/crates/legion-console/web/.svelte-kit
