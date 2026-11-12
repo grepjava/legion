@@ -1052,13 +1052,15 @@ impl JailRuntime {
         };
         let hostname = spec.hostname.clone().unwrap_or_else(|| spec.name.clone());
         let env = container_env(&cfg.env, &spec.env, &hostname);
+        // A VM's image is its disk: its command is the VM's supervisor.
+        let vm = spec.annotations.contains_key(legion_runtime::ANNOTATION_VM);
         let (jail, root, dataset) = match (&parent, pod) {
             (_, true) => (id.clone(), PathBuf::from(POD_ROOT), None),
             (Some(p), false) => {
                 let pod = load(&self.dir, p)?
                     .filter(Record::is_pod)
                     .ok_or_else(|| api(404, format!("no pod {p} to run in")))?;
-                if argv.is_empty() {
+                if argv.is_empty() && !vm {
                     return Err(api(400, format!("{}: no command to run", spec.name)));
                 }
                 (
@@ -1068,7 +1070,7 @@ impl JailRuntime {
                 )
             }
             (None, false) => {
-                if argv.is_empty() {
+                if argv.is_empty() && !vm {
                     return Err(api(400, format!("{}: no command to run", spec.name)));
                 }
                 (
@@ -2740,6 +2742,11 @@ exit 0
 
     /// An OCI layout of one plain-tar layer holding `file`, named `name`.
     fn layout(at: &Path, file: &str, name: &str) {
+        layout_running(at, file, name, &["/bin/sh"]);
+    }
+
+    /// [`layout`], its image running `cmd` (none, as a VM's disk image).
+    fn layout_running(at: &Path, file: &str, name: &str, cmd: &[&str]) {
         use sha2::Digest as _;
         let digest = |b: &[u8]| format!("sha256:{:x}", sha2::Sha256::digest(b));
         let blobs = at.join("blobs/sha256");
@@ -2756,7 +2763,7 @@ exit 0
         b.append_data(&mut h, file, file.as_bytes()).unwrap();
         let layer = b.into_inner().unwrap();
         let config = serde_json::to_vec(&serde_json::json!({"os": "freebsd",
-            "config": {"Cmd": ["/bin/sh"]}, "rootfs": {"diff_ids": [digest(&layer)]}}))
+            "config": {"Cmd": cmd}, "rootfs": {"diff_ids": [digest(&layer)]}}))
         .unwrap();
         let config = put(&config);
         let layer = put(&layer);
@@ -2800,6 +2807,64 @@ exit 0
         )
         .unwrap();
         (rt, name)
+    }
+
+    /// A VM's image is only its disk, with no command: its container runs
+    /// the VM's supervisor; any other container without one is refused.
+    #[tokio::test]
+    async fn a_vm_runs_from_an_image_without_a_command() {
+        use legion_runtime::Runtime as _;
+        let t = tempfile::tempdir().unwrap();
+        let sys = Arc::new(legion_sys::FakeSys::new());
+        let (rt, _) = on_zfs(t.path(), &sys).await;
+        let disk = Reference::parse("localhost/disk:1").unwrap().to_string();
+        let at = t.path().join("disk-layout");
+        layout_running(&at, "disk.img", &disk, &[]);
+        rt.images.import(&at, &disk).await.unwrap();
+        let pod = rt
+            .create(&ContainerSpec {
+                name: "pod".into(),
+                image: disk.clone(),
+                annotations: [(ANNOTATION_VNET.to_owned(), "new".to_owned())].into(),
+                ..ContainerSpec::default()
+            })
+            .await
+            .unwrap();
+        let member = |name: &str, vm: bool| {
+            let mut annotations: BTreeMap<String, String> =
+                [(ANNOTATION_PARENT.to_owned(), pod.clone())].into();
+            if vm {
+                let config = legion_runtime::VmConfig {
+                    cpus: 1,
+                    memory: 256 << 20,
+                    uefi: false,
+                    tap: "tap0".into(),
+                    ip: "10.200.0.2/24".into(),
+                    gateway: "10.200.0.1".into(),
+                    ip6: None,
+                    gateway6: None,
+                    mtu: 1500,
+                    dns: "10.200.0.1".into(),
+                    hostname: "guest".into(),
+                };
+                annotations.insert(
+                    legion_runtime::ANNOTATION_VM.to_owned(),
+                    serde_json::to_string(&config).unwrap(),
+                );
+            }
+            ContainerSpec {
+                name: name.into(),
+                image: disk.clone(),
+                annotations,
+                ..ContainerSpec::default()
+            }
+        };
+        let err = rt.create(&member("plain", false)).await.unwrap_err();
+        assert!(err.to_string().contains("no command to run"), "{err}");
+        let id = rt.create(&member("guest", true)).await.unwrap();
+        let rec = load(&t.path().join("state"), &id).unwrap().unwrap();
+        assert_eq!(rec.argv, crate::vm::argv());
+        assert!(rec.vm.is_some());
     }
 
     #[tokio::test]
