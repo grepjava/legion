@@ -879,6 +879,20 @@ this was verified in a 3-node lab (S3).
   `pfctl_kill_states` via `libpfctl`). Killing by address does not work for
   this: `pfctl -k 0/0 -k <backend>` matches nothing because the inbound state
   is keyed by the VIP.
+- **Load balancer addresses** (`endpoint.loadBalancer: { address, vhid }`,
+  for an outside load balancer or clients to reach a service at one
+  address on the nodes' own network, as MetalLB's layer 2 mode does): the
+  dispatcher ranks the ready, active nodes for each such service by a hash
+  of the service and the node (rendezvous hashing, so a node coming or
+  going moves only the addresses it held), and every agent puts the
+  address on its egress interface as CARP virtual host `vhid`, its skew
+  from its rank, so the first is master and the others take over within
+  seconds of its going (the kernel's CARP, as the managers' `--vip`). The
+  password is the service's own. Every node has the address's ports in
+  its rules (`rdr` to the service's table, as a published port), so only
+  where it is held does traffic arrive. A node drained, paused, suspect or
+  down drops out of the ranking and gives the address up. The `vhid` must
+  be unique on the network: not the managers', nor another service's.
 - `endpoint: dnsrr` skips the VIP: DNS returns task IPs directly.
 - Host processes cannot reach VIPs or published ports via the host's own address
   (pf `rdr` does not apply to locally generated traffic). They use DNS
