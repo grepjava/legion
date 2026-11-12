@@ -202,6 +202,10 @@ struct Conn {
     /// Bumped on every switch, so concurrent failures switch only once.
     generation: u64,
     channel: Channel,
+    /// The certificate `channel` was opened with: a connection presents
+    /// the one current when it was made, so a renewed one (a CA rotation
+    /// waits on it) takes a new channel.
+    cert: String,
 }
 
 impl GrpcControl {
@@ -216,6 +220,7 @@ impl GrpcControl {
             return Err(ControlError::Other("no manager address".into()));
         }
         let channel = connect(&managers[0], tls.as_ref())?;
+        let cert = tls.as_ref().map(|t| t.cert_and_key().0).unwrap_or_default();
         Ok(GrpcControl {
             node: node.to_owned(),
             tls,
@@ -224,6 +229,7 @@ impl GrpcControl {
                 at: 0,
                 generation: 0,
                 channel,
+                cert,
             })),
             ca: Arc::new(watch::channel(None).0),
             role: Arc::new(watch::channel(String::new()).0),
@@ -268,7 +274,21 @@ impl GrpcControl {
     }
 
     fn client(&self) -> (u64, DispatcherClient<Channel>) {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        if let Some(tls) = &self.tls {
+            let cert = tls.cert_and_key().0;
+            if cert != conn.cert {
+                match connect(&conn.managers[conn.at], Some(tls)) {
+                    Ok(channel) => {
+                        tracing::debug!("calling with the renewed certificate");
+                        conn.generation += 1;
+                        conn.channel = channel;
+                        conn.cert = cert;
+                    }
+                    Err(e) => tracing::warn!("{e}"),
+                }
+            }
+        }
         let client = DispatcherClient::new(conn.channel.clone())
             .max_decoding_message_size(MAX_MESSAGE)
             .max_encoding_message_size(MAX_MESSAGE);
@@ -288,6 +308,9 @@ impl GrpcControl {
                 conn.at = next;
                 conn.generation += 1;
                 conn.channel = channel;
+                if let Some(tls) = &self.tls {
+                    conn.cert = tls.cert_and_key().0;
+                }
             }
             Err(e) => tracing::warn!("{e}"),
         }
