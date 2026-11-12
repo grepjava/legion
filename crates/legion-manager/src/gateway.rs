@@ -166,6 +166,8 @@ fn router(gateway: Gateway) -> axum::Router {
         .route("/api/objects/{kind}", get(list))
         .route("/api/objects/{kind}/{namespace}/{name}", get(object))
         .route("/api/watch/{kind}", get(watch))
+        .route("/api/usage", get(usage))
+        .route("/api/logs/{namespace}/{task}", get(logs))
         .fallback(page)
         .layer(axum::middleware::map_response(security_headers))
         .with_state(gateway)
@@ -551,6 +553,147 @@ async fn relay(
     }
 }
 
+/// What each node's tasks use now, as `legion top` shows it: `{nodes:
+/// [{node, tasks: [{namespace, task, cpu_percent, memory_bytes}]}]}`.
+async fn usage(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Query(scope): Query<Scope>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let r = ClusterClient::new(channel)
+        .usage(pb::UsageRequest {
+            namespace: scope.namespace.unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+    let nodes: Vec<_> = r
+        .nodes
+        .iter()
+        .map(|n| {
+            let tasks: Vec<_> = n
+                .tasks
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "namespace": t.namespace, "task": t.task,
+                        "cpu_percent": t.cpu_percent, "memory_bytes": t.memory_bytes,
+                    })
+                })
+                .collect();
+            serde_json::json!({ "node": n.node, "tasks": tasks })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "nodes": nodes })).into_response())
+}
+
+#[derive(Deserialize)]
+struct LogsQuery {
+    container: Option<String>,
+    tail: Option<u32>,
+    #[serde(default)]
+    follow: bool,
+}
+
+/// A task's output, as `legion logs` prints it, as JSON text messages
+/// `{out}` or `{err}` (the bytes as text), then `{end: true}` when the
+/// container's output ends or `{error}` when the session fails.
+async fn logs(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path((namespace, task)): Path<(String, String)>,
+    Query(q): Query<LogsQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, Refused> {
+    use pb::session_frame::Frame;
+    same_origin(&headers, &uri)?;
+    let (_, channel) = g.user(&headers).await?;
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let open = pb::SessionOpen {
+        namespace,
+        task,
+        container: q.container.unwrap_or_default(),
+        action: Some(pb::session_open::Action::Logs(pb::LogsOptions {
+            follow: q.follow,
+            tail: q.tail,
+        })),
+    };
+    tx.send(pb::SessionFrame {
+        frame: Some(Frame::Open(open)),
+    })
+    .await
+    .expect("the receiver is held");
+    let stream = pb::pods_client::PodsClient::new(channel)
+        .session(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await?
+        .into_inner();
+    // `tx` is kept until the end: closing it would end the session's input.
+    Ok(ws.on_upgrade(move |socket| relay_logs(socket, stream, tx)))
+}
+
+async fn relay_logs(
+    mut socket: WebSocket,
+    mut stream: tonic::Streaming<pb::SessionFrame>,
+    _input: tokio::sync::mpsc::Sender<pb::SessionFrame>,
+) {
+    use pb::session_frame::Frame;
+    // What each stream has left of a character split between frames.
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    loop {
+        let frame = tokio::select! {
+            f = stream.message() => f,
+            m = socket.recv() => match m {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                _ => continue,
+            },
+        };
+        let text = match frame {
+            Ok(Some(pb::SessionFrame {
+                frame: Some(Frame::Stdout(data)),
+            })) => serde_json::json!({ "out": text_of(&mut out, data) }),
+            Ok(Some(pb::SessionFrame {
+                frame: Some(Frame::Stderr(data)),
+            })) => serde_json::json!({ "err": text_of(&mut err, data) }),
+            Ok(Some(pb::SessionFrame {
+                frame: Some(Frame::Error(e)),
+            })) => serde_json::json!({ "error": e.message }),
+            Ok(Some(_)) => continue,
+            Ok(None) => serde_json::json!({ "end": true }),
+            Err(s) => serde_json::json!({ "error": s.message() }),
+        };
+        let end = text.get("out").is_none() && text.get("err").is_none();
+        if socket
+            .send(Message::Text(text.to_string().into()))
+            .await
+            .is_err()
+            || end
+        {
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
+    }
+}
+
+/// `data` after what `pending` held, as text, keeping back the start of a
+/// character it ends inside of for the next; bytes that are not UTF-8 are
+/// replaced.
+fn text_of(pending: &mut Vec<u8>, data: Vec<u8>) -> String {
+    pending.extend_from_slice(&data);
+    let whole = match std::str::from_utf8(pending) {
+        Ok(_) => pending.len(),
+        // An incomplete character at the end (at most 3 bytes) waits.
+        Err(e) if e.error_len().is_none() && pending.len() - e.valid_up_to() <= 3 => {
+            e.valid_up_to()
+        }
+        Err(_) => pending.len(),
+    };
+    let rest = pending.split_off(whole);
+    let text = String::from_utf8_lossy(pending).into_owned();
+    *pending = rest;
+    text
+}
+
 /// The console's pages: a file of the build, or the app's page for any
 /// other path (its router takes it from there).
 async fn page(uri: Uri) -> Result<Response, Infallible> {
@@ -644,6 +787,16 @@ mod tests {
             same_origin(&h, &path).is_err(),
             "plain HTTP is another origin"
         );
+    }
+
+    #[test]
+    fn a_character_split_between_frames_waits_for_its_end() {
+        let mut pending = Vec::new();
+        let e = "é".as_bytes(); // two bytes
+        assert_eq!(text_of(&mut pending, [b"caf", &e[..1]].concat()), "caf");
+        assert_eq!(text_of(&mut pending, [&e[1..], b"!"].concat()), "é!");
+        assert!(pending.is_empty());
+        assert_eq!(text_of(&mut pending, vec![0xff, b'a']), "\u{fffd}a");
     }
 
     #[test]
