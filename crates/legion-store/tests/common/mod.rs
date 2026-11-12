@@ -195,6 +195,46 @@ impl Cluster {
         &self.nodes[&id]
     }
 
+    /// Writes `count` services named `prefix-N` to whichever of `ids` leads,
+    /// following a change of leader midway (on a loaded host a heartbeat
+    /// can lapse): the version of the last. A write the old leader refused
+    /// was not applied, so it is sent again.
+    pub async fn put_many_among(&self, ids: &[NodeId], prefix: &str, count: usize) -> u64 {
+        use openraft::error::ClientWriteError;
+        let mut last = 0;
+        for n in 0..count {
+            let deadline = tokio::time::Instant::now() + TIMEOUT;
+            loop {
+                let leader = ids.iter().copied().find(|&id| {
+                    self.store(id).raft.metrics().borrow().state == ServerState::Leader
+                });
+                if let Some(l) = leader {
+                    let write = Command::Put {
+                        object: service(&format!("{prefix}-{n}"), 1),
+                        precondition: Precondition::None,
+                    };
+                    match self.store(l).raft.client_write(write).await {
+                        Ok(r) => match r.data {
+                            Outcome::Written(o) => {
+                                last = o.metadata.version;
+                                break;
+                            }
+                            other => panic!("unexpected outcome {other:?}"),
+                        },
+                        Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => {}
+                        Err(e) => panic!("writing to {l}: {e}"),
+                    }
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no leader among {ids:?} took the write"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        last
+    }
+
     pub async fn initialize(&self, ids: &[NodeId]) {
         let members: BTreeMap<NodeId, BasicNode> =
             ids.iter().map(|&id| (id, BasicNode::default())).collect();

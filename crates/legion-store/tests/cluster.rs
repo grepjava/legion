@@ -46,10 +46,11 @@ async fn minority_cannot_commit() {
         c.start(id).await;
     }
     c.initialize(&[1, 2, 3]).await;
-    let old = c.leader(None).await;
-    put_many(c.store(old), "a", 10).await;
+    c.put_many_among(&[1, 2, 3], "a", 10).await;
 
-    // Cut the leader off. A write sent to it must not commit.
+    // Cut the leader off, whichever it is by now. A write sent to it must
+    // not commit.
+    let old = c.leader(None).await;
     c.router.isolate(old);
     let write = Command::Put {
         object: service("lost", 1),
@@ -67,8 +68,8 @@ async fn minority_cannot_commit() {
 
     // The majority side elects a leader and makes progress.
     let majority: Vec<_> = (1..=3).filter(|&id| id != old).collect();
-    let new = wait_for_leader_among(&c, &majority).await;
-    let last = put_many(c.store(new), "b", 10).await;
+    wait_for_leader_among(&c, &majority).await;
+    let last = c.put_many_among(&majority, "b", 10).await;
 
     // After healing, the old leader discards its uncommitted entry.
     c.router.heal(old);
