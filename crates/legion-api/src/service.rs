@@ -295,6 +295,76 @@ impl PodSpec {
             .collect()
     }
 
+    /// The pod's virtual machine, if it is one.
+    pub fn vm(&self) -> Option<&Vm> {
+        self.containers.first().and_then(|c| c.vm.as_ref())
+    }
+
+    /// A VM is its pod alone: nothing else shares its address, and nothing
+    /// can be put inside it (no files, no volumes, no exec).
+    fn admit_vm(&self, path: &str) -> Result<(), Invalid> {
+        let vms: Vec<usize> = self
+            .containers
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.vm.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        if let Some((i, c)) = self
+            .init_containers
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.vm.is_some())
+        {
+            let _ = c;
+            return Err(Invalid::new(
+                field(&index(path, "initContainers", i), "vm"),
+                "an init container is no VM",
+            ));
+        }
+        let Some(&i) = vms.first() else {
+            return Ok(());
+        };
+        let p = index(path, "containers", i);
+        if self.containers.len() > 1 || !self.init_containers.is_empty() {
+            return Err(Invalid::new(
+                field(&p, "vm"),
+                "a VM is its pod's only container",
+            ));
+        }
+        let c = &self.containers[0];
+        let vm = c.vm.as_ref().expect("found");
+        if vm.cpus == 0 || vm.memory.0 < (64 << 20) {
+            return Err(Invalid::new(
+                field(&p, "vm"),
+                "a VM needs a CPU and at least 64Mi of memory",
+            ));
+        }
+        let into = [
+            (!c.volume_mounts.is_empty(), "volumeMounts"),
+            (!c.secrets.is_empty(), "secrets"),
+            (!c.configs.is_empty(), "configs"),
+            (!self.volumes.is_empty(), "volumes"),
+        ];
+        if let Some((_, what)) = into.iter().find(|(set, _)| *set) {
+            return Err(Invalid::new(
+                field(&p, what),
+                "nothing is put inside a VM: give it to the guest another way",
+            ));
+        }
+        if [&c.probes.startup, &c.probes.liveness, &c.probes.readiness]
+            .into_iter()
+            .flatten()
+            .any(|probe| probe.exec.is_some())
+        {
+            return Err(Invalid::new(
+                field(&p, "probes"),
+                "a VM is checked over the network: http, tcp or grpc",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn admit(&mut self, path: &str) -> Result<(), Invalid> {
         if self.containers.is_empty() {
             return Err(Invalid::new(
@@ -302,6 +372,7 @@ impl PodSpec {
                 "a pod needs at least one container",
             ));
         }
+        self.admit_vm(path)?;
         for (i, name) in self.image_pull_secrets.iter().enumerate() {
             check_name(&index(path, "imagePullSecrets", i), name)?;
         }
@@ -446,18 +517,27 @@ impl PodSpec {
     /// Sum of the containers' requests; init containers run before the
     /// others, so they count only when they ask for more.
     pub fn requests(&self) -> PodRequests {
+        // A VM's memory is set aside whole while it runs, and its CPUs are
+        // its own: what it asks is at least that.
+        let cpu_of = |c: &Container| {
+            let asked = c.resources.requests.cpu.unwrap_or_default();
+            match &c.vm {
+                Some(vm) => asked.max(Cpu(u64::from(vm.cpus) * 1000)),
+                None => asked,
+            }
+        };
+        let memory_of = |c: &Container| {
+            let asked = c.resources.requests.memory.unwrap_or_default();
+            match &c.vm {
+                Some(vm) => asked.max(vm.memory),
+                None => asked,
+            }
+        };
         let sum = |cs: &[Container]| {
             cs.iter()
                 .fold(PodRequests::default(), |acc, c| PodRequests {
-                    cpu: Cpu(acc
-                        .cpu
-                        .0
-                        .saturating_add(c.resources.requests.cpu.unwrap_or_default().0)),
-                    memory: Bytes(
-                        acc.memory
-                            .0
-                            .saturating_add(c.resources.requests.memory.unwrap_or_default().0),
-                    ),
+                    cpu: Cpu(acc.cpu.0.saturating_add(cpu_of(c).0)),
+                    memory: Bytes(acc.memory.0.saturating_add(memory_of(c).0)),
                 })
         };
         let main = sum(&self.containers);
@@ -513,6 +593,41 @@ pub struct Container {
     pub security: Security,
     #[serde(default, skip_serializing_if = "crate::image::PullPolicy::is_default")]
     pub pull_policy: crate::image::PullPolicy,
+    /// A virtual machine, not a jail (DESIGN.md §6.8): the image holds its
+    /// disk, `/disk.img`, and bhyve boots it with the pod's address. A pod
+    /// with one is that one container alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm: Option<Vm>,
+}
+
+/// A container that is a bhyve virtual machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Vm {
+    /// Virtual CPUs.
+    #[serde(default = "one_cpu")]
+    pub cpus: u16,
+    /// Its memory, all of it set aside while it runs.
+    pub memory: crate::quantity::Bytes,
+    #[serde(default)]
+    pub boot: VmBoot,
+}
+
+fn one_cpu() -> u16 {
+    1
+}
+
+/// How a VM boots, and so how it learns its address.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VmBoot {
+    /// FreeBSD's loader (`bhyveload`): the guest reads its address from
+    /// the loader's `legion.*` variables (`kenv`).
+    #[default]
+    Freebsd,
+    /// UEFI firmware (the `edk2-bhyve` package on the node): the guest
+    /// reads its address from a cloud-init NoCloud seed.
+    Uefi,
 }
 
 impl Container {

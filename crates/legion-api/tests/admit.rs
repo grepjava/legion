@@ -550,3 +550,47 @@ fn the_size_limit_holds_with_defaults_filled_in() {
     let e = admit(&mut big).expect_err("admitted").to_string();
     assert!(e.contains("limit"), "{e}");
 }
+
+/// A VM is its pod's only container, with nothing put inside it and only
+/// network probes (DESIGN.md §6.8).
+#[test]
+fn a_vm_is_its_pod_alone() {
+    let vm = "{ name: guest, image: \"guest:1\", vm: { memory: 256Mi } }";
+    let o = admitted(&service(&format!("  pod: {{ containers: [{vm}] }}\n")));
+    // Its memory and CPU are what it asks, at the least.
+    let spec: ServiceSpec = parse(&o.spec).unwrap();
+    let r = spec.pod.requests();
+    assert_eq!((r.cpu.0, r.memory.0), (1000, 256 << 20));
+    let cases = [
+        (
+            format!("  pod: {{ containers: [{vm}, {{ name: side, image: \"s:1\" }}] }}\n"),
+            "only container",
+        ),
+        (
+            format!(
+                "  pod: {{ initContainers: [{{ name: i, image: \"i:1\" }}], containers: [{vm}] }}\n"
+            ),
+            "only container",
+        ),
+        (
+            "  pod: { containers: [{ name: g, image: \"g:1\", vm: { memory: 1Mi } }] }\n".into(),
+            "64Mi",
+        ),
+        (
+            "  pod: { containers: [{ name: g, image: \"g:1\", vm: { memory: 256Mi }, \
+             configs: [{ name: c, target: /etc/c }] }] }\n"
+                .into(),
+            "nothing is put inside a VM",
+        ),
+        (
+            "  pod: { containers: [{ name: g, image: \"g:1\", vm: { memory: 256Mi }, \
+             probes: { readiness: { exec: { command: [\"/bin/true\"] } } } }] }\n"
+                .into(),
+            "over the network",
+        ),
+    ];
+    for (spec, says) in cases {
+        let e = rejected(&service(&spec));
+        assert!(e.contains(says), "{e}");
+    }
+}
