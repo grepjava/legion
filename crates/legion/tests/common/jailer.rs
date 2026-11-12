@@ -31,6 +31,9 @@ pub struct Published {
     pub reference: String,
     pub digest: String,
     pub pinned: String,
+    /// For an index: each platform, as `os/arch`, and its manifest.
+    #[serde(default)]
+    pub platforms: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]

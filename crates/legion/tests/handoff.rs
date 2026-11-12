@@ -22,6 +22,11 @@
 //!   one signed jailer image runs under a policy enforcing its key, through
 //!   a drain, a move cut short and a restore onto another host, on the
 //!   digest jailer recorded at every stage, its data the same.
+//! - Across platforms (jailer's shared qualification): jailer pushes one
+//!   signed index of an amd64 image built here and an arm64 one built on an
+//!   arm64 host; every node pins the index and runs its own platform's
+//!   manifest, a Service wanting arm64 waits for an arm64 node, and an
+//!   index with no amd64 image is refused once on each node, not retried.
 //!
 //! It drives real daemons, so it is ignored by default and run by hand on a
 //! FreeBSD host as root, with the lab of `tests/common` (see there), and with
@@ -1493,5 +1498,210 @@ fn a_jailer_image_goes_from_build_to_recovery() {
     });
     lab.delete("keep");
     eprintln!("versions: {jailer_version}; {legion_version} at {revision}; image {digest}");
+    step("done");
+}
+
+/// The arm64 half of [`a_jailer_index_runs_each_nodes_platform`]: built by
+/// jailer on FreeBSD aarch64 from `FROM scratch` and an `/arch` saying
+/// `arm64`, and exported; see `fixtures/README.md`. It never runs here.
+const ARM64: &[u8] = include_bytes!("fixtures/jailer-arch-arm64.tar");
+
+/// As [`service`], placed under `constraint` if given.
+fn placed(name: &str, image: &str, replicas: u32, constraint: Option<&str>) -> String {
+    let mut yaml = service(name, image, replicas, "");
+    if let Some(c) = constraint {
+        yaml.push_str(&format!("  placement:\n    constraints: [\"{c}\"]\n"));
+    }
+    yaml
+}
+
+impl Lab {
+    /// Every task of `service`, whatever it is meant to do.
+    fn tasks_of(&self, service: &str) -> Vec<Value> {
+        self.list("tasks", "handoff")
+            .into_iter()
+            .filter(|t| t["spec"]["service"] == service)
+            .collect()
+    }
+
+    /// Waits for `n` tasks of `service` meant to run, all pending on no
+    /// node with `says`, and checks they stay so for 30 s, none rejected
+    /// or failed meanwhile; returns how many were rejected in all.
+    fn waits(&self, service: &str, n: usize, says: &str) -> usize {
+        let pending = |lab: &Lab| {
+            let live: Vec<Value> = lab
+                .tasks_of(service)
+                .into_iter()
+                .filter(|t| t["spec"]["desiredState"] == "running")
+                .collect();
+            live.len() == n
+                && live.iter().all(|t| {
+                    t["status"]["state"] == "pending"
+                        && t["spec"]["node"].as_str().unwrap_or("").is_empty()
+                        && t["status"]["message"] == says
+                })
+        };
+        wait(
+            &format!("{n} tasks of {service} waiting: {says}"),
+            300,
+            || pending(self),
+        );
+        let ended = |lab: &Lab, state: &str| {
+            lab.tasks_of(service)
+                .iter()
+                .filter(|t| t["status"]["state"] == state)
+                .count()
+        };
+        let rejected = ended(self, "rejected");
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        assert!(
+            pending(self),
+            "{service} stopped waiting: {:?}",
+            self.tasks_of(service)
+        );
+        assert_eq!(ended(self, "rejected"), rejected, "{service} placed again");
+        assert_eq!(ended(self, "failed"), 0, "{service}");
+        rejected
+    }
+
+    /// The running tasks of `service`, by name, with what `/arch` says.
+    fn arches(&self, service: &str) -> BTreeMap<String, String> {
+        self.running(service)
+            .iter()
+            .map(|t| {
+                let arch = String::from_utf8(self.file_in(t, "/arch")).unwrap();
+                (t["metadata"]["name"].as_str().unwrap().to_owned(), arch)
+            })
+            .collect()
+    }
+}
+
+/// One index across platforms (jailer's shared qualification): jailer
+/// pushes an amd64 image built here and an arm64 one built on an arm64
+/// host as one signed index. The service pins the index, the policy checks
+/// its signature on that digest, and each node runs its own platform's
+/// manifest. On these amd64 nodes a Service wanting arm64 waits, and an
+/// index of arm64 alone is refused once on each node, then waits, until
+/// the service runs other images.
+#[test]
+#[ignore = "needs root and ZFS on FreeBSD, two more nodes and jailer; see the module docs"]
+fn a_jailer_index_runs_each_nodes_platform() {
+    let mut lab = Lab::from_env();
+    let registry = Registry::start(&lab);
+    let addr = registry.addr.clone();
+    let jailer = Jailer::new(&lab, &[&addr]);
+    let step = |what: &str| eprintln!("--- {what}");
+    let path = |p: PathBuf| p.to_str().unwrap().to_owned();
+
+    step("jailer makes a key pair");
+    jailer.run(&["key", "generate", &path(lab.dir.join("arch"))]);
+    let sign_key = path(lab.dir.join("arch.key"));
+    let pub_key = path(lab.dir.join("arch.pub"));
+    let pem = std::fs::read_to_string(&pub_key).unwrap();
+    let key = legion_image::cosign::PublicKey::from_pem(&pem)
+        .unwrap()
+        .fingerprint()
+        .to_owned();
+
+    step("jailer loads the arm64 image an arm64 host built, and builds the amd64 one");
+    let archive = lab.dir.join("arch-arm64.tar");
+    std::fs::write(&archive, ARM64).unwrap();
+    let arm64 = "handoff/arch:arm64";
+    jailer.run(&["load", "--name", arm64, &path(archive)]);
+    let rec = lab.dir.join("arch.json");
+    let id = unique("arch");
+    let amd64 = "handoff/arch:amd64";
+    jailer.build_with(&lab.dir, amd64, &id, &rec, &[("arch", "amd64\n")], &[]);
+
+    // Pushes an index of `sources` to `image`, signed and recorded in
+    // `rec`: its digest, its pinned reference, and its platforms.
+    let push = |image: &str, sources: &[&str], rec: &Path| {
+        let rec_path = path(rec.to_path_buf());
+        let mut args = vec![
+            "manifest",
+            "push",
+            "--sign-key",
+            sign_key.as_str(),
+            "--record",
+            rec_path.as_str(),
+            image,
+        ];
+        args.extend_from_slice(sources);
+        jailer.run(&args);
+        let r = record(rec);
+        let p = r.published.last().expect("the push is recorded");
+        assert_eq!(p.reference, image);
+        let repo = image.rsplit_once(':').unwrap().0;
+        assert_eq!(p.pinned, format!("{repo}@{}", p.digest));
+        (p.digest.clone(), p.pinned.clone(), p.platforms.clone())
+    };
+
+    step("jailer pushes one signed index of both and checks its signature");
+    let image = format!("{addr}/handoff/arch:1");
+    let (index, pinned, platforms) = push(&image, &[amd64, arm64], &rec);
+    let amd64_manifest = record(&rec).image.manifest;
+    assert_eq!(platforms.len(), 2, "{platforms:?}");
+    assert_eq!(platforms["freebsd/amd64"], amd64_manifest, "{platforms:?}");
+    assert!(
+        platforms.keys().any(|p| p.starts_with("freebsd/arm64")),
+        "{platforms:?}"
+    );
+    assert_ne!(
+        index, amd64_manifest,
+        "the index, not a platform's manifest"
+    );
+    jailer.run(&["verify", "--key", &pub_key, &image]);
+
+    step("a cluster of amd64 nodes, under a policy enforcing jailer's key");
+    lab.flags = format!("{} --insecure-registry {addr}", lab.flags);
+    lab.three_nodes(&["--insecure-registry", &addr]);
+    lab.apply("namespace", NAMESPACE);
+    let scope = format!("{addr}/handoff/**");
+    lab.apply("policy", &policy("arch", &[&scope], &[&pem], "enforce"));
+
+    step("the service pins the index, verified on it; every task runs amd64's manifest");
+    lab.apply("multi", &placed("multi", &image, 3, None));
+    lab.runs("multi", &image, 3, &amd64_manifest, Some(&pinned), &id);
+    lab.verified_by("multi", &image, &index, &key);
+    let before = lab.arches("multi");
+    assert_eq!(before.len(), 3);
+    assert!(before.values().all(|a| a == "amd64\n"), "{before:?}");
+
+    step("a service wanting arm64 waits for an arm64 node, the other untouched");
+    let arm = "node.platform.arch == arm64";
+    lab.apply("armed", &placed("armed", &image, 2, Some(arm)));
+    let rejected = lab.waits("armed", 2, "no node can run it: 3 constraints");
+    assert_eq!(rejected, 0, "a constraint holds before any node tries");
+    assert_eq!(lab.arches("multi"), before, "the first service as it was");
+    lab.ok(&["delete", "service", "armed", "-n", "handoff"]);
+
+    step("an index of arm64 alone is refused once on each node, then waits");
+    let only = format!("{addr}/handoff/arch:arm64-only");
+    let only_rec = lab.dir.join("arch-only.json");
+    let (only_index, _, only_platforms) = push(&only, &[arm64], &only_rec);
+    assert_eq!(only_platforms.len(), 1, "{only_platforms:?}");
+    lab.apply("lone", &placed("lone", &only, 2, None));
+    let rejected = lab.waits("lone", 2, "no node can run it: 3 no image for its platform");
+    assert!((1..=3).contains(&rejected), "{rejected} rejected");
+    for t in lab.tasks_of("lone") {
+        if t["status"]["state"] == "rejected" {
+            let wrong = &t["status"]["wrongPlatform"];
+            assert_eq!(wrong["os"], "freebsd", "{t}");
+            assert_eq!(wrong["arch"], "amd64", "{t}");
+            let says = t["status"]["message"].as_str().unwrap_or("");
+            assert!(says.contains("no image for freebsd/amd64"), "{t}");
+        }
+    }
+    assert_eq!(
+        lab.images("lone")["resolved"][&only],
+        format!("{addr}/handoff/arch@{only_index}")
+    );
+    assert_eq!(lab.arches("multi"), before, "the first service as it was");
+
+    step("given the index of both, the waiting service runs");
+    lab.apply("lone", &placed("lone", &image, 2, None));
+    lab.runs("lone", &image, 2, &amd64_manifest, Some(&pinned), &id);
+    lab.delete("lone");
+    lab.delete("multi");
     step("done");
 }
