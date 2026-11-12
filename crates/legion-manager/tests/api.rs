@@ -5304,3 +5304,121 @@ async fn watch_fan_out_by_watchers() {
     }
     m.stop().await;
 }
+
+/// The web console's sign-in (DESIGN.md §3.9): a user's code, asked
+/// through a follower, is good for one session, which only a manager may
+/// start; `Me` says who the caller is and their roles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_console_code_is_good_for_one_session() {
+    use legion_proto::v1::{
+        ConsoleCodeRequest, ConsoleEndRequest, ConsoleSessionRequest, MeRequest,
+    };
+    let ca = Ca::generate().unwrap();
+    let first = Running::start_with(Some(&ca)).await;
+    first.cluster().await.init(InitRequest {}).await.unwrap();
+    let token = first
+        .cluster()
+        .await
+        .join_token(JoinTokenRequest {
+            role: "manager".into(),
+            rotate: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    let follower = Running::join(&first.addr, &token, "m2", creds(&ca, "admin", Role::Admin)).await;
+    let mut admin = first.objects().await;
+    admin
+        .apply(object("Namespace", "", "shop", serde_json::json!({})))
+        .await
+        .unwrap();
+    admin.apply(binding("shop", "alice", "edit")).await.unwrap();
+    let as_who = |who: &str, role: Role| {
+        let tls = creds(&ca, who, role);
+        let follower = &follower;
+        async move { ClusterClient::new(follower.channel(Some(&tls)).await.unwrap()) }
+    };
+    let mut alice = as_who("alice", Role::User).await;
+
+    // Who alice is.
+    let me = eventually(|| {
+        let mut alice = alice.clone();
+        async move { alice.me(MeRequest {}).await }
+    })
+    .await
+    .into_inner();
+    assert_eq!(
+        (me.name.as_str(), me.role.as_str(), me.all),
+        ("alice", "user", false)
+    );
+    assert_eq!(me.namespaces.get("shop").map(String::as_str), Some("edit"));
+    let me = as_who("admin", Role::Admin)
+        .await
+        .me(MeRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(me.all, "{me:?}");
+
+    // Her code, through the follower.
+    let code = eventually(|| {
+        let mut alice = alice.clone();
+        async move { alice.console_code(ConsoleCodeRequest::default()).await }
+    })
+    .await
+    .into_inner();
+    assert_eq!(code.code.len(), 64);
+
+    // Only a manager starts a session with it.
+    let refused = alice
+        .console_session(ConsoleSessionRequest {
+            code: code.code.clone(),
+        })
+        .await;
+    assert!(denied(refused).contains("managers only"));
+    let mut manager = as_who("m9", Role::Manager).await;
+    let session = manager
+        .console_session(ConsoleSessionRequest {
+            code: code.code.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (session.name.as_str(), session.role.as_str()),
+        ("alice", "user")
+    );
+    assert_eq!(session.session.len(), 64);
+    let hours = (session.expires_ms - code.expires_ms) / 3_600_000;
+    assert!((11..=12).contains(&hours), "{hours} h");
+
+    // Once.
+    let again = manager
+        .console_session(ConsoleSessionRequest {
+            code: code.code.clone(),
+        })
+        .await;
+    assert!(denied(again).contains("wrong, used or expired"));
+
+    // The session is in every manager's replica, and goes on sign-out.
+    let found = |m: &Running| legion_manager::console::session(&m.store, &session.session).unwrap();
+    until("the session on the follower", || found(&follower).is_some()).await;
+    assert_eq!(found(&first).unwrap().name, "alice");
+    manager
+        .console_end(ConsoleEndRequest {
+            session: session.session.clone(),
+        })
+        .await
+        .unwrap();
+    until("the session gone", || found(&follower).is_none()).await;
+
+    // Nodes do not sign in.
+    let worker = as_who("w1", Role::Worker)
+        .await
+        .console_code(ConsoleCodeRequest::default())
+        .await;
+    assert!(worker.is_err());
+    follower.stop().await;
+    first.stop().await;
+}

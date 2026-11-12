@@ -13,6 +13,7 @@ mod audit;
 mod authz;
 pub mod autolock;
 pub mod ca;
+pub mod console;
 pub mod controller;
 mod dispatcher;
 #[cfg(feature = "test-hooks")]

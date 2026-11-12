@@ -141,7 +141,61 @@ service Cluster {
   // Managers only: audit events a follower decided (the sessions it
   // serves), for the leader to keep with its own.
   rpc RecordAudit(RecordAuditRequest) returns (RecordAuditResponse);
+  // Who the caller is, and the role RoleBindings give them in each
+  // namespace (`all` for the cluster admin, who has every right).
+  rpc Me(MeRequest) returns (MeResponse);
+  // The web console's sign-in (DESIGN.md §3.9): a one-time code for the
+  // calling user or admin, good for one console session, kept 60 s.
+  rpc ConsoleCode(ConsoleCodeRequest) returns (ConsoleCodeResponse);
+  // Managers only (their console gateway): a session for a code, which
+  // is used up.
+  rpc ConsoleSession(ConsoleSessionRequest) returns (ConsoleSessionResponse);
+  // Managers only: ends a console session (sign-out).
+  rpc ConsoleEnd(ConsoleEndRequest) returns (ConsoleEndResponse);
 }
+
+message MeRequest {}
+
+message MeResponse {
+  string name = 1;
+  // "admin" or "user".
+  string role = 2;
+  // Every right, everywhere: the cluster admin.
+  bool all = 3;
+  // Namespace to role ("view", "edit", "admin"), for a user.
+  map<string, string> namespaces = 4;
+}
+
+message ConsoleCodeRequest {
+  // Set only by a manager forwarding a caller's request to the leader:
+  // who asked, and when their certificate expires (Unix ms).
+  string for_name = 1;
+  string for_role = 2;
+  int64 for_until_ms = 3;
+}
+
+message ConsoleCodeResponse {
+  string code = 1;
+  int64 expires_ms = 2;
+}
+
+message ConsoleSessionRequest {
+  string code = 1;
+}
+
+message ConsoleSessionResponse {
+  // The session's secret, for the browser's cookie.
+  string session = 1;
+  string name = 2;
+  string role = 3;
+  int64 expires_ms = 4;
+}
+
+message ConsoleEndRequest {
+  string session = 1;
+}
+
+message ConsoleEndResponse {}
 
 message AuditRequest {
   // legion_api::audit::Filter as JSON; empty for every event.

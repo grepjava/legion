@@ -612,6 +612,17 @@ impl ApiService {
         result
     }
 
+    /// Refuses any caller but a manager (or anyone, without TLS: tests).
+    fn only_managers<T>(&self, req: &Request<T>, what: &str) -> Result<(), Status> {
+        self.caller(req)?;
+        match crate::tls::caller(req, self.peer_tls.is_some())? {
+            Some(id) if id.role != Role::Manager => Err(Status::permission_denied(format!(
+                "{id} may not {what}: managers only"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     pub(crate) fn caller<T>(&self, req: &Request<T>) -> Result<Caller, Status> {
         let tls = self.peer_tls.is_some();
         // A removed manager's certificate is refused, and so is what it
@@ -1349,6 +1360,125 @@ impl Cluster for ApiService {
             crate::audit::write(self, &events).await?;
         }
         Ok(Response::new(pb::RecordAuditResponse {}))
+    }
+
+    async fn me(&self, req: Request<pb::MeRequest>) -> Result<Response<pb::MeResponse>, Status> {
+        let caller = self.caller(&req)?;
+        let id = crate::tls::caller(&req, self.peer_tls.is_some())?;
+        let (name, role) = match &id {
+            Some(id) => (id.name.clone(), id.role.as_str().to_owned()),
+            None => (String::new(), "admin".to_owned()),
+        };
+        let roles = caller.roles(&self.store)?;
+        Ok(Response::new(pb::MeResponse {
+            name,
+            role,
+            all: roles.is_none(),
+            namespaces: roles
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(ns, r)| (ns, r.to_string()))
+                .collect(),
+        }))
+    }
+
+    async fn console_code(
+        &self,
+        req: Request<pb::ConsoleCodeRequest>,
+    ) -> Result<Response<pb::ConsoleCodeResponse>, Status> {
+        let tls = self.peer_tls.is_some();
+        self.caller(&req)?;
+        let id = crate::tls::caller(&req, tls)?
+            .ok_or_else(|| Status::failed_precondition("the console needs TLS"))?;
+        let audit = self.audit_point(
+            &req,
+            "console-code",
+            crate::audit::target("User", "", &id.name),
+        );
+        let result = async {
+            // Who asked: a person with their own certificate, or one a
+            // manager forwards for, as it says.
+            let (name, role, until_ms) = match id.role {
+                Role::Admin | Role::User => {
+                    let until = req
+                        .peer_certs()
+                        .and_then(|c| c.first().cloned())
+                        .and_then(|der| legion_pki::validity(&legion_pki::cert_pem(&der)).ok())
+                        .map(|(to, _)| crate::console::ms(to))
+                        .ok_or_else(|| Status::unauthenticated("no client certificate"))?;
+                    (id.name.clone(), id.role.as_str().to_owned(), until)
+                }
+                Role::Manager if !req.get_ref().for_name.is_empty() => {
+                    let r = req.get_ref();
+                    (r.for_name.clone(), r.for_role.clone(), r.for_until_ms)
+                }
+                _ => {
+                    return Err(Status::permission_denied(format!(
+                        "{id} may not sign in to the console"
+                    )));
+                }
+            };
+            if !matches!(role.as_str(), "admin" | "user") {
+                return Err(Status::invalid_argument("the role is `admin` or `user`"));
+            }
+            if let Some(addr) = self.leader_addr(&req)? {
+                let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                    &addr,
+                    self.peer_tls.as_ref(),
+                ));
+                return c
+                    .console_code(forwarded(pb::ConsoleCodeRequest {
+                        for_name: name,
+                        for_role: role,
+                        for_until_ms: until_ms,
+                    }))
+                    .await;
+            }
+            self.consistent().await?;
+            let (code, expires_ms) = crate::console::new_code(self, &name, &role, until_ms).await?;
+            Ok(Response::new(pb::ConsoleCodeResponse { code, expires_ms }))
+        }
+        .await;
+        self.audit_end(audit, result)
+    }
+
+    async fn console_session(
+        &self,
+        req: Request<pb::ConsoleSessionRequest>,
+    ) -> Result<Response<pb::ConsoleSessionResponse>, Status> {
+        self.only_managers(&req, "start console sessions")?;
+        if let Some(addr) = self.leader_addr(&req)? {
+            let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                &addr,
+                self.peer_tls.as_ref(),
+            ));
+            return c.console_session(forwarded(req.into_inner())).await;
+        }
+        self.consistent().await?;
+        let (session, signed) = crate::console::redeem(self, &req.get_ref().code).await?;
+        tracing::info!(name = %signed.name, role = %signed.role, "a console session began");
+        Ok(Response::new(pb::ConsoleSessionResponse {
+            session,
+            name: signed.name,
+            role: signed.role,
+            expires_ms: signed.expires_ms,
+        }))
+    }
+
+    async fn console_end(
+        &self,
+        req: Request<pb::ConsoleEndRequest>,
+    ) -> Result<Response<pb::ConsoleEndResponse>, Status> {
+        self.only_managers(&req, "end console sessions")?;
+        if let Some(addr) = self.leader_addr(&req)? {
+            let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                &addr,
+                self.peer_tls.as_ref(),
+            ));
+            return c.console_end(forwarded(req.into_inner())).await;
+        }
+        crate::console::end(self, &req.get_ref().session).await?;
+        Ok(Response::new(pb::ConsoleEndResponse {}))
     }
 
     type BackupStream = ReceiverStream<Result<pb::BackupChunk, Status>>;
