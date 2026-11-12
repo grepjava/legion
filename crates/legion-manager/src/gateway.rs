@@ -234,11 +234,15 @@ fn cookie(headers: &HeaderMap) -> Option<String> {
 
 /// Refuses a request from another site's page: its `Origin` must be this
 /// host. (The cookie is `SameSite=Strict` too; this covers WebSockets.)
-fn same_origin(headers: &HeaderMap) -> Result<(), Refused> {
+/// HTTP/2 has no `Host` header: the host is the URI's authority there.
+fn same_origin(headers: &HeaderMap, uri: &Uri) -> Result<(), Refused> {
     let Some(origin) = headers.get(header::ORIGIN) else {
         return Ok(());
     };
-    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok());
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .or_else(|| uri.authority().map(|a| a.as_str()));
     let origin_host = origin
         .to_str()
         .ok()
@@ -320,9 +324,10 @@ struct LoginBody {
 async fn login(
     State(g): State<Gateway>,
     headers: HeaderMap,
+    uri: Uri,
     Json(body): Json<LoginBody>,
 ) -> Result<Response, Refused> {
-    same_origin(&headers)?;
+    same_origin(&headers, &uri)?;
     let s = ClusterClient::new(g.manager())
         .console_session(pb::ConsoleSessionRequest { code: body.code })
         .await?
@@ -343,8 +348,12 @@ async fn login(
     Ok(res)
 }
 
-async fn logout(State(g): State<Gateway>, headers: HeaderMap) -> Result<Response, Refused> {
-    same_origin(&headers)?;
+async fn logout(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Response, Refused> {
+    same_origin(&headers, &uri)?;
     if let Some(session) = cookie(&headers) {
         g.0.users.lock().unwrap().remove(&session);
         ClusterClient::new(g.manager())
@@ -476,11 +485,12 @@ struct WatchFrom {
 async fn watch(
     State(g): State<Gateway>,
     headers: HeaderMap,
+    uri: Uri,
     Path(kind): Path<String>,
     Query(from): Query<WatchFrom>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, Refused> {
-    same_origin(&headers)?;
+    same_origin(&headers, &uri)?;
     let (_, channel) = g.user(&headers).await?;
     let stream = ObjectsClient::new(channel)
         .max_decoding_message_size(crate::MAX_MESSAGE)
@@ -605,29 +615,54 @@ mod tests {
 
     #[test]
     fn another_sites_page_is_refused() {
+        // HTTP/1.1: a path in the URI, the host in Host.
+        let path = Uri::from_static("/api/login");
         let mut h = HeaderMap::new();
         h.insert(
             header::HOST,
             HeaderValue::from_static("console.example:7480"),
         );
         assert!(
-            same_origin(&h).is_ok(),
+            same_origin(&h, &path).is_ok(),
             "no Origin: not a browser's cross-site request"
         );
         h.insert(
             header::ORIGIN,
             HeaderValue::from_static("https://console.example:7480"),
         );
-        assert!(same_origin(&h).is_ok());
+        assert!(same_origin(&h, &path).is_ok());
         h.insert(
             header::ORIGIN,
             HeaderValue::from_static("https://evil.example"),
         );
-        assert!(same_origin(&h).is_err());
+        assert!(same_origin(&h, &path).is_err());
         h.insert(
             header::ORIGIN,
             HeaderValue::from_static("http://console.example:7480"),
         );
-        assert!(same_origin(&h).is_err(), "plain HTTP is another origin");
+        assert!(
+            same_origin(&h, &path).is_err(),
+            "plain HTTP is another origin"
+        );
+    }
+
+    #[test]
+    fn over_http2_the_host_is_the_uris_authority() {
+        let uri = Uri::from_static("https://console.example:7480/api/login");
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://console.example:7480"),
+        );
+        assert!(same_origin(&h, &uri).is_ok());
+        h.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        );
+        assert!(same_origin(&h, &uri).is_err());
+        assert!(
+            same_origin(&h, &Uri::from_static("/api/login")).is_err(),
+            "no host at all"
+        );
     }
 }
