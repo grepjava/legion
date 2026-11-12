@@ -182,11 +182,21 @@ fn the_ca_rotates_with_every_node_on_it() {
     assert_ne!(token, old_token);
 
     step("each node holds the new CA alone");
+    // A manager drops the old one when it next reads the record, a worker
+    // when a heartbeat next tells it the managers have.
     for node in ["n2", "n3"] {
-        let out = lab.on(node, &format!("cat {VM_DATA}/pki/ca.crt"));
-        let pem = text(&out.stdout);
+        let mut pem = String::new();
+        let alone = (0..30).any(|_| {
+            pem = text(&lab.on(node, &format!("cat {VM_DATA}/pki/ca.crt")).stdout);
+            let certs = legion_pki::split_certs(&pem);
+            if certs.len() == 1 {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            false
+        });
+        assert!(alone, "{node} still trusts more than the new CA: {pem}");
         let certs = legion_pki::split_certs(&pem);
-        assert_eq!(certs.len(), 1, "{node}: {pem}");
         assert_eq!(legion_pki::digest(&certs[0]).unwrap(), new, "{node}");
     }
 
