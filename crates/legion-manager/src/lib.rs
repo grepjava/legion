@@ -14,6 +14,8 @@ mod authz;
 pub mod autolock;
 pub mod ca;
 pub mod console;
+mod gateway;
+pub use gateway::Console;
 pub mod controller;
 mod dispatcher;
 #[cfg(feature = "test-hooks")]
@@ -92,6 +94,8 @@ pub struct ManagerConfig {
     pub protocol: legion_api::protocol::Protocol,
     /// How long audit events are kept, and how many at most.
     pub audit: audit::Retention,
+    /// Serve the web console (`--console-listen`): none by default.
+    pub console: Option<gateway::Console>,
 }
 
 impl ManagerConfig {
@@ -113,6 +117,7 @@ impl ManagerConfig {
             insecure_registries: Vec::new(),
             protocol: legion_api::protocol::Protocol::current(),
             audit: audit::Retention::default(),
+            console: None,
         }
     }
 }
@@ -178,6 +183,7 @@ pub struct Manager {
     metrics: metrics::Slot,
     /// The requests it has answered, for the metrics.
     requests: std::sync::Arc<requests::Requests>,
+    console: Option<gateway::Console>,
 }
 
 impl Manager {
@@ -237,6 +243,7 @@ impl Manager {
             acme_loopback: config.acme_loopback,
             registry_loopback: config.registry_loopback,
             insecure_registries: config.insecure_registries,
+            console: config.console,
             protocol: config.protocol,
             speaking,
             heard,
@@ -299,6 +306,11 @@ impl Manager {
             )
             .into());
         }
+        // Bound first: a console that cannot listen stops the start.
+        let console = match &self.console {
+            Some(c) => Some((gateway::bind(c).await?, c.clone())),
+            None => None,
+        };
         let (closing_tx, closing) = tokio::sync::watch::channel(false);
         let usage: std::sync::Arc<usage::Usage> = Default::default();
         let floor = tokio::spawn(upgrade::run(
@@ -382,6 +394,8 @@ impl Manager {
             ca_seen: Default::default(),
         };
         let names = tokio::spawn(managers::run(api.clone(), api.closing.clone()));
+        let console = console
+            .map(|(listener, config)| tokio::spawn(gateway::run(listener, config, api.clone())));
         let rotation = tokio::spawn(ca::run(api.clone(), api.closing.clone()));
         let demotion = tokio::spawn(roles::follow(
             api.clone(),
@@ -493,6 +507,9 @@ impl Manager {
         let _ = promote.await;
         let _ = floor.await;
         let _ = names.await;
+        if let Some(console) = console {
+            let _ = console.await;
+        }
         let _ = rotation.await;
         let _ = demotion.await;
         let _ = auditing.await;

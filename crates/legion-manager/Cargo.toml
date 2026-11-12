@@ -8,15 +8,17 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
 http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
 hyper-rustls.workspace = true
-hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2", "tokio"] }
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2", "server-auto", "service", "tokio"] }
 instant-acme.workspace = true
 legion-api.workspace = true
+legion-console.workspace = true
 legion-image.workspace = true
 legion-net.workspace = true
 legion-pki.workspace = true
@@ -43,7 +45,7 @@ test-hooks = []
 [dev-dependencies]
 # Its own integration tests get the pause points.
 legion-manager = { path = ".", features = ["test-hooks"] }
-hyper = { workspace = true, features = ["http1", "server"] }
+hyper = { workspace = true, features = ["client", "http1", "server"] }
 rcgen.workspace = true
 legion-pki.workspace = true
 serde_yaml_ng.workspace = true
