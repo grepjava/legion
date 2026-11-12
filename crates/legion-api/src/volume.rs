@@ -274,6 +274,12 @@ pub struct VolumeStatus {
     /// migrator has each drop it, and forgets the node once it has.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub leftovers: Vec<String>,
+    /// The node its data was on, removed from the cluster: the data went
+    /// with it. No task uses the Volume again until it is restored
+    /// (`legion volume restore --replace`) or deleted to start empty; a new
+    /// node joining under that name is not where the data is.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lost: String,
 }
 
 /// A Volume's data moving to another node: copied whole while its tasks

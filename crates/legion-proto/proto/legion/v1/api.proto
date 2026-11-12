@@ -230,6 +230,9 @@ message VolumeRestoreStart {
   string node = 3;
   // The backup's header, as `Backup` sent it.
   string header_json = 4;
+  // Restore into the Volume of that name, lost with its node (its
+  // status.lost), keeping it and what uses it; refused for any other.
+  bool replace = 5;
 }
 
 message VolumeRestoreResponse {}
