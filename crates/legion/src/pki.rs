@@ -341,6 +341,65 @@ impl Pki {
         rename(&cert, &self.path("ca.crt"))
     }
 
+    /// A worker promoted: its manager certificate, the CAs and the CA key,
+    /// as a manager joining would have them. The daemon starts again as
+    /// a manager on them, its store empty and filled from the others.
+    pub fn write_promoted(
+        &self,
+        cert_pem: &str,
+        key_pem: &str,
+        ca_pem: &str,
+        ca_key_pem: &str,
+    ) -> anyhow::Result<()> {
+        self.write_joined(&legion_manager::Joined {
+            role: Role::Manager,
+            tls: legion_manager::Tls {
+                ca_pem: ca_pem.to_owned(),
+                cert_pem: cert_pem.to_owned(),
+                key_pem: key_pem.to_owned(),
+                ca_key_pem: Some(ca_key_pem.to_owned()),
+            },
+        })
+    }
+
+    /// A manager demoted: a worker's credentials and its managers, and
+    /// nothing of a manager left. The CA key, the store's key and the
+    /// store go (set aside, as a restore does), so do its Raft id and the
+    /// admin bundle; its WireGuard key moves to where a worker's agent
+    /// keeps it, so its peers know it as before.
+    pub fn write_demoted(
+        &self,
+        data_dir: &Path,
+        demoted: &legion_manager::roles::Demoted,
+    ) -> anyhow::Result<()> {
+        if let Some(key) = self.read_secret(WIREGUARD_KEY)? {
+            write_private(&data_dir.join(WIREGUARD_KEY), &key)?;
+        }
+        write_public(&self.path("ca.crt"), &demoted.ca_pem)?;
+        write_private(&self.path(NEXT_KEY), &demoted.key_pem)?;
+        write_public(&self.path(NEXT_CERT), &demoted.cert_pem)?;
+        self.finish_renewal()?;
+        write_public(&self.path("role"), "worker\n")?;
+        for f in ["ca.key", "node.key", "store.key", WIREGUARD_KEY] {
+            remove(&self.sealed_path(f))?;
+        }
+        for f in ["ca.key", "store.key", WIREGUARD_KEY] {
+            remove(&self.path(f))?;
+        }
+        write_managers(data_dir, &demoted.managers)?;
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        for f in ["store.redb", "node-id"] {
+            let from = data_dir.join(f);
+            if from.exists() {
+                rename(&from, &data_dir.join(format!("{f}.demoted-{stamp}")))?;
+            }
+        }
+        remove(&data_dir.join(ADMIN_BUNDLE))
+    }
+
     /// Stores what joining a cluster gave the node.
     pub fn write_joined(&self, joined: &legion_manager::Joined) -> anyhow::Result<()> {
         private_dir(&self.dir)?;

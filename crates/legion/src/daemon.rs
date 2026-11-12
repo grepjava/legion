@@ -112,6 +112,8 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         manager.store().clone(),
         pki.clone(),
     ));
+    let demoted = manager.demoted();
+    let pki_after = pki.clone();
     let rotation = manager.authority().map(|authority| {
         tokio::spawn(crate::ca::follow(
             manager.store().clone(),
@@ -176,21 +178,32 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
             crate::metrics::collect(Some(manager.metrics()), agent_metrics),
         ))
     });
-    let shutdown = async move {
-        crate::shutdown_signal().await;
-        let _ = stop.send(true);
-        if let Some(task) = agent_task {
-            let _ = task.await;
+    let demoting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown = {
+        let demoting = demoting.clone();
+        let mut demoted = demoted.clone();
+        async move {
+            tokio::select! {
+                _ = crate::shutdown_signal() => {}
+                // Demoted: stopped to start again as a worker.
+                _ = demoted.wait_for(Option::is_some) => {
+                    demoting.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _ = stop.send(true);
+            if let Some(task) = agent_task {
+                let _ = task.await;
+            }
+            // It holds a store handle as well, and the store closes only once
+            // every handle is gone: it must end before serving does.
+            autolock.abort();
+            let _ = autolock.await;
+            if let Some(r) = rotation {
+                r.abort();
+                let _ = r.await;
+            }
+            renewal.abort();
         }
-        // It holds a store handle as well, and the store closes only once
-        // every handle is gone: it must end before serving does.
-        autolock.abort();
-        let _ = autolock.await;
-        if let Some(r) = rotation {
-            r.abort();
-            let _ = r.await;
-        }
-        renewal.abort();
     };
     let served = manager
         .serve(listener, shutdown)
@@ -199,7 +212,84 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     if let Some(metrics) = metrics {
         metrics.abort();
     }
-    served
+    served?;
+    if demoting.load(std::sync::atomic::Ordering::SeqCst)
+        && let Some(d) = demoted.borrow().clone()
+    {
+        pki_after
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .write_demoted(&opts.data_dir, &d)
+            .context("writing the worker's credentials")?;
+        tracing::info!("demoted: starting again as a worker");
+        return Err(start_again());
+    }
+    Ok(())
+}
+
+/// Starts this daemon again, in the role its data directory now says, with
+/// the arguments it was started with; returns only if that fails. Its pods
+/// run on and are adopted.
+fn start_again() -> anyhow::Error {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(e) => return anyhow::anyhow!("starting again in the new role: {e}"),
+        };
+        let e = std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .exec();
+        anyhow::anyhow!("starting again in the new role: {e}")
+    }
+    #[cfg(not(unix))]
+    anyhow::anyhow!("starting again in the new role: Unix only")
+}
+
+/// A worker's half of a promotion: once its heartbeats ask it to become a
+/// manager, it asks to be certified as one and writes what it got. Retries
+/// until it has; returns once written.
+async fn promote_when_asked(data_dir: std::path::PathBuf, advertise: String, control: GrpcControl) {
+    let mut wanted = control.wanted_role();
+    loop {
+        if wanted.wait_for(|r| r == "manager").await.is_err() {
+            return std::future::pending().await;
+        }
+        match promote_once(&data_dir, &advertise, &control).await {
+            Ok(()) => return,
+            Err(e) => tracing::warn!("asking to be promoted: {e:#}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    }
+}
+
+async fn promote_once(
+    data_dir: &Path,
+    advertise: &str,
+    control: &GrpcControl,
+) -> anyhow::Result<()> {
+    let node_id = legion_manager::node_id(data_dir).map_err(|e| anyhow::anyhow!(e))?;
+    let (key_pem, csr_pem) = legion_pki::request()?;
+    let protocol = legion_api::protocol::Protocol::current();
+    let r = control
+        .promote(legion_proto::v1::PromoteRequest {
+            csr_pem,
+            node_id,
+            advertise: advertise.to_owned(),
+            protocol: protocol.speaks,
+            oldest_protocol: protocol.oldest,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    crate::pki::Pki::new(data_dir).write_promoted(
+        &r.cert_pem,
+        &key_pem,
+        &r.ca_pem,
+        &r.ca_key_pem,
+    )?;
+    tracing::info!(node_id, %advertise, "promoted: starting again as a manager");
+    Ok(())
 }
 
 /// A worker node: the agent alone, calling the cluster's managers.
@@ -257,7 +347,12 @@ async fn run_worker(opts: &Options, pki: &crate::pki::Pki, hostname: String) -> 
         ))
     });
     tracing::info!(%node, "worker running");
-    crate::shutdown_signal().await;
+    // As a manager, it is reached where its API listens.
+    let manager_advertise = manager_address(opts.advertise.as_deref(), opts.listen);
+    let promoted = tokio::select! {
+        _ = crate::shutdown_signal() => false,
+        _ = promote_when_asked(opts.data_dir.clone(), manager_advertise, control.clone()) => true,
+    };
     renewal.abort();
     let _ = stop.send(true);
     let _ = agent.task.await;
@@ -265,7 +360,11 @@ async fn run_worker(opts: &Options, pki: &crate::pki::Pki, hostname: String) -> 
         metrics.abort();
     }
     // The managers the agent learned of, for the next start.
-    crate::pki::write_managers(&opts.data_dir, &control.managers())
+    crate::pki::write_managers(&opts.data_dir, &control.managers())?;
+    if promoted {
+        return Err(start_again());
+    }
+    Ok(())
 }
 
 /// `legion join`: certifies this node with the cluster and stores its

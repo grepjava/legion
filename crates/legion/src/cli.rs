@@ -630,6 +630,25 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             println!("{kind}/{name} deleted (version {})", resp.version);
         }
         Command::Node {
+            command:
+                ref command @ (crate::NodeCommand::Promote { ref node }
+                | crate::NodeCommand::Demote { ref node }),
+        } => {
+            let role = match command {
+                crate::NodeCommand::Promote { .. } => "manager",
+                _ => "worker",
+            };
+            cluster
+                .change_role(pb::ChangeRoleRequest {
+                    node: node.clone(),
+                    role: role.to_owned(),
+                })
+                .await?;
+            println!(
+                "node {node} becomes a {role}: its daemon takes it up and starts again (`legion list nodes` shows its role)"
+            );
+        }
+        Command::Node {
             command: crate::NodeCommand::Label { node, labels },
         } => {
             let changes = labels
@@ -681,7 +700,9 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 crate::NodeCommand::Drain { node, .. } => ("drain", node),
                 crate::NodeCommand::Pause { node } => ("pause", node),
                 crate::NodeCommand::Activate { node } => ("active", node),
-                crate::NodeCommand::Label { .. } => unreachable!("handled above"),
+                crate::NodeCommand::Label { .. }
+                | crate::NodeCommand::Promote { .. }
+                | crate::NodeCommand::Demote { .. } => unreachable!("handled above"),
             };
             let r#ref = ObjectRef {
                 kind: Kind::Node.to_string(),

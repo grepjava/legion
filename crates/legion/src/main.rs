@@ -443,6 +443,14 @@ pub enum NodeCommand {
     Pause { node: String },
     /// Undo a drain or a pause.
     Activate { node: String },
+    /// Make a worker a manager, in place: its daemon takes it up within a
+    /// heartbeat or two and starts again as a manager, its tasks running
+    /// on. It joins Raft as a learner and votes once caught up.
+    Promote { node: String },
+    /// Make a manager a worker, in place: it leaves the Raft membership
+    /// (never the last voter), gives up the CA key and its store, and its
+    /// daemon starts again as a worker, its tasks running on.
+    Demote { node: String },
     /// Set labels (`key=value`) or remove them (`key-`), for placement
     /// constraints and preferences; `legion.ingress=true` marks a node
     /// that serves HTTPS routes (see the README).
