@@ -23,10 +23,27 @@ struct Response {
     text: String,
 }
 
-/// One HTTPS request to the console at `addr`, trusting the cluster CA.
+/// One HTTPS request to the console at `addr`, trusting the cluster CA,
+/// over HTTP/1.1.
 async fn https(
     ca: &Ca,
     addr: &str,
+    method: &str,
+    path: &str,
+    cookie: Option<&str>,
+    origin: Option<&str>,
+    body: Option<serde_json::Value>,
+) -> Response {
+    request(ca, addr, false, method, path, cookie, origin, body).await
+}
+
+/// One HTTPS request, over HTTP/2 when `h2` (as browsers speak to the
+/// console): the host is then the URI's authority, with no `Host` header.
+#[allow(clippy::too_many_arguments)]
+async fn request(
+    ca: &Ca,
+    addr: &str,
+    h2: bool,
     method: &str,
     path: &str,
     cookie: Option<&str>,
@@ -37,26 +54,35 @@ async fn https(
     roots
         .add(der(ca.cert_pem()).into())
         .expect("the CA certificate");
-    let config = tokio_rustls::rustls::ClientConfig::builder_with_provider(Arc::new(
+    let mut config = tokio_rustls::rustls::ClientConfig::builder_with_provider(Arc::new(
         tokio_rustls::rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .unwrap()
     .with_root_certificates(roots)
     .with_no_client_auth();
+    config.alpn_protocols = vec![if h2 {
+        b"h2".to_vec()
+    } else {
+        b"http/1.1".to_vec()
+    }];
     let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
     let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
         .connect(ServerName::try_from(legion_pki::SERVER_NAME).unwrap(), tcp)
         .await
         .unwrap();
-    let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls))
-        .await
-        .unwrap();
-    tokio::spawn(conn);
-    let mut req = hyper::Request::builder()
-        .method(method)
-        .uri(path)
-        .header("host", addr);
+    assert_eq!(
+        tls.get_ref().1.alpn_protocol(),
+        Some(if h2 { &b"h2"[..] } else { &b"http/1.1"[..] }),
+        "the console speaks what was asked"
+    );
+    let io = hyper_util::rt::TokioIo::new(tls);
+    let mut req = hyper::Request::builder().method(method);
+    if h2 {
+        req = req.uri(format!("https://{addr}{path}"));
+    } else {
+        req = req.uri(path).header("host", addr);
+    }
     if let Some(c) = cookie {
         req = req.header("cookie", c);
     }
@@ -70,7 +96,19 @@ async fn https(
         }
         None => Full::new(Bytes::new()),
     };
-    let res = send.send_request(req.body(body).unwrap()).await.unwrap();
+    let req = req.body(body).unwrap();
+    let res = if h2 {
+        let (mut send, conn) =
+            hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+                .await
+                .unwrap();
+        tokio::spawn(conn);
+        send.send_request(req).await.unwrap()
+    } else {
+        let (mut send, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+        tokio::spawn(conn);
+        send.send_request(req).await.unwrap()
+    };
     let status = res.status().as_u16();
     let cookie = res
         .headers()
@@ -220,14 +258,30 @@ async fn the_console_calls_the_api_as_its_user() {
         .unwrap()
         .into_inner()
         .code;
-    let login = |code: &str, origin: Option<&'static str>| {
+    let login = |code: &str, h2: bool, origin: Option<String>| {
         let (ca, console) = (&ca, &console);
         let body = serde_json::json!({ "code": code });
-        async move { https(ca, console, "POST", "/api/login", None, origin, Some(body)).await }
+        async move {
+            request(
+                ca,
+                console,
+                h2,
+                "POST",
+                "/api/login",
+                None,
+                origin.as_deref(),
+                Some(body),
+            )
+            .await
+        }
     };
-    let other = login(&code, Some("https://evil.example")).await;
-    assert_eq!(other.status, 403, "another site's page: {}", other.text);
-    let signed = login(&code, None).await;
+    for h2 in [false, true] {
+        let other = login(&code, h2, Some("https://evil.example".into())).await;
+        assert_eq!(other.status, 403, "another site's page: {}", other.text);
+        assert!(other.text.contains("cross-origin"), "{}", other.text);
+    }
+    // As a browser signs in: over HTTP/2, from the console's own page.
+    let signed = login(&code, true, Some(format!("https://{console}"))).await;
     assert_eq!(signed.status, 200, "{}", signed.text);
     assert_eq!(signed.body["name"], "alice");
     let set = signed.cookie.expect("a session cookie");
@@ -235,7 +289,11 @@ async fn the_console_calls_the_api_as_its_user() {
         assert!(set.contains(attr), "{set}");
     }
     let session = set.split(';').next().unwrap().to_owned();
-    assert_eq!(login(&code, None).await.status, 403, "a code works once");
+    assert_eq!(
+        login(&code, false, None).await.status,
+        403,
+        "a code works once"
+    );
 
     // As alice: who she is, what she may read, and nothing more.
     let me = call("GET", "/api/me", Some(session.clone())).await;
@@ -275,6 +333,12 @@ async fn the_console_calls_the_api_as_its_user() {
     assert!(vault.body["error"].as_str().unwrap().contains("alice"));
     let nodes = call("GET", "/api/objects/Node", Some(session.clone())).await;
     assert_eq!(nodes.status, 403, "cluster-scoped: {}", nodes.text);
+    // What tasks use now: hers, never another namespace's.
+    let used = call("GET", "/api/usage?namespace=shop", Some(session.clone())).await;
+    assert_eq!(used.status, 200, "{}", used.text);
+    assert!(used.body["nodes"].is_array(), "{}", used.text);
+    let theirs = call("GET", "/api/usage?namespace=bank", Some(session.clone())).await;
+    assert_eq!(theirs.status, 403, "{}", theirs.text);
     let kinds = call("GET", "/api/kinds", Some(session.clone())).await;
     assert!(kinds.body.as_array().unwrap().len() >= 13);
     let headers_page = call("GET", "/api/nothing", Some(session.clone())).await;

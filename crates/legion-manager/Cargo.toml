@@ -45,7 +45,7 @@ test-hooks = []
 [dev-dependencies]
 # Its own integration tests get the pause points.
 legion-manager = { path = ".", features = ["test-hooks"] }
-hyper = { workspace = true, features = ["client", "http1", "server"] }
+hyper = { workspace = true, features = ["client", "http1", "http2", "server"] }
 rcgen.workspace = true
 legion-pki.workspace = true
 serde_yaml_ng.workspace = true
