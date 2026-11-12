@@ -182,6 +182,9 @@ pub struct GrpcControl {
     conn: Arc<Mutex<Conn>>,
     /// The cluster's CAs as the last heartbeat gave them.
     ca: Arc<watch::Sender<Option<CaAdvice>>>,
+    /// The role the last heartbeat asked this node to take ("manager"),
+    /// empty when none.
+    role: Arc<watch::Sender<String>>,
 }
 
 /// The CAs the cluster trusts, the issuing one first, and that one's
@@ -223,7 +226,23 @@ impl GrpcControl {
                 channel,
             })),
             ca: Arc::new(watch::channel(None).0),
+            role: Arc::new(watch::channel(String::new()).0),
         })
+    }
+
+    /// The role heartbeats ask this node to take: "manager" for a worker
+    /// asked to become one (`legion node promote`), else empty.
+    pub fn wanted_role(&self) -> watch::Receiver<String> {
+        self.role.subscribe()
+    }
+
+    /// This worker, asked to become a manager, certified as one for the key
+    /// `req.csr_pem` was made with, and added to Raft as a learner.
+    pub async fn promote(
+        &self,
+        req: legion_proto::v1::PromoteRequest,
+    ) -> Result<legion_proto::v1::PromoteResponse, ControlError> {
+        self.call(|mut c| async move { c.promote(req).await }).await
     }
 
     /// The cluster's CAs as heartbeats give them; `None` until one does
@@ -752,6 +771,11 @@ impl Control for GrpcControl {
             .call(|mut c| async move { c.heartbeat(req).await })
             .await?;
         self.set_managers(resp.managers);
+        self.role.send_if_modified(|now| {
+            let changed = *now != resp.role;
+            now.clone_from(&resp.role);
+            changed
+        });
         if !resp.trust_pem.is_empty() && !resp.issuer.is_empty() {
             let advice = CaAdvice {
                 trust_pem: resp.trust_pem,
