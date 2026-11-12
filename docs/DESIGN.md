@@ -628,6 +628,55 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   its join, its Raft calls and its start. So an upgrade can't be undone
   once every manager has run the new build together.
 
+### 3.9 Web console
+
+Planned (CONSOLE.md, phase 0). A manager serves it with
+`--console-listen <addr>`; nothing listens without the flag. It is a
+client of the API like the CLI, and is in the manager only so that one
+binary serves it.
+
+- **Frontend.** A Svelte app, on Svelte's latest release, built with
+  SvelteKit's static adapter as a single-page app in TypeScript. Its
+  output is embedded in the binary at build time (`crates/legion-console`,
+  `include_bytes!`), so Node is needed to build it, never to run it, and
+  the port packages nothing new. A build without the assets (Node
+  absent) serves a page saying so, and everything else is unchanged.
+- **Gateway.** HTTPS on `--console-listen`, with the manager's own
+  certificate unless `--console-cert`/`--console-key` name another (a
+  browser trusts neither the cluster CA nor its server name). axum, on
+  the hyper stack the manager already runs. JSON over HTTP for unary
+  calls; a WebSocket each for `Watch`, logs and `Pods.Session` (exec).
+  The gateway translates; it decides nothing itself.
+- **The user's own identity, on every call.** For each signed-in
+  session the gateway holds a short-lived client certificate it issued
+  for the user's identity (a new key, in memory only, never in the store
+  or on disk; 1 h, renewed while the session lives), and calls the local
+  manager's gRPC port over mutual TLS with it. So the API checks the
+  console's calls exactly as the CLI's: RBAC, the RoleBinding revocation
+  that ends sessions and watches within 5 s, forwarding to the leader,
+  audit under the user's name. There is no in-process path that skips
+  the TLS identity.
+- **Sign-in.** `legion console login` (the user's CLI, with their
+  certificate) asks the manager for a one-time code bound to their
+  identity (`Cluster.ConsoleCode`: 60 s, one use) and prints the
+  console's URL with it. The browser exchanges the code for a session.
+  No private key ever leaves the user's machine, and the browser never
+  holds one. Single sign-on (OIDC) comes later (CONSOLE.md phase 6),
+  mapped onto the same identities.
+- **Sessions.** Kept in the replicated store (`legion-system`, a kind no
+  caller lists), so any manager's console takes the session; the
+  browser holds only its id, in an `HttpOnly`, `Secure`,
+  `SameSite=Strict` cookie. A session ends on sign-out, after 12 h idle,
+  when the user's certificate would have expired, or when the user is
+  revoked (their last RoleBinding gone). A session's certificate is
+  never renewed past that.
+- **Writes.** Each carries the session's CSRF token in a header; the
+  gateway refuses requests from another origin. Destructive actions
+  confirm in the page; the API decides and audits as for the CLI.
+- **Out of the gateway.** Anything the API does not offer. A console page
+  is a view of the API, so a feature reaches the API, then the CLI, then
+  the console.
+
 ## 4. Feature set
 
 ### 4.1 From Swarm (kept)

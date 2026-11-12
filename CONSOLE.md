@@ -36,15 +36,17 @@ API first, then the CLI and the console.
 
 ## Phase 0: design notes
 
-Decide the two things that are hard to change later, in DESIGN.md:
+Decide the two things that are hard to change later, in DESIGN.md (§3.9, written):
 
 1. **Sign-in.** Users today are certificates (`legion user create`).
    Browsers handle client certificates badly, so the console signs users
    in and keeps a session:
-   - A user signs in with their existing credentials file (the PEM the
-     CLI uses, uploaded once and checked by the gateway) or with a
-     one-time code from `legion console login`, which prints a URL for
-     the CLI's current identity.
+   - A user signs in with a one-time code from `legion console login`,
+     which the CLI asks for with the user's certificate and prints as a
+     URL. No private key leaves the user's machine. The gateway then
+     calls the API as that user, over mutual TLS, with a short-lived
+     certificate it issues for their identity and keeps in memory, so
+     RBAC, revocation and audit apply as for the CLI.
    - The session is an HTTP-only, `SameSite=Strict` cookie naming a
      server-side session in the replicated store, bound to the user's
      identity and expiring with their certificate or after 12 h idle.
