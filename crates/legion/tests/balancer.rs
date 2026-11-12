@@ -107,8 +107,14 @@ fn a_load_balancer_address_answers_and_moves() {
     let file = lab.dir.join("web.yaml");
     std::fs::write(&file, app(&address)).unwrap();
     lab.ok(&["apply", "-f", file.to_str().unwrap()]);
+    // Asked from a VM not holding the address: pf's `rdr` is not for a
+    // host's own traffic, as with published ports.
     let answer = |lab: &Lab| {
-        let out = lab.on("n2", &format!("nc -N -w 5 {address} 80 </dev/null"));
+        let from = match master(lab, &iface).as_deref() {
+            Some("n2") => "n3",
+            _ => "n2",
+        };
+        let out = lab.on(from, &format!("nc -N -w 5 {address} 80 </dev/null"));
         text(&out.stdout).trim().to_owned()
     };
     wait("web answering at the address", 600, || {

@@ -894,9 +894,10 @@ this was verified in a 3-node lab (S3).
   down drops out of the ranking and gives the address up. The `vhid` must
   be unique on the network: not the managers', nor another service's.
 - `endpoint: dnsrr` skips the VIP: DNS returns task IPs directly.
-- Host processes cannot reach VIPs or published ports via the host's own address
-  (pf `rdr` does not apply to locally generated traffic). They use DNS
-  round-robin names instead.
+- Host processes cannot reach VIPs or published ports via the host's own address,
+  nor a load balancer address on the node holding it (pf `rdr` does not
+  apply to locally generated traffic). They use DNS round-robin names
+  instead.
 
 ### 5.5 DNS
 
