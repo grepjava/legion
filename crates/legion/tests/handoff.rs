@@ -1503,8 +1503,57 @@ fn a_jailer_image_goes_from_build_to_recovery() {
 
 /// The arm64 half of [`a_jailer_index_runs_each_nodes_platform`]: built by
 /// jailer on FreeBSD aarch64 from `FROM scratch` and an `/arch` saying
-/// `arm64`, and exported; see `fixtures/README.md`. It never runs here.
+/// `arm64`, and exported; see `fixtures/README.md`. It never runs here,
+/// nor goes into a store here: the test puts it in the registry.
 const ARM64: &[u8] = include_bytes!("fixtures/jailer-arch-arm64.tar");
+
+/// Pushes the image an OCI `archive` holds to `image` in the plain-HTTP
+/// registry at `addr`, unpacking it in `dir`: its blobs, then its manifest
+/// as it is, so the digest stays the archive's.
+fn put_archive(dir: &Path, archive: &[u8], addr: &str, image: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    let tar = dir.join("image.tar");
+    std::fs::write(&tar, archive).unwrap();
+    let out = Command::new("tar")
+        .arg("-xf")
+        .arg(&tar)
+        .arg("-C")
+        .arg(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "tar: {out:?}");
+    let blob = |digest: &str| {
+        dir.join("blobs/sha256")
+            .join(digest.strip_prefix("sha256:").unwrap())
+    };
+    let index: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("index.json")).unwrap()).unwrap();
+    let entry = &index["manifests"][0];
+    let digest = entry["digest"].as_str().unwrap();
+    let media_type = entry["mediaType"].as_str().unwrap();
+    let bytes = std::fs::read(blob(digest)).unwrap();
+    let manifest: Value = serde_json::from_slice(&bytes).unwrap();
+    let mut blobs = vec![manifest["config"]["digest"].as_str().unwrap().to_owned()];
+    for layer in manifest["layers"].as_array().unwrap() {
+        blobs.push(layer["digest"].as_str().unwrap().to_owned());
+    }
+    let r = legion_image::Reference::parse(image).unwrap();
+    let client = legion_image::Client::new().unwrap().plain_http(addr);
+    let pushed = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            for b in &blobs {
+                client.push_blob(&r, b, &blob(b), None).await.unwrap();
+            }
+            client
+                .push_document(&r, bytes, media_type, None)
+                .await
+                .unwrap()
+        });
+    assert_eq!(pushed, digest, "the registry holds the archive's manifest");
+}
 
 /// As [`service`], placed under `constraint` if given.
 fn placed(name: &str, image: &str, replicas: u32, constraint: Option<&str>) -> String {
@@ -1603,11 +1652,11 @@ fn a_jailer_index_runs_each_nodes_platform() {
         .fingerprint()
         .to_owned();
 
-    step("jailer loads the arm64 image an arm64 host built, and builds the amd64 one");
-    let archive = lab.dir.join("arch-arm64.tar");
-    std::fs::write(&archive, ARM64).unwrap();
-    let arm64 = "handoff/arch:arm64";
-    jailer.run(&["load", "--name", arm64, &path(archive)]);
+    // jailer keeps only images of its own platform, so the arm64 host's
+    // push is the registry's to hold, as `jailer publish` stages it.
+    step("the arm64 host pushes its image; jailer builds the amd64 one");
+    let arm64 = format!("{addr}/handoff/arch:arm64");
+    put_archive(&lab.dir.join("arch-arm64"), ARM64, &addr, &arm64);
     let rec = lab.dir.join("arch.json");
     let id = unique("arch");
     let amd64 = "handoff/arch:amd64";
@@ -1638,7 +1687,7 @@ fn a_jailer_index_runs_each_nodes_platform() {
 
     step("jailer pushes one signed index of both and checks its signature");
     let image = format!("{addr}/handoff/arch:1");
-    let (index, pinned, platforms) = push(&image, &[amd64, arm64], &rec);
+    let (index, pinned, platforms) = push(&image, &[amd64, &arm64], &rec);
     let amd64_manifest = record(&rec).image.manifest;
     assert_eq!(platforms.len(), 2, "{platforms:?}");
     assert_eq!(platforms["freebsd/amd64"], amd64_manifest, "{platforms:?}");
@@ -1678,7 +1727,7 @@ fn a_jailer_index_runs_each_nodes_platform() {
     step("an index of arm64 alone is refused once on each node, then waits");
     let only = format!("{addr}/handoff/arch:arm64-only");
     let only_rec = lab.dir.join("arch-only.json");
-    let (only_index, _, only_platforms) = push(&only, &[arm64], &only_rec);
+    let (only_index, _, only_platforms) = push(&only, &[&arm64], &only_rec);
     assert_eq!(only_platforms.len(), 1, "{only_platforms:?}");
     lab.apply("lone", &placed("lone", &only, 2, None));
     let rejected = lab.waits("lone", 2, "no node can run it: 3 no image for its platform");

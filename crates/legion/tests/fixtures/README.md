@@ -4,8 +4,10 @@
 
 The arm64 half of `handoff.rs`'s `a_jailer_index_runs_each_nodes_platform`,
 built by jailer on an arm64 host because the lab is amd64 only. It never runs
-here: the test loads it into jailer, pushes it in an index with an amd64 build,
-and checks that amd64 nodes run the other half.
+here: the test pushes it to its registry, as an arm64 host would, has jailer
+push it in an index with an amd64 build, and checks that amd64 nodes run the
+other half. (jailer keeps only images of its own platform, so it cannot load
+this archive on amd64.)
 
 - Built by jailer 33ee0d7 (Legion v0.1.18) on FreeBSD 15.1-RELEASE-p6 aarch64,
   from `FROM scratch` and `COPY arch /arch`, `/arch` holding `arm64`, and
