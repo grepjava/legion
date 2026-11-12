@@ -1584,6 +1584,11 @@ impl Lab {
                 .tasks_of(service)
                 .into_iter()
                 .filter(|t| t["spec"]["desiredState"] == "running")
+                // Those ended (refused ones) stay meant to run.
+                .filter(|t| {
+                    !["rejected", "failed", "complete", "shutdown"]
+                        .contains(&t["status"]["state"].as_str().unwrap_or(""))
+                })
                 .collect();
             live.len() == n
                 && live.iter().all(|t| {
@@ -1592,11 +1597,30 @@ impl Lab {
                         && t["status"]["message"] == says
                 })
         };
-        wait(
-            &format!("{n} tasks of {service} waiting: {says}"),
-            300,
-            || pending(self),
-        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        while !pending(self) {
+            if std::time::Instant::now() > deadline {
+                let seen: Vec<String> = self
+                    .tasks_of(service)
+                    .iter()
+                    .map(|t| {
+                        format!(
+                            "{} {} {} on {:?}: {}",
+                            t["metadata"]["name"],
+                            t["spec"]["desiredState"],
+                            t["status"]["state"],
+                            t["spec"]["node"],
+                            t["status"]["message"]
+                        )
+                    })
+                    .collect();
+                panic!(
+                    "timed out waiting for {n} tasks of {service} waiting: {says}\n{}",
+                    seen.join("\n")
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
         let ended = |lab: &Lab, state: &str| {
             lab.tasks_of(service)
                 .iter()
