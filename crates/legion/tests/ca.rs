@@ -149,12 +149,15 @@ fn the_ca_rotates_with_every_node_on_it() {
     assert_eq!(running(&lab), tasks);
 
     step("what the old CA issued is refused; the new admin bundle works");
+    // Each manager drops the old CA when it next reads the record, within
+    // its period (5 s).
     for (who, identity) in [
         ("the admin's old bundle", &before_admin),
         ("the user", &user),
     ] {
-        let out = lab.legion_as(identity, &["list", "nodes"], &[]);
-        assert!(!out.status.success(), "{who} still let in");
+        wait(&format!("{who} refused"), 30, || {
+            !lab.legion_as(identity, &["list", "nodes"], &[]).status.success()
+        });
     }
     lab.ok(&["list", "nodes"]);
     let fresh = lab.dir.join("viewer-after.pem");
