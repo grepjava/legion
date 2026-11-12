@@ -340,6 +340,7 @@ impl JailRuntime {
             stop_timeout: 10,
             linux: false,
             cpuset: None,
+            vm: None,
         };
         let cpus = step.cpuset.map(cpu_list).transpose()?;
         state::write(dir, RECORD, &rec).map_err(internal)?;

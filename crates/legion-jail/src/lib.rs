@@ -9,6 +9,7 @@ mod runtime;
 pub mod shim;
 pub mod state;
 pub mod users;
+pub mod vm;
 
 #[cfg(unix)]
 pub use runtime::{Config, JailRuntime, Starting, Step, StepMount, StepNetwork};

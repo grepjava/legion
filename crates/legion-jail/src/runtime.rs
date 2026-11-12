@@ -1130,6 +1130,23 @@ impl JailRuntime {
                 Some(c) => Some(cpu_list(c)?),
                 None => None,
             },
+            vm: None,
+        })
+        .and_then(|mut rec: Record| {
+            // A VM: its supervisor runs bhyve on the host, the disk in its
+            // root; it has a pod, whose address it takes.
+            let Some(json) = spec.annotations.get(legion_runtime::ANNOTATION_VM) else {
+                return Ok(rec);
+            };
+            let vm: legion_runtime::VmConfig = serde_json::from_str(json)
+                .map_err(|e| api(400, format!("{}: {e}", legion_runtime::ANNOTATION_VM)))?;
+            if rec.parent.is_none() {
+                return Err(api(400, format!("{}: a VM runs in a pod", spec.name)));
+            }
+            rec.argv = crate::vm::argv();
+            rec.env = crate::vm::env(&rec.id, &vm, &rec.root, &self.container_dir(&rec.id));
+            rec.vm = Some(vm);
+            Ok(rec)
         })
     }
 
@@ -1583,6 +1600,19 @@ impl legion_runtime::Runtime for JailRuntime {
                 while alive(run.shim) && tokio::time::Instant::now() < deadline {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
+            }
+            // A VM outliving its script (killed, say) holds its disk: it
+            // goes first, its bhyve and its virtual machine.
+            if rec.vm.is_some() {
+                let name = crate::vm::name(&rec.id);
+                let _ = tokio::process::Command::new("pkill")
+                    .args(["-KILL", "-f", &format!("^bhyve: {name}$")])
+                    .status()
+                    .await;
+                let _ = tokio::process::Command::new("bhyvectl")
+                    .args([&format!("--vm={name}"), "--destroy"])
+                    .status()
+                    .await;
             }
             self.unmount(&rec)?;
             // A jail just removed may be dying a while yet, its TCP
@@ -2171,6 +2201,7 @@ mod tests {
             stop_timeout: 10,
             linux: true,
             cpuset: None,
+            vm: None,
         };
         state::write(&t.path().join("state/c1"), RECORD, &rec).unwrap();
         let mounted = || sys.mounts(&root.to_string_lossy()).unwrap();
@@ -2250,6 +2281,7 @@ mod tests {
             stop_timeout: 10,
             linux: false,
             cpuset: None,
+            vm: None,
         };
         state::write(&t.join("state/c1"), RECORD, &rec).unwrap();
         (rt, rec)
@@ -2503,6 +2535,7 @@ exit 0
             stop_timeout: 10,
             linux: false,
             cpuset: None,
+            vm: None,
         };
         state::write(&t.path().join("state/c2"), RECORD, &rec).unwrap();
         // Its jail ended, but is dying yet, holding its root.
@@ -2543,6 +2576,7 @@ exit 0
             stop_timeout: 10,
             linux: false,
             cpuset: None,
+            vm: None,
         };
         std::fs::create_dir_all(&dir).unwrap();
         let run = Run {
@@ -2632,6 +2666,7 @@ exit 0
             stop_timeout: 10,
             linux: false,
             cpuset: None,
+            vm: None,
         }
     }
 

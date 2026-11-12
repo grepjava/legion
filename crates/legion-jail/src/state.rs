@@ -49,6 +49,9 @@ pub struct Record {
     /// The CPUs its jail is confined to (`crate::ANNOTATION_CPUSET`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpuset: Option<String>,
+    /// A virtual machine, its command run on the host (`crate::vm`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm: Option<legion_runtime::VmConfig>,
 }
 
 impl Record {

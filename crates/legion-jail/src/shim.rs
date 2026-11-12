@@ -358,9 +358,15 @@ mod imp {
                 libc::signal(s, libc::SIG_DFL);
             }
         }
-        let prepared = match enter(rec, jid, false) {
-            Ok(p) => p,
-            Err(e) => fail(e),
+        // A VM's command runs on the host (`crate::vm`); any other's in
+        // its jail.
+        let prepared = if rec.vm.is_some() {
+            None
+        } else {
+            match enter(rec, jid, false) {
+                Ok(p) => Some(p),
+                Err(e) => fail(e),
+            }
         };
         // SAFETY: the command's stdio: no input, output to the pipes.
         unsafe {
@@ -376,8 +382,29 @@ mod imp {
             libc::dup2(stdout, 1);
             libc::dup2(stderr, 2);
         }
-        prepared.exec();
+        match prepared {
+            Some(p) => p.exec(),
+            None => exec_host(rec),
+        }
         fail(format!("{}: {}", rec.argv[0], errno()))
+    }
+
+    /// Becomes the record's command on the host, with its environment;
+    /// returns only if that fails.
+    fn exec_host(rec: &Record) {
+        let cstrings = |v: &[String]| -> Option<Vec<CString>> {
+            v.iter().map(|s| CString::new(s.as_bytes()).ok()).collect()
+        };
+        let (Some(argv), Some(env)) = (cstrings(&rec.argv), cstrings(&rec.env)) else {
+            return;
+        };
+        let mut argp: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
+        argp.push(std::ptr::null());
+        let mut envp: Vec<*const libc::c_char> = env.iter().map(|e| e.as_ptr()).collect();
+        envp.push(std::ptr::null());
+        // SAFETY: argv and envp are null-terminated arrays of C strings that
+        // live until the call, which replaces this process or returns.
+        unsafe { libc::execve(argp[0], argp.as_ptr(), envp.as_ptr()) };
     }
 
     pub fn exec(dir: &Path, jid: i32, tty: super::Terminal, argv: &[String]) -> i32 {
