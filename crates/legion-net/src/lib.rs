@@ -256,7 +256,7 @@ impl PodNetwork {
     }
 
     /// `ip`'s IPv6 twin as an interface address, unless IPv6 is off.
-    fn addr6(&self, ip: Ipv4Addr) -> Option<Ipv6Net> {
+    pub fn addr6(&self, ip: Ipv4Addr) -> Option<Ipv6Net> {
         (self.v6 != PodV6::Off).then(|| Ipv6Net::new(self.twin(ip), NODE_PREFIX6))
     }
 
@@ -356,6 +356,32 @@ impl PodNetwork {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Gives a VM pod its network: a tap, renamed as a pod's host end
+    /// ([`Self::host_interface`]`(id)`) so policy and detaching find it as
+    /// any pod's, on the bridge. The guest takes the pod's address itself.
+    /// Returns the tap's device name, which bhyve opens (it keeps its own
+    /// across the rename); `None` if the host end exists already.
+    pub fn attach_tap(&self, sys: &dyn Sys, id: &str) -> Result<Option<String>, Error> {
+        let host = self.host_interface(id);
+        if sys.interfaces(None)?.contains(&host) {
+            return Ok(None);
+        }
+        let tap = sys.tap_create()?;
+        let result = (|| {
+            sys.interface_rename(&tap, &host)?;
+            self.join(sys, &host)
+        })();
+        if let Err(e) = result {
+            for name in [&host, &tap] {
+                if sys.interface_destroy(name).is_ok() {
+                    break;
+                }
+            }
+            return Err(e);
+        }
+        Ok(Some(tap))
     }
 
     /// Puts a pod's host end (an epair's, a guest's tap) on the bridge,

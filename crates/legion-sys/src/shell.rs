@@ -567,6 +567,19 @@ impl<R: Runner> Sys for Shell<R> {
         }
     }
 
+    fn tap_create(&self) -> Result<String> {
+        let a = args(["tap", "create"]);
+        let out = self.run("ifconfig", &a)?;
+        let name = out.trim();
+        if !name.starts_with("tap") {
+            return Err(Error::Parse {
+                command: describe("ifconfig", &a),
+                message: format!("expected a tap's name, got {name:?}"),
+            });
+        }
+        Ok(name.to_owned())
+    }
+
     fn interface_destroy(&self, name: &str) -> Result<()> {
         self.run("ifconfig", &args([name, "destroy"])).map(drop)
     }

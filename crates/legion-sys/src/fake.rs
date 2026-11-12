@@ -752,6 +752,22 @@ impl Sys for FakeSys {
         Ok(pair)
     }
 
+    fn tap_create(&self) -> Result<String> {
+        let mut s = self.state();
+        let n = s.next_epair;
+        s.next_epair += 1;
+        let name = format!("tap{n}");
+        let ether = Some(s.new_ether());
+        s.interfaces.insert(
+            name.clone(),
+            FakeInterface {
+                ether,
+                ..Default::default()
+            },
+        );
+        Ok(name)
+    }
+
     fn interface_destroy(&self, name: &str) -> Result<()> {
         let mut s = self.state();
         let peer = s

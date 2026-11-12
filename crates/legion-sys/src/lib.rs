@@ -93,6 +93,9 @@ pub trait Sys: Send + Sync {
     fn bridge_create(&self, name: &str) -> Result<()>;
     /// Creates an epair in the host stack.
     fn epair_create(&self) -> Result<Epair>;
+    /// Creates a tap in the host stack (a VM's network), named `tap<N>`;
+    /// renamed, its device keeps that name.
+    fn tap_create(&self) -> Result<String>;
     fn interface_destroy(&self, name: &str) -> Result<()>;
     /// Renames a host interface (at most 15 characters).
     fn interface_rename(&self, name: &str, new_name: &str) -> Result<()>;
