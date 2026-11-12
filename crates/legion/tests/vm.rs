@@ -120,7 +120,31 @@ fn a_vm_pod_boots_and_serves() {
             .find(|t| t["status"]["state"] == "running" && t["status"]["ready"] == true)
     };
     let started = std::time::Instant::now();
-    wait("the VM task running and ready", 300, || task().is_some());
+    while task().is_none() {
+        if started.elapsed().as_secs() > 300 {
+            // What a failure leaves to read: the tasks, the VM, its
+            // console and the daemon's log.
+            eprintln!("=== tasks\n{:#}", serde_json::Value::from(lab.list("tasks", "default")));
+            let sh = |c: &str| {
+                let out = std::process::Command::new("sh").args(["-c", c]).output().unwrap();
+                eprintln!("=== {c}\n{}{}", text(&out.stdout), text(&out.stderr));
+            };
+            sh("ls /dev/vmm; ps axww | grep -E '[b]hyve|[t]ap'; ifconfig -l");
+            for t in lab.list("tasks", "default") {
+                if let Some(n) = t["metadata"]["name"].as_str() {
+                    if let Some(out) = lab.legion_within(20, &["logs", n, "-n", "default"]) {
+                        eprintln!("=== logs {n}
+{}{}", text(&out.stdout), text(&out.stderr));
+                    }
+                }
+            }
+            let log = std::fs::read_to_string(lab.dir.join("daemon.log")).unwrap_or_default();
+            let tail: Vec<&str> = log.lines().rev().take(80).collect();
+            eprintln!("=== daemon.log\n{}", tail.into_iter().rev().collect::<Vec<_>>().join("\n"));
+            panic!("timed out waiting for the VM task running and ready");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
     eprintln!("ready in {:.1} s", started.elapsed().as_secs_f64());
     let t = task().unwrap();
     let ip = t["status"]["ip"].as_str().unwrap().to_owned();
