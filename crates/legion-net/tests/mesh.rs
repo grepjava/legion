@@ -106,6 +106,7 @@ impl Node {
             egress: egress.as_deref(),
             mesh: mesh.then_some(mesh::INTERFACE),
             published: &published,
+            balancer: None,
         };
         lb.apply(&self.sys, services, self.net.subnet, exits)
             .unwrap();
@@ -375,6 +376,8 @@ fn pods_across_nodes() {
         }],
         ready: vec![ips["w1"], w2],
         alive: vec![ips["w1"], w2],
+        address: None,
+        carp: None,
     };
     let mut lbs: Vec<LoadBalancer> = nodes.iter().map(|_| LoadBalancer::default()).collect();
     for (n, lb) in nodes.iter().zip(&mut lbs) {

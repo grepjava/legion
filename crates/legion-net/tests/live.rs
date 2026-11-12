@@ -123,6 +123,8 @@ fn pods_on_the_bridge() {
         }],
         ready: ready.to_vec(),
         alive: alive.to_vec(),
+        address: None,
+        carp: None,
     };
     let server = ips[1];
     let mut lb = LoadBalancer::default();
@@ -270,6 +272,8 @@ fn policy_on_the_bridge() {
         }],
         ready: vec![b_ip],
         alive: vec![b_ip],
+        address: None,
+        carp: None,
     };
     lb.apply(&sys, &[svc], net.subnet, Exits::default())
         .unwrap();
@@ -472,6 +476,8 @@ fn pf_updates_by_services() {
             published: None,
         }],
         alive: ready.clone(),
+        address: None,
+        carp: None,
         ready,
     };
     let three = |i: usize| (0..3).map(|k| addr(i * 3 + k)).collect::<Vec<_>>();

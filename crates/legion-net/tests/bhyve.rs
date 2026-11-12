@@ -214,6 +214,8 @@ fn guest_on_the_bridge() {
             }],
             ready: vec![guest_ip],
             alive: vec![guest_ip],
+            address: None,
+            carp: None,
         },
         Service {
             uid: "00000000000000e3".into(),
@@ -226,6 +228,8 @@ fn guest_on_the_bridge() {
             }],
             ready: vec![pod_ip],
             alive: vec![pod_ip],
+            address: None,
+            carp: None,
         },
     ];
     let mut lb = LoadBalancer::default();

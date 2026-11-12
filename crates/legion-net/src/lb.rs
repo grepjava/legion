@@ -83,6 +83,12 @@ pub struct Service {
     pub ready: Vec<Ipv4Addr>,
     /// Tasks that run, ready or not: their connections are left alone.
     pub alive: Vec<Ipv4Addr>,
+    /// Its address on the nodes' network, if it has one: its ports answer
+    /// there, on the node holding it.
+    pub address: Option<Ipv4Addr>,
+    /// That address as this node's CARP virtual host, if this node is one
+    /// that may hold it.
+    pub carp: Option<legion_sys::Carp>,
 }
 
 impl Service {
@@ -93,7 +99,9 @@ impl Service {
 
     fn balanced(&self) -> bool {
         !self.ports.is_empty()
-            && (self.vip.is_some() || self.ports.iter().any(|p| p.published.is_some()))
+            && (self.vip.is_some()
+                || self.address.is_some()
+                || self.ports.iter().any(|p| p.published.is_some()))
     }
 }
 
@@ -118,6 +126,9 @@ pub struct Exits<'a> {
     pub mesh: Option<&'a str>,
     /// Where published ports are reached: the node's own interfaces.
     pub published: &'a [String],
+    /// Where load balancer addresses are held; the egress interface if
+    /// unset.
+    pub balancer: Option<&'a str>,
 }
 
 /// Whether published ports should be reached through `interface`: every
@@ -187,6 +198,13 @@ pub fn rules(services: &[Service], subnet: Ipv4Net, exits: Exits) -> String {
                     );
                 }
             }
+            if let (Some(addr), Some(ext)) = (s.address, exits.balancer.or(egress)) {
+                let _ = writeln!(
+                    r,
+                    "rdr pass on {ext} inet proto {proto} to {addr} port {} tag {TAG} -> {to}",
+                    p.port
+                );
+            }
             if let Some(published) = p.published {
                 for i in exits.published {
                     for family in ["inet", "inet6"] {
@@ -210,6 +228,9 @@ pub struct LoadBalancer {
     /// Tasks of balanced services last time, ready or draining, with their
     /// twins: when one goes away, so do its connections.
     backends: BTreeSet<IpAddr>,
+    /// Load balancer addresses this node holds as CARP virtual hosts, and
+    /// on which interface.
+    carps: BTreeMap<Ipv4Addr, (String, legion_sys::Carp)>,
 }
 
 impl LoadBalancer {
@@ -258,6 +279,30 @@ impl LoadBalancer {
                     sys.pf_table_replace(ANCHOR, table, ready)?;
                     self.tables.insert(table.clone(), ready.clone());
                 }
+            }
+        }
+
+        // Load balancer addresses: the ones this node may hold as CARP
+        // virtual hosts on its egress interface, and the others given up.
+        let wanted: BTreeMap<Ipv4Addr, (String, legion_sys::Carp)> =
+            match exits.balancer.or(exits.egress) {
+                Some(ext) => services
+                    .iter()
+                    .filter_map(|s| s.carp.clone())
+                    .map(|c| (c.addr, (ext.to_owned(), c)))
+                    .collect(),
+                None => BTreeMap::new(),
+            };
+        for (addr, (iface, _)) in &self.carps.clone() {
+            if wanted.get(addr).is_none_or(|(i, _)| i != iface) {
+                sys.carp_remove(iface, *addr)?;
+                self.carps.remove(addr);
+            }
+        }
+        for (addr, (iface, carp)) in wanted {
+            if self.carps.get(&addr) != Some(&(iface.clone(), carp.clone())) {
+                sys.carp_set(&iface, &carp, None)?;
+                self.carps.insert(addr, (iface, carp));
             }
         }
 
@@ -335,6 +380,8 @@ mod tests {
             ],
             ready: ready.iter().map(|s| ip(s)).collect(),
             alive: alive.iter().map(|s| ip(s)).collect(),
+            address: None,
+            carp: None,
         }
     }
 
@@ -350,6 +397,7 @@ mod tests {
             egress: Some("wlan0"),
             mesh: Some("wg0"),
             published: &published,
+            balancer: None,
         };
         assert_eq!(
             rules(&[web(&[], &[]), dnsrr], subnet, exits),
@@ -474,6 +522,8 @@ mod tests {
             ports: Vec::new(),
             ready: alive.iter().map(|a| ip(a)).collect(),
             alive: alive.iter().map(|a| ip(a)).collect(),
+            address: None,
+            carp: None,
         };
         lb.apply(
             &sys,
@@ -613,5 +663,51 @@ mod tests {
         )
         .unwrap();
         assert!(sys.pf_table_show(ANCHOR, table).unwrap().is_empty());
+    }
+
+    /// A load balancer address: its ports answer on it on the egress
+    /// interface, and a node that may hold it puts it there as a CARP
+    /// virtual host, taking it off once it may no more.
+    #[test]
+    fn a_load_balancer_address_is_held_with_carp() {
+        let sys = FakeSys::new();
+        let subnet = "10.200.0.0/24".parse().unwrap();
+        let exits = Exits {
+            egress: Some("vtnet0"),
+            ..Exits::default()
+        };
+        let carp = legion_sys::Carp {
+            vhid: 7,
+            addr: ip("192.168.1.50"),
+            password: "secret".into(),
+            advskew: 20,
+        };
+        let with = |carp: Option<legion_sys::Carp>| Service {
+            vip: None,
+            address: Some(ip("192.168.1.50")),
+            carp,
+            ..web(&["10.200.0.2"], &[])
+        };
+        let mut lb = LoadBalancer::default();
+        lb.apply(&sys, &[with(Some(carp.clone()))], subnet, exits)
+            .unwrap();
+        let rules = sys.anchor(ANCHOR).unwrap();
+        assert!(
+            rules.contains("rdr pass on vtnet0 inet proto tcp to 192.168.1.50 port 80"),
+            "{rules}"
+        );
+        let (held, _) = sys.carp("vtnet0", 7).expect("held");
+        assert_eq!(held, carp);
+        // Again: nothing to do.
+        lb.apply(&sys, &[with(Some(carp.clone()))], subnet, exits)
+            .unwrap();
+        // No more among those that may hold it: given up, the rules kept.
+        lb.apply(&sys, &[with(None)], subnet, exits).unwrap();
+        assert!(sys.carp("vtnet0", 7).is_none());
+        assert!(
+            sys.anchor(ANCHOR)
+                .unwrap()
+                .contains("to 192.168.1.50 port 80")
+        );
     }
 }
