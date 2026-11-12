@@ -261,6 +261,8 @@ impl Harness {
             config.wireguard = Some(WireGuardConfig {
                 key: WireGuardKey::File(self.key_file()),
                 port: 51820,
+                nat: false,
+                relay: false,
             });
         }
         let agent = Agent::new(

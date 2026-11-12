@@ -2172,6 +2172,8 @@ async fn workers_follow_their_work_through_any_manager() {
             public_key: "pub1".into(),
             endpoint: Some("192.0.2.1:51820".into()),
             pod_cidr: registered.pod_cidr.clone(),
+            nat: false,
+            relay: false,
         }]
     );
 

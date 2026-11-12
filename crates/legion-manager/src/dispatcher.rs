@@ -1779,6 +1779,8 @@ fn peers(nodes: &BTreeMap<ObjectKey, Object>) -> Peers {
                 public_key: wireguard.public_key,
                 endpoint: wireguard.endpoint,
                 pod_cidr: status.pod_cidr?,
+                nat: wireguard.nat,
+                relay: wireguard.relay,
             })
         })
         .collect()

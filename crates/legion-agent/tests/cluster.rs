@@ -236,6 +236,8 @@ impl Cluster {
         config.wireguard = Some(WireGuardConfig {
             key: WireGuardKey::File(key_file),
             port: 51820,
+            nat: false,
+            relay: false,
         });
         let control = GrpcControl::new(&node.name, vec![node.link.addr.clone()], None).unwrap();
         let agent = Agent::new(

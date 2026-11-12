@@ -106,6 +106,11 @@ pub struct WireGuardConfig {
     pub key: WireGuardKey,
     /// The UDP port the node listens on.
     pub port: u16,
+    /// Behind a NAT no other node gets through (`--mesh-nat`): its traffic
+    /// to other such nodes goes through a relay.
+    pub nat: bool,
+    /// Relays between nodes behind NAT (`--mesh-relay`).
+    pub relay: bool,
 }
 
 /// Where the agent finds the node's WireGuard private key.
@@ -263,6 +268,8 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                     status.wireguard = Some(legion_api::node::WireGuard {
                         public_key: public,
                         endpoint,
+                        nat: wg.nat,
+                        relay: wg.relay,
                     });
                     private_key = Some(private);
                 }
@@ -321,6 +328,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                     subnet,
                     private_key,
                     port: wg.port,
+                    nat: wg.nat,
                 };
                 Some(tokio::spawn(mesh_peers(
                     ctx.sys.clone(),
@@ -768,6 +776,8 @@ async fn mesh_peers(
                     public_key: p.public_key.clone(),
                     endpoint: p.endpoint.clone(),
                     subnet: p.pod_cidr.parse().ok()?,
+                    nat: p.nat,
+                    relay: p.relay,
                 })
             })
             .collect();
