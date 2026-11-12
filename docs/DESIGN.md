@@ -279,16 +279,33 @@ Filter, then score, per task:
    rejected task; `node.platform.arch == amd64` (or `arm64`) avoids even
    that one;
    resource **requests** fit in allocatable capacity; constraints match node
-   labels; the task tolerates every taint on the node; required anti-affinity
-   holds; host-mode published ports are free; stateful tasks go to the node
-   holding their volume unless migration is allowed.
-2. **Scores**, in order: no untolerated `PreferNoSchedule` taint; placement
-   preferences, each `spread: node.labels.<key>` balancing the service's
+   labels; the task tolerates every taint on the node; required affinity
+   and anti-affinity hold (`placement.affinity` and `antiAffinity`, each a
+   service of the same namespace: on a node running one of each `affinity`
+   service, on none running an `antiAffinity` one; the service's own name
+   there keeps it to one task per node); host-mode published ports are
+   free; stateful tasks go to the node holding their volume unless
+   migration is allowed.
+2. **Scores**, in order: no untolerated `PreferNoSchedule` taint;
+   preferred (not `required`) affinity, the tasks of services preferred
+   away less those of services preferred near; placement preferences, each `spread: node.labels.<key>` balancing the service's
    tasks evenly over the key's values (nodes without the key are one more
    value), and each after the first within the values of those before it,
    as in Swarm; fewest tasks of the same service on the node; least
-   requested resources; preferred affinity. Preferences place new tasks
-   only: nothing already running moves when labels change.
+   requested resources. Preferences place new tasks only: nothing already
+   running moves when labels change.
+
+**Priorities.** A service's `priority` (default 0) orders the pending
+tasks placed, higher first. A task that fits nowhere only for want of
+room stops tasks of strictly lower priority on the one node where that
+stops the lowest and fewest (counting tasks already stopping there as
+gone), and waits there for them, saying so; their services replace them
+where there is room. Global services' tasks and Jobs' are never stopped
+(they would come back), and disruption budgets are not consulted: a
+priority is the operator's word that one matters more. A stateful task
+stopped so waits for room on its Volume's node. Tested on the fake hosts
+(`affinity_keeps_tasks_near_or_away`,
+`priority_places_first_and_preempts_lower`).
 
 The scheduler places by **requests**; rctl enforces **limits**. A task with no
 requests is scheduled as zero-cost but is the first to be evicted when a node is
