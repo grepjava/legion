@@ -1623,10 +1623,76 @@ impl Load {
     }
 }
 
-/// Lower is better: an untolerated `PreferNoSchedule` taint, tasks of the
-/// same service in the node's group for each spread preference, on the
+/// Lower is better: an untolerated `PreferNoSchedule` taint, tasks of
+/// services preferred away less those of services preferred near, tasks of
+/// the same service in the node's group for each spread preference, on the
 /// node, then requested CPU and memory in thousandths.
-type Score = (bool, Vec<u32>, u32, u64, u64);
+type Score = (bool, i64, Vec<u32>, u32, u64, u64);
+
+/// A sum past u64 fits nowhere; an allocatable of 0 is not known, and
+/// limits nothing.
+fn exceeds(load: u64, request: u64, alloc: u64) -> bool {
+    alloc > 0 && load.checked_add(request).is_none_or(|sum| sum > alloc)
+}
+
+/// Making room on `node` for a task of `priority` requesting `requests`:
+/// the tasks of lower priority to stop there, fewest and lowest first, once
+/// those stopping already (or chosen this pass) are counted gone; empty if
+/// those suffice. `None` if even all of them would not make room. Global
+/// services' tasks and Jobs' are never stopped: they would come back.
+#[allow(clippy::too_many_arguments)]
+fn preemption<'a>(
+    node: &str,
+    load: &Load,
+    alloc: legion_api::node::Capacity,
+    requests: legion_api::service::PodRequests,
+    priority: i32,
+    tasks: &'a [Task],
+    priority_of: &dyn Fn(&Task) -> Option<i32>,
+    chosen: &BTreeSet<ObjectKey>,
+) -> Option<Vec<&'a Task>> {
+    let (mut cpu, mut memory) = (load.cpu, load.memory);
+    let fits = |cpu: u64, memory: u64| {
+        !exceeds(cpu, requests.cpu.0, alloc.cpu.0)
+            && !exceeds(memory, requests.memory.0, alloc.memory.0)
+    };
+    let on: Vec<&Task> = tasks
+        .iter()
+        .filter(|t| t.placed() && t.spec.node == node)
+        .collect();
+    let mut lower = Vec::new();
+    for t in on {
+        let r = t.spec.pod.requests();
+        if t.stopping() || chosen.contains(&t.object.key()) {
+            cpu = cpu.saturating_sub(r.cpu.0);
+            memory = memory.saturating_sub(r.memory.0);
+        } else if let Some(p) = priority_of(t)
+            && p < priority
+            && !t.spec.job
+        {
+            lower.push((p, t));
+        }
+    }
+    if fits(cpu, memory) {
+        return Some(Vec::new());
+    }
+    // The lowest first, and of those the largest, so fewest go.
+    lower.sort_by_key(|(p, t)| {
+        let r = t.spec.pod.requests();
+        (*p, std::cmp::Reverse(r.cpu.0.saturating_add(r.memory.0)))
+    });
+    let mut victims = Vec::new();
+    for (_, t) in lower {
+        let r = t.spec.pod.requests();
+        cpu = cpu.saturating_sub(r.cpu.0);
+        memory = memory.saturating_sub(r.memory.0);
+        victims.push(t);
+        if fits(cpu, memory) {
+            return Some(victims);
+        }
+    }
+    None
+}
 
 /// A container of `pod` that requests nothing of what `quota` limits, CPU
 /// or memory, and which.
@@ -1725,6 +1791,38 @@ fn schedule(
         .chain(created.into_iter().map(|t| (t, None)))
         .collect();
 
+    let priority = |t: &Task| {
+        services
+            .iter()
+            .find(|s| s.owns(t))
+            .map_or(0, |s| s.spec.priority)
+    };
+    // Higher priority placed first; otherwise in the order they came.
+    let mut pending = pending;
+    pending.sort_by_key(|(t, _)| std::cmp::Reverse(priority(t)));
+    // Each service's uid by namespace and name, for affinity.
+    let uids: BTreeMap<(&str, &str), &str> = services
+        .iter()
+        .map(|s| {
+            (
+                (
+                    s.object.metadata.namespace.as_str(),
+                    s.object.metadata.name.as_str(),
+                ),
+                s.object.metadata.uid.as_str(),
+            )
+        })
+        .collect();
+    // What a preemption may stop: tasks of replicated services, at their
+    // priority.
+    let victim_priority = |t: &Task| {
+        services
+            .iter()
+            .find(|s| s.owns(t))
+            .filter(|s| s.spec.mode != legion_api::service::ServiceMode::Global)
+            .map(|s| s.spec.priority)
+    };
+    let mut preempted: BTreeSet<ObjectKey> = BTreeSet::new();
     let orphaned = held_by_orphans(tasks, nodes, volumes);
     // Volumes one node at a time may have, not yet on one, that a placed
     // task took, in this pass or before its node claimed them: other
@@ -1782,6 +1880,16 @@ fn schedule(
             .collect();
         let mut reasons: BTreeMap<&str, usize> = BTreeMap::new();
         let mut best: Option<(&str, Score)> = None;
+        // Tasks of the service named in this namespace on a node.
+        let of = |node: &str, service: &str| {
+            uids.get(&(namespace.as_str(), service))
+                .and_then(|uid| load.get(node).and_then(|l| l.per_service.get(*uid)))
+                .copied()
+                .unwrap_or(0)
+        };
+        let placement = &s.spec.placement;
+        // Where a preemption could make room: the node, and what it stops.
+        let mut room: Vec<(&str, Vec<&Task>)> = Vec::new();
         for n in nodes
             .iter()
             .filter(|_| over.is_empty() && unasked.is_none() && denied.is_none())
@@ -1812,18 +1920,54 @@ fn schedule(
                     .or_default() += 1;
                 continue;
             }
+            if placement
+                .affinity
+                .iter()
+                .any(|a| a.required && of(name, &a.service) == 0)
+            {
+                *reasons.entry("affinity").or_default() += 1;
+                continue;
+            }
+            if placement
+                .anti_affinity
+                .iter()
+                .any(|a| a.required && of(name, &a.service) > 0)
+            {
+                *reasons.entry("anti-affinity").or_default() += 1;
+                continue;
+            }
             let l = load.get(name).cloned().unwrap_or_default();
             let alloc = n.status.allocatable;
-            // A sum past u64 fits nowhere.
-            let exceeds = |load: u64, request: u64, alloc: u64| {
-                alloc > 0 && load.checked_add(request).is_none_or(|sum| sum > alloc)
-            };
             if exceeds(l.cpu, requests.cpu.0, alloc.cpu.0)
                 || exceeds(l.memory, requests.memory.0, alloc.memory.0)
             {
                 *reasons.entry("insufficient resources").or_default() += 1;
+                if let Some(victims) = preemption(
+                    name,
+                    &l,
+                    alloc,
+                    requests,
+                    s.spec.priority,
+                    tasks,
+                    &victim_priority,
+                    &preempted,
+                ) {
+                    room.push((name, victims));
+                }
                 continue;
             }
+            let near = placement
+                .anti_affinity
+                .iter()
+                .filter(|a| !a.required)
+                .map(|a| i64::from(of(name, &a.service)))
+                .sum::<i64>()
+                - placement
+                    .affinity
+                    .iter()
+                    .filter(|a| !a.required)
+                    .map(|a| i64::from(of(name, &a.service)))
+                    .sum::<i64>();
             let groups = (1..=spread.len())
                 .map(|depth| {
                     let mine = group(n, &spread[..depth]);
@@ -1836,6 +1980,7 @@ fn schedule(
                 .collect();
             let score = (
                 n.repels(s, TaintEffect::PreferNoSchedule),
+                near,
                 groups,
                 on(name),
                 l.cpu.saturating_mul(1000) / alloc.cpu.0.max(1),
@@ -1877,6 +2022,31 @@ fn schedule(
                 ),
                 ..Default::default()
             },
+            // Room made on the node where it stops least, lowest first: the
+            // task waits there for it, placed once they are gone.
+            None if let Some((node, victims)) = room.into_iter().min_by_key(|(_, v)| {
+                (v.iter().filter_map(|t| victim_priority(t)).max(), v.len())
+            }) =>
+            {
+                for v in &victims {
+                    if !touched.contains(&v.object.key()) && preempted.insert(v.object.key()) {
+                        plan.actions.push(stop(v));
+                    }
+                }
+                let message = if victims.is_empty() {
+                    format!("waiting for room on {node}: tasks of lower priority are stopping")
+                } else {
+                    format!(
+                        "waiting for room on {node}: stopping {} task(s) of lower priority",
+                        victims.len()
+                    )
+                };
+                TaskStatus {
+                    state: TaskState::Pending,
+                    message,
+                    ..Default::default()
+                }
+            }
             None => {
                 let why = if reasons.is_empty() {
                     "no nodes".to_owned()

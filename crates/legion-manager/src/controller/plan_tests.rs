@@ -4876,3 +4876,123 @@ fn reconciliation_time_by_cluster_size() {
         );
     }
 }
+
+/// The pending tasks of `service` and why they wait.
+fn waiting(w: &World, service: &str) -> Vec<String> {
+    w.tasks
+        .iter()
+        .filter(|t| {
+            t.spec.service == service
+                && t.status.state == TaskState::Pending
+                && t.spec.desired_state == DesiredState::Running
+        })
+        .map(|t| t.status.message.clone())
+        .collect()
+}
+
+/// Affinity keeps a service's tasks on nodes running another's, and
+/// anti-affinity away from them, or from its own: one task per node.
+/// Preferred, they only weigh in.
+#[test]
+fn affinity_keeps_tasks_near_or_away() {
+    let mut w = World::new();
+    for n in ["n1", "n2", "n3"] {
+        w.node(n, &[]);
+    }
+    w.service(
+        "db",
+        "replicas: 1\npod: { containers: [{ name: d, image: \"d:1\" }] }",
+    );
+    w.settle();
+    let db = w.placed("db");
+    w.service(
+        "cache",
+        "replicas: 2\npod: { containers: [{ name: c, image: \"c:1\" }] }\n\
+         placement: { affinity: [{ service: db, required: true }] }",
+    );
+    w.service(
+        "web",
+        "replicas: 4\npod: { containers: [{ name: w, image: \"w:1\" }] }\n\
+         placement: { antiAffinity: [{ service: web, required: true }] }",
+    );
+    w.service(
+        "batch",
+        "replicas: 1\npod: { containers: [{ name: b, image: \"b:1\" }] }\n\
+         placement: { antiAffinity: [{ service: db }] }",
+    );
+    w.settle();
+    assert_eq!(w.placed("cache"), [db[0].clone(), db[0].clone()]);
+    assert_eq!(w.placed("web"), ["n1", "n2", "n3"], "one per node");
+    assert_eq!(waiting(&w, "web"), ["no node can run it: 3 anti-affinity"]);
+    assert_ne!(w.placed("batch"), db, "preferred away from db");
+    // Near a service that runs nowhere: waits, saying why.
+    w.service(
+        "lonely",
+        "replicas: 1\npod: { containers: [{ name: l, image: \"l:1\" }] }\n\
+         placement: { affinity: [{ service: nothing, required: true }] }",
+    );
+    w.settle();
+    assert_eq!(waiting(&w, "lonely"), ["no node can run it: 3 affinity"]);
+}
+
+/// Higher priority is placed first, and with nowhere to run for want of
+/// room it stops tasks of lower priority on one node; never those of the
+/// same priority or higher.
+#[test]
+fn priority_places_first_and_preempts_lower() {
+    let mut w = World::new();
+    for n in ["n1", "n2"] {
+        w.node(n, &[]);
+        w.node_mut(n).status.allocatable.cpu = Cpu(1000);
+    }
+    let pod = |name: &str| {
+        format!(
+            "pod: {{ containers: [{{ name: {name}, image: \"{name}:1\", resources: {{ requests: {{ cpu: 800m }} }} }}] }}"
+        )
+    };
+    w.service("low", &format!("replicas: 2\n{}", pod("low")));
+    w.settle();
+    assert_eq!(w.placed("low"), ["n1", "n2"]);
+    // The same priority makes no room.
+    w.service("peer", &format!("replicas: 1\n{}", pod("peer")));
+    w.settle();
+    assert_eq!(
+        waiting(&w, "peer"),
+        ["no node can run it: 2 insufficient resources"]
+    );
+    w.service(
+        "high",
+        &format!("replicas: 1\npriority: 10\n{}", pod("high")),
+    );
+    w.settle();
+    assert_eq!(w.placed("high").len(), 1, "room made");
+    assert_eq!(w.placed("low").len(), 1, "one task of low stopped for it");
+    let low_waits = waiting(&w, "low");
+    assert_eq!(low_waits.len(), 1);
+    assert!(
+        low_waits[0].starts_with("no node can run it"),
+        "{low_waits:?}"
+    );
+    // A lower priority never takes it back.
+    assert!(waiting(&w, "peer").len() == 1);
+    assert_eq!(w.placed("high").len(), 1);
+    // Placed first: given room for one, the higher of two waiting takes it.
+    w.service(
+        "high",
+        &format!("replicas: 1\npriority: 10\n{}", pod("high")),
+    );
+    w.service(
+        "peer",
+        "replicas: 0\npod: { containers: [{ name: peer, image: \"peer:1\" }] }",
+    );
+    w.service("low", &format!("replicas: 0\n{}", pod("low")));
+    w.settle();
+    w.service(
+        "urgent",
+        &format!("replicas: 1\npriority: 5\n{}", pod("urgent")),
+    );
+    w.service("later", &format!("replicas: 1\n{}", pod("later")));
+    w.settle();
+    assert_eq!(w.placed("urgent").len(), 1);
+    assert_eq!(w.placed("later"), Vec::<String>::new());
+}

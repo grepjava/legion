@@ -81,6 +81,8 @@ impl Job {
                 endpoint: None,
                 update: Default::default(),
                 max_unavailable: None,
+                // Jobs run at the default priority.
+                priority: 0,
             },
             refused: Default::default(),
             covered: self.covered,
