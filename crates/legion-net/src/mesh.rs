@@ -55,6 +55,10 @@ pub struct Peer {
     /// `host:port`; without one, the peer must reach this node first.
     pub endpoint: Option<String>,
     pub subnet: Ipv4Net,
+    /// Behind a NAT no other node gets through.
+    pub nat: bool,
+    /// Relays between nodes behind NAT.
+    pub relay: bool,
 }
 
 /// This node's end of the mesh.
@@ -63,6 +67,22 @@ pub struct Mesh {
     pub subnet: Ipv4Net,
     pub private_key: String,
     pub port: u16,
+    /// Behind a NAT no other node gets through: traffic to other such
+    /// nodes goes through a relay, as neither can reach the other.
+    pub nat: bool,
+}
+
+/// The relay this node's traffic to `to` goes through, if both are behind
+/// NAT: of the relays not behind NAT themselves, the one with the lowest
+/// subnet, so every node picks the same while the list is the same.
+pub fn relay_for<'a>(nat: bool, to: &Peer, peers: &'a [Peer], own: Ipv4Net) -> Option<&'a Peer> {
+    if !(nat && to.nat) {
+        return None;
+    }
+    peers
+        .iter()
+        .filter(|p| p.relay && !p.nat && p.subnet.network() != own.network())
+        .min_by_key(|p| u32::from(p.subnet.network()))
 }
 
 impl Mesh {
@@ -110,29 +130,46 @@ impl Mesh {
     /// node behind NAT, which advertises an address of its own network.
     pub fn apply(&self, sys: &dyn Sys, peers: &[Peer], before: &[Peer]) -> Result<(), Error> {
         let own = self.subnet.network();
-        let wanted: BTreeMap<&str, WgPeer> = peers
-            .iter()
-            .filter(|p| p.subnet.network() != own)
-            .filter_map(|p| {
-                let subnet = Ipv4Net::new(p.subnet.network(), p.subnet.prefix);
-                let mut allowed_ips: Vec<IpNet> = vec![
-                    subnet.into(),
-                    Ipv4Net::new(underlay_addr(subnet)?, 32).into(),
-                    node_subnet6(subnet)?.into(),
-                    Ipv6Net::new(underlay_addr6(subnet)?, 128).into(),
-                ];
-                allowed_ips.sort();
-                Some((
-                    p.public_key.as_str(),
-                    WgPeer {
-                        public_key: p.public_key.clone(),
-                        endpoint: p.endpoint.clone(),
-                        allowed_ips,
-                        keepalive: Some(KEEPALIVE),
-                    },
-                ))
-            })
-            .collect();
+        let addresses = |p: &Peer| -> Option<Vec<IpNet>> {
+            let subnet = Ipv4Net::new(p.subnet.network(), p.subnet.prefix);
+            Some(vec![
+                subnet.into(),
+                Ipv4Net::new(underlay_addr(subnet)?, 32).into(),
+                node_subnet6(subnet)?.into(),
+                Ipv6Net::new(underlay_addr6(subnet)?, 128).into(),
+            ])
+        };
+        let mut wanted: BTreeMap<&str, WgPeer> = BTreeMap::new();
+        // Peers neither side of which can reach the other: their addresses
+        // go to the relay, which forwards them on.
+        let mut relayed: Vec<(&str, Vec<IpNet>)> = Vec::new();
+        for p in peers.iter().filter(|p| p.subnet.network() != own) {
+            let Some(allowed_ips) = addresses(p) else {
+                continue;
+            };
+            if let Some(r) = relay_for(self.nat, p, peers, self.subnet) {
+                relayed.push((r.public_key.as_str(), allowed_ips));
+                continue;
+            }
+            wanted.insert(
+                p.public_key.as_str(),
+                WgPeer {
+                    public_key: p.public_key.clone(),
+                    endpoint: p.endpoint.clone(),
+                    allowed_ips,
+                    keepalive: Some(KEEPALIVE),
+                },
+            );
+        }
+        for (relay, allowed_ips) in relayed {
+            if let Some(r) = wanted.get_mut(relay) {
+                r.allowed_ips.extend(allowed_ips);
+            }
+        }
+        for p in wanted.values_mut() {
+            p.allowed_ips.sort();
+            p.allowed_ips.dedup();
+        }
         let current = sys.wg_peers(INTERFACE)?;
         for p in &current {
             if !wanted.contains_key(p.public_key.as_str()) {
@@ -209,6 +246,7 @@ mod tests {
             subnet: net("10.200.1.0/24"),
             private_key: "key1".into(),
             port: PORT,
+            nat: false,
         };
         mesh.ensure(&sys).unwrap();
         mesh.ensure(&sys).unwrap(); // again: fine
@@ -232,6 +270,8 @@ mod tests {
             public_key: key.into(),
             endpoint: endpoint.map(str::to_owned),
             subnet: net(subnet),
+            nat: false,
+            relay: false,
         };
         let me = peer("pub:key1", Some("192.0.2.1:51820"), "10.200.1.0/24");
         let two = peer("pub:key2", Some("192.0.2.2:51820"), "10.200.2.0/24");
@@ -322,5 +362,78 @@ mod tests {
 
         mesh.apply(&sys, &[], &fifth).unwrap();
         assert!(sys.wireguard(INTERFACE).unwrap().peers.is_empty());
+    }
+
+    /// Two nodes behind NAT reach each other through a relay: each has the
+    /// other's addresses on the relay's peer, and none of its own; a node
+    /// not behind NAT keeps every peer direct.
+    #[test]
+    fn nodes_behind_nat_go_through_a_relay() {
+        let peer = |key: &str, subnet: &str, nat: bool, relay: bool| Peer {
+            public_key: key.into(),
+            endpoint: Some(format!("192.0.2.{}:51820", &key[3..])),
+            subnet: net(subnet),
+            nat,
+            relay,
+        };
+        let peers = [
+            peer("pub1", "10.200.1.0/24", false, true),
+            peer("pub2", "10.200.2.0/24", true, false),
+            peer("pub3", "10.200.3.0/24", true, false),
+            peer("pub4", "10.200.4.0/24", false, false),
+        ];
+        let mesh = |n: u8, nat: bool| Mesh {
+            subnet: net(&format!("10.200.{n}.0/24")),
+            private_key: format!("key{n}"),
+            port: PORT,
+            nat,
+        };
+        let peers_of = |m: &Mesh| {
+            let sys = FakeSys::new();
+            m.ensure(&sys).unwrap();
+            m.apply(&sys, &peers, &[]).unwrap();
+            let mut got: Vec<(String, Vec<String>)> = sys
+                .wg_peers(INTERFACE)
+                .unwrap()
+                .into_iter()
+                .map(|p| {
+                    let mut ips: Vec<String> = p
+                        .allowed_ips
+                        .iter()
+                        .map(ToString::to_string)
+                        .filter(|a| a.ends_with("/24"))
+                        .collect();
+                    ips.sort();
+                    (p.public_key, ips)
+                })
+                .collect();
+            got.sort();
+            got
+        };
+        // Node 2 behind NAT: node 3, behind NAT too, through the relay.
+        assert_eq!(
+            peers_of(&mesh(2, true)),
+            [
+                (
+                    "pub1".into(),
+                    vec!["10.200.1.0/24".into(), "10.200.3.0/24".into()]
+                ),
+                ("pub4".into(), vec!["10.200.4.0/24".into()]),
+            ]
+        );
+        // The relay and a node not behind NAT: every peer direct.
+        for n in [1, 4] {
+            assert_eq!(peers_of(&mesh(n, false)).len(), 3, "node {n}");
+        }
+        // No relay at all: direct, for what it is worth.
+        let no_relay: Vec<Peer> = peers
+            .iter()
+            .cloned()
+            .map(|p| Peer { relay: false, ..p })
+            .collect();
+        assert_eq!(
+            relay_for(true, &no_relay[2], &no_relay, net("10.200.2.0/24")),
+            None
+        );
     }
 }

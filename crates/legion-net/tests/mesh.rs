@@ -262,6 +262,7 @@ fn pods_across_nodes() {
             subnet,
             private_key: key.clone(),
             port: mesh::PORT,
+            nat: false,
         };
         mesh.ensure(&sys).unwrap();
         mesh.ensure(&sys).unwrap(); // again: fine
@@ -269,6 +270,8 @@ fn pods_across_nodes() {
             public_key: sys.wg_pubkey(&key).unwrap(),
             endpoint: Some(format!("192.168.252.{n}:{}", mesh::PORT)),
             subnet,
+            nat: false,
+            relay: false,
         };
         nodes.push(Node {
             jail: jail.to_string(),
@@ -619,12 +622,15 @@ fn mesh_growth_by_nodes() {
             subnet,
             private_key: key.clone(),
             port: mesh::PORT,
+            nat: false,
         };
         mesh.ensure(&sys).unwrap();
         let peer = Peer {
             public_key: sys.wg_pubkey(&key).unwrap(),
             endpoint: Some(format!("192.168.253.{n}:{}", mesh::PORT)),
             subnet,
+            nat: false,
+            relay: false,
         };
         let before = peers.clone();
         peers.push(peer.clone());
@@ -668,6 +674,146 @@ fn mesh_growth_by_nodes() {
             peer,
             mesh,
         });
+    }
+    drop(lab);
+}
+
+/// Two nodes each behind a NAT that lets no handshake in reach each other
+/// only through a relay (`--mesh-nat`, `--mesh-relay`): VNET jails on one
+/// switch, node 1 the relay, nodes 2 and 3 each behind a NAT as in
+/// [`pods_across_nodes`]. Without the relay they never reach each other.
+#[test]
+#[ignore = "needs root on a FreeBSD host"]
+fn nodes_behind_nat_reach_each_other_through_a_relay() {
+    assert_eq!(must("id -u").trim(), "0", "run as root");
+    assert_eq!(
+        must("sysctl -n security.jail.jailed").trim(),
+        "0",
+        "run on the host: the nodes are jails"
+    );
+    let switch = "lmeshn-sw".to_owned();
+    assert!(
+        !sh(&format!("jls -j {switch}")).0,
+        "{switch} exists already"
+    );
+    let mut lab = Growth {
+        jails: vec![switch.clone()],
+        links: Vec::new(),
+    };
+    must(&format!("jail -c name={switch} path=/ vnet persist"));
+    let bridge = must(&format!("jexec {switch} ifconfig bridge create"));
+    let bridge = bridge.trim().to_owned();
+    must(&format!(
+        "jexec {switch} ifconfig {bridge} inet 192.168.251.254/24 up"
+    ));
+
+    let mut nodes: Vec<Node> = Vec::new();
+    for n in 1..=3u8 {
+        let jail = format!("lmeshn-n{n}");
+        must(&format!(
+            "jail -c name={jail} path=/ vnet persist allow.raw_sockets"
+        ));
+        lab.jails.push(jail.clone());
+        let created = must("ifconfig epair create");
+        let created = created.trim();
+        let (a, b) = (format!("lmnu{n}"), format!("lmns{n}"));
+        must(&format!("ifconfig {created} name {a}"));
+        lab.links.push((jail.clone(), a.clone()));
+        must(&format!(
+            "ifconfig {}b name {b}",
+            created.strip_suffix('a').unwrap()
+        ));
+        must(&format!("ifconfig {a} vnet {jail}"));
+        must(&format!("ifconfig {b} vnet {switch}"));
+        must(&format!("jexec {switch} ifconfig {b} up"));
+        must(&format!("jexec {switch} ifconfig {bridge} addm {b}"));
+        must(&format!("jexec {jail} ifconfig lo0 up"));
+        must(&format!(
+            "jexec {jail} ifconfig {a} inet 192.168.251.{n}/24 up"
+        ));
+        // The relay forwards between its peers.
+        must(&format!("jexec {jail} sysctl net.inet.ip.forwarding=1"));
+        must(&format!("jexec {jail} sysctl net.inet6.ip6.forwarding=1"));
+        // Nodes 2 and 3 each behind a NAT: WireGuard leaves from port
+        // 61000, and nothing but answers comes back.
+        let mut rules = "pass all\n".to_owned();
+        if n > 1 {
+            rules = format!(
+                "nat on {a} inet proto udp from ({a}) port {port} to any -> ({a}) port 61000\n\
+                 {rules}block in quick on {a} proto udp to port {{ {port} 61000 }}\n",
+                port = mesh::PORT
+            );
+        }
+        let (ok, out) = sh(&format!("printf '{rules}' | jexec {jail} pfctl -f -"));
+        assert!(ok, "{out}");
+        sh(&format!("jexec {jail} pfctl -e"));
+
+        let sys = Shell::with_runner(Jexec(jail.clone()));
+        let subnet: Ipv4Net = format!("10.200.{n}.0/24").parse().unwrap();
+        let net = PodNetwork::new(subnet);
+        net.ensure_bridge(&sys).unwrap();
+        let key = sys.wg_genkey().unwrap();
+        let mesh = Mesh {
+            subnet,
+            private_key: key.clone(),
+            port: mesh::PORT,
+            nat: false,
+        };
+        mesh.ensure(&sys).unwrap();
+        let peer = Peer {
+            public_key: sys.wg_pubkey(&key).unwrap(),
+            endpoint: Some(format!("192.168.251.{n}:{}", mesh::PORT)),
+            subnet,
+            nat: false,
+            relay: false,
+        };
+        nodes.push(Node {
+            jail,
+            sys,
+            net,
+            peer,
+            mesh,
+        });
+    }
+    let jails: Vec<String> = nodes.iter().map(|n| n.jail.clone()).collect();
+    let addrs: Vec<Ipv4Addr> = nodes
+        .iter()
+        .map(|n| mesh::underlay_addr(n.net.subnet).unwrap())
+        .collect();
+    let reaches = |from: usize, to: usize, tries: usize| {
+        (0..tries).any(|_| sh(&format!("jexec {} ping -c1 -t1 {}", jails[from], addrs[to])).0)
+    };
+
+    // Each node reaches the relay; without it, 2 and 3 never meet.
+    let plain: Vec<Peer> = nodes.iter().map(|n| n.peer.clone()).collect();
+    for n in &nodes {
+        n.mesh.apply(&n.sys, &plain, &[]).unwrap();
+    }
+    assert!(reaches(1, 0, 20), "node 2 reaches the relay");
+    assert!(reaches(2, 0, 20), "node 3 reaches the relay");
+    assert!(!reaches(1, 2, 5), "nodes behind NAT do not meet directly");
+
+    // Said behind NAT, with node 1 relaying: 2 and 3 meet through it.
+    let flagged: Vec<Peer> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| Peer {
+            nat: i > 0,
+            relay: i == 0,
+            ..n.peer.clone()
+        })
+        .collect();
+    for (i, n) in nodes.iter_mut().enumerate() {
+        n.mesh.nat = i > 0;
+        n.mesh.apply(&n.sys, &flagged, &plain).unwrap();
+    }
+    assert!(reaches(1, 2, 20), "node 2 reaches node 3 through the relay");
+    assert!(reaches(2, 1, 20), "and back");
+    // Neither has the other as a peer: only the relay.
+    for i in [1, 2] {
+        let peers = nodes[i].sys.wg_peers(mesh::INTERFACE).unwrap();
+        assert_eq!(peers.len(), 1, "node {}: {peers:?}", i + 1);
+        assert_eq!(peers[0].public_key, nodes[0].peer.public_key);
     }
     drop(lab);
 }

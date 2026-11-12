@@ -58,6 +58,7 @@ test legion-net live pf_updates_by_services vnet shared 900 kld:if_bridge kld:if
 test legion-net mesh pods_across_nodes host shared 600 kld:if_bridge kld:if_epair kld:if_wg kld:pf
 # A measurement (PLAN.md phase 9, docs/MEASURE.md): its numbers in its log.
 test legion-net mesh mesh_growth_by_nodes host shared 900 kld:if_bridge kld:if_epair kld:if_wg
+test legion-net mesh nodes_behind_nat_reach_each_other_through_a_relay host shared 600 kld:if_bridge kld:if_epair kld:if_wg kld:pf
 test legion vip the_floating_address_follows_the_leader host shared 600 kld:carp kld:if_bridge kld:if_epair
 test legion adopt pods_outlive_the_daemon host shared 1800 kld:if_bridge kld:if_epair kld:if_wg kld:pf
 
