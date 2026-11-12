@@ -11,6 +11,32 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 
+/// The annotation a VM container's settings come in, as [`VmConfig`]'s
+/// JSON (DESIGN.md §6.8).
+pub const ANNOTATION_VM: &str = "legion.vm";
+
+/// A container that is a bhyve virtual machine: what bhyve takes, and the
+/// pod's network as the guest is to configure it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VmConfig {
+    pub cpus: u16,
+    /// Bytes.
+    pub memory: u64,
+    /// UEFI firmware and a cloud-init seed, not FreeBSD's loader.
+    pub uefi: bool,
+    /// The tap device the guest's network is (`tap<N>`).
+    pub tap: String,
+    /// `address/prefix`.
+    pub ip: String,
+    pub gateway: String,
+    pub ip6: Option<String>,
+    pub gateway6: Option<String>,
+    pub mtu: u32,
+    /// The resolver the guest asks.
+    pub dns: String,
+    pub hostname: String,
+}
+
 pub trait Runtime: Send + Sync + 'static {
     /// Whether the node has the image `reference` names and `user` (a
     /// namespace) may use it without asking its registry: it was pulled
