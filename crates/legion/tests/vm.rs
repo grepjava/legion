@@ -157,12 +157,22 @@ fn a_vm_pod_boots_and_serves() {
     let t = task().unwrap();
     let ip = t["status"]["ip"].as_str().unwrap().to_owned();
     let name = t["metadata"]["name"].as_str().unwrap().to_owned();
-    let out = std::process::Command::new("nc")
-        .args(["-N", "-w", "5", &ip, "8080"])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!(text(&out.stdout).trim(), "from-the-guest");
+    // The guest answers one connection at a time, its readiness probe's
+    // among them: a call between two may find no listener.
+    let mut answer = String::new();
+    for _ in 0..10 {
+        let out = std::process::Command::new("nc")
+            .args(["-N", "-w", "5", &ip, "8080"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        answer = text(&out.stdout).trim().to_owned();
+        if !answer.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert_eq!(answer, "from-the-guest");
     let logs = lab.ok(&["logs", &name, "-n", "default"]);
     assert!(
         logs.contains(&format!("legion-guest: up {ip}")),

@@ -531,7 +531,13 @@ pub fn kill_receiving(ds: &str, what: &str) -> String {
 /// interfaces, load balancing and state.
 pub fn clean(data: &str, run: &str) -> String {
     format!(
-        "for r in {data}/jails/*/record.json; do
+        "# A VM pod's supervisor and bhyve run on the host, not in its jail:
+         # the VMs go first, then the supervisors of this data directory.
+         for v in /dev/vmm/legion-*; do
+             [ -e \"$v\" ] && bhyvectl --vm=$(basename $v) --destroy
+         done
+         pkill -f 'jail-shim [s]upervise {data}/' 2>/dev/null
+         for r in {data}/jails/*/record.json; do
              [ -f \"$r\" ] || continue
              id=$(basename $(dirname \"$r\"))
              jls -j $id jid >/dev/null 2>&1 && jail -r $id
