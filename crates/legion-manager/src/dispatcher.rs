@@ -59,6 +59,9 @@ pub const HEARTBEAT_PERIOD: Duration = Duration::from_secs(2);
 /// yet.
 const FORWARDED_WORKER: &str = "legion-forwarded-worker";
 const FORWARDED_ISSUED: &str = "legion-forwarded-issued";
+/// With a forwarded heartbeat: the digest of the CA the node's certificate
+/// is of, as the manager it reached found it.
+const FORWARDED_CA: &str = "legion-forwarded-ca";
 /// Heartbeats missed before a node is suspect: its tasks leave the
 /// services' endpoints, so other nodes stop sending them connections,
 /// long before it is down and they are replaced.
@@ -197,6 +200,28 @@ impl DispatcherService {
             (Some(id), Some(issued)) => Some((id.name, issued)),
             _ => None,
         })
+    }
+
+    /// The digest of the CA the calling node's certificate is of: from a
+    /// manager forwarding a node's request, as it says; otherwise of the
+    /// caller's own certificate. `None` without TLS.
+    fn caller_ca<T>(&self, req: &Request<T>) -> Option<String> {
+        let trust = self.api.peer_tls.as_ref()?.ca_pem();
+        let from_manager = crate::tls::caller(req, self.tls)
+            .ok()
+            .flatten()
+            .is_some_and(|id| id.role == Role::Manager);
+        if from_manager
+            && let Some(said) = req
+                .metadata()
+                .get(FORWARDED_CA)
+                .and_then(|v| v.to_str().ok())
+        {
+            return Some(said.to_owned());
+        }
+        let certs = req.peer_certs()?;
+        let cert = certs.first()?;
+        Some(crate::ca::issuer_of(&legion_pki::cert_pem(cert), &trust))
     }
 
     /// The worker a manager forwarded the request for, as [`to_leader`]
@@ -1199,12 +1224,15 @@ impl Dispatcher for DispatcherService {
         req: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let node = self.node(&req, &req.get_ref().node)?;
+        let issuer = self.caller_ca(&req);
         if let Some(mut leader) = self.leader(&req)? {
             let worker = self.worker(&req)?;
             let usage = req.into_inner().usage;
-            return leader
-                .heartbeat(to_leader(HeartbeatRequest { node, usage }, &worker)?)
-                .await;
+            let mut forwarded = to_leader(HeartbeatRequest { node, usage }, &worker)?;
+            if let Some(issuer) = issuer.and_then(|i| i.parse().ok()) {
+                forwarded.metadata_mut().insert(FORWARDED_CA, issuer);
+            }
+            return leader.heartbeat(forwarded).await;
         }
         // Answered only as a leader a majority of managers confirmed lately.
         // One cut off from them may not know yet that another leads, which
@@ -1241,10 +1269,29 @@ impl Dispatcher for DispatcherService {
             }),
             runs_on,
         );
+        // What a CA rotation waits on: the CA of the node's certificate.
+        if let Some(issuer) = issuer {
+            self.api
+                .ca_seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(node.clone(), issuer);
+        }
         self.seen.lock().unwrap().insert(node, Instant::now());
+        // Only once this manager has taken up the recorded CA: else a node
+        // would be sent back to the one being left.
+        let (trust_pem, issuer) = match (&self.api.peer_tls, &self.api.issuer) {
+            (Some(c), Some(i)) => match i.current() {
+                Ok(ca) => (c.ca_pem(), ca.digest()),
+                Err(_) => Default::default(),
+            },
+            _ => Default::default(),
+        };
         Ok(Response::new(HeartbeatResponse {
             period_ms: self.period.as_millis() as u32,
             managers: self.managers(),
+            trust_pem,
+            issuer,
         }))
     }
 

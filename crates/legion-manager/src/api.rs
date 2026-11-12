@@ -61,6 +61,8 @@ pub struct ApiService {
     pub(crate) protocol: legion_api::protocol::Protocol,
     /// What it speaks and works with among managers: the floor counts.
     pub(crate) speaking: crate::upgrade::Speaking,
+    /// The CA each node's certificate was of at its last heartbeat here.
+    pub(crate) ca_seen: crate::ca::Seen,
 }
 
 pub(crate) enum Route {
@@ -101,7 +103,7 @@ impl ApiService {
     /// signs it, leader or not, as nothing is written.
     pub(crate) fn renew(&self, csr_pem: &str, id: &legion_pki::Identity) -> Result<String, Status> {
         self.issuer()?
-            .ca
+            .current()?
             .sign(csr_pem, id, legion_pki::CERT_LIFETIME)
             .map_err(|e| Status::invalid_argument(format!("certificate request: {e}")))
     }
@@ -1108,6 +1110,40 @@ impl Cluster for ApiService {
         self.audit_end(audit, result)
     }
 
+    async fn rotate_ca(
+        &self,
+        req: Request<pb::RotateCaRequest>,
+    ) -> Result<Response<pb::RotateCaResponse>, Status> {
+        let start = req.get_ref().start;
+        let audit = self.audit_point(
+            &req,
+            if start { "ca-rotate" } else { "ca-status" },
+            Default::default(),
+        );
+        let result = async {
+            self.caller(&req)?.require_all("rotate the cluster CA")?;
+            if let Some(addr) = self.leader_addr(&req)? {
+                let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                    &addr,
+                    self.peer_tls.as_ref(),
+                ));
+                return c.rotate_ca(forwarded(req.into_inner())).await;
+            }
+            self.consistent().await?;
+            if start {
+                crate::ca::start(self).await?;
+            }
+            Ok(Response::new(crate::ca::status(self).await?))
+        }
+        .await;
+        // Asking only reads: not a change to audit.
+        if start {
+            self.audit_end(audit, result)
+        } else {
+            result
+        }
+    }
+
     async fn autolock(
         &self,
         req: Request<pb::AutolockRequest>,
@@ -1314,7 +1350,7 @@ impl Cluster for ApiService {
                 days => std::time::Duration::from_secs(u64::from(days) * 24 * 3600),
             };
             // Any manager with the CA key can sign: nothing is written.
-            let ca = &self.issuer()?.ca;
+            let ca = self.issuer()?.current()?;
             let id = legion_pki::Identity::new(&req.name, Role::User);
             let cert_pem = ca
                 .sign(&req.csr_pem, &id, lifetime)
@@ -1352,6 +1388,7 @@ impl ApiService {
             protocol: self.speaking.mine.speaks,
             protocol_floor: crate::upgrade::read(&self.store),
             name: self.name.clone(),
+            ca_issuer: crate::ca::own_issuer(self),
         })
     }
 }

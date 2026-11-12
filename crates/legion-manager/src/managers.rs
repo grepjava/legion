@@ -82,6 +82,12 @@ async fn write(
     }
 }
 
+/// Each known member's name, by its id.
+pub(crate) fn names(store: &Store) -> Result<std::collections::HashMap<NodeId, String>, Status> {
+    let (known, _) = read(store)?;
+    Ok(known.into_iter().map(|(name, m)| (m.id, name)).collect())
+}
+
 /// `known` with each member of `members` that `named` (asked) gives a name
 /// for added, or moved to its new id; `None` if nothing changed.
 pub(crate) fn learned(

@@ -121,11 +121,28 @@ fn read_secrets(store: &Store) -> Result<(Secrets, Option<u64>), Status> {
 /// The leader's half of the join protocol, with the CA in hand.
 #[derive(Clone)]
 pub(crate) struct Issuer {
-    pub ca: Arc<Ca>,
+    /// The CA it signs with, which a rotation swaps.
+    pub ca: crate::ca::Authority,
+    /// This manager's credentials: the CAs the cluster trusts, which a
+    /// joining node is given.
+    pub credentials: Arc<crate::Credentials>,
     pub store: Store,
 }
 
 impl Issuer {
+    /// The CA to sign with: refused while this manager has not yet taken
+    /// up the CA the store records (a rotation begun moments ago), so no
+    /// certificate of the CA being left is issued after it began.
+    pub fn current(&self) -> Result<Arc<Ca>, Status> {
+        let ca = self.ca.ca();
+        match crate::ca::current(&self.store).map_err(Status::internal)? {
+            Some((record, _)) if record.digest() != ca.digest() => Err(Status::unavailable(
+                "this manager is taking up the cluster's new CA; retry",
+            )),
+            _ => Ok(ca),
+        }
+    }
+
     /// The token for `role`, made on first use; `rotate` makes a new one.
     /// Leader only: it writes.
     pub async fn token(&self, role: Role, rotate: bool) -> Result<Token, Status> {
@@ -154,7 +171,7 @@ impl Issuer {
                 _ => secrets.worker,
             };
             return Ok(Token {
-                ca_digest: self.ca.digest(),
+                ca_digest: self.current()?.digest(),
                 secret,
             });
         }
@@ -169,10 +186,17 @@ impl Issuer {
         req: JoinRequest,
     ) -> Result<JoinResponse, Status> {
         let token = Token::parse(&req.token).map_err(Status::invalid_argument)?;
-        if token.ca_digest != self.ca.digest() {
-            return Err(Status::permission_denied(
-                "the token is for another cluster",
-            ));
+        let ca = self.current()?;
+        if token.ca_digest != ca.digest() {
+            // A token shown before a CA rotation names the old CA.
+            let trusted = legion_pki::split_certs(&self.credentials.ca_pem())
+                .iter()
+                .any(|c| legion_pki::digest(c).is_ok_and(|d| d == token.ca_digest));
+            return Err(Status::permission_denied(if trusted {
+                "the token names the cluster's CA before its rotation: get a new one (`legion join-token`)"
+            } else {
+                "the token is for another cluster"
+            }));
         }
         let (secrets, _) = read_secrets(&self.store)?;
         let role = secrets
@@ -217,8 +241,7 @@ impl Issuer {
             .map_err(Status::unimplemented)?;
         let id = Identity::new(&req.name, role);
         // A bad request is refused before anything is written.
-        self.ca
-            .sign(&req.csr_pem, &id, CERT_LIFETIME)
+        ca.sign(&req.csr_pem, &id, CERT_LIFETIME)
             .map_err(|e| Status::invalid_argument(format!("certificate request: {e}")))?;
         // Run to the end even if the caller goes: stopped between its
         // writes, it would leave the name's earlier certificates refused
@@ -229,13 +252,15 @@ impl Issuer {
             .map_err(|e| Status::internal(e.to_string()))??;
         let mut ca_key_pem = String::new();
         if role == Role::Manager {
-            ca_key_pem = self.ca.key_pem().to_owned();
+            ca_key_pem = ca.key_pem().to_owned();
         }
         tracing::info!(%id, node_id = req.node_id, advertise = %req.advertise, "node joined");
         Ok(JoinResponse {
             role: role.as_str().to_owned(),
             cert_pem,
-            ca_pem: self.ca.cert_pem().to_owned(),
+            // The issuing CA first, then any other trusted while the CA is
+            // rotated: the node trusts them all.
+            ca_pem: trust_for(&ca, &self.credentials.ca_pem()),
             ca_key_pem,
             protocol: protocol.speaks,
             oldest_protocol: protocol.oldest,
@@ -266,9 +291,9 @@ impl Issuer {
                 .map_err(|e| Status::internal(e.to_string()))
         };
         let id = Identity::new(&req.name, role);
+        let ca = self.current()?;
         let certify = || {
-            self.ca
-                .sign(&req.csr_pem, &id, CERT_LIFETIME)
+            ca.sign(&req.csr_pem, &id, CERT_LIFETIME)
                 .map_err(|e| Status::invalid_argument(format!("certificate request: {e}")))
         };
         let (cert_pem, recorded) = self
@@ -399,6 +424,17 @@ fn issued_second(pem: &str) -> Result<u64, Status> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs())
+}
+
+/// The CAs a node is to trust, `ca` (which issues) first: `trust_pem` as
+/// this manager has it, which begins with `ca` once it has taken it up.
+fn trust_for(ca: &Ca, trust_pem: &str) -> String {
+    let certs = legion_pki::split_certs(trust_pem);
+    if certs.first().map(String::as_str) == Some(ca.cert_pem()) {
+        trust_pem.to_owned()
+    } else {
+        ca.cert_pem().to_owned()
+    }
 }
 
 async fn write(

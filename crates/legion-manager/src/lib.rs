@@ -12,6 +12,7 @@ mod api;
 mod audit;
 mod authz;
 pub mod autolock;
+pub mod ca;
 pub mod controller;
 mod dispatcher;
 #[cfg(feature = "test-hooks")]
@@ -155,8 +156,9 @@ pub struct Manager {
     advertise: String,
     store: Store,
     credentials: Option<std::sync::Arc<Credentials>>,
-    /// Held by managers, to certify joining and renewing nodes.
-    ca_key_pem: Option<String>,
+    /// The CA it certifies joining and renewing nodes with, which a CA
+    /// rotation swaps; `None` without the CA key.
+    authority: Option<ca::Authority>,
     heartbeat: std::time::Duration,
     controllers: bool,
     acme_loopback: bool,
@@ -190,6 +192,21 @@ impl Manager {
                 .unwrap_or_default(),
             None => config.name.clone(),
         };
+        // The CA that issues comes first among those trusted.
+        let authority = match &config.tls {
+            Some(Tls {
+                ca_pem,
+                ca_key_pem: Some(key),
+                ..
+            }) => {
+                let issuing = legion_pki::split_certs(ca_pem)
+                    .into_iter()
+                    .next()
+                    .ok_or("no CA certificate")?;
+                Some(ca::Authority::new(legion_pki::Ca::load(&issuing, key)?))
+            }
+            _ => None,
+        };
         let speaking = upgrade::Speaking::new(config.protocol);
         let heard = upgrade::Heard::default();
         let network = GrpcNetwork::new(credentials.clone(), speaking.clone(), heard.clone());
@@ -208,7 +225,7 @@ impl Manager {
             name,
             advertise: config.advertise,
             credentials,
-            ca_key_pem: config.tls.and_then(|t| t.ca_key_pem),
+            authority,
             heartbeat: config.heartbeat,
             controllers: config.controllers,
             acme_loopback: config.acme_loopback,
@@ -236,6 +253,12 @@ impl Manager {
     /// share with the agent beside it; `None` in plaintext.
     pub fn credentials(&self) -> Option<std::sync::Arc<Credentials>> {
         self.credentials.clone()
+    }
+
+    /// The CA it signs with, which the daemon swaps as a CA rotation
+    /// begins; `None` without the CA key.
+    pub fn authority(&self) -> Option<ca::Authority> {
+        self.authority.clone()
     }
 
     /// Reads this manager's metrics until its store shuts down.
@@ -298,9 +321,10 @@ impl Manager {
                 closing.clone(),
             ))
         });
-        let issuer = match (&self.credentials, &self.ca_key_pem) {
-            (Some(c), Some(key)) => Some(join::Issuer {
-                ca: std::sync::Arc::new(legion_pki::Ca::load(&c.ca_pem(), key)?),
+        let issuer = match (&self.credentials, &self.authority) {
+            (Some(c), Some(authority)) => Some(join::Issuer {
+                ca: authority.clone(),
+                credentials: c.clone(),
                 store: self.store.clone(),
             }),
             _ => None,
@@ -343,8 +367,10 @@ impl Manager {
             usage,
             protocol: self.protocol,
             speaking: self.speaking.clone(),
+            ca_seen: Default::default(),
         };
         let names = tokio::spawn(managers::run(api.clone(), api.closing.clone()));
+        let rotation = tokio::spawn(ca::run(api.clone(), api.closing.clone()));
         let auditing = tokio::spawn(audit::run(
             api.clone(),
             audited,
@@ -450,6 +476,7 @@ impl Manager {
         let _ = promote.await;
         let _ = floor.await;
         let _ = names.await;
+        let _ = rotation.await;
         let _ = auditing.await;
         let _ = dispatching.await;
         tracing::info!("API stopped; shutting down the store");
