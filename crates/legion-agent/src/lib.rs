@@ -92,6 +92,9 @@ pub struct AgentConfig {
     pub ingress: Option<std::net::SocketAddr>,
     /// Where it listens for HTTPS, for routes with `tls`, if anywhere.
     pub ingress_tls: Option<std::net::SocketAddr>,
+    /// Where load balancer addresses are held (DESIGN.md §5.4); the
+    /// default route's interface if unset.
+    pub load_balancer_interface: Option<String>,
     /// The node resolver as a process of its own, which outlives the
     /// agent; without it, the agent serves DNS itself.
     pub resolver: Option<ExternalResolver>,
@@ -150,6 +153,7 @@ impl AgentConfig {
             memory_check: Duration::from_secs(1),
             ingress: None,
             ingress_tls: None,
+            load_balancer_interface: None,
             resolver: None,
         }
     }
@@ -163,6 +167,7 @@ pub struct Agent<R, C> {
     ingress: Option<std::net::SocketAddr>,
     ingress_tls: Option<std::net::SocketAddr>,
     wireguard: Option<WireGuardConfig>,
+    load_balancer_interface: Option<String>,
     resolver: Option<ExternalResolver>,
 }
 
@@ -203,6 +208,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             ingress: config.ingress,
             ingress_tls: config.ingress_tls,
             wireguard: config.wireguard,
+            load_balancer_interface: config.load_balancer_interface,
             resolver: config.resolver,
         }
     }
@@ -392,6 +398,8 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             endpoints.clone(),
             subnet,
             mesh.is_some(),
+            ctx.node.clone(),
+            self.load_balancer_interface.clone(),
         ));
 
         let mut assignments = ctx.control.assignments(&ctx.node);
@@ -816,6 +824,8 @@ async fn load_balancing(
     mut endpoints: watch::Receiver<Endpoints>,
     subnet: legion_sys::Ipv4Net,
     mesh: bool,
+    node: String,
+    lb_interface: Option<String>,
 ) {
     use legion_net::lb::{self, Exits, LoadBalancer, Port, Proto, Service};
 
@@ -888,8 +898,18 @@ async fn load_balancing(
                     .collect(),
                 ready: e.ready.clone(),
                 alive: e.alive.clone(),
+                address: e.load_balancer.as_ref().map(|l| l.address),
+                carp: e.load_balancer.as_ref().and_then(|l| {
+                    Some(legion_sys::Carp {
+                        vhid: l.vhid,
+                        addr: l.address,
+                        password: l.password.clone(),
+                        advskew: *l.skews.get(&node)?,
+                    })
+                }),
             })
             .collect();
+        let lb_interface = lb_interface.clone();
         let (b, result) = task::blocking(&sys, move |sys| {
             let mut b = balancer;
             let egress = sys.default_interface().unwrap_or_else(|e| {
@@ -909,6 +929,7 @@ async fn load_balancing(
                 egress: egress.as_deref(),
                 mesh: mesh.then_some(legion_net::mesh::INTERFACE),
                 published: &published,
+                balancer: lb_interface.as_deref(),
             };
             let r = b.apply(sys, &services, subnet, exits);
             (b, r)
@@ -1460,6 +1481,7 @@ mod tests {
             alive: addrs.iter().map(|a| ip(a)).collect(),
             ordinals: BTreeMap::new(),
             job,
+            load_balancer: None,
         };
         let zone = zone(&vec![
             entry(false, Some(ip("10.201.0.1")), &["10.200.0.2"]),

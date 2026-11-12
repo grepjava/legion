@@ -549,6 +549,7 @@ mod tests {
             alive: ready,
             ordinals: Default::default(),
             job: false,
+            load_balancer: None,
         }
     }
 

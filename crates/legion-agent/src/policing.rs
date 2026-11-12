@@ -425,6 +425,7 @@ mod tests {
             alive: alive.iter().map(|a| ip(a)).collect(),
             ordinals: BTreeMap::new(),
             job: false,
+            load_balancer: None,
         }
     }
 

@@ -1812,6 +1812,18 @@ fn endpoints(
         })
         .map(|n| n.metadata.name.as_str())
         .collect();
+    // Nodes that may hold load balancer addresses: ready and active.
+    let holders: Vec<&str> = nodes
+        .values()
+        .filter(|n| {
+            let ready = serde_json::from_value::<NodeStatus>(n.status.clone())
+                .is_ok_and(|s| s.state == NodeState::Ready);
+            let active = legion_api::parse::<legion_api::node::NodeSpec>(&n.spec)
+                .is_ok_and(|s| s.availability == legion_api::node::Availability::Active);
+            ready && active
+        })
+        .map(|n| n.metadata.name.as_str())
+        .collect();
     /// Ready and running task addresses, and ready ones by ordinal.
     type Addrs = (Vec<Ipv4Addr>, Vec<Ipv4Addr>, BTreeMap<u32, Ipv4Addr>);
     let mut by_service: BTreeMap<(&str, String), Addrs> = BTreeMap::new();
@@ -1861,8 +1873,12 @@ fn endpoints(
                 .unwrap_or_default();
             ready.sort();
             alive.sort();
-            let ports = legion_api::parse::<ServiceSpec>(&s.spec)
-                .ok()
+            let spec = legion_api::parse::<ServiceSpec>(&s.spec).ok();
+            let load_balancer = spec
+                .as_ref()
+                .and_then(|spec| spec.endpoint.as_ref()?.load_balancer.as_ref())
+                .map(|lb| load_balancer_holders(&s.metadata.uid, lb, &holders));
+            let ports = spec
                 .and_then(|spec| {
                     let pod = spec.pod;
                     let ports = spec.endpoint?.ports;
@@ -1898,6 +1914,7 @@ fn endpoints(
                 alive,
                 ordinals,
                 job: false,
+                load_balancer,
             }
         })
         .chain(
@@ -1915,10 +1932,44 @@ fn endpoints(
                         alive,
                         ordinals: BTreeMap::new(),
                         job: true,
+                        load_balancer: None,
                     }
                 }),
         )
         .collect()
+}
+
+/// Who holds a service's load balancer address: every node in `nodes`,
+/// ranked by a hash of the service and the node (rendezvous hashing), so a
+/// node coming or going moves only the addresses it held. The first is the
+/// CARP master (the lowest skew); the password is the service's own.
+fn load_balancer_holders(
+    uid: &str,
+    lb: &legion_api::service::LoadBalancerAddress,
+    nodes: &[&str],
+) -> legion_api::dispatch::LoadBalancerHolders {
+    use sha2::Digest;
+    let mut ranked: Vec<(Vec<u8>, &str)> = nodes
+        .iter()
+        .map(|n| (sha2::Sha256::digest(format!("{uid}/{n}")).to_vec(), *n))
+        .collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0));
+    let skews = ranked
+        .iter()
+        .enumerate()
+        .map(|(i, (_, n))| ((*n).to_owned(), (i.min(12) * 20) as u8))
+        .collect();
+    let password = sha2::Sha256::digest(format!("legion-lb/{uid}"))
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    legion_api::dispatch::LoadBalancerHolders {
+        address: lb.address,
+        vhid: lb.vhid,
+        password,
+        skews,
+    }
 }
 
 fn replace<T: PartialEq + Clone>(old: &mut Option<T>, new: Option<&T>) -> bool {
