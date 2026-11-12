@@ -400,9 +400,24 @@ Built and tested in spike S4 (`crates/legion-store`).
   rules and WireGuard peers in place, and retry a manager every 500 ms.
   When the manager returns it reads its state from disk and the agents
   reconcile with it. A manager whose disk is lost is rebuilt from a backup
-  (below). There is no promotion of a worker: a worker becomes a manager
-  by having its Node deleted and joining again with a manager token, from
-  an empty data directory.
+  (below).
+- **Roles, changed in place** (`legion node promote|demote NODE`, the
+  cluster admin's): the leader records the change asked for
+  (`legion-system/role-changes`). A worker learns it from its heartbeats
+  and asks to be promoted (`Dispatcher.Promote`, with a new key's request,
+  a Raft id and its advertised address): the leader certifies it as a
+  manager, gives it the CAs and the CA key, and adds it to Raft as a
+  learner, promoted to a voter once caught up, as a joining manager. A
+  manager reads the change from its store and asks the leader to demote
+  it (`Cluster.Demote`, the leader alone answering, so none forwards it
+  under its own name): the leader certifies it as a worker and takes it
+  out of the membership; never the last voter. Either way every
+  certificate the node held before is refused from then, and its daemon
+  writes its new role's credentials and starts again in place (it execs
+  itself, with the same arguments), its pods running on and adopted. A
+  demoted manager gives up the CA key, its store's key and its store (set
+  aside), its Raft id and the admin bundle, and keeps its WireGuard key.
+  Its lab test: `a_worker_and_a_manager_change_roles_in_place`.
 - **Backup and restore** (phase 4). `legion backup -o FILE` (cluster
   admin) has the leader read every object at one linearizable version,
   with the managers' ids and addresses, and streams it as JSON (file mode
