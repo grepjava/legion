@@ -149,6 +149,11 @@ enum Command {
         /// with a public address, say.
         #[arg(long)]
         mesh_relay: bool,
+        /// The interface load balancer addresses are held on (services'
+        /// `endpoint.loadBalancer`): the one on the network they are
+        /// addresses of. The default route's if not given.
+        #[arg(long)]
+        load_balancer_interface: Option<String>,
         /// Where the node's volume plugins are: executables, by the name
         /// a Volume's `plugin.name` gives [default:
         /// /usr/local/libexec/legion/volume].
@@ -631,6 +636,7 @@ async fn run() -> anyhow::Result<()> {
             linux,
             mesh_nat,
             mesh_relay,
+            load_balancer_interface,
             volume_plugins,
             insecure_registries,
             audit_retention_days,
@@ -668,6 +674,7 @@ async fn run() -> anyhow::Result<()> {
                 linux,
                 mesh_nat,
                 mesh_relay,
+                load_balancer_interface,
                 volume_plugins,
                 insecure_registries,
                 audit: legion_manager::AuditRetention {

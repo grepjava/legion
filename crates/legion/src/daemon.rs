@@ -29,6 +29,9 @@ pub struct Options {
     /// Where the ingress proxy listens, if anywhere: HTTP and HTTPS.
     pub ingress_listen: Option<SocketAddr>,
     pub ingress_tls_listen: Option<SocketAddr>,
+    /// Where load balancer addresses are held; the default route's
+    /// interface if unset.
+    pub load_balancer_interface: Option<String>,
     /// Run Linux images too, through the Linux ABI.
     pub linux: bool,
     /// Behind a NAT no other node gets through: traffic to other such
@@ -523,6 +526,7 @@ async fn start_agent(
     }
     config.ingress = opts.ingress_listen;
     config.ingress_tls = opts.ingress_tls_listen;
+    config.load_balancer_interface = opts.load_balancer_interface.clone();
     // Its own process, which pods' lookups need through a restart.
     config.resolver = Some(legion_agent::ExternalResolver {
         command: vec![
