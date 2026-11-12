@@ -737,9 +737,11 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                     node,
                     namespace,
                     name,
+                    replace,
                 },
         } => {
-            crate::volume_backup::restore(channel.clone(), &file, node, namespace, name).await?;
+            crate::volume_backup::restore(channel.clone(), &file, node, namespace, name, replace)
+                .await?;
         }
         Command::Rollback { service, namespace } => {
             println!(

@@ -476,7 +476,10 @@ pub enum VolumeCommand {
     },
     /// Restore a Volume from a backup onto NODE, which must not have its
     /// data. The Volume is made once all of it is there, and must not
-    /// exist: delete it first, or give another --name.
+    /// exist: delete it first, or give another --name. With --replace, it
+    /// restores into the Volume of that name lost with its node (removed
+    /// with the data on it): the Volume and what uses it are kept, and its
+    /// tasks start on NODE.
     Restore {
         file: PathBuf,
         #[arg(long)]
@@ -487,6 +490,8 @@ pub enum VolumeCommand {
         /// The Volume's name (default: the backup's).
         #[arg(long)]
         name: Option<String>,
+        #[arg(long)]
+        replace: bool,
     },
 }
 

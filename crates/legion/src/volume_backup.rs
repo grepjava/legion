@@ -109,6 +109,7 @@ pub(crate) async fn restore(
     node: String,
     namespace: Option<String>,
     name: Option<String>,
+    replace: bool,
 ) -> anyhow::Result<()> {
     let file =
         std::fs::File::open(input).with_context(|| format!("opening {}", input.display()))?;
@@ -119,6 +120,7 @@ pub(crate) async fn restore(
         name: name.clone().unwrap_or_default(),
         node: node.clone(),
         header_json,
+        replace,
     };
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     tx.send(VolumeRestoreChunk {
