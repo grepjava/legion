@@ -35,6 +35,15 @@ pub struct ServiceSpec {
     /// between `min` and `max` from what the tasks use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autoscale: Option<Autoscale>,
+    /// Higher first: pending tasks are placed in its order, and one with
+    /// nowhere to run for want of room stops tasks of lower priority on a
+    /// node to make it (DESIGN.md §3.5, Priorities). Default 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub priority: i32,
+}
+
+fn is_zero(n: &i32) -> bool {
+    *n == 0
 }
 
 /// Autoscaling (DESIGN.md §3.3, Autoscaler): the replica count that brings
@@ -1139,6 +1148,29 @@ pub struct Placement {
     pub preferences: Vec<Preference>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tolerations: Vec<Toleration>,
+    /// Near other services' tasks: on nodes running one of each `required`
+    /// service (or, not required, preferring nodes running more of them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affinity: Vec<Affinity>,
+    /// Away from other services' tasks, or the service's own (at most one
+    /// task per node): never on nodes running one of each `required`
+    /// service (or, not required, preferring nodes running fewer).
+    #[serde(
+        default,
+        rename = "antiAffinity",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub anti_affinity: Vec<Affinity>,
+}
+
+/// A service, in the same namespace, a placement keeps near or away from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Affinity {
+    pub service: String,
+    /// A rule nodes must meet, not only a preference.
+    #[serde(default)]
+    pub required: bool,
 }
 
 impl Placement {
@@ -1165,6 +1197,16 @@ impl Placement {
                     field(&index(path, "tolerations", i), "key"),
                     "must not be empty",
                 ));
+            }
+        }
+        for (list, name) in [
+            (&self.affinity, "affinity"),
+            (&self.anti_affinity, "antiAffinity"),
+        ] {
+            for (i, a) in list.iter().enumerate() {
+                crate::validate_name(&a.service).map_err(|e| {
+                    Invalid::new(field(&index(path, name, i), "service"), e.to_string())
+                })?;
             }
         }
         Ok(())
