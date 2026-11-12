@@ -116,6 +116,12 @@ pub struct Peer {
     pub endpoint: Option<String>,
     /// The node's pod subnet, e.g. `10.200.3.0/24`.
     pub pod_cidr: String,
+    /// Behind a NAT no other node gets through ([`crate::node::WireGuard`]).
+    #[serde(default)]
+    pub nat: bool,
+    /// Relays between nodes behind NAT.
+    #[serde(default)]
+    pub relay: bool,
 }
 
 /// Every node with a pod subnet and a WireGuard key, by name.

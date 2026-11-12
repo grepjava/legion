@@ -195,6 +195,13 @@ pub struct WireGuard {
     /// node to reach them first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// Behind a NAT no other node gets through: two such nodes reach each
+    /// other through a relay (`--mesh-nat`, DESIGN.md §5.3).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nat: bool,
+    /// Relays between nodes behind NAT (`--mesh-relay`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub relay: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
