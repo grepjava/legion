@@ -672,7 +672,7 @@ impl ApiService {
 
     /// Takes the manager named `name` out of the Raft membership, if it is
     /// a member: never the last voter.
-    async fn leave_membership(&self, name: &str) -> Result<(), Status> {
+    pub(crate) async fn leave_membership(&self, name: &str) -> Result<(), Status> {
         use openraft::ChangeMembers;
         let Some(id) = crate::managers::id_of(&self.store, name)? else {
             return Ok(());
@@ -1145,6 +1145,59 @@ impl Cluster for ApiService {
         } else {
             result
         }
+    }
+
+    async fn change_role(
+        &self,
+        req: Request<pb::ChangeRoleRequest>,
+    ) -> Result<Response<pb::ChangeRoleResponse>, Status> {
+        let audit = self.audit_point(
+            &req,
+            "change-role",
+            crate::audit::target("Node", "", &req.get_ref().node),
+        );
+        let result = async {
+            self.caller(&req)?.require_all("change a node's role")?;
+            if let Some(addr) = self.leader_addr(&req)? {
+                let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                    &addr,
+                    self.peer_tls.as_ref(),
+                ));
+                return c.change_role(forwarded(req.into_inner())).await;
+            }
+            self.consistent().await?;
+            let req = req.into_inner();
+            crate::roles::request(self, &req.node, &req.role).await?;
+            Ok(Response::new(pb::ChangeRoleResponse {}))
+        }
+        .await;
+        self.audit_end(audit, result)
+    }
+
+    async fn demote(
+        &self,
+        req: Request<pb::DemoteRequest>,
+    ) -> Result<Response<pb::DemoteResponse>, Status> {
+        // Its own demotion, by the manager's certificate: only the leader
+        // answers, as one forwarding would call with its own.
+        let id = match crate::tls::caller(&req, self.peer_tls.is_some())? {
+            Some(id) if id.role == Role::Manager => id,
+            _ => {
+                return Err(Status::permission_denied(
+                    "only a manager asks to be demoted",
+                ));
+            }
+        };
+        let m = self.store.raft.metrics().borrow().clone();
+        if m.current_leader != Some(self.id) {
+            return Err(Status::unavailable("not the leader; ask the leader"));
+        }
+        self.consistent().await?;
+        if let Some(issued) = crate::tls::caller_issued(&req, self.peer_tls.is_some())? {
+            crate::removed::check(&self.store, &id.name, issued)?;
+        }
+        let r = crate::roles::demote(self, &id.name, req.into_inner()).await?;
+        Ok(Response::new(r))
     }
 
     async fn autolock(

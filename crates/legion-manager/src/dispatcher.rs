@@ -1145,6 +1145,42 @@ impl Dispatcher for DispatcherService {
         }))
     }
 
+    async fn promote(
+        &self,
+        req: Request<legion_proto::v1::PromoteRequest>,
+    ) -> Result<Response<legion_proto::v1::PromoteResponse>, Status> {
+        let forwarded_for = self.forwarded_worker(&req)?;
+        let (name, issued) = match self.caller(&req)? {
+            Some(id) if id.role == Role::Worker => {
+                (id.name, crate::tls::caller_issued(&req, self.tls)?)
+            }
+            Some(id) if id.role == Role::Manager && forwarded_for.is_some() => {
+                let (name, issued) = forwarded_for.clone().expect("checked");
+                (name, Some(issued))
+            }
+            Some(id) => {
+                return Err(Status::permission_denied(format!(
+                    "{id}: only a worker is promoted"
+                )));
+            }
+            None => {
+                return Err(Status::failed_precondition(
+                    "this manager serves without TLS",
+                ));
+            }
+        };
+        if let Some(mut leader) = self.leader(&req)? {
+            let worker = self.worker(&req)?;
+            return leader.promote(to_leader(req.into_inner(), &worker)?).await;
+        }
+        self.api.consistent().await?;
+        if let Some(issued) = issued {
+            crate::removed::check(self.store(), &name, issued)?;
+        }
+        let r = crate::roles::promote(&self.api, &name, req.into_inner()).await?;
+        Ok(Response::new(r))
+    }
+
     async fn renew(&self, req: Request<RenewRequest>) -> Result<Response<RenewResponse>, Status> {
         let forwarded_for = self.forwarded_worker(&req)?;
         let id = match self.caller(&req)? {
@@ -1277,7 +1313,10 @@ impl Dispatcher for DispatcherService {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(node.clone(), issuer);
         }
-        self.seen.lock().unwrap().insert(node, Instant::now());
+        self.seen
+            .lock()
+            .unwrap()
+            .insert(node.clone(), Instant::now());
         // Only once this manager has taken up the recorded CA: else a node
         // would be sent back to the one being left.
         let (trust_pem, issuer) = match (&self.api.peer_tls, &self.api.issuer) {
@@ -1287,11 +1326,17 @@ impl Dispatcher for DispatcherService {
             },
             _ => Default::default(),
         };
+        // A worker asked to become a manager takes it up from here.
+        let role = match crate::roles::wanted(self.store(), &node) {
+            Ok(Some(legion_pki::Role::Manager)) => "manager".to_owned(),
+            _ => String::new(),
+        };
         Ok(Response::new(HeartbeatResponse {
             period_ms: self.period.as_millis() as u32,
             managers: self.managers(),
             trust_pem,
             issuer,
+            role,
         }))
     }
 

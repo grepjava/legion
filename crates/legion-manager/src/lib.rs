@@ -26,6 +26,7 @@ mod quota;
 mod raft_net;
 mod removed;
 pub mod requests;
+pub mod roles;
 mod security;
 mod session;
 mod tls;
@@ -159,6 +160,9 @@ pub struct Manager {
     /// The CA it certifies joining and renewing nodes with, which a CA
     /// rotation swaps; `None` without the CA key.
     authority: Option<ca::Authority>,
+    /// Set once this manager is demoted: what its daemon writes before it
+    /// starts again as a worker.
+    demoted: std::sync::Arc<tokio::sync::watch::Sender<Option<roles::Demoted>>>,
     heartbeat: std::time::Duration,
     controllers: bool,
     acme_loopback: bool,
@@ -226,6 +230,7 @@ impl Manager {
             advertise: config.advertise,
             credentials,
             authority,
+            demoted: std::sync::Arc::new(tokio::sync::watch::channel(None).0),
             heartbeat: config.heartbeat,
             controllers: config.controllers,
             acme_loopback: config.acme_loopback,
@@ -259,6 +264,12 @@ impl Manager {
     /// begins; `None` without the CA key.
     pub fn authority(&self) -> Option<ca::Authority> {
         self.authority.clone()
+    }
+
+    /// What a demotion gave this manager, once it has been demoted: its
+    /// daemon writes it and starts again as a worker.
+    pub fn demoted(&self) -> tokio::sync::watch::Receiver<Option<roles::Demoted>> {
+        self.demoted.subscribe()
     }
 
     /// Reads this manager's metrics until its store shuts down.
@@ -371,6 +382,11 @@ impl Manager {
         };
         let names = tokio::spawn(managers::run(api.clone(), api.closing.clone()));
         let rotation = tokio::spawn(ca::run(api.clone(), api.closing.clone()));
+        let demotion = tokio::spawn(roles::follow(
+            api.clone(),
+            self.demoted.clone(),
+            api.closing.clone(),
+        ));
         let auditing = tokio::spawn(audit::run(
             api.clone(),
             audited,
@@ -477,6 +493,7 @@ impl Manager {
         let _ = floor.await;
         let _ = names.await;
         let _ = rotation.await;
+        let _ = demotion.await;
         let _ = auditing.await;
         let _ = dispatching.await;
         tracing::info!("API stopped; shutting down the store");

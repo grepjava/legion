@@ -312,7 +312,7 @@ impl Issuer {
     }
 
     /// Adds the manager `req` joins to Raft as a learner.
-    async fn add_learner(&self, req: &JoinRequest) -> Result<(), Status> {
+    pub(crate) async fn add_learner(&self, req: &JoinRequest) -> Result<(), Status> {
         // Raft takes one membership change at a time: wait for the one in
         // flight (another manager joining or being promoted), which takes
         // a few round trips.
