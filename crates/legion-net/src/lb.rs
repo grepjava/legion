@@ -412,7 +412,11 @@ mod tests {
         let r = lb.apply(&sys, &[web(&["10.200.0.2"], &[])], subnet, Exits::default());
         assert!(r.is_err());
         assert!(sys.anchor(ANCHOR).is_none());
-        assert!(sys.pf_table_show(ANCHOR, "s0000000000000007").unwrap().is_empty());
+        assert!(
+            sys.pf_table_show(ANCHOR, "s0000000000000007")
+                .unwrap()
+                .is_empty()
+        );
         sys.break_anchor(ANCHOR, false);
         lb.apply(&sys, &[web(&["10.200.0.2"], &[])], subnet, Exits::default())
             .unwrap();
@@ -422,7 +426,9 @@ mod tests {
             .expect(&loaded);
         assert!(table < loaded.find("rdr ").unwrap(), "{loaded}");
         assert_eq!(
-            sys.pf_table_show(ANCHOR, "s0000000000000007").unwrap().len(),
+            sys.pf_table_show(ANCHOR, "s0000000000000007")
+                .unwrap()
+                .len(),
             2
         );
     }

@@ -563,7 +563,10 @@ fn mesh_growth_by_nodes() {
         "run on the host: the nodes are jails"
     );
     let switch = "lmeshg-sw".to_owned();
-    assert!(!sh(&format!("jls -j {switch}")).0, "{switch} exists already");
+    assert!(
+        !sh(&format!("jls -j {switch}")).0,
+        "{switch} exists already"
+    );
     let mut lab = Growth {
         jails: vec![switch.clone()],
         links: Vec::new(),
@@ -576,7 +579,9 @@ fn mesh_growth_by_nodes() {
     ));
 
     let ms = |d: Duration| format!("{:.0} ms", d.as_secs_f64() * 1000.0);
-    println!("| Nodes | New node's peers set | Others add it (each, slowest) | Every node reached |");
+    println!(
+        "| Nodes | New node's peers set | Others add it (each, slowest) | Every node reached |"
+    );
     println!("|---|---|---|---|");
     let mut nodes: Vec<Node> = Vec::new();
     let mut peers: Vec<Peer> = Vec::new();
