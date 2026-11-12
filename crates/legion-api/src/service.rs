@@ -1317,6 +1317,25 @@ pub struct Endpoint {
     pub mode: EndpointMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<ServicePort>,
+    /// An address on the nodes' own network the service's ports answer on,
+    /// held by one node at a time with CARP and moved to another when it
+    /// fails (DESIGN.md §5.4, Load balancer addresses).
+    #[serde(
+        default,
+        rename = "loadBalancer",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub load_balancer: Option<LoadBalancerAddress>,
+}
+
+/// A service's address on the nodes' network, as a CARP virtual host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoadBalancerAddress {
+    pub address: std::net::Ipv4Addr,
+    /// The CARP virtual host id, 1 to 255, unique on the network: not the
+    /// managers' `--vip-vhid`, nor another service's.
+    pub vhid: u8,
 }
 
 impl Endpoint {
@@ -1382,6 +1401,27 @@ impl Endpoint {
                     }
                 }
                 _ => {}
+            }
+        }
+        if let Some(lb) = &self.load_balancer {
+            let a = lb.address;
+            if a.is_unspecified() || a.is_loopback() || a.is_multicast() || a.is_broadcast() {
+                return Err(Invalid::new(
+                    field(&field(path, "loadBalancer"), "address"),
+                    "must be an address of the nodes' network",
+                ));
+            }
+            if lb.vhid == 0 {
+                return Err(Invalid::new(
+                    field(&field(path, "loadBalancer"), "vhid"),
+                    "must be 1-255",
+                ));
+            }
+            if self.ports.is_empty() {
+                return Err(Invalid::new(
+                    field(path, "loadBalancer"),
+                    "a load balancer address needs ports",
+                ));
             }
         }
         if self.mode == EndpointMode::Dnsrr

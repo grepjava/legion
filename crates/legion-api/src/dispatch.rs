@@ -50,6 +50,19 @@ pub struct ServiceEndpoints {
     /// network policy, which counts them in their namespace.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub job: bool,
+    /// Its load balancer address, and the nodes that hold it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_balancer: Option<LoadBalancerHolders>,
+}
+
+/// A service's load balancer address and its CARP virtual host, with the
+/// nodes that may hold it: each its CARP skew, the lowest the master.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadBalancerHolders {
+    pub address: Ipv4Addr,
+    pub vhid: u8,
+    pub password: String,
+    pub skews: BTreeMap<String, u8>,
 }
 
 /// A service port, resolved against the pod.
