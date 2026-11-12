@@ -413,18 +413,28 @@ fn check_storage(store: &Store, cur: &Object, next: &Object) -> Result<(), Statu
     if !status.node.is_empty() {
         return refuse(format!("is held by node {}", status.node));
     }
-    if let Some(task) = mounted_by(store, cur)? {
+    if let Some(task) = mounted_by(store, cur, false)? {
         return refuse(format!("is mounted by task {task}"));
     }
     Ok(())
 }
 
-/// A task that has not ended and mounts the Volume `cur`, if any.
-fn mounted_by(store: &Store, cur: &Object) -> Result<Option<String>, Status> {
+/// A task that has not ended and mounts the Volume `cur`, if any. With
+/// `placed`, only one on a node of the cluster counts: one on no node yet
+/// mounts nothing (a lost Volume's waits so), nor does one on a node
+/// removed, which is heard no more; so such a Volume may be deleted.
+fn mounted_by(store: &Store, cur: &Object, placed: bool) -> Result<Option<String>, Status> {
     use legion_api::task::{TaskSpec, TaskStatus};
     let tasks = store
         .list(Kind::Task, Some(&cur.metadata.namespace))
         .map_err(internal)?;
+    let nodes: std::collections::BTreeSet<String> = store
+        .list(Kind::Node, None)
+        .map_err(internal)?
+        .objects
+        .into_iter()
+        .map(|n| n.metadata.name)
+        .collect();
     for t in &tasks.objects {
         let (Ok(spec), Ok(state)) = (
             serde_json::from_value::<TaskSpec>(t.spec.clone()),
@@ -432,19 +442,16 @@ fn mounted_by(store: &Store, cur: &Object) -> Result<Option<String>, Status> {
         ) else {
             continue;
         };
-        if !state.state.is_terminal() && spec.uses_volume(&cur.metadata.name) {
+        if !state.state.is_terminal()
+            && spec.uses_volume(&cur.metadata.name)
+            && (!placed || nodes.contains(&spec.node))
+        {
             return Ok(Some(t.metadata.name.clone()));
         }
     }
     Ok(None)
 }
 
-/// Refuses to delete a Volume in use, and returns the version checked, for
-/// the delete to be made on: a task that has not ended mounts it, or a
-/// node still in the cluster holds the LUN or plugin volume it attached.
-/// Deleted then, it would come back unheld, for another node to attach
-/// while the first still writes to it. (A ZFS volume's node keeps its
-/// dataset whatever its tasks do, and the Volume may go once they have.)
 /// An `ImagePolicy`'s keys must each read as a P-256 public key: admission
 /// checks only that they are PEM, as the key reader lives in legion-image.
 fn check_policy_keys(policy: &Object) -> Result<(), Status> {
@@ -461,6 +468,12 @@ fn check_policy_keys(policy: &Object) -> Result<(), Status> {
     Ok(())
 }
 
+/// Refuses to delete a Volume in use, and returns the version checked, for
+/// the delete to be made on: a task that has not ended mounts it, or a
+/// node still in the cluster holds the LUN or plugin volume it attached.
+/// Deleted then, it would come back unheld, for another node to attach
+/// while the first still writes to it. (A ZFS volume's node keeps its
+/// dataset whatever its tasks do, and the Volume may go once they have.)
 fn check_volume_delete(store: &Store, key: &ObjectKey) -> Result<Option<u64>, Status> {
     use legion_api::volume::{Access, VolumeSpec, VolumeStatus};
     let Some(cur) = store.get(key).map_err(internal)? else {
@@ -471,7 +484,7 @@ fn check_volume_delete(store: &Store, key: &ObjectKey) -> Result<Option<u64>, St
             "{key} {why}: it is deleted only once nothing uses it"
         )))
     };
-    if let Some(task) = mounted_by(store, &cur)? {
+    if let Some(task) = mounted_by(store, &cur, true)? {
         return refuse(format!("is mounted by task {task}"));
     }
     let spec: VolumeSpec = legion_api::parse(&cur.spec).map_err(internal)?;

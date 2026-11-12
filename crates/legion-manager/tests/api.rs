@@ -3975,9 +3975,37 @@ async fn a_volume_in_use_is_not_deleted() {
             .is_empty()
     })
     .await;
+    let task = |node: &str| {
+        let mut t = m
+            .store
+            .list(Kind::Task, Some("default"))
+            .unwrap()
+            .objects
+            .remove(0);
+        t.spec["node"] = serde_json::json!(node);
+        t
+    };
+    // On a node of the cluster: refused.
+    put(task("w2")).await;
     let err = delete("lun").await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
     assert!(err.message().contains("mounted by task"), "{err}");
+    // On a node removed, or on none yet (a lost Volume's task waits so),
+    // it mounts nothing: the Volume may go.
+    put(task("gone")).await;
+    delete("lun").await.unwrap();
+    apply_json(
+        &m,
+        "Volume",
+        "lun",
+        serde_json::json!({
+            "driver": "iscsi",
+            "iscsi": { "portal": "192.0.2.5", "target": "iqn.2026-11.test:a", "lun": 0 },
+        }),
+    )
+    .await;
+    put(task("")).await;
+    delete("lun").await.unwrap();
     m.stop().await;
 }
 
