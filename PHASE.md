@@ -1561,7 +1561,9 @@ services, priorities and preemption; mesh relays for nodes behind NAT
 (`--mesh-nat`, `--mesh-relay`); a service's load-balancer address held
 with CARP by one ready node (`endpoint.loadBalancer`); VM pods, a
 container with `vm` booted with bhyve on the pod's network; and jailer's
-multi-arch index, each node running its own platform's image. The
+multi-arch index, each node running its own platform's image; and the
+first part of a web console (CONSOLE.md phase 1, `--console-listen`,
+`legion console login`): read-only, live, as the signed-in user. The
 port's `distinfo` is
 made for v0.1.13, and its crates are v0.1.9's, but it has not been through
 `poudriere testport` since v0.1.9. Waiting on the user: the port's

@@ -87,6 +87,15 @@ The cluster as it is, live.
 change made with the CLI shows in an open page within a second, on the
 lab; and no page offers an action.
 
+**Built so far (v0.1.19):** sign-in (`legion console login`, `Cluster.Me`,
+`ConsoleCode`/`ConsoleSession`/`ConsoleEnd`); the gateway (`--console-listen`)
+with list, get, watch and status as the user; pages for the overview, a
+live list of every kind with columns for nodes, tasks, services, volumes,
+routes and bindings, and each object's spec and status (JSON for now).
+Tested over HTTPS against a manager (`crates/legion-manager/tests/console.rs`).
+Still to do in this phase: task logs, label filters, YAML views, the
+richer node and task pages, and the browser test on the lab.
+
 ## Phase 2: operating workloads
 
 What a team does day to day.
