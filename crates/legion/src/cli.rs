@@ -379,6 +379,24 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 output.display()
             );
         }
+        Command::Console { action: _, url } => {
+            let code = cluster
+                .console_code(pb::ConsoleCodeRequest::default())
+                .await?
+                .into_inner();
+            let base = match url {
+                Some(u) => u.trim_end_matches('/').to_owned(),
+                None => {
+                    let host = host_port(server)
+                        .rsplit_once(':')
+                        .map_or(host_port(server), |(h, _)| h);
+                    format!("https://{host}:7480")
+                }
+            };
+            // In the fragment: never sent to a server, nor kept in its logs.
+            println!("{base}/login#code={}", code.code);
+            eprintln!("open it within 60 s; it signs you in once");
+        }
         Command::Ca { action } => {
             let r = cluster
                 .rotate_ca(pb::RotateCaRequest {

@@ -111,6 +111,18 @@ enum Command {
         /// tasks show there.
         #[arg(long)]
         metrics_listen: Option<SocketAddr>,
+        /// Managers: serve the web console here over HTTPS, e.g.
+        /// `0.0.0.0:7480` (DESIGN.md §3.9). Users sign in with `legion
+        /// console login`.
+        #[arg(long)]
+        console_listen: Option<SocketAddr>,
+        /// The console's certificate (PEM, its chain included) for browsers
+        /// to trust; the manager's own, of the cluster CA, without it.
+        #[arg(long, requires = "console_key")]
+        console_cert: Option<PathBuf>,
+        /// The key of --console-cert (PEM).
+        #[arg(long, requires = "console_cert")]
+        console_key: Option<PathBuf>,
         /// Managers: a floating address for the API, held by one manager at
         /// a time (the leader when it can) with CARP on --vip-interface.
         /// Every manager on the link sets the same address, vhid and
@@ -208,6 +220,16 @@ enum Command {
     Ca {
         #[arg(value_parser = ["rotate", "status"])]
         action: String,
+    },
+    /// The web console (DESIGN.md §3.9). `login` prints a link that signs
+    /// you in as this CLI's identity: good once, for 60 s.
+    Console {
+        #[arg(value_parser = ["login"])]
+        action: String,
+        /// The console's address, as a browser reaches it [default: the
+        /// --server host, port 7480].
+        #[arg(long)]
+        url: Option<String>,
     },
     /// Give a locked manager on this host its unlock key, read from
     /// --key-file or else from stdin.
@@ -627,6 +649,9 @@ async fn run() -> anyhow::Result<()> {
             zfs_root,
             managers,
             metrics_listen,
+            console_listen,
+            console_cert,
+            console_key,
             vip,
             vip_interface,
             vip_vhid,
@@ -657,7 +682,20 @@ async fn run() -> anyhow::Result<()> {
                 }
                 _ => None,
             };
+            let read = |p: &PathBuf| {
+                std::fs::read_to_string(p)
+                    .map_err(|e| anyhow::anyhow!("reading {}: {e}", p.display()))
+            };
+            let console = match console_listen {
+                Some(listen) => Some(legion_manager::Console {
+                    listen,
+                    cert_pem: console_cert.as_ref().map(read).transpose()?,
+                    key_pem: console_key.as_ref().map(read).transpose()?,
+                }),
+                None => None,
+            };
             daemon::run(daemon::Options {
+                console,
                 data_dir,
                 run_dir,
                 listen,

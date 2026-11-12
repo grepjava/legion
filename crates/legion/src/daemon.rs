@@ -24,6 +24,7 @@ pub struct Options {
     pub managers: Vec<String>,
     /// Where to serve Prometheus metrics, if anywhere.
     pub metrics_listen: Option<SocketAddr>,
+    pub console: Option<legion_manager::Console>,
     /// Managers: the floating address.
     pub vip: Option<legion_manager::vip::VipConfig>,
     /// Where the ingress proxy listens, if anywhere: HTTP and HTTPS.
@@ -93,6 +94,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         store_key: Some(store_key),
         insecure_registries: opts.insecure_registries.clone(),
         audit: opts.audit,
+        console: opts.console.clone(),
         ..legion_manager::ManagerConfig::new(&opts.data_dir, &advertise)
     })
     .await
