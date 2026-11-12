@@ -1518,7 +1518,7 @@ make ZFS volumes. Built in `legion_api::volume`, `legion-agent::volumes`,
 - **Not yet**: CHAP for iSCSI, multipath, other file systems on LUNs,
   Compose `driver_opts`, timeouts for plugins that hang.
 
-### 6.8 bhyve tasks: the spike (phase 5)
+### 6.8 bhyve tasks
 
 Can a virtual machine be a pod? The spike (`legion-net/tests/bhyve.rs`)
 boots a small FreeBSD guest (`tests/bhyve-guest.sh`: this host's kernel,
@@ -1537,15 +1537,27 @@ checks it against Legion's own rules. On FreeBSD 15.1:
   allows it with the tap as the guard's interface. No rule changed.
 - It found the ARP fault in 5.3, which every pod had.
 
-What a `runtime: bhyve` would still need, none of it networking: disk
-images (a raw image, not OCI layers, cloned per task from a zvol, as
-images are now), boot (bhyveload for FreeBSD, UEFI otherwise), the
-seed, supervision of the bhyve process (a restart is a reboot), limits
-(`-c` and `-m` from the pod's), the console as the task's log, a
-graceful stop (ACPI power button, then `bhyvectl --destroy`), and
-volumes as virtio-blk zvols or NFS from inside. Not checked: a guest
-spoofing its source (the policy refuses any other source on the tap, as
-on an epair), and guests on other nodes (routed like any pod).
+Built (P3, after the spike): a container with `vm: { cpus, memory, boot }`
+is a virtual machine. Its image is an OCI image whose one file is the
+guest's disk, `/disk.img`: it travels, loads and is pinned as any image,
+and each task's root is a clone of it, so the guest writes its own copy.
+A VM is its pod's only container, with nothing put inside it (no
+volumes, secrets or configs) and probes over the network only. Its pod's
+network is a tap the agent makes, renamed as any pod's host end (its
+device keeps its `tapN`, which bhyve opens) and put on the bridge, so
+policy, endpoints and detaching treat it as any pod; the guest takes the
+pod's address itself. Its supervisor runs on the host what the jail
+runtime gives it (`legion_jail::vm`): `bhyveload` with the address in
+`legion.*` loader variables (`boot: freebsd`), or UEFI firmware
+(`edk2-bhyve`) with a cloud-init NoCloud seed (`boot: uefi`), then
+`bhyve` with `-c` and `-m` from the spec, the console as the container's
+output and so its log. A reboot boots it again; a power-off ends the
+container with 0; the stop signal is the ACPI power button, and removing
+the container destroys the VM whatever its script did. Its lab test,
+`a_vm_pod_boots_and_serves`, boots the spike's guest as a Service's task
+and reaches it at its address. Its memory and CPUs count as its
+requests at the least, as they are set aside whole. Not built: volumes
+for a guest (virtio-blk zvols).
 
 ## 7. Object model
 
