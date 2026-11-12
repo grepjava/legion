@@ -470,10 +470,16 @@ mod tests {
         let before = old.issue(&w1, legion_pki::CERT_LIFETIME).unwrap();
         let after = new.issue(&w1, legion_pki::CERT_LIFETIME).unwrap();
         let peer_old = old
-            .issue(&Identity::new("w2", Role::Worker), legion_pki::CERT_LIFETIME)
+            .issue(
+                &Identity::new("w2", Role::Worker),
+                legion_pki::CERT_LIFETIME,
+            )
             .unwrap();
         let peer_new = new
-            .issue(&Identity::new("w3", Role::Worker), legion_pki::CERT_LIFETIME)
+            .issue(
+                &Identity::new("w3", Role::Worker),
+                legion_pki::CERT_LIFETIME,
+            )
             .unwrap();
         let der = |pem: &str| CertificateDer::from_pem_slice(pem.as_bytes()).unwrap();
         let accepts = |creds: &Credentials, pem: &str| {
