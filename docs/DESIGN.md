@@ -1717,7 +1717,7 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
   back, `legion ca status` naming it: bring it back or remove it. Join
   tokens name the new CA from the start; one shown before is refused,
   saying why. A backup taken before restores the old CA with the rest.
-  Tested on the lab (`the_ca_rotates_with_every_node_on_it`): three nodes
+  Its lab test (`the_ca_rotates_with_every_node_on_it`): three nodes
   with a task each move, the tasks untouched.
 - **Audit** (phase 7): every change (apply, delete, init, join tokens,
   issuing users, autolock, joins, volume backups and restores), every

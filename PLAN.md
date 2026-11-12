@@ -355,8 +355,8 @@ ending), and a user's certificate renews nothing
 rotation, its own item to come. Built after 0.1.19 (docs/DESIGN.md, CA
 rotation): `legion ca rotate` moves every manager and node to a new CA
 with the old one trusted until all have, a cross-signed certificate
-bridging the two, and then refuses all the old CA issued; tested on the
-fake hosts and the lab.
+bridging the two, and then refuses all the old CA issued; tested on
+fake hosts, its lab test (`the_ca_rotates_with_every_node_on_it`) to run.
 
 Item 3 is built (docs/DESIGN.md, Audit), as decided with the user: kept
 in the replicated store, for changes, sessions and refusals, not reads.
