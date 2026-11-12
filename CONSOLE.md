@@ -16,8 +16,9 @@ API first, then the CLI and the console.
 ## Principles
 
 - **One binary.** The console is served by the daemon (`--console-listen`)
-  from assets embedded at build time. No Node, no separate server, and
-  nothing new for the port to package at run time.
+  from assets embedded at build time: a Svelte app, on Svelte's latest
+  release. No Node at run time, no separate server, and nothing new for
+  the port to package at run time.
 - **Off by default.** Nothing listens until a flag says so, as with
   `--metrics-listen` and the ingress.
 - **The API is the boundary.** A gateway in the manager turns browser
@@ -58,8 +59,10 @@ Decide the two things that are hard to change later, in DESIGN.md:
    services in-process as the user, so leader forwarding, consistency
    and RBAC behave as for the CLI.
 
-Also decided here: the frontend stack (a small, typed SPA, built in CI
-and embedded with `include_bytes!`), URL scheme, and the browsers
+The frontend is Svelte, kept on its latest release: SvelteKit with its
+static adapter, built as a single-page app in TypeScript, the output
+embedded in the daemon with `include_bytes!` (Node is needed to build,
+never to run). Also decided here: the URL scheme, and the browsers
 supported (current Firefox, Chrome, Safari).
 
 **Done when** both notes are in DESIGN.md and reviewed.
