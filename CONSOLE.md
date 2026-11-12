@@ -93,8 +93,16 @@ with list, get, watch and status as the user; pages for the overview, a
 live list of every kind with columns for nodes, tasks, services, volumes,
 routes and bindings, and each object's spec and status (JSON for now).
 Tested over HTTPS against a manager (`crates/legion-manager/tests/console.rs`).
-Still to do in this phase: task logs, label filters, YAML views, the
-richer node and task pages, and the browser test on the lab.
+
+**Since v0.1.19:** sign-in over HTTP/2, as browsers speak it (the origin
+check took the host from a `Host` header HTTP/2 doesn't send; the test
+now signs in over HTTP/2); task logs (`/api/logs`, a WebSocket of the
+`Pods.Session` the CLI's `logs` opens, tail and follow); what tasks use
+now (`/api/usage`); label filters in every list (`app=web`, `app!=web`,
+`!canary`, beside words for names); a YAML view of any object; a node's
+page with its capacity, use and tasks; a task's page with its logs and
+links to its service and node. Still to do in this phase: the browser
+test on the lab.
 
 ## Phase 2: operating workloads
 
