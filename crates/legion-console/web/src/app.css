@@ -256,3 +256,37 @@ tr:last-child td {
   border: 1px solid var(--line);
   border-radius: 8px;
 }
+
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+  border-bottom: 1px solid var(--line);
+  margin: 1rem 0 0.75rem;
+}
+.tabs button {
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: none;
+  padding: 0.4rem 0.75rem;
+  color: var(--muted);
+}
+.tabs button.here {
+  border-bottom-color: var(--accent);
+  color: var(--text);
+}
+.controls {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 0.5rem;
+}
+pre.log {
+  max-height: 70vh;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+pre.log .stderr {
+  color: var(--bad);
+}

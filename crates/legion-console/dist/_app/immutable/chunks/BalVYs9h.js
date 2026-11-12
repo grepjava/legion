@@ -1,0 +1,1 @@
+function e(e){return/[^aeiou]y$/.test(e)?e.slice(0,-1)+`ies`:/(s|x|ch|sh)$/.test(e)?e+`es`:e+`s`}export{e as t};

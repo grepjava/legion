@@ -90,8 +90,66 @@ export const api = {
     call<LObject>(
       'GET',
       `/api/objects/${encodeURIComponent(kind)}/${encodeURIComponent(namespace || '_')}/${encodeURIComponent(name)}`
-    )
+    ),
+  usage: (namespace = '') => call<{ nodes: NodeUsage[] }>('GET', `/api/usage${q(namespace)}`)
 };
+
+export interface NodeUsage {
+  node: string;
+  tasks: { namespace: string; task: string; cpu_percent: number; memory_bytes: number }[];
+}
+
+/**
+ * A task's output as it comes: `out` gets each piece (and whether it was
+ * stderr), `done` the end, with the reason when it failed. Returns a
+ * function that stops it.
+ */
+export function logs(
+  namespace: string,
+  task: string,
+  opts: { container?: string; tail?: number; follow?: boolean },
+  out: (text: string, stderr: boolean) => void,
+  done: (error: string | null) => void
+): () => void {
+  const params = new URLSearchParams();
+  if (opts.container) params.set('container', opts.container);
+  if (opts.tail !== undefined) params.set('tail', String(opts.tail));
+  if (opts.follow) params.set('follow', 'true');
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const socket = new WebSocket(
+    `${proto}//${location.host}/api/logs/${encodeURIComponent(namespace)}/${encodeURIComponent(task)}?${params}`
+  );
+  let ended = false;
+  const end = (e: string | null) => {
+    if (!ended) done(e);
+    ended = true;
+  };
+  socket.onmessage = (m) => {
+    const e = JSON.parse(m.data);
+    if (e.out !== undefined) out(e.out, false);
+    else if (e.err !== undefined) out(e.err, true);
+    else if (e.error) end(e.error);
+    else if (e.end) end(null);
+  };
+  // Refused before the upgrade (signed out, not allowed): no reason reaches
+  // a WebSocket.
+  socket.onclose = () => end('the logs could not be read');
+  return () => {
+    ended = true;
+    socket.close();
+  };
+}
+
+/** A byte count as people read it: 1.5 GiB. */
+export function bytes(n: number): string {
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) {
+    n /= 1024;
+    i++;
+  }
+  return `${i ? n.toFixed(1) : n} ${units[i]}`;
+}
 
 export function key(o: LObject): string {
   return `${o.metadata.namespace ?? ''}/${o.metadata.name}`;

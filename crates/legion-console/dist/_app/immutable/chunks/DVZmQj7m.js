@@ -1,1 +1,0 @@
-import{N as e}from"./DW4IByg3.js";var t=e({me:null,kinds:[],namespace:``});function n(e){let n=t.me;return n?n.all?e:Object.keys(n.namespaces).sort():[]}export{t as n,n as t};

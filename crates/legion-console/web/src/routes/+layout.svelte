@@ -3,6 +3,7 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import { api, whenSignedOut } from '#lib/api.ts';
+  import { plural } from '#lib/kinds.ts';
   import { namespaces, session } from '#lib/session.svelte.ts';
 
   let { children } = $props();
@@ -69,14 +70,14 @@
         <h2>Workloads and config</h2>
         {#each nsKinds as k (k.kind)}
           <a href="/k/{k.kind}" class:here={page.url.pathname.startsWith(`/k/${k.kind}`)}
-            >{k.kind}s</a
+            >{plural(k.kind)}</a
           >
         {/each}
         {#if clusterKinds.length}
           <h2>Cluster</h2>
           {#each clusterKinds as k (k.kind)}
             <a href="/k/{k.kind}" class:here={page.url.pathname.startsWith(`/k/${k.kind}`)}
-              >{k.kind}s</a
+              >{plural(k.kind)}</a
             >
           {/each}
         {/if}

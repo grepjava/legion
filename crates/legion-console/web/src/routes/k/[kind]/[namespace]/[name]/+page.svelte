@@ -2,6 +2,10 @@
   import { page } from '$app/state';
   import { api, follow, type LObject } from '#lib/api.ts';
   import { columns, tone } from '#lib/columns.ts';
+  import { plural } from '#lib/kinds.ts';
+  import NodeTasks from '#lib/NodeTasks.svelte';
+  import TaskLogs from '#lib/TaskLogs.svelte';
+  import { toYaml } from '#lib/yaml.ts';
 
   const kind = $derived(page.params.kind ?? '');
   const namespace = $derived(page.params.namespace === '_' ? '' : (page.params.namespace ?? ''));
@@ -9,11 +13,13 @@
   let object: LObject | null = $state(null);
   let error = $state('');
   let gone = $state(false);
+  let tab: 'details' | 'tasks' | 'logs' | 'yaml' = $state('details');
 
   $effect(() => {
     object = null;
     error = '';
     gone = false;
+    tab = 'details';
     api
       .get(kind, namespace, name)
       .then((o) => (object = o))
@@ -31,13 +37,18 @@
     );
   });
 
+  const tabs = $derived([
+    { id: 'details', label: 'Details' },
+    ...(kind === 'Node' ? [{ id: 'tasks', label: 'Tasks' }] : []),
+    ...(kind === 'Task' ? [{ id: 'logs', label: 'Logs' }] : []),
+    { id: 'yaml', label: 'YAML' }
+  ] as { id: typeof tab; label: string }[]);
   const cols = $derived(columns(kind));
-  const json = (v: unknown) => JSON.stringify(v ?? null, null, 2);
 </script>
 
 <header class="bar">
   <h1>
-    <a href="/k/{kind}">{kind}s</a> / {#if namespace}{namespace} / {/if}{name}
+    <a href="/k/{kind}">{plural(kind)}</a> / {#if namespace}{namespace} / {/if}{name}
   </h1>
   {#if gone}<span class="state bad">deleted</span>{/if}
 </header>
@@ -45,35 +56,56 @@
 {#if error}
   <p class="error">{error}</p>
 {:else if object}
-  <dl class="facts">
-    {#each cols as c (c.label)}
-      {#if c.value(object)}
-        <dt>{c.label}</dt>
+  <div class="tabs" role="tablist">
+    {#each tabs as t (t.id)}
+      <button role="tab" aria-selected={tab === t.id} class:here={tab === t.id} onclick={() => (tab = t.id)}
+        >{t.label}</button
+      >
+    {/each}
+  </div>
+
+  {#if tab === 'details'}
+    <dl class="facts">
+      {#each cols as c (c.label)}
+        {#if c.value(object)}
+          <dt>{c.label}</dt>
+          <dd>
+            {#if c.state}<span class="state {tone(c.value(object))}">{c.value(object)}</span>
+            {:else}{c.value(object)}{/if}
+          </dd>
+        {/if}
+      {/each}
+      {#if kind === 'Task' && object.spec?.service}
+        <dt>Service</dt>
         <dd>
-          {#if c.state}<span class="state {tone(c.value(object))}">{c.value(object)}</span>
-          {:else}{c.value(object)}{/if}
+          <a href="/k/{object.spec.job ? 'Job' : 'Service'}/{namespace}/{object.spec.service}"
+            >{object.spec.service}</a
+          >
         </dd>
       {/if}
-    {/each}
-    <dt>Version</dt>
-    <dd>{object.metadata.version} (generation {object.metadata.generation})</dd>
-    <dt>UID</dt>
-    <dd><code>{object.metadata.uid}</code></dd>
-    {#if object.metadata.labels && Object.keys(object.metadata.labels).length}
-      <dt>Labels</dt>
-      <dd>
-        {#each Object.entries(object.metadata.labels) as [k, v] (k)}
-          <span class="tag">{k}={v}</span>
-        {/each}
-      </dd>
-    {/if}
-  </dl>
-
-  <h2>Spec</h2>
-  <pre>{json(object.spec)}</pre>
-  {#if object.status !== null && object.status !== undefined}
-    <h2>Status</h2>
-    <pre>{json(object.status)}</pre>
+      {#if kind === 'Task' && object.spec?.node}
+        <dt>On node</dt>
+        <dd><a href="/k/Node/_/{object.spec.node}">{object.spec.node}</a></dd>
+      {/if}
+      <dt>Version</dt>
+      <dd>{object.metadata.version} (generation {object.metadata.generation})</dd>
+      <dt>UID</dt>
+      <dd><code>{object.metadata.uid}</code></dd>
+      {#if object.metadata.labels && Object.keys(object.metadata.labels).length}
+        <dt>Labels</dt>
+        <dd>
+          {#each Object.entries(object.metadata.labels) as [k, v] (k)}
+            <a class="tag" href="/k/{kind}?filter={encodeURIComponent(`${k}=${v}`)}">{k}={v}</a>
+          {/each}
+        </dd>
+      {/if}
+    </dl>
+  {:else if tab === 'tasks'}
+    <NodeTasks node={object} />
+  {:else if tab === 'logs'}
+    <TaskLogs task={object} />
+  {:else}
+    <pre>{toYaml(object)}</pre>
   {/if}
 {:else}
   <p class="muted">…</p>

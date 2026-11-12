@@ -2,6 +2,8 @@
   import { page } from '$app/state';
   import { follow, type LObject } from '#lib/api.ts';
   import { columns, tone } from '#lib/columns.ts';
+  import { matches, parse } from '#lib/filter.ts';
+  import { plural } from '#lib/kinds.ts';
   import { session } from '#lib/session.svelte.ts';
 
   const kind = $derived(page.params.kind ?? '');
@@ -9,6 +11,12 @@
   let objects: LObject[] = $state([]);
   let error = $state('');
   let filter = $state('');
+  // A link may bring a filter (a label on an object's page); another kind
+  // starts unfiltered.
+  $effect(() => {
+    void kind;
+    filter = page.url.searchParams.get('filter') ?? '';
+  });
 
   $effect(() => {
     objects = [];
@@ -25,17 +33,15 @@
   });
 
   const cols = $derived(columns(kind));
-  const shown = $derived(
-    filter
-      ? objects.filter((o) => `${o.metadata.namespace ?? ''}/${o.metadata.name}`.includes(filter))
-      : objects
-  );
+  const terms = $derived(parse(filter));
+  const shown = $derived(terms.length ? objects.filter((o) => matches(o, terms)) : objects);
   const href = (o: LObject) => `/k/${kind}/${o.metadata.namespace || '_'}/${o.metadata.name}`;
 </script>
 
 <header class="bar">
-  <h1>{kind}s</h1>
-  <input type="search" placeholder="Filter by name" bind:value={filter} />
+  <h1>{plural(kind)}</h1>
+  <input type="search" placeholder="Filter: name, app=web, !canary"
+    title="Words match names; key=value, key!=value and !key (no such label) match labels" bind:value={filter} />
   <span class="muted">{shown.length} of {objects.length}, live</span>
 </header>
 
