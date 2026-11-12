@@ -137,6 +137,18 @@ enum Command {
         /// `node.platform.linux == true`.
         #[arg(long)]
         linux: bool,
+        /// This node is behind a NAT that no other node gets through (one
+        /// that maps each destination apart, say): it reaches other nodes,
+        /// but they reach it only once it has, and two such nodes never
+        /// reach each other directly. Their traffic goes through a relay
+        /// (`--mesh-relay`) instead.
+        #[arg(long)]
+        mesh_nat: bool,
+        /// This node relays WireGuard traffic between nodes behind NAT
+        /// (`--mesh-nat`). Give it to a node every node reaches: a manager
+        /// with a public address, say.
+        #[arg(long)]
+        mesh_relay: bool,
         /// Where the node's volume plugins are: executables, by the name
         /// a Volume's `plugin.name` gives [default:
         /// /usr/local/libexec/legion/volume].
@@ -617,6 +629,8 @@ async fn run() -> anyhow::Result<()> {
             ingress_listen,
             ingress_tls_listen,
             linux,
+            mesh_nat,
+            mesh_relay,
             volume_plugins,
             insecure_registries,
             audit_retention_days,
@@ -652,6 +666,8 @@ async fn run() -> anyhow::Result<()> {
                 ingress_listen,
                 ingress_tls_listen,
                 linux,
+                mesh_nat,
+                mesh_relay,
                 volume_plugins,
                 insecure_registries,
                 audit: legion_manager::AuditRetention {

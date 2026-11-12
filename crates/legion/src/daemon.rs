@@ -31,6 +31,11 @@ pub struct Options {
     pub ingress_tls_listen: Option<SocketAddr>,
     /// Run Linux images too, through the Linux ABI.
     pub linux: bool,
+    /// Behind a NAT no other node gets through: traffic to other such
+    /// nodes goes through a relay.
+    pub mesh_nat: bool,
+    /// Relays between nodes behind NAT.
+    pub mesh_relay: bool,
     /// Where the volume plugins are, if not in the default place.
     pub volume_plugins: Option<PathBuf>,
     /// Registries (`host[:port]`) reached over plain HTTP: by the managers
@@ -531,6 +536,8 @@ async fn start_agent(
     config.wireguard = Some(WireGuardConfig {
         key: wireguard,
         port: legion_net::mesh::PORT,
+        nat: opts.mesh_nat,
+        relay: opts.mesh_relay,
     });
     let sys: Arc<dyn legion_sys::Sys> = Arc::new(legion_sys::Shell::new());
     let runtime = Arc::new(jail_runtime(opts, &sys)?);
