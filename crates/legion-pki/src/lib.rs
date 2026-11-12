@@ -407,11 +407,13 @@ impl Bundle {
                 _ => {}
             }
         }
+        // The CAs after the certificate: one, or more while the cluster's CA
+        // is rotated, the one that issues first.
         match (certs.as_slice(), key) {
-            ([cert, ca], Some(key)) => Ok(Bundle {
+            ([cert, cas @ ..], Some(key)) if !cas.is_empty() => Ok(Bundle {
                 cert_pem: cert.clone(),
                 key_pem: key,
-                ca_pem: ca.clone(),
+                ca_pem: cas.concat(),
             }),
             _ => Err(Error::Invalid(
                 "a bundle holds a certificate, its key and the CA certificate".into(),
@@ -625,6 +627,14 @@ mod tests {
         let ca_pem = b.ca_pem.replace("END CERTIFICATE", "END PRIVATE KEY");
         let mismatched = format!("{}{}{ca_pem}", b.cert_pem, b.key_pem);
         assert!(Bundle::parse(&mismatched).is_err());
+        // While the CA is rotated: both CAs, in order.
+        let (next, cross) = ca.successor().unwrap();
+        let trust = format!("{}{cross}{}", next.cert_pem(), ca.cert_pem());
+        let issued = next
+            .issue(&Identity::new("admin", Role::Admin), CERT_LIFETIME)
+            .unwrap();
+        let rotating = Bundle::new(issued, &trust);
+        assert_eq!(Bundle::parse(&rotating.to_pem()).unwrap(), rotating);
     }
 
     #[test]
