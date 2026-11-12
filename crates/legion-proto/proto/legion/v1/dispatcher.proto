@@ -50,6 +50,10 @@ service Dispatcher {
   // A new certificate for the calling worker, as its current one names
   // it, for the key `csr_pem` was made with. Managers issue their own.
   rpc Renew(RenewRequest) returns (RenewResponse);
+  // The calling worker, asked to become a manager (its heartbeats say so),
+  // certified as one and added to Raft as a learner, as a manager joining
+  // is.
+  rpc Promote(PromoteRequest) returns (PromoteResponse);
 }
 
 message RenewRequest {
@@ -58,6 +62,23 @@ message RenewRequest {
 
 message RenewResponse {
   string cert_pem = 1;
+}
+
+message PromoteRequest {
+  string csr_pem = 1;
+  // Its Raft id, and the address other managers reach it at.
+  uint64 node_id = 2;
+  string advertise = 3;
+  // What it speaks, and the oldest it works with (legion_api::protocol).
+  uint32 protocol = 4;
+  uint32 oldest_protocol = 5;
+}
+
+message PromoteResponse {
+  string cert_pem = 1;
+  // The CAs the cluster trusts, the issuing one first, and its key.
+  string ca_pem = 2;
+  string ca_key_pem = 3;
 }
 
 message SessionsRequest {
@@ -194,4 +215,6 @@ message HeartbeatResponse {
   // builds before.
   string trust_pem = 3;
   string issuer = 4;
+  // "manager" when the node is asked to become one; empty otherwise.
+  string role = 5;
 }

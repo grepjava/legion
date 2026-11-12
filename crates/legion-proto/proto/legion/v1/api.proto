@@ -123,6 +123,14 @@ service Cluster {
   // new CA every node moves to, the old one trusted until all have; either
   // way, says where the rotation is. The cluster admin's only.
   rpc RotateCa(RotateCaRequest) returns (RotateCaResponse);
+  // Asks a node to become a manager or a worker (DESIGN.md §3.7, roles):
+  // the node's daemon takes it up, in place, its tasks running on. The
+  // cluster admin's only.
+  rpc ChangeRole(ChangeRoleRequest) returns (ChangeRoleResponse);
+  // A manager asked to become a worker, asking the leader for its worker
+  // certificate: it leaves the Raft membership as it gets it. The calling
+  // manager's only, for itself.
+  rpc Demote(DemoteRequest) returns (DemoteResponse);
   // What tasks use, as their nodes last reported it (within a minute), by
   // node: the tasks of `namespace`, or of every namespace when empty, that
   // the caller may read.
@@ -177,6 +185,27 @@ message AutolockResponse {
 
 message RotateCaRequest {
   bool start = 1;
+}
+
+message ChangeRoleRequest {
+  string node = 1;
+  // "manager" or "worker".
+  string role = 2;
+}
+
+message ChangeRoleResponse {}
+
+message DemoteRequest {
+  // A PEM certificate request for the node's new key.
+  string csr_pem = 1;
+}
+
+message DemoteResponse {
+  string cert_pem = 1;
+  // The CAs the cluster trusts, the issuing one first.
+  string ca_pem = 2;
+  // The managers it calls from now, `host:port`.
+  repeated string managers = 3;
 }
 
 message RotateCaResponse {
