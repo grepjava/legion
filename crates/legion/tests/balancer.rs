@@ -99,11 +99,11 @@ fn a_load_balancer_address_answers_and_moves() {
     let mut lab = Lab::from_env();
     let step = |what: &str| eprintln!("--- {what}");
     let (iface, address) = interface_and_address(&lab.host);
-    let flags = ["--load-balancer-interface", iface.as_str()];
-    lab.flags = format!("{} {}", lab.flags, flags.join(" "));
+    // Every node's daemon is given it, this host's too, through `flags`.
+    lab.flags = format!("{} --load-balancer-interface {iface}", lab.flags);
 
     step("three nodes, and web at a load balancer address");
-    lab.three_nodes(&flags);
+    lab.three_nodes(&[]);
     let file = lab.dir.join("web.yaml");
     std::fs::write(&file, app(&address)).unwrap();
     lab.ok(&["apply", "-f", file.to_str().unwrap()]);
