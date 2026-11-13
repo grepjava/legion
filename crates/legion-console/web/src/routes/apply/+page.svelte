@@ -77,7 +77,7 @@
 
 <textarea class="editor" bind:value={yaml} spellcheck="false" rows="26" aria-label="YAML"></textarea>
 <div class="controls">
-  <button onclick={() => run(true)} disabled={busy || !yaml.trim()}>Show changes</button>
+  <button onclick={() => run(true)} disabled={!!why || busy || !yaml.trim()} title={why ?? ''}>Show changes</button>
   <button class="primary" onclick={() => run(false)} disabled={!!why || busy || !yaml.trim()} title={why ?? ''}
     >Apply</button
   >
