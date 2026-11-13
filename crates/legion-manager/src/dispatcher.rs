@@ -1740,7 +1740,7 @@ fn routes(routes: &BTreeMap<ObjectKey, Object>) -> Routes {
 }
 
 /// Namespaces' isolation, where it is not the default, and every policy.
-fn policies(
+pub(crate) fn policies(
     namespaces: &BTreeMap<ObjectKey, Object>,
     policies: &BTreeMap<ObjectKey, Object>,
 ) -> Policies {
@@ -1797,7 +1797,7 @@ async fn pause(closing: &mut watch::Receiver<bool>) -> bool {
 /// The ready tasks of each service: running, ready, with an address, of
 /// the service as it is now (not an earlier one of the same name), and on
 /// a node neither suspect, down nor removed.
-fn endpoints(
+pub(crate) fn endpoints(
     services: &BTreeMap<ObjectKey, Object>,
     tasks: &BTreeMap<ObjectKey, Object>,
     nodes: &BTreeMap<ObjectKey, Object>,

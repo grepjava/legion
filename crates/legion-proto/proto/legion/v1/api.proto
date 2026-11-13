@@ -135,6 +135,11 @@ service Cluster {
   // node: the tasks of `namespace`, or of every namespace when empty, that
   // the caller may read.
   rpc Usage(UsageRequest) returns (UsageResponse);
+  // What may reach what among a namespace's services, as the nodes'
+  // guards decide it (DESIGN.md §5.6): for each service, and for the
+  // tasks of every other namespace, the ports of each service it may
+  // reach. For any caller who may read the namespace's services.
+  rpc Reach(ReachRequest) returns (ReachResponse);
   // The audit events the filter matches, oldest first, at most `limit`
   // (1000 when 0): the cluster admin's only (legion_api::audit).
   rpc Audit(AuditRequest) returns (AuditResponse);
@@ -218,6 +223,33 @@ message RecordAuditResponse {}
 
 message UsageRequest {
   string namespace = 1;
+}
+
+message ReachRequest {
+  string namespace = 1;
+}
+
+message ReachResponse {
+  // The namespace's services, in name order.
+  repeated string services = 1;
+  // One per source and destination that it may reach on some port.
+  repeated ReachEdge edges = 2;
+}
+
+message ReachEdge {
+  // A service of the namespace; empty for the tasks of other namespaces.
+  string from = 1;
+  string to = 2;
+  // Every port of its tasks, not only those the service names.
+  bool all_ports = 3;
+  // The service's ports it may reach (its tasks' ports), when not all.
+  repeated ReachPort ports = 4;
+}
+
+message ReachPort {
+  // "tcp" or "udp".
+  string protocol = 1;
+  uint32 port = 2;
 }
 
 message UsageResponse {

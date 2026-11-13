@@ -1251,6 +1251,64 @@ impl Cluster for ApiService {
         self.audit_end(audit, result)
     }
 
+    async fn reach(
+        &self,
+        req: Request<pb::ReachRequest>,
+    ) -> Result<Response<pb::ReachResponse>, Status> {
+        let caller = self.caller(&req)?;
+        let namespace = req.into_inner().namespace;
+        if namespace.is_empty() {
+            return Err(Status::invalid_argument("which namespace?"));
+        }
+        check_namespace(&namespace)?;
+        caller.check(&self.store, Verb::Read, Kind::Service, &namespace)?;
+        // Built as the dispatcher builds what the nodes' guards take.
+        let all = |kind| -> Result<BTreeMap<ObjectKey, Object>, Status> {
+            Ok(self
+                .store
+                .list(kind, None)
+                .map_err(internal)?
+                .objects
+                .into_iter()
+                .map(|o| (o.key(), o))
+                .collect())
+        };
+        let policies =
+            crate::dispatcher::policies(&all(Kind::Namespace)?, &all(Kind::NetworkPolicy)?);
+        let endpoints = crate::dispatcher::endpoints(
+            &all(Kind::Service)?,
+            &all(Kind::Task)?,
+            &all(Kind::Node)?,
+        );
+        let mut services: Vec<String> = endpoints
+            .iter()
+            .filter(|e| e.namespace == namespace && !e.job)
+            .map(|e| e.name.clone())
+            .collect();
+        services.sort();
+        let edges = legion_api::policy::reach(&policies, &endpoints, &namespace)
+            .into_iter()
+            .map(|r| pb::ReachEdge {
+                from: r.from.unwrap_or_default(),
+                to: r.to,
+                all_ports: r.all_ports,
+                ports: r
+                    .ports
+                    .into_iter()
+                    .map(|(protocol, port)| pb::ReachPort {
+                        // As the API spells it: `tcp`, `udp`.
+                        protocol: serde_json::to_value(protocol)
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_owned))
+                            .unwrap_or_default(),
+                        port: port.into(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        Ok(Response::new(pb::ReachResponse { services, edges }))
+    }
+
     async fn usage(
         &self,
         req: Request<pb::UsageRequest>,
