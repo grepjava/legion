@@ -171,6 +171,7 @@ fn router(gateway: Gateway) -> axum::Router {
         .route("/api/watch/{kind}", get(watch))
         .route("/api/usage", get(usage))
         .route("/api/alerts", get(alerts))
+        .route("/api/usage-history", get(usage_history))
         .route("/api/reach", get(reach))
         .route("/api/logs/{namespace}/{task}", get(logs))
         // Writes (CONSOLE.md phases 2 and 3): each from the console's own
@@ -719,6 +720,45 @@ async fn usage(
         })
         .collect();
     Ok(Json(serde_json::json!({ "nodes": nodes })).into_response())
+}
+
+#[derive(Deserialize)]
+struct HistoryScope {
+    namespace: Option<String>,
+    task: Option<String>,
+}
+
+/// `Cluster.UsageHistory`: `{step_ms, tasks: [{namespace, task, node,
+/// samples: [[at_ms, cpu_percent, memory_bytes], ...]}]}`, oldest first.
+async fn usage_history(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Query(scope): Query<HistoryScope>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let r = ClusterClient::new(channel)
+        .usage_history(pb::UsageHistoryRequest {
+            namespace: scope.namespace.unwrap_or_default(),
+            task: scope.task.unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+    let tasks: Vec<_> = r
+        .tasks
+        .iter()
+        .map(|t| {
+            let samples: Vec<_> = t
+                .samples
+                .iter()
+                .map(|s| serde_json::json!([s.at_ms, s.cpu_percent, s.memory_bytes]))
+                .collect();
+            serde_json::json!({
+                "namespace": t.namespace, "task": t.task, "node": t.node,
+                "service": t.service, "samples": samples,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "step_ms": r.step_ms, "tasks": tasks })).into_response())
 }
 
 /// `legion reach`: what may reach what among a namespace's services,
