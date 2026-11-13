@@ -48,7 +48,7 @@ mkdir -p /var/tmp/lbhyve
 
 # jailer for the handoff test, at the revision legion.qualify records, built
 # as the lab user: its crates come from the network, as its base pull does.
-jailer_rev=d079ca91bd2404fc7d116c06f1f7dfd9c10af486
+jailer_rev=d682ad5e5c11d181eee20bc2a1735dadccc2a75f
 # A revision's archive, whole: GitHub makes one on its first request, which
 # may come back empty, so it is fetched to a file, checked and tried again.
 archive() {
