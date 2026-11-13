@@ -225,6 +225,48 @@ fn internal(e: impl std::fmt::Display) -> Status {
     Status::internal(e.to_string())
 }
 
+/// What each namespace uses now of what quotas limit: the requests of its
+/// tasks placed and not ended, and its Volumes. The metrics and
+/// `Cluster.Quotas` both report it.
+pub(crate) fn in_use(tasks: &[Object], volumes: &[Object]) -> BTreeMap<String, Usage> {
+    use legion_api::task::{TaskSpec, TaskState, TaskStatus};
+    let mut used: BTreeMap<String, Usage> = BTreeMap::new();
+    for o in tasks {
+        let Ok(spec) = legion_api::parse::<TaskSpec>(&o.spec) else {
+            continue;
+        };
+        let status: TaskStatus = serde_json::from_value(o.status.clone()).unwrap_or_default();
+        if status.state != TaskState::Pending && !status.state.is_terminal() {
+            used.entry(o.metadata.namespace.clone())
+                .or_default()
+                .add_tasks(spec.pod.requests(), 1);
+        }
+    }
+    for o in volumes {
+        if let Ok(spec) = legion_api::parse::<VolumeSpec>(&o.spec) {
+            used.entry(o.metadata.namespace.clone())
+                .or_default()
+                .add_volume(spec.size);
+        }
+    }
+    used
+}
+
+/// Each resource `q` limits, with its limit and what `u` uses of it: CPU
+/// in cores, memory and storage in bytes.
+pub(crate) fn values(q: &Quota, u: &Usage) -> Vec<(&'static str, f64, f64)> {
+    [
+        ("cpu", q.cpu.map(|c| c.0 as f64 / 1000.0), u.cpu.0 as f64 / 1000.0),
+        ("memory", q.memory.map(|b| b.0 as f64), u.memory.0 as f64),
+        ("tasks", q.tasks.map(f64::from), f64::from(u.tasks)),
+        ("volumes", q.volumes.map(f64::from), f64::from(u.volumes)),
+        ("storage", q.storage.map(|b| b.0 as f64), u.storage.0 as f64),
+    ]
+    .into_iter()
+    .filter_map(|(r, limit, used)| Some((r, limit?, used)))
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

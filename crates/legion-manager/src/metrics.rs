@@ -9,10 +9,8 @@ use std::sync::{Arc, RwLock};
 use legion_api::admit::NamespaceSpec;
 use legion_api::metrics::Metrics;
 use legion_api::node::{NodeSpec, NodeState, NodeStatus};
-use legion_api::quota::Usage;
 use legion_api::service::{ServiceMode, ServiceSpec};
 use legion_api::task::{TaskSpec, TaskState, TaskStatus};
-use legion_api::volume::VolumeSpec;
 use legion_api::{Kind, Object};
 use legion_store::{NodeId, Store};
 
@@ -130,7 +128,7 @@ fn cluster(store: &Store, m: &mut Metrics) -> Result<(), legion_store::Error> {
         })
         .collect();
     let mut states: BTreeMap<&str, BTreeMap<TaskState, u32>> = BTreeMap::new();
-    let mut used: BTreeMap<&str, Usage> = BTreeMap::new();
+    let used = crate::quota::in_use(of(Kind::Task), of(Kind::Volume));
     // Ready tasks of each service.
     let mut ready: BTreeMap<(&str, &str), u32> = BTreeMap::new();
     for (o, spec, status) in &tasks {
@@ -140,11 +138,6 @@ fn cluster(store: &Store, m: &mut Metrics) -> Result<(), legion_store::Error> {
             .or_default()
             .entry(status.state)
             .or_default() += 1;
-        if status.state != TaskState::Pending && !status.state.is_terminal() {
-            used.entry(ns)
-                .or_default()
-                .add_tasks(spec.pod.requests(), 1);
-        }
         if !spec.job && status.state == TaskState::Running && status.ready {
             *ready.entry((ns, spec.service.as_str())).or_default() += 1;
         }
@@ -224,13 +217,6 @@ fn cluster(store: &Store, m: &mut Metrics) -> Result<(), legion_store::Error> {
         f.sample(&[("state", state.as_str())], f64::from(n));
     }
 
-    for o in of(Kind::Volume) {
-        if let Ok(spec) = legion_api::parse::<VolumeSpec>(&o.spec) {
-            used.entry(&o.metadata.namespace)
-                .or_default()
-                .add_volume(spec.size);
-        }
-    }
     let quotas: Vec<(&str, legion_api::quota::Quota)> = of(Kind::Namespace)
         .iter()
         .filter_map(|o| {
@@ -243,10 +229,9 @@ fn cluster(store: &Store, m: &mut Metrics) -> Result<(), legion_store::Error> {
         "A namespace's quota (cpu in cores, memory and storage in bytes).",
     );
     for (ns, q) in &quotas {
-        for (resource, limit) in quota_values(q) {
-            if let Some(limit) = limit {
-                f.sample(&[("namespace", ns), ("resource", resource)], limit);
-            }
+        let u = used.get(*ns).copied().unwrap_or_default();
+        for (resource, limit, _) in crate::quota::values(q, &u) {
+            f.sample(&[("namespace", ns), ("resource", resource)], limit);
         }
     }
     let mut f = m.gauge(
@@ -254,32 +239,10 @@ fn cluster(store: &Store, m: &mut Metrics) -> Result<(), legion_store::Error> {
         "What a namespace with a quota uses of it: placed tasks' requests and volumes.",
     );
     for (ns, q) in &quotas {
-        let u = used.get(ns).copied().unwrap_or_default();
-        for ((resource, limit), value) in quota_values(q).into_iter().zip(usage_values(&u)) {
-            if limit.is_some() {
-                f.sample(&[("namespace", ns), ("resource", resource)], value);
-            }
+        let u = used.get(*ns).copied().unwrap_or_default();
+        for (resource, _, value) in crate::quota::values(q, &u) {
+            f.sample(&[("namespace", ns), ("resource", resource)], value);
         }
     }
     Ok(())
-}
-
-fn quota_values(q: &legion_api::quota::Quota) -> [(&'static str, Option<f64>); 5] {
-    [
-        ("cpu", q.cpu.map(|c| c.0 as f64 / 1000.0)),
-        ("memory", q.memory.map(|b| b.0 as f64)),
-        ("tasks", q.tasks.map(f64::from)),
-        ("volumes", q.volumes.map(f64::from)),
-        ("storage", q.storage.map(|b| b.0 as f64)),
-    ]
-}
-
-fn usage_values(u: &Usage) -> [f64; 5] {
-    [
-        u.cpu.0 as f64 / 1000.0,
-        u.memory.0 as f64,
-        f64::from(u.tasks),
-        f64::from(u.volumes),
-        u.storage.0 as f64,
-    ]
 }
