@@ -324,6 +324,43 @@ updates, image operations and WireGuard full-mesh growth before expanding
 the feature set. Publish workload sizes, hardware and latency/resource
 budgets; optimize demonstrated bottlenecks.
 
+Two known costs, each to be measured at the sizes it targets before
+changing code (`docs/MEASURE.md` holds the current figures):
+
+- **pf: one anchor per VIP block.** Every service's rdr rules sit in one
+  flat `legion/svc` anchor, reloaded whole when a service is added (4.2 s
+  at 2,000 services). Split it by the VIP's /24: `legion/svc` holds only
+  `rdr-anchor "vip-<b>" on legion0 inet to 10.201.<b>.0/24` and its IPv6
+  twin (`fd00:10:201::<b>:0/112`), one per block in use, and a change
+  reloads only its block. VIPs are allocated lowest free first, so a block
+  holds at most 254 services: by the current figures (26 ms at 100, 279 ms
+  at 500) a full block reloads in roughly 100 ms. Pod and outside traffic
+  then skips the VIP rules on a connection's first packet, which has not been
+  measured. Published ports keep an anchor of their own. Adding the block's
+  line when it is first used and removing it when it empties is the new
+  work; pf.conf's hooks stay as they are. Done when adding a service at
+  2,000 services is measured on the lab and recorded.
+- **The planner's per-pass work.** A pass is 78 ms at 5,000 tasks and 200
+  nodes, the planner alone. Every pass also repeats work on unchanged
+  data. Keep the whole-cluster pure planner and remove that work:
+  - Before planning, `controller/mod.rs` lists and parses every Task,
+    Node and Volume on every pass, which no figure covers yet. Keeping
+    parsed objects updated from the store's watch removes it, but must
+    rebuild from a full list when the watch falls behind compaction.
+  - `orphan()` clones every task even when no node is down or removed;
+    borrow them when none is.
+  - Each service's status is serialized to JSON to find whether it
+    changed; compare the typed status first.
+  - Tasks on a node are found by scanning every node for each task; index
+    the nodes by name once a pass.
+  - Pods are compared in full for every task. A digest of the pod, taken
+    when the task is made, would replace it, but only a cryptographic one
+    (256 bits): equal pods are the common case, and a collision would
+    silently skip a rollout.
+
+  Done when `reconciliation_time_by_cluster_size` covers 20,000 tasks,
+  times the load as well as the planner, and shows each change's gain.
+
 Consider the following only with a concrete user requirement:
 
 - Scheduling affinity/anti-affinity, priorities and preemption.
