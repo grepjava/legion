@@ -2,7 +2,7 @@
   import '../app.css';
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
-  import { api, setToken, whenSignedOut } from '#lib/api.ts';
+  import { api, followAlerts, setToken, whenSignedOut } from '#lib/api.ts';
   import { plural } from '#lib/kinds.ts';
   import { namespaces, session } from '#lib/session.svelte.ts';
 
@@ -38,6 +38,19 @@
     })();
   });
 
+  // The user's alerts, followed for as long as they are signed in.
+  $effect(() => {
+    if (!session.me) {
+      session.alerts = [];
+      return;
+    }
+    return followAlerts(
+      (a) => (session.alerts = a),
+      (why) => (session.alertsError = why)
+    );
+  });
+  const critical = $derived(session.alerts.some((a) => a.severity === 'critical'));
+
   async function signOut() {
     await api.logout().catch(() => {});
     session.me = null;
@@ -68,6 +81,10 @@
       </label>
       <nav>
         <a href="/" class:here={page.url.pathname === '/'}>Overview</a>
+        <a href="/alerts" class:here={page.url.pathname === '/alerts'}
+          >Alerts{#if session.alerts.length}
+            <span class="count {critical ? 'bad' : 'wait'}">{session.alerts.length}</span>{/if}</a
+        >
         <a href="/apply" class:here={page.url.pathname === '/apply'}>Apply YAML</a>
         <a href="/network" class:here={page.url.pathname === '/network'}>Network</a>
         <h2>Workloads and config</h2>

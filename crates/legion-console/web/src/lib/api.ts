@@ -397,3 +397,58 @@ export function follow(
     socket?.close();
   };
 }
+
+/** What an operator acts on now (`legion alerts`). */
+export interface Alert {
+  kind: string;
+  severity: 'critical' | 'warning';
+  namespace: string;
+  /** `Kind/name`, or empty for the cluster itself. */
+  object: string;
+  message: string;
+  since_ms: number;
+}
+
+/**
+ * The user's alerts as they change: `update` gets the whole list each
+ * time, `failed` why the stream broke. Reconnects after a break. Returns a
+ * function that stops it.
+ */
+export function followAlerts(
+  update: (alerts: Alert[]) => void,
+  failed: (why: string) => void
+): () => void {
+  let stopped = false;
+  let socket: WebSocket | null = null;
+  let retry: ReturnType<typeof setTimeout> | null = null;
+  function start() {
+    if (stopped) return;
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    socket = new WebSocket(`${proto}//${location.host}/api/alerts`);
+    socket.onmessage = (m) => {
+      const e = JSON.parse(m.data);
+      if (e.error) failed(e.error);
+      else {
+        failed('');
+        update(e.alerts);
+      }
+    };
+    socket.onclose = () => {
+      if (!stopped) retry = setTimeout(start, 2000);
+    };
+  }
+  start();
+  return () => {
+    stopped = true;
+    if (retry) clearTimeout(retry);
+    socket?.close();
+  };
+}
+
+/** Where an alert's cause is in the console. */
+export function alertHref(a: Alert): string {
+  if (!a.object) return '/cluster';
+  const [kind, name] = a.object.split('/', 2);
+  return `/k/${encodeURIComponent(kind)}/${encodeURIComponent(a.namespace || '_')}/${encodeURIComponent(name)}`;
+}
+

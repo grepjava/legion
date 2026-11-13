@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { api, follow, type LObject, type Status } from '#lib/api.ts';
+  import { alertHref, api, follow, type LObject, type Status } from '#lib/api.ts';
   import { tone } from '#lib/columns.ts';
   import { session } from '#lib/session.svelte.ts';
 
@@ -37,6 +37,21 @@
 </script>
 
 <h1>Overview</h1>
+
+{#if session.alerts.length}
+  <section>
+    <h2><a href="/alerts">Alerts</a></h2>
+    <ul class="plain">
+      {#each session.alerts.slice(0, 5) as a (a.kind + a.namespace + a.object)}
+        <li>
+          <span class="state {a.severity === 'critical' ? 'bad' : 'wait'}">{a.severity}</span>
+          <a href={alertHref(a)}>{a.message}</a>
+        </li>
+      {/each}
+    </ul>
+    {#if session.alerts.length > 5}<p><a href="/alerts">All {session.alerts.length}</a></p>{/if}
+  </section>
+{/if}
 
 <section class="cards">
   <div class="card">

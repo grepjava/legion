@@ -207,6 +207,16 @@ tr:last-child td {
 .good {
   color: var(--good);
 }
+.count {
+  display: inline-block;
+  min-width: 1.2rem;
+  margin-left: 0.3rem;
+  padding: 0 0.35rem;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  font-size: 0.75rem;
+  text-align: center;
+}
 .wait {
   color: var(--wait);
 }
