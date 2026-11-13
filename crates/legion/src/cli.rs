@@ -747,6 +747,32 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 print_table(["FROM", "TO", "PORTS"], &rows);
             }
         }
+        Command::Alerts {
+            namespace,
+            watch,
+            output,
+        } => {
+            let mut stream = cluster
+                .watch_alerts(pb::AlertsRequest {
+                    namespace: namespace.unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            let mut first = true;
+            loop {
+                let Some(r) = stream.message().await? else {
+                    anyhow::bail!("the manager ended the alerts");
+                };
+                if !first && output == Format::Table {
+                    println!();
+                }
+                first = false;
+                print_alerts(&r.alerts, output)?;
+                if !watch {
+                    break;
+                }
+            }
+        }
         Command::Top { namespace, once } if once => crate::top::once(channel, namespace).await?,
         Command::Top { namespace, .. } => crate::top::run(channel, namespace).await?,
         Command::Watch { kind, from } => {
@@ -1380,6 +1406,45 @@ fn print_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) {
 }
 
 /// Audit events as a table, YAML or JSON.
+fn print_alerts(alerts: &[pb::Alert], format: Format) -> anyhow::Result<()> {
+    let json: Vec<serde_json::Value> = alerts
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "kind": a.kind, "severity": a.severity, "namespace": a.namespace,
+                "object": a.object, "message": a.message, "sinceMs": a.since_ms,
+            })
+        })
+        .collect();
+    match format {
+        Format::Json => println!("{}", serde_json::to_string_pretty(&json)?),
+        Format::Yaml => print!("{}", serde_yaml_ng::to_string(&json)?),
+        Format::Table if alerts.is_empty() => println!("no alerts"),
+        Format::Table => {
+            let rows: Vec<[String; 5]> = alerts
+                .iter()
+                .map(|a| {
+                    let object = match (a.namespace.as_str(), a.object.as_str()) {
+                        (_, "") => "(cluster)".to_owned(),
+                        ("", o) => o.to_owned(),
+                        (ns, o) => format!("{ns}/{o}"),
+                    };
+                    let since = legion_api::clock::format(a.since_ms / 1000);
+                    [
+                        a.severity.clone(),
+                        a.kind.clone(),
+                        object,
+                        since,
+                        a.message.clone(),
+                    ]
+                })
+                .collect();
+            print_table(["SEVERITY", "KIND", "OBJECT", "SINCE", "MESSAGE"], &rows);
+        }
+    }
+    Ok(())
+}
+
 fn print_audit(events: &[legion_api::audit::AuditEvent], format: Format) -> anyhow::Result<()> {
     match format {
         Format::Json => println!("{}", serde_json::to_string_pretty(events)?),

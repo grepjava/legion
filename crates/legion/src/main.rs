@@ -392,6 +392,19 @@ enum Command {
         #[arg(short, long)]
         namespace: Option<String>,
     },
+    /// What to act on now: crash-looping tasks, nodes down or suspect,
+    /// lost Volumes, the CA near expiry, Raft without a leader or quorum.
+    /// Any manager answers, from what it holds, one cut off from the
+    /// leader too. With --watch, the list again each time it changes.
+    Alerts {
+        /// Only this namespace's.
+        #[arg(short, long)]
+        namespace: Option<String>,
+        #[arg(short, long)]
+        watch: bool,
+        #[arg(short, long, value_enum, default_value_t = cli::Format::Table)]
+        output: cli::Format,
+    },
     /// Stream changes, optionally of one kind.
     Watch {
         kind: Option<String>,
