@@ -1427,6 +1427,9 @@ impl Cluster for ApiService {
             Some(id) => (id.name.clone(), id.role.as_str().to_owned()),
             None => (String::new(), "admin".to_owned()),
         };
+        // As of every change committed before the question, so a role just
+        // given shows at once, whichever manager is asked.
+        self.consistent().await?;
         let roles = caller.roles(&self.store)?;
         Ok(Response::new(pb::MeResponse {
             name,
