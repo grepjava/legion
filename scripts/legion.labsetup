@@ -92,3 +92,8 @@ export LEGION_CLUSTER_VMS='lab2=lab@10.78.0.2 lab3=lab@10.78.0.3'
 export LEGION_CLUSTER_KEY=/home/lab/.ssh/id_ed25519
 export LEGION_CLUSTER_LOSE=reboot
 EOF
+# Chromium, for the console's browser test, from lab base 5 on: without it
+# the test's precondition fails rather than the test passing unrun.
+if command -v chrome > /dev/null; then
+    echo "export LEGION_BROWSER=$(command -v chrome)" >> /var/tmp/lab.env
+fi

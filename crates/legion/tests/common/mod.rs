@@ -16,6 +16,8 @@
 
 #![allow(dead_code)]
 
+#[cfg(unix)]
+pub mod browser;
 pub mod jailer;
 
 use std::io::Write;
