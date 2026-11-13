@@ -101,8 +101,8 @@ now signs in over HTTP/2); task logs (`/api/logs`, a WebSocket of the
 now (`/api/usage`); label filters in every list (`app=web`, `app!=web`,
 `!canary`, beside words for names); a YAML view of any object; a node's
 page with its capacity, use and tasks; a task's page with its logs and
-links to its service and node. Still to do in this phase: the browser
-test on the lab.
+links to its service and node. Its browser test passes on the lab (see
+below).
 
 ## Phase 2: operating workloads
 
@@ -143,7 +143,7 @@ Tested over HTTPS (`crates/legion-manager/tests/console.rs`). Not yet:
 restart and run-now, which need the API first (an applied spec that is
 unchanged makes no new generation; there is no call to start a CronJob's
 run), events per object (there is no event kind; a task's status message
-says why it waits), and the browser test on the lab.
+says why it waits). Its browser test passes on the lab (see below).
 
 ## Phase 3: cluster operations
 
@@ -182,7 +182,21 @@ reaches what and on which ports, from `Cluster.Reach` (`legion reach`),
 which evaluates the same rules the nodes' guards do (`legion_api::policy`:
 `may_reach`, `may_send`, moved there from the agent). Not yet: which node
 holds each load balancer address (no node reports it; the lab test asks
-the nodes' interfaces), and the lab test.
+the nodes' interfaces).
+
+**Lab test, phases 1 to 3** (`crates/legion/tests/console.rs`, in every
+record from lab base 5, which has Chromium): a headless Chromium, driven
+over the DevTools protocol, signs in on three nodes as a viewer, an editor
+and the admin with the link `legion console login` prints, and does each
+phase's "done when" through the pages: the viewer offered only their
+namespace, a change made with the CLI shown within a second (about 0.1 s
+on the lab), every button disabled for them saying why; the editor
+deploying from pasted YAML after its changes, scaling, rolling out an image
+and back, reading a task's logs and typing in its terminal, each in `legion
+audit`; the admin draining a node and making it active again, downloading a
+Volume's backup, removing a lost node and restoring its Volume onto another
+from that file, filtering the audit log, and rotating the CA until every
+holder is on it. First passed on 14133c5.
 
 ## Phase 4: observability
 
