@@ -663,7 +663,7 @@ impl Sys for FakeSys {
 
     fn addr_policy_add(&self, jail: &str, policies: &[(Ipv6Net, u32, u32)]) -> Result<()> {
         let mut s = self.state();
-        if !s.jails.get(jail).is_some_and(|j| j.vnet == "new") {
+        if s.jails.get(jail).is_none_or(|j| j.vnet != "new") {
             return Err(fail("ip6addrctl", format!("{jail}: not a VNET jail")));
         }
         s.addr_policies

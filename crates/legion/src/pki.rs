@@ -615,11 +615,11 @@ pub async fn renew_manager(
 /// at another time than the node's certificate (written again after it was
 /// removed, say), so it is checked on its own.
 fn admin_due(data_dir: &Path, now: SystemTime) -> bool {
-    !read(&data_dir.join(ADMIN_BUNDLE))
+    read(&data_dir.join(ADMIN_BUNDLE))
         .ok()
         .flatten()
         .and_then(|pem| Bundle::parse(&pem).ok())
-        .is_some_and(|b| !legion_pki::needs_renewal(&b.cert_pem, now))
+        .is_none_or(|b| legion_pki::needs_renewal(&b.cert_pem, now))
 }
 
 /// Keeps a worker's certificate current: past two thirds of its life, it

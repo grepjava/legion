@@ -1101,9 +1101,9 @@ fn volume_rows(model: &Model) -> Vec<TableRow> {
         if task_state(t).is_terminal() {
             continue;
         }
-        if !t.spec["pod"]["volumes"]
+        if t.spec["pod"]["volumes"]
             .as_array()
-            .is_some_and(|v| !v.is_empty())
+            .is_none_or(|v| v.is_empty())
         {
             continue;
         }
