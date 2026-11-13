@@ -519,3 +519,34 @@ export function logSearch(q: {
   if (q.limit) params.set('limit', String(q.limit));
   return call('GET', `/api/log-search?${params}`);
 }
+
+/** A variable a compose file reads, with its default. */
+export interface ComposeVariable {
+  name: string;
+  default: string | null;
+  required: boolean;
+}
+
+/** A compose file as Legion objects, as `legion stack convert` gives
+ * them, nothing written; the namespace first when it is missing. */
+export function compose(body: {
+  compose: string;
+  stack: string;
+  namespace?: string;
+  env: Record<string, string>;
+}): Promise<{ objects: object[]; warnings: string[]; variables: ComposeVariable[] }> {
+  return call('POST', '/api/compose', body);
+}
+
+/** A compose file to deploy from: an example (namespace empty), or one
+ * saved as a Config labelled `legion.template`. */
+export interface Template {
+  name: string;
+  namespace: string;
+  about: string;
+  compose: string;
+}
+
+export function templates(): Promise<{ templates: Template[] }> {
+  return call('GET', '/api/templates');
+}

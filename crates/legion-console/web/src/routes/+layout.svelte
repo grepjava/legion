@@ -85,7 +85,11 @@
           >Alerts{#if session.alerts.length}
             <span class="count {critical ? 'bad' : 'wait'}">{session.alerts.length}</span>{/if}</a
         >
+        <a href="/deploy" class:here={page.url.pathname === '/deploy'}>Deploy</a>
+        <a href="/templates" class:here={page.url.pathname === '/templates'}>Templates</a>
+        <a href="/import" class:here={page.url.pathname === '/import'}>Import compose</a>
         <a href="/apply" class:here={page.url.pathname === '/apply'}>Apply YAML</a>
+        <a href="/topology" class:here={page.url.pathname === '/topology'}>Topology</a>
         <a href="/network" class:here={page.url.pathname === '/network'}>Network</a>
         <h2>Workloads and config</h2>
         {#each nsKinds as k (k.kind)}
