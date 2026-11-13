@@ -173,6 +173,7 @@ fn router(gateway: Gateway) -> axum::Router {
         .route("/api/alerts", get(alerts))
         .route("/api/usage-history", get(usage_history))
         .route("/api/quotas", get(quotas))
+        .route("/api/log-search", get(log_search))
         .route("/api/reach", get(reach))
         .route("/api/logs/{namespace}/{task}", get(logs))
         // Writes (CONSOLE.md phases 2 and 3): each from the console's own
@@ -757,6 +758,52 @@ fn quotas_json(r: &pb::QuotasResponse) -> Vec<serde_json::Value> {
 }
 
 #[derive(Deserialize)]
+struct LogSearchQuery {
+    namespace: String,
+    service: String,
+    since_ms: Option<i64>,
+    until_ms: Option<i64>,
+    text: Option<String>,
+    limit: Option<usize>,
+}
+
+/// `legion logs-search`: `{lines: [{at_ms, task, container, stderr,
+/// text}], truncated, unread: [why]}`, oldest first.
+async fn log_search(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Query(q): Query<LogSearchQuery>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let r = crate::logsearch::search(
+        channel,
+        &crate::logsearch::Search {
+            namespace: q.namespace,
+            service: q.service,
+            since_ms: q.since_ms,
+            until_ms: q.until_ms,
+            text: q.text.unwrap_or_default(),
+            limit: q.limit.unwrap_or(1000).min(5000),
+        },
+    )
+    .await?;
+    let lines: Vec<_> = r
+        .lines
+        .iter()
+        .map(|l| {
+            serde_json::json!({
+                "at_ms": l.at_ms, "task": l.task, "container": l.container,
+                "stderr": l.stderr, "text": l.text,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "lines": lines, "truncated": r.truncated, "unread": r.unread,
+    }))
+    .into_response())
+}
+
+#[derive(Deserialize)]
 struct HistoryScope {
     namespace: Option<String>,
     task: Option<String>,
@@ -859,6 +906,7 @@ async fn logs(
         action: Some(pb::session_open::Action::Logs(pb::LogsOptions {
             follow: q.follow,
             tail: q.tail,
+            ..Default::default()
         })),
     };
     tx.send(pb::SessionFrame {
