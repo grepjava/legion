@@ -140,6 +140,10 @@ service Cluster {
   // starts empty): the tasks of `namespace`, or of every namespace when
   // empty, that the caller may read; with `task`, that one only.
   rpc UsageHistory(UsageHistoryRequest) returns (UsageHistoryResponse);
+  // Each namespace's quota and what it uses of it now: the requests of its
+  // tasks placed and not ended, and its Volumes. The namespaces with a
+  // quota whose tasks the caller may read; `namespace` alone when set.
+  rpc Quotas(QuotasRequest) returns (QuotasResponse);
   // What an operator acts on now (legion_api::alert): crash-looping
   // tasks, nodes down or suspect, lost Volumes, the CA near expiry, Raft
   // without a leader or quorum, as this manager works them out from its
@@ -235,6 +239,27 @@ message RecordAuditRequest {
 
 message RecordAuditResponse {}
 
+message QuotasRequest {
+  string namespace = 1;
+}
+
+message QuotasResponse {
+  repeated NamespaceQuota namespaces = 1;
+}
+
+message NamespaceQuota {
+  string namespace = 1;
+  // Only the resources its quota limits.
+  repeated QuotaUse resources = 2;
+}
+
+message QuotaUse {
+  // `cpu` (in cores), `memory` or `storage` (in bytes), `tasks`, `volumes`.
+  string resource = 1;
+  double limit = 2;
+  double used = 3;
+}
+
 message UsageHistoryRequest {
   string namespace = 1;
   // Needs `namespace`.
@@ -256,6 +281,12 @@ message TaskSeries {
   // Its Service or Job, as the store has it; for a task since removed,
   // as its name says (`<service>-<slot>-<n>`).
   string service = 5;
+  // What it asks for and may use, as the store has it now (0: none, or a
+  // task since removed): percent of one CPU and bytes, as its samples.
+  double cpu_request_percent = 6;
+  uint64 memory_request_bytes = 7;
+  double cpu_limit_percent = 8;
+  uint64 memory_limit_bytes = 9;
 }
 
 message UsageSample {

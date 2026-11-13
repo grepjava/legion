@@ -1387,15 +1387,16 @@ impl Cluster for ApiService {
         if !namespace.is_empty() {
             caller.check(&self.store, Verb::Read, Kind::Task, &namespace)?;
         }
-        let services: std::collections::HashMap<String, String> = self
+        // Each stored task's service, requests and limits.
+        let specs: std::collections::HashMap<String, legion_api::task::TaskSpec> = self
             .store
             .list(Kind::Task, (!namespace.is_empty()).then_some(namespace.as_str()))
             .map(|l| l.objects)
             .unwrap_or_default()
             .into_iter()
-            .map(|t| {
+            .filter_map(|t| {
                 let key = format!("{}/{}", t.metadata.namespace, t.metadata.name);
-                (key, t.spec["service"].as_str().unwrap_or("").to_owned())
+                Some((key, legion_api::parse(&t.spec).ok()?))
             })
             .collect();
         let tasks = self
@@ -1404,7 +1405,8 @@ impl Cluster for ApiService {
             .into_iter()
             .filter_map(|(key, (node, samples))| {
                 let (ns, name) = key.split_once('/')?;
-                let service = services.get(&key).cloned().unwrap_or_else(|| {
+                let spec = specs.get(&key);
+                let service = spec.map(|s| s.service.clone()).unwrap_or_else(|| {
                     let mut parts = name.rsplitn(3, '-');
                     let (_, _, svc) = (parts.next(), parts.next(), parts.next());
                     svc.unwrap_or(name).to_owned()
@@ -1418,6 +1420,12 @@ impl Cluster for ApiService {
                     task: name.to_owned(),
                     node,
                     service,
+                    cpu_request_percent: spec.map_or(0.0, |s| s.pod.requests().cpu.0 as f64 / 10.0),
+                    memory_request_bytes: spec.map_or(0, |s| s.pod.requests().memory.0),
+                    cpu_limit_percent: spec
+                        .and_then(|s| pod_limits(&s.pod).0)
+                        .map_or(0.0, |c| c as f64 / 10.0),
+                    memory_limit_bytes: spec.and_then(|s| pod_limits(&s.pod).1).unwrap_or(0),
                     samples: samples
                         .iter()
                         .map(|s| pb::UsageSample {
@@ -1433,6 +1441,54 @@ impl Cluster for ApiService {
             tasks,
             step_ms: crate::usage::STEP.as_millis() as i64,
         }))
+    }
+
+    async fn quotas(
+        &self,
+        req: Request<pb::QuotasRequest>,
+    ) -> Result<Response<pb::QuotasResponse>, Status> {
+        let caller = self.caller(&req)?;
+        let namespace = req.into_inner().namespace;
+        check_namespace(&namespace)?;
+        self.consistent().await?;
+        if !namespace.is_empty() {
+            caller.check(&self.store, Verb::Read, Kind::Task, &namespace)?;
+        }
+        let list = |kind| {
+            self.store
+                .list(kind, None)
+                .map(|l| l.objects)
+                .map_err(|e| Status::internal(e.to_string()))
+        };
+        let used = crate::quota::in_use(&list(Kind::Task)?, &list(Kind::Volume)?);
+        let mut namespaces = Vec::new();
+        for o in list(Kind::Namespace)? {
+            let ns = o.metadata.name;
+            if (!namespace.is_empty() && ns != namespace)
+                || !caller.may(&self.store, Verb::Read, Kind::Task, &ns)
+            {
+                continue;
+            }
+            let Some(q) = legion_api::parse::<legion_api::admit::NamespaceSpec>(&o.spec)
+                .ok()
+                .and_then(|s| s.quota)
+            else {
+                continue;
+            };
+            let u = used.get(&ns).copied().unwrap_or_default();
+            namespaces.push(pb::NamespaceQuota {
+                namespace: ns,
+                resources: crate::quota::values(&q, &u)
+                    .into_iter()
+                    .map(|(resource, limit, used)| pb::QuotaUse {
+                        resource: resource.into(),
+                        limit,
+                        used,
+                    })
+                    .collect(),
+            });
+        }
+        Ok(Response::new(pb::QuotasResponse { namespaces }))
     }
 
     type WatchAlertsStream = ReceiverStream<Result<pb::AlertsResponse, Status>>;
@@ -1818,4 +1874,16 @@ fn alert_visible(
         return caller.may(store, Verb::Read, Kind::Node, "");
     }
     *caller == Caller::All
+}
+
+/// A pod's limits in all, CPU in millicores and memory in bytes: each only
+/// when every container has one, as one without is not held to any.
+fn pod_limits(pod: &legion_api::service::PodSpec) -> (Option<u64>, Option<u64>) {
+    let sum = |f: &dyn Fn(&legion_api::service::Container) -> Option<u64>| {
+        pod.containers.iter().map(f).sum::<Option<u64>>()
+    };
+    (
+        sum(&|c| c.resources.limits.cpu.map(|v| v.0)),
+        sum(&|c| c.resources.limits.memory.map(|v| v.0)),
+    )
 }
