@@ -164,10 +164,32 @@ fn router(gateway: Gateway) -> axum::Router {
         .route("/api/status", get(status))
         .route("/api/kinds", get(kinds))
         .route("/api/objects/{kind}", get(list))
-        .route("/api/objects/{kind}/{namespace}/{name}", get(object))
+        .route(
+            "/api/objects/{kind}/{namespace}/{name}",
+            get(object).delete(delete_object),
+        )
         .route("/api/watch/{kind}", get(watch))
         .route("/api/usage", get(usage))
         .route("/api/logs/{namespace}/{task}", get(logs))
+        // Writes (CONSOLE.md phases 2 and 3): each from the console's own
+        // page with the session's token, as the user.
+        .route("/api/manifest/{kind}/{namespace}/{name}", get(manifest))
+        .route("/api/apply", post(apply))
+        .route("/api/set", post(set_field))
+        .route("/api/labels", post(labels))
+        .route("/api/rollback", post(rollback))
+        .route("/api/node-role", post(node_role))
+        .route("/api/exec/{namespace}/{task}", get(exec))
+        // Cluster operations (CONSOLE.md phase 3); the API lets only
+        // admins do most of them.
+        .route("/api/audit", get(audit))
+        .route("/api/join-token", post(join_token))
+        .route("/api/ca", get(ca_status).post(ca_rotate))
+        .route("/api/autolock", post(autolock))
+        .route("/api/users", post(create_user))
+        .route("/api/backup", get(store_backup))
+        .route("/api/volume-backup/{namespace}/{name}", get(volume_backup))
+        .route("/api/volume-restore", post(volume_restore))
         .fallback(page)
         .layer(axum::middleware::map_response(security_headers))
         .with_state(gateway)
@@ -234,6 +256,31 @@ fn cookie(headers: &HeaderMap) -> Option<String> {
         .filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// The header a write carries its session's token in.
+const CSRF_HEADER: &str = "x-legion-csrf";
+
+/// The token a session's writes carry (DESIGN.md §3.9): derived from the
+/// session, which only the console's own pages learn, from `/api/me`.
+/// Another site's page can neither read it nor send the cookie.
+fn csrf_token(session: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(format!("legion-console-csrf:{session}").as_bytes());
+    format!("{hash:x}")[..32].to_owned()
+}
+
+/// Whether `sent` is `session`'s token, in time that does not depend on
+/// where they differ.
+fn csrf_ok(session: &str, sent: Option<&str>) -> bool {
+    let want = csrf_token(session);
+    let Some(sent) = sent else { return false };
+    sent.len() == want.len()
+        && sent
+            .bytes()
+            .zip(want.bytes())
+            .fold(0u8, |d, (a, b)| d | (a ^ b))
+            == 0
+}
+
 /// Refuses a request from another site's page: its `Origin` must be this
 /// host. (The cookie is `SameSite=Strict` too; this covers WebSockets.)
 /// HTTP/2 has no `Host` header: the host is the URI's authority there.
@@ -265,6 +312,30 @@ impl Gateway {
 
     /// The signed-in user's channel, with a certificate for them made or
     /// renewed as needed.
+    /// The user's channel for a write: from the console's own page, with
+    /// the session's token (in the header; a WebSocket, which cannot set
+    /// one, sends it as `csrf` in the query).
+    async fn writer(
+        &self,
+        headers: &HeaderMap,
+        uri: &Uri,
+        query_token: Option<&str>,
+    ) -> Result<Channel, Refused> {
+        same_origin(headers, uri)?;
+        let (session, channel) = self.user(headers).await?;
+        let sent = headers
+            .get(CSRF_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .or(query_token);
+        if !csrf_ok(&session, sent) {
+            return Err(Refused(
+                StatusCode::FORBIDDEN,
+                "this request did not come from the console's page".into(),
+            ));
+        }
+        Ok(channel)
+    }
+
     async fn user(&self, headers: &HeaderMap) -> Result<(String, Channel), Refused> {
         let session = cookie(headers).ok_or_else(unauthorized)?;
         let deadline = Instant::now() + SESSION_LAG;
@@ -373,13 +444,14 @@ async fn logout(
 }
 
 async fn me(State(g): State<Gateway>, headers: HeaderMap) -> Result<Response, Refused> {
-    let (_, channel) = g.user(&headers).await?;
+    let (session, channel) = g.user(&headers).await?;
     let me = ClusterClient::new(channel)
         .me(pb::MeRequest {})
         .await?
         .into_inner();
     Ok(Json(serde_json::json!({
         "name": me.name, "role": me.role, "all": me.all, "namespaces": me.namespaces,
+        "csrf": csrf_token(&session),
     }))
     .into_response())
 }
@@ -694,6 +766,772 @@ fn text_of(pending: &mut Vec<u8>, data: Vec<u8>) -> String {
     text
 }
 
+fn bad_request(message: impl Into<String>) -> Refused {
+    Refused(StatusCode::BAD_REQUEST, message.into())
+}
+
+fn objects_client(channel: Channel) -> ObjectsClient<Channel> {
+    ObjectsClient::new(channel)
+        .max_decoding_message_size(crate::MAX_MESSAGE)
+        .max_encoding_message_size(crate::MAX_MESSAGE)
+}
+
+/// The parts of a stored object a manifest sets, as YAML.
+fn manifest_of(o: pb::Object) -> Result<String, Refused> {
+    let o = legion_api::Object::try_from(o)
+        .map_err(|e| Refused(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(legion_api::manifest::yaml(&o))
+}
+
+fn no_namespace(namespace: String) -> String {
+    // `_` in a path for a cluster-scoped object's namespace.
+    if namespace == "_" {
+        String::new()
+    } else {
+        namespace
+    }
+}
+
+/// An object as its manifest, to edit and apply again: `{yaml, version}`.
+async fn manifest(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Path((kind, namespace, name)): Path<(String, String, String)>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let o = objects_client(channel)
+        .get(pb::ObjectRef {
+            kind,
+            namespace: no_namespace(namespace),
+            name,
+        })
+        .await?
+        .into_inner();
+    let version = o.version;
+    Ok(Json(serde_json::json!({ "yaml": manifest_of(o)?, "version": version })).into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplyBody {
+    /// A manifest: one or more YAML documents.
+    yaml: Option<String>,
+    /// Or one object, as JSON.
+    object: Option<serde_json::Value>,
+    #[serde(default)]
+    dry_run: bool,
+    /// Only over this version (one object only): an edit of what was read.
+    expected_version: Option<u64>,
+}
+
+/// Applies a manifest's objects in order, or one object, as `legion apply`
+/// does: `{results: [{key, result, version}]}`. With `dryRun` nothing is
+/// written, and each result has the `diff` of the stored object's
+/// manifest to what would be stored, as `legion diff` prints it. The first
+/// refusal ends it, naming the object and those applied before it.
+async fn apply(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(body): Json<ApplyBody>,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    let objects: Vec<legion_api::Object> = match (body.yaml, body.object) {
+        (Some(y), None) => legion_api::manifest::parse(&y).map_err(bad_request)?,
+        (None, Some(o)) => vec![serde_json::from_value(o).map_err(|e| bad_request(e.to_string()))?],
+        _ => return Err(bad_request("send a manifest (yaml) or an object")),
+    };
+    if objects.is_empty() {
+        return Err(bad_request("the manifest has no objects"));
+    }
+    if body.expected_version.is_some() && objects.len() > 1 {
+        return Err(bad_request("an expected version is for one object"));
+    }
+    let mut client = objects_client(channel);
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    for o in &objects {
+        let key = o.key().to_string();
+        let r = match client
+            .apply(pb::ApplyRequest {
+                object: Some(o.into()),
+                expected_version: body.expected_version,
+                dry_run: body.dry_run,
+            })
+            .await
+        {
+            Ok(r) => r.into_inner(),
+            Err(s) => {
+                let Refused(code, message) = Refused::from(s);
+                let done: Vec<_> = results.iter().filter_map(|r| r["key"].as_str()).collect();
+                let message = if done.is_empty() || body.dry_run {
+                    format!("{key}: {message}")
+                } else {
+                    format!("{key}: {message} (applied before it: {})", done.join(", "))
+                };
+                return Err(Refused(code, message));
+            }
+        };
+        let result = match r.result() {
+            pb::ApplyResult::Created => "created",
+            pb::ApplyResult::Updated => "updated",
+            pb::ApplyResult::Unchanged => "unchanged",
+            pb::ApplyResult::Unspecified => "applied",
+        };
+        let after = r.object.unwrap_or_default();
+        let mut entry =
+            serde_json::json!({ "key": key, "result": result, "version": after.version });
+        if body.dry_run && result != "unchanged" {
+            let before = if result == "created" {
+                String::new()
+            } else {
+                let live = client
+                    .get(pb::ObjectRef {
+                        kind: after.kind.clone(),
+                        namespace: after.namespace.clone(),
+                        name: after.name.clone(),
+                    })
+                    .await?
+                    .into_inner();
+                manifest_of(live)?
+            };
+            let after = manifest_of(after)?;
+            entry["diff"] = similar::TextDiff::from_lines(&before, &after)
+                .unified_diff()
+                .context_radius(3)
+                .header(&format!("live {key}"), &format!("applied {key}"))
+                .to_string()
+                .into();
+        }
+        results.push(entry);
+    }
+    Ok(Json(serde_json::json!({ "results": results })).into_response())
+}
+
+#[derive(Deserialize)]
+struct DeleteQuery {
+    /// Only at this version.
+    version: Option<u64>,
+}
+
+async fn delete_object(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path((kind, namespace, name)): Path<(String, String, String)>,
+    Query(q): Query<DeleteQuery>,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    let r = objects_client(channel)
+        .delete(pb::DeleteRequest {
+            r#ref: Some(pb::ObjectRef {
+                kind,
+                namespace: no_namespace(namespace),
+                name,
+            }),
+            expected_version: q.version,
+        })
+        .await?
+        .into_inner();
+    Ok(Json(serde_json::json!({ "version": r.version })).into_response())
+}
+
+#[derive(Deserialize)]
+struct Target {
+    kind: String,
+    #[serde(default)]
+    namespace: String,
+    name: String,
+}
+
+impl Target {
+    fn into_ref(self) -> pb::ObjectRef {
+        pb::ObjectRef {
+            kind: self.kind,
+            namespace: self.namespace,
+            name: self.name,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SetBody {
+    #[serde(flatten)]
+    target: Target,
+    field: String,
+    value: serde_json::Value,
+}
+
+/// Sets one field of an object's spec, as `legion top`'s actions do
+/// (`actions::set_spec`): a Service's replicas, a CronJob's suspend, a
+/// node's availability, a Volume's node. `{key, changed}`.
+async fn set_field(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(body): Json<SetBody>,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    if body.field.is_empty() {
+        return Err(bad_request("which field?"));
+    }
+    let (key, changed) = crate::actions::set_spec(
+        &mut objects_client(channel),
+        body.target.into_ref(),
+        &body.field,
+        body.value,
+    )
+    .await?;
+    Ok(Json(serde_json::json!({ "key": key, "changed": changed })).into_response())
+}
+
+#[derive(Deserialize)]
+struct LabelsBody {
+    #[serde(flatten)]
+    target: Target,
+    /// A value sets the label; `null` removes it.
+    changes: std::collections::BTreeMap<String, Option<String>>,
+}
+
+async fn labels(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(body): Json<LabelsBody>,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    let changes: Vec<_> = body.changes.into_iter().collect();
+    let (key, changed) = crate::actions::set_labels(
+        &mut objects_client(channel),
+        body.target.into_ref(),
+        &changes,
+    )
+    .await?;
+    Ok(Json(serde_json::json!({ "key": key, "changed": changed })).into_response())
+}
+
+#[derive(Deserialize)]
+struct RollbackBody {
+    namespace: String,
+    service: String,
+}
+
+/// `legion rollback`: a Service back on the spec before its latest update.
+async fn rollback(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(body): Json<RollbackBody>,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    let message =
+        crate::actions::rollback(&mut objects_client(channel), body.namespace, body.service)
+            .await?;
+    Ok(Json(serde_json::json!({ "message": message })).into_response())
+}
+
+#[derive(Deserialize)]
+struct NodeRoleBody {
+    node: String,
+    /// `manager` or `worker`.
+    role: String,
+}
+
+/// `legion node promote|demote`: a node becomes a manager or a worker.
+async fn node_role(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(body): Json<NodeRoleBody>,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    ClusterClient::new(channel)
+        .change_role(pb::ChangeRoleRequest {
+            node: body.node,
+            role: body.role,
+        })
+        .await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[derive(Deserialize)]
+struct ExecQuery {
+    container: Option<String>,
+    /// The command as a JSON array; a shell when left out.
+    command: Option<String>,
+    cols: Option<u32>,
+    rows: Option<u32>,
+    csrf: Option<String>,
+}
+
+/// A command in a task's container under a terminal, as `legion exec -it`
+/// runs it. Binary messages carry its input and output; a text message
+/// `{resize: [cols, rows]}` resizes the terminal and `{eof: true}` closes
+/// its input; the end is `{exit: code}` or `{error}`.
+async fn exec(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path((namespace, task)): Path<(String, String)>,
+    Query(q): Query<ExecQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, Refused> {
+    use pb::session_frame::Frame;
+    let channel = g.writer(&headers, &uri, q.csrf.as_deref()).await?;
+    let command: Vec<String> = match &q.command {
+        Some(c) => serde_json::from_str(c).map_err(|e| bad_request(format!("command: {e}")))?,
+        None => vec!["/bin/sh".into()],
+    };
+    if command.is_empty() {
+        return Err(bad_request("an empty command"));
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let open = pb::SessionOpen {
+        namespace,
+        task,
+        container: q.container.unwrap_or_default(),
+        action: Some(pb::session_open::Action::Exec(pb::ExecOptions {
+            command,
+            stdin: true,
+            tty: true,
+            size: Some(pb::TerminalSize {
+                width: q.cols.unwrap_or(80).clamp(1, 1000),
+                height: q.rows.unwrap_or(24).clamp(1, 1000),
+            }),
+        })),
+    };
+    tx.send(pb::SessionFrame {
+        frame: Some(Frame::Open(open)),
+    })
+    .await
+    .expect("the receiver is held");
+    let stream = pb::pods_client::PodsClient::new(channel)
+        .session(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await?
+        .into_inner();
+    Ok(ws.on_upgrade(move |socket| relay_exec(socket, stream, tx)))
+}
+
+#[derive(Deserialize)]
+struct TerminalMessage {
+    resize: Option<(u32, u32)>,
+    #[serde(default)]
+    eof: bool,
+}
+
+async fn relay_exec(
+    mut socket: WebSocket,
+    mut stream: tonic::Streaming<pb::SessionFrame>,
+    input: tokio::sync::mpsc::Sender<pb::SessionFrame>,
+) {
+    use pb::session_frame::Frame;
+    let frame = |f: Frame| pb::SessionFrame { frame: Some(f) };
+    loop {
+        tokio::select! {
+            f = stream.message() => {
+                let end = match f {
+                    Ok(Some(pb::SessionFrame { frame: Some(Frame::Stdout(d) | Frame::Stderr(d)) })) => {
+                        if socket.send(Message::Binary(d.into())).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    Ok(Some(pb::SessionFrame { frame: Some(Frame::ExitCode(c)) })) => {
+                        serde_json::json!({ "exit": c })
+                    }
+                    Ok(Some(pb::SessionFrame { frame: Some(Frame::Error(e)) })) => {
+                        serde_json::json!({ "error": e.message })
+                    }
+                    Ok(Some(_)) => continue,
+                    Ok(None) => serde_json::json!({ "error": "the session ended without the command's exit code" }),
+                    Err(s) => serde_json::json!({ "error": s.message() }),
+                };
+                let _ = socket.send(Message::Text(end.to_string().into())).await;
+                let _ = socket.send(Message::Close(None)).await;
+                return;
+            }
+            m = socket.recv() => {
+                let sent = match m {
+                    Some(Ok(Message::Binary(d))) => input.send(frame(Frame::Input(d.to_vec()))).await,
+                    Some(Ok(Message::Text(t))) => match serde_json::from_str::<TerminalMessage>(&t) {
+                        Ok(TerminalMessage { resize: Some((cols, rows)), .. }) => {
+                            input.send(frame(Frame::Resize(pb::TerminalSize {
+                                width: cols.clamp(1, 1000),
+                                height: rows.clamp(1, 1000),
+                            }))).await
+                        }
+                        Ok(TerminalMessage { eof: true, .. }) => {
+                            input.send(frame(Frame::InputClosed(pb::InputClosed {}))).await
+                        }
+                        _ => Ok(()),
+                    },
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                    _ => Ok(()),
+                };
+                if sent.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// `legion audit`'s filters, as a query string carries them.
+#[derive(Deserialize)]
+struct AuditQuery {
+    since_ms: Option<u64>,
+    actor: Option<String>,
+    action: Option<String>,
+    namespace: Option<String>,
+    kind: Option<String>,
+    /// `ok`, `denied` or `error`.
+    result: Option<String>,
+    limit: Option<u32>,
+}
+
+/// `legion audit`: the newest events that match, `{events, truncated}`.
+async fn audit(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Query(q): Query<AuditQuery>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let result = match q.result.as_deref().filter(|r| !r.is_empty()) {
+        Some(r) => Some(
+            serde_json::from_value(r.into())
+                .map_err(|_| bad_request("result: ok, denied or error"))?,
+        ),
+        None => None,
+    };
+    let filter = legion_api::audit::Filter {
+        since_ms: q.since_ms.unwrap_or(0),
+        actor: q.actor.unwrap_or_default(),
+        action: q.action.unwrap_or_default(),
+        namespace: q.namespace.unwrap_or_default(),
+        kind: q.kind.unwrap_or_default(),
+        result,
+    };
+    let r = ClusterClient::new(channel)
+        .max_decoding_message_size(crate::MAX_MESSAGE)
+        .audit(pb::AuditRequest {
+            filter_json: serde_json::to_vec(&filter).expect("a filter serialises"),
+            limit: q.limit.unwrap_or(200).min(5000),
+        })
+        .await?
+        .into_inner();
+    let events = r
+        .events_json
+        .iter()
+        .map(|e| serde_json::from_slice(e))
+        .collect::<Result<Vec<serde_json::Value>, _>>()
+        .map_err(|e| Refused(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "events": events, "truncated": r.truncated })).into_response())
+}
+
+#[derive(Deserialize)]
+struct JoinTokenBody {
+    /// `manager` or `worker`.
+    role: String,
+    #[serde(default)]
+    rotate: bool,
+}
+
+/// `legion join-token`: the token nodes join with, made anew with `rotate`.
+async fn join_token(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(body): Json<JoinTokenBody>,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    let token = ClusterClient::new(channel)
+        .join_token(pb::JoinTokenRequest {
+            role: body.role,
+            rotate: body.rotate,
+        })
+        .await?
+        .into_inner()
+        .token;
+    Ok(Json(serde_json::json!({ "token": token })).into_response())
+}
+
+fn ca_json(r: pb::RotateCaResponse) -> Response {
+    let holders: Vec<_> = r
+        .holders
+        .iter()
+        .map(|h| serde_json::json!({ "name": h.name, "kind": h.kind, "issuer": h.issuer }))
+        .collect();
+    Json(serde_json::json!({
+        "digest": r.digest, "previous": r.previous_digest, "since_ms": r.since_ms,
+        "holders": holders,
+    }))
+    .into_response()
+}
+
+/// `legion ca status`: the CA that issues, and each holder's.
+async fn ca_status(State(g): State<Gateway>, headers: HeaderMap) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let r = ClusterClient::new(channel)
+        .rotate_ca(pb::RotateCaRequest { start: false })
+        .await?
+        .into_inner();
+    Ok(ca_json(r))
+}
+
+/// `legion ca rotate`: starts a rotation to a new CA.
+async fn ca_rotate(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    let r = ClusterClient::new(channel)
+        .rotate_ca(pb::RotateCaRequest { start: true })
+        .await?
+        .into_inner();
+    Ok(ca_json(r))
+}
+
+#[derive(Deserialize)]
+struct AutolockBody {
+    /// `enable`, `disable`, `rotate` or `show`.
+    action: String,
+}
+
+/// `legion autolock`: `{key}`, empty when autolock is off.
+async fn autolock(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(body): Json<AutolockBody>,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    if !["enable", "disable", "rotate", "show"].contains(&body.action.as_str()) {
+        return Err(bad_request("enable, disable, rotate or show"));
+    }
+    let key = ClusterClient::new(channel)
+        .autolock(pb::AutolockRequest {
+            action: body.action,
+        })
+        .await?
+        .into_inner()
+        .key;
+    Ok(Json(serde_json::json!({ "key": key })).into_response())
+}
+
+#[derive(Deserialize)]
+struct UserBody {
+    name: String,
+    role: Option<String>,
+    namespace: Option<String>,
+    #[serde(default)]
+    days: u32,
+}
+
+/// `legion user create`: the user's credentials, as the file `--identity`
+/// takes (`{pem, binding, days}`), shown once and kept nowhere.
+async fn create_user(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(body): Json<UserBody>,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    fn given(v: &Option<String>) -> Option<&str> {
+        v.as_deref().filter(|s| !s.is_empty())
+    }
+    let binding = match (given(&body.role), given(&body.namespace)) {
+        (Some(role), Some(namespace)) => Some((role, namespace)),
+        (None, None) => None,
+        _ => return Err(bad_request("a role and a namespace go together")),
+    };
+    let made = crate::actions::create_user(
+        &mut objects_client(channel.clone()),
+        &mut ClusterClient::new(channel),
+        &body.name,
+        binding,
+        body.days,
+    )
+    .await?;
+    let days = legion_pki::validity(&made.bundle.cert_pem)
+        .map_or(u64::from(body.days), |(_, life)| {
+            (life.as_secs() + 43_200) / 86_400
+        });
+    let mut res = Json(serde_json::json!({
+        "pem": made.bundle.to_pem(), "binding": made.binding, "days": days,
+    }))
+    .into_response();
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(res)
+}
+
+/// A download of what `stream` yields, as `filename`. A stream that fails
+/// partway ends the response unfinished, so the browser reports the
+/// download failed rather than keeping part of it.
+fn download(
+    filename: &str,
+    stream: impl tokio_stream::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,
+) -> Response {
+    let disposition = format!("attachment; filename=\"{}\"", filename.replace('"', ""));
+    (
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+            (header::CONTENT_DISPOSITION, disposition),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+fn chunks(
+    s: tonic::Streaming<pb::BackupChunk>,
+) -> impl tokio_stream::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
+    use tokio_stream::StreamExt;
+    s.map(|c| {
+        c.map(|c| bytes::Bytes::from(c.data))
+            .map_err(|s| std::io::Error::other(s.message().to_owned()))
+    })
+}
+
+/// `legion backup`: the control state, as `legion restore` takes it.
+async fn store_backup(State(g): State<Gateway>, headers: HeaderMap) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let stream = ClusterClient::new(channel)
+        .max_decoding_message_size(crate::MAX_MESSAGE)
+        .backup(pb::BackupRequest {})
+        .await?
+        .into_inner();
+    let name = format!("legion-backup-{}.json", crate::console::now_ms() / 1000);
+    Ok(download(&name, chunks(stream)))
+}
+
+/// `legion volume backup`: a Volume's data, as `legion volume restore` and
+/// the console's restore take it: the header's line, then the data.
+async fn volume_backup(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Response, Refused> {
+    use tokio_stream::StreamExt;
+    let (_, channel) = g.user(&headers).await?;
+    let mut stream = pb::volumes_client::VolumesClient::new(channel)
+        .max_decoding_message_size(crate::MAX_MESSAGE)
+        .backup(pb::VolumeBackupRequest { namespace, name })
+        .await?
+        .into_inner();
+    let first = stream
+        .message()
+        .await?
+        .ok_or_else(|| Refused(StatusCode::BAD_GATEWAY, "the manager sent nothing".into()))?;
+    let (header, line) = legion_api::volume::VolumeBackupHeader::line(&first.data)
+        .map_err(|e| Refused(StatusCode::BAD_GATEWAY, e))?;
+    let file = format!(
+        "{}-{}-{}.volume",
+        header.namespace, header.name, header.taken
+    );
+    let body = tokio_stream::once(Ok(bytes::Bytes::from(line))).chain(chunks(stream));
+    Ok(download(&file, body))
+}
+
+#[derive(Deserialize)]
+struct RestoreQuery {
+    /// The node to restore onto.
+    node: String,
+    /// The Volume's namespace and name; the backup's when left out.
+    namespace: Option<String>,
+    name: Option<String>,
+    /// Into the Volume of that name, lost with its node.
+    #[serde(default)]
+    replace: bool,
+}
+
+/// `legion volume restore`: a backup file uploaded as the request's body,
+/// to a Volume on `node`. Only once all of it is there does the Volume
+/// take it; an upload cut short leaves nothing.
+async fn volume_restore(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(q): Query<RestoreQuery>,
+    body: axum::body::Body,
+) -> Result<Response, Refused> {
+    use pb::volume_restore_chunk::Part;
+    use tokio_stream::StreamExt;
+    /// Bytes per message sent, as the CLI sends them.
+    const CHUNK: usize = 1 << 20;
+    let channel = g.writer(&headers, &uri, None).await?;
+    let mut upload = body.into_data_stream();
+    // The header's line first.
+    let mut first = Vec::new();
+    let rest = loop {
+        match upload.next().await {
+            Some(Ok(b)) => {
+                first.extend_from_slice(&b);
+                if let Some(end) = first.iter().position(|&c| c == b'\n') {
+                    break first.split_off(end + 1);
+                }
+                if first.len() > CHUNK {
+                    return Err(bad_request("not a volume backup: no header line"));
+                }
+            }
+            Some(Err(e)) => return Err(bad_request(format!("reading the upload: {e}"))),
+            None => return Err(bad_request("not a volume backup: no header line")),
+        }
+    };
+    let line = String::from_utf8(first)
+        .map_err(|_| bad_request("not a volume backup: its header is not text"))?;
+    let header = legion_api::volume::VolumeBackupHeader::from_line(&line).map_err(bad_request)?;
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let start = pb::VolumeRestoreStart {
+        namespace: q.namespace.clone().unwrap_or_default(),
+        name: q.name.clone().unwrap_or_default(),
+        node: q.node.clone(),
+        header_json: line.trim_end().to_owned(),
+        replace: q.replace,
+    };
+    let send = |part| pb::VolumeRestoreChunk { part: Some(part) };
+    tx.send(send(Part::Start(start)))
+        .await
+        .expect("the receiver is held");
+    // The upload failing partway ends the stream early: the node then
+    // takes nothing.
+    let feeding = tokio::spawn(async move {
+        let mut bytes = rest.len() as u64;
+        if !rest.is_empty() && tx.send(send(Part::Data(rest))).await.is_err() {
+            return Err("the manager stopped taking the data".to_owned());
+        }
+        while let Some(piece) = upload.next().await {
+            let piece = piece.map_err(|e| format!("reading the upload: {e}"))?;
+            bytes += piece.len() as u64;
+            for part in piece.chunks(CHUNK) {
+                if tx.send(send(Part::Data(part.to_vec()))).await.is_err() {
+                    return Err("the manager stopped taking the data".to_owned());
+                }
+            }
+        }
+        Ok(bytes)
+    });
+    let sent = pb::volumes_client::VolumesClient::new(channel)
+        .max_encoding_message_size(crate::MAX_MESSAGE)
+        .restore(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await;
+    let fed = feeding
+        .await
+        .map_err(|e| Refused(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    sent?;
+    let bytes = fed.map_err(bad_request)?;
+    Ok(Json(serde_json::json!({
+        "namespace": q.namespace.unwrap_or(header.namespace),
+        "name": q.name.unwrap_or(header.name),
+        "node": q.node,
+        "bytes": bytes,
+        "taken": header.taken,
+        "consistency": header.consistency,
+    }))
+    .into_response())
+}
+
 /// The console's pages: a file of the build, or the app's page for any
 /// other path (its router takes it from there).
 async fn page(uri: Uri) -> Result<Response, Infallible> {
@@ -797,6 +1635,23 @@ mod tests {
         assert_eq!(text_of(&mut pending, [&e[1..], b"!"].concat()), "é!");
         assert!(pending.is_empty());
         assert_eq!(text_of(&mut pending, vec![0xff, b'a']), "\u{fffd}a");
+    }
+
+    #[test]
+    fn a_write_carries_its_sessions_token() {
+        let session = "ab".repeat(32);
+        let token = csrf_token(&session);
+        assert_eq!(token.len(), 32);
+        assert!(csrf_ok(&session, Some(&token)));
+        assert!(!csrf_ok(&session, None));
+        assert!(!csrf_ok(&session, Some("")));
+        assert!(
+            !csrf_ok(&"cd".repeat(32), Some(&token)),
+            "another session's"
+        );
+        let mut wrong = token.clone();
+        wrong.replace_range(31.., if token.ends_with('0') { "1" } else { "0" });
+        assert!(!csrf_ok(&session, Some(&wrong)));
     }
 
     #[test]
