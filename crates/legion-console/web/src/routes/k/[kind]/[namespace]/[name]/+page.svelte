@@ -9,6 +9,7 @@
   import Rollout from '#lib/Rollout.svelte';
   import Taints from '#lib/Taints.svelte';
   import TaskLogs from '#lib/TaskLogs.svelte';
+  import UsageCharts from '#lib/UsageCharts.svelte';
   import VolumeData from '#lib/VolumeData.svelte';
   import { session } from '#lib/session.svelte.ts';
   import { toYaml } from '#lib/yaml.ts';
@@ -19,7 +20,8 @@
   let object: LObject | null = $state(null);
   let error = $state('');
   let gone = $state(false);
-  let tab: 'details' | 'rollout' | 'tasks' | 'logs' | 'terminal' | 'data' | 'yaml' = $state('details');
+  let tab: 'details' | 'rollout' | 'tasks' | 'usage' | 'logs' | 'terminal' | 'data' | 'yaml' =
+    $state('details');
 
   $effect(() => {
     object = null;
@@ -48,6 +50,7 @@
     ...(kind === 'Service' ? [{ id: 'rollout', label: 'Rollout' }] : []),
     ...(kind === 'Node' ? [{ id: 'tasks', label: 'Tasks' }] : []),
     ...(kind === 'Volume' ? [{ id: 'data', label: 'Data' }] : []),
+    ...(kind === 'Task' || kind === 'Service' || kind === 'Node' ? [{ id: 'usage', label: 'Usage' }] : []),
     ...(kind === 'Task'
       ? [
           { id: 'logs', label: 'Logs' },
@@ -115,6 +118,14 @@
     </dl>
   {:else if tab === 'tasks'}
     <NodeTasks node={object} />
+  {:else if tab === 'usage'}
+    {#if kind === 'Task'}
+      <UsageCharts {namespace} task={name} />
+    {:else if kind === 'Service'}
+      <UsageCharts {namespace} pick={(t) => t.service === name} />
+    {:else}
+      <UsageCharts namespace="" pick={(t) => t.node === name} />
+    {/if}
   {:else if tab === 'rollout'}
     <Rollout service={object} />
   {:else if tab === 'data'}

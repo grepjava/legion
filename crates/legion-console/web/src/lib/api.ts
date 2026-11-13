@@ -452,3 +452,23 @@ export function alertHref(a: Alert): string {
   return `/k/${encodeURIComponent(kind)}/${encodeURIComponent(a.namespace || '_')}/${encodeURIComponent(name)}`;
 }
 
+/** A task's samples over the last hour: [ms since the epoch, % of a CPU, bytes]. */
+export interface TaskSeries {
+  namespace: string;
+  task: string;
+  node: string;
+  service: string;
+  samples: [number, number, number][];
+}
+
+/** `legion usage`: what tasks used over the last hour, as the leader sampled it. */
+export function usageHistory(
+  namespace: string,
+  task = ''
+): Promise<{ step_ms: number; tasks: TaskSeries[] }> {
+  const params = new URLSearchParams();
+  if (namespace) params.set('namespace', namespace);
+  if (task) params.set('task', task);
+  return call('GET', `/api/usage-history?${params}`);
+}
+
