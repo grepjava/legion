@@ -324,6 +324,13 @@ updates, image operations and WireGuard full-mesh growth before expanding
 the feature set. Publish workload sizes, hardware and latency/resource
 budgets; optimize demonstrated bottlenecks.
 
+First, a benchmark of a whole cluster at 20,000 tasks, to be built once the
+console's phases are done: real managers and agents on the fake runtime
+(say 200 nodes of 100 tasks), timing a pass with its load, Raft writes per
+second as tasks change, the store's memory and snapshot size, endpoints
+sent to every node, a deploy and a node lost end to end, and the console's
+lists. It decides the order of the work below, and may add to it.
+
 Two known costs, each to be measured at the sizes it targets before
 changing code (`docs/MEASURE.md` holds the current figures):
 
