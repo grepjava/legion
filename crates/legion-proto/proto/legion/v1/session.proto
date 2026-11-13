@@ -72,8 +72,24 @@ message VolumeReceive {
 message LogsOptions {
   // Keep streaming until the container stops.
   bool follow = 1;
-  // Only the last lines.
+  // Only the last lines (of those in the range, when one is given).
   optional uint32 tail = 2;
+  // Only lines written from `since_ms` and before `until_ms`, in
+  // milliseconds since the epoch. With either, a line whose time the node
+  // does not know is left out. Agents from before ignore both.
+  optional int64 since_ms = 3;
+  optional int64 until_ms = 4;
+  // Each line as a `line` frame, with its time, rather than as `stdout`
+  // and `stderr` frames. Agents from before ignore it.
+  bool times = 5;
+}
+
+// A line of a container's output, with when it was written.
+message LogLine {
+  bool stderr = 1;
+  bytes data = 2;
+  // Milliseconds since the epoch; 0 when the node does not know.
+  int64 at_ms = 3;
 }
 
 message ExecOptions {
@@ -115,6 +131,8 @@ message SessionFrame {
     string attach = 8;
     // The session failed; the last frame.
     SessionError error = 9;
+    // Logs asked with `times`: a line and when it was written.
+    LogLine line = 10;
   }
 }
 

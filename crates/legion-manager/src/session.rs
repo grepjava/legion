@@ -489,7 +489,7 @@ async fn relay(
                 }
                 Ok(
                     f @ SessionFrame {
-                        frame: Some(Frame::Stdout(_) | Frame::Stderr(_)),
+                        frame: Some(Frame::Stdout(_) | Frame::Stderr(_) | Frame::Line(_)),
                     },
                 ) => {
                     if to_user.send(Ok(f)).await.is_err() {

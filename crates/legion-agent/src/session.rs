@@ -18,7 +18,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use legion_proto::v1::session_frame::Frame;
 use legion_proto::v1::session_open::Action;
-use legion_proto::v1::{ExecOptions, LogsOptions, SessionError, SessionFrame};
+use legion_proto::v1::{ExecOptions, LogLine, LogsOptions, SessionError, SessionFrame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tonic::{Status, Streaming};
@@ -82,10 +82,14 @@ async fn run<R: Runtime>(
                 Ok(c) => logs(runtime.as_ref(), &c, &opts, &tx, &mut inbound).await,
                 Err(e) => Err(e),
             };
+            let range = Range::of(&opts);
             match found {
                 Err(e) if e.code() == tonic::Code::NotFound => {
-                    match saved(kept, &o.task_uid, &open.container, opts.tail).await {
-                        Some(lines) => send_all(lines, &tx).await,
+                    // Read whole when a range is given: the tail is of
+                    // the lines in it.
+                    let tail = if range.given() { None } else { opts.tail };
+                    match saved(kept, &o.task_uid, &open.container, tail).await {
+                        Some(lines) => send_all(range.select(lines, opts.tail), &range, &tx).await,
                         None => Err(e),
                     }
                 }
@@ -165,17 +169,35 @@ async fn logs<R: Runtime>(
     tx: &mpsc::Sender<SessionFrame>,
     inbound: &mut Streaming<SessionFrame>,
 ) -> Result<(), Status> {
-    let tail = opts.tail.map(|n| n as usize);
+    let range = Range::of(opts);
+    // With a range, the tail is of the lines in it: read whole, then cut.
+    let tail = if range.given() {
+        None
+    } else {
+        opts.tail.map(|n| n as usize)
+    };
     // Only an error opening the output is NotFound: one while streaming it
     // is not, or the kept copy would follow lines already sent.
     let mut output = runtime
         .logs(id, opts.follow, tail)
         .await
         .map_err(runtime_status)?;
+    if range.given() && !opts.follow {
+        let mut all = Vec::new();
+        while let Some(c) = output.next().await {
+            match c {
+                Ok(c) => all.push(c),
+                Err(e) if e.is_not_found() => break,
+                Err(e) => return Err(runtime_status(e)),
+            }
+        }
+        return send_all(range.select(all, opts.tail), &range, tx).await;
+    }
     loop {
         tokio::select! {
             chunk = output.next() => match chunk {
-                Some(Ok(c)) => if tx.send(output_frame(c)).await.is_err() {
+                Some(Ok(c)) if !range.keeps(&c) => {}
+                Some(Ok(c)) => if tx.send(range.frame(c)).await.is_err() {
                     return Ok(());
                 },
                 // Removed while streaming: its output has ended.
@@ -204,13 +226,72 @@ async fn saved(
         .ok()?
 }
 
-async fn send_all(lines: Vec<Chunk>, tx: &mpsc::Sender<SessionFrame>) -> Result<(), Status> {
+async fn send_all(
+    lines: Vec<Chunk>,
+    range: &Range,
+    tx: &mpsc::Sender<SessionFrame>,
+) -> Result<(), Status> {
     for c in lines {
-        if tx.send(output_frame(c)).await.is_err() {
+        if tx.send(range.frame(c)).await.is_err() {
             break;
         }
     }
     Ok(())
+}
+
+/// Which lines a logs session asked for, and how it wants them sent.
+struct Range {
+    since: Option<std::time::SystemTime>,
+    until: Option<std::time::SystemTime>,
+    times: bool,
+}
+
+impl Range {
+    fn of(opts: &LogsOptions) -> Range {
+        let at = |ms: Option<i64>| {
+            ms.map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms.max(0) as u64))
+        };
+        Range {
+            since: at(opts.since_ms),
+            until: at(opts.until_ms),
+            times: opts.times,
+        }
+    }
+
+    fn given(&self) -> bool {
+        self.since.is_some() || self.until.is_some()
+    }
+
+    /// Within the range; with one given, only a line whose time is known.
+    fn keeps(&self, c: &Chunk) -> bool {
+        if !self.given() {
+            return true;
+        }
+        c.at.is_some_and(|t| self.since.is_none_or(|s| t >= s) && self.until.is_none_or(|u| t < u))
+    }
+
+    /// The lines it keeps, the last `tail` of them if given.
+    fn select(&self, lines: Vec<Chunk>, tail: Option<u32>) -> Vec<Chunk> {
+        let mut kept: Vec<Chunk> = lines.into_iter().filter(|c| self.keeps(c)).collect();
+        if let Some(n) = tail {
+            kept = kept.split_off(kept.len().saturating_sub(n as usize));
+        }
+        kept
+    }
+
+    fn frame(&self, c: Chunk) -> SessionFrame {
+        if !self.times {
+            return output_frame(c);
+        }
+        let at_ms =
+            c.at.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_millis() as i64);
+        frame(Frame::Line(LogLine {
+            stderr: c.stream == Output::Stderr,
+            data: c.data.to_vec(),
+            at_ms,
+        }))
+    }
 }
 
 async fn exec<R: Runtime>(
