@@ -332,6 +332,23 @@ pub struct VolumeBackupHeader {
 impl VolumeBackupHeader {
     pub const FORMAT: u32 = 1;
     pub const CRASH_CONSISTENT: &str = "crash-consistent";
+
+    /// The line a backup file starts with, from the header as a manager
+    /// sends it: compact JSON, which has no line break, then one. The data
+    /// follows it in the file.
+    pub fn line(sent: &[u8]) -> Result<(VolumeBackupHeader, Vec<u8>), String> {
+        let header: VolumeBackupHeader =
+            serde_json::from_slice(sent).map_err(|e| format!("the backup's header: {e}"))?;
+        let mut line = serde_json::to_vec(&header).expect("a header serialises");
+        line.push(b'\n');
+        Ok((header, line))
+    }
+
+    /// The header a backup file's first line holds.
+    pub fn from_line(line: &str) -> Result<VolumeBackupHeader, String> {
+        serde_json::from_str(line.trim_end())
+            .map_err(|_| "not a volume backup: it does not start with a backup's header".to_owned())
+    }
 }
 
 #[cfg(test)]

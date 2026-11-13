@@ -21,6 +21,7 @@ pub mod dispatch;
 pub mod image;
 pub mod job;
 pub mod login;
+pub mod manifest;
 pub mod metrics;
 pub mod node;
 pub mod policy;
