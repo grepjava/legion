@@ -170,6 +170,7 @@ fn router(gateway: Gateway) -> axum::Router {
         )
         .route("/api/watch/{kind}", get(watch))
         .route("/api/usage", get(usage))
+        .route("/api/reach", get(reach))
         .route("/api/logs/{namespace}/{task}", get(logs))
         // Writes (CONSOLE.md phases 2 and 3): each from the console's own
         // page with the session's token, as the user.
@@ -657,6 +658,36 @@ async fn usage(
         })
         .collect();
     Ok(Json(serde_json::json!({ "nodes": nodes })).into_response())
+}
+
+/// `legion reach`: what may reach what among a namespace's services,
+/// `{services, edges: [{from, to, all_ports, ports: [{protocol, port}]}]}`;
+/// `from` empty for other namespaces' tasks.
+async fn reach(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Query(scope): Query<Scope>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let r = ClusterClient::new(channel)
+        .reach(pb::ReachRequest {
+            namespace: scope.namespace.unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+    let edges: Vec<_> = r
+        .edges
+        .iter()
+        .map(|e| {
+            let ports: Vec<_> = e
+                .ports
+                .iter()
+                .map(|p| serde_json::json!({ "protocol": p.protocol, "port": p.port }))
+                .collect();
+            serde_json::json!({ "from": e.from, "to": e.to, "all_ports": e.all_ports, "ports": ports })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "services": r.services, "edges": edges })).into_response())
 }
 
 #[derive(Deserialize)]
@@ -1350,6 +1381,8 @@ async fn create_user(
         &body.name,
         binding,
         body.days,
+        // Handed to the browser in the answer; nothing keeps them here.
+        |_| Ok(()),
     )
     .await?;
     let days = legion_pki::validity(&made.bundle.cert_pem)

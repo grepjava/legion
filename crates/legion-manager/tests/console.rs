@@ -674,6 +674,7 @@ async fn the_console_runs_the_cluster_for_an_admin() {
     let mut objects = ObjectsClient::new(f.admin.clone());
     for (kind, ns, name, spec) in [
         ("Namespace", "", "shop", serde_json::json!({})),
+        ("Namespace", "", "bank", serde_json::json!({})),
         (
             "RoleBinding",
             "shop",
@@ -796,6 +797,59 @@ async fn the_console_runs_the_cluster_for_an_admin() {
     );
     let wrong = admin("GET", "/api/audit?result=maybe", None).await;
     assert_eq!(wrong.status, 400, "{}", wrong.text);
+
+    // What reaches what in a namespace, as the nodes enforce it: by
+    // default its own tasks, every port, and no other namespace's.
+    for name in ["web", "db"] {
+        let spec = serde_json::json!({
+            "replicas": 1, "pod": { "containers": [{ "name": "c", "image": "web:1" }] },
+        });
+        objects
+            .apply(object("Service", "shop", name, spec))
+            .await
+            .unwrap();
+    }
+    let reach = as_user(
+        &alice,
+        &alice_token,
+        "GET",
+        "/api/reach?namespace=shop",
+        None,
+    )
+    .await;
+    assert_eq!(reach.status, 200, "{}", reach.text);
+    assert_eq!(reach.body["services"], serde_json::json!(["db", "web"]));
+    let edges: Vec<(String, String, bool)> = reach.body["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["from"].as_str().unwrap().to_owned(),
+                e["to"].as_str().unwrap().to_owned(),
+                e["all_ports"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    for (from, to) in [("web", "db"), ("db", "web"), ("web", "web"), ("db", "db")] {
+        assert!(
+            edges.contains(&(from.into(), to.into(), true)),
+            "{from} to {to}: {edges:?}"
+        );
+    }
+    assert!(
+        edges.iter().all(|e| !e.0.is_empty()),
+        "others reach nothing: {edges:?}"
+    );
+    let theirs = as_user(
+        &alice,
+        &alice_token,
+        "GET",
+        "/api/reach?namespace=bank",
+        None,
+    )
+    .await;
+    assert_eq!(theirs.status, 403, "{}", theirs.text);
 
     // An admin of one namespace runs none of the cluster.
     for (method, path, body) in [
