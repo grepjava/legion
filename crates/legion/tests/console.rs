@@ -60,7 +60,7 @@ spec:
         image: {IMAGE}
         command: [/bin/sleep, "86400"]
         volumeMounts: [{{ name: data, path: /data }}]
-  volumes: [{{ name: data, claim: {{ size: 64Mi }} }}]
+    volumes: [{{ name: data, claim: {{ size: 64Mi }} }}]
 "#
     )
 }
