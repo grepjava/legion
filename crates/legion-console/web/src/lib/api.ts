@@ -103,6 +103,9 @@ export const api = {
       `/api/objects/${encodeURIComponent(kind)}/${encodeURIComponent(namespace || '_')}/${encodeURIComponent(name)}`
     ),
   usage: (namespace = '') => call<{ nodes: NodeUsage[] }>('GET', `/api/usage${q(namespace)}`),
+  /** What may reach what among a namespace's services, as `legion reach`. */
+  reach: (namespace: string) =>
+    call<{ services: string[]; edges: ReachEdge[] }>('GET', `/api/reach${q(namespace)}`),
 
   // Writes, as the user, each checked by the API as the CLI's are.
   manifest: (kind: string, namespace: string, name: string) =>
@@ -207,6 +210,14 @@ export interface CaStatus {
   previous: string;
   since_ms: number;
   holders: { name: string; kind: string; issuer: string }[];
+}
+
+export interface ReachEdge {
+  /** A service of the namespace; empty for other namespaces' tasks. */
+  from: string;
+  to: string;
+  all_ports: boolean;
+  ports: { protocol: string; port: number }[];
 }
 
 export interface ApplyResult {

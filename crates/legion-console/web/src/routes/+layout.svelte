@@ -69,6 +69,7 @@
       <nav>
         <a href="/" class:here={page.url.pathname === '/'}>Overview</a>
         <a href="/apply" class:here={page.url.pathname === '/apply'}>Apply YAML</a>
+        <a href="/network" class:here={page.url.pathname === '/network'}>Network</a>
         <h2>Workloads and config</h2>
         {#each nsKinds as k (k.kind)}
           <a href="/k/{k.kind}" class:here={page.url.pathname.startsWith(`/k/${k.kind}`)}

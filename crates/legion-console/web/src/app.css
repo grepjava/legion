@@ -370,3 +370,16 @@ pre.diff .head {
   border-radius: 6px;
   padding: 0.25rem;
 }
+
+table.matrix td {
+  text-align: center;
+}
+table.matrix td.all {
+  color: var(--good);
+}
+table.matrix td.some {
+  color: var(--wait, #9a6700);
+}
+table.matrix td.no {
+  color: var(--muted);
+}
