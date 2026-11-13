@@ -126,6 +126,25 @@ Service, execs into a task and reads its logs, all from the console, on
 the lab; every action shows in `legion audit`; a `view` user sees the
 buttons disabled with the reason.
 
+**Built so far:** writes carry a per-session token (`x-legion-csrf`, from
+`/api/me`; a WebSocket sends it in its query) besides the origin check.
+Apply YAML pasted or edited from the stored manifest (`/api/manifest`),
+an edit applied only over the version read; "Show changes" is `legion
+diff` on the server (a dry run, a unified diff of the manifests). Delete
+with confirmation naming what goes with it. Services: scale, a new image
+per container over the version shown, the rollout's state and counts,
+roll back. CronJobs: suspend and resume. A task's terminal (xterm.js,
+loaded only when opened) over `Pods.Session`. Labels added and removed on
+any object. Buttons disabled with the reason for a user who may only
+look; the API decides in the end, and audits each write as the user. The
+CLI and the console share the code for these (`legion_manager::actions`:
+`set_spec`, `set_labels`, `rollback`, `create_user`; `legion_api::manifest`).
+Tested over HTTPS (`crates/legion-manager/tests/console.rs`). Not yet:
+restart and run-now, which need the API first (an applied spec that is
+unchanged makes no new generation; there is no call to start a CronJob's
+run), events per object (there is no event kind; a task's status message
+says why it waits), and the browser test on the lab.
+
 ## Phase 3: cluster operations
 
 What an admin does.
@@ -147,6 +166,17 @@ What an admin does.
 **Done when** an admin can take a node out for maintenance and back,
 rotate the CA and watch every node move to it, and restore a lost Volume
 from the console, on the lab.
+
+**Built so far:** nodes drained, paused and activated, promoted and
+demoted, removed, labelled; a Volume moved to a node, its backup
+downloaded, a backup uploaded onto a node, a lost Volume restored in
+place; an Operations page (the CA and each holder's, rotation started
+and followed; join tokens shown and rotated; autolock; the control
+state's backup downloaded; users' credentials made and offered once as a
+file); the audit log with `legion audit`'s filters and a time window (the
+API leaves out the newest when more match than the limit). Not yet:
+taints, the NetworkPolicy matrix, load balancer addresses and their
+holders, image policies' keys, and the lab test.
 
 ## Phase 4: observability
 
