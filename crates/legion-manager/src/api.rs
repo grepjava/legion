@@ -1363,6 +1363,78 @@ impl Cluster for ApiService {
         Ok(Response::new(usage))
     }
 
+    async fn usage_history(
+        &self,
+        req: Request<pb::UsageHistoryRequest>,
+    ) -> Result<Response<pb::UsageHistoryResponse>, Status> {
+        let caller = self.caller(&req)?;
+        let (namespace, task) = (req.get_ref().namespace.clone(), req.get_ref().task.clone());
+        check_namespace(&namespace)?;
+        if !task.is_empty() && namespace.is_empty() {
+            return Err(Status::invalid_argument("a task is named in its namespace"));
+        }
+        // Only the leader hears heartbeats; it checks the user's rights.
+        if let Some(addr) = self.leader_addr(&req)? {
+            let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                &addr,
+                self.peer_tls.as_ref(),
+            ));
+            return c
+                .usage_history(forwarded_for(req.into_inner(), &caller)?)
+                .await;
+        }
+        self.consistent().await?;
+        if !namespace.is_empty() {
+            caller.check(&self.store, Verb::Read, Kind::Task, &namespace)?;
+        }
+        let services: std::collections::HashMap<String, String> = self
+            .store
+            .list(Kind::Task, (!namespace.is_empty()).then_some(namespace.as_str()))
+            .map(|l| l.objects)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| {
+                let key = format!("{}/{}", t.metadata.namespace, t.metadata.name);
+                (key, t.spec["service"].as_str().unwrap_or("").to_owned())
+            })
+            .collect();
+        let tasks = self
+            .usage
+            .history()
+            .into_iter()
+            .filter_map(|(key, (node, samples))| {
+                let (ns, name) = key.split_once('/')?;
+                let service = services.get(&key).cloned().unwrap_or_else(|| {
+                    let mut parts = name.rsplitn(3, '-');
+                    let (_, _, svc) = (parts.next(), parts.next(), parts.next());
+                    svc.unwrap_or(name).to_owned()
+                });
+                let wanted = ns != SYSTEM_NAMESPACE
+                    && (namespace.is_empty() || ns == namespace)
+                    && (task.is_empty() || name == task)
+                    && caller.may(&self.store, Verb::Read, Kind::Task, ns);
+                wanted.then(|| pb::TaskSeries {
+                    namespace: ns.to_owned(),
+                    task: name.to_owned(),
+                    node,
+                    service,
+                    samples: samples
+                        .iter()
+                        .map(|s| pb::UsageSample {
+                            at_ms: s.at_ms,
+                            cpu_percent: f64::from(s.cpu),
+                            memory_bytes: s.memory,
+                        })
+                        .collect(),
+                })
+            })
+            .collect();
+        Ok(Response::new(pb::UsageHistoryResponse {
+            tasks,
+            step_ms: crate::usage::STEP.as_millis() as i64,
+        }))
+    }
+
     type WatchAlertsStream = ReceiverStream<Result<pb::AlertsResponse, Status>>;
 
     async fn watch_alerts(

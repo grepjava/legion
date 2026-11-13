@@ -135,6 +135,11 @@ service Cluster {
   // node: the tasks of `namespace`, or of every namespace when empty, that
   // the caller may read.
   rpc Usage(UsageRequest) returns (UsageResponse);
+  // What tasks used over the last hour, a sample every 15 s, as the
+  // leader heard it from their nodes (it keeps no more, and a new leader
+  // starts empty): the tasks of `namespace`, or of every namespace when
+  // empty, that the caller may read; with `task`, that one only.
+  rpc UsageHistory(UsageHistoryRequest) returns (UsageHistoryResponse);
   // What an operator acts on now (legion_api::alert): crash-looping
   // tasks, nodes down or suspect, lost Volumes, the CA near expiry, Raft
   // without a leader or quorum, as this manager works them out from its
@@ -229,6 +234,36 @@ message RecordAuditRequest {
 }
 
 message RecordAuditResponse {}
+
+message UsageHistoryRequest {
+  string namespace = 1;
+  // Needs `namespace`.
+  string task = 2;
+}
+
+message UsageHistoryResponse {
+  repeated TaskSeries tasks = 1;
+  // Between samples, in milliseconds.
+  int64 step_ms = 2;
+}
+
+message TaskSeries {
+  string namespace = 1;
+  string task = 2;
+  // The node that took the latest sample.
+  string node = 3;
+  repeated UsageSample samples = 4;
+  // Its Service or Job, as the store has it; for a task since removed,
+  // as its name says (`<service>-<slot>-<n>`).
+  string service = 5;
+}
+
+message UsageSample {
+  // Milliseconds since the epoch.
+  int64 at_ms = 1;
+  double cpu_percent = 2;
+  uint64 memory_bytes = 3;
+}
 
 message AlertsRequest {
   string namespace = 1;
