@@ -180,6 +180,8 @@ fn router(gateway: Gateway) -> axum::Router {
         // page with the session's token, as the user.
         .route("/api/manifest/{kind}/{namespace}/{name}", get(manifest))
         .route("/api/apply", post(apply))
+        .route("/api/compose", post(compose))
+        .route("/api/templates", get(templates))
         .route("/api/set", post(set_field))
         .route("/api/labels", post(labels))
         .route("/api/rollback", post(rollback))
@@ -982,6 +984,143 @@ fn text_of(pending: &mut Vec<u8>, data: Vec<u8>) -> String {
     let text = String::from_utf8_lossy(pending).into_owned();
     *pending = rest;
     text
+}
+
+#[derive(Deserialize)]
+struct ComposeBody {
+    compose: String,
+    stack: String,
+    /// The stack's name when not given, as `legion stack deploy` does.
+    namespace: Option<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+}
+
+/// A compose file as Legion objects, as `legion stack convert` prints them
+/// (CONSOLE.md phase 5: compose import, templates), nothing written:
+/// `{objects, warnings, variables: [{name, default, required}]}`. The
+/// namespace comes first when it is missing, made as `legion stack
+/// deploy` makes it. Files a compose file names are not read: in the
+/// console, content goes in the file.
+async fn compose(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Json(body): Json<ComposeBody>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let namespace = body.namespace.unwrap_or_else(|| body.stack.clone());
+    let env = |k: &str| body.env.get(k).cloned();
+    let read = |p: &str| -> Result<Vec<u8>, String> {
+        Err(format!("{p}: the console reads no files; put the content in the compose file"))
+    };
+    let stack = legion_api::compose::convert(
+        &body.compose,
+        &body.stack,
+        &namespace,
+        &legion_api::compose::Inputs {
+            env: &env,
+            read: &read,
+        },
+    )
+    .map_err(bad_request)?;
+    let missing = match ObjectsClient::new(channel)
+        .get(pb::ObjectRef {
+            kind: legion_api::Kind::Namespace.as_str().into(),
+            namespace: String::new(),
+            name: namespace.clone(),
+        })
+        .await
+    {
+        Err(s) if s.code() == tonic::Code::NotFound => true,
+        // A user with a role there may not look at it: it is there.
+        Err(s) if s.code() != tonic::Code::PermissionDenied => return Err(s.into()),
+        _ => false,
+    };
+    let mut docs = Vec::new();
+    if missing {
+        docs.push(serde_json::json!({
+            "apiVersion": "legion/v1", "kind": "Namespace",
+            "metadata": { "name": namespace }, "spec": {},
+        }));
+    }
+    for o in &stack.objects {
+        docs.push(serde_json::json!({
+            "apiVersion": o.api_version,
+            "kind": o.kind,
+            "metadata": {
+                "name": o.metadata.name,
+                "namespace": o.metadata.namespace,
+                "labels": o.metadata.labels,
+            },
+            "spec": o.spec,
+        }));
+    }
+    let variables: Vec<_> = stack
+        .variables
+        .iter()
+        .map(|v| serde_json::json!({ "name": v.name, "default": v.default, "required": v.required }))
+        .collect();
+    Ok(Json(serde_json::json!({
+        "objects": docs, "warnings": stack.warnings, "variables": variables,
+    }))
+    .into_response())
+}
+
+/// The label marking a Config as a saved template: its text a compose file.
+const TEMPLATE_LABEL: &str = "legion.template";
+
+/// The examples in `examples/`, the catalog every console has.
+const EXAMPLES: &[(&str, &str)] = &[
+    ("counter", include_str!("../../../examples/counter/compose.yaml")),
+    ("static-site", include_str!("../../../examples/static-site/compose.yaml")),
+];
+
+/// A compose file's opening comment, as what it is.
+fn about(compose: &str) -> String {
+    compose
+        .lines()
+        .take_while(|l| l.starts_with('#'))
+        .map(|l| l.trim_start_matches('#').trim())
+        .take_while(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The templates to deploy from: the examples, and the Configs labelled
+/// `legion.template` in the namespaces the user may read. `{templates:
+/// [{name, namespace, about, compose}]}`, an example's namespace empty.
+async fn templates(State(g): State<Gateway>, headers: HeaderMap) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let mut out: Vec<_> = EXAMPLES
+        .iter()
+        .map(|(name, compose)| {
+            serde_json::json!({
+                "name": name, "namespace": "", "about": about(compose), "compose": compose,
+            })
+        })
+        .collect();
+    let saved = ObjectsClient::new(channel)
+        .max_decoding_message_size(crate::MAX_MESSAGE)
+        .list(pb::ListRequest {
+            kind: legion_api::Kind::Config.as_str().into(),
+            namespace: String::new(),
+            match_labels: [(TEMPLATE_LABEL.to_owned(), "compose".to_owned())].into(),
+        })
+        .await?
+        .into_inner();
+    for o in saved.objects {
+        let Ok(spec) = serde_json::from_slice::<legion_api::data::DataSpec>(&o.spec_json) else {
+            continue;
+        };
+        // Stored as `data`, whichever the manifest gave.
+        let Some(compose) = spec.bytes().ok().and_then(|b| String::from_utf8(b).ok()) else {
+            continue;
+        };
+        out.push(serde_json::json!({
+            "name": o.name, "namespace": o.namespace, "about": about(&compose), "compose": compose,
+        }));
+    }
+    Ok(Json(serde_json::json!({ "templates": out })).into_response())
 }
 
 fn bad_request(message: impl Into<String>) -> Refused {
