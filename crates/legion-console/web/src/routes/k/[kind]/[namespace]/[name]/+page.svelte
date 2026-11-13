@@ -5,6 +5,7 @@
   import { plural } from '#lib/kinds.ts';
   import Actions from '#lib/Actions.svelte';
   import Labels from '#lib/Labels.svelte';
+  import LogSearch from '#lib/LogSearch.svelte';
   import NodeTasks from '#lib/NodeTasks.svelte';
   import Rollout from '#lib/Rollout.svelte';
   import Taints from '#lib/Taints.svelte';
@@ -21,7 +22,7 @@
   let object: LObject | null = $state(null);
   let error = $state('');
   let gone = $state(false);
-  let tab: 'details' | 'rollout' | 'tasks' | 'usage' | 'quota' | 'logs' | 'terminal' | 'data' | 'yaml' =
+  let tab: 'details' | 'rollout' | 'tasks' | 'usage' | 'quota' | 'search' | 'logs' | 'terminal' | 'data' | 'yaml' =
     $state('details');
 
   $effect(() => {
@@ -49,6 +50,7 @@
   const tabs = $derived([
     { id: 'details', label: 'Details' },
     ...(kind === 'Service' ? [{ id: 'rollout', label: 'Rollout' }] : []),
+    ...(kind === 'Service' || kind === 'Job' ? [{ id: 'search', label: 'Logs' }] : []),
     ...(kind === 'Node' ? [{ id: 'tasks', label: 'Tasks' }] : []),
     ...(kind === 'Volume' ? [{ id: 'data', label: 'Data' }] : []),
     ...(kind === 'Namespace' ? [{ id: 'quota', label: 'Quota' }] : []),
@@ -120,6 +122,8 @@
     </dl>
   {:else if tab === 'tasks'}
     <NodeTasks node={object} />
+  {:else if tab === 'search'}
+    <LogSearch {namespace} service={name} />
   {:else if tab === 'quota'}
     <Quotas namespace={name} />
   {:else if tab === 'usage'}

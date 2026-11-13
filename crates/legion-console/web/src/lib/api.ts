@@ -490,3 +490,32 @@ export function quotas(namespace = ''): Promise<{ namespaces: NamespaceQuota[] }
   if (namespace) params.set('namespace', namespace);
   return call('GET', `/api/quotas?${params}`);
 }
+
+/** A line `logSearch` found. */
+export interface FoundLine {
+  at_ms: number;
+  task: string;
+  container: string;
+  stderr: boolean;
+  text: string;
+}
+
+/** `legion logs-search`: a service's lines across its tasks, oldest first. */
+export function logSearch(q: {
+  namespace: string;
+  service: string;
+  since_ms: number;
+  until_ms?: number;
+  text?: string;
+  limit?: number;
+}): Promise<{ lines: FoundLine[]; truncated: boolean; unread: string[] }> {
+  const params = new URLSearchParams({
+    namespace: q.namespace,
+    service: q.service,
+    since_ms: String(q.since_ms)
+  });
+  if (q.until_ms !== undefined) params.set('until_ms', String(q.until_ms));
+  if (q.text) params.set('text', q.text);
+  if (q.limit) params.set('limit', String(q.limit));
+  return call('GET', `/api/log-search?${params}`);
+}
