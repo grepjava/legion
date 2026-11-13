@@ -374,6 +374,14 @@ enum Command {
         #[arg(short, long, value_enum, default_value_t = cli::Format::Table)]
         output: cli::Format,
     },
+    /// Each namespace's quota and what it uses of it now: its placed
+    /// tasks' requests and its Volumes.
+    Quota {
+        #[arg(short, long)]
+        namespace: Option<String>,
+        #[arg(short, long, value_enum, default_value_t = cli::Format::Table)]
+        output: cli::Format,
+    },
     /// What tasks used over the last hour, as the leader sampled it every
     /// 15 s: now, on average and at most, per task; every sample with -o
     /// json or yaml.

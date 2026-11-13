@@ -773,6 +773,15 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 }
             }
         }
+        Command::Quota { namespace, output } => {
+            let r = cluster
+                .quotas(pb::QuotasRequest {
+                    namespace: namespace.unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            print_quotas(&r, output)?;
+        }
         Command::Usage {
             task,
             namespace,
@@ -1424,6 +1433,55 @@ fn print_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) {
 }
 
 /// Audit events as a table, YAML or JSON.
+fn print_quotas(r: &pb::QuotasResponse, format: Format) -> anyhow::Result<()> {
+    let json: Vec<serde_json::Value> = r
+        .namespaces
+        .iter()
+        .map(|n| {
+            let resources: Vec<_> = n
+                .resources
+                .iter()
+                .map(|q| serde_json::json!({ "resource": q.resource, "limit": q.limit, "used": q.used }))
+                .collect();
+            serde_json::json!({ "namespace": n.namespace, "resources": resources })
+        })
+        .collect();
+    match format {
+        Format::Json => println!("{}", serde_json::to_string_pretty(&json)?),
+        Format::Yaml => print!("{}", serde_yaml_ng::to_string(&json)?),
+        Format::Table if r.namespaces.is_empty() => println!("no namespace with a quota"),
+        Format::Table => {
+            let show = |resource: &str, v: f64| match resource {
+                "memory" | "storage" => format!("{:.1}Gi", v / (1u64 << 30) as f64),
+                "cpu" => format!("{v:.2}"),
+                _ => format!("{v}"),
+            };
+            let rows: Vec<[String; 5]> = r
+                .namespaces
+                .iter()
+                .flat_map(|n| {
+                    n.resources.iter().map(|q| {
+                        let pct = if q.limit > 0.0 {
+                            q.used / q.limit * 100.0
+                        } else {
+                            0.0
+                        };
+                        [
+                            n.namespace.clone(),
+                            q.resource.clone(),
+                            show(&q.resource, q.used),
+                            show(&q.resource, q.limit),
+                            format!("{pct:.0}%"),
+                        ]
+                    })
+                })
+                .collect();
+            print_table(["NAMESPACE", "RESOURCE", "USED", "LIMIT", "USE"], &rows);
+        }
+    }
+    Ok(())
+}
+
 fn print_usage_history(r: &pb::UsageHistoryResponse, format: Format) -> anyhow::Result<()> {
     let json: Vec<serde_json::Value> = r
         .tasks
