@@ -180,8 +180,11 @@ fn all_disabled(b: &mut Browser) -> Vec<(String, bool, String)> {
 }
 
 fn assert_read_only(b: &mut Browser, page: &str) {
+    // The actions come with the object, after the page's title.
+    b.until(&format!("{page}: buttons to check"), 30, |b| {
+        !all_disabled(b).is_empty()
+    });
     let buttons = all_disabled(b);
-    assert!(!buttons.is_empty(), "{page}: buttons to check");
     for (t, enabled, title) in &buttons {
         assert!(!enabled, "{page}: {t:?} may be pressed by a viewer");
         assert!(!title.is_empty(), "{page}: {t:?} says why it is disabled");
