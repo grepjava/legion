@@ -99,7 +99,11 @@ impl LogStream {
         follow: bool,
         tail: Option<u32>,
     ) -> anyhow::Result<LogStream> {
-        let action = Action::Logs(LogsOptions { follow, tail });
+        let action = Action::Logs(LogsOptions {
+            follow,
+            tail,
+            ..Default::default()
+        });
         Ok(LogStream(
             Session::open(channel, target.open(action)).await?,
         ))

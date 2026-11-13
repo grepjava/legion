@@ -419,6 +419,41 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             let target = target(task, namespace, container);
             crate::session::logs(&channel, &target, follow, tail).await?;
         }
+        Command::LogsSearch {
+            service,
+            text,
+            namespace,
+            since,
+            until,
+            limit,
+        } => {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as i64);
+            let r = legion_manager::logsearch::search(
+                channel.clone(),
+                &legion_manager::logsearch::Search {
+                    namespace: namespace.unwrap_or_else(|| "default".into()),
+                    service,
+                    since_ms: Some(now_ms - since.millis() as i64),
+                    until_ms: until.map(|u| now_ms - u.millis() as i64),
+                    text: text.unwrap_or_default(),
+                    limit,
+                },
+            )
+            .await?;
+            for l in &r.lines {
+                let time = legion_api::clock::format(l.at_ms / 1000);
+                let stream = if l.stderr { "!" } else { " " };
+                println!("{time} {}{stream} {}", l.task, l.text);
+            }
+            if r.truncated {
+                eprintln!("more lines matched than --limit {limit}: the oldest were left out");
+            }
+            for u in &r.unread {
+                eprintln!("not searched: {u}");
+            }
+        }
         Command::Exec {
             task,
             namespace,

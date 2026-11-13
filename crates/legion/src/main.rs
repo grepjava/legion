@@ -447,6 +447,25 @@ enum Command {
         #[arg(long)]
         tail: Option<u32>,
     },
+    /// Search a Service's or Job's logs across its tasks: the lines from
+    /// --since (and before --until), holding TEXT if given, oldest first,
+    /// each with its time and task.
+    LogsSearch {
+        service: String,
+        /// Lines holding this, without regard to case.
+        text: Option<String>,
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// How far back, e.g. `30m`, `24h`.
+        #[arg(long, default_value = "1h")]
+        since: legion_api::quantity::Duration,
+        /// Only lines older than this, e.g. `5m`.
+        #[arg(long)]
+        until: Option<legion_api::quantity::Duration>,
+        /// At most this many lines, the newest.
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+    },
     /// Run a command in a task's container; exits with its exit code. A
     /// service name picks one of its running tasks.
     Exec {
