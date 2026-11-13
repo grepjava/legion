@@ -24,6 +24,7 @@ mod dispatcher;
 pub mod hooks;
 pub mod images;
 pub mod join;
+pub mod logsearch;
 mod managers;
 pub mod metrics;
 mod migrate;

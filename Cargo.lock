@@ -1749,6 +1749,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "futures",
  "http",
  "http-body",
  "http-body-util",
