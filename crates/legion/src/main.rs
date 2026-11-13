@@ -374,6 +374,17 @@ enum Command {
         #[arg(short, long, value_enum, default_value_t = cli::Format::Table)]
         output: cli::Format,
     },
+    /// What tasks used over the last hour, as the leader sampled it every
+    /// 15 s: now, on average and at most, per task; every sample with -o
+    /// json or yaml.
+    Usage {
+        /// Only this task (in --namespace).
+        task: Option<String>,
+        #[arg(short, long)]
+        namespace: Option<String>,
+        #[arg(short, long, value_enum, default_value_t = cli::Format::Table)]
+        output: cli::Format,
+    },
     /// The cluster live in the terminal: nodes, services and Jobs, tasks,
     /// what they use, and what changes.
     Top {

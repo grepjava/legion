@@ -773,6 +773,24 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 }
             }
         }
+        Command::Usage {
+            task,
+            namespace,
+            output,
+        } => {
+            let namespace = match (&task, namespace) {
+                (Some(_), None) => "default".to_owned(),
+                (_, ns) => ns.unwrap_or_default(),
+            };
+            let r = cluster
+                .usage_history(pb::UsageHistoryRequest {
+                    namespace,
+                    task: task.unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            print_usage_history(&r, output)?;
+        }
         Command::Top { namespace, once } if once => crate::top::once(channel, namespace).await?,
         Command::Top { namespace, .. } => crate::top::run(channel, namespace).await?,
         Command::Watch { kind, from } => {
@@ -1406,6 +1424,65 @@ fn print_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) {
 }
 
 /// Audit events as a table, YAML or JSON.
+fn print_usage_history(r: &pb::UsageHistoryResponse, format: Format) -> anyhow::Result<()> {
+    let json: Vec<serde_json::Value> = r
+        .tasks
+        .iter()
+        .map(|t| {
+            let samples: Vec<_> = t
+                .samples
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "atMs": s.at_ms, "cpuPercent": s.cpu_percent, "memoryBytes": s.memory_bytes,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "namespace": t.namespace, "task": t.task, "node": t.node,
+                "service": t.service, "samples": samples,
+            })
+        })
+        .collect();
+    match format {
+        Format::Json => println!("{}", serde_json::to_string_pretty(&json)?),
+        Format::Yaml => print!("{}", serde_yaml_ng::to_string(&json)?),
+        Format::Table if r.tasks.is_empty() => {
+            println!("no usage heard: no task ran, or the leader started since")
+        }
+        Format::Table => {
+            let mib = |b: f64| format!("{:.1}Mi", b / (1024.0 * 1024.0));
+            let rows: Vec<[String; 8]> = r
+                .tasks
+                .iter()
+                .filter(|t| !t.samples.is_empty())
+                .map(|t| {
+                    let n = t.samples.len() as f64;
+                    let cpu: Vec<f64> = t.samples.iter().map(|s| s.cpu_percent).collect();
+                    let mem: Vec<f64> = t.samples.iter().map(|s| s.memory_bytes as f64).collect();
+                    let max = |v: &[f64]| v.iter().copied().fold(0.0, f64::max);
+                    let last = |v: &[f64]| v.last().copied().unwrap_or(0.0);
+                    [
+                        format!("{}/{}", t.namespace, t.task),
+                        t.node.clone(),
+                        format!("{:.1}%", last(&cpu)),
+                        format!("{:.1}%", cpu.iter().sum::<f64>() / n),
+                        format!("{:.1}%", max(&cpu)),
+                        mib(last(&mem)),
+                        mib(max(&mem)),
+                        format!("{} min", (t.samples.len() as i64 * r.step_ms) / 60_000),
+                    ]
+                })
+                .collect();
+            print_table(
+                ["TASK", "NODE", "CPU", "AVG", "MAX", "MEMORY", "MAX", "OVER"],
+                &rows,
+            );
+        }
+    }
+    Ok(())
+}
+
 fn print_alerts(alerts: &[pb::Alert], format: Format) -> anyhow::Result<()> {
     let json: Vec<serde_json::Value> = alerts
         .iter()
