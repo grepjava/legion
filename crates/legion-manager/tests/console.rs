@@ -34,7 +34,7 @@ async fn https(
     origin: Option<&str>,
     body: Option<serde_json::Value>,
 ) -> Response {
-    request(ca, addr, false, method, path, cookie, origin, body).await
+    request(ca, addr, false, method, path, cookie, origin, body, &[]).await
 }
 
 /// One HTTPS request, over HTTP/2 when `h2` (as browsers speak to the
@@ -49,6 +49,7 @@ async fn request(
     cookie: Option<&str>,
     origin: Option<&str>,
     body: Option<serde_json::Value>,
+    headers: &[(&str, &str)],
 ) -> Response {
     let mut roots = tokio_rustls::rustls::RootCertStore::empty();
     roots
@@ -88,6 +89,9 @@ async fn request(
     }
     if let Some(o) = origin {
         req = req.header("origin", o);
+    }
+    for (k, v) in headers {
+        req = req.header(*k, *v);
     }
     let body = match body {
         Some(b) => {
@@ -160,8 +164,18 @@ fn object(kind: &str, namespace: &str, name: &str, spec: serde_json::Value) -> A
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_console_calls_the_api_as_its_user() {
+/// A manager with the console, initialised, and the admin's channel to it.
+struct Fixture {
+    ca: Ca,
+    addr: String,
+    console_addr: std::net::SocketAddr,
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+    admin: Channel,
+    _dir: tempfile::TempDir,
+}
+
+async fn start() -> Fixture {
     let ca = Ca::generate().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -204,6 +218,28 @@ async fn the_console_calls_the_api_as_its_user() {
         .init(InitRequest {})
         .await
         .unwrap();
+    Fixture {
+        ca,
+        addr,
+        console_addr,
+        stop,
+        task,
+        admin,
+        _dir: dir,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_console_calls_the_api_as_its_user() {
+    let Fixture {
+        ca,
+        addr,
+        console_addr,
+        stop,
+        task,
+        admin,
+        _dir,
+    } = start().await;
     let mut objects = ObjectsClient::new(admin);
     for (kind, ns, name, spec) in [
         ("Namespace", "", "shop", serde_json::json!({})),
@@ -271,6 +307,7 @@ async fn the_console_calls_the_api_as_its_user() {
                 None,
                 origin.as_deref(),
                 Some(body),
+                &[],
             )
             .await
         }
@@ -362,4 +399,423 @@ async fn the_console_calls_the_api_as_its_user() {
 
     let _ = stop.send(());
     task.await.unwrap();
+}
+
+/// Signs `user` in to the console as `legion console login` would: the
+/// session's cookie and its token for writes.
+async fn sign_in(f: &Fixture, user: &str) -> (String, String) {
+    sign_in_as(f, user, Role::User).await
+}
+
+async fn sign_in_as(f: &Fixture, user: &str, role: Role) -> (String, String) {
+    let console = f.console_addr.to_string();
+    let code = ClusterClient::new(channel(&f.addr, &creds(&f.ca, user, role)).await)
+        .console_code(ConsoleCodeRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .code;
+    let signed = https(
+        &f.ca,
+        &console,
+        "POST",
+        "/api/login",
+        None,
+        None,
+        Some(serde_json::json!({ "code": code })),
+    )
+    .await;
+    assert_eq!(signed.status, 200, "{}", signed.text);
+    let session = signed.cookie.unwrap().split(';').next().unwrap().to_owned();
+    let me = https(
+        &f.ca,
+        &console,
+        "GET",
+        "/api/me",
+        Some(&session),
+        None,
+        None,
+    )
+    .await;
+    let token = me.body["csrf"].as_str().expect("a token").to_owned();
+    (session, token)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_console_writes_as_its_user() {
+    let f = start().await;
+    let mut objects = ObjectsClient::new(f.admin.clone());
+    for (kind, ns, name, spec) in [
+        ("Namespace", "", "shop", serde_json::json!({})),
+        (
+            "RoleBinding",
+            "shop",
+            "alice",
+            serde_json::json!({ "user": "alice", "role": "edit" }),
+        ),
+        (
+            "RoleBinding",
+            "shop",
+            "bob",
+            serde_json::json!({ "user": "bob", "role": "view" }),
+        ),
+    ] {
+        objects.apply(object(kind, ns, name, spec)).await.unwrap();
+    }
+    let console = f.console_addr.to_string();
+    let origin = format!("https://{console}");
+    let (alice, token) = sign_in(&f, "alice").await;
+    let write = |method: &'static str, path: String, body: Option<serde_json::Value>| {
+        let (ca, console, origin, alice, token) = (&f.ca, &console, &origin, &alice, &token);
+        async move {
+            request(
+                ca,
+                console,
+                true,
+                method,
+                &path,
+                Some(alice),
+                Some(origin),
+                body,
+                &[("x-legion-csrf", token)],
+            )
+            .await
+        }
+    };
+    let menu = "apiVersion: legion/v1\nkind: Config\nmetadata:\n  name: menu\n  namespace: shop\nspec:\n  text: soup\n";
+
+    // Without the session's token, as another site's form would send it.
+    let forged = https(
+        &f.ca,
+        &console,
+        "POST",
+        "/api/apply",
+        Some(&alice),
+        None,
+        Some(serde_json::json!({ "yaml": menu })),
+    )
+    .await;
+    assert_eq!(forged.status, 403, "{}", forged.text);
+    assert!(forged.text.contains("console's page"), "{}", forged.text);
+
+    // A dry run shows what would be stored, and stores nothing.
+    let dry = write(
+        "POST",
+        "/api/apply".into(),
+        Some(serde_json::json!({ "yaml": menu, "dryRun": true })),
+    )
+    .await;
+    assert_eq!(dry.status, 200, "{}", dry.text);
+    assert_eq!(dry.body["results"][0]["result"], "created", "{}", dry.text);
+    let diff = dry.body["results"][0]["diff"].as_str().unwrap();
+    assert!(diff.contains("+kind: Config"), "{diff}");
+    let none = write("GET", "/api/objects/Config/shop/menu".into(), None).await;
+    assert_eq!(none.status, 404, "{}", none.text);
+
+    // Applied: as `legion apply` would, by alice.
+    let applied = write(
+        "POST",
+        "/api/apply".into(),
+        Some(serde_json::json!({ "yaml": menu })),
+    )
+    .await;
+    assert_eq!(applied.status, 200, "{}", applied.text);
+    assert_eq!(applied.body["results"][0]["result"], "created");
+    let stew = menu.replace("soup", "stew");
+    let changed = write(
+        "POST",
+        "/api/apply".into(),
+        Some(serde_json::json!({ "yaml": stew, "dryRun": true })),
+    )
+    .await;
+    assert_eq!(
+        changed.body["results"][0]["result"], "updated",
+        "{}",
+        changed.text
+    );
+    let diff = changed.body["results"][0]["diff"].as_str().unwrap();
+    assert!(diff.contains("\n-") && diff.contains("\n+"), "{diff}");
+
+    // Its manifest, to edit; an edit over a version that moved on is refused.
+    let manifest = write("GET", "/api/manifest/Config/shop/menu".into(), None).await;
+    assert_eq!(manifest.status, 200, "{}", manifest.text);
+    assert!(
+        manifest.body["yaml"]
+            .as_str()
+            .unwrap()
+            .contains("name: menu")
+    );
+    let version = manifest.body["version"].as_u64().unwrap();
+    let stale = write(
+        "POST",
+        "/api/apply".into(),
+        Some(serde_json::json!({ "yaml": stew, "expectedVersion": version - 1 })),
+    )
+    .await;
+    assert_eq!(stale.status, 409, "{}", stale.text);
+
+    // Labels, and a Service scaled as `legion top` scales it.
+    let labelled = write(
+        "POST",
+        "/api/labels".into(),
+        Some(serde_json::json!({
+            "kind": "Config", "namespace": "shop", "name": "menu", "changes": { "tier": "front" },
+        })),
+    )
+    .await;
+    assert_eq!(labelled.status, 200, "{}", labelled.text);
+    assert_eq!(labelled.body["changed"], true);
+    let got = write("GET", "/api/objects/Config/shop/menu".into(), None).await;
+    assert_eq!(
+        got.body["metadata"]["labels"]["tier"], "front",
+        "{}",
+        got.text
+    );
+    let web = serde_json::json!({
+        "apiVersion": "legion/v1", "kind": "Service",
+        "metadata": { "name": "web", "namespace": "shop" },
+        "spec": { "replicas": 1, "pod": { "containers": [{ "name": "web", "image": "web:1" }] } },
+    });
+    let created = write(
+        "POST",
+        "/api/apply".into(),
+        Some(serde_json::json!({ "object": web })),
+    )
+    .await;
+    assert_eq!(created.status, 200, "{}", created.text);
+    let scale = serde_json::json!({
+        "kind": "Service", "namespace": "shop", "name": "web", "field": "replicas", "value": 3,
+    });
+    let scaled = write("POST", "/api/set".into(), Some(scale.clone())).await;
+    assert_eq!(scaled.status, 200, "{}", scaled.text);
+    assert_eq!(scaled.body["changed"], true);
+    let got = write("GET", "/api/objects/Service/shop/web".into(), None).await;
+    assert_eq!(got.body["spec"]["replicas"], 3, "{}", got.text);
+    let back = write(
+        "POST",
+        "/api/rollback".into(),
+        Some(serde_json::json!({ "namespace": "shop", "service": "web" })),
+    )
+    .await;
+    assert_eq!(back.status, 409, "{}", back.text);
+    assert!(
+        back.text.contains("no update to roll back"),
+        "{}",
+        back.text
+    );
+
+    // Bob may only look; and alice's token is not his. (A change, since
+    // asking for what is already there writes nothing.)
+    let (bob, bob_token) = sign_in(&f, "bob").await;
+    let mut scale_down = scale.clone();
+    scale_down["value"] = 0.into();
+    for (sent, why) in [
+        (&bob_token, "a view user"),
+        (&token, "another session's token"),
+    ] {
+        let refused = request(
+            &f.ca,
+            &console,
+            true,
+            "POST",
+            "/api/set",
+            Some(&bob),
+            Some(&origin),
+            Some(scale_down.clone()),
+            &[("x-legion-csrf", sent)],
+        )
+        .await;
+        assert_eq!(refused.status, 403, "{why}: {}", refused.text);
+    }
+    let got = write("GET", "/api/objects/Service/shop/web".into(), None).await;
+    assert_eq!(got.body["spec"]["replicas"], 3, "unchanged: {}", got.text);
+
+    // Deleted; and every write is in the audit log as alice's.
+    let deleted = write("DELETE", "/api/objects/Config/shop/menu".into(), None).await;
+    assert_eq!(deleted.status, 200, "{}", deleted.text);
+    let gone = write("GET", "/api/objects/Config/shop/menu".into(), None).await;
+    assert_eq!(gone.status, 404, "{}", gone.text);
+    let filter = serde_json::json!({ "actor": "alice" }).to_string();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let events = ClusterClient::new(f.admin.clone())
+            .audit(legion_proto::v1::AuditRequest {
+                filter_json: filter.clone().into_bytes(),
+                limit: 100,
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .events_json;
+        let actions: Vec<String> = events
+            .iter()
+            .map(|e| serde_json::from_slice::<serde_json::Value>(e).unwrap())
+            .map(|e| format!("{} {}", e["action"].as_str().unwrap(), e["result"]))
+            .collect();
+        if actions.iter().filter(|a| a.starts_with("apply")).count() >= 4
+            && actions.iter().any(|a| a.starts_with("delete"))
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "alice's writes in the audit log: {actions:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let _ = f.stop.send(());
+    f.task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_console_runs_the_cluster_for_an_admin() {
+    let f = start().await;
+    let mut objects = ObjectsClient::new(f.admin.clone());
+    for (kind, ns, name, spec) in [
+        ("Namespace", "", "shop", serde_json::json!({})),
+        (
+            "RoleBinding",
+            "shop",
+            "alice",
+            serde_json::json!({ "user": "alice", "role": "admin" }),
+        ),
+    ] {
+        objects.apply(object(kind, ns, name, spec)).await.unwrap();
+    }
+    let console = f.console_addr.to_string();
+    let origin = format!("https://{console}");
+    let (root, root_token) = sign_in_as(&f, "root", Role::Admin).await;
+    let (alice, alice_token) = sign_in(&f, "alice").await;
+    let as_user = |who: &str, token: &str, method: &'static str, path: &str, body| {
+        let (ca, console, origin) = (&f.ca, &console, &origin);
+        let (who, token, path) = (who.to_owned(), token.to_owned(), path.to_owned());
+        async move {
+            request(
+                ca,
+                console,
+                true,
+                method,
+                &path,
+                Some(&who),
+                Some(origin),
+                body,
+                &[("x-legion-csrf", &token)],
+            )
+            .await
+        }
+    };
+    let admin = |method, path: &str, body| as_user(&root, &root_token, method, path, body);
+
+    // The CA, and who holds a certificate of it.
+    let ca = admin("GET", "/api/ca", None).await;
+    assert_eq!(ca.status, 200, "{}", ca.text);
+    assert!(
+        !ca.body["digest"].as_str().unwrap().is_empty(),
+        "{}",
+        ca.text
+    );
+    assert!(
+        ca.body["holders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["name"] == "m1"),
+        "{}",
+        ca.text
+    );
+    let token = admin(
+        "POST",
+        "/api/join-token",
+        Some(serde_json::json!({ "role": "worker" })),
+    )
+    .await;
+    assert_eq!(token.status, 200, "{}", token.text);
+    assert!(!token.body["token"].as_str().unwrap().is_empty());
+    let lock = admin(
+        "POST",
+        "/api/autolock",
+        Some(serde_json::json!({ "action": "show" })),
+    )
+    .await;
+    assert_eq!(
+        (lock.status, &lock.body["key"]),
+        (200, &serde_json::json!("")),
+        "{}",
+        lock.text
+    );
+
+    // A user, with their binding: credentials shown once.
+    let carol = admin(
+        "POST",
+        "/api/users",
+        Some(serde_json::json!({ "name": "carol", "role": "view", "namespace": "shop" })),
+    )
+    .await;
+    assert_eq!(carol.status, 200, "{}", carol.text);
+    let pem = carol.body["pem"].as_str().unwrap();
+    assert!(pem.contains("BEGIN CERTIFICATE") && pem.contains("PRIVATE KEY"));
+    assert_eq!(carol.body["binding"], "created");
+    let bound = admin("GET", "/api/objects/RoleBinding/shop/carol", None).await;
+    assert_eq!(bound.body["spec"]["role"], "view", "{}", bound.text);
+    let half = admin(
+        "POST",
+        "/api/users",
+        Some(serde_json::json!({ "name": "dave", "role": "view" })),
+    )
+    .await;
+    assert_eq!(half.status, 400, "{}", half.text);
+
+    // The control state, as `legion restore` takes it.
+    let backup = admin("GET", "/api/backup", None).await;
+    assert_eq!(backup.status, 200, "{}", backup.text);
+    assert!(
+        backup.body["objects"].is_array(),
+        "a backup: {}",
+        &backup.text[..backup.text.len().min(200)]
+    );
+
+    // The audit log, filtered as `legion audit` filters it.
+    // Events are recorded a moment after what they record.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let log = loop {
+        let log = admin("GET", "/api/audit?action=issue-user&limit=10", None).await;
+        assert_eq!(log.status, 200, "{}", log.text);
+        if !log.body["events"].as_array().unwrap().is_empty()
+            || tokio::time::Instant::now() > deadline
+        {
+            break log;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let events = log.body["events"].as_array().unwrap();
+    assert!(
+        !events.is_empty() && events.iter().all(|e| e["action"] == "issue-user"),
+        "{}",
+        log.text
+    );
+    let wrong = admin("GET", "/api/audit?result=maybe", None).await;
+    assert_eq!(wrong.status, 400, "{}", wrong.text);
+
+    // An admin of one namespace runs none of the cluster.
+    for (method, path, body) in [
+        (
+            "POST",
+            "/api/join-token",
+            Some(serde_json::json!({ "role": "worker" })),
+        ),
+        ("POST", "/api/ca", None),
+        ("GET", "/api/backup", None),
+        (
+            "POST",
+            "/api/users",
+            Some(serde_json::json!({ "name": "eve" })),
+        ),
+    ] {
+        let refused = as_user(&alice, &alice_token, method, path, body).await;
+        assert_eq!(refused.status, 403, "{method} {path}: {}", refused.text);
+    }
+
+    let _ = f.stop.send(());
+    f.task.await.unwrap();
 }
