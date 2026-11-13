@@ -29,3 +29,14 @@ export function cannotWrite(namespace: string): string | null {
   if (role === 'edit' || role === 'admin') return null;
   return role ? `your role in ${namespace} is ${role}` : `you have no role in ${namespace}`;
 }
+
+/** Why the user may write in no namespace at all, as for a page whose
+ * namespace is in what it sends (Apply YAML); null if they may somewhere. */
+export function cannotWriteAnywhere(): string | null {
+  const me = session.me;
+  if (!me) return 'not signed in';
+  if (me.all) return null;
+  const roles = Object.values(me.namespaces);
+  if (roles.some((r) => r === 'edit' || r === 'admin')) return null;
+  return roles.length ? 'your roles let you look, not change' : 'you have no role in any namespace';
+}

@@ -5,6 +5,7 @@
   import { page } from '$app/state';
   import { api, ApiError, type ApplyResult } from '#lib/api.ts';
   import Diff from '#lib/Diff.svelte';
+  import { cannotWriteAnywhere } from '#lib/session.svelte.ts';
 
   const kind = $derived(page.url.searchParams.get('kind') ?? '');
   const namespace = $derived(page.url.searchParams.get('namespace') ?? '');
@@ -16,6 +17,7 @@
   let dry = $state(false);
   let error = $state('');
   let busy = $state(false);
+  const why = $derived(cannotWriteAnywhere());
 
   $effect(() => {
     results = [];
@@ -76,10 +78,13 @@
 <textarea class="editor" bind:value={yaml} spellcheck="false" rows="26" aria-label="YAML"></textarea>
 <div class="controls">
   <button onclick={() => run(true)} disabled={busy || !yaml.trim()}>Show changes</button>
-  <button class="primary" onclick={() => run(false)} disabled={busy || !yaml.trim()}>Apply</button>
+  <button class="primary" onclick={() => run(false)} disabled={!!why || busy || !yaml.trim()} title={why ?? ''}
+    >Apply</button
+  >
   {#if busy}<span class="muted">…</span>{/if}
 </div>
 
+{#if why}<p class="muted">Read only: {why}.</p>{/if}
 {#if error}<p class="error">{error}</p>{/if}
 
 {#each results as r (r.key)}
