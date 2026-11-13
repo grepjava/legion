@@ -9,6 +9,7 @@
 
 pub mod acme;
 pub mod actions;
+mod alerts;
 mod api;
 mod audit;
 mod authz;
@@ -393,8 +394,14 @@ impl Manager {
             protocol: self.protocol,
             speaking: self.speaking.clone(),
             ca_seen: Default::default(),
+            alerts: Default::default(),
         };
         let names = tokio::spawn(managers::run(api.clone(), api.closing.clone()));
+        let alerting = tokio::spawn(alerts::track(
+            api.store.clone(),
+            api.alerts.clone(),
+            api.closing.clone(),
+        ));
         let console = console
             .map(|(listener, config)| tokio::spawn(gateway::run(listener, config, api.clone())));
         let rotation = tokio::spawn(ca::run(api.clone(), api.closing.clone()));
@@ -508,6 +515,7 @@ impl Manager {
         let _ = promote.await;
         let _ = floor.await;
         let _ = names.await;
+        let _ = alerting.await;
         if let Some(console) = console {
             let _ = console.await;
         }

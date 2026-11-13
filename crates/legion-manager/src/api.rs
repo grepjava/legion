@@ -63,6 +63,8 @@ pub struct ApiService {
     pub(crate) speaking: crate::upgrade::Speaking,
     /// The CA each node's certificate was of at its last heartbeat here.
     pub(crate) ca_seen: crate::ca::Seen,
+    /// The restarts this manager has seen, for its alerts.
+    pub(crate) alerts: std::sync::Arc<crate::alerts::State>,
 }
 
 pub(crate) enum Route {
@@ -1361,6 +1363,78 @@ impl Cluster for ApiService {
         Ok(Response::new(usage))
     }
 
+    type WatchAlertsStream = ReceiverStream<Result<pb::AlertsResponse, Status>>;
+
+    async fn watch_alerts(
+        &self,
+        req: Request<pb::AlertsRequest>,
+    ) -> Result<Response<Self::WatchAlertsStream>, Status> {
+        let caller = self.caller(&req)?;
+        let namespace = req.into_inner().namespace;
+        check_namespace(&namespace)?;
+        if !namespace.is_empty() {
+            caller.check(&self.store, Verb::Read, Kind::Task, &namespace)?;
+        }
+        // From this replica as it is: no wait for the leader, as an alert
+        // matters most when there is none.
+        let api = self.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            let mut closing = api.closing.clone();
+            let mut raft = api.store.raft.metrics();
+            let mut sent: Option<Vec<pb::Alert>> = None;
+            let mut watcher = None;
+            loop {
+                let visible: Vec<pb::Alert> = crate::alerts::current(&api)
+                    .into_iter()
+                    .filter(|(a, _)| alert_visible(&caller, &api.store, &namespace, a))
+                    .map(|(a, since_ms)| pb::Alert {
+                        kind: a.kind.as_str().into(),
+                        severity: a.severity.as_str().into(),
+                        namespace: a.namespace,
+                        object: a.object,
+                        message: a.message,
+                        since_ms,
+                    })
+                    .collect();
+                if sent.as_ref() != Some(&visible) {
+                    let msg = pb::AlertsResponse {
+                        alerts: visible.clone(),
+                    };
+                    if tx.send(Ok(msg)).await.is_err() {
+                        return;
+                    }
+                    sent = Some(visible);
+                }
+                if watcher.is_none() {
+                    watcher = api
+                        .store
+                        .applied_version()
+                        .ok()
+                        .and_then(|v| api.store.watch(v, None).ok());
+                }
+                // Whatever may change the list: a change to the store,
+                // Raft's view, the restarts' window moving on.
+                let changed = async {
+                    match watcher.as_mut() {
+                        Some(w) => w.next().await.is_ok(),
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    ok = changed => if !ok { watcher = None },
+                    _ = raft.changed() => {}
+                    () = tokio::time::sleep(crate::alerts::RECHECK) => {}
+                    () = tx.closed() => return,
+                    _ = closing.wait_for(|c| *c) => return,
+                }
+                // Changes come in bursts: one look after them.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
     async fn audit(
         &self,
         req: Request<pb::AuditRequest>,
@@ -1651,4 +1725,25 @@ impl ApiService {
             ca_issuer: crate::ca::own_issuer(self),
         })
     }
+}
+
+/// Whether `caller` may see `a`: a namespace's alerts by its tasks' rights,
+/// a node's by the rights to read nodes, the cluster's own by an admin.
+/// With `namespace` set, only that namespace's.
+fn alert_visible(
+    caller: &Caller,
+    store: &Store,
+    namespace: &str,
+    a: &legion_api::alert::Alert,
+) -> bool {
+    if !namespace.is_empty() && a.namespace != namespace {
+        return false;
+    }
+    if !a.namespace.is_empty() {
+        return caller.may(store, Verb::Read, Kind::Task, &a.namespace);
+    }
+    if a.object.starts_with("Node/") {
+        return caller.may(store, Verb::Read, Kind::Node, "");
+    }
+    *caller == Caller::All
 }

@@ -5422,3 +5422,139 @@ async fn a_console_code_is_good_for_one_session() {
     follower.stop().await;
     first.stop().await;
 }
+
+/// Alerts (`legion_api::alert`): a task whose restarts rise, a node down
+/// and a Volume lost each raise theirs on `WatchAlerts` as they happen; a
+/// user sees only what is in the namespaces they may read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn alerts_follow_what_goes_wrong() {
+    let ca = Ca::generate().unwrap();
+    let m = Running::start_with(Some(&ca)).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let admin = m.objects().await;
+    eventually(|| {
+        let mut admin = admin.clone();
+        async move { admin.apply(binding("a", "alice", "view")).await }
+    })
+    .await;
+    let put = |o: legion_api::Object| {
+        let raft = m.store.raft.clone();
+        async move {
+            raft.client_write(legion_store::Command::Put {
+                object: o,
+                precondition: legion_store::Precondition::None,
+            })
+            .await
+            .unwrap();
+        }
+    };
+    let task = |restarts: u32| {
+        let mut t = legion_api::Object::new(
+            legion_api::Kind::Task,
+            "a",
+            "web-1-1",
+            serde_json::json!({ "service": "web", "node": "w9", "desiredState": "running" }),
+        );
+        t.status = serde_json::json!({
+            "state": "running",
+            "restarts": restarts,
+            "message": "container app exited with 1; restarting in 1s",
+        });
+        t
+    };
+    // Seen first with no restarts: those before don't count.
+    put(task(0)).await;
+
+    let alerts = |c: Channel| async move {
+        ClusterClient::new(c)
+            .watch_alerts(legion_proto::v1::AlertsRequest {
+                namespace: String::new(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+    };
+    let mut all = alerts(m.channel(m.tls.as_ref()).await.unwrap()).await;
+    let mut alice = alerts(
+        m.channel(Some(&creds(&ca, "alice", Role::User)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let first = all.message().await.unwrap().unwrap();
+    assert!(
+        first.alerts.iter().all(|a| a.kind != "crash-loop"),
+        "{first:?}"
+    );
+
+    for restarts in 1..=3 {
+        put(task(restarts)).await;
+    }
+    let mut node = legion_api::Object::new(legion_api::Kind::Node, "", "w9", serde_json::json!({}));
+    node.status = serde_json::json!({ "state": "down" });
+    put(node).await;
+    let mut volume = legion_api::Object::new(
+        legion_api::Kind::Volume,
+        "a",
+        "data",
+        serde_json::json!({ "size": "1Gi" }),
+    );
+    volume.status = serde_json::json!({ "node": "w9", "lost": "w9" });
+    put(volume).await;
+
+    let kinds = |r: &legion_proto::v1::AlertsResponse| -> Vec<(String, String, String)> {
+        let mut v: Vec<_> = r
+            .alerts
+            .iter()
+            .map(|a| (a.kind.clone(), a.namespace.clone(), a.object.clone()))
+            .collect();
+        v.sort();
+        v
+    };
+    let want = |k: &str, ns: &str, o: &str| (k.to_owned(), ns.to_owned(), o.to_owned());
+    // The list comes again as each change lands; the last has them all.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let last = loop {
+        let r = tokio::time::timeout_at(deadline, all.message())
+            .await
+            .expect("every alert within 20 s")
+            .unwrap()
+            .unwrap();
+        if kinds(&r).len() == 3 {
+            break r;
+        }
+    };
+    assert_eq!(
+        kinds(&last),
+        [
+            want("crash-loop", "a", "Task/web-1-1"),
+            want("node-down", "", "Node/w9"),
+            want("volume-lost", "a", "Volume/data"),
+        ]
+    );
+    let crash = last.alerts.iter().find(|a| a.kind == "crash-loop").unwrap();
+    assert_eq!(crash.severity, "critical");
+    assert!(crash.message.contains("restarted 3 times"), "{crash:?}");
+    assert!(crash.since_ms > 0);
+
+    // Alice may read namespace a, not nodes.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let theirs = loop {
+        let r = tokio::time::timeout_at(deadline, alice.message())
+            .await
+            .expect("alice's alerts within 20 s")
+            .unwrap()
+            .unwrap();
+        if kinds(&r).len() == 2 {
+            break r;
+        }
+    };
+    assert_eq!(
+        kinds(&theirs),
+        [
+            want("crash-loop", "a", "Task/web-1-1"),
+            want("volume-lost", "a", "Volume/data"),
+        ]
+    );
+    m.stop().await;
+}

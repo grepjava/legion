@@ -135,6 +135,15 @@ service Cluster {
   // node: the tasks of `namespace`, or of every namespace when empty, that
   // the caller may read.
   rpc Usage(UsageRequest) returns (UsageResponse);
+  // What an operator acts on now (legion_api::alert): crash-looping
+  // tasks, nodes down or suspect, lost Volumes, the CA near expiry, Raft
+  // without a leader or quorum, as this manager works them out from its
+  // replica, so any manager answers, one cut off from the leader too. The
+  // whole list at once, then again each time it changes. A user gets the
+  // alerts of `namespace` (every namespace when empty) whose tasks they
+  // may read, of nodes if they may read nodes; the cluster's own go to
+  // admins.
+  rpc WatchAlerts(AlertsRequest) returns (stream AlertsResponse);
   // What may reach what among a namespace's services, as the nodes'
   // guards decide it (DESIGN.md §5.6): for each service, and for the
   // tasks of every other namespace, the ports of each service it may
@@ -220,6 +229,27 @@ message RecordAuditRequest {
 }
 
 message RecordAuditResponse {}
+
+message AlertsRequest {
+  string namespace = 1;
+}
+
+message AlertsResponse {
+  repeated Alert alerts = 1;
+}
+
+message Alert {
+  // legion_api::alert::AlertKind, e.g. `crash-loop`.
+  string kind = 1;
+  // `critical` or `warning`.
+  string severity = 2;
+  string namespace = 3;
+  // What it is about, as `Kind/name`; empty for the cluster itself.
+  string object = 4;
+  string message = 5;
+  // When this manager first saw it, in milliseconds since the epoch.
+  int64 since_ms = 6;
+}
 
 message UsageRequest {
   string namespace = 1;
