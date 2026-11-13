@@ -14,7 +14,7 @@
 //!   onto another, and rotates the CA, watching every node move to it.
 //! - Phase 4: a crash-looping task and a node going down each raise an
 //!   alert in the open console within 30 s, leading to the cause; a lost
-//!   Volume raises its own.
+//!   Volume raises its own; a service's logs are searched across its tasks.
 //!
 //! It drives real daemons, so it is ignored by default and run on the lab
 //! of `tests/common` (see there), as root, with `LEGION_BROWSER` naming
@@ -454,6 +454,21 @@ spec:
     a.until("the crash loop gone with its task", 120, |b| {
         !b.text().contains("crash-loop")
     });
+
+    step("phase 4: hello's logs searched across its tasks over the last hour");
+    c.page(&mut a, "/k/Service/team-a/hello");
+    a.click("Logs");
+    a.fill("Search text", "TICK");
+    a.click("Search");
+    a.until("lines from more than one task", 120, |b| {
+        b.eval(
+            "new Set([...document.querySelectorAll('table.found tbody tr td:nth-child(2)')]
+               .map((td) => td.innerText)).size",
+        )
+        .as_u64()
+            >= Some(2)
+    });
+    assert!(!a.text().contains("Not searched"), "{}", a.text());
 
     step("phases 3 and 4: n2 lost, alerted within 30 s, removed from the console; its Volume lost");
     let out = c.lab.ssh(&c.lab.vms[0], &format!("{STOP}\ntrue\n"));

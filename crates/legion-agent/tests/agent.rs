@@ -2906,7 +2906,11 @@ fn exec(command: &[&str], stdin: bool, tty: bool) -> Action {
 }
 
 fn logs(follow: bool, tail: Option<u32>) -> Action {
-    Action::Logs(pb::LogsOptions { follow, tail })
+    Action::Logs(pb::LogsOptions {
+        follow,
+        tail,
+        ..Default::default()
+    })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3074,6 +3078,59 @@ async fn sessions_reach_the_pod() {
     }
     h.rt.exit(APP, 0);
     assert_eq!(s.rest().await, (vec![], None));
+    // Within a time range, each line as a `line` frame with when it was
+    // written: from a moment on, and before it; from a stopped container too.
+    let ms = |t: std::time::SystemTime| {
+        t.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let split = ms(std::time::SystemTime::now());
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    h.rt.log(APP, Output::Stdout, "four\n");
+    let ranged = |since_ms, until_ms| {
+        Action::Logs(pb::LogsOptions {
+            since_ms,
+            until_ms,
+            times: true,
+            ..Default::default()
+        })
+    };
+    let lines = |frames: Vec<Frame>| -> Vec<(bool, String, i64)> {
+        frames
+            .into_iter()
+            .map(|f| match f {
+                Frame::Line(l) => (l.stderr, String::from_utf8(l.data).unwrap(), l.at_ms),
+                other => panic!("a line frame, not {other:?}"),
+            })
+            .collect()
+    };
+    let mut s = Session::open(&h, open("web-1", ranged(Some(split), None)))
+        .await
+        .unwrap();
+    let (after, end) = s.rest().await;
+    assert_eq!(end, None);
+    let after = lines(after);
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert_eq!((after[0].0, after[0].1.as_str()), (false, "four\n"));
+    assert!(after[0].2 >= split, "{after:?}");
+    let mut s = Session::open(&h, open("web-1", ranged(None, Some(split))))
+        .await
+        .unwrap();
+    let before: Vec<_> = lines(s.rest().await.0)
+        .into_iter()
+        .map(|(e, t, at)| {
+            assert!(at > 0 && at < split, "{at}");
+            (e, t)
+        })
+        .collect();
+    assert_eq!(
+        before,
+        [
+            (false, "one\n".to_owned()),
+            (true, "two\n".to_owned()),
+            (false, "three\n".to_owned()),
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

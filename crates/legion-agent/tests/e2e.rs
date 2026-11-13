@@ -20,6 +20,7 @@ const INFRA: &str = "docker.io/freebsd/freebsd-runtime:15.1";
 
 struct Cluster {
     api: ObjectsClient<Channel>,
+    channel: Channel,
     rt: Arc<FakeRuntime>,
     sys: Arc<FakeSys>,
     /// What the node resolver and load balancing see.
@@ -90,7 +91,8 @@ impl Cluster {
             .await
             .unwrap();
         Cluster {
-            api: ObjectsClient::new(channel),
+            api: ObjectsClient::new(channel.clone()),
+            channel,
             rt,
             sys,
             endpoints,
@@ -421,5 +423,96 @@ async fn a_job_runs_to_completion() {
         .unwrap();
     eventually("tasks gone", async || c.tasks().await.is_empty()).await;
 
+    c.stop().await;
+}
+
+/// `legion logs-search`: a service's tasks' lines holding the text, from
+/// every task, in time order, and only those in the range asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_services_logs_are_searched_across_its_tasks() {
+    use legion_manager::logsearch::{Search, search};
+    use legion_runtime::Output;
+    let c = Cluster::start().await;
+    c.rt.add_image("web:1");
+    c.apply(&service(2, "web:1")).await;
+    eventually("two tasks", async || {
+        c.tasks().await == ["web-1-1 running", "web-2-1 running"]
+    })
+    .await;
+    let ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    };
+    let start = ms() - 1000;
+    c.rt.log("shop_web-1-1_web", Output::Stdout, "GET /a 200\n");
+    c.rt.log("shop_web-1-1_web", Output::Stderr, "Error: disk full\n");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let split = ms();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    c.rt.log(
+        "shop_web-2-1_web",
+        Output::Stderr,
+        "error: connection reset\n",
+    );
+    c.rt.log("shop_web-2-1_web", Output::Stdout, "GET /b 200\n");
+
+    let find = |since_ms, until_ms, text: &str| Search {
+        namespace: "shop".into(),
+        service: "web".into(),
+        since_ms: Some(since_ms),
+        until_ms,
+        text: text.into(),
+        limit: 0,
+    };
+    let lines = |r: &legion_manager::logsearch::Results| -> Vec<(String, bool, String)> {
+        assert!(r.unread.is_empty(), "{:?}", r.unread);
+        r.lines
+            .iter()
+            .map(|l| (l.task.clone(), l.stderr, l.text.clone()))
+            .collect()
+    };
+    let r = search(c.channel.clone(), &find(start, None, "ERROR"))
+        .await
+        .unwrap();
+    assert_eq!(
+        lines(&r),
+        [
+            ("web-1-1".to_owned(), true, "Error: disk full".to_owned()),
+            (
+                "web-2-1".to_owned(),
+                true,
+                "error: connection reset".to_owned()
+            ),
+        ]
+    );
+    assert!(r.lines[0].at_ms <= r.lines[1].at_ms);
+    // Before the split, only the first task had written.
+    let r = search(c.channel.clone(), &find(start, Some(split), ""))
+        .await
+        .unwrap();
+    assert_eq!(
+        lines(&r),
+        [
+            ("web-1-1".to_owned(), false, "GET /a 200".to_owned()),
+            ("web-1-1".to_owned(), true, "Error: disk full".to_owned()),
+        ]
+    );
+    // The newest when more match than the limit.
+    let r = search(
+        c.channel.clone(),
+        &Search {
+            limit: 1,
+            ..find(start, None, "")
+        },
+    )
+    .await
+    .unwrap();
+    assert!(r.truncated);
+    assert_eq!(
+        lines(&r),
+        [("web-2-1".to_owned(), false, "GET /b 200".to_owned())]
+    );
     c.stop().await;
 }
