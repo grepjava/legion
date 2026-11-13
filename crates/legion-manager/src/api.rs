@@ -1390,7 +1390,10 @@ impl Cluster for ApiService {
         // Each stored task's service, requests and limits.
         let specs: std::collections::HashMap<String, legion_api::task::TaskSpec> = self
             .store
-            .list(Kind::Task, (!namespace.is_empty()).then_some(namespace.as_str()))
+            .list(
+                Kind::Task,
+                (!namespace.is_empty()).then_some(namespace.as_str()),
+            )
             .map(|l| l.objects)
             .unwrap_or_default()
             .into_iter()

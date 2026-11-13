@@ -256,7 +256,11 @@ pub(crate) fn in_use(tasks: &[Object], volumes: &[Object]) -> BTreeMap<String, U
 /// in cores, memory and storage in bytes.
 pub(crate) fn values(q: &Quota, u: &Usage) -> Vec<(&'static str, f64, f64)> {
     [
-        ("cpu", q.cpu.map(|c| c.0 as f64 / 1000.0), u.cpu.0 as f64 / 1000.0),
+        (
+            "cpu",
+            q.cpu.map(|c| c.0 as f64 / 1000.0),
+            u.cpu.0 as f64 / 1000.0,
+        ),
         ("memory", q.memory.map(|b| b.0 as f64), u.memory.0 as f64),
         ("tasks", q.tasks.map(f64::from), f64::from(u.tasks)),
         ("volumes", q.volumes.map(f64::from), f64::from(u.volumes)),

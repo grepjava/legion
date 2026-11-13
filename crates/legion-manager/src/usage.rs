@@ -198,7 +198,13 @@ mod tests {
         let mut now = start;
         // Heartbeats every 2 s: one sample each step.
         for i in 0..(STEP.as_secs() as u32 * 3 / 2) {
-            u.record_at("w1", [("a/web-1".to_owned(), used(f64::from(i)))], any, now, 0);
+            u.record_at(
+                "w1",
+                [("a/web-1".to_owned(), used(f64::from(i)))],
+                any,
+                now,
+                0,
+            );
             now += Duration::from_secs(2);
         }
         let h = u.history_at(now);
