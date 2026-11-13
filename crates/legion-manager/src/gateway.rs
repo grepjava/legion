@@ -170,6 +170,7 @@ fn router(gateway: Gateway) -> axum::Router {
         )
         .route("/api/watch/{kind}", get(watch))
         .route("/api/usage", get(usage))
+        .route("/api/alerts", get(alerts))
         .route("/api/reach", get(reach))
         .route("/api/logs/{namespace}/{task}", get(logs))
         // Writes (CONSOLE.md phases 2 and 3): each from the console's own
@@ -546,6 +547,66 @@ async fn object(
         .await?
         .into_inner();
     Ok(Json(object_json(o)?).into_response())
+}
+
+#[derive(Deserialize)]
+struct AlertsQuery {
+    namespace: Option<String>,
+}
+
+/// `Cluster.WatchAlerts` as the user: JSON text messages `{alerts: [...]}`,
+/// the whole list each time it changes, or `{error}` as the last.
+async fn alerts(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(q): Query<AlertsQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, Refused> {
+    same_origin(&headers, &uri)?;
+    let (_, channel) = g.user(&headers).await?;
+    let stream = ClusterClient::new(channel)
+        .watch_alerts(pb::AlertsRequest {
+            namespace: q.namespace.unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+    Ok(ws.on_upgrade(move |socket| relay_alerts(socket, stream)))
+}
+
+async fn relay_alerts(mut socket: WebSocket, mut stream: tonic::Streaming<pb::AlertsResponse>) {
+    loop {
+        let next = tokio::select! {
+            r = stream.message() => r,
+            m = socket.recv() => match m {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                _ => continue,
+            },
+        };
+        let text = match next {
+            Ok(Some(r)) => serde_json::json!({
+                "alerts": r.alerts.iter().map(|a| serde_json::json!({
+                    "kind": a.kind,
+                    "severity": a.severity,
+                    "namespace": a.namespace,
+                    "object": a.object,
+                    "message": a.message,
+                    "since_ms": a.since_ms,
+                })).collect::<Vec<_>>()
+            }),
+            Ok(None) => serde_json::json!({ "error": "the alerts ended" }),
+            Err(s) => serde_json::json!({ "error": s.message() }),
+        };
+        let end = text.get("error").is_some();
+        if socket
+            .send(Message::Text(text.to_string().into()))
+            .await
+            .is_err()
+            || end
+        {
+            return;
+        }
+    }
 }
 
 #[derive(Deserialize)]
