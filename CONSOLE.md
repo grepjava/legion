@@ -215,6 +215,29 @@ holder is on it. First passed on 14133c5.
 alert in an open console within 30 s, with the way to the cause, on the
 lab.
 
+**Built so far:** alerts (`legion_api::alert`, `Cluster.WatchAlerts`,
+`legion alerts -w`): a task restarted 3 times in 5 minutes, a node suspect
+or down, a Volume lost with its node, the CA within 30 days of expiry, no
+leader or a leader cut off from a majority. Any manager works them out from
+its own replica and the restarts it has seen, so a manager cut off from the
+leader still answers; a user gets the alerts of the namespaces they may
+read. The console follows them while signed in, counts them in the side
+bar, lists them with a link to each cause and shows the first on the
+overview. What tasks used over the last hour (`Cluster.UsageHistory`,
+`legion usage`), a sample every 15 s kept by the leader, charted per task,
+service and node with what the tasks request and their limits; the charts
+fetch the history again as each sample is due, the console's one poll, as
+the history is no store object to watch. Namespaces' quotas and what each
+uses now (`Cluster.Quotas`, `legion quota`), worked out by the same code as
+the metrics, as bars with their numbers on the overview and a Namespace's
+page. The lab test (`the_console_runs_the_cluster`) checks the phase's
+"done when": on f7efd71 a crash loop was shown as its third restart was seen
+and a node's alert 4.2 s after its daemon stopped, each leading to the
+cause. Not yet: log search across a service's tasks for a time range; CPU,
+restarts and network charts beyond what heartbeats carry (agents report
+CPU and memory only); alerts for nearly full Volumes, which need agents to
+report Volume use.
+
 ## Phase 5: developer experience
 
 What makes OpenShift's console a place to deploy from.
