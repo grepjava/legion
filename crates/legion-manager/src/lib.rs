@@ -8,6 +8,7 @@
 //! managers, the Raft transport only managers. Without it (tests only) everything is plaintext.
 
 pub mod acme;
+pub mod actions;
 mod api;
 mod audit;
 mod authz;

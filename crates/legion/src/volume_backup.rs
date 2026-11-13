@@ -23,11 +23,8 @@ fn client(channel: Channel) -> VolumesClient<Channel> {
 
 /// Writes the header line a backup file starts with.
 fn write_header(out: &mut dyn Write, header: &[u8]) -> anyhow::Result<VolumeBackupHeader> {
-    let parsed: VolumeBackupHeader =
-        serde_json::from_slice(header).context("the backup's header")?;
-    // Its own line: written compact, the JSON has no line break.
-    out.write_all(&serde_json::to_vec(&parsed)?)?;
-    out.write_all(b"\n")?;
+    let (parsed, line) = VolumeBackupHeader::line(header).map_err(anyhow::Error::msg)?;
+    out.write_all(&line)?;
     Ok(parsed)
 }
 
@@ -36,8 +33,7 @@ fn read_header(input: &mut dyn BufRead) -> anyhow::Result<(String, VolumeBackupH
     let mut line = String::new();
     input.read_line(&mut line).context("reading the backup")?;
     let line = line.trim_end().to_owned();
-    let header: VolumeBackupHeader = serde_json::from_str(&line)
-        .context("not a volume backup: it does not start with a backup's header")?;
+    let header = VolumeBackupHeader::from_line(&line).map_err(anyhow::Error::msg)?;
     Ok((line, header))
 }
 

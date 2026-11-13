@@ -6,8 +6,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use legion_api::service::ServiceStatus;
-use legion_api::{API_VERSION, Kind, Object};
+use legion_api::{Kind, Object};
 use legion_proto::v1::cluster_client::ClusterClient;
 use legion_proto::v1::objects_client::ObjectsClient;
 use legion_proto::v1::{
@@ -163,71 +162,26 @@ impl Objects {
         .await
     }
 
-    /// Sets `field` of an object's spec to `value`, over the object as just
-    /// read: another write meanwhile (a node's heartbeat, a Volume's
-    /// migration) has it read again. Returns the object's key, and whether
-    /// the field changed.
+    /// Sets `field` of an object's spec to `value`
+    /// (`legion_manager::actions::set_spec`): its key, and whether the
+    /// field changed.
     pub(crate) async fn set_spec(
         &mut self,
         r#ref: ObjectRef,
         field: &str,
         value: serde_json::Value,
     ) -> anyhow::Result<(String, bool)> {
-        loop {
-            let current = self.get(r#ref.clone()).await?.into_inner();
-            let mut object = Object::try_from(current)?;
-            if object.spec[field] == value {
-                return Ok((object.key().to_string(), false));
-            }
-            object.spec[field] = value.clone();
-            match self
-                .apply(ApplyRequest {
-                    object: Some((&object).into()),
-                    expected_version: Some(object.metadata.version),
-                    ..Default::default()
-                })
-                .await
-            {
-                Ok(_) => return Ok((object.key().to_string(), true)),
-                Err(s) if s.code() == tonic::Code::Aborted => continue,
-                Err(s) => return Err(s.into()),
-            }
-        }
+        Ok(legion_manager::actions::set_spec(self, r#ref, field, value).await?)
     }
 
-    /// Sets (`Some`) or removes (`None`) labels of an object, retrying
-    /// when it changes meanwhile; whether anything changed.
+    /// Sets (`Some`) or removes (`None`) labels of an object
+    /// (`legion_manager::actions::set_labels`); whether anything changed.
     pub(crate) async fn set_labels(
         &mut self,
         r#ref: ObjectRef,
         changes: &[(String, Option<String>)],
     ) -> anyhow::Result<(String, bool)> {
-        loop {
-            let current = self.get(r#ref.clone()).await?.into_inner();
-            let mut object = Object::try_from(current)?;
-            let before = object.metadata.labels.clone();
-            for (k, v) in changes {
-                match v {
-                    Some(v) => object.metadata.labels.insert(k.clone(), v.clone()),
-                    None => object.metadata.labels.remove(k),
-                };
-            }
-            if object.metadata.labels == before {
-                return Ok((object.key().to_string(), false));
-            }
-            match self
-                .apply(ApplyRequest {
-                    object: Some((&object).into()),
-                    expected_version: Some(object.metadata.version),
-                    ..Default::default()
-                })
-                .await
-            {
-                Ok(_) => return Ok((object.key().to_string(), true)),
-                Err(s) if s.code() == tonic::Code::Aborted => continue,
-                Err(s) => return Err(s.into()),
-            }
-        }
+        Ok(legion_manager::actions::set_labels(self, r#ref, changes).await?)
     }
 
     async fn get(&mut self, req: ObjectRef) -> Answer<pb::Object> {
@@ -273,6 +227,21 @@ impl Objects {
         req: WatchRequest,
     ) -> Answer<tonic::codec::Streaming<pb::WatchEvent>> {
         self.0.watch(req).await
+    }
+}
+
+/// The shared changes' calls, each retried while the API is unavailable.
+impl legion_manager::actions::ObjectsApi for Objects {
+    async fn get(&mut self, r: ObjectRef) -> Result<pb::Object, tonic::Status> {
+        Ok(Objects::get(self, r).await?.into_inner())
+    }
+
+    async fn apply(&mut self, r: ApplyRequest) -> Result<pb::ApplyResponse, tonic::Status> {
+        Ok(Objects::apply(self, r).await?.into_inner())
+    }
+
+    async fn delete(&mut self, r: DeleteRequest) -> Result<pb::DeleteResponse, tonic::Status> {
+        Ok(Objects::delete(self, r).await?.into_inner())
     }
 }
 
@@ -490,76 +459,25 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             if path.exists() {
                 bail!("{} exists; choose another with -o", path.display());
             }
-            // The binding first: a binding refused leaves no credentials
-            // behind to block trying again. Credentials that fail put the
-            // binding back as it was.
-            let mut bound = None;
-            match (role, namespace) {
-                (Some(role), Some(namespace)) => {
-                    if legion_api::rbac::NamespaceRole::parse(&role).is_none() {
-                        bail!("--role {role:?}: one of view, edit and admin");
-                    }
-                    let spec = serde_json::json!({ "user": name, "role": role });
-                    let mut binding = Object::new(Kind::RoleBinding, &namespace, &name, spec);
-                    let before = match objects.get((&binding.key()).into()).await {
-                        Ok(o) => Some(Object::try_from(o.into_inner())?),
-                        Err(s) if s.code() == tonic::Code::NotFound => None,
-                        Err(s) => {
-                            return Err(s).with_context(|| format!("reading {}", binding.key()));
-                        }
-                    };
-                    // An apply sets the labels too: a binding there keeps its.
-                    if let Some(before) = &before {
-                        binding.metadata.labels = before.metadata.labels.clone();
-                    }
-                    apply(&mut objects, &binding).await?;
-                    bound = Some((binding, before));
-                }
-                (None, None) => {}
+            let binding = match (&role, &namespace) {
+                (Some(role), Some(namespace)) => Some((role.as_str(), namespace.as_str())),
+                (None, None) => None,
                 _ => bail!("--role and --namespace go together"),
-            }
-            let made = async {
-                let (key_pem, csr_pem) = legion_pki::request()?;
-                let issued = cluster
-                    .issue_user(pb::IssueUserRequest {
-                        name: name.clone(),
-                        csr_pem,
-                        days,
-                    })
-                    .await?
-                    .into_inner();
-                let bundle = legion_pki::Bundle {
-                    cert_pem: issued.cert_pem,
-                    key_pem,
-                    ca_pem: issued.ca_pem,
-                };
-                crate::pki::write_private(&path, &bundle.to_pem())?;
-                anyhow::Ok(bundle)
-            }
-            .await;
-            let bundle = match (made, bound) {
-                (Ok(bundle), _) => bundle,
-                (Err(e), None) => return Err(e),
-                (Err(e), Some((binding, before))) => {
-                    let undone = match before {
-                        Some(before) => {
-                            let mut back = Object::new(
-                                Kind::RoleBinding,
-                                &before.metadata.namespace,
-                                &before.metadata.name,
-                                before.spec,
-                            );
-                            back.metadata.labels = before.metadata.labels;
-                            apply(&mut objects, &back).await
-                        }
-                        None => delete(&mut objects, &binding).await,
-                    };
-                    if let Err(u) = undone {
-                        eprintln!("{}: not put back: {u:#}", binding.key());
-                    }
-                    return Err(e);
-                }
             };
+            let made = legion_manager::actions::create_user(
+                &mut objects,
+                &mut cluster,
+                &name,
+                binding,
+                days,
+            )
+            .await
+            .map_err(|s| anyhow::anyhow!("{}", s.message()))?;
+            if let (Some(result), Some(namespace)) = (made.binding, &namespace) {
+                println!("RoleBinding/{namespace}/{name} {result}");
+            }
+            let bundle = made.bundle;
+            crate::pki::write_private(&path, &bundle.to_pem())?;
             // As issued, to the nearest day: 0 asks for the default.
             let days = legion_pki::validity(&bundle.cert_pem)
                 .map_or(u64::from(days), |(_, life)| {
@@ -836,53 +754,9 @@ pub(crate) async fn rollback(
     namespace: String,
     service: String,
 ) -> anyhow::Result<String> {
-    let r#ref = ObjectRef {
-        kind: Kind::Service.to_string(),
-        namespace,
-        name: service,
-    };
-    // The generation the rollback undoes the latest update of.
-    let mut generation = None;
-    loop {
-        let current = objects.get(r#ref.clone()).await?.into_inner();
-        let mut object = Object::try_from(current)?;
-        if generation.is_some_and(|g| g != object.metadata.generation) {
-            bail!("{} changed meanwhile; nothing rolled back", object.key());
-        }
-        generation = Some(object.metadata.generation);
-        let status: ServiceStatus =
-            serde_json::from_value(object.status.clone()).unwrap_or_default();
-        let Some(update) = status.update else {
-            bail!("{} has had no update to roll back", object.key());
-        };
-        if serde_json::to_value(&update.previous)? == object.spec {
-            bail!(
-                "{} already runs the spec before its latest update",
-                object.key()
-            );
-        }
-        object.spec = serde_json::to_value(&update.previous)?;
-        // Only over the spec just read: a newer change wins. The
-        // controllers write the status meanwhile, which moves the
-        // version too; then it is read again.
-        let resp = match objects
-            .apply(ApplyRequest {
-                object: Some((&object).into()),
-                expected_version: Some(object.metadata.version),
-                ..Default::default()
-            })
-            .await
-        {
-            Ok(resp) => resp.into_inner(),
-            Err(s) if s.code() == tonic::Code::Aborted => continue,
-            Err(s) => return Err(s.into()),
-        };
-        return Ok(format!(
-            "{} rolling back (version {})",
-            object.key(),
-            resp.object.unwrap_or_default().version
-        ));
-    }
+    legion_manager::actions::rollback(objects, namespace, service)
+        .await
+        .map_err(|s| anyhow::anyhow!("{}", s.message()))
 }
 
 async fn apply(objects: &mut Objects, object: &Object) -> anyhow::Result<()> {
@@ -1118,20 +992,7 @@ async fn diff(objects: &mut Objects, object: &Object) -> anyhow::Result<bool> {
 
 /// The parts of an object a manifest sets, as YAML.
 fn manifest_yaml(o: pb::Object) -> anyhow::Result<String> {
-    let o = Object::try_from(o)?;
-    let mut metadata = serde_json::json!({ "name": o.metadata.name });
-    if !o.metadata.namespace.is_empty() {
-        metadata["namespace"] = o.metadata.namespace.into();
-    }
-    if !o.metadata.labels.is_empty() {
-        metadata["labels"] = serde_json::to_value(&o.metadata.labels)?;
-    }
-    Ok(serde_yaml_ng::to_string(&serde_json::json!({
-        "apiVersion": o.api_version,
-        "kind": o.kind,
-        "metadata": metadata,
-        "spec": o.spec,
-    }))?)
+    Ok(legion_api::manifest::yaml(&Object::try_from(o)?))
 }
 
 fn target(
@@ -1225,25 +1086,7 @@ fn read_objects(path: &Path) -> anyhow::Result<Vec<Object>> {
     } else {
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
     };
-    let mut objects = Vec::new();
-    for (n, doc) in serde_yaml_ng::Deserializer::from_str(&text).enumerate() {
-        let value: serde_json::Value = serde::Deserialize::deserialize(doc)
-            .with_context(|| format!("{}: document {}", path.display(), n + 1))?;
-        if value.is_null() {
-            continue; // empty document, e.g. a trailing `---`
-        }
-        let object: Object = serde_json::from_value(value)
-            .with_context(|| format!("{}: document {}", path.display(), n + 1))?;
-        if object.api_version != API_VERSION {
-            bail!(
-                "{}: document {}: apiVersion must be {API_VERSION}",
-                path.display(),
-                n + 1
-            );
-        }
-        objects.push(object);
-    }
-    Ok(objects)
+    legion_api::manifest::parse(&text).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
 }
 
 fn display_name(o: &pb::Object) -> String {
