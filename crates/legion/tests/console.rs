@@ -1,4 +1,4 @@
-//! The web console on three nodes (CONSOLE.md, phases 1 to 3), in a real
+//! The web console on three nodes (CONSOLE.md, phases 1 to 4), in a real
 //! browser: a headless Chromium signs in as a user who may only look, a
 //! user who may change a namespace and the cluster admin, and does through
 //! the console's pages what each phase's "done when" asks.
@@ -12,6 +12,9 @@
 //! - Phase 3: the admin takes a node out for maintenance and back, loses a
 //!   node and restores its Volume from a backup downloaded in the console
 //!   onto another, and rotates the CA, watching every node move to it.
+//! - Phase 4: a crash-looping task and a node going down each raise an
+//!   alert in the open console within 30 s, leading to the cause; a lost
+//!   Volume raises its own.
 //!
 //! It drives real daemons, so it is ignored by default and run on the lab
 //! of `tests/common` (see there), as root, with `LEGION_BROWSER` naming
@@ -402,9 +405,65 @@ spec: { text: team-b's }
         backup.metadata().unwrap().len()
     );
 
-    step("phase 3: n2 lost and removed from the console; its Volume is lost with it");
+    // --- Phase 4 -------------------------------------------------------
+    step("phase 4: a crash-looping task raises an alert in the open console, leading to it");
+    c.page(&mut a, "/alerts");
+    a.shows("Alerts", 30);
+    let crasher = c.lab.dir.join("crasher.yaml");
+    std::fs::write(
+        &crasher,
+        format!(
+            "apiVersion: legion/v1
+kind: Service
+metadata: {{ name: crasher, namespace: team-a }}
+spec:
+  replicas: 1
+  placement: {{ constraints: [\"node.name != n2\"] }}
+  pod:
+    restartPolicy: {{ delay: 1s }}
+    containers:
+      - name: c
+        image: {IMAGE}
+        command: [/bin/sh, -c, \"echo crashing; exit 1\"]
+"
+        ),
+    )
+    .unwrap();
+    c.lab.ok(&["apply", "-f", crasher.to_str().unwrap()]);
+    let restarted = |n: u64| {
+        c.lab.list("tasks", "team-a").iter().any(|t| {
+            t["spec"]["service"] == "crasher" && t["status"]["restarts"].as_u64() >= Some(n)
+        })
+    };
+    wait("crasher restarting", 300, || restarted(3));
+    let looping = Instant::now();
+    a.until("the crash loop shown", 30, |b| {
+        b.text().contains("crash-loop")
+    });
+    eprintln!(
+        "crash loop shown {} ms after its third restart",
+        looping.elapsed().as_millis()
+    );
+    a.eval(
+        "[...document.querySelectorAll('tr.alert a')]
+           .find((l) => l.innerText.includes('Task/crasher')).click()",
+    );
+    a.shows("exited with 1", 30);
+    c.lab.ok(&["delete", "service", "crasher", "-n", "team-a"]);
+    c.page(&mut a, "/alerts");
+    a.until("the crash loop gone with its task", 120, |b| {
+        !b.text().contains("crash-loop")
+    });
+
+    step("phases 3 and 4: n2 lost, alerted within 30 s, removed from the console; its Volume lost");
     let out = c.lab.ssh(&c.lab.vms[0], &format!("{STOP}\ntrue\n"));
     assert!(out.status.success(), "stopping n2: {}", text(&out.stderr));
+    let stopped = Instant::now();
+    a.until("n2's alert", 30, |b| b.text().contains("Node/n2"));
+    eprintln!(
+        "n2's alert shown {} ms after its daemon stopped",
+        stopped.elapsed().as_millis()
+    );
     wait("n2 down", 120, || c.lab.node_state("n2") == "down");
     c.page(&mut a, "/k/Node/_/n2");
     a.click("Delete");
@@ -413,6 +472,8 @@ spec: { text: team-b's }
             .as_str()
             .is_some_and(|l| !l.is_empty())
     });
+    c.page(&mut a, "/alerts");
+    a.shows(&format!("team-a/Volume/{volume}"), 30);
 
     step("phase 3: n1 labelled for keeper, the Volume restored onto it from the backup");
     c.page(&mut a, "/k/Node/_/n1");
