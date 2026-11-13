@@ -172,6 +172,7 @@ fn router(gateway: Gateway) -> axum::Router {
         .route("/api/usage", get(usage))
         .route("/api/alerts", get(alerts))
         .route("/api/usage-history", get(usage_history))
+        .route("/api/quotas", get(quotas))
         .route("/api/reach", get(reach))
         .route("/api/logs/{namespace}/{task}", get(logs))
         // Writes (CONSOLE.md phases 2 and 3): each from the console's own
@@ -722,6 +723,39 @@ async fn usage(
     Ok(Json(serde_json::json!({ "nodes": nodes })).into_response())
 }
 
+/// `legion quota`: `{namespaces: [{namespace, resources: [{resource,
+/// limit, used}]}]}`, CPU in cores, memory and storage in bytes.
+async fn quotas(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Query(scope): Query<Scope>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let r = ClusterClient::new(channel)
+        .quotas(pb::QuotasRequest {
+            namespace: scope.namespace.unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+    Ok(Json(serde_json::json!({ "namespaces": quotas_json(&r) })).into_response())
+}
+
+fn quotas_json(r: &pb::QuotasResponse) -> Vec<serde_json::Value> {
+    r.namespaces
+        .iter()
+        .map(|n| {
+            let resources: Vec<_> = n
+                .resources
+                .iter()
+                .map(|q| {
+                    serde_json::json!({ "resource": q.resource, "limit": q.limit, "used": q.used })
+                })
+                .collect();
+            serde_json::json!({ "namespace": n.namespace, "resources": resources })
+        })
+        .collect()
+}
+
 #[derive(Deserialize)]
 struct HistoryScope {
     namespace: Option<String>,
@@ -755,6 +789,10 @@ async fn usage_history(
             serde_json::json!({
                 "namespace": t.namespace, "task": t.task, "node": t.node,
                 "service": t.service, "samples": samples,
+                "cpu_request_percent": t.cpu_request_percent,
+                "memory_request_bytes": t.memory_request_bytes,
+                "cpu_limit_percent": t.cpu_limit_percent,
+                "memory_limit_bytes": t.memory_limit_bytes,
             })
         })
         .collect();
