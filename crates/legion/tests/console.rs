@@ -101,9 +101,10 @@ impl Console {
         serde_json::from_str(&self.lab.ok(&args)).unwrap()
     }
 
-    /// `hello`'s running tasks are all of its current spec, as many as it
-    /// asks for, and ready.
-    fn hello_settled(&self) -> bool {
+    /// `hello` has as many running tasks as it asks for, all ready, and with
+    /// `current` all of its current spec. A scale makes a new generation
+    /// without replacing the tasks running, so only a rollout asks that.
+    fn hello_settled(&self, current: bool) -> bool {
         let s = self.get("service", "team-a", "hello");
         let generation = s["metadata"]["generation"].as_u64().unwrap_or(0);
         let replicas = s["spec"]["replicas"].as_u64().unwrap_or(0);
@@ -118,9 +119,10 @@ impl Console {
             })
             .collect();
         tasks.len() as u64 == replicas
-            && tasks
-                .iter()
-                .all(|t| t["spec"]["serviceGeneration"].as_u64() == Some(generation))
+            && (!current
+                || tasks
+                    .iter()
+                    .all(|t| t["spec"]["serviceGeneration"].as_u64() == Some(generation)))
             && s["status"]["ready"].as_u64() == Some(replicas)
     }
 
@@ -296,7 +298,7 @@ spec: { text: team-b's }
     e.click("Apply");
     e.shows("Service/team-a/hello: created, version", 30);
     e.shows("Service/team-a/keeper: created, version", 30);
-    wait("hello's two tasks", 300, || c.hello_settled());
+    wait("hello's two tasks", 300, || c.hello_settled(true));
     wait("keeper's task on n2", 300, || {
         c.task_of("keeper").is_some_and(|(_, n)| n == "n2")
     });
@@ -308,7 +310,7 @@ spec: { text: team-b's }
     e.click("Scale");
     e.shows("hello scaled to 3", 30);
     wait("three tasks", 300, || {
-        c.get("service", "team-a", "hello")["spec"]["replicas"] == 3 && c.hello_settled()
+        c.get("service", "team-a", "hello")["spec"]["replicas"] == 3 && c.hello_settled(false)
     });
 
     step("phase 2: a new image rolled out, and the rollout followed");
@@ -316,7 +318,7 @@ spec: { text: team-b's }
     e.fill("New image for c", NEXT);
     e.click("Roll out");
     wait("the new image on every task", 600, || {
-        c.image() == NEXT && c.hello_settled()
+        c.image() == NEXT && c.hello_settled(true)
     });
     e.shows("completed", 60);
 
@@ -324,7 +326,7 @@ spec: { text: team-b's }
     e.click("Details");
     e.click("Roll back");
     wait("the image before", 600, || {
-        c.image() == IMAGE && c.hello_settled()
+        c.image() == IMAGE && c.hello_settled(true)
     });
 
     step("phase 2: a task's logs");
@@ -381,7 +383,7 @@ spec: { text: team-b's }
     wait("n3 drained", 300, || {
         c.get("node", "", "n3")["spec"]["availability"] == "drain"
             && !c.lab.placed("team-a", "hello").iter().any(|n| n == "n3")
-            && c.hello_settled()
+            && c.hello_settled(false)
     });
     a.click("Activate");
     wait("n3 active", 60, || {
