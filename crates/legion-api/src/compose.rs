@@ -34,6 +34,19 @@ pub struct Inputs<'a> {
 pub struct Stack {
     pub objects: Vec<Object>,
     pub warnings: Vec<String>,
+    /// The variables the file interpolates, in the order it first names
+    /// them: what a template asks for (CONSOLE.md phase 5).
+    pub variables: Vec<Variable>,
+}
+
+/// A variable a compose file reads, with the default it gives
+/// (`${NAME:-default}`, `${NAME-default}`) and whether it must be set
+/// (`${NAME:?why}`, `${NAME?why}`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Variable {
+    pub name: String,
+    pub default: Option<String>,
+    pub required: bool,
 }
 
 /// Converts a compose file into the objects of `stack` in `namespace`.
@@ -50,6 +63,7 @@ pub fn convert(yaml: &str, stack: &str, namespace: &str, inputs: &Inputs) -> Res
         inputs,
         warnings: Vec::new(),
         unset: BTreeSet::new(),
+        variables: Vec::new(),
         volumes: BTreeMap::new(),
         secrets: BTreeMap::new(),
         configs: BTreeMap::new(),
@@ -123,9 +137,19 @@ pub fn convert(yaml: &str, stack: &str, namespace: &str, inputs: &Inputs) -> Res
     for o in &mut objects {
         crate::admit(o).map_err(|e| format!("{}: {e}", o.key()))?;
     }
+    // In the order the file first names them, as a form would ask.
+    let mut variables = c.variables;
+    variables.sort_by_key(|v| {
+        [format!("${{{}", v.name), format!("${}", v.name)]
+            .iter()
+            .filter_map(|n| yaml.find(n.as_str()))
+            .min()
+            .unwrap_or(usize::MAX)
+    });
     Ok(Stack {
         objects,
         warnings: c.warnings,
+        variables,
     })
 }
 
@@ -143,6 +167,7 @@ struct Converter<'a> {
     warnings: Vec<String>,
     /// Variables already warned about.
     unset: BTreeSet<String>,
+    variables: Vec<Variable>,
     /// Compose names of top-level volumes, secrets and configs to Legion's.
     volumes: BTreeMap<String, String>,
     secrets: BTreeMap<String, String>,
@@ -152,6 +177,23 @@ struct Converter<'a> {
 impl Converter<'_> {
     fn warn(&mut self, w: String) {
         self.warnings.push(w);
+    }
+
+    /// Notes a variable read: a default or a requirement any use gives.
+    fn met(&mut self, name: &str, default: Option<&str>, required: bool) {
+        match self.variables.iter_mut().find(|v| v.name == name) {
+            Some(v) => {
+                if v.default.is_none() {
+                    v.default = default.map(str::to_owned);
+                }
+                v.required |= required;
+            }
+            None => self.variables.push(Variable {
+                name: name.to_owned(),
+                default: default.map(str::to_owned),
+                required,
+            }),
+        }
     }
 
     /// A name for a pod's next tmpfs volume, `tmpfs-<n>`, that neither the
@@ -240,6 +282,11 @@ impl Converter<'_> {
                     .map_or((expr, "", ""), |(at, op)| {
                         (&expr[..at], op, &expr[at + op.len()..])
                     });
+                self.met(
+                    var,
+                    matches!(op, ":-" | "-").then_some(arg),
+                    matches!(op, ":?" | "?"),
+                );
                 let value = (self.inputs.env)(var);
                 let unset_or_empty = value.as_deref().is_none_or(str::is_empty);
                 match op {
@@ -259,6 +306,7 @@ impl Converter<'_> {
                 }
                 let var = &rest[..len];
                 rest = &rest[len..];
+                self.met(var, None, false);
                 let value = (self.inputs.env)(var);
                 out.push_str(&self.lookup(var, value));
             }

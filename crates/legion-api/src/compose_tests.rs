@@ -246,6 +246,31 @@ fn interpolation() {
     assert_eq!(spec(&stack, "a").pod.containers[0].image, "b:c");
 }
 
+/// What a template asks for: each variable once, in the order the file
+/// names it, with the default any use gives; `$$` is no variable.
+#[test]
+fn the_variables_read_are_listed() {
+    let stack = convert_with(
+        "services: { a: { image: \"${IMG:-a:1}\", command: [\"$$HOME\", \"$PORT\", \"${IMG}\", \"${TAG?tag}\", \"${R-}\"] } }",
+        &[("TAG", "1")],
+    )
+    .unwrap();
+    let got: Vec<_> = stack
+        .variables
+        .iter()
+        .map(|v| (v.name.as_str(), v.default.as_deref(), v.required))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("IMG", Some("a:1"), false),
+            ("PORT", None, false),
+            ("TAG", None, true),
+            ("R", Some(""), false),
+        ]
+    );
+}
+
 #[test]
 fn errors_name_the_place() {
     for (yaml, error) in [
