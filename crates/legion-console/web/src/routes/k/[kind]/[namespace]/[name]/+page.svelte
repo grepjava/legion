@@ -7,6 +7,7 @@
   import Labels from '#lib/Labels.svelte';
   import NodeTasks from '#lib/NodeTasks.svelte';
   import Rollout from '#lib/Rollout.svelte';
+  import Taints from '#lib/Taints.svelte';
   import TaskLogs from '#lib/TaskLogs.svelte';
   import VolumeData from '#lib/VolumeData.svelte';
   import { session } from '#lib/session.svelte.ts';
@@ -107,6 +108,10 @@
       <dd><code>{object.metadata.uid}</code></dd>
       <dt>Labels</dt>
       <dd><Labels {object} {scoped} /></dd>
+      {#if kind === 'Node'}
+        <dt>Taints</dt>
+        <dd><Taints node={object} /></dd>
+      {/if}
     </dl>
   {:else if tab === 'tasks'}
     <NodeTasks node={object} />

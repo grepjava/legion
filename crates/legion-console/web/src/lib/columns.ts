@@ -8,6 +8,10 @@ export interface Column {
 }
 
 const s = (v: unknown) => (v === undefined || v === null ? '' : String(v));
+const labels = (m?: Record<string, string>) =>
+  Object.entries(m ?? {})
+    .map(([k, v]) => `${k}=${v}`)
+    .join(', ');
 
 /** The columns a list of `kind` shows besides name and namespace. */
 export function columns(kind: string): Column[] {
@@ -40,6 +44,17 @@ export function columns(kind: string): Column[] {
         {
           label: 'Image',
           value: (o) => s(o.spec?.pod?.containers?.map((c: { image: string }) => c.image).join(', '))
+        },
+        {
+          label: 'Ready',
+          value: (o) => (o.status ? `${o.status.ready ?? 0}/${o.status.desired ?? 0}` : '')
+        },
+        {
+          label: 'Address',
+          value: (o) => {
+            const lb = o.spec?.endpoint?.loadBalancer;
+            return lb ? `${lb.address} (vhid ${lb.vhid})` : s(o.status?.virtualIp);
+          }
         }
       ];
     case 'Job':
@@ -61,6 +76,24 @@ export function columns(kind: string): Column[] {
         { label: 'Host', value: (o) => s(o.spec?.host) },
         { label: 'Service', value: (o) => s(o.spec?.service) },
         { label: 'TLS', value: (o) => (o.spec?.tls ? 'yes' : '') }
+      ];
+    case 'NetworkPolicy':
+      return [
+        { label: 'Services', value: (o) => labels(o.spec?.services) || 'all' },
+        { label: 'Ingress rules', value: (o) => s(o.spec?.ingress?.length ?? 0) },
+        {
+          label: 'Egress',
+          value: (o) =>
+            o.spec?.egress === undefined || o.spec?.egress === null
+              ? 'not limited'
+              : `${o.spec.egress.length} rules`
+        }
+      ];
+    case 'ImagePolicy':
+      return [
+        { label: 'Images', value: (o) => s(o.spec?.images?.join(', ')) },
+        { label: 'Keys', value: (o) => s(o.spec?.keys?.length ?? 0) },
+        { label: 'Mode', value: (o) => s(o.spec?.mode ?? 'enforce') }
       ];
     case 'RoleBinding':
       return [
