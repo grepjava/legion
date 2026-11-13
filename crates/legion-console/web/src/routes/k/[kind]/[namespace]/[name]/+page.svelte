@@ -3,8 +3,13 @@
   import { api, follow, type LObject } from '#lib/api.ts';
   import { columns, tone } from '#lib/columns.ts';
   import { plural } from '#lib/kinds.ts';
+  import Actions from '#lib/Actions.svelte';
+  import Labels from '#lib/Labels.svelte';
   import NodeTasks from '#lib/NodeTasks.svelte';
+  import Rollout from '#lib/Rollout.svelte';
   import TaskLogs from '#lib/TaskLogs.svelte';
+  import VolumeData from '#lib/VolumeData.svelte';
+  import { session } from '#lib/session.svelte.ts';
   import { toYaml } from '#lib/yaml.ts';
 
   const kind = $derived(page.params.kind ?? '');
@@ -13,7 +18,7 @@
   let object: LObject | null = $state(null);
   let error = $state('');
   let gone = $state(false);
-  let tab: 'details' | 'tasks' | 'logs' | 'yaml' = $state('details');
+  let tab: 'details' | 'rollout' | 'tasks' | 'logs' | 'terminal' | 'data' | 'yaml' = $state('details');
 
   $effect(() => {
     object = null;
@@ -39,11 +44,19 @@
 
   const tabs = $derived([
     { id: 'details', label: 'Details' },
+    ...(kind === 'Service' ? [{ id: 'rollout', label: 'Rollout' }] : []),
     ...(kind === 'Node' ? [{ id: 'tasks', label: 'Tasks' }] : []),
-    ...(kind === 'Task' ? [{ id: 'logs', label: 'Logs' }] : []),
+    ...(kind === 'Volume' ? [{ id: 'data', label: 'Data' }] : []),
+    ...(kind === 'Task'
+      ? [
+          { id: 'logs', label: 'Logs' },
+          { id: 'terminal', label: 'Terminal' }
+        ]
+      : []),
     { id: 'yaml', label: 'YAML' }
   ] as { id: typeof tab; label: string }[]);
   const cols = $derived(columns(kind));
+  const scoped = $derived(session.kinds.find((k) => k.kind === kind)?.clusterScoped ?? false);
 </script>
 
 <header class="bar">
@@ -56,6 +69,7 @@
 {#if error}
   <p class="error">{error}</p>
 {:else if object}
+  {#if !gone}<Actions {object} {scoped} />{/if}
   <div class="tabs" role="tablist">
     {#each tabs as t (t.id)}
       <button role="tab" aria-selected={tab === t.id} class:here={tab === t.id} onclick={() => (tab = t.id)}
@@ -91,19 +105,22 @@
       <dd>{object.metadata.version} (generation {object.metadata.generation})</dd>
       <dt>UID</dt>
       <dd><code>{object.metadata.uid}</code></dd>
-      {#if object.metadata.labels && Object.keys(object.metadata.labels).length}
-        <dt>Labels</dt>
-        <dd>
-          {#each Object.entries(object.metadata.labels) as [k, v] (k)}
-            <a class="tag" href="/k/{kind}?filter={encodeURIComponent(`${k}=${v}`)}">{k}={v}</a>
-          {/each}
-        </dd>
-      {/if}
+      <dt>Labels</dt>
+      <dd><Labels {object} {scoped} /></dd>
     </dl>
   {:else if tab === 'tasks'}
     <NodeTasks node={object} />
+  {:else if tab === 'rollout'}
+    <Rollout service={object} />
+  {:else if tab === 'data'}
+    <VolumeData volume={object} />
   {:else if tab === 'logs'}
     <TaskLogs task={object} />
+  {:else if tab === 'terminal'}
+    <!-- Loaded when opened: the terminal is most of the console's size. -->
+    {#await import('#lib/Terminal.svelte') then Terminal}
+      <Terminal.default task={object} />
+    {/await}
   {:else}
     <pre>{toYaml(object)}</pre>
   {/if}

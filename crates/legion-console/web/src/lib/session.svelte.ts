@@ -14,3 +14,18 @@ export function namespaces(adminList: string[]): string[] {
   if (!me) return [];
   return me.all ? adminList : Object.keys(me.namespaces).sort();
 }
+
+/**
+ * Why the user may not change objects in `namespace` (empty for the
+ * cluster-wide kinds), or null when they may: a `view` user sees the
+ * buttons, disabled with this as the reason. The API decides in the end.
+ */
+export function cannotWrite(namespace: string): string | null {
+  const me = session.me;
+  if (!me) return 'not signed in';
+  if (me.all) return null;
+  if (!namespace) return 'only an admin changes what is cluster-wide';
+  const role = me.namespaces[namespace];
+  if (role === 'edit' || role === 'admin') return null;
+  return role ? `your role in ${namespace} is ${role}` : `you have no role in ${namespace}`;
+}

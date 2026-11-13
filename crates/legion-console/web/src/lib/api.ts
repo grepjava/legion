@@ -25,6 +25,8 @@ export interface Me {
   role: 'admin' | 'user';
   all: boolean;
   namespaces: Record<string, string>;
+  /** The token every write carries (DESIGN.md §3.9). */
+  csrf: string;
 }
 
 export interface KindInfo {
@@ -58,11 +60,20 @@ export function whenSignedOut(f: () => void) {
   onSignedOut = f;
 }
 
+/** The signed-in session's token for writes, from `/api/me`. */
+let csrf = '';
+export function setToken(token: string) {
+  csrf = token;
+}
+
 async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (body !== undefined) headers['content-type'] = 'application/json';
+  if (method !== 'GET' && csrf) headers['x-legion-csrf'] = csrf;
   const res = await fetch(path, {
     method,
     credentials: 'same-origin',
-    headers: body === undefined ? {} : { 'content-type': 'application/json' },
+    headers,
     body: body === undefined ? undefined : JSON.stringify(body)
   });
   if (res.status === 204) return undefined as T;
@@ -91,8 +102,169 @@ export const api = {
       'GET',
       `/api/objects/${encodeURIComponent(kind)}/${encodeURIComponent(namespace || '_')}/${encodeURIComponent(name)}`
     ),
-  usage: (namespace = '') => call<{ nodes: NodeUsage[] }>('GET', `/api/usage${q(namespace)}`)
+  usage: (namespace = '') => call<{ nodes: NodeUsage[] }>('GET', `/api/usage${q(namespace)}`),
+
+  // Writes, as the user, each checked by the API as the CLI's are.
+  manifest: (kind: string, namespace: string, name: string) =>
+    call<{ yaml: string; version: number }>('GET', `/api/manifest/${path(kind, namespace, name)}`),
+  apply: (body: {
+    yaml?: string;
+    object?: unknown;
+    dryRun?: boolean;
+    expectedVersion?: number;
+  }) => call<{ results: ApplyResult[] }>('POST', '/api/apply', body),
+  remove: (kind: string, namespace: string, name: string, version?: number) =>
+    call<{ version: number }>(
+      'DELETE',
+      `/api/objects/${path(kind, namespace, name)}${version === undefined ? '' : `?version=${version}`}`
+    ),
+  set: (kind: string, namespace: string, name: string, field: string, value: unknown) =>
+    call<{ key: string; changed: boolean }>('POST', '/api/set', {
+      kind,
+      namespace,
+      name,
+      field,
+      value
+    }),
+  labels: (kind: string, namespace: string, name: string, changes: Record<string, string | null>) =>
+    call<{ key: string; changed: boolean }>('POST', '/api/labels', {
+      kind,
+      namespace,
+      name,
+      changes
+    }),
+  rollback: (namespace: string, service: string) =>
+    call<{ message: string }>('POST', '/api/rollback', { namespace, service }),
+  nodeRole: (node: string, role: 'manager' | 'worker') =>
+    call<void>('POST', '/api/node-role', { node, role }),
+
+  // Cluster operations; the API lets only admins do most.
+  audit: (filter: AuditFilter) => {
+    const params = new URLSearchParams();
+    for (const [k, v] of Object.entries(filter)) if (v !== undefined && v !== '') params.set(k, String(v));
+    return call<{ events: AuditEvent[]; truncated: boolean }>('GET', `/api/audit?${params}`);
+  },
+  joinToken: (role: 'manager' | 'worker', rotate = false) =>
+    call<{ token: string }>('POST', '/api/join-token', { role, rotate }),
+  ca: () => call<CaStatus>('GET', '/api/ca'),
+  rotateCa: () => call<CaStatus>('POST', '/api/ca'),
+  autolock: (action: 'show' | 'enable' | 'disable' | 'rotate') =>
+    call<{ key: string }>('POST', '/api/autolock', { action }),
+  createUser: (user: { name: string; role?: string; namespace?: string; days?: number }) =>
+    call<{ pem: string; binding: string | null; days: number }>('POST', '/api/users', user),
+  /** Uploads a volume backup file to a Volume on `node`. */
+  restoreVolume: async (
+    file: File,
+    to: { node: string; namespace?: string; name?: string; replace?: boolean }
+  ) => {
+    const params = new URLSearchParams({ node: to.node });
+    if (to.namespace) params.set('namespace', to.namespace);
+    if (to.name) params.set('name', to.name);
+    if (to.replace) params.set('replace', 'true');
+    const res = await fetch(`/api/volume-restore?${params}`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'x-legion-csrf': csrf, 'content-type': 'application/octet-stream' },
+      body: file
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 401) onSignedOut();
+    if (!res.ok) throw new ApiError(res.status, data.error ?? res.statusText);
+    return data as { namespace: string; name: string; node: string; bytes: number; taken: number };
+  }
 };
+
+/** Downloads, which the browser saves as files. */
+export const downloads = {
+  backup: '/api/backup',
+  volume: (namespace: string, name: string) =>
+    `/api/volume-backup/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`
+};
+
+export interface AuditFilter {
+  since_ms?: number;
+  actor?: string;
+  action?: string;
+  namespace?: string;
+  kind?: string;
+  result?: '' | 'ok' | 'denied' | 'error';
+  limit?: number;
+}
+
+export interface AuditEvent {
+  timeMs: number;
+  actor: { kind: string; name?: string };
+  action: string;
+  target?: { kind?: string; namespace?: string; name?: string };
+  result: 'ok' | 'denied' | 'error';
+  message?: string;
+  manager: string;
+}
+
+export interface CaStatus {
+  digest: string;
+  /** While a rotation runs, the CA before it; empty after. */
+  previous: string;
+  since_ms: number;
+  holders: { name: string; kind: string; issuer: string }[];
+}
+
+export interface ApplyResult {
+  key: string;
+  result: 'created' | 'updated' | 'unchanged' | 'applied';
+  version: number;
+  /** With a dry run: the stored object's manifest to what would be stored. */
+  diff?: string;
+}
+
+function path(kind: string, namespace: string, name: string): string {
+  return [kind, namespace || '_', name].map(encodeURIComponent).join('/');
+}
+
+/**
+ * A command in a task's container under a terminal: `output` gets what it
+ * writes, `ended` its exit code or why it failed. Returns what to send it.
+ */
+export function exec(
+  namespace: string,
+  task: string,
+  opts: { container?: string; command?: string[]; cols: number; rows: number },
+  output: (data: Uint8Array) => void,
+  ended: (exit: number | null, error: string | null) => void
+): { input: (data: string | Uint8Array) => void; resize: (cols: number, rows: number) => void; close: () => void } {
+  const params = new URLSearchParams({ cols: String(opts.cols), rows: String(opts.rows), csrf });
+  if (opts.container) params.set('container', opts.container);
+  if (opts.command) params.set('command', JSON.stringify(opts.command));
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const socket = new WebSocket(
+    `${proto}//${location.host}/api/exec/${encodeURIComponent(namespace)}/${encodeURIComponent(task)}?${params}`
+  );
+  socket.binaryType = 'arraybuffer';
+  let done = false;
+  const end = (exit: number | null, error: string | null) => {
+    if (!done) ended(exit, error);
+    done = true;
+  };
+  socket.onmessage = (m) => {
+    if (m.data instanceof ArrayBuffer) return output(new Uint8Array(m.data));
+    const e = JSON.parse(m.data);
+    if (typeof e.exit === 'number') end(e.exit, null);
+    else if (e.error) end(null, e.error);
+  };
+  socket.onclose = () => end(null, 'the terminal could not be opened, or its connection ended');
+  const encoder = new TextEncoder();
+  const send = (data: string | ArrayBufferView) => {
+    if (socket.readyState === WebSocket.OPEN) socket.send(data as never);
+  };
+  return {
+    input: (data) => send(typeof data === 'string' ? encoder.encode(data) : data),
+    resize: (cols, rows) => send(JSON.stringify({ resize: [cols, rows] })),
+    close: () => {
+      done = true;
+      socket.close();
+    }
+  };
+}
 
 export interface NodeUsage {
   node: string;

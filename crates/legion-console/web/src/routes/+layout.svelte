@@ -2,7 +2,7 @@
   import '../app.css';
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
-  import { api, whenSignedOut } from '#lib/api.ts';
+  import { api, setToken, whenSignedOut } from '#lib/api.ts';
   import { plural } from '#lib/kinds.ts';
   import { namespaces, session } from '#lib/session.svelte.ts';
 
@@ -24,6 +24,7 @@
     (async () => {
       try {
         session.me = await api.me();
+        setToken(session.me.csrf);
         session.kinds = await api.kinds();
         if (session.me.all) {
           const ns = await api.list('Namespace');
@@ -67,6 +68,7 @@
       </label>
       <nav>
         <a href="/" class:here={page.url.pathname === '/'}>Overview</a>
+        <a href="/apply" class:here={page.url.pathname === '/apply'}>Apply YAML</a>
         <h2>Workloads and config</h2>
         {#each nsKinds as k (k.kind)}
           <a href="/k/{k.kind}" class:here={page.url.pathname.startsWith(`/k/${k.kind}`)}
@@ -75,6 +77,8 @@
         {/each}
         {#if clusterKinds.length}
           <h2>Cluster</h2>
+          <a href="/cluster" class:here={page.url.pathname === '/cluster'}>Operations</a>
+          <a href="/audit" class:here={page.url.pathname === '/audit'}>Audit</a>
           {#each clusterKinds as k (k.kind)}
             <a href="/k/{k.kind}" class:here={page.url.pathname.startsWith(`/k/${k.kind}`)}
               >{plural(k.kind)}</a
