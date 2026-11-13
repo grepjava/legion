@@ -122,7 +122,7 @@ pub fn rotated(path: &Path) -> PathBuf {
 /// do not parse (a torn last line) are skipped.
 pub fn parse(line: &[u8]) -> Option<Chunk> {
     let mut parts = line.splitn(4, |b| *b == b' ');
-    let _time = parts.next()?;
+    let at = parse_time(parts.next()?);
     let stream = match parts.next()? {
         b"stdout" => Output::Stdout,
         b"stderr" => Output::Stderr,
@@ -140,7 +140,16 @@ pub fn parse(line: &[u8]) -> Option<Chunk> {
     Some(Chunk {
         stream,
         data: Bytes::from(data),
+        at,
     })
+}
+
+/// `<seconds>.<nanos>` as written; `None` if it is not.
+fn parse_time(t: &[u8]) -> Option<SystemTime> {
+    let t = std::str::from_utf8(t).ok()?;
+    let (secs, nanos) = t.split_once('.')?;
+    let d = std::time::Duration::new(secs.parse().ok()?, nanos.parse().ok()?);
+    UNIX_EPOCH.checked_add(d)
 }
 
 /// Reads records from `path` starting at byte `offset`; returns them and
@@ -251,12 +260,19 @@ mod tests {
     fn lines_pieces_and_streams() {
         let t = tempfile::tempdir().unwrap();
         let p = t.path().join("log");
+        let before = SystemTime::now();
         let mut w = Writer::open(&p, 1 << 20).unwrap();
         w.write(Output::Stdout, b"one\ntw").unwrap();
         w.write(Output::Stderr, b"err\n").unwrap();
         w.write(Output::Stdout, b"o\nthree").unwrap();
         w.flush().unwrap();
         assert_eq!(text(&read_all(&p, None).unwrap()), "one\n!err\ntwo\nthree");
+        // Each read back with when it was written.
+        let after = SystemTime::now();
+        for c in read_all(&p, None).unwrap() {
+            let at = c.at.expect("a time");
+            assert!(before <= at && at <= after, "{at:?}");
+        }
         assert_eq!(text(&read_all(&p, Some(1)).unwrap()), "two\nthree");
         assert_eq!(text(&read_all(&p, Some(2)).unwrap()), "!err\ntwo\nthree");
         let long = vec![b'x'; PIECE + 10];

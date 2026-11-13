@@ -1763,6 +1763,7 @@ impl legion_runtime::Runtime for JailRuntime {
                         r.map(|data| Chunk {
                             stream: Output::Stdout,
                             data,
+                            at: None,
                         })
                         .map_err(Error::Io)
                     })
@@ -1806,7 +1807,12 @@ impl legion_runtime::Runtime for JailRuntime {
         );
         let tag = |s: Output| {
             move |r: std::io::Result<Bytes>| {
-                r.map(|data| Chunk { stream: s, data }).map_err(Error::Io)
+                r.map(|data| Chunk {
+                    stream: s,
+                    data,
+                    at: None,
+                })
+                .map_err(Error::Io)
             }
         };
         let output = futures::stream::select(

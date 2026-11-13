@@ -6,6 +6,9 @@
 //!
 //! A file holds one record per line written, each the stream (1 for
 //! stdout, 2 for stderr), the length as a big-endian u32, then the bytes.
+//! A record whose stream byte has [`TIMED`] set has, after the length, when
+//! the line was written: nanoseconds since the epoch, a big-endian u64.
+//! Files written before have no times, and read as before.
 
 use std::path::{Path, PathBuf};
 
@@ -19,6 +22,8 @@ use crate::runtime::Runtime;
 pub(crate) const MAX: usize = 1 << 20;
 
 const HEADER: usize = 5;
+/// Set on the stream byte of a record that carries its time.
+const TIMED: u8 = 0x80;
 
 fn file(root: &Path, uid: &str, container: &str) -> PathBuf {
     // Container names are DNS labels, and uids hex.
@@ -68,6 +73,7 @@ fn last(chunks: Vec<Chunk>) -> Vec<Chunk> {
             lines.push(Chunk {
                 stream: c.stream,
                 data: rest.split_to(at),
+                at: c.at,
             });
         }
     }
@@ -84,13 +90,24 @@ fn last(chunks: Vec<Chunk>) -> Vec<Chunk> {
 }
 
 fn write(path: &Path, lines: &[Chunk]) -> std::io::Result<()> {
-    let mut out = Vec::with_capacity(lines.iter().map(|c| HEADER + c.data.len()).sum());
+    let mut out = Vec::with_capacity(lines.iter().map(|c| HEADER + 8 + c.data.len()).sum());
     for c in lines {
-        out.push(match c.stream {
+        let stream = match c.stream {
             Output::Stderr => 2,
             _ => 1,
+        };
+        let nanos =
+            c.at.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as u64);
+        out.push(if nanos.is_some() {
+            stream | TIMED
+        } else {
+            stream
         });
         out.extend_from_slice(&(c.data.len() as u32).to_be_bytes());
+        if let Some(n) = nanos {
+            out.extend_from_slice(&n.to_be_bytes());
+        }
         out.extend_from_slice(&c.data);
     }
     std::fs::create_dir_all(path.parent().expect("a task directory"))?;
@@ -113,14 +130,26 @@ pub(crate) fn read(
     while at + HEADER <= data.len() {
         let len =
             u32::from_be_bytes(data[at + 1..at + HEADER].try_into().expect("4 bytes")) as usize;
-        let end = (at + HEADER + len).min(data.len());
+        let timed = data[at] & TIMED != 0;
+        let mut start = at + HEADER;
+        let mut when = None;
+        if timed {
+            if start + 8 > data.len() {
+                break;
+            }
+            let n = u64::from_be_bytes(data[start..start + 8].try_into().expect("8 bytes"));
+            when = Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(n));
+            start += 8;
+        }
+        let end = (start + len).min(data.len());
         lines.push(Chunk {
-            stream: if data[at] == 2 {
+            stream: if data[at] & !TIMED == 2 {
                 Output::Stderr
             } else {
                 Output::Stdout
             },
-            data: data.slice(at + HEADER..end),
+            data: data.slice(start..end),
+            at: when,
         });
         at = end;
     }
@@ -150,7 +179,43 @@ mod tests {
         Chunk {
             stream,
             data: Bytes::from(s.to_owned()),
+            at: None,
         }
+    }
+
+    /// Lines kept with their times read back with them; one without a time
+    /// (as every line in a file from before) reads as before.
+    #[test]
+    fn keeps_each_lines_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(1_794_000_000_123_456_789);
+        let lines = last(vec![
+            Chunk {
+                at: Some(t),
+                ..chunk(Output::Stderr, "first\nsecond\n")
+            },
+            chunk(Output::Stdout, "untimed\n"),
+        ]);
+        write(&file(dir.path(), "u1", "app"), &lines).unwrap();
+        let back = read(dir.path(), "u1", "app", None).unwrap();
+        let seen: Vec<_> = back
+            .iter()
+            .map(|c| {
+                (
+                    c.stream,
+                    String::from_utf8_lossy(&c.data).into_owned(),
+                    c.at,
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (Output::Stderr, "first\n".to_owned(), Some(t)),
+                (Output::Stderr, "second\n".to_owned(), Some(t)),
+                (Output::Stdout, "untimed\n".to_owned(), None),
+            ]
+        );
     }
 
     #[test]

@@ -353,6 +353,7 @@ impl FakeRuntime {
             .push(Chunk {
                 stream,
                 data: Bytes::from(data.to_owned()),
+                at: Some(std::time::SystemTime::now()),
             });
     }
 
@@ -781,6 +782,7 @@ impl Runtime for FakeRuntime {
         let chunk = |stream, data: Vec<u8>| Chunk {
             stream,
             data: Bytes::from(data),
+            at: None,
         };
         let cat = cmd == ["cat"];
         let sleep = cmd == ["sleep"];

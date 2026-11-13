@@ -281,6 +281,9 @@ pub enum Output {
 pub struct Chunk {
     pub stream: Output,
     pub data: Bytes,
+    /// When it was written, where the runtime keeps that (a log read back);
+    /// `None` for output as it comes (an exec, an attach).
+    pub at: Option<std::time::SystemTime>,
 }
 
 /// A process started by [`Runtime::exec_attach`].
