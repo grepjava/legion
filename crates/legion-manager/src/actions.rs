@@ -180,15 +180,17 @@ fn applied(r: &pb::ApplyResponse) -> &'static str {
 
 /// `legion user create`: credentials for user `name`, valid `days` (0 for
 /// the default), and with `binding` (a role in a namespace) their
-/// RoleBinding too. The binding comes first: one refused leaves no
-/// credentials behind to block trying again. Credentials that fail put the
-/// binding back as it was.
+/// RoleBinding too, the credentials handed to `keep` (the CLI writes its
+/// file). The binding comes first: one refused leaves no credentials
+/// behind to block trying again. Credentials that fail, or that `keep`
+/// fails to keep, put the binding back as it was.
 pub async fn create_user(
     objects: &mut impl ObjectsApi,
     cluster: &mut ClusterClient<Channel>,
     name: &str,
     binding: Option<(&str, &str)>,
     days: u32,
+    keep: impl FnOnce(&legion_pki::Bundle) -> Result<(), String>,
 ) -> Result<NewUser, Status> {
     let mut bound = None;
     let mut binding_result = None;
@@ -229,11 +231,13 @@ pub async fn create_user(
             })
             .await?
             .into_inner();
-        Ok::<_, Status>(legion_pki::Bundle {
+        let bundle = legion_pki::Bundle {
             cert_pem: issued.cert_pem,
             key_pem,
             ca_pem: issued.ca_pem,
-        })
+        };
+        keep(&bundle).map_err(Status::failed_precondition)?;
+        Ok::<_, Status>(bundle)
     }
     .await;
     match (made, bound) {

@@ -385,6 +385,13 @@ enum Command {
         #[arg(long)]
         once: bool,
     },
+    /// What may reach what among a namespace's services, as the nodes
+    /// enforce it: its isolation and NetworkPolicies, ingress and egress.
+    /// `(other namespaces)` stands for the tasks of every other namespace.
+    Reach {
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
     /// Stream changes, optionally of one kind.
     Watch {
         kind: Option<String>,

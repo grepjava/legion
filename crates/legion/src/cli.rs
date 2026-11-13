@@ -470,6 +470,10 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 &name,
                 binding,
                 days,
+                // A file that can't be written puts the binding back.
+                |bundle| {
+                    crate::pki::write_private(&path, &bundle.to_pem()).map_err(|e| format!("{e:#}"))
+                },
             )
             .await
             .map_err(|s| anyhow::anyhow!("{}", s.message()))?;
@@ -477,7 +481,6 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 println!("RoleBinding/{namespace}/{name} {result}");
             }
             let bundle = made.bundle;
-            crate::pki::write_private(&path, &bundle.to_pem())?;
             // As issued, to the nearest day: 0 asks for the default.
             let days = legion_pki::validity(&bundle.cert_pem)
                 .map_or(u64::from(days), |(_, life)| {
@@ -705,6 +708,44 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 "{}",
                 rollback(&mut objects, namespace.unwrap_or_default(), service).await?
             );
+        }
+        Command::Reach { namespace } => {
+            let namespace = namespace.unwrap_or_else(|| "default".into());
+            let r = cluster
+                .reach(pb::ReachRequest {
+                    namespace: namespace.clone(),
+                })
+                .await?
+                .into_inner();
+            let rows: Vec<[String; 3]> = r
+                .edges
+                .iter()
+                .map(|e| {
+                    let from = if e.from.is_empty() {
+                        "(other namespaces)".to_owned()
+                    } else {
+                        e.from.clone()
+                    };
+                    let ports = if e.all_ports {
+                        "all".to_owned()
+                    } else {
+                        e.ports
+                            .iter()
+                            .map(|p| format!("{}/{}", p.port, p.protocol))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    [from, e.to.clone(), ports]
+                })
+                .collect();
+            if rows.is_empty() {
+                println!(
+                    "nothing reaches {namespace}'s {} services",
+                    r.services.len()
+                );
+            } else {
+                print_table(["FROM", "TO", "PORTS"], &rows);
+            }
         }
         Command::Top { namespace, once } if once => crate::top::once(channel, namespace).await?,
         Command::Top { namespace, .. } => crate::top::run(channel, namespace).await?,
