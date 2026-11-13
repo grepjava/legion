@@ -2,6 +2,7 @@
   import { alertHref, api, follow, type LObject, type Status } from '#lib/api.ts';
   import { tone } from '#lib/columns.ts';
   import { session } from '#lib/session.svelte.ts';
+  import Quotas from '#lib/Quotas.svelte';
 
   let status: Status | null = $state(null);
   let statusError = $state('');
@@ -121,3 +122,6 @@
     </tbody>
   </table>
 {/if}
+
+<h2>Quotas</h2>
+<Quotas namespace={session.namespace} />

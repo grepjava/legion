@@ -64,6 +64,25 @@
     return { cpu: sorted(cpu), mem: sorted(mem), tasks: series.filter(pick).length };
   });
 
+  // Requests and limits of the tasks there now, those with a recent sample;
+  // a limit only when every one of them has one.
+  const marks = $derived.by(() => {
+    const newest = Math.max(0, ...series.flatMap((t) => t.samples.map((s) => s[0])));
+    const now = series
+      .filter(pick)
+      .filter((t) => t.samples.length && t.samples[t.samples.length - 1][0] >= newest - 2 * step);
+    const total = (f: (t: TaskSeries) => number) => now.reduce((a, t) => a + f(t), 0);
+    const every = (f: (t: TaskSeries) => number) => now.length > 0 && now.every((t) => f(t) > 0);
+    const of = (req: (t: TaskSeries) => number, lim: (t: TaskSeries) => number) => [
+      ...(total(req) > 0 ? [{ label: 'requested', value: total(req) }] : []),
+      ...(every(lim) ? [{ label: 'limit', value: total(lim) }] : [])
+    ];
+    return {
+      cpu: of((t) => t.cpu_request_percent, (t) => t.cpu_limit_percent),
+      mem: of((t) => t.memory_request_bytes, (t) => t.memory_limit_bytes)
+    };
+  });
+
   const percent = (v: number) => `${v.toFixed(v < 10 ? 1 : 0)}%`;
   const bytes = (v: number) => {
     const units = ['B', 'Ki', 'Mi', 'Gi', 'Ti'];
@@ -85,6 +104,6 @@
       ? `, summed over ${summed.tasks} tasks`
       : ''}. CPU is in percent of one CPU.
   </p>
-  <Chart title="CPU" points={summed.cpu} format={percent} {step} />
-  <Chart title="Memory" points={summed.mem} format={bytes} {step} />
+  <Chart title="CPU" points={summed.cpu} format={percent} {step} marks={marks.cpu} />
+  <Chart title="Memory" points={summed.mem} format={bytes} {step} marks={marks.mem} />
 {/if}

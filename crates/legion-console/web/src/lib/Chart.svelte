@@ -6,7 +6,8 @@
     title,
     points,
     format,
-    step
+    step,
+    marks = []
   }: {
     title: string;
     /** [milliseconds since the epoch, value], oldest first. */
@@ -14,6 +15,8 @@
     format: (v: number) => string;
     /** The time between samples: a longer gap breaks the line. */
     step: number;
+    /** Levels to compare with, drawn dashed and named: a request, a limit. */
+    marks?: { label: string; value: number }[];
   } = $props();
 
   let width = $state(600);
@@ -25,7 +28,7 @@
   const t0 = $derived(points.length ? points[0][0] : 0);
   const t1 = $derived(points.length ? points[points.length - 1][0] : 1);
   const top = $derived.by(() => {
-    const max = Math.max(0, ...points.map((p) => p[1]));
+    const max = Math.max(0, ...points.map((p) => p[1]), ...marks.map((m) => m.value));
     if (max <= 0) return 1;
     // A round top: 1, 2 or 5 times a power of ten.
     const e = Math.pow(10, Math.floor(Math.log10(max)));
@@ -67,7 +70,10 @@
   <figcaption>
     <strong>{title}</strong>
     {#if points.length}
-      <span class="muted">now {format(last)} · average {format(avg)} · highest {format(max)}</span>
+      <span class="muted"
+        >now {format(last)} · average {format(avg)} · highest {format(max)}{#each marks as m (m.label)}
+          · {m.label} {format(m.value)}{/each}</span
+      >
     {/if}
   </figcaption>
   {#if points.length < 2}
@@ -87,6 +93,12 @@
       {/each}
       <text class="axis" x={pad.left} y={height - 6}>{clock(t0)}</text>
       <text class="axis" x={pad.left + plotW} y={height - 6} text-anchor="end">{clock(t1)}</text>
+      {#each marks as m (m.label)}
+        <line class="mark" x1={pad.left} x2={pad.left + plotW} y1={y(m.value)} y2={y(m.value)} />
+        <text class="axis" x={pad.left + plotW - 4} y={y(m.value) - 4} text-anchor="end"
+          >{m.label} {format(m.value)}</text
+        >
+      {/each}
       <path class="line" d={path} />
       {#if hover !== null}
         {@const [ht, hv] = points[hover]}
@@ -131,6 +143,11 @@
     stroke-width: 2;
     stroke-linejoin: round;
     stroke-linecap: round;
+  }
+  .mark {
+    stroke: var(--muted);
+    stroke-width: 1;
+    stroke-dasharray: 6 4;
   }
   .cross {
     stroke: var(--muted);

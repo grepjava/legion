@@ -459,6 +459,11 @@ export interface TaskSeries {
   node: string;
   service: string;
   samples: [number, number, number][];
+  /** As the store has it now; 0 for none, or a task since removed. */
+  cpu_request_percent: number;
+  memory_request_bytes: number;
+  cpu_limit_percent: number;
+  memory_limit_bytes: number;
 }
 
 /** `legion usage`: what tasks used over the last hour, as the leader sampled it. */
@@ -472,3 +477,16 @@ export function usageHistory(
   return call('GET', `/api/usage-history?${params}`);
 }
 
+
+/** A namespace's quota and what it uses of it: CPU in cores, memory and storage in bytes. */
+export interface NamespaceQuota {
+  namespace: string;
+  resources: { resource: string; limit: number; used: number }[];
+}
+
+/** `legion quota`: the namespaces with a quota the user may read, or `namespace`'s. */
+export function quotas(namespace = ''): Promise<{ namespaces: NamespaceQuota[] }> {
+  const params = new URLSearchParams();
+  if (namespace) params.set('namespace', namespace);
+  return call('GET', `/api/quotas?${params}`);
+}
