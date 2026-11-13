@@ -21,6 +21,13 @@ services and operations) and 5 (Legion's own jail runtime, Linux images,
 IPv6, network volumes) are done; it is being hardened for real use.
 [PHASE.md](PHASE.md) tracks what is built and what is next.
 
+Sizes measured: the planner up to 200 nodes, 1,000 services and 5,000
+tasks (78 ms a pass); a node's pf up to 2,000 services (a service added
+then takes 4.2 s on each node); the WireGuard mesh to 24 nodes; the whole
+qualification on three nodes. [docs/MEASURE.md](docs/MEASURE.md) has the
+figures. Larger clusters are untested; if you run one, please open an
+issue saying how it goes.
+
 ## Install
 
 On FreeBSD 15, from a release tarball (amd64; or one made with
