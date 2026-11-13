@@ -177,11 +177,12 @@ file); the audit log with `legion audit`'s filters and a time window (the
 API leaves out the newest when more match than the limit); a node's
 taints added and removed over the version shown; a Service's load
 balancer address and vhid in its list; NetworkPolicies and image policies
-summarised in theirs. Not yet: which node holds each load balancer
-address (no node reports it; the lab test asks the nodes' interfaces), the
-NetworkPolicy matrix (what reaches what is decided in the agent,
-`legion-agent` `policing.rs`; it moves to `legion-api` first, so the
-console asks rather than decides again), and the lab test.
+summarised in theirs; the Network page, a namespace's matrix of what
+reaches what and on which ports, from `Cluster.Reach` (`legion reach`),
+which evaluates the same rules the nodes' guards do (`legion_api::policy`:
+`may_reach`, `may_send`, moved there from the agent). Not yet: which node
+holds each load balancer address (no node reports it; the lab test asks
+the nodes' interfaces), and the lab test.
 
 ## Phase 4: observability
 
