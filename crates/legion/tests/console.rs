@@ -1,4 +1,4 @@
-//! The web console on three nodes (CONSOLE.md, phases 1 to 4), in a real
+//! The web console on three nodes (CONSOLE.md, phases 1 to 5), in a real
 //! browser: a headless Chromium signs in as a user who may only look, a
 //! user who may change a namespace and the cluster admin, and does through
 //! the console's pages what each phase's "done when" asks.
@@ -15,6 +15,9 @@
 //! - Phase 4: a crash-looping task and a node going down each raise an
 //!   alert in the open console within 30 s, leading to the cause; a lost
 //!   Volume raises its own; a service's logs are searched across its tasks.
+//! - Phase 5: the editor deploys from an image with the form, saves a
+//!   compose file as a template and deploys it from the catalog with its
+//!   variable set, and sees both healthy in the topology.
 //!
 //! It drives real daemons, so it is ignored by default and run on the lab
 //! of `tests/common` (see there), as root, with `LEGION_BROWSER` naming
@@ -470,7 +473,76 @@ spec:
     });
     assert!(!a.text().contains("Not searched"), "{}", a.text());
 
+    // --- Phase 5 -------------------------------------------------------
+    step("phase 5: the editor deploys from an image with the form, its YAML shown first");
+    let mut e = c.sign_in("ed-5", &ed);
+    c.page(&mut e, "/deploy");
+    e.fill("Name", "formed");
+    e.fill("Namespace", "team-a");
+    e.fill("Image", IMAGE);
+    e.fill("Command", "/bin/sh\n-c\nwhile :; do echo formed; sleep 1; done");
+    e.fill("Container port", "8080");
+    e.fill("Memory", "64Mi");
+    e.until("the YAML written", 30, |b| {
+        let t = b.text();
+        t.contains("kind: Service") && t.contains("memory: 64Mi") && t.contains("containerPort: 8080")
+    });
+    e.click("Show changes");
+    e.shows("Service/team-a/formed: would be created", 30);
+    e.click("Deploy");
+    e.shows("Service/team-a/formed: created, version", 30);
+    wait("formed's task ready", 300, || {
+        c.get("service", "team-a", "formed")["status"]["ready"] == 1
+    });
+
+    step("phase 5: a compose file saved as a template, deployed from the catalog with its variable set");
+    c.page(&mut e, "/import");
+    e.fill("Stack", "draft");
+    e.fill(
+        "Compose file",
+        "# Sleeps.\nservices:\n  sleeper:\n    image: \"${IMAGE:-localhost/none:1}\"\n    command: [/bin/sleep, \"86400\"]\n",
+    );
+    e.shows("Variable IMAGE", 30);
+    e.fill("Template name", "sleeper");
+    e.fill("Template namespace", "team-a");
+    e.click("Save");
+    e.shows("Saved as Config team-a/sleeper.", 30);
+    c.page(&mut e, "/templates");
+    e.shows("saved in team-a", 30);
+    assert!(e.text().contains("counter"), "the examples are in the catalog");
+    e.eval("document.querySelector('[aria-label=\"Use sleeper\"]').click()");
+    e.until("the template opened", 30, |b| {
+        b.eval("H.field('Stack')?.value ?? ''") == serde_json::json!("sleeper")
+    });
+    e.fill("Namespace", "team-a");
+    e.fill("Variable IMAGE", IMAGE);
+    e.until("the objects with the image given", 30, |b| {
+        let t = b.text();
+        t.contains(IMAGE) && t.contains("legion.stack: sleeper")
+    });
+    e.click("Deploy");
+    e.shows("Service/team-a/sleeper", 30);
+    wait("sleeper's task ready", 300, || {
+        c.get("service", "team-a", "sleeper")["status"]["ready"] == 1
+    });
+
+    step("phase 5: the topology shows them, healthy, with keeper's Volume");
+    c.page(&mut e, "/topology");
+    e.until("every service green and keeper's Volume", 60, |b| {
+        b.eval(
+            "['formed', 'sleeper', 'hello'].every((s) =>
+               document.querySelector(`[aria-label=\"Service ${s}\"] rect`)?.classList.contains('good'))
+             && !!document.querySelector('[aria-label^=\"Volume \"]')",
+        ) == serde_json::json!(true)
+    });
+    for s in ["formed", "sleeper"] {
+        c.lab.ok(&["delete", "service", s, "-n", "team-a"]);
+    }
+    drop(e);
+
     step("phases 3 and 4: n2 lost, alerted within 30 s, removed from the console; its Volume lost");
+    // Watched where an operator would: the alerts page, open before n2 goes.
+    c.page(&mut a, "/alerts");
     let out = c.lab.ssh(&c.lab.vms[0], &format!("{STOP}\ntrue\n"));
     assert!(out.status.success(), "stopping n2: {}", text(&out.stderr));
     let stopped = Instant::now();

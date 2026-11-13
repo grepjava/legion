@@ -873,3 +873,157 @@ async fn the_console_runs_the_cluster_for_an_admin() {
     let _ = f.stop.send(());
     f.task.await.unwrap();
 }
+
+/// Compose import and templates (CONSOLE.md phase 5): a compose file as the
+/// objects `legion stack deploy` would apply, nothing written, with its
+/// variables and the namespace first when missing; the examples and the
+/// user's saved templates to start from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_console_converts_compose_files_and_lists_templates() {
+    let f = start().await;
+    let mut objects = ObjectsClient::new(f.admin.clone());
+    for (kind, ns, name, spec) in [
+        ("Namespace", "", "shop", serde_json::json!({})),
+        (
+            "RoleBinding",
+            "shop",
+            "alice",
+            serde_json::json!({ "user": "alice", "role": "edit" }),
+        ),
+        ("Config", "shop", "plain", serde_json::json!({ "text": "services: {}" })),
+    ] {
+        objects.apply(object(kind, ns, name, spec)).await.unwrap();
+    }
+    objects
+        .apply(ApplyRequest {
+            object: Some(Object {
+                kind: "Config".into(),
+                namespace: "shop".into(),
+                name: "mine".into(),
+                labels: [("legion.template".to_owned(), "compose".to_owned())].into(),
+                spec_json: serde_json::json!({
+                    "text": "# My shop.\n# More.\n\nservices: { a: { image: a } }\n"
+                })
+                .to_string()
+                .into_bytes(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let console = f.console_addr.to_string();
+    let origin = format!("https://{console}");
+    let (alice, token) = sign_in(&f, "alice").await;
+    let (root, root_token) = sign_in_as(&f, "root", Role::Admin).await;
+    let post_as = |who: &str, body: serde_json::Value| {
+        let (session, token) = if who == "root" {
+            (&root, &root_token)
+        } else {
+            (&alice, &token)
+        };
+        let (ca, console, origin) = (&f.ca, &console, &origin);
+        async move {
+            request(
+                ca,
+                console,
+                true,
+                "POST",
+                "/api/compose",
+                Some(session),
+                Some(origin),
+                Some(body),
+                &[("x-legion-csrf", token)],
+            )
+            .await
+        }
+    };
+    let post = |body: serde_json::Value| post_as("alice", body);
+    let file = "services:\n  web:\n    image: \"web:${TAG:-1}\"\n    ports: [\"8080\"]\n";
+
+    let r = post(serde_json::json!({
+        "compose": file, "stack": "site", "namespace": "shop", "env": { "TAG": "2" },
+    }))
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let made = &r.body["objects"];
+    assert_eq!(made.as_array().unwrap().len(), 1, "{made}");
+    assert_eq!(made[0]["kind"], "Service");
+    assert_eq!(made[0]["metadata"]["namespace"], "shop");
+    assert_eq!(made[0]["metadata"]["labels"]["legion.stack"], "site");
+    assert_eq!(made[0]["spec"]["pod"]["containers"][0]["image"], "web:2");
+    assert_eq!(
+        r.body["variables"],
+        serde_json::json!([{ "name": "TAG", "default": "1", "required": false }])
+    );
+    // Nothing was written.
+    let none = objects
+        .get(legion_proto::v1::ObjectRef {
+            kind: "Service".into(),
+            namespace: "shop".into(),
+            name: "web".into(),
+        })
+        .await;
+    assert_eq!(none.unwrap_err().code(), tonic::Code::NotFound);
+
+    // Into a namespace there is not yet: it comes first, for the admin who
+    // may make it. A user who may not look at namespaces is not told, as
+    // with `legion stack deploy`: theirs is there.
+    let r = post(serde_json::json!({ "compose": file, "stack": "site2", "env": {} })).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["objects"][0]["kind"], "Service");
+    let r = post_as(
+        "root",
+        serde_json::json!({ "compose": file, "stack": "site2", "env": {} }),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["objects"][0]["kind"], "Namespace");
+    assert_eq!(r.body["objects"][0]["metadata"]["name"], "site2");
+    assert_eq!(r.body["objects"][1]["metadata"]["namespace"], "site2");
+    assert_eq!(r.body["objects"][1]["spec"]["pod"]["containers"][0]["image"], "web:1");
+
+    // A file it would read, or one that is wrong, says why.
+    let r = post(serde_json::json!({
+        "compose": "services: { a: { image: a } }\nconfigs: { c: { file: ./c.conf } }\n",
+        "stack": "site", "namespace": "shop", "env": {},
+    }))
+    .await;
+    assert_eq!(r.status, 400, "{}", r.text);
+    assert!(r.text.contains("reads no files"), "{}", r.text);
+
+    let r = https(&f.ca, &console, "GET", "/api/templates", Some(&alice), None, None).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let listed: Vec<(String, String, String)> = r.body["templates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            (
+                t["namespace"].as_str().unwrap().to_owned(),
+                t["name"].as_str().unwrap().to_owned(),
+                t["about"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(listed.len(), 3, "{listed:?}");
+    assert_eq!(listed[0].0, "");
+    assert_eq!(listed[0].1, "counter");
+    assert!(listed[0].2.starts_with("A hit counter"), "{listed:?}");
+    assert_eq!(listed[1].1, "static-site");
+    assert_eq!(
+        listed[2],
+        ("shop".into(), "mine".into(), "My shop. More.".into())
+    );
+    // Each example converts as it is.
+    for t in r.body["templates"].as_array().unwrap() {
+        let c = post(serde_json::json!({
+            "compose": t["compose"], "stack": t["name"], "namespace": "shop", "env": {},
+        }))
+        .await;
+        assert_eq!(c.status, 200, "{}: {}", t["name"], c.text);
+    }
+
+    let _ = f.stop.send(());
+    f.task.await.unwrap();
+}
