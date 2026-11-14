@@ -392,6 +392,20 @@ not yet checked by a tool or a screen reader):
 - *Still to do.* An automated check (axe) on every page in the lab's
   browser test, a screen reader pass, and the charts' values as a table.
 
+**Translations** (the mechanism; no language but English yet). The console
+is written in English and every string a person reads goes through `t()`,
+or `tn()` where it counts (`lib/i18n.svelte.ts`). A language is one file,
+`lib/locales/<code>.json`, mapping each English string to its translation,
+with a form per plural category for counts; it is picked up when the
+console is built, and a string it lacks stays English. The browser's
+languages choose one, and a menu in the side bar, shown once there is a
+second language, changes it for that browser. `npm run messages` writes
+every string to `messages.json` for translators; `npm run check` fails if
+that file is stale or a string is built where the script cannot read it.
+Strings are whole sentences with `{name}` for what changes, so a
+translation orders words its own way. Names from the API (kinds, fields,
+the states it reports) and what users typed stay as they are.
+
 ## Out of scope
 
 - Anything the API does not offer. A console-only feature would be a
