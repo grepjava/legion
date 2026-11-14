@@ -181,6 +181,7 @@ fn router(gateway: Gateway) -> axum::Router {
         .route("/api/log-search", get(log_search))
         .route("/api/reach", get(reach))
         .route("/api/logs/{namespace}/{task}", get(logs))
+        .route("/api/build-logs/{namespace}/{name}", get(build_logs))
         // Writes (CONSOLE.md phases 2 and 3): each from the console's own
         // page with the session's token, as the user.
         .route("/api/manifest/{kind}/{namespace}/{name}", get(manifest))
@@ -1161,6 +1162,63 @@ async fn relay_logs(
             Err(s) => serde_json::json!({ "error": s.message() }),
         };
         let end = text.get("out").is_none() && text.get("err").is_none();
+        if socket
+            .send(Message::Text(text.to_string().into()))
+            .await
+            .is_err()
+            || end
+        {
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct BuildLogsQuery {
+    #[serde(default)]
+    follow: bool,
+}
+
+/// A Build's log (CONSOLE.md phase 5), as `legion build-logs` prints it,
+/// as the same messages as a task's: `{out}`, then `{end: true}`.
+async fn build_logs(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(q): Query<BuildLogsQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, Refused> {
+    same_origin(&headers, &uri)?;
+    let (_, channel) = g.user(&headers).await?;
+    let stream = ClusterClient::new(channel)
+        .build_logs(pb::BuildLogsRequest {
+            namespace,
+            name,
+            follow: q.follow,
+        })
+        .await?
+        .into_inner();
+    Ok(ws.on_upgrade(move |socket| relay_build_log(socket, stream)))
+}
+
+async fn relay_build_log(mut socket: WebSocket, mut stream: tonic::Streaming<pb::BuildLogsChunk>) {
+    let mut pending = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            c = stream.message() => c,
+            m = socket.recv() => match m {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                _ => continue,
+            },
+        };
+        let text = match chunk {
+            Ok(Some(c)) => serde_json::json!({ "out": text_of(&mut pending, c.data) }),
+            Ok(None) => serde_json::json!({ "end": true }),
+            Err(s) => serde_json::json!({ "error": s.message() }),
+        };
+        let end = text.get("out").is_none();
         if socket
             .send(Message::Text(text.to_string().into()))
             .await
