@@ -919,6 +919,52 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 print_table(["FROM", "TO", "PORTS"], &rows);
             }
         }
+        Command::LoadBalancers { namespace } => {
+            let namespace = namespace.unwrap_or_else(|| "default".into());
+            let r = cluster
+                .load_balancers(pb::LoadBalancersRequest {
+                    namespace: namespace.clone(),
+                })
+                .await?
+                .into_inner();
+            let rows: Vec<[String; 5]> = r
+                .balancers
+                .iter()
+                .map(|b| {
+                    let held: Vec<&str> = b
+                        .nodes
+                        .iter()
+                        .filter(|n| n.state == "master")
+                        .map(|n| n.node.as_str())
+                        .collect();
+                    let nodes = b
+                        .nodes
+                        .iter()
+                        .map(|n| {
+                            let state = if n.state.is_empty() { "?" } else { &n.state };
+                            format!("{}({state})", n.node)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    [
+                        b.service.clone(),
+                        b.address.clone(),
+                        b.vhid.to_string(),
+                        if held.is_empty() {
+                            "-".to_owned()
+                        } else {
+                            held.join(",")
+                        },
+                        nodes,
+                    ]
+                })
+                .collect();
+            if rows.is_empty() {
+                println!("{namespace} has no load balancer addresses");
+            } else {
+                print_table(["SERVICE", "ADDRESS", "VHID", "HELD BY", "NODES"], &rows);
+            }
+        }
         Command::Alerts {
             namespace,
             watch,

@@ -180,6 +180,7 @@ fn router(gateway: Gateway) -> axum::Router {
         .route("/api/quotas", get(quotas))
         .route("/api/log-search", get(log_search))
         .route("/api/reach", get(reach))
+        .route("/api/load-balancers", get(load_balancers))
         .route("/api/logs/{namespace}/{task}", get(logs))
         .route("/api/build-logs/{namespace}/{name}", get(build_logs))
         // Writes (CONSOLE.md phases 2 and 3): each from the console's own
@@ -1085,6 +1086,38 @@ async fn reach(
         })
         .collect();
     Ok(Json(serde_json::json!({ "services": r.services, "edges": edges })).into_response())
+}
+
+/// `legion load-balancers`: a namespace's load balancer addresses and
+/// which node holds each, `{balancers: [{service, address, vhid, nodes:
+/// [{node, skew, state}]}]}`, nodes by skew.
+async fn load_balancers(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Query(scope): Query<Scope>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let r = ClusterClient::new(channel)
+        .load_balancers(pb::LoadBalancersRequest {
+            namespace: scope.namespace.unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+    let balancers: Vec<_> = r
+        .balancers
+        .iter()
+        .map(|b| {
+            let nodes: Vec<_> = b
+                .nodes
+                .iter()
+                .map(|n| serde_json::json!({ "node": n.node, "skew": n.skew, "state": n.state }))
+                .collect();
+            serde_json::json!({
+                "service": b.service, "address": b.address, "vhid": b.vhid, "nodes": nodes,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "balancers": balancers })).into_response())
 }
 
 #[derive(Deserialize)]

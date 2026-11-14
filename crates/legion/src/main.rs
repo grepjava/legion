@@ -456,6 +456,14 @@ enum Command {
         #[arg(short, long)]
         namespace: Option<String>,
     },
+    /// A namespace's load balancer addresses and which node holds each:
+    /// the nodes that may, by CARP skew (the lowest meant to be master),
+    /// each with the CARP state it last reported.
+    #[command(name = "load-balancers", alias = "lb")]
+    LoadBalancers {
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
     /// What to act on now: crash-looping tasks, nodes down or suspect,
     /// lost Volumes, the CA near expiry, Raft without a leader or quorum.
     /// Any manager answers, from what it holds, one cut off from the
