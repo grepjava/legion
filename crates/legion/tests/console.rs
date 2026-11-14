@@ -574,7 +574,7 @@ spec:
     c.page(&mut a, "/settings");
     // Typed only once the settings are read, which would replace it.
     a.until("the settings form, read", 30, |b| {
-        b.eval("H.field('Cluster name')?.disabled === false") == serde_json::json!(true)
+        b.eval("H.field('Cluster name')?.matches(':enabled') === true") == serde_json::json!(true)
     });
     a.fill("Cluster name", "lab");
     a.fill("Banner text", "The lab cluster");
