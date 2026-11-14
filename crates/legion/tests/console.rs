@@ -572,8 +572,9 @@ spec:
     // --- Phase 6 -------------------------------------------------------
     step("phase 6: the admin names the cluster and sets a banner on the settings page");
     c.page(&mut a, "/settings");
-    a.until("the settings form", 30, |b| {
-        b.eval("!!H.field('Cluster name')") == serde_json::json!(true)
+    // Typed only once the settings are read, which would replace it.
+    a.until("the settings form, read", 30, |b| {
+        b.eval("H.field('Cluster name')?.disabled === false") == serde_json::json!(true)
     });
     a.fill("Cluster name", "lab");
     a.fill("Banner text", "The lab cluster");
