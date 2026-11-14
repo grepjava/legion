@@ -82,6 +82,7 @@ test legion stateful postgres_is_restored_onto_replacement_hosts host cluster 36
 # clusters signed into with one identity provider (phase 6's "done when").
 test legion console the_console_runs_the_cluster host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_BROWSER env:LEGION_AXE
 test legion console the_console_spans_two_clusters_by_single_sign_on host cluster 1800 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_BROWSER
+test legion console the_console_builds_an_example_with_jailer host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_BROWSER env:LEGION_JAILER
 test legion teams two_teams_share_a_cluster host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
 test legion ca the_ca_rotates_with_every_node_on_it host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
 test legion roles a_worker_and_a_manager_change_roles_in_place host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
@@ -98,6 +99,7 @@ test legion handoff a_jailer_index_runs_each_nodes_platform host cluster 3600 en
 test legion examples the_examples_run_as_their_readmes_say host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_JAILER
 helper legion-net mesh serve
 helper legion handoff registry
+helper legion console registry
 helper legion-store cluster write_throughput
 # Measurements of Legion's own work on fake hosts (docs/MEASURE.md), taken
 # with --release wherever the tests build, not on the lab.

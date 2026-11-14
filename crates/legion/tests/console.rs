@@ -1001,3 +1001,161 @@ fn the_console_spans_two_clusters_by_single_sign_on() {
         eprintln!("alice's pages reported: {:?}", b.errors);
     }
 }
+
+/// The registry [`the_console_builds_an_example_with_jailer`] runs
+/// (`common::registry`).
+#[test]
+#[ignore = "the registry of the_console_builds_an_example_with_jailer, run by it"]
+fn registry() {
+    common::registry::run();
+}
+
+/// Phase 5's "done when", for builds: a user who has never used the CLI
+/// deploys an example from the catalog, builds a new image for it with
+/// jailer from the console, and sees the build's log and the rollout. One
+/// node, the host, labelled a builder, with jailer (`LEGION_JAILER`) and a
+/// registry this test runs; the example is static-site, nginx from
+/// FreeBSD's packages, its image not yet built, then built from its
+/// Containerfile pasted in the console.
+#[test]
+#[ignore = "needs root, ZFS on FreeBSD, jailer, Chromium and FreeBSD's packages; see the module docs"]
+fn the_console_builds_an_example_with_jailer() {
+    use common::registry::Registry;
+    let mut lab = Lab::from_env();
+    let step = |what: &str| eprintln!("--- {what}");
+    let jailer = std::env::var("LEGION_JAILER").expect("set LEGION_JAILER to a jailer binary");
+    assert!(
+        std::path::Path::new(&jailer).is_file(),
+        "no jailer at {jailer}"
+    );
+    let listen = format!("{}:7480", lab.host);
+    let url = format!("https://{listen}");
+
+    step("one node, a builder with jailer, a registry, and a namespace for ed");
+    let registry = Registry::start(&lab);
+    let image = format!("{}/examples/nginx:1", registry.addr);
+    let state = lab.dir.join("jailer");
+    lab.flags = format!("{} --insecure-registry {}", lab.flags, registry.addr);
+    lab.start_host(&[
+        "--console-listen",
+        &listen,
+        "--jailer",
+        &jailer,
+        "--jailer-arg",
+        "--state-dir",
+        "--jailer-arg",
+        state.to_str().unwrap(),
+        "--jailer-arg",
+        "--no-zfs",
+    ]);
+    lab.ok(&["init"]);
+    lab.ok(&["node", "label", "n1", "legion.builder=true"]);
+    let ns = lab.dir.join("shop.yaml");
+    std::fs::write(
+        &ns,
+        "apiVersion: legion/v1\nkind: Namespace\nmetadata: { name: shop }\n",
+    )
+    .unwrap();
+    lab.ok(&["apply", "-f", ns.to_str().unwrap()]);
+    let ed = lab.dir.join("ed.pem");
+    lab.ok(&[
+        "user",
+        "create",
+        "ed",
+        "--role",
+        "edit",
+        "-n",
+        "shop",
+        "-o",
+        ed.to_str().unwrap(),
+    ]);
+    let c = Console { lab, url };
+    let mut e = c.sign_in("ed", &ed);
+
+    step("ed deploys static-site from the catalog, its image not built yet");
+    c.page(&mut e, "/templates");
+    e.until("the catalog", 30, |b| {
+        b.eval("!!document.querySelector('[aria-label=\"Use static-site\"]')")
+            == serde_json::json!(true)
+    });
+    e.eval("document.querySelector('[aria-label=\"Use static-site\"]').click()");
+    e.until("the template opened", 30, |b| {
+        b.eval("!!H.field('Variable IMAGE')") == serde_json::json!(true)
+    });
+    e.fill("Stack", "site");
+    e.fill("Namespace", "shop");
+    e.fill("Variable IMAGE", &image);
+    e.until("the objects with the image given", 30, |b| {
+        b.text().contains(&image)
+    });
+    e.click("Deploy");
+    e.shows("Service/shop/web", 30);
+
+    step("ed builds a new image for it from the console, its Containerfile pasted");
+    c.page(&mut e, "/k/Service/shop/web");
+    e.click("Build a new image");
+    e.until("the build form", 30, |b| {
+        b.eval("!!document.querySelector('input[type=radio][value=containerfile]')")
+            == serde_json::json!(true)
+    });
+    e.eval("document.querySelector('input[type=radio][value=containerfile]').click()");
+    e.fill(
+        "Containerfile",
+        include_str!("../../../examples/static-site/Containerfile"),
+    );
+    e.fill("Push to", &image);
+    e.click("Build");
+
+    step("the build's log, live, then the rollout");
+    e.until("the Build's page and its log", 60, |b| {
+        b.eval("location.pathname.startsWith('/k/Build/shop/web-')") == serde_json::json!(true)
+            && b.text().contains("$ ")
+    });
+    let build = e
+        .eval("location.pathname.split('/').pop()")
+        .as_str()
+        .unwrap()
+        .to_owned();
+    e.until("jailer's output in the log as it builds", 600, |b| {
+        b.text().contains("pkg install") || b.text().contains("STEP") || b.text().contains("RUN")
+    });
+    wait("the build to end", 1800, || {
+        let s = c.get("build", "shop", &build)["status"].clone();
+        let phase = s["phase"].as_str().unwrap_or_default().to_owned();
+        assert_ne!(phase, "Failed", "the build failed: {}", s["message"]);
+        phase == "Succeeded"
+    });
+    let pinned = c.get("build", "shop", &build)["status"]["pinned"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        pinned.starts_with(&format!("{}/examples/nginx@sha256:", registry.addr)),
+        "{pinned}"
+    );
+    c.page(&mut e, &format!("/k/Build/shop/{build}?tab=buildlog"));
+    e.shows("Succeeded", 30);
+    wait(
+        "web rolled out to the image built, both tasks ready",
+        600,
+        || {
+            let s = c.get("service", "shop", "web");
+            s["spec"]["pod"]["containers"][0]["image"] == pinned.as_str()
+                && s["status"]["ready"] == 2
+        },
+    );
+    c.page(&mut e, "/topology");
+    e.fill("Namespace", "shop");
+    e.click("Show");
+    e.until("web green in the topology", 60, |b| {
+        b.eval(
+            "document.querySelector('[aria-label^=\"Service web:\"] rect')?.classList.contains('good') ?? false",
+        ) == serde_json::json!(true)
+    });
+    let page = common::http_get(&c.lab.host, 30081).expect("the site answers");
+    assert!(page.contains("200"), "{page}");
+    if !e.errors.is_empty() {
+        eprintln!("ed's pages reported: {:?}", e.errors);
+    }
+    drop(registry);
+}

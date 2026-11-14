@@ -20,6 +20,7 @@
 pub mod browser;
 pub mod idp;
 pub mod jailer;
+pub mod registry;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
