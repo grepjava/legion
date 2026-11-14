@@ -1,4 +1,4 @@
-import type { Alert, ConsoleSettings, KindInfo, Me } from './api';
+import type { Alert, ConsoleSettings, KindInfo, Me, Plugin } from './api';
 import { t } from './i18n.svelte.ts';
 
 /** Who is signed in, the kinds there are, and the namespace being looked at. */
@@ -12,7 +12,9 @@ export const session = $state({
   /** Why the alerts could not be followed, if they could not. */
   alertsError: '',
   /** The console's settings: the banner alone until signed in. */
-  settings: {} as ConsoleSettings
+  settings: {} as ConsoleSettings,
+  /** Plugins' pages in the namespaces the user reads (CONSOLE.md phase 6). */
+  plugins: [] as Plugin[]
 });
 
 /** The namespaces the user has a role in; for the admin, those listed. */

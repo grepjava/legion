@@ -1,3 +1,0 @@
-import{$ as e,A as t,B as n,E as r,G as i,I as a,O as o,Q as s,W as c,X as l,_ as u,m as d,nt as f,p,tt as m,v as h}from"./g0IgH8yy.js";var g=t(`<span> </span>
-`,1),_=t(`<pre class="diff"></pre>`);function v(t,v){e(v,!0);let y=l(()=>v.text.split(`
-`).map(e=>({l:e,c:e.startsWith(`+++`)||e.startsWith(`---`)?`head`:e.startsWith(`+`)?`add`:e.startsWith(`-`)?`del`:e.startsWith(`@@`)?`hunk`:``})));var b=_();u(b,21,()=>a(y),h,(e,t)=>{let s=()=>a(t).l,l=()=>a(t).c;var u=g(),f=c(u),h=i(f,!0);m(),n(()=>{p(f,1,d(l())),r(h,s())}),o(e,u)}),f(b),o(t,b),s()}export{v as t};

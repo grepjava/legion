@@ -2,7 +2,7 @@
   import '../app.css';
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
-  import { api, consoleSettings, followAlerts, setToken, whenSignedOut } from '#lib/api.ts';
+  import { api, consoleSettings, followAlerts, plugins, setToken, whenSignedOut } from '#lib/api.ts';
   import { plural } from '#lib/kinds.ts';
   import { namespaces, session } from '#lib/session.svelte.ts';
   import { i18n, languageName, languages, setLanguage, t } from '#lib/i18n.svelte.ts';
@@ -27,6 +27,9 @@
         session.me = await api.me();
         setToken(session.me.csrf);
         session.kinds = await api.kinds();
+        plugins()
+          .then((p) => (session.plugins = p.plugins))
+          .catch(() => (session.plugins = []));
         if (session.me.all) {
           const ns = await api.list('Namespace');
           adminNamespaces = ns.objects.map((o) => o.metadata.name).sort();
@@ -110,6 +113,9 @@
     const [, k, kind, ns, name] = path.split('/').map(decodeURIComponent);
     const here =
       PAGES[path] ??
+      (k === 'plugins' && ns
+        ? t('{name} (plugin in {namespace})', { name: ns, namespace: kind })
+        : undefined) ??
       (k === 'k' && kind
         ? name
           ? ns && ns !== '_'
@@ -121,6 +127,9 @@
   });
 
   const choices = $derived(namespaces(adminNamespaces));
+  const shownPlugins = $derived(
+    session.plugins.filter((p) => !session.namespace || p.namespace === session.namespace)
+  );
   const nsKinds = $derived(session.kinds.filter((k) => !k.clusterScoped));
   const clusterKinds = $derived(
     session.me?.all ? session.kinds.filter((k) => k.clusterScoped) : []
@@ -170,6 +179,15 @@
           {#each session.settings.clusters as c, i (i)}
             <a href={there(c.url)} title={t('This page on {name}, signed into on its own', { name: c.name })}
               >{c.name}</a
+            >
+          {/each}
+        {/if}
+        {#if shownPlugins.length}
+          <h2>{t('Plugins')}</h2>
+          {#each shownPlugins as p (`${p.namespace}/${p.name}`)}
+            {@const href = `/plugins/${p.namespace}/${p.name}`}
+            <a {href} class:here={page.url.pathname === href} aria-current={at(page.url.pathname === href)}
+              >{p.name}{#if !session.namespace}<span class="muted"> ({p.namespace})</span>{/if}</a
             >
           {/each}
         {/if}

@@ -598,3 +598,14 @@ export async function meIn(peer: Peer): Promise<Me | 'signed-out' | string> {
     return t('no answer it lets this console read; it may not list this cluster');
   }
 }
+
+/** A plugin's page (CONSOLE.md phase 6): a Config so labelled. */
+export interface Plugin {
+  namespace: string;
+  name: string;
+}
+
+/** The plugins in the namespaces the user may read. */
+export function plugins(): Promise<{ plugins: Plugin[] }> {
+  return call('GET', '/api/plugins');
+}
