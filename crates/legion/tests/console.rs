@@ -1049,6 +1049,7 @@ fn the_console_builds_an_example_with_jailer() {
         "--no-zfs",
     ]);
     lab.ok(&["init"]);
+    wait("n1 ready", 120, || lab.node_state("n1") == "ready");
     lab.ok(&["node", "label", "n1", "legion.builder=true"]);
     let ns = lab.dir.join("shop.yaml");
     std::fs::write(
