@@ -25,8 +25,11 @@ export interface Me {
   role: 'admin' | 'user';
   all: boolean;
   namespaces: Record<string, string>;
-  /** The token every write carries (DESIGN.md §3.9). */
+  /** The token every write carries (DESIGN.md §3.9); not sent to
+   * another cluster's page. */
   csrf: string;
+  /** This cluster's name, as its console settings give it. */
+  cluster?: string;
 }
 
 export interface KindInfo {
@@ -553,9 +556,19 @@ export function templates(): Promise<{ templates: Template[] }> {
 
 /** The console's settings (`legion console settings`): before signing in,
  * the banner alone. */
+/** Another cluster's console. */
+export interface Peer {
+  name: string;
+  url: string;
+}
+
 export interface ConsoleSettings {
+  /** This cluster's name. */
+  name?: string;
   banner?: { text: string; level?: 'info' | 'warning' | 'danger' };
   links?: { label: string; url: string }[];
+  /** The other clusters' consoles. */
+  clusters?: Peer[];
   defaultNamespace?: string;
   /** Such as `8h`. */
   session?: string;
@@ -570,4 +583,17 @@ export function consoleSettings(): Promise<ConsoleSettings> {
 /** `legion console configure`: the cluster admin only. */
 export function setConsoleSettings(s: ConsoleSettings): Promise<ConsoleSettings> {
   return call('POST', '/api/console-settings', s);
+}
+
+/** Who the user is in another cluster, asked of its console, which answers
+ * only if it lists this one back: signed in there, not, or no answer. */
+export async function meIn(peer: Peer): Promise<Me | 'signed-out' | string> {
+  try {
+    const res = await fetch(new URL('/api/me', peer.url), { credentials: 'include' });
+    if (res.status === 401) return 'signed-out';
+    if (!res.ok) return `it answered ${res.status}`;
+    return (await res.json()) as Me;
+  } catch {
+    return 'no answer it lets this console read; it may not list this cluster';
+  }
 }

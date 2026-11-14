@@ -75,6 +75,15 @@
       .catch(() => {});
   });
 
+  /** The same page on another cluster's console. */
+  function there(url: string): string {
+    try {
+      return new URL(page.url.pathname + page.url.search, new URL(url).origin).href;
+    } catch {
+      return url;
+    }
+  }
+
   const choices = $derived(namespaces(adminNamespaces));
   const nsKinds = $derived(session.kinds.filter((k) => !k.clusterScoped));
   const clusterKinds = $derived(
@@ -82,6 +91,9 @@
   );
 </script>
 
+<svelte:head>
+  <title>{session.settings.name ? `${session.settings.name} · Legion` : 'Legion'}</title>
+</svelte:head>
 {#if session.settings.banner}
   <div class="banner {session.settings.banner.level ?? 'info'}" role="note">{session.settings.banner.text}</div>
 {/if}
@@ -90,7 +102,10 @@
 {:else if session.me}
   <div class="shell">
     <aside>
-      <a class="brand" href="/">Legion</a>
+      <a class="brand" href="/"
+        >Legion{#if session.settings.name}<span class="cluster">{session.settings.name}</span
+          >{/if}</a
+      >
       <label class="ns">
         Namespace
         <select bind:value={session.namespace}>
@@ -112,6 +127,15 @@
         <a href="/apply" class:here={page.url.pathname === '/apply'}>Apply YAML</a>
         <a href="/topology" class:here={page.url.pathname === '/topology'}>Topology</a>
         <a href="/network" class:here={page.url.pathname === '/network'}>Network</a>
+        {#if session.settings.clusters?.length}
+          <h2>Clusters</h2>
+          <a href="/clusters" class:here={page.url.pathname === '/clusters'}>All clusters</a>
+          {#each session.settings.clusters as c, i (i)}
+            <a href={there(c.url)} title="This page on {c.name}, signed into on its own"
+              >{c.name}</a
+            >
+          {/each}
+        {/if}
         {#if session.settings.links?.length}
           <h2>Links</h2>
           {#each session.settings.links as l, i (i)}

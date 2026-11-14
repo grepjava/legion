@@ -86,6 +86,12 @@ aside {
   font-size: 1.2rem;
   color: var(--text);
 }
+.brand .cluster {
+  display: block;
+  font-weight: 400;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
 .ns {
   display: flex;
   flex-direction: column;
