@@ -940,6 +940,20 @@ fn the_console_spans_two_clusters_by_single_sign_on() {
             .is_some_and(|t| t.contains("Sign in"))
     });
 
+    // West still reaches the provider through the tunnel.
+    let out = lab.ssh(
+        &lab.vms[0],
+        &format!(
+            "fetch -T 10 -qo - {}/.well-known/openid-configuration",
+            idp.issuer
+        ),
+    );
+    assert!(
+        out.status.success(),
+        "west reaches the provider: {}",
+        text(&out.stderr)
+    );
+
     step("alice signs in to west with one click: the provider remembers her");
     b.goto(&format!("{west_url}/login"));
     b.click("Sign in with Lab ID");

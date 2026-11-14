@@ -4,7 +4,7 @@
 //! a token endpoint that checks the code, the client and PKCE. Users are
 //! `<name>@example.com`, in the groups given; ID tokens are ES256.
 //!
-//! Plain HTTP on loopback, one thread, enough for one browser and the
+//! Plain HTTP on loopback, a thread a connection, enough for one browser and the
 //! managers that exchange its codes.
 
 use std::collections::HashMap;
@@ -68,11 +68,18 @@ impl Idp {
                 .collect(),
             state: state.clone(),
         };
+        // A thread a connection: a browser opens some it sends nothing on,
+        // which must not hold up the managers' requests.
+        let serve = Arc::new(serve);
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                if let Err(e) = serve.answer(stream) {
-                    eprintln!("the provider: {e}");
-                }
+                let serve = serve.clone();
+                std::thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+                    if let Err(e) = serve.answer(stream) {
+                        eprintln!("the provider: {e}");
+                    }
+                });
             }
         });
         Idp { issuer, state }
