@@ -142,6 +142,10 @@ export const api = {
     }),
   rollback: (namespace: string, service: string) =>
     call<{ message: string }>('POST', '/api/rollback', { namespace, service }),
+  restart: (namespace: string, service: string) =>
+    call<{ message: string }>('POST', '/api/restart', { namespace, service }),
+  runNow: (namespace: string, cronJob: string) =>
+    call<{ message: string }>('POST', '/api/run-now', { namespace, cronJob }),
   nodeRole: (node: string, role: 'manager' | 'worker') =>
     call<void>('POST', '/api/node-role', { node, role }),
 

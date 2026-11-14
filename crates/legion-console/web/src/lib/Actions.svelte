@@ -1,7 +1,7 @@
 <script lang="ts">
   // What a user can do to an object, as the CLI does it: edit, delete, and
-  // each kind's own actions (scale and roll back a Service, suspend a
-  // CronJob, drain or promote a Node, move a Volume). For a user who may
+  // each kind's own actions (scale, restart and roll back a Service; run
+  // a CronJob now or suspend it; drain or promote a Node, move a Volume). For a user who may
   // only look, the buttons are there, disabled, with the reason.
   import { goto } from '$app/navigation';
   import { api, type LObject } from './api.ts';
@@ -129,7 +129,19 @@
         confirm(t('Roll {name} back to the spec before its latest update?', { name })) &&
         act(async () => (await api.rollback(ns, name)).message)}>{t('Roll back')}</button
     >
+    <button
+      disabled={!!why || busy}
+      title={why ?? t('New tasks on the same spec, replacing these as an update does')}
+      onclick={() =>
+        confirm(t('Restart {name}? Its tasks are replaced, as an update replaces them.', { name })) &&
+        act(async () => (await api.restart(ns, name)).message)}>{t('Restart')}</button
+    >
   {:else if kind === 'CronJob'}
+    <button
+      disabled={!!why || busy}
+      title={why ?? t('A run now, outside its schedule')}
+      onclick={() => act(async () => (await api.runNow(ns, name)).message)}>{t('Run now')}</button
+    >
     <button
       disabled={!!why || busy}
       title={why ?? ''}
