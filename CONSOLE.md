@@ -368,6 +368,39 @@ knowing each other:
   clusters on one host would receive each other's, so each needs its own
   host name.
 
+The console's own pages name the listed consoles in their
+`Content-Security-Policy` (`connect-src`), so the Clusters page may ask
+them; no other address.
+
+**Plugins** (built; tested over the gateway,
+`the_console_serves_plugins_fenced_in`). A plugin is a page for something
+Legion does not
+know about, shown inside the console: a Config holding one self-contained
+HTML page (scripts and styles inline; 500 KiB, a Config's limit), labelled
+`legion.console-plugin: page`. Its name is the menu's.
+
+- *Where it shows.* The side bar lists the plugins in the namespaces the
+  user may read; each opens at `/plugins/<namespace>/<name>`. Who may add
+  one is who may write Configs in that namespace; nothing new to grant.
+- *Fenced in.* The page is served by the gateway (`/api/plugin/…`, read as
+  the user) with a policy of its own: `sandbox allow-scripts`, so it runs
+  in an origin of its own, with no cookie, no session and none of the
+  console's storage; `connect-src 'none'`, so its scripts reach no
+  address; framed only by the console, in an `iframe` sandboxed the same
+  way.
+- *What it may read.* It asks the console in messages (`postMessage`):
+  list a kind, get an object, who the user is. The console answers as the
+  user, for the plugin's own namespace alone, and reads only: no writes,
+  no cluster-wide kinds. A plugin is written by someone who may write in
+  that namespace, so it learns nothing they could not read already, from
+  any user who opens it; it acts for no one.
+- *The messages.* The console first sends `{legion: 1, op: "hello",
+  namespace, language}`. The plugin asks `{legion: 1, id, op: "list",
+  kind}`, `{…, op: "get", kind, name}` or `{…, op: "me"}`, and the answer
+  is `{legion: 1, id, ok: true, result}` or `{…, ok: false, error}`.
+- *An example*, `examples/console-plugin.yaml`: a page of the namespace's
+  Services and their ready tasks.
+
 **Accessibility** (a first pass against WCAG 2.2 AA, by reading the code;
 not yet checked by a tool or a screen reader):
 
