@@ -14,6 +14,7 @@ mod api;
 mod audit;
 mod authz;
 pub mod autolock;
+mod build;
 pub mod ca;
 pub mod console;
 mod gateway;
@@ -397,8 +398,16 @@ impl Manager {
             speaking: self.speaking.clone(),
             ca_seen: Default::default(),
             alerts: Default::default(),
+            builds: Default::default(),
         };
         let names = tokio::spawn(managers::run(api.clone(), api.closing.clone()));
+        let builds = self.controllers.then(|| {
+            tokio::spawn(build::run(
+                api.clone(),
+                self.insecure_registries.clone(),
+                api.closing.clone(),
+            ))
+        });
         let alerting = tokio::spawn(alerts::track(
             api.store.clone(),
             api.alerts.clone(),
@@ -506,6 +515,9 @@ impl Manager {
         }
         if let Some(acme) = acme {
             let _ = acme.await;
+        }
+        if let Some(builds) = builds {
+            let _ = builds.await;
         }
         if let Some(migrator) = migrator {
             let _ = migrator.await;

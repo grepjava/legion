@@ -213,6 +213,11 @@ impl Pods for PodsService {
                     "a volume's data is backed up and restored with `legion volume backup` and `restore`",
                 ));
             }
+            Some(Action::Build(_)) => {
+                return Err(Status::invalid_argument(
+                    "images are built by applying a Build, which the managers run",
+                ));
+            }
             None => return Err(Status::invalid_argument("the session needs an action")),
         };
         let action = match open.action {

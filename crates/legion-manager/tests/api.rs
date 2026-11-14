@@ -5668,3 +5668,297 @@ async fn the_console_settings_are_the_admins() {
     follower.stop().await;
     first.stop().await;
 }
+
+/// Builds (CONSOLE.md phase 5): a Build waits for a builder node, then the
+/// leader offers that node's agent the build, with the registry's login
+/// from the Secret named; the output it sends is the Build's log, followed
+/// as written; what it pushed is the Build's status, and the Service named
+/// runs the image pinned to it. A build the node fails says why. No user
+/// may open a build session themselves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_build_runs_on_a_builder_node_and_rolls_out() {
+    use legion_proto::v1::{BuildLogsRequest, BuildResult, SessionError, SessionsRequest};
+    let ca = Ca::generate().unwrap();
+    let m = Running::start_with(Some(&ca)).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let mut admin = m.objects().await;
+    let login = br#"{"auths":{"r.example":{"auth":"dTpw"}}}"#;
+    let encoded = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(login)
+    };
+    for req in [
+        object("Namespace", "", "shop", serde_json::json!({})),
+        binding("shop", "alice", "edit"),
+        object(
+            "Secret",
+            "shop",
+            "registry",
+            serde_json::json!({ "data": encoded }),
+        ),
+        object(
+            "Service",
+            "shop",
+            "web",
+            serde_json::json!({
+                "replicas": 1,
+                "pod": { "containers": [{ "name": "app", "image": "r.example/shop/web:1" }] },
+            }),
+        ),
+        object(
+            "Build",
+            "shop",
+            "web-2",
+            serde_json::json!({
+                "source": { "containerfile": "FROM r.example/base:1\n" },
+                "image": "r.example/shop/web:2",
+                "pushSecret": "registry",
+                "rollout": { "service": "web" },
+            }),
+        ),
+    ] {
+        admin.apply(req).await.unwrap();
+    }
+    let build_status = |name: &str| {
+        let store = m.store.clone();
+        let key = legion_api::ObjectKey::new(legion_api::Kind::Build, "shop", name);
+        move || {
+            store
+                .get(&key)
+                .unwrap()
+                .map(|o| o.status)
+                .unwrap_or_default()
+        }
+    };
+
+    // No builder yet: it waits, saying so.
+    let web2 = build_status("web-2");
+    until_within(
+        "the build waits for a builder",
+        Duration::from_secs(20),
+        || {
+            web2()["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("none is labelled legion.builder=true"))
+        },
+    )
+    .await;
+
+    // w1, ready and labelled a builder, takes it.
+    let w1 = DispatcherClient::new(
+        m.channel(Some(&creds(&ca, "w1", Role::Worker)))
+            .await
+            .unwrap(),
+    );
+    eventually(|| {
+        let mut d = w1.clone();
+        async move {
+            d.register(RegisterRequest {
+                node: String::new(),
+                status_json: br#"{"state":"ready"}"#.to_vec(),
+                role: String::new(),
+            })
+            .await
+        }
+    })
+    .await;
+    let beating = {
+        let mut d = w1.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = d
+                    .heartbeat(HeartbeatRequest {
+                        node: String::new(),
+                        usage: Vec::new(),
+                    })
+                    .await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+    };
+    let mut offers = w1
+        .clone()
+        .sessions(SessionsRequest {
+            node: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let node_key = legion_api::ObjectKey::new(legion_api::Kind::Node, "", "w1");
+    let mut node = m.store.get(&node_key).unwrap().expect("w1 registered");
+    node.metadata
+        .labels
+        .insert("legion.builder".into(), "true".into());
+    m.store
+        .raft
+        .client_write(legion_store::Command::Put {
+            object: node,
+            precondition: legion_store::Precondition::None,
+        })
+        .await
+        .unwrap();
+
+    let offer = tokio::time::timeout(Duration::from_secs(20), offers.message())
+        .await
+        .expect("the build offered to w1")
+        .unwrap()
+        .expect("an offer");
+    let open = offer.open.clone().unwrap();
+    let Some(Action::Build(opts)) = open.action else {
+        panic!("not a build: {open:?}");
+    };
+    assert_eq!(open.namespace, "shop");
+    assert_eq!(opts.containerfile, "FROM r.example/base:1\n");
+    assert_eq!(opts.image, "r.example/shop/web:2");
+    assert_eq!(opts.auth, login.to_vec(), "the Secret's login, as stored");
+    assert_eq!(web2()["phase"], "Running");
+    assert_eq!(web2()["node"], "w1");
+
+    // alice follows its log as w1 builds.
+    let (to_manager, from_worker) = tokio::sync::mpsc::channel::<SessionFrame>(8);
+    let send = |f: Frame| {
+        let to_manager = to_manager.clone();
+        async move {
+            to_manager
+                .send(SessionFrame { frame: Some(f) })
+                .await
+                .unwrap()
+        }
+    };
+    send(Frame::Attach(offer.id)).await;
+    let _attached = w1
+        .clone()
+        .attach(tokio_stream::wrappers::ReceiverStream::new(from_worker))
+        .await
+        .unwrap()
+        .into_inner();
+    send(Frame::Stdout(b"STEP 1/1: FROM r.example/base:1\n".to_vec())).await;
+    let alice = ClusterClient::new(
+        m.channel(Some(&creds(&ca, "alice", Role::User)))
+            .await
+            .unwrap(),
+    );
+    let mut log = alice
+        .clone()
+        .build_logs(BuildLogsRequest {
+            namespace: "shop".into(),
+            name: "web-2".into(),
+            follow: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let first = tokio::time::timeout(Duration::from_secs(10), log.message())
+        .await
+        .expect("the log so far")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.data, b"STEP 1/1: FROM r.example/base:1\n");
+    send(Frame::Stderr(b"pushing\n".to_vec())).await;
+    let pinned = "r.example/shop/web@sha256:abcd";
+    send(Frame::Built(BuildResult {
+        digest: "sha256:abcd".into(),
+        pinned: pinned.into(),
+    }))
+    .await;
+    send(Frame::ExitCode(0)).await;
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(c) = log.message().await.unwrap() {
+            rest.extend(c.data);
+        }
+    })
+    .await
+    .expect("the followed log ends with the build");
+    assert_eq!(rest, b"pushing\n");
+
+    // Succeeded, its log kept, the Service on the pinned image.
+    until_within("the build succeeded", Duration::from_secs(10), || {
+        web2()["phase"] == "Succeeded"
+    })
+    .await;
+    let s = web2();
+    assert_eq!(s["digest"], "sha256:abcd");
+    assert_eq!(s["pinned"], pinned);
+    assert_eq!(s["log"], "STEP 1/1: FROM r.example/base:1\npushing\n");
+    let web = m
+        .store
+        .get(&legion_api::ObjectKey::new(
+            legion_api::Kind::Service,
+            "shop",
+            "web",
+        ))
+        .unwrap()
+        .unwrap();
+    assert_eq!(web.spec["pod"]["containers"][0]["image"], pinned);
+
+    // A build the node fails says why.
+    admin
+        .apply(object(
+            "Build",
+            "shop",
+            "web-3",
+            serde_json::json!({
+                "source": { "git": { "url": "https://git.example/shop/web" } },
+                "image": "r.example/shop/web:3",
+            }),
+        ))
+        .await
+        .unwrap();
+    let offer = tokio::time::timeout(Duration::from_secs(20), offers.message())
+        .await
+        .expect("the second build offered")
+        .unwrap()
+        .expect("an offer");
+    let (to_manager, from_worker) = tokio::sync::mpsc::channel::<SessionFrame>(8);
+    for f in [
+        Frame::Attach(offer.id),
+        Frame::Error(SessionError {
+            code: tonic::Code::Aborted as i32,
+            message: "jailer build failed (exit status: 1)".into(),
+        }),
+    ] {
+        to_manager
+            .send(SessionFrame { frame: Some(f) })
+            .await
+            .unwrap();
+    }
+    let _attached = w1
+        .clone()
+        .attach(tokio_stream::wrappers::ReceiverStream::new(from_worker))
+        .await
+        .unwrap()
+        .into_inner();
+    let web3 = build_status("web-3");
+    until_within("the second build failed", Duration::from_secs(10), || {
+        web3()["phase"] == "Failed"
+    })
+    .await;
+    assert_eq!(web3()["message"], "jailer build failed (exit status: 1)");
+
+    // Nor may alice ask a node to build.
+    let open = SessionFrame {
+        frame: Some(Frame::Open(SessionOpen {
+            namespace: "shop".into(),
+            task: "web".into(),
+            container: String::new(),
+            action: Some(Action::Build(Default::default())),
+        })),
+    };
+    let r = PodsClient::new(
+        m.channel(Some(&creds(&ca, "alice", Role::User)))
+            .await
+            .unwrap(),
+    )
+    .session(tokio_stream::iter([open]))
+    .await;
+    let refused = match r {
+        Err(e) => e,
+        Ok(s) => s.into_inner().message().await.unwrap_err(),
+    };
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+    beating.abort();
+    // They hold the store, which stops only once let go.
+    drop((web2, web3));
+    m.stop().await;
+}

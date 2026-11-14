@@ -65,6 +65,8 @@ pub struct ApiService {
     pub(crate) ca_seen: crate::ca::Seen,
     /// The restarts this manager has seen, for its alerts.
     pub(crate) alerts: std::sync::Arc<crate::alerts::State>,
+    /// The logs of the builds this manager runs as leader.
+    pub(crate) builds: std::sync::Arc<crate::build::Logs>,
 }
 
 pub(crate) enum Route {
@@ -1864,6 +1866,79 @@ impl Cluster for ApiService {
         }
         .await;
         self.audit_end(audit, result)
+    }
+
+    type BuildLogsStream = ReceiverStream<Result<pb::BuildLogsChunk, Status>>;
+
+    async fn build_logs(
+        &self,
+        req: Request<pb::BuildLogsRequest>,
+    ) -> Result<Response<Self::BuildLogsStream>, Status> {
+        let caller = self.caller(&req)?;
+        let r = req.get_ref().clone();
+        check_namespace(&r.namespace)?;
+        caller.check(&self.store, Verb::Read, Kind::Build, &r.namespace)?;
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        if let Some(addr) = self.leader_addr(&req)? {
+            let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                &addr,
+                self.peer_tls.as_ref(),
+            ));
+            let mut chunks = c
+                .build_logs(forwarded(req.into_inner()))
+                .await?
+                .into_inner();
+            tokio::spawn(async move {
+                loop {
+                    let chunk = chunks.message().await.transpose();
+                    let Some(chunk) = chunk else { return };
+                    let last = chunk.is_err();
+                    if tx.send(chunk).await.is_err() || last {
+                        return;
+                    }
+                }
+            });
+            return Ok(Response::new(ReceiverStream::new(rx)));
+        }
+        self.consistent().await?;
+        let key = ObjectKey::new(Kind::Build, &r.namespace, &r.name);
+        let o = self.store.get(&key).map_err(internal)?.ok_or_else(|| {
+            Status::not_found(format!("no build {} in namespace {}", r.name, r.namespace))
+        })?;
+        let logs = self.builds.clone();
+        let mut closing = self.closing.clone();
+        match logs.reader(&key) {
+            Some(mut reader) => {
+                tokio::spawn(async move {
+                    loop {
+                        let Some((data, done)) = logs.read(&mut reader) else {
+                            return;
+                        };
+                        if !data.is_empty()
+                            && tx.send(Ok(pb::BuildLogsChunk { data })).await.is_err()
+                        {
+                            return;
+                        }
+                        if done || !r.follow {
+                            return;
+                        }
+                        tokio::select! {
+                            changed = reader.changed.changed() => if changed.is_err() { return },
+                            _ = closing.wait_for(|c| *c) => return,
+                        }
+                    }
+                });
+            }
+            None => {
+                let data = crate::build::status_log(&o).into_bytes();
+                tokio::spawn(async move {
+                    if !data.is_empty() {
+                        let _ = tx.send(Ok(pb::BuildLogsChunk { data })).await;
+                    }
+                });
+            }
+        }
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     type BackupStream = ReceiverStream<Result<pb::BackupChunk, Status>>;
