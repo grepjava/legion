@@ -7,9 +7,17 @@
   let busy = $state(false);
 
   // The code comes in the URL's fragment, which the browser never sends to
-  // a server; it is taken out of the address bar at once.
+  // a server; it is taken out of the address bar at once. So does why a
+  // single sign-on failed.
   $effect(() => {
-    const code = new URLSearchParams(location.hash.slice(1)).get('code');
+    const fragment = new URLSearchParams(location.hash.slice(1));
+    const failed = fragment.get('error');
+    if (failed) {
+      history.replaceState(null, '', '/login');
+      error = `Single sign-on failed: ${failed}`;
+      return;
+    }
+    const code = fragment.get('code');
     if (!code) return;
     history.replaceState(null, '', '/login');
     busy = true;
@@ -34,7 +42,12 @@
     {#if error}
       <p class="error">{error}</p>
     {/if}
-    <p>Sign in from the command line, with the identity you use there:</p>
+    {#if session.settings.sso}
+      <p><a class="button primary" href="/api/oidc/start" data-sveltekit-reload>{session.settings.sso.label}</a></p>
+      <p class="muted">Or sign in from the command line, with the identity you use there:</p>
+    {:else}
+      <p>Sign in from the command line, with the identity you use there:</p>
+    {/if}
     <pre>legion console login</pre>
     <p>It prints a link that signs you in here. Open it within a minute; it works once.</p>
   {/if}

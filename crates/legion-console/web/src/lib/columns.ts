@@ -98,6 +98,7 @@ export function columns(kind: string): Column[] {
     case 'RoleBinding':
       return [
         { label: 'User', value: (o) => s(o.spec?.user) },
+        { label: 'Group', value: (o) => s(o.spec?.group) },
         { label: 'Role', value: (o) => s(o.spec?.role) }
       ];
     default:

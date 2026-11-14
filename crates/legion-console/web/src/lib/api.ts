@@ -559,6 +559,8 @@ export interface ConsoleSettings {
   defaultNamespace?: string;
   /** Such as `8h`. */
   session?: string;
+  /** Single sign-on, when it is on: what its button says. */
+  sso?: { label: string };
 }
 
 export function consoleSettings(): Promise<ConsoleSettings> {
