@@ -546,7 +546,7 @@ spec:
     e.until("every service green and keeper's Volume", 60, |b| {
         b.eval(
             "['formed', 'sleeper', 'hello'].every((s) =>
-               document.querySelector(`[aria-label=\"Service ${s}\"] rect`)?.classList.contains('good'))
+               document.querySelector(`[aria-label^=\"Service ${s}:\"] rect`)?.classList.contains('good'))
              && !!document.querySelector('[aria-label^=\"Volume \"]')",
         ) == serde_json::json!(true)
     });
