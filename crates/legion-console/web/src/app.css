@@ -52,6 +52,15 @@ a {
 a:hover {
   text-decoration: underline;
 }
+/* Links within text are underlined, not told apart by colour alone
+   (WCAG 1.4.1). */
+p a,
+h1 a,
+li a,
+dd a {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
 h1 {
   font-size: 1.4rem;
   margin: 0 0 1rem;
