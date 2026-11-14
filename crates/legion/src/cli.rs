@@ -444,6 +444,25 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 print!("{}", serde_yaml_ng::to_string(&settings)?);
             }
         }
+        Command::BuildLogs {
+            build,
+            namespace,
+            follow,
+        } => {
+            let mut chunks = cluster
+                .build_logs(pb::BuildLogsRequest {
+                    namespace: namespace.unwrap_or_else(|| "default".into()),
+                    name: build,
+                    follow,
+                })
+                .await?
+                .into_inner();
+            let mut out = std::io::stdout();
+            while let Some(chunk) = chunks.message().await? {
+                std::io::Write::write_all(&mut out, &chunk.data)?;
+                std::io::Write::flush(&mut out)?;
+            }
+        }
         Command::Console { url, .. } => {
             let code = cluster
                 .console_code(pb::ConsoleCodeRequest::default())
