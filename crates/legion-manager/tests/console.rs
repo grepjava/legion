@@ -1118,6 +1118,7 @@ async fn the_console_serves_its_settings() {
     );
 
     let wanted = serde_json::json!({
+        "name": "prod-east",
         "banner": { "text": "Production", "level": "danger" },
         "links": [{ "label": "Runbook", "url": "https://wiki.example/run" }],
         "defaultNamespace": "shop",
@@ -1158,7 +1159,10 @@ async fn the_console_serves_its_settings() {
     let r = get(None).await;
     assert_eq!(
         r.body,
-        serde_json::json!({ "banner": { "text": "Production", "level": "danger" } })
+        serde_json::json!({
+            "name": "prod-east",
+            "banner": { "text": "Production", "level": "danger" },
+        })
     );
     let r = get(Some("legion_session=stale".into())).await;
     assert!(r.body.get("links").is_none(), "{}", r.text);
