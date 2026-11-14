@@ -347,6 +347,12 @@ clusters Legion is for. What is known, so the work starts quickly then:
   debugging, and `legion-net` is shared with jailer.
 - **The planner's per-pass work** (78 ms at 5,000 tasks and 200 nodes,
   the planner alone):
+  - First and cheapest, and the one item that changes how the work grows
+    rather than its constant: a task's node is found by scanning every
+    node (`on_node` in `controller/plan.rs`, the same in `plan/jobs.rs`
+    and `held_by_orphans`), up to three times a task, so a pass costs tasks
+    × nodes. Index the nodes by name once a pass and hand the index down;
+    built inside each service's planning it costs services × nodes again.
   - `controller/mod.rs` lists and parses every Task, Node and Volume on
     every pass, which no figure covers. A cache kept from the store's watch
     removes it, but is the riskiest change: drifting from the store means
@@ -358,8 +364,6 @@ clusters Legion is for. What is known, so the work starts quickly then:
   - Each service's status is serialized to JSON to find whether it changed;
     a typed comparison must mean the same, fields not serialized and those
     others write included.
-  - Tasks on a node are found by scanning every node for each task; index
-    the nodes by name once a pass.
   - Pods are compared in full for every task. A cryptographic digest of the
     pod, kept on the task, may stand for "equal"; a different digest must
     fall back to the full comparison, or a new defaulted field in a later
