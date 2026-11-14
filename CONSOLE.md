@@ -146,7 +146,8 @@ restart gives the pod a new `restartedAt`, a new pod that the update
 config rolls out and a rollback undoes; a run now makes the Job the
 schedule would make this minute, created only (an apply over expected
 version 0), so a second within the minute is refused and a run due that
-minute counts it as its own. Not yet: events per object (there is no event
+minute counts it as its own. The lab test restarts hello from its page
+and sees every task replaced on the same image (passed on c41302a). Not yet: events per object (there is no event
 kind; a task's status message says why it waits). Its browser test passes on the lab (see below).
 
 ## Phase 3: cluster operations
