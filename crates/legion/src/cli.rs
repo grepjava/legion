@@ -348,7 +348,39 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 output.display()
             );
         }
-        Command::Console { action: _, url } => {
+        Command::Console { action, file, .. } if action == "settings" || action == "configure" => {
+            let r = if action == "settings" {
+                cluster
+                    .console_settings(pb::ConsoleSettingsRequest {})
+                    .await?
+            } else {
+                let file = file.ok_or_else(|| anyhow::anyhow!("configure needs -f FILE"))?;
+                let text = if file == Path::new("-") {
+                    let mut s = String::new();
+                    std::io::stdin().read_to_string(&mut s)?;
+                    s
+                } else {
+                    std::fs::read_to_string(&file)
+                        .with_context(|| format!("reading {}", file.display()))?
+                };
+                let settings: legion_api::console::Settings = serde_yaml_ng::from_str(&text)
+                    .with_context(|| format!("reading {}", file.display()))?;
+                settings.check().map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
+                cluster
+                    .set_console_settings(pb::SetConsoleSettingsRequest {
+                        settings_json: serde_json::to_vec(&settings)?,
+                    })
+                    .await?
+            };
+            let settings: legion_api::console::Settings =
+                serde_json::from_slice(&r.into_inner().settings_json)?;
+            if settings == legion_api::console::Settings::default() {
+                eprintln!("no settings: the console's defaults (12h sessions)");
+            } else {
+                print!("{}", serde_yaml_ng::to_string(&settings)?);
+            }
+        }
+        Command::Console { url, .. } => {
             let code = cluster
                 .console_code(pb::ConsoleCodeRequest::default())
                 .await?

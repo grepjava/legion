@@ -222,14 +222,25 @@ enum Command {
         action: String,
     },
     /// The web console (DESIGN.md §3.9). `login` prints a link that signs
-    /// you in as this CLI's identity: good once, for 60 s.
+    /// you in as this CLI's identity: good once, for 60 s. `settings`
+    /// prints the console's settings as YAML; `configure -f FILE` sets them
+    /// (the cluster admin only): a banner every page shows, side-bar links,
+    /// the namespace users start in and how long a session lasts, e.g.
+    ///
+    ///   banner: { text: Production, level: danger }   # info, warning
+    ///   links: [{ label: Runbook, url: "https://wiki.example/run" }]
+    ///   defaultNamespace: shop
+    ///   session: 8h                                  # 5m to 168h
     Console {
-        #[arg(value_parser = ["login"])]
+        #[arg(value_parser = ["login", "settings", "configure"])]
         action: String,
         /// The console's address, as a browser reaches it [default: the
         /// --server host, port 7480].
         #[arg(long)]
         url: Option<String>,
+        /// For `configure`: the settings, as YAML; `-` for stdin.
+        #[arg(short, long)]
+        file: Option<PathBuf>,
     },
     /// Give a locked manager on this host its unlock key, read from
     /// --key-file or else from stdin.
