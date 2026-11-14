@@ -17,11 +17,14 @@
   let error = $state('');
   let saved = $state('');
   let busy = $state(false);
+  // Shown only once read: what is typed before then would be overwritten.
+  let loaded = $state(false);
   const why = $derived(cannotWrite(''));
 
   const lines = (ps: [string, string][]) => ps.map(([a, b]) => `${a} | ${b}`).join('\n');
 
   function show(s: ConsoleSettings) {
+    loaded = true;
     name = s.name ?? '';
     banner = s.banner?.text ?? '';
     level = s.banner?.level ?? 'info';
@@ -97,6 +100,7 @@
 </p>
 
 <form class="settings" onsubmit={save}>
+  <fieldset class="whole" disabled={!loaded}>
   <label
     >{t('Cluster name')} <span class="muted">{t('(at the top of the side bar and in the page title)')}</span>
     <input bind:value={name} aria-label={t('Cluster name')} maxlength="500" />
@@ -142,6 +146,7 @@
   </div>
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   {#if saved}<p class="ok" role="status">{saved}</p>{/if}
+  </fieldset>
 </form>
 
 <style>
@@ -156,7 +161,10 @@
     flex-direction: column;
     gap: 0.2rem;
   }
-  fieldset {
+  fieldset.whole {
+    display: contents;
+  }
+  fieldset:not(.whole) {
     border: 1px solid var(--line);
     border-radius: 6px;
     display: flex;
