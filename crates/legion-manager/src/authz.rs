@@ -4,7 +4,8 @@
 //! (watches, sessions) it serves once it has caught up with the leader.
 //!
 //! The cluster admin and managers may do everything. A user may act only
-//! in namespaces where a RoleBinding names them, as far as its role goes,
+//! in namespaces where a RoleBinding names them or a group of theirs (an
+//! OIDC user's, as of their last sign-in), as far as its role goes,
 //! and never on cluster-scoped objects. Rights live in the bindings, not
 //! the certificate, so deleting a binding takes them away at once: a
 //! request after it is refused, and a stream open before it ends within
@@ -135,12 +136,13 @@ impl Caller {
         let bindings = store
             .list(Kind::RoleBinding, None)
             .map_err(|e| Status::internal(e.to_string()))?;
+        let groups = crate::console::groups(store, name)?;
         let mut roles = Roles::new();
         for o in &bindings.objects {
             let Ok(b) = legion_api::parse::<RoleBindingSpec>(&o.spec) else {
                 continue;
             };
-            if b.user == *name {
+            if b.binds(name, &groups) {
                 let role = roles.entry(o.metadata.namespace.clone()).or_insert(b.role);
                 *role = (*role).max(b.role);
             }
@@ -178,16 +180,18 @@ fn needed(verb: Verb, kind: Kind) -> NamespaceRole {
     }
 }
 
-/// The highest role RoleBindings give `user` in `namespace`.
+/// The highest role RoleBindings give `user`, or their groups, in
+/// `namespace`.
 fn role_in(store: &Store, namespace: &str, user: &str) -> Result<Option<NamespaceRole>, Status> {
     let bindings = store
         .list(Kind::RoleBinding, Some(namespace))
         .map_err(|e| Status::internal(e.to_string()))?;
+    let groups = crate::console::groups(store, user)?;
     Ok(bindings
         .objects
         .iter()
         .filter_map(|o| legion_api::parse::<RoleBindingSpec>(&o.spec).ok())
-        .filter(|b| b.user == user)
+        .filter(|b| b.binds(user, &groups))
         .map(|b| b.role)
         .max())
 }

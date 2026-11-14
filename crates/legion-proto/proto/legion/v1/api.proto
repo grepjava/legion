@@ -179,6 +179,14 @@ service Cluster {
   // them; the cluster admin sets them.
   rpc ConsoleSettings(ConsoleSettingsRequest) returns (ConsoleSettingsResponse);
   rpc SetConsoleSettings(SetConsoleSettingsRequest) returns (ConsoleSettingsResponse);
+  // Single sign-on (CONSOLE.md phase 6), the cluster admin's: the OIDC
+  // provider the console signs users in with, its client secret never
+  // shown again.
+  rpc ConsoleOidc(ConsoleOidcRequest) returns (ConsoleOidcResponse);
+  rpc SetConsoleOidc(SetConsoleOidcRequest) returns (ConsoleOidcResponse);
+  // Managers only (their console gateway): a session for a user their
+  // provider vouched for, with their groups.
+  rpc ConsoleOidcSession(ConsoleOidcSessionRequest) returns (ConsoleSessionResponse);
 }
 
 message MeRequest {}
@@ -229,6 +237,29 @@ message ConsoleSettingsRequest {}
 message SetConsoleSettingsRequest {
   // legion_api::console::Settings as JSON.
   bytes settings_json = 1;
+}
+
+message ConsoleOidcRequest {}
+
+message SetConsoleOidcRequest {
+  // legion_api::console::Oidc as JSON; empty with `remove`.
+  bytes oidc_json = 1;
+  // Empty keeps the secret already set.
+  string client_secret = 2;
+  // Turns single sign-on off.
+  bool remove = 3;
+}
+
+message ConsoleOidcResponse {
+  // legion_api::console::Oidc as JSON; empty when single sign-on is off.
+  bytes oidc_json = 1;
+  bool has_secret = 2;
+}
+
+message ConsoleOidcSessionRequest {
+  // `oidc:` and the provider's name for them.
+  string name = 1;
+  repeated string groups = 2;
 }
 
 message ConsoleSettingsResponse {

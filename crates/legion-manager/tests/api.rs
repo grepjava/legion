@@ -5590,9 +5590,11 @@ async fn the_console_settings_are_the_admins() {
     };
     let mut admin = as_who("admin", Role::Admin).await;
     let mut alice = as_who("alice", Role::User).await;
-    let read = |r: Result<tonic::Response<legion_proto::v1::ConsoleSettingsResponse>, tonic::Status>| {
-        serde_json::from_slice::<serde_json::Value>(&r.unwrap().into_inner().settings_json).unwrap()
-    };
+    let read =
+        |r: Result<tonic::Response<legion_proto::v1::ConsoleSettingsResponse>, tonic::Status>| {
+            serde_json::from_slice::<serde_json::Value>(&r.unwrap().into_inner().settings_json)
+                .unwrap()
+        };
     let set = |v: serde_json::Value| SetConsoleSettingsRequest {
         settings_json: v.to_string().into_bytes(),
     };
@@ -5628,9 +5630,7 @@ async fn the_console_settings_are_the_admins() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let refused = alice
-        .set_console_settings(set(serde_json::json!({})))
-        .await;
+    let refused = alice.set_console_settings(set(serde_json::json!({}))).await;
     assert!(denied(refused).contains("console's settings"));
 
     // Checked.
@@ -5639,10 +5639,16 @@ async fn the_console_settings_are_the_admins() {
         serde_json::json!({ "links": [{ "label": "x", "url": "javascript:alert(1)" }] }),
         serde_json::json!({ "theme": "dark" }),
     ] {
-        let e = admin.set_console_settings(set(bad.clone())).await.unwrap_err();
+        let e = admin
+            .set_console_settings(set(bad.clone()))
+            .await
+            .unwrap_err();
         assert_eq!(e.code(), tonic::Code::InvalidArgument, "{bad}: {e:?}");
     }
-    assert_eq!(read(admin.console_settings(ConsoleSettingsRequest {}).await), wanted);
+    assert_eq!(
+        read(admin.console_settings(ConsoleSettingsRequest {}).await),
+        wanted
+    );
 
     // A session started now lasts 2 h.
     let code = alice

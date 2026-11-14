@@ -547,6 +547,17 @@ fn conflict(key: &ObjectKey, current: Option<&Object>) -> Status {
     }
 }
 
+/// Single sign-on's settings as the API gives them: never the secret.
+fn oidc_response(r: Option<crate::console::OidcRecord>) -> pb::ConsoleOidcResponse {
+    match r {
+        Some(r) => pb::ConsoleOidcResponse {
+            oidc_json: serde_json::to_vec(&r.oidc).expect("serialises"),
+            has_secret: !r.client_secret.is_empty(),
+        },
+        None => pb::ConsoleOidcResponse::default(),
+    }
+}
+
 pub(crate) fn forwarded<T>(inner: T) -> Request<T> {
     let mut req = Request::new(inner);
     req.metadata_mut()
@@ -1758,13 +1769,83 @@ impl Cluster for ApiService {
         }))
     }
 
+    async fn console_oidc(
+        &self,
+        req: Request<pb::ConsoleOidcRequest>,
+    ) -> Result<Response<pb::ConsoleOidcResponse>, Status> {
+        self.caller(&req)?
+            .require_all("read single sign-on's settings")?;
+        Ok(Response::new(oidc_response(crate::console::oidc(
+            &self.store,
+        )?)))
+    }
+
+    async fn set_console_oidc(
+        &self,
+        req: Request<pb::SetConsoleOidcRequest>,
+    ) -> Result<Response<pb::ConsoleOidcResponse>, Status> {
+        let audit = self.audit_point(&req, "console-oidc", Default::default());
+        let result = async {
+            self.caller(&req)?
+                .require_all("change single sign-on's settings")?;
+            if let Some(addr) = self.leader_addr(&req)? {
+                let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                    &addr,
+                    self.peer_tls.as_ref(),
+                ));
+                return c.set_console_oidc(forwarded(req.into_inner())).await;
+            }
+            let r = req.into_inner();
+            let oidc = if r.remove {
+                None
+            } else {
+                Some(
+                    serde_json::from_slice::<legion_api::console::Oidc>(&r.oidc_json)
+                        .map_err(|e| Status::invalid_argument(format!("the OIDC settings: {e}")))?,
+                )
+            };
+            self.consistent().await?;
+            crate::console::set_oidc(self, oidc, &r.client_secret).await?;
+            Ok(Response::new(oidc_response(crate::console::oidc(
+                &self.store,
+            )?)))
+        }
+        .await;
+        self.audit_end(audit, result)
+    }
+
+    async fn console_oidc_session(
+        &self,
+        req: Request<pb::ConsoleOidcSessionRequest>,
+    ) -> Result<Response<pb::ConsoleSessionResponse>, Status> {
+        self.only_managers(&req, "start console sessions")?;
+        if let Some(addr) = self.leader_addr(&req)? {
+            let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                &addr,
+                self.peer_tls.as_ref(),
+            ));
+            return c.console_oidc_session(forwarded(req.into_inner())).await;
+        }
+        self.consistent().await?;
+        let r = req.get_ref();
+        let (session, signed) = crate::console::oidc_session(self, &r.name, &r.groups).await?;
+        tracing::info!(name = %signed.name, groups = ?r.groups, "a console session began by single sign-on");
+        Ok(Response::new(pb::ConsoleSessionResponse {
+            session,
+            name: signed.name,
+            role: signed.role,
+            expires_ms: signed.expires_ms,
+        }))
+    }
+
     async fn set_console_settings(
         &self,
         req: Request<pb::SetConsoleSettingsRequest>,
     ) -> Result<Response<pb::ConsoleSettingsResponse>, Status> {
         let audit = self.audit_point(&req, "console-settings", Default::default());
         let result = async {
-            self.caller(&req)?.require_all("change the console's settings")?;
+            self.caller(&req)?
+                .require_all("change the console's settings")?;
             if let Some(addr) = self.leader_addr(&req)? {
                 let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
                     &addr,

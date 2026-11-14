@@ -22,6 +22,8 @@ pub(crate) const CODE_LIFETIME: Duration = Duration::from_secs(60);
 
 const CODE_PREFIX: &str = "console-code-";
 const SESSION_PREFIX: &str = "console-session-";
+/// An OIDC user's groups, as of their last sign-in.
+const GROUPS_PREFIX: &str = "oidc-groups-";
 /// The console's settings (`legion_api::console::Settings`), one record.
 const SETTINGS: &str = "console-settings";
 
@@ -157,6 +159,57 @@ pub(crate) async fn redeem(api: &ApiService, code: &str) -> Result<(String, Sign
     Ok((session, record))
 }
 
+/// An OIDC user's groups (CONSOLE.md phase 6), as their provider gave them
+/// at their last sign-in, kept until their newest session ends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Membership {
+    user: String,
+    groups: Vec<String>,
+    expires_ms: i64,
+}
+
+/// The groups `user` is in: an OIDC user's from their last sign-in, while
+/// a session of theirs may last; none for a certificate's user.
+pub(crate) fn groups(store: &Store, user: &str) -> Result<Vec<String>, Status> {
+    if !user.starts_with(legion_api::rbac::OIDC_PREFIX) {
+        return Ok(Vec::new());
+    }
+    Ok(read::<Membership>(store, &key(GROUPS_PREFIX, user))?
+        .map(|(m, _)| m)
+        .filter(|m| m.user == user && m.expires_ms > now_ms())
+        .map(|m| m.groups)
+        .unwrap_or_default())
+}
+
+/// Records `user`'s groups at a sign-in, on the leader, until `expires_ms`
+/// or a later session's end.
+pub(crate) async fn set_groups(
+    api: &ApiService,
+    user: &str,
+    groups: &[String],
+    expires_ms: i64,
+) -> Result<(), Status> {
+    let key = key(GROUPS_PREFIX, user);
+    let before = read::<Membership>(&api.store, &key)?.map(|(m, _)| m.expires_ms);
+    let record = Membership {
+        user: user.to_owned(),
+        groups: groups.to_vec(),
+        expires_ms: before.map_or(expires_ms, |b| b.max(expires_ms)),
+    };
+    let object = Object::new(
+        Kind::Secret,
+        SYSTEM_NAMESPACE,
+        &key.name,
+        serde_json::to_value(&record).expect("serialises"),
+    );
+    api.write(Command::Put {
+        object,
+        precondition: Precondition::None,
+    })
+    .await?;
+    Ok(())
+}
+
 fn settings_key() -> ObjectKey {
     ObjectKey::new(Kind::Secret, SYSTEM_NAMESPACE, SETTINGS)
 }
@@ -187,6 +240,92 @@ pub(crate) async fn set_settings(api: &ApiService, s: &Settings) -> Result<(), S
     Ok(())
 }
 
+/// Single sign-on's provider and its client secret, one record.
+const OIDC: &str = "console-oidc";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OidcRecord {
+    pub oidc: legion_api::console::Oidc,
+    pub client_secret: String,
+}
+
+fn oidc_key() -> ObjectKey {
+    ObjectKey::new(Kind::Secret, SYSTEM_NAMESPACE, OIDC)
+}
+
+/// Single sign-on's provider, if one is set, on any manager.
+pub(crate) fn oidc(store: &Store) -> Result<Option<OidcRecord>, Status> {
+    Ok(read::<OidcRecord>(store, &oidc_key())?.map(|(r, _)| r))
+}
+
+/// Sets single sign-on's provider, on the leader, once checked; an empty
+/// `client_secret` keeps the one set. `None` turns it off.
+pub(crate) async fn set_oidc(
+    api: &ApiService,
+    oidc: Option<legion_api::console::Oidc>,
+    client_secret: &str,
+) -> Result<(), Status> {
+    let Some(oidc) = oidc else {
+        api.write(Command::Delete {
+            key: oidc_key(),
+            precondition: Precondition::None,
+        })
+        .await?;
+        return Ok(());
+    };
+    oidc.check()
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+    let client_secret = if client_secret.is_empty() {
+        self::oidc(&api.store)?
+            .map(|r| r.client_secret)
+            .ok_or_else(|| Status::invalid_argument("the client secret is required"))?
+    } else {
+        client_secret.to_owned()
+    };
+    let object = Object::new(
+        Kind::Secret,
+        SYSTEM_NAMESPACE,
+        OIDC,
+        serde_json::to_value(OidcRecord {
+            oidc,
+            client_secret,
+        })
+        .expect("serialises"),
+    );
+    api.write(Command::Put {
+        object,
+        precondition: Precondition::None,
+    })
+    .await?;
+    Ok(())
+}
+
+/// A session for `name` (`oidc:…`), whom single sign-on's provider vouched
+/// for, in `groups`, on the leader: as long as the settings say.
+pub(crate) async fn oidc_session(
+    api: &ApiService,
+    name: &str,
+    groups: &[String],
+) -> Result<(String, Signed), Status> {
+    if oidc(&api.store)?.is_none() {
+        return Err(Status::failed_precondition("single sign-on is off"));
+    }
+    legion_api::rbac::check_user("name", name)
+        .ok()
+        .filter(|_| name.starts_with(legion_api::rbac::OIDC_PREFIX))
+        .ok_or_else(|| Status::invalid_argument(format!("{name:?} is no OIDC user's name")))?;
+    let expires_ms = now_ms() + settings(&api.store)?.session().millis() as i64;
+    set_groups(api, name, groups, expires_ms).await?;
+    let session = legion_pki::random_secret();
+    let record = Signed {
+        name: name.to_owned(),
+        role: "user".into(),
+        expires_ms,
+    };
+    put(api, &key(SESSION_PREFIX, &session), &record).await?;
+    Ok((session, record))
+}
+
 /// The session `session` names, if it is current: on any manager, from its
 /// replica.
 pub fn session(store: &Store, session: &str) -> Result<Option<Signed>, Status> {
@@ -214,10 +353,13 @@ async fn sweep(api: &ApiService) {
     let now = now_ms();
     for o in list.objects {
         let name = &o.metadata.name;
-        if !(name.starts_with(CODE_PREFIX) || name.starts_with(SESSION_PREFIX)) {
+        if ![CODE_PREFIX, SESSION_PREFIX, GROUPS_PREFIX]
+            .iter()
+            .any(|p| name.starts_with(p))
+        {
             continue;
         }
-        // A code's and a session's `expires_ms` alike.
+        // A code's, a session's and a membership's `expires_ms` alike.
         let expired = o
             .spec
             .get("expires_ms")
