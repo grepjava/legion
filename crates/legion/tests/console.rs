@@ -505,7 +505,9 @@ spec:
         "Compose file",
         "# Sleeps.\nservices:\n  sleeper:\n    image: \"${IMAGE:-localhost/none:1}\"\n    command: [/bin/sleep, \"86400\"]\n",
     );
-    e.shows("Variable IMAGE", 30);
+    e.until("a field for the variable", 30, |b| {
+        b.eval("!!H.field('Variable IMAGE')") == serde_json::json!(true)
+    });
     e.fill("Template name", "sleeper");
     e.fill("Template namespace", "team-a");
     e.click("Save");
