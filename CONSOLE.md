@@ -139,11 +139,15 @@ any object. Buttons disabled with the reason for a user who may only
 look; the API decides in the end, and audits each write as the user. The
 CLI and the console share the code for these (`legion_manager::actions`:
 `set_spec`, `set_labels`, `rollback`, `create_user`; `legion_api::manifest`).
-Tested over HTTPS (`crates/legion-manager/tests/console.rs`). Not yet:
-restart and run-now, which need the API first (an applied spec that is
-unchanged makes no new generation; there is no call to start a CronJob's
-run), events per object (there is no event kind; a task's status message
-says why it waits). Its browser test passes on the lab (see below).
+Tested over HTTPS (`crates/legion-manager/tests/console.rs`). Restart
+and run now came after (2026-11-15), each as the CLI does it (`legion
+restart`, `legion cronjob run`; `actions::restart`, `actions::run_now`): a
+restart gives the pod a new `restartedAt`, a new pod that the update
+config rolls out and a rollback undoes; a run now makes the Job the
+schedule would make this minute, created only (an apply over expected
+version 0), so a second within the minute is refused and a run due that
+minute counts it as its own. Not yet: events per object (there is no event
+kind; a task's status message says why it waits). Its browser test passes on the lab (see below).
 
 ## Phase 3: cluster operations
 
