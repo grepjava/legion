@@ -61,6 +61,8 @@ struct Inner {
     peer: Arc<Credentials>,
     /// Each session's channel as its user, by session.
     users: Mutex<HashMap<String, User>>,
+    /// Single sign-on's client (CONSOLE.md phase 6).
+    sso: crate::oidc::Provider,
 }
 
 struct User {
@@ -97,6 +99,7 @@ pub(crate) async fn run(listener: TcpListener, console: Console, api: ApiService
         api,
         peer,
         users: Default::default(),
+        sso: crate::oidc::Provider::new(),
     }));
     let router = router(gateway);
     tracing::info!(listen = %console.listen, built = legion_console::built(), "serving the console");
@@ -159,6 +162,8 @@ fn tls(console: &Console, peer: &Credentials) -> Result<TlsAcceptor, String> {
 fn router(gateway: Gateway) -> axum::Router {
     axum::Router::new()
         .route("/api/login", post(login))
+        .route("/api/oidc/start", get(oidc_start))
+        .route("/api/oidc/callback", get(oidc_callback))
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
         .route("/api/status", get(status))
@@ -256,15 +261,19 @@ fn unauthorized() -> Refused {
 
 /// The session the browser's cookie names.
 fn cookie(headers: &HeaderMap) -> Option<String> {
+    cookie_named(headers, COOKIE)
+        .filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+fn cookie_named(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .filter_map(|c| c.trim().split_once('='))
-        .find(|(k, _)| *k == COOKIE)
+        .find(|(k, _)| *k == name)
         .map(|(_, v)| v.to_owned())
-        .filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// The header a write carries its session's token in.
@@ -452,6 +461,136 @@ async fn logout(
         ),
     );
     Ok(res)
+}
+
+/// The cookie keeping a single sign-on flow under way, for its callback
+/// alone; `Lax`, as the provider sends the browser back from its own site.
+const FLOW_COOKIE: &str = "legion_oidc";
+
+fn see_other(to: &str) -> Response {
+    let mut res = StatusCode::SEE_OTHER.into_response();
+    if let Ok(v) = HeaderValue::from_str(to) {
+        res.headers_mut().insert(header::LOCATION, v);
+    }
+    res
+}
+
+/// Back to the sign-in page, saying why single sign-on failed (in the
+/// fragment, which no server sees).
+fn sso_failed(why: &str) -> Response {
+    tracing::warn!("single sign-on failed: {why}");
+    let encoded: String = why
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    let mut res = see_other(&format!("/login#error={encoded}"));
+    res.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&format!(
+            "{FLOW_COOKIE}=; Path=/api/oidc; HttpOnly; Secure; SameSite=Lax; Max-Age=0"
+        ))
+        .expect("ASCII"),
+    );
+    res
+}
+
+/// Single sign-on (CONSOLE.md phase 6): the browser sent to the provider,
+/// the flow's state, nonce and PKCE verifier kept in a cookie.
+async fn oidc_start(State(g): State<Gateway>) -> Response {
+    let r = match crate::console::oidc(&g.0.api.store) {
+        Ok(Some(r)) => r,
+        Ok(None) => return sso_failed("single sign-on is off"),
+        Err(e) => return sso_failed(e.message()),
+    };
+    match g.0.sso.start(&r.oidc).await {
+        Ok((url, flow)) => {
+            let mut res = see_other(&url);
+            res.headers_mut().append(
+                header::SET_COOKIE,
+                HeaderValue::from_str(&format!(
+                    "{FLOW_COOKIE}={}; Path=/api/oidc; HttpOnly; Secure; SameSite=Lax; Max-Age=600",
+                    flow.cookie_value()
+                ))
+                .expect("hex and ASCII"),
+            );
+            res
+        }
+        Err(e) => sso_failed(&e),
+    }
+}
+
+#[derive(Deserialize)]
+struct CallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+/// The provider's answer: the flow checked, the code exchanged and the ID
+/// token verified, then a session like any other for whom it names.
+async fn oidc_callback(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Query(q): Query<CallbackQuery>,
+) -> Response {
+    if let Some(error) = q.error {
+        let more = q.error_description.unwrap_or_default();
+        return sso_failed(&format!("the provider said {error}: {more}"));
+    }
+    let Some(flow) =
+        cookie_named(&headers, FLOW_COOKIE).and_then(|v| crate::oidc::Flow::from_cookie(&v))
+    else {
+        return sso_failed("no sign-in was under way in this browser; start again");
+    };
+    if q.state.as_deref() != Some(flow.state.as_str()) {
+        return sso_failed("the provider's answer is not for this sign-in");
+    }
+    let Some(code) = q.code else {
+        return sso_failed("the provider sent no code");
+    };
+    let r = match crate::console::oidc(&g.0.api.store) {
+        Ok(Some(r)) => r,
+        Ok(None) => return sso_failed("single sign-on is off"),
+        Err(e) => return sso_failed(e.message()),
+    };
+    let (name, groups) = match g
+        .0
+        .sso
+        .finish(&r.oidc, &r.client_secret, &code, &flow)
+        .await
+    {
+        Ok(who) => who,
+        Err(e) => return sso_failed(&e),
+    };
+    let s = match ClusterClient::new(g.manager())
+        .console_oidc_session(pb::ConsoleOidcSessionRequest { name, groups })
+        .await
+    {
+        Ok(s) => s.into_inner(),
+        Err(e) => return sso_failed(e.message()),
+    };
+    let max_age = ((s.expires_ms - crate::console::now_ms()) / 1000).max(0);
+    let mut res = see_other("/");
+    for c in [
+        format!(
+            "{COOKIE}={}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age={max_age}",
+            s.session
+        ),
+        format!("{FLOW_COOKIE}=; Path=/api/oidc; HttpOnly; Secure; SameSite=Lax; Max-Age=0"),
+    ] {
+        res.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&c).expect("hex and ASCII"),
+        );
+    }
+    res
 }
 
 async fn me(State(g): State<Gateway>, headers: HeaderMap) -> Result<Response, Refused> {
@@ -1015,7 +1154,9 @@ async fn compose(
     let namespace = body.namespace.unwrap_or_else(|| body.stack.clone());
     let env = |k: &str| body.env.get(k).cloned();
     let read = |p: &str| -> Result<Vec<u8>, String> {
-        Err(format!("{p}: the console reads no files; put the content in the compose file"))
+        Err(format!(
+            "{p}: the console reads no files; put the content in the compose file"
+        ))
     };
     let stack = legion_api::compose::convert(
         &body.compose,
@@ -1062,7 +1203,9 @@ async fn compose(
     let variables: Vec<_> = stack
         .variables
         .iter()
-        .map(|v| serde_json::json!({ "name": v.name, "default": v.default, "required": v.required }))
+        .map(
+            |v| serde_json::json!({ "name": v.name, "default": v.default, "required": v.required }),
+        )
         .collect();
     Ok(Json(serde_json::json!({
         "objects": docs, "warnings": stack.warnings, "variables": variables,
@@ -1075,8 +1218,14 @@ const TEMPLATE_LABEL: &str = "legion.template";
 
 /// The examples in `examples/`, the catalog every console has.
 const EXAMPLES: &[(&str, &str)] = &[
-    ("counter", include_str!("../../../examples/counter/compose.yaml")),
-    ("static-site", include_str!("../../../examples/static-site/compose.yaml")),
+    (
+        "counter",
+        include_str!("../../../examples/counter/compose.yaml"),
+    ),
+    (
+        "static-site",
+        include_str!("../../../examples/static-site/compose.yaml"),
+    ),
 ];
 
 /// A compose file's opening comment, as what it is.
@@ -1668,7 +1817,12 @@ async fn console_settings(
     } else {
         settings.public()
     };
-    Ok(Json(settings).into_response())
+    let mut body = serde_json::to_value(&settings).expect("serialises");
+    // The sign-in page offers single sign-on when it is on.
+    if let Some(r) = crate::console::oidc(&g.0.api.store)? {
+        body["sso"] = serde_json::json!({ "label": r.oidc.label });
+    }
+    Ok(Json(body).into_response())
 }
 
 /// `legion console configure`, the cluster admin only: the settings as

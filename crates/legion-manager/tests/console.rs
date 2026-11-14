@@ -19,6 +19,9 @@ use tonic::transport::{Channel, ClientTlsConfig};
 struct Response {
     status: u16,
     cookie: Option<String>,
+    /// Every cookie set, and where a redirect goes.
+    cookies: Vec<String>,
+    location: Option<String>,
     body: serde_json::Value,
     text: String,
 }
@@ -118,11 +121,23 @@ async fn request(
         .headers()
         .get("set-cookie")
         .map(|v| v.to_str().unwrap().to_owned());
+    let cookies = res
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_owned())
+        .collect();
+    let location = res
+        .headers()
+        .get("location")
+        .map(|v| v.to_str().unwrap().to_owned());
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8_lossy(&bytes).into_owned();
     Response {
         status,
         cookie,
+        cookies,
+        location,
         body: serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
         text,
     }
@@ -890,7 +905,12 @@ async fn the_console_converts_compose_files_and_lists_templates() {
             "alice",
             serde_json::json!({ "user": "alice", "role": "edit" }),
         ),
-        ("Config", "shop", "plain", serde_json::json!({ "text": "services: {}" })),
+        (
+            "Config",
+            "shop",
+            "plain",
+            serde_json::json!({ "text": "services: {}" }),
+        ),
     ] {
         objects.apply(object(kind, ns, name, spec)).await.unwrap();
     }
@@ -981,7 +1001,10 @@ async fn the_console_converts_compose_files_and_lists_templates() {
     assert_eq!(r.body["objects"][0]["kind"], "Namespace");
     assert_eq!(r.body["objects"][0]["metadata"]["name"], "site2");
     assert_eq!(r.body["objects"][1]["metadata"]["namespace"], "site2");
-    assert_eq!(r.body["objects"][1]["spec"]["pod"]["containers"][0]["image"], "web:1");
+    assert_eq!(
+        r.body["objects"][1]["spec"]["pod"]["containers"][0]["image"],
+        "web:1"
+    );
 
     // A file it would read, or one that is wrong, says why.
     let r = post(serde_json::json!({
@@ -992,7 +1015,16 @@ async fn the_console_converts_compose_files_and_lists_templates() {
     assert_eq!(r.status, 400, "{}", r.text);
     assert!(r.text.contains("reads no files"), "{}", r.text);
 
-    let r = https(&f.ca, &console, "GET", "/api/templates", Some(&alice), None, None).await;
+    let r = https(
+        &f.ca,
+        &console,
+        "GET",
+        "/api/templates",
+        Some(&alice),
+        None,
+        None,
+    )
+    .await;
     assert_eq!(r.status, 200, "{}", r.text);
     let listed: Vec<(String, String, String)> = r.body["templates"]
         .as_array()
@@ -1051,11 +1083,25 @@ async fn the_console_serves_its_settings() {
     let get = |cookie: Option<String>| {
         let (ca, console) = (&f.ca, &console);
         async move {
-            https(ca, console, "GET", "/api/console-settings", cookie.as_deref(), None, None).await
+            https(
+                ca,
+                console,
+                "GET",
+                "/api/console-settings",
+                cookie.as_deref(),
+                None,
+                None,
+            )
+            .await
         }
     };
     let r = get(None).await;
-    assert_eq!((r.status, r.body.clone()), (200, serde_json::json!({})), "{}", r.text);
+    assert_eq!(
+        (r.status, r.body.clone()),
+        (200, serde_json::json!({})),
+        "{}",
+        r.text
+    );
 
     let wanted = serde_json::json!({
         "banner": { "text": "Production", "level": "danger" },
@@ -1083,7 +1129,12 @@ async fn the_console_serves_its_settings() {
     let root = sign_in_as(&f, "root", Role::Admin).await;
     let alice = sign_in(&f, "alice").await;
     let r = post(root.clone(), wanted.clone()).await;
-    assert_eq!((r.status, r.body.clone()), (200, wanted.clone()), "{}", r.text);
+    assert_eq!(
+        (r.status, r.body.clone()),
+        (200, wanted.clone()),
+        "{}",
+        r.text
+    );
     let r = post(alice.clone(), serde_json::json!({})).await;
     assert_eq!(r.status, 403, "{}", r.text);
     let r = post(root.clone(), serde_json::json!({ "session": "1m" })).await;
@@ -1099,6 +1150,252 @@ async fn the_console_serves_its_settings() {
     assert!(r.body.get("links").is_none(), "{}", r.text);
     let r = get(Some(alice.0.clone())).await;
     assert_eq!(r.body, wanted, "{}", r.text);
+
+    let _ = f.stop.send(());
+    f.task.await.unwrap();
+}
+
+/// Single sign-on (CONSOLE.md phase 6), against a provider this test plays:
+/// discovery, its key, a token endpoint that checks the code, the client
+/// and PKCE. A user signs in through it, gets what their group's binding
+/// gives, and loses it when the binding goes; a forged or replayed answer
+/// signs no one in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_console_signs_in_with_an_identity_provider() {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+    use legion_proto::v1::SetConsoleOidcRequest;
+    use ring::rand::SystemRandom;
+    use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
+    use sha2::{Digest, Sha256};
+
+    // The provider: one ES256 key, one good code, used once.
+    #[derive(Default)]
+    struct Idp {
+        challenge: String,
+        nonce: String,
+        used: bool,
+    }
+    let rng = SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+    let pair = Arc::new(
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng).unwrap(),
+    );
+    let point = pair.public_key().as_ref().to_vec();
+    let idp = Arc::new(std::sync::Mutex::new(Idp::default()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}", listener.local_addr().unwrap());
+    let f = start().await;
+    let console = f.console_addr.to_string();
+    let callback = format!("https://{console}/api/oidc/callback");
+    {
+        use axum::routing::{get, post};
+        let discovery = serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "jwks_uri": format!("{issuer}/jwks"),
+        });
+        let jwks = serde_json::json!({ "keys": [{
+            "kty": "EC", "crv": "P-256", "kid": "k1", "use": "sig",
+            "x": B64.encode(&point[1..33]), "y": B64.encode(&point[33..]),
+        }]});
+        let (issuer, idp, pair, callback) =
+            (issuer.clone(), idp.clone(), pair.clone(), callback.clone());
+        let token = move |body: String| {
+            let (issuer, idp, pair, callback) =
+                (issuer.clone(), idp.clone(), pair.clone(), callback.clone());
+            async move {
+                let form: std::collections::HashMap<String, String> =
+                    reqwest::Url::parse(&format!("http://x/?{body}"))
+                        .unwrap()
+                        .query_pairs()
+                        .into_owned()
+                        .collect();
+                let mut idp = idp.lock().unwrap();
+                let verifier = form.get("code_verifier").cloned().unwrap_or_default();
+                let good = form.get("grant_type").map(String::as_str) == Some("authorization_code")
+                    && form.get("code").map(String::as_str) == Some("good-code")
+                    && form.get("client_id").map(String::as_str) == Some("legion")
+                    && form.get("client_secret").map(String::as_str) == Some("s3cret")
+                    && form.get("redirect_uri") == Some(&callback)
+                    && B64.encode(Sha256::digest(verifier.as_bytes())) == idp.challenge
+                    && !idp.used;
+                if !good {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(serde_json::json!({ "error": "invalid_grant" })),
+                    );
+                }
+                idp.used = true;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let header = serde_json::json!({ "alg": "ES256", "kid": "k1" });
+                let claims = serde_json::json!({
+                    "iss": issuer, "aud": "legion", "exp": now + 300, "iat": now,
+                    "nonce": idp.nonce, "email": "alice@example.com",
+                    "email_verified": true, "groups": ["shop-team", "other"],
+                });
+                let signed = format!(
+                    "{}.{}",
+                    B64.encode(header.to_string()),
+                    B64.encode(claims.to_string())
+                );
+                let sig = pair.sign(&SystemRandom::new(), signed.as_bytes()).unwrap();
+                let id_token = format!("{signed}.{}", B64.encode(sig.as_ref()));
+                (
+                    axum::http::StatusCode::OK,
+                    axum::Json(serde_json::json!({ "id_token": id_token, "token_type": "Bearer" })),
+                )
+            }
+        };
+        let app = axum::Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                get(move || async move { axum::Json(discovery) }),
+            )
+            .route("/jwks", get(move || async move { axum::Json(jwks) }))
+            .route("/token", post(token));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    }
+
+    // The admin turns single sign-on on and binds a group.
+    let mut cluster = ClusterClient::new(f.admin.clone());
+    let set = cluster
+        .set_console_oidc(SetConsoleOidcRequest {
+            oidc_json: serde_json::json!({
+                "issuer": issuer, "clientId": "legion",
+                "consoleUrl": format!("https://{console}"),
+            })
+            .to_string()
+            .into_bytes(),
+            client_secret: "s3cret".into(),
+            remove: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(set.has_secret);
+    let mut objects = ObjectsClient::new(f.admin.clone());
+    for (kind, ns, name, spec) in [
+        ("Namespace", "", "shop", serde_json::json!({})),
+        (
+            "RoleBinding",
+            "shop",
+            "shop-team",
+            serde_json::json!({ "group": "shop-team", "role": "edit" }),
+        ),
+    ] {
+        objects.apply(object(kind, ns, name, spec)).await.unwrap();
+    }
+    let get_as = |path: String, cookie: Option<String>| {
+        let (ca, console) = (&f.ca, &console);
+        async move { https(ca, console, "GET", &path, cookie.as_deref(), None, None).await }
+    };
+    let r = get_as("/api/console-settings".into(), None).await;
+    assert!(r.body["sso"]["label"].is_string(), "{}", r.text);
+
+    // To the provider, with a flow only this browser holds.
+    let r = get_as("/api/oidc/start".into(), None).await;
+    assert_eq!(r.status, 303, "{}", r.text);
+    let to = reqwest::Url::parse(r.location.as_deref().unwrap()).unwrap();
+    assert!(
+        to.as_str().starts_with(&format!("{issuer}/authorize?")),
+        "{to}"
+    );
+    let q: std::collections::HashMap<String, String> = to.query_pairs().into_owned().collect();
+    assert_eq!(q["redirect_uri"], callback);
+    assert_eq!(q["code_challenge_method"], "S256");
+    assert_eq!(q["scope"], "openid email profile");
+    let flow = r
+        .cookies
+        .iter()
+        .find(|c| c.starts_with("legion_oidc="))
+        .expect("the flow's cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    {
+        let mut idp = idp.lock().unwrap();
+        idp.challenge = q["code_challenge"].clone();
+        idp.nonce = q["nonce"].clone();
+    }
+    let back = |state: String, cookie: Option<String>| {
+        get_as(
+            format!("/api/oidc/callback?code=good-code&state={state}"),
+            cookie,
+        )
+    };
+    let failed = |r: &Response| {
+        r.status == 303
+            && r.location
+                .as_deref()
+                .is_some_and(|l| l.starts_with("/login#error="))
+    };
+
+    // Not this browser's flow, or not its state: no one signed in, and the
+    // code not spent.
+    let r = back(q["state"].clone(), None).await;
+    assert!(failed(&r), "{:?}", r.location);
+    let r = back("forged".into(), Some(flow.clone())).await;
+    assert!(failed(&r), "{:?}", r.location);
+    assert!(!idp.lock().unwrap().used);
+
+    // The provider's answer: signed in as oidc:alice@example.com, with what
+    // shop-team may do.
+    let r = back(q["state"].clone(), Some(flow.clone())).await;
+    assert_eq!(
+        (r.status, r.location.as_deref()),
+        (303, Some("/")),
+        "{:?}",
+        r.cookies
+    );
+    let session = r
+        .cookies
+        .iter()
+        .find(|c| c.starts_with("legion_session="))
+        .expect("a session")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let me = get_as("/api/me".into(), Some(session.clone())).await;
+    assert_eq!(me.body["name"], "oidc:alice@example.com", "{}", me.text);
+    assert_eq!(me.body["namespaces"], serde_json::json!({ "shop": "edit" }));
+
+    // The code once only.
+    let r = back(q["state"].clone(), Some(flow)).await;
+    assert!(failed(&r), "{:?}", r.location);
+    assert!(r.location.unwrap().contains("refused"));
+
+    // Rights stay in the bindings: the group's taken, hers are gone.
+    objects
+        .delete(legion_proto::v1::DeleteRequest {
+            r#ref: Some(legion_proto::v1::ObjectRef {
+                kind: "RoleBinding".into(),
+                namespace: "shop".into(),
+                name: "shop-team".into(),
+            }),
+            expected_version: None,
+        })
+        .await
+        .unwrap();
+    let me = get_as("/api/me".into(), Some(session)).await;
+    assert_eq!(me.body["namespaces"], serde_json::json!({}), "{}", me.text);
+
+    // Off: the start page says so.
+    cluster
+        .set_console_oidc(SetConsoleOidcRequest {
+            remove: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let r = get_as("/api/oidc/start".into(), None).await;
+    assert!(failed(&r), "{:?}", r.location);
 
     let _ = f.stop.send(());
     f.task.await.unwrap();

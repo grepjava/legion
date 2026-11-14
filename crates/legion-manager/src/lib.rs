@@ -28,6 +28,7 @@ pub mod logsearch;
 mod managers;
 pub mod metrics;
 mod migrate;
+mod oidc;
 mod quota;
 mod raft_net;
 mod removed;
