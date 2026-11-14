@@ -1,4 +1,4 @@
-import type { Alert, KindInfo, Me } from './api';
+import type { Alert, ConsoleSettings, KindInfo, Me } from './api';
 
 /** Who is signed in, the kinds there are, and the namespace being looked at. */
 export const session = $state({
@@ -9,7 +9,9 @@ export const session = $state({
   /** The user's alerts, kept current while signed in. */
   alerts: [] as Alert[],
   /** Why the alerts could not be followed, if they could not. */
-  alertsError: ''
+  alertsError: '',
+  /** The console's settings: the banner alone until signed in. */
+  settings: {} as ConsoleSettings
 });
 
 /** The namespaces the user has a role in; for the admin, those listed. */

@@ -550,3 +550,22 @@ export interface Template {
 export function templates(): Promise<{ templates: Template[] }> {
   return call('GET', '/api/templates');
 }
+
+/** The console's settings (`legion console settings`): before signing in,
+ * the banner alone. */
+export interface ConsoleSettings {
+  banner?: { text: string; level?: 'info' | 'warning' | 'danger' };
+  links?: { label: string; url: string }[];
+  defaultNamespace?: string;
+  /** Such as `8h`. */
+  session?: string;
+}
+
+export function consoleSettings(): Promise<ConsoleSettings> {
+  return call('GET', '/api/console-settings');
+}
+
+/** `legion console configure`: the cluster admin only. */
+export function setConsoleSettings(s: ConsoleSettings): Promise<ConsoleSettings> {
+  return call('POST', '/api/console-settings', s);
+}

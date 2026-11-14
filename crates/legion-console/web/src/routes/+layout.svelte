@@ -2,7 +2,7 @@
   import '../app.css';
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
-  import { api, followAlerts, setToken, whenSignedOut } from '#lib/api.ts';
+  import { api, consoleSettings, followAlerts, setToken, whenSignedOut } from '#lib/api.ts';
   import { plural } from '#lib/kinds.ts';
   import { namespaces, session } from '#lib/session.svelte.ts';
 
@@ -57,6 +57,24 @@
     goto('/login');
   }
 
+  // The settings: the banner before signing in, all of them after; the
+  // default namespace chosen once a sign-in, if the user may read it.
+  let defaulted = false;
+  $effect(() => {
+    const me = session.me;
+    if (!me) defaulted = false;
+    consoleSettings()
+      .then((s) => {
+        session.settings = s;
+        const ns = s.defaultNamespace;
+        if (me && ns && !defaulted && !session.namespace && (me.all || ns in me.namespaces)) {
+          session.namespace = ns;
+        }
+        if (me) defaulted = true;
+      })
+      .catch(() => {});
+  });
+
   const choices = $derived(namespaces(adminNamespaces));
   const nsKinds = $derived(session.kinds.filter((k) => !k.clusterScoped));
   const clusterKinds = $derived(
@@ -64,6 +82,9 @@
   );
 </script>
 
+{#if session.settings.banner}
+  <div class="banner {session.settings.banner.level ?? 'info'}" role="note">{session.settings.banner.text}</div>
+{/if}
 {#if page.url.pathname === '/login'}
   {@render children()}
 {:else if session.me}
@@ -91,6 +112,12 @@
         <a href="/apply" class:here={page.url.pathname === '/apply'}>Apply YAML</a>
         <a href="/topology" class:here={page.url.pathname === '/topology'}>Topology</a>
         <a href="/network" class:here={page.url.pathname === '/network'}>Network</a>
+        {#if session.settings.links?.length}
+          <h2>Links</h2>
+          {#each session.settings.links as l, i (i)}
+            <a href={l.url} target="_blank" rel="noopener noreferrer">{l.label}</a>
+          {/each}
+        {/if}
         <h2>Workloads and config</h2>
         {#each nsKinds as k (k.kind)}
           <a href="/k/{k.kind}" class:here={page.url.pathname.startsWith(`/k/${k.kind}`)}
@@ -101,6 +128,7 @@
           <h2>Cluster</h2>
           <a href="/cluster" class:here={page.url.pathname === '/cluster'}>Operations</a>
           <a href="/audit" class:here={page.url.pathname === '/audit'}>Audit</a>
+          <a href="/settings" class:here={page.url.pathname === '/settings'}>Console settings</a>
           {#each clusterKinds as k (k.kind)}
             <a href="/k/{k.kind}" class:here={page.url.pathname.startsWith(`/k/${k.kind}`)}
               >{plural(k.kind)}</a

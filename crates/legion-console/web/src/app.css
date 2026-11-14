@@ -393,3 +393,19 @@ table.matrix td.some {
 table.matrix td.no {
   color: var(--muted);
 }
+
+/* The console's banner (`legion console configure`), above every page:
+   white on colours dark enough for WCAG AA in either theme. */
+.banner {
+  padding: 0.35rem 1rem;
+  text-align: center;
+  font-weight: 600;
+  color: #fff;
+  background: #1f4e79;
+}
+.banner.warning {
+  background: #7a4f00;
+}
+.banner.danger {
+  background: #a4161a;
+}
