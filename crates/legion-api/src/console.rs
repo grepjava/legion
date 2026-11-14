@@ -78,10 +78,7 @@ impl Settings {
             text("banner.text", &b.text)?;
         }
         if self.links.len() > MAX_LINKS {
-            return Err(Invalid::new(
-                "links",
-                format!("at most {MAX_LINKS} links"),
-            ));
+            return Err(Invalid::new("links", format!("at most {MAX_LINKS} links")));
         }
         for (i, l) in self.links.iter().enumerate() {
             text(&format!("links[{i}].label"), &l.label)?;
@@ -101,13 +98,97 @@ impl Settings {
         if let Some(s) = self.session
             && !(SHORTEST_SESSION..=LONGEST_SESSION).contains(&s)
         {
-            return Err(Invalid::new(
-                "session",
-                "must be between 5m and 168h",
-            ));
+            return Err(Invalid::new("session", "must be between 5m and 168h"));
         }
         Ok(())
     }
+}
+
+/// Single sign-on (CONSOLE.md phase 6): an OpenID Connect provider the
+/// console signs users in with. Its client secret is kept apart and never
+/// shown again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Oidc {
+    /// The provider's issuer URL, as its ID tokens say it.
+    pub issuer: String,
+    pub client_id: String,
+    /// The console's address as browsers reach it, e.g.
+    /// `https://console.example:7480`; the provider sends them back to
+    /// `<url>/api/oidc/callback`, which it must allow.
+    pub console_url: String,
+    /// The claim naming the user, who is then `oidc:<it>`.
+    #[serde(default = "email")]
+    pub username_claim: String,
+    /// The claim listing the user's groups.
+    #[serde(default = "groups")]
+    pub groups_claim: String,
+    #[serde(default = "scopes")]
+    pub scopes: Vec<String>,
+    /// What the sign-in button says.
+    #[serde(default = "label")]
+    pub label: String,
+}
+
+fn email() -> String {
+    "email".into()
+}
+fn groups() -> String {
+    "groups".into()
+}
+fn scopes() -> Vec<String> {
+    ["openid", "email", "profile"].map(String::from).to_vec()
+}
+fn label() -> String {
+    "Sign in with single sign-on".into()
+}
+
+impl Oidc {
+    /// Where the provider sends the browser back.
+    pub fn redirect_uri(&self) -> String {
+        format!(
+            "{}/api/oidc/callback",
+            self.console_url.trim_end_matches('/')
+        )
+    }
+
+    pub fn check(&self) -> Result<(), Invalid> {
+        for (path, url) in [("issuer", &self.issuer), ("consoleUrl", &self.console_url)] {
+            if !secure_url(url) {
+                return Err(Invalid::new(
+                    path,
+                    "must be an https:// address (http:// only on this host, for tests)",
+                ));
+            }
+        }
+        text("clientId", &self.client_id)?;
+        text("usernameClaim", &self.username_claim)?;
+        text("groupsClaim", &self.groups_claim)?;
+        text("label", &self.label)?;
+        if !self.scopes.iter().any(|s| s == "openid") {
+            return Err(Invalid::new("scopes", "must include openid"));
+        }
+        for (i, s) in self.scopes.iter().enumerate() {
+            if s.is_empty() || !s.chars().all(|c| c.is_ascii_graphic()) {
+                return Err(Invalid::new(format!("scopes[{i}]"), "must be one word"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `https://`, or `http://` to this host alone (a provider played by a
+/// test).
+pub fn secure_url(url: &str) -> bool {
+    let plain_local = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
+        .iter()
+        .any(|p| {
+            url.strip_prefix(p)
+                .is_some_and(|r| r.is_empty() || r.starts_with([':', '/']))
+        });
+    (url.starts_with("https://") || plain_local)
+        && url.len() <= 2000
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 fn text(path: &str, t: &str) -> Result<(), Invalid> {
@@ -149,13 +230,22 @@ mod tests {
             }
         );
         assert_eq!(Settings::default().session(), DEFAULT_SESSION);
-        assert_eq!(read("banner: { text: hi }").banner.unwrap().level, Level::Info);
+        assert_eq!(
+            read("banner: { text: hi }").banner.unwrap().level,
+            Level::Info
+        );
 
         for (yaml, path) in [
             ("banner: { text: \" \" }", "banner.text"),
             ("banner: { text: \"a\\nb\" }", "banner.text"),
-            ("links: [{ label: x, url: \"javascript:alert(1)\" }]", "links[0].url"),
-            ("links: [{ label: x, url: \"https://a b\" }]", "links[0].url"),
+            (
+                "links: [{ label: x, url: \"javascript:alert(1)\" }]",
+                "links[0].url",
+            ),
+            (
+                "links: [{ label: x, url: \"https://a b\" }]",
+                "links[0].url",
+            ),
             ("defaultNamespace: Shop", "defaultNamespace"),
             ("session: 1m", "session"),
             ("session: 200h", "session"),
@@ -163,5 +253,35 @@ mod tests {
             assert_eq!(read(yaml).check().unwrap_err().path, path, "{yaml}");
         }
         assert!(serde_yaml_ng::from_str::<Settings>("theme: dark").is_err());
+    }
+
+    #[test]
+    fn oidc_is_read_with_defaults_and_checked() {
+        let o: Oidc = serde_yaml_ng::from_str(
+            "issuer: https://idp.example\nclientId: legion\nconsoleUrl: https://console.example:7480/\n",
+        )
+        .unwrap();
+        o.check().unwrap();
+        assert_eq!(o.username_claim, "email");
+        assert_eq!(o.groups_claim, "groups");
+        assert_eq!(o.scopes, ["openid", "email", "profile"]);
+        assert_eq!(
+            o.redirect_uri(),
+            "https://console.example:7480/api/oidc/callback"
+        );
+        let bad = |f: &dyn Fn(&mut Oidc)| {
+            let mut b = o.clone();
+            f(&mut b);
+            b.check().unwrap_err().path
+        };
+        assert_eq!(bad(&|b| b.issuer = "http://idp.example".into()), "issuer");
+        assert_eq!(
+            bad(&|b| b.issuer = "http://localhost.evil".into()),
+            "issuer"
+        );
+        assert_eq!(bad(&|b| b.scopes = vec!["email".into()]), "scopes");
+        assert_eq!(bad(&|b| b.client_id = String::new()), "clientId");
+        assert!(secure_url("http://127.0.0.1:5556/dex"));
+        assert!(secure_url("http://localhost"));
     }
 }
