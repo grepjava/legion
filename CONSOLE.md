@@ -283,11 +283,45 @@ their tasks are ready, the Routes to them, what may reach what among them
 as `legion reach` gives it, and the Volumes they use, followed live, each
 box leading to its object. The lab test deploys from the form and from a
 saved template with its variable set, and sees both in the topology
-(passed on 5b762be). Not
-yet: builds. jailer is a command, with no API for the console to call; a
-build needs either jailer serving one, or a Legion Job running `jailer
-build` in a jail allowed to make jails, pushing to the cluster's registry.
-That choice is jailer's as much as Legion's, so the "done when" waits on it.
+(passed on 5b762be).
+
+**Builds** (design; chosen 2026-11-14: on builder nodes, no pod may make
+jails). jailer is a command with no API; a node the operator chose runs it
+on the host, as its agent is told, the way a Volume's data is sent.
+
+- *The object.* A `Build` in a namespace: a source (a Git repository, a
+  ref and a directory in it; or a Containerfile written out, with nothing
+  else), the image to push (`registry/repo:tag`), the Secret holding the
+  registry's login (a Docker config, as `imagePullSecrets`), and,
+  optionally, the Service and container to roll out once pushed. Its
+  status: `Pending`, `Running` on a node, `Succeeded` with the pushed
+  digest and the reference pinned to it, or `Failed` saying why; the last
+  of its log is kept with it. A Build runs once; another build is another
+  Build. Who may write Services in a namespace may write Builds there.
+- *Where it runs.* Nodes labelled `legion.builder=true`, ready, one build
+  at a time each; a Build waits while none is free. The node needs jailer
+  (the agent's `--jailer`, `jailer` on the PATH by default) and, for Git
+  sources, git. Its `RUN` steps run in jailer's build jails on that host,
+  as a workload's would in Legion's: who may run workloads in a namespace
+  may build there.
+- *How.* The leader offers the node's agent a session with a `build`
+  action, as it does a Volume's export: the agent fetches the source
+  (`git clone --depth 1`), writes the login where jailer reads one
+  (`REGISTRY_AUTH_FILE`), runs `jailer build` and `jailer push` with a
+  release record, and sends their output as it comes, then what it
+  pushed. The leader keeps the log and sets the status; with a rollout
+  named, it sets that container's image to the pinned reference, and the
+  rollout is the Service's own. The session ending early, the node lost or
+  the leader changing fail the Build, saying so.
+- *Its log, live.* `Cluster.BuildLogs` (to the leader), `legion build logs
+  -f`, and the console's Build page, following it as it is written.
+- *In the console.* Builds are listed as any kind; a Service's page offers
+  "Build a new image" (a Git repository or a Containerfile, the image to
+  push, the login), which makes a Build rolling the Service out, and opens
+  its log.
+- *Done when*, on the lab: a user who has never used the CLI deploys an
+  example from the catalog, builds a new image for it with jailer from the
+  console, and sees the build's log and the rollout.
 
 ## Phase 6: enterprise
 
