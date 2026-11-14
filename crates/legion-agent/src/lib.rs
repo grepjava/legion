@@ -21,6 +21,8 @@ use legion_sys::Sys;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
+mod build;
+pub use build::Builder;
 pub mod control;
 pub mod fake;
 mod files;
@@ -98,6 +100,9 @@ pub struct AgentConfig {
     /// The node resolver as a process of its own, which outlives the
     /// agent; without it, the agent serves DNS itself.
     pub resolver: Option<ExternalResolver>,
+    /// How the node runs the Builds the managers give it, if they give it
+    /// any (it is labelled a builder): jailer, on the host.
+    pub builder: Builder,
 }
 
 /// Where volume plugins are by default.
@@ -138,6 +143,7 @@ impl std::fmt::Debug for WireGuardKey {
 impl AgentConfig {
     pub fn new(node: &str, files_dir: impl Into<PathBuf>) -> Self {
         let files_dir: PathBuf = files_dir.into();
+        let files_dir_for_builds = files_dir.with_file_name("builds");
         AgentConfig {
             node: node.to_owned(),
             infra_image: "docker.io/freebsd/freebsd-runtime:15.1".to_owned(),
@@ -155,6 +161,7 @@ impl AgentConfig {
             ingress_tls: None,
             load_balancer_interface: None,
             resolver: None,
+            builder: Builder::new(files_dir_for_builds),
         }
     }
 }
@@ -169,6 +176,7 @@ pub struct Agent<R, C> {
     wireguard: Option<WireGuardConfig>,
     load_balancer_interface: Option<String>,
     resolver: Option<ExternalResolver>,
+    builder: Arc<Builder>,
 }
 
 /// A running task worker.
@@ -210,6 +218,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             wireguard: config.wireguard,
             load_balancer_interface: config.load_balancer_interface,
             resolver: config.resolver,
+            builder: Arc::new(config.builder),
         }
     }
 
@@ -318,6 +327,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 zfs_root: ctx.zfs_root.clone(),
                 lock: ctx.volume_lock.clone(),
             }),
+            self.builder.clone(),
             ctx.control.sessions(&ctx.node),
         ));
         let net = legion_net::PodNetwork::new(registration.pod_cidr);

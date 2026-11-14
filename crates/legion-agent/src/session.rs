@@ -41,6 +41,7 @@ pub(crate) async fn serve<R: Runtime>(
     node: String,
     kept: Option<PathBuf>,
     volumes: Arc<Volumes>,
+    builder: Arc<crate::Builder>,
     mut offers: mpsc::Receiver<Offer>,
 ) {
     while let Some(offer) = offers.recv().await {
@@ -49,6 +50,7 @@ pub(crate) async fn serve<R: Runtime>(
             node.clone(),
             kept.clone(),
             volumes.clone(),
+            builder.clone(),
             offer,
         ));
     }
@@ -59,6 +61,7 @@ async fn run<R: Runtime>(
     node: String,
     kept: Option<PathBuf>,
     volumes: Arc<Volumes>,
+    builder: Arc<crate::Builder>,
     offer: Offer,
 ) {
     let id = offer.offer.id.clone();
@@ -117,6 +120,9 @@ async fn run<R: Runtime>(
         }
         Some(Action::VolumeImport(opts)) => {
             transfer::import(&volumes, &open.namespace, opts, &tx, &mut inbound).await
+        }
+        Some(Action::Build(opts)) => {
+            crate::build::run(&builder, &id, opts, &tx, &mut inbound).await
         }
         None => Err(Status::invalid_argument("the session has no action")),
     };

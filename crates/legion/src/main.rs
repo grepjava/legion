@@ -171,6 +171,14 @@ enum Command {
         /// /usr/local/libexec/legion/volume].
         #[arg(long)]
         volume_plugins: Option<PathBuf>,
+        /// The jailer a builder node (labelled `legion.builder=true`) builds
+        /// images with, for Builds.
+        #[arg(long, default_value = "jailer")]
+        jailer: String,
+        /// An argument put before each of jailer's commands, such as
+        /// `--state-dir=/var/db/legion-builds`; may be given again.
+        #[arg(long = "jailer-arg", allow_hyphen_values = true)]
+        jailer_args: Vec<String>,
     },
     /// Start a new cluster with the reached manager as its first member.
     Init,
@@ -471,6 +479,16 @@ enum Command {
         #[arg(long)]
         tail: Option<u32>,
     },
+    /// Print a Build's log: as it is written with --follow while the
+    /// build runs, else what is kept of it.
+    BuildLogs {
+        build: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// Keep printing until the build ends.
+        #[arg(short, long)]
+        follow: bool,
+    },
     /// Search a Service's or Job's logs across its tasks: the lines from
     /// --since (and before --until), holding TEXT if given, oldest first,
     /// each with its time and task.
@@ -745,6 +763,8 @@ async fn run() -> anyhow::Result<()> {
             mesh_relay,
             load_balancer_interface,
             volume_plugins,
+            jailer,
+            jailer_args,
             insecure_registries,
             audit_retention_days,
             audit_max_events,
@@ -796,6 +816,7 @@ async fn run() -> anyhow::Result<()> {
                 mesh_relay,
                 load_balancer_interface,
                 volume_plugins,
+                jailer: std::iter::once(jailer).chain(jailer_args).collect(),
                 insecure_registries,
                 audit: legion_manager::AuditRetention {
                     age: std::time::Duration::from_secs(audit_retention_days * 24 * 3600),
