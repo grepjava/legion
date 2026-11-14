@@ -422,8 +422,21 @@ not yet checked by a tool or a screen reader):
 - *Reflow and targets.* Below 48rem (a phone, or 400% zoom) the side bar
   goes above the page and wide tables scroll on their own; small buttons
   (a label's remove) are 24 by 24 px at least.
-- *Still to do.* An automated check (axe) on every page in the lab's
-  browser test, a screen reader pass, and the charts' values as a table.
+- *Checked by axe.* The lab's browser test runs axe-core (pinned as a
+  devDependency) on sixteen pages against WCAG 2.2 A and AA; its first run
+  found links in text told apart by colour alone, now underlined. It
+  passed on 4373b5f.
+- *Still to do.* A screen reader pass, and the charts' values as a table.
+
+**In the lab** (`the_console_runs_the_cluster`, phase 6, passed on
+4373b5f): the admin names the cluster and sets a banner, which the
+editor's pages show, titled by page and cluster; the keyboard reaches the
+skip link first and moves along an object's tabs; a plugin in team-a is
+listed, sandboxed, and reads team-a's Services through the console as the
+editor; axe on every page. The settings form taking input before it had
+read the settings, which then replaced it, was found there. Not in the lab
+yet: a second cluster, and single sign-on with a real provider (the
+"done when").
 
 **Translations** (the mechanism; no language but English yet). The console
 is written in English and every string a person reads goes through `t()`,
