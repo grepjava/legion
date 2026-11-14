@@ -106,7 +106,8 @@
     '/cluster': t('Operations'),
     '/audit': t('Audit'),
     '/settings': t('Console settings'),
-    '/clusters': t('Clusters')
+    '/clusters': t('Clusters'),
+    '/build': t('Build a new image')
   });
   const title = $derived.by(() => {
     const path = page.url.pathname;

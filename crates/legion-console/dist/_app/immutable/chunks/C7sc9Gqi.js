@@ -1,0 +1,3 @@
+import{$ as e,A as t,J as n,M as r,O as i,U as a,at as o,h as s,it as c,m as l,nt as u,q as d,tt as f,v as p,y as m,z as h}from"./DLUDR48U.js";var g=r(`<span> </span>
+`,1),_=r(`<pre class="diff"></pre>`);function v(r,v){u(v,!0);let y=e(()=>v.text.split(`
+`).map(e=>({l:e,c:e.startsWith(`+++`)||e.startsWith(`---`)?`head`:e.startsWith(`+`)?`add`:e.startsWith(`-`)?`del`:e.startsWith(`@@`)?`hunk`:``})));var b=_();p(b,21,()=>h(y),m,(e,r)=>{let o=()=>h(r).l,u=()=>h(r).c;var f=g(),p=d(f),m=n(p,!0);c(),a(()=>{l(p,1,s(u())),i(m,o())}),t(e,f)}),o(b),t(r,b),f()}export{v as t};

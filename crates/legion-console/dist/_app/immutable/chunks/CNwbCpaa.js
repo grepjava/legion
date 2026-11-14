@@ -1,3 +1,0 @@
-import{D as e,H as t,K as n,Q as r,R as i,_ as a,et as o,it as s,j as c,k as l,m as u,p as d,q as f,rt as p,tt as m,v as h}from"./CPOpKgpW.js";var g=c(`<span> </span>
-`,1),_=c(`<pre class="diff"></pre>`);function v(c,v){m(v,!0);let y=r(()=>v.text.split(`
-`).map(e=>({l:e,c:e.startsWith(`+++`)||e.startsWith(`---`)?`head`:e.startsWith(`+`)?`add`:e.startsWith(`-`)?`del`:e.startsWith(`@@`)?`hunk`:``})));var b=_();a(b,21,()=>i(y),h,(r,a)=>{let o=()=>i(a).l,s=()=>i(a).c;var c=g(),m=n(c),h=f(m,!0);p(),t(()=>{d(m,1,u(s())),e(h,o())}),l(r,c)}),s(b),l(c,b),o()}export{v as t};

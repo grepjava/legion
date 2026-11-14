@@ -14,6 +14,7 @@
   import Quotas from '#lib/Quotas.svelte';
   import UsageCharts from '#lib/UsageCharts.svelte';
   import VolumeData from '#lib/VolumeData.svelte';
+  import BuildLog from '#lib/BuildLog.svelte';
   import { session } from '#lib/session.svelte.ts';
   import { toYaml } from '#lib/yaml.ts';
 
@@ -23,14 +24,27 @@
   let object: LObject | null = $state(null);
   let error = $state('');
   let gone = $state(false);
-  let tab: 'details' | 'rollout' | 'tasks' | 'usage' | 'quota' | 'search' | 'logs' | 'terminal' | 'data' | 'yaml' =
+  let tab:
+    | 'details'
+    | 'rollout'
+    | 'tasks'
+    | 'usage'
+    | 'quota'
+    | 'search'
+    | 'logs'
+    | 'terminal'
+    | 'data'
+    | 'buildlog'
+    | 'yaml' =
     $state('details');
 
   $effect(() => {
     object = null;
     error = '';
     gone = false;
-    tab = 'details';
+    // The tab the address names (`?tab=buildlog`), if the kind has it.
+    const wanted = page.url.searchParams.get('tab');
+    tab = tabs.find((x) => x.id === wanted)?.id ?? 'details';
     api
       .get(kind, namespace, name)
       .then((o) => (object = o))
@@ -62,6 +76,7 @@
           { id: 'terminal', label: t('Terminal') }
         ]
       : []),
+    ...(kind === 'Build' ? [{ id: 'buildlog', label: t('Log') }] : []),
     { id: 'yaml', label: t('YAML') }
   ] as { id: typeof tab; label: string }[]);
   // The tabs as WAI-ARIA's pattern has them: one stop for Tab, arrows,
@@ -150,6 +165,8 @@
         <dd><Taints node={object} /></dd>
       {/if}
     </dl>
+  {:else if tab === 'buildlog'}
+    <BuildLog build={object} />
   {:else if tab === 'tasks'}
     <NodeTasks node={object} />
   {:else if tab === 'search'}

@@ -100,6 +100,13 @@
   {/if}
 
   {#if kind === 'Service'}
+    <button
+      disabled={!!why}
+      title={why ?? ''}
+      onclick={() =>
+        goto(`/build?namespace=${encodeURIComponent(ns)}&service=${encodeURIComponent(name)}`)}
+      >{t('Build a new image')}</button
+    >
     <span class="group">
       <input type="number" min="0" bind:value={replicas} aria-label={t('Replicas')} disabled={!!why} />
       <button

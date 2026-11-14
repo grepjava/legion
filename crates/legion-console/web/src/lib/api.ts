@@ -302,10 +302,38 @@ export function logs(
   if (opts.container) params.set('container', opts.container);
   if (opts.tail !== undefined) params.set('tail', String(opts.tail));
   if (opts.follow) params.set('follow', 'true');
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const socket = new WebSocket(
-    `${proto}//${location.host}/api/logs/${encodeURIComponent(namespace)}/${encodeURIComponent(task)}?${params}`
+  return logSocket(
+    `/api/logs/${encodeURIComponent(namespace)}/${encodeURIComponent(task)}?${params}`,
+    out,
+    done
   );
+}
+
+/**
+ * A Build's log (CONSOLE.md phase 5), followed while it runs with `follow`:
+ * as `logs` gives a task's.
+ */
+export function buildLog(
+  namespace: string,
+  name: string,
+  follow: boolean,
+  out: (text: string, stderr: boolean) => void,
+  done: (error: string | null) => void
+): () => void {
+  return logSocket(
+    `/api/build-logs/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}${follow ? '?follow=true' : ''}`,
+    out,
+    done
+  );
+}
+
+function logSocket(
+  path: string,
+  out: (text: string, stderr: boolean) => void,
+  done: (error: string | null) => void
+): () => void {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const socket = new WebSocket(`${proto}//${location.host}${path}`);
   let ended = false;
   const end = (e: string | null) => {
     if (!ended) done(e);

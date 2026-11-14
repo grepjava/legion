@@ -96,6 +96,18 @@ export function columns(kind: string): Column[] {
         { label: t('Keys'), value: (o) => s(o.spec?.keys?.length ?? 0) },
         { label: t('Mode'), value: (o) => s(o.spec?.mode ?? 'enforce') }
       ];
+    case 'Build':
+      return [
+        { label: t('Phase'), value: (o) => s(o.status?.phase ?? 'Pending'), state: true },
+        { label: t('Image'), value: (o) => s(o.spec?.image) },
+        {
+          label: t('Source'),
+          value: (o) => s(o.spec?.source?.git?.url ?? (o.spec?.source?.containerfile ? t('Containerfile') : ''))
+        },
+        { label: t('Node'), value: (o) => s(o.status?.node) },
+        { label: t('Pushed'), value: (o) => s(o.status?.pinned) },
+        { label: t('Why'), value: (o) => s(o.status?.message) }
+      ];
     case 'RoleBinding':
       return [
         { label: t('User'), value: (o) => s(o.spec?.user) },
@@ -109,7 +121,8 @@ export function columns(kind: string): Column[] {
 
 /** A colour class for a state. */
 export function tone(state: string): string {
-  switch (state) {
+  switch (state.toLowerCase()) {
+    case 'succeeded':
     case 'ready':
     case 'running':
     case 'complete':
