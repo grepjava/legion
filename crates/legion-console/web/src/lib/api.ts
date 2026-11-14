@@ -110,6 +110,9 @@ export const api = {
   /** What may reach what among a namespace's services, as `legion reach`. */
   reach: (namespace: string) =>
     call<{ services: string[]; edges: ReachEdge[] }>('GET', `/api/reach${q(namespace)}`),
+  /** A namespace's load balancer addresses and which node holds each, as `legion lb`. */
+  loadBalancers: (namespace: string) =>
+    call<{ balancers: Balancer[] }>('GET', `/api/load-balancers${q(namespace)}`),
 
   // Writes, as the user, each checked by the API as the CLI's are.
   manifest: (kind: string, namespace: string, name: string) =>
@@ -218,6 +221,15 @@ export interface CaStatus {
   previous: string;
   since_ms: number;
   holders: { name: string; kind: string; issuer: string }[];
+}
+
+export interface Balancer {
+  service: string;
+  address: string;
+  vhid: number;
+  /** By CARP skew, the lowest meant to be master; `state` as the node last
+   * reported it (`master`, `backup`, `init`), empty when it has not. */
+  nodes: { node: string; skew: number; state: string }[];
 }
 
 export interface ReachEdge {
