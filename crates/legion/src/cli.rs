@@ -348,6 +348,68 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 output.display()
             );
         }
+        Command::Console {
+            action,
+            file,
+            remove,
+            ..
+        } if action == "oidc" => {
+            let r = if remove {
+                cluster
+                    .set_console_oidc(pb::SetConsoleOidcRequest {
+                        remove: true,
+                        ..Default::default()
+                    })
+                    .await?
+            } else if let Some(file) = file {
+                let text = if file == Path::new("-") {
+                    let mut s = String::new();
+                    std::io::stdin().read_to_string(&mut s)?;
+                    s
+                } else {
+                    std::fs::read_to_string(&file)
+                        .with_context(|| format!("reading {}", file.display()))?
+                };
+                let mut v: serde_json::Value = serde_yaml_ng::from_str(&text)
+                    .with_context(|| format!("reading {}", file.display()))?;
+                let secret = v
+                    .as_object_mut()
+                    .and_then(|m| m.remove("clientSecret"))
+                    .map(|s| s.as_str().map(str::to_owned).unwrap_or_default())
+                    .unwrap_or_default();
+                let oidc: legion_api::console::Oidc = serde_json::from_value(v)
+                    .with_context(|| format!("reading {}", file.display()))?;
+                oidc.check()
+                    .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
+                cluster
+                    .set_console_oidc(pb::SetConsoleOidcRequest {
+                        oidc_json: serde_json::to_vec(&oidc)?,
+                        client_secret: secret,
+                        remove: false,
+                    })
+                    .await?
+            } else {
+                cluster.console_oidc(pb::ConsoleOidcRequest {}).await?
+            }
+            .into_inner();
+            if r.oidc_json.is_empty() {
+                eprintln!("single sign-on is off");
+            } else {
+                let oidc: legion_api::console::Oidc = serde_json::from_slice(&r.oidc_json)?;
+                print!("{}", serde_yaml_ng::to_string(&oidc)?);
+                println!(
+                    "clientSecret: {}",
+                    if r.has_secret { "(set)" } else { "(none)" }
+                );
+                eprintln!(
+                    "the provider must allow {} as a redirect; bind users as oidc:<{}> \
+                     and groups from {:?} in RoleBindings",
+                    oidc.redirect_uri(),
+                    oidc.username_claim,
+                    oidc.groups_claim
+                );
+            }
+        }
         Command::Console { action, file, .. } if action == "settings" || action == "configure" => {
             let r = if action == "settings" {
                 cluster
@@ -365,7 +427,9 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 };
                 let settings: legion_api::console::Settings = serde_yaml_ng::from_str(&text)
                     .with_context(|| format!("reading {}", file.display()))?;
-                settings.check().map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
+                settings
+                    .check()
+                    .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
                 cluster
                     .set_console_settings(pb::SetConsoleSettingsRequest {
                         settings_json: serde_json::to_vec(&settings)?,

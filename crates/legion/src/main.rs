@@ -231,16 +231,29 @@ enum Command {
     ///   links: [{ label: Runbook, url: "https://wiki.example/run" }]
     ///   defaultNamespace: shop
     ///   session: 8h                                  # 5m to 168h
+    ///
+    /// `oidc` shows single sign-on's provider; `oidc -f FILE` sets it, the
+    /// client secret read from the file and never shown again (left out,
+    /// the one set stays); `oidc --remove` turns it off:
+    ///
+    ///   issuer: https://idp.example
+    ///   clientId: legion
+    ///   clientSecret: ...
+    ///   consoleUrl: https://console.example:7480   # allow <it>/api/oidc/callback
+    ///   usernameClaim: email      # the user is oidc:<it>; groupsClaim: groups
     Console {
-        #[arg(value_parser = ["login", "settings", "configure"])]
+        #[arg(value_parser = ["login", "settings", "configure", "oidc"])]
         action: String,
         /// The console's address, as a browser reaches it [default: the
         /// --server host, port 7480].
         #[arg(long)]
         url: Option<String>,
-        /// For `configure`: the settings, as YAML; `-` for stdin.
+        /// For `configure` and `oidc`: the settings, as YAML; `-` for stdin.
         #[arg(short, long)]
         file: Option<PathBuf>,
+        /// For `oidc`: turn single sign-on off.
+        #[arg(long)]
+        remove: bool,
     },
     /// Give a locked manager on this host its unlock key, read from
     /// --key-file or else from stdin.
