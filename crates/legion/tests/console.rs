@@ -1,4 +1,4 @@
-//! The web console on three nodes (CONSOLE.md, phases 1 to 5), in a real
+//! The web console on three nodes (CONSOLE.md, phases 1 to 6), in a real
 //! browser: a headless Chromium signs in as a user who may only look, a
 //! user who may change a namespace and the cluster admin, and does through
 //! the console's pages what each phase's "done when" asks.
@@ -18,6 +18,12 @@
 //! - Phase 5: the editor deploys from an image with the form, saves a
 //!   compose file as a template and deploys it from the catalog with its
 //!   variable set, and sees both healthy in the topology.
+//! - Phase 6: the admin names the cluster and sets a banner, which the
+//!   editor's pages show, titled by page and cluster; the keyboard reaches
+//!   the skip link first and moves along an object's tabs with the arrows;
+//!   a plugin in team-a is listed, sandboxed, and reads through the console
+//!   as the editor; every page passes axe's WCAG 2.2 A and AA rules
+//!   (`LEGION_AXE` names axe-core's `axe.min.js`).
 //!
 //! It drives real daemons, so it is ignored by default and run on the lab
 //! of `tests/common` (see there), as root, with `LEGION_BROWSER` naming
@@ -193,6 +199,19 @@ fn assert_read_only(b: &mut Browser, page: &str) {
         b.text().contains("Read only:"),
         "{page}: says it is read only"
     );
+}
+
+/// A key pressed and let go, as the keyboard would.
+fn key(b: &mut Browser, key: &str, code: u32) {
+    for kind in ["rawKeyDown", "keyUp"] {
+        b.page(
+            "Input.dispatchKeyEvent",
+            serde_json::json!({
+                "type": kind, "key": key, "code": key,
+                "windowsVirtualKeyCode": code, "nativeVirtualKeyCode": code,
+            }),
+        );
+    }
 }
 
 #[test]
@@ -550,6 +569,137 @@ spec:
              && !!document.querySelector('[aria-label^=\"Volume \"]')",
         ) == serde_json::json!(true)
     });
+    // --- Phase 6 -------------------------------------------------------
+    step("phase 6: the admin names the cluster and sets a banner on the settings page");
+    c.page(&mut a, "/settings");
+    a.until("the settings form", 30, |b| {
+        b.eval("!!H.field('Cluster name')") == serde_json::json!(true)
+    });
+    a.fill("Cluster name", "lab");
+    a.fill("Banner text", "The lab cluster");
+    a.fill("Banner level", "warning");
+    a.click("Save");
+    a.shows("Saved.", 30);
+    c.page(&mut e, "/k/Service");
+    e.shows("The lab cluster", 30);
+    e.until("the page's title names the page and the cluster", 30, |b| {
+        b.eval("document.title") == serde_json::json!("Services · lab · Legion")
+    });
+    assert_eq!(e.eval("document.documentElement.lang"), "en");
+
+    step("phase 6: the keyboard: the skip link first, an object's tabs moved with the arrows");
+    c.page(&mut e, "/k/Service/team-a/hello");
+    e.until("the object's tabs", 30, |b| {
+        b.eval("!!H.button('Rollout')") == serde_json::json!(true)
+    });
+    key(&mut e, "Tab", 9);
+    assert_eq!(
+        e.eval("[document.activeElement.innerText, document.activeElement.getBoundingClientRect().width > 1]"),
+        serde_json::json!(["Skip to the page", true]),
+        "the first stop is the skip link, shown when focused"
+    );
+    e.eval("H.button('Details').focus()");
+    key(&mut e, "ArrowRight", 39);
+    assert_eq!(
+        e.eval("[document.activeElement.innerText, document.activeElement.getAttribute('aria-selected')]"),
+        serde_json::json!(["Rollout", "true"]),
+        "the arrow moved to the next tab and opened it"
+    );
+    key(&mut e, "End", 35);
+    assert_eq!(e.eval("document.activeElement.innerText"), "YAML");
+
+    step("phase 6: a plugin in team-a, listed, fenced in, reading through the console");
+    let plugin = c.lab.dir.join("plugin.yaml");
+    std::fs::write(
+        &plugin,
+        include_str!("../../../examples/console-plugin/plugin.yaml")
+            .replace("namespace: default", "namespace: team-a"),
+    )
+    .unwrap();
+    c.lab.ok(&["apply", "-f", plugin.to_str().unwrap()]);
+    c.page(&mut e, "/");
+    e.shows("services-at-a-glance", 30);
+    c.page(&mut e, "/plugins/team-a/services-at-a-glance");
+    e.until("the plugin's frame", 30, |b| {
+        b.eval("!!document.querySelector('iframe')") == serde_json::json!(true)
+    });
+    assert_eq!(
+        e.eval(
+            "(() => { const f = document.querySelector('iframe');
+               return [f.getAttribute('sandbox'), f.contentDocument === null]; })()"
+        ),
+        serde_json::json!(["allow-scripts", true]),
+        "sandboxed, its document not this page's to reach"
+    );
+    // What the plugin asks, and what the console fetches for it, as this
+    // page sees them; it asks again every 10 s.
+    e.eval(
+        "(() => {
+           window.asked = []; window.fetched = [];
+           addEventListener('message', (m) => asked.push(m.data?.op + ' ' + m.data?.kind));
+           const real = window.fetch;
+           window.fetch = (...a) => real(...a).then((r) => { fetched.push(`${a[0]} ${r.status}`); return r; });
+         })()",
+    );
+    e.until(
+        "the plugin asked for team-a's Services, read as the editor",
+        60,
+        |b| {
+            b.eval(
+                "asked.includes('list Service')
+             && fetched.includes('/api/objects/Service?namespace=team-a 200')",
+            ) == serde_json::json!(true)
+        },
+    );
+
+    step("phase 6: every page passes axe's WCAG 2.2 A and AA rules");
+    let axe = std::fs::read_to_string(
+        std::env::var("LEGION_AXE").expect("set LEGION_AXE to axe-core's axe.min.js"),
+    )
+    .expect("reading axe.min.js");
+    let mut found = Vec::new();
+    for path in [
+        "/",
+        "/alerts",
+        "/deploy",
+        "/templates",
+        "/import",
+        "/apply",
+        "/topology",
+        "/network",
+        "/cluster",
+        "/audit",
+        "/settings",
+        "/clusters",
+        "/k/Service",
+        "/k/Service/team-a/hello",
+        "/k/Node/_/n1",
+        "/plugins/team-a/services-at-a-glance",
+    ] {
+        c.page(&mut a, path);
+        a.until(&format!("{path} drawn"), 30, |b| {
+            b.eval("!!document.querySelector('main h1')") == serde_json::json!(true)
+        });
+        std::thread::sleep(Duration::from_secs(2));
+        a.page(
+            "Runtime.evaluate",
+            serde_json::json!({ "expression": axe, "returnByValue": true }),
+        );
+        let v = a.eval(
+            "axe.run(document, { runOnly: { type: 'tag',
+               values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'] } })
+             .then((r) => r.violations.map((v) => `${v.id} (${v.impact}): ${v.help}: ` +
+               v.nodes.slice(0, 3).map((n) => n.target.join(' ')).join(' | ')))",
+        );
+        for violation in v.as_array().cloned().unwrap_or_default() {
+            found.push(format!(
+                "{path}: {}",
+                violation.as_str().unwrap_or_default()
+            ));
+        }
+    }
+    assert!(found.is_empty(), "axe found:\n{}", found.join("\n"));
+
     for s in ["formed", "sleeper"] {
         c.lab.ok(&["delete", "service", s, "-n", "team-a"]);
     }
