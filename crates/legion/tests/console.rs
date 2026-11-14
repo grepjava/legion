@@ -362,6 +362,23 @@ spec: { text: team-b's }
         c.image() == IMAGE && c.hello_settled(true)
     });
 
+    step("phase 2: restarted: new tasks, the same image");
+    let hello_tasks = || -> std::collections::BTreeSet<String> {
+        c.lab
+            .list("tasks", "team-a")
+            .iter()
+            .filter(|t| t["spec"]["service"] == "hello" && t["spec"]["desiredState"] == "running")
+            .filter_map(|t| t["metadata"]["name"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let before = hello_tasks();
+    e.click("Restart");
+    e.shows("team-a/hello restarting", 30);
+    wait("hello's tasks all new", 600, || {
+        let now = hello_tasks();
+        now.is_disjoint(&before) && c.image() == IMAGE && c.hello_settled(true)
+    });
+
     step("phase 2: a task's logs");
     let (task, _) = c.task_of("hello").expect("a hello task");
     c.page(&mut e, &format!("/k/Task/team-a/{task}"));
