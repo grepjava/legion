@@ -16,6 +16,7 @@ pub mod alert;
 pub mod audit;
 pub mod clock;
 pub mod compose;
+pub mod console;
 pub mod cron;
 pub mod data;
 pub mod dispatch;
