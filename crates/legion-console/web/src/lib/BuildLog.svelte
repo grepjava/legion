@@ -10,6 +10,14 @@
   const name = $derived(build.metadata.name);
   // A string, so only a new phase opens the log again.
   const phase = $derived<string>(build.status?.phase ?? 'Pending');
+  // How it ended, for whoever opened the log after (or watched it to) the end.
+  const outcome = $derived(
+    phase === 'Succeeded'
+      ? t('The build succeeded.')
+      : phase === 'Failed'
+        ? t('The build failed: {message}', { message: build.status?.message ?? '' })
+        : ''
+  );
   let text = $state('');
   let status = $state('');
   let box: HTMLPreElement | undefined = $state();
@@ -34,7 +42,7 @@
   });
 </script>
 
-{#if status}<p class="muted" role="status">{status}</p>{/if}
+{#if status || outcome}<p class="muted" role="status">{status || outcome}</p>{/if}
 <pre
   class="log"
   bind:this={box}

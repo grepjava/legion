@@ -277,6 +277,8 @@
   "Terminal": "",
   "Text": "",
   "The Service changed meanwhile; look at it again and roll out once more.": "",
+  "The build failed: {message}": "",
+  "The build succeeded.": "",
   "The control state, every object and the cluster's keys, as": "",
   "The last hour, a sample every {seconds} s, summed over {n} tasks. CPU is in percent of one CPU.": {
     "one": "",
