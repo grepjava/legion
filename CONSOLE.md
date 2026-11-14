@@ -303,6 +303,40 @@ That choice is jailer's as much as Legion's, so the "done when" waits on it.
 **Done when** a team signs in with their company's identity provider and
 sees two clusters, with the access each group has there.
 
+**Built so far:** the console's settings (`legion_api::console::Settings`,
+`Cluster.ConsoleSettings` and `SetConsoleSettings`, `legion console
+settings` and `legion console configure -f`): a banner above every page,
+the sign-in page included, side-bar links, the namespace a user starts in
+if they may read it, and how long a session lasts (5m to 168h, 12h by
+default, never past the certificate it was signed in with). Before signing
+in the gateway serves the banner alone; the admin sets them on a page of
+their own too.
+
+**Single sign-on, as designed.** The certificate stays the one way to call
+the API; OIDC is one more way to start a console session.
+
+- *Who.* An OIDC user is named `oidc:` and the claim configured
+  (`email` by default), so no name from a provider can be a certificate
+  user's, which are DNS labels. Their groups are the configured claim's
+  (`groups`).
+- *Rights stay in the bindings.* A RoleBinding names a `user` or a
+  `group`. At sign-in the leader records the user's groups in the reserved
+  namespace, until their newest session ends; RBAC gives a user what their
+  own bindings give and their groups' do, so deleting a binding still takes
+  its rights at once. Groups change at the next sign-in.
+- *The flow.* The gateway does the authorization code flow with PKCE,
+  state and nonce: `/api/oidc/start` sends the browser to the provider,
+  `/api/oidc/callback` exchanges the code, checks the ID token (signature by
+  the provider's published keys, RS256 or ES256 with ring; issuer, audience,
+  expiry, nonce), and asks the leader for a session for that name and those
+  groups (`Cluster.ConsoleOidcSession`, managers only). From there it is a
+  session like any other: a certificate per session for its calls.
+- *Configured* by the admin (`legion console oidc -f`): issuer, client ID,
+  the console's address for the redirect, claims and scopes; the client
+  secret kept as a Secret in the reserved namespace, never shown again.
+- *Tested* against a provider played by the test: discovery, keys, a token
+  endpoint, a group mapped to a role.
+
 ## Out of scope
 
 - Anything the API does not offer. A console-only feature would be a
