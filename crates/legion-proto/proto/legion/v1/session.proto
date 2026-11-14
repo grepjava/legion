@@ -35,7 +35,36 @@ message SessionOpen {
     // the data goes to and comes from the user's stream.
     VolumeExport volume_export = 10;
     VolumeImport volume_import = 11;
+    // Managers only, a Build (CONSOLE.md phase 5): build an image with
+    // jailer on this node and push it.
+    BuildOptions build = 12;
   }
+}
+
+// The output of `jailer build` and `jailer push` comes as `stdout` and
+// `stderr` frames, as written; then `built`, then `exit_code` 0. A node
+// without jailer, or not a builder, ends with `error`.
+message BuildOptions {
+  // A Git repository read with no login, its ref (the default branch when
+  // empty) and the directory in it built; or, with no `git_url`, the
+  // Containerfile, built with nothing beside it.
+  string git_url = 1;
+  string git_ref = 2;
+  string git_path = 3;
+  string containerfile = 4;
+  // Where to push, `registry/repository:tag`.
+  string image = 5;
+  // A Docker config holding the registry's login; empty for none.
+  bytes auth = 6;
+  // Registries spoken to over plain HTTP, as the cluster's are.
+  repeated string plain_http = 7;
+}
+
+// What a build pushed.
+message BuildResult {
+  // The manifest, `sha256:…`, and the image pinned to it.
+  string digest = 1;
+  string pinned = 2;
 }
 
 // Snapshots the Volume, as it is while its tasks run (crash-consistent),
@@ -133,6 +162,8 @@ message SessionFrame {
     SessionError error = 9;
     // Logs asked with `times`: a line and when it was written.
     LogLine line = 10;
+    // A build's result, before its `exit_code`.
+    BuildResult built = 11;
   }
 }
 

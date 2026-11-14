@@ -187,6 +187,10 @@ service Cluster {
   // Managers only (their console gateway): a session for a user their
   // provider vouched for, with their groups.
   rpc ConsoleOidcSession(ConsoleOidcSessionRequest) returns (ConsoleSessionResponse);
+  // A Build's log (CONSOLE.md phase 5): what the leader holds of a build
+  // it runs, followed with `follow` until it ends; else the end its status
+  // kept.
+  rpc BuildLogs(BuildLogsRequest) returns (stream BuildLogsChunk);
 }
 
 message MeRequest {}
@@ -508,6 +512,16 @@ message UnlockRequest {
 message UnlockResponse {}
 
 message BackupRequest {}
+
+message BuildLogsRequest {
+  string namespace = 1;
+  string name = 2;
+  bool follow = 3;
+}
+
+message BuildLogsChunk {
+  bytes data = 1;
+}
 
 message BackupChunk {
   bytes data = 1;

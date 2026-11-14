@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 pub mod admit;
 pub mod alert;
 pub mod audit;
+pub mod build;
 pub mod clock;
 pub mod compose;
 pub mod console;
@@ -59,10 +60,11 @@ pub enum Kind {
     Route,
     RoleBinding,
     ImagePolicy,
+    Build,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 13] = [
+    pub const ALL: [Kind; 14] = [
         Kind::Namespace,
         Kind::Node,
         Kind::Service,
@@ -76,6 +78,7 @@ impl Kind {
         Kind::Route,
         Kind::RoleBinding,
         Kind::ImagePolicy,
+        Kind::Build,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -93,6 +96,7 @@ impl Kind {
             Kind::Route => "Route",
             Kind::RoleBinding => "RoleBinding",
             Kind::ImagePolicy => "ImagePolicy",
+            Kind::Build => "Build",
         }
     }
 
