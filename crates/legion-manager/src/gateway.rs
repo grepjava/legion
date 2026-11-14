@@ -593,17 +593,47 @@ async fn oidc_callback(
     res
 }
 
-async fn me(State(g): State<Gateway>, headers: HeaderMap) -> Result<Response, Refused> {
-    let (session, channel) = g.user(&headers).await?;
-    let me = ClusterClient::new(channel)
-        .me(pb::MeRequest {})
-        .await?
-        .into_inner();
-    Ok(Json(serde_json::json!({
-        "name": me.name, "role": me.role, "all": me.all, "namespaces": me.namespaces,
-        "csrf": csrf_token(&session),
-    }))
-    .into_response())
+/// Who the signed-in user is. Another cluster's console asks too, from its
+/// Clusters page (CONSOLE.md phase 6), if this cluster's settings list it:
+/// it reads the answer across origins, without the token for writes.
+async fn me(State(g): State<Gateway>, headers: HeaderMap, uri: Uri) -> Response {
+    let peer = match same_origin(&headers, &uri) {
+        Ok(()) => None,
+        Err(refused) => {
+            let origin = headers.get(header::ORIGIN).and_then(|o| o.to_str().ok());
+            match (origin, crate::console::settings(&g.0.api.store)) {
+                (Some(o), Ok(s)) if s.lists(o) => Some(o.to_owned()),
+                _ => return refused.into_response(),
+            }
+        }
+    };
+    let answer = async {
+        let (session, channel) = g.user(&headers).await?;
+        let me = ClusterClient::new(channel)
+            .me(pb::MeRequest {})
+            .await?
+            .into_inner();
+        let cluster = crate::console::settings(&g.0.api.store)?.name;
+        let mut body = serde_json::json!({
+            "name": me.name, "role": me.role, "all": me.all, "namespaces": me.namespaces,
+            "cluster": cluster,
+        });
+        if peer.is_none() {
+            body["csrf"] = csrf_token(&session).into();
+        }
+        Ok::<_, Refused>(Json(body))
+    };
+    let mut res = answer.await.into_response();
+    let h = res.headers_mut();
+    h.insert(header::VARY, HeaderValue::from_static("Origin"));
+    if let Some(o) = peer.and_then(|o| HeaderValue::from_str(&o).ok()) {
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, o);
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            HeaderValue::from_static("true"),
+        );
+    }
+    res
 }
 
 async fn status(State(g): State<Gateway>, headers: HeaderMap) -> Result<Response, Refused> {

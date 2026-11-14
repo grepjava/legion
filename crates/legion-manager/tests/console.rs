@@ -22,6 +22,8 @@ struct Response {
     /// Every cookie set, and where a redirect goes.
     cookies: Vec<String>,
     location: Option<String>,
+    /// The page origin allowed to read the answer across origins.
+    allow_origin: Option<String>,
     body: serde_json::Value,
     text: String,
 }
@@ -131,6 +133,10 @@ async fn request(
         .headers()
         .get("location")
         .map(|v| v.to_str().unwrap().to_owned());
+    let allow_origin = res
+        .headers()
+        .get("access-control-allow-origin")
+        .map(|v| v.to_str().unwrap().to_owned());
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8_lossy(&bytes).into_owned();
     Response {
@@ -138,6 +144,7 @@ async fn request(
         cookie,
         cookies,
         location,
+        allow_origin,
         body: serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
         text,
     }
@@ -1153,6 +1160,110 @@ async fn the_console_serves_its_settings() {
 
     let _ = f.stop.send(());
     f.task.await.unwrap();
+}
+
+/// Several clusters (CONSOLE.md phase 6): each console keeps its own
+/// sessions, and tells another's page who the user is only if its settings
+/// list that console, without the token for writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_consoles_of_listed_clusters_see_who_is_signed_in() {
+    use legion_proto::v1::SetConsoleSettingsRequest;
+    let (east, west) = (start().await, start().await);
+    let (east_url, west_url) = (
+        format!("https://{}", east.console_addr),
+        format!("https://{}", west.console_addr),
+    );
+    for (f, name, other, url) in [
+        (&east, "east", "west", &west_url),
+        (&west, "west", "east", &east_url),
+    ] {
+        ClusterClient::new(f.admin.clone())
+            .set_console_settings(SetConsoleSettingsRequest {
+                settings_json: serde_json::json!({
+                    "name": name,
+                    "clusters": [{ "name": other, "url": url }],
+                })
+                .to_string()
+                .into_bytes(),
+            })
+            .await
+            .unwrap();
+    }
+    let mut objects = ObjectsClient::new(west.admin.clone());
+    for (kind, ns, name, spec) in [
+        ("Namespace", "", "shop", serde_json::json!({})),
+        (
+            "RoleBinding",
+            "shop",
+            "alice",
+            serde_json::json!({ "user": "alice", "role": "view" }),
+        ),
+    ] {
+        objects.apply(object(kind, ns, name, spec)).await.unwrap();
+    }
+    let alice = sign_in(&west, "alice").await;
+    let west_console = west.console_addr.to_string();
+    let me = |cookie: Option<String>, origin: Option<String>| {
+        let (ca, console) = (&west.ca, &west_console);
+        async move {
+            https(
+                ca,
+                console,
+                "GET",
+                "/api/me",
+                cookie.as_deref(),
+                origin.as_deref(),
+                None,
+            )
+            .await
+        }
+    };
+
+    // West's own page: the token for writes, no one else allowed to read.
+    let r = me(Some(alice.0.clone()), Some(west_url.clone())).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["cluster"], "west");
+    assert!(r.body["csrf"].is_string());
+    assert_eq!(r.allow_origin, None);
+
+    // East's Clusters page: who alice is in west, and nothing to write with.
+    let r = me(Some(alice.0.clone()), Some(east_url.clone())).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.allow_origin.as_deref(), Some(east_url.as_str()));
+    assert_eq!(r.body["name"], "alice");
+    assert_eq!(r.body["namespaces"], serde_json::json!({ "shop": "view" }));
+    assert!(r.body.get("csrf").is_none(), "{}", r.text);
+    // Not signed in there: east's page may read that too.
+    let r = me(None, Some(east_url.clone())).await;
+    assert_eq!(
+        (r.status, r.allow_origin.as_deref()),
+        (401, Some(east_url.as_str()))
+    );
+
+    // A console west does not list learns nothing.
+    for origin in ["https://evil.example", "null", "http://127.0.0.1"] {
+        let r = me(Some(alice.0.clone()), Some(origin.into())).await;
+        assert_eq!((r.status, r.allow_origin), (403, None), "{origin}");
+    }
+    // And west's writes stay its own page's, listed or not.
+    let r = request(
+        &west.ca,
+        &west_console,
+        false,
+        "POST",
+        "/api/apply",
+        Some(&alice.0),
+        Some(&east_url),
+        Some(serde_json::json!({})),
+        &[("x-legion-csrf", &alice.1)],
+    )
+    .await;
+    assert_eq!(r.status, 403, "{}", r.text);
+
+    for f in [east, west] {
+        let _ = f.stop.send(());
+        f.task.await.unwrap();
+    }
 }
 
 /// Single sign-on (CONSOLE.md phase 6), against a provider this test plays:
