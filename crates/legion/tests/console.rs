@@ -1153,8 +1153,11 @@ fn the_console_builds_an_example_with_jailer() {
             "document.querySelector('[aria-label^=\"Service web:\"] rect')?.classList.contains('good') ?? false",
         ) == serde_json::json!(true)
     });
-    let page = common::http_get(&c.lab.host, 30081).expect("the site answers");
-    assert!(page.contains("200"), "{page}");
+    // Asked from a VM: pf redirects what comes in, not the host's own.
+    let vm = &c.lab.vms[0];
+    wait("the site answering on port 30081", 60, || {
+        c.lab.http_get_from(vm, &c.lab.host, 30081).is_ok()
+    });
     if !e.errors.is_empty() {
         eprintln!("ed's pages reported: {:?}", e.errors);
     }
