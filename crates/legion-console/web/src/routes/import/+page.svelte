@@ -138,12 +138,12 @@
         disabled={!text.trim() || !saveName.trim() || !!cannotWrite(saveNamespace.trim())}
         title={cannotWrite(saveNamespace.trim()) ?? ''}>Save</button
       >
-      {#if saved}<p class="ok">{saved}</p>{/if}
+      {#if saved}<p class="ok" role="status">{saved}</p>{/if}
     </fieldset>
   </div>
 
   <div>
-    {#if convertError}<p class="error">{convertError}</p>{/if}
+    {#if convertError}<p class="error" role="alert">{convertError}</p>{/if}
     {#each warnings as w (w)}<p class="muted">Not honoured: {w}</p>{/each}
     {#if yaml}<pre class="yaml" aria-label="Objects">{yaml}</pre>{/if}
     <div class="controls">
@@ -154,7 +154,7 @@
       {#if busy}<span class="muted">…</span>{/if}
     </div>
     {#if why && yaml}<p class="muted">{why}.</p>{/if}
-    {#if error}<p class="error">{error}</p>{/if}
+    {#if error}<p class="error" role="alert">{error}</p>{/if}
     {#each results as r (r.key)}
       <h2>
         {#if !dry && r.key.startsWith('Service/')}<a href="/k/{r.key}">{r.key}</a>{:else}{r.key}{/if}:

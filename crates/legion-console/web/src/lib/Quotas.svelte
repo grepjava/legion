@@ -44,7 +44,7 @@
   const tone = (f: number) => (f >= 0.9 ? 'bad' : f >= 0.75 ? 'wait' : '');
 </script>
 
-{#if error}<p class="error">{error}</p>{/if}
+{#if error}<p class="error" role="alert">{error}</p>{/if}
 {#if loaded && !list.length}
   <p class="muted">{namespace ? `${namespace} has no quota.` : 'No namespace you can see has a quota.'}</p>
 {/if}

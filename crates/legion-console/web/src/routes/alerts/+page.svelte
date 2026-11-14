@@ -25,7 +25,7 @@
 </script>
 
 <header class="bar"><h1>Alerts</h1></header>
-{#if session.alertsError}<p class="error">{session.alertsError}</p>{/if}
+{#if session.alertsError}<p class="error" role="alert">{session.alertsError}</p>{/if}
 
 {#if shown.length}
   <table>

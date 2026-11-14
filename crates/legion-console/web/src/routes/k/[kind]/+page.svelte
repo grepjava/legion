@@ -40,13 +40,13 @@
 
 <header class="bar">
   <h1>{plural(kind)}</h1>
-  <input type="search" placeholder="Filter: name, app=web, !canary"
+  <input type="search" aria-label="Filter" placeholder="Filter: name, app=web, !canary"
     title="Words match names; key=value, key!=value and !key (no such label) match labels" bind:value={filter} />
   <span class="muted">{shown.length} of {objects.length}, live</span>
 </header>
 
 {#if error}
-  <p class="error">{error}</p>
+  <p class="error" role="alert">{error}</p>
 {/if}
 
 {#if shown.length}

@@ -54,7 +54,7 @@
   What each source may reach of each service, on which of its tasks' ports: the namespace's isolation
   and its NetworkPolicies, ingress and egress, as the nodes enforce them.
 </p>
-{#if error}<p class="error">{error}</p>{/if}
+{#if error}<p class="error" role="alert">{error}</p>{/if}
 
 {#if services.length}
   <table class="matrix">

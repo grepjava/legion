@@ -135,8 +135,8 @@
     <button class="primary" disabled={!!why || busy} title={why ?? ''}>Save</button>
     {#if why}<span class="muted">{why}.</span>{/if}
   </div>
-  {#if error}<p class="error">{error}</p>{/if}
-  {#if saved}<p class="ok">{saved}</p>{/if}
+  {#if error}<p class="error" role="alert">{error}</p>{/if}
+  {#if saved}<p class="ok" role="status">{saved}</p>{/if}
 </form>
 
 <style>

@@ -63,9 +63,9 @@
   </select>
   <button class="primary" disabled={busy}>Show</button>
 </form>
-{#if error}<p class="error">{error}</p>{/if}
+{#if error}<p class="error" role="alert">{error}</p>{/if}
 {#if truncated}
-  <p class="error">More matched than {filter.limit}: the newest are left out. Narrow the filter or the time.</p>
+  <p class="error" role="alert">More matched than {filter.limit}: the newest are left out. Narrow the filter or the time.</p>
 {/if}
 
 {#if events.length}

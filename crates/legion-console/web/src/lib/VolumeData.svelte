@@ -48,7 +48,7 @@
 
 <h2>Restore</h2>
 {#if lost}
-  <p class="error">Lost with its node: restore a backup into it on another node.</p>
+  <p class="error" role="alert">Lost with its node: restore a backup into it on another node.</p>
 {/if}
 <form class="controls" onsubmit={restore}>
   <input type="file" bind:files={file} aria-label="Backup file" disabled={!!why} />
@@ -59,5 +59,5 @@
   {#if busy}<span class="muted">uploading…</span>{/if}
 </form>
 {#if why}<p class="muted">Read only: {why}.</p>{/if}
-{#if error}<p class="error">{error}</p>{/if}
-{#if message}<p class="ok">{message}</p>{/if}
+{#if error}<p class="error" role="alert">{error}</p>{/if}
+{#if message}<p class="ok" role="status">{message}</p>{/if}

@@ -86,6 +86,8 @@
     if (v.status?.lost) return 'lost';
     return v.status?.node ? `Volume on ${v.status.node}` : 'Volume';
   };
+  const svcNote = (s: LObject) =>
+    s.status ? `${s.status.ready ?? 0}/${s.status.desired ?? 0} ready` : 'not yet placed';
   const ports = (e: ReachEdge) => (e.all_ports ? 'all ports' : e.ports.map((p) => `${p.port}/${p.protocol}`).join(', '));
   const arc = (from: number, to: number) => {
     const x = X_SVC + BOX_W;
@@ -112,11 +114,14 @@
   Routes to the namespace's Services, what may reach what among them as the nodes enforce it, and the Volumes they
   use. Green: every task ready; amber: some; red: none, or a Volume lost.
 </p>
-{#if error}<p class="error">{error}</p>{/if}
+{#if error}<p class="error" role="alert">{error}</p>{/if}
 {#if everyone}<p class="muted">Every service may reach every other (the namespace is not isolated by policy).</p>{/if}
 
 {#if services.length}
-  <svg class="topology" width={X_VOL + BOX_W + 10} {height} role="img" aria-label="Topology of {namespace}">
+  <p class="sr-only">
+    What may reach what is listed on the <a href="/network">Network</a> page too.
+  </p>
+  <svg class="topology" width={X_VOL + BOX_W + 10} {height} role="group" aria-label="Topology of {namespace}">
     <defs>
       <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
         <path d="M0,0 L8,4 L0,8 z" class="head" />
@@ -145,7 +150,7 @@
     {/each}
 
     {#each shownRoutes as r, i (r.metadata.name)}
-      <a href={link('Route', r.metadata.name)} aria-label="Route {r.metadata.name}">
+      <a href={link('Route', r.metadata.name)} aria-label="Route {r.metadata.name}: {r.spec.host}{r.spec.path ?? ''} to {r.spec.service}">
         <rect class="box route" x={X_ROUTE} y={10 + i * ROW} width={BOX_W} height={BOX_H} rx="6" />
         <text x={X_ROUTE + 10} y={10 + i * ROW + 17}>{r.spec.host}{r.spec.path && r.spec.path !== '/' ? r.spec.path : ''}</text>
         <text class="sub" x={X_ROUTE + 10} y={10 + i * ROW + 32}>Route {r.metadata.name}</text>
@@ -156,16 +161,16 @@
       <text x={X_ROUTE + 10} y={10 + shownRoutes.length * ROW + 25}>other namespaces</text>
     {/if}
     {#each services as s, i (s.metadata.name)}
-      <a href={link('Service', s.metadata.name)} aria-label="Service {s.metadata.name}">
+      <a href={link('Service', s.metadata.name)} aria-label="Service {s.metadata.name}: {svcNote(s)}">
         <rect class="box svc {health(s)}" x={X_SVC} y={10 + i * ROW} width={BOX_W} height={BOX_H} rx="6" />
         <text x={X_SVC + 10} y={10 + i * ROW + 17}>{s.metadata.name}</text>
         <text class="sub" x={X_SVC + 10} y={10 + i * ROW + 32}
-          >{s.status ? `${s.status.ready ?? 0}/${s.status.desired ?? 0} ready` : 'not yet placed'}</text
+          >{svcNote(s)}</text
         >
       </a>
     {/each}
     {#each volumeNames as v, i (v)}
-      <a href={link('Volume', v)} aria-label="Volume {v}">
+      <a href={link('Volume', v)} aria-label="Volume {v}: {volumeNote(v)}">
         <rect class="box vol {volumeHealth(v)}" x={X_VOL} y={10 + i * ROW} width={BOX_W} height={BOX_H} rx="6" />
         <text x={X_VOL + 10} y={10 + i * ROW + 17}>{v}</text>
         <text class="sub" x={X_VOL + 10} y={10 + i * ROW + 32}
@@ -185,14 +190,14 @@
   }
   .box {
     fill: var(--panel);
-    stroke: var(--line);
+    stroke: var(--control);
     stroke-width: 1.5;
   }
   .box.good {
     stroke: var(--good);
   }
   .box.wait {
-    stroke: var(--wait, #9a6700);
+    stroke: var(--wait);
   }
   .box.bad {
     stroke: var(--bad);

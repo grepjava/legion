@@ -40,7 +40,7 @@
     <p>Signing in…</p>
   {:else}
     {#if error}
-      <p class="error">{error}</p>
+      <p class="error" role="alert">{error}</p>
     {/if}
     {#if session.settings.sso}
       <p><a class="button primary" href="/api/oidc/start" data-sveltekit-reload>{session.settings.sso.label}</a></p>

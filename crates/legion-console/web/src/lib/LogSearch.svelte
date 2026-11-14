@@ -55,7 +55,7 @@
   <button class="primary" disabled={busy}>Search</button>
   {#if busy}<span class="muted">searching every task…</span>{/if}
 </form>
-{#if error}<p class="error">{error}</p>{/if}
+{#if error}<p class="error" role="alert">{error}</p>{/if}
 {#each unread as u (u)}<p class="muted">Not searched: {u}</p>{/each}
 {#if truncated}<p class="muted">More lines matched than shown: the oldest were left out.</p>{/if}
 {#if searched && !lines.length && !error}<p class="muted">No line matched.</p>{/if}

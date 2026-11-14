@@ -117,7 +117,7 @@
       {#if busy}<span class="muted">…</span>{/if}
     </div>
     {#if why && yaml}<p class="muted">{why}.</p>{/if}
-    {#if error}<p class="error">{error}</p>{/if}
+    {#if error}<p class="error" role="alert">{error}</p>{/if}
     {#each results as r (r.key)}
       <h2>{r.key}: <span class="muted">{dry ? `would be ${r.result}` : `${r.result}, version ${r.version}`}</span></h2>
       {#if r.diff}<Diff text={r.diff} />{/if}

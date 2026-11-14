@@ -109,7 +109,7 @@
 {#if !session.me?.all}
   <p class="muted">Only an admin runs the cluster.</p>
 {/if}
-{#if error}<p class="error">{error}</p>{/if}
+{#if error}<p class="error" role="alert">{error}</p>{/if}
 
 <h2>Certificate authority</h2>
 {#if ca}
@@ -194,4 +194,4 @@
   <input type="number" min="0" placeholder="days" bind:value={user.days} aria-label="Days valid" />
   <button class="primary" disabled={!user.name}>Create credentials</button>
 </form>
-{#if made}<p class="ok">{made}</p>{/if}
+{#if made}<p class="ok" role="status">{made}</p>{/if}

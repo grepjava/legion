@@ -74,7 +74,7 @@
         {/each}
       </ul>
     {:else if statusError}
-      <p class="error">{statusError}</p>
+      <p class="error" role="alert">{statusError}</p>
     {:else}
       <p>…</p>
     {/if}
@@ -87,14 +87,14 @@
       {#each count(nodes, (n) => n.status?.state) as [state, n] (state)}
         <span class="state {tone(state)}">{n} {state}</span>
       {/each}
-      {#if errors.Node}<p class="error">{errors.Node}</p>{/if}
+      {#if errors.Node}<p class="error" role="alert">{errors.Node}</p>{/if}
     </div>
   {/if}
 
   <div class="card">
     <h2><a href="/k/Service">Services</a></h2>
     <p class="big">{services.length}</p>
-    {#if errors.Service}<p class="error">{errors.Service}</p>{/if}
+    {#if errors.Service}<p class="error" role="alert">{errors.Service}</p>{/if}
   </div>
 
   <div class="card">
@@ -103,7 +103,7 @@
     {#each count(live, (t) => t.status?.state) as [state, n] (state)}
       <span class="state {tone(state)}">{n} {state}</span>
     {/each}
-    {#if errors.Task}<p class="error">{errors.Task}</p>{/if}
+    {#if errors.Task}<p class="error" role="alert">{errors.Task}</p>{/if}
   </div>
 </section>
 

@@ -49,4 +49,4 @@
     <button disabled={!adding}>Add</button>
   </form>
 {/if}
-{#if error}<p class="error">{error}</p>{/if}
+{#if error}<p class="error" role="alert">{error}</p>{/if}

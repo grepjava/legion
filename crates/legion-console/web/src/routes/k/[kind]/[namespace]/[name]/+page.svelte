@@ -63,6 +63,26 @@
       : []),
     { id: 'yaml', label: 'YAML' }
   ] as { id: typeof tab; label: string }[]);
+  // The tabs as WAI-ARIA's pattern has them: one stop for Tab, arrows,
+  // Home and End to move between them.
+  let tablist: HTMLElement | undefined = $state();
+  function tabKey(e: KeyboardEvent) {
+    const i = tabs.findIndex((t) => t.id === tab);
+    const to =
+      e.key === 'ArrowRight'
+        ? (i + 1) % tabs.length
+        : e.key === 'ArrowLeft'
+          ? (i - 1 + tabs.length) % tabs.length
+          : e.key === 'Home'
+            ? 0
+            : e.key === 'End'
+              ? tabs.length - 1
+              : -1;
+    if (to < 0) return;
+    e.preventDefault();
+    tab = tabs[to].id;
+    tablist?.querySelectorAll<HTMLElement>('[role="tab"]')[to]?.focus();
+  }
   const cols = $derived(columns(kind));
   const scoped = $derived(session.kinds.find((k) => k.kind === kind)?.clusterScoped ?? false);
 </script>
@@ -75,16 +95,25 @@
 </header>
 
 {#if error}
-  <p class="error">{error}</p>
+  <p class="error" role="alert">{error}</p>
 {:else if object}
   {#if !gone}<Actions {object} {scoped} />{/if}
-  <div class="tabs" role="tablist">
+  <div class="tabs" role="tablist" aria-label="Views of {name}" bind:this={tablist}>
     {#each tabs as t (t.id)}
-      <button role="tab" aria-selected={tab === t.id} class:here={tab === t.id} onclick={() => (tab = t.id)}
-        >{t.label}</button
+      <button
+        role="tab"
+        id="tab-{t.id}"
+        aria-selected={tab === t.id}
+        aria-controls="panel"
+        tabindex={tab === t.id ? 0 : -1}
+        class:here={tab === t.id}
+        onclick={() => (tab = t.id)}
+        onkeydown={tabKey}>{t.label}</button
       >
     {/each}
   </div>
+
+  <div role="tabpanel" id="panel" aria-labelledby="tab-{tab}">
 
   {#if tab === 'details'}
     <dl class="facts">
@@ -148,6 +177,7 @@
   {:else}
     <pre>{toYaml(object)}</pre>
   {/if}
+  </div>
 {:else}
   <p class="muted">…</p>
 {/if}

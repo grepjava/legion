@@ -21,6 +21,7 @@
   let open = $state(false);
   let status = $state('');
   let box: HTMLDivElement | undefined = $state();
+  let closer: HTMLButtonElement | undefined = $state();
   let term: Terminal | null = null;
   let fit: FitAddon | null = null;
   let session: ReturnType<typeof exec> | null = null;
@@ -63,6 +64,15 @@
         t.write(`\r\n\x1b[2m[${status}]\x1b[0m\r\n`);
       }
     );
+    // Every key goes to the command but Shift+Esc, which leaves the
+    // terminal for the page (WCAG 2.1.2; Esc alone still reaches it).
+    t.attachCustomKeyEventHandler((e) => {
+      if (e.type === 'keydown' && e.key === 'Escape' && e.shiftKey) {
+        closer?.focus();
+        return false;
+      }
+      return true;
+    });
     t.onData((d) => session?.input(d));
     t.onResize(({ cols, rows }) => session?.resize(cols, rows));
     t.focus();
@@ -95,7 +105,8 @@
   <button class="primary" disabled={!!why || !runningTask} title={why ?? (runningTask ? '' : 'The task is not running')}
     >{open ? 'Start again' : 'Open'}</button
   >
-  {#if open}<button type="button" onclick={stop}>Close</button>{/if}
+  {#if open}<button type="button" onclick={stop} bind:this={closer}>Close</button>{/if}
   <span class="muted">{why ? `Read only: ${why}.` : status}</span>
 </form>
-<div class="terminal" bind:this={box}></div>
+{#if open}<p class="muted">Shift+Esc leaves the terminal for the page.</p>{/if}
+<div class="terminal" bind:this={box} role="region" aria-label="Terminal"></div>

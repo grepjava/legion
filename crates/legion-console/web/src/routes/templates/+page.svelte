@@ -21,7 +21,7 @@
   Compose files to deploy from: the examples, and those saved from <a href="/import">Import compose</a> as
   Configs labelled <code>legion.template</code>.
 </p>
-{#if error}<p class="error">{error}</p>{/if}
+{#if error}<p class="error" role="alert">{error}</p>{/if}
 <ul class="cards">
   {#each list as t (`${t.namespace}/${t.name}`)}
     <li class="card">

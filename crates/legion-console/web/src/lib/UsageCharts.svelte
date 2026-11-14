@@ -95,7 +95,7 @@
   };
 </script>
 
-{#if error}<p class="error">{error}</p>{/if}
+{#if error}<p class="error" role="alert">{error}</p>{/if}
 {#if loaded && !summed.tasks}
   <p class="muted">No usage heard in the last hour: nothing ran, or the leader started since.</p>
 {:else if loaded}

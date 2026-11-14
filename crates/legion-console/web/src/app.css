@@ -5,9 +5,12 @@
   --text: #1f1d1b;
   --muted: #6b665f;
   --line: #e2ddd6;
+  /* Borders of controls: 3:1 against the page (WCAG 1.4.11). */
+  --control: #857e75;
   --accent: #7a1f2b;
+  --on-accent: #ffffff;
   --good: #1f7a3d;
-  --wait: #9a6a00;
+  --wait: #8a5f00;
   --bad: #b3261e;
   font-family:
     system-ui,
@@ -27,7 +30,9 @@
     --text: #ebe7e1;
     --muted: #a29c94;
     --line: #34312e;
+    --control: #807a72;
     --accent: #e0707e;
+    --on-accent: #171615;
     --good: #5cc883;
     --wait: #e2b44b;
     --bad: #ff8a80;
@@ -101,11 +106,12 @@ aside {
 }
 select,
 input,
+textarea,
 button {
   font: inherit;
   color: inherit;
   background: var(--panel);
-  border: 1px solid var(--line);
+  border: 1px solid var(--control);
   border-radius: 4px;
   padding: 0.3rem 0.5rem;
 }
@@ -143,6 +149,9 @@ button.link {
   color: var(--accent);
   cursor: pointer;
   padding: 0;
+  /* At least 24 by 24 px to hit (WCAG 2.5.8). */
+  min-height: 24px;
+  min-width: 24px;
 }
 main {
   padding: 1.5rem 2rem;
@@ -327,13 +336,13 @@ input {
   font: inherit;
   color: inherit;
   background: var(--panel);
-  border: 1px solid var(--line);
+  border: 1px solid var(--control);
   border-radius: 4px;
   padding: 0.3rem 0.5rem;
 }
 a.button {
   display: inline-block;
-  border: 1px solid var(--line);
+  border: 1px solid var(--control);
   border-radius: 4px;
   padding: 0.3rem 0.5rem;
   background: var(--panel);
@@ -347,7 +356,7 @@ button:disabled {
 button.primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 button.danger {
   color: var(--bad);
@@ -362,7 +371,7 @@ textarea.editor {
   font-size: 0.85rem;
   color: inherit;
   background: var(--panel);
-  border: 1px solid var(--line);
+  border: 1px solid var(--control);
   border-radius: 6px;
   padding: 0.75rem;
   tab-size: 2;
@@ -394,7 +403,7 @@ table.matrix td.all {
   color: var(--good);
 }
 table.matrix td.some {
-  color: var(--wait, #9a6700);
+  color: var(--wait);
 }
 table.matrix td.no {
   color: var(--muted);
@@ -414,4 +423,59 @@ table.matrix td.no {
 }
 .banner.danger {
   background: #a4161a;
+}
+
+/* Keyboard use (WCAG 2.4.7, 2.4.13): a ring wherever focus lands, in the
+   accent, which keeps 3:1 or more against the page in either theme. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.tabs button:focus-visible {
+  outline-offset: -2px;
+}
+
+/* For screen readers alone, and the link past the side bar, shown when
+   focused (WCAG 2.4.1). */
+.sr-only,
+.skip:not(:focus) {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.skip:focus {
+  position: absolute;
+  top: 0.5rem;
+  left: 0.5rem;
+  z-index: 10;
+  padding: 0.5rem 0.75rem;
+  background: var(--panel);
+  border: 2px solid var(--accent);
+  border-radius: 4px;
+}
+
+/* Narrow windows and 400% zoom (WCAG 1.4.10): the side bar above the
+   page, wide tables scrolled on their own. */
+@media (max-width: 48rem) {
+  .shell {
+    grid-template-columns: 1fr;
+  }
+  aside {
+    border-right: none;
+    border-bottom: 1px solid var(--line);
+  }
+  main {
+    padding: 1rem;
+  }
+  main table {
+    display: block;
+    overflow-x: auto;
+  }
+}
+
+main:focus {
+  outline: none;
 }

@@ -85,7 +85,7 @@
 </div>
 
 {#if why}<p class="muted">Read only: {why}.</p>{/if}
-{#if error}<p class="error">{error}</p>{/if}
+{#if error}<p class="error" role="alert">{error}</p>{/if}
 
 {#each results as r (r.key)}
   <h2>{r.key}: <span class="muted">{verb(r)}</span></h2>

@@ -84,6 +84,39 @@
     }
   }
 
+  /** The side bar's link to the page shown (WCAG 1.3.1). */
+  const at = (here: boolean) => (here ? ('page' as const) : undefined);
+
+  // Each page's title (WCAG 2.4.2), which SvelteKit also announces on
+  // every navigation.
+  const PAGES: Record<string, string> = {
+    '/': 'Overview',
+    '/login': 'Sign in',
+    '/alerts': 'Alerts',
+    '/deploy': 'Deploy',
+    '/templates': 'Templates',
+    '/import': 'Import compose',
+    '/apply': 'Apply YAML',
+    '/topology': 'Topology',
+    '/network': 'Network',
+    '/cluster': 'Operations',
+    '/audit': 'Audit',
+    '/settings': 'Console settings',
+    '/clusters': 'Clusters'
+  };
+  const title = $derived.by(() => {
+    const path = page.url.pathname;
+    const [, k, kind, ns, name] = path.split('/').map(decodeURIComponent);
+    const here =
+      PAGES[path] ??
+      (k === 'k' && kind
+        ? name
+          ? `${name} (${kind}${ns && ns !== '_' ? ` in ${ns}` : ''})`
+          : plural(kind)
+        : 'Legion');
+    return [here, session.settings.name, 'Legion'].filter(Boolean).join(' · ');
+  });
+
   const choices = $derived(namespaces(adminNamespaces));
   const nsKinds = $derived(session.kinds.filter((k) => !k.clusterScoped));
   const clusterKinds = $derived(
@@ -92,7 +125,7 @@
 </script>
 
 <svelte:head>
-  <title>{session.settings.name ? `${session.settings.name} · Legion` : 'Legion'}</title>
+  <title>{title}</title>
 </svelte:head>
 {#if session.settings.banner}
   <div class="banner {session.settings.banner.level ?? 'info'}" role="note">{session.settings.banner.text}</div>
@@ -100,6 +133,7 @@
 {#if page.url.pathname === '/login'}
   {@render children()}
 {:else if session.me}
+  <a class="skip" href="#main">Skip to the page</a>
   <div class="shell">
     <aside>
       <a class="brand" href="/"
@@ -115,21 +149,21 @@
           {/each}
         </select>
       </label>
-      <nav>
-        <a href="/" class:here={page.url.pathname === '/'}>Overview</a>
-        <a href="/alerts" class:here={page.url.pathname === '/alerts'}
+      <nav aria-label="Console">
+        <a href="/" class:here={page.url.pathname === '/'} aria-current={at(page.url.pathname === '/')}>Overview</a>
+        <a href="/alerts" class:here={page.url.pathname === '/alerts'} aria-current={at(page.url.pathname === '/alerts')}
           >Alerts{#if session.alerts.length}
             <span class="count {critical ? 'bad' : 'wait'}">{session.alerts.length}</span>{/if}</a
         >
-        <a href="/deploy" class:here={page.url.pathname === '/deploy'}>Deploy</a>
-        <a href="/templates" class:here={page.url.pathname === '/templates'}>Templates</a>
-        <a href="/import" class:here={page.url.pathname === '/import'}>Import compose</a>
-        <a href="/apply" class:here={page.url.pathname === '/apply'}>Apply YAML</a>
-        <a href="/topology" class:here={page.url.pathname === '/topology'}>Topology</a>
-        <a href="/network" class:here={page.url.pathname === '/network'}>Network</a>
+        <a href="/deploy" class:here={page.url.pathname === '/deploy'} aria-current={at(page.url.pathname === '/deploy')}>Deploy</a>
+        <a href="/templates" class:here={page.url.pathname === '/templates'} aria-current={at(page.url.pathname === '/templates')}>Templates</a>
+        <a href="/import" class:here={page.url.pathname === '/import'} aria-current={at(page.url.pathname === '/import')}>Import compose</a>
+        <a href="/apply" class:here={page.url.pathname === '/apply'} aria-current={at(page.url.pathname === '/apply')}>Apply YAML</a>
+        <a href="/topology" class:here={page.url.pathname === '/topology'} aria-current={at(page.url.pathname === '/topology')}>Topology</a>
+        <a href="/network" class:here={page.url.pathname === '/network'} aria-current={at(page.url.pathname === '/network')}>Network</a>
         {#if session.settings.clusters?.length}
           <h2>Clusters</h2>
-          <a href="/clusters" class:here={page.url.pathname === '/clusters'}>All clusters</a>
+          <a href="/clusters" class:here={page.url.pathname === '/clusters'} aria-current={at(page.url.pathname === '/clusters')}>All clusters</a>
           {#each session.settings.clusters as c, i (i)}
             <a href={there(c.url)} title="This page on {c.name}, signed into on its own"
               >{c.name}</a
@@ -144,17 +178,17 @@
         {/if}
         <h2>Workloads and config</h2>
         {#each nsKinds as k (k.kind)}
-          <a href="/k/{k.kind}" class:here={page.url.pathname.startsWith(`/k/${k.kind}`)}
+          <a href="/k/{k.kind}" class:here={page.url.pathname.startsWith(`/k/${k.kind}`)} aria-current={at(page.url.pathname.startsWith(`/k/${k.kind}`))}
             >{plural(k.kind)}</a
           >
         {/each}
         {#if clusterKinds.length}
           <h2>Cluster</h2>
-          <a href="/cluster" class:here={page.url.pathname === '/cluster'}>Operations</a>
-          <a href="/audit" class:here={page.url.pathname === '/audit'}>Audit</a>
-          <a href="/settings" class:here={page.url.pathname === '/settings'}>Console settings</a>
+          <a href="/cluster" class:here={page.url.pathname === '/cluster'} aria-current={at(page.url.pathname === '/cluster')}>Operations</a>
+          <a href="/audit" class:here={page.url.pathname === '/audit'} aria-current={at(page.url.pathname === '/audit')}>Audit</a>
+          <a href="/settings" class:here={page.url.pathname === '/settings'} aria-current={at(page.url.pathname === '/settings')}>Console settings</a>
           {#each clusterKinds as k (k.kind)}
-            <a href="/k/{k.kind}" class:here={page.url.pathname.startsWith(`/k/${k.kind}`)}
+            <a href="/k/{k.kind}" class:here={page.url.pathname.startsWith(`/k/${k.kind}`)} aria-current={at(page.url.pathname.startsWith(`/k/${k.kind}`))}
               >{plural(k.kind)}</a
             >
           {/each}
@@ -165,7 +199,7 @@
         <button class="link" onclick={signOut}>Sign out</button>
       </div>
     </aside>
-    <main>
+    <main id="main" tabindex="-1">
       {@render children()}
     </main>
   </div>

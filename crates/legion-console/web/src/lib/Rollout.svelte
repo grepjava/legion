@@ -104,5 +104,5 @@
     {/each}
   </tbody>
 </table>
-{#if error}<p class="error">{error}</p>{/if}
-{#if message}<p class="ok">{message}</p>{/if}
+{#if error}<p class="error" role="alert">{error}</p>{/if}
+{#if message}<p class="ok" role="status">{message}</p>{/if}
