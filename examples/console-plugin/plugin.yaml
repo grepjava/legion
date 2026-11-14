@@ -1,0 +1,90 @@
+# A plugin for the web console (CONSOLE.md phase 6): a page listing the
+# namespace's Services and their ready tasks, refreshed every 10 seconds.
+# It is one HTML page in a Config labelled legion.console-plugin: page; the
+# console lists it in the side bar of anyone who may read the namespace.
+#
+#   legion apply -f examples/console-plugin/plugin.yaml
+#
+# The page runs in a sandbox of its own and reaches no address. It asks the
+# console in messages, which answers as the user, for this namespace only,
+# and reads only:
+#
+#   → {legion: 1, id, op: "list", kind}        ← {legion: 1, id, ok, result}
+#   → {legion: 1, id, op: "get", kind, name}   ← {legion: 1, id, ok, result}
+#   → {legion: 1, id, op: "me"}                ← {legion: 1, id, ok, result}
+#
+# and first says {legion: 1, op: "hello", namespace, language}.
+apiVersion: legion/v1
+kind: Config
+metadata:
+  name: services-at-a-glance
+  namespace: default
+  labels:
+    legion.console-plugin: page
+spec:
+  text: |
+    <!doctype html>
+    <html lang="en">
+    <meta charset="utf-8">
+    <title>Services at a glance</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; font-size: 15px; }
+      table { border-collapse: collapse; width: 100%; }
+      th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #8884; }
+      .short { color: #b3261e; font-weight: 600; }
+      @media (prefers-color-scheme: dark) { .short { color: #ff8a80; } }
+    </style>
+    <h1 id="title">Services</h1>
+    <p id="state" role="status">Waiting for the console…</p>
+    <table aria-labelledby="title">
+      <thead><tr><th>Service</th><th>Ready</th><th>Image</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <script>
+      let next = 1;
+      const waiting = new Map();
+      // Ask the console; its answer comes back as a message.
+      function ask(op, more) {
+        const id = next++;
+        parent.postMessage({ legion: 1, id, op, ...more }, '*');
+        return new Promise((ok, fail) => waiting.set(id, { ok, fail }));
+      }
+      function cell(row, text, cls) {
+        const td = row.insertCell();
+        td.textContent = text;
+        if (cls) td.className = cls;
+      }
+      async function refresh() {
+        try {
+          const services = await ask('list', { kind: 'Service' });
+          const rows = document.getElementById('rows');
+          rows.replaceChildren();
+          for (const s of services.sort((a, b) => a.metadata.name.localeCompare(b.metadata.name))) {
+            const ready = s.status?.ready ?? 0;
+            const desired = s.status?.desired ?? s.spec?.replicas ?? 0;
+            const row = rows.insertRow();
+            cell(row, s.metadata.name);
+            cell(row, ready + ' of ' + desired, ready < desired ? 'short' : '');
+            cell(row, (s.spec?.pod?.containers ?? []).map((c) => c.image).join(', '));
+          }
+          document.getElementById('state').textContent =
+            services.length + ' services, as of ' + new Date().toLocaleTimeString();
+        } catch (e) {
+          document.getElementById('state').textContent = 'Cannot read the Services: ' + e.message;
+        }
+      }
+      addEventListener('message', (e) => {
+        if (e.source !== parent || e.data?.legion !== 1) return;
+        const m = e.data;
+        if (m.op === 'hello') {
+          document.getElementById('title').textContent = 'Services in ' + m.namespace;
+          refresh();
+          setInterval(refresh, 10000);
+          return;
+        }
+        const w = waiting.get(m.id);
+        if (!w) return;
+        waiting.delete(m.id);
+        m.ok ? w.ok(m.result) : w.fail(new Error(m.error));
+      });
+    </script>
