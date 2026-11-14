@@ -185,9 +185,13 @@ balancer address and vhid in its list; NetworkPolicies and image policies
 summarised in theirs; the Network page, a namespace's matrix of what
 reaches what and on which ports, from `Cluster.Reach` (`legion reach`),
 which evaluates the same rules the nodes' guards do (`legion_api::policy`:
-`may_reach`, `may_send`, moved there from the agent). Not yet: which node
-holds each load balancer address (no node reports it; the lab test asks
-the nodes' interfaces).
+`may_reach`, `may_send`, moved there from the agent). Which node holds each
+load balancer address came after (2026-11-15): nodes report their CARP
+states in their heartbeats, the leader keeps them, and the Network page
+lists each address with the node holding it and the state of each that
+may (`Cluster.LoadBalancers`, `legion lb`), read again every 10 s; the lab
+load balancer test checks `legion lb` against the nodes' interfaces before
+and after a drain moves the address.
 
 **Lab test, phases 1 to 3** (`crates/legion/tests/console.rs`, in every
 record from lab base 5, which has Chromium): a headless Chromium, driven

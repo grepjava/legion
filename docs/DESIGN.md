@@ -942,6 +942,11 @@ this was verified in a 3-node lab (S3).
   where it is held does traffic arrive. A node drained, paused, suspect or
   down drops out of the ranking and gives the address up. The `vhid` must
   be unique on the network: not the managers', nor another service's.
+  Which node holds it is CARP's to say, so each agent reads the CARP state
+  of the addresses it took up every 5 s and its heartbeats carry them;
+  the leader keeps the latest, and `Cluster.LoadBalancers` (`legion lb`,
+  the console's Network page) gives each address's nodes by skew with the
+  state each reported, a report older than 30 s counting as none.
 - `endpoint: dnsrr` skips the VIP: DNS returns task IPs directly.
 - Host processes cannot reach VIPs or published ports via the host's own address,
   nor a load balancer address on the node holding it (pf `rdr` does not
