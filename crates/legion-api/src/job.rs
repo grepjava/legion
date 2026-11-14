@@ -233,6 +233,25 @@ impl CronJobSpec {
     pub fn parsed_schedule(&self) -> Option<crate::cron::Schedule> {
         self.schedule.parse().ok()
     }
+
+    /// The Job of `cron`'s run at `at` (seconds since the epoch), whether
+    /// the schedule's or one asked for (`legion cronjob run`): named for
+    /// its minute, so one run a minute, whichever asked first, and labelled
+    /// as its CronJob, which keeps it in its history.
+    pub fn run(&self, cron: &crate::Object, at: i64) -> crate::Object {
+        let name = format!("{}-{}", cron.metadata.name, at.div_euclid(60));
+        let mut o = crate::Object::new(
+            crate::Kind::Job,
+            &cron.metadata.namespace,
+            &name,
+            serde_json::to_value(&self.job).expect("spec serialises"),
+        );
+        o.metadata.labels = cron.metadata.labels.clone();
+        o.metadata
+            .labels
+            .insert(LABEL_CRON_JOB.to_owned(), cron.metadata.name.clone());
+        o
+    }
 }
 
 /// Written by the CronJob controller.

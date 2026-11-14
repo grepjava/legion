@@ -20,6 +20,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use legion_api::Object;
 use legion_api::clock;
 use legion_api::job::{
     ConcurrencyPolicy, CronJobSpec, CronJobStatus, JobMode, JobSpec, JobState, JobStatus,
@@ -28,7 +29,6 @@ use legion_api::job::{
 use legion_api::node::Availability;
 use legion_api::service::{ServiceMode, ServiceSpec, TaintEffect};
 use legion_api::task::TaskState;
-use legion_api::{Kind, Object};
 use tokio::time::Instant;
 
 use super::{
@@ -382,7 +382,7 @@ pub(super) fn cron_job(
             .iter()
             .filter(|j| !j.status.state.is_finished())
             .collect();
-        let job = new_job(c, due);
+        let job = c.spec.run(&c.object, due);
         status.message = if mine
             .iter()
             .any(|j| j.object.metadata.name == job.metadata.name)
@@ -475,22 +475,6 @@ pub(super) fn abandoned(jobs: &Jobs, plan: &mut Plan) {
                 .push(Action::Delete(j.object.key(), j.object.metadata.version));
         }
     }
-}
-
-/// The Job of the run due at `due`.
-fn new_job(c: &CronJob, due: i64) -> Object {
-    let name = format!("{}-{}", c.object.metadata.name, due.div_euclid(60));
-    let mut o = Object::new(
-        Kind::Job,
-        &c.object.metadata.namespace,
-        &name,
-        serde_json::to_value(&c.spec.job).expect("spec serialises"),
-    );
-    o.metadata.labels = c.object.metadata.labels.clone();
-    o.metadata
-        .labels
-        .insert(LABEL_CRON_JOB.to_owned(), c.object.metadata.name.clone());
-    o
 }
 
 /// The minute a CronJob's Job was due, from its name.

@@ -438,7 +438,6 @@ async fn single_manager_crud_and_watch() {
         .await
         .unwrap_err();
     assert_eq!(stale.code(), Code::Aborted);
-
     let web_ref = ObjectRef {
         kind: "Service".into(),
         namespace: String::new(),
@@ -470,6 +469,27 @@ async fn single_manager_crud_and_watch() {
         assert_eq!(ev.r#type(), watch_event::Type::Put);
         assert_eq!(ev.object.unwrap().generation, 2, "a status write");
     }
+
+    // Version 0: made only, never written over.
+    let made_only = |name: &str, replicas| ApplyRequest {
+        object: Some(service(name, replicas)),
+        expected_version: Some(0),
+        ..Default::default()
+    };
+    let made = api.apply(made_only("api", 1)).await.unwrap().into_inner();
+    assert_eq!(made.result(), ApplyResult::Created);
+    let over = api.apply(made_only("api", 2)).await.unwrap_err();
+    assert_eq!(over.code(), Code::Aborted, "{over}");
+    api.delete(DeleteRequest {
+        r#ref: Some(ObjectRef {
+            kind: "Service".into(),
+            namespace: String::new(),
+            name: "api".into(),
+        }),
+        expected_version: None,
+    })
+    .await
+    .unwrap();
 
     // Bad input.
     let task = Object {

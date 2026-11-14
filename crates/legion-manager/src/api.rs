@@ -256,8 +256,10 @@ impl ApiService {
 
         for _ in 0..APPLY_ATTEMPTS {
             let current = self.store.get(&key).map_err(internal)?;
+            // Version 0 is no object's (versions are log indexes): only
+            // made, never written over.
             if let Some(expected) = req.expected_version
-                && current.as_ref().map(|o| o.metadata.version) != Some(expected)
+                && current.as_ref().map_or(0, |o| o.metadata.version) != expected
             {
                 return Err(conflict(&key, current.as_ref()));
             }

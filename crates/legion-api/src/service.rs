@@ -257,6 +257,11 @@ pub struct PodSpec {
     /// (docs/PARTITIONS.md).
     #[serde(default, skip_serializing_if = "OnPartition::is_default")]
     pub on_partition: OnPartition,
+    /// When the pod was last asked to restart (`legion restart`), RFC
+    /// 3339: a new time is a new pod, so its tasks are replaced as by any
+    /// update, under the service's update config, and rolled back alike.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restarted_at: Option<String>,
 }
 
 /// What a pod does when its node is cut off from the managers, who then

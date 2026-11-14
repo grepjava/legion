@@ -42,7 +42,8 @@ service Objects {
 
 message ApplyRequest {
   Object object = 1;
-  // Fail with ABORTED unless the object is at exactly this version.
+  // Fail with ABORTED unless the object is at exactly this version; 0
+  // unless there is no such object, to make one only.
   optional uint64 expected_version = 2;
   // Validate and return what would be stored, without writing.
   bool dry_run = 3;
