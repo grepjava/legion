@@ -230,10 +230,16 @@ fetch the history again as each sample is due, the console's one poll, as
 the history is no store object to watch. Namespaces' quotas and what each
 uses now (`Cluster.Quotas`, `legion quota`), worked out by the same code as
 the metrics, as bars with their numbers on the overview and a Namespace's
-page. The lab test (`the_console_runs_the_cluster`) checks the phase's
-"done when": on f7efd71 a crash loop was shown as its third restart was seen
-and a node's alert 4.2 s after its daemon stopped, each leading to the
-cause. Not yet: log search across a service's tasks for a time range; CPU,
+page. A Service's or Job's logs searched across its tasks for a time
+range (`legion logs-search`, a Logs tab): agents keep each line's time
+(their saved output and jails' logs carry it), a logs session takes a range
+and gives each line with its time, and the manager's `logsearch` opens one
+per task and container, 8 at once, and merges what holds the text in time
+order, the newest 1000 by default; a node whose agent keeps no times is
+named as not searched (its lab step passed on 5b762be). The lab test (`the_console_runs_the_cluster`) checks
+the phase's "done when": on f7efd71 a crash loop was shown as its third
+restart was seen and a node's alert 4.2 s after its daemon stopped, each
+leading to the cause. Not yet: CPU,
 restarts and network charts beyond what heartbeats carry (agents report
 CPU and memory only); alerts for nearly full Volumes, which need agents to
 report Volume use.
@@ -258,6 +264,30 @@ What makes OpenShift's console a place to deploy from.
 **Done when** a user who has never used the CLI deploys an example from
 the catalog, changes its image through a jailer build and sees the
 rollout, on the lab.
+
+**Built so far:** deploy from an image (`/deploy`): a form (name,
+namespace, image, replicas, command, port and whether it is published on
+every node, a readiness probe, environment, a Volume mounted, made with a
+size or one there is, memory and CPU) writing the Service's YAML alongside
+as it is filled, shown as changes and applied as `legion apply` does.
+Compose import (`/import`, the gateway's `/api/compose`): a compose file
+converted by the same code as `legion stack convert`, nothing written,
+shown with what Legion cannot honour and its namespace first when it is
+missing; the variables it reads (`legion_api::compose::Stack::variables`,
+with their defaults) become fields, and files it names are not read (their
+content goes in it). Templates (`/templates`): the examples in `examples/`,
+built into the gateway, and compose files saved from the import as Configs
+labelled `legion.template`, each opened in the import. Topology
+(`/topology`): a namespace's Services, green, amber or red by how many of
+their tasks are ready, the Routes to them, what may reach what among them
+as `legion reach` gives it, and the Volumes they use, followed live, each
+box leading to its object. The lab test deploys from the form and from a
+saved template with its variable set, and sees both in the topology
+(passed on 5b762be). Not
+yet: builds. jailer is a command, with no API for the console to call; a
+build needs either jailer serving one, or a Legion Job running `jailer
+build` in a jail allowed to make jails, pushing to the cluster's registry.
+That choice is jailer's as much as Legion's, so the "done when" waits on it.
 
 ## Phase 6: enterprise
 
