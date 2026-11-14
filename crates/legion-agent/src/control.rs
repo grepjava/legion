@@ -121,12 +121,14 @@ pub trait Control: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Option<Vec<u8>>, ControlError>> + Send;
 
     /// Tells the managers `node` is alive, with what its tasks use when
-    /// read since the last heartbeat (by `namespace/task`); returns how
-    /// long to wait before the next heartbeat.
+    /// read since the last heartbeat (by `namespace/task`) and the CARP
+    /// state of each load balancer address it took up; returns how long to
+    /// wait before the next heartbeat.
     fn heartbeat(
         &self,
         node: &str,
         usage: Vec<(String, TaskUsage)>,
+        carp: Vec<(std::net::Ipv4Addr, String)>,
     ) -> impl Future<Output = Result<Duration, ControlError>> + Send;
 
     /// Sessions users open with the node's tasks, as any manager offers
@@ -773,6 +775,7 @@ impl Control for GrpcControl {
         &self,
         node: &str,
         usage: Vec<(String, TaskUsage)>,
+        carp: Vec<(std::net::Ipv4Addr, String)>,
     ) -> Result<Duration, ControlError> {
         let usage = usage
             .into_iter()
@@ -789,6 +792,13 @@ impl Control for GrpcControl {
         let req = HeartbeatRequest {
             node: node.to_owned(),
             usage,
+            carp: carp
+                .into_iter()
+                .map(|(address, state)| legion_proto::v1::CarpState {
+                    address: address.to_string(),
+                    state,
+                })
+                .collect(),
         };
         let resp = self
             .call(|mut c| async move { c.heartbeat(req).await })

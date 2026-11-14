@@ -334,6 +334,16 @@ impl LoadBalancer {
         Ok(())
     }
 
+    /// The load balancer addresses it put on this node as CARP virtual
+    /// hosts: each with its interface and vhid, to ask CARP which this node
+    /// holds.
+    pub fn held(&self) -> Vec<(Ipv4Addr, String, u8)> {
+        self.carps
+            .iter()
+            .map(|(addr, (iface, carp))| (*addr, iface.clone(), carp.vhid))
+            .collect()
+    }
+
     /// Forgets what the anchor holds, after a pass failed, so the next
     /// sets it all again; the backends stay, so their connections are
     /// still killed once they go.

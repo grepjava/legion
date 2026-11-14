@@ -152,8 +152,9 @@ impl Control for Flaky {
         &self,
         node: &str,
         usage: Vec<(String, TaskUsage)>,
+        carp: Vec<(std::net::Ipv4Addr, String)>,
     ) -> Result<Duration, ControlError> {
-        self.inner.heartbeat(node, usage).await
+        self.inner.heartbeat(node, usage, carp).await
     }
 
     fn sessions(&self, node: &str) -> tokio::sync::mpsc::Receiver<Offer> {

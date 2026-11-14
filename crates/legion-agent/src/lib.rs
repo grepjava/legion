@@ -307,10 +307,20 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             tokio::time::Instant::now(),
             Duration::from_secs(1),
         )));
+        // The load balancer addresses this node took up, and the CARP
+        // state of each, which heartbeats report.
+        let carp_held: CarpHeld = Arc::default();
+        let carp_states: CarpStates = Arc::default();
+        let carp_watch = tokio::spawn(carp_watch(
+            ctx.sys.clone(),
+            carp_held.clone(),
+            carp_states.clone(),
+        ));
         let heartbeats = tokio::spawn(heartbeats(
             heard.clone(),
             ctx.control.clone(),
             ctx.node.clone(),
+            carp_states,
             metrics::AgentMetrics {
                 runtime: ctx.runtime.clone(),
                 sys: ctx.sys.clone(),
@@ -410,6 +420,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             mesh.is_some(),
             ctx.node.clone(),
             self.load_balancer_interface.clone(),
+            carp_held,
         ));
 
         let mut assignments = ctx.control.assignments(&ctx.node);
@@ -427,6 +438,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         };
         if !loaded {
             heartbeats.abort();
+            carp_watch.abort();
             sessions.abort();
             for i in &ingress {
                 i.abort();
@@ -579,6 +591,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         // Dropping the senders ends each worker without touching its pod.
         forwarder.abort();
         heartbeats.abort();
+        carp_watch.abort();
         sessions.abort();
         for i in ingress {
             i.abort();
@@ -836,6 +849,7 @@ async fn load_balancing(
     mesh: bool,
     node: String,
     lb_interface: Option<String>,
+    held: CarpHeld,
 ) {
     use legion_net::lb::{self, Exits, LoadBalancer, Port, Proto, Service};
 
@@ -946,6 +960,7 @@ async fn load_balancing(
         })
         .await;
         balancer = b;
+        *held.lock().unwrap_or_else(|e| e.into_inner()) = balancer.held();
         retry = match result {
             Ok(()) => false,
             Err(e) => {
@@ -1107,10 +1122,57 @@ async fn quota_loop<R: Runtime, C: Control>(
 
 /// Sends heartbeats for `node` as often as the managers ask, for as long
 /// as the agent runs, with its tasks' use every `usage_period`.
+/// Load balancer addresses this node took up as CARP virtual hosts: each
+/// with its interface and vhid.
+type CarpHeld = Arc<std::sync::Mutex<Vec<(std::net::Ipv4Addr, String, u8)>>>;
+/// Their CARP states as last read: `master`, `backup` or `init`.
+type CarpStates = Arc<std::sync::Mutex<Vec<(std::net::Ipv4Addr, String)>>>;
+
+/// How often the CARP states of this node's load balancer addresses are
+/// read: CARP moves an address on its own, between the balancer's passes.
+const CARP_WATCH: Duration = Duration::from_secs(5);
+
+/// Reads the CARP state of each load balancer address this node took up,
+/// for its heartbeats to report which node holds each.
+async fn carp_watch(sys: Arc<dyn Sys>, held: CarpHeld, states: CarpStates) {
+    let mut warned = false;
+    loop {
+        let now = held.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let read = if now.is_empty() {
+            Ok(Vec::new())
+        } else {
+            task::blocking(&sys, move |sys| {
+                now.into_iter()
+                    .filter_map(|(addr, iface, vhid)| match sys.carp_state(&iface, vhid) {
+                        Ok(Some(state)) => Some(Ok((addr, state.as_str().to_owned()))),
+                        Ok(None) => None,
+                        Err(e) => Some(Err(e)),
+                    })
+                    .collect::<legion_sys::Result<Vec<_>>>()
+            })
+            .await
+        };
+        match read {
+            Ok(read) => {
+                *states.lock().unwrap_or_else(|e| e.into_inner()) = read;
+                warned = false;
+            }
+            Err(e) => {
+                if !warned {
+                    tracing::warn!("reading CARP states: {e}");
+                    warned = true;
+                }
+            }
+        }
+        tokio::time::sleep(CARP_WATCH).await;
+    }
+}
+
 async fn heartbeats<R: Runtime, C: Control>(
     heard: Arc<std::sync::Mutex<(tokio::time::Instant, Duration)>>,
     control: Arc<C>,
     node: String,
+    carp: CarpStates,
     metrics: metrics::AgentMetrics<R>,
     usage_period: Duration,
 ) {
@@ -1125,7 +1187,8 @@ async fn heartbeats<R: Runtime, C: Control>(
             Vec::new()
         };
         let sent = tokio::time::Instant::now();
-        match control.heartbeat(&node, usage).await {
+        let held = carp.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        match control.heartbeat(&node, usage, held).await {
             Ok(p) => {
                 *heard.lock().unwrap_or_else(|e| e.into_inner()) = (sent, p);
                 if failing {
