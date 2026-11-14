@@ -175,6 +175,10 @@ service Cluster {
   rpc ConsoleSession(ConsoleSessionRequest) returns (ConsoleSessionResponse);
   // Managers only: ends a console session (sign-out).
   rpc ConsoleEnd(ConsoleEndRequest) returns (ConsoleEndResponse);
+  // The console's settings (CONSOLE.md phase 6): anyone signed in reads
+  // them; the cluster admin sets them.
+  rpc ConsoleSettings(ConsoleSettingsRequest) returns (ConsoleSettingsResponse);
+  rpc SetConsoleSettings(SetConsoleSettingsRequest) returns (ConsoleSettingsResponse);
 }
 
 message MeRequest {}
@@ -219,6 +223,18 @@ message ConsoleEndRequest {
 }
 
 message ConsoleEndResponse {}
+
+message ConsoleSettingsRequest {}
+
+message SetConsoleSettingsRequest {
+  // legion_api::console::Settings as JSON.
+  bytes settings_json = 1;
+}
+
+message ConsoleSettingsResponse {
+  // legion_api::console::Settings as JSON, as now set.
+  bytes settings_json = 1;
+}
 
 message AuditRequest {
   // legion_api::audit::Filter as JSON; empty for every event.

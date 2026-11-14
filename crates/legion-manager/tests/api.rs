@@ -5558,3 +5558,107 @@ async fn alerts_follow_what_goes_wrong() {
     );
     m.stop().await;
 }
+
+/// The console's settings (CONSOLE.md phase 6): the cluster admin sets
+/// them, through any manager, checked; anyone signed in reads them; a
+/// session started after lasts as long as they say.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_console_settings_are_the_admins() {
+    use legion_proto::v1::{
+        ConsoleCodeRequest, ConsoleSessionRequest, ConsoleSettingsRequest,
+        SetConsoleSettingsRequest,
+    };
+    let ca = Ca::generate().unwrap();
+    let first = Running::start_with(Some(&ca)).await;
+    first.cluster().await.init(InitRequest {}).await.unwrap();
+    let token = first
+        .cluster()
+        .await
+        .join_token(JoinTokenRequest {
+            role: "manager".into(),
+            rotate: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    let follower = Running::join(&first.addr, &token, "m2", creds(&ca, "admin", Role::Admin)).await;
+    let as_who = |who: &str, role: Role| {
+        let tls = creds(&ca, who, role);
+        let follower = &follower;
+        async move { ClusterClient::new(follower.channel(Some(&tls)).await.unwrap()) }
+    };
+    let mut admin = as_who("admin", Role::Admin).await;
+    let mut alice = as_who("alice", Role::User).await;
+    let read = |r: Result<tonic::Response<legion_proto::v1::ConsoleSettingsResponse>, tonic::Status>| {
+        serde_json::from_slice::<serde_json::Value>(&r.unwrap().into_inner().settings_json).unwrap()
+    };
+    let set = |v: serde_json::Value| SetConsoleSettingsRequest {
+        settings_json: v.to_string().into_bytes(),
+    };
+
+    // None yet: the defaults.
+    let none = eventually(|| {
+        let mut alice = alice.clone();
+        async move { alice.console_settings(ConsoleSettingsRequest {}).await }
+    })
+    .await;
+    assert_eq!(read(Ok(none)), serde_json::json!({}));
+
+    let wanted = serde_json::json!({
+        "banner": { "text": "Production", "level": "danger" },
+        "links": [{ "label": "Runbook", "url": "https://wiki.example/run" }],
+        "defaultNamespace": "shop",
+        "session": "2h",
+    });
+    let r = eventually(|| {
+        let mut admin = admin.clone();
+        let req = set(wanted.clone());
+        async move { admin.set_console_settings(req).await }
+    })
+    .await;
+    assert_eq!(read(Ok(r)), wanted);
+
+    // A user reads them, from the follower's replica, and may not set them.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while read(alice.console_settings(ConsoleSettingsRequest {}).await) != wanted {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the settings on the follower"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let refused = alice
+        .set_console_settings(set(serde_json::json!({})))
+        .await;
+    assert!(denied(refused).contains("console's settings"));
+
+    // Checked.
+    for bad in [
+        serde_json::json!({ "session": "1m" }),
+        serde_json::json!({ "links": [{ "label": "x", "url": "javascript:alert(1)" }] }),
+        serde_json::json!({ "theme": "dark" }),
+    ] {
+        let e = admin.set_console_settings(set(bad.clone())).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::InvalidArgument, "{bad}: {e:?}");
+    }
+    assert_eq!(read(admin.console_settings(ConsoleSettingsRequest {}).await), wanted);
+
+    // A session started now lasts 2 h.
+    let code = alice
+        .console_code(ConsoleCodeRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let session = as_who("m9", Role::Manager)
+        .await
+        .console_session(ConsoleSessionRequest { code: code.code })
+        .await
+        .unwrap()
+        .into_inner();
+    let minutes = (session.expires_ms - code.expires_ms) / 60_000;
+    assert!((118..=120).contains(&minutes), "{minutes} min");
+
+    follower.stop().await;
+    first.stop().await;
+}

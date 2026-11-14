@@ -1747,6 +1747,44 @@ impl Cluster for ApiService {
         Ok(Response::new(pb::ConsoleEndResponse {}))
     }
 
+    async fn console_settings(
+        &self,
+        req: Request<pb::ConsoleSettingsRequest>,
+    ) -> Result<Response<pb::ConsoleSettingsResponse>, Status> {
+        self.caller(&req)?;
+        let settings = crate::console::settings(&self.store)?;
+        Ok(Response::new(pb::ConsoleSettingsResponse {
+            settings_json: serde_json::to_vec(&settings).expect("serialises"),
+        }))
+    }
+
+    async fn set_console_settings(
+        &self,
+        req: Request<pb::SetConsoleSettingsRequest>,
+    ) -> Result<Response<pb::ConsoleSettingsResponse>, Status> {
+        let audit = self.audit_point(&req, "console-settings", Default::default());
+        let result = async {
+            self.caller(&req)?.require_all("change the console's settings")?;
+            if let Some(addr) = self.leader_addr(&req)? {
+                let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                    &addr,
+                    self.peer_tls.as_ref(),
+                ));
+                return c.set_console_settings(forwarded(req.into_inner())).await;
+            }
+            let settings: legion_api::console::Settings =
+                serde_json::from_slice(&req.get_ref().settings_json)
+                    .map_err(|e| Status::invalid_argument(format!("the settings: {e}")))?;
+            self.consistent().await?;
+            crate::console::set_settings(self, &settings).await?;
+            Ok(Response::new(pb::ConsoleSettingsResponse {
+                settings_json: serde_json::to_vec(&settings).expect("serialises"),
+            }))
+        }
+        .await;
+        self.audit_end(audit, result)
+    }
+
     type BackupStream = ReceiverStream<Result<pb::BackupChunk, Status>>;
 
     async fn backup(

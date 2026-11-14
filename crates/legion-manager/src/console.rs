@@ -6,6 +6,8 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use legion_api::console::Settings;
+
 use legion_api::{Kind, Object, ObjectKey};
 use legion_store::{Command, Outcome, Precondition, Store};
 use serde::{Deserialize, Serialize};
@@ -17,11 +19,11 @@ use crate::join::SYSTEM_NAMESPACE;
 
 /// How long a code from `legion console login` may be exchanged.
 pub(crate) const CODE_LIFETIME: Duration = Duration::from_secs(60);
-/// How long a console session lasts at most.
-pub(crate) const SESSION_LIFETIME: Duration = Duration::from_secs(12 * 3600);
 
 const CODE_PREFIX: &str = "console-code-";
 const SESSION_PREFIX: &str = "console-session-";
+/// The console's settings (`legion_api::console::Settings`), one record.
+const SETTINGS: &str = "console-settings";
 
 /// Who a code or session is for, and until when (Unix ms).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,8 +124,8 @@ pub(crate) async fn new_code(
 }
 
 /// Exchanges `code`, once, for a session, on the leader. The session lasts
-/// [`SESSION_LIFETIME`], or until the certificate the code was asked with
-/// expires if sooner.
+/// as long as the console's settings say, or until the certificate the code
+/// was asked with expires if sooner.
 pub(crate) async fn redeem(api: &ApiService, code: &str) -> Result<(String, Signed), Status> {
     let refused = || Status::permission_denied("the code is wrong, used or expired");
     let code_key = key(CODE_PREFIX, code);
@@ -149,10 +151,40 @@ pub(crate) async fn redeem(api: &ApiService, code: &str) -> Result<(String, Sign
     let record = Signed {
         name: found.name,
         role: found.role,
-        expires_ms: (now + SESSION_LIFETIME.as_millis() as i64).min(found.until_ms),
+        expires_ms: (now + settings(&api.store)?.session().millis() as i64).min(found.until_ms),
     };
     put(api, &key(SESSION_PREFIX, &session), &record).await?;
     Ok((session, record))
+}
+
+fn settings_key() -> ObjectKey {
+    ObjectKey::new(Kind::Secret, SYSTEM_NAMESPACE, SETTINGS)
+}
+
+/// The console's settings, on any manager from its replica; the defaults
+/// when none were set.
+pub(crate) fn settings(store: &Store) -> Result<Settings, Status> {
+    Ok(read::<Settings>(store, &settings_key())?
+        .map(|(s, _)| s)
+        .unwrap_or_default())
+}
+
+/// Sets the console's settings, on the leader, once checked.
+pub(crate) async fn set_settings(api: &ApiService, s: &Settings) -> Result<(), Status> {
+    s.check()
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+    let object = Object::new(
+        Kind::Secret,
+        SYSTEM_NAMESPACE,
+        SETTINGS,
+        serde_json::to_value(s).expect("serialises"),
+    );
+    api.write(Command::Put {
+        object,
+        precondition: Precondition::None,
+    })
+    .await?;
+    Ok(())
 }
 
 /// The session `session` names, if it is current: on any manager, from its
