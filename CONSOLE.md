@@ -340,6 +340,34 @@ session.
 - *Tested* against a provider played by the test: discovery, keys, a token
   endpoint, a group mapped to a role.
 
+**Several clusters** (built as below; tested over two gateways,
+`the_consoles_of_listed_clusters_see_who_is_signed_in`). Each cluster keeps
+its own console, served by
+its own managers; a console never holds another cluster's sessions or
+calls another cluster's API for a user. "One console" is these consoles
+knowing each other:
+
+- *Named and listed.* The settings gain `name` (this cluster, shown at the
+  top of the side bar and in the page title) and `clusters`, the other
+  consoles (`name` and an `https://` address). The side bar switches to one
+  at the same page, so a list of Services on one opens the list of Services
+  on the next.
+- *Signed into separately.* Each console has its own session, by its own
+  sign-in: a code from that cluster's CLI, or its own single sign-on, whose
+  provider remembers the user, so the second sign-in is one click. Rights
+  are each cluster's bindings; nothing is carried across.
+- *Seen together.* A Clusters page asks each listed console who the user
+  is there (`/api/me`, read across origins), showing the role and
+  namespaces in each, or that the user is not signed in there. A console
+  answers that question from another's page only if its own settings list
+  that console back, and answers nothing else across origins.
+- *Where the cookie goes.* The session cookie stays `SameSite=Strict`, so
+  the Clusters page sees a session only where the consoles are one site
+  (`a.console.example` and `b.console.example`); elsewhere it shows a link
+  to sign in. Browsers send cookies by host, not port: consoles of two
+  clusters on one host would receive each other's, so each needs its own
+  host name.
+
 ## Out of scope
 
 - Anything the API does not offer. A console-only feature would be a
