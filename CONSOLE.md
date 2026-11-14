@@ -368,6 +368,30 @@ knowing each other:
   clusters on one host would receive each other's, so each needs its own
   host name.
 
+**Accessibility** (a first pass against WCAG 2.2 AA, by reading the code;
+not yet checked by a tool or a screen reader):
+
+- *Contrast.* Every text colour is 4.5:1 or more on the page, the panels
+  and the side bar, in both themes; amber was 4.1:1 on the side bar and is
+  darker. Control borders and the topology's boxes are 3:1 (they were
+  1.3:1). The primary button's text is dark on the dark theme's accent,
+  where white was 3.1:1.
+- *Keyboard.* A focus ring on everything focusable; a link past the side
+  bar; an object's tabs one stop, moved between with the arrows, Home and
+  End, each controlling its panel; the terminal, which takes every key, is
+  left with Shift+Esc (Esc alone still reaches the command).
+- *Screen readers.* Each page has its own title (`Services · prod-east ·
+  Legion`), announced on navigation; the side bar is a named navigation
+  with the page shown marked current; errors are alerts and confirmations
+  status messages, read as they appear; the topology is a group of links,
+  each naming its health (`Service web: 2/3 ready`), not an image hiding
+  them; the list filter has a label.
+- *Reflow and targets.* Below 48rem (a phone, or 400% zoom) the side bar
+  goes above the page and wide tables scroll on their own; small buttons
+  (a label's remove) are 24 by 24 px at least.
+- *Still to do.* An automated check (axe) on every page in the lab's
+  browser test, a screen reader pass, and the charts' values as a table.
+
 ## Out of scope
 
 - Anything the API does not offer. A console-only feature would be a
