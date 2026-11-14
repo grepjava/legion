@@ -24,7 +24,7 @@ legion-sys.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["fs", "io-util", "process"] }
 tokio-stream.workspace = true
 tonic = { workspace = true, features = ["tls-ring"] }
 tonic-health.workspace = true
