@@ -2,6 +2,7 @@
   // A node's capacity, what its tasks use now, and the tasks on it, live.
   import { api, bytes, follow, type LObject } from './api.ts';
   import { tone } from './columns.ts';
+  import { t } from './i18n.svelte.ts';
 
   let { node }: { node: LObject } = $props();
   const name = $derived(node.metadata.name);
@@ -58,19 +59,19 @@
 
 <div class="cards">
   <div class="card">
-    <h2>Allocatable</h2>
-    <p class="big">{alloc?.cpu ?? '?'} CPU</p>
-    <p class="muted">{alloc?.memory ?? '?'} memory</p>
+    <h2>{t('Allocatable')}</h2>
+    <p class="big">{t('{cpu} CPU', { cpu: alloc?.cpu ?? '?' })}</p>
+    <p class="muted">{t('{memory} memory', { memory: alloc?.memory ?? '?' })}</p>
   </div>
   <div class="card">
-    <h2>In use now</h2>
-    <p class="big">{total.cpu.toFixed(1)}% CPU</p>
-    <p class="muted">{bytes(total.memory)} memory, of the tasks you can see</p>
+    <h2>{t('In use now')}</h2>
+    <p class="big">{t('{cpu}% CPU', { cpu: total.cpu.toFixed(1) })}</p>
+    <p class="muted">{t('{memory} memory, of the tasks you can see', { memory: bytes(total.memory) })}</p>
   </div>
   <div class="card">
-    <h2>Tasks</h2>
+    <h2>{t('Tasks')}</h2>
     <p class="big">{tasks.length}</p>
-    <p class="muted">{running} running</p>
+    <p class="muted">{t('{n} running', { n: running })}</p>
   </div>
 </div>
 
@@ -80,12 +81,12 @@
   <table>
     <thead>
       <tr>
-        <th>Task</th>
-        <th>Namespace</th>
-        <th>State</th>
-        <th>IP</th>
-        <th>CPU</th>
-        <th>Memory</th>
+        <th>{t('Task')}</th>
+        <th>{t('Namespace')}</th>
+        <th>{t('State')}</th>
+        <th>{t('IP')}</th>
+        <th>{t('CPU')}</th>
+        <th>{t('Memory')}</th>
       </tr>
     </thead>
     <tbody>
@@ -103,5 +104,5 @@
     </tbody>
   </table>
 {:else if !error}
-  <p class="muted">No tasks on this node.</p>
+  <p class="muted">{t('No tasks on this node.')}</p>
 {/if}

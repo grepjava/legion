@@ -5,6 +5,7 @@
   import Diff from '#lib/Diff.svelte';
   import { blank, objects } from '#lib/deploy.ts';
   import { cannotWrite, namespaces, session } from '#lib/session.svelte.ts';
+  import { t } from '#lib/i18n.svelte.ts';
   import { toYaml } from '#lib/yaml.ts';
 
   let all: string[] = $state([]);
@@ -38,68 +39,71 @@
   const deployed = $derived(!dry && results.some((r) => r.key.startsWith('Service/')));
 </script>
 
-<header class="bar"><h1>Deploy from an image</h1></header>
-<p class="muted">A Service from an image, written as YAML alongside; change the YAML further in <a href="/apply">Apply YAML</a>.</p>
+<header class="bar"><h1>{t('Deploy from an image')}</h1></header>
+<p class="muted">
+  {t('A Service from an image, written as YAML alongside; change the YAML further in')}
+  <a href="/apply">{t('Apply YAML')}</a>.
+</p>
 
 <div class="split">
   <form class="deploy" onsubmit={(e) => e.preventDefault()}>
-    <label>Name <input bind:value={form.name} aria-label="Name" placeholder="web" /></label>
+    <label>{t('Name')} <input bind:value={form.name} aria-label={t('Name')} placeholder="web" /></label>
     <label
-      >Namespace
-      <select bind:value={form.namespace} aria-label="Namespace">
+      >{t('Namespace')}
+      <select bind:value={form.namespace} aria-label={t('Namespace')}>
         {#each choices.includes(form.namespace) ? choices : [form.namespace, ...choices] as n (n)}<option
             value={n}>{n}</option
           >{/each}
       </select>
     </label>
-    <label>Image <input bind:value={form.image} aria-label="Image" placeholder="registry.example/web:1" /></label>
-    <label>Replicas <input type="number" min="0" bind:value={form.replicas} aria-label="Replicas" /></label>
+    <label>{t('Image')} <input bind:value={form.image} aria-label={t('Image')} placeholder="registry.example/web:1" /></label>
+    <label>{t('Replicas')} <input type="number" min="0" bind:value={form.replicas} aria-label={t('Replicas')} /></label>
     <label
-      >Command <span class="muted">(one argument a line; empty keeps the image's)</span>
-      <textarea rows="2" bind:value={form.command} aria-label="Command"></textarea>
+      >{t('Command')} <span class="muted">{t("(one argument a line; empty keeps the image's)")}</span>
+      <textarea rows="2" bind:value={form.command} aria-label={t('Command')}></textarea>
     </label>
     <fieldset>
-      <legend>Network</legend>
+      <legend>{t('Network')}</legend>
       <label
-        >Container port <input type="number" min="0" max="65535" bind:value={form.port} aria-label="Container port" /></label
+        >{t('Container port')} <input type="number" min="0" max="65535" bind:value={form.port} aria-label={t('Container port')} /></label
       >
       <label
-        >Published on every node at <span class="muted">(0: inside the cluster only)</span>
-        <input type="number" min="0" max="65535" bind:value={form.publishedPort} aria-label="Published port" />
+        >{t('Published on every node at')} <span class="muted">{t('(0: inside the cluster only)')}</span>
+        <input type="number" min="0" max="65535" bind:value={form.publishedPort} aria-label={t('Published port')} />
       </label>
       <label
-        >Readiness probe
-        <select bind:value={form.probe} aria-label="Readiness probe">
-          <option value="none">none</option>
-          <option value="http">HTTP GET</option>
-          <option value="tcp">TCP connect</option>
+        >{t('Readiness probe')}
+        <select bind:value={form.probe} aria-label={t('Readiness probe')}>
+          <option value="none">{t('none')}</option>
+          <option value="http">{t('HTTP GET')}</option>
+          <option value="tcp">{t('TCP connect')}</option>
         </select>
       </label>
       {#if form.probe === 'http'}<label
-          >Probe path <input bind:value={form.probePath} aria-label="Probe path" /></label
+          >{t('Probe path')} <input bind:value={form.probePath} aria-label={t('Probe path')} /></label
         >{/if}
     </fieldset>
     <label
-      >Environment <span class="muted">(NAME=value a line)</span>
-      <textarea rows="3" bind:value={form.env} aria-label="Environment"></textarea>
+      >{t('Environment')} <span class="muted">{t('(NAME=value a line)')}</span>
+      <textarea rows="3" bind:value={form.env} aria-label={t('Environment')}></textarea>
     </label>
     <fieldset>
-      <legend>Storage</legend>
-      <label>Mount a Volume at <input bind:value={form.mountPath} aria-label="Mount path" placeholder="/data" /></label>
+      <legend>{t('Storage')}</legend>
+      <label>{t('Mount a Volume at')} <input bind:value={form.mountPath} aria-label={t('Mount path')} placeholder="/data" /></label>
       {#if form.mountPath.trim()}
         <label
-          >Volume <input bind:value={form.volume} aria-label="Volume" placeholder={form.name || 'name'} /></label
+          >{t('Volume')} <input bind:value={form.volume} aria-label={t('Volume')} placeholder={form.name || t('name')} /></label
         >
         <label
-          >New Volume's size <span class="muted">(empty: one there is)</span>
-          <input bind:value={form.volumeSize} aria-label="Volume size" placeholder="1Gi" />
+          >{t("New Volume's size")} <span class="muted">{t('(empty: one there is)')}</span>
+          <input bind:value={form.volumeSize} aria-label={t('Volume size')} placeholder="1Gi" />
         </label>
       {/if}
     </fieldset>
     <fieldset>
-      <legend>Resources</legend>
-      <label>Memory <input bind:value={form.memory} aria-label="Memory" placeholder="256Mi" /></label>
-      <label>CPU <input bind:value={form.cpu} aria-label="CPU" placeholder="500m" /></label>
+      <legend>{t('Resources')}</legend>
+      <label>{t('Memory')} <input bind:value={form.memory} aria-label={t('Memory')} placeholder="256Mi" /></label>
+      <label>{t('CPU')} <input bind:value={form.cpu} aria-label={t('CPU')} placeholder="500m" /></label>
     </fieldset>
   </form>
 
@@ -107,23 +111,27 @@
     {#if typeof built === 'string'}
       <p class="muted">{built}.</p>
     {:else}
-      <pre class="yaml" aria-label="Generated YAML">{yaml}</pre>
+      <pre class="yaml" aria-label={t('Generated YAML')}>{yaml}</pre>
     {/if}
     <div class="controls">
-      <button onclick={() => run(true)} disabled={!yaml || !!why || busy} title={why ?? ''}>Show changes</button>
+      <button onclick={() => run(true)} disabled={!yaml || !!why || busy} title={why ?? ''}>{t('Show changes')}</button>
       <button class="primary" onclick={() => run(false)} disabled={!yaml || !!why || busy} title={why ?? ''}
-        >Deploy</button
+        >{t('Deploy')}</button
       >
       {#if busy}<span class="muted">…</span>{/if}
     </div>
     {#if why && yaml}<p class="muted">{why}.</p>{/if}
     {#if error}<p class="error" role="alert">{error}</p>{/if}
     {#each results as r (r.key)}
-      <h2>{r.key}: <span class="muted">{dry ? `would be ${r.result}` : `${r.result}, version ${r.version}`}</span></h2>
+      <h2>{r.key}: <span class="muted"
+          >{dry
+            ? t('would be {result}', { result: r.result })
+            : t('{result}, version {version}', { result: r.result, version: r.version })}</span
+        ></h2>
       {#if r.diff}<Diff text={r.diff} />{/if}
     {/each}
     {#if deployed}
-      <p><a href="/k/Service/{form.namespace}/{form.name.trim()}">See {form.name.trim()} roll out</a></p>
+      <p><a href="/k/Service/{form.namespace}/{form.name.trim()}">{t('See {name} roll out', { name: form.name.trim() })}</a></p>
     {/if}
   </div>
 </div>

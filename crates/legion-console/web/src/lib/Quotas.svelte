@@ -3,6 +3,7 @@
   // a bar per resource the quota limits, with the numbers beside it, so
   // the bar is never read alone. Fetched again as tasks change.
   import { follow, quotas, type NamespaceQuota } from '#lib/api.ts';
+  import { t } from '#lib/i18n.svelte.ts';
 
   let { namespace = '' }: { namespace?: string } = $props();
   let list: NamespaceQuota[] = $state([]);
@@ -38,7 +39,7 @@
     r === 'memory' || r === 'storage'
       ? `${(v / gi).toFixed(v / gi < 10 ? 1 : 0)} Gi`
       : r === 'cpu'
-        ? `${v.toFixed(v < 10 ? 2 : 1)} cores`
+        ? t('{n} cores', { n: v.toFixed(v < 10 ? 2 : 1) })
         : `${v} ${r}`;
   const share = (q: { limit: number; used: number }) => (q.limit > 0 ? q.used / q.limit : 0);
   const tone = (f: number) => (f >= 0.9 ? 'bad' : f >= 0.75 ? 'wait' : '');
@@ -46,7 +47,7 @@
 
 {#if error}<p class="error" role="alert">{error}</p>{/if}
 {#if loaded && !list.length}
-  <p class="muted">{namespace ? `${namespace} has no quota.` : 'No namespace you can see has a quota.'}</p>
+  <p class="muted">{namespace ? t('{namespace} has no quota.', { namespace }) : t('No namespace you can see has a quota.')}</p>
 {/if}
 {#each list as n (n.namespace)}
   <div class="quota">
@@ -59,7 +60,13 @@
           aria-label="{n.namespace} {q.resource}"
           ><span class="fill {tone(f)}" style="width: {Math.min(100, f * 100)}%"></span></span
         >
-        <span class="nums">{show(q.resource, q.used)} of {show(q.resource, q.limit)} ({Math.round(f * 100)}%)</span>
+        <span class="nums"
+          >{t('{used} of {limit} ({percent}%)', {
+            used: show(q.resource, q.used),
+            limit: show(q.resource, q.limit),
+            percent: Math.round(f * 100)
+          })}</span
+        >
       </div>
     {/each}
   </div>

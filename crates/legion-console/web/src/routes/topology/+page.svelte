@@ -4,6 +4,7 @@
   // reach`, as the nodes enforce it) and the Volumes they use, followed
   // live. Each box leads to its object.
   import { api, follow, type LObject, type ReachEdge } from '#lib/api.ts';
+  import { t } from '#lib/i18n.svelte.ts';
   import { namespaces, session } from '#lib/session.svelte.ts';
 
   const mine = $derived(namespaces([]));
@@ -82,13 +83,16 @@
   };
   const volumeNote = (name: string) => {
     const v = volumes.find((v) => v.metadata.name === name);
-    if (!v) return 'missing';
-    if (v.status?.lost) return 'lost';
-    return v.status?.node ? `Volume on ${v.status.node}` : 'Volume';
+    if (!v) return t('missing');
+    if (v.status?.lost) return t('lost');
+    return v.status?.node ? t('Volume on {node}', { node: v.status.node }) : t('Volume');
   };
   const svcNote = (s: LObject) =>
-    s.status ? `${s.status.ready ?? 0}/${s.status.desired ?? 0} ready` : 'not yet placed';
-  const ports = (e: ReachEdge) => (e.all_ports ? 'all ports' : e.ports.map((p) => `${p.port}/${p.protocol}`).join(', '));
+    s.status
+      ? t('{ready}/{desired} ready', { ready: s.status.ready ?? 0, desired: s.status.desired ?? 0 })
+      : t('not yet placed');
+  const ports = (e: ReachEdge) =>
+    e.all_ports ? t('all ports') : e.ports.map((p) => `${p.port}/${p.protocol}`).join(', ');
   const arc = (from: number, to: number) => {
     const x = X_SVC + BOX_W;
     const bulge = Math.min(ARCS - 20, 30 + Math.abs(to - from) * 22);
@@ -98,7 +102,7 @@
 </script>
 
 <header class="bar">
-  <h1>Topology: {namespace}</h1>
+  <h1>{t('Topology: {namespace}', { namespace })}</h1>
   <form
     class="inline"
     onsubmit={(e) => {
@@ -106,22 +110,23 @@
       chosen = typed.trim();
     }}
   >
-    <input placeholder="another namespace" bind:value={typed} aria-label="Namespace" />
-    <button>Show</button>
+    <input placeholder={t('another namespace')} bind:value={typed} aria-label={t('Namespace')} />
+    <button>{t('Show')}</button>
   </form>
 </header>
 <p class="muted">
-  Routes to the namespace's Services, what may reach what among them as the nodes enforce it, and the Volumes they
-  use. Green: every task ready; amber: some; red: none, or a Volume lost.
+  {t(
+    "Routes to the namespace's Services, what may reach what among them as the nodes enforce it, and the Volumes they use. Green: every task ready; amber: some; red: none, or a Volume lost."
+  )}
 </p>
 {#if error}<p class="error" role="alert">{error}</p>{/if}
-{#if everyone}<p class="muted">Every service may reach every other (the namespace is not isolated by policy).</p>{/if}
+{#if everyone}<p class="muted">{t('Every service may reach every other (the namespace is not isolated by policy).')}</p>{/if}
 
 {#if services.length}
   <p class="sr-only">
-    What may reach what is listed on the <a href="/network">Network</a> page too.
+    {t('What may reach what is listed on the')} <a href="/network">{t('Network')}</a> {t('page too.')}
   </p>
-  <svg class="topology" width={X_VOL + BOX_W + 10} {height} role="group" aria-label="Topology of {namespace}">
+  <svg class="topology" width={X_VOL + BOX_W + 10} {height} role="group" aria-label={t('Topology of {namespace}', { namespace })}>
     <defs>
       <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
         <path d="M0,0 L8,4 L0,8 z" class="head" />
@@ -134,7 +139,7 @@
     {#if outside.length}
       {#each outside as e (e.to)}
         <line class="edge reach" x1={X_ROUTE + BOX_W} y1={y(shownRoutes.length)} x2={X_SVC} y2={y(svcRow.get(e.to)!)} marker-end="url(#arrow)"
-          ><title>other namespaces → {e.to}: {ports(e)}</title></line
+          ><title>{t('other namespaces → {service}: {ports}', { service: e.to, ports: ports(e) })}</title></line
         >
       {/each}
     {/if}
@@ -150,18 +155,26 @@
     {/each}
 
     {#each shownRoutes as r, i (r.metadata.name)}
-      <a href={link('Route', r.metadata.name)} aria-label="Route {r.metadata.name}: {r.spec.host}{r.spec.path ?? ''} to {r.spec.service}">
+      <a
+        href={link('Route', r.metadata.name)}
+        aria-label={t('Route {name}: {host}{path} to {service}', {
+          name: r.metadata.name,
+          host: r.spec.host ?? '',
+          path: r.spec.path ?? '',
+          service: r.spec.service
+        })}
+      >
         <rect class="box route" x={X_ROUTE} y={10 + i * ROW} width={BOX_W} height={BOX_H} rx="6" />
         <text x={X_ROUTE + 10} y={10 + i * ROW + 17}>{r.spec.host}{r.spec.path && r.spec.path !== '/' ? r.spec.path : ''}</text>
-        <text class="sub" x={X_ROUTE + 10} y={10 + i * ROW + 32}>Route {r.metadata.name}</text>
+        <text class="sub" x={X_ROUTE + 10} y={10 + i * ROW + 32}>{t('Route {name}', { name: r.metadata.name })}</text>
       </a>
     {/each}
     {#if outside.length}
       <rect class="box outside" x={X_ROUTE} y={10 + shownRoutes.length * ROW} width={BOX_W} height={BOX_H} rx="6" />
-      <text x={X_ROUTE + 10} y={10 + shownRoutes.length * ROW + 25}>other namespaces</text>
+      <text x={X_ROUTE + 10} y={10 + shownRoutes.length * ROW + 25}>{t('other namespaces')}</text>
     {/if}
     {#each services as s, i (s.metadata.name)}
-      <a href={link('Service', s.metadata.name)} aria-label="Service {s.metadata.name}: {svcNote(s)}">
+      <a href={link('Service', s.metadata.name)} aria-label={t('Service {name}: {note}', { name: s.metadata.name, note: svcNote(s) })}>
         <rect class="box svc {health(s)}" x={X_SVC} y={10 + i * ROW} width={BOX_W} height={BOX_H} rx="6" />
         <text x={X_SVC + 10} y={10 + i * ROW + 17}>{s.metadata.name}</text>
         <text class="sub" x={X_SVC + 10} y={10 + i * ROW + 32}
@@ -170,7 +183,7 @@
       </a>
     {/each}
     {#each volumeNames as v, i (v)}
-      <a href={link('Volume', v)} aria-label="Volume {v}: {volumeNote(v)}">
+      <a href={link('Volume', v)} aria-label={t('Volume {name}: {note}', { name: v, note: volumeNote(v) })}>
         <rect class="box vol {volumeHealth(v)}" x={X_VOL} y={10 + i * ROW} width={BOX_W} height={BOX_H} rx="6" />
         <text x={X_VOL + 10} y={10 + i * ROW + 17}>{v}</text>
         <text class="sub" x={X_VOL + 10} y={10 + i * ROW + 32}
@@ -180,7 +193,7 @@
     {/each}
   </svg>
 {:else if !error}
-  <p class="muted">No services in {namespace}.</p>
+  <p class="muted">{t('No services in {namespace}.', { namespace })}</p>
 {/if}
 
 <style>

@@ -2,6 +2,7 @@
   // A task's output, as `legion logs` prints it: the last lines, then
   // following it while the container runs.
   import { logs, type LObject } from './api.ts';
+  import { t } from './i18n.svelte.ts';
 
   let { task }: { task: LObject } = $props();
   const containers: string[] = $derived(
@@ -59,25 +60,33 @@
 <div class="controls">
   {#if containers.length > 1}
     <label>
-      Container
+      {t('Container')}
       <select bind:value={container}>
         {#each containers as c (c)}<option value={c}>{c}</option>{/each}
       </select>
     </label>
   {/if}
   <label>
-    Last
+    {t('Last')}
     <select bind:value={tail}>
       <option value={100}>100</option>
       <option value={500}>500</option>
       <option value={5000}>5000</option>
     </select>
-    lines
+    {t('lines')}
   </label>
-  <label><input type="checkbox" bind:checked={followOn} /> Follow</label>
-  <span class="muted">{status}</span>
+  <label><input type="checkbox" bind:checked={followOn} /> {t('Follow')}</label>
+  <span class="muted"
+    >{status === 'reading…'
+      ? t('reading…')
+      : status === 'following'
+        ? t('following')
+        : status === 'ended'
+          ? t('ended')
+          : status}</span
+  >
 </div>
 
 <pre class="log" bind:this={box} onscroll={scrolled}>{#each parts as p, i (i)}<span
       class:stderr={p.stderr}>{p.text}</span
-    >{/each}{#if !parts.length}<span class="muted">No output.</span>{/if}</pre>
+    >{/each}{#if !parts.length}<span class="muted">{t('No output.')}</span>{/if}</pre>

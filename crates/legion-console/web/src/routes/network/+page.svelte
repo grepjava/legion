@@ -4,6 +4,7 @@
   // source's egress, decided by the API (`legion reach`), not here.
   import { api, type ReachEdge } from '#lib/api.ts';
   import { namespaces, session } from '#lib/session.svelte.ts';
+  import { t } from '#lib/i18n.svelte.ts';
 
   let chosen = $state('');
   let typed = $state('');
@@ -38,7 +39,7 @@
 </script>
 
 <header class="bar">
-  <h1>Network: {namespace}</h1>
+  <h1>{t('Network: {namespace}', { namespace })}</h1>
   <form
     class="inline"
     onsubmit={(e) => {
@@ -46,13 +47,14 @@
       chosen = typed.trim();
     }}
   >
-    <input placeholder="another namespace" bind:value={typed} aria-label="Namespace" />
-    <button>Show</button>
+    <input placeholder={t('another namespace')} bind:value={typed} aria-label={t('Namespace')} />
+    <button>{t('Show')}</button>
   </form>
 </header>
 <p class="muted">
-  What each source may reach of each service, on which of its tasks' ports: the namespace's isolation
-  and its NetworkPolicies, ingress and egress, as the nodes enforce them.
+  {t(
+    "What each source may reach of each service, on which of its tasks' ports: the namespace's isolation and its NetworkPolicies, ingress and egress, as the nodes enforce them."
+  )}
 </p>
 {#if error}<p class="error" role="alert">{error}</p>{/if}
 
@@ -60,22 +62,22 @@
   <table class="matrix">
     <thead>
       <tr>
-        <th>from \ to</th>
+        <th>{t('from \\ to')}</th>
         {#each services as to (to)}<th><a href="/k/Service/{namespace}/{to}">{to}</a></th>{/each}
       </tr>
     </thead>
     <tbody>
       {#each sources as from (from)}
         <tr>
-          <th>{#if from}<a href="/k/Service/{namespace}/{from}">{from}</a>{:else}<span class="muted">other namespaces</span>{/if}</th>
+          <th>{#if from}<a href="/k/Service/{namespace}/{from}">{from}</a>{:else}<span class="muted">{t('other namespaces')}</span>{/if}</th>
           {#each services as to (to)}
             {@const c = cell(from, to)}
-            <td class={c === null ? 'no' : c === 'all' ? 'all' : 'some'}>{c ?? '—'}</td>
+            <td class={c === null ? 'no' : c === 'all' ? 'all' : 'some'}>{c === 'all' ? t('all') : (c ?? '—')}</td>
           {/each}
         </tr>
       {/each}
     </tbody>
   </table>
 {:else if !error}
-  <p class="muted">No services in {namespace}.</p>
+  <p class="muted">{t('No services in {namespace}.', { namespace })}</p>
 {/if}

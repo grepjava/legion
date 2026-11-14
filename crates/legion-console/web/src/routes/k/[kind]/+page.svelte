@@ -4,6 +4,7 @@
   import { columns, tone } from '#lib/columns.ts';
   import { matches, parse } from '#lib/filter.ts';
   import { plural } from '#lib/kinds.ts';
+  import { t } from '#lib/i18n.svelte.ts';
   import { session } from '#lib/session.svelte.ts';
 
   const kind = $derived(page.params.kind ?? '');
@@ -40,9 +41,9 @@
 
 <header class="bar">
   <h1>{plural(kind)}</h1>
-  <input type="search" aria-label="Filter" placeholder="Filter: name, app=web, !canary"
-    title="Words match names; key=value, key!=value and !key (no such label) match labels" bind:value={filter} />
-  <span class="muted">{shown.length} of {objects.length}, live</span>
+  <input type="search" aria-label={t('Filter')} placeholder={t('Filter: name, app=web, !canary')}
+    title={t('Words match names; key=value, key!=value and !key (no such label) match labels')} bind:value={filter} />
+  <span class="muted">{t('{shown} of {total}, live', { shown: shown.length, total: objects.length })}</span>
 </header>
 
 {#if error}
@@ -53,8 +54,8 @@
   <table>
     <thead>
       <tr>
-        <th>Name</th>
-        {#if !scoped}<th>Namespace</th>{/if}
+        <th>{t('Name')}</th>
+        {#if !scoped}<th>{t('Namespace')}</th>{/if}
         {#each cols as c (c.label)}<th>{c.label}</th>{/each}
       </tr>
     </thead>
@@ -77,5 +78,5 @@
     </tbody>
   </table>
 {:else if !error}
-  <p class="muted">None.</p>
+  <p class="muted">{t('None.')}</p>
 {/if}

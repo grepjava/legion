@@ -1,5 +1,6 @@
 // The gateway's API (DESIGN.md §3.9). Every call is made by the gateway as
 // the signed-in user, so what comes back is what the CLI would show them.
+import { t } from '#lib/i18n.svelte.ts';
 
 export interface Meta {
   name: string;
@@ -265,7 +266,7 @@ export function exec(
     if (typeof e.exit === 'number') end(e.exit, null);
     else if (e.error) end(null, e.error);
   };
-  socket.onclose = () => end(null, 'the terminal could not be opened, or its connection ended');
+  socket.onclose = () => end(null, t('the terminal could not be opened, or its connection ended'));
   const encoder = new TextEncoder();
   const send = (data: string | ArrayBufferView) => {
     if (socket.readyState === WebSocket.OPEN) socket.send(data as never);
@@ -319,7 +320,7 @@ export function logs(
   };
   // Refused before the upgrade (signed out, not allowed): no reason reaches
   // a WebSocket.
-  socket.onclose = () => end('the logs could not be read');
+  socket.onclose = () => end(t('the logs could not be read'));
   return () => {
     ended = true;
     socket.close();
@@ -591,9 +592,9 @@ export async function meIn(peer: Peer): Promise<Me | 'signed-out' | string> {
   try {
     const res = await fetch(new URL('/api/me', peer.url), { credentials: 'include' });
     if (res.status === 401) return 'signed-out';
-    if (!res.ok) return `it answered ${res.status}`;
+    if (!res.ok) return t('it answered {status}', { status: res.status });
     return (await res.json()) as Me;
   } catch {
-    return 'no answer it lets this console read; it may not list this cluster';
+    return t('no answer it lets this console read; it may not list this cluster');
   }
 }

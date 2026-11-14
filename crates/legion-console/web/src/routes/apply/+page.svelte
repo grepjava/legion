@@ -5,6 +5,7 @@
   import { page } from '$app/state';
   import { api, ApiError, type ApplyResult } from '#lib/api.ts';
   import Diff from '#lib/Diff.svelte';
+  import { t } from '#lib/i18n.svelte.ts';
   import { cannotWriteAnywhere } from '#lib/session.svelte.ts';
 
   const kind = $derived(page.url.searchParams.get('kind') ?? '');
@@ -48,43 +49,48 @@
       results = [];
       error =
         e instanceof ApiError && e.status === 409 && editing
-          ? `${e.message}. It changed after you opened it; reload the page to edit what is stored now.`
+          ? t('{message}. It changed after you opened it; reload the page to edit what is stored now.', {
+              message: e.message
+            })
           : (e as Error).message;
     } finally {
       busy = false;
     }
   }
 
-  const verb = (r: ApplyResult) => (dry ? `would be ${r.result}` : `${r.result}, version ${r.version}`);
+  const verb = (r: ApplyResult) =>
+    dry
+      ? t('would be {result}', { result: r.result })
+      : t('{result}, version {version}', { result: r.result, version: r.version });
 </script>
 
 <header class="bar">
   <h1>
     {#if editing}
-      Edit <a href="/k/{kind}/{namespace || '_'}/{name}">{kind} {namespace ? `${namespace}/` : ''}{name}</a>
+      {t('Edit')} <a href="/k/{kind}/{namespace || '_'}/{name}">{kind} {namespace ? `${namespace}/` : ''}{name}</a>
     {:else}
-      Apply YAML
+      {t('Apply YAML')}
     {/if}
   </h1>
 </header>
 <p class="muted">
   {#if editing}
-    Applied only over version {version ?? '…'}: if it changes meanwhile, nothing is written.
+    {t('Applied only over version {version}: if it changes meanwhile, nothing is written.', { version: version ?? '…' })}
   {:else}
-    One or more objects, as <code>legion apply</code> takes them, separated by <code>---</code>.
+    {t('One or more objects, as')} <code>legion apply</code> {t('takes them, separated by')} <code>---</code>.
   {/if}
 </p>
 
-<textarea class="editor" bind:value={yaml} spellcheck="false" rows="26" aria-label="YAML"></textarea>
+<textarea class="editor" bind:value={yaml} spellcheck="false" rows="26" aria-label={t('YAML')}></textarea>
 <div class="controls">
-  <button onclick={() => run(true)} disabled={!!why || busy || !yaml.trim()} title={why ?? ''}>Show changes</button>
+  <button onclick={() => run(true)} disabled={!!why || busy || !yaml.trim()} title={why ?? ''}>{t('Show changes')}</button>
   <button class="primary" onclick={() => run(false)} disabled={!!why || busy || !yaml.trim()} title={why ?? ''}
-    >Apply</button
+    >{t('Apply')}</button
   >
   {#if busy}<span class="muted">…</span>{/if}
 </div>
 
-{#if why}<p class="muted">Read only: {why}.</p>{/if}
+{#if why}<p class="muted">{t('Read only: {why}.', { why })}</p>{/if}
 {#if error}<p class="error" role="alert">{error}</p>{/if}
 
 {#each results as r (r.key)}

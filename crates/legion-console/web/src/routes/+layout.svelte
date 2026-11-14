@@ -5,6 +5,7 @@
   import { api, consoleSettings, followAlerts, setToken, whenSignedOut } from '#lib/api.ts';
   import { plural } from '#lib/kinds.ts';
   import { namespaces, session } from '#lib/session.svelte.ts';
+  import { i18n, languageName, languages, setLanguage, t } from '#lib/i18n.svelte.ts';
 
   let { children } = $props();
   let adminNamespaces: string[] = $state([]);
@@ -89,21 +90,21 @@
 
   // Each page's title (WCAG 2.4.2), which SvelteKit also announces on
   // every navigation.
-  const PAGES: Record<string, string> = {
-    '/': 'Overview',
-    '/login': 'Sign in',
-    '/alerts': 'Alerts',
-    '/deploy': 'Deploy',
-    '/templates': 'Templates',
-    '/import': 'Import compose',
-    '/apply': 'Apply YAML',
-    '/topology': 'Topology',
-    '/network': 'Network',
-    '/cluster': 'Operations',
-    '/audit': 'Audit',
-    '/settings': 'Console settings',
-    '/clusters': 'Clusters'
-  };
+  const PAGES: Record<string, string> = $derived({
+    '/': t('Overview'),
+    '/login': t('Sign in'),
+    '/alerts': t('Alerts'),
+    '/deploy': t('Deploy'),
+    '/templates': t('Templates'),
+    '/import': t('Import compose'),
+    '/apply': t('Apply YAML'),
+    '/topology': t('Topology'),
+    '/network': t('Network'),
+    '/cluster': t('Operations'),
+    '/audit': t('Audit'),
+    '/settings': t('Console settings'),
+    '/clusters': t('Clusters')
+  });
   const title = $derived.by(() => {
     const path = page.url.pathname;
     const [, k, kind, ns, name] = path.split('/').map(decodeURIComponent);
@@ -111,7 +112,9 @@
       PAGES[path] ??
       (k === 'k' && kind
         ? name
-          ? `${name} (${kind}${ns && ns !== '_' ? ` in ${ns}` : ''})`
+          ? ns && ns !== '_'
+            ? t('{name} ({kind} in {namespace})', { name, kind, namespace: ns })
+            : t('{name} ({kind})', { name, kind })
           : plural(kind)
         : 'Legion');
     return [here, session.settings.name, 'Legion'].filter(Boolean).join(' · ');
@@ -133,7 +136,7 @@
 {#if page.url.pathname === '/login'}
   {@render children()}
 {:else if session.me}
-  <a class="skip" href="#main">Skip to the page</a>
+  <a class="skip" href="#main">{t('Skip to the page')}</a>
   <div class="shell">
     <aside>
       <a class="brand" href="/"
@@ -141,52 +144,52 @@
           >{/if}</a
       >
       <label class="ns">
-        Namespace
+        {t('Namespace')}
         <select bind:value={session.namespace}>
-          <option value="">All I can see</option>
+          <option value="">{t('All I can see')}</option>
           {#each choices as ns (ns)}
             <option value={ns}>{ns}</option>
           {/each}
         </select>
       </label>
-      <nav aria-label="Console">
-        <a href="/" class:here={page.url.pathname === '/'} aria-current={at(page.url.pathname === '/')}>Overview</a>
+      <nav aria-label={t('Console')}>
+        <a href="/" class:here={page.url.pathname === '/'} aria-current={at(page.url.pathname === '/')}>{t('Overview')}</a>
         <a href="/alerts" class:here={page.url.pathname === '/alerts'} aria-current={at(page.url.pathname === '/alerts')}
-          >Alerts{#if session.alerts.length}
+          >{t('Alerts')}{#if session.alerts.length}
             <span class="count {critical ? 'bad' : 'wait'}">{session.alerts.length}</span>{/if}</a
         >
-        <a href="/deploy" class:here={page.url.pathname === '/deploy'} aria-current={at(page.url.pathname === '/deploy')}>Deploy</a>
-        <a href="/templates" class:here={page.url.pathname === '/templates'} aria-current={at(page.url.pathname === '/templates')}>Templates</a>
-        <a href="/import" class:here={page.url.pathname === '/import'} aria-current={at(page.url.pathname === '/import')}>Import compose</a>
-        <a href="/apply" class:here={page.url.pathname === '/apply'} aria-current={at(page.url.pathname === '/apply')}>Apply YAML</a>
-        <a href="/topology" class:here={page.url.pathname === '/topology'} aria-current={at(page.url.pathname === '/topology')}>Topology</a>
-        <a href="/network" class:here={page.url.pathname === '/network'} aria-current={at(page.url.pathname === '/network')}>Network</a>
+        <a href="/deploy" class:here={page.url.pathname === '/deploy'} aria-current={at(page.url.pathname === '/deploy')}>{t('Deploy')}</a>
+        <a href="/templates" class:here={page.url.pathname === '/templates'} aria-current={at(page.url.pathname === '/templates')}>{t('Templates')}</a>
+        <a href="/import" class:here={page.url.pathname === '/import'} aria-current={at(page.url.pathname === '/import')}>{t('Import compose')}</a>
+        <a href="/apply" class:here={page.url.pathname === '/apply'} aria-current={at(page.url.pathname === '/apply')}>{t('Apply YAML')}</a>
+        <a href="/topology" class:here={page.url.pathname === '/topology'} aria-current={at(page.url.pathname === '/topology')}>{t('Topology')}</a>
+        <a href="/network" class:here={page.url.pathname === '/network'} aria-current={at(page.url.pathname === '/network')}>{t('Network')}</a>
         {#if session.settings.clusters?.length}
-          <h2>Clusters</h2>
-          <a href="/clusters" class:here={page.url.pathname === '/clusters'} aria-current={at(page.url.pathname === '/clusters')}>All clusters</a>
+          <h2>{t('Clusters')}</h2>
+          <a href="/clusters" class:here={page.url.pathname === '/clusters'} aria-current={at(page.url.pathname === '/clusters')}>{t('All clusters')}</a>
           {#each session.settings.clusters as c, i (i)}
-            <a href={there(c.url)} title="This page on {c.name}, signed into on its own"
+            <a href={there(c.url)} title={t('This page on {name}, signed into on its own', { name: c.name })}
               >{c.name}</a
             >
           {/each}
         {/if}
         {#if session.settings.links?.length}
-          <h2>Links</h2>
+          <h2>{t('Links')}</h2>
           {#each session.settings.links as l, i (i)}
             <a href={l.url} target="_blank" rel="noopener noreferrer">{l.label}</a>
           {/each}
         {/if}
-        <h2>Workloads and config</h2>
+        <h2>{t('Workloads and config')}</h2>
         {#each nsKinds as k (k.kind)}
           <a href="/k/{k.kind}" class:here={page.url.pathname.startsWith(`/k/${k.kind}`)} aria-current={at(page.url.pathname.startsWith(`/k/${k.kind}`))}
             >{plural(k.kind)}</a
           >
         {/each}
         {#if clusterKinds.length}
-          <h2>Cluster</h2>
-          <a href="/cluster" class:here={page.url.pathname === '/cluster'} aria-current={at(page.url.pathname === '/cluster')}>Operations</a>
-          <a href="/audit" class:here={page.url.pathname === '/audit'} aria-current={at(page.url.pathname === '/audit')}>Audit</a>
-          <a href="/settings" class:here={page.url.pathname === '/settings'} aria-current={at(page.url.pathname === '/settings')}>Console settings</a>
+          <h2>{t('Cluster')}</h2>
+          <a href="/cluster" class:here={page.url.pathname === '/cluster'} aria-current={at(page.url.pathname === '/cluster')}>{t('Operations')}</a>
+          <a href="/audit" class:here={page.url.pathname === '/audit'} aria-current={at(page.url.pathname === '/audit')}>{t('Audit')}</a>
+          <a href="/settings" class:here={page.url.pathname === '/settings'} aria-current={at(page.url.pathname === '/settings')}>{t('Console settings')}</a>
           {#each clusterKinds as k (k.kind)}
             <a href="/k/{k.kind}" class:here={page.url.pathname.startsWith(`/k/${k.kind}`)} aria-current={at(page.url.pathname.startsWith(`/k/${k.kind}`))}
               >{plural(k.kind)}</a
@@ -196,7 +199,18 @@
       </nav>
       <div class="who">
         <span title={session.me.role}>{session.me.name}</span>
-        <button class="link" onclick={signOut}>Sign out</button>
+        {#if languages.length > 1}
+          <select
+            aria-label={t('Language')}
+            value={i18n.language}
+            onchange={(e) => setLanguage(e.currentTarget.value)}
+          >
+            {#each languages as code (code)}
+              <option value={code}>{languageName(code)}</option>
+            {/each}
+          </select>
+        {/if}
+        <button class="link" onclick={signOut}>{t('Sign out')}</button>
       </div>
     </aside>
     <main id="main" tabindex="-1">
@@ -204,5 +218,5 @@
     </main>
   </div>
 {:else if ready}
-  <p class="center">Signing in…</p>
+  <p class="center">{t('Signing in…')}</p>
 {/if}

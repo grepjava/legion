@@ -3,6 +3,7 @@
   // compose files saved as Configs labelled `legion.template`, each opened
   // in the compose import with its variables as parameters.
   import { templates, type Template } from '#lib/api.ts';
+  import { t } from '#lib/i18n.svelte.ts';
 
   let list: Template[] = $state([]);
   let error = $state('');
@@ -11,24 +12,25 @@
       .then((r) => (list = r.templates))
       .catch((e) => (error = e.message));
   });
-  const use = (t: Template) =>
-    `/import?template=${encodeURIComponent(t.name)}` +
-    (t.namespace ? `&from=${encodeURIComponent(t.namespace)}` : '');
+  const use = (tpl: Template) =>
+    `/import?template=${encodeURIComponent(tpl.name)}` +
+    (tpl.namespace ? `&from=${encodeURIComponent(tpl.namespace)}` : '');
 </script>
 
-<header class="bar"><h1>Templates</h1></header>
+<header class="bar"><h1>{t('Templates')}</h1></header>
 <p class="muted">
-  Compose files to deploy from: the examples, and those saved from <a href="/import">Import compose</a> as
-  Configs labelled <code>legion.template</code>.
+  {t('Compose files to deploy from: the examples, and those saved from')}
+  <a href="/import">{t('Import compose')}</a>
+  {t('as Configs labelled')} <code>legion.template</code>.
 </p>
 {#if error}<p class="error" role="alert">{error}</p>{/if}
 <ul class="cards">
-  {#each list as t (`${t.namespace}/${t.name}`)}
+  {#each list as tpl (`${tpl.namespace}/${tpl.name}`)}
     <li class="card">
-      <h2><a href={use(t)}>{t.name}</a></h2>
-      <p class="muted">{t.namespace ? `saved in ${t.namespace}` : 'example'}</p>
-      <p>{t.about}</p>
-      <a class="button" href={use(t)} aria-label="Use {t.name}">Use</a>
+      <h2><a href={use(tpl)}>{tpl.name}</a></h2>
+      <p class="muted">{tpl.namespace ? t('saved in {namespace}', { namespace: tpl.namespace }) : t('example')}</p>
+      <p>{tpl.about}</p>
+      <a class="button" href={use(tpl)} aria-label={t('Use {name}', { name: tpl.name })}>{t('Use')}</a>
     </li>
   {/each}
 </ul>

@@ -3,6 +3,7 @@
   import { tone } from '#lib/columns.ts';
   import { session } from '#lib/session.svelte.ts';
   import Quotas from '#lib/Quotas.svelte';
+  import { t } from '#lib/i18n.svelte.ts';
 
   let status: Status | null = $state(null);
   let statusError = $state('');
@@ -34,14 +35,14 @@
     for (const o of objects) by.set(of(o) || '—', (by.get(of(o) || '—') ?? 0) + 1);
     return [...by.entries()].sort();
   }
-  const live = $derived(tasks.filter((t) => t.spec?.desiredState === 'running'));
+  const live = $derived(tasks.filter((task) => task.spec?.desiredState === 'running'));
 </script>
 
-<h1>Overview</h1>
+<h1>{t('Overview')}</h1>
 
 {#if session.alerts.length}
   <section>
-    <h2><a href="/alerts">Alerts</a></h2>
+    <h2><a href="/alerts">{t('Alerts')}</a></h2>
     <ul class="plain">
       {#each session.alerts.slice(0, 5) as a (a.kind + a.namespace + a.object)}
         <li>
@@ -50,26 +51,26 @@
         </li>
       {/each}
     </ul>
-    {#if session.alerts.length > 5}<p><a href="/alerts">All {session.alerts.length}</a></p>{/if}
+    {#if session.alerts.length > 5}<p><a href="/alerts">{t('All {n}', { n: session.alerts.length })}</a></p>{/if}
   </section>
 {/if}
 
 <section class="cards">
   <div class="card">
-    <h2>Managers</h2>
+    <h2>{t('Managers')}</h2>
     {#if status}
       <p>
         <span class="state {status.leader ? 'good' : 'bad'}"
-          >{status.leader ? 'leader elected' : 'no leader'}</span
+          >{status.leader ? t('leader elected') : t('no leader')}</span
         >
-        term {status.term}, store version {status.version}
+        {t('term {term}, store version {version}', { term: status.term, version: status.version })}
       </p>
       <ul class="plain">
         {#each status.members as m (m.id)}
           <li>
             {m.addr}
-            {#if m.id === status.leader}<span class="tag">leader</span>{/if}
-            {#if !m.voter}<span class="tag">learner</span>{/if}
+            {#if m.id === status.leader}<span class="tag">{t('leader')}</span>{/if}
+            {#if !m.voter}<span class="tag">{t('learner')}</span>{/if}
           </li>
         {/each}
       </ul>
@@ -82,7 +83,7 @@
 
   {#if session.me?.all}
     <div class="card">
-      <h2><a href="/k/Node">Nodes</a></h2>
+      <h2><a href="/k/Node">{t('Nodes')}</a></h2>
       <p class="big">{nodes.length}</p>
       {#each count(nodes, (n) => n.status?.state) as [state, n] (state)}
         <span class="state {tone(state)}">{n} {state}</span>
@@ -92,36 +93,36 @@
   {/if}
 
   <div class="card">
-    <h2><a href="/k/Service">Services</a></h2>
+    <h2><a href="/k/Service">{t('Services')}</a></h2>
     <p class="big">{services.length}</p>
     {#if errors.Service}<p class="error" role="alert">{errors.Service}</p>{/if}
   </div>
 
   <div class="card">
-    <h2><a href="/k/Task">Tasks</a></h2>
+    <h2><a href="/k/Task">{t('Tasks')}</a></h2>
     <p class="big">{live.length}</p>
-    {#each count(live, (t) => t.status?.state) as [state, n] (state)}
+    {#each count(live, (task) => task.status?.state) as [state, n] (state)}
       <span class="state {tone(state)}">{n} {state}</span>
     {/each}
     {#if errors.Task}<p class="error" role="alert">{errors.Task}</p>{/if}
   </div>
 </section>
 
-{#if live.some((t) => t.status?.state === 'pending' || t.status?.state === 'failed')}
-  <h2>Needs attention</h2>
+{#if live.some((task) => task.status?.state === 'pending' || task.status?.state === 'failed')}
+  <h2>{t('Needs attention')}</h2>
   <table>
-    <thead><tr><th>Task</th><th>State</th><th>Why</th></tr></thead>
+    <thead><tr><th>{t('Task')}</th><th>{t('State')}</th><th>{t('Why')}</th></tr></thead>
     <tbody>
-      {#each live.filter((t) => ['pending', 'failed'].includes(t.status?.state)) as t (t.metadata.uid)}
+      {#each live.filter((task) => ['pending', 'failed'].includes(task.status?.state)) as task (task.metadata.uid)}
         <tr>
-          <td><a href="/k/Task/{t.metadata.namespace}/{t.metadata.name}">{t.metadata.namespace}/{t.metadata.name}</a></td>
-          <td><span class="state {tone(t.status?.state)}">{t.status?.state}</span></td>
-          <td>{t.status?.message ?? ''}</td>
+          <td><a href="/k/Task/{task.metadata.namespace}/{task.metadata.name}">{task.metadata.namespace}/{task.metadata.name}</a></td>
+          <td><span class="state {tone(task.status?.state)}">{task.status?.state}</span></td>
+          <td>{task.status?.message ?? ''}</td>
         </tr>
       {/each}
     </tbody>
   </table>
 {/if}
 
-<h2>Quotas</h2>
+<h2>{t('Quotas')}</h2>
 <Quotas namespace={session.namespace} />

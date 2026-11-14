@@ -6,6 +6,7 @@
   import { goto } from '$app/navigation';
   import { api, type LObject } from './api.ts';
   import { cannotWrite } from './session.svelte.ts';
+  import { t } from './i18n.svelte.ts';
 
   let { object, scoped }: { object: LObject; scoped: boolean } = $props();
   const kind = $derived(object.kind);
@@ -42,67 +43,84 @@
     act(async () => ((await api.set(kind, ns, name, field, value)).changed ? done : same));
 
   // What goes with it, said before it goes.
-  const consequences: Record<string, string> = {
-    Service: 'Its tasks are stopped and removed.',
-    Job: 'Its tasks are stopped and removed.',
-    CronJob: 'It makes no more runs.',
-    Node: 'It leaves the cluster: its tasks are placed elsewhere, and it has to join again to come back.',
-    Volume: 'Its data is destroyed. The API refuses while a task uses it.',
-    Namespace: 'What is in it goes too.'
-  };
+  const consequences = (): Record<string, string> => ({
+    Service: t('Its tasks are stopped and removed.'),
+    Job: t('Its tasks are stopped and removed.'),
+    CronJob: t('It makes no more runs.'),
+    Node: t('It leaves the cluster: its tasks are placed elsewhere, and it has to join again to come back.'),
+    Volume: t('Its data is destroyed. The API refuses while a task uses it.'),
+    Namespace: t('What is in it goes too.')
+  });
 
   async function remove() {
-    if (!confirm(`Delete ${label}? ${consequences[kind] ?? ''}`.trim())) return;
+    const consequence = consequences()[kind];
+    const ask = consequence
+      ? t('Delete {label}? {consequence}', { label, consequence })
+      : t('Delete {label}?', { label });
+    if (!confirm(ask)) return;
     await act(async () => {
       await api.remove(kind, ns, name, object.metadata.version);
       await goto(`/k/${kind}`);
-      return `${label} deleted`;
+      return t('{label} deleted', { label });
     });
   }
 
   function availability(to: 'active' | 'pause' | 'drain') {
-    const what = { active: 'activated', pause: 'paused', drain: 'draining' }[to];
-    if (to === 'drain' && !confirm(`Drain ${name}? Its tasks move to other nodes.`)) return;
-    return set('availability', to, `${name} ${what}`, `${name} is already ${to}`);
+    const done = {
+      active: t('{name} activated', { name }),
+      pause: t('{name} paused', { name }),
+      drain: t('{name} draining', { name })
+    }[to];
+    if (to === 'drain' && !confirm(t('Drain {name}? Its tasks move to other nodes.', { name }))) return;
+    return set('availability', to, done, t('{name} is already {to}', { name, to }));
   }
 
   function role(to: 'manager' | 'worker') {
-    const doing = to === 'manager' ? 'Promote' : 'Demote';
-    if (!confirm(`${doing} ${name} to a ${to}? Its daemon takes the role up and starts again.`)) return;
+    const ask =
+      to === 'manager'
+        ? t('Promote {name} to a manager? Its daemon takes the role up and starts again.', { name })
+        : t('Demote {name} to a worker? Its daemon takes the role up and starts again.', { name });
+    if (!confirm(ask)) return;
     return act(async () => {
       await api.nodeRole(name, to);
-      return `${name} becomes a ${to}`;
+      return to === 'manager' ? t('{name} becomes a manager', { name }) : t('{name} becomes a worker', { name });
     });
   }
 </script>
 
 <div class="actions">
   {#if why}
-    <button disabled title={why}>Edit YAML</button>
+    <button disabled title={why}>{t('Edit YAML')}</button>
   {:else}
     <a
       class="button"
       href="/apply?kind={encodeURIComponent(kind)}&namespace={encodeURIComponent(ns)}&name={encodeURIComponent(name)}"
-      >Edit YAML</a
+      >{t('Edit YAML')}</a
     >
   {/if}
 
   {#if kind === 'Service'}
     <span class="group">
-      <input type="number" min="0" bind:value={replicas} aria-label="Replicas" disabled={!!why} />
+      <input type="number" min="0" bind:value={replicas} aria-label={t('Replicas')} disabled={!!why} />
       <button
         disabled={!!why || busy}
         title={why ?? ''}
-        onclick={() => set('replicas', replicas, `${name} scaled to ${replicas}`, `${name} already has ${replicas}`)}
-        >Scale</button
+        onclick={() =>
+          set(
+            'replicas',
+            replicas,
+            t('{name} scaled to {n}', { name, n: replicas }),
+            t('{name} already has {n}', { name, n: replicas })
+          )}
+        >{t('Scale')}</button
       >
     </span>
     <button
       disabled={!!why || busy || !object.status?.update}
-      title={why ?? (object.status?.update ? 'Back to the spec before the latest update' : 'No update to roll back')}
+      title={why ?? (object.status?.update ? t('Back to the spec before the latest update') : t('No update to roll back'))}
       onclick={() =>
-        confirm(`Roll ${name} back to the spec before its latest update?`) &&
-        act(async () => (await api.rollback(ns, name)).message)}>Roll back</button
+        confirm(t('Roll {name} back to the spec before its latest update?', { name })) &&
+        act(async () => (await api.rollback(ns, name)).message)}>{t('Roll back')}</button
     >
   {:else if kind === 'CronJob'}
     <button
@@ -110,40 +128,45 @@
       title={why ?? ''}
       onclick={() =>
         object.spec?.suspend
-          ? set('suspend', false, `${name} resumed`, `${name} already resumed`)
-          : set('suspend', true, `${name} suspended`, `${name} already suspended`)}
-      >{object.spec?.suspend ? 'Resume' : 'Suspend'}</button
+          ? set('suspend', false, t('{name} resumed', { name }), t('{name} already resumed', { name }))
+          : set('suspend', true, t('{name} suspended', { name }), t('{name} already suspended', { name }))}
+      >{object.spec?.suspend ? t('Resume') : t('Suspend')}</button
     >
   {:else if kind === 'Node'}
     {@const now = object.spec?.availability ?? 'active'}
     <span class="group">
       {#each ['active', 'pause', 'drain'] as const as to (to)}
         <button disabled={!!why || busy || now === to} title={why ?? ''} onclick={() => availability(to)}
-          >{{ active: 'Activate', pause: 'Pause', drain: 'Drain' }[to]}</button
+          >{{ active: t('Activate'), pause: t('Pause'), drain: t('Drain') }[to]}</button
         >
       {/each}
     </span>
     {#if object.spec?.role === 'manager'}
-      <button disabled={!!why || busy} title={why ?? ''} onclick={() => role('worker')}>Demote</button>
+      <button disabled={!!why || busy} title={why ?? ''} onclick={() => role('worker')}>{t('Demote')}</button>
     {:else}
-      <button disabled={!!why || busy} title={why ?? ''} onclick={() => role('manager')}>Promote</button>
+      <button disabled={!!why || busy} title={why ?? ''} onclick={() => role('manager')}>{t('Promote')}</button>
     {/if}
   {:else if kind === 'Volume'}
     <span class="group">
-      <input placeholder="node" bind:value={moveTo} aria-label="Move to node" disabled={!!why} />
+      <input placeholder={t('node')} bind:value={moveTo} aria-label={t('Move to node')} disabled={!!why} />
       <button
         disabled={!!why || busy || !moveTo}
-        title={why ?? 'Moves its data to that node, stopping its tasks meanwhile'}
+        title={why ?? t('Moves its data to that node, stopping its tasks meanwhile')}
         onclick={() =>
-          confirm(`Move ${name} to ${moveTo}? Its tasks stop while its data moves.`) &&
-          set('node', moveTo, `${name} moves to ${moveTo}`, `${name} is already asked to be on ${moveTo}`)}
-        >Move</button
+          confirm(t('Move {name} to {node}? Its tasks stop while its data moves.', { name, node: moveTo })) &&
+          set(
+            'node',
+            moveTo,
+            t('{name} moves to {node}', { name, node: moveTo }),
+            t('{name} is already asked to be on {node}', { name, node: moveTo })
+          )}
+        >{t('Move')}</button
       >
     </span>
   {/if}
 
-  <button class="danger" disabled={!!why || busy} title={why ?? ''} onclick={remove}>Delete</button>
+  <button class="danger" disabled={!!why || busy} title={why ?? ''} onclick={remove}>{t('Delete')}</button>
 </div>
-{#if why}<p class="muted">Read only: {why}.</p>{/if}
+{#if why}<p class="muted">{t('Read only: {why}.', { why })}</p>{/if}
 {#if error}<p class="error" role="alert">{error}</p>{/if}
 {#if message}<p class="ok" role="status">{message}</p>{/if}

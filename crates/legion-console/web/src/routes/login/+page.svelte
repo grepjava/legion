@@ -2,6 +2,7 @@
   import { goto } from '$app/navigation';
   import { api } from '#lib/api.ts';
   import { session } from '#lib/session.svelte.ts';
+  import { t } from '#lib/i18n.svelte.ts';
 
   let error = $state('');
   let busy = $state(false);
@@ -14,7 +15,7 @@
     const failed = fragment.get('error');
     if (failed) {
       history.replaceState(null, '', '/login');
-      error = `Single sign-on failed: ${failed}`;
+      error = t('Single sign-on failed: {why}', { why: failed });
       return;
     }
     const code = fragment.get('code');
@@ -37,18 +38,18 @@
 <div class="login">
   <h1>Legion</h1>
   {#if busy}
-    <p>Signing in…</p>
+    <p>{t('Signing in…')}</p>
   {:else}
     {#if error}
       <p class="error" role="alert">{error}</p>
     {/if}
     {#if session.settings.sso}
       <p><a class="button primary" href="/api/oidc/start" data-sveltekit-reload>{session.settings.sso.label}</a></p>
-      <p class="muted">Or sign in from the command line, with the identity you use there:</p>
+      <p class="muted">{t('Or sign in from the command line, with the identity you use there:')}</p>
     {:else}
-      <p>Sign in from the command line, with the identity you use there:</p>
+      <p>{t('Sign in from the command line, with the identity you use there:')}</p>
     {/if}
     <pre>legion console login</pre>
-    <p>It prints a link that signs you in here. Open it within a minute; it works once.</p>
+    <p>{t('It prints a link that signs you in here. Open it within a minute; it works once.')}</p>
   {/if}
 </div>

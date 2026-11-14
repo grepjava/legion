@@ -1,4 +1,5 @@
 import type { Alert, ConsoleSettings, KindInfo, Me } from './api';
+import { t } from './i18n.svelte.ts';
 
 /** Who is signed in, the kinds there are, and the namespace being looked at. */
 export const session = $state({
@@ -28,21 +29,23 @@ export function namespaces(adminList: string[]): string[] {
  */
 export function cannotWrite(namespace: string): string | null {
   const me = session.me;
-  if (!me) return 'not signed in';
+  if (!me) return t('not signed in');
   if (me.all) return null;
-  if (!namespace) return 'only an admin changes what is cluster-wide';
+  if (!namespace) return t('only an admin changes what is cluster-wide');
   const role = me.namespaces[namespace];
   if (role === 'edit' || role === 'admin') return null;
-  return role ? `your role in ${namespace} is ${role}` : `you have no role in ${namespace}`;
+  return role
+    ? t('your role in {namespace} is {role}', { namespace, role })
+    : t('you have no role in {namespace}', { namespace });
 }
 
 /** Why the user may write in no namespace at all, as for a page whose
  * namespace is in what it sends (Apply YAML); null if they may somewhere. */
 export function cannotWriteAnywhere(): string | null {
   const me = session.me;
-  if (!me) return 'not signed in';
+  if (!me) return t('not signed in');
   if (me.all) return null;
   const roles = Object.values(me.namespaces);
   if (roles.some((r) => r === 'edit' || r === 'admin')) return null;
-  return roles.length ? 'your roles let you look, not change' : 'you have no role in any namespace';
+  return roles.length ? t('your roles let you look, not change') : t('you have no role in any namespace');
 }

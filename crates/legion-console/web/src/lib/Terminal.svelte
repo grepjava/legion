@@ -7,6 +7,7 @@
   import '@xterm/xterm/css/xterm.css';
   import { exec, type LObject } from './api.ts';
   import { cannotWrite } from './session.svelte.ts';
+  import { t } from './i18n.svelte.ts';
 
   let { task }: { task: LObject } = $props();
   const ns = $derived(task.metadata.namespace ?? '');
@@ -48,34 +49,34 @@
     term.open(box);
     fit.fit();
     open = true;
-    status = 'connecting…';
-    const t = term;
+    status = t('connecting…');
+    const xterm = term;
     session = exec(
       ns,
       name,
-      { container: container || containers[0], command: words, cols: t.cols, rows: t.rows },
+      { container: container || containers[0], command: words, cols: xterm.cols, rows: xterm.rows },
       (data) => {
         status = '';
-        t.write(data);
+        xterm.write(data);
       },
       (exit, error) => {
         open = false;
-        status = error ?? `the command exited with ${exit}`;
-        t.write(`\r\n\x1b[2m[${status}]\x1b[0m\r\n`);
+        status = error ?? t('the command exited with {exit}', { exit: String(exit) });
+        xterm.write(`\r\n\x1b[2m[${status}]\x1b[0m\r\n`);
       }
     );
     // Every key goes to the command but Shift+Esc, which leaves the
     // terminal for the page (WCAG 2.1.2; Esc alone still reaches it).
-    t.attachCustomKeyEventHandler((e) => {
+    xterm.attachCustomKeyEventHandler((e) => {
       if (e.type === 'keydown' && e.key === 'Escape' && e.shiftKey) {
         closer?.focus();
         return false;
       }
       return true;
     });
-    t.onData((d) => session?.input(d));
-    t.onResize(({ cols, rows }) => session?.resize(cols, rows));
-    t.focus();
+    xterm.onData((d) => session?.input(d));
+    xterm.onResize(({ cols, rows }) => session?.resize(cols, rows));
+    xterm.focus();
   }
 
   onMount(() => {
@@ -95,18 +96,18 @@
 >
   {#if containers.length > 1}
     <label>
-      Container
+      {t('Container')}
       <select bind:value={container}>
         {#each containers as c (c)}<option value={c}>{c}</option>{/each}
       </select>
     </label>
   {/if}
-  <label>Command <input bind:value={command} aria-label="Command" /></label>
-  <button class="primary" disabled={!!why || !runningTask} title={why ?? (runningTask ? '' : 'The task is not running')}
-    >{open ? 'Start again' : 'Open'}</button
+  <label>{t('Command')} <input bind:value={command} aria-label={t('Command')} /></label>
+  <button class="primary" disabled={!!why || !runningTask} title={why ?? (runningTask ? '' : t('The task is not running'))}
+    >{open ? t('Start again') : t('Open')}</button
   >
-  {#if open}<button type="button" onclick={stop} bind:this={closer}>Close</button>{/if}
-  <span class="muted">{why ? `Read only: ${why}.` : status}</span>
+  {#if open}<button type="button" onclick={stop} bind:this={closer}>{t('Close')}</button>{/if}
+  <span class="muted">{why ? t('Read only: {why}.', { why }) : status}</span>
 </form>
-{#if open}<p class="muted">Shift+Esc leaves the terminal for the page.</p>{/if}
-<div class="terminal" bind:this={box} role="region" aria-label="Terminal"></div>
+{#if open}<p class="muted">{t('Shift+Esc leaves the terminal for the page.')}</p>{/if}
+<div class="terminal" bind:this={box} role="region" aria-label={t('Terminal')}></div>

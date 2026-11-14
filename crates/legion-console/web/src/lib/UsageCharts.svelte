@@ -5,6 +5,7 @@
   // each new sample is due.
   import { usageHistory, type TaskSeries } from '#lib/api.ts';
   import Chart from '#lib/Chart.svelte';
+  import { t, tn } from '#lib/i18n.svelte.ts';
 
   let {
     namespace,
@@ -74,8 +75,8 @@
     const total = (f: (t: TaskSeries) => number) => now.reduce((a, t) => a + f(t), 0);
     const every = (f: (t: TaskSeries) => number) => now.length > 0 && now.every((t) => f(t) > 0);
     const of = (req: (t: TaskSeries) => number, lim: (t: TaskSeries) => number) => [
-      ...(total(req) > 0 ? [{ label: 'requested', value: total(req) }] : []),
-      ...(every(lim) ? [{ label: 'limit', value: total(lim) }] : [])
+      ...(total(req) > 0 ? [{ label: t('requested'), value: total(req) }] : []),
+      ...(every(lim) ? [{ label: t('limit'), value: total(lim) }] : [])
     ];
     return {
       cpu: of((t) => t.cpu_request_percent, (t) => t.cpu_limit_percent),
@@ -97,13 +98,20 @@
 
 {#if error}<p class="error" role="alert">{error}</p>{/if}
 {#if loaded && !summed.tasks}
-  <p class="muted">No usage heard in the last hour: nothing ran, or the leader started since.</p>
+  <p class="muted">{t('No usage heard in the last hour: nothing ran, or the leader started since.')}</p>
 {:else if loaded}
   <p class="muted">
-    The last hour, a sample every {Math.round(step / 1000)} s{summed.tasks > 1
-      ? `, summed over ${summed.tasks} tasks`
-      : ''}. CPU is in percent of one CPU.
+    {summed.tasks > 1
+      ? tn(
+          'The last hour, a sample every {seconds} s, summed over {n} tasks. CPU is in percent of one CPU.',
+          'The last hour, a sample every {seconds} s, summed over {n} tasks. CPU is in percent of one CPU.',
+          summed.tasks,
+          { seconds: Math.round(step / 1000) }
+        )
+      : t('The last hour, a sample every {seconds} s. CPU is in percent of one CPU.', {
+          seconds: Math.round(step / 1000)
+        })}
   </p>
-  <Chart title="CPU" points={summed.cpu} format={percent} {step} marks={marks.cpu} />
-  <Chart title="Memory" points={summed.mem} format={bytes} {step} marks={marks.mem} />
+  <Chart title={t('CPU')} points={summed.cpu} format={percent} {step} marks={marks.cpu} />
+  <Chart title={t('Memory')} points={summed.mem} format={bytes} {step} marks={marks.mem} />
 {/if}

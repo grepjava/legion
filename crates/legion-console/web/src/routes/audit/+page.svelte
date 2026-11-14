@@ -4,6 +4,7 @@
   import { onMount } from 'svelte';
   import { api, type AuditEvent, type AuditFilter } from '#lib/api.ts';
   import { plural } from '#lib/kinds.ts';
+  import { t } from '#lib/i18n.svelte.ts';
 
   let filter: AuditFilter = $state({ actor: '', action: '', namespace: '', kind: '', result: '', limit: 200 });
   let events: AuditEvent[] = $state([]);
@@ -43,35 +44,35 @@
       : null;
 </script>
 
-<header class="bar"><h1>Audit</h1></header>
+<header class="bar"><h1>{t('Audit')}</h1></header>
 <form class="controls" onsubmit={load}>
-  <input placeholder="who" bind:value={filter.actor} aria-label="Actor" />
-  <input placeholder="action (apply, delete, exec…)" bind:value={filter.action} aria-label="Action" />
-  <input placeholder="namespace" bind:value={filter.namespace} aria-label="Namespace" />
-  <input placeholder="kind" bind:value={filter.kind} aria-label="Kind" />
-  <select bind:value={filter.result} aria-label="Result">
-    <option value="">any result</option>
+  <input placeholder={t('who')} bind:value={filter.actor} aria-label={t('Actor')} />
+  <input placeholder={t('action (apply, delete, exec…)')} bind:value={filter.action} aria-label={t('Action')} />
+  <input placeholder={t('namespace')} bind:value={filter.namespace} aria-label={t('Namespace')} />
+  <input placeholder={t('kind')} bind:value={filter.kind} aria-label={t('Kind')} />
+  <select bind:value={filter.result} aria-label={t('Result')}>
+    <option value="">{t('any result')}</option>
     <option value="ok">ok</option>
     <option value="denied">denied</option>
     <option value="error">error</option>
   </select>
-  <select bind:value={span} aria-label="Since">
-    <option value={3_600_000}>last hour</option>
-    <option value={86_400_000}>last day</option>
-    <option value={604_800_000}>last week</option>
-    <option value={0}>all kept</option>
+  <select bind:value={span} aria-label={t('Since')}>
+    <option value={3_600_000}>{t('last hour')}</option>
+    <option value={86_400_000}>{t('last day')}</option>
+    <option value={604_800_000}>{t('last week')}</option>
+    <option value={0}>{t('all kept')}</option>
   </select>
-  <button class="primary" disabled={busy}>Show</button>
+  <button class="primary" disabled={busy}>{t('Show')}</button>
 </form>
 {#if error}<p class="error" role="alert">{error}</p>{/if}
 {#if truncated}
-  <p class="error" role="alert">More matched than {filter.limit}: the newest are left out. Narrow the filter or the time.</p>
+  <p class="error" role="alert">{t('More matched than {limit}: the newest are left out. Narrow the filter or the time.', { limit: filter.limit ?? '' })}</p>
 {/if}
 
 {#if events.length}
   <table>
     <thead>
-      <tr><th>When</th><th>Who</th><th>Action</th><th>Object</th><th>Result</th><th>Why</th></tr>
+      <tr><th>{t('When')}</th><th>{t('Who')}</th><th>{t('Action')}</th><th>{t('Object')}</th><th>{t('Result')}</th><th>{t('Why')}</th></tr>
     </thead>
     <tbody>
       {#each events as e, i (i)}
@@ -91,5 +92,5 @@
     </tbody>
   </table>
 {:else if !error && !busy}
-  <p class="muted">Nothing matches.</p>
+  <p class="muted">{t('Nothing matches.')}</p>
 {/if}

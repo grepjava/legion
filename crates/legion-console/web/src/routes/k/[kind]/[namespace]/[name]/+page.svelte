@@ -3,6 +3,7 @@
   import { api, follow, type LObject } from '#lib/api.ts';
   import { columns, tone } from '#lib/columns.ts';
   import { plural } from '#lib/kinds.ts';
+  import { t } from '#lib/i18n.svelte.ts';
   import Actions from '#lib/Actions.svelte';
   import Labels from '#lib/Labels.svelte';
   import LogSearch from '#lib/LogSearch.svelte';
@@ -48,20 +49,20 @@
   });
 
   const tabs = $derived([
-    { id: 'details', label: 'Details' },
-    ...(kind === 'Service' ? [{ id: 'rollout', label: 'Rollout' }] : []),
-    ...(kind === 'Service' || kind === 'Job' ? [{ id: 'search', label: 'Logs' }] : []),
-    ...(kind === 'Node' ? [{ id: 'tasks', label: 'Tasks' }] : []),
-    ...(kind === 'Volume' ? [{ id: 'data', label: 'Data' }] : []),
-    ...(kind === 'Namespace' ? [{ id: 'quota', label: 'Quota' }] : []),
-    ...(kind === 'Task' || kind === 'Service' || kind === 'Node' ? [{ id: 'usage', label: 'Usage' }] : []),
+    { id: 'details', label: t('Details') },
+    ...(kind === 'Service' ? [{ id: 'rollout', label: t('Rollout') }] : []),
+    ...(kind === 'Service' || kind === 'Job' ? [{ id: 'search', label: t('Logs') }] : []),
+    ...(kind === 'Node' ? [{ id: 'tasks', label: t('Tasks') }] : []),
+    ...(kind === 'Volume' ? [{ id: 'data', label: t('Data') }] : []),
+    ...(kind === 'Namespace' ? [{ id: 'quota', label: t('Quota') }] : []),
+    ...(kind === 'Task' || kind === 'Service' || kind === 'Node' ? [{ id: 'usage', label: t('Usage') }] : []),
     ...(kind === 'Task'
       ? [
-          { id: 'logs', label: 'Logs' },
-          { id: 'terminal', label: 'Terminal' }
+          { id: 'logs', label: t('Logs') },
+          { id: 'terminal', label: t('Terminal') }
         ]
       : []),
-    { id: 'yaml', label: 'YAML' }
+    { id: 'yaml', label: t('YAML') }
   ] as { id: typeof tab; label: string }[]);
   // The tabs as WAI-ARIA's pattern has them: one stop for Tab, arrows,
   // Home and End to move between them.
@@ -91,14 +92,14 @@
   <h1>
     <a href="/k/{kind}">{plural(kind)}</a> / {#if namespace}{namespace} / {/if}{name}
   </h1>
-  {#if gone}<span class="state bad">deleted</span>{/if}
+  {#if gone}<span class="state bad">{t('deleted')}</span>{/if}
 </header>
 
 {#if error}
   <p class="error" role="alert">{error}</p>
 {:else if object}
   {#if !gone}<Actions {object} {scoped} />{/if}
-  <div class="tabs" role="tablist" aria-label="Views of {name}" bind:this={tablist}>
+  <div class="tabs" role="tablist" aria-label={t('Views of {name}', { name })} bind:this={tablist}>
     {#each tabs as t (t.id)}
       <button
         role="tab"
@@ -127,7 +128,7 @@
         {/if}
       {/each}
       {#if kind === 'Task' && object.spec?.service}
-        <dt>Service</dt>
+        <dt>{t('Service')}</dt>
         <dd>
           <a href="/k/{object.spec.job ? 'Job' : 'Service'}/{namespace}/{object.spec.service}"
             >{object.spec.service}</a
@@ -135,17 +136,17 @@
         </dd>
       {/if}
       {#if kind === 'Task' && object.spec?.node}
-        <dt>On node</dt>
+        <dt>{t('On node')}</dt>
         <dd><a href="/k/Node/_/{object.spec.node}">{object.spec.node}</a></dd>
       {/if}
-      <dt>Version</dt>
-      <dd>{object.metadata.version} (generation {object.metadata.generation})</dd>
-      <dt>UID</dt>
+      <dt>{t('Version')}</dt>
+      <dd>{t('{version} (generation {generation})', { version: object.metadata.version, generation: object.metadata.generation })}</dd>
+      <dt>{t('UID')}</dt>
       <dd><code>{object.metadata.uid}</code></dd>
-      <dt>Labels</dt>
+      <dt>{t('Labels')}</dt>
       <dd><Labels {object} {scoped} /></dd>
       {#if kind === 'Node'}
-        <dt>Taints</dt>
+        <dt>{t('Taints')}</dt>
         <dd><Taints node={object} /></dd>
       {/if}
     </dl>

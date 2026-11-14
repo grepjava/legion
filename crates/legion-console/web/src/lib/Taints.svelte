@@ -4,6 +4,7 @@
   // goes there only with a toleration. Changed over the version shown.
   import { api, ApiError, type LObject } from './api.ts';
   import { cannotWrite } from './session.svelte.ts';
+  import { t } from './i18n.svelte.ts';
 
   type Taint = { key: string; value?: string; effect: string };
   let { node }: { node: LObject } = $props();
@@ -33,45 +34,53 @@
     } catch (e) {
       error =
         e instanceof ApiError && e.status === 409
-          ? 'The node changed meanwhile (its heartbeat, perhaps); try again.'
+          ? t('The node changed meanwhile (its heartbeat, perhaps); try again.')
           : (e as Error).message;
     }
   }
 
-  const show = (t: Taint) => `${t.key}${t.value ? `=${t.value}` : ''}:${t.effect}`;
+  const show = (taint: Taint) => `${taint.key}${taint.value ? `=${taint.value}` : ''}:${taint.effect}`;
 
   function add(e: SubmitEvent) {
     e.preventDefault();
-    const t: Taint = { key: key.trim(), effect, ...(value.trim() ? { value: value.trim() } : {}) };
-    const warn = effect === 'NoExecute' ? ' Tasks without a toleration for it move away.' : '';
-    write([...taints.filter((x) => !(x.key === t.key && x.effect === t.effect)), t], `Taint ${node.metadata.name} ${show(t)}?${warn}`);
+    const taint: Taint = { key: key.trim(), effect, ...(value.trim() ? { value: value.trim() } : {}) };
+    const vars = { node: node.metadata.name, taint: show(taint) };
+    const ask =
+      effect === 'NoExecute'
+        ? t('Taint {node} {taint}? Tasks without a toleration for it move away.', vars)
+        : t('Taint {node} {taint}?', vars);
+    write([...taints.filter((x) => !(x.key === taint.key && x.effect === taint.effect)), taint], ask);
   }
 </script>
 
-{#each taints as t (show(t))}
+{#each taints as taint (show(taint))}
   <span class="tag">
-    {show(t)}
+    {show(taint)}
     {#if !why}
       <button
         class="link"
-        aria-label="Remove {show(t)}"
-        onclick={() => write(taints.filter((x) => x !== t), `Remove ${show(t)} from ${node.metadata.name}?`)}
+        aria-label={t('Remove {item}', { item: show(taint) })}
+        onclick={() =>
+          write(
+            taints.filter((x) => x !== taint),
+            t('Remove {taint} from {node}?', { taint: show(taint), node: node.metadata.name })
+          )}
         >×</button
       >
     {/if}
   </span>
 {/each}
-{#if !taints.length}<span class="muted">none</span>{/if}
+{#if !taints.length}<span class="muted">{t('none')}</span>{/if}
 {#if !why}
   <form class="inline" onsubmit={add}>
-    <input placeholder="key" bind:value={key} aria-label="Taint key" required />
-    <input placeholder="value" bind:value={value} aria-label="Taint value" />
-    <select bind:value={effect} aria-label="Effect">
+    <input placeholder={t('key')} bind:value={key} aria-label={t('Taint key')} required />
+    <input placeholder={t('value')} bind:value={value} aria-label={t('Taint value')} />
+    <select bind:value={effect} aria-label={t('Effect')}>
       <option>NoSchedule</option>
       <option>PreferNoSchedule</option>
       <option>NoExecute</option>
     </select>
-    <button disabled={!key.trim()}>Add</button>
+    <button disabled={!key.trim()}>{t('Add')}</button>
   </form>
 {/if}
 {#if error}<p class="error" role="alert">{error}</p>{/if}

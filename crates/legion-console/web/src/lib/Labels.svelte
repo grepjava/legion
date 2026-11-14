@@ -3,6 +3,7 @@
   // label; a user who may change the object adds and removes them.
   import { api, type LObject } from './api.ts';
   import { cannotWrite } from './session.svelte.ts';
+  import { t } from './i18n.svelte.ts';
 
   let { object, scoped }: { object: LObject; scoped: boolean } = $props();
   const ns = $derived(object.metadata.namespace ?? '');
@@ -25,7 +26,7 @@
     e.preventDefault();
     const eq = adding.indexOf('=');
     if (eq < 1) {
-      error = 'a label is key=value';
+      error = t('a label is key=value');
       return;
     }
     change({ [adding.slice(0, eq).trim()]: adding.slice(eq + 1).trim() });
@@ -36,17 +37,17 @@
   <span class="tag">
     <a href="/k/{object.kind}?filter={encodeURIComponent(`${k}=${v}`)}">{k}={v}</a>
     {#if !why}
-      <button class="link" title="Remove {k}" aria-label="Remove {k}" onclick={() => change({ [k]: null })}
+      <button class="link" title={t('Remove {item}', { item: k })} aria-label={t('Remove {item}', { item: k })} onclick={() => change({ [k]: null })}
         >×</button
       >
     {/if}
   </span>
 {/each}
-{#if !labels.length}<span class="muted">none</span>{/if}
+{#if !labels.length}<span class="muted">{t('none')}</span>{/if}
 {#if !why}
   <form class="inline" onsubmit={add}>
-    <input placeholder="key=value" bind:value={adding} aria-label="New label" />
-    <button disabled={!adding}>Add</button>
+    <input placeholder={t('key=value')} bind:value={adding} aria-label={t('New label')} />
+    <button disabled={!adding}>{t('Add')}</button>
   </form>
 {/if}
 {#if error}<p class="error" role="alert">{error}</p>{/if}

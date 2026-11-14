@@ -1,3 +1,0 @@
-import{D as e,F as t,Q as n,T as r,U as i,W as a,Y as o,Z as s,_ as c,et as l,f as u,g as d,k as f,p,tt as m,z as h}from"./DTjzNxtC.js";var g=f(`<span> </span>
-`,1),_=f(`<pre class="diff"></pre>`);function v(f,v){n(v,!0);let y=o(()=>v.text.split(`
-`).map(e=>({l:e,c:e.startsWith(`+++`)||e.startsWith(`---`)?`head`:e.startsWith(`+`)?`add`:e.startsWith(`-`)?`del`:e.startsWith(`@@`)?`hunk`:``})));var b=_();d(b,21,()=>t(y),c,(n,o)=>{let s=()=>t(o).l,c=()=>t(o).c;var d=g(),f=i(d),m=a(f,!0);l(),h(()=>{u(f,1,p(c())),r(m,s())}),e(n,d)}),m(b),e(f,b),s()}export{v as t};

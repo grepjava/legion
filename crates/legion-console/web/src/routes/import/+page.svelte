@@ -6,6 +6,7 @@
   import { page } from '$app/state';
   import { api, compose, templates, type ApplyResult, type ComposeVariable } from '#lib/api.ts';
   import Diff from '#lib/Diff.svelte';
+  import { t } from '#lib/i18n.svelte.ts';
   import { cannotWrite, session } from '#lib/session.svelte.ts';
   import { toYaml } from '#lib/yaml.ts';
 
@@ -32,14 +33,16 @@
     const from = page.url.searchParams.get('from') ?? '';
     templates()
       .then((r) => {
-        const t = r.templates.find((t) => t.name === name && t.namespace === from);
-        if (!t) {
-          convertError = `no template ${from ? `${from}/` : ''}${name}`;
+        const found = r.templates.find((x) => x.name === name && x.namespace === from);
+        if (!found) {
+          convertError = from
+            ? t('no template {namespace}/{name}', { namespace: from, name })
+            : t('no template {name}', { name });
           return;
         }
-        text = t.compose;
-        stack = t.name;
-        saveName = t.name;
+        text = found.compose;
+        stack = found.name;
+        saveName = found.name;
       })
       .catch((e) => (convertError = e.message));
   });
@@ -97,46 +100,47 @@
     };
     try {
       await api.apply({ yaml: toYaml(config) });
-      saved = `Saved as Config ${saveNamespace.trim()}/${saveName.trim()}.`;
+      saved = t('Saved as Config {namespace}/{name}.', { namespace: saveNamespace.trim(), name: saveName.trim() });
     } catch (e) {
       error = (e as Error).message;
     }
   }
 </script>
 
-<header class="bar"><h1>Import compose</h1></header>
+<header class="bar"><h1>{t('Import compose')}</h1></header>
 <p class="muted">
-  A compose file as the objects <code>legion stack deploy</code> applies, shown before they are. Files it names are
-  not read here: put their content in it. From the <a href="/templates">templates</a>, or pasted.
+  {t('A compose file as the objects')} <code>legion stack deploy</code>
+  {t('applies, shown before they are. Files it names are not read here: put their content in it.')}
+  {t('From the')} <a href="/templates">{t('templates')}</a>{t(', or pasted.')}
 </p>
 
 <div class="split">
   <div class="side">
-    <label>Stack <input bind:value={stack} aria-label="Stack" placeholder="site" /></label>
+    <label>{t('Stack')} <input bind:value={stack} aria-label={t('Stack')} placeholder="site" /></label>
     <label
-      >Namespace <span class="muted">(empty: the stack's name)</span>
-      <input bind:value={namespace} aria-label="Namespace" placeholder={stack} />
+      >{t('Namespace')} <span class="muted">{t("(empty: the stack's name)")}</span>
+      <input bind:value={namespace} aria-label={t('Namespace')} placeholder={stack} />
     </label>
     {#if variables.length}
       <fieldset>
-        <legend>Variables</legend>
+        <legend>{t('Variables')}</legend>
         {#each variables as v (v.name)}
           <label
-            >{v.name}{#if v.required}<span class="muted"> (required)</span>{/if}
-            <input bind:value={values[v.name]} aria-label="Variable {v.name}" placeholder={v.default ?? ''} />
+            >{v.name}{#if v.required}<span class="muted"> {t('(required)')}</span>{/if}
+            <input bind:value={values[v.name]} aria-label={t('Variable {name}', { name: v.name })} placeholder={v.default ?? ''} />
           </label>
         {/each}
       </fieldset>
     {/if}
-    <textarea class="editor" bind:value={text} spellcheck="false" rows="22" aria-label="Compose file"></textarea>
+    <textarea class="editor" bind:value={text} spellcheck="false" rows="22" aria-label={t('Compose file')}></textarea>
     <fieldset>
-      <legend>Save as a template</legend>
-      <label>Name <input bind:value={saveName} aria-label="Template name" /></label>
-      <label>In namespace <input bind:value={saveNamespace} aria-label="Template namespace" /></label>
+      <legend>{t('Save as a template')}</legend>
+      <label>{t('Name')} <input bind:value={saveName} aria-label={t('Template name')} /></label>
+      <label>{t('In namespace')} <input bind:value={saveNamespace} aria-label={t('Template namespace')} /></label>
       <button
         onclick={save}
         disabled={!text.trim() || !saveName.trim() || !!cannotWrite(saveNamespace.trim())}
-        title={cannotWrite(saveNamespace.trim()) ?? ''}>Save</button
+        title={cannotWrite(saveNamespace.trim()) ?? ''}>{t('Save')}</button
       >
       {#if saved}<p class="ok" role="status">{saved}</p>{/if}
     </fieldset>
@@ -144,12 +148,12 @@
 
   <div>
     {#if convertError}<p class="error" role="alert">{convertError}</p>{/if}
-    {#each warnings as w (w)}<p class="muted">Not honoured: {w}</p>{/each}
-    {#if yaml}<pre class="yaml" aria-label="Objects">{yaml}</pre>{/if}
+    {#each warnings as w (w)}<p class="muted">{t('Not honoured: {warning}', { warning: w })}</p>{/each}
+    {#if yaml}<pre class="yaml" aria-label={t('Objects')}>{yaml}</pre>{/if}
     <div class="controls">
-      <button onclick={() => run(true)} disabled={!yaml || !!why || busy} title={why ?? ''}>Show changes</button>
+      <button onclick={() => run(true)} disabled={!yaml || !!why || busy} title={why ?? ''}>{t('Show changes')}</button>
       <button class="primary" onclick={() => run(false)} disabled={!yaml || !!why || busy} title={why ?? ''}
-        >Deploy</button
+        >{t('Deploy')}</button
       >
       {#if busy}<span class="muted">…</span>{/if}
     </div>
@@ -158,7 +162,11 @@
     {#each results as r (r.key)}
       <h2>
         {#if !dry && r.key.startsWith('Service/')}<a href="/k/{r.key}">{r.key}</a>{:else}{r.key}{/if}:
-        <span class="muted">{dry ? `would be ${r.result}` : `${r.result}, version ${r.version}`}</span>
+        <span class="muted"
+          >{dry
+            ? t('would be {result}', { result: r.result })
+            : t('{result}, version {version}', { result: r.result, version: r.version })}</span
+        >
       </h2>
       {#if r.diff}<Diff text={r.diff} />{/if}
     {/each}

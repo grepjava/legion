@@ -2,6 +2,8 @@
   // One series over time, on one axis: a 2px line, a faint grid, the
   // title naming it (no legend for one series), a crosshair and tooltip on
   // hover, and the latest, average and highest values as text beside it.
+  import { t } from '#lib/i18n.svelte.ts';
+
   let {
     title,
     points,
@@ -71,19 +73,28 @@
     <strong>{title}</strong>
     {#if points.length}
       <span class="muted"
-        >now {format(last)} · average {format(avg)} · highest {format(max)}{#each marks as m (m.label)}
+        >{t('now {now} · average {average} · highest {highest}', {
+          now: format(last),
+          average: format(avg),
+          highest: format(max)
+        })}{#each marks as m (m.label)}
           · {m.label} {format(m.value)}{/each}</span
       >
     {/if}
   </figcaption>
   {#if points.length < 2}
-    <p class="muted">Not enough samples yet: one comes every {Math.round(step / 1000)} s.</p>
+    <p class="muted">{t('Not enough samples yet: one comes every {seconds} s.', { seconds: Math.round(step / 1000) })}</p>
   {:else}
     <svg
       {width}
       {height}
       role="img"
-      aria-label="{title}: now {format(last)}, average {format(avg)}, highest {format(max)}"
+      aria-label={t('{title}: now {now}, average {average}, highest {highest}', {
+        title,
+        now: format(last),
+        average: format(avg),
+        highest: format(max)
+      })}
       onpointermove={move}
       onpointerleave={() => (hover = null)}
     >

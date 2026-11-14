@@ -1,6 +1,7 @@
 // "Deploy from an image" (CONSOLE.md phase 5): a form's answers as the
 // objects `legion apply` takes, a Service and, when asked, a new Volume
 // for it. The form writes YAML only; the server checks it on apply.
+import { t } from '#lib/i18n.svelte.ts';
 
 export type Probe = 'none' | 'http' | 'tcp';
 
@@ -60,7 +61,7 @@ export function envVars(text: string): { name: string; value: string }[] | strin
     const line = raw.trim();
     if (!line || line.startsWith('#')) continue;
     const eq = line.indexOf('=');
-    if (eq <= 0) return `environment line ${i + 1}: write NAME=value`;
+    if (eq <= 0) return t('environment line {line}: write NAME=value', { line: i + 1 });
     out.push({ name: line.slice(0, eq).trim(), value: line.slice(eq + 1) });
   }
   return out;
@@ -71,15 +72,15 @@ export function envVars(text: string): { name: string; value: string }[] | strin
 export function objects(f: DeployForm): object[] | string {
   const name = f.name.trim();
   const image = f.image.trim();
-  if (!name) return 'give the service a name';
-  if (!f.namespace) return 'choose a namespace';
-  if (!image) return 'give an image';
+  if (!name) return t('give the service a name');
+  if (!f.namespace) return t('choose a namespace');
+  if (!image) return t('give an image');
   const env = envVars(f.env);
   if (typeof env === 'string') return env;
   const mount = f.mountPath.trim();
   const volume = f.volume.trim() || name;
-  if (f.probe !== 'none' && !f.port) return 'a probe needs the port the container listens on';
-  if (f.publishedPort && !f.port) return 'publishing needs the port the container listens on';
+  if (f.probe !== 'none' && !f.port) return t('a probe needs the port the container listens on');
+  if (f.publishedPort && !f.port) return t('publishing needs the port the container listens on');
 
   const container: Record<string, unknown> = { name, image };
   const command = f.command
