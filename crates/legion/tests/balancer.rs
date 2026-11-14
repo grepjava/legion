@@ -93,6 +93,17 @@ fn master(lab: &Lab, iface: &str) -> Option<String> {
     found
 }
 
+/// The node `legion lb` says holds web's address, from the nodes' own
+/// reports; `-` when none does.
+fn held_by(lab: &Lab) -> String {
+    lab.ok(&["lb", "-n", "default"])
+        .lines()
+        .find(|l| l.starts_with("web "))
+        .and_then(|l| l.split_whitespace().nth(3))
+        .unwrap_or_default()
+        .to_owned()
+}
+
 #[test]
 #[ignore = "needs root, ZFS on FreeBSD and two more nodes; see the module docs"]
 fn a_load_balancer_address_answers_and_moves() {
@@ -124,6 +135,7 @@ fn a_load_balancer_address_answers_and_moves() {
     step("one node holds it");
     let first = master(&lab, &iface).expect("a master");
     eprintln!("held by {first}");
+    wait("legion lb saying so", 60, || held_by(&lab) == first);
 
     step("that node drained: another takes the address over, and web answers on");
     lab.ok(&["node", "drain", &first]);
@@ -131,6 +143,8 @@ fn a_load_balancer_address_answers_and_moves() {
         master(&lab, &iface).is_some_and(|m| m != first)
     });
     wait("web answering again", 120, || !answer(&lab).is_empty());
+    let second = master(&lab, &iface).expect("a master");
+    wait("legion lb saying which", 60, || held_by(&lab) == second);
     lab.ok(&["node", "activate", &first]);
 
     step("removed, the address is given up everywhere");
