@@ -483,12 +483,17 @@ spec:
     e.fill("Name", "formed");
     e.fill("Namespace", "team-a");
     e.fill("Image", IMAGE);
-    e.fill("Command", "/bin/sh\n-c\nwhile :; do echo formed; sleep 1; done");
+    e.fill(
+        "Command",
+        "/bin/sh\n-c\nwhile :; do echo formed; sleep 1; done",
+    );
     e.fill("Container port", "8080");
     e.fill("Memory", "64Mi");
     e.until("the YAML written", 30, |b| {
         let t = b.text();
-        t.contains("kind: Service") && t.contains("memory: 64Mi") && t.contains("containerPort: 8080")
+        t.contains("kind: Service")
+            && t.contains("memory: 64Mi")
+            && t.contains("containerPort: 8080")
     });
     e.click("Show changes");
     e.shows("Service/team-a/formed: would be created", 30);
@@ -498,7 +503,9 @@ spec:
         c.get("service", "team-a", "formed")["status"]["ready"] == 1
     });
 
-    step("phase 5: a compose file saved as a template, deployed from the catalog with its variable set");
+    step(
+        "phase 5: a compose file saved as a template, deployed from the catalog with its variable set",
+    );
     c.page(&mut e, "/import");
     e.fill("Stack", "draft");
     e.fill(
@@ -514,7 +521,10 @@ spec:
     e.shows("Saved as Config team-a/sleeper.", 30);
     c.page(&mut e, "/templates");
     e.shows("saved in team-a", 30);
-    assert!(e.text().contains("counter"), "the examples are in the catalog");
+    assert!(
+        e.text().contains("counter"),
+        "the examples are in the catalog"
+    );
     e.eval("document.querySelector('[aria-label=\"Use sleeper\"]').click()");
     e.until("the template opened", 30, |b| {
         b.eval("H.field('Stack')?.value ?? ''") == serde_json::json!("sleeper")
