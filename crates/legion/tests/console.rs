@@ -1135,7 +1135,7 @@ fn the_console_builds_an_example_with_jailer() {
         "{pinned}"
     );
     c.page(&mut e, &format!("/k/Build/shop/{build}?tab=buildlog"));
-    e.shows("Succeeded", 30);
+    e.shows("The build succeeded.", 30);
     wait(
         "web rolled out to the image built, both tasks ready",
         600,
