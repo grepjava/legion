@@ -59,6 +59,12 @@ fn pipe() -> (RawFd, RawFd) {
 impl Browser {
     /// Starts the browser with its profile, downloads and log in `dir`.
     pub fn start(dir: &Path) -> Browser {
+        Browser::start_with(dir, &[])
+    }
+
+    /// [`Self::start`], with more of Chromium's flags (host names mapped to
+    /// the lab's addresses, say).
+    pub fn start_with(dir: &Path, flags: &[&str]) -> Browser {
         let program = std::env::var("LEGION_BROWSER").expect("set LEGION_BROWSER");
         std::fs::create_dir_all(dir).unwrap();
         let downloads = dir.join("downloads");
@@ -79,6 +85,7 @@ impl Browser {
                 "--ignore-certificate-errors",
                 "--window-size=1400,1000",
             ])
+            .args(flags)
             .arg(format!("--user-data-dir={}", dir.join("profile").display()))
             .arg("about:blank")
             .stdin(Stdio::null())

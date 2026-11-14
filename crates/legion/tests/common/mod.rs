@@ -18,6 +18,7 @@
 
 #[cfg(unix)]
 pub mod browser;
+pub mod idp;
 pub mod jailer;
 
 use std::io::Write;
@@ -414,6 +415,96 @@ impl Lab {
             text(&out.stdout),
             text(&out.stderr)
         );
+    }
+
+    /// VM `i` as a cluster of its own, its one node the manager `n<i+2>`
+    /// with `extra` flags, initialised; its admin's credentials copied here,
+    /// to call it with [`Self::ok_at`].
+    pub fn start_vm_alone(&self, i: usize, extra: &[&str]) -> PathBuf {
+        let vm = &self.vms[i];
+        self.install(vm);
+        let addr = format!("{}:{PORT}", vm.addr);
+        let cmd = format!(
+            "{STOP}
+             {clean}
+             set -e
+             {setup}
+             daemon -o /var/log/legion-lab.log {REMOTE} daemon --node-name n{n}                  --data-dir {VM_DATA} --run-dir {VM_RUN}                  --listen {addr} --advertise {addr} {flags} {extra} </dev/null >/dev/null 2>&1
+",
+            clean = clean(VM_DATA, VM_RUN),
+            setup = self.setup,
+            n = i + 2,
+            flags = self.flags,
+            extra = extra.join(" "),
+        );
+        let out = self.ssh(vm, &cmd);
+        assert!(
+            out.status.success(),
+            "starting {} alone: {}{}",
+            vm.name,
+            text(&out.stdout),
+            text(&out.stderr)
+        );
+        let admin = self.dir.join(format!("{}-admin.pem", vm.name));
+        wait(&format!("{}'s admin credentials", vm.name), 60, || {
+            let out = self.ssh(vm, &format!("cat {VM_DATA}/admin.pem"));
+            out.status.success() && {
+                std::fs::write(&admin, &out.stdout).unwrap();
+                !out.stdout.is_empty()
+            }
+        });
+        wait(&format!("{}'s manager", vm.name), 60, || {
+            self.legion_at(&addr, &admin, &["status"]).status.success()
+        });
+        self.ok_at(&addr, &admin, &["init"]);
+        admin
+    }
+
+    /// `legion` against the manager at `server`, as `identity`.
+    pub fn legion_at(&self, server: &str, identity: &Path, args: &[&str]) -> Output {
+        Command::new(LEGION)
+            .args(["--server", server])
+            .arg("--identity")
+            .arg(identity)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    pub fn ok_at(&self, server: &str, identity: &Path, args: &[&str]) -> String {
+        let out = self.legion_at(server, identity, args);
+        assert!(
+            out.status.success(),
+            "legion at {server} {args:?}: {}",
+            text(&out.stderr)
+        );
+        text(&out.stdout)
+    }
+
+    /// Makes `127.0.0.1:port` on VM `i` reach `127.0.0.1:port` here, for
+    /// as long as the child runs.
+    pub fn tunnel(&self, i: usize, port: u16) -> Child {
+        let vm = &self.vms[i];
+        let mut child = self
+            .remote("ssh")
+            .args(["-N", "-o", "ExitOnForwardFailure=yes", "-R"])
+            .arg(format!("127.0.0.1:{port}:127.0.0.1:{port}"))
+            .arg(vm.login())
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait(&format!("the tunnel to {}", vm.name), 30, || {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "the tunnel to {} ended",
+                vm.name
+            );
+            self.ssh(vm, &format!("nc -z 127.0.0.1 {port}"))
+                .status
+                .success()
+        });
+        child
     }
 
     /// Objects of a kind in a namespace, as the admin sees them, as JSON.

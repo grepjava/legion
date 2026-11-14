@@ -25,6 +25,11 @@
 //!   as the editor; every page passes axe's WCAG 2.2 A and AA rules
 //!   (`LEGION_AXE` names axe-core's `axe.min.js`).
 //!
+//! `the_console_spans_two_clusters_by_single_sign_on` is phase 6's "done
+//! when": two clusters, each its own console, a user signing in to both
+//! with one identity provider and seeing, in each, her group's access in
+//! both.
+//!
 //! It drives real daemons, so it is ignored by default and run on the lab
 //! of `tests/common` (see there), as root, with `LEGION_BROWSER` naming
 //! Chromium: this host is the manager n1 and serves the console, the first
@@ -799,5 +804,186 @@ spec:
     assert!(after.contains("no rotation under way"), "{after}");
     if !a.errors.is_empty() {
         eprintln!("the admin's pages reported: {:?}", a.errors);
+    }
+}
+
+/// Kills a child process when dropped, as a test's tunnel must end with it.
+struct Ends(std::process::Child);
+
+impl Drop for Ends {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Phase 6's "done when": a team signs in with their company's identity
+/// provider and sees two clusters, with the access each group has there.
+/// Two clusters of one node each, east on this host and west on the first
+/// VM, each with its own console, its own client at a provider this test
+/// plays (a sign-in page with a session of its own, then codes, PKCE and
+/// ES256 ID tokens), and its own RoleBinding for the group shop-team: edit
+/// in east, view in west. The browser knows the consoles by name, one site
+/// (`east.console.lab`, `west.console.lab`), as a company would.
+#[test]
+#[ignore = "needs root, ZFS on FreeBSD, a VM and Chromium; see the module docs"]
+fn the_console_spans_two_clusters_by_single_sign_on() {
+    use common::idp::Idp;
+    let mut lab = Lab::from_env();
+    let step = |what: &str| eprintln!("--- {what}");
+    let (east_ip, west_ip) = (lab.host.clone(), lab.vms[0].addr.clone());
+    let east_url = "https://east.console.lab:7480";
+    let west_url = "https://west.console.lab:7480";
+
+    step("two clusters, east on this host and west on a VM, each with its console");
+    lab.start_host(&["--console-listen", &format!("{east_ip}:7480")]);
+    lab.ok(&["init"]);
+    let west_admin = lab.start_vm_alone(0, &["--console-listen", &format!("{west_ip}:7480")]);
+    let west = format!("{west_ip}:{}", common::PORT);
+    let east = lab.server();
+
+    step("a provider both consoles trust, reached from west through a tunnel");
+    let idp = Idp::start(
+        5556,
+        &[("east", "east-secret"), ("west", "west-secret")],
+        &[("alice", &["shop-team"])],
+    );
+    let _tunnel = Ends(lab.tunnel(0, 5556));
+
+    // Each cluster: its settings naming the other, its client, and what
+    // shop-team may do there.
+    for (server, admin, name, other, other_url, url, role) in [
+        (
+            &east,
+            lab.admin(),
+            "east",
+            "west",
+            west_url,
+            east_url,
+            "edit",
+        ),
+        (
+            &west,
+            west_admin.clone(),
+            "west",
+            "east",
+            east_url,
+            west_url,
+            "view",
+        ),
+    ] {
+        let file = |what: &str, text: String| {
+            let path = lab.dir.join(format!("{name}-{what}.yaml"));
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let settings = file(
+            "settings",
+            format!("name: {name}\nclusters:\n  - {{ name: {other}, url: \"{other_url}\" }}\n"),
+        );
+        let oidc = file(
+            "oidc",
+            format!(
+                "issuer: {}\nclientId: {name}\nclientSecret: {name}-secret\n\
+                 consoleUrl: \"{url}\"\nlabel: Sign in with Lab ID\n",
+                idp.issuer
+            ),
+        );
+        let objects = file(
+            "objects",
+            format!(
+                "apiVersion: legion/v1\nkind: Namespace\nmetadata: {{ name: shop }}\n---\n\
+                 apiVersion: legion/v1\nkind: RoleBinding\n\
+                 metadata: {{ name: shop-team, namespace: shop }}\n\
+                 spec: {{ group: shop-team, role: {role} }}\n"
+            ),
+        );
+        for args in [
+            vec!["console", "configure", "-f", settings.to_str().unwrap()],
+            vec!["console", "oidc", "-f", oidc.to_str().unwrap()],
+            vec!["apply", "-f", objects.to_str().unwrap()],
+        ] {
+            lab.ok_at(server, &admin, &args);
+        }
+    }
+
+    let mut b = Browser::start_with(
+        &lab.dir.join("browser-alice"),
+        &[&format!(
+            "--host-resolver-rules=MAP east.console.lab {east_ip}, MAP west.console.lab {west_ip}"
+        )],
+    );
+    let me = |b: &mut Browser| b.eval("fetch('/api/me').then((r) => r.json())");
+
+    step("alice signs in to east with the provider, typing her name there");
+    b.goto(&format!("{east_url}/login"));
+    b.click("Sign in with Lab ID");
+    b.until("the provider's sign-in page", 30, |b| {
+        b.eval("!!H.field('Username')") == serde_json::json!(true)
+    });
+    b.fill("Username", "alice");
+    b.click("Sign in");
+    b.shows("Sign out", 30);
+    let m = me(&mut b);
+    assert_eq!(m["name"], "oidc:alice@example.com", "{m}");
+    assert_eq!(
+        m["namespaces"],
+        serde_json::json!({ "shop": "edit" }),
+        "{m}"
+    );
+
+    step("east's Clusters page: west not signed into yet");
+    b.goto(&format!("{east_url}/clusters"));
+    b.until("west's row offering to sign in", 30, |b| {
+        b.eval("document.querySelector('[aria-label=\"Cluster west\"]')?.innerText ?? ''")
+            .as_str()
+            .is_some_and(|t| t.contains("Sign in"))
+    });
+
+    step("alice signs in to west with one click: the provider remembers her");
+    b.goto(&format!("{west_url}/login"));
+    b.click("Sign in with Lab ID");
+    b.shows("Sign out", 30);
+    let m = me(&mut b);
+    assert_eq!(m["name"], "oidc:alice@example.com", "{m}");
+    assert_eq!(
+        m["namespaces"],
+        serde_json::json!({ "shop": "view" }),
+        "{m}"
+    );
+    assert_eq!(
+        (idp.asked(), idp.exchanged()),
+        (1, 2),
+        "her name asked once, a code exchanged by each console"
+    );
+
+    step("each console's Clusters page: both clusters, with the access shop-team has in each");
+    for (url, here, there) in [
+        (east_url, ("east", "shop: edit"), ("west", "shop: view")),
+        (west_url, ("west", "shop: view"), ("east", "shop: edit")),
+    ] {
+        b.goto(&format!("{url}/clusters"));
+        b.until(
+            &format!("{url}: both clusters and alice's access"),
+            30,
+            |b| {
+                let row = |b: &mut Browser, name: &str| {
+                    b.eval(&format!(
+                        "document.querySelector('[aria-label=\"Cluster {name}\"]')?.innerText ?? ''"
+                    ))
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+                };
+                let (mine, theirs) = (row(b, here.0), row(b, there.0));
+                mine.contains("oidc:alice@example.com")
+                    && mine.contains(here.1)
+                    && theirs.contains("oidc:alice@example.com")
+                    && theirs.contains(there.1)
+            },
+        );
+    }
+    if !b.errors.is_empty() {
+        eprintln!("alice's pages reported: {:?}", b.errors);
     }
 }
