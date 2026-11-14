@@ -258,8 +258,8 @@ What makes OpenShift's console a place to deploy from.
   `docs/COMPOSE.md` describes, shown before applying.
 - Builds: images built with jailer from a Git repository or a
   Containerfile, pushed to the cluster's registry, then rolled out;
-  build logs live. (With jailer: the console calls jailer's API rather
-  than building anything itself.)
+  build logs live. (jailer builds, on builder nodes, as the agent tells
+  it; the console builds nothing itself.)
 
 **Done when** a user who has never used the CLI deploys an example from
 the catalog, changes its image through a jailer build and sees the
@@ -322,6 +322,24 @@ on the host, as its agent is told, the way a Volume's data is sent.
 - *Done when*, on the lab: a user who has never used the CLI deploys an
   example from the catalog, builds a new image for it with jailer from the
   console, and sees the build's log and the rollout.
+
+**Builds built** as designed: the `Build` kind, the leader's builds
+controller, the agent's `--jailer` (and `--jailer-arg`), `legion
+build-logs [-f]`, the console's Builds, a Build's Log tab (followed while it
+runs, saying how it ended) and a Service's "Build a new image". The lab
+found three things on the way: the test labelling its node before it had
+joined, the Log tab never saying the build had ended, and the test asking
+the published port from the host itself, which pf does not redirect.
+
+**Done when: met** (`the_console_builds_an_example_with_jailer`, passed on
+66b8f8f). One node, labelled a builder, with jailer and a registry the test
+runs. ed, an `edit` user in shop who signs in with a certificate and never
+uses the CLI, deploys static-site from the catalog with an image not yet
+built, then from its Service's page builds one from its Containerfile
+pasted in. The Build's log shows jailer pulling FreeBSD's base, running the
+`RUN` step and pushing, then says it succeeded; the Service rolls out to
+the reference pinned to the pushed digest, both tasks ready, green in the
+topology, and the site answers on its published port.
 
 ## Phase 6: enterprise
 
