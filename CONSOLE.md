@@ -312,8 +312,11 @@ default, never past the certificate it was signed in with). Before signing
 in the gateway serves the banner alone; the admin sets them on a page of
 their own too.
 
-**Single sign-on, as designed.** The certificate stays the one way to call
-the API; OIDC is one more way to start a console session.
+**Single sign-on** (`legion console oidc -f`, built as designed below and
+tested over the gateway against a provider the test plays,
+`the_console_signs_in_with_an_identity_provider`). The certificate stays
+the one way to call the API; OIDC is one more way to start a console
+session.
 
 - *Who.* An OIDC user is named `oidc:` and the claim configured
   (`email` by default), so no name from a provider can be a certificate
