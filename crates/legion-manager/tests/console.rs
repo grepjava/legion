@@ -1027,3 +1027,79 @@ async fn the_console_converts_compose_files_and_lists_templates() {
     let _ = f.stop.send(());
     f.task.await.unwrap();
 }
+
+/// The console's settings over the gateway (CONSOLE.md phase 6): before
+/// signing in only the banner, which the sign-in page shows; all of them
+/// after; set by the admin alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_console_serves_its_settings() {
+    let f = start().await;
+    let mut objects = ObjectsClient::new(f.admin.clone());
+    for (kind, ns, name, spec) in [
+        ("Namespace", "", "shop", serde_json::json!({})),
+        (
+            "RoleBinding",
+            "shop",
+            "alice",
+            serde_json::json!({ "user": "alice", "role": "edit" }),
+        ),
+    ] {
+        objects.apply(object(kind, ns, name, spec)).await.unwrap();
+    }
+    let console = f.console_addr.to_string();
+    let origin = format!("https://{console}");
+    let get = |cookie: Option<String>| {
+        let (ca, console) = (&f.ca, &console);
+        async move {
+            https(ca, console, "GET", "/api/console-settings", cookie.as_deref(), None, None).await
+        }
+    };
+    let r = get(None).await;
+    assert_eq!((r.status, r.body.clone()), (200, serde_json::json!({})), "{}", r.text);
+
+    let wanted = serde_json::json!({
+        "banner": { "text": "Production", "level": "danger" },
+        "links": [{ "label": "Runbook", "url": "https://wiki.example/run" }],
+        "defaultNamespace": "shop",
+        "session": "8h",
+    });
+    let post = |who: (String, String), body: serde_json::Value| {
+        let (ca, console, origin) = (&f.ca, &console, &origin);
+        async move {
+            request(
+                ca,
+                console,
+                true,
+                "POST",
+                "/api/console-settings",
+                Some(&who.0),
+                Some(origin),
+                Some(body),
+                &[("x-legion-csrf", &who.1)],
+            )
+            .await
+        }
+    };
+    let root = sign_in_as(&f, "root", Role::Admin).await;
+    let alice = sign_in(&f, "alice").await;
+    let r = post(root.clone(), wanted.clone()).await;
+    assert_eq!((r.status, r.body.clone()), (200, wanted.clone()), "{}", r.text);
+    let r = post(alice.clone(), serde_json::json!({})).await;
+    assert_eq!(r.status, 403, "{}", r.text);
+    let r = post(root.clone(), serde_json::json!({ "session": "1m" })).await;
+    assert_eq!(r.status, 400, "{}", r.text);
+
+    // Signed out: the banner alone. Signed in: everything.
+    let r = get(None).await;
+    assert_eq!(
+        r.body,
+        serde_json::json!({ "banner": { "text": "Production", "level": "danger" } })
+    );
+    let r = get(Some("legion_session=stale".into())).await;
+    assert!(r.body.get("links").is_none(), "{}", r.text);
+    let r = get(Some(alice.0.clone())).await;
+    assert_eq!(r.body, wanted, "{}", r.text);
+
+    let _ = f.stop.send(());
+    f.task.await.unwrap();
+}

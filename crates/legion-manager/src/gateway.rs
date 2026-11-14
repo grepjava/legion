@@ -181,6 +181,10 @@ fn router(gateway: Gateway) -> axum::Router {
         .route("/api/manifest/{kind}/{namespace}/{name}", get(manifest))
         .route("/api/apply", post(apply))
         .route("/api/compose", post(compose))
+        .route(
+            "/api/console-settings",
+            get(console_settings).post(set_console_settings),
+        )
         .route("/api/templates", get(templates))
         .route("/api/set", post(set_field))
         .route("/api/labels", post(labels))
@@ -1646,6 +1650,45 @@ async fn ca_rotate(
         .await?
         .into_inner();
     Ok(ca_json(r))
+}
+
+/// The console's settings (`legion console settings`): the banner alone
+/// before signing in, as the sign-in page shows it; all of them after.
+async fn console_settings(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+) -> Result<Response, Refused> {
+    let settings = crate::console::settings(&g.0.api.store)?;
+    let signed_in = match cookie(&headers) {
+        Some(session) => crate::console::session(&g.0.api.store, &session)?.is_some(),
+        None => false,
+    };
+    let settings = if signed_in {
+        settings
+    } else {
+        settings.public()
+    };
+    Ok(Json(settings).into_response())
+}
+
+/// `legion console configure`, the cluster admin only: the settings as
+/// now set.
+async fn set_console_settings(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(body): Json<legion_api::console::Settings>,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    let r = ClusterClient::new(channel)
+        .set_console_settings(pb::SetConsoleSettingsRequest {
+            settings_json: serde_json::to_vec(&body).expect("serialises"),
+        })
+        .await?
+        .into_inner();
+    let set: legion_api::console::Settings =
+        serde_json::from_slice(&r.settings_json).map_err(|e| bad_request(e.to_string()))?;
+    Ok(Json(set).into_response())
 }
 
 #[derive(Deserialize)]
