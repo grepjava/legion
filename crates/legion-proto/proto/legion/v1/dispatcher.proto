@@ -194,6 +194,15 @@ message HeartbeatRequest {
   // What the node's running tasks use, when the agent has read it since
   // its last heartbeat; the autoscaler works from it.
   repeated TaskUsage usage = 2;
+  // The CARP state of each load balancer address the node took up, as
+  // last read; which node holds each.
+  repeated CarpState carp = 3;
+}
+
+message CarpState {
+  string address = 1;
+  // master, backup or init.
+  string state = 2;
 }
 
 message TaskUsage {

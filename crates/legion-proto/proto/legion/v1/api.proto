@@ -159,6 +159,11 @@ service Cluster {
   // tasks of every other namespace, the ports of each service it may
   // reach. For any caller who may read the namespace's services.
   rpc Reach(ReachRequest) returns (ReachResponse);
+  // A namespace's load balancer addresses: for each, the nodes that may
+  // hold it, by CARP skew (the lowest the master meant), and the CARP
+  // state each last reported, which says which holds it. For any caller
+  // who may read the namespace's services; answered by the leader.
+  rpc LoadBalancers(LoadBalancersRequest) returns (LoadBalancersResponse);
   // The audit events the filter matches, oldest first, at most `limit`
   // (1000 when 0): the cluster admin's only (legion_api::audit).
   rpc Audit(AuditRequest) returns (AuditResponse);
@@ -382,6 +387,31 @@ message ReachResponse {
   repeated string services = 1;
   // One per source and destination that it may reach on some port.
   repeated ReachEdge edges = 2;
+}
+
+message LoadBalancersRequest {
+  string namespace = 1;
+}
+
+message LoadBalancersResponse {
+  // By service name.
+  repeated LoadBalancer balancers = 1;
+}
+
+message LoadBalancer {
+  string service = 1;
+  string address = 2;
+  uint32 vhid = 3;
+  // By skew, lowest first.
+  repeated LoadBalancerNode nodes = 4;
+}
+
+message LoadBalancerNode {
+  string node = 1;
+  uint32 skew = 2;
+  // master, backup or init, as the node last reported in its heartbeats;
+  // empty when it did not (a node down, or of a build before reports).
+  string state = 3;
 }
 
 message ReachEdge {

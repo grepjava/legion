@@ -1263,8 +1263,8 @@ impl Dispatcher for DispatcherService {
         let issuer = self.caller_ca(&req);
         if let Some(mut leader) = self.leader(&req)? {
             let worker = self.worker(&req)?;
-            let usage = req.into_inner().usage;
-            let mut forwarded = to_leader(HeartbeatRequest { node, usage }, &worker)?;
+            let HeartbeatRequest { usage, carp, .. } = req.into_inner();
+            let mut forwarded = to_leader(HeartbeatRequest { node, usage, carp }, &worker)?;
             if let Some(issuer) = issuer.and_then(|i| i.parse().ok()) {
                 forwarded.metadata_mut().insert(FORWARDED_CA, issuer);
             }
@@ -1280,7 +1280,16 @@ impl Dispatcher for DispatcherService {
                 "this manager has not heard from a majority of managers lately; retry",
             ));
         }
-        let reported = req.into_inner().usage;
+        let HeartbeatRequest {
+            usage: reported,
+            carp,
+            ..
+        } = req.into_inner();
+        self.api.balancers.record(
+            &node,
+            carp.into_iter()
+                .filter_map(|c| Some((c.address.parse().ok()?, c.state))),
+        );
         // Believed only of tasks placed on the node.
         let runs_on = |task: &str| {
             let Some((namespace, name)) = task.split_once('/') else {

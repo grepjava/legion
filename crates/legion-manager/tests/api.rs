@@ -1533,6 +1533,7 @@ async fn a_removed_worker_stays_out_until_it_joins_again() {
         d.heartbeat(HeartbeatRequest {
             node: String::new(),
             usage: Vec::new(),
+            ..Default::default()
         })
         .await
     };
@@ -1623,6 +1624,7 @@ async fn a_removed_worker_stays_out_until_it_joins_again() {
         let mut req = tonic::Request::new(HeartbeatRequest {
             node: "w1".into(),
             usage: Vec::new(),
+            ..Default::default()
         });
         let md = req.metadata_mut();
         md.insert("legion-forwarded-worker", "w1".parse().unwrap());
@@ -2022,6 +2024,76 @@ async fn workers_follow_their_work_through_any_manager() {
     assert!(registered.pod_cidr.starts_with("10.200."), "{registered:?}");
     assert_eq!(node_state(&first, "w1").as_deref(), Some("ready"));
 
+    // Its heartbeat through the follower reports holding front's load
+    // balancer address as CARP master; the leader keeps it, and says so
+    // asked through either manager.
+    apply_json(
+        &first,
+        "Service",
+        "front",
+        serde_json::json!({
+            "replicas": 0,
+            "pod": { "containers": [{
+                "name": "front", "image": "web:1", "ports": [{ "containerPort": 8080 }],
+            }] },
+            "endpoint": {
+                "ports": [{ "port": 80, "targetPort": 8080 }],
+                "loadBalancer": { "address": "192.0.2.250", "vhid": 77 },
+            },
+        }),
+    )
+    .await;
+    d1.clone()
+        .heartbeat(HeartbeatRequest {
+            node: String::new(),
+            carp: vec![legion_proto::v1::CarpState {
+                address: "192.0.2.250".into(),
+                state: "master".into(),
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    for m in [&first, &follower] {
+        let channel = m.channel(Some(&admin)).await.unwrap();
+        let r = eventually(|| {
+            let mut c = ClusterClient::new(channel.clone());
+            async move {
+                c.load_balancers(legion_proto::v1::LoadBalancersRequest {
+                    namespace: "default".into(),
+                })
+                .await
+            }
+        })
+        .await
+        .into_inner();
+        assert_eq!(r.balancers.len(), 1, "{r:?}");
+        let front = &r.balancers[0];
+        assert_eq!(
+            (front.service.as_str(), front.address.as_str(), front.vhid),
+            ("front", "192.0.2.250", 77)
+        );
+        assert_eq!(front.nodes.len(), 1, "{front:?}");
+        assert_eq!(
+            (front.nodes[0].node.as_str(), front.nodes[0].state.as_str()),
+            ("w1", "master"),
+            "{front:?}"
+        );
+    }
+    first
+        .objects()
+        .await
+        .delete(DeleteRequest {
+            r#ref: Some(ObjectRef {
+                kind: "Service".into(),
+                namespace: String::new(),
+                name: "front".into(),
+            }),
+            expected_version: None,
+        })
+        .await
+        .unwrap();
+
     // A worker acts only for itself, and admins do not dispatch.
     let err = d1
         .clone()
@@ -2366,6 +2438,7 @@ async fn usage_shows_what_the_caller_may_read() {
             d.heartbeat(HeartbeatRequest {
                 node: String::new(),
                 usage,
+                ..Default::default()
             })
             .await
         }
@@ -3395,6 +3468,7 @@ async fn a_leader_cut_off_from_a_majority_answers_no_heartbeats() {
                 .heartbeat(HeartbeatRequest {
                     node: "w1".into(),
                     usage: Vec::new(),
+                    ..Default::default()
                 })
                 .await
                 .map(drop)
@@ -4533,6 +4607,7 @@ async fn a_users_session_ends_when_their_binding_goes() {
                     .heartbeat(HeartbeatRequest {
                         node: String::new(),
                         usage: Vec::new(),
+                        ..Default::default()
                     })
                     .await;
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -4942,6 +5017,7 @@ async fn revocation_holds_through_a_follower() {
             d.heartbeat(HeartbeatRequest {
                 node: String::new(),
                 usage: Vec::new(),
+                ..Default::default()
             })
             .await
         }
@@ -5790,6 +5866,7 @@ async fn a_build_runs_on_a_builder_node_and_rolls_out() {
                     .heartbeat(HeartbeatRequest {
                         node: String::new(),
                         usage: Vec::new(),
+                        ..Default::default()
                     })
                     .await;
                 tokio::time::sleep(Duration::from_millis(500)).await;

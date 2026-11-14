@@ -63,6 +63,9 @@ pub struct ApiService {
     pub(crate) speaking: crate::upgrade::Speaking,
     /// The CA each node's certificate was of at its last heartbeat here.
     pub(crate) ca_seen: crate::ca::Seen,
+    /// The CARP state of each load balancer address, as each node's
+    /// heartbeats here report it.
+    pub(crate) balancers: std::sync::Arc<crate::balancers::Held>,
     /// The restarts this manager has seen, for its alerts.
     pub(crate) alerts: std::sync::Arc<crate::alerts::State>,
     /// The logs of the builds this manager runs as leader.
@@ -1324,6 +1327,77 @@ impl Cluster for ApiService {
             })
             .collect();
         Ok(Response::new(pb::ReachResponse { services, edges }))
+    }
+
+    async fn load_balancers(
+        &self,
+        req: Request<pb::LoadBalancersRequest>,
+    ) -> Result<Response<pb::LoadBalancersResponse>, Status> {
+        let caller = self.caller(&req)?;
+        let namespace = req.get_ref().namespace.clone();
+        if namespace.is_empty() {
+            return Err(Status::invalid_argument("which namespace?"));
+        }
+        check_namespace(&namespace)?;
+        // Only the leader hears heartbeats; it checks the user's rights.
+        if let Some(addr) = self.leader_addr(&req)? {
+            let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                &addr,
+                self.peer_tls.as_ref(),
+            ));
+            return c
+                .load_balancers(forwarded_for(req.into_inner(), &caller)?)
+                .await;
+        }
+        self.consistent().await?;
+        caller.check(&self.store, Verb::Read, Kind::Service, &namespace)?;
+        let all = |kind| -> Result<BTreeMap<ObjectKey, Object>, Status> {
+            Ok(self
+                .store
+                .list(kind, None)
+                .map_err(internal)?
+                .objects
+                .into_iter()
+                .map(|o| (o.key(), o))
+                .collect())
+        };
+        let services: BTreeMap<ObjectKey, Object> = all(Kind::Service)?
+            .into_iter()
+            .filter(|(k, _)| k.namespace == namespace)
+            .collect();
+        // The nodes that may hold each address, as the dispatcher gives
+        // them out; tasks don't matter to that.
+        let endpoints =
+            crate::dispatcher::endpoints(&services, &BTreeMap::new(), &all(Kind::Node)?);
+        let reported = self.balancers.fresh();
+        let mut balancers: Vec<pb::LoadBalancer> = endpoints
+            .into_iter()
+            .filter_map(|e| {
+                let lb = e.load_balancer?;
+                let mut nodes: Vec<pb::LoadBalancerNode> = lb
+                    .skews
+                    .iter()
+                    .map(|(node, skew)| pb::LoadBalancerNode {
+                        node: node.clone(),
+                        skew: (*skew).into(),
+                        state: reported
+                            .get(node)
+                            .and_then(|r| r.get(&lb.address))
+                            .cloned()
+                            .unwrap_or_default(),
+                    })
+                    .collect();
+                nodes.sort_by_key(|n| n.skew);
+                Some(pb::LoadBalancer {
+                    service: e.name,
+                    address: lb.address.to_string(),
+                    vhid: lb.vhid.into(),
+                    nodes,
+                })
+            })
+            .collect();
+        balancers.sort_by(|a, b| a.service.cmp(&b.service));
+        Ok(Response::new(pb::LoadBalancersResponse { balancers }))
     }
 
     async fn usage(

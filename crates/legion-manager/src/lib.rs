@@ -14,6 +14,7 @@ mod api;
 mod audit;
 mod authz;
 pub mod autolock;
+mod balancers;
 mod build;
 pub mod ca;
 pub mod console;
@@ -397,6 +398,7 @@ impl Manager {
             protocol: self.protocol,
             speaking: self.speaking.clone(),
             ca_seen: Default::default(),
+            balancers: Default::default(),
             alerts: Default::default(),
             builds: Default::default(),
         };
