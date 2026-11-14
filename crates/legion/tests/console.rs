@@ -581,6 +581,12 @@ spec:
     a.fill("Banner level", "warning");
     a.click("Save");
     a.shows("Saved.", 30);
+    let saved = c.lab.ok(&["console", "settings"]);
+    assert!(
+        saved.contains("name: lab"),
+        "the settings saved: {saved}; the form holds {}",
+        a.eval("H.field('Cluster name').value")
+    );
     c.page(&mut e, "/k/Service");
     e.shows("The lab cluster", 30);
     e.until("the page's title names the page and the cluster", 30, |b| {
