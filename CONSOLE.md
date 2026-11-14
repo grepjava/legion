@@ -434,9 +434,20 @@ editor's pages show, titled by page and cluster; the keyboard reaches the
 skip link first and moves along an object's tabs; a plugin in team-a is
 listed, sandboxed, and reads team-a's Services through the console as the
 editor; axe on every page. The settings form taking input before it had
-read the settings, which then replaced it, was found there. Not in the lab
-yet: a second cluster, and single sign-on with a real provider (the
-"done when").
+read the settings, which then replaced it, was found there.
+
+**Done when: met** (`the_console_spans_two_clusters_by_single_sign_on`,
+passed on d38c10d). Two clusters of one node each, east and west, each its
+own console, known to the browser by name on one site; an identity
+provider the test plays as a company's would be to a browser (a sign-in
+page with a session of its own, the code flow with PKCE, ES256 ID tokens),
+with a client for each console; the group shop-team bound to edit in east
+and view in west. alice signs in to east through the provider, typing her
+name there; east's Clusters page shows west not signed into; she signs in
+to west with one click, the provider remembering her; then each console's
+Clusters page shows both clusters with her access in each. The provider is
+the test's own, not a product (Dex, Keycloak), which would be one more
+package on the lab's image.
 
 **Translations** (the mechanism; no language but English yet). The console
 is written in English and every string a person reads goes through `t()`,
