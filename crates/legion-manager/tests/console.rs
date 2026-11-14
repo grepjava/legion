@@ -633,6 +633,80 @@ async fn the_console_writes_as_its_user() {
         back.text
     );
 
+    // Restarted: a new pod, the same spec otherwise; twice, two restarts.
+    let mut restarts = Vec::new();
+    for _ in 0..2 {
+        let restarted = write(
+            "POST",
+            "/api/restart".into(),
+            Some(serde_json::json!({ "namespace": "shop", "service": "web" })),
+        )
+        .await;
+        assert_eq!(restarted.status, 200, "{}", restarted.text);
+        assert!(
+            restarted.body["message"]
+                .as_str()
+                .unwrap()
+                .contains("restarting"),
+            "{}",
+            restarted.text
+        );
+        let got = write("GET", "/api/objects/Service/shop/web".into(), None).await;
+        assert_eq!(got.body["spec"]["replicas"], 3, "{}", got.text);
+        restarts.push(got.body["spec"]["pod"]["restartedAt"].clone());
+    }
+    assert!(restarts[0].is_string(), "{restarts:?}");
+    assert_ne!(restarts[0], restarts[1]);
+
+    // A CronJob run now, as the Job its schedule would make this minute;
+    // a second within the minute refused.
+    let nightly = serde_json::json!({
+        "apiVersion": "legion/v1", "kind": "CronJob",
+        "metadata": { "name": "nightly", "namespace": "shop" },
+        "spec": {
+            "schedule": "0 3 * * *",
+            "job": { "pod": { "containers": [{ "name": "run", "image": "web:1" }] } },
+        },
+    });
+    let created = write(
+        "POST",
+        "/api/apply".into(),
+        Some(serde_json::json!({ "object": nightly })),
+    )
+    .await;
+    assert_eq!(created.status, 200, "{}", created.text);
+    let run = serde_json::json!({ "namespace": "shop", "cronJob": "nightly" });
+    let ran = write("POST", "/api/run-now".into(), Some(run.clone())).await;
+    assert_eq!(ran.status, 200, "{}", ran.text);
+    let job = ran.body["message"]
+        .as_str()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert!(job.starts_with("nightly-"), "{}", ran.text);
+    let got = write("GET", format!("/api/objects/Job/shop/{job}"), None).await;
+    assert_eq!(got.status, 200, "{}", got.text);
+    assert_eq!(
+        got.body["metadata"]["labels"]["legion.cronjob"], "nightly",
+        "{}",
+        got.text
+    );
+    let again = write("POST", "/api/run-now".into(), Some(run)).await;
+    // Unless the minute turned between the two.
+    if again.status != 200 {
+        assert_eq!(again.status, 409, "{}", again.text);
+        assert!(
+            again.text.contains("already ran this minute"),
+            "{}",
+            again.text
+        );
+    }
+
     // Bob may only look; and alice's token is not his. (A change, since
     // asking for what is already there writes nothing.)
     let (bob, bob_token) = sign_in(&f, "bob").await;

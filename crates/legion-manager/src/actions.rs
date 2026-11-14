@@ -161,6 +161,78 @@ pub async fn rollback(
     }
 }
 
+/// `legion restart`: a Service's tasks replaced, as an update replaces
+/// them, by giving its pod a new `restartedAt`; what was done, for the
+/// user.
+pub async fn restart(
+    api: &mut impl ObjectsApi,
+    namespace: String,
+    service: String,
+) -> Result<String, Status> {
+    let r#ref = ObjectRef {
+        kind: Kind::Service.to_string(),
+        namespace,
+        name: service,
+    };
+    loop {
+        let mut object = read(api.get(r#ref.clone()).await?)?;
+        let last = object.spec["pod"]["restartedAt"]
+            .as_str()
+            .and_then(legion_api::clock::parse);
+        // Two restarts within a second are two restarts.
+        let at = last.map_or(legion_api::clock::now(), |l| {
+            legion_api::clock::now().max(l + 1)
+        });
+        object.spec["pod"]["restartedAt"] = legion_api::clock::format(at).into();
+        if let Some(resp) = write_over(api, &object).await? {
+            return Ok(format!(
+                "{} restarting (version {})",
+                object.key(),
+                resp.object.unwrap_or_default().version
+            ));
+        }
+    }
+}
+
+/// `legion cronjob run`: a run of a CronJob now, outside its schedule, as
+/// the Job its schedule would make this minute (which a run due this
+/// minute then counts as its own); what was done, for the user. Its
+/// suspension and concurrency policy are the schedule's, not this.
+pub async fn run_now(
+    api: &mut impl ObjectsApi,
+    namespace: String,
+    cron_job: String,
+) -> Result<String, Status> {
+    let cron = read(
+        api.get(ObjectRef {
+            kind: Kind::CronJob.to_string(),
+            namespace,
+            name: cron_job,
+        })
+        .await?,
+    )?;
+    let spec: legion_api::job::CronJobSpec = serde_json::from_value(cron.spec.clone())
+        .map_err(|e| Status::internal(format!("{}: {e}", cron.key())))?;
+    let job = spec.run(&cron, legion_api::clock::now());
+    match api
+        .apply(ApplyRequest {
+            object: Some((&job).into()),
+            // Made only: a run this minute is not written over.
+            expected_version: Some(0),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(_) => Ok(format!("{} started, for {}", job.key(), cron.key())),
+        Err(s) if s.code() == tonic::Code::Aborted => Err(Status::already_exists(format!(
+            "{} already ran this minute, as {}",
+            cron.key(),
+            job.key()
+        ))),
+        Err(s) => Err(s),
+    }
+}
+
 /// A user made by `create_user`: their credentials, and what became of the
 /// RoleBinding asked for with them.
 pub struct NewUser {

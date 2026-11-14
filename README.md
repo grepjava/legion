@@ -170,6 +170,7 @@ warning, or refused with `--strict`:
 legion stack deploy shop -c compose.yaml
 legion stack convert shop -c compose.yaml   # the Legion YAML it becomes
 legion rollback web -n shop                 # undo the latest update
+legion restart web -n shop                  # new tasks, same spec
 legion stack rm shop                        # volumes and their data stay
 ```
 

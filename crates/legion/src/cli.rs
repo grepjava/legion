@@ -859,6 +859,28 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 rollback(&mut objects, namespace.unwrap_or_default(), service).await?
             );
         }
+        Command::Restart { service, namespace } => {
+            let done = legion_manager::actions::restart(
+                &mut objects,
+                namespace.unwrap_or_default(),
+                service,
+            )
+            .await
+            .map_err(|s| anyhow::anyhow!("{}", s.message()))?;
+            println!("{done}");
+        }
+        Command::Cronjob {
+            command: crate::CronJobCommand::Run { cronjob, namespace },
+        } => {
+            let done = legion_manager::actions::run_now(
+                &mut objects,
+                namespace.unwrap_or_default(),
+                cronjob,
+            )
+            .await
+            .map_err(|s| anyhow::anyhow!("{}", s.message()))?;
+            println!("{done}");
+        }
         Command::Reach { namespace } => {
             let namespace = namespace.unwrap_or_else(|| "default".into());
             let r = cluster

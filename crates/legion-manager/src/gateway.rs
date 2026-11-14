@@ -197,6 +197,8 @@ fn router(gateway: Gateway) -> axum::Router {
         .route("/api/set", post(set_field))
         .route("/api/labels", post(labels))
         .route("/api/rollback", post(rollback))
+        .route("/api/restart", post(restart))
+        .route("/api/run-now", post(run_now))
         .route("/api/node-role", post(node_role))
         .route("/api/exec/{namespace}/{task}", get(exec))
         // Cluster operations (CONSOLE.md phase 3); the API lets only
@@ -1728,6 +1730,40 @@ async fn rollback(
     let channel = g.writer(&headers, &uri, None).await?;
     let message =
         crate::actions::rollback(&mut objects_client(channel), body.namespace, body.service)
+            .await?;
+    Ok(Json(serde_json::json!({ "message": message })).into_response())
+}
+
+/// `legion restart`: a Service's tasks replaced on the same spec.
+async fn restart(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(body): Json<RollbackBody>,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    let message =
+        crate::actions::restart(&mut objects_client(channel), body.namespace, body.service).await?;
+    Ok(Json(serde_json::json!({ "message": message })).into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunNowBody {
+    namespace: String,
+    cron_job: String,
+}
+
+/// `legion cronjob run`: a CronJob's run now, outside its schedule.
+async fn run_now(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(body): Json<RunNowBody>,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    let message =
+        crate::actions::run_now(&mut objects_client(channel), body.namespace, body.cron_job)
             .await?;
     Ok(Json(serde_json::json!({ "message": message })).into_response())
 }

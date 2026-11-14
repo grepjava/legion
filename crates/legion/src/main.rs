@@ -376,6 +376,19 @@ enum Command {
         #[arg(short, long)]
         namespace: Option<String>,
     },
+    /// Replace a service's tasks with new ones on the same spec, as an
+    /// update replaces them, under its update config: its pod's
+    /// `restartedAt` set to now.
+    Restart {
+        service: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// CronJobs: a run now.
+    Cronjob {
+        #[command(subcommand)]
+        command: CronJobCommand,
+    },
     /// The audit trail, oldest first: who changed what, opened which
     /// sessions, and what was refused (the cluster admin's only). Events
     /// name objects, never what they hold.
@@ -597,6 +610,19 @@ pub enum NodeCommand {
         node: String,
         #[arg(required = true)]
         labels: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CronJobCommand {
+    /// Run CRONJOB now, outside its schedule: the Job its schedule would
+    /// make this minute, kept in its history. Its suspension and
+    /// concurrency policy are for its schedule; a second run within the
+    /// minute is refused.
+    Run {
+        cronjob: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
     },
 }
 
