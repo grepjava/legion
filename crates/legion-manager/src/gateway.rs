@@ -191,6 +191,8 @@ fn router(gateway: Gateway) -> axum::Router {
             get(console_settings).post(set_console_settings),
         )
         .route("/api/templates", get(templates))
+        .route("/api/plugins", get(plugins))
+        .route("/api/plugin/{namespace}/{name}", get(plugin))
         .route("/api/set", post(set_field))
         .route("/api/labels", post(labels))
         .route("/api/rollback", post(rollback))
@@ -207,26 +209,57 @@ fn router(gateway: Gateway) -> axum::Router {
         .route("/api/volume-backup/{namespace}/{name}", get(volume_backup))
         .route("/api/volume-restore", post(volume_restore))
         .fallback(page)
-        .layer(axum::middleware::map_response(security_headers))
+        .layer(axum::middleware::map_response_with_state(
+            gateway.clone(),
+            security_headers,
+        ))
         .with_state(gateway)
 }
 
-async fn security_headers(mut res: Response) -> Response {
+/// The console's pages' policy, the other clusters' consoles that
+/// settings list added to where they may connect (the Clusters page).
+fn page_policy(peers: &str) -> String {
+    format!(
+        "default-src 'self'; connect-src 'self'{peers}; img-src 'self' data:; \
+         style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; \
+         frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    )
+}
+
+/// What every answer carries, unless it set its own policy (a plugin's
+/// page, CONSOLE.md phase 6).
+async fn security_headers(State(g): State<Gateway>, mut res: Response) -> Response {
+    let html = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/html"));
     let h = res.headers_mut();
     let set = |h: &mut HeaderMap, name: &'static str, value: &'static str| {
         h.insert(name, HeaderValue::from_static(value));
     };
     set(h, "x-content-type-options", "nosniff");
     set(h, "referrer-policy", "no-referrer");
-    set(h, "x-frame-options", "DENY");
-    set(
-        h,
-        "content-security-policy",
-        "default-src 'self'; connect-src 'self'; img-src 'self' data:; \
-         style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; \
-         frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
-    );
     set(h, "strict-transport-security", "max-age=31536000");
+    if h.contains_key(header::CONTENT_SECURITY_POLICY) {
+        return res;
+    }
+    set(h, "x-frame-options", "DENY");
+    let peers: String = match html.then(|| crate::console::settings(&g.0.api.store)) {
+        Some(Ok(s)) => s
+            .clusters
+            .iter()
+            .filter_map(|p| p.origin())
+            .map(|o| format!(" {o}"))
+            .collect(),
+        _ => String::new(),
+    };
+    // The origins were checked when set; should one not make a header
+    // value, the policy is the console's alone.
+    let policy = HeaderValue::from_str(&page_policy(&peers))
+        .or_else(|_| HeaderValue::from_str(&page_policy("")))
+        .expect("ASCII");
+    h.insert(header::CONTENT_SECURITY_POLICY, policy);
     res
 }
 
@@ -1304,6 +1337,78 @@ async fn templates(State(g): State<Gateway>, headers: HeaderMap) -> Result<Respo
         }));
     }
     Ok(Json(serde_json::json!({ "templates": out })).into_response())
+}
+
+/// A Config labelled so is a plugin's page (CONSOLE.md phase 6).
+const PLUGIN_LABEL: &str = "legion.console-plugin";
+
+/// A plugin page's policy: a sandbox of its own origin (no cookie, no
+/// session, none of the console's storage), reaching no address, framed
+/// by the console alone.
+const PLUGIN_POLICY: &str = "sandbox allow-scripts; default-src 'none'; \
+     script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; \
+     connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'";
+
+/// The plugins in the namespaces the user may read.
+async fn plugins(State(g): State<Gateway>, headers: HeaderMap) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let found = objects_client(channel)
+        .list(pb::ListRequest {
+            kind: legion_api::Kind::Config.as_str().into(),
+            namespace: String::new(),
+            match_labels: [(PLUGIN_LABEL.to_owned(), "page".to_owned())].into(),
+        })
+        .await?
+        .into_inner();
+    let mut found: Vec<_> = found
+        .objects
+        .into_iter()
+        .map(|o| (o.namespace, o.name))
+        .collect();
+    found.sort();
+    let out: Vec<_> = found
+        .into_iter()
+        .map(|(namespace, name)| serde_json::json!({ "namespace": namespace, "name": name }))
+        .collect();
+    Ok(Json(serde_json::json!({ "plugins": out })).into_response())
+}
+
+/// A plugin's page, read as the user, under its own policy.
+async fn plugin(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let o = objects_client(channel)
+        .get(pb::ObjectRef {
+            kind: legion_api::Kind::Config.as_str().into(),
+            namespace,
+            name,
+        })
+        .await?
+        .into_inner();
+    let not_one = || Refused(StatusCode::NOT_FOUND, "no such plugin".into());
+    if o.labels.get(PLUGIN_LABEL).map(String::as_str) != Some("page") {
+        return Err(not_one());
+    }
+    let page = serde_json::from_slice::<legion_api::data::DataSpec>(&o.spec_json)
+        .ok()
+        .and_then(|s| s.bytes().ok())
+        .ok_or_else(not_one)?;
+    let mut res = page.into_response();
+    let h = res.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(PLUGIN_POLICY),
+    );
+    h.insert("x-frame-options", HeaderValue::from_static("SAMEORIGIN"));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(res)
 }
 
 fn bad_request(message: impl Into<String>) -> Refused {

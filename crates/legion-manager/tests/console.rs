@@ -24,6 +24,8 @@ struct Response {
     location: Option<String>,
     /// The page origin allowed to read the answer across origins.
     allow_origin: Option<String>,
+    /// The answer's `Content-Security-Policy`.
+    policy: Option<String>,
     body: serde_json::Value,
     text: String,
 }
@@ -137,6 +139,10 @@ async fn request(
         .headers()
         .get("access-control-allow-origin")
         .map(|v| v.to_str().unwrap().to_owned());
+    let policy = res
+        .headers()
+        .get("content-security-policy")
+        .map(|v| v.to_str().unwrap().to_owned());
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8_lossy(&bytes).into_owned();
     Response {
@@ -145,6 +151,7 @@ async fn request(
         cookies,
         location,
         allow_origin,
+        policy,
         body: serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
         text,
     }
@@ -1264,6 +1271,133 @@ async fn the_consoles_of_listed_clusters_see_who_is_signed_in() {
         let _ = f.stop.send(());
         f.task.await.unwrap();
     }
+}
+
+/// Plugins (CONSOLE.md phase 6): a Config labelled as one is a page the
+/// console lists in the namespaces the user reads, served under a policy
+/// that fences it in. The console's own pages may reach the clusters the
+/// settings list, and no other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_console_serves_plugins_fenced_in() {
+    use legion_proto::v1::SetConsoleSettingsRequest;
+    let f = start().await;
+    let page = "<!doctype html><title>Status</title><p>hello</p>";
+    let mut objects = ObjectsClient::new(f.admin.clone());
+    for ns in ["shop", "other"] {
+        objects
+            .apply(object("Namespace", "", ns, serde_json::json!({})))
+            .await
+            .unwrap();
+    }
+    objects
+        .apply(object(
+            "RoleBinding",
+            "shop",
+            "alice",
+            serde_json::json!({ "user": "alice", "role": "view" }),
+        ))
+        .await
+        .unwrap();
+    for (ns, name, labelled) in [
+        ("shop", "status", true),
+        ("shop", "plain", false),
+        ("other", "hidden", true),
+    ] {
+        let mut req = object("Config", ns, name, serde_json::json!({ "text": page }));
+        if labelled {
+            req.object.as_mut().unwrap().labels =
+                [("legion.console-plugin".to_owned(), "page".to_owned())].into();
+        }
+        objects.apply(req).await.unwrap();
+    }
+    let alice = sign_in(&f, "alice").await;
+    let console = f.console_addr.to_string();
+    let get = |path: &str| {
+        let (ca, console, cookie) = (&f.ca, &console, alice.0.clone());
+        let path = path.to_owned();
+        async move { https(ca, console, "GET", &path, Some(&cookie), None, None).await }
+    };
+
+    // Listed where she reads: shop's, not other's, not an unlabelled Config.
+    let r = get("/api/plugins").await;
+    assert_eq!(
+        r.body["plugins"],
+        serde_json::json!([{ "namespace": "shop", "name": "status" }]),
+        "{}",
+        r.text
+    );
+
+    // The page, in a sandbox of its own that reaches nothing.
+    let r = get("/api/plugin/shop/status").await;
+    assert_eq!((r.status, r.text.as_str()), (200, page));
+    let policy = r.policy.unwrap();
+    for part in [
+        "sandbox allow-scripts;",
+        "default-src 'none'",
+        "connect-src 'none'",
+        "frame-ancestors 'self'",
+    ] {
+        assert!(policy.contains(part), "{policy}");
+    }
+    assert!(!policy.contains("allow-same-origin"), "{policy}");
+    assert_eq!(get("/api/plugin/shop/plain").await.status, 404);
+    assert_eq!(get("/api/plugin/other/hidden").await.status, 403);
+
+    // The example applies as it is, and is a plugin.
+    let root = sign_in_as(&f, "root", Role::Admin).await;
+    let r = request(
+        &f.ca,
+        &console,
+        false,
+        "POST",
+        "/api/apply",
+        Some(&root.0),
+        Some(&format!("https://{console}")),
+        Some(serde_json::json!({
+            "yaml": include_str!("../../../examples/console-plugin/plugin.yaml"),
+        })),
+        &[("x-legion-csrf", &root.1)],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let r = https(
+        &f.ca,
+        &console,
+        "GET",
+        "/api/plugin/default/services-at-a-glance",
+        Some(&root.0),
+        None,
+        None,
+    )
+    .await;
+    assert!(r.text.contains("Services at a glance"), "{}", r.text);
+
+    // The console's pages: their own origin, and the listed clusters'.
+    let r = get("/").await;
+    let policy = r.policy.unwrap();
+    assert!(policy.contains("connect-src 'self';"), "{policy}");
+    assert!(policy.contains("frame-ancestors 'none'"), "{policy}");
+    ClusterClient::new(f.admin.clone())
+        .set_console_settings(SetConsoleSettingsRequest {
+            settings_json: serde_json::json!({
+                "clusters": [{ "name": "west", "url": "https://west.example:7480/k" }],
+            })
+            .to_string()
+            .into_bytes(),
+        })
+        .await
+        .unwrap();
+    let policy = get("/").await.policy.unwrap();
+    assert!(
+        policy.contains("connect-src 'self' https://west.example:7480;"),
+        "{policy}"
+    );
+    // Not on the API's answers, which are not pages.
+    let policy = get("/api/plugins").await.policy.unwrap();
+    assert!(policy.contains("connect-src 'self';"), "{policy}");
+
+    let _ = f.stop.send(());
+    f.task.await.unwrap();
 }
 
 /// Single sign-on (CONSOLE.md phase 6), against a provider this test plays:
