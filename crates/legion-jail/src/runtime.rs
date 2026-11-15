@@ -2073,20 +2073,12 @@ impl legion_runtime::Runtime for JailRuntime {
                 if !db.join("local.sqlite").exists() {
                     return Ok(Vec::new());
                 }
-                // A copy, writable, as this host's pkg upgrades an older
-                // image's schema before reading it; the layer is read-only.
+                // Read as a copy, as `pkg shell` makes a database where
+                // there is none and the layer is never written.
                 let copy = tempfile::tempdir()?;
                 copy_package_db(&db, copy.path())?;
-                let out = pkg_query(copy.path())
-                    .stdin(std::process::Stdio::null())
-                    .output()?;
-                if !out.status.success() {
-                    return Err(legion_image::Error::Unsupported(format!(
-                        "pkg query: {}",
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    )));
-                }
-                Ok(String::from_utf8_lossy(&out.stdout)
+                let out = read_packages(copy.path())?;
+                Ok(String::from_utf8_lossy(&out)
                     .lines()
                     .filter_map(|l| l.split_once('\t'))
                     .map(|(n, v)| (n.to_owned(), v.to_owned()))
@@ -2242,14 +2234,51 @@ fn copy_package_db(db: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `pkg query` of each package's name and version in the database in
-/// `dbdir`.
-fn pkg_query(dbdir: &Path) -> std::process::Command {
+/// What [`pkg_shell`] is given: each package's name and version, a line
+/// each, tab between.
+const PACKAGES_SQL: &str = ".mode tabs\nSELECT name, version FROM packages ORDER BY name;\n";
+
+/// `pkg shell` on the database in `dbdir`: SQLite itself, as `pkg query`
+/// fails on a database of an older schema than this host's pkg knows
+/// (no `flavors` table) and doesn't bring it up to date. The `packages`
+/// table's name and version columns are in every schema.
+fn pkg_shell(dbdir: &Path) -> std::process::Command {
     let mut c = std::process::Command::new("pkg");
     c.arg("-o")
         .arg(format!("PKG_DBDIR={}", dbdir.display()))
-        .args(["query", "%n\t%v"]);
+        .arg("shell");
     c
+}
+
+/// Each package's `name\tversion` in the database in `dbdir`, a line each.
+/// SQLite says what went wrong on standard error ("Parse error", "Runtime
+/// error") and may exit 0 anyway; pkg may write other lines there.
+fn read_packages(dbdir: &Path) -> std::result::Result<Vec<u8>, legion_image::Error> {
+    use std::io::Write;
+    let mut child = pkg_shell(dbdir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("piped")
+        .write_all(PACKAGES_SQL.as_bytes())?;
+    let out = child.wait_with_output()?;
+    let err = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() || sqlite_failed(&err) {
+        return Err(legion_image::Error::Unsupported(format!(
+            "pkg shell: {}",
+            err.trim()
+        )));
+    }
+    Ok(out.stdout)
+}
+
+/// Whether SQLite's standard error says a statement failed.
+fn sqlite_failed(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("error")
 }
 
 #[cfg(test)]
@@ -2275,12 +2304,16 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["local.sqlite", "local.sqlite-wal"]);
-        let q = pkg_query(copy.path());
+        let q = pkg_shell(copy.path());
         let args: Vec<_> = q.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert_eq!(
             args,
-            ["-o", &format!("PKG_DBDIR={}", copy.path().display()), "query", "%n\t%v"]
+            ["-o", &format!("PKG_DBDIR={}", copy.path().display()), "shell"]
         );
+        assert!(PACKAGES_SQL.contains("SELECT name, version FROM packages"));
+        // What SQLite writes when the statement fails; pkg's own lines pass.
+        assert!(sqlite_failed("Parse error near line 2: no such table: packages"));
+        assert!(!sqlite_failed("pkg: DEBUG: -/-\n"));
     }
 
     #[tokio::test]
