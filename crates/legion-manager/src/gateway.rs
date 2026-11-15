@@ -176,6 +176,7 @@ fn router(gateway: Gateway) -> axum::Router {
         .route("/api/watch/{kind}", get(watch))
         .route("/api/usage", get(usage))
         .route("/api/alerts", get(alerts))
+        .route("/api/events", get(events))
         .route("/api/usage-history", get(usage_history))
         .route("/api/quotas", get(quotas))
         .route("/api/log-search", get(log_search))
@@ -810,6 +811,73 @@ async fn relay_alerts(mut socket: WebSocket, mut stream: tonic::Streaming<pb::Al
                 })).collect::<Vec<_>>()
             }),
             Ok(None) => serde_json::json!({ "error": "the alerts ended" }),
+            Err(s) => serde_json::json!({ "error": s.message() }),
+        };
+        let end = text.get("error").is_some();
+        if socket
+            .send(Message::Text(text.to_string().into()))
+            .await
+            .is_err()
+            || end
+        {
+            return;
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct EventsQuery {
+    namespace: Option<String>,
+    kind: Option<String>,
+    name: Option<String>,
+}
+
+/// `Cluster.Events` followed, as the user: JSON text messages `{events:
+/// [...]}`, those kept first, then each as it comes, or `{error}` as the
+/// last.
+async fn events(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(q): Query<EventsQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, Refused> {
+    same_origin(&headers, &uri)?;
+    let (_, channel) = g.user(&headers).await?;
+    let stream = ClusterClient::new(channel)
+        .events(pb::EventsRequest {
+            namespace: q.namespace.unwrap_or_default(),
+            kind: q.kind.unwrap_or_default(),
+            name: q.name.unwrap_or_default(),
+            follow: true,
+        })
+        .await?
+        .into_inner();
+    Ok(ws.on_upgrade(move |socket| relay_events(socket, stream)))
+}
+
+async fn relay_events(mut socket: WebSocket, mut stream: tonic::Streaming<pb::EventsResponse>) {
+    loop {
+        let next = tokio::select! {
+            r = stream.message() => r,
+            m = socket.recv() => match m {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                _ => continue,
+            },
+        };
+        let text = match next {
+            Ok(Some(r)) => serde_json::json!({
+                "events": r.events.iter().map(|e| serde_json::json!({
+                    "at_ms": e.at_ms,
+                    "kind": e.kind,
+                    "namespace": e.namespace,
+                    "name": e.name,
+                    "reason": e.reason,
+                    "message": e.message,
+                    "owner": e.owner,
+                })).collect::<Vec<_>>()
+            }),
+            Ok(None) => serde_json::json!({ "error": "the events ended" }),
             Err(s) => serde_json::json!({ "error": s.message() }),
         };
         let end = text.get("error").is_some();

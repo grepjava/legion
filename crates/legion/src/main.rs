@@ -459,6 +459,17 @@ enum Command {
     /// A namespace's load balancer addresses and which node holds each:
     /// the nodes that may, by CARP skew (the lowest meant to be master),
     /// each with the CARP state it last reported.
+    /// What happened to objects lately, oldest first, as the manager asked
+    /// saw it (kept in its memory for an hour): a namespace's, or one
+    /// object's (`service/web` with its tasks'; `node/n1`). `-w` follows.
+    Events {
+        /// `kind/name`, or a kind (`tasks`, `node`) for all of it.
+        object: Option<String>,
+        #[arg(short, long)]
+        namespace: Option<String>,
+        #[arg(short, long)]
+        watch: bool,
+    },
     #[command(name = "load-balancers", alias = "lb")]
     LoadBalancers {
         #[arg(short, long)]

@@ -919,6 +919,58 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 print_table(["FROM", "TO", "PORTS"], &rows);
             }
         }
+        Command::Events {
+            object,
+            namespace,
+            watch,
+        } => {
+            let (kind, name) = match object.as_deref() {
+                None => (None, String::new()),
+                Some(o) => {
+                    let (k, n) = o.split_once('/').unwrap_or((o, ""));
+                    (Some(parse_kind(k)?), n.to_owned())
+                }
+            };
+            let namespace = if kind.is_some_and(legion_api::Kind::is_cluster_scoped) {
+                String::new()
+            } else {
+                namespace.unwrap_or_else(|| "default".into())
+            };
+            let mut stream = cluster
+                .events(pb::EventsRequest {
+                    namespace,
+                    kind: kind.map(|k| k.to_string()).unwrap_or_default(),
+                    name,
+                    follow: watch,
+                })
+                .await?
+                .into_inner();
+            let mut first = true;
+            while let Some(r) = stream.message().await? {
+                let rows: Vec<[String; 4]> = r
+                    .events
+                    .iter()
+                    .map(|e| {
+                        [
+                            legion_api::clock::format(e.at_ms.div_euclid(1000)),
+                            format!("{}/{}", e.kind, e.name),
+                            e.reason.clone(),
+                            e.message.clone(),
+                        ]
+                    })
+                    .collect();
+                if first && rows.is_empty() && !watch {
+                    println!("no events kept");
+                } else if first {
+                    print_table(["TIME", "OBJECT", "REASON", "MESSAGE"], &rows);
+                } else {
+                    for [time, object, reason, message] in rows {
+                        println!("{time}  {object}  {reason}  {message}");
+                    }
+                }
+                first = false;
+            }
+        }
         Command::LoadBalancers { namespace } => {
             let namespace = namespace.unwrap_or_else(|| "default".into());
             let r = cluster
