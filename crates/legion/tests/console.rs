@@ -1158,6 +1158,14 @@ fn the_console_builds_an_example_with_jailer() {
     );
     c.page(&mut e, &format!("/k/Build/shop/{build}?tab=buildlog"));
     e.shows("The build succeeded.", 30);
+    // Pushed, the build's image is gone from jailer's store; its base stays.
+    let images = std::process::Command::new(&jailer)
+        .args(["--state-dir", state.to_str().unwrap(), "--no-zfs", "images"])
+        .output()
+        .expect("jailer images");
+    let images = common::text(&images.stdout);
+    assert!(!images.contains("legion-build/"), "{images}");
+    assert!(images.contains("freebsd-notoolchain"), "{images}");
     wait(
         "web rolled out to the image built, both tasks ready",
         600,
