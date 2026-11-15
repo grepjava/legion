@@ -4810,6 +4810,51 @@ fn a_task_not_yet_started_when_its_namespace_tightens_does_not_start() {
     assert_eq!(t.unwrap().status.message, NO_RAW_SOCKETS);
 }
 
+#[test]
+fn a_stopped_service_runs_nothing_and_starts_again_as_it_was() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    let web = "replicas: 3
+pod: { containers: [{ name: a, image: \"a:1\" }] }";
+    let agent = "mode: global
+pod: { containers: [{ name: a, image: \"a:1\" }] }";
+    w.service("web", web);
+    w.service("agent", agent);
+    w.settle();
+    assert_eq!(w.running().len(), 5);
+
+    // A paused node keeps a global task, but not one of a stopped service.
+    w.availability("n1", Availability::Pause);
+    w.service(
+        "web",
+        &format!(
+            "{web}
+stopped: true"
+        ),
+    );
+    w.service(
+        "agent",
+        &format!(
+            "{agent}
+stopped: true"
+        ),
+    );
+    w.settle();
+    assert!(w.running().is_empty(), "{:?}", w.tasks());
+    assert_eq!(w.status("web").desired, 0);
+    assert_eq!(w.status("agent").desired, 0);
+
+    // Started, it runs as many as before, on the nodes that take them.
+    w.availability("n1", Availability::Active);
+    w.service("web", web);
+    w.service("agent", agent);
+    w.settle();
+    assert_eq!(w.status("web").desired, 3);
+    assert_eq!(w.status("agent").desired, 2);
+    assert_eq!(w.running().len(), 5);
+}
+
 impl World {
     /// One pass of the planner over the world as it is, timed: how long it
     /// took and how many actions it planned.

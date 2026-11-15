@@ -681,6 +681,8 @@ fn service(
 
     let (replicas, autoscale) = autoscale::replicas(s, tasks, &previous, memory, now);
     let wanted: Vec<Slot> = match s.spec.mode {
+        // Stopped: every slot goes, as for a scale to 0.
+        _ if s.spec.stopped => Vec::new(),
         ServiceMode::Global => nodes
             .iter()
             .filter(|n| eligible(n, s, volumes, &shared_volumes(s)).is_ok())
@@ -1491,6 +1493,9 @@ fn kept_global(
     let Slot::Node(name) = slot else {
         return false;
     };
+    if s.spec.stopped {
+        return false;
+    }
     let Some(n) = nodes.iter().find(|n| n.name() == name) else {
         return false;
     };

@@ -40,6 +40,10 @@ pub struct ServiceSpec {
     /// node to make it (DESIGN.md §3.5, Priorities). Default 0.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub priority: i32,
+    /// Stopped: no tasks run, whatever the mode, and the rest of the spec
+    /// (the replica count included) is kept for when it starts again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped: bool,
 }
 
 fn is_zero(n: &i32) -> bool {

@@ -83,6 +83,7 @@ impl Job {
                 max_unavailable: None,
                 // Jobs run at the default priority.
                 priority: 0,
+                stopped: false,
             },
             refused: Default::default(),
             covered: self.covered,
