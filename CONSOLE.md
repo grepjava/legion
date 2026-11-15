@@ -158,7 +158,9 @@ one before, and keeps an hour of them, at most 1000 a namespace
 namespace's or an object's (a Service's or Job's with its tasks'),
 followed with `follow`; `legion events [kind/name] [-w]`; an Events tab on
 those kinds' pages, followed live. A manager knows only what happened
-since it started, and what was there when it first looked is no event.
+since it started, and what was there when it first looked is no event. The
+lab test opens hello's Events tab after its restart and sees the change,
+its new tasks made and running (passed on 07e7fe7).
 Its browser test passes on the lab (see below).
 
 ## Phase 3: cluster operations
