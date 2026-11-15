@@ -707,6 +707,8 @@ spec:
         "/clusters",
         "/k/Service",
         "/k/Service/team-a/hello",
+        "/k/Service/team-a/hello?tab=usage",
+        "/k/Service/team-a/hello?tab=events",
         "/k/Node/_/n1",
         "/plugins/team-a/services-at-a-glance",
     ] {
@@ -731,8 +733,17 @@ spec:
                 violation.as_str().unwrap_or_default()
             ));
         }
+        // What a screen reader is given: Chromium's accessibility tree, each
+        // control named, one top heading, the main landmark.
+        for problem in screen_reader_problems(&mut a) {
+            found.push(format!("{path}: {problem}"));
+        }
     }
-    assert!(found.is_empty(), "axe found:\n{}", found.join("\n"));
+    assert!(
+        found.is_empty(),
+        "axe and the accessibility tree found:\n{}",
+        found.join("\n")
+    );
 
     for s in ["formed", "sleeper"] {
         c.lab.ok(&["delete", "service", s, "-n", "team-a"]);
@@ -1192,4 +1203,52 @@ fn the_console_builds_an_example_with_jailer() {
         eprintln!("ed's pages reported: {:?}", e.errors);
     }
     drop(registry);
+}
+
+/// What the page's accessibility tree, as Chromium gives it to screen
+/// readers, lacks: a name on any control, exactly one level-1 heading, the
+/// main landmark.
+fn screen_reader_problems(b: &mut Browser) -> Vec<String> {
+    const CONTROLS: [&str; 12] = [
+        "button",
+        "link",
+        "textbox",
+        "searchbox",
+        "combobox",
+        "checkbox",
+        "radio",
+        "tab",
+        "spinbutton",
+        "switch",
+        "slider",
+        "menuitem",
+    ];
+    b.page("Accessibility.enable", serde_json::json!({}));
+    let tree = b.page("Accessibility.getFullAXTree", serde_json::json!({}));
+    let nodes = tree["nodes"].as_array().cloned().unwrap_or_default();
+    let mut problems = Vec::new();
+    let mut h1 = 0;
+    let mut main = false;
+    for n in nodes.iter().filter(|n| n["ignored"] != true) {
+        let role = n["role"]["value"].as_str().unwrap_or_default();
+        let name = n["name"]["value"].as_str().unwrap_or_default().trim();
+        if CONTROLS.contains(&role) && name.is_empty() {
+            problems.push(format!("a {role} with no name (node {})", n["nodeId"]));
+        }
+        let level_1 = n["properties"].as_array().is_some_and(|p| {
+            p.iter()
+                .any(|p| p["name"] == "level" && p["value"]["value"] == 1)
+        });
+        if role == "heading" && level_1 {
+            h1 += 1;
+        }
+        main |= role == "main";
+    }
+    if h1 != 1 {
+        problems.push(format!("{h1} level-1 headings, not one"));
+    }
+    if !main {
+        problems.push("no main landmark".to_owned());
+    }
+    problems
 }
