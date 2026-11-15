@@ -303,7 +303,7 @@
         type="button"
         class="cmd-trigger"
         onclick={() => (session.paletteOpen = true)}
-        aria-label={t('Open command palette')}
+        aria-keyshortcuts="Control+K"
       >
         <span>{t('Jump or run…')}</span>
         <kbd>Ctrl+K</kbd>

@@ -141,6 +141,8 @@ a:hover {
    (WCAG 1.4.1). */
 p a,
 h1 a,
+h2 a,
+h3 a,
 li a,
 dd a {
   text-decoration: underline;
