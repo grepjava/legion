@@ -772,15 +772,17 @@ spec:
     offline(&mut a, true);
     // Emulation stops new requests but leaves open WebSockets be: drop
     // the console's connections as a broken network would.
+    // tcpdrop lists each connection from both ends: the second finds it
+    // gone already, so what counts is that some were dropped.
     let dropped = Command::new("sh")
         .arg("-c")
-        .arg("tcpdrop -l -a | grep -E ' 7480( |$)' | sh")
+        .arg("tcpdrop -l -a | grep -E ' 7480( |$)' | sh 2>&1")
         .output()
         .expect("tcpdrop");
     assert!(
-        dropped.status.success(),
+        text(&dropped.stdout).contains("dropped"),
         "dropping the console's connections: {}",
-        text(&dropped.stderr)
+        text(&dropped.stdout)
     );
     a.shows("Not current", 60);
     offline(&mut a, false);
