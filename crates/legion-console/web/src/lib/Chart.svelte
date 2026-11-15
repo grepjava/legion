@@ -1,7 +1,9 @@
 <script lang="ts">
   // One series over time, on one axis: a 2px line, a faint grid, the
   // title naming it (no legend for one series), a crosshair and tooltip on
-  // hover, and the latest, average and highest values as text beside it.
+  // hover, and the latest, average and highest values as text beside it;
+  // every sample as a table too, behind a disclosure, for whoever can't see
+  // the line or wants the numbers (WCAG 1.1.1, 1.3.1).
   import { t } from '#lib/i18n.svelte.ts';
 
   let {
@@ -122,6 +124,31 @@
         </g>
       {/if}
     </svg>
+    <details class="values">
+      <summary>{t('{title}: values as a table', { title })}</summary>
+      <!-- Scrolled, and focusable so the keyboard scrolls it too (WCAG 2.1.1,
+           axe's scrollable-region-focusable), which Svelte's rule doesn't know. -->
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+      <div class="scroll" tabindex="0" role="region" aria-label={t('{title} over time', { title })}>
+      <table>
+        <caption class="sr-only">{t('{title} over time', { title })}</caption>
+        <thead>
+          <tr>
+            <th scope="col">{t('Time')}</th>
+            <th scope="col">{title}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each [...points].reverse() as [pt, pv] (pt)}
+            <tr>
+              <td>{new Date(pt).toLocaleTimeString()}</td>
+              <td>{format(pv)}</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+      </div>
+    </details>
   {/if}
 </figure>
 
@@ -139,6 +166,13 @@
   svg {
     display: block;
     touch-action: none;
+  }
+  .values {
+    margin-top: 0.25rem;
+  }
+  .values .scroll {
+    max-height: 16rem;
+    overflow-y: auto;
   }
   .grid {
     stroke: var(--line);

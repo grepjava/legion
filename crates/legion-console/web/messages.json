@@ -166,6 +166,7 @@
   "New key": "",
   "New label": "",
   "New tasks on the same spec, replacing these as an update does": "",
+  "No alerts now.": "",
   "No line matched.": "",
   "No namespace you can see has a quota.": "",
   "No output.": "",
@@ -488,6 +489,8 @@
   "{name} resumed": "",
   "{name} scaled to {n}": "",
   "{name} suspended": "",
+  "{n} alerts now, some critical.": "",
+  "{n} alerts now.": "",
   "{n} cores": "",
   "{n} h": "",
   "{n} min": "",
@@ -500,7 +503,9 @@
   "{ready}/{desired} ready": "",
   "{result}, version {version}": "",
   "{shown} of {total}, live": "",
+  "{title} over time": "",
   "{title}: now {now}, average {average}, highest {highest}": "",
+  "{title}: values as a table": "",
   "{used} of {limit} ({percent}%)": "",
   "{version} (generation {generation})": ""
 }

@@ -64,7 +64,8 @@
   <div class="card">
     <h2>{t('Latest update')}</h2>
     {#if update}
-      <p class="big"><span class="state {tone(update.state)}">{update.state}</span></p>
+      <!-- Said as it moves on (updating, completed), not only shown. -->
+      <p class="big" aria-live="polite"><span class="state {tone(update.state)}">{update.state}</span></p>
       <p class="muted"
         >{update.message
           ? t('from generation {generation}: {message}', { generation: update.generation, message: update.message })

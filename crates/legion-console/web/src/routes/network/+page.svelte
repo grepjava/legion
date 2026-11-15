@@ -86,7 +86,7 @@
     <tbody>
       {#each sources as from (from)}
         <tr>
-          <th>{#if from}<a href="/k/Service/{namespace}/{from}">{from}</a>{:else}<span class="muted">{t('other namespaces')}</span>{/if}</th>
+          <th scope="row">{#if from}<a href="/k/Service/{namespace}/{from}">{from}</a>{:else}<span class="muted">{t('other namespaces')}</span>{/if}</th>
           {#each services as to (to)}
             {@const c = cell(from, to)}
             <td class={c === null ? 'no' : c === 'all' ? 'all' : 'some'}>{c === 'all' ? t('all') : (c ?? '—')}</td>

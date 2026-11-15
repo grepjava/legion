@@ -54,6 +54,21 @@
     );
   });
   const critical = $derived(session.alerts.some((a) => a.severity === 'critical'));
+  // The count said when it changes, as the badge only shows it (WCAG
+  // 4.1.3); signed in with alerts already, said once.
+  let said = $state('');
+  let before = 0;
+  $effect(() => {
+    const n = session.alerts.length;
+    if (n === before) return;
+    before = n;
+    said =
+      n === 0
+        ? t('No alerts now.')
+        : critical
+          ? t('{n} alerts now, some critical.', { n })
+          : t('{n} alerts now.', { n });
+  });
 
   async function signOut() {
     await api.logout().catch(() => {});
@@ -147,6 +162,7 @@
   {@render children()}
 {:else if session.me}
   <a class="skip" href="#main">{t('Skip to the page')}</a>
+  <p class="sr-only" aria-live="polite">{said}</p>
   <div class="shell">
     <aside>
       <a class="brand" href="/"
