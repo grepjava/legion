@@ -226,9 +226,51 @@ fn router(gateway: Gateway) -> axum::Router {
 fn page_policy(peers: &str) -> String {
     format!(
         "default-src 'self'; connect-src 'self'{peers}; img-src 'self' data:; \
-         style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; \
-         frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+         style-src 'self' 'unsafe-inline'; script-src 'self'{}; \
+         frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+        inline_scripts()
     )
+}
+
+/// The page's own inline scripts (SvelteKit's start, written into
+/// `index.html` at build), each allowed by its hash: no other inline script
+/// runs, so HTML slipped into a page can't run any.
+fn inline_scripts() -> &'static str {
+    static HASHES: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASHES.get_or_init(|| {
+        let page = legion_console::asset("index.html")
+            .map(|(bytes, _)| String::from_utf8_lossy(bytes).into_owned())
+            .unwrap_or_default();
+        script_hashes(&page)
+    })
+}
+
+/// ` 'sha256-…'` for each `<script>` in `html` without a `src`.
+fn script_hashes(html: &str) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    let mut out = String::new();
+    let mut rest = html;
+    while let Some(open) = rest.find("<script") {
+        let after = &rest[open..];
+        let Some(tag_end) = after.find('>') else {
+            break;
+        };
+        let tag = &after[..tag_end];
+        let body = &after[tag_end + 1..];
+        let Some(close) = body.find("</script>") else {
+            break;
+        };
+        if !tag.contains(" src=") {
+            let digest = sha2::Sha256::digest(&body.as_bytes()[..close]);
+            out.push_str(&format!(
+                " 'sha256-{}'",
+                base64::engine::general_purpose::STANDARD.encode(digest)
+            ));
+        }
+        rest = &body[close..];
+    }
+    out
 }
 
 /// What every answer carries, unless it set its own policy (a plugin's
@@ -2462,6 +2504,25 @@ async fn page(uri: Uri) -> Result<Response, Infallible> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_pages_own_inline_scripts_are_allowed() {
+        // sha256("go()") in base64, as `openssl dgst -sha256 -binary | base64` gives it.
+        let page = r#"<head><script type="module" src="/app.js"></script></head>
+            <body><script>go()</script></body>"#;
+        assert_eq!(
+            script_hashes(page),
+            " 'sha256-5KYv+PUboo5h+0+YAtGRPbwv5d/QxzHslP4YGnUaxRw='"
+        );
+        assert_eq!(script_hashes("<p>no scripts</p>"), "");
+        // The policy built: no 'unsafe-inline' for scripts.
+        let policy = page_policy("");
+        let scripts = policy
+            .split(';')
+            .find(|d| d.trim_start().starts_with("script-src"))
+            .unwrap();
+        assert!(!scripts.contains("unsafe-inline"), "{policy}");
+    }
 
     #[test]
     fn the_session_comes_from_its_cookie_only() {
