@@ -512,8 +512,8 @@ not yet checked by a tool or a screen reader):
   as such. The lab test reads Chromium's accessibility tree, what screen
   readers are given, on every page axe checks and a Service's usage and
   events: every control named, one level-1 heading, the main landmark.
-  *Still to do:* a pass with a real screen reader (NVDA, VoiceOver), which
-  the lab cannot run.
+  Passed on d988dd3. *Still to do:* a pass with a real screen reader
+  (NVDA, VoiceOver), which the lab cannot run.
 
 **In the lab** (`the_console_runs_the_cluster`, phase 6, passed on
 4373b5f): the admin names the cluster and sets a banner, which the
