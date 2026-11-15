@@ -164,6 +164,12 @@ service Cluster {
   // state each last reported, which says which holds it. For any caller
   // who may read the namespace's services; answered by the leader.
   rpc LoadBalancers(LoadBalancersRequest) returns (LoadBalancersResponse);
+  // What happened to objects lately, as this manager saw it (worked out
+  // from the changes its replica sees, kept in memory for an hour): a
+  // namespace's, or one object's (a Service's or Job's with its tasks').
+  // The first message holds those kept, oldest first; with `follow`, each
+  // new one comes as it happens. For any caller who may read the kind there.
+  rpc Events(EventsRequest) returns (stream EventsResponse);
   // The audit events the filter matches, oldest first, at most `limit`
   // (1000 when 0): the cluster admin's only (legion_api::audit).
   rpc Audit(AuditRequest) returns (AuditResponse);
@@ -387,6 +393,33 @@ message ReachResponse {
   repeated string services = 1;
   // One per source and destination that it may reach on some port.
   repeated ReachEdge edges = 2;
+}
+
+message EventsRequest {
+  // Empty for a cluster's objects (Nodes).
+  string namespace = 1;
+  // Empty: every kind's.
+  string kind = 2;
+  // Empty: every object of the kind.
+  string name = 3;
+  bool follow = 4;
+}
+
+message EventsResponse {
+  repeated ObjectEvent events = 1;
+}
+
+message ObjectEvent {
+  // In milliseconds since the epoch, when this manager saw it.
+  int64 at_ms = 1;
+  string kind = 2;
+  string namespace = 3;
+  string name = 4;
+  // What happened, in a word or two: Created, Running, Restarted.
+  string reason = 5;
+  string message = 6;
+  // A task's Service or Job.
+  string owner = 7;
 }
 
 message LoadBalancersRequest {

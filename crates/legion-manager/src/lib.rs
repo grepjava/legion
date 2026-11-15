@@ -22,6 +22,7 @@ mod gateway;
 pub use gateway::Console;
 pub mod controller;
 mod dispatcher;
+mod events;
 #[cfg(feature = "test-hooks")]
 pub mod hooks;
 pub mod images;
@@ -399,6 +400,7 @@ impl Manager {
             speaking: self.speaking.clone(),
             ca_seen: Default::default(),
             balancers: Default::default(),
+            events: Default::default(),
             alerts: Default::default(),
             builds: Default::default(),
         };
@@ -413,6 +415,11 @@ impl Manager {
         let alerting = tokio::spawn(alerts::track(
             api.store.clone(),
             api.alerts.clone(),
+            api.closing.clone(),
+        ));
+        let eventing = tokio::spawn(events::track(
+            api.store.clone(),
+            api.events.clone(),
             api.closing.clone(),
         ));
         let console = console
@@ -532,6 +539,7 @@ impl Manager {
         let _ = floor.await;
         let _ = names.await;
         let _ = alerting.await;
+        let _ = eventing.await;
         if let Some(console) = console {
             let _ = console.await;
         }

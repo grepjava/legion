@@ -66,6 +66,8 @@ pub struct ApiService {
     /// The CARP state of each load balancer address, as each node's
     /// heartbeats here report it.
     pub(crate) balancers: std::sync::Arc<crate::balancers::Held>,
+    /// What happened to objects lately, as this manager saw it.
+    pub(crate) events: std::sync::Arc<crate::events::State>,
     /// The restarts this manager has seen, for its alerts.
     pub(crate) alerts: std::sync::Arc<crate::alerts::State>,
     /// The logs of the builds this manager runs as leader.
@@ -1581,6 +1583,120 @@ impl Cluster for ApiService {
             });
         }
         Ok(Response::new(pb::QuotasResponse { namespaces }))
+    }
+
+    type EventsStream = ReceiverStream<Result<pb::EventsResponse, Status>>;
+
+    async fn events(
+        &self,
+        req: Request<pb::EventsRequest>,
+    ) -> Result<Response<Self::EventsStream>, Status> {
+        let caller = self.caller(&req)?;
+        let pb::EventsRequest {
+            namespace,
+            kind,
+            name,
+            follow,
+        } = req.into_inner();
+        let kind: Option<Kind> = if kind.is_empty() {
+            None
+        } else {
+            Some(
+                kind.parse()
+                    .map_err(|e: legion_api::Error| Status::invalid_argument(e.to_string()))?,
+            )
+        };
+        if kind.is_some_and(Kind::is_cluster_scoped) {
+            if !namespace.is_empty() {
+                return Err(Status::invalid_argument(
+                    "a cluster's objects are in no namespace",
+                ));
+            }
+        } else if namespace.is_empty() {
+            return Err(Status::invalid_argument("which namespace?"));
+        } else {
+            check_namespace(&namespace)?;
+        }
+        if kind.is_none() && !name.is_empty() {
+            return Err(Status::invalid_argument("a name is of a kind"));
+        }
+        // Who may read the kind there; a namespace's events, its tasks.
+        caller.check(
+            &self.store,
+            Verb::Read,
+            kind.unwrap_or(Kind::Task),
+            &namespace,
+        )?;
+        let wanted = move |e: &legion_api::event::Event| match kind {
+            None => true,
+            Some(k) if name.is_empty() => e.kind == k,
+            Some(k) => crate::events::about(e, k, &name),
+        };
+        let to_pb = |e: legion_api::event::Event| pb::ObjectEvent {
+            at_ms: e.at_ms,
+            kind: e.kind.to_string(),
+            namespace: e.namespace,
+            name: e.name,
+            reason: e.reason,
+            message: e.message,
+            owner: e.owner,
+        };
+        // Following from before the backlog is read, so none falls between.
+        let mut new = self.events.subscribe();
+        let kept = self.events.of(&namespace, &wanted);
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let mut closing = self.closing.clone();
+        let last = kept.last().map(|e| e.at_ms);
+        let backlog: Vec<legion_api::event::Event> = kept
+            .iter()
+            .filter(|e| Some(e.at_ms) == last)
+            .cloned()
+            .collect();
+        tx.send(Ok(pb::EventsResponse {
+            events: kept.into_iter().map(to_pb).collect(),
+        }))
+        .await
+        .map_err(|_| Status::cancelled("gone"))?;
+        if follow {
+            tokio::spawn(async move {
+                loop {
+                    let e = tokio::select! {
+                        e = new.recv() => e,
+                        () = tx.closed() => return,
+                        _ = closing.wait_for(|c| *c) => return,
+                    };
+                    let e = match e {
+                        Ok(e) => e,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let _ = tx
+                                .send(Err(Status::resource_exhausted(
+                                    "too many events to follow; open them again",
+                                )))
+                                .await;
+                            return;
+                        }
+                        Err(_) => return,
+                    };
+                    // Sent with the backlog already.
+                    if last.is_some_and(|l| e.at_ms < l) || backlog.contains(&e) {
+                        continue;
+                    }
+                    if e.namespace != namespace || !wanted(&e) {
+                        continue;
+                    }
+                    if tx
+                        .send(Ok(pb::EventsResponse {
+                            events: vec![to_pb(e)],
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     type WatchAlertsStream = ReceiverStream<Result<pb::AlertsResponse, Status>>;

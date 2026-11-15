@@ -6059,3 +6059,85 @@ async fn a_build_runs_on_a_builder_node_and_rolls_out() {
     drop((web2, web3));
     m.stop().await;
 }
+
+/// Events (CONSOLE.md phase 2): a Service's own and its tasks', followed as
+/// they happen and kept for whoever asks after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn events_say_what_happened_to_a_service_and_its_tasks() {
+    use legion_proto::v1::EventsRequest;
+    let m = Running::start().await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let ask = |follow| EventsRequest {
+        namespace: "default".into(),
+        kind: "Service".into(),
+        name: "web".into(),
+        follow,
+    };
+    let mut following = eventually(|| {
+        let m = &m;
+        async move { m.cluster().await.events(ask(true)).await }
+    })
+    .await
+    .into_inner();
+    let first = following.message().await.unwrap().unwrap();
+    assert!(first.events.is_empty(), "{first:?}");
+
+    let mut objects = m.objects().await;
+    objects.apply(apply(service("web", 1))).await.unwrap();
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !(seen.contains(&"Service Created".to_owned())
+        && seen.iter().any(|s: &String| s.starts_with("Task Created")))
+    {
+        let next = tokio::time::timeout_at(deadline, following.message())
+            .await
+            .unwrap_or_else(|_| panic!("events so far: {seen:?}"))
+            .unwrap()
+            .unwrap();
+        for e in next.events {
+            assert!(
+                (e.kind == "Service" && e.name == "web") || (e.kind == "Task" && e.owner == "web"),
+                "{e:?}"
+            );
+            seen.push(format!("{} {}", e.kind, e.reason));
+        }
+    }
+
+    // Kept for whoever asks after, oldest first.
+    let mut kept = m
+        .cluster()
+        .await
+        .events(ask(false))
+        .await
+        .unwrap()
+        .into_inner();
+    let backlog = kept.message().await.unwrap().unwrap().events;
+    assert_eq!(backlog[0].kind, "Service", "{backlog:?}");
+    assert_eq!(backlog[0].reason, "Created", "{backlog:?}");
+    assert!(kept.message().await.unwrap().is_none(), "not followed");
+
+    // Asked wrongly.
+    for (namespace, kind, name) in [
+        ("", "Service", "web"),
+        ("default", "Node", "n1"),
+        ("default", "", "web"),
+    ] {
+        let err = m
+            .cluster()
+            .await
+            .events(EventsRequest {
+                namespace: namespace.into(),
+                kind: kind.into(),
+                name: name.into(),
+                follow: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::InvalidArgument,
+            "{namespace}/{kind}/{name}: {err}"
+        );
+    }
+    m.stop().await;
+}
