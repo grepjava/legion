@@ -147,8 +147,19 @@ config rolls out and a rollback undoes; a run now makes the Job the
 schedule would make this minute, created only (an apply over expected
 version 0), so a second within the minute is refused and a run due that
 minute counts it as its own. The lab test restarts hello from its page
-and sees every task replaced on the same image (passed on c41302a). Not yet: events per object (there is no event
-kind; a task's status message says why it waits). Its browser test passes on the lab (see below).
+and sees every task replaced on the same image (passed on c41302a).
+Events per object came last (2026-11-15; chosen: kept in memory, not
+written): each manager works them out from the changes its replica sees,
+an object's summary (a task's state, message, node, restarts and
+readiness; a Service's generation and rollout; a Job's or Build's state; a
+Node's state and availability; a Volume's node and loss) compared with the
+one before, and keeps an hour of them, at most 1000 a namespace
+(`legion_api::event`, `legion_manager::events`). `Cluster.Events` gives a
+namespace's or an object's (a Service's or Job's with its tasks'),
+followed with `follow`; `legion events [kind/name] [-w]`; an Events tab on
+those kinds' pages, followed live. A manager knows only what happened
+since it started, and what was there when it first looked is no event.
+Its browser test passes on the lab (see below).
 
 ## Phase 3: cluster operations
 
