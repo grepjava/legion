@@ -191,7 +191,7 @@ states in their heartbeats, the leader keeps them, and the Network page
 lists each address with the node holding it and the state of each that
 may (`Cluster.LoadBalancers`, `legion lb`), read again every 10 s; the lab
 load balancer test checks `legion lb` against the nodes' interfaces before
-and after a drain moves the address.
+and after a drain moves the address (passed on 6927113).
 
 **Lab test, phases 1 to 3** (`crates/legion/tests/console.rs`, in every
 record from lab base 5, which has Chromium): a headless Chromium, driven
