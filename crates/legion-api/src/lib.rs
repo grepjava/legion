@@ -21,6 +21,7 @@ pub mod console;
 pub mod cron;
 pub mod data;
 pub mod dispatch;
+pub mod event;
 pub mod image;
 pub mod job;
 pub mod login;
