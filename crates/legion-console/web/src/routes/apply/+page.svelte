@@ -39,10 +39,17 @@
       .catch((e) => (error = e.message));
   });
 
+  // The YAML last applied: the live preview leaves its result on show
+  // until the YAML changes.
+  let applied: string | null = $state(null);
+  // Each request's number; only the latest one started shows its answer,
+  // so a preview that started before an Apply can't replace its result.
+  let latest = 0;
+
   // Debounced live server dry-run diff preview when autoPreview is checked.
   $effect(() => {
     const text = yaml;
-    if (!autoPreview || !!why || !text.trim()) return;
+    if (!autoPreview || !!why || !text.trim() || text === applied) return;
     const timer = setTimeout(() => {
       run(true, true);
     }, 550);
@@ -50,18 +57,25 @@
   });
 
   async function run(dryRun: boolean, quiet = false) {
+    const mine = ++latest;
+    const text = yaml;
+    // Applying cancels a preview still waiting (the effect re-runs), and
+    // none starts again for this YAML: its result or error stays shown.
+    if (!dryRun) applied = text;
     if (!quiet) busy = true;
     error = '';
     try {
       const r = await api.apply({
-        yaml,
+        yaml: text,
         dryRun,
         expectedVersion: editing ? version : undefined
       });
+      if (mine !== latest) return;
       results = r.results;
       dry = dryRun;
       if (!dryRun && editing && results.length === 1) version = results[0].version;
     } catch (e) {
+      if (mine !== latest) return;
       results = [];
       error =
         e instanceof ApiError && e.status === 409 && editing

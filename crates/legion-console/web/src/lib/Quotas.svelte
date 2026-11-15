@@ -11,14 +11,22 @@
   let loaded = $state(false);
 
   $effect(() => {
-    const load = () =>
+    // Only the latest load started is shown: one answered late can't
+    // replace a newer count.
+    let latest = 0;
+    const load = () => {
+      const mine = ++latest;
       quotas(namespace)
         .then((r) => {
+          if (mine !== latest) return;
           list = r.namespaces;
           error = '';
         })
-        .catch((e) => (error = e.message))
+        .catch((e) => {
+          if (mine === latest) error = e.message;
+        })
         .finally(() => (loaded = true));
+    };
     // What counts changes as tasks are placed and end, and Volumes come
     // and go: loaded again after each such change.
     let pending: ReturnType<typeof setTimeout> | null = null;

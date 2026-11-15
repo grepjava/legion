@@ -47,6 +47,10 @@
       .catch((e) => (convertError = e.message));
   });
 
+  // Each conversion's number: only the latest one started is shown, so a
+  // slow answer for older text can't replace the YAML that Deploy applies.
+  let converting = 0;
+
   // Converted again a moment after each change.
   $effect(() => {
     const body = { compose: text, stack: stack.trim(), namespace: namespace.trim() || undefined, env: { ...values } };
@@ -56,15 +60,18 @@
       convertError = '';
       return;
     }
+    const mine = ++converting;
     const timer = setTimeout(async () => {
       try {
         const r = await compose(body);
+        if (mine !== converting) return;
         yaml = r.objects.map(toYaml).join('---\n');
         warnings = r.warnings;
         variables = r.variables;
         convertError = '';
         for (const v of r.variables) if (!(v.name in values)) values[v.name] = v.default ?? '';
       } catch (e) {
+        if (mine !== converting) return;
         yaml = '';
         convertError = (e as Error).message;
       }
