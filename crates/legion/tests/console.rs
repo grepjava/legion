@@ -831,7 +831,7 @@ spec:
         format!(
             "apiVersion: legion/v1\nkind: Service\nmetadata: {{ name: published, namespace: team-a }}\n\
              spec:\n  pod: {{ containers: [{{ name: c, image: {IMAGE}, command: [/bin/sleep, \"86400\"] }}] }}\n\
-             \x20 ports: [{{ port: 8080, publish: ingress, publishedPort: 30080 }}]\n"
+             \x20 endpoint: {{ ports: [{{ port: 8080, publish: ingress, publishedPort: 30080 }}] }}\n"
         ),
     )
     .unwrap();
