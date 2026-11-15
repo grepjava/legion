@@ -1,25 +1,30 @@
 <script lang="ts">
   // What a task, a service's tasks or a node's tasks used over the last
-  // hour (`legion usage`), as the leader sampled it: CPU and memory, each
-  // its own chart, summed over the tasks at each sample. Fetched again as
-  // each new sample is due.
-  import { usageHistory, type TaskSeries } from '#lib/api.ts';
+  // hour (`legion usage`), as the leader sampled it: CPU, memory, and
+  // (when node telemetry is in scope) ZFS pool space and network throughput.
+  import { usageHistory, type NodeSeries, type TaskSeries } from '#lib/api.ts';
   import Chart from '#lib/Chart.svelte';
   import { t, tn } from '#lib/i18n.svelte.ts';
 
   let {
     namespace,
     task = '',
-    pick = () => true
+    nodeFilter = '',
+    pick = () => true,
+    compact = false
   }: {
     /** Empty: every namespace the user may read. */
     namespace: string;
     task?: string;
+    /** Optional single node name for ZFS/network telemetry filtering. */
+    nodeFilter?: string;
     /** Which tasks count. */
     pick?: (t: TaskSeries) => boolean;
+    compact?: boolean;
   } = $props();
 
   let series: TaskSeries[] = $state([]);
+  let nodeSeries: NodeSeries[] = $state([]);
   let step = $state(15_000);
   let error = $state('');
   let loaded = $state(false);
@@ -32,6 +37,7 @@
         const r = await usageHistory(namespace, task);
         if (stopped) return;
         series = r.tasks;
+        nodeSeries = r.nodes ?? [];
         step = r.step_ms || 15_000;
         error = '';
       } catch (e) {
@@ -53,16 +59,34 @@
   const summed = $derived.by(() => {
     const cpu = new Map<number, number>();
     const mem = new Map<number, number>();
-    for (const t of series.filter(pick)) {
-      for (const [at, c, m] of t.samples) {
+    const zfs = new Map<number, number>();
+    const net = new Map<number, number>();
+    for (const ts of series.filter(pick)) {
+      for (const [at, c, m] of ts.samples) {
         const k = Math.round(at / step) * step;
         cpu.set(k, (cpu.get(k) ?? 0) + c);
         mem.set(k, (mem.get(k) ?? 0) + m);
       }
     }
+    if (!task) {
+      for (const ns of nodeSeries) {
+        if (nodeFilter && ns.node !== nodeFilter) continue;
+        for (const [at, used, , rx, tx] of ns.samples) {
+          const k = Math.round(at / step) * step;
+          zfs.set(k, (zfs.get(k) ?? 0) + used);
+          net.set(k, (net.get(k) ?? 0) + rx + tx);
+        }
+      }
+    }
     const sorted = (m: Map<number, number>) =>
       [...m.entries()].sort((a, b) => a[0] - b[0]) as [number, number][];
-    return { cpu: sorted(cpu), mem: sorted(mem), tasks: series.filter(pick).length };
+    return {
+      cpu: sorted(cpu),
+      mem: sorted(mem),
+      zfs: sorted(zfs),
+      net: sorted(net),
+      tasks: series.filter(pick).length
+    };
   });
 
   // Requests and limits of the tasks there now, those with a recent sample;
@@ -94,24 +118,75 @@
     }
     return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)}${units[i]}`;
   };
+  const bps = (v: number) => `${bytes(v)}/s`;
 </script>
 
 {#if error}<p class="error" role="alert">{error}</p>{/if}
-{#if loaded && !summed.tasks}
-  <p class="muted">{t('No usage heard in the last hour: nothing ran, or the leader started since.')}</p>
-{:else if loaded}
+{#if loaded && !summed.tasks && !summed.zfs.length}
   <p class="muted">
-    {summed.tasks > 1
-      ? tn(
-          'The last hour, a sample every {seconds} s, summed over {n} tasks. CPU is in percent of one CPU.',
-          'The last hour, a sample every {seconds} s, summed over {n} tasks. CPU is in percent of one CPU.',
-          summed.tasks,
-          { seconds: Math.round(step / 1000) }
-        )
-      : t('The last hour, a sample every {seconds} s. CPU is in percent of one CPU.', {
-          seconds: Math.round(step / 1000)
-        })}
+    {t('No usage heard in the last hour: nothing ran, or the leader started since.')}
   </p>
-  <Chart title={t('CPU')} points={summed.cpu} format={percent} {step} marks={marks.cpu} />
-  <Chart title={t('Memory')} points={summed.mem} format={bytes} {step} marks={marks.mem} />
+{:else if loaded}
+  {#if !compact}
+    <p class="muted">
+      {summed.tasks > 1
+        ? tn(
+            'The last hour, a sample every {seconds} s, summed over {n} tasks. CPU is in percent of one CPU.',
+            'The last hour, a sample every {seconds} s, summed over {n} tasks. CPU is in percent of one CPU.',
+            summed.tasks,
+            { seconds: Math.round(step / 1000) }
+          )
+        : t('The last hour, a sample every {seconds} s. CPU is in percent of one CPU.', {
+            seconds: Math.round(step / 1000)
+          })}
+    </p>
+  {/if}
+  <div class={compact ? 'grid-2' : ''}>
+    <div class={compact ? 'card' : ''}>
+      <Chart
+        title={t('CPU')}
+        points={summed.cpu}
+        format={percent}
+        {step}
+        marks={marks.cpu}
+        tone="accent"
+        {compact}
+      />
+    </div>
+    <div class={compact ? 'card' : ''}>
+      <Chart
+        title={t('Memory')}
+        points={summed.mem}
+        format={bytes}
+        {step}
+        marks={marks.mem}
+        tone="good"
+        {compact}
+      />
+    </div>
+    {#if summed.zfs.length}
+      <div class={compact ? 'card' : ''}>
+        <Chart
+          title={t('ZFS pool used')}
+          points={summed.zfs}
+          format={bytes}
+          {step}
+          tone="zfs"
+          {compact}
+        />
+      </div>
+    {/if}
+    {#if summed.net.length}
+      <div class={compact ? 'card' : ''}>
+        <Chart
+          title={t('Network throughput')}
+          points={summed.net}
+          format={bps}
+          {step}
+          tone="wait"
+          {compact}
+        />
+      </div>
+    {/if}
+  </div>
 {/if}

@@ -1,15 +1,31 @@
 <script lang="ts">
-  import { alertHref, api, follow, type LObject, type Status } from '#lib/api.ts';
+  // Mission-Control Overview HUD: 4-subsystem live telemetry (CPU, Memory,
+  // ZFS pool, Network RX/TX), Node heatmap matrix, CARP VIP ownership,
+  // active jail workloads with 1-click Workbench docking, and Quotas.
+  import {
+    alertHref,
+    api,
+    bytes,
+    follow,
+    type Balancer,
+    type LObject,
+    type NodeUsage,
+    type Status
+  } from '#lib/api.ts';
   import { tone } from '#lib/columns.ts';
-  import { session } from '#lib/session.svelte.ts';
   import Quotas from '#lib/Quotas.svelte';
+  import UsageCharts from '#lib/UsageCharts.svelte';
   import { t } from '#lib/i18n.svelte.ts';
+  import { openWorkbench, session } from '#lib/session.svelte.ts';
 
   let status: Status | null = $state(null);
   let statusError = $state('');
   let nodes: LObject[] = $state([]);
   let services: LObject[] = $state([]);
   let tasks: LObject[] = $state([]);
+  let volumes: LObject[] = $state([]);
+  let nodeUsage: NodeUsage[] = $state([]);
+  let balancers: Balancer[] = $state([]);
   let errors: Record<string, string> = $state({});
 
   $effect(() => {
@@ -24,10 +40,42 @@
     const fail = (kind: string) => (e: Error) => (errors[kind] = e.message);
     const stops = [
       follow('Service', ns, (o) => (services = o), fail('Service')),
-      follow('Task', ns, (o) => (tasks = o), fail('Task'))
+      follow('Task', ns, (o) => (tasks = o), fail('Task')),
+      follow('Volume', ns, (o) => (volumes = o), fail('Volume'))
     ];
     if (session.me?.all) stops.push(follow('Node', '', (o) => (nodes = o), fail('Node')));
     return () => stops.forEach((s) => s());
+  });
+
+  // Live node CPU / Memory / ZFS / Network snapshot + CARP VIPs.
+  $effect(() => {
+    const ns = session.namespace;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const poll = async () => {
+      try {
+        const u = await api.usage(ns);
+        if (!stopped) nodeUsage = u.nodes;
+      } catch {
+        // Ignore transient poll errors.
+      }
+      if (ns) {
+        api
+          .loadBalancers(ns)
+          .then((b) => {
+            if (!stopped) balancers = b.balancers;
+          })
+          .catch(() => {});
+      } else {
+        balancers = [];
+      }
+      if (!stopped) timer = setTimeout(poll, 5000);
+    };
+    poll();
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
   });
 
   function count(objects: LObject[], of: (o: LObject) => string): [string, number][] {
@@ -35,13 +83,66 @@
     for (const o of objects) by.set(of(o) || '—', (by.get(of(o) || '—') ?? 0) + 1);
     return [...by.entries()].sort();
   }
+
   const live = $derived(tasks.filter((task) => task.spec?.desiredState === 'running'));
+  const usageByNode = $derived(new Map(nodeUsage.map((n) => [n.node, n])));
+
+  const totals = $derived.by(() => {
+    let cpu = 0;
+    let mem = 0;
+    let zfsUsed = 0;
+    let zfsAvail = 0;
+    let rx = 0;
+    let tx = 0;
+    for (const n of nodeUsage) {
+      for (const tk of n.tasks) {
+        cpu += tk.cpu_percent;
+        mem += tk.memory_bytes;
+      }
+      zfsUsed += n.zfs_used_bytes ?? 0;
+      zfsAvail += n.zfs_avail_bytes ?? 0;
+      rx += n.net_rx_bps ?? 0;
+      tx += n.net_tx_bps ?? 0;
+    }
+    return { cpu, mem, zfsUsed, zfsAvail, rx, tx };
+  });
+
+  function dockLogs(task: LObject) {
+    const ns = task.metadata.namespace ?? '';
+    openWorkbench({
+      id: `logs:${ns}/${task.metadata.name}`,
+      kind: 'logs',
+      title: `${task.metadata.name} · ${t('Logs')}`,
+      namespace: ns,
+      name: task.metadata.name,
+      object: task
+    });
+  }
+
+  function dockShell(task: LObject) {
+    const ns = task.metadata.namespace ?? '';
+    openWorkbench({
+      id: `term:${ns}/${task.metadata.name}`,
+      kind: 'terminal',
+      title: `${task.metadata.name} · ${t('Terminal')}`,
+      namespace: ns,
+      name: task.metadata.name,
+      object: task
+    });
+  }
 </script>
 
-<h1>{t('Overview')}</h1>
+<header class="bar">
+  <h1>{t('Overview')}</h1>
+  <div class="controls">
+    <a class="button sm" href="/volumes">{t('Volumes Studio')}</a>
+    <a class="button sm" href="/images">{t('Images & GHCR Hub')}</a>
+    <a class="button sm primary" href="/deploy">{t('Deploy')}</a>
+  </div>
+</header>
 
 {#if session.alerts.length}
-  <section>
+  <section class="card alert-strip">
     <h2><a href="/alerts">{t('Alerts')}</a></h2>
     <ul class="plain">
       {#each session.alerts.slice(0, 5) as a (a.kind + a.namespace + a.object)}
@@ -51,7 +152,9 @@
         </li>
       {/each}
     </ul>
-    {#if session.alerts.length > 5}<p><a href="/alerts">{t('All {n}', { n: session.alerts.length })}</a></p>{/if}
+    {#if session.alerts.length > 5}
+      <p><a href="/alerts">{t('All {n}', { n: session.alerts.length })}</a></p>
+    {/if}
   </section>
 {/if}
 
@@ -63,11 +166,14 @@
         <span class="state {status.leader ? 'good' : 'bad'}"
           >{status.leader ? t('leader elected') : t('no leader')}</span
         >
-        {t('term {term}, store version {version}', { term: status.term, version: status.version })}
+        {t('term {term}, store version {version}', {
+          term: status.term,
+          version: status.version
+        })}
       </p>
       <ul class="plain">
         {#each status.members as m (m.id)}
-          <li>
+          <li class="mono">
             {m.addr}
             {#if m.id === status.leader}<span class="tag">{t('leader')}</span>{/if}
             {#if !m.voter}<span class="tag">{t('learner')}</span>{/if}
@@ -95,6 +201,9 @@
   <div class="card">
     <h2><a href="/k/Service">{t('Services')}</a></h2>
     <p class="big">{services.length}</p>
+    <p class="muted">
+      <a href="/volumes">{t('{n} ZFS/storage volumes', { n: volumes.length })}</a>
+    </p>
     {#if errors.Service}<p class="error" role="alert">{errors.Service}</p>{/if}
   </div>
 
@@ -106,18 +215,190 @@
     {/each}
     {#if errors.Task}<p class="error" role="alert">{errors.Task}</p>{/if}
   </div>
+
+  <div class="card">
+    <h2>{t('Live telemetry')}</h2>
+    <dl class="facts compact-facts">
+      <dt>{t('CPU')}</dt>
+      <dd class="mono">{totals.cpu.toFixed(1)}%</dd>
+      <dt>{t('Memory')}</dt>
+      <dd class="mono">{bytes(totals.mem)}</dd>
+      {#if totals.zfsUsed + totals.zfsAvail > 0}
+        <dt>{t('ZFS pool')}</dt>
+        <dd class="mono">
+          {bytes(totals.zfsUsed)} / {bytes(totals.zfsUsed + totals.zfsAvail)}
+        </dd>
+      {/if}
+      {#if totals.rx + totals.tx > 0}
+        <dt>{t('Net RX / TX')}</dt>
+        <dd class="mono">{bytes(totals.rx)}/s · {bytes(totals.tx)}/s</dd>
+      {/if}
+    </dl>
+  </div>
 </section>
+
+<h2>{t('Telemetry history (1h)')}</h2>
+<UsageCharts namespace={session.namespace} compact={true} />
+
+{#if session.me?.all && nodes.length}
+  <h2>{t('Node heatmap')}</h2>
+  <section class="cards">
+    {#each nodes as n (n.metadata.name)}
+      {@const nu = usageByNode.get(n.metadata.name)}
+      {@const nCpu = nu ? nu.tasks.reduce((a, x) => a + x.cpu_percent, 0) : 0}
+      {@const nMem = nu ? nu.tasks.reduce((a, x) => a + x.memory_bytes, 0) : 0}
+      {@const zUsed = nu?.zfs_used_bytes ?? 0}
+      {@const zTot = zUsed + (nu?.zfs_avail_bytes ?? 0)}
+      {@const zPct = zTot > 0 ? Math.min(100, Math.round((zUsed / zTot) * 100)) : 0}
+      <div class="card node-tile">
+        <div class="node-head">
+          <strong><a href="/k/Node/_/{n.metadata.name}">{n.metadata.name}</a></strong>
+          <span class="state {tone(n.status?.state)}">{n.status?.state ?? '—'}</span>
+        </div>
+        <p class="muted mono node-sub">
+          {n.spec?.role ?? 'worker'} · {n.status?.addr ?? ''}
+          {#if n.spec?.availability && n.spec.availability !== 'active'}
+            · <span class="wait">{n.spec.availability}</span>
+          {/if}
+        </p>
+        <dl class="facts compact-facts">
+          <dt>{t('CPU / RAM')}</dt>
+          <dd class="mono">{nCpu.toFixed(1)}% · {bytes(nMem)}</dd>
+          <dt>{t('Tasks')}</dt>
+          <dd class="mono">{nu?.tasks.length ?? 0}</dd>
+          {#if zTot > 0}
+            <dt>{t('ZFS')}</dt>
+            <dd class="mono">{bytes(zUsed)} ({zPct}%)</dd>
+          {/if}
+          {#if (nu?.net_rx_bps ?? 0) + (nu?.net_tx_bps ?? 0) > 0}
+            <dt>{t('Net')}</dt>
+            <dd class="mono">↓{bytes(nu?.net_rx_bps ?? 0)}/s ↑{bytes(nu?.net_tx_bps ?? 0)}/s</dd>
+          {/if}
+        </dl>
+        {#if zTot > 0}
+          <div class="meter" role="img" aria-label={t('ZFS usage {pct}%', { pct: zPct })}>
+            <div
+              class="meter-fill {zPct >= 90 ? 'bad' : zPct >= 75 ? 'wait' : 'zfs'}"
+              style:width="{zPct}%"
+            ></div>
+          </div>
+        {/if}
+      </div>
+    {/each}
+  </section>
+{/if}
+
+{#if balancers.length}
+  <h2>{t('CARP virtual IPs')}</h2>
+  <table>
+    <caption class="sr-only">{t('CARP load balancers')}</caption>
+    <thead>
+      <tr>
+        <th scope="col">{t('Service')}</th>
+        <th scope="col">{t('Address')}</th>
+        <th scope="col">{t('VHID')}</th>
+        <th scope="col">{t('Nodes')}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {#each balancers as b (b.service + b.address)}
+        <tr>
+          <td><a href="/k/Service/{session.namespace}/{b.service}">{b.service}</a></td>
+          <td class="mono">{b.address}</td>
+          <td class="mono">{b.vhid}</td>
+          <td>
+            {#each b.nodes as n (n.node)}
+              <span class="state {n.state === 'master' ? 'good' : 'wait'}">
+                {n.node} ({n.state || 'init'}, skew {n.skew})
+              </span>
+            {/each}
+          </td>
+        </tr>
+      {/each}
+    </tbody>
+  </table>
+{/if}
 
 {#if live.some((task) => task.status?.state === 'pending' || task.status?.state === 'failed')}
   <h2>{t('Needs attention')}</h2>
   <table>
-    <thead><tr><th>{t('Task')}</th><th>{t('State')}</th><th>{t('Why')}</th></tr></thead>
+    <caption class="sr-only">{t('Tasks needing attention')}</caption>
+    <thead>
+      <tr>
+        <th scope="col">{t('Task')}</th>
+        <th scope="col">{t('State')}</th>
+        <th scope="col">{t('Why')}</th>
+        <th scope="col">{t('Workbench')}</th>
+      </tr>
+    </thead>
     <tbody>
       {#each live.filter((task) => ['pending', 'failed'].includes(task.status?.state)) as task (task.metadata.uid)}
         <tr>
-          <td><a href="/k/Task/{task.metadata.namespace}/{task.metadata.name}">{task.metadata.namespace}/{task.metadata.name}</a></td>
+          <td>
+            <a href="/k/Task/{task.metadata.namespace}/{task.metadata.name}">
+              {task.metadata.namespace}/{task.metadata.name}
+            </a>
+          </td>
           <td><span class="state {tone(task.status?.state)}">{task.status?.state}</span></td>
           <td>{task.status?.message ?? ''}</td>
+          <td>
+            <button
+              type="button"
+              class="sm"
+              onclick={() => dockLogs(task)}
+              aria-label={t('Logs for {name}', { name: task.metadata.name })}
+            >
+              {t('Logs')}
+            </button>
+          </td>
+        </tr>
+      {/each}
+    </tbody>
+  </table>
+{/if}
+
+{#if live.some((task) => task.status?.state === 'running')}
+  <h2>{t('Running jail tasks')}</h2>
+  <table>
+    <caption class="sr-only">{t('Running jail tasks')}</caption>
+    <thead>
+      <tr>
+        <th scope="col">{t('Task')}</th>
+        <th scope="col">{t('Service')}</th>
+        <th scope="col">{t('On node')}</th>
+        <th scope="col">{t('Address')}</th>
+        <th scope="col">{t('Workbench')}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {#each live.filter((task) => task.status?.state === 'running').slice(0, 12) as task (task.metadata.uid)}
+        <tr>
+          <td>
+            <a href="/k/Task/{task.metadata.namespace}/{task.metadata.name}">
+              {task.metadata.namespace}/{task.metadata.name}
+            </a>
+          </td>
+          <td>{task.spec?.service ?? '—'}</td>
+          <td class="mono">{task.spec?.node ?? '—'}</td>
+          <td class="mono">{task.status?.ip ?? '—'}</td>
+          <td class="controls">
+            <button
+              type="button"
+              class="sm"
+              onclick={() => dockLogs(task)}
+              aria-label={t('Logs for {name}', { name: task.metadata.name })}
+            >
+              {t('Logs')}
+            </button>
+            <button
+              type="button"
+              class="sm"
+              onclick={() => dockShell(task)}
+              aria-label={t('Shell in {name}', { name: task.metadata.name })}
+            >
+              {t('Shell')}
+            </button>
+          </td>
         </tr>
       {/each}
     </tbody>
@@ -126,3 +407,25 @@
 
 <h2>{t('Quotas')}</h2>
 <Quotas namespace={session.namespace} />
+
+<style>
+  .alert-strip {
+    margin-bottom: 0.85rem;
+    border-color: var(--wait);
+  }
+  .compact-facts {
+    font-size: 0.82rem;
+    gap: 0.2rem 0.9rem;
+    margin: 0.25rem 0 0.45rem;
+  }
+  .node-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .node-sub {
+    font-size: 0.78rem;
+    margin: 0.15rem 0 0.4rem;
+  }
+</style>

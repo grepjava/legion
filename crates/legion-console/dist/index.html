@@ -4,37 +4,49 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
+    <script>
+      try {
+        const s = localStorage.getItem('color-scheme') ?? 'dark';
+        document.querySelector('meta[name="color-scheme"]').content =
+          s === 'light' || s === 'dark' ? s : 'light dark';
+        if (localStorage.getItem('legion.density') === 'compact') {
+          document.documentElement.dataset.density = 'compact';
+        }
+      } catch {}
+    </script>
     <link rel="icon" href="/favicon.svg" />
-    <link href="/_app/immutable/entry/start.3HfxUipW.js" rel="modulepreload">
+    <link href="/_app/immutable/entry/start.BKk3WWZr.js" rel="modulepreload">
 		<link href="/_app/immutable/entry/payload.DSmR2FwN.js" rel="modulepreload">
 		<link href="/_app/immutable/chunks/DclECHGd.js" rel="modulepreload">
-		<link href="/_app/immutable/chunks/DEAAAmiI.js" rel="modulepreload">
-		<link href="/_app/immutable/chunks/DFQBM6JI.js" rel="modulepreload">
-		<link href="/_app/immutable/chunks/DLUDR48U.js" rel="modulepreload">
-		<link href="/_app/immutable/chunks/CSburHMc.js" rel="modulepreload">
-		<link href="/_app/immutable/entry/app.UImXDh8i.js" rel="modulepreload">
-		<link href="/_app/immutable/nodes/0.6sH4S7WI.js" rel="modulepreload">
-		<link href="/_app/immutable/chunks/Cmy8hCwd.js" rel="modulepreload">
-		<link href="/_app/immutable/chunks/HSBZ_Lp6.js" rel="modulepreload">
+		<link href="/_app/immutable/chunks/SXWrA81Q.js" rel="modulepreload">
+		<link href="/_app/immutable/chunks/ByLl9kdK.js" rel="modulepreload">
+		<link href="/_app/immutable/chunks/CEJTshlh.js" rel="modulepreload">
+		<link href="/_app/immutable/chunks/BR2rgkgz.js" rel="modulepreload">
+		<link href="/_app/immutable/entry/app.BPgnWLpU.js" rel="modulepreload">
+		<link href="/_app/immutable/nodes/0.CH-0_zra.js" rel="modulepreload">
+		<link href="/_app/immutable/chunks/DVx5JRbS.js" rel="modulepreload">
+		<link href="/_app/immutable/chunks/BE0DM5Uo.js" rel="modulepreload">
 		<link href="/_app/immutable/chunks/BalVYs9h.js" rel="modulepreload">
-		<link href="/_app/immutable/chunks/BxEfRNn8.js" rel="modulepreload">
+		<link href="/_app/immutable/chunks/BaUvm6HX.js" rel="modulepreload">
+		<link href="/_app/immutable/chunks/BvPPVPV5.js" rel="modulepreload">
 		
-		<link href="/_app/immutable/assets/0.CcGBnmHF.css" rel="stylesheet">
+		<link href="/_app/immutable/assets/0.DPJbw-yV.css" rel="stylesheet">
+		<link href="/_app/immutable/assets/Terminal.BrP-ENHg.css" rel="stylesheet">
   </head>
   <body data-sveltekit-preload-data="hover">
     <div style="display: contents">
 			<script>
 				{
-					__sveltekit_1fqqmxe = {
+					__sveltekit_rl10xi = {
 						base: "",
-						version: "1794746262359"
+						version: "1794748467897"
 					};
 
 					const element = document.currentScript.parentElement;
 
-					import("/_app/immutable/entry/start.3HfxUipW.js").then(async (kit) => {
-						kit.init(__sveltekit_1fqqmxe);
-						const app = await import("/_app/immutable/entry/app.UImXDh8i.js");
+					import("/_app/immutable/entry/start.BKk3WWZr.js").then(async (kit) => {
+						kit.init(__sveltekit_rl10xi);
+						const app = await import("/_app/immutable/entry/app.BPgnWLpU.js");
 						kit.start(app, element);
 					});
 				}

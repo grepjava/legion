@@ -16,7 +16,7 @@
   import VolumeData from '#lib/VolumeData.svelte';
   import BuildLog from '#lib/BuildLog.svelte';
   import Events from '#lib/Events.svelte';
-  import { session } from '#lib/session.svelte.ts';
+  import { openWorkbench, session } from '#lib/session.svelte.ts';
   import { toYaml } from '#lib/yaml.ts';
 
   const kind = $derived(page.params.kind ?? '');
@@ -113,7 +113,73 @@
   <h1>
     <a href="/k/{kind}">{plural(kind)}</a> / {#if namespace}{namespace} / {/if}{name}
   </h1>
-  {#if gone}<span class="state bad">{t('deleted')}</span>{/if}
+  {#if gone}
+    <span class="state bad">{t('deleted')}</span>
+  {:else if object}
+    {@const obj = object}
+    <div class="bar">
+      {#if kind === 'Task'}
+        <button
+          type="button"
+          class="sm"
+          onclick={() =>
+            openWorkbench({
+              id: `logs:${namespace}:${name}`,
+              kind: 'logs',
+              title: `${name} · logs`,
+              namespace,
+              name,
+              object: obj
+            })}>{t('Dock logs')}</button
+        >
+        {#if obj.status?.state === 'running'}
+          <button
+            type="button"
+            class="sm"
+            onclick={() =>
+              openWorkbench({
+                id: `term:${namespace}:${name}`,
+                kind: 'terminal',
+                title: `${name} · shell`,
+                namespace,
+                name,
+                object: obj
+              })}>{t('Dock shell')}</button
+          >
+        {/if}
+      {:else if kind === 'Build'}
+        <button
+          type="button"
+          class="sm"
+          onclick={() =>
+            openWorkbench({
+              id: `build:${namespace}:${name}`,
+              kind: 'build',
+              title: `${name} · build`,
+              namespace,
+              name,
+              object: obj
+            })}>{t('Dock build log')}</button
+        >
+      {/if}
+      {#if ['Task', 'Service', 'Job', 'Node', 'Volume', 'Build'].includes(kind)}
+        <button
+          type="button"
+          class="sm"
+          onclick={() =>
+            openWorkbench({
+              id: `events:${kind}:${namespace}:${name}`,
+              kind: 'events',
+              title: `${name} · events`,
+              namespace,
+              name,
+              targetKind: kind,
+              object: obj
+            })}>{t('Dock events')}</button
+        >
+      {/if}
+    </div>
+  {/if}
 </header>
 
 {#if error}

@@ -1,8 +1,7 @@
 <script lang="ts">
-  // A Volume's data, as `legion volume backup` and `restore` move it: a
+  // A Volume's data, as `legion volume backup`, `restore`, and `snapshot`
+  // manage it: live ZFS snapshots (create, rollback, delete), a crash-consistent
   // backup downloaded as a file, and a backup file restored onto a node.
-  // A Volume lost with its node is restored in place (`--replace`), kept
-  // with what uses it.
   import { api, downloads, type LObject } from './api.ts';
   import { cannotWrite } from './session.svelte.ts';
   import { t, tn } from './i18n.svelte.ts';
@@ -10,13 +9,105 @@
   let { volume }: { volume: LObject } = $props();
   const ns = $derived(volume.metadata.namespace ?? '');
   const name = $derived(volume.metadata.name);
+  const driver = $derived(volume.spec?.driver ?? 'zfs');
+  const placedNode = $derived(volume.status?.node ?? '');
   const lost = $derived(Boolean(volume.status?.lost));
   const why = $derived(cannotWrite(ns));
+
   let file: FileList | undefined = $state();
   let node = $state('');
   let busy = $state(false);
   let message = $state('');
   let error = $state('');
+
+  let snapshots: string[] = $state([]);
+  let snapLoading = $state(false);
+  let newSnap = $state('');
+
+  async function loadSnapshots() {
+    if (driver !== 'zfs' || !placedNode || lost) {
+      snapshots = [];
+      return;
+    }
+    snapLoading = true;
+    try {
+      const r = await api.volumeSnapshots(ns, name);
+      snapshots = r.snapshots;
+    } catch {
+      snapshots = [];
+    } finally {
+      snapLoading = false;
+    }
+  }
+
+  $effect(() => {
+    void ns;
+    void name;
+    void driver;
+    void placedNode;
+    void lost;
+    loadSnapshots();
+  });
+
+  async function createSnapshot(e: SubmitEvent) {
+    e.preventDefault();
+    const snap = newSnap.trim();
+    if (!snap) return;
+    busy = true;
+    error = '';
+    message = '';
+    try {
+      const r = await api.volumeSnapshotOp(ns, name, 'create', snap);
+      snapshots = r.snapshots;
+      newSnap = '';
+      message = t('Created snapshot @{snapshot}', { snapshot: snap });
+    } catch (err) {
+      error = (err as Error).message;
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function rollbackSnapshot(snap: string) {
+    if (
+      !confirm(
+        t(
+          'Roll {name} back to @{snapshot}? Newer data and newer snapshots on this dataset will be discarded.',
+          { name, snapshot: snap }
+        )
+      )
+    ) {
+      return;
+    }
+    busy = true;
+    error = '';
+    message = '';
+    try {
+      const r = await api.volumeSnapshotOp(ns, name, 'rollback', snap);
+      snapshots = r.snapshots;
+      message = t('Rolled {name} back to @{snapshot}', { name, snapshot: snap });
+    } catch (err) {
+      error = (err as Error).message;
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function deleteSnapshot(snap: string) {
+    if (!confirm(t('Delete snapshot @{snapshot} from {name}?', { snapshot: snap, name }))) return;
+    busy = true;
+    error = '';
+    message = '';
+    try {
+      const r = await api.volumeSnapshotOp(ns, name, 'delete', snap);
+      snapshots = r.snapshots;
+      message = t('Deleted snapshot @{snapshot}', { snapshot: snap });
+    } catch (err) {
+      error = (err as Error).message;
+    } finally {
+      busy = false;
+    }
+  }
 
   async function restore(e: SubmitEvent) {
     e.preventDefault();
@@ -33,7 +124,10 @@
     error = '';
     message = '';
     try {
-      const r = await api.restoreVolume(f, lost ? { node, namespace: ns, name, replace: true } : { node });
+      const r = await api.restoreVolume(
+        f,
+        lost ? { node, namespace: ns, name, replace: true } : { node }
+      );
       message = tn(
         'restored {namespace}/{name} on {node} ({n} byte)',
         'restored {namespace}/{name} on {node} ({n} bytes)',
@@ -47,6 +141,71 @@
     }
   }
 </script>
+
+{#if driver === 'zfs'}
+  <h2>{t('ZFS snapshots')}</h2>
+  {#if !placedNode}
+    <p class="muted">{t('Snapshots become available once the Volume is placed on a node.')}</p>
+  {:else if lost}
+    <p class="muted">{t('Volume node is lost; restore a backup first.')}</p>
+  {:else}
+    <form class="controls" onsubmit={createSnapshot}>
+      <input
+        placeholder={t('snapshot name (e.g. pre-upgrade)')}
+        bind:value={newSnap}
+        aria-label={t('Snapshot name')}
+        disabled={!!why || busy}
+      />
+      <button class="primary" disabled={!!why || busy || !newSnap.trim()} title={why ?? ''}>
+        {t('Take snapshot')}
+      </button>
+      <button type="button" onclick={loadSnapshots} disabled={snapLoading || busy}>
+        {t('Refresh')}
+      </button>
+    </form>
+
+    {#if snapshots.length}
+      <table>
+        <caption class="sr-only">{t('ZFS snapshots of {name}', { name })}</caption>
+        <thead>
+          <tr>
+            <th scope="col">{t('Snapshot')}</th>
+            <th scope="col">{t('Actions')}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each snapshots as snap (snap)}
+            <tr>
+              <td class="mono">@{snap}</td>
+              <td class="controls">
+                <button
+                  type="button"
+                  class="sm"
+                  disabled={!!why || busy}
+                  title={why ?? ''}
+                  onclick={() => rollbackSnapshot(snap)}
+                >
+                  {t('Roll back')}
+                </button>
+                <button
+                  type="button"
+                  class="sm danger"
+                  disabled={!!why || busy}
+                  title={why ?? ''}
+                  onclick={() => deleteSnapshot(snap)}
+                >
+                  {t('Delete')}
+                </button>
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    {:else if !snapLoading}
+      <p class="muted">{t('No ZFS snapshots yet.')}</p>
+    {/if}
+  {/if}
+{/if}
 
 <h2>{t('Backup')}</h2>
 <p class="muted">

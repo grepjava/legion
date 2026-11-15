@@ -1,6 +1,7 @@
 <script lang="ts">
   // Deploy from an image (CONSOLE.md phase 5): a form writing the YAML,
   // shown alongside as it is written, applied as `legion apply` would.
+  import { page } from '$app/state';
   import { api, type ApplyResult } from '#lib/api.ts';
   import Diff from '#lib/Diff.svelte';
   import { blank, objects } from '#lib/deploy.ts';
@@ -15,6 +16,17 @@
   });
   const choices = $derived(namespaces(all));
   let form = $state(blank(session.namespace || 'default'));
+  $effect(() => {
+    const qImg = page.url.searchParams.get('image');
+    const qNs = page.url.searchParams.get('namespace');
+    if (qNs) form.namespace = qNs;
+    if (qImg && !form.image) {
+      form.image = qImg;
+      const base = qImg.split('@')[0].split(':')[0].split('/').pop() ?? '';
+      const clean = base.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '');
+      if (clean && !form.name) form.name = clean;
+    }
+  });
   const built = $derived(objects(form));
   const yaml = $derived(typeof built === 'string' ? '' : built.map(toYaml).join('---\n'));
   const why = $derived(cannotWrite(form.namespace));

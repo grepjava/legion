@@ -1,0 +1,3 @@
+import{A as e,J as t,M as n,O as r,U as i,Y as a,at as o,et as s,h as c,m as l,nt as u,ot as d,rt as f,v as p,y as m,z as h}from"./CEJTshlh.js";var g=n(`<span> </span>
+`,1),_=n(`<pre class="diff"></pre>`);function v(n,v){f(v,!0);let y=s(()=>v.text.split(`
+`).map(e=>({l:e,c:e.startsWith(`+++`)||e.startsWith(`---`)?`head`:e.startsWith(`+`)?`add`:e.startsWith(`-`)?`del`:e.startsWith(`@@`)?`hunk`:``})));var b=_();p(b,21,()=>h(y),m,(n,s)=>{let u=()=>h(s).l,d=()=>h(s).c;var f=g(),p=t(f),m=a(p,!0);o(),i(()=>{l(p,1,c(d())),r(m,u())}),e(n,f)}),d(b),e(n,b),u()}export{v as t};

@@ -4,6 +4,16 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
+    <script>
+      try {
+        const s = localStorage.getItem('color-scheme') ?? 'dark';
+        document.querySelector('meta[name="color-scheme"]').content =
+          s === 'light' || s === 'dark' ? s : 'light dark';
+        if (localStorage.getItem('legion.density') === 'compact') {
+          document.documentElement.dataset.density = 'compact';
+        }
+      } catch {}
+    </script>
     <link rel="icon" href="%sveltekit.assets%/favicon.svg" />
     %sveltekit.head%
   </head>

@@ -186,6 +186,69 @@ export const api = {
     if (res.status === 401) onSignedOut();
     if (!res.ok) throw new ApiError(res.status, data.error ?? res.statusText);
     return data as { namespace: string; name: string; node: string; bytes: number; taken: number };
+  },
+
+  /** Lists ZFS snapshots of a Volume (`legion volume snapshots`). */
+  volumeSnapshots: (namespace: string, name: string) =>
+    call<{ snapshots: string[] }>(
+      'GET',
+      `/api/volume-snapshots/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`
+    ),
+  /** Creates, rolls back, or deletes a ZFS snapshot on a Volume. */
+  volumeSnapshotOp: (
+    namespace: string,
+    name: string,
+    op: 'create' | 'rollback' | 'delete',
+    snapshot: string
+  ) =>
+    call<{ snapshots: string[] }>(
+      'POST',
+      `/api/volume-snapshots/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
+      { op, snapshot }
+    ),
+
+  /** Lists cached OCI jail images across ready nodes (`legion image ls`). */
+  nodeImages: (node = '') =>
+    call<{ images: CachedNodeImage[] }>(
+      'GET',
+      `/api/images${node ? `?node=${encodeURIComponent(node)}` : ''}`
+    ),
+  /** Pulls, pushes, removes, or prunes cached images on a node or across nodes. */
+  nodeImageOp: (body: {
+    op: 'pull' | 'push' | 'remove' | 'prune';
+    node?: string;
+    image?: string;
+    target?: string;
+    namespace?: string;
+    secret?: string;
+  }) => call<{ removed: number; digest: string }>('POST', '/api/images', body),
+  /** Uploads an OCI/Docker `.tar` archive onto `node` (`legion image load --node`). */
+  loadImage: async (file: File, to: { node: string; reference?: string }) => {
+    const params = new URLSearchParams({ node: to.node });
+    if (to.reference) params.set('reference', to.reference);
+    const res = await fetch(`/api/image-load?${params}`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'x-legion-csrf': csrf, 'content-type': 'application/octet-stream' },
+      body: file
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 401) onSignedOut();
+    if (!res.ok) throw new ApiError(res.status, data.error ?? res.statusText);
+    return data as { node: string; bytes: number; digest: string; images: CachedNodeImage[] };
+  },
+  /** Searches FreeBSD jail catalog and Docker Hub (`legion image search`). */
+  registrySearch: (query = '', limit = 20) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (query) params.set('query', query);
+    return call<{ results: RegistrySearchHit[] }>('GET', `/api/registry/search?${params}`);
+  },
+  /** Inspects an OCI/`ghcr.io`/Docker image (`legion image inspect`). */
+  registryInspect: (image: string, namespace = '', secret = '') => {
+    const params = new URLSearchParams({ image });
+    if (namespace) params.set('namespace', namespace);
+    if (secret) params.set('secret', secret);
+    return call<RegistryImageInspect>('GET', `/api/registry/inspect?${params}`);
   }
 };
 
@@ -193,8 +256,39 @@ export const api = {
 export const downloads = {
   backup: '/api/backup',
   volume: (namespace: string, name: string) =>
-    `/api/volume-backup/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`
+    `/api/volume-backup/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
+  image: (node: string, image: string, tag = '') => {
+    const params = new URLSearchParams({ node, image });
+    if (tag) params.set('tag', tag);
+    return `/api/image-export?${params}`;
+  }
 };
+
+export interface CachedNodeImage {
+  node: string;
+  reference: string;
+  digest: string;
+  os: string;
+  arch: string;
+  layers: number;
+}
+
+export interface RegistrySearchHit {
+  name: string;
+  description: string;
+  stars: number;
+  official: boolean;
+  source: string;
+  suggested_tag: string;
+}
+
+export interface RegistryImageInspect {
+  image: string;
+  digest: string;
+  platforms: { os: string; arch: string; digest: string }[];
+  tags: string[];
+  signed: boolean;
+}
 
 export interface AuditFilter {
   since_ms?: number;
@@ -298,9 +392,21 @@ export function exec(
   };
 }
 
+export interface VolumeSpace {
+  namespace: string;
+  name: string;
+  used_bytes: number;
+  avail_bytes: number;
+}
+
 export interface NodeUsage {
   node: string;
   tasks: { namespace: string; task: string; cpu_percent: number; memory_bytes: number }[];
+  zfs_used_bytes?: number;
+  zfs_avail_bytes?: number;
+  net_rx_bps?: number;
+  net_tx_bps?: number;
+  volumes?: VolumeSpace[];
 }
 
 /**
@@ -585,11 +691,17 @@ export interface TaskSeries {
   memory_limit_bytes: number;
 }
 
-/** `legion usage`: what tasks used over the last hour, as the leader sampled it. */
+/** A node's ZFS & network samples over the last hour: [at_ms, zfs_used_bytes, zfs_avail_bytes, net_rx_bps, net_tx_bps]. */
+export interface NodeSeries {
+  node: string;
+  samples: [number, number, number, number, number][];
+}
+
+/** `legion usage`: what tasks and nodes used over the last hour, as the leader sampled it. */
 export function usageHistory(
   namespace: string,
   task = ''
-): Promise<{ step_ms: number; tasks: TaskSeries[] }> {
+): Promise<{ step_ms: number; tasks: TaskSeries[]; nodes?: NodeSeries[] }> {
   const params = new URLSearchParams();
   if (namespace) params.set('namespace', namespace);
   if (task) params.set('task', task);
