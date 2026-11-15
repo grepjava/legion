@@ -550,6 +550,34 @@ Strings are whole sentences with `{name}` for what changes, so a
 translation orders words its own way. Names from the API (kinds, fields,
 the states it reports) and what users typed stay as they are.
 
+## After the evaluation
+
+A review of the console and `legion top` (2026-11-16) found both could
+show data that had stopped moving as if it were current, and `top`
+behind the console. Fixed:
+
+- *Live views say when they are not current.* The console's followed
+  streams (the watch of a kind, alerts, events) share one helper that
+  reconnects with a growing wait (1 s to 30 s), stops once the session is
+  gone (sending the user to sign in), and while any is broken a banner
+  says the page is not current. Before, a dropped stream left the last
+  list showing, error frames were ignored, and a failed listing was never
+  tried again. `legion top` says "not current" in its header when the
+  cluster's status or use can't be read, not only when its watch breaks.
+- *No inline script runs but the page's own.* The page policy allows
+  scripts from the console and, inline, only those in the built
+  `index.html`, by their SHA-256 (worked out once from the embedded page),
+  in place of `'unsafe-inline'`. The lab test slips a script into a page
+  and sees it not run.
+- *`legion top` caught up:* `R` restarts a service (asked), `n` runs a
+  cron job now, `e` follows the selected row's events in the pane, `A`
+  the alerts; Builds are listed with the workloads and ImagePolicies with
+  the config.
+- *Restoring a backup:* the Operations page gives the steps beside the
+  backup's download. A restore replaces a stopped manager's store on its
+  host, so the console, served by a manager that is up and out of reach
+  when the cluster is down, can't do it itself.
+
 ## Out of scope
 
 - Anything the API does not offer. A console-only feature would be a
