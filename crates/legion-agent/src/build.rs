@@ -87,7 +87,39 @@ pub(crate) async fn run(
             )))
         });
     let _ = tokio::fs::remove_dir_all(&dir).await;
+    forget(b, &tag(&short), result.is_ok()).await;
     result
+}
+
+/// The name a build gives its image in jailer's store.
+fn tag(short: &str) -> String {
+    format!("legion-build/{short}:1")
+}
+
+/// The build's image forgotten in jailer's store, pushed or not: the
+/// registry has it, and `jailer rmi` destroys the layers nothing else uses.
+/// The base images stay, for the next build, and jailer bounds its build
+/// cache itself. A build that failed before tagging has nothing to forget.
+async fn forget(b: &Builder, tag: &str, built: bool) {
+    let (program, before) = b.jailer.split_first().expect("checked");
+    match Command::new(program)
+        .args(before)
+        .args(["rmi", tag])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => {}
+        Ok(o) if !built => tracing::debug!(
+            "jailer rmi {tag} after the failed build: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Ok(o) => tracing::warn!(
+            "jailer rmi {tag}: {}; it stays in jailer's store",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => tracing::warn!("jailer rmi {tag}: {e}"),
+    }
 }
 
 async fn build(
@@ -136,7 +168,7 @@ async fn build(
         env.push(("REGISTRY_AUTH_FILE".to_owned(), auth.display().to_string()));
     }
     let record = dir.join("record.json");
-    let tag = format!("legion-build/{short}:1");
+    let tag = tag(short);
     let (program, before) = b.jailer.split_first().expect("checked");
     let mut common: Vec<String> = before.to_vec();
     for p in &opts.plain_http {
@@ -278,4 +310,47 @@ async fn pass(
 
 fn frame(f: Frame) -> SessionFrame {
     SessionFrame { frame: Some(f) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stand-in jailer writing its arguments down, failing as told.
+    fn jailer(dir: &Path, exit: i32) -> Builder {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("jailer");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {}/args\nexit {exit}\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Builder {
+            jailer: vec![
+                script.display().to_string(),
+                "--state-dir".into(),
+                "/var/db/jailer".into(),
+            ],
+            work: dir.to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_built_image_is_forgotten_with_the_jailer_arguments_given() {
+        let dir = tempfile::tempdir().unwrap();
+        forget(&jailer(dir.path(), 0), &tag("abc123"), true).await;
+        let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
+        assert_eq!(
+            args.trim(),
+            "--state-dir /var/db/jailer rmi legion-build/abc123:1"
+        );
+        // Nothing to forget after a failed build: said, and no harm done.
+        forget(&jailer(dir.path(), 1), &tag("def456"), false).await;
+        let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
+        assert_eq!(args.lines().count(), 2, "{args}");
+    }
 }
