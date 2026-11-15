@@ -347,11 +347,15 @@ on the host, as its agent is told, the way a Volume's data is sent.
 
 **Builds built** as designed: the `Build` kind, the leader's builds
 controller, the agent's `--jailer` (and `--jailer-arg`), `legion
-build-logs [-f]`, the console's Builds, a Build's Log tab (followed while it
-runs, saying how it ended) and a Service's "Build a new image". The lab
+build-logs [-f]`, the console's Builds, a Build's Log tab (followed while
+it runs, saying how it ended) and a Service's "Build a new image". The lab
 found three things on the way: the test labelling its node before it had
 joined, the Log tab never saying the build had ended, and the test asking
-the published port from the host itself, which pf does not redirect.
+the published port from the host itself, which pf does not redirect. After
+each build, pushed or not, the agent runs `jailer rmi` on its image, as
+the registry has it: its base images and jailer's build cache stay for the
+next build (the cache is bounded by jailer's `--cache-max`, and `rmi`
+keeps what the cache uses).
 
 **Done when: met** (`the_console_builds_an_example_with_jailer`, passed on
 66b8f8f). One node, labelled a builder, with jailer and a registry the test
