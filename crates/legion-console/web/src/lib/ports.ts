@@ -55,7 +55,7 @@ export function reach(
   const out: Reach[] = [];
   const name = service.metadata.name;
   const ports: { name?: string; port: number; protocol?: string; publish?: string }[] =
-    service.spec?.ports ?? [];
+    service.spec?.endpoint?.ports ?? [];
   const published: { port: number; protocol: string; publishedPort: number }[] =
     service.status?.publishedPorts ?? [];
   const running = tasks.filter(
