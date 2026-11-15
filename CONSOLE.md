@@ -505,7 +505,15 @@ not yet checked by a tool or a screen reader):
   devDependency) on sixteen pages against WCAG 2.2 A and AA; its first run
   found links in text told apart by colour alone, now underlined. It
   passed on 4373b5f.
-- *Still to do.* A screen reader pass, and the charts' values as a table.
+- *Screen readers* (2026-11-15). Each chart's samples as a table behind a
+  disclosure, scrolled in a focusable region; changes said as they happen
+  where they were only shown: the alert count (a polite live region in the
+  side bar) and a rollout's state; the network matrix's row headers marked
+  as such. The lab test reads Chromium's accessibility tree, what screen
+  readers are given, on every page axe checks and a Service's usage and
+  events: every control named, one level-1 heading, the main landmark.
+  *Still to do:* a pass with a real screen reader (NVDA, VoiceOver), which
+  the lab cannot run.
 
 **In the lab** (`the_console_runs_the_cluster`, phase 6, passed on
 4373b5f): the admin names the cluster and sets a banner, which the
