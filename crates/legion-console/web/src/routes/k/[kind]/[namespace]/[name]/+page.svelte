@@ -15,6 +15,7 @@
   import UsageCharts from '#lib/UsageCharts.svelte';
   import VolumeData from '#lib/VolumeData.svelte';
   import BuildLog from '#lib/BuildLog.svelte';
+  import Events from '#lib/Events.svelte';
   import { session } from '#lib/session.svelte.ts';
   import { toYaml } from '#lib/yaml.ts';
 
@@ -35,6 +36,7 @@
     | 'terminal'
     | 'data'
     | 'buildlog'
+    | 'events'
     | 'yaml' =
     $state('details');
 
@@ -77,6 +79,10 @@
         ]
       : []),
     ...(kind === 'Build' ? [{ id: 'buildlog', label: t('Log') }] : []),
+    // The kinds events are worked out for (legion_api::event::KINDS).
+    ...(['Task', 'Service', 'Job', 'Node', 'Volume', 'Build'].includes(kind)
+      ? [{ id: 'events', label: t('Events') }]
+      : []),
     { id: 'yaml', label: t('YAML') }
   ] as { id: typeof tab; label: string }[]);
   // The tabs as WAI-ARIA's pattern has them: one stop for Tab, arrows,
@@ -167,6 +173,8 @@
     </dl>
   {:else if tab === 'buildlog'}
     <BuildLog build={object} />
+  {:else if tab === 'events'}
+    <Events {kind} {namespace} {name} />
   {:else if tab === 'tasks'}
     <NodeTasks node={object} />
   {:else if tab === 'search'}

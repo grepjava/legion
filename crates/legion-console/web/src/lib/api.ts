@@ -462,6 +462,57 @@ export interface Alert {
  * time, `failed` why the stream broke. Reconnects after a break. Returns a
  * function that stops it.
  */
+export interface ObjectEvent {
+  at_ms: number;
+  kind: string;
+  namespace: string;
+  name: string;
+  reason: string;
+  message: string;
+  /** A task's Service or Job. */
+  owner: string;
+}
+
+/** What happened to an object lately (a Service's or Job's with its
+ * tasks'), as `legion events -w`: those kept, then each as it comes; open
+ * again when the connection drops, from the start. */
+export function followEvents(
+  namespace: string,
+  kind: string,
+  name: string,
+  update: (events: ObjectEvent[]) => void,
+  failed: (why: string) => void
+): () => void {
+  let stopped = false;
+  let socket: WebSocket | null = null;
+  let retry: ReturnType<typeof setTimeout> | null = null;
+  function start() {
+    if (stopped) return;
+    let all: ObjectEvent[] = [];
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const query = new URLSearchParams({ namespace, kind, name });
+    socket = new WebSocket(`${proto}//${location.host}/api/events?${query}`);
+    socket.onmessage = (m) => {
+      const e = JSON.parse(m.data);
+      if (e.error) failed(e.error);
+      else {
+        failed('');
+        all = [...all, ...e.events];
+        update(all);
+      }
+    };
+    socket.onclose = () => {
+      if (!stopped) retry = setTimeout(start, 2000);
+    };
+  }
+  start();
+  return () => {
+    stopped = true;
+    if (retry) clearTimeout(retry);
+    socket?.close();
+  };
+}
+
 export function followAlerts(
   update: (alerts: Alert[]) => void,
   failed: (why: string) => void
