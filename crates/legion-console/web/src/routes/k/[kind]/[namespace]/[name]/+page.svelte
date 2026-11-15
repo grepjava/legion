@@ -18,7 +18,7 @@
   import VolumeData from '#lib/VolumeData.svelte';
   import BuildLog from '#lib/BuildLog.svelte';
   import Events from '#lib/Events.svelte';
-  import { openWorkbench, session } from '#lib/session.svelte.ts';
+  import { cannotWrite, openWorkbench, session } from '#lib/session.svelte.ts';
   import { toYaml } from '#lib/yaml.ts';
 
   const kind = $derived(page.params.kind ?? '');
@@ -126,6 +126,7 @@
         <button
           type="button"
           class="sm"
+          data-look
           onclick={() =>
             openWorkbench({
               id: `logs:${namespace}:${name}`,
@@ -140,6 +141,8 @@
           <button
             type="button"
             class="sm"
+            disabled={!!cannotWrite(namespace)}
+            title={cannotWrite(namespace) ?? ''}
             onclick={() =>
               openWorkbench({
                 id: `term:${namespace}:${name}`,
@@ -155,6 +158,7 @@
         <button
           type="button"
           class="sm"
+          data-look
           onclick={() =>
             openWorkbench({
               id: `build:${namespace}:${name}`,
@@ -170,6 +174,7 @@
         <button
           type="button"
           class="sm"
+          data-look
           onclick={() =>
             openWorkbench({
               id: `events:${kind}:${namespace}:${name}`,

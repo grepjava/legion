@@ -954,6 +954,7 @@
                     <button
                       type="button"
                       class="sm"
+                      data-look
                       onclick={() =>
                         openWorkbench({
                           id: `build:${workNs}/${b.metadata.name}`,

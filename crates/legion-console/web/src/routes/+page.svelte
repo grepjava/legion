@@ -16,7 +16,7 @@
   import Quotas from '#lib/Quotas.svelte';
   import UsageCharts from '#lib/UsageCharts.svelte';
   import { t } from '#lib/i18n.svelte.ts';
-  import { openWorkbench, session } from '#lib/session.svelte.ts';
+  import { cannotWrite, openWorkbench, session } from '#lib/session.svelte.ts';
 
   let status: Status | null = $state(null);
   let statusError = $state('');
@@ -345,6 +345,7 @@
             <button
               type="button"
               class="sm"
+              data-look
               onclick={() => dockLogs(task)}
               aria-label={t('Logs for {name}', { name: task.metadata.name })}
             >
@@ -385,6 +386,7 @@
             <button
               type="button"
               class="sm"
+              data-look
               onclick={() => dockLogs(task)}
               aria-label={t('Logs for {name}', { name: task.metadata.name })}
             >
@@ -393,6 +395,8 @@
             <button
               type="button"
               class="sm"
+              disabled={!!cannotWrite(task.metadata.namespace ?? '')}
+              title={cannotWrite(task.metadata.namespace ?? '') ?? ''}
               onclick={() => dockShell(task)}
               aria-label={t('Shell in {name}', { name: task.metadata.name })}
             >

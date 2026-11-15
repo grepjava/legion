@@ -5,7 +5,7 @@
   import { api, type LObject } from './api.ts';
   import { t } from './i18n.svelte.ts';
   import { plural } from './kinds.ts';
-  import { openWorkbench, session, setDensity, setTheme } from './session.svelte.ts';
+  import { cannotWrite, openWorkbench, session, setDensity, setTheme } from './session.svelte.ts';
 
   interface Item {
     id: string;
@@ -131,7 +131,7 @@
               object: o
             })
         });
-        if (o.status?.state === 'running') {
+        if (o.status?.state === 'running' && !cannotWrite(ns)) {
           base.push({
             id: `term:${ns}:${o.metadata.name}`,
             group: actGroup,
