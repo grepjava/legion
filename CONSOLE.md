@@ -552,7 +552,7 @@ the states it reports) and what users typed stay as they are.
 
 ## After the evaluation
 
-A review of the console and `legion top` (2026-11-16) found both could
+A review of the console and `legion top` (2026-11-15) found both could
 show data that had stopped moving as if it were current, and `top`
 behind the console. Fixed:
 
@@ -577,6 +577,56 @@ behind the console. Fixed:
   backup's download. A restore replaces a stopped manager's store on its
   host, so the console, served by a manager that is up and out of reach
   when the cluster is down, can't do it itself.
+
+## What a desktop container tool offers
+
+Set against what Docker Desktop gives one machine, the console lacked a
+handful of things a cluster wants too (2026-11-15). Each is in the API and
+the CLI first, as everything is:
+
+- *A task's files* (`legion files`, `legion cp`, a task's Files tab):
+  listed, downloaded and uploaded in its container's root, its Volumes'
+  mounts included. It takes what a shell in the task takes. The agent,
+  root on the host, opens each component of a path from the root with
+  `O_NOFOLLOW`, so a link the container's processes put on the way is
+  refused, never followed out; an upload goes to a new file renamed into
+  place, whole or not at all.
+- *Image details*: an image's build history (each step and the layer it
+  added), how it runs (entrypoint, user, ports, labels), and which
+  services, Jobs and cron jobs name it, of those the caller may read;
+  from the registry, or from a node's cached copy (`legion images inspect
+  --node`) for what no registry serves.
+- *Vulnerabilities* (`legion images scan`, Scan on a cached image): the
+  image's FreeBSD packages, read from its files by `pkg query`, checked by
+  the node's own `pkg audit` against FreeBSD's VuXML (fetched again when
+  over an hour old), with every package listed as its bill of materials.
+  An image without a package database (a Linux one) has nothing to audit,
+  and says so.
+- *Opening a published port*: a service's page links its ingress ports
+  through the node the console is served from (the routing mesh answers
+  on every node), its host ports on the nodes running it, its load
+  balancer's address and its Routes.
+- *Stopping a service* (`legion stop`, `legion start`, Stop on its page,
+  `o` in `legion top`): `stopped` in its spec, so its tasks go and its
+  replica count stays for the start. A paused node keeps no global task
+  of a stopped service.
+- *Stacks* (the Stacks page, `legion stack ls|stop|start`): what a compose
+  file became, by its `legion.stack` label, shown, stopped, started and
+  removed together; removing one keeps its Volumes, as `legion stack rm`
+  does.
+- *Disk use* (the Disk usage page): each node's space under Legion's ZFS
+  root by what holds it (images, tasks' roots, Volumes, the rest) and
+  jailer's build store beside it, from the agents' heartbeats, with
+  unused images and the build cache (`jailer prune`, `legion images prune
+  --builds`) reclaimed from there.
+- *Diagnostics* (`legion diagnose`, the Diagnostics page): `legion
+  doctor`'s checks run by every node's agent, and a support bundle
+  (`legion support-bundle`): the cluster's objects without its Secrets,
+  environment values and what else could be secret masked, its alerts,
+  the last hour's events and the diagnosis. Read it before sending it.
+
+Not yet: pausing a task's processes, which wants its probes held and the
+pause carried to its agent, not only a signal sent.
 
 ## Out of scope
 

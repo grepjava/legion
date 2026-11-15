@@ -702,6 +702,11 @@ spec:
         "/apply",
         "/topology",
         "/network",
+        "/disk",
+        "/diagnostics",
+        "/stacks",
+        "/images",
+        "/volumes",
         "/cluster",
         "/audit",
         "/settings",
@@ -792,6 +797,205 @@ spec:
         c.lab.ok(&["delete", "service", s, "-n", "team-a"]);
     }
     drop(e);
+
+    step("phase 7: hello stopped from its page, its tasks gone; started, back as many");
+    let desired = |c: &Console| c.get("service", "team-a", "hello")["status"]["desired"].as_u64();
+    let before = desired(&c).expect("hello's desired count");
+    c.page(&mut a, "/k/Service/team-a/hello");
+    a.click("Stop");
+    wait("hello stopped", 120, || {
+        let s = c.get("service", "team-a", "hello");
+        s["spec"]["stopped"] == true && s["status"]["running"].as_u64() == Some(0)
+    });
+    c.page(&mut a, "/k/Service");
+    a.shows("stopped", 30);
+    c.page(&mut a, "/k/Service/team-a/hello");
+    a.click("Start");
+    wait("hello started", 180, || {
+        let s = c.get("service", "team-a", "hello");
+        s["status"]["ready"].as_u64() == Some(before)
+    });
+
+    step("phase 7: a published port opened from the service's page");
+    let web = c.lab.dir.join("published.yaml");
+    std::fs::write(
+        &web,
+        format!(
+            "apiVersion: legion/v1\nkind: Service\nmetadata: {{ name: published, namespace: team-a }}\n\
+             spec:\n  pod: {{ containers: [{{ name: c, image: {IMAGE}, command: [/bin/sleep, \"86400\"] }}] }}\n\
+             \x20 ports: [{{ port: 8080, publish: ingress, publishedPort: 30080 }}]\n"
+        ),
+    )
+    .unwrap();
+    c.lab.ok(&["apply", "-f", web.to_str().unwrap()]);
+    c.page(&mut a, "/k/Service/team-a/published");
+    let link = format!("http://{}:30080", c.lab.host);
+    a.until("the port's link", 60, |b| {
+        b.eval(&format!("!!document.querySelector('a[href=\"{link}\"]')")) == Value::Bool(true)
+    });
+    c.lab
+        .ok(&["delete", "service", "published", "-n", "team-a"]);
+
+    step("phase 7: an image's details: how it was built and what runs it");
+    // Whichever node caches the image hello runs now, as the list says.
+    let images = a.eval("fetch('/api/images').then((r) => r.json())");
+    let hellos = images["images"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|i| {
+            i["used_by"]
+                .as_array()
+                .is_some_and(|u| u.iter().any(|w| w == "Service team-a/hello"))
+        })
+        .unwrap_or_else(|| panic!("no cached image used by hello: {images}"));
+    let details = a.eval(&format!(
+        "fetch('/api/registry/inspect?node={}&image=' + encodeURIComponent({})).then((r) => r.json())",
+        hellos["node"].as_str().unwrap(),
+        hellos["reference"]
+    ));
+    assert_eq!(details["os"], "freebsd", "{details}");
+    assert!(
+        details["used_by"]
+            .as_array()
+            .is_some_and(|u| u.iter().any(|w| w == "Service team-a/hello")),
+        "{details}"
+    );
+    c.page(&mut a, "/images");
+    a.click("Details");
+    a.shows("Runs on", 60);
+
+    step("phase 7: that image scanned against FreeBSD's VuXML");
+    let scan = a.eval(&format!(
+        "fetch('/api/images/scan?node={}&image=' + encodeURIComponent({})).then((r) => r.json())",
+        hellos["node"].as_str().unwrap(),
+        hellos["reference"]
+    ));
+    assert!(
+        scan["packages"]
+            .as_array()
+            .is_some_and(|p| p.iter().any(|p| p["name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("FreeBSD-")))),
+        "a FreeBSD base image's packages: {scan}"
+    );
+    assert!(scan["vulnerable"].is_array(), "{scan}");
+    eprintln!(
+        "{} packages, {} vulnerable",
+        scan["packages"].as_array().map_or(0, Vec::len),
+        scan["vulnerable"].as_array().map_or(0, Vec::len)
+    );
+
+    step("phase 7: a compose stack shown together, stopped and started as one");
+    let compose = c.lab.dir.join("compose.yaml");
+    std::fs::write(
+        &compose,
+        format!(
+            "services:\n  web:\n    image: {IMAGE}\n    command: [/bin/sleep, \"86400\"]\n  \
+             worker:\n    image: {IMAGE}\n    command: [/bin/sleep, \"86400\"]\n"
+        ),
+    )
+    .unwrap();
+    c.lab.ok(&[
+        "stack",
+        "deploy",
+        "demo",
+        "-c",
+        compose.to_str().unwrap(),
+        "-n",
+        "team-a",
+    ]);
+    c.page(&mut a, "/stacks");
+    a.until("the demo stack, running", 120, |b| {
+        let t = b.text();
+        t.contains("demo") && t.contains("2 of 2 tasks ready")
+    });
+    a.click("Stop all");
+    a.until("the demo stack, stopped", 120, |b| {
+        let t = b.text();
+        t.contains("0 of 0 tasks ready")
+    });
+    assert!(
+        c.lab
+            .ok(&["stack", "ls", "-n", "team-a"])
+            .contains("stopped")
+    );
+    a.click("Start all");
+    a.until("the demo stack, back", 180, |b| {
+        b.text().contains("2 of 2 tasks ready")
+    });
+    c.lab.ok(&["stack", "rm", "demo", "-n", "team-a"]);
+
+    step("phase 7: the disk page says what holds each node's space");
+    c.page(&mut a, "/disk");
+    a.until("n1's disk", 60, |b| {
+        let t = b.text();
+        t.contains("n1") && t.contains("Images") && t.contains("Volumes")
+    });
+
+    step("phase 7: a file copied into keeper's Volume, listed, and copied back out");
+    let local = c.lab.dir.join("hello.txt");
+    std::fs::write(&local, "kept in the Volume\n").unwrap();
+    let into = c.lab.ok(&[
+        "cp",
+        local.to_str().unwrap(),
+        "keeper:/data/hello.txt",
+        "-n",
+        "team-a",
+    ]);
+    eprintln!("{into}");
+    assert!(
+        c.lab
+            .ok(&["files", "keeper", "/data", "-n", "team-a"])
+            .contains("hello.txt"),
+        "legion files lists it"
+    );
+    let listed = a.eval("fetch('/api/files/team-a/keeper?path=/data').then((r) => r.json())");
+    assert!(
+        listed["entries"]
+            .as_array()
+            .is_some_and(|e| e.iter().any(|f| f["name"] == "hello.txt")),
+        "{listed}"
+    );
+    let back = c.lab.dir.join("hello-back.txt");
+    c.lab.ok(&[
+        "cp",
+        "keeper:/data/hello.txt",
+        back.to_str().unwrap(),
+        "-n",
+        "team-a",
+    ]);
+    assert_eq!(
+        std::fs::read_to_string(&back).unwrap(),
+        "kept in the Volume\n"
+    );
+
+    step("phase 7: the nodes diagnosed, and a support bundle without the Secrets");
+    let secret = c.lab.dir.join("bundled-secret.yaml");
+    std::fs::write(
+        &secret,
+        "apiVersion: legion/v1\nkind: Secret\nmetadata: { name: kept-out, namespace: team-a }\nspec: { text: never-in-a-bundle }\n",
+    )
+    .unwrap();
+    c.lab.ok(&["apply", "-f", secret.to_str().unwrap()]);
+    c.page(&mut a, "/diagnostics");
+    a.until("each node's findings", 90, |b| {
+        let t = b.text();
+        ["n1", "n2", "n3"].iter().all(|n| t.contains(n)) && t.contains("module.pf")
+    });
+    let bundle = a.eval("fetch('/api/support-bundle').then((r) => r.text())");
+    let bundle = bundle.as_str().unwrap_or_default();
+    assert!(
+        bundle.contains("\"diagnosis\""),
+        "{}",
+        &bundle[..bundle.len().min(400)]
+    );
+    assert!(
+        !bundle.contains("never-in-a-bundle"),
+        "the Secret's text is in the bundle"
+    );
+    c.lab.ok(&["delete", "secret", "kept-out", "-n", "team-a"]);
 
     step("phases 3 and 4: n2 lost, alerted within 30 s, removed from the console; its Volume lost");
     // Watched where an operator would: the alerts page, open before n2 goes.
