@@ -120,6 +120,7 @@ fn cluster() -> Model {
                 cpu_percent: 25.0,
                 memory_bytes: 64 << 20,
             }],
+            ..Default::default()
         }],
     });
     m
@@ -884,6 +885,7 @@ fn renders_max_scale_cluster_of_256_nodes_and_20000_tasks() {
         nodes: vec![pb::NodeUsage {
             node: "n-000".into(),
             tasks: tasks_usage,
+            ..Default::default()
         }],
     });
 
@@ -1125,4 +1127,140 @@ fn a_poll_that_fails_says_so_until_it_reads_again() {
     assert!(screen(&m, &v).contains("not current: the cluster's status"));
     m.polled = None;
     assert!(!screen(&m, &v).contains("not current"));
+}
+
+#[test]
+fn braille_graphs_and_rgb_heat_gradients() {
+    let lines = draw::braille_lines(&[1.0, 2.0, 4.0, 8.0], 8.0, 4, 2);
+    assert_eq!(lines.len(), 2);
+    let rendered: String = lines
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered
+            .chars()
+            .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)),
+        "expected active Unicode braille dots: {rendered:?}"
+    );
+    assert!(matches!(
+        draw::heat_rgb(0.1),
+        ratatui::style::Color::Rgb(..)
+    ));
+    assert!(matches!(
+        draw::heat_rgb(0.9),
+        ratatui::style::Color::Rgb(..)
+    ));
+}
+
+#[test]
+fn bento_and_telemetry_presets_show_zfs_and_network() {
+    let mut m = cluster();
+    m.usage(pb::UsageResponse {
+        nodes: vec![pb::NodeUsage {
+            node: "n1".into(),
+            zfs_used_bytes: 12 << 30,
+            zfs_avail_bytes: 36 << 30,
+            net_rx_bps: 2 << 20,
+            net_tx_bps: 512 << 10,
+            volumes: vec![pb::VolumeTelemetry {
+                namespace: "shop".into(),
+                volume: "data".into(),
+                used_bytes: 256 << 20,
+                avail_bytes: 768 << 20,
+            }],
+            tasks: vec![pb::TaskUsage {
+                namespace: "shop".into(),
+                task: "web-1-1".into(),
+                cpu_percent: 25.0,
+                memory_bytes: 64 << 20,
+            }],
+        }],
+    });
+    let mut v = View::default();
+    // Classic modeStorage shows live ZFS volume used/size gauge when reported.
+    typed(&mut v, &m, "4");
+    assert_eq!(
+        line(&screen(&m, &v), "data"),
+        "shop data zfs 256Mi/1Gi n1 web-1-1,web-2-1"
+    );
+
+    // Cycle to Bento multi-box dashboard (`b`), then Telemetry (`b`), then Classic (`b`).
+    typed(&mut v, &m, "1b");
+    assert_eq!(v.preset, Preset::Bento);
+    let s = screen_sized(&m, &v, 150, 32);
+    assert!(s.contains("[bento]"), "{s}");
+    assert!(s.contains("12Gi/48Gi"), "{s}");
+    assert!(s.contains("▼2Mi/s ▲512Ki/s"), "{s}");
+    assert!(
+        s.contains("²Nodes") && s.contains("³Workloads") && s.contains("⁴Tasks"),
+        "{s}"
+    );
+
+    // Box toggles (`!`, `@`) hide/show individual boxes cleanly.
+    typed(&mut v, &m, "@");
+    assert!(!v.boxes[1]);
+    let s = screen_sized(&m, &v, 150, 32);
+    assert!(!s.contains("²Nodes") && s.contains("³Workloads"), "{s}");
+    typed(&mut v, &m, "@b");
+    assert_eq!(v.preset, Preset::Telemetry);
+    let s = screen_sized(&m, &v, 150, 26);
+    assert!(s.contains("[telemetry]") && s.contains("12Gi/48Gi"), "{s}");
+    typed(&mut v, &m, "b");
+    assert_eq!(v.preset, Preset::Classic);
+}
+
+#[test]
+fn workload_tree_sorting_poll_stepping_and_service_logs() {
+    let m = cluster();
+    let mut v = View::default();
+
+    // Expand workload -> task -> jail tree (`t`) on Workloads tab.
+    typed(&mut v, &m, "2t");
+    assert!(v.tree);
+    let s = screen(&m, &v);
+    assert!(s.contains("├─ web-1-1") && s.contains("jid 494"), "{s}");
+    assert!(s.contains("└─ web-2-1"), "{s}");
+
+    // `L` on Service requests multiplexed logs across all running pods.
+    typed(&mut v, &m, "t");
+    assert!(!v.tree);
+    let req = typed(&mut v, &m, "L");
+    assert_eq!(
+        req,
+        Some(Request::ServiceLogs {
+            namespace: "shop".into(),
+            kind: Kind::Service,
+            name: "web".into(),
+        })
+    );
+    v.show_logs(req.as_ref().unwrap());
+    v.logs
+        .as_mut()
+        .unwrap()
+        .push_prefixed("web-1-1", false, b"ready on 80\n");
+    let s = screen_sized(&m, &v, 130, 30);
+    assert!(
+        s.contains("all tasks of service shop/web") && s.contains("[web-1-1] ready on 80"),
+        "{s}"
+    );
+    typed(&mut v, &m, "\x1b");
+
+    // Sort tasks by CPU ascending (`>S`) so idle `web-2-1` precedes `web-1-1`.
+    typed(&mut v, &m, "3>S");
+    assert_eq!(v.sort, SortCol::Cpu);
+    assert!(!v.sort_desc);
+    let s = screen(&m, &v);
+    assert!(
+        s.find("web-2-1").unwrap() < s.find("web-1-1").unwrap(),
+        "{s}"
+    );
+
+    // Poll interval steps faster (`+`) and slower (`-`).
+    assert_eq!(v.poll_ms, 5000);
+    typed(&mut v, &m, "++");
+    assert_eq!(v.poll_ms, 1000);
+    typed(&mut v, &m, "---");
+    assert_eq!(v.poll_ms, 10000);
 }

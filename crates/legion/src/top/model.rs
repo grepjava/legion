@@ -23,6 +23,15 @@ pub(super) const LABEL_SERVICE: &str = "legion.service";
 /// An object's kind, namespace and name.
 pub type Key = (Kind, String, String);
 
+/// Host ZFS pool and network throughput telemetry reported by a node.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct NodeMetrics {
+    pub(super) zfs_used: u64,
+    pub(super) zfs_avail: u64,
+    pub(super) net_rx_bps: u64,
+    pub(super) net_tx_bps: u64,
+}
+
 /// The cluster as last heard.
 #[derive(Default)]
 pub struct Model {
@@ -31,8 +40,14 @@ pub struct Model {
     pub(super) objects: BTreeMap<Key, Object>,
     /// What tasks use, by namespace and task: percent of a CPU, bytes.
     pub(super) usage: BTreeMap<String, BTreeMap<String, (f64, u64)>>,
+    /// Host ZFS and network metrics by node name.
+    pub(super) node_telemetry: BTreeMap<String, NodeMetrics>,
+    /// Per-volume ZFS `(used_bytes, avail_bytes)` by `(namespace, volume)`.
+    pub(super) volume_telemetry: BTreeMap<(String, String), (u64, u64)>,
     /// What all tasks used, at each poll.
     pub(super) history: VecDeque<(f64, u64)>,
+    /// Cluster-wide `(zfs_used, zfs_avail, net_rx_bps, net_tx_bps)` at each poll.
+    pub(super) telemetry_history: VecDeque<(u64, u64, u64, u64)>,
     /// What changed, newest first, with when (Unix seconds).
     pub(super) log: VecDeque<(i64, String)>,
     pub(super) cluster: Option<pb::StatusResponse>,
@@ -107,18 +122,75 @@ impl Model {
 
     pub(super) fn usage(&mut self, u: pb::UsageResponse) {
         self.usage.clear();
+        self.node_telemetry.clear();
+        self.volume_telemetry.clear();
         let mut total = (0.0, 0);
-        for t in u.nodes.into_iter().flat_map(|n| n.tasks) {
-            total = (total.0 + t.cpu_percent, total.1 + t.memory_bytes);
-            self.usage
-                .entry(t.namespace)
-                .or_default()
-                .insert(t.task, (t.cpu_percent, t.memory_bytes));
+        let mut zfs_used_sum = 0u64;
+        let mut zfs_avail_sum = 0u64;
+        let mut net_rx_sum = 0u64;
+        let mut net_tx_sum = 0u64;
+        for n in u.nodes {
+            zfs_used_sum = zfs_used_sum.saturating_add(n.zfs_used_bytes);
+            zfs_avail_sum = zfs_avail_sum.saturating_add(n.zfs_avail_bytes);
+            net_rx_sum = net_rx_sum.saturating_add(n.net_rx_bps);
+            net_tx_sum = net_tx_sum.saturating_add(n.net_tx_bps);
+            if n.zfs_used_bytes > 0 || n.zfs_avail_bytes > 0 || n.net_rx_bps > 0 || n.net_tx_bps > 0
+            {
+                self.node_telemetry.insert(
+                    n.node.clone(),
+                    NodeMetrics {
+                        zfs_used: n.zfs_used_bytes,
+                        zfs_avail: n.zfs_avail_bytes,
+                        net_rx_bps: n.net_rx_bps,
+                        net_tx_bps: n.net_tx_bps,
+                    },
+                );
+            }
+            for v in n.volumes {
+                if v.used_bytes > 0 || v.avail_bytes > 0 {
+                    self.volume_telemetry
+                        .insert((v.namespace, v.volume), (v.used_bytes, v.avail_bytes));
+                }
+            }
+            for t in n.tasks {
+                total = (total.0 + t.cpu_percent, total.1 + t.memory_bytes);
+                self.usage
+                    .entry(t.namespace)
+                    .or_default()
+                    .insert(t.task, (t.cpu_percent, t.memory_bytes));
+            }
         }
         self.history.push_back(total);
         while self.history.len() > HISTORY {
             self.history.pop_front();
         }
+        self.telemetry_history
+            .push_back((zfs_used_sum, zfs_avail_sum, net_rx_sum, net_tx_sum));
+        while self.telemetry_history.len() > HISTORY {
+            self.telemetry_history.pop_front();
+        }
+    }
+
+    pub(super) fn zfs_totals(&self) -> (u64, u64) {
+        self.telemetry_history
+            .back()
+            .map_or((0, 0), |(u, a, _, _)| (*u, *a))
+    }
+
+    pub(super) fn net_totals(&self) -> (u64, u64) {
+        self.telemetry_history
+            .back()
+            .map_or((0, 0), |(_, _, rx, tx)| (*rx, *tx))
+    }
+
+    pub(super) fn node_metrics(&self, node: &str) -> Option<NodeMetrics> {
+        self.node_telemetry.get(node).copied()
+    }
+
+    pub(super) fn volume_space(&self, namespace: &str, volume: &str) -> Option<(u64, u64)> {
+        self.volume_telemetry
+            .get(&(namespace.to_owned(), volume.to_owned()))
+            .copied()
     }
 
     pub(super) fn of(&self, kind: Kind) -> impl Iterator<Item = &Object> {

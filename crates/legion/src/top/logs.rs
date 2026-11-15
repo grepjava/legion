@@ -1,7 +1,7 @@
 //! Logs followed in a pane under the table: the lines that came, cleaned
 //! of what would upset the screen, and how far back the person looks.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 /// The most lines kept; older ones go.
 const KEPT: usize = 5000;
@@ -16,6 +16,8 @@ pub(super) struct Logs {
     pub(super) lines: VecDeque<(bool, String)>,
     /// What came after the last newline, of stdout and of stderr.
     partial: [String; 2],
+    /// Partial lines per pod source when multiplexing multiple tasks.
+    prefixed_partial: BTreeMap<(String, bool), String>,
     /// Lines scrolled back from the newest; 0 follows them.
     pub(super) back: usize,
     /// Why no more come.
@@ -30,6 +32,7 @@ impl Logs {
             of,
             lines: VecDeque::new(),
             partial: Default::default(),
+            prefixed_partial: BTreeMap::new(),
             back: 0,
             ended: None,
             titled: false,
@@ -41,6 +44,31 @@ impl Logs {
         Logs {
             titled: true,
             ..Logs::new(title)
+        }
+    }
+
+    /// What came on stdout or stderr from one named task in a multiplexed stream.
+    pub(super) fn push_prefixed(&mut self, source: &str, stderr: bool, data: &[u8]) {
+        let partial = self
+            .prefixed_partial
+            .entry((source.to_owned(), stderr))
+            .or_default();
+        partial.push_str(&String::from_utf8_lossy(data));
+        let mut lines = Vec::new();
+        if let Some(end) = partial.rfind('\n') {
+            let done: String = partial.drain(..=end).collect();
+            lines.extend(done.lines().map(|l| format!("[{source}] {}", clean(l))));
+        }
+        while partial.len() > LONGEST {
+            let mut cut = LONGEST;
+            while !partial.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let head: String = partial.drain(..cut).collect();
+            lines.push(format!("[{source}] {}", clean(&head)));
+        }
+        if !lines.is_empty() {
+            self.add(stderr, lines);
         }
     }
 
@@ -72,6 +100,12 @@ impl Logs {
             let rest = std::mem::take(&mut self.partial[usize::from(stderr)]);
             if !rest.is_empty() {
                 self.add(stderr, vec![clean(&rest)]);
+            }
+        }
+        let prefixed = std::mem::take(&mut self.prefixed_partial);
+        for ((source, stderr), rest) in prefixed {
+            if !rest.is_empty() {
+                self.add(stderr, vec![format!("[{source}] {}", clean(&rest))]);
             }
         }
         self.ended = Some(why);

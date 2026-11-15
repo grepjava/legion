@@ -24,16 +24,20 @@ use legion_proto::v1::{
     self as pb, ListRequest, ObjectRef, StatusRequest, WatchRequest, watch_event,
 };
 use ratatui::backend::Backend;
-use ratatui::crossterm::event::{self, Event, KeyEvent, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEvent, KeyEventKind, MouseEvent,
+};
 use ratatui::layout::Rect;
 use ratatui::{Terminal, crossterm};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tonic::transport::Channel;
 
 use crate::session::{ExecEvent, ExecStream};
 
 pub use model::Model;
-pub use view::{Request, View};
+#[cfg(test)]
+pub use view::SortCol;
+pub use view::{Preset, Request, View};
 
 /// How often it asks for usage and the managers' state.
 const POLL: Duration = Duration::from_secs(5);
@@ -52,10 +56,13 @@ enum Msg {
     /// it could again.
     Polled(Option<String>),
     Key(KeyEvent),
+    Mouse(MouseEvent),
     /// What came of a request.
     Done(String),
     /// Logs of the stream numbered so, on stderr or not.
     Log(u64, bool, Vec<u8>),
+    /// Multiplexed log chunk from a named pod in stream `n`.
+    PodLog(u64, String, bool, Vec<u8>),
     /// That stream ended, and why.
     LogEnded(u64, String),
     /// What the shell numbered so wrote.
@@ -71,8 +78,14 @@ enum Msg {
 pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<()> {
     draw::set_mono(std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()));
     let (tx, mut rx) = mpsc::unbounded_channel();
+    let (poll_tx, poll_rx) = watch::channel(POLL);
     let follower = tokio::spawn(follow(channel.clone(), namespace.clone(), tx.clone()));
-    let poller = tokio::spawn(poll(channel.clone(), namespace.clone(), tx.clone()));
+    let poller = tokio::spawn(poll(
+        channel.clone(),
+        namespace.clone(),
+        poll_rx,
+        tx.clone(),
+    ));
     read_keys(tx.clone());
 
     // The logs shown, numbered: what an earlier stream sent is dropped.
@@ -88,8 +101,29 @@ pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<
     let mut model = Model::new(namespace);
     let mut view = View::default();
     let mut terminal = ratatui::init();
+    if let Ok(size) = terminal.size()
+        && size.width >= 110
+        && size.height >= 26
+    {
+        view.preset = Preset::Bento;
+        view.mouse = true;
+    }
+    let mut mouse_captured = false;
+    let mut last_poll_ms = view.poll_ms;
     let mut painted = Instant::now();
     let result = loop {
+        if view.mouse != mouse_captured {
+            if view.mouse {
+                let _ = crossterm::execute!(terminal.backend_mut(), EnableMouseCapture);
+            } else {
+                let _ = crossterm::execute!(terminal.backend_mut(), DisableMouseCapture);
+            }
+            mouse_captured = view.mouse;
+        }
+        if view.poll_ms != last_poll_ms {
+            last_poll_ms = view.poll_ms;
+            let _ = poll_tx.send(Duration::from_millis(last_poll_ms));
+        }
         if painted.elapsed() >= REPAINT {
             invalidate(&mut terminal);
             painted = Instant::now();
@@ -104,8 +138,9 @@ pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<
             s.set_size(rows, cols);
             let _ = input.try_send(crate::session::resize(cols, rows));
         }
-        if let Ok(size) = terminal.size() {
-            view.wide = draw::wide(size.width);
+        let term_area = terminal.size().map(Rect::from).unwrap_or_default();
+        if term_area.width > 0 {
+            view.wide = draw::wide(term_area.width);
         }
         if let Err(e) = terminal.draw(|f| draw::render(f, &model, &view)) {
             break Err(e.into());
@@ -124,12 +159,20 @@ pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<
                 Msg::Problem(p) => model.problem = Some(p),
                 Msg::Polled(p) => model.polled = p,
                 Msg::Key(k) => requests.extend(view.key(&model, k)),
+                Msg::Mouse(m) => view.mouse(&model, m, term_area),
                 Msg::Done(what) => view.notice = Some(what),
                 Msg::Log(n, stderr, data) => {
                     if let (Some(l), Some((shown, _))) = (&mut view.logs, &logs)
                         && n == *shown
                     {
                         l.push(stderr, &data);
+                    }
+                }
+                Msg::PodLog(n, pod, stderr, data) => {
+                    if let (Some(l), Some((shown, _))) = (&mut view.logs, &logs)
+                        && n == *shown
+                    {
+                        l.push_prefixed(&pod, stderr, &data);
                     }
                 }
                 Msg::ShellOutput(n, data) => {
@@ -161,7 +204,7 @@ pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<
         }
         for request in requests {
             match request {
-                Request::Logs { .. } | Request::Exec { .. } => {
+                Request::Logs { .. } | Request::ServiceLogs { .. } | Request::Exec { .. } => {
                     if let Some((_, stream)) = logs.take() {
                         stream.abort();
                     }
@@ -169,32 +212,60 @@ pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<
                         stream.abort();
                     }
                     streams += 1;
-                    if let Request::Logs { .. } = &request {
-                        view.show_logs(&request);
-                        let stream = tokio::spawn(stream_logs(
-                            channel.clone(),
-                            request,
-                            streams,
-                            tx.clone(),
-                        ));
-                        logs = Some((streams, stream));
-                    } else {
-                        view.show_shell(&request);
-                        let area = terminal.size().map(Rect::from).unwrap_or_default();
-                        let size = draw::shell_size(&model, &view, area).unwrap_or((24, 80));
-                        if let Some(s) = &mut view.shell {
-                            s.set_size(size.0, size.1);
+                    match &request {
+                        Request::Logs { .. } => {
+                            view.show_logs(&request);
+                            let stream = tokio::spawn(stream_logs(
+                                channel.clone(),
+                                request,
+                                streams,
+                                tx.clone(),
+                            ));
+                            logs = Some((streams, stream));
                         }
-                        let (input, typed) = mpsc::channel(256);
-                        let stream = tokio::spawn(run_shell(
-                            channel.clone(),
-                            request,
-                            streams,
-                            size,
-                            typed,
-                            tx.clone(),
-                        ));
-                        shell = Some((streams, stream, input));
+                        Request::ServiceLogs {
+                            namespace,
+                            kind,
+                            name,
+                        } => {
+                            let pods: Vec<String> = model
+                                .of(Kind::Task)
+                                .filter(|t| {
+                                    t.metadata.namespace == *namespace
+                                        && model::owner(t) == Some((*kind, name.as_str()))
+                                        && !model::task_state(t).is_terminal()
+                                })
+                                .map(|t| t.metadata.name.clone())
+                                .collect();
+                            view.show_logs(&request);
+                            let stream = tokio::spawn(stream_service_logs(
+                                channel.clone(),
+                                namespace.clone(),
+                                pods,
+                                streams,
+                                tx.clone(),
+                            ));
+                            logs = Some((streams, stream));
+                        }
+                        Request::Exec { .. } => {
+                            view.show_shell(&request);
+                            let area = terminal.size().map(Rect::from).unwrap_or_default();
+                            let size = draw::shell_size(&model, &view, area).unwrap_or((24, 80));
+                            if let Some(s) = &mut view.shell {
+                                s.set_size(size.0, size.1);
+                            }
+                            let (input, typed) = mpsc::channel(256);
+                            let stream = tokio::spawn(run_shell(
+                                channel.clone(),
+                                request,
+                                streams,
+                                size,
+                                typed,
+                                tx.clone(),
+                            ));
+                            shell = Some((streams, stream, input));
+                        }
+                        _ => unreachable!(),
                     }
                 }
                 Request::Events { .. } | Request::Alerts => {
@@ -242,6 +313,9 @@ pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<
             break Ok(());
         }
     };
+    if mouse_captured {
+        let _ = crossterm::execute!(terminal.backend_mut(), DisableMouseCapture);
+    }
     // The FreeBSD console has no alternate screen: blank it, so the last
     // frame does not stay behind the prompt.
     let _ = crossterm::execute!(
@@ -276,6 +350,7 @@ fn read_keys(tx: mpsc::UnboundedSender<Msg>) {
             }
             let msg = match event::read() {
                 Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => Msg::Key(k),
+                Ok(Event::Mouse(m)) => Msg::Mouse(m),
                 Ok(Event::Resize(..)) => Msg::Redraw,
                 Ok(_) => continue,
                 Err(_) => Msg::HungUp,
@@ -294,6 +369,45 @@ fn invalidate<B: Backend>(terminal: &mut Terminal<B>) {
         c.set_symbol("\u{fffe}");
     }
     terminal.swap_buffers();
+}
+
+/// Multiplexes live logs across all running tasks `pods` of a Service or Job.
+async fn stream_service_logs(
+    channel: Channel,
+    namespace: String,
+    pods: Vec<String>,
+    n: u64,
+    tx: mpsc::UnboundedSender<Msg>,
+) {
+    if pods.is_empty() {
+        let _ = tx.send(Msg::LogEnded(n, "No running tasks yet.".into()));
+        return;
+    }
+    let mut join = tokio::task::JoinSet::new();
+    for pod in pods {
+        let ch = channel.clone();
+        let ns = namespace.clone();
+        let tx_pod = tx.clone();
+        join.spawn(async move {
+            let target = crate::session::Target {
+                namespace: ns,
+                task: pod.clone(),
+                container: String::new(),
+            };
+            if let Ok(mut s) = crate::session::LogStream::open(&ch, &target, true, Some(50)).await {
+                while let Ok(Some((stderr, data))) = s.next().await {
+                    if tx_pod
+                        .send(Msg::PodLog(n, pod.clone(), stderr, data))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    while join.join_next().await.is_some() {}
+    let _ = tx.send(Msg::LogEnded(n, "All followed tasks ended.".into()));
 }
 
 /// Follows the logs a request asks for, numbered `n`.
@@ -605,6 +719,7 @@ async fn act(mut objects: crate::cli::Objects, request: Request) -> String {
                 .map_err(Into::into)
         }
         Request::Logs { .. }
+        | Request::ServiceLogs { .. }
         | Request::Exec { .. }
         | Request::Input(_)
         | Request::Events { .. }
@@ -748,12 +863,31 @@ pub async fn once(channel: Channel, namespace: Option<String>) -> anyhow::Result
     Ok(())
 }
 
-/// Asks for usage and the managers' state every [`POLL`].
-async fn poll(channel: Channel, namespace: Option<String>, tx: mpsc::UnboundedSender<Msg>) {
+/// Asks for usage and the managers' state every configured poll interval.
+async fn poll(
+    channel: Channel,
+    namespace: Option<String>,
+    mut interval_rx: watch::Receiver<Duration>,
+    tx: mpsc::UnboundedSender<Msg>,
+) {
     let mut cluster = crate::cli::cluster_client(channel);
-    let mut tick = tokio::time::interval(POLL);
+    let mut dur = *interval_rx.borrow_and_update();
+    let mut tick = tokio::time::interval(dur);
     loop {
-        tick.tick().await;
+        tokio::select! {
+            _ = tick.tick() => {}
+            changed = interval_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let next = *interval_rx.borrow_and_update();
+                if next != dur {
+                    dur = next;
+                    tick = tokio::time::interval(dur);
+                    tick.tick().await;
+                }
+            }
+        }
         // What failed is said in the header until it reads again, so the
         // figures shown are not taken as current.
         let mut failed = None;

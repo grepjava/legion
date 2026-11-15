@@ -11,7 +11,10 @@ use legion_api::service::{ServiceStatus, UpdateState};
 use legion_api::task::{TaskSpec, TaskState};
 use legion_api::volume::{VolumeSpec, VolumeStatus};
 use legion_api::{Kind, Object};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde::Deserialize;
@@ -118,6 +121,78 @@ impl Tab {
     }
 }
 
+/// Screen layout preset (`btop`-style multi-box vs classic single-table).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Preset {
+    #[default]
+    Classic,
+    Bento,
+    Telemetry,
+}
+
+impl Preset {
+    pub(super) fn next(self) -> Self {
+        match self {
+            Preset::Classic => Preset::Bento,
+            Preset::Bento => Preset::Telemetry,
+            Preset::Telemetry => Preset::Classic,
+        }
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Preset::Classic => "classic",
+            Preset::Bento => "bento",
+            Preset::Telemetry => "telemetry",
+        }
+    }
+}
+
+/// Column sorting mode for tables.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortCol {
+    #[default]
+    Default,
+    Cpu,
+    Memory,
+    State,
+    Name,
+}
+
+impl SortCol {
+    pub(super) fn next(self) -> Self {
+        match self {
+            SortCol::Default => SortCol::Cpu,
+            SortCol::Cpu => SortCol::Memory,
+            SortCol::Memory => SortCol::State,
+            SortCol::State => SortCol::Name,
+            SortCol::Name => SortCol::Default,
+        }
+    }
+
+    pub(super) fn prev(self) -> Self {
+        match self {
+            SortCol::Default => SortCol::Name,
+            SortCol::Cpu => SortCol::Default,
+            SortCol::Memory => SortCol::Cpu,
+            SortCol::State => SortCol::Memory,
+            SortCol::Name => SortCol::State,
+        }
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            SortCol::Default => "default",
+            SortCol::Cpu => "cpu",
+            SortCol::Memory => "mem",
+            SortCol::State => "state",
+            SortCol::Name => "name",
+        }
+    }
+}
+
+const POLL_STEPS: [u64; 4] = [1000, 2000, 5000, 10000];
+
 /// Which tasks the task list shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Focus {
@@ -188,6 +263,12 @@ pub enum Request {
         name: String,
         container: Option<String>,
     },
+    /// Multiplexed logs across all running tasks of a Service or Job.
+    ServiceLogs {
+        namespace: String,
+        kind: Kind,
+        name: String,
+    },
     Exec {
         namespace: String,
         task: String,
@@ -257,6 +338,19 @@ pub struct View {
     pub(super) focus: Option<Focus>,
     /// Tasks that ended are listed too.
     pub(super) history: bool,
+    /// `btop`-style layout preset (`Classic`, `Bento`, `Telemetry`).
+    pub(super) preset: Preset,
+    /// `btop` box visibility in `Bento` mode (`[telemetry, nodes, workloads, lower]`).
+    pub(super) boxes: [bool; 4],
+    /// Expand workload → task → jail tree in Workloads.
+    pub(super) tree: bool,
+    /// Active sort column and direction.
+    pub(super) sort: SortCol,
+    pub(super) sort_desc: bool,
+    /// Live poll interval in milliseconds (`1000`, `2000`, `5000`, `10000`).
+    pub(super) poll_ms: u64,
+    /// Mouse click & scroll support enabled.
+    pub(super) mouse: bool,
     pub(super) prompt: Option<Prompt>,
     /// What came of the last request, or why it was not made.
     pub(super) notice: Option<String>,
@@ -284,6 +378,13 @@ impl Default for View {
             filter: Default::default(),
             focus: None,
             history: false,
+            preset: Preset::Classic,
+            boxes: [true; 4],
+            tree: false,
+            sort: SortCol::Default,
+            sort_desc: true,
+            poll_ms: 5000,
+            mouse: false,
             prompt: None,
             notice: None,
             detail: None,
@@ -301,18 +402,29 @@ impl Default for View {
 impl View {
     /// Starts showing the logs a request asks for, in place of any shown.
     pub(super) fn show_logs(&mut self, request: &Request) {
-        if let Request::Logs {
-            namespace,
-            name,
-            container,
-        } = request
-        {
-            let mut of = format!("{namespace}/{name}");
-            if let Some(c) = container {
-                of = format!("{of}/{c}");
+        match request {
+            Request::Logs {
+                namespace,
+                name,
+                container,
+            } => {
+                let mut of = format!("{namespace}/{name}");
+                if let Some(c) = container {
+                    of = format!("{of}/{c}");
+                }
+                self.shell = None;
+                self.logs = Some(Logs::new(of));
             }
-            self.shell = None;
-            self.logs = Some(Logs::new(of));
+            Request::ServiceLogs {
+                namespace,
+                kind,
+                name,
+            } => {
+                let of = format!("all tasks of {} {namespace}/{name}", kind_word(*kind));
+                self.shell = None;
+                self.logs = Some(Logs::new(of));
+            }
+            _ => {}
         }
         let of = match request {
             Request::Events {
@@ -497,6 +609,24 @@ impl View {
             KeyCode::End | KeyCode::Char('G') => *sel = last,
             KeyCode::Char('h') => self.history = !self.history,
             KeyCode::Char('A') => return Some(Request::Alerts),
+            KeyCode::Char('b' | '0') => {
+                self.preset = self.preset.next();
+            }
+            KeyCode::F(n @ 1..=4) => {
+                let idx = (n - 1) as usize;
+                self.boxes[idx] = !self.boxes[idx];
+            }
+            KeyCode::Char('!') => self.boxes[0] = !self.boxes[0],
+            KeyCode::Char('@') => self.boxes[1] = !self.boxes[1],
+            KeyCode::Char('#') => self.boxes[2] = !self.boxes[2],
+            KeyCode::Char('$') => self.boxes[3] = !self.boxes[3],
+            KeyCode::Char('t') => self.tree = !self.tree,
+            KeyCode::Char('>' | '.') => self.sort = self.sort.next(),
+            KeyCode::Char('<' | ',') => self.sort = self.sort.prev(),
+            KeyCode::Char('S') => self.sort_desc = !self.sort_desc,
+            KeyCode::Char('+' | '=') => self.step_poll(true),
+            KeyCode::Char('-') => self.step_poll(false),
+            KeyCode::Char('M') => self.mouse = !self.mouse,
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('i') => self.detail = Some(!self.detail.unwrap_or(self.wide)),
             KeyCode::Char('y') => self.yaml = selected.map(|k| (k, 0)),
@@ -634,6 +764,11 @@ impl View {
                 let pick = Pick::Logs { namespace, name };
                 return self.container(o, pick, "Logs of which container?");
             }
+            ('L', Kind::Service | Kind::Job) => Request::ServiceLogs {
+                namespace,
+                kind,
+                name,
+            },
             ('x', Kind::Task) => {
                 let pick = Pick::Exec {
                     namespace,
@@ -802,6 +937,93 @@ impl View {
             Then::Delete { .. } => refuse(self, "Not deleted: the name did not match."),
         }
     }
+
+    fn step_poll(&mut self, faster: bool) {
+        let cur = POLL_STEPS
+            .iter()
+            .position(|&ms| ms == self.poll_ms)
+            .unwrap_or(2);
+        let next = if faster {
+            cur.saturating_sub(1)
+        } else {
+            (cur + 1).min(POLL_STEPS.len() - 1)
+        };
+        self.poll_ms = POLL_STEPS[next];
+    }
+
+    /// Mouse clicks and scroll wheel: scroll YAML/logs/table, click tabs or rows.
+    pub fn mouse(&mut self, model: &Model, ev: MouseEvent, area: Rect) {
+        if !self.mouse || self.typing() || self.prompt.is_some() || self.help {
+            return;
+        }
+        if let Some((key, scroll)) = self.yaml.take()
+            && model.get(&key).is_some()
+        {
+            let scroll = match ev.kind {
+                MouseEventKind::ScrollDown => scroll.saturating_add(3),
+                MouseEventKind::ScrollUp => scroll.saturating_sub(3),
+                _ => scroll,
+            };
+            self.yaml = Some((key, scroll));
+            return;
+        }
+        match ev.kind {
+            MouseEventKind::ScrollDown => {
+                if let Some(l) = &mut self.logs {
+                    l.scroll(-3);
+                } else if let Some(s) = &mut self.shell {
+                    s.scroll(-3);
+                } else {
+                    let count = rows(model, self).len();
+                    let sel = &mut self.selected[self.index()];
+                    *sel = (*sel + 1).min(count.saturating_sub(1));
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some(l) = &mut self.logs {
+                    l.scroll(3);
+                } else if let Some(s) = &mut self.shell {
+                    s.scroll(3);
+                } else {
+                    let sel = &mut self.selected[self.index()];
+                    *sel = sel.saturating_sub(1);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let tab_row = match self.preset {
+                    Preset::Classic => 4,
+                    Preset::Telemetry => 7,
+                    Preset::Bento => u16::MAX,
+                };
+                if ev.row == tab_row {
+                    // Approximate tab regions across the tab bar.
+                    let mut x = 0u16;
+                    for (idx, t) in TABS.iter().enumerate() {
+                        let count: usize = t.kinds().iter().map(|k| model.of(*k).count()).sum();
+                        let extra = if *t != Tab::Log && count > 0 {
+                            format!(" ({count})").len() as u16
+                        } else {
+                            0
+                        };
+                        let w = 4 + t.title().len() as u16 + extra + 1;
+                        if ev.column >= x && ev.column < x + w {
+                            self.tab = *t;
+                            let _ = idx;
+                            return;
+                        }
+                        x += w;
+                    }
+                } else if self.preset != Preset::Bento && ev.row > tab_row + 2 && area.height > 12 {
+                    let row_idx = (ev.row - (tab_row + 3)) as usize;
+                    let count = rows(model, self).len();
+                    if row_idx < count {
+                        self.selected[self.index()] = row_idx;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn picked(pick: Pick, container: Option<String>) -> Request {
@@ -824,19 +1046,38 @@ pub(super) struct TableRow {
     pub(super) cells: Vec<Line<'static>>,
     pub(super) style: Style,
     pub(super) key: Option<Key>,
+    cpu_sort: f64,
+    mem_sort: u64,
+    state_sort: String,
+    name_sort: String,
 }
 
 impl TableRow {
     fn new(cells: Vec<Line<'static>>, key: Option<Key>) -> Self {
+        let name_sort = key
+            .as_ref()
+            .map(|(_, ns, name)| format!("{ns}/{name}"))
+            .unwrap_or_default();
         TableRow {
             cells,
             style: Style::default(),
             key,
+            cpu_sort: 0.0,
+            mem_sort: 0,
+            state_sort: String::new(),
+            name_sort,
         }
     }
 
     fn style(mut self, style: Style) -> Self {
         self.style = style;
+        self
+    }
+
+    fn metrics(mut self, cpu: f64, mem: u64, state: impl Into<String>) -> Self {
+        self.cpu_sort = cpu;
+        self.mem_sort = mem;
+        self.state_sort = state.into();
         self
     }
 
@@ -849,11 +1090,17 @@ impl TableRow {
     }
 }
 
-/// The rows of the view's tab, filtered.
+/// The rows of the view's tab, filtered and sorted.
 pub(super) fn rows(model: &Model, view: &View) -> Vec<TableRow> {
-    let all = match view.tab {
+    rows_for_tab(model, view, view.tab)
+}
+
+/// The rows of any `tab`, filtered and sorted according to `view`.
+pub(super) fn rows_for_tab(model: &Model, view: &View, tab: Tab) -> Vec<TableRow> {
+    let tab_idx = TABS.iter().position(|t| *t == tab).unwrap_or(0);
+    let mut all = match tab {
         Tab::Nodes => node_rows(model),
-        Tab::Workloads => workload_rows(model),
+        Tab::Workloads => workload_rows(model, view),
         Tab::Tasks => task_rows(model, view),
         Tab::Storage => volume_rows(model),
         Tab::Network => network_rows(model),
@@ -866,13 +1113,27 @@ pub(super) fn rows(model: &Model, view: &View) -> Vec<TableRow> {
             })
             .collect(),
     };
-    let filter = view.filter[view.index()].to_lowercase();
-    if filter.is_empty() {
-        return all;
+    let filter = view.filter[tab_idx].to_lowercase();
+    if !filter.is_empty() {
+        all.retain(|r| r.text().to_lowercase().contains(&filter));
     }
-    all.into_iter()
-        .filter(|r| r.text().to_lowercase().contains(&filter))
-        .collect()
+    // Keep workload tree hierarchy intact when `view.tree` is active on Workloads.
+    if view.sort != SortCol::Default && !(tab == Tab::Workloads && view.tree) && tab != Tab::Log {
+        all.sort_by(|a, b| {
+            let ord = match view.sort {
+                SortCol::Default => std::cmp::Ordering::Equal,
+                SortCol::Cpu => a
+                    .cpu_sort
+                    .partial_cmp(&b.cpu_sort)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                SortCol::Memory => a.mem_sort.cmp(&b.mem_sort),
+                SortCol::State => a.state_sort.cmp(&b.state_sort),
+                SortCol::Name => a.name_sort.cmp(&b.name_sort),
+            };
+            if view.sort_desc { ord.reverse() } else { ord }
+        });
+    }
+    all
 }
 
 fn text(s: impl Into<String>) -> Line<'static> {
@@ -953,10 +1214,12 @@ fn node_rows(model: &Model) -> Vec<TableRow> {
                 "active" => Style::default(),
                 _ => fg(WARN),
             };
+            let state_word = word(&st.state);
+            let (cpu_val, mem_val) = used.unwrap_or((0.0, 0));
             TableRow::new(
                 vec![
                     text(name),
-                    colored(format!("● {}", word(&st.state)), state),
+                    colored(format!("● {state_word}"), state),
                     colored(word(&spec.availability), avail),
                     text(word(&spec.role)),
                     text(running.to_string()),
@@ -966,6 +1229,7 @@ fn node_rows(model: &Model) -> Vec<TableRow> {
                 ],
                 Some(key(n)),
             )
+            .metrics(cpu_val, mem_val, state_word)
         })
         .collect()
 }
@@ -989,7 +1253,79 @@ fn usage_cells(used: Option<(f64, u64)>) -> [Line<'static>; 2] {
     ]
 }
 
-fn workload_rows(model: &Model) -> Vec<TableRow> {
+fn workload_child_rows(
+    model: &Model,
+    view: &View,
+    owner_kind: Kind,
+    ns: &str,
+    owner_name: &str,
+) -> Vec<TableRow> {
+    if !view.tree {
+        return Vec::new();
+    }
+    let children: Vec<&Object> = model
+        .of(Kind::Task)
+        .filter(|t| {
+            t.metadata.namespace == ns
+                && owner(t) == Some((owner_kind, owner_name))
+                && (!task_state(t).is_terminal() || view.history)
+        })
+        .collect();
+    let total = children.len();
+    children
+        .into_iter()
+        .enumerate()
+        .map(|(idx, t)| {
+            let branch = if idx + 1 == total {
+                "└─ "
+            } else {
+                "├─ "
+            };
+            let st = task_state(t);
+            let ended = st.is_terminal();
+            let ready = t.status["ready"].as_bool().unwrap_or(false);
+            let jid = t.status["jid"]
+                .as_i64()
+                .map(|j| format!("jid {j}"))
+                .unwrap_or_else(|| "task".into());
+            let node = t.spec["node"].as_str().unwrap_or("-").to_owned();
+            let ip = t.status["ip"].as_str().unwrap_or_default().to_owned();
+            let used = model.task_usage(t);
+            let [cpu, memory] = usage_cells(used);
+            let st_style = match st {
+                TaskState::Failed | TaskState::Rejected => fg(BAD),
+                _ if ended => dim(),
+                TaskState::Running if ready => fg(OK),
+                _ => fg(WARN),
+            };
+            let st_word = word(&st);
+            let row = TableRow::new(
+                vec![
+                    dimmed(""),
+                    Line::from(vec![
+                        Span::styled(branch, dim()),
+                        Span::raw(t.metadata.name.clone()),
+                    ]),
+                    dimmed(jid),
+                    dimmed(node),
+                    colored(st_word.clone(), st_style),
+                    cpu,
+                    memory,
+                    dimmed(ip),
+                ],
+                Some(key(t)),
+            )
+            .metrics(
+                used.map_or(0.0, |(c, _)| c),
+                used.map_or(0, |(_, m)| m),
+                st_word,
+            );
+            if ended { row.style(dim()) } else { row }
+        })
+        .collect()
+}
+
+fn workload_rows(model: &Model, view: &View) -> Vec<TableRow> {
     let mut used: BTreeMap<(Kind, &str, &str), (f64, u64)> = BTreeMap::new();
     for t in model.of(Kind::Task) {
         if let Some((kind, name)) = owner(t)
@@ -1009,9 +1345,11 @@ fn workload_rows(model: &Model) -> Vec<TableRow> {
         ))
         .copied()
     };
-    let services = model.of(Kind::Service).map(|s| {
+    let mut out = Vec::new();
+    for s in model.of(Kind::Service) {
         let st: ServiceStatus = status(s);
-        let [cpu, memory] = usage_cells(used_by(Kind::Service, s));
+        let u = used_by(Kind::Service, s);
+        let [cpu, memory] = usage_cells(u);
         let warn = st.update.as_ref().is_some_and(|u| {
             matches!(
                 u.state,
@@ -1032,27 +1370,38 @@ fn workload_rows(model: &Model) -> Vec<TableRow> {
             if short { fg(WARN) } else { fg(OK) },
         );
         let state = if warn {
-            colored(update, fg(WARN))
+            colored(update.clone(), fg(WARN))
         } else {
-            text(update)
+            text(update.clone())
         };
-        TableRow::new(
-            vec![
-                dimmed(s.metadata.namespace.clone()),
-                text(s.metadata.name.clone()),
-                text(s.spec["mode"].as_str().unwrap_or("replicated").to_owned()),
-                tasks,
-                state,
-                cpu,
-                memory,
-                dimmed(images(&s.spec["pod"])),
-            ],
-            Some(key(s)),
-        )
-    });
-    let jobs = model.of(Kind::Job).map(|j| {
+        out.push(
+            TableRow::new(
+                vec![
+                    dimmed(s.metadata.namespace.clone()),
+                    text(s.metadata.name.clone()),
+                    text(s.spec["mode"].as_str().unwrap_or("replicated").to_owned()),
+                    tasks,
+                    state,
+                    cpu,
+                    memory,
+                    dimmed(images(&s.spec["pod"])),
+                ],
+                Some(key(s)),
+            )
+            .metrics(u.map_or(0.0, |(c, _)| c), u.map_or(0, |(_, m)| m), update),
+        );
+        out.extend(workload_child_rows(
+            model,
+            view,
+            Kind::Service,
+            &s.metadata.namespace,
+            &s.metadata.name,
+        ));
+    }
+    for j in model.of(Kind::Job) {
         let st: JobStatus = status(j);
-        let [cpu, memory] = usage_cells(used_by(Kind::Job, j));
+        let u = used_by(Kind::Job, j);
+        let [cpu, memory] = usage_cells(u);
         let done = match j.spec["completions"].as_u64() {
             Some(n) => format!("{}/{n}", st.succeeded),
             None => st.succeeded.to_string(),
@@ -1062,70 +1411,87 @@ fn workload_rows(model: &Model) -> Vec<TableRow> {
             JobState::Complete => fg(OK),
             _ => Style::default(),
         };
-        TableRow::new(
-            vec![
-                dimmed(j.metadata.namespace.clone()),
-                text(j.metadata.name.clone()),
-                text("job"),
-                text(done),
-                colored(word(&st.state), state),
-                cpu,
-                memory,
-                dimmed(images(&j.spec["pod"])),
-            ],
-            Some(key(j)),
-        )
-    });
-    let cron_jobs = model.of(Kind::CronJob).map(|c| {
+        let st_word = word(&st.state);
+        out.push(
+            TableRow::new(
+                vec![
+                    dimmed(j.metadata.namespace.clone()),
+                    text(j.metadata.name.clone()),
+                    text("job"),
+                    text(done),
+                    colored(st_word.clone(), state),
+                    cpu,
+                    memory,
+                    dimmed(images(&j.spec["pod"])),
+                ],
+                Some(key(j)),
+            )
+            .metrics(u.map_or(0.0, |(c, _)| c), u.map_or(0, |(_, m)| m), st_word),
+        );
+        out.extend(workload_child_rows(
+            model,
+            view,
+            Kind::Job,
+            &j.metadata.namespace,
+            &j.metadata.name,
+        ));
+    }
+    for c in model.of(Kind::CronJob) {
         let st: CronJobStatus = status(c);
-        let state = if c.spec["suspend"].as_bool().unwrap_or(false) {
-            colored("suspended", fg(WARN))
+        let suspended = c.spec["suspend"].as_bool().unwrap_or(false);
+        let st_str = if suspended {
+            "suspended".to_owned()
         } else {
-            text(format!(
-                "every {}",
-                c.spec["schedule"].as_str().unwrap_or("?")
-            ))
+            format!("every {}", c.spec["schedule"].as_str().unwrap_or("?"))
         };
-        TableRow::new(
-            vec![
-                dimmed(c.metadata.namespace.clone()),
-                text(c.metadata.name.clone()),
-                text("cron job"),
-                dimmed(st.last_job),
-                state,
-                text(""),
-                text(""),
-                dimmed(images(&c.spec["job"]["pod"])),
-            ],
-            Some(key(c)),
-        )
-    });
-    let builds = model.of(Kind::Build).map(|b| {
+        let state = if suspended {
+            colored(st_str.clone(), fg(WARN))
+        } else {
+            text(st_str.clone())
+        };
+        out.push(
+            TableRow::new(
+                vec![
+                    dimmed(c.metadata.namespace.clone()),
+                    text(c.metadata.name.clone()),
+                    text("cron job"),
+                    dimmed(st.last_job),
+                    state,
+                    text(""),
+                    text(""),
+                    dimmed(images(&c.spec["job"]["pod"])),
+                ],
+                Some(key(c)),
+            )
+            .metrics(0.0, 0, st_str),
+        );
+    }
+    for b in model.of(Kind::Build) {
         let phase = b.status["phase"].as_str().unwrap_or("pending").to_owned();
         let state = match phase.as_str() {
             "Failed" => fg(BAD),
             "Succeeded" => fg(OK),
             _ => Style::default(),
         };
-        TableRow::new(
-            vec![
-                dimmed(b.metadata.namespace.clone()),
-                text(b.metadata.name.clone()),
-                text("build"),
-                dimmed(b.status["node"].as_str().unwrap_or_default().to_owned()),
-                colored(phase.to_lowercase(), state),
-                text(""),
-                text(""),
-                dimmed(b.spec["image"].as_str().unwrap_or_default().to_owned()),
-            ],
-            Some(key(b)),
-        )
-    });
-    services
-        .chain(jobs)
-        .chain(cron_jobs)
-        .chain(builds)
-        .collect()
+        let word = phase.to_lowercase();
+        out.push(
+            TableRow::new(
+                vec![
+                    dimmed(b.metadata.namespace.clone()),
+                    text(b.metadata.name.clone()),
+                    text("build"),
+                    dimmed(b.status["node"].as_str().unwrap_or_default().to_owned()),
+                    colored(word.clone(), state),
+                    text(""),
+                    text(""),
+                    dimmed(b.spec["image"].as_str().unwrap_or_default().to_owned()),
+                ],
+                Some(key(b)),
+            )
+            .metrics(0.0, 0, word),
+        );
+    }
+    out
 }
 
 fn task_rows(model: &Model, view: &View) -> Vec<TableRow> {
@@ -1149,19 +1515,21 @@ fn task_rows(model: &Model, view: &View) -> Vec<TableRow> {
             let ip = t.status["ip"].as_str().unwrap_or_default();
             let jid = t.status["jid"].as_i64();
             let message = t.status["message"].as_str().unwrap_or_default();
-            let [cpu, memory] = usage_cells(model.task_usage(t));
+            let used = model.task_usage(t);
+            let [cpu, memory] = usage_cells(used);
             let state = match st {
                 TaskState::Failed | TaskState::Rejected => fg(BAD),
                 _ if ended => dim(),
                 TaskState::Running if ready => fg(OK),
                 _ => fg(WARN),
             };
+            let st_word = word(&st);
             let row = TableRow::new(
                 vec![
                     dimmed(t.metadata.namespace.clone()),
                     text(t.metadata.name.clone()),
                     text(t.spec["node"].as_str().unwrap_or_default().to_owned()),
-                    colored(word(&st), state),
+                    colored(st_word.clone(), state),
                     colored(if ready { "✓" } else { "" }, fg(OK)),
                     text(restarts.to_string()),
                     cpu,
@@ -1171,6 +1539,11 @@ fn task_rows(model: &Model, view: &View) -> Vec<TableRow> {
                     text(message.to_owned()),
                 ],
                 Some(key(t)),
+            )
+            .metrics(
+                used.map_or(0.0, |(c, _)| c),
+                used.map_or(0, |(_, m)| m),
+                st_word,
             );
             Some((ended, if ended { row.style(dim()) } else { row }))
         })
@@ -1219,18 +1592,31 @@ fn volume_rows(model: &Model) -> Vec<TableRow> {
                 .get(&(v.metadata.namespace.as_str(), v.metadata.name.clone()))
                 .map(|u| u.join(","))
                 .unwrap_or_default();
+            let space = model.volume_space(&v.metadata.namespace, &v.metadata.name);
+            let size_cell = match space {
+                Some((used, avail)) if used + avail > 0 => {
+                    let cap = sp.size.map_or(used + avail, |s| s.0.max(used + avail));
+                    gauge(
+                        Some(used as f64),
+                        cap as f64,
+                        format!("{}/{}", bytes(used), bytes(cap)),
+                    )
+                }
+                _ => text(sp.size.map(|s| bytes(s.0)).unwrap_or_default()),
+            };
             TableRow::new(
                 vec![
                     dimmed(v.metadata.namespace.clone()),
                     text(v.metadata.name.clone()),
                     text(word(&sp.driver)),
-                    text(sp.size.map(|s| bytes(s.0)).unwrap_or_default()),
+                    size_cell,
                     text(node),
                     text(used_by),
                     migration,
                 ],
                 Some(key(v)),
             )
+            .metrics(0.0, space.map_or(0, |(u, _)| u), word(&sp.driver))
         })
         .collect()
 }

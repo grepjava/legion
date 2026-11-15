@@ -22,7 +22,7 @@ use ratatui::widgets::{
 use super::logs::Logs;
 use super::model::{Key, Model, kind_word, status, task_state};
 use super::shell::Shell;
-use super::view::{Focus, Prompt, TABS, Tab, TableRow, View, rows};
+use super::view::{Focus, Preset, Prompt, SortCol, TABS, Tab, TableRow, View, rows, rows_for_tab};
 
 pub(super) const ACCENT: Color = Color::Cyan;
 pub(super) const OK: Color = Color::Green;
@@ -66,6 +66,98 @@ fn busy(frac: f64) -> Color {
     } else {
         OK
     }
+}
+
+/// Smooth `btop`-style Truecolor RGB heat gradient (cyan → emerald → amber → crimson).
+pub(super) fn heat_rgb(frac: f64) -> Color {
+    if mono() {
+        return Color::Reset;
+    }
+    let f = frac.clamp(0.0, 1.0);
+    let lerp = |a: u8, b: u8, t: f64| (a as f64 + (b as f64 - a as f64) * t).round() as u8;
+    if f < 0.45 {
+        let t = f / 0.45;
+        Color::Rgb(lerp(56, 52, t), lerp(189, 211, t), lerp(248, 153, t))
+    } else if f < 0.75 {
+        let t = (f - 0.45) / 0.30;
+        Color::Rgb(lerp(52, 251, t), lerp(211, 191, t), lerp(153, 36, t))
+    } else {
+        let t = (f - 0.75) / 0.25;
+        Color::Rgb(lerp(251, 248, t), lerp(191, 113, t), lerp(36, 113, t))
+    }
+}
+
+/// Unicode `2×4` Braille area graph (`U+2800`..`U+28FF`) as in `btop`:
+/// `2 * width` horizontal data points × `4 * height` vertical sub-dots.
+pub(super) fn braille_lines(
+    samples: &[f64],
+    capacity: f64,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    const LEFT_DOTS: [u32; 4] = [0x40, 0x04, 0x02, 0x01];
+    const RIGHT_DOTS: [u32; 4] = [0x80, 0x20, 0x10, 0x08];
+    let pts_needed = width * 2;
+    let tail = &samples[samples.len().saturating_sub(pts_needed)..];
+    let peak = tail.iter().copied().fold(0.0, f64::max);
+    let scale = peak.max(capacity * 0.02).max(f64::MIN_POSITIVE);
+    let color_denom = if capacity > 0.0 { capacity } else { scale };
+    let total_dots = height * 4;
+    let pad = pts_needed.saturating_sub(tail.len());
+    let sample_at = |idx: usize| -> f64 {
+        if idx < pad {
+            0.0
+        } else {
+            tail[idx - pad].max(0.0)
+        }
+    };
+    let dots_for = |val: f64| -> usize {
+        if val <= 0.0 {
+            0
+        } else {
+            (((val / scale).clamp(0.0, 1.0) * total_dots as f64).round() as usize)
+                .max(1)
+                .min(total_dots)
+        }
+    };
+    let mut out = Vec::with_capacity(height);
+    for row in 0..height {
+        // row 0 is the top row, row (height - 1) is the bottom row.
+        let base_dot = (height - 1 - row) * 4;
+        let mut spans = Vec::with_capacity(width);
+        for col in 0..width {
+            let lv = sample_at(col * 2);
+            let rv = sample_at(col * 2 + 1);
+            let ld = dots_for(lv);
+            let rd = dots_for(rv);
+            let mut mask = 0u32;
+            for sub in 0..4 {
+                if ld > base_dot + sub {
+                    mask |= LEFT_DOTS[sub];
+                }
+                if rd > base_dot + sub {
+                    mask |= RIGHT_DOTS[sub];
+                }
+            }
+            let ch = char::from_u32(0x2800 + mask).unwrap_or('⠀');
+            let style = if mask == 0 {
+                dim()
+            } else {
+                fg(heat_rgb(lv.max(rv) / color_denom))
+            };
+            spans.push(Span::styled(ch.to_string(), style));
+        }
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+/// `128Ki/s`, `4.2Mi/s`.
+pub(super) fn rate(bps: u64) -> String {
+    format!("{}/s", bytes(bps))
 }
 
 /// A bar `width` cells wide, filled to `frac` in its busy colour.
@@ -124,6 +216,20 @@ fn shows_detail(view: &View, width: u16) -> bool {
     view.tab != Tab::Log && view.detail.unwrap_or(wide(width))
 }
 
+fn top_height(view: &View) -> u16 {
+    match view.preset {
+        Preset::Classic => 5,
+        Preset::Telemetry => 8,
+        Preset::Bento => {
+            if view.boxes[0] {
+                7
+            } else {
+                0
+            }
+        }
+    }
+}
+
 /// Draws the whole screen.
 pub fn render(f: &mut Frame, model: &Model, view: &View) {
     let area = f.area();
@@ -134,15 +240,77 @@ pub fn render(f: &mut Frame, model: &Model, view: &View) {
         );
         return;
     }
-    let [top, tabs, body, bottom] = Layout::vertical([
-        Constraint::Length(4),
-        Constraint::Length(1),
-        Constraint::Fill(1),
-        Constraint::Length(1),
-    ])
-    .areas(area);
-    header(f, model, top);
-    f.render_widget(tab_bar(model, view), tabs);
+    match view.preset {
+        Preset::Classic => {
+            let [top, tabs, body, bottom] = Layout::vertical([
+                Constraint::Length(4),
+                Constraint::Length(1),
+                Constraint::Fill(1),
+                Constraint::Length(1),
+            ])
+            .areas(area);
+            header(f, model, top);
+            f.render_widget(tab_bar(model, view), tabs);
+            render_body_and_pane(f, model, view, body);
+            f.render_widget(Paragraph::new(bottom_line(view)), bottom);
+        }
+        Preset::Telemetry => {
+            let [top, tabs, body, bottom] = Layout::vertical([
+                Constraint::Length(7),
+                Constraint::Length(1),
+                Constraint::Fill(1),
+                Constraint::Length(1),
+            ])
+            .areas(area);
+            bento_telemetry_deck(f, model, view, top);
+            f.render_widget(tab_bar(model, view), tabs);
+            render_body_and_pane(f, model, view, body);
+            f.render_widget(Paragraph::new(bottom_line(view)), bottom);
+        }
+        Preset::Bento => {
+            let deck_h = if view.boxes[0] && area.height >= 18 {
+                7
+            } else {
+                0
+            };
+            let [top, body, bottom] = Layout::vertical([
+                Constraint::Length(deck_h),
+                Constraint::Fill(1),
+                Constraint::Length(1),
+            ])
+            .areas(area);
+            if deck_h > 0 {
+                bento_telemetry_deck(f, model, view, top);
+            }
+            let row_count = if view.zoom && (view.logs.is_some() || view.shell.is_some()) {
+                0
+            } else {
+                rows(model, view).len()
+            };
+            let (upper, lower) = split(view, row_count, body);
+            if let Some(upper) = upper {
+                bento_body(f, model, view, upper);
+            }
+            if let Some(lower) = lower {
+                if let Some(l) = &view.logs {
+                    logs(f, l, lower);
+                }
+                if let Some(s) = &view.shell {
+                    shell(f, s, lower);
+                }
+            }
+            f.render_widget(Paragraph::new(bottom_line(view)), bottom);
+        }
+    }
+    if let Some((key, scroll)) = &view.yaml {
+        yaml(f, model, key, *scroll);
+    }
+    if view.help {
+        help(f, view);
+    }
+}
+
+fn render_body_and_pane(f: &mut Frame, model: &Model, view: &View, body: Rect) {
     let rows = if view.zoom && (view.logs.is_some() || view.shell.is_some()) {
         Vec::new()
     } else {
@@ -159,13 +327,6 @@ pub fn render(f: &mut Frame, model: &Model, view: &View) {
         if let Some(s) = &view.shell {
             shell(f, s, lower);
         }
-    }
-    f.render_widget(Paragraph::new(bottom_line(view)), bottom);
-    if let Some((key, scroll)) = &view.yaml {
-        yaml(f, model, key, *scroll);
-    }
-    if view.help {
-        help(f, view);
     }
 }
 
@@ -190,9 +351,10 @@ pub(super) fn shell_size(model: &Model, view: &View, area: Rect) -> Option<(u16,
     if area.width < 60 || area.height < 12 {
         return None;
     }
+    let used_top = top_height(view);
     let body = Rect {
-        y: area.y + 5,
-        height: area.height - 6,
+        y: area.y + used_top,
+        height: area.height.saturating_sub(used_top + 1),
         ..area
     };
     let row_count = if view.zoom {
@@ -562,12 +724,340 @@ fn tab_bar(model: &Model, view: &View) -> Tabs<'static> {
         .padding(" ", " ")
 }
 
+/// `btop`-style 4-subsystem Unicode Braille telemetry deck (`CPU`, `MEM`, `ZFS`, `NET`).
+fn bento_telemetry_deck(f: &mut Frame, model: &Model, view: &View, area: Rect) {
+    let mut top = vec![
+        Span::styled(" ◆ legion ", fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("[{}] ", view.preset.label()), dim()),
+    ];
+    if let Some(ns) = &model.namespace {
+        top.push(Span::styled(format!("ns:{ns} "), fg(WARN)));
+    }
+    for s in summary(model).into_iter().take(1) {
+        top.extend(s.spans);
+    }
+    let mut right = vec![Span::styled(
+        format!(" poll {}s ", view.poll_ms as f64 / 1000.0),
+        dim(),
+    )];
+    if view.sort != SortCol::Default {
+        let arrow = if view.sort_desc { "↓" } else { "↑" };
+        right.push(Span::styled(
+            format!("sort:{}{arrow} ", view.sort.label()),
+            fg(ACCENT),
+        ));
+    }
+    if view.tree {
+        right.push(Span::styled("tree ", fg(OK)));
+    }
+    if let Some(problem) = &model.problem {
+        right.push(Span::styled(
+            format!("not current: {problem} "),
+            fg(BAD).add_modifier(Modifier::BOLD),
+        ));
+    }
+    let block = panel(Line::from(top)).title(Line::from(right).right_aligned());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 || inner.width < 20 {
+        return;
+    }
+
+    let (millicores, memory) = model.capacity();
+    let cpu_cap = millicores as f64 / 1000.0;
+    let mem_cap = memory as f64;
+    let cpu_samples: Vec<f64> = model.history.iter().map(|(c, _)| c / 100.0).collect();
+    let mem_samples: Vec<f64> = model.history.iter().map(|(_, m)| *m as f64).collect();
+    let (zfs_used, zfs_avail) = model.zfs_totals();
+    let zfs_cap = (zfs_used + zfs_avail) as f64;
+    let zfs_samples: Vec<f64> = model
+        .telemetry_history
+        .iter()
+        .map(|(u, _, _, _)| *u as f64)
+        .collect();
+    let (net_rx, net_tx) = model.net_totals();
+    let net_samples: Vec<f64> = model
+        .telemetry_history
+        .iter()
+        .map(|(_, _, rx, tx)| (*rx + *tx) as f64)
+        .collect();
+    let net_peak = net_samples
+        .iter()
+        .copied()
+        .fold(0.0, f64::max)
+        .max((1 << 20) as f64);
+
+    let cols = Layout::horizontal([
+        Constraint::Ratio(1, 4),
+        Constraint::Ratio(1, 4),
+        Constraint::Ratio(1, 4),
+        Constraint::Ratio(1, 4),
+    ])
+    .split(inner);
+
+    let cpu_now = cpu_samples.last().copied().unwrap_or(0.0);
+    let cpu_label = format!(
+        "{:.1}/{} cores",
+        cpu_now,
+        if cpu_cap > 0.0 {
+            trim(cpu_cap)
+        } else {
+            "-".into()
+        }
+    );
+    braille_card(f, cols[0], "¹cpu", &cpu_samples, cpu_cap, &cpu_label);
+
+    let mem_now = mem_samples.last().copied().unwrap_or(0.0) as u64;
+    let mem_label = format!("{}/{}", bytes(mem_now), bytes(memory));
+    braille_card(f, cols[1], "mem", &mem_samples, mem_cap, &mem_label);
+
+    let zfs_label = if zfs_used + zfs_avail > 0 {
+        format!("{}/{}", bytes(zfs_used), bytes(zfs_used + zfs_avail))
+    } else {
+        "no zfs telemetry".into()
+    };
+    braille_card(f, cols[2], "zfs", &zfs_samples, zfs_cap, &zfs_label);
+
+    let net_label = format!("▼{} ▲{}", rate(net_rx), rate(net_tx));
+    braille_card(f, cols[3], "net", &net_samples, net_peak, &net_label);
+}
+
+fn braille_card(
+    f: &mut Frame,
+    area: Rect,
+    name: &str,
+    samples: &[f64],
+    capacity: f64,
+    readout: &str,
+) {
+    if area.width < 8 || area.height < 2 {
+        return;
+    }
+    let now = samples.last().copied().unwrap_or(0.0);
+    let frac = if capacity > 0.0 {
+        (now / capacity).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let pct = if capacity > 0.0 {
+        format!("{:>3.0}%", frac * 100.0)
+    } else {
+        String::new()
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(fg(Color::DarkGray))
+        .title(Line::from(vec![
+            Span::styled(format!(" {name} "), fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(pct, fg(heat_rgb(frac)).add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+        ]))
+        .title(Line::from(Span::styled(format!(" {readout} "), dim())).right_aligned());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let lines = braille_lines(
+        samples,
+        capacity,
+        inner.width as usize,
+        inner.height as usize,
+    );
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Multi-pane `btop` dashboard layout: `Nodes`, `Workloads`, and `Tasks`/`Storage`
+/// (or whichever tab is currently selected) side by side.
+fn bento_body(f: &mut Frame, model: &Model, view: &View, area: Rect) {
+    let show_nodes = view.boxes[1];
+    let show_workloads = view.boxes[2];
+    let show_lower = view.boxes[3];
+
+    // Determine which auxiliary tab occupies the lower-right box so pressing 1-7
+    // always brings the selected tab on screen with an accented border!
+    let lower_tab = match view.tab {
+        Tab::Nodes | Tab::Workloads | Tab::Tasks => Tab::Tasks,
+        other => other,
+    };
+
+    if !show_nodes && !show_workloads && !show_lower {
+        let rows = rows_for_tab(model, view, view.tab);
+        upper_body(f, model, view, rows, area);
+        return;
+    }
+
+    match (show_nodes, show_workloads || show_lower) {
+        (true, true) => {
+            let [left, right] =
+                Layout::horizontal([Constraint::Percentage(38), Constraint::Fill(1)]).areas(area);
+            if left.height >= 14 && view.tab != Tab::Storage {
+                let [nodes_area, storage_area] =
+                    Layout::vertical([Constraint::Percentage(58), Constraint::Fill(1)]).areas(left);
+                draw_pane_table(
+                    f,
+                    model,
+                    view,
+                    Tab::Nodes,
+                    rows_for_tab(model, view, Tab::Nodes),
+                    nodes_area,
+                    view.tab == Tab::Nodes,
+                    "²",
+                );
+                draw_pane_table(
+                    f,
+                    model,
+                    view,
+                    Tab::Storage,
+                    rows_for_tab(model, view, Tab::Storage),
+                    storage_area,
+                    false,
+                    "⁴",
+                );
+            } else {
+                draw_pane_table(
+                    f,
+                    model,
+                    view,
+                    Tab::Nodes,
+                    rows_for_tab(model, view, Tab::Nodes),
+                    left,
+                    view.tab == Tab::Nodes,
+                    "²",
+                );
+            }
+
+            match (show_workloads, show_lower) {
+                (true, true) => {
+                    let [top_r, bot_r] =
+                        Layout::vertical([Constraint::Percentage(50), Constraint::Fill(1)])
+                            .areas(right);
+                    draw_pane_table(
+                        f,
+                        model,
+                        view,
+                        Tab::Workloads,
+                        rows_for_tab(model, view, Tab::Workloads),
+                        top_r,
+                        view.tab == Tab::Workloads,
+                        "³",
+                    );
+                    draw_pane_table(
+                        f,
+                        model,
+                        view,
+                        lower_tab,
+                        rows_for_tab(model, view, lower_tab),
+                        bot_r,
+                        view.tab == lower_tab,
+                        "⁴",
+                    );
+                }
+                (true, false) => {
+                    draw_pane_table(
+                        f,
+                        model,
+                        view,
+                        Tab::Workloads,
+                        rows_for_tab(model, view, Tab::Workloads),
+                        right,
+                        view.tab == Tab::Workloads,
+                        "³",
+                    );
+                }
+                (false, true) => {
+                    draw_pane_table(
+                        f,
+                        model,
+                        view,
+                        lower_tab,
+                        rows_for_tab(model, view, lower_tab),
+                        right,
+                        view.tab == lower_tab,
+                        "⁴",
+                    );
+                }
+                (false, false) => {}
+            }
+        }
+        (true, false) => {
+            draw_pane_table(
+                f,
+                model,
+                view,
+                Tab::Nodes,
+                rows_for_tab(model, view, Tab::Nodes),
+                area,
+                true,
+                "²",
+            );
+        }
+        (false, true) => {
+            let tab = if show_workloads && !show_lower {
+                Tab::Workloads
+            } else if !show_workloads && show_lower {
+                lower_tab
+            } else {
+                let [top_r, bot_r] =
+                    Layout::vertical([Constraint::Percentage(50), Constraint::Fill(1)]).areas(area);
+                draw_pane_table(
+                    f,
+                    model,
+                    view,
+                    Tab::Workloads,
+                    rows_for_tab(model, view, Tab::Workloads),
+                    top_r,
+                    view.tab == Tab::Workloads,
+                    "³",
+                );
+                draw_pane_table(
+                    f,
+                    model,
+                    view,
+                    lower_tab,
+                    rows_for_tab(model, view, lower_tab),
+                    bot_r,
+                    view.tab == lower_tab,
+                    "⁴",
+                );
+                return;
+            };
+            draw_pane_table(
+                f,
+                model,
+                view,
+                tab,
+                rows_for_tab(model, view, tab),
+                area,
+                true,
+                "",
+            );
+        }
+        (false, false) => {}
+    }
+}
+
 fn draw_table(f: &mut Frame, model: &Model, view: &View, rows: Vec<TableRow>, area: Rect) {
+    draw_pane_table(f, model, view, view.tab, rows, area, false, "");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_pane_table(
+    f: &mut Frame,
+    model: &Model,
+    view: &View,
+    tab: Tab,
+    rows: Vec<TableRow>,
+    area: Rect,
+    active_border: bool,
+    badge: &str,
+) {
+    let tab_idx = TABS.iter().position(|t| *t == tab).unwrap_or(0);
     let mut heading = vec![Span::styled(
-        format!(" {} ", view.tab.title()),
+        format!(" {badge}{} ", tab.title()),
         fg(ACCENT).add_modifier(Modifier::BOLD),
     )];
-    if view.tab == Tab::Tasks
+    if tab == Tab::Tasks
         && let Some(focus) = &view.focus
     {
         let of = match focus {
@@ -576,13 +1066,18 @@ fn draw_table(f: &mut Frame, model: &Model, view: &View, rows: Vec<TableRow>, ar
         };
         heading.push(Span::styled(format!("{of} "), fg(WARN)));
     }
-    let filter = &view.filter[view.index()];
+    let filter = &view.filter[tab_idx];
     if !filter.is_empty() {
         heading.push(Span::styled(format!("/{filter} "), fg(WARN)));
     }
-    let block = panel(Line::from(heading));
+    let border_color = if active_border {
+        ACCENT
+    } else {
+        Color::DarkGray
+    };
+    let block = panel(Line::from(heading)).border_style(fg(border_color));
 
-    let kinds = view.tab.kinds();
+    let kinds = tab.kinds();
     if !kinds.is_empty() && kinds.iter().all(|k| model.hidden.contains(k)) {
         let what: Vec<&str> = kinds.iter().map(|k| kind_word(*k)).collect();
         f.render_widget(
@@ -606,7 +1101,7 @@ fn draw_table(f: &mut Frame, model: &Model, view: &View, rows: Vec<TableRow>, ar
         f.render_widget(Paragraph::new(dimmed(empty)).block(block), area);
         return;
     }
-    let titles = view.tab.header();
+    let titles = tab.header();
     let mut widths: Vec<usize> = titles.iter().map(|t| t.len()).collect();
     for r in &rows {
         for (w, c) in widths.iter_mut().zip(&r.cells) {
@@ -625,7 +1120,7 @@ fn draw_table(f: &mut Frame, model: &Model, view: &View, rows: Vec<TableRow>, ar
             }
         })
         .collect();
-    let selected = view.selected[view.index()].min(count - 1);
+    let selected = view.selected[tab_idx].min(count - 1);
     let page = area.height.saturating_sub(3) as usize;
     let start = if page > 0 {
         selected.saturating_sub(page - 1)
@@ -633,7 +1128,10 @@ fn draw_table(f: &mut Frame, model: &Model, view: &View, rows: Vec<TableRow>, ar
         0
     };
     let end = (start + page).min(count);
-    let highlight = if mono() {
+    let is_focused_tab = view.tab == tab;
+    let highlight = if !is_focused_tab && view.preset == Preset::Bento {
+        Style::default()
+    } else if mono() {
         Style::default().add_modifier(Modifier::REVERSED)
     } else {
         Style::default()
@@ -654,7 +1152,11 @@ fn draw_table(f: &mut Frame, model: &Model, view: &View, rows: Vec<TableRow>, ar
     )
     .column_spacing(2)
     .row_highlight_style(highlight)
-    .highlight_symbol(Span::styled("▌", fg(ACCENT)));
+    .highlight_symbol(if is_focused_tab || view.preset != Preset::Bento {
+        Span::styled("▌", fg(ACCENT))
+    } else {
+        Span::raw(" ")
+    });
     let mut state = TableState::default().with_selected(Some(selected - start));
     f.render_stateful_widget(table.block(block), area, &mut state);
     if count + 3 > area.height as usize {
@@ -697,6 +1199,38 @@ fn detail(f: &mut Frame, model: &Model, selected: Option<Key>, area: Rect) {
         lines.push(Line::from(vec![
             Span::styled("uses ", dim()),
             Span::raw(format!("{cpu:.0}% of a CPU, {}", bytes(memory))),
+        ]));
+    }
+    if o.kind == Kind::Node
+        && let Some(nm) = model.node_metrics(&o.metadata.name)
+    {
+        if nm.zfs_used + nm.zfs_avail > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("zfs pool ", dim()),
+                Span::raw(format!(
+                    "{} used of {}",
+                    bytes(nm.zfs_used),
+                    bytes(nm.zfs_used + nm.zfs_avail)
+                )),
+            ]));
+        }
+        if nm.net_rx_bps + nm.net_tx_bps > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("network ", dim()),
+                Span::raw(format!(
+                    "▼ {}  ▲ {}",
+                    rate(nm.net_rx_bps),
+                    rate(nm.net_tx_bps)
+                )),
+            ]));
+        }
+    }
+    if o.kind == Kind::Volume
+        && let Some((used, avail)) = model.volume_space(&o.metadata.namespace, &o.metadata.name)
+    {
+        lines.push(Line::from(vec![
+            Span::styled("zfs dataset ", dim()),
+            Span::raw(format!("{} used, {} free", bytes(used), bytes(avail))),
         ]));
     }
     if !o.metadata.labels.is_empty() {
@@ -833,6 +1367,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("u n", "cron job: suspend or resume, run now"),
             ("m", "volume: move to a node"),
             ("l e", "follow logs, or events, of the row below"),
+            ("L", "service or Job: follow the logs of all its tasks"),
             (
                 "x",
                 "a shell in a task, below; Ctrl-] leaves it and returns",
@@ -846,6 +1381,17 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("PgUp PgDn", "scroll back"),
             ("z", "over the table, or not"),
             ("Esc", "close (a shell ends)"),
+        ],
+    ),
+    (
+        "Layout and telemetry",
+        &[
+            ("b / 0", "cycle preset: classic, bento, telemetry"),
+            ("F1–F4 / ! @ # $", "toggle boxes in bento mode"),
+            ("t", "expand workload → task → jail tree"),
+            ("< > S", "sort column (cpu, mem, state, name) and direction"),
+            ("+ -", "step live poll interval (1s, 2s, 5s, 10s)"),
+            ("M", "toggle mouse click & wheel support"),
         ],
     ),
 ];
