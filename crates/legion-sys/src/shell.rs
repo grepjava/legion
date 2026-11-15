@@ -9,8 +9,8 @@ use std::process::{Command, Stdio};
 use serde::Deserialize;
 
 use crate::{
-    Carp, CarpState, Dataset, Destination, Epair, Error, IfConfig, IpNet, Ipv6Net, IscsiSession,
-    Jail, JailMemory, KldState, PfState, RctlRule, Result, Sys, WgPeer,
+    Carp, CarpState, Dataset, DatasetSpace, Destination, Epair, Error, IfConfig, IpNet, Ipv6Net,
+    IscsiSession, Jail, JailMemory, KldState, PfState, RctlRule, Result, Sys, WgPeer,
 };
 
 /// Counts the memory of each jail's processes from the kernel's maps.
@@ -890,6 +890,15 @@ impl<R: Runner> Sys for Shell<R> {
             .map(|i| i.trim().to_owned()))
     }
 
+    fn net_bytes(&self) -> Result<(u64, u64)> {
+        let a = args(["--libxo=json", "-i", "-b", "-n"]);
+        let out = self.run("netstat", &a)?;
+        parse_netstat(&out).ok_or_else(|| Error::Parse {
+            command: describe("netstat", &a),
+            message: "expected statistics.interface".into(),
+        })
+    }
+
     fn sysctl_set(&self, name: &str, value: &str) -> Result<()> {
         self.run("sysctl", &[format!("{name}={value}")]).map(drop)
     }
@@ -988,6 +997,37 @@ impl<R: Runner> Sys for Shell<R> {
             .filter(|l| !l.is_empty())
             .map(|line| {
                 parse_dataset(line).ok_or_else(|| Error::Parse {
+                    command: describe("zfs", &a),
+                    message: format!("bad line {line:?}"),
+                })
+            })
+            .collect()
+    }
+
+    fn zfs_space(&self, root: &str) -> Result<Vec<DatasetSpace>> {
+        let a = args([
+            "list",
+            "-H",
+            "-p",
+            "-r",
+            "-t",
+            "filesystem",
+            "-o",
+            "name,used,avail",
+            root,
+        ]);
+        let out = self.output("zfs", &a, None)?;
+        if !out.success {
+            if out.stderr.contains("dataset does not exist") {
+                return Ok(Vec::new());
+            }
+            return Err(failed("zfs", &a, &out));
+        }
+        out.stdout
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|line| {
+                parse_dataset_space(line).ok_or_else(|| Error::Parse {
                     command: describe("zfs", &a),
                     message: format!("bad line {line:?}"),
                 })
@@ -1462,6 +1502,41 @@ fn parse_dataset(line: &str) -> Option<Dataset> {
         mountpoint,
         quota,
     })
+}
+
+fn parse_dataset_space(line: &str) -> Option<DatasetSpace> {
+    let mut cols = line.split('\t');
+    let name = cols.next()?.to_owned();
+    let used = cols.next()?.parse().ok()?;
+    let avail = cols.next()?.parse().ok()?;
+    Some(DatasetSpace { name, used, avail })
+}
+
+fn parse_netstat(out: &str) -> Option<(u64, u64)> {
+    let root: serde_json::Value = serde_json::from_str(out).ok()?;
+    let list = root.get("statistics")?.get("interface")?.as_array()?;
+    let num = |v: &serde_json::Value, k: &str| -> u64 {
+        v.get(k)
+            .and_then(|x| x.as_u64().or_else(|| x.as_str()?.parse().ok()))
+            .unwrap_or(0)
+    };
+    let mut rx = 0u64;
+    let mut tx = 0u64;
+    for entry in list {
+        let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let net = entry.get("network").and_then(|v| v.as_str()).unwrap_or("");
+        if !net.starts_with("<Link#")
+            || name.starts_with("lo")
+            || name == "legion0"
+            || name.starts_with("lp")
+            || name.starts_with("epair")
+        {
+            continue;
+        }
+        rx = rx.saturating_add(num(entry, "received-bytes"));
+        tx = tx.saturating_add(num(entry, "sent-bytes"));
+    }
+    Some((rx, tx))
 }
 
 #[cfg(test)]
@@ -2425,5 +2500,39 @@ mod tests {
             e.to_string(),
             "ifconfig epair9a destroy: ifconfig: interface epair9a does not exist"
         );
+    }
+
+    #[test]
+    fn zfs_space_and_net_bytes() {
+        let netstat = r#"{"statistics":{"interface":[
+            {"name":"vtnet0","network":"<Link#1>","received-bytes":12000,"sent-bytes":8000},
+            {"name":"vtnet0","network":"10.0.0.0/24","received-bytes":99999,"sent-bytes":99999},
+            {"name":"lo0","network":"<Link#2>","received-bytes":50000,"sent-bytes":50000},
+            {"name":"legion0","network":"<Link#3>","received-bytes":3000,"sent-bytes":3000},
+            {"name":"lp1a","network":"<Link#4>","received-bytes":4000,"sent-bytes":4000},
+            {"name":"ix0","network":"<Link#5>","received-bytes":"3000","sent-bytes":"2000"}
+        ]}}"#;
+        let sh = Script::shell(vec![
+            (
+                "zfs list -H -p -r -t filesystem -o name,used,avail tank/legion",
+                ok(
+                    "tank/legion\t536870912\t10737418240\ntank/legion/volumes/shop/db\t268435456\t2147483648\n",
+                ),
+            ),
+            (
+                "zfs list -H -p -r -t filesystem -o name,used,avail tank/missing",
+                err("cannot open 'tank/missing': dataset does not exist"),
+            ),
+            ("netstat --libxo=json -i -b -n", ok(netstat)),
+        ]);
+        let ds = sh.zfs_space("tank/legion").unwrap();
+        assert_eq!(ds.len(), 2);
+        assert_eq!(ds[0].name, "tank/legion");
+        assert_eq!(ds[0].used, 536_870_912);
+        assert_eq!(ds[0].avail, 10_737_418_240);
+        assert_eq!(ds[1].name, "tank/legion/volumes/shop/db");
+        assert_eq!(ds[1].used, 268_435_456);
+        assert!(sh.zfs_space("tank/missing").unwrap().is_empty());
+        assert_eq!(sh.net_bytes().unwrap(), (15_000, 10_000));
     }
 }

@@ -197,6 +197,23 @@ message HeartbeatRequest {
   // The CARP state of each load balancer address the node took up, as
   // last read; which node holds each.
   repeated CarpState carp = 3;
+  // Node-level ZFS pool/volume space and host network throughput.
+  optional NodeTelemetry telemetry = 4;
+}
+
+message NodeTelemetry {
+  uint64 zfs_used_bytes = 1;
+  uint64 zfs_avail_bytes = 2;
+  uint64 net_rx_bps = 3;
+  uint64 net_tx_bps = 4;
+  repeated VolumeTelemetry volumes = 5;
+}
+
+message VolumeTelemetry {
+  string namespace = 1;
+  string volume = 2;
+  uint64 used_bytes = 3;
+  uint64 avail_bytes = 4;
 }
 
 message CarpState {

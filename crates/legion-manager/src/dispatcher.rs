@@ -1263,8 +1263,21 @@ impl Dispatcher for DispatcherService {
         let issuer = self.caller_ca(&req);
         if let Some(mut leader) = self.leader(&req)? {
             let worker = self.worker(&req)?;
-            let HeartbeatRequest { usage, carp, .. } = req.into_inner();
-            let mut forwarded = to_leader(HeartbeatRequest { node, usage, carp }, &worker)?;
+            let HeartbeatRequest {
+                usage,
+                carp,
+                telemetry,
+                ..
+            } = req.into_inner();
+            let mut forwarded = to_leader(
+                HeartbeatRequest {
+                    node,
+                    usage,
+                    carp,
+                    telemetry,
+                },
+                &worker,
+            )?;
             if let Some(issuer) = issuer.and_then(|i| i.parse().ok()) {
                 forwarded.metadata_mut().insert(FORWARDED_CA, issuer);
             }
@@ -1283,6 +1296,7 @@ impl Dispatcher for DispatcherService {
         let HeartbeatRequest {
             usage: reported,
             carp,
+            telemetry,
             ..
         } = req.into_inner();
         self.api.balancers.record(
@@ -1290,6 +1304,35 @@ impl Dispatcher for DispatcherService {
             carp.into_iter()
                 .filter_map(|c| Some((c.address.parse().ok()?, c.state))),
         );
+        if let Some(t) = telemetry {
+            let holds_volume = |namespace: &str, volume: &str| {
+                let key = ObjectKey::new(Kind::Volume, namespace, volume);
+                self.get(&key)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|v| v.status["node"].as_str() == Some(node.as_str()))
+            };
+            self.api.usage.record_node(
+                &node,
+                legion_api::dispatch::NodeTelemetry {
+                    zfs_used_bytes: t.zfs_used_bytes,
+                    zfs_avail_bytes: t.zfs_avail_bytes,
+                    net_rx_bps: t.net_rx_bps,
+                    net_tx_bps: t.net_tx_bps,
+                    volumes: t
+                        .volumes
+                        .into_iter()
+                        .map(|v| legion_api::dispatch::VolumeTelemetry {
+                            namespace: v.namespace,
+                            volume: v.volume,
+                            used_bytes: v.used_bytes,
+                            avail_bytes: v.avail_bytes,
+                        })
+                        .collect(),
+                },
+                holds_volume,
+            );
+        }
         // Believed only of tasks placed on the node.
         let runs_on = |task: &str| {
             let Some((namespace, name)) = task.split_once('/') else {

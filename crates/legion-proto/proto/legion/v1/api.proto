@@ -203,6 +203,20 @@ service Cluster {
   // it runs, followed with `follow` until it ends; else the end its status
   // kept.
   rpc BuildLogs(BuildLogsRequest) returns (stream BuildLogsChunk);
+  // Images cached on nodes: list across nodes, or pull, push, remove or
+  // prune on a node. Listing goes to callers who may read nodes; pull,
+  // push, remove and prune are the cluster admin's.
+  rpc NodeImages(NodeImagesRequest) returns (NodeImagesResponse);
+  // Streams a cached image from `node` as an OCI/Docker `.tar` archive
+  // (`legion_image::Store::export`); the cluster admin's.
+  rpc ExportImage(ExportImageRequest) returns (stream BackupChunk);
+  // Streams an OCI/Docker `.tar` archive onto `node` (`Store::load`); the
+  // cluster admin's.
+  rpc LoadImage(stream LoadImageChunk) returns (NodeImagesResponse);
+  // Searches the built-in FreeBSD jail catalog and Docker Hub for images.
+  rpc SearchImages(SearchImagesRequest) returns (SearchImagesResponse);
+  // Inspects a remote registry image (tags, platforms, digest, cosign).
+  rpc InspectRegistryImage(InspectRegistryImageRequest) returns (InspectRegistryImageResponse);
 }
 
 message MeRequest {}
@@ -333,6 +347,22 @@ message UsageHistoryResponse {
   repeated TaskSeries tasks = 1;
   // Between samples, in milliseconds.
   int64 step_ms = 2;
+  // Node-level ZFS and network series over the last hour, for callers who
+  // may read nodes.
+  repeated NodeSeries nodes = 3;
+}
+
+message NodeSeries {
+  string node = 1;
+  repeated NodeSample samples = 2;
+}
+
+message NodeSample {
+  int64 at_ms = 1;
+  uint64 zfs_used_bytes = 2;
+  uint64 zfs_avail_bytes = 3;
+  uint64 net_rx_bps = 4;
+  uint64 net_tx_bps = 5;
 }
 
 message TaskSeries {
@@ -470,6 +500,11 @@ message UsageResponse {
 message NodeUsage {
   string node = 1;
   repeated TaskUsage tasks = 2;
+  uint64 zfs_used_bytes = 3;
+  uint64 zfs_avail_bytes = 4;
+  uint64 net_rx_bps = 5;
+  uint64 net_tx_bps = 6;
+  repeated VolumeTelemetry volumes = 7;
 }
 
 message AutolockRequest {
@@ -535,6 +570,108 @@ service Volumes {
   // The data goes to `node`, and only once all of it is there is the
   // Volume created, on that node; a Volume of that name must not exist.
   rpc Restore(stream VolumeRestoreChunk) returns (VolumeRestoreResponse);
+  // Lists, creates, rolls back or deletes ZFS snapshots of a Volume on the
+  // node holding it.
+  rpc Snapshot(VolumeSnapshotRequest) returns (VolumeSnapshotResponse);
+}
+
+message VolumeSnapshotRequest {
+  string namespace = 1;
+  string name = 2;
+  // "list", "create", "rollback", "delete".
+  string op = 3;
+  string snapshot = 4;
+}
+
+message VolumeSnapshotResponse {
+  repeated string snapshots = 1;
+}
+
+message NodeImagesRequest {
+  // "list", "pull", "push", "remove", "prune".
+  string op = 1;
+  // Empty on "list" queries every ready node; required on mutations.
+  string node = 2;
+  string image = 3;
+  // Target `registry/repo:tag` for "push".
+  string target = 4;
+  // Optional namespace + Secret name holding `.dockerconfigjson` auth.
+  string namespace = 5;
+  string secret = 6;
+}
+
+message NodeImageItem {
+  string node = 1;
+  string reference = 2;
+  string digest = 3;
+  string os = 4;
+  string arch = 5;
+  uint32 layers = 6;
+}
+
+message NodeImagesResponse {
+  repeated NodeImageItem images = 1;
+  uint64 removed = 2;
+  string digest = 3;
+}
+
+message ExportImageRequest {
+  string node = 1;
+  string image = 2;
+  // Optional tag to embed in Docker `manifest.json`.
+  string tag = 3;
+}
+
+message LoadImageStart {
+  string node = 1;
+  // Reference to record when the archive has none.
+  string reference = 2;
+}
+
+message LoadImageChunk {
+  oneof part {
+    LoadImageStart start = 1;
+    bytes data = 2;
+  }
+}
+
+message SearchImagesRequest {
+  string query = 1;
+  uint32 limit = 2;
+}
+
+message RegistrySearchHit {
+  string name = 1;
+  string description = 2;
+  uint64 stars = 3;
+  bool official = 4;
+  // "freebsd-catalog" or "docker-hub".
+  string source = 5;
+  string suggested_tag = 6;
+}
+
+message SearchImagesResponse {
+  repeated RegistrySearchHit results = 1;
+}
+
+message InspectRegistryImageRequest {
+  string image = 1;
+  string namespace = 2;
+  string secret = 3;
+}
+
+message RegistryPlatform {
+  string os = 1;
+  string arch = 2;
+  string digest = 3;
+}
+
+message InspectRegistryImageResponse {
+  string image = 1;
+  string digest = 2;
+  repeated RegistryPlatform platforms = 3;
+  repeated string tags = 4;
+  bool signed = 5;
 }
 
 message VolumeBackupRequest {

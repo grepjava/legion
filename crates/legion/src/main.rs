@@ -576,7 +576,7 @@ enum Command {
 pub enum ImageCommand {
     /// Load an image from an OCI archive (`podman save --format
     /// oci-archive`) into this node's image store, beside a running daemon
-    /// or not: for images no registry serves (`localhost/...`).
+    /// or not (`--zfs-root`), or stream it to a cluster node (`--node`).
     Load {
         file: PathBuf,
         /// Its name; by default the one the archive gives.
@@ -584,9 +584,77 @@ pub enum ImageCommand {
         name: Option<String>,
         #[arg(long, default_value = "/var/db/legion")]
         data_dir: PathBuf,
-        /// The daemon's `--zfs-root`.
+        /// The daemon's `--zfs-root` (when loading directly on this host).
+        #[arg(long, required_unless_present = "node")]
+        zfs_root: Option<String>,
+        /// Stream the archive over the cluster API onto NODE instead.
         #[arg(long)]
-        zfs_root: String,
+        node: Option<String>,
+    },
+    /// List cached images on ready nodes (or on `--node`).
+    Ls {
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(short, long, value_enum, default_value_t = cli::Format::Table)]
+        output: cli::Format,
+    },
+    /// Pre-pull an image onto `--node` (or every ready node when omitted).
+    Pull {
+        image: String,
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// Optional Secret holding `.dockerconfigjson` registry auth.
+        #[arg(long)]
+        secret: Option<String>,
+    },
+    /// Push a cached image from `--node` to a target registry (`ghcr.io/owner/repo:tag`).
+    Push {
+        image: String,
+        target: String,
+        #[arg(long)]
+        node: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// Optional Secret holding `.dockerconfigjson` registry auth.
+        #[arg(long)]
+        secret: Option<String>,
+    },
+    /// Remove a cached image reference from `--node` (or every ready node).
+    Rm {
+        image: String,
+        #[arg(long)]
+        node: Option<String>,
+    },
+    /// Prune unused image layers and blobs on `--node` (or every ready node).
+    Prune {
+        #[arg(long)]
+        node: Option<String>,
+    },
+    /// Export a cached image from `--node` to a local OCI/Docker `.tar` archive.
+    Export {
+        image: String,
+        #[arg(long)]
+        node: String,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long)]
+        tag: Option<String>,
+    },
+    /// Search the FreeBSD jail image catalog and Docker Hub.
+    Search {
+        query: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Inspect a remote registry image (tags, platforms, digest, cosign).
+    Inspect {
+        image: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+        #[arg(long)]
+        secret: Option<String>,
     },
 }
 
@@ -685,6 +753,33 @@ pub enum VolumeCommand {
         #[arg(long)]
         replace: bool,
     },
+    /// List ZFS snapshots of a Volume on the node holding its data.
+    Snapshots {
+        volume: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// Take a ZFS snapshot of a Volume.
+    Snapshot {
+        volume: String,
+        snapshot: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// Roll a Volume's ZFS dataset back to a snapshot (only while no task uses it).
+    Rollback {
+        volume: String,
+        snapshot: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// Delete a ZFS snapshot of a Volume.
+    RmSnapshot {
+        volume: String,
+        snapshot: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -753,10 +848,18 @@ fn main() -> anyhow::Result<()> {
     if argv.get(1).map(String::as_str) == Some(JAIL_SHIM) {
         std::process::exit(legion_jail::shim::main(&argv[2..]));
     }
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(run())
+    std::thread::Builder::new()
+        .name("legion-main".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let args = Args::parse();
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(Box::pin(run(args)))
+        })?
+        .join()
+        .unwrap_or_else(|p| std::panic::resume_unwind(p))
 }
 
 /// A registry as `--insecure-registry` takes it: `host[:port]`, no scheme
@@ -771,8 +874,7 @@ fn registry_host(s: &str) -> Result<String, String> {
     Ok(s)
 }
 
-async fn run() -> anyhow::Result<()> {
-    let args = Args::parse();
+async fn run(args: Args) -> anyhow::Result<()> {
     match args.command {
         Command::NodeResolver { listen, zone, pid } => {
             tracing_subscriber::fmt()
@@ -841,7 +943,7 @@ async fn run() -> anyhow::Result<()> {
                 }),
                 None => None,
             };
-            daemon::run(daemon::Options {
+            Box::pin(daemon::run(daemon::Options {
                 console,
                 data_dir,
                 run_dir,
@@ -868,7 +970,7 @@ async fn run() -> anyhow::Result<()> {
                     events: audit_max_events,
                     ..Default::default()
                 },
-            })
+            }))
             .await
         }
         Command::Join {
@@ -895,14 +997,15 @@ async fn run() -> anyhow::Result<()> {
                     file,
                     name,
                     data_dir,
-                    zfs_root,
+                    zfs_root: Some(zfs_root),
+                    node: None,
                 },
         } => daemon::load_image(&file, name.as_deref(), &data_dir, &zfs_root).await,
         Command::Doctor { zfs_root, json } => {
             doctor::run(&legion_sys::Shell::new(), zfs_root.as_deref(), json)
         }
         Command::Unlock { key_file } => cli::unlock(&args.server, key_file.as_deref()).await,
-        command => cli::run(&args.server, &args.identity, command).await,
+        command => Box::pin(cli::run(&args.server, &args.identity, command)).await,
     }
 }
 

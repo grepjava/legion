@@ -213,6 +213,15 @@ fn router(gateway: Gateway) -> axum::Router {
         .route("/api/backup", get(store_backup))
         .route("/api/volume-backup/{namespace}/{name}", get(volume_backup))
         .route("/api/volume-restore", post(volume_restore))
+        .route(
+            "/api/volume-snapshots/{namespace}/{name}",
+            get(volume_snapshots).post(volume_snapshot_op),
+        )
+        .route("/api/images", get(node_images_list).post(node_images_op))
+        .route("/api/image-export", get(image_export))
+        .route("/api/image-load", post(image_load))
+        .route("/api/registry/search", get(registry_search))
+        .route("/api/registry/inspect", get(registry_inspect))
         .fallback(page)
         .layer(axum::middleware::map_response_with_state(
             gateway.clone(),
@@ -1040,7 +1049,27 @@ async fn usage(
                     })
                 })
                 .collect();
-            serde_json::json!({ "node": n.node, "tasks": tasks })
+            let volumes: Vec<_> = n
+                .volumes
+                .iter()
+                .map(|v| {
+                    serde_json::json!({
+                        "namespace": v.namespace,
+                        "volume": v.volume,
+                        "used_bytes": v.used_bytes,
+                        "avail_bytes": v.avail_bytes,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "node": n.node,
+                "tasks": tasks,
+                "zfs_used_bytes": n.zfs_used_bytes,
+                "zfs_avail_bytes": n.zfs_avail_bytes,
+                "net_rx_bps": n.net_rx_bps,
+                "net_tx_bps": n.net_tx_bps,
+                "volumes": volumes,
+            })
         })
         .collect();
     Ok(Json(serde_json::json!({ "nodes": nodes })).into_response())
@@ -1132,7 +1161,9 @@ struct HistoryScope {
 }
 
 /// `Cluster.UsageHistory`: `{step_ms, tasks: [{namespace, task, node,
-/// samples: [[at_ms, cpu_percent, memory_bytes], ...]}]}`, oldest first.
+/// samples: [[at_ms, cpu_percent, memory_bytes], ...]}], nodes: [{node,
+/// samples: [[at_ms, zfs_used_bytes, zfs_avail_bytes, net_rx_bps, net_tx_bps], ...]}]}`,
+/// oldest first.
 async fn usage_history(
     State(g): State<Gateway>,
     headers: HeaderMap,
@@ -1165,7 +1196,35 @@ async fn usage_history(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({ "step_ms": r.step_ms, "tasks": tasks })).into_response())
+    let nodes: Vec<_> = r
+        .nodes
+        .iter()
+        .map(|n| {
+            let samples: Vec<_> = n
+                .samples
+                .iter()
+                .map(|s| {
+                    serde_json::json!([
+                        s.at_ms,
+                        s.zfs_used_bytes,
+                        s.zfs_avail_bytes,
+                        s.net_rx_bps,
+                        s.net_tx_bps
+                    ])
+                })
+                .collect();
+            serde_json::json!({
+                "node": n.node,
+                "samples": samples,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "step_ms": r.step_ms,
+        "tasks": tasks,
+        "nodes": nodes,
+    }))
+    .into_response())
 }
 
 /// `legion reach`: what may reach what among a namespace's services,
@@ -2456,6 +2515,332 @@ async fn volume_restore(
         "bytes": bytes,
         "taken": header.taken,
         "consistency": header.consistency,
+    }))
+    .into_response())
+}
+
+/// `legion volume snapshots`: lists ZFS snapshots of a Volume.
+async fn volume_snapshots(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let r = pb::volumes_client::VolumesClient::new(channel)
+        .snapshot(pb::VolumeSnapshotRequest {
+            namespace,
+            name,
+            op: "list".to_owned(),
+            snapshot: String::new(),
+        })
+        .await?
+        .into_inner();
+    Ok(Json(serde_json::json!({ "snapshots": r.snapshots })).into_response())
+}
+
+#[derive(Deserialize)]
+struct VolumeSnapshotBody {
+    /// `create`, `rollback`, or `delete`.
+    op: String,
+    snapshot: String,
+}
+
+/// `legion volume snapshot|rollback|rm-snapshot`: mutates a Volume's ZFS snapshots.
+async fn volume_snapshot_op(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path((namespace, name)): Path<(String, String)>,
+    Json(body): Json<VolumeSnapshotBody>,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    if !matches!(body.op.as_str(), "create" | "rollback" | "delete") {
+        return Err(bad_request("op must be create, rollback or delete"));
+    }
+    let r = pb::volumes_client::VolumesClient::new(channel)
+        .snapshot(pb::VolumeSnapshotRequest {
+            namespace,
+            name,
+            op: body.op,
+            snapshot: body.snapshot,
+        })
+        .await?
+        .into_inner();
+    Ok(Json(serde_json::json!({ "snapshots": r.snapshots })).into_response())
+}
+
+#[derive(Deserialize)]
+struct NodeImagesQuery {
+    node: Option<String>,
+}
+
+/// `legion image ls`: cached OCI images across ready nodes (or on `node`).
+async fn node_images_list(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Query(q): Query<NodeImagesQuery>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let r = ClusterClient::new(channel)
+        .max_decoding_message_size(crate::MAX_MESSAGE)
+        .node_images(pb::NodeImagesRequest {
+            op: "list".to_owned(),
+            node: q.node.unwrap_or_default(),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    let images: Vec<_> = r
+        .images
+        .iter()
+        .map(|i| {
+            serde_json::json!({
+                "node": i.node,
+                "reference": i.reference,
+                "digest": i.digest,
+                "os": i.os,
+                "arch": i.arch,
+                "layers": i.layers,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "images": images })).into_response())
+}
+
+#[derive(Deserialize)]
+struct NodeImageOpBody {
+    /// `pull`, `push`, `remove`, or `prune`.
+    op: String,
+    #[serde(default)]
+    node: String,
+    #[serde(default)]
+    image: String,
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    namespace: String,
+    #[serde(default)]
+    secret: String,
+}
+
+/// `legion image pull|push|rm|prune`: mutates cached images on a node or across nodes.
+async fn node_images_op(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(body): Json<NodeImageOpBody>,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    if !matches!(body.op.as_str(), "pull" | "push" | "remove" | "prune") {
+        return Err(bad_request("op must be pull, push, remove or prune"));
+    }
+    let r = ClusterClient::new(channel)
+        .max_decoding_message_size(crate::MAX_MESSAGE)
+        .node_images(pb::NodeImagesRequest {
+            op: body.op,
+            node: body.node,
+            image: body.image,
+            target: body.target,
+            namespace: body.namespace,
+            secret: body.secret,
+        })
+        .await?
+        .into_inner();
+    Ok(Json(serde_json::json!({
+        "removed": r.removed,
+        "digest": r.digest,
+    }))
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct ImageExportQuery {
+    node: String,
+    image: String,
+    tag: Option<String>,
+}
+
+/// `legion image export`: downloads a cached node image as an OCI/Docker `.tar` archive.
+async fn image_export(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(q): Query<ImageExportQuery>,
+) -> Result<Response, Refused> {
+    same_origin(&headers, &uri)?;
+    let (_, channel) = g.user(&headers).await?;
+    let stream = ClusterClient::new(channel)
+        .max_decoding_message_size(crate::MAX_MESSAGE)
+        .export_image(pb::ExportImageRequest {
+            node: q.node,
+            image: q.image.clone(),
+            tag: q.tag.unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+    let base: String = q
+        .image
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let filename = format!("{}.tar", base.trim_matches('-'));
+    Ok(download(&filename, chunks(stream)))
+}
+
+#[derive(Deserialize)]
+struct ImageLoadQuery {
+    node: String,
+    reference: Option<String>,
+}
+
+/// `legion image load --node`: uploads an OCI/Docker `.tar` archive onto `node`.
+async fn image_load(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(q): Query<ImageLoadQuery>,
+    body: axum::body::Body,
+) -> Result<Response, Refused> {
+    use pb::load_image_chunk::Part;
+    use tokio_stream::StreamExt;
+    const CHUNK: usize = 1 << 20;
+    let channel = g.writer(&headers, &uri, None).await?;
+    let mut upload = body.into_data_stream();
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let send = |part| pb::LoadImageChunk { part: Some(part) };
+    tx.send(send(Part::Start(pb::LoadImageStart {
+        node: q.node.clone(),
+        reference: q.reference.unwrap_or_default(),
+    })))
+    .await
+    .expect("the receiver is held");
+    let feeding = tokio::spawn(async move {
+        let mut bytes = 0u64;
+        while let Some(piece) = upload.next().await {
+            let piece = piece.map_err(|e| format!("reading the upload: {e}"))?;
+            bytes += piece.len() as u64;
+            for part in piece.chunks(CHUNK) {
+                if tx.send(send(Part::Data(part.to_vec()))).await.is_err() {
+                    return Err("the manager stopped taking the archive".to_owned());
+                }
+            }
+        }
+        Ok(bytes)
+    });
+    let sent = ClusterClient::new(channel)
+        .max_encoding_message_size(crate::MAX_MESSAGE)
+        .load_image(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await;
+    let fed = feeding
+        .await
+        .map_err(|e| Refused(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let r = sent?.into_inner();
+    let bytes = fed.map_err(bad_request)?;
+    let images: Vec<_> = r
+        .images
+        .iter()
+        .map(|i| {
+            serde_json::json!({
+                "node": i.node,
+                "reference": i.reference,
+                "digest": i.digest,
+                "os": i.os,
+                "arch": i.arch,
+                "layers": i.layers,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "node": q.node,
+        "bytes": bytes,
+        "digest": r.digest,
+        "images": images,
+    }))
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct RegistrySearchQuery {
+    query: Option<String>,
+    limit: Option<u32>,
+}
+
+/// `legion image search`: searches FreeBSD catalog and Docker Hub.
+async fn registry_search(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Query(q): Query<RegistrySearchQuery>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let r = ClusterClient::new(channel)
+        .search_images(pb::SearchImagesRequest {
+            query: q.query.unwrap_or_default(),
+            limit: q.limit.unwrap_or(20).min(50),
+        })
+        .await?
+        .into_inner();
+    let results: Vec<_> = r
+        .results
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "name": h.name,
+                "description": h.description,
+                "stars": h.stars,
+                "official": h.official,
+                "source": h.source,
+                "suggested_tag": h.suggested_tag,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "results": results })).into_response())
+}
+
+#[derive(Deserialize)]
+struct RegistryInspectQuery {
+    image: String,
+    namespace: Option<String>,
+    secret: Option<String>,
+}
+
+/// `legion image inspect`: inspects a remote registry image (tags, platforms, digest, cosign).
+async fn registry_inspect(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Query(q): Query<RegistryInspectQuery>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let r = ClusterClient::new(channel)
+        .inspect_registry_image(pb::InspectRegistryImageRequest {
+            image: q.image,
+            namespace: q.namespace.unwrap_or_default(),
+            secret: q.secret.unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+    let platforms: Vec<_> = r
+        .platforms
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "os": p.os,
+                "arch": p.arch,
+                "digest": p.digest,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "image": r.image,
+        "digest": r.digest,
+        "platforms": platforms,
+        "tags": r.tags,
+        "signed": r.signed,
     }))
     .into_response())
 }

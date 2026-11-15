@@ -555,6 +555,90 @@ impl Runtime for FakeRuntime {
         Ok(())
     }
 
+    async fn cached_images(&self) -> Result<Vec<crate::runtime::CachedImage>> {
+        let s = self.state();
+        Ok(s.images
+            .iter()
+            .map(|r| crate::runtime::CachedImage {
+                reference: r.clone(),
+                digest: format!("sha256:manifest-of-{r}"),
+                os: "freebsd".to_owned(),
+                arch: "amd64".to_owned(),
+                layers: 1,
+            })
+            .collect())
+    }
+
+    async fn remove_image(&self, reference: &str) -> Result<bool> {
+        let mut s = self.state();
+        s.private.remove(reference);
+        Ok(s.images.remove(reference))
+    }
+
+    async fn prune_images(&self) -> Result<u64> {
+        Ok(0)
+    }
+
+    async fn push_image(&self, query: &str, target: &str, _logins: &[Login]) -> Result<String> {
+        let mut s = self.state();
+        if !s.images.contains(query) {
+            return Err(api(404, format!("{query}: image not found")));
+        }
+        s.images.insert(target.to_owned());
+        Ok(format!("sha256:pushed-{target}"))
+    }
+
+    async fn export_image(
+        &self,
+        query: &str,
+        name: Option<&str>,
+        out: &std::path::Path,
+    ) -> Result<crate::runtime::CachedImage> {
+        if !self.state().images.contains(query) {
+            return Err(api(404, format!("{query}: image not found")));
+        }
+        let reference = name.unwrap_or(query).to_owned();
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "format": "fake-oci-archive",
+            "reference": reference,
+        }))
+        .map_err(|e| api(500, e.to_string()))?;
+        std::fs::write(out, payload)?;
+        Ok(crate::runtime::CachedImage {
+            reference: reference.clone(),
+            digest: format!("sha256:manifest-of-{reference}"),
+            os: "freebsd".to_owned(),
+            arch: "amd64".to_owned(),
+            layers: 1,
+        })
+    }
+
+    async fn load_image(
+        &self,
+        archive: &std::path::Path,
+        reference: Option<&str>,
+    ) -> Result<crate::runtime::CachedImage> {
+        let raw = std::fs::read(archive)?;
+        let parsed = serde_json::from_slice::<serde_json::Value>(&raw).ok();
+        let embedded = parsed
+            .as_ref()
+            .and_then(|v| v.get("reference"))
+            .and_then(|v| v.as_str());
+        let name = reference
+            .filter(|s| !s.is_empty())
+            .or(embedded)
+            .ok_or_else(|| api(400, "the archive names no image: give a reference"))?
+            .to_owned();
+        self.state().images.insert(name.clone());
+        Ok(crate::runtime::CachedImage {
+            reference: name.clone(),
+            digest: format!("sha256:manifest-of-{name}"),
+            os: "freebsd".to_owned(),
+            arch: "amd64".to_owned(),
+            layers: 1,
+        })
+    }
+
     async fn create(&self, spec: &ContainerSpec) -> Result<String> {
         let mut s = self.state();
         if !s.images.contains(&spec.image) {

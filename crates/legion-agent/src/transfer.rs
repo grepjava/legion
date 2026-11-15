@@ -12,7 +12,10 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use legion_proto::v1::session_frame::Frame;
-use legion_proto::v1::{SessionFrame, VolumeExport, VolumeImport, VolumeReceive, VolumeSend};
+use legion_proto::v1::{
+    SessionFrame, VolumeExport, VolumeImport, VolumeReceive, VolumeSend, VolumeSnapshotAction,
+    VolumeSnapshotResult,
+};
 use legion_sys::Sys;
 use tokio::sync::{Mutex, mpsc};
 use tonic::{Status, Streaming};
@@ -91,7 +94,7 @@ pub(crate) async fn receive(
 
 /// Input until it closes, into `data`; anything else ends the stream
 /// early, which makes what reads it fail. `sender` names who sends it.
-async fn feed(
+pub(crate) async fn feed(
     inbound: &mut Streaming<SessionFrame>,
     data: mpsc::Sender<Result<Vec<u8>, String>>,
     sender: &str,
@@ -314,6 +317,65 @@ pub(crate) async fn drop_copy(
     })
     .await
     .map_err(Status::internal)?;
+    let _ = tx.send(frame(Frame::ExitCode(0))).await;
+    Ok(())
+}
+
+/// Lists, creates, rolls back or deletes ZFS snapshots of a Volume's dataset.
+pub(crate) async fn snapshot(
+    v: &Volumes,
+    namespace: &str,
+    opts: VolumeSnapshotAction,
+    tx: &mpsc::Sender<SessionFrame>,
+) -> Result<(), Status> {
+    let ds = v.dataset(namespace, &opts.volume)?;
+    let op = opts.op;
+    let snap_name = opts.snapshot;
+    let valid_snap = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 128
+            && !s.starts_with("legion-move-")
+            && !s.starts_with(BACKUP)
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    if matches!(op.as_str(), "create" | "rollback" | "delete") && !valid_snap(&snap_name) {
+        return Err(Status::invalid_argument(
+            "snapshot name must be 1..128 characters of [a-zA-Z0-9._-] and not reserved",
+        ));
+    }
+    let lock = v.lock.clone();
+    let listed = crate::task::blocking(&v.sys, move |sys| -> Result<Vec<String>, String> {
+        let _guard = lock.blocking_lock();
+        match op.as_str() {
+            "list" => {}
+            "create" => sys
+                .zfs_snapshot(&format!("{ds}@{snap_name}"))
+                .map_err(|e| e.to_string())?,
+            "rollback" => {
+                sys.zfs_rollback(&format!("{ds}@{snap_name}"))
+                    .map_err(|e| e.to_string())?;
+                sys.zfs_mount(&ds).map_err(|e| e.to_string())?;
+            }
+            "delete" => sys
+                .zfs_destroy(&format!("{ds}@{snap_name}"), false)
+                .map_err(|e| e.to_string())?,
+            other => return Err(format!("unknown snapshot op {other:?}")),
+        }
+        Ok(sys
+            .zfs_snapshots(&ds)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|s| !s.starts_with("legion-move-") && !s.starts_with(BACKUP))
+            .collect())
+    })
+    .await
+    .map_err(Status::failed_precondition)?;
+    let _ = tx
+        .send(frame(Frame::Snapshots(VolumeSnapshotResult {
+            snapshots: listed,
+        })))
+        .await;
     let _ = tx.send(frame(Frame::ExitCode(0))).await;
     Ok(())
 }

@@ -218,6 +218,16 @@ impl Pods for PodsService {
                     "images are built by applying a Build, which the managers run",
                 ));
             }
+            Some(Action::VolumeSnapshot(_)) => {
+                return Err(Status::invalid_argument(
+                    "volume snapshots go through Volumes.Snapshot",
+                ));
+            }
+            Some(Action::ImageOp(_)) => {
+                return Err(Status::invalid_argument(
+                    "node image actions go through Cluster.NodeImages",
+                ));
+            }
             None => return Err(Status::invalid_argument("the session needs an action")),
         };
         let action = match open.action {

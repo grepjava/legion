@@ -106,6 +106,71 @@ pub trait Runtime: Send + Sync + 'static {
         &self,
         labels: &[(&str, &str)],
     ) -> impl Future<Output = Result<BoxStream<'static, Result<Event>>>> + Send;
+
+    /// Images cached in this node's local image store.
+    fn cached_images(&self) -> impl Future<Output = Result<Vec<CachedImage>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// Removes `reference` from this node's local image store; returns true
+    /// if the reference was present.
+    fn remove_image(&self, reference: &str) -> impl Future<Output = Result<bool>> + Send {
+        let _ = reference;
+        async { Ok(false) }
+    }
+
+    /// Prunes unreferenced layers and blobs in this node's local image store;
+    /// returns how many layers were removed.
+    fn prune_images(&self) -> impl Future<Output = Result<u64>> + Send {
+        async { Ok(0) }
+    }
+
+    /// Pushes local image `query` to `target` (`registry/repo:tag`), returning
+    /// the pushed manifest's `sha256:...` digest.
+    fn push_image(
+        &self,
+        query: &str,
+        target: &str,
+        logins: &[Login],
+    ) -> impl Future<Output = Result<String>> + Send {
+        let _ = (query, target, logins);
+        async { Err(Error::Failed("pushing images is not supported".to_owned())) }
+    }
+
+    /// Exports local image `query` as an OCI/Docker `.tar` archive at `out`.
+    fn export_image(
+        &self,
+        query: &str,
+        name: Option<&str>,
+        out: &std::path::Path,
+    ) -> impl Future<Output = Result<CachedImage>> + Send {
+        let _ = (query, name, out);
+        async {
+            Err(Error::Failed(
+                "exporting images is not supported".to_owned(),
+            ))
+        }
+    }
+
+    /// Loads an OCI/Docker `.tar` archive at `archive` into the node's store.
+    fn load_image(
+        &self,
+        archive: &std::path::Path,
+        reference: Option<&str>,
+    ) -> impl Future<Output = Result<CachedImage>> + Send {
+        let _ = (archive, reference);
+        async { Err(Error::Failed("loading images is not supported".to_owned())) }
+    }
+}
+
+/// An image held in a node's local image store.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CachedImage {
+    pub reference: String,
+    pub digest: String,
+    pub os: String,
+    pub arch: String,
+    pub layers: u32,
 }
 
 #[derive(Debug, thiserror::Error)]

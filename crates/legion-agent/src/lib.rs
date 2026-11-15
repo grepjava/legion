@@ -26,6 +26,7 @@ pub use build::Builder;
 pub mod control;
 pub mod fake;
 mod files;
+mod image_ops;
 pub mod ingress;
 mod logins;
 mod memory;
@@ -228,6 +229,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             runtime: self.ctx.runtime.clone(),
             sys: self.ctx.sys.clone(),
             node: self.ctx.node.clone(),
+            zfs_root: self.ctx.zfs_root.clone(),
         }
     }
 
@@ -325,6 +327,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 runtime: ctx.runtime.clone(),
                 sys: ctx.sys.clone(),
                 node: ctx.node.clone(),
+                zfs_root: ctx.zfs_root.clone(),
             },
             self.usage_period,
         ));
@@ -1179,16 +1182,20 @@ async fn heartbeats<R: Runtime, C: Control>(
     let mut period = Duration::from_secs(1);
     let mut failing = false;
     let mut usage_due = tokio::time::Instant::now();
+    let mut prev_net = None;
     loop {
-        let usage = if tokio::time::Instant::now() >= usage_due {
+        let (usage, telemetry) = if tokio::time::Instant::now() >= usage_due {
             usage_due = tokio::time::Instant::now() + usage_period;
-            metrics.tasks().await
+            (
+                metrics.tasks().await,
+                Some(metrics.node_telemetry(&mut prev_net).await),
+            )
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         let sent = tokio::time::Instant::now();
         let held = carp.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        match control.heartbeat(&node, usage, held).await {
+        match control.heartbeat(&node, usage, held, telemetry).await {
             Ok(p) => {
                 *heard.lock().unwrap_or_else(|e| e.into_inner()) = (sent, p);
                 if failing {

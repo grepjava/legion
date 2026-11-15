@@ -25,6 +25,7 @@ mod dispatcher;
 mod events;
 #[cfg(feature = "test-hooks")]
 pub mod hooks;
+mod image_ops;
 pub mod images;
 pub mod join;
 pub mod logsearch;
@@ -403,6 +404,8 @@ impl Manager {
             events: Default::default(),
             alerts: Default::default(),
             builds: Default::default(),
+            registry_loopback: self.registry_loopback,
+            insecure_registries: self.insecure_registries.clone().into(),
         };
         let names = tokio::spawn(managers::run(api.clone(), api.closing.clone()));
         let builds = self.controllers.then(|| {

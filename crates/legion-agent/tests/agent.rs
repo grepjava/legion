@@ -153,8 +153,9 @@ impl Control for Flaky {
         node: &str,
         usage: Vec<(String, TaskUsage)>,
         carp: Vec<(std::net::Ipv4Addr, String)>,
+        telemetry: Option<legion_api::dispatch::NodeTelemetry>,
     ) -> Result<Duration, ControlError> {
-        self.inner.heartbeat(node, usage, carp).await
+        self.inner.heartbeat(node, usage, carp, telemetry).await
     }
 
     fn sessions(&self, node: &str) -> tokio::sync::mpsc::Receiver<Offer> {

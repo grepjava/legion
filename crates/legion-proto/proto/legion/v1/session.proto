@@ -38,7 +38,47 @@ message SessionOpen {
     // Managers only, a Build (CONSOLE.md phase 5): build an image with
     // jailer on this node and push it.
     BuildOptions build = 12;
+    // Managers only: list, create, roll back or delete a ZFS Volume's
+    // snapshots on the node holding it.
+    VolumeSnapshotAction volume_snapshot = 13;
+    // Managers only: list, pull, push, remove, prune, export or load images
+    // in a node's local image store.
+    ImageNodeAction image_op = 14;
   }
+}
+
+message VolumeSnapshotAction {
+  string volume = 1;
+  // "list", "create", "rollback", "delete".
+  string op = 2;
+  string snapshot = 3;
+}
+
+message VolumeSnapshotResult {
+  repeated string snapshots = 1;
+}
+
+message ImageNodeAction {
+  // "list", "pull", "push", "remove", "prune", "export", "load".
+  string op = 1;
+  string image = 2;
+  string target = 3;
+  bytes auth = 4;
+  repeated string plain_http = 5;
+}
+
+message CachedNodeImage {
+  string reference = 1;
+  string digest = 2;
+  string os = 3;
+  string arch = 4;
+  uint32 layers = 5;
+}
+
+message ImageNodeResult {
+  repeated CachedNodeImage images = 1;
+  uint64 removed = 2;
+  string digest = 3;
 }
 
 // The output of `jailer build` and `jailer push` comes as `stdout` and
@@ -164,6 +204,10 @@ message SessionFrame {
     LogLine line = 10;
     // A build's result, before its `exit_code`.
     BuildResult built = 11;
+    // A Volume snapshot action's result, before its `exit_code`.
+    VolumeSnapshotResult snapshots = 12;
+    // A node image action's result, before its `exit_code`.
+    ImageNodeResult images = 13;
   }
 }
 

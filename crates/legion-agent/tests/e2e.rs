@@ -45,6 +45,7 @@ impl Cluster {
         rt.add_image(INFRA);
         let mut config = AgentConfig::new("n1", dir.path().join("tasks"));
         config.drain = Duration::ZERO;
+        config.zfs_root = Some("tank/legion".into());
         config.infra_image = INFRA.into();
         config.resync = Duration::from_millis(100);
         let control = GrpcControl::new("n1", vec![addr.clone()], None).unwrap();
@@ -514,5 +515,214 @@ async fn a_services_logs_are_searched_across_its_tasks() {
         lines(&r),
         [("web-2-1".to_owned(), false, "GET /b 200".to_owned())]
     );
+    c.stop().await;
+}
+
+/// ZFS volume snapshots (`create`, `list`, `rollback`, `delete`) and node
+/// image management (`list`, `export`, `load`, `remove`, `prune`) work
+/// end-to-end through the manager API and agent sessions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn volume_snapshots_and_node_image_operations_work_end_to_end() {
+    use legion_proto::v1::load_image_chunk::Part;
+    use legion_proto::v1::volumes_client::VolumesClient;
+    use legion_proto::v1::{
+        ExportImageRequest, LoadImageChunk, LoadImageStart, NodeImagesRequest,
+        VolumeSnapshotRequest,
+    };
+
+    let c = Cluster::start().await;
+    c.rt.add_image("db:1");
+    c.apply(
+        r#"
+apiVersion: legion/v1
+kind: Namespace
+metadata: { name: shop }
+"#,
+    )
+    .await;
+    c.apply(
+        r#"
+apiVersion: legion/v1
+kind: Volume
+metadata: { name: pgdata, namespace: shop }
+spec: { driver: zfs }
+"#,
+    )
+    .await;
+    c.apply(
+        r#"
+apiVersion: legion/v1
+kind: Service
+metadata: { name: db, namespace: shop }
+spec:
+  replicas: 1
+  pod:
+    containers:
+      - name: db
+        image: "db:1"
+        volumeMounts: [{ name: data, path: /var/db/postgres }]
+    volumes:
+      - name: data
+        volume: { name: pgdata }
+"#,
+    )
+    .await;
+    eventually("db running", async || c.tasks().await == ["db-1-1 running"]).await;
+
+    // 1. ZFS Volume Snapshots: create, list, rollback, delete.
+    let mut vols = VolumesClient::new(c.channel.clone());
+    let created = vols
+        .snapshot(VolumeSnapshotRequest {
+            namespace: "shop".into(),
+            name: "pgdata".into(),
+            op: "create".into(),
+            snapshot: "pre-upgrade".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        created.snapshots.contains(&"pre-upgrade".to_owned()),
+        "{created:?}"
+    );
+
+    let listed = vols
+        .snapshot(VolumeSnapshotRequest {
+            namespace: "shop".into(),
+            name: "pgdata".into(),
+            op: "list".into(),
+            snapshot: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.snapshots, ["pre-upgrade"]);
+
+    let rolled = vols
+        .snapshot(VolumeSnapshotRequest {
+            namespace: "shop".into(),
+            name: "pgdata".into(),
+            op: "rollback".into(),
+            snapshot: "pre-upgrade".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(rolled.snapshots, ["pre-upgrade"]);
+
+    let deleted = vols
+        .snapshot(VolumeSnapshotRequest {
+            namespace: "shop".into(),
+            name: "pgdata".into(),
+            op: "delete".into(),
+            snapshot: "pre-upgrade".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(deleted.snapshots.is_empty(), "{deleted:?}");
+
+    // 2. Node Images: list, export .tar archive, load under a new tag, remove, prune.
+    let mut cluster = ClusterClient::new(c.channel.clone());
+    let inv = cluster
+        .node_images(NodeImagesRequest {
+            op: "list".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        inv.images
+            .iter()
+            .any(|i| i.node == "n1" && i.reference == "db:1"),
+        "{inv:?}"
+    );
+
+    let mut stream = cluster
+        .export_image(ExportImageRequest {
+            node: "n1".into(),
+            image: "db:1".into(),
+            tag: "exported:1".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut archive = Vec::new();
+    while let Some(chunk) = stream.message().await.unwrap() {
+        archive.extend_from_slice(&chunk.data);
+    }
+    assert!(!archive.is_empty());
+
+    let loaded = cluster
+        .load_image(tokio_stream::iter(vec![
+            LoadImageChunk {
+                part: Some(Part::Start(LoadImageStart {
+                    node: "n1".into(),
+                    reference: "reloaded:2".into(),
+                })),
+            },
+            LoadImageChunk {
+                part: Some(Part::Data(archive)),
+            },
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        loaded.images.iter().any(|i| i.reference == "reloaded:2"),
+        "{loaded:?}"
+    );
+
+    let inv2 = cluster
+        .node_images(NodeImagesRequest {
+            node: "n1".into(),
+            op: "list".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        inv2.images.iter().any(|i| i.reference == "reloaded:2"),
+        "{inv2:?}"
+    );
+
+    let removed = cluster
+        .node_images(NodeImagesRequest {
+            node: "n1".into(),
+            op: "remove".into(),
+            image: "reloaded:2".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(removed.removed >= 1, "{removed:?}");
+
+    let inv3 = cluster
+        .node_images(NodeImagesRequest {
+            node: "n1".into(),
+            op: "list".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        !inv3.images.iter().any(|i| i.reference == "reloaded:2"),
+        "{inv3:?}"
+    );
+
+    let _pruned = cluster
+        .node_images(NodeImagesRequest {
+            node: "n1".into(),
+            op: "prune".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
     c.stop().await;
 }

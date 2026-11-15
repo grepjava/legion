@@ -168,6 +168,10 @@ pub trait Sys: Send + Sync {
 
     /// The interface of the default route, if there is one.
     fn default_interface(&self) -> Result<Option<String>>;
+    /// Bytes received and sent on the host's external and mesh interfaces.
+    fn net_bytes(&self) -> Result<(u64, u64)> {
+        Ok((0, 0))
+    }
     /// Sets a kernel variable (`sysctl name=value`).
     fn sysctl_set(&self, name: &str, value: &str) -> Result<()>;
     /// A kernel variable's value (`sysctl -n name`).
@@ -197,6 +201,12 @@ pub trait Sys: Send + Sync {
 
     /// `root` and its descendants; empty if `root` does not exist.
     fn zfs_list(&self, root: &str) -> Result<Vec<Dataset>>;
+    /// Bytes used and available for `root` and its descendants; empty if
+    /// `root` does not exist.
+    fn zfs_space(&self, root: &str) -> Result<Vec<DatasetSpace>> {
+        let _ = root;
+        Ok(Vec::new())
+    }
     /// Creates a dataset and any missing parents. An existing dataset is
     /// left as it is (`props` are not applied to it).
     fn zfs_create(&self, name: &str, props: &[(&str, &str)]) -> Result<()>;
@@ -610,6 +620,14 @@ pub struct Dataset {
     pub mountpoint: Option<String>,
     /// Bytes; `None` without a quota.
     pub quota: Option<u64>,
+}
+
+/// Space used and available in a ZFS dataset (`zfs list -Hp -o name,used,avail`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatasetSpace {
+    pub name: String,
+    pub used: u64,
+    pub avail: u64,
 }
 
 #[cfg(test)]

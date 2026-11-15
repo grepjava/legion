@@ -117,7 +117,7 @@ pub struct Policy {
 /// The cluster's `ImagePolicy` objects, by name. Keys are checked as a
 /// policy is applied; one that does not read here is left out, so a
 /// policy left with none passes nothing.
-fn policies(store: &Store) -> Result<Vec<Policy>, String> {
+pub(crate) fn policies(store: &Store) -> Result<Vec<Policy>, String> {
     let list = store
         .list(Kind::ImagePolicy, None)
         .map_err(|e| e.to_string())?;

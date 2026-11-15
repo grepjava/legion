@@ -263,6 +263,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn records_and_their_directory_are_their_owners_alone() {
         use std::os::unix::fs::PermissionsExt;
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;

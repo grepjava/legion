@@ -9,11 +9,11 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use legion_api::dispatch::TaskUsage;
 pub use legion_api::dispatch::{
     Assignment, Assignments, EndpointPort, Endpoints, Peer, Peers, Policies, Routes,
     ServiceEndpoints, VolumeClaim,
 };
+use legion_api::dispatch::{NodeTelemetry, TaskUsage};
 use legion_api::node::NodeStatus;
 use legion_api::task::TaskStatus;
 use legion_api::{Kind, ObjectKey};
@@ -129,6 +129,7 @@ pub trait Control: Send + Sync + 'static {
         node: &str,
         usage: Vec<(String, TaskUsage)>,
         carp: Vec<(std::net::Ipv4Addr, String)>,
+        telemetry: Option<NodeTelemetry>,
     ) -> impl Future<Output = Result<Duration, ControlError>> + Send;
 
     /// Sessions users open with the node's tasks, as any manager offers
@@ -776,6 +777,7 @@ impl Control for GrpcControl {
         node: &str,
         usage: Vec<(String, TaskUsage)>,
         carp: Vec<(std::net::Ipv4Addr, String)>,
+        telemetry: Option<NodeTelemetry>,
     ) -> Result<Duration, ControlError> {
         let usage = usage
             .into_iter()
@@ -799,6 +801,22 @@ impl Control for GrpcControl {
                     state,
                 })
                 .collect(),
+            telemetry: telemetry.map(|t| legion_proto::v1::NodeTelemetry {
+                zfs_used_bytes: t.zfs_used_bytes,
+                zfs_avail_bytes: t.zfs_avail_bytes,
+                net_rx_bps: t.net_rx_bps,
+                net_tx_bps: t.net_tx_bps,
+                volumes: t
+                    .volumes
+                    .into_iter()
+                    .map(|v| legion_proto::v1::VolumeTelemetry {
+                        namespace: v.namespace,
+                        volume: v.volume,
+                        used_bytes: v.used_bytes,
+                        avail_bytes: v.avail_bytes,
+                    })
+                    .collect(),
+            }),
         };
         let resp = self
             .call(|mut c| async move { c.heartbeat(req).await })

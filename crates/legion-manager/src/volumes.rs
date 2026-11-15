@@ -18,7 +18,7 @@ use legion_proto::v1::volumes_server::Volumes;
 use legion_proto::v1::{
     BackupChunk, InputClosed, SessionError, SessionFrame, SessionOffer, SessionOpen,
     VolumeBackupRequest, VolumeExport, VolumeImport, VolumeRestoreChunk, VolumeRestoreResponse,
-    VolumeRestoreStart,
+    VolumeRestoreStart, VolumeSnapshotAction, VolumeSnapshotRequest, VolumeSnapshotResponse,
 };
 use legion_store::{Command, Outcome, Precondition};
 use tokio::sync::mpsc;
@@ -425,6 +425,117 @@ impl Volumes for VolumesService {
     }
         .await;
         self.api.audit_end(audit, result)
+    }
+
+    async fn snapshot(
+        &self,
+        req: Request<VolumeSnapshotRequest>,
+    ) -> Result<Response<VolumeSnapshotResponse>, Status> {
+        let is_read = req.get_ref().op == "list" || req.get_ref().op.is_empty();
+        let audit = (!is_read).then(|| {
+            self.api.audit_point(
+                &req,
+                "volume-snapshot",
+                crate::audit::target("Volume", &req.get_ref().namespace, &req.get_ref().name),
+            )
+        });
+        let result = async {
+            let caller = self.api.caller(&req)?;
+            if let Some(mut leader) = self.leader(&req)? {
+                return leader
+                    .snapshot(forwarded_for(req.into_inner(), &caller)?)
+                    .await;
+            }
+            let VolumeSnapshotRequest {
+                namespace,
+                name,
+                op,
+                snapshot,
+            } = req.into_inner();
+            let op = if op.is_empty() { "list".to_owned() } else { op };
+            if !matches!(op.as_str(), "list" | "create" | "rollback" | "delete") {
+                return Err(Status::invalid_argument(format!(
+                    "unknown snapshot op {op:?}"
+                )));
+            }
+            let namespace = if namespace.is_empty() {
+                "default".to_owned()
+            } else {
+                namespace
+            };
+            check_namespace(&namespace)?;
+            self.api.consistent().await?;
+            let verb = if op == "list" {
+                Verb::Read
+            } else {
+                Verb::Write
+            };
+            caller.check(&self.api.store, verb, Kind::Volume, &namespace)?;
+            let key = ObjectKey::new(Kind::Volume, &namespace, &name);
+            let (_, spec, status) = self.volume(&key)?.ok_or_else(|| {
+                Status::not_found(format!("no volume {name} in namespace {namespace}"))
+            })?;
+            if spec.driver != VolumeDriver::Zfs {
+                return Err(Status::failed_precondition(format!(
+                    "volume {name} uses driver {}: ZFS snapshots apply to zfs volumes only",
+                    spec.driver.as_str()
+                )));
+            }
+            if status.node.is_empty() {
+                if op == "list" {
+                    return Ok(Response::new(VolumeSnapshotResponse {
+                        snapshots: Vec::new(),
+                    }));
+                }
+                return Err(Status::failed_precondition(format!(
+                    "volume {name} has no data yet: no task has used it"
+                )));
+            }
+            let Attachment { mut from_agent, .. } = self
+                .attach(
+                    &status.node,
+                    &namespace,
+                    Action::VolumeSnapshot(VolumeSnapshotAction {
+                        volume: name.clone(),
+                        op,
+                        snapshot,
+                    }),
+                )
+                .await?;
+            let mut snapshots = Vec::new();
+            loop {
+                match from_agent.next().await {
+                    Some(Ok(SessionFrame {
+                        frame: Some(Frame::Snapshots(r)),
+                    })) => snapshots = r.snapshots,
+                    Some(Ok(SessionFrame {
+                        frame: Some(Frame::ExitCode(0)),
+                    })) => break,
+                    Some(Ok(SessionFrame {
+                        frame: Some(Frame::Error(e)),
+                    })) => {
+                        return Err(Status::failed_precondition(format!(
+                            "node {}: {}",
+                            status.node, e.message
+                        )));
+                    }
+                    Some(Ok(_)) => continue,
+                    Some(Err(e)) => return Err(e),
+                    None => {
+                        return Err(Status::unavailable(format!(
+                            "node {}'s stream ended early",
+                            status.node
+                        )));
+                    }
+                }
+            }
+            Ok(Response::new(VolumeSnapshotResponse { snapshots }))
+        }
+        .await;
+        match audit {
+            Some(a) => self.api.audit_end(a, result),
+            None => result,
+        }
     }
 }
 

@@ -520,9 +520,11 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
         Command::Join { .. }
         | Command::Restore { .. }
         | Command::Doctor { .. }
-        | Command::Unlock { .. }
-        | Command::Image { .. } => {
+        | Command::Unlock { .. } => {
             unreachable!("handled in main")
+        }
+        Command::Image { command } => {
+            run_image_command(&mut cluster, command).await?;
         }
         Command::Logs {
             task,
@@ -852,6 +854,9 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
         } => {
             crate::volume_backup::restore(channel.clone(), &file, node, namespace, name, replace)
                 .await?;
+        }
+        Command::Volume { command } => {
+            run_volume_snapshot(channel.clone(), command).await?;
         }
         Command::Rollback { service, namespace } => {
             println!(
@@ -1985,6 +1990,310 @@ fn ca_status(r: &pb::RotateCaResponse) -> String {
         let _ = writeln!(out, "{:<24} {:<8} {ca}", h.name, h.kind);
     }
     out
+}
+
+async fn run_volume_snapshot(
+    channel: Channel,
+    command: crate::VolumeCommand,
+) -> anyhow::Result<()> {
+    let mut client = pb::volumes_client::VolumesClient::new(channel);
+    let (volume, namespace, op, snapshot) = match command {
+        crate::VolumeCommand::Snapshots { volume, namespace } => {
+            (volume, namespace, "list", String::new())
+        }
+        crate::VolumeCommand::Snapshot {
+            volume,
+            snapshot,
+            namespace,
+        } => (volume, namespace, "create", snapshot),
+        crate::VolumeCommand::Rollback {
+            volume,
+            snapshot,
+            namespace,
+        } => (volume, namespace, "rollback", snapshot),
+        crate::VolumeCommand::RmSnapshot {
+            volume,
+            snapshot,
+            namespace,
+        } => (volume, namespace, "delete", snapshot),
+        _ => unreachable!("handled above"),
+    };
+    let ns = namespace.unwrap_or_else(|| "default".into());
+    let r = client
+        .snapshot(pb::VolumeSnapshotRequest {
+            namespace: ns.clone(),
+            name: volume.clone(),
+            op: op.to_owned(),
+            snapshot: snapshot.clone(),
+        })
+        .await?
+        .into_inner();
+    match op {
+        "list" => {
+            if r.snapshots.is_empty() {
+                println!("Volume/{ns}/{volume} has no snapshots");
+            } else {
+                let rows: Vec<[String; 1]> = r.snapshots.into_iter().map(|s| [s]).collect();
+                print_table(["SNAPSHOT"], &rows);
+            }
+        }
+        "create" => println!("Volume/{ns}/{volume}@{snapshot} created"),
+        "rollback" => println!("Volume/{ns}/{volume} rolled back to @{snapshot}"),
+        "delete" => println!("Volume/{ns}/{volume}@{snapshot} deleted"),
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn run_image_command(
+    cluster: &mut ClusterClient<Channel>,
+    command: crate::ImageCommand,
+) -> anyhow::Result<()> {
+    match command {
+        crate::ImageCommand::Load {
+            file,
+            name,
+            node: Some(node),
+            ..
+        } => {
+            use pb::load_image_chunk::Part;
+            let bytes =
+                std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            let send = |part| pb::LoadImageChunk { part: Some(part) };
+            let reference = name.unwrap_or_default();
+            let node_name = node.clone();
+            tokio::spawn(async move {
+                if tx
+                    .send(send(Part::Start(pb::LoadImageStart {
+                        node: node_name,
+                        reference,
+                    })))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                for chunk in bytes.chunks(1 << 20) {
+                    if tx.send(send(Part::Data(chunk.to_vec()))).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            let r = cluster
+                .load_image(tokio_stream::wrappers::ReceiverStream::new(rx))
+                .await?
+                .into_inner();
+            let loaded = r
+                .images
+                .first()
+                .map(|i| i.reference.as_str())
+                .unwrap_or("(loaded)");
+            println!("loaded {loaded} on {node} ({})", r.digest);
+        }
+        crate::ImageCommand::Load { .. } => unreachable!("local load handled in main"),
+        crate::ImageCommand::Ls { node, output } => {
+            let r = cluster
+                .node_images(pb::NodeImagesRequest {
+                    op: "list".to_owned(),
+                    node: node.unwrap_or_default(),
+                    ..Default::default()
+                })
+                .await?
+                .into_inner();
+            let items: Vec<serde_json::Value> = r
+                .images
+                .iter()
+                .map(|i| {
+                    serde_json::json!({
+                        "node": i.node,
+                        "reference": i.reference,
+                        "digest": i.digest,
+                        "os": i.os,
+                        "arch": i.arch,
+                        "layers": i.layers,
+                    })
+                })
+                .collect();
+            match output {
+                Format::Json => println!("{}", serde_json::to_string_pretty(&items)?),
+                Format::Yaml => print!("{}", serde_yaml_ng::to_string(&items)?),
+                Format::Table => {
+                    if r.images.is_empty() {
+                        println!("no cached images");
+                    } else {
+                        let rows: Vec<[String; 5]> = r
+                            .images
+                            .iter()
+                            .map(|i| {
+                                [
+                                    i.node.clone(),
+                                    i.reference.clone(),
+                                    format!("{}/{}", i.os, i.arch),
+                                    i.layers.to_string(),
+                                    i.digest.chars().take(19).collect(),
+                                ]
+                            })
+                            .collect();
+                        print_table(["NODE", "IMAGE", "PLATFORM", "LAYERS", "DIGEST"], &rows);
+                    }
+                }
+            }
+        }
+        crate::ImageCommand::Pull {
+            image,
+            node,
+            namespace,
+            secret,
+        } => {
+            let scope = node.clone().unwrap_or_default();
+            let r = cluster
+                .node_images(pb::NodeImagesRequest {
+                    op: "pull".to_owned(),
+                    node: scope.clone(),
+                    image: image.clone(),
+                    namespace: namespace.unwrap_or_default(),
+                    secret: secret.unwrap_or_default(),
+                    ..Default::default()
+                })
+                .await?
+                .into_inner();
+            let where_ = if scope.is_empty() {
+                "all ready nodes"
+            } else {
+                &scope
+            };
+            println!("pulled {image} onto {where_} ({})", r.digest);
+        }
+        crate::ImageCommand::Push {
+            image,
+            target,
+            node,
+            namespace,
+            secret,
+        } => {
+            let r = cluster
+                .node_images(pb::NodeImagesRequest {
+                    op: "push".to_owned(),
+                    node: node.clone(),
+                    image: image.clone(),
+                    target: target.clone(),
+                    namespace: namespace.unwrap_or_default(),
+                    secret: secret.unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            println!("pushed {image} from {node} -> {target} ({})", r.digest);
+        }
+        crate::ImageCommand::Rm { image, node } => {
+            let scope = node.unwrap_or_default();
+            let r = cluster
+                .node_images(pb::NodeImagesRequest {
+                    op: "remove".to_owned(),
+                    node: scope,
+                    image: image.clone(),
+                    ..Default::default()
+                })
+                .await?
+                .into_inner();
+            println!("removed {image} ({} node(s))", r.removed);
+        }
+        crate::ImageCommand::Prune { node } => {
+            let r = cluster
+                .node_images(pb::NodeImagesRequest {
+                    op: "prune".to_owned(),
+                    node: node.unwrap_or_default(),
+                    ..Default::default()
+                })
+                .await?
+                .into_inner();
+            println!("pruned {} unused layer(s)", r.removed);
+        }
+        crate::ImageCommand::Export {
+            image,
+            node,
+            output,
+            tag,
+        } => {
+            let mut stream = cluster
+                .export_image(pb::ExportImageRequest {
+                    node: node.clone(),
+                    image: image.clone(),
+                    tag: tag.unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            let mut file = std::fs::File::create(&output)
+                .with_context(|| format!("creating {}", output.display()))?;
+            let mut bytes = 0u64;
+            while let Some(chunk) = stream.message().await? {
+                std::io::Write::write_all(&mut file, &chunk.data)?;
+                bytes += chunk.data.len() as u64;
+            }
+            println!(
+                "exported {image} from {node} to {} ({bytes} bytes)",
+                output.display()
+            );
+        }
+        crate::ImageCommand::Search { query, limit } => {
+            let r = cluster
+                .search_images(pb::SearchImagesRequest {
+                    query: query.unwrap_or_default(),
+                    limit,
+                })
+                .await?
+                .into_inner();
+            if r.results.is_empty() {
+                println!("no matching images");
+            } else {
+                let rows: Vec<[String; 4]> = r
+                    .results
+                    .into_iter()
+                    .map(|h| {
+                        [
+                            h.name,
+                            h.suggested_tag,
+                            h.source,
+                            h.description.chars().take(60).collect(),
+                        ]
+                    })
+                    .collect();
+                print_table(["IMAGE", "TAG", "SOURCE", "DESCRIPTION"], &rows);
+            }
+        }
+        crate::ImageCommand::Inspect {
+            image,
+            namespace,
+            secret,
+        } => {
+            let r = cluster
+                .inspect_registry_image(pb::InspectRegistryImageRequest {
+                    image,
+                    namespace: namespace.unwrap_or_default(),
+                    secret: secret.unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            println!("Image:     {}", r.image);
+            println!("Digest:    {}", r.digest);
+            println!(
+                "Signed:    {}",
+                if r.signed { "verified (cosign)" } else { "no" }
+            );
+            if !r.platforms.is_empty() {
+                let plats: Vec<String> = r
+                    .platforms
+                    .iter()
+                    .map(|p| format!("{}/{}", p.os, p.arch))
+                    .collect();
+                println!("Platforms: {}", plats.join(", "));
+            }
+            if !r.tags.is_empty() {
+                println!("Tags:      {}", r.tags.join(", "));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

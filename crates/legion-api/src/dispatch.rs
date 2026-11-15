@@ -158,3 +158,24 @@ pub struct TaskUsage {
     pub cpu: f64,
     pub memory: u64,
 }
+
+/// ZFS space of one claimed volume dataset (`<zfs root>/volumes/<ns>/<name>`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeTelemetry {
+    pub namespace: String,
+    pub volume: String,
+    pub used_bytes: u64,
+    pub avail_bytes: u64,
+}
+
+/// Host-level ZFS pool space, per-volume space, and network throughput
+/// reported by an agent with its heartbeats.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeTelemetry {
+    pub zfs_used_bytes: u64,
+    pub zfs_avail_bytes: u64,
+    pub net_rx_bps: u64,
+    pub net_tx_bps: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<VolumeTelemetry>,
+}

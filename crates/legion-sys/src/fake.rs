@@ -15,8 +15,8 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::{
-    Carp, CarpState, Dataset, Destination, Epair, Error, IfConfig, Ipv6Net, IscsiSession, Jail,
-    JailMemory, KldState, PfState, RctlRule, Result, Sys, WgPeer,
+    Carp, CarpState, Dataset, DatasetSpace, Destination, Epair, Error, IfConfig, Ipv6Net,
+    IscsiSession, Jail, JailMemory, KldState, PfState, RctlRule, Result, Sys, WgPeer,
 };
 
 #[derive(Debug, Default)]
@@ -71,6 +71,8 @@ struct State {
     anchors: BTreeMap<String, String>,
     tables: BTreeMap<(String, String), Vec<IpAddr>>,
     datasets: BTreeMap<String, Dataset>,
+    dataset_space: BTreeMap<String, (u64, u64)>,
+    net_bytes: (u64, u64),
     /// Snapshots, with the order they were taken in.
     snapshots: BTreeMap<String, u64>,
     next_snapshot: u64,
@@ -262,6 +264,18 @@ impl FakeSys {
             jail.to_owned(),
             usage.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect(),
         );
+    }
+
+    /// Sets what [`Sys::zfs_space`] reports for `dataset` (`used`, `avail`).
+    pub fn set_dataset_space(&self, dataset: &str, used: u64, avail: u64) {
+        self.state()
+            .dataset_space
+            .insert(dataset.to_owned(), (used, avail));
+    }
+
+    /// Sets what [`Sys::net_bytes`] reports (`rx_bytes`, `tx_bytes`).
+    pub fn set_net_bytes(&self, rx: u64, tx: u64) {
+        self.state().net_bytes = (rx, tx);
     }
 
     pub fn interface(&self, name: &str) -> Option<FakeInterface> {
@@ -1075,6 +1089,10 @@ impl Sys for FakeSys {
         Ok(self.state().default_interface.clone())
     }
 
+    fn net_bytes(&self) -> Result<(u64, u64)> {
+        Ok(self.state().net_bytes)
+    }
+
     fn sysctl_get(&self, name: &str) -> Result<String> {
         self.state()
             .sysctls
@@ -1165,6 +1183,31 @@ impl Sys for FakeSys {
             .filter(|d| d.name == root || d.name.starts_with(&prefix))
             .cloned()
             .collect())
+    }
+
+    fn zfs_space(&self, root: &str) -> Result<Vec<DatasetSpace>> {
+        let prefix = format!("{root}/");
+        let s = self.state();
+        let mut names: BTreeSet<&String> = s
+            .datasets
+            .keys()
+            .chain(s.dataset_space.keys())
+            .filter(|n| *n == root || n.starts_with(&prefix))
+            .collect();
+        let mut out = Vec::new();
+        for name in std::mem::take(&mut names) {
+            let (used, avail) = s.dataset_space.get(name).copied().unwrap_or_else(|| {
+                let written = s.contents.get(name).map_or(0, |b| b.len() as u64);
+                let quota = s.datasets.get(name).and_then(|d| d.quota).unwrap_or(0);
+                (written, quota.saturating_sub(written))
+            });
+            out.push(DatasetSpace {
+                name: name.clone(),
+                used,
+                avail,
+            });
+        }
+        Ok(out)
     }
 
     fn zfs_create(&self, name: &str, props: &[(&str, &str)]) -> Result<()> {

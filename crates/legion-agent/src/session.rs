@@ -124,6 +124,21 @@ async fn run<R: Runtime>(
         Some(Action::Build(opts)) => {
             crate::build::run(&builder, &id, opts, &tx, &mut inbound).await
         }
+        Some(Action::VolumeSnapshot(opts)) => {
+            transfer::snapshot(&volumes, &open.namespace, opts, &tx).await
+        }
+        Some(Action::ImageOp(opts)) => {
+            crate::image_ops::run(
+                runtime.as_ref(),
+                &builder,
+                &id,
+                &open.namespace,
+                opts,
+                &tx,
+                &mut inbound,
+            )
+            .await
+        }
         None => Err(Status::invalid_argument("the session has no action")),
     };
     if let Err(e) = result {

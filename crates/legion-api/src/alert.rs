@@ -22,6 +22,9 @@ pub const CA_WARNING: Duration = Duration::from_secs(30 * 24 * 3600);
 pub const CA_CRITICAL: Duration = Duration::from_secs(7 * 24 * 3600);
 /// A leader that has not heard from a quorum for longer than this.
 pub const QUORUM_SILENCE: Duration = Duration::from_secs(10);
+/// ZFS volume utilization percentage (`used / (used + avail)`) that raises a
+/// warning alert.
+pub const VOLUME_NEARLY_FULL_PERCENT: u64 = 90;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -48,6 +51,7 @@ pub enum AlertKind {
     NodeSuspect,
     CrashLoop,
     VolumeLost,
+    VolumeNearlyFull,
     CaExpiring,
 }
 
@@ -60,6 +64,7 @@ impl AlertKind {
             AlertKind::NodeSuspect => "node-suspect",
             AlertKind::CrashLoop => "crash-loop",
             AlertKind::VolumeLost => "volume-lost",
+            AlertKind::VolumeNearlyFull => "volume-nearly-full",
             AlertKind::CaExpiring => "ca-expiring",
         }
     }
@@ -95,10 +100,13 @@ pub struct TaskInput<'a> {
 }
 
 /// A Volume as alerts look at it: `lost` names the node it was lost with.
+#[derive(Default)]
 pub struct VolumeInput<'a> {
     pub namespace: &'a str,
     pub name: &'a str,
     pub lost: &'a str,
+    pub used_bytes: u64,
+    pub avail_bytes: u64,
 }
 
 /// What a manager knows that alerts are worked out from.
@@ -188,17 +196,38 @@ pub fn alerts(i: &Inputs) -> Vec<Alert> {
             ),
         });
     }
-    for v in i.volumes.iter().filter(|v| !v.lost.is_empty()) {
-        out.push(Alert {
-            kind: AlertKind::VolumeLost,
-            severity: Severity::Critical,
-            namespace: v.namespace.to_owned(),
-            object: format!("Volume/{}", v.name),
-            message: format!(
-                "Volume {} was lost with node {}: restore a backup into it on another node",
-                v.name, v.lost
-            ),
-        });
+    for v in &i.volumes {
+        if !v.lost.is_empty() {
+            out.push(Alert {
+                kind: AlertKind::VolumeLost,
+                severity: Severity::Critical,
+                namespace: v.namespace.to_owned(),
+                object: format!("Volume/{}", v.name),
+                message: format!(
+                    "Volume {} was lost with node {}: restore a backup into it on another node",
+                    v.name, v.lost
+                ),
+            });
+            continue;
+        }
+        let cap = v.used_bytes.saturating_add(v.avail_bytes);
+        if cap > 0
+            && (u128::from(v.used_bytes) * 100)
+                >= (u128::from(cap) * u128::from(VOLUME_NEARLY_FULL_PERCENT))
+        {
+            let pct = (u128::from(v.used_bytes) * 100) / u128::from(cap);
+            out.push(Alert {
+                kind: AlertKind::VolumeNearlyFull,
+                severity: Severity::Warning,
+                namespace: v.namespace.to_owned(),
+                object: format!("Volume/{}", v.name),
+                message: format!(
+                    "Volume {} is {pct}% full ({} MiB free): raise its quota or prune data",
+                    v.name,
+                    v.avail_bytes >> 20
+                ),
+            });
+        }
     }
     if let Some(left) = i.ca_left.filter(|l| *l < CA_WARNING) {
         let severity = if left < CA_CRITICAL {
@@ -244,6 +273,8 @@ mod tests {
                 namespace: "a",
                 name: "data",
                 lost: "",
+                used_bytes: 500 << 20,
+                avail_bytes: 500 << 20,
             }],
             ca_left: Some(CA_WARNING * 2),
             leader: true,
@@ -266,11 +297,21 @@ mod tests {
                 recent_restarts: CRASH_LOOP_RESTARTS,
                 message: "container c exited with 1; restarting in 1s",
             }],
-            volumes: vec![VolumeInput {
-                namespace: "a",
-                name: "data",
-                lost: "n3",
-            }],
+            volumes: vec![
+                VolumeInput {
+                    namespace: "a",
+                    name: "data",
+                    lost: "n3",
+                    ..Default::default()
+                },
+                VolumeInput {
+                    namespace: "a",
+                    name: "logs",
+                    lost: "",
+                    used_bytes: 950 << 20,
+                    avail_bytes: 50 << 20,
+                },
+            ],
             ca_left: Some(CA_CRITICAL * 2),
             leader: true,
             quorum_silence: Some(QUORUM_SILENCE * 2),
@@ -287,6 +328,7 @@ mod tests {
                 ("critical", "crash-loop", "Task/web-1".into()),
                 ("critical", "volume-lost", "Volume/data".into()),
                 ("warning", "node-suspect", "Node/n2".into()),
+                ("warning", "volume-nearly-full", "Volume/logs".into()),
                 ("warning", "ca-expiring", String::new()),
             ]
         );

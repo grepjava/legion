@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use legion_api::dispatch::TaskUsage;
+use legion_api::dispatch::{NodeTelemetry, TaskUsage, VolumeTelemetry};
 use legion_api::metrics::Metrics;
 use legion_sys::Sys;
 
@@ -95,6 +95,7 @@ pub struct AgentMetrics<R> {
     pub(crate) runtime: Arc<R>,
     pub(crate) sys: Arc<dyn Sys>,
     pub(crate) node: String,
+    pub(crate) zfs_root: Option<String>,
 }
 
 impl<R> Clone for AgentMetrics<R> {
@@ -103,6 +104,7 @@ impl<R> Clone for AgentMetrics<R> {
             runtime: self.runtime.clone(),
             sys: self.sys.clone(),
             node: self.node.clone(),
+            zfs_root: self.zfs_root.clone(),
         }
     }
 }
@@ -218,6 +220,74 @@ impl<R: Runtime> AgentMetrics<R> {
             .into_iter()
             .filter_map(|(task, u)| Some((task, u?)))
             .collect()
+    }
+
+    /// Host ZFS space (root dataset + claimed volume datasets) and network
+    /// receive/transmit rates over the elapsed interval since `prev_net`.
+    pub async fn node_telemetry(
+        &self,
+        prev_net: &mut Option<(tokio::time::Instant, u64, u64)>,
+    ) -> NodeTelemetry {
+        let zfs_root = self.zfs_root.clone();
+        let (spaces, net) = crate::task::blocking(&self.sys, move |sys| {
+            let spaces = zfs_root
+                .as_deref()
+                .and_then(|r| sys.zfs_space(r).ok())
+                .unwrap_or_default();
+            let net = sys.net_bytes().ok();
+            (spaces, net)
+        })
+        .await;
+        let now = tokio::time::Instant::now();
+        let (net_rx_bps, net_tx_bps) = match net {
+            Some((rx, tx)) => {
+                let rates = prev_net
+                    .map(|(at, prx, ptx)| {
+                        let secs = now.duration_since(at).as_secs_f64();
+                        if secs >= 0.05 {
+                            (
+                                (rx.saturating_sub(prx) as f64 / secs) as u64,
+                                (tx.saturating_sub(ptx) as f64 / secs) as u64,
+                            )
+                        } else {
+                            (0, 0)
+                        }
+                    })
+                    .unwrap_or((0, 0));
+                *prev_net = Some((now, rx, tx));
+                rates
+            }
+            None => (0, 0),
+        };
+        let mut zfs_used_bytes = 0u64;
+        let mut zfs_avail_bytes = 0u64;
+        let mut volumes = Vec::new();
+        if let Some(root) = self.zfs_root.as_deref() {
+            let vol_prefix = format!("{}/volumes/", root.trim_end_matches('/'));
+            for ds in spaces {
+                if ds.name == root {
+                    zfs_used_bytes = ds.used;
+                    zfs_avail_bytes = ds.avail;
+                } else if let Some(rest) = ds.name.strip_prefix(&vol_prefix)
+                    && let Some((ns, vol)) = rest.split_once('/')
+                    && !vol.contains('/')
+                {
+                    volumes.push(VolumeTelemetry {
+                        namespace: ns.to_owned(),
+                        volume: vol.to_owned(),
+                        used_bytes: ds.used,
+                        avail_bytes: ds.avail,
+                    });
+                }
+            }
+        }
+        NodeTelemetry {
+            zfs_used_bytes,
+            zfs_avail_bytes,
+            net_rx_bps,
+            net_tx_bps,
+            volumes,
+        }
     }
 
     async fn read(&self) -> Result<Read, String> {

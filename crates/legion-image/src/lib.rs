@@ -12,7 +12,7 @@ mod store;
 
 pub use oci::{Config, ImageConfig};
 pub use reference::{Reference, registry_of};
-pub use registry::{Client, Credentials, sha256};
+pub use registry::{Client, Credentials, RegistryHit, sha256};
 pub use store::{GcRoots, Image, Pin, StorageMode, Store, StoreLock, chain_ids, hex_of};
 
 #[derive(Debug, thiserror::Error)]

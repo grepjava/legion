@@ -72,6 +72,8 @@ pub struct ApiService {
     pub(crate) alerts: std::sync::Arc<crate::alerts::State>,
     /// The logs of the builds this manager runs as leader.
     pub(crate) builds: std::sync::Arc<crate::build::Logs>,
+    pub(crate) registry_loopback: bool,
+    pub(crate) insecure_registries: std::sync::Arc<[String]>,
 }
 
 pub(crate) enum Route {
@@ -1437,18 +1439,62 @@ impl Cluster for ApiService {
                     memory_bytes: u.memory,
                 });
             }
+            let mut node_telem = self.usage.fresh_nodes();
+            for n in node_telem.keys() {
+                nodes.entry(n.clone()).or_default();
+            }
             pb::UsageResponse {
                 nodes: nodes
                     .into_iter()
-                    .map(|(node, tasks)| pb::NodeUsage { node, tasks })
+                    .map(|(node, tasks)| {
+                        let t = node_telem.remove(&node).unwrap_or_default();
+                        let volumes = t
+                            .volumes
+                            .into_iter()
+                            .filter(|v| {
+                                v.namespace != SYSTEM_NAMESPACE
+                                    && (namespace.is_empty() || v.namespace == namespace)
+                            })
+                            .map(|v| pb::VolumeTelemetry {
+                                namespace: v.namespace,
+                                volume: v.volume,
+                                used_bytes: v.used_bytes,
+                                avail_bytes: v.avail_bytes,
+                            })
+                            .collect();
+                        pb::NodeUsage {
+                            node,
+                            tasks,
+                            zfs_used_bytes: t.zfs_used_bytes,
+                            zfs_avail_bytes: t.zfs_avail_bytes,
+                            net_rx_bps: t.net_rx_bps,
+                            net_tx_bps: t.net_tx_bps,
+                            volumes,
+                        }
+                    })
                     .collect(),
             }
         };
-        // A user sees the tasks of the namespaces they may read in.
+        // A user sees the tasks and volumes of the namespaces they may read in,
+        // and node-level ZFS/network metrics only when permitted to read Nodes.
         if caller != Caller::All {
+            let can_nodes = caller.may(&self.store, Verb::Read, Kind::Node, "");
             for n in &mut usage.nodes {
                 n.tasks
                     .retain(|t| caller.may(&self.store, Verb::Read, Kind::Task, &t.namespace));
+                n.volumes
+                    .retain(|v| caller.may(&self.store, Verb::Read, Kind::Volume, &v.namespace));
+                if !can_nodes {
+                    n.zfs_used_bytes = 0;
+                    n.zfs_avail_bytes = 0;
+                    n.net_rx_bps = 0;
+                    n.net_tx_bps = 0;
+                }
+            }
+            if !can_nodes {
+                usage
+                    .nodes
+                    .retain(|n| !n.tasks.is_empty() || !n.volumes.is_empty());
             }
         }
         Ok(Response::new(usage))
@@ -1531,9 +1577,31 @@ impl Cluster for ApiService {
                 })
             })
             .collect();
+        let nodes = if task.is_empty() && caller.may(&self.store, Verb::Read, Kind::Node, "") {
+            self.usage
+                .node_history()
+                .into_iter()
+                .map(|(node, samples)| pb::NodeSeries {
+                    node,
+                    samples: samples
+                        .into_iter()
+                        .map(|s| pb::NodeSample {
+                            at_ms: s.at_ms,
+                            zfs_used_bytes: s.zfs_used_bytes,
+                            zfs_avail_bytes: s.zfs_avail_bytes,
+                            net_rx_bps: s.net_rx_bps,
+                            net_tx_bps: s.net_tx_bps,
+                        })
+                        .collect(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(Response::new(pb::UsageHistoryResponse {
             tasks,
             step_ms: crate::usage::STEP.as_millis() as i64,
+            nodes,
         }))
     }
 
@@ -2214,6 +2282,43 @@ impl Cluster for ApiService {
         }
         .await;
         self.audit_end(audit, result)
+    }
+
+    async fn node_images(
+        &self,
+        req: Request<pb::NodeImagesRequest>,
+    ) -> Result<Response<pb::NodeImagesResponse>, Status> {
+        crate::image_ops::node_images(self, req).await
+    }
+
+    type ExportImageStream = ReceiverStream<Result<pb::BackupChunk, Status>>;
+
+    async fn export_image(
+        &self,
+        req: Request<pb::ExportImageRequest>,
+    ) -> Result<Response<Self::ExportImageStream>, Status> {
+        crate::image_ops::export_image(self, req).await
+    }
+
+    async fn load_image(
+        &self,
+        req: Request<tonic::Streaming<pb::LoadImageChunk>>,
+    ) -> Result<Response<pb::NodeImagesResponse>, Status> {
+        crate::image_ops::load_image(self, req).await
+    }
+
+    async fn search_images(
+        &self,
+        req: Request<pb::SearchImagesRequest>,
+    ) -> Result<Response<pb::SearchImagesResponse>, Status> {
+        crate::image_ops::search_images(self, req).await
+    }
+
+    async fn inspect_registry_image(
+        &self,
+        req: Request<pb::InspectRegistryImageRequest>,
+    ) -> Result<Response<pb::InspectRegistryImageResponse>, Status> {
+        crate::image_ops::inspect_registry_image(self, req).await
     }
 }
 

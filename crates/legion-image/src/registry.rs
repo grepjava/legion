@@ -675,7 +675,158 @@ impl Client {
         }
         Ok(())
     }
+
+    /// Lists tags in `r`'s repository (`GET /v2/<repo>/tags/list`), sorted.
+    pub async fn list_tags(
+        &self,
+        r: &Reference,
+        creds: Option<&Credentials>,
+    ) -> Result<Vec<String>, Error> {
+        #[derive(serde::Deserialize)]
+        struct TagsList {
+            #[serde(default)]
+            tags: Option<Vec<String>>,
+        }
+        let resp = self
+            .get(r, "tags/list?n=100", &["application/json"], creds)
+            .await?;
+        let parsed: TagsList = resp
+            .json()
+            .await
+            .map_err(|e| Error::Registry(format!("{r}: tags/list: {e}")))?;
+        let mut tags = parsed.tags.unwrap_or_default();
+        tags.sort();
+        Ok(tags)
+    }
+
+    /// Searches the curated FreeBSD jail image catalog and Docker Hub for
+    /// `query`, returning up to `limit` hits. If Docker Hub cannot be reached
+    /// (for example in an air-gapped cluster), returns the matching curated
+    /// FreeBSD catalog hits.
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<RegistryHit>, Error> {
+        let limit = limit.clamp(1, 50);
+        let q = query.trim().to_ascii_lowercase();
+        let mut out: Vec<RegistryHit> = FREEBSD_CATALOG
+            .iter()
+            .filter(|(name, desc, _)| {
+                q.is_empty()
+                    || name.to_ascii_lowercase().contains(&q)
+                    || desc.to_ascii_lowercase().contains(&q)
+            })
+            .map(|(name, desc, tag)| RegistryHit {
+                name: (*name).to_owned(),
+                description: (*desc).to_owned(),
+                stars: 0,
+                official: true,
+                source: "freebsd-catalog".to_owned(),
+                suggested_tag: (*tag).to_owned(),
+            })
+            .collect();
+
+        if !q.is_empty() && out.len() < limit {
+            let page_size = (limit - out.len()).clamp(1, 25);
+            let req = self
+                .http
+                .get("https://hub.docker.com/v2/search/repositories/")
+                .query(&[
+                    ("query", query.trim()),
+                    ("page_size", &page_size.to_string()),
+                ])
+                .timeout(std::time::Duration::from_secs(6));
+            if let Ok(resp) = req.send().await
+                && resp.status().is_success()
+                && let Ok(hub) = resp.json::<HubSearchResponse>().await
+            {
+                for item in hub.results {
+                    if out.len() >= limit {
+                        break;
+                    }
+                    if out.iter().any(|h| h.name == item.repo_name) {
+                        continue;
+                    }
+                    out.push(RegistryHit {
+                        name: item.repo_name,
+                        description: item.short_description,
+                        stars: item.star_count,
+                        official: item.is_official,
+                        source: "docker-hub".to_owned(),
+                        suggested_tag: "latest".to_owned(),
+                    });
+                }
+            }
+        }
+        out.truncate(limit);
+        Ok(out)
+    }
 }
+
+/// A search result from the FreeBSD jail catalog or Docker Hub.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryHit {
+    pub name: String,
+    pub description: String,
+    pub stars: u64,
+    pub official: bool,
+    pub source: String,
+    pub suggested_tag: String,
+}
+
+#[derive(serde::Deserialize)]
+struct HubSearchResponse {
+    #[serde(default)]
+    results: Vec<HubRepo>,
+}
+
+#[derive(serde::Deserialize)]
+struct HubRepo {
+    #[serde(default)]
+    repo_name: String,
+    #[serde(default)]
+    short_description: String,
+    #[serde(default)]
+    star_count: u64,
+    #[serde(default)]
+    is_official: bool,
+}
+
+/// Built-in FreeBSD OCI jail base images & common runtimes.
+const FREEBSD_CATALOG: &[(&str, &str, &str)] = &[
+    (
+        "ghcr.io/freebsd/freebsd-runtime",
+        "Official FreeBSD minimal OCI runtime userland for lightweight jails",
+        "14.2",
+    ),
+    (
+        "dougrabson/freebsd-minimal",
+        "Minimal FreeBSD base jail image (sh, coreutils, SSL certificates)",
+        "14.2",
+    ),
+    (
+        "dougrabson/freebsd",
+        "Full FreeBSD base system OCI image with pkg(8) package manager",
+        "14.2",
+    ),
+    (
+        "ghcr.io/daemonless/nginx",
+        "FreeBSD native nginx HTTP/reverse-proxy jail image",
+        "latest",
+    ),
+    (
+        "ghcr.io/daemonless/postgres",
+        "FreeBSD native PostgreSQL server jail image for ZFS datasets",
+        "16",
+    ),
+    (
+        "ghcr.io/daemonless/redis",
+        "FreeBSD native Redis in-memory data store jail image",
+        "latest",
+    ),
+    (
+        "alpine",
+        "Minimal Linux Alpine base image (runs on nodes with --linux ABI enabled)",
+        "3.20",
+    ),
+];
 
 /// The largest manifest or index taken, as most registries limit them.
 const MAX_MANIFEST: usize = 4 << 20;
@@ -781,5 +932,19 @@ mod tests {
         let c = c.plain_http("r.example:5000");
         assert!(c.own_origin(&r, "http://r.example:5000/v2/"));
         assert!(!c.own_origin(&r, "https://r.example:5000/v2/"));
+    }
+
+    #[tokio::test]
+    async fn freebsd_catalog_matches_queries() {
+        let c = Client::new().unwrap();
+        let hits = c.search("postgres", 10).await.unwrap();
+        assert!(
+            hits.iter()
+                .any(|h| h.name == "ghcr.io/daemonless/postgres" && h.source == "freebsd-catalog"),
+            "{hits:?}"
+        );
+        let empty = c.search("", 5).await.unwrap();
+        assert_eq!(empty.len(), 5);
+        assert_eq!(empty[0].source, "freebsd-catalog");
     }
 }

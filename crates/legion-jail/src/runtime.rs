@@ -2028,6 +2028,92 @@ impl legion_runtime::Runtime for JailRuntime {
         });
         Ok(stream.boxed())
     }
+
+    async fn cached_images(&self) -> Result<Vec<legion_runtime::CachedImage>> {
+        let images = self.images.images().map_err(image_error)?;
+        let mut out = Vec::new();
+        for img in images {
+            let refs = if img.references.is_empty() {
+                vec!["<none>".to_owned()]
+            } else {
+                img.references
+            };
+            for r in refs {
+                out.push(legion_runtime::CachedImage {
+                    reference: r,
+                    digest: img.digest.clone(),
+                    os: img.config.os.clone(),
+                    arch: img.config.architecture.clone(),
+                    layers: img.layers.len() as u32,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn remove_image(&self, reference: &str) -> Result<bool> {
+        self.images.remove(reference).await.map_err(image_error)
+    }
+
+    async fn prune_images(&self) -> Result<u64> {
+        self.images
+            .prune()
+            .await
+            .map(|gone| gone.len() as u64)
+            .map_err(image_error)
+    }
+
+    async fn push_image(&self, query: &str, target: &str, logins: &[Login]) -> Result<String> {
+        let dest = Reference::parse(target).map_err(image_error)?;
+        let creds = Credentials::for_registry(logins, &dest.registry);
+        self.images
+            .push(query, &dest, creds.as_ref())
+            .await
+            .map_err(image_error)
+    }
+
+    async fn export_image(
+        &self,
+        query: &str,
+        name: Option<&str>,
+        out: &Path,
+    ) -> Result<legion_runtime::CachedImage> {
+        let img = self
+            .images
+            .export(query, out, name)
+            .await
+            .map_err(image_error)?;
+        Ok(legion_runtime::CachedImage {
+            reference: img
+                .references
+                .first()
+                .cloned()
+                .unwrap_or_else(|| query.to_owned()),
+            digest: img.digest,
+            os: img.config.os,
+            arch: img.config.architecture,
+            layers: img.layers.len() as u32,
+        })
+    }
+
+    async fn load_image(
+        &self,
+        archive: &Path,
+        reference: Option<&str>,
+    ) -> Result<legion_runtime::CachedImage> {
+        let img = self
+            .images
+            .load(archive, reference)
+            .await
+            .map_err(image_error)?;
+        Ok(legion_runtime::CachedImage {
+            reference: img.references.first().cloned().unwrap_or_default(),
+            digest: img.digest,
+            os: img.config.os,
+            arch: img.config.architecture,
+            layers: img.layers.len() as u32,
+        })
+    }
 }
 
 /// What a reader yields, in pieces, until it ends (or fails: a terminal

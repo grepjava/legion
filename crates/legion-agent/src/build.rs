@@ -221,12 +221,11 @@ async fn build(
 
 /// Writes `data` readable by root alone.
 async fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut f = options.open(path)?;
     std::io::Write::write_all(&mut f, data)
 }
 
@@ -312,7 +311,7 @@ fn frame(f: Frame) -> SessionFrame {
     SessionFrame { frame: Some(f) }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

@@ -182,11 +182,18 @@ pub(crate) fn current(api: &ApiService) -> Vec<(Alert, i64)> {
             message: t.status["message"].as_str().unwrap_or(""),
         });
     }
+    let vol_space = api.usage.volume_space();
     for v in &volumes {
+        let (used_bytes, avail_bytes) = vol_space
+            .get(&format!("{}/{}", v.metadata.namespace, v.metadata.name))
+            .copied()
+            .unwrap_or((0, 0));
         inputs.volumes.push(alert::VolumeInput {
             namespace: &v.metadata.namespace,
             name: &v.metadata.name,
             lost: v.status["lost"].as_str().unwrap_or(""),
+            used_bytes,
+            avail_bytes,
         });
     }
     if let Some(c) = &api.peer_tls

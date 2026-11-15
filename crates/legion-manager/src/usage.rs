@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use legion_api::dispatch::TaskUsage;
+use legion_api::dispatch::{NodeTelemetry, TaskUsage};
 use tokio::time::Instant;
 
 /// Reports older than this are left out: the task stopped, or its node
@@ -29,6 +29,20 @@ pub struct Usage {
     tasks: Mutex<HashMap<String, Report>>,
     /// By `namespace/task`: its node and samples, oldest first.
     history: Mutex<HashMap<String, Series>>,
+    /// By node name: latest ZFS/network/volume telemetry and when reported.
+    nodes: Mutex<HashMap<String, (Instant, NodeTelemetry)>>,
+    /// By node name: 1-hour history of ZFS & network samples.
+    node_history: Mutex<HashMap<String, VecDeque<(Instant, NodeSample)>>>,
+}
+
+/// Host ZFS & network sample at a moment, in milliseconds since the epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeSample {
+    pub at_ms: i64,
+    pub zfs_used_bytes: u64,
+    pub zfs_avail_bytes: u64,
+    pub net_rx_bps: u64,
+    pub net_tx_bps: u64,
 }
 
 /// What a task used at a moment, in milliseconds since the epoch.
@@ -155,6 +169,98 @@ impl Usage {
             .iter()
             .filter(|(_, r)| now.duration_since(r.at) < FRESH)
             .map(|(task, r)| (task.clone(), (r.node.clone(), r.usage)))
+            .collect()
+    }
+
+    /// Records `node`'s host ZFS, volume ZFS and network telemetry. Only
+    /// volumes `holds_volume` says belong to `node` are kept.
+    pub fn record_node(
+        &self,
+        node: &str,
+        mut telemetry: NodeTelemetry,
+        holds_volume: impl Fn(&str, &str) -> bool,
+    ) {
+        let now = Instant::now();
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64);
+        telemetry.volumes.truncate(MAX_REPORTED);
+        telemetry
+            .volumes
+            .retain(|v| holds_volume(&v.namespace, &v.volume));
+        let mut nodes = self.nodes.lock().unwrap();
+        let mut hist = self.node_history.lock().unwrap();
+        nodes.retain(|_, (at, _)| now.duration_since(*at) < FRESH);
+        hist.retain(|_, q| {
+            while q
+                .front()
+                .is_some_and(|(t, _)| now.duration_since(*t) > HISTORY)
+            {
+                q.pop_front();
+            }
+            !q.is_empty()
+        });
+        let q = hist.entry(node.to_owned()).or_default();
+        if q.back().is_none_or(|(t, _)| now.duration_since(*t) >= STEP) {
+            q.push_back((
+                now,
+                NodeSample {
+                    at_ms,
+                    zfs_used_bytes: telemetry.zfs_used_bytes,
+                    zfs_avail_bytes: telemetry.zfs_avail_bytes,
+                    net_rx_bps: telemetry.net_rx_bps,
+                    net_tx_bps: telemetry.net_tx_bps,
+                },
+            ));
+        }
+        nodes.insert(node.to_owned(), (now, telemetry));
+    }
+
+    /// Fresh host & volume telemetry by node name.
+    pub fn fresh_nodes(&self) -> BTreeMap<String, NodeTelemetry> {
+        let now = Instant::now();
+        self.nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, (at, _))| now.duration_since(*at) < FRESH)
+            .map(|(n, (_, t))| (n.clone(), t.clone()))
+            .collect()
+    }
+
+    /// Fresh `(used_bytes, avail_bytes)` by `namespace/volume`.
+    pub fn volume_space(&self) -> HashMap<String, (u64, u64)> {
+        let now = Instant::now();
+        let mut out = HashMap::new();
+        for (at, t) in self.nodes.lock().unwrap().values() {
+            if now.duration_since(*at) < FRESH {
+                for v in &t.volumes {
+                    out.insert(
+                        format!("{}/{}", v.namespace, v.volume),
+                        (v.used_bytes, v.avail_bytes),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    /// Each node's ZFS & network samples within [`HISTORY`], oldest first.
+    pub fn node_history(&self) -> BTreeMap<String, Vec<NodeSample>> {
+        let now = Instant::now();
+        self.node_history
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(node, q)| {
+                let samples = q
+                    .iter()
+                    .filter(|(t, _)| now.duration_since(*t) <= HISTORY)
+                    .map(|(_, s)| *s)
+                    .collect::<Vec<_>>();
+                (node.clone(), samples)
+            })
+            .filter(|(_, s)| !s.is_empty())
             .collect()
     }
 }
