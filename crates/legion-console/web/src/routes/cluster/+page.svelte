@@ -205,6 +205,31 @@
   {t("takes it. Keep it as safe as the CA's key.")}
 </p>
 <a class="button" href={downloads.backup} download>{t('Download a backup')}</a>
+<details class="restore">
+  <summary>{t('Restoring the cluster from a backup')}</summary>
+  <p class="muted">
+    {t(
+      "A restore replaces a stopped manager's store, so it is done on that manager's host, not here: this console runs on a manager that is up, and is out of reach when the cluster is down. On one manager:"
+    )}
+  </p>
+  <ol>
+    <li>{t('Stop its daemon:')} <code>service legion stop</code></li>
+    <li>
+      {t('Restore the backup into its data directory:')}
+      <code>legion restore legion-backup-….json --data-dir /var/db/legion</code>
+      {t('(add --unlock-key-file with autolock on; the old store is kept beside the new one)')}
+    </li>
+    <li>{t('Start its daemon:')} <code>service legion start</code>. {t("It is now the cluster's only manager.")}</li>
+    <li>
+      {t('Have the other managers join it again, each from an empty data directory, with a manager join token from it.')}
+    </li>
+  </ol>
+  <p class="muted">
+    {t(
+        "A backup holds the objects, Secrets and join tokens, not the managers' keys (keep each manager's pki directory) nor any Volume's data (back each up from its page)."
+      )}
+  </p>
+</details>
 
 <h2>{t('Users')}</h2>
 <form class="controls" onsubmit={createUser}>

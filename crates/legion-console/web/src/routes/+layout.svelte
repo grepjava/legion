@@ -6,6 +6,7 @@
   import { plural } from '#lib/kinds.ts';
   import { namespaces, session } from '#lib/session.svelte.ts';
   import { i18n, languageName, languages, setLanguage, t } from '#lib/i18n.svelte.ts';
+  import { live } from '#lib/live.svelte.ts';
 
   let { children } = $props();
   let adminNamespaces: string[] = $state([]);
@@ -54,6 +55,9 @@
     );
   });
   const critical = $derived(session.alerts.some((a) => a.severity === 'critical'));
+  // Why a live view stopped moving, if one has: the first, as they share a
+  // cause (the gateway, the network).
+  const stale = $derived(Object.values(live.down)[0] ?? '');
   // The count said when it changes, as the badge only shows it (WCAG
   // 4.1.3); signed in with alerts already, said once.
   let said = $state('');
@@ -161,6 +165,11 @@
 {#if page.url.pathname === '/login'}
   {@render children()}
 {:else if session.me}
+  {#if stale}
+    <div class="banner warning" role="status">
+      {t('Not current: {why}. What you see may be out of date; reconnecting…', { why: stale })}
+    </div>
+  {/if}
   <a class="skip" href="#main">{t('Skip to the page')}</a>
   <p class="sr-only" aria-live="polite">{said}</p>
   <div class="shell">

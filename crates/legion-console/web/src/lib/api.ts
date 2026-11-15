@@ -1,6 +1,7 @@
 // The gateway's API (DESIGN.md §3.9). Every call is made by the gateway as
 // the signed-in user, so what comes back is what the CLI would show them.
 import { t } from '#lib/i18n.svelte.ts';
+import { live } from '#lib/live.svelte.ts';
 
 export interface Meta {
   name: string;
@@ -392,58 +393,112 @@ export function key(o: LObject): string {
  * after each change. Reconnects after a break. Returns a function that
  * stops it.
  */
+let streams = 0;
+
+/**
+ * Keeps a WebSocket open: `connect` gets ready (reading what the stream
+ * starts from) and gives the path to open, `receive` each message. Broken,
+ * it says so in `live` and tries again, waiting longer each time up to 30
+ * s; a session gone ends it, the request that found so sending the user to
+ * sign in. Returns a function that stops it.
+ */
+function keepOpen(
+  connect: () => Promise<string>,
+  receive: (message: any) => void,
+  failed: (why: string) => void = () => {}
+): () => void {
+  const id = ++streams;
+  let stopped = false;
+  let socket: WebSocket | null = null;
+  let retry: ReturnType<typeof setTimeout> | null = null;
+  let wait = 1000;
+  const broken = (why: string) => {
+    if (stopped) return;
+    live.down[id] = why;
+    failed(why);
+  };
+  const again = () => {
+    if (stopped) return;
+    retry = setTimeout(start, wait);
+    wait = Math.min(wait * 2, 30_000);
+  };
+  async function start() {
+    if (stopped) return;
+    let path: string;
+    try {
+      path = await connect();
+    } catch (e) {
+      broken(e instanceof Error ? e.message : String(e));
+      // Signed out (sent to sign in) or not allowed: trying again won't do.
+      if (e instanceof ApiError && (e.status === 401 || e.status === 403)) return;
+      again();
+      return;
+    }
+    if (stopped) return;
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    socket = new WebSocket(`${proto}//${location.host}${path}`);
+    socket.onopen = () => {
+      delete live.down[id];
+      failed('');
+      wait = 1000;
+    };
+    socket.onmessage = (m) => {
+      const e = JSON.parse(m.data);
+      if (e.error) broken(e.error);
+      else receive(e);
+    };
+    socket.onclose = () => {
+      if (stopped) return;
+      broken(live.down[id] ?? t('the connection to the console dropped'));
+      // The session may be what ended it: a request finds out, and a 401
+      // sends the user to sign in.
+      api.me().then(again, (e) => {
+        if (!(e instanceof ApiError && e.status === 401)) again();
+      });
+    };
+  }
+  start();
+  return () => {
+    stopped = true;
+    delete live.down[id];
+    if (retry) clearTimeout(retry);
+    socket?.close();
+  };
+}
+
 export function follow(
   kind: string,
   namespace: string,
   update: (objects: LObject[]) => void,
   failed: (e: ApiError) => void
 ): () => void {
-  let stopped = false;
-  let socket: WebSocket | null = null;
-  let retry: ReturnType<typeof setTimeout> | null = null;
   const objects = new Map<string, LObject>();
   const publish = () =>
-    update(
-      [...objects.values()].sort((a, b) => key(a).localeCompare(key(b)))
-    );
-
-  async function start() {
-    if (stopped) return;
-    try {
-      const listed = await api.list(kind, namespace);
+    update([...objects.values()].sort((a, b) => key(a).localeCompare(key(b))));
+  return keepOpen(
+    async () => {
+      // Listed again on every reconnect, so nothing missed meanwhile stays.
+      let listed;
+      try {
+        listed = await api.list(kind, namespace);
+      } catch (e) {
+        if (e instanceof ApiError) failed(e);
+        throw e;
+      }
       objects.clear();
       for (const o of listed.objects) objects.set(key(o), o);
       publish();
-      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const params = new URLSearchParams({ from: String(listed.version) });
       if (namespace) params.set('namespace', namespace);
-      socket = new WebSocket(
-        `${proto}//${location.host}/api/watch/${encodeURIComponent(kind)}?${params}`
-      );
-      socket.onmessage = (m) => {
-        const e = JSON.parse(m.data);
-        if (e.error) return;
-        if (e.object.kind !== kind) return;
-        if (e.type === 'delete') objects.delete(key(e.object));
-        else objects.set(key(e.object), e.object);
-        publish();
-      };
-      socket.onclose = () => {
-        if (!stopped) retry = setTimeout(start, 2000);
-      };
-    } catch (e) {
-      if (e instanceof ApiError) {
-        failed(e);
-        if (e.status >= 500 && !stopped) retry = setTimeout(start, 3000);
-      }
+      return `/api/watch/${encodeURIComponent(kind)}?${params}`;
+    },
+    (e) => {
+      if (e.object.kind !== kind) return;
+      if (e.type === 'delete') objects.delete(key(e.object));
+      else objects.set(key(e.object), e.object);
+      publish();
     }
-  }
-  start();
-  return () => {
-    stopped = true;
-    if (retry) clearTimeout(retry);
-    socket?.close();
-  };
+  );
 }
 
 /** What an operator acts on now (`legion alerts`). */
@@ -483,65 +538,30 @@ export function followEvents(
   update: (events: ObjectEvent[]) => void,
   failed: (why: string) => void
 ): () => void {
-  let stopped = false;
-  let socket: WebSocket | null = null;
-  let retry: ReturnType<typeof setTimeout> | null = null;
-  function start() {
-    if (stopped) return;
-    let all: ObjectEvent[] = [];
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const query = new URLSearchParams({ namespace, kind, name });
-    socket = new WebSocket(`${proto}//${location.host}/api/events?${query}`);
-    socket.onmessage = (m) => {
-      const e = JSON.parse(m.data);
-      if (e.error) failed(e.error);
-      else {
-        failed('');
-        all = [...all, ...e.events];
-        update(all);
-      }
-    };
-    socket.onclose = () => {
-      if (!stopped) retry = setTimeout(start, 2000);
-    };
-  }
-  start();
-  return () => {
-    stopped = true;
-    if (retry) clearTimeout(retry);
-    socket?.close();
-  };
+  let all: ObjectEvent[] = [];
+  return keepOpen(
+    async () => {
+      // Each opening sends those kept again, from the start.
+      all = [];
+      return `/api/events?${new URLSearchParams({ namespace, kind, name })}`;
+    },
+    (e) => {
+      all = [...all, ...e.events];
+      update(all);
+    },
+    failed
+  );
 }
 
 export function followAlerts(
   update: (alerts: Alert[]) => void,
   failed: (why: string) => void
 ): () => void {
-  let stopped = false;
-  let socket: WebSocket | null = null;
-  let retry: ReturnType<typeof setTimeout> | null = null;
-  function start() {
-    if (stopped) return;
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    socket = new WebSocket(`${proto}//${location.host}/api/alerts`);
-    socket.onmessage = (m) => {
-      const e = JSON.parse(m.data);
-      if (e.error) failed(e.error);
-      else {
-        failed('');
-        update(e.alerts);
-      }
-    };
-    socket.onclose = () => {
-      if (!stopped) retry = setTimeout(start, 2000);
-    };
-  }
-  start();
-  return () => {
-    stopped = true;
-    if (retry) clearTimeout(retry);
-    socket?.close();
-  };
+  return keepOpen(
+    async () => '/api/alerts',
+    (e) => update(e.alerts),
+    failed
+  );
 }
 
 /** Where an alert's cause is in the console. */
