@@ -59,7 +59,7 @@ impl Tab {
     pub(super) fn kinds(self) -> &'static [Kind] {
         match self {
             Tab::Nodes => &[Kind::Node],
-            Tab::Workloads => &[Kind::Service, Kind::Job, Kind::CronJob],
+            Tab::Workloads => &[Kind::Service, Kind::Job, Kind::CronJob, Kind::Build],
             Tab::Tasks => &[Kind::Task],
             Tab::Storage => &[Kind::Volume],
             Tab::Network => &[Kind::Route, Kind::NetworkPolicy],
@@ -68,6 +68,7 @@ impl Tab {
                 Kind::Secret,
                 Kind::Config,
                 Kind::RoleBinding,
+                Kind::ImagePolicy,
             ],
             Tab::Log => &[],
         }
@@ -148,6 +149,24 @@ pub enum Request {
         namespace: String,
         service: String,
     },
+    /// New tasks on the same spec (`legion restart`).
+    Restart {
+        namespace: String,
+        service: String,
+    },
+    /// A run of a cron job now (`legion cronjob run`).
+    RunNow {
+        namespace: String,
+        cron_job: String,
+    },
+    /// An object's events, followed in the pane (`legion events -w`).
+    Events {
+        kind: Kind,
+        namespace: String,
+        name: String,
+    },
+    /// The alerts, followed in the pane (`legion alerts -w`).
+    Alerts,
     Suspend {
         namespace: String,
         cron_job: String,
@@ -295,6 +314,22 @@ impl View {
             self.shell = None;
             self.logs = Some(Logs::new(of));
         }
+        let of = match request {
+            Request::Events {
+                kind,
+                namespace,
+                name,
+            } if namespace.is_empty() => format!("Events of {} {name}", kind_word(*kind)),
+            Request::Events {
+                kind,
+                namespace,
+                name,
+            } => format!("Events of {} {namespace}/{name}", kind_word(*kind)),
+            Request::Alerts => "Alerts".to_owned(),
+            _ => return,
+        };
+        self.shell = None;
+        self.logs = Some(Logs::titled(of));
     }
 
     /// Starts showing the shell a request asks for, with the keys.
@@ -461,6 +496,7 @@ impl View {
             KeyCode::Home | KeyCode::Char('g') => *sel = 0,
             KeyCode::End | KeyCode::Char('G') => *sel = last,
             KeyCode::Char('h') => self.history = !self.history,
+            KeyCode::Char('A') => return Some(Request::Alerts),
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('i') => self.detail = Some(!self.detail.unwrap_or(self.wide)),
             KeyCode::Char('y') => self.yaml = selected.map(|k| (k, 0)),
@@ -554,6 +590,31 @@ impl View {
                 );
                 return None;
             }
+            ('R', Kind::Service) => {
+                let ask = format!(
+                    "Restart service {ns}/{n}? Its tasks are replaced, as an update replaces them."
+                );
+                self.confirm(
+                    Request::Restart {
+                        namespace,
+                        service: name,
+                    },
+                    ask,
+                );
+                return None;
+            }
+            ('n', Kind::CronJob) => Request::RunNow {
+                namespace,
+                cron_job: name,
+            },
+            (
+                'e',
+                Kind::Task | Kind::Service | Kind::Job | Kind::Node | Kind::Volume | Kind::Build,
+            ) => Request::Events {
+                kind,
+                namespace,
+                name,
+            },
             ('u', Kind::CronJob) => Request::Suspend {
                 namespace,
                 cron_job: name,
@@ -1039,7 +1100,32 @@ fn workload_rows(model: &Model) -> Vec<TableRow> {
             Some(key(c)),
         )
     });
-    services.chain(jobs).chain(cron_jobs).collect()
+    let builds = model.of(Kind::Build).map(|b| {
+        let phase = b.status["phase"].as_str().unwrap_or("pending").to_owned();
+        let state = match phase.as_str() {
+            "Failed" => fg(BAD),
+            "Succeeded" => fg(OK),
+            _ => Style::default(),
+        };
+        TableRow::new(
+            vec![
+                dimmed(b.metadata.namespace.clone()),
+                text(b.metadata.name.clone()),
+                text("build"),
+                dimmed(b.status["node"].as_str().unwrap_or_default().to_owned()),
+                colored(phase.to_lowercase(), state),
+                text(""),
+                text(""),
+                dimmed(b.spec["image"].as_str().unwrap_or_default().to_owned()),
+            ],
+            Some(key(b)),
+        )
+    });
+    services
+        .chain(jobs)
+        .chain(cron_jobs)
+        .chain(builds)
+        .collect()
 }
 
 fn task_rows(model: &Model, view: &View) -> Vec<TableRow> {
@@ -1273,7 +1359,28 @@ fn config_rows(model: &Model) -> Vec<TableRow> {
             Some(key(b)),
         )
     });
-    namespaces.chain(data).chain(bindings).collect()
+    let policies = model.of(Kind::ImagePolicy).map(|p| {
+        let count = |field: &str| p.spec[field].as_array().map_or(0, Vec::len);
+        TableRow::new(
+            vec![
+                dimmed(""),
+                text(p.metadata.name.clone()),
+                text("image policy"),
+                text(format!(
+                    "{}: {} image patterns, {} keys",
+                    p.spec["mode"].as_str().unwrap_or("enforce"),
+                    count("images"),
+                    count("keys")
+                )),
+            ],
+            Some(key(p)),
+        )
+    });
+    namespaces
+        .chain(data)
+        .chain(bindings)
+        .chain(policies)
+        .collect()
 }
 
 /// `09:30:05`, of the day in UTC.

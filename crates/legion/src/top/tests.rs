@@ -1038,3 +1038,91 @@ fn a_wide_character_at_the_shells_edge_leaves_the_border() {
     assert_eq!(buf[(cols, pane + 1)].symbol(), " ");
     assert_eq!(buf[(129, pane + 1)].symbol(), "│");
 }
+
+#[test]
+fn restart_run_now_events_and_alerts() {
+    let m = cluster();
+    let mut v = View::default();
+    // A restart is asked first.
+    assert_eq!(typed(&mut v, &m, "2R"), None);
+    assert!(screen(&m, &v).contains("Restart service shop/web?"));
+    assert_eq!(
+        typed(&mut v, &m, "y"),
+        Some(Request::Restart {
+            namespace: "shop".into(),
+            service: "web".into()
+        })
+    );
+    let events = Request::Events {
+        kind: Kind::Service,
+        namespace: "shop".into(),
+        name: "web".into(),
+    };
+    assert_eq!(typed(&mut v, &m, "e"), Some(events.clone()));
+    assert_eq!(
+        typed(&mut v, &m, "jn"),
+        Some(Request::RunNow {
+            namespace: "shop".into(),
+            cron_job: "report".into()
+        })
+    );
+    assert_eq!(typed(&mut v, &m, "A"), Some(Request::Alerts));
+    // The pane says what it follows.
+    v.show_logs(&events);
+    assert!(screen(&m, &v).contains("Events of service shop/web"));
+    v.show_logs(&Request::Alerts);
+    assert!(screen(&m, &v).contains("Alerts"));
+}
+
+#[test]
+fn builds_and_image_policies_are_listed() {
+    let mut m = cluster();
+    m.changed(
+        true,
+        object(
+            Kind::Build,
+            "shop",
+            "web-k3",
+            20,
+            serde_json::json!({ "image": "registry.example/web:2", "source": { "containerfile": "FROM x" } }),
+            serde_json::json!({ "phase": "Succeeded", "node": "n1" }),
+        ),
+        0,
+    );
+    m.changed(
+        true,
+        object(
+            Kind::ImagePolicy,
+            "",
+            "signed",
+            21,
+            serde_json::json!({ "images": ["registry.example/*"], "keys": ["k1"] }),
+            serde_json::Value::Null,
+        ),
+        0,
+    );
+    let mut v = View::default();
+    typed(&mut v, &m, "2");
+    let s = screen(&m, &v);
+    let build = line(&s, "web-k3");
+    assert!(
+        build.contains("build") && build.contains("succeeded") && build.contains("web:2"),
+        "{build}"
+    );
+    typed(&mut v, &m, "6");
+    let s = screen(&m, &v);
+    assert!(
+        line(&s, "signed").contains("enforce: 1 image patterns, 1 keys"),
+        "{s}"
+    );
+}
+
+#[test]
+fn a_poll_that_fails_says_so_until_it_reads_again() {
+    let mut m = cluster();
+    let v = View::default();
+    m.polled = Some("the cluster's status: unavailable".into());
+    assert!(screen(&m, &v).contains("not current: the cluster's status"));
+    m.polled = None;
+    assert!(!screen(&m, &v).contains("not current"));
+}

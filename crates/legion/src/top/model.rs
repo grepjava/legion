@@ -40,6 +40,8 @@ pub struct Model {
     pub(super) hidden: BTreeSet<Kind>,
     /// Why it is not current, while it is not.
     pub(super) problem: Option<String>,
+    /// Why the cluster's status or use is not current, while it is not.
+    pub(super) polled: Option<String>,
 }
 
 impl Model {

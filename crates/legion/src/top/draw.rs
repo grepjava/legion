@@ -320,7 +320,12 @@ fn logs(f: &mut Frame, logs: &Logs, area: Rect) {
         (Some(why), _) => Span::styled(format!(" {why} "), dim()),
         (None, _) => Span::styled(" following ", fg(OK)),
     };
-    let block = panel(title(format!("Logs of {}", logs.of)))
+    let heading = if logs.titled {
+        logs.of.clone()
+    } else {
+        format!("Logs of {}", logs.of)
+    };
+    let block = panel(title(heading))
         .title(Line::from(state).right_aligned())
         .title_bottom(
             Line::from(Span::styled(
@@ -355,7 +360,7 @@ fn header(f: &mut Frame, model: &Model, area: Rect) {
         top.push_span(Span::styled(format!("namespace {ns} "), fg(WARN)));
     }
     let block = panel(top);
-    let block = match &model.problem {
+    let block = match model.problem.as_ref().or(model.polled.as_ref()) {
         Some(problem) => block.title(
             Line::from(Span::styled(
                 format!(" not current: {problem} "),
@@ -815,6 +820,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("i", "details panel on or off"),
             ("y", "the selected object's YAML"),
             ("h", "ended tasks too"),
+            ("A", "follow the alerts below"),
             ("q Ctrl-C", "quit"),
         ],
     ),
@@ -823,10 +829,10 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("d p a", "node: drain (asked), pause, activate"),
             ("L", "node: set or remove a label"),
-            ("s r", "service: scale, roll back (asked)"),
-            ("u", "cron job: suspend or resume"),
+            ("s r R", "service: scale, roll back, restart (both asked)"),
+            ("u n", "cron job: suspend or resume, run now"),
             ("m", "volume: move to a node"),
-            ("l", "follow logs of a task, service or Job below"),
+            ("l e", "follow logs, or events, of the row below"),
             (
                 "x",
                 "a shell in a task, below; Ctrl-] leaves it and returns",
@@ -938,11 +944,15 @@ fn bottom_line(view: &View) -> Line<'static> {
             ("Enter", "tasks"),
             ("s", "scale"),
             ("r", "roll back"),
+            ("R", "restart"),
             ("u", "suspend"),
+            ("n", "run now"),
             ("l", "logs"),
+            ("e", "events"),
         ],
         Tab::Tasks => &[
             ("l", "logs"),
+            ("e", "events"),
             ("x", "shell"),
             ("h", "ended"),
             ("D", "delete"),

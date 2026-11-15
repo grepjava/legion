@@ -20,6 +20,8 @@ pub(super) struct Logs {
     pub(super) back: usize,
     /// Why no more come.
     pub(super) ended: Option<String>,
+    /// Its title as given (events, alerts), not "Logs of" whose.
+    pub(super) titled: bool,
 }
 
 impl Logs {
@@ -30,6 +32,15 @@ impl Logs {
             partial: Default::default(),
             back: 0,
             ended: None,
+            titled: false,
+        }
+    }
+
+    /// A pane of other lines than a task's output, with its own title.
+    pub(super) fn titled(title: String) -> Self {
+        Logs {
+            titled: true,
+            ..Logs::new(title)
         }
     }
 

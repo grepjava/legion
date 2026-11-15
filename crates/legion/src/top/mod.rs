@@ -48,6 +48,9 @@ enum Msg {
     Usage(pb::UsageResponse),
     Status(pb::StatusResponse),
     Problem(String),
+    /// Why the cluster's status or use could not be read, or `None` once
+    /// it could again.
+    Polled(Option<String>),
     Key(KeyEvent),
     /// What came of a request.
     Done(String),
@@ -119,6 +122,7 @@ pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<
                 Msg::Usage(u) => model.usage(u),
                 Msg::Status(s) => model.cluster = Some(s),
                 Msg::Problem(p) => model.problem = Some(p),
+                Msg::Polled(p) => model.polled = p,
                 Msg::Key(k) => requests.extend(view.key(&model, k)),
                 Msg::Done(what) => view.notice = Some(what),
                 Msg::Log(n, stderr, data) => {
@@ -192,6 +196,23 @@ pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<
                         ));
                         shell = Some((streams, stream, input));
                     }
+                }
+                Request::Events { .. } | Request::Alerts => {
+                    if let Some((_, stream)) = logs.take() {
+                        stream.abort();
+                    }
+                    if let Some((_, stream, _)) = shell.take() {
+                        stream.abort();
+                    }
+                    streams += 1;
+                    view.show_logs(&request);
+                    let stream = tokio::spawn(stream_happenings(
+                        channel.clone(),
+                        request,
+                        streams,
+                        tx.clone(),
+                    ));
+                    logs = Some((streams, stream));
                 }
                 Request::Input(data) => {
                     if let Some((_, _, input)) = &shell {
@@ -307,6 +328,105 @@ async fn stream_logs(channel: Channel, request: Request, n: u64, tx: mpsc::Unbou
     let _ = tx.send(Msg::LogEnded(n, why));
 }
 
+/// Follows the events or alerts a request asks for, numbered `n`, as
+/// lines in the pane: an event a line, the alerts each time they change.
+async fn stream_happenings(
+    channel: Channel,
+    request: Request,
+    n: u64,
+    tx: mpsc::UnboundedSender<Msg>,
+) {
+    let mut cluster = crate::cli::cluster_client(channel);
+    let line = |text: String| Msg::Log(n, false, format!("{text}\n").into_bytes());
+    let why = match request {
+        Request::Events {
+            kind,
+            namespace,
+            name,
+        } => {
+            let req = pb::EventsRequest {
+                namespace,
+                kind: kind.to_string(),
+                name,
+                follow: true,
+            };
+            match cluster.events(req).await {
+                Ok(s) => {
+                    let mut s = s.into_inner();
+                    let mut first = true;
+                    loop {
+                        match s.message().await {
+                            Ok(Some(r)) => {
+                                if first && r.events.is_empty() {
+                                    let _ = tx.send(line(
+                                        "Nothing yet that the manager saw; new ones come as they happen."
+                                            .into(),
+                                    ));
+                                }
+                                first = false;
+                                for e in r.events {
+                                    let what = if e.message.is_empty() {
+                                        e.reason
+                                    } else {
+                                        format!("{}: {}", e.reason, e.message)
+                                    };
+                                    let text = format!(
+                                        "{}  {} {}  {what}",
+                                        view::time_of_day(e.at_ms.div_euclid(1000)),
+                                        e.kind.to_lowercase(),
+                                        e.name
+                                    );
+                                    if tx.send(line(text)).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Ok(None) => break "No more.".to_owned(),
+                            Err(e) => break format!("Failed: {}", e.message()),
+                        }
+                    }
+                }
+                Err(e) => format!("Failed: {}", e.message()),
+            }
+        }
+        Request::Alerts => match cluster.watch_alerts(pb::AlertsRequest::default()).await {
+            Ok(s) => {
+                let mut s = s.into_inner();
+                loop {
+                    match s.message().await {
+                        Ok(Some(r)) => {
+                            let now = view::time_of_day(legion_api::clock::now());
+                            let mut text = match r.alerts.len() {
+                                0 => format!("{now}  no alerts"),
+                                1 => format!("{now}  1 alert:"),
+                                k => format!("{now}  {k} alerts:"),
+                            };
+                            for a in r.alerts {
+                                let at = if a.object.is_empty() {
+                                    "the cluster".to_owned()
+                                } else if a.namespace.is_empty() {
+                                    a.object
+                                } else {
+                                    format!("{}/{}", a.namespace, a.object)
+                                };
+                                text.push_str(&format!("\n  {} {at}: {}", a.severity, a.message));
+                            }
+                            if tx.send(line(text)).is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => break "No more.".to_owned(),
+                        Err(e) => break format!("Failed: {}", e.message()),
+                    }
+                }
+            }
+            Err(e) => format!("Failed: {}", e.message()),
+        },
+        _ => return,
+    };
+    let _ = tx.send(Msg::LogEnded(n, why));
+}
+
 /// Runs the shell a request asks for, numbered `n`, on a screen of
 /// `size` (rows, columns), sending it what `input` brings.
 async fn run_shell(
@@ -418,6 +538,17 @@ async fn act(mut objects: crate::cli::Objects, request: Request) -> String {
         Request::Rollback { namespace, service } => {
             crate::cli::rollback(&mut objects, namespace, service).await
         }
+        Request::Restart { namespace, service } => {
+            legion_manager::actions::restart(&mut objects, namespace, service)
+                .await
+                .map_err(|s| anyhow::anyhow!("{}", s.message()))
+        }
+        Request::RunNow {
+            namespace,
+            cron_job,
+        } => legion_manager::actions::run_now(&mut objects, namespace, cron_job)
+            .await
+            .map_err(|s| anyhow::anyhow!("{}", s.message())),
         Request::Suspend {
             namespace,
             cron_job,
@@ -473,7 +604,11 @@ async fn act(mut objects: crate::cli::Objects, request: Request) -> String {
                 .map(|_| format!("{} deleted", key.replace("//", "/")))
                 .map_err(Into::into)
         }
-        Request::Logs { .. } | Request::Exec { .. } | Request::Input(_) => {
+        Request::Logs { .. }
+        | Request::Exec { .. }
+        | Request::Input(_)
+        | Request::Events { .. }
+        | Request::Alerts => {
             unreachable!("not asked of the API")
         }
     };
@@ -619,18 +754,33 @@ async fn poll(channel: Channel, namespace: Option<String>, tx: mpsc::UnboundedSe
     let mut tick = tokio::time::interval(POLL);
     loop {
         tick.tick().await;
-        if let Ok(s) = cluster.status(StatusRequest {}).await
-            && tx.send(Msg::Status(s.into_inner())).is_err()
-        {
-            return;
+        // What failed is said in the header until it reads again, so the
+        // figures shown are not taken as current.
+        let mut failed = None;
+        match cluster.status(StatusRequest {}).await {
+            Ok(s) => {
+                if tx.send(Msg::Status(s.into_inner())).is_err() {
+                    return;
+                }
+            }
+            Err(e) => failed = Some(format!("the cluster's status: {}", e.message())),
         }
-        // A manager too old to answer, or a leader just elected: none yet.
         let req = pb::UsageRequest {
             namespace: namespace.clone().unwrap_or_default(),
         };
-        if let Ok(u) = cluster.usage(req).await
-            && tx.send(Msg::Usage(u.into_inner())).is_err()
-        {
+        match cluster.usage(req).await {
+            Ok(u) => {
+                if tx.send(Msg::Usage(u.into_inner())).is_err() {
+                    return;
+                }
+            }
+            // A manager too old to have usage says nothing of the rest.
+            Err(e) if e.code() == tonic::Code::Unimplemented => {}
+            Err(e) => {
+                failed.get_or_insert_with(|| format!("what tasks use: {}", e.message()));
+            }
+        }
+        if tx.send(Msg::Polled(failed)).is_err() {
             return;
         }
     }
