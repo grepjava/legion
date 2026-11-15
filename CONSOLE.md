@@ -355,7 +355,8 @@ the published port from the host itself, which pf does not redirect. After
 each build, pushed or not, the agent runs `jailer rmi` on its image, as
 the registry has it: its base images and jailer's build cache stay for the
 next build (the cache is bounded by jailer's `--cache-max`, and `rmi`
-keeps what the cache uses).
+keeps what the cache uses). The lab builds test checks the image gone and
+its base kept (passed on e79a058).
 
 **Done when: met** (`the_console_builds_an_example_with_jailer`, passed on
 66b8f8f). One node, labelled a builder, with jailer and a registry the test
