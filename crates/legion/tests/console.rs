@@ -170,11 +170,12 @@ impl Console {
     }
 }
 
-/// Every button on the page that does something (not tabs or the
-/// sign-out) is disabled, with a title saying why; there is at least one.
+/// Every button on the page that changes something (not tabs, nor those
+/// marked `data-look` that only open a view) is disabled, with a title
+/// saying why; there is at least one.
 fn all_disabled(b: &mut Browser) -> Vec<(String, bool, String)> {
     let v = b.eval(
-        "[...document.querySelectorAll('main button')].filter(H.shown)
+        "[...document.querySelectorAll('main button:not([data-look])')].filter(H.shown)
            .filter((e) => e.getAttribute('role') !== 'tab')
            .map((e) => [e.innerText.trim(), !e.disabled, e.title ?? ''])",
     );
@@ -428,6 +429,13 @@ spec: { text: team-b's }
     assert_read_only(&mut v, "a Service");
     let (enabled, why) = v.button("Scale").expect("a Scale button");
     assert!(!enabled && why.contains("view"), "Scale: {why}");
+    // A task's shell is exec: the viewer may dock its logs, not a shell.
+    let (task, _) = c.task_of("hello").expect("a running hello task");
+    c.page(&mut v, &format!("/k/Task/team-a/{task}"));
+    v.shows("Dock shell", 30);
+    assert_read_only(&mut v, "a Task");
+    let (enabled, why) = v.button("Dock shell").expect("a Dock shell button");
+    assert!(!enabled && why.contains("view"), "Dock shell: {why}");
     drop(v);
     drop(e);
 
