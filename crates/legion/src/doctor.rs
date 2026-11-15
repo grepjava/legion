@@ -1,77 +1,73 @@
 //! `legion doctor`: whether this host can run Legion, and how to fix it.
 //! What it checks is shared with jailer in [`legion_sys::check`]; what those
-//! findings mean for Legion is here. It changes nothing on the host.
+//! findings mean for a node is in [`legion_agent::doctor`]; how they are
+//! said is here. It changes nothing on the host.
 
 use anyhow::Result;
+#[cfg(test)]
+use legion_agent::doctor::ready;
+use legion_agent::doctor::{Entry, Need, examine, verdict};
 use legion_sys::Sys;
-use legion_sys::check::{self, Finding, State};
-use serde::Serialize;
-
-/// What a finding that isn't met means for a node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum Need {
-    /// Legion can't do its work here.
-    Required,
-    /// Something is lost or Legion puts it right itself: the warning says so.
-    Advised,
-}
-
-#[derive(Debug, Serialize)]
-struct Entry {
-    need: Need,
-    #[serde(flatten)]
-    finding: Finding,
-}
-
-fn entry(need: Need, finding: Finding) -> Entry {
-    Entry { need, finding }
-}
-
-fn examine(sys: &dyn Sys, zfs_root: Option<&str>) -> Vec<Entry> {
-    use Need::{Advised, Required};
-    let mut found: Vec<_> = legion_agent::MODULES
-        .iter()
-        .map(|m| entry(Required, check::module(sys, m)))
-        .collect();
-    found.push(entry(
-        Required,
-        check::pf_anchors(sys, "legion/*", legion_net::lb::HOOKS),
-    ));
-    if let Some(root) = zfs_root {
-        found.push(entry(Required, check::zfs_root(sys, root)));
-    }
-    // Pods with limits go to other nodes; the agent sets the rest at start.
-    found.push(entry(Advised, check::racct(sys)));
-    found.push(entry(Advised, check::forwarding(sys)));
-    found.push(entry(Advised, check::bridge_filtering(sys)));
-    // Only for `--linux`.
-    found.extend(check::linux_abi(sys).into_iter().map(|f| entry(Advised, f)));
-    found
-}
-
-/// What can't be vouched for counts: a host is not ready because it went
-/// unread, so a run without root says to run it as root.
-fn ready(found: &[Entry]) -> bool {
-    found
-        .iter()
-        .all(|e| e.need != Need::Required || e.finding.state == State::Met)
-}
+use legion_sys::check::State;
 
 fn text(found: &[Entry]) -> String {
     let mut out = String::new();
     for e in found {
         let f = &e.finding;
-        let label = match (f.state, e.need) {
-            (State::Met, _) => "ok",
-            (State::Unknown, _) => "unknown",
-            (_, Need::Required) => "FAIL",
-            (State::Unsupported, Need::Advised) => "unsupported",
-            (State::Unmet, Need::Advised) => "warn",
+        out += &line(
+            label(f.state, e.need),
+            &f.id,
+            &f.detail,
+            f.remedy.as_deref().unwrap_or(""),
+        );
+    }
+    out
+}
+
+fn label(state: State, need: Need) -> &'static str {
+    match (state, need) {
+        (State::Met, _) => "ok",
+        (State::Unknown, _) => "unknown",
+        (_, Need::Required) => "FAIL",
+        (State::Unsupported, Need::Advised) => "unsupported",
+        (State::Unmet, Need::Advised) => "warn",
+    }
+}
+
+/// A finding's line, and its remedy's below it.
+fn line(label: &str, id: &str, detail: &str, remedy: &str) -> String {
+    let mut out = format!("{label:<12}{id:<20}{detail}\n");
+    if !remedy.is_empty() {
+        out += &format!("{:<32}fix: {remedy}\n", "");
+    }
+    out
+}
+
+/// `legion diagnose`: each node's findings, as `legion doctor` says them
+/// on the node itself.
+pub fn diagnosis(nodes: &[legion_proto::v1::NodeDiagnosis]) -> String {
+    let mut out = String::new();
+    for n in nodes {
+        let verdict = if !n.error.is_empty() {
+            n.error.as_str()
+        } else if n.ready {
+            "ready"
+        } else {
+            "NOT READY"
         };
-        out.push_str(&format!("{label:<12}{:<20}{}\n", f.id, f.detail));
-        if let Some(remedy) = &f.remedy {
-            out.push_str(&format!("{:<32}fix: {remedy}\n", ""));
+        out += &format!("{}: {verdict}\n", n.node);
+        for f in &n.findings {
+            // Labelled as `text` labels them, from the words the agent sent.
+            let word = |w: &str| serde_json::Value::String(w.to_owned());
+            let state = serde_json::from_value(word(&f.state));
+            let need = serde_json::from_value(word(&f.need));
+            let label = match (state, need) {
+                (Ok(state), Ok(need)) => label(state, need),
+                _ => "?",
+            };
+            out += "  ";
+            out += &line(label, &f.id, &f.detail, &f.remedy).replace('\n', "\n  ");
+            out.truncate(out.trim_end_matches(' ').len());
         }
     }
     out
@@ -87,19 +83,6 @@ pub fn run(sys: &dyn Sys, zfs_root: Option<&str>, json: bool) -> Result<()> {
     match verdict(&found) {
         Some(why) => anyhow::bail!(why),
         None => Ok(()),
-    }
-}
-
-/// Why this run can't call the host ready: a requirement that went unread
-/// says nothing against the host, and mustn't read as if it did.
-fn verdict(found: &[Entry]) -> Option<&'static str> {
-    let required = || found.iter().filter(|e| e.need == Need::Required);
-    if required().any(|e| matches!(e.finding.state, State::Unmet | State::Unsupported)) {
-        Some("this host lacks what Legion requires")
-    } else if !ready(found) {
-        Some("not everything could be checked: run it as root")
-    } else {
-        None
     }
 }
 
@@ -131,6 +114,43 @@ mod tests {
             .unwrap()
             .finding
             .state
+    }
+
+    #[test]
+    fn each_nodes_findings_are_said_as_on_the_node() {
+        use legion_proto::v1::{DoctorFinding, NodeDiagnosis};
+        let f = |id: &str, state: &str, need: &str, remedy: &str| DoctorFinding {
+            id: id.into(),
+            state: state.into(),
+            need: need.into(),
+            detail: format!("{id} detail"),
+            remedy: remedy.into(),
+        };
+        let nodes = [
+            NodeDiagnosis {
+                node: "n1".into(),
+                ready: false,
+                findings: vec![
+                    f("module.pf", "unmet", "required", "kldload pf"),
+                    f("racct", "unmet", "advised", ""),
+                    f("zfs.root", "met", "required", ""),
+                ],
+                ..Default::default()
+            },
+            NodeDiagnosis {
+                node: "n2".into(),
+                error: "not asked: the node is down".into(),
+                ..Default::default()
+            },
+        ];
+        let text = diagnosis(&nodes);
+        assert!(text.starts_with("n1: NOT READY\n"), "{text}");
+        assert!(text.contains("  FAIL        module.pf"), "{text}");
+        assert!(text.contains("fix: kldload pf"), "{text}");
+        assert!(text.contains("  warn        racct"), "{text}");
+        assert!(text.contains("  ok          zfs.root"), "{text}");
+        assert!(text.contains("n2: not asked: the node is down"), "{text}");
+        assert!(!text.contains("  \n"), "no blank indented lines: {text:?}");
     }
 
     #[test]

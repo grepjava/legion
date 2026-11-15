@@ -1042,6 +1042,36 @@ fn a_wide_character_at_the_shells_edge_leaves_the_border() {
 }
 
 #[test]
+fn a_service_is_stopped_when_asked_and_started_at_once() {
+    let mut m = cluster();
+    let mut v = View::default();
+    // Stopping is asked first.
+    assert_eq!(typed(&mut v, &m, "2o"), None);
+    assert!(screen(&m, &v).contains("Stop service shop/web?"));
+    assert_eq!(
+        typed(&mut v, &m, "y"),
+        Some(Request::Stop {
+            namespace: "shop".into(),
+            service: "web".into(),
+            stop: true
+        })
+    );
+    // Stopped, the row says so, and starting it again is not asked.
+    let mut stopped = service(9, 0, 0);
+    stopped.spec["stopped"] = true.into();
+    m.changed(true, stopped, 0);
+    assert!(screen(&m, &v).contains("stopped"));
+    assert_eq!(
+        typed(&mut v, &m, "o"),
+        Some(Request::Stop {
+            namespace: "shop".into(),
+            service: "web".into(),
+            stop: false
+        })
+    );
+}
+
+#[test]
 fn restart_run_now_events_and_alerts() {
     let m = cluster();
     let mut v = View::default();
@@ -1176,6 +1206,7 @@ fn bento_and_telemetry_presets_show_zfs_and_network() {
                 cpu_percent: 25.0,
                 memory_bytes: 64 << 20,
             }],
+            ..Default::default()
         }],
     });
     let mut v = View::default();

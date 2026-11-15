@@ -21,9 +21,11 @@ use legion_sys::Sys;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
+mod browse;
 mod build;
 pub use build::Builder;
 pub mod control;
+pub mod doctor;
 pub mod fake;
 mod files;
 mod image_ops;
@@ -230,6 +232,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             sys: self.ctx.sys.clone(),
             node: self.ctx.node.clone(),
             zfs_root: self.ctx.zfs_root.clone(),
+            build_root: self.builder.zfs_root(),
         }
     }
 
@@ -328,6 +331,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 sys: ctx.sys.clone(),
                 node: ctx.node.clone(),
                 zfs_root: ctx.zfs_root.clone(),
+                build_root: self.builder.zfs_root(),
             },
             self.usage_period,
         ));

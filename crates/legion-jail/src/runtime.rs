@@ -2055,6 +2055,59 @@ impl legion_runtime::Runtime for JailRuntime {
         self.images.remove(reference).await.map_err(image_error)
     }
 
+    async fn root(&self, id: &str) -> Result<Option<std::path::PathBuf>> {
+        let rec = self.record(id)?;
+        // A Linux VM's disk is not a directory of the host's.
+        Ok(rec.vm.is_none().then_some(rec.root))
+    }
+
+    async fn image_packages(&self, query: &str) -> Result<Option<Vec<(String, String)>>> {
+        let Some(img) = self.images.find(query).map_err(image_error)? else {
+            return Ok(None);
+        };
+        let images = self.images.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            images.with_files(&img, |root| {
+                // Without a package database there is nothing to list.
+                if !root.join("var/db/pkg/local.sqlite").exists() {
+                    return Ok(Vec::new());
+                }
+                let out = std::process::Command::new("pkg")
+                    .arg("-r")
+                    .arg(root)
+                    .args(["query", "%n\t%v"])
+                    .stdin(std::process::Stdio::null())
+                    .output()?;
+                if !out.status.success() {
+                    return Err(legion_image::Error::Unsupported(format!(
+                        "pkg query: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    )));
+                }
+                Ok(String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter_map(|l| l.split_once('\t'))
+                    .map(|(n, v)| (n.to_owned(), v.to_owned()))
+                    .collect())
+            })
+        })
+        .await
+        .map_err(|e| legion_runtime::Error::Failed(e.to_string()))?;
+        read.map(Some).map_err(image_error)
+    }
+
+    async fn image_details(&self, query: &str) -> Result<Option<legion_runtime::ImageDetails>> {
+        let Some(img) = self.images.find(query).map_err(image_error)? else {
+            return Ok(None);
+        };
+        let config = serde_json::to_string(&img.config)
+            .map_err(|e| legion_runtime::Error::Failed(format!("{query}: its config: {e}")))?;
+        Ok(Some(legion_runtime::ImageDetails {
+            config,
+            layer_sizes: img.layer_descriptors.iter().map(|d| d.size).collect(),
+        }))
+    }
+
     async fn prune_images(&self) -> Result<u64> {
         self.images
             .prune()

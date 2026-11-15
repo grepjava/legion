@@ -222,6 +222,13 @@ fn router(gateway: Gateway) -> axum::Router {
         .route("/api/image-load", post(image_load))
         .route("/api/registry/search", get(registry_search))
         .route("/api/registry/inspect", get(registry_inspect))
+        .route("/api/images/scan", get(image_scan))
+        .route("/api/diagnose", get(diagnose))
+        .route(
+            "/api/files/{namespace}/{task}",
+            get(files_read).post(files_write),
+        )
+        .route("/api/support-bundle", get(support_bundle))
         .fallback(page)
         .layer(axum::middleware::map_response_with_state(
             gateway.clone(),
@@ -1069,6 +1076,9 @@ async fn usage(
                 "net_rx_bps": n.net_rx_bps,
                 "net_tx_bps": n.net_tx_bps,
                 "volumes": volumes,
+                "images_bytes": n.images_bytes,
+                "jails_bytes": n.jails_bytes,
+                "build_bytes": n.build_bytes,
             })
         })
         .collect();
@@ -2393,6 +2403,280 @@ async fn store_backup(State(g): State<Gateway>, headers: HeaderMap) -> Result<Re
     Ok(download(&name, chunks(stream)))
 }
 
+#[derive(Deserialize)]
+struct FilesQuery {
+    path: String,
+    container: Option<String>,
+    /// `list` (the default) or `read`.
+    op: Option<String>,
+}
+
+/// A `files` session in a task's container, as its user: the frames to
+/// send it and its answer.
+async fn files_session(
+    channel: tonic::transport::Channel,
+    namespace: String,
+    task: String,
+    q: &FilesQuery,
+    op: &str,
+) -> Result<
+    (
+        tokio::sync::mpsc::Sender<pb::SessionFrame>,
+        tonic::Streaming<pb::SessionFrame>,
+    ),
+    Refused,
+> {
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let open = pb::SessionOpen {
+        namespace,
+        task,
+        container: q.container.clone().unwrap_or_default(),
+        action: Some(pb::session_open::Action::Files(pb::FilesOptions {
+            op: op.to_owned(),
+            path: q.path.clone(),
+        })),
+    };
+    tx.send(pb::SessionFrame {
+        frame: Some(pb::session_frame::Frame::Open(open)),
+    })
+    .await
+    .expect("the receiver is held");
+    let stream = pb::pods_client::PodsClient::new(channel)
+        .max_decoding_message_size(crate::MAX_MESSAGE)
+        .session(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await?
+        .into_inner();
+    Ok((tx, stream))
+}
+
+/// The next frame of a session's output, its end (`None`) or its failure.
+async fn next_out(
+    stream: &mut tonic::Streaming<pb::SessionFrame>,
+) -> Result<Option<Vec<u8>>, Refused> {
+    use pb::session_frame::Frame;
+    loop {
+        match stream.message().await? {
+            Some(pb::SessionFrame {
+                frame: Some(Frame::Stdout(d)),
+            }) => return Ok(Some(d)),
+            Some(pb::SessionFrame {
+                frame: Some(Frame::ExitCode(_)),
+            })
+            | None => return Ok(None),
+            Some(pb::SessionFrame {
+                frame: Some(Frame::Error(e)),
+            }) => {
+                let status = tonic::Status::new(tonic::Code::from_i32(e.code), e.message);
+                return Err(status.into());
+            }
+            Some(_) => continue,
+        }
+    }
+}
+
+/// `legion files`, `legion cp` out of a task: a directory of a task's
+/// container listed, `{entries}`, or a file of it downloaded (`op=read`).
+async fn files_read(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Path((namespace, task)): Path<(String, String)>,
+    Query(q): Query<FilesQuery>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let op = q.op.clone().unwrap_or_else(|| "list".to_owned());
+    match op.as_str() {
+        "list" => {
+            let (_tx, mut stream) = files_session(channel, namespace, task, &q, "list").await?;
+            let mut json = Vec::new();
+            while let Some(d) = next_out(&mut stream).await? {
+                json.extend(d);
+            }
+            let entries: serde_json::Value = serde_json::from_slice(&json)
+                .map_err(|e| Refused(StatusCode::BAD_GATEWAY, e.to_string()))?;
+            Ok(Json(serde_json::json!({ "entries": entries })).into_response())
+        }
+        "read" => {
+            let (tx, mut stream) = files_session(channel, namespace, task, &q, "read").await?;
+            // A file that cannot be read says so before the download starts.
+            let first = next_out(&mut stream).await?;
+            let name = q
+                .path
+                .rsplit('/')
+                .find(|p| !p.is_empty())
+                .unwrap_or("file")
+                .to_owned();
+            // The session's input is held open until its end.
+            let rest = futures::stream::unfold(Some((tx, stream, first)), |st| async move {
+                let (tx, mut stream, pending) = st?;
+                if let Some(d) = pending {
+                    return Some((Ok(bytes::Bytes::from(d)), Some((tx, stream, None))));
+                }
+                match next_out(&mut stream).await {
+                    Ok(Some(d)) => Some((Ok(bytes::Bytes::from(d)), Some((tx, stream, None)))),
+                    Ok(None) => None,
+                    Err(Refused(_, why)) => Some((Err(std::io::Error::other(why)), None)),
+                }
+            });
+            Ok(download(&name, rest))
+        }
+        other => Err(bad_request(format!(
+            "unknown files operation {other:?}: expected list or read"
+        ))),
+    }
+}
+
+/// `legion cp` into a task: the request's body written to `path` in the
+/// task's container, in place of what was there.
+async fn files_write(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path((namespace, task)): Path<(String, String)>,
+    Query(q): Query<FilesQuery>,
+    body: axum::body::Body,
+) -> Result<Response, Refused> {
+    use pb::session_frame::Frame;
+    use tokio_stream::StreamExt;
+    const CHUNK: usize = 1 << 20;
+    let channel = g.writer(&headers, &uri, None).await?;
+    let (tx, mut stream) = files_session(channel, namespace, task, &q, "write").await?;
+    let mut upload = body.into_data_stream();
+    let mut bytes = 0u64;
+    let feeding = async {
+        while let Some(chunk) = upload.next().await {
+            let chunk = chunk.map_err(|e| bad_request(format!("reading the upload: {e}")))?;
+            bytes += chunk.len() as u64;
+            for part in chunk.chunks(CHUNK) {
+                let input = pb::SessionFrame {
+                    frame: Some(Frame::Input(part.to_vec())),
+                };
+                if tx.send(input).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        let closed = pb::SessionFrame {
+            frame: Some(Frame::InputClosed(pb::InputClosed {})),
+        };
+        let _ = tx.send(closed).await;
+        Ok::<_, Refused>(())
+    };
+    // The node's answer says why, if it stopped taking the upload early.
+    let fed = feeding.await;
+    while next_out(&mut stream).await?.is_some() {}
+    fed?;
+    Ok(Json(serde_json::json!({ "path": q.path, "bytes": bytes })).into_response())
+}
+
+#[derive(Deserialize)]
+struct ScanQuery {
+    node: String,
+    image: String,
+}
+
+/// `legion images scan`: a node's cached image audited.
+async fn image_scan(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Query(q): Query<ScanQuery>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let r = ClusterClient::new(channel)
+        .scan_image(pb::ScanImageRequest {
+            node: q.node,
+            image: q.image,
+        })
+        .await?
+        .into_inner();
+    let packages: Vec<_> = r
+        .packages
+        .iter()
+        .map(|p| serde_json::json!({ "name": p.name, "version": p.version }))
+        .collect();
+    let vulnerable: Vec<_> = r
+        .vulnerable
+        .iter()
+        .map(|p| {
+            let issues: Vec<_> = p
+                .issues
+                .iter()
+                .map(|i| {
+                    serde_json::json!({
+                        "description": i.description, "cves": i.cves,
+                        "url": i.url, "affected": i.affected,
+                    })
+                })
+                .collect();
+            serde_json::json!({ "name": p.name, "version": p.version, "issues": issues })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "image": r.image,
+        "node": r.node,
+        "packages": packages,
+        "vulnerable": vulnerable,
+        "used_by": r.used_by,
+    }))
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct DiagnoseQuery {
+    node: Option<String>,
+}
+
+/// `legion diagnose`: what `legion doctor` finds on each node.
+async fn diagnose(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Query(q): Query<DiagnoseQuery>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let r = ClusterClient::new(channel)
+        .diagnose(pb::DiagnoseRequest {
+            node: q.node.unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+    let nodes: Vec<_> = r
+        .nodes
+        .iter()
+        .map(|n| {
+            let findings: Vec<_> = n
+                .findings
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "id": f.id, "state": f.state, "need": f.need,
+                        "detail": f.detail, "remedy": f.remedy,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "node": n.node, "error": n.error, "ready": n.ready, "findings": findings,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "nodes": nodes })).into_response())
+}
+
+/// `legion support-bundle`: the cluster as it stands, to send with a
+/// report of trouble, downloaded as a file.
+async fn support_bundle(State(g): State<Gateway>, headers: HeaderMap) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let r = ClusterClient::new(channel)
+        .max_decoding_message_size(crate::MAX_MESSAGE)
+        .support_bundle(pb::SupportBundleRequest {})
+        .await?
+        .into_inner();
+    let name = format!("legion-support-{}.json", crate::console::now_ms() / 1000);
+    let body = bytes::Bytes::from(r.json);
+    Ok(download(
+        &name,
+        tokio_stream::once(Ok::<_, std::io::Error>(body)),
+    ))
+}
+
 /// `legion volume backup`: a Volume's data, as `legion volume restore` and
 /// the console's restore take it: the header's line, then the data.
 async fn volume_backup(
@@ -2601,6 +2885,7 @@ async fn node_images_list(
                 "os": i.os,
                 "arch": i.arch,
                 "layers": i.layers,
+                "used_by": i.used_by,
             })
         })
         .collect();
@@ -2753,6 +3038,7 @@ async fn image_load(
                 "os": i.os,
                 "arch": i.arch,
                 "layers": i.layers,
+                "used_by": i.used_by,
             })
         })
         .collect();
@@ -2807,6 +3093,8 @@ struct RegistryInspectQuery {
     image: String,
     namespace: Option<String>,
     secret: Option<String>,
+    /// A node whose cached copy is read instead of the registry.
+    node: Option<String>,
 }
 
 /// `legion image inspect`: inspects a remote registry image (tags, platforms, digest, cosign).
@@ -2821,9 +3109,33 @@ async fn registry_inspect(
             image: q.image,
             namespace: q.namespace.unwrap_or_default(),
             secret: q.secret.unwrap_or_default(),
+            node: q.node.unwrap_or_default(),
         })
         .await?
         .into_inner();
+    let history: Vec<_> = r
+        .history
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "created": s.created,
+                "created_by": s.created_by,
+                "empty_layer": s.empty_layer,
+                "size": s.size,
+            })
+        })
+        .collect();
+    let run = r.run.as_ref().map(|c| {
+        serde_json::json!({
+            "entrypoint": c.entrypoint,
+            "cmd": c.cmd,
+            "env": c.env,
+            "user": c.user,
+            "working_dir": c.working_dir,
+            "exposed_ports": c.exposed_ports,
+            "labels": c.labels,
+        })
+    });
     let platforms: Vec<_> = r
         .platforms
         .iter()
@@ -2841,6 +3153,13 @@ async fn registry_inspect(
         "platforms": platforms,
         "tags": r.tags,
         "signed": r.signed,
+        "os": r.os,
+        "arch": r.arch,
+        "created": r.created,
+        "history": history,
+        "run": run,
+        "size": r.size,
+        "used_by": r.used_by,
     }))
     .into_response())
 }

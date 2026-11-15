@@ -30,6 +30,44 @@ struct Cluster {
     _dir: tempfile::TempDir,
 }
 
+/// A jailer that only writes its arguments down, a line a run, in
+/// `dir/jailer-args`.
+fn stand_in_jailer(dir: &std::path::Path) -> String {
+    let script = dir.join("jailer");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\necho \"$@\" >> {}/jailer-args\n", dir.display()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    script.display().to_string()
+}
+
+/// A pkg whose `audit` says nginx 1.27.0 is vulnerable, as pkg 2.8 says
+/// it (`--raw=json-compact`), and exits 1 as it does then.
+fn stand_in_pkg(dir: &std::path::Path) -> String {
+    let script = dir.join("pkg");
+    let json = r#"{"pkg_count":2,"packages":{"nginx":{"version":"1.27.0","issue_count":1,"issues":[{"Affected versions":["< 1.30.1,3"],"description":"www/nginx -- Remote Code Execution/DoS","cve":["CVE-2026-42926"],"url":"https://vuxml.FreeBSD.org/freebsd/3414ac89.html"}]},"pcre2":{"version":"10.45","issue_count":0,"issues":[]}}}"#;
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {}/pkg-args\necho '{json}'\nexit 1\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    script.display().to_string()
+}
+
 impl Cluster {
     async fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -48,6 +86,8 @@ impl Cluster {
         config.zfs_root = Some("tank/legion".into());
         config.infra_image = INFRA.into();
         config.resync = Duration::from_millis(100);
+        config.builder.jailer = vec![stand_in_jailer(dir.path())];
+        config.builder.pkg = vec![stand_in_pkg(dir.path())];
         let control = GrpcControl::new("n1", vec![addr.clone()], None).unwrap();
         let endpoints = legion_agent::Control::endpoints(&control);
         let agent = Agent::new(
@@ -632,12 +672,47 @@ spec:
         .await
         .unwrap()
         .into_inner();
-    assert!(
-        inv.images
-            .iter()
-            .any(|i| i.node == "n1" && i.reference == "db:1"),
-        "{inv:?}"
+    let db = inv
+        .images
+        .iter()
+        .find(|i| i.node == "n1" && i.reference == "db:1")
+        .unwrap_or_else(|| panic!("{inv:?}"));
+    assert_eq!(db.used_by, ["Service shop/db"], "{db:?}");
+
+    // Its details, from the node's copy: how it was built and runs.
+    let d = cluster
+        .inspect_registry_image(legion_proto::v1::InspectRegistryImageRequest {
+            image: "db:1".into(),
+            node: "n1".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let steps: Vec<_> = d
+        .history
+        .iter()
+        .map(|s| (s.created_by.as_str(), s.size))
+        .collect();
+    assert_eq!(
+        steps,
+        [("FROM freebsd-runtime", 4096), ("CMD [\"serve\"]", 0)],
+        "{d:?}"
     );
+    assert_eq!(d.run.as_ref().map(|r| r.user.as_str()), Some("www"));
+    assert_eq!(
+        (d.size, d.used_by.as_slice()),
+        (4096, &["Service shop/db".to_owned()][..])
+    );
+    let missing = cluster
+        .inspect_registry_image(legion_proto::v1::InspectRegistryImageRequest {
+            image: "nothere:1".into(),
+            node: "n1".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound, "{missing:?}");
 
     let mut stream = cluster
         .export_image(ExportImageRequest {
@@ -723,6 +798,273 @@ spec:
         .await
         .unwrap()
         .into_inner();
+
+    // jailer's build store: on a node named, `jailer prune` there; on every
+    // builder, none of which there is.
+    cluster
+        .node_images(NodeImagesRequest {
+            node: "n1".into(),
+            op: "prune-builds".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let ran = std::fs::read_to_string(c._dir.path().join("jailer-args")).unwrap();
+    assert_eq!(ran.trim(), "prune");
+    let none = cluster
+        .node_images(NodeImagesRequest {
+            op: "prune-builds".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(none.code(), tonic::Code::FailedPrecondition, "{none:?}");
+    assert!(none.message().contains("legion.builder=true"), "{none:?}");
+
+    c.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_nodes_are_diagnosed_and_a_support_bundle_keeps_secrets_out() {
+    use legion_proto::v1::{DiagnoseRequest, SupportBundleRequest};
+
+    let c = Cluster::start().await;
+    c.rt.add_image("web:1");
+    c.apply("apiVersion: legion/v1\nkind: Namespace\nmetadata: { name: shop }\n")
+        .await;
+    c.apply(
+        "apiVersion: legion/v1\nkind: Secret\nmetadata: { name: db, namespace: shop }\nspec: { text: s3cr3t-in-a-secret }\n",
+    )
+    .await;
+    c.apply(
+        r#"
+apiVersion: legion/v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  replicas: 1
+  pod:
+    containers:
+      - name: web
+        image: "web:1"
+        env:
+          - { name: API_TOKEN, value: s3cr3t-in-env }
+          - { name: DB, secret: db }
+"#,
+    )
+    .await;
+    eventually("web running", async || {
+        c.tasks().await == ["web-1-1 running"]
+    })
+    .await;
+
+    let mut cluster = ClusterClient::new(c.channel.clone());
+    let nodes = cluster
+        .diagnose(DiagnoseRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .nodes;
+    assert_eq!(nodes.len(), 1, "{nodes:?}");
+    let n1 = &nodes[0];
+    assert_eq!((n1.node.as_str(), n1.error.as_str()), ("n1", ""), "{n1:?}");
+    // What `legion doctor` checks, each with its state and need.
+    let pf = n1.findings.iter().find(|f| f.id == "module.pf");
+    let pf = pf.unwrap_or_else(|| panic!("{n1:?}"));
+    assert_eq!(pf.need, "required");
+    assert!(!pf.state.is_empty());
+    let missing = cluster
+        .diagnose(DiagnoseRequest { node: "n9".into() })
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+
+    let bundle = cluster
+        .support_bundle(SupportBundleRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .json;
+    let text = String::from_utf8(bundle).unwrap();
+    assert!(!text.contains("s3cr3t-in-a-secret"), "a Secret's text");
+    assert!(!text.contains("s3cr3t-in-env"), "an env value");
+    let b: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(b["objects"].get("Secret").is_none(), "Secrets are left out");
+    let web = b["objects"]["Service"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["metadata"]["name"] == "web")
+        .unwrap();
+    // The environment's names stay, to say how it runs.
+    assert_eq!(
+        web["spec"]["pod"]["containers"][0]["env"][0]["name"],
+        "API_TOKEN"
+    );
+    assert!(
+        b["objects"]["Task"]
+            .as_array()
+            .is_some_and(|t| !t.is_empty())
+    );
+    assert_eq!(b["diagnosis"][0]["node"], "n1");
+    assert!(
+        b["events"].as_array().is_some_and(|e| !e.is_empty()),
+        "{}",
+        b["events"]
+    );
+
+    c.stop().await;
+}
+
+/// A `files` session's output, or its error, through the manager.
+async fn files_session(
+    c: &Cluster,
+    task: &str,
+    op: &str,
+    path: &str,
+    input: Option<&[u8]>,
+) -> Result<Vec<u8>, tonic::Status> {
+    use legion_proto::v1::pods_client::PodsClient;
+    use legion_proto::v1::session_frame::Frame;
+    use legion_proto::v1::session_open::Action;
+    use legion_proto::v1::{FilesOptions, InputClosed, SessionFrame, SessionOpen};
+    let frame = |f| SessionFrame { frame: Some(f) };
+    let mut frames = vec![frame(Frame::Open(SessionOpen {
+        namespace: "shop".into(),
+        task: task.into(),
+        action: Some(Action::Files(FilesOptions {
+            op: op.into(),
+            path: path.into(),
+        })),
+        ..Default::default()
+    }))];
+    if let Some(data) = input {
+        frames.push(frame(Frame::Input(data.to_vec())));
+        frames.push(frame(Frame::InputClosed(InputClosed {})));
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    for f in frames {
+        tx.send(f).await.unwrap();
+    }
+    let mut out = PodsClient::new(c.channel.clone())
+        .session(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await?
+        .into_inner();
+    let mut got = Vec::new();
+    while let Some(f) = out.message().await? {
+        match f.frame {
+            Some(Frame::Stdout(d)) => got.extend(d),
+            Some(Frame::ExitCode(_)) => break,
+            Some(Frame::Error(e)) => {
+                return Err(tonic::Status::new(tonic::Code::from_i32(e.code), e.message));
+            }
+            _ => {}
+        }
+    }
+    drop(tx);
+    Ok(got)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tasks_files_are_listed_read_and_written() {
+    let c = Cluster::start().await;
+    let roots = tempfile::tempdir().unwrap();
+    c.rt.roots_in(roots.path());
+    c.rt.add_image("web:1");
+    c.apply("apiVersion: legion/v1\nkind: Namespace\nmetadata: { name: shop }\n")
+        .await;
+    c.apply(
+        "apiVersion: legion/v1\nkind: Service\nmetadata: { name: web, namespace: shop }\n\
+         spec: { replicas: 1, pod: { containers: [{ name: web, image: \"web:1\" }] } }\n",
+    )
+    .await;
+    eventually("web running", async || {
+        c.tasks().await == ["web-1-1 running"]
+    })
+    .await;
+
+    // Written, then listed and read back, through the manager.
+    let wrote = files_session(&c, "web-1-1", "write", "/index.html", Some(b"<h1>hi</h1>")).await;
+    assert_eq!(wrote.unwrap(), b"");
+    let listed = files_session(&c, "web-1-1", "list", "/", None)
+        .await
+        .unwrap();
+    let entries: serde_json::Value = serde_json::from_slice(&listed).unwrap();
+    let index = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "index.html")
+        .unwrap_or_else(|| panic!("{entries}"));
+    assert_eq!(
+        (index["kind"].as_str(), index["size"].as_u64()),
+        (Some("file"), Some(11))
+    );
+    let read = files_session(&c, "web-1-1", "read", "/index.html", None).await;
+    assert_eq!(read.unwrap(), b"<h1>hi</h1>");
+
+    // What is not there, and a path out of the root, are refused.
+    let missing = files_session(&c, "web-1-1", "read", "/nothere", None).await;
+    assert_eq!(missing.unwrap_err().code(), tonic::Code::NotFound);
+    let out = files_session(&c, "web-1-1", "list", "/../..", None).await;
+    assert_eq!(out.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    c.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cached_image_is_scanned_and_what_runs_it_named() {
+    use legion_proto::v1::ScanImageRequest;
+
+    let c = Cluster::start().await;
+    c.rt.add_image("web:1");
+    c.apply("apiVersion: legion/v1\nkind: Namespace\nmetadata: { name: shop }\n")
+        .await;
+    c.apply(
+        "apiVersion: legion/v1\nkind: Service\nmetadata: { name: web, namespace: shop }\n\
+         spec: { replicas: 1, pod: { containers: [{ name: web, image: \"web:1\" }] } }\n",
+    )
+    .await;
+    eventually("web running", async || {
+        c.tasks().await == ["web-1-1 running"]
+    })
+    .await;
+
+    let mut cluster = ClusterClient::new(c.channel.clone());
+    let r = cluster
+        .scan_image(ScanImageRequest {
+            node: "n1".into(),
+            image: "web:1".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let packages: Vec<_> = r
+        .packages
+        .iter()
+        .map(|p| format!("{}-{}", p.name, p.version))
+        .collect();
+    assert_eq!(packages, ["nginx-1.27.0", "pcre2-10.45"]);
+    assert_eq!(r.vulnerable.len(), 1, "{r:?}");
+    assert_eq!(r.vulnerable[0].name, "nginx");
+    assert_eq!(r.vulnerable[0].issues[0].cves, ["CVE-2026-42926"]);
+    assert_eq!(r.used_by, ["Service shop/web"]);
+    // pkg was asked of the image's packages, by name and version.
+    let asked = std::fs::read_to_string(c._dir.path().join("pkg-args")).unwrap();
+    assert!(asked.contains("audit"), "{asked}");
+    assert!(
+        asked.contains("--raw=json-compact nginx-1.27.0 pcre2-10.45"),
+        "{asked}"
+    );
+
+    let missing = cluster
+        .scan_image(ScanImageRequest {
+            node: "n1".into(),
+            image: "nothere:1".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
 
     c.stop().await;
 }

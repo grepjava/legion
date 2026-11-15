@@ -152,6 +152,35 @@ pub trait Runtime: Send + Sync + 'static {
         }
     }
 
+    /// The host's path to container `id`'s root file system, its Volumes'
+    /// mounts in it; `None` where its files cannot be reached so.
+    fn root(&self, id: &str) -> impl Future<Output = Result<Option<std::path::PathBuf>>> + Send {
+        let _ = id;
+        async { Ok(None) }
+    }
+
+    /// The FreeBSD packages local image `query` holds, as `name`, `version`
+    /// (what `pkg query` says of its files); `None` when the store has no
+    /// such image, empty when it has no package database.
+    fn image_packages(
+        &self,
+        query: &str,
+    ) -> impl Future<Output = Result<Option<Vec<(String, String)>>>> + Send {
+        let _ = query;
+        async { Ok(None) }
+    }
+
+    /// What local image `query` is: its config, as JSON, and its layers'
+    /// compressed sizes where the store keeps them. `None` when the store
+    /// has no such image.
+    fn image_details(
+        &self,
+        query: &str,
+    ) -> impl Future<Output = Result<Option<ImageDetails>>> + Send {
+        let _ = query;
+        async { Ok(None) }
+    }
+
     /// Loads an OCI/Docker `.tar` archive at `archive` into the node's store.
     fn load_image(
         &self,
@@ -161,6 +190,16 @@ pub trait Runtime: Send + Sync + 'static {
         let _ = (archive, reference);
         async { Err(Error::Failed("loading images is not supported".to_owned())) }
     }
+}
+
+/// A local image's config and layer sizes, for showing how it was built.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImageDetails {
+    /// The image config, as JSON.
+    pub config: String,
+    /// The compressed layers' sizes, bottom first; empty where the store
+    /// keeps no blobs.
+    pub layer_sizes: Vec<u64>,
 }
 
 /// An image held in a node's local image store.

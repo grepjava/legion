@@ -548,6 +548,35 @@ impl Client {
         }
     }
 
+    /// The manifest [`Client::manifest`] chooses, its digest, and the image
+    /// config it names.
+    pub async fn config(
+        &self,
+        r: &Reference,
+        creds: Option<&Credentials>,
+        oses: &[&str],
+    ) -> Result<(String, Manifest, ImageConfig), Error> {
+        let (digest, manifest) = self.manifest(r, creds, oses).await?;
+        if manifest.config.size > MAX_MANIFEST as u64 {
+            return Err(Error::Registry(format!(
+                "{r}: an image config over {} MiB",
+                MAX_MANIFEST >> 20
+            )));
+        }
+        let tmp = tempfile::NamedTempFile::new()?;
+        self.blob(
+            r,
+            &manifest.config.digest,
+            manifest.config.size,
+            tmp.path(),
+            creds,
+        )
+        .await?;
+        let config: ImageConfig = serde_json::from_slice(&std::fs::read(tmp.path())?)
+            .map_err(|e| Error::Unsupported(format!("{r}: the image config: {e}")))?;
+        Ok((digest, manifest, config))
+    }
+
     /// The manifest or index `target` names in `r`'s repository, and its
     /// digest.
     pub async fn document(

@@ -21,6 +21,7 @@ pub mod console;
 mod gateway;
 pub use gateway::Console;
 pub mod controller;
+mod diagnostics;
 mod dispatcher;
 mod events;
 #[cfg(feature = "test-hooks")]

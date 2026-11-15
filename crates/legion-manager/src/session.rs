@@ -202,7 +202,8 @@ impl Pods for PodsService {
         check_namespace(&open.namespace)?;
         let verb = match open.action {
             Some(Action::Logs(_)) => Verb::Read,
-            Some(Action::Exec(_) | Action::Port(_)) => Verb::Write,
+            // Reading a task's files is as much as a shell in it.
+            Some(Action::Exec(_) | Action::Port(_) | Action::Files(_)) => Verb::Write,
             Some(Action::VolumeSend(_) | Action::VolumeReceive(_) | Action::VolumeDrop(_)) => {
                 return Err(Status::invalid_argument(
                     "volumes move between nodes only when the managers move them",
@@ -228,11 +229,17 @@ impl Pods for PodsService {
                     "node image actions go through Cluster.NodeImages",
                 ));
             }
+            Some(Action::Doctor(_)) => {
+                return Err(Status::invalid_argument(
+                    "a node's diagnosis goes through Cluster.Diagnose",
+                ));
+            }
             None => return Err(Status::invalid_argument("the session needs an action")),
         };
         let action = match open.action {
             Some(Action::Logs(_)) => "logs",
             Some(Action::Port(_)) => "port-forward",
+            Some(Action::Files(_)) => "files",
             _ => "exec",
         };
         let target = crate::audit::target("Task", &open.namespace, &open.task);

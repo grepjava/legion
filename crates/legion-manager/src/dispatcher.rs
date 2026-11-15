@@ -1315,6 +1315,9 @@ impl Dispatcher for DispatcherService {
             self.api.usage.record_node(
                 &node,
                 legion_api::dispatch::NodeTelemetry {
+                    images_bytes: t.images_bytes,
+                    jails_bytes: t.jails_bytes,
+                    build_bytes: t.build_bytes,
                     zfs_used_bytes: t.zfs_used_bytes,
                     zfs_avail_bytes: t.zfs_avail_bytes,
                     net_rx_bps: t.net_rx_bps,

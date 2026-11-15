@@ -2,7 +2,7 @@
 
 use std::future::Future;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -526,6 +526,66 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
         Command::Image { command } => {
             run_image_command(&mut cluster, command).await?;
         }
+        Command::Diagnose { node, json } => {
+            let nodes = cluster
+                .diagnose(pb::DiagnoseRequest {
+                    node: node.unwrap_or_default(),
+                })
+                .await?
+                .into_inner()
+                .nodes;
+            if json {
+                let said: Vec<_> = nodes
+                    .iter()
+                    .map(|n| {
+                        let findings: Vec<_> = n
+                            .findings
+                            .iter()
+                            .map(|f| {
+                                serde_json::json!({
+                                    "id": f.id, "state": f.state, "need": f.need,
+                                    "detail": f.detail, "remedy": f.remedy,
+                                })
+                            })
+                            .collect();
+                        serde_json::json!({
+                            "node": n.node, "error": n.error, "ready": n.ready,
+                            "findings": findings,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&said)?);
+            } else {
+                print!("{}", crate::doctor::diagnosis(&nodes));
+            }
+            let short: Vec<_> = nodes
+                .iter()
+                .filter(|n| !n.ready)
+                .map(|n| n.node.as_str())
+                .collect();
+            if !short.is_empty() {
+                anyhow::bail!("not ready: {}", short.join(", "));
+            }
+        }
+        Command::SupportBundle { output } => {
+            let json = cluster
+                .support_bundle(pb::SupportBundleRequest {})
+                .await?
+                .into_inner()
+                .json;
+            let path = output.unwrap_or_else(|| {
+                let at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                PathBuf::from(format!("legion-support-{at}.json"))
+            });
+            std::fs::write(&path, &json).with_context(|| format!("writing {}", path.display()))?;
+            println!(
+                "{} written ({} bytes): read it before sending it",
+                path.display(),
+                json.len()
+            );
+        }
         Command::Logs {
             task,
             namespace,
@@ -571,6 +631,50 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 eprintln!("not searched: {u}");
             }
         }
+        Command::Files {
+            task,
+            path,
+            namespace,
+            container,
+        } => {
+            let target = target(task, namespace, container);
+            let entries = crate::session::list_files(&channel, &target, &path).await?;
+            print!("{}", files_table(&entries));
+        }
+        Command::Cp {
+            from,
+            to,
+            namespace,
+            container,
+        } => match (remote(&from), remote(&to)) {
+            (Some((task, path)), None) => {
+                let target = target(task.to_owned(), namespace, container);
+                let n = if to == "-" {
+                    crate::session::download(&channel, &target, path, &mut std::io::stdout().lock())
+                        .await?
+                } else {
+                    let mut file =
+                        std::fs::File::create(&to).with_context(|| format!("creating {to}"))?;
+                    crate::session::download(&channel, &target, path, &mut file).await?
+                };
+                if to != "-" {
+                    eprintln!("{n} bytes copied to {to}");
+                }
+            }
+            (None, Some((task, path))) => {
+                let target = target(task.to_owned(), namespace, container);
+                let n = if from == "-" {
+                    crate::session::upload(&channel, &target, path, tokio::io::stdin()).await?
+                } else {
+                    let file = tokio::fs::File::open(&from)
+                        .await
+                        .with_context(|| format!("opening {from}"))?;
+                    crate::session::upload(&channel, &target, path, file).await?
+                };
+                eprintln!("{n} bytes copied to {to}");
+            }
+            _ => bail!("one side, and only one, is a task's: TASK:PATH"),
+        },
         Command::Exec {
             task,
             namespace,
@@ -873,6 +977,12 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             .await
             .map_err(|s| anyhow::anyhow!("{}", s.message()))?;
             println!("{done}");
+        }
+        Command::Stop { service, namespace } => {
+            println!("{}", stop(&mut objects, namespace, service, true).await?);
+        }
+        Command::Start { service, namespace } => {
+            println!("{}", stop(&mut objects, namespace, service, false).await?);
         }
         Command::Cronjob {
             command: crate::CronJobCommand::Run { cronjob, namespace },
@@ -1215,8 +1325,95 @@ async fn stack(objects: &mut Objects, command: StackCommand) -> anyhow::Result<(
                 delete(objects, &o).await?;
             }
         }
+        StackCommand::Ls { namespace } => {
+            let resp = objects
+                .list(ListRequest {
+                    kind: Kind::Service.to_string(),
+                    namespace: namespace.unwrap_or_default(),
+                    ..Default::default()
+                })
+                .await?
+                .into_inner();
+            let services = resp
+                .objects
+                .into_iter()
+                .map(Object::try_from)
+                .collect::<Result<Vec<_>, _>>()?;
+            print_table(
+                ["NAMESPACE", "STACK", "SERVICES", "READY", "STATE"],
+                &stacks(&services),
+            );
+        }
+        StackCommand::Stop { stack, namespace } => {
+            stop_stack(objects, stack, namespace, true).await?
+        }
+        StackCommand::Start { stack, namespace } => {
+            stop_stack(objects, stack, namespace, false).await?
+        }
     }
     Ok(())
+}
+
+/// `legion stack stop` (`stop`) or `start`: each of the stack's services.
+async fn stop_stack(
+    objects: &mut Objects,
+    stack: String,
+    namespace: Option<String>,
+    stop_it: bool,
+) -> anyhow::Result<()> {
+    let namespace = namespace.unwrap_or_else(|| stack.clone());
+    let services = stack_objects(objects, &stack, &namespace, &[Kind::Service]).await?;
+    if services.is_empty() {
+        bail!("no stack {stack} in namespace {namespace}");
+    }
+    for s in services {
+        let said = stop(
+            objects,
+            Some(namespace.clone()),
+            s.metadata.name.clone(),
+            stop_it,
+        )
+        .await?;
+        println!("{said}");
+    }
+    Ok(())
+}
+
+/// The stacks among `services`, a row each: namespace, stack, its
+/// services, ready of desired tasks, and `stopped`, `running` or `partly
+/// stopped`.
+fn stacks(services: &[Object]) -> Vec<[String; 5]> {
+    let mut by: std::collections::BTreeMap<(String, String), Vec<&Object>> = Default::default();
+    for s in services {
+        if let Some(stack) = s.metadata.labels.get(legion_api::compose::LABEL_STACK) {
+            by.entry((s.metadata.namespace.clone(), stack.clone()))
+                .or_default()
+                .push(s);
+        }
+    }
+    by.into_iter()
+        .map(|((ns, stack), list)| {
+            let n = |o: &Object, k: &str| o.status[k].as_u64().unwrap_or(0);
+            let ready: u64 = list.iter().map(|o| n(o, "ready")).sum();
+            let desired: u64 = list.iter().map(|o| n(o, "desired")).sum();
+            let stopped = list
+                .iter()
+                .filter(|o| o.spec["stopped"].as_bool() == Some(true))
+                .count();
+            let state = match stopped {
+                0 => "running",
+                s if s == list.len() => "stopped",
+                _ => "partly stopped",
+            };
+            [
+                ns,
+                stack,
+                list.len().to_string(),
+                format!("{ready}/{desired}"),
+                state.to_owned(),
+            ]
+        })
+        .collect()
 }
 
 /// `stack convert`: the objects as Legion YAML documents.
@@ -2198,16 +2395,58 @@ async fn run_image_command(
                 .into_inner();
             println!("removed {image} ({} node(s))", r.removed);
         }
-        crate::ImageCommand::Prune { node } => {
+        crate::ImageCommand::Prune { node, builds } => {
             let r = cluster
                 .node_images(pb::NodeImagesRequest {
-                    op: "prune".to_owned(),
+                    op: if builds { "prune-builds" } else { "prune" }.to_owned(),
                     node: node.unwrap_or_default(),
                     ..Default::default()
                 })
                 .await?
                 .into_inner();
-            println!("pruned {} unused layer(s)", r.removed);
+            if builds {
+                println!("pruned the build store");
+            } else {
+                println!("pruned {} unused layer(s)", r.removed);
+            }
+        }
+        crate::ImageCommand::Scan { image, node, json } => {
+            let r = cluster
+                .scan_image(pb::ScanImageRequest { node, image })
+                .await?
+                .into_inner();
+            if json {
+                let issues = |p: &pb::VulnerablePackage| -> Vec<serde_json::Value> {
+                    p.issues
+                        .iter()
+                        .map(|i| {
+                            serde_json::json!({
+                                "description": i.description, "cves": i.cves,
+                                "url": i.url, "affected": i.affected,
+                            })
+                        })
+                        .collect()
+                };
+                let said = serde_json::json!({
+                    "image": r.image,
+                    "node": r.node,
+                    "packages": r.packages.iter()
+                        .map(|p| serde_json::json!({ "name": p.name, "version": p.version }))
+                        .collect::<Vec<_>>(),
+                    "vulnerable": r.vulnerable.iter()
+                        .map(|p| serde_json::json!({
+                            "name": p.name, "version": p.version, "issues": issues(p),
+                        }))
+                        .collect::<Vec<_>>(),
+                    "used_by": r.used_by,
+                });
+                println!("{}", serde_json::to_string_pretty(&said)?);
+            } else {
+                print!("{}", scan_text(&r));
+            }
+            if !r.vulnerable.is_empty() {
+                bail!("{} vulnerable package(s)", r.vulnerable.len());
+            }
         }
         crate::ImageCommand::Export {
             image,
@@ -2265,12 +2504,14 @@ async fn run_image_command(
             image,
             namespace,
             secret,
+            node,
         } => {
             let r = cluster
                 .inspect_registry_image(pb::InspectRegistryImageRequest {
                     image,
                     namespace: namespace.unwrap_or_default(),
                     secret: secret.unwrap_or_default(),
+                    node: node.unwrap_or_default(),
                 })
                 .await?
                 .into_inner();
@@ -2291,14 +2532,221 @@ async fn run_image_command(
             if !r.tags.is_empty() {
                 println!("Tags:      {}", r.tags.join(", "));
             }
+            print!("{}", image_details(&r));
         }
     }
     Ok(())
 }
 
+/// What `legion images scan` says of an image.
+fn scan_text(r: &pb::ScanImageResponse) -> String {
+    let mut out = format!("{} on {}: ", r.image, r.node);
+    if r.packages.is_empty() {
+        out += "no FreeBSD package database: nothing to audit\n";
+    } else if r.vulnerable.is_empty() {
+        out += &format!(
+            "{} packages, none with a known vulnerability\n",
+            r.packages.len()
+        );
+    } else {
+        out += &format!(
+            "{} packages, {} with known vulnerabilities\n",
+            r.packages.len(),
+            r.vulnerable.len()
+        );
+        for p in &r.vulnerable {
+            out += &format!("\n{}-{}\n", p.name, p.version);
+            for i in &p.issues {
+                out += &format!("  {}\n", i.description);
+                if !i.cves.is_empty() {
+                    out += &format!("    {}\n", i.cves.join(" "));
+                }
+                if !i.url.is_empty() {
+                    out += &format!("    {}\n", i.url);
+                }
+            }
+        }
+    }
+    if !r.used_by.is_empty() {
+        out += &format!("\nUsed by: {}\n", r.used_by.join(", "));
+    }
+    out
+}
+
+/// `TASK:PATH`, a task's file, or `None` for a local path. A drive's
+/// letter (`C:\x`) and a path with a separator before the colon are local.
+fn remote(arg: &str) -> Option<(&str, &str)> {
+    let (task, path) = arg.split_once(':')?;
+    let local = task.len() < 2 || task.contains(['/', '\\']);
+    (!local).then_some((task, path))
+}
+
+/// A listing as `ls -l` would show it, near enough.
+fn files_table(entries: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    for e in entries {
+        let s = |k: &str| e[k].as_str().unwrap_or_default().to_owned();
+        let kind = match s("kind").as_str() {
+            "dir" => 'd',
+            "link" => 'l',
+            "file" => '-',
+            _ => '?',
+        };
+        let name = match s("kind").as_str() {
+            "dir" => format!("{}/", s("name")),
+            "link" => format!("{} -> {}", s("name"), s("target")),
+            _ => s("name"),
+        };
+        out += &format!(
+            "{kind}{:>5} {:>10}  {name}\n",
+            s("mode"),
+            e["size"].as_u64().unwrap_or(0)
+        );
+    }
+    out
+}
+
+/// `legion stop` (`stop`) or `legion start`: the service's `stopped` set;
+/// what was done, for the user.
+async fn stop(
+    objects: &mut Objects,
+    namespace: Option<String>,
+    service: String,
+    stop: bool,
+) -> anyhow::Result<String> {
+    let (key, changed) = legion_manager::actions::set_spec(
+        objects,
+        pb::ObjectRef {
+            kind: "Service".into(),
+            namespace: namespace.unwrap_or_default(),
+            name: service,
+        },
+        "stopped",
+        stop.into(),
+    )
+    .await
+    .map_err(|s| anyhow::anyhow!("{}", s.message()))?;
+    let state = if stop { "stopped" } else { "started" };
+    Ok(if changed {
+        format!("{key} {state}")
+    } else {
+        format!("{key} was already {state}")
+    })
+}
+
+/// How an image was built and runs, and what uses it, as `legion images
+/// inspect` shows it.
+fn image_details(r: &pb::InspectRegistryImageResponse) -> String {
+    let mut out = String::new();
+    let mut line = |name: &str, v: &str| {
+        if !v.is_empty() {
+            out += &format!("{name:<11}{v}\n");
+        }
+    };
+    if !r.os.is_empty() {
+        line("Runs on:", &format!("{}/{}", r.os, r.arch));
+    }
+    if r.size > 0 {
+        line(
+            "Size:",
+            &format!("{} (compressed)", crate::top::bytes(r.size)),
+        );
+    }
+    if let Some(run) = &r.run {
+        line("Entrypoint:", &run.entrypoint.join(" "));
+        line("Command:", &run.cmd.join(" "));
+        line("User:", &run.user);
+        line("Directory:", &run.working_dir);
+        line("Ports:", &run.exposed_ports.join(", "));
+    }
+    if r.used_by.is_empty() {
+        line("Used by:", "nothing you can see");
+    } else {
+        line("Used by:", &r.used_by.join(", "));
+    }
+    if !r.history.is_empty() {
+        out += "\nHistory, first step first:\n";
+        for s in &r.history {
+            let added = if s.empty_layer {
+                "-".to_owned()
+            } else if s.size > 0 {
+                crate::top::bytes(s.size)
+            } else {
+                "?".to_owned()
+            };
+            out += &format!("  {added:>9}  {}\n", s.created_by.trim());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stack_is_its_labelled_services_together() {
+        let service = |ns: &str, name: &str, stack: Option<&str>, stopped: bool, ready: u64| {
+            let mut o = Object::new(
+                Kind::Service,
+                ns,
+                name,
+                serde_json::json!({ "stopped": stopped }),
+            );
+            if let Some(stack) = stack {
+                o.metadata
+                    .labels
+                    .insert(legion_api::compose::LABEL_STACK.into(), stack.into());
+            }
+            o.status =
+                serde_json::json!({ "ready": ready, "desired": if stopped { 0 } else { 2 } });
+            o
+        };
+        let rows = stacks(&[
+            service("shop", "web", Some("shop"), false, 2),
+            service("shop", "db", Some("shop"), false, 1),
+            service("blog", "app", Some("blog"), true, 0),
+            service("blog", "loose", None, false, 2),
+            service("mixed", "a", Some("mixed"), true, 0),
+            service("mixed", "b", Some("mixed"), false, 2),
+        ]);
+        let row = |r: &[String; 5]| r.join(" ");
+        let rows: Vec<_> = rows.iter().map(row).collect();
+        assert_eq!(
+            rows,
+            [
+                "blog blog 1 0/0 stopped",
+                "mixed mixed 2 2/2 partly stopped",
+                "shop shop 2 3/4 running",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tasks_file_is_told_from_a_local_one() {
+        assert_eq!(
+            remote("web-1-1:/etc/rc.conf"),
+            Some(("web-1-1", "/etc/rc.conf"))
+        );
+        assert_eq!(remote("./rc.conf"), None);
+        assert_eq!(remote(r"C:\Users\me\rc.conf"), None);
+        assert_eq!(remote("dir/x:y"), None);
+        assert_eq!(remote("-"), None);
+    }
+
+    #[test]
+    fn a_listing_reads_as_ls_does() {
+        let entries = vec![
+            serde_json::json!({ "name": "etc", "kind": "dir", "size": 512, "mode": "755" }),
+            serde_json::json!({ "name": "rc.conf", "kind": "file", "size": 20, "mode": "644" }),
+            serde_json::json!({ "name": "lib", "kind": "link", "size": 7, "mode": "777", "target": "usr/lib" }),
+        ];
+        let t = files_table(&entries);
+        let lines: Vec<_> = t.lines().collect();
+        assert_eq!(lines[0], "d  755        512  etc/");
+        assert_eq!(lines[1], "-  644         20  rc.conf");
+        assert_eq!(lines[2], "l  777          7  lib -> usr/lib");
+    }
 
     #[test]
     fn a_drain_line_says_what_is_left_and_why_a_move_failed() {

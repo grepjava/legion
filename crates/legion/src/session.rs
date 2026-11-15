@@ -438,6 +438,106 @@ mod terminal {
     pub async fn resizes(_tx: mpsc::Sender<SessionFrame>) {}
 }
 
+/// A `files` session's output, all of it, or why it failed.
+async fn files(
+    channel: &Channel,
+    target: &Target,
+    op: &str,
+    path: &str,
+    mut out: impl FnMut(Vec<u8>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let action = Action::Files(legion_proto::v1::FilesOptions {
+        op: op.to_owned(),
+        path: path.to_owned(),
+    });
+    let mut s = Session::open(channel, target.open(action)).await?;
+    loop {
+        match s.next().await? {
+            Some(Frame::Stdout(d)) => out(d)?,
+            Some(Frame::ExitCode(_)) | None => return Ok(()),
+            Some(Frame::Error(e)) => bail!("{}", e.message),
+            Some(_) => {}
+        }
+    }
+}
+
+/// `legion files`: a directory of a task's container, as its agent lists
+/// it (`legion_agent`'s browse entries, as JSON).
+pub async fn list_files(
+    channel: &Channel,
+    target: &Target,
+    path: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let mut json = Vec::new();
+    files(channel, target, "list", path, |d| {
+        json.extend(d);
+        Ok(())
+    })
+    .await?;
+    serde_json::from_slice(&json).context("the node's listing")
+}
+
+/// `legion cp TASK:PATH LOCAL`: a file of a task's container, written to
+/// `out`; how many bytes.
+pub async fn download(
+    channel: &Channel,
+    target: &Target,
+    path: &str,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<u64> {
+    let mut n = 0u64;
+    files(channel, target, "read", path, |d| {
+        n += d.len() as u64;
+        out.write_all(&d).context("writing the copy")
+    })
+    .await?;
+    Ok(n)
+}
+
+/// `legion cp LOCAL TASK:PATH`: `input` written to a file of a task's
+/// container, in place of what was there; how many bytes.
+pub async fn upload(
+    channel: &Channel,
+    target: &Target,
+    path: &str,
+    mut input: impl tokio::io::AsyncRead + Unpin,
+) -> anyhow::Result<u64> {
+    let action = Action::Files(legion_proto::v1::FilesOptions {
+        op: "write".to_owned(),
+        path: path.to_owned(),
+    });
+    let mut s = Session::open(channel, target.open(action)).await?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut n = 0u64;
+    loop {
+        let got = input
+            .read(&mut buf)
+            .await
+            .context("reading the file to copy")?;
+        if got == 0 {
+            break;
+        }
+        n += got as u64;
+        if s.tx
+            .send(frame(Frame::Input(buf[..got].to_vec())))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    let _ =
+        s.tx.send(frame(Frame::InputClosed(legion_proto::v1::InputClosed {})))
+            .await;
+    loop {
+        match s.next().await? {
+            Some(Frame::ExitCode(_)) | None => return Ok(n),
+            Some(Frame::Error(e)) => bail!("{}", e.message),
+            Some(_) => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

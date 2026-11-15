@@ -247,6 +247,12 @@ pub enum Request {
         cron_job: String,
         suspend: bool,
     },
+    /// A service stopped (`legion stop`) or started again.
+    Stop {
+        namespace: String,
+        service: String,
+        stop: bool,
+    },
     Move {
         namespace: String,
         volume: String,
@@ -731,6 +737,20 @@ impl View {
                     },
                     ask,
                 );
+                return None;
+            }
+            ('o', Kind::Service) => {
+                let stop = !o.spec["stopped"].as_bool().unwrap_or(false);
+                let request = Request::Stop {
+                    namespace,
+                    service: name,
+                    stop,
+                };
+                if !stop {
+                    return Some(request);
+                }
+                let ask = format!("Stop service {ns}/{n}? Its tasks go until it is started.");
+                self.confirm(request, ask);
                 return None;
             }
             ('n', Kind::CronJob) => Request::RunNow {
@@ -1359,11 +1379,16 @@ fn workload_rows(model: &Model, view: &View) -> Vec<TableRow> {
                     | UpdateState::RolledBack
             )
         });
-        let update = st
-            .update
-            .as_ref()
-            .map(|u| word(&u.state))
-            .unwrap_or_default();
+        let stopped = s.spec["stopped"].as_bool() == Some(true);
+        let warn = warn || stopped;
+        let update = if stopped {
+            "stopped".to_owned()
+        } else {
+            st.update
+                .as_ref()
+                .map(|u| word(&u.state))
+                .unwrap_or_default()
+        };
         let short = st.ready < st.desired;
         let tasks = colored(
             format!("{}/{}", st.ready, st.desired),

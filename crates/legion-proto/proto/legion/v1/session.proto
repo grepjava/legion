@@ -44,8 +44,25 @@ message SessionOpen {
     // Managers only: list, pull, push, remove, prune, export or load images
     // in a node's local image store.
     ImageNodeAction image_op = 14;
+    // Managers only: what `legion doctor` finds on this node, as JSON on
+    // `stdout`, then `exit_code` 0. It changes nothing on the host.
+    DoctorOptions doctor = 15;
+    // Files in the container's root: a directory listed (JSON on
+    // `stdout`), a file read (its bytes on `stdout`) or written (from
+    // `input` frames until `input_closed`), then `exit_code` 0. A symbolic
+    // link on the way is refused, not followed.
+    FilesOptions files = 16;
   }
 }
+
+message FilesOptions {
+  // "list", "read" or "write".
+  string op = 1;
+  // Below the container's root: `/etc/rc.conf`.
+  string path = 2;
+}
+
+message DoctorOptions {}
 
 message VolumeSnapshotAction {
   string volume = 1;
@@ -59,7 +76,9 @@ message VolumeSnapshotResult {
 }
 
 message ImageNodeAction {
-  // "list", "pull", "push", "remove", "prune", "export", "load".
+  // "list", "inspect", "pull", "push", "remove", "prune", "export",
+  // "load"; "prune-builds", jailer's store pruned on a builder; "scan",
+  // the image's packages audited.
   string op = 1;
   string image = 2;
   string target = 3;
@@ -79,6 +98,14 @@ message ImageNodeResult {
   repeated CachedNodeImage images = 1;
   uint64 removed = 2;
   string digest = 3;
+  // "inspect": the image's config, as JSON, and its compressed layers'
+  // sizes, bottom first, where the store keeps them.
+  string config = 4;
+  repeated uint64 layer_sizes = 5;
+  // "scan": what `pkg audit --raw=json-compact` said of the image's
+  // packages (empty when it has none), and the packages, `name\tversion`.
+  string audit = 6;
+  repeated string packages = 7;
 }
 
 // The output of `jailer build` and `jailer push` comes as `stdout` and

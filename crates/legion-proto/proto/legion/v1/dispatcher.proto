@@ -207,6 +207,12 @@ message NodeTelemetry {
   uint64 net_rx_bps = 3;
   uint64 net_tx_bps = 4;
   repeated VolumeTelemetry volumes = 5;
+  // Of `zfs_used_bytes`: the image store's and the tasks' roots'.
+  uint64 images_bytes = 6;
+  uint64 jails_bytes = 7;
+  // jailer's store, where builds keep their images and cache; outside
+  // Legion's ZFS root, 0 on a node without one.
+  uint64 build_bytes = 8;
 }
 
 message VolumeTelemetry {

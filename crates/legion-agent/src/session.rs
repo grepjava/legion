@@ -127,6 +127,19 @@ async fn run<R: Runtime>(
         Some(Action::VolumeSnapshot(opts)) => {
             transfer::snapshot(&volumes, &open.namespace, opts, &tx).await
         }
+        Some(Action::Doctor(_)) => crate::doctor::send(&volumes, &tx).await,
+        Some(Action::Files(opts)) => {
+            match container(runtime.as_ref(), &node, &o.task_uid, &open.container).await {
+                Ok(c) => match runtime.root(&c).await.map_err(runtime_status) {
+                    Ok(Some(root)) => crate::browse::run(&root, opts, &tx, &mut inbound).await,
+                    Ok(None) => Err(Status::failed_precondition(
+                        "this container's files are not reachable from its node",
+                    )),
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            }
+        }
         Some(Action::ImageOp(opts)) => {
             crate::image_ops::run(
                 runtime.as_ref(),

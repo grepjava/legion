@@ -527,6 +527,20 @@ impl Store {
 
     /// Runs `f` on layer `chain_hex`'s files: its directory, or a temporary
     /// clone of its snapshot.
+    /// Runs `f` on `image`'s files, read only: its top layer, mounted for
+    /// the while where layers are ZFS snapshots.
+    pub fn with_files<T>(
+        &self,
+        image: &Image,
+        f: impl FnOnce(&Path) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let top = image
+            .layers
+            .last()
+            .ok_or_else(|| Error::Unsupported("an image without layers".to_owned()))?;
+        self.with_layer_mounted(top, f)
+    }
+
     fn with_layer_mounted<T>(
         &self,
         chain_hex: &str,

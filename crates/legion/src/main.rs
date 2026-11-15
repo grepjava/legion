@@ -280,6 +280,24 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// What `legion doctor` finds on every node of the cluster, or on
+    /// `--node`, asked of their agents (the cluster admin's). Exits nonzero
+    /// unless every node asked is ready.
+    Diagnose {
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// A file to send with a report of trouble (the cluster admin's): the
+    /// cluster's objects without its Secrets, and with environment values
+    /// and what else could be secret masked; its alerts, the last hour's
+    /// events and each node's diagnosis. Read it before sending it.
+    SupportBundle {
+        /// Where to write it; `legion-support-<time>.json` here by default.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// Save every object of the cluster, read at one version, to a file.
     /// It holds Secrets and join tokens: keep it as safe as the managers'
     /// disks. The managers' keys are not in it; keep `<data-dir>/pki` too.
@@ -380,6 +398,19 @@ enum Command {
     /// update replaces them, under its update config: its pod's
     /// `restartedAt` set to now.
     Restart {
+        service: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// Stop a service: its tasks go, and its spec (the replica count
+    /// included) stays for `legion start`.
+    Stop {
+        service: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// Start a stopped service again.
+    Start {
         service: String,
         #[arg(short, long)]
         namespace: Option<String>,
@@ -542,6 +573,30 @@ enum Command {
     },
     /// Run a command in a task's container; exits with its exit code. A
     /// service name picks one of its running tasks.
+    /// List a directory in a task's container (its Volumes' mounts
+    /// included). Symbolic links are shown, never followed. Takes the
+    /// rights a shell in it would.
+    Files {
+        task: String,
+        /// Below the container's root.
+        #[arg(default_value = "/")]
+        path: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+        #[arg(short, long)]
+        container: Option<String>,
+    },
+    /// Copy a file out of a task's container or into it: `TASK:PATH LOCAL`
+    /// or `LOCAL TASK:PATH`; `-` for standard output or input. One written
+    /// into a container replaces what was at its path whole, or nothing.
+    Cp {
+        from: String,
+        to: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+        #[arg(short, long)]
+        container: Option<String>,
+    },
     Exec {
         task: String,
         #[arg(short, long)]
@@ -631,6 +686,21 @@ pub enum ImageCommand {
     Prune {
         #[arg(long)]
         node: Option<String>,
+        /// Prune jailer's build store on builders instead: the layers and
+        /// cache no image there uses (`jailer prune`).
+        #[arg(long)]
+        builds: bool,
+    },
+    /// Audit a cached image on `--node`: its FreeBSD packages checked
+    /// against FreeBSD's VuXML database (`pkg audit`), and what uses it.
+    /// Exits nonzero when a package has a known vulnerability.
+    Scan {
+        image: String,
+        #[arg(long)]
+        node: String,
+        /// Every package too, as JSON (an SBOM, with what is known of it).
+        #[arg(long)]
+        json: bool,
     },
     /// Export a cached image from `--node` to a local OCI/Docker `.tar` archive.
     Export {
@@ -655,6 +725,10 @@ pub enum ImageCommand {
         namespace: Option<String>,
         #[arg(long)]
         secret: Option<String>,
+        /// Read NODE's cached copy instead of the registry (an image built
+        /// or loaded there).
+        #[arg(long)]
+        node: Option<String>,
     },
 }
 
@@ -832,6 +906,25 @@ pub enum StackCommand {
     /// Remove a stack's services, secrets and configs; its volumes and
     /// their data stay.
     Rm {
+        stack: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// The stacks: each with its services, how many are ready, and whether
+    /// they are stopped.
+    Ls {
+        /// One namespace's; every namespace you may read by default.
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// Stop every service of a stack (`legion stop` on each).
+    Stop {
+        stack: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// Start every service of a stack again.
+    Start {
         stack: String,
         #[arg(short, long)]
         namespace: Option<String>,

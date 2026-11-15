@@ -217,6 +217,90 @@ service Cluster {
   rpc SearchImages(SearchImagesRequest) returns (SearchImagesResponse);
   // Inspects a remote registry image (tags, platforms, digest, cosign).
   rpc InspectRegistryImage(InspectRegistryImageRequest) returns (InspectRegistryImageResponse);
+  // What `legion doctor` finds on each node, or on `node`; the cluster
+  // admin's.
+  rpc Diagnose(DiagnoseRequest) returns (DiagnoseResponse);
+  // A node's cached image audited: its FreeBSD packages checked against
+  // the FreeBSD VuXML database (`pkg audit`), and what uses it. For those
+  // who may read nodes.
+  rpc ScanImage(ScanImageRequest) returns (ScanImageResponse);
+  // A file to send with a report of trouble: the cluster's objects (Secrets
+  // left out, and what could be secret in the rest masked), its managers,
+  // alerts, the last hour's events and each node's diagnosis, as JSON; the
+  // cluster admin's.
+  rpc SupportBundle(SupportBundleRequest) returns (SupportBundleResponse);
+}
+
+message ScanImageRequest {
+  string node = 1;
+  string image = 2;
+}
+
+message ScanImageResponse {
+  string image = 1;
+  string node = 2;
+  // Every FreeBSD package in it (its SBOM); none when it has no package
+  // database, a Linux image say.
+  repeated ImagePackage packages = 3;
+  // Those with known vulnerabilities.
+  repeated VulnerablePackage vulnerable = 4;
+  // As in `NodeImageItem`.
+  repeated string used_by = 5;
+}
+
+message ImagePackage {
+  string name = 1;
+  string version = 2;
+}
+
+message VulnerablePackage {
+  string name = 1;
+  string version = 2;
+  repeated Vulnerability issues = 3;
+}
+
+message Vulnerability {
+  string description = 1;
+  repeated string cves = 2;
+  string url = 3;
+  // The versions it affects, as VuXML says them: `< 1.30.1,3`.
+  repeated string affected = 4;
+}
+
+message DiagnoseRequest {
+  // Empty: every node.
+  string node = 1;
+}
+
+message DiagnoseResponse {
+  repeated NodeDiagnosis nodes = 1;
+}
+
+message NodeDiagnosis {
+  string node = 1;
+  // Why it could not be asked: the node is down, or did not answer.
+  string error = 2;
+  // Every requirement met.
+  bool ready = 3;
+  repeated DoctorFinding findings = 4;
+}
+
+// As `legion doctor --json` says it.
+message DoctorFinding {
+  // Stable: `racct`, `module.pf`, `zfs.root` and so on.
+  string id = 1;
+  // met, unmet, unknown or unsupported.
+  string state = 2;
+  // required or advised.
+  string need = 3;
+  string detail = 4;
+  string remedy = 5;
+}
+
+message SupportBundleRequest {}
+
+message SupportBundleResponse {
+  bytes json = 1;
 }
 
 message MeRequest {}
@@ -505,6 +589,10 @@ message NodeUsage {
   uint64 net_rx_bps = 5;
   uint64 net_tx_bps = 6;
   repeated VolumeTelemetry volumes = 7;
+  // As in the agent's `NodeTelemetry`.
+  uint64 images_bytes = 8;
+  uint64 jails_bytes = 9;
+  uint64 build_bytes = 10;
 }
 
 message AutolockRequest {
@@ -607,6 +695,9 @@ message NodeImageItem {
   string os = 4;
   string arch = 5;
   uint32 layers = 6;
+  // The services, Jobs and cron jobs whose pods name this image, as
+  // `Kind namespace/name`, of those the caller may read.
+  repeated string used_by = 7;
 }
 
 message NodeImagesResponse {
@@ -658,6 +749,30 @@ message InspectRegistryImageRequest {
   string image = 1;
   string namespace = 2;
   string secret = 3;
+  // A node whose cached copy is read instead of the registry: for images
+  // no registry serves, built or loaded there.
+  string node = 4;
+}
+
+// One step of how an image was built, from its config's history.
+message ImageStep {
+  string created = 1;
+  string created_by = 2;
+  // A step that changed only the config, adding no layer.
+  bool empty_layer = 3;
+  // The compressed size of the layer it added; 0 when not known.
+  uint64 size = 4;
+}
+
+// How the image runs when a pod does not say otherwise.
+message ImageRun {
+  repeated string entrypoint = 1;
+  repeated string cmd = 2;
+  repeated string env = 3;
+  string user = 4;
+  string working_dir = 5;
+  repeated string exposed_ports = 6;
+  map<string, string> labels = 7;
 }
 
 message RegistryPlatform {
@@ -672,6 +787,16 @@ message InspectRegistryImageResponse {
   repeated RegistryPlatform platforms = 3;
   repeated string tags = 4;
   bool signed = 5;
+  // Of the platform a node would run: FreeBSD first, then Linux.
+  string os = 6;
+  string arch = 7;
+  string created = 8;
+  repeated ImageStep history = 9;
+  ImageRun run = 10;
+  // All its layers, compressed; 0 when not known.
+  uint64 size = 11;
+  // As in `NodeImageItem`.
+  repeated string used_by = 12;
 }
 
 message VolumeBackupRequest {

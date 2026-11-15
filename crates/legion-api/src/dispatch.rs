@@ -178,4 +178,12 @@ pub struct NodeTelemetry {
     pub net_tx_bps: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<VolumeTelemetry>,
+    /// Of `zfs_used_bytes`: the image store's and the tasks' roots'.
+    #[serde(default)]
+    pub images_bytes: u64,
+    #[serde(default)]
+    pub jails_bytes: u64,
+    /// jailer's store, outside Legion's ZFS root; 0 without one.
+    #[serde(default)]
+    pub build_bytes: u64,
 }

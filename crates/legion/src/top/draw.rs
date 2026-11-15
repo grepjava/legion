@@ -177,7 +177,7 @@ pub(super) fn trim(n: f64) -> String {
 }
 
 /// `512B`, `512Mi`, `1.2Gi`.
-pub(super) fn bytes(n: u64) -> String {
+pub(crate) fn bytes(n: u64) -> String {
     const UNITS: [(&str, u64); 4] = [
         ("Ti", 1 << 40),
         ("Gi", 1 << 30),
@@ -1363,7 +1363,10 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("d p a", "node: drain (asked), pause, activate"),
             ("L", "node: set or remove a label"),
-            ("s r R", "service: scale, roll back, restart (both asked)"),
+            (
+                "s r R o",
+                "service: scale, roll back, restart, stop or start (asked)",
+            ),
             ("u n", "cron job: suspend or resume, run now"),
             ("m", "volume: move to a node"),
             ("l e", "follow logs, or events, of the row below"),
@@ -1491,6 +1494,7 @@ fn bottom_line(view: &View) -> Line<'static> {
             ("s", "scale"),
             ("r", "roll back"),
             ("R", "restart"),
+            ("o", "stop/start"),
             ("u", "suspend"),
             ("n", "run now"),
             ("l", "logs"),

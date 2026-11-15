@@ -33,7 +33,7 @@ fn internal(e: impl std::fmt::Display) -> Status {
     Status::internal(e.to_string())
 }
 
-fn leader_client<T>(
+pub(crate) fn leader_client<T>(
     api: &ApiService,
     req: &Request<T>,
 ) -> Result<Option<ClusterClient<tonic::transport::Channel>>, Status> {
@@ -47,7 +47,7 @@ fn leader_client<T>(
     })
 }
 
-async fn attach(
+pub(crate) async fn attach(
     api: &ApiService,
     node: &str,
     namespace: &str,
@@ -82,6 +82,24 @@ fn ready_nodes(api: &ApiService) -> Result<Vec<String>, Status> {
         .collect();
     names.sort();
     Ok(names)
+}
+
+/// The ready nodes labelled builders, whose jailer stores builds.
+fn ready_builders(api: &ApiService) -> Result<Vec<String>, Status> {
+    let ready = ready_nodes(api)?;
+    let list = api.store.list(Kind::Node, None).map_err(internal)?;
+    Ok(list
+        .objects
+        .into_iter()
+        .filter(|o| {
+            o.metadata
+                .labels
+                .get(legion_api::build::BUILDER_LABEL)
+                .is_some_and(|v| v == "true")
+                && ready.contains(&o.metadata.name)
+        })
+        .map(|o| o.metadata.name)
+        .collect())
 }
 
 fn ensure_ready_node(api: &ApiService, node: &str) -> Result<(), Status> {
@@ -201,6 +219,7 @@ pub(crate) async fn node_images(
                 ready_nodes(api)?
             };
             let mut items = Vec::new();
+            let pods = pod_images(api, &caller)?;
             for node in nodes {
                 let action = ImageNodeAction {
                     op: "list".to_owned(),
@@ -211,6 +230,7 @@ pub(crate) async fn node_images(
                         for i in res.images {
                             items.push(NodeImageItem {
                                 node: node.clone(),
+                                used_by: used_by(&pods, &i.reference, &i.digest),
                                 reference: i.reference,
                                 digest: i.digest,
                                 os: i.os,
@@ -231,9 +251,9 @@ pub(crate) async fn node_images(
             }));
         }
 
-        if !matches!(op, "pull" | "push" | "remove" | "prune") {
+        if !matches!(op, "pull" | "push" | "remove" | "prune" | "prune-builds") {
             return Err(Status::invalid_argument(format!(
-                "unknown image operation {op:?}: expected list, pull, push, remove or prune"
+                "unknown image operation {op:?}: expected list, pull, push, remove, prune or prune-builds"
             )));
         }
         caller.require_all("manage node images")?;
@@ -241,6 +261,15 @@ pub(crate) async fn node_images(
         let nodes = if op == "push" || !req.node.trim().is_empty() {
             ensure_ready_node(api, &req.node)?;
             vec![req.node.clone()]
+        } else if op == "prune-builds" {
+            let builders = ready_builders(api)?;
+            if builders.is_empty() {
+                return Err(Status::failed_precondition(format!(
+                    "no ready builder: none is labelled {}=true",
+                    legion_api::build::BUILDER_LABEL
+                )));
+            }
+            builders
         } else {
             let all = ready_nodes(api)?;
             if all.is_empty() {
@@ -473,6 +502,7 @@ pub(crate) async fn load_image(
                 os: i.os,
                 arch: i.arch,
                 layers: i.layers,
+                used_by: Vec::new(),
             })
             .collect();
         Ok(Response::new(NodeImagesResponse {
@@ -541,6 +571,11 @@ pub(crate) async fn inspect_registry_image(
             .await;
     }
     let req = req.into_inner();
+    if !req.node.trim().is_empty() {
+        return inspect_node_image(api, &caller, &req)
+            .await
+            .map(Response::new);
+    }
     let r = Reference::parse(&req.image)
         .map_err(|e| Status::invalid_argument(format!("image reference: {e}")))?;
     if r.is_local() {
@@ -614,11 +649,348 @@ pub(crate) async fn inspect_registry_image(
         ok
     };
 
-    Ok(Response::new(pb::InspectRegistryImageResponse {
-        image: r.to_string(),
-        digest,
-        platforms,
-        tags,
-        signed,
+    // How it was built, of the platform a node would run.
+    let mut out = match client.config(&r, creds.as_ref(), RUNS_ON).await {
+        Ok((_, manifest, config)) => {
+            let sizes: Vec<u64> = manifest.layers.iter().map(|l| l.size).collect();
+            details(&config, &sizes)
+        }
+        Err(_) => pb::InspectRegistryImageResponse::default(),
+    };
+    let pods = pod_images(api, &caller)?;
+    out.used_by = used_by(&pods, &r.to_string(), &digest);
+    out.image = r.to_string();
+    out.digest = digest;
+    out.platforms = platforms;
+    out.tags = tags;
+    out.signed = signed;
+    Ok(Response::new(out))
+}
+
+/// A node's cached image audited (`ScanImage`): its packages, those with
+/// known vulnerabilities, and what uses it.
+pub(crate) async fn scan_image(
+    api: &ApiService,
+    req: Request<pb::ScanImageRequest>,
+) -> Result<Response<pb::ScanImageResponse>, Status> {
+    let caller = api.caller(&req)?;
+    if let Some(mut leader) = leader_client(api, &req)? {
+        return leader
+            .scan_image(forwarded_for(req.into_inner(), &caller)?)
+            .await;
+    }
+    caller.check(&api.store, Verb::Read, Kind::Node, "")?;
+    let req = req.into_inner();
+    if req.image.trim().is_empty() {
+        return Err(Status::invalid_argument("scan needs an image reference"));
+    }
+    api.consistent().await?;
+    ensure_ready_node(api, &req.node)?;
+    let action = ImageNodeAction {
+        op: "scan".to_owned(),
+        image: req.image.clone(),
+        ..Default::default()
+    };
+    let res = run_node_op(api, &req.node, "", action).await?;
+    let packages = res
+        .packages
+        .iter()
+        .filter_map(|p| p.split_once('\t'))
+        .map(|(name, version)| pb::ImagePackage {
+            name: name.to_owned(),
+            version: version.to_owned(),
+        })
+        .collect();
+    let vulnerable = audited(&res.audit)
+        .map_err(|e| internal(format!("node {}: pkg audit's answer: {e}", req.node)))?;
+    let pods = pod_images(api, &caller)?;
+    Ok(Response::new(pb::ScanImageResponse {
+        used_by: used_by(&pods, &req.image, ""),
+        image: req.image,
+        node: req.node,
+        packages,
+        vulnerable,
     }))
+}
+
+/// The vulnerable packages in `pkg audit --raw=json-compact`'s answer;
+/// none for an empty one.
+fn audited(json: &str) -> Result<Vec<pb::VulnerablePackage>, serde_json::Error> {
+    #[derive(serde::Deserialize)]
+    struct Audit {
+        #[serde(default)]
+        packages: std::collections::BTreeMap<String, Package>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Package {
+        #[serde(default)]
+        version: String,
+        #[serde(default)]
+        issues: Vec<Issue>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Issue {
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        cve: Vec<String>,
+        #[serde(default)]
+        url: String,
+        #[serde(default, rename = "Affected versions")]
+        affected: Vec<String>,
+    }
+    if json.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let audit: Audit = serde_json::from_str(json)?;
+    Ok(audit
+        .packages
+        .into_iter()
+        .filter(|(_, p)| !p.issues.is_empty())
+        .map(|(name, p)| pb::VulnerablePackage {
+            name,
+            version: p.version,
+            issues: p
+                .issues
+                .into_iter()
+                .map(|i| pb::Vulnerability {
+                    description: i.description,
+                    cves: i.cve,
+                    url: i.url,
+                    affected: i.affected,
+                })
+                .collect(),
+        })
+        .collect())
+}
+
+/// The systems a node runs images of, in the order it would pick one.
+const RUNS_ON: &[&str] = &["freebsd", "linux"];
+
+/// A node's cached copy of an image, read from its store.
+async fn inspect_node_image(
+    api: &ApiService,
+    caller: &Caller,
+    req: &pb::InspectRegistryImageRequest,
+) -> Result<pb::InspectRegistryImageResponse, Status> {
+    caller.check(&api.store, Verb::Read, Kind::Node, "")?;
+    if req.image.trim().is_empty() {
+        return Err(Status::invalid_argument("inspect needs an image reference"));
+    }
+    api.consistent().await?;
+    ensure_ready_node(api, &req.node)?;
+    let action = ImageNodeAction {
+        op: "inspect".to_owned(),
+        image: req.image.clone(),
+        ..Default::default()
+    };
+    let res = run_node_op(api, &req.node, "", action).await?;
+    let config: legion_image::ImageConfig = serde_json::from_str(&res.config)
+        .map_err(|e| internal(format!("node {}: {}'s config: {e}", req.node, req.image)))?;
+    let mut out = details(&config, &res.layer_sizes);
+    let pods = pod_images(api, caller)?;
+    out.used_by = used_by(&pods, &req.image, "");
+    out.image = req.image.clone();
+    Ok(out)
+}
+
+/// What an image's config says of how it was built and how it runs.
+/// `layer_sizes` are its layers', bottom first, matched in order to the
+/// history's steps that added one.
+fn details(
+    config: &legion_image::ImageConfig,
+    layer_sizes: &[u64],
+) -> pb::InspectRegistryImageResponse {
+    let mut sizes = layer_sizes.iter();
+    let history = config
+        .history
+        .iter()
+        .map(|h| pb::ImageStep {
+            created: h.created.clone(),
+            created_by: h.created_by.clone(),
+            empty_layer: h.empty_layer,
+            size: if h.empty_layer {
+                0
+            } else {
+                sizes.next().copied().unwrap_or(0)
+            },
+        })
+        .collect();
+    let c = &config.config;
+    pb::InspectRegistryImageResponse {
+        os: config.os.clone(),
+        arch: config.architecture.clone(),
+        created: config.created.clone(),
+        history,
+        run: Some(pb::ImageRun {
+            entrypoint: c.entrypoint.clone(),
+            cmd: c.cmd.clone(),
+            env: c.env.clone(),
+            user: c.user.clone(),
+            working_dir: c.working_dir.clone(),
+            exposed_ports: c.exposed_ports.keys().cloned().collect(),
+            labels: c.labels.clone().into_iter().collect(),
+        }),
+        size: layer_sizes.iter().sum(),
+        ..Default::default()
+    }
+}
+
+/// Services, Jobs and cron jobs as `Kind namespace/name`, each with the
+/// references its pod names.
+type PodImages = Vec<(String, Vec<String>)>;
+
+/// Each service's, Job's and cron job's images, of those `caller` may read.
+fn pod_images(api: &ApiService, caller: &Caller) -> Result<PodImages, Status> {
+    let mut out = Vec::new();
+    for kind in [Kind::Service, Kind::Job, Kind::CronJob] {
+        let objects = api.store.list(kind, None).map_err(internal)?.objects;
+        for o in objects {
+            let ns = &o.metadata.namespace;
+            if !caller.may(&api.store, Verb::Read, kind, ns) {
+                continue;
+            }
+            let pod = if kind == Kind::CronJob {
+                &o.spec["job"]["pod"]
+            } else {
+                &o.spec["pod"]
+            };
+            let images = ["initContainers", "containers"]
+                .iter()
+                .filter_map(|k| pod[*k].as_array())
+                .flatten()
+                .filter_map(|c| c["image"].as_str().map(str::to_owned))
+                .collect();
+            out.push((format!("{kind} {ns}/{}", o.metadata.name), images));
+        }
+    }
+    Ok(out)
+}
+
+/// Those of `pods` naming `image`, cached under that reference with the
+/// manifest `digest` (empty when not known).
+fn used_by(pods: &[(String, Vec<String>)], image: &str, digest: &str) -> Vec<String> {
+    let Ok(image) = Reference::parse(image) else {
+        return Vec::new();
+    };
+    pods.iter()
+        .filter(|(_, refs)| refs.iter().any(|r| same_image(r, &image, digest)))
+        .map(|(who, _)| who.clone())
+        .collect()
+}
+
+/// Whether a pod's reference `named` runs `image` (whose manifest is
+/// `digest`, empty when not known): the same repository, and the digest it
+/// is pinned to or else the same tag.
+fn same_image(named: &str, image: &Reference, digest: &str) -> bool {
+    let Ok(named) = Reference::parse(named) else {
+        return false;
+    };
+    if (&named.registry, &named.repository) != (&image.registry, &image.repository) {
+        return false;
+    }
+    match &named.digest {
+        Some(d) => image.digest.as_ref() == Some(d) || digest == d,
+        None => {
+            let tag = |r: &Reference| r.tag.clone().unwrap_or_else(|| "latest".to_owned());
+            image.tag.is_some() && tag(&named) == tag(image)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PINNED: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
+
+    fn pods() -> PodImages {
+        let one = |who: &str, image: String| (who.to_owned(), vec![image]);
+        vec![
+            one("Service a/web", "docker.io/library/nginx:1.27".into()),
+            one("Service a/latest", "nginx".into()),
+            one(
+                "Job b/pinned",
+                format!("docker.io/library/nginx:old@{PINNED}"),
+            ),
+            one("CronJob b/other", "ghcr.io/me/nginx:1.27".into()),
+        ]
+    }
+
+    #[test]
+    fn an_image_is_used_by_pods_naming_its_tag_or_pinned_to_its_digest() {
+        let pods = pods();
+        assert_eq!(used_by(&pods, "nginx:1.27", ""), ["Service a/web"]);
+        assert_eq!(
+            used_by(&pods, "docker.io/library/nginx:latest", ""),
+            ["Service a/latest"]
+        );
+        // Pinned: by the digest, whatever tag it was cached under.
+        assert_eq!(
+            used_by(&pods, "docker.io/library/nginx:1.27", PINNED),
+            ["Service a/web", "Job b/pinned"]
+        );
+        assert_eq!(
+            used_by(&pods, &format!("docker.io/library/nginx@{PINNED}"), ""),
+            ["Job b/pinned"]
+        );
+        assert!(used_by(&pods, "redis:7", "").is_empty());
+    }
+
+    #[test]
+    fn pkg_audits_answer_is_read_package_by_package() {
+        // As pkg 2.8 writes it (`pkg audit --raw=json-compact`).
+        let json = r#"{"pkg_count":2,"packages":{
+            "nginx":{"version":"1.27.0","issue_count":1,"issues":[
+                {"Affected versions":["< 1.30.1,3"],"description":"www/nginx -- Remote Code Execution/DoS",
+                 "cve":["CVE-2026-42926"],"url":"https://vuxml.FreeBSD.org/freebsd/3414ac89.html"}]},
+            "pcre2":{"version":"10.45","issue_count":0,"issues":[]}}}"#;
+        let v = audited(json).unwrap();
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(
+            (v[0].name.as_str(), v[0].version.as_str()),
+            ("nginx", "1.27.0")
+        );
+        let i = &v[0].issues[0];
+        assert_eq!(i.cves, ["CVE-2026-42926"]);
+        assert_eq!(i.affected, ["< 1.30.1,3"]);
+        assert!(i.url.starts_with("https://vuxml.FreeBSD.org/"));
+        assert!(audited("").unwrap().is_empty());
+        assert!(audited(r#"{"pkg_count":0}"#).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_steps_get_the_layers_they_added() {
+        let config: legion_image::ImageConfig = serde_json::from_value(serde_json::json!({
+            "os": "freebsd", "architecture": "amd64", "created": "2026-11-15T00:00:00Z",
+            "config": { "Entrypoint": ["/bin/sh"], "User": "www",
+                        "ExposedPorts": { "80/tcp": {} }, "Labels": { "a": "b" } },
+            "history": [
+                { "created_by": "FROM base" },
+                { "created_by": "ENV A=1", "empty_layer": true },
+                { "created_by": "RUN pkg install nginx" }
+            ]
+        }))
+        .unwrap();
+        let d = details(&config, &[100, 20]);
+        let steps: Vec<_> = d
+            .history
+            .iter()
+            .map(|s| (s.created_by.as_str(), s.size))
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                ("FROM base", 100),
+                ("ENV A=1", 0),
+                ("RUN pkg install nginx", 20)
+            ]
+        );
+        assert_eq!(d.size, 120);
+        let run = d.run.unwrap();
+        assert_eq!(run.user, "www");
+        assert_eq!(run.exposed_ports, ["80/tcp"]);
+        assert_eq!(run.labels.get("a").map(String::as_str), Some("b"));
+        assert_eq!((d.os.as_str(), d.arch.as_str()), ("freebsd", "amd64"));
+    }
 }

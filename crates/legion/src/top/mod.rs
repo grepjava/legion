@@ -34,6 +34,7 @@ use tonic::transport::Channel;
 
 use crate::session::{ExecEvent, ExecStream};
 
+pub(crate) use draw::bytes;
 pub use model::Model;
 #[cfg(test)]
 pub use view::SortCol;
@@ -663,6 +664,27 @@ async fn act(mut objects: crate::cli::Objects, request: Request) -> String {
         } => legion_manager::actions::run_now(&mut objects, namespace, cron_job)
             .await
             .map_err(|s| anyhow::anyhow!("{}", s.message())),
+        Request::Stop {
+            namespace,
+            service,
+            stop,
+        } => {
+            let what = if stop { "stopped" } else { "started" };
+            objects
+                .set_spec(
+                    object_ref(Kind::Service, namespace, service),
+                    "stopped",
+                    stop.into(),
+                )
+                .await
+                .map(|(key, changed)| {
+                    said(
+                        changed,
+                        format!("{key} {what}"),
+                        format!("{key} already {what}"),
+                    )
+                })
+        }
         Request::Suspend {
             namespace,
             cron_job,

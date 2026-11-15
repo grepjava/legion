@@ -31,13 +31,41 @@ pub struct Builder {
     pub jailer: Vec<String>,
     /// Where each build's source and files are kept while it runs.
     pub work: PathBuf,
+    /// pkg, which audits images' packages, and the arguments put before
+    /// its commands; `pkg` on the PATH by default.
+    pub pkg: Vec<String>,
+}
+
+/// jailer with the arguments put before each of its commands, reading
+/// nothing.
+pub(crate) fn jailer(b: &Builder) -> Command {
+    let (program, before) = b.jailer.split_first().expect("checked");
+    let mut c = Command::new(program);
+    c.args(before).stdin(std::process::Stdio::null());
+    c
 }
 
 impl Builder {
+    /// The ZFS dataset jailer keeps its images and build cache under, as
+    /// its arguments name it (`--zfs-root`); none when they do not.
+    pub fn zfs_root(&self) -> Option<String> {
+        let mut args = self.jailer.iter().skip(1);
+        while let Some(a) = args.next() {
+            if a == "--zfs-root" {
+                return args.next().cloned();
+            }
+            if let Some(v) = a.strip_prefix("--zfs-root=") {
+                return Some(v.to_owned());
+            }
+        }
+        None
+    }
+
     pub fn new(work: impl Into<PathBuf>) -> Builder {
         Builder {
             jailer: vec!["jailer".to_owned()],
             work: work.into(),
+            pkg: vec!["pkg".to_owned()],
         }
     }
 }
@@ -101,14 +129,7 @@ fn tag(short: &str) -> String {
 /// The base images stay, for the next build, and jailer bounds its build
 /// cache itself. A build that failed before tagging has nothing to forget.
 async fn forget(b: &Builder, tag: &str, built: bool) {
-    let (program, before) = b.jailer.split_first().expect("checked");
-    match Command::new(program)
-        .args(before)
-        .args(["rmi", tag])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .await
-    {
+    match jailer(b).args(["rmi", tag]).output().await {
         Ok(o) if o.status.success() => {}
         Ok(o) if !built => tracing::debug!(
             "jailer rmi {tag} after the failed build: {}",
@@ -315,6 +336,31 @@ fn frame(f: Frame) -> SessionFrame {
 mod tests {
     use super::*;
 
+    #[test]
+    fn jailers_zfs_root_is_read_from_its_arguments() {
+        let with = |args: &[&str]| Builder {
+            jailer: args.iter().map(|a| (*a).to_owned()).collect(),
+            work: PathBuf::new(),
+            pkg: Vec::new(),
+        };
+        let root = |b: Builder| b.zfs_root();
+        assert_eq!(root(with(&["jailer"])), None);
+        assert_eq!(
+            root(with(&[
+                "/usr/local/bin/jailer",
+                "--zfs-root",
+                "zroot/jailer"
+            ])),
+            Some("zroot/jailer".to_owned())
+        );
+        assert_eq!(
+            root(with(&["jailer", "--state-dir", "/x", "--zfs-root=tank/j"])),
+            Some("tank/j".to_owned())
+        );
+        // The first word is the program, not one of its arguments.
+        assert_eq!(root(with(&["--zfs-root", "jailer"])), None);
+    }
+
     /// A stand-in jailer writing its arguments down, failing as told.
     fn jailer(dir: &Path, exit: i32) -> Builder {
         use std::os::unix::fs::PermissionsExt;
@@ -335,6 +381,7 @@ mod tests {
                 "/var/db/jailer".into(),
             ],
             work: dir.to_owned(),
+            pkg: vec!["pkg".to_owned()],
         }
     }
 

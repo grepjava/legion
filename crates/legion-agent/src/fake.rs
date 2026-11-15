@@ -69,6 +69,8 @@ pub struct FakeRuntime {
 #[derive(Default)]
 struct State {
     images: BTreeSet<String>,
+    /// Where each container's root is made: `<dir>/<id>`.
+    roots: Option<std::path::PathBuf>,
     /// Pulls of these fail.
     unpullable: BTreeSet<String>,
     /// Containers, by name, that fail to start.
@@ -230,6 +232,12 @@ impl FakeRuntime {
 
     pub fn add_image(&self, reference: &str) {
         self.state().images.insert(reference.to_owned());
+    }
+
+    /// Gives each container a root of its own under `dir`, made when first
+    /// asked for, as its files are browsed.
+    pub fn roots_in(&self, dir: &std::path::Path) {
+        self.state().roots = Some(dir.to_owned());
     }
 
     /// `reference` pulls only with this account.
@@ -577,6 +585,49 @@ impl Runtime for FakeRuntime {
 
     async fn prune_images(&self) -> Result<u64> {
         Ok(0)
+    }
+
+    async fn root(&self, id: &str) -> Result<Option<std::path::PathBuf>> {
+        let Some(dir) = self.state().roots.clone() else {
+            return Ok(None);
+        };
+        let root = dir.join(id);
+        std::fs::create_dir_all(&root).map_err(|e| api(500, e.to_string()))?;
+        Ok(Some(root))
+    }
+
+    async fn image_packages(&self, query: &str) -> Result<Option<Vec<(String, String)>>> {
+        if !self.state().images.contains(query) {
+            return Ok(None);
+        }
+        Ok(Some(vec![
+            ("nginx".to_owned(), "1.27.0".to_owned()),
+            ("pcre2".to_owned(), "10.45".to_owned()),
+        ]))
+    }
+
+    async fn image_details(&self, query: &str) -> Result<Option<crate::runtime::ImageDetails>> {
+        if !self.state().images.contains(query) {
+            return Ok(None);
+        }
+        // Two steps, the first a layer, as a small build writes them.
+        let config = serde_json::json!({
+            "os": "freebsd",
+            "architecture": "amd64",
+            "created": "2026-11-15T00:00:00Z",
+            "config": { "Entrypoint": ["/bin/sh", "-c"], "Cmd": ["serve"],
+                        "User": "www", "ExposedPorts": { "80/tcp": {} },
+                        "Labels": { "org.opencontainers.image.source": "fake" } },
+            "rootfs": { "type": "layers", "diff_ids": ["sha256:base"] },
+            "history": [
+                { "created_by": "FROM freebsd-runtime" },
+                { "created_by": "CMD [\"serve\"]", "empty_layer": true }
+            ]
+        });
+        Ok(Some(crate::runtime::ImageDetails {
+            config: config.to_string(),
+            layer_sizes: vec![4096],
+        }))
     }
 
     async fn push_image(&self, query: &str, target: &str, _logins: &[Login]) -> Result<String> {

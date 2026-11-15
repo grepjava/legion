@@ -1470,6 +1470,9 @@ impl Cluster for ApiService {
                             net_rx_bps: t.net_rx_bps,
                             net_tx_bps: t.net_tx_bps,
                             volumes,
+                            images_bytes: t.images_bytes,
+                            jails_bytes: t.jails_bytes,
+                            build_bytes: t.build_bytes,
                         }
                     })
                     .collect(),
@@ -1489,6 +1492,9 @@ impl Cluster for ApiService {
                     n.zfs_avail_bytes = 0;
                     n.net_rx_bps = 0;
                     n.net_tx_bps = 0;
+                    n.images_bytes = 0;
+                    n.jails_bytes = 0;
+                    n.build_bytes = 0;
                 }
             }
             if !can_nodes {
@@ -2319,6 +2325,27 @@ impl Cluster for ApiService {
         req: Request<pb::InspectRegistryImageRequest>,
     ) -> Result<Response<pb::InspectRegistryImageResponse>, Status> {
         crate::image_ops::inspect_registry_image(self, req).await
+    }
+
+    async fn scan_image(
+        &self,
+        req: Request<pb::ScanImageRequest>,
+    ) -> Result<Response<pb::ScanImageResponse>, Status> {
+        crate::image_ops::scan_image(self, req).await
+    }
+
+    async fn diagnose(
+        &self,
+        req: Request<pb::DiagnoseRequest>,
+    ) -> Result<Response<pb::DiagnoseResponse>, Status> {
+        crate::diagnostics::diagnose(self, req).await
+    }
+
+    async fn support_bundle(
+        &self,
+        req: Request<pb::SupportBundleRequest>,
+    ) -> Result<Response<pb::SupportBundleResponse>, Status> {
+        crate::diagnostics::support_bundle(self, req).await
     }
 }
 

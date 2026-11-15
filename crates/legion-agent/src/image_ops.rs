@@ -58,6 +58,42 @@ fn runtime_err(e: crate::runtime::Error) -> Status {
     }
 }
 
+/// FreeBSD's VuXML database as `pkg audit` keeps it, fetched again when
+/// older than [`VUXML_AGE`].
+const VUXML: &str = "/var/db/pkg/vuln.xml";
+const VUXML_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// What `pkg audit` says of `packages`, as JSON (`--raw=json-compact`).
+async fn audit(builder: &Builder, packages: &[(String, String)]) -> Result<String, Status> {
+    let (program, before) = builder
+        .pkg
+        .split_first()
+        .ok_or_else(|| Status::failed_precondition("no pkg to audit with"))?;
+    let stale = std::fs::metadata(VUXML)
+        .and_then(|m| m.modified())
+        .map_or(true, |at| at.elapsed().map_or(true, |age| age > VUXML_AGE));
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(before).arg("audit");
+    if stale {
+        cmd.arg("-F");
+    }
+    cmd.arg("--raw=json-compact")
+        .args(packages.iter().map(|(n, v)| format!("{n}-{v}")))
+        .stdin(std::process::Stdio::null());
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| Status::failed_precondition(format!("pkg audit: {e}")))?;
+    // 1: something is vulnerable, which is what the JSON says.
+    match out.status.code() {
+        Some(0 | 1) => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
+        _ => Err(Status::failed_precondition(format!(
+            "pkg audit: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))),
+    }
+}
+
 fn parse_auth(auth: &[u8]) -> Result<Vec<crate::runtime::Login>, Status> {
     if auth.is_empty() {
         return Ok(Vec::new());
@@ -89,6 +125,77 @@ pub(crate) async fn run<R: Runtime>(
                     images,
                     removed: 0,
                     digest: String::new(),
+                    ..Default::default()
+                })))
+                .await;
+            let _ = tx.send(frame(Frame::ExitCode(0))).await;
+            Ok(())
+        }
+        // jailer's store: layers and blobs no image or build cache entry
+        // uses, as `jailer prune` removes them.
+        "prune-builds" => {
+            let out = crate::build::jailer(builder)
+                .arg("prune")
+                .output()
+                .await
+                .map_err(|e| Status::failed_precondition(format!("jailer prune: {e}")))?;
+            if !out.status.success() {
+                return Err(Status::failed_precondition(format!(
+                    "jailer prune: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            let _ = tx
+                .send(frame(Frame::Images(ImageNodeResult::default())))
+                .await;
+            let _ = tx.send(frame(Frame::ExitCode(0))).await;
+            Ok(())
+        }
+        "scan" => {
+            if opts.image.trim().is_empty() {
+                return Err(Status::invalid_argument("scan needs an image reference"));
+            }
+            let packages = runtime
+                .image_packages(&opts.image)
+                .await
+                .map_err(runtime_err)?
+                .ok_or_else(|| {
+                    Status::not_found(format!("{}: not in this node's image store", opts.image))
+                })?;
+            let audit = if packages.is_empty() {
+                String::new()
+            } else {
+                audit(builder, &packages).await?
+            };
+            let _ = tx
+                .send(frame(Frame::Images(ImageNodeResult {
+                    audit,
+                    packages: packages
+                        .into_iter()
+                        .map(|(n, v)| format!("{n}\t{v}"))
+                        .collect(),
+                    ..Default::default()
+                })))
+                .await;
+            let _ = tx.send(frame(Frame::ExitCode(0))).await;
+            Ok(())
+        }
+        "inspect" => {
+            if opts.image.trim().is_empty() {
+                return Err(Status::invalid_argument("inspect needs an image reference"));
+            }
+            let details = runtime
+                .image_details(&opts.image)
+                .await
+                .map_err(runtime_err)?
+                .ok_or_else(|| {
+                    Status::not_found(format!("{}: not in this node's image store", opts.image))
+                })?;
+            let _ = tx
+                .send(frame(Frame::Images(ImageNodeResult {
+                    config: details.config,
+                    layer_sizes: details.layer_sizes,
+                    ..Default::default()
                 })))
                 .await;
             let _ = tx.send(frame(Frame::ExitCode(0))).await;
@@ -118,6 +225,7 @@ pub(crate) async fn run<R: Runtime>(
                     images: Vec::new(),
                     removed: 0,
                     digest,
+                    ..Default::default()
                 })))
                 .await;
             let _ = tx.send(frame(Frame::ExitCode(0))).await;
@@ -139,6 +247,7 @@ pub(crate) async fn run<R: Runtime>(
                     images: Vec::new(),
                     removed: 0,
                     digest,
+                    ..Default::default()
                 })))
                 .await;
             let _ = tx.send(frame(Frame::ExitCode(0))).await;
@@ -159,6 +268,7 @@ pub(crate) async fn run<R: Runtime>(
                     images: Vec::new(),
                     removed,
                     digest: String::new(),
+                    ..Default::default()
                 })))
                 .await;
             let _ = tx.send(frame(Frame::ExitCode(0))).await;
@@ -171,6 +281,7 @@ pub(crate) async fn run<R: Runtime>(
                     images: Vec::new(),
                     removed,
                     digest: String::new(),
+                    ..Default::default()
                 })))
                 .await;
             let _ = tx.send(frame(Frame::ExitCode(0))).await;
@@ -260,6 +371,7 @@ pub(crate) async fn run<R: Runtime>(
                     images: vec![to_pb(loaded)],
                     removed: 0,
                     digest,
+                    ..Default::default()
                 })))
                 .await;
             let _ = tx.send(frame(Frame::ExitCode(0))).await;

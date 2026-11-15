@@ -96,6 +96,8 @@ pub struct AgentMetrics<R> {
     pub(crate) sys: Arc<dyn Sys>,
     pub(crate) node: String,
     pub(crate) zfs_root: Option<String>,
+    /// jailer's, where a builder keeps build images and cache.
+    pub(crate) build_root: Option<String>,
 }
 
 impl<R> Clone for AgentMetrics<R> {
@@ -105,6 +107,7 @@ impl<R> Clone for AgentMetrics<R> {
             sys: self.sys.clone(),
             node: self.node.clone(),
             zfs_root: self.zfs_root.clone(),
+            build_root: self.build_root.clone(),
         }
     }
 }
@@ -229,13 +232,18 @@ impl<R: Runtime> AgentMetrics<R> {
         prev_net: &mut Option<(tokio::time::Instant, u64, u64)>,
     ) -> NodeTelemetry {
         let zfs_root = self.zfs_root.clone();
-        let (spaces, net) = crate::task::blocking(&self.sys, move |sys| {
+        let build_root = self.build_root.clone();
+        let (spaces, build, net) = crate::task::blocking(&self.sys, move |sys| {
             let spaces = zfs_root
                 .as_deref()
                 .and_then(|r| sys.zfs_space(r).ok())
                 .unwrap_or_default();
+            let build = build_root.as_deref().and_then(|r| {
+                let spaces = sys.zfs_space(r).ok()?;
+                spaces.into_iter().find(|d| d.name == r).map(|d| d.used)
+            });
             let net = sys.net_bytes().ok();
-            (spaces, net)
+            (spaces, build, net)
         })
         .await;
         let now = tokio::time::Instant::now();
@@ -261,13 +269,20 @@ impl<R: Runtime> AgentMetrics<R> {
         };
         let mut zfs_used_bytes = 0u64;
         let mut zfs_avail_bytes = 0u64;
+        let (mut images_bytes, mut jails_bytes) = (0u64, 0u64);
         let mut volumes = Vec::new();
         if let Some(root) = self.zfs_root.as_deref() {
-            let vol_prefix = format!("{}/volumes/", root.trim_end_matches('/'));
+            let root = root.trim_end_matches('/');
+            let vol_prefix = format!("{root}/volumes/");
+            let (images, jails) = (format!("{root}/images"), format!("{root}/jails"));
             for ds in spaces {
                 if ds.name == root {
                     zfs_used_bytes = ds.used;
                     zfs_avail_bytes = ds.avail;
+                } else if ds.name == images {
+                    images_bytes = ds.used;
+                } else if ds.name == jails {
+                    jails_bytes = ds.used;
                 } else if let Some(rest) = ds.name.strip_prefix(&vol_prefix)
                     && let Some((ns, vol)) = rest.split_once('/')
                     && !vol.contains('/')
@@ -287,6 +302,9 @@ impl<R: Runtime> AgentMetrics<R> {
             net_rx_bps,
             net_tx_bps,
             volumes,
+            images_bytes,
+            jails_bytes,
+            build_bytes: build.unwrap_or(0),
         }
     }
 
@@ -343,5 +361,45 @@ impl<R: Runtime> AgentMetrics<R> {
             pods: infra.len(),
             containers: running.into_iter().zip(usage).collect(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use legion_sys::FakeSys;
+
+    use super::AgentMetrics;
+    use crate::fake::FakeRuntime;
+
+    #[tokio::test]
+    async fn the_space_is_told_by_what_holds_it() {
+        let sys = Arc::new(FakeSys::new());
+        sys.set_dataset_space("tank/legion", 70, 30);
+        sys.set_dataset_space("tank/legion/images", 40, 30);
+        sys.set_dataset_space("tank/legion/jails", 10, 30);
+        sys.set_dataset_space("tank/legion/volumes/shop/data", 20, 5);
+        sys.set_dataset_space("tank/jailer", 15, 30);
+        sys.set_dataset_space("tank/jailer/layers", 15, 30);
+        let metrics = AgentMetrics {
+            runtime: Arc::new(FakeRuntime::new(sys.clone())),
+            sys,
+            node: "n1".to_owned(),
+            zfs_root: Some("tank/legion".to_owned()),
+            build_root: Some("tank/jailer".to_owned()),
+        };
+        let t = metrics.node_telemetry(&mut None).await;
+        assert_eq!((t.zfs_used_bytes, t.zfs_avail_bytes), (70, 30));
+        assert_eq!((t.images_bytes, t.jails_bytes, t.build_bytes), (40, 10, 15));
+        assert_eq!(t.volumes.len(), 1, "{:?}", t.volumes);
+        assert_eq!(t.volumes[0].used_bytes, 20);
+
+        // A node with no jailer store says 0 of it.
+        let none = AgentMetrics {
+            build_root: Some("tank/nothere".to_owned()),
+            ..metrics.clone()
+        };
+        assert_eq!(none.node_telemetry(&mut None).await.build_bytes, 0);
     }
 }
