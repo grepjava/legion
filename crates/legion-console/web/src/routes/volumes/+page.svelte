@@ -13,7 +13,7 @@
     type VolumeSpace
   } from '#lib/api.ts';
   import { t, tn } from '#lib/i18n.svelte.ts';
-  import { cannotWrite, namespaces, session } from '#lib/session.svelte.ts';
+  import { cannotWrite, cannotWriteAnywhere, namespaces, session } from '#lib/session.svelte.ts';
 
   let adminNamespaces: string[] = $state([]);
   let volumes: LObject[] = $state([]);
@@ -86,7 +86,7 @@
     const m = new Map<string, VolumeSpace>();
     for (const nu of nodeUsage) {
       for (const vs of nu.volumes ?? []) {
-        m.set(`${vs.namespace}/${vs.name}`, vs);
+        m.set(`${vs.namespace}/${vs.volume}`, vs);
       }
     }
     return m;
@@ -369,6 +369,8 @@
       busy = false;
     }
   }
+  // A Volume is made or restored in a namespace one may write in.
+  const anyWhy = $derived(cannotWriteAnywhere());
 </script>
 
 <header class="bar">
@@ -380,7 +382,9 @@
       placeholder={t('Filter volumes or nodes…')}
       aria-label={t('Filter volumes')}
     />
-    <button type="button" class="primary" onclick={openCreate}>{t('New Volume')}</button>
+    <button type="button" class="primary" disabled={!!anyWhy} title={anyWhy ?? ''} onclick={openCreate}
+      >{t('New Volume')}</button
+    >
   </div>
 </header>
 <p class="muted">
@@ -547,7 +551,11 @@
     {:else}
       <input placeholder={t('onto node')} bind:value={restoreNode} aria-label={t('Node')} required />
     {/if}
-    <button class="primary" disabled={busy || !restoreFiles?.length || !restoreNode.trim()}>
+    <button
+      class="primary"
+      disabled={!!anyWhy || busy || !restoreFiles?.length || !restoreNode.trim()}
+      title={anyWhy ?? ''}
+    >
       {t('Upload & Restore')}
     </button>
   </form>

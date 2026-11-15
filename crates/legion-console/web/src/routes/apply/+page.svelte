@@ -104,9 +104,15 @@
   {#if !editing}
     <div class="controls">
       <span class="muted">{t('Insert starter:')}</span>
-      <button type="button" class="sm" onclick={() => insertSnippet('service')}>{t('Service')}</button>
-      <button type="button" class="sm" onclick={() => insertSnippet('volume')}>{t('ZFS Volume')}</button>
-      <button type="button" class="sm" onclick={() => insertSnippet('build')}>{t('GHCR Build')}</button>
+      <button type="button" class="sm" disabled={!!why} title={why ?? ''} onclick={() => insertSnippet('service')}
+        >{t('Service')}</button
+      >
+      <button type="button" class="sm" disabled={!!why} title={why ?? ''} onclick={() => insertSnippet('volume')}
+        >{t('ZFS Volume')}</button
+      >
+      <button type="button" class="sm" disabled={!!why} title={why ?? ''} onclick={() => insertSnippet('build')}
+        >{t('GHCR Build')}</button
+      >
     </div>
   {/if}
 </header>

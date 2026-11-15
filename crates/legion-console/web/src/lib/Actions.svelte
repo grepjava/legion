@@ -136,6 +136,19 @@
         confirm(t('Restart {name}? Its tasks are replaced, as an update replaces them.', { name })) &&
         act(async () => (await api.restart(ns, name)).message)}>{t('Restart')}</button
     >
+    <button
+      disabled={!!why || busy}
+      title={why ??
+        (object.spec?.stopped
+          ? t('Run its tasks again, as the spec says')
+          : t('No tasks until it is started; the spec stays'))}
+      onclick={() =>
+        object.spec?.stopped
+          ? set('stopped', false, t('{name} started', { name }), t('{name} already started', { name }))
+          : confirm(t('Stop {name}? Its tasks go until it is started.', { name })) &&
+            set('stopped', true, t('{name} stopped', { name }), t('{name} already stopped', { name }))}
+      >{object.spec?.stopped ? t('Start') : t('Stop')}</button
+    >
   {:else if kind === 'CronJob'}
     <button
       disabled={!!why || busy}

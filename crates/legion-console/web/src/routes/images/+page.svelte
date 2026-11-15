@@ -13,11 +13,13 @@
     downloads,
     follow,
     type CachedNodeImage,
+    type ImageScan,
     type LObject,
     type RegistryImageInspect,
     type RegistrySearchHit
   } from '#lib/api.ts';
   import { tone } from '#lib/columns.ts';
+  import ImageDetails from '#lib/ImageDetails.svelte';
   import { t, tn } from '#lib/i18n.svelte.ts';
   import { cannotWrite, namespaces, openWorkbench, session } from '#lib/session.svelte.ts';
 
@@ -225,6 +227,41 @@
   let pushSourceRef = $state('');
   let pushTargetRef = $state('');
   let pushSecretName = $state('');
+
+  // A node's cached image, read from its store: how it was built.
+  let detailsDialog: HTMLDialogElement | undefined = $state();
+  let details: RegistryImageInspect | null = $state(null);
+  let detailsOf = $state('');
+  let detailsError = $state('');
+
+  async function showDetails(img: CachedNodeImage) {
+    detailsOf = `${img.node} · ${img.reference}`;
+    details = null;
+    detailsError = '';
+    detailsDialog?.showModal();
+    try {
+      details = await api.registryInspect(img.reference, '', '', img.node);
+    } catch (err) {
+      detailsError = (err as Error).message;
+    }
+  }
+
+  // A node's cached image audited against FreeBSD's VuXML.
+  let scanDialog: HTMLDialogElement | undefined = $state();
+  let scan: ImageScan | null = $state(null);
+  let scanError = $state('');
+
+  async function scanImage(img: CachedNodeImage) {
+    detailsOf = `${img.node} · ${img.reference}`;
+    scan = null;
+    scanError = '';
+    scanDialog?.showModal();
+    try {
+      scan = await api.scanImage(img.node, img.reference);
+    } catch (err) {
+      scanError = (err as Error).message;
+    }
+  }
 
   function openPushModal(img: CachedNodeImage) {
     pushSourceNode = img.node;
@@ -553,6 +590,7 @@
               <th scope="col">{t('Node')}</th>
               <th scope="col">{t('Platform')}</th>
               <th scope="col">{t('Layers')}</th>
+              <th scope="col">{t('Used by')}</th>
               <th scope="col">{t('Digest')}</th>
               <th scope="col">{t('Actions')}</th>
             </tr>
@@ -564,10 +602,23 @@
                 <td class="mono">{img.node}</td>
                 <td class="mono">{img.os}/{img.arch}</td>
                 <td class="mono">{img.layers}</td>
+                <td>
+                  {#each img.used_by as who (who)}
+                    <div class="mono">{who}</div>
+                  {:else}
+                    <span class="muted">{t('nothing')}</span>
+                  {/each}
+                </td>
                 <td class="mono muted" title={img.digest}>
                   {img.digest ? img.digest.slice(0, 19) : '—'}
                 </td>
                 <td class="controls">
+                  <button type="button" class="sm" onclick={() => showDetails(img)}>
+                    {t('Details')}
+                  </button>
+                  <button type="button" class="sm" onclick={() => scanImage(img)}>
+                    {t('Scan')}
+                  </button>
                   <a
                     class="button sm"
                     href={downloads.image(img.node, img.reference)}
@@ -735,6 +786,7 @@
               {/if}
             </dd>
           </dl>
+          <ImageDetails d={inspected} />
 
           <div class="controls" style="margin-top: 0.75rem">
             <button
@@ -930,6 +982,77 @@
     </div>
   {/if}
 </div>
+
+<dialog
+  bind:this={detailsDialog}
+  closedby="any"
+  aria-labelledby="image-details-title"
+  onclick={(e) => lightDismiss(e, detailsDialog)}
+>
+  <header class="bar">
+    <h2 id="image-details-title">{t('Image details')}</h2>
+    <button type="button" class="sm" onclick={() => detailsDialog?.close()}>{t('Close')}</button>
+  </header>
+  <p class="muted mono">{detailsOf}</p>
+  {#if detailsError}
+    <p class="error" role="alert">{detailsError}</p>
+  {:else if details}
+    <ImageDetails d={details} />
+  {:else}
+    <p class="muted">{t('Reading the node’s copy…')}</p>
+  {/if}
+</dialog>
+
+<dialog
+  bind:this={scanDialog}
+  closedby="any"
+  aria-labelledby="image-scan-title"
+  onclick={(e) => lightDismiss(e, scanDialog)}
+>
+  <header class="bar">
+    <h2 id="image-scan-title">{t('Vulnerabilities')}</h2>
+    <button type="button" class="sm" onclick={() => scanDialog?.close()}>{t('Close')}</button>
+  </header>
+  <p class="muted mono">{detailsOf}</p>
+  {#if scanError}
+    <p class="error" role="alert">{scanError}</p>
+  {:else if !scan}
+    <p class="muted">{t('Auditing its packages…')}</p>
+  {:else if !scan.packages.length}
+    <p>{t('No FreeBSD package database in this image: nothing to audit.')}</p>
+  {:else}
+    <p>
+      {#if scan.vulnerable.length}
+        <span class="state bad">{t('{n} vulnerable', { n: scan.vulnerable.length })}</span>
+      {:else}
+        <span class="state good">{t('no known vulnerability')}</span>
+      {/if}
+      {t('{n} packages checked against FreeBSD’s VuXML', { n: scan.packages.length })}
+    </p>
+    {#if scan.used_by.length}
+      <p>{t('Used by: {who}', { who: scan.used_by.join(', ') })}</p>
+    {/if}
+    {#each scan.vulnerable as p (p.name)}
+      <h3 class="mono">{p.name}-{p.version}</h3>
+      <ul>
+        {#each p.issues as i (i.url || i.description)}
+          <li>
+            {#if i.url}<a href={i.url} target="_blank" rel="noopener noreferrer">{i.description}</a>
+            {:else}{i.description}{/if}
+            {#if i.cves.length}<span class="mono muted">{i.cves.join(' ')}</span>{/if}
+            {#if i.affected.length}<span class="muted">{t('affects {versions}', { versions: i.affected.join(', ') })}</span>{/if}
+          </li>
+        {/each}
+      </ul>
+    {/each}
+    <details>
+      <summary>{t('Every package ({n})', { n: scan.packages.length })}</summary>
+      <ul class="mono">
+        {#each scan.packages as p (p.name)}<li>{p.name}-{p.version}</li>{/each}
+      </ul>
+    </details>
+  {/if}
+</dialog>
 
 <dialog
   bind:this={pushDialog}

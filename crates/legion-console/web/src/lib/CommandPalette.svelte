@@ -75,6 +75,9 @@
 
     const base: Item[] = [
       { id: 'nav:/', group: navGroup, label: t('Overview'), detail: 'g o', run: () => goto('/') },
+      { id: 'nav:/stacks', group: navGroup, label: t('Stacks'), detail: 'compose apps: stop / start / remove together', run: () => goto('/stacks') },
+      { id: 'nav:/diagnostics', group: navGroup, label: t('Diagnostics'), detail: 'legion doctor on every node / support bundle', run: () => goto('/diagnostics') },
+      { id: 'nav:/disk', group: navGroup, label: t('Disk usage'), detail: 'images / tasks / volumes / builds', run: () => goto('/disk') },
       { id: 'nav:/volumes', group: navGroup, label: t('Volumes Studio'), detail: 'g v · ZFS / snapshots / migrate', run: () => goto('/volumes') },
       { id: 'nav:/images', group: navGroup, label: t('Images & GHCR Hub'), detail: 'g i · OCI / search / build / push', run: () => goto('/images') },
       { id: 'nav:/topology', group: navGroup, label: t('Topology'), detail: 'g t · pf reachability & VIPs', run: () => goto('/topology') },

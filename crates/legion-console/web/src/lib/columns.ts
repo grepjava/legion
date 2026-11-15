@@ -48,7 +48,12 @@ export function columns(kind: string): Column[] {
         },
         {
           label: t('Ready'),
-          value: (o) => (o.status ? `${o.status.ready ?? 0}/${o.status.desired ?? 0}` : '')
+          value: (o) =>
+            o.spec?.stopped
+              ? t('stopped')
+              : o.status
+                ? `${o.status.ready ?? 0}/${o.status.desired ?? 0}`
+                : ''
         },
         {
           label: t('Address'),

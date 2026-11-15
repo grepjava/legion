@@ -207,9 +207,12 @@
     '/deploy': t('Deploy'),
     '/templates': t('Templates'),
     '/import': t('Import compose'),
+    '/stacks': t('Stacks'),
     '/apply': t('Apply YAML'),
     '/topology': t('Topology'),
     '/network': t('Network'),
+    '/disk': t('Disk usage'),
+    '/diagnostics': t('Diagnostics'),
     '/cluster': t('Operations'),
     '/audit': t('Audit'),
     '/settings': t('Console settings'),
@@ -358,6 +361,16 @@
             class:here={page.url.pathname === '/network'}
             aria-current={at(page.url.pathname === '/network')}>{t('Network')}</a
           >
+          <a
+            href="/disk"
+            class:here={page.url.pathname === '/disk'}
+            aria-current={at(page.url.pathname === '/disk')}>{t('Disk usage')}</a
+          >
+          <a
+            href="/diagnostics"
+            class:here={page.url.pathname === '/diagnostics'}
+            aria-current={at(page.url.pathname === '/diagnostics')}>{t('Diagnostics')}</a
+          >
 
           <h2>{t('Studios')}</h2>
           <a
@@ -369,6 +382,11 @@
             href="/images"
             class:here={page.url.pathname === '/images'}
             aria-current={at(page.url.pathname === '/images')}>{t('Images & GHCR Hub')}</a
+          >
+          <a
+            href="/stacks"
+            class:here={page.url.pathname === '/stacks'}
+            aria-current={at(page.url.pathname === '/stacks')}>{t('Stacks')}</a
           >
           <a
             href="/deploy"

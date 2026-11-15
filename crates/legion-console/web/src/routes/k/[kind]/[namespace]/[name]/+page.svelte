@@ -9,8 +9,10 @@
   import LogSearch from '#lib/LogSearch.svelte';
   import NodeTasks from '#lib/NodeTasks.svelte';
   import Rollout from '#lib/Rollout.svelte';
+  import ServicePorts from '#lib/ServicePorts.svelte';
   import Taints from '#lib/Taints.svelte';
   import TaskLogs from '#lib/TaskLogs.svelte';
+  import TaskFiles from '#lib/TaskFiles.svelte';
   import Quotas from '#lib/Quotas.svelte';
   import UsageCharts from '#lib/UsageCharts.svelte';
   import VolumeData from '#lib/VolumeData.svelte';
@@ -33,6 +35,7 @@
     | 'quota'
     | 'search'
     | 'logs'
+    | 'files'
     | 'terminal'
     | 'data'
     | 'buildlog'
@@ -75,6 +78,7 @@
     ...(kind === 'Task'
       ? [
           { id: 'logs', label: t('Logs') },
+          { id: 'files', label: t('Files') },
           { id: 'terminal', label: t('Terminal') }
         ]
       : []),
@@ -237,6 +241,7 @@
         <dd><Taints node={object} /></dd>
       {/if}
     </dl>
+    {#if kind === 'Service'}<ServicePorts service={object} />{/if}
   {:else if tab === 'buildlog'}
     <BuildLog build={object} />
   {:else if tab === 'events'}
@@ -261,6 +266,8 @@
     <VolumeData volume={object} />
   {:else if tab === 'logs'}
     <TaskLogs task={object} />
+  {:else if tab === 'files'}
+    <TaskFiles task={object} />
   {:else if tab === 'terminal'}
     <!-- Loaded when opened: the terminal is most of the console's size. -->
     {#await import('#lib/Terminal.svelte') then Terminal}

@@ -215,7 +215,7 @@ export const api = {
     ),
   /** Pulls, pushes, removes, or prunes cached images on a node or across nodes. */
   nodeImageOp: (body: {
-    op: 'pull' | 'push' | 'remove' | 'prune';
+    op: 'pull' | 'push' | 'remove' | 'prune' | 'prune-builds';
     node?: string;
     image?: string;
     target?: string;
@@ -243,11 +243,49 @@ export const api = {
     if (query) params.set('query', query);
     return call<{ results: RegistrySearchHit[] }>('GET', `/api/registry/search?${params}`);
   },
+  /** A node's cached image audited: its packages and their known vulnerabilities (`legion images scan`). */
+  scanImage: (node: string, image: string) =>
+    call<ImageScan>('GET', `/api/images/scan?${new URLSearchParams({ node, image })}`),
+  /** A directory in a task's container (`legion files`). */
+  files: (namespace: string, task: string, path: string, container = '') => {
+    const params = new URLSearchParams({ path });
+    if (container) params.set('container', container);
+    return call<{ entries: FileEntry[] }>(
+      'GET',
+      `/api/files/${encodeURIComponent(namespace)}/${encodeURIComponent(task)}?${params}`
+    );
+  },
+  /** `file` written to `path` in a task's container (`legion cp`), whole or not at all. */
+  putFile: async (namespace: string, task: string, path: string, file: File, container = '') => {
+    const params = new URLSearchParams({ path });
+    if (container) params.set('container', container);
+    const res = await fetch(
+      `/api/files/${encodeURIComponent(namespace)}/${encodeURIComponent(task)}?${params}`,
+      {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'x-legion-csrf': csrf, 'content-type': 'application/octet-stream' },
+        body: file
+      }
+    );
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 401) onSignedOut();
+    if (!res.ok) throw new ApiError(res.status, data.error ?? res.statusText);
+    return data as { path: string; bytes: number };
+  },
+  /** What `legion doctor` finds on each node, or on `node` (`legion diagnose`). */
+  diagnose: (node = '') =>
+    call<{ nodes: NodeDiagnosis[] }>(
+      'GET',
+      `/api/diagnose${node ? `?node=${encodeURIComponent(node)}` : ''}`
+    ),
   /** Inspects an OCI/`ghcr.io`/Docker image (`legion image inspect`). */
-  registryInspect: (image: string, namespace = '', secret = '') => {
+  registryInspect: (image: string, namespace = '', secret = '', node = '') => {
     const params = new URLSearchParams({ image });
     if (namespace) params.set('namespace', namespace);
     if (secret) params.set('secret', secret);
+    // A node's cached copy instead of the registry.
+    if (node) params.set('node', node);
     return call<RegistryImageInspect>('GET', `/api/registry/inspect?${params}`);
   }
 };
@@ -255,6 +293,13 @@ export const api = {
 /** Downloads, which the browser saves as files. */
 export const downloads = {
   backup: '/api/backup',
+  /** `legion support-bundle`: the cluster, Secrets left out, to send with a report. */
+  supportBundle: '/api/support-bundle',
+  file: (namespace: string, task: string, path: string, container = '') => {
+    const params = new URLSearchParams({ path, op: 'read' });
+    if (container) params.set('container', container);
+    return `/api/files/${encodeURIComponent(namespace)}/${encodeURIComponent(task)}?${params}`;
+  },
   volume: (namespace: string, name: string) =>
     `/api/volume-backup/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
   image: (node: string, image: string, tag = '') => {
@@ -264,6 +309,45 @@ export const downloads = {
   }
 };
 
+export interface ImageScan {
+  image: string;
+  node: string;
+  /** Every FreeBSD package in it; none without a package database. */
+  packages: { name: string; version: string }[];
+  vulnerable: {
+    name: string;
+    version: string;
+    issues: { description: string; cves: string[]; url: string; affected: string[] }[];
+  }[];
+  used_by: string[];
+}
+
+export interface FileEntry {
+  name: string;
+  kind: 'file' | 'dir' | 'link' | 'other';
+  size: number;
+  /** Permission bits in octal: `644`. */
+  mode: string;
+  /** Unix seconds. */
+  modified: number;
+  /** Where a link points, as written. */
+  target?: string;
+}
+
+export interface NodeDiagnosis {
+  node: string;
+  /** Why the node could not be asked. */
+  error: string;
+  ready: boolean;
+  findings: {
+    id: string;
+    state: 'met' | 'unmet' | 'unknown' | 'unsupported';
+    need: 'required' | 'advised';
+    detail: string;
+    remedy: string;
+  }[];
+}
+
 export interface CachedNodeImage {
   node: string;
   reference: string;
@@ -271,6 +355,8 @@ export interface CachedNodeImage {
   os: string;
   arch: string;
   layers: number;
+  /** `Kind namespace/name` of each service, Job and cron job naming it. */
+  used_by: string[];
 }
 
 export interface RegistrySearchHit {
@@ -288,6 +374,22 @@ export interface RegistryImageInspect {
   platforms: { os: string; arch: string; digest: string }[];
   tags: string[];
   signed: boolean;
+  os: string;
+  arch: string;
+  created: string;
+  history: { created: string; created_by: string; empty_layer: boolean; size: number }[];
+  run: {
+    entrypoint: string[];
+    cmd: string[];
+    env: string[];
+    user: string;
+    working_dir: string;
+    exposed_ports: string[];
+    labels: Record<string, string>;
+  } | null;
+  /** All layers, compressed; 0 when not known. */
+  size: number;
+  used_by: string[];
 }
 
 export interface AuditFilter {
@@ -394,7 +496,8 @@ export function exec(
 
 export interface VolumeSpace {
   namespace: string;
-  name: string;
+  /** The Volume's name, as the gateway sends it. */
+  volume: string;
   used_bytes: number;
   avail_bytes: number;
 }
@@ -407,6 +510,11 @@ export interface NodeUsage {
   net_rx_bps?: number;
   net_tx_bps?: number;
   volumes?: VolumeSpace[];
+  /** Of `zfs_used_bytes`: the image store's and the tasks' roots'. */
+  images_bytes?: number;
+  jails_bytes?: number;
+  /** jailer's store on a builder, outside Legion's ZFS root. */
+  build_bytes?: number;
 }
 
 /**
