@@ -855,16 +855,29 @@ fn pod_images(api: &ApiService, caller: &Caller) -> Result<PodImages, Status> {
             } else {
                 &o.spec["pod"]
             };
-            let images = ["initContainers", "containers"]
-                .iter()
-                .filter_map(|k| pod[*k].as_array())
-                .flatten()
-                .filter_map(|c| c["image"].as_str().map(str::to_owned))
-                .collect();
-            out.push((format!("{kind} {ns}/{}", o.metadata.name), images));
+            out.push((
+                format!("{kind} {ns}/{}", o.metadata.name),
+                written_and_resolved(pod, &o.status["images"]["resolved"]),
+            ));
         }
     }
     Ok(out)
+}
+
+/// A pod's images as written, each followed by the same image by digest
+/// where the leader resolved it (`status.images.resolved`): a node caches
+/// what it pulled, the digest, so a tag alone would match nothing there.
+fn written_and_resolved(pod: &serde_json::Value, resolved: &serde_json::Value) -> Vec<String> {
+    ["initContainers", "containers"]
+        .iter()
+        .filter_map(|k| pod[*k].as_array())
+        .flatten()
+        .filter_map(|c| c["image"].as_str())
+        .flat_map(|written| {
+            let by_digest = resolved[written].as_str().map(str::to_owned);
+            std::iter::once(written.to_owned()).chain(by_digest)
+        })
+        .collect()
 }
 
 /// Those of `pods` naming `image`, cached under that reference with the
@@ -935,6 +948,25 @@ mod tests {
             ["Job b/pinned"]
         );
         assert!(used_by(&pods, "redis:7", "").is_empty());
+    }
+
+    #[test]
+    fn a_pod_naming_a_tag_uses_the_digest_it_was_resolved_to() {
+        // As in the lab: hello runs a tag; its node caches the digest the
+        // leader resolved it to, by that digest alone.
+        let tag = "docker.io/freebsd/freebsd-notoolchain:15.1";
+        let pulled = format!("docker.io/freebsd/freebsd-notoolchain@{PINNED}");
+        let pod = serde_json::json!({ "containers": [{ "name": "c", "image": tag }] });
+        let resolved = serde_json::json!({ tag: pulled });
+        let refs = written_and_resolved(&pod, &resolved);
+        assert_eq!(refs, [tag.to_owned(), pulled.clone()]);
+        let pods = vec![("Service team-a/hello".to_owned(), refs)];
+        assert_eq!(used_by(&pods, &pulled, ""), ["Service team-a/hello"]);
+        // Not yet resolved: the tag alone, which the digest doesn't match.
+        let unresolved = written_and_resolved(&pod, &serde_json::Value::Null);
+        assert_eq!(unresolved, [tag]);
+        let pods = vec![("Service team-a/hello".to_owned(), unresolved)];
+        assert!(used_by(&pods, &pulled, "").is_empty());
     }
 
     #[test]
