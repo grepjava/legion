@@ -2069,13 +2069,15 @@ impl legion_runtime::Runtime for JailRuntime {
         let read = tokio::task::spawn_blocking(move || {
             images.with_files(&img, |root| {
                 // Without a package database there is nothing to list.
-                if !root.join("var/db/pkg/local.sqlite").exists() {
+                let db = root.join("var/db/pkg");
+                if !db.join("local.sqlite").exists() {
                     return Ok(Vec::new());
                 }
-                let out = std::process::Command::new("pkg")
-                    .arg("-r")
-                    .arg(root)
-                    .args(["query", "%n\t%v"])
+                // A copy, writable, as this host's pkg upgrades an older
+                // image's schema before reading it; the layer is read-only.
+                let copy = tempfile::tempdir()?;
+                copy_package_db(&db, copy.path())?;
+                let out = pkg_query(copy.path())
                     .stdin(std::process::Stdio::null())
                     .output()?;
                 if !out.status.success() {
@@ -2226,9 +2228,60 @@ fn pty() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
     }
 }
 
+/// An image's package database (`db`, its `/var/db/pkg`) copied to `to`:
+/// `local.sqlite` with its journal or write-ahead log, if any, which hold
+/// what isn't in the file yet.
+fn copy_package_db(db: &Path, to: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(db)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("local.sqlite") && entry.file_type()?.is_file() {
+            std::fs::copy(entry.path(), to.join(&name))?;
+        }
+    }
+    Ok(())
+}
+
+/// `pkg query` of each package's name and version in the database in
+/// `dbdir`.
+fn pkg_query(dbdir: &Path) -> std::process::Command {
+    let mut c = std::process::Command::new("pkg");
+    c.arg("-o")
+        .arg(format!("PKG_DBDIR={}", dbdir.display()))
+        .args(["query", "%n\t%v"]);
+    c
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_images_package_database_is_queried_in_a_writable_copy() {
+        let image = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("local.sqlite", "db"),
+            ("local.sqlite-wal", "wal"),
+            ("vuln.xml", "not copied"),
+        ] {
+            std::fs::write(image.path().join(name), body).unwrap();
+        }
+        std::fs::create_dir(image.path().join("repos")).unwrap();
+        let copy = tempfile::tempdir().unwrap();
+        copy_package_db(image.path(), copy.path()).unwrap();
+        let mut names: Vec<_> = std::fs::read_dir(copy.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["local.sqlite", "local.sqlite-wal"]);
+        let q = pkg_query(copy.path());
+        let args: Vec<_> = q.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            args,
+            ["-o", &format!("PKG_DBDIR={}", copy.path().display()), "query", "%n\t%v"]
+        );
+    }
 
     #[tokio::test]
     async fn an_execs_output_is_kept_up_to_its_cap_and_read_to_its_end() {
