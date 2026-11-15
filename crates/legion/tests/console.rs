@@ -745,6 +745,34 @@ spec:
         found.join("\n")
     );
 
+    step("phase 6: an inline script slipped into a page does not run");
+    c.page(&mut a, "/k/Service");
+    let ran = a.eval(
+        "(() => { const s = document.createElement('script');
+           s.textContent = 'window.__slipped = 1';
+           document.body.appendChild(s);
+           return window.__slipped === 1; })()",
+    );
+    assert_eq!(
+        ran,
+        Value::Bool(false),
+        "the page's policy let an inline script run"
+    );
+
+    step("phase 6: cut off, the page says it is not current; back, it stops saying so");
+    a.page("Network.enable", serde_json::json!({}));
+    let offline = |b: &mut Browser, offline: bool| {
+        b.page(
+            "Network.emulateNetworkConditions",
+            serde_json::json!({ "offline": offline, "latency": 0,
+                "downloadThroughput": -1, "uploadThroughput": -1 }),
+        );
+    };
+    offline(&mut a, true);
+    a.shows("Not current", 60);
+    offline(&mut a, false);
+    a.until("current again", 90, |b| !b.text().contains("Not current"));
+
     for s in ["formed", "sleeper"] {
         c.lab.ok(&["delete", "service", s, "-n", "team-a"]);
     }
