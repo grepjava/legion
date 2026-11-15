@@ -378,6 +378,11 @@ spec: { text: team-b's }
         let now = hello_tasks();
         now.is_disjoint(&before) && c.image() == IMAGE && c.hello_settled(true)
     });
+    step("phase 2: hello's events: the restart, its new tasks made and running");
+    c.page(&mut e, "/k/Service/team-a/hello?tab=events");
+    e.shows("Changed", 30);
+    e.shows("Created", 30);
+    e.shows("Running", 30);
 
     step("phase 2: a task's logs");
     let (task, _) = c.task_of("hello").expect("a hello task");
