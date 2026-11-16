@@ -1,0 +1,2880 @@
+#![cfg(target_os = "freebsd")]
+
+use std::path::Path;
+use std::process::Command;
+
+mod common;
+
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// What a host command printed.
+fn host(args: &[&str]) -> String {
+    let out = Command::new(args[0]).args(&args[1..]).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A listener's image: the host's nc and the libraries it needs, on `from`.
+fn nc_context(dir: &Path, from: &str) {
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    std::fs::copy("/usr/bin/nc", dir.join("nc")).unwrap();
+    for lib in ["libipsec.so.4", "libsbuf.so.6", "libstats.so.0"] {
+        std::fs::copy(Path::new("/lib").join(lib), dir.join("lib").join(lib)).unwrap();
+    }
+    std::fs::write(
+        dir.join("Containerfile"),
+        format!("FROM {from}\nCOPY nc /usr/bin/nc\nCOPY lib/ /lib/\n"),
+    )
+    .unwrap();
+}
+
+/// A jail on an epair of its own, at 10.99.0.2 with the host at 10.99.0.1,
+/// standing in for another machine: the host's own connections to its
+/// addresses go through lo0, where pf cannot send them on.
+struct ClientJail(String);
+
+impl ClientJail {
+    fn new() -> Self {
+        let a = host(&["ifconfig", "epair", "create"]).trim().to_owned();
+        let client = ClientJail(a.clone());
+        let b = format!("{}b", a.trim_end_matches('a'));
+        host(&["ifconfig", &a, "inet", "10.99.0.1/30", "up"]);
+        host(&[
+            "jail",
+            "-c",
+            "name=jailer_test_client",
+            "path=/",
+            "vnet",
+            "persist",
+            &format!("vnet.interface={b}"),
+        ]);
+        client.exec(&["ifconfig", &b, "inet", "10.99.0.2/30", "up"]);
+        client.exec(&["route", "add", "default", "10.99.0.1"]);
+        client
+    }
+
+    fn exec(&self, args: &[&str]) -> String {
+        host(&[&["jexec", "jailer_test_client"][..], args].concat())
+    }
+
+    /// What connecting to `address` gets, trying while a listener starts.
+    fn read(&self, address: &str, port: &str) -> String {
+        let mut got = String::new();
+        for _ in 0..20 {
+            got = self.exec(&["nc", "-w", "2", address, port]);
+            if !got.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        got
+    }
+}
+
+impl Drop for ClientJail {
+    fn drop(&mut self) {
+        let _ = Command::new("jail")
+            .args(["-r", "jailer_test_client"])
+            .status();
+        let _ = Command::new("ifconfig").args([&self.0, "destroy"]).status();
+    }
+}
+
+/// The ZFS root a test runs on, plain directories if none.
+static ZFS_ROOT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn zfs_root() -> Option<String> {
+    ZFS_ROOT.lock().unwrap().clone()
+}
+
+/// The storage options of the test running. `scripts/qualify` runs each test
+/// in a process of its own, so one setting holds for the whole of it.
+fn storage() -> Vec<String> {
+    match zfs_root() {
+        Some(root) => vec!["--zfs-root".to_owned(), root],
+        None => vec!["--no-zfs".to_owned()],
+    }
+}
+
+/// Runs `test` on a ZFS root of its own, on JAILER_TEST_POOL, then fails if
+/// it left a stage's or a container's dataset: a build can succeed with one
+/// still there.
+fn on_zfs(test: fn()) {
+    struct Destroy(String);
+    impl Drop for Destroy {
+        fn drop(&mut self) {
+            // A jail just gone may hold its root a while yet.
+            for _ in 0..60 {
+                if Command::new("zfs")
+                    .args(["destroy", "-r", &self.0])
+                    .output()
+                    .is_ok_and(|o| o.status.success())
+                {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            eprintln!("{} stays", self.0);
+        }
+    }
+    let pool = std::env::var("JAILER_TEST_POOL").unwrap_or_else(|_| "zroot".to_owned());
+    let root = format!("{pool}/jailer-test-{}", std::process::id());
+    let _destroy = Destroy(root.clone());
+    *ZFS_ROOT.lock().unwrap() = Some(root.clone());
+    test();
+    let left: Vec<String> = host(&["zfs", "list", "-H", "-o", "name", "-r", &root])
+        .lines()
+        .filter(|d| {
+            d.strip_prefix(&format!("{root}/"))
+                .and_then(|d| d.split_once('/'))
+                .is_some_and(|(top, _)| top == "build" || top == "jails")
+        })
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(left, Vec::<String>::new(), "datasets left behind");
+}
+
+/// A test's directory. Layers hold files with `schg` set, which `TempDir` cannot
+/// delete, so every test that extracted an image would leave its directory.
+struct Scratch(tempfile::TempDir);
+
+impl Scratch {
+    fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("chflags")
+            .args(["-R", "noschg"])
+            .arg(self.path())
+            .output();
+    }
+}
+
+fn scratch() -> Scratch {
+    Scratch(tempfile::tempdir().unwrap())
+}
+
+/// Whether `test` can run, which takes root.
+fn live(test: &str) -> bool {
+    if is_root() {
+        return true;
+    }
+    legion_sys::live::skip(&format!("{test} requires root"));
+    false
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn real_freebsd_jail_build_run_export_workflow() {
+    if !live("real_freebsd_jail_build_run_export_workflow") {
+        return;
+    }
+
+    let bin = env!("CARGO_BIN_EXE_jailer");
+    let tmp = scratch();
+    let state_dir = tmp.path().join("state");
+    let project_dir = tmp.path().join("hello-service");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // A pool of the host's own: JAILER_TEST_POOL, zroot if unset.
+    let pool = std::env::var("JAILER_TEST_POOL").unwrap_or_else(|_| "zroot".to_owned());
+    let zfs_root = format!("{pool}/jailer-test-{}", std::process::id());
+
+    // Ensure cleanup of test ZFS dataset on exit, and first of any container
+    // a failed assertion left running, which would hold the dataset (and a
+    // pod's epair, pf anchor and address).
+    struct ZfsGuard(String, std::path::PathBuf);
+    impl Drop for ZfsGuard {
+        fn drop(&mut self) {
+            let jailer = |args: &[&str]| {
+                let state = self.1.join("state");
+                let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
+                c.arg("--state-dir")
+                    .arg(&state)
+                    .args(["--zfs-root", &self.0]);
+                c.args(args).output().ok()
+            };
+            if let Some(ps) = jailer(&["ps", "-a"]) {
+                let ps = String::from_utf8_lossy(&ps.stdout);
+                for id in ps
+                    .lines()
+                    .skip(1)
+                    .filter_map(|l| l.split_whitespace().next())
+                {
+                    jailer(&["rm", "-f", id]);
+                }
+            }
+            let _ = Command::new("zfs")
+                .args(["destroy", "-r", &self.0])
+                .status();
+            let _ = jailer::layer::remove_tree(&self.1);
+        }
+    }
+    let _guard = ZfsGuard(zfs_root.clone(), tmp.path().to_path_buf());
+
+    // 1. Run `jailer init`
+    let status = Command::new(bin)
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--zfs-root",
+            &zfs_root,
+            "init",
+            "--template",
+            "runtime",
+            "--name",
+            "hello-service",
+            project_dir.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "jailer init failed");
+    assert!(project_dir.join("Containerfile").exists());
+
+    // Write a script and Containerfile that tests COPY + RUN in a real FreeBSD jail + USER nobody
+    std::fs::write(
+        project_dir.join("hello-service"),
+        "#!/bin/sh\necho \"hello from $(whoami) in $(pwd): $* ($GREETING)\"\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            project_dir.join("hello-service"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+
+    std::fs::write(
+        project_dir.join("Containerfile"),
+        r#"FROM docker.io/freebsd/freebsd-runtime:15.1
+ENV GREETING=legion-ready
+WORKDIR /app
+COPY --chmod=0755 hello-service /usr/local/bin/hello-service
+RUN /bin/sh -c "echo built-inside-jail > /app/stamp.txt"
+RUN mkdir -p /usr/home && { [ -e /home ] || ln -s usr/home /home; }
+WORKDIR /home/app
+RUN /bin/sh -c "pwd > here.txt"
+WORKDIR /app
+USER nobody
+ENTRYPOINT ["/usr/local/bin/hello-service"]
+CMD ["default-arg"]
+"#,
+    )
+    .unwrap();
+
+    // 2. Run `jailer build`
+    let build_out = Command::new(bin)
+        .current_dir(&project_dir)
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--zfs-root",
+            &zfs_root,
+            "build",
+            "--strict",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        build_out.status.success(),
+        "jailer build failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr)
+    );
+
+    // A rebuild reuses the RUN step's layer and yields the same image
+    let rebuild_out = Command::new(bin)
+        .current_dir(&project_dir)
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--zfs-root",
+            &zfs_root,
+            "build",
+        ])
+        .output()
+        .unwrap();
+    assert!(rebuild_out.status.success());
+    let built_line = |out: &[u8]| {
+        String::from_utf8_lossy(out)
+            .lines()
+            .find(|l| l.starts_with("Built "))
+            .map(str::to_owned)
+    };
+    let rebuild_stdout = String::from_utf8_lossy(&rebuild_out.stdout);
+    assert!(rebuild_stdout.contains("Using cache"), "{rebuild_stdout}");
+    assert_eq!(
+        built_line(&rebuild_out.stdout),
+        built_line(&build_out.stdout)
+    );
+
+    // 3. Run `jailer run` in a real FreeBSD jail and verify stdout
+    let run_out = Command::new(bin)
+        .current_dir(&project_dir)
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--zfs-root",
+            &zfs_root,
+            "run",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    assert!(
+        run_out.status.success(),
+        "jailer run failed:\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    assert_eq!(
+        stdout.trim(),
+        "hello from nobody in /app: default-arg (legion-ready)"
+    );
+
+    // A squashed build runs the same, from one layer
+    let squash_out = Command::new(bin)
+        .current_dir(&project_dir)
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--zfs-root",
+            &zfs_root,
+            "build",
+            "--squash",
+            "-t",
+            "flat:1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        squash_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&squash_out.stderr)
+    );
+    let flat_out = Command::new(bin)
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--zfs-root",
+            &zfs_root,
+            "run",
+            "flat:1",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&flat_out.stdout), stdout);
+    let flat_tar = tmp.path().join("flat.tar");
+    let status = Command::new(bin)
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--zfs-root",
+            &zfs_root,
+            "export",
+            "flat:1",
+            flat_tar.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let manifest = Command::new("tar")
+        .args(["xOf", flat_tar.to_str().unwrap(), "manifest.json"])
+        .output()
+        .unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest.stdout).unwrap();
+    assert_eq!(manifest[0]["Layers"].as_array().unwrap().len(), 1);
+
+    // Verify RUN step artifact `/app/stamp.txt` inside the built image
+    let stamp_out = Command::new(bin)
+        .current_dir(&project_dir)
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--zfs-root",
+            &zfs_root,
+            "run",
+            "--entrypoint",
+            "/bin/cat",
+            "localhost/hello-service:latest",
+            "/app/stamp.txt",
+        ])
+        .output()
+        .unwrap();
+    assert!(stamp_out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&stamp_out.stdout).trim(),
+        "built-inside-jail"
+    );
+
+    // Containers as Legion runs them: detached, then ps, exec, logs, stop
+    // and rm; Legion's security defaults, with --param over them; --vnet
+    // as a pod with a member.
+    let try_cmd = |args: &[&str]| {
+        Command::new(bin)
+            .args([
+                "--state-dir",
+                state_dir.to_str().unwrap(),
+                "--zfs-root",
+                &zfs_root,
+            ])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let cmd = |args: &[&str]| {
+        let out = try_cmd(args);
+        assert!(
+            out.status.success(),
+            "jailer {args:?}:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let shell = [
+        "--entrypoint",
+        "/bin/sh",
+        "localhost/hello-service:latest",
+        "-c",
+    ];
+    let id = cmd(&[
+        &["run", "-d", "--name", "bg"][..],
+        &shell,
+        &["echo up; sleep 60"],
+    ]
+    .concat());
+    let id = id.trim();
+    assert_eq!(id.len(), 64, "{id}");
+    let ps = cmd(&["ps"]);
+    assert!(ps.contains(" bg ") && ps.contains("running (jid "), "{ps}");
+    assert_eq!(
+        cmd(&[
+            "exec",
+            "bg",
+            "/sbin/sysctl",
+            "-n",
+            "kern.securelevel",
+            "security.jail.enforce_statfs"
+        ]),
+        "2\n2\n"
+    );
+    assert_eq!(cmd(&["logs", "bg"]), "up\n");
+    cmd(&["stop", "-t", "1", &id[..12]]);
+    assert!(cmd(&["ps", "-a"]).contains("exited"));
+    cmd(&["rm", "bg"]);
+    assert!(!cmd(&["ps", "-a"]).contains(" bg "));
+
+    // `-d --rm`: removed once it exits, after this command has returned.
+    cmd(&[
+        &["run", "-d", "--rm", "--name", "gone"][..],
+        &shell,
+        &["sleep 2"],
+    ]
+    .concat());
+    assert!(cmd(&["ps"]).contains(" gone "));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while cmd(&["ps", "-a"]).contains(" gone ") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "run -d --rm left its container"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // `-d --network none`: the container is kept once it exits, and its
+    // pod, a VNET jail with the container's name as hostname, stops.
+    let pods = || {
+        let out = Command::new("jls").arg("host.hostname").output().unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| *l == "quiet")
+            .count()
+    };
+    cmd(&[
+        &["run", "-d", "--network", "none", "--name", "quiet"][..],
+        &shell,
+        &["sleep 2"],
+    ]
+    .concat());
+    assert!(pods() > 0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while pods() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an exited -d --network none container kept its pod"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(cmd(&["ps", "-a"]).contains(" quiet "));
+    cmd(&["rm", "quiet"]);
+
+    let over = cmd(&[
+        &["run", "--param", "securelevel=-1"][..],
+        &shell,
+        &["/sbin/sysctl -n kern.securelevel"],
+    ]
+    .concat());
+    assert_eq!(over, "-1\n");
+
+    let vnet = cmd(&[
+        &["run", "--network", "none"][..],
+        &shell,
+        &["/sbin/ifconfig -l; /sbin/ifconfig lo0 inet | grep -c 'inet 127.0.0.1'"],
+    ]
+    .concat());
+    assert_eq!(vnet, "lo0\n1\n");
+
+    // --cpuset-cpus holds a container, and a build's RUN steps, to its CPUs.
+    assert_eq!(
+        cmd(&[&["run", "--cpuset-cpus", "0"][..], &shell, &["/bin/nproc"]].concat()),
+        "1\n"
+    );
+    let cpus_dir = tmp.path().join("cpus");
+    std::fs::create_dir_all(&cpus_dir).unwrap();
+    std::fs::write(
+        cpus_dir.join("Containerfile"),
+        "FROM localhost/hello-service:latest\nUSER root\nRUN /bin/nproc > /cpus\n",
+    )
+    .unwrap();
+    cmd(&[
+        "build",
+        "--cpuset-cpus",
+        "0-1",
+        "-t",
+        "cpus:1",
+        cpus_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        cmd(&["run", "--entrypoint", "/bin/cat", "cpus:1", "/cpus"]),
+        "2\n"
+    );
+
+    // --vnet puts the pod on jailer's bridge; -p publishes its ports. Both
+    // need pf.conf to call jailer's anchors.
+    if host(&["pfctl", "-sn"]).contains("\"jailer/*\"") {
+        let nc_dir = tmp.path().join("nc");
+        nc_context(&nc_dir, "localhost/hello-service:latest");
+        cmd(&["build", "-t", "nc:1", nc_dir.to_str().unwrap()]);
+        cmd(&[
+            "run",
+            "-d",
+            "--name",
+            "web",
+            "-p",
+            // On the client's address alone: not every test host is private.
+            "10.99.0.1:18080:8080",
+            "--entrypoint",
+            "/bin/sh",
+            "nc:1",
+            "-c",
+            "echo hello | /usr/bin/nc -N -l 8080",
+        ]);
+        let ps = cmd(&["ps"]);
+        assert!(
+            ps.contains("10.77.0.") && ps.contains("18080:8080/tcp"),
+            "{ps}"
+        );
+        let ip = ps
+            .split_whitespace()
+            .find(|w| w.starts_with("10.77.0."))
+            .unwrap()
+            .to_owned();
+        let client = ClientJail::new();
+        let got = client.read("10.99.0.1", "18080");
+        assert_eq!(got, "hello\n", "published port 18080, from outside");
+        // jailer sets neither: on a fresh host this says --vnet works without.
+        println!(
+            "pfil_member {} pfil_local_phys {}",
+            host(&["sysctl", "-n", "net.link.bridge.pfil_member"]).trim(),
+            host(&["sysctl", "-n", "net.link.bridge.pfil_local_phys"]).trim()
+        );
+        // Its command done, the container is kept and its pod lets go of
+        // its address and port.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while Path::new("/var/run/jailer/net").join(&ip).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an exited -d container kept its address"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(cmd(&["ps", "-a"]).contains(" web "));
+        // And a pod reaches out, through the bridge and the host.
+        let mut listener = Command::new("jexec")
+            .args(["jailer_test_client", "sh", "-c", "echo hi | nc -N -l 9999"])
+            .spawn()
+            .unwrap();
+        // The listener may take its time on a busy host, and nc says nothing
+        // of a connection refused.
+        let mut got = String::new();
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let out = try_cmd(&[
+                "run",
+                "--vnet",
+                "--entrypoint",
+                "/usr/bin/nc",
+                "nc:1",
+                "-w",
+                "5",
+                "10.99.0.2",
+                "9999",
+            ]);
+            got = String::from_utf8_lossy(&out.stdout).into_owned();
+            if out.status.success() {
+                break;
+            }
+        }
+        assert_eq!(got, "hi\n");
+        listener.wait().unwrap();
+        // Right after serving TCP: the jail may be dying still.
+        cmd(&["rm", "-f", "web"]);
+        assert!(
+            !host(&["ifconfig", "-l"]).contains(" jp"),
+            "epairs are gone"
+        );
+        assert!(!Path::new("/var/run/jailer/net").join(&ip).exists());
+        for anchor in host(&["pfctl", "-a", "jailer", "-sA"]).split_whitespace() {
+            let rules = host(&["pfctl", "-a", anchor, "-sn"]);
+            assert!(!rules.contains("18080"), "{anchor}: {rules}");
+        }
+    } else {
+        // Tested still: the refusal below is what such a host gets.
+        legion_sys::live::skip("pf.conf does not call jailer's anchors");
+        let out = try_cmd(&[&["run", "--vnet"][..], &shell, &["true"]].concat());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && err.contains("rdr-anchor \"jailer/*\""),
+            "{err}"
+        );
+    }
+
+    // Resource limits are rctl rules on the container's jail, set before it
+    // starts and dropped with it.
+    let forks =
+        "(for i in 1 2 3 4 5; do sleep 1 & done; wait) 2>/dev/null && echo free || echo limited";
+    if Command::new("sysctl")
+        .args(["-n", "kern.racct.enable"])
+        .output()
+        .map(|o| o.stdout == b"1\n")
+        .unwrap_or(false)
+    {
+        assert_eq!(
+            cmd(&[&["run", "--pids-limit", "3"][..], &shell, &[forks]].concat()),
+            "limited\n"
+        );
+        assert_eq!(cmd(&[&["run"][..], &shell, &[forks]].concat()), "free\n");
+        let id = cmd(&[
+            &["run", "-d", "--name", "lim", "-m", "64m", "--cpus", "0.5"][..],
+            &shell,
+            &["sleep 60"],
+        ]
+        .concat());
+        let rules = || String::from_utf8(Command::new("rctl").output().unwrap().stdout).unwrap();
+        let set = rules();
+        assert!(
+            set.contains(&format!(
+                "jail:{}:memoryuse:sigkill=67108864/process",
+                id.trim()
+            )) && set.contains(&format!("jail:{}:pcpu:deny=50", id.trim())),
+            "{set}"
+        );
+        cmd(&["rm", "-f", "lim"]);
+        assert!(
+            !rules().contains(id.trim()),
+            "the rules go with the container"
+        );
+
+        // And on a build's RUN steps.
+        let lim_dir = tmp.path().join("limited");
+        std::fs::create_dir_all(&lim_dir).unwrap();
+        std::fs::write(
+            lim_dir.join("Containerfile"),
+            format!("FROM localhost/hello-service:latest\nUSER root\nRUN ({forks}) > /forks\n"),
+        )
+        .unwrap();
+        cmd(&[
+            "build",
+            "--pids-limit",
+            "3",
+            "-t",
+            "limited:1",
+            lim_dir.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            cmd(&["run", "--entrypoint", "/bin/cat", "limited:1", "/forks"]),
+            "limited\n"
+        );
+        assert!(
+            !rules().contains("jailer_build_"),
+            "no step's rules are left"
+        );
+
+        // Nor by a step that cannot start: a step before made its working
+        // directory a loop of links.
+        let loop_dir = tmp.path().join("looped");
+        std::fs::create_dir_all(&loop_dir).unwrap();
+        std::fs::write(
+            loop_dir.join("Containerfile"),
+            "FROM localhost/hello-service:latest\nUSER root\nWORKDIR /w\n\
+             RUN cd / && rm -rf /w && ln -s w /w\nRUN true\n",
+        )
+        .unwrap();
+        let failed = try_cmd(&[
+            "build",
+            "--pids-limit",
+            "3",
+            "-t",
+            "looped:1",
+            loop_dir.to_str().unwrap(),
+        ]);
+        assert!(
+            String::from_utf8_lossy(&failed.stderr).contains("too many links"),
+            "a looped WORKDIR fails the step: {}",
+            String::from_utf8_lossy(&failed.stderr)
+        );
+        assert!(
+            !rules().contains("jailer_build_"),
+            "no rules are left by the step that failed:\n{}",
+            rules()
+        );
+    }
+
+    // COPY --from an image; file flags and hard links kept in layers;
+    // jail parameters and SysV IPC for RUN steps.
+    let flags_dir = tmp.path().join("flags");
+    std::fs::create_dir_all(&flags_dir).unwrap();
+    std::fs::write(
+        flags_dir.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1
+COPY --from=localhost/hello-service:latest /app/stamp.txt /stamp-copy.txt
+RUN echo x > /flagged && chflags schg /flagged && ln /bin/sh /bin/sh2 && /sbin/sysctl -n kern.securelevel > /securelevel
+",
+    )
+    .unwrap();
+    cmd(&[
+        "build",
+        "--param",
+        "securelevel=1",
+        "--sysv",
+        "shm",
+        "-t",
+        "flags:1",
+        flags_dir.to_str().unwrap(),
+    ]);
+    // The image has no stat(1).
+    let seen = cmd(&[
+        "run",
+        "--entrypoint",
+        "/bin/sh",
+        "flags:1",
+        "-c",
+        "ls -lo /flagged; ls -i /bin/sh; ls -i /bin/sh2; cat /securelevel /stamp-copy.txt",
+    ]);
+    let lines: Vec<&str> = seen.lines().collect();
+    assert_eq!(lines.len(), 5, "{seen}");
+    assert!(lines[0].contains(" schg"), "{seen}");
+    let inode = |l: &str| l.split_whitespace().next().unwrap().to_owned();
+    assert_eq!(inode(lines[1]), inode(lines[2]), "{seen}");
+    assert_eq!(lines[3..], ["1", "built-inside-jail"]);
+
+    // COPY --from keeps a stage's or an image's flags and hard links.
+    std::fs::write(
+        flags_dir.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1
+ARG SRC=flags:1
+COPY --from=$SRC /flagged /bin/sh /bin/sh2 /copied/
+",
+    )
+    .unwrap();
+    cmd(&["build", "-t", "copied:1", flags_dir.to_str().unwrap()]);
+    let seen = cmd(&[
+        "run",
+        "--entrypoint",
+        "/bin/sh",
+        "copied:1",
+        "-c",
+        "ls -lo /copied/flagged; ls -i /copied/sh; ls -i /copied/sh2",
+    ]);
+    let lines: Vec<&str> = seen.lines().collect();
+    assert_eq!(lines.len(), 3, "{seen}");
+    assert!(lines[0].contains(" schg"), "{seen}");
+    assert_eq!(inode(lines[1]), inode(lines[2]), "{seen}");
+    assert_eq!(
+        cmd(&["ps", "-a"]).lines().count(),
+        1,
+        "no pods or members are left"
+    );
+
+    // Stages are ZFS clones: of the base image, or of the stage before.
+    std::fs::write(
+        flags_dir.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1 AS base
+RUN echo one > /one && chflags schg /one
+FROM base AS next
+RUN echo two > /two
+FROM next
+RUN cat /one /two > /both
+",
+    )
+    .unwrap();
+    // In zstd layers, which a real jail's root is made from as well.
+    cmd(&[
+        "build",
+        "--compression",
+        "zstd",
+        "-t",
+        "staged:1",
+        flags_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        cmd(&["run", "--entrypoint", "/bin/cat", "staged:1", "/both"]),
+        "one\ntwo\n"
+    );
+    let left = Command::new("zfs")
+        .args([
+            "list",
+            "-H",
+            "-o",
+            "name",
+            "-r",
+            &format!("{zfs_root}/build"),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&left.stdout).trim(),
+        format!("{zfs_root}/build"),
+        "a build's stage datasets go with it"
+    );
+
+    // A registry build cache: a build in another state directory takes
+    // the RUN step from it instead of running it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (addr, _registry) = common::start_mock_registry().await;
+            tx.send(addr).unwrap();
+            std::future::pending::<()>().await;
+        })
+    });
+    let registry = format!("127.0.0.1:{}", rx.recv().unwrap().port());
+    let cache_ref = format!("{registry}/me/cache:main");
+    let cached_dir = tmp.path().join("cached");
+    std::fs::create_dir_all(&cached_dir).unwrap();
+    std::fs::write(
+        cached_dir.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1\nRUN /bin/uuidgen > /id\n",
+    )
+    .unwrap();
+    cmd(&[
+        "--plain-http",
+        &registry,
+        "build",
+        "--cache-to",
+        &cache_ref,
+        "-t",
+        "cached:1",
+        cached_dir.to_str().unwrap(),
+    ]);
+    let other_state = tmp.path().join("other-state");
+    let other_zfs = format!("{zfs_root}/other");
+    let other = |args: &[&str]| {
+        let out = Command::new(bin)
+            .args([
+                "--state-dir",
+                other_state.to_str().unwrap(),
+                "--zfs-root",
+                &other_zfs,
+                "--plain-http",
+                &registry,
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "jailer {args:?}:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let built = other(&[
+        "build",
+        "--cache-from",
+        &cache_ref,
+        "-t",
+        "cached:1",
+        cached_dir.to_str().unwrap(),
+    ]);
+    assert!(built.contains("From the registry cache"), "{built}");
+    let id = |run: &dyn Fn(&[&str]) -> String| {
+        run(&["run", "--entrypoint", "/bin/cat", "cached:1", "/id"])
+    };
+    assert_eq!(id(&other), id(&cmd));
+
+    // 4. Run `jailer export app.tar`
+    let archive = tmp.path().join("app.tar");
+    let export_out = Command::new(bin)
+        .current_dir(&project_dir)
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--zfs-root",
+            &zfs_root,
+            "export",
+            archive.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        export_out.status.success(),
+        "jailer export failed: {}",
+        String::from_utf8_lossy(&export_out.stderr)
+    );
+    assert!(Path::new(&archive).exists());
+
+    // 5. Run `jailer check`
+    let check_out = Command::new(bin)
+        .current_dir(&project_dir)
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--zfs-root",
+            &zfs_root,
+            "check",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        check_out.status.success(),
+        "jailer check failed: {}",
+        String::from_utf8_lossy(&check_out.stderr)
+    );
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn run_mounts_reach_the_step_but_not_the_image() {
+    if !live("run_mounts_reach_the_step_but_not_the_image") {
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_jailer");
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(ctx.join("data")).unwrap();
+    std::fs::write(ctx.join("data/a.txt"), "original\n").unwrap();
+    std::fs::write(ctx.join("data/hidden.txt"), "ignored\n").unwrap();
+    std::fs::write(ctx.join(".containerignore"), "data/hidden.txt\n").unwrap();
+    std::fs::write(ctx.join("tok.txt"), "s3cr3t-value").unwrap();
+    std::fs::write(
+        ctx.join("Containerfile"),
+        r#"# syntax=docker/dockerfile:1
+FROM docker.io/freebsd/freebsd-runtime:15.1
+RUN --mount=type=cache,target=/var/cache/thing sh -c 'echo run >> /var/cache/thing/log; n=0; while read l; do n=$((n+1)); done < /var/cache/thing/log; echo $n > /count'
+RUN --mount=type=bind,source=data,target=/data,rw sh -c 'cat /data/a.txt > /bound; echo scribble > /data/a.txt'
+RUN --mount=type=secret,id=tok sh -c 'v=$(cat /run/secrets/tok); echo ${#v} > /secretlen'
+RUN --mount=type=tmpfs,target=/scratch sh -c 'df -t tmpfs /scratch >/dev/null && echo yes > /tmpfs'
+RUN --network=none sh -c 'ifconfig -l > /ifs'
+RUN --mount=type=ssh sh -c 'test -S "$SSH_AUTH_SOCK" && echo "$SSH_AUTH_SOCK" > /ssh'
+RUN --mount=type=ssh,target=/etc/agent.sock sh -c 'test -S /etc/agent.sock && test -s /etc/passwd && echo kept > /etcssh'
+RUN --mount=type=ssh,target=/run/buildkit/a.sock --mount=type=ssh,target=/run/buildkit/b.sock sh -c 'test -S /run/buildkit/a.sock && test -S /run/buildkit/b.sock'
+RUN --mount=type=bind,target=/ctx ls /ctx/data > /ctxls
+RUN --mount=type=bind,from=docker.io/freebsd/freebsd-runtime:15.1,source=/bin,target=/img test -x /img/sh && echo yes > /fromimg
+RUN <<EOF
+echo heredoc-$((1+1)) > /hd
+EOF
+RUN <<EOF
+#!/bin/sh -e
+echo shebang > /sb
+EOF
+RUN cat <<A > /two && cat <<'B' >> /two
+x-$((2+3))
+A
+y-$((2+3))
+B
+CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd sb ssh etcssh two; do printf '%s=%s ' $f $(cat /$f); done; for d in /var/cache/thing /data /run/secrets /scratch /ctx /img /run/buildkit /etc/agent.sock; do test -e $d && printf 'leaked=%s ' $d; done; echo"]
+"#,
+    )
+    .unwrap();
+
+    let jailer = |args: &[&str]| {
+        let out = Command::new(bin)
+            .current_dir(&ctx)
+            .args(["--state-dir", state.to_str().unwrap()])
+            .args(storage())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "jailer {args:?}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = jailer::layer::remove_tree(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(tmp.path().to_path_buf());
+
+    // An SSH agent for `--mount=type=ssh`
+    let agent_sock = tmp.path().join("agent.sock");
+    struct Agent(std::process::Child);
+    impl Drop for Agent {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _agent = Agent(
+        Command::new("ssh-agent")
+            .arg("-D")
+            .arg("-a")
+            .arg(&agent_sock)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    while !agent_sock.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let ssh_arg = format!("default={}", agent_sock.display());
+
+    let build = [
+        "build",
+        "--no-cache",
+        "--secret",
+        "id=tok,src=tok.txt",
+        "--ssh",
+        &ssh_arg,
+        "-t",
+        "m:1",
+        ".",
+    ];
+    jailer(&build);
+    assert_eq!(
+        jailer(&["run", "m:1"]),
+        "count=1 bound=original secretlen=12 tmpfs=yes ifs=lo0 ctxls=a.txt fromimg=yes hd=heredoc-2 sb=shebang ssh=/run/buildkit/ssh_agent.0 etcssh=kept two=x-5 y-$((2+3))="
+    );
+    // The cache mount keeps its contents; the rw bind left the context alone.
+    jailer(&build);
+    assert!(jailer(&["run", "m:1"]).starts_with("count=2 "));
+    assert_eq!(
+        std::fs::read_to_string(ctx.join("data/a.txt")).unwrap(),
+        "original\n"
+    );
+    // The secret's value is in no layer.
+    jailer(&["export", "m:1", tmp.path().join("m.tar").to_str().unwrap()]);
+    let layers = Command::new("sh")
+        .arg("-c")
+        .arg("mkdir x && tar xf m.tar -C x && for l in x/blobs/sha256/*; do tar xzf $l -O 2>/dev/null; done")
+        .current_dir(tmp.path())
+        .output()
+        .unwrap()
+        .stdout;
+    assert!(!String::from_utf8_lossy(&layers).contains("s3cr3t-value"));
+
+    // A step that puts a link in place of the directory made for its agent
+    // does not take what is removed after it out to the host's files.
+    let host = tmp.path().join("host");
+    std::fs::create_dir_all(host.join("z")).unwrap();
+    let _host_sock = std::os::unix::net::UnixListener::bind(host.join("z/c.sock")).unwrap();
+    std::fs::write(
+        ctx.join("Containerfile.links"),
+        format!(
+            "FROM docker.io/freebsd/freebsd-runtime:15.1\n\
+             RUN --mount=type=ssh,target=/run/y/z/c.sock sh -c 'rm -rf /run/y && ln -s {} /run/y'\n",
+            host.display()
+        ),
+    )
+    .unwrap();
+    jailer(&[
+        "build",
+        "--no-cache",
+        "--ssh",
+        &ssh_arg,
+        "-f",
+        "Containerfile.links",
+        "-t",
+        "links:1",
+        ".",
+    ]);
+    assert!(
+        std::fs::symlink_metadata(host.join("z/c.sock")).is_ok(),
+        "the host's socket is still there"
+    );
+
+    // A directory .containerignore leaves out, with a file put back, mounts
+    // with that file; the mode of a mounted directory and the size of a
+    // tmpfs are in the steps' keys.
+    let ctx2 = tmp.path().join("ctx2");
+    std::fs::create_dir_all(ctx2.join("docs")).unwrap();
+    std::fs::create_dir_all(ctx2.join("m")).unwrap();
+    std::fs::write(ctx2.join("docs/keep.txt"), "k").unwrap();
+    std::fs::write(ctx2.join("docs/drop.txt"), "d").unwrap();
+    std::fs::write(ctx2.join(".containerignore"), "docs\n!docs/keep.txt\n").unwrap();
+    let mounts_cf = |size: &str| {
+        std::fs::write(
+            ctx2.join("Containerfile"),
+            format!(
+                "FROM docker.io/freebsd/freebsd-runtime:15.1\n\
+                 RUN --mount=type=bind,source=docs,target=/d ls /d > /docs\n\
+                 RUN --mount=type=tmpfs,target=/t,size={size} df -k /t > /size\n\
+                 RUN --mount=type=bind,source=m,target=/m ls -ld /m > /mode\n\
+                 CMD [\"/bin/cat\", \"/docs\", \"/mode\", \"/size\"]\n"
+            ),
+        )
+        .unwrap();
+    };
+    let seen = || {
+        jailer(&["build", "-t", "k:1", ctx2.to_str().unwrap()]);
+        let out = jailer(&["run", "k:1"]);
+        let lines: Vec<&str> = out.lines().collect();
+        let mode = lines[1].split_whitespace().next().unwrap().to_owned();
+        let blocks = lines
+            .last()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_owned();
+        (lines[0].to_owned(), mode, blocks)
+    };
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(ctx2.join("m"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    // One change at a time, each to a step after which nothing else would
+    // run again anyway.
+    mounts_cf("1m");
+    assert_eq!(
+        seen(),
+        ("keep.txt".into(), "drwxr-xr-x".into(), "1024".into())
+    );
+    mounts_cf("2m");
+    assert_eq!(
+        seen(),
+        ("keep.txt".into(), "drwxr-xr-x".into(), "2048".into())
+    );
+    std::fs::set_permissions(ctx2.join("m"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        seen(),
+        ("keep.txt".into(), "drwx------".into(), "2048".into())
+    );
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid() {
+    if !live("cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid") {
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_jailer");
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let ctx = tmp.path().join("ctx");
+    let other = tmp.path().join("other");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(ctx.join("tool"), "#!/bin/sh\n").unwrap();
+    // The first step makes /v empty, and from then on not; the second makes
+    // nothing while /v is empty.
+    std::fs::write(
+        ctx.join("Containerfile"),
+        r#"FROM docker.io/freebsd/freebsd-runtime:15.1
+RUN --mount=type=cache,target=/c sh -c 'cat /c/n > /v 2>/dev/null; echo x >> /c/n'
+RUN sh -c 'if test -s /v; then : > /nonempty; fi'
+COPY --chown=nobody:nobody --chmod=4755 tool /tool
+CMD ["/bin/sh", "-c", "set -- $(ls -l /tool); echo $1 $3:$4; test -e /nonempty && echo nonempty || echo empty"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        other.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1\nLABEL other=1\n",
+    )
+    .unwrap();
+    let jailer = |args: &[&str]| {
+        let out = Command::new(bin)
+            .args(["--state-dir", state.to_str().unwrap()])
+            .args(storage())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "jailer {args:?}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = jailer::layer::remove_tree(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(tmp.path().to_path_buf());
+
+    let ctx_arg = ctx.to_str().unwrap();
+    jailer(&["build", "-t", "c:1", ctx_arg]);
+    assert_eq!(jailer(&["run", "c:1"]), "-rwsr-xr-x nobody:nobody\nempty");
+    // Without the image, a trim drops the first step's layer from the
+    // cache; the second step, which made nothing, keeps its entry.
+    jailer(&["rmi", "c:1"]);
+    jailer(&[
+        "build",
+        "--cache-max",
+        "0",
+        "-t",
+        "o:1",
+        other.to_str().unwrap(),
+    ]);
+    // Run again, the first step makes another /v: the second must run too.
+    jailer(&["build", "-t", "c:2", ctx_arg]);
+    assert_eq!(
+        jailer(&["run", "c:2"]),
+        "-rwsr-xr-x nobody:nobody\nnonempty"
+    );
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn stage_copies_keep_owners_archives_take_flags_and_cache_options_count() {
+    if !live("stage_copies_keep_owners_archives_take_flags_and_cache_options_count") {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let bin = env!("CARGO_BIN_EXE_jailer");
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let ctx = tmp.path().join("ctx");
+    let packed = tmp.path().join("packed");
+    std::fs::create_dir_all(ctx.join("d")).unwrap();
+    std::fs::create_dir_all(&packed).unwrap();
+    let mode = |p: &std::path::Path, m: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    };
+    std::fs::write(ctx.join("f"), "f\n").unwrap();
+    std::fs::write(ctx.join("d/g"), "g\n").unwrap();
+    std::fs::write(packed.join("t"), "#!/bin/sh\n").unwrap();
+    mode(&ctx.join("d"), 0o755);
+    mode(&ctx.join("d/g"), 0o644);
+    mode(&packed.join("t"), 0o644);
+    let tar = Command::new("tar")
+        .arg("-cf")
+        .arg(ctx.join("a.tar"))
+        .arg("-C")
+        .arg(&packed)
+        .arg("t")
+        .status()
+        .unwrap();
+    assert!(tar.success());
+    // A named pipe, which a copy makes again rather than reads.
+    let fifo = Command::new("mkfifo")
+        .arg(ctx.join("queue"))
+        .status()
+        .unwrap();
+    assert!(fifo.success());
+    let containerfile = |cache_opts: &str| {
+        std::fs::write(
+            ctx.join("Containerfile"),
+            format!(
+                r#"FROM docker.io/freebsd/freebsd-runtime:15.1 AS base
+COPY --chown=nobody:nobody --chmod=0640 f /owned
+COPY --chown=nobody:nobody d /d
+COPY queue /queue
+FROM docker.io/freebsd/freebsd-runtime:15.1
+COPY --from=base /owned /owned
+COPY --from=base /d /d
+COPY --from=base /queue /queue
+ARG ID=c
+ADD --chown=nobody:nobody --chmod=4755 a.tar /arc/
+RUN --mount=type=cache,id=$ID,target=/c,sharing=locked{cache_opts} --mount=type=cache,id=$ID,target=/c2,sharing=locked sh -c 'if (: > /c/x) 2>/dev/null; then echo w; else echo ro; fi > /rc'
+CMD ["/bin/sh", "-c", "for f in /owned /d /d/g /arc/t; do set -- $(ls -ld $f); echo $1 $3:$4; done; test -p /queue && echo pipe; cat /rc"]
+"#
+            ),
+        )
+        .unwrap();
+    };
+    let jailer = |args: &[&str]| {
+        let out = Command::new(bin)
+            .args(["--state-dir", state.to_str().unwrap()])
+            .args(storage())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "jailer {args:?}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = jailer::layer::remove_tree(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(tmp.path().to_path_buf());
+
+    let ctx_arg = ctx.to_str().unwrap();
+    let owners = "-rw-r----- nobody:nobody\n\
+                  drwxr-xr-x nobody:nobody\n\
+                  -rw-r--r-- nobody:nobody\n\
+                  -rwsr-xr-x nobody:nobody";
+    containerfile("");
+    jailer(&["build", "-t", "o:1", ctx_arg]);
+    assert_eq!(jailer(&["run", "o:1"]), format!("{owners}\npipe\nw"));
+    // A read-only cache is another step: it runs again, and cannot write.
+    containerfile(",ro");
+    jailer(&["build", "-t", "o:2", ctx_arg]);
+    assert_eq!(jailer(&["run", "o:2"]), format!("{owners}\npipe\nro"));
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn the_pods_hostname_wins_and_a_stop_ends_an_attached_run() {
+    if !live("the_pods_hostname_wins_and_a_stop_ends_an_attached_run") {
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_jailer");
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::write(
+        ctx.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1\nENV HOSTNAME=from-image\n",
+    )
+    .unwrap();
+    let jailer = || {
+        let mut c = Command::new(bin);
+        c.args(["--state-dir", state.to_str().unwrap()])
+            .args(storage());
+        c
+    };
+    let ok = |args: &[&str]| {
+        let out = jailer().args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "jailer {args:?}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    // Ends a run a failed assertion left attached, then its files.
+    struct Cleanup(std::path::PathBuf, Option<std::process::Child>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Some(mut run) = self.1.take() {
+                let _ = run.kill();
+                let _ = run.wait();
+            }
+            let _ = Command::new(env!("CARGO_BIN_EXE_jailer"))
+                .arg("--state-dir")
+                .arg(self.0.join("state"))
+                .args(storage())
+                .args(["rm", "-f", "attached"])
+                .output();
+            let _ = jailer::layer::remove_tree(&self.0);
+        }
+    }
+    let mut cleanup = Cleanup(tmp.path().to_path_buf(), None);
+
+    ok(&["build", "-t", "h:1", ctx.to_str().unwrap()]);
+
+    // Run without a shell, which would hide a duplicate.
+    let env = ok(&[
+        "run",
+        "--hostname",
+        "the-pod",
+        "--entrypoint",
+        "/usr/bin/env",
+        "h:1",
+    ]);
+    let names: Vec<_> = env.lines().filter(|l| l.starts_with("HOSTNAME=")).collect();
+    assert_eq!(names, ["HOSTNAME=the-pod"], "{env}");
+
+    let run = jailer()
+        .args([
+            "run",
+            "--rm",
+            "--name",
+            "attached",
+            "--entrypoint",
+            "/bin/sleep",
+            "h:1",
+            "300",
+        ])
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    cleanup.1 = Some(run);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !ok(&["ps"]).contains("attached") {
+        assert!(std::time::Instant::now() < deadline, "never started");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // The container goes at once: no waiting out the stop's 10 seconds.
+    let asked = std::time::Instant::now();
+    ok(&["stop", "attached"]);
+    assert!(asked.elapsed().as_secs() < 9, "{:?}", asked.elapsed());
+
+    // `run` lives to report the exit and remove the container.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = cleanup.1.as_mut().unwrap().try_wait().unwrap() {
+            break status;
+        }
+        assert!(std::time::Instant::now() < deadline, "run never returned");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    cleanup.1 = None;
+    assert_eq!(status.code(), Some(143), "{status:?}");
+    let all = ok(&["ps", "-a"]);
+    assert!(!all.contains("attached"), "{all}");
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn a_signal_to_exec_ends_its_command() {
+    if !live("a_signal_to_exec_ends_its_command") {
+        return;
+    }
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::write(
+        ctx.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1\n",
+    )
+    .unwrap();
+    let jailer = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
+        c.args(["--state-dir", state.to_str().unwrap()])
+            .args(storage());
+        c
+    };
+    let ok = |args: &[&str]| {
+        let out = jailer().args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "jailer {args:?}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = Command::new(env!("CARGO_BIN_EXE_jailer"))
+                .arg("--state-dir")
+                .arg(self.0.join("state"))
+                .args(storage())
+                .args(["rm", "-f", "held"])
+                .output();
+            let _ = jailer::layer::remove_tree(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(tmp.path().to_path_buf());
+    ok(&["build", "-t", "e:1", ctx.to_str().unwrap()]);
+    let entry = ["--entrypoint", "/bin/sleep", "e:1"];
+    ok(&[&["run", "-d", "--name", "held"][..], &entry, &["300"]].concat());
+
+    // The command itself, not the jailer or shim naming it.
+    let running = |seconds: &str| {
+        Command::new("pgrep")
+            .args(["-f", &format!("^/bin/sleep {seconds}$")])
+            .status()
+            .unwrap()
+            .success()
+    };
+    let wait_for = |what: &str, done: &mut dyn FnMut() -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+    for (signal, seconds) in [(libc::SIGINT, "7701"), (libc::SIGTERM, "7702")] {
+        let mut exec = jailer()
+            .args(["exec", "held", "/bin/sleep", seconds])
+            .spawn()
+            .unwrap();
+        wait_for("never started", &mut || running(seconds));
+        unsafe { libc::kill(exec.id() as i32, signal) };
+        let status = exec.wait().unwrap();
+        wait_for("left running in the jail", &mut || !running(seconds));
+        assert_eq!(status.code(), Some(128 + signal), "{status:?}");
+    }
+
+    // On a terminal, Ctrl-C is the command's: this one catches it and goes
+    // on, with its terminal, to its own exit. script(1) makes the terminal,
+    // and a byte written to it the keypress.
+    let out = tmp.path().join("out");
+    let mut terminal = Command::new("script")
+        .args(["-q", "/dev/null", env!("CARGO_BIN_EXE_jailer")])
+        .args(["--state-dir", state.to_str().unwrap()])
+        .args(storage())
+        .args(["exec", "-t", "held", "/bin/sh", "-c"])
+        .arg("trap 'echo caught' INT; /bin/sleep 7703; echo done; exit 5")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::fs::File::create(&out).unwrap())
+        .spawn()
+        .unwrap();
+    wait_for("never started", &mut || running("7703"));
+    let mut keys = terminal.stdin.take().unwrap();
+    std::io::Write::write_all(&mut keys, b"").unwrap();
+    let status = terminal.wait().unwrap();
+    let said = std::fs::read_to_string(&out).unwrap();
+    assert!(said.contains("caught") && said.contains("done"), "{said}");
+    assert_eq!(
+        status.code(),
+        Some(5),
+        "{status:?}
+{said}"
+    );
+    drop(keys);
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn interrupted_builds_and_runs_leave_nothing() {
+    use std::os::unix::process::CommandExt;
+    if !live("interrupted_builds_and_runs_leave_nothing") {
+        return;
+    }
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let base = tmp.path().join("base");
+    let step = tmp.path().join("step");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::create_dir_all(&step).unwrap();
+    std::fs::write(
+        base.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        step.join("Containerfile"),
+        "FROM localhost/i:1\nRUN /bin/sleep 7721\n",
+    )
+    .unwrap();
+    let jailer = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
+        c.args(["--state-dir", state.to_str().unwrap()])
+            .args(storage());
+        c
+    };
+    let ok = |args: &[&str]| {
+        let out = jailer().args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "jailer {args:?}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    fn jails(under: &Path) -> Vec<String> {
+        let out = Command::new("jls").args(["name", "path"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_once(' '))
+            .filter(|(_, path)| path.starts_with(under.to_str().unwrap()))
+            .map(|(name, _)| name.to_owned())
+            .collect()
+    }
+    fn mounts(under: &Path) -> Vec<String> {
+        let out = Command::new("mount").arg("-p").output().unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(1))
+            .filter(|at| at.starts_with(under.to_str().unwrap()))
+            .map(str::to_owned)
+            .collect()
+    }
+    // After a failed assertion: jails first, then what they held.
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for jail in jails(&self.0) {
+                let _ = Command::new("rctl")
+                    .arg("-r")
+                    .arg(format!("jail:{jail}:"))
+                    .output();
+                let _ = Command::new("jail").args(["-r", &jail]).output();
+            }
+            for mount in mounts(&self.0).iter().rev() {
+                let _ = Command::new("umount").args(["-f", mount]).output();
+            }
+            let _ = jailer::layer::remove_tree(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(tmp.path().to_path_buf());
+    let wait_for = |what: &str, done: &mut dyn FnMut() -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+    let running = |seconds: &str| {
+        Command::new("pgrep")
+            .args(["-f", &format!("^/bin/sleep {seconds}$")])
+            .status()
+            .unwrap()
+            .success()
+    };
+    let rules = || {
+        let out = Command::new("rctl").output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    ok(&["build", "-t", "i:1", base.to_str().unwrap()]);
+
+    // Ctrl-C, as a terminal sends it: to the whole group. The step goes,
+    // with its jail, mounts and limits, and so does the build.
+    let mut build = jailer()
+        .args(["build", "--pids-limit", "50", "-t", "s:1"])
+        .arg(&step)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    wait_for("the step never started", &mut || running("7721"));
+    let jail = jails(tmp.path()).pop().unwrap();
+    assert!(rules().contains(&jail), "{}", rules());
+    unsafe { libc::kill(-(build.id() as i32), libc::SIGINT) };
+    let status = build.wait().unwrap();
+    assert_eq!(status.code(), Some(130), "{status:?}");
+    assert_eq!(jails(tmp.path()), Vec::<String>::new());
+    assert_eq!(mounts(tmp.path()), Vec::<String>::new());
+    assert!(!rules().contains(&jail), "{}", rules());
+
+    // `run --rm` outlives its command to remove it: when Ctrl-C ends the
+    // command, when the command takes it and ends as it likes, and when a
+    // signal comes for `run` alone.
+    for (seconds, script, to, signal, code) in [
+        ("7722", "exec /bin/sleep 7722", -1, libc::SIGINT, 130),
+        (
+            "7723",
+            "trap 'exit 5' INT; /bin/sleep 7723 & wait",
+            -1,
+            libc::SIGINT,
+            5,
+        ),
+        ("7724", "exec /bin/sleep 7724", 1, libc::SIGTERM, 143),
+    ] {
+        let mut run = jailer()
+            .args(["run", "--rm", "--name", "gone", "--entrypoint", "/bin/sh"])
+            .args(["i:1", "-c", script])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        wait_for("the command never started", &mut || running(seconds));
+        unsafe { libc::kill(to * run.id() as i32, signal) };
+        let status = run.wait().unwrap();
+        assert_eq!(status.code(), Some(code), "{script}: {status:?}");
+        let all = ok(&["ps", "-a"]);
+        assert!(!all.contains("gone"), "{script}: {all}");
+        assert_eq!(jails(tmp.path()), Vec::<String>::new(), "{script}");
+        assert_eq!(mounts(tmp.path()), Vec::<String>::new(), "{script}");
+    }
+
+    // While `run` still copies the image, half a container is on disk.
+    std::fs::write(
+        step.join("Containerfile"),
+        "FROM localhost/i:1\nRUN /bin/dd if=/dev/zero of=/big bs=1m count=100\n",
+    )
+    .unwrap();
+    ok(&["build", "-t", "big:1", step.to_str().unwrap()]);
+    let containers = || {
+        std::fs::read_dir(state.join("containers"))
+            .unwrap()
+            .filter(|e| {
+                let entry = e.as_ref().unwrap();
+                !entry.file_name().to_string_lossy().starts_with('.')
+            })
+            .count()
+    };
+    let mut run = jailer()
+        .args(["run", "--rm", "--entrypoint", "/bin/sleep", "big:1", "7725"])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    wait_for("the container never appeared", &mut || containers() > 0);
+    unsafe { libc::kill(-(run.id() as i32), libc::SIGINT) };
+    let status = run.wait().unwrap();
+    assert_eq!(status.code(), Some(130), "{status:?}");
+    assert_eq!(containers(), 0);
+    assert_eq!(jails(tmp.path()), Vec::<String>::new());
+    assert_eq!(mounts(tmp.path()), Vec::<String>::new());
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn another_users_state_directory_is_refused_by_name() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    if !live("another_users_state_directory_is_refused_by_name") {
+        return;
+    }
+    let tmp = scratch();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let state = tmp.path().join("state");
+    let jailer = |args: &[&str]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
+        c.args(["--state-dir", state.to_str().unwrap()])
+            .args(storage())
+            .args(args);
+        c
+    };
+    assert!(jailer(&["images"]).status().unwrap().success());
+    for command in [&["images"][..], &["ps", "-a"][..], &["logs", "any"][..]] {
+        let out = jailer(command).uid(65534).gid(65534).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{command:?}");
+        assert!(
+            err.contains("another user's state directory"),
+            "{command:?}: {err}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn a_failing_stage_nothing_needs_does_not_run() {
+    if !live("a_failing_stage_nothing_needs_does_not_run") {
+        return;
+    }
+    let tmp = scratch();
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::write(
+        ctx.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1 AS unused\nRUN false\n\
+         FROM docker.io/freebsd/freebsd-runtime:15.1 AS wanted\nENV S=env\nARG S=arg\nRUN test \"$S\" = arg\n",
+    )
+    .unwrap();
+    let build = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_jailer"))
+            .args(["--state-dir"])
+            .arg(tmp.path().join("state"))
+            .args(storage())
+            .arg("build")
+            .args(args)
+            .arg(&ctx)
+            .output()
+            .unwrap()
+    };
+    let out = build(&[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = build(&["--target", "unused"]);
+    assert!(
+        !out.status.success(),
+        "the stage still fails when asked for"
+    );
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn memory_limits_each_process_not_the_container() {
+    if !live("memory_limits_each_process_not_the_container") {
+        return;
+    }
+    let tmp = scratch();
+    let jailer = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_jailer"))
+            .arg("--state-dir")
+            .arg(tmp.path().join("state"))
+            .arg("--no-zfs")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let image = "docker.io/freebsd/freebsd-runtime:15.1";
+    assert!(jailer(&["pull", image]).status.success());
+    // A shell's string, doubled until it holds 8 << `n` bytes.
+    let grow =
+        |n: u32| format!("a=xxxxxxxx; i=0; while [ $i -lt {n} ]; do a=$a$a; i=$((i+1)); done");
+
+    // A failed assertion must not leave the container running.
+    struct Remove<'a>(&'a Path);
+    impl Drop for Remove<'_> {
+        fn drop(&mut self) {
+            let _ = Command::new(env!("CARGO_BIN_EXE_jailer"))
+                .arg("--state-dir")
+                .arg(self.0.join("state"))
+                .args(storage())
+                .args(["rm", "-f", "many"])
+                .output();
+        }
+    }
+    let _remove = Remove(tmp.path());
+
+    // Sixteen processes of about 16 MB, which doubling a string can take a
+    // few times over, each under the limit and all of them over it. Each
+    // shell stays: one ending in `sleep` would exec it and let its memory go.
+    const LIMIT: u64 = 128 << 20;
+    let many = format!(
+        "for p in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do ({}; while :; do sleep 120; done) & done; wait",
+        grow(21)
+    );
+    let started = jailer(&[
+        "run", "-d", "--name", "many", "-m", "128m", image, "/bin/sh", "-c", &many,
+    ]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let id = String::from_utf8_lossy(&started.stdout).trim().to_owned();
+    let usage = |resource: &str| -> u64 {
+        let out = Command::new("rctl")
+            .args(["-u", &format!("jail:{id}")])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{resource}=")))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0)
+    };
+    let mut total = 0;
+    for _ in 0..60 {
+        total = usage("memoryuse");
+        if total > LIMIT {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(total > LIMIT, "the container reached only {total} bytes");
+    // Past the time rctl takes to act: over the limit, and all still there.
+    std::thread::sleep(std::time::Duration::from_secs(8));
+    let (total, processes) = (usage("memoryuse"), usage("maxproc"));
+    assert!(total > LIMIT, "{total} bytes left");
+    assert!(processes >= 16, "{processes} processes left");
+    assert!(jailer(&["rm", "-f", "many"]).status.success());
+
+    // One process past the limit is killed.
+    let one = format!("{}; sleep 10; echo survived", grow(25));
+    let out = jailer(&["run", "-m", "64m", image, "/bin/sh", "-c", &one]);
+    assert!(!out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("survived"));
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn an_sbom_lists_what_pkg_knows_of_an_image() {
+    if !live("an_sbom_lists_what_pkg_knows_of_an_image") {
+        return;
+    }
+    let tmp = scratch();
+    let jailer = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_jailer"))
+            .arg("--state-dir")
+            .arg(tmp.path().join("state"))
+            .arg("--no-zfs")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let image = "docker.io/freebsd/freebsd-runtime:15.1";
+    assert!(jailer(&["pull", image]).status.success());
+    let out = jailer(&["sbom", image]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let comment = doc["creationInfo"]["comment"].as_str().unwrap();
+    let packages = doc["packages"].as_array().unwrap();
+    println!("{} entries: {comment}", packages.len());
+    assert!(packages.len() > 1, "{comment}");
+    assert!(comment.contains("not listed"), "{comment}");
+    assert!(
+        packages[1]["versionInfo"]
+            .as_str()
+            .is_some_and(|v| !v.is_empty())
+    );
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn stages_at_once_overlap_share_caches_and_fail_together() {
+    if !live("stages_at_once_overlap_share_caches_and_fail_together") {
+        return;
+    }
+    let tmp = scratch();
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(&ctx).unwrap();
+    let image = "docker.io/freebsd/freebsd-runtime:15.1";
+    let build = |file: &str, jobs: &str| {
+        std::fs::write(ctx.join("Containerfile"), file).unwrap();
+        let start = std::time::Instant::now();
+        let out = Command::new(env!("CARGO_BIN_EXE_jailer"))
+            .arg("--state-dir")
+            .arg(tmp.path().join("state"))
+            .args(storage())
+            .args(["build", "--no-cache", "--jobs", jobs])
+            .arg(&ctx)
+            .output()
+            .unwrap();
+        (out, start.elapsed().as_secs_f64())
+    };
+    let ok = |(out, took): (std::process::Output, f64)| {
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        took
+    };
+
+    // Two stages of nothing but waiting, and a last one taking from both.
+    // Each says when it waited: the build's total depends on how busy the
+    // host is, and whether the two overlapped does not.
+    let wait = |n: &str| {
+        format!(
+            "FROM {image} AS {n}\n\
+             RUN echo {n}-from $(date +%s); sleep 6; echo {n}-to $(date +%s); : > /{n}\n"
+        )
+    };
+    let waits = format!(
+        "{}{}FROM {image}\nCOPY --from=a /a /a\nCOPY --from=b /b /b\n",
+        wait("a"),
+        wait("b")
+    );
+    let spans = |run: (std::process::Output, f64)| {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&run.0.stdout),
+            String::from_utf8_lossy(&run.0.stderr)
+        );
+        let took = ok(run);
+        // The step's own line names the mark too, before a `$(date`.
+        let at = |mark: &str| -> u64 {
+            let words: Vec<&str> = text.split_whitespace().collect();
+            words
+                .windows(2)
+                .find_map(|w| (w[0] == mark).then(|| w[1].parse().ok()).flatten())
+                .unwrap_or_else(|| panic!("no {mark} in: {text}"))
+        };
+        (took, (at("a-from"), at("a-to")), (at("b-from"), at("b-to")))
+    };
+    ok(build(&format!("FROM {image}\n"), "1"));
+    let (one, a, b) = spans(build(&waits, "1"));
+    assert!(a.1 <= b.0 || b.1 <= a.0, "one at a time: {a:?}, {b:?}");
+    let (two, a, b) = spans(build(&waits, "2"));
+    assert!(a.0 < b.1 && b.0 < a.1, "two at once: {a:?}, {b:?}");
+    println!("one at a time {one:.1}s, two at once {two:.1}s");
+
+    // A locked cache: one stage holds it until the other has waited for it.
+    let locked = format!(
+        "FROM {image} AS a\nRUN --mount=type=cache,id=c,target=/c,sharing=locked sleep 3\n\
+         FROM {image} AS b\nRUN --mount=type=cache,id=c,target=/c,sharing=locked sleep 3\n\
+         FROM {image}\nCOPY --from=a /etc/passwd /a\nCOPY --from=b /etc/passwd /b\n"
+    );
+    ok(build(&locked, "2"));
+
+    // One fails: the other stops with it, and nothing stays.
+    let failing = format!(
+        "FROM {image} AS a\nRUN sleep 120\nFROM {image} AS b\nRUN false\n\
+         FROM {image}\nCOPY --from=a /etc/passwd /a\nCOPY --from=b /etc/passwd /b\n"
+    );
+    let (out, took) = build(&failing, "2");
+    assert!(!out.status.success());
+    assert!(
+        took < 60.0,
+        "the waiting stage was left running: {took:.0}s"
+    );
+    let state = tmp.path().join("state");
+    let mounts = Command::new("mount").output().unwrap();
+    assert!(
+        !String::from_utf8_lossy(&mounts.stdout).contains(state.to_str().unwrap()),
+        "mounts stay"
+    );
+    let jails = Command::new("jls").arg("path").output().unwrap();
+    assert!(
+        !String::from_utf8_lossy(&jails.stdout).contains(state.to_str().unwrap()),
+        "jails stay"
+    );
+}
+
+/// What a process killed during a create leaves: a record and no root.
+/// `ps -a` must show it and `rm` must clear it, or its name stays taken.
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn a_container_left_without_its_root_is_listed_and_removed() {
+    if !live("a_container_left_without_its_root_is_listed_and_removed") {
+        return;
+    }
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1\n",
+    )
+    .unwrap();
+    let jailer = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_jailer"))
+            .args(["--state-dir", state.to_str().unwrap()])
+            .args(storage())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let ok = |args: &[&str]| {
+        let out = jailer(args);
+        assert!(
+            out.status.success(),
+            "jailer {args:?}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    ok(&["build", "-t", "i:1", project.to_str().unwrap()]);
+    ok(&[
+        "run",
+        "--network",
+        "none",
+        "--name",
+        "left",
+        "--entrypoint",
+        "/bin/sh",
+        "localhost/i:1",
+        "-c",
+        "true",
+    ]);
+
+    // Down to what the kill leaves.
+    let containers = state.join("containers");
+    let dirs: Vec<_> = std::fs::read_dir(&containers)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.join("root").is_dir())
+        .collect();
+    // Its pod has none of its own.
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    let dir = &dirs[0];
+    let root = dir.join("root");
+    if let Some(zfs) = zfs_root() {
+        let id = dir.file_name().unwrap().to_str().unwrap();
+        let clones = host(&[
+            "zfs",
+            "list",
+            "-H",
+            "-o",
+            "name",
+            "-r",
+            &format!("{zfs}/jails"),
+        ]);
+        let clone = clones
+            .lines()
+            .find(|d| d.contains(id))
+            .unwrap_or_else(|| panic!("no dataset for {id}: {clones}"));
+        assert!(
+            Command::new("zfs")
+                .args(["destroy", "-r", "-f", clone])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _ = std::fs::remove_dir(&root);
+    } else {
+        assert!(
+            Command::new("chflags")
+                .args(["-R", "0"])
+                .arg(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    for file in ["run.json", "exit.json"] {
+        let _ = std::fs::remove_file(dir.join(file));
+    }
+
+    let ps = ok(&["ps", "-a"]);
+    let line = ps
+        .lines()
+        .find(|l| l.contains(" left "))
+        .unwrap_or_default();
+    assert!(line.contains("created"), "{ps}");
+    assert_eq!(ok(&["rm", "left"]).trim(), "left");
+    assert!(!ok(&["ps", "-a"]).contains(" left "));
+    assert!(!dir.exists(), "{}", dir.display());
+    let rest: Vec<_> = std::fs::read_dir(&containers)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.join("record.json").exists())
+        .collect();
+    assert!(rest.is_empty(), "its pod stays: {rest:?}");
+}
+
+/// On the real host: `doctor` reads and changes nothing, and an ordinary
+/// user is told what they lack, not that pf is wrong.
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn doctor_reports_on_the_host_and_changes_nothing() {
+    use std::os::unix::process::CommandExt;
+    if !live("doctor_reports_on_the_host_and_changes_nothing") {
+        return;
+    }
+    let host_state = || {
+        let run = |program: &str, args: &[&str]| {
+            let out = Command::new(program).args(args).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        [
+            run("kldstat", &[]),
+            run("sysctl", &["-n", "net.inet.ip.forwarding"]),
+            run("ifconfig", &["-l"]),
+            run("pfctl", &["-a", "jailer", "-sA"]),
+        ]
+    };
+    let doctor = |args: &[&str], uid: Option<u32>| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
+        c.args(["--no-zfs", "doctor", "--json"]).args(args);
+        if let Some(uid) = uid {
+            c.uid(uid).gid(uid);
+        }
+        let out = c.output().unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!("{e}: {}", String::from_utf8_lossy(&out.stderr));
+        });
+        (out.status.success(), json)
+    };
+    let check = |json: &serde_json::Value, id: &str| {
+        json["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id)
+            .unwrap_or_else(|| panic!("no {id}: {json}"))
+            .clone()
+    };
+
+    let before = host_state();
+    let (_, all) = doctor(&[], None);
+    assert_eq!(host_state(), before, "doctor changed the host");
+    for id in [
+        "root",
+        "racct",
+        "pf.anchors",
+        "forwarding",
+        "subnet",
+        "module.pf",
+        "module.if_bridge",
+        "module.if_epair",
+        "module.nullfs",
+        "module.tmpfs",
+        "module.linux64",
+        "linux.static",
+    ] {
+        check(&all, id);
+    }
+    assert_eq!(check(&all, "root")["state"], "met");
+
+    // What a host running these tests must be fit for.
+    let (passed, some) = doctor(&["--for", "build,run,mounts"], None);
+    assert!(passed, "{some}");
+    assert_eq!(some["passed"], true);
+    assert!(
+        some["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["id"] != "racct")
+    );
+
+    let (passed, nobody) = doctor(&["--for", "vnet"], Some(65534));
+    assert!(!passed, "{nobody}");
+    assert_eq!(check(&nobody, "root")["state"], "unmet");
+    assert_eq!(check(&nobody, "pf.anchors")["state"], "unknown", "{nobody}");
+}
+
+/// `jailer` on a state directory of a test's own.
+fn jailer_in(state: &Path) -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
+    c.args(["--state-dir", state.to_str().unwrap()])
+        .args(storage());
+    c
+}
+
+fn succeeded(c: &mut Command) -> String {
+    let out = c.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{c:?}:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Removes containers, should a failed assertion leave them running.
+struct RemoveAll<'a>(&'a Path, &'a [&'a str]);
+
+impl Drop for RemoveAll<'_> {
+    fn drop(&mut self) {
+        for name in self.1 {
+            let _ = jailer_in(self.0).args(["rm", "-f", name]).output();
+        }
+    }
+}
+
+/// A port given no address is published with `(self)`, on all the host's
+/// addresses. That is why this is not for a shared host: on a public one
+/// the port would be open to the world.
+#[test]
+#[ignore = "needs root and a disposable host: scripts/jailer.qualify runs it"]
+fn a_port_given_no_address_answers_on_the_hosts_own_addresses() {
+    if !live("a_port_given_no_address_answers_on_the_hosts_own_addresses") {
+        return;
+    }
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let context = tmp.path().join("nc");
+    nc_context(&context, "docker.io/freebsd/freebsd-runtime:15.1");
+    succeeded(jailer_in(&state).args(["build", "-t", "nc:1", context.to_str().unwrap()]));
+
+    let _remove = RemoveAll(&state, &["open"]);
+    let client = ClientJail::new();
+    succeeded(jailer_in(&state).args([
+        "run",
+        "-d",
+        "--name",
+        "open",
+        "-p",
+        "18083:8080",
+        "--entrypoint",
+        "/bin/sh",
+        "nc:1",
+        "-c",
+        "while :; do echo hello | /usr/bin/nc -N -l 8080; done",
+    ]));
+
+    // The address the client came in on, and the one the host goes out on.
+    assert_eq!(client.read("10.99.0.1", "18083"), "hello\n");
+    let route = host(&["route", "-n", "get", "default"]);
+    let egress = route
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("interface: "))
+        .unwrap_or_else(|| panic!("no default route: {route}"));
+    let inet = host(&["ifconfig", egress, "inet"]);
+    let own = inet
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("inet "))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_else(|| panic!("{egress} has no address: {inet}"));
+    assert_eq!(client.read(own, "18083"), "hello\n", "on {own}");
+
+    succeeded(jailer_in(&state).args(["rm", "-f", "open"]));
+    for anchor in host(&["pfctl", "-a", "jailer", "-sA"]).split_whitespace() {
+        let rules = host(&["pfctl", "-a", anchor, "-sn"]);
+        assert!(!rules.contains("18083"), "{anchor}: {rules}");
+    }
+}
+
+/// A pod's ports that can't be taken away keep its address, or its
+/// redirects would reach whoever had it next; once they can go, it goes.
+/// A `pfctl` first on the PATH refuses for as long as `refuse` exists.
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn a_failed_teardown_keeps_the_address_until_it_can_go() {
+    use std::os::unix::fs::PermissionsExt;
+    if !live("a_failed_teardown_keeps_the_address_until_it_can_go") {
+        return;
+    }
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let project = tmp.path().join("project");
+    let bin = tmp.path().join("bin");
+    let refuse = tmp.path().join("refuse");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        project.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1\n",
+    )
+    .unwrap();
+    let pfctl = bin.join("pfctl");
+    std::fs::write(
+        &pfctl,
+        format!(
+            "#!/bin/sh\n\
+             case \" $* \" in\n\
+             *\" -a jailer/nat \"*) ;;\n\
+             *\" -a jailer/\"*\" -F \"*)\n\
+                 if [ -e {} ]; then echo 'pfctl: refused' >&2; exit 1; fi ;;\n\
+             esac\n\
+             exec /sbin/pfctl \"$@\"\n",
+            refuse.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&pfctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let shimmed = || {
+        let mut c = jailer_in(&state);
+        c.env("PATH", &path);
+        c
+    };
+    // On the test address alone, not every test host being private.
+    let run_args = |name: &'static str| {
+        [
+            "run",
+            "-d",
+            "--name",
+            name,
+            "-p",
+            "10.99.0.1:18084:8080",
+            "--entrypoint",
+            "/bin/sh",
+            "localhost/i:1",
+            "-c",
+            "sleep 300",
+        ]
+    };
+
+    succeeded(jailer_in(&state).args(["build", "-t", "i:1", project.to_str().unwrap()]));
+    let _remove = RemoveAll(&state, &["held", "next"]);
+    succeeded(shimmed().args(run_args("held")));
+    let ps = succeeded(jailer_in(&state).arg("ps"));
+    let ip = ps
+        .split_whitespace()
+        .find(|w| w.starts_with("10.77.0."))
+        .unwrap_or_else(|| panic!("no address: {ps}"))
+        .to_owned();
+    let lease = Path::new("/var/run/jailer/net").join(&ip);
+    let pod = std::fs::read_to_string(&lease)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_owned();
+    let anchor = format!("jailer/{}", &pod[pod.len().saturating_sub(12)..]);
+    assert!(host(&["pfctl", "-a", &anchor, "-sn"]).contains("18084"));
+
+    // The pod goes outside jailer, its rules refusing to.
+    std::fs::write(&refuse, "").unwrap();
+    assert!(
+        Command::new("jail")
+            .args(["-r", &pod])
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(
+        lease.exists(),
+        "the address went with its rules still there"
+    );
+    assert!(host(&["pfctl", "-a", &anchor, "-sn"]).contains("18084"));
+
+    // Still refused: the address stays, and its port with it.
+    let out = shimmed().args(run_args("next")).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("18084"), "{err}");
+    assert!(lease.exists());
+
+    // Once they can go, they do, and the address is free again.
+    std::fs::remove_file(&refuse).unwrap();
+    let _ = jailer_in(&state).args(["rm", "-f", "next"]).output();
+    succeeded(jailer_in(&state).args(run_args("next")));
+    assert!(!host(&["pfctl", "-a", &anchor, "-sn"]).contains("18084"));
+    let now = std::fs::read_to_string(&lease).unwrap_or_default();
+    assert!(!now.starts_with(&pod), "{now}");
+}
+
+/// A registry that sends logins to plain http: the password must not go.
+/// An https server of the test's own, with `SSL_CERT_FILE` trusting it.
+#[test]
+fn login_refuses_a_token_realm_that_is_not_https() {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+
+    let tmp = scratch();
+    let file = |name: &str| tmp.path().join(name);
+    let openssl = |args: &[&str]| {
+        let out = Command::new("openssl").args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let path = |name: &str| file(name).to_str().unwrap().to_owned();
+    // A CA to trust and a server's certificate from it: webpki refuses a CA
+    // certificate as a server's own.
+    let curve = [
+        "-newkey",
+        "ec",
+        "-pkeyopt",
+        "ec_paramgen_curve:P-256",
+        "-nodes",
+    ];
+    openssl(
+        &[
+            &["req", "-x509"][..],
+            &curve,
+            &["-subj", "/CN=test CA", "-days", "1"],
+            &["-keyout", &path("ca.key"), "-out", &path("ca.pem")],
+        ]
+        .concat(),
+    );
+    openssl(
+        &[
+            &["req", "-new"][..],
+            &curve,
+            &["-subj", "/CN=127.0.0.1"],
+            &["-addext", "subjectAltName=IP:127.0.0.1"],
+            &["-keyout", &path("k.pem"), "-out", &path("c.csr")],
+        ]
+        .concat(),
+    );
+    openssl(&[
+        "x509",
+        "-req",
+        "-in",
+        &path("c.csr"),
+        "-CA",
+        &path("ca.pem"),
+        "-CAkey",
+        &path("ca.key"),
+        "-CAcreateserial",
+        "-copy_extensions",
+        "copyall",
+        "-days",
+        "1",
+        "-outform",
+        "DER",
+        "-out",
+        &path("c.der"),
+    ]);
+    openssl(&[
+        "pkcs8",
+        "-topk8",
+        "-nocrypt",
+        "-in",
+        &path("k.pem"),
+        "-outform",
+        "DER",
+        "-out",
+        &path("k.der"),
+    ]);
+    let (der, pk8) = (file("c.der"), file("k.der"));
+
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![CertificateDer::from(std::fs::read(&der).unwrap())],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(std::fs::read(&pk8).unwrap())),
+    )
+    .unwrap();
+    let config = Arc::new(config);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // Where a password would go. Nothing may come.
+    let realm = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    realm.set_nonblocking(true).unwrap();
+    let realm_port = realm.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for tcp in listener.incoming() {
+            let Ok(mut tcp) = tcp else { return };
+            let Ok(mut tls) = rustls::ServerConnection::new(config.clone()) else {
+                return;
+            };
+            let mut stream = rustls::Stream::new(&mut tls, &mut tcp);
+            let mut buf = [0u8; 4096];
+            if stream.read(&mut buf).is_err() {
+                continue;
+            }
+            let _ = write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\n\
+                 WWW-Authenticate: Bearer realm=\"http://127.0.0.1:{realm_port}/token\",service=\"t\"\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.flush();
+        }
+    });
+
+    let mut login = Command::new(env!("CARGO_BIN_EXE_jailer"));
+    login
+        .env("SSL_CERT_FILE", file("ca.pem"))
+        .args(["--state-dir", path("state").as_str(), "--no-zfs", "login"])
+        .args(["--username", "u", "--password-stdin"])
+        .arg(format!("127.0.0.1:{port}"))
+        .env("HOME", tmp.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = login.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"secret\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("not https"), "{err}");
+    assert!(realm.accept().is_err(), "the login went to the http realm");
+}
+
+/// A Ctrl-C while a run starts, before its command can hear it, must end the
+/// run all the same: it would otherwise wait on a command nothing told to
+/// stop. At delays across the start, as the moment depends on the storage.
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn a_ctrl_c_while_a_run_starts_ends_it() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    if !live("a_ctrl_c_while_a_run_starts_ends_it") {
+        return;
+    }
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1
+",
+    )
+    .unwrap();
+    succeeded(jailer_in(&state).args(["build", "-t", "i:1", project.to_str().unwrap()]));
+
+    // From when its record appears: what comes before that, the signal ends
+    // outright or in its setup, and the window is some tens of milliseconds.
+    let recorded = || {
+        std::fs::read_dir(state.join("containers")).is_ok_and(|dirs| {
+            dirs.flatten()
+                .any(|d| d.path().join("record.json").exists())
+        })
+    };
+    for delay in (0..120).step_by(3) {
+        let mut command = jailer_in(&state);
+        command
+            .args(["run", "--rm", "--name", "starting"])
+            .args(["--entrypoint", "/bin/sleep", "localhost/i:1", "7726"])
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // As from a terminal: a background job, as a qualification run is,
+        // starts with SIGINT ignored, and jailer would inherit that.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+        let mut run = command.spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !recorded() {
+            assert!(std::time::Instant::now() < deadline, "no record");
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(delay));
+        unsafe { libc::kill(-(run.id() as i32), libc::SIGINT) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = run.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                unsafe { libc::kill(-(run.id() as i32), libc::SIGKILL) };
+                let _ = run.wait();
+                let _ = jailer_in(&state).args(["rm", "-f", "starting"]).output();
+                panic!("a Ctrl-C {delay} ms into a run was lost");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        // Before jailer's handlers are in place, the signal ends it outright.
+        assert!(
+            status.code() == Some(130) || status.signal() == Some(libc::SIGINT),
+            "{delay} ms: {status:?}"
+        );
+        let all = succeeded(jailer_in(&state).args(["ps", "-a"]));
+        assert!(!all.contains("starting"), "{delay} ms: {all}");
+    }
+}
+
+/// A `stop` or `rm -f` from another process while a run makes and starts its
+/// container finds nothing running yet. It must end the run all the same, not
+/// report it stopped and leave the command to start, and `--rm` taking the
+/// container away first is no failure. From when its record appears, which
+/// spends the time in making it: a `stop` takes longer to start than what
+/// follows, which Legion's own tests cover with a slow supervisor.
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn a_stop_while_a_run_starts_ends_it() {
+    use std::os::unix::process::CommandExt;
+    if !live("a_stop_while_a_run_starts_ends_it") {
+        return;
+    }
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1
+",
+    )
+    .unwrap();
+    succeeded(jailer_in(&state).args(["build", "-t", "i:1", project.to_str().unwrap()]));
+    let _remove = RemoveAll(&state, &["starting"]);
+
+    let recorded = || {
+        std::fs::read_dir(state.join("containers")).is_ok_and(|dirs| {
+            dirs.flatten()
+                .any(|d| d.path().join("record.json").exists())
+        })
+    };
+    for delay in (0..60).step_by(3) {
+        let mut run = jailer_in(&state)
+            .args(["run", "--rm", "--name", "starting"])
+            .args(["--entrypoint", "/bin/sleep", "localhost/i:1", "7727"])
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !recorded() {
+            assert!(std::time::Instant::now() < deadline, "no record");
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(delay));
+        let end: &[&str] = if delay % 2 == 0 {
+            &["stop", "starting"]
+        } else {
+            &["rm", "-f", "starting"]
+        };
+        succeeded(jailer_in(&state).args(end));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while run.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                unsafe { libc::kill(-(run.id() as i32), libc::SIGKILL) };
+                let _ = run.wait();
+                panic!("{end:?} {delay} ms into a run left the command running");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let all = succeeded(jailer_in(&state).args(["ps", "-a"]));
+        assert!(!all.contains("starting"), "{delay} ms: {all}");
+    }
+}
+
+/// Pods on a network the host chooses, one network at a time.
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn pods_run_on_the_network_given_and_only_one_at_a_time() {
+    if !live("pods_run_on_the_network_given_and_only_one_at_a_time") {
+        return;
+    }
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1\n",
+    )
+    .unwrap();
+    succeeded(jailer_in(&state).args(["build", "-t", "i:1", project.to_str().unwrap()]));
+    let _remove = RemoveAll(&state, &["chosen", "back"]);
+    let run = |name: &'static str| {
+        [
+            "run",
+            "-d",
+            "--vnet",
+            "--name",
+            name,
+            "--entrypoint",
+            "/bin/sh",
+            "localhost/i:1",
+            "-c",
+            "sleep 300",
+        ]
+    };
+
+    succeeded(
+        jailer_in(&state)
+            .args(["--pod-subnet", "10.79.0.0/24"])
+            .args(run("chosen")),
+    );
+    let ps = succeeded(jailer_in(&state).arg("ps"));
+    assert!(ps.contains("10.79.0.2"), "{ps}");
+    let bridge = host(&["ifconfig", "jailer0", "inet"]);
+    assert!(bridge.contains("10.79.0.1"), "{bridge}");
+    let nat = host(&["pfctl", "-a", "jailer/nat", "-sn"]);
+    assert!(nat.contains("10.79.0.0/24"), "{nat}");
+
+    // The bridge is that pod's while it runs.
+    let out = jailer_in(&state).args(run("back")).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("--pod-subnet"),
+        "{err}"
+    );
+    let bridge = host(&["ifconfig", "jailer0", "inet"]);
+    assert!(bridge.contains("10.79.0.1"), "{bridge}");
+
+    // Then it goes back, leaving nothing of the other network.
+    succeeded(jailer_in(&state).args(["rm", "-f", "chosen"]));
+    let _ = jailer_in(&state).args(["rm", "-f", "back"]).output();
+    succeeded(jailer_in(&state).args(run("back")));
+    let ps = succeeded(jailer_in(&state).arg("ps"));
+    assert!(ps.contains("10.77.0.2"), "{ps}");
+    let bridge = host(&["ifconfig", "jailer0", "inet"]);
+    assert!(
+        bridge.contains("10.77.0.1") && !bridge.contains("10.79."),
+        "{bridge}"
+    );
+}
+
+// The tests storage matters to, on ZFS: clones in place of copies.
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn run_mounts_reach_the_step_but_not_the_image_on_zfs() {
+    on_zfs(run_mounts_reach_the_step_but_not_the_image);
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid_on_zfs() {
+    on_zfs(cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid);
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn stage_copies_keep_owners_archives_take_flags_and_cache_options_count_on_zfs() {
+    on_zfs(stage_copies_keep_owners_archives_take_flags_and_cache_options_count);
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn interrupted_builds_and_runs_leave_nothing_on_zfs() {
+    on_zfs(interrupted_builds_and_runs_leave_nothing);
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn a_failing_stage_nothing_needs_does_not_run_on_zfs() {
+    on_zfs(a_failing_stage_nothing_needs_does_not_run);
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn stages_at_once_overlap_share_caches_and_fail_together_on_zfs() {
+    on_zfs(stages_at_once_overlap_share_caches_and_fail_together);
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn a_stop_while_a_run_starts_ends_it_on_zfs() {
+    on_zfs(a_stop_while_a_run_starts_ends_it);
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn a_ctrl_c_while_a_run_starts_ends_it_on_zfs() {
+    on_zfs(a_ctrl_c_while_a_run_starts_ends_it);
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn a_container_left_without_its_root_is_listed_and_removed_on_zfs() {
+    on_zfs(a_container_left_without_its_root_is_listed_and_removed);
+}
+
+/// Puts a sysctl back as it was when dropped.
+struct Sysctl(&'static str, String);
+
+impl Drop for Sysctl {
+    fn drop(&mut self) {
+        host(&["sysctl", &format!("{}={}", self.0, self.1)]);
+    }
+}
+
+/// `run --linux` runs a static Linux program, which names no interpreter
+/// to brand it Linux, by setting the fallback ELF brand to Linux's where the
+/// host left it unset, as Legion's agent does; a value the host chose stays,
+/// with a warning, and such a program then fails as it would on its own. It
+/// sets a sysctl of the whole host, so: disposable hosts only.
+#[test]
+#[ignore = "needs root, Linux ABI modules and a disposable host: scripts/jailer.qualify runs it"]
+fn a_static_linux_program_runs_under_linux() {
+    if !live("a_static_linux_program_runs_under_linux") {
+        return;
+    }
+    const BRAND: &str = "kern.elf64.fallback_brand";
+    let _restore = Sysctl(BRAND, host(&["sysctl", "-n", BRAND]).trim().to_owned());
+    let brand = || host(&["sysctl", "-n", BRAND]).trim().to_owned();
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    // busybox's musl image is one static program, linked under many
+    // names, with no note to brand it: its default, glibc's, names an
+    // interpreter, and so runs whatever the fallback brand.
+    let image = "docker.io/library/busybox:1.37-musl";
+    let run = || {
+        jailer_in(&state)
+            .args(["run", "--rm", "--network", "none", "--linux", image])
+            .args(["/bin/echo", "static"])
+            .output()
+            .unwrap()
+    };
+
+    // As FreeBSD leaves it: set to Linux's, and the program runs.
+    host(&["sysctl", &format!("{BRAND}=-1")]);
+    assert_eq!(brand(), "-1");
+    let out = run();
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{said}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "static\n");
+    assert!(!said.contains("warning"), "{said}");
+    assert_eq!(brand(), "3", "set to Linux's");
+
+    // FreeBSD's, as a host may choose: kept, said, and the program, being
+    // static, is refused by the kernel.
+    host(&["sysctl", &format!("{BRAND}=9")]);
+    let out = run();
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("static Linux programs will not run"),
+        "{said}"
+    );
+    assert!(
+        !out.status.success(),
+        "a static program ran unbranded: {said}"
+    );
+    assert_eq!(brand(), "9", "the host's choice kept");
+}

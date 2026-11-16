@@ -1110,6 +1110,221 @@ async fn a_volume_lost_with_its_node_is_restored_into() {
     c.stop().await;
 }
 
+/// An NFS Volume a node provides: the node makes the dataset and shares it
+/// with the cluster's nodes, the Volume's status says where, and tasks on
+/// other nodes mount it from there; deleted, it is no longer shared, its
+/// data kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_provides_an_nfs_volume_to_the_others() {
+    let c = Cluster::start(3).await;
+    c.apply(
+        r#"
+apiVersion: legion/v1
+kind: Volume
+metadata: { name: files, namespace: shop }
+spec: { driver: nfs, size: 1Gi, nfs: { node: n1 } }
+"#,
+    )
+    .await;
+    let ds = "tank/legion/exports/shop/files";
+    let n1 = &c.nodes.iter().find(|n| n.name == "n1").unwrap().sys;
+    eventually("exported by n1", async || {
+        c.list(Kind::Volume).await.iter().any(|v| {
+            v.status["export"]["path"] == format!("/{ds}").as_str()
+                && v.status["export"]["node"] == "n1"
+        })
+    })
+    .await;
+    let shared = n1.zfs_get(ds, "sharenfs").unwrap().unwrap();
+    assert!(shared.starts_with("-maproot=root "), "{shared}");
+    assert_eq!(
+        shared.split(' ').count(),
+        4,
+        "each of the three nodes: {shared}"
+    );
+    assert_eq!(n1.zfs_list(ds).unwrap()[0].quota, Some(1 << 30));
+    let server = c.list(Kind::Volume).await[0].status["export"]["server"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(shared.contains(&server), "{shared} {server}");
+
+    c.apply(
+        r#"
+apiVersion: legion/v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  mode: global
+  pod:
+    containers: [{ name: web, image: "web:1", volumeMounts: [{ name: files, path: /srv }] }]
+    volumes: [{ name: files, volume: { name: files } }]
+"#,
+    )
+    .await;
+    eventually("web running on every node", async || {
+        c.list(Kind::Task)
+            .await
+            .iter()
+            .filter(|t| t.status["state"] == "running")
+            .count()
+            == 3
+    })
+    .await;
+    // Mounted from where n1 said, on the others too.
+    let source = format!("nfs {server}:/{ds}");
+    for n in &c.nodes {
+        assert!(
+            n.sys.mount_sources().contains(&source),
+            "{}: {:?}",
+            n.name,
+            n.sys.mount_sources()
+        );
+    }
+
+    // Deleted (the Volume once nothing uses it): no longer shared, the
+    // data kept.
+    let delete = async |kind: Kind, name: &str| {
+        c.api
+            .clone()
+            .delete(legion_proto::v1::DeleteRequest {
+                r#ref: Some(legion_proto::v1::ObjectRef {
+                    kind: kind.to_string(),
+                    namespace: "shop".into(),
+                    name: name.into(),
+                }),
+                expected_version: None,
+            })
+            .await
+    };
+    delete(Kind::Service, "web").await.unwrap();
+    eventually("the Volume deleted once its tasks are gone", async || {
+        delete(Kind::Volume, "files").await.is_ok()
+    })
+    .await;
+    eventually("no longer shared", async || {
+        n1.zfs_get(ds, "sharenfs").unwrap().as_deref() == Some("off")
+    })
+    .await;
+    assert!(!n1.zfs_list(ds).unwrap().is_empty());
+    c.stop().await;
+}
+
+/// A stateful task's Volume with a replica: copied whole to another node,
+/// then what changed every so often; its node removed, the Volume carries
+/// on from the last copy there, its task with it, and a new replica is
+/// made on the node left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replicated_volume_carries_on_when_its_node_is_removed() {
+    use legion_api::volume::VolumeStatus;
+    use legion_proto::v1::{DeleteRequest, ObjectRef};
+
+    let mut c = Cluster::start(3).await;
+    c.apply(&DB.replace("MAX", "1").replace(
+        "claim: { size: 1Gi }",
+        "claim: { size: 1Gi, replica: { everySeconds: 10 } }",
+    ))
+    .await;
+    async fn status(c: &Cluster) -> VolumeStatus {
+        c.list(Kind::Volume)
+            .await
+            .into_iter()
+            .find(|v| v.metadata.name == "data-db-0")
+            .map(|v| serde_json::from_value(v.status).unwrap_or_default())
+            .unwrap_or_default()
+    }
+    async fn running_on(c: &Cluster) -> Option<String> {
+        c.list(Kind::Task)
+            .await
+            .into_iter()
+            .find(|t| t.status["state"] == "running" && t.spec["desiredState"] == "running")
+            .map(|t| t.spec["node"].as_str().unwrap_or_default().to_owned())
+    }
+    let ds = "tank/legion/volumes/shop/data-db-0";
+    let index = |c: &Cluster, name: &str| c.nodes.iter().position(|n| n.name == name).unwrap();
+    eventually("db running", async || running_on(&c).await.is_some()).await;
+    let from = status(&c).await.node;
+    c.nodes[index(&c, &from)].sys.write_dataset(ds, b"rows 1");
+
+    eventually("a first copy", async || {
+        status(&c)
+            .await
+            .replica
+            .is_some_and(|r| !r.snapshot.is_empty())
+    })
+    .await;
+    let first = status(&c).await.replica.unwrap();
+    assert_ne!(first.node, from);
+    assert_eq!(first.from, from);
+    let keeper = first.node.clone();
+    let k = index(&c, &keeper);
+    assert_eq!(
+        c.nodes[k].sys.dataset_contents(ds).as_deref(),
+        Some(&b"rows 1"[..])
+    );
+    // Unmounted there: the replica is not the Volume.
+    assert!(c.nodes[k].sys.zfs_list(ds).unwrap()[0].mountpoint.is_none());
+
+    c.nodes[index(&c, &from)].sys.write_dataset(ds, b"rows 2");
+    eventually("the next copy", async || {
+        status(&c)
+            .await
+            .replica
+            .is_some_and(|r| r.snapshot != first.snapshot && !r.snapshot.is_empty())
+    })
+    .await;
+    assert_eq!(
+        c.nodes[k].sys.dataset_contents(ds).as_deref(),
+        Some(&b"rows 2"[..])
+    );
+    let snaps = c.nodes[k].sys.zfs_snapshots(ds).unwrap();
+    assert_eq!(snaps.len(), 1, "only the last copy's snapshot: {snaps:?}");
+
+    // The node holding the data removed: it carries on from the replica.
+    let i = index(&c, &from);
+    c.stop_agent(i).await;
+    c.api
+        .clone()
+        .delete(DeleteRequest {
+            r#ref: Some(ObjectRef {
+                kind: Kind::Node.to_string(),
+                namespace: String::new(),
+                name: from.clone(),
+            }),
+            expected_version: None,
+        })
+        .await
+        .unwrap();
+    eventually("the volume on the replica's node", async || {
+        status(&c).await.node == keeper
+    })
+    .await;
+    let s = status(&c).await;
+    assert_eq!(s.lost, "");
+    assert!(
+        s.promoted
+            .contains(&format!("of {from}'s data on {keeper}")),
+        "{}",
+        s.promoted
+    );
+    eventually("db running on the replica", async || {
+        running_on(&c).await.as_deref() == Some(keeper.as_str())
+    })
+    .await;
+    assert_eq!(
+        c.nodes[k].sys.dataset_contents(ds).as_deref(),
+        Some(&b"rows 2"[..])
+    );
+    eventually("a new replica on the node left", async || {
+        status(&c)
+            .await
+            .replica
+            .is_some_and(|r| r.node != keeper && r.node != from && !r.snapshot.is_empty())
+    })
+    .await;
+    c.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stateful_data_moves_off_a_draining_node() {
     let c = Cluster::start(3).await;

@@ -137,6 +137,10 @@ pub(super) fn migrations(
                     .cloned()
                     .collect(),
                 lost: String::new(),
+                // Copied from where the data was: whole next time.
+                replica: v.status.replica.clone(),
+                promoted: v.status.promoted.clone(),
+                export: v.status.export.clone(),
             })
             .expect("serialises");
             plan.actions

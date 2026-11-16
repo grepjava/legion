@@ -71,6 +71,9 @@ struct State {
     anchors: BTreeMap<String, String>,
     tables: BTreeMap<(String, String), Vec<IpAddr>>,
     datasets: BTreeMap<String, Dataset>,
+    /// Properties set beyond those `Dataset` holds (`sharenfs`), and each
+    /// ZFS volume's size (`volsize`), by dataset and name.
+    props: BTreeMap<(String, String), String>,
     dataset_space: BTreeMap<String, (u64, u64)>,
     net_bytes: (u64, u64),
     /// Snapshots, with the order they were taken in.
@@ -497,6 +500,12 @@ impl FakeSys {
     }
 
     /// Makes `program` a volume plugin.
+    /// What each file system mounted with a source was mounted from:
+    /// `nfs server:/path`, `ufs /dev/da0`.
+    pub fn mount_sources(&self) -> Vec<String> {
+        self.state().sources.values().cloned().collect()
+    }
+
     pub fn add_plugin(&self, program: &str) {
         self.state().plugins.insert(program.to_owned());
     }
@@ -1250,8 +1259,54 @@ impl Sys for FakeSys {
         Ok(())
     }
 
+    fn zfs_create_volume(&self, name: &str, size: u64) -> Result<()> {
+        if self.state().datasets.contains_key(name) {
+            return Ok(());
+        }
+        self.zfs_create(name, &[("mountpoint", "none")])?;
+        let mut s = self.state();
+        s.no_mountpoint.remove(name);
+        s.props
+            .insert((name.to_owned(), "volsize".to_owned()), size.to_string());
+        Ok(())
+    }
+
+    fn zfs_get(&self, name: &str, prop: &str) -> Result<Option<String>> {
+        let s = self.state();
+        let Some(ds) = s.datasets.get(name) else {
+            return Ok(None);
+        };
+        Ok(Some(match prop {
+            "quota" => ds.quota.map_or("0".to_owned(), |q| q.to_string()),
+            "mountpoint" => ds.mountpoint.clone().unwrap_or_else(|| "none".to_owned()),
+            "type" => match s
+                .props
+                .contains_key(&(name.to_owned(), "volsize".to_owned()))
+            {
+                true => "volume".to_owned(),
+                false => "filesystem".to_owned(),
+            },
+            other => s
+                .props
+                .get(&(name.to_owned(), other.to_owned()))
+                .cloned()
+                .unwrap_or_else(|| if other == "sharenfs" { "off" } else { "-" }.to_owned()),
+        }))
+    }
+
     fn zfs_set(&self, name: &str, prop: &str, value: &str) -> Result<()> {
         let mut s = self.state();
+        if prop == "sharenfs" {
+            if !s.datasets.contains_key(name) {
+                return Err(fail(
+                    "zfs set",
+                    format!("cannot open '{name}': dataset does not exist"),
+                ));
+            }
+            s.props
+                .insert((name.to_owned(), prop.to_owned()), value.to_owned());
+            return Ok(());
+        }
         let ds = s.datasets.get_mut(name).ok_or_else(|| {
             fail(
                 "zfs set",
@@ -1648,6 +1703,12 @@ must destroy them to overwrite it"
 
     fn fs_type(&self, device: &str) -> Result<Option<String>> {
         let mut s = self.state();
+        // A ZFS volume's device.
+        if let Some(ds) = device.strip_prefix("/dev/zvol/")
+            && s.props.contains_key(&(ds.to_owned(), "volsize".to_owned()))
+        {
+            return Ok(s.filesystems.get(device).cloned());
+        }
         let attached = s
             .sessions
             .keys()
@@ -1725,6 +1786,15 @@ must destroy them to overwrite it"
                 .collect::<Vec<_>>()
                 .join(" "),
         );
+        // The base system's: a ZFS volume formatted, a service told.
+        match (program, args) {
+            ("newfs", [.., device]) if device.starts_with("/dev/zvol/") => {
+                s.filesystems.insert((*device).to_owned(), "ufs".to_owned());
+                return Ok(String::new());
+            }
+            ("service", [_, _]) => return Ok(String::new()),
+            _ => {}
+        }
         if !s.plugins.contains(program) {
             return Err(Error::NotFound(program.to_owned()));
         }

@@ -1,0 +1,288 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.Dd November 16, 2026
+.Dt LEGION 1
+.Os
+.Sh NAME
+.Nm legion
+.Nd container and VM orchestrator, image builder, and local jail runner for FreeBSD
+.Sh SYNOPSIS
+.Nm
+.Op Fl -server Ar host:port
+.Op Fl -identity Ar path
+.Ar command
+.Op Ar args ...
+.Nm
+.Cm build
+.Op Ar options
+.Op Ar context
+.Nm
+.Cm build vm
+.Op Fl t Ar name Ns Op : Ns Ar tag
+.Fl -disk Ar path | Fl -rootfs Ar dir Op Fl -size Ar size
+.Nm
+.Cm local
+.Op Ar local-options
+.Ar subcommand
+.Op Ar args ...
+.Nm
+.Fl V | -version
+.Sh DESCRIPTION
+.Nm
+is a container and virtual-machine orchestrator for
+.Fx
+built on jails,
+VNET,
+.Xr pf 4 ,
+.Xr rctl 8 ,
+.Xr bhyve 8 ,
+and ZFS.
+A single binary provides the node daemon
+.Pq Nm Cm daemon ,
+the cluster CLI, the native OCI image builder
+.Pq Nm Cm build ,
+and the standalone local jail/VM runner
+.Pq Nm Cm local .
+When invoked through a symlink named
+.Nm jailer ,
+.Nm
+dispatches directly to the
+.Cm local
+subcommand set.
+.Sh GLOBAL OPTIONS
+.Bl -tag -width Ds
+.It Fl -server Ar host:port
+Manager gRPC endpoint.
+Overrides
+.Ev LEGION_SERVER
+and defaults to
+.Li 127.0.0.1:7470 .
+.It Fl -identity Ar path
+PEM file holding the client certificate, private key, and cluster CA.
+Overrides
+.Ev LEGION_IDENTITY
+and defaults to
+.Pa /var/db/legion/admin.pem .
+.It Fl h , -help
+Print usage information.
+.It Fl V , -version
+Print version information.
+.El
+.Sh CLUSTER AND NODE COMMANDS
+.Bl -tag -width Ds
+.It Cm daemon Op Ar options
+Run the node daemon (manager and, on
+.Fx ,
+worker agent).
+Key options include
+.Fl -data-dir ,
+.Fl -run-dir ,
+.Fl -listen ,
+.Fl -advertise ,
+.Fl -no-agent ,
+.Fl -node-name ,
+.Fl -zfs-root ,
+.Fl -linux ,
+.Fl -metrics-listen ,
+.Fl -console-listen ,
+.Fl -ingress-listen ,
+.Fl -ingress-tls-listen ,
+and
+.Fl -insecure-registry .
+.It Cm init
+Initialize a new cluster with the reached manager as its first member.
+.It Cm join-token Ar manager|worker Op Fl -rotate
+Print or rotate the cluster join token for the given role.
+.It Cm join Ar token manager Op Ar options
+Join an existing cluster before starting the daemon.
+.It Cm status
+Show the reached manager's view of the cluster.
+.It Cm doctor Oo Fl -zfs-root Ar dataset Oc Oo Fl -json Oc
+Check whether this host meets Legion's requirements without making changes.
+.It Cm diagnose Oo Fl -node Ar name Oc Oo Fl -json Oc
+Run
+.Cm doctor
+checks across cluster nodes.
+.It Cm support-bundle Op Fl o Ar file
+Export a masked cluster diagnostics bundle.
+.It Cm backup Ar file
+Save a consistent snapshot of all cluster objects.
+.It Cm restore Op Ar file
+Restore a stopped manager's store from a backup or its own store.
+.It Cm autolock Ar enable|disable|rotate|show
+Manage manager key sealing; restarted sealed managers wait for
+.Cm unlock .
+.It Cm unlock Op Fl -key-file Ar path
+Provide the unlock key to a sealed manager on this host.
+.It Cm ca Ar rotate|status
+Rotate the cluster CA or inspect rotation progress.
+.It Cm console Ar login|settings|configure|oidc
+Generate a one-time web console sign-in URL, or view/configure console
+settings and OIDC.
+.It Cm user create Ar name Oo Fl -role Ar view|edit|admin Fl n Ar ns Oc Oo Fl o Ar file Oc
+Create a user client certificate PEM and optional
+.Li RoleBinding .
+.It Cm node Ar drain|pause|activate|promote|demote|label|require
+Manage node availability, manager role, labels, and host readiness requirements.
+.El
+.Sh WORKLOAD AND OBSERVABILITY COMMANDS
+.Bl -tag -width Ds
+.It Cm apply Fl f Ar file|-
+Create or update objects from YAML or JSON.
+.It Cm diff Fl f Ar file|-
+Preview changes
+.Cm apply
+would make; exits 1 if differences exist.
+.It Cm get Ar kind name Oo Fl n Ar ns Oc Oo Fl o Ar yaml|json Oc
+Show a single object.
+.It Cm list Ar kind Oo Fl n Ar ns | Fl A Oc Oo Fl l Ar selector Oc Oo Fl o Ar fmt Oc
+List objects of a kind.
+.It Cm delete Ar kind name Op Fl n Ar ns
+Delete an object.
+.It Cm watch Oo Ar kind Oc Oo Fl n Ar ns Oc
+Stream live object changes.
+.It Cm stack Ar deploy|convert|ls|stop|start|rm
+Deploy, inspect, stop, start, or remove Compose stacks.
+.It Cm stop Ar service , Cm start Ar service
+Stop a service while keeping its spec, or start it again.
+.It Cm restart Ar service , Cm rollback Ar service
+Trigger a rolling restart or roll back a service to its previous spec.
+.It Cm cronjob run Ar name Op Fl n Ar ns
+Run a CronJob immediately outside its schedule.
+.It Cm top Op Fl -once
+Open the live terminal dashboard.
+.It Cm logs Ar task|service Oo Fl c Ar container Oc Oo Fl f Oc Oo Fl -tail Ar n Oc
+Print or follow container logs.
+.It Cm build-logs Ar build Oo Fl n Ar ns Oc Oo Fl f Oc
+Print or follow a Build's output.
+.It Cm logs-search Ar service|job Oo Fl -since Ar dur Oc Oo Fl -until Ar dur Oc Oo Ar text Oc
+Search logs across a Service's or Job's tasks.
+.It Cm exec Ar task|service Oo Fl c Ar container Oc Oo Fl i Oc Oo Fl t Oc -- Ar cmd ...
+Run a command inside a running task's container.
+.It Cm files Ar task|service Op Ar path , Cm cp Ar src dest
+List or copy files inside a task's container root.
+.It Cm port-forward Ar task|service Ar port ...
+Forward local ports to a task's pod.
+.It Cm events Oo Ar kind/name Oc Oo Fl n Ar ns Oc Oo Fl w Oc
+Show or follow recent cluster events.
+.It Cm alerts Op Fl -watch
+Show active cluster alerts.
+.It Cm usage Op Fl n Ar ns , Cm quota Op Fl n Ar ns
+Inspect task resource usage samples and namespace quotas.
+.It Cm audit Op Ar options
+Query the cluster audit trail (cluster admin only).
+.It Cm reach Op Fl n Ar ns , Cm load-balancers Op Fl n Ar ns
+Evaluate NetworkPolicy reachability or show CARP load balancer holders.
+.It Cm volume Ar move|backup|restore|snapshots|snapshot|rollback|rm-snapshot
+Manage persistent volumes and ZFS snapshots.
+.It Cm image Ar load|ls|pull|push|rm|prune|scan|export|search|sbom|inspect
+Manage cached images on cluster nodes, inspect registries, and run
+.Fx
+.Cm pkg audit
+vulnerability scans.
+.El
+.Sh BUILD COMMANDS
+.Bl -tag -width Ds
+.It Cm build Oo Ar options Oc Oo Ar context Oc , Cm build jail Oo Ar options Oc Oo Ar context Oc
+Build a
+.Fx
+OCI image from a
+.Pa Containerfile
+using native jails (or
+.Fl -backend Cm buildah ) .
+.It Cm build vm Oo Fl t Ar name Ns Oo : Ns Ar tag Oc Oc Fl -disk Ar path | Fl -rootfs Ar dir Oo Fl -size Ar size Oc
+Package a raw disk image or
+.Fx
+rootfs directory (via
+.Xr makefs 8 )
+into an OCI image containing
+.Pa /disk.img
+for
+.Xr bhyve 8 .
+.El
+.Sh LOCAL COMMANDS
+.Nm Cm local
+(aliased as
+.Cm jailer )
+runs standalone image, build, signing, and container operations on the local
+host without a cluster daemon.
+Local global options are
+.Fl -state-dir ,
+.Fl -zfs-root ,
+.Fl -no-zfs ,
+.Fl -pod-subnet ,
+and
+.Fl -plain-http .
+Subcommands:
+.Bl -tag -width Ds
+.It Cm init , build , check , doctor , login
+Scaffold a
+.Pa Containerfile ,
+build images, check Legion compatibility, inspect host readiness, and save
+registry credentials.
+.It Cm run Oo Ar options Oc Oo Ar image Oc Oo Ar cmd ... Oc
+Run an image in a local
+.Fx
+jail
+.Pq Fl -vnet , Fl p , Fl v , Fl e , Fl -linux
+or as a local
+.Xr bhyve 8
+virtual machine
+.Pq Fl -vm , Fl -vm-cpus , Fl -vm-memory , Fl -vm-boot Cm bhyveload|uefi .
+.It Cm ps , logs , exec , stop , rm
+List, inspect logs, exec into, stop, and remove local containers.
+.It Cm pull , load , push , export , images , rmi , prune
+Manage the local OCI image store and registries.
+.It Cm publish , manifest
+Build across multiple platform hosts and push multi-architecture OCI indexes.
+.It Cm sign , verify , attest , sbom , key
+Create signing keys, sign manifests, and attach or inspect SLSA provenance
+and SPDX SBOM attestations.
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width Ds
+.It Ev LEGION_SERVER
+Default manager address for
+.Fl -server .
+.It Ev LEGION_IDENTITY
+Default client credentials PEM path for
+.Fl -identity .
+.It Ev JAILER_STATE_DIR , JAILER_ZFS_ROOT , JAILER_NO_ZFS , JAILER_POD_SUBNET , JAILER_CACHE_MAX
+Defaults for local store and build options under
+.Cm build
+and
+.Cm local .
+.El
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa /var/db/legion/
+Default daemon data directory and
+.Pa admin.pem
+location.
+.It Pa /var/run/legion/
+Default daemon runtime directory.
+.It Pa /usr/local/etc/rc.d/legion
+.Fx
+.Xr rc 8
+service script.
+.El
+.Sh EXAMPLES
+Start a single-node cluster with the web console enabled:
+.Bd -literal -offset indent
+service legion start
+legion init
+legion console login
+.Ed
+.Pp
+Build a jail image and a bhyve VM image locally:
+.Bd -literal -offset indent
+legion build -t myapp:1 .
+legion build vm -t myvm:1 --rootfs ./guest-root --size 512m
+legion local run --rm --vm --vm-memory 512m localhost/myvm:1
+.Ed
+.Sh SEE ALSO
+.Xr pf 4 ,
+.Xr bhyve 8 ,
+.Xr jail 8 ,
+.Xr makefs 8 ,
+.Xr rctl 8 ,
+.Xr zfs 8

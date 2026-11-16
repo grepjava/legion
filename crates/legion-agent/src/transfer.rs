@@ -13,8 +13,8 @@ use std::sync::Arc;
 use futures::StreamExt;
 use legion_proto::v1::session_frame::Frame;
 use legion_proto::v1::{
-    SessionFrame, VolumeExport, VolumeImport, VolumeReceive, VolumeSend, VolumeSnapshotAction,
-    VolumeSnapshotResult,
+    ReplicaReceive, ReplicaSend, SessionFrame, VolumeExport, VolumeImport, VolumeReceive,
+    VolumeSend, VolumeSnapshotAction, VolumeSnapshotResult,
 };
 use legion_sys::Sys;
 use tokio::sync::{Mutex, mpsc};
@@ -38,6 +38,8 @@ pub(crate) struct Volumes {
     /// held here too while snapshots and datasets change, but not while
     /// data streams, which may take long.
     pub lock: Arc<Mutex<()>>,
+    /// How this node exports the iSCSI LUNs it provides.
+    pub iscsi: crate::exports::IscsiConfig,
 }
 
 impl Volumes {
@@ -298,6 +300,152 @@ fn take(
     Ok(())
 }
 
+/// The start of a replica's snapshots' names (`legion-replica-<ms>`).
+pub const REPLICA: &str = "legion-replica-";
+
+/// Whether `name` is one of a replica's snapshots: [`REPLICA`] and digits,
+/// so a name a user gave is never taken for one.
+fn replica_snapshot(name: &str) -> bool {
+    name.strip_prefix(REPLICA)
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Snapshots the Volume and sends it to its replica's node: all of it,
+/// or what changed since `base`.
+pub(crate) async fn replica_send(
+    v: &Volumes,
+    namespace: &str,
+    opts: ReplicaSend,
+    tx: &mpsc::Sender<SessionFrame>,
+) -> Result<(), Status> {
+    if !replica_snapshot(&opts.snapshot) || !(opts.base.is_empty() || replica_snapshot(&opts.base))
+    {
+        return Err(Status::invalid_argument("not a replica's snapshot"));
+    }
+    let ds = v.dataset(namespace, &opts.volume)?;
+    let (out, lock) = (tx.clone(), v.lock.clone());
+    crate::task::blocking(&v.sys, move |sys| -> Result<(), String> {
+        let mut out = FrameWriter::new(out);
+        replica_give(sys, &lock, &ds, &opts.base, &opts.snapshot, &mut out)?;
+        out.flush().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(Status::internal)?;
+    let _ = tx.send(frame(Frame::ExitCode(0))).await;
+    Ok(())
+}
+
+/// Receives a replica's copy, until the input closes.
+pub(crate) async fn replica_receive(
+    v: &Volumes,
+    namespace: &str,
+    opts: ReplicaReceive,
+    tx: &mpsc::Sender<SessionFrame>,
+    inbound: &mut Streaming<SessionFrame>,
+) -> Result<(), Status> {
+    if !replica_snapshot(&opts.snapshot) || !(opts.base.is_empty() || replica_snapshot(&opts.base))
+    {
+        return Err(Status::invalid_argument("not a replica's snapshot"));
+    }
+    let ds = v.dataset(namespace, &opts.volume)?;
+    let (data, rx) = mpsc::channel::<Result<Vec<u8>, String>>(16);
+    let lock = v.lock.clone();
+    let work = crate::task::blocking(&v.sys, move |sys| {
+        replica_take(
+            sys,
+            &lock,
+            &ds,
+            &opts.base,
+            &opts.snapshot,
+            &mut FrameReader::new(rx),
+        )
+    });
+    let (result, ()) = tokio::join!(work, feed(inbound, data, "the holding node"));
+    result.map_err(Status::internal)?;
+    let _ = tx.send(frame(Frame::ExitCode(0))).await;
+    Ok(())
+}
+
+/// Takes the replica's next snapshot and writes it: whole, or since
+/// `base` (empty: none). The holder's other replica snapshots go first:
+/// `base` is the last the replica took.
+fn replica_give(
+    sys: &dyn Sys,
+    lock: &Mutex<()>,
+    ds: &str,
+    base: &str,
+    snapshot: &str,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let snap = |n: &str| format!("{ds}@{n}");
+    {
+        let _guard = lock.blocking_lock();
+        let snaps = sys.zfs_snapshots(ds).map_err(|e| e.to_string())?;
+        if !base.is_empty() && !snaps.iter().any(|s| s == base) {
+            return Err(format!(
+                "{} is gone here: a full copy is needed",
+                snap(base)
+            ));
+        }
+        for s in snaps.iter().filter(|s| replica_snapshot(s) && *s != base) {
+            sys.zfs_destroy(&snap(s), false)
+                .map_err(|e| e.to_string())?;
+        }
+        sys.zfs_snapshot(&snap(snapshot))
+            .map_err(|e| e.to_string())?;
+    }
+    let since = (!base.is_empty()).then_some(base);
+    sys.zfs_send(&snap(snapshot), since, out)
+        .map_err(|e| e.to_string())
+}
+
+/// Takes into `ds` what `replica_give` wrote, leaving it unmounted; then
+/// only `snapshot` stays of the replica's snapshots. A full copy replaces
+/// what is here; an incremental one needs `base`.
+fn replica_take(
+    sys: &dyn Sys,
+    lock: &Mutex<()>,
+    ds: &str,
+    base: &str,
+    snapshot: &str,
+    input: &mut dyn Read,
+) -> Result<(), String> {
+    {
+        let _guard = lock.blocking_lock();
+        if let Some((parent, _)) = ds.rsplit_once('/') {
+            sys.zfs_create(parent, &[]).map_err(|e| e.to_string())?;
+        }
+        let here = sys
+            .zfs_list(ds)
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|d| d.name == ds);
+        if base.is_empty() {
+            if here {
+                sys.zfs_destroy(ds, true).map_err(|e| e.to_string())?;
+            }
+        } else {
+            let snaps = sys.zfs_snapshots(ds).map_err(|e| e.to_string())?;
+            if !snaps.iter().any(|s| s == base) {
+                return Err(format!(
+                    "no replica at {ds}@{base} here: a full copy is needed"
+                ));
+            }
+        }
+    }
+    sys.zfs_receive(ds, input).map_err(|e| e.to_string())?;
+    let _guard = lock.blocking_lock();
+    let snaps = sys.zfs_snapshots(ds).map_err(|e| e.to_string())?;
+    for s in snaps
+        .iter()
+        .filter(|s| replica_snapshot(s) && *s != snapshot)
+    {
+        sys.zfs_destroy(&format!("{ds}@{s}"), false)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Destroys this node's copy of a Volume that lives elsewhere now.
 pub(crate) async fn drop_copy(
     v: &Volumes,
@@ -546,5 +694,60 @@ mod tests {
         assert!(restore(&to, &Mutex::new(()), DS, &mut &out[..]).is_err());
         assert!(to.zfs_list(DS).unwrap().iter().all(|d| d.name != DS));
         make_room(&to, &Mutex::new(()), DS).unwrap();
+    }
+
+    /// A replica's copies: whole at first, then what changed, each taken
+    /// unmounted; the snapshots before the last go on both nodes, and a
+    /// base gone from either asks for a full copy again.
+    #[test]
+    fn a_replica_takes_each_copy_since_the_last() {
+        let lock = Mutex::new(());
+        let (from, to) = (FakeSys::new(), FakeSys::new());
+        from.zfs_create(DS, &[]).unwrap();
+        from.zfs_snapshot(&format!("{DS}@mine")).unwrap();
+        let copy = |base: &str, snap: &str| -> Result<(), String> {
+            let mut out = Vec::new();
+            replica_give(&from, &lock, DS, base, snap, &mut out)?;
+            replica_take(&to, &lock, DS, base, snap, &mut out.as_slice())
+        };
+        copy("", "legion-replica-1").unwrap();
+        assert_eq!(to.zfs_snapshots(DS).unwrap(), ["legion-replica-1"]);
+        copy("legion-replica-1", "legion-replica-2").unwrap();
+        assert_eq!(to.zfs_snapshots(DS).unwrap(), ["legion-replica-2"]);
+        // The holder keeps the last sent until the next, and a user's own.
+        assert_eq!(
+            from.zfs_snapshots(DS).unwrap(),
+            ["mine", "legion-replica-1", "legion-replica-2"]
+        );
+        copy("legion-replica-2", "legion-replica-3").unwrap();
+        assert_eq!(
+            from.zfs_snapshots(DS).unwrap(),
+            ["mine", "legion-replica-2", "legion-replica-3"]
+        );
+        // A base gone (a rollback on the holder took it): a full copy.
+        let e = copy("legion-replica-9", "legion-replica-4").unwrap_err();
+        assert!(e.contains("a full copy is needed"), "{e}");
+        let mut out = Vec::new();
+        replica_give(
+            &from,
+            &lock,
+            DS,
+            "legion-replica-3",
+            "legion-replica-5",
+            &mut out,
+        )
+        .unwrap();
+        let e = replica_take(
+            &FakeSys::new(),
+            &lock,
+            DS,
+            "legion-replica-3",
+            "legion-replica-5",
+            &mut out.as_slice(),
+        )
+        .unwrap_err();
+        assert!(e.contains("a full copy is needed"), "{e}");
+        assert!(replica_snapshot("legion-replica-12") && !replica_snapshot("legion-replica-x"));
+        assert!(!replica_snapshot("mine"));
     }
 }

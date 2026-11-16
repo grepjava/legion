@@ -608,6 +608,19 @@ impl DispatcherService {
             let spec: VolumeSpec = serde_json::from_value(volume.spec.clone()).map_err(internal)?;
             let status: VolumeStatus =
                 serde_json::from_value(volume.status.clone()).unwrap_or_default();
+            // One a node provides is mounted from where it says it is.
+            let Some(spec) = spec.resolved(status.export.as_ref()) else {
+                let why = status
+                    .export
+                    .as_ref()
+                    .map(|e| e.message.clone())
+                    .filter(|m| !m.is_empty())
+                    .map_or(String::new(), |m| format!(": {m}"));
+                return Err(Status::failed_precondition(format!(
+                    "volume {namespace}/{name} is not exported by {} yet{why}",
+                    spec.provider().unwrap_or_default()
+                )));
+            };
             // A node without ZFS names no dataset, and must not hold one;
             // it refuses the volume itself.
             if spec.access() == Access::Shared
@@ -848,7 +861,12 @@ impl DispatcherService {
             if spec.access() != Access::Single || status.node != node {
                 return Ok(VolumeClaim::Elsewhere(String::new()));
             }
-            volume.status = serde_json::to_value(VolumeStatus::default()).map_err(internal)?;
+            // Let go of; where a node provides it stays said.
+            volume.status = serde_json::to_value(VolumeStatus {
+                export: status.export.clone(),
+                ..VolumeStatus::default()
+            })
+            .map_err(internal)?;
             let version = volume.metadata.version;
             match self.write(volume, Precondition::Version(version)).await? {
                 Outcome::Written(_) => {

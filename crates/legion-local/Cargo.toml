@@ -1,0 +1,33 @@
+[package]
+name = "legion-local"
+description = "Local standalone FreeBSD jail runtime, image store, network, and host checks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+base64.workspace = true
+clap.workspace = true
+legion-api.workspace = true
+legion-image.workspace = true
+legion-jail.workspace = true
+legion-net.workspace = true
+legion-runtime.workspace = true
+legion-sys.workspace = true
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls-no-provider",
+    "http2",
+    "system-proxy",
+    "stream",
+    "json",
+] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "process"] }
+tracing.workspace = true

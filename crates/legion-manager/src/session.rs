@@ -204,7 +204,14 @@ impl Pods for PodsService {
             Some(Action::Logs(_)) => Verb::Read,
             // Reading a task's files is as much as a shell in it.
             Some(Action::Exec(_) | Action::Port(_) | Action::Files(_)) => Verb::Write,
-            Some(Action::VolumeSend(_) | Action::VolumeReceive(_) | Action::VolumeDrop(_)) => {
+            Some(
+                Action::VolumeSend(_)
+                | Action::VolumeReceive(_)
+                | Action::VolumeDrop(_)
+                | Action::ReplicaSend(_)
+                | Action::ReplicaReceive(_)
+                | Action::ExportSync(_),
+            ) => {
                 return Err(Status::invalid_argument(
                     "volumes move between nodes only when the managers move them",
                 ));

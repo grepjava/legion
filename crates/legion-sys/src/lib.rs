@@ -211,6 +211,21 @@ pub trait Sys: Send + Sync {
     /// left as it is (`props` are not applied to it).
     fn zfs_create(&self, name: &str, props: &[(&str, &str)]) -> Result<()>;
     fn zfs_set(&self, name: &str, prop: &str, value: &str) -> Result<()>;
+    /// Creates a ZFS volume (a block device, `/dev/zvol/<name>`) of `size`
+    /// bytes and any missing parents; an existing one is left as it is.
+    fn zfs_create_volume(&self, name: &str, size: u64) -> Result<()> {
+        let _ = size;
+        Err(Error::Failed {
+            command: format!("zfs create -V {name}"),
+            message: "not supported here".to_owned(),
+        })
+    }
+    /// A dataset's property, as `zfs get` says it; `None` if the dataset
+    /// does not exist.
+    fn zfs_get(&self, name: &str, prop: &str) -> Result<Option<String>> {
+        let _ = (name, prop);
+        Ok(None)
+    }
     fn zfs_snapshot(&self, snapshot: &str) -> Result<()>;
     /// The names (after the `@`) of a dataset's snapshots, oldest first;
     /// empty if the dataset does not exist.

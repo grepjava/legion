@@ -473,7 +473,8 @@ Built and tested in spike S4 (`crates/legion-store`).
   Volume restored onto a node with `legion volume restore`, which makes
   the Volume as it was, on that node. Removing a node marks the Volumes
   whose data was on it **lost** (`status.lost`, the node's name; a full
-  copy a move had already made elsewhere carries on instead): no task
+  copy a move had already made elsewhere carries on instead, as does a
+  replica, below): no task
   uses one again, pending with why, so nothing starts on empty data, also
   on a new node joining under the old one's name (a join marks any still
   bound to its name first). `legion volume restore --replace` restores
@@ -721,6 +722,7 @@ binary serves it.
 |---------|-------|-------|
 | ZFS image and volume storage | Legion's image store (one dataset per layer, containers as clones, 6.1); one dataset per volume under `<pool>/legion/volumes/<ns>/<name>`. | 1, 5 |
 | Snapshots before updates | A stateful service's `update.snapshot: true`: each task an update starts snapshots its claimed Volumes (`@legion-update-<generation>`, named in `status.update.snapshot`) before it runs, unless taken already, dropping older updates' snapshots; its old task has stopped by then, as stateful updates are stop-first. Each task the update's rollback starts, automatic or by `legion rollback` (even after the update completed, which discards what was written since), rolls its Volumes back to the snapshot and drops it, so a restart keeps its data. An ordinal the update never reached has no snapshot and keeps its data; so does a Volume migrated since, as migration sends no other snapshots. | 4 |
+| Volume replicas | A ZFS Volume's `replica` (`{ node, everySeconds }`, also a stateful claim's) has the leader keep a copy on another node: the spec's, or the first ready, active node whose host has what Legion requires, never the node holding the data nor one still dropping an old copy. The holder snapshots the dataset (`@legion-replica-<ms>`) and sends all of it the first time, then every `everySeconds` (300 by default, 10 at least) what changed since the replica's last snapshot; the replica's node receives it unmounted (`zfs receive -F -u`) and keeps only the last snapshot, the holder the last sent, through sessions the migrator's transfers use (the replicator runs beside it on the leader). A base gone (a rollback took it) or data that moved since makes the next copy whole; a failed copy is retried with the migrator's backoff, saying why in `status.replica`. A replica's node changing leaves its old copy among the leftovers, which the migrator drops. Removing the node holding the data (the operator's word that it stopped, as for lost Volumes) makes the Volume carry on from the replica's last copy on that node, its tasks with it, writes since that copy lost (`status.promoted` says from what and when), and a new replica is made; a node only down is waited for, as ever: nothing is handed over while it may still write. Removing the replica's node drops it for another. Deleting the Volume leaves the replica's dataset, as it does the data. | 6 |
 | Volume backups | `legion volume backup VOLUME -o FILE` (edit on Volumes: the data is as much as exec gives) has the leader offer the Volume's node a session in which its agent snapshots the dataset under a name of its own (`@legion-backup-<time>`, so two at once and a migration's snapshots are left alone), sends all of it and destroys the snapshot, sent or not. The snapshot is the dataset at one instant while its tasks run: **crash-consistent**, as after a power cut, which the file's header says (`consistency`) and the CLI prints; an application whose files must agree recovers as from a crash (a database replays its log), and one that needs more quiesces itself first. The file is a header line (format, namespace, name, labels, spec, node, time) then the `zfs send` stream, mode 0600, written aside and renamed once whole. `legion volume restore FILE --node NODE [--name] [-n] [--replace]` streams it to the node, which refuses it if it has data of that name; once all of it is there and mounted the leader makes the Volume, with the backup's labels (a stateful service's ordinal finds its Volume by them) and the data on that node, so no task used it before. A Volume of that name is never overwritten: the restore is refused, or, made meanwhile, fails and leaves the data restored under its name; with `--replace`, one lost with its node (3.7) is restored into and kept, its tasks then starting on NODE. ZFS only: the other drivers' data is backed up where it is kept. A follower forwards both to the leader with the caller's name. | 6 |
 | Stateful migration | Draining a node moves each wanted stateful ordinal's Volumes to a node its service may run on, the one with fewest of its tasks: the Service controller records a migration in the Volume's status (`copying`); the leader's migrator has the old node's agent snapshot and `zfs send` a full copy while the task runs, and the new node's `zfs receive -u` it, joining the two agents' sessions (3.8), so nodes need no port. Once `copied`, the drain stops the task; with nothing on a node using the Volume it is `finishing`: a second snapshot's increment goes, the Volume becomes the new node's (mounted) and the old node drops its copy. The new node keeps the migration's two snapshots, so a last part sent again (the manager failed to take the first in) rolls back to the full copy and is taken on; the Volume's first use there drops them. A node holding only the full copy's snapshot keeps it: that move is under way. The slot's next task waits (`volume moving`) and then runs there. A migration whose new node goes away (down, removed, no longer active, or no place for the service; a node only suspect, a few heartbeats late, keeps it, as dropping it would send the full copy again elsewhere: the lab found a short stall do just that), or whose old node stops draining before the last part, is dropped and started again if still needed, the drain waiting for the Volume meanwhile (`waiting`), so it never completes with data left on the node (found as a target node went silent under load as the last part was due); a failed attempt is noted in it (with the attempt's number and when the next starts) and retried after 5 s, then twice as long after each failure in a row up to 5 minutes, so a node out of space isn't sent the full copy every few seconds; the wait starts over once an attempt succeeds or the migration changes. A stale copy on the receiving node is replaced. Cut short at any stage, a move loses nothing (Phase 6, item 3): a receive cut short or out of space leaves no part copy (ZFS drops it, and the next full copy destroys any it left), and the data stays whole on the old node, its task running on until the full copy is in; a last part cut short is sent again onto the full copy; an old node cut off once its task stopped holds the only copy of the latest data, so the move waits for it and the task starts nowhere else, not even where the full copy is; a new node gone silent is dropped and the Volume goes elsewhere, sent again in full from the old node. A full disk for the full copy costs nothing but time, the task running on; for the last part the task has stopped and waits, down, until there is room or the full node is drained, which sends the Volume elsewhere: the drain status says why (`out of space`, or `space quota exceeded` for a quota). A Volume's `spec.node` (`legion volume move VOLUME NODE`) asks for its data on a node: unset, the first task to use the Volume chooses; set before then, that task goes there; set to another node than the data's, a migration to it starts once the node is ready and active, and the tasks using the Volume on the old node stop once it is copied, as off a draining node, their next ones waiting until it has moved (`volume moving` holds new placements throughout a migration). A drain still moves a Volume asked to be on the draining node; the data returns once the node is active again. A migration lasts while a drain or the Volume's `node` calls for it. | 4 |
 | CARP manager VIP | Optional floating address for the API: `legion daemon --vip ADDR --vip-interface IF --vip-password-file F [--vip-vhid N]` on managers sharing a link puts ADDR on IF as a CARP virtual host (`/32`, loading `carp`). Any manager answers the API, so the address need only be on a running one: the leader advertises skew 0 and forces itself master when it is not, followers advertise 100 and keep the address only until a better advertiser takes it, so it never goes without a holder (a follower holds it while a manager without `--vip` leads). Set again every 5 s and on every leadership change; released on shutdown, so a clean stop hands it on at once and a crash after CARP's timeout (3 s). The API listens on `0.0.0.0` to answer on it; certificates name the fixed server name, so no change is needed for clients using it. | 4 |
@@ -1535,8 +1537,8 @@ share it:
 | Driver | Data | Shared | Bound to a node |
 |--------|------|--------|-----------------|
 | `zfs` (default) | A dataset on one node (6.4, 4.3) | By that node's tasks | For good, unless moved |
-| `nfs` | `nfs: { server, path, options }` | By any tasks, anywhere | Never |
-| `iscsi` | `iscsi: { portal, target, lun }`, UFS | By one node's tasks at a time | While its tasks use it |
+| `nfs` | `nfs: { server, path, options }`, or `nfs: { node }` and `size` | By any tasks, anywhere | Never |
+| `iscsi` | `iscsi: { portal, target, lun }`, UFS, or `iscsi: { node }` and `size` | By one node's tasks at a time | While its tasks use it |
 | `plugin` | `plugin: { name, options, shared }` | `shared: true`: anywhere; otherwise as iSCSI | Unless shared |
 
 `size` and `node` are for ZFS only; claims (stateful services) always
@@ -1567,6 +1569,29 @@ make ZFS volumes. Built in `legion_api::volume`, `legion-agent::volumes`,
   once at `<run>/volumes/iscsi/<ns>/<name>` for all its tasks. A LUN without UFS is refused, never formatted: a disk whose
   partition table fstyp does not know would look blank, and formatting it
   would destroy it. Make the file system once by hand (`newfs`).
+- **Provided by a node**: `nfs: { node }` and `iscsi: { node }` have a
+  node of the cluster make the storage itself. The leader sends each node
+  the whole list of what it provides every 30 s (`ExportSync`, also when
+  the list or the cluster's nodes change), and the node's agent makes its
+  exports exactly that: an NFS Volume is the ZFS dataset
+  `<root>/exports/<ns>/<name>`, its `size` the quota, shared with the
+  cluster's nodes' addresses (`sharenfs=-maproot=root <addresses>`, so
+  `nfsd` and `mountd` must run there); an iSCSI one is the ZFS volume of
+  that path and `size`, formatted UFS once when first made (one holding
+  anything else is left alone), a target `iqn.2026-11.invalid.legion:<ns>.<name>`
+  written to the UCL file of targets the agent is given
+  (`--iscsi-targets FILE`, on the portal group `--iscsi-portal-group`,
+  `legion` by default), which ctld's own configuration includes
+  (`.include "FILE"`, ctld run with `-u`), ctld reloaded when it changes:
+  the operator's ctld configuration is never written. What the node says
+  is recorded (`status.export`: the node, its address and the path, or
+  the target and portal, `--iscsi-portal` or the node's address on 3260,
+  or why it failed), and a node mounting the Volume gets its spec with
+  that filled in, mounting it as any NFS or iSCSI Volume; until then its
+  tasks wait, saying so. What is under `exports` and no longer listed (a
+  Volume deleted) stops being shared or a target; its data stays, as a
+  deleted ZFS Volume's does. Its own LUN is no other Volume's, so no
+  alias check applies.
 - **Plugins** are the interface for anything else: an executable
   `<plugin dir>/<name>` (`legion daemon --volume-plugins DIR`, by default
   `/usr/local/libexec/legion/volume`), run per task as `<plugin> mount
@@ -1575,6 +1600,10 @@ make ZFS volumes. Built in `legion_api::volume`, `legion-agent::volumes`,
   error the reason otherwise; `mount` must leave a file system mounted at
   `<dir>`. A plugin missing from the node fails the task (it may be
   elsewhere); one missing at teardown has its mount unmounted directly.
+  Three ship with Legion as examples (`packaging/volume-plugins`, the
+  port's `share/examples/legion/volume-plugins`), `flua` scripts of the
+  base system: `hostpath` (a directory of the node, by nullfs), `sshfs` and
+  `rclone` (S3 and the rest, both through FUSE).
 - **Records**: a task writes what its teardown must undo (iSCSI targets,
   plugin mounts) to `attached.json` in its directory before attaching, so
   a teardown after a failed start or an agent restart still finds it;

@@ -447,7 +447,16 @@ The optional extensions were built in v0.1.19, at the user's request
 - VM pods: a container with `vm` booted with bhyve on the pod's network.
 - Relays for nodes behind different NATs (`--mesh-nat`, `--mesh-relay`).
 
-Additional storage integrations were not taken up.
+Further storage integrations (16 November 2026, at the user's request,
+not yet released):
+
+- Replicated ZFS Volumes (`replica`, also a stateful claim's): copied
+  to another node every so often, incrementally; when the node holding
+  the data is removed, the Volume carries on from the last copy.
+- NFS and iSCSI Volumes a node of the cluster provides (`nfs: { node }`,
+  `iscsi: { node }`): a ZFS dataset shared with the nodes, or a ZFS
+  volume formatted once and a target in a file ctld includes.
+- Volume plugins shipped as examples: `hostpath`, `sshfs` and `rclone`.
 
 Status: measured in v0.1.19 ([docs/MEASURE.md](docs/MEASURE.md)); the
 planner and pf were made faster for what that showed. Scaling past the
@@ -460,8 +469,7 @@ measured sizes is parked, as above.
   `poudriere testport` since v0.1.9.
 - A release of the work since v0.1.19 (PHASE.md).
 - Scaling past the measured sizes (P3), parked until a user needs it.
-- From the milestones: further storage integrations (P3), arm64 and real
-  hardware in qualification (P0.1).
+- From the milestones: arm64 and real hardware in qualification (P0.1).
 - In the web console: pausing a task (CONSOLE.md).
 
 ## Documentation maintenance

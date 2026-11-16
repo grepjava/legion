@@ -26,6 +26,7 @@ mod build;
 pub use build::Builder;
 pub mod control;
 pub mod doctor;
+pub mod exports;
 pub mod fake;
 mod files;
 mod image_ops;
@@ -82,6 +83,8 @@ pub struct AgentConfig {
     pub volumes_dir: PathBuf,
     /// Volume plugins, executables by name (DESIGN.md §6.7).
     pub plugin_dir: PathBuf,
+    /// How this node exports the iSCSI LUNs of the Volumes it provides.
+    pub iscsi: exports::IscsiConfig,
     /// The node's end of the WireGuard mesh to other nodes; without it, pods
     /// reach only this node.
     pub wireguard: Option<WireGuardConfig>,
@@ -156,6 +159,10 @@ impl AgentConfig {
             logs_dir: None,
             zfs_root: None,
             plugin_dir: PathBuf::from(DEFAULT_PLUGIN_DIR),
+            iscsi: exports::IscsiConfig {
+                portal_group: exports::PORTAL_GROUP.to_owned(),
+                ..Default::default()
+            },
             wireguard: None,
             drain: Duration::from_secs(2),
             usage_period: Duration::from_secs(15),
@@ -180,6 +187,7 @@ pub struct Agent<R, C> {
     load_balancer_interface: Option<String>,
     resolver: Option<ExternalResolver>,
     builder: Arc<Builder>,
+    iscsi: exports::IscsiConfig,
 }
 
 /// A running task worker.
@@ -222,6 +230,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             load_balancer_interface: config.load_balancer_interface,
             resolver: config.resolver,
             builder: Arc::new(config.builder),
+            iscsi: config.iscsi,
         }
     }
 
@@ -370,6 +379,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 sys: ctx.sys.clone(),
                 zfs_root: ctx.zfs_root.clone(),
                 lock: ctx.volume_lock.clone(),
+                iscsi: self.iscsi.clone(),
             }),
             self.builder.clone(),
             ctx.control.sessions(&ctx.node),

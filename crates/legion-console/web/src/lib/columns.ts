@@ -101,7 +101,16 @@ export function columns(kind: string): Column[] {
         { label: t('Driver'), value: (o) => s(o.spec?.driver ?? 'zfs') },
         { label: t('Node'), value: (o) => s(o.status?.node) },
         { label: t('Size'), value: (o) => s(o.spec?.size) },
-        { label: t('Lost'), value: (o) => s(o.status?.lost) }
+        { label: t('Lost'), value: (o) => s(o.status?.lost) },
+        {
+          label: t('Replica'),
+          value: (o) => {
+            const r = o.status?.replica;
+            if (!r) return '';
+            const at = r.takenMs ? new Date(r.takenMs).toLocaleString() : t('no copy yet');
+            return [r.node, at, r.message].filter((x) => x).join(', ');
+          }
+        }
       ];
     case 'Route':
       return [

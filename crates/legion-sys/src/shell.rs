@@ -1050,6 +1050,27 @@ impl<R: Runner> Sys for Shell<R> {
         Err(failed("zfs", &a, &out))
     }
 
+    fn zfs_create_volume(&self, name: &str, size: u64) -> Result<()> {
+        let a = args(["create", "-p", "-V", &size.to_string(), name]);
+        let out = self.output("zfs", &a, None)?;
+        if out.success || out.stderr.contains("dataset already exists") {
+            return Ok(());
+        }
+        Err(failed("zfs", &a, &out))
+    }
+
+    fn zfs_get(&self, name: &str, prop: &str) -> Result<Option<String>> {
+        let a = args(["get", "-H", "-p", "-o", "value", prop, name]);
+        let out = self.output("zfs", &a, None)?;
+        if out.success {
+            return Ok(Some(out.stdout.trim().to_owned()));
+        }
+        if out.stderr.contains("dataset does not exist") {
+            return Ok(None);
+        }
+        Err(failed("zfs", &a, &out))
+    }
+
     fn zfs_set(&self, name: &str, prop: &str, value: &str) -> Result<()> {
         self.run(
             "zfs",

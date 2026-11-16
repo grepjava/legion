@@ -574,13 +574,48 @@ pub(crate) async fn mark_lost(api: &ApiService, node: &str) -> Result<(), Status
                     )
             });
             let held = held && !copied;
+            // A copy of the node's data taken on a node still there.
+            let replica = status
+                .replica
+                .clone()
+                .filter(|r| held && !r.snapshot.is_empty() && r.from == node && r.node != node)
+                .filter(|r| {
+                    api.store
+                        .get(&ObjectKey::new(Kind::Node, "", &r.node))
+                        .is_ok_and(|n| n.is_some())
+                });
+            let mut promoted = None;
             if !held {
+                let mut changed = false;
                 // A copy it moved away from is gone with the node too.
                 if status.leftovers.iter().any(|n| n == node) {
                     status.leftovers.retain(|n| n != node);
-                } else {
+                    changed = true;
+                }
+                // So is a replica kept there: another is made elsewhere.
+                if status.replica.as_ref().is_some_and(|r| r.node == node) {
+                    status.replica = None;
+                    changed = true;
+                }
+                if !changed {
                     continue;
                 }
+            } else if let Some(r) = replica {
+                // The Volume carries on from its last copy, on that node.
+                let when = r
+                    .taken_ms
+                    .map(|ms| legion_api::clock::format(ms / 1000))
+                    .unwrap_or_default();
+                status.promoted = format!(
+                    "from the replica of {node}'s data on {}, taken {when}",
+                    r.node
+                );
+                status.node = r.node.clone();
+                status.dataset.clear();
+                status.migration = None;
+                status.replica = None;
+                status.leftovers.retain(|n| n != node && *n != r.node);
+                promoted = Some(r.node);
             } else {
                 status.lost = node.to_owned();
                 status.node.clear();
@@ -597,9 +632,13 @@ pub(crate) async fn mark_lost(api: &ApiService, node: &str) -> Result<(), Status
                 })
                 .await?
             {
-                Outcome::Written(_) if held => {
-                    tracing::warn!(volume = %key, node, "volume lost with its node")
-                }
+                Outcome::Written(_) if held => match &promoted {
+                    Some(to) => tracing::warn!(
+                        volume = %key, node, replica = %to,
+                        "the volume's node is removed: it carries on from its replica"
+                    ),
+                    None => tracing::warn!(volume = %key, node, "volume lost with its node"),
+                },
                 Outcome::Written(_) => {}
                 Outcome::Conflict { .. } => conflicted = true,
                 other => return Err(Status::internal(format!("unexpected {other:?}"))),

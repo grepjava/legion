@@ -24,6 +24,7 @@ pub mod controller;
 mod diagnostics;
 mod dispatcher;
 mod events;
+mod exports;
 #[cfg(feature = "test-hooks")]
 pub mod hooks;
 mod image_ops;
@@ -37,6 +38,7 @@ mod oidc;
 mod quota;
 mod raft_net;
 mod removed;
+mod replicate;
 pub mod requests;
 pub mod roles;
 mod security;

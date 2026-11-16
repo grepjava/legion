@@ -1156,6 +1156,7 @@ fn claims(s: &Service, wanted: &[Slot], volumes: &Volumes, plan: &mut Plan) {
                 None => {
                     let spec = VolumeSpec {
                         size: src.size,
+                        replica: src.replica.clone(),
                         ..Default::default()
                     };
                     let mut o = Object::new(
@@ -1170,7 +1171,7 @@ fn claims(s: &Service, wanted: &[Slot], volumes: &Volumes, plan: &mut Plan) {
                     plan.actions.push(Action::Create(o));
                 }
                 Some(v)
-                    if v.spec.size != src.size
+                    if (v.spec.size != src.size || v.spec.replica != src.replica)
                         && v.spec.driver == VolumeDriver::Zfs
                         && v.object
                             .metadata
@@ -1182,6 +1183,7 @@ fn claims(s: &Service, wanted: &[Slot], volumes: &Volumes, plan: &mut Plan) {
                     let mut o = v.object.clone();
                     o.spec = serde_json::to_value(VolumeSpec {
                         size: src.size,
+                        replica: src.replica.clone(),
                         ..v.spec.clone()
                     })
                     .expect("serialises");

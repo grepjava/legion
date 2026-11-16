@@ -21,6 +21,34 @@ use crate::{Command, StackCommand, UserCommand};
 /// an election, or while a manager waits on a quorum (DESIGN.md §3.8).
 const RETRY_FOR: Duration = Duration::from_secs(30);
 
+/// A Volume's replica in a cell: its node and how old its last copy is,
+/// or why it has none.
+fn replica_cell(r: &serde_json::Value, now_ms: i64) -> String {
+    let Some(node) = r["node"].as_str() else {
+        return String::new();
+    };
+    let age = match r["takenMs"].as_i64() {
+        Some(t) => {
+            let s = ((now_ms - t) / 1000).max(0);
+            if s < 120 {
+                format!("{s}s ago")
+            } else if s < 7200 {
+                format!("{}m ago", s / 60)
+            } else if s < 172_800 {
+                format!("{}h ago", s / 3600)
+            } else {
+                format!("{}d ago", s / 86_400)
+            }
+        }
+        None => "no copy yet".to_owned(),
+    };
+    match r["message"].as_str().filter(|m| !m.is_empty()) {
+        Some(why) if node.is_empty() => why.to_owned(),
+        Some(why) => format!("{node}, {age}: {why}"),
+        None => format!("{node}, {age}"),
+    }
+}
+
 /// A node's state, with what its host lacks that keeps new tasks off.
 fn node_state(o: &Object, state: String) -> String {
     let status = serde_json::from_value::<legion_api::node::NodeStatus>(o.status.clone());
@@ -1254,6 +1282,7 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 );
             }
         }
+        Command::Local(_) | Command::Build(_) => unreachable!("handled in main"),
     }
     Ok(())
 }
@@ -1828,10 +1857,14 @@ fn print_objects(objects: &[pb::Object], format: Format, kind: Kind) -> anyhow::
                 );
             }
             Kind::Volume => {
-                let rows: Vec<[String; 5]> = objects
+                let rows: Vec<[String; 6]> = objects
                     .iter()
                     .map(|o| {
                         let m = &o.status["migration"];
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_millis() as i64);
+                        let replica = replica_cell(&o.status["replica"], now_ms);
                         let moving = match (field(m, &["phase"]), field(m, &["message"])) {
                             (phase, _) if phase.is_empty() => String::new(),
                             (phase, why) if why.is_empty() => {
@@ -1845,10 +1878,14 @@ fn print_objects(objects: &[pb::Object], format: Format, kind: Kind) -> anyhow::
                             field(&o.spec, &["size"]),
                             field(&o.status, &["node"]),
                             moving,
+                            replica,
                         ]
                     })
                     .collect();
-                print_table(["NAMESPACE", "NAME", "SIZE", "NODE", "MIGRATION"], &rows);
+                print_table(
+                    ["NAMESPACE", "NAME", "SIZE", "NODE", "MIGRATION", "REPLICA"],
+                    &rows,
+                );
             }
             Kind::Node => {
                 let rows: Vec<[String; 5]> = objects
@@ -2771,10 +2808,7 @@ fn image_details(r: &pb::InspectRegistryImageResponse) -> String {
     }
     for (i, a) in r.attestations.iter().enumerate() {
         let name = if i == 0 { "Attested:" } else { "" };
-        out += &format!(
-            "{name:<11}{}\n",
-            attestation_line(a)
-        );
+        out += &format!("{name:<11}{}\n", attestation_line(a));
     }
     if !r.history.is_empty() {
         out += "\nHistory, first step first:\n";
@@ -2795,6 +2829,25 @@ fn image_details(r: &pb::InspectRegistryImageResponse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_volumes_replica_says_where_and_how_old() {
+        let r = |v: serde_json::Value| replica_cell(&v, 1_000_000);
+        assert_eq!(r(serde_json::Value::Null), "");
+        assert_eq!(r(serde_json::json!({"node": "n2"})), "n2, no copy yet");
+        assert_eq!(
+            r(serde_json::json!({"node": "n2", "takenMs": 955_000})),
+            "n2, 45s ago"
+        );
+        assert_eq!(
+            r(serde_json::json!({"node": "n2", "takenMs": 400_000, "message": "out of space"})),
+            "n2, 10m ago: out of space"
+        );
+        assert_eq!(
+            r(serde_json::json!({"node": "", "message": "no other node may keep it"})),
+            "no other node may keep it"
+        );
+    }
 
     #[test]
     fn an_images_attestations_say_who_signed_them_and_the_sbom_is_found() {

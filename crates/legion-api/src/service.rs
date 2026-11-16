@@ -1183,11 +1183,16 @@ impl PodVolume {
                 "must be above zero",
             )),
             (None, Some(_), None) => Ok(()),
-            (None, None, Some(c)) if c.size == Some(Bytes(0)) => Err(Invalid::new(
-                field(path, "claim.size"),
-                "must be above zero",
-            )),
-            (None, None, Some(_)) => Ok(()),
+            (None, None, Some(c)) => {
+                // Checked as the Volumes it makes are.
+                let mut v = crate::volume::VolumeSpec {
+                    size: c.size,
+                    replica: c.replica.clone(),
+                    ..Default::default()
+                };
+                crate::admit::Spec::admit(&mut v)
+                    .map_err(|e| Invalid::new(field(path, &format!("claim.{}", e.path)), e.message))
+            }
             _ => Err(Invalid::new(
                 path,
                 "set exactly one of `volume`, `tmpfs` and `claim`",
@@ -1210,6 +1215,10 @@ pub struct ClaimSource {
     /// ZFS quota of each task's Volume; none by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<Bytes>,
+    /// A replica of each task's Volume on another node, as a Volume's
+    /// `replica`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica: Option<crate::volume::Replica>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

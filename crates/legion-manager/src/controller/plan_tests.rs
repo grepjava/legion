@@ -203,6 +203,7 @@ impl World {
             migration: None,
             leftovers: Vec::new(),
             lost: String::new(),
+            ..Default::default()
         };
         o.status = serde_json::to_value(&status).unwrap();
         self.volumes.insert(
@@ -1014,13 +1015,7 @@ fn failed_tasks_are_replaced_after_a_backoff() {
 fn deleted_tasks_leave_their_names_unused() {
     let mut w = World::new();
     w.node("n1", &[]);
-    w.service(
-        "web",
-        &format!(
-            "replicas: 1
-{POD}"
-        ),
-    );
+    w.service("web", &format!("replicas: 1\n{POD}"));
     w.settle();
     // An operator deletes the slot's only task.
     w.tasks.retain(|t| t.object.metadata.name != "web-1-1");
@@ -1667,25 +1662,13 @@ fn a_host_lacking_what_it_requires_takes_no_new_tasks() {
     let mut w = World::new();
     w.node("n1", &[]);
     w.node("n2", &[]);
-    w.service(
-        "web",
-        &format!(
-            "replicas: 2
-{POD}"
-        ),
-    );
+    w.service("web", &format!("replicas: 2\n{POD}"));
     w.settle();
     assert_eq!(w.placed("web"), ["n1", "n2"]);
 
     // What runs there stays; new tasks go elsewhere.
     w.node_mut("n1").status.lacks = vec![lack("pf.anchors", "required")];
-    w.service(
-        "api",
-        &format!(
-            "mode: global
-{POD}"
-        ),
-    );
+    w.service("api", &format!("mode: global\n{POD}"));
     w.settle();
     assert_eq!(w.placed("web"), ["n1", "n2"]);
     assert_eq!(w.placed("api"), ["n2"]);
@@ -1698,11 +1681,7 @@ fn a_host_lacking_what_it_requires_takes_no_new_tasks() {
     w.node_mut("n2").spec.require = vec!["forwarding".to_owned()];
     w.service(
         "one",
-        &format!(
-            "replicas: 1
-placement: {{ constraints: [\"node.name == n2\"] }}
-{POD}"
-        ),
+        &format!("replicas: 1\nplacement: {{ constraints: [\"node.name == n2\"] }}\n{POD}"),
     );
     w.settle();
     assert!(w.placed("one").is_empty());

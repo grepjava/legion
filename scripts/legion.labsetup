@@ -12,20 +12,27 @@ mkdir -p "$lvol/export" "$lvol/empty"
 
 # Legion never formats a LUN, so it must hold UFS already.
 makefs -t ffs -s 64m "$lvol/lun.img" "$lvol/empty"
+# UCL (ctld -u), so it can include the targets the storage test's node
+# provides: the file must be there before ctld starts.
+targets=/var/tmp/legion-targets.ucl
+echo 'target {}' > "$targets"
 cat > /etc/ctl.conf << EOF
-portal-group pg0 {
-    discovery-auth-group no-authentication
-    listen 127.0.0.1
+portal-group {
+  pg0 {
+    discovery-auth-group = no-authentication
+    listen = 127.0.0.1
+  }
 }
-target "$target" {
-    auth-group no-authentication
-    portal-group pg0
-    lun 0 {
-        path $lvol/lun.img
-        size 64M
-    }
+target {
+  "$target" {
+    auth-group = no-authentication
+    portal-group = pg0
+    lun = { 0 { path = "$lvol/lun.img" } }
+  }
 }
+.include "$targets"
 EOF
+sysrc ctld_flags=-u
 service ctld onestart
 # Loaded here, waiting for it: iscsid's rc script loads it only if it is
 # not there, and a load under way (ctld's modules share its dependency)
@@ -81,6 +88,7 @@ export LEGION_STORAGE_NFS=127.0.0.1:$lvol/export
 export LEGION_SYS_NFS=127.0.0.1:$lvol/export
 export LEGION_STORAGE_ISCSI='127.0.0.1 $target'
 export LEGION_SYS_ISCSI='127.0.0.1 $target'
+export LEGION_STORAGE_TARGETS=$targets
 export LEGION_BHYVE_DISK=/dev/zvol/lpool/guest
 export LEGION_BHYVE_LAB=/var/tmp/lbhyve
 export LEGION_CLUSTER_LAB=/var/tmp/lcluster

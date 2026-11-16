@@ -9,6 +9,7 @@
 #   etc/newsyslog.conf.d/legion.conf
 #   libexec/legion/volume/          (volume plugins go here)
 #   share/doc/legion/
+#   share/man/man1/legion.1
 #
 # Install it with
 #
@@ -31,12 +32,13 @@ stage=$(mktemp -d -t legion-release)
 trap 'rm -rf "$stage"' EXIT
 root=$stage/$name
 install -d "$root/bin" "$root/etc/rc.d" "$root/etc/newsyslog.conf.d" \
-    "$root/libexec/legion/volume" "$root/share/doc/legion"
+    "$root/libexec/legion/volume" "$root/share/doc/legion" "$root/share/man/man1"
 install -s -m 755 target/release/legion "$root/bin/legion"
 install -m 555 packaging/freebsd/rc.d/legion "$root/etc/rc.d/legion"
 install -m 644 packaging/freebsd/newsyslog.conf.d/legion.conf \
     "$root/etc/newsyslog.conf.d/legion.conf"
-install -m 644 README.md LICENSE docs/DESIGN.md "$root/share/doc/legion/"
+install -m 644 README.md CLI.md LICENSE docs/DESIGN.md "$root/share/doc/legion/"
+install -m 444 man/legion.1 "$root/share/man/man1/legion.1"
 
 mkdir -p "$out"
 # Owned by root, whoever builds it.

@@ -31,6 +31,56 @@ pub struct VolumeSpec {
     /// The plugin and what it is told, for `driver: plugin`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin: Option<PluginSource>,
+    /// A copy kept on another node, sent every so often (ZFS only): when
+    /// the node holding the data is removed, the Volume carries on from
+    /// the last copy there, instead of being lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica: Option<Replica>,
+}
+
+/// Where a ZFS Volume's replica is kept, and how often it is brought up to
+/// date.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Replica {
+    /// The node keeping it; unset, the leader picks one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// Seconds between copies: what may be lost with the node holding the
+    /// data. [`Replica::DEFAULT_EVERY`] when unset, at least
+    /// [`Replica::MIN_EVERY`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every_seconds: Option<u32>,
+}
+
+impl Replica {
+    pub const DEFAULT_EVERY: u32 = 300;
+    pub const MIN_EVERY: u32 = 10;
+
+    pub fn every(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.every_seconds.unwrap_or(Self::DEFAULT_EVERY).into())
+    }
+}
+
+/// A ZFS Volume's replica, as the leader last brought it up to date.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicaStatus {
+    pub node: String,
+    /// Its last snapshot (`legion-replica-<ms>`), the next copy's base;
+    /// empty until the first copy is taken.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub snapshot: String,
+    /// The node it was copied from: the next copy is whole if the data
+    /// has moved since.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub from: String,
+    /// When the last copy was taken, in milliseconds since the epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taken_ms: Option<i64>,
+    /// Why the last attempt failed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,10 +120,17 @@ pub enum Access {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NfsSource {
-    /// Host name or address of the server.
+    /// Host name or address of the server; empty with `node`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub server: String,
-    /// The exported directory.
+    /// The exported directory; empty with `node`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
+    /// A node of the cluster that provides the export itself, instead: a
+    /// ZFS dataset of its own, shared with the cluster's nodes, with the
+    /// Volume's `size` as its quota.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
     /// `mount_nfs` options (`nfsv4`, `soft`, ...); `nfsv4` if none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
@@ -84,12 +141,46 @@ pub struct NfsSource {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IscsiSource {
-    /// `host[:port]` of the target.
+    /// `host[:port]` of the target; empty with `node`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub portal: String,
-    /// The target's name (`iqn.…`).
+    /// The target's name (`iqn.…`); empty with `node`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target: String,
     #[serde(default)]
     pub lun: u32,
+    /// A node of the cluster that provides the LUN itself, instead: a ZFS
+    /// volume of the Volume's `size`, formatted UFS once, a target of the
+    /// node's ctld.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+}
+
+/// Where a provisioned NFS or iSCSI Volume is exported, as its node said:
+/// what the nodes using it mount.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Export {
+    /// The node providing it.
+    pub node: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub server: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub portal: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub target: String,
+    /// Why it isn't exported (yet), when making it failed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+}
+
+impl Export {
+    /// Whether it may be mounted: made, and saying where.
+    pub fn ready(&self) -> bool {
+        self.message.is_empty() && (!self.path.is_empty() || !self.target.is_empty())
+    }
 }
 
 /// A volume a node's plugin provides: the executable `name` in the node's
@@ -108,6 +199,36 @@ pub struct PluginSource {
 }
 
 impl VolumeSpec {
+    /// The node providing it, for a provisioned NFS or iSCSI Volume.
+    pub fn provider(&self) -> Option<&str> {
+        match self.driver {
+            VolumeDriver::Nfs => self.nfs.as_ref()?.node.as_deref(),
+            VolumeDriver::Iscsi => self.iscsi.as_ref()?.node.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// This spec with its provisioned source filled in from `export`, as
+    /// the nodes using it mount it; `None` while it isn't ready. Others as
+    /// they are.
+    pub fn resolved(&self, export: Option<&Export>) -> Option<VolumeSpec> {
+        let Some(node) = self.provider() else {
+            return Some(self.clone());
+        };
+        let e = export.filter(|e| e.node == node && e.ready())?;
+        let mut spec = self.clone();
+        if let Some(n) = &mut spec.nfs {
+            n.server.clone_from(&e.server);
+            n.path.clone_from(&e.path);
+        }
+        if let Some(i) = &mut spec.iscsi {
+            i.portal.clone_from(&e.portal);
+            i.target.clone_from(&e.target);
+            i.lun = 0;
+        }
+        Some(spec)
+    }
+
     pub fn access(&self) -> Access {
         match self.driver {
             VolumeDriver::Zfs => Access::Local,
@@ -135,7 +256,8 @@ impl VolumeSpec {
     /// volume with its options. `None` for storage several nodes share, and
     /// for ZFS, which is each Volume's own dataset.
     pub fn exclusive_storage(&self) -> Option<String> {
-        if self.access() != Access::Single {
+        // A LUN a node provides is its Volume's own: no other names it.
+        if self.access() != Access::Single || self.provider().is_some() {
             return None;
         }
         match self.driver {
@@ -171,9 +293,36 @@ impl Spec for VolumeSpec {
                 format!("is for ZFS volumes, not {}", driver.as_str()),
             )
         };
+        if let Some(r) = &self.replica {
+            if let Some(node) = &r.node {
+                crate::validate_name(node)
+                    .map_err(|e| Invalid::new("replica.node", e.to_string()))?;
+                if self.node.as_ref() == Some(node) {
+                    return Err(Invalid::new(
+                        "replica.node",
+                        "is the node holding the data: the replica is kept elsewhere",
+                    ));
+                }
+            }
+            if r.every_seconds.is_some_and(|s| s < Replica::MIN_EVERY) {
+                return Err(Invalid::new(
+                    "replica.everySeconds",
+                    format!("at least {}", Replica::MIN_EVERY),
+                ));
+            }
+        }
         if driver != VolumeDriver::Zfs {
-            if self.size.is_some() {
-                return Err(not_zfs("size"));
+            if self.replica.is_some() {
+                return Err(not_zfs("replica"));
+            }
+            if self.size.is_some() && self.provider().is_none() {
+                return Err(Invalid::new(
+                    "size",
+                    format!(
+                        "is for ZFS volumes and those a node provides, not {}",
+                        driver.as_str()
+                    ),
+                ));
             }
             if self.node.is_some() {
                 return Err(not_zfs("node"));
@@ -194,7 +343,20 @@ impl Spec for VolumeSpec {
                 return Err(Invalid::new(field, why));
             }
         }
-        if let Some(n) = &self.nfs {
+        if let Some(n) = &self.nfs
+            && let Some(node) = &n.node
+        {
+            crate::validate_name(node).map_err(|e| Invalid::new("nfs.node", e.to_string()))?;
+            if !n.server.is_empty() || !n.path.is_empty() {
+                return Err(Invalid::new(
+                    "nfs.node",
+                    "the node provides the export: no server or path with it",
+                ));
+            }
+            if let Some(o) = n.options.iter().find(|o| !option_word(o)) {
+                return Err(Invalid::new("nfs.options", format!("bad option {o:?}")));
+            }
+        } else if let Some(n) = &self.nfs {
             if n.server.is_empty()
                 || n.server.starts_with('-')
                 || !plain(&n.server)
@@ -212,7 +374,20 @@ impl Spec for VolumeSpec {
                 return Err(Invalid::new("nfs.options", format!("bad option {o:?}")));
             }
         }
-        if let Some(i) = &self.iscsi {
+        if let Some(i) = &self.iscsi
+            && let Some(node) = &i.node
+        {
+            crate::validate_name(node).map_err(|e| Invalid::new("iscsi.node", e.to_string()))?;
+            if !i.portal.is_empty() || !i.target.is_empty() || i.lun != 0 {
+                return Err(Invalid::new(
+                    "iscsi.node",
+                    "the node provides the LUN: no portal, target or lun with it",
+                ));
+            }
+            if self.size.is_none() {
+                return Err(Invalid::new("size", "is needed for a LUN a node provides"));
+            }
+        } else if let Some(i) = &self.iscsi {
             if i.portal.is_empty()
                 || i.portal.starts_with('-')
                 || !plain(&i.portal)
@@ -280,6 +455,16 @@ pub struct VolumeStatus {
     /// node joining under that name is not where the data is.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub lost: String,
+    /// The replica, while the spec asks for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica: Option<ReplicaStatus>,
+    /// The Volume carries on from its replica, its node holding the data
+    /// removed: from which node, and as of when.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub promoted: String,
+    /// Where a provisioned NFS or iSCSI Volume is exported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export: Option<Export>,
 }
 
 /// A Volume's data moving to another node: copied whole while its tasks
@@ -484,5 +669,68 @@ mod tests {
             let e = admit(yaml).unwrap_err();
             assert!(e.contains(why), "{yaml}: {e}");
         }
+    }
+
+    #[test]
+    fn a_node_provides_nfs_and_iscsi_volumes_with_their_size() {
+        let nfs = admit("driver: nfs\nsize: 10Gi\nnfs: { node: store1 }").unwrap();
+        assert_eq!(
+            (nfs.provider(), nfs.access()),
+            (Some("store1"), Access::Shared)
+        );
+        let lun = admit("driver: iscsi\nsize: 4Gi\niscsi: { node: store1 }").unwrap();
+        assert_eq!(
+            (lun.provider(), lun.access()),
+            (Some("store1"), Access::Single)
+        );
+        // Its own LUN: no other Volume can name it.
+        assert_eq!(lun.exclusive_storage(), None);
+        assert!(admit("driver: nfs\nnfs: { node: store1 }").is_ok());
+        for (bad, field) in [
+            ("driver: iscsi\niscsi: { node: store1 }", "size"),
+            (
+                "driver: nfs\nnfs: { node: store1, server: a, path: /x }",
+                "nfs.node",
+            ),
+            (
+                "driver: iscsi\nsize: 1Gi\niscsi: { node: store1, lun: 2 }",
+                "iscsi.node",
+            ),
+            ("driver: nfs\nnfs: { node: 'Store 1' }", "nfs.node"),
+            (
+                "driver: nfs\nsize: 1Gi\nnfs: { server: a, path: /x }",
+                "size",
+            ),
+        ] {
+            let e = admit(bad).unwrap_err();
+            assert!(e.starts_with(&format!("spec.{field}:")), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_provided_volume_is_mounted_from_where_its_node_said() {
+        let nfs = admit("driver: nfs\nnfs: { node: store1, options: [nfsv3] }").unwrap();
+        assert_eq!(nfs.resolved(None), None);
+        let mut e = Export {
+            node: "store1".into(),
+            server: "10.0.0.7".into(),
+            path: "/tank/legion/exports/shop/files".into(),
+            ..Default::default()
+        };
+        let r = nfs.resolved(Some(&e)).unwrap();
+        let n = r.nfs.unwrap();
+        assert_eq!(
+            (n.server.as_str(), n.path.as_str(), n.options.len()),
+            ("10.0.0.7", "/tank/legion/exports/shop/files", 1)
+        );
+        // Said by another node, or failed: not yet.
+        e.node = "store2".into();
+        assert_eq!(nfs.resolved(Some(&e)), None);
+        e.node = "store1".into();
+        e.message = "out of space".into();
+        assert_eq!(nfs.resolved(Some(&e)), None);
+        // Others as they are.
+        let plain = admit("size: 1Gi").unwrap();
+        assert_eq!(plain.resolved(None), Some(plain.clone()));
     }
 }

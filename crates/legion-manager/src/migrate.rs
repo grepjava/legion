@@ -36,7 +36,7 @@ const RETRY: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(300);
 
 /// How long after the `count`th failure in a row the next attempt starts.
-fn backoff(count: u32) -> Duration {
+pub(crate) fn backoff(count: u32) -> Duration {
     RETRY
         .saturating_mul(2u32.saturating_pow(count.saturating_sub(1)))
         .min(RETRY_MAX)
@@ -101,8 +101,16 @@ pub(crate) async fn run(
             }
         }
         // Transfers stop with the leadership; the next leader starts over.
+        // Replicas are copied, and nodes' exports kept, beside the moves,
+        // through the same sessions.
         tokio::select! {
-            () = lead(&store, &hub) => {}
+            () = async {
+                tokio::join!(
+                    lead(&store, &hub),
+                    crate::replicate::lead(&store, &hub),
+                    crate::exports::lead(&store, &hub),
+                );
+            } => {}
             () = async {
                 while metrics.borrow().current_leader == Some(id) {
                     if metrics.changed().await.is_err() {
@@ -341,6 +349,10 @@ async fn advance(
                 migration: None,
                 leftovers,
                 lost: String::new(),
+                // Its base is on the old node: the next copy is whole.
+                replica: s.replica.take(),
+                promoted: std::mem::take(&mut s.promoted),
+                export: s.export.take(),
             };
         } else {
             s.migration = Some(Migration {
@@ -414,15 +426,18 @@ async fn transfer(
 }
 
 /// What an agent sends in a session.
-trait Frames: Stream<Item = Result<SessionFrame, tonic::Status>> + Unpin + Send {}
+pub(crate) trait Frames:
+    Stream<Item = Result<SessionFrame, tonic::Status>> + Unpin + Send
+{
+}
 impl<S: Stream<Item = Result<SessionFrame, tonic::Status>> + Unpin + Send + ?Sized> Frames for S {}
 
 /// Where an agent's session input goes.
-type ToAgent = tokio::sync::mpsc::Sender<Result<SessionFrame, tonic::Status>>;
+pub(crate) type ToAgent = tokio::sync::mpsc::Sender<Result<SessionFrame, tonic::Status>>;
 
 /// The sender's output as the receiver's input, until the receiver has
 /// taken all of it.
-async fn pipe(
+pub(crate) async fn pipe(
     sender: &mut (impl Frames + ?Sized),
     received: &mut (impl Frames + ?Sized),
     receiver: &ToAgent,
@@ -565,7 +580,7 @@ async fn note(store: &Store, key: &ObjectKey, m: &Migration, why: &str) {
 /// Changes a Volume's status with `f`, which says whether it changed
 /// anything; tries again if the Volume changes meanwhile. Returns whether
 /// it wrote.
-async fn update(
+pub(crate) async fn update(
     store: &Store,
     key: &ObjectKey,
     f: impl Fn(&mut VolumeStatus) -> bool,
@@ -650,6 +665,7 @@ mod tests {
             migration,
             leftovers: Vec::new(),
             lost: String::new(),
+            ..Default::default()
         };
         // Still on, or moved on to its next phase.
         assert!(!called_off(
@@ -707,6 +723,7 @@ mod tests {
             }),
             leftovers: ["n1", "n2", "n3", "gone"].map(String::from).into(),
             lost: String::new(),
+            ..Default::default()
         };
         // n1's copy is dropped; n2 holds the Volume, n3 receives it again,
         // and the removed node took its copy with it.

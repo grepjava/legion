@@ -5,6 +5,7 @@ mod ca;
 mod cli;
 mod daemon;
 mod doctor;
+mod local;
 mod metrics;
 mod pki;
 mod resolver;
@@ -171,10 +172,23 @@ enum Command {
         /// /usr/local/libexec/legion/volume].
         #[arg(long)]
         volume_plugins: Option<PathBuf>,
+        /// The file of iSCSI targets this node writes for the LUNs it
+        /// provides (`iscsi: { node }`), which ctld's own UCL
+        /// configuration includes (`.include "FILE"`); without it the node
+        /// provides none. ctld is reloaded when it changes.
+        #[arg(long)]
+        iscsi_targets: Option<PathBuf>,
+        /// The portal group, of ctld's configuration, its targets are on.
+        #[arg(long, default_value = "legion")]
+        iscsi_portal_group: String,
+        /// `host[:port]` the nodes reach that portal group at [default:
+        /// the node's address, port 3260].
+        #[arg(long)]
+        iscsi_portal: Option<String>,
         /// The jailer a builder node (labelled `legion.builder=true`) builds
-        /// images with, for Builds.
-        #[arg(long, default_value = "jailer")]
-        jailer: String,
+        /// images with, for Builds; defaults to `legion jailer`.
+        #[arg(long)]
+        jailer: Option<String>,
         /// An argument put before each of jailer's commands, such as
         /// `--state-dir=/var/db/legion-builds`; may be given again.
         #[arg(long = "jailer-arg", allow_hyphen_values = true)]
@@ -373,6 +387,11 @@ enum Command {
         #[command(subcommand)]
         command: StackCommand,
     },
+    /// Local standalone images, builds, and containers (built-in jailer).
+    #[command(name = "local", visible_alias = "jailer")]
+    Local(local::Cli),
+    /// Build a FreeBSD OCI image from a Containerfile.
+    Build(local::BuildCli),
     /// People's access: user certificates and their roles.
     User {
         #[command(subcommand)]
@@ -959,12 +978,25 @@ pub const JAIL_SHIM: &str = "jail-shim";
 
 fn main() -> anyhow::Result<()> {
     let argv: Vec<String> = std::env::args().collect();
+    if argv
+        .first()
+        .and_then(|p| std::path::Path::new(p).file_stem())
+        .and_then(|s| s.to_str())
+        == Some("jailer")
+    {
+        return local::main();
+    }
     if argv.get(1).map(String::as_str) == Some(JAIL_SHIM) {
         std::process::exit(legion_jail::shim::main(&argv[2..]));
     }
+    if matches!(argv.get(1).map(String::as_str), Some("local" | "jailer"))
+        && argv.get(2).map(String::as_str) == Some(JAIL_SHIM)
+    {
+        std::process::exit(legion_jail::shim::main(&argv[3..]));
+    }
     std::thread::Builder::new()
         .name("legion-main".into())
-        .stack_size(8 * 1024 * 1024)
+        .stack_size(16 * 1024 * 1024)
         .spawn(|| {
             let args = Args::parse();
             tokio::runtime::Builder::new_multi_thread()
@@ -1024,6 +1056,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
             mesh_relay,
             load_balancer_interface,
             volume_plugins,
+            iscsi_targets,
+            iscsi_portal_group,
+            iscsi_portal,
             jailer,
             jailer_args,
             insecure_registries,
@@ -1077,7 +1112,26 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 mesh_relay,
                 load_balancer_interface,
                 volume_plugins,
-                jailer: std::iter::once(jailer).chain(jailer_args).collect(),
+                iscsi_targets,
+                iscsi_portal_group,
+                iscsi_portal,
+                jailer: match jailer {
+                    Some(j) => std::iter::once(j).chain(jailer_args).collect(),
+                    None => {
+                        let exe = std::env::current_exe()
+                            .ok()
+                            .and_then(|p| p.into_os_string().into_string().ok());
+                        match exe {
+                            Some(bin) => std::iter::once(bin)
+                                .chain(std::iter::once("local".to_owned()))
+                                .chain(jailer_args)
+                                .collect(),
+                            None => std::iter::once("jailer".to_owned())
+                                .chain(jailer_args)
+                                .collect(),
+                        }
+                    }
+                },
                 insecure_registries,
                 audit: legion_manager::AuditRetention {
                     age: std::time::Duration::from_secs(audit_retention_days * 24 * 3600),
@@ -1117,6 +1171,26 @@ async fn run(args: Args) -> anyhow::Result<()> {
         } => daemon::load_image(&file, name.as_deref(), &data_dir, &zfs_root).await,
         Command::Doctor { zfs_root, json } => {
             doctor::run(&legion_sys::Shell::new(), zfs_root.as_deref(), json)
+        }
+        Command::Local(cli) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                )
+                .with_target(false)
+                .init();
+            Box::pin(local::run_cli(&cli)).await
+        }
+        Command::Build(args) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                )
+                .with_target(false)
+                .init();
+            Box::pin(local::run_build(args)).await
         }
         Command::Unlock { key_file } => cli::unlock(&args.server, key_file.as_deref()).await,
         command => Box::pin(cli::run(&args.server, &args.identity, command)).await,

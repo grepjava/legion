@@ -1,0 +1,64 @@
+#!/usr/libexec/flua
+-- A Legion volume plugin: a directory of another host over SSH, mounted
+-- with sshfs (the fusefs-sshfs package, and the fusefs kernel module, which
+-- it loads). Shared or not as the Volume says: sshfs itself lets several
+-- nodes mount one directory.
+--
+--   plugin:
+--     name: sshfs
+--     shared: true
+--     options: { remote: "backup@files.lan:/srv/shop", identity: /usr/local/etc/legion/ssh/id_ed25519 }
+--
+-- `identity` is a private key on the node; the host's key must be in
+-- root's known_hosts already (StrictHostKeyChecking=yes). `port` is
+-- optional. Run by the agent as `sshfs mount DIR` and `sshfs unmount DIR`,
+-- with {"namespace", "volume", "options"} as JSON on standard input.
+
+local ucl = require("ucl")
+
+local function fail(msg)
+	io.stderr:write(msg, "\n")
+	os.exit(1)
+end
+
+local function quote(s)
+	return "'" .. (tostring(s):gsub("'", "'\''")) .. "'"
+end
+
+local function run(cmd)
+	if not os.execute(cmd) then
+		fail("failed: " .. cmd)
+	end
+end
+
+local op, dir = arg[1], arg[2]
+if (op ~= "mount" and op ~= "unmount") or not dir then
+	fail("usage: sshfs mount|unmount DIR")
+end
+local p = ucl.parser()
+local ok, err = p:parse_string(io.read("a"))
+if not ok then
+	fail("reading the request: " .. tostring(err))
+end
+local o = p:get_object().options or {}
+local path = "PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin "
+
+if op == "unmount" then
+	run("/sbin/umount " .. quote(dir))
+	os.exit(0)
+end
+if type(o.remote) ~= "string" or not o.remote:match("^[^%s:]+:.") then
+	fail("options.remote is needed: [user@]host:/path")
+end
+if type(o.identity) ~= "string" or o.identity:sub(1, 1) ~= "/" then
+	fail("options.identity is needed: the private key's absolute path on the node")
+end
+local opts = "allow_other,reconnect,StrictHostKeyChecking=yes,IdentityFile=" .. o.identity
+if o.port ~= nil then
+	if not tostring(o.port):match("^%d+$") then
+		fail("options.port must be a number")
+	end
+	opts = opts .. ",port=" .. tostring(o.port)
+end
+run("/sbin/kldload -n fusefs")
+run(path .. "sshfs -o " .. quote(opts) .. " " .. quote(o.remote) .. " " .. quote(dir))

@@ -259,3 +259,170 @@ fn pod_on_network_storage() {
                 pfctl -a legion/svc -F all; pfctl -a legion/policy -F all";
     let _ = Command::new("sh").args(["-c", tidy]).output();
 }
+
+fn provided(node: &str, replicas: u32, run: &str) -> String {
+    format!(
+        r#"apiVersion: legion/v1
+kind: Volume
+metadata: {{ name: pfiles, namespace: shop }}
+spec: {{ driver: nfs, size: 64Mi, nfs: {{ node: "{node}", options: [nfsv3] }} }}
+---
+apiVersion: legion/v1
+kind: Volume
+metadata: {{ name: plun, namespace: shop }}
+spec: {{ driver: iscsi, size: 64Mi, iscsi: {{ node: "{node}" }} }}
+---
+apiVersion: legion/v1
+kind: Service
+metadata: {{ name: writer, namespace: shop }}
+spec:
+  replicas: {replicas}
+  pod:
+    containers:
+      - name: writer
+        image: {IMAGE}
+        command: [/bin/sh, -c, "echo {run} >> /files/legion-storage; echo {run} >> /lun/legion-storage; exec sleep 100000"]
+        volumeMounts:
+          - {{ name: files, path: /files }}
+          - {{ name: lun, path: /lun }}
+    volumes:
+      - {{ name: files, volume: {{ name: pfiles }} }}
+      - {{ name: lun, volume: {{ name: plun }} }}
+"#
+    )
+}
+
+/// Storage the node provides itself (DESIGN.md §6.7): an NFS Volume it
+/// makes and shares (nfsd and mountd running), and an iSCSI LUN it makes,
+/// formats and adds to the targets ctld includes (`LEGION_STORAGE_TARGETS`,
+/// the file the lab's UCL `/etc/ctl.conf` includes, on portal group pg0 at
+/// 127.0.0.1, iscsid running). A service writes to both, scaled to nothing
+/// and back; deleted, they are no longer exported, their data kept, then
+/// destroyed by the test.
+#[test]
+#[ignore = "needs root, ZFS, nfsd, ctld including a targets file, and iscsid on FreeBSD; see the module docs"]
+fn pod_on_storage_its_node_provides() {
+    let lab = PathBuf::from(env("LEGION_STORAGE_LAB")).join("provided");
+    let zfs_root = env("LEGION_STORAGE_ZFS_ROOT");
+    let targets = env("LEGION_STORAGE_TARGETS");
+    assert!(
+        !sh("jls path")
+            .lines()
+            .any(|p| p.starts_with(&*lab.to_string_lossy())),
+        "jails from an earlier run still run under {}",
+        lab.display()
+    );
+    if lab.exists() {
+        sh(&format!("chflags -R 0 {0} && rm -rf {0}", lab.display()));
+    }
+    std::fs::create_dir_all(&lab).unwrap();
+    let exports = format!("{zfs_root}/exports");
+    sh(&format!("zfs destroy -r {exports} 2>/dev/null"));
+    let run = format!("provided-{}", std::process::id());
+
+    let log = std::fs::File::create(lab.join("daemon.log")).unwrap();
+    let child = Command::new(LEGION)
+        .args(["daemon", "--listen", SERVER, "--zfs-root", &zfs_root])
+        .args(["--iscsi-targets", &targets, "--iscsi-portal-group", "pg0"])
+        .args(["--iscsi-portal", "127.0.0.1"])
+        .arg("--data-dir")
+        .arg(lab.join("data"))
+        .arg("--run-dir")
+        .arg(lab.join("run"))
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let mut daemon = Daemon(Some(child));
+    wait("the daemon", 60, || {
+        legion(&lab, &["status"]).status.success()
+    });
+    ok(&lab, &["init"]);
+    let nodes: Value = serde_json::from_str(&ok(&lab, &["list", "nodes", "-o", "json"])).unwrap();
+    let node = match &nodes {
+        Value::Array(v) => v[0]["metadata"]["name"].as_str().unwrap().to_owned(),
+        one => one["metadata"]["name"].as_str().unwrap().to_owned(),
+    };
+    let apply = |replicas: u32| {
+        let file = lab.join("app.yaml");
+        std::fs::write(&file, provided(&node, replicas, &run)).unwrap();
+        ok(&lab, &["apply", "-f", file.to_str().unwrap()]);
+    };
+    let export = |name: &str| get(&lab, "volume", name)["status"]["export"].clone();
+    let target = "iqn.2026-11.invalid.legion:shop.plun";
+    let logged_in = || sh("iscsictl -L").contains(target);
+
+    apply(1);
+    wait("both exported", 120, || {
+        export("pfiles")["path"].is_string() && export("plun")["target"] == target
+    });
+    let path = PathBuf::from(export("pfiles")["path"].as_str().unwrap());
+    assert_eq!(path, Path::new("/").join(format!("{exports}/shop/pfiles")));
+    assert_eq!(export("plun")["portal"], "127.0.0.1");
+    let shared = sh(&format!(
+        "zfs get -H -o value sharenfs {exports}/shop/pfiles"
+    ));
+    assert!(
+        shared.contains("-maproot=root") && shared.contains("127.0.0.1"),
+        "{shared}"
+    );
+    assert!(std::fs::read_to_string(&targets).unwrap().contains(target));
+    assert!(
+        sh("ctladm portlist").contains(target),
+        "ctld reloaded with the target"
+    );
+
+    // The first run pulls the image.
+    wait("the writer to run", 300, || running(&lab) == 1);
+    let on_lun = lab.join("run/volumes/iscsi/shop/plun/legion-storage");
+    let on_nfs = path.join("legion-storage");
+    wait("its first lines", 30, || {
+        lines(&on_nfs, &run) == 1 && lines(&on_lun, &run) == 1
+    });
+    assert!(logged_in());
+
+    // Scaled to nothing and back: what it wrote is on both.
+    apply(0);
+    wait("the node to let go of the LUN", 120, || {
+        running(&lab) == 0 && !logged_in()
+    });
+    apply(1);
+    wait("the writer to run again", 120, || running(&lab) == 1);
+    wait("the second lines", 30, || {
+        lines(&on_nfs, &run) == 2 && lines(&on_lun, &run) == 2
+    });
+
+    // Deleted: no longer exported, the data kept.
+    ok(&lab, &["delete", "service", "writer", "-n", "shop"]);
+    wait("the writer to go", 120, || {
+        running(&lab) == 0 && !logged_in()
+    });
+    for v in ["pfiles", "plun"] {
+        wait(&format!("{v} deleted once unused"), 60, || {
+            legion(&lab, &["delete", "volume", v, "-n", "shop"])
+                .status
+                .success()
+        });
+    }
+    wait("no longer exported", 120, || {
+        sh(&format!(
+            "zfs get -H -o value sharenfs {exports}/shop/pfiles"
+        ))
+        .trim()
+            == "off"
+            && !sh("ctladm portlist").contains(target)
+    });
+    assert!(!std::fs::read_to_string(&targets).unwrap().contains(target));
+    assert_eq!(lines(&on_nfs, &run), 2, "the data stays");
+
+    let status = daemon.stop().expect("the daemon stops within a minute");
+    assert!(
+        status.success(),
+        "the daemon ended with {status}; see {}",
+        lab.join("daemon.log").display()
+    );
+    sh(&format!("zfs destroy -r {exports}"));
+    let tidy = "for i in legion0 wg0; do ifconfig $i destroy; done; \
+                pfctl -a legion/svc -F all; pfctl -a legion/policy -F all";
+    let _ = Command::new("sh").args(["-c", tidy]).output();
+}

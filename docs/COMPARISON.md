@@ -107,9 +107,10 @@ Linux hosts, an ecosystem of tools and charts, or proven production use.
 | Feature | Legion | Docker Swarm | Kubernetes |
 |---|---|---|---|
 | Local volumes | ZFS datasets, a size as quota | Local driver | hostPath, local PersistentVolumes |
-| Network volumes | NFS, iSCSI (UFS on the LUN), plugins as executables | Volume plugins | CSI drivers (add-on) |
+| Network volumes | NFS, iSCSI (UFS on the LUN), plugins as executables (`hostpath`, `sshfs` and `rclone` shipped); or NFS and iSCSI a node of the cluster provides from its ZFS | Volume plugins | CSI drivers (add-on) |
 | Per-replica volumes | From claims in stateful services | No | volumeClaimTemplates |
 | Moving a volume between nodes | `zfs send` when a node drains, or `legion volume move` | No | Only with network storage |
+| Replicated local volumes | A ZFS Volume's `replica`: incremental `zfs send` to another node every so often; the Volume carries on there when its node is removed | No | With a replicating CSI driver |
 | Snapshots | Before each update of a stateful service; rolled back with it | No | VolumeSnapshot, with a CSI driver |
 | Scratch space in memory | `tmpfs` volumes | `--mount type=tmpfs` | `emptyDir: { medium: Memory }` |
 

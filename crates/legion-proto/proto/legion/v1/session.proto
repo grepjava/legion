@@ -52,7 +52,48 @@ message SessionOpen {
     // `input` frames until `input_closed`), then `exit_code` 0. A symbolic
     // link on the way is refused, not followed.
     FilesOptions files = 16;
+    // Managers only, a ZFS Volume's replica (DESIGN.md §6.4): the holder
+    // snapshots and sends, the replica's node receives, unmounted.
+    ReplicaSend replica_send = 17;
+    ReplicaReceive replica_receive = 18;
+    // Managers only: make this node's exports (the NFS and iSCSI Volumes
+    // it provides) exactly these; what it says of each as JSON on
+    // `stdout`, then `exit_code` 0.
+    ExportSync export_sync = 19;
   }
+}
+
+message ExportSync {
+  repeated ExportWanted exports = 1;
+  // The addresses NFS exports are shared with: the cluster's nodes'.
+  repeated string clients = 2;
+}
+
+message ExportWanted {
+  string namespace = 1;
+  string volume = 2;
+  // "nfs" or "iscsi".
+  string kind = 3;
+  // Bytes: the quota, or the LUN's size; 0 for no quota.
+  uint64 size = 4;
+}
+
+// Snapshots the Volume as `snapshot` and sends it: all of it, or with
+// `base` what changed since that snapshot, the last the replica holds.
+// The holder's older replica snapshots go first.
+message ReplicaSend {
+  string volume = 1;
+  string snapshot = 2;
+  string base = 3;
+}
+
+// Receives what `ReplicaSend` sends: a full copy replaces what is here; an
+// incremental one needs `base` here. It stays unmounted; the replica's
+// older snapshots go once it is taken.
+message ReplicaReceive {
+  string volume = 1;
+  string snapshot = 2;
+  string base = 3;
 }
 
 message FilesOptions {

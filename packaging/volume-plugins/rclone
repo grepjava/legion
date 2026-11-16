@@ -1,0 +1,70 @@
+#!/usr/libexec/flua
+-- A Legion volume plugin: an rclone remote (S3, B2, WebDAV, ...) mounted
+-- with `rclone mount` (the rclone package, and the fusefs kernel module,
+-- which it loads). Objects are not files: leave the Volume unshared unless
+-- its tasks only read it.
+--
+--   plugin:
+--     name: rclone
+--     options: { remote: "s3:shop-assets/www", config: /usr/local/etc/legion/rclone.conf }
+--
+-- `config` is the rclone configuration on the node naming the remote and
+-- its credentials, readable by root only. `cache` is optional: rclone's
+-- --vfs-cache-mode (off, minimal, writes, full; writes by default). Run by
+-- the agent as `rclone mount DIR` and `rclone unmount DIR`, with
+-- {"namespace", "volume", "options"} as JSON on standard input.
+
+local ucl = require("ucl")
+
+local function fail(msg)
+	io.stderr:write(msg, "\n")
+	os.exit(1)
+end
+
+local function quote(s)
+	return "'" .. (tostring(s):gsub("'", "'\''")) .. "'"
+end
+
+local function run(cmd)
+	if not os.execute(cmd) then
+		fail("failed: " .. cmd)
+	end
+end
+
+local op, dir = arg[1], arg[2]
+if (op ~= "mount" and op ~= "unmount") or not dir then
+	fail("usage: rclone mount|unmount DIR")
+end
+local p = ucl.parser()
+local ok, err = p:parse_string(io.read("a"))
+if not ok then
+	fail("reading the request: " .. tostring(err))
+end
+local o = p:get_object().options or {}
+local path = "PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin "
+
+if op == "unmount" then
+	run("/sbin/umount " .. quote(dir))
+	os.exit(0)
+end
+if type(o.remote) ~= "string" or not o.remote:match("^[%w_.-]+:") then
+	fail("options.remote is needed: remote:path, a remote of the config")
+end
+if type(o.config) ~= "string" or o.config:sub(1, 1) ~= "/" then
+	fail("options.config is needed: the rclone config's absolute path on the node")
+end
+local cache = o.cache or "writes"
+if not ({ off = true, minimal = true, writes = true, full = true })[cache] then
+	fail("options.cache is off, minimal, writes or full")
+end
+run("/sbin/kldload -n fusefs")
+run(path .. "rclone mount --daemon --allow-other --vfs-cache-mode " .. cache
+	.. " --config " .. quote(o.config) .. " " .. quote(o.remote) .. " " .. quote(dir))
+-- The agent checks a file system is there once this returns: wait for it.
+for _ = 1, 60 do
+	if os.execute("/sbin/mount -p | /usr/bin/awk '{print $2}' | /usr/bin/grep -qxF " .. quote(dir)) then
+		os.exit(0)
+	end
+	os.execute("sleep 0.5")
+end
+fail("rclone mounted nothing at " .. dir .. " within 30 s")

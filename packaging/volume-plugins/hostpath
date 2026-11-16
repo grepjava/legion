@@ -1,0 +1,51 @@
+#!/usr/libexec/flua
+-- A Legion volume plugin: a directory of the node, mounted into the
+-- Volume's tasks with nullfs. Its data is the node's own, so leave the
+-- Volume unshared (`shared: false`): it is then used on one node at a time.
+--
+--   plugin: { name: hostpath, options: { path: /srv/cache, readOnly: "true" } }
+--
+-- Run by the agent as `hostpath mount DIR` and `hostpath unmount DIR`,
+-- with {"namespace", "volume", "options"} as JSON on standard input.
+
+local ucl = require("ucl")
+
+local function fail(msg)
+	io.stderr:write(msg, "\n")
+	os.exit(1)
+end
+
+local function quote(s)
+	return "'" .. (tostring(s):gsub("'", "'\''")) .. "'"
+end
+
+local function run(cmd)
+	if not os.execute(cmd) then
+		fail("failed: " .. cmd)
+	end
+end
+
+local op, dir = arg[1], arg[2]
+if (op ~= "mount" and op ~= "unmount") or not dir then
+	fail("usage: hostpath mount|unmount DIR")
+end
+local p = ucl.parser()
+local ok, err = p:parse_string(io.read("a"))
+if not ok then
+	fail("reading the request: " .. tostring(err))
+end
+local o = p:get_object().options or {}
+
+if op == "unmount" then
+	run("/sbin/umount " .. quote(dir))
+	os.exit(0)
+end
+local path = o.path
+if type(path) ~= "string" or path:sub(1, 1) ~= "/" then
+	fail("options.path is needed: an absolute directory of the node")
+end
+if not os.execute("test -d " .. quote(path)) then
+	fail(path .. " is not a directory on this node")
+end
+local ro = (o.readOnly == "true") and "-o ro " or ""
+run("/sbin/mount_nullfs " .. ro .. quote(path) .. " " .. quote(dir))

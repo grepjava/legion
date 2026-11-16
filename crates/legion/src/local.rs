@@ -1,0 +1,2557 @@
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
+use legion_build::auth::{resolve_credentials, save_credentials};
+use legion_build::build::{BuildBackend, BuildOptions};
+use legion_build::check::{CheckReport, Severity, check_containerfile};
+use legion_build::containerfile::Containerfile;
+use legion_build::init::{InitOptions, Template, detect_app_name};
+use legion_build::layer::Compression;
+use legion_build::record::Record;
+use legion_build::registry::Client;
+use legion_build::runtime::{Config, JailRuntime};
+use legion_build::store::Store;
+use legion_build::sys::{Shell, Sys};
+use legion_build::{Reference, shim};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "jailer",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "Build, test, and publish FreeBSD jail OCI images for Legion"
+)]
+pub struct Cli {
+    /// Directory where jailer keeps images and container state
+    #[arg(long, env = "JAILER_STATE_DIR", global = true, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+
+    /// ZFS root dataset for image layers and container clones (e.g. zroot/jailer)
+    #[arg(long, env = "JAILER_ZFS_ROOT", global = true, value_name = "DATASET")]
+    pub zfs_root: Option<String>,
+
+    /// Use plain directory storage instead of ZFS
+    /// (`JAILER_NO_ZFS=1`, `yes` or `true`)
+    #[arg(
+        long,
+        env = "JAILER_NO_ZFS",
+        global = true,
+        value_parser = clap::builder::FalseyValueParser::new()
+    )]
+    pub no_zfs: bool,
+
+    /// Pods' network on jailer's bridge [default: 10.77.0.0/16]
+    #[arg(
+        long,
+        env = "JAILER_POD_SUBNET",
+        global = true,
+        value_name = "CIDR",
+        value_parser = legion_build::net::parse_subnet
+    )]
+    pub pod_subnet: Option<legion_sys::Ipv4Net>,
+
+    /// Talk to this registry over plain HTTP instead of HTTPS
+    #[arg(long, global = true, value_name = "HOST[:PORT]")]
+    pub plain_http: Vec<String>,
+
+    #[command(subcommand)]
+    pub command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    /// Scaffold a FreeBSD Containerfile and .containerignore
+    Init {
+        /// Project template (auto-detected from Cargo.toml, go.mod, etc. if omitted)
+        #[arg(long, short = 'T', value_enum)]
+        template: Option<Template>,
+
+        /// FreeBSD base image release tag [default: host release or 15.1]
+        #[arg(long, short = 'r')]
+        release: Option<String>,
+
+        /// Application or binary name [default: inferred from project]
+        #[arg(long, short = 'n')]
+        name: Option<String>,
+
+        /// Overwrite existing Containerfile
+        #[arg(long, short = 'f')]
+        force: bool,
+
+        /// Project directory [default: .]
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+    },
+
+    /// Build a FreeBSD OCI image from a Containerfile
+    Build(BuildArgs),
+
+    /// Run and test an image locally in a FreeBSD jail matching Legion's runtime
+    Run {
+        /// Remove the container and its rootfs when it exits
+        #[arg(long)]
+        rm: bool,
+
+        /// Run the container in the background and print its ID
+        #[arg(short = 'd', long)]
+        detach: bool,
+
+        /// Keep STDIN open
+        #[arg(short = 'i', long)]
+        interactive: bool,
+
+        /// Allocate a pseudo-TTY
+        #[arg(short = 't', long)]
+        tty: bool,
+
+        /// Assign a name to the container
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+
+        /// Set environment variables (KEY=VALUE)
+        #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+
+        /// Mount a host path into the container via nullfs (SRC:DEST[:ro])
+        #[arg(short = 'v', long = "volume", value_name = "SRC:DEST[:ro]")]
+        volumes: Vec<String>,
+
+        /// Username or UID (format: <name|uid>[:<group|gid>])
+        #[arg(short = 'u', long, value_name = "USER[:GROUP]")]
+        user: Option<String>,
+
+        /// Working directory inside the container
+        #[arg(short = 'w', long = "workdir", value_name = "DIR")]
+        workdir: Option<String>,
+
+        /// Container hostname
+        #[arg(long, value_name = "HOSTNAME")]
+        hostname: Option<String>,
+
+        /// Override the image's default ENTRYPOINT
+        #[arg(long, value_name = "BIN")]
+        entrypoint: Option<String>,
+
+        /// Run in a pod with a network stack of its own, on jailer's bridge
+        /// (`--network bridge`)
+        #[arg(long)]
+        vnet: bool,
+
+        /// The network: the host's, jailer's bridge (as `--vnet`), or none
+        /// (a pod with only its loopback)
+        #[arg(long, value_enum, default_value_t = NetworkArg::Host)]
+        network: NetworkArg,
+
+        /// Publish a port on the host: [IP:]HOST:CONTAINER[/tcp|udp]
+        /// (implies `--vnet`)
+        #[arg(short = 'p', long = "publish", value_name = "[IP:]HOST:CONTAINER")]
+        publish: Vec<String>,
+
+        /// Allow mlock(2) inside the jail (`org.freebsd.jail.allow.mlock=true`)
+        #[arg(long)]
+        allow_mlock: bool,
+
+        /// Enable SysV IPC namespaces (`msg`, `sem`, `shm`)
+        #[arg(long, value_delimiter = ',')]
+        sysv: Vec<String>,
+
+        /// Additional raw jail(8) parameters (KEY=VALUE)
+        #[arg(long = "param", value_name = "KEY=VALUE")]
+        params: Vec<String>,
+
+        #[command(flatten)]
+        limits: LimitArgs,
+
+        /// Run a Linux image through FreeBSD's Linux ABI (`linux(4)`)
+        #[arg(long)]
+        linux: bool,
+
+        /// Run the image as a bhyve virtual machine (expects `/disk.img`)
+        #[arg(long)]
+        vm: bool,
+
+        /// Virtual CPUs for a `--vm` guest
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        vm_cpus: u16,
+
+        /// Guest RAM for a `--vm` guest (e.g. 512m, 2g)
+        #[arg(long, default_value = "512m", value_name = "SIZE")]
+        vm_memory: String,
+
+        /// Boot loader for a `--vm` guest (`bhyveload` or `uefi`)
+        #[arg(long, value_enum, default_value_t = VmBootArg::Bhyveload)]
+        vm_boot: VmBootArg,
+
+        /// Image to run [default: current directory's built image] and optional command
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Publish an image to an OCI registry for Legion
+    Push {
+        /// Registry credentials (USER[:PASSWORD])
+        #[arg(long, value_name = "USER[:PASSWORD]")]
+        creds: Option<String>,
+
+        /// Path to Docker/Podman auth.json file
+        #[arg(long, value_name = "PATH")]
+        authfile: Option<PathBuf>,
+
+        /// Sign the pushed manifest with this private key, as cosign does
+        #[arg(long = "sign-key", value_name = "PATH")]
+        sign_key: Option<PathBuf>,
+
+        /// Add to this release record (see docs/RELEASE-RECORD.md)
+        #[arg(long, value_name = "FILE")]
+        record: Option<PathBuf>,
+
+        /// `<target-reference>` (pushes current project's image) or `<source-image> <target-reference>`
+        #[arg(required = true, num_args = 1..=2)]
+        refs: Vec<String>,
+    },
+
+    /// Build on a host for each platform, then push one index of them all
+    Publish {
+        /// A platform's build host: PLATFORM=DEST, as freebsd/arm64=me@host
+        #[arg(long = "host", value_name = "PLATFORM=DEST", required = true)]
+        hosts: Vec<String>,
+
+        /// The Containerfile, relative to the context
+        #[arg(short = 'f', long = "file", value_name = "PATH")]
+        file: Option<String>,
+
+        /// Build-time variable (KEY=VALUE)
+        #[arg(long = "build-arg", value_name = "KEY=VALUE")]
+        build_args: Vec<String>,
+
+        /// Target build stage to stop at
+        #[arg(long, value_name = "STAGE")]
+        target: Option<String>,
+
+        /// Registry credentials for the index (USER[:PASSWORD])
+        #[arg(long, value_name = "USER[:PASSWORD]")]
+        creds: Option<String>,
+
+        /// Path to Docker/Podman auth.json file
+        #[arg(long, value_name = "PATH")]
+        authfile: Option<PathBuf>,
+
+        /// Sign the index with this private key, as cosign does
+        #[arg(long = "sign-key", value_name = "PATH")]
+        sign_key: Option<PathBuf>,
+
+        /// Write a release record (see docs/RELEASE-RECORD.md)
+        #[arg(long, value_name = "FILE")]
+        record: Option<PathBuf>,
+
+        /// The jailer on the hosts
+        #[arg(long, value_name = "PATH", default_value = "jailer")]
+        remote_jailer: String,
+
+        /// The program to reach the hosts with
+        #[arg(long, env = "JAILER_SSH", value_name = "PATH", default_value = "ssh")]
+        ssh: String,
+
+        /// Registry reference to publish to (e.g. ghcr.io/me/app:1.0)
+        reference: String,
+
+        /// The build context
+        #[arg(default_value = ".")]
+        context: PathBuf,
+    },
+
+    /// Publish or inspect multi-architecture image indexes
+    #[command(subcommand)]
+    Manifest(ManifestCommand),
+
+    /// Sign an image already in a registry, as cosign does with a key pair
+    Sign {
+        /// The private key (PEM), from `jailer key generate`
+        #[arg(long, value_name = "PATH")]
+        key: PathBuf,
+
+        /// Registry credentials (USER[:PASSWORD])
+        #[arg(long, value_name = "USER[:PASSWORD]")]
+        creds: Option<String>,
+
+        /// Path to Docker/Podman auth.json file
+        #[arg(long, value_name = "PATH")]
+        authfile: Option<PathBuf>,
+
+        /// Add to this release record (see docs/RELEASE-RECORD.md)
+        #[arg(long, value_name = "FILE")]
+        record: Option<PathBuf>,
+
+        /// The image, e.g. ghcr.io/me/app:1.0
+        reference: String,
+    },
+
+    /// Check that an image in a registry is signed by a key
+    Verify {
+        /// The public key (PEM)
+        #[arg(long, value_name = "PATH")]
+        key: PathBuf,
+
+        /// Registry credentials (USER[:PASSWORD])
+        #[arg(long, value_name = "USER[:PASSWORD]")]
+        creds: Option<String>,
+
+        /// Path to Docker/Podman auth.json file
+        #[arg(long, value_name = "PATH")]
+        authfile: Option<PathBuf>,
+
+        /// Check an attestation of this kind, not a signature, and print it
+        #[arg(long = "type", value_enum)]
+        kind: Option<AttestationArg>,
+
+        /// Add to this release record (see docs/RELEASE-RECORD.md)
+        #[arg(long, value_name = "FILE")]
+        record: Option<PathBuf>,
+
+        /// The image, e.g. ghcr.io/me/app:1.0
+        reference: String,
+    },
+
+    /// Attest provenance or an SBOM for an image in a registry, as cosign does
+    Attest {
+        /// The private key (PEM), from `jailer key generate`
+        #[arg(long, value_name = "PATH")]
+        key: PathBuf,
+
+        /// What to attest
+        #[arg(long = "type", value_enum)]
+        kind: AttestationArg,
+
+        /// The release record: provenance comes from it, and it is added to
+        #[arg(long, value_name = "FILE")]
+        record: Option<PathBuf>,
+
+        /// The local image an SBOM is of [default: the reference's]
+        #[arg(long, value_name = "IMAGE")]
+        image: Option<String>,
+
+        /// Registry credentials (USER[:PASSWORD])
+        #[arg(long, value_name = "USER[:PASSWORD]")]
+        creds: Option<String>,
+
+        /// Path to Docker/Podman auth.json file
+        #[arg(long, value_name = "PATH")]
+        authfile: Option<PathBuf>,
+
+        /// The image, e.g. ghcr.io/me/app:1.0
+        reference: String,
+    },
+
+    /// Print an image's SBOM, as SPDX JSON
+    Sbom {
+        /// Write it here, not to standard output
+        #[arg(short = 'o', long = "output", value_name = "PATH")]
+        output: Option<PathBuf>,
+
+        /// A local image
+        image: String,
+    },
+
+    /// Make signing keys
+    #[command(subcommand)]
+    Key(KeyCommand),
+
+    /// Produce an offline OCI archive (`app.tar`) for `legion image load`
+    Export {
+        /// Output tar archive path
+        #[arg(short = 'o', long = "output", value_name = "PATH")]
+        output: Option<PathBuf>,
+
+        /// Override image reference recorded in the archive's `index.json`
+        #[arg(long, value_name = "REF")]
+        name: Option<String>,
+
+        /// Add to this release record (see docs/RELEASE-RECORD.md)
+        #[arg(long, value_name = "FILE")]
+        record: Option<PathBuf>,
+
+        /// `<output.tar>` (exports current project's image) or `<image> [output.tar]`
+        #[arg(num_args = 1..=2)]
+        args: Vec<String>,
+    },
+
+    /// Check a Containerfile or built image for Legion compatibility
+    Check {
+        /// Print the result as JSON, on standard output
+        #[arg(long)]
+        json: bool,
+
+        /// Image reference or directory containing a Containerfile [default: .]
+        #[arg(default_value = ".")]
+        target: String,
+    },
+
+    /// Check what this host can do, changing nothing
+    Doctor {
+        /// Print the result as JSON, on standard output
+        #[arg(long)]
+        json: bool,
+
+        /// Only what these need [default: all of them]
+        #[arg(
+            long = "for",
+            value_enum,
+            value_delimiter = ',',
+            value_name = "OPERATION"
+        )]
+        operations: Vec<legion_local::doctor::Operation>,
+    },
+
+    /// Pull an image from an OCI registry into the local store
+    Pull {
+        /// Registry credentials (USER[:PASSWORD])
+        #[arg(long, value_name = "USER[:PASSWORD]")]
+        creds: Option<String>,
+
+        /// Path to Docker/Podman auth.json file
+        #[arg(long, value_name = "PATH")]
+        authfile: Option<PathBuf>,
+
+        /// Allow Linux images when no FreeBSD image is offered
+        #[arg(long)]
+        linux: bool,
+
+        /// Image reference to pull
+        reference: String,
+    },
+
+    /// Load an image from an OCI archive (`app.tar`) into the local store
+    Load {
+        /// Override the image name
+        #[arg(long, value_name = "REF")]
+        name: Option<String>,
+
+        /// Path to the OCI archive tar
+        archive: PathBuf,
+    },
+
+    /// Save registry login credentials to ~/.docker/config.json
+    Login {
+        /// Username
+        #[arg(short = 'u', long)]
+        username: String,
+
+        /// Password or token
+        #[arg(short = 'p', long, required_unless_present = "password_stdin")]
+        password: Option<String>,
+
+        /// Read the password or token from standard input, so that it is
+        /// not in the command line
+        #[arg(long, conflicts_with = "password")]
+        password_stdin: bool,
+
+        /// Path to auth file
+        #[arg(long, value_name = "PATH")]
+        authfile: Option<PathBuf>,
+
+        /// Registry host (e.g. ghcr.io, docker.io)
+        registry: String,
+    },
+
+    /// List images in the local store
+    Images,
+
+    /// Remove images from the local store
+    Rmi {
+        /// Image references or IDs
+        #[arg(required = true)]
+        references: Vec<String>,
+    },
+
+    /// Remove layers and blobs no image or build cache entry uses
+    Prune {
+        /// Also clear the build cache
+        #[arg(long)]
+        cache: bool,
+
+        /// First remove every image no container was made from
+        #[arg(long)]
+        images: bool,
+    },
+
+    /// List local containers
+    Ps {
+        /// Show all containers (default shows just running)
+        #[arg(short = 'a', long)]
+        all: bool,
+    },
+
+    /// Fetch the logs of a container
+    Logs {
+        /// Number of lines to show from the end of the logs
+        #[arg(long, short = 'n')]
+        tail: Option<usize>,
+
+        /// Container ID or name
+        container: String,
+    },
+
+    /// Execute a command in a running container
+    Exec {
+        /// Keep STDIN open
+        #[arg(short = 'i', long)]
+        interactive: bool,
+
+        /// Allocate a pseudo-TTY
+        #[arg(short = 't', long)]
+        tty: bool,
+
+        /// Container ID or name
+        container: String,
+
+        /// Command and arguments
+        #[arg(required = true, trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+
+    /// Stop a running container
+    Stop {
+        /// Seconds to wait before killing the jail
+        #[arg(short = 't', long)]
+        time: Option<u64>,
+
+        /// Container ID or name
+        container: String,
+    },
+
+    /// Remove one or more containers
+    Rm {
+        /// Stop running containers before removing them
+        #[arg(short, long)]
+        force: bool,
+
+        /// Container IDs or names
+        #[arg(required = true)]
+        containers: Vec<String>,
+    },
+
+    /// Internal: waits for a container started by `run -d` to exit, then
+    /// stops its pod, freeing its address and ports, or with `--rm`
+    /// removes it
+    #[command(name = "on-exit", hide = true)]
+    OnExit {
+        #[arg(long)]
+        rm: bool,
+        id: String,
+    },
+
+    /// Internal supervisor shim for jails
+    #[command(name = "jail-shim", hide = true)]
+    JailShim {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+/// Reads `--secret id=ID,src=FILE` and `--secret id=ID,env=VAR` values.
+fn parse_secrets(specs: &[String]) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut out = BTreeMap::new();
+    for spec in specs {
+        let mut kv = BTreeMap::new();
+        for part in spec.split(',') {
+            match part.split_once('=') {
+                Some((k @ ("id" | "src" | "source" | "env"), v)) => {
+                    kv.insert(k, v);
+                }
+                _ => bail!("--secret {spec:?}: {part:?} is not id=, src= or env="),
+            }
+        }
+        let id = kv
+            .get("id")
+            .with_context(|| format!("--secret {spec:?}: give id=ID"))?;
+        let value = match (kv.get("src").or(kv.get("source")), kv.get("env")) {
+            (Some(path), None) => {
+                std::fs::read(path).with_context(|| format!("--secret {id}: reading {path}"))?
+            }
+            (None, Some(var)) => std::env::var(var)
+                .with_context(|| format!("--secret {id}: ${var} is not set"))?
+                .into_bytes(),
+            _ => bail!("--secret {spec:?}: give one of src=FILE or env=VAR"),
+        };
+        if out.insert((*id).to_owned(), value).is_some() {
+            bail!("--secret {id} given twice");
+        }
+    }
+    Ok(out)
+}
+
+/// Reads `--ssh ID` (the agent at $SSH_AUTH_SOCK) and `--ssh ID=SOCKET`.
+fn parse_ssh(specs: &[String]) -> Result<BTreeMap<String, PathBuf>> {
+    let mut out = BTreeMap::new();
+    for spec in specs {
+        let (id, path) = match spec.split_once('=') {
+            Some((id, path)) => (id, PathBuf::from(path)),
+            None => (
+                spec.as_str(),
+                std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from).with_context(|| {
+                    format!(
+                        "--ssh {spec}: $SSH_AUTH_SOCK is not set (sudo drops it: give --ssh {spec}=\"$SSH_AUTH_SOCK\")"
+                    )
+                })?,
+            ),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            let meta = std::fs::metadata(&path)
+                .with_context(|| format!("--ssh {id}: {}", path.display()))?;
+            if !meta.file_type().is_socket() {
+                bail!(
+                    "--ssh {id}: {} is not an agent socket (key files are not supported)",
+                    path.display()
+                );
+            }
+        }
+        if out.insert(id.to_owned(), path).is_some() {
+            bail!("--ssh {id} given twice");
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(unix)]
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(unix))]
+fn is_root() -> bool {
+    false
+}
+
+/// Jails can only be created or entered by root; fail before pulling anything.
+#[cfg(unix)]
+fn require_root(what: &str) -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("`jailer {what}` needs root to manage jails; run it with sudo or doas");
+    }
+    Ok(())
+}
+
+#[derive(Subcommand, Debug)]
+pub enum KeyCommand {
+    /// Write a new key pair: PREFIX.key (private, mode 0600) and PREFIX.pub
+    Generate {
+        #[arg(default_value = "jailer")]
+        prefix: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ManifestCommand {
+    /// Push an index naming one image per platform, e.g. an amd64 and an
+    /// arm64 build of the same app
+    Push {
+        /// Registry credentials (USER[:PASSWORD])
+        #[arg(long, value_name = "USER[:PASSWORD]")]
+        creds: Option<String>,
+
+        /// Path to Docker/Podman auth.json file
+        #[arg(long, value_name = "PATH")]
+        authfile: Option<PathBuf>,
+
+        /// Sign the pushed manifest with this private key, as cosign does
+        #[arg(long = "sign-key", value_name = "PATH")]
+        sign_key: Option<PathBuf>,
+
+        /// Add to this release record (see docs/RELEASE-RECORD.md)
+        #[arg(long, value_name = "FILE")]
+        record: Option<PathBuf>,
+
+        /// Registry reference to push the index to (e.g. ghcr.io/me/app:1.0)
+        target: String,
+
+        /// Local images, or images already pushed to the target's repository
+        #[arg(required = true)]
+        sources: Vec<String>,
+    },
+
+    /// Print the manifest or index a registry holds for a reference
+    Inspect {
+        /// Registry credentials (USER[:PASSWORD])
+        #[arg(long, value_name = "USER[:PASSWORD]")]
+        creds: Option<String>,
+
+        /// Path to Docker/Podman auth.json file
+        #[arg(long, value_name = "PATH")]
+        authfile: Option<PathBuf>,
+
+        /// Image reference
+        reference: String,
+    },
+}
+
+fn default_state_dir() -> PathBuf {
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        return PathBuf::from("/var/db/jailer");
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("jailer");
+    }
+    PathBuf::from("/var/db/jailer")
+}
+
+fn resolve_zfs_root(cli: &Cli, sys: &dyn Sys) -> Option<String> {
+    if cli.no_zfs {
+        return None;
+    }
+    if let Some(ds) = &cli.zfs_root {
+        return Some(ds.clone());
+    }
+    #[cfg(target_os = "freebsd")]
+    if unsafe { libc::geteuid() } == 0 && legion_build::sys::zfs_available() {
+        // Auto-detect the top-level pool (typically `zroot`)
+        if let Ok(list) = sys.zfs_list("zroot")
+            && !list.is_empty()
+        {
+            return Some("zroot/jailer".to_owned());
+        }
+    }
+    let _ = sys;
+    None
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestationArg {
+    Provenance,
+    Sbom,
+}
+
+impl AttestationArg {
+    fn predicate_type(self) -> &'static str {
+        match self {
+            AttestationArg::Provenance => legion_build::attest::PROVENANCE,
+            AttestationArg::Sbom => legion_build::attest::SBOM,
+        }
+    }
+}
+
+/// `image`'s SBOM: its packages are read from a copy of its root filesystem.
+fn image_sbom(
+    store: &Store,
+    image: &legion_build::store::Image,
+    name: &str,
+) -> Result<serde_json::Value> {
+    let tmp = tempfile::Builder::new()
+        .prefix("sbom")
+        .tempdir_in(store.dir().join("tmp"))?;
+    let root = tmp.path().join("root");
+    store.prepare_rootfs(image, &root, None)?;
+    let listed = legion_build::attest::packages(&root);
+    legion_build::layer::remove_tree(&root)?;
+    let listed = listed?;
+    eprintln!("{}", legion_build::attest::coverage(listed.as_deref()));
+    let created = Some(image.config.created.as_str())
+        .filter(|c| !c.is_empty())
+        .unwrap_or("1970-01-01T00:00:00Z");
+    Ok(legion_build::attest::sbom(
+        name,
+        &image.digest,
+        created,
+        listed.as_deref(),
+    ))
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkArg {
+    Host,
+    Bridge,
+    None,
+}
+
+/// Notes a signature of `digest`, pushed for `r`, in the record, if any.
+fn signed_in(record: &Option<PathBuf>, r: &Reference, digest: &str) -> Result<()> {
+    if let Some(path) = record {
+        let mut rec = Record::open(path)?;
+        rec.signed(
+            digest,
+            legion_build::sign::signature_reference(r, digest).to_string(),
+        )?;
+        rec.save(path)?;
+    }
+    Ok(())
+}
+
+/// Signs `digest`, just pushed to `r`, with the key at `path`.
+async fn sign_pushed(
+    store: &Store,
+    path: &Path,
+    r: &Reference,
+    digest: &str,
+    creds: Option<&legion_build::registry::Credentials>,
+) -> Result<()> {
+    let key = legion_build::sign::signing_key(&legion_build::sign::read_key(path)?)?;
+    legion_build::sign::sign(store.client(), r, digest, &key, creds).await?;
+    println!(
+        "Signed {r} ({digest}) as {}",
+        legion_build::sign::signature_reference(r, digest)
+    );
+    Ok(())
+}
+
+/// Resource limits, held by rctl(8).
+#[derive(clap::Args, Debug, Clone)]
+pub struct LimitArgs {
+    /// Memory limit for each process (e.g. 512m); one going past it is killed
+    #[arg(short = 'm', long, value_name = "SIZE")]
+    memory: Option<String>,
+
+    /// CPU time limit, in CPUs (e.g. 1.5)
+    #[arg(long, value_name = "N")]
+    cpus: Option<String>,
+
+    /// Limit on processes at a time
+    #[arg(long = "pids-limit", value_name = "N")]
+    pids_limit: Option<u64>,
+
+    /// CPUs to run on, as cpuset(1) lists them (e.g. 0-3,6)
+    #[arg(long = "cpuset-cpus", value_name = "LIST")]
+    cpuset_cpus: Option<String>,
+}
+
+impl LimitArgs {
+    fn parse(&self) -> Result<legion_build::runtime::Limits> {
+        Ok(legion_build::runtime::Limits::parse(
+            self.memory.as_deref(),
+            self.cpus.as_deref(),
+            self.pids_limit,
+        )?)
+    }
+}
+
+/// Leaves a process of its own, in a group of its own so that the
+/// terminal's signals miss it, to stop the pod of the container `id` once
+/// it exits, or with `rm` to remove the container.
+#[cfg(unix)]
+fn on_exit(cli: &Cli, id: &str, rm: bool) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    // As this run found its store, so the helper does.
+    cmd.arg("--state-dir")
+        .arg(cli.state_dir.clone().unwrap_or_else(default_state_dir));
+    match resolve_zfs_root(cli, &Shell::new()) {
+        Some(root) => cmd.arg("--zfs-root").arg(root),
+        None => cmd.arg("--no-zfs"),
+    };
+    cmd.arg("on-exit");
+    if rm {
+        cmd.arg("--rm");
+    }
+    cmd.arg(id)
+        .env_remove("JAILER_NO_ZFS")
+        .env_remove("JAILER_ZFS_ROOT")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .context("starting the process that cleans up after the container")?;
+    Ok(())
+}
+
+/// The state directory's store and runtime. Both need to write there, even
+/// to read: a user's own directory is fine, another's is not.
+fn open_context(cli: &Cli, linux: bool) -> Result<(Arc<dyn Sys>, Arc<Store>, JailRuntime)> {
+    open_state(cli, linux).map_err(|e| {
+        let io = match e.downcast_ref::<legion_build::Error>() {
+            Some(legion_build::Error::Io(io)) => Some(io),
+            _ => e.downcast_ref::<std::io::Error>(),
+        };
+        if io.is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied) {
+            let dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
+            anyhow::anyhow!(
+                "{}: another user's state directory: run as that user, or give --state-dir",
+                dir.display()
+            )
+        } else {
+            e
+        }
+    })
+}
+
+fn open_state(cli: &Cli, linux: bool) -> Result<(Arc<dyn Sys>, Arc<Store>, JailRuntime)> {
+    let sys: Arc<dyn Sys> = Arc::new(Shell::new());
+    let state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
+    let zfs_root = resolve_zfs_root(cli, &*sys);
+    let images_zfs = zfs_root.as_ref().map(|r| format!("{r}/images"));
+    let jails_zfs = zfs_root.as_ref().map(|r| format!("{r}/jails"));
+
+    let mut client = Client::new()?;
+    for host in &cli.plain_http {
+        client = client.plain_http(host);
+    }
+
+    let images_dir = state_dir.join("images");
+    let store = Arc::new(
+        legion_build::store::open(sys.clone(), images_zfs.as_deref(), &images_dir, client)?
+            .with_linux(linux),
+    );
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("jailer"));
+    let runtime = JailRuntime::new(
+        sys.clone(),
+        store.clone(),
+        Config {
+            state_dir: state_dir.join("containers"),
+            dataset: jails_zfs,
+            shim: vec![exe.into_os_string(), OsString::from("jail-shim")],
+            // The store is the builds' too, and its cache's.
+            prune_images: false,
+        },
+    )?;
+    Ok((sys, store, runtime))
+}
+
+fn print_report(report: &CheckReport) {
+    for f in &report.findings {
+        let prefix = match f.severity {
+            Severity::Warning => "warning",
+            Severity::Error => "error",
+        };
+        eprintln!("{prefix}[{}]: {}", f.code, f.message);
+    }
+}
+
+/// The password `jailer login --password-stdin` read: its first line,
+/// as `echo $TOKEN |` gives it.
+fn password_from_stdin(input: &str) -> Result<String> {
+    let line = input.lines().next().unwrap_or("");
+    if line.is_empty() {
+        bail!("no password on standard input");
+    }
+    Ok(line.to_owned())
+}
+
+/// Which of an image's `names` the `query` that found it gives, in the
+/// order the store looks: a local name, then a registry reference.
+fn name_given(names: &[String], query: &str) -> Option<String> {
+    [
+        Reference::parse_local_tag(query).ok(),
+        Reference::parse(query).ok(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|r| r.to_string())
+    .find(|n| names.contains(n))
+}
+
+fn default_local_image_for_cwd() -> String {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let name = detect_app_name(&cwd).to_ascii_lowercase();
+    format!("localhost/{name}:latest")
+}
+
+#[derive(clap::Args, Debug)]
+pub struct BuildArgs {
+    /// Name and optional tag for the image [default: localhost/<dir>:latest]
+    #[arg(short = 't', long = "tag", value_name = "NAME[:TAG]")]
+    pub tag: Option<String>,
+
+    /// Path to the Containerfile [default: <context>/Containerfile]
+    #[arg(short = 'f', long = "file", value_name = "PATH")]
+    pub file: Option<PathBuf>,
+
+    /// Build-time variable (KEY=VALUE)
+    #[arg(long = "build-arg", value_name = "KEY=VALUE")]
+    pub build_args: Vec<String>,
+
+    /// Target build stage to stop at
+    #[arg(long, value_name = "STAGE")]
+    pub target: Option<String>,
+
+    /// Stages to build at once, of those that do not need each other
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    pub jobs: usize,
+
+    /// Write a release record of this build (see docs/RELEASE-RECORD.md)
+    #[arg(long, value_name = "FILE")]
+    pub record: Option<PathBuf>,
+
+    /// Build backend (`native` or `buildah`)
+    #[arg(long, value_enum, default_value_t = BuildBackend::Native)]
+    pub backend: BuildBackend,
+
+    /// Fail the build if Legion compatibility checks report an error
+    #[arg(long)]
+    pub strict: bool,
+
+    /// Run every RUN step instead of reusing cached results
+    #[arg(long)]
+    pub no_cache: bool,
+
+    /// Flatten the image, base included, into one layer
+    #[arg(long)]
+    pub squash: bool,
+
+    /// Keep cached layers that no image uses to about this size (e.g. 10g, or `none`)
+    #[arg(
+        long,
+        env = "JAILER_CACHE_MAX",
+        default_value = "10g",
+        value_name = "SIZE"
+    )]
+    pub cache_max: String,
+
+    /// A secret for `RUN --mount=type=secret`: id=ID,src=FILE or id=ID,env=VAR
+    #[arg(long = "secret", value_name = "id=ID,src=FILE")]
+    pub secrets: Vec<String>,
+
+    /// An SSH agent for `RUN --mount=type=ssh`: ID (from $SSH_AUTH_SOCK) or ID=SOCKET
+    #[arg(long = "ssh", value_name = "ID[=SOCKET]")]
+    pub ssh: Vec<String>,
+
+    /// A jail(8) parameter for `RUN` steps (KEY=VALUE)
+    #[arg(long = "param", value_name = "KEY=VALUE")]
+    pub params: Vec<String>,
+
+    /// Give `RUN` steps SysV IPC of their own (`msg`, `sem`, `shm`)
+    #[arg(long, value_delimiter = ',')]
+    pub sysv: Vec<String>,
+
+    #[command(flatten)]
+    pub limits: LimitArgs,
+
+    /// A label for the image (KEY=VALUE), over the Containerfile's
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    pub labels: Vec<String>,
+
+    /// The image's creation time, in seconds since 1970 [default: none,
+    /// so that a build is reproducible]
+    #[arg(long, env = "SOURCE_DATE_EPOCH", value_name = "SECONDS")]
+    pub timestamp: Option<i64>,
+
+    /// A registry build cache to take `RUN` steps from (repeatable)
+    #[arg(long = "cache-from", value_name = "REF")]
+    pub cache_from: Vec<String>,
+
+    /// Push this build's `RUN` steps to a registry build cache
+    #[arg(long = "cache-to", value_name = "REF")]
+    pub cache_to: Option<String>,
+
+    /// An annotation for the image's manifest (KEY=VALUE)
+    #[arg(long = "annotation", value_name = "KEY=VALUE")]
+    pub annotations: Vec<String>,
+
+    /// How new layers are compressed
+    #[arg(long, alias = "compression-format", value_enum, default_value_t = Compression::Gzip)]
+    pub compression: Compression,
+
+    /// Registry credentials for pulling base images (USER[:PASSWORD])
+    #[arg(long, value_name = "USER[:PASSWORD]")]
+    pub creds: Option<String>,
+
+    /// Path to Docker/Podman auth.json file
+    #[arg(long, value_name = "PATH")]
+    pub authfile: Option<PathBuf>,
+
+    /// Build context directory [default: .]
+    #[arg(default_value = ".")]
+    pub context: PathBuf,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmBootArg {
+    Bhyveload,
+    Uefi,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct VmBuildArgs {
+    /// Name and optional tag for the VM image [default: localhost/vm:latest]
+    #[arg(short = 't', long = "tag", value_name = "NAME[:TAG]")]
+    pub tag: Option<String>,
+
+    /// Path to an existing raw disk image to package as `/disk.img`
+    #[arg(long, value_name = "PATH", conflicts_with = "rootfs")]
+    pub disk: Option<PathBuf>,
+
+    /// Path to a FreeBSD rootfs directory to turn into `/disk.img` via `makefs`
+    #[arg(long, value_name = "DIR", conflicts_with = "disk")]
+    pub rootfs: Option<PathBuf>,
+
+    /// Disk size for `makefs` when building from `--rootfs` (e.g. 512m, 2g)
+    #[arg(long, value_name = "SIZE")]
+    pub size: Option<String>,
+
+    /// How the `/disk.img` layer is compressed
+    #[arg(long, alias = "compression-format", value_enum, default_value_t = Compression::Gzip)]
+    pub compression: Compression,
+
+    /// A label for the image (KEY=VALUE)
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    pub labels: Vec<String>,
+
+    /// An annotation for the image's manifest (KEY=VALUE)
+    #[arg(long = "annotation", value_name = "KEY=VALUE")]
+    pub annotations: Vec<String>,
+
+    /// The image's creation time, in seconds since 1970
+    #[arg(long, env = "SOURCE_DATE_EPOCH", value_name = "SECONDS")]
+    pub timestamp: Option<i64>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BuildTarget {
+    /// Build a FreeBSD jail OCI image from a Containerfile
+    Jail(BuildArgs),
+    /// Build a bhyve VM OCI image containing `/disk.img`
+    Vm(VmBuildArgs),
+}
+
+#[derive(clap::Args, Debug)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct BuildCli {
+    #[command(subcommand)]
+    pub kind: Option<BuildTarget>,
+
+    /// Directory where images and build state are kept
+    #[arg(long, global = true, env = "JAILER_STATE_DIR", value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+
+    /// ZFS root dataset for image layers and build clones (e.g. zroot/jailer)
+    #[arg(long, global = true, env = "JAILER_ZFS_ROOT", value_name = "DATASET")]
+    pub zfs_root: Option<String>,
+
+    /// Use plain directory storage instead of ZFS
+    #[arg(
+        long,
+        global = true,
+        env = "JAILER_NO_ZFS",
+        value_parser = clap::builder::FalseyValueParser::new()
+    )]
+    pub no_zfs: bool,
+
+    /// Pods' network on the local bridge [default: 10.77.0.0/16]
+    #[arg(
+        long,
+        global = true,
+        env = "JAILER_POD_SUBNET",
+        value_name = "CIDR",
+        value_parser = legion_build::net::parse_subnet
+    )]
+    pub pod_subnet: Option<legion_sys::Ipv4Net>,
+
+    /// Talk to this registry over plain HTTP instead of HTTPS
+    #[arg(long, global = true, value_name = "HOST[:PORT]")]
+    pub plain_http: Vec<String>,
+
+    #[command(flatten)]
+    pub build: BuildArgs,
+}
+
+pub async fn run_build(args: BuildCli) -> Result<()> {
+    let base = Cli {
+        state_dir: args.state_dir,
+        zfs_root: args.zfs_root,
+        no_zfs: args.no_zfs,
+        pod_subnet: args.pod_subnet,
+        plain_http: args.plain_http,
+        command: Commands::Images,
+    };
+    match args.kind {
+        Some(BuildTarget::Vm(vm)) => run_vm_build(&base, vm).await,
+        Some(BuildTarget::Jail(build)) => {
+            let cli = Cli {
+                command: Commands::Build(build),
+                ..base
+            };
+            run_cli(&cli).await
+        }
+        None => {
+            let cli = Cli {
+                command: Commands::Build(args.build),
+                ..base
+            };
+            run_cli(&cli).await
+        }
+    }
+}
+
+async fn run_vm_build(cli: &Cli, vm: VmBuildArgs) -> Result<()> {
+    let (_, store, _) = open_context(cli, false)?;
+    let tag = vm.tag.unwrap_or_else(|| "localhost/vm:latest".to_owned());
+    let size = vm
+        .size
+        .as_deref()
+        .map(|s| {
+            legion_build::parse_size(s)
+                .filter(|&n| n > 0)
+                .with_context(|| format!("--size {s:?}: give a size such as 512m"))
+        })
+        .transpose()?;
+    let mut labels = BTreeMap::new();
+    for kv in vm.labels {
+        let (k, v) = kv
+            .split_once('=')
+            .with_context(|| format!("--label {kv:?} must be KEY=VALUE"))?;
+        labels.insert(k.to_owned(), v.to_owned());
+    }
+    let mut annotations = BTreeMap::new();
+    for kv in vm.annotations {
+        let (k, v) = kv
+            .split_once('=')
+            .with_context(|| format!("--annotation {kv:?} must be KEY=VALUE"))?;
+        annotations.insert(k.to_owned(), v.to_owned());
+    }
+    let image = legion_build::vm::build_vm(
+        &store,
+        legion_build::vm::VmBuildOptions {
+            tag: tag.clone(),
+            disk: vm.disk,
+            rootfs: vm.rootfs,
+            size,
+            compression: vm.compression,
+            labels,
+            annotations,
+            timestamp: vm.timestamp,
+        },
+    )
+    .await?;
+    println!("{}", image.references.first().unwrap_or(&tag));
+    Ok(())
+}
+
+pub fn main() -> Result<()> {
+    // Handle `jail-shim` immediately before initializing async logging if invoked directly.
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.get(1).map(String::as_str) == Some("jail-shim") {
+        std::process::exit(shim::main(&raw_args[2..]));
+    }
+    // The commands' future is large, more so in a debug build, and Windows
+    // gives the main thread 1 MiB of stack: run it on a thread with room.
+    std::thread::Builder::new()
+        .name("jailer".to_owned())
+        .stack_size(16 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(Box::pin(run()))
+        })?
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+async fn run() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_target(false)
+        .init();
+
+    let cli = Cli::parse();
+    run_cli(&cli).await
+}
+
+/// Run a parsed `jailer` CLI command.
+pub async fn run_cli(cli: &Cli) -> Result<()> {
+    if let Some(subnet) = cli.pod_subnet {
+        legion_build::net::choose_subnet(subnet);
+    }
+
+    match &cli.command {
+        Commands::JailShim { args } => {
+            std::process::exit(shim::main(args));
+        }
+
+        Commands::Init {
+            template,
+            release,
+            name,
+            force,
+            dir,
+        } => {
+            let outcome = legion_build::init::scaffold(&InitOptions {
+                dir: dir.clone(),
+                template: *template,
+                release: release.clone(),
+                name: name.clone(),
+                force: *force,
+            })?;
+            println!(
+                "Scaffolded {} (template: {}, FreeBSD {}, app: {})",
+                outcome.containerfile.display(),
+                outcome.template.as_str(),
+                outcome.release,
+                outcome.app_name
+            );
+            if let Some(ig) = outcome.containerignore {
+                println!("Created {}", ig.display());
+            } else if dir.join(".dockerignore").exists() {
+                println!("Kept .dockerignore: a .containerignore would go over it");
+            }
+            Ok(())
+        }
+
+        Commands::Build(BuildArgs {
+            tag,
+            file,
+            build_args,
+            target,
+            backend,
+            strict,
+            no_cache,
+            squash,
+            cache_max,
+            secrets,
+            ssh,
+            params,
+            sysv,
+            limits,
+            labels,
+            timestamp,
+            compression,
+            annotations,
+            cache_from,
+            cache_to,
+            creds,
+            authfile,
+            jobs,
+            record,
+            context,
+        }) => {
+            if record.is_some() && *backend == BuildBackend::Buildah {
+                bail!("--record: not supported with --backend buildah");
+            }
+            let (_, store, runtime) = open_context(&cli, false)?;
+            let tag = match tag {
+                Some(t) => t.clone(),
+                None => {
+                    let app = detect_app_name(context).to_ascii_lowercase();
+                    format!("localhost/{app}:latest")
+                }
+            };
+            let mut parsed_args = BTreeMap::new();
+            for kv in build_args {
+                let (k, v) = kv
+                    .split_once('=')
+                    .with_context(|| format!("--build-arg {kv:?} must be KEY=VALUE"))?;
+                parsed_args.insert(k.to_owned(), v.to_owned());
+            }
+            let remote = |r: &String| -> Result<legion_build::cache::Remote> {
+                let reference = Reference::parse(r)?;
+                let creds = resolve_credentials(
+                    &reference.registry,
+                    creds.as_deref(),
+                    authfile.as_deref(),
+                )?;
+                Ok(legion_build::cache::Remote { reference, creds })
+            };
+            let cache_from = cache_from.iter().map(remote).collect::<Result<Vec<_>>>()?;
+            let cache_to = cache_to.as_ref().map(remote).transpose()?;
+            let mut parsed_annotations = BTreeMap::new();
+            for kv in annotations {
+                let (k, v) = kv
+                    .split_once('=')
+                    .with_context(|| format!("--annotation {kv:?} must be KEY=VALUE"))?;
+                parsed_annotations.insert(k.to_owned(), v.to_owned());
+            }
+            let mut parsed_labels = BTreeMap::new();
+            for kv in labels {
+                let (k, v) = kv
+                    .split_once('=')
+                    .with_context(|| format!("--label {kv:?} must be KEY=VALUE"))?;
+                parsed_labels.insert(k.to_owned(), v.to_owned());
+            }
+            let options = BuildOptions {
+                context_dir: context.clone(),
+                containerfile: file.clone(),
+                tag: tag.clone(),
+                build_args: parsed_args,
+                target: target.clone(),
+                jobs: *jobs,
+                backend: *backend,
+                creds: legion_build::auth::CredsSource {
+                    creds: creds.clone(),
+                    authfile: authfile.clone(),
+                },
+                strict_lint: *strict,
+                no_cache: *no_cache,
+                squash: *squash,
+                cache_max: match cache_max.as_str() {
+                    "none" => None,
+                    v => Some(legion_build::containerfile::parse_size(v).ok_or_else(|| {
+                        anyhow::anyhow!("--cache-max {v:?}: give a size such as 10g, or none")
+                    })?),
+                },
+                secrets: parse_secrets(secrets)?,
+                ssh: parse_ssh(ssh)?,
+                jail_params: legion_build::runtime::step_params(params, sysv)?,
+                labels: parsed_labels,
+                timestamp: *timestamp,
+                limits: limits.parse()?,
+                compression: *compression,
+                cpuset: limits.cpuset_cpus.clone(),
+                annotations: parsed_annotations,
+                cache_from,
+                cache_to,
+            };
+            // Dropped, the build takes a running step's jail, mounts and
+            // limits with it.
+            let build = legion_build::build::build(&store, &runtime, &options);
+            let mut signalled = std::pin::pin!(signalled(false)?);
+            let res = tokio::select! {
+                res = build => Ok(res),
+                code = signalled.as_mut() => Err(code),
+            };
+            let res = match res {
+                Ok(Ok(res)) => res,
+                // From a terminal, the signal may be why it failed: it
+                // reaches the step too, and this process just after.
+                Ok(Err(e)) => match tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    signalled.as_mut(),
+                )
+                .await
+                {
+                    Ok(code) => std::process::exit(code),
+                    Err(_) => return Err(e.into()),
+                },
+                Err(code) => std::process::exit(code),
+            };
+
+            print_report(&res.report);
+            if let Some(path) = record {
+                let ignore = legion_build::containerfile::IgnoreMatcher::from_context_dir(context)?;
+                let containerfile = file
+                    .clone()
+                    .unwrap_or_else(|| context.join("Containerfile"));
+                let source = legion_build::record::Source {
+                    containerfile: legion_build::record::file_digest(&containerfile)?,
+                    context: legion_build::record::context_digest(context, &ignore)?,
+                };
+                Record::built(&res.image, source, res.bases.clone()).save(path)?;
+            }
+            // The image may carry other names too, of builds that gave the
+            // same config.
+            let name = Reference::parse_local_tag(&tag)?;
+            println!("Built {} ({})", name, res.image.id);
+            Ok(())
+        }
+
+        Commands::Push {
+            creds,
+            authfile,
+            sign_key,
+            record,
+            refs,
+        } => {
+            let (_, store, _) = open_context(&cli, true)?;
+            let (source_image, target_str) = match refs.as_slice() {
+                [only] => {
+                    // If `only` already names an image in the store, push it directly;
+                    // otherwise push the current directory's built image to `only`.
+                    if store.find(only)?.is_some() {
+                        (only.clone(), only.clone())
+                    } else {
+                        (default_local_image_for_cwd(), only.clone())
+                    }
+                }
+                [src, dst] => (src.clone(), dst.clone()),
+                _ => unreachable!(),
+            };
+            let target_ref = Reference::parse(&target_str)?;
+            let resolved_creds =
+                resolve_credentials(&target_ref.registry, creds.as_deref(), authfile.as_deref())?;
+            if let (Some(path), Some(image)) = (record, store.find(&source_image)?) {
+                Record::open(path)?.check_image(&image)?;
+            }
+            let digest = store
+                .push(&source_image, &target_ref, resolved_creds.as_ref())
+                .await?;
+            if let Some(path) = record {
+                let image = store
+                    .find(&source_image)?
+                    .ok_or_else(|| anyhow::anyhow!("{source_image}: no longer here"))?;
+                let mut r = Record::open(path)?;
+                r.pushed(
+                    &image,
+                    target_ref.to_string(),
+                    &digest,
+                    target_ref.by_digest(&digest).to_string(),
+                )?;
+                r.save(path)?;
+            }
+            println!("Pushed {} ({digest})", target_ref);
+            if let Some(path) = sign_key {
+                sign_pushed(&store, path, &target_ref, &digest, resolved_creds.as_ref()).await?;
+                signed_in(record, &target_ref, &digest)?;
+            }
+            Ok(())
+        }
+
+        Commands::Publish {
+            hosts,
+            file,
+            build_args,
+            target,
+            creds,
+            authfile,
+            sign_key,
+            record,
+            remote_jailer,
+            ssh,
+            reference,
+            context,
+        } => {
+            let (_, store, _) = open_context(&cli, true)?;
+            let target_ref = Reference::parse(reference)?;
+            let resolved_creds =
+                resolve_credentials(&target_ref.registry, creds.as_deref(), authfile.as_deref())?;
+            let hosts = hosts
+                .iter()
+                .map(|h| {
+                    h.split_once('=')
+                        .map(|(p, d)| (p.to_owned(), d.to_owned()))
+                        .ok_or_else(|| anyhow::anyhow!("--host {h:?}: give PLATFORM=DEST"))
+                })
+                .collect::<Result<_>>()?;
+            let plan = legion_build::remote::Publish {
+                target: target_ref.clone(),
+                hosts,
+                context: context.clone(),
+                containerfile: file.clone(),
+                build_stage: target.clone(),
+                build_args: build_args.clone(),
+                remote_jailer: remote_jailer.clone(),
+                ssh: ssh.clone(),
+            };
+            let mut published =
+                legion_build::remote::publish(&store, &plan, resolved_creds.as_ref()).await?;
+            if let Some(path) = record {
+                published.save(path)?;
+            }
+            let digest = published.published[0].digest.clone();
+            println!("Published {target_ref} ({digest})");
+            if let Some(path) = sign_key {
+                sign_pushed(&store, path, &target_ref, &digest, resolved_creds.as_ref()).await?;
+                signed_in(record, &target_ref, &digest)?;
+            }
+            Ok(())
+        }
+
+        Commands::Manifest(ManifestCommand::Push {
+            creds,
+            authfile,
+            sign_key,
+            record,
+            target,
+            sources,
+        }) => {
+            let (_, store, _) = open_context(&cli, true)?;
+            let target_ref = Reference::parse(target)?;
+            let resolved_creds =
+                resolve_credentials(&target_ref.registry, creds.as_deref(), authfile.as_deref())?;
+            let digest = store
+                .push_index(&target_ref, sources, resolved_creds.as_ref())
+                .await?;
+            if let Some(path) = record {
+                let (_, doc) = store
+                    .client()
+                    .document(&target_ref, &digest, resolved_creds.as_ref())
+                    .await?;
+                let mut r = Record::open(path)?;
+                r.pushed_index(
+                    target_ref.to_string(),
+                    &digest,
+                    target_ref.by_digest(&digest).to_string(),
+                    legion_build::record::platforms_of(&serde_json::to_value(&doc)?),
+                )?;
+                r.save(path)?;
+            }
+            println!("Pushed {target_ref} ({digest})");
+            if let Some(path) = sign_key {
+                sign_pushed(&store, path, &target_ref, &digest, resolved_creds.as_ref()).await?;
+                signed_in(record, &target_ref, &digest)?;
+            }
+            Ok(())
+        }
+
+        Commands::Sign {
+            key,
+            creds,
+            authfile,
+            record,
+            reference,
+        } => {
+            let (_, store, _) = open_context(&cli, true)?;
+            let r = Reference::parse(reference)?;
+            let creds = resolve_credentials(&r.registry, creds.as_deref(), authfile.as_deref())?;
+            let (digest, _) = store
+                .client()
+                .document(&r, r.target(), creds.as_ref())
+                .await?;
+            sign_pushed(&store, key, &r, &digest, creds.as_ref()).await?;
+            signed_in(record, &r, &digest)?;
+            Ok(())
+        }
+
+        Commands::Verify {
+            key,
+            creds,
+            authfile,
+            kind,
+            record,
+            reference,
+        } => {
+            let (_, store, _) = open_context(&cli, true)?;
+            let r = Reference::parse(reference)?;
+            let creds = resolve_credentials(&r.registry, creds.as_deref(), authfile.as_deref())?;
+            let public = legion_build::sign::verifying_key(&legion_build::sign::read_key(key)?)?;
+            if let Some(kind) = kind {
+                let (digest, predicate) = legion_build::attest::verify(
+                    store.client(),
+                    &r,
+                    kind.predicate_type(),
+                    &public,
+                    creds.as_ref(),
+                )
+                .await?;
+                if let Some(path) = record {
+                    Record::open(path)?.refuse_unknown(&digest)?;
+                }
+                println!("{}", serde_json::to_string_pretty(&predicate)?);
+                return Ok(());
+            }
+            let (digest, fingerprint) =
+                legion_build::sign::verify(store.client(), &r, &public, creds.as_ref()).await?;
+            if let Some(path) = record {
+                let mut rec = Record::open(path)?;
+                rec.verified(
+                    &digest,
+                    r.by_digest(&digest).to_string(),
+                    legion_build::record::file_digest(key)?,
+                )?;
+                rec.save(path)?;
+            }
+            println!("{r} ({digest}) is signed by the key {fingerprint}");
+            Ok(())
+        }
+
+        Commands::Attest {
+            key,
+            kind,
+            record,
+            image,
+            creds,
+            authfile,
+            reference,
+        } => {
+            let (_, store, _) = open_context(&cli, true)?;
+            let r = Reference::parse(reference)?;
+            let creds = resolve_credentials(&r.registry, creds.as_deref(), authfile.as_deref())?;
+            let private = legion_build::sign::signing_key(&legion_build::sign::read_key(key)?)?;
+            let (digest, _) = store
+                .client()
+                .document(&r, r.target(), creds.as_ref())
+                .await?;
+            let mut rec = record.as_deref().map(Record::open).transpose()?;
+            if let Some(rec) = &rec {
+                rec.refuse_unknown(&digest)?;
+            }
+            let predicate = match kind {
+                AttestationArg::Provenance => {
+                    let rec = rec
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("provenance comes from --record"))?;
+                    legion_build::attest::provenance(rec)?
+                }
+                AttestationArg::Sbom => {
+                    let wanted = image.as_deref().unwrap_or(reference);
+                    let local = store.find(wanted)?.ok_or_else(|| {
+                        anyhow::anyhow!("{wanted}: no such local image: give --image")
+                    })?;
+                    if local.digest != digest {
+                        bail!("{wanted} is {}, but {r} is {digest}", local.digest);
+                    }
+                    image_sbom(&store, &local, reference)?
+                }
+            };
+            legion_build::attest::attest(
+                store.client(),
+                &r,
+                &digest,
+                kind.predicate_type(),
+                &predicate,
+                &private,
+                creds.as_ref(),
+            )
+            .await?;
+            let at = legion_build::attest::attestation_ref(&r, &digest);
+            if let (Some(path), Some(rec)) = (record, &mut rec) {
+                rec.attested(&digest, kind.predicate_type(), at.to_string())?;
+                rec.save(path)?;
+            }
+            println!("Attested {r} ({digest}) as {at}");
+            Ok(())
+        }
+
+        Commands::Sbom { output, image } => {
+            let (_, store, _) = open_context(&cli, true)?;
+            let local = store
+                .find(image)?
+                .ok_or_else(|| anyhow::anyhow!("{image}: no such local image"))?;
+            let doc = serde_json::to_string_pretty(&image_sbom(&store, &local, image)?)?;
+            match output {
+                Some(path) => std::fs::write(path, doc + "\n")?,
+                None => println!("{doc}"),
+            }
+            Ok(())
+        }
+
+        Commands::Key(KeyCommand::Generate { prefix }) => {
+            let private = prefix.with_extension("key");
+            let public = prefix.with_extension("pub");
+            for p in [&private, &public] {
+                if p.exists() {
+                    bail!("{} exists already", p.display());
+                }
+            }
+            let key = legion_build::sign::PrivateKey::generate();
+            let (private_pem, public_pem) = (key.to_pem(), key.public().to_pem());
+            let mut file = std::fs::OpenOptions::new();
+            file.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
+            std::io::Write::write_all(&mut file.open(&private)?, private_pem.as_bytes())?;
+            std::fs::write(&public, public_pem)?;
+            println!(
+                "Wrote {} (keep it secret) and {}, key {}",
+                private.display(),
+                public.display(),
+                key.public().fingerprint()
+            );
+            Ok(())
+        }
+
+        Commands::Manifest(ManifestCommand::Inspect {
+            creds,
+            authfile,
+            reference,
+        }) => {
+            let (_, store, _) = open_context(&cli, true)?;
+            let r = Reference::parse(reference)?;
+            let resolved_creds =
+                resolve_credentials(&r.registry, creds.as_deref(), authfile.as_deref())?;
+            let (digest, doc) = store
+                .client()
+                .document(&r, r.target(), resolved_creds.as_ref())
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&doc)?);
+            eprintln!("{digest}");
+            Ok(())
+        }
+
+        Commands::Export {
+            output,
+            name,
+            record,
+            args,
+        } => {
+            let (_, store, _) = open_context(&cli, true)?;
+            let (image_ref, out_path) = match (output, args.as_slice()) {
+                (Some(out), [img]) => (img.clone(), out.clone()),
+                (Some(out), []) => (default_local_image_for_cwd(), out.clone()),
+                (None, [single]) => {
+                    // An image the store has, as `localhost/app:1`, is the
+                    // image; otherwise a path is the output.
+                    let is_image = !single.ends_with(".tar") && store.find(single)?.is_some();
+                    if !is_image && (single.ends_with(".tar") || single.contains(['/', '\\'])) {
+                        (default_local_image_for_cwd(), PathBuf::from(single))
+                    } else {
+                        (single.clone(), PathBuf::from("app.tar"))
+                    }
+                }
+                (None, [img, out]) => (img.clone(), PathBuf::from(out)),
+                _ => bail!("usage: jailer export [IMAGE] <OUTPUT.tar>"),
+            };
+            // The archive names the image as it was asked for, not by
+            // whichever of its names came first.
+            let name = match name {
+                Some(n) => Some(n.clone()),
+                None => store
+                    .find(&image_ref)?
+                    .and_then(|img| name_given(&img.references, &image_ref)),
+            };
+            if let (Some(path), Some(image)) = (record, store.find(&image_ref)?) {
+                Record::open(path)?.check_image(&image)?;
+            }
+            let img = store.export(&image_ref, &out_path, name.as_deref()).await?;
+            if let Some(path) = record {
+                let mut r = Record::open(path)?;
+                r.exported(&img, &out_path)?;
+                r.save(path)?;
+            }
+            let shown = name
+                .as_deref()
+                .or_else(|| img.references.first().map(String::as_str))
+                .unwrap_or(&image_ref);
+            println!("Exported {} to {}", shown, out_path.display());
+            Ok(())
+        }
+
+        Commands::Doctor { json, operations } => {
+            use legion_local::doctor;
+            if !cfg!(target_os = "freebsd") {
+                bail!("`jailer doctor` checks a FreeBSD host");
+            }
+            let sys = Shell::new();
+            let zfs_root = resolve_zfs_root(&cli, &sys);
+            let host = doctor::Host {
+                root: is_root(),
+                zfs_root: zfs_root.as_deref(),
+                subnet: legion_build::net::check_subnet().map_err(|e| e.to_string()),
+            };
+            let wanted = if operations.is_empty() {
+                &doctor::Operation::ALL[..]
+            } else {
+                &operations[..]
+            };
+            let report = doctor::examine(&sys, &host, wanted);
+            if *json {
+                let result = serde_json::json!({
+                    "schema": legion_build::record::SCHEMA,
+                    "passed": report.passed(),
+                    "operations": report.operations,
+                    "checks": report.checks,
+                });
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                print!("{}", doctor::text(&report));
+            }
+            if !report.passed() {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+
+        Commands::Check { json, target } => {
+            let mut report = CheckReport::default();
+            let path = Path::new(target);
+            let cf_candidate = if path.is_dir() {
+                let c1 = path.join("Containerfile");
+                let c2 = path.join("Dockerfile");
+                if c1.exists() {
+                    Some(c1)
+                } else if c2.exists() {
+                    Some(c2)
+                } else {
+                    None
+                }
+            } else if path.is_file() {
+                Some(path.to_path_buf())
+            } else {
+                None
+            };
+
+            let mut checked_something = false;
+            if let Some(cf_path) = cf_candidate {
+                let cf = Containerfile::parse_file(&cf_path)?;
+                report.merge(check_containerfile(&cf, None));
+                checked_something = true;
+            }
+
+            let (_, store, _) = open_context(&cli, true)?;
+            // A directory's image is tagged as `jailer build` tags it.
+            let img_lookup = if target == "." {
+                default_local_image_for_cwd()
+            } else if path.is_dir() {
+                format!(
+                    "localhost/{}:latest",
+                    detect_app_name(path).to_ascii_lowercase()
+                )
+            } else {
+                target.clone()
+            };
+            if let Some(img) = store.find(&img_lookup)? {
+                report.merge(legion_build::build::check_stored(&store, &img)?);
+                checked_something = true;
+            }
+
+            if !checked_something {
+                bail!("no Containerfile or local image found for {target:?}");
+            }
+
+            if *json {
+                let findings: Vec<_> = report
+                    .findings
+                    .iter()
+                    .map(|f| {
+                        serde_json::json!({
+                            "severity": f.severity.as_str(),
+                            "code": f.code,
+                            "message": f.message,
+                        })
+                    })
+                    .collect();
+                let result = serde_json::json!({
+                    "schema": legion_build::record::SCHEMA,
+                    "target": target,
+                    "passed": !report.has_errors(),
+                    "findings": findings,
+                });
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                if report.has_errors() {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            print_report(&report);
+            if report.has_errors() {
+                bail!("Legion compatibility check failed");
+            }
+            println!(
+                "Legion compatibility check passed ({} warning(s))",
+                report.findings.len()
+            );
+            Ok(())
+        }
+
+        Commands::Pull {
+            creds,
+            authfile,
+            linux,
+            reference,
+        } => {
+            let (_, store, _) = open_context(&cli, *linux)?;
+            let r = Reference::parse(reference)?;
+            let resolved_creds =
+                resolve_credentials(&r.registry, creds.as_deref(), authfile.as_deref())?;
+            let img = store
+                .pull(reference, resolved_creds.as_ref(), "root")
+                .await?;
+            println!("Pulled {} ({})", r, img.id);
+            Ok(())
+        }
+
+        Commands::Load { name, archive } => {
+            let (_, store, _) = open_context(&cli, true)?;
+            let img = store.load(archive, name.as_deref()).await?;
+            println!(
+                "Loaded {} ({})",
+                img.references.first().map(String::as_str).unwrap_or(""),
+                img.id
+            );
+            Ok(())
+        }
+
+        Commands::Login {
+            username,
+            password,
+            password_stdin: _,
+            authfile,
+            registry,
+        } => {
+            let password = match password {
+                Some(p) => p.clone(),
+                None => {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                    password_from_stdin(&buf)?
+                }
+            };
+            let creds = legion_build::Credentials {
+                username: username.clone(),
+                password,
+            };
+            let plain = cli
+                .plain_http
+                .iter()
+                .any(|h| *h == *registry || *h == legion_build::registry_of(registry));
+            let mut client = Client::new()?;
+            if plain {
+                client = client.plain_http(&legion_build::registry_of(registry));
+            }
+            client.check_login(registry, &creds).await?;
+            let path = save_credentials(registry, &creds, authfile.as_deref())?;
+            println!(
+                "Login succeeded for {registry} (saved to {})",
+                path.display()
+            );
+            Ok(())
+        }
+
+        Commands::Images => {
+            let (_, store, _) = open_context(&cli, true)?;
+            let images = store.images()?;
+            let w = images
+                .iter()
+                .flat_map(|i| i.references.iter().map(String::len))
+                .chain(["REFERENCE".len()])
+                .max()
+                .unwrap_or(0);
+            println!(
+                "{:<w$}  {:<16} {:<16} LAYERS",
+                "REFERENCE", "IMAGE ID", "PLATFORM"
+            );
+            for img in images {
+                let short_id = img
+                    .id
+                    .strip_prefix("sha256:")
+                    .unwrap_or(&img.id)
+                    .chars()
+                    .take(12)
+                    .collect::<String>();
+                let plat = format!(
+                    "{}/{}",
+                    if img.config.os.is_empty() {
+                        "freebsd"
+                    } else {
+                        &img.config.os
+                    },
+                    if img.config.architecture.is_empty() {
+                        legion_build::oci::arch()
+                    } else {
+                        &img.config.architecture
+                    }
+                );
+                for r in &img.references {
+                    println!(
+                        "{:<w$}  {:<16} {:<16} {}",
+                        r,
+                        short_id,
+                        plat,
+                        img.layers.len()
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        Commands::Prune { cache, images } => {
+            let (_, store, runtime) = open_context(&cli, true)?;
+            if *images {
+                #[cfg(unix)]
+                use legion_runtime::Runtime;
+                let in_use: Vec<String> = runtime
+                    .list(&[])
+                    .await?
+                    .into_iter()
+                    .map(|c| c.image)
+                    .collect();
+                for name in legion_build::store::remove_unused_images(&store, &in_use).await? {
+                    println!("Removed {name}");
+                }
+            }
+            let n = legion_build::store::prune(&store, *cache).await?;
+            println!("Removed {n} layer(s)");
+            Ok(())
+        }
+
+        Commands::Rmi { references } => {
+            let (_, store, _) = open_context(&cli, true)?;
+            // Each that can go goes, as with `docker rmi`; then the
+            // command fails if any could not.
+            let mut missing = Vec::new();
+            for reference in references {
+                if legion_build::store::remove(&store, reference).await? {
+                    println!("Removed {reference}");
+                } else {
+                    missing.push(format!("{reference:?}"));
+                }
+            }
+            if !missing.is_empty() {
+                bail!("image {} not found", missing.join(", "));
+            }
+            Ok(())
+        }
+
+        Commands::Run { .. }
+        | Commands::Ps { .. }
+        | Commands::Logs { .. }
+        | Commands::Exec { .. }
+        | Commands::Stop { .. }
+        | Commands::Rm { .. }
+        | Commands::OnExit { .. } => containers(&cli).await,
+    }
+}
+
+/// Resolves, to the exit code of a process it killed, on the first signal
+/// that should end this process. With a command `shared`, in this process's
+/// group, Ctrl-C and Ctrl-\ are the command's to act on, or not: it gets
+/// them too, and this process lives to report its exit, clean up after it
+/// and keep its terminal open. Being handled rather than ignored, they stay
+/// default in the command.
+#[cfg(unix)]
+fn signalled(shared: bool) -> std::io::Result<impl Future<Output = i32>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut quit = signal(SignalKind::quit())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+    Ok(async move {
+        loop {
+            let got = tokio::select! {
+                _ = interrupt.recv() => libc::SIGINT,
+                _ = quit.recv() => libc::SIGQUIT,
+                _ = terminate.recv() => libc::SIGTERM,
+                _ = hangup.recv() => libc::SIGHUP,
+            };
+            if !shared || (got != libc::SIGINT && got != libc::SIGQUIT) {
+                return 128 + got;
+            }
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn signalled(_: bool) -> std::io::Result<impl Future<Output = i32>> {
+    Ok(std::future::pending())
+}
+
+/// `run`, `ps`, `logs`, `exec`, `stop` and `rm`: containers, which need
+/// jails.
+#[cfg(unix)]
+async fn containers(cli: &Cli) -> Result<()> {
+    use futures::StreamExt;
+    use legion_build::runtime::{LABEL_IP, LABEL_POD, LABEL_PORTS, LABEL_ROLE, Mount, Network, RunSpec};
+    use std::time::Duration;
+
+    use legion_runtime::{Output, Runtime};
+
+    match &cli.command {
+        Commands::Run {
+            rm,
+            detach,
+            interactive,
+            tty,
+            name,
+            env,
+            volumes,
+            user,
+            workdir,
+            hostname,
+            entrypoint,
+            vnet,
+            network,
+            publish,
+            allow_mlock,
+            sysv,
+            params,
+            limits,
+            linux,
+            vm,
+            vm_cpus,
+            vm_memory,
+            vm_boot,
+            args,
+        } => {
+            require_root("run")?;
+            let (sys, store, runtime) = open_context(cli, *linux)?;
+            let (image_ref, cmd_args) = match args.split_first() {
+                Some((img, rest)) => (img.clone(), rest.to_vec()),
+                None => (default_local_image_for_cwd(), Vec::new()),
+            };
+
+            // Pull automatically if the image is not in the local store and not a localhost ref.
+            if store.find(&image_ref)?.is_none() {
+                let r = Reference::parse(&image_ref)?;
+                if !r.is_local() {
+                    let creds = resolve_credentials(&r.registry, None, None)?;
+                    // On stderr: stdout is the program's own.
+                    eprintln!("Pulling {r}...");
+                    store.pull(&image_ref, creds.as_ref(), "root").await?;
+                }
+            }
+            let image = store
+                .find(&image_ref)?
+                .with_context(|| format!("{image_ref}: image not known"))?;
+            if image.config.os == "linux" {
+                if !*linux {
+                    bail!(
+                        "{image_ref} is a Linux image; pass --linux to run it through FreeBSD's Linux ABI"
+                    );
+                }
+                // As Legion's agent does: the modules, and the fallback ELF
+                // brand set to Linux's where the host left it unset, so
+                // static Linux programs run. What cannot be done is said,
+                // and the run goes on, as `jailer doctor` tells the rest.
+                match legion_jail::enable_linux(sys.as_ref()) {
+                    Ok(None) => {}
+                    Ok(Some(note)) => eprintln!("warning: {note}"),
+                    Err(e) => eprintln!("warning: enabling Linux images: {e}"),
+                }
+            }
+
+            let mut env_map = BTreeMap::new();
+            for kv in env {
+                let (k, v) = kv
+                    .split_once('=')
+                    .with_context(|| format!("-e {kv:?} must be KEY=VALUE"))?;
+                env_map.insert(k.to_owned(), v.to_owned());
+            }
+
+            let mut mounts = Vec::new();
+            for vol in volumes {
+                let parts: Vec<&str> = vol.split(':').collect();
+                let (src, dst, ro) = match parts.as_slice() {
+                    [s, d] => (*s, *d, false),
+                    [s, d, opt] => (*s, *d, *opt == "ro"),
+                    _ => bail!("invalid volume mount {vol:?} (expected SRC:DEST[:ro])"),
+                };
+                mounts.push(Mount::nullfs(src, dst, ro));
+            }
+
+            let mut extra_params = Vec::new();
+            for kv in params {
+                let (k, v) = kv.split_once('=').unwrap_or((kv.as_str(), ""));
+                extra_params.push((k.to_owned(), v.to_owned()));
+            }
+
+            let ports = publish
+                .iter()
+                .map(|p| p.parse())
+                .collect::<Result<Vec<legion_build::net::Port>, _>>()?;
+            let network = match network {
+                NetworkArg::Host if *vnet || !ports.is_empty() || *vm => Network::Bridge,
+                NetworkArg::Host => Network::Host,
+                NetworkArg::Bridge => Network::Bridge,
+                NetworkArg::None if *vnet || !ports.is_empty() || *vm => {
+                    bail!("--network none cannot be used with --vnet, --publish, or --vm")
+                }
+                NetworkArg::None => Network::None,
+            };
+            let vm_spec = if *vm {
+                let mem = legion_build::parse_size(vm_memory)
+                    .filter(|&n| n > 0)
+                    .with_context(|| format!("--vm-memory {vm_memory:?}: give a size such as 512m"))?;
+                if *vm_cpus == 0 {
+                    bail!("--vm-cpus must be at least 1");
+                }
+                Some(legion_build::runtime::VmRunSpec {
+                    cpus: *vm_cpus,
+                    memory: mem,
+                    uefi: *vm_boot == VmBootArg::Uefi,
+                })
+            } else {
+                None
+            };
+            if network == Network::Bridge {
+                legion_build::net::check_subnet()?;
+            }
+            let leases = legion_build::net::Leases::new(legion_build::net::LEASES);
+            // Only the host's network has no pod: `none` is a VNET of its own.
+            let has_pod = network != Network::Host;
+
+            // When running in foreground without `-d`, default to removing the
+            // ephemeral test container afterwards unless `--name` was given to keep it.
+            let auto_rm = *rm || (!*detach && name.is_none());
+            let name = name.clone().unwrap_or_else(|| {
+                let mut b = [0u8; 6];
+                getrandom::fill(&mut b).expect("random bytes");
+                b.iter()
+                    .fold("jailer-".to_owned(), |n, x| n + &format!("{x:02x}"))
+            });
+            let spec = RunSpec {
+                name,
+                // The name asked for, as `ps` shows it, of an image's names.
+                image: name_given(&image.references, &image_ref)
+                    .unwrap_or_else(|| image.references[0].clone()),
+                entrypoint: entrypoint.iter().cloned().collect(),
+                command: cmd_args,
+                env: env_map,
+                user: user.clone(),
+                work_dir: workdir.clone(),
+                hostname: hostname.clone(),
+                mounts,
+                params: extra_params,
+                network,
+                ports,
+                allow_mlock: *allow_mlock,
+                sysv: sysv.clone(),
+                limits: limits.parse()?,
+                cpuset: limits.cpuset_cpus.clone(),
+                vm: vm_spec,
+            };
+
+            // A signal now waits for the container, half made until then,
+            // to be removed whole, pod and address too. Nothing has run.
+            let mut setup = std::pin::pin!(signalled(false)?);
+            let created = legion_build::runtime::create(&runtime, &*sys, &leases, &spec).await;
+            // From a terminal, the signal may be why it failed: it reaches
+            // the tools extracting the image too, and this process just after.
+            let wait = Duration::from_millis(if created.is_err() { 200 } else { 0 });
+            if let Ok(code) = tokio::time::timeout(wait, setup.as_mut()).await {
+                if let Ok((id, starting)) = created {
+                    drop(starting);
+                    let _ = legion_build::runtime::remove(&runtime, &*sys, &leases, &id).await;
+                }
+                std::process::exit(code);
+            }
+            // Until the start is over, a stop or `rm` from elsewhere waits for
+            // it: one that found nothing running would let the command start
+            // after it. Let go before this process stops or removes it itself.
+            let (id, starting) = created?;
+            if *detach {
+                let started = runtime.start(&id).await;
+                drop(starting);
+                if let Err(e) = started {
+                    if *rm {
+                        let _ = legion_build::runtime::remove(&runtime, &*sys, &leases, &id).await;
+                    } else {
+                        let _ = legion_build::runtime::stop_pod(&runtime, &*sys, &leases, &id).await;
+                    }
+                    return Err(e.into());
+                }
+                // Once it exits, its pod would run on, holding its address
+                // and ports, until a `stop` or `rm`.
+                if *rm || has_pod {
+                    on_exit(cli, &id, *rm)?;
+                }
+                println!("{id}");
+                return Ok(());
+            }
+            // In this process's group, the command takes Ctrl-C itself, and
+            // ending is its own: what follows cleans up after it.
+            // Its start goes in one step to the command, whose Ctrl-C is then
+            // its own. One that came before it reached only this process and
+            // the tools, so this process acts on it: the command would never
+            // hear it, and an error of a tool it killed is no error. Dropped,
+            // the run kills the command and takes its jail down.
+            let code = {
+                // Dropped after the run, before what follows stops it.
+                let _starting = starting;
+                let mut attached = std::pin::pin!(runtime.run_attached(&id, *interactive, *tty));
+                let signalled = signalled(true)?;
+                let early = Duration::from_millis(5);
+                match futures::poll!(attached.as_mut()) {
+                    std::task::Poll::Ready(Err(e)) => {
+                        tokio::time::timeout(Duration::from_millis(200), setup.as_mut())
+                            .await
+                            .map_err(|_| e)
+                    }
+                    std::task::Poll::Ready(code) => code,
+                    std::task::Poll::Pending => {
+                        match tokio::time::timeout(early, setup.as_mut()).await {
+                            Ok(code) => Ok(code),
+                            Err(_) => tokio::select! {
+                                code = attached => code,
+                                code = signalled => Ok(code),
+                            },
+                        }
+                    }
+                }
+            };
+            if auto_rm {
+                let _ = legion_build::runtime::remove(&runtime, &*sys, &leases, &id).await;
+            } else {
+                // Kept by `--name`, stopped: its pod lets go of its ports.
+                let _ = legion_build::runtime::stop_pod(&runtime, &*sys, &leases, &id).await;
+            }
+            let code = code?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+
+        Commands::Ps { all } => {
+            let (_, _, runtime) = open_context(cli, true)?;
+            let all_of = runtime.list(&[]).await?;
+            // A member's address and ports are its pod's.
+            let network = |c: &legion_runtime::ContainerSummary| {
+                let pod = c.labels.get(LABEL_POD)?;
+                let labels = &all_of.iter().find(|p| &p.id == pod)?.labels;
+                let mut net = labels.get(LABEL_IP)?.clone();
+                if let Some(ports) = labels.get(LABEL_PORTS) {
+                    net = format!("{net} {}", ports.replace(',', " "));
+                }
+                Some(net)
+            };
+            let mut list = Vec::new();
+            for c in &all_of {
+                if c.labels.get(LABEL_ROLE).is_some_and(|r| r == "pod")
+                    || (!*all && c.state != "running")
+                {
+                    continue;
+                }
+                let status = match c.state.as_str() {
+                    "running" => match runtime.inspect(&c.id).await {
+                        Ok(i) => format!("running (jid {}, pid {})", i.state.jid, c.pid),
+                        // Removed since the listing, as by `run --rm`.
+                        Err(e) if e.is_not_found() => continue,
+                        Err(e) => return Err(e.into()),
+                    },
+                    "exited" => format!("exited ({})", c.exit_code),
+                    other => other.to_owned(),
+                };
+                list.push((c, status, network(c).unwrap_or_default()));
+            }
+            let width = |f: fn(&legion_runtime::ContainerSummary) -> &str, head: &str| {
+                list.iter()
+                    .map(|(c, ..)| f(c).len())
+                    .chain([head.len()])
+                    .max()
+                    .unwrap_or(0)
+            };
+            let wn = width(|c| c.name(), "NAME");
+            let wi = width(|c| &c.image, "IMAGE");
+            let ws = list
+                .iter()
+                .map(|(_, s, _)| s.len())
+                .chain(["STATUS".len()])
+                .max()
+                .unwrap_or(0);
+            println!(
+                "{:<14} {:<wn$}  {:<wi$}  {:<ws$}  NETWORK",
+                "CONTAINER ID", "NAME", "IMAGE", "STATUS"
+            );
+            for (c, status, net) in &list {
+                let short_id: String = c.id.chars().take(12).collect();
+                let line = format!(
+                    "{:<14} {:<wn$}  {:<wi$}  {status:<ws$}  {net}",
+                    short_id,
+                    c.name(),
+                    c.image
+                );
+                println!("{}", line.trim_end());
+            }
+            Ok(())
+        }
+
+        Commands::Logs { tail, container } => {
+            let (_, _, runtime) = open_context(cli, true)?;
+            use std::io::Write;
+            let id = runtime.find(container)?;
+            let mut chunks = runtime.logs(&id, false, *tail).await?;
+            while let Some(chunk) = chunks.next().await {
+                let chunk = chunk?;
+                match chunk.stream {
+                    Output::Stdout => std::io::stdout().write_all(&chunk.data)?,
+                    Output::Stderr => std::io::stderr().write_all(&chunk.data)?,
+                }
+            }
+            Ok(())
+        }
+
+        Commands::Exec {
+            interactive,
+            tty,
+            container,
+            command,
+        } => {
+            require_root("exec")?;
+            let (_, _, runtime) = open_context(cli, true)?;
+            let id = runtime.find(container)?;
+            let exec = runtime.exec_inherit(&id, command, *interactive, *tty);
+            // Dropped, the exec kills the command and what it started.
+            let signalled = signalled(*interactive || *tty)?;
+            let code = tokio::select! {
+                code = exec => code?,
+                code = signalled => code,
+            };
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+
+        Commands::Stop { time, container } => {
+            require_root("stop")?;
+            let (sys, _, runtime) = open_context(cli, true)?;
+            let leases = legion_build::net::Leases::new(legion_build::net::LEASES);
+            let id = runtime.find(container)?;
+            let wait = Duration::from_secs(time.unwrap_or(10));
+            match legion_build::runtime::stop(&runtime, &*sys, &leases, &id, wait).await {
+                // Found just now: `run --rm` takes away what is stopped.
+                Err(legion_build::Error::NotFound(_)) => {}
+                r => r?,
+            }
+            println!("{container}");
+            Ok(())
+        }
+
+        Commands::OnExit { rm, id } => {
+            let (sys, _, runtime) = open_context(cli, true)?;
+            let leases = legion_build::net::Leases::new(legion_build::net::LEASES);
+            let done = match runtime.wait(id).await {
+                Ok(_) if *rm => legion_build::runtime::remove(&runtime, &*sys, &leases, id).await,
+                // The container is kept, stopped, as `stop` leaves it.
+                Ok(_) => legion_build::runtime::stop_pod(&runtime, &*sys, &leases, id).await,
+                Err(e) => Err(e.into()),
+            };
+            match done {
+                // Gone before it exits, as by `jailer rm -f`: nothing to do.
+                Err(legion_build::Error::NotFound(_)) => Ok(()),
+                r => Ok(r?),
+            }
+        }
+
+        Commands::Rm { force, containers } => {
+            require_root("rm")?;
+            let (sys, _, runtime) = open_context(cli, true)?;
+            let leases = legion_build::net::Leases::new(legion_build::net::LEASES);
+            for c in containers {
+                let id = runtime.find(c)?;
+                // During a start it is not running yet.
+                runtime.start_settled(&id).await?;
+                if !force && runtime.inspect(&id).await?.state.running {
+                    bail!("container {c:?} is running: stop it first or use `rm -f`");
+                }
+                match legion_build::runtime::remove(&runtime, &*sys, &leases, &id).await {
+                    // Found just now: `run --rm` got there first.
+                    Err(legion_build::Error::NotFound(_)) => {}
+                    r => r?,
+                }
+                println!("{c}");
+            }
+            Ok(())
+        }
+
+        _ => unreachable!("not a container command"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn containers(_: &Cli) -> Result<()> {
+    bail!("containers run in jails, which need FreeBSD")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{name_given, password_from_stdin};
+
+    #[test]
+    fn a_password_on_stdin_is_its_first_line() {
+        assert_eq!(password_from_stdin("tok\n").unwrap(), "tok");
+        assert_eq!(password_from_stdin("tok\r\n").unwrap(), "tok");
+        assert_eq!(password_from_stdin("tok").unwrap(), "tok");
+        assert_eq!(password_from_stdin("a b\nrest\n").unwrap(), "a b");
+        assert!(password_from_stdin("").is_err());
+        assert!(password_from_stdin("\n").is_err());
+    }
+
+    #[test]
+    fn an_export_names_the_image_as_asked() {
+        let names = vec![
+            "localhost/app/gz:1".to_owned(),
+            "localhost/app/zst:1".to_owned(),
+            "docker.io/library/app:1".to_owned(),
+        ];
+        let given = |q| name_given(&names, q);
+        assert_eq!(given("app/zst:1").as_deref(), Some("localhost/app/zst:1"));
+        assert_eq!(
+            given("localhost/app/gz:1").as_deref(),
+            Some("localhost/app/gz:1")
+        );
+        assert_eq!(
+            given("docker.io/app:1").as_deref(),
+            Some("docker.io/library/app:1")
+        );
+        assert_eq!(given("d2253fcb1642"), None);
+    }
+}

@@ -42,6 +42,9 @@ pub struct Options {
     pub mesh_relay: bool,
     /// Where the volume plugins are, if not in the default place.
     pub volume_plugins: Option<PathBuf>,
+    pub iscsi_targets: Option<PathBuf>,
+    pub iscsi_portal_group: String,
+    pub iscsi_portal: Option<String>,
     /// jailer and the arguments before each of its commands, for Builds.
     pub jailer: Vec<String>,
     /// Registries (`host[:port]`) reached over plain HTTP: by the managers
@@ -528,6 +531,15 @@ async fn start_agent(
     if let Some(dir) = &opts.volume_plugins {
         config.plugin_dir = dir.clone();
     }
+    if let Some(file) = &opts.iscsi_targets {
+        legion_agent::exports::ensure_targets(file, &opts.iscsi_portal_group)
+            .with_context(|| format!("making {}", file.display()))?;
+    }
+    config.iscsi = legion_agent::exports::IscsiConfig {
+        targets: opts.iscsi_targets.clone(),
+        portal_group: opts.iscsi_portal_group.clone(),
+        portal: opts.iscsi_portal.clone(),
+    };
     config.ingress = opts.ingress_listen;
     config.ingress_tls = opts.ingress_tls_listen;
     config.load_balancer_interface = opts.load_balancer_interface.clone();
