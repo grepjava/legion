@@ -30,7 +30,6 @@
   import {
     namespaces,
     session,
-    setDensity,
     setTheme,
     type ThemeMode
   } from '#lib/session.svelte.ts';
@@ -542,15 +541,6 @@
       >
         <span>{t('Jump or run…')}</span>
         <kbd>Ctrl+K</kbd>
-      </button>
-
-      <button
-        type="button"
-        class="sm"
-        aria-pressed={session.density === 'compact'}
-        onclick={() => setDensity(session.density === 'compact' ? 'comfortable' : 'compact')}
-      >
-        {t('Compact')}
       </button>
 
       <select
