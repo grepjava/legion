@@ -382,6 +382,9 @@
     e.all_ports ? t('all ports') : e.ports.map((p) => `${p.port}/${p.protocol}`).join(', ');
   const link = (kind: string, name: string) => `/k/${kind}/${namespace}/${name}`;
 
+  // The service picked for the panel, ringed; until one is, the panel
+  // shows the first, unringed.
+  const picked = $derived(services.some((s) => s.metadata.name === selectedService) ? selectedService : '');
   const inspectedSvc = $derived(
     services.find((s) => s.metadata.name === selectedService) ?? services[0] ?? null
   );
@@ -446,7 +449,7 @@
             class="sm"
             class:primary={(inspectedSvc?.metadata.name ?? '') === s.metadata.name}
             aria-pressed={(inspectedSvc?.metadata.name ?? '') === s.metadata.name}
-            onclick={() => (selectedService = s.metadata.name)}
+            onclick={() => (selectedService = selectedService === s.metadata.name ? '' : s.metadata.name)}
           >
             {s.metadata.name}
           </button>
@@ -664,7 +667,7 @@
             >
               <circle
                 class="svc-halo {h}"
-                class:picked={inspectedSvc?.metadata.name === s.metadata.name}
+                class:picked={picked === s.metadata.name}
                 cx={X_SVC_CX}
                 cy={cy}
                 r={SVC_R + 5}
@@ -760,6 +763,9 @@
         <span><span class="leg-dot bad"></span>{t('Failed / Lost')}</span>
         {#if volLinks.some((l) => l.far)}
           <span><span class="leg-far"></span>{t('Volume on another node than its pod')}</span>
+        {/if}
+        {#if picked}
+          <span><span class="leg-picked"></span>{t('Shown in the panel')}</span>
         {/if}
         <span>{t('Click any Service, Pod/VM, Route, Volume or node to drill down.')}</span>
       </div>
@@ -980,6 +986,15 @@
     stroke: var(--bad);
     stroke-dasharray: 2 4;
     stroke-width: 2;
+  }
+  .leg-picked {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    margin-right: 0.35rem;
+    border: 2px dashed var(--link);
+    border-radius: 50%;
+    vertical-align: middle;
   }
   .leg-far {
     display: inline-block;
