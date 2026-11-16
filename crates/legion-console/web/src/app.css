@@ -659,7 +659,7 @@ tbody tr:hover td {
 }
 .wizard-step.active {
   background: var(--surface2);
-  border-color: var(--accent);
+  border-color: var(--link);
   color: var(--text);
   font-weight: 600;
 }
@@ -705,10 +705,10 @@ tbody tr:hover td {
   cursor: pointer;
 }
 .choice-card:hover {
-  border-color: var(--accent);
+  border-color: var(--link);
 }
 .choice-card.selected {
-  border: 2px solid var(--accent);
+  border: 2px solid var(--link);
   background: var(--surface2);
 }
 .pill-row {
