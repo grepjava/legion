@@ -15,6 +15,10 @@
 
   let tablist: HTMLElement | undefined = $state();
   let dockHeight = $state(DEFAULT_HEIGHT);
+  let windowHeight = $state(0);
+  // The separator's range (WAI-ARIA): 0 when minimized, else the dock's
+  // height, at most what the window leaves.
+  const maxHeight = $derived(windowHeight ? Math.max(260, windowHeight - 140) : 720);
   let resizing = $state(false);
   let dragStartY = 0;
   let dragStartHeight = DEFAULT_HEIGHT;
@@ -24,7 +28,7 @@
   );
 
   function clampHeight(px: number): number {
-    const max = typeof window !== 'undefined' ? Math.max(260, window.innerHeight - 140) : 720;
+    const max = typeof window !== 'undefined' ? Math.max(260, window.innerHeight - 140) : maxHeight;
     return Math.round(Math.min(max, Math.max(MIN_HEIGHT, px)));
   }
 
@@ -113,6 +117,8 @@
   }
 </script>
 
+<svelte:window bind:innerHeight={windowHeight} />
+
 {#if session.workbench.length}
   <section class="workbench" class:resizing aria-label={t('Operator workbench')}>
     <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
@@ -122,8 +128,9 @@
       role="separator"
       aria-orientation="horizontal"
       aria-label={t('Resize workbench')}
-      aria-valuemin={MIN_HEIGHT}
-      aria-valuenow={session.workbenchMinimized ? 0 : dockHeight}
+      aria-valuemin={0}
+      aria-valuemax={maxHeight}
+      aria-valuenow={session.workbenchMinimized ? 0 : Math.min(dockHeight, maxHeight)}
       tabindex="0"
       onpointerdown={onResizeDown}
       onpointermove={onResizeMove}

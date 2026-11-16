@@ -126,7 +126,7 @@
       {#if kind === 'Task' || kind === 'Service'}
         <span class="tag">
           {#if vmSpec}
-            {t('bhyve VM')} · {vmSpec.cpus ?? 1} vCPU · {vmSpec.memory ?? ''} · {vmSpec.boot ?? 'bhyveload'}
+            {t('bhyve VM')} · {vmSpec.cpus ?? 1} vCPU · {vmSpec.memory ?? ''} · {vmSpec.boot === 'uefi' ? t('UEFI (cloud-init)') : t('FreeBSD loader (bhyveload)')}
           {:else}
             {t('FreeBSD Jail')}
           {/if}

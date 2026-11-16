@@ -1,3 +1,8 @@
+<script lang="ts" module>
+  /** Every task counts. */
+  const EVERY = () => true;
+</script>
+
 <script lang="ts">
   // What a task, a service's tasks or a node's tasks used over the last
   // hour (`legion usage`), as the leader sampled it: CPU, memory, and
@@ -10,7 +15,7 @@
     namespace,
     task = '',
     nodeFilter = '',
-    pick = () => true,
+    pick = EVERY,
     compact = false
   }: {
     /** Empty: every namespace the user may read. */
@@ -121,6 +126,18 @@
   const bps = (v: number) => `${bytes(v)}/s`;
   const totalMem = $derived(summed.mem.at(-1)?.[1] ?? 0);
   const totalCpu = $derived(summed.cpu.at(-1)?.[1] ?? 0);
+  // The agent's metrics (legion-agent's metrics.rs), one series per
+  // container, labelled namespace, task and container.
+  const selector = $derived.by(() => {
+    const m = [
+      ...(namespace ? [`namespace="${namespace}"`] : []),
+      ...(task ? [`task="${task}"`] : [])
+    ];
+    return m.length ? `{${m.join(',')}}` : '';
+  });
+  // Whether the selector picks the tasks the charts sum: a service's or a
+  // node's are not told apart by the metrics' labels.
+  const exact = $derived(pick === EVERY);
 </script>
 
 {#if error}<p class="error" role="alert">{error}</p>{/if}
@@ -194,14 +211,18 @@
   {#if !compact && summed.cpu.length}
     <details class="card" style="margin-top: 0.75rem">
       <summary>{t('Prometheus telemetry & PromQL')}</summary>
-      <p class="muted">
-        {t('Exposed by each node daemon on --metrics-listen (/metrics). Live values from current samples:')}
-      </p>
-      <pre>{`legion_task_cpu_cores{namespace="${namespace || '*'}"${task ? `,task="${task}"` : ''}} ${totalCpu.toFixed(4)}
-legion_task_memory_bytes{namespace="${namespace || '*'}"${task ? `,task="${task}"` : ''}} ${totalMem}`}</pre>
+      {#if exact}
+        <p class="muted">
+          {t('Exposed by each node daemon on --metrics-listen (/metrics). Live values from current samples:')}
+        </p>
+        <pre>{`sum(legion_container_cpu_percent${selector}) ${totalCpu.toFixed(1)}
+sum(legion_container_memory_bytes${selector}) ${totalMem}`}</pre>
+      {:else}
+        <p class="muted">{t('Exposed by each node daemon on --metrics-listen (/metrics).')}</p>
+      {/if}
       <p class="muted">{t('Example PromQL:')}</p>
-      <pre>{`rate(legion_task_cpu_seconds_total{${task ? `task="${task}"` : `namespace="${namespace || 'default'}"`}}[5m])
-legion_task_memory_bytes{${task ? `task="${task}"` : `namespace="${namespace || 'default'}"`}}`}</pre>
+      <pre>{`sum by (task) (rate(legion_container_cpu_seconds_total${selector}[5m]))
+sum by (task) (legion_container_memory_bytes${selector})`}</pre>
     </details>
   {/if}
 {/if}

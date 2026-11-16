@@ -50,7 +50,10 @@
       .catch(() => (balancers = []));
   });
 
+  // A row's least height; a service's row grows with its tasks, each
+  // TASK_STEP below the last, so they never reach into the next row.
   const ROW = 112;
+  const TASK_STEP = 52;
   const HEADER_H = 34;
   const X_ROUTE = 24;
   const ROUTE_W = 168;
@@ -97,11 +100,28 @@
   );
   const leftRows = $derived(shownRoutes.length + (outside.length ? 1 : 0));
   const svgW = X_VOL + VOL_W + 28;
-  const height = $derived(
-    HEADER_H + Math.max(services.length, volumeNames.length, leftRows, 1) * ROW + 36
+  const rowCount = $derived(Math.max(services.length, volumeNames.length, leftRows, 1));
+  // Each row's height, and where each starts: routes, services and
+  // Volumes share the rows.
+  const rowHeights = $derived(
+    Array.from({ length: rowCount }, (_, i) => {
+      const n = tasksBySvc.get(services[i]?.metadata.name ?? '')?.length ?? 0;
+      return Math.max(ROW, n * TASK_STEP + 24);
+    })
   );
+  const rowTops = $derived.by(() => {
+    const tops: number[] = [];
+    let top = HEADER_H;
+    for (const h of rowHeights) {
+      tops.push(top);
+      top += h;
+    }
+    return tops;
+  });
+  const height = $derived(HEADER_H + rowHeights.reduce((a, h) => a + h, 0) + 36);
 
-  const y = (row: number) => HEADER_H + row * ROW + ROW / 2;
+  const y = (row: number) => (rowTops[row] ?? HEADER_H + row * ROW) + (rowHeights[row] ?? ROW) / 2;
+  const taskY = (row: number, ti: number, n: number) => y(row) + (ti - (n - 1) / 2) * TASK_STEP;
   const isVmSvc = (s: LObject) =>
     Boolean((s.spec?.pod?.containers ?? []).some((c: { vm?: unknown }) => c.vm));
   const isDbSvc = (s: LObject) =>
@@ -216,6 +236,7 @@
             type="button"
             class="sm"
             class:primary={(inspectedSvc?.metadata.name ?? '') === s.metadata.name}
+            aria-pressed={(inspectedSvc?.metadata.name ?? '') === s.metadata.name}
             onclick={() => (selectedService = s.metadata.name)}
           >
             {s.metadata.name}
@@ -282,7 +303,7 @@
           {#each services as s, i (s.metadata.name)}
             {@const svcTasks = tasksBySvc.get(s.metadata.name) ?? []}
             {#each svcTasks as tk, ti (tk.metadata.name)}
-              {@const ty = y(i) + (ti - (svcTasks.length - 1) / 2) * 52}
+              {@const ty = taskY(i, ti, svcTasks.length)}
               <path
                 class="edge pod-link"
                 d="M {X_SVC_CX + SVC_R} {y(i)} C {X_SVC_CX + SVC_R + 36} {y(i)}, {X_TASK - 36} {ty}, {X_TASK} {ty}"
@@ -292,9 +313,13 @@
 
           <!-- Service -> Volume edges -->
           {#each used as u (`${u.service}>${u.volume}`)}
+            <!-- From its tasks, or from the service itself while it has none. -->
+            {@const x0 = tasksBySvc.get(u.service)?.length ? X_TASK + TASK_W : X_SVC_CX + SVC_R}
+            {@const y0 = y(svcRow.get(u.service)!)}
+            {@const y1 = y(volRow.get(u.volume)!)}
             <path
               class="edge vol-link"
-              d="M {X_TASK + TASK_W} {y(svcRow.get(u.service)!)} C {X_TASK + TASK_W + 30} {y(svcRow.get(u.service)!)}, {X_VOL - 30} {y(volRow.get(u.volume)!)}, {X_VOL} {y(volRow.get(u.volume)!)}"
+              d="M {x0} {y0} C {x0 + 30} {y0}, {X_VOL - 30} {y1}, {X_VOL} {y1}"
             />
           {/each}
 
@@ -371,6 +396,7 @@
               <text class="svc-title" x={X_SVC_CX} y={cy + SVC_R + 18} text-anchor="middle">
                 {s.metadata.name}{pList.length ? ` :${pList[0]}` : ''}
               </text>
+              <text class="sub" x={X_SVC_CX} y={cy + SVC_R + 33} text-anchor="middle">{svcNote(s)}</text>
             </a>
           {/each}
 
@@ -378,7 +404,7 @@
           {#each services as s, i (s.metadata.name)}
             {@const svcTasks = tasksBySvc.get(s.metadata.name) ?? []}
             {#each svcTasks as tk, ti (tk.metadata.name)}
-              {@const ty = y(i) + (ti - (svcTasks.length - 1) / 2) * 52}
+              {@const ty = taskY(i, ti, svcTasks.length)}
               {@const th = taskHealth(tk)}
               {@const vm = isVmSvc(tk)}
               <a

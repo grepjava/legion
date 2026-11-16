@@ -395,7 +395,7 @@ spec: { text: team-b's }
     step("phase 2: a terminal in keeper's task, writing to its Volume");
     let (keeper, _) = c.task_of("keeper").expect("keeper's task");
     c.page(&mut e, &format!("/k/Task/team-a/{keeper}"));
-    e.click("Terminal");
+    e.click("Console");
     e.fill("Command", "/bin/sh");
     e.click("Open");
     e.until("the terminal", 30, |b| {
@@ -708,6 +708,7 @@ spec:
         "/templates",
         "/import",
         "/apply",
+        "/build",
         "/topology",
         "/network",
         "/disk",
@@ -1290,50 +1291,43 @@ fn the_console_spans_two_clusters_by_single_sign_on() {
     }
 }
 
-/// The registry [`the_console_builds_an_example_with_jailer`] runs
+/// The registry [`the_console_builds_an_example`] runs
 /// (`common::registry`).
 #[test]
-#[ignore = "the registry of the_console_builds_an_example_with_jailer, run by it"]
+#[ignore = "the registry of the_console_builds_an_example, run by it"]
 fn registry() {
     common::registry::run();
 }
 
 /// Phase 5's "done when", for builds: a user who has never used the CLI
-/// deploys an example from the catalog, builds a new image for it with
-/// jailer from the console, and sees the build's log and the rollout. One
-/// node, the host, labelled a builder, with jailer (`LEGION_JAILER`) and a
+/// deploys an example from the catalog, builds a new image for it from
+/// the console, and sees the build's log and the rollout. One node, the
+/// host, labelled a builder (the daemon's own `legion local`), and a
 /// registry this test runs; the example is static-site, nginx from
 /// FreeBSD's packages, its image not yet built, then built from its
 /// Containerfile pasted in the console.
 #[test]
-#[ignore = "needs root, ZFS on FreeBSD, jailer, Chromium and FreeBSD's packages; see the module docs"]
-fn the_console_builds_an_example_with_jailer() {
+#[ignore = "needs root, ZFS on FreeBSD, Chromium and FreeBSD's packages; see the module docs"]
+fn the_console_builds_an_example() {
     use common::registry::Registry;
     let mut lab = Lab::from_env();
     let step = |what: &str| eprintln!("--- {what}");
-    let jailer = std::env::var("LEGION_JAILER").expect("set LEGION_JAILER to a jailer binary");
-    assert!(
-        std::path::Path::new(&jailer).is_file(),
-        "no jailer at {jailer}"
-    );
     let listen = format!("{}:7480", lab.host);
     let url = format!("https://{listen}");
 
-    step("one node, a builder with jailer, a registry, and a namespace for ed");
+    step("one node, a builder, a registry, and a namespace for ed");
     let registry = Registry::start(&lab);
     let image = format!("{}/examples/nginx:1", registry.addr);
-    let state = lab.dir.join("jailer");
+    let state = lab.dir.join("local");
     lab.flags = format!("{} --insecure-registry {}", lab.flags, registry.addr);
     lab.start_host(&[
         "--console-listen",
         &listen,
-        "--jailer",
-        &jailer,
-        "--jailer-arg",
+        "--builder-arg",
         "--state-dir",
-        "--jailer-arg",
+        "--builder-arg",
         state.to_str().unwrap(),
-        "--jailer-arg",
+        "--builder-arg",
         "--no-zfs",
     ]);
     lab.ok(&["init"]);
@@ -1351,12 +1345,7 @@ fn the_console_builds_an_example_with_jailer() {
     let key = legion_image::cosign::PrivateKey::generate();
     let indent = |pem: &str, by: usize| {
         pem.lines()
-            .map(|l| {
-                format!(
-                    "{:by$}{l}\n",
-                    ""
-                )
-            })
+            .map(|l| format!("{:by$}{l}\n", ""))
             .collect::<String>()
     };
     let signer = lab.dir.join("signer.yaml");
@@ -1417,18 +1406,22 @@ fn the_console_builds_an_example_with_jailer() {
     step("ed builds a new image for it from the console, its Containerfile pasted");
     c.page(&mut e, "/k/Service/shop/web");
     e.click("Build a new image");
-    e.until("the build form", 30, |b| {
-        b.eval("!!document.querySelector('input[type=radio][value=containerfile]')")
-            == serde_json::json!(true)
+    // The builder's wizard: a jail image (its first step's choice), from
+    // a Containerfile, pushed and signed, then reviewed and started.
+    e.until("the build wizard", 30, |b| {
+        b.eval("!!document.querySelector('[aria-current=step]')") == serde_json::json!(true)
     });
-    e.eval("document.querySelector('input[type=radio][value=containerfile]').click()");
+    e.click("Next: Source");
+    e.click("Containerfile");
     e.fill(
         "Containerfile",
         include_str!("../../../examples/static-site/Containerfile"),
     );
+    e.click("Next");
     e.fill("Push to", &image);
     e.fill("Signing key", "signer");
-    e.click("Build");
+    e.click("Next: Review");
+    e.click("Start Build");
 
     step("the build's log, live, then the rollout");
     e.until("the Build's page and its log", 60, |b| {
@@ -1440,7 +1433,7 @@ fn the_console_builds_an_example_with_jailer() {
         .as_str()
         .unwrap()
         .to_owned();
-    e.until("jailer's output in the log as it builds", 600, |b| {
+    e.until("the builder's output in the log as it builds", 600, |b| {
         b.text().contains("pkg install") || b.text().contains("STEP") || b.text().contains("RUN")
     });
     wait("the build to end", 1800, || {
@@ -1464,11 +1457,18 @@ fn the_console_builds_an_example_with_jailer() {
     );
     c.page(&mut e, &format!("/k/Build/shop/{build}?tab=buildlog"));
     e.shows("The build succeeded.", 30);
-    // Pushed, the build's image is gone from jailer's store; its base stays.
-    let images = std::process::Command::new(&jailer)
-        .args(["--state-dir", state.to_str().unwrap(), "--no-zfs", "images"])
+    // Pushed, the build's image is gone from the builder's store; its base
+    // stays.
+    let images = std::process::Command::new(common::LEGION)
+        .args([
+            "local",
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--no-zfs",
+            "images",
+        ])
         .output()
-        .expect("jailer images");
+        .expect("legion local images");
     let images = common::text(&images.stdout);
     assert!(!images.contains("legion-build/"), "{images}");
     assert!(images.contains("freebsd-notoolchain"), "{images}");

@@ -18,6 +18,7 @@
   import {
     namespaces,
     session,
+    setDensity,
     setTheme,
     type ThemeMode
   } from '#lib/session.svelte.ts';
@@ -274,6 +275,13 @@
     ].filter((i) => matchesNav(i.label))
   );
 
+  // A section's heading only while some of its entries pass the filter.
+  const showAllClusters = $derived(matchesNav(t('All clusters')));
+  const filteredClusters = $derived(
+    (session.settings.clusters ?? []).filter((c) => matchesNav(c.name))
+  );
+  const filteredPlugins = $derived(shownPlugins.filter((p) => matchesNav(p.name)));
+  const filteredLinks = $derived((session.settings.links ?? []).filter((l) => matchesNav(l.label)));
   const filteredNsKinds = $derived(nsKinds.filter((k) => matchesNav(plural(k.kind))));
   const filteredClusterKinds = $derived(clusterKinds.filter((k) => matchesNav(plural(k.kind))));
   const clusterOpsItems = $derived(
@@ -346,6 +354,15 @@
         <kbd>Ctrl+K</kbd>
       </button>
 
+      <button
+        type="button"
+        class="sm"
+        aria-pressed={session.density === 'compact'}
+        onclick={() => setDensity(session.density === 'compact' ? 'comfortable' : 'compact')}
+      >
+        {t('Compact')}
+      </button>
+
       <select
         aria-label={t('Color theme')}
         value={session.theme}
@@ -408,17 +425,17 @@
             </details>
           {/if}
 
-          {#if session.settings.clusters?.length}
+          {#if session.settings.clusters?.length && (showAllClusters || filteredClusters.length)}
             <details class="nav-sec" open>
               <summary class="nav-group">{t('Clusters')}</summary>
-              {#if matchesNav(t('All clusters'))}
+              {#if showAllClusters}
                 <a
                   href="/clusters"
                   class:here={page.url.pathname === '/clusters'}
                   aria-current={at(page.url.pathname === '/clusters')}>{t('All clusters')}</a
                 >
               {/if}
-              {#each session.settings.clusters.filter((c) => matchesNav(c.name)) as c, i (i)}
+              {#each filteredClusters as c, i (i)}
                 <a
                   href={there(c.url)}
                   title={t('This page on {name}, signed into on its own', { name: c.name })}
@@ -427,10 +444,10 @@
               {/each}
             </details>
           {/if}
-          {#if shownPlugins.length}
+          {#if filteredPlugins.length}
             <details class="nav-sec" open>
               <summary class="nav-group">{t('Plugins')}</summary>
-              {#each shownPlugins.filter((p) => matchesNav(p.name)) as p (`${p.namespace}/${p.name}`)}
+              {#each filteredPlugins as p (`${p.namespace}/${p.name}`)}
                 {@const href = `/plugins/${p.namespace}/${p.name}`}
                 <a {href} class:here={page.url.pathname === href} aria-current={at(page.url.pathname === href)}
                   >{p.name}{#if !session.namespace}<span class="muted"> ({p.namespace})</span>{/if}</a
@@ -438,10 +455,10 @@
               {/each}
             </details>
           {/if}
-          {#if session.settings.links?.length}
+          {#if filteredLinks.length}
             <details class="nav-sec" open>
               <summary class="nav-group">{t('Links')}</summary>
-              {#each session.settings.links.filter((l) => matchesNav(l.label)) as l, i (i)}
+              {#each filteredLinks as l, i (i)}
                 <a href={l.url} target="_blank" rel="noopener noreferrer">{l.label}</a>
               {/each}
             </details>

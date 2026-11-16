@@ -303,7 +303,6 @@
   let searchQuery = $state('');
   let searchSecret = $state('');
   let sourceFilter: 'all' | 'freebsd' | 'ghcr' | 'docker' = $state('all');
-  let kindFilter: 'all' | 'jail' | 'vm' = $state('all');
   let hits: RegistrySearchHit[] = $state([]);
   let searching = $state(false);
   let inspectInput = $state('');
@@ -317,12 +316,9 @@
       if (sourceFilter === 'freebsd' && h.source !== 'freebsd-catalog') return false;
       if (sourceFilter === 'ghcr' && !isGhcr) return false;
       if (sourceFilter === 'docker' && h.source !== 'docker-hub') return false;
-      const isVm =
-        h.name.toLowerCase().includes('vm') ||
-        h.description.toLowerCase().includes('bhyve') ||
-        h.description.toLowerCase().includes('disk.img');
-      if (kindFilter === 'vm' && !isVm) return false;
-      if (kindFilter === 'jail' && isVm) return false;
+      // Whether a hit is a VM image is in its config's labels
+      // (legion.vm.image, as `legion build vm` sets it), which a search
+      // does not fetch: the inspector shows it.
       return true;
     })
   );
@@ -706,21 +702,22 @@
           <button class="primary" disabled={searching}>{t('Search')}</button>
         </form>
 
-        <div class="pill-row" role="group" aria-label={t('Filter by source and workload')}>
-          <button type="button" class="pill" class:active={sourceFilter === 'all'} onclick={() => (sourceFilter = 'all')}>{t('All sources')}</button>
-          <button type="button" class="pill" class:active={sourceFilter === 'freebsd'} onclick={() => (sourceFilter = 'freebsd')}>{t('FreeBSD catalog')}</button>
-          <button type="button" class="pill" class:active={sourceFilter === 'ghcr'} onclick={() => (sourceFilter = 'ghcr')}>ghcr.io</button>
-          <button type="button" class="pill" class:active={sourceFilter === 'docker'} onclick={() => (sourceFilter = 'docker')}>Docker Hub</button>
-          <span class="muted" aria-hidden="true">·</span>
-          <button type="button" class="pill" class:active={kindFilter === 'all'} onclick={() => (kindFilter = 'all')}>{t('Jails & VMs')}</button>
-          <button type="button" class="pill" class:active={kindFilter === 'jail'} onclick={() => (kindFilter = 'jail')}>{t('Jails')}</button>
-          <button type="button" class="pill" class:active={kindFilter === 'vm'} onclick={() => (kindFilter = 'vm')}>{t('bhyve VMs')}</button>
+        <div class="pill-row" role="group" aria-label={t('Filter by source')}>
+          {#each [{ id: 'all', label: t('All sources') }, { id: 'freebsd', label: t('FreeBSD catalog') }, { id: 'ghcr', label: 'ghcr.io' }, { id: 'docker', label: 'Docker Hub' }] as const as f (f.id)}
+            <button
+              type="button"
+              class="pill"
+              class:active={sourceFilter === f.id}
+              aria-pressed={sourceFilter === f.id}
+              onclick={() => (sourceFilter = f.id)}>{f.label}</button
+            >
+          {/each}
         </div>
 
         {#if filteredHits.length}
           <ul class="hit-list" role="list">
             {#each filteredHits as h (h.name)}
-              {@const fullRef = `${h.name}:${h.suggested_tag || 'latest'}`}
+              {@const fullRef = h.suggested_tag ? `${h.name}:${h.suggested_tag}` : h.name}
               <li class="hit-card">
                 <div class="hit-head">
                   <strong class="mono">{h.name}</strong>
@@ -738,7 +735,7 @@
                 </div>
                 <p class="muted hit-desc">{h.description || '—'}</p>
                 <div class="controls">
-                  <span class="mono muted">:{h.suggested_tag}</span>
+                  <span class="mono muted">{h.suggested_tag ? `:${h.suggested_tag}` : t('tag not known')}</span>
                   <button
                     type="button"
                     class="sm"
@@ -823,6 +820,10 @@
               <span class="state {inspected.signed ? 'good' : 'wait'}">
                 {inspected.signed ? t('verified signature') : t('unsigned / no matching ImagePolicy')}
               </span>
+            </dd>
+            <dt>{t('Workload')}</dt>
+            <dd>
+              {inspected.run?.labels?.['legion.vm.image'] === 'true' ? t('bhyve VM') : t('FreeBSD Jail')}
             </dd>
             <dt>{t('Platforms')}</dt>
             <dd>

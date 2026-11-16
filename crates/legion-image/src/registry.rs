@@ -59,6 +59,8 @@ pub struct Client {
     /// token one account got must not serve another, or a pull without
     /// credentials.
     tokens: Mutex<BTreeMap<(String, String, String, bool), String>>,
+    /// Where searches go.
+    search_at: SearchEndpoints,
 }
 
 impl Client {
@@ -76,6 +78,7 @@ impl Client {
             http,
             plain: BTreeSet::new(),
             tokens: Mutex::new(BTreeMap::new()),
+            search_at: SearchEndpoints::default(),
         })
     }
 
@@ -736,8 +739,18 @@ impl Client {
         self.search_with_ghcr(query, limit, None).await
     }
 
-    /// Searches the FreeBSD catalog, Docker Hub, and (when `ghcr_token` is
-    /// provided or `query` starts with `ghcr.io/`) GitHub Container Registry.
+    /// [`Client::search`], and GitHub Container Registry:
+    ///
+    /// - `ghcr.io/owner/repo` (the prefix in any case) looks the repository
+    ///   up in the registry itself, anonymously as a pull is, so a public
+    ///   image is found without a token; with `ghcr_token` (a GitHub token
+    ///   with `read:packages`) the owner's packages matching `repo` are
+    ///   listed too.
+    /// - `ghcr.io/owner` lists the owner's packages, and `ghcr.io/` the
+    ///   token's own: GitHub's packages API answers only with a token.
+    /// - Any other query, with `ghcr_token`, also lists the token's own
+    ///   packages matching it. Without one it asks ghcr.io nothing, so a
+    ///   cluster that cannot reach it waits no longer than before.
     pub async fn search_with_ghcr(
         &self,
         query: &str,
@@ -747,25 +760,10 @@ impl Client {
         let limit = limit.clamp(1, 50);
         let trimmed = query.trim();
         let q = trimmed.to_ascii_lowercase();
+        let token = ghcr_token.filter(|t| !t.is_empty());
 
-        if let Some(rest) = trimmed
-            .strip_prefix("ghcr.io/")
-            .or_else(|| trimmed.strip_prefix("GHCR.IO/"))
-        {
-            let token = ghcr_token.filter(|t| !t.is_empty()).ok_or_else(|| {
-                Error::Registry(
-                    "ghcr.io search requires a GitHub token (Secret with read:packages)"
-                        .to_owned(),
-                )
-            })?;
-            let (owner, filter) = match rest.split_once('/') {
-                Some((o, f)) => (o.trim(), f.trim()),
-                None => (rest.trim(), ""),
-            };
-            if owner.is_empty() {
-                return self.query_ghcr_user(filter, limit, token).await;
-            }
-            return self.query_ghcr_owner(owner, filter, limit, token).await;
+        if let Some(g) = GhcrQuery::parse(trimmed) {
+            return self.search_ghcr(&g, limit, token).await;
         }
 
         let mut out: Vec<RegistryHit> = FREEBSD_CATALOG
@@ -785,34 +783,13 @@ impl Client {
             })
             .collect();
 
-        if let Some(token) = ghcr_token.filter(|t| !t.is_empty())
+        if let Some(token) = token
             && out.len() < limit
-            && let Ok(ghcr_hits) = self.query_ghcr_user(&q, limit - out.len(), token).await
+            && let Ok(hits) = self.ghcr_packages(None, &q, limit - out.len(), token).await
         {
-            out.extend(ghcr_hits);
-        }
-
-        if !q.is_empty() && out.len() < limit {
-            let candidates: Vec<(&str, &str)> = if let Some((o, r)) = trimmed.split_once('/') {
-                if !o.is_empty() && !r.is_empty() && !o.contains('.') {
-                    vec![(o, r)]
-                } else {
-                    Vec::new()
-                }
-            } else {
-                vec![("daemonless", &q), ("freebsd", &q), ("grepjava", &q)]
-            };
-            if !candidates.is_empty() {
-                let futs = candidates
-                    .into_iter()
-                    .map(|(owner, repo)| self.probe_ghcr_public(owner, repo));
-                for hit in futures::future::join_all(futs).await.into_iter().flatten() {
-                    if out.len() >= limit {
-                        break;
-                    }
-                    if !out.iter().any(|h| h.name == hit.name) {
-                        out.push(hit);
-                    }
+            for hit in hits {
+                if !out.iter().any(|h| h.name == hit.name) {
+                    out.push(hit);
                 }
             }
         }
@@ -821,11 +798,8 @@ impl Client {
             let page_size = (limit - out.len()).clamp(1, 25);
             let req = self
                 .http
-                .get("https://hub.docker.com/v2/search/repositories/")
-                .query(&[
-                    ("query", trimmed),
-                    ("page_size", &page_size.to_string()),
-                ])
+                .get(format!("{}/v2/search/repositories/", self.search_at.hub))
+                .query(&[("query", trimmed), ("page_size", &page_size.to_string())])
                 .timeout(std::time::Duration::from_secs(6));
             if let Ok(resp) = req.send().await
                 && resp.status().is_success()
@@ -853,44 +827,71 @@ impl Client {
         Ok(out)
     }
 
-    async fn probe_ghcr_public(&self, owner: &str, repo: &str) -> Option<RegistryHit> {
-        let scope = format!("repository:{owner}/{repo}:pull");
-        let tok_resp = self
-            .http
-            .get("https://ghcr.io/token")
-            .query(&[("scope", scope.as_str())])
-            .timeout(std::time::Duration::from_secs(3))
-            .send()
-            .await
-            .ok()?;
-        if !tok_resp.status().is_success() {
-            return None;
-        }
-        let tok: GhcrToken = tok_resp.json().await.ok()?;
-        let tags_url = format!("https://ghcr.io/v2/{owner}/{repo}/tags/list");
-        let tags_resp = self
-            .http
-            .get(&tags_url)
-            .bearer_auth(&tok.token)
-            .timeout(std::time::Duration::from_secs(3))
-            .send()
-            .await
-            .ok()?;
-        if !tags_resp.status().is_success() {
-            return None;
-        }
-        let list: GhcrTags = tags_resp.json().await.ok()?;
-        if list.tags.is_empty() {
-            return None;
-        }
-        let suggested = if list.tags.iter().any(|t| t == "latest") {
-            "latest".to_owned()
-        } else {
-            list.tags.last().cloned().unwrap_or_else(|| "latest".to_owned())
+    /// A `ghcr.io/...` query (see [`Client::search_with_ghcr`]).
+    async fn search_ghcr(
+        &self,
+        g: &GhcrQuery,
+        limit: usize,
+        token: Option<&str>,
+    ) -> Result<Vec<RegistryHit>, Error> {
+        let Some(repo) = &g.repo else {
+            let token = token.ok_or_else(|| {
+                Error::Registry(
+                    "listing ghcr.io packages needs a GitHub token (a Secret with \
+                     read:packages); name the repository, ghcr.io/owner/repo, to look \
+                     a public one up without"
+                        .to_owned(),
+                )
+            })?;
+            let owner = (!g.owner.is_empty()).then_some(g.owner.as_str());
+            return self.ghcr_packages(owner, "", limit, token).await;
         };
-        Some(RegistryHit {
+        let mut out = Vec::new();
+        let mut why = None;
+        match self.ghcr_repository(&g.owner, repo).await {
+            Ok(hit) => out.push(hit),
+            Err(e) => why = Some(e),
+        }
+        if let Some(token) = token {
+            match self.ghcr_packages(Some(&g.owner), repo, limit, token).await {
+                Ok(hits) => {
+                    for hit in hits {
+                        if !out.iter().any(|h| h.name == hit.name) {
+                            out.push(hit);
+                        }
+                    }
+                }
+                Err(e) if out.is_empty() => why = Some(e),
+                Err(_) => {}
+            }
+        }
+        match why {
+            Some(e) if out.is_empty() => Err(e),
+            _ => {
+                out.truncate(limit);
+                Ok(out)
+            }
+        }
+    }
+
+    /// `ghcr.io/owner/repo` as the registry has it, read as a pull is:
+    /// anonymously, with the token its auth service gives anyone for a
+    /// public image. Its tags are the first page the registry gives
+    /// ([`Client::list_tags`]: 100), so the tag suggested is of those.
+    async fn ghcr_repository(&self, owner: &str, repo: &str) -> Result<RegistryHit, Error> {
+        let r = Reference::parse(&format!("{}/{owner}/{repo}", self.search_at.ghcr))?;
+        let tags =
+            tokio::time::timeout(std::time::Duration::from_secs(8), self.list_tags(&r, None))
+                .await
+                .map_err(|_| {
+                    Error::Registry(format!("ghcr.io/{owner}/{repo}: no answer in 8 s"))
+                })??;
+        let suggested = suggest_tag(&tags)
+            .ok_or_else(|| Error::NotFound(format!("ghcr.io/{owner}/{repo}: no tags")))?;
+        let more = if tags.len() >= 100 { "+" } else { "" };
+        Ok(RegistryHit {
             name: format!("ghcr.io/{owner}/{repo}"),
-            description: format!("Public container image on ghcr.io ({} tags)", list.tags.len()),
+            description: format!("Container image on ghcr.io ({}{more} tags)", tags.len()),
             stars: 0,
             official: false,
             source: "ghcr.io".to_owned(),
@@ -898,108 +899,177 @@ impl Client {
         })
     }
 
-    async fn query_ghcr_owner(
+    /// The container packages of `owner` (an organization, else a user), or
+    /// of the token's own account, whose names hold `filter`. GitHub's
+    /// packages API pages its answers: the first page only, 100 packages,
+    /// is read. Their tags are not, so no tag is suggested.
+    async fn ghcr_packages(
         &self,
-        owner: &str,
+        owner: Option<&str>,
         filter: &str,
         limit: usize,
         token: &str,
     ) -> Result<Vec<RegistryHit>, Error> {
-        let org_url = format!(
-            "https://api.github.com/orgs/{owner}/packages?package_type=container&per_page=100"
-        );
-        let resp = self
-            .http
-            .get(&org_url)
-            .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "legion")
-            .bearer_auth(token)
-            .timeout(std::time::Duration::from_secs(8))
-            .send()
-            .await
-            .map_err(|e| Error::Registry(format!("ghcr.io search: {e}")))?;
-        let resp = if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            let user_url = format!(
-                "https://api.github.com/users/{owner}/packages?package_type=container&per_page=100"
-            );
+        let get = async |url: reqwest::Url| {
             self.http
-                .get(&user_url)
-                .header("Accept", "application/vnd.github+json")
-                .header("User-Agent", "legion")
+                .get(url)
+                .header(ACCEPT, "application/vnd.github+json")
                 .bearer_auth(token)
                 .timeout(std::time::Duration::from_secs(8))
                 .send()
                 .await
-                .map_err(|e| Error::Registry(format!("ghcr.io search: {e}")))?
-        } else {
-            resp
+                .map_err(|e| Error::Registry(format!("ghcr.io search: {e}")))
         };
-        Self::parse_ghcr_response(resp, filter, limit).await
-    }
-
-    async fn query_ghcr_user(
-        &self,
-        filter: &str,
-        limit: usize,
-        token: &str,
-    ) -> Result<Vec<RegistryHit>, Error> {
-        let resp = self
-            .http
-            .get("https://api.github.com/user/packages?package_type=container&per_page=100")
-            .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "legion")
-            .bearer_auth(token)
-            .timeout(std::time::Duration::from_secs(8))
-            .send()
-            .await
-            .map_err(|e| Error::Registry(format!("ghcr.io search: {e}")))?;
-        Self::parse_ghcr_response(resp, filter, limit).await
-    }
-
-    async fn parse_ghcr_response(
-        resp: reqwest::Response,
-        filter: &str,
-        limit: usize,
-    ) -> Result<Vec<RegistryHit>, Error> {
+        let api = &self.search_at.github_api;
+        let resp = match owner {
+            None => get(packages_url(api, &["user"])?).await?,
+            Some(owner) => {
+                let org = get(packages_url(api, &["orgs", owner])?).await?;
+                if org.status() == StatusCode::NOT_FOUND {
+                    get(packages_url(api, &["users", owner])?).await?
+                } else {
+                    org
+                }
+            }
+        };
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::Registry(format!(
-                "ghcr.io packages API returned HTTP {status}"
+                "ghcr.io: GitHub's packages API answered {status}"
             )));
         }
-        let pkgs: Vec<GhcrPackage> = resp
+        let packages: Vec<GhcrPackage> = resp
             .json()
             .await
-            .map_err(|e| Error::Registry(format!("ghcr.io packages response: {e}")))?;
-        let f = filter.to_ascii_lowercase();
-        let mut out = Vec::new();
-        for p in pkgs {
+            .map_err(|e| Error::Registry(format!("ghcr.io: GitHub's packages API: {e}")))?;
+        Ok(ghcr_hits(packages, filter, limit))
+    }
+}
+
+/// Where searches go, apart from the tests'.
+struct SearchEndpoints {
+    /// Docker Hub's API.
+    hub: String,
+    /// GitHub's API, for its packages.
+    github_api: String,
+    /// GitHub Container Registry, as a registry name.
+    ghcr: String,
+}
+
+impl Default for SearchEndpoints {
+    fn default() -> Self {
+        SearchEndpoints {
+            hub: "https://hub.docker.com".to_owned(),
+            github_api: "https://api.github.com".to_owned(),
+            ghcr: "ghcr.io".to_owned(),
+        }
+    }
+}
+
+/// A search for `ghcr.io/<owner>[/<repo>]`: `ghcr.io/` in any case, the
+/// rest lowercased, as ghcr.io's names are; a tag or digest given is not
+/// what is searched for, and is dropped.
+#[derive(Debug, PartialEq, Eq)]
+struct GhcrQuery {
+    /// Empty: the token's own account.
+    owner: String,
+    repo: Option<String>,
+}
+
+impl GhcrQuery {
+    fn parse(query: &str) -> Option<GhcrQuery> {
+        let prefix = query.get(..8)?;
+        if !prefix.eq_ignore_ascii_case("ghcr.io/") {
+            return None;
+        }
+        let rest = query[8..].trim().to_ascii_lowercase();
+        let rest = rest.split('@').next().unwrap_or_default();
+        let (owner, repo) = match rest.split_once('/') {
+            Some((o, r)) => (o.trim(), r.trim().trim_matches('/')),
+            None => (rest.trim(), ""),
+        };
+        let slash = repo.rfind('/').map_or(0, |i| i + 1);
+        let repo = match repo[slash..].find(':') {
+            Some(i) => &repo[..slash + i],
+            None => repo,
+        };
+        Some(GhcrQuery {
+            owner: owner.to_owned(),
+            repo: (!repo.is_empty()).then(|| repo.to_owned()),
+        })
+    }
+}
+
+/// `<api>/<segments...>/packages?package_type=container&per_page=100`,
+/// each segment escaped.
+fn packages_url(api: &str, segments: &[&str]) -> Result<reqwest::Url, Error> {
+    let mut url = reqwest::Url::parse(api)
+        .map_err(|e| Error::Registry(format!("GitHub's API at {api}: {e}")))?;
+    url.path_segments_mut()
+        .map_err(|()| Error::Registry(format!("GitHub's API at {api}: not a base")))?
+        .pop_if_empty()
+        .extend(segments)
+        .push("packages");
+    url.query_pairs_mut()
+        .append_pair("package_type", "container")
+        .append_pair("per_page", "100");
+    Ok(url)
+}
+
+/// Search hits of GitHub's container packages whose lowercased names hold
+/// `filter`, at most `limit`, named as ghcr.io names them (lowercase).
+fn ghcr_hits(packages: Vec<GhcrPackage>, filter: &str, limit: usize) -> Vec<RegistryHit> {
+    let filter = filter.to_ascii_lowercase();
+    packages
+        .into_iter()
+        .map(|p| {
             let owner = p.owner.map(|o| o.login).unwrap_or_default();
-            let full = if owner.is_empty() {
+            let name = if owner.is_empty() {
                 format!("ghcr.io/{}", p.name)
             } else {
                 format!("ghcr.io/{owner}/{}", p.name)
             };
-            if !f.is_empty() && !full.to_ascii_lowercase().contains(&f) {
-                continue;
-            }
-            out.push(RegistryHit {
-                name: full,
-                description: format!("{} container package on ghcr.io", p.visibility),
-                stars: 0,
-                official: false,
-                source: "ghcr.io".to_owned(),
-                suggested_tag: "latest".to_owned(),
-            });
-            if out.len() >= limit {
-                break;
-            }
-        }
-        Ok(out)
-    }
+            (name.to_ascii_lowercase(), p.visibility)
+        })
+        .filter(|(name, _)| filter.is_empty() || name.contains(&filter))
+        .take(limit)
+        .map(|(name, visibility)| RegistryHit {
+            name,
+            description: if visibility.is_empty() {
+                "Container package on ghcr.io".to_owned()
+            } else {
+                format!("{visibility} container package on ghcr.io")
+            },
+            stars: 0,
+            official: false,
+            source: "ghcr.io".to_owned(),
+            suggested_tag: String::new(),
+        })
+        .collect()
 }
 
-/// A search result from the FreeBSD jail catalog or Docker Hub.
+/// The tag to suggest of `tags`: `latest` when there is one, else the
+/// highest version-like tag (`1.2.3`, `v15.1`), else the last that is not
+/// a signature's or attestation's (`sha256-...`), else the last.
+fn suggest_tag(tags: &[String]) -> Option<String> {
+    if tags.iter().any(|t| t == "latest") {
+        return Some("latest".to_owned());
+    }
+    let version = |t: &str| -> Option<Vec<u64>> {
+        let digits = t.strip_prefix(['v', 'V']).unwrap_or(t);
+        digits.split('.').map(|p| p.parse().ok()).collect()
+    };
+    tags.iter()
+        .filter_map(|t| Some((version(t)?, t)))
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, t)| t)
+        .or_else(|| tags.iter().rev().find(|t| !t.starts_with("sha256-")))
+        .or(tags.last())
+        .cloned()
+}
+
+/// A search result from the FreeBSD jail catalog, Docker Hub or ghcr.io.
+/// `suggested_tag` is empty when no tag is known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryHit {
     pub name: String,
@@ -1008,17 +1078,6 @@ pub struct RegistryHit {
     pub official: bool,
     pub source: String,
     pub suggested_tag: String,
-}
-
-#[derive(serde::Deserialize)]
-struct GhcrToken {
-    token: String,
-}
-
-#[derive(serde::Deserialize)]
-struct GhcrTags {
-    #[serde(default)]
-    tags: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1196,6 +1255,247 @@ mod tests {
         let c = c.plain_http("r.example:5000");
         assert!(c.own_origin(&r, "http://r.example:5000/v2/"));
         assert!(!c.own_origin(&r, "https://r.example:5000/v2/"));
+    }
+
+    #[test]
+    fn ghcr_queries() {
+        let q = GhcrQuery::parse;
+        let g = |owner: &str, repo: Option<&str>| {
+            Some(GhcrQuery {
+                owner: owner.to_owned(),
+                repo: repo.map(str::to_owned),
+            })
+        };
+        assert_eq!(q("ghcr.io/Owner/Repo"), g("owner", Some("repo")));
+        assert_eq!(q("GHCR.IO/owner/repo"), g("owner", Some("repo")));
+        assert_eq!(q("Ghcr.Io/owner"), g("owner", None));
+        assert_eq!(q("ghcr.io/owner/"), g("owner", None));
+        assert_eq!(q("ghcr.io/"), g("", None));
+        assert_eq!(q("ghcr.io/o/team/app:1.2"), g("o", Some("team/app")));
+        assert_eq!(
+            q(&format!("ghcr.io/o/app@sha256:{}", "0".repeat(64))),
+            g("o", Some("app"))
+        );
+        for plain in [
+            "nginx",
+            "freebsd/runtime",
+            "ghcr.io",
+            "docker.io/library/x",
+            "",
+        ] {
+            assert_eq!(q(plain), None, "{plain}");
+        }
+    }
+
+    #[test]
+    fn the_tag_suggested() {
+        let s =
+            |tags: &[&str]| suggest_tag(&tags.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>());
+        assert_eq!(s(&["1.0", "latest", "2.0"]).as_deref(), Some("latest"));
+        assert_eq!(s(&["1.10.0", "1.2.0", "1.9.9"]).as_deref(), Some("1.10.0"));
+        assert_eq!(s(&["v14.2", "15.1", "edge"]).as_deref(), Some("15.1"));
+        assert_eq!(
+            s(&["edge", "main", "sha256-ab.sig"]).as_deref(),
+            Some("main"),
+            "a signature's tag is not suggested while another is there"
+        );
+        assert_eq!(s(&["sha256-ab.sig"]).as_deref(), Some("sha256-ab.sig"));
+        assert_eq!(s(&[]), None);
+    }
+
+    #[test]
+    fn package_urls_escape_the_owner() {
+        let u = packages_url("https://api.github.com", &["orgs", "a b/c?d"]).unwrap();
+        assert_eq!(
+            u.as_str(),
+            "https://api.github.com/orgs/a%20b%2Fc%3Fd/packages?package_type=container&per_page=100"
+        );
+        let u = packages_url("http://127.0.0.1:1/", &["user"]).unwrap();
+        assert_eq!(
+            u.as_str(),
+            "http://127.0.0.1:1/user/packages?package_type=container&per_page=100"
+        );
+    }
+
+    #[test]
+    fn packages_named_as_ghcr_names_them() {
+        let packages: Vec<GhcrPackage> = serde_json::from_str(
+            r#"[{"name": "Web", "visibility": "public", "owner": {"login": "Team"}},
+                {"name": "db", "visibility": "private", "owner": {"login": "Team"}},
+                {"name": "solo"}]"#,
+        )
+        .unwrap();
+        let hits = ghcr_hits(packages, "WEB", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "ghcr.io/team/web");
+        assert_eq!(
+            hits[0].suggested_tag, "",
+            "no tag claimed when none is known"
+        );
+        let packages: Vec<GhcrPackage> =
+            serde_json::from_str(r#"[{"name": "a"}, {"name": "b"}, {"name": "c"}]"#).unwrap();
+        let hits = ghcr_hits(packages, "", 2);
+        assert_eq!(
+            hits.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(),
+            ["ghcr.io/a", "ghcr.io/b"]
+        );
+    }
+
+    /// Serves `answer` over plain HTTP, keeping each request's path and
+    /// query and its `Authorization`; returns the address.
+    async fn stub(
+        answer: fn(&str) -> (u16, String),
+    ) -> (String, std::sync::Arc<Mutex<Vec<(String, String)>>>) {
+        use http_body_util::Full;
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let kept = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let kept = kept.clone();
+                tokio::spawn(async move {
+                    let svc = hyper::service::service_fn(
+                        move |req: hyper::Request<hyper::body::Incoming>| {
+                            let kept = kept.clone();
+                            async move {
+                                let path = req.uri().to_string();
+                                let auth = req
+                                    .headers()
+                                    .get("authorization")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("")
+                                    .to_owned();
+                                kept.lock().unwrap().push((path.clone(), auth));
+                                let (status, body) = answer(&path);
+                                Ok::<_, std::convert::Infallible>(
+                                    hyper::Response::builder()
+                                        .status(status)
+                                        .header("content-type", "application/json")
+                                        .body(Full::new(bytes::Bytes::from(body)))
+                                        .unwrap(),
+                                )
+                            }
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    fn stubbed(addr: &str) -> Client {
+        let mut c = Client::new().unwrap().plain_http(addr);
+        c.search_at = SearchEndpoints {
+            hub: format!("http://{addr}"),
+            github_api: format!("http://{addr}/api"),
+            ghcr: addr.to_owned(),
+        };
+        c
+    }
+
+    fn github(path: &str) -> (u16, String) {
+        match path.split('?').next().unwrap() {
+            "/v2/owner/app/tags/list" => (
+                200,
+                r#"{"tags": ["1.2.0", "1.10.0", "sha256-x.sig"]}"#.into(),
+            ),
+            "/v2/search/repositories/" => (200, r#"{"results": []}"#.into()),
+            "/api/orgs/team/packages" => (404, "{}".into()),
+            "/api/users/team/packages" | "/api/user/packages" => (
+                200,
+                r#"[{"name": "App", "visibility": "public", "owner": {"login": "Team"}}]"#.into(),
+            ),
+            _ => (404, "{}".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_public_ghcr_repository_is_found_without_a_token() {
+        let (addr, seen) = stub(github).await;
+        let hits = stubbed(&addr)
+            .search_with_ghcr("GHCR.IO/Owner/App:9", 5, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].name, "ghcr.io/owner/app");
+        assert_eq!(hits[0].suggested_tag, "1.10.0");
+        assert_eq!(hits[0].source, "ghcr.io");
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .all(|(p, auth)| !p.starts_with("/api") && auth.is_empty()),
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_an_owner_needs_a_token() {
+        let (addr, seen) = stub(github).await;
+        let c = stubbed(&addr);
+        let e = c
+            .search_with_ghcr("ghcr.io/team", 5, None)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("GitHub token"), "{e}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing asked without a token"
+        );
+
+        let hits = c
+            .search_with_ghcr("ghcr.io/Team", 5, Some("t0ken"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(
+            hits[0].name, "ghcr.io/team/app",
+            "lowercased as ghcr.io names it"
+        );
+        assert_eq!(hits[0].suggested_tag, "");
+        let seen = seen.lock().unwrap();
+        let paths: Vec<&str> = seen
+            .iter()
+            .map(|(p, _)| p.split('?').next().unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            ["/api/orgs/team/packages", "/api/users/team/packages"]
+        );
+        assert!(
+            seen.iter().all(|(_, auth)| auth == "Bearer t0ken"),
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plain_search_asks_ghcr_nothing_without_a_token() {
+        let (addr, seen) = stub(github).await;
+        let c = stubbed(&addr);
+        let hits = c.search_with_ghcr("postgres", 10, None).await.unwrap();
+        assert!(hits.iter().all(|h| h.source != "ghcr.io"), "{hits:?}");
+        let paths: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect();
+        assert!(
+            paths
+                .iter()
+                .all(|p| p.starts_with("/v2/search/repositories/")),
+            "only Docker Hub's search: {paths:?}"
+        );
+        // With a token, the token's own packages too.
+        let hits = c.search_with_ghcr("app", 10, Some("t0ken")).await.unwrap();
+        assert!(
+            hits.iter().any(|h| h.name == "ghcr.io/team/app"),
+            "{hits:?}"
+        );
     }
 
     #[tokio::test]
