@@ -338,11 +338,21 @@ fn pod_on_storage_its_node_provides() {
         legion(&lab, &["status"]).status.success()
     });
     ok(&lab, &["init"]);
-    let nodes: Value = serde_json::from_str(&ok(&lab, &["list", "nodes", "-o", "json"])).unwrap();
-    let node = match &nodes {
-        Value::Array(v) => v[0]["metadata"]["name"].as_str().unwrap().to_owned(),
-        one => one["metadata"]["name"].as_str().unwrap().to_owned(),
-    };
+    // The host's node, once it has registered: `init` returns before it has.
+    let mut node = String::new();
+    wait("this host's node", 120, || {
+        let nodes: Value =
+            serde_json::from_str(&ok(&lab, &["list", "nodes", "-o", "json"])).unwrap();
+        let first = match &nodes {
+            Value::Array(v) => v.first(),
+            one => Some(one),
+        };
+        node = first
+            .and_then(|n| n["metadata"]["name"].as_str())
+            .unwrap_or_default()
+            .to_owned();
+        !node.is_empty()
+    });
     let apply = |replicas: u32| {
         let file = lab.join("app.yaml");
         std::fs::write(&file, provided(&node, replicas, &run)).unwrap();
