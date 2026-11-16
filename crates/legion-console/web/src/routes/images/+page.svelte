@@ -327,13 +327,33 @@
     })
   );
 
+  /** What the last search was for, once it has answered. */
+  let searched = $state('');
+  // Whether the search found a FreeBSD image: if not, the offer to build
+  // one from FreeBSD's packages, which have far more software than any
+  // registry has FreeBSD images of.
+  const freebsdFound = $derived(hits.some((h) => h.os === 'freebsd'));
+  /** A word of a search, as a package name: what pkg(8) would take. */
+  const pkgName = (q: string) => q.trim().toLowerCase().replace(/[^a-z0-9._+-]/g, '');
+  function buildFromPackages(name: string) {
+    pkgFrom = 'containerfile';
+    pkgContainerfile =
+      `FROM ghcr.io/freebsd/freebsd-notoolchain:15.1\n` +
+      `# The package's name as \`pkg search ${name}\` lists it (FreshPorts has them all).\n` +
+      `RUN env ASSUME_ALWAYS_YES=yes pkg install -y ${name} && pkg clean -ay\n` +
+      `CMD ["/bin/sh"]\n`;
+    tab = 'package';
+  }
+
   async function runSearch(e?: Event) {
     e?.preventDefault();
     searching = true;
     error = '';
     try {
-      const r = await api.registrySearch(searchQuery.trim(), 24, workNs, searchSecret);
+      const q = searchQuery.trim();
+      const r = await api.registrySearch(q, 24, workNs, searchSecret);
       hits = r.results;
+      searched = q;
     } catch (err) {
       error = (err as Error).message;
     } finally {
@@ -366,11 +386,11 @@
   // --- Tab 3: Jail Image Packaging & GHCR Push Studio ---
   const TEMPLATES: Record<string, string> = {
     minimal:
-      'FROM ghcr.io/freebsd/freebsd-runtime:14.2\nCOPY --chmod=0755 <<EOF /usr/local/bin/entrypoint.sh\n#!/bin/sh\necho "FreeBSD jail ready"\nsleep 3600\nEOF\nCMD ["/usr/local/bin/entrypoint.sh"]\n',
+      'FROM ghcr.io/freebsd/freebsd-runtime:15.1\nCOPY --chmod=0755 <<EOF /usr/local/bin/entrypoint.sh\n#!/bin/sh\necho "FreeBSD jail ready"\nsleep 3600\nEOF\nCMD ["/usr/local/bin/entrypoint.sh"]\n',
     pkg:
-      'FROM dougrabson/freebsd:14.2\nRUN ASSUME_ALWAYS_YES=yes pkg install -y nginx ca_root_nss\nEXPOSE 80\nCMD ["/usr/local/sbin/nginx", "-g", "daemon off;"]\n',
+      'FROM ghcr.io/freebsd/freebsd-notoolchain:15.1\nRUN env ASSUME_ALWAYS_YES=yes pkg install -y nginx ca_root_nss && pkg clean -ay\nEXPOSE 80\nCMD ["/usr/local/sbin/nginx", "-g", "daemon off;"]\n',
     daemon:
-      'FROM dougrabson/freebsd-minimal:14.2\nWORKDIR /app\nENV APP_ENV=production\nEXPOSE 8080\nCMD ["/bin/sh", "-c", "echo listening on 8080 && sleep 3600"]\n'
+      'FROM ghcr.io/freebsd/freebsd-runtime:15.1\nWORKDIR /app\nENV APP_ENV=production\nEXPOSE 8080\nCMD ["/bin/sh", "-c", "echo listening on 8080 && sleep 3600"]\n'
   };
 
   let pkgFrom: 'containerfile' | 'git' = $state('containerfile');
@@ -534,7 +554,7 @@
         <form class="controls" onsubmit={pullImage}>
           <input
             bind:value={pullRef}
-            placeholder="ghcr.io/freebsd/freebsd-runtime:14.2"
+            placeholder="ghcr.io/freebsd/freebsd-runtime:15.1"
             aria-label={t('Image reference')}
             required
           />
@@ -732,6 +752,28 @@
           {/each}
         </div>
 
+        {#if searched && !searching && !freebsdFound && pkgName(searched) && !searched.startsWith('ghcr.io/')}
+          {@const name = pkgName(searched)}
+          <div class="build-offer" role="status">
+            <p>
+              {hits.length
+                ? t('No FreeBSD image of “{query}” was found: those listed are for Linux, or their OS is not known.', { query: searched })
+                : t('No FreeBSD image of “{query}” was found.', { query: searched })}
+              {t('FreeBSD’s packages have far more software than registries have FreeBSD images of: build an image that installs one.')}
+            </p>
+            <div class="controls">
+              <button type="button" class="sm primary" data-look onclick={() => buildFromPackages(name)}
+                >{t('Build from FreeBSD packages')}</button
+              >
+              <a
+                class="button sm"
+                href="https://www.freshports.org/search.php?query={encodeURIComponent(name)}&search=go&stype=name&method=match"
+                target="_blank"
+                rel="noopener noreferrer">{t('Find the package’s name on FreshPorts')}</a
+              >
+            </div>
+          </div>
+        {/if}
         {#if filteredHits.length}
           <ul class="hit-list" role="list">
             {#each filteredHits as h (h.name)}
@@ -742,11 +784,24 @@
                   <span>
                     <span class="tag"
                       >{h.source === 'freebsd-catalog'
-                        ? t('FreeBSD jail')
+                        ? t('catalog')
                         : h.source === 'ghcr.io'
                           ? 'ghcr.io'
                           : 'Docker Hub'}</span
                     >
+                    {#if h.os === 'freebsd'}
+                      <span class="state good">{t('FreeBSD jail')}</span>
+                    {:else if h.os === 'linux'}
+                      <span class="state wait" title={t('Runs in a jail through the Linux ABI, on nodes started with --linux; not every Linux image works (docs/LINUX.md)')}
+                        >{t('Linux: --linux nodes')}</span
+                      >
+                    {:else if h.source === 'docker-hub'}
+                      <span class="state wait" title={t('Most Docker Hub images are built for Linux: Inspect OCI shows which OS this one is for')}
+                        >{t('likely Linux')}</span
+                      >
+                    {:else}
+                      <span class="state" title={t('Inspect OCI shows which OS it is for')}>{t('OS not known')}</span>
+                    {/if}
                     {#if h.official}<span class="state good">{t('official')}</span>{/if}
                     {#if h.stars > 0}<span class="tag">★ {h.stars}</span>{/if}
                   </span>
@@ -812,7 +867,7 @@
         >
           <input
             bind:value={inspectInput}
-            placeholder="ghcr.io/freebsd/freebsd-runtime:14.2"
+            placeholder="ghcr.io/freebsd/freebsd-runtime:15.1"
             aria-label={t('Image to inspect')}
             required
           />
@@ -841,7 +896,17 @@
             </dd>
             <dt>{t('Workload')}</dt>
             <dd>
-              {inspected.run?.labels?.['legion.vm.image'] === 'true' ? t('bhyve VM') : t('FreeBSD Jail')}
+              {#if inspected.run?.labels?.['legion.vm.image'] === 'true'}
+                {t('bhyve VM')}
+              {:else if inspected.os === 'freebsd'}
+                {t('FreeBSD Jail')}
+              {:else if inspected.os === 'linux'}
+                <span class="state wait">{t('Linux image')}</span>
+                {t('runs in a jail through the Linux ABI, only on nodes started with --linux, and not every Linux image works there')}
+              {:else}
+                <span class="state bad">{t('Not runnable')}</span>
+                {t('built for {os}: Legion runs FreeBSD images, and Linux ones on --linux nodes', { os: inspected.os || t('an OS it does not say') })}
+              {/if}
             </dd>
             <dt>{t('Platforms')}</dt>
             <dd>
@@ -1210,6 +1275,15 @@
 <style>
   .studio-top {
     margin-bottom: 1rem;
+  }
+  .build-offer {
+    border: 1px dashed var(--control);
+    border-radius: 8px;
+    padding: 0.6rem 0.8rem;
+    margin: 0.6rem 0;
+  }
+  .build-offer p {
+    margin: 0 0 0.5rem;
   }
   .hit-list {
     list-style: none;

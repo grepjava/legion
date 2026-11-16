@@ -102,7 +102,7 @@
     } else if (which === 'volume') {
       yaml = `apiVersion: legion/v1\nkind: Volume\nmetadata:\n  name: pgdata\n  namespace: ${ns}\nspec:\n  driver: zfs\n  size: 10Gi\n`;
     } else {
-      yaml = `apiVersion: legion/v1\nkind: Build\nmetadata:\n  name: custom-jail-1\n  namespace: ${ns}\nspec:\n  image: ghcr.io/your-org/jail-app:v1\n  source:\n    containerfile: |\n      FROM ghcr.io/freebsd/freebsd-runtime:14.2\n      CMD ["/bin/sh", "-c", "sleep 3600"]\n`;
+      yaml = `apiVersion: legion/v1\nkind: Build\nmetadata:\n  name: custom-jail-1\n  namespace: ${ns}\nspec:\n  image: ghcr.io/your-org/jail-app:v1\n  source:\n    containerfile: |\n      FROM ghcr.io/freebsd/freebsd-runtime:15.1\n      CMD ["/bin/sh", "-c", "sleep 3600"]\n`;
     }
   }
 

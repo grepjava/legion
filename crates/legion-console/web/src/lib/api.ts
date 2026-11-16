@@ -372,6 +372,8 @@ export interface RegistrySearchHit {
   official: boolean;
   source: string;
   suggested_tag: string;
+  /** `freebsd`, `linux`, or empty when the search does not know. */
+  os: string;
 }
 
 export interface RegistryImageInspect {
