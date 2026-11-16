@@ -5,6 +5,7 @@
   // packet filter rules.
   import { api, follow, type Balancer, type LObject, type ReachEdge } from '#lib/api.ts';
   import { t } from '#lib/i18n.svelte.ts';
+  import { logoFor } from '#lib/logos.ts';
   import { namespaces, session } from '#lib/session.svelte.ts';
 
   const mine = $derived(namespaces([]));
@@ -655,6 +656,7 @@
             {@const h = health(s)}
             {@const vm = isVmSvc(s)}
             {@const db = isDbSvc(s)}
+            {@const logo = logoFor(`${s.metadata.name} ${s.spec?.pod?.containers?.[0]?.image ?? ''}`)}
             {@const pList = svcPorts(s)}
             <a
               href={link('Service', s.metadata.name)}
@@ -675,6 +677,13 @@
                 <rect x={X_SVC_CX - 10} y={cy - 9} width="20" height="14" rx="2" class="icon-stroke" />
                 <line x1={X_SVC_CX - 5} y1={cy + 9} x2={X_SVC_CX + 5} y2={cy + 9} class="icon-stroke" />
                 <line x1={X_SVC_CX} y1={cy + 5} x2={X_SVC_CX} y2={cy + 9} class="icon-stroke" />
+              {:else if logo}
+                <!-- What it runs, by its product's mark. -->
+                <path
+                  class="logo"
+                  d={logo.path}
+                  transform="translate({X_SVC_CX - 11} {cy - 11}) scale({22 / 24})"
+                ><title>{logo.title}</title></path>
               {:else if db}
                 <!-- Database cylinder icon -->
                 <ellipse cx={X_SVC_CX} cy={cy - 7} rx="9" ry="3.5" class="icon-stroke" />
@@ -912,6 +921,9 @@
     stroke-width: 1.5;
     stroke-linecap: round;
     stroke-linejoin: round;
+  }
+  .logo {
+    fill: var(--text);
   }
   .badge-pill {
     fill: var(--surface2);
