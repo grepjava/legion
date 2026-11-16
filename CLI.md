@@ -1,6 +1,6 @@
 # Legion CLI Reference
 
-`legion` is the single binary for the Legion daemon, cluster CLI, OCI image builder (`legion build`), and standalone local jail/VM runner (`legion local`, also invokable via a `jailer` symlink).
+`legion` is the single binary for the Legion daemon, cluster CLI, OCI image builder (`legion build`), and standalone local jail/VM runner (`legion local`).
 
 ## Global Options
 
@@ -24,7 +24,8 @@ Run the node daemon (manager and, on FreeBSD, worker agent). Key flags:
 - `--manager <HOST:PORT>` (repeatable), `--insecure-registry <HOST[:PORT]>` (repeatable)
 - `--metrics-listen <ADDR>`, `--console-listen <ADDR>`, `--console-cert <PEM>`, `--console-key <PEM>`
 - `--ingress-listen <ADDR>`, `--ingress-tls-listen <ADDR>`
-- `--jailer <BIN>` (defaults to `<current_exe> local`), `--jailer-arg <ARG>`
+- `--builder <BIN>` (default: this binary, as `legion local`), `--builder-arg <ARG>` (repeatable): what a builder node runs Builds with
+- `--iscsi-targets <FILE>`, `--iscsi-portal-group <NAME>` (default `legion`), `--iscsi-portal <HOST[:PORT]>`: iSCSI Volumes this node provides
 
 ### `legion init`
 Initialize a new cluster with the reached manager as its first member.
@@ -32,7 +33,7 @@ Initialize a new cluster with the reached manager as its first member.
 ### `legion join-token <manager|worker> [--rotate]`
 Print (or rotate) the join token for a manager or worker node.
 
-### `legion join <TOKEN> <MANAGER> [OPTIONS]`
+### `legion join <TOKEN> --manager <HOST:PORT> [OPTIONS]`
 Join an existing cluster before starting the daemon (`--data-dir`, `--advertise`, `--node-name`).
 
 ### `legion status`
@@ -47,7 +48,7 @@ Run `doctor` checks across all cluster nodes (or a single `--node`). Cluster adm
 ### `legion support-bundle [-o <FILE>]`
 Export a masked cluster diagnostics bundle (objects without Secrets, masked env values, alerts, recent events, node diagnoses). Cluster admin only.
 
-### `legion backup <FILE>` / `legion restore [FILE]`
+### `legion backup -o <FILE>` / `legion restore [FILE]`
 Save a consistent snapshot of all cluster objects, or restore a stopped manager's store from a backup (or from its own store when other managers are lost).
 
 ### `legion autolock <enable|disable|rotate|show>`
@@ -65,7 +66,7 @@ Rotate the cluster CA across all managers and nodes, or inspect CA rotation stat
 Generate a client certificate PEM for a user and optionally create a `RoleBinding`.
 
 ### `legion node <SUBCOMMAND>`
-- `drain <NODE>`, `pause <NODE>`, `activate <NODE>`
+- `drain <NODE> [--wait [--timeout <SECONDS>] [-o <table|json>]]`, `pause <NODE>`, `activate <NODE>`
 - `promote <NODE>`, `demote <NODE>`
 - `label <NODE> <key=value|key->...`
 - `require <NODE> [CHECK...]` (gate new tasks on `doctor` advised checks)
@@ -89,11 +90,11 @@ List objects of a kind.
 ### `legion delete <KIND> <NAME> [-n <NS>]`
 Delete an object.
 
-### `legion watch [KIND] [-n <NS>]`
-Stream live `PUT`/`DELETE` object events.
+### `legion watch [KIND] [--from <VERSION>]`
+Stream live `PUT`/`DELETE` object events, from now on or after a version.
 
 ### `legion stack <SUBCOMMAND>`
-- `deploy <STACK> -c <COMPOSE_FILE> [-n <NS>]`
+- `deploy <STACK> -c <COMPOSE_FILE> [-n <NS>] [--prune]`
 - `convert -c <COMPOSE_FILE>` (print Legion YAML)
 - `ls [-n <NS>]`, `stop <STACK>`, `start <STACK>`, `rm <STACK>` (keeps Volumes)
 
@@ -110,7 +111,7 @@ Trigger a CronJob immediately outside its schedule.
 
 ## Observability, Storage, Network & Sessions
 
-- `legion top [--once]`: Live terminal dashboard (nodes, workloads, tasks, resource graphs, logs, shell, alerts).
+- `legion top [-n <NS>] [--once]`: Live terminal dashboard (nodes, workloads, tasks, resource graphs, logs, shell, alerts).
 - `legion logs <TASK|SERVICE> [-c <CONTAINER>] [-f] [--tail <N>]`
 - `legion build-logs <BUILD> [-n <NS>] [-f]`
 - `legion logs-search <SERVICE|JOB> [--since <DUR>] [--until <DUR>] [TEXT]`
@@ -118,7 +119,7 @@ Trigger a CronJob immediately outside its schedule.
 - `legion files <TASK|SERVICE> [PATH]` / `legion cp <SRC> <DEST>`
 - `legion port-forward <TASK|SERVICE> <[LOCAL:]REMOTE>...`
 - `legion events [KIND/NAME] [-n <NS>] [-w]`
-- `legion alerts [--watch]`
+- `legion alerts [-n <NS>] [-w] [-o <table|yaml|json>]`
 - `legion usage [-n <NS>] [-o <table|yaml|json>]`
 - `legion quota [-n <NS>]`
 - `legion audit [FILTERS]` (cluster admin only)
@@ -130,16 +131,17 @@ Trigger a CronJob immediately outside its schedule.
 
 ## Cluster Image Commands (`legion image`)
 
-- `legion image load <FILE> [--zfs-root <DATASET> | --node <NODE>]`
-- `legion image ls [--node <NODE>]`
-- `legion image pull <REF> [--node <NODE>]`
-- `legion image push <REF> --node <NODE> <TARGET>`
+- `legion image load <FILE> [--name <NAME>] [--zfs-root <DATASET> [--data-dir <DIR>] | --node <NODE>]`
+- `legion image ls [--node <NODE>] [-o <table|yaml|json>]`
+- `legion image pull <REF> [--node <NODE>] [-n <NS> --secret <SECRET>]`
+- `legion image push <REF> <TARGET> --node <NODE> [-n <NS> --secret <SECRET>]`
 - `legion image rm <REF> [--node <NODE>]`
 - `legion image prune [--node <NODE>] [--builds]`
-- `legion image scan <REF> --node <NODE>` (FreeBSD `pkg audit` vulnerability check)
-- `legion image export <REF> --node <NODE> <FILE>`
-- `legion image search <QUERY>`
-- `legion image sbom <REF>` / `legion image inspect <REF>`
+- `legion image scan <REF> --node <NODE> [--json]` (FreeBSD `pkg audit` vulnerability check)
+- `legion image export <REF> --node <NODE> -o <FILE> [--tag <NAME>]`
+- `legion image search [QUERY] [--limit <N>] [-n <NS> --secret <SECRET>]`: the FreeBSD catalog and Docker Hub. `ghcr.io/OWNER/REPO` is read from ghcr.io anonymously. With `--secret` (a Secret in the namespace holding a Docker config with a ghcr.io login, a token with `read:packages`), GitHub container packages are listed too: the token's own, or `ghcr.io/OWNER`'s. Only the first 100 packages or tags are read.
+- `legion image sbom <REF> [-n <NS> --secret <SECRET>] [--json]`
+- `legion image inspect <REF> [--node <NODE>] [-n <NS> --secret <SECRET>]`
 
 ---
 
@@ -161,13 +163,13 @@ Packages a `bhyve` VM disk image as `/disk.img` inside a Legion OCI image:
 - `--disk <PATH>`: Package an existing raw disk image as `/disk.img`
 - `--rootfs <DIR>` + optional `--size <SIZE>`: Create UFS `/disk.img` from a FreeBSD rootfs via `makefs`
 - `--compression <gzip|zstd>`, `--label <KEY=VALUE>`, `--annotation <KEY=VALUE>`, `--timestamp <SECONDS>`
-- Global store flags: `--state-dir <DIR>`, `--zfs-root <DATASET>`, `--no-zfs`
+- Store flags, before `vm` or after it: `--state-dir <DIR>`, `--zfs-root <DATASET>`, `--no-zfs`. A jail build's own flags go without `vm`.
 
 ---
 
-## Local Standalone Mode (`legion local`, alias `jailer`)
+## Local Standalone Mode (`legion local`)
 
-All standalone local image, build, signing, and container commands live under `legion local` (also reachable as `legion jailer` or by invoking a `jailer` symlink to `legion`):
+All standalone local image, build, signing, and container commands live under `legion local`. It was the separate tool jailer, merged into Legion:
 
 | Command | Purpose |
 |---|---|
@@ -180,4 +182,16 @@ All standalone local image, build, signing, and container commands live under `l
 | `sign`, `verify`, `attest`, `sbom`, `key` | Cosign-compatible image signing, SLSA/SPDX attestations, and key generation |
 | `check`, `doctor`, `login` | Compatibility checks, local host readiness, and registry login |
 
-Local global options: `--state-dir <DIR>` (`JAILER_STATE_DIR`), `--zfs-root <DATASET>` (`JAILER_ZFS_ROOT`), `--no-zfs` (`JAILER_NO_ZFS`), `--pod-subnet <CIDR>` (`JAILER_POD_SUBNET`), `--plain-http <HOST[:PORT]>`.
+Local global options: `--state-dir <DIR>` (`LEGION_LOCAL_STATE_DIR`; default `/var/db/legion-local` for root, `~/.local/share/legion-local` otherwise), `--zfs-root <DATASET>` (`LEGION_LOCAL_ZFS_ROOT`; default `zroot/legion-local` for root when `zroot` exists), `--no-zfs` (`LEGION_LOCAL_NO_ZFS`), `--pod-subnet <CIDR>` (`LEGION_LOCAL_POD_SUBNET`; default `10.77.0.0/16`), `--plain-http <HOST[:PORT]>`.
+
+Pods (`run --vnet`, `-p`) are on the bridge `legionlocal0`; their ports are pf rules in anchors under `legion-local/`, which `/etc/pf.conf` must call before its filter rules:
+
+```
+nat-anchor "legion-local/*"
+rdr-anchor "legion-local/*"
+anchor "legion-local/*"
+```
+
+`publish --remote-legion <PATH>` names the legion on the build hosts (default `legion`).
+
+jailer's state moves on its own: with neither `--state-dir` nor `--zfs-root` given, the first `legion local` command moves `/var/db/jailer` (or `~/.local/share/jailer`) and `zroot/jailer` to the new defaults, unless the old state still holds containers; remove those first, or keep using it with `--state-dir`.

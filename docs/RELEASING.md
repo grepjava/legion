@@ -14,7 +14,6 @@ release rather than assume it. Replace `X.Y.Z` throughout.
 | 6. Build the tarballs | required | `packaging/freebsd/release.sh`, started by hand on each architecture |
 | 7. Write the notes | required | manual |
 | 8. Publish | required | manual |
-| 9. Tell jailer | required | manual |
 
 CI runs the unit tests on Linux, and on FreeBSD 15.1 amd64 and emulated arm64,
 for every push. It runs none of the privileged tests, so a green CI is not a
@@ -46,8 +45,8 @@ scripts/qualify --manifest scripts/legion.qualify --profile shared \
 
 That `shared` profile is safe on a host that does other work; `isolated` and
 `cluster` publish ports or need several hosts, and each profile includes those
-before it. `scripts/lab` gives disposable FreeBSD VMs for them, shared with
-jailer, and one run covers everything:
+before it. `scripts/lab` gives disposable FreeBSD VMs for them, and one run covers
+everything:
 
 ```sh
 scripts/lab run --manifest scripts/legion.qualify --profile cluster \
@@ -57,7 +56,7 @@ scripts/lab run --manifest scripts/legion.qualify --profile cluster \
 
 It resets the VMs, sets up the servers the tests need, runs the commit at HEAD
 and brings the record back. IMAGE is `crates/legion/tests/stateful/Containerfile`
-built and exported by jailer. A record's `vm` field says the host was a VM, and
+built with `legion build` and exported with `legion local export`. A record's `vm` field says the host was a VM, and
 `image` which base.
 
 Keep each run's `result.json`. A release is ready when every test in the
@@ -77,9 +76,6 @@ A change after the run needs a new run. So does a run on a tree whose
 git tag -a vX.Y.Z -m "Legion X.Y.Z"
 git push origin vX.Y.Z
 ```
-
-jailer depends on Legion's crates by tag, so a tag is a release to it even
-before the tarballs exist.
 
 ## 4. Update the port's `distinfo`
 
@@ -130,9 +126,3 @@ gh release create vX.Y.Z --repo grepjava/legion --verify-tag --latest \
 ```
 
 Download the published tarball and check it against its `.sha256`.
-
-## 9. Tell jailer
-
-jailer pins Legion's crates by tag. Tell its maintainers what changed in the
-crates it uses, above all a change of behaviour, so that it moves to the tag
-knowingly.

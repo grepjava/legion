@@ -1,9 +1,8 @@
 # Examples
 
 FreeBSD applications on Legion, each a compose file and the Containerfile
-of its image, built from FreeBSD's packages with
-[jailer](https://github.com/grepjava/jailer). The qualification runs every
-one of them on three nodes as written here
+of its image, built from FreeBSD's packages with `legion build`. The
+qualification runs every one of them on three nodes as written here
 (`the_examples_run_as_their_readmes_say` in
 `crates/legion/tests/examples.rs`).
 
@@ -11,8 +10,8 @@ To try one, build its image, load it on every node (or push it to a
 registry and set `IMAGE`), and deploy it:
 
 ```sh
-jailer build -t examples/nginx:1 examples/static-site
-jailer export examples/nginx:1 /var/tmp/nginx.oci.tar
+legion build -t examples/nginx:1 examples/static-site
+legion local export examples/nginx:1 /var/tmp/nginx.oci.tar
 legion image load /var/tmp/nginx.oci.tar     # on each node
 legion stack deploy site -c examples/static-site/compose.yaml
 ```

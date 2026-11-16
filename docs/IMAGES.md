@@ -1,10 +1,10 @@
 # Images for Legion
 
 Legion runs containers from OCI images, the same format Docker and
-Kubernetes use, but it does not build them. You build images with
-[jailer](https://github.com/grepjava/jailer), made for Legion, or with
-the usual tools, push them to a registry or copy them to the nodes, and
-Legion pulls or loads them. This guide covers where to get FreeBSD
+Kubernetes use. You build images with `legion build` (part of `legion
+local`, which was the separate tool jailer), or with the usual tools,
+push them to a registry or copy them to the nodes, and Legion pulls or
+loads them. This guide covers where to get FreeBSD
 images, how to build your own, how to get them onto a cluster, and what
 to expect from Linux images.
 
@@ -36,22 +36,14 @@ release may not run on an older kernel.
 
 ## Building a FreeBSD image
 
-Build with jailer, on a FreeBSD machine. It needs nothing but the base
-system: no buildah, Podman or Docker. Building does not need a Legion
-node, and is best done on a build machine or in CI rather than on a
-node. Install it from its release (FreeBSD 15; for arm64, aarch64 in place of amd64):
+Build with `legion build`, on a FreeBSD machine with Legion installed.
+It needs nothing but the base system: no buildah, Podman or Docker.
+Building does not need a running Legion node, and is best done on a
+build machine or in CI rather than on a node. The rest of the local
+tools are under `legion local` (`legion local build` is the same as
+`legion build`); `legion build vm` builds a VM image.
 
-```sh
-fetch https://github.com/grepjava/jailer/releases/download/v0.5.0/jailer-0.5.0-freebsd15-amd64.tar.gz
-tar xzf jailer-0.5.0-freebsd15-amd64.tar.gz
-doas install -s jailer-0.5.0-freebsd15-amd64/bin/jailer /usr/local/bin/
-doas install -m 444 jailer-0.5.0-freebsd15-amd64/man/man1/jailer.1 /usr/local/share/man/man1/
-```
-
-or, on another architecture, with Rust's cargo (`pkg install rust`):
-`cargo install --git https://github.com/grepjava/jailer --tag v0.5.0`.
-
-A Containerfile is written as for Docker (`jailer init` writes one for a
+A Containerfile is written as for Docker (`legion local init` writes one for a
 Rust, Go, Node, Python or C project, or one that installs packages).
 This one, from Legion's stateful-service test
 (`crates/legion/tests/stateful/Containerfile`), installs PostgreSQL and
@@ -70,22 +62,44 @@ USER postgres
 Build it and try it, as root, since `RUN` steps and test runs are jails:
 
 ```sh
-doas jailer build --strict -t pg:17 .
-doas jailer run pg:17               # in a jail set up as Legion sets one up
+doas legion build --strict -t pg:17 .
+doas legion local run pg:17         # in a jail set up as Legion sets one up
 ```
 
-jailer checks the image against what Legion runs: that the `USER` is in
+The build checks the image against what Legion runs: that the `USER` is in
 the image's `/etc/passwd`, that the entrypoint exists and is executable,
 and that the stop signal is one Legion knows. It warns about `pkg`
 caches left in the image and Containerfile settings Legion ignores.
-`--strict` fails the build when a check fails; `jailer check` runs the
+`--strict` fails the build when a check fails; `legion local check` runs the
 checks alone, on a Containerfile or an image. A rebuild reuses the `RUN`
 steps whose inputs did not change.
+
+`legion local` keeps its images and containers apart from a node's: in
+`/var/db/legion-local` as root (`~/.local/share/legion-local` otherwise)
+and, with ZFS, under `zroot/legion-local` (`--state-dir`, `--zfs-root`
+and `--no-zfs`, or `LEGION_LOCAL_STATE_DIR`, `LEGION_LOCAL_ZFS_ROOT` and
+`LEGION_LOCAL_NO_ZFS`, choose otherwise). `--vnet` puts a container on
+its own bridge, `legionlocal0` on 10.77.0.0/16 (`--pod-subnet`), and `-p`
+publishes its ports through pf, which needs `/etc/pf.conf` to call its
+anchors:
+
+```
+nat-anchor "legion-local/*"
+rdr-anchor "legion-local/*"
+anchor "legion-local/*"
+```
+
+A host that ran jailer, which `legion local` was before it was merged
+into Legion, has its state moved from `/var/db/jailer` (or
+`~/.local/share/jailer`) and `zroot/jailer` on first use, when no
+`--state-dir` or `--zfs-root` is given. While jailer's state still holds
+containers it is left alone: remove them with jailer, or keep using it
+with `--state-dir`.
 
 ### With buildah or Podman
 
 They build the same Containerfiles (`pkg install buildah` or
-`pkg install podman`), without jailer's checks:
+`pkg install podman`), without Legion's checks:
 
 ```sh
 podman build --network host -t registry.example/shop/pg:17 .
@@ -112,9 +126,11 @@ Some tips:
 
 Legion runs on amd64 and aarch64 nodes, and picks the entry for its own
 architecture from an image index. Build the image on (or for) each
-architecture and publish both under one name. jailer publishes one
-architecture per name; for an index use `buildah manifest create` and
-`buildah manifest push --all`. A single-architecture image runs only on
+architecture and publish both under one name: `legion local publish`
+builds on a host for each architecture and pushes one index of them, and
+`legion local manifest push` makes an index of images already built
+([RELEASE-RECORD.md](RELEASE-RECORD.md)). With buildah, use `buildah
+manifest create` and `buildah manifest push --all`. A single-architecture image runs only on
 nodes of that architecture.
 
 ## Getting an image to the cluster
@@ -126,8 +142,8 @@ Docker Hub, GitHub's or GitLab's container registry, Harbor, a cloud
 provider's registry, or one you run yourself.
 
 ```sh
-doas jailer login -u ci -p "$TOKEN" registry.example
-doas jailer push pg:17 registry.example/shop/pg:17
+doas legion local login -u ci -p "$TOKEN" registry.example
+doas legion local push pg:17 registry.example/shop/pg:17
 ```
 
 (Or `podman push`, for an image Podman built.)
@@ -215,7 +231,7 @@ Save the image as an OCI archive and load it on each node that may run
 it, as root:
 
 ```sh
-doas jailer export localhost/pg:17 pg.tar          # on the build machine
+doas legion local export localhost/pg:17 pg.tar    # on the build machine
 legion image load pg.tar --zfs-root zroot/legion   # on a node: the daemon's --zfs-root
 ```
 

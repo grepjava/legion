@@ -1263,14 +1263,14 @@ says why that went and what was kept of it.
   `status.images.warning` says what was found. A changed policy applies
   from the next resolution (an update, a new pod, a rollback) and stops
   nothing running. Images no policy covers run as before. The code
-  making and checking signatures is `legion_image::cosign`, which jailer
-  signs with. Not covered: cosign v3 bundles (OCI 1.1 referrers), the
+  making and checking signatures is `legion_image::cosign`, which `legion
+  local` signs with. Not covered: cosign v3 bundles (OCI 1.1 referrers), the
   transparency log, keyless signing and cosign's encrypted private keys.
 - **Attestations** (SBOM and provenance): a policy's `attestations` name
   predicate types an image must also carry, by cosign's names
   (`slsaprovenance1`, `slsaprovenance`, `spdxjson`, `cyclonedx`, `vuln`)
   or a URI, kept as URIs. Once its signature is good, each is looked for
-  as cosign and jailer keep them (`cosign attest`, `jailer attest`): a
+  as cosign and Legion keep them (`cosign attest`, `legion local attest`): a
   DSSE envelope of an in-toto statement (v1, or v0.1), a layer of
   `<repo>:sha256-<hex>.att`, signed with ECDSA P-256 over DSSE's
   pre-authentication encoding by one of the policy's keys, its subject
@@ -1282,9 +1282,9 @@ says why that went and what was kept of it.
   lists an image's attestations, each with the covering policies' key
   that signed it or why none did, and `legion image sbom` an SBOM's
   packages (SPDX's or CycloneDX's), as the console's image details do.
-  Making them is jailer's: a Build with `signingKeySecret` (a Secret
-  holding the private key, as `jailer key generate` writes it) runs
-  `jailer push --sign-key` and `jailer attest` for SLSA provenance v1, of
+  Making them is `legion local`'s: a Build with `signingKeySecret` (a Secret
+  holding the private key, as `legion local key generate` writes it) runs
+  `legion local push --sign-key` and `legion local attest` for SLSA provenance v1, of
   its release record, and an SPDX SBOM of the image's packages; its
   status says `attested`. Reading and checking them is
   `legion_image::attest`. An SBOM is not checked against the image's
@@ -1313,7 +1313,7 @@ says why that went and what was kept of it.
   nothing uses. A task that has just found an image therefore keeps it
   while it makes its containers. A layer a container was
   cloned from cannot be destroyed, so it stays until that container goes.
-- **Building hosts**: jailer, which builds, tries and publishes images,
+- **Building hosts**: `legion local`, which builds, tries and publishes images,
   uses the same crate (`legion-image`), so what it pulls, stores and
   checks is what a node does. A build host's store may also keep its
   layers as directories (`<dir>/layers/<chain id>`, a full copy each) where
@@ -1487,7 +1487,9 @@ terminal), and `run_step`, a build's `RUN` step: a jail on a plain
 directory that may change file flags and has no securelevel, on the
 host's network or a VNET of its own, with nullfs and tmpfs mounts and
 the host's resolver lent when the image has none; what it made for
-those goes afterwards, so it stays out of the layer.
+those goes afterwards, so it stays out of the layer. On 2026-11-16 jailer
+was merged into Legion as `legion local` (and `legion build`), so this
+sharing is now within one program.
 
 ### 6.6 Linux images (phase 5)
 
@@ -1520,8 +1522,8 @@ no FreeBSD build, through FreeBSD's Linux ABI (linux(4)):
   programs always say FreeBSD, so it reaches only unbranded ones. A host
   that chose another value keeps it, the daemon warns that static Linux
   programs won't run, and `legion doctor` says so (`linux.static`). The
-  step is `legion_jail::enable_linux`, which jailer's `run --linux` can
-  share.
+  step is `legion_jail::enable_linux`, which `legion local run --linux`
+  also calls.
 - The supervisor reads the container's user from the image's
   `/etc/passwd` and `/etc/group` as text, for every image: Linux images
   have no `pwd.db`, and FreeBSD images keep the text files beside it.

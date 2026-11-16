@@ -3,6 +3,10 @@
 Updated: 9 November 2026. Baseline: v0.1.15. Turns [ROADMAP.MD](ROADMAP.MD)
 into an order of work; what each milestone means stays there.
 
+jailer, the companion builder named throughout, was merged into Legion on
+16 November 2026 as `legion local` (and `legion build`); this plan keeps
+the names of its time.
+
 The order: make test results trustworthy first, then settle what happens
 when a cluster splits, then build the features that depend on those
 answers. Each phase ends in a tagged release with recorded evidence.
@@ -382,7 +386,8 @@ Compose support matrices, and measured resource-limit behaviour.
 
 Built, agreed with jailer: one chain in Legion's handoff test, jailer
 adding no test of its own for it
-(`a_jailer_image_goes_from_build_to_recovery`). jailer builds a writer,
+(`a_jailer_image_goes_from_build_to_recovery`, now
+`a_local_image_goes_from_build_to_recovery`). jailer builds a writer,
 signs it with a key it made and pushes it; Legion runs it under an
 ImagePolicy enforcing that key, drains its node, moves it back with the
 move's last part cut short, backs its Volume up, loses the host and

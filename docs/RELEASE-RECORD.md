@@ -1,0 +1,205 @@
+# Release records
+
+A release record is a JSON file that follows one image from its build to where
+it was published. It says exactly what to deploy, and lets a later step prove it
+is handling that same image.
+
+```sh
+legion build -t app:1 --record release.json .
+legion local push --record release.json --sign-key cosign.key app:1 ghcr.io/me/app:1
+legion local verify --record release.json --key cosign.pub ghcr.io/me/app:1
+legion local export --record release.json app:1 app.tar
+```
+
+Deploy the `pinned` reference from `published`, which names a digest. A tag can
+move later, and `pinned` cannot.
+
+`--record` also works with `manifest push`, `sign` and `attest`. A `build` starts a new
+record. The other commands add to the file, and start one if it is not there,
+without a build's `source` and `bases`. `--backend buildah` has no record.
+
+## Several platforms
+
+`legion local publish` builds natively on a host for each platform and pushes one
+index of them:
+
+```sh
+legion local publish --host freebsd/amd64=me@amd64-host --host freebsd/arm64=me@arm64-host \
+    --record release.json --sign-key cosign.key ghcr.io/me/app:1 .
+```
+
+Each host needs Legion (`legion`, or what `--remote-legion` names), `tar`, and its
+own login to the registry: no credentials are sent to it. `publish` sends the same context to every host, as a
+build sees it, and they build at once. Each host pushes to a staging tag of its
+own, `app:1-freebsd-arm64` here, and removes its working directory however it
+ends.
+
+The index goes to `app:1` only when every host has finished, each built the
+platform it was named for, and all had the same Containerfile and context. If
+not, the command fails naming the hosts, and `app:1` stays as it was. Staging tags
+already pushed stay in the registry, and the next `publish` replaces them.
+Stopping `publish` drops the ssh connections: a host may finish its step, but
+nothing is published.
+
+The record has `builds`, each platform's image and bases, in place of `image`,
+and `published` has the index with its `platforms`. `legion local manifest push` and
+per-host builds still work as before. It has been tested through a stand-in for ssh on one
+host, not yet across two real architectures: see `ROADMAP.MD`.
+
+## A record cannot mix images
+
+- `push` and `export` refuse an image other than the record's. `push` checks
+  before it sends anything, so a refused push leaves the registry as it was.
+- `verify` and `sign` refuse a digest the record does not name. If a tag has
+  moved to another image, even one signed by the same key, `verify --record`
+  fails and the record is left as it was.
+- `manifest push` refuses an index without the record's image. It can only tell
+  once the index is pushed: the index stays in the registry, and is not recorded.
+
+## Fields
+
+| Field | Meaning |
+|---|---|
+| `schema` | The format's version, now 1. Legion refuses a newer one. |
+| `builder` | The Legion that last wrote the record, as `legion 0.1.19`. |
+| `image.config` | The digest of the image's config, which is also its image ID. |
+| `image.manifest` | The digest of its manifest, which a registry and Legion go by. |
+| `image.platform` | `os/architecture`. |
+| `source.containerfile` | The digest of the Containerfile. |
+| `source.context` | One digest over the files a build can see: paths, kinds, modes and contents. Ignored files, times and owners do not count. |
+| `bases` | Each image built from or copied from: `reference` as named, with its `config` and `manifest` as resolved. |
+| `builds` | From `publish`: for each platform, its `image`, `bases`, and `builder`. |
+| `published` | Each push: `reference` as pushed, `digest`, `pinned`, and `signature`, where the signature is, if it was signed. |
+| `published[].platforms` | For an index: each platform's manifest digest. `digest` is then the index's. |
+| `verified` | Each good signature check: `digest`, `reference`, and `key`, the digest of the public key's file. |
+| `attestations` | Each attestation pushed: `digest`, `predicateType`, and `reference`, where it is. |
+| `archives` | Each export: `file`, its `sha256`, and the `manifest` inside. |
+
+These are three different digests: an image's config, its manifest, and an index
+holding that manifest. A multi-architecture release records the index and which
+manifest each platform gets.
+
+A record holds digests and names only. Secrets, build arguments and credentials
+stay out of it. A base's `reference` is written as the Containerfile gives it.
+
+## Attestations
+
+```sh
+legion local attest --key cosign.key --type provenance --record release.json ghcr.io/me/app@sha256:...
+legion local attest --key cosign.key --type sbom --image app:1 --record release.json ghcr.io/me/app@sha256:...
+legion local verify --key cosign.pub --type provenance ghcr.io/me/app@sha256:...
+```
+
+An attestation is an in-toto statement in a DSSE envelope, signed with the same
+keys as a signature and kept as cosign keeps them, at the tag `sha256-<hex>.att`.
+`legion local verify --type` prints the predicate if it is good. Tested with cosign
+3.1.4, which reads both kinds with `verify-attestation --type slsaprovenance1` or
+`--type spdxjson` and `--insecure-ignore-tlog`, as no transparency log entry is
+made. There is no keyless signing.
+
+- `--type provenance` is SLSA provenance v1, from the record: the digests of the
+  Containerfile and the context, and each base as resolved. Build arguments are
+  left out, as they may hold what is not to be published, so provenance does not
+  tell two builds apart that differ only there.
+- `--type sbom` is an SPDX 2.3 document, also printed by `legion local sbom`. It needs
+  the local image with the same manifest digest, and `pkg(8)` on the host.
+
+An SBOM lists only packages registered with `pkg(8)`. Files put in the image any
+other way, such as by `COPY` or a build from source, are not in it, and the
+document says so. An image with no package database gets a document saying it is
+not an inventory, not an empty list that reads as complete.
+
+## Deploying with Legion
+
+Legion resolves a tag when a Service or Job is deployed: its leading manager asks
+the registry once what the tag names, and every task of that deployment runs that
+digest, on whichever node it lands. This is in Legion from v0.1.14. The digest
+is the same one a push records as `published[].digest`, the index's for an image
+of several platforms, so a record can be checked against what Legion deployed:
+
+- The Service's or Job's `status.images.resolved` maps each reference as written
+  to `registry/repo@sha256:...`, which matches the record's `pinned`. These pins
+  apply when `status.images.pod` names the pod as it now is and there is no
+  `status.images.message`, which says why they are not resolved yet.
+- Each task's `status.images` maps each container's image, as the pod names it, to
+  the `sha256:...` digest of the manifest its node ran. For an index, that is the
+  one for the node's platform, which `published[].platforms` maps to that same
+  digest.
+
+A tag moved after the deployment changes nothing until the Service is deployed
+again. Scaling is not a deployment, and a rollback runs the digests the earlier
+tasks ran. A reference by digest, such as `pinned`, a `localhost/` name, and an
+image under `pullPolicy: never` are not resolved: they run as written, and are
+not in `resolved`.
+
+Legion pins only when the cluster has nodes and every one runs a version that
+reads pins. Until then, a deployment by tag runs whatever each node pulls by that
+name. Deploy `pinned` to get the recorded image whichever version the nodes run.
+
+### Signatures Legion checks
+
+From Legion v0.1.17, an `ImagePolicy` makes a good signature a condition of
+running: an image whose repository its `spec.images` patterns name runs only if
+it is signed by one of its `spec.keys`, the public keys `legion local key generate`
+writes. Legion checks the digest it resolved, the one `push`, `publish` and
+`manifest push` sign with `--sign-key` and record in `published[].digest`, so
+signing an index once covers every platform in it. `legion local` and the nodes make and
+check these signatures with the same code, Legion's `legion_image::cosign`.
+
+- `status.images.verified` maps each image a policy covers to the digest checked
+  and the key that signed it, as `sha256:...` of the key. `legion local key generate`
+  and `legion local verify` print the same fingerprint.
+- An unsigned image, one signed by another key, or one whose signature the
+  registry cannot give holds the deployment, and `status.images.message` says
+  which. The old tasks run on, and Legion tries again every 30 seconds, so
+  `legion local sign` after the deployment lets it go ahead.
+- A signature names the repository it was made in: an image copied to another
+  repository, as a mirror would, fails the check until it is signed there.
+- An archive loaded as `localhost/...` has no registry to keep a signature, so a
+  policy naming it refuses it. Load it under a registry's name and deploy it by
+  digest with `pullPolicy: never`: Legion then asks the registry only for the
+  signature.
+
+Under `mode: warn` the image runs, and `status.images.warning` says what failed.
+
+Every image a policy covers waits for that check before any task of it starts,
+whether it is named by tag, by digest or under `pullPolicy: never`. While a
+node of the cluster runs a Legion too old to read pins, as during an upgrade,
+the check is not made, and these images wait until every node is upgraded.
+
+## What a record does not do
+
+`verified` says a signature was good when `legion local` checked it. It does not stop a
+deployment. Legion's `ImagePolicy` does that, from the signatures in the registry,
+not from the record: Legion does not read these records.
+
+An offline archive keeps the image's manifest digest, which `archives[].manifest`
+records. Signatures and attestations live in the registry, so they do not travel
+in the archive.
+
+A Legion node finds a loaded archive only by the name it was loaded under, not by
+digest, and Legion asks the registry what a tag names when it deploys. Offline,
+an archive named `localhost/...`, as `legion local export` names a local image by
+default, needs nothing more. One named for a registry, as with `--name
+ghcr.io/me/app:1`, runs only with the container's `pullPolicy: never`, which runs
+what each node holds by that name.
+
+## `legion local check --json`
+
+`legion local check --json` prints one object on standard output:
+
+```json
+{
+  "schema": 1,
+  "target": ".",
+  "passed": false,
+  "findings": [
+    { "severity": "error", "code": "LEGION003", "message": "..." }
+  ]
+}
+```
+
+`severity` is `warning` or `error`. A `code` keeps its meaning; a `message` may be
+reworded. The exit status is 0 unless a finding is an error. A check that cannot
+run at all, as with no Containerfile or image, exits non-zero with its reason on
+standard error and nothing on standard output.

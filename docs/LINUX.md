@@ -46,14 +46,13 @@ failing as described fails the test, so this page is changed with it.
 The ABI has no namespaces, cgroups, seccomp or io_uring either (DESIGN.md
 6.6), so images that run containers or sandboxes of their own don't work.
 
-## jailer
+## legion local
 
-jailer's `run --linux` uses the same runtime (`legion_jail`) and the same
-Linux ABI, so an image's ABI failures are the same there; its networking
-and lifecycle are its own (see jailer's docs/LOCAL-AND-LEGION.md). From
-the jailer release that pins Legion 0.1.18 it calls
-`legion_jail::enable_linux`; before it, static Linux programs need
-`kern.elf64.fallback_brand=3` set by hand. Only nginx was checked with
-jailer: it fails as above, and serves with `accept_mutex on` or
-`worker_processes 1`. jailer keeps no matrix of its own (decided 10
-November 2026); its one Linux test runs static BusyBox, from that release.
+`legion local run --linux` uses the same runtime (`legion_jail`) and the
+same Linux ABI, so an image's ABI failures are the same there; its
+networking and lifecycle are its own (no Services, probes or restarts).
+It calls `legion_jail::enable_linux`, as a node started with `--linux`
+does. Only nginx was checked with it: it fails as above, and serves with
+`accept_mutex on` or `worker_processes 1`. It keeps no matrix of its own
+(decided 10 November 2026, when it was the separate tool jailer); its one
+Linux test runs static BusyBox (`crates/legion/tests/local_jail.rs`).

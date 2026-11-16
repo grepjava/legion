@@ -44,7 +44,7 @@ tests in native YAML.
 | `cap_add: [NET_RAW]` | `security.allow: [rawSockets]` | yes | |
 | `cap_add`, other capabilities, `privileged`, `devices`, `network_mode: host` | ignored, with a warning; `--strict` refuses | yes | |
 | `depends_on`, `restart` | ignored, with a warning, as `docker stack deploy` does | yes | |
-| `build` without `image` | refused: build with jailer and push | yes | |
+| `build` without `image` | refused: build with `legion build` and push | yes | |
 | `x-legion` | merged into the Service spec: probes, init containers, sidecars, stateful mode, tolerations, endpoints, pull secrets | yes | yes |
 
 ## `deploy`

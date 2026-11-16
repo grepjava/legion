@@ -278,13 +278,13 @@ What makes OpenShift's console a place to deploy from.
   own saved manifests, with parameters.
 - Compose import: a `docker-compose.yml` turned into Legion objects as
   `docs/COMPOSE.md` describes, shown before applying.
-- Builds: images built with jailer from a Git repository or a
+- Builds: images built with `legion local` from a Git repository or a
   Containerfile, pushed to the cluster's registry, then rolled out;
-  build logs live. (jailer builds, on builder nodes, as the agent tells
-  it; the console builds nothing itself.)
+  build logs live. (`legion local` builds, on builder nodes, as the agent
+  tells it; the console builds nothing itself.)
 
 **Done when** a user who has never used the CLI deploys an example from
-the catalog, changes its image through a jailer build and sees the
+the catalog, changes its image through a build and sees the
 rollout, on the lab.
 
 **Built so far:** deploy from an image (`/deploy`): a form (name,
@@ -308,8 +308,9 @@ saved template with its variable set, and sees both in the topology
 (passed on 5b762be).
 
 **Builds** (design; chosen 2026-11-14: on builder nodes, no pod may make
-jails). jailer is a command with no API; a node the operator chose runs it
-on the host, as its agent is told, the way a Volume's data is sent.
+jails). The builder (`legion local`, once the separate tool jailer) is a
+command with no API; a node the operator chose runs it on the host, as its
+agent is told, the way a Volume's data is sent.
 
 - *The object.* A `Build` in a namespace: a source (a Git repository, a
   ref and a directory in it; or a Containerfile written out, with nothing
@@ -317,22 +318,23 @@ on the host, as its agent is told, the way a Volume's data is sent.
   registry's login (a Docker config, as `imagePullSecrets`), and,
   optionally, the Service and container to roll out once pushed, and a
   Secret holding a signing key (`signingKeySecret`): the image is pushed
-  signed, with SLSA provenance and an SPDX SBOM attested (`jailer push
-  --sign-key`, `jailer attest`), for an ImagePolicy requiring them. Its
+  signed, with SLSA provenance and an SPDX SBOM attested (`legion local push
+  --sign-key`, `legion local attest`), for an ImagePolicy requiring them. Its
   status: `Pending`, `Running` on a node, `Succeeded` with the pushed
   digest and the reference pinned to it, or `Failed` saying why; the last
   of its log is kept with it. A Build runs once; another build is another
   Build. Who may write Services in a namespace may write Builds there.
 - *Where it runs.* Nodes labelled `legion.builder=true`, ready, one build
-  at a time each; a Build waits while none is free. The node needs jailer
-  (the agent's `--jailer`, `jailer` on the PATH by default) and, for Git
-  sources, git. Its `RUN` steps run in jailer's build jails on that host,
+  at a time each; a Build waits while none is free. The node needs the
+  builder (the agent's `--builder`, by default its own binary as `legion
+  local`, so nothing else to install) and, for Git sources, git. Its `RUN`
+  steps run in build jails (`legion_build_*`) on that host,
   as a workload's would in Legion's: who may run workloads in a namespace
   may build there.
 - *How.* The leader offers the node's agent a session with a `build`
   action, as it does a Volume's export: the agent fetches the source
-  (`git clone --depth 1`), writes the login where jailer reads one
-  (`REGISTRY_AUTH_FILE`), runs `jailer build` and `jailer push` with a
+  (`git clone --depth 1`), writes the login where the builder reads one
+  (`REGISTRY_AUTH_FILE`), runs `legion local build` and `legion local push` with a
   release record, and sends their output as it comes, then what it
   pushed. The leader keeps the log and sets the status; with a rollout
   named, it sets that container's image to the pinned reference, and the
@@ -345,24 +347,26 @@ on the host, as its agent is told, the way a Volume's data is sent.
   push, the login), which makes a Build rolling the Service out, and opens
   its log.
 - *Done when*, on the lab: a user who has never used the CLI deploys an
-  example from the catalog, builds a new image for it with jailer from the
+  example from the catalog, builds a new image for it with `legion local` from the
   console, and sees the build's log and the rollout.
 
 **Builds built** as designed: the `Build` kind, the leader's builds
-controller, the agent's `--jailer` (and `--jailer-arg`), `legion
+controller, the agent's `--builder` (and `--builder-arg`; `--jailer` and
+`--jailer-arg` before jailer was merged into Legion), `legion
 build-logs [-f]`, the console's Builds, a Build's Log tab (followed while
 it runs, saying how it ended) and a Service's "Build a new image". The lab
 found three things on the way: the test labelling its node before it had
 joined, the Log tab never saying the build had ended, and the test asking
 the published port from the host itself, which pf does not redirect. After
-each build, pushed or not, the agent runs `jailer rmi` on its image, as
-the registry has it: its base images and jailer's build cache stay for the
-next build (the cache is bounded by jailer's `--cache-max`, and `rmi`
+each build, pushed or not, the agent runs `legion local rmi` on its image, as
+the registry has it: its base images and the build cache stay for the
+next build (the cache is bounded by `legion build --cache-max`, and `rmi`
 keeps what the cache uses). The lab builds test checks the image gone and
 its base kept (passed on e79a058).
 
 **Done when: met** (`the_console_builds_an_example_with_jailer`, passed on
-66b8f8f). One node, labelled a builder, with jailer and a registry the test
+66b8f8f; now `the_console_builds_an_example`, with no jailer: the builder is
+`legion local`). One node, labelled a builder, with jailer and a registry the test
 runs. ed, an `edit` user in shop who signs in with a certificate and never
 uses the CLI, deploys static-site from the catalog with an image not yet
 built, then from its Service's page builds one from its Containerfile
@@ -619,8 +623,9 @@ the CLI first, as everything is:
   does.
 - *Disk use* (the Disk usage page): each node's space under Legion's ZFS
   root by what holds it (images, tasks' roots, Volumes, the rest) and
-  jailer's build store beside it, from the agents' heartbeats, with
-  unused images and the build cache (`jailer prune`, `legion image prune
+  the builder's store (`legion local`'s) beside it, from the agents'
+  heartbeats, with unused images and the build cache (`legion local
+  prune`, `legion image prune
   --builds`) reclaimed from there.
 - *Diagnostics* (`legion diagnose`, the Diagnostics page): `legion
   doctor`'s checks run by every node's agent, and a support bundle

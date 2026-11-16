@@ -4,7 +4,7 @@
 #   legion stack deploy site -c examples/static-site/compose.yaml
 #
 # IMAGE is where the image is: `localhost/examples/nginx:1` once loaded
-# with `legion image load`, or a registry's reference after `jailer push`.
+# with `legion image load`, or a registry's reference after `legion local push`.
 services:
   web:
     image: "${IMAGE:-localhost/examples/nginx:1}"

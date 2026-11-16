@@ -383,7 +383,9 @@ Status: done in v0.1.18: jailer's image from build to recovery in one
 lab test, [docs/COMPOSE.md](docs/COMPOSE.md),
 [docs/LINUX.md](docs/LINUX.md), the examples in `examples/` and limits
 measured. The host's firewall requirements are in the README (the pf
-anchors) and checked by `legion doctor`.
+anchors) and checked by `legion doctor`. 16 November 2026, not yet
+released: jailer merged into Legion as `legion local` and `legion build`,
+so the companion builder is now part of Legion itself.
 
 ### P3 — Measured scaling and optional extensions
 
@@ -412,7 +414,7 @@ clusters Legion is for. What is known, so the work starts quickly then:
   atomic load, the parent's block lines must follow the blocks in use and
   be rebuilt after a crash, moving to it on upgrade leaves a moment without
   rules, tables move with their rules, rules are read across anchors when
-  debugging, and `legion-net` is shared with jailer.
+  debugging, and `legion-net` is shared with `legion local`.
 - **The planner's per-pass work** (78 ms at 5,000 tasks and 200 nodes,
   the planner alone):
   - First and cheapest, and the one item that changes how the work grows

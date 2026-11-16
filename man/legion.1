@@ -42,12 +42,6 @@ the cluster CLI, the native OCI image builder
 .Pq Nm Cm build ,
 and the standalone local jail/VM runner
 .Pq Nm Cm local .
-When invoked through a symlink named
-.Nm jailer ,
-.Nm
-dispatches directly to the
-.Cm local
-subcommand set.
 .Sh GLOBAL OPTIONS
 .Bl -tag -width Ds
 .It Fl -server Ar host:port
@@ -86,13 +80,22 @@ Key options include
 .Fl -console-listen ,
 .Fl -ingress-listen ,
 .Fl -ingress-tls-listen ,
+.Fl -insecure-registry ,
+.Fl -builder ,
+.Fl -builder-arg ,
+.Fl -iscsi-targets ,
+.Fl -iscsi-portal-group ,
 and
-.Fl -insecure-registry .
+.Fl -iscsi-portal .
+A builder node runs Builds with
+.Fl -builder ,
+by default this binary as
+.Nm Cm local .
 .It Cm init
 Initialize a new cluster with the reached manager as its first member.
 .It Cm join-token Ar manager|worker Op Fl -rotate
 Print or rotate the cluster join token for the given role.
-.It Cm join Ar token manager Op Ar options
+.It Cm join Ar token Fl -manager Ar host:port Op Ar options
 Join an existing cluster before starting the daemon.
 .It Cm status
 Show the reached manager's view of the cluster.
@@ -104,7 +107,7 @@ Run
 checks across cluster nodes.
 .It Cm support-bundle Op Fl o Ar file
 Export a masked cluster diagnostics bundle.
-.It Cm backup Ar file
+.It Cm backup Fl o Ar file
 Save a consistent snapshot of all cluster objects.
 .It Cm restore Op Ar file
 Restore a stopped manager's store from a backup or its own store.
@@ -138,8 +141,8 @@ Show a single object.
 List objects of a kind.
 .It Cm delete Ar kind name Op Fl n Ar ns
 Delete an object.
-.It Cm watch Oo Ar kind Oc Oo Fl n Ar ns Oc
-Stream live object changes.
+.It Cm watch Oo Ar kind Oc Oo Fl -from Ar version Oc
+Stream live object changes, from now on or after a version.
 .It Cm stack Ar deploy|convert|ls|stop|start|rm
 Deploy, inspect, stop, start, or remove Compose stacks.
 .It Cm stop Ar service , Cm start Ar service
@@ -148,7 +151,7 @@ Stop a service while keeping its spec, or start it again.
 Trigger a rolling restart or roll back a service to its previous spec.
 .It Cm cronjob run Ar name Op Fl n Ar ns
 Run a CronJob immediately outside its schedule.
-.It Cm top Op Fl -once
+.It Cm top Oo Fl n Ar ns Oc Oo Fl -once Oc
 Open the live terminal dashboard.
 .It Cm logs Ar task|service Oo Fl c Ar container Oc Oo Fl f Oc Oo Fl -tail Ar n Oc
 Print or follow container logs.
@@ -164,7 +167,7 @@ List or copy files inside a task's container root.
 Forward local ports to a task's pod.
 .It Cm events Oo Ar kind/name Oc Oo Fl n Ar ns Oc Oo Fl w Oc
 Show or follow recent cluster events.
-.It Cm alerts Op Fl -watch
+.It Cm alerts Oo Fl n Ar ns Oc Oo Fl w Oc Oo Fl o Ar fmt Oc
 Show active cluster alerts.
 .It Cm usage Op Fl n Ar ns , Cm quota Op Fl n Ar ns
 Inspect task resource usage samples and namespace quotas.
@@ -198,11 +201,17 @@ into an OCI image containing
 .Pa /disk.img
 for
 .Xr bhyve 8 .
+The store options
+.Fl -state-dir ,
+.Fl -zfs-root
+and
+.Fl -no-zfs
+may come before
+.Cm vm
+or after it.
 .El
 .Sh LOCAL COMMANDS
 .Nm Cm local
-(aliased as
-.Cm jailer )
 runs standalone image, build, signing, and container operations on the local
 host without a cluster daemon.
 Local global options are
@@ -238,6 +247,39 @@ Build across multiple platform hosts and push multi-architecture OCI indexes.
 Create signing keys, sign manifests, and attach or inspect SLSA provenance
 and SPDX SBOM attestations.
 .El
+.Pp
+Pods
+.Pq Cm run Fl -vnet , Fl p
+are on the bridge
+.Li legionlocal0 ;
+their published ports are
+.Xr pf 4
+rules in anchors under
+.Li legion-local/ ,
+which
+.Pa /etc/pf.conf
+must call before its filter rules:
+.Bd -literal -offset indent
+nat-anchor "legion-local/*"
+rdr-anchor "legion-local/*"
+anchor "legion-local/*"
+.Ed
+.Pp
+With neither
+.Fl -state-dir
+nor
+.Fl -zfs-root
+given, the first
+.Nm Cm local
+command moves the state of the former standalone jailer,
+.Pa /var/db/jailer
+and
+.Li zroot/jailer ,
+to
+.Pa /var/db/legion-local
+and
+.Li zroot/legion-local ,
+unless it still holds containers.
 .Sh ENVIRONMENT
 .Bl -tag -width Ds
 .It Ev LEGION_SERVER
@@ -246,7 +288,7 @@ Default manager address for
 .It Ev LEGION_IDENTITY
 Default client credentials PEM path for
 .Fl -identity .
-.It Ev JAILER_STATE_DIR , JAILER_ZFS_ROOT , JAILER_NO_ZFS , JAILER_POD_SUBNET , JAILER_CACHE_MAX
+.It Ev LEGION_LOCAL_STATE_DIR , LEGION_LOCAL_ZFS_ROOT , LEGION_LOCAL_NO_ZFS , LEGION_LOCAL_POD_SUBNET , LEGION_LOCAL_CACHE_MAX , LEGION_LOCAL_SSH
 Defaults for local store and build options under
 .Cm build
 and
@@ -260,6 +302,11 @@ Default daemon data directory and
 location.
 .It Pa /var/run/legion/
 Default daemon runtime directory.
+.It Pa /var/db/legion-local/
+Default
+.Nm Cm local
+state directory, run as root; otherwise
+.Pa ~/.local/share/legion-local/ .
 .It Pa /usr/local/etc/rc.d/legion
 .Fx
 .Xr rc 8

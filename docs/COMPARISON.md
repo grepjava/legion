@@ -66,7 +66,7 @@ Linux hosts, an ecosystem of tools and charts, or proven production use.
 | Probes | Startup, liveness and readiness: exec, TCP, HTTP, gRPC | One healthcheck (exec) | Startup, liveness and readiness: exec, TCP, HTTP, gRPC |
 | Restart policy | `any`, `on-failure`, `none`, with delay and attempts | Same | Always, OnFailure, Never |
 | Private registries | `imagePullSecrets` | `--with-registry-auth` | `imagePullSecrets` |
-| Building images | `Build` objects, run with jailer on nodes labelled `legion.builder=true`; or jailer, buildah or Podman by hand ([IMAGES.md](IMAGES.md)) | `docker build` | No (external tools) |
+| Building images | `Build` objects, run with `legion local` on nodes labelled `legion.builder=true`; or `legion build`, buildah or Podman by hand ([IMAGES.md](IMAGES.md)) | `docker build` | No (external tools) |
 | Linux images | Run through FreeBSD's Linux layer (`linux64`) on nodes started with `--linux`, not on a Linux kernel | Native | Native |
 
 ## Scheduling
@@ -135,7 +135,7 @@ Linux hosts, an ecosystem of tools and charts, or proven production use.
 | Hardened by default | No raw sockets, chflags, mlock, SysV IPC or mounts; securelevel 2 | Default capabilities, seccomp profile | Depends on Pod Security Admission |
 | Loosening per workload | `security.allow`, only as far as the namespace permits | `--cap-add` and similar | securityContext, limited by Pod Security levels |
 | Admission webhooks | No | No | Yes |
-| Image signatures and attestations | `ImagePolicy`: cosign key-pair signatures, and signed SLSA provenance and SBOM attestations, enforced or warned per repository pattern; Builds sign and attest with jailer | Docker Content Trust, checked by the client | With a policy add-on (Sigstore policy-controller, Kyverno) |
+| Image signatures and attestations | `ImagePolicy`: cosign key-pair signatures, and signed SLSA provenance and SBOM attestations, enforced or warned per repository pattern; Builds sign and attest with `legion local` | Docker Content Trust, checked by the client | With a policy add-on (Sigstore policy-controller, Kyverno) |
 
 ## Operations
 

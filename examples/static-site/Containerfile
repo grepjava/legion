@@ -1,6 +1,6 @@
-# nginx from FreeBSD's packages. Build it with jailer:
+# nginx from FreeBSD's packages. Build it with Legion:
 #
-#   jailer build -t examples/nginx:1 examples/static-site
+#   legion build -t examples/nginx:1 examples/static-site
 FROM docker.io/freebsd/freebsd-notoolchain:15.1
 RUN env ASSUME_ALWAYS_YES=yes pkg bootstrap -f >/dev/null \
  && env ASSUME_ALWAYS_YES=yes pkg install -y nginx >/dev/null \
