@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Disposable FreeBSD VMs for qualification, shared by Legion and jailer.
+# Disposable FreeBSD VMs for Legion's qualification.
 #
-#   scripts/lab base [--jailer DIR --jailer-rev REV]   build the next base image
+#   scripts/lab base             build the next base image
 #   scripts/lab base --patch FILE   the next base: the current one, with FILE
 #                                run in it as root, in minutes and not half an hour
 #   scripts/lab up [VM...]       start VMs from a reset state and check them
@@ -259,18 +259,15 @@ sshd_enable="YES"
 kld_list="pf if_bridge if_epair"
 CONF
 cat > /etc/pf.conf << 'CONF'
-# Lab node: hooks for Legion's legion/* and legion-local/* anchors, and
-# jailer's jailer/*; everything else passes.
+# Lab node: hooks for Legion's legion/* and legion-local/* anchors;
+# everything else passes.
 nat-anchor "legion/*"
 rdr-anchor "legion/*"
 nat-anchor "legion-local/*"
 rdr-anchor "legion-local/*"
-nat-anchor "jailer/*"
-rdr-anchor "jailer/*"
 pass all
 anchor "legion/*"
 anchor "legion-local/*"
-anchor "jailer/*"
 CONF
 pfctl -nf /etc/pf.conf
 cat >> /etc/hosts << 'CONF'
@@ -335,12 +332,10 @@ patch_base() {
 }
 
 build_base() {
-    local jailer= jailer_rev= n s=$root/stage p=2300 pid
+    local n s=$root/stage p=2300 pid
     while [ $# -gt 0 ]; do
         case $1 in
         --patch) patch_base "${2:?}"; return ;;
-        --jailer) jailer=${2:?}; shift 2 ;;
-        --jailer-rev) jailer_rev=${2:?}; shift 2 ;;
         *) die "unknown argument: $1" ;;
         esac
     done
@@ -383,13 +378,8 @@ EOF
     wait_ssh "$p" "$pid" "$s/console.log" 1800
     say "SSL errors in the first boot: $(grep -ac 'SSL routines' "$s/console.log")"
     provision | ssh_to "$p" 'sudo sh -s' || die "provisioning failed"
-    ssh_to "$p" 'mkdir -p ~/.ssh ~/warm/legion ~/warm/jailer && umask 077 && cat > ~/.ssh/id_ed25519' < "$key" || die "no key in the VM"
+    ssh_to "$p" 'mkdir -p ~/.ssh ~/warm/legion && umask 077 && cat > ~/.ssh/id_ed25519' < "$key" || die "no key in the VM"
     git -C "$here/.." archive --format=tar HEAD | ssh_to "$p" 'tar xf - -C ~/warm/legion' || die "no Legion tree"
-    if [ -n "$jailer" ]; then
-        git -C "$jailer" archive --format=tar "${jailer_rev:-HEAD}" | ssh_to "$p" 'tar xf - -C ~/warm/jailer' || die "no jailer tree"
-    else
-        ssh_to "$p" 'rmdir ~/warm/jailer'
-    fi
     as_lab | ssh_to "$p" 'sh -s' || die "setting up lab failed"
     # First boot's identity would outrank the one a VM learns from QEMU.
     ssh_to "$p" 'sudo rm -f /etc/rc.conf.d/hostname' || die "first boot's name stays"
