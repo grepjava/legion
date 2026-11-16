@@ -43,6 +43,7 @@ fn to_pb(i: CachedImage) -> CachedNodeImage {
         os: i.os,
         arch: i.arch,
         layers: i.layers,
+        vm: i.vm,
     }
 }
 

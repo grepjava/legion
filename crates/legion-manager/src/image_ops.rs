@@ -236,6 +236,7 @@ pub(crate) async fn node_images(
                                 os: i.os,
                                 arch: i.arch,
                                 layers: i.layers,
+                                vm: i.vm,
                             });
                         }
                     }
@@ -502,6 +503,7 @@ pub(crate) async fn load_image(
                 os: i.os,
                 arch: i.arch,
                 layers: i.layers,
+                vm: i.vm,
                 used_by: Vec::new(),
             })
             .collect();

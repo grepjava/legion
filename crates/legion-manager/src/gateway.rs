@@ -2886,6 +2886,7 @@ async fn node_images_list(
                 "arch": i.arch,
                 "layers": i.layers,
                 "used_by": i.used_by,
+                "vm": i.vm,
             })
         })
         .collect();

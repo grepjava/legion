@@ -112,10 +112,10 @@ pub async fn build_vm(store: &Store, opts: VmBuildOptions) -> Result<Image, Erro
         .await?;
     desc.media_type = opts.compression.media_type().to_owned();
 
-    config
-        .config
-        .labels
-        .insert("legion.vm.image".to_owned(), "true".to_owned());
+    config.config.labels.insert(
+        legion_image::oci::VM_IMAGE_LABEL.to_owned(),
+        "true".to_owned(),
+    );
     config.config.labels.extend(opts.labels.clone());
     let created = opts
         .timestamp
@@ -183,7 +183,7 @@ mod tests {
                 .config
                 .config
                 .labels
-                .get("legion.vm.image")
+                .get(legion_image::oci::VM_IMAGE_LABEL)
                 .map(String::as_str),
             Some("true")
         );

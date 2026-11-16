@@ -196,6 +196,20 @@ pub struct ImageConfig {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+/// The label `legion build vm` puts on a VM image: its `/disk.img` is a
+/// guest's disk, for bhyve.
+pub const VM_IMAGE_LABEL: &str = "legion.vm.image";
+
+impl ImageConfig {
+    /// Whether it says it is a VM image ([`VM_IMAGE_LABEL`] `true`).
+    pub fn is_vm(&self) -> bool {
+        self.config
+            .labels
+            .get(VM_IMAGE_LABEL)
+            .is_some_and(|v| v == "true")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootFs {
     #[serde(rename = "type", default = "default_rootfs_type")]
@@ -326,6 +340,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_vm_image_is_one_labelled_so() {
+        let mut config = ImageConfig::default();
+        assert!(!config.is_vm());
+        config
+            .config
+            .labels
+            .insert(VM_IMAGE_LABEL.to_owned(), "false".to_owned());
+        assert!(!config.is_vm());
+        config
+            .config
+            .labels
+            .insert(VM_IMAGE_LABEL.to_owned(), "true".to_owned());
+        assert!(config.is_vm());
+    }
 
     #[test]
     fn configs_in_either_case() {

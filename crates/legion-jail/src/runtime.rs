@@ -2045,6 +2045,7 @@ impl legion_runtime::Runtime for JailRuntime {
                     os: img.config.os.clone(),
                     arch: img.config.architecture.clone(),
                     layers: img.layers.len() as u32,
+                    vm: img.config.is_vm(),
                 });
             }
         }
@@ -2137,6 +2138,7 @@ impl legion_runtime::Runtime for JailRuntime {
                 .cloned()
                 .unwrap_or_else(|| query.to_owned()),
             digest: img.digest,
+            vm: img.config.is_vm(),
             os: img.config.os,
             arch: img.config.architecture,
             layers: img.layers.len() as u32,
@@ -2156,6 +2158,7 @@ impl legion_runtime::Runtime for JailRuntime {
         Ok(legion_runtime::CachedImage {
             reference: img.references.first().cloned().unwrap_or_default(),
             digest: img.digest,
+            vm: img.config.is_vm(),
             os: img.config.os,
             arch: img.config.architecture,
             layers: img.layers.len() as u32,

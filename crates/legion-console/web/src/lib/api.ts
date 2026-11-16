@@ -361,6 +361,8 @@ export interface CachedNodeImage {
   layers: number;
   /** `Kind namespace/name` of each service, Job and cron job naming it. */
   used_by: string[];
+  /** A VM image (`legion.vm.image`), not a jail's. */
+  vm?: boolean;
 }
 
 export interface RegistrySearchHit {

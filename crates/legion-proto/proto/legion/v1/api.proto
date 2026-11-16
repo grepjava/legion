@@ -698,6 +698,8 @@ message NodeImageItem {
   // The services, Jobs and cron jobs whose pods name this image, as
   // `Kind namespace/name`, of those the caller may read.
   repeated string used_by = 7;
+  // A VM image (`legion.vm.image`), not a jail's.
+  bool vm = 8;
 }
 
 message NodeImagesResponse {

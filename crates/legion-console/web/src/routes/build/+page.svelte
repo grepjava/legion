@@ -34,8 +34,10 @@
     pkg: 'FROM docker.io/freebsd/freebsd-notoolchain:15.1\nRUN env ASSUME_ALWAYS_YES=yes pkg install -y nginx && pkg clean -ay\nCMD ["/usr/local/sbin/nginx", "-g", "daemon off;"]\n',
     rust: 'FROM docker.io/freebsd/freebsd-toolchain:15.1 AS build\nRUN env ASSUME_ALWAYS_YES=yes pkg install -y git-lite rust\nRUN git clone --depth 1 https://github.com/org/app /src\nWORKDIR /src\nRUN cargo build --release\n\nFROM docker.io/freebsd/freebsd-runtime:15.1\nCOPY --from=build /src/target/release/app /usr/local/bin/app\nCMD ["/usr/local/bin/app"]\n',
     // A FreeBSD cloud-init disk: boot it with UEFI, which gives the guest
-    // its address in a NoCloud seed.
-    vm: 'FROM docker.io/freebsd/freebsd-notoolchain:15.1 AS disk\nRUN fetch -o - https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.raw.xz | unxz > /disk.img\n\nFROM scratch\nCOPY --from=disk /disk.img /disk.img\nLABEL legion.vm.image=true\n'
+    // its address in a NoCloud seed. Checked against the SHA-256 FreeBSD
+    // publishes for it (CHECKSUM.SHA256 beside it), so a changed file
+    // fails the build.
+    vm: 'FROM docker.io/freebsd/freebsd-notoolchain:15.1 AS disk\nRUN fetch -o /disk.img.xz https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/amd64/Latest/FreeBSD-15.1-RELEASE-amd64-BASIC-CLOUDINIT-ufs.raw.xz && sha256 -c 926733d965078b5d635931eccc34022f74f803d35b79c05ccc2ec8a7f0ebcca2 /disk.img.xz && unxz /disk.img.xz\n\nFROM scratch\nCOPY --from=disk /disk.img /disk.img\nLABEL legion.vm.image=true\n'
   } as const;
 
   /** Whether a Containerfile COPYs or ADDs from its build context, which
@@ -120,6 +122,7 @@
     error = '';
     if (next === 'vm' && containerfile === JAIL_DEFAULT) {
       containerfile = TEMPLATES.vm;
+      vmBoot = 'uefi';
     } else if (next === 'jail' && containerfile === TEMPLATES.vm) {
       containerfile = JAIL_DEFAULT;
     }
@@ -128,6 +131,8 @@
   function applyTemplate(kind: keyof typeof TEMPLATES) {
     from = 'containerfile';
     containerfile = TEMPLATES[kind];
+    // FreeBSD's cloud-init image reads no `legion.*` loader variables.
+    if (kind === 'vm') vmBoot = 'uefi';
   }
 
   const needsContext = $derived(from === 'containerfile' && copiesContext(containerfile));

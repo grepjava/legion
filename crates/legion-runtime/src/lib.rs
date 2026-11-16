@@ -210,6 +210,8 @@ pub struct CachedImage {
     pub os: String,
     pub arch: String,
     pub layers: u32,
+    /// A VM image (`legion.vm.image`), not a jail's.
+    pub vm: bool,
 }
 
 #[derive(Debug, thiserror::Error)]

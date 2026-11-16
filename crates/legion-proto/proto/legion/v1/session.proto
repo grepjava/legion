@@ -133,6 +133,8 @@ message CachedNodeImage {
   string os = 3;
   string arch = 4;
   uint32 layers = 5;
+  // A VM image (`legion.vm.image`), not a jail's.
+  bool vm = 6;
 }
 
 message ImageNodeResult {

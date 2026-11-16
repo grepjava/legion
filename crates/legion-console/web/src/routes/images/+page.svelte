@@ -138,16 +138,19 @@
     }
   });
 
+  // Jails, bhyve VMs (`legion.vm.image`), or both, as the node says.
+  let kindFilter: 'all' | 'jail' | 'vm' = $state('all');
+
   const shownImages = $derived.by(() => {
     const q = imageFilter.trim().toLowerCase();
-    return q
-      ? cached.filter(
-          (i) =>
-            i.reference.toLowerCase().includes(q) ||
-            i.node.toLowerCase().includes(q) ||
-            i.digest.toLowerCase().includes(q)
-        )
-      : cached;
+    return cached.filter(
+      (i) =>
+        (kindFilter === 'all' || (kindFilter === 'vm') === !!i.vm) &&
+        (!q ||
+          i.reference.toLowerCase().includes(q) ||
+          i.node.toLowerCase().includes(q) ||
+          i.digest.toLowerCase().includes(q))
+    );
   });
 
   async function pullImage(e: SubmitEvent) {
@@ -579,6 +582,17 @@
           placeholder={t('Filter reference, digest, node…')}
           aria-label={t('Filter cached images')}
         />
+        <div class="pill-row" role="group" aria-label={t('Filter by workload')}>
+          {#each [{ id: 'all', label: t('Jails & VMs') }, { id: 'jail', label: t('Jails') }, { id: 'vm', label: t('bhyve VMs') }] as const as f (f.id)}
+            <button
+              type="button"
+              class="pill"
+              class:active={kindFilter === f.id}
+              aria-pressed={kindFilter === f.id}
+              onclick={() => (kindFilter = f.id)}>{f.label}</button
+            >
+          {/each}
+        </div>
         <select bind:value={nodeFilter} aria-label={t('Filter by node')}>
           <option value="">{t('All nodes')}</option>
           {#each nodes as n (n.metadata.name)}
@@ -613,7 +627,10 @@
           <tbody>
             {#each shownImages as img (`${img.node}:${img.reference}`)}
               <tr>
-                <td class="mono"><strong>{img.reference}</strong></td>
+                <td class="mono">
+                  <strong>{img.reference}</strong>
+                  {#if img.vm}<span class="tag">{t('bhyve VM')}</span>{/if}
+                </td>
                 <td class="mono">{img.node}</td>
                 <td class="mono">{img.os}/{img.arch}</td>
                 <td class="mono">{img.layers}</td>

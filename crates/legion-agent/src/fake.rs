@@ -573,6 +573,7 @@ impl Runtime for FakeRuntime {
                 os: "freebsd".to_owned(),
                 arch: "amd64".to_owned(),
                 layers: 1,
+                vm: false,
             })
             .collect())
     }
@@ -661,6 +662,7 @@ impl Runtime for FakeRuntime {
             os: "freebsd".to_owned(),
             arch: "amd64".to_owned(),
             layers: 1,
+            vm: false,
         })
     }
 
@@ -687,6 +689,7 @@ impl Runtime for FakeRuntime {
             os: "freebsd".to_owned(),
             arch: "amd64".to_owned(),
             layers: 1,
+            vm: false,
         })
     }
 
