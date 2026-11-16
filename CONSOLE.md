@@ -300,7 +300,7 @@ with their defaults) become fields, and files it names are not read (their
 content goes in it). Templates (`/templates`): the examples in `examples/`,
 built into the gateway, and compose files saved from the import as Configs
 labelled `legion.template`, each opened in the import. Topology
-(`/topology`): a namespace's Services, green, amber or red by how many of
+(`/topology`): a namespace's Services, amber or red when not all of
 their tasks are ready, the Routes to them, what may reach what among them
 as `legion reach` gives it, and the Volumes they use, followed live, each
 box leading to its object. The lab test deploys from the form and from a

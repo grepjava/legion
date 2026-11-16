@@ -426,7 +426,7 @@
 </header>
 <p class="muted">
   {t(
-    "Routes to the namespace's Services, what may reach what among them as the nodes enforce it, and the Volumes they use. Green: every task ready; amber: some; red: none, or a Volume lost."
+    "Routes to the namespace's Services, what may reach what among them as the nodes enforce it, and the Volumes they use. A ring or box turns amber when some tasks are not ready, red when none are or a Volume is lost."
   )}
 </p>
 {#if error}<p class="error" role="alert">{error}</p>{/if}
@@ -901,8 +901,10 @@
     stroke: var(--control);
     stroke-width: 3.5;
   }
+  /* Quiet while all is well: the ready badge and dots say so, the logos
+     say what each is, and only a ring or box needing a look is coloured. */
   .svc-ring.good {
-    stroke: var(--good);
+    stroke: var(--control);
   }
   .svc-ring.wait {
     stroke: var(--wait);
@@ -1086,7 +1088,7 @@
     stroke-width: 1.5;
   }
   .box.good {
-    stroke: var(--good);
+    stroke: var(--control);
   }
   .box.wait {
     stroke: var(--wait);

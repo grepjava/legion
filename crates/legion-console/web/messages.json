@@ -544,7 +544,7 @@
   "Route": "",
   "Route {name}": "",
   "Route {name}: {host}{path} to {service}": "",
-  "Routes to the namespace's Services, what may reach what among them as the nodes enforce it, and the Volumes they use. Green: every task ready; amber: some; red: none, or a Volume lost.": "",
+  "Routes to the namespace's Services, what may reach what among them as the nodes enforce it, and the Volumes they use. A ring or box turns amber when some tasks are not ready, red when none are or a Volume is lost.": "",
   "Run its tasks again, as the spec says": "",
   "Run now": "",
   "Running jail tasks": "",
