@@ -72,7 +72,47 @@
       </dd>
     {/if}
   {/if}
+  <dt>{t('Attestations')}</dt>
+  <dd>
+    {#each d.attestations ?? [] as a, i (i)}
+      <div>
+        <span class="mono">{a.predicate_type}</span>
+        {#if a.packages.length}{t('{n} packages', { n: a.packages.length })}{/if}
+        {#if a.verified_key}
+          <span class="good">{t('signed by {key}', { key: a.verified_key })}</span>
+        {:else if a.why}
+          <span class="bad">{t('not verified: {why}', { why: a.why })}</span>
+        {:else}
+          <span class="muted">{t('unverified: no image policy covers it')}</span>
+        {/if}
+      </div>
+    {:else}
+      <span class="muted">{t('none')}</span>
+    {/each}
+  </dd>
 </dl>
+
+{#each (d.attestations ?? []).filter((a) => a.packages.length) as a, i (i)}
+  <details>
+    <summary>{t('SBOM: {n} packages', { n: a.packages.length })}</summary>
+    <table>
+      <thead>
+        <tr><th scope="col">{t('Package')}</th><th scope="col">{t('Version')}</th></tr>
+      </thead>
+      <tbody>
+        {#each a.packages as p (p.name + p.version)}
+          <tr><td class="mono">{p.name}</td><td class="mono">{p.version}</td></tr>
+        {/each}
+      </tbody>
+    </table>
+  </details>
+{/each}
+{#each (d.attestations ?? []).filter((a) => a.predicate_json) as a, i (i)}
+  <details>
+    <summary>{a.predicate_type}</summary>
+    <pre class="mono">{a.predicate_json}</pre>
+  </details>
+{/each}
 
 {#if d.history.length}
   <h3>{t('History')}</h3>

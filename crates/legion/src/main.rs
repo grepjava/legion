@@ -718,7 +718,23 @@ pub enum ImageCommand {
         #[arg(long, default_value_t = 20)]
         limit: u32,
     },
-    /// Inspect a remote registry image (tags, platforms, digest, cosign).
+    /// Show the SBOM attested for a registry image (`cosign attest
+    /// --type spdxjson` or `cyclonedx`): its packages, and whether a key of
+    /// an ImagePolicy covering the image signed it. Exits nonzero when it
+    /// has none.
+    Sbom {
+        image: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// A Secret of the namespace holding the registry's login.
+        #[arg(long)]
+        secret: Option<String>,
+        /// The packages as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect a remote registry image (tags, platforms, digest, cosign
+    /// signature and attestations).
     Inspect {
         image: String,
         #[arg(short, long)]
@@ -772,6 +788,11 @@ pub enum NodeCommand {
         #[arg(required = true)]
         labels: Vec<String>,
     },
+    /// Set which of `legion doctor`'s advised checks (`forwarding`,
+    /// `racct`, `bridge.filtering`…) the node needs met to take new tasks,
+    /// as it needs its required ones; none given, none. A node whose host
+    /// lacks what it needs keeps what runs there (drain it to move that).
+    Require { node: String, checks: Vec<String> },
 }
 
 #[derive(Subcommand)]
@@ -785,11 +806,6 @@ pub enum CronJobCommand {
         #[arg(short, long)]
         namespace: Option<String>,
     },
-    /// Set which of `legion doctor`'s advised checks (`forwarding`,
-    /// `racct`, `bridge.filtering`…) the node needs met to take new tasks,
-    /// as it needs its required ones; none given, none. A node whose host
-    /// lacks what it needs keeps what runs there (drain it to move that).
-    Require { node: String, checks: Vec<String> },
 }
 
 #[derive(Subcommand)]

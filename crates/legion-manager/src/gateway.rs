@@ -2574,7 +2574,7 @@ struct ScanQuery {
     image: String,
 }
 
-/// `legion images scan`: a node's cached image audited.
+/// `legion image scan`: a node's cached image audited.
 async fn image_scan(
     State(g): State<Gateway>,
     headers: HeaderMap,
@@ -3160,6 +3160,16 @@ async fn registry_inspect(
         "run": run,
         "size": r.size,
         "used_by": r.used_by,
+        "attestations": r.attestations.iter().map(|a| serde_json::json!({
+            "predicate_type": a.predicate_type,
+            "verified_key": a.verified_key,
+            "why": a.why,
+            "packages": a.packages.iter().map(|p| serde_json::json!({
+                "name": p.name,
+                "version": p.version,
+            })).collect::<Vec<_>>(),
+            "predicate_json": a.predicate_json,
+        })).collect::<Vec<_>>(),
     }))
     .into_response())
 }

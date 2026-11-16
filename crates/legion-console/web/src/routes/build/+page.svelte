@@ -20,6 +20,7 @@
   let containerfile = $state('FROM docker.io/freebsd/freebsd-runtime:15.1\n');
   let image = $state('');
   let pushSecret = $state('');
+  let signingKeySecret = $state('');
   let container = $state('');
   let error = $state('');
   let busy = $state(false);
@@ -70,6 +71,7 @@
         source,
         image: image.trim(),
         ...(pushSecret ? { pushSecret } : {}),
+        ...(signingKeySecret ? { signingKeySecret } : {}),
         rollout: { service: serviceName, ...(container ? { container } : {}) }
       }
     };
@@ -131,6 +133,16 @@
   <label
     >{t("The registry's login")} <span class="muted">{t('(a Secret holding a Docker config)')}</span>
     <select bind:value={pushSecret} aria-label={t("The registry's login")}>
+      <option value="">{t('none')}</option>
+      {#each secrets as s (s)}<option value={s}>{s}</option>{/each}
+    </select>
+  </label>
+  <label
+    >{t('Signing key')}
+    <span class="muted"
+      >{t('(a Secret holding a P-256 private key: the image is signed, its provenance and SBOM attested)')}</span
+    >
+    <select bind:value={signingKeySecret} aria-label={t('Signing key')}>
       <option value="">{t('none')}</option>
       {#each secrets as s (s)}<option value={s}>{s}</option>{/each}
     </select>

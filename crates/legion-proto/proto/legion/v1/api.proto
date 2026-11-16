@@ -797,6 +797,24 @@ message InspectRegistryImageResponse {
   uint64 size = 11;
   // As in `NodeImageItem`.
   repeated string used_by = 12;
+  // The attestations kept for it (cosign attest), each checked against
+  // the keys of the ImagePolicies covering it.
+  repeated ImageAttestation attestations = 13;
+}
+
+message ImageAttestation {
+  // The in-toto predicate type, a URI.
+  string predicate_type = 1;
+  // The fingerprint of the covering policies' key that signed it; empty
+  // when none did, or no policy covers the image.
+  string verified_key = 2;
+  // Why it is not verified, when a policy covers the image.
+  string why = 3;
+  // For an SBOM (SPDX, CycloneDX): its packages.
+  repeated ImagePackage packages = 4;
+  // For the rest (provenance, say): the predicate as JSON, the first
+  // 64 KiB of it.
+  string predicate_json = 5;
 }
 
 message VolumeBackupRequest {

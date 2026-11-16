@@ -243,7 +243,7 @@ export const api = {
     if (query) params.set('query', query);
     return call<{ results: RegistrySearchHit[] }>('GET', `/api/registry/search?${params}`);
   },
-  /** A node's cached image audited: its packages and their known vulnerabilities (`legion images scan`). */
+  /** A node's cached image audited: its packages and their known vulnerabilities (`legion image scan`). */
   scanImage: (node: string, image: string) =>
     call<ImageScan>('GET', `/api/images/scan?${new URLSearchParams({ node, image })}`),
   /** A directory in a task's container (`legion files`). */
@@ -390,6 +390,18 @@ export interface RegistryImageInspect {
   /** All layers, compressed; 0 when not known. */
   size: number;
   used_by: string[];
+  /** cosign attestations, each checked against the keys of the
+   * ImagePolicies covering the image. */
+  attestations: {
+    predicate_type: string;
+    /** The key that signed it; empty when none of those did. */
+    verified_key: string;
+    why: string;
+    /** An SBOM's packages. */
+    packages: { name: string; version: string }[];
+    /** Anything else's predicate, as JSON. */
+    predicate_json: string;
+  }[];
 }
 
 export interface AuditFilter {

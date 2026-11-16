@@ -56,11 +56,39 @@ pub struct ImageStatus {
 pub struct Verification {
     pub digest: String,
     pub key: String,
+    /// The predicate types of the attestations its policies required,
+    /// each found signed by one of their keys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attestations: Vec<String>,
+}
+
+/// In-toto predicate types of the attestations cosign makes.
+pub const SPDX: &str = "https://spdx.dev/Document";
+pub const CYCLONEDX: &str = "https://cyclonedx.org/bom";
+pub const SLSA_PROVENANCE_02: &str = "https://slsa.dev/provenance/v0.2";
+pub const SLSA_PROVENANCE_1: &str = "https://slsa.dev/provenance/v1";
+pub const VULN: &str = "https://cosign.sigstore.dev/attestation/vuln/v1";
+
+/// The predicate type `name` stands for: cosign's `--type` names
+/// (`spdx`, `spdxjson`, `cyclonedx`, `slsaprovenance`, `slsaprovenance02`,
+/// `slsaprovenance1`, `vuln`) or an `https://` URI itself.
+pub fn predicate_type(name: &str) -> Option<&str> {
+    Some(match name {
+        "spdx" | "spdxjson" => SPDX,
+        "cyclonedx" => CYCLONEDX,
+        "slsaprovenance" | "slsaprovenance02" => SLSA_PROVENANCE_02,
+        "slsaprovenance1" => SLSA_PROVENANCE_1,
+        "vuln" => VULN,
+        uri if uri.starts_with("https://") && uri.len() > "https://".len() => uri,
+        _ => return None,
+    })
 }
 
 /// Spec of an `ImagePolicy` (cluster-scoped): images whose repository
 /// matches one of `images` run only with a good signature, made as cosign
-/// makes them, by one of `keys`. Every policy an image matches must be met.
+/// makes them, by one of `keys`, and with an attestation of each of
+/// `attestations` signed by one of them. Every policy an image matches
+/// must be met.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ImagePolicySpec {
@@ -71,6 +99,11 @@ pub struct ImagePolicySpec {
     pub keys: Vec<String>,
     #[serde(default, skip_serializing_if = "PolicyMode::is_default")]
     pub mode: PolicyMode,
+    /// Predicate types each image must also carry an attestation of,
+    /// signed by one of `keys` (`cosign attest --key`): `spdx`,
+    /// `cyclonedx`, `slsaprovenance1`… or a URI; kept as URIs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attestations: Vec<String>,
 }
 
 /// What a policy does with an image it finds no good signature on.
@@ -105,6 +138,17 @@ impl crate::admit::Spec for ImagePolicySpec {
         if self.keys.is_empty() {
             return Err(Invalid::new("keys", "a policy names at least one key"));
         }
+        for (i, a) in self.attestations.iter_mut().enumerate() {
+            let Some(t) = predicate_type(a) else {
+                return Err(Invalid::new(
+                    index("", "attestations", i),
+                    "spdx, cyclonedx, slsaprovenance, slsaprovenance1, vuln or an https:// URI",
+                ));
+            };
+            *a = t.to_owned();
+        }
+        self.attestations.sort();
+        self.attestations.dedup();
         for (i, k) in self.keys.iter().enumerate() {
             if !k.trim_start().starts_with("-----BEGIN PUBLIC KEY-----") {
                 return Err(Invalid::new(
@@ -262,6 +306,7 @@ mod tests {
             images: images.iter().map(|s| s.to_string()).collect(),
             keys: keys.iter().map(|s| s.to_string()).collect(),
             mode: PolicyMode::Enforce,
+            attestations: Vec::new(),
         };
         assert!(
             policy(&["ghcr.io/me/*", "localhost/**"], &[key])
@@ -297,6 +342,36 @@ mod tests {
             serde_json::from_str::<ImagePolicySpec>(r#"{"images":[],"keys":[],"mode":"audit"}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_policy_names_the_attestations_it_requires_as_uris() {
+        use crate::admit::Spec;
+        let key = "-----BEGIN PUBLIC KEY-----
+MFk...
+-----END PUBLIC KEY-----
+";
+        let mut p = ImagePolicySpec {
+            images: vec!["ghcr.io/**".into()],
+            keys: vec![key.into()],
+            mode: PolicyMode::Enforce,
+            attestations: vec![
+                "spdxjson".into(),
+                "slsaprovenance1".into(),
+                SPDX.into(),
+                "https://example.com/attest/v1".into(),
+            ],
+        };
+        p.admit().unwrap();
+        assert_eq!(
+            p.attestations,
+            ["https://example.com/attest/v1", SLSA_PROVENANCE_1, SPDX]
+        );
+        for bad in ["sbom", "http://example.com/x", "https://"] {
+            p.attestations = vec![bad.into()];
+            let e = p.admit().unwrap_err();
+            assert_eq!(e.path, "attestations[0]", "{bad}");
+        }
     }
 
     #[test]

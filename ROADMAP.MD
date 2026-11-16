@@ -343,8 +343,14 @@ Acceptance:
 Dependencies: P1.3 for stable image identities. Keep verification policy
 separate from image building; do not invent cryptographic formats.
 
-Status: done but for SBOM and provenance, which nothing has asked for
-yet. v0.1.17: `ImagePolicy`, cosign key-pair signatures checked as the
+Status: done. SBOM and provenance (16 November 2026, not yet released):
+an `ImagePolicy`'s `attestations` require cosign attestations of the
+types it names (SLSA provenance, SPDX or CycloneDX SBOMs), signed by its
+keys, enforced or warned as its signatures are; `legion image inspect`
+and `sbom`, and the console's image details, show them; a Build with a
+signing key pushes its image signed, its provenance and SBOM attested by
+jailer. The lab's handoff test checks jailer's attestations against a
+policy. v0.1.17: `ImagePolicy`, cosign key-pair signatures checked as the
 leader resolves a pod, enforced or warned, with jailer signing through the
 same module. v0.1.18: revocation of users, workers and managers across
 followers, renewal and open streams; the audit trail (`legion audit`).
@@ -454,9 +460,8 @@ measured sizes is parked, as above.
   `poudriere testport` since v0.1.9.
 - A release of the work since v0.1.19 (PHASE.md).
 - Scaling past the measured sizes (P3), parked until a user needs it.
-- From the milestones: readiness gating scheduling (P1.1's follow-up),
-  SBOM and provenance (P2.1), further storage integrations (P3), arm64
-  and real hardware in qualification (P0.1).
+- From the milestones: further storage integrations (P3), arm64 and real
+  hardware in qualification (P0.1).
 - In the web console: pausing a task (CONSOLE.md).
 
 ## Documentation maintenance

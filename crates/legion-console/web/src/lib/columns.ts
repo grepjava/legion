@@ -125,7 +125,14 @@ export function columns(kind: string): Column[] {
       return [
         { label: t('Images'), value: (o) => s(o.spec?.images?.join(', ')) },
         { label: t('Keys'), value: (o) => s(o.spec?.keys?.length ?? 0) },
-        { label: t('Mode'), value: (o) => s(o.spec?.mode ?? 'enforce') }
+        { label: t('Mode'), value: (o) => s(o.spec?.mode ?? 'enforce') },
+        {
+          label: t('Attestations'),
+          value: (o) =>
+            ((o.spec?.attestations ?? []) as string[])
+              .map((u) => u.replace(/^https:\/\//, ''))
+              .join(', ')
+        }
       ];
     case 'Build':
       return [

@@ -286,6 +286,9 @@ async fn pass(
                             set_status(&api, &key, |s| {
                                 s.digest = digest.clone();
                                 s.pinned = pinned.clone();
+                                // Each of jailer's steps fails the build if
+                                // it fails: pushed, it is signed and attested.
+                                s.attested = spec.signing_key_secret.is_some();
                                 s.log = kept_log(&log);
                                 match &rolled {
                                     Ok(()) => finish(s, BuildPhase::Succeeded, ""),
@@ -337,19 +340,30 @@ fn options(
     spec: &BuildSpec,
     plain_http: &[String],
 ) -> Result<BuildOptions, String> {
-    let auth = match &spec.push_secret {
-        Some(name) => {
-            let secret = api
-                .store
-                .get(&ObjectKey::new(Kind::Secret, &key.namespace, name))
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("no Secret {name} in namespace {}", key.namespace))?;
-            let data: DataSpec = legion_api::parse(&secret.spec).map_err(|e| e.to_string())?;
-            data.bytes()
-                .map_err(|e| format!("Secret {name}: {}", e.message))?
-        }
-        None => Vec::new(),
+    let secret = |name: &Option<String>| -> Result<Vec<u8>, String> {
+        let Some(name) = name else {
+            return Ok(Vec::new());
+        };
+        let secret = api
+            .store
+            .get(&ObjectKey::new(Kind::Secret, &key.namespace, name))
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("no Secret {name} in namespace {}", key.namespace))?;
+        let data: DataSpec = legion_api::parse(&secret.spec).map_err(|e| e.to_string())?;
+        data.bytes()
+            .map_err(|e| format!("Secret {name}: {}", e.message))
     };
+    let auth = secret(&spec.push_secret)?;
+    let sign_key = secret(&spec.signing_key_secret)?;
+    if !sign_key.is_empty() {
+        let pem = String::from_utf8_lossy(&sign_key);
+        legion_image::cosign::PrivateKey::from_pem(&pem).map_err(|e| {
+            format!(
+                "Secret {}: {e}",
+                spec.signing_key_secret.as_deref().unwrap_or_default()
+            )
+        })?;
+    }
     let git = spec.source.git.clone();
     Ok(BuildOptions {
         git_url: git.as_ref().map(|g| g.url.clone()).unwrap_or_default(),
@@ -362,6 +376,7 @@ fn options(
         image: spec.image.clone(),
         auth,
         plain_http: plain_http.to_vec(),
+        sign_key,
     })
 }
 

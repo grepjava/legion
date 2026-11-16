@@ -944,6 +944,94 @@ fn a_jailer_signature_is_what_legion_checks() {
     lab.held("local", &format!("{local} is local and has no signature"));
     assert!(lab.running("local").is_empty(), "no task of it runs");
     lab.delete("local");
+
+    step("a policy requiring provenance and an SBOM holds a signed image without them");
+    let attested = format!("{addr}/attested/app:1");
+    let (pinned5, digest5, id5) = push("attested", &attested, Some(&good_key));
+    let mut required = policy(
+        "attested",
+        &[&format!("{addr}/attested/**")],
+        &[&pem],
+        "enforce",
+    );
+    required.push_str(
+        "  attestations: [slsaprovenance1, spdxjson]
+",
+    );
+    lab.apply("policy-attested", &required);
+    lab.apply("attested", &service("attested", &attested, 1, ""));
+    lab.held(
+        "attested",
+        &format!("{attested}: no good attestation of https://slsa.dev/provenance/v1: none is kept"),
+    );
+    assert!(lab.running("attested").is_empty(), "no task of it runs");
+
+    step("an SBOM signed by another key is no good either");
+    let rec = lab.dir.join("attested.json");
+    let rec = rec.to_str().unwrap();
+    jailer.run(&[
+        "attest",
+        "--key",
+        &good_key,
+        "--type",
+        "provenance",
+        "--record",
+        rec,
+        &pinned5,
+    ]);
+    jailer.run(&[
+        "attest",
+        "--key",
+        &other_key,
+        "--type",
+        "sbom",
+        "--image",
+        "handoff/attested:1",
+        &pinned5,
+    ]);
+    lab.held(
+        "attested",
+        &format!("{attested}: no good attestation of https://spdx.dev/Document: made by none of the keys given"),
+    );
+
+    step("attested by jailer with the policy's key, it runs, its SBOM shown");
+    jailer.run(&[
+        "attest",
+        "--key",
+        &good_key,
+        "--type",
+        "sbom",
+        "--image",
+        "handoff/attested:1",
+        &pinned5,
+    ]);
+    lab.runs("attested", &attested, 1, &digest5, Some(&pinned5), &id5);
+    lab.verified_by("attested", &attested, &digest5, &key);
+    let v = &lab.images("attested")["verified"][&attested];
+    assert_eq!(
+        v["attestations"],
+        serde_json::json!([
+            "https://slsa.dev/provenance/v1",
+            "https://spdx.dev/Document"
+        ]),
+        "{v}"
+    );
+    let out = lab.legion(&["image", "sbom", &attested], &[]);
+    let said = text(&out.stdout);
+    assert!(out.status.success(), "{said}{}", text(&out.stderr));
+    assert!(
+        said.contains("https://spdx.dev/Document") && said.contains(&format!("signed by {key}")),
+        "{said}"
+    );
+    let out = lab.legion(&["image", "inspect", &attested], &[]);
+    let said = text(&out.stdout);
+    assert!(
+        said.contains(&format!(
+            "Attested:  https://slsa.dev/provenance/v1 (signed by {key})"
+        )),
+        "{said}"
+    );
+    lab.delete("attested");
     step("done");
 }
 

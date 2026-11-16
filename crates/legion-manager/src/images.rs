@@ -16,6 +16,7 @@ use legion_api::job::JobSpec;
 use legion_api::login::{Login, docker_config};
 use legion_api::service::{PodSpec, ServiceSpec};
 use legion_api::{Kind, Object, ObjectKey};
+use legion_image::attest;
 use legion_image::cosign::{self, PublicKey, Verified, VerifyError};
 use legion_image::{Credentials, Reference};
 use legion_store::{NodeId, Store};
@@ -49,6 +50,16 @@ pub trait Registry: Send + Sync {
         keys: &[PublicKey],
         logins: &[Login],
     ) -> impl Future<Output = Result<Verified, VerifyError>> + Send;
+
+    /// The attestations kept for the image `digest` in `reference`'s
+    /// repository, each checked against `keys`.
+    fn attestations(
+        &self,
+        reference: &Reference,
+        digest: &str,
+        keys: &[PublicKey],
+        logins: &[Login],
+    ) -> impl Future<Output = Result<Vec<attest::Found>, VerifyError>> + Send;
 }
 
 /// Registries, over HTTPS; with `loopback`, those on this host over plain
@@ -103,6 +114,21 @@ impl Registry for Live {
         let client = local.as_ref().unwrap_or(&self.client);
         cosign::verify(client, reference, digest, keys, creds.as_ref()).await
     }
+
+    async fn attestations(
+        &self,
+        reference: &Reference,
+        digest: &str,
+        keys: &[PublicKey],
+        logins: &[Login],
+    ) -> Result<Vec<attest::Found>, VerifyError> {
+        let creds = Credentials::for_registry(logins, &reference.registry);
+        let local = self
+            .local_client(reference)
+            .map_err(VerifyError::CannotFetch)?;
+        let client = local.as_ref().unwrap_or(&self.client);
+        attest::fetch(client, reference, digest, keys, creds.as_ref()).await
+    }
 }
 
 /// An `ImagePolicy`, its keys read.
@@ -112,6 +138,8 @@ pub struct Policy {
     pub images: Vec<String>,
     pub keys: Vec<PublicKey>,
     pub mode: PolicyMode,
+    /// Predicate types of attestations required, as URIs.
+    pub attestations: Vec<String>,
 }
 
 /// The cluster's `ImagePolicy` objects, by name. Keys are checked as a
@@ -135,6 +163,7 @@ pub(crate) fn policies(store: &Store) -> Result<Vec<Policy>, String> {
                     .filter_map(|k| PublicKey::from_pem(k).ok())
                     .collect(),
                 mode: spec.mode,
+                attestations: spec.attestations,
             })
         })
         .collect())
@@ -205,13 +234,20 @@ pub async fn check_signatures<R: Registry>(
                     .verify(&written, digest, &policy.keys, logins)
                     .await
                 {
-                    Ok(v) => {
-                        good.get_or_insert(Verification {
-                            digest: digest.clone(),
-                            key: v.fingerprint,
-                        });
-                        None
-                    }
+                    Ok(v) => match attested(registry, &written, digest, policy, logins).await {
+                        Ok(()) => {
+                            let g = good.get_or_insert(Verification {
+                                digest: digest.clone(),
+                                key: v.fingerprint,
+                                attestations: Vec::new(),
+                            });
+                            g.attestations.extend(policy.attestations.iter().cloned());
+                            g.attestations.sort();
+                            g.attestations.dedup();
+                            None
+                        }
+                        Err(why) => Some(format!("{image}: {why}")),
+                    },
                     Err(VerifyError::Unsigned) => Some(format!("{image} is unsigned")),
                     Err(VerifyError::CannotFetch(e)) => {
                         Some(format!("cannot check the signature of {image}: {e}"))
@@ -241,6 +277,31 @@ pub async fn check_signatures<R: Registry>(
         }
     }
     (verified, held, warned)
+}
+
+/// Whether the image `digest` carries an attestation of each type `policy`
+/// requires, signed by one of its keys; says which it lacks, and why.
+async fn attested<R: Registry>(
+    registry: &R,
+    written: &Reference,
+    digest: &str,
+    policy: &Policy,
+    logins: &[Login],
+) -> Result<(), String> {
+    if policy.attestations.is_empty() {
+        return Ok(());
+    }
+    let found = registry
+        .attestations(written, digest, &policy.keys, logins)
+        .await
+        .map_err(|e| match e {
+            VerifyError::CannotFetch(e) => format!("cannot check its attestations: {e}"),
+            other => format!("its attestations: {other}"),
+        })?;
+    match attest::missing(&found, &policy.attestations) {
+        None => Ok(()),
+        Some((t, why)) => Err(format!("no good attestation of {t}: {why}")),
+    }
 }
 
 /// Resolves pods whenever this manager leads, until `closing` turns true.
@@ -499,6 +560,16 @@ mod tests {
         ) -> Result<Verified, VerifyError> {
             Err(VerifyError::Unsigned)
         }
+
+        async fn attestations(
+            &self,
+            _: &Reference,
+            _: &str,
+            _: &[PublicKey],
+            _: &[Login],
+        ) -> Result<Vec<attest::Found>, VerifyError> {
+            Ok(Vec::new())
+        }
     }
 
     /// Signatures by digest: the fingerprint of the key that made each, or
@@ -506,6 +577,9 @@ mod tests {
     struct Signed {
         by: BTreeMap<String, String>,
         down: bool,
+        /// Attestations kept for every image: predicate type and the
+        /// fingerprint of the key that signed it.
+        attested: Vec<(String, String)>,
     }
 
     impl Registry for Signed {
@@ -531,6 +605,31 @@ mod tests {
                 Some(_) => Err(VerifyError::Bad("made by none of the keys given".into())),
             }
         }
+
+        async fn attestations(
+            &self,
+            _: &Reference,
+            _: &str,
+            keys: &[PublicKey],
+            _: &[Login],
+        ) -> Result<Vec<attest::Found>, VerifyError> {
+            if self.down {
+                return Err(VerifyError::CannotFetch("503".into()));
+            }
+            Ok(self
+                .attested
+                .iter()
+                .map(|(t, f)| {
+                    let ok = keys.iter().any(|k| k.fingerprint() == f);
+                    attest::Found {
+                        predicate_type: t.clone(),
+                        predicate: serde_json::Value::Null,
+                        verified: ok.then(|| f.clone()),
+                        why: (!ok).then(|| "made by none of the keys given".to_owned()),
+                    }
+                })
+                .collect())
+        }
     }
 
     fn policy(name: &str, images: &[&str], keys: &[&PublicKey], mode: PolicyMode) -> Policy {
@@ -539,6 +638,7 @@ mod tests {
             images: images.iter().map(|s| s.to_string()).collect(),
             keys: keys.iter().map(|k| (*k).clone()).collect(),
             mode,
+            attestations: Vec::new(),
         }
     }
 
@@ -565,6 +665,7 @@ containers:
         let signed = Signed {
             by: BTreeMap::from([(digest.clone(), good.fingerprint().to_owned())]),
             down: false,
+            attested: Vec::new(),
         };
         let enforce = [policy(
             "me",
@@ -583,6 +684,7 @@ containers:
                 Verification {
                     digest: digest.clone(),
                     key: good.fingerprint().to_owned(),
+                    attestations: Vec::new(),
                 }
             )])
         );
@@ -612,12 +714,14 @@ containers:
         let none = Signed {
             by: BTreeMap::new(),
             down: false,
+            attested: Vec::new(),
         };
         let (_, held, _) = check_signatures(&none, &p, &resolved, &enforce, &[]).await;
         assert_eq!(held, ["ghcr.io/me/app:1 is unsigned (policy me)"]);
         let down = Signed {
             by: signed.by.clone(),
             down: true,
+            attested: Vec::new(),
         };
         let (_, held, _) = check_signatures(&down, &p, &resolved, &enforce, &[]).await;
         assert_eq!(
@@ -633,12 +737,71 @@ containers:
     }
 
     #[tokio::test]
+    async fn a_policy_requiring_attestations_holds_images_without_them() {
+        use legion_api::image::{SLSA_PROVENANCE_1, SPDX};
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let good = cosign::PrivateKey::generate().public();
+        let other = cosign::PrivateKey::generate().public();
+        let p = pod(r#"containers: [{ name: a, image: "ghcr.io/me/app:1" }]"#);
+        let resolved = BTreeMap::from([(
+            "ghcr.io/me/app:1".to_owned(),
+            format!("ghcr.io/me/app@{digest}"),
+        )]);
+        let mut required = policy("me", &["ghcr.io/me/*"], &[&good], PolicyMode::Enforce);
+        required.attestations = vec![SLSA_PROVENANCE_1.to_owned(), SPDX.to_owned()];
+        let registry = |attested: &[(&str, &PublicKey)], down| Signed {
+            by: BTreeMap::from([(digest.clone(), good.fingerprint().to_owned())]),
+            down,
+            attested: attested
+                .iter()
+                .map(|(t, k)| (t.to_string(), k.fingerprint().to_owned()))
+                .collect(),
+        };
+        let both = registry(&[(SPDX, &good), (SLSA_PROVENANCE_1, &good)], false);
+        let (verified, held, _) =
+            check_signatures(&both, &p, &resolved, &[required.clone()], &[]).await;
+        assert!(held.is_empty(), "{held:?}");
+        assert_eq!(
+            verified["ghcr.io/me/app:1"].attestations,
+            [SLSA_PROVENANCE_1, SPDX]
+        );
+
+        // An SBOM alone, and provenance by another key: held.
+        let sbom_only = registry(&[(SPDX, &good), (SLSA_PROVENANCE_1, &other)], false);
+        let (verified, held, _) =
+            check_signatures(&sbom_only, &p, &resolved, &[required.clone()], &[]).await;
+        assert!(verified.is_empty());
+        assert_eq!(
+            held,
+            [format!(
+                "ghcr.io/me/app:1: no good attestation of {SLSA_PROVENANCE_1}: made by none of the keys given (policy me)"
+            )]
+        );
+        let none = registry(&[], false);
+        let (_, held, _) = check_signatures(&none, &p, &resolved, &[required.clone()], &[]).await;
+        assert_eq!(
+            held,
+            [format!(
+                "ghcr.io/me/app:1: no good attestation of {SLSA_PROVENANCE_1}: none is kept (policy me)"
+            )]
+        );
+
+        // Under warn it runs, saying what it lacks.
+        let mut warn = required.clone();
+        warn.mode = PolicyMode::Warn;
+        let (_, held, warned) = check_signatures(&none, &p, &resolved, &[warn], &[]).await;
+        assert!(held.is_empty());
+        assert_eq!(warned.len(), 1, "{warned:?}");
+    }
+
+    #[tokio::test]
     async fn a_covered_image_by_digest_is_checked_and_a_local_one_refused() {
         let digest = format!("sha256:{}", "a".repeat(64));
         let good = cosign::PrivateKey::generate().public();
         let signed = Signed {
             by: BTreeMap::from([(digest.clone(), good.fingerprint().to_owned())]),
             down: false,
+            attested: Vec::new(),
         };
         let policies = [policy(
             "lab",

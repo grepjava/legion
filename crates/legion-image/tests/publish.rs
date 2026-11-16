@@ -708,3 +708,124 @@ async fn signatures_are_verified_as_kept_in_the_registry() {
         other => panic!("{other:?}"),
     }
 }
+
+/// Keeps attestations for `digest` in `registry` as cosign and jailer do:
+/// each a DSSE envelope of an in-toto statement, signed with `key`.
+fn keep_attestations(
+    registry: &Mutex<Registry>,
+    digest: &str,
+    attested: &[(&str, serde_json::Value, &legion_image::cosign::PrivateKey)],
+) {
+    use base64::Engine;
+    use legion_image::attest::{
+        ENVELOPE_TYPE, PAYLOAD_TYPE, PREDICATE_ANNOTATION, STATEMENT_TYPE, pae,
+    };
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut r = registry.lock().unwrap();
+    let mut descriptors = Vec::new();
+    for (predicate_type, predicate, key) in attested {
+        let statement = serde_json::to_vec(&serde_json::json!({
+            "_type": STATEMENT_TYPE,
+            "subject": [{"name": "me/app", "digest": {"sha256": digest.trim_start_matches("sha256:")}}],
+            "predicateType": predicate_type,
+            "predicate": predicate,
+        }))
+        .unwrap();
+        let sig = legion_image::cosign::sign(&pae(PAYLOAD_TYPE, &statement), key);
+        let envelope = serde_json::to_vec(&serde_json::json!({
+            "payloadType": PAYLOAD_TYPE,
+            "payload": b64.encode(&statement),
+            "signatures": [{"keyid": "", "sig": sig}],
+        }))
+        .unwrap();
+        let d = sha256(&envelope);
+        r.blobs.insert(d.clone(), envelope.clone());
+        descriptors.push(Descriptor {
+            media_type: ENVELOPE_TYPE.to_owned(),
+            digest: d,
+            size: envelope.len() as u64,
+            platform: None,
+            annotations: BTreeMap::from([(
+                PREDICATE_ANNOTATION.to_owned(),
+                predicate_type.to_string(),
+            )]),
+        });
+    }
+    let config = b"{}".to_vec();
+    let config_digest = sha256(&config);
+    r.blobs.insert(config_digest.clone(), config.clone());
+    let manifest = oci::Manifest::new(
+        Descriptor {
+            media_type: "application/vnd.oci.image.config.v1+json".to_owned(),
+            digest: config_digest,
+            size: config.len() as u64,
+            platform: None,
+            annotations: BTreeMap::new(),
+        },
+        descriptors,
+    );
+    let tag = format!("{}.att", digest.replacen(':', "-", 1));
+    r.manifests
+        .insert(tag, serde_json::to_vec(&manifest).unwrap());
+}
+
+/// An image's attestations, as Legion reads them: none kept, then an SBOM
+/// by the policy's key and provenance by another, checked as given.
+#[tokio::test]
+async fn attestations_are_read_and_checked_as_kept() {
+    use legion_image::attest::{self, SLSA_PROVENANCE_1, SPDX};
+    use legion_image::cosign::PrivateKey;
+    let registry = Arc::new(Mutex::new(Registry::default()));
+    let addr = serve(registry.clone()).await;
+    let client = Client::new().unwrap().plain_http(&addr);
+    let r = Reference::parse(&format!("{addr}/me/app:1")).unwrap();
+    let digest = format!("sha256:{}", "c".repeat(64));
+    let key = PrivateKey::generate();
+    let other = PrivateKey::generate();
+
+    let none = attest::fetch(&client, &r, &digest, &[key.public()], None)
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+    let required = [SPDX.to_owned(), SLSA_PROVENANCE_1.to_owned()];
+    assert_eq!(
+        attest::missing(&none, &required),
+        Some((SPDX, "none is kept".to_owned()))
+    );
+
+    let sbom = serde_json::json!({"packages": [{"SPDXID": "SPDXRef-Package-0", "name": "nginx", "versionInfo": "1.26.2"}]});
+    keep_attestations(
+        &registry,
+        &digest,
+        &[
+            (SPDX, sbom, &key),
+            (SLSA_PROVENANCE_1, serde_json::json!({}), &other),
+        ],
+    );
+    let found = attest::fetch(&client, &r, &digest, &[key.public()], None)
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(found[0].predicate_type, SPDX);
+    assert_eq!(
+        found[0].verified.as_deref(),
+        Some(key.public().fingerprint())
+    );
+    assert_eq!(
+        attest::sbom_packages(SPDX, &found[0].predicate),
+        [("nginx".to_owned(), "1.26.2".to_owned())]
+    );
+    assert_eq!(found[1].verified, None);
+    assert_eq!(
+        attest::missing(&found, &required),
+        Some((
+            SLSA_PROVENANCE_1,
+            "made by none of the keys given".to_owned()
+        ))
+    );
+    // Without keys: read, verified by none, and no fault found.
+    let read = attest::fetch(&client, &r, &digest, &[], None)
+        .await
+        .unwrap();
+    assert!(read.iter().all(|f| f.verified.is_none() && f.why.is_none()));
+}

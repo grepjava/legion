@@ -134,6 +134,7 @@ Linux hosts, an ecosystem of tools and charts, or proven production use.
 | Hardened by default | No raw sockets, chflags, mlock, SysV IPC or mounts; securelevel 2 | Default capabilities, seccomp profile | Depends on Pod Security Admission |
 | Loosening per workload | `security.allow`, only as far as the namespace permits | `--cap-add` and similar | securityContext, limited by Pod Security levels |
 | Admission webhooks | No | No | Yes |
+| Image signatures and attestations | `ImagePolicy`: cosign key-pair signatures, and signed SLSA provenance and SBOM attestations, enforced or warned per repository pattern; Builds sign and attest with jailer | Docker Content Trust, checked by the client | With a policy add-on (Sigstore policy-controller, Kyverno) |
 
 ## Operations
 

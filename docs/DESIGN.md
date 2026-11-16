@@ -1264,6 +1264,29 @@ says why that went and what was kept of it.
   making and checking signatures is `legion_image::cosign`, which jailer
   signs with. Not covered: cosign v3 bundles (OCI 1.1 referrers), the
   transparency log, keyless signing and cosign's encrypted private keys.
+- **Attestations** (SBOM and provenance): a policy's `attestations` name
+  predicate types an image must also carry, by cosign's names
+  (`slsaprovenance1`, `slsaprovenance`, `spdxjson`, `cyclonedx`, `vuln`)
+  or a URI, kept as URIs. Once its signature is good, each is looked for
+  as cosign and jailer keep them (`cosign attest`, `jailer attest`): a
+  DSSE envelope of an in-toto statement (v1, or v0.1), a layer of
+  `<repo>:sha256-<hex>.att`, signed with ECDSA P-256 over DSSE's
+  pre-authentication encoding by one of the policy's keys, its subject
+  naming the digest that runs. One type with none good holds the pod as
+  a bad signature does, saying which type and why (`none is kept`, `made
+  by none of the keys given`, unreadable); under `warn` it runs, saying
+  so. The types found are recorded with the signature
+  (`status.images.verified[image].attestations`). `legion image inspect`
+  lists an image's attestations, each with the covering policies' key
+  that signed it or why none did, and `legion image sbom` an SBOM's
+  packages (SPDX's or CycloneDX's), as the console's image details do.
+  Making them is jailer's: a Build with `signingKeySecret` (a Secret
+  holding the private key, as `jailer key generate` writes it) runs
+  `jailer push --sign-key` and `jailer attest` for SLSA provenance v1, of
+  its release record, and an SPDX SBOM of the image's packages; its
+  status says `attested`. Reading and checking them is
+  `legion_image::attest`. An SBOM is not checked against the image's
+  contents: it says what its signer says.
 - **Layers**: each layer is decompressed (gzip, zstd or plain) and checked
   against its `diff_id` **before** anything is extracted: images share
   layers by chain id, so a layer claiming another's id would otherwise

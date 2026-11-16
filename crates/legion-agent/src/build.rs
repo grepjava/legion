@@ -188,6 +188,14 @@ async fn build(
             .map_err(|e| io("the registry's login", e))?;
         env.push(("REGISTRY_AUTH_FILE".to_owned(), auth.display().to_string()));
     }
+    let key = dir.join("sign.key");
+    let signing = !opts.sign_key.is_empty();
+    if signing {
+        write_private(&key, &opts.sign_key)
+            .await
+            .map_err(|e| io("the signing key", e))?;
+    }
+    let key_arg = key.display().to_string();
     let record = dir.join("record.json");
     let tag = tag(short);
     let (program, before) = b.jailer.split_first().expect("checked");
@@ -211,15 +219,12 @@ async fn build(
         inbound,
     )
     .await?;
-    step(
-        "jailer push",
-        program,
-        &with(&["push", "--record", &record_arg, &tag, &opts.image]),
-        &env,
-        tx,
-        inbound,
-    )
-    .await?;
+    let mut push = vec!["push", "--record", &record_arg];
+    if signing {
+        push.extend(["--sign-key", &key_arg]);
+    }
+    push.extend([tag.as_str(), &opts.image]);
+    step("jailer push", program, &with(&push), &env, tx, inbound).await?;
     let r: Record = serde_json::from_slice(
         &tokio::fs::read(&record)
             .await
@@ -230,6 +235,26 @@ async fn build(
         .published
         .last()
         .ok_or_else(|| Status::internal("jailer's record names nothing pushed"))?;
+    if signing {
+        // Provenance from the record, and the SBOM of the image built.
+        for (kind, more) in [("provenance", None), ("sbom", Some(tag.as_str()))] {
+            let mut args = vec!["attest", "--key", &key_arg, "--type", kind];
+            args.extend(["--record", &record_arg]);
+            if let Some(image) = more {
+                args.extend(["--image", image]);
+            }
+            args.push(&pushed.pinned);
+            step(
+                &format!("jailer attest {kind}"),
+                program,
+                &with(&args),
+                &env,
+                tx,
+                inbound,
+            )
+            .await?;
+        }
+    }
     let _ = tx
         .send(frame(Frame::Built(BuildResult {
             digest: pushed.digest.clone(),

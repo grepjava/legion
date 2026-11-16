@@ -23,6 +23,13 @@ pub struct BuildSpec {
     /// config, as `imagePullSecrets` hold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_secret: Option<String>,
+    /// A Secret of the namespace holding a P-256 private key (PEM, as
+    /// `jailer key generate` or `cosign generate-key-pair` makes, not
+    /// encrypted): the image pushed is signed with it, and SLSA provenance
+    /// and an SPDX SBOM attested (`jailer attest`), as an ImagePolicy
+    /// requiring them checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key_secret: Option<String>,
     /// Once pushed, this Service's container runs the image, pinned to
     /// the digest pushed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,6 +103,9 @@ pub struct BuildStatus {
     pub digest: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pinned: String,
+    /// Pushed signed, with provenance and an SBOM attested.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attested: bool,
     /// When it started and ended, in milliseconds since the epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_ms: Option<i64>,
@@ -161,6 +171,9 @@ impl Spec for BuildSpec {
                 "image",
                 "must name a registry, a repository and a tag: registry.example/team/app:2",
             ));
+        }
+        if let Some(s) = &self.signing_key_secret {
+            check_name("signingKeySecret", s)?;
         }
         if let Some(s) = &self.push_secret {
             check_name("pushSecret", s)?;

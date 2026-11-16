@@ -633,6 +633,15 @@ pub(crate) async fn inspect_registry_image(
                 .any(|pat| legion_api::image::matches(pat, &repo_name))
         })
         .collect();
+    let keys: Vec<cosign::PublicKey> = covering.iter().flat_map(|p| p.keys.clone()).collect();
+    let attestations =
+        match legion_image::attest::fetch(&client, &r, &digest, &keys, creds.as_ref()).await {
+            Ok(found) => found.into_iter().map(attestation).collect(),
+            Err(e) => {
+                tracing::debug!(image = %r, "attestations: {e}");
+                Vec::new()
+            }
+        };
     let signed = if covering.is_empty() {
         false
     } else {
@@ -664,7 +673,42 @@ pub(crate) async fn inspect_registry_image(
     out.platforms = platforms;
     out.tags = tags;
     out.signed = signed;
+    out.attestations = attestations;
     Ok(Response::new(out))
+}
+
+/// How much of a predicate that is no SBOM is sent.
+const PREDICATE_SHOWN: usize = 64 * 1024;
+
+/// An attestation as the API sends it: an SBOM's packages, or the
+/// predicate.
+fn attestation(f: legion_image::attest::Found) -> pb::ImageAttestation {
+    use legion_image::attest;
+    let sbom = attest::is_sbom(&f.predicate_type);
+    let packages = attest::sbom_packages(&f.predicate_type, &f.predicate)
+        .into_iter()
+        .map(|(name, version)| pb::ImagePackage { name, version })
+        .collect();
+    let predicate_json = if sbom || f.predicate.is_null() {
+        String::new()
+    } else {
+        let mut json = serde_json::to_string_pretty(&f.predicate).unwrap_or_default();
+        if json.len() > PREDICATE_SHOWN {
+            let mut end = PREDICATE_SHOWN;
+            while !json.is_char_boundary(end) {
+                end -= 1;
+            }
+            json.truncate(end);
+        }
+        json
+    };
+    pb::ImageAttestation {
+        predicate_type: f.predicate_type,
+        verified_key: f.verified.unwrap_or_default(),
+        why: f.why.unwrap_or_default(),
+        packages,
+        predicate_json,
+    }
 }
 
 /// A node's cached image audited (`ScanImage`): its packages, those with

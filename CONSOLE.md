@@ -315,7 +315,10 @@ on the host, as its agent is told, the way a Volume's data is sent.
   ref and a directory in it; or a Containerfile written out, with nothing
   else), the image to push (`registry/repo:tag`), the Secret holding the
   registry's login (a Docker config, as `imagePullSecrets`), and,
-  optionally, the Service and container to roll out once pushed. Its
+  optionally, the Service and container to roll out once pushed, and a
+  Secret holding a signing key (`signingKeySecret`): the image is pushed
+  signed, with SLSA provenance and an SPDX SBOM attested (`jailer push
+  --sign-key`, `jailer attest`), for an ImagePolicy requiring them. Its
   status: `Pending`, `Running` on a node, `Succeeded` with the pushed
   digest and the reference pinned to it, or `Failed` saying why; the last
   of its log is kept with it. A Build runs once; another build is another

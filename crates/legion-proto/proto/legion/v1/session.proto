@@ -125,6 +125,9 @@ message BuildOptions {
   bytes auth = 6;
   // Registries spoken to over plain HTTP, as the cluster's are.
   repeated string plain_http = 7;
+  // A P-256 private key (PEM): the image is pushed signed with it, and
+  // its provenance and SBOM attested (jailer push --sign-key, attest).
+  bytes sign_key = 8;
 }
 
 // What a build pushed.

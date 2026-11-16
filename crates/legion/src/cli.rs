@@ -2532,6 +2532,51 @@ async fn run_image_command(
                 print_table(["IMAGE", "TAG", "SOURCE", "DESCRIPTION"], &rows);
             }
         }
+        crate::ImageCommand::Sbom {
+            image,
+            namespace,
+            secret,
+            json,
+        } => {
+            let r = cluster
+                .inspect_registry_image(pb::InspectRegistryImageRequest {
+                    image,
+                    namespace: namespace.unwrap_or_default(),
+                    secret: secret.unwrap_or_default(),
+                    node: String::new(),
+                })
+                .await?
+                .into_inner();
+            let Some(sbom) = sbom_of(&r) else {
+                bail!("{} ({}) has no SBOM attested", r.image, r.digest);
+            };
+            if json {
+                let packages: Vec<_> = sbom
+                    .packages
+                    .iter()
+                    .map(|p| serde_json::json!({ "name": p.name, "version": p.version }))
+                    .collect();
+                let out = serde_json::json!({
+                    "image": r.image,
+                    "digest": r.digest,
+                    "predicateType": sbom.predicate_type,
+                    "verifiedKey": sbom.verified_key,
+                    "packages": packages,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                println!("Image:     {}", r.image);
+                println!("Digest:    {}", r.digest);
+                println!("SBOM:      {}", attestation_line(sbom));
+                let rows: Vec<[String; 2]> = sbom
+                    .packages
+                    .iter()
+                    .map(|p| [p.name.clone(), p.version.clone()])
+                    .collect();
+                println!();
+                print_table(["PACKAGE", "VERSION"], &rows);
+            }
+        }
         crate::ImageCommand::Inspect {
             image,
             namespace,
@@ -2666,8 +2711,36 @@ async fn stop(
     })
 }
 
-/// How an image was built and runs, and what uses it, as `legion images
+/// How an image was built and runs, and what uses it, as `legion image
 /// inspect` shows it.
+/// An attestation's type and who signed it, on one line.
+fn attestation_line(a: &pb::ImageAttestation) -> String {
+    let signed = if !a.verified_key.is_empty() {
+        format!("signed by {}", a.verified_key)
+    } else if !a.why.is_empty() {
+        format!("NOT VERIFIED: {}", a.why)
+    } else {
+        "unverified: no ImagePolicy covers the image".to_owned()
+    };
+    let packages = match a.packages.len() {
+        0 => String::new(),
+        n => format!(", {n} packages"),
+    };
+    format!("{}{packages} ({signed})", a.predicate_type)
+}
+
+/// The SBOM to show of an image's attestations: one verified, if any is.
+fn sbom_of(r: &pb::InspectRegistryImageResponse) -> Option<&pb::ImageAttestation> {
+    let sboms = || {
+        r.attestations
+            .iter()
+            .filter(|a| legion_image::attest::is_sbom(&a.predicate_type))
+    };
+    sboms()
+        .find(|a| !a.verified_key.is_empty())
+        .or_else(|| sboms().next())
+}
+
 fn image_details(r: &pb::InspectRegistryImageResponse) -> String {
     let mut out = String::new();
     let mut line = |name: &str, v: &str| {
@@ -2696,6 +2769,14 @@ fn image_details(r: &pb::InspectRegistryImageResponse) -> String {
     } else {
         line("Used by:", &r.used_by.join(", "));
     }
+    for (i, a) in r.attestations.iter().enumerate() {
+        let name = if i == 0 { "Attested:" } else { "" };
+        out += &format!(
+            "{name:<11}{}
+",
+            attestation_line(a)
+        );
+    }
     if !r.history.is_empty() {
         out += "\nHistory, first step first:\n";
         for s in &r.history {
@@ -2715,6 +2796,46 @@ fn image_details(r: &pb::InspectRegistryImageResponse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_images_attestations_say_who_signed_them_and_the_sbom_is_found() {
+        use legion_image::attest::{SLSA_PROVENANCE_1, SPDX};
+        let a = |t: &str, key: &str, why: &str, n: usize| pb::ImageAttestation {
+            predicate_type: t.into(),
+            verified_key: key.into(),
+            why: why.into(),
+            packages: (0..n)
+                .map(|i| pb::ImagePackage {
+                    name: format!("p{i}"),
+                    version: "1".into(),
+                })
+                .collect(),
+            predicate_json: String::new(),
+        };
+        let r = pb::InspectRegistryImageResponse {
+            attestations: vec![
+                a(SPDX, "", "made by none of the keys given", 1),
+                a(SLSA_PROVENANCE_1, "", "", 0),
+                a(SPDX, "sha256:k", "", 2),
+            ],
+            ..Default::default()
+        };
+        let out = image_details(&r);
+        assert!(
+            out.contains(&format!(
+                "Attested:  {SPDX}, 1 packages (NOT VERIFIED: made by none of the keys given)"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "           {SLSA_PROVENANCE_1} (unverified: no ImagePolicy covers the image)"
+            )),
+            "{out}"
+        );
+        assert_eq!(sbom_of(&r).unwrap().verified_key, "sha256:k");
+        assert!(sbom_of(&pb::InspectRegistryImageResponse::default()).is_none());
+    }
 
     #[test]
     fn a_stack_is_its_labelled_services_together() {
