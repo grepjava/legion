@@ -1,4 +1,4 @@
-//! `jailer init`: scaffolds a FreeBSD `Containerfile` and `.containerignore`
+//! `legion local init`: scaffolds a FreeBSD `Containerfile` and `.containerignore`
 //! tailored for Legion (`docker.io/freebsd/freebsd-runtime:15.1` and
 //! `docker.io/freebsd/freebsd-notoolchain:15.1`).
 

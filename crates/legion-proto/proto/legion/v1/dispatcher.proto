@@ -214,7 +214,7 @@ message NodeTelemetry {
   // Of `zfs_used_bytes`: the image store's and the tasks' roots'.
   uint64 images_bytes = 6;
   uint64 jails_bytes = 7;
-  // jailer's store, where builds keep their images and cache; outside
+  // the builder's store, where builds keep their images and cache; outside
   // Legion's ZFS root, 0 on a node without one.
   uint64 build_bytes = 8;
 }

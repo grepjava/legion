@@ -19,7 +19,7 @@
 #[cfg(unix)]
 pub mod browser;
 pub mod idp;
-pub mod jailer;
+pub mod local;
 pub mod registry;
 
 use std::io::Write;

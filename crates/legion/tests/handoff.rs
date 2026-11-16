@@ -1,44 +1,42 @@
-//! The image handoff (jailer's ROADMAP, P1.4; PLAN.md phase 3): an image
-//! jailer builds and records is the image Legion runs, by both routes.
+//! The image handoff (PLAN.md phase 3): an image
+//! `legion local` builds and records is the image Legion runs, by both routes.
 //!
-//! - From a registry: jailer pushes to the registry this test serves (see
-//!   [`registry`]), and every task runs the digest jailer recorded, through
+//! - From a registry: `legion local` pushes to the registry this test serves (see
+//!   [`registry`]), and every task runs the digest `legion local` recorded, through
 //!   a scale, a redeployment after the tag moved to a build in zstd, and a
 //!   rollback.
-//! - Offline: jailer exports an archive, every node loads it with
-//!   `legion image load`, and every task runs the manifest jailer recorded.
-//! - With data (jailer's ROADMAP, shared qualification; PLAN.md phases 4
-//!   and 5): a stateful task of a jailer image writes to its Volume, its
+//! - Offline: `legion local` exports an archive, every node loads it with
+//!   `legion image load`, and every task runs the manifest `legion local` recorded.
+//! - With data (the shared qualification; PLAN.md phases 4
+//!   and 5): a stateful task of a `legion local` image writes to its Volume, its
 //!   node is drained, and on the next node it runs the same manifest with
 //!   the same data, its first writer having stopped before the data moved;
 //!   and again with the move's last part cut short and sent again.
-//! - Signed (PLAN.md phase 7): jailer signs what it pushes as cosign does,
+//! - Signed (PLAN.md phase 7): `legion local` signs what it pushes as cosign does,
 //!   and an ImagePolicy wanting its key runs it, by tag or by the digest
-//!   jailer recorded; it holds an unsigned image until jailer signs it, one
+//!   `legion local` recorded; it holds an unsigned image until `legion local` signs it, one
 //!   signed by another key, a loaded one, and an update whose signature the
 //!   registry cannot give, the old tasks running; under warn it runs an
 //!   unsigned image and says so.
-//! - From build to recovery (PLAN.md phase 8, jailer's shared qualification):
-//!   one signed jailer image runs under a policy enforcing its key, through
+//! - From build to recovery (PLAN.md phase 8, the shared qualification):
+//!   one signed `legion local` image runs under a policy enforcing its key, through
 //!   a drain, a move cut short and a restore onto another host, on the
-//!   digest jailer recorded at every stage, its data the same.
-//! - Across platforms (jailer's shared qualification): jailer pushes one
+//!   digest `legion local` recorded at every stage, its data the same.
+//! - Across platforms (the shared qualification): `legion local` pushes one
 //!   signed index of an amd64 image built here and an arm64 one built on an
 //!   arm64 host; every node pins the index and runs its own platform's
 //!   manifest, a Service wanting arm64 waits for an arm64 node, and an
 //!   index with no amd64 image is refused once on each node, not retried.
 //!
 //! It drives real daemons, so it is ignored by default and run by hand on a
-//! FreeBSD host as root, with the lab of `tests/common` (see there), and with
-//! a jailer binary in `LEGION_JAILER`; jailer pulls its base image from
-//! Docker Hub:
+//! FreeBSD host as root, with the lab of `tests/common` (see there);
+//! `legion local` pulls its base image from Docker Hub:
 //!
 //! ```sh
 //! sudo LEGION_CLUSTER_LAB=/var/tmp/lhandoff \
 //!     LEGION_CLUSTER_HOST=10.78.0.1 \
 //!     LEGION_CLUSTER_VMS="lab2=lab@10.78.0.2 lab3=lab@10.78.0.3" \
 //!     LEGION_CLUSTER_KEY=/home/lab/.ssh/id_ed25519 \
-//!     LEGION_JAILER=/home/lab/jailer/target/debug/jailer \
 //!     target/debug/deps/handoff-<hash> --ignored --nocapture
 //! ```
 
@@ -48,7 +46,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::jailer::{Jailer, record, unique};
+use common::local::{Local, record, unique};
 use common::registry::Registry;
 use common::{Lab, Role, ZFS_ROOT, kill_receiving, text, wait};
 use serde_json::Value;
@@ -150,7 +148,7 @@ impl Lab {
                 Some(pinned) => assert_eq!(t["spec"]["images"][image], pinned, "{t}"),
                 None => assert!(t["spec"]["images"].get(image).is_none(), "{t}"),
             }
-            assert_eq!(self.id_in(&t), id, "the build jailer recorded");
+            assert_eq!(self.id_in(&t), id, "the build `legion local` recorded");
         }
     }
 
@@ -163,19 +161,19 @@ impl Lab {
 }
 
 #[test]
-#[ignore = "needs root and ZFS on FreeBSD, two more nodes and jailer; see the module docs"]
-fn a_jailer_archive_runs_as_exported() {
+#[ignore = "needs root and ZFS on FreeBSD and two more nodes; see the module docs"]
+fn a_local_archive_runs_as_exported() {
     let mut lab = Lab::from_env();
-    let jailer = Jailer::new(&lab, &[]);
+    let builder = Local::new(&lab, &[]);
     let step = |what: &str| eprintln!("--- {what}");
 
-    step("jailer builds an image and exports it under two names");
+    step("`legion local` builds an image and exports it under two names");
     let rec = lab.dir.join("offline.json");
     let id = unique("offline");
-    jailer.build(&lab.dir, "handoff/app:1", &id, &rec);
+    builder.build(&lab.dir, "handoff/app:1", &id, &rec);
     let local = lab.dir.join("local.oci.tar");
     let named = lab.dir.join("named.oci.tar");
-    jailer.run(&[
+    builder.run(&[
         "export",
         "--record",
         rec.to_str().unwrap(),
@@ -184,7 +182,7 @@ fn a_jailer_archive_runs_as_exported() {
     ]);
     // A registry's name that resolves nowhere: asking it fails.
     let registry_named = "registry.invalid/handoff/app:1";
-    jailer.run(&[
+    builder.run(&[
         "export",
         "--record",
         rec.to_str().unwrap(),
@@ -234,12 +232,12 @@ fn a_jailer_archive_runs_as_exported() {
 }
 
 #[test]
-#[ignore = "needs root and ZFS on FreeBSD, two more nodes and jailer; see the module docs"]
-fn a_jailer_push_is_what_legion_runs() {
+#[ignore = "needs root and ZFS on FreeBSD and two more nodes; see the module docs"]
+fn a_local_push_is_what_legion_runs() {
     let mut lab = Lab::from_env();
     let registry = Registry::start(&lab);
     let addr = registry.addr.clone();
-    let jailer = Jailer::new(&lab, &[&addr]);
+    let builder = Local::new(&lab, &[&addr]);
     let image = format!("{addr}/handoff/app:1");
     let step = |what: &str| eprintln!("--- {what}");
 
@@ -250,8 +248,8 @@ fn a_jailer_push_is_what_legion_runs() {
         let rec = dir.join(format!("{name}.json"));
         let id = unique(name);
         let tag = format!("handoff/{name}:1");
-        jailer.build_with(&dir, &tag, &id, &rec, &[], flags);
-        jailer.run(&["push", "--record", rec.to_str().unwrap(), &tag, &image]);
+        builder.build_with(&dir, &tag, &id, &rec, &[], flags);
+        builder.run(&["push", "--record", rec.to_str().unwrap(), &tag, &image]);
         let r = record(&rec);
         let p = r.published.last().expect("the push is recorded");
         assert_eq!(p.reference, image);
@@ -260,21 +258,21 @@ fn a_jailer_push_is_what_legion_runs() {
         (p.pinned.clone(), r.built().manifest.clone(), id)
     };
 
-    step("jailer builds an image and pushes it");
+    step("`legion local` builds an image and pushes it");
     let (pinned1, manifest1, id1) = push("first", &[]);
 
-    step("the cluster resolves the tag to what jailer pushed");
+    step("the cluster resolves the tag to what `legion local` pushed");
     lab.flags = format!("{} --insecure-registry {addr}", lab.flags);
     lab.three_nodes(&["--insecure-registry", &addr]);
     lab.apply("namespace", NAMESPACE);
     lab.apply("web", &service("web", &image, 2, ""));
     lab.runs("web", &image, 2, &manifest1, Some(&pinned1), &id1);
 
-    step("jailer pushes another build to the same tag, its layer in zstd");
+    step("`legion local` pushes another build to the same tag, its layer in zstd");
     let (pinned2, manifest2, id2) = push("second", &["--compression", "zstd"]);
     assert_ne!(manifest2, manifest1);
     let held: Value =
-        serde_json::from_str(&jailer.run(&["manifest", "inspect", &pinned2])).unwrap();
+        serde_json::from_str(&builder.run(&["manifest", "inspect", &pinned2])).unwrap();
     let zstd = "application/vnd.oci.image.layer.v1.tar+zstd";
     assert_eq!(
         held["layers"].as_array().unwrap().last().unwrap()["mediaType"],
@@ -298,7 +296,7 @@ fn a_jailer_push_is_what_legion_runs() {
     step("done");
 }
 
-/// The writer of [`a_jailer_image_keeps_its_data_through_a_drain`]: the
+/// The writer of [`a_local_image_keeps_its_data_through_a_drain`]: the
 /// first start keeps the build it ran and some random data; every start
 /// then logs lines of its own until it is stopped, and logs that last.
 const WRITER: &str = r#"me=$(date +%s)-$$
@@ -440,16 +438,16 @@ fn a_writer_back_after_another_is_two_writers() {
 }
 
 #[test]
-#[ignore = "needs root and ZFS on FreeBSD, two more nodes and jailer; see the module docs"]
-fn a_jailer_image_keeps_its_data_through_a_drain() {
+#[ignore = "needs root and ZFS on FreeBSD and two more nodes; see the module docs"]
+fn a_local_image_keeps_its_data_through_a_drain() {
     let mut lab = Lab::from_env();
-    let jailer = Jailer::new(&lab, &[]);
+    let builder = Local::new(&lab, &[]);
     let step = |what: &str| eprintln!("--- {what}");
 
-    step("jailer builds a writer, its layers in zstd, and exports it");
+    step("`legion local` builds a writer, its layers in zstd, and exports it");
     let rec = lab.dir.join("keep.json");
     let id = unique("keep");
-    jailer.build_with(
+    builder.build_with(
         &lab.dir,
         "handoff/keep:1",
         &id,
@@ -458,7 +456,7 @@ fn a_jailer_image_keeps_its_data_through_a_drain() {
         &["--compression", "zstd"],
     );
     let tar = lab.dir.join("keep.oci.tar");
-    jailer.run(&[
+    builder.run(&[
         "export",
         "--record",
         rec.to_str().unwrap(),
@@ -476,7 +474,7 @@ fn a_jailer_image_keeps_its_data_through_a_drain() {
     let image = "localhost/handoff/keep:1";
     lab.apply("keep", &keeper(image, ""));
     let before = lab.one("keep", image, &manifest);
-    assert_eq!(lab.id_in(&before), id, "the build jailer recorded");
+    assert_eq!(lab.id_in(&before), id, "the build `legion local` recorded");
     assert_eq!(text(&lab.file_in(&before, "/data/born")), id);
     let blob = lab.file_in(&before, "/data/blob");
     assert_eq!(blob.len(), 256 * 1024);
@@ -513,7 +511,7 @@ fn a_jailer_image_keeps_its_data_through_a_drain() {
     lab.ok(&["node", "activate", &from]);
 
     step("the image and the data are the same; one writer at a time");
-    assert_eq!(lab.id_in(&after), id, "the build jailer recorded");
+    assert_eq!(lab.id_in(&after), id, "the build `legion local` recorded");
     assert_eq!(text(&lab.file_in(&after, "/data/born")), id);
     assert!(
         lab.file_in(&after, "/data/blob") == blob,
@@ -530,10 +528,10 @@ fn a_jailer_image_keeps_its_data_through_a_drain() {
     step("done");
 }
 
-/// The registry [`a_jailer_push_is_what_legion_runs`] and others run
+/// The registry [`a_local_push_is_what_legion_runs`] and others run
 /// (`common::registry`).
 #[test]
-#[ignore = "the registry of a_jailer_push_is_what_legion_runs, run by it"]
+#[ignore = "the registry of a_local_push_is_what_legion_runs, run by it"]
 fn registry() {
     common::registry::run();
 }
@@ -561,23 +559,23 @@ impl Lab {
     }
 }
 
-/// As [`a_jailer_image_keeps_its_data_through_a_drain`], with the move cut
+/// As [`a_local_image_keeps_its_data_through_a_drain`], with the move cut
 /// short (PLAN.md phase 6, as `stateful.rs` cuts Postgres's): the full copy
 /// is made while the task runs, as its service lets none stop; then the
 /// task may stop, and the last part's `zfs receive` is killed as it
 /// receives. The part is sent again, and the moved task has every byte and
 /// every line. `n1` is paused, so the task and its move are on the VMs.
 #[test]
-#[ignore = "needs root and ZFS on FreeBSD, two more nodes and jailer; see the module docs"]
-fn a_jailer_image_keeps_its_data_through_a_cut_move() {
+#[ignore = "needs root and ZFS on FreeBSD and two more nodes; see the module docs"]
+fn a_local_image_keeps_its_data_through_a_cut_move() {
     let mut lab = Lab::from_env();
-    let jailer = Jailer::new(&lab, &[]);
+    let builder = Local::new(&lab, &[]);
     let step = |what: &str| eprintln!("--- {what}");
 
-    step("jailer builds a writer and exports it");
+    step("`legion local` builds a writer and exports it");
     let rec = lab.dir.join("cut.json");
     let id = unique("cut");
-    jailer.build_with(
+    builder.build_with(
         &lab.dir,
         "handoff/keep:1",
         &id,
@@ -586,7 +584,7 @@ fn a_jailer_image_keeps_its_data_through_a_cut_move() {
         &[],
     );
     let tar = lab.dir.join("cut.oci.tar");
-    jailer.run(&[
+    builder.run(&[
         "export",
         "--record",
         rec.to_str().unwrap(),
@@ -603,7 +601,7 @@ fn a_jailer_image_keeps_its_data_through_a_cut_move() {
     let image = "localhost/handoff/keep:1";
     lab.apply("keep", &keeper(image, "  maxUnavailable: 0\n"));
     let before = lab.one("keep", image, &manifest);
-    assert_eq!(lab.id_in(&before), id, "the build jailer recorded");
+    assert_eq!(lab.id_in(&before), id, "the build `legion local` recorded");
     let blob = lab.file_in(&before, "/data/blob");
     let from = before["spec"]["node"].as_str().unwrap().to_owned();
     let to = if from == "n2" { "n3" } else { "n2" };
@@ -676,7 +674,7 @@ fn a_jailer_image_keeps_its_data_through_a_cut_move() {
     assert_eq!(lab.keep_volume()["status"]["node"], to);
 
     step("the image and every byte the same; one writer at a time; nothing left over");
-    assert_eq!(lab.id_in(&after), id, "the build jailer recorded");
+    assert_eq!(lab.id_in(&after), id, "the build `legion local` recorded");
     assert_eq!(text(&lab.file_in(&after, "/data/born")), id);
     assert!(lab.file_in(&after, "/data/blob") == blob, "the first data");
     assert!(
@@ -756,22 +754,22 @@ impl Lab {
     }
 }
 
-/// jailer's signature, as Legion checks it (PLAN.md phase 7): an
-/// ImagePolicy wanting jailer's key runs what jailer signed, and holds what
+/// `legion local`'s signature, as Legion checks it (PLAN.md phase 7): an
+/// ImagePolicy wanting `legion local`'s key runs what `legion local` signed, and holds what
 /// it did not, or what it cannot check, the old tasks running.
 #[test]
-#[ignore = "needs root and ZFS on FreeBSD, two more nodes and jailer; see the module docs"]
-fn a_jailer_signature_is_what_legion_checks() {
+#[ignore = "needs root and ZFS on FreeBSD and two more nodes; see the module docs"]
+fn a_local_signature_is_what_legion_checks() {
     let mut lab = Lab::from_env();
     let registry = Registry::start(&lab);
     let addr = registry.addr.clone();
-    let jailer = Jailer::new(&lab, &[&addr]);
+    let builder = Local::new(&lab, &[&addr]);
     let step = |what: &str| eprintln!("--- {what}");
 
-    step("jailer makes two key pairs");
+    step("`legion local` makes two key pairs");
     let path = |p: PathBuf| p.to_str().unwrap().to_owned();
     for name in ["good", "other"] {
-        jailer.run(&["key", "generate", &path(lab.dir.join(name))]);
+        builder.run(&["key", "generate", &path(lab.dir.join(name))]);
     }
     let good_key = path(lab.dir.join("good.key"));
     let good_pub = path(lab.dir.join("good.pub"));
@@ -789,23 +787,23 @@ fn a_jailer_signature_is_what_legion_checks() {
         let rec = dir.join(format!("{name}.json"));
         let id = unique(name);
         let tag = format!("handoff/{name}:1");
-        jailer.build(&dir, &tag, &id, &rec);
+        builder.build(&dir, &tag, &id, &rec);
         let mut args = vec!["push", "--record", rec.to_str().unwrap()];
         if let Some(k) = sign {
             args.extend(["--sign-key", k]);
         }
         args.extend([tag.as_str(), image]);
-        jailer.run(&args);
+        builder.run(&args);
         let r = record(&rec);
         let p = r.published.last().expect("the push is recorded");
         assert_eq!(p.reference, image);
         (p.pinned.clone(), p.digest.clone(), id)
     };
 
-    step("jailer pushes a signed image and checks its signature");
+    step("`legion local` pushes a signed image and checks its signature");
     let image = format!("{addr}/handoff/app:1");
     let (pinned1, digest1, id1) = push("signed", &image, Some(&good_key));
-    jailer.run(&["verify", "--key", &good_pub, &image]);
+    builder.run(&["verify", "--key", &good_pub, &image]);
 
     step("a policy without a registry, or with a bad key, is refused");
     lab.flags = format!("{} --insecure-registry {addr}", lab.flags);
@@ -823,7 +821,9 @@ fn a_jailer_signature_is_what_legion_checks() {
         "key",
     );
 
-    step("policies: jailer's key enforced on the registry and loaded images, warned elsewhere");
+    step(
+        "policies: `legion local`'s key enforced on the registry and loaded images, warned elsewhere",
+    );
     let enforced = [
         format!("{addr}/handoff/**"),
         "localhost/handoff/**".to_owned(),
@@ -838,7 +838,7 @@ fn a_jailer_signature_is_what_legion_checks() {
         &policy("warned", &[&format!("{addr}/warned/**")], &[&pem], "warn"),
     );
 
-    step("the signed image runs, checked on the digest jailer signed");
+    step("the signed image runs, checked on the digest `legion local` signed");
     lab.apply("web", &service("web", &image, 2, ""));
     lab.runs("web", &image, 2, &digest1, Some(&pinned1), &id1);
     lab.verified_by("web", &image, &digest1, &key);
@@ -849,13 +849,13 @@ fn a_jailer_signature_is_what_legion_checks() {
     lab.verified_by("pinned", &pinned1, &digest1, &key);
     lab.delete("pinned");
 
-    step("an unsigned push is held until jailer signs it");
+    step("an unsigned push is held until `legion local` signs it");
     let plain = format!("{addr}/handoff/plain:1");
     let (pinned2, digest2, id2) = push("plain", &plain, None);
     lab.apply("plain", &service("plain", &plain, 1, ""));
     lab.held("plain", &format!("{plain} is unsigned"));
     assert!(lab.running("plain").is_empty(), "no task of it runs");
-    jailer.run(&["sign", "--key", &good_key, &plain]);
+    builder.run(&["sign", "--key", &good_key, &plain]);
     lab.runs("plain", &plain, 1, &digest2, Some(&pinned2), &id2);
     lab.verified_by("plain", &plain, &digest2, &key);
     lab.delete("plain");
@@ -937,7 +937,7 @@ fn a_jailer_signature_is_what_legion_checks() {
 
     step("a loaded image the policy names has no signature to check");
     let tar = lab.dir.join("signed.oci.tar");
-    jailer.run(&["export", "handoff/signed:1", tar.to_str().unwrap()]);
+    builder.run(&["export", "handoff/signed:1", tar.to_str().unwrap()]);
     lab.load_image(tar.to_str().unwrap());
     let local = "localhost/handoff/signed:1";
     lab.apply("local", &service("local", local, 1, ""));
@@ -954,9 +954,7 @@ fn a_jailer_signature_is_what_legion_checks() {
         &[&pem],
         "enforce",
     );
-    required.push_str(
-        "  attestations: [slsaprovenance1, spdxjson]\n",
-    );
+    required.push_str("  attestations: [slsaprovenance1, spdxjson]\n");
     lab.apply("policy-attested", &required);
     lab.apply("attested", &service("attested", &attested, 1, ""));
     lab.held(
@@ -968,7 +966,7 @@ fn a_jailer_signature_is_what_legion_checks() {
     step("an SBOM signed by another key is no good either");
     let rec = lab.dir.join("attested.json");
     let rec = rec.to_str().unwrap();
-    jailer.run(&[
+    builder.run(&[
         "attest",
         "--key",
         &good_key,
@@ -978,7 +976,7 @@ fn a_jailer_signature_is_what_legion_checks() {
         rec,
         &pinned5,
     ]);
-    jailer.run(&[
+    builder.run(&[
         "attest",
         "--key",
         &other_key,
@@ -993,8 +991,8 @@ fn a_jailer_signature_is_what_legion_checks() {
         &format!("{attested}: no good attestation of https://spdx.dev/Document: made by none of the keys given"),
     );
 
-    step("attested by jailer with the policy's key, it runs, its SBOM shown");
-    jailer.run(&[
+    step("attested by `legion local` with the policy's key, it runs, its SBOM shown");
+    builder.run(&[
         "attest",
         "--key",
         &good_key,
@@ -1086,33 +1084,33 @@ impl Lab {
         for t in self.running(service) {
             assert_eq!(
                 t["status"]["images"][image], digest,
-                "{at}: the digest jailer recorded\n{t}"
+                "{at}: the digest `legion local` recorded\n{t}"
             );
         }
     }
 }
 
-/// Phase 8 of PLAN.md, jailer's shared qualification: one jailer image,
-/// one identity, from its build to its recovery. jailer builds a writer,
+/// Phase 8 of PLAN.md, the shared qualification: one `legion local` image,
+/// one identity, from its build to its recovery. `legion local` builds a writer,
 /// signs it and pushes it; Legion runs it under an ImagePolicy enforcing
-/// jailer's key, drains its node, moves it back with the move's last part
+/// `legion local`'s key, drains its node, moves it back with the move's last part
 /// cut short, backs its Volume up, loses the host it is on and restores it
-/// onto another. At every stage the task runs the digest jailer recorded,
+/// onto another. At every stage the task runs the digest `legion local` recorded,
 /// the one the policy verified, and its data is the same, byte for byte.
 ///
 /// A drain or a move keeps the verification the pod was given, for the
 /// same digest; a restore applies the Service again, and the policy checks
 /// the signature again before its task runs.
 #[test]
-#[ignore = "needs root and ZFS on FreeBSD, two more nodes and jailer; see the module docs"]
-fn a_jailer_image_goes_from_build_to_recovery() {
+#[ignore = "needs root and ZFS on FreeBSD and two more nodes; see the module docs"]
+fn a_local_image_goes_from_build_to_recovery() {
     let mut lab = Lab::from_env();
     let registry = Registry::start(&lab);
     let addr = registry.addr.clone();
-    let jailer = Jailer::new(&lab, &[&addr]);
+    let builder = Local::new(&lab, &[&addr]);
     let step = |what: &str| eprintln!("--- {what}");
 
-    step("the versions: jailer, the Legion crates it was built with, and Legion");
+    step("the version of Legion, which builds the image too");
     let version = |bin: &str| {
         let out = Command::new(bin).arg("--version").output().unwrap();
         assert!(
@@ -1122,22 +1120,16 @@ fn a_jailer_image_goes_from_build_to_recovery() {
         );
         text(&out.stdout).trim().to_owned()
     };
-    let jailer_version = version(&jailer.bin);
-    // jailer names the Legion crates it was built with, from its lock.
-    assert!(
-        jailer_version.contains(" (legion ") && !jailer_version.ends_with("(legion unknown)"),
-        "jailer names the Legion crates it was built with: {jailer_version}"
-    );
     let legion_version = version(common::LEGION);
     let tree = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.qualify-revision");
     let revision = std::fs::read_to_string(&tree)
         .map(|r| r.trim().to_owned())
         .unwrap_or_else(|_| "unrecorded".to_owned());
-    eprintln!("versions: {jailer_version}; {legion_version} at {revision}");
+    eprintln!("version: {legion_version} at {revision}");
 
-    step("jailer makes a key pair, builds a writer, signs it and pushes it");
+    step("`legion local` makes a key pair, builds a writer, signs it and pushes it");
     let path = |p: PathBuf| p.to_str().unwrap().to_owned();
-    jailer.run(&["key", "generate", &path(lab.dir.join("chain"))]);
+    builder.run(&["key", "generate", &path(lab.dir.join("chain"))]);
     let sign_key = path(lab.dir.join("chain.key"));
     let public = path(lab.dir.join("chain.pub"));
     let pem = std::fs::read_to_string(&public).unwrap();
@@ -1147,7 +1139,7 @@ fn a_jailer_image_goes_from_build_to_recovery() {
         .to_owned();
     let rec = lab.dir.join("chain.json");
     let id = unique("chain");
-    jailer.build_with(
+    builder.build_with(
         &lab.dir,
         "handoff/chain:1",
         &id,
@@ -1156,7 +1148,7 @@ fn a_jailer_image_goes_from_build_to_recovery() {
         &[],
     );
     let image = format!("{addr}/handoff/chain:1");
-    jailer.run(&[
+    builder.run(&[
         "push",
         "--record",
         rec.to_str().unwrap(),
@@ -1174,13 +1166,13 @@ fn a_jailer_image_goes_from_build_to_recovery() {
         "what was built is what was pushed"
     );
     let (digest, pinned) = (p.digest.clone(), p.pinned.clone());
-    let said = jailer.run(&["verify", "--key", &public, &image]);
+    let said = builder.run(&["verify", "--key", &public, &image]);
     assert!(
         said.contains(&format!("is signed by the key {key}")),
-        "jailer's check names the key Legion's policy will: {said}"
+        "`legion local`'s check names the key Legion's policy will: {said}"
     );
 
-    step("Legion, under a policy enforcing jailer's key, runs it on a VM");
+    step("Legion, under a policy enforcing `legion local`'s key, runs it on a VM");
     lab.flags = format!("{} --insecure-registry {addr}", lab.flags);
     lab.three_nodes(&["--insecure-registry", &addr]);
     lab.apply("namespace", NAMESPACE);
@@ -1201,7 +1193,7 @@ fn a_jailer_image_goes_from_build_to_recovery() {
     let first = lab.one("keep", &image, &digest);
     assert_eq!(lab.images("keep")["resolved"][&image], pinned.as_str());
     lab.carries("keep", &image, &digest, &key, "deployed");
-    assert_eq!(lab.id_in(&first), id, "the build jailer recorded");
+    assert_eq!(lab.id_in(&first), id, "the build `legion local` recorded");
     assert_eq!(text(&lab.file_in(&first, "/data/born")), id);
     let blob = lab.file_in(&first, "/data/blob");
     assert_eq!(blob.len(), 256 * 1024);
@@ -1240,7 +1232,7 @@ fn a_jailer_image_goes_from_build_to_recovery() {
     assert_eq!(second["spec"]["node"], b.as_str());
     lab.ok(&["node", "activate", &a]);
     lab.carries("keep", &image, &digest, &key, "after the drain");
-    assert_eq!(lab.id_in(&second), id, "the build jailer recorded");
+    assert_eq!(lab.id_in(&second), id, "the build `legion local` recorded");
     assert!(
         lab.file_in(&second, "/data/blob") == blob,
         "the data came along"
@@ -1288,7 +1280,7 @@ fn a_jailer_image_goes_from_build_to_recovery() {
     assert_eq!(lab.keep_volume()["status"]["node"], a.as_str());
     lab.ok(&["node", "activate", &b]);
     lab.carries("keep", &image, &digest, &key, "after the cut move");
-    assert_eq!(lab.id_in(&third), id, "the build jailer recorded");
+    assert_eq!(lab.id_in(&third), id, "the build `legion local` recorded");
     assert!(lab.file_in(&third, "/data/blob") == blob, "the first data");
     assert!(
         lab.file_in(&third, "/data/ballast") == ballast,
@@ -1343,7 +1335,7 @@ fn a_jailer_image_goes_from_build_to_recovery() {
     assert_eq!(lab.images("keep")["resolved"][&image], pinned.as_str());
 
     step("the image and every byte the same; each writer in turn");
-    assert_eq!(lab.id_in(&fourth), id, "the build jailer recorded");
+    assert_eq!(lab.id_in(&fourth), id, "the build `legion local` recorded");
     assert_eq!(text(&lab.file_in(&fourth, "/data/born")), id);
     assert!(lab.file_in(&fourth, "/data/blob") == blob, "the first data");
     assert!(
@@ -1362,15 +1354,15 @@ fn a_jailer_image_goes_from_build_to_recovery() {
         lab.node_state(&a) == "ready"
     });
     lab.delete("keep");
-    eprintln!("versions: {jailer_version}; {legion_version} at {revision}; image {digest}");
+    eprintln!("version: {legion_version} at {revision}; image {digest}");
     step("done");
 }
 
-/// The arm64 half of [`a_jailer_index_runs_each_nodes_platform`]: built by
-/// jailer on FreeBSD aarch64 from `FROM scratch` and an `/arch` saying
+/// The arm64 half of [`a_local_index_runs_each_nodes_platform`]: built by
+/// `legion local` on FreeBSD aarch64 from `FROM scratch` and an `/arch` saying
 /// `arm64`, and exported; see `fixtures/README.md`. It never runs here,
 /// nor goes into a store here: the test puts it in the registry.
-const ARM64: &[u8] = include_bytes!("fixtures/jailer-arch-arm64.tar");
+const ARM64: &[u8] = include_bytes!("fixtures/local-arch-arm64.tar");
 
 /// Pushes the image an OCI `archive` holds to `image` in the plain-HTTP
 /// registry at `addr`, unpacking it in `dir`: its blobs, then its manifest
@@ -1514,7 +1506,7 @@ impl Lab {
     }
 }
 
-/// One index across platforms (jailer's shared qualification): jailer
+/// One index across platforms (the shared qualification): `legion local`
 /// pushes an amd64 image built here and an arm64 one built on an arm64
 /// host as one signed index. The service pins the index, the policy checks
 /// its signature on that digest, and each node runs its own platform's
@@ -1522,17 +1514,17 @@ impl Lab {
 /// index of arm64 alone is refused once on each node, then waits, until
 /// the service runs other images.
 #[test]
-#[ignore = "needs root and ZFS on FreeBSD, two more nodes and jailer; see the module docs"]
-fn a_jailer_index_runs_each_nodes_platform() {
+#[ignore = "needs root and ZFS on FreeBSD and two more nodes; see the module docs"]
+fn a_local_index_runs_each_nodes_platform() {
     let mut lab = Lab::from_env();
     let registry = Registry::start(&lab);
     let addr = registry.addr.clone();
-    let jailer = Jailer::new(&lab, &[&addr]);
+    let builder = Local::new(&lab, &[&addr]);
     let step = |what: &str| eprintln!("--- {what}");
     let path = |p: PathBuf| p.to_str().unwrap().to_owned();
 
-    step("jailer makes a key pair");
-    jailer.run(&["key", "generate", &path(lab.dir.join("arch"))]);
+    step("`legion local` makes a key pair");
+    builder.run(&["key", "generate", &path(lab.dir.join("arch"))]);
     let sign_key = path(lab.dir.join("arch.key"));
     let pub_key = path(lab.dir.join("arch.pub"));
     let pem = std::fs::read_to_string(&pub_key).unwrap();
@@ -1541,15 +1533,15 @@ fn a_jailer_index_runs_each_nodes_platform() {
         .fingerprint()
         .to_owned();
 
-    // jailer keeps only images of its own platform, so the arm64 host's
-    // push is the registry's to hold, as `jailer publish` stages it.
-    step("the arm64 host pushes its image; jailer builds the amd64 one");
+    // `legion local` keeps only images of its own platform, so the arm64 host's
+    // push is the registry's to hold, as `legion local publish` stages it.
+    step("the arm64 host pushes its image; `legion local` builds the amd64 one");
     let arm64 = format!("{addr}/handoff/arch:arm64");
     put_archive(&lab.dir.join("arch-arm64"), ARM64, &addr, &arm64);
     let rec = lab.dir.join("arch.json");
     let id = unique("arch");
     let amd64 = "handoff/arch:amd64";
-    jailer.build_with(&lab.dir, amd64, &id, &rec, &[("arch", "amd64\n")], &[]);
+    builder.build_with(&lab.dir, amd64, &id, &rec, &[("arch", "amd64\n")], &[]);
 
     // Pushes an index of `sources` to `image`, signed and recorded in
     // `rec`: its digest, its pinned reference, and its platforms.
@@ -1565,7 +1557,7 @@ fn a_jailer_index_runs_each_nodes_platform() {
             image,
         ];
         args.extend_from_slice(sources);
-        jailer.run(&args);
+        builder.run(&args);
         let r = record(rec);
         let p = r.published.last().expect("the push is recorded");
         assert_eq!(p.reference, image);
@@ -1574,7 +1566,7 @@ fn a_jailer_index_runs_each_nodes_platform() {
         (p.digest.clone(), p.pinned.clone(), p.platforms.clone())
     };
 
-    step("jailer pushes one signed index of both and checks its signature");
+    step("`legion local` pushes one signed index of both and checks its signature");
     let image = format!("{addr}/handoff/arch:1");
     let (index, pinned, platforms) = push(&image, &[amd64, &arm64], &rec);
     let amd64_manifest = record(&rec).built().manifest.clone();
@@ -1588,9 +1580,9 @@ fn a_jailer_index_runs_each_nodes_platform() {
         index, amd64_manifest,
         "the index, not a platform's manifest"
     );
-    jailer.run(&["verify", "--key", &pub_key, &image]);
+    builder.run(&["verify", "--key", &pub_key, &image]);
 
-    step("a cluster of amd64 nodes, under a policy enforcing jailer's key");
+    step("a cluster of amd64 nodes, under a policy enforcing `legion local`'s key");
     lab.flags = format!("{} --insecure-registry {addr}", lab.flags);
     lab.three_nodes(&["--insecure-registry", &addr]);
     lab.apply("namespace", NAMESPACE);

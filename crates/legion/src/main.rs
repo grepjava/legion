@@ -185,14 +185,14 @@ enum Command {
         /// the node's address, port 3260].
         #[arg(long)]
         iscsi_portal: Option<String>,
-        /// The jailer a builder node (labelled `legion.builder=true`) builds
-        /// images with, for Builds; defaults to `legion jailer`.
+        /// The program a builder node (labelled `legion.builder=true`) builds
+        /// images with, for Builds [default: this legion, as `legion local`].
         #[arg(long)]
-        jailer: Option<String>,
-        /// An argument put before each of jailer's commands, such as
+        builder: Option<String>,
+        /// An argument put before each of the builder's commands, such as
         /// `--state-dir=/var/db/legion-builds`; may be given again.
-        #[arg(long = "jailer-arg", allow_hyphen_values = true)]
-        jailer_args: Vec<String>,
+        #[arg(long = "builder-arg", allow_hyphen_values = true)]
+        builder_args: Vec<String>,
     },
     /// Start a new cluster with the reached manager as its first member.
     Init,
@@ -387,8 +387,8 @@ enum Command {
         #[command(subcommand)]
         command: StackCommand,
     },
-    /// Local standalone images, builds, and containers (built-in jailer).
-    #[command(name = "local", visible_alias = "jailer")]
+    /// Images, builds and containers on this host alone, without a cluster.
+    #[command(name = "local")]
     Local(local::Cli),
     /// Build a FreeBSD OCI image from a Containerfile.
     Build(local::BuildCli),
@@ -705,8 +705,8 @@ pub enum ImageCommand {
     Prune {
         #[arg(long)]
         node: Option<String>,
-        /// Prune jailer's build store on builders instead: the layers and
-        /// cache no image there uses (`jailer prune`).
+        /// Prune the build store on builders instead: the layers and cache
+        /// no image there uses (`legion local prune`).
         #[arg(long)]
         builds: bool,
     },
@@ -982,23 +982,23 @@ pub enum StackCommand {
 /// must be single-threaded.
 pub const JAIL_SHIM: &str = "jail-shim";
 
+/// The program, and the arguments before each of its commands, a builder
+/// node builds images with: `program` if given, else this legion's `local`.
+fn builder_command(program: Option<String>, args: Vec<String>) -> Vec<String> {
+    let program = program.map(|p| vec![p]).unwrap_or_else(|| {
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.into_os_string().into_string().ok())
+            .unwrap_or_else(|| "legion".to_owned());
+        vec![exe, "local".to_owned()]
+    });
+    program.into_iter().chain(args).collect()
+}
+
 fn main() -> anyhow::Result<()> {
     let argv: Vec<String> = std::env::args().collect();
-    if argv
-        .first()
-        .and_then(|p| std::path::Path::new(p).file_stem())
-        .and_then(|s| s.to_str())
-        == Some("jailer")
-    {
-        return local::main();
-    }
     if argv.get(1).map(String::as_str) == Some(JAIL_SHIM) {
         std::process::exit(legion_jail::shim::main(&argv[2..]));
-    }
-    if matches!(argv.get(1).map(String::as_str), Some("local" | "jailer"))
-        && argv.get(2).map(String::as_str) == Some(JAIL_SHIM)
-    {
-        std::process::exit(legion_jail::shim::main(&argv[3..]));
     }
     std::thread::Builder::new()
         .name("legion-main".into())
@@ -1065,8 +1065,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
             iscsi_targets,
             iscsi_portal_group,
             iscsi_portal,
-            jailer,
-            jailer_args,
+            builder,
+            builder_args,
             insecure_registries,
             audit_retention_days,
             audit_max_events,
@@ -1121,23 +1121,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 iscsi_targets,
                 iscsi_portal_group,
                 iscsi_portal,
-                jailer: match jailer {
-                    Some(j) => std::iter::once(j).chain(jailer_args).collect(),
-                    None => {
-                        let exe = std::env::current_exe()
-                            .ok()
-                            .and_then(|p| p.into_os_string().into_string().ok());
-                        match exe {
-                            Some(bin) => std::iter::once(bin)
-                                .chain(std::iter::once("local".to_owned()))
-                                .chain(jailer_args)
-                                .collect(),
-                            None => std::iter::once("jailer".to_owned())
-                                .chain(jailer_args)
-                                .collect(),
-                        }
-                    }
-                },
+                builder: builder_command(builder, builder_args),
                 insecure_registries,
                 audit: legion_manager::AuditRetention {
                     age: std::time::Duration::from_secs(audit_retention_days * 24 * 3600),

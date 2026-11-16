@@ -1,6 +1,6 @@
-//! jailer as the tests drive it: `LEGION_JAILER`, with a state directory
-//! of its own in the lab directory, and what they read of its release
-//! records.
+//! `legion local` as the tests drive it: the legion under test, with a
+//! state directory of its own in the lab directory, and what they read of
+//! its release records.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -9,8 +9,8 @@ use serde::Deserialize;
 
 use super::{Lab, text};
 
-/// What the tests read of a jailer release record, schema 1 (jailer's
-/// docs/RELEASE-RECORD.md).
+/// What the tests read of a release record, schema 1
+/// (docs/RELEASE-RECORD.md).
 #[derive(Deserialize)]
 pub struct Record {
     pub schema: u32,
@@ -59,36 +59,37 @@ pub fn record(path: &Path) -> Record {
     r
 }
 
-/// The jailer in `LEGION_JAILER`, with a state directory of its own in the
-/// lab directory, on plain directories.
-pub struct Jailer {
+/// `legion local` of the legion under test, with a state directory of its
+/// own in the lab directory, on plain directories.
+pub struct Local {
     pub bin: String,
     pub state: PathBuf,
     /// Registries it talks to over plain HTTP.
     pub plain: Vec<String>,
 }
 
-impl Jailer {
-    pub fn new(lab: &Lab, plain: &[&str]) -> Jailer {
-        let bin = std::env::var("LEGION_JAILER").expect("set LEGION_JAILER to a jailer binary");
-        assert!(Path::new(&bin).is_file(), "no jailer at {bin}");
-        Jailer {
-            bin,
-            state: lab.dir.join("jailer"),
+impl Local {
+    pub fn new(lab: &Lab, plain: &[&str]) -> Local {
+        Local {
+            bin: super::LEGION.to_owned(),
+            state: lab.dir.join("local"),
             plain: plain.iter().map(|p| p.to_string()).collect(),
         }
     }
 
     pub fn run(&self, args: &[&str]) -> String {
         let mut c = Command::new(&self.bin);
-        c.arg("--state-dir").arg(&self.state).arg("--no-zfs");
+        c.arg("local")
+            .arg("--state-dir")
+            .arg(&self.state)
+            .arg("--no-zfs");
         for p in &self.plain {
             c.args(["--plain-http", p]);
         }
         let out = c.args(args).stdin(Stdio::null()).output().unwrap();
         assert!(
             out.status.success(),
-            "jailer {args:?}: {}{}",
+            "legion local {args:?}: {}{}",
             text(&out.stdout),
             text(&out.stderr)
         );
@@ -128,7 +129,7 @@ impl Jailer {
     }
 }
 
-impl Jailer {
+impl Local {
     /// Builds the Containerfile in `ctx` as it is, into `tag` and the
     /// record `rec`.
     pub fn build_dir(&self, ctx: &Path, tag: &str, rec: &Path) {
@@ -143,7 +144,7 @@ impl Jailer {
     }
 }
 
-impl Drop for Jailer {
+impl Drop for Local {
     /// Its store holds base layers with `schg` files.
     fn drop(&mut self) {
         let d = self.state.display();

@@ -11,7 +11,7 @@
 //!
 //! A container with neither annotation is a standalone member: a jail of
 //! its own on the host's network (`ip4`/`ip6` inherited), set up as a pod's
-//! member is. Legion's agent never makes one; jailer runs images so.
+//! member is. Legion's agent never makes one; `legion local` runs images so.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
@@ -2305,14 +2305,23 @@ mod tests {
         names.sort();
         assert_eq!(names, ["local.sqlite", "local.sqlite-wal"]);
         let q = pkg_shell(copy.path());
-        let args: Vec<_> = q.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<_> = q
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(
             args,
-            ["-o", &format!("PKG_DBDIR={}", copy.path().display()), "shell"]
+            [
+                "-o",
+                &format!("PKG_DBDIR={}", copy.path().display()),
+                "shell"
+            ]
         );
         assert!(PACKAGES_SQL.contains("SELECT name, version FROM packages"));
         // What SQLite writes when the statement fails; pkg's own lines pass.
-        assert!(sqlite_failed("Parse error near line 2: no such table: packages"));
+        assert!(sqlite_failed(
+            "Parse error near line 2: no such table: packages"
+        ));
         assert!(!sqlite_failed("pkg: DEBUG: -/-\n"));
     }
 

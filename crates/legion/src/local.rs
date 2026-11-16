@@ -20,33 +20,43 @@ use legion_build::{Reference, shim};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "jailer",
+    name = "legion local",
     version = env!("CARGO_PKG_VERSION"),
     about = "Build, test, and publish FreeBSD jail OCI images for Legion"
 )]
 pub struct Cli {
-    /// Directory where jailer keeps images and container state
-    #[arg(long, env = "JAILER_STATE_DIR", global = true, value_name = "DIR")]
+    /// Directory where the local mode keeps images and container state
+    #[arg(
+        long,
+        env = "LEGION_LOCAL_STATE_DIR",
+        global = true,
+        value_name = "DIR"
+    )]
     pub state_dir: Option<PathBuf>,
 
-    /// ZFS root dataset for image layers and container clones (e.g. zroot/jailer)
-    #[arg(long, env = "JAILER_ZFS_ROOT", global = true, value_name = "DATASET")]
+    /// ZFS root dataset for image layers and container clones (e.g. zroot/legion-local)
+    #[arg(
+        long,
+        env = "LEGION_LOCAL_ZFS_ROOT",
+        global = true,
+        value_name = "DATASET"
+    )]
     pub zfs_root: Option<String>,
 
     /// Use plain directory storage instead of ZFS
-    /// (`JAILER_NO_ZFS=1`, `yes` or `true`)
+    /// (`LEGION_LOCAL_NO_ZFS=1`, `yes` or `true`)
     #[arg(
         long,
-        env = "JAILER_NO_ZFS",
+        env = "LEGION_LOCAL_NO_ZFS",
         global = true,
         value_parser = clap::builder::FalseyValueParser::new()
     )]
     pub no_zfs: bool,
 
-    /// Pods' network on jailer's bridge [default: 10.77.0.0/16]
+    /// Pods' network on the local mode's bridge [default: 10.77.0.0/16]
     #[arg(
         long,
-        env = "JAILER_POD_SUBNET",
+        env = "LEGION_LOCAL_POD_SUBNET",
         global = true,
         value_name = "CIDR",
         value_parser = legion_build::net::parse_subnet
@@ -135,12 +145,12 @@ pub enum Commands {
         #[arg(long, value_name = "BIN")]
         entrypoint: Option<String>,
 
-        /// Run in a pod with a network stack of its own, on jailer's bridge
+        /// Run in a pod with a network stack of its own, on the local mode's bridge
         /// (`--network bridge`)
         #[arg(long)]
         vnet: bool,
 
-        /// The network: the host's, jailer's bridge (as `--vnet`), or none
+        /// The network: the host's, the local mode's bridge (as `--vnet`), or none
         /// (a pod with only its loopback)
         #[arg(long, value_enum, default_value_t = NetworkArg::Host)]
         network: NetworkArg,
@@ -247,12 +257,17 @@ pub enum Commands {
         #[arg(long, value_name = "FILE")]
         record: Option<PathBuf>,
 
-        /// The jailer on the hosts
-        #[arg(long, value_name = "PATH", default_value = "jailer")]
-        remote_jailer: String,
+        /// The legion program on the hosts
+        #[arg(long, value_name = "PATH", default_value = "legion")]
+        remote_legion: String,
 
         /// The program to reach the hosts with
-        #[arg(long, env = "JAILER_SSH", value_name = "PATH", default_value = "ssh")]
+        #[arg(
+            long,
+            env = "LEGION_LOCAL_SSH",
+            value_name = "PATH",
+            default_value = "ssh"
+        )]
         ssh: String,
 
         /// Registry reference to publish to (e.g. ghcr.io/me/app:1.0)
@@ -269,7 +284,7 @@ pub enum Commands {
 
     /// Sign an image already in a registry, as cosign does with a key pair
     Sign {
-        /// The private key (PEM), from `jailer key generate`
+        /// The private key (PEM), from `legion local key generate`
         #[arg(long, value_name = "PATH")]
         key: PathBuf,
 
@@ -317,7 +332,7 @@ pub enum Commands {
 
     /// Attest provenance or an SBOM for an image in a registry, as cosign does
     Attest {
-        /// The private key (PEM), from `jailer key generate`
+        /// The private key (PEM), from `legion local key generate`
         #[arg(long, value_name = "PATH")]
         key: PathBuf,
 
@@ -631,7 +646,7 @@ fn is_root() -> bool {
 #[cfg(unix)]
 fn require_root(what: &str) -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
-        bail!("`jailer {what}` needs root to manage jails; run it with sudo or doas");
+        bail!("`legion local {what}` needs root to manage jails; run it with sudo or doas");
     }
     Ok(())
 }
@@ -640,7 +655,7 @@ fn require_root(what: &str) -> Result<()> {
 pub enum KeyCommand {
     /// Write a new key pair: PREFIX.key (private, mode 0600) and PREFIX.pub
     Generate {
-        #[arg(default_value = "jailer")]
+        #[arg(default_value = "legion")]
         prefix: PathBuf,
     },
 }
@@ -690,18 +705,42 @@ pub enum ManifestCommand {
 }
 
 fn default_state_dir() -> PathBuf {
+    state_dir_named("legion-local")
+}
+
+/// The state directory of `name`: `/var/db/<name>` for root, else
+/// `~/.local/share/<name>`.
+fn state_dir_named(name: &str) -> PathBuf {
     #[cfg(unix)]
     if unsafe { libc::geteuid() } == 0 {
-        return PathBuf::from("/var/db/jailer");
+        return Path::new("/var/db").join(name);
     }
     if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        return PathBuf::from(home)
-            .join(".local")
-            .join("share")
-            .join("jailer");
+        return PathBuf::from(home).join(".local").join("share").join(name);
     }
-    PathBuf::from("/var/db/jailer")
+    Path::new("/var/db").join(name)
 }
+
+/// The standalone jailer's state, where it kept it by default, moved to
+/// the local mode's default once, before the store is opened: only when
+/// no state directory and no ZFS root are given, as those are the user's.
+fn move_jailers_state(cli: &Cli, sys: &dyn Sys, zfs_root: Option<&str>) -> Result<()> {
+    if cli.state_dir.is_some() {
+        return Ok(());
+    }
+    let datasets = (cli.zfs_root.is_none() && zfs_root == Some(DEFAULT_ZFS_ROOT))
+        .then_some((legion_local::migrate::OLD_DATASET, DEFAULT_ZFS_ROOT));
+    let old = state_dir_named(legion_local::migrate::OLD_DIR_NAME);
+    if let Some(said) =
+        legion_local::migrate::jailer_state(sys, &old, &default_state_dir(), datasets)?
+    {
+        eprintln!("{said}");
+    }
+    Ok(())
+}
+
+/// The ZFS root found on its own: under the pool `zroot`.
+const DEFAULT_ZFS_ROOT: &str = "zroot/legion-local";
 
 fn resolve_zfs_root(cli: &Cli, sys: &dyn Sys) -> Option<String> {
     if cli.no_zfs {
@@ -716,7 +755,7 @@ fn resolve_zfs_root(cli: &Cli, sys: &dyn Sys) -> Option<String> {
         if let Ok(list) = sys.zfs_list("zroot")
             && !list.is_empty()
         {
-            return Some("zroot/jailer".to_owned());
+            return Some(DEFAULT_ZFS_ROOT.to_owned());
         }
     }
     let _ = sys;
@@ -839,8 +878,10 @@ fn on_exit(cli: &Cli, id: &str, rm: bool) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
-    // As this run found its store, so the helper does.
-    cmd.arg("--state-dir")
+    // `legion local`, as this run is; then as it found its store, so the
+    // helper does.
+    cmd.arg("local")
+        .arg("--state-dir")
         .arg(cli.state_dir.clone().unwrap_or_else(default_state_dir));
     match resolve_zfs_root(cli, &Shell::new()) {
         Some(root) => cmd.arg("--zfs-root").arg(root),
@@ -851,8 +892,8 @@ fn on_exit(cli: &Cli, id: &str, rm: bool) -> Result<()> {
         cmd.arg("--rm");
     }
     cmd.arg(id)
-        .env_remove("JAILER_NO_ZFS")
-        .env_remove("JAILER_ZFS_ROOT")
+        .env_remove("LEGION_LOCAL_NO_ZFS")
+        .env_remove("LEGION_LOCAL_ZFS_ROOT")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -886,6 +927,7 @@ fn open_state(cli: &Cli, linux: bool) -> Result<(Arc<dyn Sys>, Arc<Store>, JailR
     let sys: Arc<dyn Sys> = Arc::new(Shell::new());
     let state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
     let zfs_root = resolve_zfs_root(cli, &*sys);
+    move_jailers_state(cli, &*sys, zfs_root.as_deref())?;
     let images_zfs = zfs_root.as_ref().map(|r| format!("{r}/images"));
     let jails_zfs = zfs_root.as_ref().map(|r| format!("{r}/jails"));
 
@@ -899,7 +941,7 @@ fn open_state(cli: &Cli, linux: bool) -> Result<(Arc<dyn Sys>, Arc<Store>, JailR
         legion_build::store::open(sys.clone(), images_zfs.as_deref(), &images_dir, client)?
             .with_linux(linux),
     );
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("jailer"));
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("legion"));
     let runtime = JailRuntime::new(
         sys.clone(),
         store.clone(),
@@ -924,7 +966,7 @@ fn print_report(report: &CheckReport) {
     }
 }
 
-/// The password `jailer login --password-stdin` read: its first line,
+/// The password `legion local login --password-stdin` read: its first line,
 /// as `echo $TOKEN |` gives it.
 fn password_from_stdin(input: &str) -> Result<String> {
     let line = input.lines().next().unwrap_or("");
@@ -998,7 +1040,7 @@ pub struct BuildArgs {
     /// Keep cached layers that no image uses to about this size (e.g. 10g, or `none`)
     #[arg(
         long,
-        env = "JAILER_CACHE_MAX",
+        env = "LEGION_LOCAL_CACHE_MAX",
         default_value = "10g",
         value_name = "SIZE"
     )]
@@ -1105,30 +1147,42 @@ pub struct VmBuildArgs {
 #[derive(Subcommand, Debug)]
 pub enum BuildTarget {
     /// Build a FreeBSD jail OCI image from a Containerfile
-    Jail(BuildArgs),
+    Jail(Box<BuildArgs>),
     /// Build a bhyve VM OCI image containing `/disk.img`
     Vm(VmBuildArgs),
 }
 
+/// `legion build`: a jail image from a Containerfile, as `legion local
+/// build`, or `legion build vm`. The store's flags may come before `vm` or
+/// after it; a jail build's flags only without `vm`.
 #[derive(clap::Args, Debug)]
-#[command(args_conflicts_with_subcommands = true)]
 pub struct BuildCli {
     #[command(subcommand)]
     pub kind: Option<BuildTarget>,
 
     /// Directory where images and build state are kept
-    #[arg(long, global = true, env = "JAILER_STATE_DIR", value_name = "DIR")]
+    #[arg(
+        long,
+        global = true,
+        env = "LEGION_LOCAL_STATE_DIR",
+        value_name = "DIR"
+    )]
     pub state_dir: Option<PathBuf>,
 
-    /// ZFS root dataset for image layers and build clones (e.g. zroot/jailer)
-    #[arg(long, global = true, env = "JAILER_ZFS_ROOT", value_name = "DATASET")]
+    /// ZFS root dataset for image layers and build clones (e.g. zroot/legion-local)
+    #[arg(
+        long,
+        global = true,
+        env = "LEGION_LOCAL_ZFS_ROOT",
+        value_name = "DATASET"
+    )]
     pub zfs_root: Option<String>,
 
     /// Use plain directory storage instead of ZFS
     #[arg(
         long,
         global = true,
-        env = "JAILER_NO_ZFS",
+        env = "LEGION_LOCAL_NO_ZFS",
         value_parser = clap::builder::FalseyValueParser::new()
     )]
     pub no_zfs: bool,
@@ -1137,7 +1191,7 @@ pub struct BuildCli {
     #[arg(
         long,
         global = true,
-        env = "JAILER_POD_SUBNET",
+        env = "LEGION_LOCAL_POD_SUBNET",
         value_name = "CIDR",
         value_parser = legion_build::net::parse_subnet
     )]
@@ -1160,11 +1214,16 @@ pub async fn run_build(args: BuildCli) -> Result<()> {
         plain_http: args.plain_http,
         command: Commands::Images,
     };
+    if args.kind.is_some() && jail_flags_given(&args.build) {
+        bail!(
+            "a jail build's flags go after `build` alone, or after `build jail`, not before a subcommand"
+        );
+    }
     match args.kind {
         Some(BuildTarget::Vm(vm)) => run_vm_build(&base, vm).await,
         Some(BuildTarget::Jail(build)) => {
             let cli = Cli {
-                command: Commands::Build(build),
+                command: Commands::Build(*build),
                 ..base
             };
             run_cli(&cli).await
@@ -1177,6 +1236,18 @@ pub async fn run_build(args: BuildCli) -> Result<()> {
             run_cli(&cli).await
         }
     }
+}
+
+/// Whether any of a jail build's own flags or its context were given, as
+/// they are not with a subcommand: what they would be with none given.
+fn jail_flags_given(build: &BuildArgs) -> bool {
+    #[derive(clap::Parser)]
+    struct Bare {
+        #[command(flatten)]
+        build: BuildArgs,
+    }
+    let bare = <Bare as clap::Parser>::try_parse_from(["build"]).map(|b| b.build);
+    bare.map_or(true, |bare| format!("{bare:?}") != format!("{build:?}"))
 }
 
 async fn run_vm_build(cli: &Cli, vm: VmBuildArgs) -> Result<()> {
@@ -1223,41 +1294,7 @@ async fn run_vm_build(cli: &Cli, vm: VmBuildArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn main() -> Result<()> {
-    // Handle `jail-shim` immediately before initializing async logging if invoked directly.
-    let raw_args: Vec<String> = std::env::args().collect();
-    if raw_args.get(1).map(String::as_str) == Some("jail-shim") {
-        std::process::exit(shim::main(&raw_args[2..]));
-    }
-    // The commands' future is large, more so in a debug build, and Windows
-    // gives the main thread 1 MiB of stack: run it on a thread with room.
-    std::thread::Builder::new()
-        .name("jailer".to_owned())
-        .stack_size(16 << 20)
-        .spawn(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?
-                .block_on(Box::pin(run()))
-        })?
-        .join()
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-}
-
-async fn run() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_target(false)
-        .init();
-
-    let cli = Cli::parse();
-    run_cli(&cli).await
-}
-
-/// Run a parsed `jailer` CLI command.
+/// Run a parsed `legion local` command.
 pub async fn run_cli(cli: &Cli) -> Result<()> {
     if let Some(subnet) = cli.pod_subnet {
         legion_build::net::choose_subnet(subnet);
@@ -1327,7 +1364,7 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
             if record.is_some() && *backend == BuildBackend::Buildah {
                 bail!("--record: not supported with --backend buildah");
             }
-            let (_, store, runtime) = open_context(&cli, false)?;
+            let (_, store, runtime) = open_context(cli, false)?;
             let tag = match tag {
                 Some(t) => t.clone(),
                 None => {
@@ -1450,7 +1487,7 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
             record,
             refs,
         } => {
-            let (_, store, _) = open_context(&cli, true)?;
+            let (_, store, _) = open_context(cli, true)?;
             let (source_image, target_str) = match refs.as_slice() {
                 [only] => {
                     // If `only` already names an image in the store, push it directly;
@@ -1503,12 +1540,12 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
             authfile,
             sign_key,
             record,
-            remote_jailer,
+            remote_legion,
             ssh,
             reference,
             context,
         } => {
-            let (_, store, _) = open_context(&cli, true)?;
+            let (_, store, _) = open_context(cli, true)?;
             let target_ref = Reference::parse(reference)?;
             let resolved_creds =
                 resolve_credentials(&target_ref.registry, creds.as_deref(), authfile.as_deref())?;
@@ -1527,7 +1564,7 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
                 containerfile: file.clone(),
                 build_stage: target.clone(),
                 build_args: build_args.clone(),
-                remote_jailer: remote_jailer.clone(),
+                remote_legion: remote_legion.clone(),
                 ssh: ssh.clone(),
             };
             let mut published =
@@ -1552,7 +1589,7 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
             target,
             sources,
         }) => {
-            let (_, store, _) = open_context(&cli, true)?;
+            let (_, store, _) = open_context(cli, true)?;
             let target_ref = Reference::parse(target)?;
             let resolved_creds =
                 resolve_credentials(&target_ref.registry, creds.as_deref(), authfile.as_deref())?;
@@ -1588,7 +1625,7 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
             record,
             reference,
         } => {
-            let (_, store, _) = open_context(&cli, true)?;
+            let (_, store, _) = open_context(cli, true)?;
             let r = Reference::parse(reference)?;
             let creds = resolve_credentials(&r.registry, creds.as_deref(), authfile.as_deref())?;
             let (digest, _) = store
@@ -1608,7 +1645,7 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
             record,
             reference,
         } => {
-            let (_, store, _) = open_context(&cli, true)?;
+            let (_, store, _) = open_context(cli, true)?;
             let r = Reference::parse(reference)?;
             let creds = resolve_credentials(&r.registry, creds.as_deref(), authfile.as_deref())?;
             let public = legion_build::sign::verifying_key(&legion_build::sign::read_key(key)?)?;
@@ -1651,7 +1688,7 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
             authfile,
             reference,
         } => {
-            let (_, store, _) = open_context(&cli, true)?;
+            let (_, store, _) = open_context(cli, true)?;
             let r = Reference::parse(reference)?;
             let creds = resolve_credentials(&r.registry, creds.as_deref(), authfile.as_deref())?;
             let private = legion_build::sign::signing_key(&legion_build::sign::read_key(key)?)?;
@@ -1701,7 +1738,7 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
         }
 
         Commands::Sbom { output, image } => {
-            let (_, store, _) = open_context(&cli, true)?;
+            let (_, store, _) = open_context(cli, true)?;
             let local = store
                 .find(image)?
                 .ok_or_else(|| anyhow::anyhow!("{image}: no such local image"))?;
@@ -1743,7 +1780,7 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
             authfile,
             reference,
         }) => {
-            let (_, store, _) = open_context(&cli, true)?;
+            let (_, store, _) = open_context(cli, true)?;
             let r = Reference::parse(reference)?;
             let resolved_creds =
                 resolve_credentials(&r.registry, creds.as_deref(), authfile.as_deref())?;
@@ -1762,7 +1799,7 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
             record,
             args,
         } => {
-            let (_, store, _) = open_context(&cli, true)?;
+            let (_, store, _) = open_context(cli, true)?;
             let (image_ref, out_path) = match (output, args.as_slice()) {
                 (Some(out), [img]) => (img.clone(), out.clone()),
                 (Some(out), []) => (default_local_image_for_cwd(), out.clone()),
@@ -1777,7 +1814,7 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
                     }
                 }
                 (None, [img, out]) => (img.clone(), PathBuf::from(out)),
-                _ => bail!("usage: jailer export [IMAGE] <OUTPUT.tar>"),
+                _ => bail!("usage: legion local export [IMAGE] <OUTPUT.tar>"),
             };
             // The archive names the image as it was asked for, not by
             // whichever of its names came first.
@@ -1807,10 +1844,10 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
         Commands::Doctor { json, operations } => {
             use legion_local::doctor;
             if !cfg!(target_os = "freebsd") {
-                bail!("`jailer doctor` checks a FreeBSD host");
+                bail!("`legion local doctor` checks a FreeBSD host");
             }
             let sys = Shell::new();
-            let zfs_root = resolve_zfs_root(&cli, &sys);
+            let zfs_root = resolve_zfs_root(cli, &sys);
             let host = doctor::Host {
                 root: is_root(),
                 zfs_root: zfs_root.as_deref(),
@@ -1865,8 +1902,8 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
                 checked_something = true;
             }
 
-            let (_, store, _) = open_context(&cli, true)?;
-            // A directory's image is tagged as `jailer build` tags it.
+            let (_, store, _) = open_context(cli, true)?;
+            // A directory's image is tagged as `legion build` tags it.
             let img_lookup = if target == "." {
                 default_local_image_for_cwd()
             } else if path.is_dir() {
@@ -1927,7 +1964,7 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
             linux,
             reference,
         } => {
-            let (_, store, _) = open_context(&cli, *linux)?;
+            let (_, store, _) = open_context(cli, *linux)?;
             let r = Reference::parse(reference)?;
             let resolved_creds =
                 resolve_credentials(&r.registry, creds.as_deref(), authfile.as_deref())?;
@@ -1939,7 +1976,7 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
         }
 
         Commands::Load { name, archive } => {
-            let (_, store, _) = open_context(&cli, true)?;
+            let (_, store, _) = open_context(cli, true)?;
             let img = store.load(archive, name.as_deref()).await?;
             println!(
                 "Loaded {} ({})",
@@ -1986,7 +2023,7 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
         }
 
         Commands::Images => {
-            let (_, store, _) = open_context(&cli, true)?;
+            let (_, store, _) = open_context(cli, true)?;
             let images = store.images()?;
             let w = images
                 .iter()
@@ -2033,7 +2070,7 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
         }
 
         Commands::Prune { cache, images } => {
-            let (_, store, runtime) = open_context(&cli, true)?;
+            let (_, store, runtime) = open_context(cli, true)?;
             if *images {
                 #[cfg(unix)]
                 use legion_runtime::Runtime;
@@ -2053,7 +2090,7 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
         }
 
         Commands::Rmi { references } => {
-            let (_, store, _) = open_context(&cli, true)?;
+            let (_, store, _) = open_context(cli, true)?;
             // Each that can go goes, as with `docker rmi`; then the
             // command fails if any could not.
             let mut missing = Vec::new();
@@ -2076,7 +2113,7 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
         | Commands::Exec { .. }
         | Commands::Stop { .. }
         | Commands::Rm { .. }
-        | Commands::OnExit { .. } => containers(&cli).await,
+        | Commands::OnExit { .. } => containers(cli).await,
     }
 }
 
@@ -2118,7 +2155,9 @@ fn signalled(_: bool) -> std::io::Result<impl Future<Output = i32>> {
 #[cfg(unix)]
 async fn containers(cli: &Cli) -> Result<()> {
     use futures::StreamExt;
-    use legion_build::runtime::{LABEL_IP, LABEL_POD, LABEL_PORTS, LABEL_ROLE, Mount, Network, RunSpec};
+    use legion_build::runtime::{
+        LABEL_IP, LABEL_POD, LABEL_PORTS, LABEL_ROLE, Mount, Network, RunSpec,
+    };
     use std::time::Duration;
 
     use legion_runtime::{Output, Runtime};
@@ -2179,7 +2218,7 @@ async fn containers(cli: &Cli) -> Result<()> {
                 // As Legion's agent does: the modules, and the fallback ELF
                 // brand set to Linux's where the host left it unset, so
                 // static Linux programs run. What cannot be done is said,
-                // and the run goes on, as `jailer doctor` tells the rest.
+                // and the run goes on, as `legion local doctor` tells the rest.
                 match legion_jail::enable_linux(sys.as_ref()) {
                     Ok(None) => {}
                     Ok(Some(note)) => eprintln!("warning: {note}"),
@@ -2228,7 +2267,9 @@ async fn containers(cli: &Cli) -> Result<()> {
             let vm_spec = if *vm {
                 let mem = legion_build::parse_size(vm_memory)
                     .filter(|&n| n > 0)
-                    .with_context(|| format!("--vm-memory {vm_memory:?}: give a size such as 512m"))?;
+                    .with_context(|| {
+                        format!("--vm-memory {vm_memory:?}: give a size such as 512m")
+                    })?;
                 if *vm_cpus == 0 {
                     bail!("--vm-cpus must be at least 1");
                 }
@@ -2254,7 +2295,7 @@ async fn containers(cli: &Cli) -> Result<()> {
                 let mut b = [0u8; 6];
                 getrandom::fill(&mut b).expect("random bytes");
                 b.iter()
-                    .fold("jailer-".to_owned(), |n, x| n + &format!("{x:02x}"))
+                    .fold("local-".to_owned(), |n, x| n + &format!("{x:02x}"))
             });
             let spec = RunSpec {
                 name,
@@ -2303,7 +2344,8 @@ async fn containers(cli: &Cli) -> Result<()> {
                     if *rm {
                         let _ = legion_build::runtime::remove(&runtime, &*sys, &leases, &id).await;
                     } else {
-                        let _ = legion_build::runtime::stop_pod(&runtime, &*sys, &leases, &id).await;
+                        let _ =
+                            legion_build::runtime::stop_pod(&runtime, &*sys, &leases, &id).await;
                     }
                     return Err(e.into());
                 }
@@ -2485,7 +2527,7 @@ async fn containers(cli: &Cli) -> Result<()> {
                 Err(e) => Err(e.into()),
             };
             match done {
-                // Gone before it exits, as by `jailer rm -f`: nothing to do.
+                // Gone before it exits, as by `legion local rm -f`: nothing to do.
                 Err(legion_build::Error::NotFound(_)) => Ok(()),
                 r => Ok(r?),
             }
@@ -2523,7 +2565,45 @@ async fn containers(_: &Cli) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{name_given, password_from_stdin};
+    use super::{BuildCli, BuildTarget, jail_flags_given, name_given, password_from_stdin};
+
+    #[derive(clap::Parser)]
+    struct Top {
+        #[command(subcommand)]
+        command: Sub,
+    }
+
+    #[derive(clap::Subcommand)]
+    enum Sub {
+        Build(BuildCli),
+    }
+
+    fn build(args: &[&str]) -> Result<BuildCli, clap::Error> {
+        let argv = ["legion", "build"].iter().chain(args);
+        <Top as clap::Parser>::try_parse_from(argv).map(|t| match t.command {
+            Sub::Build(b) => b,
+        })
+    }
+
+    #[test]
+    fn the_stores_flags_go_before_vm_or_after_it() {
+        for args in [
+            &["--no-zfs", "vm", "--disk", "a.img"][..],
+            &["vm", "--no-zfs", "--disk", "a.img"][..],
+        ] {
+            let b = build(args).unwrap();
+            assert!(b.no_zfs, "{args:?}");
+            assert!(matches!(b.kind, Some(BuildTarget::Vm(_))), "{args:?}");
+            assert!(!jail_flags_given(&b.build), "{args:?}");
+        }
+        let jail = build(&["--no-zfs", "-t", "app:1", "ctx"]).unwrap();
+        assert!(jail.kind.is_none());
+        assert!(jail_flags_given(&jail.build));
+        assert_eq!(jail.build.tag.as_deref(), Some("app:1"));
+        // A jail build's flag before `vm` is refused, not dropped.
+        let mixed = build(&["-t", "app:1", "vm", "--disk", "a.img"]).unwrap();
+        assert!(jail_flags_given(&mixed.build));
+    }
 
     #[test]
     fn a_password_on_stdin_is_its_first_line() {

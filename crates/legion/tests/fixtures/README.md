@@ -1,15 +1,15 @@
 # Test fixtures
 
-## jailer-arch-arm64.tar
+## local-arch-arm64.tar
 
-The arm64 half of `handoff.rs`'s `a_jailer_index_runs_each_nodes_platform`,
-built by jailer on an arm64 host because the lab is amd64 only. It never runs
-here: the test pushes it to its registry, as an arm64 host would, has jailer
+The arm64 half of `handoff.rs`'s `a_local_index_runs_each_nodes_platform`,
+built on an arm64 host because the lab is amd64 only. It never runs here: the
+test pushes it to its registry, as an arm64 host would, has `legion local`
 push it in an index with an amd64 build, and checks that amd64 nodes run the
-other half. (jailer keeps only images of its own platform, so it cannot load
-this archive on amd64.)
+other half. (`legion local` keeps only images of its own platform, so it
+cannot load this archive on amd64.)
 
-- Built by jailer 33ee0d7 (Legion v0.1.18) on FreeBSD 15.1-RELEASE-p6 aarch64,
+- Built by jailer 33ee0d7 (Legion v0.1.18; jailer is now `legion local`) on FreeBSD 15.1-RELEASE-p6 aarch64,
   from `FROM scratch` and `COPY arch /arch`, `/arch` holding `arm64`, and
   exported with `jailer export` (an OCI archive).
 - Archive sha256: `e32d277135d8d5bbb33562d6857ec61ee0defc728c90a6f7dcdab822af718a6b`
@@ -22,6 +22,6 @@ To make it again, on a FreeBSD arm64 host:
 ```sh
 printf 'arm64\n' > arch
 printf 'FROM scratch\nCOPY arch /arch\n' > Containerfile
-jailer build -t localhost/jailer-arch:arm64 .
-jailer export -o jailer-arch-arm64.tar localhost/jailer-arch:arm64
+legion local build -t localhost/local-arch:arm64 .
+legion local export -o local-arch-arm64.tar localhost/local-arch:arm64
 ```

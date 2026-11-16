@@ -1,4 +1,4 @@
-//! `jailer publish`: one image for several platforms, each built natively on
+//! `legion local publish`: one image for several platforms, each built natively on
 //! a host of its own over ssh. Every host gets the same context, builds it,
 //! and pushes to a staging tag of the target. Only when all of them have, each
 //! the platform it was named for and from the same source, is the index
@@ -26,8 +26,8 @@ pub struct Publish {
     pub containerfile: Option<String>,
     pub build_stage: Option<String>,
     pub build_args: Vec<String>,
-    /// The program on the hosts.
-    pub remote_jailer: String,
+    /// The legion program on the hosts.
+    pub remote_legion: String,
     /// The local program standing for `ssh`.
     pub ssh: String,
 }
@@ -53,8 +53,8 @@ fn staging(target: &Reference, platform: &str) -> Result<Reference, Error> {
 /// What a host runs, with the context as a tar on standard input. Only the
 /// record goes to standard output. Its work goes with it however it ends.
 fn script(p: &Publish, stage: &Reference) -> String {
-    let jailer = quoted(&p.remote_jailer);
-    let mut build = format!("{jailer} build -t jailer-publish:latest --record r.json");
+    let legion = quoted(&p.remote_legion);
+    let mut build = format!("{legion} local build -t legion-publish:latest --record r.json");
     if let Some(file) = &p.containerfile {
         build += &format!(" -f {}", quoted(&format!("ctx/{file}")));
     }
@@ -73,7 +73,7 @@ fn script(p: &Publish, stage: &Reference) -> String {
          mkdir ctx\n\
          tar -xf - -C ctx\n\
          {build} ctx >&2\n\
-         {jailer} push --record r.json jailer-publish:latest {} >&2\n\
+         {legion} local push --record r.json legion-publish:latest {} >&2\n\
          cat r.json\n",
         quoted(&stage.to_string())
     )
@@ -321,7 +321,7 @@ mod tests {
             containerfile: Some("build/Containerfile".to_owned()),
             build_stage: Some("final".to_owned()),
             build_args: vec!["V=a b".to_owned()],
-            remote_jailer: "/opt/jailer".to_owned(),
+            remote_legion: "/opt/legion".to_owned(),
             ssh: "ssh".to_owned(),
         };
         let stage = staging(&p.target, "freebsd/amd64").unwrap();

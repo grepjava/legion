@@ -259,14 +259,17 @@ sshd_enable="YES"
 kld_list="pf if_bridge if_epair"
 CONF
 cat > /etc/pf.conf << 'CONF'
-# Lab node: hooks for Legion's legion/* and jailer's jailer/* anchors;
-# everything else passes.
+# Lab node: hooks for Legion's legion/* and legion-local/* anchors, and
+# jailer's jailer/*; everything else passes.
 nat-anchor "legion/*"
 rdr-anchor "legion/*"
+nat-anchor "legion-local/*"
+rdr-anchor "legion-local/*"
 nat-anchor "jailer/*"
 rdr-anchor "jailer/*"
 pass all
 anchor "legion/*"
+anchor "legion-local/*"
 anchor "jailer/*"
 CONF
 pfctl -nf /etc/pf.conf

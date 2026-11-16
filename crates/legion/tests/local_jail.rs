@@ -1,9 +1,23 @@
+//! `legion local` on a real FreeBSD host: builds, runs, pods and their
+//! networking, as root. Ignored by default; scripts/legion.qualify runs
+//! them.
 #![cfg(target_os = "freebsd")]
 
 use std::path::Path;
 use std::process::Command;
 
+#[path = "../../legion-build/tests/common/mod.rs"]
 mod common;
+
+/// The legion under test.
+const LEGION: &str = env!("CARGO_BIN_EXE_legion");
+
+/// `legion local`, to be given its arguments.
+fn local() -> Command {
+    let mut c = Command::new(LEGION);
+    c.arg("local");
+    c
+}
 
 fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
@@ -43,7 +57,7 @@ impl ClientJail {
         host(&[
             "jail",
             "-c",
-            "name=jailer_test_client",
+            "name=local_test_client",
             "path=/",
             "vnet",
             "persist",
@@ -55,7 +69,7 @@ impl ClientJail {
     }
 
     fn exec(&self, args: &[&str]) -> String {
-        host(&[&["jexec", "jailer_test_client"][..], args].concat())
+        host(&[&["jexec", "local_test_client"][..], args].concat())
     }
 
     /// What connecting to `address` gets, trying while a listener starts.
@@ -75,7 +89,7 @@ impl ClientJail {
 impl Drop for ClientJail {
     fn drop(&mut self) {
         let _ = Command::new("jail")
-            .args(["-r", "jailer_test_client"])
+            .args(["-r", "local_test_client"])
             .status();
         let _ = Command::new("ifconfig").args([&self.0, "destroy"]).status();
     }
@@ -97,7 +111,7 @@ fn storage() -> Vec<String> {
     }
 }
 
-/// Runs `test` on a ZFS root of its own, on JAILER_TEST_POOL, then fails if
+/// Runs `test` on a ZFS root of its own, on LEGION_LOCAL_TEST_POOL, then fails if
 /// it left a stage's or a container's dataset: a build can succeed with one
 /// still there.
 fn on_zfs(test: fn()) {
@@ -118,8 +132,8 @@ fn on_zfs(test: fn()) {
             eprintln!("{} stays", self.0);
         }
     }
-    let pool = std::env::var("JAILER_TEST_POOL").unwrap_or_else(|_| "zroot".to_owned());
-    let root = format!("{pool}/jailer-test-{}", std::process::id());
+    let pool = std::env::var("LEGION_LOCAL_TEST_POOL").unwrap_or_else(|_| "zroot".to_owned());
+    let root = format!("{pool}/legion-local-test-{}", std::process::id());
     let _destroy = Destroy(root.clone());
     *ZFS_ROOT.lock().unwrap() = Some(root.clone());
     test();
@@ -168,21 +182,20 @@ fn live(test: &str) -> bool {
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn real_freebsd_jail_build_run_export_workflow() {
     if !live("real_freebsd_jail_build_run_export_workflow") {
         return;
     }
 
-    let bin = env!("CARGO_BIN_EXE_jailer");
     let tmp = scratch();
     let state_dir = tmp.path().join("state");
     let project_dir = tmp.path().join("hello-service");
     std::fs::create_dir_all(&project_dir).unwrap();
 
-    // A pool of the host's own: JAILER_TEST_POOL, zroot if unset.
-    let pool = std::env::var("JAILER_TEST_POOL").unwrap_or_else(|_| "zroot".to_owned());
-    let zfs_root = format!("{pool}/jailer-test-{}", std::process::id());
+    // A pool of the host's own: LEGION_LOCAL_TEST_POOL, zroot if unset.
+    let pool = std::env::var("LEGION_LOCAL_TEST_POOL").unwrap_or_else(|_| "zroot".to_owned());
+    let zfs_root = format!("{pool}/legion-local-test-{}", std::process::id());
 
     // Ensure cleanup of test ZFS dataset on exit, and first of any container
     // a failed assertion left running, which would hold the dataset (and a
@@ -190,34 +203,34 @@ fn real_freebsd_jail_build_run_export_workflow() {
     struct ZfsGuard(String, std::path::PathBuf);
     impl Drop for ZfsGuard {
         fn drop(&mut self) {
-            let jailer = |args: &[&str]| {
+            let legion = |args: &[&str]| {
                 let state = self.1.join("state");
-                let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
+                let mut c = local();
                 c.arg("--state-dir")
                     .arg(&state)
                     .args(["--zfs-root", &self.0]);
                 c.args(args).output().ok()
             };
-            if let Some(ps) = jailer(&["ps", "-a"]) {
+            if let Some(ps) = legion(&["ps", "-a"]) {
                 let ps = String::from_utf8_lossy(&ps.stdout);
                 for id in ps
                     .lines()
                     .skip(1)
                     .filter_map(|l| l.split_whitespace().next())
                 {
-                    jailer(&["rm", "-f", id]);
+                    legion(&["rm", "-f", id]);
                 }
             }
             let _ = Command::new("zfs")
                 .args(["destroy", "-r", &self.0])
                 .status();
-            let _ = jailer::layer::remove_tree(&self.1);
+            let _ = legion_build::layer::remove_tree(&self.1);
         }
     }
     let _guard = ZfsGuard(zfs_root.clone(), tmp.path().to_path_buf());
 
-    // 1. Run `jailer init`
-    let status = Command::new(bin)
+    // 1. Run `legion local `
+    let status = local()
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
@@ -232,7 +245,7 @@ fn real_freebsd_jail_build_run_export_workflow() {
         ])
         .status()
         .unwrap();
-    assert!(status.success(), "jailer init failed");
+    assert!(status.success(), "legion local init failed");
     assert!(project_dir.join("Containerfile").exists());
 
     // Write a script and Containerfile that tests COPY + RUN in a real FreeBSD jail + USER nobody
@@ -268,8 +281,8 @@ CMD ["default-arg"]
     )
     .unwrap();
 
-    // 2. Run `jailer build`
-    let build_out = Command::new(bin)
+    // 2. Run `legion local `
+    let build_out = local()
         .current_dir(&project_dir)
         .args([
             "--state-dir",
@@ -283,13 +296,13 @@ CMD ["default-arg"]
         .unwrap();
     assert!(
         build_out.status.success(),
-        "jailer build failed:\nstdout: {}\nstderr: {}",
+        "legion local build failed:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&build_out.stdout),
         String::from_utf8_lossy(&build_out.stderr)
     );
 
     // A rebuild reuses the RUN step's layer and yields the same image
-    let rebuild_out = Command::new(bin)
+    let rebuild_out = local()
         .current_dir(&project_dir)
         .args([
             "--state-dir",
@@ -314,8 +327,8 @@ CMD ["default-arg"]
         built_line(&build_out.stdout)
     );
 
-    // 3. Run `jailer run` in a real FreeBSD jail and verify stdout
-    let run_out = Command::new(bin)
+    // 3. Run `legion local ` in a real FreeBSD jail and verify stdout
+    let run_out = local()
         .current_dir(&project_dir)
         .args([
             "--state-dir",
@@ -329,7 +342,7 @@ CMD ["default-arg"]
     let stdout = String::from_utf8_lossy(&run_out.stdout);
     assert!(
         run_out.status.success(),
-        "jailer run failed:\nstdout: {stdout}\nstderr: {}",
+        "legion local run failed:\nstdout: {stdout}\nstderr: {}",
         String::from_utf8_lossy(&run_out.stderr)
     );
     assert_eq!(
@@ -338,7 +351,7 @@ CMD ["default-arg"]
     );
 
     // A squashed build runs the same, from one layer
-    let squash_out = Command::new(bin)
+    let squash_out = local()
         .current_dir(&project_dir)
         .args([
             "--state-dir",
@@ -357,7 +370,7 @@ CMD ["default-arg"]
         "{}",
         String::from_utf8_lossy(&squash_out.stderr)
     );
-    let flat_out = Command::new(bin)
+    let flat_out = local()
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
@@ -370,7 +383,7 @@ CMD ["default-arg"]
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&flat_out.stdout), stdout);
     let flat_tar = tmp.path().join("flat.tar");
-    let status = Command::new(bin)
+    let status = local()
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
@@ -391,7 +404,7 @@ CMD ["default-arg"]
     assert_eq!(manifest[0]["Layers"].as_array().unwrap().len(), 1);
 
     // Verify RUN step artifact `/app/stamp.txt` inside the built image
-    let stamp_out = Command::new(bin)
+    let stamp_out = local()
         .current_dir(&project_dir)
         .args([
             "--state-dir",
@@ -416,7 +429,7 @@ CMD ["default-arg"]
     // and rm; Legion's security defaults, with --param over them; --vnet
     // as a pod with a member.
     let try_cmd = |args: &[&str]| {
-        Command::new(bin)
+        local()
             .args([
                 "--state-dir",
                 state_dir.to_str().unwrap(),
@@ -431,7 +444,7 @@ CMD ["default-arg"]
         let out = try_cmd(args);
         assert!(
             out.status.success(),
-            "jailer {args:?}:\n{}{}",
+            "legion local {args:?}:\n{}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
@@ -555,9 +568,9 @@ CMD ["default-arg"]
         "2\n"
     );
 
-    // --vnet puts the pod on jailer's bridge; -p publishes its ports. Both
-    // need pf.conf to call jailer's anchors.
-    if host(&["pfctl", "-sn"]).contains("\"jailer/*\"") {
+    // --vnet puts the pod on the local mode's bridge; -p publishes its ports. Both
+    // need pf.conf to call the local mode's anchors.
+    if host(&["pfctl", "-sn"]).contains("\"legion-local/*\"") {
         let nc_dir = tmp.path().join("nc");
         nc_context(&nc_dir, "localhost/hello-service:latest");
         cmd(&["build", "-t", "nc:1", nc_dir.to_str().unwrap()]);
@@ -588,7 +601,7 @@ CMD ["default-arg"]
         let client = ClientJail::new();
         let got = client.read("10.99.0.1", "18080");
         assert_eq!(got, "hello\n", "published port 18080, from outside");
-        // jailer sets neither: on a fresh host this says --vnet works without.
+        // Legion sets neither: on a fresh host this says --vnet works without.
         println!(
             "pfil_member {} pfil_local_phys {}",
             host(&["sysctl", "-n", "net.link.bridge.pfil_member"]).trim(),
@@ -597,7 +610,7 @@ CMD ["default-arg"]
         // Its command done, the container is kept and its pod lets go of
         // its address and port.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while Path::new("/var/run/jailer/net").join(&ip).exists() {
+        while Path::new("/var/run/legion-local/net").join(&ip).exists() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "an exited -d container kept its address"
@@ -607,7 +620,7 @@ CMD ["default-arg"]
         assert!(cmd(&["ps", "-a"]).contains(" web "));
         // And a pod reaches out, through the bridge and the host.
         let mut listener = Command::new("jexec")
-            .args(["jailer_test_client", "sh", "-c", "echo hi | nc -N -l 9999"])
+            .args(["local_test_client", "sh", "-c", "echo hi | nc -N -l 9999"])
             .spawn()
             .unwrap();
         // The listener may take its time on a busy host, and nc says nothing
@@ -639,18 +652,18 @@ CMD ["default-arg"]
             !host(&["ifconfig", "-l"]).contains(" jp"),
             "epairs are gone"
         );
-        assert!(!Path::new("/var/run/jailer/net").join(&ip).exists());
-        for anchor in host(&["pfctl", "-a", "jailer", "-sA"]).split_whitespace() {
+        assert!(!Path::new("/var/run/legion-local/net").join(&ip).exists());
+        for anchor in host(&["pfctl", "-a", "legion-local", "-sA"]).split_whitespace() {
             let rules = host(&["pfctl", "-a", anchor, "-sn"]);
             assert!(!rules.contains("18080"), "{anchor}: {rules}");
         }
     } else {
         // Tested still: the refusal below is what such a host gets.
-        legion_sys::live::skip("pf.conf does not call jailer's anchors");
+        legion_sys::live::skip("pf.conf does not call the local mode's anchors");
         let out = try_cmd(&[&["run", "--vnet"][..], &shell, &["true"]].concat());
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
-            !out.status.success() && err.contains("rdr-anchor \"jailer/*\""),
+            !out.status.success() && err.contains("rdr-anchor \"legion-local/*\""),
             "{err}"
         );
     }
@@ -712,7 +725,7 @@ CMD ["default-arg"]
             "limited\n"
         );
         assert!(
-            !rules().contains("jailer_build_"),
+            !rules().contains("legion_build_"),
             "no step's rules are left"
         );
 
@@ -740,7 +753,7 @@ CMD ["default-arg"]
             String::from_utf8_lossy(&failed.stderr)
         );
         assert!(
-            !rules().contains("jailer_build_"),
+            !rules().contains("legion_build_"),
             "no rules are left by the step that failed:\n{}",
             rules()
         );
@@ -886,7 +899,7 @@ RUN cat /one /two > /both
     let other_state = tmp.path().join("other-state");
     let other_zfs = format!("{zfs_root}/other");
     let other = |args: &[&str]| {
-        let out = Command::new(bin)
+        let out = local()
             .args([
                 "--state-dir",
                 other_state.to_str().unwrap(),
@@ -900,7 +913,7 @@ RUN cat /one /two > /both
             .unwrap();
         assert!(
             out.status.success(),
-            "jailer {args:?}:\n{}{}",
+            "legion local {args:?}:\n{}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
@@ -920,9 +933,9 @@ RUN cat /one /two > /both
     };
     assert_eq!(id(&other), id(&cmd));
 
-    // 4. Run `jailer export app.tar`
+    // 4. Run `legion local  app.tar`
     let archive = tmp.path().join("app.tar");
-    let export_out = Command::new(bin)
+    let export_out = local()
         .current_dir(&project_dir)
         .args([
             "--state-dir",
@@ -936,13 +949,13 @@ RUN cat /one /two > /both
         .unwrap();
     assert!(
         export_out.status.success(),
-        "jailer export failed: {}",
+        "legion local export failed: {}",
         String::from_utf8_lossy(&export_out.stderr)
     );
     assert!(Path::new(&archive).exists());
 
-    // 5. Run `jailer check`
-    let check_out = Command::new(bin)
+    // 5. Run `legion local `
+    let check_out = local()
         .current_dir(&project_dir)
         .args([
             "--state-dir",
@@ -955,18 +968,17 @@ RUN cat /one /two > /both
         .unwrap();
     assert!(
         check_out.status.success(),
-        "jailer check failed: {}",
+        "legion local check failed: {}",
         String::from_utf8_lossy(&check_out.stderr)
     );
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn run_mounts_reach_the_step_but_not_the_image() {
     if !live("run_mounts_reach_the_step_but_not_the_image") {
         return;
     }
-    let bin = env!("CARGO_BIN_EXE_jailer");
     let tmp = scratch();
     let state = tmp.path().join("state");
     let ctx = tmp.path().join("ctx");
@@ -1006,8 +1018,8 @@ CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd
     )
     .unwrap();
 
-    let jailer = |args: &[&str]| {
-        let out = Command::new(bin)
+    let legion = |args: &[&str]| {
+        let out = local()
             .current_dir(&ctx)
             .args(["--state-dir", state.to_str().unwrap()])
             .args(storage())
@@ -1016,7 +1028,7 @@ CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd
             .unwrap();
         assert!(
             out.status.success(),
-            "jailer {args:?}:\n{}",
+            "legion local {args:?}:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
@@ -1024,7 +1036,7 @@ CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd
     struct Cleanup(std::path::PathBuf);
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            let _ = jailer::layer::remove_tree(&self.0);
+            let _ = legion_build::layer::remove_tree(&self.0);
         }
     }
     let _cleanup = Cleanup(tmp.path().to_path_buf());
@@ -1063,20 +1075,20 @@ CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd
         "m:1",
         ".",
     ];
-    jailer(&build);
+    legion(&build);
     assert_eq!(
-        jailer(&["run", "m:1"]),
+        legion(&["run", "m:1"]),
         "count=1 bound=original secretlen=12 tmpfs=yes ifs=lo0 ctxls=a.txt fromimg=yes hd=heredoc-2 sb=shebang ssh=/run/buildkit/ssh_agent.0 etcssh=kept two=x-5 y-$((2+3))="
     );
     // The cache mount keeps its contents; the rw bind left the context alone.
-    jailer(&build);
-    assert!(jailer(&["run", "m:1"]).starts_with("count=2 "));
+    legion(&build);
+    assert!(legion(&["run", "m:1"]).starts_with("count=2 "));
     assert_eq!(
         std::fs::read_to_string(ctx.join("data/a.txt")).unwrap(),
         "original\n"
     );
     // The secret's value is in no layer.
-    jailer(&["export", "m:1", tmp.path().join("m.tar").to_str().unwrap()]);
+    legion(&["export", "m:1", tmp.path().join("m.tar").to_str().unwrap()]);
     let layers = Command::new("sh")
         .arg("-c")
         .arg("mkdir x && tar xf m.tar -C x && for l in x/blobs/sha256/*; do tar xzf $l -O 2>/dev/null; done")
@@ -1100,7 +1112,7 @@ CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd
         ),
     )
     .unwrap();
-    jailer(&[
+    legion(&[
         "build",
         "--no-cache",
         "--ssh",
@@ -1139,8 +1151,8 @@ CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd
         .unwrap();
     };
     let seen = || {
-        jailer(&["build", "-t", "k:1", ctx2.to_str().unwrap()]);
-        let out = jailer(&["run", "k:1"]);
+        legion(&["build", "-t", "k:1", ctx2.to_str().unwrap()]);
+        let out = legion(&["run", "k:1"]);
         let lines: Vec<&str> = out.lines().collect();
         let mode = lines[1].split_whitespace().next().unwrap().to_owned();
         let blocks = lines
@@ -1174,12 +1186,11 @@ CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid() {
     if !live("cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid") {
         return;
     }
-    let bin = env!("CARGO_BIN_EXE_jailer");
     let tmp = scratch();
     let state = tmp.path().join("state");
     let ctx = tmp.path().join("ctx");
@@ -1204,8 +1215,8 @@ CMD ["/bin/sh", "-c", "set -- $(ls -l /tool); echo $1 $3:$4; test -e /nonempty &
         "FROM docker.io/freebsd/freebsd-runtime:15.1\nLABEL other=1\n",
     )
     .unwrap();
-    let jailer = |args: &[&str]| {
-        let out = Command::new(bin)
+    let legion = |args: &[&str]| {
+        let out = local()
             .args(["--state-dir", state.to_str().unwrap()])
             .args(storage())
             .args(args)
@@ -1213,7 +1224,7 @@ CMD ["/bin/sh", "-c", "set -- $(ls -l /tool); echo $1 $3:$4; test -e /nonempty &
             .unwrap();
         assert!(
             out.status.success(),
-            "jailer {args:?}:\n{}",
+            "legion local {args:?}:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
@@ -1221,18 +1232,18 @@ CMD ["/bin/sh", "-c", "set -- $(ls -l /tool); echo $1 $3:$4; test -e /nonempty &
     struct Cleanup(std::path::PathBuf);
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            let _ = jailer::layer::remove_tree(&self.0);
+            let _ = legion_build::layer::remove_tree(&self.0);
         }
     }
     let _cleanup = Cleanup(tmp.path().to_path_buf());
 
     let ctx_arg = ctx.to_str().unwrap();
-    jailer(&["build", "-t", "c:1", ctx_arg]);
-    assert_eq!(jailer(&["run", "c:1"]), "-rwsr-xr-x nobody:nobody\nempty");
+    legion(&["build", "-t", "c:1", ctx_arg]);
+    assert_eq!(legion(&["run", "c:1"]), "-rwsr-xr-x nobody:nobody\nempty");
     // Without the image, a trim drops the first step's layer from the
     // cache; the second step, which made nothing, keeps its entry.
-    jailer(&["rmi", "c:1"]);
-    jailer(&[
+    legion(&["rmi", "c:1"]);
+    legion(&[
         "build",
         "--cache-max",
         "0",
@@ -1241,21 +1252,20 @@ CMD ["/bin/sh", "-c", "set -- $(ls -l /tool); echo $1 $3:$4; test -e /nonempty &
         other.to_str().unwrap(),
     ]);
     // Run again, the first step makes another /v: the second must run too.
-    jailer(&["build", "-t", "c:2", ctx_arg]);
+    legion(&["build", "-t", "c:2", ctx_arg]);
     assert_eq!(
-        jailer(&["run", "c:2"]),
+        legion(&["run", "c:2"]),
         "-rwsr-xr-x nobody:nobody\nnonempty"
     );
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn stage_copies_keep_owners_archives_take_flags_and_cache_options_count() {
     if !live("stage_copies_keep_owners_archives_take_flags_and_cache_options_count") {
         return;
     }
     use std::os::unix::fs::PermissionsExt;
-    let bin = env!("CARGO_BIN_EXE_jailer");
     let tmp = scratch();
     let state = tmp.path().join("state");
     let ctx = tmp.path().join("ctx");
@@ -1307,8 +1317,8 @@ CMD ["/bin/sh", "-c", "for f in /owned /d /d/g /arc/t; do set -- $(ls -ld $f); e
         )
         .unwrap();
     };
-    let jailer = |args: &[&str]| {
-        let out = Command::new(bin)
+    let legion = |args: &[&str]| {
+        let out = local()
             .args(["--state-dir", state.to_str().unwrap()])
             .args(storage())
             .args(args)
@@ -1316,7 +1326,7 @@ CMD ["/bin/sh", "-c", "for f in /owned /d /d/g /arc/t; do set -- $(ls -ld $f); e
             .unwrap();
         assert!(
             out.status.success(),
-            "jailer {args:?}:\n{}",
+            "legion local {args:?}:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
@@ -1324,7 +1334,7 @@ CMD ["/bin/sh", "-c", "for f in /owned /d /d/g /arc/t; do set -- $(ls -ld $f); e
     struct Cleanup(std::path::PathBuf);
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            let _ = jailer::layer::remove_tree(&self.0);
+            let _ = legion_build::layer::remove_tree(&self.0);
         }
     }
     let _cleanup = Cleanup(tmp.path().to_path_buf());
@@ -1335,21 +1345,20 @@ CMD ["/bin/sh", "-c", "for f in /owned /d /d/g /arc/t; do set -- $(ls -ld $f); e
                   -rw-r--r-- nobody:nobody\n\
                   -rwsr-xr-x nobody:nobody";
     containerfile("");
-    jailer(&["build", "-t", "o:1", ctx_arg]);
-    assert_eq!(jailer(&["run", "o:1"]), format!("{owners}\npipe\nw"));
+    legion(&["build", "-t", "o:1", ctx_arg]);
+    assert_eq!(legion(&["run", "o:1"]), format!("{owners}\npipe\nw"));
     // A read-only cache is another step: it runs again, and cannot write.
     containerfile(",ro");
-    jailer(&["build", "-t", "o:2", ctx_arg]);
-    assert_eq!(jailer(&["run", "o:2"]), format!("{owners}\npipe\nro"));
+    legion(&["build", "-t", "o:2", ctx_arg]);
+    assert_eq!(legion(&["run", "o:2"]), format!("{owners}\npipe\nro"));
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn the_pods_hostname_wins_and_a_stop_ends_an_attached_run() {
     if !live("the_pods_hostname_wins_and_a_stop_ends_an_attached_run") {
         return;
     }
-    let bin = env!("CARGO_BIN_EXE_jailer");
     let tmp = scratch();
     let state = tmp.path().join("state");
     let ctx = tmp.path().join("ctx");
@@ -1359,17 +1368,17 @@ fn the_pods_hostname_wins_and_a_stop_ends_an_attached_run() {
         "FROM docker.io/freebsd/freebsd-runtime:15.1\nENV HOSTNAME=from-image\n",
     )
     .unwrap();
-    let jailer = || {
-        let mut c = Command::new(bin);
+    let legion = || {
+        let mut c = local();
         c.args(["--state-dir", state.to_str().unwrap()])
             .args(storage());
         c
     };
     let ok = |args: &[&str]| {
-        let out = jailer().args(args).output().unwrap();
+        let out = legion().args(args).output().unwrap();
         assert!(
             out.status.success(),
-            "jailer {args:?}:\n{}",
+            "legion local {args:?}:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
@@ -1382,13 +1391,13 @@ fn the_pods_hostname_wins_and_a_stop_ends_an_attached_run() {
                 let _ = run.kill();
                 let _ = run.wait();
             }
-            let _ = Command::new(env!("CARGO_BIN_EXE_jailer"))
+            let _ = local()
                 .arg("--state-dir")
                 .arg(self.0.join("state"))
                 .args(storage())
                 .args(["rm", "-f", "attached"])
                 .output();
-            let _ = jailer::layer::remove_tree(&self.0);
+            let _ = legion_build::layer::remove_tree(&self.0);
         }
     }
     let mut cleanup = Cleanup(tmp.path().to_path_buf(), None);
@@ -1407,7 +1416,7 @@ fn the_pods_hostname_wins_and_a_stop_ends_an_attached_run() {
     let names: Vec<_> = env.lines().filter(|l| l.starts_with("HOSTNAME=")).collect();
     assert_eq!(names, ["HOSTNAME=the-pod"], "{env}");
 
-    let run = jailer()
+    let run = legion()
         .args([
             "run",
             "--rm",
@@ -1449,7 +1458,7 @@ fn the_pods_hostname_wins_and_a_stop_ends_an_attached_run() {
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn a_signal_to_exec_ends_its_command() {
     if !live("a_signal_to_exec_ends_its_command") {
         return;
@@ -1463,30 +1472,30 @@ fn a_signal_to_exec_ends_its_command() {
         "FROM docker.io/freebsd/freebsd-runtime:15.1\n",
     )
     .unwrap();
-    let jailer = || {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
+    let legion = || {
+        let mut c = local();
         c.args(["--state-dir", state.to_str().unwrap()])
             .args(storage());
         c
     };
     let ok = |args: &[&str]| {
-        let out = jailer().args(args).output().unwrap();
+        let out = legion().args(args).output().unwrap();
         assert!(
             out.status.success(),
-            "jailer {args:?}:\n{}",
+            "legion local {args:?}:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
     };
     struct Cleanup(std::path::PathBuf);
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            let _ = Command::new(env!("CARGO_BIN_EXE_jailer"))
+            let _ = local()
                 .arg("--state-dir")
                 .arg(self.0.join("state"))
                 .args(storage())
                 .args(["rm", "-f", "held"])
                 .output();
-            let _ = jailer::layer::remove_tree(&self.0);
+            let _ = legion_build::layer::remove_tree(&self.0);
         }
     }
     let _cleanup = Cleanup(tmp.path().to_path_buf());
@@ -1494,7 +1503,7 @@ fn a_signal_to_exec_ends_its_command() {
     let entry = ["--entrypoint", "/bin/sleep", "e:1"];
     ok(&[&["run", "-d", "--name", "held"][..], &entry, &["300"]].concat());
 
-    // The command itself, not the jailer or shim naming it.
+    // The command itself, not legion or the shim naming it.
     let running = |seconds: &str| {
         Command::new("pgrep")
             .args(["-f", &format!("^/bin/sleep {seconds}$")])
@@ -1510,7 +1519,7 @@ fn a_signal_to_exec_ends_its_command() {
         }
     };
     for (signal, seconds) in [(libc::SIGINT, "7701"), (libc::SIGTERM, "7702")] {
-        let mut exec = jailer()
+        let mut exec = legion()
             .args(["exec", "held", "/bin/sleep", seconds])
             .spawn()
             .unwrap();
@@ -1526,7 +1535,7 @@ fn a_signal_to_exec_ends_its_command() {
     // and a byte written to it the keypress.
     let out = tmp.path().join("out");
     let mut terminal = Command::new("script")
-        .args(["-q", "/dev/null", env!("CARGO_BIN_EXE_jailer")])
+        .args(["-q", "/dev/null", LEGION, "local"])
         .args(["--state-dir", state.to_str().unwrap()])
         .args(storage())
         .args(["exec", "-t", "held", "/bin/sh", "-c"])
@@ -1551,7 +1560,7 @@ fn a_signal_to_exec_ends_its_command() {
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn interrupted_builds_and_runs_leave_nothing() {
     use std::os::unix::process::CommandExt;
     if !live("interrupted_builds_and_runs_leave_nothing") {
@@ -1573,17 +1582,17 @@ fn interrupted_builds_and_runs_leave_nothing() {
         "FROM localhost/i:1\nRUN /bin/sleep 7721\n",
     )
     .unwrap();
-    let jailer = || {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
+    let legion = || {
+        let mut c = local();
         c.args(["--state-dir", state.to_str().unwrap()])
             .args(storage());
         c
     };
     let ok = |args: &[&str]| {
-        let out = jailer().args(args).output().unwrap();
+        let out = legion().args(args).output().unwrap();
         assert!(
             out.status.success(),
-            "jailer {args:?}:\n{}",
+            "legion local {args:?}:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
@@ -1620,7 +1629,7 @@ fn interrupted_builds_and_runs_leave_nothing() {
             for mount in mounts(&self.0).iter().rev() {
                 let _ = Command::new("umount").args(["-f", mount]).output();
             }
-            let _ = jailer::layer::remove_tree(&self.0);
+            let _ = legion_build::layer::remove_tree(&self.0);
         }
     }
     let _cleanup = Cleanup(tmp.path().to_path_buf());
@@ -1646,7 +1655,7 @@ fn interrupted_builds_and_runs_leave_nothing() {
 
     // Ctrl-C, as a terminal sends it: to the whole group. The step goes,
     // with its jail, mounts and limits, and so does the build.
-    let mut build = jailer()
+    let mut build = legion()
         .args(["build", "--pids-limit", "50", "-t", "s:1"])
         .arg(&step)
         .process_group(0)
@@ -1676,7 +1685,7 @@ fn interrupted_builds_and_runs_leave_nothing() {
         ),
         ("7724", "exec /bin/sleep 7724", 1, libc::SIGTERM, 143),
     ] {
-        let mut run = jailer()
+        let mut run = legion()
             .args(["run", "--rm", "--name", "gone", "--entrypoint", "/bin/sh"])
             .args(["i:1", "-c", script])
             .process_group(0)
@@ -1708,7 +1717,7 @@ fn interrupted_builds_and_runs_leave_nothing() {
             })
             .count()
     };
-    let mut run = jailer()
+    let mut run = legion()
         .args(["run", "--rm", "--entrypoint", "/bin/sleep", "big:1", "7725"])
         .process_group(0)
         .spawn()
@@ -1723,7 +1732,7 @@ fn interrupted_builds_and_runs_leave_nothing() {
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn another_users_state_directory_is_refused_by_name() {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
@@ -1733,16 +1742,16 @@ fn another_users_state_directory_is_refused_by_name() {
     let tmp = scratch();
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     let state = tmp.path().join("state");
-    let jailer = |args: &[&str]| {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
+    let legion = |args: &[&str]| {
+        let mut c = local();
         c.args(["--state-dir", state.to_str().unwrap()])
             .args(storage())
             .args(args);
         c
     };
-    assert!(jailer(&["images"]).status().unwrap().success());
+    assert!(legion(&["images"]).status().unwrap().success());
     for command in [&["images"][..], &["ps", "-a"][..], &["logs", "any"][..]] {
-        let out = jailer(command).uid(65534).gid(65534).output().unwrap();
+        let out = legion(command).uid(65534).gid(65534).output().unwrap();
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "{command:?}");
         assert!(
@@ -1753,7 +1762,7 @@ fn another_users_state_directory_is_refused_by_name() {
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn a_failing_stage_nothing_needs_does_not_run() {
     if !live("a_failing_stage_nothing_needs_does_not_run") {
         return;
@@ -1768,7 +1777,7 @@ fn a_failing_stage_nothing_needs_does_not_run() {
     )
     .unwrap();
     let build = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_jailer"))
+        local()
             .args(["--state-dir"])
             .arg(tmp.path().join("state"))
             .args(storage())
@@ -1792,14 +1801,14 @@ fn a_failing_stage_nothing_needs_does_not_run() {
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn memory_limits_each_process_not_the_container() {
     if !live("memory_limits_each_process_not_the_container") {
         return;
     }
     let tmp = scratch();
-    let jailer = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_jailer"))
+    let legion = |args: &[&str]| {
+        local()
             .arg("--state-dir")
             .arg(tmp.path().join("state"))
             .arg("--no-zfs")
@@ -1808,7 +1817,7 @@ fn memory_limits_each_process_not_the_container() {
             .unwrap()
     };
     let image = "docker.io/freebsd/freebsd-runtime:15.1";
-    assert!(jailer(&["pull", image]).status.success());
+    assert!(legion(&["pull", image]).status.success());
     // A shell's string, doubled until it holds 8 << `n` bytes.
     let grow =
         |n: u32| format!("a=xxxxxxxx; i=0; while [ $i -lt {n} ]; do a=$a$a; i=$((i+1)); done");
@@ -1817,7 +1826,7 @@ fn memory_limits_each_process_not_the_container() {
     struct Remove<'a>(&'a Path);
     impl Drop for Remove<'_> {
         fn drop(&mut self) {
-            let _ = Command::new(env!("CARGO_BIN_EXE_jailer"))
+            let _ = local()
                 .arg("--state-dir")
                 .arg(self.0.join("state"))
                 .args(storage())
@@ -1835,7 +1844,7 @@ fn memory_limits_each_process_not_the_container() {
         "for p in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do ({}; while :; do sleep 120; done) & done; wait",
         grow(21)
     );
-    let started = jailer(&[
+    let started = legion(&[
         "run", "-d", "--name", "many", "-m", "128m", image, "/bin/sh", "-c", &many,
     ]);
     assert!(
@@ -1869,24 +1878,24 @@ fn memory_limits_each_process_not_the_container() {
     let (total, processes) = (usage("memoryuse"), usage("maxproc"));
     assert!(total > LIMIT, "{total} bytes left");
     assert!(processes >= 16, "{processes} processes left");
-    assert!(jailer(&["rm", "-f", "many"]).status.success());
+    assert!(legion(&["rm", "-f", "many"]).status.success());
 
     // One process past the limit is killed.
     let one = format!("{}; sleep 10; echo survived", grow(25));
-    let out = jailer(&["run", "-m", "64m", image, "/bin/sh", "-c", &one]);
+    let out = legion(&["run", "-m", "64m", image, "/bin/sh", "-c", &one]);
     assert!(!out.status.success());
     assert!(!String::from_utf8_lossy(&out.stdout).contains("survived"));
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn an_sbom_lists_what_pkg_knows_of_an_image() {
     if !live("an_sbom_lists_what_pkg_knows_of_an_image") {
         return;
     }
     let tmp = scratch();
-    let jailer = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_jailer"))
+    let legion = |args: &[&str]| {
+        local()
             .arg("--state-dir")
             .arg(tmp.path().join("state"))
             .arg("--no-zfs")
@@ -1895,8 +1904,8 @@ fn an_sbom_lists_what_pkg_knows_of_an_image() {
             .unwrap()
     };
     let image = "docker.io/freebsd/freebsd-runtime:15.1";
-    assert!(jailer(&["pull", image]).status.success());
-    let out = jailer(&["sbom", image]);
+    assert!(legion(&["pull", image]).status.success());
+    let out = legion(&["sbom", image]);
     assert!(
         out.status.success(),
         "{}",
@@ -1916,7 +1925,7 @@ fn an_sbom_lists_what_pkg_knows_of_an_image() {
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn stages_at_once_overlap_share_caches_and_fail_together() {
     if !live("stages_at_once_overlap_share_caches_and_fail_together") {
         return;
@@ -1928,7 +1937,7 @@ fn stages_at_once_overlap_share_caches_and_fail_together() {
     let build = |file: &str, jobs: &str| {
         std::fs::write(ctx.join("Containerfile"), file).unwrap();
         let start = std::time::Instant::now();
-        let out = Command::new(env!("CARGO_BIN_EXE_jailer"))
+        let out = local()
             .arg("--state-dir")
             .arg(tmp.path().join("state"))
             .args(storage())
@@ -2020,7 +2029,7 @@ fn stages_at_once_overlap_share_caches_and_fail_together() {
 /// What a process killed during a create leaves: a record and no root.
 /// `ps -a` must show it and `rm` must clear it, or its name stays taken.
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn a_container_left_without_its_root_is_listed_and_removed() {
     if !live("a_container_left_without_its_root_is_listed_and_removed") {
         return;
@@ -2034,8 +2043,8 @@ fn a_container_left_without_its_root_is_listed_and_removed() {
         "FROM docker.io/freebsd/freebsd-runtime:15.1\n",
     )
     .unwrap();
-    let jailer = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_jailer"))
+    let legion = |args: &[&str]| {
+        local()
             .args(["--state-dir", state.to_str().unwrap()])
             .args(storage())
             .args(args)
@@ -2043,10 +2052,10 @@ fn a_container_left_without_its_root_is_listed_and_removed() {
             .unwrap()
     };
     let ok = |args: &[&str]| {
-        let out = jailer(args);
+        let out = legion(args);
         assert!(
             out.status.success(),
-            "jailer {args:?}:\n{}",
+            "legion local {args:?}:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).into_owned()
@@ -2134,7 +2143,7 @@ fn a_container_left_without_its_root_is_listed_and_removed() {
 /// On the real host: `doctor` reads and changes nothing, and an ordinary
 /// user is told what they lack, not that pf is wrong.
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn doctor_reports_on_the_host_and_changes_nothing() {
     use std::os::unix::process::CommandExt;
     if !live("doctor_reports_on_the_host_and_changes_nothing") {
@@ -2149,11 +2158,11 @@ fn doctor_reports_on_the_host_and_changes_nothing() {
             run("kldstat", &[]),
             run("sysctl", &["-n", "net.inet.ip.forwarding"]),
             run("ifconfig", &["-l"]),
-            run("pfctl", &["-a", "jailer", "-sA"]),
+            run("pfctl", &["-a", "legion-local", "-sA"]),
         ]
     };
     let doctor = |args: &[&str], uid: Option<u32>| {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
+        let mut c = local();
         c.args(["--no-zfs", "doctor", "--json"]).args(args);
         if let Some(uid) = uid {
             c.uid(uid).gid(uid);
@@ -2213,9 +2222,9 @@ fn doctor_reports_on_the_host_and_changes_nothing() {
     assert_eq!(check(&nobody, "pf.anchors")["state"], "unknown", "{nobody}");
 }
 
-/// `jailer` on a state directory of a test's own.
-fn jailer_in(state: &Path) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
+/// `legion local` on a state directory of a test's own.
+fn local_in(state: &Path) -> Command {
+    let mut c = local();
     c.args(["--state-dir", state.to_str().unwrap()])
         .args(storage());
     c
@@ -2237,7 +2246,7 @@ struct RemoveAll<'a>(&'a Path, &'a [&'a str]);
 impl Drop for RemoveAll<'_> {
     fn drop(&mut self) {
         for name in self.1 {
-            let _ = jailer_in(self.0).args(["rm", "-f", name]).output();
+            let _ = local_in(self.0).args(["rm", "-f", name]).output();
         }
     }
 }
@@ -2246,7 +2255,7 @@ impl Drop for RemoveAll<'_> {
 /// addresses. That is why this is not for a shared host: on a public one
 /// the port would be open to the world.
 #[test]
-#[ignore = "needs root and a disposable host: scripts/jailer.qualify runs it"]
+#[ignore = "needs root and a disposable host: scripts/legion.qualify runs it"]
 fn a_port_given_no_address_answers_on_the_hosts_own_addresses() {
     if !live("a_port_given_no_address_answers_on_the_hosts_own_addresses") {
         return;
@@ -2255,11 +2264,11 @@ fn a_port_given_no_address_answers_on_the_hosts_own_addresses() {
     let state = tmp.path().join("state");
     let context = tmp.path().join("nc");
     nc_context(&context, "docker.io/freebsd/freebsd-runtime:15.1");
-    succeeded(jailer_in(&state).args(["build", "-t", "nc:1", context.to_str().unwrap()]));
+    succeeded(local_in(&state).args(["build", "-t", "nc:1", context.to_str().unwrap()]));
 
     let _remove = RemoveAll(&state, &["open"]);
     let client = ClientJail::new();
-    succeeded(jailer_in(&state).args([
+    succeeded(local_in(&state).args([
         "run",
         "-d",
         "--name",
@@ -2288,8 +2297,8 @@ fn a_port_given_no_address_answers_on_the_hosts_own_addresses() {
         .unwrap_or_else(|| panic!("{egress} has no address: {inet}"));
     assert_eq!(client.read(own, "18083"), "hello\n", "on {own}");
 
-    succeeded(jailer_in(&state).args(["rm", "-f", "open"]));
-    for anchor in host(&["pfctl", "-a", "jailer", "-sA"]).split_whitespace() {
+    succeeded(local_in(&state).args(["rm", "-f", "open"]));
+    for anchor in host(&["pfctl", "-a", "legion-local", "-sA"]).split_whitespace() {
         let rules = host(&["pfctl", "-a", anchor, "-sn"]);
         assert!(!rules.contains("18083"), "{anchor}: {rules}");
     }
@@ -2299,7 +2308,7 @@ fn a_port_given_no_address_answers_on_the_hosts_own_addresses() {
 /// redirects would reach whoever had it next; once they can go, it goes.
 /// A `pfctl` first on the PATH refuses for as long as `refuse` exists.
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn a_failed_teardown_keeps_the_address_until_it_can_go() {
     use std::os::unix::fs::PermissionsExt;
     if !live("a_failed_teardown_keeps_the_address_until_it_can_go") {
@@ -2323,8 +2332,8 @@ fn a_failed_teardown_keeps_the_address_until_it_can_go() {
         format!(
             "#!/bin/sh\n\
              case \" $* \" in\n\
-             *\" -a jailer/nat \"*) ;;\n\
-             *\" -a jailer/\"*\" -F \"*)\n\
+             *\" -a legion-local/nat \"*) ;;\n\
+             *\" -a legion-local/\"*\" -F \"*)\n\
                  if [ -e {} ]; then echo 'pfctl: refused' >&2; exit 1; fi ;;\n\
              esac\n\
              exec /sbin/pfctl \"$@\"\n",
@@ -2339,7 +2348,7 @@ fn a_failed_teardown_keeps_the_address_until_it_can_go() {
         std::env::var("PATH").unwrap_or_default()
     );
     let shimmed = || {
-        let mut c = jailer_in(&state);
+        let mut c = local_in(&state);
         c.env("PATH", &path);
         c
     };
@@ -2360,26 +2369,26 @@ fn a_failed_teardown_keeps_the_address_until_it_can_go() {
         ]
     };
 
-    succeeded(jailer_in(&state).args(["build", "-t", "i:1", project.to_str().unwrap()]));
+    succeeded(local_in(&state).args(["build", "-t", "i:1", project.to_str().unwrap()]));
     let _remove = RemoveAll(&state, &["held", "next"]);
     succeeded(shimmed().args(run_args("held")));
-    let ps = succeeded(jailer_in(&state).arg("ps"));
+    let ps = succeeded(local_in(&state).arg("ps"));
     let ip = ps
         .split_whitespace()
         .find(|w| w.starts_with("10.77.0."))
         .unwrap_or_else(|| panic!("no address: {ps}"))
         .to_owned();
-    let lease = Path::new("/var/run/jailer/net").join(&ip);
+    let lease = Path::new("/var/run/legion-local/net").join(&ip);
     let pod = std::fs::read_to_string(&lease)
         .unwrap()
         .lines()
         .next()
         .unwrap()
         .to_owned();
-    let anchor = format!("jailer/{}", &pod[pod.len().saturating_sub(12)..]);
+    let anchor = format!("legion-local/{}", &pod[pod.len().saturating_sub(12)..]);
     assert!(host(&["pfctl", "-a", &anchor, "-sn"]).contains("18084"));
 
-    // The pod goes outside jailer, its rules refusing to.
+    // The pod goes outside `legion local`, its rules refusing to.
     std::fs::write(&refuse, "").unwrap();
     assert!(
         Command::new("jail")
@@ -2403,8 +2412,8 @@ fn a_failed_teardown_keeps_the_address_until_it_can_go() {
 
     // Once they can go, they do, and the address is free again.
     std::fs::remove_file(&refuse).unwrap();
-    let _ = jailer_in(&state).args(["rm", "-f", "next"]).output();
-    succeeded(jailer_in(&state).args(run_args("next")));
+    let _ = local_in(&state).args(["rm", "-f", "next"]).output();
+    succeeded(local_in(&state).args(run_args("next")));
     assert!(!host(&["pfctl", "-a", &anchor, "-sn"]).contains("18084"));
     let now = std::fs::read_to_string(&lease).unwrap_or_default();
     assert!(!now.starts_with(&pod), "{now}");
@@ -2529,7 +2538,7 @@ fn login_refuses_a_token_realm_that_is_not_https() {
         }
     });
 
-    let mut login = Command::new(env!("CARGO_BIN_EXE_jailer"));
+    let mut login = local();
     login
         .env("SSL_CERT_FILE", file("ca.pem"))
         .args(["--state-dir", path("state").as_str(), "--no-zfs", "login"])
@@ -2552,7 +2561,7 @@ fn login_refuses_a_token_realm_that_is_not_https() {
 /// run all the same: it would otherwise wait on a command nothing told to
 /// stop. At delays across the start, as the moment depends on the storage.
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn a_ctrl_c_while_a_run_starts_ends_it() {
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     if !live("a_ctrl_c_while_a_run_starts_ends_it") {
@@ -2568,7 +2577,7 @@ fn a_ctrl_c_while_a_run_starts_ends_it() {
 ",
     )
     .unwrap();
-    succeeded(jailer_in(&state).args(["build", "-t", "i:1", project.to_str().unwrap()]));
+    succeeded(local_in(&state).args(["build", "-t", "i:1", project.to_str().unwrap()]));
 
     // From when its record appears: what comes before that, the signal ends
     // outright or in its setup, and the window is some tens of milliseconds.
@@ -2579,7 +2588,7 @@ fn a_ctrl_c_while_a_run_starts_ends_it() {
         })
     };
     for delay in (0..120).step_by(3) {
-        let mut command = jailer_in(&state);
+        let mut command = local_in(&state);
         command
             .args(["run", "--rm", "--name", "starting"])
             .args(["--entrypoint", "/bin/sleep", "localhost/i:1", "7726"])
@@ -2587,7 +2596,7 @@ fn a_ctrl_c_while_a_run_starts_ends_it() {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         // As from a terminal: a background job, as a qualification run is,
-        // starts with SIGINT ignored, and jailer would inherit that.
+        // starts with SIGINT ignored, and legion would inherit that.
         unsafe {
             command.pre_exec(|| {
                 libc::signal(libc::SIGINT, libc::SIG_DFL);
@@ -2610,17 +2619,17 @@ fn a_ctrl_c_while_a_run_starts_ends_it() {
             if std::time::Instant::now() > deadline {
                 unsafe { libc::kill(-(run.id() as i32), libc::SIGKILL) };
                 let _ = run.wait();
-                let _ = jailer_in(&state).args(["rm", "-f", "starting"]).output();
+                let _ = local_in(&state).args(["rm", "-f", "starting"]).output();
                 panic!("a Ctrl-C {delay} ms into a run was lost");
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
-        // Before jailer's handlers are in place, the signal ends it outright.
+        // Before the local mode's handlers are in place, the signal ends it outright.
         assert!(
             status.code() == Some(130) || status.signal() == Some(libc::SIGINT),
             "{delay} ms: {status:?}"
         );
-        let all = succeeded(jailer_in(&state).args(["ps", "-a"]));
+        let all = succeeded(local_in(&state).args(["ps", "-a"]));
         assert!(!all.contains("starting"), "{delay} ms: {all}");
     }
 }
@@ -2632,7 +2641,7 @@ fn a_ctrl_c_while_a_run_starts_ends_it() {
 /// spends the time in making it: a `stop` takes longer to start than what
 /// follows, which Legion's own tests cover with a slow supervisor.
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn a_stop_while_a_run_starts_ends_it() {
     use std::os::unix::process::CommandExt;
     if !live("a_stop_while_a_run_starts_ends_it") {
@@ -2648,7 +2657,7 @@ fn a_stop_while_a_run_starts_ends_it() {
 ",
     )
     .unwrap();
-    succeeded(jailer_in(&state).args(["build", "-t", "i:1", project.to_str().unwrap()]));
+    succeeded(local_in(&state).args(["build", "-t", "i:1", project.to_str().unwrap()]));
     let _remove = RemoveAll(&state, &["starting"]);
 
     let recorded = || {
@@ -2658,7 +2667,7 @@ fn a_stop_while_a_run_starts_ends_it() {
         })
     };
     for delay in (0..60).step_by(3) {
-        let mut run = jailer_in(&state)
+        let mut run = local_in(&state)
             .args(["run", "--rm", "--name", "starting"])
             .args(["--entrypoint", "/bin/sleep", "localhost/i:1", "7727"])
             .process_group(0)
@@ -2677,7 +2686,7 @@ fn a_stop_while_a_run_starts_ends_it() {
         } else {
             &["rm", "-f", "starting"]
         };
-        succeeded(jailer_in(&state).args(end));
+        succeeded(local_in(&state).args(end));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while run.try_wait().unwrap().is_none() {
             if std::time::Instant::now() > deadline {
@@ -2687,14 +2696,14 @@ fn a_stop_while_a_run_starts_ends_it() {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        let all = succeeded(jailer_in(&state).args(["ps", "-a"]));
+        let all = succeeded(local_in(&state).args(["ps", "-a"]));
         assert!(!all.contains("starting"), "{delay} ms: {all}");
     }
 }
 
 /// Pods on a network the host chooses, one network at a time.
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn pods_run_on_the_network_given_and_only_one_at_a_time() {
     if !live("pods_run_on_the_network_given_and_only_one_at_a_time") {
         return;
@@ -2708,7 +2717,7 @@ fn pods_run_on_the_network_given_and_only_one_at_a_time() {
         "FROM docker.io/freebsd/freebsd-runtime:15.1\n",
     )
     .unwrap();
-    succeeded(jailer_in(&state).args(["build", "-t", "i:1", project.to_str().unwrap()]));
+    succeeded(local_in(&state).args(["build", "-t", "i:1", project.to_str().unwrap()]));
     let _remove = RemoveAll(&state, &["chosen", "back"]);
     let run = |name: &'static str| {
         [
@@ -2726,34 +2735,34 @@ fn pods_run_on_the_network_given_and_only_one_at_a_time() {
     };
 
     succeeded(
-        jailer_in(&state)
+        local_in(&state)
             .args(["--pod-subnet", "10.79.0.0/24"])
             .args(run("chosen")),
     );
-    let ps = succeeded(jailer_in(&state).arg("ps"));
+    let ps = succeeded(local_in(&state).arg("ps"));
     assert!(ps.contains("10.79.0.2"), "{ps}");
-    let bridge = host(&["ifconfig", "jailer0", "inet"]);
+    let bridge = host(&["ifconfig", "legionlocal0", "inet"]);
     assert!(bridge.contains("10.79.0.1"), "{bridge}");
-    let nat = host(&["pfctl", "-a", "jailer/nat", "-sn"]);
+    let nat = host(&["pfctl", "-a", "legion-local/nat", "-sn"]);
     assert!(nat.contains("10.79.0.0/24"), "{nat}");
 
     // The bridge is that pod's while it runs.
-    let out = jailer_in(&state).args(run("back")).output().unwrap();
+    let out = local_in(&state).args(run("back")).output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success() && err.contains("--pod-subnet"),
         "{err}"
     );
-    let bridge = host(&["ifconfig", "jailer0", "inet"]);
+    let bridge = host(&["ifconfig", "legionlocal0", "inet"]);
     assert!(bridge.contains("10.79.0.1"), "{bridge}");
 
     // Then it goes back, leaving nothing of the other network.
-    succeeded(jailer_in(&state).args(["rm", "-f", "chosen"]));
-    let _ = jailer_in(&state).args(["rm", "-f", "back"]).output();
-    succeeded(jailer_in(&state).args(run("back")));
-    let ps = succeeded(jailer_in(&state).arg("ps"));
+    succeeded(local_in(&state).args(["rm", "-f", "chosen"]));
+    let _ = local_in(&state).args(["rm", "-f", "back"]).output();
+    succeeded(local_in(&state).args(run("back")));
+    let ps = succeeded(local_in(&state).arg("ps"));
     assert!(ps.contains("10.77.0.2"), "{ps}");
-    let bridge = host(&["ifconfig", "jailer0", "inet"]);
+    let bridge = host(&["ifconfig", "legionlocal0", "inet"]);
     assert!(
         bridge.contains("10.77.0.1") && !bridge.contains("10.79."),
         "{bridge}"
@@ -2763,55 +2772,55 @@ fn pods_run_on_the_network_given_and_only_one_at_a_time() {
 // The tests storage matters to, on ZFS: clones in place of copies.
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn run_mounts_reach_the_step_but_not_the_image_on_zfs() {
     on_zfs(run_mounts_reach_the_step_but_not_the_image);
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid_on_zfs() {
     on_zfs(cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid);
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn stage_copies_keep_owners_archives_take_flags_and_cache_options_count_on_zfs() {
     on_zfs(stage_copies_keep_owners_archives_take_flags_and_cache_options_count);
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn interrupted_builds_and_runs_leave_nothing_on_zfs() {
     on_zfs(interrupted_builds_and_runs_leave_nothing);
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn a_failing_stage_nothing_needs_does_not_run_on_zfs() {
     on_zfs(a_failing_stage_nothing_needs_does_not_run);
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn stages_at_once_overlap_share_caches_and_fail_together_on_zfs() {
     on_zfs(stages_at_once_overlap_share_caches_and_fail_together);
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn a_stop_while_a_run_starts_ends_it_on_zfs() {
     on_zfs(a_stop_while_a_run_starts_ends_it);
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn a_ctrl_c_while_a_run_starts_ends_it_on_zfs() {
     on_zfs(a_ctrl_c_while_a_run_starts_ends_it);
 }
 
 #[test]
-#[ignore = "needs root: scripts/jailer.qualify runs it"]
+#[ignore = "needs root: scripts/legion.qualify runs it"]
 fn a_container_left_without_its_root_is_listed_and_removed_on_zfs() {
     on_zfs(a_container_left_without_its_root_is_listed_and_removed);
 }
@@ -2831,7 +2840,7 @@ impl Drop for Sysctl {
 /// with a warning, and such a program then fails as it would on its own. It
 /// sets a sysctl of the whole host, so: disposable hosts only.
 #[test]
-#[ignore = "needs root, Linux ABI modules and a disposable host: scripts/jailer.qualify runs it"]
+#[ignore = "needs root, Linux ABI modules and a disposable host: scripts/legion.qualify runs it"]
 fn a_static_linux_program_runs_under_linux() {
     if !live("a_static_linux_program_runs_under_linux") {
         return;
@@ -2846,7 +2855,7 @@ fn a_static_linux_program_runs_under_linux() {
     // interpreter, and so runs whatever the fallback brand.
     let image = "docker.io/library/busybox:1.37-musl";
     let run = || {
-        jailer_in(&state)
+        local_in(&state)
             .args(["run", "--rm", "--network", "none", "--linux", image])
             .args(["/bin/echo", "static"])
             .output()

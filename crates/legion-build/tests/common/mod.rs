@@ -14,7 +14,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use jailer::registry::sha256;
+use legion_build::registry::sha256;
 
 #[derive(Default)]
 pub struct MockRegistry {

@@ -1,7 +1,7 @@
 //! Paths inside a root, resolved as a process jailed there would: links are
 //! followed inside it (an absolute one starts again from it, `..` stops at
 //! it), so none leads out to the host. For what writes into an image from
-//! outside its jail; jailer's builds use it too.
+//! outside its jail; `legion local`'s builds use it too.
 
 use std::ffi::OsString;
 use std::fs::Metadata;

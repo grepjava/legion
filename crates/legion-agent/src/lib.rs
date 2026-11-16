@@ -107,7 +107,7 @@ pub struct AgentConfig {
     /// agent; without it, the agent serves DNS itself.
     pub resolver: Option<ExternalResolver>,
     /// How the node runs the Builds the managers give it, if they give it
-    /// any (it is labelled a builder): jailer, on the host.
+    /// any (it is labelled a builder): `legion local`, on the host.
     pub builder: Builder,
 }
 

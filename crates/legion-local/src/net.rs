@@ -1,11 +1,11 @@
-//! Networking for `jailer run --vnet`, as a Legion node gives a pod, with
+//! Networking for `legion local run --vnet`, as a Legion node gives a pod, with
 //! Legion's own `PodNetwork`: an epair whose host end joins a bridge and
 //! whose other end moves into the pod's jail, with the bridge as its
-//! default route. The bridge is jailer's own, `jailer0` on 10.77.0.0/16 or
+//! default route. The bridge is the local mode's own, `legionlocal0` on 10.77.0.0/16 or
 //! what `--pod-subnet` gives (not 10.88.0.0/16, Podman's default network),
 //! IPv4 only and with Ethernet's MTU, so that a host that is also a Legion
 //! node keeps its `legion0` to itself. NAT to the outside and
-//! published ports are pf rules in anchors under `jailer/`, which the
+//! published ports are pf rules in anchors under `legion-local/`, which the
 //! host's pf.conf must call.
 //!
 //! Addresses are the host's, whatever state directory a container's is
@@ -26,7 +26,7 @@ use legion_sys::{Ipv4Net, Sys};
 
 use crate::Error;
 
-pub const BRIDGE: &str = "jailer0";
+pub const BRIDGE: &str = "legionlocal0";
 pub const DEFAULT_SUBNET: Ipv4Net = Ipv4Net {
     addr: Ipv4Addr::new(10, 77, 0, 0),
     prefix: 16,
@@ -38,7 +38,7 @@ pub fn choose_subnet(subnet: Ipv4Net) {
     let _ = CHOSEN_SUBNET.set(subnet);
 }
 
-/// Pods' network: `--pod-subnet`'s, or jailer's own.
+/// Pods' network: `--pod-subnet`'s, or the local mode's own.
 pub fn subnet() -> Ipv4Net {
     CHOSEN_SUBNET.get().copied().unwrap_or(DEFAULT_SUBNET)
 }
@@ -57,19 +57,19 @@ pub fn parse_subnet(text: &str) -> Result<Ipv4Net, String> {
     Ok(net)
 }
 /// Where addresses taken are kept; gone at boot, as the jails are.
-pub const LEASES: &str = "/var/run/jailer/net";
-/// What the host's pf.conf must hold for jailer's anchors to be used.
+pub const LEASES: &str = "/var/run/legion-local/net";
+/// What the host's pf.conf must hold for the local mode's anchors to be used.
 pub const HOOKS: [&str; 3] = [
-    "nat-anchor \"jailer/*\"",
-    "rdr-anchor \"jailer/*\"",
-    "anchor \"jailer/*\"",
+    "nat-anchor \"legion-local/*\"",
+    "rdr-anchor \"legion-local/*\"",
+    "anchor \"legion-local/*\"",
 ];
-const NAT_ANCHOR: &str = "jailer/nat";
+const NAT_ANCHOR: &str = "legion-local/nat";
 
-/// jailer's bridge, as Legion's pod network code makes it.
+/// The local mode's bridge, as Legion's pod network code makes it.
 pub fn network() -> PodNetwork {
     PodNetwork::new(subnet())
-        .named(BRIDGE, "jp")
+        .named(BRIDGE, "ll")
         .expect("valid interface names")
         .without_v6()
         .with_mtu(1500)
@@ -152,10 +152,10 @@ impl Port {
 
 /// The hooks the host's main pf ruleset lacks.
 pub fn missing_hooks(main_rules: &str) -> Vec<&'static str> {
-    legion_net::lb::missing_hooks_of(main_rules, "jailer/*", HOOKS)
+    legion_net::lb::missing_hooks_of(main_rules, "legion-local/*", HOOKS)
 }
 
-/// The interface that `route -n get` says an address in jailer's subnet
+/// The interface that `route -n get` says an address in the local mode's subnet
 /// goes out of, if a route other than the default one covers it.
 pub fn subnet_route(route_get: &str) -> Option<&str> {
     let field = |name: &str| {
@@ -172,7 +172,7 @@ pub fn subnet_route(route_get: &str) -> Option<&str> {
 }
 
 /// Fails if another interface, a VPN's or a network another tool made,
-/// already routes jailer's subnet: the pods' traffic would go there
+/// already routes the local mode's subnet: the pods' traffic would go there
 /// instead.
 pub fn check_subnet() -> Result<(), Error> {
     #[cfg(target_os = "freebsd")]
@@ -186,7 +186,7 @@ pub fn check_subnet() -> Result<(), Error> {
             && other != BRIDGE
         {
             return Err(Error::Runtime(format!(
-                "jailer's pod network {}/{} is routed to {other}, not {BRIDGE}: another network has the same addresses; remove it, choose another with --pod-subnet, or use --network none",
+                "the local pod network {}/{} is routed to {other}, not {BRIDGE}: another network has the same addresses; remove it, choose another with --pod-subnet, or use --network none",
                 subnet.addr, subnet.prefix
             )));
         }
@@ -196,17 +196,17 @@ pub fn check_subnet() -> Result<(), Error> {
 
 /// Makes the bridge, turns on forwarding and loads the NAT rules: what
 /// every pod on the bridge needs. Fails, saying what to add, if pf.conf
-/// does not call jailer's anchors.
+/// does not call the local mode's anchors.
 pub fn ensure(sys: &dyn Sys) -> Result<(), Error> {
     let main = sys.pf_main_rules().map_err(|e| {
         Error::Runtime(format!(
-            "--vnet networking needs pf(4), with jailer's anchors: {e}"
+            "--vnet networking needs pf(4), with the local mode's anchors: {e}"
         ))
     })?;
     let missing = missing_hooks(&main);
     if !missing.is_empty() {
         return Err(Error::Runtime(format!(
-            "--vnet networking needs pf.conf to call jailer's anchors: add\n    {}\nwith the NAT and redirect anchors before any filter rule, then run `pfctl -f /etc/pf.conf` (or use --network none)",
+            "--vnet networking needs pf.conf to call the local mode's anchors: add\n    {}\nwith the NAT and redirect anchors before any filter rule, then run `pfctl -f /etc/pf.conf` (or use --network none)",
             missing.join("\n    ")
         )));
     }
@@ -254,7 +254,7 @@ pub fn host_interface(pod: &str) -> String {
 }
 
 fn anchor(pod: &str) -> String {
-    format!("jailer/{}", &pod[pod.len().saturating_sub(12)..])
+    format!("legion-local/{}", &pod[pod.len().saturating_sub(12)..])
 }
 
 /// Gives the pod (its jail named `pod`) the address `ip` on the bridge,
@@ -306,7 +306,7 @@ pub struct Leases {
     dir: PathBuf,
 }
 
-/// [`Leases`] locked against other jailer processes until dropped.
+/// [`Leases`] locked against other `legion local` processes until dropped.
 pub struct Locked<'a> {
     leases: &'a Leases,
     _lock: File,
@@ -348,7 +348,7 @@ impl Leases {
 
 impl Locked<'_> {
     /// The leases whose jails are still there. One whose jail is gone, as
-    /// when it was removed outside jailer, is dropped with its pf rules and
+    /// when it was removed outside the local mode, is dropped with its pf rules and
     /// epair, which would otherwise still take its ports.
     fn live(&self, sys: &dyn Sys) -> Result<Vec<(Ipv4Addr, Lease)>, Error> {
         self.live_with(sys, |jail| detach(sys, jail))
@@ -467,7 +467,10 @@ mod tests {
                 "   route to: 10.77.0.2\ndestination: {dest}\n       mask: 255.255.0.0\n        fib: 0\n  interface: {iface}\n      flags: <UP,DONE>\n"
             )
         };
-        assert_eq!(subnet_route(&get("10.77.0.0", "jailer0")), Some("jailer0"));
+        assert_eq!(
+            subnet_route(&get("10.77.0.0", "legionlocal0")),
+            Some("legionlocal0")
+        );
         assert_eq!(subnet_route(&get("10.0.0.0", "tun0")), Some("tun0"));
         assert_eq!(subnet_route(&get("default", "re0")), None);
         assert_eq!(subnet_route(""), None);
@@ -493,13 +496,12 @@ mod tests {
 
     #[test]
     fn hooks_are_found_in_the_main_ruleset() {
-        let main =
-            "nat-anchor \"legion/*\" all\nnat-anchor \"jailer/*\" all\nanchor \"jailer/*\" all\n";
+        let main = "nat-anchor \"legion/*\" all\nnat-anchor \"legion-local/*\" all\nanchor \"legion-local/*\" all\n";
         assert_eq!(missing_hooks(main), [HOOKS[1]]);
         let sys = FakeSys::new();
         sys.set_main_rules(main);
         let err = ensure(&sys).unwrap_err().to_string();
-        assert!(err.contains("rdr-anchor \"jailer/*\""), "{err}");
+        assert!(err.contains("rdr-anchor \"legion-local/*\""), "{err}");
     }
 
     #[test]
@@ -577,8 +579,8 @@ mod tests {
             "no IPv6 route"
         );
         assert_eq!(
-            sys.anchor("jailer/89abcdef0123").unwrap(),
-            "rdr pass on ! jailer0 inet proto tcp from any to (self) port 8080 -> 10.77.0.2 port 80\n"
+            sys.anchor("legion-local/89abcdef0123").unwrap(),
+            "rdr pass on ! legionlocal0 inet proto tcp from any to (self) port 8080 -> 10.77.0.2 port 80\n"
         );
 
         // The next pod gets the next address, and not the same port.
@@ -612,7 +614,7 @@ mod tests {
                 .unwrap();
             assert!(live.iter().any(|(i, l)| *i == ip && l.jail == pod));
             assert!(tmp.path().join("10.77.0.2").exists());
-            assert!(sys.anchor("jailer/89abcdef0123").is_some());
+            assert!(sys.anchor("legion-local/89abcdef0123").is_some());
         }
 
         // Once they go, it is free again, its ports and epair with it.
@@ -620,7 +622,9 @@ mod tests {
         assert!(!tmp.path().join("10.77.0.2").exists());
         assert!(sys.interface(&host_interface(pod)).is_none());
         assert_eq!(
-            sys.anchor("jailer/89abcdef0123").as_deref().unwrap_or(""),
+            sys.anchor("legion-local/89abcdef0123")
+                .as_deref()
+                .unwrap_or(""),
             ""
         );
         leases.release(ip, pod).unwrap();

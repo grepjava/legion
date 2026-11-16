@@ -36,7 +36,7 @@ message SessionOpen {
     VolumeExport volume_export = 10;
     VolumeImport volume_import = 11;
     // Managers only, a Build (CONSOLE.md phase 5): build an image with
-    // jailer on this node and push it.
+    // `legion local` on this node and push it.
     BuildOptions build = 12;
     // Managers only: list, create, roll back or delete a ZFS Volume's
     // snapshots on the node holding it.
@@ -118,7 +118,7 @@ message VolumeSnapshotResult {
 
 message ImageNodeAction {
   // "list", "inspect", "pull", "push", "remove", "prune", "export",
-  // "load"; "prune-builds", jailer's store pruned on a builder; "scan",
+  // "load"; "prune-builds", the builder's store pruned on a builder; "scan",
   // the image's packages audited.
   string op = 1;
   string image = 2;
@@ -149,9 +149,9 @@ message ImageNodeResult {
   repeated string packages = 7;
 }
 
-// The output of `jailer build` and `jailer push` comes as `stdout` and
+// The output of `legion local build` and `push` comes as `stdout` and
 // `stderr` frames, as written; then `built`, then `exit_code` 0. A node
-// without jailer, or not a builder, ends with `error`.
+// without a builder program, or not a builder, ends with `error`.
 message BuildOptions {
   // A Git repository read with no login, its ref (the default branch when
   // empty) and the directory in it built; or, with no `git_url`, the
@@ -167,7 +167,7 @@ message BuildOptions {
   // Registries spoken to over plain HTTP, as the cluster's are.
   repeated string plain_http = 7;
   // A P-256 private key (PEM): the image is pushed signed with it, and
-  // its provenance and SBOM attested (jailer push --sign-key, attest).
+  // its provenance and SBOM attested (legion local push --sign-key, attest).
   bytes sign_key = 8;
 }
 

@@ -17,7 +17,9 @@ use crate::store::{CachedLayer, CachedStep, Pin, Store, chain_ids, hex_of};
 use crate::{Error, Reference};
 
 /// The cache config's media type.
-pub const CONFIG_TYPE: &str = "application/vnd.jailer.build-cache.config.v1+json";
+pub const CONFIG_TYPE: &str = "application/vnd.legion.build-cache.config.v1+json";
+/// What the standalone jailer, merged into Legion, wrote: read still.
+const OLD_CONFIG_TYPE: &str = "application/vnd.jailer.build-cache.config.v1+json";
 
 /// A registry and repository, and the credentials for it.
 #[derive(Debug, Clone)]
@@ -150,9 +152,9 @@ async fn read_one(
         .document(r, r.target(), remote.creds.as_ref())
         .await?;
     let manifest = doc.into_manifest()?;
-    if manifest.config.media_type != CONFIG_TYPE {
+    if ![CONFIG_TYPE, OLD_CONFIG_TYPE].contains(&manifest.config.media_type.as_str()) {
         return Err(Error::Build(format!(
-            "not a jailer build cache (its config is {})",
+            "not a Legion build cache (its config is {})",
             manifest.config.media_type
         )));
     }

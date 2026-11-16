@@ -1,7 +1,5 @@
 # Legion's manifest for scripts/qualify. See that script for the format.
 project legion
-# The jailer the handoff test ran, as scripts/legion.labsetup builds it.
-record jailer sed -n 's/^jailer_rev=//p' scripts/legion.labsetup
 # The previous release the upgrade drill starts from.
 record previous sed -n 's/^previous_rev=//p' scripts/legion.labsetup
 scan crates/*/tests/*.rs
@@ -12,7 +10,13 @@ own ^jail (lsys|lnet|lvip|ladopt|lcontract)
 own ^mount .*/var/tmp/(l|q)
 own ^if (lsys|lnet|lvip|lbr|legion0|wg0)
 own ^anchor legion/
+own ^anchor legion-local/[0-9a-f]
+own ^if ll
+own ^jail [^ ]+ /tmp/\.tmp
+own ^mount .* on /tmp/\.tmp
+own ^rctl jail:
 own ^zfs [^/]+/(q[0-9]|l(jail|stand|linux|img))
+own ^zfs [^/]+/legion-local-test
 
 env LEGION_JAIL_ZFS_ROOT @zfs@
 env LEGION_IMAGE_ZFS_ROOT @zfs@
@@ -24,6 +28,7 @@ env LEGION_STORAGE_LAB @lab@/storage
 env LEGION_STORAGE_ZFS_ROOT @zfs@/storage
 env LEGION_ADOPT_LAB @lab@/adopt
 env LEGION_ADOPT_ZFS_ROOT @zfs@/adopt
+env LEGION_LOCAL_TEST_POOL @zfsmount@
 
 run clippy 3600 cargo clippy --workspace --all-targets -- -D warnings
 run unit 3600 cargo test --workspace --no-fail-fast
@@ -74,6 +79,45 @@ test legion storage pod_on_storage_its_node_provides host isolated 900 env:LEGIO
 test legion-sys live network_storage host isolated 300 env:LEGION_SYS_NFS env:LEGION_SYS_ISCSI
 test legion-net bhyve guest_on_the_bridge vnet isolated 900 kld:vmm env:LEGION_BHYVE_DISK env:LEGION_BHYVE_LAB
 
+# `legion local` on the host itself (crates/legion/tests/local_jail.rs).
+# Safe on a shared, public host: throwaway jails, and ports published only on
+# a test address.
+test legion local_jail real_freebsd_jail_build_run_export_workflow host shared 900
+test legion local_jail run_mounts_reach_the_step_but_not_the_image host shared 600
+test legion local_jail cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid host shared 600
+test legion local_jail stage_copies_keep_owners_archives_take_flags_and_cache_options_count host shared 600
+test legion local_jail the_pods_hostname_wins_and_a_stop_ends_an_attached_run host shared 600
+test legion local_jail a_signal_to_exec_ends_its_command host shared 600
+test legion local_jail interrupted_builds_and_runs_leave_nothing host shared 600
+test legion local_jail another_users_state_directory_is_refused_by_name host shared 300
+test legion local_jail a_failing_stage_nothing_needs_does_not_run host shared 300
+test legion local_jail memory_limits_each_process_not_the_container host shared 300
+test legion local_jail an_sbom_lists_what_pkg_knows_of_an_image host shared 300
+test legion local_jail stages_at_once_overlap_share_caches_and_fail_together host shared 300
+test legion local_jail a_container_left_without_its_root_is_listed_and_removed host shared 300
+test legion local_jail doctor_reports_on_the_host_and_changes_nothing host shared 120
+test legion local_jail a_failed_teardown_keeps_the_address_until_it_can_go host shared 300
+test legion local_jail a_ctrl_c_while_a_run_starts_ends_it host shared 900
+test legion local_jail a_stop_while_a_run_starts_ends_it host shared 300
+test legion local_jail pods_run_on_the_network_given_and_only_one_at_a_time host shared 300
+
+# On ZFS, where a stage or a root is a clone, not a copy.
+test legion local_jail run_mounts_reach_the_step_but_not_the_image_on_zfs host shared 600
+test legion local_jail cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid_on_zfs host shared 600
+test legion local_jail stage_copies_keep_owners_archives_take_flags_and_cache_options_count_on_zfs host shared 600
+test legion local_jail interrupted_builds_and_runs_leave_nothing_on_zfs host shared 600
+test legion local_jail a_failing_stage_nothing_needs_does_not_run_on_zfs host shared 600
+test legion local_jail stages_at_once_overlap_share_caches_and_fail_together_on_zfs host shared 600
+test legion local_jail a_container_left_without_its_root_is_listed_and_removed_on_zfs host shared 600
+test legion local_jail a_ctrl_c_while_a_run_starts_ends_it_on_zfs host shared 900
+test legion local_jail a_stop_while_a_run_starts_ends_it_on_zfs host shared 600
+
+# Publishes a port on every address the host has: disposable hosts only.
+test legion local_jail a_port_given_no_address_answers_on_the_hosts_own_addresses host isolated 300
+
+# Sets kern.elf64.fallback_brand, a sysctl of the whole host: disposable hosts only.
+test legion local_jail a_static_linux_program_runs_under_linux host isolated 600
+
 # Several disposable hosts: the lab of crates/legion/tests/common.
 test legion cluster app_updates_and_survives_losing_a_node host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_CLUSTER_LOSE
 test legion stateful postgres_moves_between_nodes host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_PG_IMAGE
@@ -83,21 +127,21 @@ test legion stateful postgres_is_restored_onto_replacement_hosts host cluster 36
 # clusters signed into with one identity provider (phase 6's "done when").
 test legion console the_console_runs_the_cluster host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_BROWSER env:LEGION_AXE
 test legion console the_console_spans_two_clusters_by_single_sign_on host cluster 1800 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_BROWSER
-test legion console the_console_builds_an_example_with_jailer host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_BROWSER env:LEGION_JAILER
+test legion console the_console_builds_an_example host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_BROWSER
 test legion teams two_teams_share_a_cluster host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
 test legion ca the_ca_rotates_with_every_node_on_it host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
 test legion roles a_worker_and_a_manager_change_roles_in_place host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
 test legion balancer a_load_balancer_address_answers_and_moves host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY kld:carp
 test legion cluster the_cluster_upgrades_one_node_at_a_time host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_PREVIOUS
 
-test legion handoff a_jailer_archive_runs_as_exported host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_JAILER
-test legion handoff a_jailer_push_is_what_legion_runs host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_JAILER
-test legion handoff a_jailer_image_keeps_its_data_through_a_drain host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_JAILER
-test legion handoff a_jailer_image_keeps_its_data_through_a_cut_move host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_JAILER
-test legion handoff a_jailer_signature_is_what_legion_checks host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_JAILER
-test legion handoff a_jailer_image_goes_from_build_to_recovery host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_JAILER
-test legion handoff a_jailer_index_runs_each_nodes_platform host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_JAILER
-test legion examples the_examples_run_as_their_readmes_say host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_JAILER
+test legion handoff a_local_archive_runs_as_exported host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
+test legion handoff a_local_push_is_what_legion_runs host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
+test legion handoff a_local_image_keeps_its_data_through_a_drain host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
+test legion handoff a_local_image_keeps_its_data_through_a_cut_move host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
+test legion handoff a_local_signature_is_what_legion_checks host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
+test legion handoff a_local_image_goes_from_build_to_recovery host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
+test legion handoff a_local_index_runs_each_nodes_platform host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
+test legion examples the_examples_run_as_their_readmes_say host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
 helper legion-net mesh serve
 helper legion handoff registry
 helper legion console registry

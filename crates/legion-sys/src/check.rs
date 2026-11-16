@@ -1,5 +1,5 @@
 //! Read-only checks of what a host offers, shared by `legion doctor` and
-//! jailer's. Each stands alone, changes nothing and needs no daemon. It says
+//! `legion local`'s. Each stands alone, changes nothing and needs no daemon. It says
 //! what it found; what that blocks is the caller's to decide, as a host with
 //! no pf suits some operations and not others. Ids are published in JSON
 //! output, so they stay as they are, and remedies name no tool's own paths.

@@ -46,7 +46,9 @@ tracing-subscriber.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+bytes.workspace = true
 ring.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 sha2.workspace = true
 tar = { version = "0.4", default-features = false }
 tempfile.workspace = true

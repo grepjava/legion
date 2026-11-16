@@ -21,7 +21,7 @@ pub const SCHEMA: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     pub schema: u32,
-    /// The jailer that wrote it last.
+    /// The Legion that wrote it last.
     pub builder: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<Built>,
@@ -223,7 +223,7 @@ impl Default for Record {
 }
 
 fn builder() -> String {
-    format!("jailer {}", env!("CARGO_PKG_VERSION"))
+    format!("legion {}", env!("CARGO_PKG_VERSION"))
 }
 
 fn identity(image: &Image) -> Built {
@@ -258,7 +258,7 @@ impl Record {
         let record: Record = serde_json::from_str(&text).map_err(|e| bad(e.to_string()))?;
         if record.schema > SCHEMA {
             return Err(bad(format!(
-                "a record of schema {}, newer than this jailer's {SCHEMA}",
+                "a record of schema {}, newer than this Legion's {SCHEMA}",
                 record.schema
             )));
         }

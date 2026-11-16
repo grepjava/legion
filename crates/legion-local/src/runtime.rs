@@ -1,8 +1,8 @@
 //! Containers are Legion's: `legion_jail::JailRuntime` runs them, as a
-//! node does, and runs a build's `RUN` steps. What is jailer's own is how
-//! `jailer run` asks for one: a standalone container (a jail of its own on
+//! node does, and runs a build's `RUN` steps. What is the local mode's own is how
+//! `legion local run` asks for one: a standalone container (a jail of its own on
 //! the host's network), or with `--vnet` a pod jail and a member in it, as
-//! a cluster runs a pod, the pod on jailer's bridge ([`crate::net`]). Containers get Legion's security defaults, with
+//! a cluster runs a pod, the pod on the local mode's bridge ([`crate::net`]). Containers get Legion's security defaults, with
 //! `--param` over them.
 
 use std::collections::BTreeMap;
@@ -21,14 +21,14 @@ pub use legion_jail::{Config, JailRuntime, Step, StepMount, StepNetwork};
 
 use crate::Error;
 
-/// On a member jailer made a pod for: the pod's id.
-pub const LABEL_POD: &str = "jailer.pod";
-/// `pod` on a pod jailer made; `jailer ps` leaves them out.
-pub const LABEL_ROLE: &str = "jailer.role";
+/// On a member the local mode made a pod for: the pod's id.
+pub const LABEL_POD: &str = "legion.local.pod";
+/// `pod` on a pod the local mode made; `legion local ps` leaves them out.
+pub const LABEL_ROLE: &str = "legion.local.role";
 /// On a pod on the bridge: its address.
-pub const LABEL_IP: &str = "jailer.ip";
+pub const LABEL_IP: &str = "legion.local.ip";
 /// On a pod on the bridge: the ports it publishes, comma-separated.
-pub const LABEL_PORTS: &str = "jailer.ports";
+pub const LABEL_PORTS: &str = "legion.local.ports";
 
 /// The network a container is on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -36,13 +36,13 @@ pub enum Network {
     /// The host's, in a jail of its own.
     #[default]
     Host,
-    /// A pod's VNET, on jailer's bridge.
+    /// A pod's VNET, on the local mode's bridge.
     Bridge,
     /// A pod's VNET with only its loopback.
     None,
 }
 
-/// What `jailer run` asks for.
+/// What `legion local run` asks for.
 #[derive(Debug, Clone, Default)]
 pub struct RunSpec {
     pub name: String,
@@ -99,10 +99,7 @@ pub fn vm_config(
         gateway6: None,
         mtu: 1500,
         dns: net.gateway().to_string(),
-        hostname: spec
-            .hostname
-            .clone()
-            .unwrap_or_else(|| spec.name.clone()),
+        hostname: spec.hostname.clone().unwrap_or_else(|| spec.name.clone()),
     }
 }
 
@@ -130,11 +127,9 @@ impl Limits {
     ) -> Result<Self, Error> {
         let memory = memory
             .map(|m| {
-                crate::parse_size(m)
-                    .filter(|&n| n > 0)
-                    .ok_or_else(|| {
-                        Error::Runtime(format!("--memory {m:?}: give a size such as 512m"))
-                    })
+                crate::parse_size(m).filter(|&n| n > 0).ok_or_else(|| {
+                    Error::Runtime(format!("--memory {m:?}: give a size such as 512m"))
+                })
             })
             .transpose()?;
         let pcpu = cpus
@@ -454,7 +449,7 @@ mod containers {
         }
     }
 
-    /// The pod `id` runs in, if jailer made one for it.
+    /// The pod `id` runs in, if the local mode made one for it.
     async fn pod_of(rt: &JailRuntime, id: &str) -> Result<Option<String>, Error> {
         Ok(rt.inspect(id).await?.config.labels.get(LABEL_POD).cloned())
     }

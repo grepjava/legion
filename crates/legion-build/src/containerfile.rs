@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::Error;
+pub use crate::parse_size;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Containerfile {
@@ -256,7 +257,7 @@ impl Containerfile {
                     }
                 }
                 "syntax" => warnings.push(format!(
-                    "line {line_no}: `# syntax={value}` is ignored: jailer parses the Containerfile itself"
+                    "line {line_no}: `# syntax={value}` is ignored: Legion parses the Containerfile itself"
                 )),
                 _ => {}
             }
@@ -1009,19 +1010,6 @@ fn parse_mount(spec: &str, line_no: usize) -> Result<RunMount, Error> {
                 .transpose()?,
         },
     })
-}
-
-/// A size such as `512`, `64k`, `100m` or `10g` (a trailing `b` is allowed).
-pub fn parse_size(v: &str) -> Option<u64> {
-    let lower = v.to_ascii_lowercase();
-    let s = lower.strip_suffix('b').unwrap_or(&lower);
-    let (num, mult) = match s.chars().last()? {
-        'k' => (&s[..s.len() - 1], 1u64 << 10),
-        'm' => (&s[..s.len() - 1], 1 << 20),
-        'g' => (&s[..s.len() - 1], 1 << 30),
-        _ => (s, 1),
-    };
-    num.parse::<u64>().ok()?.checked_mul(mult)
 }
 
 fn parse_command_form(rest: &str, line_no: usize) -> Result<CommandForm, Error> {

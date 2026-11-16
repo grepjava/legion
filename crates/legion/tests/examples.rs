@@ -1,5 +1,5 @@
 //! The examples in `examples/` (PLAN.md phase 8), each as its README says:
-//! jailer builds its image from FreeBSD's packages, every node loads it,
+//! `legion local` builds its image from FreeBSD's packages, every node loads it,
 //! and `legion stack deploy` runs its compose file on three nodes.
 //!
 //! - `static-site`: nginx answers on port 30081 of every node.
@@ -7,15 +7,14 @@
 //!   and the count stays when Redis's Volume moves to another node.
 //!
 //! It drives real daemons, so it is ignored by default and run by hand on a
-//! FreeBSD host as root, with the lab of `tests/common` and a jailer binary
-//! in `LEGION_JAILER`; jailer fetches FreeBSD's packages:
+//! FreeBSD host as root, with the lab of `tests/common`; `legion local`
+//! fetches FreeBSD's packages:
 //!
 //! ```sh
 //! sudo LEGION_CLUSTER_LAB=/var/tmp/lexamples \
 //!     LEGION_CLUSTER_HOST=10.78.0.1 \
 //!     LEGION_CLUSTER_VMS="lab2=lab@10.78.0.2 lab3=lab@10.78.0.3" \
 //!     LEGION_CLUSTER_KEY=/home/lab/.ssh/id_ed25519 \
-//!     LEGION_JAILER=/home/lab/jailer/target/debug/jailer \
 //!     target/debug/deps/examples-<hash> --ignored --nocapture
 //! ```
 
@@ -23,7 +22,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use common::jailer::Jailer;
+use common::local::Local;
 use common::{Lab, http_get, text, wait};
 use serde_json::Value;
 
@@ -34,13 +33,13 @@ fn example(name: &str) -> PathBuf {
 }
 
 impl Lab {
-    /// Builds an example's image with jailer as `tag` and loads it on every
+    /// Builds an example's image with `legion local` as `tag` and loads it on every
     /// node, as `localhost/<tag>`.
-    fn image(&self, jailer: &Jailer, name: &str, tag: &str) {
+    fn image(&self, builder: &Local, name: &str, tag: &str) {
         let rec = self.dir.join(format!("{name}.json"));
-        jailer.build_dir(&example(name), tag, &rec);
+        builder.build_dir(&example(name), tag, &rec);
         let tar = self.dir.join(format!("{name}.oci.tar"));
-        jailer.run(&[
+        builder.run(&[
             "export",
             "--record",
             rec.to_str().unwrap(),
@@ -109,16 +108,16 @@ fn hits(body: &str) -> u64 {
 }
 
 #[test]
-#[ignore = "needs root and ZFS on FreeBSD, two more nodes and jailer; see the module docs"]
+#[ignore = "needs root and ZFS on FreeBSD and two more nodes; see the module docs"]
 fn the_examples_run_as_their_readmes_say() {
     let mut lab = Lab::from_env();
-    let jailer = Jailer::new(&lab, &[]);
+    let builder = Local::new(&lab, &[]);
     let step = |what: &str| eprintln!("--- {what}");
 
-    step("three nodes, and each example's image built with jailer and loaded");
+    step("three nodes, and each example's image built with `legion local` and loaded");
     lab.three_nodes(&[]);
-    lab.image(&jailer, "static-site", "examples/nginx:1");
-    lab.image(&jailer, "counter", "examples/redis:1");
+    lab.image(&builder, "static-site", "examples/nginx:1");
+    lab.image(&builder, "counter", "examples/redis:1");
 
     step("static-site: nginx on port 30081 of every node");
     lab.deploy("site", "static-site");

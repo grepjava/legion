@@ -30,13 +30,13 @@ struct Cluster {
     _dir: tempfile::TempDir,
 }
 
-/// A jailer that only writes its arguments down, a line a run, in
-/// `dir/jailer-args`.
-fn stand_in_jailer(dir: &std::path::Path) -> String {
-    let script = dir.join("jailer");
+/// A builder that only writes its arguments down, a line a run, in
+/// `dir/builder-args`.
+fn stand_in_builder(dir: &std::path::Path) -> String {
+    let script = dir.join("legion");
     std::fs::write(
         &script,
-        format!("#!/bin/sh\necho \"$@\" >> {}/jailer-args\n", dir.display()),
+        format!("#!/bin/sh\necho \"$@\" >> {}/builder-args\n", dir.display()),
     )
     .unwrap();
     #[cfg(unix)]
@@ -90,7 +90,7 @@ impl Cluster {
         config.zfs_root = Some("tank/legion".into());
         config.infra_image = INFRA.into();
         config.resync = Duration::from_millis(100);
-        config.builder.jailer = vec![stand_in_jailer(dir.path())];
+        config.builder.command = vec![stand_in_builder(dir.path())];
         config.builder.pkg = vec![stand_in_pkg(dir.path())];
         let control = GrpcControl::new("n1", vec![addr.clone()], None).unwrap();
         let endpoints = legion_agent::Control::endpoints(&control);
@@ -803,7 +803,7 @@ spec:
         .unwrap()
         .into_inner();
 
-    // jailer's build store: on a node named, `jailer prune` there; on every
+    // `legion local`'s build store: on a node named, `legion local prune` there; on every
     // builder, none of which there is.
     cluster
         .node_images(NodeImagesRequest {
@@ -813,7 +813,7 @@ spec:
         })
         .await
         .unwrap();
-    let ran = std::fs::read_to_string(c._dir.path().join("jailer-args")).unwrap();
+    let ran = std::fs::read_to_string(c._dir.path().join("builder-args")).unwrap();
     assert_eq!(ran.trim(), "prune");
     let none = cluster
         .node_images(NodeImagesRequest {

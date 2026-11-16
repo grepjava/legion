@@ -3,9 +3,9 @@
 //! P-256, pushed as a layer of the manifest tagged `sha256-<hex>.sig` in
 //! the image's repository. `cosign verify --key` checks them (with
 //! `--insecure-ignore-tlog`, as no transparency log entry is made), and so
-//! do `jailer verify` and Legion's image policies: the payload, the keys and
+//! do `legion local verify` and Legion's image policies: the payload, the keys and
 //! the check are Legion's `legion_image::cosign`, so both sides make and
-//! read the same bytes. Pushing the signature is jailer's.
+//! read the same bytes. Pushing the signature is the local mode's.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -19,7 +19,7 @@ use crate::oci::{Descriptor, Manifest};
 use crate::registry::{Client, Credentials, sha256};
 use crate::{Error, Reference};
 
-const CONFIG_TYPE: &str = "application/vnd.oci.image.config.v1+json";
+use legion_image::oci::OCI_CONFIG as CONFIG_TYPE;
 
 /// A private key, PKCS#8 (`PRIVATE KEY`) or SEC1 (`EC PRIVATE KEY`) PEM.
 pub fn signing_key(pem: &str) -> Result<PrivateKey, Error> {

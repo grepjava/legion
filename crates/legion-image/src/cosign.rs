@@ -3,7 +3,7 @@
 //! of its manifest or index, signed with ECDSA P-256, kept as a layer of
 //! the manifest tagged `sha256-<hex>.sig` in the image's repository, its
 //! signature (base64 of the DER encoding) in an annotation. One crate makes
-//! and checks them: jailer signs with it and Legion verifies with it.
+//! and checks them: `legion local` signs with it and Legion verifies with it.
 //!
 //! Not covered: cosign v3's bundles (OCI 1.1 referrers), the transparency
 //! log, keyless signing and cosign's encrypted private keys.

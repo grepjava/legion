@@ -1,7 +1,7 @@
 //! The container runtime calls Legion's agent makes, and what they take
 //! and give: `legion_jail::JailRuntime` in production,
 //! `legion_agent::fake::FakeRuntime` in tests. A crate of its own, so that
-//! a runtime (and what uses one, such as jailer) needs no agent.
+//! a runtime (and what uses one, such as `legion local`) needs no agent.
 
 use std::future::Future;
 use std::time::Duration;

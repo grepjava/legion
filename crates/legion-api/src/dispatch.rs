@@ -183,7 +183,7 @@ pub struct NodeTelemetry {
     pub images_bytes: u64,
     #[serde(default)]
     pub jails_bytes: u64,
-    /// jailer's store, outside Legion's ZFS root; 0 without one.
+    /// `legion local`'s store, outside Legion's ZFS root; 0 without one.
     #[serde(default)]
     pub build_bytes: u64,
 }

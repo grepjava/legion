@@ -1,5 +1,5 @@
 //! What a tool on one host calls beyond [`legion_runtime::Runtime`]
-//! (jailer, which builds and tries images): containers found by name,
+//! (`legion local`, which builds and tries images): containers found by name,
 //! a member's process run in the foreground on the caller's terminal, an
 //! exec likewise, and a build's `RUN` steps.
 
@@ -674,7 +674,7 @@ mod tests {
     fn a_step_jail_is_a_member_that_may_change_flags() {
         let root = Path::new("/b/root");
         let step = Step {
-            name: "jailer_build_1",
+            name: "legion_build_1",
             root,
             argv: &[],
             env: &[],

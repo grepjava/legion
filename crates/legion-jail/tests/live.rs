@@ -616,7 +616,7 @@ shm
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// What jailer calls: a container with no pod, run supervised and on the
+/// What `legion local` calls: a container with no pod, run supervised and on the
 /// caller's output, found by name, and a build's steps on a directory.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs root, LEGION_JAIL_ZFS_ROOT and the network"]
@@ -895,7 +895,7 @@ async fn standalone_containers_and_build_steps() {
     }
     images.remove(baked).await.unwrap();
     // Stopped while it runs, from another task with a runtime of its own
-    // (as another `jailer stop` is): its command is sent the stop signal,
+    // (as another `legion local stop` is): its command is sent the stop signal,
     // not this process a SIGTERM, and ends as it chooses; the run then
     // returns, and the caller's cleanup (as `--rm`) leaves nothing.
     let trapped = rt

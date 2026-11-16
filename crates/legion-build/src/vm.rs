@@ -60,7 +60,10 @@ pub async fn build_vm(store: &Store, opts: VmBuildOptions) -> Result<Image, Erro
                 disk_src.display()
             )));
         }
-        std::fs::copy(disk_src, &disk_dest)?;
+        // A link, not a copy: a disk is large, and the layer reads it once.
+        if std::fs::hard_link(disk_src, &disk_dest).is_err() {
+            std::fs::copy(disk_src, &disk_dest)?;
+        }
     } else if let Some(rootfs_dir) = &opts.rootfs {
         if !rootfs_dir.is_dir() {
             return Err(Error::Build(format!(
@@ -109,15 +112,20 @@ pub async fn build_vm(store: &Store, opts: VmBuildOptions) -> Result<Image, Erro
         .await?;
     desc.media_type = opts.compression.media_type().to_owned();
 
-    config.config.labels.insert("legion.vm.image".to_owned(), "true".to_owned());
+    config
+        .config
+        .labels
+        .insert("legion.vm.image".to_owned(), "true".to_owned());
     config.config.labels.extend(opts.labels.clone());
-    let created = opts.timestamp.map(legion_api::clock::format).unwrap_or_default();
+    let created = opts
+        .timestamp
+        .map(legion_api::clock::format)
+        .unwrap_or_default();
     config.created.clone_from(&created);
     config.history.push(History {
         created,
         created_by: "legion build vm".to_owned(),
         empty_layer: false,
-        ..Default::default()
     });
 
     let target_ref = Reference::parse_local_tag(&opts.tag)?;
@@ -171,7 +179,12 @@ mod tests {
         assert!(image.references.iter().any(|r| r == "localhost/myvm:1"));
         assert_eq!(image.layers.len(), 1);
         assert_eq!(
-            image.config.config.labels.get("legion.vm.image").map(String::as_str),
+            image
+                .config
+                .config
+                .labels
+                .get("legion.vm.image")
+                .map(String::as_str),
             Some("true")
         );
         assert_eq!(

@@ -1,6 +1,6 @@
 //! OCI images for Legion's jail runtime (DESIGN.md §6.5): references, a
 //! registry client, and a node's store of images as ZFS layers; and for
-//! building images (jailer), pushing and exporting them, and keeping them
+//! building images (`legion local`), pushing and exporting them, and keeping them
 //! without ZFS.
 
 pub mod attest;

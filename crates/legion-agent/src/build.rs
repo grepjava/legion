@@ -1,10 +1,10 @@
 //! Builds (CONSOLE.md phase 5). A node the operator labels a builder runs
-//! jailer on the host when a manager asks, over a session as a Volume's
-//! export is: it fetches the source, builds and pushes, and sends jailer's
-//! output as it comes, then what it pushed. Its `RUN` steps run in
-//! jailer's build jails; pods never make jails.
+//! `legion local build` on the host when a manager asks, over a session as
+//! a Volume's export is: it fetches the source, builds and pushes, and
+//! sends the builder's output as it comes, then what it pushed. Its `RUN`
+//! steps run in the builder's own jails; pods never make jails.
 //!
-//! The manager's end of the session closing ends the build: jailer is
+//! The manager's end of the session closing ends the build: the builder is
 //! stopped and the build's directory removed.
 
 use std::path::{Path, PathBuf};
@@ -26,9 +26,9 @@ const BUILD_LIMIT: Duration = Duration::from_secs(2 * 3600);
 /// How this node builds.
 #[derive(Debug, Clone)]
 pub struct Builder {
-    /// jailer and the arguments put before each of its commands
-    /// (`--state-dir`, say); `jailer` on the PATH by default.
-    pub jailer: Vec<String>,
+    /// The builder program and the arguments put before each of its
+    /// commands (`local --state-dir ...`, say); `legion local` by default.
+    pub command: Vec<String>,
     /// Where each build's source and files are kept while it runs.
     pub work: PathBuf,
     /// pkg, which audits images' packages, and the arguments put before
@@ -36,20 +36,20 @@ pub struct Builder {
     pub pkg: Vec<String>,
 }
 
-/// jailer with the arguments put before each of its commands, reading
+/// The builder with the arguments put before each of its commands, reading
 /// nothing.
-pub(crate) fn jailer(b: &Builder) -> Command {
-    let (program, before) = b.jailer.split_first().expect("checked");
+pub(crate) fn builder(b: &Builder) -> Command {
+    let (program, before) = b.command.split_first().expect("checked");
     let mut c = Command::new(program);
     c.args(before).stdin(std::process::Stdio::null());
     c
 }
 
 impl Builder {
-    /// The ZFS dataset jailer keeps its images and build cache under, as
-    /// its arguments name it (`--zfs-root`); none when they do not.
+    /// The ZFS dataset the builder keeps its images and build cache under,
+    /// as its arguments name it (`--zfs-root`); none when they do not.
     pub fn zfs_root(&self) -> Option<String> {
-        let mut args = self.jailer.iter().skip(1);
+        let mut args = self.command.iter().skip(1);
         while let Some(a) = args.next() {
             if a == "--zfs-root" {
                 return args.next().cloned();
@@ -63,15 +63,15 @@ impl Builder {
 
     pub fn new(work: impl Into<PathBuf>) -> Builder {
         Builder {
-            jailer: vec!["jailer".to_owned()],
+            command: vec!["legion".to_owned(), "local".to_owned()],
             work: work.into(),
             pkg: vec!["pkg".to_owned()],
         }
     }
 }
 
-/// What the build's record says was pushed (jailer's
-/// docs/RELEASE-RECORD.md, schema 1).
+/// What the build's record says was pushed (docs/RELEASE-RECORD.md,
+/// schema 1).
 #[derive(Deserialize)]
 struct Record {
     #[serde(default)]
@@ -91,9 +91,9 @@ pub(crate) async fn run(
     tx: &mpsc::Sender<SessionFrame>,
     inbound: &mut Streaming<SessionFrame>,
 ) -> Result<(), Status> {
-    if b.jailer.is_empty() {
+    if b.command.is_empty() {
         return Err(Status::failed_precondition(
-            "this node builds nothing: its agent was given no jailer",
+            "this node builds nothing: its agent was given no builder",
         ));
     }
     let short: String = id
@@ -119,27 +119,27 @@ pub(crate) async fn run(
     result
 }
 
-/// The name a build gives its image in jailer's store.
+/// The name a build gives its image in the builder's store.
 fn tag(short: &str) -> String {
     format!("legion-build/{short}:1")
 }
 
-/// The build's image forgotten in jailer's store, pushed or not: the
-/// registry has it, and `jailer rmi` destroys the layers nothing else uses.
-/// The base images stay, for the next build, and jailer bounds its build
+/// The build's image forgotten in the builder's store, pushed or not: the
+/// registry has it, and `legion local rmi` destroys the layers nothing else
+/// uses. The base images stay, for the next build, and the builder bounds its build
 /// cache itself. A build that failed before tagging has nothing to forget.
 async fn forget(b: &Builder, tag: &str, built: bool) {
-    match jailer(b).args(["rmi", tag]).output().await {
+    match builder(b).args(["rmi", tag]).output().await {
         Ok(o) if o.status.success() => {}
         Ok(o) if !built => tracing::debug!(
-            "jailer rmi {tag} after the failed build: {}",
+            "legion local rmi {tag} after the failed build: {}",
             String::from_utf8_lossy(&o.stderr).trim()
         ),
         Ok(o) => tracing::warn!(
-            "jailer rmi {tag}: {}; it stays in jailer's store",
+            "legion local rmi {tag}: {}; it stays in the builder's store",
             String::from_utf8_lossy(&o.stderr).trim()
         ),
-        Err(e) => tracing::warn!("jailer rmi {tag}: {e}"),
+        Err(e) => tracing::warn!("legion local rmi {tag}: {e}"),
     }
 }
 
@@ -198,7 +198,7 @@ async fn build(
     let key_arg = key.display().to_string();
     let record = dir.join("record.json");
     let tag = tag(short);
-    let (program, before) = b.jailer.split_first().expect("checked");
+    let (program, before) = b.command.split_first().expect("checked");
     let mut common: Vec<String> = before.to_vec();
     for p in &opts.plain_http {
         common.extend(["--plain-http".to_owned(), p.clone()]);
@@ -211,7 +211,7 @@ async fn build(
     let record_arg = record.display().to_string();
     let context_arg = context.display().to_string();
     step(
-        "jailer build",
+        "legion local build",
         program,
         &with(&["build", "-t", &tag, "--record", &record_arg, &context_arg]),
         &env,
@@ -224,17 +224,25 @@ async fn build(
         push.extend(["--sign-key", &key_arg]);
     }
     push.extend([tag.as_str(), &opts.image]);
-    step("jailer push", program, &with(&push), &env, tx, inbound).await?;
+    step(
+        "legion local push",
+        program,
+        &with(&push),
+        &env,
+        tx,
+        inbound,
+    )
+    .await?;
     let r: Record = serde_json::from_slice(
         &tokio::fs::read(&record)
             .await
-            .map_err(|e| io("jailer's record", e))?,
+            .map_err(|e| io("the build's record", e))?,
     )
-    .map_err(|e| Status::internal(format!("jailer's record: {e}")))?;
+    .map_err(|e| Status::internal(format!("the build's record: {e}")))?;
     let pushed = r
         .published
         .last()
-        .ok_or_else(|| Status::internal("jailer's record names nothing pushed"))?;
+        .ok_or_else(|| Status::internal("the build's record names nothing pushed"))?;
     if signing {
         // Provenance from the record, and the SBOM of the image built.
         for (kind, more) in [("provenance", None), ("sbom", Some(tag.as_str()))] {
@@ -245,7 +253,7 @@ async fn build(
             }
             args.push(&pushed.pinned);
             step(
-                &format!("jailer attest {kind}"),
+                &format!("legion local attest {kind}"),
                 program,
                 &with(&args),
                 &env,
@@ -362,34 +370,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn jailers_zfs_root_is_read_from_its_arguments() {
+    fn the_builders_zfs_root_is_read_from_its_arguments() {
         let with = |args: &[&str]| Builder {
-            jailer: args.iter().map(|a| (*a).to_owned()).collect(),
+            command: args.iter().map(|a| (*a).to_owned()).collect(),
             work: PathBuf::new(),
             pkg: Vec::new(),
         };
         let root = |b: Builder| b.zfs_root();
-        assert_eq!(root(with(&["jailer"])), None);
+        assert_eq!(root(with(&["legion", "local"])), None);
         assert_eq!(
             root(with(&[
-                "/usr/local/bin/jailer",
+                "/usr/local/bin/legion",
+                "local",
                 "--zfs-root",
-                "zroot/jailer"
+                "zroot/legion-local"
             ])),
-            Some("zroot/jailer".to_owned())
+            Some("zroot/legion-local".to_owned())
         );
         assert_eq!(
-            root(with(&["jailer", "--state-dir", "/x", "--zfs-root=tank/j"])),
+            root(with(&[
+                "legion",
+                "local",
+                "--state-dir",
+                "/x",
+                "--zfs-root=tank/j"
+            ])),
             Some("tank/j".to_owned())
         );
         // The first word is the program, not one of its arguments.
-        assert_eq!(root(with(&["--zfs-root", "jailer"])), None);
+        assert_eq!(root(with(&["--zfs-root", "legion"])), None);
     }
 
-    /// A stand-in jailer writing its arguments down, failing as told.
-    fn jailer(dir: &Path, exit: i32) -> Builder {
+    /// A stand-in builder writing its arguments down, failing as told.
+    fn stand_in(dir: &Path, exit: i32) -> Builder {
         use std::os::unix::fs::PermissionsExt;
-        let script = dir.join("jailer");
+        let script = dir.join("legion");
         std::fs::write(
             &script,
             format!(
@@ -400,10 +415,11 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         Builder {
-            jailer: vec![
+            command: vec![
                 script.display().to_string(),
+                "local".into(),
                 "--state-dir".into(),
-                "/var/db/jailer".into(),
+                "/var/db/legion-local".into(),
             ],
             work: dir.to_owned(),
             pkg: vec!["pkg".to_owned()],
@@ -411,16 +427,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_built_image_is_forgotten_with_the_jailer_arguments_given() {
+    async fn the_built_image_is_forgotten_with_the_builder_arguments_given() {
         let dir = tempfile::tempdir().unwrap();
-        forget(&jailer(dir.path(), 0), &tag("abc123"), true).await;
+        forget(&stand_in(dir.path(), 0), &tag("abc123"), true).await;
         let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
         assert_eq!(
             args.trim(),
-            "--state-dir /var/db/jailer rmi legion-build/abc123:1"
+            "local --state-dir /var/db/legion-local rmi legion-build/abc123:1"
         );
         // Nothing to forget after a failed build: said, and no harm done.
-        forget(&jailer(dir.path(), 1), &tag("def456"), false).await;
+        forget(&stand_in(dir.path(), 1), &tag("def456"), false).await;
         let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
         assert_eq!(args.lines().count(), 2, "{args}");
     }

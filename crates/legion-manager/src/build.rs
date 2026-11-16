@@ -286,7 +286,7 @@ async fn pass(
                             set_status(&api, &key, |s| {
                                 s.digest = digest.clone();
                                 s.pinned = pinned.clone();
-                                // Each of jailer's steps fails the build if
+                                // Each of the builder's steps fails the build if
                                 // it fails: pushed, it is signed and attested.
                                 s.attested = spec.signing_key_secret.is_some();
                                 s.log = kept_log(&log);

@@ -1,4 +1,4 @@
-//! `jailer build`: builds a FreeBSD OCI image from a `Containerfile`, either
+//! `legion build`: builds a FreeBSD OCI image from a `Containerfile`, either
 //! natively in Rust (running `RUN` steps in ephemeral FreeBSD jails and
 //! diffing layers) or via `buildah` when `--backend buildah` is selected,
 //! followed by Legion compatibility verification.
@@ -140,7 +140,7 @@ pub async fn build(
                 c2
             } else {
                 return Err(Error::Build(format!(
-                    "no Containerfile or Dockerfile found in {} (run `jailer init` to scaffold one)",
+                    "no Containerfile or Dockerfile found in {} (run `legion local init` to scaffold one)",
                     opts.context_dir.display()
                 )));
             }
@@ -178,7 +178,7 @@ pub async fn build(
         .tempdir_in(store.dir().join("tmp"))?;
 
     // Docker's automatic platform args, known to `FROM` and to an `ARG`
-    // without a default. jailer builds for this host's platform only.
+    // without a default. Legion builds for this host's platform only.
     let platform = format!("freebsd/{}", oci::arch());
     let predefined: BTreeMap<String, String> = [
         ("BUILDPLATFORM", platform.as_str()),
@@ -331,7 +331,7 @@ pub async fn build(
         for h in &mut final_config.history {
             h.empty_layer = true;
         }
-        record_history(&mut final_config, "jailer build --squash", false);
+        record_history(&mut final_config, "legion build --squash", false);
     }
     if final_layers.is_empty() {
         let tar_out = build_tmp.path().join("scratch.tar");
@@ -752,7 +752,7 @@ fn check_platform(
         let mut parts = p.split('/');
         if parts.next() != Some("freebsd") || parts.next() != Some(oci::arch()) {
             return Err(Error::Build(format!(
-                "line {}: FROM --platform={p}: jailer builds for {platform}, this host's platform",
+                "line {}: FROM --platform={p}: Legion builds for {platform}, this host's platform",
                 stage.line
             )));
         }
@@ -1058,7 +1058,7 @@ async fn execute_instruction(
                     #[cfg(unix)]
                     if unsafe { libc::geteuid() } != 0 {
                         return Err(Error::Build(format!(
-                            "line {}: RUN needs root to create its jail; run `jailer build` with sudo or doas",
+                            "line {}: RUN needs root to create its jail; run `legion build` with sudo or doas",
                             sp.line
                         )));
                     }
@@ -1066,7 +1066,7 @@ async fn execute_instruction(
                     mounts.place_ssh(&stage.root, sp.line)?;
                     let mut id = [0u8; 6];
                     getrandom::fill(&mut id).expect("random bytes");
-                    let name: String = std::iter::once("jailer_build_".to_owned())
+                    let name: String = std::iter::once("legion_build_".to_owned())
                         .chain(id.iter().map(|b| format!("{b:02x}")))
                         .collect();
                     let sys = &**store.sys();

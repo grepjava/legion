@@ -96,7 +96,7 @@ pub struct AgentMetrics<R> {
     pub(crate) sys: Arc<dyn Sys>,
     pub(crate) node: String,
     pub(crate) zfs_root: Option<String>,
-    /// jailer's, where a builder keeps build images and cache.
+    /// The builder's, where a builder keeps build images and cache.
     pub(crate) build_root: Option<String>,
 }
 
@@ -380,14 +380,14 @@ mod tests {
         sys.set_dataset_space("tank/legion/images", 40, 30);
         sys.set_dataset_space("tank/legion/jails", 10, 30);
         sys.set_dataset_space("tank/legion/volumes/shop/data", 20, 5);
-        sys.set_dataset_space("tank/jailer", 15, 30);
-        sys.set_dataset_space("tank/jailer/layers", 15, 30);
+        sys.set_dataset_space("tank/legion-local", 15, 30);
+        sys.set_dataset_space("tank/legion-local/layers", 15, 30);
         let metrics = AgentMetrics {
             runtime: Arc::new(FakeRuntime::new(sys.clone())),
             sys,
             node: "n1".to_owned(),
             zfs_root: Some("tank/legion".to_owned()),
-            build_root: Some("tank/jailer".to_owned()),
+            build_root: Some("tank/legion-local".to_owned()),
         };
         let t = metrics.node_telemetry(&mut None).await;
         assert_eq!((t.zfs_used_bytes, t.zfs_avail_bytes), (70, 30));
@@ -395,7 +395,7 @@ mod tests {
         assert_eq!(t.volumes.len(), 1, "{:?}", t.volumes);
         assert_eq!(t.volumes[0].used_bytes, 20);
 
-        // A node with no jailer store says 0 of it.
+        // A node with no build store says 0 of it.
         let none = AgentMetrics {
             build_root: Some("tank/nothere".to_owned()),
             ..metrics.clone()

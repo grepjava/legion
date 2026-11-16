@@ -1,7 +1,7 @@
 //! A registry login as Docker configs hold it, in `~/.docker/config.json`
 //! and Kubernetes' `dockerconfigjson` Secrets: for each registry an `auth`,
 //! base64 of `user:password`, or `username` and `password`. For the agent's
-//! pull secrets, the manager's resolving of tags and jailer's logins alike.
+//! pull secrets, the manager's resolving of tags and `legion local`'s logins alike.
 
 use std::collections::BTreeMap;
 

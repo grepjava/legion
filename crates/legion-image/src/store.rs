@@ -4,7 +4,7 @@
 //! layer. What images there are, and their configs, is kept in
 //! `<dir>/index.json`.
 //!
-//! For building and publishing images (jailer) a store can also keep its
+//! For building and publishing images (`legion local`) a store can also keep its
 //! layers as plain directories (`<dir>/layers/<chain id>`) where there is no
 //! ZFS, keep the compressed blobs it pulls (`<dir>/blobs/sha256`), take
 //! layers built on the node, push images and export them as archives.

@@ -1,7 +1,7 @@
 //! The image store is Legion's (`legion_image::Store`), opened for a build
 //! host: it keeps the blobs it pulls and builds, so images go out as they
 //! came, and keeps its layers as directories where there is no ZFS. What is
-//! jailer's own is the build cache: `<dir>/cache/<key>` names the layer a
+//! The local mode's own is the build cache: `<dir>/cache/<key>` names the layer a
 //! `RUN` step left, kept (as a GC root) until the cache is trimmed.
 
 use std::collections::{BTreeMap, BTreeSet};

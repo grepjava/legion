@@ -141,17 +141,17 @@ pub(crate) async fn run<R: Runtime>(
             let _ = tx.send(frame(Frame::ExitCode(0))).await;
             Ok(())
         }
-        // jailer's store: layers and blobs no image or build cache entry
-        // uses, as `jailer prune` removes them.
+        // the builder's store: layers and blobs no image or build cache entry
+        // uses, as `legion local prune` removes them.
         "prune-builds" => {
-            let out = crate::build::jailer(builder)
+            let out = crate::build::builder(builder)
                 .arg("prune")
                 .output()
                 .await
-                .map_err(|e| Status::failed_precondition(format!("jailer prune: {e}")))?;
+                .map_err(|e| Status::failed_precondition(format!("legion local prune: {e}")))?;
             if !out.status.success() {
                 return Err(Status::failed_precondition(format!(
-                    "jailer prune: {}",
+                    "legion local prune: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 )));
             }
@@ -401,7 +401,10 @@ mod tests {
     fn the_audits_json_is_found_after_what_the_fetch_said() {
         // pkg 2.8's `pkg audit -F --raw=json-compact`, as on a lab node.
         let json = r#"{"pkg_count":1,"packages":{"pcre2":{"version":"10.45","issue_count":0,"issues":[]}}}"#;
-        assert_eq!(audit_json(&format!("vulnxml file up-to-date\n{json}\n")), json);
+        assert_eq!(
+            audit_json(&format!("vulnxml file up-to-date\n{json}\n")),
+            json
+        );
         assert_eq!(audit_json(&format!("{json}\n")), json);
         assert_eq!(audit_json("vulnxml file up-to-date\n"), "");
     }

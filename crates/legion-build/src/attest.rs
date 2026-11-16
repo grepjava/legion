@@ -3,14 +3,21 @@
 //! layer of the manifest tagged `sha256-<hex>.att` in the image's repository.
 //! `cosign verify-attestation --key` checks them (with
 //! `--insecure-ignore-tlog`, as no transparency log entry is made), and so
-//! does `jailer verify --type`. Provenance is SLSA's, from a release record,
-//! and an SBOM SPDX's, from the image's pkg(8) database.
+//! do `legion local verify --type` and Legion's image policies: reading and
+//! checking them is `legion_image::attest`'s, so both sides make and read the
+//! same bytes. Making and pushing them is the builder's. Provenance is
+//! SLSA's, from a release record, and an SBOM SPDX's, from the image's pkg(8)
+//! database.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use legion_image::attest::{
+    ENVELOPE_TYPE, PAYLOAD_TYPE, PREDICATE_ANNOTATION, STATEMENT_TYPE, attestation_reference,
+    fetch, pae,
+};
 use legion_image::cosign;
 use serde_json::{Value, json};
 
@@ -19,35 +26,14 @@ use crate::registry::{Client, Credentials};
 use crate::sign::{PrivateKey, PublicKey, SIGNATURE_ANNOTATION, add_layer};
 use crate::{Error, Reference};
 
-pub const PROVENANCE: &str = "https://slsa.dev/provenance/v1";
-pub const SBOM: &str = "https://spdx.dev/Document";
+pub use legion_image::attest::{SLSA_PROVENANCE_1 as PROVENANCE, SPDX as SBOM};
 
-const ENVELOPE_TYPE: &str = "application/vnd.dsse.envelope.v1+json";
-const STATEMENT_TYPE: &str = "application/vnd.in-toto+json";
-const STATEMENT: &str = "https://in-toto.io/Statement/v1";
-const PREDICATE_TYPE: &str = "predicateType";
-const BUILD_TYPE: &str = "https://github.com/grepjava/jailer/blob/main/docs/RELEASE-RECORD.md";
-const BUILDER: &str = "https://github.com/grepjava/jailer";
-
-/// DSSE's pre-authentication encoding: what is signed.
-fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
-    let mut out = format!(
-        "DSSEv1 {} {payload_type} {} ",
-        payload_type.len(),
-        payload.len()
-    )
-    .into_bytes();
-    out.extend_from_slice(payload);
-    out
-}
+const BUILD_TYPE: &str = "https://github.com/grepjava/legion/blob/main/docs/RELEASE-RECORD.md";
+const BUILDER: &str = "https://github.com/grepjava/legion";
 
 /// The tag a manifest's attestations are kept under.
 pub fn attestation_ref(r: &Reference, digest: &str) -> Reference {
-    Reference {
-        tag: Some(format!("{}.att", digest.replacen(':', "-", 1))),
-        digest: None,
-        ..r.clone()
-    }
+    attestation_reference(r, digest)
 }
 
 fn hex_of(digest: &str) -> &str {
@@ -57,7 +43,7 @@ fn hex_of(digest: &str) -> &str {
 /// `predicate` about the manifest `digest` of `r`.
 fn statement(r: &Reference, digest: &str, predicate_type: &str, predicate: &Value) -> Value {
     json!({
-        "_type": STATEMENT,
+        "_type": STATEMENT_TYPE,
         "subject": [{
             "name": format!("{}/{}", r.registry, r.repository),
             "digest": {"sha256": hex_of(digest)},
@@ -70,28 +56,12 @@ fn statement(r: &Reference, digest: &str, predicate_type: &str, predicate: &Valu
 /// A signed envelope of `statement`.
 fn envelope(statement: &Value, key: &PrivateKey) -> Result<Vec<u8>, Error> {
     let payload = serde_json::to_vec(statement)?;
-    let signature = cosign::sign(&pae(STATEMENT_TYPE, &payload), key);
+    let signature = cosign::sign(&pae(PAYLOAD_TYPE, &payload), key);
     Ok(serde_json::to_vec(&json!({
-        "payloadType": STATEMENT_TYPE,
+        "payloadType": PAYLOAD_TYPE,
         "payload": B64.encode(&payload),
         "signatures": [{"keyid": "", "sig": signature}],
     }))?)
-}
-
-/// The statement in `envelope`, if `key` signed it.
-fn open(envelope: &[u8], key: &PublicKey) -> Option<Value> {
-    let envelope: Value = serde_json::from_slice(envelope).ok()?;
-    if envelope["payloadType"] != STATEMENT_TYPE {
-        return None;
-    }
-    let payload = B64.decode(envelope["payload"].as_str()?).ok()?;
-    let signed = pae(STATEMENT_TYPE, &payload);
-    envelope["signatures"].as_array()?.iter().find(|s| {
-        s["sig"]
-            .as_str()
-            .is_some_and(|sig| key.verifies(&signed, sig))
-    })?;
-    serde_json::from_slice(&payload).ok()
 }
 
 /// Attests `predicate` about the manifest `digest` in `r`'s repository,
@@ -108,14 +78,14 @@ pub async fn attest(
     let body = envelope(&statement(r, digest, predicate_type, predicate), key)?;
     let annotations = BTreeMap::from([
         (SIGNATURE_ANNOTATION.to_owned(), String::new()),
-        (PREDICATE_TYPE.to_owned(), predicate_type.to_owned()),
+        (PREDICATE_ANNOTATION.to_owned(), predicate_type.to_owned()),
     ]);
     let at = attestation_ref(r, digest);
     add_layer(client, r, &at, ENVELOPE_TYPE, &body, annotations, creds).await
 }
 
 /// The manifest digest of `r`, and the predicate of `predicate_type` about
-/// it that `key` signed.
+/// it that `key` signed: what an image policy requiring it would accept.
 pub async fn verify(
     client: &Client,
     r: &Reference,
@@ -124,39 +94,18 @@ pub async fn verify(
     creds: Option<&Credentials>,
 ) -> Result<(String, Value), Error> {
     let (digest, _) = client.document(r, r.target(), creds).await?;
-    let none = || {
-        Error::NotFound(format!(
-            "{r} ({digest}) has no such attestation by this key"
-        ))
-    };
-    let at = attestation_ref(r, &digest);
-    let layers = match client.document(&at, at.target(), creds).await {
-        Ok((_, doc)) => doc.into_manifest()?.layers,
-        Err(legion_image::Error::NotFound(_)) => return Err(none()),
-        Err(e) => return Err(e.into()),
-    };
-    let tmp = tempfile::tempdir()?;
-    for (i, layer) in layers.iter().enumerate() {
-        if layer.media_type != ENVELOPE_TYPE {
-            continue;
-        }
-        let path = tmp.path().join(i.to_string());
-        client
-            .blob(&at, &layer.digest, layer.size, &path, creds)
-            .await?;
-        let Some(statement) = open(&std::fs::read(&path)?, key) else {
-            continue;
-        };
-        let about = statement["subject"].as_array().is_some_and(|subjects| {
-            subjects
-                .iter()
-                .any(|s| s["digest"]["sha256"] == hex_of(&digest))
-        });
-        if about && statement[PREDICATE_TYPE] == predicate_type {
-            return Ok((digest.clone(), statement["predicate"].clone()));
-        }
-    }
-    Err(none())
+    let found = fetch(client, r, &digest, std::slice::from_ref(key), creds)
+        .await
+        .map_err(|e| Error::Runtime(e.to_string()))?;
+    found
+        .into_iter()
+        .find(|f| f.predicate_type == predicate_type && f.verified.is_some())
+        .map(|f| (digest.clone(), f.predicate))
+        .ok_or_else(|| {
+            Error::NotFound(format!(
+                "{r} ({digest}) has no such attestation by this key"
+            ))
+        })
 }
 
 /// SLSA provenance from `record`: what was built from what, by digest. Build
@@ -185,7 +134,7 @@ pub fn provenance(record: &Record) -> Result<Value, Error> {
             "resolvedDependencies": dependencies,
         },
         "runDetails": {
-            "builder": {"id": BUILDER, "version": {"jailer": env!("CARGO_PKG_VERSION")}},
+            "builder": {"id": BUILDER, "version": {"legion": env!("CARGO_PKG_VERSION")}},
         },
     }))
 }
@@ -289,7 +238,7 @@ pub fn sbom(name: &str, digest: &str, created: &str, packages: Option<&[Package]
         "documentNamespace": format!("{BUILDER}/spdx/{}", hex_of(digest)),
         "creationInfo": {
             "created": created,
-            "creators": [format!("Tool: jailer-{}", env!("CARGO_PKG_VERSION"))],
+            "creators": [format!("Tool: legion-{}", env!("CARGO_PKG_VERSION"))],
             "comment": coverage(packages),
         },
         "packages": listed,
@@ -304,30 +253,28 @@ mod tests {
     use crate::sign::PrivateKey;
 
     #[test]
-    fn the_encoding_is_dsses() {
-        // The example in DSSE's protocol document.
-        assert_eq!(
-            pae("http://example.com/HelloWorld", b"hello world"),
-            b"DSSEv1 29 http://example.com/HelloWorld 11 hello world"
-        );
-    }
-
-    #[test]
-    fn an_envelope_opens_only_for_its_key() {
+    fn an_envelope_is_what_legion_image_checks() {
         let private = PrivateKey::generate();
         let other = PrivateKey::generate().public();
         let r = Reference::parse("ghcr.io/me/app:1").unwrap();
         let said = statement(&r, "sha256:abc", PROVENANCE, &json!({"a": 1}));
         let sealed = envelope(&said, &private).unwrap();
         let key = private.public();
-        assert_eq!(open(&sealed, &key).unwrap(), said);
-        assert_eq!(said["subject"][0]["digest"]["sha256"], "abc");
-        assert!(open(&sealed, &other).is_none());
+        let (i, got) =
+            legion_image::attest::check(&sealed, std::slice::from_ref(&key), "sha256:abc").unwrap();
+        assert_eq!(i, 0);
+        assert_eq!(got.predicate_type, PROVENANCE);
+        assert_eq!(got.predicate, json!({"a": 1}));
+        assert!(legion_image::attest::check(&sealed, &[other], "sha256:abc").is_err());
+        assert!(
+            legion_image::attest::check(&sealed, std::slice::from_ref(&key), "sha256:def").is_err()
+        );
 
         // Changing what is said breaks the signature.
         let mut changed: Value = serde_json::from_slice(&sealed).unwrap();
         changed["payload"] = json!(B64.encode(b"{}"));
-        assert!(open(&serde_json::to_vec(&changed).unwrap(), &key).is_none());
+        let changed = serde_json::to_vec(&changed).unwrap();
+        assert!(legion_image::attest::check(&changed, &[key], "sha256:abc").is_err());
     }
 
     #[test]

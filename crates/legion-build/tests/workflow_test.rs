@@ -1,15 +1,13 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-#[cfg(unix)]
-use std::path::Path;
 use std::sync::Arc;
 
-use jailer::Reference;
-use jailer::build::{BuildBackend, BuildOptions, build};
-use jailer::init::{InitOptions, Template, scaffold};
-use jailer::registry::{Client, Credentials, sha256};
-use jailer::runtime::{Config, JailRuntime};
-use jailer::sys::FakeSys;
+use legion_build::Reference;
+use legion_build::build::{BuildBackend, BuildOptions, build};
+use legion_build::init::{InitOptions, Template, scaffold};
+use legion_build::registry::{Client, Credentials, sha256};
+use legion_build::runtime::{Config, JailRuntime};
+use legion_build::sys::FakeSys;
 
 mod common;
 use common::start_mock_registry;
@@ -20,7 +18,7 @@ async fn end_to_end_init_build_export_push_and_pull() {
     let project_dir = tmp.path().join("demo");
     std::fs::create_dir_all(&project_dir).unwrap();
 
-    // 1. Test `jailer init`
+    // 1. Test `legion local init`
     let init_res = scaffold(&InitOptions {
         dir: project_dir.clone(),
         template: Some(Template::Runtime),
@@ -75,20 +73,20 @@ CMD ["--serve"]
     let sys = Arc::new(FakeSys::new());
     let client = Client::new().unwrap().plain_http(&registry_host);
     let store_dir = tmp.path().join("store1");
-    let store = Arc::new(jailer::store::open(sys.clone(), None, &store_dir, client).unwrap());
+    let store = Arc::new(legion_build::store::open(sys.clone(), None, &store_dir, client).unwrap());
     let runtime = JailRuntime::new(
         sys,
         store.clone(),
         Config {
             state_dir: tmp.path().join("containers1"),
             dataset: None,
-            shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+            shim: vec![OsString::from("legion"), OsString::from("jail-shim")],
             prune_images: false,
         },
     )
     .unwrap();
 
-    // 2. Test `jailer build`
+    // 2. Test `legion local build`
     let built = build(
         &store,
         &runtime,
@@ -129,7 +127,7 @@ CMD ["--serve"]
     );
     assert_eq!(built.image.config.config.cmd, ["--serve"]);
 
-    // 3. Test `jailer export` -> `app.tar` and `Store::load` into a second store
+    // 3. Test `legion local export` -> `app.tar` and `Store::load` into a second store
     let archive_path = tmp.path().join("demo.tar");
     store
         .export("demo:1.0", &archive_path, Some("localhost/demo:1.0"))
@@ -161,13 +159,14 @@ CMD ["--serve"]
 
     let sys2 = Arc::new(FakeSys::new());
     let client2 = Client::new().unwrap().plain_http(&registry_host);
-    let store2 =
-        Arc::new(jailer::store::open(sys2, None, &tmp.path().join("store2"), client2).unwrap());
+    let store2 = Arc::new(
+        legion_build::store::open(sys2, None, &tmp.path().join("store2"), client2).unwrap(),
+    );
     let loaded = store2.load(&archive_path, None).await.unwrap();
     assert_eq!(loaded.id, built.image.id);
     assert_eq!(loaded.references, ["localhost/demo:1.0"]);
 
-    // 4. Test `jailer push` to mock OCI registry and `Store::pull` into a third store
+    // 4. Test `legion local push` to mock OCI registry and `Store::pull` into a third store
     let push_target = Reference::parse(&format!("{registry_host}/me/app:1.0")).unwrap();
     let creds = Credentials {
         username: "me".to_owned(),
@@ -182,9 +181,9 @@ CMD ["--serve"]
     let sys3 = Arc::new(FakeSys::new());
     let client3 = Client::new().unwrap().plain_http(&registry_host);
     let store3 = Arc::new(
-        jailer::store::open(
+        legion_build::store::open(
             sys3,
-            Some("zroot/test-jailer/images"),
+            Some("zroot/test-legion-local/images"),
             &tmp.path().join("store3"),
             client3,
         )
@@ -207,10 +206,18 @@ CMD ["--serve"]
     let blobs = store_dir.join("blobs/sha256");
     let pin = store.pin().unwrap();
     assert!(store.pin_image(&pin, "demo:1.0").await.unwrap().is_some());
-    assert!(jailer::store::remove(&store, "demo:1.0").await.unwrap());
+    assert!(
+        legion_build::store::remove(&store, "demo:1.0")
+            .await
+            .unwrap()
+    );
     assert!(std::fs::read_dir(&blobs).unwrap().next().is_some());
     drop(pin);
-    assert!(!jailer::store::remove(&store, "demo:1.0").await.unwrap());
+    assert!(
+        !legion_build::store::remove(&store, "demo:1.0")
+            .await
+            .unwrap()
+    );
     assert_eq!(std::fs::read_dir(&blobs).unwrap().count(), 0);
 }
 
@@ -236,7 +243,7 @@ async fn manifest_push_publishes_one_image_per_platform() {
         let sys = Arc::new(FakeSys::new());
         let client = Client::new().unwrap().plain_http(&host);
         let store = Arc::new(
-            jailer::store::open(sys.clone(), None, &tmp.path().join(dir), client).unwrap(),
+            legion_build::store::open(sys.clone(), None, &tmp.path().join(dir), client).unwrap(),
         );
         let runtime = JailRuntime::new(
             sys,
@@ -244,7 +251,7 @@ async fn manifest_push_publishes_one_image_per_platform() {
             Config {
                 state_dir: tmp.path().join(format!("{dir}-containers")),
                 dataset: None,
-                shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+                shim: vec![OsString::from("legion"), OsString::from("jail-shim")],
                 prune_images: false,
             },
         )
@@ -286,7 +293,7 @@ async fn manifest_push_publishes_one_image_per_platform() {
     .await
     .unwrap()
     .image;
-    let other_arch = if jailer::oci::arch() == "amd64" {
+    let other_arch = if legion_build::oci::arch() == "amd64" {
         "arm64"
     } else {
         "amd64"
@@ -325,7 +332,7 @@ async fn manifest_push_publishes_one_image_per_platform() {
         .iter()
         .map(|d| d.platform.clone().unwrap().architecture)
         .collect();
-    assert_eq!(archs, [jailer::oci::arch(), other_arch]);
+    assert_eq!(archs, [legion_build::oci::arch(), other_arch]);
 
     // A local image and one already in the repository
     let other_tag = Reference::parse(&format!("{host}/me/app:other")).unwrap();
@@ -403,7 +410,7 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
     let sys = Arc::new(FakeSys::new());
     let client = Client::new().unwrap();
     let store = Arc::new(
-        jailer::store::open(sys.clone(), None, &tmp.path().join("store"), client).unwrap(),
+        legion_build::store::open(sys.clone(), None, &tmp.path().join("store"), client).unwrap(),
     );
     let runtime = JailRuntime::new(
         sys,
@@ -411,7 +418,7 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
         Config {
             state_dir: tmp.path().join("containers"),
             dataset: None,
-            shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+            shim: vec![OsString::from("legion"), OsString::from("jail-shim")],
             prune_images: false,
         },
     )
@@ -441,7 +448,7 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
         cache_from: Vec::new(),
         cache_to: None,
     };
-    let files = |image: &jailer::store::Image| {
+    let files = |image: &legion_build::store::Image| {
         let root = tmp.path().join(format!("root-{}", &image.id[7..19]));
         store.prepare_rootfs(image, &root, None).unwrap();
         let mut out = BTreeMap::new();
@@ -477,7 +484,7 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
     let want: BTreeMap<String, String> = [
         (
             "etc/greeting.txt",
-            format!("hello world on {}\n", jailer::oci::arch()),
+            format!("hello world on {}\n", legion_build::oci::arch()),
         ),
         ("etc/raw.txt", "$NAME\n".to_owned()),
         ("parents/src/a/Cargo.toml", "src/a/Cargo.toml".to_owned()),
@@ -636,7 +643,7 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
         &store,
         &runtime,
         &BuildOptions {
-            compression: jailer::layer::Compression::Zstd,
+            compression: legion_build::layer::Compression::Zstd,
             ..opts("zstd:1")
         },
     )
@@ -776,7 +783,7 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
     for (cf, msg) in [
         (
             "FROM --platform=linux/riscv64 scratch\n",
-            "jailer builds for freebsd/",
+            "Legion builds for freebsd/",
         ),
         (
             &format!(
@@ -802,13 +809,13 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
 
 #[tokio::test]
 async fn cache_trim_drops_least_recently_used_layers() {
-    use jailer::store::{CachedLayer, CachedStep};
+    use legion_build::store::{CachedLayer, CachedStep};
     let tmp = tempfile::tempdir().unwrap();
     let ctx = tmp.path().join("ctx");
     std::fs::create_dir_all(&ctx).unwrap();
     let sys = Arc::new(FakeSys::new());
     let store = Arc::new(
-        jailer::store::open(
+        legion_build::store::open(
             sys.clone(),
             None,
             &tmp.path().join("store"),
@@ -822,7 +829,7 @@ async fn cache_trim_drops_least_recently_used_layers() {
         Config {
             state_dir: tmp.path().join("containers"),
             dataset: None,
-            shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+            shim: vec![OsString::from("legion"), OsString::from("jail-shim")],
             prune_images: false,
         },
     )
@@ -866,7 +873,7 @@ async fn cache_trim_drops_least_recently_used_layers() {
         .await
         .unwrap()
         .image;
-        jailer::store::record_step(
+        legion_build::store::record_step(
             &store,
             name,
             &CachedStep {
@@ -879,7 +886,7 @@ async fn cache_trim_drops_least_recently_used_layers() {
         )
         .unwrap();
         assert!(
-            jailer::store::remove(&store, &format!("{name}:1"))
+            legion_build::store::remove(&store, &format!("{name}:1"))
                 .await
                 .unwrap()
         );
@@ -895,27 +902,34 @@ async fn cache_trim_drops_least_recently_used_layers() {
     assert!(layer(0).exists() && layer(1).exists());
 
     assert_eq!(
-        jailer::store::trim_cache(&store, u64::MAX).await.unwrap(),
+        legion_build::store::trim_cache(&store, u64::MAX)
+            .await
+            .unwrap(),
         0
     );
     let b_size = built[1].layer_descriptors[0].size;
-    assert_eq!(jailer::store::trim_cache(&store, b_size).await.unwrap(), 1);
+    assert_eq!(
+        legion_build::store::trim_cache(&store, b_size)
+            .await
+            .unwrap(),
+        1
+    );
     assert!(!layer(0).exists() && layer(1).exists());
-    assert_eq!(jailer::store::trim_cache(&store, 0).await.unwrap(), 1);
+    assert_eq!(legion_build::store::trim_cache(&store, 0).await.unwrap(), 1);
     assert!(!layer(1).exists());
 }
 
 #[tokio::test]
 async fn registry_cache_carries_steps_to_another_store() {
-    use jailer::cache::{Imported, Remote, export};
-    use jailer::store::{CachedLayer, CachedStep, cached_step};
+    use legion_build::cache::{Imported, Remote, export};
+    use legion_build::store::{CachedLayer, CachedStep, cached_step};
     let tmp = tempfile::tempdir().unwrap();
     let (addr, _) = start_mock_registry().await;
     let host = format!("127.0.0.1:{}", addr.port());
     let open = |dir: &str| {
         let sys = Arc::new(FakeSys::new());
         let store = Arc::new(
-            jailer::store::open(
+            legion_build::store::open(
                 sys.clone(),
                 None,
                 &tmp.path().join(dir),
@@ -929,7 +943,7 @@ async fn registry_cache_carries_steps_to_another_store() {
             Config {
                 state_dir: tmp.path().join(dir).join("containers"),
                 dataset: None,
-                shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+                shim: vec![OsString::from("legion"), OsString::from("jail-shim")],
                 prune_images: false,
             },
         )
@@ -1042,13 +1056,13 @@ async fn registry_cache_carries_steps_to_another_store() {
 
 #[tokio::test]
 async fn pushed_images_are_signed_and_verified() {
-    use jailer::sign::{PrivateKey, sign, signature_reference, verify};
+    use legion_build::sign::{PrivateKey, sign, signature_reference, verify};
     let tmp = tempfile::tempdir().unwrap();
     let (addr, registry) = start_mock_registry().await;
     let host = format!("127.0.0.1:{}", addr.port());
     let sys = Arc::new(FakeSys::new());
     let store = Arc::new(
-        jailer::store::open(
+        legion_build::store::open(
             sys.clone(),
             None,
             &tmp.path().join("store"),
@@ -1062,7 +1076,7 @@ async fn pushed_images_are_signed_and_verified() {
         Config {
             state_dir: tmp.path().join("containers"),
             dataset: None,
-            shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+            shim: vec![OsString::from("legion"), OsString::from("jail-shim")],
             prune_images: false,
         },
     )
@@ -1109,7 +1123,8 @@ async fn pushed_images_are_signed_and_verified() {
     let private = PrivateKey::generate();
     let other_private = PrivateKey::generate();
     let (key, other) = (private.public(), other_private.public());
-    let signed_by = |k: &jailer::sign::PublicKey| (digest.clone(), k.fingerprint().to_owned());
+    let signed_by =
+        |k: &legion_build::sign::PublicKey| (digest.clone(), k.fingerprint().to_owned());
     let err = verify(client, &target, &key, None).await.unwrap_err();
     assert!(err.to_string().contains("not signed"), "{err}");
     sign(client, &target, &digest, &private, None)
@@ -1201,7 +1216,7 @@ async fn copy_follows_links_only_inside_the_root() {
 
     let sys = Arc::new(FakeSys::new());
     let store = Arc::new(
-        jailer::store::open(
+        legion_build::store::open(
             sys.clone(),
             None,
             &tmp.path().join("store"),
@@ -1215,7 +1230,7 @@ async fn copy_follows_links_only_inside_the_root() {
         Config {
             state_dir: tmp.path().join("containers"),
             dataset: None,
-            shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+            shim: vec![OsString::from("legion"), OsString::from("jail-shim")],
             prune_images: false,
         },
     )
@@ -1348,7 +1363,7 @@ async fn copy_follows_links_only_inside_the_root() {
         .image;
     let root = tmp.path().join("accounts");
     store.prepare_rootfs(&image, &root, None).unwrap();
-    let report = jailer::check::check_image(&image.config, Some(&root));
+    let report = legion_build::check::check_image(&image.config, Some(&root));
     assert!(
         !report.findings.iter().any(|f| f.code == "LEGION008"),
         "the image's USER is in its linked /etc/passwd: {:?}",
@@ -1366,7 +1381,7 @@ async fn config_instructions_follow_docker() {
     std::fs::create_dir_all(&ctx).unwrap();
     let sys = Arc::new(FakeSys::new());
     let store = Arc::new(
-        jailer::store::open(
+        legion_build::store::open(
             sys.clone(),
             None,
             &tmp.path().join("store"),
@@ -1380,7 +1395,7 @@ async fn config_instructions_follow_docker() {
         Config {
             state_dir: tmp.path().join("containers"),
             dataset: None,
-            shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+            shim: vec![OsString::from("legion"), OsString::from("jail-shim")],
             prune_images: false,
         },
     )
@@ -1529,71 +1544,6 @@ async fn config_instructions_follow_docker() {
     );
 }
 
-/// `jailer check` checks an image's files: one whose files cannot be put
-/// together fails, not passes on its config alone.
-#[cfg(unix)]
-#[test]
-fn check_fails_on_an_image_whose_files_cannot_be_prepared() {
-    let bin = env!("CARGO_BIN_EXE_jailer");
-    let tmp = tempfile::tempdir().unwrap();
-    let state = tmp.path().join("state");
-    let ctx = tmp.path().join("ctx");
-    std::fs::create_dir_all(&ctx).unwrap();
-    std::fs::write(ctx.join("f"), "f\n").unwrap();
-    std::fs::write(
-        ctx.join("Containerfile"),
-        "FROM scratch\nCOPY f /f\nCMD [\"/missing\"]\n",
-    )
-    .unwrap();
-    let jailer = |args: &[&str]| {
-        std::process::Command::new(bin)
-            .args(["--state-dir", state.to_str().unwrap(), "--no-zfs"])
-            .args(args)
-            .output()
-            .unwrap()
-    };
-    let built = jailer(&["build", "-t", "localhost/chk:1", ctx.to_str().unwrap()]);
-    assert!(
-        built.status.success(),
-        "{}",
-        String::from_utf8_lossy(&built.stderr)
-    );
-    let check = || jailer(&["check", "localhost/chk:1"]);
-    let first = check();
-    assert!(!first.status.success());
-    assert!(
-        String::from_utf8_lossy(&first.stderr).contains("LEGION009"),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
-    );
-
-    // Its layers gone, the store cannot put its files together.
-    let mut stack = vec![state.clone()];
-    while let Some(d) = stack.pop() {
-        for e in std::fs::read_dir(&d).unwrap() {
-            let p = e.unwrap().path();
-            if p.file_name().is_some_and(|n| n == "layers") {
-                for l in std::fs::read_dir(&p).unwrap() {
-                    jailer::layer::remove_tree(&l.unwrap().path()).unwrap();
-                }
-            } else if p.is_dir() && !p.is_symlink() {
-                stack.push(p);
-            }
-        }
-    }
-    let second = check();
-    assert!(
-        !second.status.success(),
-        "passed without its files:\n{}",
-        String::from_utf8_lossy(&second.stdout)
-    );
-    assert!(
-        String::from_utf8_lossy(&second.stderr).contains("preparing the files"),
-        "{}",
-        String::from_utf8_lossy(&second.stderr)
-    );
-}
-
 #[tokio::test]
 async fn a_build_takes_only_the_stages_its_target_needs() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1609,7 +1559,7 @@ async fn a_build_takes_only_the_stages_its_target_needs() {
     .unwrap();
     let sys = Arc::new(FakeSys::new());
     let store = Arc::new(
-        jailer::store::open(
+        legion_build::store::open(
             sys.clone(),
             None,
             &tmp.path().join("store"),
@@ -1623,7 +1573,7 @@ async fn a_build_takes_only_the_stages_its_target_needs() {
         Config {
             state_dir: tmp.path().join("containers"),
             dataset: None,
-            shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+            shim: vec![OsString::from("legion"), OsString::from("jail-shim")],
             prune_images: false,
         },
     )
@@ -1674,414 +1624,6 @@ async fn a_build_takes_only_the_stages_its_target_needs() {
     assert!(err.contains("\"typo\" not found"), "{err}");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_release_record_follows_one_image_and_refuses_another() {
-    use std::process::Command;
-    let tmp = tempfile::tempdir().unwrap();
-    let (addr, _registry) = start_mock_registry().await;
-    let host = format!("127.0.0.1:{}", addr.port());
-    let ctx = tmp.path().join("ctx");
-    std::fs::create_dir_all(&ctx).unwrap();
-    std::fs::write(ctx.join("f"), "one\n").unwrap();
-    std::fs::write(
-        ctx.join("Containerfile"),
-        "FROM scratch\nARG TOKEN\nCOPY f /f\n",
-    )
-    .unwrap();
-    let record = tmp.path().join("release.json");
-    let rec = record.to_str().unwrap().to_owned();
-    let jailer = |args: &[&str]| {
-        let host = host.clone();
-        let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
-        let state = tmp.path().join("state");
-        async move {
-            tokio::task::spawn_blocking(move || {
-                Command::new(env!("CARGO_BIN_EXE_jailer"))
-                    .args(["--no-zfs", "--plain-http", &host, "--state-dir"])
-                    .arg(state)
-                    .args(args)
-                    .output()
-                    .unwrap()
-            })
-            .await
-            .unwrap()
-        }
-    };
-    let ok = |out: std::process::Output| {
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        out
-    };
-    let read = || -> serde_json::Value {
-        serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap()
-    };
-    let prefix = tmp.path().join("key");
-    ok(jailer(&["key", "generate", prefix.to_str().unwrap()]).await);
-    let (private, public) = (
-        prefix.with_extension("key").to_str().unwrap().to_owned(),
-        prefix.with_extension("pub").to_str().unwrap().to_owned(),
-    );
-    let context = ctx.to_str().unwrap().to_owned();
-    let target = format!("{host}/app:1");
-
-    ok(jailer(&[
-        "build",
-        "-t",
-        "app:1",
-        "--record",
-        &rec,
-        "--build-arg",
-        "TOKEN=hunter2",
-        &context,
-    ])
-    .await);
-    assert!(
-        !std::fs::read_to_string(&record)
-            .unwrap()
-            .contains("hunter2"),
-        "a build argument's value stays out of the record"
-    );
-    ok(jailer(&[
-        "push",
-        "--record",
-        &rec,
-        "--sign-key",
-        &private,
-        "app:1",
-        &target,
-    ])
-    .await);
-    ok(jailer(&["verify", "--record", &rec, "--key", &public, &target]).await);
-    let archive = tmp.path().join("app.tar");
-    let archive = archive.to_str().unwrap();
-    ok(jailer(&["export", "--record", &rec, "app:1", archive]).await);
-    let index = format!("{host}/app:index");
-    ok(jailer(&["manifest", "push", "--record", &rec, &index, "app:1"]).await);
-
-    let r = read();
-    let manifest = r["image"]["manifest"].as_str().unwrap().to_owned();
-    assert_ne!(manifest, r["image"]["config"].as_str().unwrap());
-    assert!(
-        r["source"]["context"]
-            .as_str()
-            .unwrap()
-            .starts_with("sha256:")
-    );
-    let published = &r["published"][0];
-    assert_eq!(published["digest"], manifest.as_str());
-    assert_eq!(published["pinned"], format!("{host}/app@{manifest}"));
-    assert!(published["signature"].as_str().unwrap().contains(".sig"));
-    assert_eq!(r["verified"][0]["digest"], manifest.as_str());
-    assert_eq!(r["archives"][0]["manifest"], manifest.as_str());
-    // The index has a digest of its own, and maps its platform to the image.
-    let by_index = &r["published"][1];
-    assert_ne!(by_index["digest"], manifest.as_str());
-    let platforms = by_index["platforms"].as_object().unwrap();
-    assert_eq!(platforms.len(), 1);
-    assert_eq!(platforms.values().next().unwrap(), manifest.as_str());
-
-    // The archive names the same manifest.
-    let mut tar = tar::Archive::new(std::fs::File::open(archive).unwrap());
-    let mut in_archive = None;
-    for entry in tar.entries().unwrap() {
-        let entry = entry.unwrap();
-        if entry.path().unwrap().to_str() == Some("index.json") {
-            let index: serde_json::Value = serde_json::from_reader(entry).unwrap();
-            in_archive = index["manifests"][0]["digest"].as_str().map(str::to_owned);
-        }
-    }
-    assert_eq!(in_archive.as_deref(), Some(manifest.as_str()));
-
-    // The tag moves to another image, signed by the same key.
-    std::fs::write(ctx.join("f"), "two\n").unwrap();
-    ok(jailer(&["build", "-t", "app:2", &context]).await);
-    let before = std::fs::read(&record).unwrap();
-    let refused = jailer(&["push", "--record", &rec, "app:2", &target]).await;
-    assert!(!refused.status.success(), "another image, into this record");
-    assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("the record is of image"),
-        "{}",
-        String::from_utf8_lossy(&refused.stderr)
-    );
-    // Refused before anything was sent: the tag is where it was.
-    ok(jailer(&["verify", "--record", &rec, "--key", &public, &target]).await);
-    ok(jailer(&["push", "--sign-key", &private, "app:2", &target]).await);
-    let moved = jailer(&["verify", "--record", &rec, "--key", &public, &target]).await;
-    assert!(!moved.status.success(), "a moved tag is not the record's");
-    assert!(
-        String::from_utf8_lossy(&moved.stderr).contains("has moved"),
-        "{}",
-        String::from_utf8_lossy(&moved.stderr)
-    );
-    assert_eq!(std::fs::read(&record).unwrap(), before);
-
-    // What was recorded can still be had, whatever the tag says now.
-    let pinned = r["published"][0]["pinned"].as_str().unwrap();
-    ok(jailer(&["verify", "--record", &rec, "--key", &public, pinned]).await);
-    let pulled = ok(jailer(&["pull", pinned]).await);
-    let config = r["image"]["config"].as_str().unwrap();
-    assert!(
-        String::from_utf8_lossy(&pulled.stdout).contains(config),
-        "{}",
-        String::from_utf8_lossy(&pulled.stdout)
-    );
-
-    // Provenance and an SBOM, signed, about the recorded image alone.
-    ok(jailer(&[
-        "attest",
-        "--key",
-        &private,
-        "--type",
-        "provenance",
-        "--record",
-        &rec,
-        pinned,
-    ])
-    .await);
-    ok(jailer(&[
-        "attest", "--key", &private, "--type", "sbom", "--image", "app:1", "--record", &rec, pinned,
-    ])
-    .await);
-    let shown = ok(jailer(&[
-        "verify",
-        "--key",
-        &public,
-        "--type",
-        "provenance",
-        "--record",
-        &rec,
-        pinned,
-    ])
-    .await);
-    let provenance: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
-    assert_eq!(
-        provenance["buildDefinition"]["externalParameters"]["context"],
-        r["source"]["context"]
-    );
-    let shown = ok(jailer(&["verify", "--key", &public, "--type", "sbom", pinned]).await);
-    let sbom: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
-    assert_eq!(sbom["spdxVersion"], "SPDX-2.3");
-    let comment = sbom["creationInfo"]["comment"].as_str().unwrap();
-    assert!(comment.contains("NOT AN INVENTORY"), "{comment}");
-    assert_eq!(read()["attestations"].as_array().unwrap().len(), 2);
-    // The tag is another image's by now: nothing here is about it.
-    let none = jailer(&["verify", "--key", &public, "--type", "provenance", &target]).await;
-    assert!(!none.status.success());
-    let other = jailer(&[
-        "attest",
-        "--key",
-        &private,
-        "--type",
-        "provenance",
-        "--record",
-        &rec,
-        &target,
-    ])
-    .await;
-    assert!(!other.status.success(), "the record is not of this image");
-
-    // A build names the images it took anything from, as they resolved.
-    std::fs::write(
-        ctx.join("Containerfile"),
-        "FROM app:1 AS base\nFROM scratch\nCOPY --from=base /f /g\nCOPY --from=app:2 /f /h\n",
-    )
-    .unwrap();
-    let derived = tmp.path().join("derived.json");
-    let derived_path = derived.to_str().unwrap();
-    ok(jailer(&[
-        "build",
-        "-t",
-        "derived:1",
-        "--record",
-        derived_path,
-        &context,
-    ])
-    .await);
-    let d: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&derived).unwrap()).unwrap();
-    let bases = d["bases"].as_array().unwrap();
-    assert_eq!(bases.len(), 2, "{bases:?}");
-    assert!(bases.iter().any(|b| b["manifest"] == manifest.as_str()));
-    assert!(
-        bases
-            .iter()
-            .all(|b| b["config"].as_str().unwrap().starts_with("sha256:"))
-    );
-}
-
-#[test]
-fn check_can_answer_in_json() {
-    use std::process::Command;
-    let tmp = tempfile::tempdir().unwrap();
-    let cf = tmp.path().join("Containerfile");
-    std::fs::write(
-        &cf,
-        "FROM scratch\nHEALTHCHECK CMD /bin/true\nSTOPSIGNAL NOPE\n",
-    )
-    .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_jailer"))
-        .args(["--no-zfs", "--state-dir"])
-        .arg(tmp.path().join("state"))
-        .args(["check", "--json"])
-        .arg(&cf)
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(result["passed"], false);
-    let codes: Vec<(&str, &str)> = result["findings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|f| (f["code"].as_str().unwrap(), f["severity"].as_str().unwrap()))
-        .collect();
-    assert!(codes.contains(&("LEGION001", "warning")), "{codes:?}");
-    assert!(codes.contains(&("LEGION003", "error")), "{codes:?}");
-}
-
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn publish_pushes_the_index_only_when_every_host_succeeds() {
-    use std::os::unix::fs::PermissionsExt;
-    use std::process::Command;
-    let tmp = tempfile::tempdir().unwrap();
-    let (addr, registry) = start_mock_registry().await;
-    let host = format!("127.0.0.1:{}", addr.port());
-    let ctx = tmp.path().join("ctx");
-    std::fs::create_dir_all(&ctx).unwrap();
-    std::fs::write(ctx.join("f"), "one\n").unwrap();
-    std::fs::write(ctx.join("x.log"), "left out\n").unwrap();
-    std::fs::write(ctx.join(".containerignore"), "*.log\n").unwrap();
-    std::fs::write(
-        ctx.join("Containerfile"),
-        "FROM scratch\nARG V\nLABEL v=$V\nCOPY f /f\n",
-    )
-    .unwrap();
-
-    // Stands for ssh: the destination names a state directory here, and one
-    // called `broken` fails. Each runs jailer with no ssh and no second host.
-    let bin = Path::new(env!("CARGO_BIN_EXE_jailer"));
-    let ssh = tmp.path().join("ssh");
-    std::fs::write(
-        &ssh,
-        format!(
-            "#!/bin/sh\nshift 2\ndest=$1\nshift\n\
-             [ \"$dest\" != broken ] || {{ echo refused >&2; exit 7; }}\n\
-             mkdir -p {bindir}\nln -sf {bin} {bindir}/jailer\n\
-             PATH={bindir}:$PATH JAILER_STATE_DIR={state}/$dest exec sh -c \"$*\"\n",
-            bindir = tmp.path().join("bin").display(),
-            bin = bin.display(),
-            state = tmp.path().display(),
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let wrapper = tmp.path().join("remote-jailer");
-    std::fs::write(
-        &wrapper,
-        format!("#!/bin/sh\nexec jailer --no-zfs --plain-http {host} \"$@\"\n"),
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-    let platform = format!("freebsd/{}", jailer::oci::arch());
-    let target = format!("{host}/app:1");
-    let record = tmp.path().join("release.json");
-    let publish = |hosts: Vec<String>| {
-        let mut c = Command::new(bin);
-        c.args(["--no-zfs", "--plain-http", &host, "--state-dir"])
-            .arg(tmp.path().join("local"))
-            .arg("publish")
-            .arg("--ssh")
-            .arg(&ssh)
-            .arg("--remote-jailer")
-            .arg(&wrapper)
-            .arg("--record")
-            .arg(&record)
-            .args(["--build-arg", "V=a b"]);
-        for h in hosts {
-            c.args(["--host", &h]);
-        }
-        c.arg(&target).arg(&ctx);
-        tokio::task::spawn_blocking(move || c.output().unwrap())
-    };
-    let tagged = |tag: &str| registry.manifests.lock().unwrap().contains_key(tag);
-
-    // A host fails, the other does not: the target's tag is not touched.
-    let out = publish(vec![
-        format!("{platform}=one"),
-        "freebsd/riscv64=broken".to_owned(),
-    ])
-    .await
-    .unwrap();
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("nothing published"), "{err}");
-    assert!(err.contains("freebsd/riscv64"), "{err}");
-    assert!(!tagged("1"), "a partial release under the final tag");
-    assert!(!record.exists());
-
-    // A host of another platform than it was named for.
-    let out = publish(vec!["freebsd/riscv64=one".to_owned()])
-        .await
-        .unwrap();
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("the host built"), "{err}");
-    assert!(!tagged("1"));
-
-    // All well: the index is there, and the record says what is in it.
-    let out = publish(vec![format!("{platform}=one")]).await.unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(tagged("1"));
-    let r: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
-    let manifest = r["builds"][&platform]["image"]["manifest"]
-        .as_str()
-        .unwrap();
-    let published = &r["published"][0];
-    assert_eq!(published["platforms"][&platform], manifest);
-    assert_ne!(published["digest"], manifest);
-    assert!(
-        r["source"]["context"]
-            .as_str()
-            .unwrap()
-            .starts_with("sha256:")
-    );
-    assert!(!std::fs::read_to_string(&record).unwrap().contains("a b"));
-}
-
-#[test]
-fn the_version_names_the_legion_crates_it_was_built_with() {
-    let lock = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.lock")).unwrap();
-    let at = lock.find("name = \"legion-image\"").unwrap();
-    let source = lock[at..]
-        .lines()
-        .find_map(|l| l.strip_prefix("source = \"git+"))
-        .unwrap();
-    let (url, commit) = source.trim_end_matches('"').rsplit_once('#').unwrap();
-    let pin = match url.split_once("?tag=") {
-        Some((_, tag)) => format!("{tag} {}", &commit[..7]),
-        None => commit[..7].to_owned(),
-    };
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_jailer"))
-        .arg("--version")
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    assert_eq!(
-        String::from_utf8(out.stdout).unwrap().trim(),
-        format!("jailer {} (legion {pin})", env!("CARGO_PKG_VERSION"))
-    );
-}
-
 #[tokio::test]
 async fn prune_images_removes_what_no_container_uses() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2089,7 +1631,7 @@ async fn prune_images_removes_what_no_container_uses() {
     std::fs::create_dir_all(&ctx).unwrap();
     let sys = Arc::new(FakeSys::new());
     let store = Arc::new(
-        jailer::store::open(
+        legion_build::store::open(
             sys.clone(),
             None,
             &tmp.path().join("store"),
@@ -2103,7 +1645,7 @@ async fn prune_images_removes_what_no_container_uses() {
         Config {
             state_dir: tmp.path().join("containers"),
             dataset: None,
-            shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+            shim: vec![OsString::from("legion"), OsString::from("jail-shim")],
             prune_images: false,
         },
     )
@@ -2154,7 +1696,7 @@ async fn prune_images_removes_what_no_container_uses() {
         "localhost/gone:1".to_owned(),
         String::new(),
     ];
-    let mut removed = jailer::store::remove_unused_images(&store, &in_use)
+    let mut removed = legion_build::store::remove_unused_images(&store, &in_use)
         .await
         .unwrap();
     removed.sort();
@@ -2165,7 +1707,7 @@ async fn prune_images_removes_what_no_container_uses() {
 
     // Named as written, too; and again, nothing more goes.
     assert!(
-        jailer::store::remove_unused_images(&store, &["a:1".to_owned()])
+        legion_build::store::remove_unused_images(&store, &["a:1".to_owned()])
             .await
             .unwrap()
             .is_empty()

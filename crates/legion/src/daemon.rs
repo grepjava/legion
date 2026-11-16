@@ -45,8 +45,9 @@ pub struct Options {
     pub iscsi_targets: Option<PathBuf>,
     pub iscsi_portal_group: String,
     pub iscsi_portal: Option<String>,
-    /// jailer and the arguments before each of its commands, for Builds.
-    pub jailer: Vec<String>,
+    /// The builder program and the arguments before each of its commands,
+    /// for Builds (`legion local`).
+    pub builder: Vec<String>,
     /// Registries (`host[:port]`) reached over plain HTTP: by the managers
     /// resolving tags, and by the node pulling.
     pub insecure_registries: Vec<String>,
@@ -543,7 +544,7 @@ async fn start_agent(
     config.ingress = opts.ingress_listen;
     config.ingress_tls = opts.ingress_tls_listen;
     config.load_balancer_interface = opts.load_balancer_interface.clone();
-    config.builder.jailer = opts.jailer.clone();
+    config.builder.command = opts.builder.clone();
     // Its own process, which pods' lookups need through a restart.
     config.resolver = Some(legion_agent::ExternalResolver {
         command: vec![

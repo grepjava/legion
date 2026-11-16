@@ -120,7 +120,7 @@ impl Security {
     /// this profile: the runtime sets them when it creates the jail (from
     /// the `legion.jail` annotation), and the agent checks them once the
     /// container runs. mlock and SysV IPC are off unless their annotations
-    /// ask for them. jailer gives `Security::default()`'s to the images it
+    /// ask for them. `legion local` gives `Security::default()`'s to the images it
     /// tries, so they run as locked down as on a node.
     pub fn jail_params(&self) -> [(&'static str, String); 4] {
         let allow = |a| self.allow.contains(&a).to_string();

@@ -1,4 +1,4 @@
-//! For privileged tests run through `scripts/qualify`, Legion's and jailer's.
+//! For privileged tests run through `scripts/qualify`, Legion's, the local mode's included.
 
 /// Whether a test lacking what it needs must fail instead of skipping.
 const REQUIRE: &str = "QUALIFY_REQUIRE_LIVE";

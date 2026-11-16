@@ -74,7 +74,7 @@ struct Held {
     uploads: u64,
 }
 
-/// The test's registry, run by [`a_jailer_push_is_what_legion_runs`]:
+/// The test's registry, run by [`a_local_push_is_what_legion_runs`]:
 /// plain HTTP on `LEGION_HANDOFF_REGISTRY_HOST`, without authentication,
 /// taking monolithic uploads into memory. It writes the address it took to
 /// the file `LEGION_HANDOFF_REGISTRY`, and is down as that file's name with

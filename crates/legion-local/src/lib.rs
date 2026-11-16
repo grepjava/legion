@@ -3,6 +3,7 @@
 
 pub mod auth;
 pub mod doctor;
+pub mod migrate;
 pub mod net;
 pub mod runtime;
 pub mod store;

@@ -199,7 +199,7 @@ impl PodNetwork {
 
     /// The same network on a bridge of another name, its pods' host
     /// interfaces named `prefix` and the end of their ids: for a tool
-    /// beside Legion on the host (jailer's `jailer0`). `None` for a name
+    /// beside Legion on the host (`legion local`'s `legionlocal0`). `None` for a name
     /// FreeBSD would not take, or a prefix leaving fewer than eight
     /// characters of an id.
     pub fn named(self, bridge: &str, prefix: &str) -> Option<Self> {
@@ -566,20 +566,20 @@ mod tests {
     fn a_network_of_other_names() {
         let sys = FakeSys::new();
         let net = PodNetwork::new("10.88.0.0/16".parse().unwrap())
-            .named("jailer0", "jp")
+            .named("legionlocal0", "ll")
             .unwrap();
         net.ensure_bridge(&sys).unwrap();
         assert!(sys.interface(BRIDGE).is_none(), "not Legion's");
-        let bridge = sys.interface("jailer0").unwrap();
+        let bridge = sys.interface("legionlocal0").unwrap();
         assert_eq!(bridge.config.addr.unwrap().to_string(), "10.88.0.1/16");
         sys.add_jail("j1", true);
         let id = "0123456789abcdef0123";
         net.attach(&sys, id, "j1", ip("10.88.0.2")).unwrap();
         let host = net.host_interface(id);
         // The end of its id, as Legion's pods' are named.
-        assert_eq!(host, "jp89abcdef0123");
+        assert_eq!(host, "ll89abcdef0123");
         assert_eq!(
-            sys.interface("jailer0").unwrap().members,
+            sys.interface("legionlocal0").unwrap().members,
             std::slice::from_ref(&host)
         );
         net.detach(&sys, id).unwrap();
@@ -593,29 +593,29 @@ mod tests {
         assert_eq!(legion.host_interface(id), host_interface(id));
         // Names FreeBSD would not take.
         let named = |b: &str, p: &str| legion.clone().named(b, p).is_some();
-        assert!(!named("", "jp"));
-        assert!(!named("a-very-long-bridge", "jp"));
-        assert!(!named("jailer0", "prefix_too_long"));
-        assert!(!named("jailer 0", "jp"));
-        assert!(!named("0bridge", "jp"));
+        assert!(!named("", "ll"));
+        assert!(!named("a-very-long-bridge", "ll"));
+        assert!(!named("legionlocal0", "prefix_too_long"));
+        assert!(!named("legion local0", "ll"));
+        assert!(!named("0bridge", "ll"));
     }
 
     #[test]
     fn a_named_network_keeps_off_legions_v6() {
-        let jailer = || {
+        let local = || {
             PodNetwork::new("10.88.0.0/16".parse().unwrap())
-                .named("jailer0", "jp")
+                .named("legionlocal0", "ll")
                 .unwrap()
         };
         let legion = PodNetwork::new("10.88.0.0/16".parse().unwrap());
         // Its own /64: the bridge and a pod there, nothing of Legion's.
         let sys = FakeSys::new();
-        let net = jailer()
+        let net = local()
             .with_v6("fd00:88::/48".parse().unwrap())
             .unwrap()
             .with_mtu(1500);
         net.ensure_bridge(&sys).unwrap();
-        let bridge = sys.interface("jailer0").unwrap();
+        let bridge = sys.interface("legionlocal0").unwrap();
         assert_eq!(bridge.config.addr6.unwrap().to_string(), "fd00:88::1/64");
         assert_ne!(net.gateway6(), legion.gateway6());
         assert_eq!(bridge.config.mtu, Some(1500));
@@ -628,13 +628,13 @@ mod tests {
         assert_eq!(b.config.mtu, Some(1500));
         let routes = sys.routes(Some("j1"));
         assert_eq!(routes[&Destination::Default6], net.gateway6());
-        assert!(jailer().with_v6("fd00:88::/96".parse().unwrap()).is_none());
+        assert!(local().with_v6("fd00:88::/96".parse().unwrap()).is_none());
 
         // Without IPv6: none on the bridge or the pod, and no route.
         let sys = FakeSys::new();
-        let net = jailer().without_v6();
+        let net = local().without_v6();
         net.ensure_bridge(&sys).unwrap();
-        assert_eq!(sys.interface("jailer0").unwrap().config.addr6, None);
+        assert_eq!(sys.interface("legionlocal0").unwrap().config.addr6, None);
         sys.add_jail("j2", true);
         net.attach(&sys, "00000000000000bb", "j2", ip("10.88.0.2"))
             .unwrap();

@@ -1,4 +1,4 @@
-//! Legion compatibility checks (`jailer check` and post-build lint):
+//! Legion compatibility checks (`legion local check` and post-build lint):
 //! validates `Containerfile` instructions, `ImageConfig`, and the image's
 //! root file system (`/etc/passwd`, `/etc/group`, entrypoint executability,
 //! stop signal, and `pkg` cache cleanup) against what Legion supports.

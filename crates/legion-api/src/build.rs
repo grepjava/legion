@@ -1,4 +1,4 @@
-//! `Build`: an image built with jailer on a builder node, pushed to a
+//! `Build`: an image built with `legion local` on a builder node, pushed to a
 //! registry and, if asked, rolled out to a Service (CONSOLE.md phase 5).
 //! A Build runs once; building again is another Build.
 
@@ -24,9 +24,9 @@ pub struct BuildSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_secret: Option<String>,
     /// A Secret of the namespace holding a P-256 private key (PEM, as
-    /// `jailer key generate` or `cosign generate-key-pair` makes, not
+    /// `legion local key generate` or `cosign generate-key-pair` makes, not
     /// encrypted): the image pushed is signed with it, and SLSA provenance
-    /// and an SPDX SBOM attested (`jailer attest`), as an ImagePolicy
+    /// and an SPDX SBOM attested (`legion local attest`), as an ImagePolicy
     /// requiring them checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_key_secret: Option<String>,

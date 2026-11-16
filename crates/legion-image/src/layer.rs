@@ -12,7 +12,8 @@ use sha2::{Digest, Sha256};
 
 use crate::Error;
 
-const WHITEOUT: &str = ".wh.";
+/// The prefix of a whiteout's name in a layer.
+pub const WHITEOUT: &str = ".wh.";
 /// The most a layer may hold uncompressed, so a small blob cannot fill the
 /// disk before its digest is checked.
 pub const MAX_LAYER: u64 = 64 << 30;

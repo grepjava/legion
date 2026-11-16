@@ -84,7 +84,7 @@ fn ready_nodes(api: &ApiService) -> Result<Vec<String>, Status> {
     Ok(names)
 }
 
-/// The ready nodes labelled builders, whose jailer stores builds.
+/// The ready nodes labelled builders, whose `legion local` stores builds.
 fn ready_builders(api: &ApiService) -> Result<Vec<String>, Status> {
     let ready = ready_nodes(api)?;
     let list = api.store.list(Kind::Node, None).map_err(internal)?;

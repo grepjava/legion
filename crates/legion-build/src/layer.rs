@@ -1,4 +1,4 @@
-//! Creating OCI image layers during `jailer build`: snapshots of a root
+//! Creating OCI image layers during `legion build`: snapshots of a root
 //! file system, compared to write what a step changed (and `.wh.`
 //! whiteouts for what it removed) as a deterministic tar. Applying layers,
 //! and copying and removing trees with their file flags, is
@@ -46,11 +46,9 @@ impl Compression {
 }
 
 pub use legion_image::layer::{
-    LayerArtifact, Whiteout, apply, apply_whiteouts, compress, compress_with, copy_tree,
+    LayerArtifact, WHITEOUT, Whiteout, apply, apply_whiteouts, compress, compress_with, copy_tree,
     decompress, extract, remove_tree, set_flags, whiteouts,
 };
-
-const WHITEOUT: &str = ".wh.";
 
 /// Fingerprint of a single entry in a rootfs directory tree, used to detect
 /// additions, modifications, and deletions between build steps.

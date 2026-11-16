@@ -1,4 +1,4 @@
-//! What a build host (jailer) does with a store besides pulling: images
+//! What a build host (`legion local`) does with a store besides pulling: images
 //! built on it, kept without ZFS, pinned against removal, exported and
 //! pushed, against a registry served in the test that takes uploads.
 
@@ -709,7 +709,7 @@ async fn signatures_are_verified_as_kept_in_the_registry() {
     }
 }
 
-/// Keeps attestations for `digest` in `registry` as cosign and jailer do:
+/// Keeps attestations for `digest` in `registry` as cosign and `legion local` do:
 /// each a DSSE envelope of an in-toto statement, signed with `key`.
 fn keep_attestations(
     registry: &Mutex<Registry>,

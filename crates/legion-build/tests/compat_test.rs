@@ -1,5 +1,5 @@
-//! jailer against BuildKit and Buildah: each case in tests/compat/cases, built
-//! by jailer, gives the config and files `scripts/compat-reference.py` recorded
+//! Legion against BuildKit and Buildah: each case in tests/compat/cases, built
+//! by Legion, gives the config and files `scripts/compat-reference.py` recorded
 //! for each, but for the differences tests/compat/differences.TOOL names.
 
 use std::collections::BTreeMap;
@@ -7,11 +7,11 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use jailer::build::{BuildBackend, BuildOptions, build};
-use jailer::registry::{Client, sha256};
-use jailer::runtime::{Config, JailRuntime};
-use jailer::store::Store;
-use jailer::sys::FakeSys;
+use legion_build::build::{BuildBackend, BuildOptions, build};
+use legion_build::registry::{Client, sha256};
+use legion_build::runtime::{Config, JailRuntime};
+use legion_build::store::Store;
+use legion_build::sys::FakeSys;
 use serde_json::{Value, json};
 
 const KEYS: [&str; 12] = [
@@ -80,7 +80,7 @@ fn files(root: &Path) -> BTreeMap<String, String> {
 async fn built(case: &Path, tmp: &Path, jobs: usize) -> Result<Value, String> {
     let sys = Arc::new(FakeSys::new());
     let store: Arc<Store> = Arc::new(
-        jailer::store::open(
+        legion_build::store::open(
             sys.clone(),
             None,
             &tmp.join("store"),
@@ -94,7 +94,7 @@ async fn built(case: &Path, tmp: &Path, jobs: usize) -> Result<Value, String> {
         Config {
             state_dir: tmp.join("containers"),
             dataset: None,
-            shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+            shim: vec![OsString::from("legion"), OsString::from("jail-shim")],
             prune_images: false,
         },
     )
@@ -153,7 +153,7 @@ async fn built(case: &Path, tmp: &Path, jobs: usize) -> Result<Value, String> {
     Ok(image)
 }
 
-/// What BuildKit gives every image from scratch, for Linux, and jailer does
+/// What BuildKit gives every image from scratch, for Linux, and Legion does
 /// not: Linux's `PATH`, and `/` as the working directory, which is the default.
 fn without_linux_defaults(image: &mut Value) {
     let config = image["config"].as_object_mut().unwrap();
@@ -212,7 +212,7 @@ fn differences(case: &str, path: &str, want: &Value, got: &Value, out: &mut Vec<
     }
 }
 
-/// Every way jailer's builds differ from `tool`'s records, given what jailer
+/// Every way Legion's builds differ from `tool`'s records, given what Legion
 /// made of each case.
 fn compare(tool: &str, made: &BTreeMap<String, Result<Value, String>>) -> Vec<String> {
     let expected = compat().join("expected").join(tool);
@@ -222,7 +222,7 @@ fn compare(tool: &str, made: &BTreeMap<String, Result<Value, String>>) -> Vec<St
             assert!(expected.join(format!("{name}.error")).exists(), "{name}");
             if let Ok(got) = got {
                 found.push(format!(
-                    "{name} /build: {tool} refuses it, jailer gives {got}"
+                    "{name} /build: {tool} refuses it, Legion gives {got}"
                 ));
             }
             continue;
@@ -231,7 +231,7 @@ fn compare(tool: &str, made: &BTreeMap<String, Result<Value, String>>) -> Vec<St
         without_linux_defaults(&mut want);
         match got {
             Ok(got) => differences(name, "", &want, got, &mut found),
-            Err(e) => found.push(format!("{name} /build: {tool} builds it, jailer: {e}")),
+            Err(e) => found.push(format!("{name} /build: {tool} builds it, Legion: {e}")),
         }
     }
     found

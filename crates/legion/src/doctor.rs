@@ -1,5 +1,5 @@
 //! `legion doctor`: whether this host can run Legion, and how to fix it.
-//! What it checks is shared with jailer in [`legion_sys::check`]; what those
+//! What it checks is shared with `legion local` in [`legion_sys::check`]; what those
 //! findings mean for a node is in [`legion_agent::doctor`]; how they are
 //! said is here. It changes nothing on the host.
 

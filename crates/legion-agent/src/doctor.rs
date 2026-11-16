@@ -1,5 +1,5 @@
 //! What `legion doctor` checks: whether this host can run Legion. The checks
-//! are shared with jailer in [`legion_sys::check`]; what their findings mean
+//! are shared with `legion local` in [`legion_sys::check`]; what their findings mean
 //! for a node is here, where both the CLI and each agent (for the cluster's
 //! diagnostics) read it. It changes nothing on the host.
 

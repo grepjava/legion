@@ -1,10 +1,10 @@
 //! Attestations as cosign makes them with a key pair (`cosign attest`, and
-//! jailer's `attest`, which Legion's builds run): an in-toto statement
+//! `legion local attest`, which Legion's builds run): an in-toto statement
 //! naming an image by digest, with a predicate (an SBOM, SLSA provenance),
 //! signed in a DSSE envelope with ECDSA P-256, kept as a layer of the
 //! manifest tagged `sha256-<hex>.att` in the image's repository, beside
 //! the signatures of [`crate::cosign`]. Here they are read and checked;
-//! jailer makes them.
+//! `legion local` makes them.
 //!
 //! Not covered, as for signatures: cosign v3's bundles (OCI 1.1
 //! referrers), the transparency log and keyless signing.
@@ -277,7 +277,7 @@ mod tests {
 
     const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    /// An attestation of `predicate` about `digest`, as jailer makes one.
+    /// An attestation of `predicate` about `digest`, as `legion local attest` makes one.
     fn envelope(digest: &str, predicate_type: &str, predicate: Value, key: &PrivateKey) -> Vec<u8> {
         let statement = serde_json::to_vec(&json!({
             "_type": STATEMENT_TYPE,
@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn an_sbom_lists_the_images_packages() {
-        // As jailer writes one: the image first, then its packages.
+        // As `legion local attest` writes one: the image first, then its packages.
         let spdx = json!({
             "spdxVersion": "SPDX-2.3",
             "packages": [

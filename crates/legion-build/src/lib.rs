@@ -15,6 +15,6 @@ pub mod vm;
 
 pub use legion_local::{
     Client, Config, Credentials, Error, Image, ImageConfig, Reference, StorageMode, Store, auth,
-    chain_ids, http_client, log, net, oci, parse_size, registry, registry_of, runtime, shim,
-    state, store, sys, users,
+    chain_ids, http_client, log, net, oci, parse_size, registry, registry_of, runtime, shim, state,
+    store, sys, users,
 };

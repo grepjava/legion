@@ -6012,7 +6012,7 @@ async fn a_build_runs_on_a_builder_node_and_rolls_out() {
         Frame::Attach(offer.id),
         Frame::Error(SessionError {
             code: tonic::Code::Aborted as i32,
-            message: "jailer build failed (exit status: 1)".into(),
+            message: "legion local build failed (exit status: 1)".into(),
         }),
     ] {
         to_manager
@@ -6031,7 +6031,10 @@ async fn a_build_runs_on_a_builder_node_and_rolls_out() {
         web3()["phase"] == "Failed"
     })
     .await;
-    assert_eq!(web3()["message"], "jailer build failed (exit status: 1)");
+    assert_eq!(
+        web3()["message"],
+        "legion local build failed (exit status: 1)"
+    );
 
     // Nor may alice ask a node to build.
     let open = SessionFrame {

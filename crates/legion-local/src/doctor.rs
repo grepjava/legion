@@ -1,6 +1,6 @@
-//! `jailer doctor`: what this host lets jailer do. The checks are Legion's,
+//! `legion local doctor`: what this host lets the local mode do. The checks are Legion's,
 //! in `legion_sys::check`, and change nothing; what each one blocks is
-//! jailer's own to say, as a host with no pf builds images well enough.
+//! the local mode's own to say, as a host with no pf builds images well enough.
 
 use legion_sys::Sys;
 use legion_sys::check::{self, Finding, State};
@@ -12,7 +12,7 @@ use serde::Serialize;
 pub enum Operation {
     /// Builds with `RUN` steps
     Build,
-    /// `jailer run` on the host's network
+    /// `legion local run` on the host's network
     Run,
     /// `--vnet`, `--network bridge` and published ports
     Vnet,
@@ -48,7 +48,7 @@ pub enum Status {
 pub struct Entry {
     #[serde(flatten)]
     pub finding: Finding,
-    /// What cannot work unless this is met. Empty for what jailer sees to
+    /// What cannot work unless this is met. Empty for what the local mode sees to
     /// itself, which is reported all the same.
     pub required_for: Vec<Operation>,
 }
@@ -98,7 +98,7 @@ fn root(yes: bool) -> Finding {
             "root",
             State::Unmet,
             "not running as root".to_owned(),
-            Some("run jailer with sudo or doas".to_owned()),
+            Some("run it with sudo or doas".to_owned()),
         )
     }
 }
@@ -143,7 +143,7 @@ pub fn examine(sys: &dyn Sys, host: &Host, operations: &[Operation]) -> Report {
 
     add(&Operation::ALL, &mut || root(host.root));
     if let Some(dataset) = host.zfs_root {
-        // jailer makes the dataset itself, on a pool that must be there.
+        // The local mode makes the dataset itself, on a pool that must be there.
         let pool = dataset.split('/').next().unwrap_or(dataset);
         add(&Operation::ALL, &mut || check::zfs_root(sys, pool));
     }
@@ -158,7 +158,7 @@ pub fn examine(sys: &dyn Sys, host: &Host, operations: &[Operation]) -> Report {
         add(&[Vnet], &mut || check::module(sys, name));
     }
     add(&[Vnet], &mut || {
-        check::pf_anchors(sys, "jailer/*", crate::net::HOOKS)
+        check::pf_anchors(sys, "legion-local/*", crate::net::HOOKS)
     });
     add(&[Vnet], &mut || subnet(&host.subnet));
 
@@ -215,7 +215,7 @@ fn operation_name(operation: Operation) -> &'static str {
     }
 }
 
-/// The report as `jailer doctor` prints it.
+/// The report as `legion local doctor` prints it.
 pub fn text(report: &Report) -> String {
     let mut out = String::new();
     for o in &report.operations {
@@ -250,7 +250,7 @@ pub fn text(report: &Report) -> String {
                 "{:12}{}\n",
                 "",
                 if needed.is_empty() {
-                    "optional: jailer sees to it when it can".to_owned()
+                    "optional: Legion sees to it when it can".to_owned()
                 } else {
                     format!("needed for: {}", needed.join(", "))
                 }
@@ -266,8 +266,7 @@ mod tests {
     use Operation::*;
     use legion_sys::FakeSys;
 
-    const CALLED: &str =
-        "nat-anchor \"jailer/*\" all\nrdr-anchor \"jailer/*\" all\nanchor \"jailer/*\" all\n";
+    const CALLED: &str = "nat-anchor \"legion-local/*\" all\nrdr-anchor \"legion-local/*\" all\nanchor \"legion-local/*\" all\n";
 
     fn host() -> Host<'static> {
         Host {
@@ -368,13 +367,13 @@ mod tests {
     }
 
     #[test]
-    fn the_pool_is_what_must_be_there_as_jailer_makes_its_dataset() {
+    fn the_pool_is_what_must_be_there_as_the_local_mode_makes_its_dataset() {
         let sys = fit();
         sys.zfs_create("tank", &[]).unwrap();
         let on = |zfs_root| Host { zfs_root, ..host() };
-        let report = examine(&sys, &on(Some("tank/jailer")), &[Build]);
+        let report = examine(&sys, &on(Some("tank/legion-local")), &[Build]);
         assert_eq!(status(&report, Build), Status::Ready, "{}", text(&report));
-        let report = examine(&sys, &on(Some("gone/jailer")), &[Build]);
+        let report = examine(&sys, &on(Some("gone/legion-local")), &[Build]);
         assert_eq!(status(&report, Build), Status::Blocked);
         // With plain directories, ZFS is not asked about at all.
         assert!(!ids(&examine(&sys, &host(), &[Build])).contains(&"zfs.root"));
