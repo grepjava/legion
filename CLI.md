@@ -139,7 +139,7 @@ Trigger a CronJob immediately outside its schedule.
 - `legion image prune [--node <NODE>] [--builds]`
 - `legion image scan <REF> --node <NODE> [--json]` (FreeBSD `pkg audit` vulnerability check)
 - `legion image export <REF> --node <NODE> -o <FILE> [--tag <NAME>]`
-- `legion image search [QUERY] [--limit <N>] [-n <NS> --secret <SECRET>]`: the FreeBSD catalog and Docker Hub. `ghcr.io/OWNER/REPO` is read from ghcr.io anonymously. With `--secret` (a Secret in the namespace holding a Docker config with a ghcr.io login, a token with `read:packages`), GitHub container packages are listed too: the token's own, or `ghcr.io/OWNER`'s. Only the first 100 packages or tags are read.
+- `legion image search [QUERY] [--limit <N>] [-n <NS> --secret <SECRET>]`: the FreeBSD catalog and Docker Hub. `ghcr.io/OWNER/REPO` is read from ghcr.io anonymously. With `--secret` (a Secret in the namespace holding a Docker config with a ghcr.io login, a token with `read:packages`), GitHub container packages are listed too: the token's own, or `ghcr.io/OWNER`'s. Only the first 100 packages or tags are read. The OS column says `freebsd` or `linux` where the search knows it (the catalog's images, Docker's own), else `?`: `legion image inspect` reads it from the image. A Linux image runs only on nodes started with `--linux`.
 - `legion image sbom <REF> [-n <NS> --secret <SECRET>] [--json]`
 - `legion image inspect <REF> [--node <NODE>] [-n <NS> --secret <SECRET>]`
 

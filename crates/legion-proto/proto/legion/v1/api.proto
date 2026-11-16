@@ -740,9 +740,11 @@ message RegistrySearchHit {
   string description = 2;
   uint64 stars = 3;
   bool official = 4;
-  // "freebsd-catalog" or "docker-hub".
+  // "freebsd-catalog", "docker-hub" or "ghcr.io".
   string source = 5;
   string suggested_tag = 6;
+  // "freebsd", "linux", or empty when the search does not know.
+  string os = 7;
 }
 
 message SearchImagesResponse {

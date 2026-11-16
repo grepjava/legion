@@ -550,6 +550,7 @@ pub(crate) async fn search_images(
             official: h.official,
             source: h.source,
             suggested_tag: h.suggested_tag,
+            os: h.os,
         })
         .collect();
     Ok(Response::new(pb::SearchImagesResponse { results }))

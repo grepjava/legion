@@ -2565,19 +2565,24 @@ async fn run_image_command(
             if r.results.is_empty() {
                 println!("no matching images");
             } else {
-                let rows: Vec<[String; 4]> = r
+                let rows: Vec<[String; 5]> = r
                     .results
                     .into_iter()
                     .map(|h| {
                         [
                             h.name,
                             h.suggested_tag,
+                            if h.os.is_empty() {
+                                "?".to_owned()
+                            } else {
+                                h.os
+                            },
                             h.source,
                             h.description.chars().take(60).collect(),
                         ]
                     })
                     .collect();
-                print_table(["IMAGE", "TAG", "SOURCE", "DESCRIPTION"], &rows);
+                print_table(["IMAGE", "TAG", "OS", "SOURCE", "DESCRIPTION"], &rows);
             }
         }
         crate::ImageCommand::Sbom {

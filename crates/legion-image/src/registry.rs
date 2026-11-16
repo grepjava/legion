@@ -768,18 +768,19 @@ impl Client {
 
         let mut out: Vec<RegistryHit> = FREEBSD_CATALOG
             .iter()
-            .filter(|(name, desc, _)| {
+            .filter(|c| {
                 q.is_empty()
-                    || name.to_ascii_lowercase().contains(&q)
-                    || desc.to_ascii_lowercase().contains(&q)
+                    || c.name.to_ascii_lowercase().contains(&q)
+                    || c.description.to_ascii_lowercase().contains(&q)
             })
-            .map(|(name, desc, tag)| RegistryHit {
-                name: (*name).to_owned(),
-                description: (*desc).to_owned(),
+            .map(|c| RegistryHit {
+                name: c.name.to_owned(),
+                description: c.description.to_owned(),
                 stars: 0,
-                official: true,
+                official: c.official,
                 source: "freebsd-catalog".to_owned(),
-                suggested_tag: (*tag).to_owned(),
+                suggested_tag: c.tag.to_owned(),
+                os: c.os.to_owned(),
             })
             .collect();
 
@@ -819,6 +820,13 @@ impl Client {
                         official: item.is_official,
                         source: "docker-hub".to_owned(),
                         suggested_tag: "latest".to_owned(),
+                        // Docker's own images are Linux's; anyone else's
+                        // may be either.
+                        os: if item.is_official {
+                            "linux".to_owned()
+                        } else {
+                            String::new()
+                        },
                     });
                 }
             }
@@ -896,6 +904,7 @@ impl Client {
             official: false,
             source: "ghcr.io".to_owned(),
             suggested_tag: suggested,
+            os: String::new(),
         })
     }
 
@@ -1044,6 +1053,7 @@ fn ghcr_hits(packages: Vec<GhcrPackage>, filter: &str, limit: usize) -> Vec<Regi
             official: false,
             source: "ghcr.io".to_owned(),
             suggested_tag: String::new(),
+            os: String::new(),
         })
         .collect()
 }
@@ -1078,6 +1088,10 @@ pub struct RegistryHit {
     pub official: bool,
     pub source: String,
     pub suggested_tag: String,
+    /// The OS its images are for, where the search knows it without
+    /// fetching them: `freebsd`, `linux`, or empty for not known (inspect
+    /// the image to tell).
+    pub os: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -1113,42 +1127,104 @@ struct HubRepo {
 }
 
 /// Built-in FreeBSD OCI jail base images & common runtimes.
-const FREEBSD_CATALOG: &[(&str, &str, &str)] = &[
-    (
+/// An image the search offers before asking any registry.
+struct CatalogEntry {
+    name: &'static str,
+    description: &'static str,
+    /// A tag the image has (checked when the entry was written).
+    tag: &'static str,
+    os: &'static str,
+    /// Published by the FreeBSD project (or Docker), not a third party.
+    official: bool,
+}
+
+const fn freebsd(name: &'static str, description: &'static str, tag: &'static str) -> CatalogEntry {
+    CatalogEntry {
+        name,
+        description,
+        tag,
+        os: "freebsd",
+        official: false,
+    }
+}
+
+const fn project(name: &'static str, description: &'static str) -> CatalogEntry {
+    CatalogEntry {
+        name,
+        description,
+        tag: "15.1",
+        os: "freebsd",
+        official: true,
+    }
+}
+
+/// FreeBSD images (and one Linux one, for `--linux` nodes): the FreeBSD
+/// project's base images, and application images from the daemonless
+/// project. No registry lists FreeBSD images, so they are
+/// listed here.
+const FREEBSD_CATALOG: &[CatalogEntry] = &[
+    project(
         "ghcr.io/freebsd/freebsd-runtime",
-        "Official FreeBSD minimal OCI runtime userland for lightweight jails",
-        "14.2",
+        "FreeBSD's base image: the runtime userland, the smallest base for a jail",
     ),
-    (
-        "dougrabson/freebsd-minimal",
-        "Minimal FreeBSD base jail image (sh, coreutils, SSL certificates)",
-        "14.2",
+    project(
+        "ghcr.io/freebsd/freebsd-static",
+        "FreeBSD's base image for statically linked programs",
     ),
-    (
-        "dougrabson/freebsd",
-        "Full FreeBSD base system OCI image with pkg(8) package manager",
-        "14.2",
+    project(
+        "ghcr.io/freebsd/freebsd-dynamic",
+        "FreeBSD's base image for dynamically linked programs",
     ),
-    (
+    project(
+        "ghcr.io/freebsd/freebsd-notoolchain",
+        "FreeBSD's base system without the compilers: a base to pkg install into",
+    ),
+    project(
+        "ghcr.io/freebsd/freebsd-toolchain",
+        "FreeBSD's base system with the compilers, for building",
+    ),
+    freebsd(
+        "ghcr.io/daemonless/base",
+        "FreeBSD base image with pkg, from the daemonless project",
+        "latest",
+    ),
+    freebsd(
         "ghcr.io/daemonless/nginx",
-        "FreeBSD native nginx HTTP/reverse-proxy jail image",
+        "nginx HTTP server and reverse proxy on FreeBSD, from the daemonless project",
         "latest",
     ),
-    (
+    freebsd(
+        "ghcr.io/daemonless/caddy",
+        "Caddy web server with automatic HTTPS on FreeBSD, from the daemonless project",
+        "latest",
+    ),
+    freebsd(
         "ghcr.io/daemonless/postgres",
-        "FreeBSD native PostgreSQL server jail image for ZFS datasets",
-        "16",
+        "PostgreSQL database server on FreeBSD, from the daemonless project",
+        "17",
     ),
-    (
-        "ghcr.io/daemonless/redis",
-        "FreeBSD native Redis in-memory data store jail image",
+    freebsd(
+        "ghcr.io/daemonless/mariadb",
+        "MariaDB (MySQL) database server on FreeBSD, from the daemonless project",
         "latest",
     ),
-    (
-        "alpine",
-        "Minimal Linux Alpine base image (runs on nodes with --linux ABI enabled)",
-        "3.20",
+    freebsd(
+        "ghcr.io/daemonless/redis",
+        "Redis in-memory data store on FreeBSD, from the daemonless project",
+        "latest",
     ),
+    freebsd(
+        "ghcr.io/daemonless/jellyfin",
+        "Jellyfin media server on FreeBSD, from the daemonless project",
+        "latest",
+    ),
+    CatalogEntry {
+        name: "alpine",
+        description: "Alpine Linux: a Linux image, run through the Linux ABI on nodes started with --linux",
+        tag: "3.20",
+        os: "linux",
+        official: true,
+    },
 ];
 
 /// The largest manifest or index taken, as most registries limit them.
@@ -1404,7 +1480,14 @@ mod tests {
                 200,
                 r#"{"tags": ["1.2.0", "1.10.0", "sha256-x.sig"]}"#.into(),
             ),
-            "/v2/search/repositories/" => (200, r#"{"results": []}"#.into()),
+            "/v2/search/repositories/" => (
+                200,
+                r#"{"results": [
+                    {"repo_name": "postgres", "short_description": "", "star_count": 9, "is_official": true},
+                    {"repo_name": "someone/postgres", "short_description": "", "star_count": 1, "is_official": false}
+                ]}"#
+                .into(),
+            ),
             "/api/orgs/team/packages" => (404, "{}".into()),
             "/api/users/team/packages" | "/api/user/packages" => (
                 200,
@@ -1478,6 +1561,16 @@ mod tests {
         let c = stubbed(&addr);
         let hits = c.search_with_ghcr("postgres", 10, None).await.unwrap();
         assert!(hits.iter().all(|h| h.source != "ghcr.io"), "{hits:?}");
+        // Docker's own images are Linux's; another's OS is not known
+        // until the image is read.
+        let os = |name: &str| hits.iter().find(|h| h.name == name).map(|h| h.os.clone());
+        assert_eq!(os("postgres").as_deref(), Some("linux"), "{hits:?}");
+        assert_eq!(os("someone/postgres").as_deref(), Some(""), "{hits:?}");
+        assert_eq!(
+            os("ghcr.io/daemonless/postgres").as_deref(),
+            Some("freebsd"),
+            "{hits:?}"
+        );
         let paths: Vec<String> = seen
             .lock()
             .unwrap()
@@ -1510,5 +1603,22 @@ mod tests {
         let empty = c.search("", 5).await.unwrap();
         assert_eq!(empty.len(), 5);
         assert_eq!(empty[0].source, "freebsd-catalog");
+    }
+
+    #[test]
+    fn the_catalog_says_each_image_s_os_and_only_the_projects_are_official() {
+        for c in FREEBSD_CATALOG {
+            assert!(c.os == "freebsd" || c.os == "linux", "{}", c.name);
+            assert!(!c.tag.is_empty(), "{}", c.name);
+            assert_eq!(
+                c.official,
+                c.name.starts_with("ghcr.io/freebsd/") || c.name == "alpine",
+                "{}",
+                c.name
+            );
+            if c.os == "linux" {
+                assert!(c.description.contains("--linux"), "{}", c.name);
+            }
+        }
     }
 }

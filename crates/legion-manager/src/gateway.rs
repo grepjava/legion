@@ -3087,6 +3087,7 @@ async fn registry_search(
                 "official": h.official,
                 "source": h.source,
                 "suggested_tag": h.suggested_tag,
+                "os": h.os,
             })
         })
         .collect();
