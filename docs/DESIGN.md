@@ -625,7 +625,9 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   go on. Once every manager has lately answered on a protocol, the
   leader records it as the floor (`legion-system`'s Config `protocol`),
   and only then may the log hold that protocol's commands (protocol 2:
-  guarded writes). The floor only rises: below it, a manager is refused
+  guarded writes). Protocol 3 is the agents': a task's spec may say it is
+  paused, which an agent before would refuse to read, so the controller
+  says so only to tasks on nodes whose agent speaks 3. The floor only rises: below it, a manager is refused
   its join, its Raft calls and its start. So an upgrade can't be undone
   once every manager has run the new build together.
 

@@ -147,6 +147,9 @@ Stream live object changes, from now on or after a version.
 Deploy, inspect, stop, start, or remove Compose stacks.
 .It Cm stop Ar service , Cm start Ar service
 Stop a service while keeping its spec, or start it again.
+.It Cm pause Ar service , Cm resume Ar service
+Freeze a service's tasks where they run, out of its endpoints and their
+probes held, or let them go on.
 .It Cm restart Ar service , Cm rollback Ar service
 Trigger a rolling restart or roll back a service to its previous spec.
 .It Cm cronjob run Ar name Op Fl n Ar ns

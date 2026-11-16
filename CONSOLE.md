@@ -637,8 +637,15 @@ the CLI first, as everything is:
   one it requires keeps new tasks off the node (`legion node require`
   adds advised ones), as `legion list nodes` and `legion top` show.
 
-Not yet: pausing a task's processes, which wants its probes held and the
-pause carried to its agent, not only a signal sent.
+- *Pausing a service* (`legion pause`, `legion resume`, Pause on its
+  page, `P` in `legion top`): `paused` in its spec, which the controller
+  copies to its tasks on nodes whose agent can pause (protocol 3). The
+  agent stops every process of each container's jail, or a VM's `bhyve`
+  (its virtual CPUs), holds the probes and reports the task not ready,
+  so it leaves the endpoints; no container restarts meanwhile. Resumed,
+  the probes start over. A stop lets a paused container go first, so it
+  gets its stop signal and grace; an agent restarted meanwhile pauses it
+  again rather than probe it.
 
 ## Getting around
 

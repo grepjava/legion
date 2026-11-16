@@ -101,6 +101,9 @@ Stream live `PUT`/`DELETE` object events, from now on or after a version.
 ### `legion stop <SERVICE>` / `legion start <SERVICE>`
 Stop a service's tasks while preserving its spec and replica count, or start it again.
 
+### `legion pause <SERVICE>` / `legion resume <SERVICE>`
+Freeze a service's tasks where they run, or let them go on. A paused task keeps its node, address and memory: a jail's processes are stopped (`SIGSTOP`), a VM's `bhyve` is, holding its virtual CPUs. It leaves the service's endpoints and its probes are held, so it is neither sent traffic nor restarted; resumed, its probes start over. A stop or an update while paused lets the task go first, so its stop signal is taken as usual. Tasks on nodes whose agent is older than protocol 3 run on; `legion list services` shows `paused N/M`, N of the M running tasks paused, and `legion list tasks` each task's state.
+
 ### `legion restart <SERVICE>` / `legion rollback <SERVICE>`
 Trigger a rolling restart (`restartedAt`) or roll back to the previous spec.
 

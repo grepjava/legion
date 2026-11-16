@@ -183,6 +183,7 @@ legion stack convert shop -c compose.yaml   # the Legion YAML it becomes
 legion rollback web -n shop                 # undo the latest update
 legion restart web -n shop                  # new tasks, same spec
 legion stop web -n shop                     # no tasks; `legion start` brings them back
+legion pause web -n shop                    # tasks frozen in place; `legion resume` thaws them
 legion stack ls                             # each stack, its services ready or stopped
 legion stack rm shop                        # volumes and their data stay
 ```
