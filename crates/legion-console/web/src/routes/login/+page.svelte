@@ -39,7 +39,7 @@
 <div class="login">
   <div class="login-brand">
     <FreeBsdLogo size={36} />
-    <h1>FreeBSD Legion</h1>
+    <h1>Legion</h1>
   </div>
   {#if busy}
     <p>{t('Signing in…')}</p>

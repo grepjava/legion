@@ -495,7 +495,7 @@
       </button>
       <a class="topbar-brand" href="/">
         <FreeBsdLogo size={24} />
-        <span class="brand-title">FreeBSD <strong>Legion</strong></span>
+        <span class="brand-title"><strong>Legion</strong></span>
         {#if session.settings.name}
           <span class="topbar-cluster">· {session.settings.name}</span>
         {/if}
