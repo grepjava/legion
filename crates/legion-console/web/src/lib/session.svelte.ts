@@ -1,5 +1,6 @@
 import type { Alert, ConsoleSettings, KindInfo, LObject, Me, Plugin } from './api';
 import { t } from './i18n.svelte.ts';
+import { moved } from './prefs.svelte.ts';
 
 export type ThemeMode = 'dark' | 'light' | 'system';
 export type DensityMode = 'comfortable' | 'compact';
@@ -129,6 +130,11 @@ export function closeWorkbench(id: string) {
   if (session.activeTab === id) {
     session.activeTab = next[Math.min(idx, next.length - 1)]?.id ?? '';
   }
+}
+
+/** The workbench's tabs in a new order: the one at `from` put at `to`. */
+export function moveWorkbench(from: number, to: number) {
+  session.workbench = moved(session.workbench, from, to);
 }
 
 /** The namespaces the user has a role in; for the admin, those listed. */

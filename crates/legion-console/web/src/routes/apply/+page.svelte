@@ -2,6 +2,7 @@
   // Split YAML & Live Dry-Run Diff Studio: paste or edit YAML on the left,
   // inspect server-evaluated `legion diff` unified changes on the right,
   // and apply with optimistic concurrency protection (`expectedVersion`).
+  import { droppable, dropped, takeDropped } from '#lib/drop.svelte.ts';
   import { page } from '$app/state';
   import { api, ApiError, type ApplyResult } from '#lib/api.ts';
   import Diff from '#lib/Diff.svelte';
@@ -37,6 +38,11 @@
         version = m.version;
       })
       .catch((e) => (error = e.message));
+  });
+
+  // A YAML file dropped elsewhere in the console, opened here.
+  $effect(() => {
+    if (dropped.apply) yaml = takeDropped('apply');
   });
 
   // The YAML last applied: the live preview leaves its result on show
@@ -144,6 +150,7 @@
   <div>
     <textarea
       class="editor"
+      use:droppable
       bind:value={yaml}
       spellcheck="false"
       rows="24"

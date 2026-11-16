@@ -20,6 +20,53 @@
   let balancers: Balancer[] = $state([]);
   let selectedService = $state('');
   let zoom = $state(100);
+  const zoomBy = (step: number) => (zoom = Math.min(160, Math.max(60, zoom + step)));
+
+  // The canvas panned by dragging it, as a map is; a press that does not
+  // move stays a click on what is under it.
+  let canvas: HTMLDivElement | undefined = $state();
+  let panning = $state(false);
+  let press: { x: number; y: number; left: number; top: number; id: number } | null = null;
+  function panDown(e: PointerEvent) {
+    if (e.button !== 0 || !canvas) return;
+    press = { x: e.clientX, y: e.clientY, left: canvas.scrollLeft, top: canvas.scrollTop, id: e.pointerId };
+  }
+  function panMove(e: PointerEvent) {
+    if (!press || !canvas || e.pointerId !== press.id) return;
+    const dx = e.clientX - press.x;
+    const dy = e.clientY - press.y;
+    if (!panning && Math.hypot(dx, dy) < 5) return;
+    if (!panning) {
+      panning = true;
+      canvas.setPointerCapture(e.pointerId);
+    }
+    canvas.scrollLeft = press.left - dx;
+    canvas.scrollTop = press.top - dy;
+  }
+  function panUp(e: PointerEvent) {
+    if (!press || e.pointerId !== press.id) return;
+    press = null;
+    if (!panning) return;
+    // The click that ends a drag opens nothing.
+    canvas?.addEventListener('click', (c) => (c.preventDefault(), c.stopPropagation()), {
+      capture: true,
+      once: true
+    });
+    requestAnimationFrame(() => (panning = false));
+  }
+  // Ctrl (or a pinch) with the wheel zooms, as elsewhere.
+  function wheel(e: WheelEvent) {
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    zoomBy(e.deltaY < 0 ? 10 : -10);
+  }
+  // Not passive, as the page must not scroll or zoom as well.
+  $effect(() => {
+    const c = canvas;
+    if (!c) return;
+    c.addEventListener('wheel', wheel, { passive: false });
+    return () => c.removeEventListener('wheel', wheel);
+  });
   let error = $state('');
 
   $effect(() => {
@@ -196,9 +243,9 @@
 <header class="bar">
   <h1>{t('Topology: {namespace}', { namespace })}</h1>
   <div class="controls">
-    <button type="button" class="sm" onclick={() => (zoom = Math.max(60, zoom - 20))}>−</button>
-    <span class="mono muted">{zoom}%</span>
-    <button type="button" class="sm" onclick={() => (zoom = Math.min(160, zoom + 20))}>+</button>
+    <button type="button" class="sm" aria-label={t('Zoom out')} title={t('Zoom out (Ctrl+wheel)')} onclick={() => zoomBy(-20)}>−</button>
+    <span class="mono muted" aria-live="polite">{zoom}%</span>
+    <button type="button" class="sm" aria-label={t('Zoom in')} title={t('Zoom in (Ctrl+wheel)')} onclick={() => zoomBy(20)}>+</button>
     <button type="button" class="sm" onclick={() => (zoom = 100)}>{t('Reset')}</button>
     <form
       class="inline"
@@ -245,7 +292,19 @@
       </div>
 
       <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-      <div class="table-scroll topo-canvas" tabindex="0" role="region" aria-label={t('Topology graph')}>
+      <div
+        class="table-scroll topo-canvas pannable"
+        class:panning
+        bind:this={canvas}
+        tabindex="0"
+        role="region"
+        aria-label={t('Topology graph')}
+        title={t('Drag to move around; Ctrl+wheel to zoom')}
+        onpointerdown={panDown}
+        onpointermove={panMove}
+        onpointerup={panUp}
+        onpointercancel={panUp}
+      >
         <svg
           class="topology"
           width={Math.round((svgW * zoom) / 100)}

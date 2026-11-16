@@ -2,6 +2,7 @@
   // A Volume's data, as `legion volume backup`, `restore`, and `snapshot`
   // manage it: live ZFS snapshots (create, rollback, delete), a crash-consistent
   // backup downloaded as a file, and a backup file restored onto a node.
+  import { droppable } from '#lib/drop.svelte.ts';
   import { api, downloads, type LObject } from './api.ts';
   import { cannotWrite } from './session.svelte.ts';
   import { t, tn } from './i18n.svelte.ts';
@@ -220,7 +221,7 @@
   <p class="error" role="alert">{t('Lost with its node: restore a backup into it on another node.')}</p>
 {/if}
 <form class="controls" onsubmit={restore}>
-  <input type="file" bind:files={file} aria-label={t('Backup file')} disabled={!!why} />
+  <span class="dropzone" use:droppable><input type="file" bind:files={file} aria-label={t('Backup file')} disabled={!!why} /><span class="hint" aria-hidden="true">{t('or drop it here')}</span></span>
   <input placeholder={t('onto node')} bind:value={node} aria-label={t('Node')} disabled={!!why} />
   <button class="primary" disabled={!!why || busy || !file?.length || !node} title={why ?? ''}
     >{lost ? t('Restore into it') : t('Restore')}</button

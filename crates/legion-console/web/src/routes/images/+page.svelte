@@ -7,6 +7,7 @@
   // 3) Jail Image Packaging & GHCR Push Studio: Containerfile templates or
   //    Git repo -> jailer build -> push to ghcr.io + inline GHCR PAT Secret
   //    creator + live Build runs table & Workbench log docking.
+  import { droppable } from '#lib/drop.svelte.ts';
   import { goto } from '$app/navigation';
   import {
     api,
@@ -554,7 +555,7 @@
       <div class="card">
         <h2>{t('Load OCI / Docker .tar archive')}</h2>
         <form class="controls" onsubmit={uploadTar}>
-          <input type="file" accept=".tar,application/x-tar" bind:files={loadFiles} aria-label={t('Image archive')} />
+          <span class="dropzone" use:droppable><input type="file" accept=".tar,application/x-tar" bind:files={loadFiles} aria-label={t('Image archive')} /><span class="hint" aria-hidden="true">{t('or drop it here')}</span></span>
           <select bind:value={loadNode} aria-label={t('Node')} required>
             <option value="">{t('Choose node…')}</option>
             {#each nodes as n (n.metadata.name)}
@@ -925,6 +926,7 @@
               {t('Containerfile')}
               <textarea
                 class="editor"
+                use:droppable
                 rows="10"
                 bind:value={pkgContainerfile}
                 spellcheck="false"

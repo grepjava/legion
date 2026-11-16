@@ -7,7 +7,8 @@
   import Events from './Events.svelte';
   import TaskLogs from './TaskLogs.svelte';
   import { t } from './i18n.svelte.ts';
-  import { closeWorkbench, session } from './session.svelte.ts';
+  import { closeWorkbench, moveWorkbench, session } from './session.svelte.ts';
+  import { sortable } from './drop.svelte.ts';
 
   const STORAGE_KEY = 'legion.workbenchHeight';
   const MIN_HEIGHT = 140;
@@ -96,6 +97,8 @@
   }
 
   function onTabKey(e: KeyboardEvent) {
+    // Alt with an arrow moves the tab instead (sortable).
+    if (e.altKey) return;
     const tabs = session.workbench;
     if (!tabs.length || !active) return;
     const i = tabs.findIndex((x) => x.id === active.id);
@@ -147,10 +150,12 @@
         aria-label={t('Workbench tabs')}
         bind:this={tablist}
       >
-        {#each session.workbench as item (item.id)}
+        {#each session.workbench as item, i (item.id)}
           <button
             type="button"
             role="tab"
+            use:sortable={{ group: 'workbench', index: i, count: session.workbench.length, move: moveWorkbench }}
+            aria-keyshortcuts="Alt+ArrowLeft Alt+ArrowRight"
             id="wb-tab-{encodeURIComponent(item.id)}"
             aria-selected={active?.id === item.id}
             tabindex={active?.id === item.id ? 0 : -1}

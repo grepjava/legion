@@ -4,6 +4,7 @@
   // Step 2: Source (Git source | Containerfile | Deploy VM Service)
   // Step 3: Destination, Credentials & Signing (or VM hardware specs)
   // Step 4: Review & Launch
+  import { droppable } from '#lib/drop.svelte.ts';
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import { api, type LObject } from '#lib/api.ts';
@@ -411,7 +412,7 @@
           </div>
           <label>
             {t('Containerfile')} <span class="muted">{t('(built with nothing beside it)')}</span>
-            <textarea class="editor" rows="10" bind:value={containerfile} aria-label={t('Containerfile')}></textarea>
+            <textarea class="editor" use:droppable rows="10" bind:value={containerfile} aria-label={t('Containerfile')}></textarea>
           </label>
           {#if needsContext}
             <p class="error" role="alert">

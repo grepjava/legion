@@ -2,6 +2,7 @@
   // A task's files: its container's directories browsed, a file downloaded
   // or uploaded in place (`legion files`, `legion cp`). Its Volumes are
   // there at their mount paths. Links are shown, never followed.
+  import { droppable } from '#lib/drop.svelte.ts';
   import { api, bytes, downloads, type FileEntry, type LObject } from '#lib/api.ts';
   import { t } from '#lib/i18n.svelte.ts';
   import { cannotWrite } from '#lib/session.svelte.ts';
@@ -144,7 +145,7 @@
   <form class="controls" onsubmit={put}>
     <label>
       {t('Upload into {path}', { path })}
-      <input type="file" bind:files={upload} />
+      <span class="dropzone" use:droppable><input type="file" bind:files={upload} /><span class="hint" aria-hidden="true">{t('or drop it here')}</span></span>
     </label>
     <button disabled={busy || !upload?.length}>{t('Upload')}</button>
   </form>

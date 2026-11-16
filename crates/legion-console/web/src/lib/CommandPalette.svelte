@@ -6,6 +6,8 @@
   import { t } from './i18n.svelte.ts';
   import { plural } from './kinds.ts';
   import { cannotWrite, openWorkbench, session, setDensity, setTheme } from './session.svelte.ts';
+  import { page } from '$app/state';
+  import { prefs } from './prefs.svelte.ts';
 
   interface Item {
     id: string;
@@ -20,6 +22,7 @@
   let query = $state('');
   let index = $state(0);
   let objects: LObject[] = $state([]);
+  let list: HTMLUListElement | undefined = $state();
 
   // Light-dismiss fallback for browsers without native <dialog closedby="any">
   function onDialogClick(event: MouseEvent) {
@@ -73,7 +76,28 @@
     const objGroup = t('Cluster objects');
     const actGroup = t('Quick actions');
 
+    // The pages the user pinned, then those they visited last (not the
+    // one shown, nor one already pinned).
+    const here = page.url.pathname + page.url.search;
+    const pins = prefs.pins.map((p) => ({
+      id: `pin:${p.href}`,
+      group: t('Pinned'),
+      label: p.title,
+      detail: p.href,
+      run: () => goto(p.href)
+    }));
+    const recent = prefs.recent
+      .filter((r) => r.href !== here && !prefs.pins.some((p) => p.href === r.href))
+      .map((r) => ({
+        id: `recent:${r.href}`,
+        group: t('Recent'),
+        label: r.title,
+        detail: r.href,
+        run: () => goto(r.href)
+      }));
     const base: Item[] = [
+      ...pins,
+      ...recent,
       { id: 'nav:/', group: navGroup, label: t('Overview'), detail: 'g o', run: () => goto('/') },
       { id: 'nav:/stacks', group: navGroup, label: t('Stacks'), detail: 'compose apps: stop / start / remove together', run: () => goto('/stacks') },
       { id: 'nav:/diagnostics', group: navGroup, label: t('Diagnostics'), detail: 'legion doctor on every node / support bundle', run: () => goto('/diagnostics') },
@@ -163,20 +187,26 @@
       }
     );
 
-    const q = query.trim().toLowerCase();
-    const filtered = q
-      ? base.filter(
-          (x) =>
-            x.label.toLowerCase().includes(q) ||
-            x.detail.toLowerCase().includes(q) ||
-            x.group.toLowerCase().includes(q)
-        )
-      : base;
-    return filtered.slice(0, 40);
+    // Every word typed, somewhere in the item; those whose name starts
+    // with the first word first.
+    const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    if (!words.length) return base.slice(0, 40);
+    const text = (x: Item) => `${x.label} ${x.detail} ${x.group}`.toLowerCase();
+    const found = base.filter((x) => words.every((w) => text(x).includes(w)));
+    const first = (x: Item) => (x.label.toLowerCase().startsWith(words[0]) ? 0 : 1);
+    return found
+      .map((x, i) => ({ x, i }))
+      .sort((a, b) => first(a.x) - first(b.x) || a.i - b.i)
+      .map(({ x }) => x)
+      .slice(0, 40);
   });
 
   $effect(() => {
     if (index >= items.length) index = 0;
+  });
+  // The chosen item kept in view as the arrows move through a long list.
+  $effect(() => {
+    list?.children[index]?.scrollIntoView({ block: 'nearest' });
   });
 
   function onKey(e: KeyboardEvent) {
@@ -215,7 +245,7 @@
     class="palette-input"
   />
   {#if items.length}
-    <ul class="palette-list" role="list">
+    <ul class="palette-list" role="list" bind:this={list}>
       {#each items as item, i (item.id)}
         <li>
           <button

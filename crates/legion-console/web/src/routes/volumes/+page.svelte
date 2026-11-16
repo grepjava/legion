@@ -3,6 +3,7 @@
   // 1-click ZFS/NFS/iSCSI volume creation wizard, live per-dataset space
   // tracking, ZFS Snapshot Manager modal, cross-node ZFS migration, and
   // streaming .zfs backup download & restore.
+  import { droppable } from '#lib/drop.svelte.ts';
   import {
     api,
     bytes,
@@ -434,22 +435,22 @@
       <thead>
         <tr>
           <th scope="col" aria-sort={sortBy === 'name' ? sortDir : undefined}>
-            <button type="button" class="sort-btn" onclick={() => toggleSort('name')}>
+            <button type="button" class="sort-btn" data-look onclick={() => toggleSort('name')}>
               {t('Volume')}
             </button>
           </th>
           <th scope="col" aria-sort={sortBy === 'driver' ? sortDir : undefined}>
-            <button type="button" class="sort-btn" onclick={() => toggleSort('driver')}>
+            <button type="button" class="sort-btn" data-look onclick={() => toggleSort('driver')}>
               {t('Driver')}
             </button>
           </th>
           <th scope="col" aria-sort={sortBy === 'node' ? sortDir : undefined}>
-            <button type="button" class="sort-btn" onclick={() => toggleSort('node')}>
+            <button type="button" class="sort-btn" data-look onclick={() => toggleSort('node')}>
               {t('Node')}
             </button>
           </th>
           <th scope="col" aria-sort={sortBy === 'used' ? sortDir : undefined}>
-            <button type="button" class="sort-btn" onclick={() => toggleSort('used')}>
+            <button type="button" class="sort-btn" data-look onclick={() => toggleSort('used')}>
               {t('ZFS space / Quota')}
             </button>
           </th>
@@ -540,7 +541,7 @@
 <section class="card restore-card">
   <h2>{t('Restore Volume from ZFS backup stream')}</h2>
   <form class="controls" onsubmit={uploadRestore}>
-    <input type="file" bind:files={restoreFiles} aria-label={t('Backup file')} />
+    <span class="dropzone" use:droppable><input type="file" bind:files={restoreFiles} aria-label={t('Backup file')} /><span class="hint" aria-hidden="true">{t('or drop it here')}</span></span>
     {#if nodes.length}
       <select bind:value={restoreNode} aria-label={t('Target node')} required>
         <option value="">{t('Choose node…')}</option>

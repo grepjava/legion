@@ -1212,3 +1212,206 @@ ul.lacks {
   margin: 0;
   padding-left: 1.2em;
 }
+
+/* Navigation: the side bar's toggle, pinned pages, the pin button. */
+.side-toggle {
+  font-size: 1rem;
+  line-height: 1;
+  min-width: 30px;
+}
+.pin-toggle[aria-pressed='true'] span {
+  color: var(--wait);
+}
+.shell.side-hidden {
+  grid-template-columns: 1fr;
+}
+aside[hidden] {
+  display: none;
+}
+ul.pins {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.08rem;
+}
+.pin-row {
+  display: flex;
+  align-items: center;
+  gap: 0.15rem;
+}
+.pin-row a {
+  flex: 1;
+  text-decoration: none;
+  min-width: 0;
+  justify-content: flex-start;
+  gap: 0.4rem;
+  cursor: grab;
+}
+.pin-row .pin-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.grip {
+  color: var(--muted);
+  font-size: 0.8rem;
+  opacity: 0.6;
+}
+.pin-row:hover .grip,
+.pin-row a:focus-visible .grip {
+  opacity: 1;
+}
+button.unpin {
+  color: var(--muted);
+  opacity: 0;
+}
+.pin-row:hover button.unpin,
+button.unpin:focus-visible {
+  opacity: 1;
+}
+@media (hover: none) {
+  button.unpin {
+    opacity: 1;
+  }
+}
+
+/* Lists the user reorders by dragging (drop.svelte.ts's sortable). */
+.sort-dragging {
+  opacity: 0.45;
+}
+.sort-over {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+.wb-tabs .sort-over {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* Files dropped on a field (drop.svelte.ts's droppable). */
+.dropzone {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding: 0.35rem 0.6rem;
+  border: 1px dashed var(--control);
+  border-radius: 6px;
+  transition:
+    border-color 0.12s ease,
+    background-color 0.12s ease;
+}
+.dropzone .hint {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.drop-over {
+  border-color: var(--accent) !important;
+  background-color: color-mix(in srgb, var(--accent) 9%, transparent) !important;
+}
+.drop-taken {
+  border-color: var(--good) !important;
+}
+.drop-refused {
+  border-color: var(--bad) !important;
+  animation: refuse 0.3s ease 2;
+}
+@keyframes refuse {
+  25% {
+    transform: translateX(-3px);
+  }
+  75% {
+    transform: translateX(3px);
+  }
+}
+.drop-hint,
+.toast {
+  position: fixed;
+  left: 50%;
+  translate: -50% 0;
+  z-index: 50;
+  max-width: min(40rem, 92vw);
+  padding: 0.55rem 0.9rem;
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--control);
+  box-shadow: 0 10px 30px rgb(0 0 0 / 0.35);
+  font-size: 0.88rem;
+  margin: 0;
+}
+.drop-hint {
+  top: 4.2rem;
+  border-style: dashed;
+  border-color: var(--accent);
+  pointer-events: none;
+}
+.toast {
+  bottom: 1.2rem;
+  animation: toast-in 0.18s ease-out;
+}
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    translate: -50% 0.5rem;
+  }
+}
+
+/* The shortcuts dialog. */
+kbd {
+  font-family: 'JetBrains Mono Variable', ui-monospace, monospace;
+  font-size: 0.78rem;
+  padding: 0.05rem 0.35rem;
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--surface2);
+}
+dl.keys {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.45rem 0.9rem;
+  margin: 0;
+  align-items: center;
+}
+dl.keys dt {
+  white-space: nowrap;
+}
+dl.keys dd {
+  margin: 0;
+}
+
+/* A short cross-fade of the page between pages (the layout's onNavigate). */
+main {
+  view-transition-name: page;
+}
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+}
+::view-transition-old(page),
+::view-transition-new(page) {
+  animation-duration: 0.14s;
+}
+
+/* The topology's canvas, panned by dragging. */
+.topo-canvas.pannable {
+  cursor: grab;
+}
+.topo-canvas.panning {
+  cursor: grabbing;
+  user-select: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .drop-refused,
+  .toast {
+    animation: none;
+  }
+}
+@media (max-width: 48rem) {
+  .topbar .telemetry-pill,
+  .topbar .brand-title {
+    display: none;
+  }
+}

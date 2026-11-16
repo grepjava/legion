@@ -1,6 +1,7 @@
 <script lang="ts">
   // Deploy from an image (CONSOLE.md phase 5): a form writing the YAML,
   // shown alongside as it is written, applied as `legion apply` would.
+  import { droppable } from '#lib/drop.svelte.ts';
   import { page } from '$app/state';
   import { api, type ApplyResult } from '#lib/api.ts';
   import Diff from '#lib/Diff.svelte';
@@ -97,7 +98,7 @@
     </fieldset>
     <label
       >{t('Environment')} <span class="muted">{t('(NAME=value a line)')}</span>
-      <textarea rows="3" bind:value={form.env} aria-label={t('Environment')}></textarea>
+      <textarea rows="3" use:droppable bind:value={form.env} aria-label={t('Environment')}></textarea>
     </label>
     <fieldset>
       <legend>{t('Storage')}</legend>

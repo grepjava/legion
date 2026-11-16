@@ -3,6 +3,7 @@
   // objects `legion stack deploy` would apply, shown before applying,
   // with what Legion cannot honour and the file's variables as fields. A
   // template opens here; a compose file is saved as one.
+  import { droppable, dropped, takeDropped } from '#lib/drop.svelte.ts';
   import { page } from '$app/state';
   import { api, compose, templates, type ApplyResult, type ComposeVariable } from '#lib/api.ts';
   import Diff from '#lib/Diff.svelte';
@@ -45,6 +46,11 @@
         saveName = found.name;
       })
       .catch((e) => (convertError = e.message));
+  });
+
+  // A compose file dropped elsewhere in the console, opened here.
+  $effect(() => {
+    if (dropped.compose) text = takeDropped('compose');
   });
 
   // Each conversion's number: only the latest one started is shown, so a
@@ -139,7 +145,7 @@
         {/each}
       </fieldset>
     {/if}
-    <textarea class="editor" bind:value={text} spellcheck="false" rows="22" aria-label={t('Compose file')}></textarea>
+    <textarea class="editor" use:droppable bind:value={text} spellcheck="false" rows="22" aria-label={t('Compose file')}></textarea>
     <fieldset>
       <legend>{t('Save as a template')}</legend>
       <label>{t('Name')} <input bind:value={saveName} aria-label={t('Template name')} /></label>

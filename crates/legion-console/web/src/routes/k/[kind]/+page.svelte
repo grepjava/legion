@@ -12,6 +12,19 @@
   let objects: LObject[] = $state([]);
   let error = $state('');
   let filter = $state('');
+  // Whether the watch has said what there is yet: until then, nothing
+  // listed means nothing known, not none.
+  let loaded = $state(false);
+  // The column sorted on (-1 the name, -2 the namespace), and which way.
+  let sortBy = $state(-1);
+  let sortDir: 'ascending' | 'descending' = $state('ascending');
+  function sortOn(col: number) {
+    if (sortBy === col) sortDir = sortDir === 'ascending' ? 'descending' : 'ascending';
+    else {
+      sortBy = col;
+      sortDir = 'ascending';
+    }
+  }
   // A link may bring a filter (a label on an object's page); another kind
   // starts unfiltered.
   $effect(() => {
@@ -22,20 +35,43 @@
   $effect(() => {
     objects = [];
     error = '';
+    loaded = false;
     return follow(
       kind,
       scoped ? '' : session.namespace,
       (o) => {
         objects = o;
         error = '';
+        loaded = true;
       },
-      (e) => (error = e.message)
+      (e) => {
+        error = e.message;
+        loaded = true;
+      }
     );
   });
 
   const cols = $derived(columns(kind));
   const terms = $derived(parse(filter));
-  const shown = $derived(terms.length ? objects.filter((o) => matches(o, terms)) : objects);
+  // Kinds differ in their columns: a new kind is sorted by name.
+  $effect(() => {
+    void kind;
+    sortBy = -1;
+    sortDir = 'ascending';
+  });
+  const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+  const cell = (o: LObject, col: number) =>
+    col === -1 ? o.metadata.name : col === -2 ? (o.metadata.namespace ?? '') : (cols[col]?.value(o) ?? '');
+  const shown = $derived.by(() => {
+    const found = terms.length ? objects.filter((o) => matches(o, terms)) : objects;
+    const sign = sortDir === 'ascending' ? 1 : -1;
+    return [...found].sort(
+      (a, b) =>
+        sign * collator.compare(String(cell(a, sortBy)), String(cell(b, sortBy))) ||
+        collator.compare(a.metadata.name, b.metadata.name)
+    );
+  });
+  const sorted = (col: number) => (sortBy === col ? sortDir : undefined);
   const href = (o: LObject) => `/k/${kind}/${o.metadata.namespace || '_'}/${o.metadata.name}`;
 </script>
 
@@ -54,9 +90,19 @@
   <table>
     <thead>
       <tr>
-        <th>{t('Name')}</th>
-        {#if !scoped}<th>{t('Namespace')}</th>{/if}
-        {#each cols as c (c.label)}<th>{c.label}</th>{/each}
+        <th scope="col" aria-sort={sorted(-1)}>
+          <button type="button" class="sort-btn" data-look onclick={() => sortOn(-1)}>{t('Name')}</button>
+        </th>
+        {#if !scoped}
+          <th scope="col" aria-sort={sorted(-2)}>
+            <button type="button" class="sort-btn" data-look onclick={() => sortOn(-2)}>{t('Namespace')}</button>
+          </th>
+        {/if}
+        {#each cols as c, i (c.label)}
+          <th scope="col" aria-sort={sorted(i)}>
+            <button type="button" class="sort-btn" data-look onclick={() => sortOn(i)}>{c.label}</button>
+          </th>
+        {/each}
       </tr>
     </thead>
     <tbody>
@@ -77,6 +123,12 @@
       {/each}
     </tbody>
   </table>
+{:else if !loaded}
+  <p class="muted" role="status">{t('Loading…')}</p>
 {:else if !error}
-  <p class="muted">{t('None.')}</p>
+  <p class="muted">
+    {terms.length && objects.length
+      ? t('None match the filter.')
+      : t('None.')}
+  </p>
 {/if}

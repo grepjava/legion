@@ -1,6 +1,7 @@
 <script lang="ts">
   import '../app.css';
-  import { goto } from '$app/navigation';
+  import { untrack } from 'svelte';
+  import { afterNavigate, beforeNavigate, goto, onNavigate } from '$app/navigation';
   import { page } from '$app/state';
   import {
     api,
@@ -13,6 +14,17 @@
   } from '#lib/api.ts';
   import CommandPalette from '#lib/CommandPalette.svelte';
   import FreeBsdLogo from '#lib/FreeBsdLogo.svelte';
+  import Shortcuts, { CHORDS } from '#lib/Shortcuts.svelte';
+  import { routeDrop, sortable } from '#lib/drop.svelte.ts';
+  import {
+    movePin,
+    prefs,
+    setSectionOpen,
+    setSidebarHidden,
+    togglePin,
+    unpin,
+    visited
+  } from '#lib/prefs.svelte.ts';
   import Workbench from '#lib/Workbench.svelte';
   import { plural } from '#lib/kinds.ts';
   import {
@@ -89,8 +101,11 @@
     };
   });
 
-  // Global keyboard shortcuts: ⌘K / Ctrl+K for Command Palette, and g + key chords.
+  // Global keyboard shortcuts: Ctrl+K for the command palette, `?` for the
+  // list of shortcuts, `/` for the page's filter, `[` for the side bar, and
+  // `g` then a key for a page (CHORDS).
   let chordAt = 0;
+  let helpOpen = $state(false);
   function onGlobalKey(e: KeyboardEvent) {
     if (!session.me || page.url.pathname === '/login') return;
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
@@ -98,35 +113,142 @@
       session.paletteOpen = !session.paletteOpen;
       return;
     }
-    if (session.paletteOpen || e.metaKey || e.ctrlKey || e.altKey) return;
-    const target = e.target as HTMLElement | null;
+    if (session.paletteOpen || helpOpen || e.metaKey || e.ctrlKey || e.altKey) return;
+    const target = e.target;
     if (
-      target &&
+      target instanceof Element &&
       (target.matches('input, textarea, select, [contenteditable="true"]') ||
         target.closest('.terminal, dialog'))
     ) {
       return;
     }
     const now = Date.now();
-    if (e.key === 'g') {
-      chordAt = now;
-      return;
-    }
     if (now - chordAt < 900) {
       chordAt = 0;
-      const dest: Record<string, string> = {
-        o: '/',
-        v: '/volumes',
-        i: '/images',
-        t: '/topology',
-        y: '/apply',
-        a: '/alerts'
-      };
-      const to = dest[e.key.toLowerCase()];
+      const to = CHORDS.find(
+        (c) => c.key === e.key.toLowerCase() && (!c.admin || session.me?.all)
+      )?.to;
       if (to) {
         e.preventDefault();
         goto(to);
       }
+      return;
+    }
+    if (e.key === 'g') {
+      chordAt = now;
+    } else if (e.key === '?') {
+      e.preventDefault();
+      helpOpen = true;
+    } else if (e.key === '[') {
+      e.preventDefault();
+      toggleSidebar();
+    } else if (e.key === '/') {
+      // The page's own filter or search, else the menu's.
+      const field =
+        [...document.querySelectorAll<HTMLInputElement>('main input[type="search"]')].find(
+          (f) => f.offsetWidth || f.offsetHeight
+        ) ?? (sideShown ? navSearch : undefined);
+      if (field) {
+        e.preventDefault();
+        field.focus();
+        field.select();
+      }
+    }
+  }
+
+  // The side bar: hidden at the user's choice; on a narrow window, shown
+  // only when asked for, and put away again on going to a page.
+  let narrow = $state(false);
+  let narrowOpen = $state(false);
+  let navSearch: HTMLInputElement | undefined = $state();
+  let sideToggle: HTMLButtonElement | undefined = $state();
+  $effect(() => {
+    const q = matchMedia('(max-width: 48rem)');
+    const set = () => (narrow = q.matches);
+    set();
+    q.addEventListener('change', set);
+    return () => q.removeEventListener('change', set);
+  });
+  const sideShown = $derived(narrow ? narrowOpen : !prefs.sidebarHidden);
+  function toggleSidebar() {
+    if (sideShown && document.activeElement?.closest('aside')) sideToggle?.focus();
+    if (narrow) narrowOpen = !narrowOpen;
+    else setSidebarHidden(!prefs.sidebarHidden);
+  }
+
+  // The page's scroll: the main column scrolls, not the window, so
+  // SvelteKit's own reset does not reach it. A new page starts at the top;
+  // Back and Forward return to where the page was left.
+  let mainCol: HTMLDivElement | undefined = $state();
+  const scrolls = new Map<string, number>();
+  beforeNavigate(({ from }) => {
+    if (from && mainCol) scrolls.set(from.url.href, mainCol.scrollTop);
+  });
+  afterNavigate(({ type, to }) => {
+    narrowOpen = false;
+    const top = (type === 'popstate' && to && scrolls.get(to.url.href)) || 0;
+    // Once the page has drawn, so that it is as long as it was.
+    requestAnimationFrame(() => mainCol?.scrollTo({ top }));
+  });
+
+  // A short cross-fade between pages, where the browser has view
+  // transitions and the user has not asked for less motion.
+  onNavigate((navigation) => {
+    if (
+      !document.startViewTransition ||
+      matchMedia('(prefers-reduced-motion: reduce)').matches ||
+      navigation.from?.url.pathname === navigation.to?.url.pathname
+    ) {
+      return;
+    }
+    return new Promise((resolve) => {
+      document.startViewTransition(async () => {
+        resolve();
+        await navigation.complete;
+      });
+    });
+  });
+
+  // A file dropped where no field takes it: a compose file opens in Import
+  // compose, other YAML or JSON in Apply YAML. Anything else is refused
+  // here, rather than the browser leaving the console to show the file.
+  let dragDepth = $state(0);
+  let dropNote = $state('');
+  let noteTimer: ReturnType<typeof setTimeout> | undefined;
+  const carriesFiles = (e: DragEvent) =>
+    !!e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+  function note(text: string) {
+    dropNote = text;
+    clearTimeout(noteTimer);
+    noteTimer = setTimeout(() => (dropNote = ''), 6000);
+  }
+  function onWindowDragEnter(e: DragEvent) {
+    if (carriesFiles(e)) dragDepth++;
+  }
+  function onWindowDragLeave(e: DragEvent) {
+    if (carriesFiles(e)) dragDepth = Math.max(0, dragDepth - 1);
+  }
+  function onWindowDragOver(e: DragEvent) {
+    if (!carriesFiles(e)) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+  }
+  async function onWindowDrop(e: DragEvent) {
+    dragDepth = 0;
+    if (!carriesFiles(e)) return;
+    e.preventDefault();
+    const file = e.dataTransfer?.files[0];
+    if (!file || !session.me || page.url.pathname === '/login') return;
+    const to = await routeDrop(file);
+    if (to) {
+      note(t('Opened {name}.', { name: file.name }));
+      if (page.url.pathname !== to) goto(to);
+    } else {
+      note(
+        t('{name}: drop it on a field that takes it. Elsewhere, only compose files and YAML open.', {
+          name: file.name
+        })
+      );
     }
   }
 
@@ -220,7 +342,7 @@
     '/clusters': t('Clusters'),
     '/build': t('Builder')
   });
-  const title = $derived.by(() => {
+  const pageTitle = $derived.by(() => {
     const path = page.url.pathname;
     const [, k, kind, ns, name] = path.split('/').map(decodeURIComponent);
     const here =
@@ -235,8 +357,37 @@
             : t('{name} ({kind})', { name, kind })
           : plural(kind)
         : 'Legion');
-    return [here, session.settings.name, 'Legion'].filter(Boolean).join(' · ');
+    return here;
   });
+  const title = $derived(
+    [pageTitle, session.settings.name, 'Legion']
+      .filter((x, i) => x && (i < 2 || x !== pageTitle))
+      .join(' · ')
+  );
+
+  // Each page visited, for the palette's recent pages; the page shown, to pin.
+  const here = $derived({ href: page.url.pathname + page.url.search, title: pageTitle });
+  $effect(() => {
+    const ref = { ...here };
+    if (session.me && page.url.pathname !== '/login') untrack(() => visited(ref));
+  });
+  const pinned = $derived(prefs.pins.some((p) => p.href === here.href));
+
+  /** A side bar section's `open`: as the user left it, but open while the menu is filtered. */
+  const sectionOpen = (key: string) => !!navFilter || !prefs.closed.includes(key);
+  function sectionToggled(key: string, e: Event) {
+    if (navFilter) return;
+    const open = (e.currentTarget as HTMLDetailsElement).open;
+    if (open === prefs.closed.includes(key)) setSectionOpen(key, open);
+  }
+  function pinMoved(from: number, to: number) {
+    const name = prefs.pins[from]?.title ?? '';
+    movePin(from, to);
+    said = t('{name} moved to {n} of {total}.', { name, n: to + 1, total: prefs.pins.length });
+  }
+  const filteredPins = $derived(
+    prefs.pins.map((p, i) => ({ ...p, i })).filter((p) => matchesNav(p.title))
+  );
 
   const choices = $derived(namespaces(adminNamespaces));
   const shownPlugins = $derived(
@@ -293,7 +444,13 @@
   );
 </script>
 
-<svelte:window onkeydown={onGlobalKey} />
+<svelte:window
+  onkeydown={onGlobalKey}
+  ondragenter={onWindowDragEnter}
+  ondragleave={onWindowDragLeave}
+  ondragover={onWindowDragOver}
+  ondrop={onWindowDrop}
+/>
 <svelte:head>
   <title>{title}</title>
 </svelte:head>
@@ -313,8 +470,30 @@
   <a class="skip" href="#main">{t('Skip to the page')}</a>
   <p class="sr-only" aria-live="polite">{said}</p>
   <CommandPalette />
+  <Shortcuts bind:open={helpOpen} />
+  {#if dropNote}
+    <p class="toast" role="status">{dropNote}</p>
+  {/if}
+  {#if dragDepth > 0}
+    <p class="drop-hint" aria-hidden="true">
+      {t('Drop a compose file to import it, or YAML to apply it; or drop on a field to choose the file there.')}
+    </p>
+  {/if}
   <div class="app-frame">
     <header class="topbar">
+      <button
+        type="button"
+        class="sm side-toggle"
+        bind:this={sideToggle}
+        aria-controls="side"
+        aria-expanded={sideShown}
+        aria-keyshortcuts="["
+        title={sideShown ? t('Hide the side bar ([)') : t('Show the side bar ([)')}
+        onclick={toggleSidebar}
+      >
+        <span aria-hidden="true">☰</span>
+        <span class="sr-only">{t('Side bar')}</span>
+      </button>
       <a class="topbar-brand" href="/">
         <FreeBsdLogo size={24} />
         <span class="brand-title">FreeBSD <strong>Legion</strong></span>
@@ -346,6 +525,17 @@
 
       <button
         type="button"
+        class="sm pin-toggle"
+        aria-pressed={pinned}
+        title={pinned ? t('Unpin this page from the side bar') : t('Pin this page to the side bar')}
+        onclick={() => togglePin({ ...here })}
+      >
+        <span aria-hidden="true">{pinned ? '★' : '☆'}</span>
+        {t('Pin')}
+      </button>
+
+      <button
+        type="button"
         class="cmd-trigger"
         onclick={() => (session.paletteOpen = true)}
         aria-keyshortcuts="Control+K"
@@ -372,10 +562,21 @@
         <option value="light">{t('Light')}</option>
         <option value="system">{t('System')}</option>
       </select>
+
+      <button
+        type="button"
+        class="sm"
+        aria-keyshortcuts="Shift+?"
+        title={t('Keyboard shortcuts (?)')}
+        onclick={() => (helpOpen = true)}
+      >
+        <span aria-hidden="true">?</span>
+        <span class="sr-only">{t('Keyboard shortcuts')}</span>
+      </button>
     </header>
 
-    <div class="shell">
-      <aside>
+    <div class="shell" class:side-hidden={!sideShown} class:narrow-open={narrow && sideShown}>
+      <aside id="side" hidden={!sideShown}>
         <label class="ns">
           {t('Namespace')}
           <select bind:value={session.namespace}>
@@ -386,6 +587,7 @@
           </select>
         </label>
         <input
+          bind:this={navSearch}
           class="nav-search"
           type="search"
           bind:value={navQuery}
@@ -393,8 +595,35 @@
           aria-label={t('Filter menu')}
         />
         <nav aria-label={t('Console')}>
+          {#if filteredPins.length}
+            <details class="nav-sec" open={sectionOpen('pinned')} ontoggle={(e) => sectionToggled('pinned', e)}>
+              <summary class="nav-group">{t('Pinned')}</summary>
+              <ul class="pins" aria-label={t('Pinned pages: drag, or Alt with an arrow key, to reorder')}>
+                {#each filteredPins as p (p.href)}
+                  <li class="pin-row">
+                    <a
+                      href={p.href}
+                      class:here={here.href === p.href}
+                      aria-current={at(here.href === p.href)}
+                      use:sortable={{ group: 'pins', index: p.i, count: prefs.pins.length, move: pinMoved }}
+                      aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
+                      ><span class="grip" aria-hidden="true">⠿</span><span class="pin-title">{p.title}</span></a
+                    >
+                    <button
+                      type="button"
+                      class="link unpin"
+                      title={t('Unpin {name}', { name: p.title })}
+                      aria-label={t('Unpin {name}', { name: p.title })}
+                      onclick={() => unpin(p.href)}>×</button
+                    >
+                  </li>
+                {/each}
+              </ul>
+            </details>
+          {/if}
+
           {#if observeItems.length}
-            <details class="nav-sec" open>
+            <details class="nav-sec" open={sectionOpen('observe')} ontoggle={(e) => sectionToggled('observe', e)}>
               <summary class="nav-group">{t('Observe')}</summary>
               {#each observeItems as item (item.href)}
                 <a
@@ -412,7 +641,7 @@
           {/if}
 
           {#if studioItems.length}
-            <details class="nav-sec" open>
+            <details class="nav-sec" open={sectionOpen('studios')} ontoggle={(e) => sectionToggled('studios', e)}>
               <summary class="nav-group">{t('Studios')}</summary>
               {#each studioItems as item (item.href)}
                 <a
@@ -426,7 +655,7 @@
           {/if}
 
           {#if session.settings.clusters?.length && (showAllClusters || filteredClusters.length)}
-            <details class="nav-sec" open>
+            <details class="nav-sec" open={sectionOpen('clusters')} ontoggle={(e) => sectionToggled('clusters', e)}>
               <summary class="nav-group">{t('Clusters')}</summary>
               {#if showAllClusters}
                 <a
@@ -445,7 +674,7 @@
             </details>
           {/if}
           {#if filteredPlugins.length}
-            <details class="nav-sec" open>
+            <details class="nav-sec" open={sectionOpen('plugins')} ontoggle={(e) => sectionToggled('plugins', e)}>
               <summary class="nav-group">{t('Plugins')}</summary>
               {#each filteredPlugins as p (`${p.namespace}/${p.name}`)}
                 {@const href = `/plugins/${p.namespace}/${p.name}`}
@@ -456,7 +685,7 @@
             </details>
           {/if}
           {#if filteredLinks.length}
-            <details class="nav-sec" open>
+            <details class="nav-sec" open={sectionOpen('links')} ontoggle={(e) => sectionToggled('links', e)}>
               <summary class="nav-group">{t('Links')}</summary>
               {#each filteredLinks as l, i (i)}
                 <a href={l.url} target="_blank" rel="noopener noreferrer">{l.label}</a>
@@ -464,7 +693,7 @@
             </details>
           {/if}
           {#if filteredNsKinds.length}
-            <details class="nav-sec" open>
+            <details class="nav-sec" open={sectionOpen('workloads')} ontoggle={(e) => sectionToggled('workloads', e)}>
               <summary class="nav-group">{t('Workloads and config')}</summary>
               {#each filteredNsKinds as k (k.kind)}
                 <a
@@ -477,7 +706,7 @@
             </details>
           {/if}
           {#if clusterKinds.length && (clusterOpsItems.length || filteredClusterKinds.length)}
-            <details class="nav-sec" open>
+            <details class="nav-sec" open={sectionOpen('cluster')} ontoggle={(e) => sectionToggled('cluster', e)}>
               <summary class="nav-group">{t('Cluster')}</summary>
               {#each clusterOpsItems as item (item.href)}
                 <a
@@ -514,7 +743,7 @@
           <button class="link" onclick={signOut}>{t('Sign out')}</button>
         </div>
       </aside>
-      <div class="main-col">
+      <div class="main-col" bind:this={mainCol}>
         <main id="main" tabindex="-1">
           {@render children()}
         </main>
