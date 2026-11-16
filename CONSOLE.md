@@ -640,6 +640,39 @@ the CLI first, as everything is:
 Not yet: pausing a task's processes, which wants its probes held and the
 pause carried to its agent, not only a signal sent.
 
+## Getting around
+
+Added 2026-11-16, in the console's own look:
+
+- *Pinned pages*: Pin in the top bar puts the page shown (with its
+  filter or tab) at the head of the side bar. Pins are dragged into the
+  order wanted, or moved with Alt and an arrow key, which says where the
+  page went; × unpins. The palette (Ctrl+K) lists them first, then the
+  pages visited last, and matches every word typed.
+- *Keys*: `?` lists them. `/` goes to the page's filter or search, `[`
+  hides or shows the side bar, and `g` then a letter goes to a page
+  (`g b` the Builder, `g s` Stacks, `g d` Deploy, `g n` Network, `g c`
+  Operations for an admin, besides the earlier ones).
+- *The side bar* remembers which sections were closed and whether it was
+  hidden. On a narrow window it is put away, opened by ☰ and closed again
+  on going to a page.
+- *Dropping files*: a backup, an image archive or a file to upload goes
+  on its field; a Containerfile, compose file, YAML or environment file
+  on its editor. A compose file dropped anywhere else opens in Import
+  compose, other YAML or JSON in Apply YAML; anything else is refused
+  with a word, not opened by the browser in the console's place.
+- *Workbench tabs* are dragged, or moved with Alt and an arrow, into the
+  order wanted.
+- *Lists* sort by any column, say they are loading until the watch has
+  answered (they said "None." until then), and say when the filter, not
+  the cluster, left nothing.
+- *The topology* pans by dragging its canvas and zooms with Ctrl and
+  the wheel.
+- *A new page starts at the top*, and Back returns to where the page
+  was left: the page scrolls in its own column, which SvelteKit's reset
+  did not reach. Pages cross-fade briefly unless the system asks for
+  less motion.
+
 ## Out of scope
 
 - Anything the API does not offer. A console-only feature would be a
