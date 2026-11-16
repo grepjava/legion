@@ -208,7 +208,9 @@ async fn pass(
         .filter(|n| {
             let spec: NodeSpec = legion_api::parse(&n.spec).unwrap_or_default();
             let status: NodeStatus = serde_json::from_value(n.status.clone()).unwrap_or_default();
-            status.state == NodeState::Ready && spec.availability != Availability::Drain
+            status.state == NodeState::Ready
+                && spec.availability != Availability::Drain
+                && status.host_blocked(&spec).is_none()
         })
         .map(|n| n.metadata.name.clone())
         .collect();

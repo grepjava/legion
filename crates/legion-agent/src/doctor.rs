@@ -50,6 +50,29 @@ pub fn examine(sys: &dyn Sys, zfs_root: Option<&str>) -> Vec<Entry> {
     found
 }
 
+/// What a node's status says of `found`: the findings not met.
+pub fn lacks(found: &[Entry]) -> Vec<legion_api::node::HostLack> {
+    found
+        .iter()
+        .filter(|e| e.finding.state != State::Met)
+        .map(|e| legion_api::node::HostLack {
+            id: e.finding.id.clone(),
+            need: word(&e.need),
+            state: word(&e.finding.state),
+            detail: e.finding.detail.clone(),
+            remedy: e.finding.remedy.clone(),
+        })
+        .collect()
+}
+
+/// A unit enum's name as serde writes it.
+fn word<T: Serialize>(v: &T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
 /// What can't be vouched for counts: a host is not ready because it went
 /// unread, so a run without root says to run it as root.
 pub fn ready(found: &[Entry]) -> bool {
@@ -89,4 +112,41 @@ pub(crate) async fn send(
         let _ = tx.send(SessionFrame { frame: Some(frame) }).await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use legion_sys::FakeSys;
+
+    use super::*;
+
+    #[test]
+    fn a_nodes_status_carries_what_is_not_met() {
+        let sys = FakeSys::new();
+        sys.sysctl_set("net.inet.ip.forwarding", "1").unwrap();
+        sys.sysctl_set("net.link.bridge.pfil_member", "1").unwrap();
+        sys.sysctl_set("net.link.bridge.pfil_local_phys", "1")
+            .unwrap();
+        sys.set_main_rules(&format!("{}\n", legion_net::lb::HOOKS.join("\n")));
+        sys.zfs_create("tank/legion", &[]).unwrap();
+        assert_eq!(lacks(&examine(&sys, Some("tank/legion"))), []);
+
+        sys.set_main_rules("");
+        sys.remove_module("linux64");
+        sys.sysctl_set("net.inet.ip.forwarding", "0").unwrap();
+        let lacks = lacks(&examine(&sys, Some("tank/legion")));
+        let said: Vec<_> = lacks
+            .iter()
+            .map(|l| (l.id.as_str(), l.need.as_str(), l.state.as_str()))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                ("pf.anchors", "required", "unmet"),
+                ("forwarding", "advised", "unmet"),
+                ("module.linux64", "advised", "unsupported"),
+            ]
+        );
+        assert!(lacks[0].remedy.is_some());
+    }
 }

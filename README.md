@@ -109,7 +109,12 @@ name (`web`, `web.shop` or `web.shop.legion`) through the node's resolver
 on the bridge. Service VIPs,
 published ports and NAT for pods need the host's `/etc/pf.conf` to call
 Legion's anchors (`legion doctor`, as root, checks this and the rest of what
-a host needs, and changes nothing):
+a host needs, and changes nothing). Each node's agent runs the same checks
+as it starts and every minute after: while one the host requires is unmet,
+the node takes no new tasks (`legion list nodes` says `ready, lacks
+pf.anchors`), keeping what runs there, and takes them again once it is put
+right. `legion node require n1 forwarding` makes an advised check count so
+on that node:
 
 ```
 nat-anchor "legion/*"

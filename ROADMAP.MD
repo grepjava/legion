@@ -178,7 +178,12 @@ Starting points: `crates/legion/src/cli.rs`,
 Status: done in v0.1.13: `legion doctor`, its checks in a crate shared
 with jailer, text or JSON, nonzero when a requirement is unmet. Since
 v0.1.19, `legion diagnose` and the console's Diagnostics page run it on
-every node. The follow-up, readiness gating scheduling, is not built.
+every node. The follow-up (16 November 2026, not yet released): each
+agent runs the checks as it starts and every minute, carried by its
+heartbeats to the Node's `status.lacks`; while a required one is unmet,
+the node gets no new tasks, Volumes, builds or load-balancer addresses,
+and keeps what runs there. An advised check counts only where the Node's
+`spec.require` names it (`legion node require`), the explicit policy.
 
 ### P1.2 — Drain completion barrier for automated maintenance
 

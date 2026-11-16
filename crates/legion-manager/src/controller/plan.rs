@@ -1538,6 +1538,10 @@ fn eligible(
     if n.spec.availability != Availability::Active {
         return Err("not active");
     }
+    // What runs there stays (`stays`): only new work keeps off.
+    if n.status.host_blocked(&n.spec).is_some() {
+        return Err("the host lacks what it requires (legion doctor)");
+    }
     if n.repels(s, TaintEffect::NoSchedule) || n.repels(s, TaintEffect::NoExecute) {
         return Err("taints");
     }

@@ -38,7 +38,9 @@ pub(super) fn migrations(
         |name: &str| node(name).is_some_and(|n| n.spec.availability == Availability::Drain);
     let usable = |name: &str| {
         node(name).is_some_and(|n| {
-            n.status.state == NodeState::Ready && n.spec.availability == Availability::Active
+            n.status.state == NodeState::Ready
+                && n.spec.availability == Availability::Active
+                && n.status.host_blocked(&n.spec).is_none()
         })
     };
     // A node a stateful service's tasks must leave: draining, or with a
@@ -73,7 +75,10 @@ pub(super) fn migrations(
             n.status.state = NodeState::Ready;
             match stateful(v) {
                 Some(s) => eligible(&n, s, volumes, &[]).is_ok(),
-                None => n.spec.availability == Availability::Active,
+                None => {
+                    n.spec.availability == Availability::Active
+                        && n.status.host_blocked(&n.spec).is_none()
+                }
             }
         }
         _ => usable_for(v, to),

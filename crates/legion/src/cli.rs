@@ -21,6 +21,20 @@ use crate::{Command, StackCommand, UserCommand};
 /// an election, or while a manager waits on a quorum (DESIGN.md §3.8).
 const RETRY_FOR: Duration = Duration::from_secs(30);
 
+/// A node's state, with what its host lacks that keeps new tasks off.
+fn node_state(o: &Object, state: String) -> String {
+    let status = serde_json::from_value::<legion_api::node::NodeStatus>(o.status.clone());
+    let spec = legion_api::parse::<legion_api::node::NodeSpec>(&o.spec);
+    let (Ok(status), Ok(spec)) = (status, spec) else {
+        return state;
+    };
+    let lacking: Vec<&str> = status.blocking(&spec).map(|l| l.id.as_str()).collect();
+    match lacking.is_empty() {
+        true => state,
+        false => format!("{state}, lacks {}", lacking.join(" ")),
+    }
+}
+
 /// Follows a node's drain until it completes (0), `deadline` passes (2),
 /// or the node is no longer draining (1): printing what is left as it
 /// changes, or with `json` only the last status. Read from whichever
@@ -861,6 +875,23 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             }
         }
         Command::Node {
+            command: crate::NodeCommand::Require { node, checks },
+        } => {
+            let r#ref = ObjectRef {
+                kind: Kind::Node.to_string(),
+                namespace: String::new(),
+                name: node,
+            };
+            let said = match checks.is_empty() {
+                true => "no advised check".to_owned(),
+                false => checks.join(", "),
+            };
+            match objects.set_spec(r#ref, "require", checks.into()).await? {
+                (key, true) => println!("{key} requires {said}"),
+                (key, false) => println!("{key} already requires {said}"),
+            }
+        }
+        Command::Node {
             command:
                 crate::NodeCommand::Drain {
                     node,
@@ -896,6 +927,7 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 crate::NodeCommand::Pause { node } => ("pause", node),
                 crate::NodeCommand::Activate { node } => ("active", node),
                 crate::NodeCommand::Label { .. }
+                | crate::NodeCommand::Require { .. }
                 | crate::NodeCommand::Promote { .. }
                 | crate::NodeCommand::Demote { .. } => unreachable!("handled above"),
             };
@@ -1824,7 +1856,7 @@ fn print_objects(objects: &[pb::Object], format: Format, kind: Kind) -> anyhow::
                     .map(|o| {
                         [
                             o.metadata.name.clone(),
-                            field(&o.status, &["state"]),
+                            node_state(o, field(&o.status, &["state"])),
                             field(&o.spec, &["availability"]),
                             field(&o.spec, &["role"]),
                             format!(

@@ -785,6 +785,11 @@ pub enum CronJobCommand {
         #[arg(short, long)]
         namespace: Option<String>,
     },
+    /// Set which of `legion doctor`'s advised checks (`forwarding`,
+    /// `racct`, `bridge.filtering`…) the node needs met to take new tasks,
+    /// as it needs its required ones; none given, none. A node whose host
+    /// lacks what it needs keeps what runs there (drain it to move that).
+    Require { node: String, checks: Vec<String> },
 }
 
 #[derive(Subcommand)]

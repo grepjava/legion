@@ -1,7 +1,7 @@
 <script lang="ts">
   import { page } from '$app/state';
   import { api, follow, type LObject } from '#lib/api.ts';
-  import { columns, tone } from '#lib/columns.ts';
+  import { blocking, columns, tone } from '#lib/columns.ts';
   import { plural } from '#lib/kinds.ts';
   import { t } from '#lib/i18n.svelte.ts';
   import Actions from '#lib/Actions.svelte';
@@ -244,6 +244,29 @@
       {#if kind === 'Node'}
         <dt>{t('Taints')}</dt>
         <dd><Taints node={object} /></dd>
+        <dt>{t('Host')}</dt>
+        <dd>
+          {#if object.status?.lacks?.length}
+            {#if blocking(object).length}
+              <p class="bad">{t('Takes no new tasks until this is put right; what runs here stays.')}</p>
+            {/if}
+            <ul class="lacks">
+              {#each object.status.lacks as l (l.id)}
+                <li>
+                  <code>{l.id}</code>
+                  {l.need === 'required' || object.spec?.require?.includes(l.id) ? t('required') : t('advised')},
+                  {l.state}: {l.detail}
+                  {#if l.remedy}<br /><small>{t('fix: {remedy}', { remedy: l.remedy })}</small>{/if}
+                </li>
+              {/each}
+            </ul>
+          {:else}
+            {t('has what Legion needs')}
+          {/if}
+          {#if object.spec?.require?.length}
+            <br /><small>{t('Also required here: {ids}', { ids: object.spec.require.join(', ') })}</small>
+          {/if}
+        </dd>
       {/if}
     </dl>
     {#if kind === 'Service'}<ServicePorts service={object} />{/if}

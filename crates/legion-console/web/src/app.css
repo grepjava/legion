@@ -909,3 +909,8 @@ dialog::backdrop {
 main:focus {
   outline: none;
 }
+
+ul.lacks {
+  margin: 0;
+  padding-left: 1.2em;
+}

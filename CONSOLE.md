@@ -624,6 +624,10 @@ the CLI first, as everything is:
   (`legion support-bundle`): the cluster's objects without its Secrets,
   environment values and what else could be secret masked, its alerts,
   the last hour's events and the diagnosis. Read it before sending it.
+- *Host readiness*: the Nodes list's Host column and each Node's page
+  say what its host lacks, from the checks its agent runs every minute;
+  one it requires keeps new tasks off the node (`legion node require`
+  adds advised ones), as `legion list nodes` and `legion top` show.
 
 Not yet: pausing a task's processes, which wants its probes held and the
 pause carried to its agent, not only a signal sent.

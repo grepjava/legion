@@ -356,6 +356,16 @@ fn describe(before: Option<&Object>, o: &Object) -> Option<String> {
             if before.metadata.labels != o.metadata.labels {
                 changes.push("labels changed".into());
             }
+            let lacking = |st: &NodeStatus, sp: &NodeSpec| {
+                st.blocking(sp).map(|l| l.id.clone()).collect::<Vec<_>>()
+            };
+            let (was, is) = (lacking(&then, &spec_then), lacking(&now, &spec_now));
+            if was != is {
+                changes.push(match is.is_empty() {
+                    true => "the host has what it requires again".into(),
+                    false => format!("the host lacks {}: no new tasks", is.join(" ")),
+                });
+            }
             (!changes.is_empty()).then(|| format!("{who}: {}", changes.join(", ")))
         }
         Kind::Service => {

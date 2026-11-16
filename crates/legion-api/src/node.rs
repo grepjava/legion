@@ -28,10 +28,30 @@ pub struct NodeSpec {
     /// Keep tasks off the node unless their service tolerates them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub taints: Vec<Taint>,
+    /// Ids of `legion doctor`'s advised checks this node needs met to
+    /// take new tasks, as its required ones (`forwarding`, `racct`…). By
+    /// default an advised check found lacking only warns (`racct` also
+    /// keeps pods with limits off, as `platform.noLimits` says).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub require: Vec<String>,
 }
 
 impl Spec for NodeSpec {
     fn admit(&mut self) -> Result<(), Invalid> {
+        for (i, id) in self.require.iter().enumerate() {
+            let ok = !id.is_empty()
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c));
+            if !ok {
+                return Err(Invalid::new(
+                    index("", "require", i),
+                    "a check's id, as legion doctor --json gives it (forwarding, module.pf…)",
+                ));
+            }
+        }
+        self.require.sort();
+        self.require.dedup();
         for (i, t) in self.taints.iter().enumerate() {
             if t.key.is_empty() {
                 return Err(Invalid::new(
@@ -131,6 +151,50 @@ pub struct NodeStatus {
     /// availability is `drain`; registration keeps it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain: Option<DrainStatus>,
+    /// What `legion doctor` finds the host lacks, as the agent last
+    /// checked: its findings not met. Empty from agents that don't say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lacks: Vec<HostLack>,
+}
+
+/// A check of the node's host (`legion doctor`) found not met.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostLack {
+    /// The check's id: `module.pf`, `pf.anchors`, `zfs.root`, `racct`…
+    pub id: String,
+    /// `required` (the node takes no new tasks) or `advised`.
+    pub need: String,
+    /// `unmet`, `unsupported`, or `unknown` (it could not be read, which
+    /// says nothing against the host, and blocks nothing).
+    pub state: String,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remedy: Option<String>,
+}
+
+impl HostLack {
+    /// Found lacking, not merely unread.
+    pub fn found(&self) -> bool {
+        matches!(self.state.as_str(), "unmet" | "unsupported")
+    }
+}
+
+impl NodeStatus {
+    /// Why the node's host takes no new work (P1.1): a required check
+    /// found lacking, or one the node's spec requires (`spec.require`).
+    /// What runs there stays: the operator drains it to move it.
+    pub fn host_blocked(&self, spec: &NodeSpec) -> Option<String> {
+        self.blocking(spec)
+            .next()
+            .map(|l| format!("the host lacks {}: {}", l.id, l.detail))
+    }
+
+    /// Each of [`NodeStatus::lacks`] that keeps new work off.
+    pub fn blocking<'a>(&'a self, spec: &'a NodeSpec) -> impl Iterator<Item = &'a HostLack> {
+        self.lacks
+            .iter()
+            .filter(|l| l.found() && (l.need == "required" || spec.require.contains(&l.id)))
+    }
 }
 
 /// Where a node's drain stands, as the leader last saw it: what still
@@ -268,4 +332,76 @@ impl Platform {
 pub struct Capacity {
     pub cpu: Cpu,
     pub memory: Bytes,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lack(id: &str, need: &str, state: &str) -> HostLack {
+        HostLack {
+            id: id.to_owned(),
+            need: need.to_owned(),
+            state: state.to_owned(),
+            detail: format!("{id} is wanting"),
+            remedy: None,
+        }
+    }
+
+    fn status(lacks: Vec<HostLack>) -> NodeStatus {
+        NodeStatus {
+            platform: Platform {
+                os: "freebsd".into(),
+                arch: "amd64".into(),
+                linux: true,
+                no_limits: false,
+            },
+            lacks,
+            ..NodeStatus::default()
+        }
+    }
+
+    #[test]
+    fn a_required_check_found_lacking_blocks_new_work() {
+        let spec = NodeSpec::default();
+        assert_eq!(status(vec![]).host_blocked(&spec), None);
+        let s = status(vec![lack("pf.anchors", "required", "unmet")]);
+        assert_eq!(
+            s.host_blocked(&spec).as_deref(),
+            Some("the host lacks pf.anchors: pf.anchors is wanting")
+        );
+        let s = status(vec![lack("module.pf", "required", "unsupported")]);
+        assert!(s.host_blocked(&spec).is_some());
+        // Unread says nothing against the host.
+        let s = status(vec![lack("pf.anchors", "required", "unknown")]);
+        assert_eq!(s.host_blocked(&spec), None);
+    }
+
+    #[test]
+    fn an_advised_check_blocks_only_where_the_spec_requires_it() {
+        let s = status(vec![lack("forwarding", "advised", "unmet")]);
+        assert_eq!(s.host_blocked(&NodeSpec::default()), None);
+        let mut spec: NodeSpec = serde_json::from_value(serde_json::json!({
+            "require": ["forwarding", "forwarding"]
+        }))
+        .unwrap();
+        spec.admit().unwrap();
+        assert_eq!(spec.require, ["forwarding"]);
+        assert!(s.host_blocked(&spec).is_some());
+        for bad in ["", "Forwarding", "pf anchors"] {
+            let mut spec = NodeSpec {
+                require: vec![bad.to_owned()],
+                ..NodeSpec::default()
+            };
+            assert!(spec.admit().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_status_without_lacks_reads_as_before() {
+        let s: NodeStatus = serde_json::from_value(serde_json::json!({"state": "ready"})).unwrap();
+        assert!(s.lacks.is_empty());
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v.get("lacks").is_none());
+    }
 }

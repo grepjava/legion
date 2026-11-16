@@ -267,6 +267,24 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         for e in modules {
             tracing::warn!("loading kernel module {e}");
         }
+        // What the host lacks, with the modules loaded: the leader gives
+        // the node no new tasks while a requirement is unmet.
+        let root = ctx.zfs_root.clone();
+        let found =
+            task::blocking(&ctx.sys, move |sys| doctor::examine(sys, root.as_deref())).await;
+        status.lacks = doctor::lacks(&found);
+        for l in status
+            .lacks
+            .iter()
+            .filter(|l| l.found() && l.need == "required")
+        {
+            tracing::error!(
+                "the host lacks {}: {}; the node takes no new tasks until it is put right ({})",
+                l.id,
+                l.detail,
+                l.remedy.as_deref().unwrap_or("see legion doctor")
+            );
+        }
 
         // Other nodes learn the key and where to send from the node's status.
         let mut private_key = None;
@@ -321,11 +339,20 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             carp_held.clone(),
             carp_states.clone(),
         ));
+        // What the host lacks, checked again now and then for heartbeats to
+        // carry, so a host put right takes tasks without a restart.
+        let lacks: Lacks = Arc::default();
+        let host_checks = tokio::spawn(host_checks(
+            ctx.sys.clone(),
+            ctx.zfs_root.clone(),
+            lacks.clone(),
+        ));
         let heartbeats = tokio::spawn(heartbeats(
             heard.clone(),
             ctx.control.clone(),
             ctx.node.clone(),
             carp_states,
+            lacks,
             metrics::AgentMetrics {
                 runtime: ctx.runtime.clone(),
                 sys: ctx.sys.clone(),
@@ -445,6 +472,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         };
         if !loaded {
             heartbeats.abort();
+            host_checks.abort();
             carp_watch.abort();
             sessions.abort();
             for i in &ingress {
@@ -598,6 +626,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         // Dropping the senders ends each worker without touching its pod.
         forwarder.abort();
         heartbeats.abort();
+        host_checks.abort();
         carp_watch.abort();
         sessions.abort();
         for i in ingress {
@@ -1175,11 +1204,30 @@ async fn carp_watch(sys: Arc<dyn Sys>, held: CarpHeld, states: CarpStates) {
     }
 }
 
+/// What the host lacks, as last checked and not yet sent.
+type Lacks = Arc<std::sync::Mutex<Option<Vec<legion_api::node::HostLack>>>>;
+
+/// How often the host is checked again (`legion doctor`).
+const HOST_CHECK: Duration = Duration::from_secs(60);
+
+/// Checks the host every [`HOST_CHECK`], for the next heartbeat to carry
+/// what it lacks; carried each time, the leader writing only a change, so
+/// one lost on the way is sent again.
+async fn host_checks(sys: Arc<dyn Sys>, zfs_root: Option<String>, lacks: Lacks) {
+    loop {
+        tokio::time::sleep(HOST_CHECK).await;
+        let root = zfs_root.clone();
+        let found = task::blocking(&sys, move |sys| doctor::examine(sys, root.as_deref())).await;
+        *lacks.lock().unwrap_or_else(|e| e.into_inner()) = Some(doctor::lacks(&found));
+    }
+}
+
 async fn heartbeats<R: Runtime, C: Control>(
     heard: Arc<std::sync::Mutex<(tokio::time::Instant, Duration)>>,
     control: Arc<C>,
     node: String,
     carp: CarpStates,
+    lacks: Lacks,
     metrics: metrics::AgentMetrics<R>,
     usage_period: Duration,
 ) {
@@ -1199,7 +1247,12 @@ async fn heartbeats<R: Runtime, C: Control>(
         };
         let sent = tokio::time::Instant::now();
         let held = carp.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        match control.heartbeat(&node, usage, held, telemetry).await {
+        let checked = lacks.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let sending = checked.clone();
+        match control
+            .heartbeat(&node, usage, held, telemetry, sending)
+            .await
+        {
             Ok(p) => {
                 *heard.lock().unwrap_or_else(|e| e.into_inner()) = (sent, p);
                 if failing {
@@ -1209,6 +1262,13 @@ async fn heartbeats<R: Runtime, C: Control>(
                 period = p;
             }
             Err(e) => {
+                // Kept for the next, unless a newer check took its place.
+                if let Some(c) = checked {
+                    lacks
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_or_insert(c);
+                }
                 if !failing {
                     tracing::warn!("heartbeat: {e}");
                     failing = true;

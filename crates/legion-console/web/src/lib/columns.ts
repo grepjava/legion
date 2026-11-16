@@ -9,6 +9,25 @@ export interface Column {
 }
 
 const s = (v: unknown) => (v === undefined || v === null ? '' : String(v));
+
+export interface HostLack {
+  id: string;
+  need: string;
+  state: string;
+  detail: string;
+  remedy?: string;
+}
+
+/** What a node's host lacks that keeps new tasks off it: a required check
+ * found lacking, or one its spec requires (NodeStatus::blocking). */
+export function blocking(node: LObject): HostLack[] {
+  const required: string[] = node.spec?.require ?? [];
+  return ((node.status?.lacks ?? []) as HostLack[]).filter(
+    (l) =>
+      (l.state === 'unmet' || l.state === 'unsupported') &&
+      (l.need === 'required' || required.includes(l.id))
+  );
+}
 const labels = (m?: Record<string, string>) =>
   Object.entries(m ?? {})
     .map(([k, v]) => `${k}=${v}`)
@@ -27,7 +46,14 @@ export function columns(kind: string): Column[] {
           value: (o) =>
             o.status?.platform ? `${o.status.platform.os}/${o.status.platform.arch}` : ''
         },
-        { label: t('Address'), value: (o) => s(o.status?.addr) }
+        { label: t('Address'), value: (o) => s(o.status?.addr) },
+        {
+          label: t('Host'),
+          value: (o) => {
+            const ids = blocking(o).map((l) => l.id);
+            return ids.length ? t('lacks {ids}', { ids: ids.join(', ') }) : '';
+          }
+        }
       ];
     case 'Task':
       return [

@@ -457,6 +457,49 @@ impl DispatcherService {
         Err(Status::unavailable(format!("{key} keeps changing")))
     }
 
+    /// Writes what `node`'s host lacks to its status, if it changed.
+    async fn record_lacks(
+        &self,
+        node: &str,
+        lacks: Vec<legion_api::node::HostLack>,
+    ) -> Result<(), Status> {
+        let key = ObjectKey::new(Kind::Node, "", node);
+        for _ in 0..ATTEMPTS {
+            let Some(mut object) = self.get(&key)? else {
+                return Ok(());
+            };
+            let mut status: NodeStatus =
+                serde_json::from_value(object.status.clone()).map_err(internal)?;
+            if status.lacks == lacks {
+                return Ok(());
+            }
+            let blocked = |s: &NodeStatus| s.host_blocked(&Default::default()).is_some();
+            let (was, is) = (blocked(&status), {
+                let mut s = status.clone();
+                s.lacks.clone_from(&lacks);
+                blocked(&s)
+            });
+            status.lacks.clone_from(&lacks);
+            object.status = serde_json::to_value(&status).map_err(internal)?;
+            let precondition = Precondition::Version(object.metadata.version);
+            match self.write(object, precondition).await? {
+                Outcome::Written(_) => {
+                    if was != is {
+                        tracing::info!(
+                            %node,
+                            "the host {}",
+                            if is { "lacks what Legion requires: no new tasks" } else { "has what Legion requires again" }
+                        );
+                    }
+                    return Ok(());
+                }
+                Outcome::Conflict { .. } => continue,
+                other => return Err(unexpected(other)),
+            }
+        }
+        Err(Status::unavailable(format!("{key} keeps changing")))
+    }
+
     /// The node's subnet: the one it reserved before, or the lowest free one,
     /// reserved now. Reservations share one object, so two nodes registering
     /// at once conflict there rather than both taking the same subnet (their
@@ -1267,6 +1310,7 @@ impl Dispatcher for DispatcherService {
                 usage,
                 carp,
                 telemetry,
+                lacks_json,
                 ..
             } = req.into_inner();
             let mut forwarded = to_leader(
@@ -1275,6 +1319,7 @@ impl Dispatcher for DispatcherService {
                     usage,
                     carp,
                     telemetry,
+                    lacks_json,
                 },
                 &worker,
             )?;
@@ -1297,8 +1342,20 @@ impl Dispatcher for DispatcherService {
             usage: reported,
             carp,
             telemetry,
+            lacks_json,
             ..
         } = req.into_inner();
+        if let Some(json) = lacks_json {
+            match serde_json::from_slice::<Vec<legion_api::node::HostLack>>(&json) {
+                // Sent again with the next check if not written now.
+                Ok(lacks) => {
+                    if let Err(e) = self.record_lacks(&node, lacks).await {
+                        tracing::debug!(%node, "what the host lacks: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!(%node, "what the host lacks, unread: {e}"),
+            }
+        }
         self.api.balancers.record(
             &node,
             carp.into_iter()
@@ -1867,15 +1924,20 @@ pub(crate) fn endpoints(
         })
         .map(|n| n.metadata.name.as_str())
         .collect();
-    // Nodes that may hold load balancer addresses: ready and active.
+    // Nodes that may hold load balancer addresses: ready and active, with
+    // what the host requires (pf among it).
     let holders: Vec<&str> = nodes
         .values()
         .filter(|n| {
-            let ready = serde_json::from_value::<NodeStatus>(n.status.clone())
-                .is_ok_and(|s| s.state == NodeState::Ready);
-            let active = legion_api::parse::<legion_api::node::NodeSpec>(&n.spec)
-                .is_ok_and(|s| s.availability == legion_api::node::Availability::Active);
-            ready && active
+            let (Ok(status), Ok(spec)) = (
+                serde_json::from_value::<NodeStatus>(n.status.clone()),
+                legion_api::parse::<legion_api::node::NodeSpec>(&n.spec),
+            ) else {
+                return false;
+            };
+            status.state == NodeState::Ready
+                && spec.availability == legion_api::node::Availability::Active
+                && status.host_blocked(&spec).is_none()
         })
         .map(|n| n.metadata.name.as_str())
         .collect();

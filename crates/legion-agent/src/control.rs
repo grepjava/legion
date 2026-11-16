@@ -123,13 +123,15 @@ pub trait Control: Send + Sync + 'static {
     /// Tells the managers `node` is alive, with what its tasks use when
     /// read since the last heartbeat (by `namespace/task`) and the CARP
     /// state of each load balancer address it took up; returns how long to
-    /// wait before the next heartbeat.
+    /// wait before the next heartbeat. `lacks`, when the host was checked
+    /// since the last one: what `legion doctor` finds it lacks.
     fn heartbeat(
         &self,
         node: &str,
         usage: Vec<(String, TaskUsage)>,
         carp: Vec<(std::net::Ipv4Addr, String)>,
         telemetry: Option<NodeTelemetry>,
+        lacks: Option<Vec<legion_api::node::HostLack>>,
     ) -> impl Future<Output = Result<Duration, ControlError>> + Send;
 
     /// Sessions users open with the node's tasks, as any manager offers
@@ -778,6 +780,7 @@ impl Control for GrpcControl {
         usage: Vec<(String, TaskUsage)>,
         carp: Vec<(std::net::Ipv4Addr, String)>,
         telemetry: Option<NodeTelemetry>,
+        lacks: Option<Vec<legion_api::node::HostLack>>,
     ) -> Result<Duration, ControlError> {
         let usage = usage
             .into_iter()
@@ -820,6 +823,7 @@ impl Control for GrpcControl {
                     })
                     .collect(),
             }),
+            lacks_json: lacks.and_then(|l| serde_json::to_vec(&l).ok()),
         };
         let resp = self
             .call(|mut c| async move { c.heartbeat(req).await })

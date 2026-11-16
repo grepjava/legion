@@ -742,6 +742,35 @@ fn changes_are_logged_and_old_ones_ignored() {
 }
 
 #[test]
+fn a_host_lacking_what_it_requires_is_shown_and_logged() {
+    let mut m = cluster();
+    let at = legion_api::clock::parse("2026-10-30T09:30:05Z").unwrap();
+    let mut lacking = node("n2", 20, "ready", "active");
+    lacking.status["lacks"] = serde_json::json!([
+        { "id": "pf.anchors", "need": "required", "state": "unmet", "detail": "no hooks" },
+        { "id": "forwarding", "need": "advised", "state": "unmet", "detail": "off" }
+    ]);
+    m.changed(true, lacking.clone(), at);
+    let v = View::default();
+    let s = screen(&m, &v);
+    assert!(s.contains("ready, lacks pf.anchors"), "{s}");
+    assert!(!s.contains("lacks pf.anchors forwarding"), "{s}");
+    let mut put_right = node("n2", 21, "ready", "active");
+    put_right.status["lacks"] = serde_json::json!([
+        { "id": "forwarding", "need": "advised", "state": "unmet", "detail": "off" }
+    ]);
+    m.changed(true, put_right, at);
+    let log: Vec<&str> = m.log.iter().rev().map(|(_, s)| s.as_str()).collect();
+    assert_eq!(
+        log,
+        [
+            "node n2: the host lacks pf.anchors: no new tasks",
+            "node n2: the host has what it requires again",
+        ]
+    );
+}
+
+#[test]
 fn what_the_caller_may_not_read_says_so() {
     let mut m = Model::new(Some("shop".into()));
     m.listed(

@@ -140,6 +140,7 @@ Linux hosts, an ecosystem of tools and charts, or proven production use.
 | Feature | Legion | Docker Swarm | Kubernetes |
 |---|---|---|---|
 | Logs | `legion logs`, through any manager; a finished task's output is kept | `docker service logs` | `kubectl logs` |
+| Host readiness | Each agent runs `legion doctor`'s checks every minute; a node lacking a requirement (pf anchors, ZFS root, kernel modules, or what its spec requires) takes no new tasks | No | Node conditions and their taints |
 | Starting a workload from the command line | No: workloads are objects sent with `legion apply` or `legion stack deploy` | `docker service create`, and `docker run` on one node | `kubectl run`, `kubectl create deployment` |
 | Exec into a task | `legion exec`, through any manager | Only on the node (`docker exec`) | `kubectl exec` |
 | Port forwarding | `legion port-forward` | No | `kubectl port-forward` |

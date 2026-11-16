@@ -1225,9 +1225,10 @@ fn node_rows(model: &Model) -> Vec<TableRow> {
                 .iter()
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect();
+            let lacking: Vec<&str> = st.blocking(&spec).map(|l| l.id.as_str()).collect();
             let state = match st.state {
-                NodeState::Ready => fg(OK),
-                NodeState::Suspect => fg(WARN),
+                NodeState::Ready if lacking.is_empty() => fg(OK),
+                NodeState::Ready | NodeState::Suspect => fg(WARN),
                 NodeState::Down | NodeState::Unknown => fg(BAD),
             };
             let avail = match word(&spec.availability).as_str() {
@@ -1239,7 +1240,13 @@ fn node_rows(model: &Model) -> Vec<TableRow> {
             TableRow::new(
                 vec![
                     text(name),
-                    colored(format!("● {state_word}"), state),
+                    colored(
+                        match lacking.is_empty() {
+                            true => format!("● {state_word}"),
+                            false => format!("● {state_word}, lacks {}", lacking.join(" ")),
+                        },
+                        state,
+                    ),
                     colored(word(&spec.availability), avail),
                     text(word(&spec.role)),
                     text(running.to_string()),

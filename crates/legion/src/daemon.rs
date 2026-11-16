@@ -709,6 +709,8 @@ fn status(hostname: String, advertise: &str) -> NodeStatus {
         wireguard: None,
         // The leader's, kept by registration.
         drain: None,
+        // Filled in by the agent, from legion doctor's checks.
+        lacks: Vec::new(),
     }
 }
 

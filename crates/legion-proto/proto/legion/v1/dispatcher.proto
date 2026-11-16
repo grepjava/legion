@@ -199,6 +199,10 @@ message HeartbeatRequest {
   repeated CarpState carp = 3;
   // Node-level ZFS pool/volume space and host network throughput.
   optional NodeTelemetry telemetry = 4;
+  // What the node's host lacks, as legion doctor finds it: a JSON array of
+  // legion_api::node::HostLack. Sent when the agent checked since its last
+  // heartbeat; the leader writes it to the Node's status when it changed.
+  optional bytes lacks_json = 5;
 }
 
 message NodeTelemetry {

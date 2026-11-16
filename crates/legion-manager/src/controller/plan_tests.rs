@@ -1655,6 +1655,70 @@ fn limited_pods_go_where_limits_hold() {
 }
 
 #[test]
+fn a_host_lacking_what_it_requires_takes_no_new_tasks() {
+    use legion_api::node::HostLack;
+    let lack = |id: &str, need: &str| HostLack {
+        id: id.to_owned(),
+        need: need.to_owned(),
+        state: "unmet".to_owned(),
+        detail: "wanting".to_owned(),
+        remedy: None,
+    };
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.service(
+        "web",
+        &format!(
+            "replicas: 2
+{POD}"
+        ),
+    );
+    w.settle();
+    assert_eq!(w.placed("web"), ["n1", "n2"]);
+
+    // What runs there stays; new tasks go elsewhere.
+    w.node_mut("n1").status.lacks = vec![lack("pf.anchors", "required")];
+    w.service(
+        "api",
+        &format!(
+            "mode: global
+{POD}"
+        ),
+    );
+    w.settle();
+    assert_eq!(w.placed("web"), ["n1", "n2"]);
+    assert_eq!(w.placed("api"), ["n2"]);
+
+    // An advised check warns, unless the node's spec requires it.
+    w.node_mut("n1").status.lacks = vec![lack("forwarding", "advised")];
+    w.settle();
+    assert_eq!(w.placed("api"), ["n1", "n2"]);
+    w.node_mut("n2").status.lacks = vec![lack("forwarding", "advised")];
+    w.node_mut("n2").spec.require = vec!["forwarding".to_owned()];
+    w.service(
+        "one",
+        &format!(
+            "replicas: 1
+placement: {{ constraints: [\"node.name == n2\"] }}
+{POD}"
+        ),
+    );
+    w.settle();
+    assert!(w.placed("one").is_empty());
+    let pending = w.tasks.iter().find(|t| t.spec.service == "one").unwrap();
+    assert_eq!(
+        pending.status.message,
+        "no node can run it: 1 constraints, 1 the host lacks what it requires (legion doctor)"
+    );
+
+    // Put right, it takes them.
+    w.node_mut("n2").status.lacks.clear();
+    w.settle();
+    assert_eq!(w.placed("one"), ["n2"]);
+}
+
+#[test]
 fn tasks_go_where_their_volume_is() {
     let mut w = World::new();
     w.node("n1", &[]);
