@@ -681,6 +681,7 @@
                 <!-- What it runs, by its product's mark. -->
                 <path
                   class="logo"
+                  style:fill="light-dark({logo.light}, {logo.dark})"
                   d={logo.path}
                   transform="translate({X_SVC_CX - 11} {cy - 11}) scale({22 / 24})"
                 ><title>{logo.title}</title></path>

@@ -685,7 +685,8 @@ Added 2026-11-16, in the console's own look:
   every other, two of them included.
 - *A service's circle shows what it runs*: the product's logo (nginx,
   PostgreSQL, Node, Redis and some thirty others, from Simple Icons,
-  CC0), matched on its name and image; a VM shows a monitor, an unknown
+  CC0) in its brand colour, darkened or lightened to stand 4.5:1 in either
+  theme, matched on its name and image; a VM shows a monitor, an unknown
   database a cylinder, anything else a jail's cube. Apps on Node (Express,
   Koa, Fastify, Nest, Next and the like) show Node's logo, called Node.
 - *A new page starts at the top*, and Back returns to where the page
