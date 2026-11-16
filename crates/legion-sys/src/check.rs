@@ -36,6 +36,36 @@ pub enum State {
     Unsupported,
 }
 
+/// How `legion doctor` and `legion local doctor` label a finding: `FAIL`
+/// for one unmet that what was asked needs, `warn` or `unsupported` for
+/// one it can do without.
+pub fn label(state: State, needed: bool) -> &'static str {
+    match (state, needed) {
+        (State::Met, _) => "ok",
+        (State::Unknown, _) => "unknown",
+        (_, true) => "FAIL",
+        (State::Unsupported, false) => "unsupported",
+        (State::Unmet, false) => "warn",
+    }
+}
+
+/// A finding as both doctors print it: its label, id and detail, and its
+/// remedy below them.
+pub fn line(label: &str, id: &str, detail: &str, remedy: &str) -> String {
+    let mut out = format!(
+        "{label:<12}{id:<20}{detail}
+"
+    );
+    if !remedy.is_empty() {
+        out += &format!(
+            "{:<32}fix: {remedy}
+",
+            ""
+        );
+    }
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finding {
     /// Stable: `racct`, `forwarding`, `module.pf` and so on.

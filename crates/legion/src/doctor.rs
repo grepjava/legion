@@ -8,7 +8,7 @@ use anyhow::Result;
 use legion_agent::doctor::ready;
 use legion_agent::doctor::{Entry, Need, examine, verdict};
 use legion_sys::Sys;
-use legion_sys::check::State;
+use legion_sys::check::{self, State, line};
 
 fn text(found: &[Entry]) -> String {
     let mut out = String::new();
@@ -25,22 +25,7 @@ fn text(found: &[Entry]) -> String {
 }
 
 fn label(state: State, need: Need) -> &'static str {
-    match (state, need) {
-        (State::Met, _) => "ok",
-        (State::Unknown, _) => "unknown",
-        (_, Need::Required) => "FAIL",
-        (State::Unsupported, Need::Advised) => "unsupported",
-        (State::Unmet, Need::Advised) => "warn",
-    }
-}
-
-/// A finding's line, and its remedy's below it.
-fn line(label: &str, id: &str, detail: &str, remedy: &str) -> String {
-    let mut out = format!("{label:<12}{id:<20}{detail}\n");
-    if !remedy.is_empty() {
-        out += &format!("{:<32}fix: {remedy}\n", "");
-    }
-    out
+    check::label(state, need == Need::Required)
 }
 
 /// `legion diagnose`: each node's findings, as `legion doctor` says them

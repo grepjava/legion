@@ -195,15 +195,6 @@ pub fn examine(sys: &dyn Sys, host: &Host, operations: &[Operation]) -> Report {
     Report { operations, checks }
 }
 
-fn state_name(state: State) -> &'static str {
-    match state {
-        State::Met => "ok",
-        State::Unmet => "unmet",
-        State::Unknown => "unknown",
-        State::Unsupported => "unsupported",
-    }
-}
-
 fn operation_name(operation: Operation) -> &'static str {
     match operation {
         Operation::Build => "build",
@@ -227,27 +218,19 @@ pub fn text(report: &Report) -> String {
         out.push_str(&format!("{:<8}{status}\n", operation_name(o.name)));
     }
     out.push('\n');
-    let width = report
-        .checks
-        .iter()
-        .map(|c| c.finding.id.len())
-        .max()
-        .unwrap_or(0);
     for c in &report.checks {
         let f = &c.finding;
-        out.push_str(&format!(
-            "{:<12}{:<width$}  {}\n",
-            state_name(f.state),
-            f.id,
-            f.detail
-        ));
+        let label = check::label(f.state, !c.required_for.is_empty());
+        let remedy = match f.state {
+            State::Met => "",
+            _ => f.remedy.as_deref().unwrap_or(""),
+        };
+        out.push_str(&check::line(label, &f.id, &f.detail, remedy));
         if f.state != State::Met {
-            if let Some(remedy) = &f.remedy {
-                out.push_str(&format!("{:12}fix: {remedy}\n", ""));
-            }
             let needed: Vec<_> = c.required_for.iter().map(|&o| operation_name(o)).collect();
             out.push_str(&format!(
-                "{:12}{}\n",
+                "{:32}{}
+",
                 "",
                 if needed.is_empty() {
                     "optional: Legion sees to it when it can".to_owned()
