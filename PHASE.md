@@ -4,8 +4,10 @@ Where Legion stands against the roadmap in [docs/DESIGN.md](docs/DESIGN.md)
 (section 11). The design says what to build and why; this file says what is
 done and what comes next. Update it in the same commit as the work.
 
-Current work: **hardening** for real use, after phase 5 (phases 1 to 4
-met their exit criteria; phase 5's features are built, bhyve as a spike).
+Current work: **none scheduled**. Phases 1 to 4 met their exit criteria,
+phase 5's features are built (bhyve since as VM pods), and the hardening is
+done, ROADMAP.md's milestones with it (PLAN.md's phases 1 to 9). Since
+v0.1.19 the work has been the web console ([CONSOLE.md](CONSOLE.md)).
 
 ## Phase 0 — Spikes
 
@@ -1564,8 +1566,18 @@ container with `vm` booted with bhyve on the pod's network; and jailer's
 multi-arch index, each node running its own platform's image; and the
 first part of a web console (CONSOLE.md phase 1, `--console-listen`,
 `legion console login`): read-only, live, as the signed-in user. The
-port's `distinfo` is
-made for v0.1.13, and its crates are v0.1.9's, but it has not been through
-`poudriere testport` since v0.1.9. Waiting on the user: the port's
+port's `distinfo` and crates are made for v0.1.19, but it has not been
+through `poudriere testport` since v0.1.9. Waiting on the user: the port's
 submission, once their FreeBSD Bugzilla account exists.
+
+Since v0.1.19, not yet tagged: the web console's phases 2 to 6
+(CONSOLE.md): editing and deploying, alerts and usage history, log search,
+deploy forms, compose import and templates, topology, settings, single
+sign-on, several clusters, translations, plugins and accessibility checks;
+image builds on builder nodes (`Build`, with jailer); restart, run now,
+events per object and the load balancer's holder; the console's new look
+and `legion top`'s layouts; and what a desktop container tool offers
+(CONSOLE.md): stop and start, port links, image details and scans, disk
+usage, diagnostics and support bundles, files, and stacks. The lab's
+console test (`the_console_runs_the_cluster`) passes at 243ddc7. Pausing a task is not built.
 

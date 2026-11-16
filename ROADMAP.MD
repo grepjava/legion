@@ -1,11 +1,17 @@
 # Legion development roadmap
 
-Updated: 8 November 2026. Baseline: workspace version 0.1.15.
+Updated: 16 November 2026. Baseline: v0.1.19, and the web console's work
+since ([PHASE.md](PHASE.md)). First written 8 November 2026 at 0.1.15.
 
 This roadmap proposes future work based on a source review. It does not
 certify runtime behavior or replace the historical implementation tracker
 in [PHASE.md](PHASE.md). Priorities are recommendations, not release or
 delivery commitments.
+
+**Status:** every milestone below is done, through
+[PLAN.md](PLAN.md)'s phases 1 to 9. Each ends with what was built, in which
+release, and where its evidence is. What remains is under
+[What is left](#what-is-left).
 
 ## Direction
 
@@ -81,6 +87,14 @@ Starting points: `.github/workflows/ci.yml`,
 `crates/legion-jail/tests/live.rs`, `crates/legion-net/tests/live.rs`,
 `crates/legion/tests/cluster.rs`, `crates/legion/tests/stateful.rs`.
 
+Status: done. `scripts/lab` runs the qualification manifest
+(`scripts/legion.qualify`) on three disposable FreeBSD VMs, reset for each
+run; a skipped test is a result, not a pass, and every run checks for
+leftovers. v0.1.13 was the first release with every test in the manifest
+run, multi-host ones included; [docs/RELEASING.md](docs/RELEASING.md) is
+the checklist. The hosts are VMs (QEMU under WSL2), not real hardware, and
+arm64 is not in qualification (PLAN.md, decisions 1 and 2).
+
 ### P0.2 — Explicit partition and storage-ownership guarantees
 
 Scope: multi-host safety.
@@ -119,6 +133,16 @@ Starting points: `crates/legion-manager/src/controller/plan.rs`,
 `crates/legion-manager/src/dispatcher.rs`,
 `crates/legion-agent/src/control.rs`.
 
+Status: done in v0.1.15
+([docs/PARTITIONS.md](docs/PARTITIONS.md)): fail-open by default, with
+`onPartition: stop` for pods that must never run twice; a leader cut off
+from the majority answers no heartbeats; a Volume used one node at a time
+stays held by an orphaned task until its node says the task stopped.
+Tested with a node's link going silent and a reply lost (a `test-hooks`
+fault), on the lab. Fencing exclusive storage is a stated operator
+procedure, not a mechanism: removing a node is the operator's word that it
+has stopped.
+
 ### P1.1 — Host diagnostics and actionable readiness
 
 Scope: single-host deployment first; reuse results across the cluster.
@@ -150,6 +174,11 @@ an optional feature failure without an explicit policy.
 Starting points: `crates/legion/src/cli.rs`,
 `crates/legion-agent/src/lib.rs`, `crates/legion-sys/src/lib.rs`,
 `crates/legion-net/src/lb.rs`.
+
+Status: done in v0.1.13: `legion doctor`, its checks in a crate shared
+with jailer, text or JSON, nonzero when a requirement is unmet. Since
+v0.1.19, `legion diagnose` and the console's Diagnostics page run it on
+every node. The follow-up, readiness gating scheduling, is not built.
 
 ### P1.2 — Drain completion barrier for automated maintenance
 
@@ -207,6 +236,10 @@ Starting points: `crates/legion/src/cli.rs`,
 `crates/legion-manager/src/controller/plan/migrate.rs`,
 `crates/legion-agent/src/volumes.rs`.
 
+Status: done in v0.1.15: the drain status (`legion node drain --wait`),
+per task and Volume, with what blocks it and what a transfer cut short
+or a source cut off does to it (docs/PARTITIONS.md).
+
 ### P1.3 — Reproducible image deployment
 
 Scope: both single-host and cluster deployment correctness.
@@ -240,6 +273,10 @@ Starting points: `crates/legion-image/src/registry.rs`,
 `crates/legion-image/src/store.rs`, `crates/legion-api/src/task.rs`,
 `crates/legion-agent/src/task.rs`.
 
+Status: done in v0.1.14: the leader resolves a tag once, at deployment,
+with the namespace's pull secret (PLAN.md, decision 4); every node runs
+the digests it recorded, and a rollback runs the old ones.
+
 ### P1.4 — Recovery and upgrade qualification
 
 Scope: control state, credentials and workload data as separate concerns.
@@ -269,6 +306,13 @@ Starting points: `crates/legion-store/src/backup.rs`,
 `crates/legion-agent/src/transfer.rs`, `crates/legion-manager/src/migrate.rs`,
 `packaging/freebsd/`.
 
+Status: done. v0.1.15: the version handshake, the upgrade drill from
+v0.1.14, and `legion volume backup` and `restore` (crash-consistent, apart
+from the control state's backup). v0.1.16: a Volume's move cut short at
+each stage, or held by a full disk, loses nothing; the restore drill
+rebuilds Postgres on replacement hosts from its backups, every stage
+timed (511 s on the lab).
+
 ### P2.1 — Image trust and security lifecycle
 
 Scope: deployment admission and administrative accountability.
@@ -294,6 +338,13 @@ Acceptance:
 Dependencies: P1.3 for stable image identities. Keep verification policy
 separate from image building; do not invent cryptographic formats.
 
+Status: done but for SBOM and provenance, which nothing has asked for
+yet. v0.1.17: `ImagePolicy`, cosign key-pair signatures checked as the
+leader resolves a pod, enforced or warned, with jailer signing through the
+same module. v0.1.18: revocation of users, workers and managers across
+followers, renewal and open streams; the audit trail (`legion audit`).
+v0.1.19: the cluster CA rotated in place (`legion ca rotate`).
+
 ### P2.2 — Compatibility and adoption
 
 Scope: predictable application delivery.
@@ -316,6 +367,12 @@ Acceptance:
 
 Dependencies: P0.1 qualification infrastructure. Preserve the companion
 builder boundary instead of creating another build subsystem in Legion.
+
+Status: done in v0.1.18: jailer's image from build to recovery in one
+lab test, [docs/COMPOSE.md](docs/COMPOSE.md),
+[docs/LINUX.md](docs/LINUX.md), the examples in `examples/` and limits
+measured. The host's firewall requirements are in the README (the pf
+anchors) and checked by `legion doctor`.
 
 ### P3 — Measured scaling and optional extensions
 
@@ -369,32 +426,38 @@ clusters Legion is for. What is known, so the work starts quickly then:
     fall back to the full comparison, or a new defaulted field in a later
     version rolls every task on upgrade.
 
-Consider the following only with a concrete user requirement:
+The optional extensions were built in v0.1.19, at the user's request
+(12 November 2026):
 
-- Scheduling affinity/anti-affinity, priorities and preemption.
-- External load-balancer and additional storage integrations.
-- In-place manager promotion/demotion.
-- VM workloads through bhyve as a separate optional backend.
-- Additional connectivity options for nodes behind different NATs.
+- Affinity and anti-affinity between services, priorities and preemption.
+- Load-balancer addresses held with CARP by one ready node
+  (`endpoint.loadBalancer`), for an outside load balancer or clients.
+- `legion node promote` and `demote`, a node changing role in place.
+- VM pods: a container with `vm` booted with bhyve on the pod's network.
+- Relays for nodes behind different NATs (`--mesh-nat`, `--mesh-relay`).
 
-These are product-scope decisions, not prerequisites for a useful local
-jail manager or small cluster.
+Additional storage integrations were not taken up.
 
-## Smallest useful next implementation
+Status: measured in v0.1.19 ([docs/MEASURE.md](docs/MEASURE.md)); the
+planner and pf were made faster for what that showed. Scaling past the
+measured sizes is parked, as above.
 
-Implement the read-only `legion doctor` slice from P1.1: RACCT, PF anchor
-hooks, forwarding and configured ZFS-root checks, with text/JSON output
-and meaningful exit status. Reuse existing checks and test through fakes.
-Leave automated host remediation and scheduler changes for a later change.
+## What is left
 
-P0 qualification and partition-safety work remain the highest-risk
-priorities; the diagnostic command is the smallest independently useful
-implementation, not a substitute for those milestones.
+- The FreeBSD port's submission, waiting on the user's Bugzilla account.
+  The port is made for v0.1.19 but has not been through
+  `poudriere testport` since v0.1.9.
+- A release of the work since v0.1.19 (PHASE.md).
+- Scaling past the measured sizes (P3), parked until a user needs it.
+- From the milestones: readiness gating scheduling (P1.1's follow-up),
+  SBOM and provenance (P2.1), further storage integrations (P3), arm64
+  and real hardware in qualification (P0.1).
+- In the web console: pausing a task (CONSOLE.md).
 
 ## Documentation maintenance
 
-- Correct `docs/COMPARISON.md`: ACME is implemented, and certificate
-  revocation claims must account for removed-worker rejection.
+- Keep `docs/COMPARISON.md` to what is built (corrected 16 November
+  2026: ACME, revocation by removal, CA rotation and the P3 extensions).
 - Keep historical phase entries clearly historical, particularly the
   former Podman runtime architecture.
 - Record evidence for completed milestones, including privileged test

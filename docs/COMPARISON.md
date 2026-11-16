@@ -24,7 +24,7 @@ what is built today, not what is planned.
 | Configuration | YAML objects, or compose files as stacks | Compose files, `docker service` flags | YAML objects, Helm charts, operators |
 | Extensible API | No (fixed kinds) | No | Yes (CRDs, operators, webhooks) |
 | Scale it is built for | Up to 256 nodes (one /24 of the pod network each) and about 20,000 tasks | Hundreds of nodes | Thousands of nodes |
-| Maturity | New; first release (v0.1.0), not used in production | Mature, in maintenance | Mature, very widely used |
+| Maturity | New (v0.1.19), qualified on FreeBSD VMs, not used in production | Mature, in maintenance | Mature, very widely used |
 
 Choose Legion to run services on FreeBSD hosts with ZFS, pf and jails,
 without assembling a stack of components. Choose Swarm or Kubernetes for
@@ -37,13 +37,13 @@ Linux hosts, an ecosystem of tools and charts, or proven production use.
 | Set-up | `legion init`; `legion join <token>` | `docker swarm init`; `docker swarm join` | kubeadm, a distribution, or a managed service |
 | Cluster store | Raft (openraft) built into the daemon, on redb | Raft built into the engine | etcd, a separate process |
 | Join tokens | Separate worker and manager tokens; the token holds the CA's digest | Same | Bootstrap tokens (kubeadm) |
-| Cluster CA and node certificates | Built in; renewed automatically | Built in; rotated automatically | kubeadm creates them; kubelet client certificates rotate |
-| Revoking a node's certificate | No (valid until it expires) | No | No (certificates expire; remove RBAC rights) |
+| Cluster CA and node certificates | Built in; renewed automatically; the CA rotated in place with `legion ca rotate` | Built in; rotated automatically | kubeadm creates them; kubelet client certificates rotate |
+| Revoking a node's certificate | Removing the node refuses its certificates, a manager's too; not one certificate by itself | No | No (certificates expire; remove RBAC rights) |
 | Store encrypted at rest | Always | Always (Raft log) | Optional (`EncryptionConfiguration`, per resource type) |
 | Locking the managers' keys | `legion autolock`; `legion unlock` after a restart | `docker swarm --autolock`; `unlock` | No |
 | Backup and restore | `legion backup`; offline `legion restore` | Copy `/var/lib/docker/swarm` offline | etcd snapshot and restore |
 | Floating API address | Built in (CARP, `--vip`) | No (external load balancer) | No (external load balancer or keepalived) |
-| Promoting and demoting managers | No (the role comes from the join token) | `docker node promote`, `demote` | Not applicable (control-plane nodes are set up as such) |
+| Promoting and demoting managers | `legion node promote`, `demote` | `docker node promote`, `demote` | Not applicable (control-plane nodes are set up as such) |
 | Node health | Heartbeats every 2 s; `suspect` after 6 s takes its tasks out of load balancing; `down` after 16 s replaces them | Heartbeats; down after missed heartbeats | Node leases; tasks evicted after a timeout (5 min by default) |
 | Drain and pause | `legion node drain`, `pause`, `activate` | `docker node update --availability` | `kubectl drain`, `cordon`, `uncordon` |
 
@@ -66,7 +66,7 @@ Linux hosts, an ecosystem of tools and charts, or proven production use.
 | Probes | Startup, liveness and readiness: exec, TCP, HTTP, gRPC | One healthcheck (exec) | Startup, liveness and readiness: exec, TCP, HTTP, gRPC |
 | Restart policy | `any`, `on-failure`, `none`, with delay and attempts | Same | Always, OnFailure, Never |
 | Private registries | `imagePullSecrets` | `--with-registry-auth` | `imagePullSecrets` |
-| Building images | No: jailer, made for Legion, or buildah or Podman on FreeBSD ([IMAGES.md](IMAGES.md)) | `docker build` | No (external tools) |
+| Building images | `Build` objects, run with jailer on nodes labelled `legion.builder=true`; or jailer, buildah or Podman by hand ([IMAGES.md](IMAGES.md)) | `docker build` | No (external tools) |
 | Linux images | Run through FreeBSD's Linux layer (`linux64`) on nodes started with `--linux`, not on a Linux kernel | Native | Native |
 
 ## Scheduling
@@ -77,10 +77,10 @@ Linux hosts, an ecosystem of tools and charts, or proven production use.
 | Nodes without enforceable limits | Pods with limits are not placed on them (no `kern.racct`) | Not applicable | Not applicable |
 | Constraints on node labels and attributes | Yes | Yes | nodeSelector, node affinity |
 | Spreading over a label (such as zone) | `spread` preferences, nested | `--placement-pref spread` | topologySpreadConstraints |
-| Affinity and anti-affinity between pods | No | No | Yes |
+| Affinity and anti-affinity between pods | Between services: `placement.affinity` and `antiAffinity`, required or preferred | No | Yes |
 | Taints and tolerations | `NoSchedule`, `PreferNoSchedule`, `NoExecute` | No | Yes |
 | Most replicas per node | No (spread one per node by default) | `--replicas-max-per-node` | Through spread constraints or anti-affinity |
-| Priority and preemption | No | No | PriorityClass |
+| Priority and preemption | A service's `priority`; a task that fits nowhere stops lower ones | No | PriorityClass |
 
 ## Networking
 
@@ -94,13 +94,13 @@ Linux hosts, an ecosystem of tools and charts, or proven production use.
 | Service DNS | `<svc>`, `<svc>.<ns>`, `<svc>.<ns>.legion`, AAAA too | Service names on shared networks | `<svc>.<ns>.svc.cluster.local` |
 | Publishing a port on every node | `publish: ingress` (routing mesh) | Ingress routing mesh | NodePort |
 | Publishing on the node running the task | `publish: host` | `mode=host` | hostPort |
-| External load balancer integration | No | No | LoadBalancer Services (cloud or MetalLB) |
+| External load balancer integration | An address on the nodes' network held by one ready node with CARP (`endpoint.loadBalancer`), as MetalLB's layer 2 mode | No | LoadBalancer Services (cloud or MetalLB) |
 | HTTP routing by host and path | `Route` objects, served by a proxy in the agent; HTTPS by SNI from Secrets | No | Ingress or Gateway API, with a controller (add-on) |
 | HTTP/2 to backends | No | Not applicable | Depends on the controller |
 | Automatic certificates (ACME) | Yes, for `Route` objects, from Let's Encrypt | Not applicable | Depends on the controller |
 | Namespace isolation by default | Yes (a namespace's tasks reach only each other, unless `open`) | Through separate networks | No (everything reaches everything) |
 | Network policy | Ingress and egress by namespace, labels, ports and CIDR; enforced by pf | No | NetworkPolicy, enforced by the CNI plugin |
-| Nodes behind NAT | Workers, reached through their keepalives; not two nodes behind different NATs | Needs reachable addresses | Depends on the CNI plugin |
+| Nodes behind NAT | Workers, reached through their keepalives; two behind NATs through a relay node (`--mesh-nat`, `--mesh-relay`); managers need a reachable address | Needs reachable addresses | Depends on the CNI plugin |
 
 ## Storage
 
@@ -145,7 +145,7 @@ Linux hosts, an ecosystem of tools and charts, or proven production use.
 | Port forwarding | `legion port-forward` | No | `kubectl port-forward` |
 | Watching objects | `legion watch` | `docker events` | `kubectl get --watch` |
 | Live view in the terminal | `legion top`: every kind of object, CPU and memory with graphs, details and YAML, a log of changes, and keys to drain, scale, roll back, move, delete, follow logs and open shells | `docker stats` (one node), `docker service ps` | `kubectl top`; k9s and others, separately |
-| Web UI | No; a Grafana dashboard for its metrics | No; Portainer and others, separately | The Kubernetes Dashboard, an add-on |
+| Web UI | Built in (`--console-listen`): every kind of object, deploying, logs, shells, files, image details and scans, alerts, usage, topology, as the signed-in user; a Grafana dashboard for its metrics | No; Portainer and others, separately | The Kubernetes Dashboard, an add-on |
 | Metrics | Prometheus endpoint: cluster state, and each container's CPU, memory and I/O; a Grafana dashboard | Engine metrics endpoint | metrics-server, kube-state-metrics, cAdvisor in kubelet |
 | Packaging | rc.d script under daemon(8), newsyslog entry, release tarballs built by a script, a FreeBSD port (not yet in the ports tree); release tarballs for amd64 on GitHub | Distribution packages | Distribution packages, many installers |
 | Running containers by hand beside the cluster | Yes; Legion touches only its own jails and pf anchors | Yes | Not recommended |
@@ -159,13 +159,15 @@ planning soon:
   Linux layer does not provide.
 - Custom resources, operators, admission webhooks, Helm or the Kubernetes
   API (non-goals; see [DESIGN.md](DESIGN.md) §2).
-- Custom roles, pod affinity and anti-affinity, priorities and preemption.
-- Integration with external load balancers.
-- Revoking one certificate by itself: a worker's certificates stop working
-  when its node is removed, and a user's access goes with their RoleBindings.
-- Promoting or demoting managers after they join.
-- A relay for nodes that are both behind NAT, and IPv6 NAT to the outside.
-- Virtual machines as tasks: bhyve was tried but is not a runtime yet.
+- Custom roles.
+- Integration with cloud load balancers (a `loadBalancer` address is held
+  on the nodes' own network).
+- Revoking one certificate by itself: a node's certificates stop working
+  when it is removed, a user's access goes with their RoleBindings, and
+  `legion ca rotate` replaces every certificate at once.
+- Managers behind NAT, and IPv6 NAT to the outside.
+- A virtual machine sharing its pod with other containers: a VM is its
+  pod's only container.
 
 ## CBSD and BastilleBSD
 
@@ -195,7 +197,7 @@ problem from Legion:
 | Networking | Cluster-wide routed VNET (`/24` per node over an automatic WireGuard mesh, dual-stack IPv6), `pf` Service VIPs, ingress routing mesh, built-in DNS (`<svc>.<ns>.legion`), L7 `Route` proxy and `NetworkPolicy` | Host bridges, VNET/`epair`, shared IP, NAT helpers; cross-host overlays configured externally | Shared IP (`lo1` with `pf` rdr), VNET (`epair` and bridge) or interface binding on the host |
 | Storage | Required ZFS pool (`--zfs-root`): OCI layer clones, quota-enforced ZFS volumes, `zfs send` on drain or `volume move`, stateful pre-update snapshots, NFS and iSCSI | ZFS datasets and zvols, UFS, `md`, NFS/Gluster/Ceph helpers | ZFS datasets or UFS directories with `nullfs` mounts |
 | Multi-tenancy and security | Namespaces, per-user client certificates and RBAC (`view`, `edit`, `admin`), namespace quotas, hardened default jail profile (`securelevel 2`, no raw sockets or mounts) | Host root/operator tool; per-jail `rctl` limits, sysctls and `devfs` rulesets | Host root/operator tool; per-jail `rctl` limits and `jail.conf` settings |
-| Observability | `legion top` cluster TUI, Prometheus metrics endpoint, `legion logs`, `exec` and `port-forward` through any manager | `cbsd jstatus`, TUI dialogs, optional Prometheus exporter | `bastille list`, `bastille top` (wraps host `top`/`jls`) |
+| Observability | Web console and `legion top` cluster TUI, Prometheus metrics endpoint, `legion logs`, `exec` and `port-forward` through any manager | `cbsd jstatus`, TUI dialogs, optional Prometheus exporter | `bastille list`, `bastille top` (wraps host `top`/`jls`) |
 
 Choose **Legion** to run replicated, self-healing services from OCI images
 or Compose files across one or more FreeBSD 15 hosts with built-in

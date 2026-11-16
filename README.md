@@ -18,8 +18,13 @@ OCI registry. Legion also runs images made by buildah or Podman.
 Status: phases 1 (single node), 2 (cluster), 3 (K8s-lite: namespaces, RBAC,
 network policy, quotas, jobs, security profiles, metrics), 4 (stateful
 services and operations) and 5 (Legion's own jail runtime, Linux images,
-IPv6, network volumes) are done; it is being hardened for real use.
-[PHASE.md](PHASE.md) tracks what is built and what is next.
+IPv6, network volumes) are done, and so is the hardening in
+[ROADMAP.MD](ROADMAP.MD): every test qualified on disposable FreeBSD VMs,
+partitions and drains with stated guarantees, deployments pinned to
+digests, recovery drills, image signatures, revocation and an audit trail.
+A web console (`legion daemon --console-listen`, [CONSOLE.md](CONSOLE.md))
+runs the cluster from a browser as the signed-in user. [PHASE.md](PHASE.md)
+tracks what is built and what is next.
 
 Sizes measured: the planner up to 200 nodes, 1,000 services and 5,000
 tasks (78 ms a pass); a node's pf up to 2,000 services (a service added

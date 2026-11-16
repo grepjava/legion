@@ -728,7 +728,7 @@ binary serves it.
 | Linux images | Via `linux64` on nodes started with `--linux`, which placement selects with `node.platform.linux == true` (6.6). | 5 |
 | IPv6 dual-stack | Every pod, VIP and node address has an IPv6 twin in a ULA range, with routes, WireGuard peers, pf rules and tables, DNS AAAA and policy for both families (5.7). | 5 |
 | Volume drivers | `driver: nfs`, `iscsi` (UFS on a LUN, one node at a time) or `plugin` (an executable on the node), beside ZFS (6.7). | 5 |
-| bhyve tasks | `runtime: bhyve` for workloads that need their own kernel. Spiked (6.8): a guest on a tap is a pod to the network; the runtime is not built. | 5 (exploratory) |
+| bhyve tasks | A container with `vm: { cpus, memory, boot }` is a bhyve virtual machine, its pod's only container, on the pod's network through a tap (6.8). | 5 (spike), P3 |
 
 ---
 
