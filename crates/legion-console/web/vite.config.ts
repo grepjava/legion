@@ -2,6 +2,11 @@ import adapter from '@sveltejs/adapter-static';
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
 
+// `npm run dev` against a manager's console, e.g. CONSOLE=https://127.0.0.1:7480.
+// The manager refuses a request whose Origin is not its own host, so the
+// proxy says it comes from there: the dev server stands in for the page.
+const target = process.env.CONSOLE;
+
 export default defineConfig({
   plugins: [
     // A single-page app: every path gets index.html, whose router takes it.
@@ -9,8 +14,25 @@ export default defineConfig({
       adapter: adapter({ pages: '../dist', assets: '../dist', fallback: 'index.html', strict: false })
     })
   ],
-  // `npm run dev` against a manager's console, e.g. CONSOLE=https://127.0.0.1:7480
-  server: process.env.CONSOLE
-    ? { proxy: { '/api': { target: process.env.CONSOLE, secure: false, ws: true } } }
+  server: target
+    ? {
+        proxy: {
+          '/api': {
+            target,
+            secure: false,
+            ws: true,
+            changeOrigin: true,
+            configure: (proxy) => {
+              const origin = new URL(target).origin;
+              proxy.on('proxyReq', (req) => {
+                if (req.getHeader('origin')) req.setHeader('origin', origin);
+              });
+              proxy.on('proxyReqWs', (req) => {
+                if (req.getHeader('origin')) req.setHeader('origin', origin);
+              });
+            }
+          }
+        }
+      }
     : undefined
 });
