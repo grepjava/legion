@@ -605,6 +605,41 @@ spec:
              && !!document.querySelector('[aria-label^=\"Volume \"]')",
         ) == serde_json::json!(true)
     });
+    step("phase 5: grouped by node, each pod is in its node's band");
+    e.click("Node");
+    // Each band is a link named for its node; each pod's names its node.
+    // Every node a pod runs on has a band, and the pod is drawn inside it.
+    let grouped = "(() => {
+        const box = (a) => a.querySelector('rect').getBBox();
+        const bands = new Map([...document.querySelectorAll('a[aria-label^=\"Node \"]')]
+          .map((a) => [/^Node (\\S+):/.exec(a.getAttribute('aria-label'))[1], box(a)]));
+        const pods = [...document.querySelectorAll('a[aria-label^=\"Task \"]')].map((a) =>
+          [/^Task \\S+ on (\\S+):/.exec(a.getAttribute('aria-label'))?.[1], box(a)]);
+        const inside = pods.every(([n, r]) => {
+          const b = bands.get(n);
+          return b && r.y >= b.y && r.y + r.height <= b.y + b.height;
+        });
+        return [pods.length, new Set(pods.map(([n]) => n)).size, bands.size, inside];
+      })()";
+    e.until("pods in their nodes' bands", 30, |b| {
+        let v = b.eval(grouped);
+        v[0].as_u64().unwrap_or(0) >= 3 && v[3] == serde_json::json!(true)
+    });
+    let v = e.eval(grouped);
+    eprintln!("--- grouped by node: {} pods on {} nodes, {} bands", v[0], v[1], v[2]);
+    assert!(
+        v[2].as_u64() >= v[1].as_u64(),
+        "a band for each node a pod runs on: {v}"
+    );
+    // Grouped by service again, pods on more than one node carry their
+    // node's colour.
+    e.click("Service");
+    if v[1].as_u64().unwrap_or(0) > 1 {
+        e.until("pods tagged with their node's colour", 30, |b| {
+            b.eval("document.querySelectorAll('a[aria-label^=\"Task \"] rect.node-tag').length")
+                == v[0]
+        });
+    }
     // --- Phase 6 -------------------------------------------------------
     step("phase 6: the admin names the cluster and sets a banner on the settings page");
     c.page(&mut a, "/settings");
