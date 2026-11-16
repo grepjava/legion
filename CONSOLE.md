@@ -674,7 +674,15 @@ Added 2026-11-16, in the console's own look:
   answered (they said "None." until then), and say when the filter, not
   the cluster, left nothing.
 - *The topology* pans by dragging its canvas and zooms with Ctrl and
-  the wheel.
+  the wheel. Its pods can be grouped by node: a band per node, saying its
+  role and state (red when down), each service's lines fanning out to the
+  nodes running its tasks, and a band leading to its node. Grouped by
+  service, each pod and Volume carries its node's colour, keyed above the
+  canvas. A line from a pod to a ZFS Volume whose data is on another node
+  is drawn red and dotted. Published ports join the Routes on the left
+  (`ingress`: on every node; `host`: on the nodes running it), and "may
+  reach every other" stands for the arcs whenever every service may reach
+  every other, two of them included.
 - *A new page starts at the top*, and Back returns to where the page
   was left: the page scrolls in its own column, which SvelteKit's reset
   did not reach. Pages cross-fade briefly unless the system asks for

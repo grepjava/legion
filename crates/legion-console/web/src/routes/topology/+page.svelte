@@ -18,7 +18,23 @@
   let volumes: LObject[] = $state([]);
   let edges: ReachEdge[] = $state([]);
   let balancers: Balancer[] = $state([]);
+  let nodes: LObject[] = $state([]);
   let selectedService = $state('');
+  // Pods drawn under their services, or in a band for each node; kept for
+  // the next visit.
+  const GROUP_KEY = 'legion.topology-group';
+  let groupBy: 'service' | 'node' = $state(
+    typeof localStorage !== 'undefined' && localStorage.getItem(GROUP_KEY) === 'node' ? 'node' : 'service'
+  );
+  function setGroup(g: 'service' | 'node') {
+    groupBy = g;
+    try {
+      localStorage.setItem(GROUP_KEY, g);
+    } catch {
+      // Private mode: kept for this page only.
+    }
+  }
+  const byNode = $derived(groupBy === 'node');
   let zoom = $state(100);
   const zoomBy = (step: number) => (zoom = Math.min(160, Math.max(60, zoom + step)));
 
@@ -79,6 +95,9 @@
       follow('Route', ns, (o) => (routes = o), failed),
       follow('Volume', ns, (o) => (volumes = o), failed)
     ];
+    // Nodes are the cluster's: only those who see everything list them;
+    // others still see each pod's node by name.
+    if (session.me?.all) stops.push(follow('Node', '', (o) => (nodes = o), () => (nodes = [])));
     return () => stops.forEach((s) => s());
   });
 
@@ -138,21 +157,47 @@
   );
   const volRow = $derived(new Map(volumeNames.map((v, i) => [v, i])));
   const shownRoutes = $derived(routes.filter((r) => svcRow.has(r.spec?.service)));
+  // Each port a service publishes outside the cluster: through the routing
+  // mesh on every node (`ingress`), or on the nodes running its tasks.
+  type Published = { service: string; what: string; at: number | null; host: boolean };
+  const published: Published[] = $derived(
+    services.flatMap((s) => {
+      const got: { port: number; protocol?: string; publishedPort: number }[] =
+        s.status?.publishedPorts ?? [];
+      return ((s.spec?.endpoint?.ports ?? []) as { port: number; protocol?: string; publish?: string }[])
+        .filter((p) => p.publish === 'ingress' || p.publish === 'host')
+        .map((p) => {
+          const protocol = p.protocol ?? 'tcp';
+          const pub = got.find((g) => g.port === p.port && (g.protocol ?? 'tcp') === protocol);
+          return {
+            service: s.metadata.name,
+            what: `${p.port}/${protocol}`,
+            at: pub?.publishedPort ?? null,
+            host: p.publish === 'host'
+          };
+        });
+    })
+  );
   const outside = $derived(edges.filter((e) => e.from === '' && svcRow.has(e.to)));
   const between = $derived(
     edges.filter((e) => e.from !== '' && e.from !== e.to && svcRow.has(e.from) && svcRow.has(e.to))
   );
+  // All may reach all: one note rather than an arc each way between every
+  // two of them, however many there are.
   const everyone = $derived(
-    services.length > 2 && between.length === services.length * (services.length - 1)
+    services.length >= 2 && between.length === services.length * (services.length - 1)
   );
-  const leftRows = $derived(shownRoutes.length + (outside.length ? 1 : 0));
+  // The left column: Routes, then published ports, then other namespaces.
+  const outsideRow = $derived(shownRoutes.length + published.length);
+  const leftRows = $derived(outsideRow + (outside.length ? 1 : 0));
   const svgW = X_VOL + VOL_W + 28;
   const rowCount = $derived(Math.max(services.length, volumeNames.length, leftRows, 1));
   // Each row's height, and where each starts: routes, services and
-  // Volumes share the rows.
+  // Volumes share the rows. Pods grow their service's row only when drawn
+  // beside it.
   const rowHeights = $derived(
     Array.from({ length: rowCount }, (_, i) => {
-      const n = tasksBySvc.get(services[i]?.metadata.name ?? '')?.length ?? 0;
+      const n = byNode ? 0 : (tasksBySvc.get(services[i]?.metadata.name ?? '')?.length ?? 0);
       return Math.max(ROW, n * TASK_STEP + 24);
     })
   );
@@ -165,10 +210,124 @@
     }
     return tops;
   });
-  const height = $derived(HEADER_H + rowHeights.reduce((a, h) => a + h, 0) + 36);
 
   const y = (row: number) => (rowTops[row] ?? HEADER_H + row * ROW) + (rowHeights[row] ?? ROW) / 2;
   const taskY = (row: number, ti: number, n: number) => y(row) + (ti - (n - 1) / 2) * TASK_STEP;
+
+  // The cluster's nodes, and those the namespace's pods name, in order;
+  // each with a colour of its own, so a pod's node shows in either view.
+  const nodeNames = $derived.by(() => {
+    const names = new Set(nodes.map((n) => n.metadata.name as string));
+    for (const tk of activeTasks) if (tk.spec?.node) names.add(tk.spec.node);
+    return [...names].sort();
+  });
+  const multiNode = $derived(nodeNames.length > 1);
+  const NODE_HUES = 6;
+  const nodeHue = (name: string) => {
+    const i = nodeNames.indexOf(name);
+    return i < 0 ? '' : `n${i % NODE_HUES}`;
+  };
+  const nodeOf = (name: string) => nodes.find((n) => n.metadata.name === name);
+  const nodeHealth = (name: string) => {
+    const st = nodeOf(name)?.status?.state;
+    if (st === 'ready') return 'good';
+    if (st === 'down') return 'bad';
+    return st ? 'wait' : '';
+  };
+  const nodeNote = (name: string) => {
+    const n = nodeOf(name);
+    if (!n) return '';
+    const parts = [n.spec?.role ?? 'worker', n.status?.state ?? 'unknown'];
+    const av = n.spec?.availability;
+    if (av && av !== 'active') parts.push(av);
+    return parts.join(' · ');
+  };
+
+  // Node bands, in the pods' column: each node's pods, then those not
+  // placed on one yet.
+  const BAND_HEAD = 28;
+  const BAND_PAD = 10;
+  const BAND_GAP = 14;
+  const BAND_X = X_TASK - 12;
+  const BAND_W = TASK_W + 24;
+  type Band = { node: string; tasks: LObject[]; top: number; h: number };
+  const bands: Band[] = $derived.by(() => {
+    if (!byNode) return [];
+    const shown = activeTasks
+      .filter((tk) => svcRow.has(tk.spec?.service))
+      .sort(
+        (a, b) =>
+          svcRow.get(a.spec.service)! - svcRow.get(b.spec.service)! ||
+          a.metadata.name.localeCompare(b.metadata.name)
+      );
+    const groups = nodeNames.map((node) => ({ node, tasks: shown.filter((tk) => tk.spec?.node === node) }));
+    const unplaced = shown.filter((tk) => !tk.spec?.node);
+    if (unplaced.length) groups.push({ node: '', tasks: unplaced });
+    let top = HEADER_H;
+    return groups.map((g) => {
+      const h = BAND_HEAD + Math.max(1, g.tasks.length) * TASK_STEP + BAND_PAD;
+      const band = { ...g, top, h };
+      top += h + BAND_GAP;
+      return band;
+    });
+  });
+  // Where each pod is drawn: beside its service, or in its node's band.
+  const taskPos = $derived.by(() => {
+    const at = new Map<string, number>();
+    if (byNode) {
+      for (const b of bands) {
+        b.tasks.forEach((tk, j) => at.set(tk.metadata.name, b.top + BAND_HEAD + j * TASK_STEP + TASK_STEP / 2));
+      }
+    } else {
+      services.forEach((s, i) => {
+        const list = tasksBySvc.get(s.metadata.name) ?? [];
+        list.forEach((tk, ti) => at.set(tk.metadata.name, taskY(i, ti, list.length)));
+      });
+    }
+    return at;
+  });
+  const shownTasks = $derived(activeTasks.filter((tk) => taskPos.has(tk.metadata.name)));
+  const bandsEnd = $derived(bands.length ? bands[bands.length - 1].top + bands[bands.length - 1].h : 0);
+  const height = $derived(Math.max(HEADER_H + rowHeights.reduce((a, h) => a + h, 0), bandsEnd) + 36);
+
+  // A ZFS Volume's data is on one node: a pod on another cannot mount it
+  // there (until it is moved). The node it is on, when that is so.
+  const elsewhere = (volume: string, tk: LObject) => {
+    const v = volumes.find((v) => v.metadata.name === volume);
+    const on: string = v?.status?.node ?? '';
+    const driver = v?.spec?.driver ?? 'zfs';
+    const at: string = tk.spec?.node ?? '';
+    return driver === 'zfs' && on && at && on !== at && !v?.status?.migration ? on : '';
+  };
+  // Lines to each Volume: from each pod using it, or from the service
+  // itself while it has none.
+  const volLinks = $derived(
+    used.flatMap((u) => {
+      const y1 = y(volRow.get(u.volume)!);
+      const list = (tasksBySvc.get(u.service) ?? []).filter((tk) => taskPos.has(tk.metadata.name));
+      if (!list.length) {
+        return [{ key: `${u.service}>${u.volume}`, x0: X_SVC_CX + SVC_R, y0: y(svcRow.get(u.service)!), y1, far: '', title: '' }];
+      }
+      return list.map((tk) => {
+        const far = elsewhere(u.volume, tk);
+        return {
+          key: `${tk.metadata.name}>${u.volume}`,
+          x0: X_TASK + TASK_W,
+          y0: taskPos.get(tk.metadata.name)!,
+          y1,
+          far,
+          title: far
+            ? t('{volume} is on {on}, {task} on {node}', {
+                volume: u.volume,
+                on: far,
+                task: tk.metadata.name,
+                node: tk.spec?.node ?? ''
+              })
+            : ''
+        };
+      });
+    })
+  );
   const isVmSvc = (s: LObject) =>
     Boolean((s.spec?.pod?.containers ?? []).some((c: { vm?: unknown }) => c.vm));
   const isDbSvc = (s: LObject) =>
@@ -206,6 +365,8 @@
     if (!v) return 'bad';
     return v.status?.lost ? 'bad' : 'good';
   };
+  const volumeNode = (name: string): string =>
+    volumes.find((v) => v.metadata.name === name)?.status?.node ?? '';
   const volumeNote = (name: string) => {
     const v = volumes.find((v) => v.metadata.name === name);
     if (!v) return t('missing');
@@ -234,6 +395,9 @@
   );
   const svcRoutes = $derived(
     inspectedSvc ? shownRoutes.filter((r) => r.spec?.service === inspectedSvc.metadata.name) : []
+  );
+  const svcPublished = $derived(
+    inspectedSvc ? published.filter((p) => p.service === inspectedSvc.metadata.name) : []
   );
   const svcVols = $derived(
     inspectedSvc ? used.filter((u) => u.service === inspectedSvc.metadata.name).map((u) => u.volume) : []
@@ -265,9 +429,6 @@
   )}
 </p>
 {#if error}<p class="error" role="alert">{error}</p>{/if}
-{#if everyone}
-  <p class="muted">{t('Every service may reach every other (the namespace is not isolated by policy).')}</p>
-{/if}
 
 {#if services.length}
   <p class="sr-only">
@@ -290,6 +451,29 @@
           </button>
         {/each}
       </div>
+      <div class="controls">
+        <span class="muted" id="group-by">{t('Group pods by:')}</span>
+        <div class="seg" role="group" aria-labelledby="group-by">
+          <button type="button" class="sm" class:primary={!byNode} aria-pressed={!byNode} onclick={() => setGroup('service')}>
+            {t('Service')}
+          </button>
+          <button type="button" class="sm" class:primary={byNode} aria-pressed={byNode} onclick={() => setGroup('node')}>
+            {t('Node')}
+          </button>
+        </div>
+        {#if multiNode && !byNode}
+          <span class="node-key muted" aria-label={t('Node colours')}>
+            {#each nodeNames as n (n)}
+              <span><span class="key-swatch {nodeHue(n)}"></span>{n}</span>
+            {/each}
+          </span>
+        {/if}
+      </div>
+      {#if everyone}
+        <p class="muted note">
+          {t('Every service may reach every other (the namespace is not isolated by policy).')}
+        </p>
+      {/if}
 
       <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
       <div
@@ -322,8 +506,36 @@
           <!-- Tier Headers -->
           <text class="tier-head" x={X_ROUTE} y={20}>{t('INGRESS / ROUTES')}</text>
           <text class="tier-head" x={X_SVC_CX - 34} y={20}>{t('SERVICES')}</text>
-          <text class="tier-head" x={X_TASK} y={20}>{t('PODS (JAILS / VMS)')}</text>
+          <text class="tier-head" x={X_TASK} y={20}>{byNode ? t('NODES / PODS') : t('PODS (JAILS / VMS)')}</text>
           <text class="tier-head" x={X_VOL} y={20}>{t('VOLUMES')}</text>
+
+          <!-- Node bands, behind their pods; a band opens its node. -->
+          {#snippet band(b: Band)}
+            {@const nh = nodeHealth(b.node)}
+            <rect class="band {nodeHue(b.node)} {nh}" class:unplaced={!b.node} x={BAND_X} y={b.top} width={BAND_W} height={b.h} rx="10" />
+            <text class="band-title" x={BAND_X + 12} y={b.top + 18}>{b.node || t('not placed yet')}</text>
+            {#if nodeNote(b.node)}
+              <text class="sub band-note {nh}" x={BAND_X + BAND_W - 12} y={b.top + 18} text-anchor="end">{nodeNote(b.node)}</text>
+            {/if}
+            {#if !b.tasks.length}
+              <text class="sub" x={X_TASK + 4} y={b.top + BAND_HEAD + TASK_STEP / 2 + 4}>{t('no pods of this namespace')}</text>
+            {/if}
+          {/snippet}
+          {#each bands as b (b.node)}
+            {#if b.node}
+              <a
+                href="/k/Node/_/{b.node}"
+                aria-label={t('Node {name}: {note}', {
+                  name: b.node,
+                  note: nodeNote(b.node) || t('{n} pods', { n: b.tasks.length })
+                })}
+              >
+                {@render band(b)}
+              </a>
+            {:else}
+              <g>{@render band(b)}</g>
+            {/if}
+          {/each}
 
           <!-- Route -> Service edges -->
           {#each shownRoutes as r, i (r.metadata.name)}
@@ -333,11 +545,20 @@
               marker-end="url(#arrow)"
             />
           {/each}
+          {#each published as p, i (`${p.service}>${p.what}`)}
+            {@const py = y(shownRoutes.length + i)}
+            {@const sy = y(svcRow.get(p.service)!)}
+            <path
+              class="edge"
+              d="M {X_ROUTE + ROUTE_W} {py} C {X_ROUTE + ROUTE_W + 45} {py}, {X_SVC_CX - SVC_R - 45} {sy}, {X_SVC_CX - SVC_R - 6} {sy}"
+              marker-end="url(#arrow)"
+            />
+          {/each}
           {#if outside.length}
             {#each outside as e (e.to)}
               <path
                 class="edge reach"
-                d="M {X_ROUTE + ROUTE_W} {y(shownRoutes.length)} C {X_ROUTE + ROUTE_W + 45} {y(shownRoutes.length)}, {X_SVC_CX - SVC_R - 45} {y(svcRow.get(e.to)!)}, {X_SVC_CX - SVC_R - 6} {y(svcRow.get(e.to)!)}"
+                d="M {X_ROUTE + ROUTE_W} {y(outsideRow)} C {X_ROUTE + ROUTE_W + 45} {y(outsideRow)}, {X_SVC_CX - SVC_R - 45} {y(svcRow.get(e.to)!)}, {X_SVC_CX - SVC_R - 6} {y(svcRow.get(e.to)!)}"
                 marker-end="url(#arrow)"
               >
                 <title>{t('other namespaces → {service}: {ports}', { service: e.to, ports: ports(e) })}</title>
@@ -358,28 +579,27 @@
             {/each}
           {/if}
 
-          <!-- Service -> Task (Pod / VM) edges -->
-          {#each services as s, i (s.metadata.name)}
-            {@const svcTasks = tasksBySvc.get(s.metadata.name) ?? []}
-            {#each svcTasks as tk, ti (tk.metadata.name)}
-              {@const ty = taskY(i, ti, svcTasks.length)}
-              <path
-                class="edge pod-link"
-                d="M {X_SVC_CX + SVC_R} {y(i)} C {X_SVC_CX + SVC_R + 36} {y(i)}, {X_TASK - 36} {ty}, {X_TASK} {ty}"
-              />
-            {/each}
+          <!-- Service -> Task (Pod / VM) edges; by node they fan out to
+               each node running one. -->
+          {#each shownTasks as tk (tk.metadata.name)}
+            {@const sy = y(svcRow.get(tk.spec.service)!)}
+            {@const ty = taskPos.get(tk.metadata.name)!}
+            <path
+              class="edge pod-link"
+              d="M {X_SVC_CX + SVC_R} {sy} C {X_SVC_CX + SVC_R + 36} {sy}, {X_TASK - 36} {ty}, {X_TASK} {ty}"
+            />
           {/each}
 
-          <!-- Service -> Volume edges -->
-          {#each used as u (`${u.service}>${u.volume}`)}
-            <!-- From its tasks, or from the service itself while it has none. -->
-            {@const x0 = tasksBySvc.get(u.service)?.length ? X_TASK + TASK_W : X_SVC_CX + SVC_R}
-            {@const y0 = y(svcRow.get(u.service)!)}
-            {@const y1 = y(volRow.get(u.volume)!)}
+          <!-- Pod -> Volume edges; one to a node the data is not on is
+               flagged. -->
+          {#each volLinks as l (l.key)}
             <path
               class="edge vol-link"
-              d="M {x0} {y0} C {x0 + 30} {y0}, {X_VOL - 30} {y1}, {X_VOL} {y1}"
-            />
+              class:far={l.far}
+              d="M {l.x0} {l.y0} C {l.x0 + 30} {l.y0}, {X_VOL - 30} {l.y1}, {X_VOL} {l.y1}"
+            >
+              {#if l.title}<title>{l.title}</title>{/if}
+            </path>
           {/each}
 
           <!-- Route Nodes with Globe Icon -->
@@ -402,9 +622,31 @@
               <text class="sub" x={X_ROUTE + 34} y={y(i) + 12}>{t('Route {name}', { name: r.metadata.name })}</text>
             </a>
           {/each}
+          <!-- Published ports: a plug icon, the port and where it is answered. -->
+          {#each published as p, i (`${p.service}>${p.what}`)}
+            {@const py = y(shownRoutes.length + i)}
+            {@const where = p.at === null ? t('not published yet') : p.host ? t('on nodes running it') : t('on every node')}
+            <a
+              href={link('Service', p.service)}
+              aria-label={t('Port {port} published to {service}, {where}', {
+                port: p.at ?? p.what,
+                service: p.service,
+                where
+              })}
+            >
+              <rect class="box route" class:idle={p.at === null} x={X_ROUTE} y={py - BOX_H / 2} width={ROUTE_W} height={BOX_H} rx="8" />
+              <circle cx={X_ROUTE + 18} cy={py} r="10" class="icon-bg route-bg" />
+              <rect x={X_ROUTE + 13} y={py - 4} width="10" height="7" rx="1.5" class="icon-stroke" />
+              <line x1={X_ROUTE + 16} y1={py - 7} x2={X_ROUTE + 16} y2={py - 4} class="icon-stroke" />
+              <line x1={X_ROUTE + 20} y1={py - 7} x2={X_ROUTE + 20} y2={py - 4} class="icon-stroke" />
+              <line x1={X_ROUTE + 18} y1={py + 3} x2={X_ROUTE + 18} y2={py + 7} class="icon-stroke" />
+              <text x={X_ROUTE + 34} y={py - 3}>{p.at === null ? p.what : `:${p.at}`} → {p.what.split('/')[0]}</text>
+              <text class="sub" x={X_ROUTE + 34} y={py + 12}>{where}</text>
+            </a>
+          {/each}
           {#if outside.length}
-            <rect class="box outside" x={X_ROUTE} y={y(shownRoutes.length) - BOX_H / 2} width={ROUTE_W} height={BOX_H} rx="8" />
-            <text x={X_ROUTE + 14} y={y(shownRoutes.length) + 4}>{t('other namespaces')}</text>
+            <rect class="box outside" x={X_ROUTE} y={y(outsideRow) - BOX_H / 2} width={ROUTE_W} height={BOX_H} rx="8" />
+            <text x={X_ROUTE + 14} y={y(outsideRow) + 4}>{t('other namespaces')}</text>
           {/if}
 
           <!-- OpenShift-style Circular Service Nodes with Pod Ring & Workload Icon -->
@@ -460,24 +702,30 @@
           {/each}
 
           <!-- Task (Jail Pod / bhyve VM) Nodes -->
-          {#each services as s, i (s.metadata.name)}
-            {@const svcTasks = tasksBySvc.get(s.metadata.name) ?? []}
-            {#each svcTasks as tk, ti (tk.metadata.name)}
-              {@const ty = taskY(i, ti, svcTasks.length)}
-              {@const th = taskHealth(tk)}
-              {@const vm = isVmSvc(tk)}
-              <a
-                href={link('Task', tk.metadata.name)}
-                aria-label={t('Task {name}: {state}', { name: tk.metadata.name, state: tk.status?.state ?? 'unknown' })}
-              >
-                <rect class="box task {th}" x={X_TASK} y={ty - TASK_H / 2} width={TASK_W} height={TASK_H} rx="8" />
-                <circle cx={X_TASK + 16} cy={ty} r="5" class="dot-status {th}" />
-                <text x={X_TASK + 28} y={ty - 3}>{tk.metadata.name}</text>
-                <text class="sub" x={X_TASK + 28} y={ty + 12}>
-                  {vm ? 'bhyve' : 'jail'} · {tk.status?.ip ?? tk.status?.state ?? ''} · {tk.spec?.node ?? ''}
-                </text>
-              </a>
-            {/each}
+          {#each shownTasks as tk (tk.metadata.name)}
+            {@const ty = taskPos.get(tk.metadata.name)!}
+            {@const th = taskHealth(tk)}
+            {@const vm = isVmSvc(tk)}
+            {@const node = tk.spec?.node ?? ''}
+            <a
+              href={link('Task', tk.metadata.name)}
+              aria-label={t('Task {name} on {node}: {state}', {
+                name: tk.metadata.name,
+                node: node || t('no node yet'),
+                state: tk.status?.paused ? 'paused' : (tk.status?.state ?? 'unknown')
+              })}
+            >
+              <rect class="box task {th}" x={X_TASK} y={ty - TASK_H / 2} width={TASK_W} height={TASK_H} rx="8" />
+              {#if multiNode && node && !byNode}
+                <!-- Its node's colour, as in the key above. -->
+                <rect class="node-tag {nodeHue(node)}" x={X_TASK + 1} y={ty - TASK_H / 2 + 6} width="4" height={TASK_H - 12} rx="2" />
+              {/if}
+              <circle cx={X_TASK + 16} cy={ty} r="5" class="dot-status {th}" />
+              <text x={X_TASK + 28} y={ty - 3}>{tk.metadata.name}</text>
+              <text class="sub" x={X_TASK + 28} y={ty + 12}>
+                {vm ? 'bhyve' : 'jail'} · {tk.status?.paused ? 'paused' : (tk.status?.ip ?? tk.status?.state ?? '')}{byNode ? '' : ` · ${node}`}
+              </text>
+            </a>
           {/each}
 
           <!-- Volume Nodes with Storage Icon -->
@@ -485,6 +733,9 @@
             {@const vh = volumeHealth(v)}
             <a href={link('Volume', v)} aria-label={t('Volume {name}: {note}', { name: v, note: volumeNote(v) })}>
               <rect class="box vol {vh}" x={X_VOL} y={y(i) - BOX_H / 2} width={VOL_W} height={BOX_H} rx="8" />
+              {#if multiNode && volumeNode(v)}
+                <rect class="node-tag {nodeHue(volumeNode(v))}" x={X_VOL + 1} y={y(i) - BOX_H / 2 + 6} width="4" height={BOX_H - 12} rx="2" />
+              {/if}
               <ellipse cx={X_VOL + 18} cy={y(i) - 5} rx="7" ry="2.8" class="icon-stroke" />
               <path d="M {X_VOL + 11} {y(i) - 5} v 10 c 0 1.6 3.1 2.8 7 2.8 s 7 -1.2 7 -2.8 v -10" class="icon-stroke" />
               <text x={X_VOL + 32} y={y(i) - 3}>{v}</text>
@@ -497,7 +748,10 @@
         <span><span class="leg-dot good"></span>{t('Ready / Running')}</span>
         <span><span class="leg-dot wait"></span>{t('Starting / Partial')}</span>
         <span><span class="leg-dot bad"></span>{t('Failed / Lost')}</span>
-        <span>{t('Click any Service, Pod/VM, Route, or Volume to drill down.')}</span>
+        {#if volLinks.some((l) => l.far)}
+          <span><span class="leg-far"></span>{t('Volume on another node than its pod')}</span>
+        {/if}
+        <span>{t('Click any Service, Pod/VM, Route, Volume or node to drill down.')}</span>
       </div>
     </div>
 
@@ -535,6 +789,20 @@
           <ul class="plain mono">
             {#each svcVips as b (b.address)}
               <li>{b.address} (vhid {b.vhid})</li>
+            {/each}
+          </ul>
+        {/if}
+
+        {#if svcPublished.length}
+          <h3>{t('Published ports')}</h3>
+          <ul class="plain mono">
+            {#each svcPublished as p (p.what)}
+              <li>
+                {p.at === null ? '—' : p.at} → {p.what}
+                <span class="muted">
+                  {p.at === null ? t('not published yet') : p.host ? t('on nodes running it') : t('on every node')}
+                </span>
+              </li>
             {/each}
           </ul>
         {/if}
@@ -692,6 +960,88 @@
     stroke: var(--zfs);
     stroke-width: 1.4;
     stroke-dasharray: 3 3;
+  }
+  .edge.vol-link.far {
+    stroke: var(--bad);
+    stroke-dasharray: 2 4;
+    stroke-width: 2;
+  }
+  .leg-far {
+    display: inline-block;
+    width: 18px;
+    margin-right: 0.35rem;
+    border-top: 2px dotted var(--bad);
+    vertical-align: middle;
+  }
+  .canvas-card .note {
+    margin: 0.5rem 0 0;
+  }
+  .seg {
+    display: inline-flex;
+  }
+  .seg button + button {
+    margin-left: -1px;
+  }
+  .node-key {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    font-size: 0.8rem;
+  }
+  .key-swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 3px;
+    margin-right: 0.3rem;
+    vertical-align: -1px;
+    background: var(--hue);
+  }
+  /* One colour per node, none of them the health colours. */
+  .n0 {
+    --hue: light-dark(#2557d6, #7aa2ff);
+  }
+  .n1 {
+    --hue: light-dark(#0e7490, #22d3ee);
+  }
+  .n2 {
+    --hue: light-dark(#7c3aed, #c4b5fd);
+  }
+  .n3 {
+    --hue: light-dark(#be185d, #f472b6);
+  }
+  .n4 {
+    --hue: light-dark(#4d5b12, #bef264);
+  }
+  .n5 {
+    --hue: light-dark(#7c4a1e, #e0a370);
+  }
+  .node-tag {
+    fill: var(--hue, var(--control));
+  }
+  .band {
+    fill: color-mix(in srgb, var(--hue, var(--control)) 7%, transparent);
+    stroke: var(--hue, var(--control));
+    stroke-width: 1.5;
+  }
+  .band.bad {
+    stroke: var(--bad);
+    stroke-width: 2.5;
+    fill: color-mix(in srgb, var(--bad) 9%, transparent);
+  }
+  .band.unplaced {
+    stroke-dasharray: 5 4;
+  }
+  .band-title {
+    font-size: 12px;
+    font-weight: 700;
+  }
+  text.band-note.bad {
+    fill: var(--bad);
+    font-weight: 700;
+  }
+  text.band-note.wait {
+    fill: var(--wait);
   }
   .topo-legend {
     display: flex;
