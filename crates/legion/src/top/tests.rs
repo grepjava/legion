@@ -1101,6 +1101,34 @@ fn a_service_is_stopped_when_asked_and_started_at_once() {
 }
 
 #[test]
+fn a_service_is_paused_when_asked_and_resumed_at_once() {
+    let mut m = cluster();
+    let mut v = View::default();
+    assert_eq!(typed(&mut v, &m, "2P"), None);
+    assert!(screen(&m, &v).contains("Pause service shop/web?"));
+    assert_eq!(
+        typed(&mut v, &m, "y"),
+        Some(Request::Pause {
+            namespace: "shop".into(),
+            service: "web".into(),
+            pause: true
+        })
+    );
+    let mut paused = service(9, 3, 3);
+    paused.spec["paused"] = true.into();
+    m.changed(true, paused, 0);
+    assert!(screen(&m, &v).contains("paused"));
+    assert_eq!(
+        typed(&mut v, &m, "P"),
+        Some(Request::Pause {
+            namespace: "shop".into(),
+            service: "web".into(),
+            pause: false
+        })
+    );
+}
+
+#[test]
 fn restart_run_now_events_and_alerts() {
     let m = cluster();
     let mut v = View::default();

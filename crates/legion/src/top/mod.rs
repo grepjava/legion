@@ -685,6 +685,27 @@ async fn act(mut objects: crate::cli::Objects, request: Request) -> String {
                     )
                 })
         }
+        Request::Pause {
+            namespace,
+            service,
+            pause,
+        } => {
+            let what = if pause { "paused" } else { "resumed" };
+            objects
+                .set_spec(
+                    object_ref(Kind::Service, namespace, service),
+                    "paused",
+                    pause.into(),
+                )
+                .await
+                .map(|(key, changed)| {
+                    said(
+                        changed,
+                        format!("{key} {what}"),
+                        format!("{key} already {what}"),
+                    )
+                })
+        }
         Request::Suspend {
             namespace,
             cron_job,

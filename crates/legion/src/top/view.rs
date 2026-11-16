@@ -253,6 +253,12 @@ pub enum Request {
         service: String,
         stop: bool,
     },
+    /// A service paused (`legion pause`) or resumed.
+    Pause {
+        namespace: String,
+        service: String,
+        pause: bool,
+    },
     Move {
         namespace: String,
         volume: String,
@@ -750,6 +756,22 @@ impl View {
                     return Some(request);
                 }
                 let ask = format!("Stop service {ns}/{n}? Its tasks go until it is started.");
+                self.confirm(request, ask);
+                return None;
+            }
+            ('P', Kind::Service) => {
+                let pause = !o.spec["paused"].as_bool().unwrap_or(false);
+                let request = Request::Pause {
+                    namespace,
+                    service: name,
+                    pause,
+                };
+                if !pause {
+                    return Some(request);
+                }
+                let ask = format!(
+                    "Pause service {ns}/{n}? Its tasks are frozen and out of its endpoints until it is resumed."
+                );
                 self.confirm(request, ask);
                 return None;
             }
@@ -1387,9 +1409,12 @@ fn workload_rows(model: &Model, view: &View) -> Vec<TableRow> {
             )
         });
         let stopped = s.spec["stopped"].as_bool() == Some(true);
-        let warn = warn || stopped;
+        let paused = s.spec["paused"].as_bool() == Some(true);
+        let warn = warn || stopped || paused;
         let update = if stopped {
             "stopped".to_owned()
+        } else if paused {
+            "paused".to_owned()
         } else {
             st.update
                 .as_ref()

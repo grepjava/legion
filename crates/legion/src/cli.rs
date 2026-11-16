@@ -1044,6 +1044,12 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
         Command::Start { service, namespace } => {
             println!("{}", stop(&mut objects, namespace, service, false).await?);
         }
+        Command::Pause { service, namespace } => {
+            println!("{}", pause(&mut objects, namespace, service, true).await?);
+        }
+        Command::Resume { service, namespace } => {
+            println!("{}", pause(&mut objects, namespace, service, false).await?);
+        }
         Command::Cronjob {
             command: crate::CronJobCommand::Run { cronjob, namespace },
         } => {
@@ -1457,13 +1463,16 @@ fn stacks(services: &[Object]) -> Vec<[String; 5]> {
             let n = |o: &Object, k: &str| o.status[k].as_u64().unwrap_or(0);
             let ready: u64 = list.iter().map(|o| n(o, "ready")).sum();
             let desired: u64 = list.iter().map(|o| n(o, "desired")).sum();
-            let stopped = list
-                .iter()
-                .filter(|o| o.spec["stopped"].as_bool() == Some(true))
-                .count();
-            let state = match stopped {
-                0 => "running",
-                s if s == list.len() => "stopped",
+            let flagged = |field: &str| {
+                list.iter()
+                    .filter(|o| o.spec[field].as_bool() == Some(true))
+                    .count()
+            };
+            let state = match (flagged("stopped"), flagged("paused")) {
+                (0, 0) => "running",
+                (s, _) if s == list.len() => "stopped",
+                (0, p) if p == list.len() => "paused",
+                (0, _) => "partly paused",
                 _ => "partly stopped",
             };
             [
@@ -1760,11 +1769,22 @@ fn print_objects(objects: &[pb::Object], format: Format, kind: Kind) -> anyhow::
                             o.metadata.namespace.clone(),
                             o.metadata.name.clone(),
                             field(&o.spec, &["mode"]),
-                            format!(
-                                "{}/{}",
-                                count(&o.status, "ready"),
-                                count(&o.status, "desired")
-                            ),
+                            if o.spec["paused"].as_bool() == Some(true)
+                                && o.spec["stopped"].as_bool() != Some(true)
+                            {
+                                // How many of those running are paused yet.
+                                format!(
+                                    "paused {}/{}",
+                                    count(&o.status, "paused"),
+                                    count(&o.status, "running")
+                                )
+                            } else {
+                                format!(
+                                    "{}/{}",
+                                    count(&o.status, "ready"),
+                                    count(&o.status, "desired")
+                                )
+                            },
                             images.join(","),
                             field(&o.status, &["update", "state"]),
                         ]
@@ -1783,7 +1803,11 @@ fn print_objects(objects: &[pb::Object], format: Format, kind: Kind) -> anyhow::
                             o.metadata.namespace.clone(),
                             o.metadata.name.clone(),
                             field(&o.spec, &["node"]),
-                            field(&o.status, &["state"]),
+                            if o.status["paused"].as_bool() == Some(true) {
+                                "paused".to_owned()
+                            } else {
+                                field(&o.status, &["state"])
+                            },
                             field(&o.status, &["ip"]),
                             field(&o.status, &["message"]),
                         ]
@@ -2744,6 +2768,31 @@ async fn stop(
     service: String,
     stop: bool,
 ) -> anyhow::Result<String> {
+    let state = if stop { "stopped" } else { "started" };
+    set_flag(objects, namespace, service, "stopped", stop, state).await
+}
+
+/// `legion pause` (`pause`) or `legion resume`: the service's `paused` set;
+/// what was done, for the user.
+async fn pause(
+    objects: &mut Objects,
+    namespace: Option<String>,
+    service: String,
+    pause: bool,
+) -> anyhow::Result<String> {
+    let state = if pause { "paused" } else { "resumed" };
+    set_flag(objects, namespace, service, "paused", pause, state).await
+}
+
+/// A service's spec `field` set to `on`; `state` says what that made it.
+async fn set_flag(
+    objects: &mut Objects,
+    namespace: Option<String>,
+    service: String,
+    field: &str,
+    on: bool,
+    state: &str,
+) -> anyhow::Result<String> {
     let (key, changed) = legion_manager::actions::set_spec(
         objects,
         pb::ObjectRef {
@@ -2751,12 +2800,11 @@ async fn stop(
             namespace: namespace.unwrap_or_default(),
             name: service,
         },
-        "stopped",
-        stop.into(),
+        field,
+        on.into(),
     )
     .await
     .map_err(|s| anyhow::anyhow!("{}", s.message()))?;
-    let state = if stop { "stopped" } else { "started" };
     Ok(if changed {
         format!("{key} {state}")
     } else {

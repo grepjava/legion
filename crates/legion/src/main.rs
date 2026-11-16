@@ -434,6 +434,20 @@ enum Command {
         #[arg(short, long)]
         namespace: Option<String>,
     },
+    /// Pause a service: its tasks stay where they are, frozen (a jail's
+    /// processes stopped, a VM's virtual CPUs held), out of its endpoints
+    /// and their probes held, until `legion resume`.
+    Pause {
+        service: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// Resume a paused service: its tasks go on where they were.
+    Resume {
+        service: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
     /// CronJobs: a run now.
     Cronjob {
         #[command(subcommand)]
