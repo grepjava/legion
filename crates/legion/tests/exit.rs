@@ -23,6 +23,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+// For the pf teardown its other lab tests share.
+mod common;
+
 const LEGION: &str = env!("CARGO_BIN_EXE_legion");
 const SERVER: &str = "127.0.0.1:7471";
 const METRICS: &str = "127.0.0.1:7472";
@@ -551,9 +554,11 @@ fn app_survives_failures() {
     wait("pods removed", 120, || lab.no_containers());
     lab.stop_daemon();
     // What the daemon keeps for the pods it leaves running goes with the test.
-    let tidy = "for i in legion0 wg0; do ifconfig $i destroy; done; \
-                pfctl -a legion/svc -F all; pfctl -a legion/policy -F all";
-    let _ = Command::new("sh").args(["-c", tidy]).output();
+    let tidy = format!(
+        "for i in legion0 wg0; do ifconfig $i destroy; done\n{}",
+        common::PF_TIDY
+    );
+    let _ = Command::new("sh").args(["-c", &tidy]).output();
     let ds = format!("{}/volumes/shop/db-data", lab.zfs_root);
     assert!(sh(&format!("zfs list -H -o name {ds}")).contains(&ds));
 }
