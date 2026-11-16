@@ -1346,6 +1346,54 @@ fn the_console_builds_an_example_with_jailer() {
     )
     .unwrap();
     lab.ok(&["apply", "-f", ns.to_str().unwrap()]);
+    // A signing key in shop, and a policy its builds must meet: signed,
+    // with provenance and an SBOM attested by that key.
+    let key = legion_image::cosign::PrivateKey::generate();
+    let indent = |pem: &str, by: usize| {
+        pem.lines()
+            .map(|l| {
+                format!(
+                    "{:by$}{l}
+",
+                    ""
+                )
+            })
+            .collect::<String>()
+    };
+    let signer = lab.dir.join("signer.yaml");
+    std::fs::write(
+        &signer,
+        format!(
+            "apiVersion: legion/v1
+kind: Secret
+metadata: {{ name: signer, namespace: shop }}
+spec:
+  text: |
+{}",
+            indent(&key.to_pem(), 4)
+        ),
+    )
+    .unwrap();
+    lab.ok(&["apply", "-f", signer.to_str().unwrap()]);
+    let policy = lab.dir.join("policy.yaml");
+    std::fs::write(
+        &policy,
+        format!(
+            "apiVersion: legion/v1
+kind: ImagePolicy
+metadata: {{ name: built }}
+spec:
+  images: [\"{}/examples/**\"]
+  attestations: [slsaprovenance1, spdxjson]
+  keys:
+    - |
+{}",
+            registry.addr,
+            indent(&key.public().to_pem(), 6)
+        ),
+    )
+    .unwrap();
+    lab.ok(&["apply", "-f", policy.to_str().unwrap()]);
     let ed = lab.dir.join("ed.pem");
     lab.ok(&[
         "user",
@@ -1393,6 +1441,7 @@ fn the_console_builds_an_example_with_jailer() {
         include_str!("../../../examples/static-site/Containerfile"),
     );
     e.fill("Push to", &image);
+    e.fill("Signing key", "signer");
     e.click("Build");
 
     step("the build's log, live, then the rollout");
@@ -1422,6 +1471,11 @@ fn the_console_builds_an_example_with_jailer() {
         pinned.starts_with(&format!("{}/examples/nginx@sha256:", registry.addr)),
         "{pinned}"
     );
+    assert_eq!(
+        c.get("build", "shop", &build)["status"]["attested"],
+        true,
+        "signed and attested"
+    );
     c.page(&mut e, &format!("/k/Build/shop/{build}?tab=buildlog"));
     e.shows("The build succeeded.", 30);
     // Pushed, the build's image is gone from jailer's store; its base stays.
@@ -1440,6 +1494,29 @@ fn the_console_builds_an_example_with_jailer() {
             s["spec"]["pod"]["containers"][0]["image"] == pinned.as_str()
                 && s["status"]["ready"] == 2
         },
+    );
+    // Run only as the policy allowed: its key's signature and attestations.
+    let verified = &c.get("service", "shop", "web")["status"]["images"]["verified"][&pinned];
+    assert_eq!(verified["key"], key.public().fingerprint(), "{verified}");
+    assert_eq!(
+        verified["attestations"],
+        serde_json::json!([
+            "https://slsa.dev/provenance/v1",
+            "https://spdx.dev/Document"
+        ]),
+        "{verified}"
+    );
+    let out = c.lab.legion(&["image", "sbom", &pinned], &[]);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        common::text(&out.stdout),
+        common::text(&out.stderr)
+    );
+    assert!(
+        common::text(&out.stdout).contains("nginx"),
+        "the SBOM lists the packages installed: {}",
+        common::text(&out.stdout)
     );
     c.page(&mut e, "/topology");
     e.fill("Namespace", "shop");
