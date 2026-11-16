@@ -347,10 +347,7 @@ mod tests {
     #[test]
     fn a_policy_names_the_attestations_it_requires_as_uris() {
         use crate::admit::Spec;
-        let key = "-----BEGIN PUBLIC KEY-----
-MFk...
------END PUBLIC KEY-----
-";
+        let key = "-----BEGIN PUBLIC KEY-----\nMFk...\n-----END PUBLIC KEY-----\n";
         let mut p = ImagePolicySpec {
             images: vec!["ghcr.io/**".into()],
             keys: vec![key.into()],
