@@ -238,10 +238,10 @@ pub fn linux_static(sys: &dyn Sys) -> Finding {
         Ok(v) => Finding::unmet(
             ID,
             format!(
-                "{FALLBACK_BRAND} is {v}: static Linux programs (Go's among them) fail with                  \"Exec format error\""
+                "{FALLBACK_BRAND} is {v}: static Linux programs (Go's among them) fail with \"Exec format error\""
             ),
             format!(
-                "add {FALLBACK_BRAND}={LINUX_BRAND} to /etc/sysctl.conf, and for now run:                  sysctl {FALLBACK_BRAND}={LINUX_BRAND}"
+                "add {FALLBACK_BRAND}={LINUX_BRAND} to /etc/sysctl.conf, and for now run: sysctl {FALLBACK_BRAND}={LINUX_BRAND}"
             ),
         ),
         Err(e) => Finding::unknown(ID, FALLBACK_BRAND, &e),

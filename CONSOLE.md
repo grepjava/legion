@@ -594,9 +594,9 @@ the CLI first, as everything is:
 - *Image details*: an image's build history (each step and the layer it
   added), how it runs (entrypoint, user, ports, labels), and which
   services, Jobs and cron jobs name it, of those the caller may read;
-  from the registry, or from a node's cached copy (`legion images inspect
+  from the registry, or from a node's cached copy (`legion image inspect
   --node`) for what no registry serves.
-- *Vulnerabilities* (`legion images scan`, Scan on a cached image): the
+- *Vulnerabilities* (`legion image scan`, Scan on a cached image): the
   image's FreeBSD packages, read from its files by `pkg query`, checked by
   the node's own `pkg audit` against FreeBSD's VuXML (fetched again when
   over an hour old), with every package listed as its bill of materials.
@@ -617,7 +617,7 @@ the CLI first, as everything is:
 - *Disk use* (the Disk usage page): each node's space under Legion's ZFS
   root by what holds it (images, tasks' roots, Volumes, the rest) and
   jailer's build store beside it, from the agents' heartbeats, with
-  unused images and the build cache (`jailer prune`, `legion images prune
+  unused images and the build cache (`jailer prune`, `legion image prune
   --builds`) reclaimed from there.
 - *Diagnostics* (`legion diagnose`, the Diagnostics page): `legion
   doctor`'s checks run by every node's agent, and a support bundle

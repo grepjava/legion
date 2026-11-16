@@ -562,7 +562,7 @@ async fn linux_images() {
         let mut spec = member(
             &format!("lx_{i}"),
             &pod,
-            "uname -s; id -u; id -G; grep ^ID= /etc/os-release;              head -1 /proc/meminfo; ls /sys | head -1; ls -l /proc/self/fd/0;              echo shm > /dev/shm/x && cat /dev/shm/x;              touch /etc/passwd 2>&1 || echo refused",
+            "uname -s; id -u; id -G; grep ^ID= /etc/os-release; head -1 /proc/meminfo; ls /sys | head -1; ls -l /proc/self/fd/0; echo shm > /dev/shm/x && cat /dev/shm/x; touch /etc/passwd 2>&1 || echo refused",
         );
         spec.image = image.into();
         spec.labels = labels("t2", "app");

@@ -2538,7 +2538,7 @@ async fn run_image_command(
     Ok(())
 }
 
-/// What `legion images scan` says of an image.
+/// What `legion image scan` says of an image.
 fn scan_text(r: &pb::ScanImageResponse) -> String {
     let mut out = format!("{} on {}: ", r.image, r.node);
     if r.packages.is_empty() {

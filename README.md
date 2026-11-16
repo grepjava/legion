@@ -187,7 +187,7 @@ into from the CLI as from the console:
 ```sh
 legion files web -n shop /usr/local/www     # a directory in a running task
 legion cp web:/etc/nginx.conf . -n shop     # out of it (or into it)
-legion images scan nginx:1.27 --node n1     # its packages against FreeBSD's VuXML
+legion image scan nginx:1.27 --node n1     # its packages against FreeBSD's VuXML
 legion diagnose                             # legion doctor, on every node
 legion support-bundle                       # to send with a report, Secrets left out
 ```

@@ -56,7 +56,7 @@ pub fn enable_linux(sys: &dyn legion_sys::Sys) -> legion_sys::Result<Option<Stri
     }
     Ok((brand != LINUX_BRAND).then(|| {
         format!(
-            "{FALLBACK_BRAND} is {brand}, set on this host: static Linux programs will not run              (set it to {LINUX_BRAND} for them)"
+            "{FALLBACK_BRAND} is {brand}, set on this host: static Linux programs will not run (set it to {LINUX_BRAND} for them)"
         )
     }))
 }

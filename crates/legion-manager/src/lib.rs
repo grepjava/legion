@@ -311,7 +311,7 @@ impl Manager {
         let speaks = legion_api::protocol::Protocol::said(self.protocol.speaks, 0).speaks;
         if floor > speaks {
             return Err(format!(
-                "the cluster's managers speak protocol {floor} and this build {speaks}:                  run a build that speaks {floor} or newer"
+                "the cluster's managers speak protocol {floor} and this build {speaks}: run a build that speaks {floor} or newer"
             )
             .into());
         }
