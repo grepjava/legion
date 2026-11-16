@@ -525,8 +525,13 @@
     stroke-width: 2;
   }
   .svc-halo.picked {
-    stroke: var(--accent);
+    stroke: var(--link);
     stroke-dasharray: 4 3;
+  }
+  .canvas-card .controls button.primary {
+    background: var(--link);
+    border-color: var(--link);
+    color: light-dark(#ffffff, #06112e);
   }
   .svc-ring {
     fill: var(--panel);
@@ -662,7 +667,7 @@
     fill: none;
   }
   .edge.reach {
-    stroke: var(--accent);
+    stroke: var(--link);
     stroke-dasharray: 5 3;
   }
   .head {

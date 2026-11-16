@@ -28,6 +28,8 @@
   --accent-dark: #ff5247;
   --on-accent-light: #ffffff;
   --on-accent-dark: #140303;
+  --link-light: #2557d6;
+  --link-dark: #7aa2ff;
   --good-light: #16794c;
   --good-dark: #34d399;
   --wait-light: #92400e;
@@ -47,6 +49,7 @@
   --control: var(--control-light);
   --accent: var(--accent-light);
   --on-accent: var(--on-accent-light);
+  --link: var(--link-light);
   --good: var(--good-light);
   --wait: var(--wait-light);
   --bad: var(--bad-light);
@@ -66,6 +69,7 @@
     --control: var(--control-dark);
     --accent: var(--accent-dark);
     --on-accent: var(--on-accent-dark);
+    --link: var(--link-dark);
     --good: var(--good-dark);
     --wait: var(--wait-dark);
     --bad: var(--bad-dark);
@@ -87,6 +91,7 @@
       --control: var(--control-dark);
       --accent: var(--accent-dark);
       --on-accent: var(--on-accent-dark);
+      --link: var(--link-dark);
       --good: var(--good-dark);
       --wait: var(--wait-dark);
       --bad: var(--bad-dark);
@@ -105,6 +110,7 @@
     --control: light-dark(var(--control-light), var(--control-dark));
     --accent: light-dark(var(--accent-light), var(--accent-dark));
     --on-accent: light-dark(var(--on-accent-light), var(--on-accent-dark));
+    --link: light-dark(var(--link-light), var(--link-dark));
     --good: light-dark(var(--good-light), var(--good-dark));
     --wait: light-dark(var(--wait-light), var(--wait-dark));
     --bad: light-dark(var(--bad-light), var(--bad-dark));
@@ -136,7 +142,7 @@ body {
   font-variant-numeric: tabular-nums;
 }
 a {
-  color: var(--accent);
+  color: var(--link);
   text-decoration: none;
 }
 a:hover {
@@ -672,9 +678,9 @@ tbody tr:hover td {
   border: 1px solid var(--control);
 }
 .wizard-step.active .wizard-num {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--on-accent);
+  background: var(--link);
+  border-color: var(--link);
+  color: light-dark(#ffffff, #06112e);
 }
 .wizard-step.done .wizard-num {
   background: var(--good);
@@ -721,9 +727,9 @@ tbody tr:hover td {
   min-height: 24px;
 }
 .pill.active {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--on-accent);
+  background: var(--link);
+  border-color: var(--link);
+  color: light-dark(#ffffff, #06112e);
   font-weight: 600;
 }
 html[data-density='compact'] .card {
@@ -941,9 +947,9 @@ button:disabled {
 }
 button.primary,
 a.button.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--on-accent);
+  background: var(--link);
+  border-color: var(--link);
+  color: light-dark(#ffffff, #06112e);
   font-weight: 600;
 }
 button.danger {
