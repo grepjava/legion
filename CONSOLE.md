@@ -684,9 +684,10 @@ Added 2026-11-16, in the console's own look:
   reach every other" stands for the arcs whenever every service may reach
   every other, two of them included.
 - *A service's circle shows what it runs*: the product's logo (nginx,
-  PostgreSQL, Node.js, Redis and some thirty others, from Simple Icons,
+  PostgreSQL, Node, Redis and some thirty others, from Simple Icons,
   CC0), matched on its name and image; a VM shows a monitor, an unknown
-  database a cylinder, anything else a jail's cube.
+  database a cylinder, anything else a jail's cube. Apps on Node (Express,
+  Koa, Fastify, Nest, Next and the like) show Node's logo, called Node.
 - *A new page starts at the top*, and Back returns to where the page
   was left: the page scrolls in its own column, which SvelteKit's reset
   did not reach. Pages cross-fade briefly unless the system asks for
