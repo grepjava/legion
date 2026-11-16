@@ -2772,8 +2772,7 @@ fn image_details(r: &pb::InspectRegistryImageResponse) -> String {
     for (i, a) in r.attestations.iter().enumerate() {
         let name = if i == 0 { "Attested:" } else { "" };
         out += &format!(
-            "{name:<11}{}
-",
+            "{name:<11}{}\n",
             attestation_line(a)
         );
     }

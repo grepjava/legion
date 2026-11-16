@@ -955,8 +955,7 @@ fn a_jailer_signature_is_what_legion_checks() {
         "enforce",
     );
     required.push_str(
-        "  attestations: [slsaprovenance1, spdxjson]
-",
+        "  attestations: [slsaprovenance1, spdxjson]\n",
     );
     lab.apply("policy-attested", &required);
     lab.apply("attested", &service("attested", &attested, 1, ""));

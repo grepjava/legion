@@ -1353,8 +1353,7 @@ fn the_console_builds_an_example_with_jailer() {
         pem.lines()
             .map(|l| {
                 format!(
-                    "{:by$}{l}
-",
+                    "{:by$}{l}\n",
                     ""
                 )
             })
@@ -1364,12 +1363,7 @@ fn the_console_builds_an_example_with_jailer() {
     std::fs::write(
         &signer,
         format!(
-            "apiVersion: legion/v1
-kind: Secret
-metadata: {{ name: signer, namespace: shop }}
-spec:
-  text: |
-{}",
+            "apiVersion: legion/v1\nkind: Secret\nmetadata: {{ name: signer, namespace: shop }}\nspec:\n  text: |\n{}",
             indent(&key.to_pem(), 4)
         ),
     )
@@ -1379,15 +1373,7 @@ spec:
     std::fs::write(
         &policy,
         format!(
-            "apiVersion: legion/v1
-kind: ImagePolicy
-metadata: {{ name: built }}
-spec:
-  images: [\"{}/examples/**\"]
-  attestations: [slsaprovenance1, spdxjson]
-  keys:
-    - |
-{}",
+            "apiVersion: legion/v1\nkind: ImagePolicy\nmetadata: {{ name: built }}\nspec:\n  images: [\"{}/examples/**\"]\n  attestations: [slsaprovenance1, spdxjson]\n  keys:\n    - |\n{}",
             registry.addr,
             indent(&key.public().to_pem(), 6)
         ),
