@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { api } from '#lib/api.ts';
+  import FreeBsdLogo from '#lib/FreeBsdLogo.svelte';
   import { session } from '#lib/session.svelte.ts';
   import { t } from '#lib/i18n.svelte.ts';
 
@@ -36,7 +37,10 @@
 </script>
 
 <div class="login">
-  <h1>Legion</h1>
+  <div class="login-brand">
+    <FreeBsdLogo size={36} />
+    <h1>FreeBSD Legion</h1>
+  </div>
   {#if busy}
     <p>{t('Signing in…')}</p>
   {:else}

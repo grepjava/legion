@@ -3055,9 +3055,11 @@ async fn image_load(
 struct RegistrySearchQuery {
     query: Option<String>,
     limit: Option<u32>,
+    namespace: Option<String>,
+    secret: Option<String>,
 }
 
-/// `legion image search`: searches FreeBSD catalog and Docker Hub.
+/// `legion image search`: searches FreeBSD catalog, Docker Hub, and ghcr.io.
 async fn registry_search(
     State(g): State<Gateway>,
     headers: HeaderMap,
@@ -3068,6 +3070,8 @@ async fn registry_search(
         .search_images(pb::SearchImagesRequest {
             query: q.query.unwrap_or_default(),
             limit: q.limit.unwrap_or(20).min(50),
+            namespace: q.namespace.unwrap_or_default(),
+            secret: q.secret.unwrap_or_default(),
         })
         .await?
         .into_inner();

@@ -2543,11 +2543,22 @@ async fn run_image_command(
                 output.display()
             );
         }
-        crate::ImageCommand::Search { query, limit } => {
+        crate::ImageCommand::Search {
+            query,
+            limit,
+            namespace,
+            secret,
+        } => {
+            let ns = secret
+                .as_ref()
+                .map(|_| namespace.as_deref().unwrap_or("default").to_owned())
+                .unwrap_or_default();
             let r = cluster
                 .search_images(pb::SearchImagesRequest {
                     query: query.unwrap_or_default(),
                     limit,
+                    namespace: ns,
+                    secret: secret.unwrap_or_default(),
                 })
                 .await?
                 .into_inner();

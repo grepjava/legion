@@ -301,6 +301,9 @@
 
   // --- Tab 2: Registry Search & OCI Inspector ---
   let searchQuery = $state('');
+  let searchSecret = $state('');
+  let sourceFilter: 'all' | 'freebsd' | 'ghcr' | 'docker' = $state('all');
+  let kindFilter: 'all' | 'jail' | 'vm' = $state('all');
   let hits: RegistrySearchHit[] = $state([]);
   let searching = $state(false);
   let inspectInput = $state('');
@@ -308,12 +311,28 @@
   let inspected: RegistryImageInspect | null = $state(null);
   let inspecting = $state(false);
 
+  const filteredHits = $derived(
+    hits.filter((h) => {
+      const isGhcr = h.source === 'ghcr.io' || h.name.startsWith('ghcr.io/');
+      if (sourceFilter === 'freebsd' && h.source !== 'freebsd-catalog') return false;
+      if (sourceFilter === 'ghcr' && !isGhcr) return false;
+      if (sourceFilter === 'docker' && h.source !== 'docker-hub') return false;
+      const isVm =
+        h.name.toLowerCase().includes('vm') ||
+        h.description.toLowerCase().includes('bhyve') ||
+        h.description.toLowerCase().includes('disk.img');
+      if (kindFilter === 'vm' && !isVm) return false;
+      if (kindFilter === 'jail' && isVm) return false;
+      return true;
+    })
+  );
+
   async function runSearch(e?: Event) {
     e?.preventDefault();
     searching = true;
     error = '';
     try {
-      const r = await api.registrySearch(searchQuery.trim(), 24);
+      const r = await api.registrySearch(searchQuery.trim(), 24, workNs, searchSecret);
       hits = r.results;
     } catch (err) {
       error = (err as Error).message;
@@ -670,26 +689,49 @@
   {:else if tab === 'search'}
     <div class="split-pane">
       <section class="card">
-        <h2>{t('Search FreeBSD catalog & Docker Hub')}</h2>
+        <h2>{t('Search FreeBSD catalog, Docker Hub & ghcr.io')}</h2>
         <form class="controls" onsubmit={runSearch}>
           <input
             type="search"
             bind:value={searchQuery}
-            placeholder={t('freebsd, postgres, nginx, redis…')}
+            placeholder={t('freebsd, postgres, or ghcr.io/owner/repo…')}
             aria-label={t('Search images')}
           />
+          <select bind:value={searchSecret} aria-label={t('GHCR login Secret')}>
+            <option value="">{t('No GHCR Secret')}</option>
+            {#each secrets as s (s)}
+              <option value={s}>{s}</option>
+            {/each}
+          </select>
           <button class="primary" disabled={searching}>{t('Search')}</button>
         </form>
 
-        {#if hits.length}
+        <div class="pill-row" role="group" aria-label={t('Filter by source and workload')}>
+          <button type="button" class="pill" class:active={sourceFilter === 'all'} onclick={() => (sourceFilter = 'all')}>{t('All sources')}</button>
+          <button type="button" class="pill" class:active={sourceFilter === 'freebsd'} onclick={() => (sourceFilter = 'freebsd')}>{t('FreeBSD catalog')}</button>
+          <button type="button" class="pill" class:active={sourceFilter === 'ghcr'} onclick={() => (sourceFilter = 'ghcr')}>ghcr.io</button>
+          <button type="button" class="pill" class:active={sourceFilter === 'docker'} onclick={() => (sourceFilter = 'docker')}>Docker Hub</button>
+          <span class="muted" aria-hidden="true">·</span>
+          <button type="button" class="pill" class:active={kindFilter === 'all'} onclick={() => (kindFilter = 'all')}>{t('Jails & VMs')}</button>
+          <button type="button" class="pill" class:active={kindFilter === 'jail'} onclick={() => (kindFilter = 'jail')}>{t('Jails')}</button>
+          <button type="button" class="pill" class:active={kindFilter === 'vm'} onclick={() => (kindFilter = 'vm')}>{t('bhyve VMs')}</button>
+        </div>
+
+        {#if filteredHits.length}
           <ul class="hit-list" role="list">
-            {#each hits as h (h.name)}
+            {#each filteredHits as h (h.name)}
               {@const fullRef = `${h.name}:${h.suggested_tag || 'latest'}`}
               <li class="hit-card">
                 <div class="hit-head">
                   <strong class="mono">{h.name}</strong>
                   <span>
-                    <span class="tag">{h.source === 'freebsd-catalog' ? t('FreeBSD jail') : 'Docker Hub'}</span>
+                    <span class="tag"
+                      >{h.source === 'freebsd-catalog'
+                        ? t('FreeBSD jail')
+                        : h.source === 'ghcr.io'
+                          ? 'ghcr.io'
+                          : 'Docker Hub'}</span
+                    >
                     {#if h.official}<span class="state good">{t('official')}</span>{/if}
                     {#if h.stars > 0}<span class="tag">★ {h.stars}</span>{/if}
                   </span>
@@ -697,7 +739,14 @@
                 <p class="muted hit-desc">{h.description || '—'}</p>
                 <div class="controls">
                   <span class="mono muted">:{h.suggested_tag}</span>
-                  <button type="button" class="sm" onclick={() => runInspect(fullRef)}>
+                  <button
+                    type="button"
+                    class="sm"
+                    onclick={() => {
+                      if (searchSecret && !inspectSecret) inspectSecret = searchSecret;
+                      runInspect(fullRef);
+                    }}
+                  >
                     {t('Inspect OCI')}
                   </button>
                   {#if session.me?.all}

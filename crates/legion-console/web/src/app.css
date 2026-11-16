@@ -1,38 +1,41 @@
-/* Mission-Control Dark & High-Tech Daylight design system.
+@import '@fontsource-variable/plus-jakarta-sans';
+@import '@fontsource-variable/jetbrains-mono';
+
+/* FreeBSD Midnight Indigo & Crimson theme (from uploaded wallpaper), light & dark.
    Follows modern-web-guidance: color-scheme on :root synced with
    <meta name="color-scheme">, light-dark() with @media fallbacks,
    WCAG 2.2 AA contrast (>= 4.5:1 text, >= 3:1 control borders),
    Forced Colors Mode borders, and modal <dialog> scroll containment. */
 :root {
-  --bg-light: #f5f7fb;
-  --bg-dark: #0a0f18;
+  --bg-light: #f4f5fa;
+  --bg-dark: #050512;
   --panel-light: #ffffff;
-  --panel-dark: #111826;
-  --side-light: #edf1f7;
-  --side-dark: #0d1320;
-  --surface2-light: #e4eaf3;
-  --surface2-dark: #172133;
-  --text-light: #0f172a;
-  --text-dark: #e6edf7;
-  --muted-light: #475569;
-  --muted-dark: #94a3b8;
-  --line-light: #d4dce8;
-  --line-dark: #223049;
+  --panel-dark: #0c0c22;
+  --side-light: #eaecf6;
+  --side-dark: #080818;
+  --surface2-light: #dfe2f0;
+  --surface2-dark: #151436;
+  --text-light: #101028;
+  --text-dark: #f2f4ff;
+  --muted-light: #4a4d6d;
+  --muted-dark: #9b9ec4;
+  --line-light: #c8cbe0;
+  --line-dark: #232152;
   /* Borders of controls: >= 3:1 against the page & panel (WCAG 1.4.11). */
-  --control-light: #64748b;
-  --control-dark: #5e7496;
-  --accent-light: #0369a1;
-  --accent-dark: #38bdf8;
+  --control-light: #6b6e91;
+  --control-dark: #4b4894;
+  --accent-light: #c41c16;
+  --accent-dark: #ff5247;
   --on-accent-light: #ffffff;
-  --on-accent-dark: #051320;
-  --good-light: #047857;
+  --on-accent-dark: #140303;
+  --good-light: #16794c;
   --good-dark: #34d399;
   --wait-light: #92400e;
   --wait-dark: #fbbf24;
-  --bad-light: #be123c;
-  --bad-dark: #fb7185;
-  --zfs-light: #6d28d9;
-  --zfs-dark: #c084fc;
+  --bad-light: #c41c16;
+  --bad-dark: #ff6b6b;
+  --zfs-light: #5b47b0;
+  --zfs-dark: #a78bfa;
 
   --bg: var(--bg-light);
   --panel: var(--panel-light);
@@ -110,11 +113,13 @@
 
   accent-color: var(--accent);
   font-family:
+    'Plus Jakarta Sans Variable',
+    'Plus Jakarta Sans',
     system-ui,
     -apple-system,
     'Segoe UI',
     sans-serif;
-  font-size: 14.5px;
+  font-size: 15px;
   color: var(--text);
   background: var(--bg);
 }
@@ -167,8 +172,16 @@ h3 {
 pre,
 code,
 .mono {
-  font-family: ui-monospace, 'Cascadia Code', 'SF Mono', Menlo, Consolas, monospace;
-  font-size: 0.84rem;
+  font-family:
+    'JetBrains Mono Variable',
+    'JetBrains Mono',
+    ui-monospace,
+    'Cascadia Code',
+    'SF Mono',
+    Menlo,
+    Consolas,
+    monospace;
+  font-size: 0.86rem;
 }
 pre {
   background: var(--panel);
@@ -192,33 +205,52 @@ pre {
   align-items: center;
   gap: 0.65rem;
   flex-wrap: wrap;
-  padding: 0.4rem 1rem;
+  padding: 0.5rem 1rem;
   background: var(--side);
+  color: var(--text);
+  border-top: 3px solid var(--accent);
   border-bottom: 1px solid var(--line);
   font-size: 0.82rem;
+}
+.topbar select,
+.topbar button.sm,
+.topbar .cmd-trigger {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--line);
+}
+.topbar .cmd-trigger kbd {
+  background: var(--surface2);
+  border-color: var(--line);
+  color: var(--muted);
+}
+.topbar .telemetry-pill {
+  background: var(--panel);
+  border-color: var(--line);
+  color: var(--muted);
+}
+.topbar .telemetry-pill strong {
+  color: var(--text);
 }
 .topbar-brand {
   display: inline-flex;
   align-items: center;
-  gap: 0.45rem;
-  font-weight: 700;
+  gap: 0.55rem;
+  font-weight: 500;
   font-size: 0.98rem;
   color: var(--text);
   text-decoration: none;
-  margin-right: 0.25rem;
+  margin-right: 0.35rem;
 }
-.topbar-brand .mark {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 1.35rem;
-  height: 1.35rem;
-  border-radius: 4px;
-  background: var(--accent);
-  color: var(--on-accent);
-  font-family: ui-monospace, monospace;
-  font-size: 0.78rem;
-  font-weight: 800;
+.topbar-brand .brand-title strong {
+  font-weight: 700;
+}
+.topbar-brand:hover {
+  text-decoration: none;
+}
+.freebsd-logo {
+  flex-shrink: 0;
+  display: block;
 }
 .topbar-cluster {
   color: var(--muted);
@@ -286,17 +318,33 @@ pre {
 
 .shell {
   display: grid;
-  grid-template-columns: 14.5rem 1fr;
+  grid-template-columns: 15.75rem 1fr;
   flex: 1;
   min-height: 0;
 }
 aside {
   background: var(--side);
+  color: var(--text);
   border-right: 1px solid var(--line);
-  padding: 0.85rem;
+  padding: 0.95rem 0.75rem;
   display: flex;
   flex-direction: column;
   gap: 0.85rem;
+}
+aside .ns {
+  color: var(--muted);
+}
+aside select {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--line);
+}
+aside .who {
+  border-top-color: var(--line);
+  color: var(--muted);
+}
+aside button.link {
+  color: var(--accent);
 }
 .brand {
   font-weight: 700;
@@ -348,17 +396,19 @@ nav h2 {
   letter-spacing: 0.06em;
   color: var(--muted);
   margin: 0.85rem 0 0.2rem;
-  padding: 0 0.45rem;
+  padding: 0 0.5rem;
 }
 nav a {
   display: flex;
   align-items: center;
   justify-content: space-between;
   color: var(--text);
-  padding: 0.28rem 0.5rem;
-  border-radius: 5px;
-  border-left: 2px solid transparent;
-  min-height: 26px;
+  font-size: 0.96rem;
+  font-weight: 500;
+  padding: 0.42rem 0.65rem;
+  border-radius: 6px;
+  border-left: 3px solid transparent;
+  min-height: 34px;
 }
 nav a:hover {
   background: var(--surface2);
@@ -394,6 +444,91 @@ button.link {
   flex-direction: column;
   min-width: 0;
   min-height: 0;
+}
+@media (min-width: 48.01rem) {
+  .app-frame {
+    height: 100dvh;
+    overflow: hidden;
+  }
+  .shell {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+  aside {
+    height: 100%;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--control) var(--side);
+  }
+  .main-col {
+    height: 100%;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--control) var(--bg);
+  }
+}
+.nav-search {
+  width: 100%;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.3rem 0.55rem;
+  font-size: 0.82rem;
+}
+.nav-search::placeholder {
+  color: var(--muted);
+}
+.nav-sec {
+  margin-top: 0.45rem;
+}
+.nav-group {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.76rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  padding: 0.36rem 0.5rem;
+  border-radius: 4px;
+  user-select: none;
+}
+.nav-group:hover {
+  background: var(--surface2);
+  color: var(--text);
+}
+.nav-group::after {
+  content: '▸';
+  font-size: 0.75rem;
+  transition: transform 0.12s ease;
+}
+.nav-sec[open] > .nav-group::after {
+  transform: rotate(90deg);
+}
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+button:focus-visible,
+summary:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+fieldset {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  padding: 0.85rem 1rem;
+}
+fieldset legend {
+  font-weight: 600;
+  font-size: 0.85rem;
+  padding: 0 0.35rem;
 }
 main {
   padding: 1.25rem 1.75rem;
@@ -490,8 +625,106 @@ tbody tr:hover td {
 .card {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 0.9rem 1rem;
+  border-radius: 6px;
+  padding: 1rem 1.15rem;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.05);
+}
+.wizard-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-bottom: 1rem;
+  padding: 0.55rem 0.75rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.wizard-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.3rem 0.65rem;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.86rem;
+  font-weight: 500;
+}
+.wizard-step.active {
+  background: var(--surface2);
+  border-color: var(--accent);
+  color: var(--text);
+  font-weight: 600;
+}
+.wizard-step.done {
+  color: var(--good);
+}
+.wizard-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.35rem;
+  height: 1.35rem;
+  border-radius: 999px;
+  font-size: 0.76rem;
+  font-weight: 700;
+  border: 1px solid var(--control);
+}
+.wizard-step.active .wizard-num {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+.wizard-step.done .wizard-num {
+  background: var(--good);
+  border-color: var(--good);
+  color: #ffffff;
+}
+.choice-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: 0.75rem;
+}
+.choice-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.3rem;
+  padding: 1rem;
+  text-align: left;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.choice-card:hover {
+  border-color: var(--accent);
+}
+.choice-card.selected {
+  border: 2px solid var(--accent);
+  background: var(--surface2);
+}
+.pill-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin: 0.45rem 0 0.75rem;
+}
+.pill {
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 0.78rem;
+  min-height: 24px;
+}
+.pill.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
 }
 html[data-density='compact'] .card {
   padding: 0.65rem 0.8rem;
@@ -577,13 +810,23 @@ html[data-density='compact'] .card {
   margin-top: 30vh;
   color: var(--muted);
 }
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  margin-bottom: 0.75rem;
+}
+.login-brand h1 {
+  margin: 0;
+}
 .login {
   max-width: 30rem;
   margin: 18vh auto;
   padding: 2rem;
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-top: 3px solid var(--accent);
+  border-radius: 6px;
 }
 
 /* Capacity & telemetry progress meters (with border for Forced Colors Mode) */
@@ -796,9 +1039,44 @@ dialog::backdrop {
   bottom: 0;
   z-index: 15;
   background: var(--side);
-  border-top: 2px solid var(--line);
+  border-top: 1px solid var(--line);
   display: flex;
   flex-direction: column;
+  flex-shrink: 0;
+}
+.workbench.resizing {
+  user-select: none;
+}
+.workbench-resizer {
+  height: 7px;
+  cursor: ns-resize;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface2);
+  border-bottom: 1px solid var(--line);
+  touch-action: none;
+  transition: background-color 0.15s ease;
+}
+.workbench-resizer:hover,
+.workbench-resizer:focus-visible,
+.workbench.resizing .workbench-resizer {
+  background: color-mix(in srgb, var(--accent) 18%, var(--surface2));
+  outline: none;
+}
+.workbench-grip {
+  width: 38px;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--muted);
+  opacity: 0.45;
+  transition: opacity 0.15s ease, background-color 0.15s ease;
+}
+.workbench-resizer:hover .workbench-grip,
+.workbench-resizer:focus-visible .workbench-grip,
+.workbench.resizing .workbench-grip {
+  background: var(--accent);
+  opacity: 1;
 }
 .workbench-bar {
   display: flex;
@@ -810,15 +1088,24 @@ dialog::backdrop {
 }
 .workbench-body {
   padding: 0.65rem 1rem;
-  max-height: 38vh;
+  height: 320px;
+  min-height: 140px;
+  display: flex;
+  flex-direction: column;
   overflow: auto;
   background: var(--panel);
 }
 .workbench-body .terminal {
-  height: 28vh;
+  flex: 1 1 auto;
+  min-height: 120px;
+  height: auto;
 }
 .workbench-body pre.log {
-  max-height: 26vh;
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+  overflow: auto;
+  margin-bottom: 0;
 }
 
 /* The console's banner (`legion console configure`), above every page:
@@ -849,11 +1136,16 @@ dialog::backdrop {
 
 /* Forced Colors Mode fallbacks (mwg: color) */
 @media (forced-colors: active) {
+  .topbar,
+  aside,
   .card,
   table,
   dialog,
   .meter {
     border: 1px solid CanvasText;
+  }
+  nav a.here {
+    border-left: 3px solid Highlight;
   }
   .meter-fill {
     background: Highlight;

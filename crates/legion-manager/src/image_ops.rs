@@ -519,8 +519,16 @@ pub(crate) async fn search_images(
     api: &ApiService,
     req: Request<pb::SearchImagesRequest>,
 ) -> Result<Response<pb::SearchImagesResponse>, Status> {
-    let _caller = api.caller(&req)?;
+    let caller = api.caller(&req)?;
     let req = req.into_inner();
+    let auth = secret_auth(api, &caller, &req.namespace, &req.secret)?;
+    let ghcr_token = if auth.is_empty() {
+        None
+    } else {
+        let logins = docker_config(&auth)
+            .map_err(|e| Status::invalid_argument(format!("Secret {}: {e}", req.secret)))?;
+        Credentials::for_registry(&logins, "ghcr.io").map(|c| c.password)
+    };
     let client = legion_image::Client::new().map_err(internal)?;
     let limit = if req.limit == 0 {
         20
@@ -528,7 +536,7 @@ pub(crate) async fn search_images(
         (req.limit as usize).min(50)
     };
     let hits = client
-        .search(&req.query, limit)
+        .search_with_ghcr(&req.query, limit, ghcr_token.as_deref())
         .await
         .map_err(|e| Status::unavailable(e.to_string()))?;
     let results = hits

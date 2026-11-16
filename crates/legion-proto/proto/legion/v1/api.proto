@@ -729,6 +729,8 @@ message LoadImageChunk {
 message SearchImagesRequest {
   string query = 1;
   uint32 limit = 2;
+  string namespace = 3;
+  string secret = 4;
 }
 
 message RegistrySearchHit {

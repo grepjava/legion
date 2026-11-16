@@ -41,8 +41,8 @@
     const words = command.trim().split(/\s+/).filter(Boolean);
     term = new Terminal({
       cursorBlink: true,
-      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-      fontSize: 13
+      fontFamily: "'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, 'Cascadia Code', SFMono-Regular, Menlo, monospace",
+      fontSize: 13.5
     });
     fit = new FitAddon();
     term.loadAddon(fit);

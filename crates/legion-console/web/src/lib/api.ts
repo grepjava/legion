@@ -238,9 +238,13 @@ export const api = {
     return data as { node: string; bytes: number; digest: string; images: CachedNodeImage[] };
   },
   /** Searches FreeBSD jail catalog and Docker Hub (`legion image search`). */
-  registrySearch: (query = '', limit = 20) => {
+  registrySearch: (query = '', limit = 20, namespace = '', secret = '') => {
     const params = new URLSearchParams({ limit: String(limit) });
     if (query) params.set('query', query);
+    if (secret) {
+      params.set('namespace', namespace);
+      params.set('secret', secret);
+    }
     return call<{ results: RegistrySearchHit[] }>('GET', `/api/registry/search?${params}`);
   },
   /** A node's cached image audited: its packages and their known vulnerabilities (`legion image scan`). */

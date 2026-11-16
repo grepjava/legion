@@ -119,6 +119,8 @@
     return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)}${units[i]}`;
   };
   const bps = (v: number) => `${bytes(v)}/s`;
+  const totalMem = $derived(summed.mem.at(-1)?.[1] ?? 0);
+  const totalCpu = $derived(summed.cpu.at(-1)?.[1] ?? 0);
 </script>
 
 {#if error}<p class="error" role="alert">{error}</p>{/if}
@@ -189,4 +191,17 @@
       </div>
     {/if}
   </div>
+  {#if !compact && summed.cpu.length}
+    <details class="card" style="margin-top: 0.75rem">
+      <summary>{t('Prometheus telemetry & PromQL')}</summary>
+      <p class="muted">
+        {t('Exposed by each node daemon on --metrics-listen (/metrics). Live values from current samples:')}
+      </p>
+      <pre>{`legion_task_cpu_cores{namespace="${namespace || '*'}"${task ? `,task="${task}"` : ''}} ${totalCpu.toFixed(4)}
+legion_task_memory_bytes{namespace="${namespace || '*'}"${task ? `,task="${task}"` : ''}} ${totalMem}`}</pre>
+      <p class="muted">{t('Example PromQL:')}</p>
+      <pre>{`rate(legion_task_cpu_seconds_total{${task ? `task="${task}"` : `namespace="${namespace || 'default'}"`}}[5m])
+legion_task_memory_bytes{${task ? `task="${task}"` : `namespace="${namespace || 'default'}"`}}`}</pre>
+    </details>
+  {/if}
 {/if}

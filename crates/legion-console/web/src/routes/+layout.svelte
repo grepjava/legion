@@ -12,12 +12,12 @@
     type Status
   } from '#lib/api.ts';
   import CommandPalette from '#lib/CommandPalette.svelte';
+  import FreeBsdLogo from '#lib/FreeBsdLogo.svelte';
   import Workbench from '#lib/Workbench.svelte';
   import { plural } from '#lib/kinds.ts';
   import {
     namespaces,
     session,
-    setDensity,
     setTheme,
     type ThemeMode
   } from '#lib/session.svelte.ts';
@@ -217,7 +217,7 @@
     '/audit': t('Audit'),
     '/settings': t('Console settings'),
     '/clusters': t('Clusters'),
-    '/build': t('Build a new image')
+    '/build': t('Builder')
   });
   const title = $derived.by(() => {
     const path = page.url.pathname;
@@ -246,6 +246,43 @@
     session.me?.all ? session.kinds.filter((k) => k.clusterScoped) : []
   );
   const voters = $derived(raftStatus ? raftStatus.members.filter((m) => m.voter).length : 0);
+  let navQuery = $state('');
+  const navFilter = $derived(navQuery.trim().toLowerCase());
+  const matchesNav = (label: string) => !navFilter || label.toLowerCase().includes(navFilter);
+
+  const observeItems = $derived(
+    [
+      { href: '/', label: t('Overview') },
+      { href: '/alerts', label: t('Alerts'), alerts: true },
+      { href: '/topology', label: t('Topology') },
+      { href: '/network', label: t('Network') },
+      { href: '/disk', label: t('Disk usage') },
+      { href: '/diagnostics', label: t('Diagnostics') }
+    ].filter((i) => matchesNav(i.label))
+  );
+
+  const studioItems = $derived(
+    [
+      { href: '/volumes', label: t('Volumes Studio') },
+      { href: '/images', label: t('Images & GHCR Hub') },
+      { href: '/build', label: t('Builder') },
+      { href: '/stacks', label: t('Stacks') },
+      { href: '/deploy', label: t('Deploy') },
+      { href: '/templates', label: t('Templates') },
+      { href: '/import', label: t('Import compose') },
+      { href: '/apply', label: t('Apply YAML') }
+    ].filter((i) => matchesNav(i.label))
+  );
+
+  const filteredNsKinds = $derived(nsKinds.filter((k) => matchesNav(plural(k.kind))));
+  const filteredClusterKinds = $derived(clusterKinds.filter((k) => matchesNav(plural(k.kind))));
+  const clusterOpsItems = $derived(
+    [
+      { href: '/cluster', label: t('Operations') },
+      { href: '/audit', label: t('Audit') },
+      { href: '/settings', label: t('Console settings') }
+    ].filter((i) => matchesNav(i.label))
+  );
 </script>
 
 <svelte:window onkeydown={onGlobalKey} />
@@ -271,8 +308,8 @@
   <div class="app-frame">
     <header class="topbar">
       <a class="topbar-brand" href="/">
-        <span class="mark" aria-hidden="true">L</span>
-        <span>Legion</span>
+        <FreeBsdLogo size={24} />
+        <span class="brand-title">FreeBSD <strong>Legion</strong></span>
         {#if session.settings.name}
           <span class="topbar-cluster">· {session.settings.name}</span>
         {/if}
@@ -318,15 +355,6 @@
         <option value="light">{t('Light')}</option>
         <option value="system">{t('System')}</option>
       </select>
-
-      <button
-        type="button"
-        class="sm"
-        aria-pressed={session.density === 'compact'}
-        onclick={() => setDensity(session.density === 'compact' ? 'comfortable' : 'compact')}
-      >
-        {t('Compact')}
-      </button>
     </header>
 
     <div class="shell">
@@ -340,139 +368,117 @@
             {/each}
           </select>
         </label>
+        <input
+          class="nav-search"
+          type="search"
+          bind:value={navQuery}
+          placeholder={t('Filter menu…')}
+          aria-label={t('Filter menu')}
+        />
         <nav aria-label={t('Console')}>
-          <a href="/" class:here={page.url.pathname === '/'} aria-current={at(page.url.pathname === '/')}
-            >{t('Overview')}</a
-          >
-          <a
-            href="/alerts"
-            class:here={page.url.pathname === '/alerts'}
-            aria-current={at(page.url.pathname === '/alerts')}
-            >{t('Alerts')}{#if session.alerts.length}
-              <span class="count {critical ? 'bad' : 'wait'}">{session.alerts.length}</span>{/if}</a
-          >
-          <a
-            href="/topology"
-            class:here={page.url.pathname === '/topology'}
-            aria-current={at(page.url.pathname === '/topology')}>{t('Topology')}</a
-          >
-          <a
-            href="/network"
-            class:here={page.url.pathname === '/network'}
-            aria-current={at(page.url.pathname === '/network')}>{t('Network')}</a
-          >
-          <a
-            href="/disk"
-            class:here={page.url.pathname === '/disk'}
-            aria-current={at(page.url.pathname === '/disk')}>{t('Disk usage')}</a
-          >
-          <a
-            href="/diagnostics"
-            class:here={page.url.pathname === '/diagnostics'}
-            aria-current={at(page.url.pathname === '/diagnostics')}>{t('Diagnostics')}</a
-          >
+          {#if observeItems.length}
+            <details class="nav-sec" open>
+              <summary class="nav-group">{t('Observe')}</summary>
+              {#each observeItems as item (item.href)}
+                <a
+                  href={item.href}
+                  class:here={page.url.pathname === item.href}
+                  aria-current={at(page.url.pathname === item.href)}
+                >
+                  <span>{item.label}</span>
+                  {#if item.alerts && session.alerts.length}
+                    <span class="count {critical ? 'bad' : 'wait'}">{session.alerts.length}</span>
+                  {/if}
+                </a>
+              {/each}
+            </details>
+          {/if}
 
-          <h2>{t('Studios')}</h2>
-          <a
-            href="/volumes"
-            class:here={page.url.pathname === '/volumes'}
-            aria-current={at(page.url.pathname === '/volumes')}>{t('Volumes Studio')}</a
-          >
-          <a
-            href="/images"
-            class:here={page.url.pathname === '/images'}
-            aria-current={at(page.url.pathname === '/images')}>{t('Images & GHCR Hub')}</a
-          >
-          <a
-            href="/stacks"
-            class:here={page.url.pathname === '/stacks'}
-            aria-current={at(page.url.pathname === '/stacks')}>{t('Stacks')}</a
-          >
-          <a
-            href="/deploy"
-            class:here={page.url.pathname === '/deploy'}
-            aria-current={at(page.url.pathname === '/deploy')}>{t('Deploy')}</a
-          >
-          <a
-            href="/templates"
-            class:here={page.url.pathname === '/templates'}
-            aria-current={at(page.url.pathname === '/templates')}>{t('Templates')}</a
-          >
-          <a
-            href="/import"
-            class:here={page.url.pathname === '/import'}
-            aria-current={at(page.url.pathname === '/import')}>{t('Import compose')}</a
-          >
-          <a
-            href="/apply"
-            class:here={page.url.pathname === '/apply'}
-            aria-current={at(page.url.pathname === '/apply')}>{t('Apply YAML')}</a
-          >
+          {#if studioItems.length}
+            <details class="nav-sec" open>
+              <summary class="nav-group">{t('Studios')}</summary>
+              {#each studioItems as item (item.href)}
+                <a
+                  href={item.href}
+                  class:here={page.url.pathname === item.href}
+                  aria-current={at(page.url.pathname === item.href)}
+                  >{item.label}</a
+                >
+              {/each}
+            </details>
+          {/if}
 
           {#if session.settings.clusters?.length}
-            <h2>{t('Clusters')}</h2>
-            <a
-              href="/clusters"
-              class:here={page.url.pathname === '/clusters'}
-              aria-current={at(page.url.pathname === '/clusters')}>{t('All clusters')}</a
-            >
-            {#each session.settings.clusters as c, i (i)}
-              <a
-                href={there(c.url)}
-                title={t('This page on {name}, signed into on its own', { name: c.name })}
-                >{c.name}</a
-              >
-            {/each}
+            <details class="nav-sec" open>
+              <summary class="nav-group">{t('Clusters')}</summary>
+              {#if matchesNav(t('All clusters'))}
+                <a
+                  href="/clusters"
+                  class:here={page.url.pathname === '/clusters'}
+                  aria-current={at(page.url.pathname === '/clusters')}>{t('All clusters')}</a
+                >
+              {/if}
+              {#each session.settings.clusters.filter((c) => matchesNav(c.name)) as c, i (i)}
+                <a
+                  href={there(c.url)}
+                  title={t('This page on {name}, signed into on its own', { name: c.name })}
+                  >{c.name}</a
+                >
+              {/each}
+            </details>
           {/if}
           {#if shownPlugins.length}
-            <h2>{t('Plugins')}</h2>
-            {#each shownPlugins as p (`${p.namespace}/${p.name}`)}
-              {@const href = `/plugins/${p.namespace}/${p.name}`}
-              <a {href} class:here={page.url.pathname === href} aria-current={at(page.url.pathname === href)}
-                >{p.name}{#if !session.namespace}<span class="muted"> ({p.namespace})</span>{/if}</a
-              >
-            {/each}
+            <details class="nav-sec" open>
+              <summary class="nav-group">{t('Plugins')}</summary>
+              {#each shownPlugins.filter((p) => matchesNav(p.name)) as p (`${p.namespace}/${p.name}`)}
+                {@const href = `/plugins/${p.namespace}/${p.name}`}
+                <a {href} class:here={page.url.pathname === href} aria-current={at(page.url.pathname === href)}
+                  >{p.name}{#if !session.namespace}<span class="muted"> ({p.namespace})</span>{/if}</a
+                >
+              {/each}
+            </details>
           {/if}
           {#if session.settings.links?.length}
-            <h2>{t('Links')}</h2>
-            {#each session.settings.links as l, i (i)}
-              <a href={l.url} target="_blank" rel="noopener noreferrer">{l.label}</a>
-            {/each}
+            <details class="nav-sec" open>
+              <summary class="nav-group">{t('Links')}</summary>
+              {#each session.settings.links.filter((l) => matchesNav(l.label)) as l, i (i)}
+                <a href={l.url} target="_blank" rel="noopener noreferrer">{l.label}</a>
+              {/each}
+            </details>
           {/if}
-          <h2>{t('Workloads and config')}</h2>
-          {#each nsKinds as k (k.kind)}
-            <a
-              href="/k/{k.kind}"
-              class:here={page.url.pathname.startsWith(`/k/${k.kind}`)}
-              aria-current={at(page.url.pathname.startsWith(`/k/${k.kind}`))}
-              >{plural(k.kind)}</a
-            >
-          {/each}
-          {#if clusterKinds.length}
-            <h2>{t('Cluster')}</h2>
-            <a
-              href="/cluster"
-              class:here={page.url.pathname === '/cluster'}
-              aria-current={at(page.url.pathname === '/cluster')}>{t('Operations')}</a
-            >
-            <a
-              href="/audit"
-              class:here={page.url.pathname === '/audit'}
-              aria-current={at(page.url.pathname === '/audit')}>{t('Audit')}</a
-            >
-            <a
-              href="/settings"
-              class:here={page.url.pathname === '/settings'}
-              aria-current={at(page.url.pathname === '/settings')}>{t('Console settings')}</a
-            >
-            {#each clusterKinds as k (k.kind)}
-              <a
-                href="/k/{k.kind}"
-                class:here={page.url.pathname.startsWith(`/k/${k.kind}`)}
-                aria-current={at(page.url.pathname.startsWith(`/k/${k.kind}`))}
-                >{plural(k.kind)}</a
-              >
-            {/each}
+          {#if filteredNsKinds.length}
+            <details class="nav-sec" open>
+              <summary class="nav-group">{t('Workloads and config')}</summary>
+              {#each filteredNsKinds as k (k.kind)}
+                <a
+                  href="/k/{k.kind}"
+                  class:here={page.url.pathname.startsWith(`/k/${k.kind}`)}
+                  aria-current={at(page.url.pathname.startsWith(`/k/${k.kind}`))}
+                  >{plural(k.kind)}</a
+                >
+              {/each}
+            </details>
+          {/if}
+          {#if clusterKinds.length && (clusterOpsItems.length || filteredClusterKinds.length)}
+            <details class="nav-sec" open>
+              <summary class="nav-group">{t('Cluster')}</summary>
+              {#each clusterOpsItems as item (item.href)}
+                <a
+                  href={item.href}
+                  class:here={page.url.pathname === item.href}
+                  aria-current={at(page.url.pathname === item.href)}
+                  >{item.label}</a
+                >
+              {/each}
+              {#each filteredClusterKinds as k (k.kind)}
+                <a
+                  href="/k/{k.kind}"
+                  class:here={page.url.pathname.startsWith(`/k/${k.kind}`)}
+                  aria-current={at(page.url.pathname.startsWith(`/k/${k.kind}`))}
+                  >{plural(k.kind)}</a
+                >
+              {/each}
+            </details>
           {/if}
         </nav>
         <div class="who">

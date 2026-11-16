@@ -74,12 +74,12 @@
     ...(kind === 'Node' ? [{ id: 'tasks', label: t('Tasks') }] : []),
     ...(kind === 'Volume' ? [{ id: 'data', label: t('Data') }] : []),
     ...(kind === 'Namespace' ? [{ id: 'quota', label: t('Quota') }] : []),
-    ...(kind === 'Task' || kind === 'Service' || kind === 'Node' ? [{ id: 'usage', label: t('Usage') }] : []),
+    ...(kind === 'Task' || kind === 'Service' || kind === 'Node' ? [{ id: 'usage', label: t('Telemetry') }] : []),
     ...(kind === 'Task'
       ? [
           { id: 'logs', label: t('Logs') },
           { id: 'files', label: t('Files') },
-          { id: 'terminal', label: t('Terminal') }
+          { id: 'terminal', label: t('Console') }
         ]
       : []),
     ...(kind === 'Build' ? [{ id: 'buildlog', label: t('Log') }] : []),
@@ -121,7 +121,17 @@
     <span class="state bad">{t('deleted')}</span>
   {:else if object}
     {@const obj = object}
+    {@const vmSpec = (obj.spec?.pod?.containers ?? []).find((c: { vm?: Record<string, unknown> }) => c.vm)?.vm}
     <div class="bar">
+      {#if kind === 'Task' || kind === 'Service'}
+        <span class="tag">
+          {#if vmSpec}
+            {t('bhyve VM')} · {vmSpec.cpus ?? 1} vCPU · {vmSpec.memory ?? ''} · {vmSpec.boot ?? 'bhyveload'}
+          {:else}
+            {t('FreeBSD Jail')}
+          {/if}
+        </span>
+      {/if}
       {#if kind === 'Task'}
         <button
           type="button"

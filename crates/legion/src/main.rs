@@ -736,6 +736,12 @@ pub enum ImageCommand {
         query: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: u32,
+        /// Namespace holding `--secret` (for ghcr.io search).
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// Docker-config Secret holding a GitHub PAT (`read:packages`) for ghcr.io.
+        #[arg(long)]
+        secret: Option<String>,
     },
     /// Show the SBOM attested for a registry image (`cosign attest
     /// --type spdxjson` or `cyclonedx`): its packages, and whether a key of
