@@ -79,6 +79,10 @@ impl Cluster {
 
         let sys = Arc::new(FakeSys::new());
         sys.set_default_interface("re0");
+        // What legion doctor requires of a host: else the node takes no
+        // new tasks.
+        sys.set_main_rules(&format!("{}\n", legion_net::lb::HOOKS.join("\n")));
+        sys.zfs_create("tank/legion", &[]).unwrap();
         let rt = Arc::new(FakeRuntime::new(sys.clone()));
         rt.add_image(INFRA);
         let mut config = AgentConfig::new("n1", dir.path().join("tasks"));

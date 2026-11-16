@@ -203,6 +203,10 @@ impl Cluster {
     async fn add_node(&mut self, protocol: legion_api::protocol::Protocol) -> usize {
         let sys = Arc::new(FakeSys::new());
         sys.set_default_interface("re0");
+        // What legion doctor requires of a host: else the node takes no
+        // new tasks.
+        sys.set_main_rules(&format!("{}\n", legion_net::lb::HOOKS.join("\n")));
+        sys.zfs_create("tank/legion", &[]).unwrap();
         let rt = Arc::new(FakeRuntime::new(sys.clone()));
         rt.add_image(INFRA);
         rt.add_image("web:1");
