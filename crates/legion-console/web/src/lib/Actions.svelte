@@ -149,6 +149,21 @@
             set('stopped', true, t('{name} stopped', { name }), t('{name} already stopped', { name }))}
       >{object.spec?.stopped ? t('Start') : t('Stop')}</button
     >
+    <button
+      disabled={!!why || busy || (!!object.spec?.stopped && !object.spec?.paused)}
+      title={why ??
+        (object.spec?.paused
+          ? t('Let its tasks go on where they were')
+          : object.spec?.stopped
+            ? t('Stopped: it has no tasks to pause')
+            : t('Freeze its tasks where they are, out of its endpoints, until resumed'))}
+      onclick={() =>
+        object.spec?.paused
+          ? set('paused', false, t('{name} resumed', { name }), t('{name} already resumed', { name }))
+          : confirm(t('Pause {name}? Its tasks are frozen and out of its endpoints until it is resumed.', { name })) &&
+            set('paused', true, t('{name} paused', { name }), t('{name} already paused', { name }))}
+      >{object.spec?.paused ? t('Resume') : t('Pause')}</button
+    >
   {:else if kind === 'CronJob'}
     <button
       disabled={!!why || busy}

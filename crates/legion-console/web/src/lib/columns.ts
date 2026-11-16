@@ -57,7 +57,11 @@ export function columns(kind: string): Column[] {
       ];
     case 'Task':
       return [
-        { label: t('State'), value: (o) => s(o.status?.state), state: true },
+        {
+          label: t('State'),
+          value: (o) => (o.status?.paused ? 'paused' : s(o.status?.state)),
+          state: true
+        },
         { label: t('Ready'), value: (o) => (o.status?.ready ? t('yes') : '') },
         { label: t('Node'), value: (o) => s(o.spec?.node) },
         { label: t('IP'), value: (o) => s(o.status?.ip) },
@@ -77,7 +81,9 @@ export function columns(kind: string): Column[] {
           value: (o) =>
             o.spec?.stopped
               ? t('stopped')
-              : o.status
+              : o.spec?.paused
+                ? t('paused {n}/{of}', { n: o.status?.paused ?? 0, of: o.status?.running ?? 0 })
+                : o.status
                 ? `${o.status.ready ?? 0}/${o.status.desired ?? 0}`
                 : ''
         },
@@ -181,6 +187,7 @@ export function tone(state: string): string {
     case 'assigned':
     case 'suspect':
     case 'draining':
+    case 'paused':
       return 'wait';
     case 'failed':
     case 'rejected':
