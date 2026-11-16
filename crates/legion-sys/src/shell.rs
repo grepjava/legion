@@ -1135,6 +1135,10 @@ impl<R: Runner> Sys for Shell<R> {
         self.run("zfs", &a).map(drop)
     }
 
+    fn zfs_rename(&self, from: &str, to: &str) -> Result<()> {
+        self.run("zfs", &args(["rename", from, to])).map(drop)
+    }
+
     fn zfs_send(
         &self,
         snapshot: &str,

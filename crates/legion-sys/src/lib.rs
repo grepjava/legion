@@ -239,6 +239,15 @@ pub trait Sys: Send + Sync {
     /// Destroys a dataset or, if `name` has an `@`, a snapshot. A snapshot
     /// that clones were made from cannot be destroyed, nor its dataset.
     fn zfs_destroy(&self, name: &str, recursive: bool) -> Result<()>;
+    /// Renames a dataset, with its descendants and snapshots, to `to`, a
+    /// name not taken in the same pool (`zfs rename`).
+    fn zfs_rename(&self, from: &str, to: &str) -> Result<()> {
+        let _ = to;
+        Err(Error::Failed {
+            command: format!("zfs rename {from}"),
+            message: "not supported here".to_owned(),
+        })
+    }
     /// Writes a `zfs send` stream of `snapshot` (`<dataset>@<name>`) to
     /// `out`: everything, or only what changed since the dataset's snapshot
     /// `since` (the name after the `@`).

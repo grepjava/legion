@@ -1432,6 +1432,54 @@ impl Sys for FakeSys {
         Ok(())
     }
 
+    fn zfs_rename(&self, from: &str, to: &str) -> Result<()> {
+        let mut s = self.state();
+        if !s.datasets.contains_key(from) {
+            return Err(fail(
+                "zfs rename",
+                format!("cannot open '{from}': dataset does not exist"),
+            ));
+        }
+        if s.datasets.contains_key(to) {
+            return Err(fail(
+                "zfs rename",
+                format!("cannot rename to '{to}': dataset already exists"),
+            ));
+        }
+        // `from`, its descendants and its snapshots, by their new names.
+        let moved = |n: &str| -> Option<String> {
+            let rest = n.strip_prefix(from)?;
+            (rest.is_empty() || rest.starts_with('/') || rest.starts_with('@'))
+                .then(|| format!("{to}{rest}"))
+        };
+        fn renamed<V>(m: &mut BTreeMap<String, V>, moved: &dyn Fn(&str) -> Option<String>) {
+            let keys: Vec<String> = m.keys().filter(|k| moved(k).is_some()).cloned().collect();
+            for k in keys {
+                let v = m.remove(&k).expect("listed");
+                m.insert(moved(&k).expect("listed"), v);
+            }
+        }
+        renamed(&mut s.datasets, &moved);
+        renamed(&mut s.snapshots, &moved);
+        renamed(&mut s.contents, &moved);
+        renamed(&mut s.origins, &moved);
+        for d in s.datasets.iter_mut() {
+            d.1.name.clone_from(d.0);
+        }
+        for o in s.origins.values_mut() {
+            if let Some(n) = moved(o) {
+                *o = n;
+            }
+        }
+        let props: Vec<((String, String), String)> =
+            std::mem::take(&mut s.props).into_iter().collect();
+        s.props = props
+            .into_iter()
+            .map(|((d, k), v)| ((moved(&d).unwrap_or(d), k), v))
+            .collect();
+        Ok(())
+    }
+
     fn zfs_destroy(&self, name: &str, recursive: bool) -> Result<()> {
         let mut s = self.state();
         // Clones of the snapshot, or of any of the dataset's, outside what
