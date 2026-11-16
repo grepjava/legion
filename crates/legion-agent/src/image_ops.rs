@@ -86,12 +86,22 @@ async fn audit(builder: &Builder, packages: &[(String, String)]) -> Result<Strin
         .map_err(|e| Status::failed_precondition(format!("pkg audit: {e}")))?;
     // 1: something is vulnerable, which is what the JSON says.
     match out.status.code() {
-        Some(0 | 1) => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Some(0 | 1) => Ok(audit_json(&String::from_utf8_lossy(&out.stdout)).to_owned()),
         _ => Err(Status::failed_precondition(format!(
             "pkg audit: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ))),
     }
+}
+
+/// The JSON in `pkg audit --raw`'s output: with `-F` it first says how the
+/// fetch of the vulnerability database went ("vulnxml file up-to-date"),
+/// on standard output too. Empty when there is none.
+fn audit_json(stdout: &str) -> &str {
+    stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or("")
 }
 
 fn parse_auth(auth: &[u8]) -> Result<Vec<crate::runtime::Login>, Status> {
@@ -380,5 +390,19 @@ pub(crate) async fn run<R: Runtime>(
         other => Err(Status::invalid_argument(format!(
             "unknown image operation {other:?}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_audits_json_is_found_after_what_the_fetch_said() {
+        // pkg 2.8's `pkg audit -F --raw=json-compact`, as on a lab node.
+        let json = r#"{"pkg_count":1,"packages":{"pcre2":{"version":"10.45","issue_count":0,"issues":[]}}}"#;
+        assert_eq!(audit_json(&format!("vulnxml file up-to-date\n{json}\n")), json);
+        assert_eq!(audit_json(&format!("{json}\n")), json);
+        assert_eq!(audit_json("vulnxml file up-to-date\n"), "");
     }
 }

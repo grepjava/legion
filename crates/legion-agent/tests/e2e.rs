@@ -55,7 +55,7 @@ fn stand_in_pkg(dir: &std::path::Path) -> String {
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\necho \"$@\" >> {}/pkg-args\necho '{json}'\nexit 1\n",
+            "#!/bin/sh\necho \"$@\" >> {}/pkg-args\n# As -F says first, on standard output.\necho 'vulnxml file up-to-date'\necho '{json}'\nexit 1\n",
             dir.display()
         ),
     )
