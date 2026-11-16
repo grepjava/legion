@@ -516,8 +516,12 @@
           <!-- Node bands, behind their pods; a band opens its node. -->
           {#snippet band(b: Band)}
             {@const nh = nodeHealth(b.node)}
-            <rect class="band {nodeHue(b.node)} {nh}" class:unplaced={!b.node} x={BAND_X} y={b.top} width={BAND_W} height={b.h} rx="10" />
-            <text class="band-title" x={BAND_X + 12} y={b.top + 18}>{b.node || t('not placed yet')}</text>
+            <rect class="band {nh}" class:unplaced={!b.node} x={BAND_X} y={b.top} width={BAND_W} height={b.h} rx="10" />
+            {#if b.node}
+              <!-- Its node's colour, as on its pods grouped by service. -->
+              <circle class="node-tag {nodeHue(b.node)}" cx={BAND_X + 16} cy={b.top + 14} r="4.5" />
+            {/if}
+            <text class="band-title" x={BAND_X + (b.node ? 26 : 12)} y={b.top + 18}>{b.node || t('not placed yet')}</text>
             {#if nodeNote(b.node)}
               <text class="sub band-note {nh}" x={BAND_X + BAND_W - 12} y={b.top + 18} text-anchor="end">{nodeNote(b.node)}</text>
             {/if}
@@ -1049,15 +1053,19 @@
   .node-tag {
     fill: var(--hue, var(--control));
   }
+  /* Neutral, as the rings are: only a node that is down is coloured. */
   .band {
-    fill: color-mix(in srgb, var(--hue, var(--control)) 7%, transparent);
-    stroke: var(--hue, var(--control));
+    fill: color-mix(in srgb, var(--control) 6%, transparent);
+    stroke: var(--control);
     stroke-width: 1.5;
   }
   .band.bad {
     stroke: var(--bad);
     stroke-width: 2.5;
     fill: color-mix(in srgb, var(--bad) 9%, transparent);
+  }
+  .band.wait {
+    stroke: var(--wait);
   }
   .band.unplaced {
     stroke-dasharray: 5 4;
