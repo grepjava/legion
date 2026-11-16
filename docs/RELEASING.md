@@ -70,6 +70,18 @@ for a reason stated in the notes. Stop for any of these:
 A change after the run needs a new run. So does a run on a tree whose
 `.qualify-revision` is not the tagged commit.
 
+Then check what `legion local` signs and attests against the tools others
+read it with, on a host with `cosign` and `pyspdxtools` (from spdx-tools):
+
+```sh
+scripts/attest-check.sh EMPTY-DIR
+```
+
+It pushes a signed image to the handoff test's registry, attests its
+provenance and SBOM, and has cosign verify all three with the key and refuse
+another key, and the SPDX validator read the SBOM. It exits 0 only if each
+came out as it should.
+
 ## 3. Tag
 
 ```sh
