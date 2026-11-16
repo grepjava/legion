@@ -31,6 +31,11 @@ pub struct TaskSpec {
     pub node: String,
     #[serde(default)]
     pub desired_state: DesiredState,
+    /// Frozen where it runs, as its Service is paused: set by the
+    /// controller once the task is on a node whose agent can pause it
+    /// (protocol 3), as an older one would not read it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paused: bool,
     /// Each image of the pod as written, and the digest it runs as
     /// ([`crate::image::pinned`]). Empty where nothing was pinned, as for a
     /// task made before, or while a node can't read this.
@@ -191,6 +196,10 @@ pub struct TaskStatus {
     /// Set by the readiness probe while running.
     #[serde(default)]
     pub ready: bool,
+    /// Its processes are frozen, as its spec asks: it is not ready
+    /// meanwhile, and its probes are held.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paused: bool,
     /// Container restarts by the agent under the restart policy.
     #[serde(default)]
     pub restarts: u32,

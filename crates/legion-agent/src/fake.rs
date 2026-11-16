@@ -159,6 +159,8 @@ struct Session {
 struct Container {
     spec: ContainerSpec,
     running: bool,
+    /// Frozen by a pause, until resumed or stopped.
+    paused: bool,
     exit_code: i32,
     starts: u32,
     jail: Option<String>,
@@ -228,6 +230,26 @@ impl FakeRuntime {
 
     fn state_handle(&self) -> Arc<Mutex<State>> {
         self.state.clone()
+    }
+
+    /// Whether the running container named `name` is paused.
+    pub fn paused(&self, name: &str) -> bool {
+        self.state()
+            .containers
+            .values()
+            .any(|c| c.spec.name == name && c.running && c.paused)
+    }
+
+    fn set_paused(&self, id: &str, paused: bool) -> Result<()> {
+        let mut s = self.state();
+        let Some(c) = s.containers.get_mut(id) else {
+            return Err(api(404, "no such container"));
+        };
+        if !c.running {
+            return Err(api(409, "container state improper"));
+        }
+        c.paused = paused;
+        Ok(())
     }
 
     pub fn add_image(&self, reference: &str) {
@@ -715,6 +737,7 @@ impl Runtime for FakeRuntime {
             Container {
                 spec: spec.clone(),
                 running: false,
+                paused: false,
                 exit_code: 0,
                 starts: 0,
                 jail: None,
@@ -814,8 +837,20 @@ impl Runtime for FakeRuntime {
             return Err(api(500, "it would not stop"));
         }
         let code = s.stop_codes.get(&name).copied().unwrap_or(143);
+        // As the jail runtime does: a paused one is let go to stop.
+        if let Some(c) = s.containers.get_mut(id) {
+            c.paused = false;
+        }
         self.die(&mut s, id, code);
         Ok(())
+    }
+
+    async fn pause(&self, id: &str) -> Result<()> {
+        self.set_paused(id, true)
+    }
+
+    async fn resume(&self, id: &str) -> Result<()> {
+        self.set_paused(id, false)
     }
 
     async fn remove(&self, id: &str) -> Result<()> {

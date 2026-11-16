@@ -63,7 +63,21 @@ pub trait Runtime: Send + Sync + 'static {
     ) -> impl Future<Output = Result<()>> + Send;
     fn create(&self, spec: &ContainerSpec) -> impl Future<Output = Result<String>> + Send;
     fn start(&self, id: &str) -> impl Future<Output = Result<()>> + Send;
+    /// Stops a container; one paused is resumed first, so that it gets
+    /// its stop signal and the grace to act on it.
     fn stop(&self, id: &str, timeout: Duration) -> impl Future<Output = Result<()>> + Send;
+    /// Freezes a running container where it is: every process of a jail
+    /// stopped (`SIGSTOP`), a VM's virtual CPUs held. Pausing one paused is
+    /// nothing; a runtime that cannot pause says so.
+    fn pause(&self, id: &str) -> impl Future<Output = Result<()>> + Send {
+        let _ = id;
+        async { Err(Error::Failed("this runtime cannot pause containers".into())) }
+    }
+    /// Lets a paused container run on (`SIGCONT`); one not paused is fine.
+    fn resume(&self, id: &str) -> impl Future<Output = Result<()>> + Send {
+        let _ = id;
+        async { Err(Error::Failed("this runtime cannot pause containers".into())) }
+    }
     fn remove(&self, id: &str) -> impl Future<Output = Result<()>> + Send;
     fn inspect(&self, id: &str) -> impl Future<Output = Result<ContainerInspect>> + Send;
     fn wait(&self, id: &str) -> impl Future<Output = Result<i32>> + Send;

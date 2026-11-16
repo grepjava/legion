@@ -44,6 +44,12 @@ pub struct ServiceSpec {
     /// (the replica count included) is kept for when it starts again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stopped: bool,
+    /// Paused: its tasks stay, frozen where they are (a jail's processes
+    /// stopped, a VM's virtual CPUs held), out of the endpoints and their
+    /// probes held, until it is resumed. A task on a node whose agent is too
+    /// old to pause runs on (`legion_api::protocol`, 3).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paused: bool,
 }
 
 fn is_zero(n: &i32) -> bool {
@@ -1682,6 +1688,10 @@ pub struct PublishedPort {
     pub published_port: u16,
 }
 
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
 /// Observed state, written by the Service controller.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1691,6 +1701,11 @@ pub struct ServiceStatus {
     pub desired: u32,
     pub running: u32,
     pub ready: u32,
+    /// Of those running, how many are paused. Below `running` while the
+    /// service is paused, the rest are still being paused, or are on nodes
+    /// too old to pause them.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub paused: u32,
     /// Assigned by the allocator when `endpoint.mode` is `vip` and the
     /// service has ports.
     #[serde(default, skip_serializing_if = "Option::is_none")]

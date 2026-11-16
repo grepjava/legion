@@ -382,6 +382,14 @@ impl Harness {
         self.write(object, Precondition::MustNotExist).await.key()
     }
 
+    /// The task's spec says to pause it, or not, as the controller writes.
+    async fn set_paused(&self, key: &ObjectKey, paused: bool) {
+        let mut o = self.store.get(key).unwrap().unwrap();
+        o.spec["paused"] = paused.into();
+        let v = o.metadata.version;
+        self.write(o, Precondition::Version(v)).await;
+    }
+
     async fn shut_down(&self, key: &ObjectKey) {
         let mut o = self.store.get(key).unwrap().unwrap();
         o.spec["desiredState"] = serde_json::to_value(DesiredState::Shutdown).unwrap();
@@ -1468,6 +1476,71 @@ containers:
         status.message
     );
     h.nothing_left().await;
+}
+
+/// A paused task's containers are frozen and it is not ready; resumed,
+/// they go on and it is ready again. A stop while paused stops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_task_pauses_resumes_and_stops_paused() {
+    let h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let pod = r#"containers: [{ name: app, image: "app:1" }]"#;
+    let key = h.task("web-1", pod).await;
+    h.wait_state(&key, TaskState::Running).await;
+    eventually("ready", || h.status(&key).ready).await;
+
+    h.set_paused(&key, true).await;
+    eventually("paused", || h.status(&key).paused).await;
+    assert!(h.rt.paused("shop_web-1_app"), "its container is frozen");
+    let st = h.status(&key);
+    assert_eq!(st.state, TaskState::Running);
+    assert!(!st.ready, "a paused task takes no traffic");
+    assert_eq!(st.message, "paused");
+
+    h.set_paused(&key, false).await;
+    eventually("resumed", || !h.status(&key).paused).await;
+    assert!(!h.rt.paused("shop_web-1_app"));
+    eventually("ready again", || h.status(&key).ready).await;
+
+    h.set_paused(&key, true).await;
+    eventually("paused again", || h.status(&key).paused).await;
+    h.shut_down(&key).await;
+    let st = h.wait_state(&key, TaskState::Shutdown).await;
+    assert!(!st.paused, "ended, nothing is paused");
+    h.nothing_left().await;
+}
+
+/// A task paused before the agent restarts stays paused, its probes held:
+/// the new agent pauses it again rather than probing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paused_task_stays_paused_over_an_agent_restart() {
+    let mut h = Harness::new().await;
+    h.rt.add_image("app:1");
+    let pod = r#"containers: [{ name: app, image: "app:1" }]"#;
+    let key = h.task("web-1", pod).await;
+    h.wait_state(&key, TaskState::Running).await;
+    h.set_paused(&key, true).await;
+    eventually("paused", || h.status(&key).paused).await;
+    let created = h.rt.created();
+
+    h.stop_agent().await;
+    h.start_agent();
+    // Adopted, not made again, and paused as before.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(h.rt.created(), created, "no container recreated");
+    eventually("still paused", || {
+        h.status(&key).paused && h.rt.paused("shop_web-1_app")
+    })
+    .await;
+    assert!(!h.status(&key).ready);
+
+    // Resumed after the restart: the new agent lets it go.
+    h.set_paused(&key, false).await;
+    eventually("resumed", || {
+        !h.status(&key).paused && !h.rt.paused("shop_web-1_app")
+    })
+    .await;
+    eventually("ready again", || h.status(&key).ready).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

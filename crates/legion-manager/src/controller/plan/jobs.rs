@@ -84,6 +84,7 @@ impl Job {
                 // Jobs run at the default priority.
                 priority: 0,
                 stopped: false,
+                paused: false,
             },
             refused: Default::default(),
             covered: self.covered,

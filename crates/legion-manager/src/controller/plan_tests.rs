@@ -4898,6 +4898,50 @@ stopped: true"
     assert_eq!(w.running().len(), 5);
 }
 
+/// A paused service's tasks are told to pause where their node's agent
+/// reads it (protocol 3), and run on elsewhere; none is replaced, and
+/// resumed, they are told to go on.
+#[test]
+fn a_paused_service_pauses_its_tasks_on_nodes_that_can() {
+    let mut w = World::new();
+    w.node("new", &[]);
+    w.node("old", &[]);
+    w.nodes[0].status.protocol = legion_api::protocol::Protocol::current();
+    let agent = "mode: global
+pod: { containers: [{ name: a, image: \"a:1\" }] }";
+    w.service("agent", agent);
+    w.settle();
+    assert_eq!(w.running().len(), 2);
+    let before = w.tasks();
+
+    w.service(
+        "agent",
+        &format!(
+            "{agent}
+paused: true"
+        ),
+    );
+    w.settle();
+    let paused = |w: &World, node: &str| {
+        w.tasks
+            .iter()
+            .find(|t| t.spec.node == node && t.spec.desired_state == DesiredState::Running)
+            .map(|t| t.spec.paused)
+    };
+    assert_eq!(paused(&w, "new"), Some(true));
+    assert_eq!(
+        paused(&w, "old"),
+        Some(false),
+        "an older agent would refuse it"
+    );
+    assert_eq!(w.tasks(), before, "the same tasks, none replaced");
+
+    w.service("agent", agent);
+    w.settle();
+    assert_eq!(paused(&w, "new"), Some(false));
+    assert_eq!(w.tasks(), before);
+}
+
 impl World {
     /// One pass of the planner over the world as it is, timed: how long it
     /// took and how many actions it planned.

@@ -194,6 +194,8 @@ pub struct Agent<R, C> {
 struct Worker {
     tx: mpsc::Sender<Msg>,
     stopping: bool,
+    /// Whether the worker was last told to pause its task.
+    paused: bool,
     /// Set with a stop, which a status report under way gives way to.
     halt: tokio::sync::watch::Sender<bool>,
 }
@@ -1356,6 +1358,12 @@ async fn reconcile<R: Runtime, C: Control>(
                 if !wanted && !w.stopping && a.spec.desired_state == DesiredState::Shutdown {
                     w.halt.send_replace(true);
                     w.stopping = w.tx.send(Msg::Stop).await.is_ok();
+                } else if wanted && !w.stopping && w.paused != a.spec.paused {
+                    // Told again on the next reconcile if the worker's
+                    // queue is full.
+                    if w.tx.try_send(Msg::Pause(a.spec.paused)).is_ok() {
+                        w.paused = a.spec.paused;
+                    }
                 }
             }
             // A task to shut down that never reached an end state still
@@ -1366,6 +1374,7 @@ async fn reconcile<R: Runtime, C: Control>(
             {
                 let (tx, rx) = mpsc::channel(64);
                 let (halt, halted) = tokio::sync::watch::channel(false);
+                let paused = a.spec.paused;
                 let (worker_ctx, a, key) = (ctx.clone(), a.clone(), uid.clone());
                 let handle = running.spawn(async move {
                     let end = task::run(worker_ctx, a, rx, halted).await;
@@ -1377,6 +1386,8 @@ async fn reconcile<R: Runtime, C: Control>(
                     Worker {
                         tx,
                         stopping: false,
+                        // The worker reads it from its assignment.
+                        paused,
                         halt,
                     },
                 );

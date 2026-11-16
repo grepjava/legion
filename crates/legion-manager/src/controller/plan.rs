@@ -1113,6 +1113,8 @@ fn service(
         }
     }
 
+    pause(s, tasks, nodes, plan);
+
     // Status, from the tasks as they are now.
     let running: Vec<&&Task> = tasks
         .iter()
@@ -1123,6 +1125,7 @@ fn service(
         desired: wanted.len() as u32,
         running: running.len() as u32,
         ready: running.iter().filter(|t| t.status.ready).count() as u32,
+        paused: running.iter().filter(|t| t.status.paused).count() as u32,
         virtual_ip: addrs.vip.map(|ip| ip.to_string()),
         published_ports: addrs.published,
         conflicts: addrs.conflicts,
@@ -1438,6 +1441,9 @@ fn new_task(
         stateful: s.spec.mode == ServiceMode::Stateful,
         node,
         desired_state: DesiredState::Running,
+        // Paused, if the service is, once on a node that can pause it:
+        // see [`paused`].
+        paused: false,
         pod: s.spec.pod.clone(),
         images: pins.clone(),
         snapshot: None,
@@ -1456,6 +1462,54 @@ fn new_task(
         object,
         spec,
         status: TaskStatus::default(),
+    }
+}
+
+/// The protocol from which an agent pauses a task ([`TaskSpec::paused`]).
+const PAUSES: u32 = 3;
+
+/// A paused service's tasks told to pause, a resumed one's to resume, in
+/// their spec, for their agents. Only on nodes whose agent reads it: a task
+/// on an older node, or not yet placed, runs on (and is paused once it is
+/// on a node that can). A task with another action planned waits for the
+/// next pass, as both would write it.
+fn pause(s: &Service, tasks: &[&Task], nodes: &[Node], plan: &mut Plan) {
+    let want = s.spec.paused && !s.spec.stopped;
+    for t in tasks {
+        if t.spec.paused == want
+            || t.spec.desired_state != DesiredState::Running
+            || t.status.state.is_terminal()
+        {
+            continue;
+        }
+        if want {
+            let pauses = nodes
+                .iter()
+                .find(|n| n.name() == t.spec.node)
+                .is_some_and(|n| {
+                    legion_api::protocol::Protocol::said(
+                        n.status.protocol.speaks,
+                        n.status.protocol.oldest,
+                    )
+                    .speaks
+                        >= PAUSES
+                });
+            if !pauses {
+                continue;
+            }
+        }
+        let key = t.object.key();
+        if plan.actions.iter().any(|a| a.key() == key) {
+            continue;
+        }
+        let mut o = t.object.clone();
+        if want {
+            o.spec["paused"] = true.into();
+        } else if let Some(spec) = o.spec.as_object_mut() {
+            spec.remove("paused");
+        }
+        plan.actions
+            .push(Action::Update(o, t.object.metadata.version));
     }
 }
 

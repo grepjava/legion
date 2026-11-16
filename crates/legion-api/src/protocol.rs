@@ -9,8 +9,9 @@
 use serde::{Deserialize, Serialize};
 
 /// The protocol this build speaks. 2: the managers' log may hold guarded
-/// writes (`legion_store::Command::Guarded`).
-pub const SPEAKS: u32 = 2;
+/// writes (`legion_store::Command::Guarded`). 3: a task's spec may say it
+/// is paused (`TaskSpec::paused`), which an agent before would refuse.
+pub const SPEAKS: u32 = 3;
 /// The oldest protocol this build works with.
 pub const OLDEST: u32 = 1;
 

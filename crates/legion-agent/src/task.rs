@@ -42,6 +42,9 @@ pub(crate) enum Msg {
     Resync,
     /// The task is no longer wanted here: tear the pod down.
     Stop,
+    /// Freeze the pod's containers where they are (`true`), or let them go
+    /// on, as the task's spec now says.
+    Pause(bool),
 }
 
 pub(crate) struct Ctx<R, C> {
@@ -200,6 +203,9 @@ struct Worker<R, C> {
     probe_rx: mpsc::UnboundedReceiver<probe::Report>,
     /// A VM pod's tap device, once its network is attached.
     tap: Option<String>,
+    /// Whether the task's spec says to pause it, as last told; the status
+    /// says whether it is.
+    paused: bool,
 }
 
 /// How a worker ended: the state it last reported, and that status if the
@@ -216,6 +222,7 @@ pub(crate) async fn run<R: Runtime, C: Control>(
     halt: tokio::sync::watch::Receiver<bool>,
 ) -> Ended {
     let status = a.status.clone();
+    let paused = a.spec.paused;
     let (probe_tx, probe_rx) = mpsc::unbounded_channel();
     let mut w = Worker {
         ctx,
@@ -229,6 +236,7 @@ pub(crate) async fn run<R: Runtime, C: Control>(
         probe_tx,
         probe_rx,
         tap: None,
+        paused,
     };
     let span = tracing::info_span!("task", task = %w.a.key, uid = %w.a.uid);
     w.main().instrument(span).await;
@@ -368,6 +376,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 msg = self.rx.recv() => match msg {
                     None => return false,
                     Some(Msg::Stop) => self.stopping = true,
+                    Some(Msg::Pause(p)) => self.paused = p,
                     Some(_) => {}
                 },
             }
@@ -377,6 +386,8 @@ impl<R: Runtime, C: Control> Worker<R, C> {
     async fn finish(&mut self, state: TaskState, message: String, exit_code: Option<i32>) {
         tracing::info!(state = state.as_str(), "{message}");
         self.status.exit_code = exit_code;
+        // Ended, nothing of it is paused.
+        self.status.paused = false;
         // Its jail is gone, or soon will be.
         self.status.jid = None;
         self.report(state, message).await;
@@ -408,8 +419,10 @@ impl<R: Runtime, C: Control> Worker<R, C> {
     /// the containers are checked once the pod is up.
     fn stop_requested(&mut self) -> bool {
         while let Ok(msg) = self.rx.try_recv() {
-            if matches!(msg, Msg::Stop) {
-                self.stopping = true;
+            match msg {
+                Msg::Stop => self.stopping = true,
+                Msg::Pause(p) => self.paused = p,
+                _ => {}
             }
         }
         self.stopping
@@ -424,6 +437,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         loop {
             match self.rx.recv().await {
                 Some(Msg::Stop) => return Abort::Stopped,
+                Some(Msg::Pause(p)) => self.paused = p,
                 Some(_) => {}
                 None => return Abort::Closing,
             }
@@ -1017,6 +1031,9 @@ impl<R: Runtime, C: Control> Worker<R, C> {
     }
 
     async fn probed(&mut self, pod: &mut Pod, r: probe::Report) {
+        if self.status.paused {
+            return;
+        }
         let Some(m) = pod
             .members
             .iter_mut()
@@ -1112,6 +1129,13 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 self.report(TaskState::Running, message).await;
             }
         }
+        // As the spec says, whatever the pod was left as: an adopted pod's
+        // probes have just started over, and are held again if it is to be
+        // paused; one left frozen by an agent before is let go if not.
+        if self.paused || self.status.paused {
+            self.status.paused = !self.paused;
+        }
+        self.apply_pause(&mut pod).await;
         loop {
             // A stop may be queued behind other messages.
             if self.stopping || *self.halt.borrow() {
@@ -1130,7 +1154,12 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 }
                 return self.finish(state, message, code).await;
             }
-            let next_restart = pod.members.iter().filter_map(|m| m.restart_at).min();
+            // No container restarts while the pod is paused: once resumed.
+            let next_restart = if self.status.paused {
+                None
+            } else {
+                pod.members.iter().filter_map(|m| m.restart_at).min()
+            };
             tokio::select! {
                 msg = self.rx.recv() => match msg {
                     // The agent is shutting down; the pod keeps running.
@@ -1138,6 +1167,10 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                     Some(Msg::Stop) => {
                         self.drain().await;
                         return self.stop().await;
+                    }
+                    Some(Msg::Pause(p)) => {
+                        self.paused = p;
+                        self.apply_pause(&mut pod).await;
                     }
                     Some(Msg::Died { id, .. }) if id == pod.infra => {
                         if !self.remove_pod().await {
@@ -1189,6 +1222,8 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                                 }
                             }
                         }
+                        // A pause or resume that failed, tried again.
+                        self.apply_pause(&mut pod).await;
                         self.resend().await;
                     }
                 },
@@ -1203,6 +1238,67 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 }
             }
         }
+    }
+
+    /// Freezes the pod's running containers, or lets them go on, if that
+    /// is not how they are, as [`Self::paused`] says, and reports it. A
+    /// paused pod is not ready and its probes are held; resumed, they start
+    /// over, as for a container just started. If a container cannot be
+    /// paused, those already are are let go again, and the task runs on,
+    /// saying why; a resync tries again, as it does a resume that failed.
+    async fn apply_pause(&mut self, pod: &mut Pod) {
+        let want = self.paused;
+        if self.status.paused == want {
+            return;
+        }
+        let mut done: Vec<String> = Vec::new();
+        let mut failed = None;
+        for m in pod.members.iter().filter(|m| m.running) {
+            let r = if want {
+                self.ctx.runtime.pause(&m.id).await
+            } else {
+                self.ctx.runtime.resume(&m.id).await
+            };
+            match r {
+                Ok(()) => done.push(m.id.clone()),
+                Err(e) => {
+                    let what = if want { "pausing" } else { "resuming" };
+                    failed = Some(format!("{what} container {}: {e}", m.name));
+                    break;
+                }
+            }
+        }
+        if let Some(why) = failed {
+            tracing::warn!("{why}");
+            if want {
+                for id in &done {
+                    if let Err(e) = self.ctx.runtime.resume(id).await {
+                        tracing::warn!("letting {id} go again: {e}");
+                    }
+                }
+                return self.report(TaskState::Running, why).await;
+            }
+            // Some may be left frozen: tried again on the next resync.
+            return self.report(TaskState::Running, why).await;
+        }
+        if want {
+            for m in &mut pod.members {
+                m.prober = None;
+                m.ready = false;
+            }
+            tracing::info!("paused");
+        } else {
+            for i in 0..pod.members.len() {
+                if pod.members[i].running {
+                    self.probe(&mut pod.members[i]);
+                }
+            }
+            tracing::info!("resumed");
+        }
+        self.status.paused = want;
+        self.ready = pod.ready();
+        let message = if want { "paused" } else { "" };
+        self.report(TaskState::Running, message).await;
     }
 
     /// Applies the restart policy to a container that exited.

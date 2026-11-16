@@ -339,6 +339,54 @@ async fn signal_group(group: u32, jid: u32, signal: &str) -> bool {
     status.is_ok_and(|s| s.success())
 }
 
+/// The file in a container's directory that says it is paused, so that a
+/// stop, by this agent or the next, lets it go first.
+const PAUSED: &str = "paused";
+
+/// Sends every process in jail `jid` `SIGSTOP` (`stop`) or `SIGCONT`. A
+/// stop goes round again until each is stopped (or a zombie), as one may
+/// fork meanwhile; it gives up after a while, as one forking without end
+/// would never let it finish.
+async fn freeze_jail(jid: u32, stop: bool) -> Result<()> {
+    let jid = jid.to_string();
+    let signal = if stop { "-STOP" } else { "-CONT" };
+    for _ in 0..50 {
+        tokio::process::Command::new("pkill")
+            .args([signal, "-j", &jid])
+            .status()
+            .await
+            .map_err(internal)?;
+        if !stop {
+            return Ok(());
+        }
+        let ps = tokio::process::Command::new("ps")
+            // `-x` for those without a terminal; not `-a`, which would add
+            // every process of the host to the jail's.
+            .args(["-x", "-o", "stat=", "-J", &jid])
+            .output()
+            .await
+            .map_err(internal)?;
+        if all_stopped(&String::from_utf8_lossy(&ps.stdout)) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Err(api(
+        500,
+        format!("jail {jid}: its processes kept starting others while being paused"),
+    ))
+}
+
+/// Whether every process `ps -o stat=` lists is stopped (`T`) or a zombie
+/// (`Z`), which no signal stops.
+fn all_stopped(stats: &str) -> bool {
+    stats
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .all(|l| l.starts_with('T') || l.starts_with('Z'))
+}
+
 /// A terminal's controlling side, non-blocking and polled by the reactor,
 /// shared by the session, its output and its input. Its one descriptor
 /// closes when the last of them goes, which hangs the terminal up; a read
@@ -636,6 +684,42 @@ impl JailRuntime {
                 format!("container {id} is not running: container state improper"),
             )),
         }
+    }
+
+    /// A running member (not a pod's own jail), to pause or resume.
+    fn running_member(&self, id: &str) -> Result<(Record, Run)> {
+        let rec = self.record(id)?;
+        match self.status(&rec)? {
+            Status::Running(run) if !rec.is_pod() => Ok((rec, run)),
+            Status::Running(_) => Err(api(409, format!("{id} is a pod: its containers pause"))),
+            _ => Err(api(
+                409,
+                format!("container {id} is not running: container state improper"),
+            )),
+        }
+    }
+
+    /// Stops (`freeze`) or continues every process of a running member: a
+    /// VM's `bhyve`, which holds its virtual CPUs, or all of a jail's.
+    async fn freeze(&self, rec: &Record, run: &Run, freeze: bool) -> Result<()> {
+        let signal = if freeze { "-STOP" } else { "-CONT" };
+        if rec.vm.is_some() {
+            let name = crate::vm::name(&rec.id);
+            let found = tokio::process::Command::new("pkill")
+                .args([signal, "-f", &format!("^bhyve: {name}$")])
+                .status()
+                .await
+                .map_err(internal)?;
+            return if found.success() || !freeze {
+                Ok(())
+            } else {
+                Err(api(
+                    409,
+                    format!("{}: the VM is not running yet (booting)", rec.id),
+                ))
+            };
+        }
+        freeze_jail(run.jid, freeze).await
     }
 
     fn shim_command(&self, args: &[&std::ffi::OsStr]) -> tokio::process::Command {
@@ -1527,8 +1611,17 @@ impl legion_runtime::Runtime for JailRuntime {
         let rec = self.record(id)?;
         self.start_over(&rec).await?;
         let Status::Running(run) = self.status(&rec)? else {
+            let _ = std::fs::remove_file(self.container_dir(id).join(PAUSED));
             return Ok(());
         };
+        // Frozen, it would take its stop signal only once let go, and its
+        // grace run out meanwhile: let go first.
+        if self.container_dir(id).join(PAUSED).exists() {
+            if let Err(e) = self.freeze(&rec, &run, false).await {
+                tracing::warn!("resuming {id} to stop it: {e}");
+            }
+            let _ = std::fs::remove_file(self.container_dir(id).join(PAUSED));
+        }
         if rec.is_pod() {
             return match self.sys.jail_remove(&rec.jail) {
                 Ok(()) | Err(legion_sys::Error::NotFound(_)) => Ok(()),
@@ -1572,6 +1665,25 @@ impl legion_runtime::Runtime for JailRuntime {
             )
             .map_err(internal)?;
         }
+        Ok(())
+    }
+
+    async fn pause(&self, id: &str) -> Result<()> {
+        let (rec, run) = self.running_member(id)?;
+        // Marked first: a stop that comes while it is being frozen lets
+        // go of whatever was.
+        std::fs::write(self.container_dir(id).join(PAUSED), b"").map_err(internal)?;
+        self.freeze(&rec, &run, true).await
+    }
+
+    async fn resume(&self, id: &str) -> Result<()> {
+        // Never paused: nothing to let go.
+        if !self.container_dir(id).join(PAUSED).exists() {
+            return Ok(());
+        }
+        let (rec, run) = self.running_member(id)?;
+        self.freeze(&rec, &run, false).await?;
+        let _ = std::fs::remove_file(self.container_dir(id).join(PAUSED));
         Ok(())
     }
 
@@ -2346,6 +2458,10 @@ mod tests {
         // the first.
         assert_eq!(exit_code(ExitStatus::from_raw(3 << 8)), 3);
         assert_eq!(exit_code(ExitStatus::from_raw(libc::SIGTERM)), 143);
+        // `ps -o stat=` of a jail being paused.
+        assert!(all_stopped("T\nTs\n Z\n\n"));
+        assert!(!all_stopped("T\nSs\n"));
+        assert!(all_stopped(""));
         assert_eq!(exit_code(ExitStatus::from_raw(libc::SIGKILL)), 137);
     }
 

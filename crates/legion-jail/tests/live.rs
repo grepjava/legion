@@ -169,6 +169,66 @@ async fn pods_of_jails() {
     assert_eq!(params["securelevel"], "2", "{params:?}");
     assert_eq!(params["vnet"], "inherit", "{params:?}");
 
+    // Paused, a member's processes are frozen: its count stands still.
+    // Resumed, it counts on; stopped while paused, it is let go first, so
+    // its stop signal's trap runs instead of a kill at the grace's end.
+    let mut spec = member(
+        "shop_web_tick",
+        &pod,
+        "trap 'echo bye; exit 0' TERM; i=0; while :; do i=$((i+1)); echo $i; sleep 0.1; done",
+    );
+    // A task of its own: its end is no event of `t1`'s, which are
+    // followed below.
+    spec.labels = labels("t9", "app");
+    spec.stop_timeout = Some(20);
+    let tick = rt.create(&spec).await.unwrap();
+    rt.start(&tick).await.unwrap();
+    until("ticking", async || {
+        output(&rt, &tick).await.lines().count() > 3
+    })
+    .await;
+    rt.pause(&tick).await.unwrap();
+    rt.pause(&tick).await.unwrap();
+    // A line under way may still land.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let frozen = output(&rt, &tick).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        output(&rt, &tick).await,
+        frozen,
+        "paused, it counts no more"
+    );
+    assert!(
+        rt.inspect(&tick).await.unwrap().state.running,
+        "paused is still running"
+    );
+    rt.resume(&tick).await.unwrap();
+    until("ticking again", async || {
+        output(&rt, &tick).await.lines().count() > frozen.lines().count() + 3
+    })
+    .await;
+    rt.resume(&tick).await.unwrap();
+    rt.pause(&tick).await.unwrap();
+    let stopping = Instant::now();
+    rt.stop(&tick, Duration::from_secs(20)).await.unwrap();
+    assert!(
+        stopping.elapsed() < Duration::from_secs(10),
+        "a paused member stops at once, not at its grace's end: {:?}",
+        stopping.elapsed()
+    );
+    assert_eq!(
+        rt.inspect(&tick).await.unwrap().state.exit_code,
+        0,
+        "its trap ran"
+    );
+    assert!(output(&rt, &tick).await.ends_with("bye\n"));
+    assert!(rt.pause(&tick).await.unwrap_err().is_wrong_state());
+    rt.remove(&tick).await.unwrap();
+    assert!(
+        rt.pause(&pod).await.unwrap_err().is_wrong_state(),
+        "a pod's members pause, not it"
+    );
+
     // A child jail may have only what its parent has: a pod's allows what
     // one container asks for, and the other keeps its locked profile.
     let open = "allow.raw_sockets=true allow.chflags=true enforce_statfs=1";
