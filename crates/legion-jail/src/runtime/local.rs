@@ -184,7 +184,8 @@ impl JailRuntime {
                     pid,
                     jid,
                     started: state::now(),
-                    boot: self.boot,
+                    boot: self.boot.time,
+                    boot_id: self.boot.id.clone(),
                 };
                 state::write(&dir, RUN, &run).map_err(internal)?;
                 drop(starting);

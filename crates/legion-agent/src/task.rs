@@ -545,7 +545,18 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 }
             }
         }
-        tracing::info!("removing an incomplete pod left by a previous run");
+        // What was found, so that a pod not adopted says why.
+        let seen: Vec<String> = found
+            .iter()
+            .map(|c| {
+                let name = match role(c) {
+                    Some(Role::Infra) => "infra",
+                    _ => c.labels.get(LABEL_CONTAINER).map_or("?", String::as_str),
+                };
+                format!("{name} {}", c.state)
+            })
+            .collect();
+        tracing::info!(found = %seen.join(", "), "removing an incomplete pod left by a previous run");
         if !self.remove_pod().await {
             return Err(Abort::Closing);
         }

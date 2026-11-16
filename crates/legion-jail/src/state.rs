@@ -82,6 +82,9 @@ pub struct Run {
     /// When the host booted ([`boot_time`]): a run from before a reboot
     /// is over, whatever its files say.
     pub boot: u64,
+    /// The boot's id ([`Boot`]); empty in runs recorded before it was kept.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub boot_id: String,
 }
 
 /// How it ended.
@@ -103,6 +106,9 @@ pub struct Starting {
     pub pid: u32,
     /// As in [`Run::boot`], as a pid means nothing across a reboot.
     pub boot: u64,
+    /// As in [`Run::boot_id`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub boot_id: String,
 }
 
 pub const RECORD: &str = "record.json";
@@ -203,6 +209,62 @@ pub fn boot_time() -> u64 {
 #[cfg(not(target_os = "freebsd"))]
 pub fn boot_time() -> u64 {
     0
+}
+
+/// The host's id for this boot, `kern.boot_id` in hex: random each boot
+/// (empty where unknown).
+#[cfg(target_os = "freebsd")]
+pub fn boot_id() -> String {
+    let mut id = [0u8; 16];
+    let mut len = id.len();
+    // SAFETY: kern.boot_id is 16 bytes, written into id; len says how many.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.boot_id".as_ptr(),
+            id.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if rc != 0 || len == 0 || id.iter().all(|b| *b == 0) {
+        return String::new();
+    }
+    id[..len].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn boot_id() -> String {
+    String::new()
+}
+
+/// This boot of the host, which a recorded run or start is told apart by:
+/// a pid, or a jid, means nothing across a reboot. The boot's time alone
+/// moves when the clock is set (by ntpd soon after boot, say), as the
+/// kernel keeps the uptime; its id never does, so it decides when both a
+/// record and this boot have one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Boot {
+    pub time: u64,
+    pub id: String,
+}
+
+impl Boot {
+    pub fn now() -> Self {
+        Boot {
+            time: boot_time(),
+            id: boot_id(),
+        }
+    }
+
+    /// Whether a record stamped with `time` and `id` is of this boot.
+    pub fn is(&self, time: u64, id: &str) -> bool {
+        if self.id.is_empty() || id.is_empty() {
+            self.time == time
+        } else {
+            self.id == id
+        }
+    }
 }
 
 /// A signal by name (`SIGQUIT`, `QUIT`) or number, as images give their

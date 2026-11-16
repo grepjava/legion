@@ -217,6 +217,7 @@ mod imp {
             jid: jid as u32,
             started: state::now(),
             boot: state::boot_time(),
+            boot_id: state::boot_id(),
         };
         state::write(dir, RUN, &run).map_err(|e| format!("writing run.json: {e}"))?;
         answer(&format!("ok {pid}"));

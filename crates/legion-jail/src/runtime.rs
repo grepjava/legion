@@ -89,7 +89,7 @@ pub struct JailRuntime {
     dir: PathBuf,
     dataset: Option<String>,
     shim: Vec<OsString>,
-    boot: u64,
+    boot: state::Boot,
     events: broadcast::Sender<Event>,
     execs: Execs,
     used: Used,
@@ -241,13 +241,14 @@ pub struct Starting(PathBuf);
 
 impl Starting {
     fn mark(rt: &JailRuntime, rec: &Record) -> Result<Self> {
-        Self::mark_in(rt.container_dir(&rec.id), rt.boot)
+        Self::mark_in(rt.container_dir(&rec.id), &rt.boot)
     }
 
-    fn mark_in(dir: PathBuf, boot: u64) -> Result<Self> {
+    fn mark_in(dir: PathBuf, boot: &state::Boot) -> Result<Self> {
         let mark = state::Starting {
             pid: std::process::id(),
-            boot,
+            boot: boot.time,
+            boot_id: boot.id.clone(),
         };
         state::write(&dir, STARTING, &mark).map_err(internal)?;
         Ok(Self(dir))
@@ -635,7 +636,7 @@ impl JailRuntime {
             dir: config.state_dir,
             dataset: config.dataset,
             shim: config.shim,
-            boot: state::boot_time(),
+            boot: state::Boot::now(),
             events,
             execs: Arc::default(),
             used: Used::default(),
@@ -644,7 +645,7 @@ impl JailRuntime {
         tokio::spawn(watch_exits(
             rt.sys.clone(),
             rt.dir.clone(),
-            rt.boot,
+            rt.boot.clone(),
             rt.events.clone(),
         ));
         if config.prune_images {
@@ -671,7 +672,7 @@ impl JailRuntime {
     fn status(&self, rec: &Record) -> Result<Status> {
         let files = Files::read(&self.dir, rec)?;
         let jails = jail_names(&*self.sys)?;
-        status(&self.dir, rec, files, self.boot, &jails)
+        status(&self.dir, rec, files, &self.boot, &jails)
     }
 
     /// The jail id of a running member, for exec.
@@ -798,7 +799,7 @@ fn status(
     dir: &Path,
     rec: &Record,
     files: Files,
-    boot: u64,
+    boot: &state::Boot,
     jails: &std::collections::BTreeSet<String>,
 ) -> Result<Status> {
     if let Some(exit) = files.exit {
@@ -807,13 +808,12 @@ fn status(
     let Some(run) = files.run else {
         return Ok(Status::Created);
     };
+    // Its jail, whose name is never used again, is there: the run is of
+    // this boot, whatever the clock says of when the host booted. Without
+    // it, a member's supervisor tells, by a pid that means something only
+    // in the boot it was recorded in.
     let here = jails.contains(&rec.jail);
-    let running = run.boot == boot
-        && if rec.is_pod() {
-            here
-        } else {
-            here || alive(run.shim)
-        };
+    let running = here || (!rec.is_pod() && boot.is(run.boot, &run.boot_id) && alive(run.shim));
     if running {
         return Ok(Status::Running(run));
     }
@@ -831,12 +831,18 @@ fn status(
 }
 
 /// Sends `died` when a container that was not over is.
-async fn watch_exits(sys: Arc<dyn Sys>, dir: PathBuf, boot: u64, events: broadcast::Sender<Event>) {
+async fn watch_exits(
+    sys: Arc<dyn Sys>,
+    dir: PathBuf,
+    boot: state::Boot,
+    events: broadcast::Sender<Event>,
+) {
     let mut seen: BTreeMap<String, (Status, Option<Run>)> = BTreeMap::new();
     let mut first = true;
     loop {
         let dir2 = dir.clone();
         let sys2 = sys.clone();
+        let boot = boot.clone();
         let now =
             tokio::task::spawn_blocking(move || -> Result<Vec<(Record, Status, Option<Run>)>> {
                 let mut read = Vec::new();
@@ -848,7 +854,7 @@ async fn watch_exits(sys: Arc<dyn Sys>, dir: PathBuf, boot: u64, events: broadca
                 let mut out = Vec::new();
                 for (rec, files) in read {
                     let run = files.run.clone();
-                    let s = status(&dir2, &rec, files, boot, &jails)?;
+                    let s = status(&dir2, &rec, files, &boot, &jails)?;
                     out.push((rec, s, run));
                 }
                 Ok(out)
@@ -1027,7 +1033,7 @@ impl JailRuntime {
         let rec = self.make_record(spec)?;
         let dir = self.container_dir(&rec.id);
         let images = self.images.clone();
-        let boot = self.boot;
+        let boot = self.boot.clone();
         // On a blocking thread to the end, even if the caller stops
         // waiting: what it makes is then either recorded or gone, never
         // left where nothing lists it. The record comes first for the same
@@ -1060,7 +1066,7 @@ impl JailRuntime {
             };
             // Before the record: a stop finds the container by that.
             let starting = run
-                .then(|| Starting::mark_in(dir.clone(), boot))
+                .then(|| Starting::mark_in(dir.clone(), &boot))
                 .transpose()
                 .map_err(undo)?;
             state::write(&dir, RECORD, &rec)
@@ -1457,7 +1463,7 @@ impl JailRuntime {
         let deadline = tokio::time::Instant::now() + START_ENDS;
         loop {
             let mark = state::read::<state::Starting>(&dir, STARTING).map_err(internal)?;
-            if mark.is_none_or(|m| m.boot != self.boot || !alive(m.pid))
+            if mark.is_none_or(|m| !self.boot.is(m.boot, &m.boot_id) || !alive(m.pid))
                 || matches!(self.status(rec)?, Status::Running(_))
             {
                 return Ok(());
@@ -1597,7 +1603,8 @@ impl legion_runtime::Runtime for JailRuntime {
                 pid: 0,
                 jid,
                 started: state::now(),
-                boot: self.boot,
+                boot: self.boot.time,
+                boot_id: self.boot.id.clone(),
             };
             state::write(&dir, RUN, &run).map_err(internal)?;
         } else {
@@ -1708,7 +1715,7 @@ impl legion_runtime::Runtime for JailRuntime {
             // Its supervisor may outlive the stop a little, its last output
             // and exit.json still to write: the directory goes once it has.
             if let Some(run) = Files::read(&self.dir, &rec)?.run
-                && run.boot == self.boot
+                && self.boot.is(run.boot, &run.boot_id)
             {
                 let deadline = tokio::time::Instant::now() + SUPERVISOR_GONE;
                 while alive(run.shim) && tokio::time::Instant::now() < deadline {
@@ -2042,20 +2049,21 @@ impl legion_runtime::Runtime for JailRuntime {
         }
         let sys = self.sys.clone();
         let dir = self.dir.clone();
-        let boot = self.boot;
+        let boot = self.boot.clone();
         let start = (path, offset, inode, false);
         let more = futures::stream::unfold(start, move |(path, offset, inode, last)| {
-            let (sys, dir, rec) = (sys.clone(), dir.clone(), rec.clone());
+            let (sys, dir, rec, boot) = (sys.clone(), dir.clone(), rec.clone(), boot.clone());
             async move {
                 if last {
                     return None;
                 }
                 loop {
                     // jls runs off the async workers: this looks every tick.
-                    let (sys, dir, rec) = (sys.clone(), dir.clone(), rec.clone());
+                    let (sys, dir, rec, boot) =
+                        (sys.clone(), dir.clone(), rec.clone(), boot.clone());
                     let over = blocking(move || {
                         Files::read(&dir, &rec)
-                            .and_then(|f| status(&dir, &rec, f, boot, &jail_names(&*sys)?))
+                            .and_then(|f| status(&dir, &rec, f, &boot, &jail_names(&*sys)?))
                     })
                     .await
                     .map_or(true, |s| matches!(s, Status::Exited(_)));
@@ -2094,7 +2102,7 @@ impl legion_runtime::Runtime for JailRuntime {
         let jails = jail_names(&*self.sys)?;
         let mut out = Vec::new();
         for (rec, files) in read {
-            let s = status(&self.dir, &rec, files, self.boot, &jails)?;
+            let s = status(&self.dir, &rec, files, &self.boot, &jails)?;
             let (pid, exit_code) = match &s {
                 Status::Running(r) => (r.pid, 0),
                 Status::Exited(e) => (0, e.code),
@@ -2492,6 +2500,7 @@ mod tests {
                 jid,
                 started: 1000,
                 boot: 1,
+                boot_id: String::new(),
             })
         };
         let exited = |code| {
@@ -2508,6 +2517,99 @@ mod tests {
         assert!(exited_since(&(exited(1), run(1)), &(exited(1), run(2))));
         assert!(!exited_since(&running(1), &running(2)));
         assert!(exited_since(&(Status::Created, None), &(exited(1), run(1))));
+    }
+
+    /// The clock set after boot (by ntpd, say) moves the boot's time the
+    /// kernel tells: a pod or member whose jail is there runs, whatever
+    /// time its run was stamped with, so a new daemon adopts it. Without a
+    /// jail, only a supervisor of this boot is believed.
+    #[test]
+    fn a_run_whose_jail_is_there_runs_whatever_the_boot_time() {
+        let dir = Path::new("/nonexistent");
+        let rec = |id: &str, parent: Option<&str>| Record {
+            id: id.into(),
+            name: id.into(),
+            image: String::new(),
+            created: 0,
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            parent: parent.map(Into::into),
+            standalone: false,
+            jail: match parent {
+                Some(p) => format!("{p}.{id}"),
+                None => id.into(),
+            },
+            root: "/var/empty".into(),
+            dataset: None,
+            argv: Vec::new(),
+            env: Vec::new(),
+            user: String::new(),
+            work_dir: "/".into(),
+            hostname: id.into(),
+            mounts: Vec::new(),
+            params: Vec::new(),
+            stop_signal: 15,
+            stop_timeout: 10,
+            linux: false,
+            cpuset: None,
+            vm: None,
+        };
+        let (pod, member) = (rec("p", None), rec("m", Some("p")));
+        assert!(pod.is_pod() && !member.is_pod());
+        // This process stands for a live supervisor.
+        let me = std::process::id();
+        let files = |boot, id: &str| Files {
+            exit: None,
+            run: Some(Run {
+                shim: me,
+                pid: me,
+                jid: 1,
+                started: 1000,
+                boot,
+                boot_id: id.into(),
+            }),
+        };
+        let now = state::Boot {
+            time: 2000,
+            id: "aa".into(),
+        };
+        let both: BTreeSet<String> = ["p".into(), "p.m".into()].into();
+        let none = BTreeSet::new();
+        let runs = |rec: &Record, f, jails: &BTreeSet<String>| {
+            matches!(
+                status(dir, rec, f, &now, jails).unwrap(),
+                Status::Running(_)
+            )
+        };
+        // Stamped 9 s before the boot time now told, by a daemon started
+        // before the clock was set.
+        assert!(runs(&pod, files(1991, ""), &both));
+        assert!(runs(&member, files(1991, ""), &both));
+        // No jail: a pod is over; a member's supervisor is believed only
+        // if of this boot, by its id, or its time where a side has none.
+        assert!(!runs(&pod, files(2000, "aa"), &none));
+        assert!(runs(&member, files(1991, "aa"), &none));
+        assert!(runs(&member, files(2000, ""), &none));
+        assert!(!runs(&member, files(1991, ""), &none));
+        assert!(!runs(&member, files(2000, "bb"), &none));
+    }
+
+    #[test]
+    fn a_boot_is_told_by_its_id_where_both_have_one() {
+        let now = state::Boot {
+            time: 2000,
+            id: "aa".into(),
+        };
+        assert!(now.is(1991, "aa"));
+        assert!(!now.is(2000, "bb"));
+        assert!(now.is(2000, ""));
+        assert!(!now.is(1991, ""));
+        let no_id = state::Boot {
+            time: 2000,
+            id: String::new(),
+        };
+        assert!(no_id.is(2000, "aa"));
+        assert!(!no_id.is(1991, "aa"));
     }
 
     #[tokio::test]
@@ -2715,7 +2817,16 @@ wait
         let (rt, _) = with_shim(t.path(), sys, "exit 1\n");
         let dir = rt.container_dir("c1");
         let mark = |pid, boot| {
-            state::write(&dir, STARTING, &state::Starting { pid, boot }).unwrap();
+            state::write(
+                &dir,
+                STARTING,
+                &state::Starting {
+                    pid,
+                    boot,
+                    boot_id: String::new(),
+                },
+            )
+            .unwrap();
         };
         // Left by a process gone, and by one from before a reboot.
         let mut gone = std::process::Command::new("/bin/sh")
@@ -2724,13 +2835,13 @@ wait
             .unwrap();
         let pid = gone.id();
         gone.wait().unwrap();
-        mark(pid, rt.boot);
+        mark(pid, rt.boot.time);
         rt.stop("c1", Duration::ZERO).await.unwrap();
-        mark(std::process::id(), rt.boot + 1);
+        mark(std::process::id(), rt.boot.time + 1);
         rt.stop("c1", Duration::ZERO).await.unwrap();
         rt.start_settled("c1").await.unwrap();
         // One that never ends.
-        mark(std::process::id(), rt.boot);
+        mark(std::process::id(), rt.boot.time);
         let err = rt.stop("c1", Duration::ZERO).await.unwrap_err();
         assert!(err.to_string().contains("still starting"), "{err}");
         let err = rt.start_settled("c1").await.unwrap_err();
@@ -2911,7 +3022,15 @@ exit 0
         let t = tempfile::tempdir().unwrap();
         let sys = Arc::new(legion_sys::FakeSys::new());
         let (tx, mut events) = broadcast::channel(8);
-        let watching = tokio::spawn(watch_exits(sys, t.path().to_owned(), 1, tx));
+        let watching = tokio::spawn(watch_exits(
+            sys,
+            t.path().to_owned(),
+            state::Boot {
+                time: 1,
+                id: String::new(),
+            },
+            tx,
+        ));
         tokio::time::sleep(TICK * 2).await;
         let dir = t.path().join("c3");
         let rec = Record {
@@ -2946,6 +3065,7 @@ exit 0
             jid: 1,
             started: 1,
             boot: 1,
+            boot_id: String::new(),
         };
         state::write(&dir, RUN, &run).unwrap();
         let exit = Exit {

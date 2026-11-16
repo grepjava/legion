@@ -1443,7 +1443,11 @@ rotated at 8 MiB, one old file kept), and when the main process ends it
 removes the jail, so nothing the process left behind keeps running, then
 writes its exit status. Everything is kept in `<data-dir>/jails/<id>`
 (record, run, exit, log), so the agent may restart while containers run
-and finds them again; a run from before a reboot counts as over. Stop asks
+and finds them again; a run from before a reboot counts as over. A run
+whose jail is there is of this boot; without one, a supervisor's pid is
+believed only if the run is of this boot, told by `kern.boot_id` (the
+boot's time moves when the clock is set, as ntpd does soon after boot;
+runs recorded without an id are told by that time). Stop asks
 the supervisor to send the image's stop signal, waits the grace period,
 then removes the jail. Exec enters the jail the same way, with a
 pseudo-terminal when asked.
