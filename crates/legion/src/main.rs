@@ -520,6 +520,17 @@ enum Command {
         #[arg(short, long)]
         namespace: Option<String>,
     },
+    /// The connections a namespace's tasks open or answer, as the nodes'
+    /// pf keeps them: those open, or closed in about the last minute and a
+    /// half, by what opened them, what answered, the port and how it was
+    /// sent (`service`: to the service's address; `published`: to a port a
+    /// node publishes). `(other namespaces)` stands for the tasks of every
+    /// other namespace; `node/NAME` for a node itself (its probes, or a
+    /// connection it forwards).
+    Connections {
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
     /// A namespace's load balancer addresses and which node holds each:
     /// the nodes that may, by CARP skew (the lowest meant to be master),
     /// each with the CARP state it last reported.

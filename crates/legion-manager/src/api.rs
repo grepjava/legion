@@ -1333,6 +1333,13 @@ impl Cluster for ApiService {
         Ok(Response::new(pb::ReachResponse { services, edges }))
     }
 
+    async fn connections(
+        &self,
+        req: Request<pb::ConnectionsRequest>,
+    ) -> Result<Response<pb::ConnectionsResponse>, Status> {
+        crate::connections::connections(self, req).await
+    }
+
     async fn load_balancers(
         &self,
         req: Request<pb::LoadBalancersRequest>,

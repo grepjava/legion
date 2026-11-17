@@ -60,8 +60,15 @@ message SessionOpen {
     // it provides) exactly these; what it says of each as JSON on
     // `stdout`, then `exit_code` 0.
     ExportSync export_sync = 19;
+    // Managers only: the connections this node's pf keeps state for that
+    // a pod's address is an end of, as JSON on `stdout`, then `exit_code`
+    // 0. It changes nothing on the host. An agent from before it ends the
+    // session with an error: the session has no action.
+    ConnectionsOptions connections = 20;
   }
 }
+
+message ConnectionsOptions {}
 
 message ExportSync {
   repeated ExportWanted exports = 1;

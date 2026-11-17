@@ -1100,6 +1100,44 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 print_table(["FROM", "TO", "PORTS"], &rows);
             }
         }
+        Command::Connections { namespace } => {
+            let namespace = namespace.unwrap_or_else(|| "default".into());
+            let r = cluster
+                .connections(pb::ConnectionsRequest {
+                    namespace: namespace.clone(),
+                })
+                .await?
+                .into_inner();
+            let rows: Vec<[String; 6]> = r
+                .edges
+                .iter()
+                .map(|e| {
+                    [
+                        connection_end(e.from.as_ref()),
+                        connection_end(e.to.as_ref()),
+                        format!("{}/{}", e.port, e.protocol),
+                        if e.via.is_empty() {
+                            "-".to_owned()
+                        } else {
+                            e.via.clone()
+                        },
+                        e.connections.to_string(),
+                        e.clients.to_string(),
+                    ]
+                })
+                .collect();
+            if rows.is_empty() {
+                println!("no connections of {namespace}'s tasks");
+            } else {
+                print_table(
+                    ["FROM", "TO", "PORT", "VIA", "CONNECTIONS", "CLIENTS"],
+                    &rows,
+                );
+            }
+            for n in &r.unanswered {
+                eprintln!("node {} did not say: {}", n.node, n.error);
+            }
+        }
         Command::Events {
             object,
             namespace,
@@ -1974,6 +2012,18 @@ fn print_objects(objects: &[pb::Object], format: Format, kind: Kind) -> anyhow::
         }
     }
     Ok(())
+}
+
+/// An end of a connection as `legion connections` prints it: a service
+/// by name, the others by kind.
+pub(crate) fn connection_end(end: Option<&pb::ConnectionEnd>) -> String {
+    let Some(e) = end else { return "?".to_owned() };
+    match e.kind.as_str() {
+        "service" => e.name.clone(),
+        "namespace" => "(other namespaces)".to_owned(),
+        "outside" => "(outside)".to_owned(),
+        kind => format!("{kind}/{}", e.name),
+    }
 }
 
 fn print_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) {

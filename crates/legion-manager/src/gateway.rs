@@ -181,6 +181,7 @@ fn router(gateway: Gateway) -> axum::Router {
         .route("/api/quotas", get(quotas))
         .route("/api/log-search", get(log_search))
         .route("/api/reach", get(reach))
+        .route("/api/connections", get(connections))
         .route("/api/load-balancers", get(load_balancers))
         .route("/api/logs/{namespace}/{task}", get(logs))
         .route("/api/build-logs/{namespace}/{name}", get(build_logs))
@@ -1265,6 +1266,49 @@ async fn reach(
         })
         .collect();
     Ok(Json(serde_json::json!({ "services": r.services, "edges": edges })).into_response())
+}
+
+/// `legion connections`: the connections a namespace's tasks open or
+/// answer, as the nodes' pf keeps them, `{edges: [{from: {kind, name}, to:
+/// {kind, name}, protocol, port, via, connections, clients}], unanswered:
+/// [{node, error}]}`.
+async fn connections(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Query(scope): Query<Scope>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let r = ClusterClient::new(channel)
+        .connections(pb::ConnectionsRequest {
+            namespace: scope.namespace.unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+    let end = |e: &Option<pb::ConnectionEnd>| {
+        let e = e.clone().unwrap_or_default();
+        serde_json::json!({ "kind": e.kind, "name": e.name })
+    };
+    let edges: Vec<_> = r
+        .edges
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "from": end(&e.from),
+                "to": end(&e.to),
+                "protocol": e.protocol,
+                "port": e.port,
+                "via": e.via,
+                "connections": e.connections,
+                "clients": e.clients,
+            })
+        })
+        .collect();
+    let unanswered: Vec<_> = r
+        .unanswered
+        .iter()
+        .map(|n| serde_json::json!({ "node": n.node, "error": n.error }))
+        .collect();
+    Ok(Json(serde_json::json!({ "edges": edges, "unanswered": unanswered })).into_response())
 }
 
 /// `legion load-balancers`: a namespace's load balancer addresses and

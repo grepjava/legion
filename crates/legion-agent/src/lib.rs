@@ -24,6 +24,7 @@ use tokio::task::JoinSet;
 mod browse;
 mod build;
 pub use build::Builder;
+pub mod connections;
 pub mod control;
 pub mod doctor;
 pub mod exports;

@@ -241,6 +241,11 @@ impl Pods for PodsService {
                     "a node's diagnosis goes through Cluster.Diagnose",
                 ));
             }
+            Some(Action::Connections(_)) => {
+                return Err(Status::invalid_argument(
+                    "nodes' connections go through Cluster.Connections",
+                ));
+            }
             None => return Err(Status::invalid_argument("the session needs an action")),
         };
         let action = match open.action {

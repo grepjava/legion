@@ -137,6 +137,7 @@ async fn run<R: Runtime>(
             transfer::snapshot(&volumes, &open.namespace, opts, &tx).await
         }
         Some(Action::Doctor(_)) => crate::doctor::send(&volumes, &tx).await,
+        Some(Action::Connections(_)) => crate::connections::send(&volumes, &tx).await,
         Some(Action::Files(opts)) => {
             match container(runtime.as_ref(), &node, &o.task_uid, &open.container).await {
                 Ok(c) => match runtime.root(&c).await.map_err(runtime_status) {

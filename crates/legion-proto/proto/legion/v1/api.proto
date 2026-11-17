@@ -159,6 +159,12 @@ service Cluster {
   // tasks of every other namespace, the ports of each service it may
   // reach. For any caller who may read the namespace's services.
   rpc Reach(ReachRequest) returns (ReachResponse);
+  // The connections a namespace's tasks open or answer, as the nodes' pf
+  // keeps them: each node asked at once, its connections open or closed
+  // in about the last minute and a half, counted by what opened them, what
+  // answered, the port and the way it was sent. For any caller who may
+  // read the namespace's services; answered by the leader.
+  rpc Connections(ConnectionsRequest) returns (ConnectionsResponse);
   // A namespace's load balancer addresses: for each, the nodes that may
   // hold it, by CARP skew (the lowest the master meant), and the CARP
   // state each last reported, which says which holds it. For any caller
@@ -569,6 +575,49 @@ message ReachEdge {
   bool all_ports = 3;
   // The service's ports it may reach (its tasks' ports), when not all.
   repeated ReachPort ports = 4;
+}
+
+message ConnectionsRequest {
+  string namespace = 1;
+}
+
+message ConnectionsResponse {
+  // One per opening end, answering end, protocol, port and way.
+  repeated ConnectionEdge edges = 1;
+  // The nodes asked that did not say, and why: their connections are
+  // missing.
+  repeated NodeError unanswered = 2;
+}
+
+message NodeError {
+  string node = 1;
+  string error = 2;
+}
+
+// An end of a connection.
+message ConnectionEnd {
+  // "service" or "job", of the namespace, by name; "namespace", a task of
+  // another namespace, unnamed, as in Reach; "node", a node of the
+  // cluster (its own address, or forwarding for a client), by name;
+  // "outside", anything else, unnamed.
+  string kind = 1;
+  string name = 2;
+}
+
+message ConnectionEdge {
+  ConnectionEnd from = 1;
+  ConnectionEnd to = 2;
+  // "tcp" or "udp".
+  string protocol = 3;
+  // The port that answered.
+  uint32 port = 4;
+  // Where the client sent them: "service", to the service's address;
+  // "published", to a port a node publishes; empty, to the task's own.
+  string via = 5;
+  uint32 connections = 6;
+  // Distinct addresses among the opening ends: an "outside" end may be
+  // many clients.
+  uint32 clients = 7;
 }
 
 message ReachPort {

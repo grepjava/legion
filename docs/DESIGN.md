@@ -1062,6 +1062,25 @@ daemon has registered, about five seconds (measured on the lab).
   arriving), so a node whose pf cannot take the policy runs no new pods
   rather than unguarded ones. Pods adopted after an agent restart are
   handed over too but not held: their guards are still loaded.
+- **Built** (seeing it): the connections policy let through
+  (`Cluster.Connections`, `legion connections`, the console's Topology).
+  pf keeps a state for each connection it passes, on each interface it
+  crosses (bridge members are filtered: `pfil_member`), so the host's
+  states hold every connection of its pods, theirs among themselves too.
+  Asked, each ready node's agent reads them (`pfctl -ss`) and keeps those
+  with a pod's address at an end, IPv6 twins written as their IPv4
+  addresses: per connection, its client before NAT, its client after NAT
+  where the host changed it, its server after any redirect, and where the
+  client sent it before that. The leader joins what the nodes said: a
+  connection NATed onto the mesh by one node (a published port answered on
+  another) is seen by the next with the first node's underlay address as
+  its client, which the first node's client after NAT matches, so it
+  counts once, as from its first client. Ends are named from the tasks'
+  and nodes' addresses; an address of Legion's that no task or node has is
+  not counted. States last as long as pf keeps them, so a connection
+  counts while open and about 90 s after (TCP's TIME_WAIT); one opened and
+  closed between two asks is still seen. Nothing is sampled continuously:
+  each ask costs each node one `pfctl -ss`.
 
 ### 5.7 IPv6
 

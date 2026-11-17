@@ -127,6 +127,7 @@ Trigger a CronJob immediately outside its schedule.
 - `legion quota [-n <NS>]`
 - `legion audit [FILTERS]` (cluster admin only)
 - `legion reach [-n <NS>]` (evaluate NetworkPolicy reachability matrix)
+- `legion connections [-n <NS>]` (the connections the nodes' pf saw, by service and port)
 - `legion load-balancers [-n <NS>]` (CARP holders and states)
 - `legion volume <move|backup|restore|snapshots|snapshot|rollback|rm-snapshot>`
 

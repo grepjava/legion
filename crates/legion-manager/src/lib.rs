@@ -17,6 +17,7 @@ pub mod autolock;
 mod balancers;
 mod build;
 pub mod ca;
+mod connections;
 pub mod console;
 mod gateway;
 pub use gateway::Console;
