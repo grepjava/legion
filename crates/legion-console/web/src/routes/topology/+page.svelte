@@ -3,7 +3,15 @@
   // namespace's Routes, Services, PF packet-filter reachability arcs, CARP
   // VIPs, and ZFS/NFS/iSCSI Volumes with zoom controls and click-to-inspect
   // packet filter rules.
-  import { api, follow, type Balancer, type LObject, type ReachEdge } from '#lib/api.ts';
+  import {
+    api,
+    follow,
+    type Balancer,
+    type ConnectionEdge,
+    type ConnectionEnd,
+    type LObject,
+    type ReachEdge
+  } from '#lib/api.ts';
   import { t } from '#lib/i18n.svelte.ts';
   import { logoFor } from '#lib/logos.ts';
   import { namespaces, session } from '#lib/session.svelte.ts';
@@ -36,6 +44,21 @@
     }
   }
   const byNode = $derived(groupBy === 'node');
+  // Arcs between services for what may connect, or for the connections
+  // the nodes saw; kept for the next visit.
+  const ARCS_KEY = 'legion.topology-arcs';
+  let arcs: 'allowed' | 'seen' = $state(
+    typeof localStorage !== 'undefined' && localStorage.getItem(ARCS_KEY) === 'allowed' ? 'allowed' : 'seen'
+  );
+  function setArcs(a: 'allowed' | 'seen') {
+    arcs = a;
+    try {
+      localStorage.setItem(ARCS_KEY, a);
+    } catch {
+      // Private mode: kept for this page only.
+    }
+  }
+  const showSeen = $derived(arcs === 'seen');
   let zoom = $state(100);
   const zoomBy = (step: number) => (zoom = Math.min(160, Math.max(60, zoom + step)));
 
@@ -100,6 +123,36 @@
     // others still see each pod's node by name.
     if (session.me?.all) stops.push(follow('Node', '', (o) => (nodes = o), () => (nodes = [])));
     return () => stops.forEach((s) => s());
+  });
+
+  // The connections the nodes' pf keeps, asked again every 10 s: each ask
+  // has every node list its states.
+  let seen: ConnectionEdge[] = $state([]);
+  let unanswered: { node: string; error: string }[] = $state([]);
+  let seenError = $state('');
+  $effect(() => {
+    const ns = namespace;
+    let gone = false;
+    const load = () =>
+      api
+        .connections(ns)
+        .then((r) => {
+          if (gone) return;
+          seen = r.edges;
+          unanswered = r.unanswered;
+          seenError = '';
+        })
+        .catch((e) => {
+          if (!gone) seenError = e.message;
+        });
+    seen = [];
+    unanswered = [];
+    load();
+    const every = setInterval(load, 10_000);
+    return () => {
+      gone = true;
+      clearInterval(every);
+    };
   });
 
   // Reach & CARP VIPs are refreshed when services change.
@@ -183,6 +236,57 @@
   const between = $derived(
     edges.filter((e) => e.from !== '' && e.from !== e.to && svcRow.has(e.from) && svcRow.has(e.to))
   );
+  // What the nodes saw: between two services, summed over ports and ways;
+  // and into each service from anything but another of them.
+  const isSvc = (e: ConnectionEnd) => e.kind === 'service' && svcRow.has(e.name);
+  type Seen = { from: string; to: string; n: number; what: string[] };
+  const seenBetween: Seen[] = $derived.by(() => {
+    const by = new Map<string, Seen>();
+    for (const e of seen) {
+      if (!isSvc(e.from) || !isSvc(e.to) || e.from.name === e.to.name) continue;
+      const key = `${e.from.name}>${e.to.name}`;
+      const s = by.get(key) ?? { from: e.from.name, to: e.to.name, n: 0, what: [] };
+      s.n += e.connections;
+      s.what.push(`${e.port}/${e.protocol}`);
+      by.set(key, s);
+    }
+    return [...by.values()];
+  });
+  const seenIn: Seen[] = $derived.by(() => {
+    const by = new Map<string, Seen>();
+    for (const e of seen) {
+      if (isSvc(e.from) || !isSvc(e.to)) continue;
+      const s = by.get(e.to.name) ?? { from: '', to: e.to.name, n: 0, what: [] };
+      s.n += e.connections;
+      s.what.push(endName(e.from));
+      by.set(e.to.name, s);
+    }
+    return [...by.values()];
+  });
+  // Wider for more connections, up to about four times as wide.
+  const width = (n: number) => 1.4 + Math.min(3.6, Math.log2(n + 1));
+  const conns = (n: number) => (n === 1 ? t('1 connection') : t('{n} connections', { n }));
+  function endName(e: ConnectionEnd) {
+    switch (e.kind) {
+      case 'service':
+        return e.name;
+      case 'job':
+        return t('Job {name}', { name: e.name });
+      case 'node':
+        return t('node {name}', { name: e.name });
+      case 'namespace':
+        return t('other namespaces');
+      default:
+        return t('outside');
+    }
+  }
+  const viaNote = (e: ConnectionEdge) =>
+    e.via === 'service'
+      ? t('to its service address')
+      : e.via === 'published'
+        ? t('to a published port')
+        : t('to the task');
+
   // All may reach all: one note rather than an arc each way between every
   // two of them, however many there are.
   const everyone = $derived(
@@ -190,7 +294,7 @@
   );
   // The left column: Routes, then published ports, then other namespaces.
   const outsideRow = $derived(shownRoutes.length + published.length);
-  const leftRows = $derived(outsideRow + (outside.length ? 1 : 0));
+  const leftRows = $derived(outsideRow + ((showSeen ? seenIn.length : outside.length) ? 1 : 0));
   const svgW = X_VOL + VOL_W + 28;
   const rowCount = $derived(Math.max(services.length, volumeNames.length, leftRows, 1));
   // Each row's height, and where each starts: routes, services and
@@ -394,6 +498,19 @@
   const outboundEdges = $derived(
     inspectedSvc ? edges.filter((e) => e.from === inspectedSvc.metadata.name) : []
   );
+  const seenInbound = $derived(
+    inspectedSvc ? seen.filter((e) => e.to.kind === 'service' && e.to.name === inspectedSvc.metadata.name) : []
+  );
+  const seenOutbound = $derived(
+    inspectedSvc
+      ? seen.filter(
+          (e) =>
+            e.from.kind === 'service' &&
+            e.from.name === inspectedSvc.metadata.name &&
+            !(e.to.kind === 'service' && e.to.name === inspectedSvc.metadata.name)
+        )
+      : []
+  );
   const svcVips = $derived(
     inspectedSvc ? balancers.filter((b) => b.service === inspectedSvc.metadata.name) : []
   );
@@ -429,7 +546,7 @@
 </header>
 <p class="muted">
   {t(
-    "Routes to the namespace's Services, what may reach what among them as the nodes enforce it, and the Volumes they use. A ring or box turns amber when some tasks are not ready, red when none are or a Volume is lost."
+    "Routes to the namespace's Services, what may reach what among them as the nodes enforce it, or the connections the nodes saw, and the Volumes they use. A ring or box turns amber when some tasks are not ready, red when none are or a Volume is lost."
   )}
 </p>
 {#if error}<p class="error" role="alert">{error}</p>{/if}
@@ -465,6 +582,15 @@
             {t('Node')}
           </button>
         </div>
+        <span class="muted" id="arcs-of">{t('Arcs:')}</span>
+        <div class="seg" role="group" aria-labelledby="arcs-of">
+          <button type="button" class="sm" class:primary={!showSeen} aria-pressed={!showSeen} onclick={() => setArcs('allowed')}>
+            {t('Allowed')}
+          </button>
+          <button type="button" class="sm" class:primary={showSeen} aria-pressed={showSeen} onclick={() => setArcs('seen')}>
+            {t('Seen')}
+          </button>
+        </div>
         {#if multiNode && !byNode}
           <span class="node-key muted" aria-label={t('Node colours')}>
             {#each nodeNames as n (n)}
@@ -473,7 +599,17 @@
           </span>
         {/if}
       </div>
-      {#if everyone}
+      {#if showSeen}
+        {#if seenError}
+          <p class="error note" role="alert">{t('Connections: {error}', { error: seenError })}</p>
+        {/if}
+        {#each unanswered as u (u.node)}
+          <p class="muted note">{t('Node {node} did not say its connections: {error}', { node: u.node, error: u.error })}</p>
+        {/each}
+        {#if !seenError && !seenBetween.length && !seenIn.length}
+          <p class="muted note">{t('No connections of these services seen in the last minute and a half.')}</p>
+        {/if}
+      {:else if everyone}
         <p class="muted note">
           {t('Every service may reach every other (the namespace is not isolated by policy).')}
         </p>
@@ -504,6 +640,10 @@
           <defs>
             <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
               <path d="M0,0 L8,4 L0,8 z" class="head" />
+            </marker>
+            <!-- Sized in user units: a wide arc's would grow with it. -->
+            <marker id="arrow-seen" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto">
+              <path d="M0,0 L8,4 L0,8 z" class="head seen" />
             </marker>
           </defs>
 
@@ -562,7 +702,18 @@
               marker-end="url(#arrow)"
             />
           {/each}
-          {#if outside.length}
+          {#if showSeen}
+            {#each seenIn as e (e.to)}
+              <path
+                class="edge seen"
+                style:stroke-width={width(e.n)}
+                d="M {X_ROUTE + ROUTE_W} {y(outsideRow)} C {X_ROUTE + ROUTE_W + 45} {y(outsideRow)}, {X_SVC_CX - SVC_R - 45} {y(svcRow.get(e.to)!)}, {X_SVC_CX - SVC_R - 6} {y(svcRow.get(e.to)!)}"
+                marker-end="url(#arrow-seen)"
+              >
+                <title>{[...new Set(e.what)].join(', ')} → {e.to}: {conns(e.n)}</title>
+              </path>
+            {/each}
+          {:else if outside.length}
             {#each outside as e (e.to)}
               <path
                 class="edge reach"
@@ -574,8 +725,19 @@
             {/each}
           {/if}
 
-          <!-- Service <-> Service PF reachability arcs -->
-          {#if !everyone}
+          <!-- Service <-> Service connections seen, or PF reachability arcs -->
+          {#if showSeen}
+            {#each seenBetween as e (`${e.from}>${e.to}`)}
+              <path
+                class="edge seen"
+                style:stroke-width={width(e.n)}
+                d={arc(svcRow.get(e.from)!, svcRow.get(e.to)!)}
+                marker-end="url(#arrow-seen)"
+              >
+                <title>{e.from} → {e.to}: {[...new Set(e.what)].join(', ')}, {conns(e.n)}</title>
+              </path>
+            {/each}
+          {:else if !everyone}
             {#each between as e (`${e.from}>${e.to}`)}
               <path
                 class="edge reach"
@@ -652,9 +814,9 @@
               <text class="sub" x={X_ROUTE + 34} y={py + 12}>{where}</text>
             </a>
           {/each}
-          {#if outside.length}
+          {#if showSeen ? seenIn.length : outside.length}
             <rect class="box outside" x={X_ROUTE} y={y(outsideRow) - BOX_H / 2} width={ROUTE_W} height={BOX_H} rx="8" />
-            <text x={X_ROUTE + 14} y={y(outsideRow) + 4}>{t('other namespaces')}</text>
+            <text x={X_ROUTE + 14} y={y(outsideRow) + 4}>{showSeen ? t('outside the namespace') : t('other namespaces')}</text>
           {/if}
 
           <!-- OpenShift-style Circular Service Nodes with Pod Ring & Workload Icon -->
@@ -771,6 +933,11 @@
         {#if picked}
           <span><span class="leg-picked"></span>{t('Shown in the panel')}</span>
         {/if}
+        {#if showSeen}
+          <span><span class="leg-seen"></span>{t('Connections open or closed in the last minute and a half; wider for more')}</span>
+        {:else}
+          <span><span class="leg-reach"></span>{t('May connect, as the nodes enforce it')}</span>
+        {/if}
         <span>{t('Click any Service, Pod/VM, Route, Volume or node to drill down.')}</span>
       </div>
     </div>
@@ -802,6 +969,26 @@
           </ul>
         {:else}
           <p class="muted">{t('No intra-namespace outbound edges.')}</p>
+        {/if}
+
+        <h3>{t('Connections seen')}</h3>
+        {#if seenInbound.length || seenOutbound.length}
+          <ul class="plain mono">
+            {#each seenInbound as e (`${e.from.kind}:${e.from.name}>${e.port}/${e.protocol}/${e.via}`)}
+              <li>
+                ← {endName(e.from)}{e.from.kind === 'outside' && e.clients > 1 ? ` (${t('{n} clients', { n: e.clients })})` : ''}: {e.port}/{e.protocol}
+                <span class="muted">{viaNote(e)} · {conns(e.connections)}</span>
+              </li>
+            {/each}
+            {#each seenOutbound as e (`${e.to.kind}:${e.to.name}>${e.port}/${e.protocol}/${e.via}`)}
+              <li>
+                → {endName(e.to)}: {e.port}/{e.protocol}
+                <span class="muted">{viaNote(e)} · {conns(e.connections)}</span>
+              </li>
+            {/each}
+          </ul>
+        {:else}
+          <p class="muted">{t('None in the last minute and a half.')}</p>
         {/if}
 
         {#if svcVips.length}
@@ -1007,6 +1194,19 @@
     border-top: 2px dotted var(--bad);
     vertical-align: middle;
   }
+  .leg-seen,
+  .leg-reach {
+    display: inline-block;
+    width: 18px;
+    margin-right: 0.35rem;
+    vertical-align: middle;
+  }
+  .leg-seen {
+    border-top: 3px solid var(--link);
+  }
+  .leg-reach {
+    border-top: 1.5px dashed var(--link);
+  }
   .canvas-card .note {
     margin: 0.5rem 0 0;
   }
@@ -1142,6 +1342,14 @@
   .edge.reach {
     stroke: var(--link);
     stroke-dasharray: 5 3;
+  }
+  .edge.seen {
+    stroke: var(--link);
+    stroke-linecap: round;
+    opacity: 0.85;
+  }
+  .head.seen {
+    fill: var(--link);
   }
   .head {
     fill: var(--muted);

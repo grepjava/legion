@@ -305,7 +305,18 @@ their tasks are ready, the Routes to them, what may reach what among them
 as `legion reach` gives it, and the Volumes they use, followed live, each
 box leading to its object. The lab test deploys from the form and from a
 saved template with its variable set, and sees both in the topology
-(passed on 5b762be).
+(passed on 5b762be). Since 2026-11-17 its arcs show either what may
+connect or the connections the nodes saw (`Cluster.Connections`, `legion
+connections`, asked every 10 s): each ready node's agent lists the states
+its pf keeps with a pod's address at an end, open or closed in about the
+last minute and a half, and the leader names the ends from the tasks and
+nodes it knows (a service or Job of the namespace, another namespace, a
+node, or outside), counts each connection once though several states and
+nodes saw it, and says how it was sent (to a service's address, a
+published port, or the task's own). An arc grows wider with more
+connections; the panel lists them by port with their counts, and the
+TUI's details of a service list them too. A node that cannot say is named
+with why; its connections are missing.
 
 **Builds** (design; chosen 2026-11-14: on builder nodes, no pod may make
 jails). The builder (`legion local`, once the separate tool jailer) is a

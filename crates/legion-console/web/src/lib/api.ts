@@ -111,6 +111,12 @@ export const api = {
   /** What may reach what among a namespace's services, as `legion reach`. */
   reach: (namespace: string) =>
     call<{ services: string[]; edges: ReachEdge[] }>('GET', `/api/reach${q(namespace)}`),
+  /** The connections a namespace's tasks open or answer, as the nodes' pf keeps them, as `legion connections`. */
+  connections: (namespace: string) =>
+    call<{ edges: ConnectionEdge[]; unanswered: { node: string; error: string }[] }>(
+      'GET',
+      `/api/connections${q(namespace)}`
+    ),
   /** A namespace's load balancer addresses and which node holds each, as `legion lb`. */
   loadBalancers: (namespace: string) =>
     call<{ balancers: Balancer[] }>('GET', `/api/load-balancers${q(namespace)}`),
@@ -455,6 +461,26 @@ export interface ReachEdge {
   to: string;
   all_ports: boolean;
   ports: { protocol: string; port: number }[];
+}
+
+/** An end of a connection: a service or Job of the namespace by name; a
+ * task of another namespace, a node by name, or anything outside. */
+export interface ConnectionEnd {
+  kind: 'service' | 'job' | 'namespace' | 'node' | 'outside';
+  name: string;
+}
+
+export interface ConnectionEdge {
+  from: ConnectionEnd;
+  to: ConnectionEnd;
+  protocol: string;
+  /** The port that answered. */
+  port: number;
+  /** `service`: sent to the service's address; `published`: to a port a node publishes; empty: to the task's own. */
+  via: '' | 'service' | 'published';
+  connections: number;
+  /** Distinct addresses among the opening ends. */
+  clients: number;
 }
 
 export interface ApplyResult {
