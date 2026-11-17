@@ -173,6 +173,32 @@ fn app_updates_and_survives_losing_a_node() {
     assert_eq!(webs.len(), 3, "every web task serves: {webs:?}");
     assert_eq!(apis.len(), 3, "every api task serves: {apis:?}");
 
+    step("the connections the nodes saw");
+    // The 40 requests just sent: each came in on a published port, some
+    // answered on another node than the one asked (NATed onto the mesh, so
+    // seen by two nodes), and each had web ask api through api's VIP, most
+    // of them across the mesh (seen by both nodes too). Each counts once.
+    // pf keeps a closed connection's state about 90 s, so a few may have
+    // gone by now; more than 40 would be one counted twice.
+    let table = lab.ok(&["connections", "-n", "shop"]);
+    eprintln!("{table}");
+    let rows: Vec<Vec<&str>> = table
+        .lines()
+        .skip(1)
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    let counted = |to: &str, port: &str, via: &str, from: Option<&str>| -> u64 {
+        rows.iter()
+            .filter(|r| r.len() == 6 && r[1] == to && r[2] == port && r[3] == via)
+            .filter(|r| from.is_none_or(|f| r[0] == f))
+            .map(|r| r[4].parse::<u64>().unwrap())
+            .sum()
+    };
+    let published = counted("web", "8080/tcp", "published", None);
+    let asked = counted("api", "7000/tcp", "service", Some("web"));
+    assert!((35..=40).contains(&published), "web through its published port: {published}");
+    assert!((35..=40).contains(&asked), "web to api through its VIP: {asked}");
+
     step("update with zero downtime");
     let load = Load::start(addrs.clone());
     std::thread::sleep(Duration::from_secs(2));

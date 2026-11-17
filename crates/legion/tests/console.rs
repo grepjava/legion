@@ -1555,6 +1555,14 @@ fn the_console_builds_an_example() {
     wait("the site answering on port 30081", 60, || {
         c.lab.http_get_from(vm, &c.lab.host, 30081).is_ok()
     });
+    // The page asks the nodes for their connections every 10 s: the
+    // requests just answered show as an arc into web.
+    e.until("the requests seen as an arc into web", 40, |b| {
+        b.eval(
+            "[...document.querySelectorAll('path.edge.seen title')]
+               .some((t) => t.textContent.includes('→ web:'))",
+        ) == serde_json::json!(true)
+    });
     if !e.errors.is_empty() {
         eprintln!("ed's pages reported: {:?}", e.errors);
     }
