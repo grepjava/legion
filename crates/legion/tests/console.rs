@@ -626,7 +626,10 @@ spec:
         v[0].as_u64().unwrap_or(0) >= 3 && v[3] == serde_json::json!(true)
     });
     let v = e.eval(grouped);
-    eprintln!("--- grouped by node: {} pods on {} nodes, {} bands", v[0], v[1], v[2]);
+    eprintln!(
+        "--- grouped by node: {} pods on {} nodes, {} bands",
+        v[0], v[1], v[2]
+    );
     assert!(
         v[2].as_u64() >= v[1].as_u64(),
         "a band for each node a pod runs on: {v}"
