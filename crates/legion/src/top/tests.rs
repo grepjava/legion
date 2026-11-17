@@ -274,6 +274,61 @@ fn details_and_yaml_of_the_selected_object() {
 }
 
 #[test]
+fn a_services_details_show_the_connections_seen() {
+    let mut m = cluster();
+    assert_eq!(m.service_namespaces(), BTreeSet::from(["shop".to_owned()]));
+    let end = |kind: &str, name: &str| {
+        Some(pb::ConnectionEnd {
+            kind: kind.into(),
+            name: name.into(),
+        })
+    };
+    let edge = |from, to, port, via: &str, connections| pb::ConnectionEdge {
+        from,
+        to,
+        protocol: "tcp".into(),
+        port,
+        via: via.into(),
+        connections,
+        clients: 1,
+    };
+    let v = View {
+        wide: true,
+        tab: Tab::Workloads,
+        ..View::default()
+    };
+    // Not asked yet: no section.
+    assert!(!screen_of(&m, &v, 170).contains("connections seen"));
+    m.connections.insert("shop".into(), Vec::new());
+    let s = screen_of(&m, &v, 170);
+    assert!(
+        s.contains("connections seen") && s.contains("none in the last minute"),
+        "{s}"
+    );
+    m.connections.insert(
+        "shop".into(),
+        vec![
+            edge(
+                end("outside", ""),
+                end("service", "web"),
+                80,
+                "published",
+                3,
+            ),
+            edge(end("service", "web"), end("service", "db"), 5432, "", 1),
+            edge(end("service", "api"), end("service", "db"), 5432, "", 4),
+        ],
+    );
+    let s = screen_of(&m, &v, 170);
+    assert!(
+        s.contains("← (outside): 80/tcp via published, 3 connections"),
+        "{s}"
+    );
+    assert!(s.contains("→ db: 5432/tcp, 1 connection"), "{s}");
+    assert!(!s.contains("api"), "another service's: {s}");
+}
+
+#[test]
 fn enter_shows_the_tasks_of_a_node_or_service() {
     let m = cluster();
     let mut v = View::default();

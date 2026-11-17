@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 use legion_api::Kind;
 use legion_api::node::{NodeState, NodeStatus};
 use legion_api::task::TaskState;
+use legion_proto::v1 as pb;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -1225,6 +1226,13 @@ fn detail(f: &mut Frame, model: &Model, selected: Option<Key>, area: Rect) {
             ]));
         }
     }
+    if o.kind == Kind::Service
+        && let Some(edges) = model.connections.get(&o.metadata.namespace)
+    {
+        lines.push(Line::default());
+        lines.push(section("connections seen"));
+        lines.extend(connection_lines(&o.metadata.name, edges));
+    }
     if o.kind == Kind::Volume
         && let Some((used, avail)) = model.volume_space(&o.metadata.namespace, &o.metadata.name)
     {
@@ -1256,6 +1264,44 @@ fn detail(f: &mut Frame, model: &Model, selected: Option<Key>, area: Rect) {
             .block(panel(title(super::model::name(o)))),
         area,
     );
+}
+
+/// The connections `service` answered (←) and opened (→), open or closed
+/// in about the last minute and a half, as `legion connections` names
+/// their other ends.
+fn connection_lines(service: &str, edges: &[pb::ConnectionEdge]) -> Vec<Line<'static>> {
+    let is_it = |e: &Option<pb::ConnectionEnd>| {
+        e.as_ref()
+            .is_some_and(|e| e.kind == "service" && e.name == service)
+    };
+    let mut lines = Vec::new();
+    for e in edges {
+        let (arrow, other) = match (is_it(&e.from), is_it(&e.to)) {
+            (_, true) => ("←", e.from.as_ref()),
+            (true, false) => ("→", e.to.as_ref()),
+            (false, false) => continue,
+        };
+        let via = match e.via.as_str() {
+            "" => String::new(),
+            via => format!(" via {via}"),
+        };
+        let n = match e.connections {
+            1 => "1 connection".to_owned(),
+            n => format!("{n} connections"),
+        };
+        lines.push(field(
+            1,
+            &format!("{arrow} {}", crate::cli::connection_end(other)),
+            &format!("{}/{}{via}, {n}", e.port, e.protocol),
+        ));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("none in the last minute and a half", dim()),
+        ]));
+    }
+    lines
 }
 
 fn section(name: &str) -> Line<'static> {

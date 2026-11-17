@@ -45,6 +45,9 @@ const POLL: Duration = Duration::from_secs(5);
 /// How often every cell is written again, not only those that changed:
 /// what else wrote to the terminal (console messages) goes.
 const REPAINT: Duration = Duration::from_secs(5);
+/// How often the connections of the namespaces shown are asked: each ask
+/// has every node list its pf states.
+const SEEN: Duration = Duration::from_secs(10);
 
 /// What the screen hears of.
 enum Msg {
@@ -71,6 +74,8 @@ enum Msg {
     /// That shell ended, and why.
     ShellEnded(u64, String),
     Redraw,
+    /// The connections the nodes saw of a namespace's tasks.
+    Connections(String, Vec<pb::ConnectionEdge>),
     /// The terminal is gone.
     HungUp,
 }
@@ -87,6 +92,8 @@ pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<
         poll_rx,
         tx.clone(),
     ));
+    let (seen_tx, seen_rx) = watch::channel(BTreeSet::new());
+    let seer = tokio::spawn(poll_connections(channel.clone(), seen_rx, tx.clone()));
     read_keys(tx.clone());
 
     // The logs shown, numbered: what an earlier stream sent is dropped.
@@ -199,10 +206,18 @@ pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<
                     }
                 }
                 Msg::Redraw => {}
+                Msg::Connections(namespace, edges) => {
+                    model.connections.insert(namespace, edges);
+                }
                 Msg::HungUp => view.quit = true,
             }
             next = rx.try_recv().ok();
         }
+        seen_tx.send_if_modified(|asked| {
+            let now = model.service_namespaces();
+            model.connections.retain(|ns, _| now.contains(ns));
+            (*asked != now).then(|| *asked = now).is_some()
+        });
         for request in requests {
             match request {
                 Request::Logs { .. } | Request::ServiceLogs { .. } | Request::Exec { .. } => {
@@ -327,7 +342,43 @@ pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<
     ratatui::restore();
     follower.abort();
     poller.abort();
+    seer.abort();
     result
+}
+
+/// Asks for the connections of each namespace in `namespaces` every
+/// [`SEEN`], and at once when they change. A manager too old to say, or a
+/// caller who may not read a namespace's services, gets none shown.
+async fn poll_connections(
+    channel: Channel,
+    mut namespaces: watch::Receiver<BTreeSet<String>>,
+    tx: mpsc::UnboundedSender<Msg>,
+) {
+    let mut cluster = crate::cli::cluster_client(channel);
+    let mut tick = tokio::time::interval(SEEN);
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            changed = namespaces.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+        let asked: Vec<String> = namespaces.borrow_and_update().iter().cloned().collect();
+        for namespace in asked {
+            let req = pb::ConnectionsRequest {
+                namespace: namespace.clone(),
+            };
+            if let Ok(r) = cluster.connections(req).await
+                && tx
+                    .send(Msg::Connections(namespace, r.into_inner().edges))
+                    .is_err()
+            {
+                return;
+            }
+        }
+    }
 }
 
 /// Reads keys on a thread of its own. crossterm reads a hung-up terminal

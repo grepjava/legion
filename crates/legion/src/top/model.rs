@@ -57,6 +57,9 @@ pub struct Model {
     pub(super) problem: Option<String>,
     /// Why the cluster's status or use is not current, while it is not.
     pub(super) polled: Option<String>,
+    /// The connections the nodes saw (`Connections`), by namespace: each
+    /// namespace with a service shown is asked.
+    pub(super) connections: BTreeMap<String, Vec<pb::ConnectionEdge>>,
 }
 
 impl Model {
@@ -65,6 +68,13 @@ impl Model {
             namespace,
             ..Default::default()
         }
+    }
+
+    /// The namespaces of the services shown, whose connections are asked.
+    pub fn service_namespaces(&self) -> BTreeSet<String> {
+        self.of(Kind::Service)
+            .map(|s| s.metadata.namespace.clone())
+            .collect()
     }
 
     fn shown(&self, o: &Object) -> bool {
