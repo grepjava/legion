@@ -3,14 +3,14 @@
 //! outputs).
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
 use crate::{
     Carp, CarpState, Dataset, DatasetSpace, Destination, Epair, Error, IfConfig, IpNet, Ipv6Net,
-    IscsiSession, Jail, JailMemory, KldState, PfState, RctlRule, Result, Sys, WgPeer,
+    IscsiSession, Jail, JailMemory, KldState, PfConn, PfState, RctlRule, Result, Sys, WgPeer,
 };
 
 /// Counts the memory of each jail's processes from the kernel's maps.
@@ -919,6 +919,11 @@ impl<R: Runner> Sys for Shell<R> {
         Ok(parse_states(&out))
     }
 
+    fn pf_connections(&self) -> Result<Vec<PfConn>> {
+        let out = self.run("pfctl", &args(["-ss"]))?;
+        Ok(parse_connections(&out))
+    }
+
     fn pf_kill_state(&self, id: &str) -> Result<()> {
         self.run("pfctl", &args(["-q", "-k", "id", "-k", id]))
             .map(drop)
@@ -1376,6 +1381,65 @@ fn parse_states(out: &str) -> Vec<PfState> {
         }
     }
     states
+}
+
+/// Connections from `pfctl -ss`, a line per state: interface (`all` for a
+/// floating state), protocol, the two ends with an arrow between and pf's
+/// word for them. The opening end is on the left of `->` (a state made
+/// going out) and on the right of `<-` (made coming in). An end that was
+/// translated is written as it is after, then as it was before in
+/// brackets: the client before NAT, the server before a redirect, which
+/// is where the client sent it. A connection crossing the host has a state
+/// on each interface, so may be listed twice.
+fn parse_connections(out: &str) -> Vec<PfConn> {
+    fn end(word: &str) -> Option<SocketAddr> {
+        let word = word.trim_start_matches('(').trim_end_matches(')');
+        if let Some((addr, port)) = word.split_once('[') {
+            let port = port.strip_suffix(']')?.parse().ok()?;
+            return Some(SocketAddr::new(addr.parse().ok()?, port));
+        }
+        let (addr, port) = word.rsplit_once(':')?;
+        Some(SocketAddr::new(
+            IpAddr::V4(addr.parse().ok()?),
+            port.parse().ok()?,
+        ))
+    }
+    // An end, and what it was before translation if it says.
+    fn side(words: &[&str]) -> Option<(SocketAddr, Option<SocketAddr>)> {
+        let now = end(words.first()?)?;
+        let before = match words.get(1) {
+            Some(w) if w.starts_with('(') => Some(end(w)?),
+            _ => None,
+        };
+        Some((now, before))
+    }
+    out.lines()
+        .filter(|l| !l.starts_with(char::is_whitespace))
+        .filter_map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let proto = *words.get(1)?;
+            if proto != "tcp" && proto != "udp" {
+                return None;
+            }
+            let rest = &words[2..];
+            let arrow = rest.iter().position(|w| *w == "->" || *w == "<-")?;
+            let (left, right) = (side(&rest[..arrow])?, side(&rest[arrow + 1..])?);
+            let (client, server) = if rest[arrow] == "->" {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            let state = rest.last().filter(|_| rest.len() > arrow + 2)?;
+            Some(PfConn {
+                proto: proto.to_owned(),
+                client: client.1.unwrap_or(client.0),
+                translated: client.1.map(|_| client.0),
+                server: server.0,
+                addressed: server.1,
+                state: (*state).to_owned(),
+            })
+        })
+        .collect()
 }
 
 /// Peers from `wg show <name> dump`: a line for the interface (private key,
@@ -1931,6 +1995,81 @@ mod tests {
         assert_eq!(sh.default_interface().unwrap(), None);
         sh.sysctl_set("net.inet.ip.forwarding", "1").unwrap();
         assert_eq!(sh.sysctl_get("kern.racct.enable").unwrap(), "1");
+    }
+
+    #[test]
+    fn connections() {
+        // Captured on FreeBSD 15.1, a cluster's node: a client outside to a
+        // published port, a pod to a service's address (both of its
+        // states: the hairpin NAT's and the redirect's), a pod to another's
+        // own address, a pod over IPv6, the host's own, and what is skipped.
+        let sh = Script::shell(vec![(
+            "pfctl -ss",
+            ok(concat!(
+                "all tcp 10.200.0.3:80 (192.168.100.219:8080) <- 192.168.100.100:55434       FIN_WAIT_2:FIN_WAIT_2\n",
+                "all tcp 192.168.100.100:55434 -> 10.200.0.3:80       FIN_WAIT_2:FIN_WAIT_2\n",
+                "all tcp 10.200.0.5:3000 (10.201.0.3:3000) <- 10.200.0.3:30236       FIN_WAIT_2:FIN_WAIT_2\n",
+                "all tcp 10.200.0.1:56952 (10.200.0.3:30236) -> 10.200.0.5:3000       FIN_WAIT_2:FIN_WAIT_2\n",
+                "lp00000000011b tcp 10.200.0.2:5432 <- 10.200.0.5:45986       ESTABLISHED:ESTABLISHED\n",
+                "all tcp fd00:10:200:9::3[8080] (fd00:10:201::1[80]) <- fd00:10:200:9::2[10226]       ESTABLISHED:ESTABLISHED\n",
+                "all udp 192.168.100.219:60848 -> 8.8.8.8:53       MULTIPLE:SINGLE\n",
+                "all icmp 10.200.0.1:7 -> 10.200.0.5:7       0:0\n",
+                "all tcp 10.200.0.1:1 ->\n",
+                "   age 00:00:41, expires in 00:00:01, 5:8 pkts\n",
+            )),
+        )]);
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let conn =
+            |proto: &str, client: &str, server: &str, addressed: Option<&str>, state: &str| {
+                PfConn {
+                    proto: proto.into(),
+                    client: a(client),
+                    translated: None,
+                    server: a(server),
+                    addressed: addressed.map(a),
+                    state: state.into(),
+                }
+            };
+        let (fin, est) = ("FIN_WAIT_2:FIN_WAIT_2", "ESTABLISHED:ESTABLISHED");
+        assert_eq!(
+            sh.pf_connections().unwrap(),
+            [
+                conn(
+                    "tcp",
+                    "192.168.100.100:55434",
+                    "10.200.0.3:80",
+                    Some("192.168.100.219:8080"),
+                    fin
+                ),
+                conn("tcp", "192.168.100.100:55434", "10.200.0.3:80", None, fin),
+                conn(
+                    "tcp",
+                    "10.200.0.3:30236",
+                    "10.200.0.5:3000",
+                    Some("10.201.0.3:3000"),
+                    fin
+                ),
+                PfConn {
+                    translated: Some(a("10.200.0.1:56952")),
+                    ..conn("tcp", "10.200.0.3:30236", "10.200.0.5:3000", None, fin)
+                },
+                conn("tcp", "10.200.0.5:45986", "10.200.0.2:5432", None, est),
+                conn(
+                    "tcp",
+                    "[fd00:10:200:9::2]:10226",
+                    "[fd00:10:200:9::3]:8080",
+                    Some("[fd00:10:201::1]:80"),
+                    est
+                ),
+                conn(
+                    "udp",
+                    "192.168.100.219:60848",
+                    "8.8.8.8:53",
+                    None,
+                    "MULTIPLE:SINGLE"
+                ),
+            ]
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 
 pub mod check;
@@ -184,6 +184,8 @@ pub trait Sys: Send + Sync {
     fn pf_main_rules(&self) -> Result<String>;
     /// Every pf state.
     fn pf_states(&self) -> Result<Vec<PfState>>;
+    /// The connections pf keeps state for (`pfctl -ss`), TCP and UDP.
+    fn pf_connections(&self) -> Result<Vec<PfConn>>;
     /// Kills one state by its [`PfState::id`]; one already gone is fine.
     fn pf_kill_state(&self, id: &str) -> Result<()>;
     /// Replaces the rules of `anchor` (e.g. `legion/svc`).
@@ -339,6 +341,27 @@ pub struct PfState {
     /// Every address on the state's line: both ends and the translated
     /// one (the VIP of a load-balanced connection, for example).
     pub addrs: Vec<IpAddr>,
+}
+
+/// A connection pf keeps state for, as `pfctl -ss` shows it: who opened
+/// it, who answered, and where it was sent when a redirect sent it on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PfConn {
+    /// `tcp` or `udp`.
+    pub proto: String,
+    /// The end that opened it, as it sent it: before any NAT.
+    pub client: SocketAddr,
+    /// The client as it went on, when NAT changed it: what a state of the
+    /// same connection on the next host has as its client.
+    pub translated: Option<SocketAddr>,
+    /// The end that answered: after any redirect.
+    pub server: SocketAddr,
+    /// Where the client sent it, when a redirect sent it to `server`
+    /// instead: a service's address, or a published port.
+    pub addressed: Option<SocketAddr>,
+    /// pf's word for it, both ends': `ESTABLISHED:ESTABLISHED`,
+    /// `FIN_WAIT_2:FIN_WAIT_2`, `MULTIPLE:SINGLE`.
+    pub state: String,
 }
 
 /// An iSCSI session of this node.

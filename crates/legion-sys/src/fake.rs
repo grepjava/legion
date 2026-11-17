@@ -16,7 +16,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use crate::{
     Carp, CarpState, Dataset, DatasetSpace, Destination, Epair, Error, IfConfig, Ipv6Net,
-    IscsiSession, Jail, JailMemory, KldState, PfState, RctlRule, Result, Sys, WgPeer,
+    IscsiSession, Jail, JailMemory, KldState, PfConn, PfState, RctlRule, Result, Sys, WgPeer,
 };
 
 #[derive(Debug, Default)]
@@ -112,6 +112,7 @@ struct State {
     sysctls: BTreeMap<String, String>,
     main_rules: String,
     states: Vec<PfState>,
+    connections: Vec<PfConn>,
     /// CARP virtual hosts by interface and vhid, with their state.
     carp: BTreeMap<(String, u8), (Carp, CarpState)>,
     /// Commands that fail once, the next time they run.
@@ -380,6 +381,11 @@ impl FakeSys {
 
     pub fn add_state(&self, state: PfState) {
         self.state().states.push(state);
+    }
+
+    /// What `pfctl -ss` lists from now on.
+    pub fn set_connections(&self, connections: Vec<PfConn>) {
+        self.state().connections = connections;
     }
 
     pub fn states(&self) -> Vec<PfState> {
@@ -1133,6 +1139,14 @@ impl Sys for FakeSys {
             return Err(fail("pfctl -ss", "Device busy"));
         }
         Ok(s.states.clone())
+    }
+
+    fn pf_connections(&self) -> Result<Vec<PfConn>> {
+        let mut s = self.state();
+        if s.failing.remove("pfctl -ss") {
+            return Err(fail("pfctl -ss", "Device busy"));
+        }
+        Ok(s.connections.clone())
     }
 
     fn pf_kill_state(&self, id: &str) -> Result<()> {

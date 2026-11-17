@@ -101,6 +101,27 @@ pub fn v6(ip: Ipv4Addr) -> Option<Ipv6Addr> {
     }
 }
 
+/// The address whose IPv6 twin `ip` is ([`v6`]); `None` for any other.
+pub fn v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = ip.segments();
+    let (net, c, d) = if CLUSTER_POD_CIDR6.contains(ip) && s[4..7] == [0, 0, 0] {
+        (CLUSTER_POD_CIDR, s[3], s[7])
+    } else if SERVICE_CIDR6.contains(ip) && s[3..6] == [0, 0, 0] {
+        (SERVICE_CIDR, s[6], s[7])
+    } else if mesh::UNDERLAY6.contains(ip) && s[3..6] == [0, 0, 0] {
+        (mesh::UNDERLAY, s[6], s[7])
+    } else {
+        return None;
+    };
+    let [a, b, ..] = net.addr.octets();
+    Some(Ipv4Addr::new(
+        a,
+        b,
+        u8::try_from(c).ok()?,
+        u8::try_from(d).ok()?,
+    ))
+}
+
 /// The /64 of node subnet `subnet`.
 pub fn node_subnet6(subnet: Ipv4Net) -> Option<Ipv6Net> {
     let net = v6(subnet.network()).filter(|_| subnet.prefix == NODE_PREFIX)?;
@@ -464,10 +485,19 @@ mod tests {
         assert_eq!(twin("10.201.1.2").as_deref(), Some("fd00:10:201::1:2"));
         assert_eq!(twin("100.64.3.1").as_deref(), Some("fd00:100:64::3:1"));
         assert_eq!(twin("192.0.2.1"), None);
-        for s in ["10.200.3.17", "10.201.1.2", "100.64.3.1"] {
+        for s in ["10.200.3.17", "10.201.1.2", "100.64.3.1", "10.200.255.254"] {
             let t = v6(ip(s)).unwrap();
+            assert_eq!(v4(t), Some(ip(s)), "{s}");
             let ranges = [CLUSTER_POD_CIDR6, SERVICE_CIDR6, mesh::UNDERLAY6];
             assert_eq!(ranges.iter().filter(|r| r.contains(t)).count(), 1, "{s}");
+        }
+        for other in [
+            "fd00:10:200:3::1:11",
+            "fd00:10:200:3::100",
+            "fd00::1",
+            "::1",
+        ] {
+            assert_eq!(v4(other.parse().unwrap()), None, "{other}");
         }
         let node = node_subnet6("10.200.3.0/24".parse().unwrap()).unwrap();
         assert_eq!(node.to_string(), "fd00:10:200:3::/64");
