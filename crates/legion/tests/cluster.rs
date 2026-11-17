@@ -158,6 +158,7 @@ fn app_updates_and_survives_losing_a_node() {
     let addrs: Vec<String> = lab.vms.iter().map(|v| v.addr.clone()).collect();
     let mut webs = BTreeSet::new();
     let mut apis = BTreeSet::new();
+    let mut sent = 0u64;
     for _ in 0..10 {
         let host = lab.get_from(&lab.vms[1], &lab.host);
         let bodies = addrs.iter().map(|a| (a, get(a)));
@@ -167,6 +168,7 @@ fn app_updates_and_survives_losing_a_node() {
             assert_eq!(&words[..2], ["web", "1"], "{body}");
             webs.insert(words[2].to_owned());
             apis.insert(words[4].to_owned());
+            sent += 1;
         }
     }
     eprintln!("web tasks answering: {webs:?}; api tasks: {apis:?}");
@@ -174,12 +176,12 @@ fn app_updates_and_survives_losing_a_node() {
     assert_eq!(apis.len(), 3, "every api task serves: {apis:?}");
 
     step("the connections the nodes saw");
-    // The 40 requests just sent: each came in on a published port, some
+    // The requests just sent: each came in on a published port, some
     // answered on another node than the one asked (NATed onto the mesh, so
     // seen by two nodes), and each had web ask api through api's VIP, most
     // of them across the mesh (seen by both nodes too). Each counts once.
     // pf keeps a closed connection's state about 90 s, so a few may have
-    // gone by now; more than 40 would be one counted twice.
+    // gone by now; more than were sent would be one counted twice.
     let table = lab.ok(&["connections", "-n", "shop"]);
     eprintln!("{table}");
     let rows: Vec<Vec<&str>> = table
@@ -196,8 +198,15 @@ fn app_updates_and_survives_losing_a_node() {
     };
     let published = counted("web", "8080/tcp", "published", None);
     let asked = counted("api", "7000/tcp", "service", Some("web"));
-    assert!((35..=40).contains(&published), "web through its published port: {published}");
-    assert!((35..=40).contains(&asked), "web to api through its VIP: {asked}");
+    let expected = sent.saturating_sub(5)..=sent;
+    assert!(
+        expected.contains(&published),
+        "web through its published port: {published} of {sent}"
+    );
+    assert!(
+        expected.contains(&asked),
+        "web to api through its VIP: {asked} of {sent}"
+    );
 
     step("update with zero downtime");
     let load = Load::start(addrs.clone());
