@@ -1423,10 +1423,28 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
                 "a shell in a task, below; Ctrl-] leaves it and returns",
             ),
             ("D", "delete (type the name; a task: asked)"),
+            ("E", "edit in $EDITOR, then apply over the version read"),
+            ("I", "node: its images"),
+            ("N B", "volume: its snapshots; back it up to a file"),
+            ("f", "task: its files (more with :files TASK PATH)"),
+            ("l", "build: follow its log"),
         ],
     ),
     (
-        "While logs or a shell show",
+        "The cluster, below",
+        &[
+            (
+                ":",
+                "run a legion command, e.g. :join-token worker; ↑↓ recall",
+            ),
+            ("H", "diagnose every node"),
+            ("W C", "the namespace's reach, and connections seen"),
+            ("T", "the namespace's topology"),
+            ("U K", "the audit log (a day), and what tasks use"),
+        ],
+    ),
+    (
+        "While logs, output or a shell show",
         &[
             ("PgUp PgDn", "scroll back"),
             ("z", "over the table, or not"),
@@ -1447,10 +1465,9 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
 ];
 
 fn help(f: &mut Frame, view: &View) {
-    let mut lines = Vec::new();
-    for (heading, keys) in HELP {
-        lines.push(section(heading));
-        for (k, what) in *keys {
+    let block = |heading: &str, keys: &[(&str, &str)]| {
+        let mut lines = vec![section(heading)];
+        for (k, what) in keys {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("  {k:<22}"),
@@ -1460,22 +1477,48 @@ fn help(f: &mut Frame, view: &View) {
             ]));
         }
         lines.push(Line::default());
-    }
-    lines.push(dimmed(format!(
+        lines
+    };
+    let blocks: Vec<Vec<Line>> = HELP.iter().map(|(h, k)| block(h, k)).collect();
+    let footer = dimmed(format!(
         "On the {} tab now. What you may do follows your role bindings.",
         view.tab.title()
-    )));
-    let [area] = Layout::vertical([Constraint::Length(lines.len() as u16 + 2)])
+    ));
+    let total: usize = blocks.iter().map(Vec::len).sum::<usize>() + 1;
+    let screen = f.area();
+    // Too tall for the screen but wide enough: two columns, the sections
+    // split where their lines are about halved.
+    let columns = if total + 2 > usize::from(screen.height) && screen.width >= 110 {
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        for b in blocks {
+            if left.len() + b.len() / 2 < total / 2 {
+                left.extend(b);
+            } else {
+                right.extend(b);
+            }
+        }
+        right.push(footer);
+        vec![left, right]
+    } else {
+        let mut lines: Vec<Line> = blocks.into_iter().flatten().collect();
+        lines.push(footer);
+        vec![lines]
+    };
+    let tallest = columns.iter().map(Vec::len).max().unwrap_or(0);
+    let width = if columns.len() > 1 { 96 } else { 70 };
+    let [area] = Layout::vertical([Constraint::Length(tallest as u16 + 2)])
         .flex(Flex::Center)
-        .areas(centered(f.area(), 70, 100));
+        .areas(centered(screen, width, 100));
     f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(lines).block(
-            panel(title("Keys"))
-                .title_bottom(Line::from(Span::styled(" any key closes ", dim())).right_aligned()),
-        ),
-        area,
-    );
+    let outer = panel(title("Keys"))
+        .title_bottom(Line::from(Span::styled(" any key closes ", dim())).right_aligned());
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+    let parts = Layout::horizontal(vec![Constraint::Fill(1); columns.len()]).split(inner);
+    for (lines, part) in columns.into_iter().zip(parts.iter()) {
+        f.render_widget(Paragraph::new(lines), *part);
+    }
 }
 
 fn centered(area: Rect, width_percent: u16, height_percent: u16) -> Rect {

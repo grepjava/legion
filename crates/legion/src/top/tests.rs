@@ -1407,3 +1407,185 @@ fn workload_tree_sorting_poll_stepping_and_service_logs() {
     typed(&mut v, &m, "---");
     assert_eq!(v.poll_ms, 10000);
 }
+
+fn run(args: &[&str]) -> Option<Request> {
+    Some(Request::Run {
+        args: args.iter().map(|a| (*a).to_owned()).collect(),
+    })
+}
+
+#[test]
+fn a_command_line_runs_legion_with_its_output_below() {
+    let m = cluster();
+    let mut v = View::default();
+    assert_eq!(typed(&mut v, &m, ":diagnose\n"), run(&["diagnose"]));
+    // `legion` before it is taken as said; quotes keep words together.
+    assert_eq!(
+        typed(
+            &mut v,
+            &m,
+            ":legion volume snapshot data 'before upgrade' -n shop\n"
+        ),
+        run(&["volume", "snapshot", "data", "before upgrade", "-n", "shop"])
+    );
+    // Up recalls what ran, the latest first; Down comes back.
+    typed(&mut v, &m, ":");
+    typed_code(&mut v, &m, KeyCode::Up);
+    typed_code(&mut v, &m, KeyCode::Up);
+    typed_code(&mut v, &m, KeyCode::Down);
+    assert_eq!(
+        typed(&mut v, &m, "\n"),
+        run(&["volume", "snapshot", "data", "before upgrade", "-n", "shop"])
+    );
+    // What needs the terminal, or a host, is not run.
+    assert_eq!(typed(&mut v, &m, ":exec web-1-1 -- sh\n"), None);
+    assert!(
+        v.notice.as_deref().unwrap().contains("x on a task"),
+        "{:?}",
+        v.notice
+    );
+    assert_eq!(typed(&mut v, &m, ":daemon\n"), None);
+    assert!(v.notice.as_deref().unwrap().contains("acts on the host"));
+    assert_eq!(typed(&mut v, &m, ":get 'service\n"), None);
+    assert!(v.notice.as_deref().unwrap().contains("not closed"));
+    // The output shows below, titled by the command.
+    v.show_logs(&run(&["diagnose"]).unwrap());
+    assert!(screen(&m, &v).contains("legion diagnose"));
+}
+
+#[test]
+fn command_lines_split_as_a_shell_splits_them() {
+    let split = |s: &str| view::split_words(s);
+    assert_eq!(split("  a  b\tc ").unwrap(), ["a", "b", "c"]);
+    assert_eq!(
+        split(r#"a "b c" 'd e' f\ g"#).unwrap(),
+        ["a", "b c", "d e", "f g"]
+    );
+    assert_eq!(
+        split(r#""say \"hi\"" x''y"#).unwrap(),
+        [r#"say "hi""#, "xy"]
+    );
+    assert_eq!(split("''").unwrap(), [""]);
+    assert!(split("'open").is_err());
+    assert!(split("\"open").is_err());
+    assert!(split("end\\").is_err());
+    assert!(view::refused("top").is_some());
+    assert!(view::refused("audit").is_none());
+}
+
+#[test]
+fn keys_run_the_cluster_commands_for_the_namespace_shown() {
+    let m = cluster();
+    let mut v = View::default();
+    // On a node, cluster-scoped: the default namespace.
+    assert_eq!(typed(&mut v, &m, "H"), run(&["diagnose"]));
+    assert_eq!(typed(&mut v, &m, "W"), run(&["reach", "-n", "default"]));
+    // On a workload of shop: shop's.
+    typed(&mut v, &m, "2");
+    assert_eq!(typed(&mut v, &m, "C"), run(&["connections", "-n", "shop"]));
+    assert_eq!(typed(&mut v, &m, "T"), run(&["topology", "-n", "shop"]));
+    assert_eq!(typed(&mut v, &m, "K"), run(&["usage", "-n", "shop"]));
+    assert_eq!(typed(&mut v, &m, "U"), run(&["audit", "--since", "24h"]));
+    // legion top -n gives the namespace when the row has none.
+    let mut only = Model::new(Some("team-a".into()));
+    only.listed(vec![node("n1", 1, "ready", "active")], BTreeSet::new());
+    let mut v = View::default();
+    assert_eq!(typed(&mut v, &only, "W"), run(&["reach", "-n", "team-a"]));
+}
+
+#[test]
+fn row_keys_edit_and_reach_what_the_console_s_pages_do() {
+    let mut m = cluster();
+    m.changed(
+        true,
+        object(
+            Kind::Build,
+            "shop",
+            "web-k3",
+            20,
+            serde_json::json!({ "image": "registry.example/web:2" }),
+            serde_json::json!({ "phase": "Running" }),
+        ),
+        0,
+    );
+    let mut v = View::default();
+    assert_eq!(
+        typed(&mut v, &m, "I"),
+        run(&["image", "ls", "--node", "n1"])
+    );
+    assert_eq!(
+        typed(&mut v, &m, "E"),
+        Some(Request::Edit {
+            key: (Kind::Node, String::new(), "n1".into())
+        })
+    );
+    typed(&mut v, &m, "4");
+    assert_eq!(
+        typed(&mut v, &m, "N"),
+        run(&["volume", "snapshots", "data", "-n", "shop"])
+    );
+    assert_eq!(
+        typed(&mut v, &m, "B/tmp/data.zst\n"),
+        run(&[
+            "volume",
+            "backup",
+            "data",
+            "-o",
+            "/tmp/data.zst",
+            "-n",
+            "shop"
+        ])
+    );
+    assert_eq!(typed(&mut v, &m, "B\n"), None);
+    assert!(v.notice.as_deref().unwrap().contains("no file"));
+    typed(&mut v, &m, "3");
+    assert_eq!(
+        typed(&mut v, &m, "f"),
+        run(&["files", "web-1-1", "/", "-n", "shop"])
+    );
+    typed(&mut v, &m, "2/web-k3\n");
+    assert_eq!(
+        typed(&mut v, &m, "l"),
+        run(&["build-logs", "web-k3", "-n", "shop", "--follow"])
+    );
+}
+
+#[test]
+fn an_edit_applies_the_one_object_over_the_version_read() {
+    let key = (Kind::Service, "shop".to_owned(), "web".to_owned());
+    let manifest = |name: &str| {
+        legion_api::manifest::yaml(&Object::new(
+            Kind::Service,
+            "shop",
+            name,
+            serde_json::json!({ "replicas": 3 }),
+        ))
+    };
+    let r = super::edited(&manifest("web"), &key, 7).unwrap();
+    assert_eq!(r.expected_version, Some(7));
+    assert_eq!(r.object.unwrap().name, "web");
+    let renamed = super::edited(&manifest("web2"), &key, 7).unwrap_err();
+    assert!(renamed.contains("legion apply"), "{renamed}");
+    let two = format!("{}---\n{}", manifest("web"), manifest("api"));
+    assert!(
+        super::edited(&two, &key, 7)
+            .unwrap_err()
+            .contains("2 objects")
+    );
+    assert!(super::edited("kind: [", &key, 7).is_err());
+}
+
+#[test]
+fn the_keys_fit_a_short_wide_screen_in_two_columns() {
+    let m = cluster();
+    let v = View {
+        help: true,
+        ..View::default()
+    };
+    let s = screen_sized(&m, &v, 160, 40);
+    assert!(
+        s.contains("Moving around") && s.contains("diagnose every node"),
+        "{s}"
+    );
+    assert!(s.contains("On the Nodes tab now"), "{s}");
+}

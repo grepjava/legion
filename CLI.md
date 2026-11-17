@@ -114,7 +114,7 @@ Trigger a CronJob immediately outside its schedule.
 
 ## Observability, Storage, Network & Sessions
 
-- `legion top [-n <NS>] [--once]`: Live terminal dashboard (nodes, workloads, tasks, resource graphs, logs, shell, alerts).
+- `legion top [-n <NS>] [--once]`: Live terminal dashboard (nodes, workloads, tasks, resource graphs, logs, shell, alerts); `:` runs any `legion` command below it, `E` edits the selected object, `?` lists the keys.
 - `legion logs <TASK|SERVICE> [-c <CONTAINER>] [-f] [--tail <N>]`
 - `legion build-logs <BUILD> [-n <NS>] [-f]`
 - `legion logs-search <SERVICE|JOB> [--since <DUR>] [--until <DUR>] [TEXT]`
@@ -128,6 +128,7 @@ Trigger a CronJob immediately outside its schedule.
 - `legion audit [FILTERS]` (cluster admin only)
 - `legion reach [-n <NS>]` (evaluate NetworkPolicy reachability matrix)
 - `legion connections [-n <NS>]` (the connections the nodes' pf saw, by service and port)
+- `legion topology [-n <NS>]` (each service with its ports, Routes, tasks, Volumes, what may reach it and what was seen)
 - `legion load-balancers [-n <NS>]` (CARP holders and states)
 - `legion volume <move|backup|restore|snapshots|snapshot|rollback|rm-snapshot>`
 

@@ -11,6 +11,7 @@ mod pki;
 mod resolver;
 mod session;
 mod top;
+mod topology;
 mod volume_backup;
 
 use std::net::SocketAddr;
@@ -528,6 +529,13 @@ enum Command {
     /// other namespace; `node/NAME` for a node itself (its probes, or a
     /// connection it forwards).
     Connections {
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// A namespace as the console's Topology page draws it, in text: each
+    /// service with its ports, Routes, tasks and Volumes, what may reach it
+    /// and the connections the nodes saw.
+    Topology {
         #[arg(short, long)]
         namespace: Option<String>,
     },

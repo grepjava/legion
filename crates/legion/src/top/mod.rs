@@ -16,6 +16,9 @@ mod view;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use legion_api::{Kind, Object};
@@ -81,7 +84,19 @@ enum Msg {
 }
 
 /// Runs until the person quits or the terminal goes.
-pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<()> {
+/// The manager and identity `legion top` was started with, which the
+/// commands it runs (`:`) use too.
+#[derive(Clone, Debug)]
+pub struct Connection {
+    pub server: String,
+    pub identity: PathBuf,
+}
+
+pub async fn run(
+    channel: Channel,
+    namespace: Option<String>,
+    connection: Connection,
+) -> anyhow::Result<()> {
     draw::set_mono(std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()));
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (poll_tx, poll_rx) = watch::channel(POLL);
@@ -94,7 +109,8 @@ pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<
     ));
     let (seen_tx, seen_rx) = watch::channel(BTreeSet::new());
     let seer = tokio::spawn(poll_connections(channel.clone(), seen_rx, tx.clone()));
-    read_keys(tx.clone());
+    let keys = Keys::default();
+    read_keys(tx.clone(), keys.clone());
 
     // The logs shown, numbered: what an earlier stream sent is dropped.
     let mut logs: Option<(u64, tokio::task::JoinHandle<()>)> = None;
@@ -284,7 +300,7 @@ pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<
                         _ => unreachable!(),
                     }
                 }
-                Request::Events { .. } | Request::Alerts => {
+                Request::Events { .. } | Request::Alerts | Request::Run { .. } => {
                     if let Some((_, stream)) = logs.take() {
                         stream.abort();
                     }
@@ -293,13 +309,23 @@ pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<
                     }
                     streams += 1;
                     view.show_logs(&request);
-                    let stream = tokio::spawn(stream_happenings(
-                        channel.clone(),
-                        request,
-                        streams,
-                        tx.clone(),
-                    ));
+                    let stream = match request {
+                        Request::Run { args } => {
+                            tokio::spawn(run_command(connection.clone(), args, streams, tx.clone()))
+                        }
+                        request => tokio::spawn(stream_happenings(
+                            channel.clone(),
+                            request,
+                            streams,
+                            tx.clone(),
+                        )),
+                    };
                     logs = Some((streams, stream));
+                }
+                Request::Edit { key } => {
+                    let done = edit(&mut terminal, &objects, &key, &keys, mouse_captured).await;
+                    view.notice = Some(done);
+                    invalidate(&mut terminal);
                 }
                 Request::Input(data) => {
                     if let Some((_, _, input)) = &shell {
@@ -346,6 +372,206 @@ pub async fn run(channel: Channel, namespace: Option<String>) -> anyhow::Result<
     result
 }
 
+/// Runs `legion ARGS` with the connection `legion top` has, its output
+/// as stream `n` in the pane, then how it ended. Closing the pane drops the
+/// task, which kills the command.
+async fn run_command(
+    connection: Connection,
+    args: Vec<String>,
+    n: u64,
+    tx: mpsc::UnboundedSender<Msg>,
+) {
+    use tokio::io::AsyncReadExt;
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            let _ = tx.send(Msg::LogEnded(
+                n,
+                format!("Not run: this program's path: {e}"),
+            ));
+            return;
+        }
+    };
+    let child = tokio::process::Command::new(exe)
+        .args(&args)
+        .env("LEGION_SERVER", &connection.server)
+        .env("LEGION_IDENTITY", &connection.identity)
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(Msg::LogEnded(n, format!("Not run: {e}")));
+            return;
+        }
+    };
+    let pipe = |stream: Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>, stderr: bool| {
+        let tx = tx.clone();
+        async move {
+            let Some(mut stream) = stream else { return };
+            let mut buf = vec![0; 8192];
+            while let Ok(read @ 1..) = stream.read(&mut buf).await {
+                if tx.send(Msg::Log(n, stderr, buf[..read].to_vec())).is_err() {
+                    return;
+                }
+            }
+        }
+    };
+    let out = child
+        .stdout
+        .take()
+        .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>);
+    let err = child
+        .stderr
+        .take()
+        .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>);
+    tokio::join!(pipe(out, false), pipe(err, true));
+    let why = match child.wait().await {
+        Ok(s) if s.success() => "Done.".to_owned(),
+        Ok(s) => match s.code() {
+            Some(code) => format!("Failed: exit {code}."),
+            None => "Killed.".to_owned(),
+        },
+        Err(e) => format!("Failed: {e}"),
+    };
+    let _ = tx.send(Msg::LogEnded(n, why));
+}
+
+/// What an edit of `key`, read at `version`, applies: the one object, over
+/// that version, so an edit of what someone changed meanwhile is refused.
+pub(super) fn edited(
+    text: &str,
+    key: &model::Key,
+    version: u64,
+) -> Result<pb::ApplyRequest, String> {
+    let objects = legion_api::manifest::parse(text)?;
+    let [object] = objects.as_slice() else {
+        return Err(format!(
+            "the file holds {} objects: an edit is of the one",
+            objects.len()
+        ));
+    };
+    let (kind, namespace, name) = key;
+    if object.kind != *kind
+        || object.metadata.namespace != *namespace
+        || object.metadata.name != *name
+    {
+        return Err(format!(
+            "it names {} now: apply another object with legion apply",
+            object.key()
+        ));
+    }
+    Ok(pb::ApplyRequest {
+        object: Some(object.into()),
+        expected_version: Some(version),
+        ..Default::default()
+    })
+}
+
+/// The editor to run: `$VISUAL`, `$EDITOR`, else `vi`, with its words.
+fn editor() -> Vec<String> {
+    ["VISUAL", "EDITOR"]
+        .iter()
+        .filter_map(|v| std::env::var(v).ok())
+        .find_map(|e| view::split_words(&e).ok().filter(|w| !w.is_empty()))
+        .unwrap_or_else(|| vec!["vi".to_owned()])
+}
+
+/// Edits `key` in the editor, the terminal given over to it meanwhile, and
+/// applies what was saved: what came of it, for the bottom line. A failed
+/// apply keeps the edit in its file, named.
+async fn edit(
+    terminal: &mut ratatui::DefaultTerminal,
+    objects: &crate::cli::Objects,
+    key: &model::Key,
+    keys: &Keys,
+    mouse: bool,
+) -> String {
+    let (kind, namespace, name) = key.clone();
+    let got = objects
+        .clone()
+        .get(ObjectRef {
+            kind: kind.to_string(),
+            namespace: namespace.clone(),
+            name: name.clone(),
+        })
+        .await;
+    let object = match got.map(|r| Object::try_from(r.into_inner())) {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return format!("Not edited: {e}"),
+        Err(e) => return format!("Not edited: {}", e.message()),
+    };
+    let version = object.metadata.version;
+    let before = legion_api::manifest::yaml(&object);
+    let path = std::env::temp_dir().join(format!(
+        "legion-edit-{}-{name}-{}.yaml",
+        kind.to_string().to_lowercase(),
+        std::process::id()
+    ));
+    if let Err(e) = std::fs::write(&path, &before) {
+        return format!("Not edited: writing {}: {e}", path.display());
+    }
+    keys.hold().await;
+    if mouse {
+        let _ = crossterm::execute!(terminal.backend_mut(), DisableMouseCapture);
+    }
+    ratatui::restore();
+    let words = editor();
+    let ran = tokio::process::Command::new(&words[0])
+        .args(&words[1..])
+        .arg(&path)
+        .status()
+        .await;
+    *terminal = ratatui::init();
+    if mouse {
+        let _ = crossterm::execute!(terminal.backend_mut(), EnableMouseCapture);
+    }
+    keys.release();
+    let what = format!("{} {}", kind_word_of(kind), display(&namespace, &name));
+    let kept = |why: String| format!("{why}. Your edit is kept in {}.", path.display());
+    match ran {
+        Ok(s) if s.success() => {}
+        Ok(s) => return kept(format!("Not applied: {} exited {s}", words[0])),
+        Err(e) => return format!("Not edited: running {}: {e}", words[0]),
+    }
+    let after = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => return format!("Not applied: reading {}: {e}", path.display()),
+    };
+    if after == before {
+        let _ = std::fs::remove_file(&path);
+        return format!("No change to {what}.");
+    }
+    let request = match edited(&after, key, version) {
+        Ok(r) => r,
+        Err(e) => return kept(format!("Not applied: {e}")),
+    };
+    match objects.clone().apply(request).await {
+        Ok(r) => {
+            let _ = std::fs::remove_file(&path);
+            let version = r.into_inner().object.map_or(0, |o| o.version);
+            format!("Applied {what} (version {version}).")
+        }
+        Err(e) => kept(format!("Not applied: {}", e.message())),
+    }
+}
+
+fn kind_word_of(kind: Kind) -> &'static str {
+    model::kind_word(kind)
+}
+
+fn display(namespace: &str, name: &str) -> String {
+    if namespace.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{namespace}/{name}")
+    }
+}
+
 /// Asks for the connections of each namespace in `namespaces` every
 /// [`SEEN`], and at once when they change. A manager too old to say, or a
 /// caller who may not read a namespace's services, gets none shown.
@@ -384,10 +610,41 @@ async fn poll_connections(
 /// Reads keys on a thread of its own. crossterm reads a hung-up terminal
 /// forever (jmon found it), so it stops once stdin is no longer a
 /// terminal.
-fn read_keys(tx: mpsc::UnboundedSender<Msg>) {
+/// Whether the key reader is to leave the terminal alone (`held`), and
+/// whether it does (`parked`): an editor run meanwhile reads the keys.
+#[derive(Clone, Default)]
+struct Keys {
+    held: Arc<AtomicBool>,
+    parked: Arc<AtomicBool>,
+}
+
+impl Keys {
+    /// Stops the reader, once it is not reading.
+    async fn hold(&self) {
+        self.held.store(true, Ordering::SeqCst);
+        for _ in 0..50 {
+            if self.parked.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn release(&self) {
+        self.held.store(false, Ordering::SeqCst);
+    }
+}
+
+fn read_keys(tx: mpsc::UnboundedSender<Msg>, keys: Keys) {
     let watch_tty = std::io::stdin().is_terminal();
     std::thread::spawn(move || {
         loop {
+            if keys.held.load(Ordering::SeqCst) {
+                keys.parked.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            keys.parked.store(false, Ordering::SeqCst);
             if watch_tty && !std::io::stdin().is_terminal() {
                 let _ = tx.send(Msg::HungUp);
                 return;
@@ -817,7 +1074,9 @@ async fn act(mut objects: crate::cli::Objects, request: Request) -> String {
         | Request::Exec { .. }
         | Request::Input(_)
         | Request::Events { .. }
-        | Request::Alerts => {
+        | Request::Alerts
+        | Request::Run { .. }
+        | Request::Edit { .. } => {
             unreachable!("not asked of the API")
         }
     };

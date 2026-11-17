@@ -288,6 +288,97 @@ pub enum Request {
     },
     /// Typing for the shell shown.
     Input(Vec<u8>),
+    /// A `legion` command, its output in the pane (`:`, and the keys that
+    /// stand for one).
+    Run {
+        args: Vec<String>,
+    },
+    /// The object edited in `$EDITOR`, then applied over the version read.
+    Edit {
+        key: Key,
+    },
+}
+
+/// How many command lines Up goes back through.
+const COMMANDS_KEPT: usize = 50;
+
+/// A `legion` command, its output to show in the pane.
+fn run(args: &[&str]) -> Request {
+    Request::Run {
+        args: args.iter().map(|a| (*a).to_owned()).collect(),
+    }
+}
+
+/// The namespace keys that read one act on: the selected object's, the
+/// one `legion top -n` shows, or `default`.
+fn namespace_of(model: &Model, selected: Option<&Key>) -> String {
+    selected
+        .map(|(_, ns, _)| ns.clone())
+        .filter(|ns| !ns.is_empty())
+        .or_else(|| model.namespace.clone())
+        .unwrap_or_else(|| "default".to_owned())
+}
+
+/// Why a command can't run with its output in the pane: it needs the
+/// terminal, keeps running as a server, or acts on the host it runs on.
+pub(super) fn refused(command: &str) -> Option<String> {
+    Some(match command {
+        "top" => "this is legion top".to_owned(),
+        "exec" => "x on a task opens a shell here".to_owned(),
+        "port-forward" => "it keeps running: run it in another terminal".to_owned(),
+        "daemon" | "node-resolver" | "init" | "join" | "local" | "restore" | "unlock" => {
+            format!("{command} acts on the host it runs on: run it in a shell there")
+        }
+        _ => return None,
+    })
+}
+
+/// A command line's words, split as a shell splits them: on blanks,
+/// keeping what is quoted ('…' as it is, "…" with \ escapes) together.
+pub(super) fn split_words(line: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if let Some(w) = word.take() {
+                    words.push(w);
+                }
+            }
+            '\'' => {
+                let w = word.get_or_insert_with(String::new);
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(c) => w.push(c),
+                        None => return Err("a ' is not closed".into()),
+                    }
+                }
+            }
+            '"' => {
+                let w = word.get_or_insert_with(String::new);
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            Some(c) => w.push(c),
+                            None => return Err("a \" is not closed".into()),
+                        },
+                        Some(c) => w.push(c),
+                        None => return Err("a \" is not closed".into()),
+                    }
+                }
+            }
+            '\\' => match chars.next() {
+                Some(c) => word.get_or_insert_with(String::new).push(c),
+                None => return Err("the line ends with \\".into()),
+            },
+            c => word.get_or_insert_with(String::new).push(c),
+        }
+    }
+    words.extend(word);
+    Ok(words)
 }
 
 /// What typed text is for.
@@ -313,6 +404,13 @@ pub(super) enum Then {
     /// Filters as it is typed; Esc goes back to this.
     Filter {
         before: String,
+    },
+    /// A `legion` command line.
+    Command,
+    /// Where a volume's backup is written.
+    Backup {
+        namespace: String,
+        volume: String,
     },
 }
 
@@ -379,6 +477,9 @@ pub struct View {
     pub(super) shell: Option<Shell>,
     /// That pane over the table too.
     pub(super) zoom: bool,
+    /// The command lines run, oldest first, and how far back Up has gone.
+    pub(super) commands: Vec<String>,
+    pub(super) recalled: usize,
     pub(super) quit: bool,
 }
 
@@ -406,6 +507,8 @@ impl Default for View {
             logs: None,
             shell: None,
             zoom: false,
+            commands: Vec::new(),
+            recalled: 0,
             quit: false,
         }
     }
@@ -450,6 +553,7 @@ impl View {
                 name,
             } => format!("Events of {} {namespace}/{name}", kind_word(*kind)),
             Request::Alerts => "Alerts".to_owned(),
+            Request::Run { args } => format!("legion {}", args.join(" ")),
             _ => return,
         };
         self.shell = None;
@@ -640,6 +744,22 @@ impl View {
             KeyCode::Char('-') => self.step_poll(false),
             KeyCode::Char('M') => self.mouse = !self.mouse,
             KeyCode::Char('?') => self.help = true,
+            KeyCode::Char(':') => {
+                self.recalled = 0;
+                self.input("legion".into(), Then::Command);
+            }
+            KeyCode::Char(c @ ('H' | 'W' | 'C' | 'T' | 'U' | 'K')) => {
+                let ns = namespace_of(model, selected.as_ref());
+                let args: &[&str] = match c {
+                    'H' => &["diagnose"],
+                    'W' => &["reach", "-n", &ns],
+                    'C' => &["connections", "-n", &ns],
+                    'T' => &["topology", "-n", &ns],
+                    'U' => &["audit", "--since", "24h"],
+                    _ => &["usage", "-n", &ns],
+                };
+                return Some(run(args));
+            }
             KeyCode::Char('i') => self.detail = Some(!self.detail.unwrap_or(self.wide)),
             KeyCode::Char('y') => self.yaml = selected.map(|k| (k, 0)),
             KeyCode::Char('/') => {
@@ -806,6 +926,21 @@ impl View {
                 let pick = Pick::Logs { namespace, name };
                 return self.container(o, pick, "Logs of which container?");
             }
+            ('l', Kind::Build) => run(&["build-logs", &name, "-n", &namespace, "--follow"]),
+            ('E', _) => Request::Edit { key: k.clone() },
+            ('I', Kind::Node) => run(&["image", "ls", "--node", &name]),
+            ('N', Kind::Volume) => run(&["volume", "snapshots", &name, "-n", &namespace]),
+            ('B', Kind::Volume) => {
+                self.input(
+                    format!("Back up volume {ns}/{n} to the file"),
+                    Then::Backup {
+                        namespace,
+                        volume: name,
+                    },
+                );
+                return None;
+            }
+            ('f', Kind::Task) => run(&["files", &name, "/", "-n", &namespace]),
             ('L', Kind::Service | Kind::Job) => Request::ServiceLogs {
                 namespace,
                 kind,
@@ -916,6 +1051,18 @@ impl View {
                     KeyCode::Backspace => {
                         input.pop();
                     }
+                    KeyCode::Up | KeyCode::Down if matches!(then, Then::Command) => {
+                        let n = self.commands.len();
+                        self.recalled = if k.code == KeyCode::Up {
+                            (self.recalled + 1).min(n)
+                        } else {
+                            self.recalled.saturating_sub(1)
+                        };
+                        input = match self.recalled {
+                            0 => String::new(),
+                            back => self.commands[n - back].clone(),
+                        };
+                    }
                     KeyCode::Esc => {
                         if let Then::Filter { before } = then {
                             self.filter[i] = before;
@@ -963,6 +1110,31 @@ impl View {
                 node: input,
             }),
             Then::Move { .. } => refuse(self, "Cancelled: no node given."),
+            Then::Command => {
+                let mut args = match split_words(&input) {
+                    Ok(args) => args,
+                    Err(e) => return refuse(self, &format!("Not run: {e}.")),
+                };
+                if args.first().is_some_and(|a| a == "legion") {
+                    args.remove(0);
+                }
+                if args.is_empty() {
+                    return refuse(self, "Cancelled.");
+                }
+                if let Some(why) = refused(&args[0]) {
+                    return refuse(self, &format!("Not run: {why}."));
+                }
+                if self.commands.last() != Some(&input) {
+                    self.commands.push(input);
+                    let over = self.commands.len().saturating_sub(COMMANDS_KEPT);
+                    self.commands.drain(..over);
+                }
+                Some(Request::Run { args })
+            }
+            Then::Backup { namespace, volume } if !input.is_empty() => Some(run(&[
+                "volume", "backup", &volume, "-o", &input, "-n", &namespace,
+            ])),
+            Then::Backup { .. } => refuse(self, "Cancelled: no file given."),
             Then::Label { node } => match crate::cli::label_change(&input) {
                 Ok((key, value)) => Some(Request::Label { node, key, value }),
                 Err(e) => refuse(self, &format!("Cancelled: {e}.")),

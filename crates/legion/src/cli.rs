@@ -195,7 +195,7 @@ impl Objects {
         Objects(objects_client(channel))
     }
 
-    async fn apply(&mut self, req: ApplyRequest) -> Answer<pb::ApplyResponse> {
+    pub(crate) async fn apply(&mut self, req: ApplyRequest) -> Answer<pb::ApplyResponse> {
         let client = &self.0;
         retrying(|| {
             let (mut c, req) = (client.clone(), req.clone());
@@ -226,7 +226,7 @@ impl Objects {
         Ok(legion_manager::actions::set_labels(self, r#ref, changes).await?)
     }
 
-    async fn get(&mut self, req: ObjectRef) -> Answer<pb::Object> {
+    pub(crate) async fn get(&mut self, req: ObjectRef) -> Answer<pb::Object> {
         let client = &self.0;
         retrying(|| {
             let (mut c, req) = (client.clone(), req.clone());
@@ -1100,6 +1100,61 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 print_table(["FROM", "TO", "PORTS"], &rows);
             }
         }
+        Command::Topology { namespace } => {
+            let namespace = namespace.unwrap_or_else(|| "default".into());
+            let read = |kind: Kind| {
+                let mut objects = objects.clone();
+                let namespace = namespace.clone();
+                async move {
+                    let resp = objects
+                        .list(ListRequest {
+                            kind: kind.to_string(),
+                            namespace,
+                            match_labels: Default::default(),
+                        })
+                        .await?
+                        .into_inner();
+                    resp.objects
+                        .into_iter()
+                        .map(Object::try_from)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(anyhow::Error::from)
+                }
+            };
+            let services = read(Kind::Service).await?;
+            let tasks = read(Kind::Task).await?;
+            let routes = read(Kind::Route).await?;
+            let volumes = read(Kind::Volume).await?;
+            let reach = cluster
+                .reach(pb::ReachRequest {
+                    namespace: namespace.clone(),
+                })
+                .await?
+                .into_inner()
+                .edges;
+            // A manager from before connections says nothing of them.
+            let seen = cluster
+                .connections(pb::ConnectionsRequest {
+                    namespace: namespace.clone(),
+                })
+                .await
+                .ok()
+                .map(|r| r.into_inner().edges);
+            let lines = crate::topology::lines(&crate::topology::Namespace {
+                services: &services,
+                tasks: &tasks,
+                routes: &routes,
+                volumes: &volumes,
+                reach: &reach,
+                seen: seen.as_deref(),
+            });
+            if lines.is_empty() {
+                println!("no services in {namespace}");
+            }
+            for line in lines {
+                println!("{line}");
+            }
+        }
         Command::Connections { namespace } => {
             let namespace = namespace.unwrap_or_else(|| "default".into());
             let r = cluster
@@ -1290,7 +1345,13 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             print_usage_history(&r, output)?;
         }
         Command::Top { namespace, once } if once => crate::top::once(channel, namespace).await?,
-        Command::Top { namespace, .. } => crate::top::run(channel, namespace).await?,
+        Command::Top { namespace, .. } => {
+            let connection = crate::top::Connection {
+                server: server.to_owned(),
+                identity: identity.to_owned(),
+            };
+            crate::top::run(channel, namespace, connection).await?
+        }
         Command::Watch { kind, from } => {
             let kind = kind.as_deref().map(parse_kind).transpose()?;
             let from_version = match from {

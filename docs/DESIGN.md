@@ -574,7 +574,10 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   with kubectl-style kind names (`service`, `services`, `svc`), `-n`, `-A`,
   `-l key=value` and `-o table|yaml|json`. `apply` reads multi-document YAML
   or JSON, or stdin with `-f -`.
-- **`legion top`.** The cluster live in the terminal (ratatui). A header
+- **`legion top`.** The cluster live in the terminal (ratatui), level
+  with the console for what an operator does over SSH: `:` runs any
+  `legion` command into the pane, and keys stand for the console's pages
+  (CONSOLE.md, "`legion top` level with the console"). A header
   shows nodes and tasks by state, the managers, and for CPU and memory
   what all tasks use: a bar and a share of what the nodes hold, the
   amounts, and the last 20 minutes as a graph scaled to their peak (not

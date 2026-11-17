@@ -591,6 +591,20 @@ behind the console. Fixed:
   cron job now, `e` follows the selected row's events in the pane, `A`
   the alerts; Builds are listed with the workloads and ImagePolicies with
   the config.
+- *`legion top` level with the console* (2026-11-18): `:` runs any
+  `legion` command with the connection `top` has, its output in the pane
+  (Up recalls; what needs the terminal or acts on a host, `exec`,
+  `port-forward`, `daemon` and such, is refused with where to do it). Keys
+  stand for the console's pages: `H` diagnoses every node, `W` and `C`
+  show the namespace's reach and the connections seen, `T` its topology
+  (`legion topology`, new: each service with its ports, Routes, tasks,
+  Volumes, what may reach it and what was seen), `U` the audit log of a
+  day, `K` what tasks use; on a row, `E` edits the object in `$EDITOR`
+  and applies it over the version read (as the console's editor does; a
+  failed apply keeps the edit in its file), `I` a node's images, `N` and
+  `B` a volume's snapshots and its backup to a file, `f` a task's files,
+  `l` a build's log. The deploy form, compose import and templates stay
+  the console's: in a terminal they are a manifest and `legion apply`.
 - *Restoring a backup:* the Operations page gives the steps beside the
   backup's download. A restore replaces a stopped manager's store on its
   host, so the console, served by a manager that is up and out of reach
