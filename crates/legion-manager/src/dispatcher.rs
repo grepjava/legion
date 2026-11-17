@@ -945,10 +945,16 @@ impl DispatcherService {
         let suspect = self.period * SUSPECT_HEARTBEATS;
         let tick = self.period.min(Duration::from_secs(1));
         let mut leading_since: Option<Instant> = None;
+        let mut stalls = Stalls::new(tick, Instant::now());
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(tick) => {}
                 _ = closing.wait_for(|c| *c) => return,
+            }
+            if let Some(gap) = stalls.tick(Instant::now()) {
+                tracing::warn!(
+                    "this manager did not run for {gap:?}: nodes' silence is counted from now"
+                );
             }
             let m = self.store().raft.metrics().borrow().clone();
             if m.current_leader != Some(self.api.id) {
@@ -956,7 +962,9 @@ impl DispatcherService {
                 self.seen.lock().unwrap().clear();
                 continue;
             }
-            let since = *leading_since.get_or_insert_with(Instant::now);
+            // Not before this manager last ran again: a node is not
+            // silent for the time the leader itself was not listening.
+            let since = (*leading_since.get_or_insert_with(Instant::now)).max(stalls.resumed);
             let nodes = match self.store().list(Kind::Node, None) {
                 Ok(l) => l.objects,
                 Err(e) => {
@@ -2253,6 +2261,38 @@ fn unexpected(outcome: Outcome) -> Status {
     Status::internal(format!("unexpected outcome {outcome:?}"))
 }
 
+/// When a loop that ticks every `tick` last ran again after not running
+/// for much longer (its process stopped, its VM paused, its host overrun):
+/// what it measured across that time it did not see.
+struct Stalls {
+    tick: Duration,
+    last: Instant,
+    resumed: Instant,
+}
+
+impl Stalls {
+    /// Late by more than this many ticks, it did not run.
+    const LATE_TICKS: u32 = 3;
+
+    fn new(tick: Duration, now: Instant) -> Stalls {
+        Stalls {
+            tick,
+            last: now,
+            resumed: now,
+        }
+    }
+
+    /// The loop runs `now`: how long it did not, if it stalled.
+    fn tick(&mut self, now: Instant) -> Option<Duration> {
+        let gap = now.saturating_duration_since(self.last);
+        self.last = now;
+        (gap > self.tick * (Self::LATE_TICKS + 1)).then(|| {
+            self.resumed = now;
+            gap
+        })
+    }
+}
+
 /// The state a node's heartbeats give it, if it changes: `heard` from under
 /// this leader, last `silent` ago. A node still registering (its state
 /// unknown until its subnet is reserved) keeps it whatever its name was
@@ -2309,6 +2349,25 @@ mod tests {
         );
         assert_eq!(heard(NodeState::Ready, false, ms(10), suspect, grace), None);
         assert_eq!(heard(NodeState::Ready, true, ms(10), suspect, grace), None);
+    }
+
+    /// A leader that did not run for a while (its VM paused, say) counts
+    /// nodes' silence from when it ran again: they were not silent, it was
+    /// not listening. Late ticks of an ordinary busy loop are no stall.
+    #[test]
+    fn a_leader_that_did_not_run_counts_silence_from_when_it_ran_again() {
+        use super::{Duration, Instant, Stalls};
+        let tick = Duration::from_secs(1);
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut stalls = Stalls::new(tick, t0);
+        assert_eq!(stalls.tick(at(1)), None);
+        assert_eq!(stalls.tick(at(3)), None, "a tick or two late");
+        assert_eq!(stalls.resumed, t0);
+        assert_eq!(stalls.tick(at(17)), Some(Duration::from_secs(14)));
+        assert_eq!(stalls.resumed, at(17));
+        assert_eq!(stalls.tick(at(18)), None);
+        assert_eq!(stalls.resumed, at(17), "kept until the next stall");
     }
 
     use super::*;

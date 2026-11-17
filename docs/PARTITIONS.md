@@ -26,7 +26,12 @@ managers forwarded to it:
 
 The leader checks once a second, so each time can be up to a second late. A
 new leader marks nothing `down` until it has led for 16 s, and nothing
-`suspect` before it has heard from the node.
+`suspect` before it has heard from the node. A leader that did not run for
+a while (its VM paused, its host overrun: its once-a-second check more than
+4 s late) counts silence from when it ran again, as for a new leader: the
+nodes were not silent, it was not listening. Before, waking from a 14 s
+stall, it marked a node `down` that then restarted for an upgrade, and the
+node's pods were replaced instead of adopted.
 
 Tested: `tasks_of_a_lost_node_move`, `a_global_task_stays_on_a_node_taking_no_new_ones`
 and `lost_tasks_are_replaced_whatever_the_restart_policy` (the planner);
