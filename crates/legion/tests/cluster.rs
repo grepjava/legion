@@ -259,14 +259,15 @@ fn app_updates_and_survives_losing_a_node() {
     step("done");
 }
 
-/// The version `node`'s agent says it runs. (Not its protocol: a leader
-/// from before the handshake keeps no such field in what it writes.)
-fn version(lab: &Lab, node: &str) -> String {
+/// The protocol `node`'s agent says it speaks: 1 from a build before the
+/// handshake. It tells the previous release from this build where their
+/// versions are the same, as they are until the next release is cut.
+fn speaks(lab: &Lab, node: &str) -> u64 {
     lab.list("nodes", "")
         .iter()
         .find(|n| n["metadata"]["name"] == node)
-        .and_then(|n| n["status"]["version"].as_str().map(str::to_owned))
-        .unwrap_or_default()
+        .and_then(|n| n["status"]["protocol"]["speaks"].as_u64())
+        .unwrap_or(1)
 }
 
 /// The managers' protocol floor, as the manager at `server` reads it: 1
@@ -351,17 +352,16 @@ fn the_cluster_upgrades_one_node_at_a_time() {
             .iter()
             .all(|n| lab.node_state(n) == "ready")
     });
-    let this = env!("CARGO_PKG_VERSION");
+    let this = legion_api::protocol::SPEAKS as u64;
     for n in ["n1", "n2", "n3"] {
-        assert_ne!(version(&lab, n), this, "{n} runs the previous release");
+        assert!(speaks(&lab, n) < this, "{n} runs the previous release");
     }
     lab.deploy("1");
     wait("the app", 600, || lab.app_ready());
     let old = floor_at(&lab, &lab.server());
-    let new = legion_api::protocol::SPEAKS as u64;
     assert!(
-        old < new,
-        "the previous release's floor {old}, this build's {new}"
+        old < this,
+        "the previous release's floor {old}, this build's {this}"
     );
 
     step("upgrade n3, then n2, then n1");
@@ -377,7 +377,7 @@ fn the_cluster_upgrades_one_node_at_a_time() {
         let from = Instant::now();
         lab.restart_vm(i, Role::Manager);
         wait(&format!("{name} on this build"), 120, || {
-            lab.node_state(&name) == "ready" && version(&lab, &name) == this
+            lab.node_state(&name) == "ready" && speaks(&lab, &name) == this
         });
         restarts.push((from, Instant::now()));
         wait("the app", 300, || lab.app_ready());
@@ -390,11 +390,11 @@ fn the_cluster_upgrades_one_node_at_a_time() {
     let from = Instant::now();
     lab.restart_host(&[]);
     wait("n1 on this build", 120, || {
-        lab.node_state("n1") == "ready" && version(&lab, "n1") == this
+        lab.node_state("n1") == "ready" && speaks(&lab, "n1") == this
     });
     restarts.push((from, Instant::now()));
     wait("the floor raised", 60, || {
-        floor_at(&lab, &lab.server()) == new
+        floor_at(&lab, &lab.server()) == this
     });
     wait("the app", 300, || lab.app_ready());
     kept(&lab, "n1", &before);
