@@ -285,15 +285,51 @@ fn floor_at(lab: &Lab, server: &str) -> u64 {
         .unwrap_or(1)
 }
 
+/// The app's running pods on `node`: each task's name, jail and address.
+/// A restarted daemon adopts them, and they stay the same; replaced, they
+/// don't, though the app may well answer throughout.
+fn pods_on(lab: &Lab, node: &str) -> BTreeSet<(String, u64, String)> {
+    lab.list("tasks", "shop")
+        .iter()
+        .filter(|t| {
+            t["spec"]["node"] == node
+                && t["spec"]["desiredState"] == "running"
+                && t["status"]["state"] == "running"
+        })
+        .map(|t| {
+            (
+                t["metadata"]["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                t["status"]["jid"].as_u64().unwrap_or_default(),
+                t["status"]["ip"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// The pods `name` ran before its restart, as [`pods_on`] gave them, are
+/// the ones it runs now.
+fn kept(lab: &Lab, name: &str, before: &BTreeSet<(String, u64, String)>) {
+    assert!(!before.is_empty(), "{name} runs some of the app");
+    assert_eq!(
+        &pods_on(lab, name),
+        before,
+        "{name}'s pods adopted, not replaced"
+    );
+}
+
 /// The upgrade drill (PLAN.md, phase 6): three managers on the previous
 /// release (`LEGION_PREVIOUS`, its `legion`) run the app, and each node in
-/// turn is restarted on this build, as an operator upgrades. The managers'
-/// floor stays where the previous release left it until the last manager
-/// is upgraded, then rises. The previous release's node resolver lives in
-/// its daemon, so a node's pods may fail to look names up while that node
-/// restarts, and only then; restarted again on this build, whose resolver
-/// outlives the daemon, the app answers throughout. Then the upgraded
-/// cluster updates the app.
+/// turn is restarted on this build, as an operator upgrades. Each node's
+/// pods are adopted by the new daemon, not replaced. The managers' floor
+/// stays where the previous release left it until the last manager is
+/// upgraded, then rises. A node's pods may fail to look names up while
+/// that node restarts, and only then, if the previous release's node
+/// resolver lives in its daemon; restarted again on this build, whose
+/// resolver outlives the daemon, the app answers throughout, and the pods
+/// are adopted again. Then the upgraded cluster updates the app.
 #[test]
 #[ignore = "needs root, the lab's VMs and ZFS on FreeBSD; see the module docs"]
 fn the_cluster_upgrades_one_node_at_a_time() {
@@ -321,17 +357,23 @@ fn the_cluster_upgrades_one_node_at_a_time() {
     }
     lab.deploy("1");
     wait("the app", 600, || lab.app_ready());
+    let old = floor_at(&lab, &lab.server());
+    let new = legion_api::protocol::SPEAKS as u64;
+    assert!(
+        old < new,
+        "the previous release's floor {old}, this build's {new}"
+    );
 
     step("upgrade n3, then n2, then n1");
     let addrs: Vec<String> = lab.vms.iter().map(|v| v.addr.clone()).collect();
     let load = Load::start(addrs.clone());
     std::thread::sleep(Duration::from_secs(2));
     lab.binary = common::LEGION.to_owned();
-    let new = legion_api::protocol::SPEAKS as u64;
     // Each node's restart, from its daemon's stop to its being ready.
     let mut restarts = Vec::new();
     for i in [1, 0] {
         let name = format!("n{}", i + 2);
+        let before = pods_on(&lab, &name);
         let from = Instant::now();
         lab.restart_vm(i, Role::Manager);
         wait(&format!("{name} on this build"), 120, || {
@@ -339,10 +381,12 @@ fn the_cluster_upgrades_one_node_at_a_time() {
         });
         restarts.push((from, Instant::now()));
         wait("the app", 300, || lab.app_ready());
+        kept(&lab, &name, &before);
         let at = format!("{}:{}", lab.vms[i].addr, common::PORT);
         std::thread::sleep(Duration::from_secs(5));
-        assert_eq!(floor_at(&lab, &at), 1, "the floor with n1 not upgraded");
+        assert_eq!(floor_at(&lab, &at), old, "the floor with n1 not upgraded");
     }
+    let before = pods_on(&lab, "n1");
     let from = Instant::now();
     lab.restart_host(&[]);
     wait("n1 on this build", 120, || {
@@ -353,6 +397,7 @@ fn the_cluster_upgrades_one_node_at_a_time() {
         floor_at(&lab, &lab.server()) == new
     });
     wait("the app", 300, || lab.app_ready());
+    kept(&lab, "n1", &before);
     std::thread::sleep(Duration::from_secs(2));
     let results = load.finish();
     let failures: Vec<_> = results.iter().filter(|r| r.2.is_err()).collect();
@@ -383,15 +428,19 @@ fn the_cluster_upgrades_one_node_at_a_time() {
     std::thread::sleep(Duration::from_secs(2));
     for i in [1, 0] {
         let name = format!("n{}", i + 2);
+        let before = pods_on(&lab, &name);
         lab.restart_vm(i, Role::Manager);
         wait(&format!("{name} back"), 120, || {
             lab.node_state(&name) == "ready"
         });
         wait("the app", 300, || lab.app_ready());
+        kept(&lab, &name, &before);
     }
+    let before = pods_on(&lab, "n1");
     lab.restart_host(&[]);
     wait("n1 back", 120, || lab.node_state("n1") == "ready");
     wait("the app", 300, || lab.app_ready());
+    kept(&lab, "n1", &before);
     std::thread::sleep(Duration::from_secs(2));
     let results = load.finish();
     let failures: Vec<_> = results.iter().filter(|r| r.2.is_err()).collect();

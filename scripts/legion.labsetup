@@ -78,9 +78,9 @@ archive() {
     chmod 644 /tmp/src.tar.gz
 }
 
-# The previous release, v0.1.14, for the upgrade drill, at the revision
+# The previous release, v0.1.19, for the upgrade drill, at the revision
 # legion.qualify records: its version commit.
-previous_rev=6b3cb38ba8469b7ba92f0160fce158575837fd06
+previous_rev=e2c225174ce1fce11fa196a3e1d348a91bb4f70c
 archive legion "$previous_rev"
 su -l lab -c "rm -rf ~/legion-prev && mkdir ~/legion-prev &&
     tar -xzf /tmp/src.tar.gz -C ~/legion-prev --strip-components 1 &&

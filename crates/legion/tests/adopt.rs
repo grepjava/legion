@@ -565,3 +565,83 @@ fn pods_outlive_the_daemon() {
     lab.stop();
     eprintln!("adopt: all done");
 }
+
+/// `kern.boottime`'s seconds.
+fn boot_time() -> u64 {
+    let out = ok("sysctl -n kern.boottime");
+    out.split_once("sec = ")
+        .and_then(|(_, r)| r.split(',').next())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or_else(|| panic!("kern.boottime: {out}"))
+}
+
+/// The host's clock set `secs` ahead, as ntpd may soon after boot, and set
+/// back when dropped.
+struct ClockAhead(u64);
+
+impl ClockAhead {
+    fn set(secs: u64) -> ClockAhead {
+        let now = ok("date +%s").trim().parse::<u64>().unwrap();
+        ok(&format!("date -f %s {}", now + secs));
+        ClockAhead(secs)
+    }
+}
+
+impl Drop for ClockAhead {
+    fn drop(&mut self) {
+        let now = ok("date +%s").trim().parse::<u64>().unwrap();
+        let _ = sh(&format!("date -f %s {}", now - self.0));
+    }
+}
+
+/// The clock set after the daemon started moves the boot time the kernel
+/// tells, not the boot: a daemon started after that adopts the pods of the
+/// one before. Sets this host's clock, so it runs only where nothing else
+/// does (the lab's own VM).
+#[test]
+#[ignore = "needs root and ZFS on FreeBSD, and sets the clock; set LEGION_ADOPT_LAB and LEGION_ADOPT_ZFS_ROOT"]
+fn pods_outlive_a_clock_set_after_boot() {
+    let (Some(dir), Some(zfs_root)) = (
+        std::env::var_os("LEGION_ADOPT_LAB"),
+        std::env::var("LEGION_ADOPT_ZFS_ROOT").ok(),
+    ) else {
+        legion_sys::live::skip("LEGION_ADOPT_LAB or LEGION_ADOPT_ZFS_ROOT not set");
+        return;
+    };
+    let mut lab = Lab::new(dir.into(), zfs_root);
+    lab.start();
+    lab.cli(&["init"]);
+    lab.apply(2);
+    wait("the pods", 180, || lab.ready(2));
+    let pods = lab.pods();
+    assert_eq!(pods.len(), 2);
+
+    eprintln!("adopt: the clock set 90 s ahead while the daemon is stopped");
+    lab.stop();
+    let booted = boot_time();
+    let clock = ClockAhead::set(90);
+    let moved = boot_time();
+    assert!(
+        moved >= booted + 89,
+        "setting the clock moves kern.boottime: {booted}, then {moved}"
+    );
+    lab.start();
+    wait("the pods adopted", 120, || lab.adopted(2));
+    assert_eq!(lab.pods(), pods, "the same jails, processes and addresses");
+    assert_eq!(lab.logged("removing an incomplete pod"), 0);
+
+    eprintln!("adopt: and set back");
+    lab.stop();
+    drop(clock);
+    assert!(boot_time() <= booted + 1, "kern.boottime back");
+    lab.start();
+    wait("the pods adopted again", 120, || lab.adopted(2));
+    assert_eq!(lab.pods(), pods);
+
+    lab.cli(&["delete", "service", "beat", "-n", "shop"]);
+    wait("the pods removed", 120, || {
+        lab.records().is_empty() && lab.tasks().is_empty()
+    });
+    lab.stop();
+    eprintln!("adopt: clock done");
+}
