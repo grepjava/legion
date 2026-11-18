@@ -236,8 +236,15 @@
 </figure>
 
 <style>
+  /* The title and its button on one row, the figures under them: a narrow
+     chart then keeps its button in the corner instead of on a row of its own. */
   .chart-tool {
-    margin-left: auto;
+    grid-column: 2;
+    grid-row: 1;
+    align-self: center;
+  }
+  figcaption > :global(.muted) {
+    grid-column: 1 / -1;
   }
   .chart-range {
     margin: 0.1rem 0 0.2rem;
@@ -247,10 +254,10 @@
     margin: 0 0 0.75rem;
   }
   figcaption {
-    display: flex;
-    gap: 0.65rem;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0.1rem 0.65rem;
     align-items: baseline;
-    flex-wrap: wrap;
     margin-bottom: 0.2rem;
     font-size: 0.85rem;
   }

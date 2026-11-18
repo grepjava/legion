@@ -15,7 +15,7 @@
   import { tone } from '#lib/columns.ts';
   import Quotas from '#lib/Quotas.svelte';
   import UsageCharts from '#lib/UsageCharts.svelte';
-  import { t } from '#lib/i18n.svelte.ts';
+  import { t, tn } from '#lib/i18n.svelte.ts';
   import { cannotWrite, openWorkbench, session } from '#lib/session.svelte.ts';
   import Ico from '#lib/Ico.svelte';
   import { CircleCheck, OctagonX, TriangleExclamationPoint } from '@lucide/svelte';
@@ -184,7 +184,7 @@
         {:else if critical || warnings}
           {t('{critical} critical and {warnings} warning alerts: see them below.', { critical, warnings })}
         {:else if notReady.length}
-          {t('{n} nodes not ready.', { n: notReady.length })}
+          {tn('1 node not ready.', '{n} nodes not ready.', notReady.length)}
         {:else}
           {t('Every node ready, a leader elected, nothing to act on.')}
         {/if}
@@ -196,8 +196,7 @@
       <div>
         <dt>{t('Quorum')}</dt>
         <dd>
-          {t('{voters} managers, quorum {quorum}, can lose {spare}', {
-            voters,
+          {tn('1 manager, quorum {quorum}, can lose {spare}', '{n} managers, quorum {quorum}, can lose {spare}', voters, {
             quorum,
             spare: Math.max(0, voters - quorum)
           })}{#if managersOut}<span class="wait">{t(', {n} not ready', { n: managersOut })}</span>{/if}
@@ -283,7 +282,7 @@
     <h2><a href="/k/Service">{t('Services')}</a></h2>
     <p class="big">{services.length}</p>
     <p class="muted">
-      <a href="/volumes">{t('{n} ZFS/storage volumes', { n: volumes.length })}</a>
+      <a href="/volumes">{tn('1 ZFS/storage volume', '{n} ZFS/storage volumes', volumes.length)}</a>
     </p>
     {#if errors.Service}<p class="error" role="alert">{errors.Service}</p>{/if}
   </div>
@@ -343,8 +342,10 @@
           {/if}
         </p>
         <dl class="facts compact-facts">
-          <dt>{t('CPU / RAM')}</dt>
-          <dd class="mono">{nCpu.toFixed(1)}% · {bytes(nMem)}</dd>
+          <dt>{t('CPU')}</dt>
+          <dd class="mono">{nCpu.toFixed(1)}%</dd>
+          <dt>{t('Memory')}</dt>
+          <dd class="mono">{bytes(nMem)}</dd>
           <dt>{t('Tasks')}</dt>
           <dd class="mono">{nu?.tasks.length ?? 0}</dd>
           {#if zTot > 0}
