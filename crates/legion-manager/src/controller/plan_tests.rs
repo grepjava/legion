@@ -5128,3 +5128,188 @@ fn priority_places_first_and_preempts_lower() {
     assert_eq!(w.placed("urgent").len(), 1);
     assert_eq!(w.placed("later"), Vec::<String>::new());
 }
+
+/// A stateful service whose ordinal must not run twice, its Volume with a
+/// replica the leader may hand it to on its own.
+const FAILOVER: &str = "mode: stateful\nreplicas: 1\npod: { onPartition: stop, stopGracePeriod: 3s, containers: [{ name: db, image: \"pg:17\" }], volumes: [{ name: data, claim: { size: 1G, replica: { failover: automatic } } }] }";
+
+impl World {
+    /// The leader's replicator, done: a copy of `volume`'s data, from the
+    /// node holding it, on `on`.
+    fn replicated(&mut self, volume: &str, on: &str) {
+        let v = self
+            .volumes
+            .get_mut(&("shop".to_owned(), volume.to_owned()))
+            .unwrap();
+        v.status.replica = Some(legion_api::volume::ReplicaStatus {
+            node: on.to_owned(),
+            snapshot: "legion-replica-1000".into(),
+            from: v.status.node.clone(),
+            taken_ms: Some(1_000_000),
+            message: String::new(),
+        });
+        v.object.status = serde_json::to_value(&v.status).unwrap();
+    }
+
+    fn volume_status(&self, volume: &str) -> legion_api::volume::VolumeStatus {
+        self.volumes[&("shop".to_owned(), volume.to_owned())]
+            .status
+            .clone()
+    }
+}
+
+#[test]
+fn a_volume_fails_over_to_its_replica_once_its_node_has_stopped_writing() {
+    let mut w = World::new();
+    for n in ["n1", "n2", "n3"] {
+        w.node(n, &[]);
+    }
+    w.service("db", FAILOVER);
+    w.settle();
+    let from = w.placed_task("db-0-1").spec.node.clone();
+    let keeper = ["n1", "n2", "n3"].into_iter().find(|n| *n != from).unwrap();
+    w.replicated("data-db-0", keeper);
+
+    // Down, its task orphaned: its agent stops it within its stop grace
+    // period of being cut off, so the Volume waits that and the margin.
+    w.state(&from, NodeState::Down);
+    w.settle();
+    assert_eq!(w.placed_task("db-0-1").status.state, TaskState::Orphaned);
+    assert_eq!(w.volume_status("data-db-0").node, from);
+    assert!(w.wake().is_some(), "woken when the wait ends");
+    w.now += Duration::from_secs(7);
+    w.settle();
+    assert_eq!(w.volume_status("data-db-0").node, from, "3 s and 5 more");
+    w.now += Duration::from_secs(1);
+    w.settle();
+    let s = w.volume_status("data-db-0");
+    assert_eq!(s.node, keeper, "carries on from the replica");
+    assert!(
+        s.promoted
+            .starts_with(&format!("automatically, {from} being down")),
+        "{}",
+        s.promoted
+    );
+    assert_eq!(
+        s.leftovers,
+        std::slice::from_ref(&from),
+        "the old copy to drop once it is back"
+    );
+    assert!(s.replica.is_none(), "a new one is made");
+    assert!(s.lost.is_empty());
+
+    // Its slot's next task runs where the data now is: the orphan, stopped
+    // on a node it no longer has the data of, holds nothing.
+    let next = w
+        .tasks
+        .iter()
+        .find(|t| t.spec.slot == Some(0) && t.status.state == TaskState::Running)
+        .expect("db-0 running again");
+    assert_eq!(next.spec.node, keeper);
+}
+
+#[test]
+fn a_volume_does_not_fail_over_while_anything_may_write_to_it() {
+    let lost = |w: &mut World| {
+        let from = w.placed_task("db-0-1").spec.node.clone();
+        let keeper = ["n1", "n2", "n3"].into_iter().find(|n| *n != from).unwrap();
+        w.replicated("data-db-0", keeper);
+        (from, keeper)
+    };
+    let world = |spec: &str| {
+        let mut w = World::new();
+        for n in ["n1", "n2", "n3"] {
+            w.node(n, &[]);
+        }
+        w.service("db", spec);
+        w.settle();
+        w
+    };
+
+    // Manual: only removing the node hands it over.
+    let mut w = world(&FAILOVER.replace(", replica: { failover: automatic }", ", replica: {}"));
+    let (from, _) = lost(&mut w);
+    w.state(&from, NodeState::Down);
+    w.settle();
+    w.now += Duration::from_secs(60);
+    w.settle();
+    assert_eq!(w.volume_status("data-db-0").node, from, "manual");
+
+    // Only suspect: the node may be back in a moment.
+    let mut w = world(FAILOVER);
+    let (from, _) = lost(&mut w);
+    w.state(&from, NodeState::Suspect);
+    w.settle();
+    w.now += Duration::from_secs(60);
+    w.settle();
+    assert_eq!(w.volume_status("data-db-0").node, from, "suspect");
+
+    // A Volume of its own asking for it, used by a task that runs on when
+    // cut off: still writing, for all the leader knows (admission refuses
+    // this for a claim, not for a Volume a service mounts).
+    let mut w = World::new();
+    for n in ["n1", "n2", "n3"] {
+        w.node(n, &[]);
+    }
+    w.volume_of(
+        "files",
+        serde_json::json!({ "replica": { "failover": "automatic" } }),
+        "n1",
+    );
+    w.service(
+        "web",
+        "replicas: 1\npod: { containers: [{ name: web, image: \"web:1\", volumeMounts: [{ name: f, path: /srv }] }], volumes: [{ name: f, volume: { name: files } }] }",
+    );
+    w.settle();
+    assert_eq!(w.placed("web"), ["n1"], "where its Volume is");
+    w.replicated("files", "n2");
+    w.state("n1", NodeState::Down);
+    w.settle();
+    w.now += Duration::from_secs(60);
+    w.settle();
+    assert_eq!(w.volume_status("files").node, "n1", "onPartition: run");
+
+    // A replica of data that moved since, or none yet: nothing to go on.
+    let mut w = world(FAILOVER);
+    let (from, keeper) = lost(&mut w);
+    let v = w
+        .volumes
+        .get_mut(&("shop".to_owned(), "data-db-0".to_owned()))
+        .unwrap();
+    v.status.replica.as_mut().unwrap().from = keeper.to_owned();
+    v.object.status = serde_json::to_value(&v.status).unwrap();
+    w.state(&from, NodeState::Down);
+    w.settle();
+    w.now += Duration::from_secs(60);
+    w.settle();
+    assert_eq!(w.volume_status("data-db-0").node, from, "a stale replica");
+
+    // The replica's node down too: nowhere to carry on.
+    let mut w = world(FAILOVER);
+    let (from, keeper) = lost(&mut w);
+    w.state(&from, NodeState::Down);
+    w.state(keeper, NodeState::Down);
+    w.settle();
+    w.now += Duration::from_secs(60);
+    w.settle();
+    assert_eq!(
+        w.volume_status("data-db-0").node,
+        from,
+        "replica's node down"
+    );
+}
+
+#[test]
+fn automatic_failover_needs_pods_that_stop_when_cut_off() {
+    let mut spec: ServiceSpec = legion_api::parse(
+        &serde_yaml_ng::from_str::<serde_json::Value>(&FAILOVER.replace("onPartition: stop, ", ""))
+            .unwrap(),
+    )
+    .unwrap();
+    let e = spec.admit().unwrap_err();
+    assert_eq!(e.path, "pod.onPartition", "{e:?}");
+    let mut spec: ServiceSpec =
+        legion_api::parse(&serde_yaml_ng::from_str::<serde_json::Value>(FAILOVER).unwrap())
+            .unwrap();
+    spec.admit().unwrap();
+}

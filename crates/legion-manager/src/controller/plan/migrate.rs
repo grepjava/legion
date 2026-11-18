@@ -26,11 +26,131 @@ use super::{
     Action, LABEL_SERVICE, Node, Plan, Service, Task, Volume, Volumes, eligible, shared_volumes,
 };
 
+/// Automatic failover (DESIGN.md, Volume replicas): a Volume whose replica
+/// has `failover: automatic`, on a node down long enough that its agent has
+/// stopped every task using it, carries on from the replica's last copy, as
+/// it would once the node is removed. Only tasks that must not run twice
+/// (`onPartition: stop`) count as stopped: their agent stops them once cut
+/// off as long as it takes the leader to mark the node down, and the wait
+/// is theirs (`fenced_until`): their stop grace period and a margin from
+/// when this leader saw them orphaned. Any other task still placed there
+/// holds the Volume, as does one not yet orphaned. The old copy is left
+/// over, for the migrator to drop once the node is back. Returns the
+/// Volumes promoted, which the rest of this pass leaves alone.
+pub(super) fn failover(
+    tasks: &[Task],
+    nodes: &[Node],
+    volumes: &Volumes,
+    memory: &super::Memory,
+    now: tokio::time::Instant,
+    plan: &mut Plan,
+) -> std::collections::BTreeSet<(String, String)> {
+    use legion_api::service::OnPartition;
+    use legion_api::task::TaskState;
+    use legion_api::volume::Failover;
+
+    let node = |name: &str| nodes.iter().find(|n| n.name() == name);
+    let mut promoted = std::collections::BTreeSet::new();
+    for ((namespace, name), v) in volumes {
+        let automatic = v
+            .spec
+            .replica
+            .as_ref()
+            .is_some_and(|r| r.failover == Failover::Automatic);
+        let from = v.status.node.as_str();
+        if !automatic
+            || v.spec.access() != Access::Local
+            || from.is_empty()
+            || !v.status.lost.is_empty()
+            || v.status.migration.is_some()
+            || !node(from).is_some_and(|n| n.status.state == NodeState::Down)
+        {
+            continue;
+        }
+        // A copy of this node's data, on a node ready to take it.
+        let Some(r) = v.status.replica.as_ref().filter(|r| {
+            !r.snapshot.is_empty()
+                && r.from == from
+                && r.node != from
+                && node(&r.node).is_some_and(|n| {
+                    n.status.state == NodeState::Ready
+                        && n.spec.availability == Availability::Active
+                        && n.status.host_blocked(&n.spec).is_none()
+                })
+        }) else {
+            continue;
+        };
+        // Every task that may still write to it there has surely stopped.
+        let mut due = Some(now);
+        for t in tasks.iter().filter(|t| {
+            // An orphaned task counts as ended for its slot, not here: its
+            // pod may still run on the node, cut off.
+            t.spec.node == from
+                && (!t.status.state.is_terminal() || t.status.state == TaskState::Orphaned)
+                && t.object.metadata.namespace == *namespace
+                && t.spec.uses_volume(name)
+        }) {
+            let fenced = (t.status.state == TaskState::Orphaned
+                && t.spec.pod.on_partition == OnPartition::Stop)
+                .then(|| {
+                    memory.orphaned_at.get(t.uid()).copied().unwrap_or(now)
+                        + t.spec.pod.stop_grace_period.as_std()
+                        + super::FENCE_MARGIN
+                });
+            due = match (due, fenced) {
+                (Some(d), Some(f)) => Some(d.max(f)),
+                _ => None,
+            };
+        }
+        let Some(due) = due else {
+            continue;
+        };
+        if due > now {
+            plan.wake_at(due);
+            continue;
+        }
+        let when = r
+            .taken_ms
+            .map(|ms| legion_api::clock::format(ms / 1000))
+            .unwrap_or_default();
+        let mut leftovers: Vec<String> = v
+            .status
+            .leftovers
+            .iter()
+            .filter(|n| **n != r.node)
+            .cloned()
+            .collect();
+        if !leftovers.iter().any(|n| n == from) {
+            leftovers.push(from.to_owned());
+        }
+        let mut o = v.object.clone();
+        o.status = serde_json::to_value(VolumeStatus {
+            node: r.node.clone(),
+            dataset: String::new(),
+            migration: None,
+            leftovers,
+            lost: String::new(),
+            replica: None,
+            promoted: format!(
+                "automatically, {from} being down: from the replica of its data on {}, taken {when}",
+                r.node
+            ),
+            export: v.status.export.clone(),
+        })
+        .expect("serialises");
+        plan.actions
+            .push(Action::Update(o, v.object.metadata.version));
+        promoted.insert((namespace.clone(), name.clone()));
+    }
+    promoted
+}
+
 pub(super) fn migrations(
     services: &[Service],
     tasks: &[Task],
     nodes: &[Node],
     volumes: &Volumes,
+    promoted: &std::collections::BTreeSet<(String, String)>,
     plan: &mut Plan,
 ) {
     let node = |name: &str| nodes.iter().find(|n| n.name() == name);
@@ -177,6 +297,7 @@ pub(super) fn migrations(
     for (key, v) in volumes {
         if let Some(to) = requested(v)
             && v.status.migration.is_none()
+            && !promoted.contains(key)
             && usable_for(v, to)
         {
             let m = Migration {
@@ -231,7 +352,9 @@ pub(super) fn migrations(
                 .claims()
                 .filter_map(|(claim, _)| {
                     let key = (namespace.to_owned(), claim_volume(claim, svc, n));
-                    volumes.get(&key).filter(|_| !started.contains(&key))
+                    volumes
+                        .get(&key)
+                        .filter(|_| !started.contains(&key) && !promoted.contains(&key))
                 })
                 .filter(|v| {
                     v.status.migration.is_none()

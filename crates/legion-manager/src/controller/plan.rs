@@ -287,7 +287,8 @@ pub fn plan(
         .recommended
         .retain(|uid, _| service_uids.contains(uid.as_str()));
 
-    migrate::migrations(services, tasks, nodes, volumes, &mut plan);
+    let promoted = migrate::failover(tasks, nodes, volumes, memory, now, &mut plan);
+    migrate::migrations(services, tasks, nodes, volumes, &promoted, &mut plan);
     let mut addresses = addresses(services);
     let mut created: Vec<Task> = Vec::new();
     for s in services {
@@ -1792,13 +1793,18 @@ pub(super) fn held_by_orphans(
             t.spec
                 .volumes()
                 .into_iter()
-                .map(|v| (t.object.metadata.namespace.clone(), v))
+                .map(move |v| (t, (t.object.metadata.namespace.clone(), v)))
         })
-        .filter(|k| {
-            volumes
-                .get(k)
-                .is_some_and(|v| v.spec.access() != Access::Shared)
+        .filter(|(t, k)| {
+            volumes.get(k).is_some_and(|v| match v.spec.access() {
+                Access::Shared => false,
+                // Data handed to another node (a replica taken over) is no
+                // longer what the orphan's pod could write to.
+                Access::Local => v.status.node.is_empty() || v.status.node == t.spec.node,
+                Access::Single => true,
+            })
         })
+        .map(|(_, k)| k)
         .collect()
 }
 
