@@ -719,6 +719,102 @@ Added 2026-11-16, in the console's own look:
   did not reach. Pages cross-fade briefly unless the system asks for
   less motion.
 
+## Phases 7 to 12: what an operator watches
+
+Planned 2026-11-19, after a look at Sylve's host panel
+(docs/COMPARISON.md): the state a small cluster's operator needs before
+something breaks, and word of it when nobody has the console open. Each
+phase is API first, then the CLI, `legion top` and the console in its own
+look, then a lab test for its "done when".
+
+### Phase 7: replication in view
+
+- A Volume's replica says its state (`ready`, `syncing`, `stale`,
+  `failed`), the age of its last copy and the bytes of the last copy and
+  the one under way; each copy and each failover is an event, the
+  Volume's page listing them as its copies.
+- A `replica-stale` alert once the last copy is older than three
+  intervals.
+- Whether it can fail over now, and if not why: a pod using it that is
+  not `onPartition: stop`, no copy yet, the replica's node not ready.
+- The deploy form's claim takes a replica and its failover, warning of
+  `automatic` without `onPartition: stop`; promoting by hand is an API
+  action, the console asking for the Volume's name typed and saying how
+  long ago the copy it carries on from was taken.
+
+**Done when** the replica's node stopping raises `replica-stale` with the
+way to the Volume, and the cut-off test sees "can fail over" before the
+cut, on the lab.
+
+### Phase 8: pools and hosts
+
+- Agents report each pool's state, read, write and checksum errors, last
+  scrub or resilver and how full it is; each Volume's use; the host's
+  FreeBSD release, kernel, uptime, load and boot method.
+- Alerts: `pool-degraded`, `pool-errors` (the counts seen can be taken as
+  the baseline), `scrub-overdue`, `pool-nearly-full` at 80% and 90%,
+  `volume-nearly-full`, and `version-skew` while nodes run different
+  builds. A scrub schedule is a field of the Node, run by its agent.
+- A node's page shows its host and pools; the overview a health card:
+  quorum in words ("3 managers, quorum 2, can lose 1"), nodes up and
+  down, and the cluster's CPU, memory and disk.
+
+**Done when** one side of a mirrored pool taken offline raises
+`pool-degraded` within 30 s, leading to the node.
+
+### Phase 9: alerts sent
+
+- An `AlertReceiver` kind: a webhook, ntfy or SMTP, its credentials in a
+  Secret, chosen by severity, namespace and alert kind.
+- The leader sends each alert once as it is raised and once as it
+  clears, across a change of leader (what was sent is in the store),
+  trying again with a growing wait; a receiver says when it last
+  delivered and its last error.
+- `legion alerts test RECEIVER` and the console's Send test.
+
+**Done when** a node going down reaches a webhook within 60 s, once,
+with the leader killed in between.
+
+### Phase 10: long operations and activity
+
+- Moves, drains, restores and a replica's first copy say their phase
+  (preparing, full copy, final copy, switch-over, cleanup) and bytes
+  done; cancelling is refused by the API once the switch-over has begun.
+- An activity panel at the console's foot, from the audit log and the
+  events: what was done, by whom, when it began and ended, how it ended,
+  the full output with Copy; `legion top` lists the same.
+
+**Done when** the drain test shows each phase in turn, and a cancel past
+the switch-over is refused.
+
+### Phase 11: checks before disruption
+
+- A dry run of a drain, a Volume's move, a node's removal and deleting a
+  service with Volumes: what could not be placed, what Volumes would move
+  and their sizes, what `maxUnavailable` holds back, as blocking or
+  warning. `--dry-run` on the CLI; the console's confirmation shows it
+  and does not confirm while anything blocks.
+
+**Done when** a drain that would strand a Volume is refused in the
+dialog and from the CLI alike.
+
+### Phase 12: history and the rest
+
+- What tasks used kept 30 days (a sample a minute for a day, then one
+  every 15 minutes) in a file on each manager, outside Raft, so a new
+  leader keeps it; charts with ranges, a strip to drag one, PNG and CSV.
+- Notes: a Config labelled `legion.note`, shown as Markdown on what it
+  names.
+- "Tag moved since the rollout" on services not pinned to a digest.
+
+**Done when** a week's history outlives a change of leader in the
+console test.
+
+Not taken, by design: host networking, switches, DHCP and firewall rules
+in order, a root terminal or file explorer on the host, partitioning
+disks and making pools, host package updates, Samba and iSCSI shares,
+and "force" buttons (see Out of scope).
+
 ## Out of scope
 
 - Anything the API does not offer. A console-only feature would be a
