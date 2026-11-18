@@ -126,11 +126,21 @@
     </tbody>
   </table>
 {:else if !loaded}
-  <p class="muted" role="status">{t('Loading…')}</p>
+  <!-- Rows to come, in the table's shape, until the watch has answered. -->
+  <div class="skeleton" role="status" aria-label={t('Loading…')}>
+    {#each [0, 1, 2, 3, 4] as i (i)}<div class="skeleton-row" style:opacity={1 - i * 0.16}></div>{/each}
+  </div>
 {:else if !error}
-  <p class="muted">
-    {terms.length && objects.length
-      ? t('None match the filter.')
-      : t('None.')}
-  </p>
+  {#if terms.length && objects.length}
+    <p class="empty">{t('None match the filter.')} <button type="button" class="link" onclick={() => (filter = '')}>{t('Clear the filter')}</button></p>
+  {:else}
+    <p class="empty">
+      {t('No {kinds} here yet.', { kinds: plural(kind) })}
+      {#if ['Service', 'Job', 'CronJob', 'Volume', 'Secret', 'Config', 'Route', 'NetworkPolicy'].includes(kind)}
+        <a href={kind === 'Service' ? '/deploy' : '/apply'}
+          >{kind === 'Service' ? t('Deploy one') : t('Write one')}</a
+        >
+      {/if}
+    </p>
+  {/if}
 {/if}

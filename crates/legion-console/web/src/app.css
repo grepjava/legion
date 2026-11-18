@@ -1699,3 +1699,30 @@ h1.object-title .obj-name {
     transition: transform 160ms ease;
   }
 }
+
+/* What is coming, in its shape: rows shimmering until the data is there
+   (still rows where the system asks for less motion). */
+.skeleton {
+  display: grid;
+  gap: 0.45rem;
+  margin-top: 0.5rem;
+}
+.skeleton-row {
+  height: 2rem;
+  border-radius: 6px;
+  background: linear-gradient(90deg, var(--surface2) 25%, var(--panel) 50%, var(--surface2) 75%);
+  background-size: 200% 100%;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .skeleton-row {
+    animation: skeleton-shimmer 1.4s ease-in-out infinite;
+  }
+}
+@keyframes skeleton-shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
