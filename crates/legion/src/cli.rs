@@ -22,8 +22,9 @@ use crate::{Command, StackCommand, UserCommand};
 const RETRY_FOR: Duration = Duration::from_secs(30);
 
 /// A Volume's replica in a cell: its node and how old its last copy is,
-/// or why it has none.
-fn replica_cell(r: &serde_json::Value, now_ms: i64) -> String {
+/// or why it has none; then, as they hold, that it is stale, a copy runs,
+/// and automatic failover is blocked (`legion get volume` says why).
+pub(crate) fn replica_cell(r: &serde_json::Value, now_ms: i64) -> String {
     let Some(node) = r["node"].as_str() else {
         return String::new();
     };
@@ -42,11 +43,21 @@ fn replica_cell(r: &serde_json::Value, now_ms: i64) -> String {
         }
         None => "no copy yet".to_owned(),
     };
-    match r["message"].as_str().filter(|m| !m.is_empty()) {
+    let mut cell = match r["message"].as_str().filter(|m| !m.is_empty()) {
         Some(why) if node.is_empty() => why.to_owned(),
         Some(why) => format!("{node}, {age}: {why}"),
         None => format!("{node}, {age}"),
+    };
+    if r["state"] == "stale" {
+        cell.push_str(", stale");
     }
+    if r["copyingMs"].is_i64() {
+        cell.push_str(", copying");
+    }
+    if r["blocked"].as_array().is_some_and(|b| !b.is_empty()) {
+        cell.push_str(", failover blocked");
+    }
+    cell
 }
 
 /// A node's state, with what its host lacks that keeps new tasks off.
@@ -3021,6 +3032,13 @@ mod tests {
         assert_eq!(
             r(serde_json::json!({"node": "", "message": "no other node may keep it"})),
             "no other node may keep it"
+        );
+        assert_eq!(
+            r(serde_json::json!({
+                "node": "n2", "takenMs": 400_000, "state": "stale", "copyingMs": 999_000,
+                "blocked": ["web uses it with onPartition: run"]
+            })),
+            "n2, 10m ago, stale, copying, failover blocked"
         );
     }
 

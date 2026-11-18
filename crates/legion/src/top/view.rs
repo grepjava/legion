@@ -112,6 +112,7 @@ impl Tab {
                 "SIZE",
                 "NODE",
                 "USED BY",
+                "REPLICA",
                 "MIGRATION",
             ],
             Tab::Network => &["NAMESPACE", "NAME", "KIND", "WHAT"],
@@ -1821,6 +1822,17 @@ fn volume_rows(model: &Model) -> Vec<TableRow> {
                 .get(&(v.metadata.namespace.as_str(), v.metadata.name.clone()))
                 .map(|u| u.join(","))
                 .unwrap_or_default();
+            // Its replica as the CLI says it, coloured by what it amounts to.
+            let r = &v.status["replica"];
+            let replica = crate::cli::replica_cell(r, legion_api::clock::now() * 1000);
+            let replica = match r["state"].as_str() {
+                Some("failed") => colored(replica, fg(BAD)),
+                Some("stale") => colored(replica, fg(WARN)),
+                _ if r["blocked"].as_array().is_some_and(|b| !b.is_empty()) => {
+                    colored(replica, fg(WARN))
+                }
+                _ => text(replica),
+            };
             let space = model.volume_space(&v.metadata.namespace, &v.metadata.name);
             let size_cell = match space {
                 Some((used, avail)) if used + avail > 0 => {
@@ -1841,6 +1853,7 @@ fn volume_rows(model: &Model) -> Vec<TableRow> {
                     size_cell,
                     text(node),
                     text(used_by),
+                    replica,
                     migration,
                 ],
                 Some(key(v)),
