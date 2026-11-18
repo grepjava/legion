@@ -877,6 +877,21 @@ pub enum VolumeCommand {
         #[arg(short, long)]
         namespace: Option<String>,
     },
+    /// Hand a Volume whose node is down to its replica: it carries on from
+    /// the replica's last copy of that node's data, on the replica's node,
+    /// what was written there since being lost. Do it only once you know
+    /// nothing runs on the node any more (or that it is gone): what still
+    /// runs there writes to a copy no longer the Volume's, dropped once the
+    /// node is back. `failover: automatic` does this on its own for tasks
+    /// that stop where they are cut off (`onPartition: stop`).
+    Promote {
+        volume: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// Go ahead without asking.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Back up a Volume's data to a file: a snapshot taken as its tasks
     /// run, so crash-consistent, as after a power cut. The cluster's
     /// backup (`legion backup`) holds no volume's data.

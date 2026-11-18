@@ -1003,6 +1003,44 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
         }
         Command::Volume {
             command:
+                crate::VolumeCommand::Promote {
+                    volume,
+                    namespace,
+                    yes,
+                },
+        } => {
+            let namespace = namespace.unwrap_or_else(|| "default".into());
+            if !yes {
+                use std::io::{BufRead, IsTerminal, Write};
+                if !std::io::stdin().is_terminal() {
+                    anyhow::bail!(
+                        "promoting {namespace}/{volume} hands it to its replica: confirm with --yes"
+                    );
+                }
+                print!(
+                    "Hand {namespace}/{volume} to its replica? What runs on its node now writes                      to a copy that is dropped. Type the Volume's name to go on: "
+                );
+                std::io::stdout().flush()?;
+                let mut typed = String::new();
+                std::io::stdin().lock().read_line(&mut typed)?;
+                if typed.trim() != volume {
+                    anyhow::bail!("not promoted");
+                }
+            }
+            let r = pb::volumes_client::VolumesClient::new(channel.clone())
+                .promote(pb::VolumePromoteRequest {
+                    namespace: namespace.clone(),
+                    name: volume.clone(),
+                })
+                .await?
+                .into_inner();
+            println!(
+                "{namespace}/{volume} carries on on {}: {}",
+                r.node, r.promoted
+            );
+        }
+        Command::Volume {
+            command:
                 crate::VolumeCommand::Backup {
                     volume,
                     output,

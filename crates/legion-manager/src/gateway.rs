@@ -218,6 +218,10 @@ fn router(gateway: Gateway) -> axum::Router {
             "/api/volume-snapshots/{namespace}/{name}",
             get(volume_snapshots).post(volume_snapshot_op),
         )
+        .route(
+            "/api/volume-promote/{namespace}/{name}",
+            post(volume_promote),
+        )
         .route("/api/images", get(node_images_list).post(node_images_op))
         .route("/api/image-export", get(image_export))
         .route("/api/image-load", post(image_load))
@@ -2895,6 +2899,21 @@ async fn volume_snapshot_op(
         .await?
         .into_inner();
     Ok(Json(serde_json::json!({ "snapshots": r.snapshots })).into_response())
+}
+
+/// `legion volume promote`: hands a Volume whose node is down to its replica.
+async fn volume_promote(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    let r = pb::volumes_client::VolumesClient::new(channel)
+        .promote(pb::VolumePromoteRequest { namespace, name })
+        .await?
+        .into_inner();
+    Ok(Json(serde_json::json!({ "node": r.node, "promoted": r.promoted })).into_response())
 }
 
 #[derive(Deserialize)]
