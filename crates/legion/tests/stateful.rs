@@ -32,7 +32,7 @@
 
 mod common;
 
-use common::{Lab, Role, ZFS_ROOT, kill_receiving, text, vm, wait};
+use common::{Lab, PORT, Role, ZFS_ROOT, kill_receiving, text, vm, wait};
 use serde_json::Value;
 
 /// The namespace, allowed the SysV shared memory Postgres needs, the
@@ -1029,7 +1029,7 @@ fn a_replicated_volume_carries_on_from_its_copy_when_its_host_is_lost() {
 
 /// The rules cutting a VM off from this host and the other VM, all but
 /// this host's ssh to it, which passes without state so the session the
-/// rules are loaded over lives on; the states already held are dropped.
+/// rules are loaded over lives on; every state held is dropped.
 fn cut_off(host: &str, other: &str) -> String {
     format!(
         "pfctl -si | grep -q 'Status: Enabled' || {{ echo 'pf is not enabled' >&2; exit 1; }}
@@ -1045,7 +1045,10 @@ rules=$(pfctl -a legion/labcut -sr)
 # pfctl prints the rules in its own form (`block drop quick inet from …`):
 # counted by the addresses they name, the two passes and four blocks.
 [ \"$(echo \"$rules\" | grep -c -e '{host}' -e '{other}')\" -ge 6 ] || {{ echo \"the cut is not loaded: $rules\" >&2; exit 1; }}
-for a in {host} {other}; do pfctl -q -k $a; pfctl -q -k 0.0.0.0/0 -k $a; done
+# Every state goes, so no connection made before outlives the cut (killing
+# those of the two addresses alone left the agent's): the ssh this runs over
+# lives on by the rules above, which keep none.
+pfctl -q -F states
 "
     )
 }
@@ -1151,6 +1154,20 @@ fn a_replicated_volume_fails_over_on_its_own_when_its_node_is_cut_off() {
         text(&out.stderr)
     );
     let cut = std::time::Instant::now();
+    // The cut holds, or nothing after says anything: the node can't reach
+    // the manager's API, and the manager stops hearing from it.
+    let out = lab.on(
+        &from,
+        &format!("nc -z -w 3 {host} {PORT} && echo reached || echo cut"),
+    );
+    assert_eq!(
+        text(&out.stdout).trim(),
+        "cut",
+        "the cut does not hold: {from} still reaches {host}:{PORT}"
+    );
+    lab.waited("the cut-off node no longer heard from", 90, || {
+        lab.node_state(&from) != "ready"
+    });
     let mut stopped = None;
     lab.waited("the Volume handed to its replica", 300, || {
         let s = lab.pg_volume()["status"].clone();
