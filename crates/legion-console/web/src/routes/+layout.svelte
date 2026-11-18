@@ -30,6 +30,7 @@
   import Workbench from '#lib/Workbench.svelte';
   import { plural } from '#lib/kinds.ts';
   import Ico from '#lib/Ico.svelte';
+  import { drafts } from '#lib/drafts.svelte.ts';
   import { kindIcon, pageIcon } from '#lib/icons.ts';
   import {
     CircleQuestionMark,
@@ -667,7 +668,10 @@
                   href={item.href}
                   class:here={page.url.pathname === item.href}
                   aria-current={at(page.url.pathname === item.href)}
-                  ><Ico icon={pageIcon(item.href)} /><span>{item.label}</span></a
+                  ><Ico icon={pageIcon(item.href)} /><span>{item.label}</span
+                  >{#if drafts[item.href.slice(1)]}<span class="draft-dot" title={t('A draft is kept here')}
+                      ><span class="sr-only">{t('(draft)')}</span></span
+                    >{/if}</a
                 >
               {/each}
             </details>
@@ -737,7 +741,10 @@
                   href={item.href}
                   class:here={page.url.pathname === item.href}
                   aria-current={at(page.url.pathname === item.href)}
-                  ><Ico icon={pageIcon(item.href)} /><span>{item.label}</span></a
+                  ><Ico icon={pageIcon(item.href)} /><span>{item.label}</span
+                  >{#if drafts[item.href.slice(1)]}<span class="draft-dot" title={t('A draft is kept here')}
+                      ><span class="sr-only">{t('(draft)')}</span></span
+                    >{/if}</a
                 >
               {/each}
               {#each filteredClusterKinds as k (k.kind)}

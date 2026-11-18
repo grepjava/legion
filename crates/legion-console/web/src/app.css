@@ -1755,3 +1755,14 @@ th[aria-sort='ascending'] > button.sort-btn::after {
   opacity: 1;
   transform: translateY(0.12rem) rotate(225deg);
 }
+
+/* A page that keeps a draft (lib/drafts.svelte.ts): a small dot after its
+   name in the side bar. */
+.draft-dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: var(--wait);
+  margin-left: auto;
+  flex: none;
+}

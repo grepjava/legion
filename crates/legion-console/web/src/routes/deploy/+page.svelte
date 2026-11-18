@@ -9,6 +9,10 @@
   import { cannotWrite, namespaces, session } from '#lib/session.svelte.ts';
   import { t } from '#lib/i18n.svelte.ts';
   import { toYaml } from '#lib/yaml.ts';
+  import { dropDraft, loadDraft, saveDraft } from '#lib/drafts.svelte.ts';
+  import type { DeployForm } from '#lib/deploy.ts';
+  import Ico from '#lib/Ico.svelte';
+  import { RotateCcw } from '@lucide/svelte';
 
   let all: string[] = $state([]);
   $effect(() => {
@@ -16,7 +20,18 @@
       api.list('Namespace').then((r) => (all = r.objects.map((o) => o.metadata.name).sort()));
   });
   const choices = $derived(namespaces(all));
-  let form = $state(blank(session.namespace || 'default'));
+  // What was typed last, unless a link brings an image of its own.
+  const fresh = () => blank(session.namespace || 'default');
+  let form = $state<DeployForm>(
+    (!page.url.searchParams.get('image') && loadDraft<DeployForm>('deploy')) || fresh()
+  );
+  $effect(() => saveDraft('deploy', $state.snapshot(form), fresh()));
+  function startOver() {
+    form = fresh();
+    results = [];
+    error = '';
+    dropDraft('deploy');
+  }
   $effect(() => {
     const qImg = page.url.searchParams.get('image');
     const qNs = page.url.searchParams.get('namespace');
@@ -42,6 +57,8 @@
     try {
       results = (await api.apply({ yaml, dryRun })).results;
       dry = dryRun;
+      // Deployed, the form has done its work: no draft to come back to.
+      if (!dryRun) dropDraft('deploy');
     } catch (e) {
       results = [];
       error = (e as Error).message;
@@ -52,7 +69,12 @@
   const deployed = $derived(!dry && results.some((r) => r.key.startsWith('Service/')));
 </script>
 
-<header class="bar"><h1>{t('Deploy from an image')}</h1></header>
+<header class="bar">
+  <h1>{t('Deploy from an image')}</h1>
+  <button type="button" class="sm" onclick={startOver} title={t('Empty the form and forget the draft')}
+    ><Ico icon={RotateCcw} size={14} />{t('Start over')}</button
+  >
+</header>
 <p class="muted">
   {t('A Service from an image, written as YAML alongside; change the YAML further in')}
   <a href="/apply">{t('Apply YAML')}</a>.
