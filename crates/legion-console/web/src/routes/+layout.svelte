@@ -31,7 +31,17 @@
   import { plural } from '#lib/kinds.ts';
   import Ico from '#lib/Ico.svelte';
   import { kindIcon, pageIcon } from '#lib/icons.ts';
-  import { CircleQuestionMark, GripVertical, PanelLeft, Search, Star, X } from '@lucide/svelte';
+  import {
+    CircleQuestionMark,
+    GripVertical,
+    MonitorCog,
+    Moon,
+    PanelLeft,
+    Search,
+    Star,
+    Sun,
+    X
+  } from '@lucide/svelte';
   import {
     namespaces,
     session,
@@ -401,6 +411,9 @@
   const clusterKinds = $derived(
     session.me?.all ? session.kinds.filter((k) => k.clusterScoped) : []
   );
+  // The theme button goes round dark, light and the system's.
+  const nextTheme = (m: ThemeMode): ThemeMode => (m === 'dark' ? 'light' : m === 'light' ? 'system' : 'dark');
+  const themeName = (m: ThemeMode) => (m === 'dark' ? t('Dark') : m === 'light' ? t('Light') : t('System'));
   const voters = $derived(raftStatus ? raftStatus.members.filter((m) => m.voter).length : 0);
   let navQuery = $state('');
   const navFilter = $derived(navQuery.trim().toLowerCase());
@@ -509,23 +522,25 @@
       </a>
 
       {#if raftStatus}
-        <span class="telemetry-pill">
+        <span
+          class="telemetry-pill"
+          title={t('{voters} voting managers, term {term}, store version {version}', {
+            voters,
+            term: raftStatus.term,
+            version: raftStatus.version
+          })}
+        >
           <span class={raftStatus.leader ? 'dot-live' : 'dot-bad'} aria-hidden="true"></span>
-          <strong>{raftStatus.leader ? t('quorum ok') : t('no leader')}</strong>
-          <span class="mono">
-            {t('{voters}v · t{term} · r{version}', {
-              voters,
-              term: raftStatus.term,
-              version: raftStatus.version
-            })}
-          </span>
+          <span>{raftStatus.leader ? t('quorum') : t('no leader')}</span>
         </span>
       {/if}
 
-      <span class="telemetry-pill">
-        <span class={session.alertsError ? 'dot-bad' : 'dot-live'} aria-hidden="true"></span>
-        <span>{session.alertsError ? t('watch degraded') : t('watch live')}</span>
-      </span>
+      {#if session.alertsError}
+        <span class="telemetry-pill" title={session.alertsError}>
+          <span class="dot-bad" aria-hidden="true"></span>
+          <span>{t('watch degraded')}</span>
+        </span>
+      {/if}
 
       <div class="topbar-spacer"></div>
 
@@ -551,15 +566,18 @@
         <kbd>Ctrl+K</kbd>
       </button>
 
-      <select
-        aria-label={t('Color theme')}
-        value={session.theme}
-        onchange={(e) => setTheme(e.currentTarget.value as ThemeMode)}
+      <button
+        type="button"
+        class="sm"
+        title={t('Theme: {now} (click for {next})', {
+          now: themeName(session.theme),
+          next: themeName(nextTheme(session.theme))
+        })}
+        onclick={() => setTheme(nextTheme(session.theme))}
       >
-        <option value="dark">{t('Dark')}</option>
-        <option value="light">{t('Light')}</option>
-        <option value="system">{t('System')}</option>
-      </select>
+        <Ico icon={session.theme === 'dark' ? Moon : session.theme === 'light' ? Sun : MonitorCog} size={18} />
+        <span class="sr-only">{t('Color theme: {now}', { now: themeName(session.theme) })}</span>
+      </button>
 
       <button
         type="button"
