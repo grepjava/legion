@@ -1033,7 +1033,10 @@ block drop quick from any to {host}
 block drop quick from {other} to any
 block drop quick from any to {other}
 RULES
-pfctl -a legion/labcut -sr | grep -q 'block drop quick from {other}' || {{ echo 'the cut is not loaded' >&2; exit 1; }}
+rules=$(pfctl -a legion/labcut -sr)
+# pfctl prints the rules in its own form (`block drop quick inet from …`):
+# counted by the addresses they name, the two passes and four blocks.
+[ \"$(echo \"$rules\" | grep -c -e '{host}' -e '{other}')\" -ge 6 ] || {{ echo \"the cut is not loaded: $rules\" >&2; exit 1; }}
 for a in {host} {other}; do pfctl -q -k $a; pfctl -q -k 0.0.0.0/0 -k $a; done
 "
     )
