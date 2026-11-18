@@ -810,6 +810,57 @@ dialog and from the CLI alike.
 **Done when** a week's history outlives a change of leader in the
 console test.
 
+### Alongside: the console's feel
+
+From going through Sylve's live sandbox (2026-11-19): what makes a
+console feel finished is a frame that never moves, colour kept for
+state, an icon on everything, actions in one place, and an answer to
+every click. Taken in Legion's own look (Midnight Indigo and crimson,
+meters rather than rings, tabs rather than a menu column), each built
+where the phases above first need it:
+
+1. *Icons*: a small line set of Legion's own, drawn for its kinds
+   (namespace, service, task as a jail or a VM, node, volume, job, route
+   and the rest) and its controls, in the side bar, lists, headers, the
+   palette and the workbench; muted, the text colour on hover, never
+   crimson.
+2. *An object strip* on every object's page: its icon with a state dot,
+   name, namespace and what runs it on the left, its usual actions as one
+   group and the rest in a menu on the right, the tabs under it, so
+   changing tab never moves the actions.
+3. *A confirmation dialog of the console's own* in place of the browser's
+   `confirm()`: what will happen, a button naming the action, the name
+   typed for what can't be undone, and room for a dry run's answer
+   (phase 11).
+4. *An answer to every click*: a button busy while its call runs, a
+   toast for what was done (an error one stays until closed), skeleton
+   rows in place of "Loading…", and an empty list saying what to do.
+5. *The overview as a health page*: one card for the cluster's health in
+   words, then tiles with a label, a value, a line on what it means and
+   what to do, a meter; when it was sampled beside the title.
+6. *A resource tree* as a mode of the side bar: by namespace (service,
+   its tasks and Volumes) or by node (its tasks and Volumes), each with
+   its icon and state dot, fed by the watches the console holds, filtered
+   by the side bar's filter, arrow keys and a context menu on each.
+7. *Tables*: one toolbar (filter, count, what the selected rows can do),
+   sort marks, compact rows, a row opening on what it holds (a task's
+   events, a Volume's snapshots).
+8. *Charts*: the card's header with the range, CSV and PNG; a line under
+   it saying range and resolution; two series on one chart where they
+   belong together (received solid, sent dashed).
+9. *Forms*: names and namespaces filled in, a reset in the title bar, a
+   draft kept when the form is left (a dot on its entry).
+10. *The workbench as a thin bar always there*: the last thing done and
+    how it ended, what runs, opening into the activity of phase 10.
+11. *A lighter top bar*: theme and language in the user's menu, quorum
+    as a dot and a word, leaving search, alerts and pins.
+12. *Motion*: the side bar's sections opening and closing smoothly,
+    nothing moving when the system asks for less.
+
+Not taken: a near-black palette with one accent, ring gauges, a pager on
+live lists, a search hidden behind an icon, menus that close one section
+on opening another, a column of menus per object.
+
 Not taken, by design: host networking, switches, DHCP and firewall rules
 in order, a root terminal or file explorer on the host, partitioning
 disks and making pools, host package updates, Samba and iSCSI shares,
