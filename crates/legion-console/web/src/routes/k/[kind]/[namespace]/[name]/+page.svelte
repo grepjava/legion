@@ -21,6 +21,8 @@
   import Events from '#lib/Events.svelte';
   import { cannotWrite, openWorkbench, session } from '#lib/session.svelte.ts';
   import { toYaml } from '#lib/yaml.ts';
+  import Ico from '#lib/Ico.svelte';
+  import { kindIcon, toolIcon } from '#lib/icons.ts';
 
   const kind = $derived(page.params.kind ?? '');
   const namespace = $derived(page.params.namespace === '_' ? '' : (page.params.namespace ?? ''));
@@ -118,12 +120,30 @@
     tablist?.querySelectorAll<HTMLElement>('[role="tab"]')[to]?.focus();
   }
   const cols = $derived(columns(kind));
+  // What the strip shows of it: a VM's monitor for its kind, and its state.
+  const isVm = $derived.by(() => {
+    const o = object as LObject | null;
+    return (o?.spec?.pod?.containers ?? []).some((c: { vm?: unknown }) => c.vm);
+  });
+  const objState = $derived.by(() => {
+    const o = object as LObject | null;
+    const st = o?.status?.state;
+    return typeof st === 'string' ? st : '';
+  });
   const scoped = $derived(session.kinds.find((k) => k.kind === kind)?.clusterScoped ?? false);
 </script>
 
+<!-- The object's strip: what it is, its actions and its views, held at the
+     top as the page scrolls, so changing view never moves them. -->
+<div class="object-head">
 <header class="bar">
-  <h1>
-    <a href="/k/{kind}">{plural(kind)}</a> / {#if namespace}{namespace} / {/if}{name}
+  <h1 class="object-title">
+    <a class="crumb" href="/k/{kind}"><Ico icon={kindIcon(kind, isVm)} size={20} /><span>{plural(kind)}</span></a>
+    <span class="sep" aria-hidden="true">/</span>
+    {#if objState}<span class="dot {tone(objState)}" title={objState} aria-hidden="true"></span>{/if}
+    <span class="obj-name">{name}</span>
+    {#if namespace}<span class="ns-chip" title={t('Namespace')}>{namespace}</span>{/if}
+    {#if objState}<span class="sr-only">, {objState}</span>{/if}
   </h1>
   {#if gone}
     <span class="state bad">{t('deleted')}</span>
@@ -153,7 +173,7 @@
               namespace,
               name,
               object: obj
-            })}>{t('Dock logs')}</button
+            })}><Ico icon={toolIcon('logs')} size={14} />{t('Dock logs')}</button
         >
         {#if obj.status?.state === 'running'}
           <button
@@ -169,7 +189,7 @@
                 namespace,
                 name,
                 object: obj
-              })}>{t('Dock shell')}</button
+              })}><Ico icon={toolIcon('terminal')} size={14} />{t('Dock shell')}</button
           >
         {/if}
       {:else if kind === 'Build'}
@@ -185,7 +205,7 @@
               namespace,
               name,
               object: obj
-            })}>{t('Dock build log')}</button
+            })}><Ico icon={toolIcon('build')} size={14} />{t('Dock build log')}</button
         >
       {/if}
       {#if ['Task', 'Service', 'Job', 'Node', 'Volume', 'Build'].includes(kind)}
@@ -202,16 +222,14 @@
               name,
               targetKind: kind,
               object: obj
-            })}>{t('Dock events')}</button
+            })}><Ico icon={toolIcon('events')} size={14} />{t('Dock events')}</button
         >
       {/if}
     </div>
   {/if}
 </header>
 
-{#if error}
-  <p class="error" role="alert">{error}</p>
-{:else if object}
+{#if !error && object}
   {#if !gone}<Actions {object} {scoped} />{/if}
   <div class="tabs" role="tablist" aria-label={t('Views of {name}', { name })} bind:this={tablist}>
     {#each tabs as t (t.id)}
@@ -227,7 +245,12 @@
       >
     {/each}
   </div>
+{/if}
+</div>
 
+{#if error}
+  <p class="error" role="alert">{error}</p>
+{:else if object}
   <div role="tabpanel" id="panel" aria-labelledby="tab-{tab}">
 
   {#if tab === 'details'}

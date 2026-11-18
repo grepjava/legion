@@ -1549,3 +1549,75 @@ p.note {
   margin: 0.2rem 0 0.4rem;
   max-width: 40rem;
 }
+
+/* An object's strip (its page's head): held at the top of the page's
+   column as it scrolls, over what passes under it. */
+.object-head {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--bg);
+  margin: -0.25rem 0 0.75rem;
+  padding: 0.25rem 0 0;
+  border-bottom: 1px solid var(--line);
+}
+.object-head .tabs {
+  margin-bottom: 0;
+  border-bottom: none;
+}
+h1.object-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  min-width: 0;
+}
+h1.object-title .crumb {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: var(--muted);
+}
+h1.object-title .crumb:hover,
+h1.object-title .crumb:hover .ico {
+  color: var(--text);
+}
+h1.object-title .sep {
+  color: var(--line);
+  font-weight: 400;
+}
+h1.object-title .obj-name {
+  overflow-wrap: anywhere;
+}
+.dot {
+  display: inline-block;
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+.dot.good {
+  background: var(--good);
+}
+.dot.wait {
+  background: var(--wait);
+}
+.dot.bad {
+  background: var(--bad);
+}
+.ns-chip {
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 0.08rem 0.5rem;
+  border-radius: 999px;
+  background: var(--surface2);
+  color: var(--muted);
+}
+@media (forced-colors: active) {
+  .dot {
+    background: CanvasText;
+  }
+}
