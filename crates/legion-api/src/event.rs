@@ -57,6 +57,8 @@ pub struct Summary {
     /// Why a volume is lost, empty while it is not.
     pub lost: String,
     pub owner: String,
+    /// How a volume came to carry on from its replica, empty until it did.
+    pub promoted: String,
 }
 
 fn text(v: &serde_json::Value) -> String {
@@ -94,7 +96,11 @@ impl Summary {
             Kind::Volume => {
                 s.node = text(&status["node"]);
                 s.lost = text(&status["lost"]);
-                s.message = String::new();
+                s.promoted = text(&status["promoted"]);
+                // Its replica's state and why, the replicator's: unset
+                // while pending, so the first copy reads as Ready.
+                s.state = text(&status["replica"]["state"]);
+                s.message = text(&status["replica"]["message"]);
             }
             _ => return None,
         }
@@ -189,6 +195,12 @@ pub fn changes(
             }
             if a.lost != b.lost && !a.lost.is_empty() {
                 out.push(("Lost".into(), a.lost.clone()));
+            }
+            if a.promoted != b.promoted && !a.promoted.is_empty() {
+                out.push(("FailedOver".into(), a.promoted.clone()));
+            }
+            if a.state != b.state && !a.state.is_empty() {
+                out.push((format!("Replica{}", reason(&a.state)), a.message.clone()));
             }
         }
         _ => {}
@@ -294,6 +306,34 @@ mod tests {
                 Some(&lost)
             )),
             ["Lost: its node was removed"]
+        );
+        let ready = Summary {
+            node: "n1".into(),
+            state: "ready".into(),
+            ..Summary::default()
+        };
+        let failed = Summary {
+            state: "failed".into(),
+            message: "node n2: refused".into(),
+            ..ready.clone()
+        };
+        assert_eq!(
+            reasons(changes(Kind::Volume, Some(&ready), Some(&failed))),
+            ["ReplicaFailed: node n2: refused"]
+        );
+        // Another attempt failing the same way says nothing new.
+        assert!(changes(Kind::Volume, Some(&failed), Some(&failed)).is_empty());
+        let promoted = Summary {
+            node: "n2".into(),
+            promoted: "automatically, n1 being down: from the replica of its data on n2".into(),
+            ..Summary::default()
+        };
+        assert_eq!(
+            reasons(changes(Kind::Volume, Some(&ready), Some(&promoted))),
+            [
+                "OnNode: n2",
+                "FailedOver: automatically, n1 being down: from the replica of its data on n2"
+            ]
         );
     }
 

@@ -52,6 +52,7 @@ pub enum AlertKind {
     CrashLoop,
     VolumeLost,
     VolumeNearlyFull,
+    ReplicaStale,
     CaExpiring,
 }
 
@@ -65,6 +66,7 @@ impl AlertKind {
             AlertKind::CrashLoop => "crash-loop",
             AlertKind::VolumeLost => "volume-lost",
             AlertKind::VolumeNearlyFull => "volume-nearly-full",
+            AlertKind::ReplicaStale => "replica-stale",
             AlertKind::CaExpiring => "ca-expiring",
         }
     }
@@ -107,6 +109,21 @@ pub struct VolumeInput<'a> {
     pub lost: &'a str,
     pub used_bytes: u64,
     pub avail_bytes: u64,
+    /// Its replica, when the last copy there is stale
+    /// (`ReplicaStatus::stale_at`).
+    pub stale_replica: Option<StaleReplica>,
+}
+
+/// A Volume's replica whose last copy is too old.
+#[derive(Default)]
+pub struct StaleReplica {
+    pub node: String,
+    /// Since the last copy was taken.
+    pub age: Duration,
+    /// How often it is meant to be copied.
+    pub every: Duration,
+    /// Why the last attempt failed, if it did.
+    pub why: String,
 }
 
 /// What a manager knows that alerts are worked out from.
@@ -210,6 +227,26 @@ pub fn alerts(i: &Inputs) -> Vec<Alert> {
             });
             continue;
         }
+        if let Some(r) = &v.stale_replica {
+            let why = if r.why.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", r.why)
+            };
+            out.push(Alert {
+                kind: AlertKind::ReplicaStale,
+                severity: Severity::Warning,
+                namespace: v.namespace.to_owned(),
+                object: format!("Volume/{}", v.name),
+                message: format!(
+                    "Volume {}'s replica on {} was last copied {} ago, meant to be every {}{why}",
+                    v.name,
+                    r.node,
+                    crate::clock::span(r.age),
+                    crate::clock::span(r.every),
+                ),
+            });
+        }
         let cap = v.used_bytes.saturating_add(v.avail_bytes);
         if cap > 0
             && (u128::from(v.used_bytes) * 100)
@@ -275,6 +312,7 @@ mod tests {
                 lost: "",
                 used_bytes: 500 << 20,
                 avail_bytes: 500 << 20,
+                stale_replica: None,
             }],
             ca_left: Some(CA_WARNING * 2),
             leader: true,
@@ -310,6 +348,7 @@ mod tests {
                     lost: "",
                     used_bytes: 950 << 20,
                     avail_bytes: 50 << 20,
+                    stale_replica: None,
                 },
             ],
             ca_left: Some(CA_CRITICAL * 2),
@@ -347,5 +386,34 @@ mod tests {
         let got = alerts(&Inputs::default());
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].kind, AlertKind::NoLeader);
+    }
+
+    #[test]
+    fn a_stale_replica_says_how_old_its_copy_is() {
+        let i = Inputs {
+            leader: true,
+            volumes: vec![VolumeInput {
+                namespace: "a",
+                name: "pg-db-0",
+                stale_replica: Some(StaleReplica {
+                    node: "n2".into(),
+                    age: Duration::from_secs(16 * 60),
+                    every: Duration::from_secs(300),
+                    why: "node n2: refused (attempt 3; the next in 40s)".into(),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let got = alerts(&i);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, AlertKind::ReplicaStale);
+        assert_eq!(got[0].severity, Severity::Warning);
+        assert_eq!(got[0].object, "Volume/pg-db-0");
+        assert_eq!(
+            got[0].message,
+            "Volume pg-db-0's replica on n2 was last copied 16m ago, meant to be every 5m: \
+             node n2: refused (attempt 3; the next in 40s)"
+        );
     }
 }

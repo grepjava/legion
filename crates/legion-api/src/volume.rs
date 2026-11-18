@@ -105,6 +105,106 @@ pub struct ReplicaStatus {
     /// Why the last attempt failed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub message: String,
+    /// What the copy kept there amounts to, as the leader last weighed it
+    /// ([`ReplicaStatus::settled`]); a copy under way does not change it.
+    #[serde(default, skip_serializing_if = "ReplicaState::is_pending")]
+    pub state: ReplicaState,
+    /// When the copy under way began, in milliseconds since the epoch;
+    /// unset while none is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copying_ms: Option<i64>,
+    /// The last copies, newest last, at most [`ReplicaStatus::KEPT`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub copies: Vec<ReplicaCopy>,
+    /// Why the Volume would not fail over on its own if its node went down
+    /// now; empty when it would, or when its failover is manual.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked: Vec<String>,
+}
+
+/// One copy to a Volume's replica, or an attempt at one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicaCopy {
+    /// When it began, in milliseconds since the epoch.
+    pub at_ms: i64,
+    /// How long it took.
+    pub took_ms: u64,
+    /// What was sent: the whole Volume, or what changed since the last.
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub whole: bool,
+    /// Why it failed; empty when it did not.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
+/// What a Volume's replica amounts to (see [`ReplicaStatus::settled`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplicaState {
+    /// No copy yet.
+    #[default]
+    Pending,
+    /// A copy at most [`ReplicaStatus::STALE_AFTER`] intervals old.
+    Ready,
+    /// The last copy older than that.
+    Stale,
+    /// The last attempt failed, or there is nowhere to keep it.
+    Failed,
+}
+
+impl ReplicaState {
+    pub fn is_pending(&self) -> bool {
+        *self == ReplicaState::Pending
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplicaState::Pending => "pending",
+            ReplicaState::Ready => "ready",
+            ReplicaState::Stale => "stale",
+            ReplicaState::Failed => "failed",
+        }
+    }
+}
+
+impl ReplicaStatus {
+    /// Copies kept in [`ReplicaStatus::copies`].
+    pub const KEPT: usize = 10;
+    /// Intervals after which the last copy is stale.
+    pub const STALE_AFTER: u32 = 3;
+
+    /// Whether the last copy is older than [`Self::STALE_AFTER`] intervals
+    /// of `every` at `now_ms`; never before the first.
+    pub fn stale_at(&self, every: std::time::Duration, now_ms: i64) -> bool {
+        let limit = every.as_millis() as i64 * i64::from(Self::STALE_AFTER);
+        !self.snapshot.is_empty() && self.taken_ms.is_none_or(|t| now_ms - t > limit)
+    }
+
+    /// What the replica amounts to at `now_ms`: failed while the last
+    /// attempt did, else pending until the first copy, stale once that is
+    /// too old, ready otherwise.
+    pub fn settled(&self, every: std::time::Duration, now_ms: i64) -> ReplicaState {
+        if !self.message.is_empty() {
+            ReplicaState::Failed
+        } else if self.snapshot.is_empty() {
+            ReplicaState::Pending
+        } else if self.stale_at(every, now_ms) {
+            ReplicaState::Stale
+        } else {
+            ReplicaState::Ready
+        }
+    }
+
+    /// `copy` added to the copies kept, the oldest going past
+    /// [`Self::KEPT`].
+    pub fn record(&mut self, copy: ReplicaCopy) {
+        self.copies.push(copy);
+        let over = self.copies.len().saturating_sub(Self::KEPT);
+        self.copies.drain(..over);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -756,5 +856,22 @@ mod tests {
         // Others as they are.
         let plain = admit("size: 1Gi").unwrap();
         assert_eq!(plain.resolved(None), Some(plain.clone()));
+    }
+
+    #[test]
+    fn a_replica_is_pending_ready_stale_or_failed() {
+        let every = std::time::Duration::from_secs(10);
+        let mut r = ReplicaStatus::default();
+        assert_eq!(r.settled(every, 0), ReplicaState::Pending);
+        assert!(
+            !r.stale_at(every, i64::MAX),
+            "never stale before the first copy"
+        );
+        r.snapshot = "legion-replica-1000".into();
+        r.taken_ms = Some(1000);
+        assert_eq!(r.settled(every, 31_000), ReplicaState::Ready);
+        assert_eq!(r.settled(every, 31_001), ReplicaState::Stale);
+        r.message = "node n2: refused".into();
+        assert_eq!(r.settled(every, 2000), ReplicaState::Failed);
     }
 }

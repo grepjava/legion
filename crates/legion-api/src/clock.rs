@@ -87,9 +87,37 @@ pub fn now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// A span of time for people, in its two largest units: `45s`, `12m`,
+/// `3h 5m`, `2d 4h`.
+pub fn span(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    let (days, hours, mins, secs) = (s / 86400, s / 3600 % 24, s / 60 % 60, s % 60);
+    match (days, hours, mins) {
+        (0, 0, 0) => format!("{secs}s"),
+        (0, 0, _) if secs == 0 => format!("{mins}m"),
+        (0, 0, _) => format!("{mins}m {secs}s"),
+        (0, _, 0) => format!("{hours}h"),
+        (0, _, _) => format!("{hours}h {mins}m"),
+        (_, 0, _) => format!("{days}d"),
+        _ => format!("{days}d {hours}h"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spans_read_in_their_two_largest_units() {
+        let s = |n| span(std::time::Duration::from_secs(n));
+        assert_eq!(s(45), "45s");
+        assert_eq!(s(600), "10m");
+        assert_eq!(s(630), "10m 30s");
+        assert_eq!(s(3600), "1h");
+        assert_eq!(s(3 * 3600 + 5 * 60 + 9), "3h 5m");
+        assert_eq!(s(2 * 86400), "2d");
+        assert_eq!(s(2 * 86400 + 4 * 3600 + 7), "2d 4h");
+    }
 
     #[test]
     fn round_trips() {
