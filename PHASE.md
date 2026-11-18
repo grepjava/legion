@@ -7,7 +7,7 @@ done and what comes next. Update it in the same commit as the work.
 Current work: **none scheduled**. Phases 1 to 4 met their exit criteria,
 phase 5's features are built (bhyve since as VM pods), and the hardening is
 done, ROADMAP.md's milestones with it (PLAN.md's phases 1 to 9). Since
-v0.1.19 the work has been the web console ([CONSOLE.md](CONSOLE.md)).
+v0.1.19 the work has been the web console, released as v0.2.0 ([CONSOLE.md](CONSOLE.md)).
 
 ## Phase 0 — Spikes
 
@@ -1570,7 +1570,8 @@ port's `distinfo` and crates are made for v0.1.19, but it has not been
 through `poudriere testport` since v0.1.9. Waiting on the user: the port's
 submission, once their FreeBSD Bugzilla account exists.
 
-Since v0.1.19, not yet tagged: the web console's phases 2 to 6
+v0.2.0, the first minor version, carries the 202 commits since v0.1.19:
+the web console's phases 2 to 6
 (CONSOLE.md): editing and deploying, alerts and usage history, log search,
 deploy forms, compose import and templates, topology, settings, single
 sign-on, several clusters, translations, plugins and accessibility checks;
@@ -1579,7 +1580,12 @@ events per object and the load balancer's holder; the console's new look
 and `legion top`'s layouts; and what a desktop container tool offers
 (CONSOLE.md): stop and start, port links, image details and scans, disk
 usage, diagnostics and support bundles, files, and stacks. The lab's
-console test (`the_console_runs_the_cluster`) passes at 243ddc7. Pausing a task is not built.
+console test (`the_console_runs_the_cluster`) passes at 243ddc7. Also:
+pausing and resuming a service (`paused`, agent protocol 3); the
+connections the nodes saw in pf's states (`legion connections`,
+`Cluster.Connections`, the console Topology's Seen arcs); and `legion top`
+level with the console (`:` runs any `legion` command, `E` edits and
+applies) with `legion topology`.
 jailer is merged into Legion as `legion local` and `legion build` (its
 state under `/var/db/legion-local`, moved from jailer's on first use;
 `legion.local.*` labels, `legion-local/*` pf anchors, the `legionlocal0`

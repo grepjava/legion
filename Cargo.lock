@@ -1618,7 +1618,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "legion"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1663,7 +1663,7 @@ dependencies = [
 
 [[package]]
 name = "legion-agent"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1698,7 +1698,7 @@ dependencies = [
 
 [[package]]
 name = "legion-api"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -1710,7 +1710,7 @@ dependencies = [
 
 [[package]]
 name = "legion-build"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1740,11 +1740,11 @@ dependencies = [
 
 [[package]]
 name = "legion-console"
-version = "0.1.19"
+version = "0.2.0"
 
 [[package]]
 name = "legion-image"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1773,7 +1773,7 @@ dependencies = [
 
 [[package]]
 name = "legion-jail"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures",
@@ -1793,7 +1793,7 @@ dependencies = [
 
 [[package]]
 name = "legion-local"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -1816,7 +1816,7 @@ dependencies = [
 
 [[package]]
 name = "legion-manager"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1861,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "legion-net"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "hickory-proto",
  "legion-sys",
@@ -1876,7 +1876,7 @@ dependencies = [
 
 [[package]]
 name = "legion-pki"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "getrandom 0.3.4",
  "rcgen",
@@ -1888,7 +1888,7 @@ dependencies = [
 
 [[package]]
 name = "legion-proto"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "hyper-util",
  "legion-api",
@@ -1909,7 +1909,7 @@ dependencies = [
 
 [[package]]
 name = "legion-runtime"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures",
@@ -1921,7 +1921,7 @@ dependencies = [
 
 [[package]]
 name = "legion-store"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "legion-api",
@@ -1939,7 +1939,7 @@ dependencies = [
 
 [[package]]
 name = "legion-sys"
-version = "0.1.19"
+version = "0.2.0"
 dependencies = [
  "libc",
  "serde",
