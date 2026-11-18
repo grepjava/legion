@@ -9,6 +9,8 @@
   import { t } from './i18n.svelte.ts';
   import { closeWorkbench, moveWorkbench, session } from './session.svelte.ts';
   import { sortable } from './drop.svelte.ts';
+  import Ico from './Ico.svelte';
+  import { toolIcon } from './icons.ts';
 
   const STORAGE_KEY = 'legion.workbenchHeight';
   const MIN_HEIGHT = 140;
@@ -165,6 +167,7 @@
             }}
             onkeydown={onTabKey}
           >
+            <Ico icon={toolIcon(item.kind)} size={14} />
             {item.title}
           </button>
         {/each}

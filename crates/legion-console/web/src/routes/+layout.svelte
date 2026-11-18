@@ -27,6 +27,9 @@
   } from '#lib/prefs.svelte.ts';
   import Workbench from '#lib/Workbench.svelte';
   import { plural } from '#lib/kinds.ts';
+  import Ico from '#lib/Ico.svelte';
+  import { kindIcon, pageIcon } from '#lib/icons.ts';
+  import { CircleQuestionMark, GripVertical, PanelLeft, Search, Star, X } from '@lucide/svelte';
   import {
     namespaces,
     session,
@@ -490,7 +493,7 @@
         title={sideShown ? t('Hide the side bar ([)') : t('Show the side bar ([)')}
         onclick={toggleSidebar}
       >
-        <span aria-hidden="true">☰</span>
+        <Ico icon={PanelLeft} size={18} />
         <span class="sr-only">{t('Side bar')}</span>
       </button>
       <a class="topbar-brand" href="/">
@@ -529,7 +532,7 @@
         title={pinned ? t('Unpin this page from the side bar') : t('Pin this page to the side bar')}
         onclick={() => togglePin({ ...here })}
       >
-        <span aria-hidden="true">{pinned ? '★' : '☆'}</span>
+        <Ico icon={Star} fill={pinned} class={pinned ? 'on' : ''} />
         {t('Pin')}
       </button>
 
@@ -539,6 +542,7 @@
         onclick={() => (session.paletteOpen = true)}
         aria-keyshortcuts="Control+K"
       >
+        <Ico icon={Search} />
         <span>{t('Jump or run…')}</span>
         <kbd>Ctrl+K</kbd>
       </button>
@@ -560,7 +564,7 @@
         title={t('Keyboard shortcuts (?)')}
         onclick={() => (helpOpen = true)}
       >
-        <span aria-hidden="true">?</span>
+        <Ico icon={CircleQuestionMark} size={18} />
         <span class="sr-only">{t('Keyboard shortcuts')}</span>
       </button>
     </header>
@@ -597,14 +601,16 @@
                       aria-current={at(here.href === p.href)}
                       use:sortable={{ group: 'pins', index: p.i, count: prefs.pins.length, move: pinMoved }}
                       aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
-                      ><span class="grip" aria-hidden="true">⠿</span><span class="pin-title">{p.title}</span></a
+                      ><span class="grip" aria-hidden="true"><Ico icon={GripVertical} size={14} /></span><Ico
+                        icon={pageIcon(p.href)}
+                      /><span class="pin-title">{p.title}</span></a
                     >
                     <button
                       type="button"
                       class="link unpin"
                       title={t('Unpin {name}', { name: p.title })}
                       aria-label={t('Unpin {name}', { name: p.title })}
-                      onclick={() => unpin(p.href)}>×</button
+                      onclick={() => unpin(p.href)}><Ico icon={X} size={14} /></button
                     >
                   </li>
                 {/each}
@@ -621,6 +627,7 @@
                   class:here={page.url.pathname === item.href}
                   aria-current={at(page.url.pathname === item.href)}
                 >
+                  <Ico icon={pageIcon(item.href)} />
                   <span>{item.label}</span>
                   {#if item.alerts && session.alerts.length}
                     <span class="count {critical ? 'bad' : 'wait'}">{session.alerts.length}</span>
@@ -638,7 +645,7 @@
                   href={item.href}
                   class:here={page.url.pathname === item.href}
                   aria-current={at(page.url.pathname === item.href)}
-                  >{item.label}</a
+                  ><Ico icon={pageIcon(item.href)} /><span>{item.label}</span></a
                 >
               {/each}
             </details>
@@ -651,14 +658,15 @@
                 <a
                   href="/clusters"
                   class:here={page.url.pathname === '/clusters'}
-                  aria-current={at(page.url.pathname === '/clusters')}>{t('All clusters')}</a
+                  aria-current={at(page.url.pathname === '/clusters')}
+                  ><Ico icon={pageIcon('/clusters')} /><span>{t('All clusters')}</span></a
                 >
               {/if}
               {#each filteredClusters as c, i (i)}
                 <a
                   href={there(c.url)}
                   title={t('This page on {name}, signed into on its own', { name: c.name })}
-                  >{c.name}</a
+                  ><Ico icon={pageIcon('/clusters')} /><span>{c.name}</span></a
                 >
               {/each}
             </details>
@@ -669,7 +677,9 @@
               {#each filteredPlugins as p (`${p.namespace}/${p.name}`)}
                 {@const href = `/plugins/${p.namespace}/${p.name}`}
                 <a {href} class:here={page.url.pathname === href} aria-current={at(page.url.pathname === href)}
-                  >{p.name}{#if !session.namespace}<span class="muted"> ({p.namespace})</span>{/if}</a
+                  ><Ico icon={pageIcon(href)} /><span
+                    >{p.name}{#if !session.namespace}<span class="muted"> ({p.namespace})</span>{/if}</span
+                  ></a
                 >
               {/each}
             </details>
@@ -678,7 +688,9 @@
             <details class="nav-sec" open={sectionOpen('links')} ontoggle={(e) => sectionToggled('links', e)}>
               <summary class="nav-group">{t('Links')}</summary>
               {#each filteredLinks as l, i (i)}
-                <a href={l.url} target="_blank" rel="noopener noreferrer">{l.label}</a>
+                <a href={l.url} target="_blank" rel="noopener noreferrer"
+                  ><Ico icon={pageIcon(l.url)} /><span>{l.label}</span></a
+                >
               {/each}
             </details>
           {/if}
@@ -690,7 +702,7 @@
                   href="/k/{k.kind}"
                   class:here={page.url.pathname.startsWith(`/k/${k.kind}`)}
                   aria-current={at(page.url.pathname.startsWith(`/k/${k.kind}`))}
-                  >{plural(k.kind)}</a
+                  ><Ico icon={kindIcon(k.kind)} /><span>{plural(k.kind)}</span></a
                 >
               {/each}
             </details>
@@ -703,7 +715,7 @@
                   href={item.href}
                   class:here={page.url.pathname === item.href}
                   aria-current={at(page.url.pathname === item.href)}
-                  >{item.label}</a
+                  ><Ico icon={pageIcon(item.href)} /><span>{item.label}</span></a
                 >
               {/each}
               {#each filteredClusterKinds as k (k.kind)}
@@ -711,7 +723,7 @@
                   href="/k/{k.kind}"
                   class:here={page.url.pathname.startsWith(`/k/${k.kind}`)}
                   aria-current={at(page.url.pathname.startsWith(`/k/${k.kind}`))}
-                  >{plural(k.kind)}</a
+                  ><Ico icon={kindIcon(k.kind)} /><span>{plural(k.kind)}</span></a
                 >
               {/each}
             </details>

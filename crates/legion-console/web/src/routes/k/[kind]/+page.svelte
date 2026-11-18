@@ -4,6 +4,8 @@
   import { columns, tone } from '#lib/columns.ts';
   import { matches, parse } from '#lib/filter.ts';
   import { plural } from '#lib/kinds.ts';
+  import Ico from '#lib/Ico.svelte';
+  import { kindIcon } from '#lib/icons.ts';
   import { t } from '#lib/i18n.svelte.ts';
   import { session } from '#lib/session.svelte.ts';
 
@@ -76,7 +78,7 @@
 </script>
 
 <header class="bar">
-  <h1>{plural(kind)}</h1>
+  <h1 class="with-icon"><Ico icon={kindIcon(kind)} size={22} />{plural(kind)}</h1>
   <input type="search" aria-label={t('Filter')} placeholder={t('Filter: name, app=web, !canary')}
     title={t('Words match names; key=value, key!=value and !key (no such label) match labels')} bind:value={filter} />
   <span class="muted">{t('{shown} of {total}, live', { shown: shown.length, total: objects.length })}</span>

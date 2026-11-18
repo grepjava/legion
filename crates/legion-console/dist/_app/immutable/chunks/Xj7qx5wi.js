@@ -1,3 +1,0 @@
-import{$ as e,F as t,H as n,J as r,N as i,S as a,_ as o,ct as s,dt as c,et as l,ft as u,g as d,j as f,lt as p,ot as m,x as h}from"./DUiOS_6R.js";var g=t(`<span> </span>
-`,1),_=t(`<pre class="diff"></pre>`);function v(t,v){p(v,!0);let y=m(()=>v.text.split(`
-`).map(e=>({l:e,c:e.startsWith(`+++`)||e.startsWith(`---`)?`head`:e.startsWith(`+`)?`add`:e.startsWith(`-`)?`del`:e.startsWith(`@@`)?`hunk`:``})));var b=_();h(b,21,()=>n(y),a,(t,a)=>{let s=()=>n(a).l,u=()=>n(a).c;var p=g(),m=e(p),h=l(m,!0);c(),r(()=>{d(m,1,o(u())),f(h,s())}),i(t,p)}),u(b),i(t,b),s()}export{v as t};

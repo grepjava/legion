@@ -8,6 +8,8 @@
   import { cannotWrite, openWorkbench, session, setDensity, setTheme } from './session.svelte.ts';
   import { page } from '$app/state';
   import { prefs } from './prefs.svelte.ts';
+  import Ico from './Ico.svelte';
+  import { actionIcon, kindIcon, pageIcon, type IconComponent } from './icons.ts';
 
   interface Item {
     id: string;
@@ -15,6 +17,15 @@
     label: string;
     detail: string;
     run: () => void;
+  }
+
+  /** Each item's icon: the page's or kind's it leads to, else its action's. */
+  function iconOf(item: Item): IconComponent {
+    const [what, rest] = [item.id.slice(0, item.id.indexOf(':')), item.id.slice(item.id.indexOf(':') + 1)];
+    if (what === 'nav') return pageIcon(rest);
+    if (what === 'pin' || what === 'recent') return pageIcon(item.detail);
+    if (what === 'kind' || what === 'obj') return kindIcon(rest.split(':')[0]);
+    return actionIcon(item.id);
   }
 
   let dialog: HTMLDialogElement | undefined = $state();
@@ -255,7 +266,8 @@
             onpointerenter={() => (index = i)}
             onclick={() => pick(item.run)}
           >
-            <span>
+            <span class="palette-label">
+              <Ico icon={iconOf(item)} />
               <span class="muted group-tag">{item.group}</span>
               <strong>{item.label}</strong>
             </span>
@@ -270,6 +282,16 @@
 </dialog>
 
 <style>
+  .palette-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    min-width: 0;
+  }
+  .palette-item.selected :global(.ico),
+  .palette-item:hover :global(.ico) {
+    color: var(--text);
+  }
   .palette {
     padding: 0.9rem;
     max-width: min(38rem, 94vw);

@@ -425,6 +425,37 @@ nav a.here {
   border-left-color: var(--accent);
   font-weight: 600;
 }
+/* Icons (lib/Ico.svelte): line drawings in the colour of what holds them,
+   muted until what holds them is hovered or current; never the accent,
+   which is kept for the current page's mark and for danger. */
+.ico {
+  flex: none;
+  color: var(--muted);
+  vertical-align: -0.2em;
+  transition: color 120ms ease;
+}
+nav a {
+  justify-content: flex-start;
+  gap: 0.55rem;
+}
+nav a > span:not(.count):not(.grip) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+nav a .count {
+  margin-left: auto;
+}
+nav a:hover .ico,
+nav a.here .ico,
+button:hover > .ico,
+.cmd-trigger:hover .ico {
+  color: var(--text);
+}
+button > .ico + * {
+  margin-left: 0.1rem;
+}
 .who {
   display: flex;
   justify-content: space-between;
@@ -1219,7 +1250,7 @@ ul.lacks {
   line-height: 1;
   min-width: 30px;
 }
-.pin-toggle[aria-pressed='true'] span {
+.pin-toggle .ico.on {
   color: var(--wait);
 }
 .shell.side-hidden {
@@ -1414,4 +1445,18 @@ main {
   .topbar .brand-title {
     display: none;
   }
+}
+h1.with-icon {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+h1.with-icon > .ico {
+  color: var(--muted);
+}
+[role='tab'] > .ico {
+  margin-right: 0.3rem;
+}
+[role='tab'][aria-selected='true'] > .ico {
+  color: var(--text);
 }
