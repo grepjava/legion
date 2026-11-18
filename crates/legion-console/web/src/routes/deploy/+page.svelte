@@ -111,6 +111,32 @@
           >{t("New Volume's size")} <span class="muted">{t('(empty: one there is)')}</span>
           <input bind:value={form.volumeSize} aria-label={t('Volume size')} placeholder="1Gi" />
         </label>
+        {#if form.volumeSize.trim()}
+          <label
+            >{t('Copy to another node every')}
+            <select bind:value={form.replicaEvery} aria-label={t('Replica')}>
+              <option value={0}>{t('never (no replica)')}</option>
+              <option value={10}>{t('10 seconds')}</option>
+              <option value={60}>{t('minute')}</option>
+              <option value={300}>{t('5 minutes')}</option>
+              <option value={3600}>{t('hour')}</option>
+            </select>
+          </label>
+          {#if form.replicaEvery}
+            <label
+              >{t('Failover')}
+              <select bind:value={form.failover} aria-label={t('Failover')}>
+                <option value="manual">{t('manual: when its node is removed')}</option>
+                <option value="automatic">{t('automatic: once its node is down and its tasks there stopped')}</option>
+              </select>
+            </label>
+            <p class="muted note">
+              {form.failover === 'automatic'
+                ? t('Its tasks stop where they are cut off from the cluster (onPartition: stop), so only one copy is ever written to. What was written since the last copy is lost with the node.')
+                : t('A copy is kept on another node; removing this node (legion delete node) carries the Volume on from it. What was written since the last copy is lost.')}
+            </p>
+          {/if}
+        {/if}
       {/if}
     </fieldset>
     <fieldset>

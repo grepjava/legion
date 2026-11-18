@@ -1542,3 +1542,10 @@ button[aria-busy='true']::after {
   border: 1px dashed var(--line);
   border-radius: 6px;
 }
+/* A line of explanation under a field: smaller, kept to the form's width. */
+p.note {
+  font-size: 0.84rem;
+  line-height: 1.45;
+  margin: 0.2rem 0 0.4rem;
+  max-width: 40rem;
+}

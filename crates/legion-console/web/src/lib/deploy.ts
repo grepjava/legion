@@ -25,6 +25,13 @@ export interface DeployForm {
   volume: string;
   /** A size such as `1Gi` makes the Volume; empty uses one there is. */
   volumeSize: string;
+  /** Seconds between copies of the Volume made here to another node; 0
+   * for no replica. */
+  replicaEvery: number;
+  /** Who hands the Volume to its replica when its node is gone: automatic
+   * also has the tasks stop where they are cut off (`onPartition: stop`),
+   * which it needs. */
+  failover: 'manual' | 'automatic';
   probe: Probe;
   /** For an HTTP probe. */
   probePath: string;
@@ -47,6 +54,8 @@ export function blank(namespace: string): DeployForm {
     mountPath: '',
     volume: '',
     volumeSize: '',
+    replicaEvery: 0,
+    failover: 'manual',
     probe: 'none',
     probePath: '/',
     memory: '',
@@ -81,6 +90,10 @@ export function objects(f: DeployForm): object[] | string {
   const volume = f.volume.trim() || name;
   if (f.probe !== 'none' && !f.port) return t('a probe needs the port the container listens on');
   if (f.publishedPort && !f.port) return t('publishing needs the port the container listens on');
+  const making = !!(mount && f.volumeSize.trim());
+  if (f.replicaEvery && !making) return t('a replica is kept of a Volume made here: give its size');
+  if (f.replicaEvery && f.replicaEvery < 10) return t('a replica is copied at most every 10 seconds');
+  const automatic = !!f.replicaEvery && f.failover === 'automatic';
 
   const container: Record<string, unknown> = { name, image };
   const command = f.command
@@ -109,6 +122,10 @@ export function objects(f: DeployForm): object[] | string {
   if (mount) container.volumeMounts = [{ name: 'data', path: mount }];
 
   const pod: Record<string, unknown> = { containers: [container] };
+  // Failing over on its own, the Volume needs its writers to stop where
+  // they are cut off, so the old copy takes no writes as the replica takes
+  // over.
+  if (automatic) pod.onPartition = 'stop';
   if (mount) pod.volumes = [{ name: 'data', volume: { name: volume } }];
   const spec: Record<string, unknown> = { mode: 'replicated', replicas: f.replicas, pod };
   if (f.port) {
@@ -121,12 +138,18 @@ export function objects(f: DeployForm): object[] | string {
   }
 
   const out: object[] = [];
-  if (mount && f.volumeSize.trim()) {
+  if (making) {
+    const vspec: Record<string, unknown> = { size: f.volumeSize.trim() };
+    if (f.replicaEvery) {
+      vspec.replica = automatic
+        ? { everySeconds: f.replicaEvery, failover: 'automatic' }
+        : { everySeconds: f.replicaEvery };
+    }
     out.push({
       apiVersion: 'legion/v1',
       kind: 'Volume',
       metadata: { name: volume, namespace: f.namespace },
-      spec: { size: f.volumeSize.trim() }
+      spec: vspec
     });
   }
   out.push({
