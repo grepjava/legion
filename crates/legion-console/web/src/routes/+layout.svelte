@@ -23,14 +23,17 @@
     prefs,
     setSectionOpen,
     setSidebarHidden,
+    setTree,
     togglePin,
     unpin,
-    visited
+    visited,
+    type TreeMode
   } from '#lib/prefs.svelte.ts';
   import Workbench from '#lib/Workbench.svelte';
   import { plural } from '#lib/kinds.ts';
   import Ico from '#lib/Ico.svelte';
   import { drafts } from '#lib/drafts.svelte.ts';
+  import ResourceTree from '#lib/ResourceTree.svelte';
   import { kindIcon, pageIcon } from '#lib/icons.ts';
   import {
     CircleQuestionMark,
@@ -611,6 +614,20 @@
           placeholder={t('Filter menu…')}
           aria-label={t('Filter menu')}
         />
+        <div class="tree-switch" role="radiogroup" aria-label={t('The side bar shows')}>
+          {#each [{ id: 'pages', label: t('Pages') }, { id: 'namespace', label: t('Namespaces') }, ...(session.me.all ? [{ id: 'node', label: t('Nodes') }] : [])] as m (m.id)}
+            <button
+              type="button"
+              role="radio"
+              aria-checked={prefs.tree === m.id}
+              class:on={prefs.tree === m.id}
+              onclick={() => setTree(m.id as TreeMode)}>{m.label}</button
+            >
+          {/each}
+        </div>
+        {#if prefs.tree !== 'pages' && (prefs.tree !== 'node' || session.me.all)}
+          <ResourceTree mode={prefs.tree === 'node' ? 'node' : 'namespace'} filter={navQuery} />
+        {:else}
         <nav aria-label={t('Console')}>
           {#if filteredPins.length}
             <details class="nav-sec" open={sectionOpen('pinned')} ontoggle={(e) => sectionToggled('pinned', e)}>
@@ -758,6 +775,7 @@
             </details>
           {/if}
         </nav>
+        {/if}
         <div class="who">
           <span title={session.me.role}>{session.me.name}</span>
           {#if languages.length > 1}

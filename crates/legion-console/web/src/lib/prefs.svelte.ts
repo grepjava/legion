@@ -14,8 +14,14 @@ const KEYS = {
   pins: 'legion.pins',
   recent: 'legion.recent',
   sidebar: 'legion.sidebar',
-  closed: 'legion.nav-closed'
+  closed: 'legion.nav-closed',
+  tree: 'legion.tree',
+  treeOpen: 'legion.tree-open'
 } as const;
+
+/** What the side bar shows: its pages, or the cluster's objects as a tree
+ * by namespace or by node. */
+export type TreeMode = 'pages' | 'namespace' | 'node';
 
 /** How many pages the recent list keeps. */
 export const RECENT_MAX = 8;
@@ -48,6 +54,7 @@ const isRefs = (v: unknown): v is PageRef[] =>
 const isStrings = (v: unknown): v is string[] =>
   Array.isArray(v) && v.every((x) => typeof x === 'string');
 const isBool = (v: unknown): v is boolean => typeof v === 'boolean';
+const isMode = (v: unknown): v is TreeMode => v === 'pages' || v === 'namespace' || v === 'node';
 
 const hasStorage = typeof localStorage !== 'undefined';
 
@@ -57,7 +64,10 @@ export const prefs = $state({
   /** The side bar hidden, to give the page the whole width. */
   sidebarHidden: hasStorage ? read(KEYS.sidebar, false, isBool) : false,
   /** The side bar's sections the user closed, by their key. */
-  closed: hasStorage ? read(KEYS.closed, [] as string[], isStrings) : []
+  closed: hasStorage ? read(KEYS.closed, [] as string[], isStrings) : [],
+  tree: (hasStorage ? read(KEYS.tree, 'pages' as TreeMode, isMode) : 'pages') as TreeMode,
+  /** The tree's branches opened, by their key. */
+  treeOpen: hasStorage ? read(KEYS.treeOpen, [] as string[], isStrings) : []
 });
 
 if (typeof window !== 'undefined') {
@@ -98,6 +108,18 @@ export function visited(ref: PageRef) {
 export function setSidebarHidden(hidden: boolean) {
   prefs.sidebarHidden = hidden;
   write(KEYS.sidebar, hidden);
+}
+
+export function setTree(mode: TreeMode) {
+  prefs.tree = mode;
+  write(KEYS.tree, mode);
+}
+
+export function setBranchOpen(key: string, open: boolean) {
+  const rest = prefs.treeOpen.filter((k) => k !== key);
+  // The newest few hundred: a long session doesn't grow it without end.
+  prefs.treeOpen = open ? [...rest, key].slice(-300) : rest;
+  write(KEYS.treeOpen, prefs.treeOpen);
 }
 
 export function setSectionOpen(key: string, open: boolean) {

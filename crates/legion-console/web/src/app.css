@@ -1766,3 +1766,29 @@ th[aria-sort='ascending'] > button.sort-btn::after {
   margin-left: auto;
   flex: none;
 }
+
+/* What the side bar shows: its pages or the cluster's objects as a tree. */
+.tree-switch {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  margin: 0.4rem 0 0.5rem;
+  border-radius: 7px;
+  background: var(--surface2);
+}
+.tree-switch button {
+  flex: 1;
+  min-height: 26px;
+  padding: 0.15rem 0.3rem;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+.tree-switch button.on {
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.15);
+}
