@@ -951,6 +951,14 @@ fn a_replicated_volume_carries_on_from_its_copy_when_its_host_is_lost() {
         "promoted while its node was only down: {}",
         lab.pg_volume()["status"]
     );
+    // No copy can be taken while the node is down: the replica goes stale,
+    // three intervals of 10 s on, and an alert says so.
+    lab.waited("the replica-stale alert", 180, || {
+        let out = lab.legion(&["alerts", "-n", "data", "-o", "json"], &[]);
+        let said = text(&out.stdout);
+        said.contains("replica-stale") && said.contains("pg-db-0")
+    });
+    assert_eq!(replica(&lab)["state"], "stale", "{}", replica(&lab));
 
     step("the host removed: the Volume carries on from the copy, the primary with it");
     lab.ok(&["delete", "node", &from]);
@@ -1127,6 +1135,11 @@ fn a_replicated_volume_fails_over_on_its_own_when_its_node_is_cut_off() {
         !text(&out.stdout).trim().is_empty()
     };
     assert!(postgres(&lab), "Postgres runs on {from} before the cut");
+    // Before the cut, the Volume says it would fail over on its own.
+    lab.waited("the Volume saying it can fail over", 120, || {
+        let r = replica(&lab);
+        r["state"] == "ready" && r["blocked"].as_array().is_none_or(|b| b.is_empty())
+    });
 
     step("the primary's node cut off, its daemon running");
     let host = lab.host.clone();
