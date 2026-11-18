@@ -1325,6 +1325,120 @@ async fn a_replicated_volume_carries_on_when_its_node_is_removed() {
     c.stop().await;
 }
 
+/// A stateful task's Volume whose replica fails over on its own
+/// (`failover: automatic`), its pod one that must not run twice: its node
+/// cut off with its agent running, the agent stops the pod, and once the
+/// leader has waited for that the Volume carries on from the replica's last
+/// copy, its task with it, though nobody removed the node. Mended, the node
+/// starts nothing again and drops its old copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replicated_volume_fails_over_on_its_own_when_its_node_is_cut_off() {
+    use legion_api::volume::VolumeStatus;
+
+    let c = Cluster::start(3).await;
+    c.apply(
+        &DB.replace("MAX", "1")
+            .replace(
+                "  pod:
+",
+                "  pod:
+    onPartition: stop
+    stopGracePeriod: 1s
+",
+            )
+            .replace(
+                "claim: { size: 1Gi }",
+                "claim: { size: 1Gi, replica: { everySeconds: 10, failover: automatic } }",
+            ),
+    )
+    .await;
+    async fn status(c: &Cluster) -> VolumeStatus {
+        c.list(Kind::Volume)
+            .await
+            .into_iter()
+            .find(|v| v.metadata.name == "data-db-0")
+            .map(|v| serde_json::from_value(v.status).unwrap_or_default())
+            .unwrap_or_default()
+    }
+    async fn running_on(c: &Cluster) -> Option<String> {
+        c.list(Kind::Task)
+            .await
+            .into_iter()
+            .find(|t| t.status["state"] == "running" && t.spec["desiredState"] == "running")
+            .map(|t| t.spec["node"].as_str().unwrap_or_default().to_owned())
+    }
+    let ds = "tank/legion/volumes/shop/data-db-0";
+    let index = |c: &Cluster, name: &str| c.nodes.iter().position(|n| n.name == name).unwrap();
+    eventually("db running", async || running_on(&c).await.is_some()).await;
+    let from = status(&c).await.node;
+    let i = index(&c, &from);
+    c.nodes[i].sys.write_dataset(ds, b"rows 1");
+    eventually("a copy of the rows", async || {
+        status(&c).await.replica.is_some_and(|r| {
+            !r.snapshot.is_empty()
+                && c.nodes[index(&c, &r.node)]
+                    .sys
+                    .dataset_contents(ds)
+                    .as_deref()
+                    == Some(&b"rows 1"[..])
+        })
+    })
+    .await;
+    let keeper = status(&c).await.replica.unwrap().node;
+    assert_ne!(keeper, from);
+    let k = index(&c, &keeper);
+
+    // Cut off: its agent stops the pod before the Volume is handed over.
+    c.nodes[i].link.cut();
+    let start = tokio::time::Instant::now();
+    let mut stopped = None;
+    while status(&c).await.node != keeper {
+        assert!(
+            start.elapsed() < Duration::from_secs(40),
+            "not handed over: {:?}",
+            status(&c).await
+        );
+        if stopped.is_none() && c.pods(i).is_empty() {
+            stopped = Some(start.elapsed());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let handed = start.elapsed();
+    let stopped = stopped.expect("the cut-off pod was never stopped");
+    assert!(
+        stopped < handed,
+        "stopped {stopped:?}, handed over {handed:?}"
+    );
+    let s = status(&c).await;
+    assert!(
+        s.promoted
+            .starts_with(&format!("automatically, {from} being down")),
+        "{}",
+        s.promoted
+    );
+    assert!(s.lost.is_empty());
+    eventually("db running on the replica's node", async || {
+        running_on(&c).await.as_deref() == Some(keeper.as_str())
+    })
+    .await;
+    assert_eq!(
+        c.nodes[k].sys.dataset_contents(ds).as_deref(),
+        Some(&b"rows 1"[..])
+    );
+
+    // Mended: nothing starts there again, and the old copy goes.
+    c.nodes[i].link.mend();
+    c.eventually_node_ready(&from).await;
+    eventually("the old copy dropped", async || {
+        c.nodes[i].sys.zfs_list(ds).unwrap_or_default().is_empty()
+            && !status(&c).await.leftovers.contains(&from)
+    })
+    .await;
+    assert!(c.pods(i).is_empty(), "nothing runs again on {from}");
+    assert_eq!(running_on(&c).await.as_deref(), Some(keeper.as_str()));
+    c.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stateful_data_moves_off_a_draining_node() {
     let c = Cluster::start(3).await;
