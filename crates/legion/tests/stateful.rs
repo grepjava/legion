@@ -1018,3 +1018,196 @@ fn a_replicated_volume_carries_on_from_its_copy_when_its_host_is_lost() {
     });
     step("done");
 }
+
+/// The rules cutting a VM off from this host and the other VM, all but
+/// this host's ssh to it, which passes without state so the session the
+/// rules are loaded over lives on; the states already held are dropped.
+fn cut_off(host: &str, other: &str) -> String {
+    format!(
+        "pfctl -si | grep -q 'Status: Enabled' || {{ echo 'pf is not enabled' >&2; exit 1; }}
+pfctl -a legion/labcut -f - << 'RULES'
+pass in quick proto tcp from {host} to any port 22 no state
+pass out quick proto tcp from any port 22 to {host} no state
+block drop quick from {host} to any
+block drop quick from any to {host}
+block drop quick from {other} to any
+block drop quick from any to {other}
+RULES
+pfctl -a legion/labcut -sr | grep -q 'block drop quick from {other}' || {{ echo 'the cut is not loaded' >&2; exit 1; }}
+for a in {host} {other}; do pfctl -q -k $a; pfctl -q -k 0.0.0.0/0 -k $a; done
+"
+    )
+}
+
+/// Phase 9's automatic failover on real ZFS: the primary's node cut off
+/// from the cluster, its daemon running, its Volume replicated with
+/// `failover: automatic` and its pod `onPartition: stop`. Its agent stops
+/// Postgres there, and once the manager has waited for that the Volume
+/// carries on from the replica's last copy on the other worker, the primary
+/// with it, though nobody removed the node. Mended, the node starts nothing
+/// again and drops its old copy.
+#[test]
+#[ignore = "needs root and ZFS on FreeBSD, two more nodes and the image; see the module docs"]
+fn a_replicated_volume_fails_over_on_its_own_when_its_node_is_cut_off() {
+    let image = std::env::var("LEGION_PG_IMAGE").expect("set LEGION_PG_IMAGE");
+    let mut lab = Lab::from_env();
+    let step = |what: &str| eprintln!("--- {what}");
+
+    step("a manager and two workers, each with a pool for volumes; the manager paused");
+    lab.start_host(&[]);
+    lab.ok(&["init"]);
+    let worker = lab.ok(&["join-token", "worker"]).trim().to_owned();
+    lab.join(0, &worker, Role::Worker);
+    lab.join(1, &worker, Role::Worker);
+    wait("three ready nodes", 120, || {
+        ["n1", "n2", "n3"]
+            .iter()
+            .all(|n| lab.node_state(n) == "ready")
+    });
+    lab.load_image(&image);
+    lab.ok(&["node", "pause", "n1"]);
+
+    step(
+        "a primary that stops when cut off, its Volume copied to the other worker and failing over on its own",
+    );
+    let automatic = APP
+        .replace("replicas: 2", "replicas: 1")
+        .replace(
+            "  pod:\n    initContainers:",
+            "  pod:\n    onPartition: stop\n    stopGracePeriod: 5s\n    initContainers:",
+        )
+        .replace(
+            "claim: { size: 512Mi }",
+            "claim: { size: 512Mi, replica: { everySeconds: 10, failover: automatic } }",
+        );
+    assert!(
+        automatic.contains("onPartition: stop") && automatic.contains("failover: automatic"),
+        "the service asks for both: {automatic}"
+    );
+    let app = lab.dir.join("app.yaml");
+    std::fs::write(&app, &automatic).unwrap();
+    lab.ok(&["apply", "-f", app.to_str().unwrap()]);
+    lab.waited("the primary ready", 600, || {
+        lab.list("services", "data")
+            .iter()
+            .any(|s| s["metadata"]["name"] == "db" && s["status"]["ready"] == 1)
+    });
+    let from = lab.node_of(0);
+    let other = if from == "n2" { "n3" } else { "n2" };
+    lab.sql(
+        0,
+        "create table orders (id serial primary key, item text); \
+         insert into orders (item) select 'copied ' || i from generate_series(1, 1000) i; \
+         checkpoint",
+    )
+    .expect("writing to the primary");
+    let replica = |lab: &Lab| lab.pg_volume()["status"]["replica"].clone();
+    lab.waited("a first copy on the other worker", 300, || {
+        let r = replica(&lab);
+        r["node"] == other && r["snapshot"].as_str().is_some_and(|s| !s.is_empty())
+    });
+    let seen = replica(&lab)["snapshot"].as_str().unwrap().to_owned();
+    lab.waited("a copy taken after the rows", 120, || {
+        replica(&lab)["snapshot"]
+            .as_str()
+            .is_some_and(|s| s != seen)
+    });
+    eprintln!(
+        "db-0 on {from}, its replica on {other} at {}",
+        replica(&lab)["snapshot"]
+    );
+    lab.sql(0, "insert into orders (item) values ('late')")
+        .expect("writing after the copy");
+    let postgres = |lab: &Lab| {
+        let out = lab.on(&from, "pgrep -f 'postgres -D /var/db/pg/data' || true");
+        assert!(out.status.success(), "asking {from}: {}", text(&out.stderr));
+        !text(&out.stdout).trim().is_empty()
+    };
+    assert!(postgres(&lab), "Postgres runs on {from} before the cut");
+
+    step("the primary's node cut off, its daemon running");
+    let host = lab.host.clone();
+    let other_addr = lab.vms[vm(other)].addr.clone();
+    let out = lab.on(&from, &cut_off(&host, &other_addr));
+    assert!(
+        out.status.success(),
+        "cutting {from} off: {}",
+        text(&out.stderr)
+    );
+    let cut = std::time::Instant::now();
+    let mut stopped = None;
+    lab.waited("the Volume handed to its replica", 300, || {
+        let s = lab.pg_volume()["status"].clone();
+        if s["node"] == other && s["promoted"].as_str().is_some_and(|p| !p.is_empty()) {
+            return true;
+        }
+        if stopped.is_none() && !postgres(&lab) {
+            stopped = Some(cut.elapsed());
+        }
+        false
+    });
+    let handed = cut.elapsed();
+    let stopped =
+        stopped.expect("Postgres on the cut-off node was not seen stopped before the handover");
+    eprintln!("stopped after {stopped:?}, handed over after {handed:?}");
+    assert!(!postgres(&lab), "nothing writes on {from} once handed over");
+    let v = lab.pg_volume();
+    let promoted = v["status"]["promoted"].as_str().unwrap_or_default();
+    assert!(
+        promoted.starts_with(&format!("automatically, {from} being down")),
+        "{promoted}"
+    );
+    assert!(
+        v["status"]["lost"].as_str().unwrap_or_default().is_empty(),
+        "not lost: {v}"
+    );
+    assert_eq!(
+        lab.node_state(&from),
+        "down",
+        "{from} is still a node, down"
+    );
+
+    step("the primary serving from the copy");
+    lab.waited("the primary running on the replica's node", 600, || {
+        lab.ordinal(0).is_some_and(|t| t["spec"]["node"] == other) && lab.rows(0).is_some()
+    });
+    let rows = lab.rows(0).unwrap();
+    assert!(
+        rows == 1000 || rows == 1001,
+        "every row up to the copy, at most the late one after: {rows}"
+    );
+
+    step("mended: nothing starts again on the node, and its old copy goes");
+    let out = lab.on(&from, "pfctl -a legion/labcut -F rules");
+    assert!(
+        out.status.success(),
+        "mending {from}: {}",
+        text(&out.stderr)
+    );
+    lab.waited("the mended node ready", 180, || {
+        lab.node_state(&from) == "ready"
+    });
+    lab.waited("the old copy dropped", 300, || {
+        let leftovers = lab.pg_volume()["status"]["leftovers"].clone();
+        lab.held(&from).trim().is_empty()
+            && !leftovers
+                .as_array()
+                .is_some_and(|l| l.iter().any(|n| n == from.as_str()))
+    });
+    assert!(!postgres(&lab), "nothing runs again on {from}");
+    assert_eq!(
+        lab.ordinal(0).map(|t| t["spec"]["node"].clone()),
+        Some(Value::from(other)),
+        "the primary stays on {other}"
+    );
+    assert_eq!(lab.rows(0), Some(rows), "no row lost after mending");
+
+    step("clean up");
+    lab.ok(&["delete", "service", "db", "-n", "data"]);
+    lab.waited("every task gone", 180, || {
+        lab.list("tasks", "data")
+            .iter()
+            .all(|t| t["status"]["state"] != "running")
+    });
+    step("done");
+}
