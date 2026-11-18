@@ -93,8 +93,9 @@ A host that ran jailer, which `legion local` was before it was merged
 into Legion, has its state moved from `/var/db/jailer` (or
 `~/.local/share/jailer`) and `zroot/jailer` on first use, when no
 `--state-dir` or `--zfs-root` is given. While jailer's state still holds
-containers it is left alone: remove them with jailer, or keep using it
-with `--state-dir`.
+containers it is left alone: remove them with jailer (its repository is
+archived, and has no releases after the merge), or keep using it with
+`--state-dir`.
 
 ### With buildah or Podman
 

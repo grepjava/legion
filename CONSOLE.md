@@ -94,7 +94,7 @@ live list of every kind with columns for nodes, tasks, services, volumes,
 routes and bindings, and each object's spec and status (JSON for now).
 Tested over HTTPS against a manager (`crates/legion-manager/tests/console.rs`).
 
-**Since v0.1.19:** sign-in over HTTP/2, as browsers speak it (the origin
+**Since v0.1.19 (released in v0.2.0):** sign-in over HTTP/2, as browsers speak it (the origin
 check took the host from a `Host` header HTTP/2 doesn't send; the test
 now signs in over HTTP/2); task logs (`/api/logs`, a WebSocket of the
 `Pods.Session` the CLI's `logs` opens, tail and follow); what tasks use

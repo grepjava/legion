@@ -24,7 +24,7 @@ what is built today, not what is planned.
 | Configuration | YAML objects, or compose files as stacks | Compose files, `docker service` flags | YAML objects, Helm charts, operators |
 | Extensible API | No (fixed kinds) | No | Yes (CRDs, operators, webhooks) |
 | Scale it is built for | Up to 256 nodes (one /24 of the pod network each) and about 20,000 tasks | Hundreds of nodes | Thousands of nodes |
-| Maturity | New (v0.1.19), qualified on FreeBSD VMs, not used in production | Mature, in maintenance | Mature, very widely used |
+| Maturity | New (v0.2.0), qualified on FreeBSD VMs, not used in production | Mature, in maintenance | Mature, very widely used |
 
 Choose Legion to run services on FreeBSD hosts with ZFS, pf and jails,
 without assembling a stack of components. Choose Swarm or Kubernetes for

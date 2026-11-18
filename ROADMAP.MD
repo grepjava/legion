@@ -178,7 +178,7 @@ Starting points: `crates/legion/src/cli.rs`,
 Status: done in v0.1.13: `legion doctor`, its checks in a crate shared
 with jailer, text or JSON, nonzero when a requirement is unmet. Since
 v0.1.19, `legion diagnose` and the console's Diagnostics page run it on
-every node. The follow-up (16 November 2026, not yet released): each
+every node. The follow-up (16 November 2026, released in v0.2.0): each
 agent runs the checks as it starts and every minute, carried by its
 heartbeats to the Node's `status.lacks`; while a required one is unmet,
 the node gets no new tasks, Volumes, builds or load-balancer addresses,
@@ -343,7 +343,7 @@ Acceptance:
 Dependencies: P1.3 for stable image identities. Keep verification policy
 separate from image building; do not invent cryptographic formats.
 
-Status: done. SBOM and provenance (16 November 2026, not yet released):
+Status: done. SBOM and provenance (16 November 2026, released in v0.2.0):
 an `ImagePolicy`'s `attestations` require cosign attestations of the
 types it names (SLSA provenance, SPDX or CycloneDX SBOMs), signed by its
 keys, enforced or warned as its signatures are; `legion image inspect`
@@ -383,8 +383,8 @@ Status: done in v0.1.18: jailer's image from build to recovery in one
 lab test, [docs/COMPOSE.md](docs/COMPOSE.md),
 [docs/LINUX.md](docs/LINUX.md), the examples in `examples/` and limits
 measured. The host's firewall requirements are in the README (the pf
-anchors) and checked by `legion doctor`. 16 November 2026, not yet
-released: jailer merged into Legion as `legion local` and `legion build`,
+anchors) and checked by `legion doctor`. 16 November 2026, released
+in v0.2.0: jailer merged into Legion as `legion local` and `legion build`,
 so the companion builder is now part of Legion itself.
 
 ### P3 — Measured scaling and optional extensions
@@ -450,7 +450,7 @@ The optional extensions were built in v0.1.19, at the user's request
 - Relays for nodes behind different NATs (`--mesh-nat`, `--mesh-relay`).
 
 Further storage integrations (16 November 2026, at the user's request,
-not yet released):
+released in v0.2.0):
 
 - Replicated ZFS Volumes (`replica`, also a stateful claim's): copied
   to another node every so often, incrementally; when the node holding

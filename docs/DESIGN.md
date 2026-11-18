@@ -2098,7 +2098,7 @@ WireGuard and bridge, with tasks as VNET jails attached to the node bridges.
    (`packaging/freebsd/release.sh`, with an rc.d script) are on GitHub,
    and the port `sysutils/legion` (`packaging/freebsd/port`, amd64 and
    aarch64) last passed `poudriere testport` on 15.1 amd64 at v0.1.9 and
-   last built on 15.1 arm64 at v0.1.7. It is to be submitted to the ports
-   tree.
+   last built on 15.1 arm64 at v0.1.7. It is filed as a new port (FreeBSD
+   bug 300441), its `distinfo` made for v0.2.0.
 3. ~~Licence~~ Decided: BSD-2-Clause, which fits the FreeBSD ecosystem.
 4. ~~Manage the system Podman's containers~~ Decided: no; Legion runs its own jails and leaves other runtimes alone.

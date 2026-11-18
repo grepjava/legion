@@ -21,7 +21,10 @@ tagged, so between releases it lags `Cargo.lock`.
 4. Test it: `make stage check-plist stage-qa package` with
    `DEVELOPER=yes`, `portlint -AC`, then in poudriere (`poudriere testport
    -o sysutils/legion`) on FreeBSD 15 for amd64 and aarch64.
-5. Submit it to the ports tree as a new port at https://bugs.freebsd.org.
+5. Submit it to the ports tree at https://bugs.freebsd.org. The port is
+   filed as a new port in bug 300441: attach the new
+   `git format-patch` against ports main there, marking the old one
+   obsolete.
 
 Without root, point the ports framework at directories of your own:
 `PORTSDIR`, `DISTDIR`, `WRKDIRPREFIX` and `PORT_DBDIR`, with `BATCH=yes`.

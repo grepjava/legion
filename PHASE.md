@@ -1566,11 +1566,13 @@ container with `vm` booted with bhyve on the pod's network; and jailer's
 multi-arch index, each node running its own platform's image; and the
 first part of a web console (CONSOLE.md phase 1, `--console-listen`,
 `legion console login`): read-only, live, as the signed-in user. The
-port's `distinfo` and crates are made for v0.1.19, but it has not been
-through `poudriere testport` since v0.1.9. Waiting on the user: the port's
-submission, once their FreeBSD Bugzilla account exists.
+port was filed as a new port in FreeBSD's Bugzilla (bug 300441) at
+v0.1.9, and jailer's beside it (bug 300442).
 
-v0.2.0, the first minor version, carries the 202 commits since v0.1.19:
+v0.2.0, the first minor version, tagged on 2026-11-18 on 31f0743 from a
+clean record (the full manifest at profile `cluster` on the lab, 91 of 91
+passed, nothing left behind; `scripts/attest-check.sh` passed on the tag),
+carries the 202 commits since v0.1.19:
 the web console's phases 2 to 6
 (CONSOLE.md): editing and deploying, alerts and usage history, log search,
 deploy forms, compose import and templates, topology, settings, single
@@ -1591,4 +1593,7 @@ state under `/var/db/legion-local`, moved from jailer's on first use;
 `legion.local.*` labels, `legion-local/*` pf anchors, the `legionlocal0`
 bridge); a builder node runs the daemon's own binary (`--builder`, once
 `--jailer`), and jailer's root tests are in `crates/legion/tests/local_jail.rs`.
+jailer's repository is archived, and its port report (bug 300442) was
+withdrawn on 2026-11-18; the port's `distinfo` and crates are made for
+v0.2.0, and bug 300441 is to be updated to it.
 
