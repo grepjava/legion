@@ -919,10 +919,17 @@ fn a_replicated_volume_carries_on_from_its_copy_when_its_host_is_lost() {
     });
     let copy = replica(&lab)["snapshot"].as_str().unwrap().to_owned();
     eprintln!("db-0 on {from}, its replica on {other} at {copy}");
+    // That copy, or the next one if it came in between: each copy is sent
+    // onto the last and the one before is let go, every 10 s.
+    let stamp = |s: &str| {
+        s.rsplit_once("@legion-replica-")
+            .and_then(|(_, t)| t.trim().parse::<u64>().ok())
+    };
+    let copied = stamp(&format!("@{copy}")).expect("a replica snapshot's name");
+    let held = lab.held(other);
     assert!(
-        lab.held(other).contains(&copy),
-        "the replica's snapshot on {other}: {}",
-        lab.held(other)
+        held.lines().filter_map(stamp).any(|t| t >= copied),
+        "the replica's snapshot {copy}, or a later one, on {other}: {held}"
     );
     // Written after the copy that will be taken over, so possibly lost:
     // the test asks only for what came before.
