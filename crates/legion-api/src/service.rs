@@ -216,6 +216,24 @@ impl Spec for ServiceSpec {
                 format!("volume {name:?}: only a stateful service's tasks claim volumes"),
             ));
         }
+        // A replica the leader hands the data to on its own: only safe when
+        // the old node's agent has surely stopped the tasks writing to it.
+        if self.pod.on_partition != OnPartition::Stop
+            && let Some((name, _)) = self.pod.claims().find(|(_, c)| {
+                c.replica
+                    .as_ref()
+                    .is_some_and(|r| r.failover == crate::volume::Failover::Automatic)
+            })
+        {
+            return Err(Invalid::new(
+                "pod.onPartition",
+                format!(
+                    "volume {name:?}: a replica with `failover: automatic` needs \
+                     `onPartition: stop`, so a node cut off stops writing before its \
+                     replica takes over"
+                ),
+            ));
+        }
         self.placement.admit("placement")?;
         if let Some(a) = &self.autoscale {
             if self.mode != ServiceMode::Replicated {

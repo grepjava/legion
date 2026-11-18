@@ -386,6 +386,7 @@ mod tests {
             replica: Some(Replica {
                 node: node.map(str::to_owned),
                 every_seconds: Some(60),
+                ..Default::default()
             }),
             ..Default::default()
         }

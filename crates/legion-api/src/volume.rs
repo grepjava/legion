@@ -51,6 +51,30 @@ pub struct Replica {
     /// [`Replica::MIN_EVERY`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub every_seconds: Option<u32>,
+    /// Who hands the Volume to the replica when the node holding the data
+    /// is gone: `manual` (the default), the operator, by removing the node;
+    /// `automatic`, the leader, once the node has been down long enough
+    /// that its agent has stopped the tasks using it. Automatic needs every
+    /// task using the Volume to be one that must not run twice
+    /// (`onPartition: stop`), so nothing writes to the old copy as the
+    /// replica takes over (docs/PARTITIONS.md).
+    #[serde(default, skip_serializing_if = "Failover::is_manual")]
+    pub failover: Failover,
+}
+
+/// Who hands a Volume to its replica: see [`Replica::failover`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Failover {
+    #[default]
+    Manual,
+    Automatic,
+}
+
+impl Failover {
+    pub fn is_manual(&self) -> bool {
+        *self == Failover::Manual
+    }
 }
 
 impl Replica {
