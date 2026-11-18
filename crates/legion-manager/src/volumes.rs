@@ -8,6 +8,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use legion_api::node::{NodeSpec, NodeStatus};
 use legion_api::volume::{VolumeBackupHeader, VolumeDriver, VolumeSpec, VolumeStatus};
 use legion_api::{Kind, Object, ObjectKey};
 use legion_proto::v1::session_frame::Frame;
@@ -17,8 +18,9 @@ use legion_proto::v1::volumes_client::VolumesClient;
 use legion_proto::v1::volumes_server::Volumes;
 use legion_proto::v1::{
     BackupChunk, InputClosed, SessionError, SessionFrame, SessionOffer, SessionOpen,
-    VolumeBackupRequest, VolumeExport, VolumeImport, VolumeRestoreChunk, VolumeRestoreResponse,
-    VolumeRestoreStart, VolumeSnapshotAction, VolumeSnapshotRequest, VolumeSnapshotResponse,
+    VolumeBackupRequest, VolumeExport, VolumeImport, VolumePromoteRequest, VolumePromoteResponse,
+    VolumeRestoreChunk, VolumeRestoreResponse, VolumeRestoreStart, VolumeSnapshotAction,
+    VolumeSnapshotRequest, VolumeSnapshotResponse,
 };
 use legion_store::{Command, Outcome, Precondition};
 use tokio::sync::mpsc;
@@ -427,6 +429,84 @@ impl Volumes for VolumesService {
         self.api.audit_end(audit, result)
     }
 
+    async fn promote(
+        &self,
+        req: Request<VolumePromoteRequest>,
+    ) -> Result<Response<VolumePromoteResponse>, Status> {
+        let audit = self.api.audit_point(
+            &req,
+            "volume-promote",
+            crate::audit::target("Volume", &req.get_ref().namespace, &req.get_ref().name),
+        );
+        let result = async {
+            let caller = self.api.caller(&req)?;
+            if let Some(mut leader) = self.leader(&req)? {
+                return leader
+                    .promote(forwarded_for(req.into_inner(), &caller)?)
+                    .await;
+            }
+            let VolumePromoteRequest { namespace, name } = req.into_inner();
+            let namespace = if namespace.is_empty() {
+                "default".to_owned()
+            } else {
+                namespace
+            };
+            check_namespace(&namespace)?;
+            self.api.consistent().await?;
+            caller.check(&self.api.store, Verb::Write, Kind::Volume, &namespace)?;
+            let key = ObjectKey::new(Kind::Volume, &namespace, &name);
+            let (mut o, _, status) = self.volume(&key)?.ok_or_else(|| {
+                Status::not_found(format!("no volume {name} in namespace {namespace}"))
+            })?;
+            let node_state = |n: &str| -> Result<Option<(NodeSpec, NodeStatus)>, Status> {
+                Ok(self
+                    .api
+                    .store
+                    .get(&ObjectKey::new(Kind::Node, "", n))
+                    .map_err(internal)?
+                    .map(|o| {
+                        (
+                            legion_api::parse(&o.spec).unwrap_or_default(),
+                            serde_json::from_value(o.status).unwrap_or_default(),
+                        )
+                    }))
+            };
+            let holder = node_state(&status.node)?;
+            let who = match &caller {
+                crate::authz::Caller::User(u) => u.clone(),
+                crate::authz::Caller::All => "an admin".to_owned(),
+            };
+            let next = promoted(&name, &status, holder.as_ref(), &who, |n| {
+                node_state(n).ok().flatten()
+            })
+            .map_err(Status::failed_precondition)?;
+            let answer = VolumePromoteResponse {
+                node: next.node.clone(),
+                promoted: next.promoted.clone(),
+            };
+            o.status = serde_json::to_value(&next).map_err(internal)?;
+            let version = o.metadata.version;
+            match self
+                .api
+                .write(Command::Put {
+                    object: o,
+                    precondition: Precondition::Version(version),
+                })
+                .await?
+            {
+                Outcome::Written(_) => {
+                    tracing::warn!(volume = %key, to = %answer.node, by = %who, "volume promoted by hand");
+                    Ok(Response::new(answer))
+                }
+                _ => Err(Status::aborted(format!(
+                    "volume {name} changed as it was promoted: look again and try again"
+                ))),
+            }
+        }
+        .await;
+        self.api.audit_end(audit, result)
+    }
+
     async fn snapshot(
         &self,
         req: Request<VolumeSnapshotRequest>,
@@ -537,6 +617,92 @@ impl Volumes for VolumesService {
             None => result,
         }
     }
+}
+
+/// A Volume handed to its replica by `who` (`Volumes.Promote`): what its
+/// status becomes, or why it can't be. Its node must be down, as for
+/// `failover: automatic`; the replica a copy of that node's data, on a
+/// node ready to take it. The old copy joins the leftovers, dropped once
+/// its node is back, and the replica's node holds the Volume from then on.
+pub(crate) fn promoted(
+    name: &str,
+    status: &VolumeStatus,
+    holder: Option<&(NodeSpec, NodeStatus)>,
+    who: &str,
+    node: impl Fn(&str) -> Option<(NodeSpec, NodeStatus)>,
+) -> Result<VolumeStatus, String> {
+    use legion_api::node::{Availability, NodeState};
+    let from = status.node.as_str();
+    if !status.lost.is_empty() {
+        return Err(format!("volume {name} is lost: restore a backup into it"));
+    }
+    if from.is_empty() {
+        return Err(format!("volume {name} has no data yet: nothing to promote"));
+    }
+    if status.migration.is_some() {
+        return Err(format!("volume {name} is moving: let the move end first"));
+    }
+    match holder.map(|(_, s)| s.state) {
+        Some(NodeState::Down) => {}
+        Some(state) => {
+            return Err(format!(
+                "{from}, holding volume {name}, is {}: only a Volume whose node is down is promoted;                  move it instead (legion volume move)",
+                state.as_str()
+            ));
+        }
+        // Gone already: mark_lost has done what can be done.
+        None => {
+            return Err(format!(
+                "{from}, holding volume {name}, is no node of the cluster"
+            ));
+        }
+    }
+    let Some(r) = status.replica.as_ref() else {
+        return Err(format!("volume {name} has no replica"));
+    };
+    if r.snapshot.is_empty() || r.from != from {
+        return Err(format!(
+            "volume {name}'s replica on {} holds no copy of {from}'s data yet",
+            r.node
+        ));
+    }
+    let usable = node(&r.node).is_some_and(|(spec, s)| {
+        s.state == NodeState::Ready
+            && spec.availability == Availability::Active
+            && s.host_blocked(&spec).is_none()
+    });
+    if !usable {
+        return Err(format!(
+            "{}, keeping volume {name}'s replica, is not ready and active",
+            r.node
+        ));
+    }
+    let when = r
+        .taken_ms
+        .map(|ms| legion_api::clock::format(ms / 1000))
+        .unwrap_or_default();
+    let mut leftovers: Vec<String> = status
+        .leftovers
+        .iter()
+        .filter(|n| **n != r.node)
+        .cloned()
+        .collect();
+    if !leftovers.iter().any(|n| n == from) {
+        leftovers.push(from.to_owned());
+    }
+    Ok(VolumeStatus {
+        node: r.node.clone(),
+        dataset: String::new(),
+        migration: None,
+        leftovers,
+        lost: String::new(),
+        replica: None,
+        promoted: format!(
+            "by {who}, {from} being down: from the replica of its data on {}, taken {when}",
+            r.node
+        ),
+        export: status.export.clone(),
+    })
 }
 
 /// Marks the Volumes whose data was on `node` lost (`status.lost`), as
@@ -655,4 +821,98 @@ pub(crate) async fn mark_lost(api: &ApiService, node: &str) -> Result<(), Status
 
 fn internal(e: impl std::fmt::Display) -> Status {
     Status::internal(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use legion_api::node::{Availability, NodeState};
+    use legion_api::volume::ReplicaStatus;
+
+    fn node(state: NodeState, availability: Availability) -> (NodeSpec, NodeStatus) {
+        (
+            NodeSpec {
+                availability,
+                ..Default::default()
+            },
+            NodeStatus {
+                state,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn on_n1() -> VolumeStatus {
+        VolumeStatus {
+            node: "n1".into(),
+            leftovers: vec!["n2".into()],
+            replica: Some(ReplicaStatus {
+                node: "n2".into(),
+                snapshot: "legion-replica-1000".into(),
+                from: "n1".into(),
+                taken_ms: Some(1_000_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_volume_is_promoted_by_hand_only_while_its_node_is_down() {
+        let ready = |_: &str| Some(node(NodeState::Ready, Availability::Active));
+        let down = node(NodeState::Down, Availability::Active);
+        let s = promoted("db", &on_n1(), Some(&down), "ed", ready).unwrap();
+        assert_eq!(s.node, "n2");
+        assert_eq!(
+            s.leftovers,
+            ["n1"],
+            "the old copy to drop, not the new home"
+        );
+        assert_eq!(s.replica, None, "a new replica is made elsewhere");
+        assert!(
+            s.promoted
+                .starts_with("by ed, n1 being down: from the replica of its data on n2"),
+            "{}",
+            s.promoted
+        );
+        // Not while it may still be heard from.
+        for state in [NodeState::Ready, NodeState::Suspect] {
+            let up = node(state, Availability::Active);
+            let e = promoted("db", &on_n1(), Some(&up), "ed", ready).unwrap_err();
+            assert!(e.contains("only a Volume whose node is down"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_promotion_needs_a_copy_of_that_nodes_data_where_it_can_run() {
+        let down = node(NodeState::Down, Availability::Active);
+        let ready = |_: &str| Some(node(NodeState::Ready, Availability::Active));
+        let mut moved = on_n1();
+        moved.replica.as_mut().unwrap().from = "n3".into();
+        assert!(
+            promoted("db", &moved, Some(&down), "ed", ready)
+                .unwrap_err()
+                .contains("holds no copy of n1's data")
+        );
+        let mut none = on_n1();
+        none.replica = None;
+        assert!(
+            promoted("db", &none, Some(&down), "ed", ready)
+                .unwrap_err()
+                .contains("has no replica")
+        );
+        let paused = |_: &str| Some(node(NodeState::Ready, Availability::Pause));
+        assert!(
+            promoted("db", &on_n1(), Some(&down), "ed", paused)
+                .unwrap_err()
+                .contains("not ready and active")
+        );
+        let mut lost = on_n1();
+        lost.lost = "its node was removed".into();
+        assert!(
+            promoted("db", &lost, Some(&down), "ed", ready)
+                .unwrap_err()
+                .contains("is lost")
+        );
+    }
 }

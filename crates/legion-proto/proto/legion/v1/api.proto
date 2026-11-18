@@ -710,6 +710,24 @@ service Volumes {
   // Lists, creates, rolls back or deletes ZFS snapshots of a Volume on the
   // node holding it.
   rpc Snapshot(VolumeSnapshotRequest) returns (VolumeSnapshotResponse);
+  // Hands a Volume whose node is down to its replica, by hand: the Volume
+  // carries on from the replica's last copy of that node's data, on the
+  // replica's node, as `failover: automatic` does on its own once the
+  // tasks there have surely stopped. The caller answers for that here:
+  // whatever still runs on the node writes to a copy no longer the
+  // Volume's, dropped once the node is back.
+  rpc Promote(VolumePromoteRequest) returns (VolumePromoteResponse);
+}
+
+message VolumePromoteRequest {
+  string namespace = 1;
+  string name = 2;
+}
+
+message VolumePromoteResponse {
+  // The node the Volume carries on on, and the status's account of it.
+  string node = 1;
+  string promoted = 2;
 }
 
 message VolumeSnapshotRequest {
