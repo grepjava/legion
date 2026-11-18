@@ -114,7 +114,7 @@ export function columns(kind: string): Column[] {
             const r = o.status?.replica;
             if (!r) return '';
             const at = r.takenMs ? new Date(r.takenMs).toLocaleString() : t('no copy yet');
-            return [r.node, at, r.message].filter((x) => x).join(', ');
+            return [r.state ?? 'pending', r.node, at].filter((x) => x).join(' · ');
           }
         }
       ];
@@ -188,6 +188,7 @@ export function tone(state: string): string {
     case 'suspect':
     case 'draining':
     case 'paused':
+    case 'stale':
       return 'wait';
     case 'failed':
     case 'rejected':

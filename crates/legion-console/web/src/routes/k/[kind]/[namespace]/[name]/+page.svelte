@@ -16,6 +16,7 @@
   import Quotas from '#lib/Quotas.svelte';
   import UsageCharts from '#lib/UsageCharts.svelte';
   import VolumeData from '#lib/VolumeData.svelte';
+  import VolumeReplica from '#lib/VolumeReplica.svelte';
   import BuildLog from '#lib/BuildLog.svelte';
   import Events from '#lib/Events.svelte';
   import { cannotWrite, openWorkbench, session } from '#lib/session.svelte.ts';
@@ -38,6 +39,7 @@
     | 'files'
     | 'terminal'
     | 'data'
+    | 'replica'
     | 'buildlog'
     | 'events'
     | 'yaml' =
@@ -67,12 +69,18 @@
     );
   });
 
+  // A Volume that keeps a replica, or kept one, has a page for it.
+  const replicated = $derived.by(() => {
+    const o = object as LObject | null;
+    return !!(o?.spec?.replica || o?.status?.replica);
+  });
   const tabs = $derived([
     { id: 'details', label: t('Details') },
     ...(kind === 'Service' ? [{ id: 'rollout', label: t('Rollout') }] : []),
     ...(kind === 'Service' || kind === 'Job' ? [{ id: 'search', label: t('Logs') }] : []),
     ...(kind === 'Node' ? [{ id: 'tasks', label: t('Tasks') }] : []),
     ...(kind === 'Volume' ? [{ id: 'data', label: t('Data') }] : []),
+    ...(kind === 'Volume' && replicated ? [{ id: 'replica', label: t('Replica') }] : []),
     ...(kind === 'Namespace' ? [{ id: 'quota', label: t('Quota') }] : []),
     ...(kind === 'Task' || kind === 'Service' || kind === 'Node' ? [{ id: 'usage', label: t('Telemetry') }] : []),
     ...(kind === 'Task'
@@ -302,6 +310,8 @@
     <Rollout service={object} />
   {:else if tab === 'data'}
     <VolumeData volume={object} />
+  {:else if tab === 'replica'}
+    <VolumeReplica volume={object} />
   {:else if tab === 'logs'}
     <TaskLogs task={object} />
   {:else if tab === 'files'}
