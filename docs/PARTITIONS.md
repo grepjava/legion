@@ -170,8 +170,17 @@ Where an old copy of a workload and its replacement can run at once today:
    heartbeats go unanswered, so pods with `onPartition: stop` stop, as on
    any node cut off.
 
+5. **A node whose daemon died but whose pods run on** (pods outlive the
+   daemon, so that it can be restarted or upgraded under them): after
+   16 s it looks like a node cut off, but no agent is there to stop its
+   `onPartition: stop` pods, so their replacements run beside them. A
+   Volume with `failover: automatic` is handed to its replica the same
+   way, and what the old pods write after that is dropped with the old
+   copy once the node is back.
+
 A task bound to a volume used by one node at a time doesn't run twice
-during a split: its replacement waits for the volume.
+during a split: its replacement waits for the volume, unless the volume's
+replica takes over (below).
 
 ## Pods that must not run twice
 
@@ -203,6 +212,38 @@ A new leader starts the wait anew when it first sees the orphaned task,
 which only makes it longer. Not covered: an agent from before v0.1.15
 doesn't stop such a pod, so its replacement runs beside it, as with any
 other pod.
+
+## A volume handed to its replica
+
+A ZFS volume can keep a replica on another node, copied every
+`everySeconds` (DESIGN.md, Volume replicas). By default the replica takes
+over only when the operator removes the node holding the data, the word
+that it has stopped. With `failover: automatic` the leader does it on its
+own, but only when nothing can still write to the old copy:
+
+```yaml
+pod:
+  onPartition: stop
+  stopGracePeriod: 10s
+  volumes:
+    - name: data
+      claim: { size: 10Gi, replica: { everySeconds: 30, failover: automatic } }
+```
+
+Once the node is down and every task there using the volume is one that
+must not run twice, orphaned for its stop grace period and 5 s more (the
+same wait as before its replacement starts, above), the volume carries on
+from the replica's last copy and its task starts there. What was written
+after that copy is lost, at most `everySeconds` of it; `status.promoted`
+says from what copy and that it was automatic. A claim asking for it
+without `onPartition: stop` is refused. A task that runs on when cut off,
+or one not yet orphaned, keeps the volume where it is, as does a replica
+of data that moved since or one on a node not ready and active. The node,
+once back, starts nothing again and drops its old copy. Tested:
+`a_volume_fails_over_to_its_replica_once_its_node_has_stopped_writing`
+and `a_volume_does_not_fail_over_while_anything_may_write_to_it` (the
+planner), `a_replicated_volume_fails_over_on_its_own_when_its_node_is_cut_off`
+(agents in a real cluster, cut off by a silent link).
 
 ## A volume an orphaned task used
 
