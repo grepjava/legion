@@ -9,6 +9,7 @@
   // (when node telemetry is in scope) ZFS pool space and network throughput.
   import { usageHistory, type NodeSeries, type TaskSeries } from '#lib/api.ts';
   import Chart from '#lib/Chart.svelte';
+  import { sumHeld } from '#lib/series.ts';
   import { t, tn } from '#lib/i18n.svelte.ts';
 
   let {
@@ -59,38 +60,20 @@
     };
   });
 
-  // Summed per sample time, rounded to the step: tasks' samples fall
-  // within a step of each other.
+  // Summed per step, each task and node counted once in every step it was
+  // sampled in, though their samples fall apart (lib/series.ts).
   const summed = $derived.by(() => {
-    const cpu = new Map<number, number>();
-    const mem = new Map<number, number>();
-    const zfs = new Map<number, number>();
-    const net = new Map<number, number>();
-    for (const ts of series.filter(pick)) {
-      for (const [at, c, m] of ts.samples) {
-        const k = Math.round(at / step) * step;
-        cpu.set(k, (cpu.get(k) ?? 0) + c);
-        mem.set(k, (mem.get(k) ?? 0) + m);
-      }
-    }
-    if (!task) {
-      for (const ns of nodeSeries) {
-        if (nodeFilter && ns.node !== nodeFilter) continue;
-        for (const [at, used, , rx, tx] of ns.samples) {
-          const k = Math.round(at / step) * step;
-          zfs.set(k, (zfs.get(k) ?? 0) + used);
-          net.set(k, (net.get(k) ?? 0) + rx + tx);
-        }
-      }
-    }
-    const sorted = (m: Map<number, number>) =>
-      [...m.entries()].sort((a, b) => a[0] - b[0]) as [number, number][];
+    const picked = series.filter(pick);
+    const nodesIn = task ? [] : nodeSeries.filter((ns) => !nodeFilter || ns.node === nodeFilter);
     return {
-      cpu: sorted(cpu),
-      mem: sorted(mem),
-      zfs: sorted(zfs),
-      net: sorted(net),
-      tasks: series.filter(pick).length
+      cpu: sumHeld(picked.map((ts) => ts.samples.map(([at, c]) => [at, c] as [number, number])), step),
+      mem: sumHeld(picked.map((ts) => ts.samples.map(([at, , m]) => [at, m] as [number, number])), step),
+      zfs: sumHeld(nodesIn.map((ns) => ns.samples.map(([at, used]) => [at, used] as [number, number])), step),
+      net: sumHeld(
+        nodesIn.map((ns) => ns.samples.map(([at, , , rx, tx]) => [at, rx + tx] as [number, number])),
+        step
+      ),
+      tasks: picked.length
     };
   });
 
