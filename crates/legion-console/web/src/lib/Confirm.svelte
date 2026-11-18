@@ -31,8 +31,12 @@
     }
   });
 
+  // Closed first, so focus is back on what asked before the answer goes:
+  // the action that follows marks that button busy, not this dialog's.
   function answer(ok: boolean) {
-    confirming.now?.resolve(ok && !blocked);
+    const yes = ok && !blocked;
+    dialog?.close();
+    confirming.now?.resolve(yes);
   }
 </script>
 

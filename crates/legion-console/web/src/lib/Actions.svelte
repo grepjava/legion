@@ -8,6 +8,7 @@
   import { cannotWrite } from './session.svelte.ts';
   import { t } from './i18n.svelte.ts';
   import { ask } from './confirm.svelte.ts';
+  import { busyWhile, toast } from './toast.svelte.ts';
 
   let { object, scoped }: { object: LObject; scoped: boolean } = $props();
   const kind = $derived(object.kind);
@@ -15,7 +16,6 @@
   const name = $derived(object.metadata.name);
   const why = $derived(cannotWrite(scoped ? '' : ns));
   const label = $derived(`${kind} ${ns ? `${ns}/` : ''}${name}`);
-  let message = $state('');
   let error = $state('');
   let busy = $state(false);
   let replicas: number = $state(0);
@@ -27,12 +27,13 @@
     replicas = stored;
   });
 
+  // Done, it says so in a toast; failed, here beside the buttons, until
+  // the next try.
   async function act(what: () => Promise<string>) {
     busy = true;
     error = '';
-    message = '';
     try {
-      message = await what();
+      toast(await busyWhile(what));
     } catch (e) {
       error = (e as Error).message;
     } finally {
@@ -227,4 +228,3 @@
 </div>
 {#if why}<p class="muted">{t('Read only: {why}.', { why })}</p>{/if}
 {#if error}<p class="error" role="alert">{error}</p>{/if}
-{#if message}<p class="ok" role="status">{message}</p>{/if}

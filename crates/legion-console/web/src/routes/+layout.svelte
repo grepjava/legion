@@ -14,6 +14,7 @@
   } from '#lib/api.ts';
   import CommandPalette from '#lib/CommandPalette.svelte';
   import Confirm from '#lib/Confirm.svelte';
+  import Toasts from '#lib/Toasts.svelte';
   import FreeBsdLogo from '#lib/FreeBsdLogo.svelte';
   import Shortcuts, { CHORDS } from '#lib/Shortcuts.svelte';
   import { routeDrop, sortable } from '#lib/drop.svelte.ts';
@@ -474,6 +475,7 @@
   <p class="sr-only" aria-live="polite">{said}</p>
   <CommandPalette />
   <Confirm />
+  <Toasts />
   <Shortcuts bind:open={helpOpen} />
   {#if dropNote}
     <p class="toast" role="status">{dropNote}</p>

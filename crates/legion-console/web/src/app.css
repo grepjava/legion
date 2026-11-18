@@ -1460,3 +1460,32 @@ h1.with-icon > .ico {
 [role='tab'][aria-selected='true'] > .ico {
   color: var(--text);
 }
+
+/* A button whose call runs (lib/toast.svelte.ts busyWhile): a small ring
+   turning beside its label, the button otherwise as it was. */
+button[aria-busy='true'] {
+  position: relative;
+  cursor: progress;
+}
+button[aria-busy='true']::after {
+  content: '';
+  display: inline-block;
+  width: 0.8em;
+  height: 0.8em;
+  margin-left: 0.45em;
+  vertical-align: -0.1em;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: busy-turn 0.7s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  button[aria-busy='true']::after {
+    animation-duration: 2.4s;
+  }
+}
+@keyframes busy-turn {
+  to {
+    transform: rotate(360deg);
+  }
+}
