@@ -260,6 +260,7 @@
           <dt>{c.label}</dt>
           <dd>
             {#if c.state}<span class="state {tone(c.value(object))}">{c.value(object)}</span>
+            {:else if c.href?.(object)}<a href={c.href(object)}>{c.value(object)}</a>
             {:else}{c.value(object)}{/if}
           </dd>
         {/if}
@@ -271,10 +272,6 @@
             >{object.spec.service}</a
           >
         </dd>
-      {/if}
-      {#if kind === 'Task' && object.spec?.node}
-        <dt>{t('On node')}</dt>
-        <dd><a href="/k/Node/_/{object.spec.node}">{object.spec.node}</a></dd>
       {/if}
       <dt>{t('Version')}</dt>
       <dd>{t('{version} (generation {generation})', { version: object.metadata.version, generation: object.metadata.generation })}</dd>

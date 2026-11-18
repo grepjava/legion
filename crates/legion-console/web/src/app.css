@@ -453,8 +453,13 @@ button:hover > .ico,
 .cmd-trigger:hover .ico {
   color: var(--text);
 }
-button > .ico + * {
-  margin-left: 0.1rem;
+/* An icon and its words, spaced the same whether the words are bare text
+   or an element. */
+button:has(> .ico),
+a.button:has(> .ico) {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
 }
 .who {
   display: flex;

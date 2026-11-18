@@ -116,6 +116,8 @@
             <td>
               {#if c.state}
                 <span class="state {tone(c.value(o))}">{c.value(o)}</span>
+              {:else if c.href?.(o)}
+                <a href={c.href(o)}>{c.value(o)}</a>
               {:else}
                 {c.value(o)}
               {/if}

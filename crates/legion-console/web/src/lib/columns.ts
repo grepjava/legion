@@ -6,7 +6,12 @@ export interface Column {
   value: (o: LObject) => string;
   /** A state, shown with its colour. */
   state?: boolean;
+  /** Where the value leads, when it names another object: a node. */
+  href?: (o: LObject) => string;
 }
+
+/** A node's page, for a column naming one. */
+const nodeHref = (name: unknown) => (name ? `/k/Node/_/${encodeURIComponent(String(name))}` : '');
 
 const s = (v: unknown) => (v === undefined || v === null ? '' : String(v));
 
@@ -63,7 +68,7 @@ export function columns(kind: string): Column[] {
           state: true
         },
         { label: t('Ready'), value: (o) => (o.status?.ready ? t('yes') : '') },
-        { label: t('Node'), value: (o) => s(o.spec?.node) },
+        { label: t('Node'), value: (o) => s(o.spec?.node), href: (o) => nodeHref(o.spec?.node) },
         { label: t('IP'), value: (o) => s(o.status?.ip) },
         { label: t('Restarts'), value: (o) => s(o.status?.restarts ?? 0) },
         { label: t('Message'), value: (o) => s(o.status?.message) }
@@ -105,7 +110,7 @@ export function columns(kind: string): Column[] {
     case 'Volume':
       return [
         { label: t('Driver'), value: (o) => s(o.spec?.driver ?? 'zfs') },
-        { label: t('Node'), value: (o) => s(o.status?.node) },
+        { label: t('Node'), value: (o) => s(o.status?.node), href: (o) => nodeHref(o.status?.node) },
         { label: t('Size'), value: (o) => s(o.spec?.size) },
         { label: t('Lost'), value: (o) => s(o.status?.lost) },
         {
@@ -157,7 +162,7 @@ export function columns(kind: string): Column[] {
           label: t('Source'),
           value: (o) => s(o.spec?.source?.git?.url ?? (o.spec?.source?.containerfile ? t('Containerfile') : ''))
         },
-        { label: t('Node'), value: (o) => s(o.status?.node) },
+        { label: t('Node'), value: (o) => s(o.status?.node), href: (o) => nodeHref(o.status?.node) },
         { label: t('Pushed'), value: (o) => s(o.status?.pinned) },
         { label: t('Why'), value: (o) => s(o.status?.message) }
       ];
