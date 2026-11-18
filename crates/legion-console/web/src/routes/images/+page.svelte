@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { ask } from '#lib/confirm.svelte.ts';
   // Docker-Desktop Jail Images & GHCR Packaging Hub:
   // 1) Cluster Node Images: cached OCI jail images across nodes, .tar export,
   //    .tar upload/load, re-tag & push to ghcr.io, pre-pull, remove, prune.
@@ -208,7 +209,7 @@
   }
 
   async function pruneNodes() {
-    if (!confirm(t('Prune unreferenced image layers on {target}?', { target: nodeFilter || t('all ready nodes') }))) {
+    if (!(await ask(t('Prune unreferenced image layers on {target}?', { target: nodeFilter || t('all ready nodes') })))) {
       return;
     }
     busy = true;
@@ -697,7 +698,7 @@
                     class="sm danger"
                     disabled={busy}
                     onclick={async () => {
-                      if (!confirm(t('Remove cached image {image} from {node}?', { image: img.reference, node: img.node }))) return;
+                      if (!(await ask(t('Remove cached image {image} from {node}?', { image: img.reference, node: img.node })))) return;
                       busy = true;
                       try {
                         await api.nodeImageOp({ op: 'remove', node: img.node, image: img.reference });

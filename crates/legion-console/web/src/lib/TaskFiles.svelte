@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { ask } from './confirm.svelte.ts';
   // A task's files: its container's directories browsed, a file downloaded
   // or uploaded in place (`legion files`, `legion cp`). Its Volumes are
   // there at their mount paths. Links are shown, never followed.
@@ -58,7 +59,7 @@
     const file = upload?.[0];
     if (!file) return;
     const to = join(path, file.name);
-    if (entries.some((x) => x.name === file.name) && !confirm(t('Replace {path}?', { path: to }))) return;
+    if (entries.some((x) => x.name === file.name) && !(await ask(t('Replace {path}?', { path: to })))) return;
     busy = true;
     message = '';
     try {

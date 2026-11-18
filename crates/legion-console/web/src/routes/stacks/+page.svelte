@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { ask } from '#lib/confirm.svelte.ts';
   // Stacks: the services a compose file became (`legion stack deploy`, the
   // Import page), labelled `legion.stack`, shown and stopped, started or
   // removed together. Removing one keeps its Volumes and their data, as
@@ -71,7 +72,7 @@
     );
 
   async function remove(st: Stack) {
-    if (!confirm(t('Remove stack {stack}: its services, Secrets and Configs? Its Volumes and their data stay.', { stack: st.name })))
+    if (!(await ask(t('Remove stack {stack}: its services, Secrets and Configs? Its Volumes and their data stay.', { stack: st.name }))))
       return;
     busy = `${st.namespace}/${st.name}`;
     error = '';
@@ -128,8 +129,9 @@
         type="button"
         disabled={!!why || !!busy || st.stopped === st.services.length}
         title={why ?? ''}
-        onclick={() =>
-          confirm(t('Stop every service of {stack}?', { stack: st.name })) && stopAll(st, true)}
+        onclick={async () =>
+          (await ask(t('Stop every service of {stack}?', { stack: st.name }), { action: t('Stop all') })) &&
+          stopAll(st, true)}
         >{t('Stop all')}</button
       >
       <button

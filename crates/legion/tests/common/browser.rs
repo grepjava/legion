@@ -295,6 +295,26 @@ impl Browser {
             matches!(b.button(t), Some((true, _)))
         });
         self.eval(&format!("H.button({t:?}).click()"));
+        self.confirm_if_asked();
+    }
+
+    /// Presses the action of the console's confirmation (lib/Confirm.svelte)
+    /// if the last click opened it, as a user who meant it would; one asking
+    /// for a name typed is left for the test to answer.
+    pub fn confirm_if_asked(&mut self) {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            let r = self.eval(
+                "(() => { const d = document.querySelector('dialog.confirm[open]');
+                   if (!d) return 'none';
+                   if (d.querySelector('input')) return 'typed';
+                   d.querySelector('button[type=submit]').click(); return 'pressed'; })()",
+            );
+            if r != json!("none") {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     /// Types `value` into the field labelled `label`, as a user does.

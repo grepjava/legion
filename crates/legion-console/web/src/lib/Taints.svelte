@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { ask } from './confirm.svelte.ts';
   // A node's taints: NoSchedule keeps new tasks off, PreferNoSchedule
   // makes it a last choice, NoExecute moves running tasks away too. A task
   // goes there only with a toleration. Changed over the version shown.
@@ -16,7 +17,7 @@
   let error = $state('');
 
   async function write(next: Taint[], what: string) {
-    if (!confirm(what)) return;
+    if (!(await ask(what))) return;
     error = '';
     const spec = { ...$state.snapshot(node.spec), taints: next };
     try {

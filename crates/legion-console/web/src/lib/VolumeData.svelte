@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { ask } from './confirm.svelte.ts';
   // A Volume's data, as `legion volume backup`, `restore`, and `snapshot`
   // manage it: live ZFS snapshots (create, rollback, delete), a crash-consistent
   // backup downloaded as a file, and a backup file restored onto a node.
@@ -71,12 +72,12 @@
 
   async function rollbackSnapshot(snap: string) {
     if (
-      !confirm(
+      !(await ask(
         t(
           'Roll {name} back to @{snapshot}? Newer data and newer snapshots on this dataset will be discarded.',
           { name, snapshot: snap }
         )
-      )
+      ))
     ) {
       return;
     }
@@ -95,7 +96,7 @@
   }
 
   async function deleteSnapshot(snap: string) {
-    if (!confirm(t('Delete snapshot @{snapshot} from {name}?', { snapshot: snap, name }))) return;
+    if (!(await ask(t('Delete snapshot @{snapshot} from {name}?', { snapshot: snap, name })))) return;
     busy = true;
     error = '';
     message = '';
@@ -120,7 +121,7 @@
           file: f.name,
           node
         });
-    if (!confirm(what)) return;
+    if (!(await ask(what))) return;
     busy = true;
     error = '';
     message = '';

@@ -7,6 +7,7 @@
   import { api, type LObject } from './api.ts';
   import { cannotWrite } from './session.svelte.ts';
   import { t } from './i18n.svelte.ts';
+  import { ask } from './confirm.svelte.ts';
 
   let { object, scoped }: { object: LObject; scoped: boolean } = $props();
   const kind = $derived(object.kind);
@@ -54,10 +55,12 @@
 
   async function remove() {
     const consequence = consequences()[kind];
-    const ask = consequence
+    const ask_ = consequence
       ? t('Delete {label}? {consequence}', { label, consequence })
       : t('Delete {label}?', { label });
-    if (!confirm(ask)) return;
+    // What can't be come back from asks for its name typed.
+    const lasting = ['Volume', 'Namespace', 'Node'].includes(kind);
+    if (!(await ask(ask_, { action: t('Delete'), typed: lasting ? name : undefined }))) return;
     await act(async () => {
       await api.remove(kind, ns, name, object.metadata.version);
       await goto(`/k/${kind}`);
@@ -65,22 +68,23 @@
     });
   }
 
-  function availability(to: 'active' | 'pause' | 'drain') {
+  async function availability(to: 'active' | 'pause' | 'drain') {
     const done = {
       active: t('{name} activated', { name }),
       pause: t('{name} paused', { name }),
       drain: t('{name} draining', { name })
     }[to];
-    if (to === 'drain' && !confirm(t('Drain {name}? Its tasks move to other nodes.', { name }))) return;
+    if (to === 'drain' && !(await ask(t('Drain {name}? Its tasks move to other nodes.', { name }), { action: t('Drain') })))
+      return;
     return set('availability', to, done, t('{name} is already {to}', { name, to }));
   }
 
-  function role(to: 'manager' | 'worker') {
-    const ask =
+  async function role(to: 'manager' | 'worker') {
+    const what =
       to === 'manager'
         ? t('Promote {name} to a manager? Its daemon takes the role up and starts again.', { name })
         : t('Demote {name} to a worker? Its daemon takes the role up and starts again.', { name });
-    if (!confirm(ask)) return;
+    if (!(await ask(what, { action: to === 'manager' ? t('Promote') : t('Demote') }))) return;
     return act(async () => {
       await api.nodeRole(name, to);
       return to === 'manager' ? t('{name} becomes a manager', { name }) : t('{name} becomes a worker', { name });
@@ -125,15 +129,17 @@
     <button
       disabled={!!why || busy || !object.status?.update}
       title={why ?? (object.status?.update ? t('Back to the spec before the latest update') : t('No update to roll back'))}
-      onclick={() =>
-        confirm(t('Roll {name} back to the spec before its latest update?', { name })) &&
+      onclick={async () =>
+        (await ask(t('Roll {name} back to the spec before its latest update?', { name }), { action: t('Roll back') })) &&
         act(async () => (await api.rollback(ns, name)).message)}>{t('Roll back')}</button
     >
     <button
       disabled={!!why || busy}
       title={why ?? t('New tasks on the same spec, replacing these as an update does')}
-      onclick={() =>
-        confirm(t('Restart {name}? Its tasks are replaced, as an update replaces them.', { name })) &&
+      onclick={async () =>
+        (await ask(t('Restart {name}? Its tasks are replaced, as an update replaces them.', { name }), {
+          action: t('Restart')
+        })) &&
         act(async () => (await api.restart(ns, name)).message)}>{t('Restart')}</button
     >
     <button
@@ -142,10 +148,10 @@
         (object.spec?.stopped
           ? t('Run its tasks again, as the spec says')
           : t('No tasks until it is started; the spec stays'))}
-      onclick={() =>
+      onclick={async () =>
         object.spec?.stopped
           ? set('stopped', false, t('{name} started', { name }), t('{name} already started', { name }))
-          : confirm(t('Stop {name}? Its tasks go until it is started.', { name })) &&
+          : (await ask(t('Stop {name}? Its tasks go until it is started.', { name }), { action: t('Stop') })) &&
             set('stopped', true, t('{name} stopped', { name }), t('{name} already stopped', { name }))}
       >{object.spec?.stopped ? t('Start') : t('Stop')}</button
     >
@@ -157,10 +163,12 @@
           : object.spec?.stopped
             ? t('Stopped: it has no tasks to pause')
             : t('Freeze its tasks where they are, out of its endpoints, until resumed'))}
-      onclick={() =>
+      onclick={async () =>
         object.spec?.paused
           ? set('paused', false, t('{name} resumed', { name }), t('{name} already resumed', { name }))
-          : confirm(t('Pause {name}? Its tasks are frozen and out of its endpoints until it is resumed.', { name })) &&
+          : (await ask(t('Pause {name}? Its tasks are frozen and out of its endpoints until it is resumed.', { name }), {
+              action: t('Pause')
+            })) &&
             set('paused', true, t('{name} paused', { name }), t('{name} already paused', { name }))}
       >{object.spec?.paused ? t('Resume') : t('Pause')}</button
     >
@@ -199,8 +207,11 @@
       <button
         disabled={!!why || busy || !moveTo}
         title={why ?? t('Moves its data to that node, stopping its tasks meanwhile')}
-        onclick={() =>
-          confirm(t('Move {name} to {node}? Its tasks stop while its data moves.', { name, node: moveTo })) &&
+        onclick={async () =>
+          (await ask(t('Move {name} to {node}? Its tasks stop while its data moves.', { name, node: moveTo }), {
+            action: t('Move'),
+            danger: true
+          })) &&
           set(
             'node',
             moveTo,

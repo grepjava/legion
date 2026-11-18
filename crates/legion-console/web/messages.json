@@ -703,6 +703,7 @@
   "Turn autolock on? A manager restarted from now on starts only after `legion unlock` with the key shown next: keep it safe.": "",
   "Turn off": "",
   "Turn on": "",
+  "Type {name} to go on": "",
   "UEFI (cloud-init)": "",
   "UID": "",
   "Unpin this page from the side bar": "",

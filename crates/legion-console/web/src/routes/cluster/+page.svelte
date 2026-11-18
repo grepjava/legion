@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { ask } from '#lib/confirm.svelte.ts';
   // What an admin runs the cluster with, as the CLI does it: the CA and
   // its rotation, join tokens, autolock, the control state's backup and
   // users' credentials.
@@ -40,11 +41,11 @@
 
   async function rotate() {
     if (
-      !confirm(
+      !(await ask(
         t(
           "Rotate the cluster CA? Every node moves to a new CA by itself, the old one trusted until all have. Then users' certificates and copies of admin.pem from before are refused: issue them again."
         )
-      )
+      ))
     )
       return;
     error = '';
@@ -56,11 +57,11 @@
   }
 
   async function token(role: 'manager' | 'worker', rotate: boolean) {
-    const ask =
+    const what =
       role === 'manager'
         ? t('Make a new manager join token? The one before stops working.')
         : t('Make a new worker join token? The one before stops working.');
-    if (rotate && !confirm(ask)) return;
+    if (rotate && !(await ask(what))) return;
     error = '';
     try {
       tokens[role] = (await api.joinToken(role, rotate)).token;
@@ -78,7 +79,7 @@
       rotate: t('Make a new autolock key? The one before stops working.'),
       show: ''
     }[action];
-    if (warn && !confirm(warn)) return;
+    if (warn && !(await ask(warn))) return;
     error = '';
     try {
       lockKey = (await api.autolock(action)).key;

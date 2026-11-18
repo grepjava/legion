@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { ask } from '#lib/confirm.svelte.ts';
   // Docker-Desktop ZFS Volumes Studio: per-node ZFS pool capacity meters,
   // 1-click ZFS/NFS/iSCSI volume creation wizard, live per-dataset space
   // tracking, ZFS Snapshot Manager modal, cross-node ZFS migration, and
@@ -262,12 +263,12 @@
   async function rollbackSnap(snap: string) {
     if (!activeVol) return;
     if (
-      !confirm(
+      !(await ask(
         t(
           'Roll {name} back to @{snapshot}? Newer data and newer snapshots on this dataset will be discarded.',
           { name: activeVol.metadata.name, snapshot: snap }
         )
-      )
+      ))
     ) {
       return;
     }
@@ -291,12 +292,12 @@
   async function removeSnap(snap: string) {
     if (!activeVol) return;
     if (
-      !confirm(
+      !(await ask(
         t('Delete snapshot @{snapshot} from {name}?', {
           snapshot: snap,
           name: activeVol.metadata.name
         })
-      )
+      ))
     ) {
       return;
     }
@@ -323,12 +324,12 @@
     const ns = activeVol.metadata.namespace ?? '';
     const nm = activeVol.metadata.name;
     if (
-      !confirm(
+      !(await ask(
         t('Move {name} to {node}? Its tasks stop while its data moves.', {
           name: nm,
           node: migrateNode.trim()
         })
-      )
+      ))
     ) {
       return;
     }
@@ -515,7 +516,10 @@
                 disabled={!!ro || busy || users.length > 0}
                 title={ro ?? (users.length ? t('In use by a Service') : '')}
                 onclick={async () => {
-                  if (!confirm(t('Delete Volume {name}? Its data is destroyed.', { name: `${ns}/${v.metadata.name}` }))) return;
+                  if (!(await ask(t('Delete Volume {name}? Its data is destroyed.', { name: `${ns}/${v.metadata.name}` }), {
+                      action: t('Delete'),
+                      typed: v.metadata.name
+                    }))) return;
                   busy = true;
                   try {
                     await api.remove('Volume', ns, v.metadata.name, v.metadata.version);

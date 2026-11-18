@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { ask } from '#lib/confirm.svelte.ts';
   // Each node's disk, as its agent last reported it: what holds the space
   // under Legion's ZFS root (images, tasks' roots, Volumes, the rest) and
   // jailer's build store beside it, with what can be reclaimed.
@@ -57,7 +58,7 @@
   }
 
   async function reclaim(node: string, r: NonNullable<Part['reclaim']>) {
-    if (!confirm(r.ask)) return;
+    if (!(await ask(r.ask))) return;
     busy = `${node}:${r.op}`;
     message = '';
     try {
