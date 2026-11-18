@@ -13,6 +13,8 @@ LICENSE_FILE=	${WRKSRC}/LICENSE
 ONLY_FOR_ARCHS=	aarch64 amd64
 ONLY_FOR_ARCHS_REASON=	tested on these only
 
+LIB_DEPENDS=	libzstd.so:archivers/zstd
+
 USES=		cargo
 USE_GITHUB=	yes
 GH_ACCOUNT=	grepjava
