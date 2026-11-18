@@ -295,7 +295,8 @@
   // The left column: Routes, then published ports, then other namespaces.
   const outsideRow = $derived(shownRoutes.length + published.length);
   const leftRows = $derived(outsideRow + ((showSeen ? seenIn.length : outside.length) ? 1 : 0));
-  const svgW = X_VOL + VOL_W + 28;
+  // Without Volumes, no column for them: the graph ends with the pods.
+  const svgW = $derived(volumeNames.length ? X_VOL + VOL_W + 28 : X_TASK + TASK_W + 28);
   const rowCount = $derived(Math.max(services.length, volumeNames.length, leftRows, 1));
   // Each row's height, and where each starts: routes, services and
   // Volumes share the rows. Pods grow their service's row only when drawn
@@ -651,7 +652,9 @@
           <text class="tier-head" x={X_ROUTE} y={20}>{t('INGRESS / ROUTES')}</text>
           <text class="tier-head" x={X_SVC_CX - 34} y={20}>{t('SERVICES')}</text>
           <text class="tier-head" x={X_TASK} y={20}>{byNode ? t('NODES / PODS') : t('PODS (JAILS / VMS)')}</text>
-          <text class="tier-head" x={X_VOL} y={20}>{t('VOLUMES')}</text>
+          {#if volumeNames.length}
+            <text class="tier-head" x={X_VOL} y={20}>{t('VOLUMES')}</text>
+          {/if}
 
           <!-- Node bands, behind their pods; a band opens its node. -->
           {#snippet band(b: Band)}
@@ -1053,6 +1056,13 @@
     .topo-layout {
       grid-template-columns: 1fr;
     }
+  }
+  /* The name and how ready it is read as one heading. */
+  .pf-inspector h2 {
+    margin-bottom: 0.1rem;
+  }
+  .pf-inspector h2 + p {
+    margin-top: 0;
   }
   .pf-inspector {
     border-right: 1px solid var(--line);
