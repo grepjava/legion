@@ -1677,3 +1677,25 @@ h1.object-title .obj-name {
   margin: 0.15rem 0 0;
   font-weight: 600;
 }
+
+/* The side bar's sections open and close smoothly where the browser can
+   animate to and from `auto`, and at once where the system asks for less
+   motion or the browser can't. */
+@media (prefers-reduced-motion: no-preference) {
+  :root {
+    interpolate-size: allow-keywords;
+  }
+  details.nav-sec::details-content {
+    height: 0;
+    overflow: clip;
+    transition:
+      height 180ms ease,
+      content-visibility 180ms allow-discrete;
+  }
+  details.nav-sec[open]::details-content {
+    height: auto;
+  }
+  .nav-group::after {
+    transition: transform 160ms ease;
+  }
+}
