@@ -746,6 +746,22 @@ look, then a lab test for its "done when".
 way to the Volume, and the cut-off test sees "can fail over" before the
 cut, on the lab.
 
+**Built so far** (2026-11-19): the replica's `state`, `copyingMs`, its
+last ten `copies` (when, how long, bytes, whole or not, why it failed)
+and `blocked`, written by the replicator as they change; the
+`replica-stale` alert; events as the replica's state changes
+(`ReplicaStale`, `ReplicaFailed`, `ReplicaReady`) and as a Volume fails
+over (`FailedOver`). The console's Volume page has a Replica tab (its
+state, where it is kept, the last copy's age against when it goes stale,
+what was last sent, whether it would fail over now or what blocks it, its
+copies, and Promote while its node is down); the Volumes list and `legion
+top`'s storage tab say stale, copying and failover blocked; the deploy
+form keeps a replica of the Volume it makes, failing over by hand or on
+its own (then with `onPartition: stop`). `Volumes.Promote` and `legion
+volume promote` hand over by hand. The lab tests check the stale alert
+(the host-lost test) and "can fail over" before the cut (the cut-off
+test); their records are to come.
+
 ### Phase 8: pools and hosts
 
 - Agents report each pool's state, read, write and checksum errors, last

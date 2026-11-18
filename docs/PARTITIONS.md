@@ -245,6 +245,20 @@ and `a_volume_does_not_fail_over_while_anything_may_write_to_it` (the
 planner), `a_replicated_volume_fails_over_on_its_own_when_its_node_is_cut_off`
 (agents in a real cluster, cut off by a silent link).
 
+By hand, `legion volume promote NAME` (or the console's Promote on the
+Volume's Replica tab, the name typed) hands a volume whose node is down to
+its replica at once, whatever its tasks' `onPartition`: the operator
+answers for nothing writing there any more. It is refused while the node
+may still be heard from (ready or suspect), and needs a copy of that
+node's data on a node ready and active; `status.promoted` names who did
+it. Until then the volume says what it is waiting for: its replica's
+`state` (`pending`, `ready`, `stale` once the last copy is three intervals
+old, `failed`), the copy under way, its last ten copies, and, for
+`failover: automatic`, `blocked` with each reason it would not fail over
+now (a task that runs on when cut off, no copy of this node's data yet,
+the replica's node not ready and active). A stale replica raises the
+`replica-stale` alert.
+
 ## A volume an orphaned task used
 
 An orphaned task's pod may still be running on its node, so a volume used
