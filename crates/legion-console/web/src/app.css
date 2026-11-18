@@ -1621,3 +1621,59 @@ h1.object-title .obj-name {
     background: CanvasText;
   }
 }
+
+/* The overview's health: a word for the whole cluster, in its colour, and
+   the few facts it rests on. */
+.card.health {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem 2rem;
+  margin-bottom: 0.85rem;
+  border-left: 4px solid var(--good);
+}
+.card.health.wait {
+  border-left-color: var(--wait);
+}
+.card.health.bad {
+  border-left-color: var(--bad);
+}
+.health-word {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+}
+.health-word h2 {
+  margin: 0;
+  font-size: 1.35rem;
+}
+.health-word p {
+  margin: 0.15rem 0 0;
+}
+.card.health.good .health-word .ico {
+  color: var(--good);
+}
+.card.health.wait .health-word .ico {
+  color: var(--wait);
+}
+.card.health.bad .health-word .ico {
+  color: var(--bad);
+}
+.health-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 1.8rem;
+  margin: 0;
+}
+.health-facts dt {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.health-facts dd {
+  margin: 0.15rem 0 0;
+  font-weight: 600;
+}

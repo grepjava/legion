@@ -17,6 +17,8 @@
   import UsageCharts from '#lib/UsageCharts.svelte';
   import { t } from '#lib/i18n.svelte.ts';
   import { cannotWrite, openWorkbench, session } from '#lib/session.svelte.ts';
+  import Ico from '#lib/Ico.svelte';
+  import { CircleCheck, OctagonX, TriangleExclamationPoint } from '@lucide/svelte';
 
   let status: Status | null = $state(null);
   let statusError = $state('');
@@ -27,6 +29,26 @@
   let nodeUsage: NodeUsage[] = $state([]);
   let balancers: Balancer[] = $state([]);
   let errors: Record<string, string> = $state({});
+  let sampled: Date | null = $state(null);
+
+  // The cluster's health in a word, and why: no leader or a critical alert
+  // is unhealthy; a warning or a node not ready, degraded.
+  const st = $derived(status as Status | null);
+  const voters = $derived(st ? st.members.filter((m) => m.voter).length : 0);
+  const quorum = $derived(Math.floor(voters / 2) + 1);
+  const notReady = $derived(nodes.filter((n) => n.status?.state !== 'ready'));
+  const managersOut = $derived(
+    notReady.filter((n) => n.spec?.role === 'manager' || n.status?.role === 'manager').length
+  );
+  const critical = $derived(session.alerts.filter((a) => a.severity === 'critical').length);
+  const warnings = $derived(session.alerts.length - critical);
+  const health = $derived(
+    (st && !st.leader) || critical
+      ? 'bad'
+      : warnings || notReady.length
+        ? 'wait'
+        : 'good'
+  );
 
   $effect(() => {
     api
@@ -55,7 +77,10 @@
     const poll = async () => {
       try {
         const u = await api.usage(ns);
-        if (!stopped) nodeUsage = u.nodes;
+        if (!stopped) {
+          nodeUsage = u.nodes;
+          sampled = new Date();
+        }
       } catch {
         // Ignore transient poll errors.
       }
@@ -134,12 +159,68 @@
 
 <header class="bar">
   <h1>{t('Overview')}</h1>
+  {#if sampled}
+    <span class="tag" title={t('When what nodes report was last read')}
+      >{t('sampled {time}', { time: sampled.toLocaleTimeString() })}</span
+    >
+  {/if}
   <div class="controls">
     <a class="button sm" href="/volumes">{t('Volumes Studio')}</a>
     <a class="button sm" href="/images">{t('Images & GHCR Hub')}</a>
     <a class="button sm primary" href="/deploy">{t('Deploy')}</a>
   </div>
 </header>
+
+<section class="card health {health}" aria-labelledby="health-title">
+  <div class="health-word">
+    <Ico icon={health === 'good' ? CircleCheck : health === 'wait' ? TriangleExclamationPoint : OctagonX} size={36} />
+    <div>
+      <h2 id="health-title">
+        {health === 'good' ? t('Healthy') : health === 'wait' ? t('Degraded') : t('Unhealthy')}
+      </h2>
+      <p class="muted">
+        {#if status && !status.leader}
+          {t('No manager leads: the cluster takes no changes until a majority of managers reach each other.')}
+        {:else if critical || warnings}
+          {t('{critical} critical and {warnings} warning alerts: see them below.', { critical, warnings })}
+        {:else if notReady.length}
+          {t('{n} nodes not ready.', { n: notReady.length })}
+        {:else}
+          {t('Every node ready, a leader elected, nothing to act on.')}
+        {/if}
+      </p>
+    </div>
+  </div>
+  <dl class="health-facts">
+    {#if status}
+      <div>
+        <dt>{t('Quorum')}</dt>
+        <dd>
+          {t('{voters} managers, quorum {quorum}, can lose {spare}', {
+            voters,
+            quorum,
+            spare: Math.max(0, voters - quorum)
+          })}{#if managersOut}<span class="wait">{t(', {n} not ready', { n: managersOut })}</span>{/if}
+        </dd>
+      </div>
+    {/if}
+    {#if session.me?.all}
+      <div>
+        <dt>{t('Nodes')}</dt>
+        <dd>
+          <span class="good">{t('{n} ready', { n: nodes.length - notReady.length })}</span>
+          {#if notReady.length}· <span class="bad">{t('{n} not', { n: notReady.length })}</span>{/if}
+        </dd>
+      </div>
+    {/if}
+    <div>
+      <dt>{t('Alerts')}</dt>
+      <dd>
+        {#if session.alerts.length}<a href="/alerts">{t('{n} open', { n: session.alerts.length })}</a>{:else}{t('none')}{/if}
+      </dd>
+    </div>
+  </dl>
+</section>
 
 {#if session.alerts.length}
   <section class="card alert-strip">
