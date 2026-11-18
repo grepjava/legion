@@ -13,7 +13,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use legion_api::node::{Availability, NodeSpec, NodeState, NodeStatus};
-use legion_api::volume::{ReplicaStatus, VolumeDriver, VolumeSpec, VolumeStatus};
+use legion_api::service::OnPartition;
+use legion_api::task::{TaskSpec, TaskState, TaskStatus};
+use legion_api::volume::{
+    Failover, ReplicaCopy, ReplicaState, ReplicaStatus, VolumeDriver, VolumeSpec, VolumeStatus,
+};
 use legion_api::{Kind, ObjectKey};
 use legion_proto::v1::session_open::Action;
 use legion_proto::v1::{ReplicaReceive, ReplicaSend, SessionOffer, SessionOpen};
@@ -41,6 +45,59 @@ pub(crate) struct Candidate {
     pub usable: bool,
 }
 
+/// A task that may write to a Volume: not ended, using it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct User {
+    /// Its service, or its own name when it has none.
+    pub name: String,
+    pub on_partition: OnPartition,
+}
+
+/// Why a Volume with `failover: automatic` would not fail over on its own
+/// if the node holding it went down now: what the planner's rule
+/// (`controller::plan::migrate::failover`) needs and does not have. Empty
+/// for one whose failover is manual.
+pub(crate) fn blockers(
+    spec: &VolumeSpec,
+    status: &VolumeStatus,
+    nodes: &[Candidate],
+    users: &[User],
+) -> Vec<String> {
+    let Some(want) = spec.replica.as_ref() else {
+        return Vec::new();
+    };
+    if want.failover != Failover::Automatic {
+        return Vec::new();
+    }
+    let mut why = Vec::new();
+    match status.replica.as_ref() {
+        Some(r) if r.snapshot.is_empty() => why.push("no copy has been taken yet".to_owned()),
+        Some(r) if r.from != status.node => why.push(format!(
+            "the last copy was taken on {} before the data moved: the next is whole",
+            r.from
+        )),
+        Some(r) if !nodes.iter().any(|c| c.name == r.node && c.usable) => why.push(format!(
+            "{}, keeping the replica, is not ready and active",
+            r.node
+        )),
+        Some(_) => {}
+        None => why.push("no node keeps a replica yet".to_owned()),
+    }
+    let mut runs: Vec<&str> = users
+        .iter()
+        .filter(|u| u.on_partition != OnPartition::Stop)
+        .map(|u| u.name.as_str())
+        .collect();
+    runs.sort_unstable();
+    runs.dedup();
+    for name in runs {
+        why.push(format!(
+            "{name} uses it with onPartition: run, so it may write on where it is cut off"
+        ));
+    }
+    why
+}
+
 /// What to do about one Volume's replica now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Step {
@@ -57,13 +114,16 @@ pub(crate) enum Step {
 }
 
 /// What a Volume's replica needs, by its spec and status, the nodes, and
-/// the time; `waiting` while a failed copy's backoff runs.
+/// the time; `waiting` while a failed copy's backoff runs, `blocked` why
+/// it would not fail over now ([`blockers`]). Called only while no copy
+/// of it runs here.
 pub(crate) fn step(
     spec: &VolumeSpec,
     status: &VolumeStatus,
     nodes: &[Candidate],
     now_ms: i64,
     waiting: bool,
+    blocked: &[String],
 ) -> Step {
     let node = |n: &str| nodes.iter().find(|c| c.name == n);
     let Some(want) = spec
@@ -105,10 +165,11 @@ pub(crate) fn step(
             None => "no other node may keep it".to_owned(),
         };
         return match current {
-            Some(r) if r.message == why => Step::Nothing,
+            Some(r) if r.message == why && r.state == ReplicaState::Failed => Step::Nothing,
             _ => Step::Write(Box::new(VolumeStatus {
                 replica: Some(ReplicaStatus {
                     message: why,
+                    state: ReplicaState::Failed,
                     ..current.cloned().unwrap_or_default()
                 }),
                 ..status.clone()
@@ -137,6 +198,22 @@ pub(crate) fn step(
         }
     }
     let r = current.expect("matched");
+    // What it amounts to now, and why it would not fail over: written as
+    // they change, before any copy. A copy said to be under way runs no
+    // more (this manager runs none of it): one cut short by a change of
+    // leader.
+    let state = r.settled(want.every(), now_ms);
+    if r.state != state || r.blocked != blocked || r.copying_ms.is_some() {
+        return Step::Write(Box::new(VolumeStatus {
+            replica: Some(ReplicaStatus {
+                state,
+                blocked: blocked.to_vec(),
+                copying_ms: None,
+                ..r.clone()
+            }),
+            ..status.clone()
+        }));
+    }
     let ready = |n: &str| node(n).is_some_and(|c| c.ready);
     let incremental = !r.snapshot.is_empty() && r.from == holder;
     let due = !incremental
@@ -193,26 +270,76 @@ fn candidates(store: &Store) -> Option<Vec<Candidate>> {
     Some(nodes)
 }
 
+/// The tasks that may write to each Volume, by namespace and name: every
+/// one not ended, an orphan included, as the failover rule weighs them.
+fn users(store: &Store) -> HashMap<(String, String), Vec<User>> {
+    let mut out: HashMap<(String, String), Vec<User>> = HashMap::new();
+    let Ok(list) = store.list(Kind::Task, None) else {
+        return out;
+    };
+    for o in &list.objects {
+        let (Ok(spec), Ok(status)) = (
+            legion_api::parse::<TaskSpec>(&o.spec),
+            serde_json::from_value::<TaskStatus>(o.status.clone()),
+        ) else {
+            continue;
+        };
+        if status.state.is_terminal() && status.state != TaskState::Orphaned {
+            continue;
+        }
+        let name = if spec.service.is_empty() {
+            o.metadata.name.clone()
+        } else {
+            spec.service.clone()
+        };
+        for v in spec.volumes() {
+            out.entry((o.metadata.namespace.clone(), v.clone()))
+                .or_default()
+                .push(User {
+                    name: name.clone(),
+                    on_partition: spec.pod.on_partition,
+                });
+        }
+    }
+    out
+}
+
 /// Keeps replicas copied while this manager leads; ends with the
 /// leadership (the caller's select).
 pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>) {
-    let mut copies: JoinSet<(ObjectKey, ReplicaStatus, Result<(), String>)> = JoinSet::new();
+    let mut copies: JoinSet<(ObjectKey, ReplicaStatus, bool, Result<u64, String>)> = JoinSet::new();
     let mut running: HashMap<ObjectKey, ()> = HashMap::new();
     // Failures in a row, and when the last was.
     let mut failed: HashMap<ObjectKey, (u32, Instant)> = HashMap::new();
     loop {
         while let Some(done) = copies.try_join_next() {
-            let Ok((key, taken, result)) = done else {
+            let Ok((key, taken, whole, result)) = done else {
                 continue;
             };
             running.remove(&key);
+            let began = taken.taken_ms.unwrap_or_default();
+            let copy = |bytes: u64, error: String| ReplicaCopy {
+                at_ms: began,
+                took_ms: (crate::console::now_ms() - began).max(0) as u64,
+                bytes,
+                whole,
+                error,
+            };
             let r = match result {
-                Ok(()) => {
+                Ok(bytes) => {
                     failed.remove(&key);
-                    tracing::debug!(volume = %key, to = %taken.node, "replica copied");
+                    tracing::debug!(volume = %key, to = %taken.node, bytes, "replica copied");
+                    let done = copy(bytes, String::new());
                     update(store, &key, |s| match &mut s.replica {
                         Some(now) if now.node == taken.node && s.node == taken.from => {
-                            *now = taken.clone();
+                            let mut next = ReplicaStatus {
+                                copies: std::mem::take(&mut now.copies),
+                                state: ReplicaState::Ready,
+                                blocked: std::mem::take(&mut now.blocked),
+                                ..taken.clone()
+                            };
+                            next.record(done.clone());
+                            *now = next;
                             true
                         }
                         _ => false,
@@ -229,11 +356,15 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>) {
                         f.0,
                         backoff(f.0).as_secs()
                     );
-                    let whole = e.contains(FULL_NEEDED);
+                    let full_needed = e.contains(FULL_NEEDED);
+                    let attempt = copy(0, e.clone());
                     update(store, &key, |s| match &mut s.replica {
                         Some(now) if now.node == taken.node => {
                             now.message = why.clone();
-                            if whole {
+                            now.state = ReplicaState::Failed;
+                            now.copying_ms = None;
+                            now.record(attempt.clone());
+                            if full_needed {
                                 now.snapshot.clear();
                             }
                             true
@@ -259,6 +390,7 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>) {
             tokio::time::sleep(PERIOD).await;
             continue;
         };
+        let users = users(store);
         let now = crate::console::now_ms();
         for v in volumes {
             let key = v.key();
@@ -275,7 +407,12 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>) {
             let waiting = failed
                 .get(&key)
                 .is_some_and(|(n, at)| at.elapsed() < backoff(*n));
-            match step(&spec, &status, &nodes, now, waiting) {
+            let using = users
+                .get(&(key.namespace.clone(), key.name.clone()))
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let blocked = blockers(&spec, &status, &nodes, using);
+            match step(&spec, &status, &nodes, now, waiting, &blocked) {
                 Step::Nothing => {}
                 Step::Write(next) => {
                     let r = update(store, &key, |s| {
@@ -302,12 +439,25 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>) {
                         snapshot: snapshot.clone(),
                         from: from.clone(),
                         taken_ms: Some(now),
-                        message: String::new(),
+                        ..Default::default()
                     };
+                    // Said to be under way, for those watching.
+                    let r = update(store, &key, |s| match &mut s.replica {
+                        Some(r) if r.node == to => {
+                            r.copying_ms = Some(now);
+                            true
+                        }
+                        _ => false,
+                    })
+                    .await;
+                    if let Err(e) = r {
+                        tracing::debug!(volume = %key, "the replica's copy under way: {e}");
+                    }
+                    let whole = base.is_empty();
                     let (hub, k) = (hub.clone(), key.clone());
                     copies.spawn(async move {
                         let result = copy(&hub, &k, &from, &to, &base, &snapshot).await;
-                        (k, taken, result)
+                        (k, taken, whole, result)
                     });
                     running.insert(key, ());
                 }
@@ -325,7 +475,7 @@ async fn copy(
     to: &str,
     base: &str,
     snapshot: &str,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let open = |action| SessionOffer {
         id: legion_pki::random_secret(),
         open: Some(SessionOpen {
@@ -406,6 +556,13 @@ mod tests {
             from: from.into(),
             taken_ms,
             message: String::new(),
+            // As the replicator leaves one it has copied to or placed.
+            state: if snapshot.is_empty() {
+                ReplicaState::Pending
+            } else {
+                ReplicaState::Ready
+            },
+            ..Default::default()
         }
     }
 
@@ -418,17 +575,17 @@ mod tests {
         ];
         // Unplaced: nothing yet.
         assert_eq!(
-            step(&spec(None), &VolumeStatus::default(), &nodes, 0, false),
+            step(&spec(None), &VolumeStatus::default(), &nodes, 0, false, &[]),
             Step::Nothing
         );
         // The first usable node but the holder; n2 is paused.
-        let Step::Write(s) = step(&spec(None), &on("n1"), &nodes, 0, false) else {
+        let Step::Write(s) = step(&spec(None), &on("n1"), &nodes, 0, false, &[]) else {
             panic!()
         };
         let s = *s;
         assert_eq!(s.replica, Some(replica("n3", "", "", None)));
         assert_eq!(
-            step(&spec(None), &s, &nodes, 1000, false),
+            step(&spec(None), &s, &nodes, 1000, false, &[]),
             Step::Copy {
                 from: "n1".into(),
                 to: "n3".into(),
@@ -437,7 +594,7 @@ mod tests {
             }
         );
         // The spec's node, paused or not.
-        let Step::Write(s) = step(&spec(Some("n2")), &on("n1"), &nodes, 0, false) else {
+        let Step::Write(s) = step(&spec(Some("n2")), &on("n1"), &nodes, 0, false, &[]) else {
             panic!()
         };
         let s = *s;
@@ -449,9 +606,12 @@ mod tests {
         let nodes = [node("n1", true, true), node("n2", true, true)];
         let mut s = on("n1");
         s.replica = Some(replica("n2", "legion-replica-1000", "n1", Some(1000)));
-        assert_eq!(step(&spec(None), &s, &nodes, 30_000, false), Step::Nothing);
         assert_eq!(
-            step(&spec(None), &s, &nodes, 61_000, false),
+            step(&spec(None), &s, &nodes, 30_000, false, &[]),
+            Step::Nothing
+        );
+        assert_eq!(
+            step(&spec(None), &s, &nodes, 61_000, false, &[]),
             Step::Copy {
                 from: "n1".into(),
                 to: "n2".into(),
@@ -460,9 +620,15 @@ mod tests {
             }
         );
         // After a failure, the backoff; with a node away, a wait.
-        assert_eq!(step(&spec(None), &s, &nodes, 61_000, true), Step::Nothing);
+        assert_eq!(
+            step(&spec(None), &s, &nodes, 61_000, true, &[]),
+            Step::Nothing
+        );
         let away = [node("n1", true, true), node("n2", false, false)];
-        assert_eq!(step(&spec(None), &s, &away, 61_000, false), Step::Nothing);
+        assert_eq!(
+            step(&spec(None), &s, &away, 61_000, false, &[]),
+            Step::Nothing
+        );
         // The data moved since: whole, at once.
         s.node = "n3".into();
         let nodes = [
@@ -470,7 +636,7 @@ mod tests {
             node("n2", true, true),
             node("n3", true, true),
         ];
-        let Step::Copy { base, .. } = step(&spec(None), &s, &nodes, 2000, false) else {
+        let Step::Copy { base, .. } = step(&spec(None), &s, &nodes, 2000, false, &[]) else {
             panic!()
         };
         assert_eq!(base, "");
@@ -480,7 +646,10 @@ mod tests {
             phase: MigrationPhase::Copying,
             message: String::new(),
         });
-        assert_eq!(step(&spec(None), &s, &nodes, 99_000, false), Step::Nothing);
+        assert_eq!(
+            step(&spec(None), &s, &nodes, 99_000, false, &[]),
+            Step::Nothing
+        );
     }
 
     #[test]
@@ -492,7 +661,7 @@ mod tests {
         ];
         let mut s = on("n1");
         s.replica = Some(replica("n2", "legion-replica-1", "n1", Some(1)));
-        let Step::Write(next) = step(&spec(Some("n3")), &s, &nodes, 5, false) else {
+        let Step::Write(next) = step(&spec(Some("n3")), &s, &nodes, 5, false, &[]) else {
             panic!()
         };
         let next = *next;
@@ -501,13 +670,13 @@ mod tests {
         // The data moved to the replica's node: another keeps it.
         let mut moved = on("n2");
         moved.replica = Some(replica("n2", "legion-replica-1", "n1", Some(1)));
-        let Step::Write(next) = step(&spec(None), &moved, &nodes, 5, false) else {
+        let Step::Write(next) = step(&spec(None), &moved, &nodes, 5, false, &[]) else {
             panic!()
         };
         let next = *next;
         assert_eq!(next.replica.unwrap().node, "n1");
         // No longer asked for: dropped.
-        let Step::Write(next) = step(&VolumeSpec::default(), &s, &nodes, 5, false) else {
+        let Step::Write(next) = step(&VolumeSpec::default(), &s, &nodes, 5, false, &[]) else {
             panic!()
         };
         let next = *next;
@@ -520,7 +689,7 @@ mod tests {
     #[test]
     fn with_nowhere_to_keep_it_the_status_says_why_once() {
         let nodes = [node("n1", true, true)];
-        let Step::Write(s) = step(&spec(None), &on("n1"), &nodes, 0, false) else {
+        let Step::Write(s) = step(&spec(None), &on("n1"), &nodes, 0, false, &[]) else {
             panic!()
         };
         let s = *s;
@@ -528,14 +697,124 @@ mod tests {
             s.replica.as_ref().unwrap().message,
             "no other node may keep it"
         );
-        assert_eq!(step(&spec(None), &s, &nodes, 0, false), Step::Nothing);
-        let Step::Write(s) = step(&spec(Some("n1")), &on("n1"), &nodes, 0, false) else {
+        assert_eq!(step(&spec(None), &s, &nodes, 0, false, &[]), Step::Nothing);
+        let Step::Write(s) = step(&spec(Some("n1")), &on("n1"), &nodes, 0, false, &[]) else {
             panic!()
         };
         let s = *s;
         assert_eq!(
             s.replica.unwrap().message,
             "n1 holds the data: the replica is kept elsewhere"
+        );
+    }
+
+    #[test]
+    fn a_replica_says_when_it_goes_stale_and_when_a_copy_failed() {
+        let nodes = [node("n1", true, true), node("n2", true, true)];
+        let mut s = on("n1");
+        s.replica = Some(replica("n2", "legion-replica-1000", "n1", Some(1000)));
+        // Three intervals of 60 s after the copy: still ready, then stale.
+        let late = 1000 + 180_000;
+        assert!(matches!(
+            step(&spec(None), &s, &nodes, late, true, &[]),
+            Step::Nothing
+        ));
+        let Step::Write(next) = step(&spec(None), &s, &nodes, late + 1, true, &[]) else {
+            panic!()
+        };
+        assert_eq!(next.replica.as_ref().unwrap().state, ReplicaState::Stale);
+        // Once written, nothing more until it changes again.
+        assert_eq!(
+            step(&spec(None), &next, &nodes, late + 2, true, &[]),
+            Step::Nothing
+        );
+        // A failed attempt is failed whatever the age.
+        let mut failed = (*next).clone();
+        failed.replica.as_mut().unwrap().message = "node n2: refused".into();
+        let Step::Write(f) = step(&spec(None), &failed, &nodes, 2000, true, &[]) else {
+            panic!()
+        };
+        assert_eq!(f.replica.as_ref().unwrap().state, ReplicaState::Failed);
+    }
+
+    #[test]
+    fn a_copy_said_to_be_under_way_that_runs_no_more_is_cleared() {
+        let nodes = [node("n1", true, true), node("n2", true, true)];
+        let mut s = on("n1");
+        let mut r = replica("n2", "legion-replica-1000", "n1", Some(1000));
+        r.copying_ms = Some(1000);
+        s.replica = Some(r);
+        let Step::Write(next) = step(&spec(None), &s, &nodes, 2000, false, &[]) else {
+            panic!()
+        };
+        assert_eq!(next.replica.as_ref().unwrap().copying_ms, None);
+    }
+
+    #[test]
+    fn the_copies_kept_are_the_last_ten() {
+        let mut r = ReplicaStatus::default();
+        for at_ms in 0..12 {
+            r.record(ReplicaCopy {
+                at_ms,
+                ..Default::default()
+            });
+        }
+        assert_eq!(r.copies.len(), ReplicaStatus::KEPT);
+        assert_eq!(r.copies[0].at_ms, 2);
+        assert_eq!(r.copies[9].at_ms, 11);
+    }
+
+    #[test]
+    fn what_keeps_a_volume_from_failing_over_on_its_own() {
+        let automatic = VolumeSpec {
+            replica: Some(Replica {
+                failover: Failover::Automatic,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let nodes = [node("n1", true, true), node("n2", true, true)];
+        let stop = User {
+            name: "db".into(),
+            on_partition: OnPartition::Stop,
+        };
+        let run = |name: &str| User {
+            name: name.into(),
+            on_partition: OnPartition::Run,
+        };
+        let mut s = on("n1");
+        // Manual: never said.
+        assert!(blockers(&spec(None), &s, &nodes, &[run("web")]).is_empty());
+        assert_eq!(
+            blockers(&automatic, &s, &nodes, std::slice::from_ref(&stop)),
+            ["no node keeps a replica yet"]
+        );
+        s.replica = Some(replica("n2", "", "", None));
+        assert_eq!(
+            blockers(&automatic, &s, &nodes, std::slice::from_ref(&stop)),
+            ["no copy has been taken yet"]
+        );
+        s.replica = Some(replica("n2", "legion-replica-1", "n1", Some(1)));
+        assert!(blockers(&automatic, &s, &nodes, std::slice::from_ref(&stop)).is_empty());
+        // A writer that runs on where it is cut off, named once.
+        assert_eq!(
+            blockers(
+                &automatic,
+                &s,
+                &nodes,
+                &[stop.clone(), run("web"), run("web")]
+            ),
+            ["web uses it with onPartition: run, so it may write on where it is cut off"]
+        );
+        let paused = [node("n1", true, true), node("n2", true, false)];
+        assert_eq!(
+            blockers(&automatic, &s, &paused, std::slice::from_ref(&stop)),
+            ["n2, keeping the replica, is not ready and active"]
+        );
+        s.node = "n3".into();
+        assert_eq!(
+            blockers(&automatic, &s, &nodes, &[stop]),
+            ["the last copy was taken on n1 before the data moved: the next is whole"]
         );
     }
 }

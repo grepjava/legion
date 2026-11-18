@@ -183,6 +183,7 @@ pub(crate) fn current(api: &ApiService) -> Vec<(Alert, i64)> {
         });
     }
     let vol_space = api.usage.volume_space();
+    let now_ms = crate::console::now_ms();
     for v in &volumes {
         let (used_bytes, avail_bytes) = vol_space
             .get(&format!("{}/{}", v.metadata.namespace, v.metadata.name))
@@ -194,6 +195,7 @@ pub(crate) fn current(api: &ApiService) -> Vec<(Alert, i64)> {
             lost: v.status["lost"].as_str().unwrap_or(""),
             used_bytes,
             avail_bytes,
+            stale_replica: stale_replica(v, now_ms),
         });
     }
     if let Some(c) = &api.peer_tls
@@ -213,4 +215,24 @@ pub(crate) fn current(api: &ApiService) -> Vec<(Alert, i64)> {
     let alerts = alert::alerts(&inputs);
     let since = api.alerts.since(&alerts);
     alerts.into_iter().zip(since).collect()
+}
+
+/// A Volume's replica, if its spec asks for one and the last copy there
+/// is stale at `now_ms`.
+fn stale_replica(v: &Object, now_ms: i64) -> Option<alert::StaleReplica> {
+    use legion_api::volume::{VolumeSpec, VolumeStatus};
+    let spec: VolumeSpec = legion_api::parse(&v.spec).ok()?;
+    let every = spec.replica.as_ref()?.every();
+    let status: VolumeStatus = serde_json::from_value(v.status.clone()).ok()?;
+    let r = status.replica.as_ref()?;
+    if !status.lost.is_empty() || !r.stale_at(every, now_ms) {
+        return None;
+    }
+    let age = r.taken_ms.map_or(0, |t| (now_ms - t).max(0) as u64);
+    Some(alert::StaleReplica {
+        node: r.node.clone(),
+        age: Duration::from_millis(age),
+        every,
+        why: r.message.clone(),
+    })
 }

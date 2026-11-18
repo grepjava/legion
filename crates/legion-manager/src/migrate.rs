@@ -422,7 +422,7 @@ async fn transfer(
                 message: e.clone(),
             }))));
     }
-    result
+    result.map(|_| ())
 }
 
 /// What an agent sends in a session.
@@ -436,19 +436,21 @@ impl<S: Stream<Item = Result<SessionFrame, tonic::Status>> + Unpin + Send + ?Siz
 pub(crate) type ToAgent = tokio::sync::mpsc::Sender<Result<SessionFrame, tonic::Status>>;
 
 /// The sender's output as the receiver's input, until the receiver has
-/// taken all of it.
+/// taken all of it; the bytes sent.
 pub(crate) async fn pipe(
     sender: &mut (impl Frames + ?Sized),
     received: &mut (impl Frames + ?Sized),
     receiver: &ToAgent,
     from: &str,
     to: &str,
-) -> Result<(), String> {
+) -> Result<u64, String> {
+    let mut sent = 0u64;
     loop {
         tokio::select! {
             f = tokio::time::timeout(IDLE, sender.next()) => {
                 match f.map_err(|_| idle(from))? {
                     Some(Ok(SessionFrame { frame: Some(Frame::Stdout(data)) })) => {
+                        sent += data.len() as u64;
                         forward(received, receiver, Frame::Input(data), to).await?;
                     }
                     Some(Ok(SessionFrame { frame: Some(Frame::ExitCode(0)) })) => {
@@ -461,7 +463,8 @@ pub(crate) async fn pipe(
             f = received.next() => early(f, to)?,
         }
     }
-    finished(received, to).await
+    finished(received, to).await?;
+    Ok(sent)
 }
 
 fn idle(node: &str) -> String {
@@ -763,10 +766,12 @@ mod tests {
             got
         });
         let mut said = ReceiverStream::new(said);
-        pipe(&mut sender, &mut said, &input, "n1", "n2")
+        let sent = pipe(&mut sender, &mut said, &input, "n1", "n2")
             .await
             .unwrap();
-        assert_eq!(receiving.await.unwrap(), chunks);
+        let got = receiving.await.unwrap();
+        assert_eq!(sent, got.iter().map(|c| c.len() as u64).sum::<u64>());
+        assert_eq!(got, chunks);
     }
 
     #[tokio::test]

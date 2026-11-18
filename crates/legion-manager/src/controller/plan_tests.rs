@@ -5146,7 +5146,7 @@ impl World {
             snapshot: "legion-replica-1000".into(),
             from: v.status.node.clone(),
             taken_ms: Some(1_000_000),
-            message: String::new(),
+            ..Default::default()
         });
         v.object.status = serde_json::to_value(&v.status).unwrap();
     }
