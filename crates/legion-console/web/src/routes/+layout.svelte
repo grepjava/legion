@@ -52,7 +52,7 @@
     setTheme,
     type ThemeMode
   } from '#lib/session.svelte.ts';
-  import { i18n, languageName, languages, setLanguage, t } from '#lib/i18n.svelte.ts';
+  import { i18n, languageName, languages, setLanguage, t, tn } from '#lib/i18n.svelte.ts';
   import { live } from '#lib/live.svelte.ts';
 
   let { children } = $props();
@@ -297,8 +297,8 @@
       n === 0
         ? t('No alerts now.')
         : critical
-          ? t('{n} alerts now, some critical.', { n })
-          : t('{n} alerts now.', { n });
+          ? tn('1 alert now, critical.', '{n} alerts now, some critical.', n)
+          : tn('1 alert now.', '{n} alerts now.', n);
   });
 
   async function signOut() {

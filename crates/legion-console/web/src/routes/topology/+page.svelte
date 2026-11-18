@@ -12,7 +12,7 @@
     type LObject,
     type ReachEdge
   } from '#lib/api.ts';
-  import { t } from '#lib/i18n.svelte.ts';
+  import { t, tn } from '#lib/i18n.svelte.ts';
   import { logoFor } from '#lib/logos.ts';
   import { namespaces, session } from '#lib/session.svelte.ts';
 
@@ -265,7 +265,7 @@
   });
   // Wider for more connections, up to about four times as wide.
   const width = (n: number) => 1.4 + Math.min(3.6, Math.log2(n + 1));
-  const conns = (n: number) => (n === 1 ? t('1 connection') : t('{n} connections', { n }));
+  const conns = (n: number) => tn('1 connection', '{n} connections', n);
   function endName(e: ConnectionEnd) {
     switch (e.kind) {
       case 'service':
@@ -678,7 +678,7 @@
                 href="/k/Node/_/{b.node}"
                 aria-label={t('Node {name}: {note}', {
                   name: b.node,
-                  note: nodeNote(b.node) || t('{n} pods', { n: b.tasks.length })
+                  note: nodeNote(b.node) || tn('1 pod', '{n} pods', b.tasks.length)
                 })}
               >
                 {@render band(b)}

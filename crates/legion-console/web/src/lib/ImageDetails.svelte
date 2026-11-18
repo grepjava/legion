@@ -2,7 +2,7 @@
   // How an image was built (its config's history, each step's layer) and
   // how it runs, and the services, Jobs and cron jobs that name it.
   import { bytes, type RegistryImageInspect } from '#lib/api.ts';
-  import { t } from '#lib/i18n.svelte.ts';
+  import { t, tn } from '#lib/i18n.svelte.ts';
 
   let { d }: { d: RegistryImageInspect } = $props();
 
@@ -77,7 +77,7 @@
     {#each d.attestations ?? [] as a, i (i)}
       <div>
         <span class="mono">{a.predicate_type}</span>
-        {#if a.packages.length}{t('{n} packages', { n: a.packages.length })}{/if}
+        {#if a.packages.length}{tn('1 package', '{n} packages', a.packages.length)}{/if}
         {#if a.verified_key}
           <span class="good">{t('signed by {key}', { key: a.verified_key })}</span>
         {:else if a.why}
@@ -94,7 +94,7 @@
 
 {#each (d.attestations ?? []).filter((a) => a.packages.length) as a, i (i)}
   <details>
-    <summary>{t('SBOM: {n} packages', { n: a.packages.length })}</summary>
+    <summary>{tn('SBOM: 1 package', 'SBOM: {n} packages', a.packages.length)}</summary>
     <table>
       <thead>
         <tr><th scope="col">{t('Package')}</th><th scope="col">{t('Version')}</th></tr>

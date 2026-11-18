@@ -1163,7 +1163,7 @@
       {:else}
         <span class="state good">{t('no known vulnerability')}</span>
       {/if}
-      {t('{n} packages checked against FreeBSD’s VuXML', { n: scan.packages.length })}
+      {tn('1 package checked against FreeBSD’s VuXML', '{n} packages checked against FreeBSD’s VuXML', scan.packages.length)}
     </p>
     {#if scan.used_by.length}
       <p>{t('Used by: {who}', { who: scan.used_by.join(', ') })}</p>

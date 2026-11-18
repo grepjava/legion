@@ -26,7 +26,6 @@
   "(where users start, if they may read it)": "",
   ", or pasted.": "",
   ", {n} not ready": "",
-  "1 connection": "",
   "1. Choose what to build or launch": "",
   "10 seconds": "",
   "2. Choose FreeBSD Jail source": "",
@@ -107,7 +106,6 @@
   "CARP load balancers": "",
   "CARP virtual IPs": "",
   "CPU": "",
-  "CPU / RAM": "",
   "Cached node images": "",
   "Cached node images ({n})": "",
   "Cancel": "",
@@ -605,7 +603,10 @@
   "Runs in a jail through the Linux ABI, on nodes started with --linux; not every Linux image works (docs/LINUX.md)": "",
   "Runs on": "",
   "Rust multi-stage": "",
-  "SBOM: {n} packages": "",
+  "SBOM: {n} packages": {
+    "one": "",
+    "other": ""
+  },
   "SERVICES": "",
   "Save": "",
   "Save GHCR / Registry Credentials Secret": "",
@@ -1088,20 +1089,48 @@
   "{name} suspended": "",
   "{name}: drop it on a field that takes it. Elsewhere, only compose files and YAML open.": "",
   "{node}: used": "",
-  "{n} ZFS/storage volumes": "",
-  "{n} alerts now, some critical.": "",
-  "{n} alerts now.": "",
+  "{n} ZFS/storage volumes": {
+    "one": "",
+    "other": ""
+  },
+  "{n} alerts now, some critical.": {
+    "one": "",
+    "other": ""
+  },
+  "{n} alerts now.": {
+    "one": "",
+    "other": ""
+  },
   "{n} clients": "",
-  "{n} connections": "",
+  "{n} connections": {
+    "one": "",
+    "other": ""
+  },
   "{n} cores": "",
   "{n} h": "",
+  "{n} managers, quorum {quorum}, can lose {spare}": {
+    "one": "",
+    "other": ""
+  },
   "{n} min": "",
-  "{n} nodes not ready.": "",
+  "{n} nodes not ready.": {
+    "one": "",
+    "other": ""
+  },
   "{n} not": "",
   "{n} open": "",
-  "{n} packages": "",
-  "{n} packages checked against FreeBSD’s VuXML": "",
-  "{n} pods": "",
+  "{n} packages": {
+    "one": "",
+    "other": ""
+  },
+  "{n} packages checked against FreeBSD’s VuXML": {
+    "one": "",
+    "other": ""
+  },
+  "{n} pods": {
+    "one": "",
+    "other": ""
+  },
   "{n} ready": "",
   "{n} rules": {
     "one": "",
@@ -1109,7 +1138,10 @@
   },
   "{n} running": "",
   "{n} s": "",
-  "{n} services, {ready} of {desired} tasks ready": "",
+  "{n} services, {ready} of {desired} tasks ready": {
+    "one": "",
+    "other": ""
+  },
   "{n} vulnerable": "",
   "{path} written ({size})": "",
   "{pct}% of the way to stale": "",
@@ -1128,7 +1160,6 @@
   "{used} used · {avail} free": "",
   "{version} (generation {generation})": "",
   "{volume} is on {on}, {task} on {node}": "",
-  "{voters} managers, quorum {quorum}, can lose {spare}": "",
   "{voters} voting managers, term {term}, store version {version}": "",
   "{what} on {node}: done; the figures change with its next report.": ""
 }

@@ -5,7 +5,7 @@
   // removed together. Removing one keeps its Volumes and their data, as
   // `legion stack rm` does.
   import { api, follow, type LObject } from '#lib/api.ts';
-  import { t } from '#lib/i18n.svelte.ts';
+  import { t, tn } from '#lib/i18n.svelte.ts';
   import { cannotWrite, session } from '#lib/session.svelte.ts';
 
   const STACK = 'legion.stack';
@@ -109,8 +109,7 @@
       <span class="state {st.stopped ? 'wait' : st.ready >= st.desired ? 'good' : 'wait'}">{condition(st)}</span>
     </h2>
     <p>
-      {t('{n} services, {ready} of {desired} tasks ready', {
-        n: st.services.length,
+      {tn('1 service, {ready} of {desired} tasks ready', '{n} services, {ready} of {desired} tasks ready', st.services.length, {
         ready: st.ready,
         desired: st.desired
       })}
