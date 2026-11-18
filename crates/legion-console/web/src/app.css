@@ -1726,3 +1726,32 @@ h1.object-title .obj-name {
     background-position: -200% 0;
   }
 }
+
+/* Sort marks: the sorted column says which way, the others offer it on
+   hover. Drawn, not typed, so screen readers hear aria-sort alone. */
+button.sort-btn::after {
+  content: '';
+  width: 0.45rem;
+  height: 0.45rem;
+  margin-left: 0.15rem;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  opacity: 0;
+  transform: translateY(-0.12rem) rotate(45deg);
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease;
+}
+th:hover > button.sort-btn::after {
+  opacity: 0.35;
+}
+th[aria-sort] > button.sort-btn {
+  color: var(--text);
+}
+th[aria-sort='descending'] > button.sort-btn::after {
+  opacity: 1;
+}
+th[aria-sort='ascending'] > button.sort-btn::after {
+  opacity: 1;
+  transform: translateY(0.12rem) rotate(225deg);
+}
