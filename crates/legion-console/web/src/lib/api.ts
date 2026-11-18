@@ -201,6 +201,14 @@ export const api = {
       `/api/volume-snapshots/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`
     ),
   /** Creates, rolls back, or deletes a ZFS snapshot on a Volume. */
+  /** `legion volume promote`: a Volume whose node is down handed to its replica. */
+  volumePromote: (namespace: string, name: string) =>
+    call<{ node: string; promoted: string }>(
+      'POST',
+      `/api/volume-promote/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
+      {}
+    ),
+
   volumeSnapshotOp: (
     namespace: string,
     name: string,

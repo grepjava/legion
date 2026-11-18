@@ -4,8 +4,10 @@
   // whether the Volume would fail over on its own now and if not why, and
   // its last copies. All of it from the Volume's status as the replicator
   // writes it; the ages tick here.
-  import type { LObject } from './api.ts';
-  import { bytes } from './api.ts';
+  import { api, bytes, follow, type LObject } from './api.ts';
+  import { ask } from './confirm.svelte.ts';
+  import { busyWhile, toast } from './toast.svelte.ts';
+  import { cannotWrite } from './session.svelte.ts';
   import { t } from './i18n.svelte.ts';
   import Ico from './Ico.svelte';
   import { tone } from './columns.ts';
@@ -60,6 +62,55 @@
   const lagPct = $derived(age === undefined ? 0 : Math.min(100, Math.round((age / (every * 3)) * 100)));
   const last = $derived(r?.copies?.findLast((c) => !c.error));
   const copies = $derived([...(r?.copies ?? [])].reverse());
+
+  // The node holding the data, followed: promoting by hand is for one that
+  // is down.
+  let holderState = $state('');
+  $effect(() => {
+    const holder = volume.status?.node as string | undefined;
+    if (!holder) return;
+    return follow(
+      'Node',
+      '',
+      (nodes) => (holderState = String(nodes.find((n) => n.metadata.name === holder)?.status?.state ?? '')),
+      () => (holderState = '')
+    );
+  });
+  const ns = $derived(volume.metadata.namespace ?? '');
+  const readOnly = $derived(cannotWrite(ns));
+  const promoteWhy = $derived(
+    readOnly ??
+      (!r?.snapshot || r.from !== volume.status?.node
+        ? t("No copy of its node's data yet")
+        : holderState !== 'down'
+          ? t('Its node, {node}, is {state}: only a Volume whose node is down is handed over', {
+              node: volume.status?.node ?? '',
+              state: holderState || t('not known')
+            })
+          : null)
+  );
+  let promoting = $state(false);
+  async function promote() {
+    if (!r) return;
+    const taken = r.takenMs ? t('{time} ago', { time: span(Date.now() - r.takenMs) }) : '';
+    const yes = await ask(
+      t(
+        'Hand {name} to its replica on {node}? It carries on from the copy taken {taken}; what was written on {holder} since is lost, and what still runs there writes to a copy that is dropped once the node is back.',
+        { name: volume.metadata.name, node: r.node, taken, holder: volume.status?.node ?? '' }
+      ),
+      { action: t('Promote'), danger: true, typed: volume.metadata.name }
+    );
+    if (!yes) return;
+    promoting = true;
+    try {
+      const out = await busyWhile(() => api.volumePromote(ns, volume.metadata.name));
+      toast(t('{name} carries on on {node}', { name: volume.metadata.name, node: out.node }));
+    } catch (e) {
+      toast((e as Error).message, true);
+    } finally {
+      promoting = false;
+    }
+  }
 
   let copied = $state(false);
   async function copyMessage() {
@@ -144,6 +195,15 @@
     </div>
   </div>
 
+  {#if r?.node}
+    <div class="promote">
+      <button type="button" class="danger" disabled={!!promoteWhy || promoting} title={promoteWhy ?? ''} onclick={promote}
+        >{t('Promote the replica')}</button
+      >
+      <span class="muted">{promoteWhy ?? t('Its node is down: the Volume can carry on from this copy now.')}</span>
+    </div>
+  {/if}
+
   <h3>{t('Copies')}</h3>
   {#if copies.length}
     <table>
@@ -222,5 +282,12 @@
   }
   h3 {
     margin: 1.3rem 0 0.5rem;
+  }
+  .promote {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.75rem;
+    margin-top: 1rem;
   }
 </style>
