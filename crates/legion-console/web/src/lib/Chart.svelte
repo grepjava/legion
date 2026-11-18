@@ -5,6 +5,8 @@
   // sample as a table too, behind a disclosure, for whoever can't see the
   // line or wants the numbers (WCAG 1.1.1, 1.3.1).
   import { t } from '#lib/i18n.svelte.ts';
+  import Ico from '#lib/Ico.svelte';
+  import { Download } from '@lucide/svelte';
 
   let {
     title,
@@ -102,6 +104,17 @@
   const clock = (tm: number) =>
     new Date(tm).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
+  // The samples as CSV, for a spreadsheet: the time in ISO 8601, the value.
+  function downloadCsv() {
+    const rows = [`time,${JSON.stringify(title)}`, ...points.map(([tm, v]) => `${new Date(tm).toISOString()},${v}`)];
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([rows.join('\n') + '\n'], { type: 'text/csv' }));
+    a.download = `${title.replace(/[^\w.-]+/g, '-').toLowerCase()}.csv`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }
+  const spanMin = $derived(Math.max(1, Math.round((t1 - t0) / 60000)));
+
   let hover: number | null = $state(null);
   function move(e: PointerEvent) {
     const r = (e.currentTarget as SVGElement).getBoundingClientRect();
@@ -126,6 +139,13 @@
           highest: format(max)
         })}{#each marks as m (m.label)}
           · {m.label} {format(m.value)}{/each}</span
+      >
+      <button
+        type="button"
+        class="sm chart-tool"
+        title={t('Download the samples as CSV')}
+        aria-label={t('Download {title} as CSV', { title })}
+        onclick={downloadCsv}><Ico icon={Download} size={14} />CSV</button
       >
     {/if}
   </figcaption>
@@ -184,6 +204,9 @@
         </g>
       {/if}
     </svg>
+    <p class="chart-range muted">
+      {t('last {minutes} min · a sample every {seconds} s', { minutes: spanMin, seconds: Math.round(step / 1000) })}
+    </p>
     <details class="values">
       <summary>{t('{title}: values as a table', { title })}</summary>
       <!-- Scrolled, and focusable so the keyboard scrolls it too (WCAG 2.1.1,
@@ -213,6 +236,13 @@
 </figure>
 
 <style>
+  .chart-tool {
+    margin-left: auto;
+  }
+  .chart-range {
+    margin: 0.1rem 0 0.2rem;
+    font-size: 0.78rem;
+  }
   .chart {
     margin: 0 0 0.75rem;
   }
