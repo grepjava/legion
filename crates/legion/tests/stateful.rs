@@ -848,3 +848,173 @@ fn postgres_is_restored_onto_replacement_hosts() {
     });
     step("done");
 }
+
+/// A Volume's replica on real ZFS (DESIGN.md, Volume replicas): the
+/// Postgres primary's Volume keeps a copy on another node every 10 s. Its
+/// host is lost (daemon killed, data and pool gone) and removed: the Volume
+/// carries on from the replica's last copy there, every row written before
+/// that copy with it, `status.promoted` saying from what; the primary runs
+/// there, and a new replica is made on the node made active for it, which
+/// is kept up to date as the primary is written to again.
+#[test]
+#[ignore = "needs root and ZFS on FreeBSD, two more nodes and the image; see the module docs"]
+fn a_replicated_volume_carries_on_from_its_copy_when_its_host_is_lost() {
+    let image = std::env::var("LEGION_PG_IMAGE").expect("set LEGION_PG_IMAGE");
+    let mut lab = Lab::from_env();
+    let step = |what: &str| eprintln!("--- {what}");
+
+    step("a manager and two workers, each with a pool for volumes; the manager paused");
+    lab.start_host(&[]);
+    lab.ok(&["init"]);
+    let worker = lab.ok(&["join-token", "worker"]).trim().to_owned();
+    lab.join(0, &worker, Role::Worker);
+    lab.join(1, &worker, Role::Worker);
+    wait("three ready nodes", 120, || {
+        ["n1", "n2", "n3"]
+            .iter()
+            .all(|n| lab.node_state(n) == "ready")
+    });
+    lab.load_image(&image);
+    lab.ok(&["node", "pause", "n1"]);
+
+    step("a primary whose Volume is copied to the other worker every 10 s");
+    let replicated = APP.replace("replicas: 2", "replicas: 1").replace(
+        "claim: { size: 512Mi }",
+        "claim: { size: 512Mi, replica: { everySeconds: 10 } }",
+    );
+    assert_ne!(
+        replicated,
+        APP.replace("replicas: 2", "replicas: 1"),
+        "the claim asks for a replica"
+    );
+    let app = lab.dir.join("app.yaml");
+    std::fs::write(&app, &replicated).unwrap();
+    lab.ok(&["apply", "-f", app.to_str().unwrap()]);
+    lab.waited("the primary ready", 600, || {
+        lab.list("services", "data")
+            .iter()
+            .any(|s| s["metadata"]["name"] == "db" && s["status"]["ready"] == 1)
+    });
+    let from = lab.node_of(0);
+    let other = if from == "n2" { "n3" } else { "n2" };
+    lab.sql(
+        0,
+        "create table orders (id serial primary key, item text); \
+         insert into orders (item) select 'copied ' || i from generate_series(1, 1000) i; \
+         create table ballast as select md5(i::text) as v from generate_series(1, 300000) i; \
+         checkpoint",
+    )
+    .expect("writing to the primary");
+    let replica = |lab: &Lab| lab.pg_volume()["status"]["replica"].clone();
+    lab.waited("a first copy on the other worker", 300, || {
+        let r = replica(&lab);
+        r["node"] == other && r["snapshot"].as_str().is_some_and(|s| !s.is_empty())
+    });
+    // A copy begun after every row was written: the next snapshot.
+    let seen = replica(&lab)["snapshot"].as_str().unwrap().to_owned();
+    lab.waited("a copy taken after the rows", 120, || {
+        replica(&lab)["snapshot"]
+            .as_str()
+            .is_some_and(|s| s != seen)
+    });
+    let copy = replica(&lab)["snapshot"].as_str().unwrap().to_owned();
+    eprintln!("db-0 on {from}, its replica on {other} at {copy}");
+    assert!(
+        lab.held(other).contains(&copy),
+        "the replica's snapshot on {other}: {}",
+        lab.held(other)
+    );
+    // Written after the copy that will be taken over, so possibly lost:
+    // the test asks only for what came before.
+    lab.sql(0, "insert into orders (item) values ('late')")
+        .expect("writing after the copy");
+
+    step("the primary's host lost: its daemon killed, its data directory and pool gone");
+    let out = lab.on(
+        &from,
+        &format!(
+            "pkill -KILL -f 'legion-lab daemon'\n{}{}",
+            common::clean(common::VM_DATA, common::VM_RUN),
+            common::NO_POOL
+        ),
+    );
+    assert!(out.status.success(), "losing {from}: {}", text(&out.stderr));
+    lab.waited("the lost host seen down", 120, || {
+        lab.node_state(&from) == "down"
+    });
+    // Only down: it may still write, so nothing is handed over.
+    assert!(
+        lab.pg_volume()["status"]["promoted"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "promoted while its node was only down: {}",
+        lab.pg_volume()["status"]
+    );
+
+    step("the host removed: the Volume carries on from the copy, the primary with it");
+    lab.ok(&["delete", "node", &from]);
+    lab.waited("the Volume promoted on the replica's node", 120, || {
+        let s = &lab.pg_volume()["status"];
+        s["node"] == other && s["promoted"].as_str().is_some_and(|p| !p.is_empty())
+    });
+    let v = lab.pg_volume();
+    eprintln!("promoted: {}", v["status"]["promoted"]);
+    assert!(
+        v["status"]["lost"].as_str().unwrap_or_default().is_empty(),
+        "not lost: {v}"
+    );
+    lab.waited("the primary serving from the copy", 600, || {
+        lab.ordinal(0).is_some_and(|t| t["spec"]["node"] == other) && lab.rows(0).is_some()
+    });
+    let rows = lab.rows(0).unwrap();
+    assert!(
+        rows == 1000 || rows == 1001,
+        "every row up to the copy, at most the late one after: {rows}"
+    );
+    assert_eq!(
+        lab.sql(0, "select count(*) from orders where item like 'copied %'")
+            .as_deref(),
+        Some("1000")
+    );
+    assert_eq!(
+        lab.sql(0, "select count(*) from ballast").as_deref(),
+        Some("300000")
+    );
+
+    step("a new replica, on the node made active for it, kept up to date");
+    lab.ok(&["node", "activate", "n1"]);
+    lab.waited("a copy on n1", 300, || {
+        let r = replica(&lab);
+        r["node"] == "n1" && r["snapshot"].as_str().is_some_and(|s| !s.is_empty())
+    });
+    let first = replica(&lab)["snapshot"].as_str().unwrap().to_owned();
+    lab.sql(0, "insert into orders (item) values ('after')")
+        .expect("writing to the promoted primary");
+    lab.waited("the next copy on n1", 120, || {
+        replica(&lab)["snapshot"]
+            .as_str()
+            .is_some_and(|s| s != first)
+    });
+    let last = replica(&lab)["snapshot"].as_str().unwrap().to_owned();
+    // n1 is this host, not a VM: its datasets are listed here.
+    let out = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "zfs list -H -o name -t all -r {ZFS_ROOT}/volumes 2>/dev/null | grep pg-db-0"
+        ))
+        .output()
+        .unwrap();
+    let held = text(&out.stdout).trim().to_owned();
+    assert!(held.contains(&last), "n1 keeps the last copy: {held}");
+    assert!(!held.contains(&first), "and only the last: {held}");
+
+    step("clean up");
+    lab.ok(&["delete", "service", "db", "-n", "data"]);
+    lab.waited("every task gone", 180, || {
+        lab.list("tasks", "data")
+            .iter()
+            .all(|t| t["status"]["state"] != "running")
+    });
+    step("done");
+}
