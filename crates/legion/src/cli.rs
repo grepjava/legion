@@ -1459,6 +1459,18 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             }
         }
         Command::Alerts {
+            command: Some(crate::AlertsCommand::Test { receiver }),
+            ..
+        } => {
+            cluster
+                .test_alert_receiver(pb::TestAlertReceiverRequest {
+                    name: receiver.clone(),
+                })
+                .await?;
+            println!("AlertReceiver {receiver} took the test");
+        }
+        Command::Alerts {
+            command: None,
             namespace,
             watch,
             output,

@@ -562,7 +562,10 @@ enum Command {
     /// lost Volumes, the CA near expiry, Raft without a leader or quorum.
     /// Any manager answers, from what it holds, one cut off from the
     /// leader too. With --watch, the list again each time it changes.
+    /// The leader sends them to the AlertReceivers that choose them.
     Alerts {
+        #[command(subcommand)]
+        command: Option<AlertsCommand>,
         /// Only this namespace's.
         #[arg(short, long)]
         namespace: Option<String>,
@@ -804,6 +807,13 @@ pub enum ImageCommand {
         #[arg(long)]
         node: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum AlertsCommand {
+    /// Send a test through the AlertReceiver RECEIVER now, as it sends
+    /// alerts: exits nonzero, saying why, if it was not taken.
+    Test { receiver: String },
 }
 
 #[derive(Subcommand)]
