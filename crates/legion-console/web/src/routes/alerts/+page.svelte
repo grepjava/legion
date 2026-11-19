@@ -50,5 +50,5 @@
     </tbody>
   </table>
 {:else}
-  <p class="muted">{t('Nothing to act on.')}</p>
+  <p class="empty">{t('Nothing to act on.')}</p>
 {/if}

@@ -719,7 +719,7 @@
         </table>
       </div>
     {:else if !loadingImages}
-      <p class="muted">{t('No cached images reported on the selected nodes.')}</p>
+      <p class="empty">{t('No cached images reported on the selected nodes.')}</p>
     {/if}
   {:else if tab === 'search'}
     <div class="split-pane">

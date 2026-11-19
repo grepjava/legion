@@ -88,7 +88,7 @@
 {#if !session.me?.all}
   <p class="muted">{t('Only the cluster admin sees the nodes’ disks.')}</p>
 {:else if !reported.length}
-  <p class="muted">{t('No node has reported its disk yet, or none keeps its data in ZFS.')}</p>
+  <p class="empty">{t('No node has reported its disk yet, or none keeps its data in ZFS.')}</p>
 {:else}
   {#each reported as n (n.node)}
     {@const used = n.zfs_used_bytes ?? 0}

@@ -104,5 +104,5 @@
     </tbody>
   </table>
 {:else if !error}
-  <p class="muted">{t('No tasks on this node.')}</p>
+  <p class="empty">{t('No tasks on this node.')}</p>
 {/if}

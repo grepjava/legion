@@ -95,6 +95,6 @@
       {/if}
     </section>
   {:else}
-    {#if asked}<p class="muted">{t('No nodes.')}</p>{/if}
+    {#if asked}<p class="empty">{t('No nodes.')}</p>{/if}
   {/each}
 {/if}

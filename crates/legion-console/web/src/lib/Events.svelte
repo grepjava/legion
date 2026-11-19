@@ -51,5 +51,5 @@
     </tbody>
   </table>
 {:else if !error}
-  <p class="muted">{t('Nothing has happened to it lately that this manager saw.')}</p>
+  <p class="empty">{t('Nothing has happened to it lately that this manager saw.')}</p>
 {/if}

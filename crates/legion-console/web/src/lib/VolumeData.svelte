@@ -204,7 +204,7 @@
         </tbody>
       </table>
     {:else if !snapLoading}
-      <p class="muted">{t('No ZFS snapshots yet.')}</p>
+      <p class="empty">{t('No ZFS snapshots yet.')}</p>
     {/if}
   {/if}
 {/if}

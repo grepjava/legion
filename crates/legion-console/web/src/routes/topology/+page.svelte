@@ -1042,7 +1042,7 @@
     {/if}
   </div>
 {:else if !error}
-  <p class="muted">{t('No services in {namespace}.', { namespace })}</p>
+  <p class="empty">{t('No services in {namespace}.', { namespace })}</p>
 {/if}
 
 <style>

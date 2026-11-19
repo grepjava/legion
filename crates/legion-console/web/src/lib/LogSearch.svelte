@@ -59,7 +59,7 @@
 {#if error}<p class="error" role="alert">{error}</p>{/if}
 {#each unread as u (u)}<p class="muted">{t('Not searched: {reason}', { reason: u })}</p>{/each}
 {#if truncated}<p class="muted">{t('More lines matched than shown: the oldest were left out.')}</p>{/if}
-{#if searched && !lines.length && !error}<p class="muted">{t('No line matched.')}</p>{/if}
+{#if searched && !lines.length && !error}<p class="empty">{t('No line matched.')}</p>{/if}
 {#if lines.length}
   <table class="found">
     <thead><tr><th>{t('Time')}</th><th>{t('Task')}</th><th>{t('Line')}</th></tr></thead>

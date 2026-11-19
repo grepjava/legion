@@ -539,7 +539,7 @@
     </table>
   </div>
 {:else}
-  <p class="muted">{t('No Volumes found in this scope.')}</p>
+  <p class="empty">{t('No Volumes found in this scope.')}</p>
 {/if}
 
 <section class="card restore-card">
@@ -700,7 +700,7 @@
           </tbody>
         </table>
       {:else if !snapBusy}
-        <p class="muted">{t('No ZFS snapshots yet.')}</p>
+        <p class="empty">{t('No ZFS snapshots yet.')}</p>
       {/if}
     {/if}
 

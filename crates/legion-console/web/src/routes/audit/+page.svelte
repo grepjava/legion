@@ -92,5 +92,5 @@
     </tbody>
   </table>
 {:else if !error && !busy}
-  <p class="muted">{t('Nothing matches.')}</p>
+  <p class="empty">{t('Nothing matches.')}</p>
 {/if}

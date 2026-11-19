@@ -145,5 +145,5 @@
     </div>
   </section>
 {:else}
-  <p class="muted">{t('No stacks here yet.')}</p>
+  <p class="empty">{t('No stacks here yet.')}</p>
 {/each}

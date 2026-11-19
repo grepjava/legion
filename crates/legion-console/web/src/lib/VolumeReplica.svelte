@@ -122,7 +122,7 @@
 </script>
 
 {#if !want && !r}
-  <p class="muted">{t('No replica: add replica to the Volume, or to the claim of the service using it, to keep a copy on another node.')}</p>
+  <p class="empty">{t('No replica: add replica to the Volume, or to the claim of the service using it, to keep a copy on another node.')}</p>
 {:else}
   <section class="replica-head">
     <span class="state {tone(shownState)}">{shownState}</span>

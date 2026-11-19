@@ -930,6 +930,31 @@ html[data-density='compact'] .card {
   border-block-end: 2px solid var(--accent);
 }
 
+/* A search in a page's head is wide enough for what it asks for. */
+.controls input[type='search'] {
+  min-width: 15rem;
+}
+/* A file picker's button is one of ours, not the browser's own. */
+input[type='file'] {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+input[type='file']::file-selector-button {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--control);
+  border-radius: 5px;
+  padding: 0.28rem 0.65rem;
+  margin-right: 0.6rem;
+  cursor: pointer;
+}
+input[type='file']:hover::file-selector-button {
+  background: var(--surface2);
+}
 .controls {
   display: flex;
   gap: 0.65rem;
