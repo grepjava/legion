@@ -473,6 +473,48 @@ spec: { text: team-b's }
         c.get("node", "", "n3")["spec"]["availability"] == "active"
     });
 
+    // --- Phase 11 ------------------------------------------------------
+    step(
+        "phase 11: a drain of n2 would strand keeper's Volume: the dialog says so and holds; the CLI refuses it alike",
+    );
+    c.page(&mut a, "/k/Node/_/n2");
+    a.click("Drain");
+    let found = a.confirmation_check().expect("the drain checked first");
+    eprintln!("the dialog: {found}");
+    assert!(
+        found.contains("Volume team-a/data-keeper-0: stays on n2: no node takes it")
+            && found.contains("It would not complete"),
+        "{found}"
+    );
+    let go = a.eval("document.querySelector('dialog.confirm[open] button[type=submit]').disabled");
+    assert_eq!(
+        go,
+        serde_json::json!(true),
+        "the drain may not be confirmed"
+    );
+    // Enter in the dialog does not take it either: it closes, and that is all.
+    a.eval("document.querySelector('dialog.confirm[open] form').requestSubmit()");
+    a.until("the dialog closed", 10, |b| {
+        b.eval("!document.querySelector('dialog.confirm[open]')") == serde_json::json!(true)
+    });
+    assert_eq!(c.get("node", "", "n2")["spec"]["availability"], "active");
+    let out = c.lab.legion(&["node", "drain", "n2", "--dry-run"], &[]);
+    let said = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "the dry run blocks: {said}");
+    assert!(
+        said.contains("BLOCKS (stranded): Volume team-a/data-keeper-0: stays on n2"),
+        "{said}"
+    );
+    let out = c.lab.legion(&["node", "drain", "n2"], &[]);
+    assert!(!out.status.success(), "refused: {}", text(&out.stdout));
+    assert!(
+        text(&out.stderr).contains("refused (--force to go ahead anyway)"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(c.get("node", "", "n2")["spec"]["availability"], "active");
+    eprintln!("the CLI: {}", text(&out.stderr).trim());
+
     step("phase 3: keeper's Volume backed up from the console");
     let volume = "data-keeper-0";
     c.page(&mut a, &format!("/k/Volume/team-a/{volume}"));

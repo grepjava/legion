@@ -309,19 +309,28 @@ impl Browser {
     }
 
     /// Presses the action of the console's confirmation (lib/Confirm.svelte)
-    /// if the last click opened it, as a user who meant it would; one asking
-    /// for a name typed is left for the test to answer.
+    /// if the last click opened it, as a user who meant it would, once the
+    /// change it checks first is checked; one asking for a name typed, or
+    /// whose check finds something blocking, is left for the test to answer.
     pub fn confirm_if_asked(&mut self) {
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < deadline {
+        let opened = Instant::now() + Duration::from_millis(500);
+        let checked = Instant::now() + Duration::from_secs(30);
+        loop {
             let r = self.eval(
                 "(() => { const d = document.querySelector('dialog.confirm[open]');
                    if (!d) return 'none';
                    if (d.querySelector('input')) return 'typed';
+                   const c = d.querySelector('[data-check]');
+                   if (c && c.dataset.check === 'checking') return 'checking';
+                   if (c && c.dataset.check === 'blocks') return 'blocks';
                    d.querySelector('button[type=submit]').click(); return 'pressed'; })()",
             );
-            if r != json!("none") {
-                return;
+            let now = Instant::now();
+            match r.as_str() {
+                Some("none") if now < opened => {}
+                Some("checking") if now < checked => {}
+                Some("checking") => panic!("the confirmation's check did not end within 30 s"),
+                _ => return,
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -341,11 +350,32 @@ impl Browser {
                return e.value; }})()"
         ));
         assert_eq!(done, json!(name), "the name typed");
-        self.until("the action enabled once the name is typed", 10, |b| {
-            b.eval("!document.querySelector('dialog.confirm[open] button[type=submit]').disabled")
-                == json!(true)
-        });
+        self.until(
+            "the action enabled once the name is typed and the change checked",
+            30,
+            |b| {
+                b.eval(
+                    "!document.querySelector('dialog.confirm[open] button[type=submit]').disabled",
+                ) == json!(true)
+            },
+        );
         self.eval("document.querySelector('dialog.confirm[open] button[type=submit]').click()");
+    }
+
+    /// What the open confirmation's check found, as its text says, once
+    /// done: none if it checks nothing.
+    pub fn confirmation_check(&mut self) -> Option<String> {
+        self.until("the confirmation's check done", 30, |b| {
+            b.eval(
+                "(() => { const c = document.querySelector('dialog.confirm[open] [data-check]');
+                   return !c || c.dataset.check !== 'checking'; })()",
+            ) == json!(true)
+        });
+        self.eval(
+            "document.querySelector('dialog.confirm[open] [data-check]')?.textContent ?? null",
+        )
+        .as_str()
+        .map(str::to_owned)
     }
 
     /// Types `value` into the field labelled `label`, as a user does.

@@ -1336,6 +1336,37 @@ fn a_drain_says_each_stage_and_refuses_a_cancel_past_the_switch_over() {
     )
     .expect("writing to the primary");
 
+    step(
+        "checked first (phase 11): with nowhere to go the drain is refused; with room, what moves and its size",
+    );
+    lab.ok(&["node", "pause", to]);
+    let out = lab.legion(&["node", "drain", &from], &[]);
+    assert_eq!(out.status.code(), Some(1), "refused: {}", text(&out.stdout));
+    assert!(
+        text(&out.stderr).contains(&format!(
+            "BLOCKS (stranded): Volume data/pg-db-0: stays on {from}: no node takes it"
+        )),
+        "{}",
+        text(&out.stderr)
+    );
+    let n = lab
+        .list("nodes", "default")
+        .into_iter()
+        .find(|n| n["metadata"]["name"] == from.as_str())
+        .unwrap();
+    assert_ne!(n["spec"]["availability"], "drain", "not drained: {n}");
+    lab.ok(&["node", "activate", to]);
+    let mut said = String::new();
+    lab.waited("the dry run with the Volume's size", 120, || {
+        let out = lab.legion(&["node", "drain", &from, "--dry-run"], &[]);
+        said = text(&out.stdout);
+        out.status.success()
+            && said.contains(&format!("Volume data/pg-db-0 moves from {from} to {to} ("))
+            && !said.contains("size not known")
+    });
+    eprintln!("{said}");
+    assert!(said.ends_with("Nothing blocks it.\n"), "{said}");
+
     step("the drain: its move prepares, sends the full copy, then waits for its task to stop");
     lab.ok(&["node", "drain", &from]);
     let moving = || lab.operation("move", "pg-db-0");
