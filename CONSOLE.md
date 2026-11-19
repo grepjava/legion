@@ -782,6 +782,23 @@ its attempts fail, as the alert says.
 **Done when** one side of a mirrored pool taken offline raises
 `pool-degraded` within 30 s, leading to the node.
 
+**Built so far.** Each agent reads its host and pools every 10 s
+(`zpool status -j`, OpenZFS 2.3 and later; `freebsd-version`, the boot
+method and time) and its heartbeat carries them; the leader writes them
+into the Node's status when they change, a pool's space in steps of a
+percent so ordinary writes don't rewrite it. A node says which build it
+runs (a digest of its executable), which `version-skew` compares. The
+alerts above are raised on the node (`Node/<name>`), `pool-degraded` a
+warning while the pool still serves and critical once it doesn't; a node
+that schedules none is held to a scrub every 35 days. `legion node pools`,
+`legion node errors-seen` and `legion node scrub` (`scrubEveryDays`, the
+agent starting each scrub due); a node's page shows its host and pools
+with the same two actions. The lab test passed at 39515a2 on one VM:
+`pool-degraded` 10.3 s after a mirror's side went offline, gone once it
+was back, and a scrub started once scheduled. Still to come: the load
+average (with the node's telemetry rather than its status, as it changes
+every second), and the overview's cluster CPU, memory and disk.
+
 ### Phase 9: alerts sent
 
 - An `AlertReceiver` kind: a webhook, ntfy or SMTP, its credentials in a
