@@ -98,7 +98,8 @@ change, until each settles, and reports the difference:
 
 - the Volumes that move, from where to where, and how much data each holds;
 - what blocks it: work no node would take (`unplaced`), a Volume left where
-  it is (`stranded`), a task still on a drained node (`stays`), a node whose
+  it is (`stranded`), a Volume's move waiting on tasks that may not stop
+  (`held`), a task still on a drained node (`stays`), a node whose
   pools lack room for the data moving there (`no-room`), data lost with a
   node that is still up (`lost`: drain it first), a cancel of a move past its
   switch-over (`switch-over`);

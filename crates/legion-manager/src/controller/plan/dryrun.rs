@@ -283,13 +283,25 @@ pub fn dry_run(
         }
         for r in d.remaining.iter().filter(|_| d.reason != "unreachable") {
             let (reason, message) = match r.kind.as_str() {
-                "Volume" => (
-                    "stranded",
-                    format!(
-                        "stays on {node}: {}",
-                        nowhere(&after, &r.namespace, &r.name, node)
+                // On its way, it waits for what holds its tasks (said of
+                // them); with nowhere to go, it stays.
+                "Volume" => match after
+                    .volumes
+                    .get(&(r.namespace.clone(), r.name.clone()))
+                    .and_then(|v| v.status.migration.as_ref())
+                {
+                    Some(m) => (
+                        "held",
+                        format!("its move to {} waits for its tasks to stop", m.to),
                     ),
-                ),
+                    None => (
+                        "stranded",
+                        format!(
+                            "stays on {node}: {}",
+                            nowhere(&after, &r.namespace, &r.name, node)
+                        ),
+                    ),
+                },
                 _ => ("stays", format!("keeps running on {node} ({})", r.reason)),
             };
             findings.push(Finding {
@@ -328,8 +340,16 @@ pub fn dry_run(
         let (Some(was), Some(would)) = (cluster.volumes.get(key), base.volumes.get(key)) else {
             continue;
         };
-        let (from, to) = (&was.status.node, &v.status.node);
-        if from.is_empty() || to.is_empty() || to == from || *to == would.status.node {
+        // Where it ends, or goes: a move held on the way (by a budget, say)
+        // still sends its data there.
+        let ends = |v: &super::Volume| {
+            v.status
+                .migration
+                .as_ref()
+                .map_or(v.status.node.clone(), |m| m.to.clone())
+        };
+        let (from, to) = (&was.status.node, &ends(v));
+        if from.is_empty() || to.is_empty() || to == from || *to == ends(would) {
             continue;
         }
         moves.push(Move {

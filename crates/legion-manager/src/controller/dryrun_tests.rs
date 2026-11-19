@@ -146,8 +146,7 @@ fn a_drain_says_what_the_budget_holds_back() {
     w.service(
         "db",
         &format!(
-            "{}
-maxUnavailable: 1",
+            "{}\nmaxUnavailable: 1",
             STATEFUL.replace("replicas: 3", "replicas: 2")
         ),
     );
@@ -342,5 +341,39 @@ fn a_volume_asked_onto_a_node_not_there() {
     assert_eq!(
         said(&d),
         ["blocking stranded Volume shop/held: stays on n1: node n9 is not in the cluster"]
+    );
+}
+
+/// A budget that lets no task stop holds the drain: it blocks, saying so,
+/// and says where the data would go and how much there is.
+#[test]
+fn a_budget_that_lets_nothing_stop_blocks_the_drain() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.service(
+        "db",
+        &format!(
+            "{}\nmaxUnavailable: 0",
+            STATEFUL.replace("replicas: 3", "replicas: 1")
+        ),
+    );
+    w.settle();
+    let from = w.placed("db")[0].clone();
+    let to = if from == "n1" { "n2" } else { "n1" };
+    let mut facts = Facts::default();
+    facts.used.insert("shop/data-db-0".into(), 200 << 20);
+    let d = w.check(drain(&from), &facts);
+    assert!(d.blocks());
+    assert_eq!(
+        said(&d),
+        [format!("blocking held Volume shop/data-db-0: its move to {to} waits for its tasks to stop"), format!(
+            "blocking stays Task shop/db-0-1: keeps running on {from} (budget)"
+        ), "warning budget Service shop/db: its disruption budget (maxUnavailable 0) holds 1 of its task(s) back until the others run again: they move a few at a time".to_owned()]
+    );
+    assert_eq!(d.moves.len(), 1);
+    assert_eq!(
+        (d.moves[0].to.as_str(), d.moves[0].bytes),
+        (to, Some(200 << 20))
     );
 }

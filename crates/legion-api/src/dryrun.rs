@@ -70,6 +70,8 @@ pub struct Finding {
     pub severity: Severity,
     /// A stable word a tool can act on: `unplaced` (tasks no node would
     /// take), `stranded` (a Volume the change would leave where it is),
+    /// `held` (a Volume's move waiting on tasks that may not stop), `stays`
+    /// (a task left on a drained node),
     /// `no-room` (a node without the space for what moves there), `lost`
     /// (data that goes with a removed node), `unreachable` (a node whose
     /// tasks are not known), `budget` (tasks that move a few at a time),
