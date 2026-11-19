@@ -72,7 +72,11 @@ impl Note {
             )
         };
         match self.change {
-            Change::Raised => format!("[{}] {}: {what}", self.cluster, self.alert.severity.as_str()),
+            Change::Raised => format!(
+                "[{}] {}: {what}",
+                self.cluster,
+                self.alert.severity.as_str()
+            ),
             Change::Cleared => format!("[{}] cleared: {what}", self.cluster),
             Change::Test => format!("[{}] a test from Legion", self.cluster),
         }
@@ -105,7 +109,13 @@ impl Note {
 /// What a header line may hold: no line ends, nothing beyond ASCII.
 fn header_safe(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii() && !c.is_ascii_control() { c } else { ' ' })
+        .map(|c| {
+            if c.is_ascii() && !c.is_ascii_control() {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect()
 }
 
@@ -116,12 +126,22 @@ fn from_key(key: &str) -> Option<Alert> {
     let kind = parts.next()?;
     let namespace = parts.next()?.to_owned();
     let object = parts.next().unwrap_or_default().to_owned();
-    let kind = legion_api::alert::KINDS.into_iter().find(|k| k.as_str() == kind)?;
+    let kind = legion_api::alert::KINDS
+        .into_iter()
+        .find(|k| k.as_str() == kind)?;
     Some(Alert {
         kind,
         severity: legion_api::alert::Severity::Warning,
         namespace,
-        message: format!("{}{}", kind.as_str(), if object.is_empty() { String::new() } else { format!(" on {object}") }),
+        message: format!(
+            "{}{}",
+            kind.as_str(),
+            if object.is_empty() {
+                String::new()
+            } else {
+                format!(" on {object}")
+            }
+        ),
         object,
     })
 }
@@ -198,11 +218,12 @@ fn answered(r: reqwest::Result<reqwest::Response>) -> Result<(), String> {
 
 /// A mail of `note` through `s` (RFC 5321): EHLO, STARTTLS when asked,
 /// AUTH PLAIN with a login, then the envelope and the message.
-async fn mail(s: &legion_api::alert::Smtp, password: Option<&str>, note: &Note) -> Result<(), String> {
-    let (host, _) = s
-        .server
-        .rsplit_once(':')
-        .ok_or("the server is host:port")?;
+async fn mail(
+    s: &legion_api::alert::Smtp,
+    password: Option<&str>,
+    note: &Note,
+) -> Result<(), String> {
+    let (host, _) = s.server.rsplit_once(':').ok_or("the server is host:port")?;
     let tcp = tokio::net::TcpStream::connect(&s.server)
         .await
         .map_err(|e| format!("connecting to {}: {e}", s.server))?;
@@ -272,7 +293,10 @@ async fn converse<S: AsyncRead + AsyncWrite + Unpin>(
         s.to.join(", "),
         header_safe(&note.title()),
     );
-    for line in note.body().lines().chain(["", &format!("({}: {})", note.alert.key(), note.change.as_str())]) {
+    for line in note.body().lines().chain([
+        "",
+        &format!("({}: {})", note.alert.key(), note.change.as_str()),
+    ]) {
         // A line starting with a dot is sent with another (RFC 5321 4.5.2).
         if line.starts_with('.') {
             message.push('.');
@@ -304,7 +328,9 @@ fn httpdate(at: std::time::SystemTime) -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
-    let names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let names = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
     format!(
         "{weekday}, {day:02} {} {year} {:02}:{:02}:{:02} +0000",
         names[(month - 1) as usize],
@@ -321,7 +347,9 @@ struct Conn<S> {
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     fn new(io: S) -> Self {
-        Conn { io: BufReader::new(io) }
+        Conn {
+            io: BufReader::new(io),
+        }
     }
 
     fn into_inner(self) -> S {
@@ -334,7 +362,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             .write_all(s.as_bytes())
             .await
             .map_err(|e| format!("to the mail server: {e}"))?;
-        self.io.get_mut().flush().await.map_err(|e| format!("to the mail server: {e}"))
+        self.io
+            .get_mut()
+            .flush()
+            .await
+            .map_err(|e| format!("to the mail server: {e}"))
     }
 
     /// A reply, its lines joined; an error unless its code is `want`.
@@ -459,7 +491,11 @@ async fn pass(
     let now = Instant::now();
     for r in receivers {
         let name = r.metadata.name.clone();
-        if failing.get(&name).and_then(|f| f.next).is_some_and(|t| t > now) {
+        if failing
+            .get(&name)
+            .and_then(|f| f.next)
+            .is_some_and(|t| t > now)
+        {
             continue;
         }
         let Ok(spec) = legion_api::parse::<ReceiverSpec>(&r.spec) else {
@@ -627,8 +663,14 @@ mod tests {
 
     #[test]
     fn a_note_reads_as_its_change() {
-        assert_eq!(note(Change::Raised).title(), "[lab] critical: node-down Node/n2");
-        assert_eq!(note(Change::Cleared).title(), "[lab] cleared: node-down Node/n2");
+        assert_eq!(
+            note(Change::Raised).title(),
+            "[lab] critical: node-down Node/n2"
+        );
+        assert_eq!(
+            note(Change::Cleared).title(),
+            "[lab] cleared: node-down Node/n2"
+        );
         let j = note(Change::Raised).json();
         assert_eq!(j["state"], "raised");
         assert_eq!(j["id"], "node-down//Node/n2");
@@ -640,10 +682,16 @@ mod tests {
     #[test]
     fn an_alert_gone_is_known_again_from_its_key() {
         let a = from_key("node-down//Node/n2").unwrap();
-        assert_eq!((a.kind, a.namespace.as_str(), a.object.as_str()), (AlertKind::NodeDown, "", "Node/n2"));
+        assert_eq!(
+            (a.kind, a.namespace.as_str(), a.object.as_str()),
+            (AlertKind::NodeDown, "", "Node/n2")
+        );
         assert_eq!(a.key(), "node-down//Node/n2");
         let a = from_key("crash-loop/shop/Task/web-1").unwrap();
-        assert_eq!((a.namespace.as_str(), a.object.as_str()), ("shop", "Task/web-1"));
+        assert_eq!(
+            (a.namespace.as_str(), a.object.as_str()),
+            ("shop", "Task/web-1")
+        );
         assert!(from_key("no-such-kind//x").is_none());
     }
 
@@ -651,7 +699,10 @@ mod tests {
     fn a_mails_date_is_rfc_5322() {
         let at = std::time::UNIX_EPOCH + Duration::from_secs(1_795_035_876);
         assert_eq!(httpdate(at), "Wed, 18 Nov 2026 21:04:36 +0000");
-        assert_eq!(httpdate(std::time::UNIX_EPOCH), "Thu, 01 Jan 1970 00:00:00 +0000");
+        assert_eq!(
+            httpdate(std::time::UNIX_EPOCH),
+            "Thu, 01 Jan 1970 00:00:00 +0000"
+        );
     }
 
     /// A mail server of a few lines: answers each command, keeps what it
@@ -710,8 +761,14 @@ mod tests {
         let got = server.await.unwrap();
         assert!(got.contains("MAIL FROM:<legion@example.com>\r\n"), "{got}");
         assert!(got.contains("RCPT TO:<ops@example.com>\r\n"), "{got}");
-        assert!(got.contains("Subject: [lab] critical: node-down Node/n2\r\n"), "{got}");
-        assert!(got.contains("\r\n..dot line\r\n"), "a dot line is doubled: {got}");
+        assert!(
+            got.contains("Subject: [lab] critical: node-down Node/n2\r\n"),
+            "{got}"
+        );
+        assert!(
+            got.contains("\r\n..dot line\r\n"),
+            "a dot line is doubled: {got}"
+        );
         assert!(got.contains("AUTH PLAIN AGxlZ2lvbgBwdw==\r\n"), "{got}");
     }
 }

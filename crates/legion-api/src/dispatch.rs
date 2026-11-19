@@ -204,7 +204,10 @@ pub fn parse_loadavg(raw: &str) -> Option<[u32; 3]> {
 mod load_tests {
     #[test]
     fn the_load_average_is_read_in_hundredths() {
-        assert_eq!(super::parse_loadavg("{ 0.14 0.10 2.08 }"), Some([14, 10, 208]));
+        assert_eq!(
+            super::parse_loadavg("{ 0.14 0.10 2.08 }"),
+            Some([14, 10, 208])
+        );
         assert_eq!(super::parse_loadavg("{ 0.14 }"), None);
         assert_eq!(super::parse_loadavg(""), None);
     }

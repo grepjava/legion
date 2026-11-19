@@ -29,8 +29,8 @@ pub mod control;
 pub mod doctor;
 pub mod exports;
 pub mod fake;
-pub mod host;
 mod files;
+pub mod host;
 mod image_ops;
 pub mod ingress;
 mod logins;
@@ -1256,10 +1256,14 @@ async fn host_reads<C: Control>(sys: Arc<dyn Sys>, control: Arc<C>, hosted: Host
                 }
                 tried.insert(pool.clone(), tokio::time::Instant::now());
                 let p = pool.clone();
-                match task::blocking(&sys, move |sys| sys.run_program("zpool", &["scrub", &p], ""))
-                    .await
+                match task::blocking(&sys, move |sys| {
+                    sys.run_program("zpool", &["scrub", &p], "")
+                })
+                .await
                 {
-                    Ok(_) => tracing::info!(%pool, every = days, "scrub started, as the node schedules"),
+                    Ok(_) => {
+                        tracing::info!(%pool, every = days, "scrub started, as the node schedules")
+                    }
                     Err(e) => tracing::warn!(%pool, "starting a scrub: {e}"),
                 }
             }

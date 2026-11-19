@@ -163,7 +163,11 @@ pub(crate) fn current(api: &ApiService) -> Vec<(Alert, i64)> {
     );
     // Each node's spec and status as read; a node down says nothing of
     // its pools or build that is current.
-    let read: Vec<(&str, legion_api::node::NodeSpec, legion_api::node::NodeStatus)> = nodes
+    let read: Vec<(
+        &str,
+        legion_api::node::NodeSpec,
+        legion_api::node::NodeStatus,
+    )> = nodes
         .iter()
         .map(|n| {
             (

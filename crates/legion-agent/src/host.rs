@@ -19,7 +19,11 @@ pub fn read(sys: &dyn Sys) -> HostReport {
     let host = run("freebsd-version", &["-u"]).map(|release| HostFacts {
         release,
         kernel: run("freebsd-version", &["-k"]).unwrap_or_default(),
-        boot: sys.sysctl_get("machdep.bootmethod").unwrap_or_default().trim().to_owned(),
+        boot: sys
+            .sysctl_get("machdep.bootmethod")
+            .unwrap_or_default()
+            .trim()
+            .to_owned(),
         booted_ms: sys
             .sysctl_get("kern.boottime")
             .ok()
@@ -89,16 +93,19 @@ pub fn pools(json: &str) -> Vec<Pool> {
                 }
             }
             let s = &p["scan_stats"];
-            let scan = s["function"].as_str().filter(|f| !f.is_empty() && *f != "NONE").map(|f| {
-                let at = |k: &str| Some(num(&s[k]) as i64 * 1000).filter(|t| *t > 0);
-                PoolScan {
-                    function: f.to_lowercase(),
-                    state: s["state"].as_str().unwrap_or_default().to_lowercase(),
-                    start_ms: at("start_time"),
-                    end_ms: at("end_time"),
-                    errors: num(&s["errors"]),
-                }
-            });
+            let scan = s["function"]
+                .as_str()
+                .filter(|f| !f.is_empty() && *f != "NONE")
+                .map(|f| {
+                    let at = |k: &str| Some(num(&s[k]) as i64 * 1000).filter(|t| *t > 0);
+                    PoolScan {
+                        function: f.to_lowercase(),
+                        state: s["state"].as_str().unwrap_or_default().to_lowercase(),
+                        start_ms: at("start_time"),
+                        end_ms: at("end_time"),
+                        errors: num(&s["errors"]),
+                    }
+                });
             Pool {
                 name: name.clone(),
                 state: p["state"].as_str().unwrap_or("UNKNOWN").to_owned(),
@@ -157,14 +164,21 @@ mod tests {
         let p = pools(STATUS);
         assert_eq!(p.len(), 2);
         let (tank, zroot) = (&p[0], &p[1]);
-        assert_eq!((tank.name.as_str(), tank.state.as_str()), ("tank", "DEGRADED"));
+        assert_eq!(
+            (tank.name.as_str(), tank.state.as_str()),
+            ("tank", "DEGRADED")
+        );
         assert_eq!(
             (tank.read_errors, tank.write_errors, tank.checksum_errors),
             (2, 1, 5),
             "every device's errors, however deep"
         );
         assert_eq!(tank.scan, None, "never scanned");
-        assert_eq!((tank.size_bytes, tank.alloc_bytes), (100_000, 1000), "numbers as strings too");
+        assert_eq!(
+            (tank.size_bytes, tank.alloc_bytes),
+            (100_000, 1000),
+            "numbers as strings too"
+        );
         assert!(zroot.healthy());
         assert_eq!(zroot.scrubbed_ms(), Some(1_794_226_751_000));
         assert_eq!(zroot.percent_used(), 21);

@@ -339,7 +339,10 @@ pub fn alerts(i: &Inputs) -> Vec<Alert> {
                     pool.write_errors,
                     pool.checksum_errors,
                     if p.errors_seen > 0 {
-                        format!(", {} more than taken as seen", pool.errors() - p.errors_seen)
+                        format!(
+                            ", {} more than taken as seen",
+                            pool.errors() - p.errors_seen
+                        )
                     } else {
                         String::new()
                     },
@@ -606,7 +609,11 @@ fn http_url(url: &str) -> bool {
 impl crate::admit::Spec for ReceiverSpec {
     fn admit(&mut self) -> Result<(), crate::admit::Invalid> {
         use crate::admit::{Invalid, field, index};
-        let ways = [self.webhook.is_some(), self.ntfy.is_some(), self.smtp.is_some()];
+        let ways = [
+            self.webhook.is_some(),
+            self.ntfy.is_some(),
+            self.smtp.is_some(),
+        ];
         if ways.iter().filter(|w| **w).count() != 1 {
             return Err(Invalid::new(
                 "",
@@ -616,7 +623,10 @@ impl crate::admit::Spec for ReceiverSpec {
         if let Some(w) = &self.webhook
             && !http_url(&w.url)
         {
-            return Err(Invalid::new(field("webhook", "url"), "an http:// or https:// URL"));
+            return Err(Invalid::new(
+                field("webhook", "url"),
+                "an http:// or https:// URL",
+            ));
         }
         if let Some(n) = &self.ntfy
             && !http_url(&n.url)
@@ -632,7 +642,10 @@ impl crate::admit::Spec for ReceiverSpec {
                 p.parse::<u16>().ok()
             });
             if port.is_none() {
-                return Err(Invalid::new(field("smtp", "server"), "host:port, e.g. mail.example.com:587"));
+                return Err(Invalid::new(
+                    field("smtp", "server"),
+                    "host:port, e.g. mail.example.com:587",
+                ));
             }
             // Nothing that could end a line of the mail's header or of the
             // envelope's command, and start another.
@@ -666,7 +679,11 @@ impl crate::admit::Spec for ReceiverSpec {
                     index("", "kinds", i),
                     format!(
                         "an alert's kind: {}",
-                        KINDS.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(", ")
+                        KINDS
+                            .iter()
+                            .map(|a| a.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     ),
                 ));
             }
@@ -821,7 +838,11 @@ mod tests {
         assert_eq!(a[0].kind, AlertKind::PoolDegraded);
         assert_eq!(a[0].severity, Severity::Warning);
         assert_eq!(a[0].object, "Node/n1");
-        assert!(a[0].message.contains("tank on n1 is DEGRADED"), "{}", a[0].message);
+        assert!(
+            a[0].message.contains("tank on n1 is DEGRADED"),
+            "{}",
+            a[0].message
+        );
         let a = with_pool(&pool("SUSPENDED", 10), 0, false, 0);
         assert_eq!(a[0].severity, Severity::Critical);
         assert_eq!(with_pool(&pool("ONLINE", 10), 0, false, 0), []);
@@ -833,18 +854,29 @@ mod tests {
         p.checksum_errors = 3;
         let a = with_pool(&p, 0, false, 0);
         assert_eq!(a[0].kind, AlertKind::PoolErrors);
-        assert!(a[0].message.contains("3 checksum errors"), "{}", a[0].message);
+        assert!(
+            a[0].message.contains("3 checksum errors"),
+            "{}",
+            a[0].message
+        );
         assert_eq!(with_pool(&p, 3, false, 0), [], "taken as seen");
         p.read_errors = 1;
         let a = with_pool(&p, 3, false, 0);
-        assert!(a[0].message.contains("1 more than taken as seen"), "{}", a[0].message);
+        assert!(
+            a[0].message.contains("1 more than taken as seen"),
+            "{}",
+            a[0].message
+        );
     }
 
     #[test]
     fn a_filling_pool_warns_at_80_and_is_critical_at_90() {
         assert_eq!(with_pool(&pool("ONLINE", 79), 0, false, 0), []);
         let a = with_pool(&pool("ONLINE", 80), 0, false, 0);
-        assert_eq!((a[0].kind, a[0].severity), (AlertKind::PoolNearlyFull, Severity::Warning));
+        assert_eq!(
+            (a[0].kind, a[0].severity),
+            (AlertKind::PoolNearlyFull, Severity::Warning)
+        );
         let a = with_pool(&pool("ONLINE", 90), 0, false, 0);
         assert_eq!(a[0].severity, Severity::Critical);
         assert!(a[0].message.contains("10 GiB free"), "{}", a[0].message);
@@ -863,7 +895,11 @@ mod tests {
         assert_eq!(with_pool(&p, 0, false, 35 * day), []);
         let a = with_pool(&p, 0, false, 36 * day);
         assert_eq!(a[0].kind, AlertKind::ScrubOverdue);
-        assert!(a[0].message.contains("last scrubbed 36d ago"), "{}", a[0].message);
+        assert!(
+            a[0].message.contains("last scrubbed 36d ago"),
+            "{}",
+            a[0].message
+        );
         p.scan.as_mut().unwrap().state = "scanning".into();
         assert_eq!(with_pool(&p, 0, false, 36 * day), [], "one runs now");
         // Never scrubbed: overdue only where scrubs are scheduled.
@@ -877,14 +913,20 @@ mod tests {
     fn nodes_on_different_builds_are_a_skew() {
         let i = Inputs {
             leader: true,
-            versions: vec![("n1", "0.2.0 (abc)"), ("n2", "0.2.0 (def)"), ("n3", "0.2.0 (abc)"), ("n4", "")],
+            versions: vec![
+                ("n1", "0.2.0 (abc)"),
+                ("n2", "0.2.0 (def)"),
+                ("n3", "0.2.0 (abc)"),
+                ("n4", ""),
+            ],
             ..Default::default()
         };
         let a = alerts(&i);
         assert_eq!(a.len(), 1, "{a:?}");
         assert_eq!(a[0].kind, AlertKind::VersionSkew);
         assert!(
-            a[0].message.contains("0.2.0 (abc) on n1, n3; 0.2.0 (def) on n2"),
+            a[0].message
+                .contains("0.2.0 (abc) on n1, n3; 0.2.0 (def) on n2"),
             "{}",
             a[0].message
         );
@@ -909,13 +951,19 @@ mod tests {
         assert!(receiver("ntfy: {url: https://ntfy.sh/ops}").is_ok());
         let e = receiver("{}").unwrap_err();
         assert!(e.contains("exactly one"), "{e}");
-        let e = receiver("webhook: {url: https://a.example}
-ntfy: {url: https://ntfy.sh/x}").unwrap_err();
+        let e = receiver(
+            "webhook: {url: https://a.example}
+ntfy: {url: https://ntfy.sh/x}",
+        )
+        .unwrap_err();
         assert!(e.contains("exactly one"), "{e}");
         let e = receiver("webhook: {url: ftp://a.example}").unwrap_err();
         assert!(e.contains("http"), "{e}");
-        let e = receiver("webhook: {url: https://a.example}
-kinds: [node-gone]").unwrap_err();
+        let e = receiver(
+            "webhook: {url: https://a.example}
+kinds: [node-gone]",
+        )
+        .unwrap_err();
         assert!(e.contains("node-down"), "lists the kinds there are: {e}");
         let e = receiver("smtp: {server: mail.example, from: a@example.com, to: [b@example.com]}")
             .unwrap_err();
@@ -944,18 +992,27 @@ kinds: [node-gone]").unwrap_err();
         let all = receiver("webhook: {url: https://a.example}").unwrap();
         assert!(all.wants(&alert(AlertKind::NodeDown, Severity::Critical, "")));
         assert!(all.wants(&alert(AlertKind::CrashLoop, Severity::Warning, "shop")));
-        let critical = receiver("webhook: {url: https://a.example}
-severity: critical").unwrap();
+        let critical = receiver(
+            "webhook: {url: https://a.example}
+severity: critical",
+        )
+        .unwrap();
         assert!(critical.wants(&alert(AlertKind::NodeDown, Severity::Critical, "")));
         assert!(!critical.wants(&alert(AlertKind::CrashLoop, Severity::Warning, "shop")));
-        let shop = receiver("webhook: {url: https://a.example}
+        let shop = receiver(
+            "webhook: {url: https://a.example}
 namespaces: [shop]
-kinds: [crash-loop]").unwrap();
+kinds: [crash-loop]",
+        )
+        .unwrap();
         assert!(shop.wants(&alert(AlertKind::CrashLoop, Severity::Warning, "shop")));
         assert!(!shop.wants(&alert(AlertKind::CrashLoop, Severity::Warning, "blog")));
         assert!(!shop.wants(&alert(AlertKind::NodeDown, Severity::Critical, "")));
-        let cluster = receiver("webhook: {url: https://a.example}
-namespaces: ['']").unwrap();
+        let cluster = receiver(
+            "webhook: {url: https://a.example}
+namespaces: ['']",
+        )
+        .unwrap();
         assert!(cluster.wants(&alert(AlertKind::NodeDown, Severity::Critical, "")));
         assert!(!cluster.wants(&alert(AlertKind::CrashLoop, Severity::Warning, "shop")));
     }

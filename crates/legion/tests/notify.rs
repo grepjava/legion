@@ -54,7 +54,9 @@ impl Hook {
                     eprintln!("webhook: {} {}", v["state"], v["id"]);
                     kept.lock().unwrap().push(v);
                 }
-                let _ = conn.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                let _ = conn.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                );
             }
         });
         Hook { got }
@@ -125,7 +127,9 @@ fn a_node_down_reaches_a_webhook_once_across_a_change_of_leader() {
     lab.join(0, &manager, Role::Manager);
     lab.join(1, &manager, Role::Manager);
     wait("three ready nodes", 120, || {
-        ["n1", "n2", "n3"].iter().all(|n| lab.node_state(n) == "ready")
+        ["n1", "n2", "n3"]
+            .iter()
+            .all(|n| lab.node_state(n) == "ready")
     });
     let hook = Hook::start();
     let receiver = lab.dir.join("receiver.yaml");
@@ -142,7 +146,9 @@ fn a_node_down_reaches_a_webhook_once_across_a_change_of_leader() {
 
     step("a test reaches it");
     lab.ok(&["alerts", "test", "ops"]);
-    wait("the test at the webhook", 30, || hook.count("test", "node-suspect//") == 1);
+    wait("the test at the webhook", 30, || {
+        hook.count("test", "node-suspect//") == 1
+    });
 
     let first = leader(&lab, &lab.server()).expect("a leader");
     let down = if first == "n2" { "n3" } else { "n2" };
@@ -154,15 +160,26 @@ fn a_node_down_reaches_a_webhook_once_across_a_change_of_leader() {
     let out = lab.ssh(&lab.vms[i], "pkill -KILL -f 'legion-lab daemon'");
     assert!(out.status.success(), "{}", text(&out.stderr));
     let id = format!("node-down//Node/{down}");
-    wait("node-down at the webhook", 60, || hook.count("raised", &id) == 1);
-    eprintln!("node-down of {down} at the webhook {} ms after its daemon was killed", killed.elapsed().as_millis());
+    wait("node-down at the webhook", 60, || {
+        hook.count("raised", &id) == 1
+    });
+    eprintln!(
+        "node-down of {down} at the webhook {} ms after its daemon was killed",
+        killed.elapsed().as_millis()
+    );
 
     step("back: its clearing reaches the webhook");
     lab.restart_vm(i, Role::Manager);
-    wait("the node ready again", 120, || lab.node_state(down) == "ready");
-    wait("the clearing at the webhook", 90, || hook.count("cleared", &id) == 1);
+    wait("the node ready again", 120, || {
+        lab.node_state(down) == "ready"
+    });
+    wait("the clearing at the webhook", 90, || {
+        hook.count("cleared", &id) == 1
+    });
 
-    step("the leader's daemon killed: its node-down reaches the webhook within 60 s, from the next");
+    step(
+        "the leader's daemon killed: its node-down reaches the webhook within 60 s, from the next",
+    );
     let lead = leader(&lab, &lab.server()).expect("a leader");
     let killed = Instant::now();
     if lead == "n1" {
@@ -170,7 +187,10 @@ fn a_node_down_reaches_a_webhook_once_across_a_change_of_leader() {
         child.kill().unwrap();
         let _ = child.wait();
     } else {
-        let out = lab.ssh(&lab.vms[common::vm(&lead)], "pkill -KILL -f 'legion-lab daemon'");
+        let out = lab.ssh(
+            &lab.vms[common::vm(&lead)],
+            "pkill -KILL -f 'legion-lab daemon'",
+        );
         assert!(out.status.success(), "{}", text(&out.stderr));
     }
     let other = servers
@@ -180,8 +200,13 @@ fn a_node_down_reaches_a_webhook_once_across_a_change_of_leader() {
         .map(|(s, _)| s.clone())
         .unwrap();
     let lead_id = format!("node-down//Node/{lead}");
-    wait("the leader's node-down at the webhook", 60, || hook.count("raised", &lead_id) == 1);
-    eprintln!("node-down of {lead}, the leader, at the webhook {} ms after its daemon was killed", killed.elapsed().as_millis());
+    wait("the leader's node-down at the webhook", 60, || {
+        hook.count("raised", &lead_id) == 1
+    });
+    eprintln!(
+        "node-down of {lead}, the leader, at the webhook {} ms after its daemon was killed",
+        killed.elapsed().as_millis()
+    );
     let next = leader(&lab, &other).expect("a new leader");
     assert_ne!(next, lead, "a new leader sent it");
 
@@ -203,11 +228,19 @@ fn a_node_down_reaches_a_webhook_once_across_a_change_of_leader() {
         "each message once"
     );
     let status: Value = serde_json::from_str(&text(
-        &lab.legion_at(&other, &lab.admin(), &["get", "alertreceiver", "ops", "-o", "json"])
-            .stdout,
+        &lab.legion_at(
+            &other,
+            &lab.admin(),
+            &["get", "alertreceiver", "ops", "-o", "json"],
+        )
+        .stdout,
     ))
     .unwrap_or(Value::Null);
-    assert_eq!(status["status"]["sent"], serde_json::json!([lead_id]), "{status}");
+    assert_eq!(
+        status["status"]["sent"],
+        serde_json::json!([lead_id]),
+        "{status}"
+    );
     assert!(status["status"]["error"].is_null(), "{status}");
 
     step("the old leader back, for the teardown");

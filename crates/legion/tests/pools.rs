@@ -178,8 +178,7 @@ fn a_pool_losing_a_device_is_degraded_on_its_node_within_30_s() {
         legion(&lab, &["status"]).status.success()
     });
     ok(&lab, &["init"]);
-    let nodes: Value =
-        serde_json::from_str(&ok(&lab, &["list", "nodes", "-o", "json"])).unwrap();
+    let nodes: Value = serde_json::from_str(&ok(&lab, &["list", "nodes", "-o", "json"])).unwrap();
     let node = match &nodes {
         Value::Array(v) => v[0]["metadata"]["name"].as_str().unwrap().to_owned(),
         one => one["metadata"]["name"].as_str().unwrap().to_owned(),
@@ -192,10 +191,17 @@ fn a_pool_losing_a_device_is_degraded_on_its_node_within_30_s() {
     let n: Value = serde_json::from_str(&ok(&lab, &["get", "node", &node, "-o", "json"])).unwrap();
     let host = &n["status"]["host"];
     assert!(
-        host["release"].as_str().is_some_and(|r| r.contains("RELEASE") || r.contains("STABLE") || r.contains("CURRENT")),
+        host["release"]
+            .as_str()
+            .is_some_and(|r| r.contains("RELEASE")
+                || r.contains("STABLE")
+                || r.contains("CURRENT")),
         "the host's release: {host}"
     );
-    assert!(host["bootedMs"].as_i64().is_some_and(|t| t > 0), "when it booted: {host}");
+    assert!(
+        host["bootedMs"].as_i64().is_some_and(|t| t > 0),
+        "when it booted: {host}"
+    );
     assert!(
         ok(&lab, &["node", "pools", &node]).contains(POOL),
         "legion node pools lists it"
@@ -207,7 +213,10 @@ fn a_pool_losing_a_device_is_degraded_on_its_node_within_30_s() {
     let took = wait("pool-degraded", 30, || {
         !alerted(&lab, "pool-degraded", &node).is_empty()
     });
-    eprintln!("pool-degraded raised {} ms after the side went offline", took.as_millis());
+    eprintln!(
+        "pool-degraded raised {} ms after the side went offline",
+        took.as_millis()
+    );
     let raised = &alerted(&lab, "pool-degraded", &node)[0];
     assert_eq!(raised["severity"], "warning", "{raised}");
     assert!(
