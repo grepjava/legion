@@ -569,7 +569,13 @@ export interface NodeUsage {
   jails_bytes?: number;
   /** jailer's store on a builder, outside Legion's ZFS root. */
   build_bytes?: number;
+  /** The host's load averages over 1, 5 and 15 minutes, in hundredths. */
+  load?: [number, number, number];
 }
+
+/** Load averages, in hundredths, as `uptime` writes them. */
+export const loadText = (l?: number[]) =>
+  l && l.some((x) => x > 0) ? l.map((x) => (x / 100).toFixed(2)).join(' · ') : '';
 
 /**
  * A task's output as it comes: `out` gets each piece (and whether it was

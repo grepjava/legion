@@ -4,7 +4,7 @@
   // booted; each pool's health, how full, its errors and its last scrub.
   // The errors can be taken as seen, and the scrubs scheduled, as
   // `legion node errors-seen` and `legion node scrub` do.
-  import { api, bytes, type LObject } from './api.ts';
+  import { api, bytes, loadText, type LObject } from './api.ts';
   import { ask } from './confirm.svelte.ts';
   import { t } from './i18n.svelte.ts';
   import { cannotWrite } from './session.svelte.ts';
@@ -36,6 +36,28 @@
   const pools = $derived((node.status?.pools ?? []) as Pool[]);
   const seen = $derived((node.spec?.poolErrorsSeen ?? {}) as Record<string, number>);
   const why = $derived(cannotWrite(''));
+
+  // The load moves every second: asked for with the usage, not stored.
+  let load = $state('');
+  $effect(() => {
+    const n = name;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    async function poll() {
+      try {
+        const u = await api.usage();
+        load = loadText(u.nodes.find((x) => x.node === n)?.load);
+      } catch {
+        load = '';
+      }
+      if (!stopped) timer = setTimeout(poll, 5000);
+    }
+    timer = setTimeout(poll, 0);
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+  });
 
   const errors = (p: Pool) => (p.readErrors ?? 0) + (p.writeErrors ?? 0) + (p.checksumErrors ?? 0);
   const pct = (p: Pool) => (p.sizeBytes ? Math.round((p.allocBytes / p.sizeBytes) * 100) : 0);
@@ -108,6 +130,7 @@
     <dt>{t('FreeBSD')}</dt>
     <dd>{host.release}{#if host.kernel && host.kernel !== host.release}<span class="muted"> · {t('kernel {k}', { k: host.kernel })}</span>{/if}</dd>
     {#if host.boot}<dt>{t('Boot')}</dt><dd>{host.boot}</dd>{/if}
+    {#if load}<dt>{t('Load')}</dt><dd class="mono" title={t('Over 1, 5 and 15 minutes')}>{load}</dd>{/if}
     {#if host.bootedMs}
       <dt>{t('Up since')}</dt>
       <dd>{new Date(host.bootedMs).toLocaleString()} <span class="muted">({ago(host.bootedMs)})</span></dd>

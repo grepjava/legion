@@ -7,11 +7,13 @@
     api,
     bytes,
     follow,
+    loadText,
     type Balancer,
     type LObject,
     type NodeUsage,
     type Status
   } from '#lib/api.ts';
+  import { byteCount, cores } from '#lib/quantity.ts';
   import { tone } from '#lib/columns.ts';
   import Quotas from '#lib/Quotas.svelte';
   import UsageCharts from '#lib/UsageCharts.svelte';
@@ -132,6 +134,25 @@
     return { cpu, mem, zfsUsed, zfsAvail, rx, tx };
   });
 
+  // What the cluster has, against what its tasks use: the nodes' CPU and
+  // memory for tasks, and their pools' space.
+  const capacity = $derived.by(() => {
+    let cpu = 0;
+    let mem = 0;
+    let disk = 0;
+    let diskUsed = 0;
+    for (const n of nodes) {
+      cpu += cores(n.status?.allocatable?.cpu);
+      mem += byteCount(n.status?.allocatable?.memory);
+      for (const p of (n.status?.pools ?? []) as { sizeBytes: number; allocBytes: number }[]) {
+        disk += p.sizeBytes ?? 0;
+        diskUsed += p.allocBytes ?? 0;
+      }
+    }
+    return { cpu, mem, disk, diskUsed };
+  });
+  const pct = (a: number, b: number) => (b > 0 ? Math.round((a / b) * 100) : 0);
+
   function dockLogs(task: LObject) {
     const ns = task.metadata.namespace ?? '';
     openWorkbench({
@@ -211,6 +232,26 @@
           {#if notReady.length}· <span class="bad">{t('{n} not', { n: notReady.length })}</span>{/if}
         </dd>
       </div>
+    {/if}
+    {#if session.me?.all && capacity.cpu > 0}
+      <div>
+        <dt>{t('CPU')}</dt>
+        <dd title={t('What tasks use now, of the CPU the nodes offer them')}>
+          {t('{pct}% of {n} cores', { pct: pct(totals.cpu / 100, capacity.cpu), n: capacity.cpu })}
+        </dd>
+      </div>
+      <div>
+        <dt>{t('Memory')}</dt>
+        <dd>{t('{used} of {total}', { used: bytes(totals.mem), total: bytes(capacity.mem) })}</dd>
+      </div>
+      {#if capacity.disk > 0}
+        <div>
+          <dt>{t('Disk')}</dt>
+          <dd title={t('All the nodes’ pools together')}>
+            {t('{pct}% of {total}', { pct: pct(capacity.diskUsed, capacity.disk), total: bytes(capacity.disk) })}
+          </dd>
+        </div>
+      {/if}
     {/if}
     <div>
       <dt>{t('Alerts')}</dt>
@@ -346,6 +387,10 @@
           <dd class="mono">{nCpu.toFixed(1)}%</dd>
           <dt>{t('Memory')}</dt>
           <dd class="mono">{bytes(nMem)}</dd>
+          {#if loadText(nu?.load)}
+            <dt>{t('Load')}</dt>
+            <dd class="mono" title={t('Over 1, 5 and 15 minutes')}>{loadText(nu?.load)}</dd>
+          {/if}
           <dt>{t('Tasks')}</dt>
           <dd class="mono">{nu?.tasks.length ?? 0}</dd>
           {#if zTot > 0}
