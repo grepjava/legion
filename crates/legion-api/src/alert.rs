@@ -29,10 +29,11 @@ pub const VOLUME_NEARLY_FULL_PERCENT: u64 = 90;
 pub const POOL_FULL_WARNING: u64 = 80;
 pub const POOL_FULL_CRITICAL: u64 = 90;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Severity {
     Critical,
+    #[default]
     Warning,
 }
 
@@ -451,6 +452,252 @@ pub fn alerts(i: &Inputs) -> Vec<Alert> {
     out
 }
 
+/// Spec of an `AlertReceiver` (cluster-scoped): where the leader sends the
+/// alerts it chooses, each once as it is raised and once as it clears
+/// (CONSOLE.md, phase 9). Exactly one of `webhook`, `ntfy` and `smtp`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReceiverSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<Webhook>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ntfy: Option<Ntfy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smtp: Option<Smtp>,
+    /// The least severe alert sent: `warning` (every alert, the default)
+    /// or `critical`.
+    #[serde(default, skip_serializing_if = "is_warning")]
+    pub severity: Severity,
+    /// The namespaces whose alerts are sent; none, every one and the
+    /// cluster's own. The cluster's own (a node down, a pool degraded) are
+    /// named by the empty string.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub namespaces: Vec<String>,
+    /// The kinds of alert sent (`node-down`, `pool-degraded`…); none, all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<String>,
+}
+
+fn is_warning(s: &Severity) -> bool {
+    *s == Severity::Warning
+}
+
+/// A Secret named from another object: its value, whole.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SecretRef {
+    pub namespace: String,
+    pub name: String,
+}
+
+/// An HTTP POST of each alert as JSON (see `ReceiverSpec`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Webhook {
+    /// `https://…`, or `http://…` on a network that is trusted.
+    pub url: String,
+    /// Sent as `Authorization: Bearer <value>` when given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<SecretRef>,
+}
+
+/// A message to an ntfy topic (<https://ntfy.sh>), its priority by severity.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Ntfy {
+    /// The topic's URL: `https://ntfy.sh/my-topic`, or a server of one's own.
+    pub url: String,
+    /// An access token, sent as `Authorization: Bearer`, for a topic that
+    /// asks for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<SecretRef>,
+}
+
+/// A mail through an SMTP server.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Smtp {
+    /// `host:port`: 587 with `starttls`, 465 with `tls`.
+    pub server: String,
+    #[serde(default, skip_serializing_if = "SmtpTls::is_default")]
+    pub tls: SmtpTls,
+    pub from: String,
+    pub to: Vec<String>,
+    /// Who logs in (`AUTH PLAIN`), its password the Secret's value; no
+    /// login without one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<SecretRef>,
+}
+
+/// How a mail server is spoken to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SmtpTls {
+    /// Plain, then TLS before anything is sent (`STARTTLS`).
+    #[default]
+    Starttls,
+    /// TLS from the start.
+    Tls,
+    /// None: a relay on a network that is trusted.
+    None,
+}
+
+impl SmtpTls {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl ReceiverSpec {
+    /// How it sends: `webhook`, `ntfy` or `smtp`.
+    pub fn via(&self) -> &'static str {
+        if self.webhook.is_some() {
+            "webhook"
+        } else if self.ntfy.is_some() {
+            "ntfy"
+        } else {
+            "smtp"
+        }
+    }
+
+    /// Whether `a` is one it sends.
+    pub fn wants(&self, a: &Alert) -> bool {
+        a.severity <= self.severity
+            && (self.namespaces.is_empty() || self.namespaces.contains(&a.namespace))
+            && (self.kinds.is_empty() || self.kinds.iter().any(|k| k == a.kind.as_str()))
+    }
+
+    /// The Secret it reads, if any.
+    pub fn secret(&self) -> Option<&SecretRef> {
+        self.webhook
+            .as_ref()
+            .and_then(|w| w.secret.as_ref())
+            .or_else(|| self.ntfy.as_ref().and_then(|n| n.secret.as_ref()))
+            .or_else(|| self.smtp.as_ref().and_then(|s| s.secret.as_ref()))
+    }
+}
+
+/// The kinds of alert there are, as receivers name them.
+pub const KINDS: [AlertKind; 14] = [
+    AlertKind::NoLeader,
+    AlertKind::NoQuorum,
+    AlertKind::NodeDown,
+    AlertKind::NodeSuspect,
+    AlertKind::CrashLoop,
+    AlertKind::VolumeLost,
+    AlertKind::VolumeNearlyFull,
+    AlertKind::ReplicaStale,
+    AlertKind::CaExpiring,
+    AlertKind::PoolDegraded,
+    AlertKind::PoolErrors,
+    AlertKind::PoolNearlyFull,
+    AlertKind::ScrubOverdue,
+    AlertKind::VersionSkew,
+];
+
+fn http_url(url: &str) -> bool {
+    url.strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
+}
+
+impl crate::admit::Spec for ReceiverSpec {
+    fn admit(&mut self) -> Result<(), crate::admit::Invalid> {
+        use crate::admit::{Invalid, field, index};
+        let ways = [self.webhook.is_some(), self.ntfy.is_some(), self.smtp.is_some()];
+        if ways.iter().filter(|w| **w).count() != 1 {
+            return Err(Invalid::new(
+                "",
+                "exactly one of webhook, ntfy and smtp says where the alerts go",
+            ));
+        }
+        if let Some(w) = &self.webhook
+            && !http_url(&w.url)
+        {
+            return Err(Invalid::new(field("webhook", "url"), "an http:// or https:// URL"));
+        }
+        if let Some(n) = &self.ntfy
+            && !http_url(&n.url)
+        {
+            return Err(Invalid::new(
+                field("ntfy", "url"),
+                "the topic's URL: https://ntfy.sh/my-topic",
+            ));
+        }
+        if let Some(s) = &self.smtp {
+            let port = s.server.rsplit_once(':').and_then(|(h, p)| {
+                (!h.is_empty()).then_some(())?;
+                p.parse::<u16>().ok()
+            });
+            if port.is_none() {
+                return Err(Invalid::new(field("smtp", "server"), "host:port, e.g. mail.example.com:587"));
+            }
+            // Nothing that could end a line of the mail's header or of the
+            // envelope's command, and start another.
+            let address = |a: &str| {
+                a.contains('@')
+                    && !a.contains(|c: char| {
+                        c.is_whitespace() || c.is_control() || c == '<' || c == '>'
+                    })
+            };
+            if !address(&s.from) {
+                return Err(Invalid::new(field("smtp", "from"), "an address"));
+            }
+            if s.to.is_empty() {
+                return Err(Invalid::new(field("smtp", "to"), "at least one address"));
+            }
+            for (i, to) in s.to.iter().enumerate() {
+                if !address(to) {
+                    return Err(Invalid::new(index("smtp", "to", i), "an address"));
+                }
+            }
+            if s.username.is_empty() != s.secret.is_none() {
+                return Err(Invalid::new(
+                    field("smtp", "username"),
+                    "a login needs both a username and a secret holding its password",
+                ));
+            }
+        }
+        for (i, k) in self.kinds.iter().enumerate() {
+            if !KINDS.iter().any(|a| a.as_str() == k) {
+                return Err(Invalid::new(
+                    index("", "kinds", i),
+                    format!(
+                        "an alert's kind: {}",
+                        KINDS.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(", ")
+                    ),
+                ));
+            }
+        }
+        self.kinds.sort();
+        self.kinds.dedup();
+        self.namespaces.sort();
+        self.namespaces.dedup();
+        Ok(())
+    }
+}
+
+/// What a receiver was last sent, and how its sending goes; written by the
+/// leader. `sent` is what lets a new leader carry on without sending again
+/// what was sent, nor missing what clears.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiverStatus {
+    /// The alerts it was told are raised and has not been told cleared,
+    /// by [`Alert::key`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sent: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_ms: Option<i64>,
+    /// Why the last attempt failed, until one succeeds.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_ms: Option<i64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,6 +894,79 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(alerts(&same), []);
+    }
+
+    fn receiver(yaml: &str) -> Result<ReceiverSpec, String> {
+        use crate::admit::Spec;
+        let mut r: ReceiverSpec = serde_yaml_ng::from_str(yaml).map_err(|e| e.to_string())?;
+        r.admit().map_err(|e| e.to_string())?;
+        Ok(r)
+    }
+
+    #[test]
+    fn a_receiver_names_one_way_and_valid_kinds() {
+        assert!(receiver("webhook: {url: https://hooks.example/legion}").is_ok());
+        assert!(receiver("ntfy: {url: https://ntfy.sh/ops}").is_ok());
+        let e = receiver("{}").unwrap_err();
+        assert!(e.contains("exactly one"), "{e}");
+        let e = receiver("webhook: {url: https://a.example}
+ntfy: {url: https://ntfy.sh/x}").unwrap_err();
+        assert!(e.contains("exactly one"), "{e}");
+        let e = receiver("webhook: {url: ftp://a.example}").unwrap_err();
+        assert!(e.contains("http"), "{e}");
+        let e = receiver("webhook: {url: https://a.example}
+kinds: [node-gone]").unwrap_err();
+        assert!(e.contains("node-down"), "lists the kinds there are: {e}");
+        let e = receiver("smtp: {server: mail.example, from: a@example.com, to: [b@example.com]}")
+            .unwrap_err();
+        assert!(e.contains("host:port"), "{e}");
+        let e = receiver(
+            "smtp: {server: 'mail.example:587', from: a@example.com, to: [b@example.com], username: a}",
+        )
+        .unwrap_err();
+        assert!(e.contains("both a username and a secret"), "{e}");
+        let e = receiver(
+            "smtp: {server: 'mail.example:587', from: a@example.com, to: [\"b@example.com\\r\\nBcc: c@example.com\"]}",
+        )
+        .unwrap_err();
+        assert!(e.contains("to[0]"), "a header can't be slipped in: {e}");
+    }
+
+    #[test]
+    fn a_receiver_wants_what_its_severity_namespaces_and_kinds_say() {
+        let alert = |kind, severity, namespace: &str| Alert {
+            kind,
+            severity,
+            namespace: namespace.into(),
+            object: String::new(),
+            message: String::new(),
+        };
+        let all = receiver("webhook: {url: https://a.example}").unwrap();
+        assert!(all.wants(&alert(AlertKind::NodeDown, Severity::Critical, "")));
+        assert!(all.wants(&alert(AlertKind::CrashLoop, Severity::Warning, "shop")));
+        let critical = receiver("webhook: {url: https://a.example}
+severity: critical").unwrap();
+        assert!(critical.wants(&alert(AlertKind::NodeDown, Severity::Critical, "")));
+        assert!(!critical.wants(&alert(AlertKind::CrashLoop, Severity::Warning, "shop")));
+        let shop = receiver("webhook: {url: https://a.example}
+namespaces: [shop]
+kinds: [crash-loop]").unwrap();
+        assert!(shop.wants(&alert(AlertKind::CrashLoop, Severity::Warning, "shop")));
+        assert!(!shop.wants(&alert(AlertKind::CrashLoop, Severity::Warning, "blog")));
+        assert!(!shop.wants(&alert(AlertKind::NodeDown, Severity::Critical, "")));
+        let cluster = receiver("webhook: {url: https://a.example}
+namespaces: ['']").unwrap();
+        assert!(cluster.wants(&alert(AlertKind::NodeDown, Severity::Critical, "")));
+        assert!(!cluster.wants(&alert(AlertKind::CrashLoop, Severity::Warning, "shop")));
+    }
+
+    #[test]
+    fn every_kind_of_alert_can_be_named() {
+        // A kind added to AlertKind but not to KINDS couldn't be chosen.
+        let named: std::collections::BTreeSet<_> = KINDS.iter().map(|k| k.as_str()).collect();
+        assert_eq!(named.len(), KINDS.len());
+        let last = AlertKind::VersionSkew;
+        assert!(KINDS.contains(&last));
     }
 
     #[test]

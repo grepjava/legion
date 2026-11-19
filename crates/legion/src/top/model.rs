@@ -279,6 +279,7 @@ pub(super) fn kind_word(kind: Kind) -> &'static str {
         Kind::RoleBinding => "role binding",
         Kind::ImagePolicy => "image policy",
         Kind::Build => "build",
+        Kind::AlertReceiver => "alert receiver",
     }
 }
 

@@ -43,7 +43,8 @@ pub use admit::{Invalid, Spec, admit, parse};
 
 pub const API_VERSION: &str = "legion/v1";
 
-/// Namespace used for cluster-scoped kinds (`Namespace`, `Node`, `ImagePolicy`).
+/// Namespace used for cluster-scoped kinds (`Namespace`, `Node`, `ImagePolicy`,
+/// `AlertReceiver`).
 pub const CLUSTER_SCOPE: &str = "";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -62,10 +63,11 @@ pub enum Kind {
     RoleBinding,
     ImagePolicy,
     Build,
+    AlertReceiver,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 14] = [
+    pub const ALL: [Kind; 15] = [
         Kind::Namespace,
         Kind::Node,
         Kind::Service,
@@ -80,6 +82,7 @@ impl Kind {
         Kind::RoleBinding,
         Kind::ImagePolicy,
         Kind::Build,
+        Kind::AlertReceiver,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -98,12 +101,16 @@ impl Kind {
             Kind::RoleBinding => "RoleBinding",
             Kind::ImagePolicy => "ImagePolicy",
             Kind::Build => "Build",
+            Kind::AlertReceiver => "AlertReceiver",
         }
     }
 
     /// Cluster-scoped kinds live outside any namespace.
     pub fn is_cluster_scoped(self) -> bool {
-        matches!(self, Kind::Namespace | Kind::Node | Kind::ImagePolicy)
+        matches!(
+            self,
+            Kind::Namespace | Kind::Node | Kind::ImagePolicy | Kind::AlertReceiver
+        )
     }
 }
 

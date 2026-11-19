@@ -72,6 +72,7 @@ impl Tab {
                 Kind::Config,
                 Kind::RoleBinding,
                 Kind::ImagePolicy,
+                Kind::AlertReceiver,
             ],
             Tab::Log => &[],
         }
@@ -2004,10 +2005,34 @@ fn config_rows(model: &Model) -> Vec<TableRow> {
             Some(key(p)),
         )
     });
+    let receivers = model.of(Kind::AlertReceiver).map(|r| {
+        let spec: legion_api::alert::ReceiverSpec =
+            serde_json::from_value(r.spec.clone()).unwrap_or_default();
+        let error = r.status["error"].as_str().unwrap_or_default();
+        let what = format!(
+            "by {}, {}{}",
+            spec.via(),
+            match spec.severity {
+                legion_api::alert::Severity::Critical => "critical alerts",
+                legion_api::alert::Severity::Warning => "every alert",
+            },
+            if error.is_empty() { String::new() } else { format!(": failing, {error}") }
+        );
+        TableRow::new(
+            vec![
+                dimmed(""),
+                text(r.metadata.name.clone()),
+                text("alert receiver"),
+                text(what),
+            ],
+            Some(key(r)),
+        )
+    });
     namespaces
         .chain(data)
         .chain(bindings)
         .chain(policies)
+        .chain(receivers)
         .collect()
 }
 
