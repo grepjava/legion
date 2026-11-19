@@ -839,6 +839,42 @@ killed, sent by the next leader; every message once.
 **Done when** the drain test shows each phase in turn, and a cancel past
 the switch-over is refused.
 
+**Built so far** (2026-11-19). `legion_api::activity`: an operation (a
+drain, a Volume's move, a restore, a replica's whole copy) with its stage,
+the bytes its transfer has sent, when it began and ended and how, who
+asked and all it said. A move's stages are `preparing` (nothing sent yet,
+or waiting to try again), `full-copy` (sent while its tasks run),
+`stopping` (the copy is there; its tasks stop), `switch-over` (stopped:
+what changed is sent and the Volume becomes the new node's) and `cleanup`
+(the old copy dropped): the plan's "final copy" is the first part of the
+switch-over, as Legion sends only one part with the tasks stopped. Every
+manager works operations out from the drains and moves it sees and keeps
+them in memory (an hour of ended ones); the leader's migrator,
+replicator and restores count what they send as they go, so
+`Cluster.Activity` asks the leader. Who asked comes from the audit trail,
+for the cluster admin only. Past the switch-over the controller carried
+a move through whatever was asked, so the API now refuses what would call
+it off: the Volume asked elsewhere, its node's drain ended (made active or
+paused), the Volume deleted. Removing a node stays allowed: it is how a
+dead node is given up, and the controller handles it. `legion activity`
+(`-w`, one's stages and output by ID or name), `legion top`'s Activity
+tab, and the console's workbench bar (feel item 10), always there: what
+runs or the last thing done and how it ended, opening on its Activity
+tab (a move's stages in turn, what each sent, who asked, why it waits,
+the full output with Copy) and what was done in this console. The lab
+test passed at a275d90 on real ZFS in 225 s: the move said preparing,
+full-copy (174.7 MiB), stopping, then switch-over held by a full disk on
+the node it went to, saying why; `legion node activate` and `legion
+volume move` back were both refused; with room made it went on to
+cleanup and ended with every row on its new node, the drain completed,
+both by `admin`. The console test passed at 2315ce0 with the bar and its
+tab: the bar named n3's drain and its tab listed it. That run also
+caught a bar that sat over the page, so axe found targets under it: the
+page now scrolls above the workbench rather than under it. The test had
+fallen behind the console since its last pass (2026-11-15): it now finds
+a field by the label it sits in, and types a node's name where deleting
+it asks for it.
+
 ### Phase 11: checks before disruption
 
 - A dry run of a drain, a Volume's move, a node's removal and deleting a
@@ -903,7 +939,8 @@ where the phases above first need it:
 9. *Forms*: names and namespaces filled in, a reset in the title bar, a
    draft kept when the form is left (a dot on its entry).
 10. *The workbench as a thin bar always there*: the last thing done and
-    how it ended, what runs, opening into the activity of phase 10.
+    how it ended, what runs, opening into the activity of phase 10
+    (built with it).
 11. *A lighter top bar*: theme and language in the user's menu, quorum
     as a dot and a word, leaving search, alerts and pins.
 12. *Motion*: the side bar's sections opening and closing smoothly,
