@@ -29,6 +29,7 @@ pub mod control;
 pub mod doctor;
 pub mod exports;
 pub mod fake;
+pub mod host;
 mod files;
 mod image_ops;
 pub mod ingress;
@@ -359,12 +360,20 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             ctx.zfs_root.clone(),
             lacks.clone(),
         ));
+        // The host and its pools, read often for heartbeats to carry, so a
+        // pool losing a device is seen within seconds.
+        let hosted: Hosted = Arc::default();
+        let host_reads = tokio::spawn(host_reads(
+            ctx.sys.clone(),
+            ctx.control.clone(),
+            hosted.clone(),
+        ));
         let heartbeats = tokio::spawn(heartbeats(
             heard.clone(),
             ctx.control.clone(),
             ctx.node.clone(),
             carp_states,
-            lacks,
+            (lacks, hosted),
             metrics::AgentMetrics {
                 runtime: ctx.runtime.clone(),
                 sys: ctx.sys.clone(),
@@ -486,6 +495,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         if !loaded {
             heartbeats.abort();
             host_checks.abort();
+            host_reads.abort();
             carp_watch.abort();
             sessions.abort();
             for i in &ingress {
@@ -640,6 +650,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
         forwarder.abort();
         heartbeats.abort();
         host_checks.abort();
+        host_reads.abort();
         carp_watch.abort();
         sessions.abort();
         for i in ingress {
@@ -1219,6 +1230,44 @@ async fn carp_watch(sys: Arc<dyn Sys>, held: CarpHeld, states: CarpStates) {
 
 /// What the host lacks, as last checked and not yet sent.
 type Lacks = Arc<std::sync::Mutex<Option<Vec<legion_api::node::HostLack>>>>;
+/// The host and its pools, as last read and not yet sent.
+type Hosted = Arc<std::sync::Mutex<Option<legion_api::node::HostReport>>>;
+
+/// How often the host and its pools are read: a pool losing a device is
+/// at the managers within about this, and a heartbeat.
+const HOST_READ: Duration = Duration::from_secs(10);
+/// How long before a scrub that failed to start is tried again.
+const SCRUB_RETRY: Duration = Duration::from_secs(3600);
+
+/// Reads the host and its pools every [`HOST_READ`] for the next heartbeat
+/// to carry (the leader writes only a change), and starts the scrubs the
+/// Node schedules.
+async fn host_reads<C: Control>(sys: Arc<dyn Sys>, control: Arc<C>, hosted: Hosted) {
+    let mut tried: std::collections::HashMap<String, tokio::time::Instant> = Default::default();
+    loop {
+        let report = task::blocking(&sys, |sys| host::read(sys)).await;
+        if let Some(days) = control.scrub_every_days() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as i64);
+            for pool in host::due(&report.pools, days, now) {
+                if tried.get(&pool).is_some_and(|t| t.elapsed() < SCRUB_RETRY) {
+                    continue;
+                }
+                tried.insert(pool.clone(), tokio::time::Instant::now());
+                let p = pool.clone();
+                match task::blocking(&sys, move |sys| sys.run_program("zpool", &["scrub", &p], ""))
+                    .await
+                {
+                    Ok(_) => tracing::info!(%pool, every = days, "scrub started, as the node schedules"),
+                    Err(e) => tracing::warn!(%pool, "starting a scrub: {e}"),
+                }
+            }
+        }
+        *hosted.lock().unwrap_or_else(|e| e.into_inner()) = Some(report);
+        tokio::time::sleep(HOST_READ).await;
+    }
+}
 
 /// How often the host is checked again (`legion doctor`).
 const HOST_CHECK: Duration = Duration::from_secs(60);
@@ -1240,7 +1289,7 @@ async fn heartbeats<R: Runtime, C: Control>(
     control: Arc<C>,
     node: String,
     carp: CarpStates,
-    lacks: Lacks,
+    (lacks, hosted): (Lacks, Hosted),
     metrics: metrics::AgentMetrics<R>,
     usage_period: Duration,
 ) {
@@ -1262,8 +1311,9 @@ async fn heartbeats<R: Runtime, C: Control>(
         let held = carp.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let checked = lacks.lock().unwrap_or_else(|e| e.into_inner()).take();
         let sending = checked.clone();
+        let read = hosted.lock().unwrap_or_else(|e| e.into_inner()).take();
         match control
-            .heartbeat(&node, usage, held, telemetry, sending)
+            .heartbeat(&node, usage, held, telemetry, sending, read.clone())
             .await
         {
             Ok(p) => {
@@ -1281,6 +1331,12 @@ async fn heartbeats<R: Runtime, C: Control>(
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .get_or_insert(c);
+                }
+                if let Some(r) = read {
+                    hosted
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_or_insert(r);
                 }
                 if !failing {
                     tracing::warn!("heartbeat: {e}");

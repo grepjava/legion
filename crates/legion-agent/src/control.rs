@@ -124,7 +124,8 @@ pub trait Control: Send + Sync + 'static {
     /// read since the last heartbeat (by `namespace/task`) and the CARP
     /// state of each load balancer address it took up; returns how long to
     /// wait before the next heartbeat. `lacks`, when the host was checked
-    /// since the last one: what `legion doctor` finds it lacks.
+    /// since the last one: what `legion doctor` finds it lacks; `host`,
+    /// when read since: the host and its pools.
     fn heartbeat(
         &self,
         node: &str,
@@ -132,7 +133,14 @@ pub trait Control: Send + Sync + 'static {
         carp: Vec<(std::net::Ipv4Addr, String)>,
         telemetry: Option<NodeTelemetry>,
         lacks: Option<Vec<legion_api::node::HostLack>>,
+        host: Option<legion_api::node::HostReport>,
     ) -> impl Future<Output = Result<Duration, ControlError>> + Send;
+
+    /// Days between scrubs of the node's pools, as the last heartbeat's
+    /// answer gave them; none unless the Node schedules them.
+    fn scrub_every_days(&self) -> Option<u32> {
+        None
+    }
 
     /// Sessions users open with the node's tasks, as any manager offers
     /// them.
@@ -190,6 +198,9 @@ pub struct GrpcControl {
     /// The role the last heartbeat asked this node to take ("manager"),
     /// empty when none.
     role: Arc<watch::Sender<String>>,
+    /// Days between scrubs, as the last heartbeat's answer gave them; 0
+    /// for none.
+    scrub_days: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// The CAs the cluster trusts, the issuing one first, and that one's
@@ -238,6 +249,7 @@ impl GrpcControl {
             })),
             ca: Arc::new(watch::channel(None).0),
             role: Arc::new(watch::channel(String::new()).0),
+            scrub_days: Arc::default(),
         })
     }
 
@@ -781,6 +793,7 @@ impl Control for GrpcControl {
         carp: Vec<(std::net::Ipv4Addr, String)>,
         telemetry: Option<NodeTelemetry>,
         lacks: Option<Vec<legion_api::node::HostLack>>,
+        host: Option<legion_api::node::HostReport>,
     ) -> Result<Duration, ControlError> {
         let usage = usage
             .into_iter()
@@ -824,6 +837,7 @@ impl Control for GrpcControl {
                     .collect(),
             }),
             lacks_json: lacks.and_then(|l| serde_json::to_vec(&l).ok()),
+            host_json: host.and_then(|h| serde_json::to_vec(&h).ok()),
         };
         let resp = self
             .call(|mut c| async move { c.heartbeat(req).await })
@@ -845,6 +859,12 @@ impl Control for GrpcControl {
                 changed
             });
         }
+        self.scrub_days
+            .store(resp.scrub_every_days, std::sync::atomic::Ordering::Relaxed);
         Ok(Duration::from_millis(resp.period_ms.max(100).into()))
+    }
+
+    fn scrub_every_days(&self) -> Option<u32> {
+        Some(self.scrub_days.load(std::sync::atomic::Ordering::Relaxed)).filter(|d| *d > 0)
     }
 }

@@ -203,6 +203,10 @@ message HeartbeatRequest {
   // legion_api::node::HostLack. Sent when the agent checked since its last
   // heartbeat; the leader writes it to the Node's status when it changed.
   optional bytes lacks_json = 5;
+  // The host and its ZFS pools: a JSON legion_api::node::HostReport, sent
+  // when the agent read them since its last heartbeat; the leader writes
+  // them to the Node's status when they changed.
+  optional bytes host_json = 6;
 }
 
 message NodeTelemetry {
@@ -253,4 +257,7 @@ message HeartbeatResponse {
   string issuer = 4;
   // "manager" when the node is asked to become one; empty otherwise.
   string role = 5;
+  // Days between scrubs of the node's pools (the Node's scrubEveryDays);
+  // 0 for none.
+  uint32 scrub_every_days = 6;
 }

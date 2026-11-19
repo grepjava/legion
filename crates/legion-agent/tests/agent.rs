@@ -155,9 +155,10 @@ impl Control for Flaky {
         carp: Vec<(std::net::Ipv4Addr, String)>,
         telemetry: Option<legion_api::dispatch::NodeTelemetry>,
         lacks: Option<Vec<legion_api::node::HostLack>>,
+        host: Option<legion_api::node::HostReport>,
     ) -> Result<Duration, ControlError> {
         self.inner
-            .heartbeat(node, usage, carp, telemetry, lacks)
+            .heartbeat(node, usage, carp, telemetry, lacks, host)
             .await
     }
 
