@@ -15,6 +15,17 @@ const nodeHref = (name: unknown) => (name ? `/k/Node/_/${encodeURIComponent(Stri
 
 const s = (v: unknown) => (v === undefined || v === null ? '' : String(v));
 
+/** A Service's state, as it has none of its own: stopped or paused as its
+ * spec says, else ready when all it wants are, pending while some are,
+ * failed when none are. Empty when it wants none. */
+export function serviceState(o: LObject): string {
+  if (o.spec?.stopped) return 'stopped';
+  if (o.spec?.paused) return 'paused';
+  const want = Number(o.status?.desired ?? o.spec?.replicas ?? 0);
+  const ready = Number(o.status?.ready ?? 0);
+  return !want ? '' : ready >= want ? 'ready' : ready ? 'pending' : 'failed';
+}
+
 export interface HostLack {
   id: string;
   need: string;

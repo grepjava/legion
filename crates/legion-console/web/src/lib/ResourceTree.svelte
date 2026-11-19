@@ -7,7 +7,7 @@
   import { page } from '$app/state';
   import { goto } from '$app/navigation';
   import { follow, type LObject } from './api.ts';
-  import { tone } from './columns.ts';
+  import { serviceState, tone } from './columns.ts';
   import { t } from './i18n.svelte.ts';
   import Ico from './Ico.svelte';
   import { kindIcon } from './icons.ts';
@@ -68,13 +68,6 @@
     state: v.status?.lost ? 'failed' : v.status?.replica?.state === 'stale' ? 'stale' : '',
     children: []
   });
-  // A service is ready when all it asks for are; waiting otherwise.
-  const serviceState = (s: LObject) => {
-    const want = Number(s.status?.replicas ?? s.spec?.replicas ?? 0);
-    const ready = Number(s.status?.ready ?? 0);
-    if (s.spec?.stopped) return 'paused';
-    return want && ready >= want ? 'ready' : want ? 'pending' : '';
-  };
 
   const roots = $derived.by((): Item[] => {
     if (mode === 'node') {

@@ -1,13 +1,14 @@
 <script lang="ts">
   import { page } from '$app/state';
   import { api, follow, type LObject } from '#lib/api.ts';
-  import { blocking, columns, tone } from '#lib/columns.ts';
+  import { blocking, columns, serviceState, tone } from '#lib/columns.ts';
   import { plural } from '#lib/kinds.ts';
   import { t } from '#lib/i18n.svelte.ts';
   import Actions from '#lib/Actions.svelte';
   import Labels from '#lib/Labels.svelte';
   import LogSearch from '#lib/LogSearch.svelte';
   import NodeTasks from '#lib/NodeTasks.svelte';
+  import ServiceTasks from '#lib/ServiceTasks.svelte';
   import Rollout from '#lib/Rollout.svelte';
   import ServicePorts from '#lib/ServicePorts.svelte';
   import Taints from '#lib/Taints.svelte';
@@ -128,7 +129,10 @@
   const objState = $derived.by(() => {
     const o = object as LObject | null;
     const st = o?.status?.state;
-    return typeof st === 'string' ? st : '';
+    if (typeof st === 'string') return st;
+    // A Service has no state of its own: ready when all it wants are.
+    if (o?.kind === 'Service') return serviceState(o);
+    return '';
   });
   const scoped = $derived(session.kinds.find((k) => k.kind === kind)?.clusterScoped ?? false);
 </script>
@@ -307,6 +311,7 @@
         </dd>
       {/if}
     </dl>
+    {#if kind === 'Service' || kind === 'Job'}<ServiceTasks owner={object} />{/if}
     {#if kind === 'Service'}<ServicePorts service={object} />{/if}
   {:else if tab === 'buildlog'}
     <BuildLog build={object} />

@@ -9,6 +9,22 @@
   import { t } from './i18n.svelte.ts';
   import { ask } from './confirm.svelte.ts';
   import { busyWhile, toast } from './toast.svelte.ts';
+  import Ico from './Ico.svelte';
+  import {
+    ArrowRightLeft,
+    ArrowUpFromLine,
+    ArrowDownToLine,
+    CirclePause,
+    CirclePlay,
+    FilePenLine,
+    Hammer,
+    Play,
+    RotateCw,
+    Square,
+    Trash2,
+    Undo2,
+    Zap
+  } from '@lucide/svelte';
 
   let { object, scoped }: { object: LObject; scoped: boolean } = $props();
   const kind = $derived(object.kind);
@@ -95,12 +111,12 @@
 
 <div class="actions">
   {#if why}
-    <button disabled title={why}>{t('Edit YAML')}</button>
+    <button disabled title={why}><Ico icon={FilePenLine} size={14} />{t('Edit YAML')}</button>
   {:else}
     <a
       class="button"
       href="/apply?kind={encodeURIComponent(kind)}&namespace={encodeURIComponent(ns)}&name={encodeURIComponent(name)}"
-      >{t('Edit YAML')}</a
+      ><Ico icon={FilePenLine} size={14} />{t('Edit YAML')}</a
     >
   {/if}
 
@@ -110,10 +126,13 @@
       title={why ?? ''}
       onclick={() =>
         goto(`/build?namespace=${encodeURIComponent(ns)}&service=${encodeURIComponent(name)}`)}
-      >{t('Build a new image')}</button
+      ><Ico icon={Hammer} size={14} />{t('Build a new image')}</button
     >
     <span class="group">
-      <input type="number" min="0" bind:value={replicas} aria-label={t('Replicas')} disabled={!!why} />
+      <label class="inline-label"
+        ><span class="muted">{t('Replicas')}</span>
+        <input type="number" min="0" bind:value={replicas} disabled={!!why} /></label
+      >
       <button
         disabled={!!why || busy}
         title={why ?? ''}
@@ -132,7 +151,7 @@
       title={why ?? (object.status?.update ? t('Back to the spec before the latest update') : t('No update to roll back'))}
       onclick={async () =>
         (await ask(t('Roll {name} back to the spec before its latest update?', { name }), { action: t('Roll back') })) &&
-        act(async () => (await api.rollback(ns, name)).message)}>{t('Roll back')}</button
+        act(async () => (await api.rollback(ns, name)).message)}><Ico icon={Undo2} size={14} />{t('Roll back')}</button
     >
     <button
       disabled={!!why || busy}
@@ -141,7 +160,7 @@
         (await ask(t('Restart {name}? Its tasks are replaced, as an update replaces them.', { name }), {
           action: t('Restart')
         })) &&
-        act(async () => (await api.restart(ns, name)).message)}>{t('Restart')}</button
+        act(async () => (await api.restart(ns, name)).message)}><Ico icon={RotateCw} size={14} />{t('Restart')}</button
     >
     <button
       disabled={!!why || busy}
@@ -154,7 +173,7 @@
           ? set('stopped', false, t('{name} started', { name }), t('{name} already started', { name }))
           : (await ask(t('Stop {name}? Its tasks go until it is started.', { name }), { action: t('Stop') })) &&
             set('stopped', true, t('{name} stopped', { name }), t('{name} already stopped', { name }))}
-      >{object.spec?.stopped ? t('Start') : t('Stop')}</button
+      ><Ico icon={object.spec?.stopped ? Play : Square} size={14} />{object.spec?.stopped ? t('Start') : t('Stop')}</button
     >
     <button
       disabled={!!why || busy || (!!object.spec?.stopped && !object.spec?.paused)}
@@ -171,13 +190,13 @@
               action: t('Pause')
             })) &&
             set('paused', true, t('{name} paused', { name }), t('{name} already paused', { name }))}
-      >{object.spec?.paused ? t('Resume') : t('Pause')}</button
+      ><Ico icon={object.spec?.paused ? CirclePlay : CirclePause} size={14} />{object.spec?.paused ? t('Resume') : t('Pause')}</button
     >
   {:else if kind === 'CronJob'}
     <button
       disabled={!!why || busy}
       title={why ?? t('A run now, outside its schedule')}
-      onclick={() => act(async () => (await api.runNow(ns, name)).message)}>{t('Run now')}</button
+      onclick={() => act(async () => (await api.runNow(ns, name)).message)}><Ico icon={Zap} size={14} />{t('Run now')}</button
     >
     <button
       disabled={!!why || busy}
@@ -186,21 +205,21 @@
         object.spec?.suspend
           ? set('suspend', false, t('{name} resumed', { name }), t('{name} already resumed', { name }))
           : set('suspend', true, t('{name} suspended', { name }), t('{name} already suspended', { name }))}
-      >{object.spec?.suspend ? t('Resume') : t('Suspend')}</button
+      ><Ico icon={object.spec?.suspend ? CirclePlay : CirclePause} size={14} />{object.spec?.suspend ? t('Resume') : t('Suspend')}</button
     >
   {:else if kind === 'Node'}
     {@const now = object.spec?.availability ?? 'active'}
     <span class="group">
       {#each ['active', 'pause', 'drain'] as const as to (to)}
         <button disabled={!!why || busy || now === to} title={why ?? ''} onclick={() => availability(to)}
-          >{{ active: t('Activate'), pause: t('Pause'), drain: t('Drain') }[to]}</button
+          ><Ico icon={{ active: Play, pause: CirclePause, drain: ArrowRightLeft }[to]} size={14} />{{ active: t('Activate'), pause: t('Pause'), drain: t('Drain') }[to]}</button
         >
       {/each}
     </span>
     {#if object.spec?.role === 'manager'}
-      <button disabled={!!why || busy} title={why ?? ''} onclick={() => role('worker')}>{t('Demote')}</button>
+      <button disabled={!!why || busy} title={why ?? ''} onclick={() => role('worker')}><Ico icon={ArrowDownToLine} size={14} />{t('Demote')}</button>
     {:else}
-      <button disabled={!!why || busy} title={why ?? ''} onclick={() => role('manager')}>{t('Promote')}</button>
+      <button disabled={!!why || busy} title={why ?? ''} onclick={() => role('manager')}><Ico icon={ArrowUpFromLine} size={14} />{t('Promote')}</button>
     {/if}
   {:else if kind === 'Volume'}
     <span class="group">
@@ -219,12 +238,12 @@
             t('{name} moves to {node}', { name, node: moveTo }),
             t('{name} is already asked to be on {node}', { name, node: moveTo })
           )}
-        >{t('Move')}</button
+        ><Ico icon={ArrowRightLeft} size={14} />{t('Move')}</button
       >
     </span>
   {/if}
 
-  <button class="danger" disabled={!!why || busy} title={why ?? ''} onclick={remove}>{t('Delete')}</button>
+  <button class="danger" disabled={!!why || busy} title={why ?? ''} onclick={remove}><Ico icon={Trash2} size={14} />{t('Delete')}</button>
 </div>
 {#if why}<p class="muted">{t('Read only: {why}.', { why })}</p>{/if}
 {#if error}<p class="error" role="alert">{error}</p>{/if}

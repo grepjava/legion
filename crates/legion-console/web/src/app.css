@@ -960,7 +960,18 @@ form.inline {
   align-items: center;
 }
 .actions input[type='number'] {
-  width: 5rem;
+  width: 4.5rem;
+}
+/* A field named beside it, the name as part of its label. */
+.actions .inline-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+}
+/* Deleting stands apart from the rest. */
+.actions > button.danger {
+  margin-left: 0.5rem;
 }
 a.button {
   display: inline-flex;
