@@ -420,6 +420,12 @@ impl DispatcherService {
             let before = serde_json::from_value::<NodeStatus>(node.status.clone()).ok();
             // The leader's word on a drain is not the agent's to change.
             status.drain = before.as_ref().and_then(|s| s.drain.clone());
+            // The host and its pools as last read, until the agent's next
+            // read: a restart says nothing new of them.
+            if let Some(b) = &before {
+                status.host.clone_from(&b.host);
+                status.pools.clone_from(&b.pools);
+            }
             status.pod_cidr = match before.and_then(|s| s.pod_cidr) {
                 Some(cidr) => Some(cidr),
                 None => Some(self.reserve_subnet(name).await?.to_string()),
@@ -458,6 +464,45 @@ impl DispatcherService {
     }
 
     /// Writes what `node`'s host lacks to its status, if it changed.
+    /// Writes the host and its pools into `node`'s status when they
+    /// changed: a pool losing a device, filling by a percent, finishing a
+    /// scrub; a reboot or an upgrade.
+    async fn record_host(
+        &self,
+        node: &str,
+        report: legion_api::node::HostReport,
+    ) -> Result<(), Status> {
+        let key = ObjectKey::new(Kind::Node, "", node);
+        for _ in 0..ATTEMPTS {
+            let Some(mut object) = self.get(&key)? else {
+                return Ok(());
+            };
+            let mut status: NodeStatus =
+                serde_json::from_value(object.status.clone()).map_err(internal)?;
+            // An agent that could not read its host says nothing of it.
+            let host = report.host.clone().or_else(|| status.host.clone());
+            if status.host == host && status.pools == report.pools {
+                return Ok(());
+            }
+            for p in &report.pools {
+                let was = status.pools.iter().find(|q| q.name == p.name);
+                if was.is_none_or(|q| q.state != p.state) {
+                    tracing::info!(%node, pool = %p.name, state = %p.state, "pool");
+                }
+            }
+            status.host = host;
+            status.pools = report.pools.clone();
+            object.status = serde_json::to_value(&status).map_err(internal)?;
+            let precondition = Precondition::Version(object.metadata.version);
+            match self.write(object, precondition).await? {
+                Outcome::Written(_) => return Ok(()),
+                Outcome::Conflict { .. } => continue,
+                other => return Err(unexpected(other)),
+            }
+        }
+        Err(Status::unavailable(format!("{key} keeps changing")))
+    }
+
     async fn record_lacks(
         &self,
         node: &str,
@@ -1337,6 +1382,7 @@ impl Dispatcher for DispatcherService {
                 carp,
                 telemetry,
                 lacks_json,
+                host_json,
                 ..
             } = req.into_inner();
             let mut forwarded = to_leader(
@@ -1346,6 +1392,7 @@ impl Dispatcher for DispatcherService {
                     carp,
                     telemetry,
                     lacks_json,
+                    host_json,
                 },
                 &worker,
             )?;
@@ -1369,8 +1416,20 @@ impl Dispatcher for DispatcherService {
             carp,
             telemetry,
             lacks_json,
+            host_json,
             ..
         } = req.into_inner();
+        if let Some(json) = host_json {
+            match serde_json::from_slice::<legion_api::node::HostReport>(&json) {
+                // Sent again with the next read if not written now.
+                Ok(report) => {
+                    if let Err(e) = self.record_host(&node, report).await {
+                        tracing::debug!(%node, "the host and its pools: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!(%node, "the host and its pools, unread: {e}"),
+            }
+        }
         if let Some(json) = lacks_json {
             match serde_json::from_slice::<Vec<legion_api::node::HostLack>>(&json) {
                 // Sent again with the next check if not written now.
@@ -1469,12 +1528,20 @@ impl Dispatcher for DispatcherService {
             Ok(Some(legion_pki::Role::Manager)) => "manager".to_owned(),
             _ => String::new(),
         };
+        // The scrubs its Node schedules, which its agent starts.
+        let scrub_every_days = self
+            .get(&ObjectKey::new(Kind::Node, "", &node))
+            .ok()
+            .flatten()
+            .and_then(|n| n.spec["scrubEveryDays"].as_u64())
+            .unwrap_or(0) as u32;
         Ok(Response::new(HeartbeatResponse {
             period_ms: self.period.as_millis() as u32,
             managers: self.managers(),
             trust_pem,
             issuer,
             role,
+            scrub_every_days,
         }))
     }
 

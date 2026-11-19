@@ -161,11 +161,41 @@ pub(crate) fn current(api: &ApiService) -> Vec<(Alert, i64)> {
         objects(Kind::Task),
         objects(Kind::Volume),
     );
-    let mut inputs = Inputs::default();
+    // Each node's spec and status as read; a node down says nothing of
+    // its pools or build that is current.
+    let read: Vec<(&str, legion_api::node::NodeSpec, legion_api::node::NodeStatus)> = nodes
+        .iter()
+        .map(|n| {
+            (
+                n.metadata.name.as_str(),
+                serde_json::from_value(n.spec.clone()).unwrap_or_default(),
+                serde_json::from_value(n.status.clone()).unwrap_or_default(),
+            )
+        })
+        .collect();
+    let mut inputs = Inputs {
+        now_ms: crate::console::now_ms(),
+        ..Inputs::default()
+    };
     for n in &nodes {
         let state: NodeState =
             serde_json::from_value(n.status["state"].clone()).unwrap_or_default();
         inputs.nodes.push((&n.metadata.name, state));
+    }
+    for (name, spec, status) in &read {
+        if status.state == NodeState::Down {
+            continue;
+        }
+        inputs.versions.push((name, &status.version));
+        for pool in &status.pools {
+            inputs.pools.push(alert::PoolInput {
+                node: name,
+                pool,
+                errors_seen: spec.pool_errors_seen.get(&pool.name).copied().unwrap_or(0),
+                scrub_due: spec.scrub_due(),
+                scheduled: spec.scrub_every_days.is_some(),
+            });
+        }
     }
     let recent: Vec<u32> = tasks
         .iter()

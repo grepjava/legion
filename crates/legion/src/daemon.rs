@@ -724,6 +724,9 @@ fn status(hostname: String, advertise: &str) -> NodeStatus {
         drain: None,
         // Filled in by the agent, from legion doctor's checks.
         lacks: Vec::new(),
+        // Filled in by the agent's reads; registration keeps the last.
+        host: None,
+        pools: Vec::new(),
     }
 }
 
