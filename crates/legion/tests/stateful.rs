@@ -1251,3 +1251,242 @@ fn a_replicated_volume_fails_over_on_its_own_when_its_node_is_cut_off() {
     });
     step("done");
 }
+
+impl Lab {
+    /// The newest long operation `legion activity` lists of `kind` done
+    /// to `name`.
+    fn operation(&self, kind: &str, name: &str) -> Option<Value> {
+        let out = self.legion(&["activity", "-o", "json"], &[]);
+        if !out.status.success() {
+            return None;
+        }
+        let ops: Vec<Value> = serde_json::from_slice(&out.stdout).ok()?;
+        ops.into_iter()
+            .rev()
+            .find(|o| o["kind"] == kind && o["target"]["name"] == name)
+    }
+}
+
+/// The stages an operation went through, in turn, as it says.
+fn stages_of(op: &Value) -> Vec<String> {
+    op["stages"]
+        .as_array()
+        .map(|s| {
+            s.iter()
+                .filter_map(|m| m["stage"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether `want` comes in `seen` in that order (a stage tried again, a
+/// transfer that failed and started over, may come between).
+fn in_turn(seen: &[String], want: &[&str]) -> bool {
+    let mut it = seen.iter();
+    want.iter().all(|w| it.any(|s| s == w))
+}
+
+/// Phase 10's "done when" (CONSOLE.md): a drain's move says each stage
+/// in turn, preparing, the full copy with its bytes, stopping, the
+/// switch-over and the cleanup, through `legion activity`; held in its
+/// switch-over by a full disk where it goes, its cancels are refused (the
+/// node made active again, the Volume asked back), and once there is room
+/// it ends, every row on the new node, the drain completed. Three
+/// managers, `n1` paused, as in the test of cut moves.
+#[test]
+#[ignore = "needs root and ZFS on FreeBSD, two more nodes and the image; see the module docs"]
+fn a_drain_says_each_stage_and_refuses_a_cancel_past_the_switch_over() {
+    let image = std::env::var("LEGION_PG_IMAGE").expect("set LEGION_PG_IMAGE");
+    let mut lab = Lab::from_env();
+    let step = |what: &str| eprintln!("--- {what}");
+
+    step("three managers, each with a pool for volumes; n1 takes no Postgres");
+    lab.start_host(&[]);
+    lab.ok(&["init"]);
+    let manager = lab.ok(&["join-token", "manager"]).trim().to_owned();
+    lab.join(0, &manager, Role::Manager);
+    lab.join(1, &manager, Role::Manager);
+    wait("three ready nodes", 120, || {
+        ["n1", "n2", "n3"]
+            .iter()
+            .all(|n| lab.node_state(n) == "ready")
+    });
+    lab.load_image(&image);
+    lab.ok(&["node", "pause", "n1"]);
+
+    step("a primary whose task may not stop yet, with rows and a ballast to send");
+    let held = APP.replace("replicas: 2", "replicas: 1\n  maxUnavailable: 0");
+    let app = lab.dir.join("app.yaml");
+    std::fs::write(&app, &held).unwrap();
+    lab.ok(&["apply", "-f", app.to_str().unwrap()]);
+    wait("the primary ready", 600, || {
+        lab.list("services", "data")
+            .iter()
+            .any(|s| s["metadata"]["name"] == "db" && s["status"]["ready"] == 1)
+    });
+    let from = lab.node_of(0);
+    let to = if from == "n2" { "n3" } else { "n2" };
+    eprintln!("db-0 on {from}, to move to {to}");
+    lab.sql(
+        0,
+        "create table orders (id serial primary key, item text); \
+         insert into orders (item) select 'before ' || i from generate_series(1, 1000) i; \
+         create table ballast1 as select md5(i::text) as v from generate_series(1, 1000000) i; \
+         checkpoint",
+    )
+    .expect("writing to the primary");
+
+    step("the drain: its move prepares, sends the full copy, then waits for its task to stop");
+    lab.ok(&["node", "drain", &from]);
+    let moving = || lab.operation("move", "pg-db-0");
+    let mut most = 0u64;
+    lab.waited("the move stopping its task", 600, || {
+        let Some(op) = moving() else { return false };
+        most = most.max(op["bytes"].as_u64().unwrap_or(0));
+        op["stage"] == "stopping"
+    });
+    let op = moving().unwrap();
+    let said: Vec<&str> = op["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|l| l["text"].as_str())
+        .collect();
+    eprintln!("the move so far: {said:?}; most seen sent at once {most}");
+    assert!(
+        in_turn(&stages_of(&op), &["preparing", "full-copy", "stopping"]),
+        "{op}"
+    );
+    assert!(
+        said.iter()
+            .any(|l| l.starts_with("full-copy: ") && l.ends_with(" sent")),
+        "the full copy says what it sent: {said:?}"
+    );
+    assert_eq!(op["state"], "running");
+    assert_eq!(
+        op["what"],
+        format!("move Volume data/pg-db-0 from {from} to {to}")
+    );
+    let drain = lab.operation("drain", &from).expect("the drain listed");
+    assert_eq!(op["partOf"], drain["id"], "the move is the drain's");
+    assert_eq!(
+        drain["by"], "admin",
+        "who drained, from the audit trail: {drain}"
+    );
+
+    step("a full disk where it goes holds the switch-over, which says why");
+    let out = lab.on(
+        to,
+        &format!(
+            "set -e
+             used=$(zfs get -Hp -o value used {ZFS_ROOT}/volumes)
+             zfs set quota=$((used + 2097152)) {ZFS_ROOT}/volumes
+"
+        ),
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    lab.sql(
+        0,
+        "insert into orders (item) select 'after ' || i from generate_series(1, 1000) i; \
+         create table ballast2 as select md5(i::text) as v from generate_series(1, 700000) i; \
+         checkpoint",
+    )
+    .expect("writing after the full copy");
+    std::fs::write(
+        &app,
+        APP.replace("replicas: 2", "replicas: 1\n  maxUnavailable: 1"),
+    )
+    .unwrap();
+    lab.ok(&["apply", "-f", app.to_str().unwrap()]);
+    lab.waited("the switch-over held by the full disk", 600, || {
+        moving().is_some_and(|op| {
+            let why = op["message"].as_str().unwrap_or_default();
+            op["stage"] == "switch-over" && (why.contains("quota") || why.contains("space"))
+        })
+    });
+    eprintln!("held: {}", moving().unwrap()["message"]);
+
+    step("a cancel past the switch-over is refused, from the CLI as from the API");
+    for (args, what) in [
+        (
+            vec!["node", "activate", from.as_str()],
+            "the drain cancelled",
+        ),
+        (
+            vec!["volume", "move", "pg-db-0", from.as_str(), "-n", "data"],
+            "the Volume asked back",
+        ),
+    ] {
+        let out = lab.legion(&args, &[]);
+        assert!(
+            !out.status.success(),
+            "{what}: taken: {}",
+            text(&out.stdout)
+        );
+        assert!(
+            text(&out.stderr).contains("switch-over"),
+            "{what}: {}",
+            text(&out.stderr)
+        );
+        eprintln!("{what}: refused: {}", text(&out.stderr).trim());
+    }
+    let n = lab
+        .list("nodes", "default")
+        .into_iter()
+        .find(|n| n["metadata"]["name"] == from.as_str())
+        .unwrap();
+    assert_eq!(n["spec"]["availability"], "drain", "still draining: {n}");
+    let v = lab.pg_volume();
+    assert!(v["spec"].get("node").is_none(), "not asked back: {v}");
+    assert_eq!(v["status"]["migration"]["phase"], "finishing", "{v}");
+
+    step("room made, the move ends: the cleanup, then done; the drain completes");
+    let out = lab.on(to, &format!("zfs set quota=none {ZFS_ROOT}/volumes"));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    lab.waited("the move done", 900, || {
+        moving().is_some_and(|op| op["state"] == "succeeded")
+    });
+    let op = moving().unwrap();
+    eprintln!(
+        "the move's stages: {:?}, ended: {}",
+        stages_of(&op),
+        op["message"]
+    );
+    assert!(
+        in_turn(
+            &stages_of(&op),
+            &[
+                "preparing",
+                "full-copy",
+                "stopping",
+                "switch-over",
+                "cleanup"
+            ]
+        ),
+        "each stage in turn: {op}"
+    );
+    lab.waited("the drain completed", 600, || {
+        lab.operation("drain", &from)
+            .is_some_and(|d| d["state"] == "succeeded" && d["stage"] == "completed")
+    });
+    assert_eq!(lab.pg_volume()["status"]["node"], to);
+    assert_eq!(lab.held(&from), "", "nothing left on {from}");
+    lab.waited("db-0 running on its new node", 600, || {
+        lab.ordinal(0).is_some_and(|t| t["spec"]["node"] == to)
+    });
+    lab.waited("the rows readable", 120, || lab.rows(0) == Some(2000));
+    eprintln!("{}", lab.ok(&["activity"]));
+    eprintln!("{}", lab.ok(&["activity", "pg-db-0"]));
+
+    step("past it, the node is made active again as asked");
+    lab.ok(&["node", "activate", &from]);
+
+    step("clean up");
+    lab.ok(&["delete", "service", "db", "-n", "data"]);
+    lab.waited("every task gone", 180, || {
+        lab.list("tasks", "data")
+            .iter()
+            .all(|t| t["status"]["state"] != "running")
+    });
+    step("done");
+}

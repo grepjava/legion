@@ -449,6 +449,25 @@ spec: { text: team-b's }
             && !c.lab.placed("team-a", "hello").iter().any(|n| n == "n3")
             && c.hello_settled(false)
     });
+    // Phase 10: the workbench's bar, always there, says the drain as it
+    // runs or as it ended, and opens on the Activity tab listing it.
+    let bar = "document.querySelector('.wb-status')?.textContent ?? ''";
+    a.until("the bar says the drain", 60, |b| {
+        b.eval(bar)
+            .as_str()
+            .unwrap_or_default()
+            .contains("drain node n3")
+    });
+    a.eval("document.querySelector('.wb-status-open').click()");
+    a.until("the Activity tab lists the drain", 30, |b| {
+        let rows = b.eval(
+            "[...document.querySelectorAll('[data-op]')].map(r => r.textContent).join('\\n')",
+        );
+        let rows = rows.as_str().unwrap_or_default();
+        rows.contains("drain node n3") && (rows.contains("succeeded") || rows.contains("running"))
+    });
+    // Folded away again, as the steps after it expect.
+    a.eval("document.querySelector('.wb-status-open').click()");
     a.click("Activate");
     wait("n3 active", 60, || {
         c.get("node", "", "n3")["spec"]["availability"] == "active"
