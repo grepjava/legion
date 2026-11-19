@@ -114,7 +114,7 @@ Trigger a CronJob immediately outside its schedule.
 
 ## Observability, Storage, Network & Sessions
 
-- `legion top [-n <NS>] [--once]`: Live terminal dashboard (nodes, workloads, tasks, resource graphs, logs, shell, alerts); `:` runs any `legion` command below it, `E` edits the selected object, `?` lists the keys.
+- `legion top [-n <NS>] [--once]`: Live terminal dashboard (nodes, workloads, tasks, resource graphs, logs, shell, alerts, long operations); `:` runs any `legion` command below it, `E` edits the selected object, `?` lists the keys.
 - `legion logs <TASK|SERVICE> [-c <CONTAINER>] [-f] [--tail <N>]`
 - `legion build-logs <BUILD> [-n <NS>] [-f]`
 - `legion logs-search <SERVICE|JOB> [--since <DUR>] [--until <DUR>] [TEXT]`
@@ -122,6 +122,7 @@ Trigger a CronJob immediately outside its schedule.
 - `legion files <TASK|SERVICE> [PATH]` / `legion cp <SRC> <DEST>`
 - `legion port-forward <TASK|SERVICE> <[LOCAL:]REMOTE>...`
 - `legion events [KIND/NAME] [-n <NS>] [-w]`
+- `legion activity [ID|NAME] [-w] [-o <table|yaml|json>]` (drains, Volume moves, restores and replicas' whole copies: stage, bytes sent, how long, who asked, how it ended; with an ID, its stages and full output)
 - `legion alerts [-n <NS>] [-w] [-o <table|yaml|json>]`
 - `legion usage [-n <NS>] [-o <table|yaml|json>]`
 - `legion quota [-n <NS>]`

@@ -975,9 +975,15 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 }
             }
             if rows.is_empty() {
-                println!("no pools reported{}", node.map(|n| format!(" by {n}")).unwrap_or_default());
+                println!(
+                    "no pools reported{}",
+                    node.map(|n| format!(" by {n}")).unwrap_or_default()
+                );
             } else {
-                print_table(["NODE", "POOL", "STATE", "USED", "ERRORS", "SCRUBBED"], &rows);
+                print_table(
+                    ["NODE", "POOL", "STATE", "USED", "ERRORS", "SCRUBBED"],
+                    &rows,
+                );
             }
         }
         Command::Node {
@@ -1006,13 +1012,21 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                     .collect::<Vec<_>>()
                     .join(", ")
             };
-            match objects.set_spec(r#ref, "poolErrorsSeen", seen.into()).await? {
+            match objects
+                .set_spec(r#ref, "poolErrorsSeen", seen.into())
+                .await?
+            {
                 (key, true) => println!("{key}: errors taken as seen ({said})"),
                 (key, false) => println!("{key}: already so ({said})"),
             }
         }
         Command::Node {
-            command: crate::NodeCommand::Scrub { node, every, never: _ },
+            command:
+                crate::NodeCommand::Scrub {
+                    node,
+                    every,
+                    never: _,
+                },
         } => {
             let r#ref = ObjectRef {
                 kind: Kind::Node.to_string(),
@@ -1411,6 +1425,9 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 }
                 first = false;
             }
+        }
+        Command::Activity { id, watch, output } => {
+            crate::activity::run(channel.clone(), id, watch, output).await?;
         }
         Command::LoadBalancers { namespace } => {
             let namespace = namespace.unwrap_or_else(|| "default".into());
@@ -2266,7 +2283,7 @@ pub(crate) fn connection_end(end: Option<&pb::ConnectionEnd>) -> String {
     }
 }
 
-fn print_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) {
+pub(crate) fn print_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) {
     let mut widths = header.map(str::len);
     for row in rows {
         for (w, cell) in widths.iter_mut().zip(row) {
@@ -3215,7 +3232,10 @@ mod tests {
         p.scan.as_mut().unwrap().state = "scanning".into();
         p.checksum_errors = 0;
         let row = pool_row("n1", &p, 0);
-        assert_eq!((row[4].as_str(), row[5].as_str()), ("none", "resilver running"));
+        assert_eq!(
+            (row[4].as_str(), row[5].as_str()),
+            ("none", "resilver running")
+        );
         p.scan = None;
         assert_eq!(pool_row("n1", &p, 0)[5], "never");
     }

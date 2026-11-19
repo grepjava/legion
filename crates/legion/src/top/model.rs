@@ -60,6 +60,8 @@ pub struct Model {
     /// The connections the nodes saw (`Connections`), by namespace: each
     /// namespace with a service shown is asked.
     pub(super) connections: BTreeMap<String, Vec<pb::ConnectionEdge>>,
+    /// Long operations (`Cluster.Activity`), by id.
+    pub(super) activity: BTreeMap<String, legion_api::activity::Operation>,
 }
 
 impl Model {

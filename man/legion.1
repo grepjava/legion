@@ -170,6 +170,10 @@ List or copy files inside a task's container root.
 Forward local ports to a task's pod.
 .It Cm events Oo Ar kind/name Oc Oo Fl n Ar ns Oc Oo Fl w Oc
 Show or follow recent cluster events.
+.It Cm activity Oo Ar id|name Oc Oo Fl w Oc Oo Fl o Ar fmt Oc
+Show or follow long operations: drains, Volume moves, restores and
+replicas' whole copies, each with its stage, the bytes sent and how it
+ended; with an id, its stages and full output.
 .It Cm alerts Oo Fl n Ar ns Oc Oo Fl w Oc Oo Fl o Ar fmt Oc
 Show active cluster alerts.
 .It Cm usage Op Fl n Ar ns , Cm quota Op Fl n Ar ns

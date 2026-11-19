@@ -1589,3 +1589,70 @@ fn the_keys_fit_a_short_wide_screen_in_two_columns() {
     );
     assert!(s.contains("On the Nodes tab now"), "{s}");
 }
+
+#[test]
+fn the_activity_tab_lists_long_operations_newest_first() {
+    use legion_api::activity::{Operation, OperationKind, OperationState, Stage};
+    use legion_api::audit::Target;
+    let mut m = cluster();
+    let volume = Target {
+        kind: "Volume".into(),
+        namespace: "shop".into(),
+        name: "data".into(),
+    };
+    let mut moving = Operation::new(
+        OperationKind::Move,
+        volume,
+        "move Volume shop/data from n1 to n2".into(),
+        2_000_000,
+        Stage::Preparing,
+    );
+    moving.enter(2_001_000, Stage::FullCopy);
+    moving.bytes = 3 * 1024 * 1024;
+    let mut drain = Operation::new(
+        OperationKind::Drain,
+        Target {
+            kind: "Node".into(),
+            namespace: String::new(),
+            name: "n1".into(),
+        },
+        "drain node n1".into(),
+        1_000_000,
+        Stage::Draining,
+    );
+    drain.end(
+        3_000_000,
+        OperationState::Cancelled,
+        "the node was made active again",
+    );
+    for op in [drain, moving] {
+        m.activity.insert(op.id.clone(), op);
+    }
+    let v = View {
+        tab: Tab::Activity,
+        ..View::default()
+    };
+    let text = draw::plain(&m, &v);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[0].starts_with("BEGAN"), "{text}");
+    assert!(
+        lines[1].contains("move Volume shop/data from n1 to n2"),
+        "{text}"
+    );
+    assert!(
+        lines[1].contains("full-copy") && lines[1].contains("3.0 MiB"),
+        "{text}"
+    );
+    assert!(lines[2].contains("cancelled"), "{text}");
+    assert_eq!(
+        super::view::tab_count(&m, Tab::Activity),
+        1,
+        "one under way"
+    );
+    // Its row leads to what it is done to.
+    let rows = super::view::rows(&m, &v);
+    assert_eq!(
+        rows[0].key,
+        Some((Kind::Volume, "shop".to_owned(), "data".to_owned()))
+    );
+}

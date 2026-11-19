@@ -700,7 +700,7 @@ fn summary(model: &Model) -> Vec<Line<'static>> {
 
 fn tab_bar(model: &Model, view: &View) -> Tabs<'static> {
     let titles = TABS.iter().enumerate().map(|(i, t)| {
-        let count: usize = t.kinds().iter().map(|k| model.of(*k).count()).sum();
+        let count = super::view::tab_count(model, *t);
         let mut spans = vec![
             Span::styled(format!("{}", i + 1), fg(ACCENT)),
             Span::raw(format!(" {}", t.title())),
@@ -875,7 +875,7 @@ fn bento_body(f: &mut Frame, model: &Model, view: &View, area: Rect) {
     let show_workloads = view.boxes[2];
     let show_lower = view.boxes[3];
 
-    // Determine which auxiliary tab occupies the lower-right box so pressing 1-7
+    // Determine which auxiliary tab occupies the lower-right box so pressing 1-8
     // always brings the selected tab on screen with an accented border!
     let lower_tab = match view.tab {
         Tab::Nodes | Tab::Workloads | Tab::Tasks => Tab::Tasks,
@@ -1393,7 +1393,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Moving around",
         &[
-            ("1–7 ←→ Tab", "tabs"),
+            ("1–8 ←→ Tab", "tabs"),
             ("↑↓ j k PgUp PgDn g G", "select"),
             ("Enter", "a node's or workload's tasks; else the YAML"),
             ("/", "filter rows; Esc clears"),
@@ -1600,7 +1600,7 @@ fn bottom_line(view: &View) -> Line<'static> {
         ],
         Tab::Storage => &[("m", "move"), ("D", "delete")],
         Tab::Network | Tab::Config => &[("y", "YAML"), ("D", "delete")],
-        Tab::Log => &[],
+        Tab::Log | Tab::Activity => &[],
     };
     if view.typing() {
         return Line::from(vec![

@@ -1,5 +1,6 @@
 //! `legion`: the daemon (`legion daemon`) and the CLI that talks to it.
 
+mod activity;
 mod autolock;
 mod ca;
 mod cli;
@@ -539,9 +540,6 @@ enum Command {
         #[arg(short, long)]
         namespace: Option<String>,
     },
-    /// A namespace's load balancer addresses and which node holds each:
-    /// the nodes that may, by CARP skew (the lowest meant to be master),
-    /// each with the CARP state it last reported.
     /// What happened to objects lately, oldest first, as the manager asked
     /// saw it (kept in its memory for an hour): a namespace's, or one
     /// object's (`service/web` with its tasks'; `node/n1`). `-w` follows.
@@ -553,6 +551,24 @@ enum Command {
         #[arg(short, long)]
         watch: bool,
     },
+    /// Long operations, as the leader follows them: drains, Volume moves,
+    /// restores and replicas' whole copies, those under way and those
+    /// ended in the last hour, each with its stage (a move: preparing,
+    /// full-copy, stopping, switch-over, cleanup), what it has sent, how
+    /// long it has run, who asked (for the cluster admin) and why it waits
+    /// or how it ended. `-w` follows, a line per change. With an ID (or
+    /// the start of one, or the name of what it is done to), that one's
+    /// stages and all it said.
+    Activity {
+        id: Option<String>,
+        #[arg(short, long)]
+        watch: bool,
+        #[arg(short, long, value_enum, default_value_t = cli::Format::Table)]
+        output: cli::Format,
+    },
+    /// A namespace's load balancer addresses and which node holds each:
+    /// the nodes that may, by CARP skew (the lowest meant to be master),
+    /// each with the CARP state it last reported.
     #[command(name = "load-balancers", alias = "lb")]
     LoadBalancers {
         #[arg(short, long)]

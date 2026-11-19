@@ -33,9 +33,10 @@ pub enum Tab {
     Network,
     Config,
     Log,
+    Activity,
 }
 
-pub(super) const TABS: [Tab; 7] = [
+pub(super) const TABS: [Tab; 8] = [
     Tab::Nodes,
     Tab::Workloads,
     Tab::Tasks,
@@ -43,6 +44,7 @@ pub(super) const TABS: [Tab; 7] = [
     Tab::Network,
     Tab::Config,
     Tab::Log,
+    Tab::Activity,
 ];
 
 impl Tab {
@@ -55,6 +57,7 @@ impl Tab {
             Tab::Network => "Network",
             Tab::Config => "Config",
             Tab::Log => "Changes",
+            Tab::Activity => "Activity",
         }
     }
 
@@ -74,7 +77,7 @@ impl Tab {
                 Kind::ImagePolicy,
                 Kind::AlertReceiver,
             ],
-            Tab::Log => &[],
+            Tab::Log | Tab::Activity => &[],
         }
     }
 
@@ -119,6 +122,7 @@ impl Tab {
             Tab::Network => &["NAMESPACE", "NAME", "KIND", "WHAT"],
             Tab::Config => &["NAMESPACE", "NAME", "KIND", "WHAT"],
             Tab::Log => &["TIME (UTC)", "CHANGE"],
+            Tab::Activity => &crate::activity::HEADER,
         }
     }
 }
@@ -444,9 +448,9 @@ pub(super) enum Prompt {
 pub struct View {
     pub(super) tab: Tab,
     /// The selected row of each tab.
-    pub(super) selected: [usize; 7],
+    pub(super) selected: [usize; 8],
     /// Each tab's filter: rows holding the text, in any case.
-    pub(super) filter: [String; 7],
+    pub(super) filter: [String; 8],
     pub(super) focus: Option<Focus>,
     /// Tasks that ended are listed too.
     pub(super) history: bool,
@@ -489,7 +493,7 @@ impl Default for View {
     fn default() -> Self {
         View {
             tab: Tab::Nodes,
-            selected: [0; 7],
+            selected: [0; 8],
             filter: Default::default(),
             focus: None,
             history: false,
@@ -716,7 +720,7 @@ impl View {
                     self.focus = None;
                 }
             }
-            KeyCode::Char(c @ '1'..='7') => self.tab = TABS[c as usize - '1' as usize],
+            KeyCode::Char(c @ '1'..='8') => self.tab = TABS[c as usize - '1' as usize],
             KeyCode::Tab | KeyCode::Right => self.tab = TABS[(i + 1) % TABS.len()],
             KeyCode::BackTab | KeyCode::Left => self.tab = TABS[(i + TABS.len() - 1) % TABS.len()],
             KeyCode::Down | KeyCode::Char('j') => *sel = (*sel + 1).min(last),
@@ -1215,7 +1219,7 @@ impl View {
                     // Approximate tab regions across the tab bar.
                     let mut x = 0u16;
                     for (idx, t) in TABS.iter().enumerate() {
-                        let count: usize = t.kinds().iter().map(|k| model.of(*k).count()).sum();
+                        let count = tab_count(model, *t);
                         let extra = if *t != Tab::Log && count > 0 {
                             format!(" ({count})").len() as u16
                         } else {
@@ -1306,6 +1310,56 @@ impl TableRow {
     }
 }
 
+/// What a tab counts in its title: its objects; for Activity, the
+/// operations under way.
+pub(super) fn tab_count(model: &Model, tab: Tab) -> usize {
+    match tab {
+        Tab::Activity => model.activity.values().filter(|o| o.running()).count(),
+        t => t.kinds().iter().map(|k| model.of(*k).count()).sum(),
+    }
+}
+
+/// The long operations, newest first, as `legion activity` lists them:
+/// each row leads to what it is done to.
+fn activity_rows(model: &Model) -> Vec<TableRow> {
+    use legion_api::activity::OperationState;
+    let now = legion_api::clock::now() * 1000;
+    let mut ops: Vec<&legion_api::activity::Operation> = model.activity.values().collect();
+    ops.sort_by_key(|o| std::cmp::Reverse(o.began_ms));
+    ops.into_iter()
+        .map(|op| {
+            let key = op
+                .target
+                .kind
+                .parse::<Kind>()
+                .ok()
+                .map(|k| (k, op.target.namespace.clone(), op.target.name.clone()));
+            // When it began as the other tabs say times: the time of day.
+            let [_, what, stage, sent, state, by, message] = crate::activity::row(op, now);
+            let state = match op.state {
+                OperationState::Running => colored(state, fg(WARN)),
+                OperationState::Succeeded => colored(state, fg(OK)),
+                OperationState::Failed => colored(state, fg(BAD)),
+                OperationState::Cancelled => dimmed(state),
+            };
+            let began = time_of_day(op.began_ms.div_euclid(1000));
+            TableRow::new(
+                vec![
+                    dimmed(began),
+                    text(what),
+                    text(stage),
+                    text(sent),
+                    state,
+                    text(by),
+                    text(message),
+                ],
+                key,
+            )
+            .metrics(0.0, op.bytes, op.state.as_str())
+        })
+        .collect()
+}
+
 /// The rows of the view's tab, filtered and sorted.
 pub(super) fn rows(model: &Model, view: &View) -> Vec<TableRow> {
     rows_for_tab(model, view, view.tab)
@@ -1321,6 +1375,7 @@ pub(super) fn rows_for_tab(model: &Model, view: &View, tab: Tab) -> Vec<TableRow
         Tab::Storage => volume_rows(model),
         Tab::Network => network_rows(model),
         Tab::Config => config_rows(model),
+        Tab::Activity => activity_rows(model),
         Tab::Log => model
             .log
             .iter()
@@ -2016,7 +2071,11 @@ fn config_rows(model: &Model) -> Vec<TableRow> {
                 legion_api::alert::Severity::Critical => "critical alerts",
                 legion_api::alert::Severity::Warning => "every alert",
             },
-            if error.is_empty() { String::new() } else { format!(": failing, {error}") }
+            if error.is_empty() {
+                String::new()
+            } else {
+                format!(": failing, {error}")
+            }
         );
         TableRow::new(
             vec![

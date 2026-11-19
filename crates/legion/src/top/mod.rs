@@ -79,6 +79,9 @@ enum Msg {
     Redraw,
     /// The connections the nodes saw of a namespace's tasks.
     Connections(String, Vec<pb::ConnectionEdge>),
+    /// Long operations as they change (`Cluster.Activity`); `true`: all
+    /// of them, what was known before replaced.
+    Activity(bool, Vec<legion_api::activity::Operation>),
     /// The terminal is gone.
     HungUp,
 }
@@ -109,6 +112,7 @@ pub async fn run(
     ));
     let (seen_tx, seen_rx) = watch::channel(BTreeSet::new());
     let seer = tokio::spawn(poll_connections(channel.clone(), seen_rx, tx.clone()));
+    let activity = tokio::spawn(follow_activity(channel.clone(), tx.clone()));
     let keys = Keys::default();
     read_keys(tx.clone(), keys.clone());
 
@@ -222,6 +226,14 @@ pub async fn run(
                     }
                 }
                 Msg::Redraw => {}
+                Msg::Activity(all, ops) => {
+                    if all {
+                        model.activity.clear();
+                    }
+                    for op in ops {
+                        model.activity.insert(op.id.clone(), op);
+                    }
+                }
                 Msg::Connections(namespace, edges) => {
                     model.connections.insert(namespace, edges);
                 }
@@ -369,6 +381,7 @@ pub async fn run(
     follower.abort();
     poller.abort();
     seer.abort();
+    activity.abort();
     result
 }
 
@@ -604,6 +617,34 @@ async fn poll_connections(
                 return;
             }
         }
+    }
+}
+
+/// Follows `Cluster.Activity`, again a few seconds after it ends; not
+/// for a manager too old to have it.
+async fn follow_activity(channel: Channel, tx: mpsc::UnboundedSender<Msg>) {
+    let mut cluster = crate::cli::cluster_client(channel);
+    loop {
+        match cluster.activity(pb::ActivityRequest { follow: true }).await {
+            Ok(r) => {
+                let mut stream = r.into_inner();
+                let mut first = true;
+                while let Ok(Some(r)) = stream.message().await {
+                    let ops = r
+                        .operations_json
+                        .iter()
+                        .filter_map(|j| serde_json::from_slice(j).ok())
+                        .collect();
+                    if tx.send(Msg::Activity(first, ops)).is_err() {
+                        return;
+                    }
+                    first = false;
+                }
+            }
+            Err(e) if e.code() == tonic::Code::Unimplemented => return,
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 
@@ -1199,6 +1240,19 @@ pub async fn once(channel: Channel, namespace: Option<String>) -> anyhow::Result
     if let Ok(u) = cluster.usage(req).await {
         model.usage(u.into_inner());
     }
+    if let Ok(r) = cluster
+        .activity(pb::ActivityRequest { follow: false })
+        .await
+        && let Ok(Some(r)) = r.into_inner().message().await
+    {
+        for op in r
+            .operations_json
+            .iter()
+            .filter_map(|j| serde_json::from_slice::<legion_api::activity::Operation>(j).ok())
+        {
+            model.activity.insert(op.id.clone(), op);
+        }
+    }
     let mut out = draw::plain_summary(&model);
     out.push('\n');
     for tab in view::TABS.into_iter().filter(|t| *t != view::Tab::Log) {
@@ -1206,7 +1260,10 @@ pub async fn once(channel: Channel, namespace: Option<String>) -> anyhow::Result
             tab,
             ..View::default()
         };
-        if tab.kinds().iter().all(|k| model.hidden.contains(k)) {
+        if tab == view::Tab::Activity && model.activity.is_empty() {
+            continue;
+        }
+        if tab != view::Tab::Activity && tab.kinds().iter().all(|k| model.hidden.contains(k)) {
             continue;
         }
         out.push_str(&format!("\n{}\n", tab.title()));
