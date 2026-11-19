@@ -21,7 +21,8 @@ use serde_json::{Value, json};
 
 /// What every expression the tests evaluate may use: `H.button(text)` the
 /// visible button, link styled as one, or tab whose text is `text`;
-/// `H.field(label)` the control labelled `label`; `H.text()` the page's text.
+/// `H.field(label)` the control labelled `label`, by its `aria-label` or a
+/// `<label>` it is in or named by; `H.text()` the page's text.
 const HELPERS: &str = r#"
 const H = {
   shown: (e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length),
@@ -29,7 +30,16 @@ const H = {
     [...document.querySelectorAll('button, a.button, [role=tab]')]
       .filter(H.shown)
       .find((e) => e.innerText.trim() === t),
-  field: (l) => [...document.querySelectorAll(`[aria-label="${l}"]`)].find(H.shown),
+  field: (l) =>
+    [...document.querySelectorAll(`[aria-label="${l}"]`)].find(H.shown) ??
+    H.labelled(
+      [...document.querySelectorAll('label')]
+        .filter(H.shown)
+        .find((x) => x.innerText.trim() === l)
+    ),
+  // The control a label names: the one inside it, or the one it is for.
+  labelled: (x) =>
+    x && (x.querySelector('input, select, textarea') ?? (x.htmlFor ? document.getElementById(x.htmlFor) : undefined)),
   text: () => document.body.innerText,
 };
 "#;
