@@ -1356,19 +1356,39 @@ fn a_drain_says_each_stage_and_refuses_a_cancel_past_the_switch_over() {
         .unwrap();
     assert_ne!(n["spec"]["availability"], "drain", "not drained: {n}");
     lab.ok(&["node", "activate", to]);
+    // Its budget lets no task stop: the drain would hold, as this test
+    // means it to, so the check says so, with where the data goes and how
+    // much; the drain is then forced.
     let mut said = String::new();
+    let mut last = String::new();
     lab.waited("the dry run with the Volume's size", 120, || {
         let out = lab.legion(&["node", "drain", &from, "--dry-run"], &[]);
         said = text(&out.stdout);
-        out.status.success()
+        if said != last {
+            eprintln!("dry run (exit {:?}):\n{said}", out.status.code());
+            last = said.clone();
+        }
+        out.status.code() == Some(1)
             && said.contains(&format!("Volume data/pg-db-0 moves from {from} to {to} ("))
             && !said.contains("size not known")
     });
-    eprintln!("{said}");
-    assert!(said.ends_with("Nothing blocks it.\n"), "{said}");
+    assert!(
+        said.contains(&format!(
+            "BLOCKS (stays): Task data/db-0-1: keeps running on {from} (budget)"
+        )),
+        "{said}"
+    );
 
-    step("the drain: its move prepares, sends the full copy, then waits for its task to stop");
-    lab.ok(&["node", "drain", &from]);
+    step(
+        "the drain, forced: its move prepares, sends the full copy, then waits for its task to stop",
+    );
+    let out = lab.legion(&["node", "drain", &from, "--force"], &[]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("Going ahead anyway, as --force asks."),
+        "{}",
+        text(&out.stderr)
+    );
     let moving = || lab.operation("move", "pg-db-0");
     let mut most = 0u64;
     lab.waited("the move stopping its task", 600, || {
