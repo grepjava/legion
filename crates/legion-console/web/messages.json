@@ -114,8 +114,11 @@
   "Check": "",
   "Check again": "",
   "Choose a namespace": "",
+  "Choose every row shown": "",
   "Choose node…": "",
   "Choose target node…": "",
+  "Choose {name}": "",
+  "Clear": "",
   "Clear the filter": "",
   "Click any Service, Pod/VM, Route, Volume or node to drill down.": "",
   "Close": "",
@@ -165,6 +168,7 @@
   "Delete snapshot @{snapshot} from {name}?": "",
   "Delete {label}?": "",
   "Delete {label}? {consequence}": "",
+  "Delete {n} {kinds}: {names}?": "",
   "Deleted snapshot @{snapshot}": "",
   "Demote": "",
   "Demote {name} to a worker? Its daemon takes the role up and starts again.": "",
@@ -333,6 +337,7 @@
   "Last": "",
   "Last copy": "",
   "Last sent": "",
+  "Lately": "",
   "Latest update": "",
   "Launch a bhyve VM Service from an existing /disk.img OCI image.": "",
   "Layer": "",
@@ -570,6 +575,7 @@
   "Resize workbench": "",
   "Resources": "",
   "Restart": "",
+  "Restart {names}? Their tasks are replaced, as an update replaces them.": "",
   "Restart {name}? Its tasks are replaced, as an update replaces them.": "",
   "Restarts": "",
   "Restore": "",
@@ -808,6 +814,7 @@
   "What the Volume could lose with its node. Stale past {time}.": "",
   "What the doctor finds on {node}": "",
   "What was found": "",
+  "What {name} holds": "",
   "When": "",
   "When what nodes report was last read": "",
   "Where in the container": "",
@@ -1059,6 +1066,7 @@
     "one": "",
     "other": ""
   },
+  "{kinds}: filter and actions": "",
   "{label} deleted": "",
   "{memory} memory": "",
   "{memory} memory, of the tasks you can see": "",
@@ -1102,6 +1110,7 @@
     "one": "",
     "other": ""
   },
+  "{n} chosen": "",
   "{n} clients": "",
   "{n} connections": {
     "one": "",
@@ -1133,6 +1142,7 @@
     "other": ""
   },
   "{n} ready": "",
+  "{n} restarted": "",
   "{n} rules": {
     "one": "",
     "other": ""
@@ -1144,6 +1154,7 @@
     "other": ""
   },
   "{n} vulnerable": "",
+  "{n} {kinds} deleted": "",
   "{path} written ({size})": "",
   "{pct}% of the way to stale": "",
   "{ready}/{desired} ready": "",
