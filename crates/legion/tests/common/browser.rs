@@ -327,6 +327,27 @@ impl Browser {
         }
     }
 
+    /// Answers the console's confirmation asking for `name` typed (what
+    /// can't be undone: deleting a Node, a Volume, a Namespace), as a user
+    /// who meant it would: types it, then presses the action.
+    pub fn confirm_typing(&mut self, name: &str) {
+        self.until("the confirmation asking for the name", 30, |b| {
+            b.eval("!!document.querySelector('dialog.confirm[open] input')") == json!(true)
+        });
+        let done = self.eval(&format!(
+            "(() => {{ const d = document.querySelector('dialog.confirm[open]');
+               const e = d.querySelector('input'); e.focus(); e.value = {name:?};
+               e.dispatchEvent(new Event('input', {{ bubbles: true }}));
+               return e.value; }})()"
+        ));
+        assert_eq!(done, json!(name), "the name typed");
+        self.until("the action enabled once the name is typed", 10, |b| {
+            b.eval("!document.querySelector('dialog.confirm[open] button[type=submit]').disabled")
+                == json!(true)
+        });
+        self.eval("document.querySelector('dialog.confirm[open] button[type=submit]').click()");
+    }
+
     /// Types `value` into the field labelled `label`, as a user does.
     pub fn fill(&mut self, label: &str, value: &str) {
         self.until(&format!("a field {label:?}"), 30, |b| {

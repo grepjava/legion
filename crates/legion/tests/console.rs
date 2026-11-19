@@ -1077,6 +1077,7 @@ spec:
     wait("n2 down", 120, || c.lab.node_state("n2") == "down");
     c.page(&mut a, "/k/Node/_/n2");
     a.click("Delete");
+    a.confirm_typing("n2");
     wait("the Volume lost", 120, || {
         c.get("volume", "team-a", volume)["status"]["lost"]
             .as_str()
