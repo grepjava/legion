@@ -323,6 +323,7 @@ impl Browser {
                    const c = d.querySelector('[data-check]');
                    if (c && c.dataset.check === 'checking') return 'checking';
                    if (c && c.dataset.check === 'blocks') return 'blocks';
+                   if (c && c.dataset.check === 'error') return 'error: ' + c.textContent;
                    d.querySelector('button[type=submit]').click(); return 'pressed'; })()",
             );
             let now = Instant::now();
@@ -330,6 +331,10 @@ impl Browser {
                 Some("none") if now < opened => {}
                 Some("checking") if now < checked => {}
                 Some("checking") => panic!("the confirmation's check did not end within 30 s"),
+                // A check that failed is a fault here, not a reason to go on.
+                Some(e) if e.starts_with("error: ") => {
+                    panic!("the confirmation's check failed: {e}")
+                }
                 _ => return,
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -365,6 +370,9 @@ impl Browser {
     /// What the open confirmation's check found, as its text says, once
     /// done: none if it checks nothing.
     pub fn confirmation_check(&mut self) -> Option<String> {
+        self.until("the confirmation open", 10, |b| {
+            b.eval("!!document.querySelector('dialog.confirm[open]')") == json!(true)
+        });
         self.until("the confirmation's check done", 30, |b| {
             b.eval(
                 "(() => { const c = document.querySelector('dialog.confirm[open] [data-check]');
