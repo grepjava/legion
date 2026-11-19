@@ -21,6 +21,42 @@ use crate::{Command, StackCommand, UserCommand};
 /// an election, or while a manager waits on a quorum (DESIGN.md §3.8).
 const RETRY_FOR: Duration = Duration::from_secs(30);
 
+/// A pool's row in `legion node pools`: its node, name, state, how full,
+/// its errors and when it was last scrubbed (or what scans it now).
+pub(crate) fn pool_row(node: &str, p: &legion_api::node::Pool, now_ms: i64) -> [String; 6] {
+    let gib = |b: u64| format!("{:.1}", b as f64 / f64::from(1u32 << 30));
+    let used = format!(
+        "{}% ({} of {} GiB)",
+        p.percent_used(),
+        gib(p.alloc_bytes),
+        gib(p.size_bytes)
+    );
+    let errors = if p.errors() == 0 {
+        "none".to_owned()
+    } else {
+        format!(
+            "{} read, {} write, {} checksum",
+            p.read_errors, p.write_errors, p.checksum_errors
+        )
+    };
+    let scrubbed = match (&p.scan, p.scrubbed_ms()) {
+        (Some(s), _) if s.state == "scanning" => format!("{} running", s.function),
+        (_, Some(at)) => format!(
+            "{} ago",
+            legion_api::clock::span(std::time::Duration::from_millis((now_ms - at).max(0) as u64))
+        ),
+        _ => "never".to_owned(),
+    };
+    [
+        node.to_owned(),
+        p.name.clone(),
+        p.state.clone(),
+        used,
+        errors,
+        scrubbed,
+    ]
+}
+
 /// A Volume's replica in a cell: its node and how old its last copy is,
 /// or why it has none; then, as they hold, that it is stale, a copy runs,
 /// and automatic failover is blocked (`legion get volume` says why).
@@ -914,6 +950,85 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             }
         }
         Command::Node {
+            command: crate::NodeCommand::Pools { node },
+        } => {
+            let resp = objects
+                .list(ListRequest {
+                    kind: Kind::Node.to_string(),
+                    ..Default::default()
+                })
+                .await?
+                .into_inner();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as i64);
+            let mut rows = Vec::new();
+            for o in resp.objects {
+                let o = Object::try_from(o).map_err(|e| anyhow::anyhow!("{e}"))?;
+                if node.as_ref().is_some_and(|n| *n != o.metadata.name) {
+                    continue;
+                }
+                let status: legion_api::node::NodeStatus =
+                    serde_json::from_value(o.status).unwrap_or_default();
+                for p in &status.pools {
+                    rows.push(pool_row(&o.metadata.name, p, now_ms));
+                }
+            }
+            if rows.is_empty() {
+                println!("no pools reported{}", node.map(|n| format!(" by {n}")).unwrap_or_default());
+            } else {
+                print_table(["NODE", "POOL", "STATE", "USED", "ERRORS", "SCRUBBED"], &rows);
+            }
+        }
+        Command::Node {
+            command: crate::NodeCommand::ErrorsSeen { node },
+        } => {
+            let r#ref = ObjectRef {
+                kind: Kind::Node.to_string(),
+                namespace: String::new(),
+                name: node.clone(),
+            };
+            let o = Object::try_from(objects.get(r#ref.clone()).await?.into_inner())
+                .map_err(|e| anyhow::anyhow!("node {node}: {e}"))?;
+            let status: legion_api::node::NodeStatus =
+                serde_json::from_value(o.status).unwrap_or_default();
+            let seen: serde_json::Map<String, serde_json::Value> = status
+                .pools
+                .iter()
+                .filter(|p| p.errors() > 0)
+                .map(|p| (p.name.clone(), p.errors().into()))
+                .collect();
+            let said = if seen.is_empty() {
+                "no errors to take as seen".to_owned()
+            } else {
+                seen.iter()
+                    .map(|(p, n)| format!("{p}: {n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            match objects.set_spec(r#ref, "poolErrorsSeen", seen.into()).await? {
+                (key, true) => println!("{key}: errors taken as seen ({said})"),
+                (key, false) => println!("{key}: already so ({said})"),
+            }
+        }
+        Command::Node {
+            command: crate::NodeCommand::Scrub { node, every, never: _ },
+        } => {
+            let r#ref = ObjectRef {
+                kind: Kind::Node.to_string(),
+                namespace: String::new(),
+                name: node,
+            };
+            let said = every.map_or("no scheduled scrubs".to_owned(), |d| {
+                format!("its pools scrubbed every {d} days")
+            });
+            let value = every.map_or(serde_json::Value::Null, Into::into);
+            match objects.set_spec(r#ref, "scrubEveryDays", value).await? {
+                (key, true) => println!("{key}: {said}"),
+                (key, false) => println!("{key} already has {said}"),
+            }
+        }
+        Command::Node {
             command: crate::NodeCommand::Require { node, checks },
         } => {
             let r#ref = ObjectRef {
@@ -967,6 +1082,9 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 crate::NodeCommand::Activate { node } => ("active", node),
                 crate::NodeCommand::Label { .. }
                 | crate::NodeCommand::Require { .. }
+                | crate::NodeCommand::Pools { .. }
+                | crate::NodeCommand::ErrorsSeen { .. }
+                | crate::NodeCommand::Scrub { .. }
                 | crate::NodeCommand::Promote { .. }
                 | crate::NodeCommand::Demote { .. } => unreachable!("handled above"),
             };
@@ -3053,6 +3171,42 @@ fn image_details(r: &pb::InspectRegistryImageResponse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pools_row_says_how_full_its_errors_and_its_last_scrub() {
+        let mut p = legion_api::node::Pool {
+            name: "tank".into(),
+            state: "DEGRADED".into(),
+            size_bytes: 100 << 30,
+            alloc_bytes: 25 << 30,
+            checksum_errors: 3,
+            scan: Some(legion_api::node::PoolScan {
+                function: "scrub".into(),
+                state: "finished".into(),
+                end_ms: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            pool_row("n1", &p, 2 * 86_400_000),
+            [
+                "n1",
+                "tank",
+                "DEGRADED",
+                "25% (25.0 of 100.0 GiB)",
+                "0 read, 0 write, 3 checksum",
+                "2d ago"
+            ]
+        );
+        p.scan.as_mut().unwrap().function = "resilver".into();
+        p.scan.as_mut().unwrap().state = "scanning".into();
+        p.checksum_errors = 0;
+        let row = pool_row("n1", &p, 0);
+        assert_eq!((row[4].as_str(), row[5].as_str()), ("none", "resilver running"));
+        p.scan = None;
+        assert_eq!(pool_row("n1", &p, 0)[5], "never");
+    }
 
     #[test]
     fn a_volumes_replica_says_where_and_how_old() {

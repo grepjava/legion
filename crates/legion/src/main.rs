@@ -851,6 +851,22 @@ pub enum NodeCommand {
     /// as it needs its required ones; none given, none. A node whose host
     /// lacks what it needs keeps what runs there (drain it to move that).
     Require { node: String, checks: Vec<String> },
+    /// List the ZFS pools of NODE, or of every node: health, how full,
+    /// errors, the last scrub (as each node's agent last read them).
+    Pools { node: Option<String> },
+    /// Take NODE's pools' errors as they stand as seen: `pool-errors` is
+    /// raised again only for more. Clear them on the host with `zpool
+    /// clear` once dealt with, and this starts over from none.
+    ErrorsSeen { node: String },
+    /// Have NODE's agent scrub its pools every DAYS days, and hold them to
+    /// it (`scrub-overdue`); --never stops it.
+    Scrub {
+        node: String,
+        #[arg(long, value_name = "DAYS", required_unless_present = "never", value_parser = clap::value_parser!(u32).range(1..))]
+        every: Option<u32>,
+        #[arg(long, conflicts_with = "every")]
+        never: bool,
+    },
 }
 
 #[derive(Subcommand)]
