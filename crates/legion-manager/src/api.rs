@@ -1248,6 +1248,19 @@ impl Cluster for ApiService {
         Ok(Response::new(r))
     }
 
+    async fn test_alert_receiver(
+        &self,
+        req: Request<pb::TestAlertReceiverRequest>,
+    ) -> Result<Response<pb::TestAlertReceiverResponse>, Status> {
+        let caller = self.caller(&req)?;
+        let name = req.into_inner().name;
+        caller.check(&self.store, Verb::Write, Kind::AlertReceiver, "")?;
+        crate::notify::test(&self.store, &name)
+            .await
+            .map_err(|e| Status::failed_precondition(format!("AlertReceiver {name}: {e}")))?;
+        Ok(Response::new(pb::TestAlertReceiverResponse {}))
+    }
+
     async fn autolock(
         &self,
         req: Request<pb::AutolockRequest>,

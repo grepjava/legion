@@ -176,6 +176,9 @@ service Cluster {
   // The first message holds those kept, oldest first; with `follow`, each
   // new one comes as it happens. For any caller who may read the kind there.
   rpc Events(EventsRequest) returns (stream EventsResponse);
+  // Sends a test through an AlertReceiver now, as it sends alerts, and
+  // says whether it was taken: for whoever may write receivers.
+  rpc TestAlertReceiver(TestAlertReceiverRequest) returns (TestAlertReceiverResponse);
   // The audit events the filter matches, oldest first, at most `limit`
   // (1000 when 0): the cluster admin's only (legion_api::audit).
   rpc Audit(AuditRequest) returns (AuditResponse);
@@ -541,6 +544,12 @@ message ObjectEvent {
   // A task's Service or Job.
   string owner = 7;
 }
+
+message TestAlertReceiverRequest {
+  string name = 1;
+}
+
+message TestAlertReceiverResponse {}
 
 message LoadBalancersRequest {
   string namespace = 1;

@@ -35,6 +35,7 @@ pub mod logsearch;
 mod managers;
 pub mod metrics;
 mod migrate;
+mod notify;
 mod oidc;
 mod quota;
 mod raft_net;
@@ -424,6 +425,8 @@ impl Manager {
             api.alerts.clone(),
             api.closing.clone(),
         ));
+        // Alerts sent to the receivers, while this manager leads.
+        let notifying = tokio::spawn(notify::run(api.clone()));
         let eventing = tokio::spawn(events::track(
             api.store.clone(),
             api.events.clone(),
@@ -546,6 +549,7 @@ impl Manager {
         let _ = floor.await;
         let _ = names.await;
         let _ = alerting.await;
+        let _ = notifying.await;
         let _ = eventing.await;
         if let Some(console) = console {
             let _ = console.await;

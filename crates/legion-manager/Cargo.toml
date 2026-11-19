@@ -36,6 +36,7 @@ similar.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
+rustls-platform-verifier = "0.7"
 tokio-stream.workspace = true
 tonic = { workspace = true, features = ["tls-ring"] }
 tower-layer.workspace = true

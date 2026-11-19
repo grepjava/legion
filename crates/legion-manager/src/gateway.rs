@@ -222,6 +222,7 @@ fn router(gateway: Gateway) -> axum::Router {
             "/api/volume-promote/{namespace}/{name}",
             post(volume_promote),
         )
+        .route("/api/alert-receiver-test/{name}", post(alert_receiver_test))
         .route("/api/images", get(node_images_list).post(node_images_op))
         .route("/api/image-export", get(image_export))
         .route("/api/image-load", post(image_load))
@@ -2915,6 +2916,20 @@ async fn volume_promote(
         .await?
         .into_inner();
     Ok(Json(serde_json::json!({ "node": r.node, "promoted": r.promoted })).into_response())
+}
+
+/// `legion alerts test RECEIVER`.
+async fn alert_receiver_test(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(name): Path<String>,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    pb::cluster_client::ClusterClient::new(channel)
+        .test_alert_receiver(pb::TestAlertReceiverRequest { name })
+        .await?;
+    Ok(Json(serde_json::json!({ "sent": true })).into_response())
 }
 
 #[derive(Deserialize)]
