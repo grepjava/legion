@@ -1084,6 +1084,7 @@ async fn usage(
                 "images_bytes": n.images_bytes,
                 "jails_bytes": n.jails_bytes,
                 "build_bytes": n.build_bytes,
+                "load": [n.load1, n.load5, n.load15],
             })
         })
         .collect();

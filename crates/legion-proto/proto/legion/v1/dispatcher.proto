@@ -221,6 +221,11 @@ message NodeTelemetry {
   // the builder's store, where builds keep their images and cache; outside
   // Legion's ZFS root, 0 on a node without one.
   uint64 build_bytes = 8;
+  // The host's load averages over 1, 5 and 15 minutes, in hundredths
+  // (vm.loadavg); 0 from builds before.
+  uint32 load1 = 9;
+  uint32 load5 = 10;
+  uint32 load15 = 11;
 }
 
 message VolumeTelemetry {

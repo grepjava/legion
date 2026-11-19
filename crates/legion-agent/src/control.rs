@@ -825,6 +825,9 @@ impl Control for GrpcControl {
                 zfs_avail_bytes: t.zfs_avail_bytes,
                 net_rx_bps: t.net_rx_bps,
                 net_tx_bps: t.net_tx_bps,
+                load1: t.load[0],
+                load5: t.load[1],
+                load15: t.load[2],
                 volumes: t
                     .volumes
                     .into_iter()

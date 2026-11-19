@@ -1480,6 +1480,9 @@ impl Cluster for ApiService {
                             images_bytes: t.images_bytes,
                             jails_bytes: t.jails_bytes,
                             build_bytes: t.build_bytes,
+                            load1: t.load[0],
+                            load5: t.load[1],
+                            load15: t.load[2],
                         }
                     })
                     .collect(),
@@ -1502,6 +1505,7 @@ impl Cluster for ApiService {
                     n.images_bytes = 0;
                     n.jails_bytes = 0;
                     n.build_bytes = 0;
+                    (n.load1, n.load5, n.load15) = (0, 0, 0);
                 }
             }
             if !can_nodes {

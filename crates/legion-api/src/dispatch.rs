@@ -186,4 +186,26 @@ pub struct NodeTelemetry {
     /// `legion local`'s store, outside Legion's ZFS root; 0 without one.
     #[serde(default)]
     pub build_bytes: u64,
+    /// The host's load averages over 1, 5 and 15 minutes, in hundredths.
+    #[serde(default)]
+    pub load: [u32; 3],
+}
+
+/// `vm.loadavg` (`{ 0.14 0.10 0.08 }`) in hundredths.
+pub fn parse_loadavg(raw: &str) -> Option<[u32; 3]> {
+    let mut n = raw
+        .split(|c: char| c.is_whitespace() || c == '{' || c == '}')
+        .filter(|w| !w.is_empty())
+        .map(|w| w.parse::<f64>().ok().map(|f| (f * 100.0).round() as u32));
+    Some([n.next()??, n.next()??, n.next()??])
+}
+
+#[cfg(test)]
+mod load_tests {
+    #[test]
+    fn the_load_average_is_read_in_hundredths() {
+        assert_eq!(super::parse_loadavg("{ 0.14 0.10 2.08 }"), Some([14, 10, 208]));
+        assert_eq!(super::parse_loadavg("{ 0.14 }"), None);
+        assert_eq!(super::parse_loadavg(""), None);
+    }
 }

@@ -243,9 +243,15 @@ impl<R: Runtime> AgentMetrics<R> {
                 spaces.into_iter().find(|d| d.name == r).map(|d| d.used)
             });
             let net = sys.net_bytes().ok();
-            (spaces, build, net)
+            let load = sys
+                .sysctl_get("vm.loadavg")
+                .ok()
+                .and_then(|l| legion_api::dispatch::parse_loadavg(&l))
+                .unwrap_or_default();
+            (spaces, build, (net, load))
         })
         .await;
+        let (net, load) = net;
         let now = tokio::time::Instant::now();
         let (net_rx_bps, net_tx_bps) = match net {
             Some((rx, tx)) => {
@@ -305,6 +311,7 @@ impl<R: Runtime> AgentMetrics<R> {
             images_bytes,
             jails_bytes,
             build_bytes: build.unwrap_or(0),
+            load,
         }
     }
 

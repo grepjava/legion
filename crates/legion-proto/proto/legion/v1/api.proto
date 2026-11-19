@@ -642,6 +642,10 @@ message NodeUsage {
   uint64 images_bytes = 8;
   uint64 jails_bytes = 9;
   uint64 build_bytes = 10;
+  // The host's load averages, in hundredths.
+  uint32 load1 = 11;
+  uint32 load5 = 12;
+  uint32 load15 = 13;
 }
 
 message AutolockRequest {
