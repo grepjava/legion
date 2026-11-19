@@ -34,7 +34,36 @@ pub struct NodeSpec {
     /// keeps pods with limits off, as `platform.noLimits` says).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub require: Vec<String>,
+    /// Days between scrubs of the node's pools, started by its agent; none
+    /// unless set. A pool unscrubbed for longer raises `scrub-overdue`.
+    #[serde(
+        default,
+        rename = "scrubEveryDays",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub scrub_every_days: Option<u32>,
+    /// Read, write and checksum errors per pool taken as seen: only more
+    /// than these raise `pool-errors` (`legion node errors-seen`).
+    #[serde(
+        default,
+        rename = "poolErrorsSeen",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub pool_errors_seen: std::collections::BTreeMap<String, u64>,
 }
+
+impl NodeSpec {
+    /// The days between scrubs that a pool is held to: the node's own, or
+    /// [`SCRUB_DUE_DAYS`] when it sets none.
+    pub fn scrub_due(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            u64::from(self.scrub_every_days.unwrap_or(SCRUB_DUE_DAYS)) * 86_400,
+        )
+    }
+}
+
+/// Days a pool may go unscrubbed on a node that schedules none.
+pub const SCRUB_DUE_DAYS: u32 = 35;
 
 impl Spec for NodeSpec {
     fn admit(&mut self) -> Result<(), Invalid> {
@@ -52,6 +81,12 @@ impl Spec for NodeSpec {
         }
         self.require.sort();
         self.require.dedup();
+        if self.scrub_every_days == Some(0) {
+            return Err(Invalid::new(
+                field("", "scrubEveryDays"),
+                "at least 1, or unset for no scrubs",
+            ));
+        }
         for (i, t) in self.taints.iter().enumerate() {
             if t.key.is_empty() {
                 return Err(Invalid::new(
@@ -155,6 +190,115 @@ pub struct NodeStatus {
     /// checked: its findings not met. Empty from agents that don't say.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lacks: Vec<HostLack>,
+    /// The host, as its agent last said: unset from agents that don't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostFacts>,
+    /// Its ZFS pools, as its agent last read them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<Pool>,
+}
+
+/// What an agent says of its host with a heartbeat (`host_json`): the
+/// leader writes it into the Node's status when it changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostFacts>,
+    #[serde(default)]
+    pub pools: Vec<Pool>,
+}
+
+/// What a node's host is: written when it changes (a reboot, an upgrade).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostFacts {
+    /// FreeBSD's release, its userland's (`freebsd-version -u`).
+    pub release: String,
+    /// The running kernel's (`freebsd-version -k`).
+    pub kernel: String,
+    /// How it booted: `UEFI` or `BIOS`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub boot: String,
+    /// When it booted, in milliseconds since the epoch.
+    #[serde(default)]
+    pub booted_ms: i64,
+}
+
+/// A ZFS pool of a node, as its agent last read it (`zpool status`). Its
+/// space moves in steps of a hundredth of its size, so the Node is
+/// written when the pool fills by a percent, not with every write.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Pool {
+    pub name: String,
+    /// `ONLINE`, `DEGRADED`, `FAULTED`, `OFFLINE`, `UNAVAIL`, `REMOVED`,
+    /// `SUSPENDED`.
+    pub state: String,
+    pub size_bytes: u64,
+    pub alloc_bytes: u64,
+    /// Over all its devices, since they were last cleared.
+    #[serde(default)]
+    pub read_errors: u64,
+    #[serde(default)]
+    pub write_errors: u64,
+    #[serde(default)]
+    pub checksum_errors: u64,
+    /// Its last or current scrub or resilver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan: Option<PoolScan>,
+}
+
+impl Pool {
+    pub fn errors(&self) -> u64 {
+        self.read_errors + self.write_errors + self.checksum_errors
+    }
+
+    /// How full, in whole percent: rounded, as the agent reads the space in
+    /// steps of a hundredth of the pool, each a little under a percent.
+    pub fn percent_used(&self) -> u64 {
+        if self.size_bytes == 0 {
+            0
+        } else {
+            let size = u128::from(self.size_bytes);
+            ((u128::from(self.alloc_bytes) * 100 + size / 2) / size) as u64
+        }
+    }
+
+    /// When its last scrub ended, if one did.
+    pub fn scrubbed_ms(&self) -> Option<i64> {
+        self.scan
+            .as_ref()
+            .filter(|s| s.function == "scrub" && s.state == "finished")
+            .and_then(|s| s.end_ms)
+    }
+
+    /// Whether a scrub or resilver runs now.
+    pub fn scanning(&self) -> bool {
+        self.scan.as_ref().is_some_and(|s| s.state == "scanning")
+    }
+
+    /// Healthy: nothing missing or failing.
+    pub fn healthy(&self) -> bool {
+        self.state == "ONLINE"
+    }
+}
+
+/// A pool's scrub or resilver.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolScan {
+    /// `scrub` or `resilver`.
+    pub function: String,
+    /// `scanning`, `finished` or `canceled`.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_ms: Option<i64>,
+    /// What it found and could not repair.
+    #[serde(default)]
+    pub errors: u64,
 }
 
 /// A check of the node's host (`legion doctor`) found not met.
