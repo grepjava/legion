@@ -6,6 +6,7 @@ import type { Component } from 'svelte';
 import {
   BadgeCheck,
   Bell,
+  BellRing,
   Box,
   Boxes,
   Cable,
@@ -64,7 +65,8 @@ const kinds: Record<string, IconComponent> = {
   Route: Route,
   RoleBinding: UserRoundCheck,
   ImagePolicy: BadgeCheck,
-  Build: Hammer
+  Build: Hammer,
+  AlertReceiver: BellRing
 };
 
 /** A kind's icon; a task running a VM shows a monitor, as its circle does. */

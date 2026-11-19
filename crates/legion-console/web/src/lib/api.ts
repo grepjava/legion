@@ -201,6 +201,9 @@ export const api = {
       `/api/volume-snapshots/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`
     ),
   /** Creates, rolls back, or deletes a ZFS snapshot on a Volume. */
+  /** `legion alerts test RECEIVER`: a test through an AlertReceiver, now. */
+  testReceiver: (name: string) =>
+    call<{ sent: boolean }>('POST', `/api/alert-receiver-test/${encodeURIComponent(name)}`, {}),
   /** `legion volume promote`: a Volume whose node is down handed to its replica. */
   volumePromote: (namespace: string, name: string) =>
     call<{ node: string; promoted: string }>(

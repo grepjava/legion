@@ -25,7 +25,12 @@
   );
 </script>
 
-<header class="bar"><h1>{t('Alerts')}</h1></header>
+<header class="bar">
+  <h1>{t('Alerts')}</h1>
+  {#if session.me?.all}
+    <a class="button sm" href="/k/AlertReceiver">{t('Where they are sent')}</a>
+  {/if}
+</header>
 {#if session.alertsError}<p class="error" role="alert">{session.alertsError}</p>{/if}
 
 {#if shown.length}

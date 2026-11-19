@@ -22,6 +22,7 @@
     RotateCw,
     Square,
     Trash2,
+    Send,
     Undo2,
     Zap
   } from '@lucide/svelte';
@@ -191,6 +192,16 @@
             })) &&
             set('paused', true, t('{name} paused', { name }), t('{name} already paused', { name }))}
       ><Ico icon={object.spec?.paused ? CirclePlay : CirclePause} size={14} />{object.spec?.paused ? t('Resume') : t('Pause')}</button
+    >
+  {:else if kind === 'AlertReceiver'}
+    <button
+      disabled={!!why || busy}
+      title={why ?? t('Sends a test through it now, as it sends alerts')}
+      onclick={() =>
+        act(async () => {
+          await api.testReceiver(name);
+          return t('{name} took the test', { name });
+        })}><Ico icon={Send} size={14} />{t('Send a test')}</button
     >
   {:else if kind === 'CronJob'}
     <button

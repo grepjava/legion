@@ -165,6 +165,34 @@ export function columns(kind: string): Column[] {
               .join(', ')
         }
       ];
+    case 'AlertReceiver':
+      return [
+        {
+          label: t('Sends by'),
+          value: (o) =>
+            o.spec?.webhook ? t('webhook') : o.spec?.ntfy ? 'ntfy' : o.spec?.smtp ? t('mail') : ''
+        },
+        {
+          label: t('Chooses'),
+          value: (o) =>
+            [
+              o.spec?.severity === 'critical' ? t('critical only') : t('every severity'),
+              o.spec?.namespaces?.length
+                ? (o.spec.namespaces as string[]).map((n) => n || t('the cluster')).join(', ')
+                : '',
+              o.spec?.kinds?.length ? (o.spec.kinds as string[]).join(', ') : ''
+            ]
+              .filter(Boolean)
+              .join(' · ')
+        },
+        {
+          label: t('Delivered'),
+          value: (o) =>
+            o.status?.deliveredMs ? new Date(o.status.deliveredMs).toLocaleString() : t('not yet')
+        },
+        { label: t('State'), value: (o) => (o.status?.error ? 'failing' : 'ready'), state: true },
+        { label: t('Why'), value: (o) => s(o.status?.error) }
+      ];
     case 'Build':
       return [
         { label: t('Phase'), value: (o) => s(o.status?.phase ?? 'Pending'), state: true },
@@ -207,6 +235,7 @@ export function tone(state: string): string {
     case 'stale':
       return 'wait';
     case 'failed':
+    case 'failing':
     case 'rejected':
     case 'down':
     case 'orphaned':
