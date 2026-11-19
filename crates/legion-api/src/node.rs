@@ -167,6 +167,11 @@ pub struct NodeStatus {
     pub allocatable: Capacity,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub version: String,
+    /// Which build of that version: the first 12 hex digits of the SHA-256
+    /// of the daemon's executable, told apart where the version is not
+    /// (`version-skew`). Empty from builds before.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub build: String,
     /// What the agent speaks (`legion_api::protocol`); unset from builds
     /// before the handshake, which speak protocol 1.
     #[serde(default, skip_serializing_if = "crate::protocol::Protocol::is_unset")]

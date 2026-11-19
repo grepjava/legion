@@ -173,6 +173,14 @@ pub(crate) fn current(api: &ApiService) -> Vec<(Alert, i64)> {
             )
         })
         .collect();
+    // Each node's build as told apart: its version, and which build of it.
+    let builds: Vec<String> = read
+        .iter()
+        .map(|(_, _, s)| match s.build.as_str() {
+            "" => s.version.clone(),
+            b => format!("{} ({b})", s.version),
+        })
+        .collect();
     let mut inputs = Inputs {
         now_ms: crate::console::now_ms(),
         ..Inputs::default()
@@ -182,11 +190,11 @@ pub(crate) fn current(api: &ApiService) -> Vec<(Alert, i64)> {
             serde_json::from_value(n.status["state"].clone()).unwrap_or_default();
         inputs.nodes.push((&n.metadata.name, state));
     }
-    for (name, spec, status) in &read {
+    for ((name, spec, status), build) in read.iter().zip(&builds) {
         if status.state == NodeState::Down {
             continue;
         }
-        inputs.versions.push((name, &status.version));
+        inputs.versions.push((name, build));
         for pool in &status.pools {
             inputs.pools.push(alert::PoolInput {
                 node: name,

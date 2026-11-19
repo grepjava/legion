@@ -714,6 +714,7 @@ fn status(hostname: String, advertise: &str) -> NodeStatus {
             memory: Bytes(physical_memory().unwrap_or(0)),
         },
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        build: build_digest().unwrap_or_default(),
         protocol: legion_api::protocol::Protocol::current(),
         image_pins: true,
         // Assigned by the manager on registration.
@@ -728,6 +729,19 @@ fn status(hostname: String, advertise: &str) -> NodeStatus {
         host: None,
         pools: Vec::new(),
     }
+}
+
+/// The first 12 hex digits of the SHA-256 of this executable: which build
+/// runs, as builds of one version are not told apart by it.
+fn build_digest() -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(std::env::current_exe().ok()?).ok()?;
+    let hex: String = Sha256::digest(&bytes)
+        .iter()
+        .take(6)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Some(hex)
 }
 
 fn hostname() -> anyhow::Result<String> {
