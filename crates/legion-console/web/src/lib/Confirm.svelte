@@ -16,29 +16,34 @@
   let field: HTMLInputElement | undefined = $state();
 
   const now = $derived(confirming.now);
-  // The checks of the question open now: none asked, under way, done, or
-  // failed (a manager from before them, say), which does not hold it.
-  let checks: { for: unknown; runs: DryRun[] | null; error: string } = $state({ for: null, runs: null, error: '' });
-  const checking = $derived(!!now?.check?.length && checks.for === now && !checks.runs && !checks.error);
-  const blocks = $derived(
-    !!now?.check?.length && checks.for === now && !!checks.runs?.some((r) => r.findings.some((f) => f.severity === 'blocking'))
-  );
-  const findings = $derived(checks.for === now ? (checks.runs ?? []).flatMap((r) => r.findings) : []);
-  const moves = $derived(checks.for === now ? (checks.runs ?? []).flatMap((r) => r.moves) : []);
-  const stopped = $derived(checks.for === now ? (checks.runs ?? []).reduce((n, r) => n + r.stopped, 0) : 0);
-  const hidden = $derived(checks.for === now ? (checks.runs ?? []).reduce((n, r) => n + (r.hidden ?? 0), 0) : 0);
+  // The checks of the question open now (by its id: the question itself is
+  // a reactive proxy, not to be told apart by identity): under way until
+  // its own answer is in, done, or failed (a manager from before them,
+  // say), which does not hold it.
+  let checks: { for: number; runs: DryRun[] | null; error: string } = $state({ for: 0, runs: null, error: '' });
+  const asks = $derived(!!now?.check?.length);
+  const mine = $derived(!!now && checks.for === now.id);
+  const checking = $derived(asks && (!mine || (!checks.runs && !checks.error)));
+  const failed = $derived(asks && mine && !!checks.error);
+  const runs = $derived(asks && mine ? (checks.runs ?? []) : []);
+  const blocks = $derived(runs.some((r) => r.findings.some((f) => f.severity === 'blocking')));
+  const findings = $derived(runs.flatMap((r) => r.findings));
+  const moves = $derived(runs.flatMap((r) => r.moves));
+  const stopped = $derived(runs.reduce((n, r) => n + r.stopped, 0));
+  const hidden = $derived(runs.reduce((n, r) => n + (r.hidden ?? 0), 0));
   const blocked = $derived((!!now?.typed && typedNow.trim() !== now.typed) || checking || blocks);
 
   $effect(() => {
     const asked = now;
     if (!asked?.check?.length) return;
-    checks = { for: asked, runs: null, error: '' };
+    const id = asked.id;
+    checks = { for: id, runs: null, error: '' };
     Promise.all(asked.check.map((c) => api.dryRun(c))).then(
       (runs) => {
-        if (checks.for === asked) checks = { for: asked, runs, error: '' };
+        if (checks.for === id) checks = { for: id, runs, error: '' };
       },
       (e) => {
-        if (checks.for === asked) checks = { for: asked, runs: null, error: (e as Error).message };
+        if (checks.for === id) checks = { for: id, runs: null, error: (e as Error).message };
       }
     );
   });
@@ -98,12 +103,12 @@
         </ul>
       {/if}
       {#if now.check?.length}
-        <div class="check" aria-live="polite" data-check={checking ? 'checking' : blocks ? 'blocks' : 'done'}>
+        <div class="check" aria-live="polite" data-check={checking ? 'checking' : failed ? 'error' : blocks ? 'blocks' : 'done'}>
           {#if checking}
             <p class="muted">{t('Checking what it would do…')}</p>
-          {:else if checks.error}
+          {:else if failed}
             <p class="muted">{t('Not checked first: {why}', { why: checks.error })}</p>
-          {:else if checks.runs}
+          {:else}
             <ul class="found">
               {#if stopped}<li>{tn('{n} task stops where it runs', '{n} tasks stop where they run', stopped)}</li>{/if}
               {#each moves as m (`${m.namespace}/${m.volume}`)}

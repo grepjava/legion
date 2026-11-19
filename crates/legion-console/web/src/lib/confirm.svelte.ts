@@ -23,8 +23,12 @@ export interface Ask {
 }
 
 interface Pending extends Ask {
+  /** Each question its own, for what is worked out for it. */
+  id: number;
   resolve: (ok: boolean) => void;
 }
+
+let asked = 0;
 
 export const confirming = $state<{ now: Pending | null }>({ now: null });
 
@@ -44,6 +48,7 @@ export function ask(what: string | Ask, more: Partial<Ask> = {}): Promise<boolea
   return new Promise((resolve) => {
     confirming.now = {
       ...a,
+      id: ++asked,
       action,
       danger: a.danger ?? DANGER.test(action),
       resolve: (ok) => {
