@@ -760,7 +760,11 @@ form keeps a replica of the Volume it makes, failing over by hand or on
 its own (then with `onPartition: stop`). `Volumes.Promote` and `legion
 volume promote` hand over by hand. The lab tests check the stale alert
 (the host-lost test) and "can fail over" before the cut (the cut-off
-test); their records are to come.
+test). Both passed at 5e833e1 in the QEMU lab (cluster profile, three
+VMs on real ZFS), each in about six minutes, nothing left behind: the
+cut, all states flushed, held (the manager's port out of reach, the node
+no longer heard from), and a replica too old to use reads `stale` while
+its attempts fail, as the alert says.
 
 ### Phase 8: pools and hosts
 
