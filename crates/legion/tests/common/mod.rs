@@ -521,6 +521,29 @@ impl Lab {
         }
     }
 
+    /// [`wait`], printing what the cluster looks like if it times out: the
+    /// nodes' states, the processes and last lines of each VM's daemon.
+    pub fn wait_or_report(&self, what: &str, secs: u64, f: impl FnMut() -> bool) {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wait(what, secs, f)));
+        if let Err(e) = r {
+            for n in self.list("nodes", "default") {
+                eprintln!(
+                    "node {}: {} {}",
+                    n["metadata"]["name"], n["status"]["state"], n["status"]["message"]
+                );
+            }
+            for (i, vm) in self.vms.iter().enumerate() {
+                let out = self.ssh(
+                    vm,
+                    "ps -axo pid,stat,etime,wchan,command | grep -E 'legion|zfs|zpool|wg|ifconfig' \
+                     | grep -v grep; tail -40 /var/log/legion-lab.log",
+                );
+                eprintln!("=== n{}\n{}{}", i + 2, text(&out.stdout), text(&out.stderr));
+            }
+            std::panic::resume_unwind(e);
+        }
+    }
+
     pub fn node_state(&self, name: &str) -> String {
         self.list("nodes", "default")
             .iter()

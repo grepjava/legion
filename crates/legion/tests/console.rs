@@ -334,7 +334,7 @@ spec: { text: team-b's }
     e.shows("Service/team-a/hello: created, version", 30);
     e.shows("Service/team-a/keeper: created, version", 30);
     wait("hello's two tasks", 300, || c.hello_settled(true));
-    wait("keeper's task on n2", 300, || {
+    c.lab.wait_or_report("keeper's task on n2", 300, || {
         c.task_of("keeper").is_some_and(|(_, n)| n == "n2")
     });
 
