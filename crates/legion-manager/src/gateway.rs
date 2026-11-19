@@ -177,6 +177,7 @@ fn router(gateway: Gateway) -> axum::Router {
         .route("/api/usage", get(usage))
         .route("/api/alerts", get(alerts))
         .route("/api/events", get(events))
+        .route("/api/activity", get(activity))
         .route("/api/usage-history", get(usage_history))
         .route("/api/quotas", get(quotas))
         .route("/api/log-search", get(log_search))
@@ -942,6 +943,56 @@ async fn relay_events(mut socket: WebSocket, mut stream: tonic::Streaming<pb::Ev
                 })).collect::<Vec<_>>()
             }),
             Ok(None) => serde_json::json!({ "error": "the events ended" }),
+            Err(s) => serde_json::json!({ "error": s.message() }),
+        };
+        let end = text.get("error").is_some();
+        if socket
+            .send(Message::Text(text.to_string().into()))
+            .await
+            .is_err()
+            || end
+        {
+            return;
+        }
+    }
+}
+
+/// `Cluster.Activity` followed, as the user: JSON text messages
+/// `{operations: [...]}` (legion_api::activity::Operation), all of them
+/// first, then each as it changes, or `{error}` as the last.
+async fn activity(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    ws: WebSocketUpgrade,
+) -> Result<Response, Refused> {
+    same_origin(&headers, &uri)?;
+    let (_, channel) = g.user(&headers).await?;
+    let stream = ClusterClient::new(channel)
+        .activity(pb::ActivityRequest { follow: true })
+        .await?
+        .into_inner();
+    Ok(ws.on_upgrade(move |socket| relay_activity(socket, stream)))
+}
+
+async fn relay_activity(mut socket: WebSocket, mut stream: tonic::Streaming<pb::ActivityResponse>) {
+    loop {
+        let next = tokio::select! {
+            r = stream.message() => r,
+            m = socket.recv() => match m {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                _ => continue,
+            },
+        };
+        let text = match next {
+            Ok(Some(r)) => serde_json::json!({
+                "operations": r
+                    .operations_json
+                    .iter()
+                    .filter_map(|j| serde_json::from_slice::<serde_json::Value>(j).ok())
+                    .collect::<Vec<_>>()
+            }),
+            Ok(None) => serde_json::json!({ "error": "the activity ended" }),
             Err(s) => serde_json::json!({ "error": s.message() }),
         };
         let end = text.get("error").is_some();

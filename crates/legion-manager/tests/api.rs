@@ -6144,3 +6144,202 @@ async fn events_say_what_happened_to_a_service_and_its_tasks() {
     }
     m.stop().await;
 }
+
+/// Long operations (CONSOLE.md phase 10): a drain and the move of a Volume
+/// off its node, followed through `Cluster.Activity` stage by stage, who
+/// drained it found in the audit trail; past the move's switch-over, its
+/// cancels are refused: the node made active again, the Volume asked back,
+/// the Volume deleted. With no controllers, so only the test moves it on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_says_each_stage_and_refuses_a_cancel_past_its_switch_over() {
+    use legion_api::activity::{Operation, OperationKind, OperationState};
+    use legion_api::{Kind, Object as Stored, ObjectKey};
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let config = ManagerConfig {
+        raft: Running::quick_raft(),
+        heartbeat: STEADY,
+        registry_loopback: true,
+        controllers: false,
+        name: manager_name(&addr),
+        ..ManagerConfig::new(dir.path(), &addr)
+    };
+    let m = Running::serve_config(dir, listener, config, None).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let put = |object: Stored| {
+        let raft = m.store.raft.clone();
+        async move {
+            raft.client_write(legion_store::Command::Put {
+                object,
+                precondition: legion_store::Precondition::None,
+            })
+            .await
+            .unwrap();
+        }
+    };
+    for name in ["w1", "w2"] {
+        let mut node = Stored::new(Kind::Node, "", name, serde_json::json!({}));
+        node.status = serde_json::json!({ "state": "ready" });
+        put(node).await;
+    }
+    let key = ObjectKey::new(Kind::Volume, "default", "data");
+    let mut volume = Stored::new(Kind::Volume, "default", "data", serde_json::json!({}));
+    volume.status = serde_json::json!({ "node": "w1" });
+    put(volume).await;
+    let mut ops = m
+        .cluster()
+        .await
+        .activity(legion_proto::v1::ActivityRequest { follow: true })
+        .await
+        .unwrap()
+        .into_inner();
+    let first = ops.message().await.unwrap().unwrap();
+    assert!(first.operations_json.is_empty(), "nothing under way yet");
+    // The latest of each operation, by id, as they come.
+    let mut latest: std::collections::BTreeMap<String, Operation> = Default::default();
+    let mut until_op = async |what: &str, f: &dyn Fn(&Operation) -> bool| -> Operation {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(op) = latest.values().find(|o| f(o)) {
+                return op.clone();
+            }
+            let r = tokio::time::timeout_at(deadline, ops.message())
+                .await
+                .unwrap_or_else(|_| panic!("timed out: {what}; seen {latest:#?}"))
+                .unwrap()
+                .unwrap();
+            for json in r.operations_json {
+                let op: Operation = serde_json::from_slice(&json).unwrap();
+                latest.insert(op.id.clone(), op);
+            }
+        }
+    };
+    let objects = m.objects().await;
+    let set = |kind: &str, name: &str, spec: serde_json::Value| {
+        let mut objects = objects.clone();
+        let (kind, name) = (kind.to_owned(), name.to_owned());
+        async move {
+            let namespace = if kind == "Node" { "" } else { "default" };
+            objects
+                .apply(apply(Object {
+                    kind,
+                    namespace: namespace.into(),
+                    name,
+                    spec_json: spec.to_string().into_bytes(),
+                    ..Default::default()
+                }))
+                .await
+        }
+    };
+
+    set("Node", "w1", serde_json::json!({ "availability": "drain" }))
+        .await
+        .unwrap();
+    let drain = until_op("the drain", &|o| o.kind == OperationKind::Drain).await;
+    assert_eq!(drain.what, "drain node w1");
+    let status = |s: serde_json::Value| {
+        let mut v = m.store.get(&key).unwrap().unwrap();
+        v.status = s;
+        v
+    };
+    let moving = |phase: &str| serde_json::json!({ "node": "w1", "migration": { "to": "w2", "phase": phase } });
+    put(status(moving("copying"))).await;
+    let mv = until_op("the move", &|o| o.kind == OperationKind::Move).await;
+    assert_eq!(mv.what, "move Volume default/data from w1 to w2");
+    assert_eq!(mv.part_of, drain.id, "the drain's");
+    assert_eq!(mv.stage.as_str(), "preparing");
+
+    // Before the switch-over, a cancel goes through as asked.
+    put(status(moving("copied"))).await;
+    until_op("stopping", &|o| {
+        o.kind == OperationKind::Move && o.stage.as_str() == "stopping"
+    })
+    .await;
+    set("Volume", "data", serde_json::json!({ "node": "w1" }))
+        .await
+        .expect("called off before the switch-over");
+    set("Volume", "data", serde_json::json!({})).await.unwrap();
+
+    put(status(moving("finishing"))).await;
+    until_op("the switch-over", &|o| {
+        o.kind == OperationKind::Move && o.stage.as_str() == "switch-over"
+    })
+    .await;
+    let refused = |r: Result<tonic::Response<legion_proto::v1::ApplyResponse>, tonic::Status>,
+                   what: &str| {
+        let e = r.expect_err(what);
+        assert_eq!(e.code(), Code::FailedPrecondition, "{what}: {e}");
+        assert!(e.message().contains("switch-over"), "{what}: {e}");
+    };
+    refused(
+        set(
+            "Node",
+            "w1",
+            serde_json::json!({ "availability": "active" }),
+        )
+        .await,
+        "the drain cancelled",
+    );
+    refused(
+        set("Volume", "data", serde_json::json!({ "node": "w1" })).await,
+        "the Volume asked back",
+    );
+    let deleted = objects
+        .clone()
+        .delete(DeleteRequest {
+            r#ref: Some(ObjectRef {
+                kind: "Volume".into(),
+                namespace: "default".into(),
+                name: "data".into(),
+            }),
+            expected_version: None,
+        })
+        .await
+        .expect_err("deleted in its switch-over");
+    assert_eq!(deleted.code(), Code::FailedPrecondition, "{deleted}");
+    assert!(deleted.message().contains("switch-over"), "{deleted}");
+    // Asked to go where it goes anyway is no cancel.
+    set("Volume", "data", serde_json::json!({ "node": "w2" }))
+        .await
+        .expect("asked for where it goes");
+
+    put(status(
+        serde_json::json!({ "node": "w2", "leftovers": ["w1"] }),
+    ))
+    .await;
+    until_op("the cleanup", &|o| {
+        o.kind == OperationKind::Move && o.stage.as_str() == "cleanup"
+    })
+    .await;
+    put(status(serde_json::json!({ "node": "w2" }))).await;
+    let mv = until_op("the move done", &|o| {
+        o.kind == OperationKind::Move && o.state == OperationState::Succeeded
+    })
+    .await;
+    let stages: Vec<&str> = mv.stages.iter().map(|s| s.stage.as_str()).collect();
+    assert_eq!(
+        stages,
+        ["preparing", "stopping", "switch-over", "cleanup"],
+        "each stage in turn (no transfer runs here, so no full copy is seen)"
+    );
+    set(
+        "Node",
+        "w1",
+        serde_json::json!({ "availability": "active" }),
+    )
+    .await
+    .expect("made active once the move is done");
+    let drain = until_op("the drain cancelled", &|o| {
+        o.kind == OperationKind::Drain && o.state == OperationState::Cancelled
+    })
+    .await;
+    assert_eq!(drain.message, "the node was made active again");
+    // Who drained it, from the audit trail (no TLS here: `none`).
+    let drain = until_op("who drained", &|o| {
+        o.kind == OperationKind::Drain && !o.by.is_empty()
+    })
+    .await;
+    assert_eq!(drain.by, "none");
+    m.stop().await;
+}

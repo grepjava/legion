@@ -68,6 +68,8 @@ pub struct ApiService {
     pub(crate) balancers: std::sync::Arc<crate::balancers::Held>,
     /// What happened to objects lately, as this manager saw it.
     pub(crate) events: std::sync::Arc<crate::events::State>,
+    /// Long operations, as this manager follows them (`Cluster.Activity`).
+    pub(crate) activity: std::sync::Arc<crate::activity::State>,
     /// The restarts this manager has seen, for its alerts.
     pub(crate) alerts: std::sync::Arc<crate::alerts::State>,
     /// The logs of the builds this manager runs as leader.
@@ -300,6 +302,7 @@ impl ApiService {
             };
             if let Some(cur) = &current {
                 check_storage(&self.store, cur, &object)?;
+                check_switch_over(&self.store, cur, &object)?;
             }
             crate::quota::check(&self.store, &object)?;
             crate::security::check(&self.store, &object)?;
@@ -366,6 +369,26 @@ fn check_host(store: &Store, next: &Object) -> Result<(), Status> {
         }
     }
     Ok(())
+}
+
+/// Refuses a change that would call off a Volume's move past its
+/// switch-over (`crate::activity::past_switch_over`): the Volume asked to
+/// be elsewhere, or the node it moves off for a drain made active or
+/// paused. The controller would carry the move through regardless, its
+/// tasks having stopped for the last part, so the change is refused rather
+/// than taken and not done.
+fn check_switch_over(store: &Store, cur: &Object, next: &Object) -> Result<(), Status> {
+    let volumes = || {
+        store
+            .list(Kind::Volume, None)
+            .map(|l| l.objects)
+            .map_err(|e| e.to_string())
+    };
+    match crate::activity::past_switch_over(volumes, cur, next) {
+        Ok(None) => Ok(()),
+        Ok(Some(why)) => Err(Status::failed_precondition(why)),
+        Err(e) => Err(Status::internal(e)),
+    }
 }
 
 /// Refuses a Volume naming storage one node at a time uses (an iSCSI LUN,
@@ -502,6 +525,17 @@ fn check_volume_delete(store: &Store, key: &ObjectKey) -> Result<Option<u64>, St
     }
     let spec: VolumeSpec = legion_api::parse(&cur.spec).map_err(internal)?;
     let status: VolumeStatus = serde_json::from_value(cur.status.clone()).unwrap_or_default();
+    // Its tasks stopped for the last part of a move, which goes through.
+    if let Some(m) = status
+        .migration
+        .as_ref()
+        .filter(|m| m.phase == legion_api::volume::MigrationPhase::Finishing)
+    {
+        return Err(Status::failed_precondition(format!(
+            "{key} is past its switch-over from {} to {}: it is deleted once its move is done",
+            status.node, m.to
+        )));
+    }
     if spec.access() == Access::Single
         && !status.node.is_empty()
         && store
@@ -1785,6 +1819,93 @@ impl Cluster for ApiService {
                     if tx
                         .send(Ok(pb::EventsResponse {
                             events: vec![to_pb(e)],
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    type ActivityStream = ReceiverStream<Result<pb::ActivityResponse, Status>>;
+
+    async fn activity(
+        &self,
+        req: Request<pb::ActivityRequest>,
+    ) -> Result<Response<Self::ActivityStream>, Status> {
+        let caller = self.caller(&req)?;
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        // The leader runs the moves and restores and hears what they send.
+        if let Some(addr) = self.leader_addr(&req)? {
+            let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                &addr,
+                self.peer_tls.as_ref(),
+            ));
+            let mut from_leader = c
+                .activity(forwarded_for(req.into_inner(), &caller)?)
+                .await?
+                .into_inner();
+            tokio::spawn(async move {
+                loop {
+                    let r = from_leader.message().await.transpose();
+                    let Some(r) = r else { return };
+                    let last = r.is_err();
+                    if tx.send(r).await.is_err() || last {
+                        return;
+                    }
+                }
+            });
+            return Ok(Response::new(ReceiverStream::new(rx)));
+        }
+        let follow = req.into_inner().follow;
+        let store = self.store.clone();
+        // Each as its target may be read; who asked, for the admin.
+        let shown = move |mut op: legion_api::activity::Operation| {
+            let kind: Kind = op.target.kind.parse().ok()?;
+            if !caller.may(&store, Verb::Read, kind, &op.target.namespace) {
+                return None;
+            }
+            if caller != Caller::All {
+                op.by.clear();
+            }
+            Some(serde_json::to_vec(&op).expect("serialises"))
+        };
+        let mut new = self.activity.subscribe();
+        let kept: Vec<Vec<u8>> = self.activity.all().into_iter().filter_map(&shown).collect();
+        tx.send(Ok(pb::ActivityResponse {
+            operations_json: kept,
+        }))
+        .await
+        .map_err(|_| Status::cancelled("gone"))?;
+        if follow {
+            let mut closing = self.closing.clone();
+            tokio::spawn(async move {
+                loop {
+                    let op = tokio::select! {
+                        op = new.recv() => op,
+                        () = tx.closed() => return,
+                        _ = closing.wait_for(|c| *c) => return,
+                    };
+                    let op = match op {
+                        Ok(op) => op,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let _ = tx
+                                .send(Err(Status::resource_exhausted(
+                                    "the activity changed too fast to follow; open it again",
+                                )))
+                                .await;
+                            return;
+                        }
+                        Err(_) => return,
+                    };
+                    let Some(json) = shown(op) else { continue };
+                    if tx
+                        .send(Ok(pb::ActivityResponse {
+                            operations_json: vec![json],
                         }))
                         .await
                         .is_err()

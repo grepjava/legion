@@ -308,7 +308,7 @@ fn users(store: &Store) -> HashMap<(String, String), Vec<User>> {
 
 /// Keeps replicas copied while this manager leads; ends with the
 /// leadership (the caller's select).
-pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>) {
+pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::activity::State>) {
     let mut copies: JoinSet<(ObjectKey, ReplicaStatus, bool, Result<u64, String>)> = JoinSet::new();
     let mut running: HashMap<ObjectKey, ()> = HashMap::new();
     // Failures in a row, and when the last was.
@@ -460,9 +460,34 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>) {
                         tracing::debug!(volume = %key, "the replica's copy under way: {e}");
                     }
                     let whole = base.is_empty();
+                    // A whole copy takes a while: an operation of its own.
+                    let reported = whole.then(|| {
+                        let first = status.replica.as_ref().is_none_or(|r| r.copies.is_empty());
+                        let what = match first {
+                            true => "first copy",
+                            false => "whole copy",
+                        };
+                        activity.begin(
+                            legion_api::activity::OperationKind::ReplicaCopy,
+                            crate::audit::target("Volume", &key.namespace, &key.name),
+                            format!(
+                                "{what} of Volume {}/{}'s replica, from {from} to {to}",
+                                key.namespace, key.name
+                            ),
+                            legion_api::activity::Stage::FullCopy,
+                            String::new(),
+                        )
+                    });
                     let (hub, k) = (hub.clone(), key.clone());
                     copies.spawn(async move {
-                        let result = copy(&hub, &k, &from, &to, &base, &snapshot).await;
+                        let counter = reported.as_ref().map(|r| r.counter());
+                        let result = copy(&hub, &k, &from, &to, &base, &snapshot, counter).await;
+                        if let Some(r) = reported {
+                            r.finish(match &result {
+                                Ok(_) => Ok(format!("on {to}")),
+                                Err(e) => Err(e.clone()),
+                            });
+                        }
                         (k, taken, whole, result)
                     });
                     running.insert(key, ());
@@ -481,6 +506,7 @@ async fn copy(
     to: &str,
     base: &str,
     snapshot: &str,
+    counted: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<u64, String> {
     let open = |action| SessionOffer {
         id: legion_pki::random_secret(),
@@ -519,6 +545,7 @@ async fn copy(
         &receiver.to_agent,
         from,
         to,
+        counted,
     )
     .await
 }

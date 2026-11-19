@@ -83,6 +83,7 @@ const IDLE: Duration = Duration::from_secs(120);
 pub(crate) async fn run(
     store: Store,
     hub: Arc<Hub>,
+    activity: Arc<crate::activity::State>,
     id: NodeId,
     mut closing: watch::Receiver<bool>,
 ) {
@@ -106,8 +107,8 @@ pub(crate) async fn run(
         tokio::select! {
             () = async {
                 tokio::join!(
-                    lead(&store, &hub),
-                    crate::replicate::lead(&store, &hub),
+                    lead(&store, &hub, &activity),
+                    crate::replicate::lead(&store, &hub, &activity),
                     crate::exports::lead(&store, &hub),
                 );
             } => {}
@@ -123,7 +124,7 @@ pub(crate) async fn run(
     }
 }
 
-async fn lead(store: &Store, hub: &Arc<Hub>) {
+async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::activity::State>) {
     // Each Volume's task, with what it moves and, until called off, the
     // word to stop. What a migration called off left on its new node is
     // among the Volume's leftovers, written by the controller.
@@ -254,12 +255,12 @@ async fn lead(store: &Store, hub: &Arc<Hub>) {
             {
                 continue;
             }
-            let (store, hub) = (store.clone(), hub.clone());
+            let (store, hub, activity) = (store.clone(), hub.clone(), activity.clone());
             let (k, started, from) = (key.clone(), m.clone(), status.node.clone());
             let (cancel, mut cancelled) = watch::channel(false);
             tasks.spawn(async move {
                 let result = tokio::select! {
-                    r = advance(&store, &hub, &v, &status.node, &started) => r,
+                    r = advance(&store, &hub, &activity, &v, &status.node, &started) => r,
                     // What the new node received is a leftover now.
                     _ = cancelled.changed() => Ok(()),
                 };
@@ -324,6 +325,7 @@ fn called_off(m: &Migration, now: Option<&VolumeStatus>) -> bool {
 async fn advance(
     store: &Store,
     hub: &Arc<Hub>,
+    activity: &Arc<crate::activity::State>,
     v: &Object,
     from: &str,
     m: &Migration,
@@ -331,8 +333,10 @@ async fn advance(
     let (namespace, volume) = (&v.metadata.namespace, &v.metadata.name);
     let last = m.phase == MigrationPhase::Finishing;
     tracing::info!(volume = %v.key(), from, to = %m.to, last, "moving volume data");
-    transfer(hub, namespace, volume, from, &m.to, last).await?;
     let key = v.key();
+    // Said to be sending, and what it has sent, until written.
+    let sending = activity.sending(&key);
+    transfer(hub, namespace, volume, from, &m.to, last, sending.counter()).await?;
     let moved = update(store, &key, |s| {
         if s.migration.as_ref() != Some(m) {
             return false;
@@ -364,6 +368,7 @@ async fn advance(
         true
     })
     .await?;
+    sending.done();
     if moved && last {
         // The old copy is a leftover now, dropped by the migrator's round.
         tracing::info!(volume = %key, from, to = %m.to, "volume moved");
@@ -380,6 +385,7 @@ async fn transfer(
     from: &str,
     to: &str,
     last: bool,
+    sent: &std::sync::atomic::AtomicU64,
 ) -> Result<(), String> {
     let open = |action| SessionOffer {
         id: legion_pki::random_secret(),
@@ -411,6 +417,7 @@ async fn transfer(
         &receiver.to_agent,
         from,
         to,
+        Some(sent),
     )
     .await;
     // Not waited on: a receiver that stopped reading goes with the session.
@@ -443,6 +450,7 @@ pub(crate) async fn pipe(
     receiver: &ToAgent,
     from: &str,
     to: &str,
+    counted: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<u64, String> {
     let mut sent = 0u64;
     loop {
@@ -451,6 +459,9 @@ pub(crate) async fn pipe(
                 match f.map_err(|_| idle(from))? {
                     Some(Ok(SessionFrame { frame: Some(Frame::Stdout(data)) })) => {
                         sent += data.len() as u64;
+                        if let Some(c) = counted {
+                            c.store(sent, std::sync::atomic::Ordering::Relaxed);
+                        }
                         forward(received, receiver, Frame::Input(data), to).await?;
                     }
                     Some(Ok(SessionFrame { frame: Some(Frame::ExitCode(0)) })) => {
@@ -766,11 +777,13 @@ mod tests {
             got
         });
         let mut said = ReceiverStream::new(said);
-        let sent = pipe(&mut sender, &mut said, &input, "n1", "n2")
+        let counted = std::sync::atomic::AtomicU64::new(0);
+        let sent = pipe(&mut sender, &mut said, &input, "n1", "n2", Some(&counted))
             .await
             .unwrap();
         let got = receiving.await.unwrap();
         assert_eq!(sent, got.iter().map(|c| c.len() as u64).sum::<u64>());
+        assert_eq!(counted.into_inner(), sent, "counted as it went");
         assert_eq!(got, chunks);
     }
 
@@ -779,7 +792,7 @@ mod tests {
         let mut sender = tokio_stream::pending::<Result<SessionFrame, tonic::Status>>();
         let (input, _taken) = mpsc::channel(1);
         let mut said = tokio_stream::iter(vec![ok(Frame::ExitCode(0))]);
-        let err = pipe(&mut sender, &mut said, &input, "n1", "n2")
+        let err = pipe(&mut sender, &mut said, &input, "n1", "n2", None)
             .await
             .unwrap_err();
         assert!(err.contains("before it had all the data"), "{err}");

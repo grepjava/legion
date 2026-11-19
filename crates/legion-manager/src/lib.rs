@@ -9,6 +9,7 @@
 
 pub mod acme;
 pub mod actions;
+mod activity;
 mod alerts;
 mod api;
 mod audit;
@@ -380,10 +381,12 @@ impl Manager {
             closing.clone(),
         ));
         let sessions: std::sync::Arc<session::Hub> = Default::default();
+        let activity: std::sync::Arc<activity::State> = Default::default();
         let migrator = self.controllers.then(|| {
             tokio::spawn(migrate::run(
                 self.store.clone(),
                 sessions.clone(),
+                activity.clone(),
                 self.id,
                 closing.clone(),
             ))
@@ -407,6 +410,7 @@ impl Manager {
             ca_seen: Default::default(),
             balancers: Default::default(),
             events: Default::default(),
+            activity,
             alerts: Default::default(),
             builds: Default::default(),
             registry_loopback: self.registry_loopback,
@@ -430,6 +434,11 @@ impl Manager {
         let eventing = tokio::spawn(events::track(
             api.store.clone(),
             api.events.clone(),
+            api.closing.clone(),
+        ));
+        let following = tokio::spawn(activity::track(
+            api.store.clone(),
+            api.activity.clone(),
             api.closing.clone(),
         ));
         let console = console
@@ -551,6 +560,7 @@ impl Manager {
         let _ = alerting.await;
         let _ = notifying.await;
         let _ = eventing.await;
+        let _ = following.await;
         if let Some(console) = console {
             let _ = console.await;
         }

@@ -176,6 +176,12 @@ service Cluster {
   // The first message holds those kept, oldest first; with `follow`, each
   // new one comes as it happens. For any caller who may read the kind there.
   rpc Events(EventsRequest) returns (stream EventsResponse);
+  // Long operations, as the leader follows them (legion_api::activity):
+  // drains, Volume moves, restores and replicas' whole copies, those under
+  // way and those ended in the last hour; with `follow`, each again as it
+  // changes. Each as the caller may read its target; who asked, for the
+  // cluster admin only.
+  rpc Activity(ActivityRequest) returns (stream ActivityResponse);
   // Sends a test through an AlertReceiver now, as it sends alerts, and
   // says whether it was taken: for whoever may write receivers.
   rpc TestAlertReceiver(TestAlertReceiverRequest) returns (TestAlertReceiverResponse);
@@ -516,6 +522,16 @@ message ReachResponse {
   repeated string services = 1;
   // One per source and destination that it may reach on some port.
   repeated ReachEdge edges = 2;
+}
+
+message ActivityRequest {
+  bool follow = 1;
+}
+
+message ActivityResponse {
+  // Each a legion_api::activity::Operation as JSON: first all of them,
+  // oldest first, then each as it changes.
+  repeated bytes operations_json = 1;
 }
 
 message EventsRequest {

@@ -213,6 +213,12 @@ impl Volumes for VolumesService {
             "volume-restore",
             crate::audit::target("Volume", "", ""),
         );
+        let by = {
+            let a = crate::audit::actor(&req, self.api.peer_tls.is_some());
+            if a.name.is_empty() { a.kind } else { a.name }
+        };
+        // The restore as an operation, on the leader: what it has received.
+        let mut reported: Option<crate::activity::Reported> = None;
         let result = async {
         let caller = self.api.caller(&req)?;
         let leader = self.leader(&req)?;
@@ -304,6 +310,13 @@ impl Volumes for VolumesService {
                 "node {node} is not ready"
             )));
         }
+        let op = reported.insert(self.api.activity.begin(
+            legion_api::activity::OperationKind::Restore,
+            crate::audit::target("Volume", &namespace, &name),
+            format!("restore Volume {namespace}/{name} onto {node}"),
+            legion_api::activity::Stage::Receiving,
+            by,
+        ));
 
         let Attachment {
             mut from_agent,
@@ -325,6 +338,8 @@ impl Volumes for VolumesService {
                     Ok(VolumeRestoreChunk {
                         part: Some(Part::Data(data)),
                     }) => {
+                        op.counter()
+                            .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         if to_agent.send(Ok(send(Frame::Input(data)))).await.is_err() {
                             return Err(Status::unavailable("the node stopped taking the data"));
                         }
@@ -370,6 +385,7 @@ impl Volumes for VolumesService {
             }
         }
 
+        op.enter(legion_api::activity::Stage::Registering);
         // The data is there: the Volume now, on that node. Asked for no
         // node of its own, it stays where it was restored. Restored into
         // a lost one, that one is kept as it is (its labels name its
@@ -426,6 +442,12 @@ impl Volumes for VolumesService {
         }
     }
         .await;
+        if let Some(op) = reported {
+            op.finish(match &result {
+                Ok(_) => Ok("restored".to_owned()),
+                Err(e) => Err(e.message().to_owned()),
+            });
+        }
         self.api.audit_end(audit, result)
     }
 
