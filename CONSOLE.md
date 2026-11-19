@@ -812,6 +812,21 @@ every second), and the overview's cluster CPU, memory and disk.
 **Done when** a node going down reaches a webhook within 60 s, once,
 with the leader killed in between.
 
+**Built so far.** `AlertReceiver` (cluster-scoped): `webhook` (JSON, a
+bearer token from a Secret), `ntfy` (priority by severity) or `smtp`
+(STARTTLS or TLS, `AUTH PLAIN`, a client of Legion's own), choosing by
+`severity`, `namespaces` (`''` the cluster's own) and `kinds`. The leader
+looks every 5 s; an alert is said to clear once gone 15 s, so a new
+leader starting its counts over doesn't clear what goes on. Its status
+keeps what each was told (`sent`), when it last delivered and why it
+fails. `legion alerts test RECEIVER`, the console's Send a test, the
+receivers listed under Cluster and led to from the alerts page. Three
+managers can lose one, so the lab test kills the leader after the node
+it reported on is back rather than while it is down: at 85ff943, n2's
+`node-down` reached the webhook 21.7 s after its daemon was killed, its
+clearing once it was back, then the leader n1's own 39.6 s after it was
+killed, sent by the next leader; every message once.
+
 ### Phase 10: long operations and activity
 
 - Moves, drains, restores and a replica's first copy say their phase
