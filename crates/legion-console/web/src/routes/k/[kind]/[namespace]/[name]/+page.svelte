@@ -9,6 +9,7 @@
   import LogSearch from '#lib/LogSearch.svelte';
   import NodeTasks from '#lib/NodeTasks.svelte';
   import ServiceTasks from '#lib/ServiceTasks.svelte';
+  import NodeHost from '#lib/NodeHost.svelte';
   import Rollout from '#lib/Rollout.svelte';
   import ServicePorts from '#lib/ServicePorts.svelte';
   import Taints from '#lib/Taints.svelte';
@@ -312,6 +313,7 @@
       {/if}
     </dl>
     {#if kind === 'Service' || kind === 'Job'}<ServiceTasks owner={object} />{/if}
+    {#if kind === 'Node'}<NodeHost node={object} />{/if}
     {#if kind === 'Service'}<ServicePorts service={object} />{/if}
   {:else if tab === 'buildlog'}
     <BuildLog build={object} />
