@@ -66,7 +66,7 @@ Rotate the cluster CA across all managers and nodes, or inspect CA rotation stat
 Generate a client certificate PEM for a user and optionally create a `RoleBinding`.
 
 ### `legion node <SUBCOMMAND>`
-- `drain <NODE> [--wait [--timeout <SECONDS>] [-o <table|json>]]`, `pause <NODE>`, `activate <NODE>`
+- `drain <NODE> [--wait [--timeout <SECONDS>] [-o <table|json>]] [--dry-run|--force]`, `pause <NODE>`, `activate <NODE>`
 - `promote <NODE>`, `demote <NODE>`
 - `label <NODE> <key=value|key->...`
 - `require <NODE> [CHECK...]` (gate new tasks on `doctor` advised checks)
@@ -87,8 +87,33 @@ Show a single object.
 ### `legion list <KIND> [-n <NS>|-A] [-l <SELECTOR>] [-o <table|yaml|json>]`
 List objects of a kind.
 
-### `legion delete <KIND> <NAME> [-n <NS>]`
+### `legion delete <KIND> <NAME> [-n <NS>] [--dry-run|--force]`
 Delete an object.
+
+#### Checks before disruption
+`legion node drain`, `legion volume move`, and `legion delete` of a node or
+a Service ask the leader first what the change would do. The leader runs
+the controller over a copy of the cluster, once as it is and once with the
+change, until each settles, and reports the difference:
+
+- the Volumes that move, from where to where, and how much data each holds;
+- what blocks it: work no node would take (`unplaced`), a Volume left where
+  it is (`stranded`), a task still on a drained node (`stays`), a node whose
+  pools lack room for the data moving there (`no-room`), data lost with a
+  node that is still up (`lost`: drain it first), a cancel of a move past its
+  switch-over (`switch-over`);
+- what to know first: tasks a disruption budget holds back until the
+  others run again (`budget`), a Volume carrying on from an older replica
+  (`replica`), the Volumes a deleted Service leaves (`kept`), a manager
+  leaving Raft (`manager`), a drained node that is not ready, whose drain
+  completes once it is back (`unreachable`), a node not in the cluster yet
+  (`absent`).
+
+With `--dry-run` it prints this, changes nothing, and exits 1 if anything
+blocks. Without it, a change that would block is refused (exit 1, with the
+findings) unless `--force` is given; warnings are printed and the change
+goes ahead. The console's confirmation shows the same check and keeps its
+button disabled while anything blocks.
 
 ### `legion watch [KIND] [--from <VERSION>]`
 Stream live `PUT`/`DELETE` object events, from now on or after a version.
@@ -131,7 +156,7 @@ Trigger a CronJob immediately outside its schedule.
 - `legion connections [-n <NS>]` (the connections the nodes' pf saw, by service and port)
 - `legion topology [-n <NS>]` (each service with its ports, Routes, tasks, Volumes, what may reach it and what was seen)
 - `legion load-balancers [-n <NS>]` (CARP holders and states)
-- `legion volume <move|backup|restore|snapshots|snapshot|rollback|rm-snapshot>`
+- `legion volume <move|backup|restore|snapshots|snapshot|rollback|rm-snapshot>` (`move <VOLUME> <NODE> [--dry-run|--force]` is checked first, see Checks before disruption)
 
 ---
 

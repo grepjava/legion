@@ -1656,3 +1656,64 @@ fn the_activity_tab_lists_long_operations_newest_first() {
         Some((Kind::Volume, "shop".to_owned(), "data".to_owned()))
     );
 }
+
+/// What `legion top` checks first, as the CLI does: a drain, a move, a
+/// node's removal and a Service's deletion; nothing else.
+#[test]
+fn disruptions_are_checked_first() {
+    use legion_api::dryrun::Change;
+    let checked = |r: Request| super::disruption(&r);
+    assert_eq!(
+        checked(Request::Availability {
+            node: "n2".into(),
+            to: "drain"
+        }),
+        Some(Change::Drain { node: "n2".into() })
+    );
+    assert_eq!(
+        checked(Request::Availability {
+            node: "n2".into(),
+            to: "pause"
+        }),
+        None
+    );
+    assert_eq!(
+        checked(Request::Move {
+            namespace: String::new(),
+            volume: "data".into(),
+            node: "n3".into()
+        }),
+        Some(Change::MoveVolume {
+            namespace: "default".into(),
+            volume: "data".into(),
+            node: "n3".into()
+        })
+    );
+    assert_eq!(
+        checked(Request::Delete {
+            kind: Kind::Node,
+            namespace: String::new(),
+            name: "n2".into()
+        }),
+        Some(Change::RemoveNode { node: "n2".into() })
+    );
+    assert_eq!(
+        checked(Request::Delete {
+            kind: Kind::Service,
+            namespace: "shop".into(),
+            name: "web".into()
+        }),
+        Some(Change::DeleteService {
+            namespace: "shop".into(),
+            service: "web".into()
+        })
+    );
+    assert_eq!(
+        checked(Request::Delete {
+            kind: Kind::Config,
+            namespace: "shop".into(),
+            name: "web".into()
+        }),
+        None
+    );
+}

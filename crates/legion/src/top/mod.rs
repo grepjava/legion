@@ -347,8 +347,9 @@ pub async fn run(
                 request => {
                     view.notice = Some("Asking…".into());
                     let (objects, tx) = (objects.clone(), tx.clone());
+                    let cluster = crate::cli::cluster_client(channel.clone());
                     tokio::spawn(async move {
-                        let _ = tx.send(Msg::Done(act(objects, request).await));
+                        let _ = tx.send(Msg::Done(act(objects, cluster, request).await));
                     });
                 }
             }
@@ -943,6 +944,46 @@ async fn run_shell(
     let _ = tx.send(Msg::ShellEnded(n, why));
 }
 
+/// The change a request makes that is checked first.
+fn disruption(request: &Request) -> Option<legion_api::dryrun::Change> {
+    use legion_api::dryrun::Change;
+    let namespace = |n: &str| {
+        if n.is_empty() {
+            "default".to_owned()
+        } else {
+            n.to_owned()
+        }
+    };
+    match request {
+        Request::Availability { node, to } if *to == "drain" => {
+            Some(Change::Drain { node: node.clone() })
+        }
+        Request::Move {
+            namespace: ns,
+            volume,
+            node,
+        } => Some(Change::MoveVolume {
+            namespace: namespace(ns),
+            volume: volume.clone(),
+            node: node.clone(),
+        }),
+        Request::Delete {
+            kind: Kind::Node,
+            name,
+            ..
+        } => Some(Change::RemoveNode { node: name.clone() }),
+        Request::Delete {
+            kind: Kind::Service,
+            namespace: ns,
+            name,
+        } => Some(Change::DeleteService {
+            namespace: namespace(ns),
+            service: name.clone(),
+        }),
+        _ => None,
+    }
+}
+
 fn object_ref(kind: Kind, namespace: String, name: String) -> ObjectRef {
     ObjectRef {
         kind: kind.to_string(),
@@ -951,8 +992,37 @@ fn object_ref(kind: Kind, namespace: String, name: String) -> ObjectRef {
     }
 }
 
-/// Makes a request over the API; what came of it, for people.
-async fn act(mut objects: crate::cli::Objects, request: Request) -> String {
+/// Makes a request over the API; what came of it, for people. A drain, a
+/// Volume's move and a node's removal or a Service's deletion are checked
+/// first, as the CLI checks them: one that would not complete is refused,
+/// saying why (the CLI's --force goes ahead all the same).
+async fn act(
+    mut objects: crate::cli::Objects,
+    mut cluster: legion_proto::v1::cluster_client::ClusterClient<Channel>,
+    request: Request,
+) -> String {
+    if let Some(change) = disruption(&request) {
+        match crate::cli::dry_run_of(&mut cluster, &change).await {
+            Ok(Some(d)) if d.blocks() => {
+                let why: Vec<String> = d
+                    .findings
+                    .iter()
+                    .filter(|f| f.severity == legion_api::dryrun::Severity::Blocking)
+                    .map(|f| match f.object.is_empty() {
+                        true => f.message.clone(),
+                        false => format!("{}: {}", f.object, f.message),
+                    })
+                    .collect();
+                return format!(
+                    "Refused: {} would not complete: {} (the CLI's --force goes ahead anyway)",
+                    change.describe(),
+                    why.join("; ")
+                );
+            }
+            Ok(_) => {}
+            Err(e) => return format!("Failed: {e:#}"),
+        }
+    }
     let said = |changed: bool, done: String, already: String| {
         if changed { done } else { already }
     };

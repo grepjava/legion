@@ -126,6 +126,19 @@ Create a user client certificate PEM and optional
 .Li RoleBinding .
 .It Cm node Ar drain|pause|activate|promote|demote|label|require
 Manage node availability, manager role, labels, and host readiness requirements.
+.Cm node drain ,
+.Cm volume move
+and
+.Cm delete
+of a node or a Service first ask the leader what the change would do:
+the Volumes that move and their sizes, work no node would take, a Volume
+left behind, a node without room for what moves there, data lost with a
+node still up, and what a disruption budget holds back.
+A change that would not complete is refused unless
+.Fl -force
+is given;
+.Fl -dry-run
+prints the check, changes nothing, and exits 1 if anything blocks.
 .El
 .Sh WORKLOAD AND OBSERVABILITY COMMANDS
 .Bl -tag -width Ds
@@ -139,8 +152,11 @@ would make; exits 1 if differences exist.
 Show a single object.
 .It Cm list Ar kind Oo Fl n Ar ns | Fl A Oc Oo Fl l Ar selector Oc Oo Fl o Ar fmt Oc
 List objects of a kind.
-.It Cm delete Ar kind name Op Fl n Ar ns
+.It Cm delete Ar kind name Oo Fl n Ar ns Oc Op Fl -dry-run | Fl -force
 Delete an object.
+A node's removal and a Service's deletion are checked first, as
+.Cm node drain
+is.
 .It Cm watch Oo Ar kind Oc Oo Fl -from Ar version Oc
 Stream live object changes, from now on or after a version.
 .It Cm stack Ar deploy|convert|ls|stop|start|rm

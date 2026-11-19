@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use legion_api::dryrun::{Change, DryRun};
 use legion_api::{Kind, Object};
 use legion_proto::v1::cluster_client::ClusterClient;
 use legion_proto::v1::objects_client::ObjectsClient;
@@ -357,6 +358,15 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
     let channel = connect(server, identity).await?;
     let mut objects = Objects::new(channel.clone());
     let mut cluster = cluster_client(channel.clone());
+    if let Some((change, dry_run, force)) = disruption(&command)? {
+        let blocks = check_first(&mut cluster, change, dry_run, force).await?;
+        if dry_run {
+            if blocks {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+    }
     match command {
         Command::Daemon { .. } | Command::NodeResolver { .. } => unreachable!("handled in main"),
         Command::Init => {
@@ -898,6 +908,7 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             kind,
             name,
             namespace,
+            ..
         } => {
             let kind = parse_kind(&kind)?;
             let resp = objects
@@ -1066,6 +1077,7 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                     wait: true,
                     timeout,
                     output,
+                    ..
                 },
         } => {
             let r#ref = ObjectRef {
@@ -1121,6 +1133,7 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                     volume,
                     node,
                     namespace,
+                    ..
                 },
         } => {
             let r#ref = ObjectRef {
@@ -1877,6 +1890,120 @@ async fn delete(objects: &mut Objects, o: &Object) -> anyhow::Result<()> {
         .with_context(|| format!("deleting {}", o.key()))?;
     println!("{} deleted", o.key());
     Ok(())
+}
+
+/// The change a command would make that is checked first (CONSOLE.md
+/// phase 11), with its `--dry-run` and `--force`.
+fn disruption(command: &Command) -> anyhow::Result<Option<(Change, bool, bool)>> {
+    let namespace = |n: &Option<String>| {
+        n.clone()
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "default".into())
+    };
+    Ok(match command {
+        Command::Node {
+            command:
+                crate::NodeCommand::Drain {
+                    node,
+                    dry_run,
+                    force,
+                    ..
+                },
+        } => Some((Change::Drain { node: node.clone() }, *dry_run, *force)),
+        Command::Volume {
+            command:
+                crate::VolumeCommand::Move {
+                    volume,
+                    node,
+                    namespace: ns,
+                    dry_run,
+                    force,
+                },
+        } => Some((
+            Change::MoveVolume {
+                namespace: namespace(ns),
+                volume: volume.clone(),
+                node: node.clone(),
+            },
+            *dry_run,
+            *force,
+        )),
+        Command::Delete {
+            kind,
+            name,
+            namespace: ns,
+            dry_run,
+            force,
+        } => match parse_kind(kind)? {
+            Kind::Node => Some((Change::RemoveNode { node: name.clone() }, *dry_run, *force)),
+            Kind::Service => Some((
+                Change::DeleteService {
+                    namespace: namespace(ns),
+                    service: name.clone(),
+                },
+                *dry_run,
+                *force,
+            )),
+            _ if *dry_run => {
+                anyhow::bail!("--dry-run is for a node's removal or a Service's deletion")
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// What the leader says `change` would do; none from a manager from
+/// before the check.
+pub(crate) async fn dry_run_of(
+    cluster: &mut ClusterClient<Channel>,
+    change: &Change,
+) -> anyhow::Result<Option<DryRun>> {
+    let asked = cluster
+        .dry_run(pb::DryRunRequest {
+            change_json: serde_json::to_vec(change)?,
+        })
+        .await;
+    match asked {
+        Ok(r) => Ok(Some(
+            serde_json::from_slice(&r.into_inner().dry_run_json).context("reading the dry run")?,
+        )),
+        Err(s) if s.code() == tonic::Code::Unimplemented => Ok(None),
+        Err(s) => Err(s).with_context(|| format!("checking first: {}", change.describe())),
+    }
+}
+
+/// Asks the leader what `change` would do. With `dry_run`, prints it all;
+/// otherwise says what it found, if anything, and refuses one that would
+/// block unless `force`. True if it would block. A manager from before
+/// the check is not asked.
+async fn check_first(
+    cluster: &mut ClusterClient<Channel>,
+    change: Change,
+    dry_run: bool,
+    force: bool,
+) -> anyhow::Result<bool> {
+    let d = match dry_run_of(cluster, &change).await? {
+        Some(d) => d,
+        None if !dry_run => return Ok(false),
+        None => bail!("this manager does not check changes first: it is from before the check"),
+    };
+    let blocks = d.blocks();
+    if dry_run {
+        println!("{}", d.render());
+    } else if blocks && !force {
+        eprintln!("{}", d.render());
+        std::process::exit(1);
+    } else if blocks {
+        let text = d.render();
+        let found = text
+            .rsplit_once('\n')
+            .map_or(text.as_str(), |(found, _)| found);
+        eprintln!("{found}\nGoing ahead anyway, as --force asks.");
+    } else if !d.findings.is_empty() {
+        eprintln!("{}", d.render());
+    }
+    Ok(blocks)
 }
 
 /// Prints how applying `object` would change the stored one; true if it would.

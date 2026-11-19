@@ -377,12 +377,24 @@ enum Command {
         #[arg(short, long, value_enum, default_value_t = cli::Format::Table)]
         output: cli::Format,
     },
-    /// Delete one object.
+    /// Delete one object. A node's removal and a Service's deletion are
+    /// checked first (as --dry-run says): refused if the check finds it
+    /// would leave work no node takes or lose data on a node still up.
     Delete {
         kind: String,
         name: String,
         #[arg(short, long)]
         namespace: Option<String>,
+        /// For a node or a Service: say what removing it would do (the
+        /// data that goes with a node, the Volumes a Service leaves, what
+        /// no node would take) and change nothing: exits 1 if anything
+        /// would block it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Go ahead even though the check made first finds it would not
+        /// complete.
+        #[arg(long, conflicts_with = "dry_run")]
+        force: bool,
     },
     /// Deploy, convert or remove compose stacks.
     Stack {
@@ -835,7 +847,8 @@ pub enum AlertsCommand {
 #[derive(Subcommand)]
 pub enum NodeCommand {
     /// Move the node's tasks elsewhere (and stateful tasks' Volumes with
-    /// them), and place no new ones there.
+    /// them), and place no new ones there. Checked first (as --dry-run
+    /// says): refused if it would not complete.
     Drain {
         node: String,
         /// Wait until nothing runs on the node and none of its data is
@@ -851,6 +864,15 @@ pub enum NodeCommand {
         /// node's `status.drain` has it, with the node's name.
         #[arg(short, long, value_enum, default_value_t = cli::Format::Table, requires = "wait")]
         output: cli::Format,
+        /// Say what it would do (what moves, and its size; what no node
+        /// would take; what a disruption budget holds back) and change
+        /// nothing: exits 1 if anything would block it.
+        #[arg(long, conflicts_with = "wait")]
+        dry_run: bool,
+        /// Go ahead even though the check made first finds it would not
+        /// complete.
+        #[arg(long, conflicts_with = "dry_run")]
+        force: bool,
     },
     /// Keep the node's tasks but place no new ones there.
     Pause { node: String },
@@ -912,12 +934,22 @@ pub enum CronJobCommand {
 pub enum VolumeCommand {
     /// Move a Volume's data to NODE (its `spec.node`): copied while its
     /// tasks run, which then stop and start again there once the rest has
-    /// gone. It stays there, and returns there after a drain.
+    /// gone. It stays there, and returns there after a drain. Checked
+    /// first (as --dry-run says): refused if it would stay where it is.
     Move {
         volume: String,
         node: String,
         #[arg(short, long)]
         namespace: Option<String>,
+        /// Say what it would do (what moves, and its size; what no node
+        /// would take; what a disruption budget holds back) and change
+        /// nothing: exits 1 if anything would block it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Go ahead even though the check made first finds it would not
+        /// complete.
+        #[arg(long, conflicts_with = "dry_run")]
+        force: bool,
     },
     /// Hand a Volume whose node is down to its replica: it carries on from
     /// the replica's last copy of that node's data, on the replica's node,
