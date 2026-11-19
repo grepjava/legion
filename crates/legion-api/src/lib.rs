@@ -11,6 +11,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+pub mod activity;
 pub mod admit;
 pub mod alert;
 pub mod audit;
