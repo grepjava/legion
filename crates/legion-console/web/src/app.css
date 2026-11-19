@@ -503,8 +503,15 @@ button.link {
     scrollbar-width: thin;
     scrollbar-color: var(--control) var(--side);
   }
+  /* The page scrolls above the workbench, which is laid out under it
+     rather than held over it: nothing on the page passes under its bar,
+     where it could not be reached. */
   .main-col {
     height: 100%;
+    overflow: hidden;
+  }
+  main {
+    min-height: 0;
     overflow-y: auto;
     scrollbar-width: thin;
     scrollbar-color: var(--control) var(--bg);
@@ -1119,10 +1126,8 @@ dialog::backdrop {
   align-items: start;
 }
 
-/* Persistent bottom Workbench drawer */
+/* Persistent bottom Workbench drawer, under the page (see .main-col) */
 .workbench {
-  position: sticky;
-  bottom: 0;
   z-index: 15;
   background: var(--side);
   border-top: 1px solid var(--line);

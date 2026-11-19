@@ -196,10 +196,10 @@
     else setSidebarHidden(!prefs.sidebarHidden);
   }
 
-  // The page's scroll: the main column scrolls, not the window, so
+  // The page's scroll: the page itself (main) scrolls, not the window, so
   // SvelteKit's own reset does not reach it. A new page starts at the top;
   // Back and Forward return to where the page was left.
-  let mainCol: HTMLDivElement | undefined = $state();
+  let mainCol: HTMLElement | undefined = $state();
   const scrolls = new Map<string, number>();
   beforeNavigate(({ from }) => {
     if (from && mainCol) scrolls.set(from.url.href, mainCol.scrollTop);
@@ -805,8 +805,8 @@
           <button class="link" onclick={signOut}>{t('Sign out')}</button>
         </div>
       </aside>
-      <div class="main-col" bind:this={mainCol}>
-        <main id="main" tabindex="-1">
+      <div class="main-col">
+        <main id="main" tabindex="-1" bind:this={mainCol}>
           {@render children()}
         </main>
         <Workbench />
