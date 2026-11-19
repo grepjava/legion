@@ -1,6 +1,6 @@
 <script lang="ts">
   import { page } from '$app/state';
-  import { api, follow, type LObject } from '#lib/api.ts';
+  import { api, follow, removal, type LObject } from '#lib/api.ts';
   import { ask } from '#lib/confirm.svelte.ts';
   import RowDetail from '#lib/RowDetail.svelte';
   import { busyWhile, toast } from '#lib/toast.svelte.ts';
@@ -139,7 +139,8 @@
       !(await ask(t('Delete {n} {kinds}: {names}?', { n, kinds: plural(kind), names }), {
         action: t('Delete'),
         danger: true,
-        typed: lasting ? String(n) : undefined
+        typed: lasting ? String(n) : undefined,
+        check: picked.flatMap((o) => removal(kind, o.metadata.namespace ?? '', o.metadata.name) ?? [])
       }))
     )
       return;

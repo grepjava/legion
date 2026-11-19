@@ -328,7 +328,8 @@
         t('Move {name} to {node}? Its tasks stop while its data moves.', {
           name: nm,
           node: migrateNode.trim()
-        })
+        }),
+        { check: [{ change: 'move-volume', namespace: ns, volume: nm, node: migrateNode.trim() }] }
       ))
     ) {
       return;

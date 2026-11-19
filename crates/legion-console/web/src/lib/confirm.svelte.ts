@@ -3,6 +3,8 @@
 // button naming the action, and for what can't be undone asks for the
 // object's name typed. `ask` resolves to whether it was confirmed.
 
+import type { Change } from './api.ts';
+
 export interface Ask {
   /** What will happen, as a question: "Drain n2? Its tasks move…". */
   message: string;
@@ -12,8 +14,12 @@ export interface Ask {
   danger?: boolean;
   /** A name to type before the button works, for what can't be undone. */
   typed?: string;
-  /** Said under the message, e.g. a dry run's findings (phase 11). */
+  /** Said under the message. */
   detail?: string[];
+  /** Changes checked first (CONSOLE.md phase 11): the dialog shows what
+   * each would do, and does not confirm while one is being checked or
+   * anything blocks. */
+  check?: Change[];
 }
 
 interface Pending extends Ask {

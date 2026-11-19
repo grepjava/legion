@@ -72,7 +72,16 @@
     );
 
   async function remove(st: Stack) {
-    if (!(await ask(t('Remove stack {stack}: its services, Secrets and Configs? Its Volumes and their data stay.', { stack: st.name }))))
+    const check = st.services.map((s) => ({
+      change: 'delete-service' as const,
+      namespace: st.namespace,
+      service: s.metadata.name
+    }));
+    if (
+      !(await ask(t('Remove stack {stack}: its services, Secrets and Configs? Its Volumes and their data stay.', { stack: st.name }), {
+        check
+      }))
+    )
       return;
     busy = `${st.namespace}/${st.name}`;
     error = '';

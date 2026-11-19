@@ -158,6 +158,8 @@ export const api = {
     call<{ message: string }>('POST', '/api/run-now', { namespace, cronJob }),
   nodeRole: (node: string, role: 'manager' | 'worker') =>
     call<void>('POST', '/api/node-role', { node, role }),
+  /** What a change would do, changing nothing (`--dry-run`). */
+  dryRun: (change: Change) => call<DryRun>('POST', '/api/dry-run', change),
 
   // Cluster operations; the API lets only admins do most.
   audit: (filter: AuditFilter) => {
@@ -1006,6 +1008,39 @@ export interface Plugin {
 /** The plugins in the namespaces the user may read. */
 export function plugins(): Promise<{ plugins: Plugin[] }> {
   return call('GET', '/api/plugins');
+}
+
+/** A change checked before it is made (legion_api::dryrun). */
+export type Change =
+  | { change: 'drain'; node: string }
+  | { change: 'move-volume'; namespace: string; volume: string; node: string }
+  | { change: 'remove-node'; node: string }
+  | { change: 'delete-service'; namespace: string; service: string };
+
+/** The check a deletion is given first: a node's removal or a Service's
+ * deletion; none for other kinds. */
+export function removal(kind: string, namespace: string, name: string): Change[] | undefined {
+  if (kind === 'Node') return [{ change: 'remove-node', node: name }];
+  if (kind === 'Service') return [{ change: 'delete-service', namespace, service: name }];
+  return undefined;
+}
+
+/** What a change would do, as the leader works it out. */
+export interface DryRun {
+  change: Change;
+  /** Blocking first. */
+  findings: {
+    severity: 'blocking' | 'warning';
+    reason: string;
+    object?: string;
+    namespace?: string;
+    message: string;
+  }[];
+  moves: { namespace: string; volume: string; from: string; to: string; bytes?: number }[];
+  /** Tasks it would stop where they run. */
+  stopped: number;
+  /** Findings in namespaces the user may not read. */
+  hidden?: number;
 }
 
 /** A long operation (`legion activity`, legion_api::activity). */

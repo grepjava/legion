@@ -4,7 +4,7 @@
   // a CronJob now or suspend it; drain or promote a Node, move a Volume). For a user who may
   // only look, the buttons are there, disabled, with the reason.
   import { goto } from '$app/navigation';
-  import { api, type LObject } from './api.ts';
+  import { api, removal, type LObject } from './api.ts';
   import { cannotWrite } from './session.svelte.ts';
   import { t } from './i18n.svelte.ts';
   import { ask } from './confirm.svelte.ts';
@@ -78,7 +78,9 @@
       : t('Delete {label}?', { label });
     // What can't be come back from asks for its name typed.
     const lasting = ['Volume', 'Namespace', 'Node'].includes(kind);
-    if (!(await ask(ask_, { action: t('Delete'), typed: lasting ? name : undefined }))) return;
+    // A node's removal and a Service's deletion are checked first.
+    const check = removal(kind, ns, name);
+    if (!(await ask(ask_, { action: t('Delete'), typed: lasting ? name : undefined, check }))) return;
     await act(async () => {
       await api.remove(kind, ns, name, object.metadata.version);
       await goto(`/k/${kind}`);
@@ -92,7 +94,13 @@
       pause: t('{name} paused', { name }),
       drain: t('{name} draining', { name })
     }[to];
-    if (to === 'drain' && !(await ask(t('Drain {name}? Its tasks move to other nodes.', { name }), { action: t('Drain') })))
+    if (
+      to === 'drain' &&
+      !(await ask(t('Drain {name}? Its tasks move to other nodes.', { name }), {
+        action: t('Drain'),
+        check: [{ change: 'drain', node: name }]
+      }))
+    )
       return;
     return set('availability', to, done, t('{name} is already {to}', { name, to }));
   }
@@ -241,7 +249,8 @@
         onclick={async () =>
           (await ask(t('Move {name} to {node}? Its tasks stop while its data moves.', { name, node: moveTo }), {
             action: t('Move'),
-            danger: true
+            danger: true,
+            check: [{ change: 'move-volume', namespace: ns, volume: name, node: moveTo }]
           })) &&
           set(
             'node',
