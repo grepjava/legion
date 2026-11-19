@@ -791,9 +791,10 @@ pub(crate) fn past_switch_over(
                 return Ok(None);
             }
             Ok(Some(format!(
-                "{} is past its switch-over from {from} to {to}: its tasks have stopped for \
-                 the last part, and the move goes through; ask again once it is on {to}",
-                cur.key()
+                "Volume {}/{} is past its switch-over from {from} to {to}: its tasks have \
+                 stopped for the last part, and the move goes through; ask again once it is \
+                 on {to}",
+                cur.metadata.namespace, cur.metadata.name
             )))
         }
         Kind::Node => {
