@@ -79,8 +79,8 @@
   <table class="matrix">
     <thead>
       <tr>
-        <th>{t('from \\ to')}</th>
-        {#each services as to (to)}<th><a href="/k/Service/{namespace}/{to}">{to}</a></th>{/each}
+        <th scope="col">{t('from \\ to')}</th>
+        {#each services as to (to)}<th scope="col"><a href="/k/Service/{namespace}/{to}">{to}</a></th>{/each}
       </tr>
     </thead>
     <tbody>

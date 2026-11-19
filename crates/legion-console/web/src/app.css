@@ -623,6 +623,14 @@ th {
   font-weight: 600;
   background: var(--surface2);
 }
+/* A header that names something (a row's object, a link to one) keeps
+   the name as it is written: names are not headings. */
+th[scope='row'],
+th:has(> a) {
+  text-transform: none;
+  letter-spacing: normal;
+  font-size: 0.85rem;
+}
 th:has(> button.sort-btn) {
   padding: 0;
 }
