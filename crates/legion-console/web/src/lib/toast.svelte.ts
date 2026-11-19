@@ -8,6 +8,8 @@ export interface Toast {
   error: boolean;
 }
 
+import { noteDone } from './activity.svelte.ts';
+
 export const toasts = $state<{ list: Toast[] }>({ list: [] });
 
 const KEPT = 4;
@@ -16,6 +18,8 @@ let next = 1;
 
 export function toast(text: string, error = false): void {
   if (!text) return;
+  // Kept for the workbench's bar and its Activity tab too.
+  noteDone(text, error);
   const id = next++;
   toasts.list = [...toasts.list, { id, text, error }].slice(-KEPT);
   if (!error) setTimeout(() => dismiss(id), SHOWN_MS);

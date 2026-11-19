@@ -1,13 +1,17 @@
 <script lang="ts">
   // Persistent Multi-Tab Bottom Workbench Drawer: keeps live TaskLogs,
   // interactive xterm.js jail shells, Build logs, and Watch Events open
-  // across page navigations.
+  // across page navigations. Under it, always there, a thin bar (CONSOLE.md
+  // phase 10): what runs now, else the last thing done and how it ended,
+  // opening into the Activity tab.
   import { onMount } from 'svelte';
+  import Activity from './Activity.svelte';
+  import { activity, running, sent } from './activity.svelte.ts';
   import BuildLog from './BuildLog.svelte';
   import Events from './Events.svelte';
   import TaskLogs from './TaskLogs.svelte';
   import { t } from './i18n.svelte.ts';
-  import { closeWorkbench, moveWorkbench, session } from './session.svelte.ts';
+  import { closeWorkbench, moveWorkbench, openWorkbench, session } from './session.svelte.ts';
   import { sortable } from './drop.svelte.ts';
   import Ico from './Ico.svelte';
   import { toolIcon } from './icons.ts';
@@ -98,6 +102,48 @@
     }
   }
 
+  // The bar: what runs, else the newest of what ended and what was done here.
+  let now = $state(Date.now());
+  $effect(() => {
+    const tick = setInterval(() => (now = Date.now()), 5000);
+    return () => clearInterval(tick);
+  });
+  const runs = $derived(running(activity.ops));
+  const newest = $derived(runs[runs.length - 1]);
+  const last = $derived.by(() => {
+    const ended = activity.ops
+      .filter((o) => o.endedMs)
+      .map((o) => ({
+        at: o.endedMs ?? 0,
+        text: o.message ? `${o.what}: ${o.state}, ${o.message}` : `${o.what}: ${o.state}`,
+        tone: o.state === 'succeeded' ? 'good' : o.state === 'failed' ? 'bad' : ''
+      }));
+    const done = activity.done.map((d) => ({
+      at: d.atMs,
+      text: d.text,
+      tone: d.error ? 'bad' : 'good'
+    }));
+    return [...ended, ...done].sort((a, b) => b.at - a.at)[0] ?? null;
+  });
+  const ago = (ms: number) => {
+    const s = Math.max(0, Math.round((now - ms) / 1000));
+    if (s < 60) return t('just now');
+    if (s < 3600) return t('{n} min ago', { n: Math.round(s / 60) });
+    return t('{n} h ago', { n: Math.round(s / 3600) });
+  };
+  const activityOpen = $derived(
+    session.activeTab === 'activity' &&
+      !session.workbenchMinimized &&
+      session.workbench.some((x) => x.id === 'activity')
+  );
+  function toggleActivity() {
+    if (activityOpen) {
+      session.workbenchMinimized = true;
+      return;
+    }
+    openWorkbench({ id: 'activity', kind: 'activity', title: t('Activity'), namespace: '', name: '' });
+  }
+
   function onTabKey(e: KeyboardEvent) {
     // Alt with an arrow moves the tab instead (sortable).
     if (e.altKey) return;
@@ -124,8 +170,8 @@
 
 <svelte:window bind:innerHeight={windowHeight} />
 
-{#if session.workbench.length}
-  <section class="workbench" class:resizing aria-label={t('Operator workbench')}>
+<section class="workbench" class:resizing aria-label={t('Operator workbench')}>
+  {#if session.workbench.length}
     <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <div
@@ -226,14 +272,97 @@
               namespace={active.namespace}
               name={active.name}
             />
+          {:else if active.kind === 'activity'}
+            <Activity />
           {/if}
         {/key}
       </div>
     {/if}
-  </section>
-{/if}
+  {/if}
+  <div class="wb-status">
+    <button
+      type="button"
+      class="wb-status-open"
+      aria-expanded={activityOpen}
+      onclick={toggleActivity}
+      title={t('Activity: what runs and what was done')}
+    >
+      <Ico icon={toolIcon('activity')} size={14} />
+      {#if newest}
+        <span class="dot wait wb-pulse" aria-hidden="true"></span>
+        <span class="wb-what">
+          {runs.length === 1
+            ? t('{what}: {stage}', { what: newest.what, stage: newest.stage })
+            : t('{n} running; {what}: {stage}', {
+                n: runs.length,
+                what: newest.what,
+                stage: newest.stage
+              })}
+          {#if newest.bytes}
+            <span class="muted">({sent(newest.bytes)})</span>
+          {/if}
+        </span>
+      {:else if last}
+        <span class="dot {last.tone}" aria-hidden="true"></span>
+        <span class="wb-what">{last.text}</span>
+        <span class="muted">· {ago(last.at)}</span>
+      {:else}
+        <span class="muted">{t('Nothing has run lately')}</span>
+      {/if}
+    </button>
+    {#if activity.error}
+      <span class="error wb-error" title={activity.error}>{t('activity not current')}</span>
+    {/if}
+  </div>
+</section>
 
 <style>
+  .wb-status {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    min-height: 26px;
+    padding: 0 0.6rem;
+    border-top: 1px solid var(--line);
+    background: var(--side);
+    font-size: 0.78rem;
+  }
+  .wb-status-open {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    min-width: 0;
+    flex: 1;
+    background: none;
+    border: none;
+    padding: 0.15rem 0;
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    min-height: 24px;
+  }
+  .wb-status-open:hover .wb-what {
+    text-decoration: underline;
+  }
+  .wb-what {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .wb-error {
+    white-space: nowrap;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .wb-pulse {
+      animation: wb-pulse 1.6s ease-in-out infinite;
+    }
+  }
+  @keyframes wb-pulse {
+    50% {
+      opacity: 0.35;
+    }
+  }
   .wb-tabs {
     margin: 0;
     border-bottom: none;

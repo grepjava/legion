@@ -7,7 +7,7 @@ export type DensityMode = 'comfortable' | 'compact';
 
 export interface WorkbenchTab {
   id: string;
-  kind: 'logs' | 'terminal' | 'build' | 'events';
+  kind: 'logs' | 'terminal' | 'build' | 'events' | 'activity';
   title: string;
   namespace: string;
   name: string;

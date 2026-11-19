@@ -6,6 +6,7 @@
   import {
     api,
     consoleSettings,
+    followActivity,
     followAlerts,
     plugins,
     setToken,
@@ -30,6 +31,7 @@
     type TreeMode
   } from '#lib/prefs.svelte.ts';
   import Workbench from '#lib/Workbench.svelte';
+  import { activity } from '#lib/activity.svelte.ts';
   import { plural } from '#lib/kinds.ts';
   import Ico from '#lib/Ico.svelte';
   import { drafts } from '#lib/drafts.svelte.ts';
@@ -279,6 +281,17 @@
     return followAlerts(
       (a) => (session.alerts = a),
       (why) => (session.alertsError = why)
+    );
+  });
+  // The cluster's long operations, for the workbench's bar and its tab.
+  $effect(() => {
+    if (!session.me) {
+      activity.ops = [];
+      return;
+    }
+    return followActivity(
+      (ops) => (activity.ops = ops),
+      (why) => (activity.error = why)
     );
   });
   const critical = $derived(session.alerts.some((a) => a.severity === 'critical'));

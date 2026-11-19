@@ -4,6 +4,7 @@
 // and the workbench.
 import type { Component } from 'svelte';
 import {
+  Activity,
   BadgeCheck,
   Bell,
   BellRing,
@@ -98,8 +99,16 @@ const pages: Record<string, IconComponent> = {
 };
 
 /** A workbench tab's icon, by what it shows. */
-export function toolIcon(kind: 'logs' | 'terminal' | 'build' | 'events'): IconComponent {
-  return { logs: FileText, terminal: SquareTerminal, build: Hammer, events: Bell }[kind];
+export function toolIcon(
+  kind: 'logs' | 'terminal' | 'build' | 'events' | 'activity'
+): IconComponent {
+  return {
+    logs: FileText,
+    terminal: SquareTerminal,
+    build: Hammer,
+    events: Bell,
+    activity: Activity
+  }[kind];
 }
 
 /** An action's icon in the palette; one that changes the theme shows it. */

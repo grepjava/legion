@@ -1007,3 +1007,47 @@ export interface Plugin {
 export function plugins(): Promise<{ plugins: Plugin[] }> {
   return call('GET', '/api/plugins');
 }
+
+/** A long operation (`legion activity`, legion_api::activity). */
+export interface Operation {
+  id: string;
+  kind: 'drain' | 'move' | 'restore' | 'replica-copy';
+  target: { kind?: string; namespace?: string; name?: string };
+  what: string;
+  /** Who asked: for the cluster admin only. */
+  by?: string;
+  /** The drain a move is part of. */
+  partOf?: string;
+  beganMs: number;
+  endedMs?: number;
+  state: 'running' | 'succeeded' | 'failed' | 'cancelled';
+  stage: string;
+  bytes: number;
+  message?: string;
+  stages?: { stage: string; atMs: number }[];
+  output?: { atMs: number; text: string }[];
+}
+
+/** Long operations as the leader follows them, as `legion activity -w`:
+ * all of them first, then each as it changes; `update` gets them all,
+ * oldest first, each time. Open again when the connection drops. */
+export function followActivity(
+  update: (ops: Operation[]) => void,
+  failed: (why: string) => void
+): () => void {
+  const ops = new Map<string, Operation>();
+  let first = true;
+  return keepOpen(
+    async () => {
+      first = true;
+      return '/api/activity';
+    },
+    (e) => {
+      if (first) ops.clear();
+      first = false;
+      for (const op of e.operations as Operation[]) ops.set(op.id, op);
+      update([...ops.values()].sort((a, b) => a.beganMs - b.beganMs));
+    },
+    failed
+  );
+}
