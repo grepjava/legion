@@ -203,6 +203,7 @@ fn router(gateway: Gateway) -> axum::Router {
         .route("/api/rollback", post(rollback))
         .route("/api/restart", post(restart))
         .route("/api/run-now", post(run_now))
+        .route("/api/dry-run", post(dry_run))
         .route("/api/node-role", post(node_role))
         .route("/api/exec/{namespace}/{task}", get(exec))
         // Cluster operations (CONSOLE.md phase 3); the API lets only
@@ -2058,6 +2059,26 @@ async fn restart(
     let message =
         crate::actions::restart(&mut objects_client(channel), body.namespace, body.service).await?;
     Ok(Json(serde_json::json!({ "message": message })).into_response())
+}
+
+/// What a change would do (`Cluster.DryRun`), for the confirmation that
+/// asks before it: posted as the change would be, by who would make it.
+async fn dry_run(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(change): Json<legion_api::dryrun::Change>,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    let r = ClusterClient::new(channel)
+        .dry_run(pb::DryRunRequest {
+            change_json: serde_json::to_vec(&change).expect("serialises"),
+        })
+        .await?
+        .into_inner();
+    let d: serde_json::Value = serde_json::from_slice(&r.dry_run_json)
+        .map_err(|e| tonic::Status::internal(format!("the dry run: {e}")))?;
+    Ok(Json(d).into_response())
 }
 
 #[derive(Deserialize)]

@@ -744,72 +744,20 @@ pub(crate) async fn mark_lost(api: &ApiService, node: &str) -> Result<(), Status
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let mut status: VolumeStatus =
-                serde_json::from_value(o.status.clone()).unwrap_or_default();
-            if spec.access() != legion_api::volume::Access::Local || !status.lost.is_empty() {
+            let status: VolumeStatus = serde_json::from_value(o.status.clone()).unwrap_or_default();
+            let exists = |n: &str| {
+                api.store
+                    .get(&ObjectKey::new(Kind::Node, "", n))
+                    .is_ok_and(|n| n.is_some())
+            };
+            let Some((status, fate)) = on_removal(&spec, &status, node, exists) else {
                 continue;
-            }
-            let held = status.node == node
-                || (status.node.is_empty() && spec.node.as_deref() == Some(node));
-            // A full copy made elsewhere carries on: the move's planner takes
-            // it for the Volume once the node is gone.
-            let copied = status.migration.as_ref().is_some_and(|m| {
-                m.to != node
-                    && matches!(
-                        m.phase,
-                        legion_api::volume::MigrationPhase::Copied
-                            | legion_api::volume::MigrationPhase::Finishing
-                    )
-            });
-            let held = held && !copied;
-            // A copy of the node's data taken on a node still there.
-            let replica = status
-                .replica
-                .clone()
-                .filter(|r| held && !r.snapshot.is_empty() && r.from == node && r.node != node)
-                .filter(|r| {
-                    api.store
-                        .get(&ObjectKey::new(Kind::Node, "", &r.node))
-                        .is_ok_and(|n| n.is_some())
-                });
-            let mut promoted = None;
-            if !held {
-                let mut changed = false;
-                // A copy it moved away from is gone with the node too.
-                if status.leftovers.iter().any(|n| n == node) {
-                    status.leftovers.retain(|n| n != node);
-                    changed = true;
-                }
-                // So is a replica kept there: another is made elsewhere.
-                if status.replica.as_ref().is_some_and(|r| r.node == node) {
-                    status.replica = None;
-                    changed = true;
-                }
-                if !changed {
-                    continue;
-                }
-            } else if let Some(r) = replica {
-                // The Volume carries on from its last copy, on that node.
-                let when = r
-                    .taken_ms
-                    .map(|ms| legion_api::clock::format(ms / 1000))
-                    .unwrap_or_default();
-                status.promoted = format!(
-                    "from the replica of {node}'s data on {}, taken {when}",
-                    r.node
-                );
-                status.node = r.node.clone();
-                status.dataset.clear();
-                status.migration = None;
-                status.replica = None;
-                status.leftovers.retain(|n| n != node && *n != r.node);
-                promoted = Some(r.node);
-            } else {
-                status.lost = node.to_owned();
-                status.node.clear();
-                status.migration = None;
-                status.leftovers.retain(|n| n != node);
-            }
+            };
+            let held = fate != Removal::Tidied;
+            let promoted = match fate {
+                Removal::Promoted(to) => Some(to),
+                _ => None,
+            };
             o.status = serde_json::to_value(&status).map_err(internal)?;
             let version = o.metadata.version;
             let key = o.key();
@@ -839,6 +787,87 @@ pub(crate) async fn mark_lost(api: &ApiService, node: &str) -> Result<(), Status
     Err(Status::aborted(format!(
         "the Volumes of node {node} kept changing; retry"
     )))
+}
+
+/// What removing `node` does to a Volume (`spec`, `status`), as
+/// [`mark_lost`] writes it: its status after, and how it fared; none if
+/// it is not touched. `exists` says whether a node is still there.
+pub(crate) fn on_removal(
+    spec: &VolumeSpec,
+    status: &VolumeStatus,
+    node: &str,
+    exists: impl Fn(&str) -> bool,
+) -> Option<(VolumeStatus, Removal)> {
+    let mut status = status.clone();
+    if spec.access() != legion_api::volume::Access::Local || !status.lost.is_empty() {
+        return None;
+    }
+    let held =
+        status.node == node || (status.node.is_empty() && spec.node.as_deref() == Some(node));
+    // A full copy made elsewhere carries on: the move's planner takes it
+    // for the Volume once the node is gone.
+    let copied = status.migration.as_ref().is_some_and(|m| {
+        m.to != node
+            && matches!(
+                m.phase,
+                legion_api::volume::MigrationPhase::Copied
+                    | legion_api::volume::MigrationPhase::Finishing
+            )
+    });
+    let held = held && !copied;
+    // A copy of the node's data taken on a node still there.
+    let replica = status
+        .replica
+        .clone()
+        .filter(|r| held && !r.snapshot.is_empty() && r.from == node && r.node != node)
+        .filter(|r| exists(&r.node));
+    if !held {
+        let mut changed = false;
+        // A copy it moved away from is gone with the node too.
+        if status.leftovers.iter().any(|n| n == node) {
+            status.leftovers.retain(|n| n != node);
+            changed = true;
+        }
+        // So is a replica kept there: another is made elsewhere.
+        if status.replica.as_ref().is_some_and(|r| r.node == node) {
+            status.replica = None;
+            changed = true;
+        }
+        return changed.then_some((status, Removal::Tidied));
+    }
+    if let Some(r) = replica {
+        // The Volume carries on from its last copy, on that node.
+        let when = r
+            .taken_ms
+            .map(|ms| legion_api::clock::format(ms / 1000))
+            .unwrap_or_default();
+        status.promoted = format!(
+            "from the replica of {node}'s data on {}, taken {when}",
+            r.node
+        );
+        status.node = r.node.clone();
+        status.dataset.clear();
+        status.migration = None;
+        status.replica = None;
+        status.leftovers.retain(|n| n != node && *n != r.node);
+        return Some((status, Removal::Promoted(r.node)));
+    }
+    status.lost = node.to_owned();
+    status.node.clear();
+    status.migration = None;
+    status.leftovers.retain(|n| n != node);
+    Some((status, Removal::Lost))
+}
+
+/// How a Volume fares as its node is removed ([`on_removal`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Removal {
+    /// Not its data's node: only what it kept there is forgotten.
+    Tidied,
+    /// It carries on from its replica, on this node.
+    Promoted(String),
+    /// Its data goes with the node.
+    Lost,
 }
 
 fn internal(e: impl std::fmt::Display) -> Status {

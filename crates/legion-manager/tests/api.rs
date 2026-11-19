@@ -6343,3 +6343,194 @@ async fn a_move_says_each_stage_and_refuses_a_cancel_past_its_switch_over() {
     assert_eq!(drain.by, "none");
     m.stop().await;
 }
+
+/// Asks the leader what `change` would do (`Cluster.DryRun`).
+async fn dry_run(
+    cluster: &mut ClusterClient<Channel>,
+    change: serde_json::Value,
+) -> Result<legion_api::dryrun::DryRun, tonic::Status> {
+    let r = cluster
+        .dry_run(legion_proto::v1::DryRunRequest {
+            change_json: change.to_string().into_bytes(),
+        })
+        .await?;
+    Ok(serde_json::from_slice(&r.into_inner().dry_run_json).unwrap())
+}
+
+/// Checks before disruption (CONSOLE.md phase 11): a drain that would
+/// strand a Volume, as `legion node drain` and the console ask first, is
+/// said to block, and why; nothing is changed by asking. With no
+/// controllers, so only the check runs the planner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dry_run_says_a_drain_would_strand_a_volume() {
+    use legion_api::dryrun::Severity;
+    use legion_api::{Kind, Object as Stored, ObjectKey};
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let config = ManagerConfig {
+        raft: Running::quick_raft(),
+        heartbeat: STEADY,
+        registry_loopback: true,
+        controllers: false,
+        name: manager_name(&addr),
+        ..ManagerConfig::new(dir.path(), &addr)
+    };
+    let m = Running::serve_config(dir, listener, config, None).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let put = |object: Stored| {
+        let raft = m.store.raft.clone();
+        async move {
+            raft.client_write(legion_store::Command::Put {
+                object,
+                precondition: legion_store::Precondition::None,
+            })
+            .await
+            .unwrap();
+        }
+    };
+    for (name, disk) in [("w1", "ssd"), ("w2", "hdd")] {
+        let mut node = Stored::new(Kind::Node, "", name, serde_json::json!({}));
+        node.metadata.labels.insert("disk".into(), disk.into());
+        node.status = serde_json::json!({ "state": "ready" });
+        put(node).await;
+    }
+    let mut objects = m.objects().await;
+    objects
+        .apply(apply(Object {
+            kind: "Service".into(),
+            namespace: "default".into(),
+            name: "db".into(),
+            spec_json: serde_json::json!({
+                "mode": "stateful",
+                "replicas": 1,
+                "placement": { "constraints": ["node.labels.disk == ssd"] },
+                "pod": {
+                    "containers": [{ "name": "db", "image": "pg:17" }],
+                    "volumes": [{ "name": "data", "claim": { "size": "1G" } }]
+                }
+            })
+            .to_string()
+            .into_bytes(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let mut volume = Stored::new(Kind::Volume, "default", "data-db-0", serde_json::json!({}));
+    volume
+        .metadata
+        .labels
+        .insert("legion.service".into(), "db".into());
+    volume.status = serde_json::json!({ "node": "w1" });
+    put(volume).await;
+
+    let mut cluster = m.cluster().await;
+    let d = dry_run(
+        &mut cluster,
+        serde_json::json!({ "change": "drain", "node": "w1" }),
+    )
+    .await
+    .unwrap();
+    assert!(d.blocks(), "{d:#?}");
+    let stranded = d
+        .findings
+        .iter()
+        .find(|f| f.reason == "stranded")
+        .unwrap_or_else(|| panic!("{d:#?}"));
+    assert_eq!(stranded.severity, Severity::Blocking);
+    assert_eq!(stranded.object, "Volume default/data-db-0");
+    assert_eq!(
+        stranded.message,
+        "stays on w1: no node takes it: 1 constraints"
+    );
+    assert!(
+        d.render()
+            .ends_with("refused (--force to go ahead anyway)."),
+        "{}",
+        d.render()
+    );
+    // Nothing was changed by asking.
+    let w1 = m
+        .store
+        .get(&ObjectKey::new(Kind::Node, "", "w1"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(w1.spec, serde_json::json!({}));
+
+    // The node w2, which nothing needs, drains freely.
+    let d = dry_run(
+        &mut cluster,
+        serde_json::json!({ "change": "drain", "node": "w2" }),
+    )
+    .await
+    .unwrap();
+    assert!(!d.blocks(), "{d:#?}");
+    // Removing w1, which is up, would lose the Volume's data.
+    let d = dry_run(
+        &mut cluster,
+        serde_json::json!({ "change": "remove-node", "node": "w1" }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        d.findings
+            .iter()
+            .any(|f| f.reason == "lost" && f.severity == Severity::Blocking),
+        "{d:#?}"
+    );
+    let e = dry_run(
+        &mut cluster,
+        serde_json::json!({ "change": "drain", "node": "w9" }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.code(), Code::NotFound, "{e}");
+    let e = dry_run(&mut cluster, serde_json::json!({ "change": "reboot" }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), Code::InvalidArgument, "{e}");
+    m.stop().await;
+}
+
+/// A dry run is asked by who may make the change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dry_run_is_for_who_may_make_the_change() {
+    let ca = Ca::generate().unwrap();
+    let m = Running::start_with(Some(&ca)).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let admin = m.objects().await;
+    let mut web = service("web", 1);
+    web.namespace = "a".into();
+    for req in [
+        apply(web),
+        binding("a", "alice", "view"),
+        binding("a", "bob", "edit"),
+    ] {
+        eventually(|| {
+            let mut admin = admin.clone();
+            let req = req.clone();
+            async move { admin.apply(req).await }
+        })
+        .await;
+    }
+    let user = |name: &str| {
+        let creds = creds(&ca, name, Role::User);
+        let m = &m;
+        async move { ClusterClient::new(m.channel(Some(&creds)).await.unwrap()) }
+    };
+    let delete_web =
+        serde_json::json!({ "change": "delete-service", "namespace": "a", "service": "web" });
+    let mut alice = user("alice").await;
+    denied(dry_run(&mut alice, delete_web.clone()).await);
+    let mut bob = user("bob").await;
+    denied(
+        dry_run(
+            &mut bob,
+            serde_json::json!({ "change": "drain", "node": "n1" }),
+        )
+        .await,
+    );
+    let d = dry_run(&mut bob, delete_web).await.unwrap();
+    assert!(!d.blocks(), "{d:#?}");
+    m.stop().await;
+}

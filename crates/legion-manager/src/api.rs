@@ -1831,6 +1831,84 @@ impl Cluster for ApiService {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
+    async fn dry_run(
+        &self,
+        req: Request<pb::DryRunRequest>,
+    ) -> Result<Response<pb::DryRunResponse>, Status> {
+        use legion_api::dryrun::Change;
+        let caller = self.caller(&req)?;
+        let change: Change = serde_json::from_slice(&req.get_ref().change_json)
+            .map_err(|e| Status::invalid_argument(format!("the change: {e}")))?;
+        // Asked by who may make the change.
+        match &change {
+            Change::Drain { .. } | Change::RemoveNode { .. } => {
+                caller.check(&self.store, Verb::Write, Kind::Node, "")?
+            }
+            Change::MoveVolume { namespace, .. } => {
+                check_namespace(namespace)?;
+                caller.check(&self.store, Verb::Write, Kind::Volume, namespace)?
+            }
+            Change::DeleteService { namespace, .. } => {
+                check_namespace(namespace)?;
+                caller.check(&self.store, Verb::Write, Kind::Service, namespace)?
+            }
+        }
+        // The leader hears what the nodes' pools and datasets hold.
+        if let Some(addr) = self.leader_addr(&req)? {
+            let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                &addr,
+                self.peer_tls.as_ref(),
+            ));
+            return c.dry_run(forwarded_for(req.into_inner(), &caller)?).await;
+        }
+        self.consistent().await?;
+        let cluster = crate::controller::read_cluster(&self.store).map_err(internal)?;
+        let facts = crate::controller::plan::dryrun::Facts {
+            used: self
+                .usage
+                .volume_space()
+                .into_iter()
+                .map(|(k, (used, _))| (k, used))
+                .collect(),
+            free: self
+                .usage
+                .fresh_nodes()
+                .into_iter()
+                .map(|(n, t)| (n, t.zfs_avail_bytes))
+                .filter(|(_, free)| *free > 0)
+                .collect(),
+        };
+        let now = tokio::time::Instant::now();
+        let asked = change.clone();
+        let done = tokio::task::spawn_blocking(move || {
+            crate::controller::plan::dryrun::dry_run(cluster, &asked, &facts, now)
+        })
+        .await
+        .map_err(internal)?;
+        use crate::controller::plan::dryrun::Refused;
+        let mut d = match done {
+            Ok(d) => d,
+            Err(Refused::NotFound(m)) => return Err(Status::not_found(m)),
+            Err(Refused::Invalid(m)) => return Err(Status::invalid_argument(m)),
+        };
+        // Each as its object may be read; the rest counted.
+        let readable = |object: &str, namespace: &str| {
+            let kind = object.split(' ').next().unwrap_or("");
+            match kind.parse::<Kind>() {
+                Ok(kind) => caller.may(&self.store, Verb::Read, kind, namespace),
+                Err(_) => true,
+            }
+        };
+        let before = d.findings.len() + d.moves.len();
+        d.findings.retain(|f| readable(&f.object, &f.namespace));
+        d.moves
+            .retain(|m| caller.may(&self.store, Verb::Read, Kind::Volume, &m.namespace));
+        d.hidden = u32::try_from(before - d.findings.len() - d.moves.len()).unwrap_or(u32::MAX);
+        Ok(Response::new(pb::DryRunResponse {
+            dry_run_json: serde_json::to_vec(&d).expect("serialises"),
+        }))
+    }
+
     type ActivityStream = ReceiverStream<Result<pb::ActivityResponse, Status>>;
 
     async fn activity(

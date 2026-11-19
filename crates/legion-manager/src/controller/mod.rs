@@ -11,6 +11,7 @@
 pub mod plan;
 #[cfg(test)]
 mod plan_tests;
+pub(crate) mod simulate;
 
 use std::time::Duration;
 
@@ -262,6 +263,19 @@ fn read(store: &Store) -> Result<State, legion_store::Error> {
         namespaces.security.insert(o.metadata.name, spec.security);
     }
     Ok((services, jobs, tasks, nodes, volumes, namespaces))
+}
+
+/// The cluster as the controller reads it, for a dry run.
+pub(crate) fn read_cluster(store: &Store) -> Result<plan::dryrun::Cluster, legion_store::Error> {
+    let (services, jobs, tasks, nodes, volumes, namespaces) = read(store)?;
+    Ok(plan::dryrun::Cluster {
+        services,
+        jobs,
+        tasks,
+        nodes,
+        volumes,
+        namespaces,
+    })
 }
 
 fn status_of<T: serde::de::DeserializeOwned + Default>(o: &Object) -> T {

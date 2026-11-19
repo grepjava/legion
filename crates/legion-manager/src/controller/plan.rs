@@ -26,6 +26,7 @@ use tokio::time::Instant;
 
 mod autoscale;
 mod drain;
+pub mod dryrun;
 mod jobs;
 mod migrate;
 pub use jobs::{CronJob, Job, Jobs};

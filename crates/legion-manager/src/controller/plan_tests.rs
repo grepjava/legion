@@ -12,47 +12,31 @@ use legion_api::task::{DesiredState, TaskState, TaskStatus};
 use legion_api::{Kind, Object, Spec};
 use tokio::time::Instant;
 
-use super::plan::{
-    Action, CronJob, HISTORY, Job, Jobs, Memory, Namespaces, Node, Service, Task, Volume, Volumes,
-    plan,
-};
+use super::plan::{Action, CronJob, HISTORY, Job, Memory, Node, Service, Task, Volume};
+use super::simulate::Sim;
 
-struct World {
-    services: Vec<Service>,
-    jobs: Jobs,
-    tasks: Vec<Task>,
-    nodes: Vec<Node>,
-    volumes: Volumes,
-    namespaces: Namespaces,
-    index: u64,
-    memory: Memory,
-    now: Instant,
-    /// Agents run what they are given; off to watch tasks stay pending.
-    agents: bool,
+/// The simulated cluster ([`Sim`]), with the checks the tests hold the
+/// planner to: none of its writes is one the store would refuse.
+struct World(Sim);
+
+impl std::ops::Deref for World {
+    type Target = Sim;
+    fn deref(&self) -> &Sim {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for World {
+    fn deref_mut(&mut self) -> &mut Sim {
+        &mut self.0
+    }
 }
 
 impl World {
     fn new() -> Self {
-        World {
-            services: vec![],
-            jobs: Jobs {
-                wall: legion_api::clock::parse("2026-10-28T09:31:00Z").unwrap(),
-                ..Default::default()
-            },
-            tasks: vec![],
-            nodes: vec![],
-            volumes: Volumes::new(),
-            namespaces: Namespaces::default(),
-            index: 0,
-            memory: Memory::default(),
-            now: Instant::now(),
-            agents: true,
-        }
-    }
-
-    fn next(&mut self) -> u64 {
-        self.index += 1;
-        self.index
+        let mut sim = Sim::new(Instant::now());
+        sim.jobs.wall = legion_api::clock::parse("2026-10-28T09:31:00Z").unwrap();
+        World(sim)
     }
 
     fn node(&mut self, name: &str, labels: &[(&str, &str)]) {
@@ -231,24 +215,7 @@ impl World {
 
     /// The leader's migrator, done with each migration's current phase.
     fn migrate(&mut self) {
-        use legion_api::volume::MigrationPhase;
-        for v in self.volumes.values_mut() {
-            let Some(m) = &mut v.status.migration else {
-                continue;
-            };
-            match m.phase {
-                MigrationPhase::Copying => m.phase = MigrationPhase::Copied,
-                MigrationPhase::Finishing => {
-                    v.status.node = m.to.clone();
-                    v.status.dataset.clear();
-                    v.status.migration = None;
-                }
-                MigrationPhase::Copied => continue,
-            }
-            v.object.status = serde_json::to_value(&v.status).unwrap();
-            self.index += 1;
-            v.object.metadata.version = self.index;
-        }
+        self.0.migrate();
     }
 
     /// The migration of a Volume: its node and phase.
@@ -259,16 +226,7 @@ impl World {
 
     /// One pass, and the agents acting on it.
     fn step(&mut self) {
-        let p = plan(
-            &self.services,
-            &self.jobs,
-            &self.tasks,
-            &self.nodes,
-            &self.volumes,
-            &self.namespaces,
-            &mut self.memory,
-            self.now,
-        );
+        let p = self.plan();
         self.apply(p.actions);
         self.agents();
     }
@@ -312,200 +270,20 @@ impl World {
     }
 
     fn apply(&mut self, actions: Vec<Action>) {
-        for a in actions {
-            let index = self.next();
-            match a {
-                Action::Create(mut o) if o.kind == Kind::Job => {
-                    assert!(
-                        !self.jobs.jobs.iter().any(|j| j.object.key() == o.key()),
-                        "duplicate job {}",
-                        o.key()
-                    );
-                    o.metadata.uid = format!("{index:016x}");
-                    o.metadata.version = index;
-                    o.metadata.generation = 1;
-                    self.jobs.jobs.push(Job {
-                        spec: legion_api::parse(&o.spec).unwrap(),
-                        status: Default::default(),
-                        covered: false,
-                        object: o,
-                    });
-                }
-                Action::Create(mut o) if o.kind == Kind::Volume => {
-                    let key = (o.metadata.namespace.clone(), o.metadata.name.clone());
-                    assert!(!self.volumes.contains_key(&key), "duplicate volume {key:?}");
-                    o.metadata.uid = format!("{index:016x}");
-                    o.metadata.version = index;
-                    self.volumes.insert(
-                        key,
-                        Volume {
-                            spec: legion_api::parse(&o.spec).unwrap(),
-                            status: Default::default(),
-                            object: o,
-                        },
-                    );
-                }
-                Action::Create(mut o) => {
-                    assert_eq!(o.kind, Kind::Task);
-                    assert!(
-                        !self.tasks.iter().any(|t| t.object.key() == o.key()),
-                        "duplicate task {}",
-                        o.key()
-                    );
-                    o.metadata.uid = format!("{index:016x}");
-                    o.metadata.version = index;
-                    o.metadata.generation = 1;
-                    self.tasks.push(task(o));
-                }
-                Action::Update(mut o, version) => {
-                    o.metadata.version = index;
-                    match o.kind {
-                        Kind::Task => {
-                            let Some(t) = self.tasks.iter_mut().find(|t| t.object.key() == o.key())
-                            else {
-                                continue;
-                            };
-                            if t.object.metadata.version != version {
-                                continue; // conflict: the next pass retries
-                            }
-                            *t = task(o);
-                        }
-                        Kind::Service => {
-                            let s = self
-                                .services
-                                .iter_mut()
-                                .find(|s| s.object.key() == o.key())
-                                .unwrap();
-                            if s.object.metadata.version == version {
-                                // As the store: a new spec is a new generation.
-                                if o.spec != s.object.spec {
-                                    o.metadata.generation += 1;
-                                    s.spec = legion_api::parse(&o.spec).unwrap();
-                                }
-                                s.object = o;
-                            }
-                        }
-                        Kind::Job => {
-                            let j = self
-                                .jobs
-                                .jobs
-                                .iter_mut()
-                                .find(|j| j.object.key() == o.key())
-                                .unwrap();
-                            if j.object.metadata.version == version {
-                                assert_eq!(o.spec, j.object.spec, "only the status changes");
-                                j.status = serde_json::from_value(o.status.clone()).unwrap();
-                                j.object = o;
-                            }
-                        }
-                        Kind::Volume => {
-                            let key = (o.metadata.namespace.clone(), o.metadata.name.clone());
-                            let v = self.volumes.get_mut(&key).unwrap();
-                            if v.object.metadata.version == version {
-                                v.spec = legion_api::parse(&o.spec).unwrap();
-                                v.status =
-                                    serde_json::from_value(o.status.clone()).unwrap_or_default();
-                                v.object = o;
-                            }
-                        }
-                        Kind::CronJob => {
-                            let c = self
-                                .jobs
-                                .cron_jobs
-                                .iter_mut()
-                                .find(|c| c.object.key() == o.key())
-                                .unwrap();
-                            if c.object.metadata.version == version {
-                                assert_eq!(o.spec, c.object.spec, "only the status changes");
-                                c.status = serde_json::from_value(o.status.clone()).unwrap();
-                                c.object = o;
-                            }
-                        }
-                        Kind::Node => {
-                            let n = self
-                                .nodes
-                                .iter_mut()
-                                .find(|n| n.object.key() == o.key())
-                                .unwrap();
-                            if n.object.metadata.version == version {
-                                assert_eq!(o.spec, n.object.spec, "only the status changes");
-                                n.status = serde_json::from_value(o.status.clone()).unwrap();
-                                n.object = o;
-                            }
-                        }
-                        k => panic!("unexpected update of {k}"),
-                    }
-                }
-                Action::Delete(key, version) => {
-                    self.tasks
-                        .retain(|t| t.object.key() != key || t.object.metadata.version != version);
-                    self.jobs
-                        .jobs
-                        .retain(|j| j.object.key() != key || j.object.metadata.version != version);
-                }
-            }
-        }
+        self.0.apply(actions);
+        assert!(self.faults.is_empty(), "{:?}", self.faults);
     }
 
     /// Agents: assigned tasks start; stopping tasks stop. A node that is
     /// down does neither, and pending tasks are not sent to agents.
     fn agents(&mut self) -> bool {
-        if !self.agents {
-            return false;
-        }
-        let mut changed = false;
-        for i in 0..self.tasks.len() {
-            let t = &self.tasks[i];
-            let up = self.nodes.iter().any(|n| {
-                n.object.metadata.name == t.spec.node && n.status.state != NodeState::Down
-            });
-            if !up || t.status.state.is_terminal() || t.status.state == TaskState::Pending {
-                continue;
-            }
-            let next = match t.spec.desired_state {
-                DesiredState::Running if t.status.state != TaskState::Running => TaskState::Running,
-                DesiredState::Shutdown => TaskState::Shutdown,
-                _ => continue,
-            };
-            // A task's first start claims its volumes for its node.
-            if next == TaskState::Running {
-                let (ns, node) = (t.object.metadata.namespace.clone(), t.spec.node.clone());
-                for name in t.spec.volumes() {
-                    if let Some(v) = self.volumes.get_mut(&(ns.clone(), name))
-                        && v.status.node.is_empty()
-                    {
-                        v.status.node = node.clone();
-                        v.object.status = serde_json::to_value(&v.status).unwrap();
-                    }
-                }
-            }
-            let version = self.next();
-            let t = &mut self.tasks[i];
-            t.status = TaskStatus {
-                state: next,
-                ready: next == TaskState::Running,
-                ..Default::default()
-            };
-            t.object.status = serde_json::to_value(&t.status).unwrap();
-            t.object.metadata.version = version;
-            changed = true;
-        }
-        changed
+        self.0.run_agents()
     }
 
     /// Plans and applies until nothing changes; returns the passes taken.
     fn settle(&mut self) -> usize {
         for pass in 1..100 {
-            let p = plan(
-                &self.services,
-                &self.jobs,
-                &self.tasks,
-                &self.nodes,
-                &self.volumes,
-                &self.namespaces,
-                &mut self.memory,
-                self.now,
-            );
+            let p = self.plan();
             let acted = !p.actions.is_empty();
             self.apply(p.actions);
             if !self.agents() && !acted {
@@ -532,17 +310,7 @@ impl World {
     }
 
     fn wake(&mut self) -> Option<Instant> {
-        plan(
-            &self.services,
-            &self.jobs,
-            &self.tasks,
-            &self.nodes,
-            &self.volumes,
-            &self.namespaces,
-            &mut self.memory,
-            self.now,
-        )
-        .wake
+        self.plan().wake
     }
 
     /// `name state node` of every task, sorted.
@@ -948,14 +716,6 @@ fn rollback_by_hand() {
     assert_eq!(w.update("web").0, "rolled-back");
 }
 
-fn task(o: Object) -> Task {
-    Task {
-        spec: legion_api::parse(&o.spec).unwrap(),
-        status: serde_json::from_value(o.status.clone()).unwrap_or_default(),
-        object: o,
-    }
-}
-
 const POD: &str = "pod: { containers: [{ name: web, image: \"web:1\" }] }";
 
 #[test]
@@ -1125,16 +885,7 @@ fn rolling_update_stop_first() {
         "replicas: 3\npod: { containers: [{ name: web, image: \"web:2\" }] }",
     );
     // One slot at a time: the first pass stops one old task only.
-    let p = plan(
-        &w.services,
-        &w.jobs,
-        &w.tasks,
-        &w.nodes,
-        &w.volumes,
-        &w.namespaces,
-        &mut w.memory,
-        w.now,
-    );
+    let p = w.plan();
     let stops = p
         .actions
         .iter()
@@ -1166,16 +917,7 @@ fn rolling_update_start_first() {
     w.settle();
     w.agents = false;
     w.service("web", "replicas: 1\npod: { containers: [{ name: web, image: \"web:2\" }] }\nupdate: { order: start-first }");
-    let p = plan(
-        &w.services,
-        &w.jobs,
-        &w.tasks,
-        &w.nodes,
-        &w.volumes,
-        &w.namespaces,
-        &mut w.memory,
-        w.now,
-    );
+    let p = w.plan();
     w.apply(p.actions);
     // The new task exists while the old one still runs.
     assert_eq!(w.tasks(), ["web-1-1 running n1", "web-1-2 assigned n1"]);
@@ -2747,16 +2489,7 @@ impl World {
     fn ready_per_pass(&mut self, service: &str) -> Vec<usize> {
         let mut seen = Vec::new();
         for _ in 1..100 {
-            let p = plan(
-                &self.services,
-                &self.jobs,
-                &self.tasks,
-                &self.nodes,
-                &self.volumes,
-                &self.namespaces,
-                &mut self.memory,
-                self.now,
-            );
+            let p = self.plan();
             let acted = !p.actions.is_empty();
             self.apply(p.actions);
             seen.push(
@@ -2844,16 +2577,7 @@ fn a_budget_spent_elsewhere_drains_start_first() {
     w.agents = false;
     w.fail(&name);
     w.availability("n1", Availability::Drain);
-    let p = plan(
-        &w.services,
-        &w.jobs,
-        &w.tasks,
-        &w.nodes,
-        &w.volumes,
-        &w.namespaces,
-        &mut w.memory,
-        w.now,
-    );
+    let p = w.plan();
     w.apply(p.actions);
     let on_n1: Vec<String> = w
         .tasks
@@ -3675,16 +3399,7 @@ pod:
         t.object.spec = serde_json::to_value(&t.spec).unwrap();
     }
     w.report("web", 10.0, 50 << 20);
-    let p = plan(
-        &w.services,
-        &w.jobs,
-        &w.tasks,
-        &w.nodes,
-        &w.volumes,
-        &w.namespaces,
-        &mut w.memory,
-        w.now,
-    );
+    let p = w.plan();
     w.apply(p.actions);
     let a = w.scaled("web");
     assert_eq!(a.memory, Some(50));
@@ -4266,16 +3981,7 @@ fn going_forward_again_during_a_rollback_is_a_new_update() {
 /// One pass whose write of the CronJob's status is lost, as a version
 /// conflict loses it; the rest goes in.
 fn pass_losing_cron_status(w: &mut World) {
-    let p = plan(
-        &w.services,
-        &w.jobs,
-        &w.tasks,
-        &w.nodes,
-        &w.volumes,
-        &w.namespaces,
-        &mut w.memory,
-        w.now,
-    );
+    let p = w.plan();
     let actions = p
         .actions
         .into_iter()
@@ -4947,16 +4653,7 @@ impl World {
     /// took and how many actions it planned.
     fn timed_pass(&mut self) -> (std::time::Duration, usize) {
         let started = std::time::Instant::now();
-        let p = plan(
-            &self.services,
-            &self.jobs,
-            &self.tasks,
-            &self.nodes,
-            &self.volumes,
-            &self.namespaces,
-            &mut self.memory,
-            self.now,
-        );
+        let p = self.plan();
         (started.elapsed(), p.actions.len())
     }
 }
@@ -5313,3 +5010,6 @@ fn automatic_failover_needs_pods_that_stop_when_cut_off() {
             .unwrap();
     spec.admit().unwrap();
 }
+
+#[path = "dryrun_tests.rs"]
+mod dryrun_tests;
