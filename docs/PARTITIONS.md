@@ -253,7 +253,8 @@ may still be heard from (ready or suspect), and needs a copy of that
 node's data on a node ready and active; `status.promoted` names who did
 it. Until then the volume says what it is waiting for: its replica's
 `state` (`pending`, `ready`, `stale` once the last copy is three intervals
-old, `failed`), the copy under way, its last ten copies, and, for
+old, whatever the attempts since, `failed` while attempts fail before
+that; the message says why they do), the copy under way, its last ten copies, and, for
 `failover: automatic`, `blocked` with each reason it would not fail over
 now (a task that runs on when cut off, no copy of this node's data yet,
 the replica's node not ready and active). A stale replica raises the

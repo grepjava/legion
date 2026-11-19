@@ -164,14 +164,16 @@ pub(crate) fn step(
             Some(n) => format!("{n} is still dropping an old copy"),
             None => "no other node may keep it".to_owned(),
         };
+        // Failed, or stale once its last copy is too old.
+        let mut next = ReplicaStatus {
+            message: why,
+            ..current.cloned().unwrap_or_default()
+        };
+        next.state = next.settled(want.every(), now_ms);
         return match current {
-            Some(r) if r.message == why && r.state == ReplicaState::Failed => Step::Nothing,
+            Some(r) if r.message == next.message && r.state == next.state => Step::Nothing,
             _ => Step::Write(Box::new(VolumeStatus {
-                replica: Some(ReplicaStatus {
-                    message: why,
-                    state: ReplicaState::Failed,
-                    ..current.cloned().unwrap_or_default()
-                }),
+                replica: Some(next),
                 ..status.clone()
             })),
         };
@@ -361,7 +363,11 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>) {
                     update(store, &key, |s| match &mut s.replica {
                         Some(now) if now.node == taken.node => {
                             now.message = why.clone();
-                            now.state = ReplicaState::Failed;
+                            // Stale stays stale: only a copy makes it
+                            // fresh again (ReplicaStatus::settled).
+                            if now.state != ReplicaState::Stale {
+                                now.state = ReplicaState::Failed;
+                            }
                             now.copying_ms = None;
                             now.record(attempt.clone());
                             if full_needed {
@@ -728,13 +734,19 @@ mod tests {
             step(&spec(None), &next, &nodes, late + 2, true, &[]),
             Step::Nothing
         );
-        // A failed attempt is failed whatever the age.
+        // A failed attempt is failed while the copy is fresh, and stale
+        // once it is not, as the replica-stale alert says.
         let mut failed = (*next).clone();
         failed.replica.as_mut().unwrap().message = "node n2: refused".into();
+        failed.replica.as_mut().unwrap().state = ReplicaState::Ready;
         let Step::Write(f) = step(&spec(None), &failed, &nodes, 2000, true, &[]) else {
             panic!()
         };
         assert_eq!(f.replica.as_ref().unwrap().state, ReplicaState::Failed);
+        let Step::Write(f) = step(&spec(None), &f, &nodes, late + 1, true, &[]) else {
+            panic!()
+        };
+        assert_eq!(f.replica.as_ref().unwrap().state, ReplicaState::Stale);
     }
 
     #[test]

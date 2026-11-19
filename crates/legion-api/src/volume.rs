@@ -149,9 +149,12 @@ pub enum ReplicaState {
     Pending,
     /// A copy at most [`ReplicaStatus::STALE_AFTER`] intervals old.
     Ready,
-    /// The last copy older than that.
+    /// The last copy older than that, whether or not the attempts since
+    /// failed (the message says why they did): what a copy is worth comes
+    /// first.
     Stale,
-    /// The last attempt failed, or there is nowhere to keep it.
+    /// The last attempt failed, or there is nowhere to keep it, while the
+    /// last copy, if any, is not yet stale.
     Failed,
 }
 
@@ -183,16 +186,17 @@ impl ReplicaStatus {
         !self.snapshot.is_empty() && self.taken_ms.is_none_or(|t| now_ms - t > limit)
     }
 
-    /// What the replica amounts to at `now_ms`: failed while the last
-    /// attempt did, else pending until the first copy, stale once that is
-    /// too old, ready otherwise.
+    /// What the replica amounts to at `now_ms`: stale once the last copy
+    /// is too old, as the replica-stale alert says, whatever the attempts
+    /// since; else failed while the last attempt did; else pending until
+    /// the first copy, ready after it.
     pub fn settled(&self, every: std::time::Duration, now_ms: i64) -> ReplicaState {
-        if !self.message.is_empty() {
+        if self.stale_at(every, now_ms) {
+            ReplicaState::Stale
+        } else if !self.message.is_empty() {
             ReplicaState::Failed
         } else if self.snapshot.is_empty() {
             ReplicaState::Pending
-        } else if self.stale_at(every, now_ms) {
-            ReplicaState::Stale
         } else {
             ReplicaState::Ready
         }
@@ -873,5 +877,11 @@ mod tests {
         assert_eq!(r.settled(every, 31_001), ReplicaState::Stale);
         r.message = "node n2: refused".into();
         assert_eq!(r.settled(every, 2000), ReplicaState::Failed);
+        // Too old, it is stale though its attempts fail: as the alert says.
+        assert_eq!(r.settled(every, 31_001), ReplicaState::Stale);
+        // Failing before any copy: failed, never stale.
+        r.snapshot.clear();
+        r.taken_ms = None;
+        assert_eq!(r.settled(every, i64::MAX), ReplicaState::Failed);
     }
 }
