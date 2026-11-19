@@ -886,6 +886,38 @@ it asks for it.
 **Done when** a drain that would strand a Volume is refused in the
 dialog and from the CLI alike.
 
+**Built so far** (2026-11-19). `legion_api::dryrun`: a change (a drain,
+a Volume's move, a node's removal, a Service's deletion) and what it
+would do: the Volumes that move, from where to where and their sizes,
+how many tasks it stops, and each finding as blocking or warning with a
+stable reason. The leader works it out (`Cluster.DryRun`, the console's
+`/api/dry-run`) by running the controller over two copies of the
+cluster in memory, as it is and with the change, each until it settles:
+the planner, the store's writes, agents starting and stopping tasks and
+the migrator finishing each phase of a move (`controller::simulate`,
+which the planner's tests now drive too), then compares them. It blocks
+on work no node would take (`unplaced`), a Volume left behind with why
+no node takes it (`stranded`), a move held on its way and the tasks
+holding it (`held`, `stays`), data lost with its node still up (`lost`),
+no room on the pool data moves to (`no-room`), and a cancel past the
+switch-over (`switch-over`); what `maxUnavailable` holds back, a
+replica carried on from, the Volumes a deletion keeps, a node that is
+unreachable or not in the cluster are warnings. Sizes come from the
+leader's usage data and free space from each node's pool. It is asked
+by who may make the change and shows only what the caller may read,
+counting the rest. `legion node drain`, `volume move` and `delete` of a
+node or Service ask first and refuse what blocks unless `--force`;
+`--dry-run` prints it and exits 1 if anything blocks; `legion top`
+checks the same. The console's confirmation of those (one or many, and
+a stack's removal) shows the check and cannot be confirmed while it
+runs, fails or blocks. The console test passed at efdd8f4: the drain of
+keeper's node said "Volume team-a/data-keeper-0: stays on n2: no node
+takes it" and held, the CLI refused it alike and n2 stayed active. The
+drain test passed at 96b29cf: with nowhere to go its drain was refused;
+with room, its budget of 0 holds the move, which the dry run says with
+the size ("Volume data/pg-db-0 moves from n2 to n3 (91.5 MiB)", held,
+its task staying), so it drains with `--force`.
+
 ### Phase 12: history and the rest
 
 - What tasks used kept 30 days (a sample a minute for a day, then one
