@@ -182,6 +182,11 @@ service Cluster {
   // changes. Each as the caller may read its target; who asked, for the
   // cluster admin only.
   rpc Activity(ActivityRequest) returns (stream ActivityResponse);
+  // What a drain, a Volume's move, a node's removal or a Service's
+  // deletion would do, worked out by the leader over a copy of the cluster
+  // (legion_api::dryrun); nothing is changed. Asked as the change itself
+  // would be: by who may make it.
+  rpc DryRun(DryRunRequest) returns (DryRunResponse);
   // Sends a test through an AlertReceiver now, as it sends alerts, and
   // says whether it was taken: for whoever may write receivers.
   rpc TestAlertReceiver(TestAlertReceiverRequest) returns (TestAlertReceiverResponse);
@@ -522,6 +527,16 @@ message ReachResponse {
   repeated string services = 1;
   // One per source and destination that it may reach on some port.
   repeated ReachEdge edges = 2;
+}
+
+message DryRunRequest {
+  // A legion_api::dryrun::Change as JSON.
+  bytes change_json = 1;
+}
+
+message DryRunResponse {
+  // A legion_api::dryrun::DryRun as JSON.
+  bytes dry_run_json = 1;
 }
 
 message ActivityRequest {
