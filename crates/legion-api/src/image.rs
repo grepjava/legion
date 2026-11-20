@@ -47,6 +47,11 @@ pub struct ImageStatus {
     /// What a policy in `warn` mode found wrong; the pod runs regardless.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub warning: String,
+    /// Each reference as written whose tag names another image now than
+    /// the one its tasks run, and the digest it names: the tag moved since
+    /// the rollout (CONSOLE.md, phase 12). A restart runs it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub moved: BTreeMap<String, String>,
 }
 
 /// A good signature on an image: the digest it signs and the key's
