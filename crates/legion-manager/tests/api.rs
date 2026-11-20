@@ -4016,6 +4016,19 @@ async fn a_deployment_runs_what_its_tags_named_then() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    // Its tag names another image than the one it runs now: said on its
+    // status, the first time a minute after the manager leads.
+    let moved = || m.store.get(&key).unwrap().unwrap().status["images"]["moved"][&image].clone();
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while moved() != serde_json::json!(d2) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tag moved since the rollout: {}",
+            m.store.get(&key).unwrap().unwrap().status["images"]
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
     let status = m.store.get(&key).unwrap().unwrap().status.to_string();
     assert!(!status.contains("hunter2"), "{status}");
     for t in m.store.list(Kind::Task, None).unwrap().objects {

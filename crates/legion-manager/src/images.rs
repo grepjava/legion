@@ -28,6 +28,9 @@ use crate::controller::plan::Action;
 
 /// How long a pod that couldn't be resolved waits before it is tried again.
 const RETRY: Duration = Duration::from_secs(30);
+/// How often the leader asks again what each Service's tags name, to say
+/// which moved since its rollout; the first time a minute after it leads.
+const MOVED: Duration = Duration::from_secs(5 * 60);
 const DEBOUNCE: Duration = Duration::from_millis(50);
 
 /// What asks registries what a reference names: a registry client, or a
@@ -330,12 +333,17 @@ pub async fn run(
 
 async fn lead<R: Registry>(store: &Store, registry: &R) {
     let mut failed = BTreeMap::new();
+    let mut moved_at = Instant::now() + Duration::from_secs(60) - MOVED;
     loop {
         let Ok(from) = store.applied_version() else {
             tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         };
         pass(store, registry, &mut failed).await;
+        if moved_at.elapsed() >= MOVED {
+            moved(store, registry).await;
+            moved_at = Instant::now();
+        }
         let Ok(mut watcher) = store.watch(from, None) else {
             continue;
         };
@@ -400,6 +408,70 @@ fn logins(store: &Store, namespace: &str, pod: &PodSpec) -> Result<Vec<Login>, S
         out.extend(docker_config(&value).map_err(|e| format!("secret {name}: {e}"))?);
     }
     Ok(out)
+}
+
+/// Says on each Service run from a tag whether the tag names another image
+/// now (`status.images.moved`): asked again of the registry, against the
+/// digest its tasks run. A tag the registry can't be asked about keeps
+/// what was said of it. Written only when that changes.
+pub async fn moved<R: Registry>(store: &Store, registry: &R) {
+    let services = match store.list(Kind::Service, None) {
+        Ok(list) => list.objects,
+        Err(e) => {
+            tracing::warn!("image resolver: reading the store: {e}");
+            return;
+        }
+    };
+    for o in services {
+        let Some(pod) = pod_of(Kind::Service, &o) else {
+            continue;
+        };
+        let Some(current) = o
+            .status
+            .get("images")
+            .and_then(|v| serde_json::from_value::<ImageStatus>(v.clone()).ok())
+        else {
+            continue;
+        };
+        if !current.ready_for(&pod_hash(&pod)) || current.resolved.is_empty() {
+            continue;
+        }
+        let Ok(logins) = logins(store, &o.metadata.namespace, &pod) else {
+            continue;
+        };
+        let mut moved = BTreeMap::new();
+        for (written, runs) in &current.resolved {
+            let Ok(r) = Reference::parse(written) else {
+                continue;
+            };
+            match registry.digest(&r, &logins).await {
+                Ok(digest) if r.by_digest(&digest).to_string() != *runs => {
+                    moved.insert(written.clone(), digest);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(owner = %o.key(), "asking what {written} names: {e}");
+                    if let Some(said) = current.moved.get(written) {
+                        moved.insert(written.clone(), said.clone());
+                    }
+                }
+            }
+        }
+        if moved == current.moved {
+            continue;
+        }
+        let mut written = o.clone();
+        written.status["images"]["moved"] = serde_json::to_value(&moved).expect("serialises");
+        if moved.is_empty()
+            && let Some(images) = written.status["images"].as_object_mut()
+        {
+            images.remove("moved");
+        }
+        let version = o.metadata.version;
+        if let Err(e) = crate::controller::apply(store, Action::Update(written, version)).await {
+            tracing::debug!(owner = %o.key(), "image resolver write: {e}");
+        }
+    }
 }
 
 /// The images a Service ran before its update, when its pod is that one's
@@ -508,6 +580,7 @@ pub async fn pass<R: Registry>(
                 message: String::new(),
                 verified,
                 warning,
+                moved: BTreeMap::new(),
             },
             Err(message) => {
                 tracing::info!(owner = %key, "{message}");
