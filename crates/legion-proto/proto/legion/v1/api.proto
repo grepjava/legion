@@ -196,6 +196,9 @@ service Cluster {
   // Managers only: audit events a follower decided (the sessions it
   // serves), for the leader to keep with its own.
   rpc RecordAudit(RecordAuditRequest) returns (RecordAuditResponse);
+  // Managers only: the leader's samples of what tasks and nodes used,
+  // after a time, for a follower to keep too (the 30 days' history).
+  rpc UsageArchive(UsageArchiveRequest) returns (UsageArchiveResponse);
   // Who the caller is, and the role RoleBindings give them in each
   // namespace (`all` for the cluster admin, who has every right).
   rpc Me(MeRequest) returns (MeResponse);
@@ -420,6 +423,16 @@ message RecordAuditRequest {
 
 message RecordAuditResponse {}
 
+message UsageArchiveRequest {
+  // Milliseconds since the epoch: the samples after it.
+  int64 since_ms = 1;
+}
+
+message UsageArchiveResponse {
+  // The samples, oldest first, as JSON; a full batch means there are more.
+  bytes entries_json = 1;
+}
+
 message QuotasRequest {
   string namespace = 1;
 }
@@ -445,13 +458,17 @@ message UsageHistoryRequest {
   string namespace = 1;
   // Needs `namespace`.
   string task = 2;
+  // How far back, in milliseconds: up to an hour (or 0) is the leader's
+  // own samples, every 15 s; past that, from the 30 days kept, a sample a
+  // minute within a day and every 15 minutes beyond.
+  int64 range_ms = 3;
 }
 
 message UsageHistoryResponse {
   repeated TaskSeries tasks = 1;
   // Between samples, in milliseconds.
   int64 step_ms = 2;
-  // Node-level ZFS and network series over the last hour, for callers who
+  // Node-level ZFS and network series over the range, for callers who
   // may read nodes.
   repeated NodeSeries nodes = 3;
 }

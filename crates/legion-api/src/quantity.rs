@@ -134,7 +134,8 @@ impl FromStr for Duration {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, String> {
-        let bad = || format!("invalid duration {s:?}: expected for example `500ms`, `5s`, `1m30s`");
+        let bad =
+            || format!("invalid duration {s:?}: expected for example `500ms`, `5s`, `1m30s`, `7d`");
         if let Ok(secs) = s.parse::<u64>() {
             return secs.checked_mul(1000).map(Duration).ok_or_else(bad);
         }
@@ -158,6 +159,8 @@ impl FromStr for Duration {
                 (60_000, 1)
             } else if rest.starts_with('h') {
                 (3_600_000, 1)
+            } else if rest.starts_with('d') {
+                (86_400_000, 1)
             } else {
                 return Err(bad());
             };
@@ -294,6 +297,7 @@ mod tests {
         assert_eq!("5s".parse::<Duration>().unwrap(), Duration(5000));
         assert_eq!("1m30s".parse::<Duration>().unwrap(), Duration(90_000));
         assert_eq!("250ms".parse::<Duration>().unwrap(), Duration(250));
+        assert_eq!("7d".parse::<Duration>().unwrap(), Duration(7 * 86_400_000));
         assert_eq!("10".parse::<Duration>().unwrap(), Duration(10_000));
         assert!("".parse::<Duration>().is_err());
         assert!("5x".parse::<Duration>().is_err());
