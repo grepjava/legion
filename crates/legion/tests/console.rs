@@ -830,6 +830,41 @@ spec:
         png.display(),
         bytes.len()
     );
+    assert_eq!(
+        e.eval(
+            "[...document.querySelectorAll('figure.chart strong')].some((s) => s.innerText === 'Network throughput')"
+        ),
+        serde_json::json!(false),
+        "a Service's usage is its tasks', without the nodes' network"
+    );
+
+    step("feel: a node's network received and sent on one chart, sent dashed; its CSV has both");
+    c.page(&mut a, "/k/Node/_/n1?tab=usage");
+    let net = "(() => { const f = [...document.querySelectorAll('figure.chart')]
+                 .find((f) => f.querySelector('strong')?.innerText === 'Network throughput');
+               if (!f) return null;
+               const d = [...f.querySelectorAll('svg[role=img] path.line')]
+                 .map((p) => getComputedStyle(p).strokeDasharray);
+               return [d.length, d[0], d[1] !== undefined && d[1] !== 'none',
+                 f.querySelector('.key')?.innerText.replace(/\\s+/g, ' ').trim() ?? null]; })()";
+    a.until("n1's network as two lines", 120, |b| {
+        b.eval(net) == serde_json::json!([2, "none", true, "received sent"])
+    });
+    for f in std::fs::read_dir(&a.downloads)
+        .unwrap()
+        .filter_map(Result::ok)
+    {
+        let _ = std::fs::remove_file(f.path());
+    }
+    a.eval(
+        "document.querySelector('button[aria-label=\"Download Network throughput as CSV\"]').click()",
+    );
+    let csv = std::fs::read_to_string(a.downloaded(60)).unwrap();
+    assert!(
+        csv.starts_with("time,\"received\",\"sent\"\n") && csv.lines().count() > 2,
+        "the network's CSV has both series: {}",
+        csv.lines().take(3).collect::<Vec<_>>().join(" | ")
+    );
 
     step("phase 12: a note on hello in Markdown, on its page as elements; the viewer reads it");
     c.page(&mut e, "/k/Service/team-a/hello");
@@ -894,6 +929,7 @@ spec:
         "/k/Service/team-a/hello?tab=usage",
         "/k/Service/team-a/hello?tab=events",
         "/k/Node/_/n1",
+        "/k/Node/_/n1?tab=usage",
         "/plugins/team-a/services-at-a-glance",
     ] {
         c.page(&mut a, path);
