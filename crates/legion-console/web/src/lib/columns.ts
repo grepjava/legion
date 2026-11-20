@@ -90,13 +90,19 @@ export function columns(kind: string): Column[] {
         { label: t('Replicas'), value: (o) => s(o.spec?.replicas) },
         {
           label: t('Image'),
-          // A tag that names another image now than the one running says so.
+          // A tag that names another image now than the one running says
+          // so, and a Linux image (run through FreeBSD's Linux ABI) too.
           value: (o) =>
             s(
               o.spec?.pod?.containers
-                ?.map((c: { image: string }) =>
-                  o.status?.images?.moved?.[c.image] ? t('{image} (tag moved)', { image: c.image }) : c.image
-                )
+                ?.map((c: { image: string }) => {
+                  let shown = c.image;
+                  if (o.status?.linuxImages && c.image in o.status.linuxImages) {
+                    shown = t('{image} (Linux)', { image: shown });
+                  }
+                  if (o.status?.images?.moved?.[c.image]) shown = t('{image} (tag moved)', { image: shown });
+                  return shown;
+                })
                 .join(', ')
             )
         },

@@ -261,6 +261,29 @@
 
   {#if tab === 'details'}
     {#if kind !== 'Config' && kind !== 'Secret'}<Notes {kind} {namespace} {name} />{/if}
+    {#if kind === 'Service' && Object.keys(object.status?.linuxImages ?? {}).length}
+      <!-- A Linux image runs through FreeBSD's Linux ABI, which not every
+           program does well on: the native recipe that does the same from
+           FreeBSD's packages, where there is one. -->
+      <div class="card moved" data-linux>
+        <ul>
+          {#each Object.entries(object.status.linuxImages as Record<string, string>) as [image, recipe] (image)}
+            <li>
+              <span class="state wait">{t('Linux image')}</span>
+              {t('{image} runs through FreeBSD\'s Linux ABI.', { image })}
+              {#if recipe}
+                <a href="/import?template={encodeURIComponent(recipe)}&from=" data-recipe={recipe}
+                  >{t('The {recipe} recipe runs it natively, from FreeBSD\'s packages', { recipe })}</a
+                >
+              {/if}
+            </li>
+          {/each}
+        </ul>
+        <p class="muted">
+          {t('Native images start faster, are patched with FreeBSD, and avoid what the Linux ABI lacks (docs/LINUX.md).')}
+        </p>
+      </div>
+    {/if}
     {#if kind === 'Service' && Object.keys(object.status?.images?.moved ?? {}).length}
       <div class="card moved" data-moved>
         <ul>
