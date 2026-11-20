@@ -324,5 +324,22 @@ spec: { security: { allow: [sysvipc] } }
         let t = task(&lab, row.name).unwrap();
         assert_eq!(t["status"]["restarts"], 0, "{}: {t}", row.name);
     }
+
+    step("each Service running a Linux image says so, with the native recipe in its stead");
+    for row in ROWS.iter().filter(|r| matches!(r.expect, Expect::Works(_))) {
+        let recipe = legion_api::image::native_recipe(row.image).unwrap_or_default();
+        wait(&format!("{} said to run a Linux image", row.name), 60, || {
+            lab.list("services", "lx")
+                .iter()
+                .find(|s| s["metadata"]["name"] == row.name)
+                .is_some_and(|s| s["status"]["linuxImages"][row.image] == recipe)
+        });
+    }
+    let listed = lab.ok(&["list", "services", "-n", "lx"]);
+    assert!(
+        listed.contains("docker.io/library/nginx:1.27-alpine (Linux; native: static-site)")
+            && listed.contains("(Linux)"),
+        "{listed}"
+    );
     step("done");
 }

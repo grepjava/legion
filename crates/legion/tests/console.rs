@@ -1599,6 +1599,14 @@ fn the_console_builds_an_example() {
     e.shows("Service/shop/web", 30);
 
     step("ed builds a new image for it from the console, its Containerfile pasted");
+    // static-site's image is built FROM Legion's native base, which the
+    // builder holds once built, as examples/README.md says to do first.
+    let base = common::local::Local::new(&c.lab, &[]);
+    base.build_dir(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/base"),
+        "examples/base:15.1",
+        &c.lab.dir.join("base.json"),
+    );
     c.page(&mut e, "/k/Service/shop/web");
     e.click("Build a new image");
     // The builder's wizard: a jail image (its first step's choice), from
@@ -1666,7 +1674,7 @@ fn the_console_builds_an_example() {
         .expect("legion local images");
     let images = common::text(&images.stdout);
     assert!(!images.contains("legion-build/"), "{images}");
-    assert!(images.contains("freebsd-notoolchain"), "{images}");
+    assert!(images.contains("examples/base:15.1"), "{images}");
     wait(
         "web rolled out to the image built, both tasks ready",
         600,
