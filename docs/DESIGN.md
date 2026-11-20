@@ -558,7 +558,10 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   Raft state (leader, term, log and applied indexes, voters, and on the
   leader each follower's lag). Only the leader reports the cluster:
   objects by kind and namespace, tasks by state, restarts of tasks not
-  ended, services' replicas and ready tasks, nodes, and each quota's
+  ended, each such task's containers with its state, node and image as
+  labels (`legion_task_info`, 1) and when its pod started
+  (`legion_task_start_time_seconds`, as its node's runtime recorded it,
+  kept across a daemon restart), services' replicas and ready tasks, nodes, and each quota's
   limits beside what the namespace uses of them. A sum across managers
   then counts each thing once. The agent reports each running
   container's usage from rctl on the container's own jail: CPU time and
@@ -569,7 +572,11 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   racct the usage is missing and `legion_agent_usage_unread` counts the
   containers concerned. The manager's metrics read the store through a
   slot emptied before the store shuts down, so a scraper holding a
-  connection open never keeps the store open.
+  connection open never keeps the store open. An address not on the
+  host when the daemon starts (`--metrics-listen 10.200.0.1:7472`, the
+  pod network's gateway, before the bridge is up after a reboot) is
+  bound once it is, every 5 s, rather than stopping the daemon: served
+  there, only the node's pods and the host reach it.
 - **CLI.** `legion init | status | apply -f | get | list | delete | watch`,
   with kubectl-style kind names (`service`, `services`, `svc`), `-n`, `-A`,
   `-l key=value` and `-o table|yaml|json`. `apply` reads multi-document YAML
