@@ -794,6 +794,76 @@ spec:
         },
     );
 
+    // --- Phase 12 ------------------------------------------------------
+    step("phase 12: hello's usage over a day, from what the managers keep; a window on it; a PNG");
+    c.page(&mut e, "/k/Service/team-a/hello?tab=usage");
+    e.click("24 h");
+    // Kept a sample a minute since the cluster began: more than two by now.
+    e.shows("a sample every 1 min", 120);
+    let strip = |b: &mut Browser| {
+        b.eval("document.querySelector('[role=slider]')?.dataset.view ?? 'none'")
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    e.until("the strip under the charts", 60, |b| strip(b) == "all");
+    // Narrower with Shift and the left arrow, as a keyboard user would.
+    e.eval(
+        "(() => { const s = document.querySelector('[role=slider]'); s.focus();
+           s.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', shiftKey: true, bubbles: true })); })()",
+    );
+    e.until("a window on the day", 30, |b| strip(b) != "all");
+    e.click("Whole range");
+    e.until("the whole day again", 30, |b| strip(b) == "all");
+    for f in std::fs::read_dir(&e.downloads)
+        .unwrap()
+        .filter_map(Result::ok)
+    {
+        let _ = std::fs::remove_file(f.path());
+    }
+    e.eval("document.querySelector('button[aria-label=\"Download CPU as PNG\"]').click()");
+    let png = e.downloaded(60);
+    let bytes = std::fs::read(&png).unwrap();
+    assert!(
+        png.extension().is_some_and(|x| x == "png") && bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "{} is a PNG ({} bytes)",
+        png.display(),
+        bytes.len()
+    );
+
+    step("phase 12: a note on hello in Markdown, on its page as elements; the viewer reads it");
+    c.page(&mut e, "/k/Service/team-a/hello");
+    e.click("Add a note");
+    e.fill(
+        "Note on Service/hello, in Markdown",
+        "## On call\n\nPage **ops** first: [the runbook](https://example.org/runbook)\n\n<img src=x onerror=\"window.noted=1\">",
+    );
+    e.click("Save note");
+    wait("the note kept as a Config", 30, || {
+        c.get("config", "team-a", "note-service-hello")["metadata"]["labels"]["legion.note"]
+            == "Service/hello"
+    });
+    e.shows("On call", 30);
+    let note = e.eval(
+        "(() => { const n = document.querySelector('[data-note=\"note-service-hello\"]');
+           return n && [n.querySelector('h4')?.innerText, n.querySelector('strong')?.innerText,
+             n.querySelector('a[href=\"https://example.org/runbook\"]')?.rel,
+             !!n.querySelector('img'), window.noted ?? null]; })()",
+    );
+    assert_eq!(
+        note,
+        serde_json::json!(["On call", "ops", "noopener noreferrer", false, null]),
+        "the note's Markdown as elements, its HTML as text"
+    );
+    let mut v = c.sign_in("vera-12", &vera);
+    c.page(&mut v, "/k/Service/team-a/hello");
+    v.shows("On call", 30);
+    assert!(
+        matches!(v.button("Add another note"), Some((false, _))),
+        "the viewer reads the note and writes none"
+    );
+    drop(v);
+
     step("phase 6: every page passes axe's WCAG 2.2 A and AA rules");
     let axe = std::fs::read_to_string(
         std::env::var("LEGION_AXE").expect("set LEGION_AXE to axe-core's axe.min.js"),
