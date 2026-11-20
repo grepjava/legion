@@ -930,6 +930,55 @@ its task staying), so it drains with `--force`.
 **Done when** a week's history outlives a change of leader in the
 console test.
 
+**Built so far** (2026-11-20). What tasks and nodes used is kept 30 days
+in `usage-history.jsonl` in each manager's data directory, a line of
+JSON a sample, outside Raft (`legion-manager/src/history.rs`). On the
+minute the leader makes one sample of each task and node from the 15 s
+samples it heard in that minute (their mean); every manager, leader or
+not, asks each other manager for what it took since it last asked
+(`Cluster.UsageArchive`, managers only, in batches), so the next leader
+has it, and a manager that led alone hands on what only it had. A
+sample from before is taken only into a 15 minutes its series has
+nothing in, so nothing is counted twice. Once an hour the file is
+written again with what is past a day made one sample every 15 minutes
+and what is past 30 days dropped. `Cluster.UsageHistory` takes
+`range_ms` (up to 30 days): an hour or less is the leader's own samples
+as before; beyond, from the file, a minute apart within a day and 15
+minutes beyond. `legion usage --range 24h|7d|30d`; durations take days.
+The console's usage charts have a range (1 h, 6 h, 24 h, 7 days, 30
+days), a line under each chart saying its span and step, times with the
+day past a day, a strip under the charts with the whole range on which
+a window is dragged, or moved to where a click falls, or moved and
+resized with the keys (WCAG 2.5.7), and PNG beside CSV (drawn through a
+data: URL, as the console's policy takes no blob: images). Notes: a
+Config labelled `legion.note: <Kind>/<name>` in the object's namespace
+(a node's in any) is shown on that object's page as Markdown, parsed to
+elements so nothing in a note becomes markup, links only to http(s),
+mailto and the console; whoever may write Configs there adds or edits
+one on the page (`note-<kind>-<name>`), and the Config's page links back.
+Tag moved: every 5 minutes (the first a minute after it leads) the
+leader asks each registry again what a Service's tags name, and one
+naming another image than its tasks run is listed in
+`status.images.moved` until a rollout runs it (a restart does);
+`legion list services` marks it `(tag moved)`, the console's list and
+the Service's page say so with what to do. The plan's test of the
+history across a change of leader needs three managers, which the
+console test hasn't (its console is on the leader, n1, with one other
+manager), so it is a test of its own: `a_weeks_usage_outlives_a_change_of_leader`
+(`tests/history.rs`) passed at c5f937d in 98 s: a week put in n1's file
+while it was the only manager was in n2's and n3's by the time all three
+were ready; n1's daemon killed, n2 led and answered `legion usage
+--range 7d` with 669 samples over 7.0 days, and went on writing a sample
+a minute to its own file. In-process, `a_weeks_usage_outlives_a_change_of_leader`
+(`legion-manager/tests/api.rs`) does the same with three managers, and
+the resolver's test sees a tag moved after a rollback. The console test
+passed at 1d3611d: hello's usage over 24 h a minute apart, a window on
+it from the keyboard and back, a PNG of its CPU; a note on hello with a
+heading, bold and a link, its HTML left as text, read by the viewer, who
+may not add one; axe found nothing on the pages with them. Its first
+run, at c5f937d, found notes showing empty: a Config keeps its text as
+base64 `data` once admitted, which the notes now read.
+
 ### Alongside: the console's feel
 
 From going through Sylve's live sandbox (2026-11-19): what makes a
@@ -967,7 +1016,8 @@ where the phases above first need it:
    events, a Volume's snapshots).
 8. *Charts*: the card's header with the range, CSV and PNG; a line under
    it saying range and resolution; two series on one chart where they
-   belong together (received solid, sent dashed).
+   belong together (received solid, sent dashed). (Range, PNG and the
+   line built with phase 12; the two series on one chart not yet.)
 9. *Forms*: names and namespaces filled in, a reset in the title bar, a
    draft kept when the form is left (a dot on its entry).
 10. *The workbench as a thin bar always there*: the last thing done and

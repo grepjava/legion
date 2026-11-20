@@ -192,8 +192,17 @@ replicas' whole copies, each with its stage, the bytes sent and how it
 ended; with an id, its stages and full output.
 .It Cm alerts Oo Fl n Ar ns Oc Oo Fl w Oc Oo Fl o Ar fmt Oc
 Show active cluster alerts.
-.It Cm usage Op Fl n Ar ns , Cm quota Op Fl n Ar ns
+.It Cm usage Oo Ar task Oc Oo Fl n Ar ns Oc Oo Fl Fl range Ar dur Oc , Cm quota Op Fl n Ar ns
 Inspect task resource usage samples and namespace quotas.
+Without
+.Fl Fl range ,
+the last hour as the leader sampled it;
+with it, up to
+.Ql 30d ,
+from what each manager keeps in
+.Pa usage-history.jsonl
+in its data directory: a sample a minute within a day, one every 15
+minutes beyond.
 .It Cm audit Op Ar options
 Query the cluster audit trail (cluster admin only).
 .It Cm reach Op Fl n Ar ns , Cm load-balancers Op Fl n Ar ns

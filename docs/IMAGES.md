@@ -166,7 +166,11 @@ An image name without a registry means Docker Hub, as in Docker
 When a Service or Job is deployed, the leading manager asks the registry
 what each tag names, once, and every task of that deployment runs that
 digest, on whichever node it lands. A tag moved since changes nothing until
-the Service is deployed again; scaling it is not a deployment. The
+the Service is deployed again; scaling it is not a deployment, a restart
+is. Every 5 minutes the leader asks again what each Service's tags name,
+and one that names another image now is listed under
+`status.images.moved`, marked `(tag moved)` by `legion list services` and
+said on the Service's page in the console, until a deployment runs it. The
 digests are on the Service's status (`legion get service web -n shop`,
 under `status.images`), and each task's status says which manifest its node
 ran, which for an image of several platforms is the one for that node's.
