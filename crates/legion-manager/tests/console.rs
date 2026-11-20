@@ -1154,6 +1154,16 @@ async fn the_console_converts_compose_files_and_lists_templates() {
         }))
         .await;
         assert_eq!(c.status, 200, "{}: {}", t["name"], c.text);
+        // Nothing in an example is ignored or read as a variable it isn't.
+        if t["namespace"] == "" {
+            assert_eq!(
+                c.body["warnings"],
+                serde_json::json!([]),
+                "{}: {}",
+                t["name"],
+                c.text
+            );
+        }
     }
 
     let _ = f.stop.send(());

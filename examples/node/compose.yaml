@@ -28,5 +28,5 @@ configs:
       const os = require('node:os');
       http.createServer((req, res) => {
         res.writeHead(200, { 'content-type': 'text/plain' });
-        res.end(`hello from node ${process.version} on ${os.hostname()}\n`);
+        res.end(`hello from node $${process.version} on $${os.hostname()}\n`);
       }).listen(8080);
