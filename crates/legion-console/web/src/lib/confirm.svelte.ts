@@ -46,6 +46,9 @@ export function ask(what: string | Ask, more: Partial<Ask> = {}): Promise<boolea
   // A second ask while one is open refuses the first: one question at a time.
   confirming.now?.resolve(false);
   return new Promise((resolve) => {
+    // How many times the console asked, on the page for whoever drives it
+    // (the lab's browser) to know a click asked, however late it opens.
+    document.documentElement.dataset.asked = String(asked + 1);
     confirming.now = {
       ...a,
       id: ++asked,
