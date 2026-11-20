@@ -358,7 +358,7 @@
     {:else if kind === 'Service'}
       <UsageCharts {namespace} pick={(t) => t.service === name} />
     {:else}
-      <UsageCharts namespace="" pick={(t) => t.node === name} />
+      <UsageCharts namespace="" nodeFilter={name} pick={(t) => t.node === name} />
     {/if}
   {:else if tab === 'rollout'}
     <Rollout service={object} />

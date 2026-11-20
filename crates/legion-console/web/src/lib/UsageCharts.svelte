@@ -74,15 +74,15 @@
   // sampled in, though their samples fall apart (lib/series.ts).
   const summed = $derived.by(() => {
     const picked = series.filter(pick);
-    const nodesIn = task ? [] : nodeSeries.filter((ns) => !nodeFilter || ns.node === nodeFilter);
+    // The nodes' own figures: every node's for the whole cluster, one node's
+    // on its page, none for a task or a service, whose they are not.
+    const nodesIn = task || (pick !== EVERY && !nodeFilter) ? [] : nodeSeries.filter((ns) => !nodeFilter || ns.node === nodeFilter);
     return {
       cpu: sumHeld(picked.map((ts) => ts.samples.map(([at, c]) => [at, c] as [number, number])), step),
       mem: sumHeld(picked.map((ts) => ts.samples.map(([at, , m]) => [at, m] as [number, number])), step),
       zfs: sumHeld(nodesIn.map((ns) => ns.samples.map(([at, used]) => [at, used] as [number, number])), step),
-      net: sumHeld(
-        nodesIn.map((ns) => ns.samples.map(([at, , , rx, tx]) => [at, rx + tx] as [number, number])),
-        step
-      ),
+      rx: sumHeld(nodesIn.map((ns) => ns.samples.map(([at, , , rx]) => [at, rx] as [number, number])), step),
+      tx: sumHeld(nodesIn.map((ns) => ns.samples.map(([at, , , , tx]) => [at, tx] as [number, number])), step),
       tasks: picked.length
     };
   });
@@ -90,7 +90,7 @@
   const shown = $derived.by(() => {
     const w = view;
     const within = (p: [number, number][]) => (w ? p.filter(([at]) => at >= w[0] && at <= w[1]) : p);
-    return { cpu: within(summed.cpu), mem: within(summed.mem), zfs: within(summed.zfs), net: within(summed.net) };
+    return { cpu: within(summed.cpu), mem: within(summed.mem), zfs: within(summed.zfs), rx: within(summed.rx), tx: within(summed.tx) };
   });
 
   // Requests and limits of the tasks there now, those with a recent sample;
@@ -212,11 +212,13 @@
         />
       </div>
     {/if}
-    {#if summed.net.length}
+    {#if summed.rx.length || summed.tx.length}
       <div class={compact ? 'card' : ''}>
         <Chart
           title={t('Network throughput')}
-          points={shown.net}
+          label={t('received')}
+          points={shown.rx}
+          also={{ label: t('sent'), points: shown.tx }}
           format={bps}
           {step}
           tone="wait"

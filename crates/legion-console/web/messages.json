@@ -1073,6 +1073,7 @@
   "reads everywhere": "",
   "ready": "",
   "ready; {n} running": "",
+  "received": "",
   "registry/name:tag": "",
   "requested": "",
   "required": "",
@@ -1087,6 +1088,7 @@
   "saved in {namespace}": "",
   "searching every task…": "",
   "seen by the controller": "",
+  "sent": "",
   "sets them.": "",
   "signed by {key}": "",
   "since {when}: {moved} of {total} moved": "",
@@ -1154,6 +1156,7 @@
     "one": "",
     "other": ""
   },
+  "{first}: now {now1} · average {average1} · highest {highest1}; {second}: now {now2} · average {average2} · highest {highest2}": "",
   "{free} free": "",
   "{image} (tag moved)": "",
   "{image} names {digest} now, not the image its tasks run.": "",

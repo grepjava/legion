@@ -4,6 +4,9 @@
   // and the latest, average and highest values as text beside it; every
   // sample as a table too, behind a disclosure, for whoever can't see the
   // line or wants the numbers (WCAG 1.1.1, 1.3.1). CSV and PNG to take away.
+  // A second series that belongs with it (sent beside received) shares the
+  // axis, dashed in the same colour, each named in a key: the dash, not
+  // the colour, tells them apart (WCAG 1.4.1).
   import { t } from '#lib/i18n.svelte.ts';
   import Ico from '#lib/Ico.svelte';
   import { duration, stamp } from '#lib/span.ts';
@@ -16,7 +19,9 @@
     step,
     marks = [],
     tone = 'accent',
-    compact = false
+    compact = false,
+    label = '',
+    also
   }: {
     title: string;
     /** [milliseconds since the epoch, value], oldest first. */
@@ -28,6 +33,10 @@
     marks?: { label: string; value: number }[];
     tone?: 'accent' | 'good' | 'zfs' | 'wait';
     compact?: boolean;
+    /** The first series' name, when there is a second. */
+    label?: string;
+    /** A second series on the same axis, drawn dashed. */
+    also?: { label: string; points: [number, number][] };
   } = $props();
 
   let width = $state(600);
@@ -47,10 +56,11 @@
           : 'var(--accent)'
   );
 
-  const t0 = $derived(points.length ? points[0][0] : 0);
-  const t1 = $derived(points.length ? points[points.length - 1][0] : 1);
+  const second = $derived(also?.points ?? []);
+  const t0 = $derived(points.length || second.length ? Math.min(points[0]?.[0] ?? Infinity, second[0]?.[0] ?? Infinity) : 0);
+  const t1 = $derived(points.length || second.length ? Math.max(points.at(-1)?.[0] ?? -Infinity, second.at(-1)?.[0] ?? -Infinity) : 1);
   const top = $derived.by(() => {
-    const max = Math.max(0, ...points.map((p) => p[1]), ...marks.map((m) => m.value));
+    const max = Math.max(0, ...points.map((p) => p[1]), ...second.map((p) => p[1]), ...marks.map((m) => m.value));
     if (max <= 0) return 1;
     // A round top: 1, 2 or 5 times a power of ten.
     const e = Math.pow(10, Math.floor(Math.log10(max)));
@@ -59,11 +69,12 @@
   const x = (tm: number) => pad.left + (t1 === t0 ? plotW : ((tm - t0) / (t1 - t0)) * plotW);
   const y = (v: number) => pad.top + plotH - (v / top) * plotH;
 
-  const segments = $derived.by(() => {
+  // A series as runs of samples: a longer gap than a step or two breaks it.
+  function runs(of: [number, number][]) {
     const segs: [number, number][][] = [];
     let cur: [number, number][] = [];
     let prev: number | null = null;
-    for (const [tm, v] of points) {
+    for (const [tm, v] of of) {
       if (prev !== null && tm - prev > step * 2.5 && cur.length) {
         segs.push(cur);
         cur = [];
@@ -73,15 +84,16 @@
     }
     if (cur.length) segs.push(cur);
     return segs;
-  });
-
-  const path = $derived(
-    segments
+  }
+  const line = (segs: [number, number][][]) =>
+    segs
       .map((seg) =>
         seg.map(([tm, v], i) => `${i === 0 ? 'M' : 'L'}${x(tm).toFixed(1)},${y(v).toFixed(1)}`).join('')
       )
-      .join('')
-  );
+      .join('');
+  const segments = $derived(runs(points));
+  const path = $derived(line(segments));
+  const path2 = $derived(line(runs(second)));
 
   const area = $derived(
     segments
@@ -102,13 +114,64 @@
   const last = $derived(values.length ? values[values.length - 1] : 0);
   const avg = $derived(values.length ? values.reduce((a, b) => a + b, 0) / values.length : 0);
   const max = $derived(values.length ? Math.max(...values) : 0);
+  // The figures of one series: now, average, highest.
+  function figures(of: [number, number][]) {
+    const vs = of.map((p) => p[1]);
+    return {
+      now: format(vs.at(-1) ?? 0),
+      average: format(vs.length ? vs.reduce((a, b) => a + b, 0) / vs.length : 0),
+      highest: format(vs.length ? Math.max(...vs) : 0)
+    };
+  }
+  const summary = $derived.by(() => {
+    if (!also) {
+      return t('now {now} · average {average} · highest {highest}', {
+        now: format(last),
+        average: format(avg),
+        highest: format(max)
+      });
+    }
+    const a = figures(points);
+    const b = figures(second);
+    return t(
+      '{first}: now {now1} · average {average1} · highest {highest1}; {second}: now {now2} · average {average2} · highest {highest2}',
+      {
+        first: label || title,
+        now1: a.now,
+        average1: a.average,
+        highest1: a.highest,
+        second: also.label,
+        now2: b.now,
+        average2: b.average,
+        highest2: b.highest
+      }
+    );
+  });
+  // Each time either series has a sample, with what each had then.
+  const rows = $derived.by(() => {
+    const by = new Map<number, [number | undefined, number | undefined]>();
+    for (const [tm, v] of points) by.set(tm, [v, undefined]);
+    for (const [tm, v] of second) by.set(tm, [by.get(tm)?.[0], v]);
+    return [...by.entries()].sort((a, b) => a[0] - b[0]);
+  });
+  // The second series' sample nearest a time, if one is within a step.
+  function near(tm: number): number | undefined {
+    let best: [number, number] | undefined;
+    for (const p of second) if (!best || Math.abs(p[0] - tm) < Math.abs(best[0] - tm)) best = p;
+    return best && Math.abs(best[0] - tm) <= step ? best[1] : undefined;
+  }
   const clock = (tm: number) => stamp(tm, t1 - t0);
 
   // The samples as CSV, for a spreadsheet: the time in ISO 8601, the value.
   function downloadCsv() {
-    const rows = [`time,${JSON.stringify(title)}`, ...points.map(([tm, v]) => `${new Date(tm).toISOString()},${v}`)];
+    const lines = also
+      ? [
+          `time,${JSON.stringify(label || title)},${JSON.stringify(also.label)}`,
+          ...rows.map(([tm, [a, b]]) => `${new Date(tm).toISOString()},${a ?? ''},${b ?? ''}`)
+        ]
+      : [`time,${JSON.stringify(title)}`, ...points.map(([tm, v]) => `${new Date(tm).toISOString()},${v}`)];
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([rows.join('\n') + '\n'], { type: 'text/csv' }));
+    a.href = URL.createObjectURL(new Blob([lines.join('\n') + '\n'], { type: 'text/csv' }));
     a.download = fileName('csv');
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
@@ -193,13 +256,15 @@
     <strong>{title}</strong>
     {#if points.length}
       <span class="muted"
-        >{t('now {now} · average {average} · highest {highest}', {
-          now: format(last),
-          average: format(avg),
-          highest: format(max)
-        })}{#each marks as m (m.label)}
+        >{summary}{#each marks as m (m.label)}
           · {m.label} {format(m.value)}{/each}</span
       >
+      {#if also}
+        <span class="key muted" aria-hidden="true">
+          <svg width="22" height="8"><line class="line" x1="1" x2="21" y1="4" y2="4" /></svg>{label || title}
+          <svg width="22" height="8"><line class="line second" x1="1" x2="21" y1="4" y2="4" /></svg>{also.label}
+        </span>
+      {/if}
       <button
         type="button"
         class="sm chart-tool"
@@ -227,12 +292,14 @@
       {width}
       {height}
       role="img"
-      aria-label={t('{title}: now {now}, average {average}, highest {highest}', {
-        title,
-        now: format(last),
-        average: format(avg),
-        highest: format(max)
-      })}
+      aria-label={also
+        ? `${title}: ${summary}`
+        : t('{title}: now {now}, average {average}, highest {highest}', {
+            title,
+            now: format(last),
+            average: format(avg),
+            highest: format(max)
+          })}
       onpointermove={move}
       onpointerleave={() => (hover = null)}
     >
@@ -260,14 +327,26 @@
         <path d={area} fill="url(#{gradId})" />
       {/if}
       <path class="line" d={path} />
+      {#if also}
+        <path class="line second" d={path2} />
+      {/if}
       {#if hover !== null}
         {@const [ht, hv] = points[hover]}
+        {@const hv2 = also ? near(ht) : undefined}
         <line class="cross" x1={x(ht)} x2={x(ht)} y1={pad.top} y2={pad.top + plotH} />
         <circle class="dot" cx={x(ht)} cy={y(hv)} r="4" />
-        <g transform="translate({Math.min(x(ht) + 8, pad.left + plotW - 120)},{pad.top + 4})">
-          <rect class="tip" width="116" height="36" rx="4" />
+        {#if hv2 !== undefined}
+          <circle class="dot second" cx={x(ht)} cy={y(hv2)} r="3.5" />
+        {/if}
+        <g transform="translate({Math.min(x(ht) + 8, pad.left + plotW - (also ? 164 : 120))},{pad.top + 4})">
+          <rect class="tip" width={also ? 160 : 116} height={also ? 50 : 36} rx="4" />
           <text class="tiptext" x="8" y="15">{clock(ht)}</text>
-          <text class="tiptext strong" x="8" y="29">{format(hv)}</text>
+          {#if also}
+            <text class="tiptext strong" x="8" y="29">{label || title} {format(hv)}</text>
+            <text class="tiptext strong" x="8" y="43">{also.label} {hv2 === undefined ? '—' : format(hv2)}</text>
+          {:else}
+            <text class="tiptext strong" x="8" y="29">{format(hv)}</text>
+          {/if}
         </g>
       {/if}
     </svg>
@@ -283,14 +362,20 @@
           <thead>
             <tr>
               <th scope="col">{t('Time')}</th>
-              <th scope="col">{title}</th>
+              {#if also}
+                <th scope="col">{label || title}</th>
+                <th scope="col">{also.label}</th>
+              {:else}
+                <th scope="col">{title}</th>
+              {/if}
             </tr>
           </thead>
           <tbody>
-            {#each [...points].reverse() as [pt, pv] (pt)}
+            {#each [...rows].reverse() as [pt, [pv, pv2]] (pt)}
               <tr>
                 <td>{t1 - t0 > 86_400_000 ? new Date(pt).toLocaleString() : new Date(pt).toLocaleTimeString()}</td>
-                <td>{format(pv)}</td>
+                <td>{pv === undefined ? '—' : format(pv)}</td>
+                {#if also}<td>{pv2 === undefined ? '—' : format(pv2)}</td>{/if}
               </tr>
             {/each}
           </tbody>
@@ -355,6 +440,26 @@
     stroke-width: 2;
     stroke-linejoin: round;
     stroke-linecap: round;
+  }
+  /* The second series: the same colour, dashed. */
+  .line.second {
+    stroke-dasharray: 6 4;
+    stroke-linecap: butt;
+  }
+  .dot.second {
+    fill: var(--panel);
+    stroke: var(--chart-color, var(--accent));
+  }
+  .key {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.2rem 0.4rem;
+    font-size: 0.78rem;
+  }
+  .key svg + svg {
+    margin-left: 0.6rem;
   }
   .mark {
     stroke: var(--muted);
