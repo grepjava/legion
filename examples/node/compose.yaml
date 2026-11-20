@@ -1,0 +1,32 @@
+# Node.js from FreeBSD's packages: two tasks of a small HTTP server, its
+# code from a Config, published on port 30083 of every node. Your own app
+# is an image built FROM examples/node:24 with its code copied in (see the
+# Containerfile), and a command of its own instead of this one.
+#
+#   legion stack deploy hello-node -c examples/node/compose.yaml
+#
+# IMAGE is where the image is: `localhost/examples/node:24` once loaded
+# with `legion image load`, or a registry's reference.
+services:
+  web:
+    image: "${IMAGE:-localhost/examples/node:24}"
+    command: [/usr/local/bin/node, /app/server.js]
+    ports: ["30083:8080"]
+    configs:
+      - { source: server, target: /app/server.js }
+    healthcheck:
+      test: ["CMD", "fetch", "-qo", "/dev/null", "http://127.0.0.1:8080/"]
+      interval: 5s
+      retries: 3
+    deploy:
+      replicas: 2
+      resources: { limits: { memory: 128M } }
+configs:
+  server:
+    content: |
+      const http = require('node:http');
+      const os = require('node:os');
+      http.createServer((req, res) => {
+        res.writeHead(200, { 'content-type': 'text/plain' });
+        res.end(`hello from node ${process.version} on ${os.hostname()}\n`);
+      }).listen(8080);

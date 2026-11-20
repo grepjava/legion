@@ -1126,19 +1126,31 @@ async fn the_console_converts_compose_files_and_lists_templates() {
             )
         })
         .collect();
-    assert_eq!(listed.len(), 3, "{listed:?}");
-    assert_eq!(listed[0].0, "");
-    assert_eq!(listed[0].1, "counter");
-    assert!(listed[0].2.starts_with("A hit counter"), "{listed:?}");
-    assert_eq!(listed[1].1, "static-site");
+    let names: Vec<(&str, &str)> = listed
+        .iter()
+        .map(|(ns, name, _)| (ns.as_str(), name.as_str()))
+        .collect();
     assert_eq!(
-        listed[2],
-        ("shop".into(), "mine".into(), "My shop. More.".into())
+        names,
+        [
+            ("", "counter"),
+            ("", "node"),
+            ("", "postgres"),
+            ("", "python"),
+            ("", "redis"),
+            ("", "static-site"),
+            ("shop", "mine"),
+        ],
+        "the examples, then the namespace's own"
     );
-    // Each example converts as it is.
+    assert!(listed[0].2.starts_with("A hit counter"), "{listed:?}");
+    assert!(listed[2].2.starts_with("PostgreSQL 17 from FreeBSD's packages"), "{listed:?}");
+    assert_eq!(listed[6].2, "My shop. More.");
+    // Each example converts as it is, given what it asks for.
     for t in r.body["templates"].as_array().unwrap() {
         let c = post(serde_json::json!({
-            "compose": t["compose"], "stack": t["name"], "namespace": "shop", "env": {},
+            "compose": t["compose"], "stack": t["name"], "namespace": "shop",
+            "env": { "POSTGRES_PASSWORD": "secret" },
         }))
         .await;
         assert_eq!(c.status, 200, "{}: {}", t["name"], c.text);

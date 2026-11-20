@@ -1656,12 +1656,23 @@ async fn compose(
 /// The label marking a Config as a saved template: its text a compose file.
 const TEMPLATE_LABEL: &str = "legion.template";
 
-/// The examples in `examples/`, the catalog every console has.
+/// The examples in `examples/`, the catalog every console has: the native
+/// recipes (FreeBSD's packages on Legion's base image) and two apps.
 const EXAMPLES: &[(&str, &str)] = &[
     (
         "counter",
         include_str!("../../../examples/counter/compose.yaml"),
     ),
+    ("node", include_str!("../../../examples/node/compose.yaml")),
+    (
+        "postgres",
+        include_str!("../../../examples/postgres/compose.yaml"),
+    ),
+    (
+        "python",
+        include_str!("../../../examples/python/compose.yaml"),
+    ),
+    ("redis", include_str!("../../../examples/redis/compose.yaml")),
     (
         "static-site",
         include_str!("../../../examples/static-site/compose.yaml"),

@@ -1,8 +1,10 @@
-# nginx from FreeBSD's packages. Build it with Legion:
+# nginx from FreeBSD's packages, on Legion's native base.
 #
+#   legion build -t examples/base:15.1 examples/base
 #   legion build -t examples/nginx:1 examples/static-site
-FROM docker.io/freebsd/freebsd-notoolchain:15.1
-RUN env ASSUME_ALWAYS_YES=yes pkg bootstrap -f >/dev/null \
- && env ASSUME_ALWAYS_YES=yes pkg install -y nginx >/dev/null \
+ARG BASE=localhost/examples/base:15.1
+FROM ${BASE}
+RUN env ASSUME_ALWAYS_YES=yes pkg install -y nginx >/dev/null \
  && pkg clean -ay >/dev/null && rm -rf /var/db/pkg/repos /var/cache/pkg/* \
- && mkdir -p /var/tmp/nginx /srv/www
+ && mkdir -p /var/tmp/nginx /srv/www \
+ && /usr/local/sbin/nginx -v

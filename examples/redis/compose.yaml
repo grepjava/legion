@@ -1,0 +1,34 @@
+# Redis from FreeBSD's packages: one server, its data on a Volume
+# (append-only, so it outlives the task), found by the other services of
+# its namespace as `redis`, port 6379.
+#
+#   legion stack deploy cache -c examples/redis/compose.yaml
+#
+# IMAGE is where the image is: `localhost/examples/redis:1` once loaded
+# with `legion image load`, or a registry's reference after `legion local push`.
+services:
+  redis:
+    image: "${IMAGE:-localhost/examples/redis:1}"
+    command:
+      [/usr/local/bin/redis-server, --dir, /data, --appendonly, "yes",
+       --protected-mode, "no"]
+    ports: ["6379"]
+    volumes: ["data:/data"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/redis-cli", "ping"]
+      interval: 5s
+      retries: 3
+    deploy:
+      resources: { limits: { memory: 256M } }
+    x-legion:
+      pod:
+        # The Volume is root's; Redis runs as redis.
+        initContainers:
+          - name: own
+            image: "${IMAGE:-localhost/examples/redis:1}"
+            user: root
+            command: [/usr/sbin/chown, redis:redis, /data]
+            volumeMounts: [{ name: data, path: /data }]
+volumes:
+  data:
+    x-legion: { size: 1Gi }

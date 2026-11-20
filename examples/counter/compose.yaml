@@ -7,7 +7,7 @@
 # GET / on port 30082 of any node answers `hits <n>`.
 services:
   redis:
-    image: "${IMAGE:-localhost/examples/redis:1}"
+    image: "${IMAGE:-localhost/examples/counter:1}"
     command:
       [/usr/local/bin/redis-server, --dir, /data, --appendonly, "yes",
        --protected-mode, "no", --save, ""]
@@ -16,7 +16,7 @@ services:
     deploy:
       resources: { limits: { memory: 128M } }
   web:
-    image: "${IMAGE:-localhost/examples/redis:1}"
+    image: "${IMAGE:-localhost/examples/counter:1}"
     command: [/usr/sbin/inetd, -d, /etc/inetd.conf]
     ports: ["30082:8080"]
     configs:

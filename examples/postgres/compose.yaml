@@ -1,0 +1,43 @@
+# PostgreSQL 17 from FreeBSD's packages: one server, its data on a Volume,
+# the superuser's password from a Secret made of POSTGRES_PASSWORD. Other
+# services of its namespace reach it as `postgres`, port 5432. PostgreSQL
+# needs SysV shared memory, which the namespace must allow:
+# `spec: { security: { allow: [sysvipc] } }` on the Namespace.
+#
+#   POSTGRES_PASSWORD=... legion stack deploy db -n data \
+#       -c examples/postgres/compose.yaml
+#
+# IMAGE is where the image is: `localhost/examples/postgres:17` once
+# loaded with `legion image load`, or a registry's reference.
+services:
+  postgres:
+    image: "${IMAGE:-localhost/examples/postgres:17}"
+    ports: ["5432"]
+    volumes: ["data:/var/db/postgres"]
+    secrets:
+      - { source: pg-password, target: /run/secrets/pg-password }
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/pg_isready", "-q", "-h", "127.0.0.1"]
+      interval: 5s
+      retries: 5
+    stop_grace_period: 30s
+    x-legion:
+      pod:
+        containers:
+          - name: postgres
+            security: { allow: [sysvipc] }
+        # The Volume is root's; PostgreSQL runs as postgres.
+        initContainers:
+          - name: own
+            image: "${IMAGE:-localhost/examples/postgres:17}"
+            user: root
+            command:
+              [/usr/bin/install, -d, -o, postgres, -g, postgres, -m, "700",
+               /var/db/postgres/data]
+            volumeMounts: [{ name: data, path: /var/db/postgres }]
+volumes:
+  data:
+    x-legion: { size: 4Gi }
+secrets:
+  pg-password:
+    environment: POSTGRES_PASSWORD

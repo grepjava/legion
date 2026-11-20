@@ -1,0 +1,20 @@
+# Node.js from FreeBSD's packages, on Legion's native base: a runtime for
+# an app copied onto it. Build an app's image FROM this one:
+#
+#   FROM localhost/examples/node:24
+#   WORKDIR /app
+#   COPY . .
+#   CMD ["/usr/local/bin/node", "server.js"]
+#
+# npm is not in it; install the app's dependencies in a stage of its own
+# (FROM this image, `pkg install -y npm-node24`, `npm ci`) and copy them in.
+#
+#   legion build -t examples/base:15.1 examples/base
+#   legion build -t examples/node:24 examples/node
+ARG BASE=localhost/examples/base:15.1
+FROM ${BASE}
+RUN env ASSUME_ALWAYS_YES=yes pkg install -y node24 >/dev/null \
+ && pkg clean -ay >/dev/null && rm -rf /var/db/pkg/repos /var/cache/pkg/* \
+ && /usr/local/bin/node --version
+USER nobody
+CMD ["/usr/local/bin/node"]

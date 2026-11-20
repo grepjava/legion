@@ -1,0 +1,41 @@
+# Python 3 from FreeBSD's packages: two tasks of a small HTTP server, its
+# code from a Config, published on port 30084 of every node. Your own app
+# is an image built FROM examples/python:3 with its code copied in (see
+# the Containerfile), and a command of its own instead of this one.
+#
+#   legion stack deploy hello-python -c examples/python/compose.yaml
+#
+# IMAGE is where the image is: `localhost/examples/python:3` once loaded
+# with `legion image load`, or a registry's reference.
+services:
+  web:
+    image: "${IMAGE:-localhost/examples/python:3}"
+    command: [/usr/local/bin/python3, /app/app.py]
+    ports: ["30084:8080"]
+    configs:
+      - { source: app, target: /app/app.py }
+    healthcheck:
+      test: ["CMD", "fetch", "-qo", "/dev/null", "http://127.0.0.1:8080/"]
+      interval: 5s
+      retries: 3
+    deploy:
+      replicas: 2
+      resources: { limits: { memory: 128M } }
+configs:
+  app:
+    content: |
+      import platform, socket
+      from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+      class Hello(BaseHTTPRequestHandler):
+          def do_GET(self):
+              body = f"hello from python {platform.python_version()} on {socket.gethostname()}\n"
+              self.send_response(200)
+              self.send_header("content-type", "text/plain")
+              self.end_headers()
+              self.wfile.write(body.encode())
+
+          def log_message(self, *args):
+              pass
+
+      ThreadingHTTPServer(("", 8080), Hello).serve_forever()

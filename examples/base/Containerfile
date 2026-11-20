@@ -1,0 +1,23 @@
+# Legion's native base image: FreeBSD's minimal runtime image (a userland
+# of shared libraries, sh and a few tools, about 12 MiB compressed) with
+# pkg added, so the recipes beside it install what they run from FreeBSD's
+# packages onto it. Each recipe builds FROM it: rebuilding the base, then
+# the recipes, patches them all at once.
+#
+#   legion build -t examples/base:15.1 examples/base
+#
+# The release is the nodes' FreeBSD release or an older one: a jail
+# shares the host's kernel.
+ARG RELEASE=15.1
+
+# pkg, fetched and checked as FreeBSD's bootstrap does; only its static
+# binary is taken.
+FROM docker.io/freebsd/freebsd-notoolchain:${RELEASE} AS pkg
+RUN env ASSUME_ALWAYS_YES=yes pkg bootstrap -f >/dev/null
+
+FROM docker.io/freebsd/freebsd-runtime:${RELEASE}
+COPY --from=pkg /usr/local/sbin/pkg-static /usr/local/sbin/pkg-static
+# pkg installed by itself, so it is a package the image knows; the
+# catalogue it fetched is dropped, as each recipe fetches its own.
+RUN env ASSUME_ALWAYS_YES=yes /usr/local/sbin/pkg-static install -y pkg >/dev/null \
+ && pkg clean -ay >/dev/null && rm -rf /var/db/pkg/repos /var/cache/pkg/*

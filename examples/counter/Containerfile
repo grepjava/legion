@@ -1,7 +1,10 @@
 # Redis from FreeBSD's packages, for both of the counter's services: the
-# server, and redis-cli for the web tier. Build it with Legion:
+# server, and redis-cli for the web tier, which answers through inetd. It
+# is built on FreeBSD's notoolchain image rather than Legion's native base
+# (examples/base), as inetd is in the base system's tools and not in the
+# runtime image. Build it with Legion:
 #
-#   legion build -t examples/redis:1 examples/counter
+#   legion build -t examples/counter:1 examples/counter
 FROM docker.io/freebsd/freebsd-notoolchain:15.1
 RUN env ASSUME_ALWAYS_YES=yes pkg bootstrap -f >/dev/null \
  && env ASSUME_ALWAYS_YES=yes pkg install -y redis >/dev/null \

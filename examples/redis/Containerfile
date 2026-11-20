@@ -1,0 +1,12 @@
+# Redis from FreeBSD's packages, on Legion's native base.
+#
+#   legion build -t examples/base:15.1 examples/base
+#   legion build -t examples/redis:1 examples/redis
+ARG BASE=localhost/examples/base:15.1
+FROM ${BASE}
+RUN env ASSUME_ALWAYS_YES=yes pkg install -y redis >/dev/null \
+ && pkg clean -ay >/dev/null && rm -rf /var/db/pkg/repos /var/cache/pkg/* \
+ && /usr/local/bin/redis-server --version
+USER redis
+EXPOSE 6379
+CMD ["/usr/local/bin/redis-server", "--dir", "/data", "--protected-mode", "no"]
