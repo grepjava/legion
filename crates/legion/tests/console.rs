@@ -815,12 +815,6 @@ spec:
     e.until("a window on the day", 30, |b| strip(b) != "all");
     e.click("Whole range");
     e.until("the whole day again", 30, |b| strip(b) == "all");
-    for f in std::fs::read_dir(&e.downloads)
-        .unwrap()
-        .filter_map(Result::ok)
-    {
-        let _ = std::fs::remove_file(f.path());
-    }
     e.eval("document.querySelector('button[aria-label=\"Download CPU as PNG\"]').click()");
     let png = e.downloaded(60);
     let bytes = std::fs::read(&png).unwrap();
@@ -850,12 +844,6 @@ spec:
     a.until("n1's network as two lines", 120, |b| {
         b.eval(net) == serde_json::json!([2, "none", true, "received sent"])
     });
-    for f in std::fs::read_dir(&a.downloads)
-        .unwrap()
-        .filter_map(Result::ok)
-    {
-        let _ = std::fs::remove_file(f.path());
-    }
     a.eval(
         "document.querySelector('button[aria-label=\"Download Network throughput as CSV\"]').click()",
     );

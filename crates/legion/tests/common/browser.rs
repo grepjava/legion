@@ -52,6 +52,8 @@ pub struct Browser {
     session: String,
     /// Where downloads land.
     pub downloads: PathBuf,
+    /// The downloads `downloaded` has given, which it won't give again.
+    taken: Vec<PathBuf>,
     /// Errors the page reported (exceptions, `console.error`), for a failure's message.
     pub errors: Vec<String>,
 }
@@ -145,6 +147,7 @@ impl Browser {
             next: 0,
             session: String::new(),
             downloads,
+            taken: Vec::new(),
             errors: Vec::new(),
         };
         let target = b.call("Target.createTarget", json!({ "url": "about:blank" }));
@@ -437,9 +440,12 @@ impl Browser {
         }
     }
 
-    /// A file downloaded whole, waited for up to `secs`.
+    /// A file downloaded whole since the last one this gave, waited for up
+    /// to `secs`. Earlier downloads stay where they are, for the steps
+    /// that use them later (a Volume's backup, restored at the end).
     pub fn downloaded(&mut self, secs: u64) -> PathBuf {
         let dir = self.downloads.clone();
+        let taken = self.taken.clone();
         let mut found = None;
         self.until("a download", secs, |_| {
             found = std::fs::read_dir(&dir)
@@ -447,12 +453,15 @@ impl Browser {
                 .filter_map(Result::ok)
                 .map(|e| e.path())
                 .find(|p| {
-                    p.extension().is_none_or(|e| e != "crdownload")
+                    !taken.contains(p)
+                        && p.extension().is_none_or(|e| e != "crdownload")
                         && p.metadata().is_ok_and(|m| m.len() > 0)
                 });
             found.is_some()
         });
-        found.unwrap()
+        let found = found.unwrap();
+        self.taken.push(found.clone());
+        found
     }
 }
 
