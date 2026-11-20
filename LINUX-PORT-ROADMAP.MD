@@ -50,7 +50,8 @@ The FreeBSD-specific part is about 16k lines:
 | The agent counting each container's memory (`kern.proc.vmmap`) and killing over it | `legion-sys` memory.rs | `memory.max`: the kernel does it, counting shared pages once |
 | CARP for `--vip` | `legion-manager` vip | the leader announcing the address (gratuitous ARP and unsolicited NA) |
 | bhyve tasks | `legion-jail` vm.rs | not ported (KVM later, if a workload asks) |
-| `legion local`, `legion build` | `legion-local`, `legion-build` | not ported at first: Linux nodes run images built anywhere |
+| `legion build`: `RUN` steps in jails, layers from ZFS diffs (about 9k lines) | `legion-build` | `RUN` steps as crun containers, the same layers (phase 5) |
+| `legion local`: one machine, no cluster (about 2.6k lines) | `legion-local` | on the crun runtime and Linux pod network (phase 5) |
 
 The seam for the runtime exists: `legion_runtime::Runtime` (`pull`,
 `create`, `start`, `stop`, `pause`, `resume`, `remove`, `inspect`, `wait`,
@@ -167,15 +168,43 @@ stateful Postgres moves from a Linux node to another Linux node on drain.
   COMPARISON.md saying what a Linux node is and isn't.
 
 **Done when** the qualification suite, less the FreeBSD-only tests (jails
-by name, bhyve, the Linux ABI, `legion local`, builds), passes on a
+by name, bhyve, the Linux ABI, and, until phase 5, `legion local` and
+builds), passes on a
 three-node Linux lab and on a mixed lab, under crun and again under runc,
 with no leftovers.
+
+### Phase 5: `legion build`, then `legion local` (4 to 6 weeks)
+
+Both reuse what phases 2 and 3 build: the crun runtime, the Linux pod
+network and OpenZFS layers. Build comes first, as it is what a mixed
+cluster gains most from: one tool, with the same signed provenance, for
+FreeBSD and Linux images.
+
+- **`legion build` on Linux** (2 to 3 weeks). Each `RUN` step runs in a
+  short-lived crun container on the step's rootfs (a ZFS clone, as the
+  jail's is now), with the step's limits as cgroups and its network as a
+  pod's; the layer is the ZFS diff after it, as on FreeBSD. The
+  Containerfile parser, cache, records, signing and attestation are not
+  FreeBSD's and stay as they are. A build sent to the cluster goes to a
+  node of the image's OS: Linux images to a Linux builder, FreeBSD ones to
+  a FreeBSD one. Building in a VM (`vm.rs`, bhyve) is not ported.
+- **`legion local` on Linux** (2 to 3 weeks). Its runtime and network
+  move onto the crun runtime and the Linux pod network; its doctor checks
+  are phase 2's; its state and the path from a local container to a
+  cluster Service stay as they are. On Linux it sits beside Docker and
+  Podman: its reason is the same commands on a Linux laptop as on
+  FreeBSD servers, not doing what they do.
+
+**Done when** the build tests pass on a Linux node (a Containerfile of
+several steps, cached on a second build, signed and its attestation
+checked) and a build sent to a mixed cluster lands on a node of the right
+OS; and the `legion local` tests that are not about jails pass on Linux,
+a container run locally then deployed to the Linux lab as a Service.
 
 ## Not in this plan
 
 - bhyve tasks on Linux (KVM, Firecracker): only when a workload asks.
-- `legion local` and `legion build` on Linux: Linux nodes run images
-  built anywhere; buildah exists for building.
+- Building in a VM on Linux (`legion build`'s bhyve path).
 - A Kubernetes API or CRI: as ROADMAP.md says, not Legion's direction.
 - Storage without ZFS (LVM, btrfs, plain directories): a backend of its
   own, decided once a user asks for one.
@@ -185,7 +214,7 @@ with no leftovers.
 
 About 3 to 4 months to the end of phase 4, most of it phases 2 and 3; a
 Linux worker that runs Services (phase 2) in about 6 to 8 weeks from the
-start. The estimates assume the lab gains Linux VMs early (Debian 13 and
+start; phase 5 another 4 to 6 weeks, about 4 to 5 months in all. The estimates assume the lab gains Linux VMs early (Debian 13 and
 Ubuntu 24.04, amd64 first, arm64 after) and that the spike finds no
 surprise in the manager.
 
