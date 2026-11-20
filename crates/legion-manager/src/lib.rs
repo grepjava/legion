@@ -198,6 +198,9 @@ pub struct Manager {
     metrics: metrics::Slot,
     /// The requests it has answered, for the metrics.
     requests: std::sync::Arc<requests::Requests>,
+    /// What tasks and nodes use, as their agents report it: for the API,
+    /// the controllers and the metrics.
+    usage: std::sync::Arc<usage::Usage>,
     console: Option<gateway::Console>,
     /// Where it keeps what tasks and nodes used (`history::FILE`).
     data_dir: PathBuf,
@@ -267,6 +270,7 @@ impl Manager {
             vip: config.vip,
             metrics: std::sync::Arc::new(std::sync::RwLock::new(Some(store.clone()))),
             requests: Default::default(),
+            usage: Default::default(),
             data_dir: config.data_dir.clone(),
             store,
         })
@@ -304,6 +308,7 @@ impl Manager {
             id: self.id,
             store: self.metrics.clone(),
             requests: self.requests.clone(),
+            usage: self.usage.clone(),
         }
     }
 
@@ -330,7 +335,7 @@ impl Manager {
             None => None,
         };
         let (closing_tx, closing) = tokio::sync::watch::channel(false);
-        let usage: std::sync::Arc<usage::Usage> = Default::default();
+        let usage = self.usage.clone();
         let floor = tokio::spawn(upgrade::run(
             self.store.clone(),
             self.id,

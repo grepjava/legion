@@ -3185,7 +3185,7 @@ async fn the_leader_reports_the_cluster() {
         "Namespace",
         "",
         "team",
-        serde_json::json!({ "quota": { "tasks": 5, "volumes": 2 } }),
+        serde_json::json!({ "quota": { "tasks": 5, "volumes": 3 } }),
     ))
     .await;
     apply(object(
@@ -3196,6 +3196,7 @@ async fn the_leader_reports_the_cluster() {
     ))
     .await;
     apply(object("Volume", "team", "data", serde_json::json!({}))).await;
+    apply(object("Volume", "team", "pg", serde_json::json!({ "size": "2Gi" }))).await;
 
     // The controllers make the tasks; with no node, they wait.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -3220,9 +3221,10 @@ async fn the_leader_reports_the_cluster() {
         "legion_service_ready_tasks{namespace=\"team\",service=\"web\"} 0",
         "legion_nodes{state=\"ready\"} 0",
         "legion_quota_limit{namespace=\"team\",resource=\"tasks\"} 5",
-        "legion_quota_limit{namespace=\"team\",resource=\"volumes\"} 2",
+        "legion_quota_limit{namespace=\"team\",resource=\"volumes\"} 3",
         "legion_quota_used{namespace=\"team\",resource=\"tasks\"} 0",
-        "legion_quota_used{namespace=\"team\",resource=\"volumes\"} 1",
+        "legion_quota_used{namespace=\"team\",resource=\"volumes\"} 2",
+        "legion_volume_size_bytes{namespace=\"team\",volume=\"pg\",node=\"\"} 2147483648",
     ] {
         assert!(text.contains(&format!("\n{line}\n")), "{line} in:\n{text}");
     }

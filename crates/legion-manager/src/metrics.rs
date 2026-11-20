@@ -24,6 +24,7 @@ pub struct ManagerMetrics {
     pub(crate) id: NodeId,
     pub(crate) store: Slot,
     pub(crate) requests: Arc<crate::requests::Requests>,
+    pub(crate) usage: Arc<crate::usage::Usage>,
 }
 
 impl ManagerMetrics {
@@ -91,8 +92,90 @@ impl ManagerMetrics {
                 Ok(()) => {}
                 Err(e) => tracing::warn!("reading the store for metrics: {e}"),
             }
+            storage(store, &self.usage, &mut m);
         }
         m
+    }
+}
+
+/// What each node's agent last reported of its ZFS pool and of each ZFS
+/// Volume on it (with its heartbeats, within the last minute), and the
+/// size each Volume asks for. On the leader, which the agents report to.
+fn storage(store: &Store, usage: &crate::usage::Usage, m: &mut Metrics) {
+    reported_storage(&usage.fresh_nodes(), m);
+    sizes(store, m);
+}
+
+/// The space each node's agent reported, of its pool and its Volumes.
+fn reported_storage(
+    nodes: &BTreeMap<String, legion_api::dispatch::NodeTelemetry>,
+    m: &mut Metrics,
+) {
+    let mut f = m.gauge(
+        "legion_node_zfs_used_bytes",
+        "ZFS space used on the node, as its agent reports it.",
+    );
+    for (node, t) in nodes {
+        f.sample(&[("node", node)], t.zfs_used_bytes as f64);
+    }
+    let mut f = m.gauge(
+        "legion_node_zfs_available_bytes",
+        "ZFS space available on the node, as its agent reports it.",
+    );
+    for (node, t) in nodes {
+        f.sample(&[("node", node)], t.zfs_avail_bytes as f64);
+    }
+    let mut f = m.gauge(
+        "legion_volume_used_bytes",
+        "Space a ZFS Volume's data uses, as the agent of the node holding it reports it.",
+    );
+    for (node, t) in nodes {
+        for v in &t.volumes {
+            f.sample(
+                &[("namespace", &v.namespace), ("volume", &v.volume), ("node", node)],
+                v.used_bytes as f64,
+            );
+        }
+    }
+    let mut f = m.gauge(
+        "legion_volume_available_bytes",
+        "Space a ZFS Volume may still take: what its size leaves, or the pool's free space if less.",
+    );
+    for (node, t) in nodes {
+        for v in &t.volumes {
+            f.sample(
+                &[("namespace", &v.namespace), ("volume", &v.volume), ("node", node)],
+                v.avail_bytes as f64,
+            );
+        }
+    }
+}
+
+/// The size each ZFS Volume asks for, from the store.
+fn sizes(store: &Store, m: &mut Metrics) {
+    let volumes = match store.list(Kind::Volume, None) {
+        Ok(list) => list.objects,
+        Err(e) => {
+            tracing::warn!("reading the store for metrics: {e}");
+            return;
+        }
+    };
+    let mut f = m.gauge(
+        "legion_volume_size_bytes",
+        "The size a Volume asks for (its ZFS quota), where it asks for one.",
+    );
+    for o in &volumes {
+        let Ok(spec) = legion_api::parse::<legion_api::volume::VolumeSpec>(&o.spec) else {
+            continue;
+        };
+        let (Some(size), legion_api::volume::VolumeDriver::Zfs) = (spec.size, spec.driver) else {
+            continue;
+        };
+        let node = o.status["node"].as_str().unwrap_or_default();
+        f.sample(
+            &[("namespace", &o.metadata.namespace), ("volume", &o.metadata.name), ("node", node)],
+            size.0 as f64,
+        );
     }
 }
 
@@ -290,4 +373,39 @@ fn cluster(store: &Store, m: &mut Metrics) -> Result<(), legion_store::Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use legion_api::dispatch::{NodeTelemetry, VolumeTelemetry};
+
+    #[test]
+    fn each_node_and_volume_reported_is_a_sample() {
+        let nodes = BTreeMap::from([(
+            "n1".to_owned(),
+            NodeTelemetry {
+                zfs_used_bytes: 40,
+                zfs_avail_bytes: 60,
+                volumes: vec![VolumeTelemetry {
+                    namespace: "shop".into(),
+                    volume: "pg".into(),
+                    used_bytes: 7,
+                    avail_bytes: 3,
+                }],
+                ..Default::default()
+            },
+        )]);
+        let mut m = Metrics::default();
+        reported_storage(&nodes, &mut m);
+        let text = m.finish();
+        for line in [
+            "legion_node_zfs_used_bytes{node=\"n1\"} 40",
+            "legion_node_zfs_available_bytes{node=\"n1\"} 60",
+            "legion_volume_used_bytes{namespace=\"shop\",volume=\"pg\",node=\"n1\"} 7",
+            "legion_volume_available_bytes{namespace=\"shop\",volume=\"pg\",node=\"n1\"} 3",
+        ] {
+            assert!(text.contains(&format!("\n{line}\n")), "{line} in:\n{text}");
+        }
+    }
 }
