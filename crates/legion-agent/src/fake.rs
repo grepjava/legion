@@ -81,6 +81,8 @@ struct State {
     unlistable: bool,
     /// Images for another platform than this node's.
     foreign: BTreeSet<String>,
+    /// Images that are Linux's.
+    linux: BTreeSet<String>,
     /// Images pulled only with this account (username, password), and who
     /// pulled them.
     private: BTreeMap<String, ((String, String), BTreeSet<String>)>,
@@ -331,6 +333,13 @@ impl FakeRuntime {
         self.state().foreign.insert(reference.to_owned());
     }
 
+    /// `reference` is a Linux image, which this node runs.
+    pub fn linux_image(&self, reference: &str) {
+        let mut s = self.state();
+        s.images.insert(reference.to_owned());
+        s.linux.insert(reference.to_owned());
+    }
+
     pub fn ignore_vnet(&self) {
         self.state().ignore_vnet = true;
     }
@@ -555,6 +564,13 @@ impl Runtime for FakeRuntime {
             .images
             .contains(reference)
             .then(|| format!("sha256:manifest-of-{reference}")))
+    }
+
+    async fn image_os(&self, reference: &str) -> Result<Option<String>> {
+        let s = self.state();
+        Ok(s.images.contains(reference).then(|| {
+            if s.linux.contains(reference) { "linux" } else { "freebsd" }.to_owned()
+        }))
     }
 
     async fn pull(&self, reference: &str, user: &str, logins: &[Login]) -> Result<()> {

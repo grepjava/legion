@@ -53,6 +53,13 @@ pub trait Runtime: Send + Sync + 'static {
         let _ = reference;
         async { Ok(None) }
     }
+    /// The OS of the image the node holds for `reference` (`freebsd`,
+    /// `linux`), once pulled or loaded. `None` from a runtime that doesn't
+    /// say.
+    fn image_os(&self, reference: &str) -> impl Future<Output = Result<Option<String>>> + Send {
+        let _ = reference;
+        async { Ok(None) }
+    }
     /// Pulls `reference` for `user`, with the login in `logins` for its
     /// registry if there is one.
     fn pull(

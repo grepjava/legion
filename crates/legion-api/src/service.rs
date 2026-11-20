@@ -1752,6 +1752,11 @@ pub struct ServiceStatus {
     /// The pod's images for the generation being run, as resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images: Option<crate::image::ImageStatus>,
+    /// The Linux images its running tasks run, through FreeBSD's Linux
+    /// ABI, each with the native recipe in `examples/` that does what it
+    /// does from FreeBSD's packages (empty when there is none).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub linux_images: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

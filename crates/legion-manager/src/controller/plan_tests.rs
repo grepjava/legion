@@ -748,6 +748,42 @@ fn replicated_scale_up_and_down() {
     assert_eq!(w.status("web").desired, 1);
 }
 
+/// The Linux images a Service's running tasks say they run are on its
+/// status, each with the native recipe in its stead; none once they stop.
+#[test]
+fn a_service_says_which_linux_images_it_runs() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.service("web", &format!("replicas: 2\n{POD}"));
+    w.settle();
+    assert!(w.status("web").linux_images.is_empty());
+    let version = w.next();
+    let t = w
+        .tasks
+        .iter_mut()
+        .find(|t| t.object.metadata.name == "web-1-1")
+        .unwrap();
+    t.status.linux_images = ["postgres:17-alpine".to_owned(), "alpine:3".to_owned()].into();
+    t.object.status = serde_json::to_value(&t.status).unwrap();
+    t.object.metadata.version = version;
+    w.settle();
+    assert_eq!(
+        w.status("web").linux_images,
+        [
+            ("alpine:3".to_owned(), String::new()),
+            ("postgres:17-alpine".to_owned(), "postgres".to_owned()),
+        ]
+        .into()
+    );
+    w.service("web", &format!("replicas: 1\n{POD}"));
+    w.settle();
+    let left = w.tasks();
+    assert_eq!(left, ["web-1-1 running n1"]);
+    w.service("web", &format!("replicas: 0\n{POD}"));
+    w.settle();
+    assert!(w.status("web").linux_images.is_empty(), "no running task, nothing said");
+}
+
 #[test]
 fn failed_tasks_are_replaced_after_a_backoff() {
     let mut w = World::new();

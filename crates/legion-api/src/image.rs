@@ -237,6 +237,23 @@ impl ImageStatus {
     }
 }
 
+/// The native recipe (`examples/<name>`, a template in the console) that
+/// runs from FreeBSD's packages what the Linux image `image` runs, by the
+/// image's name: `docker.io/library/postgres:17` is `postgres`.
+pub fn native_recipe(image: &str) -> Option<&'static str> {
+    let name = image.split('@').next().unwrap_or(image);
+    let name = name.rsplit('/').next().unwrap_or(name);
+    let name = name.split(':').next().unwrap_or(name);
+    Some(match name {
+        "postgres" | "postgresql" => "postgres",
+        "redis" | "valkey" => "redis",
+        "nginx" => "static-site",
+        "node" => "node",
+        "python" => "python",
+        _ => return None,
+    })
+}
+
 /// What a task runs for `image` as written: the digest it was pinned to, if
 /// it was.
 pub fn pinned<'a>(images: &'a BTreeMap<String, String>, image: &'a str) -> &'a str {
@@ -246,6 +263,24 @@ pub fn pinned<'a>(images: &'a BTreeMap<String, String>, image: &'a str) -> &'a s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_linux_image_names_its_native_recipe() {
+        for (image, recipe) in [
+            ("postgres:17-alpine", Some("postgres")),
+            ("docker.io/library/postgres@sha256:00", Some("postgres")),
+            ("ghcr.io/x/redis:7", Some("redis")),
+            ("valkey/valkey:8", Some("redis")),
+            ("nginx:1.27-alpine", Some("static-site")),
+            ("node:22-alpine", Some("node")),
+            ("python:3.12-slim", Some("python")),
+            ("localhost:5000/team/python", Some("python")),
+            ("alpine:3.20", None),
+            ("ubuntu:24.04", None),
+        ] {
+            assert_eq!(native_recipe(image), recipe, "{image}");
+        }
+    }
 
     #[test]
     fn a_reference_runs_as_pinned_or_as_written() {

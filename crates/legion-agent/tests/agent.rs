@@ -1414,8 +1414,20 @@ async fn pinned_images_and_held_ones() {
     );
     h.rt.add_image("local:1");
     let key = h.task("held-2", held).await;
-    h.wait_state(&key, TaskState::Running).await;
+    let status = h.wait_state(&key, TaskState::Running).await;
     assert_eq!(h.rt.spec("shop_held-2_app").unwrap().image, "local:1");
+    assert!(status.linux_images.is_empty(), "a FreeBSD image is not said to be Linux's");
+
+    // A Linux image is said to be one, by the name the pod gives it.
+    h.rt.linux_image("postgres:17-alpine");
+    let key = h
+        .task(
+            "linux-1",
+            r#"containers: [{ name: app, image: "postgres:17-alpine", pullPolicy: never }]"#,
+        )
+        .await;
+    let status = h.wait_state(&key, TaskState::Running).await;
+    assert_eq!(status.linux_images, ["postgres:17-alpine".to_owned()].into());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

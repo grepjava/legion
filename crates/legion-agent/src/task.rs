@@ -645,15 +645,23 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 return Err(Abort::Stopped);
             }
         }
-        // What this node runs for each, by the name the pod gives it.
+        // What this node runs for each, by the name the pod gives it, and
+        // which are Linux's.
         let mut ran = BTreeMap::new();
+        let mut linux = std::collections::BTreeSet::new();
         for c in self.pod().containers() {
             let image = legion_api::image::pinned(&self.a.spec.images, &c.image);
             if let Ok(Some(digest)) = rt.image_digest(image).await {
                 ran.insert(c.image.clone(), digest);
             }
+            if let Ok(Some(os)) = rt.image_os(image).await
+                && os == "linux"
+            {
+                linux.insert(c.image.clone());
+            }
         }
         self.status.images = ran;
+        self.status.linux_images = linux;
 
         let resolv_conf = self
             .ctx

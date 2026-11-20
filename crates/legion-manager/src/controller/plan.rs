@@ -1137,6 +1137,14 @@ fn service(
         autoscale,
         // Written by the resolver, not by this pass.
         images,
+        linux_images: running
+            .iter()
+            .flat_map(|t| &t.status.linux_images)
+            .map(|i| {
+                let recipe = legion_api::image::native_recipe(i).unwrap_or_default();
+                (i.clone(), recipe.to_owned())
+            })
+            .collect(),
     };
     let status = serde_json::to_value(&status).expect("status serialises");
     if s.object.status != status {
