@@ -4,6 +4,10 @@ Written 20 November 2026, at main 2ce337b. A plan, not a commitment: it
 says what a Linux node of Legion would take, in what order, and how each
 step is known to be done. Nothing here is built yet.
 
+**Status: kept in view, not scheduled** (decided 20 November 2026).
+Legion's work stays on FreeBSD; this plan is taken up only when that
+changes.
+
 ## Goal
 
 A Legion node that runs on Linux: the same daemon, the same API, CLI and
