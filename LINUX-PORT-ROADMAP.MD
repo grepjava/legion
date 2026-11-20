@@ -125,8 +125,9 @@ implementations.
   forwarding, and br_netfilter's settings.
 
 **Done when** the lab's first test runs on a Linux node: a Service of a
-Linux image (nginx, Postgres 17, Node 22: the three that don't run under
-FreeBSD's Linux ABI) is deployed, probed, scaled, updated and rolled
+Linux image (Postgres 17 and Node 22, which don't run under FreeBSD's
+Linux ABI, and nginx with its defaults, which needs a workaround there)
+is deployed, probed, scaled, updated and rolled
 back, its logs and exec work, a memory limit holds, and the agent
 restarted adopts its tasks.
 
