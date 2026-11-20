@@ -1017,7 +1017,14 @@ where the phases above first need it:
 8. *Charts*: the card's header with the range, CSV and PNG; a line under
    it saying range and resolution; two series on one chart where they
    belong together (received solid, sent dashed). (Range, PNG and the
-   line built with phase 12; the two series on one chart not yet.)
+   line built with phase 12; the two series on one chart on 2026-11-20:
+   a node's network is one chart, received solid with its fill and sent
+   dashed in the same colour, told apart by the dash and a key rather
+   than by colour (WCAG 1.4.1), both in the tooltip, the table and the
+   CSV's columns. A node's usage now shows that node's ZFS and network,
+   not every node's summed, and a Service's or a task's none. The console
+   test checks both lines, the key and the CSV on n1's usage, and axe
+   that page; passed at f810217.)
 9. *Forms*: names and namespaces filled in, a reset in the title bar, a
    draft kept when the form is left (a dot on its entry).
 10. *The workbench as a thin bar always there*: the last thing done and
