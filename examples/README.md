@@ -4,7 +4,9 @@ FreeBSD applications on Legion, each a compose file and the Containerfile
 of its image, built from FreeBSD's packages with `legion build`. The
 qualification runs every one of them on three nodes as written here
 (`the_examples_run_as_their_readmes_say` in
-`crates/legion/tests/examples.rs`).
+`crates/legion/tests/examples.rs`; the base and every recipe passed at
+56d60ad, 2026-11-20, as did the console's build of static-site on the
+base at 25db40f).
 
 The recipes build on [base](base/Containerfile), Legion's native base
 image: FreeBSD's runtime image with `pkg` added (35 MiB on disk). Build
