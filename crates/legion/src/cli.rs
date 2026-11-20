@@ -1538,6 +1538,7 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
         Command::Usage {
             task,
             namespace,
+            range,
             output,
         } => {
             let namespace = match (&task, namespace) {
@@ -1548,6 +1549,7 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 .usage_history(pb::UsageHistoryRequest {
                     namespace,
                     task: task.unwrap_or_default(),
+                    range_ms: range.map_or(0, |r| r.millis() as i64),
                 })
                 .await?
                 .into_inner();
@@ -2183,9 +2185,23 @@ fn print_objects(objects: &[pb::Object], format: Format, kind: Kind) -> anyhow::
                 let rows: Vec<[String; 6]> = objects
                     .iter()
                     .map(|o| {
+                        // A tag that names another image now than the one
+                        // its tasks run is marked: a restart runs it.
+                        let moved = &o.status["images"]["moved"];
                         let images: Vec<String> = o.spec["pod"]["containers"]
                             .as_array()
-                            .map(|cs| cs.iter().map(|c| field(c, &["image"])).collect())
+                            .map(|cs| {
+                                cs.iter()
+                                    .map(|c| {
+                                        let image = field(c, &["image"]);
+                                        if moved.get(&image).is_some() {
+                                            format!("{image} (tag moved)")
+                                        } else {
+                                            image
+                                        }
+                                    })
+                                    .collect()
+                            })
                             .unwrap_or_default();
                         [
                             o.metadata.namespace.clone(),
@@ -2481,6 +2497,18 @@ fn print_quotas(r: &pb::QuotasResponse, format: Format) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How long samples span, read short: `45 min`, `6 h`, `7 d`.
+fn span(ms: i64) -> String {
+    let min = ms / 60_000;
+    if min < 120 {
+        format!("{min} min")
+    } else if min < 48 * 60 {
+        format!("{} h", min / 60)
+    } else {
+        format!("{} d", min / (24 * 60))
+    }
+}
+
 fn print_usage_history(r: &pb::UsageHistoryResponse, format: Format) -> anyhow::Result<()> {
     let json: Vec<serde_json::Value> = r
         .tasks
@@ -2527,7 +2555,7 @@ fn print_usage_history(r: &pb::UsageHistoryResponse, format: Format) -> anyhow::
                         format!("{:.1}%", max(&cpu)),
                         mib(last(&mem)),
                         mib(max(&mem)),
-                        format!("{} min", (t.samples.len() as i64 * r.step_ms) / 60_000),
+                        span(t.samples.len() as i64 * r.step_ms),
                     ]
                 })
                 .collect();

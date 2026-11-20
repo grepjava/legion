@@ -506,13 +506,18 @@ enum Command {
         output: cli::Format,
     },
     /// What tasks used over the last hour, as the leader sampled it every
-    /// 15 s: now, on average and at most, per task; every sample with -o
-    /// json or yaml.
+    /// 15 s, or further back with --range: now, on average and at most,
+    /// per task; every sample with -o json or yaml.
     Usage {
         /// Only this task (in --namespace).
         task: Option<String>,
         #[arg(short, long)]
         namespace: Option<String>,
+        /// How far back, up to `30d`: past an hour, from what the managers
+        /// keep, a sample a minute within a day and every 15 minutes
+        /// beyond, e.g. `24h`, `7d`.
+        #[arg(long)]
+        range: Option<legion_api::quantity::Duration>,
         #[arg(short, long, value_enum, default_value_t = cli::Format::Table)]
         output: cli::Format,
     },
