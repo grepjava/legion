@@ -2186,19 +2186,29 @@ fn print_objects(objects: &[pb::Object], format: Format, kind: Kind) -> anyhow::
                     .iter()
                     .map(|o| {
                         // A tag that names another image now than the one
-                        // its tasks run is marked: a restart runs it.
+                        // its tasks run is marked: a restart runs it. A
+                        // Linux image is marked too, with the native recipe
+                        // that does what it does, if there is one.
                         let moved = &o.status["images"]["moved"];
+                        let linux = &o.status["linuxImages"];
                         let images: Vec<String> = o.spec["pod"]["containers"]
                             .as_array()
                             .map(|cs| {
                                 cs.iter()
                                     .map(|c| {
-                                        let image = field(c, &["image"]);
-                                        if moved.get(&image).is_some() {
-                                            format!("{image} (tag moved)")
-                                        } else {
-                                            image
+                                        let mut image = field(c, &["image"]);
+                                        if let Some(recipe) = linux.get(&image) {
+                                            image = match recipe.as_str() {
+                                                Some(r) if !r.is_empty() => {
+                                                    format!("{image} (Linux; native: {r})")
+                                                }
+                                                _ => format!("{image} (Linux)"),
+                                            };
                                         }
+                                        if moved.get(field(c, &["image"])).is_some() {
+                                            image = format!("{image} (tag moved)");
+                                        }
+                                        image
                                     })
                                     .collect()
                             })
