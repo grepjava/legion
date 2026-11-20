@@ -40,6 +40,8 @@ pub struct ApiService {
     pub(crate) name: String,
     /// Where it records what it decides, for the audit trail.
     pub(crate) audit: crate::audit::Audit,
+    /// What tasks and nodes used, kept 30 days.
+    pub(crate) history: crate::history::Shared,
     /// `host:port` peers and forwarded requests reach this manager at.
     pub(crate) advertise: String,
     pub(crate) store: Store,
@@ -1574,6 +1576,13 @@ impl Cluster for ApiService {
         if !task.is_empty() && namespace.is_empty() {
             return Err(Status::invalid_argument("a task is named in its namespace"));
         }
+        let range_ms = req.get_ref().range_ms;
+        if range_ms < 0 || range_ms > crate::history::KEEP.as_millis() as i64 {
+            return Err(Status::invalid_argument(format!(
+                "a range is up to {} days",
+                crate::history::KEEP.as_secs() / 86_400
+            )));
+        }
         // Only the leader hears heartbeats; it checks the user's rights.
         if let Some(addr) = self.leader_addr(&req)? {
             let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
@@ -1603,18 +1612,75 @@ impl Cluster for ApiService {
                 Some((key, legion_api::parse(&t.spec).ok()?))
             })
             .collect();
-        let tasks = self
-            .usage
-            .history()
+        // Up to an hour, the leader's own samples; past it, those kept.
+        let hour = crate::usage::HISTORY.as_millis() as i64;
+        let (step_ms, task_series, node_series) = if range_ms <= hour {
+            let tasks = self
+                .usage
+                .history()
+                .into_iter()
+                .map(|(key, (node, samples))| {
+                    let samples = samples
+                        .iter()
+                        .map(|s| (s.at_ms, f64::from(s.cpu), s.memory))
+                        .collect::<Vec<_>>();
+                    (key, (node, String::new(), samples))
+                })
+                .collect::<Vec<_>>();
+            let nodes = self.usage.node_history().into_iter().collect::<Vec<_>>();
+            (crate::usage::STEP.as_millis() as i64, tasks, nodes)
+        } else {
+            let step = crate::history::step_for(std::time::Duration::from_millis(range_ms as u64));
+            let step_ms = step.as_millis() as i64;
+            let from = crate::history::now_ms() - range_ms;
+            let archive = self.history.clone();
+            let kept =
+                tokio::task::spawn_blocking(move || archive.lock().unwrap().range(from, step_ms))
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+            let mut tasks = Vec::new();
+            let mut nodes = Vec::new();
+            for (key, s) in kept {
+                if let Some(task) = key.strip_prefix("t/") {
+                    let samples = s
+                        .points
+                        .iter()
+                        .filter(|(_, v)| v.len() >= 2)
+                        .map(|(at, v)| (*at, v[0], v[1] as u64))
+                        .collect::<Vec<_>>();
+                    tasks.push((task.to_owned(), (s.node, s.service, samples)));
+                } else if let Some(node) = key.strip_prefix("n/") {
+                    let samples = s
+                        .points
+                        .iter()
+                        .filter(|(_, v)| v.len() >= 4)
+                        .map(|(at, v)| crate::usage::NodeSample {
+                            at_ms: *at,
+                            zfs_used_bytes: v[0] as u64,
+                            zfs_avail_bytes: v[1] as u64,
+                            net_rx_bps: v[2] as u64,
+                            net_tx_bps: v[3] as u64,
+                        })
+                        .collect::<Vec<_>>();
+                    nodes.push((node.to_owned(), samples));
+                }
+            }
+            (step_ms, tasks, nodes)
+        };
+        let tasks = task_series
             .into_iter()
-            .filter_map(|(key, (node, samples))| {
+            .filter_map(|(key, (node, kept_service, samples))| {
                 let (ns, name) = key.split_once('/')?;
                 let spec = specs.get(&key);
-                let service = spec.map(|s| s.service.clone()).unwrap_or_else(|| {
-                    let mut parts = name.rsplitn(3, '-');
-                    let (_, _, svc) = (parts.next(), parts.next(), parts.next());
-                    svc.unwrap_or(name).to_owned()
-                });
+                let kept_service = (!kept_service.is_empty()).then_some(kept_service);
+                let service = spec
+                    .map(|s| s.service.clone())
+                    .or(kept_service)
+                    .unwrap_or_else(|| {
+                        let mut parts = name.rsplitn(3, '-');
+                        let (_, _, svc) = (parts.next(), parts.next(), parts.next());
+                        svc.unwrap_or(name).to_owned()
+                    });
                 let wanted = ns != SYSTEM_NAMESPACE
                     && (namespace.is_empty() || ns == namespace)
                     && (task.is_empty() || name == task)
@@ -1632,18 +1698,17 @@ impl Cluster for ApiService {
                     memory_limit_bytes: spec.and_then(|s| pod_limits(&s.pod).1).unwrap_or(0),
                     samples: samples
                         .iter()
-                        .map(|s| pb::UsageSample {
-                            at_ms: s.at_ms,
-                            cpu_percent: f64::from(s.cpu),
-                            memory_bytes: s.memory,
+                        .map(|&(at_ms, cpu_percent, memory_bytes)| pb::UsageSample {
+                            at_ms,
+                            cpu_percent,
+                            memory_bytes,
                         })
                         .collect(),
                 })
             })
             .collect();
         let nodes = if task.is_empty() && caller.may(&self.store, Verb::Read, Kind::Node, "") {
-            self.usage
-                .node_history()
+            node_series
                 .into_iter()
                 .map(|(node, samples)| pb::NodeSeries {
                     node,
@@ -1664,7 +1729,7 @@ impl Cluster for ApiService {
         };
         Ok(Response::new(pb::UsageHistoryResponse {
             tasks,
-            step_ms: crate::usage::STEP.as_millis() as i64,
+            step_ms,
             nodes,
         }))
     }
@@ -2125,6 +2190,36 @@ impl Cluster for ApiService {
             crate::audit::write(self, &events).await?;
         }
         Ok(Response::new(pb::RecordAuditResponse {}))
+    }
+
+    async fn usage_archive(
+        &self,
+        req: Request<pb::UsageArchiveRequest>,
+    ) -> Result<Response<pb::UsageArchiveResponse>, Status> {
+        // From another manager only: what tasks used, unfiltered, is not
+        // for users.
+        let tls = self.peer_tls.is_some();
+        if let Some(id) = crate::tls::caller(&req, tls)?
+            && id.role != Role::Manager
+        {
+            return Err(Status::permission_denied(format!(
+                "{id} may not read the usage archive"
+            )));
+        }
+        self.caller(&req)?;
+        let since_ms = req.into_inner().since_ms;
+        let archive = self.history.clone();
+        let entries = tokio::task::spawn_blocking(move || {
+            archive
+                .lock()
+                .unwrap()
+                .entries_since(since_ms, crate::history::BATCH)
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+        let entries_json =
+            serde_json::to_vec(&entries).map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(pb::UsageArchiveResponse { entries_json }))
     }
 
     async fn me(&self, req: Request<pb::MeRequest>) -> Result<Response<pb::MeResponse>, Status> {

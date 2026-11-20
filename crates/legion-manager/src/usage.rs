@@ -82,7 +82,7 @@ impl Usage {
         self.record_at(node, reported, runs_on, Instant::now(), at_ms);
     }
 
-    fn record_at(
+    pub(crate) fn record_at(
         &self,
         node: &str,
         reported: impl IntoIterator<Item = (String, TaskUsage)>,

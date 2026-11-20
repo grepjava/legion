@@ -1227,6 +1227,8 @@ async fn log_search(
 struct HistoryScope {
     namespace: Option<String>,
     task: Option<String>,
+    /// How far back, in milliseconds (an hour if not said).
+    range_ms: Option<i64>,
 }
 
 /// `Cluster.UsageHistory`: `{step_ms, tasks: [{namespace, task, node,
@@ -1243,6 +1245,7 @@ async fn usage_history(
         .usage_history(pb::UsageHistoryRequest {
             namespace: scope.namespace.unwrap_or_default(),
             task: scope.task.unwrap_or_default(),
+            range_ms: scope.range_ms.unwrap_or_default(),
         })
         .await?
         .into_inner();

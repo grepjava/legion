@@ -732,6 +732,133 @@ async fn three_managers_forward_and_fail_over() {
     }
 }
 
+/// What tasks used is kept 30 days in a file of each manager's own (CONSOLE.md,
+/// phase 12): a week kept by the first manager alone is copied by the
+/// others within a minute or two, so the next leader answers for it once
+/// the one that led is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_weeks_usage_outlives_a_change_of_leader() {
+    const MIN: i64 = 60_000;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    // A week, every 15 minutes, as the file has it once compacted.
+    let first = (now - 7 * 24 * 60 * MIN).div_euclid(15 * MIN) * 15 * MIN + 15 * MIN;
+    let mut lines = String::new();
+    let mut at = first;
+    while at < now - MIN {
+        lines.push_str(
+            &serde_json::json!({
+                "k": "t/default/seed-1-1", "n": "w1", "s": "seed", "t": at,
+                "v": [5.0, 64.0 * 1024.0 * 1024.0],
+            })
+            .to_string(),
+        );
+        lines.push('\n');
+        at += 15 * MIN;
+    }
+    let kept = lines.lines().count();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("usage-history.jsonl"), lines).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut managers = vec![Running::serve(dir, listener, None, None).await];
+    for _ in 0..2 {
+        managers.push(Running::start().await);
+    }
+    form_cluster(&managers).await;
+
+    // Each copies the week, on the minute.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+    for (i, m) in managers.iter().enumerate() {
+        let mut c = m.cluster().await;
+        loop {
+            let json = c
+                .usage_archive(legion_proto::v1::UsageArchiveRequest { since_ms: i64::MIN })
+                .await
+                .unwrap()
+                .into_inner()
+                .entries_json;
+            let entries: Vec<serde_json::Value> = serde_json::from_slice(&json).unwrap();
+            let has = entries
+                .iter()
+                .filter(|e| e["k"] == "t/default/seed-1-1")
+                .count();
+            if has == kept {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "manager {i} has {has} of the week's {kept} samples"
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    // The leader stopped; the next answers for the week.
+    let mut leader = None;
+    for (i, m) in managers.iter().enumerate() {
+        let id = m
+            .cluster()
+            .await
+            .status(StatusRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .node_id;
+        if m.store.raft.metrics().borrow().current_leader == Some(id) {
+            leader = Some(i);
+        }
+    }
+    let old = managers.remove(leader.expect("a leader"));
+    old.stop().await;
+    let c = managers[0].cluster().await;
+    let r = eventually(|| {
+        let mut c = c.clone();
+        async move {
+            c.usage_history(legion_proto::v1::UsageHistoryRequest {
+                range_ms: 7 * 24 * 60 * MIN,
+                ..Default::default()
+            })
+            .await
+        }
+    })
+    .await
+    .into_inner();
+    assert_eq!(r.step_ms, 15 * MIN);
+    let seed = r
+        .tasks
+        .iter()
+        .find(|t| t.task == "seed-1-1")
+        .unwrap_or_else(|| panic!("the week, from the next leader: {:?}", r.tasks));
+    assert_eq!(seed.service, "seed");
+    assert_eq!(seed.node, "w1");
+    let span = seed.samples.last().unwrap().at_ms - seed.samples[0].at_ms;
+    assert!(span > 6 * 24 * 60 * MIN + 23 * 60 * MIN, "{span} ms");
+    assert!(seed.samples.iter().all(|s| s.cpu_percent == 5.0));
+    // An hour, as before: the leader's own samples, none of them yet.
+    let r = c
+        .clone()
+        .usage_history(legion_proto::v1::UsageHistoryRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(r.step_ms, 15_000);
+    // Further back than kept is refused.
+    let refused = c
+        .clone()
+        .usage_history(legion_proto::v1::UsageHistoryRequest {
+            range_ms: 31 * 24 * 60 * MIN,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    for m in managers {
+        m.stop().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mutual_tls() {
     let ca = Ca::generate().unwrap();

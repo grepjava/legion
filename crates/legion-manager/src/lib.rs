@@ -27,6 +27,7 @@ mod diagnostics;
 mod dispatcher;
 mod events;
 mod exports;
+mod history;
 #[cfg(feature = "test-hooks")]
 pub mod hooks;
 mod image_ops;
@@ -198,6 +199,8 @@ pub struct Manager {
     /// The requests it has answered, for the metrics.
     requests: std::sync::Arc<requests::Requests>,
     console: Option<gateway::Console>,
+    /// Where it keeps what tasks and nodes used (`history::FILE`).
+    data_dir: PathBuf,
 }
 
 impl Manager {
@@ -264,6 +267,7 @@ impl Manager {
             vip: config.vip,
             metrics: std::sync::Arc::new(std::sync::RwLock::new(Some(store.clone()))),
             requests: Default::default(),
+            data_dir: config.data_dir.clone(),
             store,
         })
     }
@@ -396,6 +400,10 @@ impl Manager {
         let api = api::ApiService {
             id: self.id,
             audit,
+            history: std::sync::Arc::new(std::sync::Mutex::new(history::Archive::open(
+                &self.data_dir.join(history::FILE),
+                history::now_ms(),
+            ))),
             name: self.name.clone(),
             advertise: self.advertise.clone(),
             store: self.store.clone(),
@@ -417,6 +425,7 @@ impl Manager {
             insecure_registries: self.insecure_registries.clone().into(),
         };
         let names = tokio::spawn(managers::run(api.clone(), api.closing.clone()));
+        let keeping = tokio::spawn(history::run(api.clone()));
         let builds = self.controllers.then(|| {
             tokio::spawn(build::run(
                 api.clone(),
@@ -557,6 +566,7 @@ impl Manager {
         let _ = promote.await;
         let _ = floor.await;
         let _ = names.await;
+        let _ = keeping.await;
         let _ = alerting.await;
         let _ = notifying.await;
         let _ = eventing.await;
