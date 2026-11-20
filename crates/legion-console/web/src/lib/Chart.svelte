@@ -3,10 +3,11 @@
   // a faint grid, the title naming it, a crosshair and tooltip on hover,
   // and the latest, average and highest values as text beside it; every
   // sample as a table too, behind a disclosure, for whoever can't see the
-  // line or wants the numbers (WCAG 1.1.1, 1.3.1).
+  // line or wants the numbers (WCAG 1.1.1, 1.3.1). CSV and PNG to take away.
   import { t } from '#lib/i18n.svelte.ts';
   import Ico from '#lib/Ico.svelte';
-  import { Download } from '@lucide/svelte';
+  import { duration, stamp } from '#lib/span.ts';
+  import { Download, ImageDown } from '@lucide/svelte';
 
   let {
     title,
@@ -101,19 +102,78 @@
   const last = $derived(values.length ? values[values.length - 1] : 0);
   const avg = $derived(values.length ? values.reduce((a, b) => a + b, 0) / values.length : 0);
   const max = $derived(values.length ? Math.max(...values) : 0);
-  const clock = (tm: number) =>
-    new Date(tm).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const clock = (tm: number) => stamp(tm, t1 - t0);
 
   // The samples as CSV, for a spreadsheet: the time in ISO 8601, the value.
   function downloadCsv() {
     const rows = [`time,${JSON.stringify(title)}`, ...points.map(([tm, v]) => `${new Date(tm).toISOString()},${v}`)];
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([rows.join('\n') + '\n'], { type: 'text/csv' }));
-    a.download = `${title.replace(/[^\w.-]+/g, '-').toLowerCase()}.csv`;
+    a.download = fileName('csv');
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }
-  const spanMin = $derived(Math.max(1, Math.round((t1 - t0) / 60000)));
+  // The file a chart is saved as.
+  const fileName = (ext: string) => `${title.replace(/[^\w.-]+/g, '-').toLowerCase()}.${ext}`;
+  const spanText = $derived(
+    t('{span} from {from} to {to} · a sample every {every}', {
+      span: duration(t1 - t0),
+      from: stamp(t0, t1 - t0),
+      to: stamp(t1, t1 - t0),
+      every: duration(step)
+    })
+  );
+
+  // The chart as a PNG, its title and span above it, at twice its size.
+  // The page's styles don't travel with an image: each mark takes its
+  // colours inline first. A data: URL, as the console's policy takes no
+  // blob: images.
+  let svg: SVGSVGElement | undefined = $state();
+  let saving = $state(false);
+  async function downloadPng() {
+    if (!svg || saving) return;
+    saving = true;
+    try {
+      const copy = svg.cloneNode(true) as SVGSVGElement;
+      const from = svg.querySelectorAll('*');
+      const to = copy.querySelectorAll('*');
+      const props = ['fill', 'stroke', 'stroke-width', 'stroke-dasharray', 'stroke-linejoin', 'stroke-linecap',
+        'stop-color', 'stop-opacity', 'opacity', 'font-size', 'font-family', 'font-weight'];
+      from.forEach((el, i) => {
+        const cs = getComputedStyle(el);
+        const d = to[i] as SVGElement;
+        for (const p of props) d.style.setProperty(p, cs.getPropertyValue(p));
+      });
+      copy.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+      const img = new Image();
+      img.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(new XMLSerializer().serializeToString(copy))}`;
+      await img.decode();
+      const head = 40;
+      const scale = 2;
+      const canvas = document.createElement('canvas');
+      canvas.width = width * scale;
+      canvas.height = (height + head) * scale;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.scale(scale, scale);
+      const page = getComputedStyle(svg.closest('figure') ?? svg);
+      const panel = getComputedStyle(document.body).getPropertyValue('--panel').trim() || '#fff';
+      ctx.fillStyle = panel;
+      ctx.fillRect(0, 0, width, height + head);
+      ctx.fillStyle = page.color;
+      ctx.font = `600 13px ${page.fontFamily}`;
+      ctx.fillText(title, pad.left, 16);
+      ctx.font = `11px ${page.fontFamily}`;
+      ctx.fillText(spanText, pad.left, 32);
+      ctx.drawImage(img, 0, head, width, height);
+      const a = document.createElement('a');
+      a.href = canvas.toDataURL('image/png');
+      a.download = fileName('png');
+      a.click();
+    } finally {
+      saving = false;
+    }
+  }
 
   let hover: number | null = $state(null);
   function move(e: PointerEvent) {
@@ -147,16 +207,23 @@
         aria-label={t('Download {title} as CSV', { title })}
         onclick={downloadCsv}><Ico icon={Download} size={14} />CSV</button
       >
+      <button
+        type="button"
+        class="sm chart-tool png"
+        title={t('Download the chart as a PNG image')}
+        aria-label={t('Download {title} as PNG', { title })}
+        disabled={points.length < 2 || saving}
+        onclick={downloadPng}><Ico icon={ImageDown} size={14} />PNG</button
+      >
     {/if}
   </figcaption>
   {#if points.length < 2}
     <p class="muted">
-      {t('Not enough samples yet: one comes every {seconds} s.', {
-        seconds: Math.round(step / 1000)
-      })}
+      {t('Not enough samples yet: one comes every {every}.', { every: duration(step) })}
     </p>
   {:else}
     <svg
+      bind:this={svg}
       {width}
       {height}
       role="img"
@@ -204,9 +271,7 @@
         </g>
       {/if}
     </svg>
-    <p class="chart-range muted">
-      {t('last {minutes} min · a sample every {seconds} s', { minutes: spanMin, seconds: Math.round(step / 1000) })}
-    </p>
+    <p class="chart-range muted">{spanText}</p>
     <details class="values">
       <summary>{t('{title}: values as a table', { title })}</summary>
       <!-- Scrolled, and focusable so the keyboard scrolls it too (WCAG 2.1.1,
@@ -224,7 +289,7 @@
           <tbody>
             {#each [...points].reverse() as [pt, pv] (pt)}
               <tr>
-                <td>{new Date(pt).toLocaleTimeString()}</td>
+                <td>{t1 - t0 > 86_400_000 ? new Date(pt).toLocaleString() : new Date(pt).toLocaleTimeString()}</td>
                 <td>{format(pv)}</td>
               </tr>
             {/each}
@@ -243,6 +308,9 @@
     grid-row: 1;
     align-self: center;
   }
+  .chart-tool.png {
+    grid-column: 3;
+  }
   figcaption > :global(.muted) {
     grid-column: 1 / -1;
   }
@@ -255,7 +323,7 @@
   }
   figcaption {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) auto auto;
     gap: 0.1rem 0.65rem;
     align-items: baseline;
     margin-bottom: 0.2rem;

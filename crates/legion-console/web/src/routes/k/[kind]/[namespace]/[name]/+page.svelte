@@ -6,6 +6,7 @@
   import { t } from '#lib/i18n.svelte.ts';
   import Actions from '#lib/Actions.svelte';
   import Labels from '#lib/Labels.svelte';
+  import Notes, { NOTE } from '#lib/Notes.svelte';
   import LogSearch from '#lib/LogSearch.svelte';
   import NodeTasks from '#lib/NodeTasks.svelte';
   import ServiceTasks from '#lib/ServiceTasks.svelte';
@@ -259,6 +260,25 @@
   <div role="tabpanel" id="panel" aria-labelledby="tab-{tab}">
 
   {#if tab === 'details'}
+    {#if kind !== 'Config' && kind !== 'Secret'}<Notes {kind} {namespace} {name} />{/if}
+    {#if kind === 'Service' && Object.keys(object.status?.images?.moved ?? {}).length}
+      <div class="card moved" data-moved>
+        <ul>
+          {#each Object.entries(object.status.images.moved as Record<string, string>) as [image, digest] (image)}
+            <li>
+              <span class="state wait">{t('Tag moved since the rollout')}</span>
+              {t('{image} names {digest} now, not the image its tasks run.', {
+                image,
+                digest: digest.replace(/^(sha256:.{12}).*$/, '$1…')
+              })}
+            </li>
+          {/each}
+        </ul>
+        <p class="muted">
+          {t('Restart it to run what the tag names now, or name the image by its digest to keep it as it is.')}
+        </p>
+      </div>
+    {/if}
     <dl class="facts">
       {#each cols as c (c.label)}
         {#if c.value(object)}
@@ -284,6 +304,13 @@
       <dd><code>{object.metadata.uid}</code></dd>
       <dt>{t('Labels')}</dt>
       <dd><Labels {object} {scoped} /></dd>
+      {#if kind === 'Config' && object.metadata.labels?.[NOTE]?.includes('/')}
+        {@const [onKind, onName] = object.metadata.labels[NOTE].split('/', 2)}
+        <dt>{t('A note on')}</dt>
+        <dd>
+          <a href="/k/{onKind}/{onKind === 'Node' ? '_' : namespace}/{onName}">{object.metadata.labels[NOTE]}</a>
+        </dd>
+      {/if}
       {#if kind === 'Node'}
         <dt>{t('Taints')}</dt>
         <dd><Taints node={object} /></dd>
@@ -355,3 +382,13 @@
 {:else}
   <p class="muted">…</p>
 {/if}
+
+<style>
+  .moved {
+    margin-bottom: 1rem;
+  }
+  .moved ul {
+    margin: 0 0 0.35rem;
+    padding-left: 1rem;
+  }
+</style>

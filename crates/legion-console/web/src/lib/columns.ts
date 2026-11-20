@@ -90,7 +90,15 @@ export function columns(kind: string): Column[] {
         { label: t('Replicas'), value: (o) => s(o.spec?.replicas) },
         {
           label: t('Image'),
-          value: (o) => s(o.spec?.pod?.containers?.map((c: { image: string }) => c.image).join(', '))
+          // A tag that names another image now than the one running says so.
+          value: (o) =>
+            s(
+              o.spec?.pod?.containers
+                ?.map((c: { image: string }) =>
+                  o.status?.images?.moved?.[c.image] ? t('{image} (tag moved)', { image: c.image }) : c.image
+                )
+                .join(', ')
+            )
         },
         {
           label: t('Ready'),

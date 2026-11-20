@@ -870,14 +870,17 @@ export interface NodeSeries {
   samples: [number, number, number, number, number][];
 }
 
-/** `legion usage`: what tasks and nodes used over the last hour, as the leader sampled it. */
+/** `legion usage`: what tasks and nodes used over the last hour as the leader sampled it, or over `rangeMs` from what the managers keep. */
 export function usageHistory(
   namespace: string,
-  task = ''
+  task = '',
+  rangeMs = 0
 ): Promise<{ step_ms: number; tasks: TaskSeries[]; nodes?: NodeSeries[] }> {
   const params = new URLSearchParams();
   if (namespace) params.set('namespace', namespace);
   if (task) params.set('task', task);
+  // Past an hour, from the 30 days the managers keep.
+  if (rangeMs) params.set('range_ms', String(rangeMs));
   return call('GET', `/api/usage-history?${params}`);
 }
 

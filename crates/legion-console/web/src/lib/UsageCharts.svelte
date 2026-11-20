@@ -4,12 +4,16 @@
 </script>
 
 <script lang="ts">
-  // What a task, a service's tasks or a node's tasks used over the last
-  // hour (`legion usage`), as the leader sampled it: CPU, memory, and
-  // (when node telemetry is in scope) ZFS pool space and network throughput.
+  // What a task, a service's tasks or a node's tasks used (`legion usage`):
+  // CPU, memory, and (when node telemetry is in scope) ZFS pool space and
+  // network throughput. The last hour as the leader sampled it, or up to
+  // 30 days from what the managers keep; a strip under the charts to look
+  // closer at part of it.
   import { usageHistory, type NodeSeries, type TaskSeries } from '#lib/api.ts';
   import Chart from '#lib/Chart.svelte';
+  import RangeStrip from '#lib/RangeStrip.svelte';
   import { sumHeld } from '#lib/series.ts';
+  import { RANGES, duration } from '#lib/span.ts';
   import { t, tn } from '#lib/i18n.svelte.ts';
 
   let {
@@ -34,13 +38,18 @@
   let step = $state(15_000);
   let error = $state('');
   let loaded = $state(false);
+  // How far back, and the window on it the charts show (null: all of it).
+  let range = $state(RANGES[0]);
+  let view: [number, number] | null = $state(null);
 
   $effect(() => {
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    const back = range;
+    view = null;
     const load = async () => {
       try {
-        const r = await usageHistory(namespace, task);
+        const r = await usageHistory(namespace, task, back === RANGES[0] ? 0 : back);
         if (stopped) return;
         series = r.tasks;
         nodeSeries = r.nodes ?? [];
@@ -50,7 +59,8 @@
         error = (e as Error).message;
       } finally {
         loaded = true;
-        if (!stopped) timer = setTimeout(load, step);
+        // As often as samples come, and at least each minute.
+        if (!stopped) timer = setTimeout(load, Math.min(Math.max(step, 15_000), 60_000));
       }
     };
     load();
@@ -75,6 +85,12 @@
       ),
       tasks: picked.length
     };
+  });
+  // What the window on the strip covers.
+  const shown = $derived.by(() => {
+    const w = view;
+    const within = (p: [number, number][]) => (w ? p.filter(([at]) => at >= w[0] && at <= w[1]) : p);
+    return { cpu: within(summed.cpu), mem: within(summed.mem), zfs: within(summed.zfs), net: within(summed.net) };
   });
 
   // Requests and limits of the tasks there now, those with a recent sample;
@@ -124,30 +140,48 @@
 </script>
 
 {#if error}<p class="error" role="alert">{error}</p>{/if}
+{#if !compact}
+  <div class="ranges" role="group" aria-label={t('How far back')}>
+    {#each RANGES as r (r)}
+      <button
+        type="button"
+        class="sm"
+        class:primary={range === r}
+        aria-pressed={range === r}
+        data-range={r}
+        onclick={() => (range = r)}>{duration(r)}</button
+      >
+    {/each}
+  </div>
+{/if}
 {#if loaded && !summed.tasks && !summed.zfs.length}
   <p class="muted">
-    {t('No usage heard in the last hour: nothing ran, or the leader started since.')}
+    {range === RANGES[0]
+      ? t('No usage heard in the last hour: nothing ran, or the leader started since.')
+      : t('No usage kept for the last {span}.', { span: duration(range) })}
   </p>
 {:else if loaded}
   {#if !compact}
     <p class="muted">
       {summed.tasks > 1
         ? tn(
-            'The last hour, a sample every {seconds} s, summed over {n} tasks. CPU is in percent of one CPU.',
-            'The last hour, a sample every {seconds} s, summed over {n} tasks. CPU is in percent of one CPU.',
+            'The last {span}, a sample every {every}, summed over {n} tasks. CPU is in percent of one CPU.',
+            'The last {span}, a sample every {every}, summed over {n} tasks. CPU is in percent of one CPU.',
             summed.tasks,
-            { seconds: Math.round(step / 1000) }
+            { span: duration(range), every: duration(step) }
           )
-        : t('The last hour, a sample every {seconds} s. CPU is in percent of one CPU.', {
-            seconds: Math.round(step / 1000)
+        : t('The last {span}, a sample every {every}. CPU is in percent of one CPU.', {
+            span: duration(range),
+            every: duration(step)
           })}
     </p>
+    <RangeStrip points={summed.cpu.length ? summed.cpu : summed.zfs} bind:view />
   {/if}
   <div class={compact ? 'grid-2' : ''}>
     <div class={compact ? 'card' : ''}>
       <Chart
         title={t('CPU')}
-        points={summed.cpu}
+        points={shown.cpu}
         format={percent}
         {step}
         marks={marks.cpu}
@@ -158,7 +192,7 @@
     <div class={compact ? 'card' : ''}>
       <Chart
         title={t('Memory')}
-        points={summed.mem}
+        points={shown.mem}
         format={bytes}
         {step}
         marks={marks.mem}
@@ -170,7 +204,7 @@
       <div class={compact ? 'card' : ''}>
         <Chart
           title={t('ZFS pool used')}
-          points={summed.zfs}
+          points={shown.zfs}
           format={bytes}
           {step}
           tone="zfs"
@@ -182,7 +216,7 @@
       <div class={compact ? 'card' : ''}>
         <Chart
           title={t('Network throughput')}
-          points={summed.net}
+          points={shown.net}
           format={bps}
           {step}
           tone="wait"
@@ -209,3 +243,13 @@ sum by (task) (legion_container_memory_bytes${selector})`}</pre>
     </details>
   {/if}
 {/if}
+
+<style>
+  .ranges {
+    display: inline-flex;
+    margin-bottom: 0.5rem;
+  }
+  .ranges button + button {
+    margin-left: -1px;
+  }
+</style>
