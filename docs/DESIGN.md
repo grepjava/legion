@@ -561,7 +561,11 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   ended, each such task's containers with its state, node and image as
   labels (`legion_task_info`, 1) and when its pod started
   (`legion_task_start_time_seconds`, as its node's runtime recorded it,
-  kept across a daemon restart), services' replicas and ready tasks, nodes, and each quota's
+  kept across a daemon restart), services' replicas and ready tasks, nodes,
+  each node's ZFS space used and available and each ZFS Volume's used and
+  available bytes as its agent last reported them (`legion_node_zfs_*`,
+  `legion_volume_{used,available}_bytes`), each sized Volume's size
+  (`legion_volume_size_bytes`), and each quota's
   limits beside what the namespace uses of them. A sum across managers
   then counts each thing once. The agent reports each running
   container's usage from rctl on the container's own jail: CPU time and
