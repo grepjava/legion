@@ -3,7 +3,9 @@
 `legion.json` shows a Legion cluster in Grafana: whether the managers
 have a leader, nodes and tasks by state, services short of ready tasks,
 container restarts, CPU, memory and storage I/O by task and by node,
-quota use, and each node's runtime.
+quota use, each node's runtime, every task with its node, state and
+image and the youngest by when they started, and ZFS space: each node's,
+and each Volume's used, available and size.
 
 It reads what the daemons serve with `--metrics-listen` (DESIGN.md,
 Metrics). Have Prometheus scrape every node, managers and workers:
@@ -21,10 +23,10 @@ names every namespace's services and tasks, so keep it on an admin
 network.
 
 Only the leading manager reports the cluster (nodes, services, tasks,
-quotas), so sums across managers count each thing once. Container usage
+quotas, and the ZFS space its agents report), so sums across managers count each thing once. Container usage
 comes from each node's agent and is labelled with the node Prometheus
 scraped (`instance`).
 
 To add it: in Grafana, Dashboards → New → Import, upload `legion.json`,
 and pick the Prometheus data source. The Namespace menu narrows the task,
-service, resource and quota panels.
+service, resource, quota and Volume panels.
