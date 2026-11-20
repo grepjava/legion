@@ -46,6 +46,13 @@ failing as described fails the test, so this page is changed with it.
 The ABI has no namespaces, cgroups, seccomp or io_uring either (DESIGN.md
 6.6), so images that run containers or sandboxes of their own don't work.
 
+Native images are the better choice where there is one: `examples/`
+holds recipes for PostgreSQL, Redis, nginx, Node.js and Python, built
+from FreeBSD's packages on Legion's native base (docs/IMAGES.md). A
+Service running a Linux image says so in `status.linuxImages`, with the
+recipe in its stead; `legion list services` and the console show it.
+The test above checks that for each image that works.
+
 ## legion local
 
 `legion local run --linux` uses the same runtime (`legion_jail`) and the

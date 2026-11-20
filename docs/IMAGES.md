@@ -34,6 +34,38 @@ Match the base image's release to the nodes' FreeBSD release or an older
 one: a jail shares the host's kernel, and programs built for a newer
 release may not run on an older kernel.
 
+### Legion's native base and recipes
+
+`examples/base` builds Legion's own base: FreeBSD's runtime image with
+`pkg` added, 35 MiB on disk against the notoolchain image's 73. Recipes
+build on it, each installing one stack from FreeBSD's packages:
+
+| Recipe | Image | What it runs |
+|---|---|---|
+| `examples/postgres` | `examples/postgres:17` | PostgreSQL 17, its data on a Volume, its password from a Secret |
+| `examples/redis` | `examples/redis:1` | Redis, its data on a Volume |
+| `examples/static-site` | `examples/nginx:1` | nginx serving a page from Configs |
+| `examples/node` | `examples/node:24` | Node.js 24, for an app built FROM it |
+| `examples/python` | `examples/python:3` | Python 3, for an app built FROM it |
+
+Build the base first, then a recipe; each takes `--build-arg
+BASE=<ref>` for a base pushed to a registry:
+
+```sh
+legion build -t examples/base:15.1 examples/base
+legion build -t examples/postgres:17 examples/postgres
+```
+
+Every recipe is also a template in the console (Templates, then Use),
+and a compose file for `legion stack deploy`. To patch them all, rebuild
+the base (it takes FreeBSD's newest runtime image), then the recipes:
+`pkg install` in each fetches the packages' newest versions.
+
+A Service running a Linux image says so: `status.linuxImages` names each
+one with the recipe that runs the same from FreeBSD's packages, `legion
+list services` marks it `(Linux; native: <recipe>)`, and the console's
+Service page links to the recipe's template.
+
 ## Building a FreeBSD image
 
 Build with `legion build`, on a FreeBSD machine with Legion installed.
@@ -287,7 +319,9 @@ Many Linux images run unchanged. These do not:
   example some monitoring agents, may fail or report wrong values.
 
 If a program is in FreeBSD's ports, a FreeBSD image is the better choice:
-it runs natively, without the compatibility layer.
+it runs natively, without the compatibility layer. For PostgreSQL, Redis,
+nginx, Node.js and Python, the recipes above are ready-made; a Service
+running one of those as a Linux image is pointed to its recipe.
 
 ## Removing images
 
