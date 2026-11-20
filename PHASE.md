@@ -7,7 +7,11 @@ done and what comes next. Update it in the same commit as the work.
 Current work: **none scheduled**. Phases 1 to 4 met their exit criteria,
 phase 5's features are built (bhyve since as VM pods), and the hardening is
 done, ROADMAP.md's milestones with it (PLAN.md's phases 1 to 9). Since
-v0.1.19 the work has been the web console, released as v0.2.0 ([CONSOLE.md](CONSOLE.md)).
+v0.1.19 the work has been the web console, released as v0.2.0 ([CONSOLE.md](CONSOLE.md));
+since v0.2.0, the console's phases 7 to 12, Legion's native base image and
+recipes, and more metrics (the last section below). The Linux port
+([LINUX-PORT-ROADMAP.MD](LINUX-PORT-ROADMAP.MD)) is kept in view, not
+scheduled.
 
 ## Phase 0 — Spikes
 
@@ -1597,3 +1601,38 @@ jailer's repository is archived, and its port report (bug 300442) was
 withdrawn on 2026-11-18; the port's `distinfo` and crates are made for
 v0.2.0, and bug 300441 is to be updated to it.
 
+### Since v0.2.0
+
+On main, not yet released (120 commits to 35f284b):
+- **Replicated Volumes fail over**: a replica's `failover: automatic`
+  carries the Volume on from its last copy once its node is down (a claim
+  asking for it needs `onPartition: stop`), or by hand with `legion volume
+  promote`; a replica's state (pending, ready, stale, failed), its copy
+  under way and its last ten copies, and `replica-stale` raised.
+- **The console's phases 7 to 12** (CONSOLE.md): replication in view;
+  each node's host and ZFS pools (`legion node pools`, `errors-seen`,
+  `scrub`; `pool-degraded`), with its load; alerts sent by an
+  `AlertReceiver` (webhook, ntfy or SMTP; `legion alerts test`); long
+  operations followed (`legion activity`, the workbench's bar); checks
+  before disruption (a drain, a Volume's move, a node's removal or a
+  Service's deletion is worked out by the leader first, and refused by
+  the CLI and held in the console's dialog where it would not complete);
+  usage kept 30 days by every manager (`legion usage --range`, charts over
+  an hour to 30 days), a Service's tags that name another image now
+  (`(tag moved)`); and the console's feel, all twelve items, the last
+  network received and sent on one chart. The console test passed on the
+  lab at f810217.
+- **Native images**: `examples/base`, FreeBSD's runtime image with `pkg`
+  (35 MiB on disk), and recipes on it for PostgreSQL 17, Redis, nginx,
+  Node.js 24 and Python 3, each a console template (docs/IMAGES.md). A
+  Service running a Linux image says so (`status.linuxImages`, with the
+  recipe that runs the same natively), as do `legion list services` and
+  its console page. The examples test passed at 56d60ad, the Linux images
+  and console build tests at 25db40f.
+- **Metrics**: `legion_task_info` (each container of a task with its
+  state, node and image) and `legion_task_start_time_seconds` (kept when
+  the daemon restarts and takes the pod over); each node's ZFS space and
+  each ZFS Volume's used, available and size (DESIGN.md §3.8). A
+  `--metrics-listen` address not on the host yet, as a node's pod gateway
+  before its bridge is up, is bound once it is, so pods may read a node's
+  metrics without the LAN.

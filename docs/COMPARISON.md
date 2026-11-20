@@ -66,8 +66,8 @@ Linux hosts, an ecosystem of tools and charts, or proven production use.
 | Probes | Startup, liveness and readiness: exec, TCP, HTTP, gRPC | One healthcheck (exec) | Startup, liveness and readiness: exec, TCP, HTTP, gRPC |
 | Restart policy | `any`, `on-failure`, `none`, with delay and attempts | Same | Always, OnFailure, Never |
 | Private registries | `imagePullSecrets` | `--with-registry-auth` | `imagePullSecrets` |
-| Building images | `Build` objects, run with `legion local` on nodes labelled `legion.builder=true`; or `legion build`, buildah or Podman by hand ([IMAGES.md](IMAGES.md)) | `docker build` | No (external tools) |
-| Linux images | Run through FreeBSD's Linux layer (`linux64`) on nodes started with `--linux`, not on a Linux kernel | Native | Native |
+| Building images | `Build` objects, run with `legion local` on nodes labelled `legion.builder=true`; or `legion build`, buildah or Podman by hand ([IMAGES.md](IMAGES.md)); a native base and recipes for PostgreSQL, Redis, nginx, Node.js and Python in `examples/` | `docker build` | No (external tools) |
+| Linux images | Run through FreeBSD's Linux layer (`linux64`) on nodes started with `--linux`, not on a Linux kernel; a Service running one is pointed to a native recipe where there is one | Native | Native |
 
 ## Scheduling
 
@@ -110,7 +110,7 @@ Linux hosts, an ecosystem of tools and charts, or proven production use.
 | Network volumes | NFS, iSCSI (UFS on the LUN), plugins as executables (`hostpath`, `sshfs` and `rclone` shipped); or NFS and iSCSI a node of the cluster provides from its ZFS | Volume plugins | CSI drivers (add-on) |
 | Per-replica volumes | From claims in stateful services | No | volumeClaimTemplates |
 | Moving a volume between nodes | `zfs send` when a node drains, or `legion volume move` | No | Only with network storage |
-| Replicated local volumes | A ZFS Volume's `replica`: incremental `zfs send` to another node every so often; the Volume carries on there when its node is removed | No | With a replicating CSI driver |
+| Replicated local volumes | A ZFS Volume's `replica`: incremental `zfs send` to another node every so often; the Volume carries on there when its node is removed, or is down (automatically, or by hand with `legion volume promote`) | No | With a replicating CSI driver |
 | Snapshots | Before each update of a stateful service; rolled back with it | No | VolumeSnapshot, with a CSI driver |
 | Scratch space in memory | `tmpfs` volumes | `--mount type=tmpfs` | `emptyDir: { medium: Memory }` |
 
@@ -148,8 +148,9 @@ Linux hosts, an ecosystem of tools and charts, or proven production use.
 | Port forwarding | `legion port-forward` | No | `kubectl port-forward` |
 | Watching objects | `legion watch` | `docker events` | `kubectl get --watch` |
 | Live view in the terminal | `legion top`: every kind of object, CPU and memory with graphs, details and YAML, a log of changes, and keys to drain, scale, roll back, move, delete, follow logs and open shells | `docker stats` (one node), `docker service ps` | `kubectl top`; k9s and others, separately |
-| Web UI | Built in (`--console-listen`): every kind of object, deploying, logs, shells, files, image details and scans, alerts, usage, topology, as the signed-in user; a Grafana dashboard for its metrics | No; Portainer and others, separately | The Kubernetes Dashboard, an add-on |
-| Metrics | Prometheus endpoint: cluster state, and each container's CPU, memory and I/O; a Grafana dashboard | Engine metrics endpoint | metrics-server, kube-state-metrics, cAdvisor in kubelet |
+| Web UI | Built in (`--console-listen`): every kind of object, deploying, logs, shells, files, image details and scans, alerts, usage over 30 days, topology, replication, pools, long operations, checks before a drain or deletion, as the signed-in user; a Grafana dashboard for its metrics | No; Portainer and others, separately | The Kubernetes Dashboard, an add-on |
+| Metrics | Prometheus endpoint: cluster state (each task's state, node, image and start), ZFS space per node and Volume, and each container's CPU, memory and I/O; a Grafana dashboard | Engine metrics endpoint | metrics-server, kube-state-metrics, cAdvisor in kubelet |
+| Alerts sent | Built in: node down, pool degraded, replica stale and others, sent by `AlertReceiver`s by webhook, ntfy or SMTP | No | Prometheus Alertmanager (add-on) |
 | Packaging | rc.d script under daemon(8), newsyslog entry, release tarballs built by a script, a FreeBSD port (not yet in the ports tree); release tarballs for amd64 on GitHub | Distribution packages | Distribution packages, many installers |
 | Running containers by hand beside the cluster | Yes; Legion touches only its own jails and pf anchors | Yes | Not recommended |
 

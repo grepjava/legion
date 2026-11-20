@@ -2095,7 +2095,7 @@ WireGuard and bridge, with tasks as VNET jails attached to the node bridges.
 | A jail that does not get its profile | Silent security gaps | The agent reads every container jail's parameters back after start and refuses the pod (§9) |
 | pf is not a full load balancer (no weights, no health checks) | Uneven load, rough failover | Table-only updates for soft drain; source-hash option; kill-by-key for dead backends; userspace proxy fallback per service if needed |
 | `pcpu` throttling is bursty | Latency spikes for CPU-limited tasks | Document; offer `cpuset` pinning for latency-sensitive services |
-| Small FreeBSD OCI image ecosystem | Adoption | Good base images and build docs; Linux images in phase 5 |
+| Small FreeBSD OCI image ecosystem | Adoption | Good base images and build docs (`examples/base` and native recipes for PostgreSQL, Redis, nginx, Node.js and Python); Linux images in phase 5 |
 | Rust rewrite effort | Schedule | Phase 1 is deliberately single-node; reuse SwarmKit's designs and tests as references |
 | Double-NAT on routing mesh hides client IP | Logging and access control | `publish: host` and PROXY protocol support in ingress |
 | Cluster-wide pf tables at scale | Update cost at thousands of endpoints | Incremental table updates; per-node tables limited to services that local tasks use (phase 4 optimisation) |

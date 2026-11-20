@@ -14,7 +14,11 @@ Containerfiles with nothing but the base system, and `legion local` runs
 them in a jail set up as a Legion node sets one up (the same runtime and
 image store) and publishes them to any OCI registry. These were the
 separate tool jailer until it was merged into Legion. Legion also runs
-images made by buildah or Podman.
+images made by buildah or Podman. `examples/` has a small native base
+(FreeBSD's runtime image with `pkg`, 35 MiB) and recipes on it for
+PostgreSQL, Redis, nginx, Node.js and Python, each a template in the
+console; a Service running a Linux image is pointed to the recipe that
+runs the same natively.
 
 Status: phases 1 (single node), 2 (cluster), 3 (K8s-lite: namespaces, RBAC,
 network policy, quotas, jobs, security profiles, metrics), 4 (stateful
@@ -25,7 +29,9 @@ partitions and drains with stated guarantees, deployments pinned to
 digests, recovery drills, image signatures, revocation and an audit trail.
 A web console (`legion daemon --console-listen`, [CONSOLE.md](CONSOLE.md))
 runs the cluster from a browser as the signed-in user. [PHASE.md](PHASE.md)
-tracks what is built and what is next.
+tracks what is built and what is next, including the work on main since
+v0.2.0 (Volume failover, alerts sent, checks before disruption, 30 days of
+usage, native recipes).
 
 Sizes measured: the planner up to 200 nodes, 1,000 services and 5,000
 tasks (78 ms a pass); a node's pf up to 2,000 services (a service added
@@ -300,7 +306,8 @@ legion node label n1 legion.ingress=true    # key- removes a label
 
 `--metrics-listen 0.0.0.0:7472` on the daemon serves Prometheus metrics
 at `/metrics`: Raft, objects, tasks (each one's state, node, image and
-start), services, nodes and quotas from the leading manager, and each
+start), services, nodes, quotas, each node's ZFS space and each Volume's
+used, available and size from the leading manager, and each
 container's CPU, memory and I/O from rctl on every node. It is plain HTTP
 without authentication, and shows every namespace's names, so keep it on
 an admin network, or on the node's pod gateway (`10.200.<n>.1:7472`)
