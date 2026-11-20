@@ -50,7 +50,18 @@
     load();
   });
 
-  const text = (c: LObject) => (c.spec?.text as string | undefined) ?? '';
+  // A Config keeps what it holds as base64 (`data`) once admitted; `text`
+  // only as written, before.
+  function text(c: LObject): string {
+    if (typeof c.spec?.text === 'string') return c.spec.text;
+    if (typeof c.spec?.data !== 'string') return '';
+    try {
+      const raw = atob(c.spec.data);
+      return new TextDecoder().decode(Uint8Array.from(raw, (ch) => ch.charCodeAt(0)));
+    } catch {
+      return '';
+    }
+  }
   // A new note's name: `note-<kind>-<name>`, as a DNS label.
   const fresh = $derived(
     `note-${kind}-${name}`
