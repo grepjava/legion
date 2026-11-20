@@ -1247,6 +1247,7 @@ spec:
     a.choose_file("Backup file", &backup);
     a.fill("Node", "n1");
     a.click("Restore into it");
+    a.shows(&format!("restored team-a/{volume} on n1"), 300);
     wait("keeper running on n1", 600, || {
         c.task_of("keeper").is_some_and(|(_, n)| n == "n1")
     });

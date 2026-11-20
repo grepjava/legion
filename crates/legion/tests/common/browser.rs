@@ -304,8 +304,11 @@ impl Browser {
         self.until(&format!("a button {t:?} to press"), 30, |b| {
             matches!(b.button(t), Some((true, _)))
         });
-        self.eval(&format!("H.button({t:?}).click()"));
-        self.confirm_if_asked();
+        let asked = self.eval(&format!(
+            "(() => {{ const n = document.documentElement.dataset.asked;
+               H.button({t:?}).click(); return document.documentElement.dataset.asked !== n; }})()"
+        ));
+        self.confirm(asked == json!(true));
     }
 
     /// Presses the action of the console's confirmation (lib/Confirm.svelte)
@@ -313,7 +316,14 @@ impl Browser {
     /// change it checks first is checked; one asking for a name typed, or
     /// whose check finds something blocking, is left for the test to answer.
     pub fn confirm_if_asked(&mut self) {
-        let opened = Instant::now() + Duration::from_millis(500);
+        self.confirm(false);
+    }
+
+    /// As `confirm_if_asked`; `asked`: the console said the click asked
+    /// (lib/confirm.svelte.ts), so its dialog is waited for however long a
+    /// busy browser takes to open it, rather than half a second.
+    fn confirm(&mut self, asked: bool) {
+        let opened = Instant::now() + Duration::from_millis(if asked { 30_000 } else { 500 });
         let checked = Instant::now() + Duration::from_secs(30);
         loop {
             let r = self.eval(
@@ -329,6 +339,7 @@ impl Browser {
             let now = Instant::now();
             match r.as_str() {
                 Some("none") if now < opened => {}
+                Some("none") if asked => panic!("the confirmation asked for did not open within 30 s"),
                 Some("checking") if now < checked => {}
                 Some("checking") => panic!("the confirmation's check did not end within 30 s"),
                 // A check that failed is a fault here, not a reason to go on.
