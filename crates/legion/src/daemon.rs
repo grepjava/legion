@@ -497,15 +497,24 @@ fn worker_address(managers: &[String]) -> String {
 }
 
 /// Binds the metrics endpoint's listener, if asked for one.
-async fn bind_metrics(opts: &Options) -> anyhow::Result<Option<tokio::net::TcpListener>> {
+/// The metrics socket, bound before the daemon goes on; an address not on
+/// this host yet (the pod network's gateway, before Legion's bridge is up
+/// after a reboot) is bound once it is, rather than stopping the daemon.
+async fn bind_metrics(opts: &Options) -> anyhow::Result<Option<crate::metrics::Listen>> {
     let Some(addr) = opts.metrics_listen else {
         return Ok(None);
     };
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("listening for metrics on {addr}"))?;
-    tracing::info!(%addr, "serving metrics at /metrics");
-    Ok(Some(listener))
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => {
+            tracing::info!(%addr, "serving metrics at /metrics");
+            Ok(Some(crate::metrics::Listen::Now(listener)))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+            tracing::warn!(%addr, "metrics: the address is not on this host yet; serving there once it is");
+            Ok(Some(crate::metrics::Listen::Later(addr)))
+        }
+        Err(e) => Err(e).with_context(|| format!("listening for metrics on {addr}")),
+    }
 }
 
 /// A running agent and what it needs.

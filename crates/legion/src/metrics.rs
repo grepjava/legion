@@ -47,7 +47,41 @@ pub fn collect(
 }
 
 /// Serves `/metrics` on `listener` until the task is dropped.
-pub async fn serve(listener: TcpListener, collect: Collect) {
+/// Where metrics are served: a socket bound, or an address not on this
+/// host yet, as the pod network's gateway is until Legion's bridge is up.
+pub enum Listen {
+    Now(TcpListener),
+    Later(std::net::SocketAddr),
+}
+
+/// How long between tries at an address not on this host yet.
+const RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Serves metrics where `listen` says, binding a `Later` address once it
+/// is on this host.
+pub async fn serve(listen: Listen, collect: Collect) {
+    let listener = match listen {
+        Listen::Now(l) => l,
+        Listen::Later(addr) => loop {
+            match TcpListener::bind(addr).await {
+                Ok(l) => {
+                    tracing::info!(%addr, "serving metrics at /metrics");
+                    break l;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                    tokio::time::sleep(RETRY).await;
+                }
+                Err(e) => {
+                    tracing::error!(%addr, "listening for metrics: {e}");
+                    return;
+                }
+            }
+        },
+    };
+    serve_on(listener, collect).await
+}
+
+async fn serve_on(listener: TcpListener, collect: Collect) {
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
@@ -123,7 +157,7 @@ mod tests {
                 m
             })
         });
-        let server = tokio::spawn(serve(listener, collect));
+        let server = tokio::spawn(serve(Listen::Now(listener), collect));
         let ok = get(addr, "/metrics").await;
         assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
         assert!(ok.contains("text/plain; version=0.0.4"), "{ok}");
@@ -132,6 +166,20 @@ mod tests {
             "{ok}"
         );
         assert!(get(addr, "/").await.starts_with("HTTP/1.1 404"));
+        server.abort();
+    }
+
+    /// An address not on this host (yet) is tried again, not given up on:
+    /// the pod network's gateway after a reboot, before the bridge is up.
+    #[tokio::test]
+    async fn an_address_not_here_yet_is_waited_for() {
+        let not_here: std::net::SocketAddr = "192.0.2.1:7472".parse().unwrap();
+        let e = TcpListener::bind(not_here).await.unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AddrNotAvailable, "{e}");
+        let collect: Collect = Arc::new(|| Box::pin(async { Metrics::default() }));
+        let server = tokio::spawn(serve(Listen::Later(not_here), collect));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!server.is_finished(), "still waiting for its address");
         server.abort();
     }
 }
