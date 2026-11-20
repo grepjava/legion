@@ -779,8 +779,24 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             refused: None,
         };
         self.ready = pod.ready();
+        self.note_started(&pod.infra).await;
         self.report(TaskState::Running, "").await;
         Ok(pod)
+    }
+
+    /// When the pod started, as the runtime recorded it for its infra
+    /// container; what was said before, or now, where it records nothing.
+    async fn note_started(&mut self, infra: &str) {
+        let recorded = match self.ctx.runtime.inspect(infra).await {
+            Ok(c) => c.state.started_at.parse::<i64>().ok().filter(|s| *s > 0),
+            Err(_) => None,
+        };
+        let now = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64)
+        };
+        self.status.started = recorded.or(self.status.started).or_else(|| Some(now()));
     }
 
     /// Gives the pod its address: the one it had (an adopted pod, or a task
@@ -1095,6 +1111,9 @@ impl<R: Runtime, C: Control> Worker<R, C> {
     }
 
     async fn monitor(&mut self, mut pod: Pod, adopted: bool) {
+        if adopted {
+            self.note_started(&pod.infra).await;
+        }
         // Limits are reapplied for adopted containers, in case they were
         // lost (rules of a jail removed by hand, a host reboot), and their
         // probes start over; a pod just started has had both.

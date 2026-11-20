@@ -3215,6 +3215,7 @@ async fn the_leader_reports_the_cluster() {
         "legion_objects{kind=\"Task\",namespace=\"team\"} 2",
         "legion_tasks{namespace=\"team\",state=\"running\"} 0",
         "legion_task_restarts{namespace=\"team\",task=\"web-1-1\",service=\"web\",node=\"\"} 0",
+        "legion_task_info{namespace=\"team\",service=\"web\",task=\"web-1-1\",node=\"\",state=\"pending\",container=\"c\",image=\"c:1\"} 1",
         "legion_service_replicas{namespace=\"team\",service=\"web\"} 2",
         "legion_service_ready_tasks{namespace=\"team\",service=\"web\"} 0",
         "legion_nodes{state=\"ready\"} 0",

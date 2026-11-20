@@ -213,6 +213,11 @@ pub struct TaskStatus {
     /// an index, the one for its platform.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub images: std::collections::BTreeMap<String, String>,
+    /// When its pod started, in seconds since the Unix epoch, as its node's
+    /// runtime recorded it: kept when the node's daemon restarts and takes
+    /// the pod over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<i64>,
     /// Its images, as the pod names them, that are Linux's, run through
     /// FreeBSD's Linux ABI.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]

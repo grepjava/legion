@@ -815,16 +815,20 @@ restartPolicy: { condition: on-failure, maxAttempts: 1, delay: 0s }
 "#,
         )
         .await;
-    h.wait_state(&key, TaskState::Running).await;
+    let started = h.wait_state(&key, TaskState::Running).await.started;
+    assert!(started.is_some_and(|s| s > 0), "{started:?}");
     h.rt.exit("shop_app-1_a", 1);
     eventually("restart counted", || h.status(&key).restarts == 1).await;
     eventually("restarted", || h.running().len() == 3).await;
 
     // a's one attempt used, before and after the agent restarts: its next
-    // exit is its last, while b runs on.
+    // exit is its last, while b runs on. The pod's start is the one the
+    // runtime recorded, not the restart's.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
     h.stop_agent().await;
     h.start_agent();
-    h.wait_state(&key, TaskState::Running).await;
+    let adopted = h.wait_state(&key, TaskState::Running).await;
+    assert_eq!(adopted.started, started, "the start kept across the agent's restart");
     h.rt.exit("shop_app-1_a", 1);
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let st = h.status(&key);

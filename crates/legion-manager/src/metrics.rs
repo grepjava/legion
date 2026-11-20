@@ -171,6 +171,51 @@ fn cluster(store: &Store, m: &mut Metrics) -> Result<(), legion_store::Error> {
         );
     }
 
+    // What each task not ended runs, a sample a container (1, its facts
+    // the labels), and when it started, as the value: Prometheus's way
+    // with timestamps, which as labels would make a series a second.
+    let mut f = m.gauge(
+        "legion_task_info",
+        "A task that has not ended, one sample a container: its state, node and image as labels.",
+    );
+    for (o, spec, status) in &tasks {
+        if status.state.is_terminal() {
+            continue;
+        }
+        for c in spec.pod.containers() {
+            f.sample(
+                &[
+                    ("namespace", &o.metadata.namespace),
+                    ("service", &spec.service),
+                    ("task", &o.metadata.name),
+                    ("node", &spec.node),
+                    ("state", status.state.as_str()),
+                    ("container", &c.name),
+                    ("image", &c.image),
+                ],
+                1.0,
+            );
+        }
+    }
+    let mut f = m.gauge(
+        "legion_task_start_time_seconds",
+        "When a task's pod started, in seconds since the Unix epoch, as its node recorded it.",
+    );
+    for (o, spec, status) in &tasks {
+        let (false, Some(started)) = (status.state.is_terminal(), status.started) else {
+            continue;
+        };
+        f.sample(
+            &[
+                ("namespace", &o.metadata.namespace),
+                ("service", &spec.service),
+                ("task", &o.metadata.name),
+                ("node", &spec.node),
+            ],
+            started as f64,
+        );
+    }
+
     let services: Vec<(&Object, ServiceSpec)> = of(Kind::Service)
         .iter()
         .filter_map(|o| Some((o, legion_api::parse::<ServiceSpec>(&o.spec).ok()?)))

@@ -165,6 +165,9 @@ struct Container {
     paused: bool,
     exit_code: i32,
     starts: u32,
+    /// When it last started, in seconds since the epoch, as a runtime
+    /// records it.
+    started_at: i64,
     jail: Option<String>,
 }
 
@@ -756,6 +759,7 @@ impl Runtime for FakeRuntime {
                 paused: false,
                 exit_code: 0,
                 starts: 0,
+                started_at: 0,
                 jail: None,
             },
         );
@@ -826,6 +830,9 @@ impl Runtime for FakeRuntime {
         let c = s.containers.get_mut(id).expect("exists");
         c.running = true;
         c.starts += 1;
+        c.started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
         c.jail = Some(jail);
         if c.spec.labels.get(LABEL_ROLE).map(String::as_str) == Some("init")
             && let Some(code) = init_exit
@@ -900,6 +907,7 @@ impl Runtime for FakeRuntime {
                 running: c.running,
                 jid,
                 exit_code: c.exit_code,
+                started_at: c.started_at.to_string(),
                 ..Default::default()
             },
             config: ContainerConfig {
