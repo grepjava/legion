@@ -10,6 +10,7 @@
   //    creator + live Build runs table & Workbench log docking.
   import { droppable } from '#lib/drop.svelte.ts';
   import { goto } from '$app/navigation';
+  import { fromAddress, keepInAddress } from '#lib/address.svelte.ts';
   import {
     api,
     downloads,
@@ -26,7 +27,13 @@
   import { cannotWrite, namespaces, openWorkbench, session } from '#lib/session.svelte.ts';
 
   type TabId = 'nodes' | 'search' | 'package';
-  let tab: TabId = $state(session.me?.all ? 'nodes' : 'search');
+  const TABS: TabId[] = ['nodes', 'search', 'package'];
+  // The tab the address names, else the one for the user; the tab open is
+  // kept in the address, so a reload or a link keeps it.
+  const firstTab: TabId = session.me?.all ? 'nodes' : 'search';
+  const askedTab = fromAddress('tab');
+  let tab: TabId = $state(TABS.find((x) => x === askedTab) ?? firstTab);
+  keepInAddress('tab', () => tab, firstTab);
   let tablist: HTMLElement | undefined = $state();
 
   let adminNamespaces: string[] = $state([]);
@@ -1100,7 +1107,7 @@
                           object: b
                         })}
                     >
-                      {t('Dock log')}
+                      {t('Keep log open')}
                     </button>
                   </td>
                 </tr>

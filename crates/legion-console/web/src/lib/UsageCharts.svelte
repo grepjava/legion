@@ -178,28 +178,47 @@
     <RangeStrip points={summed.cpu.length ? summed.cpu : summed.zfs} bind:view />
   {/if}
   <div class={compact ? 'grid-2' : ''}>
-    <div class={compact ? 'card' : ''}>
-      <Chart
-        title={t('CPU')}
-        points={shown.cpu}
-        format={percent}
-        {step}
-        marks={marks.cpu}
-        tone="accent"
-        {compact}
-      />
-    </div>
-    <div class={compact ? 'card' : ''}>
-      <Chart
-        title={t('Memory')}
-        points={shown.mem}
-        format={bytes}
-        {step}
-        marks={marks.mem}
-        tone="good"
-        {compact}
-      />
-    </div>
+    {#if !summed.tasks && !task && pick === EVERY && !nodeFilter}
+      <!-- A namespace's or the cluster's: CPU and memory are what tasks
+           use, so with none say so, rather than draw two empty charts
+           waiting for samples that will not come. One task's or service's
+           still waits for its first samples. -->
+      <div class={compact ? 'card' : ''}>
+        <p class="muted">
+          {namespace
+            ? t('No tasks ran in {namespace} in the last {span}, so there is no CPU or memory to show.', {
+                namespace,
+                span: duration(range)
+              })
+            : t('No tasks ran in the last {span}, so there is no CPU or memory to show.', {
+                span: duration(range)
+              })}
+        </p>
+      </div>
+    {:else}
+      <div class={compact ? 'card' : ''}>
+        <Chart
+          title={t('CPU')}
+          points={shown.cpu}
+          format={percent}
+          {step}
+          marks={marks.cpu}
+          tone="accent"
+          {compact}
+        />
+      </div>
+      <div class={compact ? 'card' : ''}>
+        <Chart
+          title={t('Memory')}
+          points={shown.mem}
+          format={bytes}
+          {step}
+          marks={marks.mem}
+          tone="good"
+          {compact}
+        />
+      </div>
+    {/if}
     {#if summed.zfs.length}
       <div class={compact ? 'card' : ''}>
         <Chart

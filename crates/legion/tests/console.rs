@@ -432,10 +432,10 @@ spec: { text: team-b's }
     // A task's shell is exec: the viewer may dock its logs, not a shell.
     let (task, _) = c.task_of("hello").expect("a running hello task");
     c.page(&mut v, &format!("/k/Task/team-a/{task}"));
-    v.shows("Dock shell", 30);
+    v.shows("Keep a shell open", 30);
     assert_read_only(&mut v, "a Task");
-    let (enabled, why) = v.button("Dock shell").expect("a Dock shell button");
-    assert!(!enabled && why.contains("view"), "Dock shell: {why}");
+    let (enabled, why) = v.button("Keep a shell open").expect("a Keep a shell open button");
+    assert!(!enabled && why.contains("view"), "Keep a shell open: {why}");
     drop(v);
     drop(e);
 

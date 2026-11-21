@@ -1,5 +1,6 @@
 <script lang="ts">
   import { page } from '$app/state';
+  import { fromAddress, keepInAddress } from '#lib/address.svelte.ts';
   import { api, follow, type LObject } from '#lib/api.ts';
   import { blocking, columns, serviceState, tone } from '#lib/columns.ts';
   import { plural } from '#lib/kinds.ts';
@@ -49,13 +50,16 @@
     | 'events'
     | 'yaml' =
     $state('details');
+  // The tab open, in the address, so a reload or a link keeps it.
+  keepInAddress('tab', () => tab, 'details');
 
   $effect(() => {
     object = null;
     error = '';
     gone = false;
-    // The tab the address names (`?tab=buildlog`), if the kind has it.
-    const wanted = page.url.searchParams.get('tab');
+    // The tab the address names (`?tab=buildlog`), if the kind has it;
+    // read as the page opens, not followed (the tab chosen is kept there).
+    const wanted = fromAddress('tab');
     tab = tabs.find((x) => x.id === wanted)?.id ?? 'details';
     api
       .get(kind, namespace, name)
@@ -179,7 +183,7 @@
               namespace,
               name,
               object: obj
-            })}><Ico icon={toolIcon('logs')} size={14} />{t('Dock logs')}</button
+            })}><Ico icon={toolIcon('logs')} size={14} />{t('Keep logs open')}</button
         >
         {#if obj.status?.state === 'running'}
           <button
@@ -195,7 +199,7 @@
                 namespace,
                 name,
                 object: obj
-              })}><Ico icon={toolIcon('terminal')} size={14} />{t('Dock shell')}</button
+              })}><Ico icon={toolIcon('terminal')} size={14} />{t('Keep a shell open')}</button
           >
         {/if}
       {:else if kind === 'Build'}
@@ -211,7 +215,7 @@
               namespace,
               name,
               object: obj
-            })}><Ico icon={toolIcon('build')} size={14} />{t('Dock build log')}</button
+            })}><Ico icon={toolIcon('build')} size={14} />{t('Keep build log open')}</button
         >
       {/if}
       {#if ['Task', 'Service', 'Job', 'Node', 'Volume', 'Build'].includes(kind)}
@@ -228,7 +232,7 @@
               name,
               targetKind: kind,
               object: obj
-            })}><Ico icon={toolIcon('events')} size={14} />{t('Dock events')}</button
+            })}><Ico icon={toolIcon('events')} size={14} />{t('Keep events open')}</button
         >
       {/if}
     </div>

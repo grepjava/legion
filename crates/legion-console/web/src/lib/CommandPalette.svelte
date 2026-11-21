@@ -154,7 +154,7 @@
         base.push({
           id: `logs:${ns}:${o.metadata.name}`,
           group: actGroup,
-          label: t('Dock logs: {name}', { name: `${ns}/${o.metadata.name}` }),
+          label: t('Keep logs open: {name}', { name: `${ns}/${o.metadata.name}` }),
           detail: t('Workbench'),
           run: () =>
             openWorkbench({

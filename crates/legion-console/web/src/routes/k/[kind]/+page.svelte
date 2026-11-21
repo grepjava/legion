@@ -1,5 +1,6 @@
 <script lang="ts">
   import { page } from '$app/state';
+  import { fromAddress, keepInAddress } from '#lib/address.svelte.ts';
   import { api, follow, removal, type LObject } from '#lib/api.ts';
   import { ask } from '#lib/confirm.svelte.ts';
   import RowDetail from '#lib/RowDetail.svelte';
@@ -32,11 +33,13 @@
     }
   }
   // A link may bring a filter (a label on an object's page); another kind
-  // starts unfiltered.
+  // starts unfiltered. Read as the kind opens, not followed: the filter
+  // typed is kept in the address, so a reload or a link keeps it.
   $effect(() => {
     void kind;
-    filter = page.url.searchParams.get('filter') ?? '';
+    filter = fromAddress('filter') ?? '';
   });
+  keepInAddress('filter', () => filter);
 
   $effect(() => {
     objects = [];

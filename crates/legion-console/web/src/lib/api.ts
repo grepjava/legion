@@ -651,7 +651,9 @@ function logSocket(
   };
 }
 
-/** A byte count as people read it: 1.5 GiB. */
+/** A byte count as people read it: 1.5 GiB. The number and its unit are
+ * joined by a no-break space, so a narrow card never puts the unit on a
+ * line of its own. */
 export function bytes(n: number): string {
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
   let i = 0;
@@ -659,7 +661,7 @@ export function bytes(n: number): string {
     n /= 1024;
     i++;
   }
-  return `${i ? n.toFixed(1) : n} ${units[i]}`;
+  return `${i ? n.toFixed(1) : n}\u00a0${units[i]}`;
 }
 
 export function key(o: LObject): string {

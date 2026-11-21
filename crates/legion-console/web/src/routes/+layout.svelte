@@ -3,6 +3,7 @@
   import { untrack } from 'svelte';
   import { afterNavigate, beforeNavigate, goto, onNavigate } from '$app/navigation';
   import { page } from '$app/state';
+  import { fromAddress, keepInAddress } from '#lib/address.svelte.ts';
   import {
     api,
     consoleSettings,
@@ -321,22 +322,36 @@
   }
 
   // The settings: the banner before signing in, all of them after; the
-  // default namespace chosen once a sign-in, if the user may read it.
-  let defaulted = false;
+  // namespace chosen once a sign-in: the one the address names, if the
+  // user may read it, else the console's default, if they may read that.
+  const ALL_NAMESPACES = '*';
+  const askedNamespace = fromAddress('ns');
+  let defaulted = $state(false);
   $effect(() => {
     const me = session.me;
     if (!me) defaulted = false;
     consoleSettings()
       .then((s) => {
         session.settings = s;
-        const ns = s.defaultNamespace;
-        if (me && ns && !defaulted && !session.namespace && (me.all || ns in me.namespaces)) {
-          session.namespace = ns;
+        if (me && !untrack(() => defaulted)) {
+          const readable = (ns: string) => ns === '' || me.all || ns in me.namespaces;
+          const asked = askedNamespace === ALL_NAMESPACES ? '' : askedNamespace;
+          const ns = s.defaultNamespace;
+          if (asked !== null && readable(asked)) {
+            session.namespace = asked;
+          } else if (ns && !session.namespace && readable(ns)) {
+            session.namespace = ns;
+          }
+          defaulted = true;
         }
-        if (me) defaulted = true;
       })
       .catch(() => {});
   });
+  // The namespace looked at, in the address (`?ns=jax2`, `*` for all), so
+  // a reload or a shared link shows the same; as asked until chosen.
+  keepInAddress('ns', () =>
+    defaulted ? session.namespace || ALL_NAMESPACES : (askedNamespace ?? '')
+  );
 
   /** The same page on another cluster's console. */
   function there(url: string): string {
