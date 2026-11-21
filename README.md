@@ -6,7 +6,7 @@ A container orchestrator for FreeBSD: Docker Swarm's operating model plus
 selected Kubernetes features, running workloads as jails from OCI images,
 which it pulls into ZFS and runs itself. The plan and its rationale are in
 [docs/DESIGN.md](docs/DESIGN.md); how it compares with Docker Swarm,
-Kubernetes, CBSD and BastilleBSD is in [docs/COMPARISON.md](docs/COMPARISON.md), and how to build
+Kubernetes, CBSD, BastilleBSD and Sylve is in [docs/COMPARISON.md](docs/COMPARISON.md), and how to build
 and ship images for it in [docs/IMAGES.md](docs/IMAGES.md).
 
 Images are built with `legion build`: it builds FreeBSD jail images from

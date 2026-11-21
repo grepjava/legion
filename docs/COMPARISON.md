@@ -1,7 +1,8 @@
-# Legion compared with Docker Swarm, Kubernetes, CBSD and BastilleBSD
+# Legion compared with Docker Swarm, Kubernetes, CBSD, BastilleBSD and Sylve
 
 How Legion's features compare with Docker's cluster mode (Swarm) and
-Kubernetes, and with the FreeBSD jail managers [CBSD and BastilleBSD](#cbsd-and-bastillebsd).
+Kubernetes, with the FreeBSD jail managers [CBSD and BastilleBSD](#cbsd-and-bastillebsd),
+and with the FreeBSD host management plane [Sylve](#sylve).
 Legion takes Swarm's way of running a cluster (one binary,
 built-in Raft and PKI, `init` and `join`, compose files) and adds the parts
 of Kubernetes that teams sharing a cluster need (namespaces, RBAC, network
@@ -213,3 +214,66 @@ base or thin jails with `Bastillefile` templates. Because Legion touches
 only its own ZFS subtree (`<pool>/legion`), bridge (`legion0`) and `pf`
 anchors (`legion/*`), it can run on the same host beside CBSD or
 BastilleBSD jails.
+
+## Sylve
+
+[Sylve](https://sylve.io) also runs on FreeBSD 15, uses jails, ZFS, pf
+and WireGuard, keeps its cluster in Raft and has a web UI, so it can look
+like the same thing. It is a different kind of tool: a management plane
+for hosts, in the way Proxmox is for Linux, where Legion is an
+orchestrator for applications.
+
+- **Legion** runs applications: you declare a Service (an image, how many
+  replicas, its ports, volumes and routes) and controllers keep it so,
+  choosing the nodes, replacing what fails, rolling updates out and
+  balancing traffic to the replicas.
+- **Sylve** manages machines and what is on them: you create each bhyve
+  VM, jail or Podman container by hand in its web UI, API or
+  CLI, on the node you choose, and look after it there, beside the host's
+  ZFS pools, network, firewall, file shares and backups.
+
+This compares with Sylve as its main branch stands (`6993ec1a`,
+2026-11-21), which Sylve ships as its rolling `tip` build and its
+[documentation](https://sylve.io/docs/) describes; its latest tagged
+release is v0.3.1. It was checked on 2026-11-22 against that
+documentation and the source.
+
+| Feature | Legion | Sylve |
+|---|---|---|
+| Primary role | Multi-node declarative orchestrator for services and jobs | Web management plane for FreeBSD hosts: VMs, jails, storage, networking, backups |
+| Implementation | One Rust binary (daemon and CLI); Raft (`openraft` on `redb`) | One Go daemon per host with an embedded SvelteKit UI on port 8181, a REST API and a local CLI over a Unix socket; SQLite per node, HashiCorp Raft for the cluster's shared state |
+| Workloads | Pods of jails run by Legion itself; a container can be a bhyve VM (FreeBSD or UEFI with cloud-init), its pod's only container | bhyve VMs through libvirt (PCI passthrough, TPM, cloud-init, VNC and serial consoles, templates, VMware import); FreeBSD jails; Linux jails (experimental); OCI containers through Podman and `ocijail` |
+| Where root file systems come from | OCI images from any registry, pulled into ZFS; Linux images through `linux64` | Jails: a pkgbase bootstrap or an extracted `base.txz` or Linux root-FS tarball, then templates; containers: images pulled by Podman |
+| Compose and app catalogs | Compose files as stacks (`legion stack deploy`) | A catalog of 117 apps from daemonless.io, rendered into a container or a stack of them; their compose-style YAML is read for 12 keys (no health checks, replicas or builds); no upload of your own compose file |
+| Declarative configuration | Every object is YAML, applied and reconciled (`legion apply`) | Imperative (UI, API, CLI); only a first-boot JSON for a host's pools, services, DNS and switches, not workloads |
+| Where workloads run | The scheduler picks the node (resources, constraints, spread) | You pick the node for each VM, jail or container |
+| Replicas and self-healing | Replicated and global Services, Jobs and CronJobs; a failed task is replaced, on another node when its node is down | One instance each; no replicas. Jails and VMs start at boot; restarted after a crash only under a replication policy; containers have Podman's restart policies |
+| Failover when a node is lost | Tasks are rescheduled on other nodes; a Volume carries on from its replica | Per VM or jail, through a replication policy: needs three voters; manual, safe hand-off or forced recovery (which can lose the latest writes); early access, hidden behind Experimental Features |
+| Moving a workload | Tasks are replaced, not moved; a Volume moves with `zfs send` (`legion volume move`, or on drain) | Staged migration of a VM or jail with ZFS send: copied while it runs, then stopped for the last changes ("not live migration", in Sylve's words) |
+| Service discovery and load balancing | Cluster DNS (`<svc>.<ns>.legion`), a virtual IP per Service balanced by pf across nodes | Names between one stack's containers (`cni-dnsname`), dnsmasq lease names, mDNS; no load balancing |
+| Ingress and TLS for workloads | `Route` objects by host and path, served by a proxy in the agent, HTTPS by SNI with Let's Encrypt certificates; a routing mesh for published ports | None for workloads; pf DNAT to a guest; certificates (Let's Encrypt and others) are for Sylve itself |
+| Rolling updates and health checks | Rolling updates with parallelism, start-first or stop-first, rollback; readiness and liveness probes act on tasks | Neither for workloads; containers can check for a newer image and be upgraded one at a time |
+| Networking across nodes | A routed pod network over an automatic WireGuard mesh, IPv4 and IPv6, with `NetworkPolicy` | Per node: managed bridges ("switches"), VLANs, dnsmasq DHCP and DNS, pf rules and NAT, a WireGuard server and clients, Dynamic DNS; no overlay between nodes |
+| Storage | A required ZFS pool: image layer clones, ZFS Volumes with quotas, NFS and iSCSI sources, snapshots before stateful updates | Pools, datasets, zvols, encryption, scrubs, S.M.A.R.T., scheduled snapshots with retention |
+| Replication and backups | A Volume's replica on another node by incremental `zfs send`; `legion volume backup` to a file; `legion backup` of the cluster state | Replication policies between nodes (early access); scheduled backup jobs of datasets, jails and VMs to a remote ZFS host over SSH, with retention and restore |
+| File sharing | None (not a NAS) | Samba (with AD and Kerberos), iSCSI targets, NFS |
+| Users and access | Namespaces, per-user client certificates, RBAC (`view`, `edit`, `admin`), quotas | Local users, PAM, passkeys and OIDC; Proxmox-style roles with path ACLs |
+| Metrics and alerts | Prometheus endpoint and Grafana dashboard; alerts (node down, pool degraded, replica stale and others) to webhooks, ntfy or SMTP | Charts in the UI; a Prometheus endpoint and Grafana dashboard; notifications to ntfy, Pushover, SMTP or Discord on disk S.M.A.R.T. and pool state |
+| Platform | FreeBSD 15 and newer; amd64 (aarch64 builds) | FreeBSD 15.0 and newer (-STABLE advised); amd64 and arm64; libvirt for VMs |
+| Maturity | New (v0.2.0), qualified on FreeBSD VMs, not used in production | v0.1.0 in March 2026, v0.3.1 the latest; one main developer, backed by Alchemilla and the FreeBSD Foundation; a large test suite |
+
+Choose **Sylve** to run a few FreeBSD hosts as a small private cloud or
+home lab, Proxmox-style: VMs with passthrough and consoles, hand-built
+jails, ZFS pools, file shares and backups, all from a web UI. Choose
+**Legion** to deploy applications from images and keep them running:
+replicas spread over nodes, rescheduled when a node fails, updated in
+rolling steps, found by name and reached through load-balanced routes,
+all declared in files you can keep in Git. They meet at the edges: Sylve
+has started on containers (one node at a time), and
+Legion runs simple VMs as tasks.
+
+They have not been tried on the same host. Legion keeps to its own ZFS
+subtree (`<pool>/legion`), bridge and `pf` anchors, but when Sylve
+manages the firewall it writes the whole of `/etc/pf.conf`, so Legion's
+anchors would have to go into Sylve's advanced firewall sections. Separate
+hosts are the safe arrangement.
