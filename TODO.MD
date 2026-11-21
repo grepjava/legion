@@ -14,6 +14,7 @@ In order of priority:
 3. [Setting up pf for Legion](#3-setting-up-pf-for-legion)
 4. [Console sign-in with host accounts and passkeys](#4-console-sign-in-with-host-accounts-and-passkeys)
 5. [Ready-to-deploy applications](#5-ready-to-deploy-applications)
+6. [Console polish](#6-console-polish)
 
 ## 1. Scheduled Volume snapshots and backups
 
@@ -162,3 +163,41 @@ Paperless-ngx and Actual Budget.
 
 **Done when** ten widely used applications deploy from a catalog with one
 command or a few clicks, and the lab deploys and reaches three of them.
+
+## 6. Console polish
+
+**Today.** Compared screen by screen with Sylve's console on
+22 November 2026 (Sylve on weft, ours on the Ryzen): ours is stronger at
+showing what a cluster does (Topology, the Overview's health, alerts,
+rollouts, the command palette, YAML beside every form), Sylve's is the
+more finished management UI. Fixed the same day: the namespace, an
+object's tab, a list's filter and the Images tab now stay in the address
+(`?ns=`, `?tab=`, `?filter=`) across a reload or a shared link; the
+Overview says no tasks ran in a namespace instead of drawing empty CPU
+and memory charts; sizes no longer break between number and unit; the
+"Dock …" buttons say "Keep … open".
+
+**Proposed.**
+- *One component kit*, as Sylve's bits-ui (the shadcn style) gives it:
+  every table sortable, searchable and paged the same way; one button
+  style (ours mixes outlined and filled); one font for figures (ours
+  mixes monospace and proportional in a row); card titles as headings,
+  not underlined links.
+- *A tree for the sidebar*: about 30 links in one list today; group them
+  in collapsible sections, as Sylve's node menu does, with the cluster's
+  objects and the namespace's apart.
+- *Guided forms*: Deploy as a dialog with tabs (Basic, Image, Network,
+  Storage, Resources), as Sylve's Create Container; no bare `0` in port
+  fields; the YAML beside it as now.
+- *Dashboards*: status cards with history, as Sylve's ZFS page, for
+  Volumes and nodes (pool health, capacity, last scrub, live I/O), with a
+  range picker on every chart.
+- *Plainer names*: "Volumes Studio" and "Images & GHCR Hub" say less
+  than "Volumes" and "Images".
+- *A review before changing a host*, as Sylve shows before its first
+  setup: what `legion doctor --fix pf` (item 3) will change, the old
+  file's copy, and a way back.
+
+**Done when** the lab's console tests and an axe-core pass hold after the
+change, and the same screens, side by side with Sylve's, read as one
+consistent product.
