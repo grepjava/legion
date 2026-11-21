@@ -205,7 +205,14 @@ fn the_examples_run_as_their_readmes_say() {
     lab.deploy("cache", "redis");
     wait("redis ready", 600, || lab.stack_ready("cache"));
     let cli = |args: &[&str]| {
-        let mut a = vec!["exec", "redis", "-n", "cache", "--", "/usr/local/bin/redis-cli"];
+        let mut a = vec![
+            "exec",
+            "redis",
+            "-n",
+            "cache",
+            "--",
+            "/usr/local/bin/redis-cli",
+        ];
         a.extend_from_slice(args);
         lab.ok(&a)
     };
@@ -225,14 +232,28 @@ fn the_examples_run_as_their_readmes_say() {
     let psql = |password: &str, sql: &str| {
         lab.legion(
             &[
-                "exec", "postgres", "-n", "db", "--", "/usr/bin/env",
+                "exec",
+                "postgres",
+                "-n",
+                "db",
+                "--",
+                "/usr/bin/env",
                 &format!("PGPASSWORD={password}"),
-                "/usr/local/bin/psql", "-h", "127.0.0.1", "-U", "postgres", "-tAc", sql,
+                "/usr/local/bin/psql",
+                "-h",
+                "127.0.0.1",
+                "-U",
+                "postgres",
+                "-tAc",
+                sql,
             ],
             &[],
         )
     };
-    let out = psql("native-42", "create table kept (n int); insert into kept values (42)");
+    let out = psql(
+        "native-42",
+        "create table kept (n int); insert into kept values (42)",
+    );
     assert!(out.status.success(), "{}", text(&out.stderr));
     let wrong = psql("not-it", "select 1");
     assert!(
@@ -265,7 +286,10 @@ fn the_examples_run_as_their_readmes_say() {
     wait("both ready", 600, || {
         lab.stack_ready("hello-node") && lab.stack_ready("hello-python")
     });
-    for (port, says) in [(30083, "hello from node v24"), (30084, "hello from python 3")] {
+    for (port, says) in [
+        (30083, "hello from node v24"),
+        (30084, "hello from python 3"),
+    ] {
         wait(&format!("{says} on every node"), 120, || {
             lab.on_every_node(port)
                 .iter()

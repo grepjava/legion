@@ -342,7 +342,9 @@ impl Browser {
             let now = Instant::now();
             match r.as_str() {
                 Some("none") if now < opened => {}
-                Some("none") if asked => panic!("the confirmation asked for did not open within 30 s"),
+                Some("none") if asked => {
+                    panic!("the confirmation asked for did not open within 30 s")
+                }
                 Some("checking") if now < checked => {}
                 Some("checking") => panic!("the confirmation's check did not end within 30 s"),
                 // A check that failed is a fault here, not a reason to go on.
