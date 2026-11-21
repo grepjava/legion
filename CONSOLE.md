@@ -623,8 +623,17 @@ behind the console. Fixed:
   goes back to the panel under, as it was; 1–8 go to a list from
   anywhere. Logs, command output and shells take a panel of their own.
   The title line shows the panels opened, the last the function keys.
-  Next: line commands typed beside rows, a command line, and pulldown
-  menus on F10; then a theme in 24-bit colour and a panel of graphs.
+  Then (the same day) the rest of ISPF's: Space marks rows and a letter
+  acts on all marked, asked once (what asks for more than a yes, and
+  logs, shells and commands, stay one row at a time); a `Command ===>`
+  line (`:` or `=`) takes `=N`, `=x`, `find`, `sort`, `range`, `poll`,
+  `tree`, `ended`, `back`, `mark all`, `unmark` and `colors`, else runs
+  a `legion` command; F10 (or a click) pulls down the action bar's
+  Actions (the selected row's letters), View, Go, Cluster and Help. And
+  btop's look: a theme in 24-bit colour (256 or 16 where the terminal
+  says so, as `COLORTERM` and `TERM` tell, or `colors` sets), meters
+  shaded along the heat gradient, and option 0, the graphs: CPU, memory,
+  ZFS and network as large as the screen.
 - *Restoring a backup:* the Operations page gives the steps beside the
   backup's download. A restore replaces a stopped manager's store on its
   host, so the console, served by a manager that is up and out of reach

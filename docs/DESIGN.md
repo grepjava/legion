@@ -601,8 +601,15 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   tall enough); Enter opens a list, a row's details, then a node's or
   workload's tasks, each over the one before, and F3 (or Esc) goes back
   to it, so a panel never moves or changes what it holds. A number goes
-  to a list from any panel. The title line shows the panels opened, the
-  last line the function keys of the panel shown.
+  to a list from any panel, 0 to the graphs (CPU, memory, ZFS and
+  network as large as the screen). The first line is the action bar
+  (F10 pulls down its menus, the Actions being the selected row's
+  letters) and the panels opened; the second the command line (`:` or
+  `=`: `=N`, `find`, `sort`, `range` and others of top's, else a `legion`
+  command); the last the function keys of the panel shown. Space marks
+  rows: a letter then acts on all of them, asked once. Colours are a
+  24-bit theme, brought to 256 or 16 where the terminal says it shows no
+  more (`COLORTERM`, `TERM`; `colors` on the command line sets it).
   Eight lists: nodes (state,
   availability, tasks, CPU and memory bars against capacity), workloads
   (services, Jobs, cron jobs), tasks (with the pod jail's id, which

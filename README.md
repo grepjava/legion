@@ -99,9 +99,11 @@ object's details and YAML, and a log of what changes. Keys drain, pause
 or label nodes, schedule their scrubs, scale or roll back services,
 suspend cron jobs, move volumes or promote their replicas, delete objects,
 and follow logs or open a shell in a task. It shows one panel at a time, as
-ISPF does: a menu of the lists, Enter to open a list, a row or a node's
-tasks, F3 to go back, and the function keys on the last line; `/` filters
-and F1 lists the keys (`legion top --once` prints it as text). For dashboards, Prometheus can scrape each daemon's
+ISPF does: a menu of the lists and the graphs, Enter to open a list, a row
+or a node's tasks, F3 to go back, a `Command ===>` line, an action bar
+pulled down with F10, rows marked with Space for one letter to act on all,
+and the function keys on the last line; F1 lists the keys (`legion top
+--once` prints it as text). For dashboards, Prometheus can scrape each daemon's
 `--metrics-listen` endpoint; [packaging/grafana](packaging/grafana) has a
 Grafana dashboard for it.
 
