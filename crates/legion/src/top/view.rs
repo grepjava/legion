@@ -84,7 +84,8 @@ impl Tab {
     pub(super) fn header(self) -> &'static [&'static str] {
         match self {
             Tab::Nodes => &[
-                "NAME", "STATE", "AVAIL", "ROLE", "TASKS", "CPU", "MEMORY", "LABELS",
+                "NAME", "STATE", "AVAIL", "ROLE", "TASKS", "CPU", "MEMORY", "LOAD", "POOLS",
+                "LABELS",
             ],
             Tab::Workloads => &[
                 "NAMESPACE",
@@ -113,7 +114,7 @@ impl Tab {
                 "NAMESPACE",
                 "NAME",
                 "DRIVER",
-                "SIZE",
+                "USED/SIZE",
                 "NODE",
                 "USED BY",
                 "REPLICA",
@@ -305,6 +306,17 @@ pub enum Request {
     },
 }
 
+/// The ranges the graphs show, `w` going round them: the polls, then
+/// what the managers kept (up to 30 days).
+pub(super) const RANGES: [(i64, &str); 6] = [
+    (0, "live"),
+    (3_600_000, "1h"),
+    (6 * 3_600_000, "6h"),
+    (24 * 3_600_000, "24h"),
+    (7 * 24 * 3_600_000, "7d"),
+    (30 * 24 * 3_600_000, "30d"),
+];
+
 /// How many command lines Up goes back through.
 const COMMANDS_KEPT: usize = 50;
 
@@ -418,6 +430,15 @@ pub(super) enum Then {
         namespace: String,
         volume: String,
     },
+    /// Days between a node's scrubs; none, or 0, for none.
+    Scrub {
+        node: String,
+    },
+    /// The Volume's name must be typed again.
+    Promote {
+        namespace: String,
+        volume: String,
+    },
 }
 
 /// What a chosen container is for.
@@ -467,6 +488,8 @@ pub struct View {
     pub(super) poll_ms: u64,
     /// Mouse click & scroll support enabled.
     pub(super) mouse: bool,
+    /// Which of [`RANGES`] the graphs show.
+    pub(super) range: usize,
     pub(super) prompt: Option<Prompt>,
     /// What came of the last request, or why it was not made.
     pub(super) notice: Option<String>,
@@ -504,6 +527,7 @@ impl Default for View {
             sort_desc: true,
             poll_ms: 5000,
             mouse: false,
+            range: 0,
             prompt: None,
             notice: None,
             detail: None,
@@ -521,6 +545,16 @@ impl Default for View {
 }
 
 impl View {
+    /// The range the graphs show, in milliseconds; `0`: the polls.
+    pub(super) fn range_ms(&self) -> i64 {
+        RANGES[self.range].0
+    }
+
+    /// Its name: `live`, `7d`.
+    pub(super) fn range_name(&self) -> &'static str {
+        RANGES[self.range].1
+    }
+
     /// Starts showing the logs a request asks for, in place of any shown.
     pub(super) fn show_logs(&mut self, request: &Request) {
         match request {
@@ -749,6 +783,7 @@ impl View {
             KeyCode::Char('+' | '=') => self.step_poll(true),
             KeyCode::Char('-') => self.step_poll(false),
             KeyCode::Char('M') => self.mouse = !self.mouse,
+            KeyCode::Char('w') => self.range = (self.range + 1) % RANGES.len(),
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char(':') => {
                 self.recalled = 0;
@@ -822,6 +857,31 @@ impl View {
                 node: name,
                 to: "active",
             },
+            ('c', Kind::Node) => {
+                let now = spec::<NodeSpec>(o)
+                    .scrub_every_days
+                    .map_or("none now".to_owned(), |d| format!("now every {d}"));
+                self.input(
+                    format!(
+                        "Scrub node {name}'s pools every how many days ({now}; empty or 0: none)"
+                    ),
+                    Then::Scrub { node: name },
+                );
+                return None;
+            }
+            ('X', Kind::Node) => {
+                let st: NodeStatus = status(o);
+                let errors: u64 = st.pools.iter().map(|p| p.errors()).sum();
+                if errors == 0 {
+                    self.notice = Some(format!("Node {name}'s pools have no errors."));
+                    return None;
+                }
+                let ask = format!(
+                    "Take node {name}'s {errors} pool errors as seen? Only more than these raise pool-errors."
+                );
+                self.confirm(run(&["node", "errors-seen", &name]), ask);
+                return None;
+            }
             ('L', Kind::Node) => {
                 self.input(
                     format!("Label node {name} (key=value, or key- to remove)"),
@@ -935,6 +995,22 @@ impl View {
             ('l', Kind::Build) => run(&["build-logs", &name, "-n", &namespace, "--follow"]),
             ('E', _) => Request::Edit { key: k.clone() },
             ('I', Kind::Node) => run(&["image", "ls", "--node", &name]),
+            ('p', Kind::Volume) => {
+                if o.status["replica"]["node"].as_str().is_none() {
+                    self.notice = Some(format!("Volume {ns}/{n} has no replica to promote."));
+                    return None;
+                }
+                self.input(
+                    format!(
+                        "Type {n} to hand volume {ns}/{n} to its replica (what runs on its node now writes to a copy that is dropped)"
+                    ),
+                    Then::Promote {
+                        namespace,
+                        volume: name,
+                    },
+                );
+                return None;
+            }
             ('N', Kind::Volume) => run(&["volume", "snapshots", &name, "-n", &namespace]),
             ('B', Kind::Volume) => {
                 self.input(
@@ -1049,7 +1125,7 @@ impl View {
                 let i = self.index();
                 match k.code {
                     KeyCode::Char(c) if input.chars().count() < 120 => {
-                        let digits_only = matches!(then, Then::Scale { .. });
+                        let digits_only = matches!(then, Then::Scale { .. } | Then::Scrub { .. });
                         if !digits_only || c.is_ascii_digit() {
                             input.push(c);
                         }
@@ -1141,6 +1217,17 @@ impl View {
                 "volume", "backup", &volume, "-o", &input, "-n", &namespace,
             ])),
             Then::Backup { .. } => refuse(self, "Cancelled: no file given."),
+            Then::Scrub { node } => match input.parse::<u32>() {
+                Ok(0) | Err(_) if input.is_empty() || input == "0" => {
+                    Some(run(&["node", "scrub", &node, "--never"]))
+                }
+                Ok(days) => Some(run(&["node", "scrub", &node, "--every", &days.to_string()])),
+                Err(_) => refuse(self, "Cancelled: no number given."),
+            },
+            Then::Promote { namespace, volume } if input == volume => Some(run(&[
+                "volume", "promote", &volume, "-n", &namespace, "--yes",
+            ])),
+            Then::Promote { .. } => refuse(self, "Not promoted: the name did not match."),
             Then::Label { node } => match crate::cli::label_change(&input) {
                 Ok((key, value)) => Some(Request::Label { node, key, value }),
                 Err(e) => refuse(self, &format!("Cancelled: {e}.")),
@@ -1488,6 +1575,7 @@ fn node_rows(model: &Model) -> Vec<TableRow> {
             };
             let state_word = word(&st.state);
             let (cpu_val, mem_val) = used.unwrap_or((0.0, 0));
+            let load = load_cell(model.node_metrics(&name).map(|m| m.load), cores);
             TableRow::new(
                 vec![
                     text(name),
@@ -1503,6 +1591,8 @@ fn node_rows(model: &Model) -> Vec<TableRow> {
                     text(running.to_string()),
                     cpu,
                     memory,
+                    load,
+                    pools_cell(&st.pools, &spec),
                     dimmed(labels.join(",")),
                 ],
                 Some(key(n)),
@@ -1510,6 +1600,79 @@ fn node_rows(model: &Model) -> Vec<TableRow> {
             .metrics(cpu_val, mem_val, state_word)
         })
         .collect()
+}
+
+/// The load averages over 1, 5 and 15 minutes, the first coloured by
+/// how it stands to the node's cores.
+fn load_cell(load: Option<[u32; 3]>, cores: f64) -> Line<'static> {
+    let Some(load) = load.filter(|l| *l != [0; 3]) else {
+        return text("");
+    };
+    let [one, five, fifteen] = load.map(|l| f64::from(l) / 100.0);
+    let style = match cores {
+        c if c > 0.0 && one >= c => fg(BAD),
+        c if c > 0.0 && one >= c * 0.7 => fg(WARN),
+        _ => Style::default(),
+    };
+    Line::from(vec![
+        Span::styled(format!("{one:.2}"), style),
+        Span::styled(format!(" {five:.2} {fifteen:.2}"), dim()),
+    ])
+}
+
+/// A node's ZFS pools in a cell: each one's name and how full, its
+/// state where it is not ONLINE, its errors not taken as seen, and a
+/// scrub or resilver running; the worst of them sets the colour.
+fn pools_cell(pools: &[legion_api::node::Pool], spec: &NodeSpec) -> Line<'static> {
+    let mut style = Style::default();
+    let words: Vec<String> = pools
+        .iter()
+        .map(|p| {
+            let mut w = format!("{} {}%", p.name, p.percent_used());
+            if !p.healthy() {
+                w = format!("{} {}", p.name, p.state);
+                style = fg(BAD);
+            }
+            let seen = spec.pool_errors_seen.get(&p.name).copied().unwrap_or(0);
+            let new = p.errors().saturating_sub(seen);
+            if new > 0 {
+                w.push_str(&match new {
+                    1 => ", 1 error".to_owned(),
+                    n => format!(", {n} errors"),
+                });
+                if style != fg(BAD) {
+                    style = fg(WARN);
+                }
+            }
+            if let Some(s) = p.scan.as_ref().filter(|_| p.scanning()) {
+                w.push_str(&format!(", {}", s.function));
+            }
+            w
+        })
+        .collect();
+    colored(words.join(" "), style)
+}
+
+/// A Service's images, each marked as `legion list services` marks it (a
+/// Linux image, a tag moved), in the warning colour when one is.
+fn service_images(s: &Object) -> Line<'static> {
+    let plain: Vec<&str> = s.spec["pod"]["containers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c["image"].as_str())
+        .collect();
+    let marked: Vec<String> = plain
+        .iter()
+        .map(|i| crate::cli::marked_image(i, &s.status))
+        .collect();
+    let any = marked.iter().zip(&plain).any(|(m, p)| m != p);
+    let joined = marked.join(",");
+    if any {
+        colored(joined, fg(WARN))
+    } else {
+        dimmed(joined)
+    }
 }
 
 fn images(pod: &serde_json::Value) -> String {
@@ -1670,7 +1833,7 @@ fn workload_rows(model: &Model, view: &View) -> Vec<TableRow> {
                     state,
                     cpu,
                     memory,
-                    dimmed(images(&s.spec["pod"])),
+                    service_images(s),
                 ],
                 Some(key(s)),
             )

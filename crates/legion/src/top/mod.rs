@@ -82,6 +82,9 @@ enum Msg {
     /// Long operations as they change (`Cluster.Activity`); `true`: all
     /// of them, what was known before replaced.
     Activity(bool, Vec<legion_api::activity::Operation>),
+    /// What the managers kept over a range (`0`: the hour before the
+    /// first poll).
+    History(i64, pb::UsageHistoryResponse),
     /// The terminal is gone.
     HungUp,
 }
@@ -113,6 +116,13 @@ pub async fn run(
     let (seen_tx, seen_rx) = watch::channel(BTreeSet::new());
     let seer = tokio::spawn(poll_connections(channel.clone(), seen_rx, tx.clone()));
     let activity = tokio::spawn(follow_activity(channel.clone(), tx.clone()));
+    let (range_tx, range_rx) = watch::channel(0i64);
+    let past = tokio::spawn(follow_history(
+        channel.clone(),
+        namespace.clone(),
+        range_rx,
+        tx.clone(),
+    ));
     let keys = Keys::default();
     read_keys(tx.clone(), keys.clone());
 
@@ -148,6 +158,11 @@ pub async fn run(
             }
             mouse_captured = view.mouse;
         }
+        range_tx.send_if_modified(|r| {
+            (*r != view.range_ms())
+                .then(|| *r = view.range_ms())
+                .is_some()
+        });
         if view.poll_ms != last_poll_ms {
             last_poll_ms = view.poll_ms;
             let _ = poll_tx.send(Duration::from_millis(last_poll_ms));
@@ -234,6 +249,7 @@ pub async fn run(
                         model.activity.insert(op.id.clone(), op);
                     }
                 }
+                Msg::History(range_ms, r) => model.history_answer(range_ms, &r),
                 Msg::Connections(namespace, edges) => {
                     model.connections.insert(namespace, edges);
                 }
@@ -383,6 +399,7 @@ pub async fn run(
     poller.abort();
     seer.abort();
     activity.abort();
+    past.abort();
     result
 }
 
@@ -616,6 +633,64 @@ async fn poll_connections(
                     .is_err()
             {
                 return;
+            }
+        }
+    }
+}
+
+/// How often a range the graphs show is asked again: the managers keep
+/// a sample a minute.
+const PAST: Duration = Duration::from_secs(60);
+
+/// Asks what the managers kept: the hour before the first poll once, for
+/// the graphs to start full, then the range the graphs show, as it
+/// changes and every minute while it is shown. Not for a manager too old
+/// to have it, nor a caller who may not read it.
+async fn follow_history(
+    channel: Channel,
+    namespace: Option<String>,
+    mut range: watch::Receiver<i64>,
+    tx: mpsc::UnboundedSender<Msg>,
+) {
+    let cluster = crate::cli::cluster_client(channel);
+    let ask = |range_ms: i64| {
+        let req = pb::UsageHistoryRequest {
+            namespace: namespace.clone().unwrap_or_default(),
+            task: String::new(),
+            range_ms: if range_ms == 0 { 3_600_000 } else { range_ms },
+        };
+        let mut cluster = cluster.clone();
+        async move { cluster.usage_history(req).await.map(|r| r.into_inner()) }
+    };
+    match ask(0).await {
+        Ok(r) => {
+            if tx.send(Msg::History(0, r)).is_err() {
+                return;
+            }
+        }
+        Err(e) if e.code() == tonic::Code::Unimplemented => return,
+        Err(_) => {}
+    }
+    loop {
+        let shown = *range.borrow_and_update();
+        if shown != 0
+            && let Ok(r) = ask(shown).await
+            && tx.send(Msg::History(shown, r)).is_err()
+        {
+            return;
+        }
+        // The polls need nothing more: wait for a range to be chosen.
+        let wait = if shown == 0 {
+            Duration::from_secs(86_400)
+        } else {
+            PAST
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            changed = range.changed() => {
+                if changed.is_err() {
+                    return;
+                }
             }
         }
     }

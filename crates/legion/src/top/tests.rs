@@ -1717,3 +1717,296 @@ fn disruptions_are_checked_first() {
         None
     );
 }
+
+/// A node with its host and two pools, one degraded with errors partly
+/// taken as seen, and its agent's load.
+fn host_and_pools() -> Model {
+    let mut m = cluster();
+    let mut n1 = node("n1", 30, "ready", "active");
+    n1.spec["poolErrorsSeen"] = serde_json::json!({ "tank": 1 });
+    n1.spec["scrubEveryDays"] = serde_json::json!(14);
+    let now_ms = legion_api::clock::now() * 1000;
+    n1.status["host"] = serde_json::json!({
+        "release": "15.1-RELEASE-p2", "kernel": "15.1-RELEASE-p1", "boot": "UEFI",
+        "bootedMs": now_ms - 3 * 86_400_000,
+    });
+    n1.status["pools"] = serde_json::json!([
+        { "name": "zroot", "state": "ONLINE", "sizeBytes": 100u64 << 30, "allocBytes": 34u64 << 30,
+          "scan": { "function": "scrub", "state": "finished", "endMs": now_ms - 86_400_000 } },
+        { "name": "tank", "state": "DEGRADED", "sizeBytes": 10u64 << 30, "allocBytes": 5u64 << 30,
+          "checksumErrors": 4, "scan": { "function": "resilver", "state": "scanning" } },
+    ]);
+    m.changed(true, n1, 0);
+    m.usage(pb::UsageResponse {
+        nodes: vec![pb::NodeUsage {
+            node: "n1".into(),
+            load1: 350,
+            load5: 120,
+            load15: 40,
+            ..Default::default()
+        }],
+    });
+    m
+}
+
+#[test]
+fn nodes_show_their_load_and_pools_and_details_their_host() {
+    let m = host_and_pools();
+    let mut v = View {
+        detail: Some(false),
+        ..View::default()
+    };
+    let s = screen_of(&m, &v, 200);
+    // 3.50 of 4 cores is past 70 %; tank is degraded, with 3 errors not
+    // taken as seen and a resilver running.
+    assert!(
+        line(&s, "n1").contains("3.50 1.20 0.40 zroot 34% tank DEGRADED, 3 errors, resilver"),
+        "{s}"
+    );
+    assert!(!line(&s, "n2").contains("zroot"), "{s}");
+    v.detail = Some(true);
+    let s = screen_sized(&m, &v, 200, 60);
+    let flat: String = s
+        .lines()
+        .map(|l| {
+            l.chars()
+                .filter(|c| !"│╭╮╰╯─".contains(*c))
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for said in [
+        "load 3.50 1.20 0.40 (1, 5, 15 min)",
+        "release: 15.1-RELEASE-p2 (kernel 15.1-RELEASE-p1)",
+        "boot: UEFI",
+        "up: 3d",
+        "zroot ONLINE 34% (34.0 of 100.0 GiB)",
+        "errors: none",
+        "scrubbed: 1d ago",
+        "tank DEGRADED 50% (5.0 of 10.0 GiB)",
+        "errors: 0 read, 0 write, 4 checksum",
+        "scrubbed: resilver running",
+        "scrubs: every 14 days",
+    ] {
+        assert!(flat.contains(said), "{said}: {flat}");
+    }
+    // Said once, not again as the status's fields.
+    assert!(!s.contains("allocBytes"), "{s}");
+}
+
+#[test]
+fn services_mark_linux_images_and_tags_that_moved() {
+    let mut m = cluster();
+    let mut s = service(40, 1, 1);
+    s.spec["pod"]["containers"] = serde_json::json!([
+        { "name": "web", "image": "nginx:1" },
+        { "name": "cache", "image": "redis:7" },
+        { "name": "app", "image": "examples/node:24" },
+    ]);
+    s.status["linuxImages"] = serde_json::json!({ "nginx:1": "static-site", "redis:7": "" });
+    s.status["images"] = serde_json::json!({ "moved": { "examples/node:24": "sha256:ab" } });
+    m.changed(true, s, 0);
+    let mut v = View {
+        detail: Some(false),
+        ..View::default()
+    };
+    typed(&mut v, &m, "2");
+    let screen = screen_of(&m, &v, 220);
+    assert!(
+        line(&screen, "replicated").contains(
+            "nginx:1 (Linux; native: static-site),redis:7 (Linux),examples/node:24 (tag moved)"
+        ),
+        "{screen}"
+    );
+    // As legion list services says them.
+    let web = m
+        .get(&(Kind::Service, "shop".into(), "web".into()))
+        .unwrap();
+    assert_eq!(
+        crate::cli::marked_image("nginx:1", &web.status),
+        "nginx:1 (Linux; native: static-site)"
+    );
+}
+
+#[test]
+fn node_keys_schedule_scrubs_and_take_pool_errors_as_seen() {
+    let m = host_and_pools();
+    let mut v = View::default();
+    assert_eq!(typed(&mut v, &m, "c"), None);
+    match &v.prompt {
+        Some(view::Prompt::Input { ask, .. }) => assert!(ask.contains("now every 14"), "{ask}"),
+        p => panic!("{p:?}"),
+    }
+    // Only digits are taken.
+    assert_eq!(
+        typed(&mut v, &m, "7x\n"),
+        run(&["node", "scrub", "n1", "--every", "7"])
+    );
+    assert_eq!(
+        typed(&mut v, &m, "c\n"),
+        run(&["node", "scrub", "n1", "--never"])
+    );
+    assert_eq!(
+        typed(&mut v, &m, "c0\n"),
+        run(&["node", "scrub", "n1", "--never"])
+    );
+    // Asked first, then taken.
+    assert_eq!(typed(&mut v, &m, "X"), None);
+    match &v.prompt {
+        Some(view::Prompt::Confirm(_, ask)) => assert!(ask.contains("4 pool errors"), "{ask}"),
+        p => panic!("{p:?}"),
+    }
+    assert_eq!(typed(&mut v, &m, "y"), run(&["node", "errors-seen", "n1"]));
+    // A node without errors has none to take.
+    v.notice = None;
+    assert_eq!(typed(&mut v, &m, "↓X"), None);
+    assert!(v.prompt.is_none());
+    assert!(
+        v.notice.as_deref().unwrap().contains("no errors"),
+        "{:?}",
+        v.notice
+    );
+}
+
+#[test]
+fn a_volume_s_replica_is_promoted_once_its_name_is_typed() {
+    let mut m = cluster();
+    let mut v = View::default();
+    typed(&mut v, &m, "4");
+    // Without a replica, there is nothing to promote.
+    assert_eq!(typed(&mut v, &m, "p"), None);
+    assert!(v.notice.as_deref().unwrap().contains("no replica"));
+    let mut data = m
+        .get(&(Kind::Volume, "shop".into(), "data".into()))
+        .unwrap()
+        .clone();
+    data.status["replica"] = serde_json::json!({ "node": "n2", "state": "ready" });
+    data.metadata.version += 1;
+    m.changed(true, data, 0);
+    v.notice = None;
+    assert_eq!(typed(&mut v, &m, "pdat\n"), None);
+    assert!(v.notice.as_deref().unwrap().contains("did not match"));
+    assert_eq!(
+        typed(&mut v, &m, "pdata\n"),
+        run(&["volume", "promote", "data", "-n", "shop", "--yes"])
+    );
+}
+
+fn usage_history(step_ms: i64) -> pb::UsageHistoryResponse {
+    let sample = |at_ms, cpu_percent, memory_bytes| pb::UsageSample {
+        at_ms,
+        cpu_percent,
+        memory_bytes,
+    };
+    let node_sample =
+        |at_ms, zfs_used_bytes, zfs_avail_bytes, net_rx_bps, net_tx_bps| pb::NodeSample {
+            at_ms,
+            zfs_used_bytes,
+            zfs_avail_bytes,
+            net_rx_bps,
+            net_tx_bps,
+        };
+    pb::UsageHistoryResponse {
+        step_ms,
+        tasks: vec![
+            pb::TaskSeries {
+                namespace: "shop".into(),
+                task: "web-1-1".into(),
+                // Twice in the first step: its latest counts.
+                samples: vec![
+                    sample(0, 10.0, 100),
+                    sample(5, 30.0, 300),
+                    sample(10, 40.0, 400),
+                ],
+                ..Default::default()
+            },
+            pb::TaskSeries {
+                namespace: "shop".into(),
+                task: "web-2-1".into(),
+                samples: vec![sample(12, 50.0, 500), sample(20, 60.0, 600)],
+                ..Default::default()
+            },
+        ],
+        nodes: vec![pb::NodeSeries {
+            node: "n1".into(),
+            samples: vec![node_sample(0, 1, 9, 5, 5), node_sample(10, 2, 8, 7, 3)],
+        }],
+    }
+}
+
+#[test]
+fn what_the_managers_kept_is_summed_a_step_at_a_time() {
+    let past = model::Past::of(7, &usage_history(10));
+    assert_eq!(past.range_ms, 7);
+    assert_eq!(past.totals, vec![(30.0, 300), (90.0, 900), (60.0, 600)]);
+    assert_eq!(past.telemetry, vec![(1, 9, 5, 5), (2, 8, 7, 3)]);
+}
+
+fn series_len(m: &Model, v: &View) -> usize {
+    m.series(v.range_ms()).0.len()
+}
+
+#[test]
+fn the_graphs_start_with_the_last_hour_and_show_a_range_on_w() {
+    let mut m = cluster();
+    // Polls heard before the hour kept (the cluster's, then this): they
+    // stay the latest.
+    m.usage(pb::UsageResponse {
+        nodes: vec![pb::NodeUsage {
+            node: "n1".into(),
+            tasks: vec![pb::TaskUsage {
+                namespace: "shop".into(),
+                task: "web-1-1".into(),
+                cpu_percent: 5.0,
+                memory_bytes: 50,
+            }],
+            ..Default::default()
+        }],
+    });
+    m.history_answer(0, &usage_history(10));
+    let polls: Vec<(f64, u64)> = m.history.iter().copied().collect();
+    assert_eq!(
+        polls,
+        vec![
+            (30.0, 300),
+            (90.0, 900),
+            (60.0, 600),
+            (25.0, 64 << 20),
+            (5.0, 50)
+        ]
+    );
+    assert_eq!(m.telemetry_history.len(), 4);
+
+    let mut v = View::default();
+    assert_eq!(series_len(&m, &v), 5);
+    typed(&mut v, &m, "w");
+    assert_eq!((v.range_ms(), v.range_name()), (3_600_000, "1h"));
+    // Nothing until the managers answer for that range.
+    assert_eq!(series_len(&m, &v), 0);
+    m.history_answer(3_600_000, &usage_history(10));
+    assert_eq!(series_len(&m, &v), 3);
+    let s = screen(&m, &v);
+    assert!(s.contains("cpu 1h") && s.contains("mem 1h"), "{s}");
+    // An answer for another range is not shown for this one.
+    typed(&mut v, &m, "w");
+    assert_eq!(v.range_name(), "6h");
+    assert_eq!(series_len(&m, &v), 0);
+    typed(&mut v, &m, "wwww");
+    assert_eq!(v.range_name(), "live");
+    assert_eq!(series_len(&m, &v), 5);
+}
+
+#[test]
+fn a_range_is_fitted_to_the_graph_keeping_its_peaks() {
+    let samples: Vec<f64> = (0..100).map(|i| if i == 37 { 9.0 } else { 1.0 }).collect();
+    let fitted = draw::fit(&samples, 10, true);
+    assert_eq!(fitted.len(), 10);
+    assert_eq!(fitted[3], 9.0);
+    assert_eq!(fitted.iter().filter(|v| **v == 1.0).count(), 9);
+    // The polls are shown as they are, the latest where they don't fit.
+    assert_eq!(draw::fit(&samples, 10, false).len(), 100);
+    assert_eq!(draw::fit(&samples[..5], 10, true).len(), 5);
+}

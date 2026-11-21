@@ -30,6 +30,8 @@ pub(super) struct NodeMetrics {
     pub(super) zfs_avail: u64,
     pub(super) net_rx_bps: u64,
     pub(super) net_tx_bps: u64,
+    /// The host's load averages over 1, 5 and 15 minutes, in hundredths.
+    pub(super) load: [u32; 3],
 }
 
 /// The cluster as last heard.
@@ -62,6 +64,84 @@ pub struct Model {
     pub(super) connections: BTreeMap<String, Vec<pb::ConnectionEdge>>,
     /// Long operations (`Cluster.Activity`), by id.
     pub(super) activity: BTreeMap<String, legion_api::activity::Operation>,
+    /// What the managers kept over a range the graphs show in place of
+    /// the polls (`UsageHistory`), as the last answer for it was.
+    pub(super) past: Option<Past>,
+}
+
+/// `(zfs_used, zfs_avail, net_rx_bps, net_tx_bps)` over the nodes.
+pub(super) type Telemetry = (u64, u64, u64, u64);
+
+/// Usage over a range, as the managers kept it: totals at each step.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct Past {
+    pub(super) range_ms: i64,
+    /// What all tasks used: percent of a CPU, bytes.
+    pub(super) totals: Vec<(f64, u64)>,
+    /// `(zfs_used, zfs_avail, net_rx_bps, net_tx_bps)` over the nodes.
+    pub(super) telemetry: Vec<(u64, u64, u64, u64)>,
+}
+
+impl Past {
+    /// Totals at each step of the answer: each task (and node) counted once
+    /// in every step it was sampled in, by its latest sample there.
+    pub(super) fn of(range_ms: i64, r: &pb::UsageHistoryResponse) -> Past {
+        let step = r.step_ms.max(1);
+        let mut tasks: BTreeMap<i64, BTreeMap<usize, (i64, f64, u64)>> = BTreeMap::new();
+        for (i, t) in r.tasks.iter().enumerate() {
+            for s in &t.samples {
+                let latest = tasks
+                    .entry(s.at_ms / step)
+                    .or_default()
+                    .entry(i)
+                    .or_default();
+                if s.at_ms >= latest.0 {
+                    *latest = (s.at_ms, s.cpu_percent, s.memory_bytes);
+                }
+            }
+        }
+        let totals = tasks
+            .values()
+            .map(|by_task| {
+                by_task
+                    .values()
+                    .fold((0.0, 0), |(c, m), (_, tc, tm)| (c + tc, m + tm))
+            })
+            .collect();
+        type Sample = (i64, u64, u64, u64, u64);
+        let mut nodes: BTreeMap<i64, BTreeMap<usize, Sample>> = BTreeMap::new();
+        for (i, n) in r.nodes.iter().enumerate() {
+            for s in &n.samples {
+                let latest = nodes
+                    .entry(s.at_ms / step)
+                    .or_default()
+                    .entry(i)
+                    .or_default();
+                if s.at_ms >= latest.0 {
+                    *latest = (
+                        s.at_ms,
+                        s.zfs_used_bytes,
+                        s.zfs_avail_bytes,
+                        s.net_rx_bps,
+                        s.net_tx_bps,
+                    );
+                }
+            }
+        }
+        let telemetry = nodes
+            .values()
+            .map(|by_node| {
+                by_node.values().fold((0, 0, 0, 0), |t, (_, u, a, rx, tx)| {
+                    (t.0 + u, t.1 + a, t.2 + rx, t.3 + tx)
+                })
+            })
+            .collect();
+        Past {
+            range_ms,
+            totals,
+            telemetry,
+        }
+    }
 }
 
 impl Model {
@@ -146,7 +226,12 @@ impl Model {
             zfs_avail_sum = zfs_avail_sum.saturating_add(n.zfs_avail_bytes);
             net_rx_sum = net_rx_sum.saturating_add(n.net_rx_bps);
             net_tx_sum = net_tx_sum.saturating_add(n.net_tx_bps);
-            if n.zfs_used_bytes > 0 || n.zfs_avail_bytes > 0 || n.net_rx_bps > 0 || n.net_tx_bps > 0
+            let load = [n.load1, n.load5, n.load15];
+            if n.zfs_used_bytes > 0
+                || n.zfs_avail_bytes > 0
+                || n.net_rx_bps > 0
+                || n.net_tx_bps > 0
+                || load != [0; 3]
             {
                 self.node_telemetry.insert(
                     n.node.clone(),
@@ -155,6 +240,7 @@ impl Model {
                         zfs_avail: n.zfs_avail_bytes,
                         net_rx_bps: n.net_rx_bps,
                         net_tx_bps: n.net_tx_bps,
+                        load,
                     },
                 );
             }
@@ -180,6 +266,42 @@ impl Model {
             .push_back((zfs_used_sum, zfs_avail_sum, net_rx_sum, net_tx_sum));
         while self.telemetry_history.len() > HISTORY {
             self.telemetry_history.pop_front();
+        }
+    }
+
+    /// What the managers kept: over the range asked for, in place of the
+    /// polls; or, for the polls (`0`), the last hour before the first, so
+    /// the graphs start full rather than empty.
+    pub(super) fn history_answer(&mut self, range_ms: i64, r: &pb::UsageHistoryResponse) {
+        let past = Past::of(range_ms, r);
+        if range_ms != 0 {
+            self.past = Some(past);
+            return;
+        }
+        let mut history: VecDeque<(f64, u64)> = past.totals.into();
+        history.extend(self.history.drain(..));
+        let over = history.len().saturating_sub(HISTORY);
+        history.drain(..over);
+        self.history = history;
+        let mut telemetry: VecDeque<_> = past.telemetry.into();
+        telemetry.extend(self.telemetry_history.drain(..));
+        let over = telemetry.len().saturating_sub(HISTORY);
+        telemetry.drain(..over);
+        self.telemetry_history = telemetry;
+    }
+
+    /// What the graphs show: over `range_ms` as the managers kept it, once
+    /// it is heard, or the polls (`0`).
+    pub(super) fn series(&self, range_ms: i64) -> (Vec<(f64, u64)>, Vec<Telemetry>) {
+        match &self.past {
+            Some(p) if range_ms != 0 && p.range_ms == range_ms => {
+                (p.totals.clone(), p.telemetry.clone())
+            }
+            Some(_) | None if range_ms != 0 => (Vec::new(), Vec::new()),
+            _ => (
+                self.history.iter().copied().collect(),
+                self.telemetry_history.iter().copied().collect(),
+            ),
         }
     }
 

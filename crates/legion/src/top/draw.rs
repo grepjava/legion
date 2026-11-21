@@ -250,7 +250,7 @@ pub fn render(f: &mut Frame, model: &Model, view: &View) {
                 Constraint::Length(1),
             ])
             .areas(area);
-            header(f, model, top);
+            header(f, model, view, top);
             f.render_widget(tab_bar(model, view), tabs);
             render_body_and_pane(f, model, view, body);
             f.render_widget(Paragraph::new(bottom_line(view)), bottom);
@@ -514,7 +514,7 @@ fn logs(f: &mut Frame, logs: &Logs, area: Rect) {
 }
 
 /// The managers, nodes and tasks at a glance, and graphs of use.
-fn header(f: &mut Frame, model: &Model, area: Rect) {
+fn header(f: &mut Frame, model: &Model, view: &View, area: Rect) {
     let mut top = Line::from(vec![Span::styled(
         " ◆ legion ",
         fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -541,31 +541,42 @@ fn header(f: &mut Frame, model: &Model, area: Rect) {
 
     let (millicores, memory) = model.capacity();
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(right);
-    let cpu: Vec<f64> = model.history.iter().map(|(c, _)| c / 100.0).collect();
-    let mem: Vec<f64> = model.history.iter().map(|(_, m)| *m as f64).collect();
+    let (totals, _) = model.series(view.range_ms());
+    let whole = view.range_ms() != 0;
+    let cpu: Vec<f64> = totals.iter().map(|(c, _)| c / 100.0).collect();
+    let mem: Vec<f64> = totals.iter().map(|(_, m)| *m as f64).collect();
     let cores = |c: f64| format!("{c:.1}");
     let cpu_total = format!(" CPU of {}", trim(millicores as f64 / 1000.0));
     let mem_total = format!(" of {}", bytes(memory));
     let mib = |m: f64| bytes(m as u64);
+    let (cpu_name, mem_name) = match whole {
+        true => (
+            format!("cpu {}", view.range_name()),
+            format!("mem {}", view.range_name()),
+        ),
+        false => ("cpu".to_owned(), "mem".to_owned()),
+    };
     graph(
         f,
         rows[0],
-        "cpu",
+        &cpu_name,
         &cpu,
         millicores as f64 / 1000.0,
         &cores,
         &cpu_total,
         OK,
+        whole,
     );
     graph(
         f,
         rows[1],
-        "mem",
+        &mem_name,
         &mem,
         memory as f64,
         &mib,
         &mem_total,
         ACCENT,
+        whole,
     );
 }
 
@@ -582,6 +593,7 @@ fn graph(
     show: &dyn Fn(f64) -> String,
     total: &str,
     color: Color,
+    whole: bool,
 ) {
     let now = samples.last().copied();
     let frac = match now {
@@ -612,7 +624,8 @@ fn graph(
     if spark.width < 8 {
         return;
     }
-    let shown = &samples[samples.len().saturating_sub(spark.width as usize)..];
+    let fitted = fit(samples, spark.width as usize, whole);
+    let shown = &fitted[fitted.len().saturating_sub(spark.width as usize)..];
     let peak = shown.iter().copied().fold(0.0, f64::max);
     // Scaled to the peak, but not below 2 % of what the nodes hold:
     // noise on an idle cluster stays flat.
@@ -767,18 +780,15 @@ fn bento_telemetry_deck(f: &mut Frame, model: &Model, view: &View, area: Rect) {
     let (millicores, memory) = model.capacity();
     let cpu_cap = millicores as f64 / 1000.0;
     let mem_cap = memory as f64;
-    let cpu_samples: Vec<f64> = model.history.iter().map(|(c, _)| c / 100.0).collect();
-    let mem_samples: Vec<f64> = model.history.iter().map(|(_, m)| *m as f64).collect();
+    let (totals, telemetry) = model.series(view.range_ms());
+    let whole = view.range_ms() != 0;
+    let cpu_samples: Vec<f64> = totals.iter().map(|(c, _)| c / 100.0).collect();
+    let mem_samples: Vec<f64> = totals.iter().map(|(_, m)| *m as f64).collect();
     let (zfs_used, zfs_avail) = model.zfs_totals();
     let zfs_cap = (zfs_used + zfs_avail) as f64;
-    let zfs_samples: Vec<f64> = model
-        .telemetry_history
-        .iter()
-        .map(|(u, _, _, _)| *u as f64)
-        .collect();
+    let zfs_samples: Vec<f64> = telemetry.iter().map(|(u, _, _, _)| *u as f64).collect();
     let (net_rx, net_tx) = model.net_totals();
-    let net_samples: Vec<f64> = model
-        .telemetry_history
+    let net_samples: Vec<f64> = telemetry
         .iter()
         .map(|(_, _, rx, tx)| (*rx + *tx) as f64)
         .collect();
@@ -806,21 +816,75 @@ fn bento_telemetry_deck(f: &mut Frame, model: &Model, view: &View, area: Rect) {
             "-".into()
         }
     );
-    braille_card(f, cols[0], "¹cpu", &cpu_samples, cpu_cap, &cpu_label);
+    let named = |n: &str| match whole {
+        true => format!("{n} {}", view.range_name()),
+        false => n.to_owned(),
+    };
+    braille_card(
+        f,
+        cols[0],
+        &named("¹cpu"),
+        &cpu_samples,
+        cpu_cap,
+        &cpu_label,
+        whole,
+    );
 
     let mem_now = mem_samples.last().copied().unwrap_or(0.0) as u64;
     let mem_label = format!("{}/{}", bytes(mem_now), bytes(memory));
-    braille_card(f, cols[1], "mem", &mem_samples, mem_cap, &mem_label);
+    braille_card(
+        f,
+        cols[1],
+        &named("mem"),
+        &mem_samples,
+        mem_cap,
+        &mem_label,
+        whole,
+    );
 
     let zfs_label = if zfs_used + zfs_avail > 0 {
         format!("{}/{}", bytes(zfs_used), bytes(zfs_used + zfs_avail))
     } else {
         "no zfs telemetry".into()
     };
-    braille_card(f, cols[2], "zfs", &zfs_samples, zfs_cap, &zfs_label);
+    braille_card(
+        f,
+        cols[2],
+        &named("zfs"),
+        &zfs_samples,
+        zfs_cap,
+        &zfs_label,
+        whole,
+    );
 
     let net_label = format!("▼{} ▲{}", rate(net_rx), rate(net_tx));
-    braille_card(f, cols[3], "net", &net_samples, net_peak, &net_label);
+    braille_card(
+        f,
+        cols[3],
+        &named("net"),
+        &net_samples,
+        net_peak,
+        &net_label,
+        whole,
+    );
+}
+
+/// The samples for a graph `points` wide: as they are, the latest
+/// shown; or, `whole`, the range in that space, each point the highest of
+/// the samples it stands for, so a peak is not lost.
+pub(super) fn fit(samples: &[f64], points: usize, whole: bool) -> Vec<f64> {
+    if !whole || points == 0 || samples.len() <= points {
+        return samples.to_vec();
+    }
+    (0..points)
+        .map(|i| {
+            let (from, to) = (i * samples.len() / points, (i + 1) * samples.len() / points);
+            samples[from..to.max(from + 1)]
+                .iter()
+                .copied()
+                .fold(0.0, f64::max)
+        })
+        .collect()
 }
 
 fn braille_card(
@@ -830,6 +894,7 @@ fn braille_card(
     samples: &[f64],
     capacity: f64,
     readout: &str,
+    whole: bool,
 ) {
     if area.width < 8 || area.height < 2 {
         return;
@@ -859,8 +924,9 @@ fn braille_card(
     if inner.width == 0 || inner.height == 0 {
         return;
     }
+    let samples = fit(samples, inner.width as usize * 2, whole);
     let lines = braille_lines(
-        samples,
+        &samples,
         capacity,
         inner.width as usize,
         inner.height as usize,
@@ -1226,6 +1292,13 @@ fn detail(f: &mut Frame, model: &Model, selected: Option<Key>, area: Rect) {
             ]));
         }
     }
+    if o.kind == Kind::Node {
+        lines.extend(node_lines(
+            o,
+            model.node_metrics(&o.metadata.name),
+            legion_api::clock::now() * 1000,
+        ));
+    }
     if o.kind == Kind::Service
         && let Some(edges) = model.connections.get(&o.metadata.namespace)
     {
@@ -1248,7 +1321,15 @@ fn detail(f: &mut Frame, model: &Model, selected: Option<Key>, area: Rect) {
             lines.push(field(1, k, v));
         }
     }
-    for (name, value) in [("status", &o.status), ("spec", &o.spec)] {
+    // A node's host and pools are said above.
+    let mut node_status = o.status.clone();
+    if o.kind == Kind::Node
+        && let Some(m) = node_status.as_object_mut()
+    {
+        m.remove("host");
+        m.remove("pools");
+    }
+    for (name, value) in [("status", &node_status), ("spec", &o.spec)] {
         if value.is_null() || value.as_object().is_some_and(|m| m.is_empty()) {
             continue;
         }
@@ -1264,6 +1345,78 @@ fn detail(f: &mut Frame, model: &Model, selected: Option<Key>, area: Rect) {
             .block(panel(title(super::model::name(o)))),
         area,
     );
+}
+
+/// A node's load, its host and its pools, as `legion node pools` says
+/// them, for its details.
+pub(super) fn node_lines(
+    o: &legion_api::Object,
+    metrics: Option<super::model::NodeMetrics>,
+    now_ms: i64,
+) -> Vec<Line<'static>> {
+    let st: NodeStatus = status(o);
+    let spec: legion_api::node::NodeSpec = super::model::spec(o);
+    let mut lines = Vec::new();
+    if let Some(load) = metrics.map(|m| m.load).filter(|l| *l != [0; 3]) {
+        let [a, b, c] = load.map(|l| f64::from(l) / 100.0);
+        lines.push(Line::from(vec![
+            Span::styled("load ", dim()),
+            Span::raw(format!("{a:.2} {b:.2} {c:.2}")),
+            Span::styled(" (1, 5, 15 min)", dim()),
+        ]));
+    }
+    if let Some(h) = &st.host {
+        lines.push(Line::default());
+        lines.push(section("host"));
+        let mut release = h.release.clone();
+        if !h.kernel.is_empty() && h.kernel != h.release {
+            release = format!("{release} (kernel {})", h.kernel);
+        }
+        lines.push(field(1, "release", &release));
+        if !h.boot.is_empty() {
+            lines.push(field(1, "boot", &h.boot));
+        }
+        if h.booted_ms > 0 {
+            let up = std::time::Duration::from_millis((now_ms - h.booted_ms).max(0) as u64);
+            lines.push(field(1, "up", &legion_api::clock::span(up)));
+        }
+    }
+    if !st.pools.is_empty() {
+        lines.push(Line::default());
+        lines.push(section("pools"));
+        for p in &st.pools {
+            let [_, name, state, used, errors, scrubbed] =
+                crate::cli::pool_row(&o.metadata.name, p, now_ms);
+            let seen = spec.pool_errors_seen.get(&p.name).copied().unwrap_or(0);
+            let errors = match (p.errors(), seen) {
+                (0, _) => errors,
+                (n, seen) if n <= seen => format!("{errors} (taken as seen)"),
+                _ => errors,
+            };
+            let style = if !p.healthy() {
+                fg(BAD)
+            } else if p.errors() > seen {
+                fg(WARN)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{name} {state}"),
+                    style.add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(" {used}")),
+            ]));
+            lines.push(field(2, "errors", &errors));
+            lines.push(field(2, "scrubbed", &scrubbed));
+        }
+        let every = spec
+            .scrub_every_days
+            .map_or("none scheduled".to_owned(), |d| format!("every {d} days"));
+        lines.push(field(1, "scrubs", &every));
+    }
+    lines
 }
 
 /// The connections `service` answered (←) and opened (→), open or closed
@@ -1410,6 +1563,10 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("d p a", "node: drain (asked), pause, activate"),
             ("L", "node: set or remove a label"),
             (
+                "c X",
+                "node: scrub its pools every N days; take its pool errors as seen (asked)",
+            ),
+            (
                 "s r R o",
                 "service: scale, roll back, restart, stop or start (asked)",
             ),
@@ -1426,6 +1583,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("E", "edit in $EDITOR, then apply over the version read"),
             ("I", "node: its images"),
             ("N B", "volume: its snapshots; back it up to a file"),
+            ("p", "volume: promote its replica (type the name)"),
             ("f", "task: its files (more with :files TASK PATH)"),
             ("l", "build: follow its log"),
         ],
@@ -1459,6 +1617,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("t", "expand workload → task → jail tree"),
             ("< > S", "sort column (cpu, mem, state, name) and direction"),
             ("+ -", "step live poll interval (1s, 2s, 5s, 10s)"),
+            ("w", "graphs over live, 1h, 6h, 24h, 7d or 30d"),
             ("M", "toggle mouse click & wheel support"),
         ],
     ),
@@ -1578,6 +1737,7 @@ fn bottom_line(view: &View) -> Line<'static> {
             ("p", "pause"),
             ("a", "activate"),
             ("L", "label"),
+            ("c", "scrubs"),
         ],
         Tab::Workloads => &[
             ("Enter", "tasks"),
@@ -1598,7 +1758,7 @@ fn bottom_line(view: &View) -> Line<'static> {
             ("h", "ended"),
             ("D", "delete"),
         ],
-        Tab::Storage => &[("m", "move"), ("D", "delete")],
+        Tab::Storage => &[("m", "move"), ("p", "promote"), ("D", "delete")],
         Tab::Network | Tab::Config => &[("y", "YAML"), ("D", "delete")],
         Tab::Log | Tab::Activity => &[],
     };

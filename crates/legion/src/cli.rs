@@ -58,6 +58,23 @@ pub(crate) fn pool_row(node: &str, p: &legion_api::node::Pool, now_ms: i64) -> [
     ]
 }
 
+/// A Service's image as its lists say it: a Linux image marked, with the
+/// native recipe that does what it does if there is one, and a tag that
+/// names another image now than the one its tasks run (a restart runs it).
+pub(crate) fn marked_image(image: &str, status: &serde_json::Value) -> String {
+    let mut marked = image.to_owned();
+    if let Some(recipe) = status["linuxImages"].get(image) {
+        marked = match recipe.as_str() {
+            Some(r) if !r.is_empty() => format!("{marked} (Linux; native: {r})"),
+            _ => format!("{marked} (Linux)"),
+        };
+    }
+    if status["images"]["moved"].get(image).is_some() {
+        marked = format!("{marked} (tag moved)");
+    }
+    marked
+}
+
 /// A Volume's replica in a cell: its node and how old its last copy is,
 /// or why it has none; then, as they hold, that it is stale, a copy runs,
 /// and automatic failover is blocked (`legion get volume` says why).
@@ -2185,31 +2202,11 @@ fn print_objects(objects: &[pb::Object], format: Format, kind: Kind) -> anyhow::
                 let rows: Vec<[String; 6]> = objects
                     .iter()
                     .map(|o| {
-                        // A tag that names another image now than the one
-                        // its tasks run is marked: a restart runs it. A
-                        // Linux image is marked too, with the native recipe
-                        // that does what it does, if there is one.
-                        let moved = &o.status["images"]["moved"];
-                        let linux = &o.status["linuxImages"];
                         let images: Vec<String> = o.spec["pod"]["containers"]
                             .as_array()
                             .map(|cs| {
                                 cs.iter()
-                                    .map(|c| {
-                                        let mut image = field(c, &["image"]);
-                                        if let Some(recipe) = linux.get(&image) {
-                                            image = match recipe.as_str() {
-                                                Some(r) if !r.is_empty() => {
-                                                    format!("{image} (Linux; native: {r})")
-                                                }
-                                                _ => format!("{image} (Linux)"),
-                                            };
-                                        }
-                                        if moved.get(field(c, &["image"])).is_some() {
-                                            image = format!("{image} (tag moved)");
-                                        }
-                                        image
-                                    })
+                                    .map(|c| marked_image(&field(c, &["image"]), &o.status))
                                     .collect()
                             })
                             .unwrap_or_default();
