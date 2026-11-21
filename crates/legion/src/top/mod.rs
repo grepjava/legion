@@ -41,7 +41,7 @@ pub(crate) use draw::bytes;
 pub use model::Model;
 #[cfg(test)]
 pub use view::SortCol;
-pub use view::{Preset, Request, View};
+pub use view::{Request, View};
 
 /// How often it asks for usage and the managers' state.
 const POLL: Duration = Duration::from_secs(5);
@@ -143,7 +143,6 @@ pub async fn run(
         && size.width >= 110
         && size.height >= 26
     {
-        view.preset = Preset::Bento;
         view.mouse = true;
     }
     let mut mouse_captured = false;
@@ -174,7 +173,7 @@ pub async fn run(
         // The shell's screen as large as its pane.
         if let Some((_, _, input)) = &shell
             && let Ok(size) = terminal.size()
-            && let Some((rows, cols)) = draw::shell_size(&model, &view, size.into())
+            && let Some((rows, cols)) = draw::shell_size(&view, size.into())
             && let Some(s) = &mut view.shell
             && s.size() != (rows, cols)
         {
@@ -182,9 +181,6 @@ pub async fn run(
             let _ = input.try_send(crate::session::resize(cols, rows));
         }
         let term_area = terminal.size().map(Rect::from).unwrap_or_default();
-        if term_area.width > 0 {
-            view.wide = draw::wide(term_area.width);
-        }
         if let Err(e) = terminal.draw(|f| draw::render(f, &model, &view)) {
             break Err(e.into());
         }
@@ -310,7 +306,7 @@ pub async fn run(
                         Request::Exec { .. } => {
                             view.show_shell(&request);
                             let area = terminal.size().map(Rect::from).unwrap_or_default();
-                            let size = draw::shell_size(&model, &view, area).unwrap_or((24, 80));
+                            let size = draw::shell_size(&view, area).unwrap_or((24, 80));
                             if let Some(s) = &mut view.shell {
                                 s.set_size(size.0, size.1);
                             }

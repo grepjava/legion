@@ -165,6 +165,13 @@ fn line(screen: &str, token: &str) -> String {
         .join(" ")
 }
 
+/// A view on the nodes' list, where most tests start.
+fn listing() -> View {
+    let mut v = View::default();
+    v.jump(view::Tab::Nodes);
+    v
+}
+
 fn typed(view: &mut View, model: &Model, keys: &str) -> Option<Request> {
     let mut last = None;
     for c in keys.chars() {
@@ -173,6 +180,8 @@ fn typed(view: &mut View, model: &Model, keys: &str) -> Option<Request> {
             '\x1b' => KeyCode::Esc,
             '\x08' => KeyCode::Backspace,
             '↓' => KeyCode::Down,
+            '↑' => KeyCode::Up,
+            '«' => KeyCode::F(3),
             c => KeyCode::Char(c),
         };
         last = view.key(model, KeyEvent::new(code, KeyModifiers::NONE));
@@ -183,7 +192,7 @@ fn typed(view: &mut View, model: &Model, keys: &str) -> Option<Request> {
 #[test]
 fn shows_every_kind_with_its_use() {
     let m = cluster();
-    let mut v = View::default();
+    let mut v = listing();
     let s = screen(&m, &v);
     assert!(
         s.contains("2/2 nodes ready") && s.contains("1 running"),
@@ -234,7 +243,7 @@ fn shows_every_kind_with_its_use() {
 #[test]
 fn yaml_of_a_deleted_object_lets_keys_through() {
     let mut m = cluster();
-    let mut v = View::default();
+    let mut v = listing();
     typed(&mut v, &m, "y");
     assert!(screen(&m, &v).contains("node n1 — YAML"));
     m.changed(false, node("n1", 1, "ready", "active"), 0);
@@ -247,15 +256,15 @@ fn yaml_of_a_deleted_object_lets_keys_through() {
 #[test]
 fn details_and_yaml_of_the_selected_object() {
     let m = cluster();
-    // Wide enough, the details show beside the table (the screen's width
-    // is noted as the loop does).
-    let mut v = View {
-        wide: true,
-        ..View::default()
-    };
+    // The list shows no details; Enter opens them on a panel of their
+    // own, F3 goes back.
+    let mut v = listing();
+    assert!(!screen_of(&m, &v, 170).contains("allocatable"));
+    typed(&mut v, &m, "\n");
     let s = screen_of(&m, &v, 170);
     assert!(s.contains("node n1") && s.contains("allocatable"), "{s}");
-    typed(&mut v, &m, "i");
+    assert!(s.contains("Menu › Nodes › node n1"), "{s}");
+    typed(&mut v, &m, "«");
     assert!(!screen_of(&m, &v, 170).contains("allocatable"));
     typed(&mut v, &m, "y");
     let s = screen(&m, &v);
@@ -268,7 +277,7 @@ fn details_and_yaml_of_the_selected_object() {
     typed(&mut v, &m, "x");
     assert!(v.yaml.is_none());
     typed(&mut v, &m, "?");
-    assert!(screen(&m, &v).contains("Acting on the selected row"));
+    assert!(screen(&m, &v).contains("Acting on the row selected"));
     typed(&mut v, &m, "x");
     assert!(!v.help);
 }
@@ -292,11 +301,8 @@ fn a_services_details_show_the_connections_seen() {
         connections,
         clients: 1,
     };
-    let v = View {
-        wide: true,
-        tab: Tab::Workloads,
-        ..View::default()
-    };
+    let mut v = listing();
+    typed(&mut v, &m, "2\n");
     // Not asked yet: no section.
     assert!(!screen_of(&m, &v, 170).contains("connections seen"));
     m.connections.insert("shop".into(), Vec::new());
@@ -331,21 +337,27 @@ fn a_services_details_show_the_connections_seen() {
 #[test]
 fn enter_shows_the_tasks_of_a_node_or_service() {
     let m = cluster();
-    let mut v = View::default();
+    let mut v = listing();
+    // Enter opens the node, Enter again its tasks.
     typed(&mut v, &m, "↓\n");
+    assert!(screen(&m, &v).contains("Menu › Nodes › node n2"));
+    typed(&mut v, &m, "\n");
     assert_eq!(v.tab, Tab::Tasks);
     let s = screen(&m, &v);
     assert!(s.contains("web-2-1") && !s.contains("web-1-1"), "{s}");
     assert!(s.contains("on node n2"), "{s}");
-    // Esc shows all tasks again; q quits.
+    // Esc goes back a panel at a time: the node, then the nodes.
     typed(&mut v, &m, "\x1b");
-    assert!(screen(&m, &v).contains("web-1-1"));
+    assert!(matches!(v.panel(), view::Panel::Detail { .. }));
+    typed(&mut v, &m, "\x1b");
+    assert_eq!(v.tab, Tab::Nodes);
+    assert_eq!(v.selected[0], 1);
     assert!(!v.quit);
     typed(&mut v, &m, "q");
     assert!(v.quit);
 
-    let mut v = View::default();
-    typed(&mut v, &m, "2\n");
+    let mut v = listing();
+    typed(&mut v, &m, "2\n\n");
     let s = screen(&m, &v);
     assert!(s.contains("web-1-1") && s.contains("web-2-1"), "{s}");
     assert!(s.contains("of service shop/web"), "{s}");
@@ -354,7 +366,7 @@ fn enter_shows_the_tasks_of_a_node_or_service() {
 #[test]
 fn a_filter_narrows_the_rows_as_it_is_typed() {
     let m = cluster();
-    let mut v = View::default();
+    let mut v = listing();
     typed(&mut v, &m, "3/2-1");
     let s = screen(&m, &v);
     assert!(s.contains("web-2-1") && !s.contains("web-1-1"), "{s}");
@@ -374,7 +386,7 @@ fn a_filter_narrows_the_rows_as_it_is_typed() {
 fn ended_tasks_only_on_asking() {
     let mut m = cluster();
     m.changed(true, task("web-1-0", 19, "n1", "failed", false), 0);
-    let mut v = View::default();
+    let mut v = listing();
     typed(&mut v, &m, "3");
     assert!(!screen(&m, &v).contains("web-1-0"));
     typed(&mut v, &m, "h");
@@ -386,7 +398,7 @@ fn ended_tasks_only_on_asking() {
 #[test]
 fn letters_with_ctrl_or_alt_do_nothing() {
     let m = cluster();
-    let mut v = View::default();
+    let mut v = listing();
     typed(&mut v, &m, "2jj");
     assert_eq!(ctrl(&mut v, &m, 'u'), None);
     let alt = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT);
@@ -396,7 +408,7 @@ fn letters_with_ctrl_or_alt_do_nothing() {
         Some(Request::Suspend { .. })
     ));
     // Nor do they answer a question.
-    let mut v = View::default();
+    let mut v = listing();
     typed(&mut v, &m, "2r");
     assert_eq!(ctrl(&mut v, &m, 'y'), None);
     assert!(matches!(
@@ -408,7 +420,7 @@ fn letters_with_ctrl_or_alt_do_nothing() {
 #[test]
 fn keys_act_on_the_selected_row() {
     let m = cluster();
-    let mut v = View::default();
+    let mut v = listing();
     // A drain is asked first; anything but y cancels.
     assert_eq!(typed(&mut v, &m, "d"), None);
     assert!(screen(&m, &v).contains("Drain node n1? Its tasks move"));
@@ -438,7 +450,7 @@ fn keys_act_on_the_selected_row() {
     assert!(screen(&m, &v).contains("Cancelled: label"));
 
     // Scaling takes a number; letters are not typed in.
-    let mut v = View::default();
+    let mut v = listing();
     assert_eq!(typed(&mut v, &m, "2s1"), None);
     assert!(screen(&m, &v).contains("Replicas for shop/web: 1"));
     assert_eq!(
@@ -478,7 +490,7 @@ fn keys_act_on_the_selected_row() {
     );
 
     // A volume moves to the node typed.
-    let mut v = View::default();
+    let mut v = listing();
     assert_eq!(
         typed(&mut v, &m, "4mn2\n"),
         Some(Request::Move {
@@ -492,7 +504,7 @@ fn keys_act_on_the_selected_row() {
 #[test]
 fn logs_and_shells_ask_which_container_when_there_are_several() {
     let m = cluster();
-    let mut v = View::default();
+    let mut v = listing();
     assert_eq!(
         typed(&mut v, &m, "3l"),
         Some(Request::Logs {
@@ -528,19 +540,18 @@ fn logs_and_shells_ask_which_container_when_there_are_several() {
 }
 
 #[test]
-fn logs_follow_under_the_table() {
+fn logs_follow_on_a_panel_of_their_own() {
     let m = cluster();
-    let mut v = View::default();
+    let mut v = listing();
     let logs = typed(&mut v, &m, "3l").unwrap();
     v.show_logs(&logs);
     let s = screen_sized(&m, &v, 130, 30);
     assert!(s.contains("Logs of shop/web-1-1"), "{s}");
     assert!(s.contains("Waiting for lines"));
     assert!(s.contains("following"));
-    // The table keeps its rows above.
-    let table = s.lines().position(|l| l.contains("web-2-1")).unwrap();
-    let pane = s.lines().position(|l| l.contains("Logs of")).unwrap();
-    assert!(table < pane, "{s}");
+    // Over the list, F3 going back to it.
+    assert!(!s.contains("web-2-1"), "{s}");
+    assert!(s.contains("Menu › Tasks › Logs of shop/web-1-1"), "{s}");
 
     let l = v.logs.as_mut().unwrap();
     // Lines come in pieces, with colours, tabs and carriage returns.
@@ -616,7 +627,7 @@ GET /a",
     assert!(!s.contains("web-2-1"), "{s}");
     assert_eq!(typed(&mut v, &m, "jD"), None);
     assert!(v.prompt.is_none());
-    assert_eq!(v.selected, View::default().selected);
+    assert_eq!(v.selected, listing().selected);
     typed(&mut v, &m, "z");
 
     v.logs.as_mut().unwrap().push(false, b"no newline");
@@ -649,13 +660,13 @@ fn ctrl(view: &mut View, model: &Model, c: char) -> Option<Request> {
 }
 
 #[test]
-fn a_shell_opens_under_the_table_and_takes_the_keys() {
+fn a_shell_opens_over_the_list_and_takes_the_keys() {
     let m = cluster();
-    let mut v = View::default();
+    let mut v = listing();
     let exec = typed(&mut v, &m, "3x").unwrap();
     v.show_shell(&exec);
     let area = ratatui::layout::Rect::new(0, 0, 130, 30);
-    let (rows, cols) = draw::shell_size(&m, &v, area).unwrap();
+    let (rows, cols) = draw::shell_size(&v, area).unwrap();
     let sh = v.shell.as_mut().unwrap();
     sh.set_size(rows, cols);
     // A prompt, a coloured word, and a line drawn over by a carriage
@@ -665,9 +676,8 @@ fn a_shell_opens_under_the_table_and_takes_the_keys() {
     assert!(s.contains("Shell in shop/web-1-1"), "{s}");
     assert!(s.contains("red file"), "{s}");
     assert!(s.contains("new line"), "{s}");
-    let table = s.lines().position(|l| l.contains("web-2-1")).unwrap();
-    let pane = s.lines().position(|l| l.contains("Shell in")).unwrap();
-    assert!(table < pane, "the table stays above: {s}");
+    assert!(!s.contains("web-2-1"), "over the list: {s}");
+    let pane = s.lines().position(|l| l.contains("╭ Shell in")).unwrap();
     // The pane's inside is the shell's screen.
     let inside = s.lines().nth(pane + 1).unwrap();
     assert!(inside.starts_with("│# ls"), "{inside}");
@@ -693,22 +703,17 @@ fn a_shell_opens_under_the_table_and_takes_the_keys() {
     );
     assert!(screen_sized(&m, &v, 130, 30).contains("The shell has the keys"));
 
-    // Ctrl-] gives the keys back: the table moves again.
+    // Ctrl-] gives the keys back to top: they scroll the shell, the
+    // list under it stays.
     assert_eq!(ctrl(&mut v, &m, ']'), None);
     assert!(!v.typing());
     assert_eq!(typed(&mut v, &m, "j"), None);
-    assert_eq!(v.selected[2], 1);
+    assert_eq!(v.selected[2], 0);
+    assert_eq!(*v.panel(), view::Panel::Pane);
     // As crossterm reads Ctrl-] on a terminal: Ctrl-5.
     assert_eq!(ctrl(&mut v, &m, '5'), None);
     assert!(v.typing());
     ctrl(&mut v, &m, ']');
-
-    // z over the table, z back.
-    typed(&mut v, &m, "z");
-    assert!(!screen_sized(&m, &v, 130, 30).contains("web-2-1"));
-    let (_, cols) = draw::shell_size(&m, &v, area).unwrap();
-    assert_eq!(cols, 128);
-    typed(&mut v, &m, "z");
 
     // It ends: the keys stay with top, and Ctrl-] cannot go back.
     let sh = v.shell.as_mut().unwrap();
@@ -719,6 +724,9 @@ fn a_shell_opens_under_the_table_and_takes_the_keys() {
     assert!(!v.typing());
     typed(&mut v, &m, "\x1b");
     assert!(v.shell.is_none());
+    assert_eq!(v.tab, Tab::Tasks);
+    assert!(matches!(v.panel(), view::Panel::List { .. }));
+    assert!(draw::shell_size(&v, area).is_none());
 
     // Logs and a shell share the pane: one closes the other.
     v.show_shell(&exec);
@@ -739,7 +747,7 @@ fn global_and_autoscaled_services_are_not_scaled_here() {
     let mut global = service(20, 1, 1);
     global.spec["mode"] = "global".into();
     m.changed(true, global, 0);
-    let mut v = View::default();
+    let mut v = listing();
     assert_eq!(typed(&mut v, &m, "2s"), None);
     assert!(screen(&m, &v).contains("global or autoscaled"));
     // The next key clears it.
@@ -790,7 +798,7 @@ fn changes_are_logged_and_old_ones_ignored() {
         .state,
         TaskState::Running
     );
-    let mut v = View::default();
+    let mut v = listing();
     typed(&mut v, &m, "7");
     let s = screen(&m, &v);
     assert_eq!(line(&s, "drain"), "09:30:05 node n1: active → drain");
@@ -806,7 +814,7 @@ fn a_host_lacking_what_it_requires_is_shown_and_logged() {
         { "id": "forwarding", "need": "advised", "state": "unmet", "detail": "off" }
     ]);
     m.changed(true, lacking.clone(), at);
-    let v = View::default();
+    let v = listing();
     let s = screen(&m, &v);
     assert!(s.contains("ready, lacks pf.anchors"), "{s}");
     assert!(!s.contains("lacks pf.anchors forwarding"), "{s}");
@@ -836,7 +844,7 @@ fn what_the_caller_may_not_read_says_so() {
     let mut other = service(5, 1, 1);
     other.metadata.namespace = "b".into();
     m.changed(true, other, 0);
-    let v = View::default();
+    let v = listing();
     let s = screen(&m, &v);
     assert!(s.contains("do not let you read node"), "{s}");
     assert!(
@@ -852,7 +860,7 @@ fn what_the_caller_may_not_read_says_so() {
 fn a_kind_shows_once_the_watch_brings_one() {
     let mut m = Model::new(Some("shop".into()));
     m.listed(vec![service(3, 1, 1)], BTreeSet::from([Kind::Node]));
-    let v = View::default();
+    let v = listing();
     assert!(screen(&m, &v).contains("do not let you read node"));
     m.changed(true, node("n1", 4, "ready", "active"), 0);
     let s = screen(&m, &v);
@@ -864,7 +872,7 @@ fn a_kind_shows_once_the_watch_brings_one() {
 fn a_problem_shows_until_listed_again() {
     let mut m = cluster();
     m.problem = Some("connection refused".into());
-    let v = View::default();
+    let v = listing();
     assert!(screen(&m, &v).contains("not current: connection refused"));
     m.listed(Vec::new(), BTreeSet::new());
     assert!(!screen(&m, &v).contains("not current"));
@@ -875,7 +883,7 @@ fn once_prints_plain_tables() {
     let m = cluster();
     let v = View {
         tab: Tab::Nodes,
-        ..View::default()
+        ..listing()
     };
     let text = draw::plain(&m, &v);
     let lines: Vec<&str> = text.lines().collect();
@@ -892,7 +900,7 @@ fn the_header_graphs_show_small_loads() {
     for cpu in [10.0, 50.0, 25.0] {
         m.history.push_back((cpu, 64 << 20));
     }
-    let s = screen_of(&m, &View::default(), 170);
+    let s = screen_of(&m, &listing(), 170);
     let cpu = s.lines().find(|l| l.contains("cpu ")).unwrap();
     let mem = s.lines().find(|l| l.contains("mem ")).unwrap();
     // The share of what the nodes hold, its bar, and the amounts.
@@ -910,7 +918,7 @@ fn the_header_graphs_show_small_loads() {
     for cpu in [1.0, 2.0, 1.0] {
         m.history.push_back((cpu, 0));
     }
-    let s = screen_of(&m, &View::default(), 170);
+    let s = screen_of(&m, &listing(), 170);
     let cpu = s.lines().find(|l| l.contains("cpu ")).unwrap();
     let graph = cpu.split("of 8").nth(1).unwrap();
     assert!(!graph.contains('█') && graph.contains('▁'), "{cpu}");
@@ -973,7 +981,7 @@ fn renders_max_scale_cluster_of_256_nodes_and_20000_tasks() {
         }],
     });
 
-    let mut v = View::default();
+    let mut v = listing();
     let s = screen(&m, &v);
     assert!(
         s.contains("256/256 nodes ready") && s.contains("20000 running"),
@@ -987,11 +995,10 @@ fn renders_max_scale_cluster_of_256_nodes_and_20000_tasks() {
     assert!(line(&s, "svc-000").starts_with("shop svc-000 replicated 200/200 200% 200Mi nginx:1"));
 
     typed(&mut v, &m, "3G");
+    assert!(screen_of(&m, &v, 170).contains("t-19999"));
+    typed(&mut v, &m, "\n");
     let s = screen_of(&m, &v, 170);
-    assert!(
-        s.contains("t-19999") && s.contains("task shop/t-19999"),
-        "{s}"
-    );
+    assert!(s.contains("› task shop/t-19999"), "{s}");
 }
 
 #[test]
@@ -1011,7 +1018,7 @@ fn failed_updates_are_highlighted() {
             "previous": { "pod": { "containers": [{ "name": "web", "image": "nginx:1" }] } },
         });
         m.changed(true, s, 0);
-        let mut v = View::default();
+        let mut v = listing();
         typed(&mut v, &m, "2");
         let mut t = Terminal::new(TestBackend::new(130, 20)).unwrap();
         t.draw(|f| draw::render(f, &m, &v)).unwrap();
@@ -1032,7 +1039,7 @@ fn failed_updates_are_highlighted() {
 #[test]
 fn the_selection_follows_rows_that_went() {
     let mut m = cluster();
-    let mut v = View::default();
+    let mut v = listing();
     typed(&mut v, &m, "3↓");
     assert_eq!(v.selected[2], 1);
     let gone = m
@@ -1041,29 +1048,72 @@ fn the_selection_follows_rows_that_went() {
         .unwrap()
         .clone();
     m.changed(false, gone, 0);
-    // The details show the row left, and a key acts on it at once.
-    let s = screen_of(&m, &v, 170);
-    assert!(
-        !s.contains("Nothing selected.") && s.contains("task shop/web-1-1"),
-        "{s}"
-    );
+    // The row left is selected, and a key acts on it at once.
+    let mut opened = View { ..listing() };
+    typed(&mut opened, &m, "3↓\n");
+    let s = screen_of(&m, &opened, 170);
+    assert!(s.contains("› task shop/web-1-1"), "{s}");
     typed(&mut v, &m, "↓");
     assert_eq!(v.selected[2], 0);
 }
 
 #[test]
-fn details_toggle_from_what_shows() {
+fn panels_open_over_each_other_and_f3_goes_back() {
     let m = cluster();
-    // Narrow: hidden at first, so i shows them.
+    // It starts on the menu; F3 there leaves.
     let mut v = View::default();
-    typed(&mut v, &m, "i");
-    assert_eq!(v.detail, Some(true));
-    let mut v = View {
-        wide: true,
-        ..View::default()
-    };
-    typed(&mut v, &m, "i");
-    assert_eq!(v.detail, Some(false));
+    assert_eq!(*v.panel(), view::Panel::Menu);
+    typed(&mut v, &m, "«");
+    assert!(v.quit);
+
+    let mut v = View::default();
+    // Down and Enter open the second option.
+    typed(&mut v, &m, "↓\n");
+    assert_eq!(v.tab, Tab::Workloads);
+    assert!(screen(&m, &v).contains("Menu › Workloads"));
+    // The service, its tasks, a task: four panels deep.
+    typed(&mut v, &m, "\n\n\n");
+    assert_eq!(v.stack.len(), 5);
+    let s = screen_of(&m, &v, 200);
+    assert!(
+        s.contains(
+            "Menu › Workloads › service shop/web › Tasks of service shop/web › task shop/web-1-1"
+        ),
+        "{s}"
+    );
+    // F3 goes back one at a time, to where it was.
+    typed(&mut v, &m, "««");
+    assert_eq!(v.tab, Tab::Workloads);
+    assert!(matches!(v.panel(), view::Panel::Detail { .. }));
+    typed(&mut v, &m, "««");
+    assert_eq!(*v.panel(), view::Panel::Menu);
+    assert!(!v.quit);
+    // A number goes straight to a list from anywhere, all else closed.
+    typed(&mut v, &m, "2\n\n4");
+    assert_eq!(v.stack.len(), 2);
+    assert_eq!(v.tab, Tab::Storage);
+    assert_eq!(v.option, 3);
+    // Rows with nothing to open stay.
+    typed(&mut v, &m, "7\n");
+    assert_eq!(v.stack.len(), 2);
+}
+
+#[test]
+fn details_scroll_but_not_past_their_end() {
+    let m = cluster();
+    let mut v = listing();
+    typed(&mut v, &m, "\n");
+    // Three lines of details on the smallest screen.
+    let small = |v: &View| screen_sized(&m, v, 100, 12);
+    let top = small(&v);
+    assert!(top.contains("version 1"), "{top}");
+    typed(&mut v, &m, "jj");
+    assert!(!small(&v).contains("version 1"));
+    typed(&mut v, &m, "G");
+    let end = small(&v);
+    assert!(end.contains("availability"), "the last line shows: {end}");
+    typed(&mut v, &m, "g");
+    assert_eq!(small(&v), top);
 }
 
 #[test]
@@ -1072,7 +1122,7 @@ fn init_containers_have_logs_but_no_shell() {
     let mut t = task("web-1-1", 30, "n1", "running", true);
     t.spec["pod"]["initContainers"] = serde_json::json!([{ "name": "seed", "image": "seed:1" }]);
     m.changed(true, t, 0);
-    let mut v = View::default();
+    let mut v = listing();
     assert_eq!(typed(&mut v, &m, "3l"), None);
     assert_eq!(
         line(&screen(&m, &v), "which container"),
@@ -1099,11 +1149,11 @@ fn init_containers_have_logs_but_no_shell() {
 #[test]
 fn a_wide_character_at_the_shells_edge_leaves_the_border() {
     let m = cluster();
-    let mut v = View::default();
+    let mut v = listing();
     let exec = typed(&mut v, &m, "3x").unwrap();
     v.show_shell(&exec);
     let area = ratatui::layout::Rect::new(0, 0, 130, 30);
-    let (rows, cols) = draw::shell_size(&m, &v, area).unwrap();
+    let (rows, cols) = draw::shell_size(&v, area).unwrap();
     let sh = v.shell.as_mut().unwrap();
     // Wider than the pane, as just after the terminal shrank.
     sh.set_size(rows, cols + 2);
@@ -1116,7 +1166,7 @@ fn a_wide_character_at_the_shells_edge_leaves_the_border() {
             (0..130)
                 .map(|x| buf[(x, y)].symbol())
                 .collect::<String>()
-                .contains("Shell in")
+                .contains("╭ Shell in")
         })
         .unwrap();
     // The pane's last column, at x = cols, holds no half of it; the border
@@ -1128,7 +1178,7 @@ fn a_wide_character_at_the_shells_edge_leaves_the_border() {
 #[test]
 fn a_service_is_stopped_when_asked_and_started_at_once() {
     let mut m = cluster();
-    let mut v = View::default();
+    let mut v = listing();
     // Stopping is asked first.
     assert_eq!(typed(&mut v, &m, "2o"), None);
     assert!(screen(&m, &v).contains("Stop service shop/web?"));
@@ -1158,7 +1208,7 @@ fn a_service_is_stopped_when_asked_and_started_at_once() {
 #[test]
 fn a_service_is_paused_when_asked_and_resumed_at_once() {
     let mut m = cluster();
-    let mut v = View::default();
+    let mut v = listing();
     assert_eq!(typed(&mut v, &m, "2P"), None);
     assert!(screen(&m, &v).contains("Pause service shop/web?"));
     assert_eq!(
@@ -1186,7 +1236,7 @@ fn a_service_is_paused_when_asked_and_resumed_at_once() {
 #[test]
 fn restart_run_now_events_and_alerts() {
     let m = cluster();
-    let mut v = View::default();
+    let mut v = listing();
     // A restart is asked first.
     assert_eq!(typed(&mut v, &m, "2R"), None);
     assert!(screen(&m, &v).contains("Restart service shop/web?"));
@@ -1245,7 +1295,7 @@ fn builds_and_image_policies_are_listed() {
         ),
         0,
     );
-    let mut v = View::default();
+    let mut v = listing();
     typed(&mut v, &m, "2");
     let s = screen(&m, &v);
     let build = line(&s, "web-k3");
@@ -1264,7 +1314,7 @@ fn builds_and_image_policies_are_listed() {
 #[test]
 fn a_poll_that_fails_says_so_until_it_reads_again() {
     let mut m = cluster();
-    let v = View::default();
+    let v = listing();
     m.polled = Some("the cluster's status: unavailable".into());
     assert!(screen(&m, &v).contains("not current: the cluster's status"));
     m.polled = None;
@@ -1297,7 +1347,7 @@ fn braille_graphs_and_rgb_heat_gradients() {
 }
 
 #[test]
-fn bento_and_telemetry_presets_show_zfs_and_network() {
+fn the_menu_graphs_zfs_and_network_and_storage_their_space() {
     let mut m = cluster();
     m.usage(pb::UsageResponse {
         nodes: vec![pb::NodeUsage {
@@ -1321,43 +1371,32 @@ fn bento_and_telemetry_presets_show_zfs_and_network() {
             ..Default::default()
         }],
     });
-    let mut v = View::default();
-    // Classic modeStorage shows live ZFS volume used/size gauge when reported.
+    let mut v = listing();
+    // Storage shows each Volume's ZFS space used of its size when reported.
     typed(&mut v, &m, "4");
     assert_eq!(
         line(&screen(&m, &v), "data"),
         "shop data zfs 256Mi/1Gi n1 web-1-1,web-2-1"
     );
 
-    // Cycle to Bento multi-box dashboard (`b`), then Telemetry (`b`), then Classic (`b`).
-    typed(&mut v, &m, "1b");
-    assert_eq!(v.preset, Preset::Bento);
+    // The menu, room allowing, graphs CPU, memory, ZFS and network.
+    let v = View::default();
     let s = screen_sized(&m, &v, 150, 32);
-    assert!(s.contains("[bento]"), "{s}");
     assert!(s.contains("12Gi/48Gi"), "{s}");
     assert!(s.contains("▼2Mi/s ▲512Ki/s"), "{s}");
     assert!(
-        s.contains("²Nodes") && s.contains("³Workloads") && s.contains("⁴Tasks"),
+        line(&s, "Storage").contains("4 Storage Volumes: their space, node and replica 1"),
         "{s}"
     );
-
-    // Box toggles (`!`, `@`) hide/show individual boxes cleanly.
-    typed(&mut v, &m, "@");
-    assert!(!v.boxes[1]);
-    let s = screen_sized(&m, &v, 150, 32);
-    assert!(!s.contains("²Nodes") && s.contains("³Workloads"), "{s}");
-    typed(&mut v, &m, "@b");
-    assert_eq!(v.preset, Preset::Telemetry);
-    let s = screen_sized(&m, &v, 150, 26);
-    assert!(s.contains("[telemetry]") && s.contains("12Gi/48Gi"), "{s}");
-    typed(&mut v, &m, "b");
-    assert_eq!(v.preset, Preset::Classic);
+    // Short, the two lines of graphs only.
+    let s = screen_sized(&m, &v, 150, 20);
+    assert!(!s.contains("12Gi/48Gi") && s.contains("CPU of 8"), "{s}");
 }
 
 #[test]
 fn workload_tree_sorting_poll_stepping_and_service_logs() {
     let m = cluster();
-    let mut v = View::default();
+    let mut v = listing();
 
     // Expand workload -> task -> jail tree (`t`) on Workloads tab.
     typed(&mut v, &m, "2t");
@@ -1417,7 +1456,7 @@ fn run(args: &[&str]) -> Option<Request> {
 #[test]
 fn a_command_line_runs_legion_with_its_output_below() {
     let m = cluster();
-    let mut v = View::default();
+    let mut v = listing();
     assert_eq!(typed(&mut v, &m, ":diagnose\n"), run(&["diagnose"]));
     // `legion` before it is taken as said; quotes keep words together.
     assert_eq!(
@@ -1476,7 +1515,7 @@ fn command_lines_split_as_a_shell_splits_them() {
 #[test]
 fn keys_run_the_cluster_commands_for_the_namespace_shown() {
     let m = cluster();
-    let mut v = View::default();
+    let mut v = listing();
     // On a node, cluster-scoped: the default namespace.
     assert_eq!(typed(&mut v, &m, "H"), run(&["diagnose"]));
     assert_eq!(typed(&mut v, &m, "W"), run(&["reach", "-n", "default"]));
@@ -1489,7 +1528,7 @@ fn keys_run_the_cluster_commands_for_the_namespace_shown() {
     // legion top -n gives the namespace when the row has none.
     let mut only = Model::new(Some("team-a".into()));
     only.listed(vec![node("n1", 1, "ready", "active")], BTreeSet::new());
-    let mut v = View::default();
+    let mut v = listing();
     assert_eq!(typed(&mut v, &only, "W"), run(&["reach", "-n", "team-a"]));
 }
 
@@ -1508,7 +1547,7 @@ fn row_keys_edit_and_reach_what_the_console_s_pages_do() {
         ),
         0,
     );
-    let mut v = View::default();
+    let mut v = listing();
     assert_eq!(
         typed(&mut v, &m, "I"),
         run(&["image", "ls", "--node", "n1"])
@@ -1580,14 +1619,14 @@ fn the_keys_fit_a_short_wide_screen_in_two_columns() {
     let m = cluster();
     let v = View {
         help: true,
-        ..View::default()
+        ..listing()
     };
     let s = screen_sized(&m, &v, 160, 40);
     assert!(
-        s.contains("Moving around") && s.contains("diagnose every node"),
+        s.contains("Panels") && s.contains("diagnose every node"),
         "{s}"
     );
-    assert!(s.contains("On the Nodes tab now"), "{s}");
+    assert!(s.contains("On Nodes now"), "{s}");
 }
 
 #[test]
@@ -1630,7 +1669,7 @@ fn the_activity_tab_lists_long_operations_newest_first() {
     }
     let v = View {
         tab: Tab::Activity,
-        ..View::default()
+        ..listing()
     };
     let text = draw::plain(&m, &v);
     let lines: Vec<&str> = text.lines().collect();
@@ -1752,10 +1791,7 @@ fn host_and_pools() -> Model {
 #[test]
 fn nodes_show_their_load_and_pools_and_details_their_host() {
     let m = host_and_pools();
-    let mut v = View {
-        detail: Some(false),
-        ..View::default()
-    };
+    let mut v = listing();
     let s = screen_of(&m, &v, 200);
     // 3.50 of 4 cores is past 70 %; tank is degraded, with 3 errors not
     // taken as seen and a resilver running.
@@ -1764,7 +1800,10 @@ fn nodes_show_their_load_and_pools_and_details_their_host() {
         "{s}"
     );
     assert!(!line(&s, "n2").contains("zroot"), "{s}");
-    v.detail = Some(true);
+    typed(
+        &mut v, &m, "
+",
+    );
     let s = screen_sized(&m, &v, 200, 60);
     let flat: String = s
         .lines()
@@ -1809,10 +1848,7 @@ fn services_mark_linux_images_and_tags_that_moved() {
     s.status["linuxImages"] = serde_json::json!({ "nginx:1": "static-site", "redis:7": "" });
     s.status["images"] = serde_json::json!({ "moved": { "examples/node:24": "sha256:ab" } });
     m.changed(true, s, 0);
-    let mut v = View {
-        detail: Some(false),
-        ..View::default()
-    };
+    let mut v = listing();
     typed(&mut v, &m, "2");
     let screen = screen_of(&m, &v, 220);
     assert!(
@@ -1834,7 +1870,7 @@ fn services_mark_linux_images_and_tags_that_moved() {
 #[test]
 fn node_keys_schedule_scrubs_and_take_pool_errors_as_seen() {
     let m = host_and_pools();
-    let mut v = View::default();
+    let mut v = listing();
     assert_eq!(typed(&mut v, &m, "c"), None);
     match &v.prompt {
         Some(view::Prompt::Input { ask, .. }) => assert!(ask.contains("now every 14"), "{ask}"),
@@ -1874,7 +1910,7 @@ fn node_keys_schedule_scrubs_and_take_pool_errors_as_seen() {
 #[test]
 fn a_volume_s_replica_is_promoted_once_its_name_is_typed() {
     let mut m = cluster();
-    let mut v = View::default();
+    let mut v = listing();
     typed(&mut v, &m, "4");
     // Without a replica, there is nothing to promote.
     assert_eq!(typed(&mut v, &m, "p"), None);
@@ -1980,7 +2016,7 @@ fn the_graphs_start_with_the_last_hour_and_show_a_range_on_w() {
     );
     assert_eq!(m.telemetry_history.len(), 4);
 
-    let mut v = View::default();
+    let mut v = listing();
     assert_eq!(series_len(&m, &v), 5);
     typed(&mut v, &m, "w");
     assert_eq!((v.range_ms(), v.range_name()), (3_600_000, "1h"));

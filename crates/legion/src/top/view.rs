@@ -128,31 +128,18 @@ impl Tab {
     }
 }
 
-/// Screen layout preset (`btop`-style multi-box vs classic single-table).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Preset {
-    #[default]
-    Classic,
-    Bento,
-    Telemetry,
-}
-
-impl Preset {
-    pub(super) fn next(self) -> Self {
-        match self {
-            Preset::Classic => Preset::Bento,
-            Preset::Bento => Preset::Telemetry,
-            Preset::Telemetry => Preset::Classic,
-        }
-    }
-
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            Preset::Classic => "classic",
-            Preset::Bento => "bento",
-            Preset::Telemetry => "telemetry",
-        }
-    }
+/// A panel of the stack, as ISPF shows them: one at a time, Enter opens
+/// the next over it, F3 goes back to the one under it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Panel {
+    /// The options: the lists, by number.
+    Menu,
+    /// A tab's list; the tasks may be of one node or workload.
+    List { tab: Tab, focus: Option<Focus> },
+    /// An object, field by field, scrolled this far.
+    Detail { key: Key, scroll: u16 },
+    /// Logs followed, a command's output or a shell.
+    Pane,
 }
 
 /// Column sorting mode for tables.
@@ -467,18 +454,21 @@ pub(super) enum Prompt {
 
 /// What the person looks at.
 pub struct View {
+    /// The list last opened: the shown one, or the one under the
+    /// details shown.
     pub(super) tab: Tab,
     /// The selected row of each tab.
     pub(super) selected: [usize; 8],
     /// Each tab's filter: rows holding the text, in any case.
     pub(super) filter: [String; 8],
+    /// Whose tasks that list shows, if it is the tasks of one.
     pub(super) focus: Option<Focus>,
     /// Tasks that ended are listed too.
     pub(super) history: bool,
-    /// `btop`-style layout preset (`Classic`, `Bento`, `Telemetry`).
-    pub(super) preset: Preset,
-    /// `btop` box visibility in `Bento` mode (`[telemetry, nodes, workloads, lower]`).
-    pub(super) boxes: [bool; 4],
+    /// The panels opened, the menu first; the last is shown.
+    pub(super) stack: Vec<Panel>,
+    /// The menu's selected option.
+    pub(super) option: usize,
     /// Expand workload → task → jail tree in Workloads.
     pub(super) tree: bool,
     /// Active sort column and direction.
@@ -493,19 +483,13 @@ pub struct View {
     pub(super) prompt: Option<Prompt>,
     /// What came of the last request, or why it was not made.
     pub(super) notice: Option<String>,
-    /// The detail panel: shown or not, or as the width allows.
-    pub(super) detail: Option<bool>,
-    /// The terminal is wide enough for the detail panel by default.
-    pub(super) wide: bool,
     /// An object's YAML over everything, scrolled this far.
     pub(super) yaml: Option<(Key, u16)>,
     pub(super) help: bool,
-    /// Logs followed under the table.
+    /// Logs followed, or a command's output, on the pane panel.
     pub(super) logs: Option<Logs>,
     /// Or a shell there.
     pub(super) shell: Option<Shell>,
-    /// That pane over the table too.
-    pub(super) zoom: bool,
     /// The command lines run, oldest first, and how far back Up has gone.
     pub(super) commands: Vec<String>,
     pub(super) recalled: usize,
@@ -520,8 +504,8 @@ impl Default for View {
             filter: Default::default(),
             focus: None,
             history: false,
-            preset: Preset::Classic,
-            boxes: [true; 4],
+            stack: vec![Panel::Menu],
+            option: 0,
             tree: false,
             sort: SortCol::Default,
             sort_desc: true,
@@ -530,13 +514,10 @@ impl Default for View {
             range: 0,
             prompt: None,
             notice: None,
-            detail: None,
-            wide: false,
             yaml: None,
             help: false,
             logs: None,
             shell: None,
-            zoom: false,
             commands: Vec::new(),
             recalled: 0,
             quit: false,
@@ -555,6 +536,59 @@ impl View {
         RANGES[self.range].1
     }
 
+    /// The panel shown.
+    pub(super) fn panel(&self) -> &Panel {
+        self.stack.last().expect("the menu is never closed")
+    }
+
+    /// Opens a panel over the one shown.
+    fn open(&mut self, panel: Panel) {
+        if let Panel::List { tab, focus } = &panel {
+            self.tab = *tab;
+            self.focus = focus.clone();
+        }
+        self.stack.push(panel);
+    }
+
+    /// Shows the pane panel, unless it shows already.
+    fn open_pane(&mut self) {
+        if *self.panel() != Panel::Pane {
+            self.open(Panel::Pane);
+        }
+    }
+
+    /// Goes back to the panel under the one shown: a shell ends, logs
+    /// stop. On the menu, F3 leaves.
+    fn back(&mut self) {
+        if self.stack.len() == 1 {
+            return;
+        }
+        if self.stack.pop() == Some(Panel::Pane) {
+            self.logs = None;
+            self.shell = None;
+        }
+        // The list under, if any, is the one acted on again.
+        if let Some(Panel::List { tab, focus }) = self
+            .stack
+            .iter()
+            .rev()
+            .find(|p| matches!(p, Panel::List { .. }))
+        {
+            self.tab = *tab;
+            self.focus = focus.clone();
+        }
+    }
+
+    /// Goes to a list from anywhere, as ISPF's `=N` does: over the menu,
+    /// all else closed.
+    pub(super) fn jump(&mut self, tab: Tab) {
+        self.stack.truncate(1);
+        self.logs = None;
+        self.shell = None;
+        self.option = TABS.iter().position(|t| *t == tab).expect("a tab");
+        self.open(Panel::List { tab, focus: None });
+    }
+
     /// Starts showing the logs a request asks for, in place of any shown.
     pub(super) fn show_logs(&mut self, request: &Request) {
         match request {
@@ -569,6 +603,7 @@ impl View {
                 }
                 self.shell = None;
                 self.logs = Some(Logs::new(of));
+                return self.open_pane();
             }
             Request::ServiceLogs {
                 namespace,
@@ -578,6 +613,7 @@ impl View {
                 let of = format!("all tasks of {} {namespace}/{name}", kind_word(*kind));
                 self.shell = None;
                 self.logs = Some(Logs::new(of));
+                return self.open_pane();
             }
             _ => {}
         }
@@ -598,6 +634,7 @@ impl View {
         };
         self.shell = None;
         self.logs = Some(Logs::titled(of));
+        self.open_pane();
     }
 
     /// Starts showing the shell a request asks for, with the keys.
@@ -614,6 +651,7 @@ impl View {
             }
             self.logs = None;
             self.shell = Some(Shell::new(of));
+            self.open_pane();
         }
     }
 
@@ -622,7 +660,7 @@ impl View {
         self.shell.as_ref().is_some_and(|s| s.focus)
     }
 
-    /// The pane under the table: what keys do to it, if anything.
+    /// The pane panel: what keys do to it, if anything.
     fn pane_key(&mut self, k: KeyEvent) -> Option<Option<Request>> {
         if let Some(s) = &mut self.shell {
             if s.focus {
@@ -638,31 +676,25 @@ impl View {
                 return Some(None);
             }
         }
-        if self.logs.is_none() && self.shell.is_none() {
+        if *self.panel() != Panel::Pane {
             return None;
         }
-        let page = 20;
-        match k.code {
-            KeyCode::Esc => {
-                self.logs = None;
-                self.shell = None;
-                self.zoom = false;
+        let n = match k.code {
+            KeyCode::Esc | KeyCode::F(3) | KeyCode::F(12) => {
+                self.back();
+                return Some(None);
             }
-            KeyCode::PageUp | KeyCode::PageDown => {
-                let n = if k.code == KeyCode::PageUp {
-                    page
-                } else {
-                    -page
-                };
-                if let Some(l) = &mut self.logs {
-                    l.scroll(n);
-                }
-                if let Some(s) = &mut self.shell {
-                    s.scroll(n);
-                }
-            }
-            KeyCode::Char('z') => self.zoom = !self.zoom,
+            KeyCode::PageUp => 20,
+            KeyCode::PageDown => -20,
+            KeyCode::Up | KeyCode::Char('k') => 1,
+            KeyCode::Down | KeyCode::Char('j') => -1,
             _ => return None,
+        };
+        if let Some(l) = &mut self.logs {
+            l.scroll(n);
+        }
+        if let Some(s) = &mut self.shell {
+            s.scroll(n);
         }
         Some(None)
     }
@@ -719,21 +751,44 @@ impl View {
         if modified {
             return None;
         }
-        // A zoomed pane hides the table: nothing acts on rows unseen.
-        if self.zoom && (self.logs.is_some() || self.shell.is_some()) {
-            match k.code {
-                KeyCode::Char('q') => self.quit = true,
-                KeyCode::Char('?') => self.help = true,
-                _ => {}
+        // Keys every panel takes.
+        match k.code {
+            KeyCode::Char('q') => {
+                self.quit = true;
+                return None;
             }
-            return None;
+            KeyCode::F(1) | KeyCode::Char('?') => {
+                self.help = true;
+                return None;
+            }
+            KeyCode::F(3) if self.stack.len() == 1 => {
+                self.quit = true;
+                return None;
+            }
+            KeyCode::F(3) | KeyCode::F(12) => {
+                self.back();
+                return None;
+            }
+            KeyCode::Char(c @ '1'..='8') => {
+                self.jump(TABS[c as usize - '1' as usize]);
+                return None;
+            }
+            _ => {}
         }
-        let rows = rows(model, self);
-        let count = rows.len();
+        // What keys act on: the row selected, or the object shown.
         let i = self.index();
-        // Rows may have gone since the selection was made.
-        self.selected[i] = self.selected[i].min(count.saturating_sub(1));
-        let selected = rows.into_iter().nth(self.selected[i]).and_then(|r| r.key);
+        let mut count = 0;
+        let selected = match self.panel() {
+            Panel::List { .. } => {
+                let rows = rows(model, self);
+                count = rows.len();
+                // Rows may have gone since the selection was made.
+                self.selected[i] = self.selected[i].min(count.saturating_sub(1));
+                rows.into_iter().nth(self.selected[i]).and_then(|r| r.key)
+            }
+            Panel::Detail { key, .. } => Some(key.clone()),
+            Panel::Menu | Panel::Pane => None,
+        };
         if let KeyCode::Char(c) = k.code
             && let Some(key) = &selected
             && let Some(request) = self.act(c, model, key)
@@ -743,39 +798,30 @@ impl View {
         if self.prompt.is_some() || self.notice.is_some() {
             return None;
         }
-        let sel = &mut self.selected[i];
-        let last = count.saturating_sub(1);
+        if self.moved(k.code, count) {
+            return None;
+        }
         match k.code {
-            KeyCode::Char('q') => self.quit = true,
-            KeyCode::Esc => {
-                if !self.filter[i].is_empty() {
-                    self.filter[i].clear();
-                } else {
-                    self.focus = None;
+            KeyCode::Esc => match self.panel() {
+                Panel::List { .. } if !self.filter[i].is_empty() => self.filter[i].clear(),
+                _ => self.back(),
+            },
+            KeyCode::Enter => match (self.panel(), selected) {
+                (Panel::Menu, _) => {
+                    let tab = TABS[self.option];
+                    self.open(Panel::List { tab, focus: None });
                 }
-            }
-            KeyCode::Char(c @ '1'..='8') => self.tab = TABS[c as usize - '1' as usize],
-            KeyCode::Tab | KeyCode::Right => self.tab = TABS[(i + 1) % TABS.len()],
-            KeyCode::BackTab | KeyCode::Left => self.tab = TABS[(i + TABS.len() - 1) % TABS.len()],
-            KeyCode::Down | KeyCode::Char('j') => *sel = (*sel + 1).min(last),
-            KeyCode::Up | KeyCode::Char('k') => *sel = sel.saturating_sub(1).min(last),
-            KeyCode::PageDown => *sel = (*sel + 20).min(last),
-            KeyCode::PageUp => *sel = sel.saturating_sub(20),
-            KeyCode::Home | KeyCode::Char('g') => *sel = 0,
-            KeyCode::End | KeyCode::Char('G') => *sel = last,
+                (Panel::List { .. }, Some(key)) => self.open(Panel::Detail { key, scroll: 0 }),
+                (Panel::Detail { .. }, Some((Kind::Node, _, name))) => {
+                    self.show_tasks(Focus::Node(name))
+                }
+                (Panel::Detail { .. }, Some((kind @ (Kind::Service | Kind::Job), ns, name))) => {
+                    self.show_tasks(Focus::Owner(kind, ns, name))
+                }
+                _ => {}
+            },
             KeyCode::Char('h') => self.history = !self.history,
             KeyCode::Char('A') => return Some(Request::Alerts),
-            KeyCode::Char('b' | '0') => {
-                self.preset = self.preset.next();
-            }
-            KeyCode::F(n @ 1..=4) => {
-                let idx = (n - 1) as usize;
-                self.boxes[idx] = !self.boxes[idx];
-            }
-            KeyCode::Char('!') => self.boxes[0] = !self.boxes[0],
-            KeyCode::Char('@') => self.boxes[1] = !self.boxes[1],
-            KeyCode::Char('#') => self.boxes[2] = !self.boxes[2],
-            KeyCode::Char('$') => self.boxes[3] = !self.boxes[3],
             KeyCode::Char('t') => self.tree = !self.tree,
             KeyCode::Char('>' | '.') => self.sort = self.sort.next(),
             KeyCode::Char('<' | ',') => self.sort = self.sort.prev(),
@@ -784,7 +830,6 @@ impl View {
             KeyCode::Char('-') => self.step_poll(false),
             KeyCode::Char('M') => self.mouse = !self.mouse,
             KeyCode::Char('w') => self.range = (self.range + 1) % RANGES.len(),
-            KeyCode::Char('?') => self.help = true,
             KeyCode::Char(':') => {
                 self.recalled = 0;
                 self.input("legion".into(), Then::Command);
@@ -801,9 +846,8 @@ impl View {
                 };
                 return Some(run(args));
             }
-            KeyCode::Char('i') => self.detail = Some(!self.detail.unwrap_or(self.wide)),
             KeyCode::Char('y') => self.yaml = selected.map(|k| (k, 0)),
-            KeyCode::Char('/') => {
+            KeyCode::Char('/') if matches!(self.panel(), Panel::List { .. }) => {
                 let before = self.filter[i].clone();
                 self.prompt = Some(Prompt::Input {
                     ask: "Filter".into(),
@@ -811,24 +855,43 @@ impl View {
                     then: Then::Filter { before },
                 });
             }
-            KeyCode::Enter => match selected {
-                Some((Kind::Node, _, name)) => self.show_tasks(Focus::Node(name)),
-                Some((kind @ (Kind::Service | Kind::Job), ns, name)) => {
-                    self.show_tasks(Focus::Owner(kind, ns, name))
-                }
-                Some(k) => self.yaml = Some((k, 0)),
-                None => {}
-            },
             _ => {}
         }
         None
     }
 
+    /// Moves through the menu's options, the list's rows or the
+    /// details' lines, if the key moves.
+    fn moved(&mut self, code: KeyCode, rows: usize) -> bool {
+        let i = self.index();
+        let (at, last) = match self.stack.last_mut().expect("the menu is never closed") {
+            Panel::Menu => (&mut self.option, TABS.len() - 1),
+            Panel::List { .. } => (&mut self.selected[i], rows.saturating_sub(1)),
+            Panel::Detail { scroll, .. } => {
+                let Some(to) = step(usize::from(*scroll), DETAIL_LINES, code) else {
+                    return false;
+                };
+                *scroll = to as u16;
+                return true;
+            }
+            Panel::Pane => return false,
+        };
+        match step(*at, last, code) {
+            Some(to) => {
+                *at = to;
+                true
+            }
+            None => false,
+        }
+    }
+
     fn show_tasks(&mut self, focus: Focus) {
-        self.focus = Some(focus);
         let tasks = TABS.iter().position(|t| *t == Tab::Tasks).expect("a tab");
         self.selected[tasks] = 0;
-        self.tab = Tab::Tasks;
+        self.open(Panel::List {
+            tab: Tab::Tasks,
+            focus: Some(focus),
+        });
     }
 
     /// A letter acting on the selected object: a request, a question
@@ -1275,62 +1338,99 @@ impl View {
             return;
         }
         match ev.kind {
-            MouseEventKind::ScrollDown => {
-                if let Some(l) = &mut self.logs {
-                    l.scroll(-3);
-                } else if let Some(s) = &mut self.shell {
-                    s.scroll(-3);
-                } else {
-                    let count = rows(model, self).len();
-                    let sel = &mut self.selected[self.index()];
-                    *sel = (*sel + 1).min(count.saturating_sub(1));
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let down = ev.kind == MouseEventKind::ScrollDown;
+                if *self.panel() == Panel::Pane {
+                    let n = if down { -3 } else { 3 };
+                    if let Some(l) = &mut self.logs {
+                        l.scroll(n);
+                    }
+                    if let Some(s) = &mut self.shell {
+                        s.scroll(n);
+                    }
+                    return;
                 }
-            }
-            MouseEventKind::ScrollUp => {
-                if let Some(l) = &mut self.logs {
-                    l.scroll(3);
-                } else if let Some(s) = &mut self.shell {
-                    s.scroll(3);
-                } else {
-                    let sel = &mut self.selected[self.index()];
-                    *sel = sel.saturating_sub(1);
-                }
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                let tab_row = match self.preset {
-                    Preset::Classic => 4,
-                    Preset::Telemetry => 7,
-                    Preset::Bento => u16::MAX,
+                let count = match self.panel() {
+                    Panel::List { .. } => rows(model, self).len(),
+                    _ => 0,
                 };
-                if ev.row == tab_row {
-                    // Approximate tab regions across the tab bar.
-                    let mut x = 0u16;
-                    for (idx, t) in TABS.iter().enumerate() {
-                        let count = tab_count(model, *t);
-                        let extra = if *t != Tab::Log && count > 0 {
-                            format!(" ({count})").len() as u16
-                        } else {
-                            0
-                        };
-                        let w = 4 + t.title().len() as u16 + extra + 1;
-                        if ev.column >= x && ev.column < x + w {
-                            self.tab = *t;
-                            let _ = idx;
+                let lines = if matches!(self.panel(), Panel::Detail { .. }) {
+                    3
+                } else {
+                    1
+                };
+                let code = if down { KeyCode::Down } else { KeyCode::Up };
+                for _ in 0..lines {
+                    self.moved(code, count);
+                }
+            }
+            // Point and shoot: a click selects, a click on what is
+            // selected opens it.
+            MouseEventKind::Down(MouseButton::Left) => {
+                let body = super::draw::body(self, area);
+                if ev.row <= body.y || ev.row + 1 >= body.bottom() {
+                    return;
+                }
+                match self.panel() {
+                    Panel::Menu => {
+                        let at = usize::from(ev.row - body.y - 1);
+                        if at < TABS.len() {
+                            if at == self.option {
+                                self.open(Panel::List {
+                                    tab: TABS[at],
+                                    focus: None,
+                                });
+                            } else {
+                                self.option = at;
+                            }
+                        }
+                    }
+                    Panel::List { .. } => {
+                        // Under the border and the column titles.
+                        let first = body.y + 2;
+                        if ev.row < first {
                             return;
                         }
-                        x += w;
+                        let rows = rows(model, self);
+                        let i = self.index();
+                        let selected = self.selected[i].min(rows.len().saturating_sub(1));
+                        let page = usize::from(body.height.saturating_sub(3));
+                        let start = selected.saturating_sub(page.saturating_sub(1));
+                        let at = start + usize::from(ev.row - first);
+                        if at >= rows.len() {
+                            return;
+                        }
+                        if at == selected {
+                            if let Some(key) = rows.into_iter().nth(at).and_then(|r| r.key) {
+                                self.open(Panel::Detail { key, scroll: 0 });
+                            }
+                        } else {
+                            self.selected[i] = at;
+                        }
                     }
-                } else if self.preset != Preset::Bento && ev.row > tab_row + 2 && area.height > 12 {
-                    let row_idx = (ev.row - (tab_row + 3)) as usize;
-                    let count = rows(model, self).len();
-                    if row_idx < count {
-                        self.selected[self.index()] = row_idx;
-                    }
+                    Panel::Detail { .. } | Panel::Pane => {}
                 }
             }
             _ => {}
         }
     }
+}
+
+/// How far details scroll, at most.
+const DETAIL_LINES: usize = 1000;
+
+/// Where a moving key goes from `at`, `last` the furthest; `None`: the
+/// key does not move.
+fn step(at: usize, last: usize, code: KeyCode) -> Option<usize> {
+    Some(match code {
+        KeyCode::Down | KeyCode::Char('j') => (at + 1).min(last),
+        KeyCode::Up | KeyCode::Char('k') => at.saturating_sub(1).min(last),
+        KeyCode::PageDown => (at + 20).min(last),
+        KeyCode::PageUp => at.saturating_sub(20),
+        KeyCode::Home | KeyCode::Char('g') => 0,
+        KeyCode::End | KeyCode::Char('G') => last,
+        _ => return None,
+    })
 }
 
 fn picked(pick: Pick, container: Option<String>) -> Request {

@@ -1,8 +1,9 @@
-//! Drawing `legion top`: a header of the cluster at a glance with graphs
-//! of what its tasks use, the tabs, the selected tab's table beside the
-//! selected object's details, logs followed under them, and the bottom line of keys, questions and
-//! answers; over them, an object's YAML or the keys' help. The colours
-//! and bars follow jmon's.
+//! Drawing `legion top`, one panel at a time as ISPF shows them: the
+//! title line with the panels opened, the cluster at a glance with graphs
+//! of what its tasks use, the panel (the menu, a list, an object's
+//! details, or logs, output or a shell), the message line of questions
+//! and answers, and the function keys; over them, an object's YAML or
+//! the keys' help. The colours and bars follow jmon's.
 
 use std::sync::OnceLock;
 
@@ -17,13 +18,13 @@ use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Sparkline, Table, TableState, Tabs, Wrap,
+    ScrollbarState, Sparkline, Table, TableState, Wrap,
 };
 
 use super::logs::Logs;
 use super::model::{Key, Model, kind_word, status, task_state};
 use super::shell::Shell;
-use super::view::{Focus, Preset, Prompt, SortCol, TABS, Tab, TableRow, View, rows, rows_for_tab};
+use super::view::{Focus, Panel, Prompt, SortCol, TABS, Tab, TableRow, View, rows};
 
 pub(super) const ACCENT: Color = Color::Cyan;
 pub(super) const OK: Color = Color::Green;
@@ -207,28 +208,61 @@ fn title(s: impl Into<String>) -> Line<'static> {
     ))
 }
 
-/// Whether the terminal has room for the detail panel unless asked.
-pub(super) fn wide(width: u16) -> bool {
-    width >= 150
+/// Where each part of the screen goes.
+struct Areas {
+    /// The panels opened, and how lists are sorted and graphs drawn.
+    title: Rect,
+    /// The cluster at a glance: none over the pane, more on the menu.
+    top: Rect,
+    /// The panel shown.
+    body: Rect,
+    /// A question, what came of a request, or what letters do.
+    message: Rect,
+    /// The function keys.
+    keys: Rect,
 }
 
-/// Whether the detail panel shows: as asked, else when there is room.
-fn shows_detail(view: &View, width: u16) -> bool {
-    view.tab != Tab::Log && view.detail.unwrap_or(wide(width))
+/// The cluster at a glance as the menu shows it: the four graphs, room
+/// allowing.
+fn deck(view: &View, area: Rect) -> bool {
+    *view.panel() == Panel::Menu && area.height >= 24
 }
 
-fn top_height(view: &View) -> u16 {
-    match view.preset {
-        Preset::Classic => 5,
-        Preset::Telemetry => 8,
-        Preset::Bento => {
-            if view.boxes[0] {
-                7
-            } else {
-                0
-            }
-        }
+fn areas(view: &View, area: Rect) -> Areas {
+    let top = match view.panel() {
+        Panel::Pane => 0,
+        _ if deck(view, area) => 7,
+        _ => 4,
+    };
+    let [title, top, body, message, keys] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(top),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+    Areas {
+        title,
+        top,
+        body,
+        message,
+        keys,
     }
+}
+
+/// Where the panel shown is drawn on a terminal of `area`.
+pub(super) fn body(view: &View, area: Rect) -> Rect {
+    areas(view, area).body
+}
+
+/// The rows and columns of the shell's screen on a terminal of `area`.
+pub(super) fn shell_size(view: &View, area: Rect) -> Option<(u16, u16)> {
+    if area.width < 60 || area.height < 12 || *view.panel() != Panel::Pane {
+        return None;
+    }
+    let inner = panel(Line::default()).inner(body(view, area));
+    Some((inner.height.max(1), inner.width.max(1)))
 }
 
 /// Draws the whole screen.
@@ -241,68 +275,28 @@ pub fn render(f: &mut Frame, model: &Model, view: &View) {
         );
         return;
     }
-    match view.preset {
-        Preset::Classic => {
-            let [top, tabs, body, bottom] = Layout::vertical([
-                Constraint::Length(4),
-                Constraint::Length(1),
-                Constraint::Fill(1),
-                Constraint::Length(1),
-            ])
-            .areas(area);
-            header(f, model, view, top);
-            f.render_widget(tab_bar(model, view), tabs);
-            render_body_and_pane(f, model, view, body);
-            f.render_widget(Paragraph::new(bottom_line(view)), bottom);
-        }
-        Preset::Telemetry => {
-            let [top, tabs, body, bottom] = Layout::vertical([
-                Constraint::Length(7),
-                Constraint::Length(1),
-                Constraint::Fill(1),
-                Constraint::Length(1),
-            ])
-            .areas(area);
-            bento_telemetry_deck(f, model, view, top);
-            f.render_widget(tab_bar(model, view), tabs);
-            render_body_and_pane(f, model, view, body);
-            f.render_widget(Paragraph::new(bottom_line(view)), bottom);
-        }
-        Preset::Bento => {
-            let deck_h = if view.boxes[0] && area.height >= 18 {
-                7
-            } else {
-                0
-            };
-            let [top, body, bottom] = Layout::vertical([
-                Constraint::Length(deck_h),
-                Constraint::Fill(1),
-                Constraint::Length(1),
-            ])
-            .areas(area);
-            if deck_h > 0 {
-                bento_telemetry_deck(f, model, view, top);
+    let a = areas(view, area);
+    title_line(f, model, view, a.title);
+    if deck(view, area) {
+        telemetry_deck(f, model, view, a.top);
+    } else if a.top.height > 0 {
+        header(f, model, view, a.top);
+    }
+    match view.panel() {
+        Panel::Menu => menu(f, model, view, a.body),
+        Panel::List { .. } => draw_table(f, model, view, rows(model, view), a.body),
+        Panel::Detail { key, scroll } => detail(f, model, key, *scroll, a.body),
+        Panel::Pane => {
+            if let Some(l) = &view.logs {
+                logs(f, l, a.body);
             }
-            let row_count = if view.zoom && (view.logs.is_some() || view.shell.is_some()) {
-                0
-            } else {
-                rows(model, view).len()
-            };
-            let (upper, lower) = split(view, row_count, body);
-            if let Some(upper) = upper {
-                bento_body(f, model, view, upper);
+            if let Some(s) = &view.shell {
+                shell(f, s, a.body);
             }
-            if let Some(lower) = lower {
-                if let Some(l) = &view.logs {
-                    logs(f, l, lower);
-                }
-                if let Some(s) = &view.shell {
-                    shell(f, s, lower);
-                }
-            }
-            f.render_widget(Paragraph::new(bottom_line(view)), bottom);
         }
     }
+    f.render_widget(Paragraph::new(bottom_line(view)), a.message);
+    f.render_widget(Paragraph::new(function_keys(view)), a.keys);
     if let Some((key, scroll)) = &view.yaml {
         yaml(f, model, key, *scroll);
     }
@@ -311,61 +305,154 @@ pub fn render(f: &mut Frame, model: &Model, view: &View) {
     }
 }
 
-fn render_body_and_pane(f: &mut Frame, model: &Model, view: &View, body: Rect) {
-    let rows = if view.zoom && (view.logs.is_some() || view.shell.is_some()) {
-        Vec::new()
-    } else {
-        rows(model, view)
-    };
-    let (upper, lower) = split(view, rows.len(), body);
-    if let Some(upper) = upper {
-        upper_body(f, model, view, rows, upper);
-    }
-    if let Some(lower) = lower {
-        if let Some(l) = &view.logs {
-            logs(f, l, lower);
-        }
-        if let Some(s) = &view.shell {
-            shell(f, s, lower);
-        }
+/// What a panel is called on the title line.
+fn panel_name(model: &Model, view: &View, panel: &Panel) -> String {
+    match panel {
+        Panel::Menu => "Menu".to_owned(),
+        Panel::List { tab, focus } => match focus {
+            Some(Focus::Node(n)) => format!("{} on node {n}", tab.title()),
+            Some(Focus::Owner(kind, ns, name)) => {
+                format!("{} of {} {ns}/{name}", tab.title(), kind_word(*kind))
+            }
+            None => tab.title().to_owned(),
+        },
+        Panel::Detail { key, .. } => match model.get(key) {
+            Some(o) => super::model::name(o),
+            None => format!("{} {} (gone)", kind_word(key.0), key.2),
+        },
+        Panel::Pane => match (&view.logs, &view.shell) {
+            (Some(l), _) if l.titled => l.of.clone(),
+            (Some(l), _) => format!("Logs of {}", l.of),
+            (_, Some(s)) => format!("Shell in {}", s.of),
+            _ => "Output".to_owned(),
+        },
     }
 }
 
-/// The table's area and the pane's under it, if they show.
-fn split(view: &View, row_count: usize, body: Rect) -> (Option<Rect>, Option<Rect>) {
-    if view.logs.is_none() && view.shell.is_none() {
-        return (Some(body), None);
+/// The title line: the panels opened, as a trail back to the menu, and
+/// how lists are sorted and graphs drawn.
+fn title_line(f: &mut Frame, model: &Model, view: &View, area: Rect) {
+    let bar = if mono() {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default().bg(Color::Indexed(236))
+    };
+    let mut left = vec![Span::styled(
+        " LEGION TOP ",
+        if mono() {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .bg(ACCENT)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        },
+    )];
+    let last = view.stack.len() - 1;
+    for (i, panel) in view.stack.iter().enumerate() {
+        left.push(Span::styled(if i == 0 { "  " } else { " › " }, dim()));
+        let name = panel_name(model, view, panel);
+        left.push(if i == last {
+            Span::styled(name, Style::default().add_modifier(Modifier::BOLD))
+        } else {
+            Span::styled(name, dim())
+        });
     }
-    if view.zoom {
-        return (None, Some(body));
+    let mut right = Vec::new();
+    if view.sort != SortCol::Default {
+        let arrow = if view.sort_desc { "↓" } else { "↑" };
+        right.push(Span::styled(
+            format!("sort {}{arrow} ", view.sort.label()),
+            fg(ACCENT),
+        ));
     }
-    // The table as tall as its rows, up to half.
-    let rows = row_count.min(1000) as u16 + 3;
-    let upper = rows.clamp(5, (body.height / 2).max(5));
-    let [upper, lower] =
-        Layout::vertical([Constraint::Length(upper), Constraint::Fill(1)]).areas(body);
-    (Some(upper), Some(lower))
+    if view.tree {
+        right.push(Span::styled("tree ", fg(OK)));
+    }
+    if view.history {
+        right.push(Span::styled("ended too ", fg(WARN)));
+    }
+    right.push(Span::styled(
+        format!(
+            "graphs {} · poll {}s ",
+            view.range_name(),
+            trim(view.poll_ms as f64 / 1000.0)
+        ),
+        dim(),
+    ));
+    let right = Line::from(right);
+    let [l, r] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(right.width() as u16),
+    ])
+    .areas(area);
+    f.render_widget(Paragraph::new(Line::from(left)).style(bar), l);
+    f.render_widget(Paragraph::new(right).style(bar), r);
 }
 
-/// The rows and columns of the shell's screen on a terminal of `area`.
-pub(super) fn shell_size(model: &Model, view: &View, area: Rect) -> Option<(u16, u16)> {
-    if area.width < 60 || area.height < 12 {
-        return None;
+/// What each list holds, as the menu says it.
+fn about(tab: Tab) -> &'static str {
+    match tab {
+        Tab::Nodes => "machines: their load, pools and tasks",
+        Tab::Workloads => "Services, Jobs, cron jobs and builds",
+        Tab::Tasks => "every task, where it runs and what it uses",
+        Tab::Storage => "Volumes: their space, node and replica",
+        Tab::Network => "Routes and network policies",
+        Tab::Config => "namespaces, Secrets, configs, roles, policies, alerts",
+        Tab::Log => "the changes heard, as they happen",
+        Tab::Activity => "operations running and done",
     }
-    let used_top = top_height(view);
-    let body = Rect {
-        y: area.y + used_top,
-        height: area.height.saturating_sub(used_top + 1),
-        ..area
-    };
-    let row_count = if view.zoom {
-        0
+}
+
+/// The menu: the lists, by number, as ISPF's primary option menu.
+fn menu(f: &mut Frame, model: &Model, view: &View, area: Rect) {
+    let selected = if mono() {
+        Style::default().add_modifier(Modifier::REVERSED)
     } else {
-        rows(model, view).len()
+        Style::default()
+            .bg(Color::Indexed(237))
+            .add_modifier(Modifier::BOLD)
     };
-    let lower = split(view, row_count, body).1?;
-    let inner = panel(Line::default()).inner(lower);
-    Some((inner.height.max(1), inner.width.max(1)))
+    let mut lines: Vec<Line> = TABS
+        .iter()
+        .enumerate()
+        .map(|(i, tab)| {
+            let count = super::view::tab_count(model, *tab);
+            let mut spans = vec![
+                if i == view.option {
+                    Span::styled("▌", fg(ACCENT))
+                } else {
+                    Span::raw(" ")
+                },
+                Span::styled(
+                    format!(" {} ", i + 1),
+                    fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {:<11}", tab.title()),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("{:<56}", about(*tab)), dim()),
+            ];
+            if *tab != Tab::Log && count > 0 {
+                spans.push(Span::raw(format!("{count:>5}")));
+            }
+            let line = Line::from(spans);
+            if i == view.option {
+                line.style(selected)
+            } else {
+                line
+            }
+        })
+        .collect();
+    lines.push(Line::default());
+    lines.push(dimmed(
+        "  Enter or a number opens a list; Enter on a row opens it, F3 goes back.",
+    ));
+    lines.push(dimmed(
+        "  1–8 go to a list from any panel. : runs a legion command, A follows the alerts.",
+    ));
+    f.render_widget(Paragraph::new(lines).block(panel(title("Options"))), area);
 }
 
 /// The shell's screen, as the terminal emulated shows it.
@@ -383,7 +470,7 @@ fn shell(f: &mut Frame, shell: &Shell, area: Rect) {
     let hint = if shell.focus {
         " keys go to the shell "
     } else {
-        " PgUp PgDn scroll · z enlarges · Esc closes "
+        " PgUp PgDn scroll · F3 back (the shell ends) "
     };
     let border = if shell.focus { ACCENT } else { Color::DarkGray };
     let block = panel(title(format!("Shell in {}", shell.of)))
@@ -460,21 +547,6 @@ fn color(c: vt100::Color) -> Option<Color> {
 }
 
 /// The table, with the details beside it when shown.
-fn upper_body(f: &mut Frame, model: &Model, view: &View, rows: Vec<TableRow>, body: Rect) {
-    let width = f.area().width;
-    if shows_detail(view, width) {
-        let at = view.selected[view.index()].min(rows.len().saturating_sub(1));
-        let selected = rows.get(at).and_then(|r| r.key.clone());
-        let side = (width / 3).clamp(40, 70);
-        let [table, detail_area] =
-            Layout::horizontal([Constraint::Fill(1), Constraint::Length(side)]).areas(body);
-        draw_table(f, model, view, rows, table);
-        detail(f, model, selected, detail_area);
-    } else {
-        draw_table(f, model, view, rows, body);
-    }
-}
-
 /// The logs followed: the newest lines, or those scrolled back to.
 fn logs(f: &mut Frame, logs: &Logs, area: Rect) {
     let state = match (&logs.ended, logs.back) {
@@ -491,11 +563,7 @@ fn logs(f: &mut Frame, logs: &Logs, area: Rect) {
     let block = panel(title(heading))
         .title(Line::from(state).right_aligned())
         .title_bottom(
-            Line::from(Span::styled(
-                " PgUp PgDn scroll · z enlarges · Esc closes ",
-                dim(),
-            ))
-            .right_aligned(),
+            Line::from(Span::styled(" PgUp PgDn scroll · F3 back ", dim())).right_aligned(),
         );
     let height = block.inner(area).height as usize;
     let end = logs.lines.len() - logs.back.min(logs.lines.len());
@@ -711,60 +779,21 @@ fn summary(model: &Model) -> Vec<Line<'static>> {
     vec![Line::from(first), second]
 }
 
-fn tab_bar(model: &Model, view: &View) -> Tabs<'static> {
-    let titles = TABS.iter().enumerate().map(|(i, t)| {
-        let count = super::view::tab_count(model, *t);
-        let mut spans = vec![
-            Span::styled(format!("{}", i + 1), fg(ACCENT)),
-            Span::raw(format!(" {}", t.title())),
-        ];
-        if *t != Tab::Log && count > 0 {
-            spans.push(Span::styled(format!(" ({count})"), dim()));
-        }
-        Line::from(spans)
-    });
-    let selected = if mono() {
-        Style::default().add_modifier(Modifier::REVERSED)
-    } else {
-        Style::default()
-            .bg(Color::DarkGray)
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
-    };
-    Tabs::new(titles.collect::<Vec<_>>())
-        .select(view.index())
-        .highlight_style(selected)
-        .divider(Span::styled("│", dim()))
-        .padding(" ", " ")
-}
-
-/// `btop`-style 4-subsystem Unicode Braille telemetry deck (`CPU`, `MEM`, `ZFS`, `NET`).
-fn bento_telemetry_deck(f: &mut Frame, model: &Model, view: &View, area: Rect) {
-    let mut top = vec![
-        Span::styled(" ◆ legion ", fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("[{}] ", view.preset.label()), dim()),
-    ];
+/// The cluster at a glance on the menu: CPU, memory, ZFS and network,
+/// each a braille graph.
+fn telemetry_deck(f: &mut Frame, model: &Model, view: &View, area: Rect) {
+    let mut top = vec![Span::styled(
+        " ◆ legion ",
+        fg(ACCENT).add_modifier(Modifier::BOLD),
+    )];
     if let Some(ns) = &model.namespace {
         top.push(Span::styled(format!("ns:{ns} "), fg(WARN)));
     }
     for s in summary(model).into_iter().take(1) {
         top.extend(s.spans);
     }
-    let mut right = vec![Span::styled(
-        format!(" poll {}s ", view.poll_ms as f64 / 1000.0),
-        dim(),
-    )];
-    if view.sort != SortCol::Default {
-        let arrow = if view.sort_desc { "↓" } else { "↑" };
-        right.push(Span::styled(
-            format!("sort:{}{arrow} ", view.sort.label()),
-            fg(ACCENT),
-        ));
-    }
-    if view.tree {
-        right.push(Span::styled("tree ", fg(OK)));
-    }
-    if let Some(problem) = &model.problem {
+    let mut right = Vec::new();
+    if let Some(problem) = model.problem.as_ref().or(model.polled.as_ref()) {
         right.push(Span::styled(
             format!("not current: {problem} "),
             fg(BAD).add_modifier(Modifier::BOLD),
@@ -823,7 +852,7 @@ fn bento_telemetry_deck(f: &mut Frame, model: &Model, view: &View, area: Rect) {
     braille_card(
         f,
         cols[0],
-        &named("¹cpu"),
+        &named("cpu"),
         &cpu_samples,
         cpu_cap,
         &cpu_label,
@@ -936,192 +965,12 @@ fn braille_card(
 
 /// Multi-pane `btop` dashboard layout: `Nodes`, `Workloads`, and `Tasks`/`Storage`
 /// (or whichever tab is currently selected) side by side.
-fn bento_body(f: &mut Frame, model: &Model, view: &View, area: Rect) {
-    let show_nodes = view.boxes[1];
-    let show_workloads = view.boxes[2];
-    let show_lower = view.boxes[3];
-
-    // Determine which auxiliary tab occupies the lower-right box so pressing 1-8
-    // always brings the selected tab on screen with an accented border!
-    let lower_tab = match view.tab {
-        Tab::Nodes | Tab::Workloads | Tab::Tasks => Tab::Tasks,
-        other => other,
-    };
-
-    if !show_nodes && !show_workloads && !show_lower {
-        let rows = rows_for_tab(model, view, view.tab);
-        upper_body(f, model, view, rows, area);
-        return;
-    }
-
-    match (show_nodes, show_workloads || show_lower) {
-        (true, true) => {
-            let [left, right] =
-                Layout::horizontal([Constraint::Percentage(38), Constraint::Fill(1)]).areas(area);
-            if left.height >= 14 && view.tab != Tab::Storage {
-                let [nodes_area, storage_area] =
-                    Layout::vertical([Constraint::Percentage(58), Constraint::Fill(1)]).areas(left);
-                draw_pane_table(
-                    f,
-                    model,
-                    view,
-                    Tab::Nodes,
-                    rows_for_tab(model, view, Tab::Nodes),
-                    nodes_area,
-                    view.tab == Tab::Nodes,
-                    "²",
-                );
-                draw_pane_table(
-                    f,
-                    model,
-                    view,
-                    Tab::Storage,
-                    rows_for_tab(model, view, Tab::Storage),
-                    storage_area,
-                    false,
-                    "⁴",
-                );
-            } else {
-                draw_pane_table(
-                    f,
-                    model,
-                    view,
-                    Tab::Nodes,
-                    rows_for_tab(model, view, Tab::Nodes),
-                    left,
-                    view.tab == Tab::Nodes,
-                    "²",
-                );
-            }
-
-            match (show_workloads, show_lower) {
-                (true, true) => {
-                    let [top_r, bot_r] =
-                        Layout::vertical([Constraint::Percentage(50), Constraint::Fill(1)])
-                            .areas(right);
-                    draw_pane_table(
-                        f,
-                        model,
-                        view,
-                        Tab::Workloads,
-                        rows_for_tab(model, view, Tab::Workloads),
-                        top_r,
-                        view.tab == Tab::Workloads,
-                        "³",
-                    );
-                    draw_pane_table(
-                        f,
-                        model,
-                        view,
-                        lower_tab,
-                        rows_for_tab(model, view, lower_tab),
-                        bot_r,
-                        view.tab == lower_tab,
-                        "⁴",
-                    );
-                }
-                (true, false) => {
-                    draw_pane_table(
-                        f,
-                        model,
-                        view,
-                        Tab::Workloads,
-                        rows_for_tab(model, view, Tab::Workloads),
-                        right,
-                        view.tab == Tab::Workloads,
-                        "³",
-                    );
-                }
-                (false, true) => {
-                    draw_pane_table(
-                        f,
-                        model,
-                        view,
-                        lower_tab,
-                        rows_for_tab(model, view, lower_tab),
-                        right,
-                        view.tab == lower_tab,
-                        "⁴",
-                    );
-                }
-                (false, false) => {}
-            }
-        }
-        (true, false) => {
-            draw_pane_table(
-                f,
-                model,
-                view,
-                Tab::Nodes,
-                rows_for_tab(model, view, Tab::Nodes),
-                area,
-                true,
-                "²",
-            );
-        }
-        (false, true) => {
-            let tab = if show_workloads && !show_lower {
-                Tab::Workloads
-            } else if !show_workloads && show_lower {
-                lower_tab
-            } else {
-                let [top_r, bot_r] =
-                    Layout::vertical([Constraint::Percentage(50), Constraint::Fill(1)]).areas(area);
-                draw_pane_table(
-                    f,
-                    model,
-                    view,
-                    Tab::Workloads,
-                    rows_for_tab(model, view, Tab::Workloads),
-                    top_r,
-                    view.tab == Tab::Workloads,
-                    "³",
-                );
-                draw_pane_table(
-                    f,
-                    model,
-                    view,
-                    lower_tab,
-                    rows_for_tab(model, view, lower_tab),
-                    bot_r,
-                    view.tab == lower_tab,
-                    "⁴",
-                );
-                return;
-            };
-            draw_pane_table(
-                f,
-                model,
-                view,
-                tab,
-                rows_for_tab(model, view, tab),
-                area,
-                true,
-                "",
-            );
-        }
-        (false, false) => {}
-    }
-}
-
+/// The list shown: its rows, the selected one marked.
 fn draw_table(f: &mut Frame, model: &Model, view: &View, rows: Vec<TableRow>, area: Rect) {
-    draw_pane_table(f, model, view, view.tab, rows, area, false, "");
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_pane_table(
-    f: &mut Frame,
-    model: &Model,
-    view: &View,
-    tab: Tab,
-    rows: Vec<TableRow>,
-    area: Rect,
-    active_border: bool,
-    badge: &str,
-) {
-    let tab_idx = TABS.iter().position(|t| *t == tab).unwrap_or(0);
+    let tab = view.tab;
+    let tab_idx = view.index();
     let mut heading = vec![Span::styled(
-        format!(" {badge}{} ", tab.title()),
+        format!(" {} ", tab.title()),
         fg(ACCENT).add_modifier(Modifier::BOLD),
     )];
     if tab == Tab::Tasks
@@ -1137,12 +986,7 @@ fn draw_pane_table(
     if !filter.is_empty() {
         heading.push(Span::styled(format!("/{filter} "), fg(WARN)));
     }
-    let border_color = if active_border {
-        ACCENT
-    } else {
-        Color::DarkGray
-    };
-    let block = panel(Line::from(heading)).border_style(fg(border_color));
+    let block = panel(Line::from(heading));
 
     let kinds = tab.kinds();
     if !kinds.is_empty() && kinds.iter().all(|k| model.hidden.contains(k)) {
@@ -1195,10 +1039,7 @@ fn draw_pane_table(
         0
     };
     let end = (start + page).min(count);
-    let is_focused_tab = view.tab == tab;
-    let highlight = if !is_focused_tab && view.preset == Preset::Bento {
-        Style::default()
-    } else if mono() {
+    let highlight = if mono() {
         Style::default().add_modifier(Modifier::REVERSED)
     } else {
         Style::default()
@@ -1219,11 +1060,7 @@ fn draw_pane_table(
     )
     .column_spacing(2)
     .row_highlight_style(highlight)
-    .highlight_symbol(if is_focused_tab || view.preset != Preset::Bento {
-        Span::styled("▌", fg(ACCENT))
-    } else {
-        Span::raw(" ")
-    });
+    .highlight_symbol(Span::styled("▌", fg(ACCENT)));
     let mut state = TableState::default().with_selected(Some(selected - start));
     f.render_stateful_widget(table.block(block), area, &mut state);
     if count + 3 > area.height as usize {
@@ -1243,15 +1080,14 @@ fn draw_pane_table(
 }
 
 /// The selected object, field by field.
-fn detail(f: &mut Frame, model: &Model, selected: Option<Key>, area: Rect) {
-    let Some(key) = selected else {
+fn detail(f: &mut Frame, model: &Model, key: &Key, scroll: u16, area: Rect) {
+    let Some(o) = model.get(key) else {
         f.render_widget(
-            Paragraph::new(dimmed("Nothing selected.")).block(panel(title("Details"))),
+            Paragraph::new(dimmed("It is gone. F3 goes back.")).block(panel(title("Details"))),
             area,
         );
         return;
     };
-    let Some(o) = model.get(&key) else { return };
     let mut lines = vec![Line::from(vec![
         Span::styled("version ", dim()),
         Span::raw(o.metadata.version.to_string()),
@@ -1337,12 +1173,22 @@ fn detail(f: &mut Frame, model: &Model, selected: Option<Key>, area: Rect) {
         lines.push(section(name));
         flatten(value, 1, &mut lines);
     }
-    lines.push(Line::default());
-    lines.push(dimmed("y: the whole YAML"));
+    let hint = match o.kind {
+        Kind::Node | Kind::Service | Kind::Job => " Enter its tasks · y the whole YAML ",
+        _ => " y the whole YAML ",
+    };
+    let block = panel(title(super::model::name(o)))
+        .title_bottom(Line::from(Span::styled(hint, dim())).right_aligned());
+    // Not past the last line, each as many as it wraps to.
+    let inner = block.inner(area);
+    let width = usize::from(inner.width.max(1));
+    let wrapped: usize = lines.iter().map(|l| l.width().div_ceil(width).max(1)).sum();
+    let most = wrapped.saturating_sub(usize::from(inner.height)) as u16;
     f.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(panel(title(super::model::name(o)))),
+            .scroll((scroll.min(most), 0))
+            .block(block),
         area,
     );
 }
@@ -1544,21 +1390,23 @@ fn yaml(f: &mut Frame, model: &Model, key: &super::model::Key, scroll: u16) {
 
 const HELP: &[(&str, &[(&str, &str)])] = &[
     (
-        "Moving around",
+        "Panels",
         &[
-            ("1–8 ←→ Tab", "tabs"),
-            ("↑↓ j k PgUp PgDn g G", "select"),
-            ("Enter", "a node's or workload's tasks; else the YAML"),
-            ("/", "filter rows; Esc clears"),
-            ("i", "details panel on or off"),
-            ("y", "the selected object's YAML"),
+            ("Enter", "open: a list from the menu, a row's details"),
+            ("", "and a node's or workload's tasks from its details"),
+            ("F3 Esc F12", "back one panel; F3 on the menu quits"),
+            ("1–8", "go to a list from any panel"),
+            ("↑↓ j k PgUp PgDn g G", "select, or scroll"),
+            ("/", "filter the list; Esc clears"),
+            ("y", "the YAML of the row or object"),
             ("h", "ended tasks too"),
-            ("A", "follow the alerts below"),
+            ("A", "follow the alerts"),
+            ("F1 ?", "these keys"),
             ("q Ctrl-C", "quit"),
         ],
     ),
     (
-        "Acting on the selected row",
+        "Acting on the row selected, or the object shown",
         &[
             ("d p a", "node: drain (asked), pause, activate"),
             ("L", "node: set or remove a label"),
@@ -1575,10 +1423,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("m", "volume: move to a node"),
             ("l e", "follow logs, or events, of the row below"),
             ("L", "service or Job: follow the logs of all its tasks"),
-            (
-                "x",
-                "a shell in a task, below; Ctrl-] leaves it and returns",
-            ),
+            ("x", "a shell in a task; Ctrl-] leaves it and returns"),
             ("D", "delete (type the name; a task: asked)"),
             ("E", "edit in $EDITOR, then apply over the version read"),
             ("I", "node: its images"),
@@ -1589,7 +1434,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
-        "The cluster, below",
+        "The cluster, on a panel of its own",
         &[
             (
                 ":",
@@ -1604,16 +1449,13 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "While logs, output or a shell show",
         &[
-            ("PgUp PgDn", "scroll back"),
-            ("z", "over the table, or not"),
-            ("Esc", "close (a shell ends)"),
+            ("PgUp PgDn ↑↓", "scroll back"),
+            ("F3 Esc", "back (a shell ends)"),
         ],
     ),
     (
-        "Layout and telemetry",
+        "Lists and graphs",
         &[
-            ("b / 0", "cycle preset: classic, bento, telemetry"),
-            ("F1–F4 / ! @ # $", "toggle boxes in bento mode"),
             ("t", "expand workload → task → jail tree"),
             ("< > S", "sort column (cpu, mem, state, name) and direction"),
             ("+ -", "step live poll interval (1s, 2s, 5s, 10s)"),
@@ -1640,8 +1482,13 @@ fn help(f: &mut Frame, view: &View) {
     };
     let blocks: Vec<Vec<Line>> = HELP.iter().map(|(h, k)| block(h, k)).collect();
     let footer = dimmed(format!(
-        "On the {} tab now. What you may do follows your role bindings.",
-        view.tab.title()
+        "On {} now. What you may do follows your role bindings.",
+        match view.panel() {
+            Panel::Menu => "the menu",
+            Panel::List { .. } => view.tab.title(),
+            Panel::Detail { .. } => "an object's details",
+            Panel::Pane => "logs or output",
+        }
     ));
     let total: usize = blocks.iter().map(Vec::len).sum::<usize>() + 1;
     let screen = f.area();
@@ -1730,9 +1577,22 @@ fn bottom_line(view: &View) -> Line<'static> {
             style.add_modifier(Modifier::BOLD),
         ));
     }
+    if view.typing() {
+        return Line::from(vec![
+            Span::styled(
+                " The shell has the keys. ",
+                fg(OK).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Ctrl-] ", fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(" gives them back to legion top ", dim()),
+        ]);
+    }
+    // What letters do to the row selected, or the object shown.
+    if !matches!(view.panel(), Panel::List { .. } | Panel::Detail { .. }) {
+        return Line::default();
+    }
     let keys: &[(&str, &str)] = match view.tab {
         Tab::Nodes => &[
-            ("Enter", "tasks"),
             ("d", "drain"),
             ("p", "pause"),
             ("a", "activate"),
@@ -1740,7 +1600,6 @@ fn bottom_line(view: &View) -> Line<'static> {
             ("c", "scrubs"),
         ],
         Tab::Workloads => &[
-            ("Enter", "tasks"),
             ("s", "scale"),
             ("r", "roll back"),
             ("R", "restart"),
@@ -1762,31 +1621,8 @@ fn bottom_line(view: &View) -> Line<'static> {
         Tab::Network | Tab::Config => &[("y", "YAML"), ("D", "delete")],
         Tab::Log | Tab::Activity => &[],
     };
-    if view.typing() {
-        return Line::from(vec![
-            Span::styled(
-                " The shell has the keys. ",
-                fg(OK).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" Ctrl-] ", fg(ACCENT).add_modifier(Modifier::BOLD)),
-            Span::styled(" gives them back to legion top ", dim()),
-        ]);
-    }
-    let logs: &[(&str, &str)] = if view.logs.is_some() {
-        &[("Esc", "close logs")]
-    } else if view.shell.as_ref().is_some_and(|s| s.ended.is_none()) {
-        &[("Ctrl-]", "to the shell"), ("Esc", "end it")]
-    } else if view.shell.is_some() {
-        &[("Esc", "close")]
-    } else {
-        &[]
-    };
     let mut spans = Vec::new();
-    for (k, what) in logs
-        .iter()
-        .chain(keys)
-        .chain(&[("/", "filter"), ("?", "help"), ("q", "quit")])
-    {
+    for (k, what) in keys {
         spans.push(Span::styled(
             format!(" {k} "),
             if mono() {
@@ -1796,6 +1632,56 @@ fn bottom_line(view: &View) -> Line<'static> {
             },
         ));
         spans.push(Span::styled(format!(" {what} "), dim()));
+    }
+    Line::from(spans)
+}
+
+/// The function keys, as ISPF's last line: what moves between panels.
+fn function_keys(view: &View) -> Line<'static> {
+    let mut keys: Vec<(&str, &str)> = Vec::new();
+    match view.panel() {
+        Panel::Menu => keys.extend([("Enter", "Open"), ("1-8", "List"), (":", "Command")]),
+        Panel::List { .. } => keys.extend([
+            ("Enter", "Open"),
+            ("F3", "Back"),
+            ("/", "Filter"),
+            ("1-8", "List"),
+        ]),
+        Panel::Detail { key, .. } => {
+            if matches!(key.0, Kind::Node | Kind::Service | Kind::Job) {
+                keys.push(("Enter", "Tasks"));
+            }
+            keys.extend([
+                ("↑↓", "Scroll"),
+                ("y", "YAML"),
+                ("F3", "Back"),
+                ("1-8", "List"),
+            ]);
+        }
+        Panel::Pane => {
+            if view
+                .shell
+                .as_ref()
+                .is_some_and(|s| s.ended.is_none() && !s.focus)
+            {
+                keys.push(("Ctrl-]", "Type"));
+            }
+            keys.extend([("PgUp PgDn", "Scroll"), ("F3", "Back"), ("1-8", "List")]);
+        }
+    }
+    keys.push(("F1", "Help"));
+    keys.push(if view.stack.len() == 1 {
+        ("F3", "Exit")
+    } else {
+        ("q", "Quit")
+    });
+    let mut spans = Vec::new();
+    for (k, what) in keys {
+        spans.push(Span::styled(
+            format!(" {k}"),
+            fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(format!("={what} "), dim()));
     }
     Line::from(spans)
 }
