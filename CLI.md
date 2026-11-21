@@ -140,7 +140,7 @@ Trigger a CronJob immediately outside its schedule.
 
 ## Observability, Storage, Network & Sessions
 
-- `legion top [-n <NS>] [--once]`: Live terminal dashboard (nodes, workloads, tasks, resource graphs, logs, shell, alerts, long operations); `:` runs any `legion` command below it, `E` edits the selected object, `?` lists the keys.
+- `legion top [-n <NS>] [--once]`: Live terminal dashboard (nodes with their load and ZFS pools, workloads with their Linux images and moved tags marked, tasks, resource graphs over the polls or up to 30 days (`w`), logs, shell, alerts, long operations); `:` runs any `legion` command below it, `E` edits the selected object, `?` lists the keys.
 - `legion logs <TASK|SERVICE> [-c <CONTAINER>] [-f] [--tail <N>]`
 - `legion build-logs <BUILD> [-n <NS>] [-f]`
 - `legion logs-search <SERVICE|JOB> [--since <DUR>] [--until <DUR>] [TEXT]`

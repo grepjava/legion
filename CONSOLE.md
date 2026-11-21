@@ -605,6 +605,17 @@ behind the console. Fixed:
   `B` a volume's snapshots and its backup to a file, `f` a task's files,
   `l` a build's log. The deploy form, compose import and templates stay
   the console's: in a terminal they are a manifest and `legion apply`.
+- *`legion top` level with phases 7 to 12* (2026-11-21): the Nodes tab
+  shows each node's load averages (the 1-minute one coloured against its
+  cores) and its pools (how full, a state not ONLINE, errors not taken as
+  seen, a scrub or resilver running); a node's details its host
+  (release, kernel, boot, up since) and each pool as `legion node pools`
+  says it. `c` schedules a node's scrubs, `X` takes its pool errors as
+  seen (asked), `p` promotes a Volume's replica (its name typed, as the
+  console asks). A Service's images are marked as `legion list services`
+  marks them (Linux, with the native recipe; tag moved). The graphs start
+  with the last hour the managers kept, and `w` shows 1 hour, 6 hours, a
+  day, a week or 30 days of it.
 - *Restoring a backup:* the Operations page gives the steps beside the
   backup's download. A restore replaces a stopped manager's store on its
   host, so the console, served by a manager that is up and out of reach

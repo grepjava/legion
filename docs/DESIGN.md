@@ -592,7 +592,10 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   shows nodes and tasks by state, the managers, and for CPU and memory
   what all tasks use: a bar and a share of what the nodes hold, the
   amounts, and the last 20 minutes as a graph scaled to their peak (not
-  below 2 % of the nodes', so idle noise stays flat), with the peak.
+  below 2 % of the nodes', so idle noise stays flat), with the peak. The
+  graphs start with the hour the managers kept before the first poll;
+  `w` shows 1 hour to 30 days of it instead, each point the highest of
+  the samples it stands for.
   Seven tabs: nodes (state,
   availability, tasks, CPU and memory bars against capacity), workloads
   (services, Jobs, cron jobs), tasks (with the pod jail's id, which

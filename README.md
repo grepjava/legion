@@ -93,9 +93,11 @@ legion top
 
 `legion top` shows the cluster live in the terminal: nodes, workloads,
 tasks, volumes, routes and policies, namespaces and their quotas, Secrets
-and Configs, with graphs of what tasks use, each object's details and
-YAML, and a log of what changes. Keys drain, pause or label nodes, scale
-or roll back services, suspend cron jobs, move volumes, delete objects,
+and Configs, with graphs of what tasks use (live, or over up to 30 days
+as the managers keep it), each node's load, host and ZFS pools, each
+object's details and YAML, and a log of what changes. Keys drain, pause
+or label nodes, schedule their scrubs, scale or roll back services,
+suspend cron jobs, move volumes or promote their replicas, delete objects,
 and follow logs or open a shell in a task in a pane under the table; `/` filters and `?` lists the
 keys (`legion top --once` prints it as text). For dashboards, Prometheus can scrape each daemon's
 `--metrics-listen` endpoint; [packaging/grafana](packaging/grafana) has a
