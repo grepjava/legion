@@ -591,8 +591,11 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   (CONSOLE.md, "`legion top` level with the console"). A header
   shows nodes and tasks by state, the managers, and for CPU and memory
   what all tasks use: a bar and a share of what the nodes hold, the
-  amounts, and the last 20 minutes as a graph scaled to their peak (not
-  below 2 % of the nodes', so idle noise stays flat), with the peak. The
+  amounts, and the last 20 minutes as a graph, with the peak: CPU, which
+  moves, scaled to its peak (not below 2 % of the nodes', so idle noise
+  stays flat); memory, which is held, against all the nodes hold, so a
+  steady 11 % is a low band, not a full box (ZFS space on the graphs
+  panel likewise; network, like CPU, to its peak). The
   graphs start with the hour the managers kept before the first poll;
   `w` shows 1 hour to 30 days of it instead, each point the highest of
   the samples it stands for.
