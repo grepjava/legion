@@ -595,7 +595,9 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   moves, scaled to its peak (not below 2 % of the nodes', so idle noise
   stays flat); memory, which is held, against all the nodes hold, so a
   steady 11 % is a low band, not a full box (ZFS space on the graphs
-  panel likewise; network, like CPU, to its peak). The
+  panel likewise; network to the busiest seen but not below 1 MiB/s, so
+  a trickle stays a trickle, and with no share, its links' speeds being
+  unknown). The
   graphs start with the hour the managers kept before the first poll;
   `w` shows 1 hour to 30 days of it instead, each point the highest of
   the samples it stands for.

@@ -1086,6 +1086,9 @@ fn summary(model: &Model) -> Vec<Line<'static>> {
 struct Card {
     palette: Palette,
     scale: Scale,
+    /// Whether what it is out of is real, for a share of it: not the
+    /// network's, whose links' speeds are not known.
+    share: bool,
     name: String,
     samples: Vec<f64>,
     capacity: f64,
@@ -1109,6 +1112,8 @@ fn cards(model: &Model, view: &View) -> [Card; 4] {
         .iter()
         .map(|(_, _, rx, tx)| (*rx + *tx) as f64)
         .collect();
+    // The links' speeds are not known: the graph's top is the busiest
+    // seen, or 1 MiB/s, so a trickle stays a trickle.
     let net_peak = net
         .iter()
         .copied()
@@ -1121,6 +1126,7 @@ fn cards(model: &Model, view: &View) -> [Card; 4] {
         Card {
             palette: CPU,
             scale: Scale::Peak,
+            share: true,
             name: named("cpu"),
             readout: format!(
                 "{cpu_now:.1}/{} cores",
@@ -1136,6 +1142,7 @@ fn cards(model: &Model, view: &View) -> [Card; 4] {
         Card {
             palette: MEM,
             scale: Scale::Whole,
+            share: true,
             name: named("mem"),
             readout: format!("{}/{}", bytes(mem_now), bytes(memory)),
             samples: mem,
@@ -1144,6 +1151,7 @@ fn cards(model: &Model, view: &View) -> [Card; 4] {
         Card {
             palette: ZFS,
             scale: Scale::Whole,
+            share: true,
             name: named("zfs"),
             readout: if zfs_used + zfs_avail > 0 {
                 format!("{}/{}", bytes(zfs_used), bytes(zfs_used + zfs_avail))
@@ -1155,7 +1163,8 @@ fn cards(model: &Model, view: &View) -> [Card; 4] {
         },
         Card {
             palette: NET,
-            scale: Scale::Peak,
+            scale: Scale::Whole,
+            share: false,
             name: named("net"),
             readout: format!("▼{} ▲{}", rate(net_rx), rate(net_tx)),
             samples: net,
@@ -1238,6 +1247,7 @@ fn braille_card(f: &mut Frame, area: Rect, card: &Card, whole: bool) {
     let Card {
         palette,
         scale,
+        share,
         name,
         samples,
         capacity,
@@ -1253,7 +1263,7 @@ fn braille_card(f: &mut Frame, area: Rect, card: &Card, whole: bool) {
     } else {
         0.0
     };
-    let pct = if capacity > 0.0 {
+    let pct = if *share && capacity > 0.0 {
         format!("{:>3.0}%", frac * 100.0)
     } else {
         String::new()

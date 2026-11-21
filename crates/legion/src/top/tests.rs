@@ -2279,3 +2279,43 @@ fn the_graphs_panel_draws_the_four_large() {
     typed(&mut v, &m, "«");
     assert_eq!(*v.panel(), view::Panel::Menu);
 }
+
+#[test]
+fn a_trickle_of_network_is_a_low_line_with_no_share() {
+    let mut m = cluster();
+    // 26 KiB/s: of the 1 MiB/s the graph's top stands for at least, a
+    // fortieth, not the full height.
+    for _ in 0..10 {
+        m.usage(pb::UsageResponse {
+            nodes: vec![pb::NodeUsage {
+                node: "n1".into(),
+                net_rx_bps: 1 << 10,
+                net_tx_bps: 25 << 10,
+                ..Default::default()
+            }],
+        });
+    }
+    let mut v = View::default();
+    typed(&mut v, &m, "0");
+    let s = screen_sized(&m, &v, 120, 30);
+    let title = line(&s, "net ");
+    assert!(
+        !title.contains('%'),
+        "no share of an unknown speed: {title}"
+    );
+    assert!(title.contains("▼1Ki/s ▲25Ki/s"), "{title}");
+    // The net card is the lower right: its first rows are blank.
+    let top = s.lines().position(|l| l.contains("╭ net ")).unwrap();
+    let head = s.lines().nth(top).unwrap();
+    let column = head[..head.find("╭ net ").unwrap()].chars().count();
+    let first: String = s
+        .lines()
+        .nth(top + 1)
+        .unwrap()
+        .chars()
+        .skip(column + 1)
+        .take(40)
+        .collect();
+    assert_eq!(first.chars().count(), 40);
+    assert!(first.chars().all(|c| c == '⠀' || c == ' '), "{first:?}");
+}
