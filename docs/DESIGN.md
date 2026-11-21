@@ -596,25 +596,32 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   graphs start with the hour the managers kept before the first poll;
   `w` shows 1 hour to 30 days of it instead, each point the highest of
   the samples it stands for.
-  Seven tabs: nodes (state,
+  It shows one panel at a time, as ISPF does: it opens on a menu of the
+  lists (with CPU, memory, ZFS and network graphed when the terminal is
+  tall enough); Enter opens a list, a row's details, then a node's or
+  workload's tasks, each over the one before, and F3 (or Esc) goes back
+  to it, so a panel never moves or changes what it holds. A number goes
+  to a list from any panel. The title line shows the panels opened, the
+  last line the function keys of the panel shown.
+  Eight lists: nodes (state,
   availability, tasks, CPU and memory bars against capacity), workloads
   (services, Jobs, cron jobs), tasks (with the pod jail's id, which
   the agent reports while the pod runs, for `jls` and `jexec` on its
   node), storage (volumes, the tasks using
   them, migrations), network (routes, network policies), config
   (namespaces with their quotas, Secrets, Configs, role bindings) and
-  the log of changes. Beside the table, when wide enough (`i` toggles),
-  the selected object field by field; `y` shows its YAML. A Secret's
+  the log of changes, and the long operations. An object's details show
+  it field by field; `y` shows its YAML. A Secret's
   value is dropped as it arrives: only its size is kept. `/` filters the
-  rows as typed; Enter on a node or workload lists its tasks. Keys act
-  on the selected row through the same calls as the CLI: drain (asked
+  rows as typed. Keys act on the selected row, or the object whose
+  details show, through the same calls as the CLI: drain (asked
   first), pause, activate or label a node; scale or roll back (asked) a
   service; suspend or resume a cron job; move a volume; delete anything
   (by typing its name; a task after a yes, as its owner starts another);
-  follow logs in a pane under the table (PgUp and PgDn scroll it, `z`
-  lays it over the table, Esc closes it; colour codes and other control
-  characters are dropped), or open a shell in that pane: a terminal
-  emulated in `top` (vt100) shows it, sized to the pane, and has every
+  follow logs on a panel of their own (PgUp and PgDn scroll it, F3
+  closes it; colour codes and other control characters are dropped), or
+  open a shell there: a terminal emulated in `top` (vt100) shows it,
+  sized to the panel, and has every
   key, Ctrl-C too, until Ctrl-] gives them back (and again to return);
   logs and shells ask which container when a pod has several. It lists every kind, then follows one watch
   from the oldest listing's version, ignoring what is older than what it

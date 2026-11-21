@@ -616,6 +616,15 @@ behind the console. Fixed:
   marks them (Linux, with the native recipe; tag moved). The graphs start
   with the last hour the managers kept, and `w` shows 1 hour, 6 hours, a
   day, a week or 30 days of it.
+- *`legion top` as ISPF panels* (2026-11-21): one panel at a time over a
+  menu of the lists, in place of the tabs, the three layouts and their
+  boxes, the details beside the table and the pane under it. Enter opens
+  a list, a row's details, then a node's or workload's tasks; F3 or Esc
+  goes back to the panel under, as it was; 1–8 go to a list from
+  anywhere. Logs, command output and shells take a panel of their own.
+  The title line shows the panels opened, the last the function keys.
+  Next: line commands typed beside rows, a command line, and pulldown
+  menus on F10; then a theme in 24-bit colour and a panel of graphs.
 - *Restoring a backup:* the Operations page gives the steps beside the
   backup's download. A restore replaces a stopped manager's store on its
   host, so the console, served by a manager that is up and out of reach
