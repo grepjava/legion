@@ -1325,7 +1325,7 @@ fn a_poll_that_fails_says_so_until_it_reads_again() {
 
 #[test]
 fn braille_graphs_and_rgb_heat_gradients() {
-    let lines = draw::braille_lines(&[1.0, 2.0, 4.0, 8.0], 8.0, 4, 2);
+    let lines = draw::braille_lines(&[1.0, 2.0, 4.0, 8.0], 8.0, 4, 2, &draw::HEAT);
     assert_eq!(lines.len(), 2);
     let rendered: String = lines
         .iter()
@@ -1338,14 +1338,17 @@ fn braille_graphs_and_rgb_heat_gradients() {
             .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)),
         "expected active Unicode braille dots: {rendered:?}"
     );
-    assert!(matches!(
-        draw::heat_rgb(0.1),
-        ratatui::style::Color::Rgb(..)
-    ));
-    assert!(matches!(
-        draw::heat_rgb(0.9),
-        ratatui::style::Color::Rgb(..)
-    ));
+    // Green when idle, red when busy, as btop's meters.
+    assert_eq!(
+        draw::heat_rgb(0.0),
+        ratatui::style::Color::Rgb(80, 200, 120)
+    );
+    assert_eq!(draw::heat_rgb(1.0), ratatui::style::Color::Rgb(240, 85, 85));
+    // Shaded by height: the bottom row in the first colour, the top in
+    // the last, however busy.
+    let lines = draw::braille_lines(&[8.0; 8], 8.0, 4, 4, &draw::HEAT);
+    let colour = |row: usize| lines[row].spans[0].style.fg;
+    assert_ne!(colour(0), colour(3));
 }
 
 #[test]

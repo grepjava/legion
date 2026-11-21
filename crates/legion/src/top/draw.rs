@@ -150,23 +150,64 @@ fn busy(frac: f64) -> Color {
     }
 }
 
-/// Smooth `btop`-style Truecolor RGB heat gradient (cyan → emerald → amber → crimson).
+/// A gradient of three colours, as btop's themes give each box.
+pub(super) struct Palette {
+    start: (u8, u8, u8),
+    mid: (u8, u8, u8),
+    end: (u8, u8, u8),
+}
+
+/// Busy: green, yellow, red, as btop's meters.
+pub(super) const HEAT: Palette = Palette {
+    start: (80, 200, 120),
+    mid: (230, 200, 60),
+    end: (240, 85, 85),
+};
+const CPU: Palette = HEAT;
+const MEM: Palette = Palette {
+    start: (86, 182, 247),
+    mid: (167, 139, 250),
+    end: (236, 72, 153),
+};
+const ZFS: Palette = Palette {
+    start: (251, 191, 36),
+    mid: (249, 115, 22),
+    end: (239, 68, 68),
+};
+const NET: Palette = Palette {
+    start: (45, 212, 191),
+    mid: (96, 165, 250),
+    end: (192, 132, 252),
+};
+
+impl Palette {
+    /// The colour `frac` of the way along.
+    pub(super) fn at(&self, frac: f64) -> Color {
+        let f = frac.clamp(0.0, 1.0);
+        let lerp = |a: u8, b: u8, t: f64| (a as f64 + (b as f64 - a as f64) * t).round() as u8;
+        let mix = |a: (u8, u8, u8), b: (u8, u8, u8), t: f64| {
+            Color::Rgb(lerp(a.0, b.0, t), lerp(a.1, b.1, t), lerp(a.2, b.2, t))
+        };
+        if f < 0.5 {
+            mix(self.start, self.mid, f * 2.0)
+        } else {
+            mix(self.mid, self.end, (f - 0.5) * 2.0)
+        }
+    }
+
+    /// The box's own colour: its frame and name.
+    fn own(&self) -> Color {
+        let (r, g, b) = self.start;
+        Color::Rgb(r, g, b)
+    }
+}
+
+/// How busy, coloured green to red; none without colours.
 pub(super) fn heat_rgb(frac: f64) -> Color {
     if mono() {
         return Color::Reset;
     }
-    let f = frac.clamp(0.0, 1.0);
-    let lerp = |a: u8, b: u8, t: f64| (a as f64 + (b as f64 - a as f64) * t).round() as u8;
-    if f < 0.45 {
-        let t = f / 0.45;
-        Color::Rgb(lerp(56, 52, t), lerp(189, 211, t), lerp(248, 153, t))
-    } else if f < 0.75 {
-        let t = (f - 0.45) / 0.30;
-        Color::Rgb(lerp(52, 251, t), lerp(211, 191, t), lerp(153, 36, t))
-    } else {
-        let t = (f - 0.75) / 0.25;
-        Color::Rgb(lerp(251, 248, t), lerp(191, 113, t), lerp(36, 113, t))
-    }
+    HEAT.at(frac)
 }
 
 /// Unicode `2×4` Braille area graph (`U+2800`..`U+28FF`) as in `btop`:
@@ -176,6 +217,7 @@ pub(super) fn braille_lines(
     capacity: f64,
     width: usize,
     height: usize,
+    palette: &Palette,
 ) -> Vec<Line<'static>> {
     if width == 0 || height == 0 {
         return Vec::new();
@@ -186,7 +228,6 @@ pub(super) fn braille_lines(
     let tail = &samples[samples.len().saturating_sub(pts_needed)..];
     let peak = tail.iter().copied().fold(0.0, f64::max);
     let scale = peak.max(capacity * 0.02).max(f64::MIN_POSITIVE);
-    let color_denom = if capacity > 0.0 { capacity } else { scale };
     let total_dots = height * 4;
     let pad = pts_needed.saturating_sub(tail.len());
     let sample_at = |idx: usize| -> f64 {
@@ -209,6 +250,9 @@ pub(super) fn braille_lines(
     for row in 0..height {
         // row 0 is the top row, row (height - 1) is the bottom row.
         let base_dot = (height - 1 - row) * 4;
+        // Shaded by height, as btop's: the box's first colour at the
+        // bottom, its last at the top.
+        let shade = fg(palette.at((height - row) as f64 / height as f64 - 0.5 / height as f64));
         let mut spans = Vec::with_capacity(width);
         for col in 0..width {
             let lv = sample_at(col * 2);
@@ -225,11 +269,7 @@ pub(super) fn braille_lines(
                 }
             }
             let ch = char::from_u32(0x2800 + mask).unwrap_or('⠀');
-            let style = if mask == 0 {
-                dim()
-            } else {
-                fg(heat_rgb(lv.max(rv) / color_denom))
-            };
+            let style = if mask == 0 { dim() } else { shade };
             spans.push(Span::styled(ch.to_string(), style));
         }
         out.push(Line::from(spans));
@@ -283,8 +323,17 @@ pub(crate) fn bytes(n: u64) -> String {
 fn panel(title: Line<'static>) -> Block<'static> {
     Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(fg(Color::DarkGray))
+        .border_style(frame())
         .title(title)
+}
+
+/// Frames: slate blue, or grey on 16 colours.
+fn frame() -> Style {
+    if depth() == 4 {
+        fg(Color::DarkGray)
+    } else {
+        fg(Color::Rgb(70, 92, 132))
+    }
 }
 
 fn title(s: impl Into<String>) -> Line<'static> {
@@ -320,7 +369,7 @@ fn deck(view: &View, area: Rect) -> bool {
 fn areas(view: &View, area: Rect) -> Areas {
     let top = match view.panel() {
         Panel::Pane | Panel::Graphs => 0,
-        _ if deck(view, area) => 7,
+        _ if deck(view, area) => (area.height / 3).max(7),
         _ if area.height >= 18 => 4,
         _ => 0,
     };
@@ -1005,6 +1054,7 @@ fn summary(model: &Model) -> Vec<Line<'static>> {
 /// A graph of the cluster: its name, samples, what they are out of, and
 /// what it reads now.
 struct Card {
+    palette: Palette,
     name: String,
     samples: Vec<f64>,
     capacity: f64,
@@ -1038,6 +1088,7 @@ fn cards(model: &Model, view: &View) -> [Card; 4] {
     let mem_now = mem.last().copied().unwrap_or(0.0) as u64;
     [
         Card {
+            palette: CPU,
             name: named("cpu"),
             readout: format!(
                 "{cpu_now:.1}/{} cores",
@@ -1051,12 +1102,14 @@ fn cards(model: &Model, view: &View) -> [Card; 4] {
             capacity: cpu_cap,
         },
         Card {
+            palette: MEM,
             name: named("mem"),
             readout: format!("{}/{}", bytes(mem_now), bytes(memory)),
             samples: mem,
             capacity: memory as f64,
         },
         Card {
+            palette: ZFS,
             name: named("zfs"),
             readout: if zfs_used + zfs_avail > 0 {
                 format!("{}/{}", bytes(zfs_used), bytes(zfs_used + zfs_avail))
@@ -1067,6 +1120,7 @@ fn cards(model: &Model, view: &View) -> [Card; 4] {
             capacity: (zfs_used + zfs_avail) as f64,
         },
         Card {
+            palette: NET,
             name: named("net"),
             readout: format!("▼{} ▲{}", rate(net_rx), rate(net_tx)),
             samples: net,
@@ -1147,6 +1201,7 @@ pub(super) fn fit(samples: &[f64], points: usize, whole: bool) -> Vec<f64> {
 
 fn braille_card(f: &mut Frame, area: Rect, card: &Card, whole: bool) {
     let Card {
+        palette,
         name,
         samples,
         capacity,
@@ -1169,9 +1224,12 @@ fn braille_card(f: &mut Frame, area: Rect, card: &Card, whole: bool) {
     };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(fg(Color::DarkGray))
+        .border_style(fg(palette.own()))
         .title(Line::from(vec![
-            Span::styled(format!(" {name} "), fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" {name} "),
+                fg(palette.own()).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(pct, fg(heat_rgb(frac)).add_modifier(Modifier::BOLD)),
             Span::raw(" "),
         ]))
@@ -1187,6 +1245,7 @@ fn braille_card(f: &mut Frame, area: Rect, card: &Card, whole: bool) {
         capacity,
         inner.width as usize,
         inner.height as usize,
+        palette,
     );
     f.render_widget(Paragraph::new(lines), inner);
 }
