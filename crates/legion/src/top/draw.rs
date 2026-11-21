@@ -6,6 +6,7 @@
 //! the keys' help. The colours and bars follow jmon's.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use legion_api::Kind;
 use legion_api::node::{NodeState, NodeStatus};
@@ -24,7 +25,10 @@ use ratatui::widgets::{
 use super::logs::Logs;
 use super::model::{Key, Model, kind_word, status, task_state};
 use super::shell::Shell;
-use super::view::{Focus, Panel, Prompt, SortCol, TABS, Tab, TableRow, View, rows};
+use super::view::{
+    BAR, COMMAND, Focus, OPTIONS, PULLDOWN_EMPTY, Panel, Prompt, SortCol, Tab, TableRow, Then,
+    View, actions, option_tab, rows,
+};
 
 pub(super) const ACCENT: Color = Color::Cyan;
 pub(super) const OK: Color = Color::Green;
@@ -42,12 +46,88 @@ fn mono() -> bool {
     MONO.get().copied().unwrap_or(false)
 }
 
+/// Colours the terminal shows: 24 (any), 8 (256), 4 (16); 0 until
+/// asked or read from the environment.
+static DEPTH: AtomicU8 = AtomicU8::new(0);
+
+/// Sets the colours shown, as `colors` on the command line does.
+pub(super) fn set_depth(bits: u8) {
+    DEPTH.store(bits, Ordering::Relaxed);
+}
+
+/// The colours shown: as set, else as `COLORTERM` and `TERM` say.
+pub(super) fn depth() -> u8 {
+    match DEPTH.load(Ordering::Relaxed) {
+        0 => {
+            let colorterm = std::env::var("COLORTERM").unwrap_or_default();
+            let term = std::env::var("TERM").unwrap_or_default();
+            let bits = if matches!(colorterm.as_str(), "truecolor" | "24bit")
+                || term.ends_with("-direct")
+            {
+                24
+            } else if term.contains("256color") {
+                8
+            } else {
+                4
+            };
+            DEPTH.store(bits, Ordering::Relaxed);
+            bits
+        }
+        bits => bits,
+    }
+}
+
+/// The theme: each of the named colours as the terminal can show it,
+/// and any colour brought to what it can.
+pub(super) fn tone(color: Color) -> Color {
+    let bits = depth();
+    if bits == 4 {
+        return match color {
+            Color::Rgb(r, g, b) => {
+                if r > 200 && g < 150 {
+                    BAD
+                } else if r > 200 {
+                    WARN
+                } else if g > b {
+                    OK
+                } else {
+                    ACCENT
+                }
+            }
+            Color::Indexed(236 | 237) => Color::DarkGray,
+            other => other,
+        };
+    }
+    let (rgb, index) = match color {
+        Color::Cyan => ((86, 182, 247), 75),
+        Color::Green => ((52, 211, 153), 79),
+        Color::Yellow => ((251, 191, 36), 214),
+        Color::Red => ((248, 113, 113), 203),
+        Color::DarkGray => ((75, 85, 99), 240),
+        Color::White => ((229, 231, 235), 254),
+        Color::Black => ((17, 24, 39), 234),
+        Color::Indexed(236) => ((31, 36, 46), 236),
+        Color::Indexed(237) => ((45, 55, 72), 238),
+        Color::Rgb(r, g, b) if bits == 8 => {
+            let six = |c: u8| (u16::from(c) * 5 + 127) / 255;
+            let at = 16 + 36 * six(r) + 6 * six(g) + six(b);
+            return Color::Indexed(at as u8);
+        }
+        other => return other,
+    };
+    if bits == 24 {
+        Color::Rgb(rgb.0, rgb.1, rgb.2)
+    } else {
+        Color::Indexed(index)
+    }
+}
+
 /// Text in `color`, unless colours are off.
 pub(super) fn fg(color: Color) -> Style {
     if mono() {
         Style::default()
     } else {
-        Style::default().fg(color)
+        Style::default().fg(tone(color))
     }
 }
 
@@ -162,14 +242,20 @@ pub(super) fn rate(bps: u64) -> String {
     format!("{}/s", bytes(bps))
 }
 
-/// A bar `width` cells wide, filled to `frac` in its busy colour.
+/// A bar `width` cells wide, filled to `frac`: in its busy colour on 16
+/// colours, else each cell shaded along the heat gradient, as btop's.
 pub(super) fn meter(frac: f64, width: usize) -> Vec<Span<'static>> {
     let filled = ((frac.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
     let filled = if frac > 0.0 { filled.max(1) } else { 0 };
-    vec![
-        Span::styled("█".repeat(filled), fg(busy(frac))),
-        Span::styled("░".repeat(width - filled), dim()),
-    ]
+    let mut spans = if depth() == 4 || mono() {
+        vec![Span::styled("█".repeat(filled), fg(busy(frac)))]
+    } else {
+        (0..filled)
+            .map(|i| Span::styled("█", fg(heat_rgb((i as f64 + 0.5) / width as f64))))
+            .collect()
+    };
+    spans.push(Span::styled("░".repeat(width - filled), dim()));
+    spans
 }
 
 /// `1.5`, `4`.
@@ -210,9 +296,12 @@ fn title(s: impl Into<String>) -> Line<'static> {
 
 /// Where each part of the screen goes.
 struct Areas {
-    /// The panels opened, and how lists are sorted and graphs drawn.
-    title: Rect,
-    /// The cluster at a glance: none over the pane, more on the menu.
+    /// The action bar, the panels opened, how lists sort and graphs draw.
+    bar: Rect,
+    /// The command line.
+    command: Rect,
+    /// The cluster at a glance: none over the pane or the graphs, more
+    /// on the menu.
     top: Rect,
     /// The panel shown.
     body: Rect,
@@ -225,16 +314,18 @@ struct Areas {
 /// The cluster at a glance as the menu shows it: the four graphs, room
 /// allowing.
 fn deck(view: &View, area: Rect) -> bool {
-    *view.panel() == Panel::Menu && area.height >= 24
+    *view.panel() == Panel::Menu && area.height >= 28
 }
 
 fn areas(view: &View, area: Rect) -> Areas {
     let top = match view.panel() {
-        Panel::Pane => 0,
+        Panel::Pane | Panel::Graphs => 0,
         _ if deck(view, area) => 7,
-        _ => 4,
+        _ if area.height >= 18 => 4,
+        _ => 0,
     };
-    let [title, top, body, message, keys] = Layout::vertical([
+    let [bar, command, top, body, message, keys] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(top),
         Constraint::Fill(1),
@@ -243,7 +334,8 @@ fn areas(view: &View, area: Rect) -> Areas {
     ])
     .areas(area);
     Areas {
-        title,
+        bar,
+        command,
         top,
         body,
         message,
@@ -276,7 +368,8 @@ pub fn render(f: &mut Frame, model: &Model, view: &View) {
         return;
     }
     let a = areas(view, area);
-    title_line(f, model, view, a.title);
+    action_bar(f, model, view, a.bar);
+    command_line(f, model, view, a.command);
     if deck(view, area) {
         telemetry_deck(f, model, view, a.top);
     } else if a.top.height > 0 {
@@ -284,6 +377,7 @@ pub fn render(f: &mut Frame, model: &Model, view: &View) {
     }
     match view.panel() {
         Panel::Menu => menu(f, model, view, a.body),
+        Panel::Graphs => graphs(f, model, view, a.body),
         Panel::List { .. } => draw_table(f, model, view, rows(model, view), a.body),
         Panel::Detail { key, scroll } => detail(f, model, key, *scroll, a.body),
         Panel::Pane => {
@@ -295,8 +389,11 @@ pub fn render(f: &mut Frame, model: &Model, view: &View) {
             }
         }
     }
-    f.render_widget(Paragraph::new(bottom_line(view)), a.message);
+    f.render_widget(Paragraph::new(bottom_line(model, view)), a.message);
     f.render_widget(Paragraph::new(function_keys(view)), a.keys);
+    if let Some((menu, at)) = view.bar {
+        pulldown(f, model, view, menu, at, area);
+    }
     if let Some((key, scroll)) = &view.yaml {
         yaml(f, model, key, *scroll);
     }
@@ -309,6 +406,7 @@ pub fn render(f: &mut Frame, model: &Model, view: &View) {
 fn panel_name(model: &Model, view: &View, panel: &Panel) -> String {
     match panel {
         Panel::Menu => "Menu".to_owned(),
+        Panel::Graphs => "Graphs".to_owned(),
         Panel::List { tab, focus } => match focus {
             Some(Focus::Node(n)) => format!("{} on node {n}", tab.title()),
             Some(Focus::Owner(kind, ns, name)) => {
@@ -329,31 +427,46 @@ fn panel_name(model: &Model, view: &View, panel: &Panel) -> String {
     }
 }
 
-/// The title line: the panels opened, as a trail back to the menu, and
-/// how lists are sorted and graphs drawn.
-fn title_line(f: &mut Frame, model: &Model, view: &View, area: Rect) {
-    let bar = if mono() {
+/// The bars' background.
+fn bar_style() -> Style {
+    if mono() {
         Style::default().add_modifier(Modifier::REVERSED)
     } else {
-        Style::default().bg(Color::Indexed(236))
-    };
-    let mut left = vec![Span::styled(
-        " LEGION TOP ",
-        if mono() {
-            Style::default().add_modifier(Modifier::BOLD)
+        Style::default().bg(tone(Color::Indexed(236)))
+    }
+}
+
+/// The first line: the action bar's menus (F10), the panels opened as a
+/// trail back to the menu, and how lists sort and graphs draw.
+fn action_bar(f: &mut Frame, model: &Model, view: &View, area: Rect) {
+    let mut left = vec![Span::raw(" ")];
+    for (m, name) in BAR.iter().enumerate() {
+        let open = view.bar.is_some_and(|(o, _)| o == m);
+        left.push(if open {
+            Span::styled(
+                format!(" {name} "),
+                if mono() {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .bg(tone(ACCENT))
+                        .fg(tone(Color::Black))
+                        .add_modifier(Modifier::BOLD)
+                },
+            )
         } else {
-            Style::default()
-                .bg(ACCENT)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD)
-        },
-    )];
+            Span::raw(format!(" {name} "))
+        });
+    }
+    left.push(Span::styled(" │ ", dim()));
     let last = view.stack.len() - 1;
     for (i, panel) in view.stack.iter().enumerate() {
-        left.push(Span::styled(if i == 0 { "  " } else { " › " }, dim()));
+        if i > 0 {
+            left.push(Span::styled(" › ", dim()));
+        }
         let name = panel_name(model, view, panel);
         left.push(if i == last {
-            Span::styled(name, Style::default().add_modifier(Modifier::BOLD))
+            Span::styled(name, fg(ACCENT).add_modifier(Modifier::BOLD))
         } else {
             Span::styled(name, dim())
         });
@@ -380,14 +493,121 @@ fn title_line(f: &mut Frame, model: &Model, view: &View, area: Rect) {
         ),
         dim(),
     ));
+    right.push(Span::styled(
+        " LEGION ",
+        if mono() {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .bg(tone(ACCENT))
+                .fg(tone(Color::Black))
+                .add_modifier(Modifier::BOLD)
+        },
+    ));
     let right = Line::from(right);
     let [l, r] = Layout::horizontal([
         Constraint::Fill(1),
         Constraint::Length(right.width() as u16),
     ])
     .areas(area);
-    f.render_widget(Paragraph::new(Line::from(left)).style(bar), l);
-    f.render_widget(Paragraph::new(right).style(bar), r);
+    f.render_widget(Paragraph::new(Line::from(left)).style(bar_style()), l);
+    f.render_widget(Paragraph::new(right).style(bar_style()), r);
+}
+
+/// The second line: the command line, as ISPF's, and where the panel is
+/// scrolled to.
+fn command_line(f: &mut Frame, model: &Model, view: &View, area: Rect) {
+    let mut left = vec![Span::styled(
+        format!(" {COMMAND} "),
+        fg(ACCENT).add_modifier(Modifier::BOLD),
+    )];
+    match &view.prompt {
+        Some(Prompt::Input {
+            input,
+            then: Then::Command,
+            ..
+        }) => {
+            left.push(Span::raw(input.clone()));
+            left.push(Span::styled("▏", fg(ACCENT)));
+            left.push(Span::styled("  Enter · ↑↓ recall · Esc cancels", dim()));
+        }
+        _ => left.push(Span::styled(
+            ": or = types here: =N, find, sort, range, back, or a legion command",
+            dim(),
+        )),
+    }
+    let mut right = Vec::new();
+    if !view.marked.is_empty() {
+        right.push(Span::styled(
+            format!("{} marked ", view.marked.len()),
+            fg(WARN).add_modifier(Modifier::BOLD),
+        ));
+    }
+    match view.panel() {
+        Panel::List { .. } => {
+            let count = rows(model, view).len();
+            let at = view.selected[view.index()].min(count.saturating_sub(1));
+            right.push(Span::styled(
+                match count {
+                    0 => "No rows ".to_owned(),
+                    n => format!("Row {} of {n} ", at + 1),
+                },
+                dim(),
+            ));
+        }
+        Panel::Detail { scroll, .. } => {
+            right.push(Span::styled(format!("Line {} ", scroll + 1), dim()));
+        }
+        _ => {}
+    }
+    let right = Line::from(right);
+    let [l, r] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(right.width() as u16),
+    ])
+    .areas(area);
+    f.render_widget(Paragraph::new(Line::from(left)), l);
+    f.render_widget(Paragraph::new(right), r);
+}
+
+/// An action bar menu pulled down under its name.
+fn pulldown(f: &mut Frame, model: &Model, view: &View, menu: usize, at: usize, area: Rect) {
+    let drop = view.pulldown_area(model, menu, area);
+    let items = &view.menus(model)[menu];
+    let selected = if mono() {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+            .bg(tone(Color::Indexed(237)))
+            .add_modifier(Modifier::BOLD)
+    };
+    let lines: Vec<Line> = if items.is_empty() {
+        vec![dimmed(format!(" {PULLDOWN_EMPTY}"))]
+    } else {
+        items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!(" {:<6} ", item.key),
+                        fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(item.label.clone()),
+                ]);
+                if i == at { line.style(selected) } else { line }
+            })
+            .collect()
+    };
+    f.render_widget(Clear, drop);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(fg(ACCENT)),
+        ),
+        drop,
+    );
 }
 
 /// What each list holds, as the menu says it.
@@ -404,37 +624,40 @@ fn about(tab: Tab) -> &'static str {
     }
 }
 
-/// The menu: the lists, by number, as ISPF's primary option menu.
+/// The menu: the graphs and the lists, by number, as ISPF's primary
+/// option menu.
 fn menu(f: &mut Frame, model: &Model, view: &View, area: Rect) {
     let selected = if mono() {
         Style::default().add_modifier(Modifier::REVERSED)
     } else {
         Style::default()
-            .bg(Color::Indexed(237))
+            .bg(tone(Color::Indexed(237)))
             .add_modifier(Modifier::BOLD)
     };
-    let mut lines: Vec<Line> = TABS
-        .iter()
-        .enumerate()
-        .map(|(i, tab)| {
-            let count = super::view::tab_count(model, *tab);
+    let mut lines: Vec<Line> = (0..OPTIONS)
+        .map(|i| {
+            let (title, what, count) = match option_tab(i) {
+                Some(tab) => {
+                    let count = super::view::tab_count(model, tab);
+                    let count = (tab != Tab::Log && count > 0).then_some(count);
+                    (tab.title(), about(tab), count)
+                }
+                None => ("Graphs", "CPU, memory, ZFS and network, large", None),
+            };
             let mut spans = vec![
                 if i == view.option {
                     Span::styled("▌", fg(ACCENT))
                 } else {
                     Span::raw(" ")
                 },
+                Span::styled(format!(" {i} "), fg(ACCENT).add_modifier(Modifier::BOLD)),
                 Span::styled(
-                    format!(" {} ", i + 1),
-                    fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" {:<11}", tab.title()),
+                    format!(" {title:<11}"),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("{:<56}", about(*tab)), dim()),
+                Span::styled(format!("{what:<56}"), dim()),
             ];
-            if *tab != Tab::Log && count > 0 {
+            if let Some(count) = count {
                 spans.push(Span::raw(format!("{count:>5}")));
             }
             let line = Line::from(spans);
@@ -447,10 +670,10 @@ fn menu(f: &mut Frame, model: &Model, view: &View, area: Rect) {
         .collect();
     lines.push(Line::default());
     lines.push(dimmed(
-        "  Enter or a number opens a list; Enter on a row opens it, F3 goes back.",
+        "  Enter or a number opens an option; Enter on a row opens it, F3 goes back.",
     ));
     lines.push(dimmed(
-        "  1–8 go to a list from any panel. : runs a legion command, A follows the alerts.",
+        "  0–8 go to an option from any panel; F10 opens the action bar; : or = the command line.",
     ));
     f.render_widget(Paragraph::new(lines).block(panel(title("Options"))), area);
 }
@@ -779,6 +1002,79 @@ fn summary(model: &Model) -> Vec<Line<'static>> {
     vec![Line::from(first), second]
 }
 
+/// A graph of the cluster: its name, samples, what they are out of, and
+/// what it reads now.
+struct Card {
+    name: String,
+    samples: Vec<f64>,
+    capacity: f64,
+    readout: String,
+}
+
+/// CPU, memory, ZFS and network, over the range shown.
+fn cards(model: &Model, view: &View) -> [Card; 4] {
+    let (millicores, memory) = model.capacity();
+    let (totals, telemetry) = model.series(view.range_ms());
+    let named = |n: &str| match view.range_ms() != 0 {
+        true => format!("{n} {}", view.range_name()),
+        false => n.to_owned(),
+    };
+    let cpu: Vec<f64> = totals.iter().map(|(c, _)| c / 100.0).collect();
+    let mem: Vec<f64> = totals.iter().map(|(_, m)| *m as f64).collect();
+    let (zfs_used, zfs_avail) = model.zfs_totals();
+    let zfs: Vec<f64> = telemetry.iter().map(|(u, _, _, _)| *u as f64).collect();
+    let (net_rx, net_tx) = model.net_totals();
+    let net: Vec<f64> = telemetry
+        .iter()
+        .map(|(_, _, rx, tx)| (*rx + *tx) as f64)
+        .collect();
+    let net_peak = net
+        .iter()
+        .copied()
+        .fold(0.0, f64::max)
+        .max((1 << 20) as f64);
+    let cpu_cap = millicores as f64 / 1000.0;
+    let cpu_now = cpu.last().copied().unwrap_or(0.0);
+    let mem_now = mem.last().copied().unwrap_or(0.0) as u64;
+    [
+        Card {
+            name: named("cpu"),
+            readout: format!(
+                "{cpu_now:.1}/{} cores",
+                if cpu_cap > 0.0 {
+                    trim(cpu_cap)
+                } else {
+                    "-".into()
+                }
+            ),
+            samples: cpu,
+            capacity: cpu_cap,
+        },
+        Card {
+            name: named("mem"),
+            readout: format!("{}/{}", bytes(mem_now), bytes(memory)),
+            samples: mem,
+            capacity: memory as f64,
+        },
+        Card {
+            name: named("zfs"),
+            readout: if zfs_used + zfs_avail > 0 {
+                format!("{}/{}", bytes(zfs_used), bytes(zfs_used + zfs_avail))
+            } else {
+                "no zfs telemetry".into()
+            },
+            samples: zfs,
+            capacity: (zfs_used + zfs_avail) as f64,
+        },
+        Card {
+            name: named("net"),
+            readout: format!("▼{} ▲{}", rate(net_rx), rate(net_tx)),
+            samples: net,
+            capacity: net_peak,
+        },
+    ]
+}
+
 /// The cluster at a glance on the menu: CPU, memory, ZFS and network,
 /// each a braille graph.
 fn telemetry_deck(f: &mut Frame, model: &Model, view: &View, area: Rect) {
@@ -805,97 +1101,30 @@ fn telemetry_deck(f: &mut Frame, model: &Model, view: &View, area: Rect) {
     if inner.height == 0 || inner.width < 20 {
         return;
     }
-
-    let (millicores, memory) = model.capacity();
-    let cpu_cap = millicores as f64 / 1000.0;
-    let mem_cap = memory as f64;
-    let (totals, telemetry) = model.series(view.range_ms());
     let whole = view.range_ms() != 0;
-    let cpu_samples: Vec<f64> = totals.iter().map(|(c, _)| c / 100.0).collect();
-    let mem_samples: Vec<f64> = totals.iter().map(|(_, m)| *m as f64).collect();
-    let (zfs_used, zfs_avail) = model.zfs_totals();
-    let zfs_cap = (zfs_used + zfs_avail) as f64;
-    let zfs_samples: Vec<f64> = telemetry.iter().map(|(u, _, _, _)| *u as f64).collect();
-    let (net_rx, net_tx) = model.net_totals();
-    let net_samples: Vec<f64> = telemetry
-        .iter()
-        .map(|(_, _, rx, tx)| (*rx + *tx) as f64)
-        .collect();
-    let net_peak = net_samples
-        .iter()
-        .copied()
-        .fold(0.0, f64::max)
-        .max((1 << 20) as f64);
+    let cols = Layout::horizontal([Constraint::Ratio(1, 4); 4]).split(inner);
+    for (card, at) in cards(model, view).iter().zip(cols.iter()) {
+        braille_card(f, *at, card, whole);
+    }
+}
 
-    let cols = Layout::horizontal([
-        Constraint::Ratio(1, 4),
-        Constraint::Ratio(1, 4),
-        Constraint::Ratio(1, 4),
-        Constraint::Ratio(1, 4),
-    ])
-    .split(inner);
-
-    let cpu_now = cpu_samples.last().copied().unwrap_or(0.0);
-    let cpu_label = format!(
-        "{:.1}/{} cores",
-        cpu_now,
-        if cpu_cap > 0.0 {
-            trim(cpu_cap)
-        } else {
-            "-".into()
-        }
-    );
-    let named = |n: &str| match whole {
-        true => format!("{n} {}", view.range_name()),
-        false => n.to_owned(),
-    };
-    braille_card(
-        f,
-        cols[0],
-        &named("cpu"),
-        &cpu_samples,
-        cpu_cap,
-        &cpu_label,
-        whole,
-    );
-
-    let mem_now = mem_samples.last().copied().unwrap_or(0.0) as u64;
-    let mem_label = format!("{}/{}", bytes(mem_now), bytes(memory));
-    braille_card(
-        f,
-        cols[1],
-        &named("mem"),
-        &mem_samples,
-        mem_cap,
-        &mem_label,
-        whole,
-    );
-
-    let zfs_label = if zfs_used + zfs_avail > 0 {
-        format!("{}/{}", bytes(zfs_used), bytes(zfs_used + zfs_avail))
+/// The graphs panel (`0`): the four graphs as large as the screen.
+fn graphs(f: &mut Frame, model: &Model, view: &View, area: Rect) {
+    let whole = view.range_ms() != 0;
+    let cards = cards(model, view);
+    let places: Vec<Rect> = if area.height >= 12 {
+        let [upper, lower] = Layout::vertical([Constraint::Ratio(1, 2); 2]).areas(area);
+        let [a, b] = Layout::horizontal([Constraint::Ratio(1, 2); 2]).areas(upper);
+        let [c, d] = Layout::horizontal([Constraint::Ratio(1, 2); 2]).areas(lower);
+        vec![a, b, c, d]
     } else {
-        "no zfs telemetry".into()
+        Layout::horizontal([Constraint::Ratio(1, 4); 4])
+            .split(area)
+            .to_vec()
     };
-    braille_card(
-        f,
-        cols[2],
-        &named("zfs"),
-        &zfs_samples,
-        zfs_cap,
-        &zfs_label,
-        whole,
-    );
-
-    let net_label = format!("▼{} ▲{}", rate(net_rx), rate(net_tx));
-    braille_card(
-        f,
-        cols[3],
-        &named("net"),
-        &net_samples,
-        net_peak,
-        &net_label,
-        whole,
-    );
+    for (card, at) in cards.iter().zip(places) {
+        braille_card(f, at, card, whole);
+    }
 }
 
 /// The samples for a graph `points` wide: as they are, the latest
@@ -916,15 +1145,14 @@ pub(super) fn fit(samples: &[f64], points: usize, whole: bool) -> Vec<f64> {
         .collect()
 }
 
-fn braille_card(
-    f: &mut Frame,
-    area: Rect,
-    name: &str,
-    samples: &[f64],
-    capacity: f64,
-    readout: &str,
-    whole: bool,
-) {
+fn braille_card(f: &mut Frame, area: Rect, card: &Card, whole: bool) {
+    let Card {
+        name,
+        samples,
+        capacity,
+        readout,
+    } = card;
+    let capacity = *capacity;
     if area.width < 8 || area.height < 2 {
         return;
     }
@@ -1012,7 +1240,31 @@ fn draw_table(f: &mut Frame, model: &Model, view: &View, rows: Vec<TableRow>, ar
         f.render_widget(Paragraph::new(dimmed(empty)).block(block), area);
         return;
     }
-    let titles = tab.header();
+    // A column for the marks first, while rows are marked.
+    let marking = !view.marked.is_empty();
+    let titles: Vec<&str> = marking
+        .then_some("")
+        .into_iter()
+        .chain(tab.header().iter().copied())
+        .collect();
+    let rows: Vec<TableRow> = rows
+        .into_iter()
+        .map(|mut r| {
+            if !marking {
+                return r;
+            }
+            let marked = r.key.as_ref().is_some_and(|k| view.marked.contains(k));
+            r.cells.insert(
+                0,
+                if marked {
+                    Line::from(Span::styled("✓", fg(WARN).add_modifier(Modifier::BOLD)))
+                } else {
+                    Line::from(" ")
+                },
+            );
+            r
+        })
+        .collect();
     let mut widths: Vec<usize> = titles.iter().map(|t| t.len()).collect();
     for r in &rows {
         for (w, c) in widths.iter_mut().zip(&r.cells) {
@@ -1043,7 +1295,7 @@ fn draw_table(f: &mut Frame, model: &Model, view: &View, rows: Vec<TableRow>, ar
         Style::default().add_modifier(Modifier::REVERSED)
     } else {
         Style::default()
-            .bg(Color::Indexed(237))
+            .bg(tone(Color::Indexed(237)))
             .add_modifier(Modifier::BOLD)
     };
     let table = Table::new(
@@ -1395,7 +1647,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("Enter", "open: a list from the menu, a row's details"),
             ("", "and a node's or workload's tasks from its details"),
             ("F3 Esc F12", "back one panel; F3 on the menu quits"),
-            ("1–8", "go to a list from any panel"),
+            ("0–8", "go to the graphs or a list from any panel"),
+            ("F10", "the action bar: ←→ menus, ↑↓ items, Enter does one"),
             ("↑↓ j k PgUp PgDn g G", "select, or scroll"),
             ("/", "filter the list; Esc clears"),
             ("y", "the YAML of the row or object"),
@@ -1408,6 +1661,10 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Acting on the row selected, or the object shown",
         &[
+            (
+                "Space",
+                "mark the row; a letter then acts on all marked (asked once)",
+            ),
             ("d p a", "node: drain (asked), pause, activate"),
             ("L", "node: set or remove a label"),
             (
@@ -1437,9 +1694,18 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         "The cluster, on a panel of its own",
         &[
             (
-                ":",
-                "run a legion command, e.g. :join-token worker; ↑↓ recall",
+                ": =",
+                "the command line: a legion command (join-token worker); ↑↓ recall",
             ),
+            (
+                "",
+                "or top's: =N, =x, find TEXT, sort cpu|mem|state|name [asc|desc],",
+            ),
+            (
+                "",
+                "range 1h…30d, poll 2s, tree, ended, back, mark all, unmark,",
+            ),
+            ("", "colors 24bit|256|16"),
             ("H", "diagnose every node"),
             ("W C", "the namespace's reach, and connections seen"),
             ("T", "the namespace's topology"),
@@ -1485,6 +1751,7 @@ fn help(f: &mut Frame, view: &View) {
         "On {} now. What you may do follows your role bindings.",
         match view.panel() {
             Panel::Menu => "the menu",
+            Panel::Graphs => "the graphs",
             Panel::List { .. } => view.tab.title(),
             Panel::Detail { .. } => "an object's details",
             Panel::Pane => "logs or output",
@@ -1538,9 +1805,13 @@ fn centered(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
 }
 
 /// A question, else what came of the last request, else the keys.
-fn bottom_line(view: &View) -> Line<'static> {
+fn bottom_line(model: &Model, view: &View) -> Line<'static> {
     let ask = |s: String| Line::from(Span::styled(s, fg(WARN).add_modifier(Modifier::BOLD)));
     match &view.prompt {
+        Some(Prompt::Input {
+            then: Then::Command,
+            ..
+        }) => {}
         Some(Prompt::Confirm(_, q)) => return ask(format!(" {q}")),
         Some(Prompt::Input { ask: q, input, .. }) => {
             return Line::from(vec![
@@ -1588,50 +1859,31 @@ fn bottom_line(view: &View) -> Line<'static> {
         ]);
     }
     // What letters do to the row selected, or the object shown.
-    if !matches!(view.panel(), Panel::List { .. } | Panel::Detail { .. }) {
+    let Some(key) = view.selected_key(model) else {
         return Line::default();
-    }
-    let keys: &[(&str, &str)] = match view.tab {
-        Tab::Nodes => &[
-            ("d", "drain"),
-            ("p", "pause"),
-            ("a", "activate"),
-            ("L", "label"),
-            ("c", "scrubs"),
-        ],
-        Tab::Workloads => &[
-            ("s", "scale"),
-            ("r", "roll back"),
-            ("R", "restart"),
-            ("o", "stop/start"),
-            ("P", "pause/resume"),
-            ("u", "suspend"),
-            ("n", "run now"),
-            ("l", "logs"),
-            ("e", "events"),
-        ],
-        Tab::Tasks => &[
-            ("l", "logs"),
-            ("e", "events"),
-            ("x", "shell"),
-            ("h", "ended"),
-            ("D", "delete"),
-        ],
-        Tab::Storage => &[("m", "move"), ("p", "promote"), ("D", "delete")],
-        Tab::Network | Tab::Config => &[("y", "YAML"), ("D", "delete")],
-        Tab::Log | Tab::Activity => &[],
     };
     let mut spans = Vec::new();
-    for (k, what) in keys {
+    if !view.marked.is_empty() {
+        spans.push(Span::styled(
+            format!(
+                " {} marked: a letter acts on all, Esc clears ",
+                view.marked.len()
+            ),
+            fg(WARN).add_modifier(Modifier::BOLD),
+        ));
+    }
+    for (k, what) in actions(key.0).iter().take(6) {
         spans.push(Span::styled(
             format!(" {k} "),
             if mono() {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
-                Style::default().bg(Color::DarkGray).fg(Color::White)
+                Style::default()
+                    .bg(tone(Color::DarkGray))
+                    .fg(tone(Color::White))
             },
         ));
-        spans.push(Span::styled(format!(" {what} "), dim()));
+        spans.push(Span::styled(format!(" {} ", what.to_lowercase()), dim()));
     }
     Line::from(spans)
 }
@@ -1640,23 +1892,19 @@ fn bottom_line(view: &View) -> Line<'static> {
 fn function_keys(view: &View) -> Line<'static> {
     let mut keys: Vec<(&str, &str)> = Vec::new();
     match view.panel() {
-        Panel::Menu => keys.extend([("Enter", "Open"), ("1-8", "List"), (":", "Command")]),
+        Panel::Menu => keys.extend([("Enter", "Open"), ("0-8", "Go"), (":", "Command")]),
+        Panel::Graphs => keys.extend([("w", "Range"), ("F3", "Back"), ("0-8", "Go")]),
         Panel::List { .. } => keys.extend([
             ("Enter", "Open"),
+            ("Space", "Mark"),
             ("F3", "Back"),
             ("/", "Filter"),
-            ("1-8", "List"),
         ]),
         Panel::Detail { key, .. } => {
             if matches!(key.0, Kind::Node | Kind::Service | Kind::Job) {
                 keys.push(("Enter", "Tasks"));
             }
-            keys.extend([
-                ("↑↓", "Scroll"),
-                ("y", "YAML"),
-                ("F3", "Back"),
-                ("1-8", "List"),
-            ]);
+            keys.extend([("↑↓", "Scroll"), ("y", "YAML"), ("F3", "Back")]);
         }
         Panel::Pane => {
             if view
@@ -1666,9 +1914,10 @@ fn function_keys(view: &View) -> Line<'static> {
             {
                 keys.push(("Ctrl-]", "Type"));
             }
-            keys.extend([("PgUp PgDn", "Scroll"), ("F3", "Back"), ("1-8", "List")]);
+            keys.extend([("PgUp PgDn", "Scroll"), ("F3", "Back")]);
         }
     }
+    keys.push(("F10", "Actions"));
     keys.push(("F1", "Help"));
     keys.push(if view.stack.len() == 1 {
         ("F3", "Exit")

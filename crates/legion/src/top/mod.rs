@@ -197,8 +197,14 @@ pub async fn run(
                 Msg::Status(s) => model.cluster = Some(s),
                 Msg::Problem(p) => model.problem = Some(p),
                 Msg::Polled(p) => model.polled = p,
-                Msg::Key(k) => requests.extend(view.key(&model, k)),
-                Msg::Mouse(m) => view.mouse(&model, m, term_area),
+                Msg::Key(k) => {
+                    requests.extend(view.key(&model, k).into_iter().flat_map(Request::flatten))
+                }
+                Msg::Mouse(m) => requests.extend(
+                    view.mouse(&model, m, term_area)
+                        .into_iter()
+                        .flat_map(Request::flatten),
+                ),
                 Msg::Done(what) => view.notice = Some(what),
                 Msg::Log(n, stderr, data) => {
                     if let (Some(l), Some((shown, _))) = (&mut view.logs, &logs)
@@ -1258,7 +1264,8 @@ async fn act(
         | Request::Events { .. }
         | Request::Alerts
         | Request::Run { .. }
-        | Request::Edit { .. } => {
+        | Request::Edit { .. }
+        | Request::Batch(_) => {
             unreachable!("not asked of the API")
         }
     };

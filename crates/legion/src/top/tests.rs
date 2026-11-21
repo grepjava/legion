@@ -182,6 +182,7 @@ fn typed(view: &mut View, model: &Model, keys: &str) -> Option<Request> {
             '↓' => KeyCode::Down,
             '↑' => KeyCode::Up,
             '«' => KeyCode::F(3),
+            '§' => KeyCode::F(10),
             c => KeyCode::Char(c),
         };
         last = view.key(model, KeyEvent::new(code, KeyModifiers::NONE));
@@ -750,8 +751,8 @@ fn global_and_autoscaled_services_are_not_scaled_here() {
     let mut v = listing();
     assert_eq!(typed(&mut v, &m, "2s"), None);
     assert!(screen(&m, &v).contains("global or autoscaled"));
-    // The next key clears it.
-    typed(&mut v, &m, "j");
+    // The next key clears it, and the service's letters show again.
+    typed(&mut v, &m, "k");
     assert!(screen(&m, &v).contains("scale"));
 }
 
@@ -1032,7 +1033,7 @@ fn failed_updates_are_highlighted() {
                     == state
             })
             .unwrap_or_else(|| panic!("no {state}"));
-        assert_eq!(buf[at].fg == draw::WARN, warn, "{state}");
+        assert_eq!(buf[at].fg == draw::tone(draw::WARN), warn, "{state}");
     }
 }
 
@@ -1092,7 +1093,8 @@ fn panels_open_over_each_other_and_f3_goes_back() {
     typed(&mut v, &m, "2\n\n4");
     assert_eq!(v.stack.len(), 2);
     assert_eq!(v.tab, Tab::Storage);
-    assert_eq!(v.option, 3);
+    // The menu's options: 0 the graphs, then the lists.
+    assert_eq!(v.option, 4);
     // Rows with nothing to open stay.
     typed(&mut v, &m, "7\n");
     assert_eq!(v.stack.len(), 2);
@@ -2045,4 +2047,212 @@ fn a_range_is_fitted_to_the_graph_keeping_its_peaks() {
     // The polls are shown as they are, the latest where they don't fit.
     assert_eq!(draw::fit(&samples, 10, false).len(), 100);
     assert_eq!(draw::fit(&samples[..5], 10, true).len(), 5);
+}
+
+#[test]
+fn marked_rows_are_acted_on_together_once_asked() {
+    let m = cluster();
+    let mut v = listing();
+    // Space marks a row and moves on.
+    typed(&mut v, &m, "  ");
+    assert_eq!(v.marked.len(), 2);
+    let s = screen(&m, &v);
+    assert!(s.contains("2 marked"), "{s}");
+    assert!(line(&s, "n1 ").starts_with("✓ n1"), "{s}");
+    // A letter for all, asked once.
+    assert_eq!(typed(&mut v, &m, "p"), None);
+    match &v.prompt {
+        Some(view::Prompt::Confirm(Request::Batch(all), ask)) => {
+            assert_eq!(all.len(), 2);
+            assert!(ask.contains("Pause 2 marked: n1, n2?"), "{ask}");
+        }
+        p => panic!("{p:?}"),
+    }
+    let done = typed(&mut v, &m, "y").unwrap();
+    assert!(v.marked.is_empty());
+    assert_eq!(
+        done.flatten(),
+        vec![
+            Request::Availability {
+                node: "n1".into(),
+                to: "pause"
+            },
+            Request::Availability {
+                node: "n2".into(),
+                to: "pause"
+            },
+        ]
+    );
+    // Drain, asked of one, is asked once for all.
+    typed(&mut v, &m, "g  d");
+    assert!(matches!(
+        &v.prompt,
+        Some(view::Prompt::Confirm(Request::Batch(all), _)) if all.len() == 2
+    ));
+    typed(&mut v, &m, "n");
+    assert_eq!(v.marked.len(), 2, "kept when not done");
+    // What asks for more than a yes is one row at a time.
+    assert_eq!(typed(&mut v, &m, "L"), None);
+    assert!(v.prompt.is_none());
+    assert!(v.notice.as_deref().unwrap().contains("one row at a time"));
+    // Logs open for one row.
+    v.notice = None;
+    typed(&mut v, &m, "\x1b3 ");
+    assert!(v.marked.is_empty() || v.tab == Tab::Tasks);
+    v.notice = None;
+    assert_eq!(typed(&mut v, &m, "l"), None);
+    assert!(v.notice.as_deref().unwrap().contains("one row at a time"));
+    // Esc clears the marks before the filter, and goes back after.
+    v.notice = None;
+    typed(&mut v, &m, "\x1b");
+    assert!(v.marked.is_empty());
+    assert_eq!(v.tab, Tab::Tasks);
+    // Letters that act on none of the rows marked do what they always do.
+    typed(&mut v, &m, " ");
+    typed(&mut v, &m, "h");
+    assert!(v.history);
+}
+
+#[test]
+fn the_command_line_takes_top_s_commands_and_legion_s() {
+    let m = cluster();
+    let mut v = View::default();
+    // = starts it with =.
+    typed(&mut v, &m, "=");
+    let s = screen(&m, &v);
+    assert!(s.contains("Command ===> =▏"), "{s}");
+    typed(&mut v, &m, "4\n");
+    assert_eq!(v.tab, Tab::Storage);
+    typed(&mut v, &m, ":=0\n");
+    assert_eq!(*v.panel(), view::Panel::Graphs);
+    typed(&mut v, &m, ":=3\n:find 2-1\n");
+    let s = screen(&m, &v);
+    assert!(s.contains("web-2-1") && !s.contains("web-1-1"), "{s}");
+    typed(&mut v, &m, ":sort cpu asc\n:range 7d\n");
+    assert_eq!(v.sort, view::SortCol::Cpu);
+    assert!(!v.sort_desc);
+    assert_eq!(v.range_name(), "7d");
+    typed(&mut v, &m, ":range 2w\n");
+    assert!(v.notice.as_deref().unwrap().contains("range live"));
+    typed(&mut v, &m, ":poll 2s\n");
+    assert_eq!(v.poll_ms, 2000);
+    typed(&mut v, &m, ":mark all\n");
+    assert_eq!(v.marked.len(), 1);
+    typed(&mut v, &m, ":unmark\n:back\n");
+    assert!(v.marked.is_empty());
+    assert_eq!(*v.panel(), view::Panel::Menu);
+    // Anything else is legion's; "legion help" is too.
+    assert_eq!(typed(&mut v, &m, ":list nodes\n"), run(&["list", "nodes"]));
+    assert_eq!(typed(&mut v, &m, ":legion help\n"), run(&["help"]));
+    typed(&mut v, &m, ":help\n");
+    assert!(v.help);
+    // ↑ recalls them, top's too.
+    v.help = false;
+    typed(&mut v, &m, ":↑↑↑");
+    match &v.prompt {
+        Some(view::Prompt::Input { input, .. }) => assert_eq!(input, "list nodes"),
+        p => panic!("{p:?}"),
+    }
+    typed(&mut v, &m, "\x1b:=x\n");
+    assert!(v.quit);
+}
+
+#[test]
+fn f10_pulls_down_the_action_bar_s_menus() {
+    let m = cluster();
+    let mut v = listing();
+    typed(&mut v, &m, "§");
+    assert_eq!(v.bar, Some((0, 0)));
+    let s = screen_of(&m, &v, 140);
+    // The Actions of the node selected.
+    assert!(
+        s.contains("d      Drain") && s.contains("X      Pool errors seen"),
+        "{s}"
+    );
+    // ↓ Enter does the second: pause.
+    assert_eq!(
+        typed(&mut v, &m, "↓\n"),
+        Some(Request::Availability {
+            node: "n1".into(),
+            to: "pause"
+        })
+    );
+    assert!(v.bar.is_none());
+    // → to the Cluster menu, its first item: diagnose.
+    typed(&mut v, &m, "§");
+    for _ in 0..3 {
+        typed_code(&mut v, &m, KeyCode::Right);
+    }
+    assert_eq!(v.bar, Some((3, 0)));
+    assert!(screen_of(&m, &v, 140).contains("Diagnose every node"));
+    assert_eq!(typed(&mut v, &m, "\n"), run(&["diagnose"]));
+    // Esc closes it, doing nothing.
+    typed(&mut v, &m, "§\x1b");
+    assert!(v.bar.is_none());
+    assert_eq!(
+        *v.panel(),
+        view::Panel::List {
+            tab: Tab::Nodes,
+            focus: None
+        }
+    );
+    // On the menu, nothing is selected to act on.
+    let mut v = View::default();
+    typed(&mut v, &m, "§");
+    assert!(screen_of(&m, &v, 140).contains("Nothing selected to act on"));
+}
+
+#[test]
+fn a_click_opens_the_action_bar_and_does_an_item() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let m = cluster();
+    let mut v = listing();
+    v.mouse = true;
+    let area = ratatui::layout::Rect::new(0, 0, 140, 20);
+    let click = |column, row| MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    // View's name, then its second item: the workload tree.
+    assert_eq!(v.mouse(&m, click(view::bar_x(1) + 1, 0), area), None);
+    assert_eq!(v.bar, Some((1, 0)));
+    v.mouse(&m, click(view::bar_x(1) + 2, 3), area);
+    assert!(v.tree && v.bar.is_none());
+    // Again on its name closes it; a click elsewhere too.
+    v.mouse(&m, click(view::bar_x(0) + 1, 0), area);
+    v.mouse(&m, click(view::bar_x(0) + 1, 0), area);
+    assert!(v.bar.is_none());
+    // Cluster's first: diagnose.
+    v.mouse(&m, click(view::bar_x(3) + 1, 0), area);
+    assert_eq!(
+        v.mouse(&m, click(view::bar_x(3) + 2, 2), area),
+        run(&["diagnose"])
+    );
+}
+
+#[test]
+fn the_graphs_panel_draws_the_four_large() {
+    let m = cluster();
+    let mut v = View::default();
+    let s = screen(&m, &v);
+    assert!(
+        line(&s, "Graphs").starts_with("0 Graphs CPU, memory"),
+        "{s}"
+    );
+    typed(&mut v, &m, "k\n");
+    assert_eq!(*v.panel(), view::Panel::Graphs);
+    let s = screen_sized(&m, &v, 120, 30);
+    for card in ["cpu", "mem", "zfs", "net"] {
+        assert!(s.contains(&format!("╭ {card} ")), "{card}: {s}");
+    }
+    // Two rows of two.
+    let cpu = s.lines().position(|l| l.contains("╭ cpu ")).unwrap();
+    let zfs = s.lines().position(|l| l.contains("╭ zfs ")).unwrap();
+    assert!(zfs > cpu + 5, "{s}");
+    typed(&mut v, &m, "w");
+    assert!(screen_sized(&m, &v, 120, 30).contains("╭ cpu 1h"));
+    typed(&mut v, &m, "«");
+    assert_eq!(*v.panel(), view::Panel::Menu);
 }

@@ -132,8 +132,10 @@ impl Tab {
 /// the next over it, F3 goes back to the one under it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Panel {
-    /// The options: the lists, by number.
+    /// The options: the graphs and the lists, by number.
     Menu,
+    /// The cluster's CPU, memory, ZFS and network, graphed large.
+    Graphs,
     /// A tab's list; the tasks may be of one node or workload.
     List { tab: Tab, focus: Option<Focus> },
     /// An object, field by field, scrolled this far.
@@ -291,6 +293,136 @@ pub enum Request {
     Edit {
         key: Key,
     },
+    /// One letter's requests for every row marked, asked once.
+    Batch(Vec<Request>),
+}
+
+impl Request {
+    /// The requests to make: a batch's each, else this one.
+    pub(super) fn flatten(self) -> Vec<Request> {
+        match self {
+            Request::Batch(all) => all,
+            one => vec![one],
+        }
+    }
+
+    /// Whether it changes an object and says so in a line, so that it
+    /// may be made for many rows at once; logs, shells, events, commands
+    /// and edits open one at a time.
+    fn batched(&self) -> bool {
+        matches!(
+            self,
+            Request::Availability { .. }
+                | Request::Rollback { .. }
+                | Request::Restart { .. }
+                | Request::RunNow { .. }
+                | Request::Suspend { .. }
+                | Request::Stop { .. }
+                | Request::Pause { .. }
+                | Request::Delete { .. }
+        )
+    }
+}
+
+/// What a kind's letters do, for the Actions menu and the message line.
+pub(super) fn actions(kind: Kind) -> &'static [(char, &'static str)] {
+    match kind {
+        Kind::Node => &[
+            ('d', "Drain"),
+            ('p', "Pause"),
+            ('a', "Activate"),
+            ('L', "Label"),
+            ('c', "Scrub schedule"),
+            ('X', "Pool errors seen"),
+            ('I', "Images"),
+            ('e', "Events"),
+            ('E', "Edit"),
+            ('D', "Delete"),
+        ],
+        Kind::Service => &[
+            ('s', "Scale"),
+            ('r', "Roll back"),
+            ('R', "Restart"),
+            ('o', "Stop or start"),
+            ('P', "Pause or resume"),
+            ('l', "Logs"),
+            ('L', "Logs of all tasks"),
+            ('e', "Events"),
+            ('E', "Edit"),
+            ('D', "Delete"),
+        ],
+        Kind::Job => &[
+            ('l', "Logs"),
+            ('L', "Logs of all tasks"),
+            ('e', "Events"),
+            ('E', "Edit"),
+            ('D', "Delete"),
+        ],
+        Kind::CronJob => &[
+            ('n', "Run now"),
+            ('u', "Suspend or resume"),
+            ('E', "Edit"),
+            ('D', "Delete"),
+        ],
+        Kind::Build => &[
+            ('l', "Log"),
+            ('e', "Events"),
+            ('E', "Edit"),
+            ('D', "Delete"),
+        ],
+        Kind::Task => &[
+            ('l', "Logs"),
+            ('x', "Shell"),
+            ('f', "Files"),
+            ('e', "Events"),
+            ('E', "Edit"),
+            ('D', "Delete"),
+        ],
+        Kind::Volume => &[
+            ('m', "Move"),
+            ('p', "Promote replica"),
+            ('N', "Snapshots"),
+            ('B', "Back up"),
+            ('e', "Events"),
+            ('E', "Edit"),
+            ('D', "Delete"),
+        ],
+        _ => &[('E', "Edit"), ('D', "Delete")],
+    }
+}
+
+/// The action bar's menus, F10 opening the first.
+pub(super) const BAR: [&str; 5] = ["Actions", "View", "Go", "Cluster", "Help"];
+
+/// Where each of the action bar's menus starts on the first line.
+pub(super) fn bar_x(menu: usize) -> u16 {
+    BAR[..menu].iter().map(|t| t.len() as u16 + 2).sum::<u16>() + 1
+}
+
+/// An item of a pulldown: what it says, and the key it stands for.
+pub(super) struct Item {
+    pub(super) key: String,
+    pub(super) label: String,
+    code: KeyCode,
+}
+
+fn item(key: &str, label: &str, code: KeyCode) -> Item {
+    Item {
+        key: key.to_owned(),
+        label: label.to_owned(),
+        code,
+    }
+}
+
+/// What an Actions pulldown says with nothing selected.
+pub(super) const PULLDOWN_EMPTY: &str = "Nothing selected to act on";
+
+/// The menu options: the graphs, then the lists.
+pub(super) const OPTIONS: usize = TABS.len() + 1;
+
+/// The list an option opens; `None`: the graphs.
+pub(super) fn option_tab(option: usize) -> Option<Tab> {
+    option.checked_sub(1).map(|i| TABS[i])
 }
 
 /// The ranges the graphs show, `w` going round them: the polls, then
@@ -303,6 +435,9 @@ pub(super) const RANGES: [(i64, &str); 6] = [
     (7 * 24 * 3_600_000, "7d"),
     (30 * 24 * 3_600_000, "30d"),
 ];
+
+/// What the command line asks, as ISPF's does.
+pub(super) const COMMAND: &str = "Command ===>";
 
 /// How many command lines Up goes back through.
 const COMMANDS_KEPT: usize = 50;
@@ -467,8 +602,14 @@ pub struct View {
     pub(super) history: bool,
     /// The panels opened, the menu first; the last is shown.
     pub(super) stack: Vec<Panel>,
-    /// The menu's selected option.
+    /// The menu's selected option: 0 the graphs, then the lists.
     pub(super) option: usize,
+    /// Rows marked, for a letter to act on all of them.
+    pub(super) marked: std::collections::BTreeSet<Key>,
+    /// The action bar's menu open, and its item selected.
+    pub(super) bar: Option<(usize, usize)>,
+    /// `mark all` typed: the rows shown are to be marked.
+    pub(super) mark_all: bool,
     /// Expand workload → task → jail tree in Workloads.
     pub(super) tree: bool,
     /// Active sort column and direction.
@@ -505,7 +646,10 @@ impl Default for View {
             focus: None,
             history: false,
             stack: vec![Panel::Menu],
-            option: 0,
+            option: 1,
+            marked: Default::default(),
+            bar: None,
+            mark_all: false,
             tree: false,
             sort: SortCol::Default,
             sort_desc: true,
@@ -585,8 +729,329 @@ impl View {
         self.stack.truncate(1);
         self.logs = None;
         self.shell = None;
-        self.option = TABS.iter().position(|t| *t == tab).expect("a tab");
+        self.option = TABS.iter().position(|t| *t == tab).expect("a tab") + 1;
         self.open(Panel::List { tab, focus: None });
+    }
+
+    /// Goes to the graphs from anywhere, as `=0` does.
+    pub(super) fn graphs(&mut self) {
+        self.stack.truncate(1);
+        self.logs = None;
+        self.shell = None;
+        self.option = 0;
+        self.open(Panel::Graphs);
+    }
+
+    /// Opens what a menu option stands for.
+    fn open_option(&mut self, option: usize) {
+        self.option = option;
+        match option_tab(option) {
+            Some(tab) => self.open(Panel::List { tab, focus: None }),
+            None => self.open(Panel::Graphs),
+        }
+    }
+
+    /// The row selected in the list shown, or the object whose details
+    /// show.
+    pub(super) fn selected_key(&self, model: &Model) -> Option<Key> {
+        match self.panel() {
+            Panel::List { .. } => {
+                let rows = rows(model, self);
+                let at = self.selected[self.index()].min(rows.len().saturating_sub(1));
+                rows.into_iter().nth(at).and_then(|r| r.key)
+            }
+            Panel::Detail { key, .. } => Some(key.clone()),
+            _ => None,
+        }
+    }
+
+    /// The action bar's menus as they are now: the Actions of the row
+    /// selected, then the rest.
+    pub(super) fn menus(&self, model: &Model) -> [Vec<Item>; 5] {
+        let char_item = |c: char, label: &str| item(&c.to_string(), label, KeyCode::Char(c));
+        let mut acts: Vec<Item> = match self.selected_key(model) {
+            Some(key) => actions(key.0)
+                .iter()
+                .map(|(c, label)| char_item(*c, label))
+                .chain([char_item('y', "YAML")])
+                .collect(),
+            None => Vec::new(),
+        };
+        if matches!(self.panel(), Panel::List { .. }) {
+            acts.push(item("Space", "Mark or unmark the row", KeyCode::Char(' ')));
+        }
+        let view = vec![
+            char_item('/', "Filter the list"),
+            char_item('t', "Workload tree"),
+            char_item('>', "Sort by the next column"),
+            char_item('S', "Sort the other way"),
+            char_item('h', "Ended tasks too"),
+            char_item('w', "Graphs over a longer range"),
+            char_item('+', "Poll faster"),
+            char_item('-', "Poll slower"),
+            char_item('M', "Mouse on or off"),
+        ];
+        let mut go = vec![char_item(':', "Command line"), char_item('0', "Graphs")];
+        for (i, tab) in TABS.iter().enumerate() {
+            let c = char::from(b'1' + i as u8);
+            go.push(char_item(c, tab.title()));
+        }
+        go.push(char_item('A', "Alerts"));
+        go.push(item("F3", "Back", KeyCode::F(3)));
+        let cluster = vec![
+            char_item('H', "Diagnose every node"),
+            char_item('W', "Reach of the namespace"),
+            char_item('C', "Connections seen"),
+            char_item('T', "Topology"),
+            char_item('U', "Audit log, a day"),
+            char_item('K', "What tasks use"),
+        ];
+        let help = vec![item("F1", "Keys", KeyCode::F(1)), char_item('q', "Quit")];
+        [acts, view, go, cluster, help]
+    }
+
+    /// Where a menu's pulldown shows, under its name, on a terminal of
+    /// `area`.
+    pub(super) fn pulldown_area(&self, model: &Model, menu: usize, area: Rect) -> Rect {
+        let items = &self.menus(model)[menu];
+        let width = items
+            .iter()
+            .map(|i| i.label.chars().count() + 11)
+            .max()
+            .unwrap_or(0)
+            .max(PULLDOWN_EMPTY.len() + 4) as u16;
+        let height = items.len().max(1) as u16 + 2;
+        let width = width.min(area.width);
+        let x = bar_x(menu)
+            .saturating_sub(1)
+            .min(area.right().saturating_sub(width));
+        Rect {
+            x,
+            y: area.y + 1,
+            width,
+            height: height.min(area.height.saturating_sub(1)),
+        }
+    }
+
+    /// Keys while a pulldown is open: ←→ between menus, ↑↓ through its
+    /// items, Enter does one, Esc or F10 closes it.
+    fn bar_key(&mut self, model: &Model, k: KeyEvent) -> Option<Request> {
+        let (menu, at) = self.bar?;
+        let menus = self.menus(model);
+        let last = menus[menu].len().saturating_sub(1);
+        self.bar = Some(match k.code {
+            KeyCode::Left => ((menu + BAR.len() - 1) % BAR.len(), 0),
+            KeyCode::Right | KeyCode::Tab => ((menu + 1) % BAR.len(), 0),
+            KeyCode::Down | KeyCode::Char('j') => (menu, (at + 1).min(last)),
+            KeyCode::Up | KeyCode::Char('k') => (menu, at.saturating_sub(1)),
+            KeyCode::Enter => return self.pick_item(model, menu, at),
+            KeyCode::Esc | KeyCode::F(10) | KeyCode::F(12) => {
+                self.bar = None;
+                return None;
+            }
+            _ => (menu, at),
+        });
+        None
+    }
+
+    /// Closes the pulldown and does what its item stands for.
+    fn pick_item(&mut self, model: &Model, menu: usize, at: usize) -> Option<Request> {
+        self.bar = None;
+        let code = self.menus(model)[menu].get(at)?.code;
+        self.key(model, KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// A letter for every row marked: their requests, asked once; or why
+    /// not; `None`: the letter does not act on rows.
+    fn act_on_marked(&mut self, c: char, model: &Model) -> Option<Option<Request>> {
+        let keys: Vec<Key> = self
+            .marked
+            .iter()
+            .filter(|k| model.get(k).is_some())
+            .cloned()
+            .collect();
+        let mut requests = Vec::new();
+        let mut names = Vec::new();
+        let mut skipped = 0;
+        for key in &keys {
+            let made = self.act(c, model, key);
+            let asked = self.prompt.take();
+            let refused = self.notice.take();
+            let request = match (made, asked) {
+                (Some(r), None) | (None, Some(Prompt::Confirm(r, _))) => r,
+                (None, None) if refused.is_none() => {
+                    skipped += 1;
+                    continue;
+                }
+                (None, None) => {
+                    skipped += 1;
+                    continue;
+                }
+                _ => {
+                    self.notice = Some(format!(
+                        "Not done: {c} asks for more than a yes, one row at a time. Esc clears the marks."
+                    ));
+                    return Some(None);
+                }
+            };
+            if !request.batched() {
+                self.notice = Some(format!(
+                    "Not done: {c} opens for one row at a time. Esc clears the marks."
+                ));
+                return Some(None);
+            }
+            names.push(key.2.clone());
+            requests.push(request);
+        }
+        if requests.is_empty() {
+            return None;
+        }
+        let what = keys
+            .first()
+            .and_then(|k| actions(k.0).iter().find(|(l, _)| *l == c))
+            .map_or(c.to_string(), |(_, label)| (*label).to_owned());
+        let mut ask = format!("{what} {} marked: {}?", requests.len(), names.join(", "));
+        if skipped > 0 {
+            ask = format!("{ask} ({skipped} it does not apply to are left.)");
+        }
+        self.confirm(Request::Batch(requests), ask);
+        Some(None)
+    }
+
+    /// A command typed on the command line that `top` itself does, as
+    /// ISPF's are: `=N`, `find`, `sort`, `range`, `back`; `None`: one
+    /// for `legion`.
+    fn top_command(&mut self, line: &str) -> Option<Option<Request>> {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let first = words.first()?.to_ascii_lowercase();
+        let rest = words.get(1).map(|w| w.to_ascii_lowercase());
+        let done = |view: &mut View, notice: String| {
+            view.notice = Some(notice);
+            Some(None)
+        };
+        if let Some(to) = first.strip_prefix('=') {
+            return match to {
+                "" => {
+                    self.stack.truncate(1);
+                    self.logs = None;
+                    self.shell = None;
+                    Some(None)
+                }
+                "0" => {
+                    self.graphs();
+                    Some(None)
+                }
+                "x" => {
+                    self.quit = true;
+                    Some(None)
+                }
+                n => match n.parse::<usize>() {
+                    Ok(n @ 1..=8) => {
+                        self.jump(TABS[n - 1]);
+                        Some(None)
+                    }
+                    _ => done(self, format!("Not done: no option {n}; =0 to =8, or =x.")),
+                },
+            };
+        }
+        match first.as_str() {
+            "find" | "f" | "filter" => {
+                if !matches!(self.panel(), Panel::List { .. }) {
+                    return done(self, "Not done: find works on a list.".into());
+                }
+                let i = self.index();
+                self.filter[i] = words[1..].join(" ");
+                self.selected[i] = 0;
+                Some(None)
+            }
+            "sort" => {
+                self.sort = match rest.as_deref() {
+                    Some("cpu") => SortCol::Cpu,
+                    Some("mem" | "memory") => SortCol::Memory,
+                    Some("state") => SortCol::State,
+                    Some("name") => SortCol::Name,
+                    None | Some("default" | "off") => SortCol::Default,
+                    Some(other) => {
+                        return done(
+                            self,
+                            format!(
+                                "Not done: sort by cpu, mem, state, name or default, not {other}."
+                            ),
+                        );
+                    }
+                };
+                match words.get(2).map(|w| w.to_ascii_lowercase()).as_deref() {
+                    Some("a" | "asc" | "up") => self.sort_desc = false,
+                    Some("d" | "desc" | "down") => self.sort_desc = true,
+                    _ => {}
+                }
+                Some(None)
+            }
+            "range" => match RANGES
+                .iter()
+                .position(|(_, name)| Some(*name) == rest.as_deref())
+            {
+                Some(at) => {
+                    self.range = at;
+                    Some(None)
+                }
+                None => done(self, "Not done: range live, 1h, 6h, 24h, 7d or 30d.".into()),
+            },
+            "poll" => {
+                let ms = rest
+                    .as_deref()
+                    .map(|r| r.trim_end_matches('s'))
+                    .and_then(|r| r.parse::<u64>().ok())
+                    .map(|s| s * 1000)
+                    .filter(|ms| POLL_STEPS.contains(ms));
+                match ms {
+                    Some(ms) => {
+                        self.poll_ms = ms;
+                        Some(None)
+                    }
+                    None => done(self, "Not done: poll 1s, 2s, 5s or 10s.".into()),
+                }
+            }
+            "tree" => {
+                self.tree = !self.tree;
+                Some(None)
+            }
+            "ended" => {
+                self.history = !self.history;
+                Some(None)
+            }
+            "back" | "end" => {
+                self.back();
+                Some(None)
+            }
+            "menu" => self.top_command("="),
+            "graphs" => self.top_command("=0"),
+            "exit" | "quit" => self.top_command("=x"),
+            "help" if rest.is_none() => {
+                self.help = true;
+                Some(None)
+            }
+            "colors" | "colours" => {
+                let bits = match rest.as_deref() {
+                    Some("24bit" | "truecolor" | "24") => 24,
+                    Some("256") => 8,
+                    Some("16") => 4,
+                    _ => return done(self, "Not done: colors 24bit, 256 or 16.".into()),
+                };
+                super::draw::set_depth(bits);
+                Some(None)
+            }
+            "unmark" => {
+                self.marked.clear();
+                Some(None)
+            }
+            "mark" if rest.as_deref() == Some("all") => {
+                // The rows shown, once the model is at hand.
+                self.mark_all = matches!(self.panel(), Panel::List { .. });
+                Some(None)
+            }
+            _ => None,
+        }
     }
 
     /// Starts showing the logs a request asks for, in place of any shown.
@@ -722,7 +1187,17 @@ impl View {
             return None;
         }
         if let Some(prompt) = self.prompt.take() {
-            return self.answer(prompt, k);
+            let answered = self.answer(prompt, k);
+            if std::mem::take(&mut self.mark_all) {
+                self.marked = rows(model, self)
+                    .into_iter()
+                    .filter_map(|r| r.key)
+                    .collect();
+            }
+            return answered;
+        }
+        if self.bar.is_some() {
+            return self.bar_key(model, k);
         }
         if self.help {
             self.help = false;
@@ -773,6 +1248,14 @@ impl View {
                 self.jump(TABS[c as usize - '1' as usize]);
                 return None;
             }
+            KeyCode::Char('0') => {
+                self.graphs();
+                return None;
+            }
+            KeyCode::F(10) => {
+                self.bar = Some((0, 0));
+                return None;
+            }
             _ => {}
         }
         // What keys act on: the row selected, or the object shown.
@@ -787,8 +1270,16 @@ impl View {
                 rows.into_iter().nth(self.selected[i]).and_then(|r| r.key)
             }
             Panel::Detail { key, .. } => Some(key.clone()),
-            Panel::Menu | Panel::Pane => None,
+            Panel::Menu | Panel::Graphs | Panel::Pane => None,
         };
+        // A letter acts on every row marked, if any are.
+        if let KeyCode::Char(c) = k.code
+            && matches!(self.panel(), Panel::List { .. })
+            && !self.marked.is_empty()
+            && let Some(done) = self.act_on_marked(c, model)
+        {
+            return done;
+        }
         if let KeyCode::Char(c) = k.code
             && let Some(key) = &selected
             && let Some(request) = self.act(c, model, key)
@@ -803,14 +1294,20 @@ impl View {
         }
         match k.code {
             KeyCode::Esc => match self.panel() {
+                Panel::List { .. } if !self.marked.is_empty() => self.marked.clear(),
                 Panel::List { .. } if !self.filter[i].is_empty() => self.filter[i].clear(),
                 _ => self.back(),
             },
-            KeyCode::Enter => match (self.panel(), selected) {
-                (Panel::Menu, _) => {
-                    let tab = TABS[self.option];
-                    self.open(Panel::List { tab, focus: None });
+            KeyCode::Char(' ') => {
+                if let (Panel::List { .. }, Some(key)) = (self.panel(), selected)
+                    && !self.marked.remove(&key)
+                {
+                    self.marked.insert(key);
                 }
+                self.moved(KeyCode::Down, count);
+            }
+            KeyCode::Enter => match (self.panel(), selected) {
+                (Panel::Menu, _) => self.open_option(self.option),
                 (Panel::List { .. }, Some(key)) => self.open(Panel::Detail { key, scroll: 0 }),
                 (Panel::Detail { .. }, Some((Kind::Node, _, name))) => {
                     self.show_tasks(Focus::Node(name))
@@ -826,13 +1323,18 @@ impl View {
             KeyCode::Char('>' | '.') => self.sort = self.sort.next(),
             KeyCode::Char('<' | ',') => self.sort = self.sort.prev(),
             KeyCode::Char('S') => self.sort_desc = !self.sort_desc,
-            KeyCode::Char('+' | '=') => self.step_poll(true),
+            KeyCode::Char('+') => self.step_poll(true),
             KeyCode::Char('-') => self.step_poll(false),
             KeyCode::Char('M') => self.mouse = !self.mouse,
             KeyCode::Char('w') => self.range = (self.range + 1) % RANGES.len(),
-            KeyCode::Char(':') => {
+            KeyCode::Char(c @ (':' | '=')) => {
                 self.recalled = 0;
-                self.input("legion".into(), Then::Command);
+                let typed = if c == '=' { "=" } else { "" };
+                self.prompt = Some(Prompt::Input {
+                    ask: COMMAND.into(),
+                    input: typed.into(),
+                    then: Then::Command,
+                });
             }
             KeyCode::Char(c @ ('H' | 'W' | 'C' | 'T' | 'U' | 'K')) => {
                 let ns = namespace_of(model, selected.as_ref());
@@ -865,7 +1367,7 @@ impl View {
     fn moved(&mut self, code: KeyCode, rows: usize) -> bool {
         let i = self.index();
         let (at, last) = match self.stack.last_mut().expect("the menu is never closed") {
-            Panel::Menu => (&mut self.option, TABS.len() - 1),
+            Panel::Menu => (&mut self.option, OPTIONS - 1),
             Panel::List { .. } => (&mut self.selected[i], rows.saturating_sub(1)),
             Panel::Detail { scroll, .. } => {
                 let Some(to) = step(usize::from(*scroll), DETAIL_LINES, code) else {
@@ -874,7 +1376,7 @@ impl View {
                 *scroll = to as u16;
                 return true;
             }
-            Panel::Pane => return false,
+            Panel::Graphs | Panel::Pane => return false,
         };
         match step(*at, last, code) {
             Some(to) => {
@@ -1156,7 +1658,12 @@ impl View {
 
     fn answer(&mut self, prompt: Prompt, k: KeyEvent) -> Option<Request> {
         match prompt {
-            Prompt::Confirm(request, _) if k.code == KeyCode::Char('y') => Some(request),
+            Prompt::Confirm(request, _) if k.code == KeyCode::Char('y') => {
+                if matches!(request, Request::Batch(_)) {
+                    self.marked.clear();
+                }
+                Some(request)
+            }
             Prompt::Confirm(..) => {
                 self.notice = Some("Cancelled.".into());
                 None
@@ -1256,6 +1763,13 @@ impl View {
             }),
             Then::Move { .. } => refuse(self, "Cancelled: no node given."),
             Then::Command => {
+                let ours = !input.trim_start().starts_with("legion ");
+                if ours && let Some(done) = self.top_command(&input) {
+                    if self.commands.last() != Some(&input) {
+                        self.commands.push(input);
+                    }
+                    return done;
+                }
                 let mut args = match split_words(&input) {
                     Ok(args) => args,
                     Err(e) => return refuse(self, &format!("Not run: {e}.")),
@@ -1322,9 +1836,9 @@ impl View {
     }
 
     /// Mouse clicks and scroll wheel: scroll YAML/logs/table, click tabs or rows.
-    pub fn mouse(&mut self, model: &Model, ev: MouseEvent, area: Rect) {
+    pub fn mouse(&mut self, model: &Model, ev: MouseEvent, area: Rect) -> Option<Request> {
         if !self.mouse || self.typing() || self.prompt.is_some() || self.help {
-            return;
+            return None;
         }
         if let Some((key, scroll)) = self.yaml.take()
             && model.get(&key).is_some()
@@ -1335,7 +1849,7 @@ impl View {
                 _ => scroll,
             };
             self.yaml = Some((key, scroll));
-            return;
+            return None;
         }
         match ev.kind {
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
@@ -1348,7 +1862,7 @@ impl View {
                     if let Some(s) = &mut self.shell {
                         s.scroll(n);
                     }
-                    return;
+                    return None;
                 }
                 let count = match self.panel() {
                     Panel::List { .. } => rows(model, self).len(),
@@ -1367,19 +1881,42 @@ impl View {
             // Point and shoot: a click selects, a click on what is
             // selected opens it.
             MouseEventKind::Down(MouseButton::Left) => {
+                // The action bar: a menu's name opens it, or closes it.
+                if ev.row == area.y {
+                    let hit = (0..BAR.len()).find(|&m| {
+                        ev.column >= bar_x(m) && ev.column < bar_x(m) + BAR[m].len() as u16 + 2
+                    });
+                    self.bar = match (hit, self.bar) {
+                        (Some(m), Some((open, _))) if m == open => None,
+                        (Some(m), _) => Some((m, 0)),
+                        (None, _) => None,
+                    };
+                    return None;
+                }
+                if let Some((menu, _)) = self.bar {
+                    let drop = self.pulldown_area(model, menu, area);
+                    if ev.column > drop.x
+                        && ev.column + 1 < drop.right()
+                        && ev.row > drop.y
+                        && ev.row + 1 < drop.bottom()
+                    {
+                        let at = usize::from(ev.row - drop.y - 1);
+                        return self.pick_item(model, menu, at);
+                    } else {
+                        self.bar = None;
+                    }
+                    return None;
+                }
                 let body = super::draw::body(self, area);
                 if ev.row <= body.y || ev.row + 1 >= body.bottom() {
-                    return;
+                    return None;
                 }
                 match self.panel() {
                     Panel::Menu => {
                         let at = usize::from(ev.row - body.y - 1);
-                        if at < TABS.len() {
+                        if at < OPTIONS {
                             if at == self.option {
-                                self.open(Panel::List {
-                                    tab: TABS[at],
-                                    focus: None,
-                                });
+                                self.open_option(at);
                             } else {
                                 self.option = at;
                             }
@@ -1389,7 +1926,7 @@ impl View {
                         // Under the border and the column titles.
                         let first = body.y + 2;
                         if ev.row < first {
-                            return;
+                            return None;
                         }
                         let rows = rows(model, self);
                         let i = self.index();
@@ -1398,7 +1935,7 @@ impl View {
                         let start = selected.saturating_sub(page.saturating_sub(1));
                         let at = start + usize::from(ev.row - first);
                         if at >= rows.len() {
-                            return;
+                            return None;
                         }
                         if at == selected {
                             if let Some(key) = rows.into_iter().nth(at).and_then(|r| r.key) {
@@ -1408,11 +1945,12 @@ impl View {
                             self.selected[i] = at;
                         }
                     }
-                    Panel::Detail { .. } | Panel::Pane => {}
+                    Panel::Detail { .. } | Panel::Graphs | Panel::Pane => {}
                 }
             }
             _ => {}
         }
+        None
     }
 }
 
