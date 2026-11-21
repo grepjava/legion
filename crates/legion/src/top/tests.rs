@@ -910,8 +910,8 @@ fn the_header_graphs_show_small_loads() {
     // The graph is scaled to its peak: a fifth, all, a half of it.
     assert!(cpu.contains("▁█▄"), "{cpu}");
     assert!(cpu.contains("peak 0.5"), "{cpu}");
-    // Under 2 % of what the nodes hold, steady use is a low line, not
-    // a full one.
+    // Memory is held: drawn against all the nodes hold, steady use is a
+    // low line, not a full one.
     assert!(mem.contains("▁▁▁") && mem.contains("peak 64Mi"), "{mem}");
 
     // An idle cluster's noise stays near the floor, not at full height.
@@ -1325,7 +1325,14 @@ fn a_poll_that_fails_says_so_until_it_reads_again() {
 
 #[test]
 fn braille_graphs_and_rgb_heat_gradients() {
-    let lines = draw::braille_lines(&[1.0, 2.0, 4.0, 8.0], 8.0, 4, 2, &draw::HEAT);
+    let lines = draw::braille_lines(
+        &[1.0, 2.0, 4.0, 8.0],
+        8.0,
+        4,
+        2,
+        &draw::HEAT,
+        draw::Scale::Peak,
+    );
     assert_eq!(lines.len(), 2);
     let rendered: String = lines
         .iter()
@@ -1346,9 +1353,22 @@ fn braille_graphs_and_rgb_heat_gradients() {
     assert_eq!(draw::heat_rgb(1.0), ratatui::style::Color::Rgb(240, 85, 85));
     // Shaded by height: the bottom row in the first colour, the top in
     // the last, however busy.
-    let lines = draw::braille_lines(&[8.0; 8], 8.0, 4, 4, &draw::HEAT);
+    let lines = draw::braille_lines(&[8.0; 8], 8.0, 4, 4, &draw::HEAT, draw::Scale::Peak);
     let colour = |row: usize| lines[row].spans[0].style.fg;
     assert_ne!(colour(0), colour(3));
+}
+
+#[test]
+fn what_is_held_is_graphed_against_the_whole() {
+    let blank = |l: &ratatui::text::Line| l.to_string().chars().all(|c| c == '\u{2800}');
+    // A steady 11 % of memory: drawn to the top against its peak, a
+    // tenth of the way up against the whole.
+    let steady = [11.0; 8];
+    let by_peak = draw::braille_lines(&steady, 100.0, 4, 4, &draw::HEAT, draw::Scale::Peak);
+    assert!(!blank(&by_peak[0]), "the top row filled");
+    let whole = draw::braille_lines(&steady, 100.0, 4, 4, &draw::HEAT, draw::Scale::Whole);
+    assert!(blank(&whole[0]) && blank(&whole[1]) && blank(&whole[2]));
+    assert!(!blank(&whole[3]), "the bottom row holds it");
 }
 
 #[test]

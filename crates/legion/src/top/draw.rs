@@ -210,6 +210,29 @@ pub(super) fn heat_rgb(frac: f64) -> Color {
     HEAT.at(frac)
 }
 
+/// What a graph's top stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Scale {
+    /// The highest point shown, not below 2 % of the whole: what moves
+    /// (CPU, network) shows its shape even when small, and noise on an
+    /// idle cluster stays flat.
+    Peak,
+    /// All there is: what is held (memory, ZFS space) shows how full,
+    /// not a steady line drawn to the top.
+    Whole,
+}
+
+impl Scale {
+    /// The value the graph's top stands for.
+    fn top(self, peak: f64, capacity: f64) -> f64 {
+        match self {
+            Scale::Whole if capacity > 0.0 => capacity,
+            _ => peak.max(capacity * 0.02),
+        }
+        .max(f64::MIN_POSITIVE)
+    }
+}
+
 /// Unicode `2×4` Braille area graph (`U+2800`..`U+28FF`) as in `btop`:
 /// `2 * width` horizontal data points × `4 * height` vertical sub-dots.
 pub(super) fn braille_lines(
@@ -218,6 +241,7 @@ pub(super) fn braille_lines(
     width: usize,
     height: usize,
     palette: &Palette,
+    scale: Scale,
 ) -> Vec<Line<'static>> {
     if width == 0 || height == 0 {
         return Vec::new();
@@ -227,7 +251,7 @@ pub(super) fn braille_lines(
     let pts_needed = width * 2;
     let tail = &samples[samples.len().saturating_sub(pts_needed)..];
     let peak = tail.iter().copied().fold(0.0, f64::max);
-    let scale = peak.max(capacity * 0.02).max(f64::MIN_POSITIVE);
+    let scale = scale.top(peak, capacity);
     let total_dots = height * 4;
     let pad = pts_needed.saturating_sub(tail.len());
     let sample_at = |idx: usize| -> f64 {
@@ -906,6 +930,7 @@ fn header(f: &mut Frame, model: &Model, view: &View, area: Rect) {
         &cpu_total,
         OK,
         whole,
+        Scale::Peak,
     );
     graph(
         f,
@@ -917,6 +942,7 @@ fn header(f: &mut Frame, model: &Model, view: &View, area: Rect) {
         &mem_total,
         ACCENT,
         whole,
+        Scale::Whole,
     );
 }
 
@@ -934,6 +960,7 @@ fn graph(
     total: &str,
     color: Color,
     whole: bool,
+    scale: Scale,
 ) {
     let now = samples.last().copied();
     let frac = match now {
@@ -967,12 +994,15 @@ fn graph(
     let fitted = fit(samples, spark.width as usize, whole);
     let shown = &fitted[fitted.len().saturating_sub(spark.width as usize)..];
     let peak = shown.iter().copied().fold(0.0, f64::max);
-    // Scaled to the peak, but not below 2 % of what the nodes hold:
-    // noise on an idle cluster stays flat.
-    let scale = peak.max(capacity * 0.02).max(f64::MIN_POSITIVE);
+    let scale = scale.top(peak, capacity);
     let data: Vec<u64> = shown
         .iter()
-        .map(|v| (v / scale * 64.0).round() as u64)
+        // Any use at all shows, if only as the lowest bar.
+        .map(|v| match (v / scale * 64.0).round() as u64 {
+            // An eighth of the height: the lowest bar drawn.
+            n if n < 8 && *v > 0.0 => 8,
+            n => n,
+        })
         .collect();
     f.render_widget(
         Sparkline::default()
@@ -1055,6 +1085,7 @@ fn summary(model: &Model) -> Vec<Line<'static>> {
 /// what it reads now.
 struct Card {
     palette: Palette,
+    scale: Scale,
     name: String,
     samples: Vec<f64>,
     capacity: f64,
@@ -1089,6 +1120,7 @@ fn cards(model: &Model, view: &View) -> [Card; 4] {
     [
         Card {
             palette: CPU,
+            scale: Scale::Peak,
             name: named("cpu"),
             readout: format!(
                 "{cpu_now:.1}/{} cores",
@@ -1103,6 +1135,7 @@ fn cards(model: &Model, view: &View) -> [Card; 4] {
         },
         Card {
             palette: MEM,
+            scale: Scale::Whole,
             name: named("mem"),
             readout: format!("{}/{}", bytes(mem_now), bytes(memory)),
             samples: mem,
@@ -1110,6 +1143,7 @@ fn cards(model: &Model, view: &View) -> [Card; 4] {
         },
         Card {
             palette: ZFS,
+            scale: Scale::Whole,
             name: named("zfs"),
             readout: if zfs_used + zfs_avail > 0 {
                 format!("{}/{}", bytes(zfs_used), bytes(zfs_used + zfs_avail))
@@ -1121,6 +1155,7 @@ fn cards(model: &Model, view: &View) -> [Card; 4] {
         },
         Card {
             palette: NET,
+            scale: Scale::Peak,
             name: named("net"),
             readout: format!("▼{} ▲{}", rate(net_rx), rate(net_tx)),
             samples: net,
@@ -1202,6 +1237,7 @@ pub(super) fn fit(samples: &[f64], points: usize, whole: bool) -> Vec<f64> {
 fn braille_card(f: &mut Frame, area: Rect, card: &Card, whole: bool) {
     let Card {
         palette,
+        scale,
         name,
         samples,
         capacity,
@@ -1246,6 +1282,7 @@ fn braille_card(f: &mut Frame, area: Rect, card: &Card, whole: bool) {
         inner.width as usize,
         inner.height as usize,
         palette,
+        *scale,
     );
     f.render_widget(Paragraph::new(lines), inner);
 }
