@@ -108,7 +108,7 @@
     display: block;
     height: 100%;
     border-radius: 4px;
-    background: var(--accent);
+    background: var(--primary);
   }
   .fill.wait {
     background: var(--wait);

@@ -1,5 +1,6 @@
 <script lang="ts">
   import Tabs from '#lib/Tabs.svelte';
+  import RowMenu from '#lib/RowMenu.svelte';
   import { ask } from '#lib/confirm.svelte.ts';
   // Docker-Desktop Jail Images & GHCR Packaging Hub:
   // 1) Cluster Node Images: cached OCI jail images across nodes, .tar export,
@@ -644,16 +645,16 @@
           <tbody>
             {#each imageTable.rows as img (`${img.node}:${img.reference}`)}
               <tr>
-                <td class="mono">
+                <td>
                   <strong>{img.reference}</strong>
                   {#if img.vm}<span class="tag">{t('bhyve VM')}</span>{/if}
                 </td>
-                <td class="mono">{img.node}</td>
-                <td class="mono">{img.os}/{img.arch}</td>
+                <td>{img.node}</td>
+                <td class="muted">{img.os}/{img.arch}</td>
                 <td>{img.layers}</td>
                 <td>
                   {#each img.used_by as who (who)}
-                    <div class="mono">{who}</div>
+                    <div>{who}</div>
                   {:else}
                     <span class="muted">{t('nothing')}</span>
                   {/each}
@@ -665,6 +666,17 @@
                   <button type="button" class="sm" onclick={() => showDetails(img)}>
                     {t('Details')}
                   </button>
+                  <button
+                    type="button"
+                    class="sm"
+                    onclick={() =>
+                      goto(
+                        `/deploy?namespace=${encodeURIComponent(workNs)}&image=${encodeURIComponent(img.reference)}`
+                      )}
+                  >
+                    {t('Deploy')}
+                  </button>
+                  <RowMenu label={t('More actions for {image} on {node}', { image: img.reference, node: img.node })}>
                   <button type="button" class="sm" onclick={() => scanImage(img)}>
                     {t('Scan')}
                   </button>
@@ -677,16 +689,6 @@
                   </a>
                   <button type="button" class="sm" onclick={() => openPushModal(img)}>
                     {t('Push to GHCR')}
-                  </button>
-                  <button
-                    type="button"
-                    class="sm"
-                    onclick={() =>
-                      goto(
-                        `/deploy?namespace=${encodeURIComponent(workNs)}&image=${encodeURIComponent(img.reference)}`
-                      )}
-                  >
-                    {t('Deploy')}
                   </button>
                   <button
                     type="button"
@@ -707,6 +709,7 @@
                   >
                     {t('Remove')}
                   </button>
+                  </RowMenu>
                 </td>
               </tr>
             {:else}

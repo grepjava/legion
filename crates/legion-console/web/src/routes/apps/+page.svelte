@@ -77,7 +77,7 @@
         <p class="about">{a.description}</p>
         <div class="app-foot">
           {#if a.web_url}<a href={a.web_url} target="_blank" rel="noopener noreferrer">{t('Its site')}</a>{/if}
-          <a class="button primary" href="/import?app={encodeURIComponent(a.id)}"
+          <a class="button" href="/import?app={encodeURIComponent(a.id)}"
             aria-label={t('Deploy {name}', { name: a.name || a.id })}>{t('Deploy')}</a
           >
         </div>

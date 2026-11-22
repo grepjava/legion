@@ -262,7 +262,7 @@
         {#if status && !status.leader}
           {t('No manager leads: the cluster takes no changes until a majority of managers reach each other.')}
         {:else if critical || warnings}
-          {t('{critical} critical and {warnings} warning alerts: see them below.', { critical, warnings })}
+          {t('{critical} critical and {warnings} warning alerts.', { critical, warnings })}
         {:else if notReady.length}
           {tn('1 node not ready.', '{n} nodes not ready.', notReady.length)}
         {:else}
@@ -290,24 +290,22 @@
       </dd>
     </div>
   </dl>
-</section>
-
-{#if session.alerts.length}
-  <section class="card alert-strip">
-    <h2><a href="/alerts">{t('Alerts')}</a></h2>
-    <ul class="plain">
+  {#if session.alerts.length}
+    <!-- What is wrong, under the word for it: the first five, the rest a
+         click away. -->
+    <ul class="plain health-alerts" aria-label={t('Alerts')}>
       {#each session.alerts.slice(0, 5) as a (a.kind + a.namespace + a.object)}
         <li>
           <span class="state {a.severity === 'critical' ? 'bad' : 'wait'}">{a.severity}</span>
           <a href={alertHref(a)}>{a.message}</a>
         </li>
       {/each}
+      {#if session.alerts.length > 5}
+        <li><a href="/alerts">{t('All {n}', { n: session.alerts.length })}</a></li>
+      {/if}
     </ul>
-    {#if session.alerts.length > 5}
-      <p><a href="/alerts">{t('All {n}', { n: session.alerts.length })}</a></p>
-    {/if}
-  </section>
-{/if}
+  {/if}
+</section>
 
 <!-- The cluster at a glance: a card for each thing it has, with the
      figure to read, what it means, a meter where it is a share, and where
@@ -646,9 +644,16 @@
 <Quotas namespace={session.namespace} />
 
 <style>
-  .alert-strip {
-    margin-bottom: 0.85rem;
-    border-color: var(--wait);
+  .health-alerts {
+    flex-basis: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--line);
+  }
+  .health-alerts .state {
+    margin: 0 0.5rem 0 0;
   }
   .node-head {
     display: flex;

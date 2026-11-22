@@ -1,4 +1,4 @@
-@import '@fontsource-variable/plus-jakarta-sans';
+@import '@fontsource-variable/inter';
 @import '@fontsource-variable/jetbrains-mono';
 
 /* FreeBSD Midnight Indigo & Crimson theme (from uploaded wallpaper), light & dark.
@@ -7,35 +7,41 @@
    WCAG 2.2 AA contrast (>= 4.5:1 text, >= 3:1 control borders),
    Forced Colors Mode borders, and modal <dialog> scroll containment. */
 :root {
-  --bg-light: #f4f5fa;
-  --bg-dark: #050512;
+  --bg-light: #f5f6fb;
+  --bg-dark: #0b0d1a;
   --panel-light: #ffffff;
-  --panel-dark: #0c0c22;
-  --side-light: #eaecf6;
-  --side-dark: #080818;
-  --surface2-light: #dfe2f0;
-  --surface2-dark: #151436;
-  --text-light: #101028;
-  --text-dark: #f2f4ff;
-  --muted-light: #4a4d6d;
-  --muted-dark: #9b9ec4;
-  --line-light: #c8cbe0;
-  --line-dark: #232152;
+  --panel-dark: #121528;
+  --side-light: #eef0f8;
+  --side-dark: #0e1020;
+  --surface2-light: #e9ecf6;
+  --surface2-dark: #1c2040;
+  --text-light: #151830;
+  --text-dark: #e8eaf8;
+  --muted-light: #535878;
+  --muted-dark: #a3a7c9;
+  --line-light: #dfe2ef;
+  --line-dark: #22264a;
   /* Borders of controls: >= 3:1 against the page & panel (WCAG 1.4.11). */
-  --control-light: #6b6e91;
-  --control-dark: #4b4894;
+  --control-light: #7c81a6;
+  --control-dark: #61689f;
+  /* Crimson: the brand's mark and danger only. */
   --accent-light: #c41c16;
-  --accent-dark: #ff5247;
+  --accent-dark: #ff5a52;
   --on-accent-light: #ffffff;
   --on-accent-dark: #140303;
-  --link-light: #2557d6;
-  --link-dark: #7aa2ff;
-  --good-light: #16794c;
-  --good-dark: #34d399;
-  --wait-light: #92400e;
-  --wait-dark: #fbbf24;
-  --bad-light: #c41c16;
-  --bad-dark: #ff6b6b;
+  /* Indigo: what to do (the main button, the current page and tab). */
+  --primary-light: #4a56d4;
+  --primary-dark: #5560e0;
+  --on-primary-light: #ffffff;
+  --on-primary-dark: #ffffff;
+  --link-light: #3846c9;
+  --link-dark: #9aa6ff;
+  --good-light: #127046;
+  --good-dark: #3fd49a;
+  --wait-light: #8a4b0c;
+  --wait-dark: #f4bd4a;
+  --bad-light: #c0262d;
+  --bad-dark: #ff7272;
   --zfs-light: #5b47b0;
   --zfs-dark: #a78bfa;
 
@@ -49,6 +55,8 @@
   --control: var(--control-light);
   --accent: var(--accent-light);
   --on-accent: var(--on-accent-light);
+  --primary: var(--primary-light);
+  --on-primary: var(--on-primary-light);
   --link: var(--link-light);
   --good: var(--good-light);
   --wait: var(--wait-light);
@@ -69,6 +77,8 @@
     --control: var(--control-dark);
     --accent: var(--accent-dark);
     --on-accent: var(--on-accent-dark);
+    --primary: var(--primary-dark);
+    --on-primary: var(--on-primary-dark);
     --link: var(--link-dark);
     --good: var(--good-dark);
     --wait: var(--wait-dark);
@@ -91,6 +101,10 @@
       --control: var(--control-dark);
       --accent: var(--accent-dark);
       --on-accent: var(--on-accent-dark);
+      --primary: var(--primary-dark);
+      --on-primary: var(--on-primary-dark);
+    --primary: var(--primary-dark);
+    --on-primary: var(--on-primary-dark);
       --link: var(--link-dark);
       --good: var(--good-dark);
       --wait: var(--wait-dark);
@@ -110,6 +124,8 @@
     --control: light-dark(var(--control-light), var(--control-dark));
     --accent: light-dark(var(--accent-light), var(--accent-dark));
     --on-accent: light-dark(var(--on-accent-light), var(--on-accent-dark));
+    --primary: light-dark(var(--primary-light), var(--primary-dark));
+    --on-primary: light-dark(var(--on-primary-light), var(--on-primary-dark));
     --link: light-dark(var(--link-light), var(--link-dark));
     --good: light-dark(var(--good-light), var(--good-dark));
     --wait: light-dark(var(--wait-light), var(--wait-dark));
@@ -117,21 +133,22 @@
     --zfs: light-dark(var(--zfs-light), var(--zfs-dark));
   }
 
-  accent-color: var(--accent);
+  accent-color: var(--primary);
   font-family:
-    'Plus Jakarta Sans Variable',
-    'Plus Jakarta Sans',
+    'Inter Variable',
+    'Inter',
     system-ui,
     -apple-system,
     'Segoe UI',
     sans-serif;
-  font-size: 15px;
+  font-size: 14px;
+  line-height: 1.5;
   color: var(--text);
   background: var(--bg);
 }
 
 html[data-density='compact'] {
-  font-size: 13.5px;
+  font-size: 13px;
 }
 
 * {
@@ -139,6 +156,12 @@ html[data-density='compact'] {
 }
 body {
   margin: 0;
+}
+/* Figures of one width where they stand in columns or change in place;
+   not everywhere, as Inter's also widens the hyphens in names. */
+.tile-value,
+.table-count,
+.chart-range {
   font-variant-numeric: tabular-nums;
 }
 a {
@@ -160,9 +183,9 @@ dd a {
   text-underline-offset: 2px;
 }
 h1 {
-  font-size: 1.35rem;
+  font-size: 1.45rem;
   font-weight: 700;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.02em;
   margin: 0 0 0.85rem;
 }
 h2 {
@@ -214,9 +237,9 @@ pre {
   padding: 0.5rem 1rem;
   background: var(--side);
   color: var(--text);
-  border-top: 3px solid var(--accent);
   border-bottom: 1px solid var(--line);
   font-size: 0.82rem;
+  min-height: 3rem;
 }
 .topbar select,
 .topbar button.sm,
@@ -301,15 +324,16 @@ pre {
   gap: 0.5rem;
   background: var(--panel);
   border: 1px solid var(--control);
-  border-radius: 6px;
-  padding: 0.24rem 0.6rem;
-  min-height: 26px;
+  border-radius: 8px;
+  padding: 0.3rem 0.65rem;
+  min-height: 30px;
+  min-width: 15rem;
   font-size: 0.82rem;
   color: var(--muted);
   cursor: pointer;
 }
 .cmd-trigger:hover {
-  border-color: var(--accent);
+  border-color: var(--link);
   color: var(--text);
 }
 .cmd-trigger kbd {
@@ -324,7 +348,7 @@ pre {
 
 .shell {
   display: grid;
-  grid-template-columns: 15.75rem 1fr;
+  grid-template-columns: 15rem 1fr;
   flex: 1;
   min-height: 0;
 }
@@ -332,10 +356,10 @@ aside {
   background: var(--side);
   color: var(--text);
   border-right: 1px solid var(--line);
-  padding: 0.95rem 0.75rem;
+  padding: 0.75rem 0.6rem;
   display: flex;
   flex-direction: column;
-  gap: 0.85rem;
+  gap: 0.6rem;
 }
 aside .ns {
   color: var(--muted);
@@ -350,7 +374,7 @@ aside .who {
   color: var(--muted);
 }
 aside button.link {
-  color: var(--accent);
+  color: var(--link);
 }
 .brand {
   font-weight: 700;
@@ -378,12 +402,24 @@ button {
   color: inherit;
   background: var(--panel);
   border: 1px solid var(--control);
-  border-radius: 5px;
-  padding: 0.28rem 0.55rem;
-  min-height: 26px;
+  border-radius: 7px;
+  padding: 0.3rem 0.6rem;
+  min-height: 30px;
+}
+input[type='checkbox'],
+input[type='radio'] {
+  min-height: 0;
+  padding: 0;
+  width: 1rem;
+  height: 1rem;
+  vertical-align: middle;
 }
 button {
   cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
 }
 html[data-density='compact'] select,
 html[data-density='compact'] input,
@@ -408,22 +444,25 @@ nav a {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  color: var(--text);
-  font-size: 0.96rem;
+  color: color-mix(in oklab, var(--text) 82%, var(--muted));
+  font-size: 0.9rem;
   font-weight: 500;
-  padding: 0.42rem 0.65rem;
-  border-radius: 6px;
-  border-left: 3px solid transparent;
-  min-height: 34px;
+  padding: 0.32rem 0.6rem;
+  border-radius: 7px;
+  min-height: 30px;
 }
 nav a:hover {
   background: var(--surface2);
+  color: var(--text);
   text-decoration: none;
 }
 nav a.here {
-  background: var(--surface2);
-  border-left-color: var(--accent);
+  background: color-mix(in oklab, var(--primary) 18%, transparent);
+  color: var(--text);
   font-weight: 600;
+}
+nav a.here .ico {
+  color: var(--link);
 }
 /* Icons (lib/Ico.svelte): line drawings in the colour of what holds them,
    muted until what holds them is hovered or current; never the accent,
@@ -474,7 +513,7 @@ a.button:has(> .ico) {
 button.link {
   border: none;
   background: none;
-  color: var(--accent);
+  color: var(--link);
   cursor: pointer;
   padding: 0 0.2rem;
   /* At least 24 by 24 px to hit (WCAG 2.5.8). */
@@ -530,7 +569,7 @@ button.link {
   color: var(--muted);
 }
 .nav-sec {
-  margin-top: 0.45rem;
+  margin-top: 0.3rem;
 }
 .nav-group {
   list-style: none;
@@ -538,12 +577,12 @@ button.link {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-size: 0.76rem;
-  font-weight: 700;
+  font-size: 0.72rem;
+  font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.07em;
   color: var(--muted);
-  padding: 0.36rem 0.5rem;
+  padding: 0.3rem 0.6rem;
   border-radius: 4px;
   user-select: none;
 }
@@ -565,7 +604,7 @@ textarea:focus-visible,
 button:focus-visible,
 summary:focus-visible,
 a:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--link);
   outline-offset: 1px;
 }
 fieldset {
@@ -580,7 +619,7 @@ fieldset legend {
   padding: 0 0.35rem;
 }
 main {
-  padding: 1.25rem 1.75rem;
+  padding: 1.5rem 2rem;
   min-width: 0;
   flex: 1;
 }
@@ -602,19 +641,21 @@ html[data-density='compact'] main {
 .table-scroll {
   overflow-x: auto;
   max-inline-size: 100%;
-  border-radius: 6px;
+  border-radius: 10px;
 }
 table {
   width: 100%;
-  border-collapse: collapse;
+  border-collapse: separate;
+  border-spacing: 0;
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 10px;
+  font-size: 0.92rem;
 }
 th,
 td {
   text-align: left;
-  padding: 0.45rem 0.7rem;
+  padding: 0.55rem 0.85rem;
   border-bottom: 1px solid var(--line);
   vertical-align: middle;
 }
@@ -623,12 +664,16 @@ html[data-density='compact'] td {
   padding: 0.28rem 0.55rem;
 }
 th {
-  font-size: 0.76rem;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  font-size: 0.8rem;
   color: var(--muted);
   font-weight: 600;
-  background: var(--surface2);
+  background: color-mix(in oklab, var(--surface2) 40%, var(--panel));
+}
+thead tr:first-child > :first-child {
+  border-top-left-radius: 10px;
+}
+thead tr:first-child > :last-child {
+  border-top-right-radius: 10px;
 }
 /* A header that names something (a row's object, a link to one) keeps
    the name as it is written: names are not headings. */
@@ -646,7 +691,7 @@ button.sort-btn {
   border: none;
   border-radius: 0;
   background: transparent;
-  padding: 0.45rem 0.7rem;
+  padding: 0.55rem 0.85rem;
   text-align: left;
   font: inherit;
   color: inherit;
@@ -657,7 +702,8 @@ button.sort-btn {
   gap: 0.3rem;
   min-height: 28px;
 }
-tr:last-child td {
+tr:last-child td,
+tr:last-child th {
   border-bottom: none;
 }
 tbody tr:hover td {
@@ -682,9 +728,9 @@ tbody tr:hover td {
 .card {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 1rem 1.15rem;
-  box-shadow: 0 1px 2px rgb(0 0 0 / 0.05);
+  border-radius: 12px;
+  padding: 1.1rem 1.25rem;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.06);
 }
 .wizard-steps {
   display: flex;
@@ -729,9 +775,9 @@ tbody tr:hover td {
   border: 1px solid var(--control);
 }
 .wizard-step.active .wizard-num {
-  background: var(--link);
-  border-color: var(--link);
-  color: light-dark(#ffffff, #06112e);
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--on-primary);
 }
 .wizard-step.done .wizard-num {
   background: var(--good);
@@ -778,9 +824,9 @@ tbody tr:hover td {
   min-height: 24px;
 }
 .pill.active {
-  background: var(--link);
-  border-color: var(--link);
-  color: light-dark(#ffffff, #06112e);
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--on-primary);
   font-weight: 600;
 }
 html[data-density='compact'] .card {
@@ -803,9 +849,10 @@ html[data-density='compact'] .card {
   gap: 0.25rem;
   font-size: 0.76rem;
   font-weight: 600;
-  padding: 0.06rem 0.48rem;
+  padding: 0.08rem 0.55rem;
   border-radius: 999px;
-  border: 1px solid currentColor;
+  border: 1px solid color-mix(in oklab, currentColor 45%, transparent);
+  background: color-mix(in oklab, currentColor 12%, transparent);
   margin: 0 0.25rem 0.2rem 0;
   white-space: nowrap;
 }
@@ -825,9 +872,11 @@ html[data-density='compact'] .card {
   display: inline-block;
   min-width: 1.25rem;
   margin-left: 0.3rem;
-  padding: 0 0.35rem;
+  padding: 0 0.4rem;
   border-radius: 999px;
-  border: 1px solid currentColor;
+  border: 1px solid color-mix(in oklab, currentColor 45%, transparent);
+  background: color-mix(in oklab, currentColor 14%, transparent);
+  font-weight: 600;
   font-size: 0.72rem;
   text-align: center;
 }
@@ -882,22 +931,22 @@ html[data-density='compact'] .card {
   padding: 2rem;
   background: var(--panel);
   border: 1px solid var(--line);
-  border-top: 3px solid var(--accent);
-  border-radius: 6px;
+  border-radius: 14px;
+  box-shadow: 0 10px 30px rgb(0 0 0 / 0.18);
 }
 
 /* Capacity & telemetry progress meters (with border for Forced Colors Mode) */
 .meter {
-  height: 7px;
+  height: 6px;
   width: 100%;
   background: var(--surface2);
-  border: 1px solid var(--line);
+  border: 1px solid transparent;
   border-radius: 999px;
   overflow: hidden;
 }
 .meter-fill {
   height: 100%;
-  background: var(--accent);
+  background: var(--primary);
   border-radius: 999px;
 }
 .meter-fill.good {
@@ -942,7 +991,7 @@ html[data-density='compact'] .card {
   content: '';
   position: absolute;
   inset: auto 0 0;
-  border-block-end: 2px solid var(--accent);
+  border-block-end: 2px solid var(--primary);
 }
 
 /* A search in a page's head is wide enough for what it asks for. */
@@ -1017,15 +1066,15 @@ a.button {
   display: inline-flex;
   align-items: center;
   border: 1px solid var(--control);
-  border-radius: 5px;
-  padding: 0.28rem 0.55rem;
-  min-height: 26px;
+  border-radius: 7px;
+  padding: 0.3rem 0.6rem;
+  min-height: 30px;
   background: var(--panel);
   color: inherit;
   text-decoration: none;
 }
 a.button:hover {
-  border-color: var(--accent);
+  border-color: var(--link);
   text-decoration: none;
 }
 button:disabled {
@@ -1034,9 +1083,9 @@ button:disabled {
 }
 button.primary,
 a.button.primary {
-  background: var(--link);
-  border-color: var(--link);
-  color: light-dark(#ffffff, #06112e);
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--on-primary);
   font-weight: 600;
 }
 button.danger {
@@ -1152,7 +1201,7 @@ dialog::backdrop {
 .workbench-resizer:hover,
 .workbench-resizer:focus-visible,
 .workbench.resizing .workbench-resizer {
-  background: color-mix(in srgb, var(--accent) 18%, var(--surface2));
+  background: color-mix(in srgb, var(--primary) 18%, var(--surface2));
   outline: none;
 }
 .workbench-grip {
@@ -1166,7 +1215,7 @@ dialog::backdrop {
 .workbench-resizer:hover .workbench-grip,
 .workbench-resizer:focus-visible .workbench-grip,
 .workbench.resizing .workbench-grip {
-  background: var(--accent);
+  background: var(--primary);
   opacity: 1;
 }
 .workbench-bar {
@@ -1216,9 +1265,9 @@ dialog::backdrop {
 }
 
 /* Keyboard use (WCAG 2.4.7, 2.4.13): a ring wherever focus lands, in the
-   accent, which keeps 3:1 or more against the page in either theme. */
+   indigo link colour, which keeps 3:1 or more against the page in either theme. */
 :focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--link);
   outline-offset: 2px;
 }
 .tabs button:focus-visible {
@@ -1261,7 +1310,7 @@ dialog::backdrop {
   z-index: 30;
   padding: 0.5rem 0.75rem;
   background: var(--panel);
-  border: 2px solid var(--accent);
+  border: 2px solid var(--primary);
   border-radius: 4px;
 }
 
@@ -1367,10 +1416,10 @@ button.unpin:focus-visible {
   opacity: 0.45;
 }
 .sort-over {
-  box-shadow: inset 0 2px 0 var(--accent);
+  box-shadow: inset 0 2px 0 var(--primary);
 }
 .wb-tabs .sort-over {
-  box-shadow: inset 2px 0 0 var(--accent);
+  box-shadow: inset 2px 0 0 var(--primary);
 }
 
 /* Files dropped on a field (drop.svelte.ts's droppable). */
@@ -1391,8 +1440,8 @@ button.unpin:focus-visible {
   color: var(--muted);
 }
 .drop-over {
-  border-color: var(--accent) !important;
-  background-color: color-mix(in srgb, var(--accent) 9%, transparent) !important;
+  border-color: var(--primary) !important;
+  background-color: color-mix(in srgb, var(--primary) 9%, transparent) !important;
 }
 .drop-taken {
   border-color: var(--good) !important;
@@ -1428,7 +1477,7 @@ button.unpin:focus-visible {
 .drop-hint {
   top: 4.2rem;
   border-style: dashed;
-  border-color: var(--accent);
+  border-color: var(--primary);
   pointer-events: none;
 }
 .toast {
@@ -1548,7 +1597,7 @@ button[aria-busy='true']::after {
    means (and what to do) under it, and a meter where it is a share. */
 .tiles {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(max(14rem, calc((100% - 3 * 0.75rem) / 4)), 1fr));
   gap: 0.75rem;
   margin-bottom: 0.85rem;
 }
@@ -1558,8 +1607,12 @@ button[aria-busy='true']::after {
   gap: 0.3rem;
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 0.9rem 1rem;
+  border-radius: 12px;
+  padding: 1rem 1.15rem;
+  transition: border-color 120ms ease;
+}
+.tile:hover {
+  border-color: color-mix(in oklab, var(--control) 60%, var(--line));
 }
 .tile-head {
   display: flex;
@@ -1579,8 +1632,9 @@ button[aria-busy='true']::after {
   display: flex;
   align-items: center;
   margin: 0.1rem 0 0;
-  font-size: 1.45rem;
+  font-size: 1.55rem;
   font-weight: 700;
+  letter-spacing: -0.02em;
   line-height: 1.2;
 }
 .tile-note {
@@ -1938,7 +1992,7 @@ table {
   background: var(--surface2);
   color: var(--text);
   font-weight: 600;
-  box-shadow: inset 0 -2px 0 var(--accent);
+  box-shadow: inset 0 -2px 0 var(--primary);
 }
 
 /* A section's head: its title, and what acts on all of it to the right. */
@@ -1988,4 +2042,56 @@ table {
     outline: 2px solid Highlight;
     outline-offset: -2px;
   }
+}
+
+/* The namespace looked at, in the top bar beside the cluster's name. */
+.ns-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding-left: 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.ns-picker:hover {
+  border-color: var(--control);
+}
+.ns-picker:focus-within {
+  outline: 2px solid var(--link);
+  outline-offset: 1px;
+}
+.topbar .ns-picker select {
+  border: none;
+  background: transparent;
+  font-weight: 600;
+  padding-left: 0.1rem;
+  min-height: 28px;
+  max-width: 14rem;
+}
+.topbar .ns-picker select:focus-visible {
+  outline: none;
+}
+
+/* An object's details: its facts in a card, the names in a column of
+   their own. */
+.facts.details-card {
+  gap: 0.6rem 2rem;
+  margin: 0 0 1.25rem;
+}
+.facts.details-card dt {
+  font-size: 0.86rem;
+}
+.facts.details-card dd {
+  font-weight: 500;
+}
+
+/* A table's cell of buttons stays a cell, so its row's rule runs straight
+   under it; its buttons are spaced as a row's controls are. */
+td.controls {
+  display: table-cell;
+}
+td.controls > * {
+  margin: 0.15rem 0.4rem 0.15rem 0;
+  vertical-align: middle;
 }

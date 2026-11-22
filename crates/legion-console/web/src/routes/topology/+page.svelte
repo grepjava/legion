@@ -483,6 +483,14 @@
     s.status
       ? t('{ready}/{desired} ready', { ready: s.status.ready ?? 0, desired: s.status.desired ?? 0 })
       : t('not yet placed');
+  // What a route, a published port and a task show on their second line,
+  // and so what their links are named by first.
+  const routeAddress = (r: LObject) => `${r.spec?.host ?? ''}${r.spec?.path && r.spec.path !== '/' ? r.spec.path : ''}`;
+  const portShown = (p: Published) => `${p.at === null ? p.what : `:${p.at}`} → ${p.what.split('/')[0]}`;
+  const taskLine = (tk: LObject) =>
+    `${isVmSvc(tk) ? 'bhyve' : 'jail'} · ${tk.status?.paused ? 'paused' : (tk.status?.ip ?? tk.status?.state ?? '')}${
+      byNode ? '' : ` · ${tk.spec?.node ?? ''}`
+    }`;
   const ports = (e: ReachEdge) =>
     e.all_ports ? t('all ports') : e.ports.map((p) => `${p.port}/${p.protocol}`).join(', ');
   const link = (kind: string, name: string) => `/k/${kind}/${namespace}/${name}`;
@@ -664,21 +672,29 @@
               <!-- Its node's colour, as on its pods grouped by service. -->
               <circle class="node-tag {nodeHue(b.node)}" cx={BAND_X + 16} cy={b.top + 14} r="4.5" />
             {/if}
-            <text class="band-title" x={BAND_X + (b.node ? 26 : 12)} y={b.top + 18}>{b.node || t('not placed yet')}</text>
-            {#if nodeNote(b.node)}
-              <text class="sub band-note {nh}" x={BAND_X + BAND_W - 12} y={b.top + 18} text-anchor="end">{nodeNote(b.node)}</text>
-            {/if}
-            {#if !b.tasks.length}
-              <text class="sub" x={X_TASK + 4} y={b.top + BAND_HEAD + TASK_STEP / 2 + 4}>{t('no pods of this namespace')}</text>
-            {/if}
+            <!-- One text, its lines spaced, so what it shows reads as words
+                 its link's name holds (WCAG 2.5.3). -->
+            <text
+              ><tspan class="band-title" x={BAND_X + (b.node ? 26 : 12)} y={b.top + 18}>{b.node || t('not placed yet')}</tspan
+              >{#if nodeNote(b.node)}{' '}<tspan
+                  class="sub band-note {nh}"
+                  x={BAND_X + BAND_W - 12}
+                  y={b.top + 18}
+                  text-anchor="end">{nodeNote(b.node)}</tspan
+                >{/if}{#if !b.tasks.length}{' '}<tspan class="sub" x={X_TASK + 4} y={b.top + BAND_HEAD + TASK_STEP / 2 + 4}
+                  >{t('no pods of this namespace')}</tspan
+                >{/if}</text
+            >
           {/snippet}
           {#each bands as b (b.node)}
             {#if b.node}
               <a
                 href="/k/Node/_/{b.node}"
-                aria-label={t('Node {name}: {note}', {
-                  name: b.node,
-                  note: nodeNote(b.node) || tn('1 pod', '{n} pods', b.tasks.length)
+                aria-label={t('Node {shown}, {pods}', {
+                  shown: [b.node, nodeNote(b.node), b.tasks.length ? '' : t('no pods of this namespace')]
+                    .filter((x) => x)
+                    .join(' '),
+                  pods: tn('1 pod', '{n} pods', b.tasks.length)
                 })}
               >
                 {@render band(b)}
@@ -779,10 +795,9 @@
           {#each shownRoutes as r, i (r.metadata.name)}
             <a
               href={link('Route', r.metadata.name)}
-              aria-label={t('Route {name}: {host}{path} to {service}', {
-                name: r.metadata.name,
-                host: r.spec.host ?? '',
-                path: r.spec.path ?? '',
+              aria-label={t('{address} {route}, to {service}', {
+                address: routeAddress(r),
+                route: t('Route {name}', { name: r.metadata.name }),
                 service: r.spec.service
               })}
             >
@@ -791,8 +806,13 @@
               <circle cx={X_ROUTE + 18} cy={y(i)} r="5.5" class="icon-stroke" />
               <line x1={X_ROUTE + 12.5} y1={y(i)} x2={X_ROUTE + 23.5} y2={y(i)} class="icon-stroke" />
               <ellipse cx={X_ROUTE + 18} cy={y(i)} rx="2.6" ry="5.5" class="icon-stroke" />
-              <text x={X_ROUTE + 34} y={y(i) - 3}>{r.spec.host}{r.spec.path && r.spec.path !== '/' ? r.spec.path : ''}</text>
-              <text class="sub" x={X_ROUTE + 34} y={y(i) + 12}>{t('Route {name}', { name: r.metadata.name })}</text>
+              <text
+                ><tspan x={X_ROUTE + 34} y={y(i) - 3}>{routeAddress(r)}</tspan>{' '}<tspan
+                  class="sub"
+                  x={X_ROUTE + 34}
+                  y={y(i) + 12}>{t('Route {name}', { name: r.metadata.name })}</tspan
+                ></text
+              >
             </a>
           {/each}
           <!-- Published ports: a plug icon, the port and where it is answered. -->
@@ -801,8 +821,8 @@
             {@const where = p.at === null ? t('not published yet') : p.host ? t('on nodes running it') : t('on every node')}
             <a
               href={link('Service', p.service)}
-              aria-label={t('Port {port} published to {service}, {where}', {
-                port: p.at ?? p.what,
+              aria-label={t('Port {shown} {where}, to {service}', {
+                shown: portShown(p),
                 service: p.service,
                 where
               })}
@@ -813,8 +833,11 @@
               <line x1={X_ROUTE + 16} y1={py - 7} x2={X_ROUTE + 16} y2={py - 4} class="icon-stroke" />
               <line x1={X_ROUTE + 20} y1={py - 7} x2={X_ROUTE + 20} y2={py - 4} class="icon-stroke" />
               <line x1={X_ROUTE + 18} y1={py + 3} x2={X_ROUTE + 18} y2={py + 7} class="icon-stroke" />
-              <text x={X_ROUTE + 34} y={py - 3}>{p.at === null ? p.what : `:${p.at}`} → {p.what.split('/')[0]}</text>
-              <text class="sub" x={X_ROUTE + 34} y={py + 12}>{where}</text>
+              <text
+                ><tspan x={X_ROUTE + 34} y={py - 3}>{portShown(p)}</tspan>{' '}<tspan class="sub" x={X_ROUTE + 34} y={py + 12}
+                  >{where}</tspan
+                ></text
+              >
             </a>
           {/each}
           {#if showSeen ? seenIn.length : outside.length}
@@ -832,7 +855,7 @@
             {@const pList = svcPorts(s)}
             <a
               href={link('Service', s.metadata.name)}
-              aria-label={t('Service {name}: {note}', {
+              aria-label={t('Service {name} {note}', {
                 name: `${s.metadata.name}${pList.length ? ` :${pList[0]}` : ''}`,
                 note: svcNote(s)
               })}
@@ -859,7 +882,8 @@
                   style:fill="light-dark({logo.light}, {logo.dark})"
                   d={logo.path}
                   transform="translate({X_SVC_CX - 11} {cy - 11}) scale({22 / 24})"
-                ><title>{logo.title}</title></path>
+                aria-hidden="true"
+              ></path>
               {:else if db}
                 <!-- Database cylinder icon -->
                 <ellipse cx={X_SVC_CX} cy={cy - 7} rx="9" ry="3.5" class="icon-stroke" />
@@ -878,10 +902,11 @@
               <rect x={X_SVC_CX + 18} y={cy - 32} width="14" height="14" rx="7" class="badge-pill {h}" />
 
               <!-- Service label & ports -->
-              <text class="svc-title" x={X_SVC_CX} y={cy + SVC_R + 18} text-anchor="middle">
-                {s.metadata.name}{pList.length ? ` :${pList[0]}` : ''}
-              </text>
-              <text class="sub" x={X_SVC_CX} y={cy + SVC_R + 33} text-anchor="middle">{svcNote(s)}</text>
+              <text text-anchor="middle"
+                ><tspan class="svc-title" x={X_SVC_CX} y={cy + SVC_R + 18}
+                  >{s.metadata.name}{pList.length ? ` :${pList[0]}` : ''}</tspan
+                >{' '}<tspan class="sub" x={X_SVC_CX} y={cy + SVC_R + 33}>{svcNote(s)}</tspan></text
+              >
             </a>
           {/each}
 
@@ -893,10 +918,10 @@
             {@const node = tk.spec?.node ?? ''}
             <a
               href={link('Task', tk.metadata.name)}
-              aria-label={t('Task {name} on {node}: {state}', {
-                name: tk.metadata.name,
-                node: node || t('no node yet'),
-                state: tk.status?.paused ? 'paused' : (tk.status?.state ?? 'unknown')
+              aria-label={t('Task {shown}, {state}, on {node}', {
+                shown: `${tk.metadata.name} ${taskLine(tk)}`,
+                state: tk.status?.paused ? 'paused' : (tk.status?.state ?? 'unknown'),
+                node: node || t('no node yet')
               })}
             >
               <rect class="box task {th}" x={X_TASK} y={ty - TASK_H / 2} width={TASK_W} height={TASK_H} rx="8" />
@@ -905,10 +930,13 @@
                 <rect class="node-tag {nodeHue(node)}" x={X_TASK + 1} y={ty - TASK_H / 2 + 6} width="4" height={TASK_H - 12} rx="2" />
               {/if}
               <circle cx={X_TASK + 16} cy={ty} r="5" class="dot-status {th}" />
-              <text x={X_TASK + 28} y={ty - 3}>{tk.metadata.name}</text>
-              <text class="sub" x={X_TASK + 28} y={ty + 12}>
-                {vm ? 'bhyve' : 'jail'} · {tk.status?.paused ? 'paused' : (tk.status?.ip ?? tk.status?.state ?? '')}{byNode ? '' : ` · ${node}`}
-              </text>
+              <text
+                ><tspan x={X_TASK + 28} y={ty - 3}>{tk.metadata.name}</tspan>{' '}<tspan
+                  class="sub"
+                  x={X_TASK + 28}
+                  y={ty + 12}>{taskLine(tk)}</tspan
+                ></text
+              >
             </a>
           {/each}
 
@@ -922,8 +950,11 @@
               {/if}
               <ellipse cx={X_VOL + 18} cy={y(i) - 5} rx="7" ry="2.8" class="icon-stroke" />
               <path d="M {X_VOL + 11} {y(i) - 5} v 10 c 0 1.6 3.1 2.8 7 2.8 s 7 -1.2 7 -2.8 v -10" class="icon-stroke" />
-              <text x={X_VOL + 32} y={y(i) - 3}>{v}</text>
-              <text class="sub" x={X_VOL + 32} y={y(i) + 12}>{volumeNote(v)}</text>
+              <text
+                ><tspan x={X_VOL + 32} y={y(i) - 3}>{v}</tspan>{' '}<tspan class="sub" x={X_VOL + 32} y={y(i) + 12}
+                  >{volumeNote(v)}</tspan
+                ></text
+              >
             </a>
           {/each}
         </svg>
@@ -1101,9 +1132,9 @@
     stroke-dasharray: 4 3;
   }
   .canvas-card .controls button.primary {
-    background: var(--link);
-    border-color: var(--link);
-    color: light-dark(#ffffff, #06112e);
+    background: var(--primary);
+    border-color: var(--primary);
+    color: var(--on-primary);
   }
   .svc-ring {
     fill: var(--panel);
@@ -1275,11 +1306,15 @@
     font-size: 12px;
     font-weight: 700;
   }
-  text.band-note.bad {
+  .sub {
+    fill: var(--muted);
+    font-size: 11px;
+  }
+  .band-note.bad {
     fill: var(--bad);
     font-weight: 700;
   }
-  text.band-note.wait {
+  .band-note.wait {
     fill: var(--wait);
   }
   .topo-legend {
@@ -1330,10 +1365,6 @@
   text {
     fill: var(--text);
     font-size: 13px;
-  }
-  text.sub {
-    fill: var(--muted);
-    font-size: 11px;
   }
   .edge {
     stroke: var(--muted);

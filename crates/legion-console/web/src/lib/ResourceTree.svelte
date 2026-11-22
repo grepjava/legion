@@ -277,7 +277,7 @@
     background: var(--surface2);
   }
   .row.here {
-    box-shadow: inset 3px 0 0 var(--accent);
+    box-shadow: inset 3px 0 0 var(--primary);
   }
   [role='treeitem']:focus-visible > .row {
     outline: 2px solid var(--link);

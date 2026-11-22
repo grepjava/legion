@@ -624,6 +624,17 @@
         {/if}
       </a>
 
+      <label class="ns-picker">
+        <Ico icon={kindIcon('Namespace')} size={15} />
+        <span class="sr-only">{t('Namespace')}</span>
+        <select bind:value={session.namespace} title={t('Namespace')}>
+          <option value="">{t('All I can see')}</option>
+          {#each choices as ns (ns)}
+            <option value={ns}>{ns}</option>
+          {/each}
+        </select>
+      </label>
+
       {#if raftStatus}
         <span
           class="telemetry-pill"
@@ -696,15 +707,6 @@
 
     <div class="shell" class:side-hidden={!sideShown} class:narrow-open={narrow && sideShown}>
       <aside id="side" hidden={!sideShown}>
-        <label class="ns">
-          {t('Namespace')}
-          <select bind:value={session.namespace}>
-            <option value="">{t('All I can see')}</option>
-            {#each choices as ns (ns)}
-              <option value={ns}>{ns}</option>
-            {/each}
-          </select>
-        </label>
         <input
           bind:this={navSearch}
           class="nav-search"

@@ -280,7 +280,7 @@ spec: { text: team-b's }
     // --- Phase 1 -------------------------------------------------------
     step("phase 1: the viewer signs in and sees only team-a");
     let mut v = c.sign_in("vera", &vera);
-    let choices = v.eval("[...document.querySelectorAll('label.ns option')].map((o) => o.value)");
+    let choices = v.eval("[...document.querySelectorAll('label.ns-picker option')].map((o) => o.value)");
     assert_eq!(
         choices,
         serde_json::json!(["", "team-a"]),
@@ -667,7 +667,7 @@ spec:
         b.eval(
             "['formed', 'sleeper', 'hello'].every((s) =>
                // Named for what it shows: its name, its port if it has one.
-               document.querySelector(`[aria-label^=\"Service ${s}:\"] rect, [aria-label^=\"Service ${s} :\"] rect`)?.classList.contains('good'))
+               document.querySelector(`[aria-label^=\"Service ${s} \"] rect`)?.classList.contains('good'))
              && !!document.querySelector('[aria-label^=\"Volume \"]')",
         ) == serde_json::json!(true)
     });
@@ -678,9 +678,9 @@ spec:
     let grouped = "(() => {
         const box = (a) => a.querySelector('rect').getBBox();
         const bands = new Map([...document.querySelectorAll('a[aria-label^=\"Node \"]')]
-          .map((a) => [/^Node (\\S+):/.exec(a.getAttribute('aria-label'))[1], box(a)]));
+          .map((a) => [/^Node (\\S+)[ ,]/.exec(a.getAttribute('aria-label'))[1], box(a)]));
         const pods = [...document.querySelectorAll('a[aria-label^=\"Task \"]')].map((a) =>
-          [/^Task \\S+ on (\\S+):/.exec(a.getAttribute('aria-label'))?.[1], box(a)]);
+          [/, on (\\S+)$/.exec(a.getAttribute('aria-label'))?.[1], box(a)]);
         const inside = pods.every(([n, r]) => {
           const b = bands.get(n);
           return b && r.y >= b.y && r.y + r.height <= b.y + b.height;
@@ -1717,7 +1717,7 @@ fn the_console_builds_an_example() {
     e.click("Show");
     e.until("web green in the topology", 60, |b| {
         b.eval(
-            "document.querySelector('[aria-label^=\"Service web:\"] rect, [aria-label^=\"Service web :\"] rect')?.classList.contains('good') ?? false",
+            "document.querySelector('[aria-label^=\"Service web \"] rect')?.classList.contains('good') ?? false",
         ) == serde_json::json!(true)
     });
     // Asked from a VM: pf redirects what comes in, not the host's own.

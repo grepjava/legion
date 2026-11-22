@@ -140,7 +140,7 @@
     border-radius: 4px;
   }
   svg:focus-visible {
-    outline: 2px solid var(--accent);
+    outline: 2px solid var(--link);
     outline-offset: 2px;
   }
   .spark {
@@ -154,7 +154,7 @@
   }
   .window {
     fill: none;
-    stroke: var(--accent);
+    stroke: var(--link);
     stroke-width: 1.5;
   }
   .said {

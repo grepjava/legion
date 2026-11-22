@@ -6,6 +6,11 @@ export interface Column {
   value: (o: LObject) => string;
   /** A state, shown with its colour. */
   state?: boolean;
+  /** A figure shown as a state is, in the colour this gives it (a
+   * Service's "1/1" in its state's). */
+  tone?: (o: LObject) => string;
+  /** Detail that reads as secondary: an image, a reference. */
+  quiet?: boolean;
   /** Where the value leads, when it names another object: a node. */
   href?: (o: LObject) => string;
 }
@@ -90,6 +95,7 @@ export function columns(kind: string): Column[] {
         { label: t('Replicas'), value: (o) => s(o.spec?.replicas) },
         {
           label: t('Image'),
+          quiet: true,
           // A tag that names another image now than the one running says
           // so, and a Linux image (run through FreeBSD's Linux ABI) too.
           value: (o) =>
@@ -115,7 +121,8 @@ export function columns(kind: string): Column[] {
                 ? t('paused {n}/{of}', { n: o.status?.paused ?? 0, of: o.status?.running ?? 0 })
                 : o.status
                 ? `${o.status.ready ?? 0}/${o.status.desired ?? 0}`
-                : ''
+                : '',
+          tone: (o) => tone(serviceState(o))
         },
         {
           label: t('Address'),
@@ -168,7 +175,7 @@ export function columns(kind: string): Column[] {
       ];
     case 'ImagePolicy':
       return [
-        { label: t('Images'), value: (o) => s(o.spec?.images?.join(', ')) },
+        { label: t('Images'), value: (o) => s(o.spec?.images?.join(', ')), quiet: true },
         { label: t('Keys'), value: (o) => s(o.spec?.keys?.length ?? 0) },
         { label: t('Mode'), value: (o) => s(o.spec?.mode ?? 'enforce') },
         {
@@ -221,7 +228,7 @@ export function columns(kind: string): Column[] {
     case 'Build':
       return [
         { label: t('Phase'), value: (o) => s(o.status?.phase ?? 'Pending'), state: true },
-        { label: t('Image'), value: (o) => s(o.spec?.image) },
+        { label: t('Image'), value: (o) => s(o.spec?.image), quiet: true },
         {
           label: t('Source'),
           value: (o) => s(o.spec?.source?.git?.url ?? (o.spec?.source?.containerfile ? t('Containerfile') : ''))

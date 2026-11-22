@@ -274,12 +274,13 @@
         </p>
       </div>
     {/if}
-    <dl class="facts">
+    <dl class="facts card details-card">
       {#each cols as c (c.label)}
         {#if c.value(object)}
           <dt>{c.label}</dt>
           <dd>
             {#if c.state}<span class="state {tone(c.value(object))}">{c.value(object)}</span>
+            {:else if c.tone}<span class="state {c.tone(object)}">{c.value(object)}</span>
             {:else if c.href?.(object)}<a href={c.href(object)}>{c.value(object)}</a>
             {:else}{c.value(object)}{/if}
           </dd>

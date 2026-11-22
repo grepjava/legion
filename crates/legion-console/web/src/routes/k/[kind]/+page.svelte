@@ -248,13 +248,18 @@
           </td>
           {#if !scoped}<td>{o.metadata.namespace}</td>{/if}
           {#each cols as c (c.label)}
-            <td>
-              {#if c.state}
-                <span class="state {tone(c.value(o))}">{c.value(o)}</span>
+            {@const v = c.value(o)}
+            <td class:quiet={c.quiet}>
+              {#if v === ''}
+                <span class="muted" aria-hidden="true">—</span>
+              {:else if c.state}
+                <span class="state {tone(v)}">{v}</span>
+              {:else if c.tone}
+                <span class="state {c.tone(o)}">{v}</span>
               {:else if c.href?.(o)}
-                <a href={c.href(o)}>{c.value(o)}</a>
+                <a href={c.href(o)}>{v}</a>
               {:else}
-                {c.value(o)}
+                {v}
               {/if}
             </td>
           {/each}
@@ -295,11 +300,17 @@
     gap: 0.6rem;
     flex-wrap: wrap;
     min-height: 2.4rem;
-    margin: 0 0 0.6rem;
-    padding: 0.35rem 0.5rem;
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    background: var(--panel);
+    margin: 0 0 0.75rem;
+  }
+  td.quiet {
+    color: var(--muted);
+  }
+  .name-cell a {
+    color: var(--text);
+    font-weight: 600;
+  }
+  .name-cell a:hover {
+    color: var(--link);
   }
   .toolbar input[type='search'] {
     min-width: 16rem;

@@ -53,7 +53,7 @@
         ? 'var(--zfs)'
         : tone === 'wait'
           ? 'var(--wait)'
-          : 'var(--accent)'
+          : 'var(--link)'
   );
 
   const second = $derived(also?.points ?? []);
@@ -270,7 +270,7 @@
         class="sm chart-tool"
         title={t('Download the samples as CSV')}
         aria-label={t('Download {title} as CSV', { title })}
-        onclick={downloadCsv}><Ico icon={Download} size={14} />CSV</button
+        onclick={downloadCsv}><Ico icon={Download} size={15} /></button
       >
       <button
         type="button"
@@ -278,7 +278,7 @@
         title={t('Download the chart as a PNG image')}
         aria-label={t('Download {title} as PNG', { title })}
         disabled={points.length < 2 || saving}
-        onclick={downloadPng}><Ico icon={ImageDown} size={14} />PNG</button
+        onclick={downloadPng}><Ico icon={ImageDown} size={15} /></button
       >
     {/if}
   </figcaption>
@@ -392,6 +392,26 @@
     grid-column: 2;
     grid-row: 1;
     align-self: center;
+    border-color: transparent;
+    background: transparent;
+    padding: 0.2rem;
+    min-width: 26px;
+    justify-content: center;
+    opacity: 0.6;
+  }
+  /* Taking the data away is there when wanted, quiet otherwise. */
+  .chart:hover .chart-tool,
+  .chart:focus-within .chart-tool {
+    opacity: 1;
+  }
+  .chart-tool:hover:not(:disabled) {
+    background: var(--surface2);
+    border-color: var(--line);
+  }
+  @media (hover: none) {
+    .chart-tool {
+      opacity: 1;
+    }
   }
   .chart-tool.png {
     grid-column: 3;
@@ -409,10 +429,13 @@
   figcaption {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto auto;
-    gap: 0.1rem 0.65rem;
+    gap: 0.1rem 0.25rem;
     align-items: baseline;
-    margin-bottom: 0.2rem;
+    margin-bottom: 0.35rem;
     font-size: 0.85rem;
+  }
+  figcaption > strong {
+    font-size: 0.95rem;
   }
   svg {
     display: block;
@@ -420,7 +443,15 @@
   }
   .values {
     margin-top: 0.2rem;
-    font-size: 0.8rem;
+    font-size: 0.78rem;
+    color: var(--muted);
+  }
+  .values > summary {
+    cursor: pointer;
+    width: fit-content;
+  }
+  .values > summary:hover {
+    color: var(--text);
   }
   .values .scroll {
     max-height: 14rem;
@@ -433,10 +464,11 @@
   .axis {
     fill: var(--muted);
     font-size: 11px;
+    font-variant-numeric: tabular-nums;
   }
   .line {
     fill: none;
-    stroke: var(--chart-color, var(--accent));
+    stroke: var(--chart-color, var(--link));
     stroke-width: 2;
     stroke-linejoin: round;
     stroke-linecap: round;
@@ -448,7 +480,7 @@
   }
   .dot.second {
     fill: var(--panel);
-    stroke: var(--chart-color, var(--accent));
+    stroke: var(--chart-color, var(--link));
   }
   .key {
     grid-column: 1 / -1;
@@ -472,7 +504,7 @@
     stroke-dasharray: 3 3;
   }
   .dot {
-    fill: var(--chart-color, var(--accent));
+    fill: var(--chart-color, var(--link));
     stroke: var(--panel);
     stroke-width: 2;
   }
