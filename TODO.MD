@@ -11,7 +11,7 @@ In order of priority:
 
 1. [Scheduled Volume snapshots and backups](#1-scheduled-volume-snapshots-and-backups)
 2. [Moving a Volume while it runs](#2-moving-a-volume-while-it-runs): checked, already built
-3. [Setting up pf for Legion](#3-setting-up-pf-for-legion)
+3. [Setting up pf for Legion](#3-setting-up-pf-for-legion): built
 4. [Console sign-in with host accounts and passkeys](#4-console-sign-in-with-host-accounts-and-passkeys)
 5. [Ready-to-deploy applications](#5-ready-to-deploy-applications)
 6. [Console polish](#6-console-polish)
@@ -110,6 +110,13 @@ user trips on. Sylve writes the whole ruleset itself.
 node that takes tasks without editing a file by hand, and a second run
 changes nothing (lab).
 
+**Built** (22 November 2026), as proposed, recorded in DESIGN.md §5.4:
+- `legion doctor --fix pf` and `legion local doctor --fix pf`; `legion join` and `legion init` on the manager's host offer it.
+- A file Sylve (or another tool) writes is refused with the lines to add. A default-block ruleset gets a warning, never a changed policy.
+- The console's Diagnostics page shows each node's plan for review: the file as it would be, the copy kept, the way back, the command to run.
+- Lab test `doctor_puts_pf_right_asks_first_and_changes_nothing_twice`.
+- Left: the port's `pkg-message`, at its next update (it lives in the ports tree).
+
 ## 4. Console sign-in with host accounts and passkeys
 
 **Today.** A user is a certificate (`legion user create`). The console
@@ -197,8 +204,8 @@ and memory charts; sizes no longer break between number and unit; the
 
 **Left.**
 - *Live pool I/O* on the dashboards: the agent does not read it yet (`zpool iostat`); a daemon change first.
-- *A review before changing a host*, as Sylve shows before its first setup: what `legion doctor --fix pf` (item 3) will change, the old file's copy, and a way back. It comes with item 3.
-- *Topology's service links* name themselves by their state ("Service web: 1/1 ready") while showing a logo, the ready count and the port. axe 4.11's label-content-name-mismatch (WCAG 2.5.3) flags it. The label should start with what is shown, with the lab's selectors moved with it.
+- *A review before changing a host*: built with item 3 (Diagnostics).
+- *Topology's service links*: built. They are named for what they show (its name, its port, how many are ready), and the ready count is no longer said twice (WCAG 2.5.3).
 
 **Done when** the lab's console tests and an axe-core pass hold after the
 change, and the same screens, side by side with Sylve's, read as one
