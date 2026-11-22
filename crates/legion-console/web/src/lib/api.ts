@@ -646,7 +646,14 @@ export function logs(
   if (opts.tail !== undefined) params.set('tail', String(opts.tail));
   if (opts.follow) params.set('follow', 'true');
   return logStream(
-    `/api/logs/${encodeURIComponent(namespace)}/${encodeURIComponent(task)}?${params}`,
+    {
+      what: 'logs',
+      namespace,
+      task,
+      container: opts.container || undefined,
+      tail: opts.tail,
+      follow: !!opts.follow
+    },
     out,
     done
   );
@@ -663,40 +670,37 @@ export function buildLog(
   out: (text: string, stderr: boolean) => void,
   done: (error: string | null) => void
 ): () => void {
-  return logStream(
-    `/api/build-logs/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}${follow ? '?follow=true' : ''}`,
-    out,
-    done
-  );
+  return logStream({ what: 'build-logs', namespace, name, follow }, out, done);
 }
 
-/** A log as server-sent events: `{out}` or `{err}` as it comes, then `{end}`
- * or `{error}`. Read once: never opened again by the browser on its own. */
+/** A log followed on the tab's stream: `{out}` or `{err}` as it comes, then
+ * `{end}` or `{error}`. Read once: not followed again after a break. */
 function logStream(
-  path: string,
+  follow: Follow,
   out: (text: string, stderr: boolean) => void,
   done: (error: string | null) => void
 ): () => void {
-  const source = new EventSource(path);
+  const key = `log${++streams}`;
   let ended = false;
   const end = (e: string | null) => {
-    source.close();
+    hubForget(key);
     if (!ended) done(e);
     ended = true;
   };
-  source.onmessage = (m) => {
-    const e = JSON.parse(m.data);
-    if (e.out !== undefined) out(e.out, false);
-    else if (e.err !== undefined) out(e.err, true);
-    else if (e.error) end(e.error);
-    else if (e.end) end(null);
-  };
-  // Refused (signed out, not allowed) or cut off: no reason reaches an
-  // EventSource.
-  source.onerror = () => end(t('the logs could not be read'));
+  hubFollow(key, follow, {
+    receive: (e) => {
+      if (e.out !== undefined) out(e.out, false);
+      else if (e.err !== undefined) out(e.err, true);
+      else if (e.error) end(e.error);
+      else if (e.end) end(null);
+    },
+    opened: () => {},
+    refused: (_status, why) => end(why),
+    dropped: () => end(t('the logs could not be read'))
+  });
   return () => {
     ended = true;
-    source.close();
+    hubForget(key);
   };
 }
 
@@ -725,24 +729,199 @@ export function key(o: LObject): string {
  */
 let streams = 0;
 
+/** What the console follows: as the gateway's `Follow`. */
+export type Follow =
+  | { what: 'watch'; kind: string; namespace?: string; from?: number }
+  | { what: 'alerts'; namespace?: string }
+  | { what: 'events'; namespace?: string; kind?: string; name?: string }
+  | { what: 'activity' }
+  | { what: 'usage'; namespace?: string }
+  | {
+      what: 'logs';
+      namespace: string;
+      task: string;
+      container?: string;
+      tail?: number;
+      follow?: boolean;
+    }
+  | { what: 'build-logs'; namespace: string; name: string; follow?: boolean };
+
+/** What a follower is told of what it follows on the tab's stream. */
+interface Followed {
+  /** Each of its messages. */
+  receive: (message: any) => void;
+  /** Taken on: the gateway follows it now. */
+  opened: () => void;
+  /** Not taken on (not allowed, say), with the answer's status. */
+  refused: (status: number, why: string) => void;
+  /** The tab's stream broke: what it followed went with it. */
+  dropped: (why: string) => void;
+}
+
 /**
- * Keeps a stream of server-sent events open: `connect` gets ready (reading
- * what the stream starts from) and gives the path to open, `receive` each
- * message. Over HTTP/2 a page's streams share its one connection. Broken,
- * it says so in `live` and opens it again itself, waiting longer each time
- * up to 30 s, rather than leave it to the browser, which would open the
- * same address again (a watch must list again and go on from there); a
- * session gone ends it, the request that found so sending the user to sign
- * in. Returns a function that stops it.
+ * The tab's one stream (`/api/stream`): one connection, whatever a page
+ * follows, so a browser speaking HTTP/1.1 to the console (six connections
+ * to a site: through a proxy, or the dev server) is not held up by its own
+ * streams. What is followed is added and dropped with `POST
+ * /api/stream/ID`, gathered into one request; messages come back tagged
+ * with the follower's key. Broken, every follower is told, and the stream
+ * is opened again, waiting longer each time up to 30 s; a session gone
+ * ends it, the request that found so sending the user to sign in.
+ */
+const hub = {
+  source: null as EventSource | null,
+  id: '',
+  followers: new Map<string, { follow: Follow; told: Followed }>(),
+  /** Followers to start again on a new stream: keepOpen's, not a log's. */
+  restart: new Map<string, () => void>(),
+  adds: new Set<string>(),
+  removes: new Set<string>(),
+  flushing: null as Promise<void> | null,
+  wait: 1000,
+  retry: null as ReturnType<typeof setTimeout> | null,
+  idle: null as ReturnType<typeof setTimeout> | null
+};
+
+function hubOpen() {
+  if (hub.idle) {
+    clearTimeout(hub.idle);
+    hub.idle = null;
+  }
+  if (hub.source || hub.retry) return;
+  const source = new EventSource('/api/stream');
+  hub.source = source;
+  source.onmessage = (m) => {
+    const e = JSON.parse(m.data);
+    if (e.stream) {
+      hub.id = e.stream;
+      hub.wait = 1000;
+      for (const key of hub.followers.keys()) hub.adds.add(key);
+      hub.removes.clear();
+      hubFlush();
+      return;
+    }
+    hub.followers.get(e.id)?.told.receive(e.data);
+  };
+  source.onerror = () => hubLost(t('the connection to the console dropped'));
+}
+
+/** The tab's stream broke: each follower is told, and it is opened again
+ * after a wait, its followers started again (a watch lists again). */
+function hubLost(why: string) {
+  hub.source?.close();
+  hub.source = null;
+  hub.id = '';
+  hub.adds.clear();
+  hub.removes.clear();
+  const told = [...hub.followers.values()];
+  hub.followers.clear();
+  for (const f of told) f.told.dropped(why);
+  if (!hub.restart.size || hub.retry) return;
+  const wait = hub.wait;
+  hub.wait = Math.min(hub.wait * 2, 30_000);
+  // The session may be what ended it: a request finds out, and a 401
+  // sends the user to sign in.
+  api.me().then(
+    () => again(wait),
+    (e) => {
+      if (!(e instanceof ApiError && e.status === 401)) again(wait);
+    }
+  );
+  function again(after: number) {
+    hub.retry = setTimeout(() => {
+      hub.retry = null;
+      for (const start of [...hub.restart.values()]) start();
+      // Something followed since, that is not started again (a log):
+      // the stream opened for it.
+      if (hub.followers.size) hubOpen();
+    }, after);
+  }
+}
+
+function hubFollow(key: string, follow: Follow, told: Followed) {
+  hub.followers.set(key, { follow, told });
+  hub.removes.delete(key);
+  if (hub.id) {
+    hub.adds.add(key);
+    hubFlush();
+  } else hubOpen();
+}
+
+function hubForget(key: string) {
+  hub.restart.delete(key);
+  if (!hub.followers.delete(key)) return;
+  hub.adds.delete(key);
+  if (hub.id) {
+    hub.removes.add(key);
+    hubFlush();
+  }
+  // Nothing followed for a while: the stream is closed, not kept for
+  // nothing; a page that follows again opens another.
+  if (!hub.followers.size && !hub.idle) {
+    hub.idle = setTimeout(() => {
+      hub.idle = null;
+      if (hub.followers.size) return;
+      hub.source?.close();
+      hub.source = null;
+      hub.id = '';
+    }, 5000);
+  }
+}
+
+/** What was added and dropped since the last, in one request, once the
+ * changes of this moment are all in. */
+function hubFlush() {
+  if (hub.flushing) return;
+  hub.flushing = Promise.resolve().then(async () => {
+    while (hub.id && (hub.adds.size || hub.removes.size)) {
+      const id = hub.id;
+      const adds = [...hub.adds].filter((k) => hub.followers.has(k));
+      const removes = [...hub.removes];
+      hub.adds.clear();
+      hub.removes.clear();
+      const add = adds.map((key) => ({ id: key, ...hub.followers.get(key)!.follow }));
+      try {
+        const r = await call<{ refused: Record<string, { status: number; error: string }> }>(
+          'POST',
+          `/api/stream/${encodeURIComponent(id)}`,
+          { add, remove: removes }
+        );
+        for (const key of adds) {
+          const f = hub.followers.get(key);
+          if (!f) continue;
+          const no = r.refused?.[key];
+          if (no) {
+            hub.followers.delete(key);
+            f.told.refused(no.status, no.error);
+          } else f.told.opened();
+        }
+      } catch (e) {
+        if (id !== hub.id) continue;
+        // The stream gone (the connection dropped meanwhile), or the
+        // request failing: opened again, all followed again.
+        hubLost(e instanceof Error ? e.message : String(e));
+      }
+    }
+    hub.flushing = null;
+  });
+}
+
+/**
+ * Keeps something followed on the tab's stream: `connect` gets ready
+ * (reading what it starts from: a watch lists first) and says what to
+ * follow, `receive` gets each message. Its own failure (`{error}`) or the
+ * tab's stream breaking: it says so in `live` and is followed again, its
+ * own failures after a wait growing up to 30 s; refused as not allowed, or
+ * signed out, it stops. Returns a function that stops it.
  */
 function keepOpen(
-  connect: () => Promise<string>,
+  connect: () => Promise<Follow>,
   receive: (message: any) => void,
   failed: (why: string) => void = () => {}
 ): () => void {
   const id = ++streams;
+  const key = `s${id}`;
   let stopped = false;
-  let source: EventSource | null = null;
   let retry: ReturnType<typeof setTimeout> | null = null;
   let wait = 1000;
   const broken = (why: string) => {
@@ -751,15 +930,18 @@ function keepOpen(
     failed(why);
   };
   const again = () => {
-    if (stopped) return;
-    retry = setTimeout(start, wait);
+    if (stopped || retry) return;
+    retry = setTimeout(() => {
+      retry = null;
+      start();
+    }, wait);
     wait = Math.min(wait * 2, 30_000);
   };
   async function start() {
     if (stopped) return;
-    let path: string;
+    let follow: Follow;
     try {
-      path = await connect();
+      follow = await connect();
     } catch (e) {
       broken(e instanceof Error ? e.message : String(e));
       // Signed out (sent to sign in) or not allowed: trying again won't do.
@@ -768,38 +950,35 @@ function keepOpen(
       return;
     }
     if (stopped) return;
-    const opened = new EventSource(path);
-    source = opened;
-    let lost = false;
-    const lose = (why: string) => {
-      opened.close();
-      if (stopped || lost) return;
-      lost = true;
-      broken(why);
-      // The session may be what ended it: a request finds out, and a 401
-      // sends the user to sign in.
-      api.me().then(again, (e) => {
-        if (!(e instanceof ApiError && e.status === 401)) again();
-      });
-    };
-    opened.onopen = () => {
-      delete live.down[id];
-      failed('');
-      wait = 1000;
-    };
-    opened.onmessage = (m) => {
-      const e = JSON.parse(m.data);
-      if (e.error) lose(e.error);
-      else receive(e);
-    };
-    opened.onerror = () => lose(live.down[id] ?? t('the connection to the console dropped'));
+    hubFollow(key, follow, {
+      opened: () => {
+        delete live.down[id];
+        failed('');
+        wait = 1000;
+      },
+      receive: (e) => {
+        if (!e.error) return receive(e);
+        // Ended with a reason: followed again after a wait.
+        hubForget(key);
+        hub.restart.set(key, start);
+        broken(e.error);
+        again();
+      },
+      refused: (status, why) => {
+        broken(why);
+        if (status !== 401 && status !== 403) again();
+      },
+      // The hub starts it again once the tab's stream is back.
+      dropped: (why) => broken(why)
+    });
   }
+  hub.restart.set(key, start);
   start();
   return () => {
     stopped = true;
     delete live.down[id];
     if (retry) clearTimeout(retry);
-    source?.close();
+    hubForget(key);
   };
 }
 
@@ -825,9 +1004,7 @@ export function follow(
       objects.clear();
       for (const o of listed.objects) objects.set(key(o), o);
       publish();
-      const params = new URLSearchParams({ from: String(listed.version) });
-      if (namespace) params.set('namespace', namespace);
-      return `/api/watch/${encodeURIComponent(kind)}?${params}`;
+      return { what: 'watch', kind, namespace: namespace || undefined, from: listed.version };
     },
     (e) => {
       if (e.object.kind !== kind) return;
@@ -880,7 +1057,7 @@ export function followEvents(
     async () => {
       // Each opening sends those kept again, from the start.
       all = [];
-      return `/api/events?${new URLSearchParams({ namespace, kind, name })}`;
+      return { what: 'events', namespace, kind, name };
     },
     (e) => {
       all = [...all, ...e.events];
@@ -895,7 +1072,7 @@ export function followAlerts(
   failed: (why: string) => void
 ): () => void {
   return keepOpen(
-    async () => '/api/alerts',
+    async () => ({ what: 'alerts' }),
     (e) => update(e.alerts),
     failed
   );
@@ -909,7 +1086,7 @@ export function followUsage(
   failed: (why: string) => void = () => {}
 ): () => void {
   return keepOpen(
-    async () => `/api/usage/watch${q(namespace)}`,
+    async () => ({ what: 'usage', namespace: namespace || undefined }),
     (e) => update(e.nodes),
     failed
   );
@@ -1177,7 +1354,7 @@ export function followActivity(
   return keepOpen(
     async () => {
       first = true;
-      return '/api/activity';
+      return { what: 'activity' };
     },
     (e) => {
       if (first) ops.clear();
