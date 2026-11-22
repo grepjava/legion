@@ -42,6 +42,9 @@ Show the reached manager's view of the cluster (managers, Raft leader, nodes).
 ### `legion doctor [--zfs-root <DATASET>] [--json]`
 Check whether this host satisfies Legion's prerequisites without changing anything (run as `root` to inspect `pf` rules). Exits nonzero if a required check fails or cannot be read.
 
+### `legion doctor --fix pf [--yes] [--pf-conf <FILE>]`
+Put pf right for Legion: add the lines calling its anchors to `/etc/pf.conf` (translation hooks before the first filter rule, the filter hook at the end; no other line changed), after showing them and asking. pf checks the new file before it is written (`pfctl -nf`); the old one is kept as `/etc/pf.conf.legion-<time>`; then pf is loaded, `pf_enable=YES` set and the rules loaded, and the way back is printed. A file another tool writes (Sylve's) is left alone, with the lines to add said instead. Run again, it changes nothing. `legion init` (on the manager's host) and `legion join` offer it when pf is not set up; the console's Diagnostics page shows the same plan for each node. `legion local doctor --fix pf` does the same for `legion local`'s anchors.
+
 ### `legion diagnose [--node <NAME>] [--json]`
 Run `doctor` checks across all cluster nodes (or a single `--node`). Cluster admin only.
 

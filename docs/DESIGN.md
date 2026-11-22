@@ -926,6 +926,22 @@ this was verified in a 3-node lab (S3).
   of egress-limited pods to it, pass on those states. A default-block or
   `if-bound` host ruleset is not supported (checked by the mesh live test
   with egress limits, 2026-11-03).
+- **Putting pf.conf right** (`legion doctor --fix pf`, 2026-11-22): the file
+  stays the operator's, so only the hook lines are added, never a policy:
+  translation hooks just before the first filter rule (pf wants
+  translation first), the filter hook at the end, each block marked with a
+  comment; an empty file gets a dedicated node's ruleset (hooks, loopback
+  without state, `pass all`). pf checks the new file (`pfctl -nf -`)
+  before it is written, the old one is kept as `pf.conf.legion-<time>`,
+  then pf is loaded, `pf_enable=YES` set and the rules loaded. A file
+  another tool writes (Sylve's says so at its top) is refused with the
+  lines to add in that tool's place; a default-block ruleset is changed
+  with a warning that it is unsupported, not opened up. It asks first,
+  shows the way back, and changes nothing when run again. Each agent sends
+  the same plan with its diagnosis, so the console shows it for review
+  (Diagnostics) before anyone runs it on the node; the console never makes
+  the change itself, which stays a root action on the host
+  (`legion_sys::pffix`).
 - One pf table per service holding its **ready** endpoints, cluster-wide.
 - East-west traffic (task to VIP):
   `rdr on legion0 proto tcp to <VIP> port 80 tag LSVC -> <svc_web> port 8080 round-robin`.

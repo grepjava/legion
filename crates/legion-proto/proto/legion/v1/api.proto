@@ -306,6 +306,10 @@ message NodeDiagnosis {
   // Every requirement met.
   bool ready = 3;
   repeated DoctorFinding findings = 4;
+  // What `legion doctor --fix pf` would do to the node's /etc/pf.conf, as
+  // JSON (`{"path", "plan"}`, the plan as legion_sys::pffix writes it), so
+  // the console can show it before anyone runs it; empty when not said.
+  string pf_fix_json = 5;
 }
 
 // As `legion doctor --json` says it.

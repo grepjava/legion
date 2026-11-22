@@ -4,6 +4,7 @@
   import { api, downloads, type NodeDiagnosis } from '#lib/api.ts';
   import { t } from '#lib/i18n.svelte.ts';
   import { session } from '#lib/session.svelte.ts';
+  import PfFixReview from '#lib/PfFixReview.svelte';
 
   let nodes: NodeDiagnosis[] = $state([]);
   let asked = $state(false);
@@ -43,7 +44,7 @@
   <p class="muted">{t('Only the cluster admin diagnoses the nodes.')}</p>
 {:else}
   <p class="muted">
-    {t('What legion doctor finds on each node, asked of its agent. Nothing on the nodes is changed.')}
+    {t('What legion doctor finds on each node, asked of its agent. Nothing on the nodes is changed here; where pf is not set up, the fix is shown for review, to run on the node.')}
   </p>
   <div class="controls">
     <button type="button" disabled={asking} onclick={ask}>{asking ? t('Asking…') : t('Check again')}</button>
@@ -92,6 +93,11 @@
             {/each}
           </tbody>
         </table>
+        <!-- pf not calling Legion's anchors: what the fix would change,
+             reviewed here, made on the node. -->
+        {#if n.pfFix && n.findings.some((f) => f.id === 'pf.anchors' && f.state === 'unmet')}
+          <PfFixReview node={n.node} fix={n.pfFix} />
+        {/if}
       {/if}
     </section>
   {:else}

@@ -1,7 +1,8 @@
 //! `legion doctor`: whether this host can run Legion, and how to fix it.
 //! What it checks is shared with `legion local` in [`legion_sys::check`]; what those
 //! findings mean for a node is in [`legion_agent::doctor`]; how they are
-//! said is here. It changes nothing on the host.
+//! said is here. It changes nothing on the host, but for `--fix pf`
+//! ([`fix_pf`]), which says what it will change and asks first.
 
 use anyhow::Result;
 #[cfg(test)]
@@ -70,6 +71,112 @@ pub fn run(sys: &dyn Sys, zfs_root: Option<&str>, json: bool) -> Result<()> {
         None => Ok(()),
     }
 }
+
+/// `legion doctor --fix pf` (and `legion local doctor --fix pf`): has
+/// `path` call `sets`' anchors, as [`legion_sys::pffix`] plans it. Says
+/// what it adds and how to undo it, and asks before changing anything
+/// unless `yes`; run again, it changes nothing.
+pub fn fix_pf(
+    sys: &dyn Sys,
+    path: &str,
+    sets: &[legion_sys::pffix::Hooks],
+    yes: bool,
+) -> Result<()> {
+    use legion_sys::pffix::{self, Files, HostFiles, Plan};
+    let files = HostFiles;
+    let current = files.read(path).map_err(anyhow::Error::msg)?;
+    let plan = pffix::plan(current.as_deref(), sets);
+    // The file may be right and pf not yet told, or not started at boot.
+    let loaded = sets
+        .iter()
+        .all(|h| check::pf_anchors(sys, h.anchor, h.lines).state == State::Met);
+    let at_boot = sys
+        .run_program("sysrc", &["-n", "pf_enable"], "")
+        .map(|v| v.trim() == "YES")
+        .unwrap_or(false);
+    print!("{}", pffix::describe(&plan, path));
+    match &plan {
+        Plan::Refused { .. } => anyhow::bail!("{path} was not changed"),
+        Plan::Nothing if loaded && at_boot => {
+            println!("pf runs those rules and starts at boot: nothing to change.");
+            return Ok(());
+        }
+        Plan::Nothing => println!(
+            "Loads {path} into pf{}.",
+            if at_boot { "" } else { ", and has pf start at boot (pf_enable=YES)" }
+        ),
+        Plan::Change { .. } => {
+            let backup = format!("{path}.legion-<time>");
+            println!(
+                "Checks the new file with pfctl -nf first; keeps the old one as {backup}; then loads pf, sets pf_enable=YES and loads the rules.
+To undo: {}",
+                pffix::undo(path, &backup)
+            );
+        }
+    }
+    if !yes {
+        use std::io::{BufRead, IsTerminal, Write};
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!("nothing changed: confirm with --yes");
+        }
+        print!("Go ahead? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut said = String::new();
+        std::io::stdin().lock().read_line(&mut said)?;
+        if !matches!(said.trim(), "y" | "Y" | "yes") {
+            anyhow::bail!("nothing changed");
+        }
+    }
+    let done = pffix::apply(sys, &files, path, &plan, &pffix::stamp(std::time::SystemTime::now()))
+        .map_err(anyhow::Error::msg)?;
+    for step in &done.steps {
+        println!("  {step}");
+    }
+    if let Some(b) = &done.backup {
+        println!("To undo: {}", pffix::undo(path, b));
+    }
+    let after: Vec<_> = sets.iter().map(|h| check::pf_anchors(sys, h.anchor, h.lines)).collect();
+    for f in &after {
+        print!("{}", line(check::label(f.state, true), &f.id, &f.detail, f.remedy.as_deref().unwrap_or("")));
+    }
+    if after.iter().any(|f| f.state != State::Met) {
+        anyhow::bail!("pf still does not call every anchor");
+    }
+    Ok(())
+}
+
+/// After `legion init` or `legion join` on a host whose pf does not call
+/// Legion's anchors yet: says so, and at a terminal offers to put it right
+/// ([`fix_pf`], which asks first). Never fails what came before it.
+pub fn offer_pf_fix() {
+    if !cfg!(target_os = "freebsd") {
+        return;
+    }
+    let sys = legion_sys::Shell::new();
+    let found = check::pf_anchors(&sys, LEGION_HOOKS.anchor, LEGION_HOOKS.lines);
+    if found.state == State::Met {
+        return;
+    }
+    println!(
+        "
+This node takes no tasks until pf calls Legion's anchors ({}).",
+        found.detail
+    );
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        println!("Run `legion doctor --fix pf` as root to put it right.");
+        return;
+    }
+    if let Err(e) = fix_pf(&sys, "/etc/pf.conf", &[LEGION_HOOKS], false) {
+        println!("{e}; `legion doctor --fix pf` does it later.");
+    }
+}
+
+/// Legion's own anchors, as `--fix pf` adds them.
+pub const LEGION_HOOKS: legion_sys::pffix::Hooks = legion_sys::pffix::Hooks {
+    anchor: "legion/*",
+    lines: legion_net::lb::HOOKS,
+};
 
 #[cfg(test)]
 mod tests {

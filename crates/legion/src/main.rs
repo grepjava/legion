@@ -288,13 +288,25 @@ enum Command {
     /// Check whether this host can run Legion, and say how to fix what it
     /// can't. Needs no daemon and changes nothing; run it as root, as pf's
     /// rules can't be read otherwise. Exits nonzero if a requirement is
-    /// missing or could not be read.
+    /// missing or could not be read. `--fix pf` puts pf right instead:
+    /// adds the lines calling Legion's anchors to /etc/pf.conf (keeping a
+    /// dated copy, checked by pfctl before it is loaded), sets
+    /// pf_enable=YES and loads it, after saying what it changes and asking.
     Doctor {
         /// The dataset the daemon would use.
         #[arg(long)]
         zfs_root: Option<String>,
         #[arg(long)]
         json: bool,
+        /// Put this right on the host, rather than only check it.
+        #[arg(long, value_parser = ["pf"])]
+        fix: Option<String>,
+        /// With --fix: change it without asking.
+        #[arg(long, short)]
+        yes: bool,
+        /// With --fix pf: the file to change.
+        #[arg(long, default_value = "/etc/pf.conf")]
+        pf_conf: String,
     },
     /// What `legion doctor` finds on every node of the cluster, or on
     /// `--node`, asked of their agents (the cluster admin's). Exits nonzero
@@ -1264,7 +1276,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
             data_dir,
             advertise,
             node_name,
-        } => daemon::join(&token, &manager, &data_dir, advertise.as_deref(), node_name).await,
+        } => {
+            daemon::join(&token, &manager, &data_dir, advertise.as_deref(), node_name).await?;
+            doctor::offer_pf_fix();
+            Ok(())
+        }
         Command::Restore {
             file,
             data_dir,
@@ -1286,7 +1302,13 @@ async fn run(args: Args) -> anyhow::Result<()> {
                     node: None,
                 },
         } => daemon::load_image(&file, name.as_deref(), &data_dir, &zfs_root).await,
-        Command::Doctor { zfs_root, json } => {
+        Command::Doctor {
+            fix: Some(_),
+            yes,
+            pf_conf,
+            ..
+        } => doctor::fix_pf(&legion_sys::Shell::new(), &pf_conf, &[doctor::LEGION_HOOKS], yes),
+        Command::Doctor { zfs_root, json, .. } => {
             doctor::run(&legion_sys::Shell::new(), zfs_root.as_deref(), json)
         }
         Command::Local(cli) => {

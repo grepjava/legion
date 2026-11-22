@@ -404,11 +404,25 @@ pub enum Commands {
         target: String,
     },
 
-    /// Check what this host can do, changing nothing
+    /// Check what this host can do, changing nothing; `--fix pf` adds the
+    /// lines calling legion-local's anchors to /etc/pf.conf, after saying
+    /// what it changes and asking
     Doctor {
         /// Print the result as JSON, on standard output
         #[arg(long)]
         json: bool,
+
+        /// Put this right on the host, rather than only check it
+        #[arg(long, value_parser = ["pf"])]
+        fix: Option<String>,
+
+        /// With --fix: change it without asking
+        #[arg(long, short)]
+        yes: bool,
+
+        /// With --fix pf: the file to change
+        #[arg(long, default_value = "/etc/pf.conf")]
+        pf_conf: String,
 
         /// Only what these need [default: all of them]
         #[arg(
@@ -1841,12 +1855,25 @@ pub async fn run_cli(cli: &Cli) -> Result<()> {
             Ok(())
         }
 
-        Commands::Doctor { json, operations } => {
+        Commands::Doctor {
+            json,
+            operations,
+            fix,
+            yes,
+            pf_conf,
+        } => {
             use legion_local::doctor;
             if !cfg!(target_os = "freebsd") {
                 bail!("`legion local doctor` checks a FreeBSD host");
             }
             let sys = Shell::new();
+            if fix.is_some() {
+                let hooks = legion_sys::pffix::Hooks {
+                    anchor: "legion-local/*",
+                    lines: legion_local::net::HOOKS,
+                };
+                return crate::doctor::fix_pf(&sys, pf_conf, &[hooks], *yes);
+            }
             let zfs_root = resolve_zfs_root(cli, &sys);
             let host = doctor::Host {
                 root: is_root(),

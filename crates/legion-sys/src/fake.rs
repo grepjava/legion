@@ -1848,7 +1848,15 @@ must destroy them to overwrite it"
                 .collect::<Vec<_>>()
                 .join(" "),
         );
-        // The base system's: a ZFS volume formatted, a service told.
+        // The base system's: a ZFS volume formatted, a service told, pf
+        // checked or loaded, rc.conf set (failing where told to).
+        let line = s.ran.last().cloned().unwrap_or_default();
+        if matches!(program, "pfctl" | "sysrc") {
+            if s.failing.remove(&line) {
+                return Err(fail(program, "failed (fake)"));
+            }
+            return Ok(String::new());
+        }
         match (program, args) {
             ("newfs", [.., device]) if device.starts_with("/dev/zvol/") => {
                 s.filesystems.insert((*device).to_owned(), "ufs".to_owned());

@@ -18,6 +18,7 @@ use std::str::FromStr;
 pub mod check;
 mod fake;
 pub mod live;
+pub mod pffix;
 mod memory;
 mod shell;
 

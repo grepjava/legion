@@ -56,8 +56,9 @@ service legion start
 legion init                   # on the first manager; other nodes join (below)
 ```
 
-pf must be enabled (`sysrc pf_enable=YES`) and `/etc/pf.conf` must call
-Legion's anchors (see below) before the daemon starts. The daemon logs to
+pf must be enabled and `/etc/pf.conf` must call Legion's anchors (see
+below): `legion doctor --fix pf`, as root, does both, after showing what it
+changes and asking; `legion init` and `legion join` offer it. The daemon logs to
 `/var/log/legion.log`, which newsyslog rotates; `service legion stop`
 leaves the pods running, and the next start takes them over.
 
@@ -122,7 +123,8 @@ name (`web`, `web.shop` or `web.shop.legion`) through the node's resolver
 on the bridge. Service VIPs,
 published ports and NAT for pods need the host's `/etc/pf.conf` to call
 Legion's anchors (`legion doctor`, as root, checks this and the rest of what
-a host needs, and changes nothing). Each node's agent runs the same checks
+a host needs, and changes nothing; `legion doctor --fix pf` adds the lines
+below after showing them and asking, keeping a copy of the old file). Each node's agent runs the same checks
 as it starts and every minute after: while one the host requires is unmet,
 the node takes no new tasks (`legion list nodes` says `ready, lacks
 pf.anchors`), keeping what runs there, and takes them again once it is put

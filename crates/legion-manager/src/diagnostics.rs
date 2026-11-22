@@ -82,6 +82,7 @@ async fn diagnose_nodes(api: &ApiService, only: &str) -> Result<Vec<pb::NodeDiag
                 Ok(said) => pb::NodeDiagnosis {
                     ready: said.ready,
                     findings: said.findings,
+                    pf_fix_json: said.pf_fix.map(|v| v.to_string()).unwrap_or_default(),
                     node,
                     error: String::new(),
                 },
@@ -117,6 +118,9 @@ struct Said {
     ready: bool,
     #[serde(deserialize_with = "findings")]
     findings: Vec<pb::DoctorFinding>,
+    /// What `--fix pf` would do there; agents before it say nothing.
+    #[serde(default, rename = "pfFix")]
+    pf_fix: Option<serde_json::Value>,
 }
 
 /// Findings as `legion doctor --json` writes them.
@@ -352,5 +356,21 @@ mod tests {
             ("unmet", "required", "kldload pf")
         );
         assert_eq!((f[1].id.as_str(), f[1].remedy.as_str()), ("racct", ""));
+        assert!(said.pf_fix.is_none(), "an agent from before --fix pf says nothing of it");
+
+        // An agent with it says what `--fix pf` would do, carried as it is.
+        let hooks = legion_sys::pffix::Hooks { anchor: "legion/*", lines: legion_net::lb::HOOKS };
+        let plan = json!({
+            "path": "/nonexistent/pf.conf",
+            "plan": legion_sys::pffix::plan(None, &[hooks]),
+        });
+        let said: Said = serde_json::from_value(json!({
+            "ready": true, "findings": [], "pfFix": plan,
+        }))
+        .unwrap();
+        let fix = said.pf_fix.unwrap();
+        assert_eq!(fix["path"], "/nonexistent/pf.conf");
+        assert_eq!(fix["plan"]["action"], "change");
+        assert!(fix["plan"]["added"].as_array().unwrap().contains(&json!("anchor \"legion/*\"")));
     }
 }

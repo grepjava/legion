@@ -2788,8 +2788,10 @@ async fn diagnose(
                     })
                 })
                 .collect();
+            let pf_fix: Option<serde_json::Value> = serde_json::from_str(&n.pf_fix_json).ok();
             serde_json::json!({
                 "node": n.node, "error": n.error, "ready": n.ready, "findings": findings,
+                "pfFix": pf_fix,
             })
         })
         .collect();

@@ -94,6 +94,27 @@ pub fn verdict(found: &[Entry]) -> Option<&'static str> {
     }
 }
 
+/// The host's pf configuration, which `legion doctor --fix pf` changes.
+const PF_CONF: &str = "/etc/pf.conf";
+
+/// What `legion doctor --fix pf` would do to `path`, for the console to
+/// show before anyone runs it: `{"path", "plan"}`, or why the file could
+/// not be read.
+pub fn pf_fix(path: &str) -> serde_json::Value {
+    use legion_sys::pffix::{self, Files, HostFiles, Hooks};
+    let hooks = Hooks {
+        anchor: "legion/*",
+        lines: legion_net::lb::HOOKS,
+    };
+    match HostFiles.read(path) {
+        Ok(current) => serde_json::json!({
+            "path": path,
+            "plan": pffix::plan(current.as_deref(), &[hooks]),
+        }),
+        Err(e) => serde_json::json!({ "path": path, "error": e }),
+    }
+}
+
 /// A manager's session asking what this node's doctor finds:
 /// `{"ready": …, "findings": […]}` as JSON on `stdout`, each finding as
 /// `legion doctor --json` writes it, then `exit_code` 0.
@@ -104,8 +125,11 @@ pub(crate) async fn send(
     use legion_proto::v1::SessionFrame;
     use legion_proto::v1::session_frame::Frame;
     let root = volumes.zfs_root.clone();
-    let found = crate::task::blocking(&volumes.sys, move |sys| examine(sys, root.as_deref())).await;
-    let said = serde_json::json!({ "ready": ready(&found), "findings": found });
+    let (found, pf_fix) = crate::task::blocking(&volumes.sys, move |sys| {
+        (examine(sys, root.as_deref()), pf_fix(PF_CONF))
+    })
+    .await;
+    let said = serde_json::json!({ "ready": ready(&found), "findings": found, "pfFix": pf_fix });
     let json = serde_json::to_vec(&said)
         .map_err(|e| tonic::Status::internal(format!("the findings: {e}")))?;
     for frame in [Frame::Stdout(json), Frame::ExitCode(0)] {

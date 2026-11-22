@@ -392,6 +392,11 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 "cluster initialized; this manager is node {}",
                 status.node_id
             );
+            // On the manager's own host, pf is this host's to set up.
+            let host = host_port(server).rsplit_once(':').map_or(host_port(server), |(h, _)| h);
+            if matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+                crate::doctor::offer_pf_fix();
+            }
         }
         Command::Status => {
             let status = retrying(|| {

@@ -369,6 +369,19 @@ export interface NodeDiagnosis {
     detail: string;
     remedy: string;
   }[];
+  /** What `legion doctor --fix pf` would do there; absent from older agents. */
+  pfFix?: PfFix | null;
+}
+
+/** A node's /etc/pf.conf as `legion doctor --fix pf` would leave it
+ * (legion_sys::pffix's plan). */
+export interface PfFix {
+  path: string;
+  error?: string;
+  plan?:
+    | { action: 'nothing' }
+    | { action: 'change'; new: string; added: string[]; note?: string }
+    | { action: 'refused'; why: string; lines: string[] };
 }
 
 export interface CachedNodeImage {

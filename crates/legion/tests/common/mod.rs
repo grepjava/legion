@@ -269,7 +269,7 @@ impl Lab {
     }
 
     /// Copies the daemons' `legion` to a VM, stripped: it is far smaller.
-    fn install(&self, vm: &Vm) {
+    pub fn install(&self, vm: &Vm) {
         let stripped = self.dir.join(if self.binary == LEGION {
             "legion"
         } else {
