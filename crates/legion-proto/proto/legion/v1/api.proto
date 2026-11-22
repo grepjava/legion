@@ -136,6 +136,10 @@ service Cluster {
   // node: the tasks of `namespace`, or of every namespace when empty, that
   // the caller may read.
   rpc Usage(UsageRequest) returns (UsageResponse);
+  // Usage as Usage gives it, the whole of it at once, then again each
+  // time a node's report changes it (or a report grows too old to show):
+  // what the console's figures follow instead of asking again and again.
+  rpc WatchUsage(UsageRequest) returns (stream UsageResponse);
   // What tasks used over the last hour, a sample every 15 s, as the
   // leader heard it from their nodes (it keeps no more, and a new leader
   // starts empty): the tasks of `namespace`, or of every namespace when

@@ -98,6 +98,102 @@ pub(crate) fn check_namespace(namespace: &str) -> Result<(), Status> {
 }
 
 impl ApiService {
+    /// What tasks and nodes use now, as the leader heard it: what
+    /// `caller` may read of `namespace` (every namespace when empty).
+    pub(crate) fn usage_seen(&self, caller: &Caller, namespace: &str) -> pb::UsageResponse {
+        let mut usage = {
+            let mut nodes: BTreeMap<String, Vec<pb::TaskUsage>> = BTreeMap::new();
+            for (key, (node, u)) in self.usage.fresh() {
+                let Some((ns, task)) = key.split_once('/') else {
+                    continue;
+                };
+                if ns == SYSTEM_NAMESPACE || (!namespace.is_empty() && ns != namespace) {
+                    continue;
+                }
+                nodes.entry(node).or_default().push(pb::TaskUsage {
+                    namespace: ns.to_owned(),
+                    task: task.to_owned(),
+                    cpu_percent: u.cpu,
+                    memory_bytes: u.memory,
+                });
+            }
+            let mut node_telem = self.usage.fresh_nodes();
+            for n in node_telem.keys() {
+                nodes.entry(n.clone()).or_default();
+            }
+            pb::UsageResponse {
+                nodes: nodes
+                    .into_iter()
+                    .map(|(node, tasks)| {
+                        let t = node_telem.remove(&node).unwrap_or_default();
+                        let volumes = t
+                            .volumes
+                            .into_iter()
+                            .filter(|v| {
+                                v.namespace != SYSTEM_NAMESPACE
+                                    && (namespace.is_empty() || v.namespace == namespace)
+                            })
+                            .map(|v| pb::VolumeTelemetry {
+                                namespace: v.namespace,
+                                volume: v.volume,
+                                used_bytes: v.used_bytes,
+                                avail_bytes: v.avail_bytes,
+                            })
+                            .collect();
+                        pb::NodeUsage {
+                            node,
+                            tasks,
+                            zfs_used_bytes: t.zfs_used_bytes,
+                            zfs_avail_bytes: t.zfs_avail_bytes,
+                            net_rx_bps: t.net_rx_bps,
+                            net_tx_bps: t.net_tx_bps,
+                            zfs_read_bps: t.zfs_read_bps,
+                            zfs_write_bps: t.zfs_write_bps,
+                            zfs_read_iops: t.zfs_read_iops,
+                            zfs_write_iops: t.zfs_write_iops,
+                            volumes,
+                            images_bytes: t.images_bytes,
+                            jails_bytes: t.jails_bytes,
+                            build_bytes: t.build_bytes,
+                            load1: t.load[0],
+                            load5: t.load[1],
+                            load15: t.load[2],
+                        }
+                    })
+                    .collect(),
+            }
+        };
+        // A user sees the tasks and volumes of the namespaces they may read in,
+        // and node-level ZFS/network metrics only when permitted to read Nodes.
+        if *caller != Caller::All {
+            let can_nodes = caller.may(&self.store, Verb::Read, Kind::Node, "");
+            for n in &mut usage.nodes {
+                n.tasks
+                    .retain(|t| caller.may(&self.store, Verb::Read, Kind::Task, &t.namespace));
+                n.volumes
+                    .retain(|v| caller.may(&self.store, Verb::Read, Kind::Volume, &v.namespace));
+                if !can_nodes {
+                    n.zfs_used_bytes = 0;
+                    n.zfs_avail_bytes = 0;
+                    n.net_rx_bps = 0;
+                    n.net_tx_bps = 0;
+                    (n.zfs_read_bps, n.zfs_write_bps) = (0, 0);
+                    (n.zfs_read_iops, n.zfs_write_iops) = (0, 0);
+                    n.images_bytes = 0;
+                    n.jails_bytes = 0;
+                    n.build_bytes = 0;
+                    (n.load1, n.load5, n.load15) = (0, 0, 0);
+                }
+            }
+            if !can_nodes {
+                usage
+                    .nodes
+                    .retain(|n| !n.tasks.is_empty() || !n.volumes.is_empty());
+            }
+        }
+        usage
+    }
+
     /// The leader's address, or `None` if this manager leads.
     pub(crate) fn leader_addr<T>(&self, req: &Request<T>) -> Result<Option<String>, Status> {
         match self.route(req)? {
@@ -1479,97 +1575,85 @@ impl Cluster for ApiService {
         if !namespace.is_empty() {
             caller.check(&self.store, Verb::Read, Kind::Task, &namespace)?;
         }
-        let mut usage = {
-            let mut nodes: BTreeMap<String, Vec<pb::TaskUsage>> = BTreeMap::new();
-            for (key, (node, u)) in self.usage.fresh() {
-                let Some((ns, task)) = key.split_once('/') else {
-                    continue;
-                };
-                if ns == SYSTEM_NAMESPACE || (!namespace.is_empty() && ns != namespace) {
-                    continue;
+        Ok(Response::new(self.usage_seen(&caller, &namespace)))
+    }
+
+    type WatchUsageStream = ReceiverStream<Result<pb::UsageResponse, Status>>;
+
+    async fn watch_usage(
+        &self,
+        req: Request<pb::UsageRequest>,
+    ) -> Result<Response<Self::WatchUsageStream>, Status> {
+        let caller = self.caller(&req)?;
+        let namespace = req.get_ref().namespace.clone();
+        check_namespace(&namespace)?;
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        // Only the leader hears heartbeats: followed there, passed on.
+        if let Some(addr) = self.leader_addr(&req)? {
+            let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                &addr,
+                self.peer_tls.as_ref(),
+            ));
+            let mut from_leader = c
+                .watch_usage(forwarded_for(req.into_inner(), &caller)?)
+                .await?
+                .into_inner();
+            tokio::spawn(async move {
+                loop {
+                    let r = tokio::select! {
+                        r = from_leader.message() => r.transpose(),
+                        () = tx.closed() => return,
+                    };
+                    let Some(r) = r else { return };
+                    let last = r.is_err();
+                    if tx.send(r).await.is_err() || last {
+                        return;
+                    }
                 }
-                nodes.entry(node).or_default().push(pb::TaskUsage {
-                    namespace: ns.to_owned(),
-                    task: task.to_owned(),
-                    cpu_percent: u.cpu,
-                    memory_bytes: u.memory,
-                });
-            }
-            let mut node_telem = self.usage.fresh_nodes();
-            for n in node_telem.keys() {
-                nodes.entry(n.clone()).or_default();
-            }
-            pb::UsageResponse {
-                nodes: nodes
-                    .into_iter()
-                    .map(|(node, tasks)| {
-                        let t = node_telem.remove(&node).unwrap_or_default();
-                        let volumes = t
-                            .volumes
-                            .into_iter()
-                            .filter(|v| {
-                                v.namespace != SYSTEM_NAMESPACE
-                                    && (namespace.is_empty() || v.namespace == namespace)
-                            })
-                            .map(|v| pb::VolumeTelemetry {
-                                namespace: v.namespace,
-                                volume: v.volume,
-                                used_bytes: v.used_bytes,
-                                avail_bytes: v.avail_bytes,
-                            })
-                            .collect();
-                        pb::NodeUsage {
-                            node,
-                            tasks,
-                            zfs_used_bytes: t.zfs_used_bytes,
-                            zfs_avail_bytes: t.zfs_avail_bytes,
-                            net_rx_bps: t.net_rx_bps,
-                            net_tx_bps: t.net_tx_bps,
-                            zfs_read_bps: t.zfs_read_bps,
-                            zfs_write_bps: t.zfs_write_bps,
-                            zfs_read_iops: t.zfs_read_iops,
-                            zfs_write_iops: t.zfs_write_iops,
-                            volumes,
-                            images_bytes: t.images_bytes,
-                            jails_bytes: t.jails_bytes,
-                            build_bytes: t.build_bytes,
-                            load1: t.load[0],
-                            load5: t.load[1],
-                            load15: t.load[2],
-                        }
-                    })
-                    .collect(),
-            }
-        };
-        // A user sees the tasks and volumes of the namespaces they may read in,
-        // and node-level ZFS/network metrics only when permitted to read Nodes.
-        if caller != Caller::All {
-            let can_nodes = caller.may(&self.store, Verb::Read, Kind::Node, "");
-            for n in &mut usage.nodes {
-                n.tasks
-                    .retain(|t| caller.may(&self.store, Verb::Read, Kind::Task, &t.namespace));
-                n.volumes
-                    .retain(|v| caller.may(&self.store, Verb::Read, Kind::Volume, &v.namespace));
-                if !can_nodes {
-                    n.zfs_used_bytes = 0;
-                    n.zfs_avail_bytes = 0;
-                    n.net_rx_bps = 0;
-                    n.net_tx_bps = 0;
-                    (n.zfs_read_bps, n.zfs_write_bps) = (0, 0);
-                    (n.zfs_read_iops, n.zfs_write_iops) = (0, 0);
-                    n.images_bytes = 0;
-                    n.jails_bytes = 0;
-                    n.build_bytes = 0;
-                    (n.load1, n.load5, n.load15) = (0, 0, 0);
-                }
-            }
-            if !can_nodes {
-                usage
-                    .nodes
-                    .retain(|n| !n.tasks.is_empty() || !n.volumes.is_empty());
-            }
+            });
+            return Ok(Response::new(ReceiverStream::new(rx)));
         }
-        Ok(Response::new(usage))
+        self.consistent().await?;
+        if !namespace.is_empty() {
+            caller.check(&self.store, Verb::Read, Kind::Task, &namespace)?;
+        }
+        let api = self.clone();
+        tokio::spawn(async move {
+            let mut closing = api.closing.clone();
+            let mut reports = api.usage.reports();
+            let mut raft = api.store.raft.metrics();
+            let mut sent: Option<pb::UsageResponse> = None;
+            loop {
+                // Another leader hears the nodes now: ended, to be opened
+                // again there.
+                if raft.borrow().current_leader != Some(api.id) {
+                    let _ = tx
+                        .send(Err(Status::unavailable(
+                            "leadership moved; follow usage again",
+                        )))
+                        .await;
+                    return;
+                }
+                let now = api.usage_seen(&caller, &namespace);
+                if sent.as_ref() != Some(&now) {
+                    if tx.send(Ok(now.clone())).await.is_err() {
+                        return;
+                    }
+                    sent = Some(now);
+                }
+                tokio::select! {
+                    r = reports.changed() => if r.is_err() { return },
+                    _ = raft.changed() => {}
+                    // A report grows too old to show though none comes.
+                    () = tokio::time::sleep(crate::usage::STEP) => {}
+                    () = tx.closed() => return,
+                    _ = closing.wait_for(|c| *c) => return,
+                }
+                // Nodes report about together: one look after them.
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn usage_history(

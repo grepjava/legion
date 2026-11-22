@@ -33,6 +33,9 @@ pub struct Usage {
     nodes: Mutex<HashMap<String, (Instant, NodeTelemetry)>>,
     /// By node name: 1-hour history of ZFS & network samples.
     node_history: Mutex<HashMap<String, VecDeque<(Instant, NodeSample)>>>,
+    /// Counts the reports taken, so those who follow usage (WatchUsage)
+    /// look again when one comes rather than asking on a timer.
+    reported: tokio::sync::watch::Sender<u64>,
 }
 
 /// Host ZFS & network sample at a moment, in milliseconds since the epoch.
@@ -72,6 +75,15 @@ struct Report {
 }
 
 impl Usage {
+    /// Changes each time a node's report is taken.
+    pub fn reports(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.reported.subscribe()
+    }
+
+    fn taken(&self) {
+        self.reported.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
     /// What `node` reports of its tasks, by `namespace/task`: only those
     /// `runs_on` says are on `node`, and only usage that is a number of
     /// both kinds, so no node speaks for another's tasks or feeds the
@@ -139,6 +151,8 @@ impl Usage {
             };
             tasks.insert(task, report);
         }
+        drop((tasks, history));
+        self.taken();
     }
 
     /// Each task's samples within [`HISTORY`], oldest first, by
@@ -224,6 +238,8 @@ impl Usage {
             ));
         }
         nodes.insert(node.to_owned(), (now, telemetry));
+        drop((nodes, hist));
+        self.taken();
     }
 
     /// Fresh host & volume telemetry by node name.

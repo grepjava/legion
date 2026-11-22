@@ -15,6 +15,7 @@ use axum::Json;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use legion_pki::{Identity, Role};
@@ -175,6 +176,7 @@ fn router(gateway: Gateway) -> axum::Router {
         )
         .route("/api/watch/{kind}", get(watch))
         .route("/api/usage", get(usage))
+        .route("/api/usage/watch", get(usage_watch))
         .route("/api/alerts", get(alerts))
         .route("/api/events", get(events))
         .route("/api/activity", get(activity))
@@ -842,14 +844,55 @@ struct AlertsQuery {
     namespace: Option<String>,
 }
 
-/// `Cluster.WatchAlerts` as the user: JSON text messages `{alerts: [...]}`,
-/// the whole list each time it changes, or `{error}` as the last.
+/// What a relay makes of each message of a stream: a JSON message to
+/// pass on, the last one to pass on, or nothing.
+enum Step {
+    Send(serde_json::Value),
+    Last(serde_json::Value),
+    Skip,
+}
+
+/// A gRPC stream as server-sent events: each message `each` makes of one
+/// an event of JSON, `ended` the last when the stream ends and `{error}`
+/// when it fails. A comment every 15 s keeps a quiet one open through
+/// proxies. Over HTTP/2 a page's streams share its one connection. The
+/// browser would open an ended stream again by itself; the console closes
+/// it on a last message (`error`, `end`) and opens it again as it sees fit
+/// (a watch from where its list left off). Dropped when the browser goes,
+/// and the gRPC stream with it.
+fn events_of<T: Send + 'static>(
+    stream: tonic::Streaming<T>,
+    each: impl FnMut(T) -> Step + Send + 'static,
+    ended: serde_json::Value,
+) -> Response {
+    let event = |v: serde_json::Value| Ok::<_, Infallible>(Event::default().data(v.to_string()));
+    let events = futures::stream::unfold(Some((stream, each, ended)), move |state| async move {
+        let (mut stream, mut each, ended) = state?;
+        loop {
+            let step = match stream.message().await {
+                Ok(Some(m)) => each(m),
+                Ok(None) => Step::Last(ended.clone()),
+                Err(s) => Step::Last(serde_json::json!({ "error": s.message() })),
+            };
+            return match step {
+                Step::Skip => continue,
+                Step::Send(v) => Some((event(v), Some((stream, each, ended)))),
+                Step::Last(v) => Some((event(v), None)),
+            };
+        }
+    });
+    Sse::new(events)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
+}
+
+/// `Cluster.WatchAlerts` as the user, as server-sent events: `{alerts:
+/// [...]}`, the whole list each time it changes, or `{error}` as the last.
 async fn alerts(
     State(g): State<Gateway>,
     headers: HeaderMap,
     uri: Uri,
     Query(q): Query<AlertsQuery>,
-    ws: WebSocketUpgrade,
 ) -> Result<Response, Refused> {
     same_origin(&headers, &uri)?;
     let (_, channel) = g.user(&headers).await?;
@@ -859,20 +902,10 @@ async fn alerts(
         })
         .await?
         .into_inner();
-    Ok(ws.on_upgrade(move |socket| relay_alerts(socket, stream)))
-}
-
-async fn relay_alerts(mut socket: WebSocket, mut stream: tonic::Streaming<pb::AlertsResponse>) {
-    loop {
-        let next = tokio::select! {
-            r = stream.message() => r,
-            m = socket.recv() => match m {
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
-                _ => continue,
-            },
-        };
-        let text = match next {
-            Ok(Some(r)) => serde_json::json!({
+    Ok(events_of(
+        stream,
+        |r: pb::AlertsResponse| {
+            Step::Send(serde_json::json!({
                 "alerts": r.alerts.iter().map(|a| serde_json::json!({
                     "kind": a.kind,
                     "severity": a.severity,
@@ -881,20 +914,10 @@ async fn relay_alerts(mut socket: WebSocket, mut stream: tonic::Streaming<pb::Al
                     "message": a.message,
                     "since_ms": a.since_ms,
                 })).collect::<Vec<_>>()
-            }),
-            Ok(None) => serde_json::json!({ "error": "the alerts ended" }),
-            Err(s) => serde_json::json!({ "error": s.message() }),
-        };
-        let end = text.get("error").is_some();
-        if socket
-            .send(Message::Text(text.to_string().into()))
-            .await
-            .is_err()
-            || end
-        {
-            return;
-        }
-    }
+            }))
+        },
+        serde_json::json!({ "error": "the alerts ended" }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -904,15 +927,14 @@ struct EventsQuery {
     name: Option<String>,
 }
 
-/// `Cluster.Events` followed, as the user: JSON text messages `{events:
-/// [...]}`, those kept first, then each as it comes, or `{error}` as the
-/// last.
+/// `Cluster.Events` followed, as the user, as server-sent events:
+/// `{events: [...]}`, those kept first, then each as it comes, or `{error}`
+/// as the last.
 async fn events(
     State(g): State<Gateway>,
     headers: HeaderMap,
     uri: Uri,
     Query(q): Query<EventsQuery>,
-    ws: WebSocketUpgrade,
 ) -> Result<Response, Refused> {
     same_origin(&headers, &uri)?;
     let (_, channel) = g.user(&headers).await?;
@@ -925,20 +947,10 @@ async fn events(
         })
         .await?
         .into_inner();
-    Ok(ws.on_upgrade(move |socket| relay_events(socket, stream)))
-}
-
-async fn relay_events(mut socket: WebSocket, mut stream: tonic::Streaming<pb::EventsResponse>) {
-    loop {
-        let next = tokio::select! {
-            r = stream.message() => r,
-            m = socket.recv() => match m {
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
-                _ => continue,
-            },
-        };
-        let text = match next {
-            Ok(Some(r)) => serde_json::json!({
+    Ok(events_of(
+        stream,
+        |r: pb::EventsResponse| {
+            Step::Send(serde_json::json!({
                 "events": r.events.iter().map(|e| serde_json::json!({
                     "at_ms": e.at_ms,
                     "kind": e.kind,
@@ -948,30 +960,19 @@ async fn relay_events(mut socket: WebSocket, mut stream: tonic::Streaming<pb::Ev
                     "message": e.message,
                     "owner": e.owner,
                 })).collect::<Vec<_>>()
-            }),
-            Ok(None) => serde_json::json!({ "error": "the events ended" }),
-            Err(s) => serde_json::json!({ "error": s.message() }),
-        };
-        let end = text.get("error").is_some();
-        if socket
-            .send(Message::Text(text.to_string().into()))
-            .await
-            .is_err()
-            || end
-        {
-            return;
-        }
-    }
+            }))
+        },
+        serde_json::json!({ "error": "the events ended" }),
+    ))
 }
 
-/// `Cluster.Activity` followed, as the user: JSON text messages
+/// `Cluster.Activity` followed, as the user, as server-sent events:
 /// `{operations: [...]}` (legion_api::activity::Operation), all of them
 /// first, then each as it changes, or `{error}` as the last.
 async fn activity(
     State(g): State<Gateway>,
     headers: HeaderMap,
     uri: Uri,
-    ws: WebSocketUpgrade,
 ) -> Result<Response, Refused> {
     same_origin(&headers, &uri)?;
     let (_, channel) = g.user(&headers).await?;
@@ -979,39 +980,19 @@ async fn activity(
         .activity(pb::ActivityRequest { follow: true })
         .await?
         .into_inner();
-    Ok(ws.on_upgrade(move |socket| relay_activity(socket, stream)))
-}
-
-async fn relay_activity(mut socket: WebSocket, mut stream: tonic::Streaming<pb::ActivityResponse>) {
-    loop {
-        let next = tokio::select! {
-            r = stream.message() => r,
-            m = socket.recv() => match m {
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
-                _ => continue,
-            },
-        };
-        let text = match next {
-            Ok(Some(r)) => serde_json::json!({
+    Ok(events_of(
+        stream,
+        |r: pb::ActivityResponse| {
+            Step::Send(serde_json::json!({
                 "operations": r
                     .operations_json
                     .iter()
                     .filter_map(|j| serde_json::from_slice::<serde_json::Value>(j).ok())
                     .collect::<Vec<_>>()
-            }),
-            Ok(None) => serde_json::json!({ "error": "the activity ended" }),
-            Err(s) => serde_json::json!({ "error": s.message() }),
-        };
-        let end = text.get("error").is_some();
-        if socket
-            .send(Message::Text(text.to_string().into()))
-            .await
-            .is_err()
-            || end
-        {
-            return;
-        }
-    }
+            }))
+        },
+        serde_json::json!({ "error": "the activity ended" }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1020,16 +1001,15 @@ struct WatchFrom {
     from: Option<u64>,
 }
 
-/// The changes to objects of `kind` from version `from` on, as JSON text
-/// messages `{type: "put"|"delete", object}`, until either side closes;
-/// an error ends it with `{error}`.
+/// The changes to objects of `kind` from version `from` on, as
+/// server-sent events `{type: "put"|"delete", object}`, until the browser
+/// goes; an error ends it with `{error}`.
 async fn watch(
     State(g): State<Gateway>,
     headers: HeaderMap,
     uri: Uri,
     Path(kind): Path<String>,
     Query(from): Query<WatchFrom>,
-    ws: WebSocketUpgrade,
 ) -> Result<Response, Refused> {
     same_origin(&headers, &uri)?;
     let (_, channel) = g.user(&headers).await?;
@@ -1042,54 +1022,29 @@ async fn watch(
         .await?
         .into_inner();
     let namespace = from.namespace.filter(|n| !n.is_empty());
-    Ok(ws.on_upgrade(move |socket| relay(socket, stream, namespace)))
-}
-
-async fn relay(
-    mut socket: WebSocket,
-    mut stream: tonic::Streaming<pb::WatchEvent>,
-    namespace: Option<String>,
-) {
-    loop {
-        let event = tokio::select! {
-            e = stream.message() => e,
-            m = socket.recv() => match m {
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
-                _ => continue,
-            },
-        };
-        let text = match event {
-            Ok(Some(e)) => {
-                let Some(object) = e.object else { continue };
-                if let Some(ns) = &namespace
-                    && &object.namespace != ns
-                {
-                    continue;
-                }
-                let kind = if e.r#type == pb::watch_event::Type::Delete as i32 {
-                    "delete"
-                } else {
-                    "put"
-                };
-                match object_json(object) {
-                    Ok(o) => serde_json::json!({ "type": kind, "object": o }),
-                    Err(Refused(_, e)) => serde_json::json!({ "error": e }),
-                }
+    Ok(events_of(
+        stream,
+        move |e: pb::WatchEvent| {
+            let Some(object) = e.object else {
+                return Step::Skip;
+            };
+            if let Some(ns) = &namespace
+                && &object.namespace != ns
+            {
+                return Step::Skip;
             }
-            Ok(None) => serde_json::json!({ "error": "the watch ended" }),
-            Err(s) => serde_json::json!({ "error": s.message() }),
-        };
-        let end = text.get("error").is_some();
-        if socket
-            .send(Message::Text(text.to_string().into()))
-            .await
-            .is_err()
-            || end
-        {
-            let _ = socket.send(Message::Close(None)).await;
-            return;
-        }
-    }
+            let kind = if e.r#type == pb::watch_event::Type::Delete as i32 {
+                "delete"
+            } else {
+                "put"
+            };
+            match object_json(object) {
+                Ok(o) => Step::Send(serde_json::json!({ "type": kind, "object": o })),
+                Err(Refused(_, e)) => Step::Last(serde_json::json!({ "error": e })),
+            }
+        },
+        serde_json::json!({ "error": "the watch ended" }),
+    ))
 }
 
 /// What each node's tasks use now, as `legion top` shows it: `{nodes:
@@ -1106,6 +1061,34 @@ async fn usage(
         })
         .await?
         .into_inner();
+    Ok(Json(usage_json(&r)).into_response())
+}
+
+/// The usage as `/api/usage` answers it, as server-sent events: all of it
+/// at once, then again each time a node's report changes it, or `{error}`
+/// as the last (the leader changing, say).
+async fn usage_watch(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(scope): Query<Scope>,
+) -> Result<Response, Refused> {
+    same_origin(&headers, &uri)?;
+    let (_, channel) = g.user(&headers).await?;
+    let stream = ClusterClient::new(channel)
+        .watch_usage(pb::UsageRequest {
+            namespace: scope.namespace.unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+    Ok(events_of(
+        stream,
+        |r: pb::UsageResponse| Step::Send(usage_json(&r)),
+        serde_json::json!({ "error": "the usage ended" }),
+    ))
+}
+
+fn usage_json(r: &pb::UsageResponse) -> serde_json::Value {
     let nodes: Vec<_> = r
         .nodes
         .iter()
@@ -1151,7 +1134,7 @@ async fn usage(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({ "nodes": nodes })).into_response())
+    serde_json::json!({ "nodes": nodes })
 }
 
 /// `legion quota`: `{namespaces: [{namespace, resources: [{resource,
@@ -1427,7 +1410,7 @@ struct LogsQuery {
     follow: bool,
 }
 
-/// A task's output, as `legion logs` prints it, as JSON text messages
+/// A task's output, as `legion logs` prints it, as server-sent events
 /// `{out}` or `{err}` (the bytes as text), then `{end: true}` when the
 /// container's output ends or `{error}` when the session fails.
 async fn logs(
@@ -1436,7 +1419,6 @@ async fn logs(
     uri: Uri,
     Path((namespace, task)): Path<(String, String)>,
     Query(q): Query<LogsQuery>,
-    ws: WebSocketUpgrade,
 ) -> Result<Response, Refused> {
     use pb::session_frame::Frame;
     same_origin(&headers, &uri)?;
@@ -1461,51 +1443,27 @@ async fn logs(
         .session(tokio_stream::wrappers::ReceiverStream::new(rx))
         .await?
         .into_inner();
-    // `tx` is kept until the end: closing it would end the session's input.
-    Ok(ws.on_upgrade(move |socket| relay_logs(socket, stream, tx)))
-}
-
-async fn relay_logs(
-    mut socket: WebSocket,
-    mut stream: tonic::Streaming<pb::SessionFrame>,
-    _input: tokio::sync::mpsc::Sender<pb::SessionFrame>,
-) {
-    use pb::session_frame::Frame;
     // What each stream has left of a character split between frames.
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    loop {
-        let frame = tokio::select! {
-            f = stream.message() => f,
-            m = socket.recv() => match m {
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
-                _ => continue,
-            },
-        };
-        let text = match frame {
-            Ok(Some(pb::SessionFrame {
-                frame: Some(Frame::Stdout(data)),
-            })) => serde_json::json!({ "out": text_of(&mut out, data) }),
-            Ok(Some(pb::SessionFrame {
-                frame: Some(Frame::Stderr(data)),
-            })) => serde_json::json!({ "err": text_of(&mut err, data) }),
-            Ok(Some(pb::SessionFrame {
-                frame: Some(Frame::Error(e)),
-            })) => serde_json::json!({ "error": e.message }),
-            Ok(Some(_)) => continue,
-            Ok(None) => serde_json::json!({ "end": true }),
-            Err(s) => serde_json::json!({ "error": s.message() }),
-        };
-        let end = text.get("out").is_none() && text.get("err").is_none();
-        if socket
-            .send(Message::Text(text.to_string().into()))
-            .await
-            .is_err()
-            || end
-        {
-            let _ = socket.send(Message::Close(None)).await;
-            return;
-        }
-    }
+    Ok(events_of(
+        stream,
+        move |f: pb::SessionFrame| {
+            // `tx` is kept to the end: closing it would end the session's
+            // input.
+            let _input = &tx;
+            match f.frame {
+                Some(Frame::Stdout(data)) => {
+                    Step::Send(serde_json::json!({ "out": text_of(&mut out, data) }))
+                }
+                Some(Frame::Stderr(data)) => {
+                    Step::Send(serde_json::json!({ "err": text_of(&mut err, data) }))
+                }
+                Some(Frame::Error(e)) => Step::Last(serde_json::json!({ "error": e.message })),
+                _ => Step::Skip,
+            }
+        },
+        serde_json::json!({ "end": true }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1515,14 +1473,13 @@ struct BuildLogsQuery {
 }
 
 /// A Build's log (CONSOLE.md phase 5), as `legion build-logs` prints it,
-/// as the same messages as a task's: `{out}`, then `{end: true}`.
+/// as the same events as a task's: `{out}`, then `{end: true}`.
 async fn build_logs(
     State(g): State<Gateway>,
     headers: HeaderMap,
     uri: Uri,
     Path((namespace, name)): Path<(String, String)>,
     Query(q): Query<BuildLogsQuery>,
-    ws: WebSocketUpgrade,
 ) -> Result<Response, Refused> {
     same_origin(&headers, &uri)?;
     let (_, channel) = g.user(&headers).await?;
@@ -1534,35 +1491,14 @@ async fn build_logs(
         })
         .await?
         .into_inner();
-    Ok(ws.on_upgrade(move |socket| relay_build_log(socket, stream)))
-}
-
-async fn relay_build_log(mut socket: WebSocket, mut stream: tonic::Streaming<pb::BuildLogsChunk>) {
     let mut pending = Vec::new();
-    loop {
-        let chunk = tokio::select! {
-            c = stream.message() => c,
-            m = socket.recv() => match m {
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
-                _ => continue,
-            },
-        };
-        let text = match chunk {
-            Ok(Some(c)) => serde_json::json!({ "out": text_of(&mut pending, c.data) }),
-            Ok(None) => serde_json::json!({ "end": true }),
-            Err(s) => serde_json::json!({ "error": s.message() }),
-        };
-        let end = text.get("out").is_none();
-        if socket
-            .send(Message::Text(text.to_string().into()))
-            .await
-            .is_err()
-            || end
-        {
-            let _ = socket.send(Message::Close(None)).await;
-            return;
-        }
-    }
+    Ok(events_of(
+        stream,
+        move |c: pb::BuildLogsChunk| {
+            Step::Send(serde_json::json!({ "out": text_of(&mut pending, c.data) }))
+        },
+        serde_json::json!({ "end": true }),
+    ))
 }
 
 /// `data` after what `pending` held, as text, keeping back the start of a
@@ -1716,9 +1652,12 @@ async fn apps(State(g): State<Gateway>, headers: HeaderMap) -> Result<Response, 
     let body = legion_image::fetch::get(&url)
         .await
         .map_err(|e| Refused(StatusCode::BAD_GATEWAY, e))?;
-    let catalog: legion_api::app::Catalog =
-        serde_json::from_slice(&body).map_err(|e| Refused(StatusCode::BAD_GATEWAY, format!("{url}: {e}")))?;
-    Ok(Json(serde_json::json!({ "name": catalog.catalog_name, "apps": catalog.apps })).into_response())
+    let catalog: legion_api::app::Catalog = serde_json::from_slice(&body)
+        .map_err(|e| Refused(StatusCode::BAD_GATEWAY, format!("{url}: {e}")))?;
+    Ok(
+        Json(serde_json::json!({ "name": catalog.catalog_name, "apps": catalog.apps }))
+            .into_response(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -1740,15 +1679,23 @@ async fn app_manifest(
     g.user(&headers).await?;
     let gateway = |e: String| Refused(StatusCode::BAD_GATEWAY, e);
     let base = legion_api::app::CATALOG;
-    let body = legion_image::fetch::get(&format!("{base}/catalog.json")).await.map_err(gateway)?;
-    let catalog: legion_api::app::Catalog = serde_json::from_slice(&body).map_err(|e| gateway(e.to_string()))?;
+    let body = legion_image::fetch::get(&format!("{base}/catalog.json"))
+        .await
+        .map_err(gateway)?;
+    let catalog: legion_api::app::Catalog =
+        serde_json::from_slice(&body).map_err(|e| gateway(e.to_string()))?;
     let found = catalog
         .apps
         .into_iter()
         .find(|a| a.id == id)
         .ok_or_else(|| Refused(StatusCode::NOT_FOUND, format!("no app {id} in the catalog")))?;
-    if found.manifest_url.contains("..") || found.manifest_url.starts_with('/') || found.manifest_url.contains("://") {
-        return Err(gateway(format!("{id}: its manifest is outside the catalog")));
+    if found.manifest_url.contains("..")
+        || found.manifest_url.starts_with('/')
+        || found.manifest_url.contains("://")
+    {
+        return Err(gateway(format!(
+            "{id}: its manifest is outside the catalog"
+        )));
     }
     let text = legion_image::fetch::get(&format!("{base}/{}", found.manifest_url))
         .await

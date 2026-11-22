@@ -543,7 +543,10 @@ impl Lab {
                 );
                 eprintln!(
                     "task {ns}/{name} on {}: {} {} (restarts {})",
-                    t["spec"]["node"], t["status"]["state"], t["status"]["message"], t["status"]["restarts"]
+                    t["spec"]["node"],
+                    t["status"]["state"],
+                    t["status"]["message"],
+                    t["status"]["restarts"]
                 );
                 let logs = self.legion(&["logs", name, "-n", ns, "--tail", "15"], &[]);
                 for line in text(&logs.stdout).lines().chain(text(&logs.stderr).lines()) {

@@ -58,33 +58,7 @@ async fn request(
     body: Option<serde_json::Value>,
     headers: &[(&str, &str)],
 ) -> Response {
-    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-    roots
-        .add(der(ca.cert_pem()).into())
-        .expect("the CA certificate");
-    let mut config = tokio_rustls::rustls::ClientConfig::builder_with_provider(Arc::new(
-        tokio_rustls::rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    config.alpn_protocols = vec![if h2 {
-        b"h2".to_vec()
-    } else {
-        b"http/1.1".to_vec()
-    }];
-    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
-        .connect(ServerName::try_from(legion_pki::SERVER_NAME).unwrap(), tcp)
-        .await
-        .unwrap();
-    assert_eq!(
-        tls.get_ref().1.alpn_protocol(),
-        Some(if h2 { &b"h2"[..] } else { &b"http/1.1"[..] }),
-        "the console speaks what was asked"
-    );
-    let io = hyper_util::rt::TokioIo::new(tls);
+    let io = hyper_util::rt::TokioIo::new(tls(ca, addr, h2).await);
     let mut req = hyper::Request::builder().method(method);
     if h2 {
         req = req.uri(format!("https://{addr}{path}"));
@@ -155,6 +129,100 @@ async fn request(
         body: serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
         text,
     }
+}
+
+/// A TLS connection to the console, speaking HTTP/2 when `h2`.
+async fn tls(
+    ca: &Ca,
+    addr: &str,
+    h2: bool,
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+    roots
+        .add(der(ca.cert_pem()).into())
+        .expect("the CA certificate");
+    let mut config = tokio_rustls::rustls::ClientConfig::builder_with_provider(Arc::new(
+        tokio_rustls::rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    config.alpn_protocols = vec![if h2 {
+        b"h2".to_vec()
+    } else {
+        b"http/1.1".to_vec()
+    }];
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(ServerName::try_from(legion_pki::SERVER_NAME).unwrap(), tcp)
+        .await
+        .unwrap();
+    assert_eq!(
+        tls.get_ref().1.alpn_protocol(),
+        Some(if h2 { &b"h2"[..] } else { &b"http/1.1"[..] }),
+        "the console speaks what was asked"
+    );
+    tls
+}
+
+/// The first `n` server-sent events of `path`, each `data:` read as JSON,
+/// over HTTP/2 as a browser's EventSource reads them; with the response's
+/// status and content type. Several open at once on one connection.
+async fn events(
+    ca: &Ca,
+    addr: &str,
+    paths: &[&str],
+    cookie: &str,
+    n: usize,
+) -> Vec<(u16, String, Vec<serde_json::Value>)> {
+    let io = hyper_util::rt::TokioIo::new(tls(ca, addr, true).await);
+    let (send, conn) =
+        hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    let reads = paths.iter().map(|path| {
+        let mut send = send.clone();
+        let req = hyper::Request::get(format!("https://{addr}{path}"))
+            .header("cookie", cookie)
+            .header("accept", "text/event-stream")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        async move {
+            let res = send.send_request(req).await.unwrap();
+            let status = res.status().as_u16();
+            let kind = res
+                .headers()
+                .get("content-type")
+                .map(|v| v.to_str().unwrap().to_owned())
+                .unwrap_or_default();
+            let mut body = res.into_body();
+            let (mut text, mut got) = (String::new(), Vec::new());
+            while got.len() < n {
+                let Some(frame) = tokio::time::timeout(Duration::from_secs(20), body.frame())
+                    .await
+                    .expect("an event within 20 s")
+                else {
+                    break;
+                };
+                if let Ok(data) = frame.unwrap().into_data() {
+                    text.push_str(&String::from_utf8_lossy(&data));
+                }
+                // An event ends at a blank line; a line `data: ...` holds it.
+                while let Some(end) = text.find("\n\n") {
+                    let event: String = text.drain(..end + 2).collect();
+                    for line in event.lines() {
+                        if let Some(data) = line.strip_prefix("data:") {
+                            got.push(serde_json::from_str(data.trim()).unwrap());
+                        }
+                    }
+                }
+            }
+            (status, kind, got)
+        }
+    });
+    futures::future::join_all(reads).await
 }
 
 fn der(pem: &str) -> Vec<u8> {
@@ -405,6 +473,37 @@ async fn the_console_calls_the_api_as_its_user() {
     assert!(used.body["nodes"].is_array(), "{}", used.text);
     let theirs = call("GET", "/api/usage?namespace=bank", Some(session.clone())).await;
     assert_eq!(theirs.status, 403, "{}", theirs.text);
+    // Followed as server-sent events, on one HTTP/2 connection: the
+    // usage, the alerts and a watch of her Configs, each its first message
+    // at once.
+    let followed = events(
+        &ca,
+        &console,
+        &[
+            "/api/usage/watch?namespace=shop",
+            "/api/alerts?namespace=shop",
+            "/api/watch/Config?namespace=shop",
+        ],
+        &session,
+        1,
+    )
+    .await;
+    for (status, kind, _) in &followed {
+        assert_eq!(*status, 200);
+        assert!(kind.starts_with("text/event-stream"), "{kind}");
+    }
+    assert!(followed[0].2[0]["nodes"].is_array(), "{:?}", followed[0].2);
+    assert!(followed[1].2[0]["alerts"].is_array(), "{:?}", followed[1].2);
+    assert_eq!(followed[2].2[0]["type"], "put", "{:?}", followed[2].2);
+    assert_eq!(followed[2].2[0]["object"]["metadata"]["name"], "menu");
+    // Another namespace's usage is refused before any stream starts.
+    let refused = call(
+        "GET",
+        "/api/usage/watch?namespace=bank",
+        Some(session.clone()),
+    )
+    .await;
+    assert_eq!(refused.status, 403, "{}", refused.text);
     let kinds = call("GET", "/api/kinds", Some(session.clone())).await;
     assert!(kinds.body.as_array().unwrap().len() >= 13);
     let headers_page = call("GET", "/api/nothing", Some(session.clone())).await;
@@ -1144,7 +1243,12 @@ async fn the_console_converts_compose_files_and_lists_templates() {
         "the examples, then the namespace's own"
     );
     assert!(listed[0].2.starts_with("A hit counter"), "{listed:?}");
-    assert!(listed[2].2.starts_with("PostgreSQL 17 from FreeBSD's packages"), "{listed:?}");
+    assert!(
+        listed[2]
+            .2
+            .starts_with("PostgreSQL 17 from FreeBSD's packages"),
+        "{listed:?}"
+    );
     assert_eq!(listed[6].2, "My shop. More.");
     // Each example converts as it is, given what it asks for.
     for t in r.body["templates"].as_array().unwrap() {

@@ -2603,7 +2603,42 @@ async fn usage_shows_what_the_caller_may_read() {
     );
     let mine = usage(alice.clone(), "").await.unwrap().into_inner();
     assert_eq!(seen(mine), [row("a", 25.0)]);
-    denied(usage(alice, "b").await);
+    denied(usage(alice.clone(), "b").await);
+
+    // Followed, the same: what she may read at once, then again when a
+    // report changes it, without asking.
+    let mut follow = alice
+        .clone()
+        .watch_usage(legion_proto::v1::UsageRequest {
+            namespace: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let first = follow.message().await.unwrap().unwrap();
+    assert_eq!(seen(first), [row("a", 25.0)]);
+    let mut d = d1.clone();
+    d.heartbeat(HeartbeatRequest {
+        node: String::new(),
+        usage: vec![task("a", 75.0), task("b", 10.0)],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let next = tokio::time::timeout(Duration::from_secs(10), follow.message())
+        .await
+        .expect("the report is sent on within seconds")
+        .unwrap()
+        .unwrap();
+    assert_eq!(seen(next), [row("a", 75.0)]);
+    let mut alice = alice;
+    denied(
+        alice
+            .watch_usage(legion_proto::v1::UsageRequest {
+                namespace: "b".into(),
+            })
+            .await,
+    );
 }
 
 /// A manager forwards a user's request with the user's name, and the leader
@@ -3196,7 +3231,13 @@ async fn the_leader_reports_the_cluster() {
     ))
     .await;
     apply(object("Volume", "team", "data", serde_json::json!({}))).await;
-    apply(object("Volume", "team", "pg", serde_json::json!({ "size": "2Gi" }))).await;
+    apply(object(
+        "Volume",
+        "team",
+        "pg",
+        serde_json::json!({ "size": "2Gi" }),
+    ))
+    .await;
 
     // The controllers make the tasks; with no node, they wait.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
