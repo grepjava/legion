@@ -8,6 +8,10 @@ import { defineConfig } from 'vite';
 const target = process.env.CONSOLE;
 
 export default defineConfig({
+  // Nothing inlined as a `data:` address: the console's policy loads fonts
+  // and images from itself only, so an inlined font (a small subset of
+  // Inter's) would be refused.
+  build: { assetsInlineLimit: 0 },
   plugins: [
     // A single-page app: every path gets index.html, whose router takes it.
     sveltekit({
