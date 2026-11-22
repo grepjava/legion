@@ -64,6 +64,8 @@ struct Inner {
     users: Mutex<HashMap<String, User>>,
     /// Single sign-on's client (CONSOLE.md phase 6).
     sso: crate::oidc::Provider,
+    /// Each tab's one stream, by its id (`/api/stream`).
+    hubs: Mutex<HashMap<String, Hub>>,
 }
 
 struct User {
@@ -101,6 +103,7 @@ pub(crate) async fn run(listener: TcpListener, console: Console, api: ApiService
         peer,
         users: Default::default(),
         sso: crate::oidc::Provider::new(),
+        hubs: Default::default(),
     }));
     let router = router(gateway);
     tracing::info!(listen = %console.listen, built = legion_console::built(), "serving the console");
@@ -118,6 +121,7 @@ pub(crate) async fn run(listener: TcpListener, console: Console, api: ApiService
             }
         };
         let (acceptor, router) = (acceptor.clone(), router.clone());
+        let mut closing = closing.clone();
         tokio::spawn(async move {
             let stream =
                 match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
@@ -128,10 +132,23 @@ pub(crate) async fn run(listener: TcpListener, console: Console, api: ApiService
             let service = hyper_util::service::TowerToHyperService::new(router);
             let builder =
                 hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-            if let Err(e) = builder
-                .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), service)
-                .await
-            {
+            let conn = builder
+                .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), service);
+            tokio::pin!(conn);
+            // The manager closing: what is in flight finishes (a stream
+            // ends with it), nothing new is taken, and the connection goes
+            // within seconds, so nothing of the manager is kept alive by a
+            // browser's tab.
+            let served = tokio::select! {
+                r = conn.as_mut() => r,
+                () = async { let _ = closing.wait_for(|c| *c).await; } => {
+                    conn.as_mut().graceful_shutdown();
+                    tokio::time::timeout(Duration::from_secs(5), conn.as_mut())
+                        .await
+                        .unwrap_or(Ok(()))
+                }
+            };
+            if let Err(e) = served {
                 tracing::debug!(%client, "console connection: {e}");
             }
         });
@@ -177,6 +194,8 @@ fn router(gateway: Gateway) -> axum::Router {
         .route("/api/watch/{kind}", get(watch))
         .route("/api/usage", get(usage))
         .route("/api/usage/watch", get(usage_watch))
+        .route("/api/stream", get(stream_open))
+        .route("/api/stream/{id}", post(stream_change))
         .route("/api/alerts", get(alerts))
         .route("/api/events", get(events))
         .route("/api/activity", get(activity))
@@ -852,42 +871,318 @@ enum Step {
     Skip,
 }
 
-/// A gRPC stream as server-sent events: each message `each` makes of one
-/// an event of JSON, `ended` the last when the stream ends and `{error}`
-/// when it fails. A comment every 15 s keeps a quiet one open through
-/// proxies. Over HTTP/2 a page's streams share its one connection. The
-/// browser would open an ended stream again by itself; the console closes
-/// it on a last message (`error`, `end`) and opens it again as it sees fit
-/// (a watch from where its list left off). Dropped when the browser goes,
-/// and the gRPC stream with it.
-fn events_of<T: Send + 'static>(
+/// The JSON messages of something the console follows.
+type Values = futures::stream::BoxStream<'static, serde_json::Value>;
+
+/// A gRPC stream as the JSON messages the console reads: each message
+/// `each` makes of one, `ended` the last when the stream ends and
+/// `{error}` when it fails. Dropped, the gRPC stream goes with it.
+fn values_of<T: Send + 'static>(
     stream: tonic::Streaming<T>,
     each: impl FnMut(T) -> Step + Send + 'static,
     ended: serde_json::Value,
-) -> Response {
-    let event = |v: serde_json::Value| Ok::<_, Infallible>(Event::default().data(v.to_string()));
-    let events = futures::stream::unfold(Some((stream, each, ended)), move |state| async move {
-        let (mut stream, mut each, ended) = state?;
-        loop {
-            let step = match stream.message().await {
-                Ok(Some(m)) => each(m),
-                Ok(None) => Step::Last(ended.clone()),
-                Err(s) => Step::Last(serde_json::json!({ "error": s.message() })),
-            };
-            return match step {
-                Step::Skip => continue,
-                Step::Send(v) => Some((event(v), Some((stream, each, ended)))),
-                Step::Last(v) => Some((event(v), None)),
-            };
-        }
-    });
-    Sse::new(events)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
-        .into_response()
+) -> Values {
+    Box::pin(futures::stream::unfold(
+        Some((stream, each, ended)),
+        |state| async move {
+            let (mut stream, mut each, ended) = state?;
+            loop {
+                let step = match stream.message().await {
+                    Ok(Some(m)) => each(m),
+                    Ok(None) => Step::Last(ended.clone()),
+                    Err(s) => Step::Last(serde_json::json!({ "error": s.message() })),
+                };
+                return match step {
+                    Step::Skip => continue,
+                    Step::Send(v) => Some((v, Some((stream, each, ended)))),
+                    Step::Last(v) => Some((v, None)),
+                };
+            }
+        },
+    ))
 }
 
-/// `Cluster.WatchAlerts` as the user, as server-sent events: `{alerts:
-/// [...]}`, the whole list each time it changes, or `{error}` as the last.
+/// Messages as server-sent events, a comment every 15 s keeping a quiet
+/// stream open through proxies; ended when the manager closes, so its
+/// connection can close too. The browser would open an ended stream again
+/// by itself; the console closes it on a last message (`error`, `end`) and
+/// opens it again as it sees fit.
+fn sse(g: &Gateway, values: Values) -> Response {
+    use futures::StreamExt;
+    let mut closing = g.0.api.closing.clone();
+    let closed = async move {
+        let _ = closing.wait_for(|c| *c).await;
+    };
+    Sse::new(
+        values
+            .take_until(closed)
+            .map(|v| Ok::<_, Infallible>(Event::default().data(v.to_string()))),
+    )
+    .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+    .into_response()
+}
+
+/// What the console follows: on its own stream (`/api/watch/KIND`,
+/// `/api/alerts`, ...) or on its tab's one stream (`/api/stream`), the
+/// same messages either way.
+#[derive(Deserialize)]
+#[serde(tag = "what", rename_all = "kebab-case")]
+enum Follow {
+    /// The changes to objects of `kind` from version `from` on: `{type:
+    /// "put"|"delete", object}`.
+    Watch {
+        kind: String,
+        namespace: Option<String>,
+        from: Option<u64>,
+    },
+    /// `Cluster.WatchAlerts`: `{alerts: [...]}`, the whole list each time
+    /// it changes.
+    Alerts { namespace: Option<String> },
+    /// `Cluster.Events` followed: `{events: [...]}`, those kept first, then
+    /// each as it comes.
+    Events {
+        namespace: Option<String>,
+        kind: Option<String>,
+        name: Option<String>,
+    },
+    /// `Cluster.Activity` followed: `{operations: [...]}`
+    /// (legion_api::activity::Operation), all first, then each as it
+    /// changes.
+    Activity,
+    /// `Cluster.WatchUsage`: the usage as `/api/usage` answers it, all at
+    /// once, then again each time a node's report changes it.
+    Usage { namespace: Option<String> },
+    /// A task's output, as `legion logs` prints it: `{out}` or `{err}` (the
+    /// bytes as text), then `{end: true}` when the container's output ends.
+    Logs {
+        namespace: String,
+        task: String,
+        container: Option<String>,
+        tail: Option<u32>,
+        #[serde(default)]
+        follow: bool,
+    },
+    /// A Build's log (CONSOLE.md phase 5), as `legion build-logs` prints
+    /// it, as a task's: `{out}`, then `{end: true}`.
+    BuildLogs {
+        namespace: String,
+        name: String,
+        #[serde(default)]
+        follow: bool,
+    },
+}
+
+impl Follow {
+    /// Opened as the signed-in user; refused as the call would be.
+    async fn open(self, g: &Gateway, headers: &HeaderMap) -> Result<Values, Refused> {
+        let (_, channel) = g.user(headers).await?;
+        Ok(match self {
+            Follow::Watch {
+                kind,
+                namespace,
+                from,
+            } => {
+                let stream = ObjectsClient::new(channel)
+                    .max_decoding_message_size(crate::MAX_MESSAGE)
+                    .watch(pb::WatchRequest {
+                        kind,
+                        from_version: from.unwrap_or(0),
+                    })
+                    .await?
+                    .into_inner();
+                let namespace = namespace.filter(|n| !n.is_empty());
+                values_of(
+                    stream,
+                    move |e: pb::WatchEvent| {
+                        let Some(object) = e.object else {
+                            return Step::Skip;
+                        };
+                        if let Some(ns) = &namespace
+                            && &object.namespace != ns
+                        {
+                            return Step::Skip;
+                        }
+                        let kind = if e.r#type == pb::watch_event::Type::Delete as i32 {
+                            "delete"
+                        } else {
+                            "put"
+                        };
+                        match object_json(object) {
+                            Ok(o) => Step::Send(serde_json::json!({ "type": kind, "object": o })),
+                            Err(Refused(_, e)) => Step::Last(serde_json::json!({ "error": e })),
+                        }
+                    },
+                    serde_json::json!({ "error": "the watch ended" }),
+                )
+            }
+            Follow::Alerts { namespace } => {
+                let stream = ClusterClient::new(channel)
+                    .watch_alerts(pb::AlertsRequest {
+                        namespace: namespace.unwrap_or_default(),
+                    })
+                    .await?
+                    .into_inner();
+                values_of(
+                    stream,
+                    |r: pb::AlertsResponse| {
+                        Step::Send(serde_json::json!({
+                            "alerts": r.alerts.iter().map(|a| serde_json::json!({
+                                "kind": a.kind,
+                                "severity": a.severity,
+                                "namespace": a.namespace,
+                                "object": a.object,
+                                "message": a.message,
+                                "since_ms": a.since_ms,
+                            })).collect::<Vec<_>>()
+                        }))
+                    },
+                    serde_json::json!({ "error": "the alerts ended" }),
+                )
+            }
+            Follow::Events {
+                namespace,
+                kind,
+                name,
+            } => {
+                let stream = ClusterClient::new(channel)
+                    .events(pb::EventsRequest {
+                        namespace: namespace.unwrap_or_default(),
+                        kind: kind.unwrap_or_default(),
+                        name: name.unwrap_or_default(),
+                        follow: true,
+                    })
+                    .await?
+                    .into_inner();
+                values_of(
+                    stream,
+                    |r: pb::EventsResponse| {
+                        Step::Send(serde_json::json!({
+                            "events": r.events.iter().map(|e| serde_json::json!({
+                                "at_ms": e.at_ms,
+                                "kind": e.kind,
+                                "namespace": e.namespace,
+                                "name": e.name,
+                                "reason": e.reason,
+                                "message": e.message,
+                                "owner": e.owner,
+                            })).collect::<Vec<_>>()
+                        }))
+                    },
+                    serde_json::json!({ "error": "the events ended" }),
+                )
+            }
+            Follow::Activity => {
+                let stream = ClusterClient::new(channel)
+                    .activity(pb::ActivityRequest { follow: true })
+                    .await?
+                    .into_inner();
+                values_of(
+                    stream,
+                    |r: pb::ActivityResponse| {
+                        Step::Send(serde_json::json!({
+                            "operations": r
+                                .operations_json
+                                .iter()
+                                .filter_map(|j| serde_json::from_slice::<serde_json::Value>(j).ok())
+                                .collect::<Vec<_>>()
+                        }))
+                    },
+                    serde_json::json!({ "error": "the activity ended" }),
+                )
+            }
+            Follow::Usage { namespace } => {
+                let stream = ClusterClient::new(channel)
+                    .watch_usage(pb::UsageRequest {
+                        namespace: namespace.unwrap_or_default(),
+                    })
+                    .await?
+                    .into_inner();
+                values_of(
+                    stream,
+                    |r: pb::UsageResponse| Step::Send(usage_json(&r)),
+                    serde_json::json!({ "error": "the usage ended" }),
+                )
+            }
+            Follow::Logs {
+                namespace,
+                task,
+                container,
+                tail,
+                follow,
+            } => {
+                use pb::session_frame::Frame;
+                let (tx, rx) = tokio::sync::mpsc::channel(4);
+                let open = pb::SessionOpen {
+                    namespace,
+                    task,
+                    container: container.unwrap_or_default(),
+                    action: Some(pb::session_open::Action::Logs(pb::LogsOptions {
+                        follow,
+                        tail,
+                        ..Default::default()
+                    })),
+                };
+                tx.send(pb::SessionFrame {
+                    frame: Some(Frame::Open(open)),
+                })
+                .await
+                .expect("the receiver is held");
+                let stream = pb::pods_client::PodsClient::new(channel)
+                    .session(tokio_stream::wrappers::ReceiverStream::new(rx))
+                    .await?
+                    .into_inner();
+                // What each stream has left of a character split between
+                // frames.
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                values_of(
+                    stream,
+                    move |f: pb::SessionFrame| {
+                        // `tx` is kept to the end: closing it would end the
+                        // session's input.
+                        let _input = &tx;
+                        match f.frame {
+                            Some(Frame::Stdout(data)) => {
+                                Step::Send(serde_json::json!({ "out": text_of(&mut out, data) }))
+                            }
+                            Some(Frame::Stderr(data)) => {
+                                Step::Send(serde_json::json!({ "err": text_of(&mut err, data) }))
+                            }
+                            Some(Frame::Error(e)) => {
+                                Step::Last(serde_json::json!({ "error": e.message }))
+                            }
+                            _ => Step::Skip,
+                        }
+                    },
+                    serde_json::json!({ "end": true }),
+                )
+            }
+            Follow::BuildLogs {
+                namespace,
+                name,
+                follow,
+            } => {
+                let stream = ClusterClient::new(channel)
+                    .build_logs(pb::BuildLogsRequest {
+                        namespace,
+                        name,
+                        follow,
+                    })
+                    .await?
+                    .into_inner();
+                let mut pending = Vec::new();
+                values_of(
+                    stream,
+                    move |c: pb::BuildLogsChunk| {
+                        Step::Send(serde_json::json!({ "out": text_of(&mut pending, c.data) }))
+                    },
+                    serde_json::json!({ "end": true }),
+                )
+            }
+        })
+    }
+}
+
+/// `Follow::Alerts` as server-sent events of its own.
 async fn alerts(
     State(g): State<Gateway>,
     headers: HeaderMap,
@@ -895,29 +1190,260 @@ async fn alerts(
     Query(q): Query<AlertsQuery>,
 ) -> Result<Response, Refused> {
     same_origin(&headers, &uri)?;
-    let (_, channel) = g.user(&headers).await?;
-    let stream = ClusterClient::new(channel)
-        .watch_alerts(pb::AlertsRequest {
-            namespace: q.namespace.unwrap_or_default(),
-        })
-        .await?
-        .into_inner();
-    Ok(events_of(
-        stream,
-        |r: pb::AlertsResponse| {
-            Step::Send(serde_json::json!({
-                "alerts": r.alerts.iter().map(|a| serde_json::json!({
-                    "kind": a.kind,
-                    "severity": a.severity,
-                    "namespace": a.namespace,
-                    "object": a.object,
-                    "message": a.message,
-                    "since_ms": a.since_ms,
-                })).collect::<Vec<_>>()
-            }))
-        },
-        serde_json::json!({ "error": "the alerts ended" }),
-    ))
+    let follow = Follow::Alerts {
+        namespace: q.namespace,
+    };
+    Ok(sse(&g, follow.open(&g, &headers).await?))
+}
+
+/// `Follow::Events` as server-sent events of its own.
+async fn events(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(q): Query<EventsQuery>,
+) -> Result<Response, Refused> {
+    same_origin(&headers, &uri)?;
+    let follow = Follow::Events {
+        namespace: q.namespace,
+        kind: q.kind,
+        name: q.name,
+    };
+    Ok(sse(&g, follow.open(&g, &headers).await?))
+}
+
+/// `Follow::Activity` as server-sent events of its own.
+async fn activity(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Response, Refused> {
+    same_origin(&headers, &uri)?;
+    Ok(sse(&g, Follow::Activity.open(&g, &headers).await?))
+}
+
+/// `Follow::Watch` as server-sent events of its own.
+async fn watch(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(kind): Path<String>,
+    Query(from): Query<WatchFrom>,
+) -> Result<Response, Refused> {
+    same_origin(&headers, &uri)?;
+    let follow = Follow::Watch {
+        kind,
+        namespace: from.namespace,
+        from: from.from,
+    };
+    Ok(sse(&g, follow.open(&g, &headers).await?))
+}
+
+/// `Follow::Usage` as server-sent events of its own.
+async fn usage_watch(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(scope): Query<Scope>,
+) -> Result<Response, Refused> {
+    same_origin(&headers, &uri)?;
+    let follow = Follow::Usage {
+        namespace: scope.namespace,
+    };
+    Ok(sse(&g, follow.open(&g, &headers).await?))
+}
+
+/// `Follow::Logs` as server-sent events of its own.
+async fn logs(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path((namespace, task)): Path<(String, String)>,
+    Query(q): Query<LogsQuery>,
+) -> Result<Response, Refused> {
+    same_origin(&headers, &uri)?;
+    let follow = Follow::Logs {
+        namespace,
+        task,
+        container: q.container,
+        tail: q.tail,
+        follow: q.follow,
+    };
+    Ok(sse(&g, follow.open(&g, &headers).await?))
+}
+
+/// `Follow::BuildLogs` as server-sent events of its own.
+async fn build_logs(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(q): Query<BuildLogsQuery>,
+) -> Result<Response, Refused> {
+    same_origin(&headers, &uri)?;
+    let follow = Follow::BuildLogs {
+        namespace,
+        name,
+        follow: q.follow,
+    };
+    Ok(sse(&g, follow.open(&g, &headers).await?))
+}
+
+/// The most tabs a session keeps a stream open in, and the most a tab
+/// follows on it at once.
+const MAX_TABS: usize = 64;
+const MAX_FOLLOWS: usize = 64;
+
+/// A tab's one stream (`/api/stream`): whose it is, where its messages go,
+/// and what it follows, by the id the tab gave each.
+struct Hub {
+    session: String,
+    tx: tokio::sync::mpsc::Sender<serde_json::Value>,
+    follows: HashMap<String, tokio::task::AbortHandle>,
+}
+
+/// Held by a tab's stream: when the tab goes, so does its response and
+/// with it this, stopping all it followed.
+struct HubClosed(Gateway, String);
+
+impl Drop for HubClosed {
+    fn drop(&mut self) {
+        if let Some(hub) = self.0.0.hubs.lock().unwrap().remove(&self.1) {
+            for f in hub.follows.values() {
+                f.abort();
+            }
+        }
+    }
+}
+
+/// A tab's one stream of server-sent events, whatever it follows: first
+/// `{stream: ID}`, then `{id, data}` for each message of what the tab
+/// follows (`POST /api/stream/ID`), as its stream of its own would send
+/// it. One connection however much a page follows, so a browser speaking
+/// HTTP/1.1 to the console (six connections to a site, a proxy in front,
+/// the dev server) is not held up by its own streams.
+async fn stream_open(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Response, Refused> {
+    use futures::StreamExt;
+    same_origin(&headers, &uri)?;
+    let (session, _) = g.user(&headers).await?;
+    let id = legion_pki::random_secret();
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    {
+        let mut hubs = g.0.hubs.lock().unwrap();
+        if hubs.values().filter(|h| h.session == session).count() >= MAX_TABS {
+            return Err(Refused(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many console tabs open for this session".into(),
+            ));
+        }
+        hubs.insert(
+            id.clone(),
+            Hub {
+                session,
+                tx,
+                follows: HashMap::new(),
+            },
+        );
+    }
+    let closed = HubClosed(g.clone(), id.clone());
+    let first = futures::stream::once(async move { serde_json::json!({ "stream": id }) });
+    let values = first
+        .chain(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .map(move |v| {
+            let _held = &closed;
+            v
+        });
+    Ok(sse(&g, Box::pin(values)))
+}
+
+#[derive(Deserialize)]
+struct StreamChange {
+    #[serde(default)]
+    add: Vec<Followed>,
+    #[serde(default)]
+    remove: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct Followed {
+    id: String,
+    #[serde(flatten)]
+    follow: Follow,
+}
+
+/// What a tab's stream follows, changed: each removed stopped, each added
+/// opened as the user and its messages sent on as `{id, data}`. Answers
+/// `{refused: {ID: {status, error}}}` for those refused (not allowed, too
+/// many). Only from the console's page, by the session whose stream it
+/// is; a stream gone (the tab's connection dropped) answers 404, for the
+/// tab to open another.
+async fn stream_change(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(id): Path<String>,
+    Json(change): Json<StreamChange>,
+) -> Result<Response, Refused> {
+    g.writer(&headers, &uri, None).await?;
+    let (session, _) = g.user(&headers).await?;
+    let gone = || Refused(StatusCode::NOT_FOUND, "no such stream; open another".into());
+    let tx = {
+        let mut hubs = g.0.hubs.lock().unwrap();
+        let hub = hubs
+            .get_mut(&id)
+            .filter(|h| h.session == session)
+            .ok_or_else(gone)?;
+        for r in &change.remove {
+            if let Some(f) = hub.follows.remove(r) {
+                f.abort();
+            }
+        }
+        hub.tx.clone()
+    };
+    let mut refused = serde_json::Map::new();
+    for Followed { id: name, follow } in change.add {
+        let mut values = match follow.open(&g, &headers).await {
+            Ok(v) => v,
+            Err(Refused(status, why)) => {
+                refused.insert(
+                    name,
+                    serde_json::json!({ "status": status.as_u16(), "error": why }),
+                );
+                continue;
+            }
+        };
+        let (tx, tagged) = (tx.clone(), name.clone());
+        let task = tokio::spawn(async move {
+            use futures::StreamExt;
+            while let Some(v) = values.next().await {
+                let message = serde_json::json!({ "id": tagged, "data": v });
+                if tx.send(message).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let mut hubs = g.0.hubs.lock().unwrap();
+        let Some(hub) = hubs.get_mut(&id) else {
+            task.abort();
+            return Err(gone());
+        };
+        if hub.follows.len() >= MAX_FOLLOWS && !hub.follows.contains_key(&name) {
+            task.abort();
+            refused.insert(
+                name,
+                serde_json::json!({ "status": 429, "error": "this tab follows too much at once" }),
+            );
+            continue;
+        }
+        if let Some(old) = hub.follows.insert(name, task.abort_handle()) {
+            old.abort();
+        }
+    }
+    Ok(Json(serde_json::json!({ "refused": refused })).into_response())
 }
 
 #[derive(Deserialize)]
@@ -927,124 +1453,10 @@ struct EventsQuery {
     name: Option<String>,
 }
 
-/// `Cluster.Events` followed, as the user, as server-sent events:
-/// `{events: [...]}`, those kept first, then each as it comes, or `{error}`
-/// as the last.
-async fn events(
-    State(g): State<Gateway>,
-    headers: HeaderMap,
-    uri: Uri,
-    Query(q): Query<EventsQuery>,
-) -> Result<Response, Refused> {
-    same_origin(&headers, &uri)?;
-    let (_, channel) = g.user(&headers).await?;
-    let stream = ClusterClient::new(channel)
-        .events(pb::EventsRequest {
-            namespace: q.namespace.unwrap_or_default(),
-            kind: q.kind.unwrap_or_default(),
-            name: q.name.unwrap_or_default(),
-            follow: true,
-        })
-        .await?
-        .into_inner();
-    Ok(events_of(
-        stream,
-        |r: pb::EventsResponse| {
-            Step::Send(serde_json::json!({
-                "events": r.events.iter().map(|e| serde_json::json!({
-                    "at_ms": e.at_ms,
-                    "kind": e.kind,
-                    "namespace": e.namespace,
-                    "name": e.name,
-                    "reason": e.reason,
-                    "message": e.message,
-                    "owner": e.owner,
-                })).collect::<Vec<_>>()
-            }))
-        },
-        serde_json::json!({ "error": "the events ended" }),
-    ))
-}
-
-/// `Cluster.Activity` followed, as the user, as server-sent events:
-/// `{operations: [...]}` (legion_api::activity::Operation), all of them
-/// first, then each as it changes, or `{error}` as the last.
-async fn activity(
-    State(g): State<Gateway>,
-    headers: HeaderMap,
-    uri: Uri,
-) -> Result<Response, Refused> {
-    same_origin(&headers, &uri)?;
-    let (_, channel) = g.user(&headers).await?;
-    let stream = ClusterClient::new(channel)
-        .activity(pb::ActivityRequest { follow: true })
-        .await?
-        .into_inner();
-    Ok(events_of(
-        stream,
-        |r: pb::ActivityResponse| {
-            Step::Send(serde_json::json!({
-                "operations": r
-                    .operations_json
-                    .iter()
-                    .filter_map(|j| serde_json::from_slice::<serde_json::Value>(j).ok())
-                    .collect::<Vec<_>>()
-            }))
-        },
-        serde_json::json!({ "error": "the activity ended" }),
-    ))
-}
-
 #[derive(Deserialize)]
 struct WatchFrom {
     namespace: Option<String>,
     from: Option<u64>,
-}
-
-/// The changes to objects of `kind` from version `from` on, as
-/// server-sent events `{type: "put"|"delete", object}`, until the browser
-/// goes; an error ends it with `{error}`.
-async fn watch(
-    State(g): State<Gateway>,
-    headers: HeaderMap,
-    uri: Uri,
-    Path(kind): Path<String>,
-    Query(from): Query<WatchFrom>,
-) -> Result<Response, Refused> {
-    same_origin(&headers, &uri)?;
-    let (_, channel) = g.user(&headers).await?;
-    let stream = ObjectsClient::new(channel)
-        .max_decoding_message_size(crate::MAX_MESSAGE)
-        .watch(pb::WatchRequest {
-            kind,
-            from_version: from.from.unwrap_or(0),
-        })
-        .await?
-        .into_inner();
-    let namespace = from.namespace.filter(|n| !n.is_empty());
-    Ok(events_of(
-        stream,
-        move |e: pb::WatchEvent| {
-            let Some(object) = e.object else {
-                return Step::Skip;
-            };
-            if let Some(ns) = &namespace
-                && &object.namespace != ns
-            {
-                return Step::Skip;
-            }
-            let kind = if e.r#type == pb::watch_event::Type::Delete as i32 {
-                "delete"
-            } else {
-                "put"
-            };
-            match object_json(object) {
-                Ok(o) => Step::Send(serde_json::json!({ "type": kind, "object": o })),
-                Err(Refused(_, e)) => Step::Last(serde_json::json!({ "error": e })),
-            }
-        },
-        serde_json::json!({ "error": "the watch ended" }),
-    ))
 }
 
 /// What each node's tasks use now, as `legion top` shows it: `{nodes:
@@ -1062,30 +1474,6 @@ async fn usage(
         .await?
         .into_inner();
     Ok(Json(usage_json(&r)).into_response())
-}
-
-/// The usage as `/api/usage` answers it, as server-sent events: all of it
-/// at once, then again each time a node's report changes it, or `{error}`
-/// as the last (the leader changing, say).
-async fn usage_watch(
-    State(g): State<Gateway>,
-    headers: HeaderMap,
-    uri: Uri,
-    Query(scope): Query<Scope>,
-) -> Result<Response, Refused> {
-    same_origin(&headers, &uri)?;
-    let (_, channel) = g.user(&headers).await?;
-    let stream = ClusterClient::new(channel)
-        .watch_usage(pb::UsageRequest {
-            namespace: scope.namespace.unwrap_or_default(),
-        })
-        .await?
-        .into_inner();
-    Ok(events_of(
-        stream,
-        |r: pb::UsageResponse| Step::Send(usage_json(&r)),
-        serde_json::json!({ "error": "the usage ended" }),
-    ))
 }
 
 fn usage_json(r: &pb::UsageResponse) -> serde_json::Value {
@@ -1410,95 +1798,10 @@ struct LogsQuery {
     follow: bool,
 }
 
-/// A task's output, as `legion logs` prints it, as server-sent events
-/// `{out}` or `{err}` (the bytes as text), then `{end: true}` when the
-/// container's output ends or `{error}` when the session fails.
-async fn logs(
-    State(g): State<Gateway>,
-    headers: HeaderMap,
-    uri: Uri,
-    Path((namespace, task)): Path<(String, String)>,
-    Query(q): Query<LogsQuery>,
-) -> Result<Response, Refused> {
-    use pb::session_frame::Frame;
-    same_origin(&headers, &uri)?;
-    let (_, channel) = g.user(&headers).await?;
-    let (tx, rx) = tokio::sync::mpsc::channel(4);
-    let open = pb::SessionOpen {
-        namespace,
-        task,
-        container: q.container.unwrap_or_default(),
-        action: Some(pb::session_open::Action::Logs(pb::LogsOptions {
-            follow: q.follow,
-            tail: q.tail,
-            ..Default::default()
-        })),
-    };
-    tx.send(pb::SessionFrame {
-        frame: Some(Frame::Open(open)),
-    })
-    .await
-    .expect("the receiver is held");
-    let stream = pb::pods_client::PodsClient::new(channel)
-        .session(tokio_stream::wrappers::ReceiverStream::new(rx))
-        .await?
-        .into_inner();
-    // What each stream has left of a character split between frames.
-    let (mut out, mut err) = (Vec::new(), Vec::new());
-    Ok(events_of(
-        stream,
-        move |f: pb::SessionFrame| {
-            // `tx` is kept to the end: closing it would end the session's
-            // input.
-            let _input = &tx;
-            match f.frame {
-                Some(Frame::Stdout(data)) => {
-                    Step::Send(serde_json::json!({ "out": text_of(&mut out, data) }))
-                }
-                Some(Frame::Stderr(data)) => {
-                    Step::Send(serde_json::json!({ "err": text_of(&mut err, data) }))
-                }
-                Some(Frame::Error(e)) => Step::Last(serde_json::json!({ "error": e.message })),
-                _ => Step::Skip,
-            }
-        },
-        serde_json::json!({ "end": true }),
-    ))
-}
-
 #[derive(Deserialize)]
 struct BuildLogsQuery {
     #[serde(default)]
     follow: bool,
-}
-
-/// A Build's log (CONSOLE.md phase 5), as `legion build-logs` prints it,
-/// as the same events as a task's: `{out}`, then `{end: true}`.
-async fn build_logs(
-    State(g): State<Gateway>,
-    headers: HeaderMap,
-    uri: Uri,
-    Path((namespace, name)): Path<(String, String)>,
-    Query(q): Query<BuildLogsQuery>,
-) -> Result<Response, Refused> {
-    same_origin(&headers, &uri)?;
-    let (_, channel) = g.user(&headers).await?;
-    let stream = ClusterClient::new(channel)
-        .build_logs(pb::BuildLogsRequest {
-            namespace,
-            name,
-            follow: q.follow,
-        })
-        .await?
-        .into_inner();
-    let mut pending = Vec::new();
-    Ok(events_of(
-        stream,
-        move |c: pb::BuildLogsChunk| {
-            Step::Send(serde_json::json!({ "out": text_of(&mut pending, c.data) }))
-        },
-        serde_json::json!({ "end": true }),
-    ))
 }
 
 /// `data` after what `pending` held, as text, keeping back the start of a

@@ -569,6 +569,200 @@ async fn sign_in_as(f: &Fixture, user: &str, role: Role) -> (String, String) {
     (session, token)
 }
 
+/// A tab's one stream, read as it comes over HTTP/1.1 (as a browser behind
+/// a proxy that speaks only that reads it): each server-sent event's JSON.
+async fn tab_stream(
+    ca: &Ca,
+    addr: &str,
+    cookie: &str,
+) -> tokio::sync::mpsc::UnboundedReceiver<serde_json::Value> {
+    let io = hyper_util::rt::TokioIo::new(tls(ca, addr, false).await);
+    let (mut send, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    tokio::spawn(conn);
+    let req = hyper::Request::get("/api/stream")
+        .header("host", addr)
+        .header("cookie", cookie)
+        .header("accept", "text/event-stream")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let res = send.send_request(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut body = res.into_body();
+        let mut text = String::new();
+        while let Some(Ok(frame)) = body.frame().await {
+            if let Ok(data) = frame.into_data() {
+                text.push_str(&String::from_utf8_lossy(&data));
+            }
+            while let Some(end) = text.find("\n\n") {
+                let event: String = text.drain(..end + 2).collect();
+                for line in event.lines() {
+                    if let Some(data) = line.strip_prefix("data:")
+                        && tx.send(serde_json::from_str(data.trim()).unwrap()).is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    rx
+}
+
+/// The next message on a tab's stream within 20 s.
+async fn next(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(20), rx.recv())
+        .await
+        .expect("a message within 20 s")
+        .expect("the stream open")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tab_follows_everything_on_one_stream() {
+    let f = start().await;
+    let mut objects = ObjectsClient::new(f.admin.clone());
+    for (kind, ns, name, spec) in [
+        ("Namespace", "", "shop", serde_json::json!({})),
+        ("Namespace", "", "bank", serde_json::json!({})),
+        (
+            "RoleBinding",
+            "shop",
+            "alice",
+            serde_json::json!({ "user": "alice", "role": "view" }),
+        ),
+        (
+            "Config",
+            "shop",
+            "menu",
+            serde_json::json!({ "text": "soup" }),
+        ),
+    ] {
+        objects.apply(object(kind, ns, name, spec)).await.unwrap();
+    }
+    let console = f.console_addr.to_string();
+    let origin = format!("https://{console}");
+    let (alice, token) = sign_in(&f, "alice").await;
+    let change = |id: String, body: serde_json::Value, cookie: String, token: String| {
+        let (ca, console, origin) = (&f.ca, &console, &origin);
+        async move {
+            request(
+                ca,
+                console,
+                false,
+                "POST",
+                &format!("/api/stream/{id}"),
+                Some(&cookie),
+                Some(origin),
+                Some(body),
+                &[("x-legion-csrf", &token)],
+            )
+            .await
+        }
+    };
+
+    // One stream for the tab, over HTTP/1.1; its id first.
+    let mut rx = tab_stream(&f.ca, &console, &alice).await;
+    let id = next(&mut rx).await["stream"]
+        .as_str()
+        .expect("the stream's id first")
+        .to_owned();
+
+    // Three things followed on it; another namespace's usage refused.
+    let added = change(
+        id.clone(),
+        serde_json::json!({ "add": [
+            { "id": "w", "what": "watch", "kind": "Config", "namespace": "shop" },
+            { "id": "a", "what": "alerts", "namespace": "shop" },
+            { "id": "u", "what": "usage", "namespace": "shop" },
+            { "id": "theirs", "what": "usage", "namespace": "bank" },
+        ] }),
+        alice.clone(),
+        token.clone(),
+    )
+    .await;
+    assert_eq!(added.status, 200, "{}", added.text);
+    assert_eq!(
+        added.body["refused"]["theirs"]["status"], 403,
+        "{}",
+        added.text
+    );
+    assert!(added.body["refused"].get("w").is_none(), "{}", added.text);
+    let mut seen = std::collections::BTreeMap::new();
+    while seen.len() < 3 {
+        let m = next(&mut rx).await;
+        seen.entry(m["id"].as_str().unwrap().to_owned())
+            .or_insert(m["data"].clone());
+    }
+    assert_eq!(seen["w"]["type"], "put");
+    assert_eq!(seen["w"]["object"]["metadata"]["name"], "menu");
+    assert!(seen["a"]["alerts"].is_array(), "{seen:?}");
+    assert!(seen["u"]["nodes"].is_array(), "{seen:?}");
+
+    // Another session may not change her stream, nor may a page without
+    // her session's token.
+    let (bob, bob_token) = sign_in(&f, "bob").await;
+    let theirs = change(
+        id.clone(),
+        serde_json::json!({ "remove": ["w"] }),
+        bob,
+        bob_token,
+    )
+    .await;
+    assert_eq!(theirs.status, 404, "{}", theirs.text);
+    let forged = change(
+        id.clone(),
+        serde_json::json!({ "remove": ["w"] }),
+        alice.clone(),
+        "forged".into(),
+    )
+    .await;
+    assert_eq!(forged.status, 403, "{}", forged.text);
+
+    // Dropped, the watch sends no more; what else it follows goes on.
+    let dropped = change(
+        id.clone(),
+        serde_json::json!({ "remove": ["w"] }),
+        alice.clone(),
+        token.clone(),
+    )
+    .await;
+    assert_eq!(dropped.status, 200, "{}", dropped.text);
+    objects
+        .apply(object(
+            "Config",
+            "shop",
+            "menu",
+            serde_json::json!({ "text": "stew" }),
+        ))
+        .await
+        .unwrap();
+    let quiet = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let m = next(&mut rx).await;
+            if m["id"] == "w" {
+                return m;
+            }
+        }
+    })
+    .await;
+    assert!(quiet.is_err(), "the dropped watch sent {quiet:?}");
+
+    // A stream no one has answers 404, for the tab to open another.
+    let unknown = change(
+        "no-such-stream".into(),
+        serde_json::json!({ "remove": [] }),
+        alice,
+        token,
+    )
+    .await;
+    assert_eq!(unknown.status, 404, "{}", unknown.text);
+    let _ = f.stop.send(());
+    f.task.await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_console_writes_as_its_user() {
     let f = start().await;
