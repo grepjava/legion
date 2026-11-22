@@ -127,6 +127,11 @@ Stream live `PUT`/`DELETE` object events, from now on or after a version.
 - `convert -c <COMPOSE_FILE>` (print Legion YAML)
 - `ls [-n <NS>]`, `stop <STACK>`, `start <STACK>`, `rm <STACK>` (keeps Volumes)
 
+### `legion app <SUBCOMMAND>`
+Ready-to-deploy applications from the daemonless catalog (FreeBSD images, read from `catalog.daemonless.io` when asked; `--catalog URL` for another):
+- `list [--category C]`, `show <APP>` (its variables, kinds and defaults, and its image's variants)
+- `deploy <APP> [--name STACK] [-n NS] [--set NAME=VALUE]... [--variant TAG] [--dry-run]`: deployed as a stack, in a namespace made if missing allowing what its containers ask for (SysV IPC, raw sockets); a storage variable names a Volume, a secret not set is made up and printed once.
+
 ### `legion stop <SERVICE>` / `legion start <SERVICE>`
 Stop a service's tasks while preserving its spec and replica count, or start it again.
 
@@ -160,7 +165,12 @@ Trigger a CronJob immediately outside its schedule.
 - `legion connections [-n <NS>]` (the connections the nodes' pf saw, by service and port)
 - `legion topology [-n <NS>]` (each service with its ports, Routes, tasks, Volumes, what may reach it and what was seen)
 - `legion load-balancers [-n <NS>]` (CARP holders and states)
-- `legion volume <move|backup|restore|snapshots|snapshot|rollback|rm-snapshot>` (`move <VOLUME> <NODE> [--dry-run|--force]` is checked first, see Checks before disruption)
+- `legion volume <move|backup|restore|backups|snapshots|snapshot|rollback|rm-snapshot|clone>` (`move <VOLUME> <NODE> [--dry-run|--force]` is checked first, see Checks before disruption)
+  - `snapshots` lists a person's and the schedules' (`legion-auto-<every>-<time>`), not the bases of moves, replicas and backups; `legion-` names are Legion's, so a person's may not start so.
+  - `rollback <VOLUME> <SNAPSHOT> [--yes]` says which later snapshots it destroys and asks first.
+  - `clone <VOLUME>@<SNAPSHOT> <NAME>` copies a snapshot's data into a new Volume on the same node, leaving the Volume as it is.
+  - `backups <VOLUME> [--from TARGET]` lists what its BackupTarget holds of it, oldest first; `restore --from TARGET <VOLUME>@<BACKUP> --node NODE [--name NAME]` restores one of them onto NODE as a new Volume.
+  - A Volume's `snapshots: [{every, keep}]` and `backup: {target, every, keep}` take them on a schedule (DESIGN.md §4.3); a `BackupTarget` is a ZFS host over SSH (`ssh: {host, port, user, dataset, keySecret, hostKey}`) or a directory on the node (`directory: {path}`).
 
 ---
 
