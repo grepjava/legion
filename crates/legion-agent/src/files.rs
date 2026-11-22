@@ -11,7 +11,12 @@
 //! when its pod next starts.
 //!
 //! The same tmpfs holds the pod's `resolv.conf`, mounted at
-//! `/etc/resolv.conf` in every container that does not mount its own.
+//! `/etc/resolv.conf` in every container that does not mount its own, and
+//! its `hosts`, at `/etc/hosts`: `localhost`, and the containers' own host
+//! names at the pod's address, as Docker and Kubernetes give them, for the
+//! programs that look themselves up (a Next.js server binding to
+//! `$HOSTNAME`). The address is written in once the pod has it, before
+//! its containers start.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -87,6 +92,54 @@ fn wants_files(pod: &PodSpec) -> bool {
 }
 
 const RESOLV_CONF: &str = "/etc/resolv.conf";
+const HOSTS: &str = "/etc/hosts";
+
+/// The host names the pod's containers have: a stateful task's
+/// `<service>-<ordinal>`, else each container's own name (the runtime's
+/// default), with the task's name.
+pub(crate) fn host_names(a: &Assignment) -> Vec<String> {
+    match a.spec.hostname() {
+        Some(h) => vec![h],
+        None => std::iter::once(a.key.name.clone())
+            .chain(
+                a.spec
+                    .pod
+                    .containers()
+                    .map(|c| crate::pod::container_name(a, Some(&c.name))),
+            )
+            .collect(),
+    }
+}
+
+/// A pod's `/etc/hosts`: `localhost`, and `names` at `ip` once known.
+pub(crate) fn hosts_text(names: &[String], ip: Option<std::net::Ipv4Addr>) -> String {
+    let mut out = String::from("127.0.0.1\tlocalhost localhost.my.domain\n::1\t\tlocalhost localhost.my.domain\n");
+    if let Some(ip) = ip
+        && !names.is_empty()
+    {
+        out += &format!("{ip}\t{}\n", names.join(" "));
+    }
+    out
+}
+
+/// Writes the pod's address into its `/etc/hosts`, once it has one; for a
+/// pod whose files carry one (a pod on the network).
+pub(crate) async fn write_hosts(
+    sys: &std::sync::Arc<dyn Sys>,
+    root: &Path,
+    a: &Assignment,
+    ip: std::net::Ipv4Addr,
+) -> Result<(), String> {
+    let path = task_dir(root, &a.uid).join("hosts");
+    let text = hosts_text(&host_names(a), Some(ip));
+    crate::task::blocking(sys, move |_| {
+        if !path.exists() {
+            return Ok(());
+        }
+        write_file(&path, text.as_bytes()).map_err(|e| format!("writing the pod's hosts: {e}"))
+    })
+    .await
+}
 
 /// Fetches the pod's secrets and configs and writes the files, with
 /// `resolv_conf` if given. The error says what is missing or failed.
@@ -151,14 +204,24 @@ pub(crate) async fn prepare<C: Control>(
             let source = dir.join("resolv.conf");
             m.push(Mount::nullfs(&source.to_string_lossy(), RESOLV_CONF, true));
         }
+        let own_hosts = m.iter().any(|m| m.destination == HOSTS)
+            || c.volume_mounts
+                .iter()
+                .any(|v| same_path(&v.path, HOSTS) || same_path(&v.path, "/etc"));
+        if resolv_conf.is_some() && !own_hosts {
+            let source = dir.join("hosts");
+            m.push(Mount::nullfs(&source.to_string_lossy(), HOSTS, true));
+        }
         files.mounts.insert(c.name.clone(), m);
     }
     let size = tmpfs_size(
         values
             .values()
             .map(Vec::len)
-            .chain(resolv_conf.as_ref().map(String::len)),
+            .chain(resolv_conf.as_ref().map(String::len))
+            .chain(resolv_conf.as_ref().map(|_| 4096)),
     );
+    let hosts = resolv_conf.as_ref().map(|_| hosts_text(&host_names(a), None));
     let write = move |sys: &dyn Sys| -> Result<(), String> {
         let path = dir.to_str().ok_or("the files directory is not UTF-8")?;
         std::fs::create_dir_all(&dir).map_err(|e| format!("creating {path}: {e}"))?;
@@ -175,6 +238,10 @@ pub(crate) async fn prepare<C: Control>(
         if let Some(conf) = &resolv_conf {
             write_file(&dir.join("resolv.conf"), conf.as_bytes())
                 .map_err(|e| format!("writing resolv.conf: {e}"))?;
+        }
+        if let Some(hosts) = &hosts {
+            write_file(&dir.join("hosts"), hosts.as_bytes())
+                .map_err(|e| format!("writing hosts: {e}"))?;
         }
         Ok(())
     };
@@ -292,7 +359,7 @@ pub(crate) fn present(root: &Path) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PAGE, SLACK, same_path, tmpfs_size};
+    use super::{PAGE, SLACK, hosts_text, same_path, tmpfs_size};
 
     #[test]
     fn a_tmpfs_holds_each_file_in_whole_pages() {
@@ -314,5 +381,16 @@ mod tests {
         }
         assert!(!same_path("/etc2", "/etc"));
         assert!(!same_path("/etc/resolv.conf", "/etc"));
+    }
+
+    #[test]
+    fn a_pods_hosts_name_its_containers_at_its_address_once_known() {
+        let names = vec!["web-1-1".to_owned(), "shop_web-1-1_app".to_owned()];
+        let before = hosts_text(&names, None);
+        assert!(before.starts_with("127.0.0.1	localhost"), "{before}");
+        assert!(!before.contains("web-1-1"), "no address yet: {before}");
+        let after = hosts_text(&names, Some("10.200.0.7".parse().unwrap()));
+        assert!(after.ends_with("10.200.0.7	web-1-1 shop_web-1-1_app
+"), "{after}");
     }
 }

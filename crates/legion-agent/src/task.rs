@@ -703,6 +703,12 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             .map_err(|e| Abort::Failed(format!("starting the infra container: {e}")))?;
         self.check_infra_jail(&infra).await?;
         self.attach(&infra, false).await?;
+        // Its address in its `/etc/hosts`, before its containers mount it.
+        if let Some(ip) = self.status.ip.as_deref().and_then(|s| s.parse().ok()) {
+            files::write_hosts(&self.ctx.sys, &self.ctx.files_dir, &self.a, ip)
+                .await
+                .map_err(Abort::Failed)?;
+        }
         self.guarded().await?;
 
         let init: Vec<_> = self.pod().init_containers.clone();
