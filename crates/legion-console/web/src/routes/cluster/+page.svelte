@@ -3,7 +3,7 @@
   // What an admin runs the cluster with, as the CLI does it: the CA and
   // its rotation, join tokens, autolock, the control state's backup and
   // users' credentials.
-  import { api, downloads, type CaStatus } from '#lib/api.ts';
+  import { api, downloads, followCa, type CaStatus } from '#lib/api.ts';
   import { session } from '#lib/session.svelte.ts';
   import { t, tn } from '#lib/i18n.svelte.ts';
   import { Table } from '#lib/table.svelte.ts';
@@ -20,25 +20,16 @@
 
   const fail = (e: unknown) => (error = (e as Error).message);
 
-  // A rotation's progress is each holder moving to the new CA: asked for
-  // again while one runs.
-  $effect(() => {
-    let stopped = false;
-    let timer: ReturnType<typeof setTimeout>;
-    async function poll() {
-      try {
-        ca = await api.ca();
-      } catch (e) {
-        fail(e);
+  // A rotation's progress is each holder moving to the new CA: followed,
+  // the manager sending it again as they move.
+  $effect(() =>
+    followCa(
+      (c) => (ca = c),
+      (why) => {
+        if (why) error = why;
       }
-      if (!stopped) timer = setTimeout(poll, ca?.previous ? 3000 : 30000);
-    }
-    poll();
-    return () => {
-      stopped = true;
-      clearTimeout(timer);
-    };
-  });
+    )
+  );
 
   const short = (d: string) => (d ? d.slice(0, 12) : t('not known'));
   const moved = $derived(ca ? ca.holders.filter((h) => h.issuer === ca?.digest).length : 0);

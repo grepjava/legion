@@ -8,6 +8,8 @@
     api,
     bytes,
     follow,
+    followLoadBalancers,
+    followStatus,
     followUsage,
     loadText,
     type Balancer,
@@ -71,12 +73,17 @@
         : 'good'
   );
 
-  $effect(() => {
-    api
-      .status()
-      .then((s) => (status = s))
-      .catch((e) => (statusError = e.message));
-  });
+  $effect(() =>
+    followStatus(
+      (s) => {
+        status = s;
+        statusError = '';
+      },
+      (why) => {
+        if (why) statusError = why;
+      }
+    )
+  );
 
   $effect(() => {
     const ns = session.namespace;
@@ -97,26 +104,13 @@
       sampled = new Date();
     })
   );
-  // The namespace's virtual addresses and who holds them, read again now
-  // and then.
+  // The namespace's virtual addresses and who holds them, as CARP moves
+  // them.
   $effect(() => {
     const ns = session.namespace;
     balancers = [];
     if (!ns) return;
-    let stopped = false;
-    const read = () =>
-      api
-        .loadBalancers(ns)
-        .then((b) => {
-          if (!stopped) balancers = b.balancers;
-        })
-        .catch(() => {});
-    read();
-    const every = setInterval(read, 10_000);
-    return () => {
-      stopped = true;
-      clearInterval(every);
-    };
+    return followLoadBalancers(ns, (b) => (balancers = b));
   });
 
   function count(objects: LObject[], of: (o: LObject) => string): [string, number][] {

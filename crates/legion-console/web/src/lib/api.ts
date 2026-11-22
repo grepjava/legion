@@ -95,7 +95,6 @@ export const api = {
     call<{ name: string; role: string; expires_ms: number }>('POST', '/api/login', { code }),
   logout: () => call<void>('POST', '/api/logout'),
   me: () => call<Me>('GET', '/api/me'),
-  status: () => call<Status>('GET', '/api/status'),
   kinds: () => call<KindInfo[]>('GET', '/api/kinds'),
   list: (kind: string, namespace = '') =>
     call<{ objects: LObject[]; version: number }>(
@@ -111,15 +110,6 @@ export const api = {
   /** What may reach what among a namespace's services, as `legion reach`. */
   reach: (namespace: string) =>
     call<{ services: string[]; edges: ReachEdge[] }>('GET', `/api/reach${q(namespace)}`),
-  /** The connections a namespace's tasks open or answer, as the nodes' pf keeps them, as `legion connections`. */
-  connections: (namespace: string) =>
-    call<{ edges: ConnectionEdge[]; unanswered: { node: string; error: string }[] }>(
-      'GET',
-      `/api/connections${q(namespace)}`
-    ),
-  /** A namespace's load balancer addresses and which node holds each, as `legion lb`. */
-  loadBalancers: (namespace: string) =>
-    call<{ balancers: Balancer[] }>('GET', `/api/load-balancers${q(namespace)}`),
 
   // Writes, as the user, each checked by the API as the CLI's are.
   manifest: (kind: string, namespace: string, name: string) =>
@@ -169,7 +159,6 @@ export const api = {
   },
   joinToken: (role: 'manager' | 'worker', rotate = false) =>
     call<{ token: string }>('POST', '/api/join-token', { role, rotate }),
-  ca: () => call<CaStatus>('GET', '/api/ca'),
   rotateCa: () => call<CaStatus>('POST', '/api/ca'),
   autolock: (action: 'show' | 'enable' | 'disable' | 'rotate') =>
     call<{ key: string }>('POST', '/api/autolock', { action }),
@@ -736,6 +725,11 @@ export type Follow =
   | { what: 'events'; namespace?: string; kind?: string; name?: string }
   | { what: 'activity' }
   | { what: 'usage'; namespace?: string }
+  | { what: 'status' }
+  | { what: 'history'; namespace?: string; task?: string; range_ms?: number }
+  | { what: 'connections'; namespace: string }
+  | { what: 'load-balancers'; namespace: string }
+  | { what: 'ca' }
   | {
       what: 'logs';
       namespace: string;
@@ -1092,6 +1086,49 @@ export function followUsage(
   );
 }
 
+/** This manager's status (Raft's leader, term, version applied), followed:
+ * `update` gets it at once, then again each time it changes. */
+export function followStatus(
+  update: (s: Status) => void,
+  failed: (why: string) => void = () => {}
+): () => void {
+  return keepOpen(async () => ({ what: 'status' }), update, failed);
+}
+
+/** Where the cluster's CA stands (`legion ca status`), followed: at once,
+ * then again each time it changes, as a rotation moves its holders. */
+export function followCa(
+  update: (ca: CaStatus) => void,
+  failed: (why: string) => void = () => {}
+): () => void {
+  return keepOpen(async () => ({ what: 'ca' }), update, failed);
+}
+
+/** A namespace's load balancer addresses and which node holds each,
+ * followed: at once, then again each time a node's CARP state or a
+ * Service changes them. */
+export function followLoadBalancers(
+  namespace: string,
+  update: (balancers: Balancer[]) => void,
+  failed: (why: string) => void = () => {}
+): () => void {
+  return keepOpen(
+    async () => ({ what: 'load-balancers', namespace }),
+    (e) => update(e.balancers),
+    failed
+  );
+}
+
+/** The connections a namespace's tasks open or answer, followed: at once,
+ * then again each time they change (the nodes are asked every 10 s). */
+export function followConnections(
+  namespace: string,
+  update: (r: { edges: ConnectionEdge[]; unanswered: { node: string; error: string }[] }) => void,
+  failed: (why: string) => void = () => {}
+): () => void {
+  return keepOpen(async () => ({ what: 'connections', namespace }), update, failed);
+}
+
 /** Where an alert's cause is in the console. */
 export function alertHref(a: Alert): string {
   if (!a.object) return '/cluster';
@@ -1122,18 +1159,26 @@ export interface NodeSeries {
   samples: [number, number, number, number, number, number?, number?, number?, number?][];
 }
 
-/** `legion usage`: what tasks and nodes used over the last hour as the leader sampled it, or over `rangeMs` from what the managers keep. */
-export function usageHistory(
+/** `legion usage`: what tasks and nodes used over the last hour as the
+ * leader sampled it, or over `rangeMs` from what the managers keep,
+ * followed: at once, then again each time a sample is added. */
+export function followHistory(
   namespace: string,
-  task = '',
-  rangeMs = 0
-): Promise<{ step_ms: number; tasks: TaskSeries[]; nodes?: NodeSeries[] }> {
-  const params = new URLSearchParams();
-  if (namespace) params.set('namespace', namespace);
-  if (task) params.set('task', task);
-  // Past an hour, from the 30 days the managers keep.
-  if (rangeMs) params.set('range_ms', String(rangeMs));
-  return call('GET', `/api/usage-history?${params}`);
+  task: string,
+  rangeMs: number,
+  update: (r: { step_ms: number; tasks: TaskSeries[]; nodes?: NodeSeries[] }) => void,
+  failed: (why: string) => void = () => {}
+): () => void {
+  return keepOpen(
+    async () => ({
+      what: 'history',
+      namespace: namespace || undefined,
+      task: task || undefined,
+      range_ms: rangeMs || undefined
+    }),
+    update,
+    failed
+  );
 }
 
 

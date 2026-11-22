@@ -3,8 +3,8 @@
   // isolation and its NetworkPolicies, the destination's ingress and the
   // source's egress, decided by the API (`legion reach`), not here; and
   // its load balancer addresses with the node holding each (`legion lb`),
-  // read again every 10 s, as CARP moves them on its own.
-  import { api, type Balancer, type ReachEdge } from '#lib/api.ts';
+  // followed, as CARP moves them on its own.
+  import { api, followLoadBalancers, type Balancer, type ReachEdge } from '#lib/api.ts';
   import { namespaces, session } from '#lib/session.svelte.ts';
   import { t } from '#lib/i18n.svelte.ts';
   import { Table } from '#lib/table.svelte.ts';
@@ -40,14 +40,7 @@
   $effect(() => {
     const ns = namespace;
     balancers = [];
-    const read = () =>
-      api
-        .loadBalancers(ns)
-        .then((r) => (balancers = r.balancers))
-        .catch(() => {});
-    read();
-    const every = setInterval(read, 10_000);
-    return () => clearInterval(every);
+    return followLoadBalancers(ns, (b) => (balancers = b));
   });
   const holders = (b: Balancer) => b.nodes.filter((n) => n.state === 'master').map((n) => n.node);
   // The addresses by service; an address sorts by its numbers, the

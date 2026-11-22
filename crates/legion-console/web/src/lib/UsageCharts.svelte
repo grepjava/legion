@@ -9,7 +9,7 @@
   // I/O and network throughput. The last hour as the leader sampled it, or up to
   // 30 days from what the managers keep; a strip under the charts to look
   // closer at part of it.
-  import { usageHistory, type NodeSeries, type TaskSeries } from '#lib/api.ts';
+  import { followHistory, type NodeSeries, type TaskSeries } from '#lib/api.ts';
   import Chart from '#lib/Chart.svelte';
   import RangeStrip from '#lib/RangeStrip.svelte';
   import { sumHeld } from '#lib/series.ts';
@@ -45,32 +45,26 @@
   let range = $state(RANGES[0]);
   let view: [number, number] | null = $state(null);
 
+  // Followed: the manager sends it again each time a sample is added.
   $effect(() => {
-    let stopped = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
     const back = range;
     view = null;
-    const load = async () => {
-      try {
-        const r = await usageHistory(namespace, task, back === RANGES[0] ? 0 : back);
-        if (stopped) return;
+    return followHistory(
+      namespace,
+      task,
+      back === RANGES[0] ? 0 : back,
+      (r) => {
         series = r.tasks;
         nodeSeries = r.nodes ?? [];
         step = r.step_ms || 15_000;
         error = '';
-      } catch (e) {
-        error = (e as Error).message;
-      } finally {
         loaded = true;
-        // As often as samples come, and at least each minute.
-        if (!stopped) timer = setTimeout(load, Math.min(Math.max(step, 15_000), 60_000));
+      },
+      (why) => {
+        error = why;
+        if (why) loaded = true;
       }
-    };
-    load();
-    return () => {
-      stopped = true;
-      if (timer) clearTimeout(timer);
-    };
+    );
   });
 
   // Summed per step, each task and node counted once in every step it was

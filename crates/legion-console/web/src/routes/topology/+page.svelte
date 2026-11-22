@@ -6,6 +6,8 @@
   import {
     api,
     follow,
+    followConnections,
+    followLoadBalancers,
     type Balancer,
     type ConnectionEdge,
     type ConnectionEnd,
@@ -125,37 +127,28 @@
     return () => stops.forEach((s) => s());
   });
 
-  // The connections the nodes' pf keeps, asked again every 10 s: each ask
-  // has every node list its states.
+  // The connections the nodes' pf keeps, followed: the leader asks every
+  // node again each 10 s and sends them when they changed.
   let seen: ConnectionEdge[] = $state([]);
   let unanswered: { node: string; error: string }[] = $state([]);
   let seenError = $state('');
   $effect(() => {
     const ns = namespace;
-    let gone = false;
-    const load = () =>
-      api
-        .connections(ns)
-        .then((r) => {
-          if (gone) return;
-          seen = r.edges;
-          unanswered = r.unanswered;
-          seenError = '';
-        })
-        .catch((e) => {
-          if (!gone) seenError = e.message;
-        });
     seen = [];
     unanswered = [];
-    load();
-    const every = setInterval(load, 10_000);
-    return () => {
-      gone = true;
-      clearInterval(every);
-    };
+    return followConnections(
+      ns,
+      (r) => {
+        seen = r.edges;
+        unanswered = r.unanswered;
+        seenError = '';
+      },
+      (why) => (seenError = why)
+    );
   });
 
-  // Reach & CARP VIPs are refreshed when services change.
+  // Reach is read again when services change; the CARP addresses are
+  // followed, as CARP moves them.
   const names = $derived(services.map((s) => s.metadata.name).join(','));
   $effect(() => {
     const ns = namespace;
@@ -164,10 +157,11 @@
       .reach(ns)
       .then((r) => (edges = r.edges))
       .catch((e) => (error = e.message));
-    api
-      .loadBalancers(ns)
-      .then((b) => (balancers = b.balancers))
-      .catch(() => (balancers = []));
+  });
+  $effect(() => {
+    const ns = namespace;
+    balancers = [];
+    return followLoadBalancers(ns, (b) => (balancers = b));
   });
 
   // A row's least height; a service's row grows with its tasks, each

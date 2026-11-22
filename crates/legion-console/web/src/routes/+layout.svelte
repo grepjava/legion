@@ -9,6 +9,7 @@
     consoleSettings,
     followActivity,
     followAlerts,
+    followStatus,
     plugins,
     setToken,
     whenSignedOut,
@@ -94,32 +95,14 @@
     })();
   });
 
-  // Poll Raft quorum / term / store version for the Top Telemetry Strip.
-  function setRaftStatus(s: Status | null) {
-    raftStatus = s;
-  }
+  // Raft's leader, term and store version for the top bar, as they
+  // change; the last known kept while the stream is back.
   $effect(() => {
     if (!session.me) {
-      setRaftStatus(null);
+      raftStatus = null;
       return;
     }
-    let stopped = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const poll = async () => {
-      try {
-        const s = await api.status();
-        if (!stopped) setRaftStatus(s);
-      } catch {
-        // Keep last known status.
-      } finally {
-        if (!stopped) timer = setTimeout(poll, 15_000);
-      }
-    };
-    poll();
-    return () => {
-      stopped = true;
-      if (timer) clearTimeout(timer);
-    };
+    return followStatus((s) => (raftStatus = s));
   });
 
   // Global keyboard shortcuts: Ctrl+K for the command palette, `?` for the
