@@ -147,7 +147,7 @@ pub fn render(
 ) -> Result<(String, BTreeMap<String, String>), String> {
     let mut env = BTreeMap::new();
     for v in &m.variables {
-        let default = v.default.clone().filter(|d| !d.is_empty());
+        let default = v.default.as_deref().map(unquote).filter(|d| !d.is_empty());
         let value = values.get(&v.name).cloned().or(default).unwrap_or_else(|| {
             if v.kind == "secret" {
                 secret()
@@ -203,6 +203,19 @@ pub fn render(
     }
     let compose = serde_yaml_ng::to_string(&doc).map_err(|e| e.to_string())?;
     Ok((compose, env))
+}
+
+/// A default as an `.env` file holds it, quoted or not: `"@every 1h"` is
+/// `@every 1h`, as the catalog's own tools read it.
+fn unquote(v: &str) -> String {
+    let v = v.trim();
+    for q in ['"', '\'']
+    {
+        if v.len() >= 2 && v.starts_with(q) && v.ends_with(q) {
+            return v[1..v.len() - 1].to_owned();
+        }
+    }
+    v.to_owned()
 }
 
 /// A made-up secret: 24 characters from the system's randomness.
@@ -324,6 +337,14 @@ x-fjord:
         let bad = BTreeMap::from([("CONFIG_DATA".to_owned(), "../etc".to_owned())]);
         m.variables.pop();
         assert!(render(&m, "", None, &bad, &|| "x".into()).is_err(), "a Volume's name is a name");
+    }
+
+    #[test]
+    fn a_default_is_read_as_an_env_file_reads_it() {
+        assert_eq!(unquote("\"@every 1h\""), "@every 1h");
+        assert_eq!(unquote("'x y'"), "x y");
+        assert_eq!(unquote("plain"), "plain");
+        assert_eq!(unquote("\""), "\"");
     }
 
     #[test]
