@@ -645,7 +645,7 @@ export function logs(
   if (opts.container) params.set('container', opts.container);
   if (opts.tail !== undefined) params.set('tail', String(opts.tail));
   if (opts.follow) params.set('follow', 'true');
-  return logSocket(
+  return logStream(
     `/api/logs/${encodeURIComponent(namespace)}/${encodeURIComponent(task)}?${params}`,
     out,
     done
@@ -663,38 +663,40 @@ export function buildLog(
   out: (text: string, stderr: boolean) => void,
   done: (error: string | null) => void
 ): () => void {
-  return logSocket(
+  return logStream(
     `/api/build-logs/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}${follow ? '?follow=true' : ''}`,
     out,
     done
   );
 }
 
-function logSocket(
+/** A log as server-sent events: `{out}` or `{err}` as it comes, then `{end}`
+ * or `{error}`. Read once: never opened again by the browser on its own. */
+function logStream(
   path: string,
   out: (text: string, stderr: boolean) => void,
   done: (error: string | null) => void
 ): () => void {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const socket = new WebSocket(`${proto}//${location.host}${path}`);
+  const source = new EventSource(path);
   let ended = false;
   const end = (e: string | null) => {
+    source.close();
     if (!ended) done(e);
     ended = true;
   };
-  socket.onmessage = (m) => {
+  source.onmessage = (m) => {
     const e = JSON.parse(m.data);
     if (e.out !== undefined) out(e.out, false);
     else if (e.err !== undefined) out(e.err, true);
     else if (e.error) end(e.error);
     else if (e.end) end(null);
   };
-  // Refused before the upgrade (signed out, not allowed): no reason reaches
-  // a WebSocket.
-  socket.onclose = () => end(t('the logs could not be read'));
+  // Refused (signed out, not allowed) or cut off: no reason reaches an
+  // EventSource.
+  source.onerror = () => end(t('the logs could not be read'));
   return () => {
     ended = true;
-    socket.close();
+    source.close();
   };
 }
 
@@ -724,11 +726,14 @@ export function key(o: LObject): string {
 let streams = 0;
 
 /**
- * Keeps a WebSocket open: `connect` gets ready (reading what the stream
- * starts from) and gives the path to open, `receive` each message. Broken,
- * it says so in `live` and tries again, waiting longer each time up to 30
- * s; a session gone ends it, the request that found so sending the user to
- * sign in. Returns a function that stops it.
+ * Keeps a stream of server-sent events open: `connect` gets ready (reading
+ * what the stream starts from) and gives the path to open, `receive` each
+ * message. Over HTTP/2 a page's streams share its one connection. Broken,
+ * it says so in `live` and opens it again itself, waiting longer each time
+ * up to 30 s, rather than leave it to the browser, which would open the
+ * same address again (a watch must list again and go on from there); a
+ * session gone ends it, the request that found so sending the user to sign
+ * in. Returns a function that stops it.
  */
 function keepOpen(
   connect: () => Promise<string>,
@@ -737,7 +742,7 @@ function keepOpen(
 ): () => void {
   const id = ++streams;
   let stopped = false;
-  let socket: WebSocket | null = null;
+  let source: EventSource | null = null;
   let retry: ReturnType<typeof setTimeout> | null = null;
   let wait = 1000;
   const broken = (why: string) => {
@@ -763,34 +768,38 @@ function keepOpen(
       return;
     }
     if (stopped) return;
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    socket = new WebSocket(`${proto}//${location.host}${path}`);
-    socket.onopen = () => {
-      delete live.down[id];
-      failed('');
-      wait = 1000;
-    };
-    socket.onmessage = (m) => {
-      const e = JSON.parse(m.data);
-      if (e.error) broken(e.error);
-      else receive(e);
-    };
-    socket.onclose = () => {
-      if (stopped) return;
-      broken(live.down[id] ?? t('the connection to the console dropped'));
+    const opened = new EventSource(path);
+    source = opened;
+    let lost = false;
+    const lose = (why: string) => {
+      opened.close();
+      if (stopped || lost) return;
+      lost = true;
+      broken(why);
       // The session may be what ended it: a request finds out, and a 401
       // sends the user to sign in.
       api.me().then(again, (e) => {
         if (!(e instanceof ApiError && e.status === 401)) again();
       });
     };
+    opened.onopen = () => {
+      delete live.down[id];
+      failed('');
+      wait = 1000;
+    };
+    opened.onmessage = (m) => {
+      const e = JSON.parse(m.data);
+      if (e.error) lose(e.error);
+      else receive(e);
+    };
+    opened.onerror = () => lose(live.down[id] ?? t('the connection to the console dropped'));
   }
   start();
   return () => {
     stopped = true;
     delete live.down[id];
     if (retry) clearTimeout(retry);
-    socket?.close();
+    source?.close();
   };
 }
 
@@ -888,6 +897,20 @@ export function followAlerts(
   return keepOpen(
     async () => '/api/alerts',
     (e) => update(e.alerts),
+    failed
+  );
+}
+
+/** What tasks and nodes use now (`/api/usage`), followed: `update` gets all
+ * of it at once, then again each time a node's report changes it. */
+export function followUsage(
+  namespace: string,
+  update: (nodes: NodeUsage[]) => void,
+  failed: (why: string) => void = () => {}
+): () => void {
+  return keepOpen(
+    async () => `/api/usage/watch${q(namespace)}`,
+    (e) => update(e.nodes),
     failed
   );
 }

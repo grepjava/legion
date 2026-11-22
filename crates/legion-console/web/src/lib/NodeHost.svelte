@@ -4,7 +4,7 @@
   // booted; each pool's health, how full, its errors and its last scrub.
   // The errors can be taken as seen, and the scrubs scheduled, as
   // `legion node errors-seen` and `legion node scrub` do.
-  import { api, bytes, loadText, type LObject } from './api.ts';
+  import { api, bytes, followUsage, loadText, type LObject } from './api.ts';
   import { ask } from './confirm.svelte.ts';
   import { t, tn } from './i18n.svelte.ts';
   import { cannotWrite } from './session.svelte.ts';
@@ -43,22 +43,11 @@
   let load = $state('');
   $effect(() => {
     const n = name;
-    let stopped = false;
-    let timer: ReturnType<typeof setTimeout>;
-    async function poll() {
-      try {
-        const u = await api.usage();
-        load = loadText(u.nodes.find((x) => x.node === n)?.load);
-      } catch {
-        load = '';
-      }
-      if (!stopped) timer = setTimeout(poll, 5000);
-    }
-    timer = setTimeout(poll, 0);
-    return () => {
-      stopped = true;
-      clearTimeout(timer);
-    };
+    return followUsage(
+      '',
+      (nodes) => (load = loadText(nodes.find((x) => x.node === n)?.load)),
+      () => (load = '')
+    );
   });
 
   const errors = (p: Pool) => (p.readErrors ?? 0) + (p.writeErrors ?? 0) + (p.checksumErrors ?? 0);

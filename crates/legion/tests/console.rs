@@ -982,7 +982,7 @@ spec:
         );
     };
     offline(&mut a, true);
-    // Emulation stops new requests but leaves open WebSockets be: drop
+    // Emulation stops new requests but leaves open streams be: drop
     // the console's connections as a broken network would.
     // tcpdrop lists each connection from both ends: the second finds it
     // gone already, so what counts is that some were dropped.

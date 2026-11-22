@@ -1,6 +1,6 @@
 <script lang="ts">
   // A node's capacity, what its tasks use now, and the tasks on it, live.
-  import { api, bytes, follow, type LObject } from './api.ts';
+  import { bytes, follow, followUsage, type LObject } from './api.ts';
   import { tone } from './columns.ts';
   import { t } from './i18n.svelte.ts';
   import { Table } from './table.svelte.ts';
@@ -25,30 +25,22 @@
     );
   });
 
-  // Usage is reported with heartbeats, not stored: asked for again.
+  // Usage is reported with heartbeats, not stored: followed as it comes.
   $effect(() => {
     const n = name;
-    let stopped = false;
-    async function poll() {
-      try {
-        const u = await api.usage();
-        const here = u.nodes.find((x) => x.node === n);
+    return followUsage(
+      '',
+      (nodes) => {
+        const here = nodes.find((x) => x.node === n);
         use = Object.fromEntries(
           (here?.tasks ?? []).map((t) => [
             `${t.namespace}/${t.task}`,
             { cpu: t.cpu_percent, memory: t.memory_bytes }
           ])
         );
-      } catch {
-        use = {};
-      }
-      if (!stopped) timer = setTimeout(poll, 5000);
-    }
-    let timer = setTimeout(poll, 0);
-    return () => {
-      stopped = true;
-      clearTimeout(timer);
-    };
+      },
+      () => (use = {})
+    );
   });
 
   const total = $derived(

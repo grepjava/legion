@@ -8,6 +8,7 @@
     api,
     bytes,
     follow,
+    followUsage,
     loadText,
     type Balancer,
     type LObject,
@@ -89,37 +90,32 @@
     return () => stops.forEach((s) => s());
   });
 
-  // Live node CPU / Memory / ZFS / Network snapshot + CARP VIPs.
+  // What nodes and tasks use now, as each report comes.
+  $effect(() =>
+    followUsage(session.namespace, (nodes) => {
+      nodeUsage = nodes;
+      sampled = new Date();
+    })
+  );
+  // The namespace's virtual addresses and who holds them, read again now
+  // and then.
   $effect(() => {
     const ns = session.namespace;
+    balancers = [];
+    if (!ns) return;
     let stopped = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const poll = async () => {
-      try {
-        const u = await api.usage(ns);
-        if (!stopped) {
-          nodeUsage = u.nodes;
-          sampled = new Date();
-        }
-      } catch {
-        // Ignore transient poll errors.
-      }
-      if (ns) {
-        api
-          .loadBalancers(ns)
-          .then((b) => {
-            if (!stopped) balancers = b.balancers;
-          })
-          .catch(() => {});
-      } else {
-        balancers = [];
-      }
-      if (!stopped) timer = setTimeout(poll, 5000);
-    };
-    poll();
+    const read = () =>
+      api
+        .loadBalancers(ns)
+        .then((b) => {
+          if (!stopped) balancers = b.balancers;
+        })
+        .catch(() => {});
+    read();
+    const every = setInterval(read, 10_000);
     return () => {
       stopped = true;
-      if (timer) clearTimeout(timer);
+      clearInterval(every);
     };
   });
 

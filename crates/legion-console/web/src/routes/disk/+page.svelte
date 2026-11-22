@@ -3,7 +3,7 @@
   // Each node's disk, as its agent last reported it: what holds the space
   // under Legion's ZFS root (images, tasks' roots, Volumes, the rest) and
   // jailer's build store beside it, with what can be reclaimed.
-  import { api, bytes, type NodeUsage } from '#lib/api.ts';
+  import { api, bytes, followUsage, type NodeUsage } from '#lib/api.ts';
   import { t } from '#lib/i18n.svelte.ts';
   import { session } from '#lib/session.svelte.ts';
 
@@ -12,20 +12,17 @@
   let message = $state('');
   let busy = $state('');
 
-  async function load() {
-    try {
-      nodes = (await api.usage()).nodes;
-      error = '';
-    } catch (err) {
-      error = (err as Error).message;
-    }
-  }
-
-  $effect(() => {
-    load();
-    const timer = setInterval(load, 10_000);
-    return () => clearInterval(timer);
-  });
+  // What each node holds, as it reports it.
+  $effect(() =>
+    followUsage(
+      '',
+      (n) => {
+        nodes = n;
+        error = '';
+      },
+      (why) => (error = why)
+    )
+  );
 
   interface Part {
     label: string;

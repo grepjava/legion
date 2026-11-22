@@ -1,7 +1,7 @@
 <script lang="ts">
   // What to act on now (`legion alerts`), as the managers work it out:
   // crash-looping tasks, nodes down or suspect, lost Volumes, the CA near
-  // expiry, Raft without a leader or quorum. Kept current over a WebSocket
+  // expiry, Raft without a leader or quorum. Kept current as a stream
   // by the layout; each links to its cause.
   import { alertHref } from '#lib/api.ts';
   import { session } from '#lib/session.svelte.ts';

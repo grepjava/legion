@@ -10,6 +10,7 @@
     bytes,
     downloads,
     follow,
+    followUsage,
     type LObject,
     type NodeUsage,
     type VolumeSpace
@@ -54,25 +55,8 @@
     return () => stops.forEach((s) => s());
   });
 
-  $effect(() => {
-    const ns = session.namespace;
-    let stopped = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const poll = async () => {
-      try {
-        const u = await api.usage(ns);
-        if (!stopped) nodeUsage = u.nodes;
-      } catch {
-        // Ignore transient usage poll error.
-      }
-      if (!stopped) timer = setTimeout(poll, 6000);
-    };
-    poll();
-    return () => {
-      stopped = true;
-      if (timer) clearTimeout(timer);
-    };
-  });
+  // The pools' and Volumes' space and I/O, as each node reports it.
+  $effect(() => followUsage(session.namespace, (nodes) => (nodeUsage = nodes)));
 
   const spaceMap = $derived.by(() => {
     const m = new Map<string, VolumeSpace>();
