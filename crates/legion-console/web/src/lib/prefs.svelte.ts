@@ -63,8 +63,10 @@ export const prefs = $state({
   recent: hasStorage ? read(KEYS.recent, [] as PageRef[], isRefs) : [],
   /** The side bar hidden, to give the page the whole width. */
   sidebarHidden: hasStorage ? read(KEYS.sidebar, false, isBool) : false,
-  /** The side bar's sections the user closed, by their key. */
-  closed: hasStorage ? read(KEYS.closed, [] as string[], isStrings) : [],
+  /** The side bar's sections the user closed, by their key; until they
+   * choose, the ways to make things and the configuration, so the side
+   * bar's foot is in view on a laptop's screen. */
+  closed: hasStorage ? read(KEYS.closed, ['create', 'config'] as string[], isStrings) : [],
   tree: (hasStorage ? read(KEYS.tree, 'pages' as TreeMode, isMode) : 'pages') as TreeMode,
   /** The tree's branches opened, by their key. */
   treeOpen: hasStorage ? read(KEYS.treeOpen, [] as string[], isStrings) : []

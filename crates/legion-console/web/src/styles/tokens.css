@@ -1,0 +1,142 @@
+/* The theme: Midnight Indigo, calm (TODO.MD item 6, second round), light
+   and dark. color-scheme on :root synced with <meta name="color-scheme">,
+   light-dark() with @media fallbacks, WCAG 2.2 AA contrast (>= 4.5:1
+   text, >= 3:1 control borders). */
+:root {
+  --bg-light: #f5f6fb;
+  --bg-dark: #0b0d1a;
+  --panel-light: #ffffff;
+  --panel-dark: #121528;
+  --side-light: #eef0f8;
+  --side-dark: #0e1020;
+  --surface2-light: #e9ecf6;
+  --surface2-dark: #1c2040;
+  --text-light: #151830;
+  --text-dark: #e8eaf8;
+  --muted-light: #535878;
+  --muted-dark: #a3a7c9;
+  --line-light: #dfe2ef;
+  --line-dark: #22264a;
+  /* Borders of controls: >= 3:1 against the page & panel (WCAG 1.4.11). */
+  --control-light: #7c81a6;
+  --control-dark: #61689f;
+  /* Crimson: the brand's mark and danger only. */
+  --accent-light: #c41c16;
+  --accent-dark: #ff5a52;
+  --on-accent-light: #ffffff;
+  --on-accent-dark: #140303;
+  /* Indigo: what to do (the main button, the current page and tab). */
+  --primary-light: #4a56d4;
+  --primary-dark: #5560e0;
+  --on-primary-light: #ffffff;
+  --on-primary-dark: #ffffff;
+  --link-light: #3846c9;
+  --link-dark: #9aa6ff;
+  --good-light: #127046;
+  --good-dark: #3fd49a;
+  --wait-light: #8a4b0c;
+  --wait-dark: #f4bd4a;
+  --bad-light: #c0262d;
+  --bad-dark: #ff7272;
+  --zfs-light: #5b47b0;
+  --zfs-dark: #a78bfa;
+
+  --bg: var(--bg-light);
+  --panel: var(--panel-light);
+  --side: var(--side-light);
+  --surface2: var(--surface2-light);
+  --text: var(--text-light);
+  --muted: var(--muted-light);
+  --line: var(--line-light);
+  --control: var(--control-light);
+  --accent: var(--accent-light);
+  --on-accent: var(--on-accent-light);
+  --primary: var(--primary-light);
+  --on-primary: var(--on-primary-light);
+  --link: var(--link-light);
+  --good: var(--good-light);
+  --wait: var(--wait-light);
+  --bad: var(--bad-light);
+  --zfs: var(--zfs-light);
+
+  color-scheme: light dark;
+
+  &:has(> head > meta[name='color-scheme'][content='dark']) {
+    color-scheme: dark;
+    --bg: var(--bg-dark);
+    --panel: var(--panel-dark);
+    --side: var(--side-dark);
+    --surface2: var(--surface2-dark);
+    --text: var(--text-dark);
+    --muted: var(--muted-dark);
+    --line: var(--line-dark);
+    --control: var(--control-dark);
+    --accent: var(--accent-dark);
+    --on-accent: var(--on-accent-dark);
+    --primary: var(--primary-dark);
+    --on-primary: var(--on-primary-dark);
+    --link: var(--link-dark);
+    --good: var(--good-dark);
+    --wait: var(--wait-dark);
+    --bad: var(--bad-dark);
+    --zfs: var(--zfs-dark);
+  }
+  &:has(> head > meta[name='color-scheme'][content='light']) {
+    color-scheme: light;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    &:not(:has(> head > meta[name='color-scheme'][content='light'])) {
+      --bg: var(--bg-dark);
+      --panel: var(--panel-dark);
+      --side: var(--side-dark);
+      --surface2: var(--surface2-dark);
+      --text: var(--text-dark);
+      --muted: var(--muted-dark);
+      --line: var(--line-dark);
+      --control: var(--control-dark);
+      --accent: var(--accent-dark);
+      --on-accent: var(--on-accent-dark);
+      --primary: var(--primary-dark);
+      --on-primary: var(--on-primary-dark);
+      --link: var(--link-dark);
+      --good: var(--good-dark);
+      --wait: var(--wait-dark);
+      --bad: var(--bad-dark);
+      --zfs: var(--zfs-dark);
+    }
+  }
+
+  @supports (color: light-dark(white, black)) {
+    --bg: light-dark(var(--bg-light), var(--bg-dark));
+    --panel: light-dark(var(--panel-light), var(--panel-dark));
+    --side: light-dark(var(--side-light), var(--side-dark));
+    --surface2: light-dark(var(--surface2-light), var(--surface2-dark));
+    --text: light-dark(var(--text-light), var(--text-dark));
+    --muted: light-dark(var(--muted-light), var(--muted-dark));
+    --line: light-dark(var(--line-light), var(--line-dark));
+    --control: light-dark(var(--control-light), var(--control-dark));
+    --accent: light-dark(var(--accent-light), var(--accent-dark));
+    --on-accent: light-dark(var(--on-accent-light), var(--on-accent-dark));
+    --primary: light-dark(var(--primary-light), var(--primary-dark));
+    --on-primary: light-dark(var(--on-primary-light), var(--on-primary-dark));
+    --link: light-dark(var(--link-light), var(--link-dark));
+    --good: light-dark(var(--good-light), var(--good-dark));
+    --wait: light-dark(var(--wait-light), var(--wait-dark));
+    --bad: light-dark(var(--bad-light), var(--bad-dark));
+    --zfs: light-dark(var(--zfs-light), var(--zfs-dark));
+  }
+
+  accent-color: var(--primary);
+  font-family:
+    'Inter Variable',
+    'Inter',
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+}

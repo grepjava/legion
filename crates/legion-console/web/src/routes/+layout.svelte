@@ -420,8 +420,10 @@
   });
   const pinned = $derived(prefs.pins.some((p) => p.href === here.href));
 
-  /** A side bar section's `open`: as the user left it, but open while the menu is filtered. */
-  const sectionOpen = (key: string) => !!navFilter || !prefs.closed.includes(key);
+  /** A side bar section's `open`: as the user left it, but open while the
+   * menu is filtered or the page shown is in it. */
+  const sectionOpen = (key: string, items: NavItem[] = []) =>
+    !!navFilter || !prefs.closed.includes(key) || items.some(isHere);
   function sectionToggled(key: string, e: Event) {
     if (navFilter) return;
     const open = (e.currentTarget as HTMLDetailsElement).open;
@@ -760,7 +762,7 @@
           {/if}
 
           {#each navGroups as g (g.key)}
-            <details class="nav-sec" open={sectionOpen(g.key)} ontoggle={(e) => sectionToggled(g.key, e)}>
+            <details class="nav-sec" open={sectionOpen(g.key, g.items)} ontoggle={(e) => sectionToggled(g.key, e)}>
               <summary class="nav-group">{g.label}</summary>
               {#each g.items as item (item.href)}{@render navLink(item)}{/each}
             </details>
@@ -810,7 +812,7 @@
             </details>
           {/if}
           {#if clusterItems.length}
-            <details class="nav-sec" open={sectionOpen('cluster')} ontoggle={(e) => sectionToggled('cluster', e)}>
+            <details class="nav-sec" open={sectionOpen('cluster', clusterItems)} ontoggle={(e) => sectionToggled('cluster', e)}>
               <summary class="nav-group">{t('Cluster')}</summary>
               {#each clusterItems as item (item.href)}{@render navLink(item)}{/each}
             </details>

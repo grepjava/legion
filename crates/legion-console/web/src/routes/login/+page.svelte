@@ -10,8 +10,10 @@
 
   // The code comes in the URL's fragment, which the browser never sends to
   // a server; it is taken out of the address bar at once. So does why a
-  // single sign-on failed.
-  $effect(() => {
+  // single sign-on failed. Read on arriving and whenever the fragment
+  // changes: a fresh link pasted into this tab, after one that expired,
+  // signs in too.
+  function fromFragment() {
     const fragment = new URLSearchParams(location.hash.slice(1));
     const failed = fragment.get('error');
     if (failed) {
@@ -22,6 +24,7 @@
     const code = fragment.get('code');
     if (!code) return;
     history.replaceState(null, '', '/login');
+    error = '';
     busy = true;
     api
       .login(code)
@@ -33,8 +36,11 @@
         error = e.message;
         busy = false;
       });
-  });
+  }
+  $effect(fromFragment);
 </script>
+
+<svelte:window onhashchange={fromFragment} />
 
 <div class="login">
   <div class="login-brand">

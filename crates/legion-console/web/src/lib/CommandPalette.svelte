@@ -63,18 +63,29 @@
     }
   });
 
+  // What was read last, and of which namespace, when: opened again soon
+  // after, the palette shows it at once instead of asking for five lists
+  // each time; older, it is shown while read again.
+  const FRESH_MS = 30_000;
+  let cached: { ns: string; at: number } | null = null;
+
   async function loadObjects() {
     if (!session.me) return;
     const ns = session.namespace;
+    if (cached?.ns === ns) {
+      if (Date.now() - cached.at < FRESH_MS) return;
+    } else objects = [];
     const kinds = ['Service', 'Task', 'Volume', 'Build', ...(session.me.all ? ['Node'] : [])];
     const settled = await Promise.allSettled(
       kinds.map((k) => api.list(k, k === 'Node' ? '' : ns))
     );
+    if (ns !== session.namespace) return;
     const all: LObject[] = [];
     for (const r of settled) {
       if (r.status === 'fulfilled') all.push(...r.value.objects);
     }
     objects = all;
+    cached = { ns, at: Date.now() };
   }
 
   function pick(fn: () => void) {

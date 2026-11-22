@@ -200,7 +200,7 @@
     </p>
     <RangeStrip points={summed.cpu.length ? summed.cpu : summed.zfs} bind:view />
   {/if}
-  <div class={compact ? 'grid-2' : ''}>
+  <div class={compact ? 'grid-2 chart-cards' : ''}>
     {#if !summed.tasks && !task && pick === EVERY && !nodeFilter}
       <!-- A namespace's or the cluster's: CPU and memory are what tasks
            use, so with none say so, rather than draw two empty charts
@@ -303,6 +303,10 @@ sum by (task) (legion_container_memory_bytes${selector})`}</pre>
 {/if}
 
 <style>
+  .chart-cards > .card {
+    display: flex;
+    flex-direction: column;
+  }
   .ranges {
     margin-bottom: 0.5rem;
   }

@@ -370,6 +370,8 @@
       note={t('{used} of {n} cores, by tasks now', { used: (totals.cpu / 100).toFixed(1), n: capacity.cpu })}
       pct={(totals.cpu / 100 / capacity.cpu) * 100}
       meterLabel={t('CPU used')}
+      href="/k/Node"
+      more={t('By node')}
     />
     <Tile
       label={t('Memory')}
@@ -378,6 +380,8 @@
       note={t('{used} of {total}, by tasks now', { used: bytes(totals.mem), total: bytes(capacity.mem) })}
       pct={capacity.mem ? (totals.mem / capacity.mem) * 100 : 0}
       meterLabel={t('Memory used')}
+      href="/k/Node"
+      more={t('By node')}
     />
   {:else}
     <Tile
@@ -385,8 +389,17 @@
       icon={Cpu}
       value={`${totals.cpu.toFixed(1)}%`}
       note={t('Of one CPU, by the tasks you can see')}
+      href="/k/Task"
+      more={t('Tasks')}
     />
-    <Tile label={t('Memory')} icon={MemoryStick} value={bytes(totals.mem)} note={t('Used by the tasks you can see')} />
+    <Tile
+      label={t('Memory')}
+      icon={MemoryStick}
+      value={bytes(totals.mem)}
+      note={t('Used by the tasks you can see')}
+      href="/k/Task"
+      more={t('Tasks')}
+    />
   {/if}
   {#if session.me?.all && capacity.disk > 0}
     <Tile
@@ -425,8 +438,8 @@
         written: bytes(totals.written),
         iops: Math.round(totals.readOps + totals.writeOps)
       })}
-      href="/volumes"
-      more={t('Volumes')}
+      href="/disk"
+      more={t('Disk usage')}
     />
   {/if}
   {#if totals.rx + totals.tx > 0}
@@ -445,7 +458,8 @@
 
 {#if session.me?.all && nodes.length}
   <h2>{t('Nodes')}</h2>
-  <section class="cards">
+  <!-- As wide as the page gives a few nodes, not left narrow at the side. -->
+  <section class="node-cards" style:max-width="{Math.max(nodes.length, 2) * 30}rem">
     {#each nodes as n (n.metadata.name)}
       {@const nu = usageByNode.get(n.metadata.name)}
       {@const nCpu = nu ? nu.tasks.reduce((a, x) => a + x.cpu_percent, 0) : 0}
@@ -464,12 +478,13 @@
           <h3><a href="/k/Node/_/{n.metadata.name}">{n.metadata.name}</a></h3>
           <span class="state {tone(n.status?.state)}">{n.status?.state ?? '—'}</span>
         </div>
-        <p class="muted node-sub">
-          {n.spec?.role ?? 'worker'} · <span class="mono">{n.status?.addr ?? ''}</span>
+        <ul class="plain muted node-sub">
+          <li>{n.spec?.role ?? 'worker'}</li>
+          {#if n.status?.addr}<li class="mono">{n.status.addr}</li>{/if}
           {#if n.spec?.availability && n.spec.availability !== 'active'}
-            · <span class="wait">{n.spec.availability}</span>
+            <li class="wait">{n.spec.availability}</li>
           {/if}
-        </p>
+        </ul>
         <ul class="plain node-meters">
           {#each shares as m (m.label)}
             <li>
@@ -491,13 +506,15 @@
             </li>
           {/each}
         </ul>
-        <p class="muted node-sub">
-          {tn('1 task', '{n} tasks', nu?.tasks.length ?? 0)}
-          {#if loadText(nu?.load)}· <span title={t('Over 1, 5 and 15 minutes')}>{t('load {load}', { load: loadText(nu?.load) })}</span>{/if}
-          {#if (nu?.net_rx_bps ?? 0) + (nu?.net_tx_bps ?? 0) > 0}
-            · ↓{bytes(nu?.net_rx_bps ?? 0)}/s ↑{bytes(nu?.net_tx_bps ?? 0)}/s
+        <ul class="plain muted node-sub">
+          <li>{tn('1 task', '{n} tasks', nu?.tasks.length ?? 0)}</li>
+          {#if loadText(nu?.load)}
+            <li title={t('Over 1, 5 and 15 minutes')}>{t('load {load}', { load: loadText(nu?.load) })}</li>
           {/if}
-        </p>
+          {#if (nu?.net_rx_bps ?? 0) + (nu?.net_tx_bps ?? 0) > 0}
+            <li title={t('Received and sent')}>↓{bytes(nu?.net_rx_bps ?? 0)}/s ↑{bytes(nu?.net_tx_bps ?? 0)}/s</li>
+          {/if}
+        </ul>
       </div>
     {/each}
   </section>
@@ -669,9 +686,22 @@
     color: var(--link);
     text-decoration: underline;
   }
+  .node-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+    gap: 0.85rem;
+  }
+  /* A node's facts, each whole on its line: a role, an address, how it
+     takes tasks; its tasks, load and traffic. */
   .node-sub {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.1rem 0.9rem;
     font-size: 0.8rem;
-    margin: 0.15rem 0 0.5rem;
+    margin: 0.15rem 0 0.6rem;
+  }
+  .node-sub > li {
+    white-space: nowrap;
   }
   .node-meters {
     display: grid;

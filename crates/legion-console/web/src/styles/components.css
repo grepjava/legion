@@ -1,0 +1,1470 @@
+/* The kit every page is drawn with: tables, cards, buttons, tabs, meters,
+   dialogs and the rest, in the order they were written. */
+.table-scroll {
+  overflow-x: auto;
+  max-inline-size: 100%;
+  border-radius: 10px;
+}
+table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-size: 0.92rem;
+}
+th,
+td {
+  text-align: left;
+  padding: 0.55rem 0.85rem;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
+}
+html[data-density='compact'] th,
+html[data-density='compact'] td {
+  padding: 0.28rem 0.55rem;
+}
+th {
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-weight: 600;
+  background: color-mix(in oklab, var(--surface2) 40%, var(--panel));
+}
+thead tr:first-child > :first-child {
+  border-top-left-radius: 10px;
+}
+thead tr:first-child > :last-child {
+  border-top-right-radius: 10px;
+}
+/* A header that names something (a row's object, a link to one) keeps
+   the name as it is written: names are not headings. */
+th[scope='row'],
+th:has(> a) {
+  text-transform: none;
+  letter-spacing: normal;
+  font-size: 0.85rem;
+}
+th:has(> button.sort-btn) {
+  padding: 0;
+}
+button.sort-btn {
+  width: 100%;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  padding: 0.55rem 0.85rem;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-height: 28px;
+}
+tr:last-child td,
+tr:last-child th {
+  border-bottom: none;
+}
+tbody tr:hover td {
+  background: color-mix(in oklab, var(--surface2) 45%, var(--panel));
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
+  gap: 0.85rem;
+}
+.grid-2 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(22rem, 1fr));
+  gap: 0.85rem;
+}
+.grid-4 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 0.85rem;
+}
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 1.1rem 1.25rem;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.06);
+}
+.wizard-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-bottom: 1rem;
+  padding: 0.55rem 0.75rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.wizard-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.3rem 0.65rem;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.86rem;
+  font-weight: 500;
+}
+.wizard-step.active {
+  background: var(--surface2);
+  border-color: var(--link);
+  color: var(--text);
+  font-weight: 600;
+}
+.wizard-step.done {
+  color: var(--good);
+}
+.wizard-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.35rem;
+  height: 1.35rem;
+  border-radius: 999px;
+  font-size: 0.76rem;
+  font-weight: 700;
+  border: 1px solid var(--control);
+}
+.wizard-step.active .wizard-num {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--on-primary);
+}
+.wizard-step.done .wizard-num {
+  background: var(--good);
+  border-color: var(--good);
+  color: #ffffff;
+}
+.choice-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: 0.75rem;
+}
+.choice-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.3rem;
+  padding: 1rem;
+  text-align: left;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.choice-card:hover {
+  border-color: var(--link);
+}
+.choice-card.selected {
+  border: 2px solid var(--link);
+  background: var(--surface2);
+}
+.pill-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin: 0.45rem 0 0.75rem;
+}
+.pill {
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 0.78rem;
+  min-height: 24px;
+}
+.pill.active {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--on-primary);
+  font-weight: 600;
+}
+html[data-density='compact'] .card {
+  padding: 0.65rem 0.8rem;
+}
+.card h2,
+.card h3 {
+  margin-top: 0;
+}
+.big {
+  font-size: 1.85rem;
+  font-weight: 700;
+  margin: 0.15rem 0 0.4rem;
+  line-height: 1.15;
+}
+
+.state {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.76rem;
+  font-weight: 600;
+  padding: 0.08rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid color-mix(in oklab, currentColor 45%, transparent);
+  background: color-mix(in oklab, currentColor 12%, transparent);
+  margin: 0 0.25rem 0.2rem 0;
+  white-space: nowrap;
+}
+.good {
+  color: var(--good);
+}
+.wait {
+  color: var(--wait);
+}
+.bad {
+  color: var(--bad);
+}
+.zfs {
+  color: var(--zfs);
+}
+.count {
+  display: inline-block;
+  min-width: 1.25rem;
+  margin-left: 0.3rem;
+  padding: 0 0.4rem;
+  border-radius: 999px;
+  border: 1px solid color-mix(in oklab, currentColor 45%, transparent);
+  background: color-mix(in oklab, currentColor 14%, transparent);
+  font-weight: 600;
+  font-size: 0.72rem;
+  text-align: center;
+}
+.tag {
+  display: inline-block;
+  font-size: 0.74rem;
+  background: var(--surface2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.04rem 0.38rem;
+  margin: 0 0.22rem 0.2rem 0;
+}
+.muted {
+  color: var(--muted);
+}
+.error {
+  color: var(--bad);
+}
+.plain {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.35rem 1.5rem;
+}
+.facts dt {
+  color: var(--muted);
+}
+.facts dd {
+  margin: 0;
+}
+.center {
+  text-align: center;
+  margin-top: 30vh;
+  color: var(--muted);
+}
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  margin-bottom: 0.75rem;
+}
+.login-brand h1 {
+  margin: 0;
+}
+.login {
+  max-width: 30rem;
+  margin: 18vh auto;
+  padding: 2rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 10px 30px rgb(0 0 0 / 0.18);
+}
+
+/* Capacity & telemetry progress meters (with border for Forced Colors Mode) */
+.meter {
+  height: 6px;
+  width: 100%;
+  /* The track shows against the panel in either theme, a 0% meter too. */
+  background: color-mix(in oklab, var(--muted) 24%, transparent);
+  border: 1px solid transparent;
+  border-radius: 999px;
+  overflow: hidden;
+}
+.meter-fill {
+  height: 100%;
+  background: var(--primary);
+  border-radius: 999px;
+}
+.meter-fill.good {
+  background: var(--good);
+}
+.meter-fill.wait {
+  background: var(--wait);
+}
+.meter-fill.bad {
+  background: var(--bad);
+}
+.meter-fill.zfs {
+  background: var(--zfs);
+}
+
+/* Tabs: styled from [aria-selected="true"] + border pseudo-element so Forced Colors keeps it */
+.tabs {
+  display: flex;
+  gap: 0.2rem;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--line);
+  margin: 0.85rem 0 0.75rem;
+}
+.tabs button {
+  position: relative;
+  flex: none;
+  border: none;
+  border-radius: 0;
+  background: none;
+  padding: 0.45rem 0.8rem;
+  color: var(--muted);
+}
+.tabs button:hover {
+  color: var(--text);
+}
+.tabs button[aria-selected='true'],
+.tabs button.here {
+  color: var(--text);
+}
+.tabs button[aria-selected='true']::after,
+.tabs button.here::after {
+  content: '';
+  position: absolute;
+  inset: auto 0 0;
+  border-block-end: 2px solid var(--primary);
+}
+
+/* A search in a page's head is wide enough for what it asks for. */
+.controls input[type='search'] {
+  min-width: 15rem;
+}
+/* A file picker's button is one of ours, not the browser's own. */
+input[type='file'] {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+input[type='file']::file-selector-button {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--control);
+  border-radius: 5px;
+  padding: 0.28rem 0.65rem;
+  margin-right: 0.6rem;
+  cursor: pointer;
+}
+input[type='file']:hover::file-selector-button {
+  background: var(--surface2);
+}
+.controls {
+  display: flex;
+  gap: 0.65rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 0.5rem;
+}
+pre.log {
+  max-height: 68vh;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+pre.log .stderr {
+  color: var(--bad);
+}
+
+.actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  align-items: center;
+  margin: 0.5rem 0;
+}
+.actions .group,
+form.inline {
+  display: inline-flex;
+  gap: 0.25rem;
+  align-items: center;
+}
+.actions input[type='number'] {
+  width: 4.5rem;
+}
+/* A field named beside it, the name as part of its label. */
+.actions .inline-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+}
+/* Deleting stands apart from the rest. */
+.actions > button.danger {
+  margin-left: 0.5rem;
+}
+a.button {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--control);
+  border-radius: 7px;
+  padding: 0.3rem 0.6rem;
+  min-height: 30px;
+  background: var(--panel);
+  color: inherit;
+  text-decoration: none;
+}
+a.button:hover {
+  border-color: var(--link);
+  text-decoration: none;
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+button.primary,
+a.button.primary {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--on-primary);
+  font-weight: 600;
+}
+button.danger {
+  color: var(--bad);
+  border-color: var(--bad);
+}
+button.sm,
+a.button.sm {
+  font-size: 0.78rem;
+  padding: 0.16rem 0.45rem;
+  min-height: 24px;
+}
+.ok {
+  color: var(--good);
+}
+textarea.editor {
+  width: 100%;
+  font-family: ui-monospace, 'Cascadia Code', SFMono-Regular, Menlo, monospace;
+  font-size: 0.84rem;
+  color: inherit;
+  background: var(--panel);
+  border: 1px solid var(--control);
+  border-radius: 6px;
+  padding: 0.75rem;
+  tab-size: 2;
+}
+pre.diff .add {
+  color: var(--good);
+}
+pre.diff .del {
+  color: var(--bad);
+}
+pre.diff .hunk,
+pre.diff .head {
+  color: var(--muted);
+}
+.tag .link {
+  padding: 0 0 0 0.25rem;
+}
+.terminal {
+  height: 56vh;
+  background: #05080f;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.25rem;
+}
+
+table.matrix td {
+  text-align: center;
+}
+table.matrix td.all {
+  color: var(--good);
+}
+table.matrix td.some {
+  color: var(--wait);
+}
+table.matrix td.no {
+  color: var(--muted);
+}
+
+/* Native <dialog> modal styling and scroll containment (mwg: dialog, light-dismiss-a-dialog) */
+dialog {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--control);
+  border-radius: 10px;
+  padding: 1.1rem 1.25rem;
+  max-width: min(44rem, 94vw);
+  width: 100%;
+  box-shadow: 0 20px 50px rgb(0 0 0 / 0.45);
+}
+dialog:modal {
+  overscroll-behavior: contain;
+}
+dialog::backdrop {
+  background: rgb(4 8 16 / 0.65);
+  backdrop-filter: blur(2px);
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+
+/* Split layout for YAML + live dry-run diff and Topology + Inspector */
+.split-pane {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+/* Persistent bottom Workbench drawer, under the page (see .main-col) */
+.workbench {
+  z-index: 15;
+  background: var(--side);
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+.workbench.resizing {
+  user-select: none;
+}
+.workbench-resizer {
+  height: 7px;
+  cursor: ns-resize;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface2);
+  border-bottom: 1px solid var(--line);
+  touch-action: none;
+  transition: background-color 0.15s ease;
+}
+.workbench-resizer:hover,
+.workbench-resizer:focus-visible,
+.workbench.resizing .workbench-resizer {
+  background: color-mix(in srgb, var(--primary) 18%, var(--surface2));
+  outline: none;
+}
+.workbench-grip {
+  width: 38px;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--muted);
+  opacity: 0.45;
+  transition: opacity 0.15s ease, background-color 0.15s ease;
+}
+.workbench-resizer:hover .workbench-grip,
+.workbench-resizer:focus-visible .workbench-grip,
+.workbench.resizing .workbench-grip {
+  background: var(--primary);
+  opacity: 1;
+}
+.workbench-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0 0.75rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface2);
+}
+.workbench-body {
+  padding: 0.65rem 1rem;
+  height: 320px;
+  min-height: 140px;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  background: var(--panel);
+}
+.workbench-body .terminal {
+  flex: 1 1 auto;
+  min-height: 120px;
+  height: auto;
+}
+.workbench-body pre.log {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+  overflow: auto;
+  margin-bottom: 0;
+}
+
+/* The console's banner (`legion console configure`), above every page:
+   white on colours dark enough for WCAG AA in either theme. */
+.banner {
+  padding: 0.35rem 1rem;
+  text-align: center;
+  font-weight: 600;
+  color: #fff;
+  background: #1f4e79;
+}
+.banner.warning {
+  background: #7a4f00;
+}
+.banner.danger {
+  background: #a4161a;
+}
+
+/* Keyboard use (WCAG 2.4.7, 2.4.13): a ring wherever focus lands, in the
+   indigo link colour, which keeps 3:1 or more against the page in either theme. */
+:focus-visible {
+  outline: 2px solid var(--link);
+  outline-offset: 2px;
+}
+.tabs button:focus-visible {
+  outline-offset: -2px;
+}
+
+/* Forced Colors Mode fallbacks (mwg: color) */
+@media (forced-colors: active) {
+  .topbar,
+  aside,
+  .card,
+  table,
+  dialog,
+  .meter {
+    border: 1px solid CanvasText;
+  }
+  nav a.here {
+    border-left: 3px solid Highlight;
+  }
+  .meter-fill {
+    background: Highlight;
+  }
+}
+
+/* For screen readers alone, and the link past the side bar, shown when
+   focused (WCAG 2.4.1). */
+.sr-only,
+.skip:not(:focus) {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.skip:focus {
+  position: absolute;
+  top: 0.5rem;
+  left: 0.5rem;
+  z-index: 30;
+  padding: 0.5rem 0.75rem;
+  background: var(--panel);
+  border: 2px solid var(--primary);
+  border-radius: 4px;
+}
+
+/* Narrow windows and 400% zoom (WCAG 1.4.10): the side bar above the
+   page, wide tables scrolled on their own. */
+@media (max-width: 56rem) {
+  .split-pane {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 48rem) {
+  .shell {
+    grid-template-columns: 1fr;
+  }
+  aside {
+    border-right: none;
+    border-bottom: 1px solid var(--line);
+  }
+  main {
+    padding: 1rem;
+  }
+  main table {
+    display: block;
+    overflow-x: auto;
+  }
+}
+
+main:focus {
+  outline: none;
+}
+
+ul.lacks {
+  margin: 0;
+  padding-left: 1.2em;
+}
+
+/* Navigation: the side bar's toggle, pinned pages, the pin button. */
+.side-toggle {
+  font-size: 1rem;
+  line-height: 1;
+  min-width: 30px;
+}
+.pin-toggle .ico.on {
+  color: var(--wait);
+}
+.shell.side-hidden {
+  grid-template-columns: 1fr;
+}
+aside[hidden] {
+  display: none;
+}
+ul.pins {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.08rem;
+}
+.pin-row {
+  display: flex;
+  align-items: center;
+  gap: 0.15rem;
+}
+.pin-row a {
+  flex: 1;
+  text-decoration: none;
+  min-width: 0;
+  justify-content: flex-start;
+  gap: 0.4rem;
+  cursor: grab;
+}
+.pin-row .pin-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.grip {
+  color: var(--muted);
+  font-size: 0.8rem;
+  opacity: 0.6;
+}
+.pin-row:hover .grip,
+.pin-row a:focus-visible .grip {
+  opacity: 1;
+}
+button.unpin {
+  color: var(--muted);
+  opacity: 0;
+}
+.pin-row:hover button.unpin,
+button.unpin:focus-visible {
+  opacity: 1;
+}
+@media (hover: none) {
+  button.unpin {
+    opacity: 1;
+  }
+}
+
+/* Lists the user reorders by dragging (drop.svelte.ts's sortable). */
+.sort-dragging {
+  opacity: 0.45;
+}
+.sort-over {
+  box-shadow: inset 0 2px 0 var(--primary);
+}
+.wb-tabs .sort-over {
+  box-shadow: inset 2px 0 0 var(--primary);
+}
+
+/* Files dropped on a field (drop.svelte.ts's droppable). */
+.dropzone {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding: 0.35rem 0.6rem;
+  border: 1px dashed var(--control);
+  border-radius: 6px;
+  transition:
+    border-color 0.12s ease,
+    background-color 0.12s ease;
+}
+.dropzone .hint {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.drop-over {
+  border-color: var(--primary) !important;
+  background-color: color-mix(in srgb, var(--primary) 9%, transparent) !important;
+}
+.drop-taken {
+  border-color: var(--good) !important;
+}
+.drop-refused {
+  border-color: var(--bad) !important;
+  animation: refuse 0.3s ease 2;
+}
+@keyframes refuse {
+  25% {
+    transform: translateX(-3px);
+  }
+  75% {
+    transform: translateX(3px);
+  }
+}
+.drop-hint,
+.toast {
+  position: fixed;
+  left: 50%;
+  translate: -50% 0;
+  z-index: 50;
+  max-width: min(40rem, 92vw);
+  padding: 0.55rem 0.9rem;
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--control);
+  box-shadow: 0 10px 30px rgb(0 0 0 / 0.35);
+  font-size: 0.88rem;
+  margin: 0;
+}
+.drop-hint {
+  top: 4.2rem;
+  border-style: dashed;
+  border-color: var(--primary);
+  pointer-events: none;
+}
+.toast {
+  bottom: 1.2rem;
+  animation: toast-in 0.18s ease-out;
+}
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    translate: -50% 0.5rem;
+  }
+}
+
+/* The shortcuts dialog. */
+kbd {
+  font-family: 'JetBrains Mono Variable', ui-monospace, monospace;
+  font-size: 0.78rem;
+  padding: 0.05rem 0.35rem;
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--surface2);
+}
+dl.keys {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.45rem 0.9rem;
+  margin: 0;
+  align-items: center;
+}
+dl.keys dt {
+  white-space: nowrap;
+}
+dl.keys dd {
+  margin: 0;
+}
+
+/* A short cross-fade of the page between pages (the layout's onNavigate). */
+main {
+  view-transition-name: page;
+}
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+}
+::view-transition-old(page),
+::view-transition-new(page) {
+  animation-duration: 0.14s;
+}
+
+/* The topology's canvas, panned by dragging. */
+.topo-canvas.pannable {
+  cursor: grab;
+}
+.topo-canvas.panning {
+  cursor: grabbing;
+  user-select: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .drop-refused,
+  .toast {
+    animation: none;
+  }
+}
+@media (max-width: 48rem) {
+  .topbar .telemetry-pill,
+  .topbar .brand-title {
+    display: none;
+  }
+}
+h1.with-icon {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+h1.with-icon > .ico {
+  color: var(--muted);
+}
+[role='tab'] > .ico {
+  margin-right: 0.3rem;
+}
+[role='tab'][aria-selected='true'] > .ico {
+  color: var(--text);
+}
+
+/* A button whose call runs (lib/toast.svelte.ts busyWhile): a small ring
+   turning beside its label, the button otherwise as it was. */
+button[aria-busy='true'] {
+  position: relative;
+  cursor: progress;
+}
+button[aria-busy='true']::after {
+  content: '';
+  display: inline-block;
+  width: 0.8em;
+  height: 0.8em;
+  margin-left: 0.45em;
+  vertical-align: -0.1em;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: busy-turn 0.7s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  button[aria-busy='true']::after {
+    animation-duration: 2.4s;
+  }
+}
+@keyframes busy-turn {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Tiles: a figure to read at a glance, its label above, a line on what it
+   means (and what to do) under it, and a meter where it is a share. */
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(max(14rem, calc((100% - 3 * 0.75rem) / 4)), 1fr));
+  gap: 0.75rem;
+  margin-bottom: 0.85rem;
+}
+.tile {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 1rem 1.15rem;
+  transition: border-color 120ms ease;
+}
+.tile:hover {
+  border-color: color-mix(in oklab, var(--control) 60%, var(--line));
+}
+.tile-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.tile-label {
+  margin: 0;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.tile-value {
+  display: flex;
+  align-items: center;
+  margin: 0.1rem 0 0;
+  font-size: 1.55rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+.tile-note {
+  margin: 0;
+  font-size: 0.84rem;
+  color: var(--muted);
+  line-height: 1.4;
+}
+.tile-list {
+  margin: 0;
+  padding-left: 1.05rem;
+  font-size: 0.84rem;
+  color: var(--muted);
+}
+.tile .meter {
+  margin-top: 0.35rem;
+}
+/* Where more is shown: under a rule at the foot of the card. */
+.tile-foot {
+  margin: auto 0 0;
+  padding-top: 0.55rem;
+  border-top: 1px solid var(--line);
+  font-size: 0.82rem;
+}
+.tile-foot a {
+  text-decoration: none;
+}
+.tile-foot a::after {
+  content: ' →';
+}
+.tile-foot a:hover {
+  text-decoration: underline;
+}
+/* An empty list says so in its place, quietly. */
+.empty {
+  padding: 1.2rem;
+  text-align: center;
+  color: var(--muted);
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+}
+/* A line of explanation under a field: smaller, kept to the form's width. */
+p.note {
+  font-size: 0.84rem;
+  line-height: 1.45;
+  margin: 0.2rem 0 0.4rem;
+  max-width: 40rem;
+}
+
+/* An object's strip (its page's head): held at the top of the page's
+   column as it scrolls, over what passes under it. */
+.object-head {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--bg);
+  margin: -0.25rem 0 0.75rem;
+  padding: 0.25rem 0 0;
+  border-bottom: 1px solid var(--line);
+}
+.object-head .tabs {
+  margin-bottom: 0;
+  border-bottom: none;
+}
+h1.object-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  min-width: 0;
+}
+h1.object-title .crumb {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: var(--muted);
+}
+h1.object-title .crumb:hover,
+h1.object-title .crumb:hover .ico {
+  color: var(--text);
+}
+h1.object-title .sep {
+  color: var(--line);
+  font-weight: 400;
+}
+h1.object-title .obj-name {
+  overflow-wrap: anywhere;
+}
+.dot {
+  display: inline-block;
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+.dot.good {
+  background: var(--good);
+}
+.dot.wait {
+  background: var(--wait);
+}
+.dot.bad {
+  background: var(--bad);
+}
+.ns-chip {
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 0.08rem 0.5rem;
+  border-radius: 999px;
+  background: var(--surface2);
+  color: var(--muted);
+}
+@media (forced-colors: active) {
+  .dot {
+    background: CanvasText;
+  }
+}
+
+/* The overview's health: a word for the whole cluster, in its colour, and
+   the few facts it rests on. */
+.card.health {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem 2rem;
+  margin-bottom: 0.85rem;
+  border-left: 4px solid var(--good);
+}
+.card.health.wait {
+  border-left-color: var(--wait);
+}
+.card.health.bad {
+  border-left-color: var(--bad);
+}
+.health-word {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+}
+.health-word h2 {
+  margin: 0;
+  font-size: 1.35rem;
+}
+.health-word p {
+  margin: 0.15rem 0 0;
+}
+.card.health.good .health-word .ico {
+  color: var(--good);
+}
+.card.health.wait .health-word .ico {
+  color: var(--wait);
+}
+.card.health.bad .health-word .ico {
+  color: var(--bad);
+}
+.health-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 1.8rem;
+  margin: 0;
+}
+.health-facts dt {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.health-facts dd {
+  margin: 0.15rem 0 0;
+  font-weight: 600;
+}
+
+/* The side bar's sections open and close smoothly where the browser can
+   animate to and from `auto`, and at once where the system asks for less
+   motion or the browser can't. */
+@media (prefers-reduced-motion: no-preference) {
+  :root {
+    interpolate-size: allow-keywords;
+  }
+  details.nav-sec::details-content {
+    height: 0;
+    overflow: clip;
+    transition:
+      height 180ms ease,
+      content-visibility 180ms allow-discrete;
+  }
+  details.nav-sec[open]::details-content {
+    height: auto;
+  }
+  .nav-group::after {
+    transition: transform 160ms ease;
+  }
+}
+
+/* What is coming, in its shape: rows shimmering until the data is there
+   (still rows where the system asks for less motion). */
+.skeleton {
+  display: grid;
+  gap: 0.45rem;
+  margin-top: 0.5rem;
+}
+.skeleton-row {
+  height: 2rem;
+  border-radius: 6px;
+  background: linear-gradient(90deg, var(--surface2) 25%, var(--panel) 50%, var(--surface2) 75%);
+  background-size: 200% 100%;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .skeleton-row {
+    animation: skeleton-shimmer 1.4s ease-in-out infinite;
+  }
+}
+@keyframes skeleton-shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+/* Sort marks: the sorted column says which way, the others offer it on
+   hover. Drawn, not typed, so screen readers hear aria-sort alone. */
+button.sort-btn::after {
+  content: '';
+  width: 0.45rem;
+  height: 0.45rem;
+  margin-left: 0.15rem;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  opacity: 0;
+  transform: translateY(-0.12rem) rotate(45deg);
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease;
+}
+th:hover > button.sort-btn::after {
+  opacity: 0.35;
+}
+th[aria-sort] > button.sort-btn {
+  color: var(--text);
+}
+th[aria-sort='descending'] > button.sort-btn::after {
+  opacity: 1;
+}
+th[aria-sort='ascending'] > button.sort-btn::after {
+  opacity: 1;
+  transform: translateY(0.12rem) rotate(225deg);
+}
+
+/* A page that keeps a draft (lib/drafts.svelte.ts): a small dot after its
+   name in the side bar. */
+.draft-dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: var(--wait);
+  margin-left: auto;
+  flex: none;
+}
+
+/* What the side bar shows: its pages or the cluster's objects as a tree. */
+.tree-switch {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  margin: 0.4rem 0 0.5rem;
+  border-radius: 7px;
+  background: var(--surface2);
+}
+.tree-switch button {
+  flex: 1;
+  min-height: 26px;
+  padding: 0.15rem 0.3rem;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+.tree-switch button.on {
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.15);
+}
+
+/* One kit (TODO.MD item 6): every button, linked button and table drawn
+   the same way on every page. Kept at the lowest specificity, so a
+   control drawn otherwise on purpose (tabs, sort headers, the side bar's
+   switch) stays as it is. */
+:where(button, a.button) {
+  border-radius: 6px;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease;
+}
+:where(button):hover:not(:disabled),
+:where(a.button):hover {
+  background-color: var(--surface2);
+}
+:where(button.primary):hover:not(:disabled),
+:where(a.button.primary):hover {
+  background-color: color-mix(in oklab, var(--link) 85%, var(--text));
+}
+:where(button.danger):hover:not(:disabled) {
+  background-color: color-mix(in oklab, var(--bad) 12%, var(--panel));
+}
+
+/* A card's title is a heading, also where it leads somewhere: in the
+   text's colour, underlined only under the pointer. */
+.card > h2 > a:only-child,
+.card > h3 > a:only-child {
+  color: var(--text);
+  text-decoration: none;
+}
+.card > h2 > a:only-child:hover,
+.card > h3 > a:only-child:hover {
+  color: var(--link);
+  text-decoration: underline;
+}
+
+/* Tables with their corners rounded, as the cards around them. */
+table {
+  border-collapse: separate;
+  border-spacing: 0;
+  overflow: hidden;
+}
+
+/* A row of choices of which one holds (a chart's range): one control. */
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--control);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.segmented button {
+  border: none;
+  border-radius: 0;
+  background: var(--panel);
+  min-height: 26px;
+  padding: 0.16rem 0.6rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.segmented button + button {
+  border-left: 1px solid var(--line);
+}
+.segmented button[aria-pressed='true'] {
+  background: var(--surface2);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: inset 0 -2px 0 var(--primary);
+}
+
+/* A section's head: its title, and what acts on all of it to the right. */
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin: 1.35rem 0 0.6rem;
+}
+.section-head h2 {
+  margin: 0;
+}
+
+/* Over a list, its search and count; under it, its pages
+   (lib/TableBar.svelte, lib/Pager.svelte). */
+.table-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  margin: 0 0 0.6rem;
+}
+.table-bar input[type='search'] {
+  min-width: 15rem;
+}
+.table-count {
+  margin-left: auto;
+  font-size: 0.84rem;
+}
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.6rem 0 0;
+  font-size: 0.86rem;
+}
+.pager .muted {
+  padding: 0 0.4rem;
+}
+
+@media (forced-colors: active) {
+  .segmented button[aria-pressed='true'] {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
+}
+
+/* The namespace looked at, in the top bar beside the cluster's name. */
+.ns-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding-left: 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.ns-picker:hover {
+  border-color: var(--control);
+}
+.ns-picker:focus-within {
+  outline: 2px solid var(--link);
+  outline-offset: 1px;
+}
+.topbar .ns-picker select {
+  border: none;
+  background: transparent;
+  font-weight: 600;
+  padding-left: 0.1rem;
+  min-height: 28px;
+  max-width: 14rem;
+}
+.topbar .ns-picker select:focus-visible {
+  outline: none;
+}
+
+/* An object's details: its facts in a card, the names in a column of
+   their own. */
+.facts.details-card {
+  gap: 0.6rem 2rem;
+  margin: 0 0 1.25rem;
+}
+.facts.details-card dt {
+  font-size: 0.86rem;
+}
+.facts.details-card dd {
+  font-weight: 500;
+}
+
+/* A table's cell of buttons stays a cell, so its row's rule runs straight
+   under it; its buttons are spaced as a row's controls are. */
+td.controls {
+  display: table-cell;
+}
+td.controls > * {
+  margin: 0.15rem 0.4rem 0.15rem 0;
+  vertical-align: middle;
+}
+
+/* A drop-down's list is drawn by the browser from the options' own
+   colours: the panel's and the text's, so a select with a see-through
+   face (the namespace picker) does not open on a white list with light
+   words. */
+option,
+optgroup {
+  background-color: var(--panel);
+  color: var(--text);
+}

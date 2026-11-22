@@ -125,7 +125,7 @@
   }
   const summary = $derived.by(() => {
     if (!also) {
-      return t('now {now} · average {average} · highest {highest}', {
+      return t('now {now} · avg {average} · max {highest}', {
         now: format(last),
         average: format(avg),
         highest: format(max)
@@ -134,7 +134,7 @@
     const a = figures(points);
     const b = figures(second);
     return t(
-      '{first}: now {now1} · average {average1} · highest {highest1}; {second}: now {now2} · average {average2} · highest {highest2}',
+      '{first}: now {now1} · avg {average1} · max {highest1}; {second}: now {now2} · avg {average2} · max {highest2}',
       {
         first: label || title,
         now1: a.now,
@@ -423,8 +423,16 @@
     margin: 0.1rem 0 0.2rem;
     font-size: 0.78rem;
   }
+  /* In a card of a row, the plot at the foot, so the x-axes of a row line
+     up however much the cards above them say. */
   .chart {
     margin: 0 0 0.75rem;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+  }
+  .chart > svg {
+    margin-top: auto;
   }
   figcaption {
     display: grid;

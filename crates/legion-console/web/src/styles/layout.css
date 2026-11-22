@@ -1,0 +1,422 @@
+/* App chrome: Top Telemetry Strip + Left Rail + Main + Bottom Workbench */
+.app-frame {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+  padding: 0.5rem 1rem;
+  background: var(--side);
+  color: var(--text);
+  border-bottom: 1px solid var(--line);
+  font-size: 0.82rem;
+  min-height: 3rem;
+}
+.topbar select,
+.topbar button.sm,
+.topbar .cmd-trigger {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--line);
+}
+/* The bar's buttons of an icon alone (the side bar, the theme, the
+   shortcuts) in the text's colour, as heavy as those with words. */
+.topbar button.sm .ico {
+  color: var(--text);
+}
+.topbar .cmd-trigger kbd {
+  background: var(--surface2);
+  border-color: var(--line);
+  color: var(--muted);
+}
+.topbar .telemetry-pill {
+  background: var(--panel);
+  border-color: var(--line);
+  color: var(--muted);
+}
+.topbar .telemetry-pill strong {
+  color: var(--text);
+}
+.topbar-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  font-weight: 500;
+  font-size: 0.98rem;
+  color: var(--text);
+  text-decoration: none;
+  margin-right: 0.35rem;
+}
+.topbar-brand .brand-title strong {
+  font-weight: 700;
+}
+.topbar-brand:hover {
+  text-decoration: none;
+}
+.freebsd-logo {
+  flex-shrink: 0;
+  display: block;
+}
+.topbar-cluster {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 0.82rem;
+}
+.telemetry-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.18rem 0.55rem;
+  border-radius: 999px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.telemetry-pill strong {
+  color: var(--text);
+  font-weight: 600;
+}
+.dot-live {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--good);
+  display: inline-block;
+}
+.dot-bad {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--bad);
+  display: inline-block;
+}
+.topbar-spacer {
+  flex: 1;
+}
+.cmd-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: var(--panel);
+  border: 1px solid var(--control);
+  border-radius: 8px;
+  padding: 0.3rem 0.65rem;
+  min-height: 30px;
+  min-width: 15rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+.cmd-trigger:hover {
+  border-color: var(--link);
+  color: var(--text);
+}
+.cmd-trigger kbd {
+  font-family: ui-monospace, monospace;
+  font-size: 0.73rem;
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+  border: 1px solid var(--line);
+  background: var(--surface2);
+  color: var(--text);
+}
+
+.shell {
+  display: grid;
+  grid-template-columns: 15rem 1fr;
+  flex: 1;
+  min-height: 0;
+}
+aside {
+  background: var(--side);
+  color: var(--text);
+  border-right: 1px solid var(--line);
+  padding: 0.75rem 0.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+aside .ns {
+  color: var(--muted);
+}
+aside select {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--line);
+}
+aside .who {
+  border-top-color: var(--line);
+  color: var(--muted);
+}
+aside button.link {
+  color: var(--link);
+}
+.brand {
+  font-weight: 700;
+  font-size: 1.1rem;
+  color: var(--text);
+}
+.brand .cluster {
+  display: block;
+  font-weight: 400;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.ns {
+  display: flex;
+  flex-direction: column;
+  gap: 0.22rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+select,
+input,
+textarea,
+button {
+  font: inherit;
+  color: inherit;
+  background: var(--panel);
+  border: 1px solid var(--control);
+  border-radius: 7px;
+  padding: 0.3rem 0.6rem;
+  min-height: 30px;
+}
+input[type='checkbox'],
+input[type='radio'] {
+  min-height: 0;
+  padding: 0;
+  width: 1rem;
+  height: 1rem;
+  vertical-align: middle;
+}
+button {
+  cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
+}
+html[data-density='compact'] select,
+html[data-density='compact'] input,
+html[data-density='compact'] button {
+  padding: 0.18rem 0.45rem;
+}
+nav {
+  display: flex;
+  flex-direction: column;
+  gap: 0.08rem;
+  flex: 1;
+}
+nav h2 {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 0.85rem 0 0.2rem;
+  padding: 0 0.5rem;
+}
+nav a {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: color-mix(in oklab, var(--text) 82%, var(--muted));
+  font-size: 0.9rem;
+  font-weight: 500;
+  padding: 0.32rem 0.6rem;
+  border-radius: 7px;
+  min-height: 30px;
+}
+nav a:hover {
+  background: var(--surface2);
+  color: var(--text);
+  text-decoration: none;
+}
+nav a.here {
+  background: color-mix(in oklab, var(--primary) 18%, transparent);
+  color: var(--text);
+  font-weight: 600;
+}
+nav a.here .ico {
+  color: var(--link);
+}
+/* Icons (lib/Ico.svelte): line drawings in the colour of what holds them,
+   muted until what holds them is hovered or current; never the accent,
+   which is kept for the current page's mark and for danger. */
+.ico {
+  flex: none;
+  color: var(--muted);
+  vertical-align: -0.2em;
+  transition: color 120ms ease;
+}
+nav a {
+  justify-content: flex-start;
+  gap: 0.55rem;
+}
+nav a > span:not(.count):not(.grip) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+nav a .count {
+  margin-left: auto;
+}
+nav a:hover .ico,
+nav a.here .ico,
+button:hover > .ico,
+.cmd-trigger:hover .ico {
+  color: var(--text);
+}
+/* An icon and its words, spaced the same whether the words are bare text
+   or an element. */
+button:has(> .ico),
+a.button:has(> .ico) {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.who {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  font-size: 0.82rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--line);
+}
+button.link {
+  border: none;
+  background: none;
+  color: var(--link);
+  cursor: pointer;
+  padding: 0 0.2rem;
+  /* At least 24 by 24 px to hit (WCAG 2.5.8). */
+  min-height: 24px;
+  min-width: 24px;
+}
+.main-col {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+@media (min-width: 48.01rem) {
+  .app-frame {
+    height: 100dvh;
+    overflow: hidden;
+  }
+  .shell {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+  aside {
+    height: 100%;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--control) var(--side);
+  }
+  /* The page scrolls above the workbench, which is laid out under it
+     rather than held over it: nothing on the page passes under its bar,
+     where it could not be reached. */
+  .main-col {
+    height: 100%;
+    overflow: hidden;
+  }
+  main {
+    min-height: 0;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--control) var(--bg);
+  }
+}
+.nav-search {
+  width: 100%;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.3rem 0.55rem;
+  font-size: 0.82rem;
+}
+.nav-search::placeholder {
+  color: var(--muted);
+}
+.nav-sec {
+  margin-top: 0.3rem;
+}
+.nav-group {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--muted);
+  padding: 0.3rem 0.6rem;
+  border-radius: 4px;
+  user-select: none;
+}
+.nav-group:hover {
+  background: var(--surface2);
+  color: var(--text);
+}
+.nav-group::after {
+  content: '▸';
+  font-size: 0.75rem;
+  transition: transform 0.12s ease;
+}
+.nav-sec[open] > .nav-group::after {
+  transform: rotate(90deg);
+}
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+button:focus-visible,
+summary:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--link);
+  outline-offset: 1px;
+}
+fieldset {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  padding: 0.85rem 1rem;
+}
+fieldset legend {
+  font-weight: 600;
+  font-size: 0.85rem;
+  padding: 0 0.35rem;
+}
+main {
+  padding: 1.5rem 2rem;
+  min-width: 0;
+  flex: 1;
+}
+html[data-density='compact'] main {
+  padding: 0.9rem 1.25rem;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+.bar h1 {
+  margin: 0 auto 0 0;
+}
