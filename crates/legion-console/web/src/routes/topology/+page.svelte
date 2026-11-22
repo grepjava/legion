@@ -832,7 +832,10 @@
             {@const pList = svcPorts(s)}
             <a
               href={link('Service', s.metadata.name)}
-              aria-label={t('Service {name}: {note}', { name: s.metadata.name, note: svcNote(s) })}
+              aria-label={t('Service {name}: {note}', {
+                name: `${s.metadata.name}${pList.length ? ` :${pList[0]}` : ''}`,
+                note: svcNote(s)
+              })}
             >
               <circle
                 class="svc-halo {h}"
@@ -869,11 +872,10 @@
                 <line x1={X_SVC_CX} y1={cy + 1} x2={X_SVC_CX} y2={cy + 12} class="icon-stroke" />
               {/if}
 
-              <!-- Ready badge pill -->
-              <rect x={X_SVC_CX + 14} y={cy - 34} width="32" height="16" rx="8" class="badge-pill {h}" />
-              <text class="badge-text" x={X_SVC_CX + 30} y={cy - 22} text-anchor="middle">
-                {s.status?.ready ?? 0}/{s.status?.desired ?? 0}
-              </text>
+              <!-- Its health as a lamp; the count is said once, under its
+                   name, so what is shown is what its link is named
+                   (WCAG 2.5.3). -->
+              <rect x={X_SVC_CX + 18} y={cy - 32} width="14" height="14" rx="7" class="badge-pill {h}" />
 
               <!-- Service label & ports -->
               <text class="svc-title" x={X_SVC_CX} y={cy + SVC_R + 18} text-anchor="middle">
@@ -1151,11 +1153,6 @@
   .badge-pill.bad {
     fill: var(--bad);
     stroke: var(--bad);
-  }
-  .badge-text {
-    fill: #ffffff;
-    font-size: 10px;
-    font-weight: 700;
   }
   .svc-title {
     fill: var(--text);

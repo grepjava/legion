@@ -666,7 +666,8 @@ spec:
     e.until("every service green and keeper's Volume", 60, |b| {
         b.eval(
             "['formed', 'sleeper', 'hello'].every((s) =>
-               document.querySelector(`[aria-label^=\"Service ${s}:\"] rect`)?.classList.contains('good'))
+               // Named for what it shows: its name, its port if it has one.
+               document.querySelector(`[aria-label^=\"Service ${s}:\"] rect, [aria-label^=\"Service ${s} :\"] rect`)?.classList.contains('good'))
              && !!document.querySelector('[aria-label^=\"Volume \"]')",
         ) == serde_json::json!(true)
     });
@@ -1716,7 +1717,7 @@ fn the_console_builds_an_example() {
     e.click("Show");
     e.until("web green in the topology", 60, |b| {
         b.eval(
-            "document.querySelector('[aria-label^=\"Service web:\"] rect')?.classList.contains('good') ?? false",
+            "document.querySelector('[aria-label^=\"Service web:\"] rect, [aria-label^=\"Service web :\"] rect')?.classList.contains('good') ?? false",
         ) == serde_json::json!(true)
     });
     // Asked from a VM: pf redirects what comes in, not the host's own.
