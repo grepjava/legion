@@ -2095,3 +2095,13 @@ td.controls > * {
   margin: 0.15rem 0.4rem 0.15rem 0;
   vertical-align: middle;
 }
+
+/* A drop-down's list is drawn by the browser from the options' own
+   colours: the panel's and the text's, so a select with a see-through
+   face (the namespace picker) does not open on a white list with light
+   words. */
+option,
+optgroup {
+  background-color: var(--panel);
+  color: var(--text);
+}
