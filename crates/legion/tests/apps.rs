@@ -28,10 +28,12 @@ fn running(lab: &Lab, namespace: &str) -> bool {
         .any(|t| t["status"]["state"] == "running")
 }
 
-/// Whether something answers on `port` of this host.
-fn open(port: u16) -> bool {
+/// Whether something answers on `port` of this host, at its address: a
+/// published port is taken where the node is reached, not on its own
+/// loopback.
+fn open(host: &str, port: u16) -> bool {
     std::net::TcpStream::connect_timeout(
-        &format!("127.0.0.1:{port}").parse().unwrap(),
+        &format!("{host}:{port}").parse().unwrap(),
         std::time::Duration::from_secs(3),
     )
     .is_ok()
@@ -46,10 +48,16 @@ fn apps_of_the_catalog_deploy_and_answer() {
 
     let listed = lab.ok(&["app", "list"]);
     for app in ["vaultwarden", "postgres", "redis"] {
-        assert!(listed.lines().any(|l| l.starts_with(app)), "{app} listed:\n{listed}");
+        assert!(
+            listed.lines().any(|l| l.starts_with(app)),
+            "{app} listed:\n{listed}"
+        );
     }
     let shown = lab.ok(&["app", "show", "postgres"]);
-    assert!(shown.contains("POSTGRES_PASSWORD") && shown.contains("(made up)"), "{shown}");
+    assert!(
+        shown.contains("POSTGRES_PASSWORD") && shown.contains("(made up)"),
+        "{shown}"
+    );
 
     let pg = deploy(&lab, "postgres", &["WEB_PORT=25432"]);
     let password = pg
@@ -59,18 +67,28 @@ fn apps_of_the_catalog_deploy_and_answer() {
         .expect("the password made up, said")
         .to_owned();
     let ns = lab.ok(&["get", "namespace", "postgres", "-o", "yaml"]);
-    assert!(ns.contains("sysvipc"), "its namespace allows what it asks for: {ns}");
+    assert!(
+        ns.contains("sysvipc"),
+        "its namespace allows what it asks for: {ns}"
+    );
     deploy(&lab, "redis", &["WEB_PORT=26379"]);
     deploy(&lab, "vaultwarden", &["WEB_PORT=28080"]);
 
-    for (namespace, port) in [("postgres", 25432), ("redis", 26379), ("vaultwarden", 28080)] {
-        lab.wait_or_report(&format!("{namespace} running and answering on {port}"), 900, || {
-            running(&lab, namespace) && open(port)
-        });
+    for (namespace, port) in [
+        ("postgres", 25432),
+        ("redis", 26379),
+        ("vaultwarden", 28080),
+    ] {
+        lab.wait_or_report(
+            &format!("{namespace} running and answering on {port}"),
+            900,
+            || running(&lab, namespace) && open(&lab.host, port),
+        );
     }
     // Vaultwarden's web page; PostgreSQL taking its password.
     wait("Vaultwarden's page", 120, || {
-        common::http_get("127.0.0.1", 28080).is_ok_and(|r| r.starts_with("HTTP/1.1 200") || r.starts_with("HTTP/1.0 200"))
+        common::http_get(&lab.host, 28080)
+            .is_ok_and(|r| r.starts_with("HTTP/1.1 200") || r.starts_with("HTTP/1.0 200"))
     });
     let task = lab
         .list("tasks", "postgres")
@@ -80,8 +98,20 @@ fn apps_of_the_catalog_deploy_and_answer() {
         .unwrap();
     let said = lab.legion(
         &[
-            "exec", &task, "-n", "postgres", "--", "env", &format!("PGPASSWORD={password}"), "psql", "-h",
-            "127.0.0.1", "-U", "postgres", "-Atc", "select 41 + 1",
+            "exec",
+            &task,
+            "-n",
+            "postgres",
+            "--",
+            "env",
+            &format!("PGPASSWORD={password}"),
+            "psql",
+            "-h",
+            "127.0.0.1",
+            "-U",
+            "postgres",
+            "-Atc",
+            "select 41 + 1",
         ],
         &[],
     );
