@@ -214,16 +214,45 @@ export const api = {
       {}
     ),
 
+  /** The daemonless catalog's apps. */
+  apps: () => call<{ name: string; apps: CatalogApp[] }>('GET', '/api/apps'),
+  /** One app, ready for Import compose. */
+  app: (id: string, variant = '') =>
+    call<AppManifest>(
+      'GET',
+      `/api/apps/${encodeURIComponent(id)}${variant ? `?variant=${encodeURIComponent(variant)}` : ''}`
+    ),
+
+  /** What a Volume's BackupTarget holds of it, oldest first. */
+  volumeBackups: (namespace: string, name: string, target = '') =>
+    call<{ backups: string[] }>(
+      'GET',
+      `/api/volume-backups/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}${target ? `?target=${encodeURIComponent(target)}` : ''}`
+    ),
+  /** One of them restored onto `node` as the Volume `into`. */
+  volumeRestoreFrom: (
+    namespace: string,
+    name: string,
+    body: { target?: string; backup: string; node: string; into?: string }
+  ) =>
+    call<object>(
+      'POST',
+      `/api/volume-backups/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
+      body
+    ),
+
   volumeSnapshotOp: (
     namespace: string,
     name: string,
-    op: 'create' | 'rollback' | 'delete',
-    snapshot: string
+    op: 'create' | 'rollback' | 'delete' | 'clone',
+    snapshot: string,
+    /** For `clone`: the new Volume's name. */
+    into = ''
   ) =>
     call<{ snapshots: string[] }>(
       'POST',
       `/api/volume-snapshots/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
-      { op, snapshot }
+      { op, snapshot, into }
     ),
 
   /** Lists cached OCI jail images across ready nodes (`legion image ls`). */
@@ -581,6 +610,11 @@ export interface NodeUsage {
   zfs_avail_bytes?: number;
   net_rx_bps?: number;
   net_tx_bps?: number;
+  /** The ZFS root's pool: bytes read and written, and read and write operations, per second. */
+  zfs_read_bps?: number;
+  zfs_write_bps?: number;
+  zfs_read_iops?: number;
+  zfs_write_iops?: number;
   volumes?: VolumeSpace[];
   /** Of `zfs_used_bytes`: the image store's and the tasks' roots'. */
   images_bytes?: number;
@@ -879,10 +913,13 @@ export interface TaskSeries {
   memory_limit_bytes: number;
 }
 
-/** A node's ZFS & network samples over the last hour: [at_ms, zfs_used_bytes, zfs_avail_bytes, net_rx_bps, net_tx_bps]. */
+/**
+ * A node's ZFS & network samples over the last hour: [at_ms, zfs_used_bytes, zfs_avail_bytes, net_rx_bps, net_tx_bps,
+ * zfs_read_bps, zfs_write_bps, zfs_read_iops, zfs_write_iops]. A manager from before the pool's I/O sends only the first five.
+ */
 export interface NodeSeries {
   node: string;
-  samples: [number, number, number, number, number][];
+  samples: [number, number, number, number, number, number?, number?, number?, number?][];
 }
 
 /** `legion usage`: what tasks and nodes used over the last hour as the leader sampled it, or over `rangeMs` from what the managers keep. */
@@ -958,6 +995,30 @@ export function compose(body: {
   env: Record<string, string>;
 }): Promise<{ objects: object[]; warnings: string[]; variables: ComposeVariable[] }> {
   return call('POST', '/api/compose', body);
+}
+
+/** An app in the daemonless catalog (legion_api::app). */
+export interface CatalogApp {
+  id: string;
+  name: string;
+  category: string;
+  description: string;
+  image: string;
+  version: string;
+  web_url?: string;
+}
+
+/** An app as Import compose deploys it: its compose file and its
+ * variables' values (defaults, a secret made up). */
+export interface AppManifest {
+  id: string;
+  name: string;
+  description: string;
+  compose: string;
+  values: Record<string, string>;
+  variables: { name: string; label?: string; type?: string }[];
+  variants: { id: string; label?: string; default?: boolean }[];
+  variant?: string;
 }
 
 /** A compose file to deploy from: an example (namespace empty), or one
@@ -1064,7 +1125,7 @@ export interface DryRun {
 /** A long operation (`legion activity`, legion_api::activity). */
 export interface Operation {
   id: string;
-  kind: 'drain' | 'move' | 'restore' | 'replica-copy';
+  kind: 'drain' | 'move' | 'restore' | 'replica-copy' | 'backup';
   target: { kind?: string; namespace?: string; name?: string };
   what: string;
   /** Who asked: for the cluster admin only. */

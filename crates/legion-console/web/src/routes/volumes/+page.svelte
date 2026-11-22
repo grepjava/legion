@@ -21,7 +21,7 @@
   import SortTh from '#lib/SortTh.svelte';
   import TableBar from '#lib/TableBar.svelte';
   import Pager from '#lib/Pager.svelte';
-  import { Activity, Database, HardDrive, ShieldCheck } from '@lucide/svelte';
+  import { Activity, Database, Gauge, HardDrive, ShieldCheck } from '@lucide/svelte';
 
   let adminNamespaces: string[] = $state([]);
   let volumes: LObject[] = $state([]);
@@ -398,6 +398,20 @@
     const d = Math.floor((Date.now() - ms) / 86_400_000);
     return d < 1 ? t('today') : tn('1 day ago', '{n} days ago', d);
   }
+  // What the nodes' pools read and write now, summed: the agents' rates
+  // from the datasets' counters, as each heartbeat brings them.
+  const io = $derived.by(() => {
+    const sum = (f: (n: NodeUsage) => number | undefined) => nodeUsage.reduce((a, n) => a + (f(n) ?? 0), 0);
+    return {
+      // Whether any node tells its pool at all (an agent from before the
+      // pool's I/O tells only its space).
+      told: nodeUsage.some((n) => n.zfs_read_bps !== undefined && (n.zfs_used_bytes ?? 0) + (n.zfs_avail_bytes ?? 0) > 0),
+      read: sum((n) => n.zfs_read_bps),
+      written: sum((n) => n.zfs_write_bps),
+      reads: sum((n) => n.zfs_read_iops),
+      writes: sum((n) => n.zfs_write_iops)
+    };
+  });
   const detached = $derived(
     volumes.filter((v) => !attachedBy.get(`${v.metadata.namespace ?? ''}/${v.metadata.name}`)?.length).length
   );
@@ -462,6 +476,18 @@
       note={verified.stalest
         ? t('The stalest pool scrubbed {when}', { when: ago(verified.stalest) })
         : t('Schedule scrubs on a node’s Host tab')}
+    />
+  {/if}
+  {#if io.told}
+    <Tile
+      label={t('Live I/O')}
+      icon={Gauge}
+      tone="zfs"
+      value={t('{read}/s read · {written}/s written', { read: bytes(io.read), written: bytes(io.written) })}
+      note={t('{reads} read and {writes} write IOPS, over every node’s pool now', {
+        reads: Math.round(io.reads),
+        writes: Math.round(io.writes)
+      })}
     />
   {/if}
   <Tile

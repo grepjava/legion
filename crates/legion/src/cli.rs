@@ -641,6 +641,12 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
         Command::Join { .. }
         | Command::Restore { .. }
         | Command::Doctor { .. }
+        | Command::App {
+            command:
+                crate::AppCommand::List { .. }
+                | crate::AppCommand::Show { .. }
+                | crate::AppCommand::Deploy { dry_run: true, .. },
+        }
         | Command::Unlock { .. } => {
             unreachable!("handled in main")
         }
@@ -876,6 +882,55 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             }
         }
         Command::Stack { command } => stack(&mut objects, command).await?,
+        Command::App {
+            command:
+                crate::AppCommand::Deploy {
+                    app,
+                    name,
+                    namespace,
+                    set,
+                    variant,
+                    dry_run,
+                    catalog,
+                },
+        } => {
+            let stack = name.unwrap_or_else(|| app.clone());
+            let namespace = namespace.unwrap_or_else(|| stack.clone());
+            let (converted, env) =
+                crate::app::stack(&catalog, &app, &set, variant.as_deref(), &stack, &namespace).await?;
+            let _ = dry_run;
+            // Made only when missing, allowing what its containers ask
+            // for; one there is keeps what it allows, as the admin set it.
+            let found = objects
+                .get(ObjectRef {
+                    kind: Kind::Namespace.as_str().into(),
+                    namespace: String::new(),
+                    name: namespace.clone(),
+                })
+                .await;
+            if let Err(s) = &found
+                && s.code() == tonic::Code::NotFound
+            {
+                let spec = converted.namespace_spec();
+                let ns = Object::new(Kind::Namespace, "", &namespace, spec);
+                apply(&mut objects, &ns).await?;
+            } else if let Err(s) = found
+                && s.code() != tonic::Code::PermissionDenied
+            {
+                return Err(anyhow::Error::from(s).context(format!("namespace {namespace}")));
+            }
+            for object in &converted.objects {
+                apply(&mut objects, object).await?;
+            }
+            let secrets: Vec<_> = env
+                .iter()
+                .filter(|(k, _)| !set.iter().any(|s| s.starts_with(&format!("{k}="))))
+                .filter(|(k, _)| k.contains("PASSWORD") || k.contains("SECRET") || k.contains("TOKEN") || k.ends_with("_KEY"))
+                .collect();
+            for (k, v) in secrets {
+                println!("{k}={v}  (made up: keep it)");
+            }
+        }
         Command::Diff { files } => {
             let mut changed = false;
             for file in files {
@@ -1227,13 +1282,79 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 crate::VolumeCommand::Restore {
                     file,
                     node,
+                    from: Some(target),
+                    namespace,
+                    name,
+                    ..
+                },
+        } => {
+            let source = file.to_string_lossy().into_owned();
+            let (volume, backup) = source
+                .split_once('@')
+                .ok_or_else(|| anyhow::anyhow!("with --from, give the backup as VOLUME@BACKUP"))?;
+            let ns = namespace.unwrap_or_else(|| "default".into());
+            let into = name.unwrap_or_else(|| volume.to_owned());
+            pb::volumes_client::VolumesClient::new(channel.clone())
+                .restore_from(pb::VolumeRestoreFromRequest {
+                    namespace: ns.clone(),
+                    name: volume.to_owned(),
+                    target: target.clone(),
+                    backup: backup.to_owned(),
+                    node: node.clone(),
+                    into: into.clone(),
+                })
+                .await?;
+            println!("Volume/{ns}/{into} restored on {node} from {target}: {backup}");
+        }
+        Command::Volume {
+            command:
+                crate::VolumeCommand::Restore {
+                    file,
+                    node,
                     namespace,
                     name,
                     replace,
+                    from: None,
                 },
         } => {
             crate::volume_backup::restore(channel.clone(), &file, node, namespace, name, replace)
                 .await?;
+        }
+        Command::Volume {
+            command:
+                crate::VolumeCommand::Backups {
+                    volume,
+                    from,
+                    namespace,
+                },
+        } => {
+            let ns = namespace.unwrap_or_else(|| "default".into());
+            let r = pb::volumes_client::VolumesClient::new(channel.clone())
+                .backups(pb::VolumeBackupsRequest {
+                    namespace: ns.clone(),
+                    name: volume.clone(),
+                    target: from.unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            if r.snapshots.is_empty() {
+                println!("Volume/{ns}/{volume} has no backups there yet");
+            } else {
+                let rows: Vec<[String; 2]> = r
+                    .snapshots
+                    .into_iter()
+                    .map(|held| {
+                        let name = held
+                            .rsplit(['@', '/'])
+                            .next()
+                            .unwrap_or(&held)
+                            .trim_end_matches(".zfs")
+                            .to_owned();
+                        [name, held]
+                    })
+                    .collect();
+                print_table(["BACKUP", "HELD AS"], &rows);
+            }
         }
         Command::Volume { command } => {
             run_volume_snapshot(channel.clone(), command).await?;
@@ -1689,7 +1810,7 @@ async fn stack(objects: &mut Objects, command: StackCommand) -> anyhow::Result<(
                 .await;
             match found {
                 Err(s) if s.code() == tonic::Code::NotFound => {
-                    let ns = Object::new(Kind::Namespace, "", &namespace, serde_json::json!({}));
+                    let ns = Object::new(Kind::Namespace, "", &namespace, converted.namespace_spec());
                     apply(objects, &ns).await?;
                 }
                 Err(s) if s.code() != tonic::Code::PermissionDenied => {
@@ -2761,6 +2882,7 @@ async fn run_volume_snapshot(
     command: crate::VolumeCommand,
 ) -> anyhow::Result<()> {
     let mut client = pb::volumes_client::VolumesClient::new(channel);
+    let mut into = String::new();
     let (volume, namespace, op, snapshot) = match command {
         crate::VolumeCommand::Snapshots { volume, namespace } => {
             (volume, namespace, "list", String::new())
@@ -2774,7 +2896,65 @@ async fn run_volume_snapshot(
             volume,
             snapshot,
             namespace,
-        } => (volume, namespace, "rollback", snapshot),
+            yes,
+        } => {
+            // What goes with it: the snapshots after it.
+            let ns = namespace.clone().unwrap_or_else(|| "default".into());
+            let listed = client
+                .snapshot(pb::VolumeSnapshotRequest {
+                    namespace: ns.clone(),
+                    name: volume.clone(),
+                    op: "list".to_owned(),
+                    snapshot: String::new(),
+                    into: String::new(),
+                })
+                .await?
+                .into_inner()
+                .snapshots;
+            let later: Vec<_> = listed
+                .iter()
+                .skip_while(|s| **s != snapshot)
+                .skip(1)
+                .cloned()
+                .collect();
+            if !yes {
+                use std::io::{BufRead, IsTerminal, Write};
+                let gone = if later.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " Destroyed with it: {}; a replica's or backup's base after it too, so their next copy is whole.",
+                        later.join(", ")
+                    )
+                };
+                if !std::io::stdin().is_terminal() {
+                    anyhow::bail!(
+                        "rolling Volume/{ns}/{volume} back to @{snapshot} loses what was written since.{gone} Confirm with --yes"
+                    );
+                }
+                print!(
+                    "Roll Volume/{ns}/{volume} back to @{snapshot}? What was written since is lost.{gone} [y/N] "
+                );
+                std::io::stdout().flush()?;
+                let mut said = String::new();
+                std::io::stdin().lock().read_line(&mut said)?;
+                if !matches!(said.trim(), "y" | "Y" | "yes") {
+                    anyhow::bail!("not rolled back");
+                }
+            }
+            (volume, namespace, "rollback", snapshot)
+        }
+        crate::VolumeCommand::Clone {
+            source,
+            name,
+            namespace,
+        } => {
+            let (volume, snapshot) = source
+                .split_once('@')
+                .ok_or_else(|| anyhow::anyhow!("give the snapshot as VOLUME@SNAPSHOT"))?;
+            into = name;
+            (volume.to_owned(), namespace, "clone", snapshot.to_owned())
+        }
         crate::VolumeCommand::RmSnapshot {
             volume,
             snapshot,
@@ -2789,6 +2969,7 @@ async fn run_volume_snapshot(
             name: volume.clone(),
             op: op.to_owned(),
             snapshot: snapshot.clone(),
+            into: into.clone(),
         })
         .await?
         .into_inner();
@@ -2804,6 +2985,7 @@ async fn run_volume_snapshot(
         "create" => println!("Volume/{ns}/{volume}@{snapshot} created"),
         "rollback" => println!("Volume/{ns}/{volume} rolled back to @{snapshot}"),
         "delete" => println!("Volume/{ns}/{volume}@{snapshot} deleted"),
+        "clone" => println!("Volume/{ns}/{into} made from {volume}@{snapshot}"),
         _ => {}
     }
     Ok(())

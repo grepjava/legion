@@ -488,6 +488,12 @@ message NodeSample {
   uint64 zfs_avail_bytes = 3;
   uint64 net_rx_bps = 4;
   uint64 net_tx_bps = 5;
+  // The pool's I/O, as in NodeUsage; 0 in samples taken before builds
+  // that measured it.
+  uint64 zfs_read_bps = 6;
+  uint64 zfs_write_bps = 7;
+  uint64 zfs_read_iops = 8;
+  uint64 zfs_write_iops = 9;
 }
 
 message TaskSeries {
@@ -707,6 +713,12 @@ message NodeUsage {
   uint32 load1 = 11;
   uint32 load5 = 12;
   uint32 load15 = 13;
+  // The pool's bytes read and written and its read and write operations,
+  // per second, as in the agent's `NodeTelemetry`.
+  uint64 zfs_read_bps = 14;
+  uint64 zfs_write_bps = 15;
+  uint64 zfs_read_iops = 16;
+  uint64 zfs_write_iops = 17;
 }
 
 message AutolockRequest {
@@ -782,6 +794,32 @@ service Volumes {
   // whatever still runs on the node writes to a copy no longer the
   // Volume's, dropped once the node is back.
   rpc Promote(VolumePromoteRequest) returns (VolumePromoteResponse);
+  // The Volume's backups its BackupTarget holds (`backup.target`, or
+  // `target` given), oldest first, as `snapshots`.
+  rpc Backups(VolumeBackupsRequest) returns (VolumeSnapshotResponse);
+  // Restores one of them onto `node`, which must not have the data, as the
+  // Volume `into` (the Volume's own name if empty, which must then not
+  // exist), made once all of it is there.
+  rpc RestoreFrom(VolumeRestoreFromRequest) returns (VolumeRestoreResponse);
+}
+
+message VolumeBackupsRequest {
+  string namespace = 1;
+  string name = 2;
+  // The target; empty for the Volume's `backup.target`.
+  string target = 3;
+}
+
+message VolumeRestoreFromRequest {
+  string namespace = 1;
+  // The Volume backed up.
+  string name = 2;
+  string target = 3;
+  // The backup, as `Backups` names it, or its snapshot's name
+  // (`legion-bk-<target>-<time>`).
+  string backup = 4;
+  string node = 5;
+  string into = 6;
 }
 
 message VolumePromoteRequest {
@@ -798,9 +836,11 @@ message VolumePromoteResponse {
 message VolumeSnapshotRequest {
   string namespace = 1;
   string name = 2;
-  // "list", "create", "rollback", "delete".
+  // "list", "create", "rollback", "delete"; "clone", the snapshot copied
+  // into the new Volume `into`, on the same node.
   string op = 3;
   string snapshot = 4;
+  string into = 5;
 }
 
 message VolumeSnapshotResponse {

@@ -1807,6 +1807,8 @@ fn host_and_pools() -> Model {
             load1: 350,
             load5: 120,
             load15: 40,
+            zfs_read_bps: 3 << 20,
+            zfs_write_bps: 512 << 10,
             ..Default::default()
         }],
     });
@@ -1844,6 +1846,7 @@ fn nodes_show_their_load_and_pools_and_details_their_host() {
         .join("\n");
     for said in [
         "load 3.50 1.20 0.40 (1, 5, 15 min)",
+        "pool i/o read 3Mi/s written 512Ki/s",
         "release: 15.1-RELEASE-p2 (kernel 15.1-RELEASE-p1)",
         "boot: UEFI",
         "up: 3d",
@@ -1969,6 +1972,7 @@ fn usage_history(step_ms: i64) -> pb::UsageHistoryResponse {
             zfs_avail_bytes,
             net_rx_bps,
             net_tx_bps,
+            ..Default::default()
         };
     pb::UsageHistoryResponse {
         step_ms,

@@ -5,6 +5,7 @@
 
 pub mod attest;
 pub mod cosign;
+pub mod fetch;
 pub mod layer;
 pub mod oci;
 mod reference;

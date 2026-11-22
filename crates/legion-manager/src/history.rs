@@ -50,7 +50,10 @@ pub struct Entry {
     #[serde(rename = "t")]
     pub at_ms: i64,
     /// A task's CPU (percent of a core) and memory (bytes); a node's ZFS
-    /// used and free (bytes), received and sent (bytes a second).
+    /// used and free (bytes), received and sent (bytes a second), then its
+    /// pool's bytes read and written and read and write operations (each a
+    /// second). A node's entries written before the pool's I/O was kept
+    /// have only the first four.
     pub v: Vec<f64>,
 }
 
@@ -327,6 +330,27 @@ fn mean((at, sum, n): (i64, Vec<f64>, usize)) -> (i64, Vec<f64>) {
     (at, sum.into_iter().map(|s| s / n as f64).collect())
 }
 
+/// A node's sample from its series' values at `at_ms` (see [`Entry::v`]);
+/// `None` with fewer than the four every entry has. What an entry written
+/// before the pool's I/O was kept lacks is 0.
+pub fn node_sample(at_ms: i64, v: &[f64]) -> Option<crate::usage::NodeSample> {
+    if v.len() < 4 {
+        return None;
+    }
+    let at = |i: usize| v.get(i).copied().unwrap_or(0.0) as u64;
+    Some(crate::usage::NodeSample {
+        at_ms,
+        zfs_used_bytes: at(0),
+        zfs_avail_bytes: at(1),
+        net_rx_bps: at(2),
+        net_tx_bps: at(3),
+        zfs_read_bps: at(4),
+        zfs_write_bps: at(5),
+        zfs_read_iops: at(6),
+        zfs_write_iops: at(7),
+    })
+}
+
 /// The step a chart of the last `range` is drawn with: a minute within a
 /// day, 15 minutes past it.
 pub fn step_for(range: Duration) -> Duration {
@@ -383,6 +407,10 @@ pub fn minute(
                 avg(|s| s.zfs_avail_bytes),
                 avg(|s| s.net_rx_bps),
                 avg(|s| s.net_tx_bps),
+                avg(|s| s.zfs_read_bps),
+                avg(|s| s.zfs_write_bps),
+                avg(|s| s.zfs_read_iops),
+                avg(|s| s.zfs_write_iops),
             ],
         });
     }
@@ -650,6 +678,10 @@ mod tests {
                 zfs_avail_bytes: 2,
                 net_rx_bps: 4,
                 net_tx_bps: 6,
+                zfs_read_bps: 5000,
+                zfs_write_bps: 7000,
+                zfs_read_iops: 50,
+                zfs_write_iops: 70,
                 ..Default::default()
             },
             |_, _| true,
@@ -672,7 +704,45 @@ mod tests {
         let got = minute(&u, now - 60_000, now + 60_000, |_| None);
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].key, "n/w1");
-        assert_eq!(got[0].v, vec![8.0, 2.0, 4.0, 6.0]);
+        assert_eq!(
+            got[0].v,
+            vec![8.0, 2.0, 4.0, 6.0, 5000.0, 7000.0, 50.0, 70.0]
+        );
+        let s = node_sample(now, &got[0].v).unwrap();
+        assert_eq!(
+            (
+                s.net_rx_bps,
+                s.zfs_read_bps,
+                s.zfs_write_bps,
+                s.zfs_read_iops,
+                s.zfs_write_iops
+            ),
+            (4, 5000, 7000, 50, 70)
+        );
+    }
+
+    #[test]
+    fn a_node_entry_from_before_the_pool_io_still_loads() {
+        // A line as a manager wrote it before the pool's I/O was kept.
+        let old: Entry =
+            serde_json::from_str(r#"{"k":"n/w1","t":60000,"v":[8.0,2.0,4.0,6.0]}"#).unwrap();
+        let mut a = Archive::default();
+        a.add(vec![old], 0);
+        let r = a.range(0, MIN);
+        let (at, v) = &r["n/w1"].points[0];
+        assert_eq!(
+            node_sample(*at, v),
+            Some(crate::usage::NodeSample {
+                at_ms: 60_000,
+                zfs_used_bytes: 8,
+                zfs_avail_bytes: 2,
+                net_rx_bps: 4,
+                net_tx_bps: 6,
+                ..Default::default()
+            })
+        );
+        // Fewer than the four every node entry has is no sample.
+        assert_eq!(node_sample(0, &[1.0, 2.0]), None);
     }
 
     #[test]

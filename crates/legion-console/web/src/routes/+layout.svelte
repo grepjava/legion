@@ -375,6 +375,7 @@
     '/images': t('Images'),
     '/deploy': t('Deploy'),
     '/templates': t('Templates'),
+    '/apps': t('Apps'),
     '/import': t('Import compose'),
     '/stacks': t('Stacks'),
     '/apply': t('Apply YAML'),
@@ -475,16 +476,19 @@
     CronJob: 'apps',
     Task: 'apps',
     Build: 'storage',
+    BackupTarget: 'storage',
     Route: 'network',
     NetworkPolicy: 'network'
   };
   const LISTED_ELSEWHERE = new Set(['Volume']);
   const shown = (items: NavItem[]) => items.filter((i) => matchesNav(i.label));
   const navGroups = $derived.by((): NavGroup[] => {
-    const kindsIn = (group: string) =>
-      nsKinds
+    const kindsIn = (group: string) => [
+      ...nsKinds
         .filter((k) => !LISTED_ELSEWHERE.has(k.kind) && (KIND_GROUP[k.kind] ?? 'config') === group)
-        .map((k) => kindItem(k.kind));
+        .map((k) => kindItem(k.kind)),
+      ...clusterKinds.filter((k) => KIND_GROUP[k.kind] === group).map((k) => kindItem(k.kind))
+    ];
     return [
       {
         key: 'observe',
@@ -502,6 +506,7 @@
         label: t('Create'),
         items: [
           pageItem('/deploy', t('Deploy')),
+          pageItem('/apps', t('Apps')),
           pageItem('/templates', t('Templates')),
           pageItem('/import', t('Import compose')),
           pageItem('/apply', t('Apply YAML')),
@@ -524,11 +529,12 @@
       .map((g) => ({ ...g, items: shown(g.items) }))
       .filter((g) => g.items.length);
   });
-  // The cluster's own: for those who may see all of it.
+  // The cluster's own: for those who may see all of it; a kind with a
+  // group of its own (BackupTarget, with storage) goes there instead.
   const clusterItems = $derived(
     clusterKinds.length
       ? shown([
-          ...clusterKinds.map((k) => kindItem(k.kind)),
+          ...clusterKinds.filter((k) => !KIND_GROUP[k.kind]).map((k) => kindItem(k.kind)),
           pageItem('/cluster', t('Operations')),
           pageItem('/audit', t('Audit')),
           pageItem('/settings', t('Console settings'))

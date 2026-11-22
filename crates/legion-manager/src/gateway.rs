@@ -196,6 +196,8 @@ fn router(gateway: Gateway) -> axum::Router {
             get(console_settings).post(set_console_settings),
         )
         .route("/api/templates", get(templates))
+        .route("/api/apps", get(apps))
+        .route("/api/apps/{id}", get(app_manifest))
         .route("/api/plugins", get(plugins))
         .route("/api/plugin/{namespace}/{name}", get(plugin))
         .route("/api/set", post(set_field))
@@ -223,6 +225,10 @@ fn router(gateway: Gateway) -> axum::Router {
         .route(
             "/api/volume-promote/{namespace}/{name}",
             post(volume_promote),
+        )
+        .route(
+            "/api/volume-backups/{namespace}/{name}",
+            get(volume_backups).post(volume_restore_from),
         )
         .route("/api/alert-receiver-test/{name}", post(alert_receiver_test))
         .route("/api/images", get(node_images_list).post(node_images_op))
@@ -1133,6 +1139,10 @@ async fn usage(
                 "zfs_avail_bytes": n.zfs_avail_bytes,
                 "net_rx_bps": n.net_rx_bps,
                 "net_tx_bps": n.net_tx_bps,
+                "zfs_read_bps": n.zfs_read_bps,
+                "zfs_write_bps": n.zfs_write_bps,
+                "zfs_read_iops": n.zfs_read_iops,
+                "zfs_write_iops": n.zfs_write_iops,
                 "volumes": volumes,
                 "images_bytes": n.images_bytes,
                 "jails_bytes": n.jails_bytes,
@@ -1233,8 +1243,9 @@ struct HistoryScope {
 
 /// `Cluster.UsageHistory`: `{step_ms, tasks: [{namespace, task, node,
 /// samples: [[at_ms, cpu_percent, memory_bytes], ...]}], nodes: [{node,
-/// samples: [[at_ms, zfs_used_bytes, zfs_avail_bytes, net_rx_bps, net_tx_bps], ...]}]}`,
-/// oldest first.
+/// samples: [[at_ms, zfs_used_bytes, zfs_avail_bytes, net_rx_bps, net_tx_bps,
+/// zfs_read_bps, zfs_write_bps, zfs_read_iops, zfs_write_iops], ...]}]}`,
+/// oldest first. The pool's I/O is 0 in samples from before it was kept.
 async fn usage_history(
     State(g): State<Gateway>,
     headers: HeaderMap,
@@ -1281,7 +1292,11 @@ async fn usage_history(
                         s.zfs_used_bytes,
                         s.zfs_avail_bytes,
                         s.net_rx_bps,
-                        s.net_tx_bps
+                        s.net_tx_bps,
+                        s.zfs_read_bps,
+                        s.zfs_write_bps,
+                        s.zfs_read_iops,
+                        s.zfs_write_iops
                     ])
                 })
                 .collect();
@@ -1625,7 +1640,7 @@ async fn compose(
     if missing {
         docs.push(serde_json::json!({
             "apiVersion": "legion/v1", "kind": "Namespace",
-            "metadata": { "name": namespace }, "spec": {},
+            "metadata": { "name": namespace }, "spec": stack.namespace_spec(),
         }));
     }
     for o in &stack.objects {
@@ -1672,7 +1687,10 @@ const EXAMPLES: &[(&str, &str)] = &[
         "python",
         include_str!("../../../examples/python/compose.yaml"),
     ),
-    ("redis", include_str!("../../../examples/redis/compose.yaml")),
+    (
+        "redis",
+        include_str!("../../../examples/redis/compose.yaml"),
+    ),
     (
         "static-site",
         include_str!("../../../examples/static-site/compose.yaml"),
@@ -1688,6 +1706,76 @@ fn about(compose: &str) -> String {
         .take_while(|l| !l.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The daemonless catalog (legion_api::app), read when asked: `{apps}`.
+/// Signed in only, as every page; the catalog is public.
+async fn apps(State(g): State<Gateway>, headers: HeaderMap) -> Result<Response, Refused> {
+    g.user(&headers).await?;
+    let url = format!("{}/catalog.json", legion_api::app::CATALOG);
+    let body = legion_image::fetch::get(&url)
+        .await
+        .map_err(|e| Refused(StatusCode::BAD_GATEWAY, e))?;
+    let catalog: legion_api::app::Catalog =
+        serde_json::from_slice(&body).map_err(|e| Refused(StatusCode::BAD_GATEWAY, format!("{url}: {e}")))?;
+    Ok(Json(serde_json::json!({ "name": catalog.catalog_name, "apps": catalog.apps })).into_response())
+}
+
+#[derive(Deserialize)]
+struct AppQuery {
+    #[serde(default)]
+    variant: Option<String>,
+}
+
+/// An app as the Import page deploys it: `{name, description, compose,
+/// values, variables, variants, variant}`, the compose file with its
+/// variant's image and its Volumes declared, the values its defaults (a
+/// secret made up).
+async fn app_manifest(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<AppQuery>,
+) -> Result<Response, Refused> {
+    g.user(&headers).await?;
+    let gateway = |e: String| Refused(StatusCode::BAD_GATEWAY, e);
+    let base = legion_api::app::CATALOG;
+    let body = legion_image::fetch::get(&format!("{base}/catalog.json")).await.map_err(gateway)?;
+    let catalog: legion_api::app::Catalog = serde_json::from_slice(&body).map_err(|e| gateway(e.to_string()))?;
+    let found = catalog
+        .apps
+        .into_iter()
+        .find(|a| a.id == id)
+        .ok_or_else(|| Refused(StatusCode::NOT_FOUND, format!("no app {id} in the catalog")))?;
+    if found.manifest_url.contains("..") || found.manifest_url.starts_with('/') || found.manifest_url.contains("://") {
+        return Err(gateway(format!("{id}: its manifest is outside the catalog")));
+    }
+    let text = legion_image::fetch::get(&format!("{base}/{}", found.manifest_url))
+        .await
+        .map_err(gateway)?;
+    let m = legion_api::app::manifest(&String::from_utf8_lossy(&text)).map_err(gateway)?;
+    let variant = q
+        .variant
+        .or_else(|| m.variants.iter().find(|v| v.default).map(|v| v.id.clone()));
+    let (compose, values) = legion_api::app::render(
+        &m,
+        &found.image,
+        variant.as_deref(),
+        &std::collections::BTreeMap::new(),
+        &legion_api::app::random_secret,
+    )
+    .map_err(bad_request)?;
+    Ok(Json(serde_json::json!({
+        "id": found.id,
+        "name": m.name,
+        "description": m.description,
+        "compose": compose,
+        "values": values,
+        "variables": m.variables,
+        "variants": m.variants,
+        "variant": variant,
+    }))
+    .into_response())
 }
 
 /// The templates to deploy from: the examples, and the Configs labelled
@@ -2954,6 +3042,7 @@ async fn volume_snapshots(
             name,
             op: "list".to_owned(),
             snapshot: String::new(),
+            into: String::new(),
         })
         .await?
         .into_inner();
@@ -2962,9 +3051,12 @@ async fn volume_snapshots(
 
 #[derive(Deserialize)]
 struct VolumeSnapshotBody {
-    /// `create`, `rollback`, or `delete`.
+    /// `create`, `rollback`, `delete` or `clone`.
     op: String,
     snapshot: String,
+    /// For `clone`: the new Volume's name.
+    #[serde(default)]
+    into: String,
 }
 
 /// `legion volume snapshot|rollback|rm-snapshot`: mutates a Volume's ZFS snapshots.
@@ -2976,8 +3068,8 @@ async fn volume_snapshot_op(
     Json(body): Json<VolumeSnapshotBody>,
 ) -> Result<Response, Refused> {
     let channel = g.writer(&headers, &uri, None).await?;
-    if !matches!(body.op.as_str(), "create" | "rollback" | "delete") {
-        return Err(bad_request("op must be create, rollback or delete"));
+    if !matches!(body.op.as_str(), "create" | "rollback" | "delete" | "clone") {
+        return Err(bad_request("op must be create, rollback, delete or clone"));
     }
     let r = pb::volumes_client::VolumesClient::new(channel)
         .snapshot(pb::VolumeSnapshotRequest {
@@ -2985,10 +3077,69 @@ async fn volume_snapshot_op(
             name,
             op: body.op,
             snapshot: body.snapshot,
+            into: body.into,
         })
         .await?
         .into_inner();
     Ok(Json(serde_json::json!({ "snapshots": r.snapshots })).into_response())
+}
+
+#[derive(Deserialize)]
+struct VolumeBackupsQuery {
+    #[serde(default)]
+    target: String,
+}
+
+/// `legion volume backups`: what a Volume's BackupTarget holds of it.
+async fn volume_backups(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(q): Query<VolumeBackupsQuery>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let r = pb::volumes_client::VolumesClient::new(channel)
+        .backups(pb::VolumeBackupsRequest {
+            namespace,
+            name,
+            target: q.target,
+        })
+        .await?
+        .into_inner();
+    Ok(Json(serde_json::json!({ "backups": r.snapshots })).into_response())
+}
+
+#[derive(Deserialize)]
+struct VolumeRestoreFromBody {
+    #[serde(default)]
+    target: String,
+    backup: String,
+    node: String,
+    #[serde(default)]
+    into: String,
+}
+
+/// `legion volume restore --from`: one of a Volume's backups restored
+/// onto a node.
+async fn volume_restore_from(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path((namespace, name)): Path<(String, String)>,
+    Json(body): Json<VolumeRestoreFromBody>,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    pb::volumes_client::VolumesClient::new(channel)
+        .restore_from(pb::VolumeRestoreFromRequest {
+            namespace,
+            name,
+            target: body.target,
+            backup: body.backup,
+            node: body.node,
+            into: body.into,
+        })
+        .await?;
+    Ok(Json(serde_json::json!({})).into_response())
 }
 
 /// `legion volume promote`: hands a Volume whose node is down to its replica.

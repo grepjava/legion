@@ -39,6 +39,31 @@ pub struct Stack {
     pub variables: Vec<Variable>,
 }
 
+impl Stack {
+    /// The spec of the namespace to make for the stack, when there is
+    /// none: allowing what its containers ask to be allowed (raw sockets,
+    /// SysV IPC…), which they could not otherwise have.
+    pub fn namespace_spec(&self) -> Value {
+        let mut allow: Vec<String> = Vec::new();
+        for o in self.objects.iter().filter(|o| o.kind == Kind::Service) {
+            for c in o.spec["pod"]["containers"].as_array().into_iter().flatten() {
+                for a in c["security"]["allow"].as_array().into_iter().flatten() {
+                    if let Some(a) = a.as_str()
+                        && !allow.iter().any(|x| x == a)
+                    {
+                        allow.push(a.to_owned());
+                    }
+                }
+            }
+        }
+        if allow.is_empty() {
+            json!({})
+        } else {
+            json!({ "security": { "allow": allow } })
+        }
+    }
+}
+
 /// A variable a compose file reads, with the default it gives
 /// (`${NAME:-default}`, `${NAME-default}`) and whether it must be set
 /// (`${NAME:?why}`, `${NAME?why}`).
@@ -444,11 +469,42 @@ impl Converter<'_> {
                 "cap_add" => {
                     for cap in strings(val) {
                         match cap.trim_start_matches("CAP_") {
-                            "NET_RAW" => {
-                                container
-                                    .insert("security".into(), json!({ "allow": ["rawSockets"] }));
-                            }
+                            "NET_RAW" => allow(&mut container, "rawSockets"),
                             other => self.warn(format!("{at}: {other}: not supported, ignored")),
+                        }
+                    }
+                }
+                // Podman's FreeBSD jail annotations, as the daemonless
+                // images ask for what they need: those Legion grants as a
+                // container's `security.allow` (the namespace must allow
+                // them); any other jail parameter is not set.
+                "annotations" => {
+                    let pairs: Vec<(String, String)> = match val {
+                        Value::Object(m) => m.iter().map(|(k, v)| (k.clone(), scalar(v))).collect(),
+                        _ => strings(val)
+                            .into_iter()
+                            .map(|kv| match kv.split_once('=') {
+                                Some((k, v)) => (k.to_owned(), v.to_owned()),
+                                None => (kv, String::new()),
+                            })
+                            .collect(),
+                    };
+                    for (k, v) in pairs {
+                        let Some(param) = k.strip_prefix("org.freebsd.jail.") else {
+                            continue;
+                        };
+                        let allow_name = match param {
+                            "allow.raw_sockets" => "rawSockets",
+                            "allow.sysvipc" | "allow.sysvmsg" | "allow.sysvsem" | "allow.sysvshm" => "sysvipc",
+                            "allow.mlock" => "mlock",
+                            "allow.chflags" => "chflags",
+                            other => {
+                                self.warn(format!("{at}.{k}: the jail parameter {other} is not one Legion sets, ignored"));
+                                continue;
+                            }
+                        };
+                        if matches!(v.as_str(), "true" | "1" | "") {
+                            allow(&mut container, allow_name);
                         }
                     }
                 }
@@ -971,6 +1027,21 @@ fn external(v: &Value) -> bool {
 }
 
 /// A scalar as a string: compose writes ports and numbers either way.
+/// Adds `what` to a container's `security.allow`, keeping what is there:
+/// `cap_add` and jail annotations both grant into it.
+fn allow(container: &mut Map<String, Value>, what: &str) {
+    let security = container.entry("security").or_insert_with(|| json!({}));
+    let Some(security) = security.as_object_mut() else {
+        return;
+    };
+    let list = security.entry("allow").or_insert_with(|| json!([]));
+    if let Some(l) = list.as_array_mut()
+        && !l.iter().any(|x| x == what)
+    {
+        l.push(json!(what));
+    }
+}
+
 fn scalar(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),

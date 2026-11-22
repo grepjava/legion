@@ -234,6 +234,15 @@ impl Spec for ServiceSpec {
                 ),
             ));
         }
+        for (name, c) in self.pod.claims() {
+            crate::volume::check_schedules(
+                &c.snapshots,
+                &format!("pod.volumes[{name}].claim.snapshots"),
+            )?;
+            if let Some(b) = &c.backup {
+                b.check(&format!("pod.volumes[{name}].claim.backup"))?;
+            }
+        }
         self.placement.admit("placement")?;
         if let Some(a) = &self.autoscale {
             if self.mode != ServiceMode::Replicated {
@@ -1243,6 +1252,12 @@ pub struct ClaimSource {
     /// `replica`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replica: Option<crate::volume::Replica>,
+    /// Snapshot schedules of each task's Volume, as a Volume's `snapshots`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snapshots: Vec<crate::volume::SnapshotSchedule>,
+    /// Backups of each task's Volume, as a Volume's `backup`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<crate::backup::BackupSchedule>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

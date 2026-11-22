@@ -27,6 +27,27 @@
   let saveNamespace = $state(session.namespace || 'default');
   let saved = $state('');
 
+  // An app opened from the Apps page: its compose file, and what its
+  // variables are, with their defaults (a secret made up) to look over.
+  let app: { name: string; description: string; labels: Record<string, string> } | null = $state(null);
+  $effect(() => {
+    const id = page.url.searchParams.get('app');
+    if (!id) return;
+    api
+      .app(id, page.url.searchParams.get('variant') ?? '')
+      .then((a) => {
+        text = a.compose;
+        stack = a.id;
+        values = { ...a.values };
+        app = {
+          name: a.name || a.id,
+          description: a.description,
+          labels: Object.fromEntries(a.variables.filter((v) => v.label).map((v) => [v.name, v.label ?? '']))
+        };
+      })
+      .catch((e) => (convertError = (e as Error).message));
+  });
+
   // A template opened from the catalog.
   $effect(() => {
     const name = page.url.searchParams.get('template');
@@ -126,6 +147,15 @@
   {t('applies, shown before they are. Files it names are not read here: put their content in it.')}
   {t('From the')} <a href="/templates">{t('templates')}</a>{t(', or pasted.')}
 </p>
+{#if app}
+  <section class="card app-note" aria-label={t('The app')}>
+    <h2>{app.name}</h2>
+    {#if app.description}<p class="muted">{app.description}</p>{/if}
+    <p class="muted">
+      {t('From the daemonless catalog. Its data goes on the Volumes it names; a secret it asks for was made up here: note it before deploying.')}
+    </p>
+  </section>
+{/if}
 
 <div class="split">
   <div class="side">
@@ -139,7 +169,7 @@
         <legend>{t('Variables')}</legend>
         {#each variables as v (v.name)}
           <label
-            >{v.name}{#if v.required}<span class="muted"> {t('(required)')}</span>{/if}
+            >{v.name}{#if app?.labels[v.name]}<span class="muted"> · {app.labels[v.name]}</span>{/if}{#if v.required}<span class="muted"> {t('(required)')}</span>{/if}
             <input bind:value={values[v.name]} aria-label={t('Variable {name}', { name: v.name })} placeholder={v.default ?? ''} />
           </label>
         {/each}
@@ -187,6 +217,12 @@
 </div>
 
 <style>
+  .app-note {
+    margin-bottom: 0.85rem;
+  }
+  .app-note h2 {
+    margin: 0 0 0.25rem;
+  }
   .split {
     display: grid;
     grid-template-columns: minmax(20rem, 34rem) 1fr;

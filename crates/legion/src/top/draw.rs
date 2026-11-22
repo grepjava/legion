@@ -1475,6 +1475,16 @@ fn detail(f: &mut Frame, model: &Model, key: &Key, scroll: u16, area: Rect) {
                 )),
             ]));
         }
+        if nm.zfs_read_bps + nm.zfs_write_bps > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("pool i/o ", dim()),
+                Span::raw(format!(
+                    "read {}  written {}",
+                    rate(nm.zfs_read_bps),
+                    rate(nm.zfs_write_bps)
+                )),
+            ]));
+        }
         if nm.net_rx_bps + nm.net_tx_bps > 0 {
             lines.push(Line::from(vec![
                 Span::styled("network ", dim()),

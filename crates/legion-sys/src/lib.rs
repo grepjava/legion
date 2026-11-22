@@ -173,6 +173,12 @@ pub trait Sys: Send + Sync {
     fn net_bytes(&self) -> Result<(u64, u64)> {
         Ok((0, 0))
     }
+    /// What the datasets of ZFS pool `pool` have read and written since
+    /// boot, summed over them (`sysctl kstat.zfs.<pool>.dataset`).
+    fn zfs_pool_io(&self, pool: &str) -> Result<PoolIo> {
+        let _ = pool;
+        Ok(PoolIo::default())
+    }
     /// Sets a kernel variable (`sysctl name=value`).
     fn sysctl_set(&self, name: &str, value: &str) -> Result<()>;
     /// A kernel variable's value (`sysctl -n name`).
@@ -676,6 +682,21 @@ pub struct DatasetSpace {
     pub name: String,
     pub used: u64,
     pub avail: u64,
+}
+
+/// A ZFS pool's I/O since boot, the sum of its datasets' kstat counters.
+/// They count what the datasets were asked for, so reads served from the
+/// ARC count too.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PoolIo {
+    /// Bytes read (`nread`).
+    pub read_bytes: u64,
+    /// Bytes written (`nwritten`).
+    pub written_bytes: u64,
+    /// Read operations (`reads`).
+    pub reads: u64,
+    /// Write operations (`writes`).
+    pub writes: u64,
 }
 
 #[cfg(test)]

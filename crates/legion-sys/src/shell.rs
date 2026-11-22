@@ -10,7 +10,8 @@ use serde::Deserialize;
 
 use crate::{
     Carp, CarpState, Dataset, DatasetSpace, Destination, Epair, Error, IfConfig, IpNet, Ipv6Net,
-    IscsiSession, Jail, JailMemory, KldState, PfConn, PfState, RctlRule, Result, Sys, WgPeer,
+    IscsiSession, Jail, JailMemory, KldState, PfConn, PfState, PoolIo, RctlRule, Result, Sys,
+    WgPeer,
 };
 
 /// Counts the memory of each jail's processes from the kernel's maps.
@@ -899,6 +900,11 @@ impl<R: Runner> Sys for Shell<R> {
         })
     }
 
+    fn zfs_pool_io(&self, pool: &str) -> Result<PoolIo> {
+        let out = self.run("sysctl", &[format!("kstat.zfs.{pool}.dataset")])?;
+        Ok(parse_pool_io(pool, &out))
+    }
+
     fn sysctl_set(&self, name: &str, value: &str) -> Result<()> {
         self.run("sysctl", &[format!("{name}={value}")]).map(drop)
     }
@@ -1626,6 +1632,41 @@ fn parse_netstat(out: &str) -> Option<(u64, u64)> {
         tx = tx.saturating_add(num(entry, "sent-bytes"));
     }
     Some((rx, tx))
+}
+
+/// Sums `nread`, `nwritten`, `reads` and `writes` over every objset in
+/// `sysctl kstat.zfs.<pool>.dataset`'s lines, which read
+/// `kstat.zfs.<pool>.dataset.objset-0x36.nread: 123`. A line for another
+/// field (`dataset_name`, `nunlinks`, ...), of another pool, without a
+/// value or with one that is not a number is skipped, so one odd line
+/// costs only itself.
+fn parse_pool_io(pool: &str, out: &str) -> PoolIo {
+    let prefix = format!("kstat.zfs.{pool}.dataset.");
+    let mut io = PoolIo::default();
+    for line in out.lines() {
+        let Some((key, value)) = line
+            .trim()
+            .strip_prefix(&prefix)
+            .and_then(|l| l.split_once(':'))
+        else {
+            continue;
+        };
+        let Some((_, field)) = key.rsplit_once('.') else {
+            continue;
+        };
+        let Ok(n) = value.trim().parse::<u64>() else {
+            continue;
+        };
+        let sum = match field {
+            "nread" => &mut io.read_bytes,
+            "nwritten" => &mut io.written_bytes,
+            "reads" => &mut io.reads,
+            "writes" => &mut io.writes,
+            _ => continue,
+        };
+        *sum = sum.saturating_add(n);
+    }
+    io
 }
 
 #[cfg(test)]
@@ -2698,5 +2739,45 @@ mod tests {
         assert_eq!(ds[1].used, 268_435_456);
         assert!(sh.zfs_space("tank/missing").unwrap().is_empty());
         assert_eq!(sh.net_bytes().unwrap(), (15_000, 10_000));
+    }
+
+    #[test]
+    fn zfs_pool_io_sums_the_datasets_counters() {
+        let out = "kstat.zfs.zroot.dataset.objset-0x2710.dataset_name: zroot/ROOT/default
+kstat.zfs.zroot.dataset.objset-0x2710.writes: 40
+kstat.zfs.zroot.dataset.objset-0x2710.nwritten: 4096000
+kstat.zfs.zroot.dataset.objset-0x2710.reads: 100
+kstat.zfs.zroot.dataset.objset-0x2710.nread: 123000
+kstat.zfs.zroot.dataset.objset-0x2710.nunlinks: 7
+kstat.zfs.zroot.dataset.objset-0x2710.nunlinked: 7
+kstat.zfs.zroot.dataset.objset-0x36.dataset_name: zroot/legion
+kstat.zfs.zroot.dataset.objset-0x36.writes: 2
+kstat.zfs.zroot.dataset.objset-0x36.nwritten: 8192
+kstat.zfs.zroot.dataset.objset-0x36.reads: 5
+kstat.zfs.zroot.dataset.objset-0x36.nread: 1000
+kstat.zfs.zroot.dataset.objset-0x36.nread:
+kstat.zfs.zroot.dataset.objset-0x36.reads: many
+kstat.zfs.tank.dataset.objset-0x99.nread: 999999
+kstat.zfs.zroot.misc.nread: 999999
+
+";
+        let io = parse_pool_io("zroot", out);
+        assert_eq!(
+            io,
+            PoolIo {
+                read_bytes: 124_000,
+                written_bytes: 4_104_192,
+                reads: 105,
+                writes: 42,
+            }
+        );
+        assert_eq!(parse_pool_io("zroot", ""), PoolIo::default());
+
+        let sh = Script::shell(vec![(
+            "sysctl kstat.zfs.zroot.dataset",
+            ok("kstat.zfs.zroot.dataset.objset-0x36.nread: 512
+"),
+        )]);
+        assert_eq!(sh.zfs_pool_io("zroot").unwrap().read_bytes, 512);
     }
 }

@@ -30,6 +30,9 @@ pub(super) struct NodeMetrics {
     pub(super) zfs_avail: u64,
     pub(super) net_rx_bps: u64,
     pub(super) net_tx_bps: u64,
+    /// The pool's bytes read and written a second.
+    pub(super) zfs_read_bps: u64,
+    pub(super) zfs_write_bps: u64,
     /// The host's load averages over 1, 5 and 15 minutes, in hundredths.
     pub(super) load: [u32; 3],
 }
@@ -231,6 +234,8 @@ impl Model {
                 || n.zfs_avail_bytes > 0
                 || n.net_rx_bps > 0
                 || n.net_tx_bps > 0
+                || n.zfs_read_bps > 0
+                || n.zfs_write_bps > 0
                 || load != [0; 3]
             {
                 self.node_telemetry.insert(
@@ -240,6 +245,8 @@ impl Model {
                         zfs_avail: n.zfs_avail_bytes,
                         net_rx_bps: n.net_rx_bps,
                         net_tx_bps: n.net_tx_bps,
+                        zfs_read_bps: n.zfs_read_bps,
+                        zfs_write_bps: n.zfs_write_bps,
                         load,
                     },
                 );
@@ -404,6 +411,7 @@ pub(super) fn kind_word(kind: Kind) -> &'static str {
         Kind::ImagePolicy => "image policy",
         Kind::Build => "build",
         Kind::AlertReceiver => "alert receiver",
+        Kind::BackupTarget => "backup target",
     }
 }
 

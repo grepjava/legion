@@ -621,6 +621,7 @@ spec:
             name: "pgdata".into(),
             op: "create".into(),
             snapshot: "pre-upgrade".into(),
+            into: String::new(),
         })
         .await
         .unwrap()
@@ -636,6 +637,7 @@ spec:
             name: "pgdata".into(),
             op: "list".into(),
             snapshot: String::new(),
+            into: String::new(),
         })
         .await
         .unwrap()
@@ -648,6 +650,7 @@ spec:
             name: "pgdata".into(),
             op: "rollback".into(),
             snapshot: "pre-upgrade".into(),
+            into: String::new(),
         })
         .await
         .unwrap()
@@ -660,6 +663,7 @@ spec:
             name: "pgdata".into(),
             op: "delete".into(),
             snapshot: "pre-upgrade".into(),
+            into: String::new(),
         })
         .await
         .unwrap()

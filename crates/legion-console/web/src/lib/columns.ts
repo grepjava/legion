@@ -179,6 +179,17 @@ export function columns(kind: string): Column[] {
               .join(', ')
         }
       ];
+    case 'BackupTarget':
+      return [
+        {
+          label: t('Where'),
+          value: (o) =>
+            o.spec?.ssh
+              ? `${o.spec.ssh.user}@${o.spec.ssh.host}:${o.spec.ssh.dataset}`
+              : s(o.spec?.directory?.path)
+        },
+        { label: t('Kind'), value: (o) => (o.spec?.ssh ? t('ZFS over SSH') : t('directory')) }
+      ];
     case 'AlertReceiver':
       return [
         {

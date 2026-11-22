@@ -65,6 +65,12 @@ message SessionOpen {
     // 0. It changes nothing on the host. An agent from before it ends the
     // session with an error: the session has no action.
     ConnectionsOptions connections = 20;
+    // Managers only, a Volume's backups (DESIGN.md §4.3, Volume backups):
+    // one taken and sent to its target and the target pruned, those the
+    // target holds listed, one restored onto this node.
+    BackupRun backup_run = 21;
+    BackupList backup_list = 22;
+    BackupRestore backup_restore = 23;
   }
 }
 
@@ -114,9 +120,17 @@ message DoctorOptions {}
 
 message VolumeSnapshotAction {
   string volume = 1;
-  // "list", "create", "rollback", "delete".
+  // "list", "create", "rollback", "delete"; "auto", a schedule's snapshot
+  // (`legion-auto-<every>-<stamp>`) taken and that schedule's pruned to
+  // `keep`, the oldest first.
   string op = 2;
   string snapshot = 3;
+  // For "auto": how many of the schedule's snapshots are kept.
+  uint32 keep = 4;
+  // For "clone": the new Volume (in the same namespace) the snapshot's
+  // data is copied into, on this node; a copy, so it needs nothing of the
+  // snapshot after.
+  string into = 5;
 }
 
 message VolumeSnapshotResult {
@@ -300,4 +314,41 @@ message SessionOffer {
   string task_uid = 3;
   // The pod's address, for port-forward.
   string pod_ip = 4;
+}
+
+// Where a Volume's backups go, as the agent reaches it: the BackupTarget's
+// spec (JSON) with, for SSH, the private key from its Secret.
+message BackupTargetAccess {
+  string name = 1;
+  string spec_json = 2;
+  bytes key = 3;
+}
+
+// Snapshots the Volume as `snapshot`, sends it to the target (what changed
+// since `base` when both still hold it, else whole) and prunes the
+// target's to `keep`; says `{"bytes", "whole", "held"}` as JSON on
+// `stdout`, then `exit_code` 0.
+message BackupRun {
+  string volume = 1;
+  BackupTargetAccess target = 2;
+  string snapshot = 3;
+  string base = 4;
+  uint32 keep = 5;
+}
+
+// The Volume's backups the target holds, oldest first, as `snapshots`.
+message BackupList {
+  string volume = 1;
+  BackupTargetAccess target = 2;
+}
+
+// Restores `held` (as `BackupList` names it) from the target as the Volume
+// `volume`'s data on this node, which must have none, mounted, then
+// `exit_code` 0.
+message BackupRestore {
+  string volume = 1;
+  BackupTargetAccess target = 2;
+  // Whose backups: `<namespace>.<volume>` of the Volume backed up.
+  string of = 3;
+  string held = 4;
 }

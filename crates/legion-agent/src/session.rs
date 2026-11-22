@@ -136,6 +136,15 @@ async fn run<R: Runtime>(
         Some(Action::VolumeSnapshot(opts)) => {
             transfer::snapshot(&volumes, &open.namespace, opts, &tx).await
         }
+        Some(Action::BackupRun(o)) => {
+            crate::backups::run_session(&volumes, &open.namespace, o, &tx).await
+        }
+        Some(Action::BackupList(o)) => {
+            crate::backups::list_session(&volumes, &open.namespace, o, &tx).await
+        }
+        Some(Action::BackupRestore(o)) => {
+            crate::backups::restore_session(&volumes, &open.namespace, o, &tx).await
+        }
         Some(Action::Doctor(_)) => crate::doctor::send(&volumes, &tx).await,
         Some(Action::Connections(_)) => crate::connections::send(&volumes, &tx).await,
         Some(Action::Files(opts)) => {

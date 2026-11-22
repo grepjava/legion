@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::admit::{Invalid, Spec};
-use crate::quantity::Bytes;
+use crate::quantity::{Bytes, Duration};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,6 +36,96 @@ pub struct VolumeSpec {
     /// the last copy there, instead of being lost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replica: Option<Replica>,
+    /// Snapshots taken on a schedule and pruned to how many are kept
+    /// (ZFS only; DESIGN.md §4.3, Volume snapshot schedules).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snapshots: Vec<SnapshotSchedule>,
+    /// Backups to a `BackupTarget` on a schedule (ZFS only; DESIGN.md
+    /// §4.3, Volume backups).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<crate::backup::BackupSchedule>,
+}
+
+/// A snapshot every `every`, the last `keep` of them kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SnapshotSchedule {
+    pub every: Duration,
+    pub keep: u32,
+}
+
+impl SnapshotSchedule {
+    /// The fewest minutes apart, and the most schedules and kept snapshots.
+    pub const MIN_EVERY: Duration = Duration::from_secs(60);
+    pub const MOST: usize = 8;
+    pub const MOST_KEPT: u32 = 1000;
+    /// What every snapshot Legion takes or keeps starts with: a user's
+    /// may not.
+    pub const RESERVED: &str = "legion-";
+    /// What a schedule's snapshots start with.
+    pub const AUTO: &str = "legion-auto-";
+
+    /// The schedule's own snapshots' prefix: `legion-auto-1h-`.
+    pub fn prefix(&self) -> String {
+        format!("{}{}-", Self::AUTO, self.every)
+    }
+
+    /// The name of the snapshot taken at `ms` since the epoch:
+    /// `legion-auto-1h-20261122T143005Z`.
+    pub fn name_at(&self, ms: i64) -> String {
+        format!("{}{}", self.prefix(), stamp(ms))
+    }
+}
+
+/// `20261122T143005Z`, UTC, from milliseconds since the epoch.
+pub fn stamp(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
+}
+
+/// Checks schedules given at `field`: each at least a minute apart, none
+/// twice, keeping 1 to 1000, at most 8.
+pub fn check_schedules(schedules: &[SnapshotSchedule], field: &str) -> Result<(), Invalid> {
+    if schedules.len() > SnapshotSchedule::MOST {
+        return Err(Invalid::new(
+            field,
+            format!("at most {} schedules", SnapshotSchedule::MOST),
+        ));
+    }
+    for (i, s) in schedules.iter().enumerate() {
+        if s.every < SnapshotSchedule::MIN_EVERY {
+            return Err(Invalid::new(format!("{field}[{i}].every"), "at least 1m"));
+        }
+        if s.keep == 0 || s.keep > SnapshotSchedule::MOST_KEPT {
+            return Err(Invalid::new(
+                format!("{field}[{i}].keep"),
+                format!("1 to {}", SnapshotSchedule::MOST_KEPT),
+            ));
+        }
+        if schedules[..i].iter().any(|o| o.every == s.every) {
+            return Err(Invalid::new(
+                format!("{field}[{i}].every"),
+                format!("{} is given twice: one schedule an interval", s.every),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Where a ZFS Volume's replica is kept, and how often it is brought up to
@@ -439,9 +529,19 @@ impl Spec for VolumeSpec {
                 ));
             }
         }
+        check_schedules(&self.snapshots, "snapshots")?;
+        if let Some(b) = &self.backup {
+            b.check("backup")?;
+        }
         if driver != VolumeDriver::Zfs {
             if self.replica.is_some() {
                 return Err(not_zfs("replica"));
+            }
+            if !self.snapshots.is_empty() {
+                return Err(not_zfs("snapshots"));
+            }
+            if self.backup.is_some() {
+                return Err(not_zfs("backup"));
             }
             if self.size.is_some() && self.provider().is_none() {
                 return Err(Invalid::new(
@@ -593,6 +693,38 @@ pub struct VolumeStatus {
     /// Where a provisioned NFS or iSCSI Volume is exported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export: Option<Export>,
+    /// Each snapshot schedule, as the leader last took its snapshot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snapshots: Vec<ScheduleStatus>,
+    /// Its backups, as the leader last ran them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<crate::backup::BackupStatus>,
+}
+
+/// A snapshot schedule as the leader last kept it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleStatus {
+    /// The schedule's `every`, which tells them apart.
+    pub every: Duration,
+    /// The last snapshot it took, and when, in milliseconds since the epoch.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taken_ms: Option<i64>,
+    /// How many of its snapshots the node held after the last pruning.
+    #[serde(default)]
+    pub kept: u32,
+    /// Why the last attempt failed, and how many have failed since one
+    /// worked (for the backoff).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub failures: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// A Volume's data moving to another node: copied whole while its tasks

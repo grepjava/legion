@@ -136,6 +136,8 @@ pub(super) fn failover(
                 r.node
             ),
             export: v.status.export.clone(),
+            snapshots: v.status.snapshots.clone(),
+            backup: v.status.backup.clone(),
         })
         .expect("serialises");
         plan.actions
@@ -260,6 +262,8 @@ pub(super) fn migrations(
                 // Copied from where the data was: whole next time.
                 replica: v.status.replica.clone(),
                 promoted: v.status.promoted.clone(),
+                snapshots: v.status.snapshots.clone(),
+                backup: v.status.backup.clone(),
                 export: v.status.export.clone(),
             })
             .expect("serialises");

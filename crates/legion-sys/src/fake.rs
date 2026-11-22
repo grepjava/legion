@@ -16,7 +16,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use crate::{
     Carp, CarpState, Dataset, DatasetSpace, Destination, Epair, Error, IfConfig, Ipv6Net,
-    IscsiSession, Jail, JailMemory, KldState, PfConn, PfState, RctlRule, Result, Sys, WgPeer,
+    IscsiSession, Jail, JailMemory, KldState, PfConn, PfState, PoolIo, RctlRule, Result, Sys,
+    WgPeer,
 };
 
 #[derive(Debug, Default)]
@@ -76,6 +77,8 @@ struct State {
     props: BTreeMap<(String, String), String>,
     dataset_space: BTreeMap<String, (u64, u64)>,
     net_bytes: (u64, u64),
+    /// What each pool's datasets have read and written, by pool.
+    pool_io: BTreeMap<String, PoolIo>,
     /// Snapshots, with the order they were taken in.
     snapshots: BTreeMap<String, u64>,
     next_snapshot: u64,
@@ -280,6 +283,12 @@ impl FakeSys {
     /// Sets what [`Sys::net_bytes`] reports (`rx_bytes`, `tx_bytes`).
     pub fn set_net_bytes(&self, rx: u64, tx: u64) {
         self.state().net_bytes = (rx, tx);
+    }
+
+    /// Sets what [`Sys::zfs_pool_io`] reports for `pool`; a pool never set
+    /// is not there, as `sysctl` says of an unknown pool.
+    pub fn set_pool_io(&self, pool: &str, io: PoolIo) {
+        self.state().pool_io.insert(pool.to_owned(), io);
     }
 
     pub fn interface(&self, name: &str) -> Option<FakeInterface> {
@@ -1106,6 +1115,14 @@ impl Sys for FakeSys {
 
     fn net_bytes(&self) -> Result<(u64, u64)> {
         Ok(self.state().net_bytes)
+    }
+
+    fn zfs_pool_io(&self, pool: &str) -> Result<PoolIo> {
+        self.state()
+            .pool_io
+            .get(pool)
+            .copied()
+            .ok_or_else(|| Error::NotFound(format!("kstat.zfs.{pool}.dataset")))
     }
 
     fn sysctl_get(&self, name: &str) -> Result<String> {

@@ -1464,6 +1464,10 @@ impl Dispatcher for DispatcherService {
                     zfs_avail_bytes: t.zfs_avail_bytes,
                     net_rx_bps: t.net_rx_bps,
                     net_tx_bps: t.net_tx_bps,
+                    zfs_read_bps: t.zfs_read_bps,
+                    zfs_write_bps: t.zfs_write_bps,
+                    zfs_read_iops: t.zfs_read_iops,
+                    zfs_write_iops: t.zfs_write_iops,
                     load: [t.load1, t.load5, t.load15],
                     volumes: t
                         .volumes

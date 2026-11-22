@@ -226,6 +226,13 @@ message NodeTelemetry {
   uint32 load1 = 9;
   uint32 load5 = 10;
   uint32 load15 = 11;
+  // The pool holding Legion's ZFS root: bytes read and written, and read
+  // and write operations, per second, from the datasets' kstat counters
+  // (kstat.zfs.<pool>.dataset); 0 from builds before.
+  uint64 zfs_read_bps = 12;
+  uint64 zfs_write_bps = 13;
+  uint64 zfs_read_iops = 14;
+  uint64 zfs_write_iops = 15;
 }
 
 message VolumeTelemetry {

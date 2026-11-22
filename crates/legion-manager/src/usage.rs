@@ -36,13 +36,19 @@ pub struct Usage {
 }
 
 /// Host ZFS & network sample at a moment, in milliseconds since the epoch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NodeSample {
     pub at_ms: i64,
     pub zfs_used_bytes: u64,
     pub zfs_avail_bytes: u64,
     pub net_rx_bps: u64,
     pub net_tx_bps: u64,
+    /// The pool's bytes read and written and its read and write operations,
+    /// per second.
+    pub zfs_read_bps: u64,
+    pub zfs_write_bps: u64,
+    pub zfs_read_iops: u64,
+    pub zfs_write_iops: u64,
 }
 
 /// What a task used at a moment, in milliseconds since the epoch.
@@ -210,6 +216,10 @@ impl Usage {
                     zfs_avail_bytes: telemetry.zfs_avail_bytes,
                     net_rx_bps: telemetry.net_rx_bps,
                     net_tx_bps: telemetry.net_tx_bps,
+                    zfs_read_bps: telemetry.zfs_read_bps,
+                    zfs_write_bps: telemetry.zfs_write_bps,
+                    zfs_read_iops: telemetry.zfs_read_iops,
+                    zfs_write_iops: telemetry.zfs_write_iops,
                 },
             ));
         }

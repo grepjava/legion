@@ -1,7 +1,7 @@
 <script lang="ts">
   // The Overview: the cluster's health in a word; a status card for each
-  // thing it has (nodes, managers, workloads, CPU, memory, storage,
-  // network); their history over a range picked; each node's share used;
+  // thing it has (nodes, managers, workloads, CPU, memory, storage, pool
+  // I/O, network); their history over a range picked; each node's share used;
   // CARP addresses; tasks needing attention and those running; quotas.
   import {
     alertHref,
@@ -27,6 +27,7 @@
   import TableBar from '#lib/TableBar.svelte';
   import Pager from '#lib/Pager.svelte';
   import {
+    Activity,
     ArrowDownUp,
     Boxes,
     CircleCheck,
@@ -173,6 +174,10 @@
     let zfsAvail = 0;
     let rx = 0;
     let tx = 0;
+    let read = 0;
+    let written = 0;
+    let readOps = 0;
+    let writeOps = 0;
     for (const n of nodeUsage) {
       for (const tk of n.tasks) {
         cpu += tk.cpu_percent;
@@ -182,8 +187,12 @@
       zfsAvail += n.zfs_avail_bytes ?? 0;
       rx += n.net_rx_bps ?? 0;
       tx += n.net_tx_bps ?? 0;
+      read += n.zfs_read_bps ?? 0;
+      written += n.zfs_write_bps ?? 0;
+      readOps += n.zfs_read_iops ?? 0;
+      writeOps += n.zfs_write_iops ?? 0;
     }
-    return { cpu, mem, zfsUsed, zfsAvail, rx, tx };
+    return { cpu, mem, zfsUsed, zfsAvail, rx, tx, read, written, readOps, writeOps };
   });
 
   // What the cluster has, against what its tasks use: the nodes' CPU and
@@ -407,6 +416,21 @@
       })}
       pct={(totals.zfsUsed / (totals.zfsUsed + totals.zfsAvail)) * 100}
       meterLabel={t('Pool space used')}
+      href="/volumes"
+      more={t('Volumes')}
+    />
+  {/if}
+  {#if totals.read + totals.written > 0}
+    <Tile
+      label={t('Pool I/O')}
+      icon={Activity}
+      tone="zfs"
+      value={`${bytes(totals.read + totals.written)}/s`}
+      note={t('{read}/s read, {written}/s written, {iops} IOPS, over every node’s pool now', {
+        read: bytes(totals.read),
+        written: bytes(totals.written),
+        iops: Math.round(totals.readOps + totals.writeOps)
+      })}
       href="/volumes"
       more={t('Volumes')}
     />

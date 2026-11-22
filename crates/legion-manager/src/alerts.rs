@@ -238,6 +238,8 @@ pub(crate) fn current(api: &ApiService) -> Vec<(Alert, i64)> {
             used_bytes,
             avail_bytes,
             stale_replica: stale_replica(v, now_ms),
+            late_snapshots: late_snapshots(v, now_ms),
+            late_backup: late_backup(v, now_ms),
         });
     }
     if let Some(c) = &api.peer_tls
@@ -257,6 +259,51 @@ pub(crate) fn current(api: &ApiService) -> Vec<(Alert, i64)> {
     let alerts = alert::alerts(&inputs);
     let since = api.alerts.since(&alerts);
     alerts.into_iter().zip(since).collect()
+}
+
+/// A Volume's backups, if late at `now_ms`.
+fn late_backup(v: &Object, now_ms: i64) -> Option<alert::LateBackup> {
+    use legion_api::volume::{VolumeSpec, VolumeStatus};
+    let spec: VolumeSpec = legion_api::parse(&v.spec).ok()?;
+    let schedule = spec.backup.as_ref()?;
+    let status: VolumeStatus = serde_json::from_value(v.status.clone()).ok()?;
+    if !status.lost.is_empty() || !crate::backups::late(schedule, status.backup.as_ref(), now_ms) {
+        return None;
+    }
+    let st = status.backup.as_ref()?;
+    Some(alert::LateBackup {
+        target: schedule.target.clone(),
+        age: st
+            .taken_ms
+            .map(|t| Duration::from_millis((now_ms - t).max(0) as u64)),
+        every: schedule.every.as_std(),
+        why: st.message.clone(),
+    })
+}
+
+/// A Volume's snapshot schedules late by twice their interval at `now_ms`.
+fn late_snapshots(v: &Object, now_ms: i64) -> Vec<alert::LateSnapshots> {
+    use legion_api::volume::{VolumeSpec, VolumeStatus};
+    let (Ok(spec), Ok(status)) = (
+        legion_api::parse::<VolumeSpec>(&v.spec),
+        serde_json::from_value::<VolumeStatus>(v.status.clone()),
+    ) else {
+        return Vec::new();
+    };
+    if !status.lost.is_empty() {
+        return Vec::new();
+    }
+    spec.snapshots
+        .iter()
+        .filter_map(|s| {
+            let st = status.snapshots.iter().find(|st| st.every == s.every)?;
+            crate::snapshots::late(s, st, now_ms).then(|| alert::LateSnapshots {
+                age: Duration::from_millis(st.taken_ms.map_or(0, |t| (now_ms - t).max(0) as u64)),
+                every: s.every.as_std(),
+                why: st.message.clone(),
+            })
+        })
+        .collect()
 }
 
 /// A Volume's replica, if its spec asks for one and the last copy there

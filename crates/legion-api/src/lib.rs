@@ -13,8 +13,10 @@ use serde::{Deserialize, Serialize};
 
 pub mod activity;
 pub mod admit;
+pub mod app;
 pub mod alert;
 pub mod audit;
+pub mod backup;
 pub mod build;
 pub mod clock;
 pub mod compose;
@@ -46,7 +48,7 @@ pub use admit::{Invalid, Spec, admit, parse};
 pub const API_VERSION: &str = "legion/v1";
 
 /// Namespace used for cluster-scoped kinds (`Namespace`, `Node`, `ImagePolicy`,
-/// `AlertReceiver`).
+/// `AlertReceiver`, `BackupTarget`).
 pub const CLUSTER_SCOPE: &str = "";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -66,10 +68,11 @@ pub enum Kind {
     ImagePolicy,
     Build,
     AlertReceiver,
+    BackupTarget,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 15] = [
+    pub const ALL: [Kind; 16] = [
         Kind::Namespace,
         Kind::Node,
         Kind::Service,
@@ -85,6 +88,7 @@ impl Kind {
         Kind::ImagePolicy,
         Kind::Build,
         Kind::AlertReceiver,
+        Kind::BackupTarget,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -104,6 +108,7 @@ impl Kind {
             Kind::ImagePolicy => "ImagePolicy",
             Kind::Build => "Build",
             Kind::AlertReceiver => "AlertReceiver",
+            Kind::BackupTarget => "BackupTarget",
         }
     }
 
@@ -111,7 +116,11 @@ impl Kind {
     pub fn is_cluster_scoped(self) -> bool {
         matches!(
             self,
-            Kind::Namespace | Kind::Node | Kind::ImagePolicy | Kind::AlertReceiver
+            Kind::Namespace
+                | Kind::Node
+                | Kind::ImagePolicy
+                | Kind::AlertReceiver
+                | Kind::BackupTarget
         )
     }
 }

@@ -1525,6 +1525,10 @@ impl Cluster for ApiService {
                             zfs_avail_bytes: t.zfs_avail_bytes,
                             net_rx_bps: t.net_rx_bps,
                             net_tx_bps: t.net_tx_bps,
+                            zfs_read_bps: t.zfs_read_bps,
+                            zfs_write_bps: t.zfs_write_bps,
+                            zfs_read_iops: t.zfs_read_iops,
+                            zfs_write_iops: t.zfs_write_iops,
                             volumes,
                             images_bytes: t.images_bytes,
                             jails_bytes: t.jails_bytes,
@@ -1551,6 +1555,8 @@ impl Cluster for ApiService {
                     n.zfs_avail_bytes = 0;
                     n.net_rx_bps = 0;
                     n.net_tx_bps = 0;
+                    (n.zfs_read_bps, n.zfs_write_bps) = (0, 0);
+                    (n.zfs_read_iops, n.zfs_write_iops) = (0, 0);
                     n.images_bytes = 0;
                     n.jails_bytes = 0;
                     n.build_bytes = 0;
@@ -1653,14 +1659,7 @@ impl Cluster for ApiService {
                     let samples = s
                         .points
                         .iter()
-                        .filter(|(_, v)| v.len() >= 4)
-                        .map(|(at, v)| crate::usage::NodeSample {
-                            at_ms: *at,
-                            zfs_used_bytes: v[0] as u64,
-                            zfs_avail_bytes: v[1] as u64,
-                            net_rx_bps: v[2] as u64,
-                            net_tx_bps: v[3] as u64,
-                        })
+                        .filter_map(|(at, v)| crate::history::node_sample(*at, v))
                         .collect::<Vec<_>>();
                     nodes.push((node.to_owned(), samples));
                 }
@@ -1720,6 +1719,10 @@ impl Cluster for ApiService {
                             zfs_avail_bytes: s.zfs_avail_bytes,
                             net_rx_bps: s.net_rx_bps,
                             net_tx_bps: s.net_tx_bps,
+                            zfs_read_bps: s.zfs_read_bps,
+                            zfs_write_bps: s.zfs_write_bps,
+                            zfs_read_iops: s.zfs_read_iops,
+                            zfs_write_iops: s.zfs_write_iops,
                         })
                         .collect(),
                 })

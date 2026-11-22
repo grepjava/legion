@@ -59,6 +59,7 @@ pub enum OperationKind {
     Move,
     Restore,
     ReplicaCopy,
+    Backup,
 }
 
 impl OperationKind {
@@ -68,6 +69,7 @@ impl OperationKind {
             OperationKind::Move => "move",
             OperationKind::Restore => "restore",
             OperationKind::ReplicaCopy => "replica-copy",
+            OperationKind::Backup => "backup",
         }
     }
 }
@@ -118,6 +120,7 @@ pub enum Stage {
     Completed,
     Receiving,
     Registering,
+    Sending,
 }
 
 impl Stage {
@@ -133,6 +136,7 @@ impl Stage {
             Stage::Completed => "completed",
             Stage::Receiving => "receiving",
             Stage::Registering => "registering",
+            Stage::Sending => "sending",
         }
     }
 

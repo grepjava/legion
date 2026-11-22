@@ -57,6 +57,8 @@ pub enum AlertKind {
     VolumeLost,
     VolumeNearlyFull,
     ReplicaStale,
+    SnapshotLate,
+    BackupLate,
     CaExpiring,
     PoolDegraded,
     PoolErrors,
@@ -76,6 +78,8 @@ impl AlertKind {
             AlertKind::VolumeLost => "volume-lost",
             AlertKind::VolumeNearlyFull => "volume-nearly-full",
             AlertKind::ReplicaStale => "replica-stale",
+            AlertKind::SnapshotLate => "snapshot-late",
+            AlertKind::BackupLate => "backup-late",
             AlertKind::CaExpiring => "ca-expiring",
             AlertKind::PoolDegraded => "pool-degraded",
             AlertKind::PoolErrors => "pool-errors",
@@ -126,6 +130,32 @@ pub struct VolumeInput<'a> {
     /// Its replica, when the last copy there is stale
     /// (`ReplicaStatus::stale_at`).
     pub stale_replica: Option<StaleReplica>,
+    /// Its snapshot schedules late by twice their interval.
+    pub late_snapshots: Vec<LateSnapshots>,
+    /// Its backups, when late (`backup-late`).
+    pub late_backup: Option<LateBackup>,
+}
+
+/// A Volume's backups that are late: the last too old, or the first
+/// failing.
+#[derive(Default)]
+pub struct LateBackup {
+    pub target: String,
+    /// Since the last was taken; none yet if `None`.
+    pub age: Option<Duration>,
+    pub every: Duration,
+    pub why: String,
+}
+
+/// A Volume's snapshot schedule whose last snapshot is too old.
+#[derive(Default)]
+pub struct LateSnapshots {
+    /// Since the last was taken.
+    pub age: Duration,
+    /// How often one is meant to be taken.
+    pub every: Duration,
+    /// Why the last attempt failed, if it did.
+    pub why: String,
 }
 
 /// A Volume's replica whose last copy is too old.
@@ -277,6 +307,51 @@ pub fn alerts(i: &Inputs) -> Vec<Alert> {
                     r.node,
                     crate::clock::span(r.age),
                     crate::clock::span(r.every),
+                ),
+            });
+        }
+        for l in &v.late_snapshots {
+            let why = if l.why.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", l.why)
+            };
+            out.push(Alert {
+                kind: AlertKind::SnapshotLate,
+                severity: Severity::Warning,
+                namespace: v.namespace.to_owned(),
+                object: format!("Volume/{}", v.name),
+                message: format!(
+                    "Volume {}'s last scheduled snapshot was taken {} ago, meant to be every {}{why}",
+                    v.name,
+                    crate::clock::span(l.age),
+                    crate::clock::span(l.every),
+                ),
+            });
+        }
+        if let Some(b) = &v.late_backup {
+            let why = if b.why.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", b.why)
+            };
+            let when = match b.age {
+                Some(age) => format!(
+                    "was last backed up to {} {} ago",
+                    b.target,
+                    crate::clock::span(age)
+                ),
+                None => format!("has not been backed up to {} yet", b.target),
+            };
+            out.push(Alert {
+                kind: AlertKind::BackupLate,
+                severity: Severity::Warning,
+                namespace: v.namespace.to_owned(),
+                object: format!("Volume/{}", v.name),
+                message: format!(
+                    "Volume {} {when}, meant to be every {}{why}",
+                    v.name,
+                    crate::clock::span(b.every),
                 ),
             });
         }
@@ -583,7 +658,7 @@ impl ReceiverSpec {
 }
 
 /// The kinds of alert there are, as receivers name them.
-pub const KINDS: [AlertKind; 14] = [
+pub const KINDS: [AlertKind; 16] = [
     AlertKind::NoLeader,
     AlertKind::NoQuorum,
     AlertKind::NodeDown,
@@ -592,6 +667,8 @@ pub const KINDS: [AlertKind; 14] = [
     AlertKind::VolumeLost,
     AlertKind::VolumeNearlyFull,
     AlertKind::ReplicaStale,
+    AlertKind::SnapshotLate,
+    AlertKind::BackupLate,
     AlertKind::CaExpiring,
     AlertKind::PoolDegraded,
     AlertKind::PoolErrors,
@@ -736,6 +813,8 @@ mod tests {
                 used_bytes: 500 << 20,
                 avail_bytes: 500 << 20,
                 stale_replica: None,
+                late_snapshots: Vec::new(),
+                late_backup: None,
             }],
             ca_left: Some(CA_WARNING * 2),
             leader: true,
@@ -773,6 +852,8 @@ mod tests {
                     used_bytes: 950 << 20,
                     avail_bytes: 50 << 20,
                     stale_replica: None,
+                    late_snapshots: Vec::new(),
+                    late_backup: None,
                 },
             ],
             ca_left: Some(CA_CRITICAL * 2),
@@ -1031,6 +1112,74 @@ namespaces: ['']",
         let got = alerts(&Inputs::default());
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].kind, AlertKind::NoLeader);
+    }
+
+    #[test]
+    fn a_late_snapshot_schedule_says_how_late() {
+        let i = Inputs {
+            leader: true,
+            volumes: vec![VolumeInput {
+                namespace: "a",
+                name: "pg-db-0",
+                late_snapshots: vec![LateSnapshots {
+                    age: Duration::from_secs(3 * 3600),
+                    every: Duration::from_secs(3600),
+                    why: "node n2: out of space (attempt 4; the next in 80s)".into(),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let got = alerts(&i);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind.as_str(), "snapshot-late");
+        assert_eq!(
+            got[0].message,
+            "Volume pg-db-0's last scheduled snapshot was taken 3h ago, meant to be every 1h: node n2: out of space (attempt 4; the next in 80s)"
+        );
+    }
+
+    #[test]
+    fn late_backups_say_when_the_last_was_or_that_none_was() {
+        let i = Inputs {
+            leader: true,
+            volumes: vec![
+                VolumeInput {
+                    namespace: "a",
+                    name: "db",
+                    late_backup: Some(LateBackup {
+                        target: "offsite".into(),
+                        age: Some(Duration::from_secs(3 * 3600)),
+                        every: Duration::from_secs(3600),
+                        why: String::new(),
+                    }),
+                    ..Default::default()
+                },
+                VolumeInput {
+                    namespace: "a",
+                    name: "logs",
+                    late_backup: Some(LateBackup {
+                        target: "offsite".into(),
+                        age: None,
+                        every: Duration::from_secs(3600),
+                        why: "offsite: Permission denied (attempt 1; the next in 5s)".into(),
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let got = alerts(&i);
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|a| a.kind.as_str() == "backup-late"));
+        assert_eq!(
+            got[0].message,
+            "Volume db was last backed up to offsite 3h ago, meant to be every 1h"
+        );
+        assert_eq!(
+            got[1].message,
+            "Volume logs has not been backed up to offsite yet, meant to be every 1h: offsite: Permission denied (attempt 1; the next in 5s)"
+        );
     }
 
     #[test]

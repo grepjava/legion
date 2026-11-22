@@ -13,6 +13,7 @@ import {
   Cable,
   CalendarClock,
   ChartPie,
+  DatabaseBackup,
   ExternalLink,
   FileCode,
   FileCog,
@@ -39,6 +40,7 @@ import {
   Settings,
   ShieldCheck,
   SquareStack,
+  Store,
   SquareTerminal,
   Stethoscope,
   Sun,
@@ -67,7 +69,8 @@ const kinds: Record<string, IconComponent> = {
   RoleBinding: UserRoundCheck,
   ImagePolicy: BadgeCheck,
   Build: Hammer,
-  AlertReceiver: BellRing
+  AlertReceiver: BellRing,
+  BackupTarget: DatabaseBackup
 };
 
 /** A kind's icon; a task running a VM shows a monitor, as its circle does. */
@@ -89,6 +92,7 @@ const pages: Record<string, IconComponent> = {
   '/stacks': SquareStack,
   '/deploy': Rocket,
   '/templates': LayoutTemplate,
+  '/apps': Store,
   '/import': FileInput,
   '/apply': FileCode,
   '/cluster': Wrench,

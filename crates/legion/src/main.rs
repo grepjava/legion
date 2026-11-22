@@ -3,6 +3,7 @@
 mod activity;
 mod autolock;
 mod ca;
+mod app;
 mod cli;
 mod daemon;
 mod doctor;
@@ -412,6 +413,13 @@ enum Command {
     Stack {
         #[command(subcommand)]
         command: StackCommand,
+    },
+    /// Ready-to-deploy applications from the daemonless catalog (FreeBSD
+    /// images, read from the catalog when asked, nothing of it kept):
+    /// listed, shown with what they ask for, deployed as a stack.
+    App {
+        #[command(subcommand)]
+        command: AppCommand,
     },
     /// Images, builds and containers on this host alone, without a cluster.
     #[command(name = "local")]
@@ -998,11 +1006,16 @@ pub enum VolumeCommand {
     /// exist: delete it first, or give another --name. With --replace, it
     /// restores into the Volume of that name lost with its node (removed
     /// with the data on it): the Volume and what uses it are kept, and its
-    /// tasks start on NODE.
+    /// tasks start on NODE. With --from TARGET, FILE is VOLUME@BACKUP, one
+    /// of those `legion volume backups VOLUME` lists, restored from the
+    /// BackupTarget TARGET.
     Restore {
         file: PathBuf,
         #[arg(long)]
         node: String,
+        /// The BackupTarget the backup is on; FILE is then VOLUME@BACKUP.
+        #[arg(long, conflicts_with = "replace")]
+        from: Option<String>,
         /// The namespace to restore into (default: the backup's).
         #[arg(short, long)]
         namespace: Option<String>,
@@ -1011,6 +1024,15 @@ pub enum VolumeCommand {
         name: Option<String>,
         #[arg(long)]
         replace: bool,
+    },
+    /// List the backups of a Volume its BackupTarget holds (its
+    /// `backup.target`, or --from), oldest first.
+    Backups {
+        volume: String,
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(short, long)]
+        namespace: Option<String>,
     },
     /// List ZFS snapshots of a Volume on the node holding its data.
     Snapshots {
@@ -1025,10 +1047,26 @@ pub enum VolumeCommand {
         #[arg(short, long)]
         namespace: Option<String>,
     },
-    /// Roll a Volume's ZFS dataset back to a snapshot (only while no task uses it).
+    /// Roll a Volume's ZFS dataset back to a snapshot (only while no task
+    /// uses it). Every later snapshot is destroyed with it, scheduled ones
+    /// too, and the next replica copy or backup is whole: it says which
+    /// and asks first.
     Rollback {
         volume: String,
         snapshot: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// Go ahead without asking.
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Copy a snapshot's data into a new Volume NAME on the same node,
+    /// leaving the Volume as it is: `legion volume clone db@legion-auto-1h-20261122T140000Z db-noon`.
+    /// A copy, so the snapshot can go after.
+    Clone {
+        /// VOLUME@SNAPSHOT.
+        source: String,
+        name: String,
         #[arg(short, long)]
         namespace: Option<String>,
     },
@@ -1059,6 +1097,49 @@ pub enum UserCommand {
         /// How long the certificate is valid.
         #[arg(long, default_value_t = 90)]
         days: u32,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AppCommand {
+    /// The apps in the catalog.
+    List {
+        /// Only those of this category (Media, Utilities, …).
+        #[arg(long)]
+        category: Option<String>,
+        /// The catalog to read.
+        #[arg(long, default_value = legion_api::app::CATALOG)]
+        catalog: String,
+    },
+    /// What an app is, and the variables it asks for.
+    Show {
+        app: String,
+        #[arg(long, default_value = legion_api::app::CATALOG)]
+        catalog: String,
+    },
+    /// Deploy an app as the stack NAME (default: the app's id) in
+    /// namespace NAME, made if missing with what its containers ask to be
+    /// allowed. Variables take their defaults unless set; a secret not set
+    /// is made up; each storage variable names a Volume.
+    Deploy {
+        app: String,
+        /// The stack's name.
+        #[arg(long)]
+        name: Option<String>,
+        /// The namespace (default: the stack's name).
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// A variable's value: --set WEB_PORT=8080; may be given again.
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        set: Vec<String>,
+        /// The image's variant (its tag), as `legion app show` lists them.
+        #[arg(long)]
+        variant: Option<String>,
+        /// Print the objects it would make, and make none.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, default_value = legion_api::app::CATALOG)]
+        catalog: String,
     },
 }
 
@@ -1302,6 +1383,24 @@ async fn run(args: Args) -> anyhow::Result<()> {
                     node: None,
                 },
         } => daemon::load_image(&file, name.as_deref(), &data_dir, &zfs_root).await,
+        Command::App {
+            command: AppCommand::List { category, catalog },
+        } => app::list(&catalog, category.as_deref()).await,
+        Command::App {
+            command: AppCommand::Show { app, catalog },
+        } => app::show(&catalog, &app).await,
+        Command::App {
+            command:
+                AppCommand::Deploy {
+                    app,
+                    name,
+                    namespace,
+                    set,
+                    variant,
+                    dry_run: true,
+                    catalog,
+                },
+        } => app::dry_run(&catalog, &app, &set, variant.as_deref(), name, namespace).await,
         Command::Doctor {
             fix: Some(_),
             yes,

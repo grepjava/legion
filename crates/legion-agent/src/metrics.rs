@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use legion_api::dispatch::{NodeTelemetry, TaskUsage, VolumeTelemetry};
 use legion_api::metrics::Metrics;
-use legion_sys::Sys;
+use legion_sys::{PoolIo, Sys};
 
 use crate::pod::{
     self, LABEL_CONTAINER, LABEL_NODE, LABEL_ROLE, LABEL_TASK, LABEL_TASK_NAME, Role,
@@ -225,11 +225,13 @@ impl<R: Runtime> AgentMetrics<R> {
             .collect()
     }
 
-    /// Host ZFS space (root dataset + claimed volume datasets) and network
-    /// receive/transmit rates over the elapsed interval since `prev_net`.
+    /// Host ZFS space (root dataset + claimed volume datasets), network
+    /// receive/transmit rates over the elapsed interval since `prev_net`,
+    /// and the ZFS root's pool's read/write rates since `prev_io`.
     pub async fn node_telemetry(
         &self,
         prev_net: &mut Option<(tokio::time::Instant, u64, u64)>,
+        prev_io: &mut Option<(tokio::time::Instant, PoolIo)>,
     ) -> NodeTelemetry {
         let zfs_root = self.zfs_root.clone();
         let build_root = self.build_root.clone();
@@ -243,15 +245,21 @@ impl<R: Runtime> AgentMetrics<R> {
                 spaces.into_iter().find(|d| d.name == r).map(|d| d.used)
             });
             let net = sys.net_bytes().ok();
+            // The pool is the ZFS root's first component (`zroot` of
+            // `zroot/legion`).
+            let io = zfs_root
+                .as_deref()
+                .and_then(|r| r.split('/').next())
+                .and_then(|pool| sys.zfs_pool_io(pool).ok());
             let load = sys
                 .sysctl_get("vm.loadavg")
                 .ok()
                 .and_then(|l| legion_api::dispatch::parse_loadavg(&l))
                 .unwrap_or_default();
-            (spaces, build, (net, load))
+            (spaces, build, (net, io, load))
         })
         .await;
-        let (net, load) = net;
+        let (net, io, load) = net;
         let now = tokio::time::Instant::now();
         let (net_rx_bps, net_tx_bps) = match net {
             Some((rx, tx)) => {
@@ -272,6 +280,16 @@ impl<R: Runtime> AgentMetrics<R> {
                 rates
             }
             None => (0, 0),
+        };
+        // The same for the pool's bytes and operations: no rate before a
+        // second reading, or over too short an interval to mean anything.
+        let [zfs_read_bps, zfs_write_bps, zfs_read_iops, zfs_write_iops] = match io {
+            Some(io) => {
+                let rates = pool_io_rates(*prev_io, now, io);
+                *prev_io = Some((now, io));
+                rates
+            }
+            None => [0; 4],
         };
         let mut zfs_used_bytes = 0u64;
         let mut zfs_avail_bytes = 0u64;
@@ -307,6 +325,10 @@ impl<R: Runtime> AgentMetrics<R> {
             zfs_avail_bytes,
             net_rx_bps,
             net_tx_bps,
+            zfs_read_bps,
+            zfs_write_bps,
+            zfs_read_iops,
+            zfs_write_iops,
             volumes,
             images_bytes,
             jails_bytes,
@@ -371,13 +393,40 @@ impl<R: Runtime> AgentMetrics<R> {
     }
 }
 
+/// The pool's bytes read and written and its read and write operations,
+/// each a second, from the reading before (`prev`) to `io` at `now`: 0 with
+/// no reading before or over less than 0.05 s, and 0 for a counter that
+/// went back (a pool imported again) rather than a wrapped number.
+fn pool_io_rates(
+    prev: Option<(tokio::time::Instant, PoolIo)>,
+    now: tokio::time::Instant,
+    io: PoolIo,
+) -> [u64; 4] {
+    let Some((at, p)) = prev else {
+        return [0; 4];
+    };
+    let secs = now.duration_since(at).as_secs_f64();
+    if secs < 0.05 {
+        return [0; 4];
+    }
+    let rate = |cur: u64, prev: u64| (cur.saturating_sub(prev) as f64 / secs) as u64;
+    [
+        rate(io.read_bytes, p.read_bytes),
+        rate(io.written_bytes, p.written_bytes),
+        rate(io.reads, p.reads),
+        rate(io.writes, p.writes),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use legion_sys::FakeSys;
+    use std::time::Duration;
 
-    use super::AgentMetrics;
+    use legion_sys::{FakeSys, PoolIo};
+
+    use super::{AgentMetrics, pool_io_rates};
     use crate::fake::FakeRuntime;
 
     #[tokio::test]
@@ -396,7 +445,7 @@ mod tests {
             zfs_root: Some("tank/legion".to_owned()),
             build_root: Some("tank/legion-local".to_owned()),
         };
-        let t = metrics.node_telemetry(&mut None).await;
+        let t = metrics.node_telemetry(&mut None, &mut None).await;
         assert_eq!((t.zfs_used_bytes, t.zfs_avail_bytes), (70, 30));
         assert_eq!((t.images_bytes, t.jails_bytes, t.build_bytes), (40, 10, 15));
         assert_eq!(t.volumes.len(), 1, "{:?}", t.volumes);
@@ -407,6 +456,73 @@ mod tests {
             build_root: Some("tank/nothere".to_owned()),
             ..metrics.clone()
         };
-        assert_eq!(none.node_telemetry(&mut None).await.build_bytes, 0);
+        assert_eq!(
+            none.node_telemetry(&mut None, &mut None).await.build_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn pool_io_is_a_rate_over_the_interval() {
+        let io = |read_bytes, written_bytes, reads, writes| PoolIo {
+            read_bytes,
+            written_bytes,
+            reads,
+            writes,
+        };
+        let at = tokio::time::Instant::now();
+        let before = io(1000, 2000, 10, 20);
+        // The first reading has nothing to compare with.
+        assert_eq!(pool_io_rates(None, at, before), [0; 4]);
+        let later = at + Duration::from_secs(2);
+        assert_eq!(
+            pool_io_rates(Some((at, before)), later, io(5000, 8000, 30, 60)),
+            [2000, 3000, 10, 20]
+        );
+        // Too short an interval says nothing.
+        let soon = at + Duration::from_millis(10);
+        assert_eq!(
+            pool_io_rates(Some((at, before)), soon, io(5000, 8000, 30, 60)),
+            [0; 4]
+        );
+        // Counters that went back (a pool imported again) give 0, not a
+        // wrapped number.
+        assert_eq!(
+            pool_io_rates(Some((at, before)), later, io(10, 10, 1, 1)),
+            [0; 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_io_is_read_from_the_zfs_roots_pool() {
+        let sys = Arc::new(FakeSys::new());
+        sys.set_pool_io(
+            "tank",
+            PoolIo {
+                read_bytes: 1000,
+                ..Default::default()
+            },
+        );
+        let metrics = AgentMetrics {
+            runtime: Arc::new(FakeRuntime::new(sys.clone())),
+            sys,
+            node: "n1".to_owned(),
+            zfs_root: Some("tank/legion".to_owned()),
+            build_root: None,
+        };
+        let mut prev_io = None;
+        let t = metrics.node_telemetry(&mut None, &mut prev_io).await;
+        assert_eq!(t.zfs_read_bps, 0, "no rate from one reading");
+        assert_eq!(prev_io.map(|(_, io)| io.read_bytes), Some(1000));
+
+        // A pool sysctl does not know gives no reading and no rates.
+        let other = AgentMetrics {
+            zfs_root: Some("gone/legion".to_owned()),
+            ..metrics.clone()
+        };
+        let mut prev_io = None;
+        let t = other.node_telemetry(&mut None, &mut prev_io).await;
+        assert_eq!(t.zfs_read_bps, 0);
+        assert!(prev_io.is_none());
     }
 }

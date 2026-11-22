@@ -18,9 +18,9 @@ use legion_proto::v1::volumes_client::VolumesClient;
 use legion_proto::v1::volumes_server::Volumes;
 use legion_proto::v1::{
     BackupChunk, InputClosed, SessionError, SessionFrame, SessionOffer, SessionOpen,
-    VolumeBackupRequest, VolumeExport, VolumeImport, VolumePromoteRequest, VolumePromoteResponse,
-    VolumeRestoreChunk, VolumeRestoreResponse, VolumeRestoreStart, VolumeSnapshotAction,
-    VolumeSnapshotRequest, VolumeSnapshotResponse,
+    VolumeBackupRequest, VolumeBackupsRequest, VolumeExport, VolumeImport, VolumePromoteRequest,
+    VolumePromoteResponse, VolumeRestoreChunk, VolumeRestoreFromRequest, VolumeRestoreResponse,
+    VolumeRestoreStart, VolumeSnapshotAction, VolumeSnapshotRequest, VolumeSnapshotResponse,
 };
 use legion_store::{Command, Outcome, Precondition};
 use tokio::sync::mpsc;
@@ -77,6 +77,19 @@ impl VolumesService {
         tokio::select! {
             a = self.api.sessions.offer(node, offer) => a,
             _ = closing.wait_for(|c| *c) => Err(Status::unavailable("the manager is shutting down")),
+        }
+    }
+
+    /// The node to ask what a target holds: the one holding the Volume's
+    /// data if it is ready (a directory target is there), else any ready.
+    fn reader_node(&self, holder: Option<&str>) -> Result<String, Status> {
+        let ready = crate::backups::ready_nodes(&self.api.store).unwrap_or_default();
+        match holder {
+            Some(n) if ready.contains(n) => Ok(n.to_owned()),
+            _ => ready
+                .into_iter()
+                .min()
+                .ok_or_else(|| Status::unavailable("no node is ready to ask")),
         }
     }
 
@@ -451,6 +464,213 @@ impl Volumes for VolumesService {
         self.api.audit_end(audit, result)
     }
 
+    async fn backups(
+        &self,
+        req: Request<VolumeBackupsRequest>,
+    ) -> Result<Response<VolumeSnapshotResponse>, Status> {
+        let caller = self.api.caller(&req)?;
+        if let Some(mut leader) = self.leader(&req)? {
+            return leader
+                .backups(forwarded_for(req.into_inner(), &caller)?)
+                .await;
+        }
+        let VolumeBackupsRequest {
+            namespace,
+            name,
+            target,
+        } = req.into_inner();
+        let namespace = if namespace.is_empty() {
+            "default".to_owned()
+        } else {
+            namespace
+        };
+        check_namespace(&namespace)?;
+        self.api.consistent().await?;
+        caller.check(&self.api.store, Verb::Read, Kind::Volume, &namespace)?;
+        let key = ObjectKey::new(Kind::Volume, &namespace, &name);
+        let found = self.volume(&key)?;
+        let target = match (target.is_empty(), &found) {
+            (false, _) => target,
+            (true, Some((_, spec, _))) => spec
+                .backup
+                .as_ref()
+                .map(|b| b.target.clone())
+                .ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "volume {name} has no backup: name the target (--from)"
+                    ))
+                })?,
+            (true, None) => {
+                return Err(Status::not_found(format!(
+                    "no volume {name} in namespace {namespace}: name the target (--from)"
+                )));
+            }
+        };
+        let node = self.reader_node(found.as_ref().map(|(_, _, s)| s.node.as_str()))?;
+        let access = crate::backups::access(&self.api.store, &target)
+            .map_err(Status::failed_precondition)?;
+        let mut a = crate::backups::open(
+            &self.api.sessions,
+            &node,
+            &namespace,
+            Action::BackupList(legion_proto::v1::BackupList {
+                volume: name.clone(),
+                target: Some(access),
+            }),
+        )
+        .await
+        .map_err(Status::unavailable)?;
+        let (_, snapshots) = crate::backups::said(&mut a, &node)
+            .await
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(VolumeSnapshotResponse { snapshots }))
+    }
+
+    async fn restore_from(
+        &self,
+        req: Request<VolumeRestoreFromRequest>,
+    ) -> Result<Response<VolumeRestoreResponse>, Status> {
+        let audit = self.api.audit_point(
+            &req,
+            "volume-restore",
+            crate::audit::target("Volume", &req.get_ref().namespace, &req.get_ref().name),
+        );
+        let result = async {
+            let caller = self.api.caller(&req)?;
+            if let Some(mut leader) = self.leader(&req)? {
+                return leader.restore_from(forwarded_for(req.into_inner(), &caller)?).await;
+            }
+            let VolumeRestoreFromRequest {
+                namespace,
+                name,
+                target,
+                backup,
+                node,
+                into,
+            } = req.into_inner();
+            let namespace = if namespace.is_empty() { "default".to_owned() } else { namespace };
+            check_namespace(&namespace)?;
+            self.api.consistent().await?;
+            caller.check(&self.api.store, Verb::Write, Kind::Volume, &namespace)?;
+            let into = if into.is_empty() { name.clone() } else { into };
+            legion_api::validate_name(&into)
+                .map_err(|e| Status::invalid_argument(format!("the Volume's name: {e}")))?;
+            let into_key = ObjectKey::new(Kind::Volume, &namespace, &into);
+            if self.volume(&into_key)?.is_some() {
+                return Err(Status::already_exists(format!(
+                    "volume {into} is in namespace {namespace}: delete it first, or restore under another name (--as)"
+                )));
+            }
+            let ready = crate::backups::ready_nodes(&self.api.store).unwrap_or_default();
+            if !ready.contains(&node) {
+                return Err(Status::failed_precondition(format!("node {node} is not ready")));
+            }
+            let source = self.volume(&ObjectKey::new(Kind::Volume, &namespace, &name))?;
+            let target = match (target.is_empty(), &source) {
+                (false, _) => target,
+                (true, Some((_, spec, _))) => spec.backup.as_ref().map(|b| b.target.clone()).ok_or_else(|| {
+                    Status::failed_precondition(format!("volume {name} has no backup: name the target (--from)"))
+                })?,
+                (true, None) => {
+                    return Err(Status::invalid_argument("name the target the backup is on (--from)"));
+                }
+            };
+            let access = crate::backups::access(&self.api.store, &target).map_err(Status::failed_precondition)?;
+            let of = format!("{namespace}.{name}");
+            // Named by its snapshot: found among what the target holds.
+            let held = if backup.contains('@') || backup.contains('/') {
+                backup.clone()
+            } else {
+                let mut a = crate::backups::open(
+                    &self.api.sessions,
+                    &node,
+                    &namespace,
+                    Action::BackupList(legion_proto::v1::BackupList {
+                        volume: name.clone(),
+                        target: Some(access.clone()),
+                    }),
+                )
+                .await
+                .map_err(Status::unavailable)?;
+                let (_, listed) = crate::backups::said(&mut a, &node)
+                    .await
+                    .map_err(Status::failed_precondition)?;
+                listed
+                    .into_iter()
+                    .find(|h| {
+                        h.rsplit(['@', '/']).next().map(|n| n.trim_end_matches(".zfs")) == Some(backup.as_str())
+                    })
+                    .ok_or_else(|| {
+                        Status::not_found(format!(
+                            "{target} holds no backup {backup} of {name}: `legion volume backups {name}` lists them"
+                        ))
+                    })?
+            };
+            let op = self.api.activity.begin(
+                legion_api::activity::OperationKind::Restore,
+                crate::audit::target("Volume", &namespace, &into),
+                format!("restore Volume {namespace}/{into} onto {node} from {target}"),
+                legion_api::activity::Stage::Receiving,
+                String::new(),
+            );
+            let restored = async {
+                let mut a = crate::backups::open(
+                    &self.api.sessions,
+                    &node,
+                    &namespace,
+                    Action::BackupRestore(legion_proto::v1::BackupRestore {
+                        volume: into.clone(),
+                        target: Some(access),
+                        of,
+                        held: held.clone(),
+                    }),
+                )
+                .await
+                .map_err(Status::unavailable)?;
+                crate::backups::said(&mut a, &node)
+                    .await
+                    .map_err(Status::failed_precondition)?;
+                // The data is there: the Volume now, on that node, as big
+                // as the one backed up.
+                let size = source.as_ref().and_then(|(_, s, _)| s.size);
+                let mut object = Object::new(
+                    Kind::Volume,
+                    &namespace,
+                    &into,
+                    serde_json::to_value(VolumeSpec { size, ..Default::default() }).map_err(internal)?,
+                );
+                object.status = serde_json::to_value(VolumeStatus {
+                    node: node.clone(),
+                    ..Default::default()
+                })
+                .map_err(internal)?;
+                match self
+                    .api
+                    .write(Command::Put {
+                        object,
+                        precondition: Precondition::MustNotExist,
+                    })
+                    .await?
+                {
+                    Outcome::Written(_) => Ok(()),
+                    _ => Err(Status::already_exists(format!(
+                        "volume {into} was made in namespace {namespace} as it was restored; the data restored on {node} is under its name"
+                    ))),
+                }
+            }
+            .await;
+            op.finish(match &restored {
+                Ok(()) => Ok(format!("from {held}")),
+                Err(e) => Err(e.message().to_owned()),
+            });
+            restored?;
+            tracing::info!(volume = %into_key, node, from = %held, "volume restored from a backup");
+            Ok(Response::new(VolumeRestoreResponse {}))
+        }
+        .await;
+        self.api.audit_end(audit, result)
+    }
+
     async fn promote(
         &self,
         req: Request<VolumePromoteRequest>,
@@ -553,9 +773,10 @@ impl Volumes for VolumesService {
                 name,
                 op,
                 snapshot,
+                into,
             } = req.into_inner();
             let op = if op.is_empty() { "list".to_owned() } else { op };
-            if !matches!(op.as_str(), "list" | "create" | "rollback" | "delete") {
+            if !matches!(op.as_str(), "list" | "create" | "rollback" | "delete" | "clone") {
                 return Err(Status::invalid_argument(format!(
                     "unknown snapshot op {op:?}"
                 )));
@@ -593,14 +814,28 @@ impl Volumes for VolumesService {
                     "volume {name} has no data yet: no task has used it"
                 )));
             }
+            // A clone is a new Volume: named as any, and not one there is.
+            let clone_key = ObjectKey::new(Kind::Volume, &namespace, &into);
+            if op == "clone" {
+                legion_api::validate_name(&into)
+                    .map_err(|e| Status::invalid_argument(format!("the clone's name: {e}")))?;
+                if self.volume(&clone_key)?.is_some() {
+                    return Err(Status::already_exists(format!(
+                        "volume {into} is in namespace {namespace} already: name the clone otherwise"
+                    )));
+                }
+            }
             let Attachment { mut from_agent, .. } = self
                 .attach(
                     &status.node,
                     &namespace,
                     Action::VolumeSnapshot(VolumeSnapshotAction {
                         volume: name.clone(),
-                        op,
-                        snapshot,
+                        op: op.clone(),
+                        snapshot: snapshot.clone(),
+                        // Only the leader's snapshotter takes a schedule's.
+                        keep: 0,
+                        into: into.clone(),
                     }),
                 )
                 .await?;
@@ -630,6 +865,42 @@ impl Volumes for VolumesService {
                         )));
                     }
                 }
+            }
+            if op == "clone" {
+                // The data is there: the Volume now, on that node, as big
+                // as the one it came from, and nothing else of its.
+                let mut object = Object::new(
+                    Kind::Volume,
+                    &namespace,
+                    &into,
+                    serde_json::to_value(VolumeSpec {
+                        size: spec.size,
+                        ..Default::default()
+                    })
+                    .map_err(internal)?,
+                );
+                object.status = serde_json::to_value(VolumeStatus {
+                    node: status.node.clone(),
+                    ..Default::default()
+                })
+                .map_err(internal)?;
+                return match self
+                    .api
+                    .write(Command::Put {
+                        object,
+                        precondition: Precondition::MustNotExist,
+                    })
+                    .await?
+                {
+                    Outcome::Written(_) => {
+                        tracing::info!(volume = %clone_key, from = %snapshot, "volume cloned");
+                        Ok(Response::new(VolumeSnapshotResponse { snapshots: Vec::new() }))
+                    }
+                    _ => Err(Status::already_exists(format!(
+                        "volume {into} was made in namespace {namespace} as it was cloned; the data copied on {} is under its name",
+                        status.node
+                    ))),
+                };
             }
             Ok(Response::new(VolumeSnapshotResponse { snapshots }))
         }
@@ -724,6 +995,8 @@ pub(crate) fn promoted(
             r.node
         ),
         export: status.export.clone(),
+        snapshots: status.snapshots.clone(),
+        backup: status.backup.clone(),
     })
 }
 

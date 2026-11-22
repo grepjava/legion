@@ -118,6 +118,7 @@
       { id: 'nav:/topology', group: navGroup, label: t('Topology'), detail: 'g t · pf reachability & VIPs', run: () => goto('/topology') },
       { id: 'nav:/apply', group: navGroup, label: t('Apply YAML'), detail: 'g y · live dry-run diff', run: () => goto('/apply') },
       { id: 'nav:/deploy', group: navGroup, label: t('Deploy'), detail: '/deploy', run: () => goto('/deploy') },
+      { id: 'nav:/apps', group: navGroup, label: t('Apps'), detail: '/apps · daemonless catalog', run: () => goto('/apps') },
       { id: 'nav:/templates', group: navGroup, label: t('Templates'), detail: '/templates', run: () => goto('/templates') },
       { id: 'nav:/import', group: navGroup, label: t('Import compose'), detail: '/import', run: () => goto('/import') },
       { id: 'nav:/network', group: navGroup, label: t('Network'), detail: '/network', run: () => goto('/network') },

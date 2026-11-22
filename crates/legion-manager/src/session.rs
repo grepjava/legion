@@ -231,6 +231,11 @@ impl Pods for PodsService {
                     "volume snapshots go through Volumes.Snapshot",
                 ));
             }
+            Some(Action::BackupRun(_) | Action::BackupList(_) | Action::BackupRestore(_)) => {
+                return Err(Status::invalid_argument(
+                    "a Volume's backups go through its `backup` and Volumes.Backups and RestoreFrom",
+                ));
+            }
             Some(Action::ImageOp(_)) => {
                 return Err(Status::invalid_argument(
                     "node image actions go through Cluster.NodeImages",

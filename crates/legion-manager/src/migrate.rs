@@ -102,13 +102,15 @@ pub(crate) async fn run(
             }
         }
         // Transfers stop with the leadership; the next leader starts over.
-        // Replicas are copied, and nodes' exports kept, beside the moves,
-        // through the same sessions.
+        // Replicas are copied, scheduled snapshots taken, and nodes' exports
+        // kept, beside the moves, through the same sessions.
         tokio::select! {
             () = async {
                 tokio::join!(
                     lead(&store, &hub, &activity),
                     crate::replicate::lead(&store, &hub, &activity),
+                    crate::snapshots::lead(&store, &hub),
+                    crate::backups::lead(&store, &hub, &activity),
                     crate::exports::lead(&store, &hub),
                 );
             } => {}
@@ -357,6 +359,10 @@ async fn advance(
                 replica: s.replica.take(),
                 promoted: std::mem::take(&mut s.promoted),
                 export: s.export.take(),
+                // Schedules go on as they were, on the new node.
+                snapshots: std::mem::take(&mut s.snapshots),
+                // Its base is on the old node: the next backup is whole.
+                backup: s.backup.take(),
             };
         } else {
             s.migration = Some(Migration {

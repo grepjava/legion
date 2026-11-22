@@ -168,14 +168,24 @@ pub struct VolumeTelemetry {
     pub avail_bytes: u64,
 }
 
-/// Host-level ZFS pool space, per-volume space, and network throughput
-/// reported by an agent with its heartbeats.
+/// Host-level ZFS pool space and I/O, per-volume space, and network
+/// throughput reported by an agent with its heartbeats.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeTelemetry {
     pub zfs_used_bytes: u64,
     pub zfs_avail_bytes: u64,
     pub net_rx_bps: u64,
     pub net_tx_bps: u64,
+    /// The ZFS root's pool's reads and writes, in bytes and operations per
+    /// second; 0 where the pool's counters cannot be read.
+    #[serde(default)]
+    pub zfs_read_bps: u64,
+    #[serde(default)]
+    pub zfs_write_bps: u64,
+    #[serde(default)]
+    pub zfs_read_iops: u64,
+    #[serde(default)]
+    pub zfs_write_iops: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<VolumeTelemetry>,
     /// Of `zfs_used_bytes`: the image store's and the tasks' roots'.

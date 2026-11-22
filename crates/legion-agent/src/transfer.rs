@@ -43,7 +43,7 @@ pub(crate) struct Volumes {
 }
 
 impl Volumes {
-    fn dataset(&self, namespace: &str, volume: &str) -> Result<String, Status> {
+    pub(crate) fn dataset(&self, namespace: &str, volume: &str) -> Result<String, Status> {
         let root = self.zfs_root.as_deref().ok_or_else(|| {
             Status::failed_precondition("this node has no ZFS dataset for volumes")
         })?;
@@ -170,7 +170,7 @@ pub(crate) async fn import(
 }
 
 /// Refuses a node that has data for `ds` already, and makes its parent.
-fn make_room(sys: &dyn Sys, lock: &Mutex<()>, ds: &str) -> Result<(), String> {
+pub(crate) fn make_room(sys: &dyn Sys, lock: &Mutex<()>, ds: &str) -> Result<(), String> {
     let _guard = lock.blocking_lock();
     let found = sys.zfs_list(ds).map_err(|e| e.to_string())?;
     if found.iter().any(|d| d.name == ds) {
@@ -201,7 +201,12 @@ fn backup(sys: &dyn Sys, lock: &Mutex<()>, ds: &str, out: &mut dyn Write) -> Res
 
 /// Receives a backup's stream as `ds`, drops the backup's snapshot it
 /// brings and mounts it. What a failed receive left goes.
-fn restore(sys: &dyn Sys, lock: &Mutex<()>, ds: &str, input: &mut dyn Read) -> Result<(), String> {
+pub(crate) fn restore(
+    sys: &dyn Sys,
+    lock: &Mutex<()>,
+    ds: &str,
+    input: &mut dyn Read,
+) -> Result<(), String> {
     if let Err(e) = sys.zfs_receive(ds, input) {
         let _guard = lock.blocking_lock();
         if sys
@@ -477,45 +482,26 @@ pub(crate) async fn snapshot(
     tx: &mpsc::Sender<SessionFrame>,
 ) -> Result<(), Status> {
     let ds = v.dataset(namespace, &opts.volume)?;
-    let op = opts.op;
-    let snap_name = opts.snapshot;
-    let valid_snap = |s: &str| {
-        !s.is_empty()
-            && s.len() <= 128
-            && !s.starts_with("legion-move-")
-            && !s.starts_with(BACKUP)
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    check_snapshot_op(&opts.op, &opts.snapshot, opts.keep)?;
+    let into = if opts.op == "clone" {
+        v.dataset(namespace, &opts.into)?
+    } else {
+        String::new()
     };
-    if matches!(op.as_str(), "create" | "rollback" | "delete") && !valid_snap(&snap_name) {
-        return Err(Status::invalid_argument(
-            "snapshot name must be 1..128 characters of [a-zA-Z0-9._-] and not reserved",
-        ));
-    }
     let lock = v.lock.clone();
-    let listed = crate::task::blocking(&v.sys, move |sys| -> Result<Vec<String>, String> {
-        let _guard = lock.blocking_lock();
-        match op.as_str() {
-            "list" => {}
-            "create" => sys
-                .zfs_snapshot(&format!("{ds}@{snap_name}"))
-                .map_err(|e| e.to_string())?,
-            "rollback" => {
-                sys.zfs_rollback(&format!("{ds}@{snap_name}"))
-                    .map_err(|e| e.to_string())?;
-                sys.zfs_mount(&ds).map_err(|e| e.to_string())?;
-            }
-            "delete" => sys
-                .zfs_destroy(&format!("{ds}@{snap_name}"), false)
-                .map_err(|e| e.to_string())?,
-            other => return Err(format!("unknown snapshot op {other:?}")),
+    let listed = crate::task::blocking(&v.sys, move |sys| {
+        if opts.op == "clone" {
+            clone_snapshot(sys, &lock, &ds, &opts.snapshot, &into)?;
+            return Ok(Vec::new());
         }
-        Ok(sys
-            .zfs_snapshots(&ds)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .filter(|s| !s.starts_with("legion-move-") && !s.starts_with(BACKUP))
-            .collect())
+        snapshot_op(
+            sys,
+            &lock,
+            &ds,
+            &opts.op,
+            &opts.snapshot,
+            opts.keep as usize,
+        )
     })
     .await
     .map_err(Status::failed_precondition)?;
@@ -528,8 +514,138 @@ pub(crate) async fn snapshot(
     Ok(())
 }
 
+/// Whether `op` may be done with `name`. `legion-` is Legion's: a person
+/// names none so, and of Legion's own only a schedule's are theirs to roll
+/// back to or delete; a move's, a replica's or a backup's is another
+/// copy's base. `auto` takes only a schedule's, keeping at least one.
+fn check_snapshot_op(op: &str, name: &str, keep: u32) -> Result<(), Status> {
+    use legion_api::volume::SnapshotSchedule;
+    let well_formed = !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    let refused = match op {
+        "list" => false,
+        "create" => !well_formed || name.starts_with(SnapshotSchedule::RESERVED),
+        "rollback" | "delete" | "clone" => {
+            !well_formed
+                || (name.starts_with(SnapshotSchedule::RESERVED)
+                    && !name.starts_with(SnapshotSchedule::AUTO))
+        }
+        "auto" => !well_formed || !name.starts_with(SnapshotSchedule::AUTO) || keep == 0,
+        other => {
+            return Err(Status::invalid_argument(format!(
+                "unknown snapshot op {other:?}"
+            )));
+        }
+    };
+    if refused {
+        return Err(Status::invalid_argument(
+            "snapshot name must be 1..128 characters of [a-zA-Z0-9._-], not starting with legion- (Legion's own)",
+        ));
+    }
+    Ok(())
+}
+
+/// Copies `ds@snap` into the new dataset `into` on this node, which must
+/// not have it: a copy rather than a ZFS clone, so the snapshot can be
+/// pruned and the Volume deleted after. Sent and received at once, through
+/// a pipe; the snapshot's name is not kept on the copy.
+fn clone_snapshot(
+    sys: &dyn Sys,
+    lock: &Mutex<()>,
+    ds: &str,
+    snap: &str,
+    into: &str,
+) -> Result<(), String> {
+    make_room(sys, lock, into)?;
+    let (mut from, to) = std::io::pipe().map_err(|e| format!("a pipe: {e}"))?;
+    std::thread::scope(|scope| {
+        let sender = scope.spawn(move || {
+            let mut to = to;
+            sys.zfs_send(&format!("{ds}@{snap}"), None, &mut to)
+                .map_err(|e| e.to_string())
+        });
+        let taken = restore(sys, lock, into, &mut from);
+        let sent = sender
+            .join()
+            .unwrap_or_else(|_| Err("sending stopped".to_owned()));
+        sent.and(taken)
+    })?;
+    let _guard = lock.blocking_lock();
+    sys.zfs_destroy(&format!("{into}@{snap}"), false)
+        .map_err(|e| format!("dropping {snap} from the copy: {e}"))
+}
+
+/// Does `op` on the dataset `ds` and lists its snapshots as shown: a
+/// person's and a schedule's. `auto` takes `name` and drops its
+/// schedule's oldest beyond `keep`.
+fn snapshot_op(
+    sys: &dyn Sys,
+    lock: &Mutex<()>,
+    ds: &str,
+    op: &str,
+    name: &str,
+    keep: usize,
+) -> Result<Vec<String>, String> {
+    let _guard = lock.blocking_lock();
+    match op {
+        "list" => {}
+        "create" => sys
+            .zfs_snapshot(&format!("{ds}@{name}"))
+            .map_err(|e| e.to_string())?,
+        "rollback" => {
+            sys.zfs_rollback(&format!("{ds}@{name}"))
+                .map_err(|e| e.to_string())?;
+            sys.zfs_mount(ds).map_err(|e| e.to_string())?;
+        }
+        "delete" => sys
+            .zfs_destroy(&format!("{ds}@{name}"), false)
+            .map_err(|e| e.to_string())?,
+        "auto" => {
+            sys.zfs_snapshot(&format!("{ds}@{name}"))
+                .map_err(|e| e.to_string())?;
+            // The schedule's own, oldest first (they are listed by when
+            // they were taken), beyond `keep` dropped.
+            let prefix = schedule_prefix(name);
+            let mine: Vec<String> = sys
+                .zfs_snapshots(ds)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|s| s.starts_with(prefix))
+                .collect();
+            for old in &mine[..mine.len().saturating_sub(keep)] {
+                sys.zfs_destroy(&format!("{ds}@{old}"), false)
+                    .map_err(|e| format!("pruning {old}: {e}"))?;
+            }
+        }
+        other => return Err(format!("unknown snapshot op {other:?}")),
+    }
+    Ok(sys
+        .zfs_snapshots(ds)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|s| shown(s))
+        .collect())
+}
+
 fn frame(f: Frame) -> SessionFrame {
     SessionFrame { frame: Some(f) }
+}
+
+/// Whether a snapshot is listed: a person's, or a schedule's; not the
+/// bases of moves, replicas and backups.
+fn shown(snapshot: &str) -> bool {
+    use legion_api::volume::SnapshotSchedule;
+    !snapshot.starts_with(SnapshotSchedule::RESERVED)
+        || snapshot.starts_with(SnapshotSchedule::AUTO)
+}
+
+/// A schedule's snapshots' prefix, from one of their names:
+/// `legion-auto-1h-` from `legion-auto-1h-20261122T143005Z`.
+fn schedule_prefix(snapshot: &str) -> &str {
+    snapshot.rfind('-').map_or(snapshot, |i| &snapshot[..=i])
 }
 
 /// Output frames, from a blocking writer.
@@ -694,6 +810,91 @@ mod tests {
         assert!(restore(&to, &Mutex::new(()), DS, &mut &out[..]).is_err());
         assert!(to.zfs_list(DS).unwrap().iter().all(|d| d.name != DS));
         make_room(&to, &Mutex::new(()), DS).unwrap();
+    }
+
+    /// A schedule's snapshots: each taken, its oldest beyond `keep`
+    /// dropped, never another schedule's or a person's or a replica's.
+    #[test]
+    fn a_schedule_keeps_its_last_snapshots_and_touches_no_others() {
+        let lock = Mutex::new(());
+        let sys = FakeSys::new();
+        sys.zfs_create(DS, &[]).unwrap();
+        for s in [
+            "mine",
+            "legion-replica-1",
+            "legion-auto-24h-20261120T000000Z",
+        ] {
+            sys.zfs_snapshot(&format!("{DS}@{s}")).unwrap();
+        }
+        let auto = |n: u32| {
+            let name = format!("legion-auto-1h-20261122T{n:02}0000Z");
+            snapshot_op(&sys, &lock, DS, "auto", &name, 2).unwrap()
+        };
+        auto(1);
+        auto(2);
+        let shown = auto(3);
+        assert_eq!(
+            shown,
+            [
+                "mine",
+                "legion-auto-24h-20261120T000000Z",
+                "legion-auto-1h-20261122T020000Z",
+                "legion-auto-1h-20261122T030000Z"
+            ],
+            "the replica's base is not shown"
+        );
+        assert!(
+            sys.zfs_snapshots(DS)
+                .unwrap()
+                .contains(&"legion-replica-1".to_owned())
+        );
+    }
+
+    /// A clone is a copy of the snapshot's data in a new dataset, which
+    /// needs nothing of the snapshot after.
+    #[test]
+    fn a_clone_is_a_copy_of_the_snapshot_alone() {
+        let lock = Mutex::new(());
+        let sys = FakeSys::new();
+        sys.zfs_create(DS, &[]).unwrap();
+        sys.write_dataset(DS, b"at noon");
+        sys.zfs_snapshot(&format!("{DS}@noon")).unwrap();
+        sys.write_dataset(DS, b"later");
+        let into = "tank/legion/volumes/shop/data-noon";
+        clone_snapshot(&sys, &lock, DS, "noon", into).unwrap();
+        assert_eq!(sys.dataset_contents(into).unwrap(), b"at noon");
+        assert!(sys.zfs_snapshots(into).unwrap().is_empty());
+        sys.zfs_destroy(&format!("{DS}@noon"), false).unwrap();
+        assert_eq!(sys.dataset_contents(into).unwrap(), b"at noon");
+        let e = clone_snapshot(&sys, &lock, DS, "noon", into).unwrap_err();
+        assert!(e.contains("has data for the volume already"), "{e}");
+    }
+
+    /// `legion-` is Legion's: a person makes none, and touches only a
+    /// schedule's of Legion's own.
+    #[test]
+    fn legions_own_snapshots_are_guarded() {
+        let ok = |op: &str, name: &str| check_snapshot_op(op, name, 1).is_ok();
+        assert!(ok("create", "before-upgrade"));
+        assert!(!ok("create", "legion-auto-1h-x"));
+        assert!(!ok("create", "legion-replica-9"));
+        assert!(ok("rollback", "legion-auto-1h-20261122T010000Z"));
+        assert!(ok("delete", "legion-auto-1h-20261122T010000Z"));
+        for base in [
+            "legion-replica-9",
+            "legion-move-1",
+            "legion-backup-1",
+            "legion-bk-offsite-1",
+        ] {
+            assert!(!ok("rollback", base), "{base}");
+            assert!(!ok("delete", base), "{base}");
+        }
+        assert!(!ok("auto", "mine"));
+        assert!(
+            check_snapshot_op("auto", "legion-auto-1h-x", 0).is_err(),
+            "keeps at least one"
+        );
+        assert!(check_snapshot_op("unmake", "x", 1).is_err());
     }
 
     /// A replica's copies: whole at first, then what changed, each taken

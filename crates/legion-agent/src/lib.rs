@@ -21,6 +21,7 @@ use legion_sys::Sys;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
+mod backups;
 mod browse;
 mod build;
 pub use build::Builder;
@@ -1301,12 +1302,13 @@ async fn heartbeats<R: Runtime, C: Control>(
     let mut failing = false;
     let mut usage_due = tokio::time::Instant::now();
     let mut prev_net = None;
+    let mut prev_io = None;
     loop {
         let (usage, telemetry) = if tokio::time::Instant::now() >= usage_due {
             usage_due = tokio::time::Instant::now() + usage_period;
             (
                 metrics.tasks().await,
-                Some(metrics.node_telemetry(&mut prev_net).await),
+                Some(metrics.node_telemetry(&mut prev_net, &mut prev_io).await),
             )
         } else {
             (Vec::new(), None)

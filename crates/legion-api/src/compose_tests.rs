@@ -614,3 +614,42 @@ configs:
         assert!(warnings.contains(expected), "{expected}\n{warnings}");
     }
 }
+
+#[test]
+fn freebsd_jail_annotations_become_what_a_container_is_allowed() {
+    let yaml = r#"
+services:
+  db:
+    image: ghcr.io/daemonless/postgres:latest
+    annotations:
+      org.freebsd.jail.allow.sysvipc: "true"
+      org.freebsd.jail.allow.raw_sockets: "false"
+      org.freebsd.jail.allow.mount: "true"
+      io.podman.unrelated: "x"
+  ping:
+    image: ghcr.io/daemonless/uptime-kuma:latest
+    cap_add: [NET_RAW]
+    annotations: ["org.freebsd.jail.allow.raw_sockets=true", "org.freebsd.jail.allow.mlock=1"]
+"#;
+    let stack = convert_with(yaml, &[]).unwrap();
+    let allowed = |name: &str| spec(&stack, name).pod.containers[0].security.allow.clone();
+    assert_eq!(allowed("db"), [crate::security::Allow::Sysvipc].into());
+    assert_eq!(
+        allowed("ping"),
+        [crate::security::Allow::RawSockets, crate::security::Allow::Mlock].into()
+    );
+    assert!(
+        stack.warnings.iter().any(|w| w.contains("allow.mount") && w.contains("not one Legion sets")),
+        "{:?}",
+        stack.warnings
+    );
+}
+
+#[test]
+fn a_stacks_namespace_allows_what_its_containers_ask_for() {
+    let yaml = "services:\n  db:\n    image: pg\n    annotations: { org.freebsd.jail.allow.sysvipc: \"true\" }\n  web:\n    image: web\n";
+    let stack = convert_with(yaml, &[]).unwrap();
+    assert_eq!(stack.namespace_spec(), json!({ "security": { "allow": ["sysvipc"] } }));
+    let plain = convert_with("services:\n  web:\n    image: web\n", &[]).unwrap();
+    assert_eq!(plain.namespace_spec(), json!({}));
+}
