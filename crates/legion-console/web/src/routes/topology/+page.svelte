@@ -530,7 +530,7 @@
   <h1>{t('Topology: {namespace}', { namespace })}</h1>
   <div class="controls">
     <button type="button" class="sm" aria-label={t('Zoom out')} title={t('Zoom out (Ctrl+wheel)')} onclick={() => zoomBy(-20)}>−</button>
-    <span class="mono muted" aria-live="polite">{zoom}%</span>
+    <span class="muted" aria-live="polite">{zoom}%</span>
     <button type="button" class="sm" aria-label={t('Zoom in')} title={t('Zoom in (Ctrl+wheel)')} onclick={() => zoomBy(20)}>+</button>
     <button type="button" class="sm" onclick={() => (zoom = 100)}>{t('Reset')}</button>
     <form
@@ -575,20 +575,20 @@
       </div>
       <div class="controls">
         <span class="muted" id="group-by">{t('Group pods by:')}</span>
-        <div class="seg" role="group" aria-labelledby="group-by">
-          <button type="button" class="sm" class:primary={!byNode} aria-pressed={!byNode} onclick={() => setGroup('service')}>
+        <div class="segmented" role="group" aria-labelledby="group-by">
+          <button type="button" aria-pressed={!byNode} onclick={() => setGroup('service')}>
             {t('Service')}
           </button>
-          <button type="button" class="sm" class:primary={byNode} aria-pressed={byNode} onclick={() => setGroup('node')}>
+          <button type="button" aria-pressed={byNode} onclick={() => setGroup('node')}>
             {t('Node')}
           </button>
         </div>
         <span class="muted" id="arcs-of">{t('Arcs:')}</span>
-        <div class="seg" role="group" aria-labelledby="arcs-of">
-          <button type="button" class="sm" class:primary={!showSeen} aria-pressed={!showSeen} onclick={() => setArcs('allowed')}>
+        <div class="segmented" role="group" aria-labelledby="arcs-of">
+          <button type="button" aria-pressed={!showSeen} onclick={() => setArcs('allowed')}>
             {t('Allowed')}
           </button>
-          <button type="button" class="sm" class:primary={showSeen} aria-pressed={showSeen} onclick={() => setArcs('seen')}>
+          <button type="button" aria-pressed={showSeen} onclick={() => setArcs('seen')}>
             {t('Seen')}
           </button>
         </div>
@@ -1219,12 +1219,6 @@
   }
   .canvas-card .note {
     margin: 0.5rem 0 0;
-  }
-  .seg {
-    display: inline-flex;
-  }
-  .seg button + button {
-    margin-left: -1px;
   }
   .node-key {
     display: inline-flex;

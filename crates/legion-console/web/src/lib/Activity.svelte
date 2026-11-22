@@ -9,6 +9,10 @@
   import type { Operation } from './api.ts';
   import { t } from './i18n.svelte.ts';
   import Ico from './Ico.svelte';
+  import { Table } from './table.svelte.ts';
+  import SortTh from './SortTh.svelte';
+  import TableBar from './TableBar.svelte';
+  import Pager from './Pager.svelte';
   import { Check, ChevronDown, ChevronRight, Copy } from '@lucide/svelte';
 
   let show: 'all' | 'running' = $state('all');
@@ -49,6 +53,21 @@
   const time = (ms: number) => new Date(ms).toLocaleTimeString();
   const reached = (o: Operation, stage: string) => (o.stages ?? []).some((s) => s.stage === stage);
 
+  // Unsorted, those under way come first, then the newest: the order
+  // above. A header sorts on its column instead; "State" on the word.
+  const table = new Table(() => shown, {
+    sorts: {
+      began: (o) => o.beganMs,
+      what: (o) => o.what,
+      stage: (o) => o.stage,
+      sent: (o) => o.bytes,
+      state: (o) => stateWord(o),
+      by: (o) => o.by ?? '',
+      why: (o) => o.message ?? ''
+    },
+    text: (o) => `${time(o.beganMs)} ${o.what} ${o.stage} ${stateWord(o)} ${o.by ?? ''} ${o.message ?? ''}`
+  });
+
   async function copy(o: Operation) {
     await navigator.clipboard.writeText(outputText(o));
     copied = o.id;
@@ -57,43 +76,45 @@
 </script>
 
 <div class="activity">
-  <div class="table-toolbar">
-    <div class="pill-row" role="group" aria-label={t('Show')}>
-      <button
-        type="button"
-        class="pill"
-        class:active={show === 'all'}
-        aria-pressed={show === 'all'}
-        onclick={() => (show = 'all')}>{t('All')}</button
-      >
-      <button
-        type="button"
-        class="pill"
-        class:active={show === 'running'}
-        aria-pressed={show === 'running'}
-        onclick={() => (show = 'running')}
-        >{t('Running')}<span class="count">{runningCount}</span></button
-      >
+  <TableBar {table} label={t('Search operations')}>
+    <div class="table-toolbar">
+      <div class="pill-row" role="group" aria-label={t('Show')}>
+        <button
+          type="button"
+          class="pill"
+          class:active={show === 'all'}
+          aria-pressed={show === 'all'}
+          onclick={() => (show = 'all')}>{t('All')}</button
+        >
+        <button
+          type="button"
+          class="pill"
+          class:active={show === 'running'}
+          aria-pressed={show === 'running'}
+          onclick={() => (show = 'running')}
+          >{t('Running')}<span class="count">{runningCount}</span></button
+        >
+      </div>
+      {#if activity.error}<span class="error" role="alert">{activity.error}</span>{/if}
     </div>
-    {#if activity.error}<span class="error" role="alert">{activity.error}</span>{/if}
-  </div>
+  </TableBar>
 
   {#if shown.length}
     <table aria-label={t('Long operations')}>
       <thead>
         <tr>
           <th><span class="sr-only">{t('Open')}</span></th>
-          <th>{t('Began')}</th>
-          <th>{t('What')}</th>
-          <th>{t('Stage')}</th>
-          <th>{t('Sent')}</th>
-          <th>{t('State')}</th>
-          <th>{t('By')}</th>
-          <th>{t('Why')}</th>
+          <SortTh {table} col="began">{t('Began')}</SortTh>
+          <SortTh {table} col="what">{t('What')}</SortTh>
+          <SortTh {table} col="stage">{t('Stage')}</SortTh>
+          <SortTh {table} col="sent">{t('Sent')}</SortTh>
+          <SortTh {table} col="state">{t('State')}</SortTh>
+          <SortTh {table} col="by">{t('By')}</SortTh>
+          <SortTh {table} col="why">{t('Why')}</SortTh>
         </tr>
       </thead>
       <tbody>
-        {#each shown as o (o.id)}
+        {#each table.rows as o (o.id)}
           <tr data-op={o.id}>
             <td>
               <button
@@ -157,9 +178,12 @@
               </td>
             </tr>
           {/if}
+        {:else}
+          <tr><td colspan="8" class="muted">{t('Nothing matches.')}</td></tr>
         {/each}
       </tbody>
     </table>
+    <Pager {table} label={t('Long operations')} />
   {:else}
     <p class="empty">
       {show === 'running'

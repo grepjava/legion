@@ -1,0 +1,1 @@
+import{n as e,r as t}from"./D8wUbpUU.js";import{t as n}from"./DQqEozB6.js";var r={name:`database`,size:24,node:[[`ellipse`,{cx:`12`,cy:`5`,rx:`9`,ry:`3`}],[`path`,{d:`M3 5V19A9 3 0 0 0 21 19V5`}],[`path`,{d:`M3 12A9 3 0 0 0 21 12`}]]};r.node;var i=new Set([`$$slots`,`$$events`,`$$legacy`]);function a(a,o){let s=e(o,i);n(a,t(()=>s,{get icon(){return r}}))}export{a as t};

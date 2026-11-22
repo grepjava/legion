@@ -6,6 +6,10 @@
   import { api, downloads, type CaStatus } from '#lib/api.ts';
   import { session } from '#lib/session.svelte.ts';
   import { t, tn } from '#lib/i18n.svelte.ts';
+  import { Table } from '#lib/table.svelte.ts';
+  import SortTh from '#lib/SortTh.svelte';
+  import TableBar from '#lib/TableBar.svelte';
+  import Pager from '#lib/Pager.svelte';
 
   let ca = $state<CaStatus | null>(null);
   let error = $state('');
@@ -38,6 +42,12 @@
 
   const short = (d: string) => (d ? d.slice(0, 12) : t('not known'));
   const moved = $derived(ca ? ca.holders.filter((h) => h.issuer === ca?.digest).length : 0);
+  // The CA's holders, a row each, by name; sorted on their CA, those still
+  // to move come together during a rotation.
+  const holders = new Table(() => ca?.holders ?? [], {
+    sorts: { name: (h) => h.name, kind: (h) => h.kind, issuer: (h) => h.issuer },
+    sortBy: 'name'
+  });
 
   async function rotate() {
     if (
@@ -146,10 +156,17 @@
       })}
     {/if}
   </p>
+  <TableBar table={holders} label={t('Search holders')} />
   <table>
-    <thead><tr><th>{t('Holder')}</th><th>{t('Kind')}</th><th>{t('Its CA')}</th></tr></thead>
+    <thead>
+      <tr>
+        <SortTh table={holders} col="name">{t('Holder')}</SortTh>
+        <SortTh table={holders} col="kind">{t('Kind')}</SortTh>
+        <SortTh table={holders} col="issuer">{t('Its CA')}</SortTh>
+      </tr>
+    </thead>
     <tbody>
-      {#each ca.holders as h (h.kind + h.name)}
+      {#each holders.rows as h (h.kind + h.name)}
         <tr>
           <td>{h.name}</td>
           <td>{h.kind}</td>
@@ -162,6 +179,7 @@
       {/each}
     </tbody>
   </table>
+  <Pager table={holders} label={t('Holders')} />
   <div class="controls">
     <button class="danger" disabled={!!ca.previous || !session.me?.all} onclick={rotate}
       >{t('Rotate the CA')}</button

@@ -118,8 +118,8 @@
           {#each parts(n) as p (p.label)}
             <tr>
               <th scope="row">{#if p.href}<a href={p.href}>{p.label}</a>{:else}{p.label}{/if}</th>
-              <td class="mono">{bytes(p.used)}</td>
-              <td class="mono">{pct(p.used, used)}%</td>
+              <td>{bytes(p.used)}</td>
+              <td>{pct(p.used, used)}%</td>
               <td>
                 {#if p.reclaim}
                   <button
@@ -135,7 +135,7 @@
           {#if n.build_bytes}
             <tr>
               <th scope="row">{t('Build store (jailer, beside Legion’s)')}</th>
-              <td class="mono">{bytes(n.build_bytes)}</td>
+              <td>{bytes(n.build_bytes)}</td>
               <td></td>
               <td>
                 <button

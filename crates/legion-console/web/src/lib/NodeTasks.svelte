@@ -3,6 +3,10 @@
   import { api, bytes, follow, type LObject } from './api.ts';
   import { tone } from './columns.ts';
   import { t } from './i18n.svelte.ts';
+  import { Table } from './table.svelte.ts';
+  import SortTh from './SortTh.svelte';
+  import TableBar from './TableBar.svelte';
+  import Pager from './Pager.svelte';
 
   let { node }: { node: LObject } = $props();
   const name = $derived(node.metadata.name);
@@ -55,6 +59,22 @@
   );
   const running = $derived(tasks.filter((t) => t.status?.state === 'running').length);
   const alloc = $derived(node.status?.allocatable);
+
+  // The tasks by name; CPU and memory sort as numbers, a task not reported
+  // on below every one that is.
+  const used = (x: LObject) => use[`${x.metadata.namespace}/${x.metadata.name}`];
+  const table = new Table(() => tasks, {
+    sorts: {
+      name: (x) => x.metadata.name,
+      namespace: (x) => x.metadata.namespace ?? '',
+      state: (x) => x.status?.state ?? '',
+      ip: (x) => x.status?.ip ?? '',
+      cpu: (x) => used(x)?.cpu ?? -1,
+      memory: (x) => used(x)?.memory ?? -1
+    },
+    sortBy: 'name',
+    text: (x) => `${x.metadata.name} ${x.metadata.namespace ?? ''} ${x.status?.state ?? ''} ${x.status?.ip ?? ''}`
+  });
 </script>
 
 <div class="cards">
@@ -78,31 +98,35 @@
 {#if error}<p class="error" role="alert">{error}</p>{/if}
 
 {#if tasks.length}
+  <TableBar {table} label={t('Search tasks')} />
   <table>
     <thead>
       <tr>
-        <th>{t('Task')}</th>
-        <th>{t('Namespace')}</th>
-        <th>{t('State')}</th>
-        <th>{t('IP')}</th>
-        <th>{t('CPU')}</th>
-        <th>{t('Memory')}</th>
+        <SortTh {table} col="name">{t('Task')}</SortTh>
+        <SortTh {table} col="namespace">{t('Namespace')}</SortTh>
+        <SortTh {table} col="state">{t('State')}</SortTh>
+        <SortTh {table} col="ip">{t('IP')}</SortTh>
+        <SortTh {table} col="cpu">{t('CPU')}</SortTh>
+        <SortTh {table} col="memory">{t('Memory')}</SortTh>
       </tr>
     </thead>
     <tbody>
-      {#each tasks as t (t.metadata.uid)}
-        {@const u = use[`${t.metadata.namespace}/${t.metadata.name}`]}
+      {#each table.rows as task (task.metadata.uid)}
+        {@const u = used(task)}
         <tr>
-          <td><a href="/k/Task/{t.metadata.namespace}/{t.metadata.name}">{t.metadata.name}</a></td>
-          <td>{t.metadata.namespace}</td>
-          <td><span class="state {tone(t.status?.state ?? '')}">{t.status?.state ?? ''}</span></td>
-          <td>{t.status?.ip ?? ''}</td>
+          <td><a href="/k/Task/{task.metadata.namespace}/{task.metadata.name}">{task.metadata.name}</a></td>
+          <td>{task.metadata.namespace}</td>
+          <td><span class="state {tone(task.status?.state ?? '')}">{task.status?.state ?? ''}</span></td>
+          <td>{task.status?.ip ?? ''}</td>
           <td>{u ? `${u.cpu.toFixed(1)}%` : ''}</td>
           <td>{u ? bytes(u.memory) : ''}</td>
         </tr>
+      {:else}
+        <tr><td colspan="6" class="muted">{t('Nothing matches.')}</td></tr>
       {/each}
     </tbody>
   </table>
+  <Pager {table} label={t('Tasks')} />
 {:else if !error}
   <p class="empty">{t('No tasks on this node.')}</p>
 {/if}

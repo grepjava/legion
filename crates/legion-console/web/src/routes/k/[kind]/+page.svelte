@@ -4,6 +4,8 @@
   import { api, follow, removal, type LObject } from '#lib/api.ts';
   import { ask } from '#lib/confirm.svelte.ts';
   import RowDetail from '#lib/RowDetail.svelte';
+  import Pager from '#lib/Pager.svelte';
+  import { Table } from '#lib/table.svelte.ts';
   import { busyWhile, toast } from '#lib/toast.svelte.ts';
   import { ChevronRight, RotateCw, Trash2, X } from '@lucide/svelte';
   import { columns, tone } from '#lib/columns.ts';
@@ -81,6 +83,16 @@
     );
   });
   const sorted = (col: number) => (sortBy === col ? sortDir : undefined);
+  // Paged as every list is (lib/table.svelte.ts); the filter and the sort
+  // stay this page's own, as the filter takes labels and states.
+  const paged = new Table(() => shown);
+  $effect(() => {
+    void filter;
+    void kind;
+    void sortBy;
+    void sortDir;
+    paged.page = 0;
+  });
 
   // Rows chosen for the toolbar's actions, and rows opened on what they
   // hold; by uid, so a row keeps both as the list changes around it.
@@ -219,7 +231,7 @@
       </tr>
     </thead>
     <tbody>
-      {#each shown as o (o.metadata.uid)}
+      {#each paged.rows as o (o.metadata.uid)}
         {@const open = opened.includes(o.metadata.uid)}
         <tr class:picked={chosen.includes(o.metadata.uid)}>
           <td class="pick">
@@ -255,6 +267,7 @@
       {/each}
     </tbody>
   </table>
+  <Pager table={paged} label={plural(kind)} />
 {:else if !loaded}
   <!-- Rows to come, in the table's shape, until the watch has answered. -->
   <div class="skeleton" role="status" aria-label={t('Loading…')}>

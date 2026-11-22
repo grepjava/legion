@@ -7,6 +7,9 @@
   import { api, bytes, downloads, type FileEntry, type LObject } from '#lib/api.ts';
   import { t } from '#lib/i18n.svelte.ts';
   import { cannotWrite } from '#lib/session.svelte.ts';
+  import { Table } from '#lib/table.svelte.ts';
+  import SortTh from '#lib/SortTh.svelte';
+  import TableBar from '#lib/TableBar.svelte';
 
   let { task }: { task: LObject } = $props();
 
@@ -33,6 +36,23 @@
       .filter(Boolean)
       .map((part, i, all) => ({ part, to: '/' + all.slice(0, i + 1).join('/') }))
   );
+  // A directory's entries searched by name and sorted on a column, all on
+  // one page as a directory is listed; directories stay above the files
+  // whichever way, as the agent lists them (by name, directories first).
+  const table = new Table(() => entries, {
+    sorts: {
+      name: (e) => e.name,
+      size: (e) => (e.kind === 'file' ? e.size : -1),
+      mode: (e) => e.mode,
+      modified: (e) => e.modified
+    },
+    text: (e) => e.name,
+    size: 0
+  });
+  const shown = $derived([
+    ...table.rows.filter((e) => e.kind === 'dir'),
+    ...table.rows.filter((e) => e.kind !== 'dir')
+  ]);
   const join = (dir: string, entry: string) => (dir.endsWith('/') ? dir : dir + '/') + entry;
 
   async function load(to = path) {
@@ -40,6 +60,8 @@
     error = '';
     try {
       entries = (await api.files(ns, name, to, chosen)).entries;
+      // A search made in one directory is not carried into another.
+      if (to !== path) table.search('');
       path = to;
     } catch (err) {
       error = (err as Error).message;
@@ -99,16 +121,17 @@
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   {#if message}<p class="notice" role="status">{message}</p>{/if}
 
+  <TableBar {table} label={t('Search this directory')} />
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
   <div class="table-scroll" tabindex="0" role="region" aria-label={t('Files in {path}', { path })}>
     <table>
       <caption class="sr-only">{t('Files in {path}', { path })}</caption>
       <thead>
         <tr>
-          <th scope="col">{t('Name')}</th>
-          <th scope="col">{t('Size')}</th>
-          <th scope="col">{t('Mode')}</th>
-          <th scope="col">{t('Modified')}</th>
+          <SortTh {table} col="name">{t('Name')}</SortTh>
+          <SortTh {table} col="size">{t('Size')}</SortTh>
+          <SortTh {table} col="mode">{t('Mode')}</SortTh>
+          <SortTh {table} col="modified">{t('Modified')}</SortTh>
         </tr>
       </thead>
       <tbody>
@@ -119,7 +142,7 @@
             </td>
           </tr>
         {/if}
-        {#each entries as e (e.name)}
+        {#each shown as e (e.name)}
           <tr>
             <td class="mono">
               {#if e.kind === 'dir'}
@@ -132,12 +155,16 @@
                 {e.name}
               {/if}
             </td>
-            <td class="mono">{e.kind === 'file' ? bytes(e.size) : ''}</td>
+            <td>{e.kind === 'file' ? bytes(e.size) : ''}</td>
             <td class="mono">{e.mode}</td>
             <td class="mono muted">{new Date(e.modified * 1000).toLocaleString()}</td>
           </tr>
         {:else}
-          <tr><td colspan="4" class="muted">{busy ? t('Reading…') : t('Empty')}</td></tr>
+          <tr>
+            <td colspan="4" class="muted">
+              {busy ? t('Reading…') : entries.length ? t('Nothing matches.') : t('Empty')}
+            </td>
+          </tr>
         {/each}
       </tbody>
     </table>

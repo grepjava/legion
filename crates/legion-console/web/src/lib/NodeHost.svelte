@@ -6,9 +6,11 @@
   // `legion node errors-seen` and `legion node scrub` do.
   import { api, bytes, loadText, type LObject } from './api.ts';
   import { ask } from './confirm.svelte.ts';
-  import { t } from './i18n.svelte.ts';
+  import { t, tn } from './i18n.svelte.ts';
   import { cannotWrite } from './session.svelte.ts';
   import { busyWhile, toast } from './toast.svelte.ts';
+  import Tile from './Tile.svelte';
+  import { Activity, Database, Monitor, ShieldCheck } from '@lucide/svelte';
 
   let { node }: { node: LObject } = $props();
   const name = $derived(node.metadata.name);
@@ -122,7 +124,70 @@
       busy = false;
     }
   }
+
+  // The status cards over the details: the host, its pools' health, their
+  // space, and when they were last verified (the stalest pool's scrub).
+  const sizeAll = $derived(pools.reduce((a, p) => a + (p.sizeBytes ?? 0), 0));
+  const usedAll = $derived(pools.reduce((a, p) => a + (p.allocBytes ?? 0), 0));
+  const online = $derived(pools.filter((p) => p.state === 'ONLINE').length);
+  const errorsAll = $derived(pools.reduce((a, p) => a + errors(p), 0));
+  const scrubbing = $derived(pools.some((p) => p.scan?.state === 'scanning'));
+  const lastScrubs = $derived(
+    pools.map((p) => (p.scan?.function === 'scrub' && p.scan.state === 'finished' && p.scan.endMs ? p.scan.endMs : 0))
+  );
+  const never = $derived(lastScrubs.filter((x) => !x).length);
+  // The latest scrub of those scrubbed least lately; pools never scrubbed
+  // are counted apart.
+  const scrubbed = $derived(lastScrubs.filter((x) => x));
+  const stalest = $derived(scrubbed.length ? Math.min(...scrubbed) : 0);
+  const scrubFound = $derived(pools.reduce((a, p) => a + (p.scan?.function === 'scrub' ? (p.scan.errors ?? 0) : 0), 0));
 </script>
+
+<div class="tiles host-tiles">
+  {#if host}
+    <Tile
+      label={t('Host')}
+      icon={Monitor}
+      value={host.release}
+      note={host.bootedMs ? t('Booted {when}', { when: ago(host.bootedMs) }) + (load ? ` · ${t('load {load}', { load })}` : '') : load ? t('load {load}', { load }) : ''}
+    />
+  {/if}
+  {#if pools.length}
+    <Tile
+      label={t('Storage health')}
+      icon={ShieldCheck}
+      value={t('{n} of {total} online', { n: online, total: pools.length })}
+      tone={online < pools.length ? 'bad' : errorsAll > Object.values(seen).reduce((a, n) => a + n, 0) ? 'wait' : 'good'}
+      note={errorsAll ? t('{r} read, {w} write, {c} checksum', {
+        r: pools.reduce((a, p) => a + (p.readErrors ?? 0), 0),
+        w: pools.reduce((a, p) => a + (p.writeErrors ?? 0), 0),
+        c: pools.reduce((a, p) => a + (p.checksumErrors ?? 0), 0)
+      }) : t('No known pool or device errors')}
+    />
+    <Tile
+      label={t('Capacity')}
+      icon={Database}
+      value={t('{pct}% used', { pct: sizeAll ? Math.round((usedAll / sizeAll) * 100) : 0 })}
+      note={t('{used} of {total} · {free} free', { used: bytes(usedAll), total: bytes(sizeAll), free: bytes(sizeAll - usedAll) })}
+      pct={sizeAll ? (usedAll / sizeAll) * 100 : 0}
+      meterLabel={t('Pool space used')}
+    />
+    <Tile
+      label={t('Pool verification')}
+      icon={Activity}
+      value={scrubbing
+        ? t('Scrub running')
+        : never
+          ? tn('1 pool never scrubbed', '{n} pools never scrubbed', never)
+          : scrubFound
+            ? t('Last scrub found errors')
+            : t('Last scrub clean')}
+      tone={scrubFound ? 'bad' : never && !scrubbing ? 'wait' : 'good'}
+      note={(stalest ? t('The stalest pool scrubbed {when}', { when: ago(stalest) }) : '') +
+        (stored ? `${stalest ? ' · ' : ''}${t('every {n} days', { n: stored })}` : `${stalest ? ' · ' : ''}${t('none scheduled')}`)}
+    />
+  {/if}
+</div>
 
 <h2>{t('Host')}</h2>
 {#if host}
@@ -130,7 +195,7 @@
     <dt>{t('FreeBSD')}</dt>
     <dd>{host.release}{#if host.kernel && host.kernel !== host.release}<span class="muted"> · {t('kernel {k}', { k: host.kernel })}</span>{/if}</dd>
     {#if host.boot}<dt>{t('Boot')}</dt><dd>{host.boot}</dd>{/if}
-    {#if load}<dt>{t('Load')}</dt><dd class="mono" title={t('Over 1, 5 and 15 minutes')}>{load}</dd>{/if}
+    {#if load}<dt>{t('Load')}</dt><dd title={t('Over 1, 5 and 15 minutes')}>{load}</dd>{/if}
     {#if host.bootedMs}
       <dt>{t('Up since')}</dt>
       <dd>{new Date(host.bootedMs).toLocaleString()} <span class="muted">({ago(host.bootedMs)})</span></dd>
@@ -214,5 +279,8 @@
   }
   .used .meter {
     flex: 0 0 6rem;
+  }
+  .host-tiles {
+    margin-top: 0.5rem;
   }
 </style>

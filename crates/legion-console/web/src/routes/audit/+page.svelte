@@ -5,6 +5,10 @@
   import { api, type AuditEvent, type AuditFilter } from '#lib/api.ts';
   import { plural } from '#lib/kinds.ts';
   import { t } from '#lib/i18n.svelte.ts';
+  import { Table } from '#lib/table.svelte.ts';
+  import SortTh from '#lib/SortTh.svelte';
+  import TableBar from '#lib/TableBar.svelte';
+  import Pager from '#lib/Pager.svelte';
 
   let filter: AuditFilter = $state({ actor: '', action: '', namespace: '', kind: '', result: '', limit: 200 });
   let events: AuditEvent[] = $state([]);
@@ -42,6 +46,22 @@
     e.target?.kind && e.target?.name
       ? `/k/${e.target.kind}/${e.target.namespace || '_'}/${e.target.name}`
       : null;
+  const who = (e: AuditEvent) => e.actor.name || e.actor.kind;
+  // The filters above ask the managers; the search below looks through
+  // what they answered. Newest first, as a log is read.
+  const table = new Table(() => events, {
+    sorts: {
+      when: (e) => e.timeMs,
+      who,
+      action: (e) => e.action,
+      object: target,
+      result: (e) => e.result,
+      why: (e) => e.message ?? ''
+    },
+    sortBy: 'when',
+    dir: 'descending',
+    text: (e) => `${who(e)} ${e.action} ${target(e)} ${e.result} ${e.message ?? ''}`
+  });
 </script>
 
 <header class="bar"><h1>{t('Audit')}</h1></header>
@@ -70,16 +90,24 @@
 {/if}
 
 {#if events.length}
+  <TableBar {table} label={t('Search audit entries')} />
   <table>
     <thead>
-      <tr><th>{t('When')}</th><th>{t('Who')}</th><th>{t('Action')}</th><th>{t('Object')}</th><th>{t('Result')}</th><th>{t('Why')}</th></tr>
+      <tr>
+        <SortTh {table} col="when">{t('When')}</SortTh>
+        <SortTh {table} col="who">{t('Who')}</SortTh>
+        <SortTh {table} col="action">{t('Action')}</SortTh>
+        <SortTh {table} col="object">{t('Object')}</SortTh>
+        <SortTh {table} col="result">{t('Result')}</SortTh>
+        <SortTh {table} col="why">{t('Why')}</SortTh>
+      </tr>
     </thead>
     <tbody>
-      {#each events as e, i (i)}
+      {#each table.rows as e, i (i)}
         {@const href = link(e)}
         <tr>
           <td>{new Date(e.timeMs).toLocaleString()}</td>
-          <td>{e.actor.name || e.actor.kind}</td>
+          <td>{who(e)}</td>
           <td>{e.action}</td>
           <td>
             {#if href}<a {href}>{target(e)}</a>{:else}{target(e)}{/if}
@@ -88,9 +116,12 @@
           <td><span class="state {tone(e.result)}">{e.result}</span></td>
           <td>{e.message ?? ''}</td>
         </tr>
+      {:else}
+        <tr><td colspan="6" class="muted">{t('Nothing matches.')}</td></tr>
       {/each}
     </tbody>
   </table>
+  <Pager {table} label={t('Audit entries')} />
 {:else if !error && !busy}
   <p class="empty">{t('Nothing matches.')}</p>
 {/if}

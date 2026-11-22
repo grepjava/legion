@@ -7,6 +7,10 @@
   import { api, downloads, type LObject } from './api.ts';
   import { cannotWrite } from './session.svelte.ts';
   import { t, tn } from './i18n.svelte.ts';
+  import { Table } from './table.svelte.ts';
+  import SortTh from './SortTh.svelte';
+  import TableBar from './TableBar.svelte';
+  import Pager from './Pager.svelte';
 
   let { volume }: { volume: LObject } = $props();
   const ns = $derived(volume.metadata.namespace ?? '');
@@ -25,6 +29,8 @@
   let snapshots: string[] = $state([]);
   let snapLoading = $state(false);
   let newSnap = $state('');
+  // In the order ZFS made them, oldest first, until sorted by name.
+  const table = new Table(() => snapshots, { sorts: { name: (s) => s } });
 
   async function loadSnapshots() {
     if (driver !== 'zfs' || !placedNode || lost) {
@@ -167,16 +173,17 @@
     </form>
 
     {#if snapshots.length}
+      <TableBar {table} label={t('Search snapshots')} />
       <table>
         <caption class="sr-only">{t('ZFS snapshots of {name}', { name })}</caption>
         <thead>
           <tr>
-            <th scope="col">{t('Snapshot')}</th>
+            <SortTh {table} col="name">{t('Snapshot')}</SortTh>
             <th scope="col">{t('Actions')}</th>
           </tr>
         </thead>
         <tbody>
-          {#each snapshots as snap (snap)}
+          {#each table.rows as snap (snap)}
             <tr>
               <td class="mono">@{snap}</td>
               <td class="controls">
@@ -200,9 +207,12 @@
                 </button>
               </td>
             </tr>
+          {:else}
+            <tr><td colspan="2" class="muted">{t('Nothing matches.')}</td></tr>
           {/each}
         </tbody>
       </table>
+      <Pager {table} label={t('Snapshots')} />
     {:else if !snapLoading}
       <p class="empty">{t('No ZFS snapshots yet.')}</p>
     {/if}

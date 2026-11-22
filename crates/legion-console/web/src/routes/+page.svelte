@@ -1,7 +1,8 @@
 <script lang="ts">
-  // Mission-Control Overview HUD: 4-subsystem live telemetry (CPU, Memory,
-  // ZFS pool, Network RX/TX), Node heatmap matrix, CARP VIP ownership,
-  // active jail workloads with 1-click Workbench docking, and Quotas.
+  // The Overview: the cluster's health in a word; a status card for each
+  // thing it has (nodes, managers, workloads, CPU, memory, storage,
+  // network); their history over a range picked; each node's share used;
+  // CARP addresses; tasks needing attention and those running; quotas.
   import {
     alertHref,
     api,
@@ -20,7 +21,23 @@
   import { t, tn } from '#lib/i18n.svelte.ts';
   import { cannotWrite, openWorkbench, session } from '#lib/session.svelte.ts';
   import Ico from '#lib/Ico.svelte';
-  import { CircleCheck, OctagonX, TriangleExclamationPoint } from '@lucide/svelte';
+  import Tile from '#lib/Tile.svelte';
+  import { Table } from '#lib/table.svelte.ts';
+  import SortTh from '#lib/SortTh.svelte';
+  import TableBar from '#lib/TableBar.svelte';
+  import Pager from '#lib/Pager.svelte';
+  import {
+    ArrowDownUp,
+    Boxes,
+    CircleCheck,
+    Cpu,
+    Crown,
+    HardDrive,
+    MemoryStick,
+    OctagonX,
+    Server,
+    TriangleExclamationPoint
+  } from '@lucide/svelte';
 
   let status: Status | null = $state(null);
   let statusError = $state('');
@@ -112,6 +129,41 @@
   }
 
   const live = $derived(tasks.filter((task) => task.spec?.desiredState === 'running'));
+
+  // The tables under the cards: the CARP addresses by Service; the tasks
+  // needing attention, the failed before the pending; the running tasks by
+  // name, twelve a page. An address sorts by its numbers.
+  const taskName = (task: LObject) => `${task.metadata.namespace ?? ''}/${task.metadata.name}`;
+  const vipTable = new Table(() => balancers, {
+    sorts: {
+      service: (b) => b.service,
+      address: (b) => b.address,
+      vhid: (b) => b.vhid,
+      nodes: (b) => b.nodes.find((n) => n.state === 'master')?.node ?? ''
+    },
+    sortBy: 'service',
+    text: (b) => `${b.service} ${b.address} ${b.vhid} ${b.nodes.map((n) => n.node).join(' ')}`
+  });
+  const attention = $derived(live.filter((task) => ['pending', 'failed'].includes(task.status?.state)));
+  const attentionTable = new Table(() => attention, {
+    sorts: {
+      task: taskName,
+      state: (task) => task.status?.state ?? '',
+      why: (task) => task.status?.message ?? ''
+    },
+    sortBy: 'state'
+  });
+  const running = $derived(live.filter((task) => task.status?.state === 'running'));
+  const runningTable = new Table(() => running, {
+    sorts: {
+      task: taskName,
+      service: (task) => task.spec?.service ?? '',
+      node: (task) => task.spec?.node ?? '',
+      address: (task) => task.status?.ip ?? ''
+    },
+    sortBy: 'task',
+    size: 12
+  });
   const usageByNode = $derived(new Map(nodeUsage.map((n) => [n.node, n])));
 
   const totals = $derived.by(() => {
@@ -186,9 +238,7 @@
     >
   {/if}
   <div class="controls">
-    <a class="button sm" href="/volumes">{t('Volumes Studio')}</a>
-    <a class="button sm" href="/images">{t('Images & GHCR Hub')}</a>
-    <a class="button sm primary" href="/deploy">{t('Deploy')}</a>
+    <a class="button primary" href="/deploy">{t('Deploy')}</a>
   </div>
 </header>
 
@@ -224,35 +274,6 @@
         </dd>
       </div>
     {/if}
-    {#if session.me?.all}
-      <div>
-        <dt>{t('Nodes')}</dt>
-        <dd>
-          <span class="good">{t('{n} ready', { n: nodes.length - notReady.length })}</span>
-          {#if notReady.length}· <span class="bad">{t('{n} not', { n: notReady.length })}</span>{/if}
-        </dd>
-      </div>
-    {/if}
-    {#if session.me?.all && capacity.cpu > 0}
-      <div>
-        <dt>{t('CPU')}</dt>
-        <dd title={t('What tasks use now, of the CPU the nodes offer them')}>
-          {t('{pct}% of {n} cores', { pct: pct(totals.cpu / 100, capacity.cpu), n: capacity.cpu })}
-        </dd>
-      </div>
-      <div>
-        <dt>{t('Memory')}</dt>
-        <dd>{t('{used} of {total}', { used: bytes(totals.mem), total: bytes(capacity.mem) })}</dd>
-      </div>
-      {#if capacity.disk > 0}
-        <div>
-          <dt>{t('Disk')}</dt>
-          <dd title={t('All the nodes’ pools together')}>
-            {t('{pct}% of {total}', { pct: pct(capacity.diskUsed, capacity.disk), total: bytes(capacity.disk) })}
-          </dd>
-        </div>
-      {/if}
-    {/if}
     <div>
       <dt>{t('Alerts')}</dt>
       <dd>
@@ -279,137 +300,186 @@
   </section>
 {/if}
 
-<section class="cards">
-  <div class="card">
-    <h2>{t('Managers')}</h2>
-    {#if status}
-      <p>
-        <span class="state {status.leader ? 'good' : 'bad'}"
-          >{status.leader ? t('leader elected') : t('no leader')}</span
-        >
-        {t('term {term}, store version {version}', {
+<!-- The cluster at a glance: a card for each thing it has, with the
+     figure to read, what it means, a meter where it is a share, and where
+     more is shown. -->
+<div class="tiles">
+  {#if session.me?.all}
+    <Tile
+      label={t('Nodes')}
+      icon={Server}
+      value={t('{ready} of {n} ready', { ready: nodes.length - notReady.length, n: nodes.length })}
+      tone={notReady.length ? 'bad' : nodes.length ? 'good' : ''}
+      note={notReady.length
+        ? t('Not ready: {names}', { names: notReady.map((n) => n.metadata.name).join(', ') })
+        : t('Every node takes tasks.')}
+      href="/k/Node"
+      more={t('All nodes')}
+    />
+  {/if}
+  <Tile
+    label={t('Managers')}
+    icon={Crown}
+    value={status ? (status.leader ? t('Leader elected') : t('No leader')) : '…'}
+    tone={status ? (status.leader ? 'good' : 'bad') : ''}
+    note={status
+      ? t('{n} of them, term {term}, store version {version}', {
+          n: status.members.length,
           term: status.term,
           version: status.version
-        })}
-      </p>
-      <ul class="plain">
+        })
+      : statusError}
+    href={session.me?.all ? '/cluster' : ''}
+    more={t('Operations')}
+  >
+    {#if status}
+      <ul class="plain managers">
         {#each status.members as m (m.id)}
-          <li class="mono">
-            {m.addr}
+          <li>
+            <span class="mono">{m.addr}</span>
             {#if m.id === status.leader}<span class="tag">{t('leader')}</span>{/if}
             {#if !m.voter}<span class="tag">{t('learner')}</span>{/if}
           </li>
         {/each}
       </ul>
-    {:else if statusError}
-      <p class="error" role="alert">{statusError}</p>
-    {:else}
-      <p>…</p>
     {/if}
-  </div>
-
-  {#if session.me?.all}
-    <div class="card">
-      <h2><a href="/k/Node">{t('Nodes')}</a></h2>
-      <p class="big">{nodes.length}</p>
-      {#each count(nodes, (n) => n.status?.state) as [state, n] (state)}
-        <span class="state {tone(state)}">{n} {state}</span>
-      {/each}
-      {#if errors.Node}<p class="error" role="alert">{errors.Node}</p>{/if}
-    </div>
+  </Tile>
+  <Tile
+    label={t('Workloads')}
+    icon={Boxes}
+    value={tn('1 service', '{n} services', services.length)}
+    note={[
+      t('{n} tasks running', { n: live.filter((x) => x.status?.state === 'running').length }),
+      ...count(live, (x) => x.status?.state)
+        .filter(([state]) => state !== 'running')
+        .map(([state, n]) => `${n} ${state}`),
+      tn('1 Volume', '{n} Volumes', volumes.length)
+    ].join(' · ')}
+    tone={live.some((x) => x.status?.state === 'failed') ? 'bad' : ''}
+    href="/k/Service"
+    more={t('Services')}
+  />
+  {#if session.me?.all && capacity.cpu > 0}
+    <Tile
+      label={t('CPU')}
+      icon={Cpu}
+      value={t('{pct}% used', { pct: pct(totals.cpu / 100, capacity.cpu) })}
+      note={t('{used} of {n} cores, by tasks now', { used: (totals.cpu / 100).toFixed(1), n: capacity.cpu })}
+      pct={(totals.cpu / 100 / capacity.cpu) * 100}
+      meterLabel={t('CPU used')}
+    />
+    <Tile
+      label={t('Memory')}
+      icon={MemoryStick}
+      value={t('{pct}% used', { pct: pct(totals.mem, capacity.mem) })}
+      note={t('{used} of {total}, by tasks now', { used: bytes(totals.mem), total: bytes(capacity.mem) })}
+      pct={capacity.mem ? (totals.mem / capacity.mem) * 100 : 0}
+      meterLabel={t('Memory used')}
+    />
+  {:else}
+    <Tile
+      label={t('CPU')}
+      icon={Cpu}
+      value={`${totals.cpu.toFixed(1)}%`}
+      note={t('Of one CPU, by the tasks you can see')}
+    />
+    <Tile label={t('Memory')} icon={MemoryStick} value={bytes(totals.mem)} note={t('Used by the tasks you can see')} />
   {/if}
+  {#if session.me?.all && capacity.disk > 0}
+    <Tile
+      label={t('Storage')}
+      icon={HardDrive}
+      value={t('{pct}% used', { pct: pct(capacity.diskUsed, capacity.disk) })}
+      note={t('{used} of {total} in the nodes’ pools', { used: bytes(capacity.diskUsed), total: bytes(capacity.disk) })}
+      pct={(capacity.diskUsed / capacity.disk) * 100}
+      meterLabel={t('Pool space used')}
+      href="/volumes"
+      more={t('Volumes')}
+    />
+  {:else if totals.zfsUsed + totals.zfsAvail > 0}
+    <Tile
+      label={t('Storage')}
+      icon={HardDrive}
+      value={t('{pct}% used', { pct: pct(totals.zfsUsed, totals.zfsUsed + totals.zfsAvail) })}
+      note={t('{used} of {total} in the pools', {
+        used: bytes(totals.zfsUsed),
+        total: bytes(totals.zfsUsed + totals.zfsAvail)
+      })}
+      pct={(totals.zfsUsed / (totals.zfsUsed + totals.zfsAvail)) * 100}
+      meterLabel={t('Pool space used')}
+      href="/volumes"
+      more={t('Volumes')}
+    />
+  {/if}
+  {#if totals.rx + totals.tx > 0}
+    <Tile
+      label={t('Network')}
+      icon={ArrowDownUp}
+      value={`${bytes(totals.rx + totals.tx)}/s`}
+      note={t('{rx}/s in, {tx}/s out, over every node now', { rx: bytes(totals.rx), tx: bytes(totals.tx) })}
+      href="/network"
+      more={t('Network')}
+    />
+  {/if}
+</div>
 
-  <div class="card">
-    <h2><a href="/k/Service">{t('Services')}</a></h2>
-    <p class="big">{services.length}</p>
-    <p class="muted">
-      <a href="/volumes">{tn('1 ZFS/storage volume', '{n} ZFS/storage volumes', volumes.length)}</a>
-    </p>
-    {#if errors.Service}<p class="error" role="alert">{errors.Service}</p>{/if}
-  </div>
-
-  <div class="card">
-    <h2><a href="/k/Task">{t('Tasks')}</a></h2>
-    <p class="big">{live.length}</p>
-    {#each count(live, (task) => task.status?.state) as [state, n] (state)}
-      <span class="state {tone(state)}">{n} {state}</span>
-    {/each}
-    {#if errors.Task}<p class="error" role="alert">{errors.Task}</p>{/if}
-  </div>
-
-  <div class="card">
-    <h2>{t('Live telemetry')}</h2>
-    <dl class="facts compact-facts">
-      <dt>{t('CPU')}</dt>
-      <dd class="mono">{totals.cpu.toFixed(1)}%</dd>
-      <dt>{t('Memory')}</dt>
-      <dd class="mono">{bytes(totals.mem)}</dd>
-      {#if totals.zfsUsed + totals.zfsAvail > 0}
-        <dt>{t('ZFS pool')}</dt>
-        <dd class="mono">
-          {bytes(totals.zfsUsed)} / {bytes(totals.zfsUsed + totals.zfsAvail)}
-        </dd>
-      {/if}
-      {#if totals.rx + totals.tx > 0}
-        <dt>{t('Net RX / TX')}</dt>
-        <dd class="mono">{bytes(totals.rx)}/s · {bytes(totals.tx)}/s</dd>
-      {/if}
-    </dl>
-  </div>
-</section>
-
-<h2>{t('Telemetry history (1h)')}</h2>
-<UsageCharts namespace={session.namespace} compact={true} />
+<UsageCharts namespace={session.namespace} compact={true} heading={t('History')} />
 
 {#if session.me?.all && nodes.length}
-  <h2>{t('Node heatmap')}</h2>
+  <h2>{t('Nodes')}</h2>
   <section class="cards">
     {#each nodes as n (n.metadata.name)}
       {@const nu = usageByNode.get(n.metadata.name)}
       {@const nCpu = nu ? nu.tasks.reduce((a, x) => a + x.cpu_percent, 0) : 0}
       {@const nMem = nu ? nu.tasks.reduce((a, x) => a + x.memory_bytes, 0) : 0}
+      {@const cpuCap = cores(n.status?.allocatable?.cpu)}
+      {@const memCap = byteCount(n.status?.allocatable?.memory)}
       {@const zUsed = nu?.zfs_used_bytes ?? 0}
       {@const zTot = zUsed + (nu?.zfs_avail_bytes ?? 0)}
-      {@const zPct = zTot > 0 ? Math.min(100, Math.round((zUsed / zTot) * 100)) : 0}
+      {@const shares = [
+        { label: t('CPU'), text: cpuCap ? `${pct(nCpu / 100, cpuCap)}%` : `${nCpu.toFixed(1)}%`, share: cpuCap ? (nCpu / 100 / cpuCap) * 100 : undefined },
+        { label: t('Memory'), text: bytes(nMem), share: memCap ? (nMem / memCap) * 100 : undefined },
+        ...(zTot > 0 ? [{ label: t('ZFS'), text: `${bytes(zUsed)} / ${bytes(zTot)}`, share: (zUsed / zTot) * 100 }] : [])
+      ]}
       <div class="card node-tile">
         <div class="node-head">
-          <strong><a href="/k/Node/_/{n.metadata.name}">{n.metadata.name}</a></strong>
+          <h3><a href="/k/Node/_/{n.metadata.name}">{n.metadata.name}</a></h3>
           <span class="state {tone(n.status?.state)}">{n.status?.state ?? '—'}</span>
         </div>
-        <p class="muted mono node-sub">
-          {n.spec?.role ?? 'worker'} · {n.status?.addr ?? ''}
+        <p class="muted node-sub">
+          {n.spec?.role ?? 'worker'} · <span class="mono">{n.status?.addr ?? ''}</span>
           {#if n.spec?.availability && n.spec.availability !== 'active'}
             · <span class="wait">{n.spec.availability}</span>
           {/if}
         </p>
-        <dl class="facts compact-facts">
-          <dt>{t('CPU')}</dt>
-          <dd class="mono">{nCpu.toFixed(1)}%</dd>
-          <dt>{t('Memory')}</dt>
-          <dd class="mono">{bytes(nMem)}</dd>
-          {#if loadText(nu?.load)}
-            <dt>{t('Load')}</dt>
-            <dd class="mono" title={t('Over 1, 5 and 15 minutes')}>{loadText(nu?.load)}</dd>
-          {/if}
-          <dt>{t('Tasks')}</dt>
-          <dd class="mono">{nu?.tasks.length ?? 0}</dd>
-          {#if zTot > 0}
-            <dt>{t('ZFS')}</dt>
-            <dd class="mono">{bytes(zUsed)} ({zPct}%)</dd>
-          {/if}
+        <ul class="plain node-meters">
+          {#each shares as m (m.label)}
+            <li>
+              <span class="what">{m.label}</span>
+              <span class="figure">{m.text}</span>
+              {#if m.share !== undefined}
+                {@const f = Math.min(100, Math.max(0, m.share))}
+                <div
+                  class="meter"
+                  role="meter"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={Math.round(f)}
+                  aria-label={t('{what} on {node}', { what: m.label, node: n.metadata.name })}
+                >
+                  <div class="meter-fill {f >= 90 ? 'bad' : f >= 75 ? 'wait' : 'good'}" style:width="{f}%"></div>
+                </div>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+        <p class="muted node-sub">
+          {tn('1 task', '{n} tasks', nu?.tasks.length ?? 0)}
+          {#if loadText(nu?.load)}· <span title={t('Over 1, 5 and 15 minutes')}>{t('load {load}', { load: loadText(nu?.load) })}</span>{/if}
           {#if (nu?.net_rx_bps ?? 0) + (nu?.net_tx_bps ?? 0) > 0}
-            <dt>{t('Net')}</dt>
-            <dd class="mono">↓{bytes(nu?.net_rx_bps ?? 0)}/s ↑{bytes(nu?.net_tx_bps ?? 0)}/s</dd>
+            · ↓{bytes(nu?.net_rx_bps ?? 0)}/s ↑{bytes(nu?.net_tx_bps ?? 0)}/s
           {/if}
-        </dl>
-        {#if zTot > 0}
-          <div class="meter" role="img" aria-label={t('ZFS usage {pct}%', { pct: zPct })}>
-            <div
-              class="meter-fill {zPct >= 90 ? 'bad' : zPct >= 75 ? 'wait' : 'zfs'}"
-              style:width="{zPct}%"
-            ></div>
-          </div>
-        {/if}
+        </p>
       </div>
     {/each}
   </section>
@@ -417,22 +487,23 @@
 
 {#if balancers.length}
   <h2>{t('CARP virtual IPs')}</h2>
+  <TableBar table={vipTable} label={t('Search virtual IPs')} />
   <table>
     <caption class="sr-only">{t('CARP load balancers')}</caption>
     <thead>
       <tr>
-        <th scope="col">{t('Service')}</th>
-        <th scope="col">{t('Address')}</th>
-        <th scope="col">{t('VHID')}</th>
-        <th scope="col">{t('Nodes')}</th>
+        <SortTh table={vipTable} col="service">{t('Service')}</SortTh>
+        <SortTh table={vipTable} col="address">{t('Address')}</SortTh>
+        <SortTh table={vipTable} col="vhid">{t('VHID')}</SortTh>
+        <SortTh table={vipTable} col="nodes">{t('Nodes')}</SortTh>
       </tr>
     </thead>
     <tbody>
-      {#each balancers as b (b.service + b.address)}
+      {#each vipTable.rows as b (b.service + b.address)}
         <tr>
           <td><a href="/k/Service/{session.namespace}/{b.service}">{b.service}</a></td>
           <td class="mono">{b.address}</td>
-          <td class="mono">{b.vhid}</td>
+          <td>{b.vhid}</td>
           <td>
             {#each b.nodes as n (n.node)}
               <span class="state {n.state === 'master' ? 'good' : 'wait'}">
@@ -441,25 +512,29 @@
             {/each}
           </td>
         </tr>
+      {:else}
+        <tr><td colspan="4" class="muted">{t('Nothing matches.')}</td></tr>
       {/each}
     </tbody>
   </table>
+  <Pager table={vipTable} label={t('Virtual IPs')} />
 {/if}
 
-{#if live.some((task) => task.status?.state === 'pending' || task.status?.state === 'failed')}
+{#if attention.length}
   <h2>{t('Needs attention')}</h2>
+  <TableBar table={attentionTable} label={t('Search tasks needing attention')} />
   <table>
     <caption class="sr-only">{t('Tasks needing attention')}</caption>
     <thead>
       <tr>
-        <th scope="col">{t('Task')}</th>
-        <th scope="col">{t('State')}</th>
-        <th scope="col">{t('Why')}</th>
+        <SortTh table={attentionTable} col="task">{t('Task')}</SortTh>
+        <SortTh table={attentionTable} col="state">{t('State')}</SortTh>
+        <SortTh table={attentionTable} col="why">{t('Why')}</SortTh>
         <th scope="col">{t('Workbench')}</th>
       </tr>
     </thead>
     <tbody>
-      {#each live.filter((task) => ['pending', 'failed'].includes(task.status?.state)) as task (task.metadata.uid)}
+      {#each attentionTable.rows as task (task.metadata.uid)}
         <tr>
           <td>
             <a href="/k/Task/{task.metadata.namespace}/{task.metadata.name}">
@@ -480,26 +555,30 @@
             </button>
           </td>
         </tr>
+      {:else}
+        <tr><td colspan="4" class="muted">{t('Nothing matches.')}</td></tr>
       {/each}
     </tbody>
   </table>
+  <Pager table={attentionTable} label={t('Tasks needing attention')} />
 {/if}
 
-{#if live.some((task) => task.status?.state === 'running')}
+{#if running.length}
   <h2>{t('Running jail tasks')}</h2>
+  <TableBar table={runningTable} label={t('Search running tasks')} />
   <table>
     <caption class="sr-only">{t('Running jail tasks')}</caption>
     <thead>
       <tr>
-        <th scope="col">{t('Task')}</th>
-        <th scope="col">{t('Service')}</th>
-        <th scope="col">{t('On node')}</th>
-        <th scope="col">{t('Address')}</th>
+        <SortTh table={runningTable} col="task">{t('Task')}</SortTh>
+        <SortTh table={runningTable} col="service">{t('Service')}</SortTh>
+        <SortTh table={runningTable} col="node">{t('On node')}</SortTh>
+        <SortTh table={runningTable} col="address">{t('Address')}</SortTh>
         <th scope="col">{t('Workbench')}</th>
       </tr>
     </thead>
     <tbody>
-      {#each live.filter((task) => task.status?.state === 'running').slice(0, 12) as task (task.metadata.uid)}
+      {#each runningTable.rows as task (task.metadata.uid)}
         <tr>
           <td>
             <a href="/k/Task/{task.metadata.namespace}/{task.metadata.name}">
@@ -531,9 +610,12 @@
             </button>
           </td>
         </tr>
+      {:else}
+        <tr><td colspan="5" class="muted">{t('Nothing matches.')}</td></tr>
       {/each}
     </tbody>
   </table>
+  <Pager table={runningTable} label={t('Running jail tasks')} />
 {/if}
 
 <h2>{t('Quotas')}</h2>
@@ -544,19 +626,50 @@
     margin-bottom: 0.85rem;
     border-color: var(--wait);
   }
-  .compact-facts {
-    font-size: 0.82rem;
-    gap: 0.2rem 0.9rem;
-    margin: 0.25rem 0 0.45rem;
-  }
   .node-head {
     display: flex;
     justify-content: space-between;
     align-items: center;
     gap: 0.5rem;
   }
+  .node-head h3 {
+    margin: 0;
+    font-size: 1rem;
+  }
+  .node-head h3 a {
+    color: var(--text);
+    text-decoration: none;
+  }
+  .node-head h3 a:hover {
+    color: var(--link);
+    text-decoration: underline;
+  }
   .node-sub {
-    font-size: 0.78rem;
-    margin: 0.15rem 0 0.4rem;
+    font-size: 0.8rem;
+    margin: 0.15rem 0 0.5rem;
+  }
+  .node-meters {
+    display: grid;
+    gap: 0.5rem;
+    margin: 0 0 0.5rem;
+  }
+  .node-meters > li {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 0.15rem 0.5rem;
+    font-size: 0.84rem;
+  }
+  .node-meters .what {
+    color: var(--muted);
+  }
+  .node-meters .figure {
+    font-weight: 600;
+  }
+  .node-meters .meter {
+    grid-column: 1 / -1;
+  }
+  .managers {
+    font-size: 0.8rem;
+    margin-top: 0.2rem;
   }
 </style>

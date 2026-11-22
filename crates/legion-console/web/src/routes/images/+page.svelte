@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Tabs from '#lib/Tabs.svelte';
   import { ask } from '#lib/confirm.svelte.ts';
   // Docker-Desktop Jail Images & GHCR Packaging Hub:
   // 1) Cluster Node Images: cached OCI jail images across nodes, .tar export,
@@ -24,6 +25,10 @@
   import { tone } from '#lib/columns.ts';
   import ImageDetails from '#lib/ImageDetails.svelte';
   import { t, tn } from '#lib/i18n.svelte.ts';
+  import { Table } from '#lib/table.svelte.ts';
+  import SortTh from '#lib/SortTh.svelte';
+  import TableBar from '#lib/TableBar.svelte';
+  import Pager from '#lib/Pager.svelte';
   import { cannotWrite, namespaces, openWorkbench, session } from '#lib/session.svelte.ts';
 
   type TabId = 'nodes' | 'search' | 'package';
@@ -34,7 +39,6 @@
   const askedTab = fromAddress('tab');
   let tab: TabId = $state(TABS.find((x) => x === askedTab) ?? firstTab);
   keepInAddress('tab', () => tab, firstTab);
-  let tablist: HTMLElement | undefined = $state();
 
   let adminNamespaces: string[] = $state([]);
   let nodes: LObject[] = $state([]);
@@ -85,24 +89,6 @@
     ]
   );
 
-  function tabKey(e: KeyboardEvent) {
-    const i = tabs.findIndex((x) => x.id === tab);
-    const to =
-      e.key === 'ArrowRight'
-        ? (i + 1) % tabs.length
-        : e.key === 'ArrowLeft'
-          ? (i - 1 + tabs.length) % tabs.length
-          : e.key === 'Home'
-            ? 0
-            : e.key === 'End'
-              ? tabs.length - 1
-              : -1;
-    if (to < 0) return;
-    e.preventDefault();
-    tab = tabs[to].id;
-    tablist?.querySelectorAll<HTMLElement>('[role="tab"]')[to]?.focus();
-  }
-
   function lightDismiss(e: MouseEvent, dlg: HTMLDialogElement | undefined) {
     if (!dlg || 'closedBy' in HTMLDialogElement.prototype) return;
     if (e.target !== dlg) return;
@@ -119,7 +105,6 @@
   let cached: CachedNodeImage[] = $state([]);
   let loadingImages = $state(false);
   let nodeFilter = $state('');
-  let imageFilter = $state('');
   let pullRef = $state('');
   let pullNode = $state('');
   let pullSecret = $state('');
@@ -150,16 +135,22 @@
   // Jails, bhyve VMs (`legion.vm.image`), or both, as the node says.
   let kindFilter: 'all' | 'jail' | 'vm' = $state('all');
 
-  const shownImages = $derived.by(() => {
-    const q = imageFilter.trim().toLowerCase();
-    return cached.filter(
-      (i) =>
-        (kindFilter === 'all' || (kindFilter === 'vm') === !!i.vm) &&
-        (!q ||
-          i.reference.toLowerCase().includes(q) ||
-          i.node.toLowerCase().includes(q) ||
-          i.digest.toLowerCase().includes(q))
-    );
+  const shownImages = $derived(
+    cached.filter((i) => kindFilter === 'all' || (kindFilter === 'vm') === !!i.vm)
+  );
+  // Those of the kind chosen, by reference; the search looks in the
+  // reference, the node and the digest.
+  const imageTable = new Table(() => shownImages, {
+    sorts: {
+      reference: (i) => i.reference,
+      node: (i) => i.node,
+      platform: (i) => `${i.os}/${i.arch}`,
+      layers: (i) => i.layers,
+      used: (i) => i.used_by.join(', '),
+      digest: (i) => i.digest
+    },
+    sortBy: 'reference',
+    text: (i) => `${i.reference} ${i.node} ${i.digest}`
   });
 
   async function pullImage(e: SubmitEvent) {
@@ -410,6 +401,17 @@
   let pkgSecret = $state('');
   let pkgRolloutService = $state('');
 
+  // The namespace's Build runs, newest first as they came until a header
+  // sorts them; a page holds 15, as many as the card showed before.
+  const buildTable = new Table(() => builds, {
+    sorts: {
+      build: (b) => b.metadata.name,
+      image: (b) => b.spec?.image ?? '',
+      phase: (b) => b.status?.phase ?? 'Pending'
+    },
+    size: 15
+  });
+
   async function startPackageBuild(e: SubmitEvent) {
     e.preventDefault();
     error = '';
@@ -522,7 +524,7 @@
 </script>
 
 <header class="bar">
-  <h1>{t('Images & GHCR Hub')}</h1>
+  <h1>{t('Images')}</h1>
   <div class="controls">
     <button type="button" class="sm" onclick={() => secretDialog?.showModal()}>
       {t('Add GHCR / Registry Login')}
@@ -538,23 +540,9 @@
 {#if error}<p class="error" role="alert">{error}</p>{/if}
 {#if message}<p class="ok" role="status">{message}</p>{/if}
 
-<div class="tabs" role="tablist" aria-label={t('Image studio views')} bind:this={tablist}>
-  {#each tabs as item (item.id)}
-    <button
-      type="button"
-      role="tab"
-      id="img-tab-{item.id}"
-      aria-selected={tab === item.id}
-      tabindex={tab === item.id ? 0 : -1}
-      onclick={() => (tab = item.id)}
-      onkeydown={tabKey}
-    >
-      {item.label}
-    </button>
-  {/each}
-</div>
+<Tabs {tabs} bind:tab label={t('Image studio views')} idPrefix="img-tab" panelId="img-panel" />
 
-<div role="tabpanel" aria-labelledby="img-tab-{tab}">
+<div role="tabpanel" id="img-panel" aria-labelledby="img-tab-{tab}">
   {#if tab === 'nodes'}
     <section class="grid-2 studio-top">
       <div class="card">
@@ -603,14 +591,14 @@
     </section>
 
     <div class="bar">
-      <h2>{t('Cached node images ({n})', { n: shownImages.length })}</h2>
+      <h2>{t('Cached node images ({n})', { n: imageTable.found.length })}</h2>
+    </div>
+    <TableBar
+      table={imageTable}
+      label={t('Filter cached images')}
+      placeholder={t('Filter reference, digest, node…')}
+    >
       <div class="controls">
-        <input
-          type="search"
-          bind:value={imageFilter}
-          placeholder={t('Filter reference, digest, node…')}
-          aria-label={t('Filter cached images')}
-        />
         <div class="pill-row" role="group" aria-label={t('Filter by workload')}>
           {#each [{ id: 'all', label: t('Jails & VMs') }, { id: 'jail', label: t('Jails') }, { id: 'vm', label: t('bhyve VMs') }] as const as f (f.id)}
             <button
@@ -635,7 +623,7 @@
           {t('Prune unused')}
         </button>
       </div>
-    </div>
+    </TableBar>
 
     {#if shownImages.length}
       <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
@@ -644,17 +632,17 @@
           <caption class="sr-only">{t('Cached node images')}</caption>
           <thead>
             <tr>
-              <th scope="col">{t('Reference')}</th>
-              <th scope="col">{t('Node')}</th>
-              <th scope="col">{t('Platform')}</th>
-              <th scope="col">{t('Layers')}</th>
-              <th scope="col">{t('Used by')}</th>
-              <th scope="col">{t('Digest')}</th>
+              <SortTh table={imageTable} col="reference">{t('Reference')}</SortTh>
+              <SortTh table={imageTable} col="node">{t('Node')}</SortTh>
+              <SortTh table={imageTable} col="platform">{t('Platform')}</SortTh>
+              <SortTh table={imageTable} col="layers">{t('Layers')}</SortTh>
+              <SortTh table={imageTable} col="used">{t('Used by')}</SortTh>
+              <SortTh table={imageTable} col="digest">{t('Digest')}</SortTh>
               <th scope="col">{t('Actions')}</th>
             </tr>
           </thead>
           <tbody>
-            {#each shownImages as img (`${img.node}:${img.reference}`)}
+            {#each imageTable.rows as img (`${img.node}:${img.reference}`)}
               <tr>
                 <td class="mono">
                   <strong>{img.reference}</strong>
@@ -662,7 +650,7 @@
                 </td>
                 <td class="mono">{img.node}</td>
                 <td class="mono">{img.os}/{img.arch}</td>
-                <td class="mono">{img.layers}</td>
+                <td>{img.layers}</td>
                 <td>
                   {#each img.used_by as who (who)}
                     <div class="mono">{who}</div>
@@ -721,10 +709,13 @@
                   </button>
                 </td>
               </tr>
+            {:else}
+              <tr><td colspan="7" class="muted">{t('Nothing matches.')}</td></tr>
             {/each}
           </tbody>
         </table>
       </div>
+      <Pager table={imageTable} label={t('Cached node images')} />
     {:else if !loadingImages}
       <p class="empty">{t('No cached images reported on the selected nodes.')}</p>
     {/if}
@@ -1070,18 +1061,19 @@
       <section class="card">
         <h2>{t('Recent Build runs in {namespace}', { namespace: workNs })}</h2>
         {#if builds.length}
+          <TableBar table={buildTable} label={t('Search Build runs')} />
           <table>
             <caption class="sr-only">{t('Recent Build runs')}</caption>
             <thead>
               <tr>
-                <th scope="col">{t('Build')}</th>
-                <th scope="col">{t('Target image')}</th>
-                <th scope="col">{t('Phase')}</th>
+                <SortTh table={buildTable} col="build">{t('Build')}</SortTh>
+                <SortTh table={buildTable} col="image">{t('Target image')}</SortTh>
+                <SortTh table={buildTable} col="phase">{t('Phase')}</SortTh>
                 <th scope="col">{t('Workbench')}</th>
               </tr>
             </thead>
             <tbody>
-              {#each builds.slice(0, 15) as b (b.metadata.uid)}
+              {#each buildTable.rows as b (b.metadata.uid)}
                 <tr>
                   <td>
                     <a href="/k/Build/{workNs}/{b.metadata.name}?tab=buildlog">{b.metadata.name}</a>
@@ -1111,9 +1103,12 @@
                     </button>
                   </td>
                 </tr>
+              {:else}
+                <tr><td colspan="4" class="muted">{t('Nothing matches.')}</td></tr>
               {/each}
             </tbody>
           </table>
+          <Pager table={buildTable} label={t('Build runs')} />
         {:else}
           <p class="muted">
             {t(

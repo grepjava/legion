@@ -603,7 +603,11 @@ spec:
         "Command",
         "/bin/sh\n-c\nwhile :; do echo formed; sleep 1; done",
     );
+    // The form's parts are tabs: the port under Network, the memory
+    // under Resources.
+    e.click("Network");
     e.fill("Container port", "8080");
+    e.click("Resources");
     e.fill("Memory", "64Mi");
     e.until("the YAML written", 30, |b| {
         let t = b.text();

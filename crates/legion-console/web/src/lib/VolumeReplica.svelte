@@ -221,7 +221,7 @@
           <tr>
             <td title={new Date(c.atMs).toLocaleString()}>{t('{time} ago', { time: span(now - c.atMs) })}</td>
             <td class="mono">{span(c.tookMs)}</td>
-            <td class="mono">{c.error ? '—' : bytes(c.bytes ?? 0)}</td>
+            <td>{c.error ? '—' : bytes(c.bytes ?? 0)}</td>
             <td>{c.whole ? t('whole') : t('changes')}</td>
             <td>
               {#if c.error}

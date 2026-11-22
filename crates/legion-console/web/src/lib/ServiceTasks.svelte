@@ -4,6 +4,10 @@
   import { follow, type LObject } from './api.ts';
   import { tone } from './columns.ts';
   import { t } from './i18n.svelte.ts';
+  import { Table } from './table.svelte.ts';
+  import SortTh from './SortTh.svelte';
+  import TableBar from './TableBar.svelte';
+  import Pager from './Pager.svelte';
 
   let { owner }: { owner: LObject } = $props();
   const ns = $derived(owner.metadata.namespace ?? '');
@@ -28,26 +32,38 @@
   });
 
   const meant = (x: LObject) => (x.spec?.desiredState === 'running' ? 0 : 1);
-  const shown = $derived(
-    [...tasks].sort((a, b) => meant(a) - meant(b) || a.metadata.name.localeCompare(b.metadata.name))
-  );
+  // First those meant to run, then the ended ones, each by name: an order no
+  // header gives, kept until a header is chosen.
+  const table = new Table(() => tasks, {
+    sorts: {
+      meant: (x) => `${meant(x)} ${x.metadata.name}`,
+      name: (x) => x.metadata.name,
+      state: (x) => String(x.status?.state ?? ''),
+      node: (x) => x.spec?.node ?? '',
+      ip: (x) => x.status?.ip ?? '',
+      restarts: (x) => Number(x.status?.restarts ?? 0)
+    },
+    sortBy: 'meant',
+    text: (x) => `${x.metadata.name} ${x.status?.state ?? ''} ${x.spec?.node ?? ''} ${x.status?.ip ?? ''}`
+  });
 </script>
 
 <h2>{t('Tasks')}</h2>
 {#if error}<p class="error" role="alert">{error}</p>{/if}
-{#if shown.length}
+{#if tasks.length}
+  <TableBar {table} label={t('Search tasks')} />
   <table>
     <thead>
       <tr>
-        <th scope="col">{t('Task')}</th>
-        <th scope="col">{t('State')}</th>
-        <th scope="col">{t('Node')}</th>
-        <th scope="col">{t('IP')}</th>
-        <th scope="col">{t('Restarts')}</th>
+        <SortTh {table} col="name">{t('Task')}</SortTh>
+        <SortTh {table} col="state">{t('State')}</SortTh>
+        <SortTh {table} col="node">{t('Node')}</SortTh>
+        <SortTh {table} col="ip">{t('IP')}</SortTh>
+        <SortTh {table} col="restarts">{t('Restarts')}</SortTh>
       </tr>
     </thead>
     <tbody>
-      {#each shown as x (x.metadata.uid)}
+      {#each table.rows as x (x.metadata.uid)}
         {@const st = String(x.status?.state ?? '')}
         <tr class:ended={meant(x)}>
           <td><a href="/k/Task/{encodeURIComponent(ns)}/{encodeURIComponent(x.metadata.name)}">{x.metadata.name}</a></td>
@@ -58,9 +74,12 @@
           <td class="mono">{x.status?.ip ?? ''}</td>
           <td>{x.status?.restarts ?? 0}</td>
         </tr>
+      {:else}
+        <tr><td colspan="5" class="muted">{t('Nothing matches.')}</td></tr>
       {/each}
     </tbody>
   </table>
+  <Pager {table} label={t('Tasks')} />
 {:else if loaded && !error}
   <p class="empty">{t('No tasks yet.')}</p>
 {:else if !error}

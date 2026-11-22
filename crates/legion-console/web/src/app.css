@@ -1550,6 +1550,7 @@ button[aria-busy='true']::after {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
   gap: 0.75rem;
+  margin-bottom: 0.85rem;
 }
 .tile {
   display: flex;
@@ -1557,10 +1558,17 @@ button[aria-busy='true']::after {
   gap: 0.3rem;
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 0.85rem 1rem;
+  border-radius: 8px;
+  padding: 0.9rem 1rem;
+}
+.tile-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
 }
 .tile-label {
+  margin: 0;
   font-size: 0.7rem;
   font-weight: 600;
   letter-spacing: 0.06em;
@@ -1570,11 +1578,13 @@ button[aria-busy='true']::after {
 .tile-value {
   display: flex;
   align-items: center;
+  margin: 0.1rem 0 0;
   font-size: 1.45rem;
   font-weight: 700;
   line-height: 1.2;
 }
 .tile-note {
+  margin: 0;
   font-size: 0.84rem;
   color: var(--muted);
   line-height: 1.4;
@@ -1586,7 +1596,23 @@ button[aria-busy='true']::after {
   color: var(--muted);
 }
 .tile .meter {
-  margin-top: auto;
+  margin-top: 0.35rem;
+}
+/* Where more is shown: under a rule at the foot of the card. */
+.tile-foot {
+  margin: auto 0 0;
+  padding-top: 0.55rem;
+  border-top: 1px solid var(--line);
+  font-size: 0.82rem;
+}
+.tile-foot a {
+  text-decoration: none;
+}
+.tile-foot a::after {
+  content: ' →';
+}
+.tile-foot a:hover {
+  text-decoration: underline;
 }
 /* An empty list says so in its place, quietly. */
 .empty {
@@ -1845,4 +1871,121 @@ th[aria-sort='ascending'] > button.sort-btn::after {
   background: var(--panel);
   color: var(--text);
   box-shadow: 0 1px 2px rgb(0 0 0 / 0.15);
+}
+
+/* One kit (TODO.MD item 6): every button, linked button and table drawn
+   the same way on every page. Kept at the lowest specificity, so a
+   control drawn otherwise on purpose (tabs, sort headers, the side bar's
+   switch) stays as it is. */
+:where(button, a.button) {
+  border-radius: 6px;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease;
+}
+:where(button):hover:not(:disabled),
+:where(a.button):hover {
+  background-color: var(--surface2);
+}
+:where(button.primary):hover:not(:disabled),
+:where(a.button.primary):hover {
+  background-color: color-mix(in oklab, var(--link) 85%, var(--text));
+}
+:where(button.danger):hover:not(:disabled) {
+  background-color: color-mix(in oklab, var(--bad) 12%, var(--panel));
+}
+
+/* A card's title is a heading, also where it leads somewhere: in the
+   text's colour, underlined only under the pointer. */
+.card > h2 > a:only-child,
+.card > h3 > a:only-child {
+  color: var(--text);
+  text-decoration: none;
+}
+.card > h2 > a:only-child:hover,
+.card > h3 > a:only-child:hover {
+  color: var(--link);
+  text-decoration: underline;
+}
+
+/* Tables with their corners rounded, as the cards around them. */
+table {
+  border-collapse: separate;
+  border-spacing: 0;
+  overflow: hidden;
+}
+
+/* A row of choices of which one holds (a chart's range): one control. */
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--control);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.segmented button {
+  border: none;
+  border-radius: 0;
+  background: var(--panel);
+  min-height: 26px;
+  padding: 0.16rem 0.6rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.segmented button + button {
+  border-left: 1px solid var(--line);
+}
+.segmented button[aria-pressed='true'] {
+  background: var(--surface2);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+/* A section's head: its title, and what acts on all of it to the right. */
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin: 1.35rem 0 0.6rem;
+}
+.section-head h2 {
+  margin: 0;
+}
+
+/* Over a list, its search and count; under it, its pages
+   (lib/TableBar.svelte, lib/Pager.svelte). */
+.table-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  margin: 0 0 0.6rem;
+}
+.table-bar input[type='search'] {
+  min-width: 15rem;
+}
+.table-count {
+  margin-left: auto;
+  font-size: 0.84rem;
+}
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.6rem 0 0;
+  font-size: 0.86rem;
+}
+.pager .muted {
+  padding: 0 0.4rem;
+}
+
+@media (forced-colors: active) {
+  .segmented button[aria-pressed='true'] {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
 }

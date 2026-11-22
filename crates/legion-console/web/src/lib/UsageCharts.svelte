@@ -21,7 +21,8 @@
     task = '',
     nodeFilter = '',
     pick = EVERY,
-    compact = false
+    compact = false,
+    heading = ''
   }: {
     /** Empty: every namespace the user may read. */
     namespace: string;
@@ -31,6 +32,8 @@
     /** Which tasks count. */
     pick?: (t: TaskSeries) => boolean;
     compact?: boolean;
+    /** A title over the charts, the range picker beside it. */
+    heading?: string;
   } = $props();
 
   let series: TaskSeries[] = $state([]);
@@ -139,21 +142,24 @@
   const exact = $derived(pick === EVERY);
 </script>
 
-{#if error}<p class="error" role="alert">{error}</p>{/if}
-{#if !compact}
-  <div class="ranges" role="group" aria-label={t('How far back')}>
+{#snippet ranges()}
+  <div class="segmented" role="group" aria-label={t('How far back')}>
     {#each RANGES as r (r)}
-      <button
-        type="button"
-        class="sm"
-        class:primary={range === r}
-        aria-pressed={range === r}
-        data-range={r}
-        onclick={() => (range = r)}>{duration(r)}</button
+      <button type="button" aria-pressed={range === r} data-range={r} onclick={() => (range = r)}
+        >{duration(r)}</button
       >
     {/each}
   </div>
+{/snippet}
+{#if heading}
+  <div class="section-head">
+    <h2>{heading}</h2>
+    {@render ranges()}
+  </div>
+{:else}
+  <div class="ranges">{@render ranges()}</div>
 {/if}
+{#if error}<p class="error" role="alert">{error}</p>{/if}
 {#if loaded && !summed.tasks && !summed.zfs.length}
   <p class="muted">
     {range === RANGES[0]
@@ -267,10 +273,6 @@ sum by (task) (legion_container_memory_bytes${selector})`}</pre>
 
 <style>
   .ranges {
-    display: inline-flex;
     margin-bottom: 0.5rem;
-  }
-  .ranges button + button {
-    margin-left: -1px;
   }
 </style>

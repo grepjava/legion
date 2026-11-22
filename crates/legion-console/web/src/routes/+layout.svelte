@@ -37,7 +37,7 @@
   import Ico from '#lib/Ico.svelte';
   import { drafts } from '#lib/drafts.svelte.ts';
   import ResourceTree from '#lib/ResourceTree.svelte';
-  import { kindIcon, pageIcon } from '#lib/icons.ts';
+  import { kindIcon, pageIcon, type IconComponent } from '#lib/icons.ts';
   import {
     CircleQuestionMark,
     GripVertical,
@@ -371,8 +371,8 @@
     '/': t('Overview'),
     '/login': t('Sign in'),
     '/alerts': t('Alerts'),
-    '/volumes': t('Volumes Studio'),
-    '/images': t('Images & GHCR Hub'),
+    '/volumes': t('Volumes'),
+    '/images': t('Images'),
     '/deploy': t('Deploy'),
     '/templates': t('Templates'),
     '/import': t('Import compose'),
@@ -451,29 +451,92 @@
   const navFilter = $derived(navQuery.trim().toLowerCase());
   const matchesNav = (label: string) => !navFilter || label.toLowerCase().includes(navFilter);
 
-  const observeItems = $derived(
-    [
-      { href: '/', label: t('Overview') },
-      { href: '/alerts', label: t('Alerts'), alerts: true },
-      { href: '/topology', label: t('Topology') },
-      { href: '/network', label: t('Network') },
-      { href: '/disk', label: t('Disk usage') },
-      { href: '/diagnostics', label: t('Diagnostics') }
-    ].filter((i) => matchesNav(i.label))
+  // The side bar's groups, as a tree: what to look at, the applications,
+  // ways to make them, storage, the network, configuration, the cluster.
+  // A kind goes in the group KIND_GROUP gives it, any other with
+  // configuration; Volumes are listed on the Volumes page, not apart.
+  type NavItem = { href: string; label: string; icon: IconComponent; alerts?: boolean; prefix?: boolean };
+  type NavGroup = { key: string; label: string; items: NavItem[] };
+  const pageItem = (href: string, label: string, alerts = false): NavItem => ({
+    href,
+    label,
+    icon: pageIcon(href),
+    alerts
+  });
+  const kindItem = (kind: string): NavItem => ({
+    href: `/k/${kind}`,
+    label: plural(kind),
+    icon: kindIcon(kind),
+    prefix: true
+  });
+  const KIND_GROUP: Record<string, string> = {
+    Service: 'apps',
+    Job: 'apps',
+    CronJob: 'apps',
+    Task: 'apps',
+    Build: 'storage',
+    Route: 'network',
+    NetworkPolicy: 'network'
+  };
+  const LISTED_ELSEWHERE = new Set(['Volume']);
+  const shown = (items: NavItem[]) => items.filter((i) => matchesNav(i.label));
+  const navGroups = $derived.by((): NavGroup[] => {
+    const kindsIn = (group: string) =>
+      nsKinds
+        .filter((k) => !LISTED_ELSEWHERE.has(k.kind) && (KIND_GROUP[k.kind] ?? 'config') === group)
+        .map((k) => kindItem(k.kind));
+    return [
+      {
+        key: 'observe',
+        label: t('Observe'),
+        items: [
+          pageItem('/', t('Overview')),
+          pageItem('/alerts', t('Alerts'), true),
+          pageItem('/topology', t('Topology')),
+          pageItem('/diagnostics', t('Diagnostics'))
+        ]
+      },
+      { key: 'apps', label: t('Applications'), items: [...kindsIn('apps'), pageItem('/stacks', t('Stacks'))] },
+      {
+        key: 'create',
+        label: t('Create'),
+        items: [
+          pageItem('/deploy', t('Deploy')),
+          pageItem('/templates', t('Templates')),
+          pageItem('/import', t('Import compose')),
+          pageItem('/apply', t('Apply YAML')),
+          pageItem('/build', t('Builder'))
+        ]
+      },
+      {
+        key: 'storage',
+        label: t('Storage and images'),
+        items: [
+          pageItem('/volumes', t('Volumes')),
+          pageItem('/disk', t('Disk usage')),
+          pageItem('/images', t('Images')),
+          ...kindsIn('storage')
+        ]
+      },
+      { key: 'network', label: t('Network'), items: [pageItem('/network', t('Network')), ...kindsIn('network')] },
+      { key: 'config', label: t('Configuration and access'), items: kindsIn('config') }
+    ]
+      .map((g) => ({ ...g, items: shown(g.items) }))
+      .filter((g) => g.items.length);
+  });
+  // The cluster's own: for those who may see all of it.
+  const clusterItems = $derived(
+    clusterKinds.length
+      ? shown([
+          ...clusterKinds.map((k) => kindItem(k.kind)),
+          pageItem('/cluster', t('Operations')),
+          pageItem('/audit', t('Audit')),
+          pageItem('/settings', t('Console settings'))
+        ])
+      : []
   );
-
-  const studioItems = $derived(
-    [
-      { href: '/volumes', label: t('Volumes Studio') },
-      { href: '/images', label: t('Images & GHCR Hub') },
-      { href: '/build', label: t('Builder') },
-      { href: '/stacks', label: t('Stacks') },
-      { href: '/deploy', label: t('Deploy') },
-      { href: '/templates', label: t('Templates') },
-      { href: '/import', label: t('Import compose') },
-      { href: '/apply', label: t('Apply YAML') }
-    ].filter((i) => matchesNav(i.label))
-  );
+  const isHere = (item: NavItem) =>
+    item.prefix ? page.url.pathname.startsWith(item.href) : page.url.pathname === item.href;
 
   // A section's heading only while some of its entries pass the filter.
   const showAllClusters = $derived(matchesNav(t('All clusters')));
@@ -482,16 +545,18 @@
   );
   const filteredPlugins = $derived(shownPlugins.filter((p) => matchesNav(p.name)));
   const filteredLinks = $derived((session.settings.links ?? []).filter((l) => matchesNav(l.label)));
-  const filteredNsKinds = $derived(nsKinds.filter((k) => matchesNav(plural(k.kind))));
-  const filteredClusterKinds = $derived(clusterKinds.filter((k) => matchesNav(plural(k.kind))));
-  const clusterOpsItems = $derived(
-    [
-      { href: '/cluster', label: t('Operations') },
-      { href: '/audit', label: t('Audit') },
-      { href: '/settings', label: t('Console settings') }
-    ].filter((i) => matchesNav(i.label))
-  );
 </script>
+
+{#snippet navLink(item: NavItem)}
+  <a href={item.href} class:here={isHere(item)} aria-current={at(isHere(item))}
+    ><Ico icon={item.icon} /><span>{item.label}</span
+    >{#if item.alerts && session.alerts.length}<span class="count {critical ? 'bad' : 'wait'}"
+        >{session.alerts.length}</span
+      >{/if}{#if drafts[item.href.slice(1)]}<span class="draft-dot" title={t('A draft is kept here')}
+        ><span class="sr-only">{t('(draft)')}</span></span
+      >{/if}</a
+  >
+{/snippet}
 
 <svelte:window
   onkeydown={onGlobalKey}
@@ -686,41 +751,12 @@
             </details>
           {/if}
 
-          {#if observeItems.length}
-            <details class="nav-sec" open={sectionOpen('observe')} ontoggle={(e) => sectionToggled('observe', e)}>
-              <summary class="nav-group">{t('Observe')}</summary>
-              {#each observeItems as item (item.href)}
-                <a
-                  href={item.href}
-                  class:here={page.url.pathname === item.href}
-                  aria-current={at(page.url.pathname === item.href)}
-                >
-                  <Ico icon={pageIcon(item.href)} />
-                  <span>{item.label}</span>
-                  {#if item.alerts && session.alerts.length}
-                    <span class="count {critical ? 'bad' : 'wait'}">{session.alerts.length}</span>
-                  {/if}
-                </a>
-              {/each}
+          {#each navGroups as g (g.key)}
+            <details class="nav-sec" open={sectionOpen(g.key)} ontoggle={(e) => sectionToggled(g.key, e)}>
+              <summary class="nav-group">{g.label}</summary>
+              {#each g.items as item (item.href)}{@render navLink(item)}{/each}
             </details>
-          {/if}
-
-          {#if studioItems.length}
-            <details class="nav-sec" open={sectionOpen('studios')} ontoggle={(e) => sectionToggled('studios', e)}>
-              <summary class="nav-group">{t('Studios')}</summary>
-              {#each studioItems as item (item.href)}
-                <a
-                  href={item.href}
-                  class:here={page.url.pathname === item.href}
-                  aria-current={at(page.url.pathname === item.href)}
-                  ><Ico icon={pageIcon(item.href)} /><span>{item.label}</span
-                  >{#if drafts[item.href.slice(1)]}<span class="draft-dot" title={t('A draft is kept here')}
-                      ><span class="sr-only">{t('(draft)')}</span></span
-                    >{/if}</a
-                >
-              {/each}
-            </details>
-          {/if}
+          {/each}
 
           {#if session.settings.clusters?.length && (showAllClusters || filteredClusters.length)}
             <details class="nav-sec" open={sectionOpen('clusters')} ontoggle={(e) => sectionToggled('clusters', e)}>
@@ -765,41 +801,10 @@
               {/each}
             </details>
           {/if}
-          {#if filteredNsKinds.length}
-            <details class="nav-sec" open={sectionOpen('workloads')} ontoggle={(e) => sectionToggled('workloads', e)}>
-              <summary class="nav-group">{t('Workloads and config')}</summary>
-              {#each filteredNsKinds as k (k.kind)}
-                <a
-                  href="/k/{k.kind}"
-                  class:here={page.url.pathname.startsWith(`/k/${k.kind}`)}
-                  aria-current={at(page.url.pathname.startsWith(`/k/${k.kind}`))}
-                  ><Ico icon={kindIcon(k.kind)} /><span>{plural(k.kind)}</span></a
-                >
-              {/each}
-            </details>
-          {/if}
-          {#if clusterKinds.length && (clusterOpsItems.length || filteredClusterKinds.length)}
+          {#if clusterItems.length}
             <details class="nav-sec" open={sectionOpen('cluster')} ontoggle={(e) => sectionToggled('cluster', e)}>
               <summary class="nav-group">{t('Cluster')}</summary>
-              {#each clusterOpsItems as item (item.href)}
-                <a
-                  href={item.href}
-                  class:here={page.url.pathname === item.href}
-                  aria-current={at(page.url.pathname === item.href)}
-                  ><Ico icon={pageIcon(item.href)} /><span>{item.label}</span
-                  >{#if drafts[item.href.slice(1)]}<span class="draft-dot" title={t('A draft is kept here')}
-                      ><span class="sr-only">{t('(draft)')}</span></span
-                    >{/if}</a
-                >
-              {/each}
-              {#each filteredClusterKinds as k (k.kind)}
-                <a
-                  href="/k/{k.kind}"
-                  class:here={page.url.pathname.startsWith(`/k/${k.kind}`)}
-                  aria-current={at(page.url.pathname.startsWith(`/k/${k.kind}`))}
-                  ><Ico icon={kindIcon(k.kind)} /><span>{plural(k.kind)}</span></a
-                >
-              {/each}
+              {#each clusterItems as item (item.href)}{@render navLink(item)}{/each}
             </details>
           {/if}
         </nav>

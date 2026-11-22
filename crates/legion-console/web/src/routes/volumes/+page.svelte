@@ -1,6 +1,6 @@
 <script lang="ts">
   import { ask } from '#lib/confirm.svelte.ts';
-  // Docker-Desktop ZFS Volumes Studio: per-node ZFS pool capacity meters,
+  // The Volumes page: per-node ZFS pool capacity meters,
   // 1-click ZFS/NFS/iSCSI volume creation wizard, live per-dataset space
   // tracking, ZFS Snapshot Manager modal, cross-node ZFS migration, and
   // streaming .zfs backup download & restore.
@@ -16,6 +16,12 @@
   } from '#lib/api.ts';
   import { t, tn } from '#lib/i18n.svelte.ts';
   import { cannotWrite, cannotWriteAnywhere, namespaces, session } from '#lib/session.svelte.ts';
+  import Tile from '#lib/Tile.svelte';
+  import { Table } from '#lib/table.svelte.ts';
+  import SortTh from '#lib/SortTh.svelte';
+  import TableBar from '#lib/TableBar.svelte';
+  import Pager from '#lib/Pager.svelte';
+  import { Activity, Database, HardDrive, ShieldCheck } from '@lucide/svelte';
 
   let adminNamespaces: string[] = $state([]);
   let volumes: LObject[] = $state([]);
@@ -25,22 +31,6 @@
   let error = $state('');
   let message = $state('');
   let busy = $state(false);
-  let filterText = $state('');
-
-  // Sortable table state (mwg: sortable-table)
-  type SortKey = 'name' | 'driver' | 'node' | 'used';
-  let sortBy: SortKey = $state('name');
-  let sortDir: 'ascending' | 'descending' = $state('ascending');
-  const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
-
-  function toggleSort(col: SortKey) {
-    if (sortBy === col) {
-      sortDir = sortDir === 'ascending' ? 'descending' : 'ascending';
-    } else {
-      sortBy = col;
-      sortDir = 'ascending';
-    }
-  }
 
   $effect(() => {
     if (session.me?.all) {
@@ -108,37 +98,23 @@
     return m;
   });
 
-  const sortedVolumes = $derived.by(() => {
-    const q = filterText.trim().toLowerCase();
-    const list = q
-      ? volumes.filter(
-          (v) =>
-            v.metadata.name.toLowerCase().includes(q) ||
-            (v.metadata.namespace ?? '').toLowerCase().includes(q) ||
-            (v.status?.node ?? '').toLowerCase().includes(q)
-        )
-      : [...volumes];
-    const factor = sortDir === 'ascending' ? 1 : -1;
-    return list.sort((a, b) => {
-      if (sortBy === 'used') {
-        const ua = spaceMap.get(`${a.metadata.namespace ?? ''}/${a.metadata.name}`)?.used_bytes ?? 0;
-        const ub = spaceMap.get(`${b.metadata.namespace ?? ''}/${b.metadata.name}`)?.used_bytes ?? 0;
-        return factor * (ua - ub);
-      }
-      const va =
-        sortBy === 'driver'
-          ? String(a.spec?.driver ?? 'zfs')
-          : sortBy === 'node'
-            ? String(a.status?.node ?? a.spec?.node ?? '')
-            : `${a.metadata.namespace ?? ''}/${a.metadata.name}`;
-      const vb =
-        sortBy === 'driver'
-          ? String(b.spec?.driver ?? 'zfs')
-          : sortBy === 'node'
-            ? String(b.status?.node ?? b.spec?.node ?? '')
-            : `${b.metadata.namespace ?? ''}/${b.metadata.name}`;
-      return factor * collator.compare(va, vb);
-    });
+  // The Volumes by namespace and name; the space used sorts as a number,
+  // a Volume with none reported below every one that has; "Mounted by" on
+  // the Services' names, the detached first. A search looks in the names,
+  // the node, the driver and the Services.
+  const key = (v: LObject) => `${v.metadata.namespace ?? ''}/${v.metadata.name}`;
+  const nodeOf = (v: LObject) => String(v.status?.node ?? v.spec?.node ?? '');
+  const table = new Table(() => volumes, {
+    sorts: {
+      name: key,
+      driver: (v) => String(v.spec?.driver ?? 'zfs'),
+      node: nodeOf,
+      used: (v) => spaceMap.get(key(v))?.used_bytes ?? -1,
+      mounted: (v) => (attachedBy.get(key(v)) ?? []).join(', ')
+    },
+    sortBy: 'name',
+    text: (v) =>
+      `${key(v)} ${nodeOf(v)} ${v.spec?.driver ?? 'zfs'} ${(attachedBy.get(key(v)) ?? []).join(' ')}`
   });
 
   // Create Volume dialog
@@ -218,10 +194,13 @@
   let migrateNode = $state('');
   let snapBusy = $state(false);
   let snapError = $state('');
+  // In the order ZFS made them, oldest first, until sorted by name.
+  const snapTable = new Table(() => snapshots, { sorts: { name: (s) => s } });
 
   async function openManage(v: LObject) {
     activeVol = v;
     snapshots = [];
+    snapTable.search('');
     snapInput = '';
     migrateNode = v.spec?.node ?? '';
     snapError = '';
@@ -374,17 +353,61 @@
   }
   // A Volume is made or restored in a namespace one may write in.
   const anyWhy = $derived(cannotWriteAnywhere());
+
+  // The status cards: the pools' health, their space, when they were last
+  // verified (scrubbed), and the Volumes on them. The pools are the nodes'
+  // (for those who may see nodes); else the space the nodes report.
+  type Pool = {
+    node: string;
+    name: string;
+    state: string;
+    sizeBytes: number;
+    allocBytes: number;
+    readErrors?: number;
+    writeErrors?: number;
+    checksumErrors?: number;
+    scan?: { function: string; state: string; endMs?: number; errors?: number };
+  };
+  const pools = $derived(
+    nodes.flatMap((n) =>
+      ((n.status?.pools ?? []) as Omit<Pool, 'node'>[]).map((p) => ({ ...p, node: n.metadata.name }))
+    )
+  );
+  const poolErrors = (p: Pool) => (p.readErrors ?? 0) + (p.writeErrors ?? 0) + (p.checksumErrors ?? 0);
+  const space = $derived.by(() => {
+    if (pools.length) {
+      const size = pools.reduce((a, p) => a + (p.sizeBytes ?? 0), 0);
+      const used = pools.reduce((a, p) => a + (p.allocBytes ?? 0), 0);
+      return { used, size };
+    }
+    const used = nodeUsage.reduce((a, n) => a + (n.zfs_used_bytes ?? 0), 0);
+    return { used, size: used + nodeUsage.reduce((a, n) => a + (n.zfs_avail_bytes ?? 0), 0) };
+  });
+  // The pool longest without a scrub decides how verified the storage is.
+  const verified = $derived.by(() => {
+    if (!pools.length) return null;
+    const scanning = pools.filter((p) => p.scan?.state === 'scanning');
+    const last = pools.map((p) =>
+      p.scan?.function === 'scrub' && p.scan.state === 'finished' && p.scan.endMs ? p.scan.endMs : 0
+    );
+    const stalest = Math.min(...last);
+    const found = pools.reduce((a, p) => a + (p.scan?.errors ?? 0), 0);
+    return { scanning: scanning.length, stalest, never: last.filter((x) => !x).length, found };
+  });
+  function ago(ms: number) {
+    const d = Math.floor((Date.now() - ms) / 86_400_000);
+    return d < 1 ? t('today') : tn('1 day ago', '{n} days ago', d);
+  }
+  const detached = $derived(
+    volumes.filter((v) => !attachedBy.get(`${v.metadata.namespace ?? ''}/${v.metadata.name}`)?.length).length
+  );
+  const lost = $derived(volumes.filter((v) => v.status?.lost).length);
+  const replicated = $derived(volumes.filter((v) => v.spec?.replica).length);
 </script>
 
 <header class="bar">
-  <h1>{t('Volumes Studio')}</h1>
+  <h1>{t('Volumes')}</h1>
   <div class="controls">
-    <input
-      type="search"
-      bind:value={filterText}
-      placeholder={t('Filter volumes or nodes…')}
-      aria-label={t('Filter volumes')}
-    />
     <button type="button" class="primary" disabled={!!anyWhy} title={anyWhy ?? ''} onclick={openCreate}
       >{t('New Volume')}</button
     >
@@ -392,15 +415,74 @@
 </header>
 <p class="muted">
   {t(
-    'Manage persistent FreeBSD ZFS datasets, NFS exports, and iSCSI LUNs: inspect live ZFS pool space, take instant copy-on-write snapshots, migrate datasets across nodes, or download and restore ZFS stream archives.'
+    'A Volume keeps a service’s data across restarts and moves: a ZFS dataset on a node, an NFS export or an iSCSI LUN. Snapshot, move, back up and restore them here.'
   )}
 </p>
+
+<div class="tiles">
+  {#if pools.length}
+    {@const online = pools.filter((p) => p.state === 'ONLINE').length}
+    {@const errs = pools.reduce((a, p) => a + poolErrors(p), 0)}
+    <Tile
+      label={t('Storage health')}
+      icon={ShieldCheck}
+      value={t('{n} of {total} online', { n: online, total: pools.length })}
+      tone={online < pools.length ? 'bad' : errs ? 'wait' : 'good'}
+      note={errs
+        ? tn('1 read, write or checksum error', '{n} read, write or checksum errors', errs)
+        : t('No known pool or device errors')}
+    />
+  {/if}
+  {#if space.size > 0}
+    <Tile
+      label={t('Capacity')}
+      icon={Database}
+      value={t('{pct}% used', { pct: Math.round((space.used / space.size) * 100) })}
+      note={t('{used} of {total} · {free} free', {
+        used: bytes(space.used),
+        total: bytes(space.size),
+        free: bytes(space.size - space.used)
+      })}
+      pct={(space.used / space.size) * 100}
+      meterLabel={t('Pool space used')}
+    />
+  {/if}
+  {#if verified}
+    <Tile
+      label={t('Pool verification')}
+      icon={Activity}
+      value={verified.scanning
+        ? t('Scrub running')
+        : verified.never
+          ? tn('1 pool never scrubbed', '{n} pools never scrubbed', verified.never)
+          : verified.found
+            ? t('Last scrub found errors')
+            : t('Last scrub clean')}
+      tone={verified.found ? 'bad' : verified.never ? 'wait' : 'good'}
+      note={verified.stalest
+        ? t('The stalest pool scrubbed {when}', { when: ago(verified.stalest) })
+        : t('Schedule scrubs on a node’s Host tab')}
+    />
+  {/if}
+  <Tile
+    label={t('Volumes')}
+    icon={HardDrive}
+    value={tn('1 Volume', '{n} Volumes', volumes.length)}
+    tone={lost ? 'bad' : ''}
+    note={[
+      tn('1 in use', '{n} in use', volumes.length - detached),
+      tn('1 detached', '{n} detached', detached),
+      tn('1 with a replica', '{n} with a replica', replicated),
+      ...(lost ? [tn('1 lost', '{n} lost', lost)] : [])
+    ].join(' · ')}
+  />
+</div>
 
 {#if error}<p class="error" role="alert">{error}</p>{/if}
 {#if message}<p class="ok" role="status">{message}</p>{/if}
 
 {#if nodeUsage.some((n) => (n.zfs_used_bytes ?? 0) + (n.zfs_avail_bytes ?? 0) > 0)}
-  <h2>{t('Node ZFS pools')}</h2>
+  <h2>{t('Pools by node')}</h2>
   <section class="cards">
     {#each nodeUsage as nu (nu.node)}
       {@const used = nu.zfs_used_bytes ?? 0}
@@ -410,10 +492,10 @@
         {@const pct = Math.min(100, Math.round((used / tot) * 100))}
         <div class="card">
           <div class="pool-head">
-            <strong>{nu.node}</strong>
+            <h3>{nu.node}</h3>
             <span class="state {pct >= 90 ? 'bad' : pct >= 75 ? 'wait' : 'zfs'}">{pct}%</span>
           </div>
-          <p class="muted mono">
+          <p class="muted">
             {t('{used} used · {avail} free', { used: bytes(used), avail: bytes(avail) })}
           </p>
           <div class="meter" role="img" aria-label={t('ZFS pool on {node}: {pct}%', { node: nu.node, pct })}>
@@ -428,40 +510,25 @@
   </section>
 {/if}
 
-<h2>{t('Volumes ({n})', { n: sortedVolumes.length })}</h2>
-{#if sortedVolumes.length}
+<h2>{t('Volumes ({n})', { n: volumes.length })}</h2>
+{#if volumes.length}
+  <TableBar {table} label={t('Filter volumes')} placeholder={t('Filter volumes or nodes…')} />
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
   <div class="table-scroll" tabindex="0" role="region" aria-label={t('Volumes inventory')}>
     <table>
       <caption class="sr-only">{t('Volumes inventory')}</caption>
       <thead>
         <tr>
-          <th scope="col" aria-sort={sortBy === 'name' ? sortDir : undefined}>
-            <button type="button" class="sort-btn" data-look onclick={() => toggleSort('name')}>
-              {t('Volume')}
-            </button>
-          </th>
-          <th scope="col" aria-sort={sortBy === 'driver' ? sortDir : undefined}>
-            <button type="button" class="sort-btn" data-look onclick={() => toggleSort('driver')}>
-              {t('Driver')}
-            </button>
-          </th>
-          <th scope="col" aria-sort={sortBy === 'node' ? sortDir : undefined}>
-            <button type="button" class="sort-btn" data-look onclick={() => toggleSort('node')}>
-              {t('Node')}
-            </button>
-          </th>
-          <th scope="col" aria-sort={sortBy === 'used' ? sortDir : undefined}>
-            <button type="button" class="sort-btn" data-look onclick={() => toggleSort('used')}>
-              {t('ZFS space / Quota')}
-            </button>
-          </th>
-          <th scope="col">{t('Mounted by')}</th>
+          <SortTh {table} col="name">{t('Volume')}</SortTh>
+          <SortTh {table} col="driver">{t('Driver')}</SortTh>
+          <SortTh {table} col="node">{t('Node')}</SortTh>
+          <SortTh {table} col="used">{t('ZFS space / Quota')}</SortTh>
+          <SortTh {table} col="mounted">{t('Mounted by')}</SortTh>
           <th scope="col">{t('Actions')}</th>
         </tr>
       </thead>
       <tbody>
-        {#each sortedVolumes as v (v.metadata.uid)}
+        {#each table.rows as v (v.metadata.uid)}
           {@const ns = v.metadata.namespace ?? ''}
           {@const drv = v.spec?.driver ?? 'zfs'}
           {@const sp = spaceMap.get(`${ns}/${v.metadata.name}`)}
@@ -473,12 +540,12 @@
               {#if v.status?.lost}<span class="state bad">{t('lost')}</span>{/if}
             </td>
             <td><span class="tag mono">{drv}</span></td>
-            <td class="mono">{v.status?.node ?? v.spec?.node ?? '—'}</td>
+            <td>{v.status?.node ?? v.spec?.node ?? '—'}</td>
             <td>
               {#if sp}
                 {@const stot = sp.used_bytes + sp.avail_bytes}
                 {@const spct = stot > 0 ? Math.min(100, Math.round((sp.used_bytes / stot) * 100)) : 0}
-                <div class="mono">
+                <div>
                   {bytes(sp.used_bytes)} / {bytes(stot)} ({spct}%)
                 </div>
                 <div class="meter">
@@ -488,7 +555,7 @@
                   ></div>
                 </div>
               {:else if v.spec?.size}
-                <span class="mono">{v.spec.size}</span>
+                <span>{v.spec.size}</span>
               {:else}
                 <span class="muted">—</span>
               {/if}
@@ -535,10 +602,13 @@
               </button>
             </td>
           </tr>
+        {:else}
+          <tr><td colspan="6" class="muted">{t('Nothing matches.')}</td></tr>
         {/each}
       </tbody>
     </table>
   </div>
+  <Pager {table} label={t('Volumes')} />
 {:else}
   <p class="empty">{t('No Volumes found in this scope.')}</p>
 {/if}
@@ -670,16 +740,17 @@
         </button>
       </form>
       {#if snapshots.length}
+        <TableBar table={snapTable} label={t('Search snapshots')} />
         <table>
           <caption class="sr-only">{t('Snapshots')}</caption>
           <thead>
             <tr>
-              <th scope="col">{t('Snapshot')}</th>
+              <SortTh table={snapTable} col="name">{t('Snapshot')}</SortTh>
               <th scope="col">{t('Actions')}</th>
             </tr>
           </thead>
           <tbody>
-            {#each snapshots as s (s)}
+            {#each snapTable.rows as s (s)}
               <tr>
                 <td class="mono">@{s}</td>
                 <td class="controls">
@@ -697,9 +768,12 @@
                   >
                 </td>
               </tr>
+            {:else}
+              <tr><td colspan="2" class="muted">{t('Nothing matches.')}</td></tr>
             {/each}
           </tbody>
         </table>
+        <Pager table={snapTable} label={t('Snapshots')} />
       {:else if !snapBusy}
         <p class="empty">{t('No ZFS snapshots yet.')}</p>
       {/if}
@@ -739,6 +813,10 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
+  }
+  .pool-head h3 {
+    margin: 0;
+    font-size: 1rem;
   }
   .restore-card {
     margin-top: 1.25rem;

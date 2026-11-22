@@ -7,6 +7,10 @@
   import { api, type Balancer, type ReachEdge } from '#lib/api.ts';
   import { namespaces, session } from '#lib/session.svelte.ts';
   import { t } from '#lib/i18n.svelte.ts';
+  import { Table } from '#lib/table.svelte.ts';
+  import SortTh from '#lib/SortTh.svelte';
+  import TableBar from '#lib/TableBar.svelte';
+  import Pager from '#lib/Pager.svelte';
 
   let chosen = $state('');
   let typed = $state('');
@@ -46,6 +50,17 @@
     return () => clearInterval(every);
   });
   const holders = (b: Balancer) => b.nodes.filter((n) => n.state === 'master').map((n) => n.node);
+  // The addresses by service; an address sorts by its numbers, the
+  // collator putting 10.0.0.9 before 10.0.0.10.
+  const lbs = new Table(() => balancers, {
+    sorts: {
+      service: (b) => b.service,
+      address: (b) => b.address,
+      held: (b) => holders(b).join(', '),
+      nodes: (b) => b.nodes.map((n) => n.node).join(', ')
+    },
+    sortBy: 'service'
+  });
 
   const sources = $derived(['', ...services]);
   const cell = (from: string, to: string) => {
@@ -101,17 +116,18 @@
 
 {#if balancers.length}
   <h2>{t('Load balancer addresses')}</h2>
+  <TableBar table={lbs} label={t('Search load balancer addresses')} />
   <table>
     <thead>
       <tr>
-        <th>{t('Service')}</th>
-        <th>{t('Address')}</th>
-        <th>{t('Held by')}</th>
-        <th>{t('Nodes that may hold it')}</th>
+        <SortTh table={lbs} col="service">{t('Service')}</SortTh>
+        <SortTh table={lbs} col="address">{t('Address')}</SortTh>
+        <SortTh table={lbs} col="held">{t('Held by')}</SortTh>
+        <SortTh table={lbs} col="nodes">{t('Nodes that may hold it')}</SortTh>
       </tr>
     </thead>
     <tbody>
-      {#each balancers as b (b.service)}
+      {#each lbs.rows as b (b.service)}
         {@const held = holders(b)}
         <tr>
           <td><a href="/k/Service/{namespace}/{b.service}">{b.service}</a></td>
@@ -124,7 +140,10 @@
               <span class="muted">({n.state || t('not reported')})</span>{/each}</td
           >
         </tr>
+      {:else}
+        <tr><td colspan="4" class="muted">{t('Nothing matches.')}</td></tr>
       {/each}
     </tbody>
   </table>
+  <Pager table={lbs} label={t('Load balancer addresses')} />
 {/if}

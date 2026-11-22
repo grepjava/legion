@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Tabs from '#lib/Tabs.svelte';
   import { page } from '$app/state';
   import { fromAddress, keepInAddress } from '#lib/address.svelte.ts';
   import { api, follow, type LObject } from '#lib/api.ts';
@@ -106,26 +107,6 @@
       : []),
     { id: 'yaml', label: t('YAML') }
   ] as { id: typeof tab; label: string }[]);
-  // The tabs as WAI-ARIA's pattern has them: one stop for Tab, arrows,
-  // Home and End to move between them.
-  let tablist: HTMLElement | undefined = $state();
-  function tabKey(e: KeyboardEvent) {
-    const i = tabs.findIndex((t) => t.id === tab);
-    const to =
-      e.key === 'ArrowRight'
-        ? (i + 1) % tabs.length
-        : e.key === 'ArrowLeft'
-          ? (i - 1 + tabs.length) % tabs.length
-          : e.key === 'Home'
-            ? 0
-            : e.key === 'End'
-              ? tabs.length - 1
-              : -1;
-    if (to < 0) return;
-    e.preventDefault();
-    tab = tabs[to].id;
-    tablist?.querySelectorAll<HTMLElement>('[role="tab"]')[to]?.focus();
-  }
   const cols = $derived(columns(kind));
   // What the strip shows of it: a VM's monitor for its kind, and its state.
   const isVm = $derived.by(() => {
@@ -241,20 +222,7 @@
 
 {#if !error && object}
   {#if !gone}<Actions {object} {scoped} />{/if}
-  <div class="tabs" role="tablist" aria-label={t('Views of {name}', { name })} bind:this={tablist}>
-    {#each tabs as t (t.id)}
-      <button
-        role="tab"
-        id="tab-{t.id}"
-        aria-selected={tab === t.id}
-        aria-controls="panel"
-        tabindex={tab === t.id ? 0 : -1}
-        class:here={tab === t.id}
-        onclick={() => (tab = t.id)}
-        onkeydown={tabKey}>{t.label}</button
-      >
-    {/each}
-  </div>
+  <Tabs {tabs} bind:tab label={t('Views of {name}', { name })} idPrefix="tab" panelId="panel" />
 {/if}
 </div>
 
