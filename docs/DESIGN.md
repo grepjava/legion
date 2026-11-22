@@ -685,9 +685,13 @@ binary serves it.
   browser trusts neither the cluster CA nor its server name). axum, on
   the hyper stack the manager already runs. JSON over HTTP for unary
   calls; server-sent events for the streams the console follows
-  (`Watch`, alerts, events, operations, logs, and usage from
-  `Cluster.WatchUsage`, which the leader sends again each time a node's
-  report changes it): each on an address of its own, and all of a tab's
+  (`Watch`, alerts, events, operations, logs, and the `Cluster.Watch*`
+  calls: usage, usage history, status, load balancers, connections and
+  the CA, each sent again when it changes, woken by what changes it:
+  Raft's view, a node's heartbeat, the store, and for connections, which
+  pf does not announce, the nodes asked again every 10 s): each on an
+  address of its own (status, history, load balancers, connections and
+  the CA only on the tab's), and all of a tab's
   on its one stream (`GET /api/stream`, what it follows added and dropped
   by `POST /api/stream/ID`, its messages tagged), so a browser speaking
   HTTP/1.1, six connections to a site, is not held up. The manager

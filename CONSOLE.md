@@ -23,14 +23,17 @@ API first, then the CLI and the console.
   `--metrics-listen` and the ingress.
 - **The API is the boundary.** A gateway in the manager turns browser
   requests into the same calls the CLI makes, as the signed-in user.
-  Watches, alerts, events, operations, logs and what tasks use come as
-  server-sent events on one stream per tab (`/api/stream`, since 23
+  Watches, alerts, events, operations, logs, what tasks use and used,
+  the cluster's status, load balancers, connections seen and the CA come
+  as server-sent events on one stream per tab (`/api/stream`, since 23
   November 2026): a page says what it follows with `POST /api/stream/ID`,
   so a browser speaking HTTP/1.1 (a proxy in front, the dev server, six
-  connections to a site) is not held up by its streams. Exec goes over a
-  WebSocket, as it takes input. Read again on a timer: what nodes are
-  asked for on demand (connections seen, load balancers, the CA), the
-  cluster's status and the charts' history, every 10 to 30 s.
+  connections to a site) is not held up by its streams. The page asks
+  nothing again on a timer: the manager sends each again when it changes,
+  woken by what changes it (Raft, a node's heartbeat, the store); only
+  connections are asked of the nodes again, every 10 s while followed, as
+  pf says nothing as they come and go. Exec goes over a WebSocket, as it
+  takes input.
 - **Generic first.** The 13 kinds share one list, detail, YAML and
   delete view, driven by the API's own kind list. Hand-built pages are
   added where a generic view is not enough (nodes, tasks, volumes).
@@ -211,7 +214,8 @@ which evaluates the same rules the nodes' guards do (`legion_api::policy`:
 load balancer address came after (2026-11-15): nodes report their CARP
 states in their heartbeats, the leader keeps them, and the Network page
 lists each address with the node holding it and the state of each that
-may (`Cluster.LoadBalancers`, `legion lb`), read again every 10 s; the lab
+may (`Cluster.LoadBalancers`, `legion lb`; followed since 2026-11-23,
+`Cluster.WatchLoadBalancers`, sent again as a heartbeat changes it); the lab
 load balancer test checks `legion lb` against the nodes' interfaces before
 and after a drain moves the address (passed on 6927113).
 
@@ -257,8 +261,8 @@ bar, lists them with a link to each cause and shows the first on the
 overview. What tasks used over the last hour (`Cluster.UsageHistory`,
 `legion usage`), a sample every 15 s kept by the leader, charted per task,
 service and node with what the tasks request and their limits; the charts
-fetch the history again as each sample is due, the console's one poll, as
-the history is no store object to watch. Namespaces' quotas and what each
+follow the history (`Cluster.WatchUsageHistory`, since 2026-11-23), the
+leader sending it again as each sample is added. Namespaces' quotas and what each
 uses now (`Cluster.Quotas`, `legion quota`), worked out by the same code as
 the metrics, as bars with their numbers on the overview and a Namespace's
 page. A Service's or Job's logs searched across its tasks for a time
@@ -316,7 +320,9 @@ box leading to its object. The lab test deploys from the form and from a
 saved template with its variable set, and sees both in the topology
 (passed on 5b762be). Since 2026-11-17 its arcs show either what may
 connect or the connections the nodes saw (`Cluster.Connections`, `legion
-connections`, asked every 10 s): each ready node's agent lists the states
+connections`; followed with `Cluster.WatchConnections` since 2026-11-23,
+the leader asking every 10 s and sending them when they changed): each
+ready node's agent lists the states
 its pf keeps with a pod's address at an end, open or closed in about the
 last minute and a half, and the leader names the ends from the tasks and
 nodes it knows (a service or Job of the namespace, another namespace, a
