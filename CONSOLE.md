@@ -1013,9 +1013,10 @@ base64 `data` once admitted, which the notes now read.
 From going through Sylve's live sandbox (2026-11-19): what makes a
 console feel finished is a frame that never moves, colour kept for
 state, an icon on everything, actions in one place, and an answer to
-every click. Taken in Legion's own look (Midnight Indigo and crimson,
-meters rather than rings, tabs rather than a menu column), each built
-where the phases above first need it:
+every click. Taken in Legion's own look (Midnight Indigo, made calmer on
+22 November 2026: indigo for what to do and where one is, crimson kept to
+the brand's mark and danger; meters rather than rings, tabs rather than a
+menu column), each built where the phases above first need it:
 
 1. *Icons*: a small line set of Legion's own, drawn for its kinds
    (namespace, service, task as a jail or a VM, node, volume, job, route

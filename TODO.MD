@@ -227,6 +227,17 @@ and memory charts; sizes no longer break between number and unit; the
 - *A review before changing a host*: built with item 3 (Diagnostics).
 - *Topology's service links*: built. They are named for what they show (its name, its port, how many are ready), and the ready count is no longer said twice (WCAG 2.5.3).
 
+**Second round** (22 November 2026, "ours needs to be more user friendly and modern"; the Midnight Indigo kept, calmer, as chosen):
+- *Colour*: softer navy surfaces; indigo for the main button, the current page and tab, the focus ring and meters; crimson only for the brand's mark and danger (the red rule along the top gone).
+- *Type*: Inter in place of Plus Jakarta Sans, a size smaller; tabular figures only where numbers stand in columns (Inter's widen the hyphens in names).
+- *Shell*: the namespace picker in the top bar; quieter side bar entries, the current one tinted indigo.
+- *Lists*: headers in sentence case on a faint band, rounded tables, names in the text colour, images and other detail muted, an empty cell a dash; a Service's Ready count a pill in its state's colour (`Column.tone`); a cell of buttons stays a cell, so the row's rule runs straight.
+- *Cards*: rounder; at most four status cards a row; the Overview's alerts inside its health card, not in a second one; an object's details in a card.
+- *Charts*: CSV and PNG as quiet icon buttons, full strength on hover or focus.
+- *Images*: a row's less used actions (Scan, Download, Push, Remove) behind a More menu (lib/RowMenu.svelte); names in the text font. Apps' Deploy buttons plain, not a wall of indigo.
+- *Topology*: each link's two lines one text, its name starting with what it shows (axe's 2.5.3 rule; the route's and the published port's names did not hold their visible text).
+- Checked through the dev server against the Ryzen, dark and light: axe's WCAG 2.2 AA rules pass on Overview, Services, a Service, Volumes, a node, Deploy, Apps, Alerts, Images (its menu open), Topology and Diagnostics.
+
 **Done when** the lab's console tests and an axe-core pass hold after the
 change, and the same screens, side by side with Sylve's, read as one
 consistent product.
