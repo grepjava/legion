@@ -773,12 +773,17 @@ async fn status(State(g): State<Gateway>, headers: HeaderMap) -> Result<Response
         .status(pb::StatusRequest {})
         .await?
         .into_inner();
+    Ok(Json(status_json(&s)).into_response())
+}
+
+/// A manager's status as the console reads it.
+fn status_json(s: &pb::StatusResponse) -> serde_json::Value {
     let members: Vec<_> = s
         .members
         .iter()
         .map(|m| serde_json::json!({ "id": m.id.to_string(), "addr": m.addr, "voter": m.voter }))
         .collect();
-    Ok(Json(serde_json::json!({
+    serde_json::json!({
         "node": s.node_id.to_string(),
         "name": s.name,
         "leader": s.leader_id.map(|l| l.to_string()),
@@ -787,8 +792,7 @@ async fn status(State(g): State<Gateway>, headers: HeaderMap) -> Result<Response
         "version": s.applied_version,
         "protocol": s.protocol,
         "members": members,
-    }))
-    .into_response())
+    })
 }
 
 async fn kinds() -> Response {
@@ -952,6 +956,25 @@ enum Follow {
     /// `Cluster.WatchUsage`: the usage as `/api/usage` answers it, all at
     /// once, then again each time a node's report changes it.
     Usage { namespace: Option<String> },
+    /// `Cluster.WatchStatus`: this manager's status as `/api/status`
+    /// answers it, then again each time it changes.
+    Status,
+    /// `Cluster.WatchUsageHistory`: as `/api/usage-history` answers, then
+    /// again each time a sample is added.
+    History {
+        namespace: Option<String>,
+        task: Option<String>,
+        range_ms: Option<i64>,
+    },
+    /// `Cluster.WatchConnections`: as `/api/connections` answers, then
+    /// again each time they change (the nodes asked every 10 s).
+    Connections { namespace: String },
+    /// `Cluster.WatchLoadBalancers`: as `/api/load-balancers` answers,
+    /// then again each time they change.
+    LoadBalancers { namespace: String },
+    /// `Cluster.WatchCa`: as `/api/ca` answers, then again each time it
+    /// changes.
+    Ca,
     /// A task's output, as `legion logs` prints it: `{out}` or `{err}` (the
     /// bytes as text), then `{end: true}` when the container's output ends.
     Logs {
@@ -1101,6 +1124,70 @@ impl Follow {
                     stream,
                     |r: pb::UsageResponse| Step::Send(usage_json(&r)),
                     serde_json::json!({ "error": "the usage ended" }),
+                )
+            }
+            Follow::Status => {
+                let stream = ClusterClient::new(channel)
+                    .watch_status(pb::StatusRequest {})
+                    .await?
+                    .into_inner();
+                values_of(
+                    stream,
+                    |r: pb::StatusResponse| Step::Send(status_json(&r)),
+                    serde_json::json!({ "error": "the status ended" }),
+                )
+            }
+            Follow::History {
+                namespace,
+                task,
+                range_ms,
+            } => {
+                let stream = ClusterClient::new(channel)
+                    .max_decoding_message_size(crate::MAX_MESSAGE)
+                    .watch_usage_history(pb::UsageHistoryRequest {
+                        namespace: namespace.unwrap_or_default(),
+                        task: task.unwrap_or_default(),
+                        range_ms: range_ms.unwrap_or_default(),
+                    })
+                    .await?
+                    .into_inner();
+                values_of(
+                    stream,
+                    |r: pb::UsageHistoryResponse| Step::Send(history_json(&r)),
+                    serde_json::json!({ "error": "the usage history ended" }),
+                )
+            }
+            Follow::Connections { namespace } => {
+                let stream = ClusterClient::new(channel)
+                    .watch_connections(pb::ConnectionsRequest { namespace })
+                    .await?
+                    .into_inner();
+                values_of(
+                    stream,
+                    |r: pb::ConnectionsResponse| Step::Send(connections_json(&r)),
+                    serde_json::json!({ "error": "the connections ended" }),
+                )
+            }
+            Follow::LoadBalancers { namespace } => {
+                let stream = ClusterClient::new(channel)
+                    .watch_load_balancers(pb::LoadBalancersRequest { namespace })
+                    .await?
+                    .into_inner();
+                values_of(
+                    stream,
+                    |r: pb::LoadBalancersResponse| Step::Send(balancers_json(&r)),
+                    serde_json::json!({ "error": "the load balancers ended" }),
+                )
+            }
+            Follow::Ca => {
+                let stream = ClusterClient::new(channel)
+                    .watch_ca(pb::WatchCaRequest {})
+                    .await?
+                    .into_inner();
+                values_of(
+                    stream,
+                    |r: pb::RotateCaResponse| Step::Send(ca_value(&r)),
+                    serde_json::json!({ "error": "the CA's status ended" }),
                 )
             }
             Follow::Logs {
@@ -1631,6 +1718,11 @@ async fn usage_history(
         })
         .await?
         .into_inner();
+    Ok(Json(history_json(&r)).into_response())
+}
+
+/// Usage history as the console reads it: samples as arrays, smaller.
+fn history_json(r: &pb::UsageHistoryResponse) -> serde_json::Value {
     let tasks: Vec<_> = r
         .tasks
         .iter()
@@ -1677,12 +1769,11 @@ async fn usage_history(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({
+    serde_json::json!({
         "step_ms": r.step_ms,
         "tasks": tasks,
         "nodes": nodes,
-    }))
-    .into_response())
+    })
 }
 
 /// `legion reach`: what may reach what among a namespace's services,
@@ -1731,6 +1822,11 @@ async fn connections(
         })
         .await?
         .into_inner();
+    Ok(Json(connections_json(&r)).into_response())
+}
+
+/// Connections as the console reads them.
+fn connections_json(r: &pb::ConnectionsResponse) -> serde_json::Value {
     let end = |e: &Option<pb::ConnectionEnd>| {
         let e = e.clone().unwrap_or_default();
         serde_json::json!({ "kind": e.kind, "name": e.name })
@@ -1755,7 +1851,7 @@ async fn connections(
         .iter()
         .map(|n| serde_json::json!({ "node": n.node, "error": n.error }))
         .collect();
-    Ok(Json(serde_json::json!({ "edges": edges, "unanswered": unanswered })).into_response())
+    serde_json::json!({ "edges": edges, "unanswered": unanswered })
 }
 
 /// `legion load-balancers`: a namespace's load balancer addresses and
@@ -1773,6 +1869,11 @@ async fn load_balancers(
         })
         .await?
         .into_inner();
+    Ok(Json(balancers_json(&r)).into_response())
+}
+
+/// Load balancers as the console reads them.
+fn balancers_json(r: &pb::LoadBalancersResponse) -> serde_json::Value {
     let balancers: Vec<_> = r
         .balancers
         .iter()
@@ -1787,7 +1888,7 @@ async fn load_balancers(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({ "balancers": balancers })).into_response())
+    serde_json::json!({ "balancers": balancers })
 }
 
 #[derive(Deserialize)]
@@ -2680,16 +2781,20 @@ async fn join_token(
 }
 
 fn ca_json(r: pb::RotateCaResponse) -> Response {
+    Json(ca_value(&r)).into_response()
+}
+
+/// Where the CA stands, as the console reads it.
+fn ca_value(r: &pb::RotateCaResponse) -> serde_json::Value {
     let holders: Vec<_> = r
         .holders
         .iter()
         .map(|h| serde_json::json!({ "name": h.name, "kind": h.kind, "issuer": h.issuer }))
         .collect();
-    Json(serde_json::json!({
+    serde_json::json!({
         "digest": r.digest, "previous": r.previous_digest, "since_ms": r.since_ms,
         "holders": holders,
-    }))
-    .into_response()
+    })
 }
 
 /// `legion ca status`: the CA that issues, and each holder's.

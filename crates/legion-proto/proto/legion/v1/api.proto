@@ -105,6 +105,9 @@ service Cluster {
   // ALREADY_EXISTS if it already belongs to one.
   rpc Init(InitRequest) returns (StatusResponse);
   rpc Status(StatusRequest) returns (StatusResponse);
+  // Status as this manager gives it, then again each time it changes
+  // (Raft's view: its leader, term, members, the version applied).
+  rpc WatchStatus(StatusRequest) returns (stream StatusResponse);
   // The token that lets a node join with `role` ("manager" or "worker");
   // `rotate` replaces it, so the old token stops working.
   rpc JoinToken(JoinTokenRequest) returns (JoinTokenResponse);
@@ -124,6 +127,10 @@ service Cluster {
   // new CA every node moves to, the old one trusted until all have; either
   // way, says where the rotation is. The cluster admin's only.
   rpc RotateCa(RotateCaRequest) returns (RotateCaResponse);
+  // Where the CA stands, as RotateCa says it without `start`, then again
+  // each time it changes: a rotation's progress, each holder moving to
+  // the new CA. Ended once this manager no longer leads.
+  rpc WatchCa(WatchCaRequest) returns (stream RotateCaResponse);
   // Asks a node to become a manager or a worker (DESIGN.md §3.7, roles):
   // the node's daemon takes it up, in place, its tasks running on. The
   // cluster admin's only.
@@ -145,6 +152,9 @@ service Cluster {
   // starts empty): the tasks of `namespace`, or of every namespace when
   // empty, that the caller may read; with `task`, that one only.
   rpc UsageHistory(UsageHistoryRequest) returns (UsageHistoryResponse);
+  // UsageHistory, then again each time a sample is added to it. Ended
+  // once this manager no longer leads.
+  rpc WatchUsageHistory(UsageHistoryRequest) returns (stream UsageHistoryResponse);
   // Each namespace's quota and what it uses of it now: the requests of its
   // tasks placed and not ended, and its Volumes. The namespaces with a
   // quota whose tasks the caller may read; `namespace` alone when set.
@@ -169,11 +179,19 @@ service Cluster {
   // answered, the port and the way it was sent. For any caller who may
   // read the namespace's services; answered by the leader.
   rpc Connections(ConnectionsRequest) returns (ConnectionsResponse);
+  // Connections, then again each time they change: the nodes are asked
+  // again every 10 s while it is followed (pf says no more as it goes).
+  // Ended once this manager no longer leads.
+  rpc WatchConnections(ConnectionsRequest) returns (stream ConnectionsResponse);
   // A namespace's load balancer addresses: for each, the nodes that may
   // hold it, by CARP skew (the lowest the master meant), and the CARP
   // state each last reported, which says which holds it. For any caller
   // who may read the namespace's services; answered by the leader.
   rpc LoadBalancers(LoadBalancersRequest) returns (LoadBalancersResponse);
+  // LoadBalancers, then again each time they change: a node's heartbeat
+  // reporting another CARP state, a Service changed. Ended once this
+  // manager no longer leads.
+  rpc WatchLoadBalancers(LoadBalancersRequest) returns (stream LoadBalancersResponse);
   // What happened to objects lately, as this manager saw it (worked out
   // from the changes its replica sees, kept in memory for an hour): a
   // namespace's, or one object's (a Service's or Job's with its tasks').
@@ -736,6 +754,8 @@ message AutolockResponse {
 message RotateCaRequest {
   bool start = 1;
 }
+
+message WatchCaRequest {}
 
 message ChangeRoleRequest {
   string node = 1;

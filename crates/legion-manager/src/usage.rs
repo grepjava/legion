@@ -75,7 +75,8 @@ struct Report {
 }
 
 impl Usage {
-    /// Changes each time a node's report is taken.
+    /// Changes each time a node's report is taken: each heartbeat, its
+    /// CARP states and certificate's CA taken before (`Dispatcher::heartbeat`).
     pub fn reports(&self) -> tokio::sync::watch::Receiver<u64> {
         self.reported.subscribe()
     }

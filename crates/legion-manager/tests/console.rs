@@ -670,14 +670,20 @@ async fn a_tab_follows_everything_on_one_stream() {
         .expect("the stream's id first")
         .to_owned();
 
-    // Three things followed on it; another namespace's usage refused.
+    // What a page follows, on it; another namespace's usage, and the CA
+    // (an admin's), refused.
     let added = change(
         id.clone(),
         serde_json::json!({ "add": [
             { "id": "w", "what": "watch", "kind": "Config", "namespace": "shop" },
             { "id": "a", "what": "alerts", "namespace": "shop" },
             { "id": "u", "what": "usage", "namespace": "shop" },
+            { "id": "s", "what": "status" },
+            { "id": "h", "what": "history", "namespace": "shop" },
+            { "id": "l", "what": "load-balancers", "namespace": "shop" },
+            { "id": "c", "what": "connections", "namespace": "shop" },
             { "id": "theirs", "what": "usage", "namespace": "bank" },
+            { "id": "ca", "what": "ca" },
         ] }),
         alice.clone(),
         token.clone(),
@@ -689,9 +695,15 @@ async fn a_tab_follows_everything_on_one_stream() {
         "{}",
         added.text
     );
-    assert!(added.body["refused"].get("w").is_none(), "{}", added.text);
+    assert_eq!(added.body["refused"]["ca"]["status"], 403, "{}", added.text);
+    assert_eq!(
+        added.body["refused"].as_object().unwrap().len(),
+        2,
+        "{}",
+        added.text
+    );
     let mut seen = std::collections::BTreeMap::new();
-    while seen.len() < 3 {
+    while seen.len() < 7 {
         let m = next(&mut rx).await;
         seen.entry(m["id"].as_str().unwrap().to_owned())
             .or_insert(m["data"].clone());
@@ -700,6 +712,13 @@ async fn a_tab_follows_everything_on_one_stream() {
     assert_eq!(seen["w"]["object"]["metadata"]["name"], "menu");
     assert!(seen["a"]["alerts"].is_array(), "{seen:?}");
     assert!(seen["u"]["nodes"].is_array(), "{seen:?}");
+    assert!(seen["s"]["term"].as_u64().unwrap() >= 1, "{seen:?}");
+    assert_eq!(seen["s"]["leader"], seen["s"]["node"], "{seen:?}");
+    assert_eq!(seen["h"]["step_ms"], 15_000, "{seen:?}");
+    assert!(seen["h"]["tasks"].is_array(), "{seen:?}");
+    assert_eq!(seen["l"]["balancers"], serde_json::json!([]), "{seen:?}");
+    assert_eq!(seen["c"]["edges"], serde_json::json!([]), "{seen:?}");
+    let version = seen["s"]["version"].as_u64().unwrap();
 
     // Another session may not change her stream, nor may a page without
     // her session's token.
@@ -739,16 +758,38 @@ async fn a_tab_follows_everything_on_one_stream() {
         ))
         .await
         .unwrap();
+    // The status goes on, sent again as the change is applied.
+    let mut status = None;
     let quiet = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let m = next(&mut rx).await;
             if m["id"] == "w" {
                 return m;
             }
+            if m["id"] == "s" {
+                status = Some(m["data"].clone());
+            }
         }
     })
     .await;
     assert!(quiet.is_err(), "the dropped watch sent {quiet:?}");
+    let status = match status {
+        Some(s) => s,
+        None => tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let m = next(&mut rx).await;
+                if m["id"] == "s" {
+                    return m["data"].clone();
+                }
+            }
+        })
+        .await
+        .expect("the status is sent again once the change is applied"),
+    };
+    assert!(
+        status["version"].as_u64().unwrap() > version,
+        "{status} after {version}"
+    );
 
     // A stream no one has answers 404, for the tab to open another.
     let unknown = change(

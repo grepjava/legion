@@ -2207,6 +2207,59 @@ async fn workers_follow_their_work_through_any_manager() {
             "{front:?}"
         );
     }
+    // Followed through the follower, the leader's answer, then again as
+    // the node's next heartbeat changes it.
+    let mut follow = ClusterClient::new(follower.channel(Some(&admin)).await.unwrap())
+        .watch_load_balancers(legion_proto::v1::LoadBalancersRequest {
+            namespace: "default".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    // w1's state, if it may hold the address now (ready, so lately heard).
+    let state = |r: legion_proto::v1::LoadBalancersResponse| {
+        r.balancers[0].nodes.first().map(|n| n.state.clone())
+    };
+    assert_eq!(
+        state(follow.message().await.unwrap().unwrap()).as_deref(),
+        Some("master")
+    );
+    // w1 heartbeats as a node does, now saying it is CARP backup: each
+    // change is sent as it comes (w1 may have been suspect meanwhile, as
+    // it is heard only now), the new state among them.
+    let beating = {
+        let d1 = d1.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = d1
+                    .clone()
+                    .heartbeat(HeartbeatRequest {
+                        node: String::new(),
+                        carp: vec![legion_proto::v1::CarpState {
+                            address: "192.0.2.250".into(),
+                            state: "backup".into(),
+                        }],
+                        ..Default::default()
+                    })
+                    .await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while state(follow.message().await.unwrap().unwrap()).as_deref() != Some("backup") {}
+    })
+    .await
+    .expect("the heartbeat is sent on within seconds");
+    beating.abort();
+    // Without a namespace, refused before anything is followed.
+    let err = ClusterClient::new(follower.channel(Some(&admin)).await.unwrap())
+        .watch_load_balancers(legion_proto::v1::LoadBalancersRequest {
+            namespace: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
     first
         .objects()
         .await
@@ -2639,6 +2692,71 @@ async fn usage_shows_what_the_caller_may_read() {
             })
             .await,
     );
+
+    // The history followed: what she may read, at once; another
+    // namespace's refused, a task without its namespace too.
+    let history = |namespace: &str, task: &str| legion_proto::v1::UsageHistoryRequest {
+        namespace: namespace.into(),
+        task: task.into(),
+        range_ms: 0,
+    };
+    let mut follow = alice
+        .watch_usage_history(history("a", ""))
+        .await
+        .unwrap()
+        .into_inner();
+    let first = follow.message().await.unwrap().unwrap();
+    assert_eq!(first.step_ms, 15_000);
+    assert!(
+        !first.tasks.is_empty() && first.tasks.iter().all(|t| t.namespace == "a"),
+        "{first:?}"
+    );
+    denied(alice.watch_usage_history(history("b", "")).await);
+    let err = alice
+        .watch_usage_history(history("", "web-1-1"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err}");
+
+    // The CA followed: the admin's, refused to her.
+    denied(alice.watch_ca(legion_proto::v1::WatchCaRequest {}).await);
+    let mut ca_follow = m
+        .cluster()
+        .await
+        .watch_ca(legion_proto::v1::WatchCaRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let ca_now = ca_follow.message().await.unwrap().unwrap();
+    assert!(!ca_now.digest.is_empty(), "{ca_now:?}");
+    assert!(ca_now.previous_digest.is_empty(), "{ca_now:?}");
+
+    // The status followed, by anyone: again once a change is applied.
+    let mut status = alice
+        .watch_status(legion_proto::v1::StatusRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let before = status.message().await.unwrap().unwrap().applied_version;
+    admin
+        .clone()
+        .apply(apply(Object {
+            namespace: "a".into(),
+            ..service("api", 0)
+        }))
+        .await
+        .unwrap();
+    let after = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let s = status.message().await.unwrap().unwrap();
+            if s.applied_version > before {
+                return s.applied_version;
+            }
+        }
+    })
+    .await
+    .expect("the status is sent again within seconds");
+    assert!(after > before);
 }
 
 /// A manager forwards a user's request with the user's name, and the leader

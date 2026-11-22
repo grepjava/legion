@@ -1441,6 +1441,16 @@ impl Dispatcher for DispatcherService {
                 Err(e) => tracing::warn!(%node, "what the host lacks, unread: {e}"),
             }
         }
+        // What a CA rotation waits on: the CA of the node's certificate.
+        // Kept, as the CARP states are, before the usage is: taking the
+        // usage is what tells those following any of them (`Usage::reports`).
+        if let Some(issuer) = issuer {
+            self.api
+                .ca_seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(node.clone(), issuer);
+        }
         self.api.balancers.record(
             &node,
             carp.into_iter()
@@ -1507,14 +1517,6 @@ impl Dispatcher for DispatcherService {
             }),
             runs_on,
         );
-        // What a CA rotation waits on: the CA of the node's certificate.
-        if let Some(issuer) = issuer {
-            self.api
-                .ca_seen
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(node.clone(), issuer);
-        }
         self.seen
             .lock()
             .unwrap()

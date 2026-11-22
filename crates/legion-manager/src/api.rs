@@ -98,6 +98,202 @@ pub(crate) fn check_namespace(namespace: &str) -> Result<(), Status> {
 }
 
 impl ApiService {
+    /// The samples kept of what tasks and nodes used over `range_ms` (the
+    /// last hour when 0), as the leader keeps them: what `caller` may read
+    /// of `namespace` (every namespace when empty), `task` alone when set.
+    pub(crate) async fn history_seen(
+        &self,
+        caller: &Caller,
+        namespace: &str,
+        task: &str,
+        range_ms: i64,
+    ) -> Result<pb::UsageHistoryResponse, Status> {
+        // Each stored task's service, requests and limits.
+        let specs: std::collections::HashMap<String, legion_api::task::TaskSpec> = self
+            .store
+            .list(Kind::Task, (!namespace.is_empty()).then_some(namespace))
+            .map(|l| l.objects)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|t| {
+                let key = format!("{}/{}", t.metadata.namespace, t.metadata.name);
+                Some((key, legion_api::parse(&t.spec).ok()?))
+            })
+            .collect();
+        // Up to an hour, the leader's own samples; past it, those kept.
+        let hour = crate::usage::HISTORY.as_millis() as i64;
+        let (step_ms, task_series, node_series) = if range_ms <= hour {
+            let tasks = self
+                .usage
+                .history()
+                .into_iter()
+                .map(|(key, (node, samples))| {
+                    let samples = samples
+                        .iter()
+                        .map(|s| (s.at_ms, f64::from(s.cpu), s.memory))
+                        .collect::<Vec<_>>();
+                    (key, (node, String::new(), samples))
+                })
+                .collect::<Vec<_>>();
+            let nodes = self.usage.node_history().into_iter().collect::<Vec<_>>();
+            (crate::usage::STEP.as_millis() as i64, tasks, nodes)
+        } else {
+            let step = crate::history::step_for(std::time::Duration::from_millis(range_ms as u64));
+            let step_ms = step.as_millis() as i64;
+            let from = crate::history::now_ms() - range_ms;
+            let archive = self.history.clone();
+            let kept =
+                tokio::task::spawn_blocking(move || archive.lock().unwrap().range(from, step_ms))
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+            let mut tasks = Vec::new();
+            let mut nodes = Vec::new();
+            for (key, s) in kept {
+                if let Some(task) = key.strip_prefix("t/") {
+                    let samples = s
+                        .points
+                        .iter()
+                        .filter(|(_, v)| v.len() >= 2)
+                        .map(|(at, v)| (*at, v[0], v[1] as u64))
+                        .collect::<Vec<_>>();
+                    tasks.push((task.to_owned(), (s.node, s.service, samples)));
+                } else if let Some(node) = key.strip_prefix("n/") {
+                    let samples = s
+                        .points
+                        .iter()
+                        .filter_map(|(at, v)| crate::history::node_sample(*at, v))
+                        .collect::<Vec<_>>();
+                    nodes.push((node.to_owned(), samples));
+                }
+            }
+            (step_ms, tasks, nodes)
+        };
+        let tasks = task_series
+            .into_iter()
+            .filter_map(|(key, (node, kept_service, samples))| {
+                let (ns, name) = key.split_once('/')?;
+                let spec = specs.get(&key);
+                let kept_service = (!kept_service.is_empty()).then_some(kept_service);
+                let service = spec
+                    .map(|s| s.service.clone())
+                    .or(kept_service)
+                    .unwrap_or_else(|| {
+                        let mut parts = name.rsplitn(3, '-');
+                        let (_, _, svc) = (parts.next(), parts.next(), parts.next());
+                        svc.unwrap_or(name).to_owned()
+                    });
+                let wanted = ns != SYSTEM_NAMESPACE
+                    && (namespace.is_empty() || ns == namespace)
+                    && (task.is_empty() || name == task)
+                    && caller.may(&self.store, Verb::Read, Kind::Task, ns);
+                wanted.then(|| pb::TaskSeries {
+                    namespace: ns.to_owned(),
+                    task: name.to_owned(),
+                    node,
+                    service,
+                    cpu_request_percent: spec.map_or(0.0, |s| s.pod.requests().cpu.0 as f64 / 10.0),
+                    memory_request_bytes: spec.map_or(0, |s| s.pod.requests().memory.0),
+                    cpu_limit_percent: spec
+                        .and_then(|s| pod_limits(&s.pod).0)
+                        .map_or(0.0, |c| c as f64 / 10.0),
+                    memory_limit_bytes: spec.and_then(|s| pod_limits(&s.pod).1).unwrap_or(0),
+                    samples: samples
+                        .iter()
+                        .map(|&(at_ms, cpu_percent, memory_bytes)| pb::UsageSample {
+                            at_ms,
+                            cpu_percent,
+                            memory_bytes,
+                        })
+                        .collect(),
+                })
+            })
+            .collect();
+        let nodes = if task.is_empty() && caller.may(&self.store, Verb::Read, Kind::Node, "") {
+            node_series
+                .into_iter()
+                .map(|(node, samples)| pb::NodeSeries {
+                    node,
+                    samples: samples
+                        .into_iter()
+                        .map(|s| pb::NodeSample {
+                            at_ms: s.at_ms,
+                            zfs_used_bytes: s.zfs_used_bytes,
+                            zfs_avail_bytes: s.zfs_avail_bytes,
+                            net_rx_bps: s.net_rx_bps,
+                            net_tx_bps: s.net_tx_bps,
+                            zfs_read_bps: s.zfs_read_bps,
+                            zfs_write_bps: s.zfs_write_bps,
+                            zfs_read_iops: s.zfs_read_iops,
+                            zfs_write_iops: s.zfs_write_iops,
+                        })
+                        .collect(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(pb::UsageHistoryResponse {
+            tasks,
+            step_ms,
+            nodes,
+        })
+    }
+
+    /// A namespace's load balancer addresses and the CARP state each node
+    /// last reported of them, as the leader heard it.
+    pub(crate) fn balancers_seen(
+        &self,
+        namespace: &str,
+    ) -> Result<pb::LoadBalancersResponse, Status> {
+        let all = |kind| -> Result<BTreeMap<ObjectKey, Object>, Status> {
+            Ok(self
+                .store
+                .list(kind, None)
+                .map_err(internal)?
+                .objects
+                .into_iter()
+                .map(|o| (o.key(), o))
+                .collect())
+        };
+        let services: BTreeMap<ObjectKey, Object> = all(Kind::Service)?
+            .into_iter()
+            .filter(|(k, _)| k.namespace == namespace)
+            .collect();
+        // The nodes that may hold each address, as the dispatcher gives
+        // them out; tasks don't matter to that.
+        let endpoints =
+            crate::dispatcher::endpoints(&services, &BTreeMap::new(), &all(Kind::Node)?);
+        let reported = self.balancers.fresh();
+        let mut balancers: Vec<pb::LoadBalancer> = endpoints
+            .into_iter()
+            .filter_map(|e| {
+                let lb = e.load_balancer?;
+                let mut nodes: Vec<pb::LoadBalancerNode> = lb
+                    .skews
+                    .iter()
+                    .map(|(node, skew)| pb::LoadBalancerNode {
+                        node: node.clone(),
+                        skew: (*skew).into(),
+                        state: reported
+                            .get(node)
+                            .and_then(|r| r.get(&lb.address))
+                            .cloned()
+                            .unwrap_or_default(),
+                    })
+                    .collect();
+                nodes.sort_by_key(|n| n.skew);
+                Some(pb::LoadBalancer {
+                    service: e.name,
+                    address: lb.address.to_string(),
+                    vhid: lb.vhid.into(),
+                    nodes,
+                })
+            })
+            .collect();
+        balancers.sort_by(|a, b| a.service.cmp(&b.service));
+        Ok(pb::LoadBalancersResponse { balancers })
+    }
+
     /// What tasks and nodes use now, as the leader heard it: what
     /// `caller` may read of `namespace` (every namespace when empty).
     pub(crate) fn usage_seen(&self, caller: &Caller, namespace: &str) -> pb::UsageResponse {
@@ -1507,53 +1703,7 @@ impl Cluster for ApiService {
         }
         self.consistent().await?;
         caller.check(&self.store, Verb::Read, Kind::Service, &namespace)?;
-        let all = |kind| -> Result<BTreeMap<ObjectKey, Object>, Status> {
-            Ok(self
-                .store
-                .list(kind, None)
-                .map_err(internal)?
-                .objects
-                .into_iter()
-                .map(|o| (o.key(), o))
-                .collect())
-        };
-        let services: BTreeMap<ObjectKey, Object> = all(Kind::Service)?
-            .into_iter()
-            .filter(|(k, _)| k.namespace == namespace)
-            .collect();
-        // The nodes that may hold each address, as the dispatcher gives
-        // them out; tasks don't matter to that.
-        let endpoints =
-            crate::dispatcher::endpoints(&services, &BTreeMap::new(), &all(Kind::Node)?);
-        let reported = self.balancers.fresh();
-        let mut balancers: Vec<pb::LoadBalancer> = endpoints
-            .into_iter()
-            .filter_map(|e| {
-                let lb = e.load_balancer?;
-                let mut nodes: Vec<pb::LoadBalancerNode> = lb
-                    .skews
-                    .iter()
-                    .map(|(node, skew)| pb::LoadBalancerNode {
-                        node: node.clone(),
-                        skew: (*skew).into(),
-                        state: reported
-                            .get(node)
-                            .and_then(|r| r.get(&lb.address))
-                            .cloned()
-                            .unwrap_or_default(),
-                    })
-                    .collect();
-                nodes.sort_by_key(|n| n.skew);
-                Some(pb::LoadBalancer {
-                    service: e.name,
-                    address: lb.address.to_string(),
-                    vhid: lb.vhid.into(),
-                    nodes,
-                })
-            })
-            .collect();
-        balancers.sort_by(|a, b| a.service.cmp(&b.service));
-        Ok(Response::new(pb::LoadBalancersResponse { balancers }))
+        Ok(Response::new(self.balancers_seen(&namespace)?))
     }
 
     async fn usage(
@@ -1587,73 +1737,215 @@ impl Cluster for ApiService {
         let caller = self.caller(&req)?;
         let namespace = req.get_ref().namespace.clone();
         check_namespace(&namespace)?;
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
         // Only the leader hears heartbeats: followed there, passed on.
         if let Some(addr) = self.leader_addr(&req)? {
             let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
                 &addr,
                 self.peer_tls.as_ref(),
             ));
-            let mut from_leader = c
+            let from_leader = c
                 .watch_usage(forwarded_for(req.into_inner(), &caller)?)
                 .await?
                 .into_inner();
-            tokio::spawn(async move {
-                loop {
-                    let r = tokio::select! {
-                        r = from_leader.message() => r.transpose(),
-                        () = tx.closed() => return,
-                    };
-                    let Some(r) = r else { return };
-                    let last = r.is_err();
-                    if tx.send(r).await.is_err() || last {
-                        return;
-                    }
-                }
-            });
-            return Ok(Response::new(ReceiverStream::new(rx)));
+            return Ok(Response::new(passed_on(from_leader)));
         }
         self.consistent().await?;
         if !namespace.is_empty() {
             caller.check(&self.store, Verb::Read, Kind::Task, &namespace)?;
         }
-        let api = self.clone();
-        tokio::spawn(async move {
-            let mut closing = api.closing.clone();
-            let mut reports = api.usage.reports();
-            let mut raft = api.store.raft.metrics();
-            let mut sent: Option<pb::UsageResponse> = None;
-            loop {
-                // Another leader hears the nodes now: ended, to be opened
-                // again there.
-                if raft.borrow().current_leader != Some(api.id) {
-                    let _ = tx
-                        .send(Err(Status::unavailable(
-                            "leadership moved; follow usage again",
-                        )))
-                        .await;
-                    return;
-                }
-                let now = api.usage_seen(&caller, &namespace);
-                if sent.as_ref() != Some(&now) {
-                    if tx.send(Ok(now.clone())).await.is_err() {
-                        return;
-                    }
-                    sent = Some(now);
-                }
-                tokio::select! {
-                    r = reports.changed() => if r.is_err() { return },
-                    _ = raft.changed() => {}
-                    // A report grows too old to show though none comes.
-                    () = tokio::time::sleep(crate::usage::STEP) => {}
-                    () = tx.closed() => return,
-                    _ = closing.wait_for(|c| *c) => return,
-                }
-                // Nodes report about together: one look after them.
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        });
-        Ok(Response::new(ReceiverStream::new(rx)))
+        let wake = Wake {
+            leader: true,
+            reports: true,
+            // A report grows too old to show though none comes.
+            every: crate::usage::STEP,
+            ..Wake::default()
+        };
+        Ok(Response::new(self.followed(
+            wake,
+            |_| None,
+            move |api| {
+                let (caller, namespace) = (caller.clone(), namespace.clone());
+                async move { Ok(api.usage_seen(&caller, &namespace)) }
+            },
+        )))
+    }
+
+    type WatchStatusStream = ReceiverStream<Result<StatusResponse, Status>>;
+
+    async fn watch_status(
+        &self,
+        _req: Request<StatusRequest>,
+    ) -> Result<Response<Self::WatchStatusStream>, Status> {
+        // This manager's own view, as Status gives it: any caller, any
+        // manager, no leader needed.
+        let wake = Wake {
+            raft: true,
+            // What Raft's view does not hold: the CA a rotation moved
+            // this manager to, the protocol floor.
+            every: std::time::Duration::from_secs(60),
+            ..Wake::default()
+        };
+        Ok(Response::new(self.followed(
+            wake,
+            |_| None,
+            |api| async move { api.status() },
+        )))
+    }
+
+    type WatchCaStream = ReceiverStream<Result<pb::RotateCaResponse, Status>>;
+
+    async fn watch_ca(
+        &self,
+        req: Request<pb::WatchCaRequest>,
+    ) -> Result<Response<Self::WatchCaStream>, Status> {
+        self.caller(&req)?.require_all("follow the cluster CA")?;
+        if let Some(addr) = self.leader_addr(&req)? {
+            let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                &addr,
+                self.peer_tls.as_ref(),
+            ));
+            let from_leader = c.watch_ca(forwarded(req.into_inner())).await?.into_inner();
+            return Ok(Response::new(passed_on(from_leader)));
+        }
+        self.consistent().await?;
+        // Nodes tell their CA in their heartbeats, managers when asked:
+        // asked again often while a rotation runs.
+        let wake = Wake {
+            leader: true,
+            reports: true,
+            store: true,
+            every: std::time::Duration::from_secs(30),
+            settle: std::time::Duration::from_secs(1),
+            ..Wake::default()
+        };
+        let sooner = |r: &pb::RotateCaResponse| {
+            (!r.previous_digest.is_empty()).then_some(std::time::Duration::from_secs(3))
+        };
+        Ok(Response::new(self.followed(
+            wake,
+            sooner,
+            |api| async move { crate::ca::status(&api).await },
+        )))
+    }
+
+    type WatchUsageHistoryStream = ReceiverStream<Result<pb::UsageHistoryResponse, Status>>;
+
+    async fn watch_usage_history(
+        &self,
+        req: Request<pb::UsageHistoryRequest>,
+    ) -> Result<Response<Self::WatchUsageHistoryStream>, Status> {
+        let caller = self.caller(&req)?;
+        let (namespace, task, range_ms) = history_asked(req.get_ref())?;
+        if let Some(addr) = self.leader_addr(&req)? {
+            let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                &addr,
+                self.peer_tls.as_ref(),
+            ));
+            let from_leader = c
+                .watch_usage_history(forwarded_for(req.into_inner(), &caller)?)
+                .await?
+                .into_inner();
+            return Ok(Response::new(passed_on(from_leader)));
+        }
+        self.consistent().await?;
+        if !namespace.is_empty() {
+            caller.check(&self.store, Verb::Read, Kind::Task, &namespace)?;
+        }
+        // A sample is added each step: looked at again as often, and at
+        // least each minute.
+        let wake = Wake {
+            leader: true,
+            every: crate::usage::STEP,
+            ..Wake::default()
+        };
+        let every = |r: &pb::UsageHistoryResponse| {
+            Some(std::time::Duration::from_millis(
+                r.step_ms
+                    .clamp(crate::usage::STEP.as_millis() as i64, 60_000) as u64,
+            ))
+        };
+        Ok(Response::new(self.followed(wake, every, move |api| {
+            let (caller, namespace, task) = (caller.clone(), namespace.clone(), task.clone());
+            async move { api.history_seen(&caller, &namespace, &task, range_ms).await }
+        })))
+    }
+
+    type WatchConnectionsStream = ReceiverStream<Result<pb::ConnectionsResponse, Status>>;
+
+    async fn watch_connections(
+        &self,
+        req: Request<pb::ConnectionsRequest>,
+    ) -> Result<Response<Self::WatchConnectionsStream>, Status> {
+        let caller = self.caller(&req)?;
+        let namespace = crate::connections::asked(self, &caller, req.get_ref())?;
+        if let Some(mut leader) = crate::image_ops::leader_client(self, &req)? {
+            let from_leader = leader
+                .watch_connections(forwarded_for(req.into_inner(), &caller)?)
+                .await?
+                .into_inner();
+            return Ok(Response::new(passed_on(from_leader)));
+        }
+        self.consistent().await?;
+        // pf says nothing as connections come and go: the nodes are asked
+        // again every 10 s while someone follows.
+        let wake = Wake {
+            leader: true,
+            every: std::time::Duration::from_secs(10),
+            ..Wake::default()
+        };
+        Ok(Response::new(self.followed(
+            wake,
+            |_| None,
+            move |api| {
+                let namespace = namespace.clone();
+                async move { crate::connections::seen(&api, &namespace).await }
+            },
+        )))
+    }
+
+    type WatchLoadBalancersStream = ReceiverStream<Result<pb::LoadBalancersResponse, Status>>;
+
+    async fn watch_load_balancers(
+        &self,
+        req: Request<pb::LoadBalancersRequest>,
+    ) -> Result<Response<Self::WatchLoadBalancersStream>, Status> {
+        let caller = self.caller(&req)?;
+        let namespace = req.get_ref().namespace.clone();
+        if namespace.is_empty() {
+            return Err(Status::invalid_argument("which namespace?"));
+        }
+        check_namespace(&namespace)?;
+        if let Some(addr) = self.leader_addr(&req)? {
+            let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                &addr,
+                self.peer_tls.as_ref(),
+            ));
+            let from_leader = c
+                .watch_load_balancers(forwarded_for(req.into_inner(), &caller)?)
+                .await?
+                .into_inner();
+            return Ok(Response::new(passed_on(from_leader)));
+        }
+        self.consistent().await?;
+        caller.check(&self.store, Verb::Read, Kind::Service, &namespace)?;
+        // A heartbeat brings each node's CARP states; a Service changed
+        // changes its addresses; a node silent long enough says nothing.
+        let wake = Wake {
+            leader: true,
+            reports: true,
+            store: true,
+            every: std::time::Duration::from_secs(10),
+            settle: std::time::Duration::from_secs(1),
+            ..Wake::default()
+        };
+        Ok(Response::new(self.followed(
+            wake,
+            |_| None,
+            move |api| {
+                let namespace = namespace.clone();
+                async move { api.balancers_seen(&namespace) }
+            },
+        )))
     }
 
     async fn usage_history(
@@ -1661,18 +1953,7 @@ impl Cluster for ApiService {
         req: Request<pb::UsageHistoryRequest>,
     ) -> Result<Response<pb::UsageHistoryResponse>, Status> {
         let caller = self.caller(&req)?;
-        let (namespace, task) = (req.get_ref().namespace.clone(), req.get_ref().task.clone());
-        check_namespace(&namespace)?;
-        if !task.is_empty() && namespace.is_empty() {
-            return Err(Status::invalid_argument("a task is named in its namespace"));
-        }
-        let range_ms = req.get_ref().range_ms;
-        if range_ms < 0 || range_ms > crate::history::KEEP.as_millis() as i64 {
-            return Err(Status::invalid_argument(format!(
-                "a range is up to {} days",
-                crate::history::KEEP.as_secs() / 86_400
-            )));
-        }
+        let (namespace, task, range_ms) = history_asked(req.get_ref())?;
         // Only the leader hears heartbeats; it checks the user's rights.
         if let Some(addr) = self.leader_addr(&req)? {
             let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
@@ -1687,138 +1968,10 @@ impl Cluster for ApiService {
         if !namespace.is_empty() {
             caller.check(&self.store, Verb::Read, Kind::Task, &namespace)?;
         }
-        // Each stored task's service, requests and limits.
-        let specs: std::collections::HashMap<String, legion_api::task::TaskSpec> = self
-            .store
-            .list(
-                Kind::Task,
-                (!namespace.is_empty()).then_some(namespace.as_str()),
-            )
-            .map(|l| l.objects)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|t| {
-                let key = format!("{}/{}", t.metadata.namespace, t.metadata.name);
-                Some((key, legion_api::parse(&t.spec).ok()?))
-            })
-            .collect();
-        // Up to an hour, the leader's own samples; past it, those kept.
-        let hour = crate::usage::HISTORY.as_millis() as i64;
-        let (step_ms, task_series, node_series) = if range_ms <= hour {
-            let tasks = self
-                .usage
-                .history()
-                .into_iter()
-                .map(|(key, (node, samples))| {
-                    let samples = samples
-                        .iter()
-                        .map(|s| (s.at_ms, f64::from(s.cpu), s.memory))
-                        .collect::<Vec<_>>();
-                    (key, (node, String::new(), samples))
-                })
-                .collect::<Vec<_>>();
-            let nodes = self.usage.node_history().into_iter().collect::<Vec<_>>();
-            (crate::usage::STEP.as_millis() as i64, tasks, nodes)
-        } else {
-            let step = crate::history::step_for(std::time::Duration::from_millis(range_ms as u64));
-            let step_ms = step.as_millis() as i64;
-            let from = crate::history::now_ms() - range_ms;
-            let archive = self.history.clone();
-            let kept =
-                tokio::task::spawn_blocking(move || archive.lock().unwrap().range(from, step_ms))
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
-            let mut tasks = Vec::new();
-            let mut nodes = Vec::new();
-            for (key, s) in kept {
-                if let Some(task) = key.strip_prefix("t/") {
-                    let samples = s
-                        .points
-                        .iter()
-                        .filter(|(_, v)| v.len() >= 2)
-                        .map(|(at, v)| (*at, v[0], v[1] as u64))
-                        .collect::<Vec<_>>();
-                    tasks.push((task.to_owned(), (s.node, s.service, samples)));
-                } else if let Some(node) = key.strip_prefix("n/") {
-                    let samples = s
-                        .points
-                        .iter()
-                        .filter_map(|(at, v)| crate::history::node_sample(*at, v))
-                        .collect::<Vec<_>>();
-                    nodes.push((node.to_owned(), samples));
-                }
-            }
-            (step_ms, tasks, nodes)
-        };
-        let tasks = task_series
-            .into_iter()
-            .filter_map(|(key, (node, kept_service, samples))| {
-                let (ns, name) = key.split_once('/')?;
-                let spec = specs.get(&key);
-                let kept_service = (!kept_service.is_empty()).then_some(kept_service);
-                let service = spec
-                    .map(|s| s.service.clone())
-                    .or(kept_service)
-                    .unwrap_or_else(|| {
-                        let mut parts = name.rsplitn(3, '-');
-                        let (_, _, svc) = (parts.next(), parts.next(), parts.next());
-                        svc.unwrap_or(name).to_owned()
-                    });
-                let wanted = ns != SYSTEM_NAMESPACE
-                    && (namespace.is_empty() || ns == namespace)
-                    && (task.is_empty() || name == task)
-                    && caller.may(&self.store, Verb::Read, Kind::Task, ns);
-                wanted.then(|| pb::TaskSeries {
-                    namespace: ns.to_owned(),
-                    task: name.to_owned(),
-                    node,
-                    service,
-                    cpu_request_percent: spec.map_or(0.0, |s| s.pod.requests().cpu.0 as f64 / 10.0),
-                    memory_request_bytes: spec.map_or(0, |s| s.pod.requests().memory.0),
-                    cpu_limit_percent: spec
-                        .and_then(|s| pod_limits(&s.pod).0)
-                        .map_or(0.0, |c| c as f64 / 10.0),
-                    memory_limit_bytes: spec.and_then(|s| pod_limits(&s.pod).1).unwrap_or(0),
-                    samples: samples
-                        .iter()
-                        .map(|&(at_ms, cpu_percent, memory_bytes)| pb::UsageSample {
-                            at_ms,
-                            cpu_percent,
-                            memory_bytes,
-                        })
-                        .collect(),
-                })
-            })
-            .collect();
-        let nodes = if task.is_empty() && caller.may(&self.store, Verb::Read, Kind::Node, "") {
-            node_series
-                .into_iter()
-                .map(|(node, samples)| pb::NodeSeries {
-                    node,
-                    samples: samples
-                        .into_iter()
-                        .map(|s| pb::NodeSample {
-                            at_ms: s.at_ms,
-                            zfs_used_bytes: s.zfs_used_bytes,
-                            zfs_avail_bytes: s.zfs_avail_bytes,
-                            net_rx_bps: s.net_rx_bps,
-                            net_tx_bps: s.net_tx_bps,
-                            zfs_read_bps: s.zfs_read_bps,
-                            zfs_write_bps: s.zfs_write_bps,
-                            zfs_read_iops: s.zfs_read_iops,
-                            zfs_write_iops: s.zfs_write_iops,
-                        })
-                        .collect(),
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        Ok(Response::new(pb::UsageHistoryResponse {
-            tasks,
-            step_ms,
-            nodes,
-        }))
+        Ok(Response::new(
+            self.history_seen(&caller, &namespace, &task, range_ms)
+                .await?,
+        ))
     }
 
     async fn quotas(
@@ -2779,6 +2932,176 @@ impl ApiService {
             ca_issuer: crate::ca::own_issuer(self),
         })
     }
+}
+
+/// What wakes a followed answer (`ApiService::followed`) to be worked out
+/// again; sent only when it changed.
+#[derive(Clone, Copy)]
+pub(crate) struct Wake {
+    /// Leader's work: ended once this manager no longer leads, to be
+    /// followed again on the leader there is.
+    pub leader: bool,
+    /// Raft's view changing: leader, term, members, a version applied.
+    pub raft: bool,
+    /// A node's heartbeat taken (`Usage::reports`).
+    pub reports: bool,
+    /// A change to the store.
+    pub store: bool,
+    /// Worked out again after this though nothing woke it.
+    pub every: std::time::Duration,
+    /// Once woken, how long to wait for what comes with it: changes and
+    /// heartbeats come in bursts.
+    pub settle: std::time::Duration,
+}
+
+impl Default for Wake {
+    fn default() -> Self {
+        Wake {
+            leader: false,
+            raft: false,
+            reports: false,
+            store: false,
+            every: std::time::Duration::from_secs(60),
+            settle: std::time::Duration::from_secs(1),
+        }
+    }
+}
+
+impl ApiService {
+    /// Follows an answer: `look` works it out, sent first, then again
+    /// each time it is different, worked out again whenever `wake` says
+    /// (`sooner`, given the last answer, may ask for it sooner than
+    /// `wake.every`). Ends when the follower goes, the manager closes,
+    /// `look` fails (its error the last message), or, for the leader's
+    /// work, another manager leads.
+    pub(crate) fn followed<T, F, Fut>(
+        &self,
+        wake: Wake,
+        sooner: impl Fn(&T) -> Option<std::time::Duration> + Send + 'static,
+        mut look: F,
+    ) -> ReceiverStream<Result<T, Status>>
+    where
+        T: PartialEq + Clone + Send + 'static,
+        F: FnMut(ApiService) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T, Status>> + Send,
+    {
+        let api = self.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            let mut closing = api.closing.clone();
+            let mut reports = api.usage.reports();
+            let mut raft = api.store.raft.metrics();
+            let mut watcher = None;
+            let mut sent: Option<T> = None;
+            loop {
+                let leads = raft.borrow().current_leader == Some(api.id);
+                if wake.leader && !leads {
+                    let _ = tx
+                        .send(Err(Status::unavailable(
+                            "leadership moved; follow it again",
+                        )))
+                        .await;
+                    return;
+                }
+                let now = match look(api.clone()).await {
+                    Ok(now) => now,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                };
+                let every = sooner(&now).map_or(wake.every, |s| s.min(wake.every));
+                if sent.as_ref() != Some(&now) {
+                    if tx.send(Ok(now.clone())).await.is_err() {
+                        return;
+                    }
+                    sent = Some(now);
+                }
+                if wake.store && watcher.is_none() {
+                    watcher = api
+                        .store
+                        .applied_version()
+                        .ok()
+                        .and_then(|v| api.store.watch(v, None).ok());
+                }
+                let changed = async {
+                    match watcher.as_mut() {
+                        Some(w) => w.next().await.is_ok(),
+                        None => std::future::pending().await,
+                    }
+                };
+                let reported = async {
+                    if wake.reports {
+                        reports.changed().await.is_ok()
+                    } else {
+                        std::future::pending().await
+                    }
+                };
+                // The leader's work ends when another leads: Raft is
+                // watched for that too.
+                let viewed = async {
+                    if wake.raft || wake.leader {
+                        raft.changed().await.is_ok()
+                    } else {
+                        std::future::pending().await
+                    }
+                };
+                tokio::select! {
+                    ok = changed => if !ok { watcher = None },
+                    ok = reported => if !ok { return },
+                    ok = viewed => if !ok { return },
+                    () = tokio::time::sleep(every) => {}
+                    () = tx.closed() => return,
+                    _ = closing.wait_for(|c| *c) => return,
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(wake.settle) => {}
+                    () = tx.closed() => return,
+                    _ = closing.wait_for(|c| *c) => return,
+                }
+            }
+        });
+        ReceiverStream::new(rx)
+    }
+}
+
+/// A stream followed on the leader, passed on as it comes, ended with it
+/// (its error the last message) or when the follower goes.
+fn passed_on<T: Send + 'static>(
+    mut from: tonic::Streaming<T>,
+) -> ReceiverStream<Result<T, Status>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move {
+        loop {
+            let r = tokio::select! {
+                r = from.message() => r.transpose(),
+                () = tx.closed() => return,
+            };
+            let Some(r) = r else { return };
+            let last = r.is_err();
+            if tx.send(r).await.is_err() || last {
+                return;
+            }
+        }
+    });
+    ReceiverStream::new(rx)
+}
+
+/// A usage history request's namespace, task and range, checked.
+fn history_asked(req: &pb::UsageHistoryRequest) -> Result<(String, String, i64), Status> {
+    let (namespace, task) = (req.namespace.clone(), req.task.clone());
+    check_namespace(&namespace)?;
+    if !task.is_empty() && namespace.is_empty() {
+        return Err(Status::invalid_argument("a task is named in its namespace"));
+    }
+    let range_ms = req.range_ms;
+    if range_ms < 0 || range_ms > crate::history::KEEP.as_millis() as i64 {
+        return Err(Status::invalid_argument(format!(
+            "a range is up to {} days",
+            crate::history::KEEP.as_secs() / 86_400
+        )));
+    }
+    Ok((namespace, task, range_ms))
 }
 
 /// Whether `caller` may see `a`: a namespace's alerts by its tasks' rights,

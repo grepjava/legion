@@ -19,7 +19,7 @@ use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 
 use crate::api::{ApiService, check_namespace, forwarded_for};
-use crate::authz::Verb;
+use crate::authz::{Caller, Verb};
 use crate::image_ops::{attach, leader_client};
 use crate::session::Attachment;
 
@@ -43,18 +43,37 @@ pub(crate) async fn connections(
     req: Request<pb::ConnectionsRequest>,
 ) -> Result<Response<pb::ConnectionsResponse>, Status> {
     let caller = api.caller(&req)?;
-    let namespace = req.get_ref().namespace.clone();
-    if namespace.is_empty() {
-        return Err(Status::invalid_argument("which namespace?"));
-    }
-    check_namespace(&namespace)?;
-    caller.check(&api.store, Verb::Read, Kind::Service, &namespace)?;
+    let namespace = asked(api, &caller, req.get_ref())?;
     if let Some(mut leader) = leader_client(api, &req)? {
         return leader
             .connections(forwarded_for(req.into_inner(), &caller)?)
             .await;
     }
     api.consistent().await?;
+    Ok(Response::new(seen(api, &namespace).await?))
+}
+
+/// The namespace asked about, if `caller` may read its services.
+pub(crate) fn asked(
+    api: &ApiService,
+    caller: &Caller,
+    req: &pb::ConnectionsRequest,
+) -> Result<String, Status> {
+    let namespace = req.namespace.clone();
+    if namespace.is_empty() {
+        return Err(Status::invalid_argument("which namespace?"));
+    }
+    check_namespace(&namespace)?;
+    caller.check(&api.store, Verb::Read, Kind::Service, &namespace)?;
+    Ok(namespace)
+}
+
+/// The connections of `namespace`'s tasks, each node asked now: on the
+/// leader, caught up.
+pub(crate) async fn seen(
+    api: &ApiService,
+    namespace: &str,
+) -> Result<pb::ConnectionsResponse, Status> {
     let list = |kind| {
         api.store
             .list(kind, None)
@@ -97,10 +116,10 @@ pub(crate) async fn connections(
         }),
         statuses.iter().map(|(n, s)| (n.as_str(), s)),
     );
-    Ok(Response::new(pb::ConnectionsResponse {
-        edges: edges(&directory, &namespace, seen),
+    Ok(pb::ConnectionsResponse {
+        edges: edges(&directory, namespace, seen),
         unanswered,
-    }))
+    })
 }
 
 /// What `node`'s agent says.
