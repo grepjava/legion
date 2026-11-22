@@ -28,15 +28,43 @@ fn running(lab: &Lab, namespace: &str) -> bool {
         .any(|t| t["status"]["state"] == "running")
 }
 
-/// Whether something answers on `port` of this host, at its address: a
-/// published port is taken where the node is reached, not on its own
-/// loopback.
-fn open(host: &str, port: u16) -> bool {
-    std::net::TcpStream::connect_timeout(
-        &format!("{host}:{port}").parse().unwrap(),
-        std::time::Duration::from_secs(3),
-    )
-    .is_ok()
+/// Whether something answers on `addr` (`ip:port`).
+fn open(addr: &str) -> bool {
+    addr.parse().is_ok_and(|a| {
+        std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_secs(3)).is_ok()
+    })
+}
+
+/// Where an app answers from this host: its running task's address and
+/// the container port behind `published`, which its Service must publish.
+/// Not the published port itself: pf's `rdr` does not take what a host
+/// sends itself (DESIGN.md §5.4), so a node's own published ports are
+/// reached from another, and this test has one host.
+fn reached(lab: &Lab, namespace: &str, published: u64) -> Option<String> {
+    let service = lab.list("services", namespace).into_iter().next()?;
+    let port = service["spec"]["endpoint"]["ports"]
+        .as_array()?
+        .iter()
+        .find(|p| p["publishedPort"].as_u64() == Some(published))?
+        .clone();
+    // The container port: a number, or a container's port by its name.
+    let target = match &port["targetPort"] {
+        serde_json::Value::Number(n) => n.as_u64()?,
+        serde_json::Value::String(name) => service["spec"]["pod"]["containers"]
+            .as_array()?
+            .iter()
+            .flat_map(|c| c["ports"].as_array().cloned().unwrap_or_default())
+            .find(|p| p["name"] == name.as_str())?["containerPort"]
+            .as_u64()?,
+        _ => port["port"].as_u64()?,
+    };
+    let ip = lab
+        .list("tasks", namespace)
+        .into_iter()
+        .find(|t| t["status"]["state"] == "running")?["status"]["ip"]
+        .as_str()?
+        .to_owned();
+    Some(format!("{ip}:{target}"))
 }
 
 #[test]
@@ -80,15 +108,16 @@ fn apps_of_the_catalog_deploy_and_answer() {
         ("vaultwarden", 28080),
     ] {
         lab.wait_or_report(
-            &format!("{namespace} running and answering on {port}"),
+            &format!("{namespace} running, published on {port} and answering"),
             900,
-            || running(&lab, namespace) && open(&lab.host, port),
+            || running(&lab, namespace) && reached(&lab, namespace, port).is_some_and(|a| open(&a)),
         );
     }
-    // Vaultwarden's web page; PostgreSQL taking its password.
+    // Vaultwarden's web page (a 200); PostgreSQL taking its password.
+    let web = reached(&lab, "vaultwarden", 28080).unwrap();
+    let (ip, port) = web.rsplit_once(':').unwrap();
     wait("Vaultwarden's page", 120, || {
-        common::http_get(&lab.host, 28080)
-            .is_ok_and(|r| r.starts_with("HTTP/1.1 200") || r.starts_with("HTTP/1.0 200"))
+        common::http_get(ip, port.parse().unwrap()).is_ok()
     });
     let task = lab
         .list("tasks", "postgres")
