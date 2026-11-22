@@ -28,6 +28,23 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  console:
+    name: console (type check, messages, unit tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/legion-console/web
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/legion-console/web/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+
   freebsd:
     name: test (FreeBSD 15.1 ${{ matrix.arch }})
     runs-on: ubuntu-latest
