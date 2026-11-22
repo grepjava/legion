@@ -9,12 +9,12 @@ phase has been.
 
 In order of priority:
 
-1. [Scheduled Volume snapshots and backups](#1-scheduled-volume-snapshots-and-backups)
+1. [Scheduled Volume snapshots and backups](#1-scheduled-volume-snapshots-and-backups): built
 2. [Moving a Volume while it runs](#2-moving-a-volume-while-it-runs): checked, already built
 3. [Setting up pf for Legion](#3-setting-up-pf-for-legion): built
-4. [Console sign-in with host accounts and passkeys](#4-console-sign-in-with-host-accounts-and-passkeys)
-5. [Ready-to-deploy applications](#5-ready-to-deploy-applications)
-6. [Console polish](#6-console-polish)
+4. [Console sign-in with host accounts and passkeys](#4-console-sign-in-with-host-accounts-and-passkeys): not now (decided 22 November 2026: the certificate and one-time link suit, as Kubernetes' do)
+5. [Ready-to-deploy applications](#5-ready-to-deploy-applications): built
+6. [Console polish](#6-console-polish): built
 
 ## 1. Scheduled Volume snapshots and backups
 
@@ -70,6 +70,16 @@ over SSH, with retention and restore).
 backups pruned to `keep` across a manager failover and a node drain, a
 backup restores to another node with the data as at that time, and the
 lab covers it.
+
+**Built** (22 November 2026), as proposed, settled in DESIGN.md §4.3 (Volume snapshot schedules, Volume backups):
+- `snapshots: [{every, keep}]` on a Volume or a stateful claim, taken by the leader's snapshotter as `legion-auto-<every>-<time>`, pruned per schedule. Its status is in the Volume, so a new leader carries on. `snapshot-late` is raised.
+- `legion-` names are Legion's: a person's may not start so, and of Legion's own only a schedule's are listed, rolled back to or deleted. `rollback` says which later snapshots it destroys and asks first. `legion volume clone VOLUME@SNAPSHOT NAME` copies a snapshot into a new Volume.
+- `BackupTarget` (cluster-scoped): a ZFS host over SSH (key from a Secret, host key pinned, incremental after the first, each whole backup in a dataset of its own there) or a directory on the node (a whole stream file each).
+- `backup: {target, every, keep}` runs each as an Activity, prunes the target and keeps only the next base on the node. `legion volume backups` lists, `restore --from` restores onto a node. `backup-late` is raised.
+- Console: the Volume's Data tab shows its schedules, its backups and a restore, and copies a snapshot into a new Volume.
+- Checked on the Ryzen: snapshots and directory backups pruned to `keep`; restore and clone hold the data as at their time.
+- Lab test: `volumes_keep_scheduled_snapshots_and_backups_that_restore`, n3 as the SSH host.
+- Left: S3-compatible targets; the failover and drain cases of "done when" are covered by the status carrying over moves and promotions, but not yet run in the lab.
 
 ## 2. Moving a Volume while it runs
 
@@ -171,6 +181,16 @@ Paperless-ngx and Actual Budget.
 **Done when** ten widely used applications deploy from a catalog with one
 command or a few clicks, and the lab deploys and reaches three of them.
 
+**Built** (22 November 2026), settled in DESIGN.md §4.3 (Ready-to-deploy apps):
+- The daemonless images run under Legion as they are. The catalog (BSD-2-Clause) is read when asked, never bundled.
+- `legion app list|show|deploy` and the console's Apps page (132 apps, opening on Import compose with the variables filled in).
+- A manifest's variables are typed: storage is a Volume of the stack, a secret not set is made up and printed once, an empty default is left to the app.
+- Podman's FreeBSD jail annotations become `security.allow`, and a stack's namespace allows what its containers ask (for `stack deploy`, `app deploy` and the console alike).
+- Checked on the Ryzen with twelve apps deployed by `legion app deploy` and reached: PostgreSQL, Redis, Uptime Kuma, Homepage, Vaultwarden, Syncthing, Actual Budget, nginx, File Browser, Navidrome, Gitea, Mealie.
+- Two Legion bugs found and fixed on the way: pods now have an `/etc/hosts` naming their containers (Homepage), and a manifest's quoted defaults are read as `.env` files read them (Navidrome).
+- Lab test: `apps_of_the_catalog_deploy_and_answer` (Vaultwarden, PostgreSQL, Redis).
+- Not honoured: `network_mode: host` (Actual Budget answers on its pod's address, not a node port).
+
 ## 6. Console polish
 
 **Today.** Compared screen by screen with Sylve's console on
@@ -203,7 +223,7 @@ and memory charts; sizes no longer break between number and unit; the
 - *Plainer names*: "Volumes" and "Images".
 
 **Left.**
-- *Live pool I/O* on the dashboards: the agent does not read it yet (`zpool iostat`); a daemon change first.
+- *Live pool I/O*: built. The agent reads ZFS's per-dataset counters (`kstat.zfs.<pool>.dataset`) as rates. They are charted (Pool I/O) and shown on the Overview's and Volumes' cards, with a history of 30 days.
 - *A review before changing a host*: built with item 3 (Diagnostics).
 - *Topology's service links*: built. They are named for what they show (its name, its port, how many are ready), and the ready count is no longer said twice (WCAG 2.5.3).
 

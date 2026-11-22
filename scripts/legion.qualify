@@ -131,6 +131,12 @@ test legion stateful a_drain_says_each_stage_and_refuses_a_cancel_past_the_switc
 test legion stateful postgres_is_restored_onto_replacement_hosts host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_PG_IMAGE
 test legion stateful a_replicated_volume_carries_on_from_its_copy_when_its_host_is_lost host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_PG_IMAGE
 test legion stateful a_replicated_volume_fails_over_on_its_own_when_its_node_is_cut_off host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_PG_IMAGE
+# Scheduled snapshots and backups (TODO.MD item 1): n3 the SSH backup host.
+test legion backups volumes_keep_scheduled_snapshots_and_backups_that_restore host cluster 2400 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
+# pf set up by legion doctor --fix pf (TODO.MD item 3), on n2's pf.conf, put back after.
+test legion pf_fix doctor_puts_pf_right_asks_first_and_changes_nothing_twice host cluster 900 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
+# Apps of the daemonless catalog (TODO.MD item 5): needs the internet.
+test legion apps apps_of_the_catalog_deploy_and_answer host cluster 2400 env:LEGION_CLUSTER_LAB
 # The web console in a headless Chromium (CONSOLE.md, phases 1 to 6), and two
 # clusters signed into with one identity provider (phase 6's "done when").
 test legion console the_console_runs_the_cluster host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_BROWSER env:LEGION_AXE
