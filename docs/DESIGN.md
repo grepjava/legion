@@ -684,7 +684,11 @@ binary serves it.
   certificate unless `--console-cert`/`--console-key` name another (a
   browser trusts neither the cluster CA nor its server name). axum, on
   the hyper stack the manager already runs. JSON over HTTP for unary
-  calls; a WebSocket each for `Watch`, logs and `Pods.Session` (exec).
+  calls; server-sent events for the streams the console follows
+  (`Watch`, alerts, events, operations, logs, and usage from
+  `Cluster.WatchUsage`, which the leader sends again each time a node's
+  report changes it), so a page's streams share its one HTTP/2
+  connection; a WebSocket for `Pods.Session` (exec), which takes input.
   The gateway translates; it decides nothing itself.
 - **The user's own identity, on every call.** For each signed-in
   session the gateway holds a short-lived client certificate it issued

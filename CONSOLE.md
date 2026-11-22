@@ -23,7 +23,11 @@ API first, then the CLI and the console.
   `--metrics-listen` and the ingress.
 - **The API is the boundary.** A gateway in the manager turns browser
   requests into the same calls the CLI makes, as the signed-in user.
-  Watches, logs and exec go over WebSockets; nothing is polled.
+  Watches, alerts, events, operations, logs and what tasks use come as
+  server-sent events (since 23 November 2026; over HTTP/2 a page's streams
+  share its one connection), exec over a WebSocket, as it takes input.
+  What nodes are asked for on demand (connections seen, load balancers,
+  the CA) is read again every 10 to 30 s.
 - **Generic first.** The 13 kinds share one list, detail, YAML and
   delete view, driven by the API's own kind list. Hand-built pages are
   added where a generic view is not enough (nodes, tasks, volumes).
@@ -56,8 +60,9 @@ Decide the two things that are hard to change later, in DESIGN.md (§3.9, writte
      cross-origin requests.
    - OIDC comes later (phase 6), mapped onto the same identities.
 2. **Gateway.** In the manager, on axum (the hyper/tonic stack the
-   manager already has): JSON over HTTP for unary calls, WebSockets for
-   `Watch`, logs and `Pods.Session`. It calls the local manager's gRPC
+   manager already has): JSON over HTTP for unary calls, server-sent
+   events for `Watch` and the other streams, a WebSocket for
+   `Pods.Session` (exec). It calls the local manager's gRPC
    services in-process as the user, so leader forwarding, consistency
    and RBAC behave as for the CLI.
 
@@ -96,7 +101,7 @@ Tested over HTTPS against a manager (`crates/legion-manager/tests/console.rs`).
 
 **Since v0.1.19 (released in v0.2.0):** sign-in over HTTP/2, as browsers speak it (the origin
 check took the host from a `Host` header HTTP/2 doesn't send; the test
-now signs in over HTTP/2); task logs (`/api/logs`, a WebSocket of the
+now signs in over HTTP/2); task logs (`/api/logs`, a stream of the
 `Pods.Session` the CLI's `logs` opens, tail and follow); what tasks use
 now (`/api/usage`); label filters in every list (`app=web`, `app!=web`,
 `!canary`, beside words for names); a YAML view of any object; a node's
@@ -127,7 +132,7 @@ the lab; every action shows in `legion audit`; a `view` user sees the
 buttons disabled with the reason.
 
 **Built so far:** writes carry a per-session token (`x-legion-csrf`, from
-`/api/me`; a WebSocket sends it in its query) besides the origin check.
+`/api/me`; exec's WebSocket sends it in its query) besides the origin check.
 Apply YAML pasted or edited from the stored manifest (`/api/manifest`),
 an edit applied only over the version read; "Show changes" is `legion
 diff` on the server (a dry run, a unified diff of the manifests). Delete
