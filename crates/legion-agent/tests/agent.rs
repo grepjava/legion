@@ -2109,7 +2109,7 @@ containers:
     let mounts: Vec<_> = spec
         .mounts
         .iter()
-        .filter(|m| m.destination != "/etc/resolv.conf")
+        .filter(|m| !matches!(m.destination.as_str(), "/etc/resolv.conf" | "/etc/hosts"))
         .map(|m| {
             (
                 m.source.as_str(),
@@ -2138,18 +2138,26 @@ containers:
     );
     assert_eq!(spec.env["DB_PASSWORD"], "s3cret");
     assert_eq!(spec.env["MODE"], "prod");
-    // Every container gets the pod's resolv.conf, from the same tmpfs.
+    // Every container gets the pod's resolv.conf and hosts, from the
+    // same tmpfs, the hosts naming the pod's containers at its address.
     let sidecar = h.rt.spec("shop_app-1_sidecar").unwrap();
     assert!(sidecar.env.is_empty());
     let resolv = dir.join("resolv.conf");
+    let hosts = dir.join("hosts");
     assert_eq!(
         sidecar
             .mounts
             .iter()
             .map(|m| (m.source.as_str(), m.destination.as_str()))
             .collect::<Vec<_>>(),
-        [(resolv.to_str().unwrap(), "/etc/resolv.conf")]
+        [
+            (resolv.to_str().unwrap(), "/etc/resolv.conf"),
+            (hosts.to_str().unwrap(), "/etc/hosts")
+        ]
     );
+    let named = std::fs::read_to_string(&hosts).unwrap();
+    assert!(named.contains("	app-1 shop_app-1_app shop_app-1_sidecar
+"), "{named}");
     assert_eq!(
         std::fs::read_to_string(&resolv).unwrap(),
         "search shop.legion legion\nnameserver 10.200.0.1\noptions ndots:2\n"
@@ -2320,7 +2328,7 @@ async fn volumes() {
             .unwrap()
             .mounts
             .iter()
-            .filter(|m| m.destination != "/etc/resolv.conf")
+            .filter(|m| !matches!(m.destination.as_str(), "/etc/resolv.conf" | "/etc/hosts"))
             .map(|m| {
                 (
                     m.source.clone(),
