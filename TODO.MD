@@ -177,26 +177,28 @@ Overview says no tasks ran in a namespace instead of drawing empty CPU
 and memory charts; sizes no longer break between number and unit; the
 "Dock …" buttons say "Keep … open".
 
-**Proposed.**
-- *One component kit*, as Sylve's bits-ui (the shadcn style) gives it:
-  every table sortable, searchable and paged the same way; one button
-  style (ours mixes outlined and filled); one font for figures (ours
-  mixes monospace and proportional in a row); card titles as headings,
-  not underlined links.
-- *A tree for the sidebar*: about 30 links in one list today; group them
-  in collapsible sections, as Sylve's node menu does, with the cluster's
-  objects and the namespace's apart.
-- *Guided forms*: Deploy as a dialog with tabs (Basic, Image, Network,
-  Storage, Resources), as Sylve's Create Container; no bare `0` in port
-  fields; the YAML beside it as now.
-- *Dashboards*: status cards with history, as Sylve's ZFS page, for
-  Volumes and nodes (pool health, capacity, last scrub, live I/O), with a
-  range picker on every chart.
-- *Plainer names*: "Volumes Studio" and "Images & GHCR Hub" say less
-  than "Volumes" and "Images".
-- *A review before changing a host*, as Sylve shows before its first
-  setup: what `legion doctor --fix pf` (item 3) will change, the old
-  file's copy, and a way back.
+**Done** (22 November 2026):
+- *One component kit*.
+  - Every list is sorted, searched and paged the same way: `lib/table.svelte.ts` with SortTh, TableBar and Pager, on about 20 lists (alerts, audit, events, log search, long operations, tasks, Volumes, snapshots, images, builds, CA holders, virtual IPs, files).
+  - Fixed per-node and per-setting tables are left as they are.
+  - One button look with hover states, and one segmented control for chart ranges and Topology's toggles.
+  - One Tabs component on Deploy, object pages and Images.
+  - Figures in the text font, with monospace kept for addresses and names.
+  - Card titles are headings.
+- *The sidebar as a tree*: Observe, Applications, Create, Storage and images, Network, Configuration and access, then the Cluster's own.
+- *Guided Deploy*:
+  - tabs (Basic, Network, Environment, Storage, Resources) with Back and Next, and a mark on a tab filled in;
+  - empty port fields instead of `0`;
+  - the YAML beside it.
+- *Dashboards*:
+  - Status cards (lib/Tile.svelte) on the Overview (nodes, managers, workloads, CPU, memory, storage, network, each node's meters), on Volumes (pool health, capacity, last scrub, Volumes) and on a node's Host tab.
+  - A range picker on every usage chart.
+- *Plainer names*: "Volumes" and "Images".
+
+**Left.**
+- *Live pool I/O* on the dashboards: the agent does not read it yet (`zpool iostat`); a daemon change first.
+- *A review before changing a host*, as Sylve shows before its first setup: what `legion doctor --fix pf` (item 3) will change, the old file's copy, and a way back. It comes with item 3.
+- *Topology's service links* name themselves by their state ("Service web: 1/1 ready") while showing a logo, the ready count and the port. axe 4.11's label-content-name-mismatch (WCAG 2.5.3) flags it. The label should start with what is shown, with the lab's selectors moved with it.
 
 **Done when** the lab's console tests and an axe-core pass hold after the
 change, and the same screens, side by side with Sylve's, read as one
