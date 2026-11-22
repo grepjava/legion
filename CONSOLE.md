@@ -24,10 +24,13 @@ API first, then the CLI and the console.
 - **The API is the boundary.** A gateway in the manager turns browser
   requests into the same calls the CLI makes, as the signed-in user.
   Watches, alerts, events, operations, logs and what tasks use come as
-  server-sent events (since 23 November 2026; over HTTP/2 a page's streams
-  share its one connection), exec over a WebSocket, as it takes input.
-  What nodes are asked for on demand (connections seen, load balancers,
-  the CA) is read again every 10 to 30 s.
+  server-sent events on one stream per tab (`/api/stream`, since 23
+  November 2026): a page says what it follows with `POST /api/stream/ID`,
+  so a browser speaking HTTP/1.1 (a proxy in front, the dev server, six
+  connections to a site) is not held up by its streams. Exec goes over a
+  WebSocket, as it takes input. Read again on a timer: what nodes are
+  asked for on demand (connections seen, load balancers, the CA), the
+  cluster's status and the charts' history, every 10 to 30 s.
 - **Generic first.** The 13 kinds share one list, detail, YAML and
   delete view, driven by the API's own kind list. Hand-built pages are
   added where a generic view is not enough (nodes, tasks, volumes).
@@ -61,8 +64,9 @@ Decide the two things that are hard to change later, in DESIGN.md (§3.9, writte
    - OIDC comes later (phase 6), mapped onto the same identities.
 2. **Gateway.** In the manager, on axum (the hyper/tonic stack the
    manager already has): JSON over HTTP for unary calls, server-sent
-   events for `Watch` and the other streams, a WebSocket for
-   `Pods.Session` (exec). It calls the local manager's gRPC
+   events for `Watch` and the other streams (each on its own address, and
+   all of a tab's on its one stream), a WebSocket for `Pods.Session`
+   (exec). It calls the local manager's gRPC
    services in-process as the user, so leader forwarding, consistency
    and RBAC behave as for the CLI.
 

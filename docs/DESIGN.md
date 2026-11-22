@@ -687,8 +687,12 @@ binary serves it.
   calls; server-sent events for the streams the console follows
   (`Watch`, alerts, events, operations, logs, and usage from
   `Cluster.WatchUsage`, which the leader sends again each time a node's
-  report changes it), so a page's streams share its one HTTP/2
-  connection; a WebSocket for `Pods.Session` (exec), which takes input.
+  report changes it): each on an address of its own, and all of a tab's
+  on its one stream (`GET /api/stream`, what it follows added and dropped
+  by `POST /api/stream/ID`, its messages tagged), so a browser speaking
+  HTTP/1.1, six connections to a site, is not held up. The manager
+  closing ends every stream and connection, so no tab keeps it alive. A
+  WebSocket for `Pods.Session` (exec), which takes input.
   The gateway translates; it decides nothing itself.
 - **The user's own identity, on every call.** For each signed-in
   session the gateway holds a short-lived client certificate it issued
