@@ -678,7 +678,7 @@ spec:
     let grouped = "(() => {
         const box = (a) => a.querySelector('rect').getBBox();
         const bands = new Map([...document.querySelectorAll('a[aria-label^=\"Node \"]')]
-          .map((a) => [/^Node (\\S+)[ ,]/.exec(a.getAttribute('aria-label'))[1], box(a)]));
+          .map((a) => [/^Node ([^\\s,]+)/.exec(a.getAttribute('aria-label'))[1], box(a)]));
         const pods = [...document.querySelectorAll('a[aria-label^=\"Task \"]')].map((a) =>
           [/, on (\\S+)$/.exec(a.getAttribute('aria-label'))?.[1], box(a)]);
         const inside = pods.every(([n, r]) => {
