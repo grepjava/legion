@@ -532,6 +532,36 @@ impl Lab {
                     n["metadata"]["name"], n["status"]["state"], n["status"]["message"]
                 );
             }
+            // Every task, how it stands and why, and the end of its output:
+            // what a wait for something to run usually needs to be read.
+            let tasks = self.legion(&["list", "tasks", "-A", "-o", "json"], &[]);
+            let tasks: Vec<Value> = serde_json::from_slice(&tasks.stdout).unwrap_or_default();
+            for t in &tasks {
+                let (ns, name) = (
+                    t["metadata"]["namespace"].as_str().unwrap_or(""),
+                    t["metadata"]["name"].as_str().unwrap_or(""),
+                );
+                eprintln!(
+                    "task {ns}/{name} on {}: {} {} (restarts {})",
+                    t["spec"]["node"], t["status"]["state"], t["status"]["message"], t["status"]["restarts"]
+                );
+                let logs = self.legion(&["logs", name, "-n", ns, "--tail", "15"], &[]);
+                for line in text(&logs.stdout).lines().chain(text(&logs.stderr).lines()) {
+                    eprintln!("  | {line}");
+                }
+            }
+            let namespaces: std::collections::BTreeSet<&str> = tasks
+                .iter()
+                .filter_map(|t| t["metadata"]["namespace"].as_str())
+                .collect();
+            for ns in namespaces {
+                let events = self.legion(&["events", "-n", ns], &[]);
+                let said = text(&events.stdout);
+                let lines: Vec<&str> = said.lines().collect();
+                for line in &lines[lines.len().saturating_sub(15)..] {
+                    eprintln!("event {ns}: {line}");
+                }
+            }
             for (i, vm) in self.vms.iter().enumerate() {
                 let out = self.ssh(
                     vm,
