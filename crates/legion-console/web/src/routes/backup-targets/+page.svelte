@@ -1,6 +1,7 @@
 <script lang="ts">
   // Where Volumes are backed up (BackupTarget, cluster-scoped): a ZFS host
-  // reached over SSH, or a directory on the node holding the data. Listed,
+  // reached over SSH, a directory on the node holding the data, or an
+  // S3-compatible bucket. Listed,
   // added and changed here in a form, each change reviewed before it is
   // saved (SpecChange); a Volume's Protection tab picks one.
   import { api, follow, type LObject } from '#lib/api.ts';
@@ -25,7 +26,7 @@
   let editing: LObject | null = $state(null);
   let adding = $state(false);
   let name = $state('');
-  let kind = $state<'ssh' | 'directory'>('ssh');
+  let kind = $state<'ssh' | 'directory' | 's3'>('ssh');
   let host = $state('');
   let port = $state(22);
   let user = $state('root');
@@ -34,21 +35,34 @@
   let keyName = $state('');
   let hostKey = $state('');
   let path = $state('');
+  let endpoint = $state('');
+  let region = $state('us-east-1');
+  let bucket = $state('');
+  let prefix = $state('');
+  let accessKeyId = $state('');
+  let virtualHosted = $state(false);
 
   function open(o: LObject | null) {
     editing = o;
     adding = !o;
     name = o?.metadata.name ?? '';
     const s = o?.spec ?? {};
-    kind = s.directory ? 'directory' : 'ssh';
+    kind = s.directory ? 'directory' : s.s3 ? 's3' : 'ssh';
     host = s.ssh?.host ?? '';
     port = s.ssh?.port ?? 22;
     user = s.ssh?.user ?? 'root';
     dataset = s.ssh?.dataset ?? '';
-    keyNamespace = s.ssh?.keySecret?.namespace ?? 'default';
-    keyName = s.ssh?.keySecret?.name ?? '';
+    const secret = s.ssh?.keySecret ?? s.s3?.secretKeySecret;
+    keyNamespace = secret?.namespace ?? 'default';
+    keyName = secret?.name ?? '';
     hostKey = s.ssh?.hostKey ?? '';
     path = s.directory?.path ?? '';
+    endpoint = s.s3?.endpoint ?? '';
+    region = s.s3?.region ?? 'us-east-1';
+    bucket = s.s3?.bucket ?? '';
+    prefix = s.s3?.prefix ?? '';
+    accessKeyId = s.s3?.accessKeyId ?? '';
+    virtualHosted = !!s.s3?.virtualHosted;
   }
 
   const object = $derived<LObject>(
@@ -72,19 +86,34 @@
             hostKey: hostKey.trim()
           }
         }
-      : { directory: { path: path.trim() } }
+      : kind === 's3'
+        ? {
+            s3: {
+              endpoint: endpoint.trim().replace(/\/+$/, ''),
+              region: region.trim() || 'us-east-1',
+              bucket: bucket.trim(),
+              ...(prefix.trim() ? { prefix: prefix.trim().replace(/^\/+|\/+$/g, '') } : {}),
+              accessKeyId: accessKeyId.trim(),
+              secretKeySecret: { namespace: keyNamespace.trim(), name: keyName.trim() },
+              ...(virtualHosted ? { virtualHosted: true } : {})
+            }
+          }
+        : { directory: { path: path.trim() } }
   );
   const ready = $derived(
     !!name.trim() &&
       (kind === 'ssh'
         ? !!(host.trim() && user.trim() && dataset.trim() && keyName.trim() && hostKey.trim())
-        : path.trim().startsWith('/'))
+        : kind === 's3'
+          ? /^https?:\/\/./.test(endpoint.trim()) && !!(bucket.trim() && accessKeyId.trim() && keyName.trim())
+          : path.trim().startsWith('/'))
   );
 
   function where(o: LObject): string {
     const s = o.spec ?? {};
     if (s.ssh) return `${s.ssh.user}@${s.ssh.host}:${s.ssh.port ?? 22} ${s.ssh.dataset}`;
     if (s.directory) return t('{path} on the node holding the data', { path: s.directory.path });
+    if (s.s3) return `s3://${s.s3.bucket}/${s.s3.prefix ? s.s3.prefix + '/' : ''} ${t('at')} ${s.s3.endpoint}`;
     return '';
   }
 
@@ -110,7 +139,7 @@
   {#if !why}<button class="sm" onclick={() => open(null)}>{t('Add a target')}</button>{/if}
 </header>
 <p class="muted">
-  {t('Where Volumes are backed up: a ZFS host over SSH, or a directory on the node holding the data. A Volume picks one on its Protection tab.')}
+  {t('Where Volumes are backed up: a ZFS host over SSH, a directory on the node holding the data, or an S3-compatible bucket. A Volume picks one on its Protection tab.')}
 </p>
 {#if error}<p class="error" role="alert">{error}</p>{/if}
 
@@ -128,7 +157,7 @@
       {#each targets as o (o.metadata.name)}
         <tr>
           <td><a href={`/k/BackupTarget/_/${encodeURIComponent(o.metadata.name)}`}>{o.metadata.name}</a></td>
-          <td>{o.spec?.ssh ? t('ZFS over SSH') : t('Directory')}</td>
+          <td>{o.spec?.ssh ? t('ZFS over SSH') : o.spec?.s3 ? t('S3 bucket') : t('Directory')}</td>
           <td class="mono">{where(o)}</td>
           <td class="controls">
             {#if !why}
@@ -153,6 +182,7 @@
       <legend>{t('Kind')}</legend>
       <label class="check"><input type="radio" bind:group={kind} value="ssh" /> {t('A ZFS host over SSH')}</label>
       <label class="check"><input type="radio" bind:group={kind} value="directory" /> {t('A directory on the node holding the data')}</label>
+      <label class="check"><input type="radio" bind:group={kind} value="s3" /> {t('An S3-compatible bucket')}</label>
     </fieldset>
     {#if kind === 'ssh'}
       <div class="row">
@@ -174,6 +204,29 @@
         {t('Host key')}
         <textarea rows="2" bind:value={hostKey} placeholder="ssh-ed25519 AAAA…"></textarea>
         <span class="muted">{t('As ssh-keyscan prints it, without the host name: no other host is believed.')}</span>
+      </label>
+    {:else if kind === 's3'}
+      <div class="row">
+        <label>
+          {t('Endpoint')}
+          <input bind:value={endpoint} placeholder="https://s3.eu-west-1.amazonaws.com" />
+        </label>
+        <label>{t('Region')} <input bind:value={region} /></label>
+      </div>
+      <div class="row">
+        <label>{t('Bucket')} <input bind:value={bucket} placeholder="legion-backups" /></label>
+        <label>{t('Prefix')} <input bind:value={prefix} placeholder="legion/prod" /></label>
+      </div>
+      <span class="muted">{t('Each backup is an object, whole: PREFIX/NAMESPACE.VOLUME/SNAPSHOT.zfs.')}</span>
+      <label>{t('Access key ID')} <input bind:value={accessKeyId} /></label>
+      <div class="row">
+        <label>{t('Secret key Secret namespace')} <input bind:value={keyNamespace} /></label>
+        <label>{t('Secret key Secret name')} <input bind:value={keyName} placeholder="s3-key" /></label>
+      </div>
+      <p class="muted">{t('The Secret holds the secret access key: legion secret create s3-key --from-file secret-key')}</p>
+      <label class="check">
+        <input type="checkbox" bind:checked={virtualHosted} />
+        {t('Name the bucket in the host (bucket.endpoint), for services that take no other')}
       </label>
     {:else}
       <label>

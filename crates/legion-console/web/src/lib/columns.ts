@@ -193,9 +193,14 @@ export function columns(kind: string): Column[] {
           value: (o) =>
             o.spec?.ssh
               ? `${o.spec.ssh.user}@${o.spec.ssh.host}:${o.spec.ssh.dataset}`
-              : s(o.spec?.directory?.path)
+              : o.spec?.s3
+                ? `s3://${o.spec.s3.bucket}/${o.spec.s3.prefix ?? ''}`
+                : s(o.spec?.directory?.path)
         },
-        { label: t('Kind'), value: (o) => (o.spec?.ssh ? t('ZFS over SSH') : t('directory')) }
+        {
+          label: t('Kind'),
+          value: (o) => (o.spec?.ssh ? t('ZFS over SSH') : o.spec?.s3 ? t('S3 bucket') : t('directory'))
+        }
       ];
     case 'AlertReceiver':
       return [
