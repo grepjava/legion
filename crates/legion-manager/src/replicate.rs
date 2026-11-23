@@ -254,6 +254,24 @@ pub(crate) fn step(
     }
 }
 
+/// Marks `r` as having a copy of `snapshot` under way since `now`, kept as
+/// one cut short until it is in (its attempts that got nowhere carried
+/// over when it goes on with the same).
+fn under_way(r: &mut ReplicaStatus, now: i64, from: &str, base: &str, snapshot: &str) {
+    r.copying_ms = Some(now);
+    let tries = r
+        .partial
+        .as_ref()
+        .filter(|p| p.snapshot == snapshot)
+        .map_or(0, |p| p.tries);
+    r.partial = Some(PartialCopy {
+        snapshot: snapshot.to_owned(),
+        base: base.to_owned(),
+        from: from.to_owned(),
+        tries,
+    });
+}
+
 /// `status` without its replica, whose copy on `node` joins the leftovers.
 fn drop_replica(status: &VolumeStatus, node: &str) -> VolumeStatus {
     let mut s = status.clone();
@@ -335,7 +353,7 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::ac
         while let Some(done) = copies.try_join_next() {
             let Ok(Done {
                 key,
-                mut taken,
+                taken,
                 base,
                 resumed,
                 outcome,
@@ -344,9 +362,6 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::ac
                 continue;
             };
             let whole = base.is_empty();
-            // What it took or was taking: the snapshot gone on with, or
-            // one made anew.
-            taken.snapshot = outcome.snapshot;
             let result = outcome.result;
             running.remove(&key);
             let began = taken.taken_ms.unwrap_or_default();
@@ -497,10 +512,14 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::ac
                         taken_ms: Some(now),
                         ..Default::default()
                     };
-                    // Said to be under way, for those watching.
+                    // Said to be under way, for those watching; and kept as
+                    // one cut short until it is in, so that a leader taking
+                    // over from this one, should it stop meanwhile, goes on
+                    // with what the replica's node kept rather than
+                    // starting again (and destroying it).
                     let r = update(store, &key, |s| match &mut s.replica {
                         Some(r) if r.node == to => {
-                            r.copying_ms = Some(now);
+                            under_way(r, now, &from, &base, &snapshot);
                             true
                         }
                         _ => false,
@@ -577,9 +596,6 @@ struct Done {
 
 /// What came of a copy.
 struct Outcome {
-    /// The snapshot it sent: the one asked for, or, going on with a copy
-    /// of which nothing was kept, one made anew.
-    snapshot: String,
     /// What it sent, whether or not it was taken in.
     sent: u64,
     /// What was sent, once taken in.
@@ -588,7 +604,9 @@ struct Outcome {
 
 /// Copies a Volume from the node holding it to its replica's node; with
 /// `resume`, goes on with the copy of `snapshot` cut short, or starts it
-/// again under a new snapshot if the replica's node kept nothing of it.
+/// again if the replica's node kept nothing of it (the holder takes the
+/// snapshot anew, under the same name, so the copy recorded as under way
+/// stays the one sent).
 #[allow(clippy::too_many_arguments)]
 async fn copy(
     hub: &Arc<Hub>,
@@ -605,7 +623,6 @@ async fn copy(
             Ok(t) => t,
             Err(e) => {
                 return Outcome {
-                    snapshot: snapshot.to_owned(),
                     sent: 0,
                     result: Err(e),
                 };
@@ -613,13 +630,8 @@ async fn copy(
         },
         false => String::new(),
     };
-    let snapshot = match resume && token.is_empty() {
-        true => format!("legion-replica-{}", crate::console::now_ms()),
-        false => snapshot.to_owned(),
-    };
-    let result = send(hub, key, from, to, base, &snapshot, token, counted).await;
+    let result = send(hub, key, from, to, base, snapshot, token, counted).await;
     Outcome {
-        snapshot,
         sent: counted.load(std::sync::atomic::Ordering::Relaxed),
         result,
     }
@@ -921,6 +933,43 @@ mod tests {
             panic!()
         };
         assert_eq!(next.replica.as_ref().unwrap().copying_ms, None);
+    }
+
+    /// The leader stopping while a copy runs (seen 2026-11-23: a restart of
+    /// the leading manager, which was also the replica's node) records no
+    /// failure; the next leader goes on with what the replica's node kept,
+    /// rather than starting again and destroying it.
+    #[test]
+    fn a_copy_under_way_when_the_leader_stops_goes_on_under_the_next() {
+        let nodes = [node("n1", true, true), node("n2", true, true)];
+        let mut s = on("n1");
+        let mut r = replica("n2", "", "", None);
+        under_way(&mut r, 2000, "n1", "", "legion-replica-2000");
+        s.replica = Some(r);
+        let Step::Write(next) = step(&spec(None), &s, &nodes, 3000, false, &[]) else {
+            panic!()
+        };
+        let r = next.replica.as_ref().unwrap();
+        assert_eq!(r.copying_ms, None);
+        assert!(r.partial.is_some(), "kept as cut short: {r:?}");
+        assert_eq!(
+            step(&spec(None), &next, &nodes, 3000, false, &[]),
+            Step::Copy {
+                from: "n1".into(),
+                to: "n2".into(),
+                base: String::new(),
+                snapshot: "legion-replica-2000".into(),
+                resume: true,
+            }
+        );
+        // Going on with the same, its attempts that got nowhere carry over;
+        // a new one starts at none.
+        let mut r = next.replica.clone().unwrap();
+        r.partial.as_mut().unwrap().tries = 2;
+        under_way(&mut r, 4000, "n1", "", "legion-replica-2000");
+        assert_eq!(r.partial.as_ref().unwrap().tries, 2);
+        under_way(&mut r, 5000, "n1", "legion-replica-2000", "legion-replica-5000");
+        assert_eq!(r.partial.as_ref().unwrap().tries, 0);
     }
 
     #[test]

@@ -1165,6 +1165,36 @@ mod tests {
         .unwrap();
         assert_eq!(to.zfs_snapshots(DS).unwrap(), ["legion-replica-4"]);
         assert_eq!(to.dataset_contents(DS).unwrap(), [9u8; 1000]);
+
+        // Cut, with nothing kept there: started again under the same name
+        // (the copy recorded as under way), which the holder takes anew.
+        from.write_dataset(DS, &[10u8; 1000]);
+        from.fail_next("zfs send");
+        let give = |out: &mut Vec<u8>| {
+            replica_give(
+                &from,
+                &lock,
+                DS,
+                "legion-replica-4",
+                "legion-replica-5",
+                out,
+            )
+        };
+        give(&mut Vec::new()).unwrap_err();
+        from.write_dataset(DS, &[11u8; 1000]);
+        let mut out = Vec::new();
+        give(&mut out).unwrap();
+        replica_take(
+            &to,
+            &lock,
+            DS,
+            "legion-replica-4",
+            "legion-replica-5",
+            &mut out.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(to.zfs_snapshots(DS).unwrap(), ["legion-replica-5"]);
+        assert_eq!(to.dataset_contents(DS).unwrap(), [11u8; 1000]);
     }
 
     /// A move's full copy cut short: the new node keeps what came, the
