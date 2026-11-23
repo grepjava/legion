@@ -84,6 +84,11 @@ enum Command {
         /// Run the manager only; no tasks run on this node.
         #[arg(long)]
         no_agent: bool,
+        /// A witness (docs/HA.md): a manager that votes, so a quorum may
+        /// count it, but runs no tasks and never leads. Implied when the
+        /// node joined with `legion join --witness`.
+        #[arg(long)]
+        witness: bool,
         /// Name of this node (default: the hostname's first label).
         #[arg(long)]
         node_name: Option<String>,
@@ -224,6 +229,11 @@ enum Command {
         /// Name of this node (default: the hostname's first label).
         #[arg(long)]
         node_name: Option<String>,
+        /// Join as a witness (docs/HA.md), with a manager token: it votes
+        /// in the managers' quorum but runs no tasks and never leads, so a
+        /// small machine (no ZFS, no pf) makes two managers three.
+        #[arg(long)]
+        witness: bool,
     },
     /// Show the reached manager's view of the cluster.
     Status,
@@ -308,6 +318,18 @@ enum Command {
         /// With --fix pf: the file to change.
         #[arg(long, default_value = "/etc/pf.conf")]
         pf_conf: String,
+    },
+    /// The cluster's single points of failure (docs/HA.md): too few
+    /// managers, one node running every task, services with one replica or
+    /// all on one node, Volumes whose data is on one node, each with how to
+    /// put it right. Exits nonzero if any is a risk (losing one machine
+    /// stops something, or loses data).
+    Ha {
+        /// Only this namespace's (the cluster's own findings too).
+        #[arg(short, long)]
+        namespace: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// What `legion doctor` finds on every node of the cluster, or on
     /// `--node`, asked of their agents (the cluster admin's). Exits nonzero
@@ -1263,6 +1285,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             listen,
             advertise,
             no_agent,
+            witness,
             node_name,
             infra_image,
             zfs_root,
@@ -1325,6 +1348,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 listen,
                 advertise,
                 agent: !no_agent,
+                witness,
                 node_name,
                 infra_image,
                 zfs_root,
@@ -1357,9 +1381,21 @@ async fn run(args: Args) -> anyhow::Result<()> {
             data_dir,
             advertise,
             node_name,
+            witness,
         } => {
-            daemon::join(&token, &manager, &data_dir, advertise.as_deref(), node_name).await?;
-            doctor::offer_pf_fix();
+            daemon::join(
+                &token,
+                &manager,
+                &data_dir,
+                advertise.as_deref(),
+                node_name,
+                witness,
+            )
+            .await?;
+            // A witness runs no pods: pf is not its business.
+            if !witness {
+                doctor::offer_pf_fix();
+            }
             Ok(())
         }
         Command::Restore {

@@ -653,6 +653,28 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
         Command::Image { command } => {
             run_image_command(&mut cluster, command).await?;
         }
+        Command::Ha { namespace, json } => {
+            let r = cluster
+                .availability(pb::AvailabilityRequest {
+                    namespace: namespace.unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            let report: legion_api::ha::Report = serde_json::from_slice(&r.report_json)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", legion_api::ha::render(&report));
+            }
+            let risks = report
+                .findings
+                .iter()
+                .filter(|f| f.severity == legion_api::ha::Severity::Risk)
+                .count();
+            if risks > 0 {
+                anyhow::bail!("{risks} risk{} found", if risks == 1 { "" } else { "s" });
+            }
+        }
         Command::Diagnose { node, json } => {
             let nodes = cluster
                 .diagnose(pb::DiagnoseRequest {
@@ -2796,7 +2818,11 @@ fn print_status(s: &StatusResponse) {
     } else {
         println!("members:");
         for m in &s.members {
-            let role = if m.voter { "voter" } else { "learner" };
+            let role = match (m.voter, m.witness) {
+                (true, true) => "voter, witness",
+                (true, false) => "voter",
+                (false, _) => "learner",
+            };
             println!("  {:<20} {:<22} {role}", m.id, m.addr);
         }
     }

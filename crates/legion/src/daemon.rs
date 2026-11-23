@@ -17,6 +17,9 @@ pub struct Options {
     pub listen: SocketAddr,
     pub advertise: Option<String>,
     pub agent: bool,
+    /// A witness: votes, runs no tasks, never leads (also when the data
+    /// directory says so, [`WITNESS`]).
+    pub witness: bool,
     pub node_name: Option<String>,
     pub infra_image: Option<String>,
     pub zfs_root: Option<String>,
@@ -76,6 +79,12 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     }
     let node = manager_node(opts.node_name.as_deref(), &pki, &hostname)?;
     legion_api::validate_name(&node).context("node name")?;
+    let witness = opts.witness || opts.data_dir.join(WITNESS).exists();
+    if witness {
+        tracing::info!(
+            "a witness: it votes in the managers' quorum, runs no tasks and never leads"
+        );
+    }
     let tls = pki
         .ensure(&node, &opts.data_dir)
         .context("setting up certificates")?;
@@ -101,6 +110,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         insecure_registries: opts.insecure_registries.clone(),
         audit: opts.audit,
         console: opts.console.clone(),
+        witness,
         ..legion_manager::ManagerConfig::new(&opts.data_dir, &advertise)
     })
     .await
@@ -110,7 +120,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     // The agent calls this manager as the node, with the same credentials.
     let control = GrpcControl::new(&node, vec![advertise.clone()], Some(credentials.clone()))
         .map_err(|e| anyhow::anyhow!(e))?;
-    let run_agent = opts.agent && cfg!(target_os = "freebsd");
+    let run_agent = opts.agent && !witness && cfg!(target_os = "freebsd");
     // Kept with the other private keys, so that autolock seals it too.
     let wireguard = run_agent.then(|| {
         let sys = legion_sys::Shell::new();
@@ -385,12 +395,17 @@ async fn run_worker(opts: &Options, pki: &crate::pki::Pki, hostname: String) -> 
 
 /// `legion join`: certifies this node with the cluster and stores its
 /// credentials in `data_dir`, before the daemon first starts there.
+/// In a data directory, what makes its manager a witness (`legion join
+/// --witness`): it votes, runs no tasks and never leads.
+pub const WITNESS: &str = "witness";
+
 pub async fn join(
     token: &str,
     manager: &str,
     data_dir: &Path,
     advertise: Option<&str>,
     name: Option<String>,
+    witness: bool,
 ) -> anyhow::Result<()> {
     let pki = crate::pki::Pki::new(data_dir);
     if pki.exists() || data_dir.join("store.redb").exists() {
@@ -416,9 +431,24 @@ pub async fn join(
     let joined = legion_manager::join(manager, token, &node, id, &advertise)
         .await
         .map_err(|e| anyhow::anyhow!("joining through {manager}: {e}"))?;
+    if witness && joined.role != legion_pki::Role::Manager {
+        bail!(
+            "a witness joins with a manager's token (legion join-token manager); this one is a {}'s",
+            joined.role
+        );
+    }
     pki.write_joined(&joined)?;
     if joined.role == legion_pki::Role::Worker {
         crate::pki::write_managers(data_dir, &[manager.to_owned()])?;
+    }
+    if witness {
+        std::fs::write(data_dir.join(WITNESS), "")
+            .with_context(|| format!("marking {} a witness's", data_dir.display()))?;
+        println!(
+            "joined as witness {node}: it votes, runs no tasks and never leads; start the daemon with --data-dir {}",
+            data_dir.display()
+        );
+        return Ok(());
     }
     println!(
         "joined as {} {node}; start the daemon with --data-dir {}",
