@@ -7008,6 +7008,46 @@ async fn a_witness_votes_but_never_leads() {
         members.iter().any(|m| m.id == witness_id && m.witness),
         "{members:?}"
     );
+    // Demoting the leader is checked first: an election, two voters left,
+    // one of them able to lead (the Node as an agent would have made it).
+    let leader_name = manager_name(&first.addr);
+    eventually(|| {
+        let mut admin = admin_objects.clone();
+        let node = object(
+            "Node",
+            "",
+            &leader_name,
+            serde_json::json!({ "role": "manager" }),
+        );
+        async move { admin.apply(node).await }
+    })
+    .await;
+    let checked = c
+        .dry_run(legion_proto::v1::DryRunRequest {
+            change_json: serde_json::to_vec(&legion_api::dryrun::Change::Demote {
+                node: leader_name.clone(),
+            })
+            .unwrap(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let d: legion_api::dryrun::DryRun = serde_json::from_slice(&checked.dry_run_json).unwrap();
+    let found: Vec<&str> = d.findings.iter().map(|f| f.reason.as_str()).collect();
+    assert_eq!(found, ["leaders", "quorum", "leader"], "{d:?}");
+    assert!(!d.blocks(), "{d:?}");
+    // Refused to a user who may not change roles.
+    let err = alice
+        .dry_run(legion_proto::v1::DryRunRequest {
+            change_json: serde_json::to_vec(&legion_api::dryrun::Change::Demote {
+                node: leader_name.clone(),
+            })
+            .unwrap(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err}");
+
     // It may not start a cluster of its own.
     let err = witness
         .cluster()

@@ -160,6 +160,13 @@ pub(crate) async fn request(api: &ApiService, node: &str, role: &str) -> Result<
                 "manager {node} is the cluster's last voter: promote another first"
             )));
         }
+        // Witnesses never lead: one of the others must be able to.
+        let witnesses = crate::managers::witnesses(&api.store)?;
+        if !voters.iter().any(|v| *v != id && !witnesses.contains(v)) {
+            return Err(Status::failed_precondition(format!(
+                "manager {node} is the last that may lead, the others witnesses: promote another first"
+            )));
+        }
     }
     change(api, |c| {
         c.insert(node.to_owned(), role.as_str().to_owned());

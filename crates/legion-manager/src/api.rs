@@ -100,6 +100,32 @@ pub(crate) fn check_namespace(namespace: &str) -> Result<(), Status> {
 }
 
 impl ApiService {
+    /// The managers as Raft's membership and their own word have them, by
+    /// name, and the leader's name (empty when there is none).
+    pub(crate) fn managers_seen(&self) -> Result<(Vec<legion_api::ha::Manager>, String), Status> {
+        let m = self.store.raft.metrics().borrow().clone();
+        let membership = m.membership_config.membership();
+        let names = crate::managers::names(&self.store)?;
+        let witnesses = crate::managers::witnesses(&self.store)?;
+        let name_of = |id: &NodeId| {
+            if *id == self.id {
+                self.name.clone()
+            } else {
+                names.get(id).cloned().unwrap_or_else(|| format!("#{id}"))
+            }
+        };
+        let managers = membership
+            .nodes()
+            .map(|(id, _)| legion_api::ha::Manager {
+                name: name_of(id),
+                voter: membership.voter_ids().any(|v| v == *id),
+                witness: witnesses.contains(id) || (*id == self.id && self.witness),
+            })
+            .collect();
+        let leader = m.current_leader.as_ref().map(name_of).unwrap_or_default();
+        Ok((managers, leader))
+    }
+
     /// The cluster's single points of failure as `caller` may see them: of
     /// `namespace` (every namespace when empty) where they may read its
     /// services, the cluster's own (managers, nodes) where they may read
@@ -113,24 +139,7 @@ impl ApiService {
             Ok(self.store.list(kind, None).map_err(internal)?.objects)
         };
         let nodes = list(Kind::Node)?;
-        let managers = {
-            let m = self.store.raft.metrics().borrow().clone();
-            let membership = m.membership_config.membership();
-            let names = crate::managers::names(&self.store)?;
-            let witnesses = crate::managers::witnesses(&self.store)?;
-            membership
-                .nodes()
-                .map(|(id, _)| legion_api::ha::Manager {
-                    name: if *id == self.id {
-                        self.name.clone()
-                    } else {
-                        names.get(id).cloned().unwrap_or_else(|| format!("#{id}"))
-                    },
-                    voter: membership.voter_ids().any(|v| v == *id),
-                    witness: witnesses.contains(id) || (*id == self.id && self.witness),
-                })
-                .collect::<Vec<_>>()
-        };
+        let (managers, _) = self.managers_seen()?;
         let found = legion_api::ha::check(&legion_api::ha::Cluster {
             managers: &managers,
             nodes: &nodes,
@@ -2235,6 +2244,7 @@ impl Cluster for ApiService {
             Change::Drain { .. } | Change::RemoveNode { .. } => {
                 caller.check(&self.store, Verb::Write, Kind::Node, "")?
             }
+            Change::Demote { .. } => caller.require_all("change a node's role")?,
             Change::MoveVolume { namespace, .. } => {
                 check_namespace(namespace)?;
                 caller.check(&self.store, Verb::Write, Kind::Volume, namespace)?
@@ -2282,6 +2292,13 @@ impl Cluster for ApiService {
             Err(Refused::NotFound(m)) => return Err(Status::not_found(m)),
             Err(Refused::Invalid(m)) => return Err(Status::invalid_argument(m)),
         };
+        // A manager leaving the membership: what the managers are left with.
+        if let Change::Demote { node } | Change::RemoveNode { node } = &change {
+            let (managers, leader) = self.managers_seen()?;
+            d.findings
+                .extend(legion_api::dryrun::membership(node, &managers, &leader));
+            d.findings.sort_by_key(|f| f.severity);
+        }
         // Each as its object may be read; the rest counted.
         let readable = |object: &str, namespace: &str| {
             let kind = object.split(' ').next().unwrap_or("");

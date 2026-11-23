@@ -33,6 +33,8 @@ pub enum Change {
     /// `legion delete service SERVICE`.
     #[serde(rename_all = "camelCase")]
     DeleteService { namespace: String, service: String },
+    /// `legion node demote NODE`: a manager made a worker.
+    Demote { node: String },
 }
 
 impl Change {
@@ -49,6 +51,7 @@ impl Change {
             Change::DeleteService { namespace, service } => {
                 format!("delete Service {namespace}/{service}")
             }
+            Change::Demote { node } => format!("demote node {node} to a worker"),
         }
     }
 }
@@ -89,6 +92,75 @@ pub struct Finding {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub namespace: String,
     pub message: String,
+}
+
+/// What a manager leaving the Raft membership (demoted, or its node
+/// removed) does to the managers: `managers` as they are, `leader` the
+/// one that leads now. The leader leaving means an election, about 16 s
+/// with no leader (`leader`); fewer than three voters left can lose none
+/// (`quorum`); one manager left that may lead, the others witnesses, can't
+/// lose it (`leaders`), and none blocks. Nothing for a node that is no
+/// voter.
+pub fn membership(node: &str, managers: &[crate::ha::Manager], leader: &str) -> Vec<Finding> {
+    let Some(leaving) = managers.iter().find(|m| m.name == node && m.voter) else {
+        return Vec::new();
+    };
+    let left: Vec<_> = managers
+        .iter()
+        .filter(|m| m.voter && m.name != leaving.name)
+        .collect();
+    let voters = left.len();
+    let leaders = left.iter().filter(|m| !m.witness).count();
+    let finding = |severity, reason: &str, message: String| Finding {
+        severity,
+        reason: reason.into(),
+        object: format!("Node {node}"),
+        namespace: String::new(),
+        message,
+    };
+    let mut out = Vec::new();
+    if voters > 0 && leaders == 0 {
+        out.push(finding(
+            Severity::Blocking,
+            "leaders",
+            "it is the last manager that may lead: only witnesses would be left, and they never \
+             lead"
+                .into(),
+        ));
+    } else if voters >= 2 && leaders == 1 {
+        out.push(finding(
+            Severity::Warning,
+            "leaders",
+            "one manager that may lead would be left, the others witnesses: if it is lost, no \
+             leader is chosen"
+                .into(),
+        ));
+    }
+    match voters {
+        1 => out.push(finding(
+            Severity::Warning,
+            "quorum",
+            "one voting manager would be left: if it is lost, nothing is placed or changed until \
+             it is back"
+                .into(),
+        )),
+        2 => out.push(finding(
+            Severity::Warning,
+            "quorum",
+            "two voting managers would be left: losing either then stops the cluster".into(),
+        )),
+        _ => {}
+    }
+    if leaving.name == leader && voters > 0 {
+        out.push(finding(
+            Severity::Warning,
+            "leader",
+            "it leads: the other managers elect another, about 16 s with no leader (nothing is \
+             placed or changed; running tasks carry on)"
+                .into(),
+        ));
+    }
+    out
 }
 
 /// A Volume whose data would move.
@@ -268,5 +340,51 @@ mod tests {
         d.findings.remove(0);
         assert!(!d.blocks());
         assert!(d.render().ends_with("Nothing blocks it."));
+    }
+}
+
+#[cfg(test)]
+mod membership_tests {
+    use super::*;
+    use crate::ha::Manager;
+
+    fn m(name: &str, witness: bool) -> Manager {
+        Manager {
+            name: name.into(),
+            voter: true,
+            witness,
+        }
+    }
+
+    fn reasons(f: &[Finding]) -> Vec<(&str, Severity)> {
+        f.iter().map(|f| (f.reason.as_str(), f.severity)).collect()
+    }
+
+    #[test]
+    fn a_manager_leaving_says_what_the_others_are_left_with() {
+        let three = [m("m1", false), m("m2", false), m("w", true)];
+        // The leader of two managers and a witness: an election, two voters
+        // left, one of them able to lead.
+        assert_eq!(
+            reasons(&membership("m1", &three, "m1")),
+            [
+                ("leaders", Severity::Warning),
+                ("quorum", Severity::Warning),
+                ("leader", Severity::Warning)
+            ]
+        );
+        // A follower: no election.
+        assert!(!reasons(&membership("m2", &three, "m1")).contains(&("leader", Severity::Warning)));
+        // Of one manager and two witnesses, the manager: none left to lead.
+        let witnessed = [m("m1", false), m("w1", true), m("w2", true)];
+        assert_eq!(
+            reasons(&membership("m1", &witnessed, "m1"))[0],
+            ("leaders", Severity::Blocking)
+        );
+        // Of five full managers, one: nothing worth saying.
+        let five: Vec<_> = (1..=5).map(|i| m(&format!("m{i}"), false)).collect();
+        assert!(membership("m5", &five, "m1").is_empty());
+        // A node that is no voter: nothing.
+        assert!(membership("n9", &three, "m1").is_empty());
     }
 }

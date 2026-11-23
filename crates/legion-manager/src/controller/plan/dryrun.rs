@@ -115,6 +115,11 @@ pub fn dry_run(
                 ));
             }
         }
+        // A manager made a worker keeps its tasks: what it does to the
+        // managers is added by the API, which knows them.
+        Change::Demote { node } => {
+            node_named(&changed, node)?;
+        }
         Change::RemoveNode { node } => {
             let i = node_named(&changed, node)?;
             let n = changed.nodes.remove(i);
