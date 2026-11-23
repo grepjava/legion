@@ -30,17 +30,16 @@ use crate::session::{Attachment, Hub};
 /// How often the Volumes are looked at.
 const PERIOD: Duration = Duration::from_secs(10);
 
-/// The target `name` as a node reaches it: its spec and, for SSH, the key
-/// from its Secret.
+/// The target `name` as a node reaches it: its spec and the value of the
+/// Secret it names (an SSH key, an S3 secret key), if any.
 pub(crate) fn access(store: &Store, name: &str) -> Result<BackupTargetAccess, String> {
     let o = store
         .get(&ObjectKey::new(Kind::BackupTarget, "", name))
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("no BackupTarget {name}"))?;
     let spec: BackupTargetSpec = legion_api::parse(&o.spec).map_err(|e| e.to_string())?;
-    let key = match &spec.ssh {
-        Some(s) => {
-            let r = &s.key_secret;
+    let key = match spec.secret() {
+        Some(r) => {
             let secret = store
                 .get(&ObjectKey::new(Kind::Secret, &r.namespace, &r.name))
                 .map_err(|e| e.to_string())?

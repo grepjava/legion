@@ -341,7 +341,9 @@ message SessionOffer {
 }
 
 // Where a Volume's backups go, as the agent reaches it: the BackupTarget's
-// spec (JSON) with, for SSH, the private key from its Secret.
+// spec (JSON) with the value of the Secret it names, if any: for SSH the
+// private key, for S3 the secret access key. An agent from before S3
+// targets refuses one, its spec having a field unknown to it (`s3`).
 message BackupTargetAccess {
   string name = 1;
   string spec_json = 2;

@@ -1682,6 +1682,8 @@ dependencies = [
  "libc",
  "openraft",
  "rcgen",
+ "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "serde_yaml_ng",

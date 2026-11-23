@@ -1,7 +1,8 @@
 //! Where Volumes are backed up (DESIGN.md §4.3, Volume backups): a
-//! cluster-scoped `BackupTarget`, a ZFS host reached over SSH or a
+//! cluster-scoped `BackupTarget`, a ZFS host reached over SSH, a
 //! directory on the node holding the data (an NFS mount, a second disk),
-//! named by a Volume's `backup: { target, every, keep }`.
+//! or an S3-compatible bucket, named by a Volume's
+//! `backup: { target, every, keep }`.
 
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +16,8 @@ pub struct BackupTargetSpec {
     pub ssh: Option<SshTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory: Option<DirectoryTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3: Option<S3Target>,
 }
 
 /// A ZFS host reached over SSH: each Volume's backups are received into
@@ -57,12 +60,130 @@ pub struct DirectoryTarget {
     pub path: String,
 }
 
+/// An S3-compatible bucket (AWS S3, MinIO, Garage, Ceph's RGW, R2, B2…):
+/// each backup an object, whole, in the format `legion volume backup`
+/// writes, at `<prefix>/<namespace>.<volume>/<snapshot>.zfs`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct S3Target {
+    /// Where the service answers: `https://s3.eu-west-1.amazonaws.com`,
+    /// `http://minio.lan:9000`; no path.
+    pub endpoint: String,
+    /// The region requests are signed for; `us-east-1` where the service
+    /// has none of its own (most besides AWS).
+    #[serde(default = "s3_region")]
+    pub region: String,
+    pub bucket: String,
+    /// Where under the bucket this cluster's backups go: `legion/prod`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+    pub access_key_id: String,
+    /// The Secret whose value is the secret access key.
+    pub secret_key_secret: SecretRef,
+    /// The bucket named in the host (`bucket.s3.example.com`) rather than
+    /// in the path (`s3.example.com/bucket`), for services that take no
+    /// other.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub virtual_hosted: bool,
+}
+
+pub fn s3_region() -> String {
+    "us-east-1".to_owned()
+}
+
+impl S3Target {
+    fn check(&self) -> Result<(), Invalid> {
+        let rest = self
+            .endpoint
+            .strip_prefix("https://")
+            .or_else(|| self.endpoint.strip_prefix("http://"));
+        let host_ok = rest.is_some_and(|h| {
+            !h.is_empty()
+                && h.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']')
+                })
+        });
+        if !host_ok {
+            return Err(Invalid::new(
+                "s3.endpoint",
+                "https:// or http:// and a host, with a port if need be and no path: https://s3.example.com",
+            ));
+        }
+        let region_ok = !self.region.is_empty()
+            && self
+                .region
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if !region_ok {
+            return Err(Invalid::new("s3.region", "a region, as us-east-1"));
+        }
+        let b = &self.bucket;
+        let bucket_ok = (3..=63).contains(&b.len())
+            && b.bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'.' || c == b'-')
+            && !b.starts_with(['.', '-'])
+            && !b.ends_with(['.', '-']);
+        if !bucket_ok {
+            return Err(Invalid::new(
+                "s3.bucket",
+                "a bucket name: 3 to 63 lowercase letters, digits, dots and hyphens",
+            ));
+        }
+        let p = &self.prefix;
+        let prefix_ok = p.is_empty()
+            || !p.starts_with('/')
+                && !p.ends_with('/')
+                && p.split('/')
+                    .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+                && p.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'/' | b'.' | b'-' | b'_'));
+        if !prefix_ok {
+            return Err(Invalid::new(
+                "s3.prefix",
+                "letters, digits, '.', '-', '_' and '/' between parts: legion/prod",
+            ));
+        }
+        let key_ok = !self.access_key_id.is_empty()
+            && self
+                .access_key_id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'));
+        if !key_ok {
+            return Err(Invalid::new("s3.accessKeyId", "an access key ID"));
+        }
+        crate::validate_name(&self.secret_key_secret.namespace)
+            .map_err(|e| Invalid::new("s3.secretKeySecret.namespace", e.to_string()))?;
+        crate::validate_name(&self.secret_key_secret.name)
+            .map_err(|e| Invalid::new("s3.secretKeySecret.name", e.to_string()))?;
+        Ok(())
+    }
+}
+
+impl BackupTargetSpec {
+    /// The Secret it needs, if any: an SSH key or an S3 secret key.
+    pub fn secret(&self) -> Option<&SecretRef> {
+        self.ssh
+            .as_ref()
+            .map(|s| &s.key_secret)
+            .or(self.s3.as_ref().map(|s| &s.secret_key_secret))
+    }
+}
+
 impl Spec for BackupTargetSpec {
     fn admit(&mut self) -> Result<(), Invalid> {
+        let given = [
+            self.ssh.is_some(),
+            self.directory.is_some(),
+            self.s3.is_some(),
+        ];
+        if given.iter().filter(|g| **g).count() != 1 {
+            return Err(Invalid::new("", "give one of ssh, directory and s3"));
+        }
+        if let Some(s) = &self.s3 {
+            return s.check();
+        }
         match (&self.ssh, &self.directory) {
-            (Some(_), Some(_)) | (None, None) => {
-                return Err(Invalid::new("", "give one of ssh and directory"));
-            }
+            (Some(_), Some(_)) | (None, None) => unreachable!("exactly one given, checked above"),
             (Some(s), None) => {
                 let plain = |v: &str| {
                     !v.is_empty()
@@ -241,20 +362,21 @@ mod tests {
             directory: Some(DirectoryTarget {
                 path: "/backups".into(),
             }),
+            ..Default::default()
         };
         assert!(both.admit().is_err());
         assert!(BackupTargetSpec::default().admit().is_err());
         assert!(
             BackupTargetSpec {
                 ssh: Some(ssh()),
-                directory: None
+                ..Default::default()
             }
             .admit()
             .is_ok()
         );
         let dir = |p: &str| BackupTargetSpec {
-            ssh: None,
             directory: Some(DirectoryTarget { path: p.into() }),
+            ..Default::default()
         };
         assert!(dir("/mnt/backups").admit().is_ok());
         assert!(dir("backups").admit().is_err());
@@ -277,7 +399,7 @@ mod tests {
             }
             let e = BackupTargetSpec {
                 ssh: Some(s),
-                directory: None,
+                ..Default::default()
             }
             .admit();
             assert!(e.is_err(), "{field} {bad:?}");
@@ -287,11 +409,83 @@ mod tests {
         assert!(
             BackupTargetSpec {
                 ssh: Some(s),
-                directory: None
+                ..Default::default()
             }
             .admit()
             .is_err()
         );
+    }
+
+    fn s3() -> S3Target {
+        S3Target {
+            endpoint: "https://s3.eu-west-1.amazonaws.com".into(),
+            region: "eu-west-1".into(),
+            bucket: "shop-backups".into(),
+            prefix: "legion/prod".into(),
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".into(),
+            secret_key_secret: SecretRef {
+                namespace: "legion-ops".into(),
+                name: "s3-key".into(),
+            },
+            virtual_hosted: false,
+        }
+    }
+
+    #[test]
+    fn an_s3_target_names_a_bucket_reached_over_http() {
+        let admit = |s: S3Target| {
+            BackupTargetSpec {
+                s3: Some(s),
+                ..Default::default()
+            }
+            .admit()
+        };
+        assert!(admit(s3()).is_ok());
+        let mut both = BackupTargetSpec {
+            s3: Some(s3()),
+            ssh: Some(ssh()),
+            ..Default::default()
+        };
+        assert!(both.admit().is_err());
+        // A region left out is us-east-1; so is no prefix.
+        let t: BackupTargetSpec = serde_json::from_value(serde_json::json!({
+            "s3": {"endpoint": "http://minio.lan:9000", "bucket": "b-1",
+                   "accessKeyId": "minio",
+                   "secretKeySecret": {"namespace": "default", "name": "k"}}
+        }))
+        .unwrap();
+        assert_eq!(t.secret().unwrap().name, "k");
+        let s = t.s3.unwrap();
+        assert_eq!((s.region.as_str(), s.prefix.as_str()), ("us-east-1", ""));
+        assert!(admit(s).is_ok());
+        for (field, bad) in [
+            ("endpoint", "s3.example.com"),
+            ("endpoint", "https://s3.example.com/path"),
+            ("endpoint", "ftp://s3.example.com"),
+            ("endpoint", "https://"),
+            ("region", "EU West"),
+            ("bucket", "Shop_Backups"),
+            ("bucket", "ab"),
+            ("bucket", "-shop"),
+            ("prefix", "/legion"),
+            ("prefix", "legion/"),
+            ("prefix", "legion//prod"),
+            ("prefix", "legion/../x"),
+            ("prefix", "legion prod"),
+            ("accessKeyId", ""),
+            ("accessKeyId", "key with spaces"),
+        ] {
+            let mut s = s3();
+            match field {
+                "endpoint" => s.endpoint = bad.into(),
+                "region" => s.region = bad.into(),
+                "bucket" => s.bucket = bad.into(),
+                "prefix" => s.prefix = bad.into(),
+                _ => s.access_key_id = bad.into(),
+            }
+            let e = admit(s).expect_err(&format!("{field} {bad:?}"));
+            assert_eq!(e.path, format!("s3.{field}"), "{bad:?}");
+        }
     }
 
     #[test]

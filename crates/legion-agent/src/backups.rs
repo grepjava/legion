@@ -3,8 +3,9 @@
 //! target holds listed and pruned, and one restored onto a node.
 //!
 //! A target is a [`Remote`]: a ZFS host over SSH, which receives each
-//! backup incrementally after the first, or a directory, which keeps
-//! each whole as a file. A whole backup to a ZFS host starts a dataset of
+//! backup incrementally after the first; a directory, which keeps each
+//! whole as a file; or an S3-compatible bucket (`crate::s3`), which keeps
+//! each whole as an object. A whole backup to a ZFS host starts a dataset of
 //! its own there (`<dataset>/<namespace>.<volume>.<stamp>`), so the
 //! backups it already holds are never written over; what changed since is
 //! received into the dataset holding its base. A backup cut short there
@@ -272,10 +273,15 @@ pub(crate) fn remote(
     key: &[u8],
     of: &str,
 ) -> Result<Box<dyn Remote>, String> {
-    match (&spec.ssh, &spec.directory) {
-        (Some(s), _) => Ok(Box::new(Ssh::new(s, key, of)?)),
-        (None, Some(d)) => Ok(Box::new(Directory::new(d, of))),
-        (None, None) => Err("the target names neither ssh nor a directory".to_owned()),
+    match (&spec.ssh, &spec.directory, &spec.s3) {
+        (Some(s), _, _) => Ok(Box::new(Ssh::new(s, key, of)?)),
+        (None, Some(d), _) => Ok(Box::new(Directory::new(d, of))),
+        (None, None, Some(s)) => {
+            let rt = tokio::runtime::Handle::try_current()
+                .map_err(|_| "an S3 target is reached from the agent's runtime".to_owned())?;
+            Ok(Box::new(crate::s3::S3::new(s, key, of, rt)?))
+        }
+        (None, None, None) => Err("the target names none of ssh, a directory and s3".to_owned()),
     }
 }
 

@@ -42,6 +42,7 @@ pub mod pod;
 pub mod policing;
 mod probe;
 mod resolver;
+mod s3;
 pub use legion_runtime as runtime;
 pub use resolver::ExternalResolver;
 mod session;
