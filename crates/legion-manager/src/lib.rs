@@ -16,12 +16,12 @@ mod audit;
 mod authz;
 pub mod autolock;
 mod balancers;
-mod lead;
 mod build;
 pub mod ca;
 mod connections;
 pub mod console;
 mod gateway;
+mod lead;
 pub use gateway::Console;
 mod backups;
 pub mod controller;
@@ -400,10 +400,7 @@ impl Manager {
                 closing.clone(),
             ))
         });
-        let promote = tokio::spawn(join::promote_learners(
-            self.store.clone(),
-            closing.clone(),
-        ));
+        let promote = tokio::spawn(join::promote_learners(self.store.clone(), closing.clone()));
         let sessions: std::sync::Arc<session::Hub> = Default::default();
         let activity: std::sync::Arc<activity::State> = Default::default();
         let migrator = self.controllers.then(|| {
@@ -551,58 +548,86 @@ impl Manager {
         };
         // TLS is ended here rather than by tonic, so a renewed certificate
         // is served without a restart.
-        match &self.credentials {
+        let serving: std::pin::Pin<
+            Box<dyn Future<Output = Result<(), tonic::transport::Error>> + Send>,
+        > = match &self.credentials {
             Some(c) => {
-                router
-                    .serve_with_incoming_shutdown(c.incoming(listener), stopping)
-                    .await?
+                Box::pin(router.serve_with_incoming_shutdown(c.incoming(listener), stopping))
             }
-            None => {
-                router
-                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), stopping)
-                    .await?
-            }
+            None => Box::pin(
+                router.serve_with_incoming_shutdown(TcpListenerStream::new(listener), stopping),
+            ),
+        };
+        // Shutting down, it waits for its connections to end; one that never
+        // does (half-open through a NAT, a client that went quiet) would hold
+        // it forever, so they are given a while, then closed.
+        let mut closing = closing_tx.subscribe();
+        tokio::select! {
+            served = serving => served?,
+            _ = async {
+                let _ = closing.wait_for(|c| *c).await;
+                tokio::time::sleep(SHUTDOWN_GRACE).await;
+            } => tracing::warn!(
+                "connections still open {SHUTDOWN_GRACE:?} after the shutdown began: closed"
+            ),
         }
         // The controllers hold a store handle; they stop on `closing`.
         let _ = closing_tx.send(true);
         if let Some(controllers) = controllers {
-            let _ = controllers.await;
+            ended("controllers", controllers).await;
         }
         if let Some(resolver) = resolver {
-            let _ = resolver.await;
+            ended("resolver", resolver).await;
         }
         if let Some(acme) = acme {
-            let _ = acme.await;
+            ended("acme", acme).await;
         }
         if let Some(builds) = builds {
-            let _ = builds.await;
+            ended("builds", builds).await;
         }
         if let Some(migrator) = migrator {
-            let _ = migrator.await;
+            ended("migrator", migrator).await;
         }
         // Released as soon as `closing` turned, for another to take.
         if let Some(vip) = vip {
-            let _ = vip.await;
+            ended("vip", vip).await;
         }
-        let _ = promote.await;
-        let _ = floor.await;
-        let _ = names.await;
-        let _ = keeping.await;
-        let _ = alerting.await;
-        let _ = notifying.await;
-        let _ = eventing.await;
-        let _ = following.await;
+        ended("promote", promote).await;
+        ended("floor", floor).await;
+        ended("names", names).await;
+        ended("keeping", keeping).await;
+        ended("alerting", alerting).await;
+        ended("notifying", notifying).await;
+        ended("eventing", eventing).await;
+        ended("following", following).await;
         if let Some(console) = console {
-            let _ = console.await;
+            ended("console", console).await;
         }
-        let _ = rotation.await;
-        let _ = demotion.await;
-        let _ = auditing.await;
-        let _ = dispatching.await;
+        ended("rotation", rotation).await;
+        ended("demotion", demotion).await;
+        ended("auditing", auditing).await;
+        ended("dispatching", dispatching).await;
         tracing::info!("API stopped; shutting down the store");
         *self.metrics.write().unwrap_or_else(|e| e.into_inner()) = None;
         self.store.shutdown().await?;
         Ok(())
+    }
+}
+
+/// How long a manager shutting down waits for its connections, and for
+/// each of its tasks, before leaving it behind: what holds out longer
+/// would hold its shutdown forever.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Waits for a task of a manager shutting down, up to [`SHUTDOWN_GRACE`];
+/// one that overruns is said by name and left behind, as the process is
+/// about to end.
+async fn ended<T>(what: &str, task: impl Future<Output = T>) {
+    if tokio::time::timeout(SHUTDOWN_GRACE, task).await.is_err() {
+        tracing::warn!(
+            task = what,
+            "still running {SHUTDOWN_GRACE:?} after the shutdown began: left behind"
+        );
     }
 }
 

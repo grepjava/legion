@@ -1936,7 +1936,7 @@ impl Cluster for ApiService {
                 .watch_usage(forwarded_for(req.into_inner(), &caller)?)
                 .await?
                 .into_inner();
-            return Ok(Response::new(passed_on(from_leader)));
+            return Ok(Response::new(passed_on(from_leader, self.closing.clone())));
         }
         self.consistent().await?;
         if !namespace.is_empty() {
@@ -1994,7 +1994,7 @@ impl Cluster for ApiService {
                 self.peer_tls.as_ref(),
             ));
             let from_leader = c.watch_ca(forwarded(req.into_inner())).await?.into_inner();
-            return Ok(Response::new(passed_on(from_leader)));
+            return Ok(Response::new(passed_on(from_leader, self.closing.clone())));
         }
         self.consistent().await?;
         // Nodes tell their CA in their heartbeats, managers when asked:
@@ -2034,7 +2034,7 @@ impl Cluster for ApiService {
                 .watch_usage_history(forwarded_for(req.into_inner(), &caller)?)
                 .await?
                 .into_inner();
-            return Ok(Response::new(passed_on(from_leader)));
+            return Ok(Response::new(passed_on(from_leader, self.closing.clone())));
         }
         self.consistent().await?;
         if !namespace.is_empty() {
@@ -2072,7 +2072,7 @@ impl Cluster for ApiService {
                 .watch_connections(forwarded_for(req.into_inner(), &caller)?)
                 .await?
                 .into_inner();
-            return Ok(Response::new(passed_on(from_leader)));
+            return Ok(Response::new(passed_on(from_leader, self.closing.clone())));
         }
         self.consistent().await?;
         // pf says nothing as connections come and go: the nodes are asked
@@ -2113,7 +2113,7 @@ impl Cluster for ApiService {
                 .watch_load_balancers(forwarded_for(req.into_inner(), &caller)?)
                 .await?
                 .into_inner();
-            return Ok(Response::new(passed_on(from_leader)));
+            return Ok(Response::new(passed_on(from_leader, self.closing.clone())));
         }
         self.consistent().await?;
         caller.check(&self.store, Verb::Read, Kind::Service, &namespace)?;
@@ -3279,16 +3279,21 @@ impl ApiService {
 }
 
 /// A stream followed on the leader, passed on as it comes, ended with it
-/// (its error the last message) or when the follower goes.
+/// (its error the last message), when the follower goes, or when this
+/// manager closes.
 fn passed_on<T: Send + 'static>(
     mut from: tonic::Streaming<T>,
+    mut closing: tokio::sync::watch::Receiver<bool>,
 ) -> ReceiverStream<Result<T, Status>> {
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     tokio::spawn(async move {
         loop {
+            // Ended with this manager, as every stream it serves is: one
+            // left open would hold its shutdown.
             let r = tokio::select! {
                 r = from.message() => r.transpose(),
                 () = tx.closed() => return,
+                _ = closing.wait_for(|c| *c) => return,
             };
             let Some(r) = r else { return };
             let last = r.is_err();
