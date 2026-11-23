@@ -112,6 +112,10 @@ pub struct AgentConfig {
     /// How the node runs the Builds the managers give it, if they give it
     /// any (it is labelled a builder): `legion local`, on the host.
     pub builder: Builder,
+    /// The lease the supervisors of pods that must not run twice follow
+    /// (`legion_runtime::fence`): renewed as the managers answer; beside
+    /// `files_dir` by default.
+    pub lease: PathBuf,
 }
 
 /// Where volume plugins are by default.
@@ -153,6 +157,7 @@ impl AgentConfig {
     pub fn new(node: &str, files_dir: impl Into<PathBuf>) -> Self {
         let files_dir: PathBuf = files_dir.into();
         let files_dir_for_builds = files_dir.with_file_name("builds");
+        let lease = files_dir.with_file_name("lease");
         AgentConfig {
             node: node.to_owned(),
             infra_image: "docker.io/freebsd/freebsd-runtime:15.1".to_owned(),
@@ -175,6 +180,7 @@ impl AgentConfig {
             load_balancer_interface: None,
             resolver: None,
             builder: Builder::new(files_dir_for_builds),
+            lease,
         }
     }
 }
@@ -225,6 +231,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 no_limits: false,
                 platform: Default::default(),
                 drain: config.drain,
+                lease: config.lease,
             },
             resync: config.resync,
             usage_period: config.usage_period,
@@ -370,7 +377,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             hosted.clone(),
         ));
         let heartbeats = tokio::spawn(heartbeats(
-            heard.clone(),
+            (heard.clone(), ctx.lease.clone()),
             ctx.control.clone(),
             ctx.node.clone(),
             carp_states,
@@ -1290,7 +1297,10 @@ async fn host_checks(sys: Arc<dyn Sys>, zfs_root: Option<String>, lacks: Lacks) 
 }
 
 async fn heartbeats<R: Runtime, C: Control>(
-    heard: Arc<std::sync::Mutex<(tokio::time::Instant, Duration)>>,
+    (heard, lease): (
+        Arc<std::sync::Mutex<(tokio::time::Instant, Duration)>>,
+        PathBuf,
+    ),
     control: Arc<C>,
     node: String,
     carp: CarpStates,
@@ -1314,6 +1324,7 @@ async fn heartbeats<R: Runtime, C: Control>(
             (Vec::new(), None)
         };
         let sent = tokio::time::Instant::now();
+        let sent_ms = legion_runtime::fence::monotonic_ms();
         let held = carp.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let checked = lacks.lock().unwrap_or_else(|e| e.into_inner()).take();
         let sending = checked.clone();
@@ -1324,6 +1335,18 @@ async fn heartbeats<R: Runtime, C: Control>(
         {
             Ok(p) => {
                 *heard.lock().unwrap_or_else(|e| e.into_inner()) = (sent, p);
+                // Until the managers would mark this node down, counted
+                // from when they were asked, as `heard` is: the moment
+                // this node's pods that must not run twice stop, by their
+                // supervisors when no agent is here to.
+                let until =
+                    sent_ms + (p * legion_api::node::DOWN_AFTER_HEARTBEATS).as_millis() as u64;
+                if let Err(e) = legion_runtime::fence::renew(&lease, until) {
+                    tracing::error!(
+                        lease = %lease.display(),
+                        "renewing the lease: {e}; this node's pods that must not run twice stop once it runs out"
+                    );
+                }
                 if failing {
                     tracing::info!("heartbeats reach the managers again");
                     failing = false;

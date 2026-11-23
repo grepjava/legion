@@ -540,6 +540,31 @@ async fn a_pod_that_must_not_run_twice_stops_before_it_is_replaced() {
     })
     .await;
 
+    // Its containers follow the node's lease (`legion_runtime::fence`),
+    // which their supervisors stop them by when no agent is there: the
+    // app's, not the infra jail's. Renewed as the managers answer.
+    use legion_runtime::fence;
+    let lease = c.dir.path().join("n2").join("lease");
+    let names: Vec<String> = c.nodes[1]
+        .rt
+        .containers()
+        .into_iter()
+        .map(|(n, _, _)| n)
+        .collect();
+    for name in &names {
+        let spec = c.nodes[1].rt.spec(name).unwrap();
+        let fenced = spec.annotations.get(fence::ANNOTATION_FENCE);
+        if name.ends_with("_web") {
+            assert_eq!(fenced, Some(&lease.display().to_string()), "{name}");
+        } else {
+            assert_eq!(fenced, None, "{name}");
+        }
+    }
+    eventually("the lease is renewed", async || {
+        fence::until(&lease).is_some_and(|u| u > fence::monotonic_ms())
+    })
+    .await;
+
     c.nodes[1].link.cut();
     let start = tokio::time::Instant::now();
     let (mut stopped, mut replaced) = (None, None);
@@ -570,6 +595,15 @@ async fn a_pod_that_must_not_run_twice_stops_before_it_is_replaced() {
     assert!(
         stopped < replaced.unwrap(),
         "stopped {stopped:?}, replaced {replaced:?}"
+    );
+    // Not renewed since the cut: by the time the pod is replaced, the
+    // lease has run out, so its supervisors would have stopped it had the
+    // agent been gone.
+    assert!(
+        fence::expired(&lease, fence::monotonic_ms()),
+        "the lease holds until {:?}, now {}",
+        fence::until(&lease),
+        fence::monotonic_ms()
     );
 
     c.nodes[1].link.mend();

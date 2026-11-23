@@ -76,8 +76,120 @@ fn env_entry(entry: &str) -> String {
     }
 }
 
+/// What a supervisor does about its container's lease
+/// (`legion_runtime::fence`), asked each time it polls: the lease read once
+/// a second; run out, the container's stop signal, then after its stop
+/// timeout a kill, as the agent would stop it if one were here.
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+pub(crate) struct Fence {
+    lease: std::path::PathBuf,
+    stop_timeout: std::time::Duration,
+    checked: Option<std::time::Instant>,
+    stopped: Option<std::time::Instant>,
+    killed: bool,
+}
+
+/// What [`Fence::step`] says to do.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+pub(crate) enum FenceStep {
+    Nothing,
+    /// Send the container's stop signal.
+    Stop,
+    /// Kill it: its stop timeout has passed.
+    Kill,
+}
+
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+impl Fence {
+    /// The fence of a container whose annotations name a lease; `None`
+    /// for one that may run on cut off.
+    pub(crate) fn of(
+        annotations: &std::collections::BTreeMap<String, String>,
+        stop_timeout_secs: u64,
+    ) -> Option<Fence> {
+        let lease = annotations.get(legion_runtime::fence::ANNOTATION_FENCE)?;
+        Some(Fence {
+            lease: lease.into(),
+            stop_timeout: std::time::Duration::from_secs(stop_timeout_secs.max(1)),
+            checked: None,
+            stopped: None,
+            killed: false,
+        })
+    }
+
+    pub(crate) fn step(&mut self, now: std::time::Instant, now_ms: u64) -> FenceStep {
+        if self.killed {
+            return FenceStep::Nothing;
+        }
+        if let Some(at) = self.stopped {
+            if now.duration_since(at) >= self.stop_timeout {
+                self.killed = true;
+                return FenceStep::Kill;
+            }
+            return FenceStep::Nothing;
+        }
+        if self
+            .checked
+            .is_some_and(|at| now.duration_since(at) < std::time::Duration::from_secs(1))
+        {
+            return FenceStep::Nothing;
+        }
+        self.checked = Some(now);
+        if legion_runtime::fence::expired(&self.lease, now_ms) {
+            self.stopped = Some(now);
+            return FenceStep::Stop;
+        }
+        FenceStep::Nothing
+    }
+}
+
+/// What a fenced container's log says as it is stopped.
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+const FENCED: &[u8] = b"legion: the managers have not answered this node for as long as they take to replace its pods; stopping, as this pod must not run twice (onPartition: stop)\n";
+
 #[cfg(test)]
 mod tests {
+    use super::{Fence, FenceStep};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_fenced_container_stops_once_its_lease_runs_out_then_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = dir.path().join("lease");
+        let annotations = std::collections::BTreeMap::from([(
+            legion_runtime::fence::ANNOTATION_FENCE.to_owned(),
+            lease.display().to_string(),
+        )]);
+        assert!(Fence::of(&Default::default(), 10).is_none(), "not fenced");
+        let mut f = Fence::of(&annotations, 3).unwrap();
+        let t0 = Instant::now();
+        // No lease yet: nothing.
+        assert_eq!(f.step(t0, 50_000), FenceStep::Nothing);
+        legion_runtime::fence::renew(&lease, 10_000).unwrap();
+        // Read at most once a second.
+        assert_eq!(
+            f.step(t0 + Duration::from_millis(500), 20_000),
+            FenceStep::Nothing
+        );
+        assert_eq!(
+            f.step(t0 + Duration::from_secs(1), 9_000),
+            FenceStep::Nothing
+        );
+        // Run out: stopped, killed once its stop timeout has passed, then
+        // left alone.
+        assert_eq!(f.step(t0 + Duration::from_secs(2), 10_001), FenceStep::Stop);
+        assert_eq!(
+            f.step(t0 + Duration::from_secs(4), 10_001),
+            FenceStep::Nothing
+        );
+        assert_eq!(f.step(t0 + Duration::from_secs(5), 10_001), FenceStep::Kill);
+        assert_eq!(
+            f.step(t0 + Duration::from_secs(9), 10_001),
+            FenceStep::Nothing
+        );
+    }
+
     #[test]
     fn an_environment_entry_is_named_without_its_value() {
         let named = super::env_entry("TOKEN=s3cr\0et");
@@ -231,10 +343,27 @@ mod imp {
         let mut open = [Some(out_r), Some(err_r)];
         let mut ended: Option<(i32, Instant)> = None;
         let mut buf = vec![0u8; 64 << 10];
+        let mut fence = super::Fence::of(&rec.annotations, rec.stop_timeout);
         loop {
             if STOP.swap(false, Ordering::Relaxed) && ended.is_none() {
                 // SAFETY: the child is ours and not yet reaped.
                 unsafe { libc::kill(pid, rec.stop_signal) };
+            }
+            if ended.is_none()
+                && let Some(f) = fence.as_mut()
+            {
+                match f.step(Instant::now(), legion_runtime::fence::monotonic_ms()) {
+                    super::FenceStep::Stop => {
+                        let _ = log.write(Output::Stderr, super::FENCED);
+                        // SAFETY: the child is ours and not yet reaped.
+                        unsafe { libc::kill(pid, rec.stop_signal) };
+                    }
+                    // SAFETY: the child is ours and not yet reaped.
+                    super::FenceStep::Kill => unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    },
+                    super::FenceStep::Nothing => {}
+                }
             }
             let mut fds: Vec<libc::pollfd> = open
                 .iter()

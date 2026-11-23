@@ -645,3 +645,120 @@ fn pods_outlive_a_clock_set_after_boot() {
     lab.stop();
     eprintln!("adopt: clock done");
 }
+
+/// A pod that must not run twice, as `guard`: stopped by its supervisor
+/// once the managers would have marked its node down (`onPartition: stop`).
+fn guard() -> String {
+    format!(
+        r#"apiVersion: legion/v1
+kind: Service
+metadata: {{ name: guard, namespace: shop }}
+spec:
+  replicas: 1
+  pod:
+    onPartition: stop
+    stopGracePeriod: 2s
+    restartPolicy: {{ condition: any, delay: 0s }}
+    containers:
+      - name: guard
+        image: {IMAGE}
+        pullPolicy: never
+        command: [/bin/sh, -c, 'while :; do sleep 1; done']
+"#
+    )
+}
+
+/// Self-fencing (`legion_runtime::fence`): the daemon killed, nothing is
+/// left to stop a pod that must not run twice, so its supervisor does, once
+/// the lease the agent renewed runs out: no sooner, and well before a
+/// replacement could start elsewhere. A pod that may run on cut off is
+/// left alone, and the next daemon takes it over.
+#[test]
+#[ignore = "needs root and ZFS on FreeBSD; set LEGION_ADOPT_LAB and LEGION_ADOPT_ZFS_ROOT"]
+fn a_pod_that_must_not_run_twice_stops_when_the_daemon_dies() {
+    let (Some(dir), Some(zfs_root)) = (
+        std::env::var_os("LEGION_ADOPT_LAB"),
+        std::env::var("LEGION_ADOPT_ZFS_ROOT").ok(),
+    ) else {
+        legion_sys::live::skip("LEGION_ADOPT_LAB or LEGION_ADOPT_ZFS_ROOT not set");
+        return;
+    };
+    let mut lab = Lab::new(dir.into(), zfs_root);
+    lab.start();
+    lab.cli(&["init"]);
+    lab.apply(1);
+    let file = lab.dir.join("guard.yaml");
+    std::fs::write(&file, guard()).unwrap();
+    lab.cli(&["apply", "-f", file.to_str().unwrap()]);
+    let both_ready = |lab: &Lab| {
+        let services = lab.list("services");
+        services.len() == 2
+            && services
+                .iter()
+                .all(|s| s["status"]["ready"] == 1 && s["status"]["desired"] == 1)
+    };
+    wait("both pods", 180, || both_ready(&lab));
+    let task_of = |lab: &Lab, service: &str| -> String {
+        lab.tasks()
+            .iter()
+            .find(|t| t["spec"]["service"] == service)
+            .and_then(|t| t["metadata"]["name"].as_str())
+            .unwrap()
+            .to_owned()
+    };
+    let (beat, guarded) = (task_of(&lab, "beat"), task_of(&lab, "guard"));
+    let (_, guard_jail) = lab.records()[&format!("shop_{guarded}_guard")].clone();
+    let lease = lab.dir.join("run/lease");
+    assert!(
+        legion_runtime::fence::until(&lease).is_some(),
+        "the agent keeps a lease at {}",
+        lease.display()
+    );
+    let beat_pid = |lab: &Lab| {
+        let jid = lab.member_jid(&beat);
+        ok(&format!("pgrep -o -j {jid} sh")).trim().to_owned()
+    };
+    let running = |jail: &str| {
+        sh(&format!("jexec {JAIL} jls -j {jail} jid"))
+            .status
+            .success()
+    };
+    let pid = beat_pid(&lab);
+
+    eprintln!("adopt: killed under a pod that must not run twice");
+    lab.kill();
+    let killed = Instant::now();
+    // Not before the managers would have marked the node down: the lease
+    // was renewed as the last heartbeat was answered, 16 s ahead.
+    std::thread::sleep(Duration::from_secs(8));
+    assert!(running(&guard_jail), "stopped before its lease ran out");
+    wait("the guard stopped by its supervisor", 45, || {
+        !running(&guard_jail)
+    });
+    let after = killed.elapsed();
+    assert!(
+        after >= Duration::from_secs(12),
+        "stopped {after:?} after the kill: before the lease ran out"
+    );
+    let said = sh(&format!(
+        "grep -l 'must not run twice' {}/data/jails/*/log",
+        lab.dir.display()
+    ));
+    assert!(said.status.success(), "the guard's log says why it stopped");
+    // The other pod runs on, the same process.
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        beat_pid(&lab),
+        pid,
+        "a pod that may run on cut off is left alone"
+    );
+
+    eprintln!("adopt: the next daemon");
+    lab.start();
+    wait("both running again", 180, || both_ready(&lab));
+    assert_eq!(beat_pid(&lab), pid, "beat adopted, not replaced");
+    assert!(
+        lab.logged("adopted running pod") >= 1,
+        "the next daemon adopted beat"
+    );
+}

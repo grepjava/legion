@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 
+pub mod fence;
+
 /// The annotation a VM container's settings come in, as [`VmConfig`]'s
 /// JSON (DESIGN.md §6.8).
 pub const ANNOTATION_VM: &str = "legion.vm";

@@ -14,3 +14,9 @@ serde.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -76,6 +76,9 @@ pub(crate) struct Ctx<R, C> {
     pub platform: legion_api::node::Platform,
     /// How long a ready task told to stop keeps running first.
     pub drain: std::time::Duration,
+    /// The lease (`legion_runtime::fence`) the containers of a pod that
+    /// must not run twice follow.
+    pub lease: std::path::PathBuf,
 }
 
 impl<R, C> Ctx<R, C> {
@@ -112,6 +115,7 @@ impl<R, C> Clone for Ctx<R, C> {
             no_limits: self.no_limits,
             platform: self.platform.clone(),
             drain: self.drain,
+            lease: self.lease.clone(),
         }
     }
 }
@@ -716,6 +720,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             let step = format!("init container {} ({}/{})", c.name, i + 1, init.len());
             self.report(TaskState::Starting, step).await;
             let mut spec = pod::container_spec(&self.ctx.node, &self.a, c, Role::Init, &infra);
+            self.fence(&mut spec);
             spec.mounts.extend(volumes::mounts(c, &sources));
             files.apply(&c.name, &mut spec);
             let id = rt
@@ -755,6 +760,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
         let apps: Vec<_> = self.pod().containers.clone();
         for c in &apps {
             let mut spec = pod::container_spec(&self.ctx.node, &self.a, c, Role::App, &infra);
+            self.fence(&mut spec);
             if let Some(vm) = &c.vm {
                 let config = self.vm_config(vm)?;
                 spec.annotations.insert(
@@ -903,6 +909,18 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                 .hostname()
                 .unwrap_or_else(|| self.a.key.name.clone()),
         })
+    }
+
+    /// A container of a pod that must not run twice follows the node's
+    /// lease (`legion_runtime::fence`): its supervisor stops it once the
+    /// managers would have marked the node down, the agent gone or not.
+    fn fence(&self, spec: &mut legion_runtime::ContainerSpec) {
+        if self.a.spec.pod.on_partition == legion_api::service::OnPartition::Stop {
+            spec.annotations.insert(
+                legion_runtime::fence::ANNOTATION_FENCE.to_owned(),
+                self.ctx.lease.display().to_string(),
+            );
+        }
     }
 
     /// Waits until the pod's host end is guarded at its address, before

@@ -70,6 +70,7 @@ test legion-net mesh nodes_behind_nat_reach_each_other_through_a_relay host shar
 test legion vip the_floating_address_follows_the_leader host shared 600 kld:carp kld:if_bridge kld:if_epair
 test legion adopt pods_outlive_the_daemon host shared 1800 kld:if_bridge kld:if_epair kld:if_wg kld:pf
 test legion adopt pods_outlive_a_clock_set_after_boot host isolated 900 kld:if_bridge kld:if_epair kld:if_wg kld:pf
+test legion adopt a_pod_that_must_not_run_twice_stops_when_the_daemon_dies host shared 900 kld:if_bridge kld:if_epair kld:if_wg kld:pf
 
 # A disposable host: these publish ports, or need servers set up first.
 test legion-sys contract real_modules host isolated 120
