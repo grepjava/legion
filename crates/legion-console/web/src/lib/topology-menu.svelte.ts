@@ -30,7 +30,9 @@ import {
   SquareTerminal,
   Trash2,
   Truck,
-  Undo2
+  Undo2,
+  Unplug,
+  Globe
 } from '@lucide/svelte';
 
 /** What the menus need of the page. */
@@ -407,6 +409,137 @@ export function volumeMenu(v: string, on: string, scene: Scene): MenuItem[] {
       separated: true,
       disabled: why ?? (elsewhere.length ? undefined : t('no other node')),
       children: elsewhere.map((n) => ({ label: n, run: () => moveVolume(v, n, scene) }))
+    }
+  ];
+}
+
+/** A port a Service publishes outside the cluster, as the page draws it. */
+export interface PublishedPort {
+  service: string;
+  /** `PORT/PROTOCOL`, the Service's port. */
+  what: string;
+  /** The port it is published on; null until it is. */
+  at: number | null;
+  /** On the nodes running it (`host`) rather than every node (`ingress`). */
+  host: boolean;
+}
+
+async function copied(text: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(t('Copied {text}', { text }));
+  } catch (e) {
+    toast((e as Error).message, true);
+  }
+}
+
+/** What a published port's menu offers: opened or copied at this node's
+ * address (any node answers an `ingress` port), its Service, its ports
+ * edited, or no longer published. */
+export function portMenu(p: PublishedPort, scene: Scene): MenuItem[] {
+  const ns = scene.namespace;
+  const service = p.service;
+  const why = cannotWrite(ns) ?? undefined;
+  const [port, protocol] = p.what.split('/');
+  const address = p.at === null ? '' : `${location.hostname}:${p.at}`;
+  const notYet = p.at === null ? t('not published yet') : undefined;
+  return [
+    {
+      label: t('Open in browser'),
+      icon: ExternalLink,
+      disabled: notYet ?? (protocol === 'tcp' ? undefined : t('a {protocol} port', { protocol })),
+      children: ['https', 'http'].map((scheme) => ({
+        label: `${scheme}://${address}`,
+        run: () => window.open(`${scheme}://${address}/`, '_blank', 'noopener')
+      }))
+    },
+    { label: t('Copy address'), icon: Copy, disabled: notYet, run: () => copied(address) },
+    { label: t('Its Service'), icon: Layers, separated: true, run: () => goto(page('Service', ns, service)) },
+    {
+      label: t('Edit ports'),
+      icon: FilePenLine,
+      disabled: why,
+      run: () =>
+        goto(`/apply?kind=Service&namespace=${encodeURIComponent(ns)}&name=${encodeURIComponent(service)}`)
+    },
+    {
+      label: t('Stop publishing'),
+      icon: Unplug,
+      danger: true,
+      separated: true,
+      disabled: why,
+      run: async () => {
+        const ok = await ask(
+          p.host
+            ? t('Stop publishing port {port}/{protocol} of {service}? It is no longer answered on the nodes running it; inside the cluster it still is.', { port, protocol, service })
+            : t('Stop publishing port {port}/{protocol} of {service}? No node answers it any more; inside the cluster it still is.', { port, protocol, service }),
+          { action: t('Stop publishing') }
+        );
+        if (!ok) return;
+        await done(async () => {
+          const fresh = await api.get('Service', ns, service);
+          const endpoint = { ...(fresh.spec?.endpoint ?? {}) };
+          endpoint.ports = ((endpoint.ports ?? []) as Record<string, unknown>[]).map((q) => {
+            if (String(q.port) !== port || ((q.protocol as string) ?? 'tcp') !== protocol) return q;
+            const { publish: _, publishedPort: __, ...rest } = q;
+            return rest;
+          });
+          await api.apply({
+            object: {
+              apiVersion: fresh.apiVersion,
+              kind: 'Service',
+              metadata: { name: service, namespace: ns, labels: fresh.metadata.labels ?? {} },
+              spec: { ...fresh.spec, endpoint }
+            },
+            expectedVersion: fresh.metadata.version
+          });
+          return t('Port {port}/{protocol} of {service} no longer published', { port, protocol, service });
+        });
+      }
+    }
+  ];
+}
+
+/** What an ingress Route's menu offers. */
+export function routeMenu(r: LObject, scene: Scene): MenuItem[] {
+  const ns = scene.namespace;
+  const name = r.metadata.name;
+  const why = cannotWrite(ns) ?? undefined;
+  const host = (r.spec?.host as string) ?? '';
+  const url = `${r.spec?.tls ? 'https' : 'http'}://${host}${(r.spec?.path as string) ?? '/'}`;
+  const wildcard = host.startsWith('*') ? t('its host is a wildcard') : undefined;
+  return [
+    { label: t('Open'), icon: ExternalLink, run: () => goto(page('Route', ns, name)) },
+    {
+      label: t('Open in browser'),
+      icon: Globe,
+      disabled: wildcard,
+      run: () => window.open(url, '_blank', 'noopener')
+    },
+    { label: t('Copy address'), icon: Copy, run: () => copied(url) },
+    ...(r.spec?.service
+      ? [{ label: t('Its Service'), icon: Layers, separated: true, run: () => goto(page('Service', ns, r.spec.service)) }]
+      : []),
+    {
+      label: t('Edit YAML'),
+      icon: FilePenLine,
+      disabled: why,
+      run: () => goto(`/apply?kind=Route&namespace=${encodeURIComponent(ns)}&name=${encodeURIComponent(name)}`)
+    },
+    {
+      label: t('Delete'),
+      icon: Trash2,
+      danger: true,
+      separated: true,
+      disabled: why,
+      run: async () => {
+        const ok = await ask({
+          message: t('Delete Route {name}? {url} is no longer routed to {service}.', { name, url, service: r.spec?.service ?? '' }),
+          action: t('Delete'),
+          typed: name
+        });
+        if (ok) done(async () => (await api.remove('Route', ns, name), t('{name} deleted', { name })));
+      }
     }
   ];
 }

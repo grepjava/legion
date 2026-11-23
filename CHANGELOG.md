@@ -173,6 +173,10 @@ beyond the usual (managers first, one at a time, then workers).
   move it there. A Service whose data is a Volume is never offered a
   second replica: two Postgres over one data directory, each in its own
   jail, don't see each other's lock.
+- Topology's published ports and Routes have a right-click menu too: a
+  port opened in the browser or its address copied, its Service, its ports
+  edited, or no longer published (asked first); a Route opened, copied,
+  edited or deleted.
 - Topology's links are named for what they show (WCAG 2.5.3); a sign-in
   link pasted into the sign-in tab is read.
 - Unit tests of its helpers (`npm test`, Vitest), run by CI with the type

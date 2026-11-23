@@ -26,7 +26,9 @@
     serviceMenu,
     taskMenu,
     volumeMenu,
-    type Scene
+    type Scene,
+    portMenu,
+    routeMenu
   } from '#lib/topology-menu.svelte.ts';
 
   const mine = $derived(namespaces([]));
@@ -873,6 +875,8 @@
           {#each shownRoutes as r, i (r.metadata.name)}
             <a
               href={link('Route', r.metadata.name)}
+              oncontextmenu={(e) => openMenu(e, routeMenu(r, scene), t('Route {name}', { name: r.metadata.name }))}
+              onkeydown={(e) => menuKey(e, () => routeMenu(r, scene), t('Route {name}', { name: r.metadata.name }))}
               aria-label={t('{address} {route}, to {service}', {
                 address: routeAddress(r),
                 route: t('Route {name}', { name: r.metadata.name }),
@@ -899,6 +903,8 @@
             {@const where = p.at === null ? t('not published yet') : p.host ? t('on nodes running it') : t('on every node')}
             <a
               href={link('Service', p.service)}
+              oncontextmenu={(e) => openMenu(e, portMenu(p, scene), t('Port {shown}', { shown: portShown(p) }))}
+              onkeydown={(e) => menuKey(e, () => portMenu(p, scene), t('Port {shown}', { shown: portShown(p) }))}
               aria-label={t('Port {shown} {where}, to {service}', {
                 shown: portShown(p),
                 service: p.service,
