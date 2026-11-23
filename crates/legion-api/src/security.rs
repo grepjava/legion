@@ -2,7 +2,9 @@
 //! raw sockets, no changing file flags, no mlock, no SysV IPC, no mounting,
 //! `enforce_statfs=2` and `securelevel=2`. A container's `security` loosens
 //! that, and only as far as its namespace's `security.allow` lets it, which
-//! only the cluster admin sets.
+//! only the cluster admin sets. A container that is a bhyve VM counts as a
+//! loosening too (`vm`): its hypervisor runs on the host, outside any
+//! jail, so no namespace runs one unless the cluster admin allows it.
 
 use std::collections::BTreeSet;
 
@@ -41,6 +43,10 @@ pub enum Loosening {
     Securelevel,
     /// `enforceStatfs: 1`.
     EnforceStatfs,
+    /// A container that is a bhyve virtual machine (`vm`): bhyve runs on
+    /// the host, as root and outside any jail, booting a disk image the
+    /// namespace supplies.
+    Vm,
 }
 
 impl From<Allow> for Loosening {
@@ -63,6 +69,7 @@ impl Loosening {
             Loosening::Sysvipc => "sysvipc",
             Loosening::Securelevel => "securelevel",
             Loosening::EnforceStatfs => "enforceStatfs",
+            Loosening::Vm => "vm",
         }
     }
 }
@@ -155,10 +162,17 @@ impl Security {
     }
 }
 
-/// How the pod's containers, init containers included, loosen their jails.
+/// How the pod's containers, init containers included, loosen their jails;
+/// a VM among them, `vm`.
 pub fn pod_loosenings(pod: &PodSpec) -> BTreeSet<Loosening> {
     pod.containers()
-        .flat_map(|c| c.security.loosenings())
+        .flat_map(|c| {
+            let mut l = c.security.loosenings();
+            if c.vm.is_some() {
+                l.insert(Loosening::Vm);
+            }
+            l
+        })
         .collect()
 }
 
@@ -190,10 +204,21 @@ impl NamespaceSecurity {
         if refused.is_empty() {
             return None;
         }
-        let names: Vec<&str> = refused.iter().map(|l| l.as_str()).collect();
+        let jails: Vec<&str> = refused
+            .iter()
+            .filter(|l| **l != Loosening::Vm)
+            .map(|l| l.as_str())
+            .collect();
+        let mut why = Vec::new();
+        if !jails.is_empty() {
+            why.push(format!("its containers' jails {}", jails.join(", ")));
+        }
+        if refused.contains(&Loosening::Vm) {
+            why.push("virtual machines (vm: bhyve runs on the host, outside any jail)".to_owned());
+        }
         Some(format!(
-            "namespace {namespace} does not allow its containers' jails {}",
-            names.join(", ")
+            "namespace {namespace} does not allow {}",
+            why.join(", nor ")
         ))
     }
 }
@@ -265,5 +290,30 @@ mod tests {
         }
         let unknown: Result<Security, _> = serde_yaml_ng::from_str("allow: [mount]");
         assert!(unknown.is_err());
+    }
+
+    #[test]
+    fn a_vm_needs_its_namespace_to_allow_it() {
+        let p = pod("containers: [{ name: guest, image: x, vm: { memory: 1Gi } }]");
+        assert_eq!(
+            pod_loosenings(&p).into_iter().collect::<Vec<_>>(),
+            [Loosening::Vm]
+        );
+        let why = NamespaceSecurity::default().refusal("shop", &p).unwrap();
+        assert_eq!(
+            why,
+            "namespace shop does not allow virtual machines (vm: bhyve runs on the host, outside any jail)"
+        );
+        let ns: NamespaceSecurity = serde_yaml_ng::from_str("allow: [vm]").unwrap();
+        assert!(ns.refusal("shop", &p).is_none());
+        // Jails and a VM refused together, each said.
+        let both = pod(
+            "containers: [{ name: guest, image: x, vm: { memory: 1Gi }, security: { allow: [rawSockets] } }]",
+        );
+        let why = NamespaceSecurity::default().refusal("shop", &both).unwrap();
+        assert!(
+            why.contains("jails rawSockets, nor virtual machines"),
+            "{why}"
+        );
     }
 }

@@ -111,6 +111,25 @@ fn a_vm_pod_boots_and_serves() {
     let file = lab.dir.join("guest.yaml");
     let mut f = std::fs::File::create(&file).unwrap();
     f.write_all(APP.as_bytes()).unwrap();
+    // A VM's bhyve runs on the host, outside any jail: refused until the
+    // cluster admin allows the namespace VMs.
+    let refused = lab.legion(&["apply", "-f", file.to_str().unwrap()], &[]);
+    assert!(
+        !refused.status.success() && text(&refused.stderr).contains("virtual machines (vm"),
+        "{}",
+        text(&refused.stderr)
+    );
+    let allow = lab.dir.join("allow-vm.yaml");
+    std::fs::write(
+        &allow,
+        "apiVersion: legion/v1
+kind: Namespace
+metadata: { name: default }
+spec: { security: { allow: [vm] } }
+",
+    )
+    .unwrap();
+    lab.ok(&["apply", "-f", allow.to_str().unwrap()]);
     lab.ok(&["apply", "-f", file.to_str().unwrap()]);
 
     step("the guest boots with the pod's address, and answers there");
