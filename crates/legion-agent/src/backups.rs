@@ -7,7 +7,9 @@
 //! each whole as a file. A whole backup to a ZFS host starts a dataset of
 //! its own there (`<dataset>/<namespace>.<volume>.<stamp>`), so the
 //! backups it already holds are never written over; what changed since is
-//! received into the dataset holding its base.
+//! received into the dataset holding its base. A backup cut short there
+//! is kept for what came (`zfs receive -s`), and the next run goes on
+//! with it before taking its own.
 
 use std::io::{Read, Write};
 
@@ -35,6 +37,28 @@ pub(crate) trait Remote: Send + Sync {
     fn destroy(&self, held: &str) -> Result<(), String>;
     /// Writes `held`, whole, to `out`.
     fn send(&self, held: &str, out: &mut dyn Write) -> Result<(), String>;
+    /// A backup of this Volume cut short that the target kept to go on
+    /// with: the dataset taking it, and its resume token. None where
+    /// nothing is kept (a directory).
+    fn partial(&self) -> Result<Option<(String, String)>, String> {
+        Ok(None)
+    }
+    /// Takes the rest of a backup of `snapshot` cut short into `dataset`;
+    /// where it is held.
+    fn resume(
+        &self,
+        dataset: &str,
+        snapshot: &str,
+        input: &mut dyn Read,
+    ) -> Result<String, String> {
+        let _ = (dataset, snapshot, input);
+        Err("this target keeps nothing of a backup cut short".to_owned())
+    }
+    /// Gives up what `dataset` kept of a backup cut short.
+    fn abort(&self, dataset: &str) -> Result<(), String> {
+        let _ = dataset;
+        Ok(())
+    }
 }
 
 /// The snapshot a held backup is: `legion-bk-offsite-…` from
@@ -72,8 +96,11 @@ pub(crate) struct Ran {
 /// Takes `ds@snapshot` and sends it to `remote`: what changed since
 /// `base` when both the dataset and the target still hold it, else whole;
 /// then drops the dataset's older backup snapshots (the new one is the
-/// next base) and the target's beyond `keep`, oldest first. A run that
-/// fails leaves no new snapshot behind.
+/// next base) and the target's beyond `keep`, oldest first. A backup cut
+/// short that the target kept goes on first, from its resume token, and
+/// is the base if it gets there; one that cannot go on (its snapshot gone
+/// here) is given up. A run that fails leaves no new snapshot behind,
+/// unless the target kept what came of it to go on with.
 pub(crate) fn run(
     sys: &dyn Sys,
     lock: &Mutex<()>,
@@ -84,6 +111,21 @@ pub(crate) fn run(
     keep: usize,
 ) -> Result<Ran, String> {
     let prefix = &snapshot[..snapshot.rfind('-').map_or(0, |i| i + 1)];
+    let mut base = base.to_owned();
+    let mut resumed_bytes = 0;
+    if let Some((dataset, token)) = remote.partial()? {
+        match resumable(sys, ds, prefix, &token) {
+            Some(cut) => {
+                resumed_bytes = piped(
+                    |out| sys.zfs_send_resume(&token, out).map_err(|e| e.to_string()),
+                    |input| remote.resume(&dataset, &cut, input),
+                    remote,
+                )?;
+                base = cut;
+            }
+            None => remote.abort(&dataset)?,
+        }
+    }
     let held = remote.list()?;
     {
         let _guard = lock.blocking_lock();
@@ -92,41 +134,32 @@ pub(crate) fn run(
     }
     let local = sys.zfs_snapshots(ds).map_err(|e| e.to_string())?;
     let base_held = held.iter().find(|h| snapshot_of(h) == base);
-    let since = (remote.incremental() && !base.is_empty() && local.iter().any(|s| s == base))
+    let since = (remote.incremental() && !base.is_empty() && local.contains(&base))
         .then_some(base_held)
         .flatten();
-    let (mut from, to) = std::io::pipe().map_err(|e| format!("a pipe: {e}"))?;
-    let sent = std::thread::scope(|scope| {
-        let sender = scope.spawn(move || {
-            let mut out = Counted {
-                inner: to,
-                bytes: 0,
-            };
-            let r = sys
-                .zfs_send(&format!("{ds}@{snapshot}"), since.map(|_| base), &mut out)
-                .map_err(|e| e.to_string());
-            r.map(|()| out.bytes)
-        });
-        let taken = remote.receive(snapshot, since.map(String::as_str), &mut from);
-        drop(from);
-        let bytes = sender
-            .join()
-            .unwrap_or_else(|_| Err("sending stopped".to_owned()));
-        match (bytes, taken) {
-            (Ok(b), Ok(_)) => Ok(b),
-            // Taken there though not all was sent: what it took goes.
-            (Err(e), Ok(held)) => {
-                let _ = remote.destroy(&held);
-                Err(e)
-            }
-            (Err(e), _) | (_, Err(e)) => Err(e),
-        }
-    });
+    let sent = piped(
+        |out| {
+            sys.zfs_send(
+                &format!("{ds}@{snapshot}"),
+                since.map(|_| base.as_str()),
+                out,
+            )
+            .map_err(|e| e.to_string())
+        },
+        |input| remote.receive(snapshot, since.map(String::as_str), input),
+        remote,
+    );
     let bytes = match sent {
-        Ok(b) => b,
+        Ok(b) => b + resumed_bytes,
         Err(e) => {
-            let _guard = lock.blocking_lock();
-            let _ = sys.zfs_destroy(&format!("{ds}@{snapshot}"), false);
+            // Kept there to go on with: the snapshot it is of stays here.
+            let kept = remote.partial().ok().flatten().is_some_and(|(_, token)| {
+                resumable(sys, ds, prefix, &token).as_deref() == Some(snapshot)
+            });
+            if !kept {
+                let _guard = lock.blocking_lock();
+                let _ = sys.zfs_destroy(&format!("{ds}@{snapshot}"), false);
+            }
             return Err(e);
         }
     };
@@ -152,6 +185,46 @@ pub(crate) fn run(
         bytes,
         whole: since.is_none(),
         held: now,
+    })
+}
+
+/// The backup snapshot of `ds` a resume token sends, if it is one of this
+/// target's (named with `prefix`) and still here to send from.
+fn resumable(sys: &dyn Sys, ds: &str, prefix: &str, token: &str) -> Option<String> {
+    let target = sys.zfs_resume_target(token).ok()?;
+    let (dataset, snapshot) = target.split_once('@')?;
+    (dataset == ds && snapshot.starts_with(prefix)).then(|| snapshot.to_owned())
+}
+
+/// What `send` writes, as `receive` reads it: the bytes sent, once taken.
+/// Taken though not all was sent, what was taken goes.
+fn piped(
+    send: impl FnOnce(&mut dyn Write) -> Result<(), String> + Send,
+    receive: impl FnOnce(&mut dyn Read) -> Result<String, String>,
+    remote: &dyn Remote,
+) -> Result<u64, String> {
+    let (mut from, to) = std::io::pipe().map_err(|e| format!("a pipe: {e}"))?;
+    std::thread::scope(|scope| {
+        let sender = scope.spawn(move || {
+            let mut out = Counted {
+                inner: to,
+                bytes: 0,
+            };
+            send(&mut out).map(|()| out.bytes)
+        });
+        let taken = receive(&mut from);
+        drop(from);
+        let bytes = sender
+            .join()
+            .unwrap_or_else(|_| Err("sending stopped".to_owned()));
+        match (bytes, taken) {
+            (Ok(b), Ok(_)) => Ok(b),
+            (Err(e), Ok(held)) => {
+                let _ = remote.destroy(&held);
+                Err(e)
+            }
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        }
     })
 }
 
@@ -439,8 +512,52 @@ impl Remote for Ssh {
                 snapshot.rsplit('-').next().unwrap_or(snapshot)
             ),
         };
+        self.receive_into(&dataset, input)?;
+        Ok(format!("{dataset}@{snapshot}"))
+    }
+    fn partial(&self) -> Result<Option<(String, String)>, String> {
+        let said = self.ask(&format!(
+            "zfs get -H -o name,value -r -t filesystem receive_resume_token {} 2>/dev/null || true",
+            self.target.dataset
+        ))?;
+        Ok(said.lines().find_map(|l| {
+            let (name, token) = l.trim().split_once('\t')?;
+            (self.ours(name) && token != "-" && !token.is_empty())
+                .then(|| (name.to_owned(), token.to_owned()))
+        }))
+    }
+    fn resume(
+        &self,
+        dataset: &str,
+        snapshot: &str,
+        input: &mut dyn Read,
+    ) -> Result<String, String> {
+        if !self.ours(dataset) {
+            return Err(format!("{dataset} is not one of this Volume's backups"));
+        }
+        self.receive_into(dataset, input)?;
+        Ok(format!("{dataset}@{snapshot}"))
+    }
+    fn abort(&self, dataset: &str) -> Result<(), String> {
+        if !self.ours(dataset) {
+            return Err(format!("{dataset} is not one of this Volume's backups"));
+        }
+        self.ask(&format!("zfs receive -A {dataset}")).map(drop)
+    }
+    fn destroy(&self, held: &str) -> Result<(), String> {
+        self.destroy_held(held)
+    }
+    fn send(&self, held: &str, out: &mut dyn Write) -> Result<(), String> {
+        self.send_held(held, out)
+    }
+}
+
+impl Ssh {
+    /// `zfs receive -s -u` there: cut short, what came is kept to go on
+    /// with.
+    fn receive_into(&self, dataset: &str, input: &mut dyn Read) -> Result<(), String> {
         let mut child = self
-            .command(&format!("zfs receive -u {dataset}"))
+            .command(&format!("zfs receive -s -u {dataset}"))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -460,9 +577,10 @@ impl Remote for Ssh {
             ));
         }
         copied.map_err(|e| format!("sending to {}: {e}", self.target.host))?;
-        Ok(format!("{dataset}@{snapshot}"))
+        Ok(())
     }
-    fn destroy(&self, held: &str) -> Result<(), String> {
+
+    fn destroy_held(&self, held: &str) -> Result<(), String> {
         if !self.ours(held) || !held.contains('@') {
             return Err(format!("{held} is not one of this Volume's backups"));
         }
@@ -475,7 +593,7 @@ impl Remote for Ssh {
         }
         Ok(())
     }
-    fn send(&self, held: &str, out: &mut dyn Write) -> Result<(), String> {
+    fn send_held(&self, held: &str, out: &mut dyn Write) -> Result<(), String> {
         if !self.ours(held) || !held.contains('@') {
             return Err(format!("{held} is not one of this Volume's backups"));
         }
@@ -664,6 +782,145 @@ mod tests {
 
     fn snap(n: u32) -> String {
         format!("legion-bk-offsite-20261122T{n:02}0000Z")
+    }
+
+    /// A ZFS host as the SSH target is: its own pool, which keeps what came
+    /// of a stream cut short (`zfs receive -s`).
+    struct ZfsHost {
+        sys: FakeSys,
+        held: StdMutex<Vec<String>>,
+        datasets: StdMutex<std::collections::BTreeSet<String>>,
+    }
+
+    impl ZfsHost {
+        fn new() -> ZfsHost {
+            let sys = FakeSys::new();
+            sys.zfs_create("tank/b", &[]).unwrap();
+            ZfsHost {
+                sys,
+                held: StdMutex::new(Vec::new()),
+                datasets: StdMutex::new(Default::default()),
+            }
+        }
+
+        fn take(
+            &self,
+            dataset: &str,
+            snapshot: &str,
+            input: &mut dyn Read,
+        ) -> Result<String, String> {
+            self.datasets.lock().unwrap().insert(dataset.to_owned());
+            self.sys
+                .zfs_receive_resumable(dataset, input)
+                .map_err(|e| e.to_string())?;
+            let held = format!("{dataset}@{snapshot}");
+            self.held.lock().unwrap().push(held.clone());
+            Ok(held)
+        }
+    }
+
+    impl Remote for ZfsHost {
+        fn list(&self) -> Result<Vec<String>, String> {
+            let mut v = self.held.lock().unwrap().clone();
+            v.sort_by(|a, b| snapshot_of(a).cmp(snapshot_of(b)));
+            Ok(v)
+        }
+        fn incremental(&self) -> bool {
+            true
+        }
+        fn receive(
+            &self,
+            snapshot: &str,
+            base: Option<&str>,
+            input: &mut dyn Read,
+        ) -> Result<String, String> {
+            let dataset = match base {
+                Some(b) => b.split('@').next().unwrap().to_owned(),
+                None => format!("tank/b/shop.db.{}", snapshot.rsplit('-').next().unwrap()),
+            };
+            self.take(&dataset, snapshot, input)
+        }
+        fn destroy(&self, held: &str) -> Result<(), String> {
+            self.held.lock().unwrap().retain(|h| h != held);
+            self.sys.zfs_destroy(held, false).map_err(|e| e.to_string())
+        }
+        fn send(&self, _: &str, _: &mut dyn Write) -> Result<(), String> {
+            unimplemented!()
+        }
+        fn partial(&self) -> Result<Option<(String, String)>, String> {
+            for d in self.datasets.lock().unwrap().iter() {
+                if let Ok(Some(t)) = self.sys.zfs_resume_token(d) {
+                    return Ok(Some((d.clone(), t)));
+                }
+            }
+            Ok(None)
+        }
+        fn resume(
+            &self,
+            dataset: &str,
+            snapshot: &str,
+            input: &mut dyn Read,
+        ) -> Result<String, String> {
+            self.take(dataset, snapshot, input)
+        }
+        fn abort(&self, dataset: &str) -> Result<(), String> {
+            self.sys
+                .zfs_receive_abort(dataset)
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    /// A backup cut short that the target kept goes on at the next run,
+    /// which then takes its own from it; the snapshot it was of is kept
+    /// here meanwhile. One whose snapshot is gone here is given up.
+    #[test]
+    fn a_backup_cut_short_goes_on_at_the_next_run() {
+        let (sys, lock, host) = (FakeSys::new(), Mutex::new(()), ZfsHost::new());
+        sys.zfs_create(DS, &[]).unwrap();
+        sys.write_dataset(DS, &[1u8; 1000]);
+        run(&sys, &lock, &host, DS, &snap(1), "", 5).unwrap();
+
+        sys.write_dataset(DS, &[2u8; 1000]);
+        sys.fail_next("zfs send");
+        let e = run(&sys, &lock, &host, DS, &snap(2), &snap(1), 5).unwrap_err();
+        assert!(e.contains("Broken pipe") || e.contains("incomplete"), "{e}");
+        assert!(host.partial().unwrap().is_some(), "what came kept there");
+        assert_eq!(
+            sys.zfs_snapshots(DS).unwrap(),
+            [snap(1), snap(2)],
+            "and its snapshot here"
+        );
+
+        // The next run, which knows only the first as its base: the second
+        // goes on, then the third from it.
+        sys.write_dataset(DS, &[3u8; 1000]);
+        let r = run(&sys, &lock, &host, DS, &snap(3), &snap(1), 5).unwrap();
+        assert!(!r.whole, "{r:?}");
+        assert_eq!(
+            r.held.iter().map(|h| snapshot_of(h)).collect::<Vec<_>>(),
+            [snap(1), snap(2), snap(3)]
+        );
+        assert!(host.partial().unwrap().is_none());
+        assert_eq!(sys.zfs_snapshots(DS).unwrap(), [snap(3)]);
+        assert_eq!(
+            host.sys
+                .dataset_contents("tank/b/shop.db.20261122T010000Z")
+                .unwrap(),
+            [3u8; 1000]
+        );
+
+        // Cut short again, its snapshot then gone here (a rollback): given
+        // up, and the run goes on as ever.
+        sys.write_dataset(DS, &[4u8; 1000]);
+        sys.fail_next("zfs send");
+        run(&sys, &lock, &host, DS, &snap(4), &snap(3), 5).unwrap_err();
+        sys.zfs_destroy(&format!("{DS}@{}", snap(4)), false)
+            .unwrap();
+        sys.write_dataset(DS, &[5u8; 1000]);
+        let r = run(&sys, &lock, &host, DS, &snap(5), &snap(3), 5).unwrap();
+        assert!(!r.whole);
+        assert!(host.partial().unwrap().is_none());
+        assert_eq!(snapshot_of(r.held.last().unwrap()), snap(5));
     }
 
     #[test]
