@@ -53,6 +53,12 @@
     'What would stop, or lose data, if one machine were lost: each a single point of failure, with how to put it right.'
   )}
 </p>
+{#if session.namespace}
+  <p class="muted">
+    {t('Namespace {ns} and the cluster.', { ns: session.namespace })}
+    <a href="/availability?ns=*">{t('Every namespace')}</a>
+  </p>
+{/if}
 {#if error}<p class="error" role="alert">{error}</p>{/if}
 
 {#if report}
@@ -118,7 +124,11 @@
       </tbody>
     </table>
   {:else}
-    <p class="empty">{t('No single point of failure found.')}</p>
+    <p class="empty">
+      {session.namespace
+        ? t('No single point of failure found in namespace {ns} or the cluster.', { ns: session.namespace })
+        : t('No single point of failure found.')}
+    </p>
   {/if}
   {#if report.hidden}
     <p class="muted">

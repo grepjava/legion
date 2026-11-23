@@ -373,7 +373,10 @@
           ? tn('1 warning', '{n} warnings', availability.findings.length)
           : t('No single point of failure')}
       tone={availabilityRisks ? 'bad' : availability.findings.length ? 'wait' : 'good'}
-      note={availability.findings[0]?.message ?? t('Losing any one machine stops nothing.')}
+      note={availability.findings[0]?.message ??
+        (session.namespace
+          ? t('In namespace {ns} and the cluster.', { ns: session.namespace })
+          : t('Losing any one machine stops nothing.'))}
       href="/availability"
       more={t('What and how to fix')}
     />
