@@ -6836,3 +6836,205 @@ async fn a_dry_run_is_for_who_may_make_the_change() {
     assert!(!d.blocks(), "{d:#?}");
     m.stop().await;
 }
+
+/// A fresh manager that joins at `via` as a witness: it votes, runs no
+/// tasks and never stands for leader.
+async fn join_witness(via: &str, token: &str, name: &str, admin: ClientTlsConfig) -> Running {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let id = legion_manager::node_id(dir.path()).unwrap();
+    let joined = legion_manager::join(via, token, name, id, &addr)
+        .await
+        .unwrap();
+    let config = ManagerConfig {
+        raft: Running::quick_raft(),
+        tls: Some(joined.tls),
+        heartbeat: HEARTBEAT,
+        registry_loopback: true,
+        name: name.into(),
+        witness: true,
+        ..ManagerConfig::new(dir.path(), &addr)
+    };
+    let m = Running::serve_config(dir, listener, config, Some(admin)).await;
+    until_within(
+        "the witness knows the leader",
+        Duration::from_secs(30),
+        || m.store.raft.metrics().borrow().current_leader.is_some(),
+    )
+    .await;
+    m
+}
+
+async fn availability(c: &mut ClusterClient<Channel>, namespace: &str) -> legion_api::ha::Report {
+    let r = c
+        .availability(legion_proto::v1::AvailabilityRequest {
+            namespace: namespace.into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    serde_json::from_slice(&r.report_json).unwrap()
+}
+
+/// High availability (docs/HA.md): `Cluster.Availability` names the
+/// single points of failure each caller may see, and a witness makes two
+/// managers three: it votes, so the cluster survives losing the leader,
+/// but it never leads, so a full manager takes over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_witness_votes_but_never_leads() {
+    let ca = Ca::generate().unwrap();
+    let first = Running::start_with(Some(&ca)).await;
+    first.cluster().await.init(InitRequest {}).await.unwrap();
+    let admin_objects = first.objects().await;
+    for request in [
+        binding("a", "alice", "view"),
+        apply(Object {
+            namespace: "a".into(),
+            ..service("web", 1)
+        }),
+        apply(Object {
+            namespace: "b".into(),
+            ..service("web", 1)
+        }),
+    ] {
+        eventually(|| {
+            let mut c = admin_objects.clone();
+            let request = request.clone();
+            async move { c.apply(request).await }
+        })
+        .await;
+    }
+    let token = first
+        .cluster()
+        .await
+        .join_token(JoinTokenRequest {
+            role: "manager".into(),
+            rotate: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    let admin = creds(&ca, "admin", Role::Admin);
+    let second = Running::join(&first.addr, &token, "m2", admin.clone()).await;
+
+    // Two managers: losing either leaves no quorum.
+    let reasons = |r: &legion_api::ha::Report| -> Vec<(String, String)> {
+        r.findings
+            .iter()
+            .map(|f| (f.reason.clone(), f.object.clone()))
+            .collect()
+    };
+    let mut c = first.cluster().await;
+    until_within("both managers vote", Duration::from_secs(20), || {
+        first
+            .store
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .count()
+            == 2
+    })
+    .await;
+    let two = availability(&mut c, "").await;
+    assert!(
+        reasons(&two).contains(&("managers".into(), String::new())),
+        "{two:?}"
+    );
+    assert!(
+        reasons(&two).contains(&("one-replica".into(), "Service a/web".into())),
+        "{two:?}"
+    );
+    // A user sees her namespace's, not the cluster's, and is told of the rest.
+    let mut alice = ClusterClient::new(
+        first
+            .channel(Some(&creds(&ca, "alice", Role::User)))
+            .await
+            .unwrap(),
+    );
+    let hers = availability(&mut alice, "").await;
+    assert_eq!(
+        reasons(&hers),
+        [("one-replica".to_owned(), "Service a/web".to_owned())]
+    );
+    assert!(hers.managers.is_empty() && hers.hidden >= 1, "{hers:?}");
+    denied(
+        alice
+            .availability(legion_proto::v1::AvailabilityRequest {
+                namespace: "b".into(),
+            })
+            .await,
+    );
+
+    // A witness joins: three voters, two that may lead.
+    let witness = join_witness(&first.addr, &token, "w", admin).await;
+    let witness_id = witness.store.raft.metrics().borrow().id;
+    let status = witness
+        .cluster()
+        .await
+        .status(StatusRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(status.witness, "{status:?}");
+    // The leader learns it is a witness as it learns its name.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let three = loop {
+        let r = availability(&mut c, "").await;
+        let voters = r.managers.iter().filter(|m| m.voter).count();
+        if voters == 3 && r.managers.iter().any(|m| m.witness && m.name == "w") {
+            break r;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{r:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert!(
+        !reasons(&three)
+            .iter()
+            .any(|(r, _)| r == "managers" || r == "leaders"),
+        "{three:?}"
+    );
+    let members = c
+        .status(StatusRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .members;
+    assert!(
+        members.iter().any(|m| m.id == witness_id && m.witness),
+        "{members:?}"
+    );
+    // It may not start a cluster of its own.
+    let err = witness
+        .cluster()
+        .await
+        .init(InitRequest {})
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+
+    // The leader lost: the other full manager leads, never the witness,
+    // and writes go on through the witness.
+    let second_id = second.store.raft.metrics().borrow().id;
+    first.stop().await;
+    until_within("m2 leads", Duration::from_secs(30), || {
+        second.store.raft.metrics().borrow().current_leader == Some(second_id)
+    })
+    .await;
+    assert_ne!(
+        witness.store.raft.metrics().borrow().current_leader,
+        Some(witness_id)
+    );
+    let through = witness.objects().await;
+    eventually(|| {
+        let mut c = through.clone();
+        async move { c.apply(apply(service("after", 1))).await }
+    })
+    .await;
+    witness.stop().await;
+    second.stop().await;
+}

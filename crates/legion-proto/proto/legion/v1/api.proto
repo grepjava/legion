@@ -188,6 +188,13 @@ service Cluster {
   // state each last reported, which says which holds it. For any caller
   // who may read the namespace's services; answered by the leader.
   rpc LoadBalancers(LoadBalancersRequest) returns (LoadBalancersResponse);
+  // The cluster's single points of failure (legion_api::ha): too few
+  // managers, one node running every task, services with one replica or
+  // all on one node, Volumes whose data is on one node. Any manager
+  // answers from its replica, caught up with the leader. A caller gets the
+  // findings of `namespace` (every namespace when empty) they may read,
+  // the cluster's own if they may read nodes.
+  rpc Availability(AvailabilityRequest) returns (AvailabilityResponse);
   // LoadBalancers, then again each time they change: a node's heartbeat
   // reporting another CARP state, a Service changed. Ended once this
   // manager no longer leads.
@@ -757,6 +764,15 @@ message RotateCaRequest {
 
 message WatchCaRequest {}
 
+message AvailabilityRequest {
+  string namespace = 1;
+}
+
+message AvailabilityResponse {
+  // A legion_api::ha::Report as JSON.
+  bytes report_json = 1;
+}
+
 message ChangeRoleRequest {
   string node = 1;
   // "manager" or "worker".
@@ -1151,10 +1167,15 @@ message StatusResponse {
   // The digest of the CA this manager's certificate is of; empty from
   // builds before CA rotation.
   string ca_issuer = 10;
+  // A witness (`legion join --witness`): it votes, runs no tasks and never
+  // leads.
+  bool witness = 11;
 }
 
 message Member {
   uint64 id = 1;
   string addr = 2;
   bool voter = 3;
+  // A witness, as it said when the leader learned its name.
+  bool witness = 4;
 }

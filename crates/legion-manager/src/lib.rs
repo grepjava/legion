@@ -113,6 +113,10 @@ pub struct ManagerConfig {
     pub audit: audit::Retention,
     /// Serve the web console (`--console-listen`): none by default.
     pub console: Option<gateway::Console>,
+    /// A witness (`legion join --witness`, docs/HA.md): it votes, so a
+    /// quorum may count it, but never stands for leader, so the work a
+    /// leader does stays with the full managers.
+    pub witness: bool,
 }
 
 impl ManagerConfig {
@@ -135,6 +139,7 @@ impl ManagerConfig {
             protocol: legion_api::protocol::Protocol::current(),
             audit: audit::Retention::default(),
             console: None,
+            witness: false,
         }
     }
 }
@@ -191,6 +196,7 @@ pub struct Manager {
     acme_loopback: bool,
     registry_loopback: bool,
     insecure_registries: Vec<String>,
+    witness: bool,
     protocol: legion_api::protocol::Protocol,
     /// The protocol among managers, and what each was last heard to speak.
     speaking: upgrade::Speaking,
@@ -245,6 +251,11 @@ impl Manager {
         let network = GrpcNetwork::new(credentials.clone(), speaking.clone(), heard.clone());
         let key = config.store_key.as_ref();
         let store = Store::open_with(id, &config.data_dir, key, config.raft, network).await?;
+        if config.witness {
+            // It votes, and answers, but never stands: a full manager
+            // leads whenever a quorum is up.
+            store.raft.runtime_config().elect(false);
+        }
         tracing::info!(
             node_id = id,
             advertise = %config.advertise,
@@ -265,6 +276,7 @@ impl Manager {
             acme_loopback: config.acme_loopback,
             registry_loopback: config.registry_loopback,
             insecure_registries: config.insecure_registries,
+            witness: config.witness,
             console: config.console,
             protocol: config.protocol,
             speaking,
@@ -430,6 +442,7 @@ impl Manager {
             builds: Default::default(),
             registry_loopback: self.registry_loopback,
             insecure_registries: self.insecure_registries.clone().into(),
+            witness: self.witness,
         };
         let names = tokio::spawn(managers::run(api.clone(), api.closing.clone()));
         let keeping = tokio::spawn(history::run(api.clone()));

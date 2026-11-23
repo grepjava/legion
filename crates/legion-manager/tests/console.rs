@@ -1146,6 +1146,20 @@ async fn the_console_runs_the_cluster_for_an_admin() {
     let admin = |method, path: &str, body| as_user(&root, &root_token, method, path, body);
 
     // The CA, and who holds a certificate of it.
+    // The single points of failure (`legion ha`): one manager, here.
+    let ha = admin("GET", "/api/availability", None).await;
+    assert_eq!(ha.status, 200, "{}", ha.text);
+    assert!(
+        ha.body["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["reason"] == "managers" && f["severity"] == "risk"),
+        "{}",
+        ha.text
+    );
+    assert_eq!(ha.body["managers"][0]["voter"], true, "{}", ha.text);
+
     let ca = admin("GET", "/api/ca", None).await;
     assert_eq!(ca.status, 200, "{}", ca.text);
     assert!(

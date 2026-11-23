@@ -30,6 +30,9 @@ fn key() -> ObjectKey {
 pub(crate) struct Member {
     pub id: NodeId,
     pub addr: String,
+    /// A witness: it votes, runs no tasks and never leads.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub witness: bool,
 }
 
 /// The managers by name, and the record's version.
@@ -80,6 +83,16 @@ async fn write(
         Outcome::Written(_) | Outcome::Conflict { .. } => Ok(()),
         other => Err(Status::internal(format!("unexpected outcome {other:?}"))),
     }
+}
+
+/// The members that said they are witnesses, by id.
+pub(crate) fn witnesses(store: &Store) -> Result<std::collections::HashSet<NodeId>, Status> {
+    let (known, _) = read(store)?;
+    Ok(known
+        .into_values()
+        .filter(|m| m.witness)
+        .map(|m| m.id)
+        .collect())
 }
 
 /// Each known member's name, by its id.
@@ -135,8 +148,8 @@ async fn pass(api: &ApiService) -> Result<(), Status> {
     };
     let mut named = Vec::new();
     for (id, addr) in members {
-        let name = if id == api.id {
-            api.name.clone()
+        let (name, witness) = if id == api.id {
+            (api.name.clone(), api.witness)
         } else {
             let mut c = legion_proto::v1::cluster_client::ClusterClient::new(
                 crate::raft_net::connect_lazy(&addr, api.peer_tls.as_ref()),
@@ -145,11 +158,14 @@ async fn pass(api: &ApiService) -> Result<(), Status> {
             match tokio::time::timeout(Duration::from_secs(5), asked).await {
                 // Only a member that says it is that id: an address
                 // reused by another manager names nothing.
-                Ok(Ok(r)) if r.get_ref().node_id == id => r.into_inner().name,
+                Ok(Ok(r)) if r.get_ref().node_id == id => {
+                    let r = r.into_inner();
+                    (r.name, r.witness)
+                }
                 _ => continue,
             }
         };
-        named.push((name, Member { id, addr }));
+        named.push((name, Member { id, addr, witness }));
     }
     if let Some(next) = learned(&known, &named) {
         write(api, &next, version).await?;
@@ -166,6 +182,7 @@ mod tests {
         let m = |id, addr: &str| Member {
             id,
             addr: addr.into(),
+            witness: false,
         };
         let known = BTreeMap::from([("m1".to_owned(), m(1, "a:1"))]);
         assert_eq!(learned(&known, &[]), None);

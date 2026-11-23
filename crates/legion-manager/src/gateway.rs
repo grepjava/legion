@@ -205,6 +205,7 @@ fn router(gateway: Gateway) -> axum::Router {
         .route("/api/reach", get(reach))
         .route("/api/connections", get(connections))
         .route("/api/load-balancers", get(load_balancers))
+        .route("/api/availability", get(availability))
         .route("/api/logs/{namespace}/{task}", get(logs))
         .route("/api/build-logs/{namespace}/{name}", get(build_logs))
         // Writes (CONSOLE.md phases 2 and 3): each from the console's own
@@ -781,7 +782,11 @@ fn status_json(s: &pb::StatusResponse) -> serde_json::Value {
     let members: Vec<_> = s
         .members
         .iter()
-        .map(|m| serde_json::json!({ "id": m.id.to_string(), "addr": m.addr, "voter": m.voter }))
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id.to_string(), "addr": m.addr, "voter": m.voter, "witness": m.witness,
+            })
+        })
         .collect();
     serde_json::json!({
         "node": s.node_id.to_string(),
@@ -792,6 +797,7 @@ fn status_json(s: &pb::StatusResponse) -> serde_json::Value {
         "version": s.applied_version,
         "protocol": s.protocol,
         "members": members,
+        "witness": s.witness,
     })
 }
 
@@ -1870,6 +1876,25 @@ async fn load_balancers(
         .await?
         .into_inner();
     Ok(Json(balancers_json(&r)).into_response())
+}
+
+/// `legion ha`: the cluster's single points of failure as the user may see
+/// them, a legion_api::ha::Report.
+async fn availability(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Query(scope): Query<Scope>,
+) -> Result<Response, Refused> {
+    let (_, channel) = g.user(&headers).await?;
+    let r = ClusterClient::new(channel)
+        .availability(pb::AvailabilityRequest {
+            namespace: scope.namespace.unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+    let report: serde_json::Value = serde_json::from_slice(&r.report_json)
+        .map_err(|e| Refused(StatusCode::BAD_GATEWAY, e.to_string()))?;
+    Ok(Json(report).into_response())
 }
 
 /// Load balancers as the console reads them.

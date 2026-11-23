@@ -78,6 +78,8 @@ pub struct ApiService {
     pub(crate) builds: std::sync::Arc<crate::build::Logs>,
     pub(crate) registry_loopback: bool,
     pub(crate) insecure_registries: std::sync::Arc<[String]>,
+    /// A witness: it votes, runs no tasks and never leads (docs/HA.md).
+    pub(crate) witness: bool,
 }
 
 pub(crate) enum Route {
@@ -98,6 +100,67 @@ pub(crate) fn check_namespace(namespace: &str) -> Result<(), Status> {
 }
 
 impl ApiService {
+    /// The cluster's single points of failure as `caller` may see them: of
+    /// `namespace` (every namespace when empty) where they may read its
+    /// services, the cluster's own (managers, nodes) where they may read
+    /// nodes.
+    pub(crate) fn availability_seen(
+        &self,
+        caller: &Caller,
+        namespace: &str,
+    ) -> Result<legion_api::ha::Report, Status> {
+        let list = |kind| -> Result<Vec<Object>, Status> {
+            Ok(self.store.list(kind, None).map_err(internal)?.objects)
+        };
+        let nodes = list(Kind::Node)?;
+        let managers = {
+            let m = self.store.raft.metrics().borrow().clone();
+            let membership = m.membership_config.membership();
+            let names = crate::managers::names(&self.store)?;
+            let witnesses = crate::managers::witnesses(&self.store)?;
+            membership
+                .nodes()
+                .map(|(id, _)| legion_api::ha::Manager {
+                    name: if *id == self.id {
+                        self.name.clone()
+                    } else {
+                        names.get(id).cloned().unwrap_or_else(|| format!("#{id}"))
+                    },
+                    voter: membership.voter_ids().any(|v| v == *id),
+                    witness: witnesses.contains(id) || (*id == self.id && self.witness),
+                })
+                .collect::<Vec<_>>()
+        };
+        let found = legion_api::ha::check(&legion_api::ha::Cluster {
+            managers: &managers,
+            nodes: &nodes,
+            services: &list(Kind::Service)?,
+            tasks: &list(Kind::Task)?,
+            volumes: &list(Kind::Volume)?,
+        });
+        let see_nodes = caller.may(&self.store, Verb::Read, Kind::Node, "");
+        let mut report = legion_api::ha::Report::default();
+        for f in found {
+            let visible = if f.namespace.is_empty() {
+                see_nodes
+            } else {
+                (namespace.is_empty() || f.namespace == namespace)
+                    && caller.may(&self.store, Verb::Read, Kind::Service, &f.namespace)
+            };
+            if visible {
+                report.findings.push(f);
+            } else if !f.namespace.is_empty() && (namespace.is_empty() || f.namespace == namespace)
+            {
+                report.hidden += 1;
+            }
+        }
+        if see_nodes {
+            report.nodes = legion_api::ha::task_nodes(&nodes).len() as u32;
+            report.managers = managers;
+        }
+        Ok(report)
+    }
+
     /// The samples kept of what tasks and nodes used over `range_ms` (the
     /// last hour when 0), as the leader keeps them: what `caller` may read
     /// of `namespace` (every namespace when empty), `task` alone when set.
@@ -1427,6 +1490,11 @@ impl Cluster for ApiService {
         let audit = self.audit_point(&req, "init", Default::default());
         let result = async {
             self.caller(&req)?.require_all("initialise the cluster")?;
+            if self.witness {
+                return Err(Status::failed_precondition(
+                    "a witness never leads: initialise the cluster on a full manager, then join this one with --witness",
+                ));
+            }
             let raft = &self.store.raft;
             if raft.is_initialized().await.map_err(internal)? {
                 return Err(Status::already_exists(
@@ -1679,6 +1747,24 @@ impl Cluster for ApiService {
         req: Request<pb::ConnectionsRequest>,
     ) -> Result<Response<pb::ConnectionsResponse>, Status> {
         crate::connections::connections(self, req).await
+    }
+
+    async fn availability(
+        &self,
+        req: Request<pb::AvailabilityRequest>,
+    ) -> Result<Response<pb::AvailabilityResponse>, Status> {
+        let caller = self.caller(&req)?;
+        let namespace = req.into_inner().namespace;
+        check_namespace(&namespace)?;
+        if !namespace.is_empty() {
+            caller.check(&self.store, Verb::Read, Kind::Service, &namespace)?;
+        }
+        // Any manager, once caught up with the leader.
+        self.consistent().await?;
+        let report = self.availability_seen(&caller, &namespace)?;
+        Ok(Response::new(pb::AvailabilityResponse {
+            report_json: serde_json::to_vec(&report).expect("serialises"),
+        }))
     }
 
     async fn load_balancers(
@@ -2911,12 +2997,14 @@ impl ApiService {
     fn status(&self) -> Result<StatusResponse, Status> {
         let m = self.store.raft.metrics().borrow().clone();
         let membership = m.membership_config.membership();
+        let witnesses = crate::managers::witnesses(&self.store).unwrap_or_default();
         let members = membership
             .nodes()
             .map(|(id, node)| pb::Member {
                 id: *id,
                 addr: node.addr.clone(),
                 voter: membership.voter_ids().any(|v| v == *id),
+                witness: witnesses.contains(id) || (*id == self.id && self.witness),
             })
             .collect();
         Ok(StatusResponse {
@@ -2930,6 +3018,7 @@ impl ApiService {
             protocol_floor: crate::upgrade::read(&self.store),
             name: self.name.clone(),
             ca_issuer: crate::ca::own_issuer(self),
+            witness: self.witness,
         })
     }
 }

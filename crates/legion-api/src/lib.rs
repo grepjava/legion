@@ -26,6 +26,7 @@ pub mod data;
 pub mod dispatch;
 pub mod dryrun;
 pub mod event;
+pub mod ha;
 pub mod image;
 pub mod job;
 pub mod login;
