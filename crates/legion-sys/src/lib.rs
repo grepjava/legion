@@ -259,7 +259,9 @@ pub trait Sys: Send + Sync {
     }
     /// Writes a `zfs send` stream of `snapshot` (`<dataset>@<name>`) to
     /// `out`: everything, or only what changed since the dataset's snapshot
-    /// `since` (the name after the `@`).
+    /// `since` (the name after the `@`). Blocks go as the pool stores them
+    /// (`-L -c -e`): compressed, so a stream is the size the data takes on
+    /// disk rather than all it would take uncompressed.
     fn zfs_send(
         &self,
         snapshot: &str,
@@ -271,6 +273,47 @@ pub trait Sys: Send + Sync {
     /// incremental stream rolls the dataset back to the stream's starting
     /// snapshot first; a full one replaces it only if it has no snapshots.
     fn zfs_receive(&self, dataset: &str, input: &mut dyn std::io::Read) -> Result<()>;
+    /// [`Sys::zfs_receive`], keeping what came of a stream cut short
+    /// (`zfs receive -s`): `dataset` then holds a resume token
+    /// ([`Sys::zfs_resume_token`]) from which the sender goes on
+    /// ([`Sys::zfs_send_resume`]); until then, or until it is given up
+    /// ([`Sys::zfs_receive_abort`]), no other stream goes into it.
+    fn zfs_receive_resumable(&self, dataset: &str, input: &mut dyn std::io::Read) -> Result<()> {
+        let _ = (dataset, input);
+        Err(Error::Failed {
+            command: "zfs receive -s".to_owned(),
+            message: "not supported here".to_owned(),
+        })
+    }
+    /// The resume token of a stream `dataset` took part of, if it did.
+    fn zfs_resume_token(&self, dataset: &str) -> Result<Option<String>> {
+        let _ = dataset;
+        Ok(None)
+    }
+    /// Gives up what `dataset` took of a stream cut short (`zfs receive
+    /// -A`).
+    fn zfs_receive_abort(&self, dataset: &str) -> Result<()> {
+        let _ = dataset;
+        Ok(())
+    }
+    /// The snapshot (`<dataset>@<name>`) a resume token sends, on the
+    /// sending node: an error if it is not there.
+    fn zfs_resume_target(&self, token: &str) -> Result<String> {
+        let _ = token;
+        Err(Error::Failed {
+            command: "zfs send -nv -t".to_owned(),
+            message: "not supported here".to_owned(),
+        })
+    }
+    /// Writes the rest of a stream cut short, from its resume token (`zfs
+    /// send -t`).
+    fn zfs_send_resume(&self, token: &str, out: &mut dyn std::io::Write) -> Result<()> {
+        let _ = (token, out);
+        Err(Error::Failed {
+            command: "zfs send -t".to_owned(),
+            message: "not supported here".to_owned(),
+        })
+    }
     /// Mounts a dataset at its mountpoint unless it is mounted.
     fn zfs_mount(&self, dataset: &str) -> Result<()>;
 

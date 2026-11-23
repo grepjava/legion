@@ -392,6 +392,15 @@ struct JlsJail {
 const DETACH_CHECKS: u32 = 100;
 const DETACH_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// The snapshot `zfs send -nv -t TOKEN` says the token sends: its
+/// `toname = <dataset>@<name>` line.
+fn resume_target(out: &str) -> Option<String> {
+    out.lines()
+        .find_map(|l| l.trim().strip_prefix("toname = "))
+        .map(|t| t.trim().to_owned())
+        .filter(|t| t.contains('@'))
+}
+
 impl<R: Runner> Sys for Shell<R> {
     fn kld_load(&self, module: &str) -> Result<()> {
         self.run("kldload", &args(["-n", module])).map(drop)
@@ -1156,7 +1165,7 @@ impl<R: Runner> Sys for Shell<R> {
         since: Option<&str>,
         out: &mut dyn std::io::Write,
     ) -> Result<()> {
-        let mut a = args(["send"]);
+        let mut a = args(["send", "-L", "-c", "-e"]);
         if let Some(since) = since {
             a.extend(["-i".to_owned(), format!("@{since}")]);
         }
@@ -1175,6 +1184,53 @@ impl<R: Runner> Sys for Shell<R> {
             |child| {
                 let mut to = child.stdin.take().expect("piped stdin");
                 std::io::copy(input, &mut to).map(drop)
+            },
+        )
+    }
+
+    fn zfs_receive_resumable(&self, dataset: &str, input: &mut dyn std::io::Read) -> Result<()> {
+        stream(
+            "zfs",
+            &args(["receive", "-s", "-F", "-u", dataset]),
+            Streamed::Input,
+            |child| {
+                let mut to = child.stdin.take().expect("piped stdin");
+                std::io::copy(input, &mut to).map(drop)
+            },
+        )
+    }
+
+    fn zfs_resume_token(&self, dataset: &str) -> Result<Option<String>> {
+        let out = self.run(
+            "zfs",
+            &args(["get", "-H", "-o", "value", "receive_resume_token", dataset]),
+        )?;
+        let token = out.trim();
+        Ok((!token.is_empty() && token != "-").then(|| token.to_owned()))
+    }
+
+    fn zfs_receive_abort(&self, dataset: &str) -> Result<()> {
+        self.run("zfs", &args(["receive", "-A", dataset])).map(drop)
+    }
+
+    fn zfs_resume_target(&self, token: &str) -> Result<String> {
+        // `resume token contents:` then the token's fields, `toname = ...`
+        // among them, then the estimate.
+        let out = self.run("zfs", &args(["send", "-nv", "-t", token]))?;
+        resume_target(&out).ok_or_else(|| Error::Failed {
+            command: "zfs send -nv -t".to_owned(),
+            message: "the resume token names no snapshot".to_owned(),
+        })
+    }
+
+    fn zfs_send_resume(&self, token: &str, out: &mut dyn std::io::Write) -> Result<()> {
+        stream(
+            "zfs",
+            &args(["send", "-t", token]),
+            Streamed::Output,
+            |child| {
+                let mut from = child.stdout.take().expect("piped stdout");
+                std::io::copy(&mut from, out).map(drop)
             },
         )
     }

@@ -84,6 +84,8 @@ struct State {
     next_snapshot: u64,
     /// What tests wrote into datasets, and what their snapshots hold.
     contents: BTreeMap<String, Vec<u8>>,
+    /// What a resumable receive took of a stream cut short, by dataset.
+    partial: BTreeMap<String, Partial>,
     /// Clones, with the snapshot each was made from.
     origins: BTreeMap<String, String>,
     /// tmpfs mount points, with their size.
@@ -175,6 +177,76 @@ impl FakeSys {
             crate::check::NO_BRAND.into(),
         );
         sys
+    }
+
+    /// Takes a whole stream of snapshot `name` (made from `since`, or `-`)
+    /// into `dataset`, as `zfs receive -F -u` does.
+    fn received(&self, dataset: &str, name: &str, since: &str, data: Vec<u8>) -> Result<()> {
+        let mut s = self.state();
+        if s.free.is_some_and(|free| data.len() as u64 > free) {
+            let kind = if since == "-" {
+                "new filesystem"
+            } else {
+                "incremental"
+            };
+            return Err(fail(
+                "zfs receive",
+                format!("cannot receive {kind} stream: out of space"),
+            ));
+        }
+        let parent = dataset.rsplit_once('/').map(|(p, _)| p);
+        if let Some(parent) = parent
+            && !s.datasets.contains_key(parent)
+        {
+            return Err(fail(
+                "zfs receive",
+                format!("cannot receive new filesystem stream: parent '{parent}' does not exist"),
+            ));
+        }
+        let snap = format!("{dataset}@");
+        if since == "-" {
+            if let Some(old) = s.snapshots.keys().find(|d| d.starts_with(&snap)) {
+                return Err(fail(
+                    "zfs receive",
+                    format!(
+                        "cannot receive new filesystem stream: destination has snapshots (eg. {old})
+must destroy them to overwrite it"
+                    ),
+                ));
+            }
+            s.datasets.insert(
+                dataset.to_owned(),
+                Dataset {
+                    name: dataset.to_owned(),
+                    mountpoint: None,
+                    quota: None,
+                },
+            );
+        } else if s
+            .snapshots
+            .iter()
+            .filter(|(d, _)| d.starts_with(&snap))
+            .max_by_key(|(_, n)| **n)
+            .is_none_or(|(d, _)| *d != format!("{dataset}@{since}"))
+        {
+            // As `zfs receive -F` does: an incremental stream goes onto
+            // the snapshot it was made from, which must be the newest.
+            return Err(fail(
+                "zfs receive",
+                format!(
+                    "cannot receive incremental stream: most recent snapshot of {dataset} does not match incremental source"
+                ),
+            ));
+        }
+        s.take_snapshot(&format!("{dataset}@{name}"));
+        s.contents.insert(format!("{dataset}@{name}"), data.clone());
+        s.contents.insert(dataset.to_owned(), data);
+        let hook = s.after_receive.take();
+        drop(s);
+        if let Some(Hook(f)) = hook {
+            f();
+        }
+        Ok(())
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -1578,11 +1650,12 @@ impl Sys for FakeSys {
         s.contents
             .retain(|d, _| d != name && !d.starts_with(&snap) && !d.starts_with(&child));
         s.origins.retain(|d, _| d != name && !d.starts_with(&child));
+        s.partial.retain(|d, _| d != name && !d.starts_with(&child));
         Ok(())
     }
 
-    /// The stream is `fakezfs <snapshot name> <since or ->` on one line,
-    /// then what the snapshot holds.
+    /// The stream is `fakezfs <snapshot name> <since or -> <length>
+    /// <dataset>` on one line, then what the snapshot holds.
     fn zfs_send(
         &self,
         snapshot: &str,
@@ -1612,9 +1685,14 @@ impl Sys for FakeSys {
                     "cannot open '{ds}@{since}': dataset does not exist"
                 )));
             }
+            let data = s.contents.get(snapshot).cloned().unwrap_or_default();
             (
-                format!("fakezfs {name} {}\n", since.unwrap_or("-")),
-                s.contents.get(snapshot).cloned().unwrap_or_default(),
+                format!(
+                    "fakezfs {name} {} {} {ds}\n",
+                    since.unwrap_or("-"),
+                    data.len()
+                ),
+                data,
                 cut,
             )
         };
@@ -1637,80 +1715,164 @@ impl Sys for FakeSys {
         if self.state().failing.remove("zfs receive") {
             return Err(fail("zfs receive", "I/O error".to_owned()));
         }
-        let bad = || fail("zfs receive", "invalid backup stream".to_owned());
-        let end = stream.iter().position(|b| *b == b'\n').ok_or_else(bad)?;
-        let header = String::from_utf8_lossy(&stream[..end]).into_owned();
-        let data = stream[end + 1..].to_vec();
-        let mut parts = header.split(' ');
-        let (Some("fakezfs"), Some(name), Some(since)) = (parts.next(), parts.next(), parts.next())
-        else {
-            return Err(bad());
-        };
-        let mut s = self.state();
-        if s.free.is_some_and(|free| data.len() as u64 > free) {
-            let kind = if since == "-" {
-                "new filesystem"
-            } else {
-                "incremental"
-            };
+        let got = Stream::parse(&stream)?;
+        if got.offset.is_some() {
             return Err(fail(
                 "zfs receive",
-                format!("cannot receive {kind} stream: out of space"),
+                "a resuming stream needs zfs receive -s".to_owned(),
             ));
         }
-        let parent = dataset.rsplit_once('/').map(|(p, _)| p);
-        if let Some(parent) = parent
-            && !s.datasets.contains_key(parent)
+        if self.state().partial.contains_key(dataset) {
+            return Err(partially(dataset));
+        }
+        if got.cut() {
+            return Err(incomplete());
+        }
+        self.received(dataset, &got.name, &got.since, got.data)
+    }
+
+    fn zfs_receive_resumable(&self, dataset: &str, input: &mut dyn std::io::Read) -> Result<()> {
+        let mut stream = Vec::new();
+        input
+            .read_to_end(&mut stream)
+            .map_err(|e| fail("zfs receive", e.to_string()))?;
+        if self.state().failing.remove("zfs receive") {
+            return Err(fail("zfs receive", "I/O error".to_owned()));
+        }
+        let mut got = Stream::parse(&stream)?;
         {
-            return Err(fail(
-                "zfs receive",
-                format!("cannot receive new filesystem stream: parent '{parent}' does not exist"),
-            ));
-        }
-        let snap = format!("{dataset}@");
-        if since == "-" {
-            if let Some(old) = s.snapshots.keys().find(|d| d.starts_with(&snap)) {
-                return Err(fail(
-                    "zfs receive",
-                    format!(
-                        "cannot receive new filesystem stream: destination has snapshots (eg. {old})
-must destroy them to overwrite it"
-                    ),
-                ));
+            let mut s = self.state();
+            match (got.offset, s.partial.get(dataset)) {
+                (None, Some(_)) => return Err(partially(dataset)),
+                (None, None) => {}
+                (Some(at), Some(p))
+                    if p.name == got.name && p.since == got.since && p.data.len() as u64 == at =>
+                {
+                    let mut data = p.data.clone();
+                    data.extend_from_slice(&got.data);
+                    got.data = data;
+                }
+                (Some(_), _) => {
+                    return Err(fail(
+                        "zfs receive",
+                        "resume stream does not match the partially received one".to_owned(),
+                    ));
+                }
             }
-            s.datasets.insert(
-                dataset.to_owned(),
-                Dataset {
-                    name: dataset.to_owned(),
-                    mountpoint: None,
-                    quota: None,
-                },
-            );
-        } else if s
-            .snapshots
-            .iter()
-            .filter(|(d, _)| d.starts_with(&snap))
-            .max_by_key(|(_, n)| **n)
-            .is_none_or(|(d, _)| *d != format!("{dataset}@{since}"))
-        {
-            // As `zfs receive -F` does: an incremental stream goes onto
-            // the snapshot it was made from, which must be the newest.
+            if got.cut() {
+                if got.since == "-" && !s.datasets.contains_key(dataset) {
+                    s.datasets.insert(
+                        dataset.to_owned(),
+                        Dataset {
+                            name: dataset.to_owned(),
+                            mountpoint: None,
+                            quota: None,
+                        },
+                    );
+                }
+                s.partial.insert(
+                    dataset.to_owned(),
+                    Partial {
+                        name: got.name.clone(),
+                        since: got.since.clone(),
+                        source: got.source.clone(),
+                        len: got.len,
+                        data: got.data,
+                    },
+                );
+                return Err(incomplete());
+            }
+            s.partial.remove(dataset);
+        }
+        if got.since == "-" {
+            // The new file system the partial one made: replaced whole.
+            let mut s = self.state();
+            if !s
+                .snapshots
+                .keys()
+                .any(|d| d.starts_with(&format!("{dataset}@")))
+            {
+                s.datasets.remove(dataset);
+            }
+        }
+        self.received(dataset, &got.name, &got.since, got.data)
+    }
+
+    fn zfs_resume_token(&self, dataset: &str) -> Result<Option<String>> {
+        let s = self.state();
+        if !s.datasets.contains_key(dataset) {
             return Err(fail(
+                "zfs get",
+                format!("cannot open '{dataset}': dataset does not exist"),
+            ));
+        }
+        Ok(s.partial.get(dataset).map(|p| {
+            format!(
+                "fakeresume {}@{} {} {} {}",
+                p.source,
+                p.name,
+                p.since,
+                p.len,
+                p.data.len()
+            )
+        }))
+    }
+
+    fn zfs_receive_abort(&self, dataset: &str) -> Result<()> {
+        let mut s = self.state();
+        match s.partial.remove(dataset) {
+            Some(p) => {
+                if p.since == "-" {
+                    s.datasets.remove(dataset);
+                }
+                Ok(())
+            }
+            None => Err(fail(
                 "zfs receive",
+                format!("'{dataset}' does not have any resumable receive state to abort"),
+            )),
+        }
+    }
+
+    fn zfs_resume_target(&self, token: &str) -> Result<String> {
+        let (snapshot, ..) = resume_token(token)?;
+        if !self.state().snapshots.contains_key(&snapshot) {
+            return Err(fail(
+                "zfs send",
                 format!(
-                    "cannot receive incremental stream: most recent snapshot of {dataset} does not match incremental source"
+                    "cannot resume send: '{snapshot}' used in the initial send no longer exists"
                 ),
             ));
         }
-        s.take_snapshot(&format!("{dataset}@{name}"));
-        s.contents.insert(format!("{dataset}@{name}"), data.clone());
-        s.contents.insert(dataset.to_owned(), data);
-        let hook = s.after_receive.take();
-        drop(s);
-        if let Some(Hook(f)) = hook {
-            f();
+        Ok(snapshot)
+    }
+
+    fn zfs_send_resume(&self, token: &str, out: &mut dyn std::io::Write) -> Result<()> {
+        let (snapshot, since, len, at) = resume_token(token)?;
+        let (ds, name) = snapshot.split_once('@').expect("checked");
+        let data = {
+            let s = self.state();
+            let Some(data) = s
+                .contents
+                .get(&snapshot)
+                .cloned()
+                .or_else(|| s.snapshots.contains_key(&snapshot).then(Vec::new))
+            else {
+                return Err(fail(
+                    "zfs send",
+                    format!(
+                        "cannot resume send: '{snapshot}' used in the initial send no longer exists"
+                    ),
+                ));
+            };
+            data
+        };
+        if data.len() as u64 != len || at > len {
+            return Err(fail("zfs send", "resume token is corrupt".to_owned()));
         }
-        Ok(())
+        out.write_all(format!("fakezfs {name} {since} {len} {ds} {at}\n").as_bytes())
+            .and_then(|()| out.write_all(&data[at as usize..]))
+            .map_err(|e| fail("zfs send", e.to_string()))
     }
 
     fn zfs_mount(&self, dataset: &str) -> Result<()> {
@@ -1997,6 +2159,107 @@ fn apply_prop(ds: &mut Dataset, prop: &str, value: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// What a resumable receive took of a stream cut short.
+#[derive(Debug)]
+struct Partial {
+    name: String,
+    since: String,
+    /// The dataset it came from, for its token.
+    source: String,
+    /// How long the whole stream is.
+    len: u64,
+    data: Vec<u8>,
+}
+
+/// A fake `zfs send` stream: `fakezfs <name> <since> [<length> <dataset>
+/// [<offset>]]`, then the data (from `offset`, for one resumed).
+struct Stream {
+    name: String,
+    since: String,
+    len: u64,
+    source: String,
+    offset: Option<u64>,
+    data: Vec<u8>,
+}
+
+impl Stream {
+    fn parse(stream: &[u8]) -> Result<Stream> {
+        let bad = || fail("zfs receive", "invalid backup stream".to_owned());
+        let end = stream.iter().position(|b| *b == b'\n').ok_or_else(bad)?;
+        let header = String::from_utf8_lossy(&stream[..end]).into_owned();
+        let data = stream[end + 1..].to_vec();
+        let mut parts = header.split(' ');
+        let (Some("fakezfs"), Some(name), Some(since)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(bad());
+        };
+        let len = match parts.next() {
+            Some(l) => l.parse().map_err(|_| bad())?,
+            None => data.len() as u64,
+        };
+        let source = parts.next().unwrap_or_default().to_owned();
+        let offset = parts
+            .next()
+            .map(str::parse)
+            .transpose()
+            .map_err(|_| bad())?;
+        Ok(Stream {
+            name: name.to_owned(),
+            since: since.to_owned(),
+            len,
+            source,
+            offset,
+            data,
+        })
+    }
+
+    /// Whether less came than the stream holds.
+    fn cut(&self) -> bool {
+        (self.data.len() as u64) < self.len
+    }
+}
+
+/// A fake resume token: `fakeresume <snapshot> <since> <length> <offset>`.
+fn resume_token(token: &str) -> Result<(String, String, u64, u64)> {
+    let corrupt = || {
+        fail(
+            "zfs send",
+            "cannot resume send: resume token is corrupt (invalid format)".to_owned(),
+        )
+    };
+    let mut p = token.split(' ');
+    let (Some("fakeresume"), Some(snapshot), Some(since), Some(len), Some(at)) =
+        (p.next(), p.next(), p.next(), p.next(), p.next())
+    else {
+        return Err(corrupt());
+    };
+    if !snapshot.contains('@') {
+        return Err(corrupt());
+    }
+    Ok((
+        snapshot.to_owned(),
+        since.to_owned(),
+        len.parse().map_err(|_| corrupt())?,
+        at.parse().map_err(|_| corrupt())?,
+    ))
+}
+
+fn incomplete() -> Error {
+    fail(
+        "zfs receive",
+        "cannot receive stream: checksum mismatch or incomplete stream. Partially received snapshot is saved.".to_owned(),
+    )
+}
+
+fn partially(dataset: &str) -> Error {
+    fail(
+        "zfs receive",
+        format!(
+            "cannot receive stream: destination {dataset} contains partially-complete state from \"zfs receive -s\"."
+        ),
+    )
 }
 
 #[cfg(test)]
