@@ -7250,3 +7250,112 @@ async fn leadership_is_handed_on_with_nothing_down() {
     second.stop().await;
     first.stop().await;
 }
+
+/// A manager stops however its connections behave: a stream it passes on
+/// from the leader ends with it, and a connection gone quiet (as one
+/// half-open through a NAT does) is closed once the shutdown's grace is
+/// up, instead of holding it forever (seen 2026-11-23 on a witness across
+/// the internet).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_manager_stops_with_streams_and_quiet_connections_open() {
+    let ca = Ca::generate().unwrap();
+    let first = Running::start_with(Some(&ca)).await;
+    first.cluster().await.init(InitRequest {}).await.unwrap();
+    let token = first
+        .cluster()
+        .await
+        .join_token(JoinTokenRequest {
+            role: "manager".into(),
+            rotate: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    let admin = creds(&ca, "admin", Role::Admin);
+    let second = Running::join(&first.addr, &token, "m2", admin.clone()).await;
+    until("the follower knows the leader", || {
+        second.store.raft.metrics().borrow().current_leader
+            == Some(first.store.raft.metrics().borrow().id)
+    })
+    .await;
+    // A stream the follower passes on from the leader, kept open.
+    let mut usage = second
+        .cluster()
+        .await
+        .watch_usage(legion_proto::v1::UsageRequest {
+            namespace: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    usage.message().await.unwrap().unwrap();
+    // A connection that opens and says nothing more.
+    let quiet = tokio::net::TcpStream::connect(&second.addr).await.unwrap();
+
+    let began = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(30), second.stop())
+        .await
+        .expect("the manager stopped");
+    assert!(
+        began.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        began.elapsed()
+    );
+    // The stream it passed on ended with it.
+    let ended = tokio::time::timeout(Duration::from_secs(5), usage.message()).await;
+    assert!(
+        matches!(ended, Ok(Ok(None)) | Ok(Err(_))),
+        "the passed-on stream ended: {ended:?}"
+    );
+    drop(quiet);
+    first.stop().await;
+}
+
+/// A VM's bhyve runs on the host, outside any jail: a Service with a VM
+/// container is refused unless its namespace allows `vm`, which only the
+/// cluster admin sets; allowed, it is taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vm_pod_needs_its_namespace_to_allow_it() {
+    let ca = Ca::generate().unwrap();
+    let m = Running::start_with(Some(&ca)).await;
+    m.cluster().await.init(InitRequest {}).await.unwrap();
+    let admin = m.objects().await;
+    let guest = object(
+        "Service",
+        "shop",
+        "guest",
+        serde_json::json!({
+            "replicas": 1,
+            "pod": { "containers": [{
+                "name": "guest", "image": "guest:1", "vm": { "cpus": 1, "memory": "256Mi" },
+            }] },
+        }),
+    );
+    eventually(|| {
+        let mut c = admin.clone();
+        async move {
+            c.apply(object("Namespace", "", "shop", serde_json::json!({})))
+                .await
+        }
+    })
+    .await;
+    let err = admin.clone().apply(guest.clone()).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err}");
+    assert!(
+        err.message().contains("virtual machines (vm"),
+        "{}",
+        err.message()
+    );
+    admin
+        .clone()
+        .apply(object(
+            "Namespace",
+            "",
+            "shop",
+            serde_json::json!({ "security": { "allow": ["vm"] } }),
+        ))
+        .await
+        .unwrap();
+    admin.clone().apply(guest).await.unwrap();
+}
