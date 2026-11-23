@@ -115,6 +115,49 @@ pub fn dry_run(
                 ));
             }
         }
+        Change::MoveServices {
+            namespace,
+            services,
+            node,
+        } => {
+            node_named(&changed, node)?;
+            let mut moved: BTreeSet<String> = BTreeSet::new();
+            for name in services {
+                let Some(s) = changed
+                    .services
+                    .iter_mut()
+                    .find(|s| s.key() == (namespace.as_str(), name.as_str()))
+                else {
+                    return Err(Refused::NotFound(format!(
+                        "Service {namespace}/{name} not found"
+                    )));
+                };
+                s.spec
+                    .placement
+                    .constraints
+                    .retain(|c| !c.trim_start().starts_with("node.name"));
+                s.spec
+                    .placement
+                    .constraints
+                    .push(format!("node.name == {node}"));
+                s.object.spec = serde_json::to_value(&s.spec).expect("serialises");
+                for v in &s.spec.pod.volumes {
+                    if let Some(source) = &v.volume {
+                        moved.insert(source.name.clone());
+                    }
+                }
+            }
+            for name in moved {
+                let Some(v) = changed.volumes.get_mut(&(namespace.clone(), name.clone())) else {
+                    continue;
+                };
+                if v.spec.driver != VolumeDriver::Zfs {
+                    continue;
+                }
+                v.spec.node = Some(node.clone());
+                v.object.spec = serde_json::to_value(&v.spec).expect("serialises");
+            }
+        }
         // A manager made a worker keeps its tasks: what it does to the
         // managers is added by the API, which knows them.
         Change::Demote { node } => {

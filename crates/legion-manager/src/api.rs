@@ -2339,6 +2339,11 @@ impl Cluster for ApiService {
                 caller.check(&self.store, Verb::Write, Kind::Node, "")?
             }
             Change::Demote { .. } => caller.require_all("change a node's role")?,
+            Change::MoveServices { namespace, .. } => {
+                check_namespace(namespace)?;
+                caller.check(&self.store, Verb::Write, Kind::Service, namespace)?;
+                caller.check(&self.store, Verb::Write, Kind::Volume, namespace)?
+            }
             Change::MoveVolume { namespace, .. } => {
                 check_namespace(namespace)?;
                 caller.check(&self.store, Verb::Write, Kind::Volume, namespace)?

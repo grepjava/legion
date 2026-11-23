@@ -35,6 +35,15 @@ pub enum Change {
     DeleteService { namespace: String, service: String },
     /// `legion node demote NODE`: a manager made a worker.
     Demote { node: String },
+    /// Services pinned to `node` (`placement.constraints: node.name ==
+    /// NODE`, any other node pin replaced), every Volume they mount moved
+    /// there with them: the console's Move to.
+    #[serde(rename_all = "camelCase")]
+    MoveServices {
+        namespace: String,
+        services: Vec<String>,
+        node: String,
+    },
 }
 
 impl Change {
@@ -52,6 +61,18 @@ impl Change {
                 format!("delete Service {namespace}/{service}")
             }
             Change::Demote { node } => format!("demote node {node} to a worker"),
+            Change::MoveServices {
+                namespace,
+                services,
+                node,
+            } => format!(
+                "move {} in {namespace} to {node}",
+                services
+                    .iter()
+                    .map(|s| format!("Service {s}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
     }
 }

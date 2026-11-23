@@ -377,3 +377,46 @@ fn a_budget_that_lets_nothing_stop_blocks_the_drain() {
         (to, Some(200 << 20))
     );
 }
+
+/// The console's Move to: Services pinned to another node, the Volumes they
+/// mount moved with them. Two Services sharing a Volume move together;
+/// moving one alone strands the other, which the check says.
+#[test]
+fn services_moved_with_their_volume_and_no_one_left_holding_it() {
+    let mut w = World::new();
+    w.node("n1", &[]);
+    w.node("n2", &[]);
+    w.volume("data", "n1");
+    let on_n1 = |name: &str| {
+        format!(
+            "replicas: 1\nplacement: {{ constraints: [\"node.name == n1\"] }}\npod: {{ containers: [{{ name: {name}, image: \"app:1\" }}], volumes: [{{ name: data, volume: {{ name: data }} }}] }}"
+        )
+    };
+    w.service("api", &on_n1("api"));
+    w.service("migrator", &on_n1("migrator"));
+    w.settle();
+    assert_eq!(w.placed("api"), ["n1"]);
+    assert_eq!(w.placed("migrator"), ["n1"]);
+    let moving = |services: &[&str]| Change::MoveServices {
+        namespace: "shop".into(),
+        services: services.iter().map(|s| s.to_string()).collect(),
+        node: "n2".into(),
+    };
+    // Together: the Volume moves, both run on n2, nothing blocks.
+    let d = w.check(moving(&["api", "migrator"]), &Facts::default());
+    assert!(!d.blocks(), "{:?}", said(&d));
+    assert_eq!(d.moves.len(), 1, "{:?}", d.moves);
+    assert_eq!(
+        (d.moves[0].volume.as_str(), d.moves[0].to.as_str()),
+        ("data", "n2")
+    );
+    // One alone: the other is left pinned to n1 without its data.
+    let d = w.check(moving(&["api"]), &Facts::default());
+    assert!(
+        said(&d).iter().any(|f| f.contains("migrator")),
+        "{:?}",
+        said(&d)
+    );
+    // A Service or node that is not there is refused.
+    assert!(dry_run(w.cluster(), &moving(&["nope"]), &Facts::default(), w.now).is_err());
+}
