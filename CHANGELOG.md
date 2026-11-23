@@ -28,6 +28,15 @@ beyond the usual (managers first, one at a time, then workers).
   over a slow link gets there however often daemons restart.
   `status.replica.partial` says which replica copy is under way. Backups to
   a directory are files, and are written again.
+- **Backups to S3-compatible storage.** A `BackupTarget` can be a bucket
+  (`s3: {endpoint, region, bucket, prefix, accessKeyId, secretKeySecret}`,
+  `virtualHosted` for services that take no path-style requests): AWS S3,
+  MinIO, Garage, Ceph's RGW, R2, B2 and the like. Each backup is an object,
+  whole, at `<prefix>/<namespace>.<volume>/<snapshot>.zfs`, pruned to
+  `keep`, listed and restored as the other targets' are. It goes up a part
+  at a time, so the object appears only once complete; a part failing on
+  the way is sent again, and an upload left unfinished is aborted at the
+  next run. The console's Backup targets page adds and changes them.
 - **Sends are compressed.** Every `zfs send` (replicas, moves, backups)
   sends blocks as the pool stores them (`-L -c -e`): a lz4 database at
   2x sends half what it did.

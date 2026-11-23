@@ -170,7 +170,7 @@ Trigger a CronJob immediately outside its schedule.
   - `rollback <VOLUME> <SNAPSHOT> [--yes]` says which later snapshots it destroys and asks first.
   - `clone <VOLUME>@<SNAPSHOT> <NAME>` copies a snapshot's data into a new Volume on the same node, leaving the Volume as it is.
   - `backups <VOLUME> [--from TARGET]` lists what its BackupTarget holds of it, oldest first; `restore --from TARGET <VOLUME>@<BACKUP> --node NODE [--name NAME]` restores one of them onto NODE as a new Volume.
-  - A Volume's `snapshots: [{every, keep}]` and `backup: {target, every, keep}` take them on a schedule (DESIGN.md §4.3); a `BackupTarget` is a ZFS host over SSH (`ssh: {host, port, user, dataset, keySecret, hostKey}`) or a directory on the node (`directory: {path}`).
+  - A Volume's `snapshots: [{every, keep}]` and `backup: {target, every, keep}` take them on a schedule (DESIGN.md §4.3); a `BackupTarget` is a ZFS host over SSH (`ssh: {host, port, user, dataset, keySecret, hostKey}`) a directory on the node (`directory: {path}`), or an S3-compatible bucket (`s3: {endpoint, region, bucket, prefix, accessKeyId, secretKeySecret, virtualHosted}`).
 
 ---
 

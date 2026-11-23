@@ -79,7 +79,8 @@ lab covers it.
 - Console: the Volume's Data tab shows its schedules, its backups and a restore, and copies a snapshot into a new Volume.
 - Checked on the Ryzen: snapshots and directory backups pruned to `keep`; restore and clone hold the data as at their time.
 - Lab test: `volumes_keep_scheduled_snapshots_and_backups_that_restore`, n3 as the SSH host.
-- Left: S3-compatible targets; the failover and drain cases of "done when" are covered by the status carrying over moves and promotions, but not yet run in the lab.
+- S3-compatible targets (24 November 2026): `s3: {endpoint, region, bucket, prefix, accessKeyId, secretKeySecret, virtualHosted}`, each backup a whole object, sent as a multipart upload; signed with Signature Version 4 (checked against AWS's own example) by the agent itself.
+- Left: the failover and drain cases of "done when" are covered by the status carrying over moves and promotions, but not yet run in the lab.
 
 ## 2. Moving a Volume while it runs
 
