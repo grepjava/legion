@@ -4,7 +4,7 @@
   // a CronJob now or suspend it; drain or promote a Node, move a Volume). For a user who may
   // only look, the buttons are there, disabled, with the reason.
   import { goto } from '$app/navigation';
-  import { api, removal, type LObject } from './api.ts';
+  import { api, followStatus, removal, type LObject } from './api.ts';
   import { cannotWrite } from './session.svelte.ts';
   import { t } from './i18n.svelte.ts';
   import { ask } from './confirm.svelte.ts';
@@ -13,6 +13,7 @@
   import {
     ArrowRightLeft,
     ArrowUpFromLine,
+    Crown,
     ArrowDownToLine,
     CirclePause,
     CirclePlay,
@@ -36,6 +37,28 @@
   let error = $state('');
   let busy = $state(false);
   let replicas: number = $state(0);
+  // Which manager leads, for a manager's page to offer to hand leadership
+  // to it.
+  let leader = $state('');
+  $effect(() => {
+    if (kind !== 'Node' || object.spec?.role !== 'manager') return;
+    return followStatus((s) => (leader = s.leaderName ?? ''));
+  });
+
+  async function lead() {
+    const ok = await ask(
+      t(
+        'Make {name} the leader? For about 10 s nothing is placed or changed while the leader hands over; no node goes down and running tasks carry on.',
+        { name }
+      ),
+      { action: t('Lead') }
+    );
+    if (!ok) return;
+    return act(async () => {
+      const r = await api.lead(name);
+      return t('{name} leads now (nothing written for {s} s)', { name: r.leader, s: (r.tookMs / 1000).toFixed(1) });
+    });
+  }
   let moveTo = $state('');
 
   // Follows the stored count, not every new status of the Service.
@@ -239,6 +262,9 @@
       {/each}
     </span>
     {#if object.spec?.role === 'manager'}
+      {#if leader && leader !== name}
+        <button disabled={!!why || busy} title={why ?? ''} onclick={lead}><Ico icon={Crown} size={14} />{t('Lead')}</button>
+      {/if}
       <button disabled={!!why || busy} title={why ?? ''} onclick={() => role('worker')}><Ico icon={ArrowDownToLine} size={14} />{t('Demote')}</button>
     {:else}
       <button disabled={!!why || busy} title={why ?? ''} onclick={() => role('manager')}><Ico icon={ArrowUpFromLine} size={14} />{t('Promote')}</button>

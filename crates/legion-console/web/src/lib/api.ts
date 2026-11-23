@@ -51,6 +51,8 @@ export interface Status {
   members: { id: string; addr: string; voter: boolean; witness?: boolean }[];
   /** This manager is a witness. */
   witness?: boolean;
+  /** The leader by name, empty if none or not known yet. */
+  leaderName?: string;
 }
 
 export class ApiError extends Error {
@@ -151,6 +153,8 @@ export const api = {
     call<{ message: string }>('POST', '/api/restart', { namespace, service }),
   runNow: (namespace: string, cronJob: string) =>
     call<{ message: string }>('POST', '/api/run-now', { namespace, cronJob }),
+  /** Leadership handed to the manager `node`, nothing brought down (`legion node lead`). */
+  lead: (node: string) => call<{ leader: string; tookMs: number }>('POST', '/api/lead', { node }),
   nodeRole: (node: string, role: 'manager' | 'worker') =>
     call<void>('POST', '/api/node-role', { node, role }),
   /** What a change would do, changing nothing (`--dry-run`). */
