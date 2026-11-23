@@ -172,11 +172,11 @@ Where an old copy of a workload and its replacement can run at once today:
 
 5. **A node whose daemon died but whose pods run on** (pods outlive the
    daemon, so that it can be restarted or upgraded under them): after
-   16 s it looks like a node cut off, but no agent is there to stop its
-   `onPartition: stop` pods, so their replacements run beside them. A
-   Volume with `failover: automatic` is handed to its replica the same
-   way, and what the old pods write after that is dropped with the old
-   copy once the node is back.
+   16 s it looks like a node cut off, and its pods run on beside their
+   replacements, but for `onPartition: stop` pods: their supervisors stop
+   them once the agent's lease runs out (self-fencing, above), so those
+   don't run twice, and a Volume with `failover: automatic` is handed over
+   only once they have stopped.
 
 A task bound to a volume used by one node at a time doesn't run twice
 during a split: its replacement waits for the volume, unless the volume's
@@ -207,6 +207,28 @@ to it, and is sent again once they answer. Tested:
 `a_task_that_must_not_run_twice_is_replaced_after_its_node_stopped_it`
 (the planner) and `a_pod_that_must_not_run_twice_stops_before_it_is_replaced`
 (agents in a real cluster, cut off by a silent link).
+
+**Without the agent (self-fencing, since 2026-11-23).** Pods outlive the
+daemon, so that it can be restarted or upgraded under them; a daemon that
+dies leaves no agent to stop them. So the stop does not rest on the agent
+alone. Each time the managers answer a heartbeat, the agent renews a lease
+(`legion_runtime::fence`): the moment, on the system's monotonic clock,
+counted as above, past which they will have marked the node down. Each
+container of such a pod carries the lease's path, and its supervisor
+(`legion jail-shim`, one per container, which outlives the daemon) reads
+the lease every second; once it has run out, the supervisor sends the
+container its stop signal, writes why to the container's log, and kills it
+once its stop timeout has passed. A lease that can't be read stops nothing;
+setting the time of day moves nothing, the monotonic clock being apart
+from it. A daemon restarted within the 16 s renews the lease before it runs
+out, so an upgrade still adopts these pods; a daemon down longer has its
+node marked down anyway, and the pods replaced. Tested:
+`a_fenced_container_stops_once_its_lease_runs_out_then_is_killed` (the
+supervisor's rule), the lease checked in
+`a_pod_that_must_not_run_twice_stops_before_it_is_replaced`, and
+`a_pod_that_must_not_run_twice_stops_when_the_daemon_dies` (lab: a daemon
+killed with SIGKILL, such a pod stopped by its supervisor after 12 s and
+before 45 s, another pod left running and adopted).
 
 A new leader starts the wait anew when it first sees the orphaned task,
 which only makes it longer. Not covered: an agent from before v0.1.15

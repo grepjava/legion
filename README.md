@@ -7,8 +7,9 @@ selected Kubernetes features, running workloads as jails from OCI images,
 which it pulls into ZFS and runs itself. The plan and its rationale are in
 [docs/DESIGN.md](docs/DESIGN.md); how it compares with Docker Swarm,
 Kubernetes, CBSD, BastilleBSD and Sylve is in [docs/COMPARISON.md](docs/COMPARISON.md), and how to build
-and ship images for it in [docs/IMAGES.md](docs/IMAGES.md). What changed in
-each version is in [CHANGELOG.md](CHANGELOG.md).
+and ship images for it in [docs/IMAGES.md](docs/IMAGES.md). What it takes to lose any one machine
+is in [docs/HA.md](docs/HA.md). What changed in each version is in
+[CHANGELOG.md](CHANGELOG.md).
 
 Images are built with `legion build`: it builds FreeBSD jail images from
 Containerfiles with nothing but the base system, and `legion local` runs

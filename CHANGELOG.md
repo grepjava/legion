@@ -31,6 +31,23 @@ beyond the usual (managers first, one at a time, then workers).
   schedule; `backup-late` says when one fails or is overdue. `legion volume
   backups` lists them and `legion volume restore --from TARGET` restores one.
 
+### High availability
+
+- **`legion ha`** ([docs/HA.md](docs/HA.md)) lists the cluster's single
+  points of failure, each with how to put it right: too few managers or
+  only one that may lead, one node running every task, a service with one
+  replica or all on one node, published ports without a load balancer
+  address, a Volume's data on one node or failing over only by hand. Exits
+  nonzero on a risk. The console has an Availability page and an Overview
+  tile for it.
+- **Witness managers.** `legion join --witness` adds a manager that votes
+  but runs no tasks and never leads, so a small machine makes two managers
+  three. `legion status` and the console mark witnesses.
+- **Self-fencing.** A pod with `onPartition: stop` now stops on its node
+  even when the daemon is dead: the agent renews a lease as heartbeats are
+  answered, and each container's supervisor stops it once the lease runs
+  out. A Volume's automatic failover is then safe in that case too.
+
 ### Nodes and hosts
 
 - A Node's status holds its host (FreeBSD release, kernel, boot method, up
