@@ -145,6 +145,7 @@
   "Check": "",
   "Check again": "",
   "Checking what it would do…": "",
+  "Checking…": "",
   "Choose a namespace": "",
   "Choose every row shown": "",
   "Choose node…": "",
@@ -332,6 +333,7 @@
   "How far back": "",
   "How the image was built": "",
   "How the image was built, first step first": "",
+  "How to put it right": "",
   "INGRESS / ROUTES": "",
   "IP": "",
   "If its node went down now, it would carry on from this copy once the pods there have stopped.": "",
@@ -359,6 +361,7 @@
   "Instant ZFS snapshots": "",
   "Isolated: no inbound peers allowed.": "",
   "Issuing:": "",
+  "It carries on, but slowly, by hand, or only for some clients.": "",
   "It is now the cluster's only manager.": "",
   "It leaves the cluster: its tasks are placed elsewhere, and it has to join again to come back.": "",
   "It makes no more runs.": "",
@@ -429,6 +432,8 @@
   "Logs": "",
   "Logs for {name}": "",
   "Long operations": "",
+  "Losing any one machine stops nothing.": "",
+  "Losing one machine stops something, or loses data.": "",
   "Lost": "",
   "Lost with its node: restore a backup into it on another node.": "",
   "Made Volume {into} from @{snapshot}": "",
@@ -515,6 +520,8 @@
   "No pools reported: the host has none, or its agent has not read them yet.": "",
   "No replica: add replica to the Volume, or to the claim of the service using it, to keep a copy on another node.": "",
   "No services in {namespace}.": "",
+  "No single point of failure": "",
+  "No single point of failure found.": "",
   "No stacks here yet.": "",
   "No tasks on this node.": "",
   "No tasks ran in the last {span}, so there is no CPU or memory to show.": "",
@@ -524,6 +531,7 @@
   "No update to roll back": "",
   "No usage heard in the last hour: nothing ran, or the leader started since.": "",
   "No usage kept for the last {span}.": "",
+  "No witness": "",
   "No {kinds} here yet.": "",
   "Node": "",
   "Node colours": "",
@@ -531,6 +539,7 @@
   "Node {node} did not say its connections: {error}": "",
   "Node {shown}, {pods}": "",
   "Nodes": "",
+  "Nodes running tasks": "",
   "Nodes that may hold it": "",
   "None in the last minute and a half.": "",
   "None match the filter.": "",
@@ -702,6 +711,7 @@
   "Resume": "",
   "Review & launch": "",
   "Review the fix for pf on {node}": "",
+  "Risks": "",
   "Role": "",
   "Roll back": "",
   "Roll out": "",
@@ -964,7 +974,9 @@
   "Volumes on {node} ({n})": "",
   "Vulnerabilities": "",
   "Waiting for a builder node.": "",
+  "Warnings": "",
   "What": "",
+  "What and how to fix": "",
   "What each source may reach of each service, on which of its tasks' ports: the namespace's isolation and its NetworkPolicies, ingress and egress, as the nodes enforce them.": "",
   "What happened": "",
   "What is in it goes too.": "",
@@ -976,6 +988,8 @@
   "What the doctor finds on {node}": "",
   "What was found": "",
   "What will be applied": "",
+  "What would happen": "",
+  "What would stop, or lose data, if one machine were lost: each a single point of failure, with how to put it right.": "",
   "What {name} holds": "",
   "What {what} said": "",
   "When": "",
@@ -1188,6 +1202,7 @@
     "one": "",
     "other": ""
   },
+  "risk": "",
   "rotating": "",
   "running": "",
   "runs in a jail through the Linux ABI, only on nodes started with --linux, and not every Linux image works there": "",
@@ -1242,6 +1257,7 @@
   "which object?": "",
   "who": "",
   "whole": "",
+  "witness": "",
   "worker": "",
   "would be {result}": "",
   "written": "",
@@ -1354,7 +1370,15 @@
   },
   "{n} min": "",
   "{n} min ago": "",
+  "{n} more in namespaces you may not read.": {
+    "one": "",
+    "other": ""
+  },
   "{n} nodes not ready.": {
+    "one": "",
+    "other": ""
+  },
+  "{n} of them witnesses": {
     "one": "",
     "other": ""
   },
@@ -1383,6 +1407,10 @@
     "other": ""
   },
   "{n} restarted": "",
+  "{n} risks": {
+    "one": "",
+    "other": ""
+  },
   "{n} rules": {
     "one": "",
     "other": ""
@@ -1408,7 +1436,15 @@
     "one": "",
     "other": ""
   },
+  "{n} voting": {
+    "one": "",
+    "other": ""
+  },
   "{n} vulnerable": "",
+  "{n} warnings": {
+    "one": "",
+    "other": ""
+  },
   "{n} with a replica": {
     "one": "",
     "other": ""

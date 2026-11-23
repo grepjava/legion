@@ -354,6 +354,7 @@
     '/': t('Overview'),
     '/login': t('Sign in'),
     '/alerts': t('Alerts'),
+    '/availability': t('Availability'),
     '/volumes': t('Volumes'),
     '/images': t('Images'),
     '/deploy': t('Deploy'),
@@ -481,6 +482,7 @@
         items: [
           pageItem('/', t('Overview')),
           pageItem('/alerts', t('Alerts'), true),
+          pageItem('/availability', t('Availability')),
           pageItem('/topology', t('Topology')),
           pageItem('/diagnostics', t('Diagnostics'))
         ]

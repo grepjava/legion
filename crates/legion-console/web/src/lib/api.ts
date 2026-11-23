@@ -47,7 +47,10 @@ export interface Status {
   term: number;
   version: number;
   protocol: number;
-  members: { id: string; addr: string; voter: boolean }[];
+  /** Each manager; a witness votes, runs no tasks and never leads. */
+  members: { id: string; addr: string; voter: boolean; witness?: boolean }[];
+  /** This manager is a witness. */
+  witness?: boolean;
 }
 
 export class ApiError extends Error {
@@ -107,6 +110,8 @@ export const api = {
       `/api/objects/${encodeURIComponent(kind)}/${encodeURIComponent(namespace || '_')}/${encodeURIComponent(name)}`
     ),
   usage: (namespace = '') => call<{ nodes: NodeUsage[] }>('GET', `/api/usage${q(namespace)}`),
+  /** The cluster's single points of failure, as `legion ha`. */
+  availability: (namespace = '') => call<HaReport>('GET', `/api/availability${q(namespace)}`),
   /** What may reach what among a namespace's services, as `legion reach`. */
   reach: (namespace: string) =>
     call<{ services: string[]; edges: ReachEdge[] }>('GET', `/api/reach${q(namespace)}`),
@@ -1007,6 +1012,36 @@ export function follow(
       publish();
     }
   );
+}
+
+/** A manager, as `legion ha` counts it. */
+export interface HaManager {
+  name: string;
+  voter: boolean;
+  /** Votes, runs no tasks, never leads. */
+  witness: boolean;
+}
+
+/** A single point of failure and how to put it right (legion_api::ha). */
+export interface HaFinding {
+  severity: 'risk' | 'warning';
+  /** A stable word: managers, leaders, nodes, one-replica, one-node, published, no-replica, manual-failover. */
+  reason: string;
+  /** `Kind namespace/name`; absent for the cluster. */
+  object?: string;
+  namespace?: string;
+  message: string;
+  fix: string;
+}
+
+/** What `legion ha` says of the cluster. */
+export interface HaReport {
+  findings: HaFinding[];
+  managers: HaManager[];
+  /** Nodes that may run tasks now. */
+  nodes: number;
+  /** Findings in namespaces the user may not read. */
+  hidden: number;
 }
 
 /** What an operator acts on now (`legion alerts`). */

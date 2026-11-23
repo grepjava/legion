@@ -25,6 +25,7 @@ import {
   HardDrive,
   KeyRound,
   Layers,
+  LifeBuoy,
   LayoutDashboard,
   LayoutTemplate,
   Monitor,
@@ -82,6 +83,7 @@ export function kindIcon(kind: string, vm = false): IconComponent {
 const pages: Record<string, IconComponent> = {
   '/': LayoutDashboard,
   '/alerts': Bell,
+  '/availability': LifeBuoy,
   '/topology': Network,
   '/network': Cable,
   '/disk': ChartPie,

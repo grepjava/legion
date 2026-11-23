@@ -12,6 +12,7 @@
     followStatus,
     followUsage,
     loadText,
+    type HaReport,
     type Balancer,
     type LObject,
     type NodeUsage,
@@ -36,6 +37,7 @@
     CircleCheck,
     Cpu,
     Crown,
+    LifeBuoy,
     HardDrive,
     MemoryStick,
     OctagonX,
@@ -45,6 +47,12 @@
 
   let status: Status | null = $state(null);
   let statusError = $state('');
+  // The single points of failure (`legion ha`), worked out again a moment
+  // after what they rest on changes.
+  let availability = $state<HaReport | null>(null);
+  const availabilityRisks = $derived(
+    availability?.findings.filter((f) => f.severity === 'risk').length ?? 0
+  );
   let nodes: LObject[] = $state([]);
   let services: LObject[] = $state([]);
   let tasks: LObject[] = $state([]);
@@ -95,6 +103,19 @@
     ];
     if (session.me?.all) stops.push(follow('Node', '', (o) => (nodes = o), fail('Node')));
     return () => stops.forEach((s) => s());
+  });
+
+  $effect(() => {
+    const ns = session.namespace;
+    // Read again a second after the services, Volumes or nodes change.
+    void [services, volumes, nodes];
+    const soon = setTimeout(() => {
+      api
+        .availability(ns)
+        .then((r) => (availability = r))
+        .catch(() => (availability = null));
+    }, 1000);
+    return () => clearTimeout(soon);
   });
 
   // What nodes and tasks use now, as each report comes.
@@ -336,11 +357,27 @@
             <span class="mono">{m.addr}</span>
             {#if m.id === status.leader}<span class="tag">{t('leader')}</span>{/if}
             {#if !m.voter}<span class="tag">{t('learner')}</span>{/if}
+            {#if m.witness}<span class="tag">{t('witness')}</span>{/if}
           </li>
         {/each}
       </ul>
     {/if}
   </Tile>
+  {#if availability}
+    <Tile
+      label={t('Availability')}
+      icon={LifeBuoy}
+      value={availabilityRisks
+        ? tn('1 risk', '{n} risks', availabilityRisks)
+        : availability.findings.length
+          ? tn('1 warning', '{n} warnings', availability.findings.length)
+          : t('No single point of failure')}
+      tone={availabilityRisks ? 'bad' : availability.findings.length ? 'wait' : 'good'}
+      note={availability.findings[0]?.message ?? t('Losing any one machine stops nothing.')}
+      href="/availability"
+      more={t('What and how to fix')}
+    />
+  {/if}
   <Tile
     label={t('Workloads')}
     icon={Boxes}
