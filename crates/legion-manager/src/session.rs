@@ -210,7 +210,7 @@ impl Pods for PodsService {
                 | Action::VolumeDrop(_)
                 | Action::ReplicaSend(_)
                 | Action::ReplicaReceive(_)
-                | Action::ReplicaToken(_)
+                | Action::ResumeToken(_)
                 | Action::ExportSync(_),
             ) => {
                 return Err(Status::invalid_argument(

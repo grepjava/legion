@@ -71,11 +71,12 @@ message SessionOpen {
     BackupRun backup_run = 21;
     BackupList backup_list = 22;
     BackupRestore backup_restore = 23;
-    // Managers only: the resume token of a replica's copy cut short that
-    // this node kept (`zfs receive -s`), on `stdout` (nothing if none),
-    // then `exit_code` 0. An agent from before it ends the session with an
-    // error: the session has no action.
-    ReplicaToken replica_token = 24;
+    // Managers only: the resume token of a copy of the Volume cut short
+    // that this node kept (`zfs receive -s`: a replica's, or a move's full
+    // copy), on `stdout` (nothing if none), then `exit_code` 0. An agent
+    // from before it ends the session with an error: the session has no
+    // action.
+    ResumeToken resume_token = 24;
   }
 }
 
@@ -109,7 +110,7 @@ message ReplicaSend {
   string resume_token = 4;
 }
 
-message ReplicaToken {
+message ResumeToken {
   string volume = 1;
 }
 
@@ -237,6 +238,10 @@ message VolumeSend {
   string volume = 1;
   // Only what changed since the full copy, from a second snapshot.
   bool last = 2;
+  // Goes on with the full copy cut short instead, from the receiving
+  // node's resume token (`zfs send -t`): it must send the move's full
+  // snapshot, which is kept, not taken again.
+  string resume_token = 3;
 }
 
 // Receives what `VolumeSend` sends, from `input` frames until
@@ -246,6 +251,9 @@ message VolumeReceive {
   // The last part: afterwards the dataset is mounted and the migration's
   // snapshots go.
   bool last = 2;
+  // Takes the rest of the full copy cut short, which this node kept,
+  // rather than a new one.
+  bool resume = 3;
 }
 
 message LogsOptions {

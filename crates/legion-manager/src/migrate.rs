@@ -18,7 +18,8 @@ use legion_api::{Kind, Object, ObjectKey};
 use legion_proto::v1::session_frame::Frame;
 use legion_proto::v1::session_open::Action;
 use legion_proto::v1::{
-    InputClosed, SessionError, SessionFrame, SessionOffer, SessionOpen, VolumeReceive, VolumeSend,
+    InputClosed, ResumeToken, SessionError, SessionFrame, SessionOffer, SessionOpen, VolumeReceive,
+    VolumeSend,
 };
 use legion_store::{Command, NodeId, Outcome, Precondition, Store};
 use tokio::sync::watch;
@@ -51,6 +52,9 @@ struct Failures {
     /// The nodes of the move not ready at the last failure: once one is
     /// back, the next attempt starts at once, the wait being for it.
     away: Vec<String>,
+    /// Attempts in a row that went on with a full copy cut short and got
+    /// next to nowhere: at `PartialCopy::TRIES`, the next starts again.
+    stalled: u32,
 }
 
 impl Failures {
@@ -132,7 +136,7 @@ async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::activity::Sta
     // among the Volume's leftovers, written by the controller.
     let mut running: HashMap<ObjectKey, (Migration, Option<watch::Sender<bool>>)> = HashMap::new();
     // Each transfer's Volume, migration, node it moves from, and outcome.
-    let mut tasks: JoinSet<(ObjectKey, Migration, String, Result<(), String>)> = JoinSet::new();
+    let mut tasks: JoinSet<(ObjectKey, Migration, String, Result<(), Copied>)> = JoinSet::new();
     let mut failed: HashMap<ObjectKey, Failures> = HashMap::new();
     // Old copies being dropped, and when a drop last failed.
     let mut drops: JoinSet<(ObjectKey, String, Result<(), String>)> = JoinSet::new();
@@ -145,18 +149,20 @@ async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::activity::Sta
             };
             running.remove(&key);
             match result {
-                Err(e) => {
+                Err(Copied { why: e, stalled }) => {
                     let f = failed.entry(key.clone()).or_insert(Failures {
                         to: m.to.clone(),
                         phase: m.phase,
                         count: 0,
                         last: Instant::now(),
                         away: Vec::new(),
+                        stalled: 0,
                     });
                     if !f.of(&m) {
-                        (f.to, f.phase, f.count) = (m.to.clone(), m.phase, 0);
+                        (f.to, f.phase, f.count, f.stalled) = (m.to.clone(), m.phase, 0, 0);
                     }
                     f.count += 1;
+                    f.stalled = if stalled { f.stalled + 1 } else { 0 };
                     f.last = Instant::now();
                     let ready = ready_nodes(store);
                     f.away = [from, m.to.clone()]
@@ -259,10 +265,14 @@ async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::activity::Sta
             }
             let (store, hub, activity) = (store.clone(), hub.clone(), activity.clone());
             let (k, started, from) = (key.clone(), m.clone(), status.node.clone());
+            let stalled = failed
+                .get(&key)
+                .filter(|f| f.of(&m))
+                .map_or(0, |f| f.stalled);
             let (cancel, mut cancelled) = watch::channel(false);
             tasks.spawn(async move {
                 let result = tokio::select! {
-                    r = advance(&store, &hub, &activity, &v, &status.node, &started) => r,
+                    r = advance(&store, &hub, &activity, &v, &status.node, &started, stalled) => r,
                     // What the new node received is a leftover now.
                     _ = cancelled.changed() => Ok(()),
                 };
@@ -331,14 +341,42 @@ async fn advance(
     v: &Object,
     from: &str,
     m: &Migration,
-) -> Result<(), String> {
+    stalled: u32,
+) -> Result<(), Copied> {
     let (namespace, volume) = (&v.metadata.namespace, &v.metadata.name);
     let last = m.phase == MigrationPhase::Finishing;
     tracing::info!(volume = %v.key(), from, to = %m.to, last, "moving volume data");
     let key = v.key();
     // Said to be sending, and what it has sent, until written.
     let sending = activity.sending(&key);
-    transfer(hub, namespace, volume, from, &m.to, last, sending.counter()).await?;
+    if last {
+        transfer(
+            hub,
+            namespace,
+            volume,
+            from,
+            &m.to,
+            true,
+            "",
+            sending.counter(),
+        )
+        .await
+        .map_err(|why| Copied {
+            why,
+            stalled: false,
+        })?;
+    } else {
+        full_copy(
+            hub,
+            namespace,
+            volume,
+            from,
+            &m.to,
+            sending.counter(),
+            stalled,
+        )
+        .await?;
+    }
     let moved = update(store, &key, |s| {
         if s.migration.as_ref() != Some(m) {
             return false;
@@ -382,8 +420,129 @@ async fn advance(
     Ok(())
 }
 
+/// The resume token of the copy of a Volume cut short that `node` kept (a
+/// replica's, or a move's full copy): empty if it kept none, or if its
+/// agent is from before tokens were asked for (the copy then starts
+/// again).
+pub(crate) async fn resume_token(
+    hub: &Arc<Hub>,
+    namespace: &str,
+    volume: &str,
+    node: &str,
+) -> Result<String, String> {
+    let offer = SessionOffer {
+        id: legion_pki::random_secret(),
+        open: Some(SessionOpen {
+            namespace: namespace.to_owned(),
+            action: Some(Action::ResumeToken(ResumeToken {
+                volume: volume.to_owned(),
+            })),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let asking = async {
+        let mut a = hub
+            .offer(node, offer)
+            .await
+            .map_err(|e| e.message().to_owned())?;
+        let mut out = Vec::new();
+        loop {
+            match a.from_agent.next().await {
+                Some(Ok(SessionFrame {
+                    frame: Some(Frame::Stdout(data)),
+                })) => out.extend_from_slice(&data),
+                Some(Ok(SessionFrame {
+                    frame: Some(Frame::ExitCode(0)),
+                })) => break,
+                Some(Ok(SessionFrame {
+                    frame: Some(Frame::Error(e)),
+                })) if e.message.contains("no action") => return Ok(String::new()),
+                Some(Ok(SessionFrame {
+                    frame: Some(Frame::Error(e)),
+                })) => return Err(format!("node {node}: {}", e.message)),
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => return Err(format!("node {node}: {}", e.message())),
+                None => return Err(format!("node {node}: its session ended early")),
+            }
+        }
+        String::from_utf8(out).map_err(|_| format!("node {node}: a resume token that is not text"))
+    };
+    tokio::time::timeout(TOKEN_WAIT, asking)
+        .await
+        .map_err(|_| format!("node {node}: no resume token in {}s", TOKEN_WAIT.as_secs()))?
+}
+
+/// How long a node has to say what it kept of a copy cut short.
+const TOKEN_WAIT: Duration = Duration::from_secs(30);
+
+/// A move's full copy cut short, which the new node kept, goes on from
+/// there; a token the old node cannot send (its full snapshot taken again
+/// since) starts it again at once. Attempts to go on that fail in a row
+/// moving next to nothing (an old node from before resuming sends a new
+/// stream, which is refused) make the next one start again.
+async fn full_copy(
+    hub: &Arc<Hub>,
+    namespace: &str,
+    volume: &str,
+    from: &str,
+    to: &str,
+    sent: &std::sync::atomic::AtomicU64,
+    stalled: u32,
+) -> Result<(), Copied> {
+    let token = match stalled < legion_api::volume::PartialCopy::TRIES {
+        true => resume_token(hub, namespace, volume, to)
+            .await
+            .map_err(|e| Copied::failed(e, false, sent))?,
+        false => String::new(),
+    };
+    if !token.is_empty() {
+        tracing::info!(volume, from, to, "going on with the full copy cut short");
+        match transfer(hub, namespace, volume, from, to, false, &token, sent).await {
+            Ok(()) => return Ok(()),
+            Err(e) if e.contains(legion_api::volume::NOT_RESUMABLE) => {
+                tracing::info!(volume, from, to, "starting the full copy again: {e}");
+                sent.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(e) => return Err(Copied::failed(e, true, sent)),
+        }
+    }
+    transfer(hub, namespace, volume, from, to, false, "", sent)
+        .await
+        .map_err(|e| Copied::failed(e, false, sent))
+}
+
+/// A full copy that failed: why, and whether it went on with one cut
+/// short and got next to nowhere.
+pub(crate) struct Copied {
+    pub why: String,
+    pub stalled: bool,
+}
+
+/// A failure after the copy (writing it down): nothing to go on with.
+impl From<String> for Copied {
+    fn from(why: String) -> Copied {
+        Copied {
+            why,
+            stalled: false,
+        }
+    }
+}
+
+impl Copied {
+    fn failed(why: String, resumed: bool, sent: &std::sync::atomic::AtomicU64) -> Copied {
+        let moved = sent.load(std::sync::atomic::Ordering::Relaxed);
+        Copied {
+            why,
+            stalled: resumed && moved < legion_api::volume::PartialCopy::PROGRESS,
+        }
+    }
+}
+
 /// Sends a Volume from one node to another: all of it, or with `last`
-/// what changed since the full copy.
+/// what changed since the full copy; with `token`, the rest of the full
+/// copy cut short.
+#[allow(clippy::too_many_arguments)]
 async fn transfer(
     hub: &Arc<Hub>,
     namespace: &str,
@@ -391,6 +550,7 @@ async fn transfer(
     from: &str,
     to: &str,
     last: bool,
+    token: &str,
     sent: &std::sync::atomic::AtomicU64,
 ) -> Result<(), String> {
     let open = |action| SessionOffer {
@@ -409,12 +569,20 @@ async fn transfer(
             open(Action::VolumeReceive(VolumeReceive {
                 volume: volume.clone(),
                 last,
+                resume: !token.is_empty(),
             })),
         )
         .await
         .map_err(|e| e.message().to_owned())?;
     let mut sender = hub
-        .offer(from, open(Action::VolumeSend(VolumeSend { volume, last })))
+        .offer(
+            from,
+            open(Action::VolumeSend(VolumeSend {
+                volume,
+                last,
+                resume_token: token.to_owned(),
+            })),
+        )
         .await
         .map_err(|e| e.message().to_owned())?;
     let result = pipe(
@@ -662,6 +830,7 @@ mod tests {
             count: 6,
             last: Instant::now(),
             away: vec!["n1".into()],
+            stalled: 0,
         };
         let ready = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect();
         assert!(f.waiting(&ready(&["n2", "n3"])));

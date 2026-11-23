@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::StreamExt;
 use legion_api::node::{Availability, NodeSpec, NodeState, NodeStatus};
 use legion_api::service::OnPartition;
 use legion_api::task::{TaskSpec, TaskState, TaskStatus};
@@ -21,16 +20,13 @@ use legion_api::volume::{
     VolumeSpec, VolumeStatus,
 };
 use legion_api::{Kind, ObjectKey};
-use legion_proto::v1::session_frame::Frame;
 use legion_proto::v1::session_open::Action;
-use legion_proto::v1::{
-    ReplicaReceive, ReplicaSend, ReplicaToken, SessionFrame, SessionOffer, SessionOpen,
-};
+use legion_proto::v1::{ReplicaReceive, ReplicaSend, SessionOffer, SessionOpen};
 use legion_store::Store;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use crate::migrate::{backoff, pipe, update};
+use crate::migrate::{backoff, pipe, resume_token, update};
 use crate::session::Hub;
 
 /// How often the Volumes are looked at.
@@ -605,7 +601,7 @@ async fn copy(
     counted: &std::sync::atomic::AtomicU64,
 ) -> Outcome {
     let token = match resume {
-        true => match token(hub, key, to).await {
+        true => match resume_token(hub, &key.namespace, &key.name, to).await {
             Ok(t) => t,
             Err(e) => {
                 return Outcome {
@@ -685,56 +681,6 @@ async fn send(
     )
     .await
 }
-
-/// The resume token of the copy of `key` cut short that `node` kept:
-/// empty if it kept none, or if its agent is from before tokens were asked
-/// for (the copy then starts again).
-async fn token(hub: &Arc<Hub>, key: &ObjectKey, node: &str) -> Result<String, String> {
-    let offer = SessionOffer {
-        id: legion_pki::random_secret(),
-        open: Some(SessionOpen {
-            namespace: key.namespace.clone(),
-            action: Some(Action::ReplicaToken(ReplicaToken {
-                volume: key.name.clone(),
-            })),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let asking = async {
-        let mut a = hub
-            .offer(node, offer)
-            .await
-            .map_err(|e| e.message().to_owned())?;
-        let mut out = Vec::new();
-        loop {
-            match a.from_agent.next().await {
-                Some(Ok(SessionFrame {
-                    frame: Some(Frame::Stdout(data)),
-                })) => out.extend_from_slice(&data),
-                Some(Ok(SessionFrame {
-                    frame: Some(Frame::ExitCode(0)),
-                })) => break,
-                Some(Ok(SessionFrame {
-                    frame: Some(Frame::Error(e)),
-                })) if e.message.contains("no action") => return Ok(String::new()),
-                Some(Ok(SessionFrame {
-                    frame: Some(Frame::Error(e)),
-                })) => return Err(format!("node {node}: {}", e.message)),
-                Some(Ok(_)) => continue,
-                Some(Err(e)) => return Err(format!("node {node}: {}", e.message())),
-                None => return Err(format!("node {node}: its session ended early")),
-            }
-        }
-        String::from_utf8(out).map_err(|_| format!("node {node}: a resume token that is not text"))
-    };
-    tokio::time::timeout(TOKEN_WAIT, asking)
-        .await
-        .map_err(|_| format!("node {node}: no resume token in {}s", TOKEN_WAIT.as_secs()))?
-}
-
-/// How long a replica's node has to say what it kept of a copy cut short.
-const TOKEN_WAIT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 mod tests {
