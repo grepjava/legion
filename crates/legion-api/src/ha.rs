@@ -222,7 +222,30 @@ pub fn check(c: &Cluster) -> Vec<Finding> {
             message,
             fix,
         };
-        if wanted == 1 {
+        // The Volumes its pod mounts as they are (not a stateful claim,
+        // each replica's own): a second replica would share their data.
+        let shared: Vec<&str> = spec
+            .pod
+            .volumes
+            .iter()
+            .filter_map(|v| v.volume.as_ref().map(|s| s.name.as_str()))
+            .collect();
+        if wanted == 1 && !shared.is_empty() {
+            out.push(finding(
+                Severity::Risk,
+                "one-replica",
+                format!(
+                    "One replica, its data on Volume {}: if its node is lost, it is down until \
+                     the Volume is back or taken over by its replica",
+                    shared.join(", ")
+                ),
+                "Keep it at 1: a second replica would share the Volume's data, which a \
+                 database can't survive. Protect the Volume (a replica failing over on its own), \
+                 and for no loss at all run the application's own replication, a second Service \
+                 with a Volume of its own"
+                    .into(),
+            ));
+        } else if wanted == 1 {
             out.push(finding(
                 Severity::Risk,
                 "one-replica",
@@ -501,7 +524,12 @@ mod tests {
             obj(Kind::Service, "shop", name, spec, serde_json::json!({}))
         };
         let pod = serde_json::json!({ "containers": [{ "name": "c", "image": "web:1" }] });
+        let with_data = serde_json::json!({
+            "containers": [{ "name": "c", "image": "pg:17" }],
+            "volumes": [{ "name": "data", "volume": { "name": "alone" } }],
+        });
         let services = [
+            svc("db", serde_json::json!({ "replicas": 1, "pod": with_data })),
             svc("one", serde_json::json!({ "replicas": 1, "pod": pod })),
             svc("two", serde_json::json!({ "replicas": 2, "pod": pod })),
             svc("spread", serde_json::json!({ "replicas": 2, "pod": pod })),
@@ -584,6 +612,7 @@ mod tests {
         assert_eq!(
             reasons(&found),
             [
+                ("one-replica", "Service shop/db"),
                 ("one-replica", "Service shop/one"),
                 ("no-replica", "Volume shop/alone"),
                 ("published", "Service shop/front"),
@@ -592,16 +621,24 @@ mod tests {
                 ("manual-failover", "Volume shop/by-hand"),
             ]
         );
+        // Its data on a Volume: told to keep one, never to add replicas.
+        assert!(found[0].fix.starts_with("Keep it at 1"), "{}", found[0].fix);
         assert!(
-            found[2].message.contains("port 8080"),
+            found[0].message.contains("Volume alone"),
             "{}",
-            found[2].message
+            found[0].message
         );
-        assert!(found[3].message.contains("node n1"), "{}", found[3].message);
+        assert!(found[1].fix.starts_with("replicas: 2"), "{}", found[1].fix);
         assert!(
-            found[3].fix.contains("antiAffinity: [{service: two}]"),
+            found[3].message.contains("port 8080"),
             "{}",
-            found[3].fix
+            found[3].message
+        );
+        assert!(found[4].message.contains("node n1"), "{}", found[4].message);
+        assert!(
+            found[4].fix.contains("antiAffinity: [{service: two}]"),
+            "{}",
+            found[4].fix
         );
     }
 
