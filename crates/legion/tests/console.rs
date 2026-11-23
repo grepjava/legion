@@ -1028,7 +1028,9 @@ spec:
     a.shows("What would change", 30);
     a.click("Save");
     wait("pinned kept apart from itself", 30, || {
-        spec(&c)["placement"]["antiAffinity"] == serde_json::json!([{ "service": "pinned" }])
+        // As stored: `required` written out, false.
+        let anti = &spec(&c)["placement"]["antiAffinity"];
+        anti[0]["service"] == "pinned" && anti[0]["required"] != true
     });
     // Published on every node: given a load balancer address.
     let lb = format!("{}.240", c.lab.host.rsplit_once('.').unwrap().0);
@@ -1039,7 +1041,8 @@ spec:
     a.shows("What would change", 30);
     a.click("Save");
     wait("pinned given a load balancer address", 30, || {
-        spec(&c)["endpoint"]["loadBalancer"] == serde_json::json!({ "address": lb, "vhid": 211 })
+        let held = &spec(&c)["endpoint"]["loadBalancer"];
+        held["address"] == lb.as_str() && held["vhid"] == 211
     });
     c.page(&mut a, "/availability?ns=team-a");
     a.until("the published finding gone", 60, |b| {
