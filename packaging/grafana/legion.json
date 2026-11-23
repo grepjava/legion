@@ -168,7 +168,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(legion_node_ready)",
+          "expr": "sum(max without (instance) (legion_node_ready))",
           "legendFormat": "",
           "datasource": {
             "type": "prometheus",
@@ -206,7 +206,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(legion_nodes{state!=\"ready\"}) or vector(0)",
+          "expr": "sum(max without (instance) (legion_nodes{state!=\"ready\"})) or vector(0)",
           "legendFormat": "",
           "datasource": {
             "type": "prometheus",
@@ -258,7 +258,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(legion_tasks{state=\"running\",namespace=~\"$namespace\"}) or vector(0)",
+          "expr": "sum(max without (instance) (legion_tasks{state=\"running\",namespace=~\"$namespace\"})) or vector(0)",
           "legendFormat": "",
           "datasource": {
             "type": "prometheus",
@@ -296,7 +296,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(legion_tasks{state=~\"failed|rejected\",namespace=~\"$namespace\"}) or vector(0)",
+          "expr": "sum(max without (instance) (legion_tasks{state=~\"failed|rejected\",namespace=~\"$namespace\"})) or vector(0)",
           "legendFormat": "",
           "datasource": {
             "type": "prometheus",
@@ -349,7 +349,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (state) (legion_nodes)",
+          "expr": "sum by (state) (max without (instance) (legion_nodes))",
           "legendFormat": "{{state}}",
           "datasource": {
             "type": "prometheus",
@@ -380,7 +380,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (state) (legion_tasks{namespace=~\"$namespace\"})",
+          "expr": "sum by (state) (max without (instance) (legion_tasks{namespace=~\"$namespace\"}))",
           "legendFormat": "{{state}}",
           "datasource": {
             "type": "prometheus",
@@ -456,7 +456,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (namespace, service) (legion_service_ready_tasks{namespace=~\"$namespace\"})",
+          "expr": "sum by (namespace, service) (max without (instance) (legion_service_ready_tasks{namespace=~\"$namespace\"}))",
           "legendFormat": "{{namespace}}/{{service}}",
           "datasource": {
             "type": "prometheus",
@@ -487,7 +487,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (namespace, service) (legion_service_replicas{namespace=~\"$namespace\"}) - sum by (namespace, service) (legion_service_ready_tasks{namespace=~\"$namespace\"}) > 0",
+          "expr": "sum by (namespace, service) (max without (instance) (legion_service_replicas{namespace=~\"$namespace\"})) - sum by (namespace, service) (max without (instance) (legion_service_ready_tasks{namespace=~\"$namespace\"})) > 0",
           "format": "table",
           "instant": true,
           "datasource": {
@@ -520,7 +520,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (namespace, service) (legion_task_restarts{namespace=~\"$namespace\"})",
+          "expr": "sum by (namespace, service) (max without (instance) (legion_task_restarts{namespace=~\"$namespace\"}))",
           "legendFormat": "{{namespace}}/{{service}}",
           "datasource": {
             "type": "prometheus",
@@ -755,7 +755,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "legion_quota_used{namespace=~\"$namespace\"} / legion_quota_limit{namespace=~\"$namespace\"}",
+          "expr": "max without (instance) (legion_quota_used{namespace=~\"$namespace\"}) / max without (instance) (legion_quota_limit{namespace=~\"$namespace\"})",
           "legendFormat": "{{namespace}} {{resource}}",
           "datasource": {
             "type": "prometheus",
@@ -863,7 +863,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "legion_task_info{namespace=~\"$namespace\"}",
+          "expr": "max without (instance) (legion_task_info{namespace=~\"$namespace\"})",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -910,7 +910,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "bottomk(10, time() - legion_task_start_time_seconds{namespace=~\"$namespace\"})",
+          "expr": "bottomk(10, time() - max without (instance) (legion_task_start_time_seconds{namespace=~\"$namespace\"}))",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -947,7 +947,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "legion_node_zfs_used_bytes / (legion_node_zfs_used_bytes + legion_node_zfs_available_bytes)",
+          "expr": "max without (instance) (legion_node_zfs_used_bytes) / (max without (instance) (legion_node_zfs_used_bytes) + max without (instance) (legion_node_zfs_available_bytes))",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -981,7 +981,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "legion_volume_used_bytes{namespace=~\"$namespace\"} / (legion_volume_used_bytes{namespace=~\"$namespace\"} + legion_volume_available_bytes{namespace=~\"$namespace\"})",
+          "expr": "max without (instance) (legion_volume_used_bytes{namespace=~\"$namespace\"}) / (max without (instance) (legion_volume_used_bytes{namespace=~\"$namespace\"}) + max without (instance) (legion_volume_available_bytes{namespace=~\"$namespace\"}))",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -1018,7 +1018,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "topk(10, legion_volume_used_bytes{namespace=~\"$namespace\"})",
+          "expr": "topk(10, max without (instance) (legion_volume_used_bytes{namespace=~\"$namespace\"}))",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -1052,7 +1052,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "legion_volume_used_bytes{namespace=~\"$namespace\"}",
+          "expr": "max without (instance) (legion_volume_used_bytes{namespace=~\"$namespace\"})",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -1062,7 +1062,7 @@
         },
         {
           "refId": "B",
-          "expr": "legion_volume_available_bytes{namespace=~\"$namespace\"}",
+          "expr": "max without (instance) (legion_volume_available_bytes{namespace=~\"$namespace\"})",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -1072,7 +1072,7 @@
         },
         {
           "refId": "C",
-          "expr": "legion_volume_size_bytes{namespace=~\"$namespace\"}",
+          "expr": "max without (instance) (legion_volume_size_bytes{namespace=~\"$namespace\"})",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
