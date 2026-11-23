@@ -81,8 +81,12 @@
         setToken(session.me.csrf);
         session.kinds = await api.kinds();
         plugins()
-          .then((p) => (session.plugins = p.plugins))
-          .catch(() => (session.plugins = []));
+          .then((p) => {
+            session.plugins = p.plugins;
+          })
+          .catch(() => {
+            session.plugins = [];
+          });
         if (session.me.all) {
           const ns = await api.list('Namespace');
           adminNamespaces = ns.objects.map((o) => o.metadata.name).sort();
@@ -263,7 +267,9 @@
       return;
     }
     return followAlerts(
-      (a) => (session.alerts = a),
+      (a) => {
+        session.alerts = a;
+      },
       (why) => (session.alertsError = why)
     );
   });
@@ -274,7 +280,9 @@
       return;
     }
     return followActivity(
-      (ops) => (activity.ops = ops),
+      (ops) => {
+        activity.ops = ops;
+      },
       (why) => (activity.error = why)
     );
   });

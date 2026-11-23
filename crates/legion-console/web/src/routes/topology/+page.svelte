@@ -8,6 +8,7 @@
     follow,
     followConnections,
     followLoadBalancers,
+    followStatus,
     type Balancer,
     type ConnectionEdge,
     type ConnectionEnd,
@@ -16,7 +17,17 @@
   } from '#lib/api.ts';
   import { t, tn } from '#lib/i18n.svelte.ts';
   import { logoFor } from '#lib/logos.ts';
-  import { namespaces, session } from '#lib/session.svelte.ts';
+  import { cannotWrite, namespaces, session } from '#lib/session.svelte.ts';
+  import ContextMenu, { type MenuItem } from '#lib/ContextMenu.svelte';
+  import {
+    moveService,
+    moveVolume,
+    nodeMenu,
+    serviceMenu,
+    taskMenu,
+    volumeMenu,
+    type Scene
+  } from '#lib/topology-menu.svelte.ts';
 
   const mine = $derived(namespaces([]));
   let chosen = $state('');
@@ -69,15 +80,36 @@
   let canvas: HTMLDivElement | undefined = $state();
   let panning = $state(false);
   let press: { x: number; y: number; left: number; top: number; id: number } | null = null;
+  // A Service or Volume pressed on is dragged instead: dropped on a node's
+  // band, it moves there, as its menu's Move to does (asked first).
+  let drag: { kind: 'Service' | 'Volume'; name: string } | null = $state(null);
+  let dragging = $state(false);
+  let ghost = $state({ x: 0, y: 0 });
+  let dropOn = $state('');
   function panDown(e: PointerEvent) {
     if (e.button !== 0 || !canvas) return;
+    const item = (e.target as Element).closest<HTMLElement | SVGElement>('[data-drag]');
+    drag =
+      item && !cannotWrite(namespace)
+        ? { kind: item.dataset.drag as 'Service' | 'Volume', name: item.dataset.name ?? '' }
+        : null;
     press = { x: e.clientX, y: e.clientY, left: canvas.scrollLeft, top: canvas.scrollTop, id: e.pointerId };
   }
   function panMove(e: PointerEvent) {
     if (!press || !canvas || e.pointerId !== press.id) return;
     const dx = e.clientX - press.x;
     const dy = e.clientY - press.y;
-    if (!panning && Math.hypot(dx, dy) < 5) return;
+    if (!panning && !dragging && Math.hypot(dx, dy) < 5) return;
+    if (drag) {
+      if (!dragging) {
+        dragging = true;
+        canvas.setPointerCapture(e.pointerId);
+      }
+      ghost = { x: e.clientX, y: e.clientY };
+      const under = document.elementFromPoint(e.clientX, e.clientY)?.closest<SVGElement>('[data-node]');
+      dropOn = under?.dataset.node ?? '';
+      return;
+    }
     if (!panning) {
       panning = true;
       canvas.setPointerCapture(e.pointerId);
@@ -88,6 +120,25 @@
   function panUp(e: PointerEvent) {
     if (!press || e.pointerId !== press.id) return;
     press = null;
+    if (dragging && drag) {
+      const { kind, name } = drag;
+      const to = dropOn;
+      drag = null;
+      dragging = false;
+      dropOn = '';
+      canvas?.addEventListener('click', (c) => (c.preventDefault(), c.stopPropagation()), {
+        capture: true,
+        once: true
+      });
+      if (to && kind === 'Service') {
+        const s = services.find((x) => x.metadata.name === name);
+        if (s) void moveService(s, to, scene);
+      } else if (to && kind === 'Volume' && to !== volumeNode(name)) {
+        void moveVolume(name, to, scene);
+      }
+      return;
+    }
+    drag = null;
     if (!panning) return;
     // The click that ends a drag opens nothing.
     canvas?.addEventListener('click', (c) => (c.preventDefault(), c.stopPropagation()), {
@@ -328,6 +379,35 @@
     return i < 0 ? '' : `n${i % NODE_HUES}`;
   };
   const nodeOf = (name: string) => nodes.find((n) => n.metadata.name === name);
+
+  // What the menus need: the nodes that take tasks, the managers and which
+  // leads.
+  let leader = $state('');
+  $effect(() => followStatus((st) => (leader = st.leaderName ?? '')));
+  const scene: Scene = $derived({
+    namespace,
+    nodes: nodes
+      .filter((n) => n.status?.state === 'ready' && (n.spec?.availability ?? 'active') === 'active')
+      .map((n) => n.metadata.name as string)
+      .sort(),
+    leader,
+    managers: nodes.filter((n) => n.spec?.role === 'manager').map((n) => n.metadata.name as string),
+    services
+  });
+  let menu: { x: number; y: number; items: MenuItem[]; label: string } | null = $state(null);
+  /** Right-click: the menu at the pointer. */
+  function openMenu(e: MouseEvent, items: MenuItem[], label: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    menu = { x: e.clientX, y: e.clientY, items, label };
+  }
+  /** The menu key or Shift+F10 on what has focus: the menu beside it. */
+  function menuKey(e: KeyboardEvent, items: () => MenuItem[], label: string) {
+    if (!(e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10'))) return;
+    e.preventDefault();
+    const r = (e.currentTarget as Element).getBoundingClientRect();
+    menu = { x: r.left + Math.min(r.width, 40), y: r.top + r.height / 2, items: items(), label };
+  }
   const nodeHealth = (name: string) => {
     const st = nodeOf(name)?.status?.state;
     if (st === 'ready') return 'good';
@@ -626,11 +706,11 @@
         tabindex="0"
         role="region"
         aria-label={t('Topology graph')}
-        title={t('Drag to move around; Ctrl+wheel to zoom')}
         onpointerdown={panDown}
         onpointermove={panMove}
         onpointerup={panUp}
         onpointercancel={panUp}
+        title={t('Drag to move around; drag a Service or Volume onto a node to move it there; right-click for more')}
       >
         <svg
           class="topology"
@@ -684,6 +764,10 @@
             {#if b.node}
               <a
                 href="/k/Node/_/{b.node}"
+                data-node={b.node}
+                class:drop-target={dragging && dropOn === b.node}
+                oncontextmenu={(e) => openMenu(e, nodeMenu(nodeOf(b.node), b.node, scene), t('Node {name}', { name: b.node }))}
+                onkeydown={(e) => menuKey(e, () => nodeMenu(nodeOf(b.node), b.node, scene), t('Node {name}', { name: b.node }))}
                 aria-label={t('Node {shown}, {pods}', {
                   shown: [b.node, nodeNote(b.node), b.tasks.length ? '' : t('no pods of this namespace')]
                     .filter((x) => x)
@@ -849,6 +933,10 @@
             {@const pList = svcPorts(s)}
             <a
               href={link('Service', s.metadata.name)}
+              data-drag="Service"
+              data-name={s.metadata.name}
+              oncontextmenu={(e) => openMenu(e, serviceMenu(s, scene), t('Service {name}', { name: s.metadata.name }))}
+              onkeydown={(e) => menuKey(e, () => serviceMenu(s, scene), t('Service {name}', { name: s.metadata.name }))}
               aria-label={t('Service {name} {note}', {
                 name: `${s.metadata.name}${pList.length ? ` :${pList[0]}` : ''}`,
                 note: svcNote(s)
@@ -912,6 +1000,8 @@
             {@const node = tk.spec?.node ?? ''}
             <a
               href={link('Task', tk.metadata.name)}
+              oncontextmenu={(e) => openMenu(e, taskMenu(tk, scene), t('Task {name}', { name: tk.metadata.name }))}
+              onkeydown={(e) => menuKey(e, () => taskMenu(tk, scene), t('Task {name}', { name: tk.metadata.name }))}
               aria-label={t('Task {shown}, {state}, on {node}', {
                 shown: `${tk.metadata.name} ${taskLine(tk)}`,
                 state: tk.status?.paused ? 'paused' : (tk.status?.state ?? 'unknown'),
@@ -937,7 +1027,14 @@
           <!-- Volume Nodes with Storage Icon -->
           {#each volumeNames as v, i (v)}
             {@const vh = volumeHealth(v)}
-            <a href={link('Volume', v)} aria-label={t('Volume {name}: {note}', { name: v, note: volumeNote(v) })}>
+            <a
+              href={link('Volume', v)}
+              data-drag="Volume"
+              data-name={v}
+              oncontextmenu={(e) => openMenu(e, volumeMenu(v, volumeNode(v), scene), t('Volume {name}', { name: v }))}
+              onkeydown={(e) => menuKey(e, () => volumeMenu(v, volumeNode(v), scene), t('Volume {name}', { name: v }))}
+              aria-label={t('Volume {name}: {note}', { name: v, note: volumeNote(v) })}
+            >
               <rect class="box vol {vh}" x={X_VOL} y={y(i) - BOX_H / 2} width={VOL_W} height={BOX_H} rx="8" />
               {#if multiNode && volumeNode(v)}
                 <rect class="node-tag {nodeHue(volumeNode(v))}" x={X_VOL + 1} y={y(i) - BOX_H / 2 + 6} width="4" height={BOX_H - 12} rx="2" />
@@ -1072,7 +1169,27 @@
   <p class="empty">{t('No services in {namespace}.', { namespace })}</p>
 {/if}
 
+{#if menu}
+  <ContextMenu x={menu.x} y={menu.y} items={menu.items} label={menu.label} onclose={() => (menu = null)} />
+{/if}
+{#if dragging && drag}
+  <div class="drag-ghost card" style:left="{ghost.x + 14}px" style:top="{ghost.y + 10}px" aria-hidden="true">
+    {drag.name} → {dropOn || t('drop on a node')}
+  </div>
+{/if}
+
 <style>
+  .drag-ghost {
+    position: fixed;
+    z-index: 40;
+    pointer-events: none;
+    padding: 0.3rem 0.6rem;
+    font-size: 0.85rem;
+  }
+  :global(a.drop-target rect.band) {
+    stroke: var(--primary);
+    stroke-width: 3;
+  }
   .topo-layout {
     display: grid;
     grid-template-columns: minmax(0, 1fr) 20rem;
