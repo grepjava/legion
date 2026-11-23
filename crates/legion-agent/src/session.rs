@@ -121,6 +121,9 @@ async fn run<R: Runtime>(
         Some(Action::ReplicaReceive(opts)) => {
             transfer::replica_receive(&volumes, &open.namespace, opts, &tx, &mut inbound).await
         }
+        Some(Action::ReplicaToken(opts)) => {
+            transfer::replica_token(&volumes, &open.namespace, opts, &tx).await
+        }
         Some(Action::VolumeDrop(volume)) => {
             transfer::drop_copy(&volumes, &open.namespace, &volume, &tx).await
         }

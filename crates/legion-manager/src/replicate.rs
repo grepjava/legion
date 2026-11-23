@@ -12,15 +12,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
 use legion_api::node::{Availability, NodeSpec, NodeState, NodeStatus};
 use legion_api::service::OnPartition;
 use legion_api::task::{TaskSpec, TaskState, TaskStatus};
 use legion_api::volume::{
-    Failover, ReplicaCopy, ReplicaState, ReplicaStatus, VolumeDriver, VolumeSpec, VolumeStatus,
+    Failover, NOT_RESUMABLE, PartialCopy, ReplicaCopy, ReplicaState, ReplicaStatus, VolumeDriver,
+    VolumeSpec, VolumeStatus,
 };
 use legion_api::{Kind, ObjectKey};
+use legion_proto::v1::session_frame::Frame;
 use legion_proto::v1::session_open::Action;
-use legion_proto::v1::{ReplicaReceive, ReplicaSend, SessionOffer, SessionOpen};
+use legion_proto::v1::{
+    ReplicaReceive, ReplicaSend, ReplicaToken, SessionFrame, SessionOffer, SessionOpen,
+};
 use legion_store::Store;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -104,12 +109,14 @@ pub(crate) enum Step {
     Nothing,
     /// Write the status so.
     Write(Box<VolumeStatus>),
-    /// Copy from the node holding the data to the replica's.
+    /// Copy from the node holding the data to the replica's; `resume`, go
+    /// on with the copy of `snapshot` cut short.
     Copy {
         from: String,
         to: String,
         base: String,
         snapshot: String,
+        resume: bool,
     },
 }
 
@@ -217,6 +224,20 @@ pub(crate) fn step(
         }));
     }
     let ready = |n: &str| node(n).is_some_and(|c| c.ready);
+    // A copy cut short goes on, due or not, while the data is where it
+    // came from.
+    if let Some(p) = r.partial.as_ref().filter(|p| p.from == holder) {
+        if waiting || !ready(holder) || !ready(&target) {
+            return Step::Nothing;
+        }
+        return Step::Copy {
+            from: holder.to_owned(),
+            to: target,
+            base: p.base.clone(),
+            snapshot: p.snapshot.clone(),
+            resume: true,
+        };
+    }
     let incremental = !r.snapshot.is_empty() && r.from == holder;
     let due = !incremental
         || r.taken_ms
@@ -233,6 +254,7 @@ pub(crate) fn step(
             String::new()
         },
         snapshot: format!("legion-replica-{now_ms}"),
+        resume: false,
     }
 }
 
@@ -309,15 +331,27 @@ fn users(store: &Store) -> HashMap<(String, String), Vec<User>> {
 /// Keeps replicas copied while this manager leads; ends with the
 /// leadership (the caller's select).
 pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::activity::State>) {
-    let mut copies: JoinSet<(ObjectKey, ReplicaStatus, bool, Result<u64, String>)> = JoinSet::new();
+    let mut copies: JoinSet<Done> = JoinSet::new();
     let mut running: HashMap<ObjectKey, ()> = HashMap::new();
     // Failures in a row, and when the last was.
     let mut failed: HashMap<ObjectKey, (u32, Instant)> = HashMap::new();
     loop {
         while let Some(done) = copies.try_join_next() {
-            let Ok((key, taken, whole, result)) = done else {
+            let Ok(Done {
+                key,
+                mut taken,
+                base,
+                resumed,
+                outcome,
+            }) = done
+            else {
                 continue;
             };
+            let whole = base.is_empty();
+            // What it took or was taking: the snapshot gone on with, or
+            // one made anew.
+            taken.snapshot = outcome.snapshot;
+            let result = outcome.result;
             running.remove(&key);
             let began = taken.taken_ms.unwrap_or_default();
             let copy = |bytes: u64, error: String| ReplicaCopy {
@@ -359,6 +393,24 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::ac
                         backoff(f.0).as_secs()
                     );
                     let full_needed = e.contains(FULL_NEEDED);
+                    // Cut short: the replica's node kept what it took (an
+                    // agent from before it did not; the next attempt
+                    // finds no token then and starts again).
+                    // Attempts to go on that keep failing without getting
+                    // anywhere (a sending agent from before resuming sends
+                    // a new stream, which is refused) give it up.
+                    let tries = match (resumed, outcome.sent >= PartialCopy::PROGRESS) {
+                        (Some(tries), false) => tries + 1,
+                        _ => 0,
+                    };
+                    let partial =
+                        (!full_needed && !e.contains(NOT_RESUMABLE) && tries < PartialCopy::TRIES)
+                            .then(|| PartialCopy {
+                                snapshot: taken.snapshot.clone(),
+                                base: base.clone(),
+                                from: taken.from.clone(),
+                                tries,
+                            });
                     let attempt = copy(0, e.clone());
                     update(store, &key, |s| match &mut s.replica {
                         Some(now) if now.node == taken.node => {
@@ -373,6 +425,7 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::ac
                             if full_needed {
                                 now.snapshot.clear();
                             }
+                            now.partial = partial.clone();
                             true
                         }
                         _ => false,
@@ -439,6 +492,7 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::ac
                     to,
                     base,
                     snapshot,
+                    resume,
                 } => {
                     let taken = ReplicaStatus {
                         node: to.clone(),
@@ -463,9 +517,10 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::ac
                     // A whole copy takes a while: an operation of its own.
                     let reported = whole.then(|| {
                         let first = status.replica.as_ref().is_none_or(|r| r.copies.is_empty());
-                        let what = match first {
-                            true => "first copy",
-                            false => "whole copy",
+                        let what = match (resume, first) {
+                            (true, _) => "rest of the whole copy",
+                            (false, true) => "first copy",
+                            (false, false) => "whole copy",
                         };
                         activity.begin(
                             legion_api::activity::OperationKind::ReplicaCopy,
@@ -479,16 +534,31 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::ac
                         )
                     });
                     let (hub, k) = (hub.clone(), key.clone());
+                    let resumed = resume.then(|| {
+                        status
+                            .replica
+                            .as_ref()
+                            .and_then(|r| r.partial.as_ref())
+                            .map_or(0, |p| p.tries)
+                    });
                     copies.spawn(async move {
-                        let counter = reported.as_ref().map(|r| r.counter());
-                        let result = copy(&hub, &k, &from, &to, &base, &snapshot, counter).await;
+                        let own = std::sync::atomic::AtomicU64::new(0);
+                        let counter = reported.as_ref().map_or(&own, |r| r.counter());
+                        let outcome =
+                            copy(&hub, &k, &from, &to, &base, &snapshot, resume, counter).await;
                         if let Some(r) = reported {
-                            r.finish(match &result {
+                            r.finish(match &outcome.result {
                                 Ok(_) => Ok(format!("on {to}")),
                                 Err(e) => Err(e.clone()),
                             });
                         }
-                        (k, taken, whole, result)
+                        Done {
+                            key: k,
+                            taken,
+                            base,
+                            resumed,
+                            outcome,
+                        }
                     });
                     running.insert(key, ());
                 }
@@ -498,7 +568,32 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::ac
     }
 }
 
-/// Copies a Volume from the node holding it to its replica's node.
+/// A copy that ended, as `lead` hears of it.
+struct Done {
+    key: ObjectKey,
+    /// The replica as it is once the copy is in.
+    taken: ReplicaStatus,
+    base: String,
+    /// Going on with a copy cut short: the attempts at it that had failed.
+    resumed: Option<u32>,
+    outcome: Outcome,
+}
+
+/// What came of a copy.
+struct Outcome {
+    /// The snapshot it sent: the one asked for, or, going on with a copy
+    /// of which nothing was kept, one made anew.
+    snapshot: String,
+    /// What it sent, whether or not it was taken in.
+    sent: u64,
+    /// What was sent, once taken in.
+    result: Result<u64, String>,
+}
+
+/// Copies a Volume from the node holding it to its replica's node; with
+/// `resume`, goes on with the copy of `snapshot` cut short, or starts it
+/// again under a new snapshot if the replica's node kept nothing of it.
+#[allow(clippy::too_many_arguments)]
 async fn copy(
     hub: &Arc<Hub>,
     key: &ObjectKey,
@@ -506,7 +601,46 @@ async fn copy(
     to: &str,
     base: &str,
     snapshot: &str,
-    counted: Option<&std::sync::atomic::AtomicU64>,
+    resume: bool,
+    counted: &std::sync::atomic::AtomicU64,
+) -> Outcome {
+    let token = match resume {
+        true => match token(hub, key, to).await {
+            Ok(t) => t,
+            Err(e) => {
+                return Outcome {
+                    snapshot: snapshot.to_owned(),
+                    sent: 0,
+                    result: Err(e),
+                };
+            }
+        },
+        false => String::new(),
+    };
+    let snapshot = match resume && token.is_empty() {
+        true => format!("legion-replica-{}", crate::console::now_ms()),
+        false => snapshot.to_owned(),
+    };
+    let result = send(hub, key, from, to, base, &snapshot, token, counted).await;
+    Outcome {
+        snapshot,
+        sent: counted.load(std::sync::atomic::Ordering::Relaxed),
+        result,
+    }
+}
+
+/// Sends `snapshot` (or, with `token`, the rest of it) from `from` to
+/// `to`: what was sent, once taken in.
+#[allow(clippy::too_many_arguments)]
+async fn send(
+    hub: &Arc<Hub>,
+    key: &ObjectKey,
+    from: &str,
+    to: &str,
+    base: &str,
+    snapshot: &str,
+    token: String,
+    counted: &std::sync::atomic::AtomicU64,
 ) -> Result<u64, String> {
     let open = |action| SessionOffer {
         id: legion_pki::random_secret(),
@@ -524,6 +658,7 @@ async fn copy(
                 volume: key.name.clone(),
                 snapshot: snapshot.to_owned(),
                 base: base.to_owned(),
+                resume: !token.is_empty(),
             })),
         )
         .await
@@ -535,6 +670,7 @@ async fn copy(
                 volume: key.name.clone(),
                 snapshot: snapshot.to_owned(),
                 base: base.to_owned(),
+                resume_token: token,
             })),
         )
         .await
@@ -545,10 +681,60 @@ async fn copy(
         &receiver.to_agent,
         from,
         to,
-        counted,
+        Some(counted),
     )
     .await
 }
+
+/// The resume token of the copy of `key` cut short that `node` kept:
+/// empty if it kept none, or if its agent is from before tokens were asked
+/// for (the copy then starts again).
+async fn token(hub: &Arc<Hub>, key: &ObjectKey, node: &str) -> Result<String, String> {
+    let offer = SessionOffer {
+        id: legion_pki::random_secret(),
+        open: Some(SessionOpen {
+            namespace: key.namespace.clone(),
+            action: Some(Action::ReplicaToken(ReplicaToken {
+                volume: key.name.clone(),
+            })),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let asking = async {
+        let mut a = hub
+            .offer(node, offer)
+            .await
+            .map_err(|e| e.message().to_owned())?;
+        let mut out = Vec::new();
+        loop {
+            match a.from_agent.next().await {
+                Some(Ok(SessionFrame {
+                    frame: Some(Frame::Stdout(data)),
+                })) => out.extend_from_slice(&data),
+                Some(Ok(SessionFrame {
+                    frame: Some(Frame::ExitCode(0)),
+                })) => break,
+                Some(Ok(SessionFrame {
+                    frame: Some(Frame::Error(e)),
+                })) if e.message.contains("no action") => return Ok(String::new()),
+                Some(Ok(SessionFrame {
+                    frame: Some(Frame::Error(e)),
+                })) => return Err(format!("node {node}: {}", e.message)),
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => return Err(format!("node {node}: {}", e.message())),
+                None => return Err(format!("node {node}: its session ended early")),
+            }
+        }
+        String::from_utf8(out).map_err(|_| format!("node {node}: a resume token that is not text"))
+    };
+    tokio::time::timeout(TOKEN_WAIT, asking)
+        .await
+        .map_err(|_| format!("node {node}: no resume token in {}s", TOKEN_WAIT.as_secs()))?
+}
+
+/// How long a replica's node has to say what it kept of a copy cut short.
+const TOKEN_WAIT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 mod tests {
@@ -623,7 +809,8 @@ mod tests {
                 from: "n1".into(),
                 to: "n3".into(),
                 base: String::new(),
-                snapshot: "legion-replica-1000".into()
+                snapshot: "legion-replica-1000".into(),
+                resume: false,
             }
         );
         // The spec's node, paused or not.
@@ -649,7 +836,8 @@ mod tests {
                 from: "n1".into(),
                 to: "n2".into(),
                 base: "legion-replica-1000".into(),
-                snapshot: "legion-replica-61000".into()
+                snapshot: "legion-replica-61000".into(),
+                resume: false,
             }
         );
         // After a failure, the backoff; with a node away, a wait.
@@ -854,6 +1042,61 @@ mod tests {
         assert_eq!(
             blockers(&automatic, &s, &nodes, &[stop]),
             ["the last copy was taken on n1 before the data moved: the next is whole"]
+        );
+    }
+
+    /// A copy cut short goes on at once, due or not, from the same
+    /// snapshot, as long as the data is still where it came from; once it
+    /// moved, the next copy is whole and new.
+    #[test]
+    fn a_copy_cut_short_goes_on_while_the_data_stays() {
+        let nodes = [node("n1", true, true), node("n2", true, true)];
+        let mut s = on("n1");
+        let mut r = replica("n2", "legion-replica-1000", "n1", Some(1000));
+        r.partial = Some(PartialCopy {
+            snapshot: "legion-replica-2000".into(),
+            base: "legion-replica-1000".into(),
+            from: "n1".into(),
+            tries: 0,
+        });
+        s.replica = Some(r);
+        // Not due for another minute, but cut short: on with it.
+        assert_eq!(
+            step(&spec(None), &s, &nodes, 2_500, false, &[]),
+            Step::Copy {
+                from: "n1".into(),
+                to: "n2".into(),
+                base: "legion-replica-1000".into(),
+                snapshot: "legion-replica-2000".into(),
+                resume: true,
+            }
+        );
+        // Not while a failure's backoff runs, nor with a node away.
+        assert_eq!(
+            step(&spec(None), &s, &nodes, 2_500, true, &[]),
+            Step::Nothing
+        );
+        let away = [node("n1", true, true), node("n2", false, false)];
+        assert_eq!(
+            step(&spec(None), &s, &away, 2_500, false, &[]),
+            Step::Nothing
+        );
+        // The data moved: whole and new.
+        s.node = "n3".into();
+        let nodes = [
+            node("n1", true, true),
+            node("n2", true, true),
+            node("n3", true, true),
+        ];
+        assert_eq!(
+            step(&spec(None), &s, &nodes, 2_500, false, &[]),
+            Step::Copy {
+                from: "n3".into(),
+                to: "n2".into(),
+                base: String::new(),
+                snapshot: "legion-replica-2500".into(),
+                resume: false,
+            }
         );
     }
 }

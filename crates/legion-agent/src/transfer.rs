@@ -11,10 +11,11 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 use futures::StreamExt;
+use legion_api::volume::NOT_RESUMABLE;
 use legion_proto::v1::session_frame::Frame;
 use legion_proto::v1::{
-    ReplicaReceive, ReplicaSend, SessionFrame, VolumeExport, VolumeImport, VolumeReceive,
-    VolumeSend, VolumeSnapshotAction, VolumeSnapshotResult,
+    ReplicaReceive, ReplicaSend, ReplicaToken, SessionFrame, VolumeExport, VolumeImport,
+    VolumeReceive, VolumeSend, VolumeSnapshotAction, VolumeSnapshotResult,
 };
 use legion_sys::Sys;
 use tokio::sync::{Mutex, mpsc};
@@ -316,7 +317,8 @@ fn replica_snapshot(name: &str) -> bool {
 }
 
 /// Snapshots the Volume and sends it to its replica's node: all of it,
-/// or what changed since `base`.
+/// or what changed since `base`; or goes on with a copy cut short, from
+/// the receiving node's resume token.
 pub(crate) async fn replica_send(
     v: &Volumes,
     namespace: &str,
@@ -331,11 +333,44 @@ pub(crate) async fn replica_send(
     let (out, lock) = (tx.clone(), v.lock.clone());
     crate::task::blocking(&v.sys, move |sys| -> Result<(), String> {
         let mut out = FrameWriter::new(out);
-        replica_give(sys, &lock, &ds, &opts.base, &opts.snapshot, &mut out)?;
+        if opts.resume_token.is_empty() {
+            replica_give(sys, &lock, &ds, &opts.base, &opts.snapshot, &mut out)?;
+        } else {
+            replica_resume(sys, &ds, &opts.snapshot, &opts.resume_token, &mut out)?;
+        }
         out.flush().map_err(|e| e.to_string())
     })
     .await
     .map_err(Status::internal)?;
+    let _ = tx.send(frame(Frame::ExitCode(0))).await;
+    Ok(())
+}
+
+/// The resume token of a copy of the Volume cut short here, if one was
+/// kept: on `stdout`, or nothing.
+pub(crate) async fn replica_token(
+    v: &Volumes,
+    namespace: &str,
+    opts: ReplicaToken,
+    tx: &mpsc::Sender<SessionFrame>,
+) -> Result<(), Status> {
+    let ds = v.dataset(namespace, &opts.volume)?;
+    let token = crate::task::blocking(&v.sys, move |sys| -> Result<Option<String>, String> {
+        let here = sys
+            .zfs_list(&ds)
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|d| d.name == ds);
+        if !here {
+            return Ok(None);
+        }
+        sys.zfs_resume_token(&ds).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(Status::internal)?;
+    if let Some(token) = token {
+        let _ = tx.send(frame(Frame::Stdout(token.into_bytes()))).await;
+    }
     let _ = tx.send(frame(Frame::ExitCode(0))).await;
     Ok(())
 }
@@ -356,14 +391,12 @@ pub(crate) async fn replica_receive(
     let (data, rx) = mpsc::channel::<Result<Vec<u8>, String>>(16);
     let lock = v.lock.clone();
     let work = crate::task::blocking(&v.sys, move |sys| {
-        replica_take(
-            sys,
-            &lock,
-            &ds,
-            &opts.base,
-            &opts.snapshot,
-            &mut FrameReader::new(rx),
-        )
+        let mut input = FrameReader::new(rx);
+        if opts.resume {
+            replica_resumed(sys, &lock, &ds, &opts.snapshot, &mut input)
+        } else {
+            replica_take(sys, &lock, &ds, &opts.base, &opts.snapshot, &mut input)
+        }
     });
     let (result, ()) = tokio::join!(work, feed(inbound, data, "the holding node"));
     result.map_err(Status::internal)?;
@@ -404,9 +437,58 @@ fn replica_give(
         .map_err(|e| e.to_string())
 }
 
+/// Goes on with a copy of `ds@snapshot` cut short, from the receiving
+/// node's resume token: refused unless the token sends just that.
+fn replica_resume(
+    sys: &dyn Sys,
+    ds: &str,
+    snapshot: &str,
+    token: &str,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let wanted = format!("{ds}@{snapshot}");
+    let target = sys
+        .zfs_resume_target(token)
+        .map_err(|e| format!("{NOT_RESUMABLE}: {e}"))?;
+    if target != wanted {
+        return Err(format!("{NOT_RESUMABLE}: it was of {target}, not {wanted}"));
+    }
+    sys.zfs_send_resume(token, out).map_err(|e| e.to_string())
+}
+
+/// Takes the rest of a copy cut short into `ds`, unmounted; then only
+/// `snapshot` stays of the replica's snapshots.
+fn replica_resumed(
+    sys: &dyn Sys,
+    lock: &Mutex<()>,
+    ds: &str,
+    snapshot: &str,
+    input: &mut dyn Read,
+) -> Result<(), String> {
+    sys.zfs_receive_resumable(ds, input)
+        .map_err(|e| e.to_string())?;
+    keep_only(sys, lock, ds, snapshot)
+}
+
+/// Of the replica's snapshots of `ds`, drops all but `snapshot`.
+fn keep_only(sys: &dyn Sys, lock: &Mutex<()>, ds: &str, snapshot: &str) -> Result<(), String> {
+    let _guard = lock.blocking_lock();
+    let snaps = sys.zfs_snapshots(ds).map_err(|e| e.to_string())?;
+    for s in snaps
+        .iter()
+        .filter(|s| replica_snapshot(s) && *s != snapshot)
+    {
+        sys.zfs_destroy(&format!("{ds}@{s}"), false)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Takes into `ds` what `replica_give` wrote, leaving it unmounted; then
 /// only `snapshot` stays of the replica's snapshots. A full copy replaces
-/// what is here; an incremental one needs `base`.
+/// what is here; an incremental one needs `base`, and gives up what was
+/// kept of one cut short. Either keeps what comes of it if it too is cut
+/// short (`zfs receive -s`), for the next attempt to go on from.
 fn replica_take(
     sys: &dyn Sys,
     lock: &Mutex<()>,
@@ -430,6 +512,14 @@ fn replica_take(
                 sys.zfs_destroy(ds, true).map_err(|e| e.to_string())?;
             }
         } else {
+            if here
+                && sys
+                    .zfs_resume_token(ds)
+                    .map_err(|e| e.to_string())?
+                    .is_some()
+            {
+                sys.zfs_receive_abort(ds).map_err(|e| e.to_string())?;
+            }
             let snaps = sys.zfs_snapshots(ds).map_err(|e| e.to_string())?;
             if !snaps.iter().any(|s| s == base) {
                 return Err(format!(
@@ -438,17 +528,9 @@ fn replica_take(
             }
         }
     }
-    sys.zfs_receive(ds, input).map_err(|e| e.to_string())?;
-    let _guard = lock.blocking_lock();
-    let snaps = sys.zfs_snapshots(ds).map_err(|e| e.to_string())?;
-    for s in snaps
-        .iter()
-        .filter(|s| replica_snapshot(s) && *s != snapshot)
-    {
-        sys.zfs_destroy(&format!("{ds}@{s}"), false)
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    sys.zfs_receive_resumable(ds, input)
+        .map_err(|e| e.to_string())?;
+    keep_only(sys, lock, ds, snapshot)
 }
 
 /// Destroys this node's copy of a Volume that lives elsewhere now.
@@ -950,5 +1032,120 @@ mod tests {
         assert!(e.contains("a full copy is needed"), "{e}");
         assert!(replica_snapshot("legion-replica-12") && !replica_snapshot("legion-replica-x"));
         assert!(!replica_snapshot("mine"));
+    }
+
+    /// A replica's copy cut short (the link dropped, a daemon restarted):
+    /// the replica's node keeps what it took, and the next attempt sends
+    /// only the rest, from its resume token, whole or incremental. Seen
+    /// 2026-11-23: a 37 GB copy over a slow link started again from
+    /// nothing at every restart, so never finished.
+    #[test]
+    fn a_copy_cut_short_goes_on_from_where_it_stopped() {
+        let lock = Mutex::new(());
+        let (from, to) = (FakeSys::new(), FakeSys::new());
+        from.zfs_create(DS, &[]).unwrap();
+        to.zfs_create("tank/legion/volumes/shop", &[]).unwrap();
+        from.write_dataset(DS, &[7u8; 1000]);
+
+        // Whole: cut halfway.
+        from.fail_next("zfs send");
+        let mut out = Vec::new();
+        let e = replica_give(&from, &lock, DS, "", "legion-replica-1", &mut out).unwrap_err();
+        assert!(e.contains("Broken pipe"), "{e}");
+        let e =
+            replica_take(&to, &lock, DS, "", "legion-replica-1", &mut out.as_slice()).unwrap_err();
+        assert!(e.contains("incomplete stream"), "{e}");
+        let token = to.zfs_resume_token(DS).unwrap().expect("what came is kept");
+        // Only the rest goes.
+        let mut rest = Vec::new();
+        replica_resume(&from, DS, "legion-replica-1", &token, &mut rest).unwrap();
+        assert!(rest.len() < 600, "{}", rest.len());
+        replica_resumed(&to, &lock, DS, "legion-replica-1", &mut rest.as_slice()).unwrap();
+        assert_eq!(to.zfs_snapshots(DS).unwrap(), ["legion-replica-1"]);
+        assert_eq!(to.dataset_contents(DS).unwrap(), [7u8; 1000]);
+        assert_eq!(to.zfs_resume_token(DS).unwrap(), None);
+
+        // Incremental: cut, then gone on with.
+        from.write_dataset(DS, &[8u8; 1000]);
+        from.fail_next("zfs send");
+        let mut out = Vec::new();
+        replica_give(
+            &from,
+            &lock,
+            DS,
+            "legion-replica-1",
+            "legion-replica-2",
+            &mut out,
+        )
+        .unwrap_err();
+        replica_take(
+            &to,
+            &lock,
+            DS,
+            "legion-replica-1",
+            "legion-replica-2",
+            &mut out.as_slice(),
+        )
+        .unwrap_err();
+        let token = to.zfs_resume_token(DS).unwrap().expect("kept");
+        // A token of another snapshot, or one the holder no longer has, is
+        // refused as not resumable: the next copy starts again.
+        let e = replica_resume(&from, DS, "legion-replica-9", &token, &mut Vec::new()).unwrap_err();
+        assert!(e.contains(NOT_RESUMABLE), "{e}");
+        let mut rest = Vec::new();
+        replica_resume(&from, DS, "legion-replica-2", &token, &mut rest).unwrap();
+        replica_resumed(&to, &lock, DS, "legion-replica-2", &mut rest.as_slice()).unwrap();
+        assert_eq!(to.zfs_snapshots(DS).unwrap(), ["legion-replica-2"]);
+        assert_eq!(to.dataset_contents(DS).unwrap(), [8u8; 1000]);
+
+        // Cut again, but started over: a new incremental gives up what
+        // was kept rather than being refused for it.
+        from.write_dataset(DS, &[9u8; 1000]);
+        from.fail_next("zfs send");
+        let mut out = Vec::new();
+        replica_give(
+            &from,
+            &lock,
+            DS,
+            "legion-replica-2",
+            "legion-replica-3",
+            &mut out,
+        )
+        .unwrap_err();
+        replica_take(
+            &to,
+            &lock,
+            DS,
+            "legion-replica-2",
+            "legion-replica-3",
+            &mut out.as_slice(),
+        )
+        .unwrap_err();
+        let token = to.zfs_resume_token(DS).unwrap().expect("kept");
+        from.zfs_destroy(&format!("{DS}@legion-replica-3"), false)
+            .unwrap();
+        let e = replica_resume(&from, DS, "legion-replica-3", &token, &mut Vec::new()).unwrap_err();
+        assert!(e.contains(NOT_RESUMABLE), "{e}");
+        let mut out = Vec::new();
+        replica_give(
+            &from,
+            &lock,
+            DS,
+            "legion-replica-2",
+            "legion-replica-4",
+            &mut out,
+        )
+        .unwrap();
+        replica_take(
+            &to,
+            &lock,
+            DS,
+            "legion-replica-2",
+            "legion-replica-4",
+            &mut out.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(to.zfs_snapshots(DS).unwrap(), ["legion-replica-4"]);
+        assert_eq!(to.dataset_contents(DS).unwrap(), [9u8; 1000]);
     }
 }

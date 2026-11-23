@@ -210,6 +210,42 @@ pub struct ReplicaStatus {
     /// now; empty when it would, or when its failover is manual.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked: Vec<String>,
+    /// A copy cut short (the link dropped, a daemon restarted) of which the
+    /// replica's node kept what it took: the next attempt goes on from
+    /// there rather than starting again, as long as the data is still on
+    /// `from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<PartialCopy>,
+}
+
+/// What a replica's copy that cannot be resumed says, the agent sending
+/// it to the manager: the next starts again.
+pub const NOT_RESUMABLE: &str = "the copy cut short cannot be resumed";
+
+/// A replica's copy cut short, to go on with.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartialCopy {
+    /// The snapshot it sends.
+    pub snapshot: String,
+    /// The snapshot it sends what changed since; empty for a whole copy.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base: String,
+    /// The node it comes from.
+    pub from: String,
+    /// Attempts to go on with it that failed in a row, moving next to
+    /// nothing: after [`PartialCopy::TRIES`], it is given up and the next
+    /// copy starts again.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tries: u32,
+}
+
+impl PartialCopy {
+    /// Failed attempts to go on, without getting anywhere, before starting
+    /// again.
+    pub const TRIES: u32 = 3;
+    /// What an attempt must move to count as getting somewhere.
+    pub const PROGRESS: u64 = 16 << 20;
 }
 
 /// One copy to a Volume's replica, or an attempt at one.
