@@ -1125,6 +1125,7 @@ impl Follow {
                 let stream = ClusterClient::new(channel)
                     .watch_usage(pb::UsageRequest {
                         namespace: namespace.unwrap_or_default(),
+                        system: false,
                     })
                     .await?
                     .into_inner();
@@ -1565,6 +1566,7 @@ async fn usage(
     let r = ClusterClient::new(channel)
         .usage(pb::UsageRequest {
             namespace: scope.namespace.unwrap_or_default(),
+            system: false,
         })
         .await?
         .into_inner();

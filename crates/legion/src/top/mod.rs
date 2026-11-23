@@ -1384,6 +1384,7 @@ pub async fn once(channel: Channel, namespace: Option<String>) -> anyhow::Result
         .map(|s| s.into_inner());
     let req = pb::UsageRequest {
         namespace: namespace.unwrap_or_default(),
+        system: false,
     };
     if let Ok(u) = cluster.usage(req).await {
         model.usage(u.into_inner());
@@ -1459,6 +1460,7 @@ async fn poll(
         }
         let req = pb::UsageRequest {
             namespace: namespace.clone().unwrap_or_default(),
+            system: false,
         };
         match cluster.usage(req).await {
             Ok(u) => {

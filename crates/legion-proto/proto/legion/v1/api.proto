@@ -582,6 +582,9 @@ message Alert {
 
 message UsageRequest {
   string namespace = 1;
+  // The system namespace's tasks and Volumes too: for the cluster admin
+  // and managers (a follower mirroring the leader's for its metrics).
+  bool system = 2;
 }
 
 message ReachRequest {

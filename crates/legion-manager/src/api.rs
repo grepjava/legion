@@ -368,14 +368,20 @@ impl ApiService {
 
     /// What tasks and nodes use now, as the leader heard it: what
     /// `caller` may read of `namespace` (every namespace when empty).
-    pub(crate) fn usage_seen(&self, caller: &Caller, namespace: &str) -> pb::UsageResponse {
+    pub(crate) fn usage_seen(
+        &self,
+        caller: &Caller,
+        namespace: &str,
+        system: bool,
+    ) -> pb::UsageResponse {
         let mut usage = {
             let mut nodes: BTreeMap<String, Vec<pb::TaskUsage>> = BTreeMap::new();
             for (key, (node, u)) in self.usage.fresh() {
                 let Some((ns, task)) = key.split_once('/') else {
                     continue;
                 };
-                if ns == SYSTEM_NAMESPACE || (!namespace.is_empty() && ns != namespace) {
+                if (ns == SYSTEM_NAMESPACE && !system) || (!namespace.is_empty() && ns != namespace)
+                {
                     continue;
                 }
                 nodes.entry(node).or_default().push(pb::TaskUsage {
@@ -398,7 +404,7 @@ impl ApiService {
                             .volumes
                             .into_iter()
                             .filter(|v| {
-                                v.namespace != SYSTEM_NAMESPACE
+                                (v.namespace != SYSTEM_NAMESPACE || system)
                                     && (namespace.is_empty() || v.namespace == namespace)
                             })
                             .map(|v| pb::VolumeTelemetry {
@@ -973,6 +979,16 @@ fn oidc_response(r: Option<crate::console::OidcRecord>) -> pb::ConsoleOidcRespon
         },
         None => pb::ConsoleOidcResponse::default(),
     }
+}
+
+/// Whether a usage request asks for the system namespace's too, which
+/// only the cluster admin and managers may.
+fn system_usage(req: &Request<pb::UsageRequest>, caller: &Caller) -> Result<bool, Status> {
+    let system = req.get_ref().system;
+    if system {
+        caller.require_all("read the system namespace's usage")?;
+    }
+    Ok(system)
 }
 
 pub(crate) fn forwarded<T>(inner: T) -> Request<T> {
@@ -1902,6 +1918,7 @@ impl Cluster for ApiService {
         let caller = self.caller(&req)?;
         let namespace = req.get_ref().namespace.clone();
         check_namespace(&namespace)?;
+        let system = system_usage(&req, &caller)?;
         // Only the leader hears heartbeats; it checks the user's rights.
         if let Some(addr) = self.leader_addr(&req)? {
             let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
@@ -1914,7 +1931,7 @@ impl Cluster for ApiService {
         if !namespace.is_empty() {
             caller.check(&self.store, Verb::Read, Kind::Task, &namespace)?;
         }
-        Ok(Response::new(self.usage_seen(&caller, &namespace)))
+        Ok(Response::new(self.usage_seen(&caller, &namespace, system)))
     }
 
     type WatchUsageStream = ReceiverStream<Result<pb::UsageResponse, Status>>;
@@ -1926,6 +1943,7 @@ impl Cluster for ApiService {
         let caller = self.caller(&req)?;
         let namespace = req.get_ref().namespace.clone();
         check_namespace(&namespace)?;
+        let system = system_usage(&req, &caller)?;
         // Only the leader hears heartbeats: followed there, passed on.
         if let Some(addr) = self.leader_addr(&req)? {
             let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
@@ -1954,7 +1972,7 @@ impl Cluster for ApiService {
             |_| None,
             move |api| {
                 let (caller, namespace) = (caller.clone(), namespace.clone());
-                async move { Ok(api.usage_seen(&caller, &namespace)) }
+                async move { Ok(api.usage_seen(&caller, &namespace, system)) }
             },
         )))
     }

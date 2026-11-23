@@ -1,7 +1,10 @@
 //! The manager's metrics, for Prometheus. Every manager reports the API
-//! requests it answered and its own view of Raft; only the leader reports the cluster's objects, tasks,
-//! nodes and quotas, so summing a metric across managers counts each thing
-//! once, and what is reported is what the controllers act on.
+//! requests it answered and its own view of Raft, and, once it is in a
+//! cluster with a leader, the cluster's objects, tasks, nodes, quotas and
+//! storage: from its own replica of the store, and the agents' reports as
+//! the leader, which hears them, last sent them (`mirror`). So any one
+//! manager's metrics show the whole cluster, whichever leads; summed across
+//! managers, the cluster's count once per manager.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
@@ -87,7 +90,9 @@ impl ManagerMetrics {
                 lag.sample(&[("manager", &peer.to_string())], behind as f64);
             }
         }
-        if leader {
+        // Outside a cluster, or while it has no leader, there is no cluster
+        // to report: a manager before init, or one cut off.
+        if r.current_leader.is_some() {
             match cluster(store, &mut m) {
                 Ok(()) => {}
                 Err(e) => tracing::warn!("reading the store for metrics: {e}"),
@@ -100,7 +105,8 @@ impl ManagerMetrics {
 
 /// What each node's agent last reported of its ZFS pool and of each ZFS
 /// Volume on it (with its heartbeats, within the last minute), and the
-/// size each Volume asks for. On the leader, which the agents report to.
+/// size each Volume asks for. The agents report to the leader; a follower
+/// has what the leader last sent it.
 fn storage(store: &Store, usage: &crate::usage::Usage, m: &mut Metrics) {
     reported_storage(&usage.fresh_nodes(), m);
     sizes(store, m);

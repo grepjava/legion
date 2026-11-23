@@ -2627,6 +2627,7 @@ async fn usage_shows_what_the_caller_may_read() {
     let usage = |mut c: ClusterClient<Channel>, namespace: &str| {
         let req = legion_proto::v1::UsageRequest {
             namespace: namespace.into(),
+            system: false,
         };
         async move { c.usage(req).await }
     };
@@ -2664,6 +2665,7 @@ async fn usage_shows_what_the_caller_may_read() {
         .clone()
         .watch_usage(legion_proto::v1::UsageRequest {
             namespace: String::new(),
+            system: false,
         })
         .await
         .unwrap()
@@ -2689,6 +2691,7 @@ async fn usage_shows_what_the_caller_may_read() {
         alice
             .watch_usage(legion_proto::v1::UsageRequest {
                 namespace: "b".into(),
+                system: false,
             })
             .await,
     );
@@ -7251,6 +7254,149 @@ async fn leadership_is_handed_on_with_nothing_down() {
     first.stop().await;
 }
 
+/// Every manager reports the cluster, whichever leads: its objects from
+/// the manager's own replica, and what the agents report (heard by the
+/// leader alone) as the leader last sent it. A scraper of one manager lost
+/// the cluster's metrics while another led (seen 2026-11-23: Jax's System
+/// page, scraping the Ryzen, went blank while weft led). The system
+/// namespace's usage, which a follower asks for, is the admin's and the
+/// managers' alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_manager_reports_the_cluster_whichever_leads() {
+    let ca = Ca::generate().unwrap();
+    let first = Running::start_with(Some(&ca)).await;
+    first.cluster().await.init(InitRequest {}).await.unwrap();
+    let token = first
+        .cluster()
+        .await
+        .join_token(JoinTokenRequest {
+            role: "manager".into(),
+            rotate: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    let admin = creds(&ca, "admin", Role::Admin);
+    let second = Running::join(&first.addr, &token, "m2", admin.clone()).await;
+    let objects = first.objects().await;
+    eventually(|| {
+        let mut c = objects.clone();
+        async move { c.apply(apply(service("web", 1))).await }
+    })
+    .await;
+
+    // A worker heartbeating with its pool's space, through the follower.
+    let w1 = creds(&ca, "w1", Role::Worker);
+    let d1 = DispatcherClient::new(second.channel(Some(&w1)).await.unwrap());
+    eventually(|| {
+        let mut d = d1.clone();
+        async move {
+            d.register(RegisterRequest {
+                node: String::new(),
+                status_json: br#"{"state":"ready"}"#.to_vec(),
+                ..Default::default()
+            })
+            .await
+        }
+    })
+    .await;
+    let beating = {
+        let d1 = d1.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = d1
+                    .clone()
+                    .heartbeat(HeartbeatRequest {
+                        node: String::new(),
+                        telemetry: Some(legion_proto::v1::NodeTelemetry {
+                            zfs_used_bytes: 1234,
+                            zfs_avail_bytes: 5678,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    })
+                    .await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+    };
+    let reports = |m: &Running| {
+        let text = m.metrics.collect().finish();
+        text.contains("\nlegion_objects{kind=\"Service\",namespace=\"default\"} 1\n")
+            && text.contains("\nlegion_node_zfs_used_bytes{node=\"w1\"} 1234\n")
+            && text.contains("\nlegion_node_zfs_available_bytes{node=\"w1\"} 5678\n")
+    };
+    until("the leader and the follower report the cluster", || {
+        reports(&first) && reports(&second)
+    })
+    .await;
+    let follower = second.metrics.collect().finish();
+    assert!(follower.contains("\nlegion_raft_leader 0\n"), "{follower}");
+    assert!(!follower.contains("legion_raft_follower_lag"), "{follower}");
+
+    // Leadership handed on: the old leader, now following, still reports
+    // it all, the agents' reports included. (The leader learns the
+    // managers' names in passes.)
+    let mut c = first.cluster().await;
+    let first_name = manager_name(&first.addr);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let second_name = loop {
+        let r = availability(&mut c, "").await;
+        if let Some(m) = r
+            .managers
+            .iter()
+            .find(|m| m.name != first_name && !m.name.starts_with('#'))
+        {
+            break m.name.clone();
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{r:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let r = c
+        .lead(legion_proto::v1::LeadRequest { node: second_name })
+        .await
+        .unwrap()
+        .into_inner();
+    eprintln!("handed on in {} ms", r.took_ms);
+    let second_id = second.store.raft.metrics().borrow().id;
+    until("the first follows the second", || {
+        first.store.raft.metrics().borrow().current_leader == Some(second_id)
+    })
+    .await;
+    until("both report the cluster again", || {
+        reports(&first) && reports(&second)
+    })
+    .await;
+    assert!(
+        first
+            .metrics
+            .collect()
+            .finish()
+            .contains("\nlegion_raft_leader 0\n")
+    );
+
+    // The system namespace's usage: refused to a user, at either manager.
+    for m in [&first, &second] {
+        let mut alice = ClusterClient::new(
+            m.channel(Some(&creds(&ca, "alice", Role::User)))
+                .await
+                .unwrap(),
+        );
+        denied(
+            alice
+                .usage(legion_proto::v1::UsageRequest {
+                    namespace: String::new(),
+                    system: true,
+                })
+                .await,
+        );
+    }
+    beating.abort();
+    second.stop().await;
+    first.stop().await;
+}
+
 /// A manager stops however its connections behave: a stream it passes on
 /// from the leader ends with it, and a connection gone quiet (as one
 /// half-open through a NAT does) is closed once the shutdown's grace is
@@ -7285,6 +7431,7 @@ async fn a_manager_stops_with_streams_and_quiet_connections_open() {
         .await
         .watch_usage(legion_proto::v1::UsageRequest {
             namespace: String::new(),
+            system: false,
         })
         .await
         .unwrap()

@@ -36,6 +36,11 @@ pub struct Usage {
     /// Counts the reports taken, so those who follow usage (WatchUsage)
     /// look again when one comes rather than asking on a timer.
     reported: tokio::sync::watch::Sender<u64>,
+    /// On a follower, the nodes' telemetry as the leader last sent it
+    /// (`mirror::run`), the agents reporting to the leader alone: kept as
+    /// sent, the leader sending it again when it changes, and dropped when
+    /// the follower stops following.
+    mirrored: Mutex<BTreeMap<String, NodeTelemetry>>,
 }
 
 /// Host ZFS & network sample at a moment, in milliseconds since the epoch.
@@ -243,30 +248,38 @@ impl Usage {
         self.taken();
     }
 
-    /// Fresh host & volume telemetry by node name.
+    /// Fresh host & volume telemetry by node name: what the agents
+    /// reported here, over what was mirrored from the leader.
     pub fn fresh_nodes(&self) -> BTreeMap<String, NodeTelemetry> {
         let now = Instant::now();
-        self.nodes
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, (at, _))| now.duration_since(*at) < FRESH)
-            .map(|(n, (_, t))| (n.clone(), t.clone()))
-            .collect()
+        let mut out = self.mirrored.lock().unwrap().clone();
+        out.extend(
+            self.nodes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, (at, _))| now.duration_since(*at) < FRESH)
+                .map(|(n, (_, t))| (n.clone(), t.clone())),
+        );
+        out
+    }
+
+    /// Takes the leader's node telemetry as it sent it, all of it, in
+    /// place of what it sent before; none once the follower stops
+    /// following.
+    pub fn mirror(&self, nodes: BTreeMap<String, NodeTelemetry>) {
+        *self.mirrored.lock().unwrap() = nodes;
     }
 
     /// Fresh `(used_bytes, avail_bytes)` by `namespace/volume`.
     pub fn volume_space(&self) -> HashMap<String, (u64, u64)> {
-        let now = Instant::now();
         let mut out = HashMap::new();
-        for (at, t) in self.nodes.lock().unwrap().values() {
-            if now.duration_since(*at) < FRESH {
-                for v in &t.volumes {
-                    out.insert(
-                        format!("{}/{}", v.namespace, v.volume),
-                        (v.used_bytes, v.avail_bytes),
-                    );
-                }
+        for t in self.fresh_nodes().values() {
+            for v in &t.volumes {
+                out.insert(
+                    format!("{}/{}", v.namespace, v.volume),
+                    (v.used_bytes, v.avail_bytes),
+                );
             }
         }
         out

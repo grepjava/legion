@@ -38,6 +38,7 @@ pub mod join;
 pub mod logsearch;
 mod managers;
 pub mod metrics;
+mod mirror;
 mod migrate;
 mod notify;
 mod oidc;
@@ -444,6 +445,7 @@ impl Manager {
         };
         let names = tokio::spawn(managers::run(api.clone(), api.closing.clone()));
         let keeping = tokio::spawn(history::run(api.clone()));
+        let mirroring = tokio::spawn(mirror::run(api.clone()));
         let builds = self.controllers.then(|| {
             tokio::spawn(build::run(
                 api.clone(),
@@ -596,6 +598,7 @@ impl Manager {
         ended("floor", floor).await;
         ended("names", names).await;
         ended("keeping", keeping).await;
+        ended("mirroring", mirroring).await;
         ended("alerting", alerting).await;
         ended("notifying", notifying).await;
         ended("eventing", eventing).await;
