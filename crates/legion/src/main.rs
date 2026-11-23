@@ -930,9 +930,19 @@ pub enum NodeCommand {
     /// on. It joins Raft as a learner and votes once caught up.
     Promote { node: String },
     /// Make a manager a worker, in place: it leaves the Raft membership
-    /// (never the last voter), gives up the CA key and its store, and its
-    /// daemon starts again as a worker, its tasks running on.
-    Demote { node: String },
+    /// (never the last voter, nor the last that may lead), gives up the CA
+    /// key and its store, and its daemon starts again as a worker, its
+    /// tasks running on. Asks the leader first what it leaves the managers
+    /// with (an election if it leads, fewer than three voters).
+    Demote {
+        node: String,
+        /// Print what it would do and change nothing; exits 1 if it blocks.
+        #[arg(long)]
+        dry_run: bool,
+        /// Demote even if the check finds it would block.
+        #[arg(long)]
+        force: bool,
+    },
     /// Set labels (`key=value`) or remove them (`key-`), for placement
     /// constraints and preferences; `legion.ingress=true` marks a node
     /// that serves HTTPS routes (see the README).

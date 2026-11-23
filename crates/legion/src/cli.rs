@@ -1026,7 +1026,7 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
         Command::Node {
             command:
                 ref command @ (crate::NodeCommand::Promote { ref node }
-                | crate::NodeCommand::Demote { ref node }),
+                | crate::NodeCommand::Demote { ref node, .. }),
         } => {
             let role = match command {
                 crate::NodeCommand::Promote { .. } => "manager",
@@ -2077,6 +2077,14 @@ fn disruption(command: &Command) -> anyhow::Result<Option<(Change, bool, bool)>>
                     ..
                 },
         } => Some((Change::Drain { node: node.clone() }, *dry_run, *force)),
+        Command::Node {
+            command:
+                crate::NodeCommand::Demote {
+                    node,
+                    dry_run,
+                    force,
+                },
+        } => Some((Change::Demote { node: node.clone() }, *dry_run, *force)),
         Command::Volume {
             command:
                 crate::VolumeCommand::Move {
