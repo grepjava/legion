@@ -212,6 +212,49 @@ spec:
     let back = volume_named(&lab, "data-back");
     assert_eq!(back["status"]["node"], "n3", "{back}");
 
+    // A backup cut short (its SSH connection killed as it sends): n3 keeps
+    // what came, its resume token says so, and a later run goes on from
+    // there; none is left once it has.
+    let tokens = || {
+        let out = lab.on(
+            "n3",
+            &format!("zfs get -H -o name,value -r -t filesystem receive_resume_token {BK_DATASET}"),
+        );
+        text(&out.stdout)
+            .lines()
+            .filter(|l| l.split('\t').nth(1).is_some_and(|t| t.starts_with("1-")))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let out = lab.on(
+        "n2",
+        &format!(
+            "set -e
+            dd if=/dev/urandom of=\"$(zfs get -H -o value mountpoint {dataset})/ballast\" bs=1m count=300 2>/dev/null
+            i=0
+            until pgrep -qf 'ssh .*zfs receive -s -u {BK_DATASET}'; do
+                i=$((i + 1)); [ $i -lt 3000 ] || {{ echo 'no backup came' >&2; exit 3; }}
+                sleep 0.1
+            done
+            sleep 1
+            pkill -KILL -f 'ssh .*zfs receive -s -u {BK_DATASET}'"
+        ),
+    );
+    assert!(out.status.success(), "cutting a backup short: {}", text(&out.stderr));
+    lab.wait_or_report("what came of the backup cut short kept on n3", 60, || {
+        !tokens().is_empty()
+    });
+    eprintln!("kept on n3: {:?}", tokens());
+    let cut_runs = volume(&lab)["status"]["backup"]["runs"]
+        .as_array()
+        .map_or(0, Vec::len);
+    lab.wait_or_report("the backup cut short gone on with", 420, || {
+        let runs = volume(&lab)["status"]["backup"]["runs"].as_array().cloned().unwrap_or_default();
+        tokens().is_empty()
+            && runs.len() > cut_runs
+            && runs.last().is_some_and(|r| r["error"].as_str().unwrap_or("").is_empty())
+    });
+
     // To a directory on n2: a file a backup, whole.
     apply(&lab, &app("local"));
     lab.wait_or_report("two backups as files on n2", 300, || {
