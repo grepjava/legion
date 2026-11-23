@@ -167,7 +167,9 @@ export async function duplicateService(s: LObject, node: string, scene: Scene) {
       await api.volumeSnapshotOp(ns, v, 'clone', snap, copies[i]);
       await api.set('Volume', ns, copies[i], 'node', node);
     }
-    const spec = structuredClone(s.spec) as Record<string, any>;
+    // A plain copy: what the page holds is a reactive proxy, which
+    // structuredClone refuses.
+    const spec = $state.snapshot(s.spec) as Record<string, any>;
     // Its own data: each Volume it mounts, the copy made of it.
     for (const pv of (spec.pod?.volumes ?? []) as { volume?: { name: string } }[]) {
       const i = vols.indexOf(pv.volume?.name ?? '');
