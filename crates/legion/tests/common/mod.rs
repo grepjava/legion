@@ -57,6 +57,10 @@ impl Vm {
 pub enum Role {
     Manager,
     Worker,
+    /// A manager that votes but runs no tasks and never leads
+    /// (`legion join --witness`, docs/HA.md).
+    #[allow(dead_code)]
+    Witness,
 }
 
 /// A throwaway pool, `llab`, backed by a file in `/var/tmp`.
@@ -355,6 +359,7 @@ impl Lab {
         let addr = format!("{}:{PORT}", vm.addr);
         let join = match role {
             Role::Manager => format!("--advertise {addr}"),
+            Role::Witness => format!("--advertise {addr} --witness"),
             Role::Worker => String::new(),
         };
         let cmd = format!(
@@ -388,7 +393,7 @@ impl Lab {
         let vm = &self.vms[i];
         let addr = format!("{}:{PORT}", vm.addr);
         let daemon = match role {
-            Role::Manager => format!("--listen {addr} --advertise {addr}"),
+            Role::Manager | Role::Witness => format!("--listen {addr} --advertise {addr}"),
             Role::Worker => format!("--advertise {}", vm.addr),
         };
         format!(

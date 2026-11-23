@@ -146,6 +146,7 @@ test legion console the_console_builds_an_example host cluster 3600 env:LEGION_C
 test legion teams two_teams_share_a_cluster host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
 test legion ca the_ca_rotates_with_every_node_on_it host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
 test legion roles a_worker_and_a_manager_change_roles_in_place host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
+test legion witness a_witness_keeps_the_quorum_and_a_full_manager_takes_over host cluster 1800 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
 test legion balancer a_load_balancer_address_answers_and_moves host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY kld:carp
 test legion cluster the_cluster_upgrades_one_node_at_a_time host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_PREVIOUS
 test legion notify a_node_down_reaches_a_webhook_once_across_a_change_of_leader host cluster 1800 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY

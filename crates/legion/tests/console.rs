@@ -975,6 +975,80 @@ spec:
         "the page's policy let an inline script run"
     );
 
+    step("phase 6: single points of failure fixed from the Availability page");
+    // Two tasks held to one node and published without a load balancer
+    // address: a finding each, each put right by its form.
+    let pinned = c.lab.dir.join("pinned.yaml");
+    std::fs::write(
+        &pinned,
+        format!(
+            r#"apiVersion: legion/v1
+kind: Service
+metadata: {{ name: pinned, namespace: team-a }}
+spec:
+  replicas: 2
+  placement: {{ constraints: ["node.name == n2"] }}
+  pod:
+    containers:
+      - name: c
+        image: {IMAGE}
+        command: [/bin/sleep, "86400"]
+  endpoint:
+    ports: [{{ port: 80, publishedPort: 18090, publish: ingress }}]
+"#
+        ),
+    )
+    .unwrap();
+    c.lab.ok(&["apply", "-f", pinned.to_str().unwrap()]);
+    wait("pinned's two tasks on n2", 300, || {
+        c.lab.placed("team-a", "pinned") == ["n2", "n2"]
+    });
+    let fix = |b: &mut Browser, says: &str| {
+        c.page(b, "/availability?ns=team-a");
+        b.shows(says, 60);
+        let opened = b.eval(&format!(
+            "(() => {{ const row = [...document.querySelectorAll('main tbody tr')]
+                 .find((r) => r.innerText.includes('Service team-a/pinned') && r.innerText.includes({says:?}));
+               const fix = row && [...row.querySelectorAll('button')].find((x) => x.innerText.trim() === 'Fix');
+               if (fix) fix.click(); return !!fix; }})()"
+        ));
+        assert_eq!(opened, Value::Bool(true), "a Fix for {says:?}");
+    };
+    let spec = |c: &Console| -> Value {
+        serde_json::from_str(
+            &c.lab
+                .ok(&["get", "service", "pinned", "-n", "team-a", "-o", "json"]),
+        )
+        .map(|o: Value| o["spec"].clone())
+        .unwrap_or_default()
+    };
+    // Its tasks all on one node: kept apart from each other.
+    fix(&mut a, "All its tasks run on node n2");
+    a.click("Review the change");
+    a.shows("What would change", 30);
+    a.click("Save");
+    wait("pinned kept apart from itself", 30, || {
+        spec(&c)["placement"]["antiAffinity"] == serde_json::json!([{ "service": "pinned" }])
+    });
+    // Published on every node: given a load balancer address.
+    let lb = format!("{}.240", c.lab.host.rsplit_once('.').unwrap().0);
+    fix(&mut a, "Published on port 18090");
+    a.fill("Load balancer address", &lb);
+    a.fill("CARP vhid (1 to 255)", "211");
+    a.click("Review the change");
+    a.shows("What would change", 30);
+    a.click("Save");
+    wait("pinned given a load balancer address", 30, || {
+        spec(&c)["endpoint"]["loadBalancer"] == serde_json::json!({ "address": lb, "vhid": 211 })
+    });
+    c.page(&mut a, "/availability?ns=team-a");
+    a.until("the published finding gone", 60, |b| {
+        let t = b.text();
+        t.contains("Service team-a/pinned") && !t.contains("Published on port 18090")
+            || !t.contains("Service team-a/pinned")
+    });
+    c.lab.ok(&["delete", "service", "pinned", "-n", "team-a"]);
+
     step("phase 6: cut off, the page says it is not current; back, it stops saying so");
     a.page("Network.enable", serde_json::json!({}));
     let offline = |b: &mut Browser, offline: bool| {
