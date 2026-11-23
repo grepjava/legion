@@ -620,7 +620,7 @@ pub(crate) async fn record(store: &Store, name: &str, change: impl Fn(&mut Recei
             object: o,
             precondition: Precondition::Version(version),
         };
-        match tokio::time::timeout(crate::COMMIT_TIMEOUT, store.raft.client_write(command)).await {
+        match tokio::time::timeout(crate::COMMIT_TIMEOUT, store.client_write(command)).await {
             Ok(Ok(out)) => match out.data {
                 Outcome::Written(_) => return,
                 Outcome::Conflict { .. } => continue,

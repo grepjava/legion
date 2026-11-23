@@ -566,6 +566,13 @@ impl ApiService {
 
     async fn linearize(&self) -> Result<(), Status> {
         let Some(leader) = self.leader_addr(&Request::new(()))? else {
+            // Confirming would reach the followers, which must hear
+            // nothing while leadership is handed on.
+            if self.store.hushed() {
+                return Err(Status::unavailable(
+                    "leadership is being handed to another manager; retry in a few seconds",
+                ));
+            }
             return self
                 .store
                 .raft
@@ -585,10 +592,9 @@ impl ApiService {
     }
 
     pub(crate) async fn write(&self, cmd: Command) -> Result<Outcome, Status> {
-        let written =
-            tokio::time::timeout(crate::COMMIT_TIMEOUT, self.store.raft.client_write(cmd))
-                .await
-                .map_err(|_| crate::no_quorum())?;
+        let written = tokio::time::timeout(crate::COMMIT_TIMEOUT, self.store.client_write(cmd))
+            .await
+            .map_err(|_| crate::no_quorum())?;
         match written {
             Ok(resp) => Ok(resp.data),
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ForwardToLeader {
@@ -1141,6 +1147,11 @@ impl ApiService {
             return Ok(());
         };
         tracing::info!(manager = name, id, "removing a manager from the membership");
+        if self.store.hushed() {
+            return Err(Status::unavailable(
+                "leadership is being handed to another manager; retry in a few seconds",
+            ));
+        }
         let changed = self.store.raft.change_membership(change, false);
         tokio::time::timeout(crate::COMMIT_TIMEOUT, changed)
             .await
@@ -1625,6 +1636,89 @@ impl Cluster for ApiService {
         }
         .await;
         self.audit_end(audit, result)
+    }
+
+    async fn lead(
+        &self,
+        req: Request<pb::LeadRequest>,
+    ) -> Result<Response<pb::LeadResponse>, Status> {
+        let audit = self.audit_point(
+            &req,
+            "lead",
+            crate::audit::target("Node", "", &req.get_ref().node),
+        );
+        let result = async {
+            self.caller(&req)?.require_all("hand leadership on")?;
+            if let Some(addr) = self.leader_addr(&req)? {
+                let mut c = legion_proto::v1::cluster_client::ClusterClient::new(connect_lazy(
+                    &addr,
+                    self.peer_tls.as_ref(),
+                ));
+                return c.lead(forwarded(req.into_inner())).await;
+            }
+            let node = req.into_inner().node;
+            if node == self.name {
+                return Err(Status::already_exists(format!("{node} leads already")));
+            }
+            let id = crate::managers::id_of(&self.store, &node)?.ok_or_else(|| {
+                Status::not_found(format!(
+                    "no manager {node} (a worker, or not known by name yet)"
+                ))
+            })?;
+            if crate::managers::witnesses(&self.store)?.contains(&id) {
+                return Err(Status::failed_precondition(format!(
+                    "{node} is a witness: it never leads"
+                )));
+            }
+            let addr = {
+                let m = self.store.raft.metrics().borrow().clone();
+                let membership = m.membership_config.membership();
+                if !membership.voter_ids().any(|v| v == id) {
+                    return Err(Status::failed_precondition(format!(
+                        "{node} does not vote yet: it can't be elected"
+                    )));
+                }
+                membership
+                    .nodes()
+                    .find(|(n, _)| **n == id)
+                    .map(|(_, n)| n.addr.clone())
+                    .unwrap_or_default()
+            };
+            let took = crate::lead::hand_over(self, id, &addr).await?;
+            Ok(Response::new(pb::LeadResponse {
+                leader: node,
+                took_ms: took.as_millis() as u64,
+            }))
+        }
+        .await;
+        self.audit_end(audit, result)
+    }
+
+    async fn campaign(
+        &self,
+        req: Request<pb::CampaignRequest>,
+    ) -> Result<Response<pb::CampaignResponse>, Status> {
+        // The leader handing leadership on, by its manager's certificate.
+        match crate::tls::caller(&req, self.peer_tls.is_some())? {
+            Some(id) if id.role == Role::Manager => {}
+            _ => {
+                return Err(Status::permission_denied(
+                    "only a manager asks another to stand",
+                ));
+            }
+        }
+        if self.witness {
+            return Err(Status::failed_precondition(
+                "a witness never stands for leader",
+            ));
+        }
+        self.store
+            .raft
+            .trigger()
+            .elect()
+            .await
+            .map_err(|e| Status::unavailable(e.to_string()))?;
+        Ok(Response::new(pb::CampaignResponse {}))
     }
 
     async fn demote(
@@ -3036,6 +3130,14 @@ impl ApiService {
             name: self.name.clone(),
             ca_issuer: crate::ca::own_issuer(self),
             witness: self.witness,
+            leader_name: match m.current_leader {
+                Some(id) if id == self.id => self.name.clone(),
+                Some(id) => crate::managers::names(&self.store)
+                    .ok()
+                    .and_then(|n| n.get(&id).cloned())
+                    .unwrap_or_default(),
+                None => String::new(),
+            },
         })
     }
 }

@@ -370,6 +370,12 @@ impl raft_server::Raft for RaftService {
     }
 
     async fn read_index(&self, _: Request<RaftPayload>) -> Result<Response<RaftPayload>, Status> {
+        // Handing leadership on: confirming would reach the followers.
+        if self.store.hushed() {
+            return encode(Err::<Option<u64>, String>(
+                "leadership is being handed to another manager; retry in a few seconds".into(),
+            ));
+        }
         // Confirmed with a quorum: a deposed leader answers with an error.
         let read: Result<Option<u64>, String> = self
             .store

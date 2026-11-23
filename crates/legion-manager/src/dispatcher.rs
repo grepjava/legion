@@ -951,6 +951,11 @@ impl DispatcherService {
     /// Has a majority of managers confirm this one leads, now: true if they
     /// did within the lease.
     async fn confirm_now(&self) -> bool {
+        // Handing leadership on: the followers must hear nothing, and a
+        // heartbeat goes unanswered for those few seconds.
+        if self.store().hushed() {
+            return false;
+        }
         let began = Instant::now();
         let raft = &self.store().raft;
         let confirmed = matches!(

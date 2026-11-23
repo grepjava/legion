@@ -150,7 +150,7 @@ async fn raise(store: &Store, to: u32) {
             return;
         }
     };
-    let write = store.raft.client_write(Command::Put {
+    let write = store.client_write(Command::Put {
         object,
         precondition,
     });

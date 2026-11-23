@@ -7078,3 +7078,175 @@ async fn a_witness_votes_but_never_leads() {
     witness.stop().await;
     second.stop().await;
 }
+
+/// Leadership handed on with nothing brought down (`legion node lead`,
+/// docs/HA.md): the leader goes quiet until the others' leases on it run
+/// out, then the manager asked for stands and is elected. A worker
+/// heartbeating throughout is never marked down; the witness never leads;
+/// writes go on after; and it goes back the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leadership_is_handed_on_with_nothing_down() {
+    let ca = Ca::generate().unwrap();
+    let first = Running::start_with(Some(&ca)).await;
+    first.cluster().await.init(InitRequest {}).await.unwrap();
+    let token = first
+        .cluster()
+        .await
+        .join_token(JoinTokenRequest {
+            role: "manager".into(),
+            rotate: false,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    let admin = creds(&ca, "admin", Role::Admin);
+    let second = Running::join(&first.addr, &token, "m2", admin.clone()).await;
+    let witness = join_witness(&first.addr, &token, "w", admin.clone()).await;
+    let id = |m: &Running| m.store.raft.metrics().borrow().id;
+    let leads = |m: &Running| m.store.raft.metrics().borrow().current_leader;
+    // Three voters, each known by name (the leader learns names in passes).
+    let mut c = first.cluster().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let managers = loop {
+        let r = availability(&mut c, "").await;
+        if r.managers.iter().filter(|m| m.voter).count() == 3
+            && r.managers.iter().all(|m| !m.name.starts_with('#'))
+        {
+            break r.managers;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{r:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let first_name = manager_name(&first.addr);
+    let second_name = managers
+        .iter()
+        .find(|m| m.name != first_name && !m.witness)
+        .expect("the second manager")
+        .name
+        .clone();
+
+    // A worker heartbeating throughout, as an agent does.
+    let w1 = creds(&ca, "w1", Role::Worker);
+    let d1 = DispatcherClient::new(second.channel(Some(&w1)).await.unwrap());
+    eventually(|| {
+        let mut d = d1.clone();
+        async move {
+            d.register(RegisterRequest {
+                node: String::new(),
+                status_json: br#"{"state":"ready"}"#.to_vec(),
+                ..Default::default()
+            })
+            .await
+        }
+    })
+    .await;
+    let beating = {
+        let d1 = d1.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = d1
+                    .clone()
+                    .heartbeat(HeartbeatRequest {
+                        node: String::new(),
+                        ..Default::default()
+                    })
+                    .await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+    };
+    until("w1 ready", || {
+        node_state(&first, "w1").as_deref() == Some("ready")
+    })
+    .await;
+
+    // Refused: to a witness, to the leader itself, by a user.
+    let err = c
+        .lead(legion_proto::v1::LeadRequest { node: "w".into() })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+    let err = c
+        .lead(legion_proto::v1::LeadRequest {
+            node: first_name.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::AlreadyExists, "{err}");
+    let mut alice = ClusterClient::new(
+        first
+            .channel(Some(&creds(&ca, "alice", Role::User)))
+            .await
+            .unwrap(),
+    );
+    denied(
+        alice
+            .lead(legion_proto::v1::LeadRequest {
+                node: second_name.clone(),
+            })
+            .await,
+    );
+
+    // Handed to the second manager.
+    assert_eq!(leads(&first), Some(id(&first)));
+    let r = c
+        .lead(legion_proto::v1::LeadRequest {
+            node: second_name.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(r.leader, second_name);
+    eprintln!("handed to {second_name} in {} ms", r.took_ms);
+    // At least the followers' lease (`quick_raft`: 3 s), and not much more.
+    assert!((3000..15_000).contains(&r.took_ms), "{r:?}");
+    // Each hears of it with the new leader's first message.
+    until("every manager follows the new leader", || {
+        [&first, &second, &witness]
+            .iter()
+            .all(|m| leads(m) == Some(id(&second)))
+    })
+    .await;
+    let status = witness
+        .cluster()
+        .await
+        .status(StatusRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(status.leader_name, second_name, "{status:?}");
+    // The worker was never marked down, and stays ready.
+    assert_eq!(node_state(&first, "w1").as_deref(), Some("ready"));
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(node_state(&second, "w1").as_deref(), Some("ready"));
+    // Writes go on, through the old leader too.
+    let through = first.objects().await;
+    eventually(|| {
+        let mut c = through.clone();
+        async move { c.apply(apply(service("after", 1))).await }
+    })
+    .await;
+
+    // And back.
+    let r = second
+        .cluster()
+        .await
+        .lead(legion_proto::v1::LeadRequest {
+            node: first_name.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(r.leader, first_name);
+    eprintln!("handed back to {first_name} in {} ms", r.took_ms);
+    until("the witness follows it", || {
+        leads(&witness) == Some(id(&first))
+    })
+    .await;
+    assert_eq!(node_state(&first, "w1").as_deref(), Some("ready"));
+    beating.abort();
+    witness.stop().await;
+    second.stop().await;
+    first.stop().await;
+}

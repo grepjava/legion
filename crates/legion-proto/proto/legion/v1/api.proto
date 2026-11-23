@@ -135,6 +135,16 @@ service Cluster {
   // the node's daemon takes it up, in place, its tasks running on. The
   // cluster admin's only.
   rpc ChangeRole(ChangeRoleRequest) returns (ChangeRoleResponse);
+  // Hands leadership to the manager `node` (not a witness), with nothing
+  // brought down: the leader stops writing and stops its heartbeats until
+  // the others' leases on it run out, then asks `node` to stand, which
+  // wins. About as long as a lease (10 s) nothing is placed or changed;
+  // no node is marked down and running tasks carry on. The cluster
+  // admin's; answered by the leader.
+  rpc Lead(LeadRequest) returns (LeadResponse);
+  // Asked by the leader handing leadership on: this manager stands for
+  // election now. Managers only; a witness refuses.
+  rpc Campaign(CampaignRequest) returns (CampaignResponse);
   // A manager asked to become a worker, asking the leader for its worker
   // certificate: it leaves the Raft membership as it gets it. The calling
   // manager's only, for itself.
@@ -764,6 +774,21 @@ message RotateCaRequest {
 
 message WatchCaRequest {}
 
+message LeadRequest {
+  string node = 1;
+}
+
+message LeadResponse {
+  // The manager that leads now, by name.
+  string leader = 1;
+  // How long it took, the time nothing could be written.
+  uint64 took_ms = 2;
+}
+
+message CampaignRequest {}
+
+message CampaignResponse {}
+
 message AvailabilityRequest {
   string namespace = 1;
 }
@@ -1170,6 +1195,9 @@ message StatusResponse {
   // A witness (`legion join --witness`): it votes, runs no tasks and never
   // leads.
   bool witness = 11;
+  // The leader by name, as the managers know one another; empty if none
+  // leads or its name is not known yet.
+  string leader_name = 12;
 }
 
 message Member {

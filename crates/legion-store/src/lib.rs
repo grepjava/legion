@@ -117,9 +117,61 @@ pub struct Store {
     state: StateMachine,
     /// The database file, to know when [`Store::shutdown`] has closed it.
     path: std::path::PathBuf,
+    /// Set while this leader hands leadership on ([`Store::hush`]).
+    hushed: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// This leader kept quiet while it hands leadership on: it writes nothing
+/// ([`Store::client_write`] says it is not the leader) and its callers
+/// confirm nothing, so no message reaches the followers and their leases
+/// on it run out. Released when dropped.
+pub struct Hush(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for Hush {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// What a write to the store gives: as `Raft::client_write`.
+pub type WriteResult = Result<
+    openraft::raft::ClientWriteResponse<TypeConfig>,
+    openraft::error::RaftError<NodeId, openraft::error::ClientWriteError<NodeId, BasicNode>>,
+>;
+
 impl Store {
+    /// Keeps this leader quiet until the guard is dropped ([`Hush`]).
+    pub fn hush(&self) -> Hush {
+        self.hushed.store(true, std::sync::atomic::Ordering::SeqCst);
+        Hush(self.hushed.clone())
+    }
+
+    /// Whether this leader is handing leadership on: it writes nothing and
+    /// confirms nothing meanwhile.
+    pub fn hushed(&self) -> bool {
+        self.hushed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Writes `command` through Raft: every write to the store goes this
+    /// way, so none goes out while this leader is hushed (it answers as a
+    /// manager that does not lead, which callers already take in their
+    /// stride).
+    // openraft's own error, as `Raft::client_write` gives it.
+    #[allow(clippy::result_large_err)]
+    pub async fn client_write(&self, command: Command) -> WriteResult {
+        if self.hushed() {
+            return Err(openraft::error::RaftError::APIError(
+                openraft::error::ClientWriteError::ForwardToLeader(
+                    openraft::error::ForwardToLeader {
+                        leader_id: None,
+                        leader_node: None,
+                    },
+                ),
+            ));
+        }
+        self.raft.client_write(command).await
+    }
+
     /// Opens (or creates) `dir/store.redb` and starts the Raft node,
     /// writing in the clear: for tests.
     pub async fn open<N>(
@@ -154,7 +206,12 @@ impl Store {
         let state = StateMachine::open_with(db, codec)?;
         let config = Arc::new(config.validate()?);
         let raft = Raft::new(id, config, network, log, state.clone()).await?;
-        Ok(Store { raft, state, path })
+        Ok(Store {
+            raft,
+            state,
+            path,
+            hushed: Default::default(),
+        })
     }
 
     pub fn get(&self, key: &ObjectKey) -> Result<Option<Object>, Error> {

@@ -16,6 +16,7 @@ mod audit;
 mod authz;
 pub mod autolock;
 mod balancers;
+mod lead;
 mod build;
 pub mod ca;
 mod connections;
@@ -400,7 +401,7 @@ impl Manager {
             ))
         });
         let promote = tokio::spawn(join::promote_learners(
-            self.store.raft.clone(),
+            self.store.clone(),
             closing.clone(),
         ));
         let sessions: std::sync::Arc<session::Hub> = Default::default();

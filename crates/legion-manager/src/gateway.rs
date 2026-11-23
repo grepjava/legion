@@ -229,6 +229,7 @@ fn router(gateway: Gateway) -> axum::Router {
         .route("/api/run-now", post(run_now))
         .route("/api/dry-run", post(dry_run))
         .route("/api/node-role", post(node_role))
+        .route("/api/lead", post(lead))
         .route("/api/exec/{namespace}/{task}", get(exec))
         // Cluster operations (CONSOLE.md phase 3); the API lets only
         // admins do most of them.
@@ -798,6 +799,7 @@ fn status_json(s: &pb::StatusResponse) -> serde_json::Value {
         "protocol": s.protocol,
         "members": members,
         "witness": s.witness,
+        "leaderName": s.leader_name,
     })
 }
 
@@ -2602,6 +2604,27 @@ async fn node_role(
         })
         .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[derive(Deserialize)]
+struct LeadBody {
+    node: String,
+}
+
+/// `legion node lead NODE`: leadership handed to a manager, nothing brought
+/// down. `{leader, tookMs}`.
+async fn lead(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(body): Json<LeadBody>,
+) -> Result<Response, Refused> {
+    let channel = g.writer(&headers, &uri, None).await?;
+    let r = ClusterClient::new(channel)
+        .lead(pb::LeadRequest { node: body.node })
+        .await?
+        .into_inner();
+    Ok(Json(serde_json::json!({ "leader": r.leader, "tookMs": r.took_ms })).into_response())
 }
 
 #[derive(Deserialize)]

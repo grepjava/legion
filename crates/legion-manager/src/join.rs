@@ -23,7 +23,7 @@ use legion_api::{Kind, Object, ObjectKey};
 use legion_pki::{CERT_LIFETIME, Ca, Identity, Role, SERVER_NAME};
 use legion_proto::v1::join_client::JoinClient;
 use legion_proto::v1::{JoinRequest, JoinResponse};
-use legion_store::{Command, NodeId, Outcome, Precondition, Raft, Store};
+use legion_store::{Command, NodeId, Outcome, Precondition, Store};
 use openraft::error::{ChangeMembershipError, ClientWriteError, RaftError};
 use openraft::{BasicNode, ChangeMembers};
 use serde::{Deserialize, Serialize};
@@ -321,6 +321,11 @@ impl Issuer {
             let node = BasicNode {
                 addr: req.advertise.clone(),
             };
+            if self.store.hushed() {
+                return Err(Status::unavailable(
+                    "leadership is being handed to another manager; retry in a few seconds",
+                ));
+            }
             let add = self.store.raft.add_learner(req.node_id, node, false);
             let added = tokio::time::timeout(crate::COMMIT_TIMEOUT, add)
                 .await
@@ -445,7 +450,7 @@ async fn write(
     object: Object,
     precondition: Precondition,
 ) -> Result<Outcome, Status> {
-    let put = store.raft.client_write(Command::Put {
+    let put = store.client_write(Command::Put {
         object,
         precondition,
     });
@@ -485,7 +490,11 @@ impl legion_proto::v1::join_server::Join for JoinService {
 
 /// While this manager leads, promotes learners that have caught up to
 /// voters, until `closing`.
-pub(crate) async fn promote_learners(raft: Raft, mut closing: tokio::sync::watch::Receiver<bool>) {
+pub(crate) async fn promote_learners(
+    store: legion_store::Store,
+    mut closing: tokio::sync::watch::Receiver<bool>,
+) {
+    let raft = store.raft.clone();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
@@ -493,7 +502,9 @@ pub(crate) async fn promote_learners(raft: Raft, mut closing: tokio::sync::watch
             _ = closing.wait_for(|c| *c) => return,
         }
         let m = raft.metrics().borrow().clone();
-        if m.current_leader != Some(m.id) {
+        // Not while leadership is handed on: the followers must hear
+        // nothing.
+        if m.current_leader != Some(m.id) || store.hushed() {
             continue;
         }
         let membership = m.membership_config.membership();
