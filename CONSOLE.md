@@ -1089,6 +1089,39 @@ in order, a root terminal or file explorer on the host, partitioning
 disks and making pools, host package updates, Samba and iSCSI shares,
 and "force" buttons (see Out of scope).
 
+## High availability in the console (2026-11-23)
+
+What [docs/HA.md](docs/HA.md) describes, in forms rather than YAML:
+
+- **Availability** (side bar, Observe): `legion ha`'s report, the managers
+  (witnesses marked) and the nodes running tasks in tiles, each single point
+  of failure with what would happen and how to put it right, for the
+  namespace in view and the cluster; an Overview tile says it in a word.
+  Each finding has a **Fix**: a Service's replicas; its tasks kept on
+  different nodes (`placement.antiAffinity` on itself, preferred or
+  required); a load balancer address and CARP vhid for one published on
+  every node; a Volume's Protection tab, filled in for the fix; or, for
+  the managers and nodes, the commands that add a witness, promote a
+  worker or join one.
+- **A Volume's Protection tab**: its replica (every 10 s to an hour,
+  failing over by hand or on its own, the node to keep it on), snapshot
+  schedules (with a preset: hourly for a day, daily for a month), backups
+  to a target, and its size. Automatic failover names the Services using
+  the Volume that would run on cut off and offers to set `onPartition:
+  stop` on each.
+- **Backup targets** (side bar, Storage): listed, added and changed in a
+  form (a ZFS host over SSH, its key in a Secret and its host key pinned,
+  or a directory on the node holding the data), deleted with the name
+  typed; the Protection tab picks from them.
+
+Every one of these changes is made the same way (lib/SpecChange.svelte):
+Review shows the diff the API would store, from a dry run checked by the
+same rules as `legion apply`, with what the change would do under it;
+Save writes it only over the version the form was filled from. Tested by
+the console lab test: axe on the three pages, and the two Fix forms that
+change a Service on a real cluster (its tasks kept apart, a load balancer
+address given).
+
 ## Out of scope
 
 - Anything the API does not offer. A console-only feature would be a
