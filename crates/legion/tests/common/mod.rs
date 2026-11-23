@@ -663,13 +663,14 @@ pub fn vm(node: &str) -> usize {
     }
 }
 
-/// Waits up to 300 s for the node's `zfs receive` of `ds`, then kills
+/// Waits up to 300 s for the node's `zfs receive` of `ds` (a move's full
+/// copy is `-s -F -u`, resumable; its last part `-F -u`), then kills
 /// `what` (a pattern for `pkill -f`) and waits for the receive to end.
 /// Fails, saying so, if no receive came.
 pub fn kill_receiving(ds: &str, what: &str) -> String {
     format!(
         "i=0
-         until pgrep -qf 'zfs receive -F -u {ds}'; do
+         until pgrep -qf 'zfs receive .*-F -u {ds}'; do
              i=$((i + 1))
              [ $i -lt 3000 ] || {{ echo 'no receive came' >&2; exit 3; }}
              sleep 0.1

@@ -404,7 +404,8 @@ impl Lab {
 /// primary's move off a draining node, first held by a full disk, then cut
 /// short as each part is received, ends with every row, nothing left of
 /// what was cut. The full copy is cut by killing the receiving node's
-/// daemon (the move starts over once the node is back), the last part by
+/// daemon: the node keeps what it took (`zfs receive -s`) and the move
+/// goes on from there once the node is back; the last part by
 /// killing its `zfs receive` alone (the agent answers, and the part is sent
 /// again onto the full copy). Three managers, so a node's daemon can go;
 /// `n1` is paused, so the primary and its move are on the two VMs.
@@ -482,7 +483,9 @@ fn a_move_cut_short_or_held_by_a_full_disk_loses_nothing() {
     eprintln!("drain status: {}", says_why().unwrap());
     assert_eq!(lab.node_of(0), from, "the primary runs on");
     assert_eq!(lab.rows(0), Some(1000));
-    assert_eq!(lab.held(to), "", "nothing of the copy out of space");
+    // No copy there: at most a part kept to go on with, no snapshot.
+    let held = lab.held(to);
+    assert!(!held.contains('@'), "a copy out of space: {held}");
     lab.sql(
         0,
         "insert into orders (item) select 'during ' || i from generate_series(1, 1000) i",
@@ -510,11 +513,28 @@ fn a_move_cut_short_or_held_by_a_full_disk_loses_nothing() {
         v["status"]["migration"].is_null() || v["status"]["migration"]["phase"] == "copying",
         "cut short, yet copied: {v}"
     );
-    assert_eq!(lab.held(to), "", "nothing of the copy cut short");
+    // What came is kept to go on with: the dataset, no snapshot yet, and
+    // its resume token.
+    let held = lab.held(to);
+    assert!(!held.contains('@'), "cut short, yet a snapshot: {held}");
+    let token = lab.on(
+        to,
+        &format!("zfs get -H -o value receive_resume_token {ds}"),
+    );
+    let token = text(&token.stdout).trim().to_owned();
+    assert!(
+        token.starts_with("1-"),
+        "the part cut short kept to go on with: {token:?} ({held})"
+    );
     lab.restart_vm(vm(to), Role::Manager);
     lab.waited("copied once the node is back", 600, || {
         lab.pg_volume()["status"]["migration"]["phase"] == "copied"
     });
+    let log = std::fs::read_to_string(lab.dir.join("daemon.log")).unwrap_or_default();
+    assert!(
+        log.contains("going on with the full copy cut short"),
+        "the full copy went on from where it stopped"
+    );
     assert_eq!(lab.pg_volume()["status"]["migration"]["to"], to);
 
     step("what is written after the full copy goes in the last part, cut short too");
