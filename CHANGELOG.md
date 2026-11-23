@@ -43,6 +43,10 @@ beyond the usual (managers first, one at a time, then workers).
 - **Witness managers.** `legion join --witness` adds a manager that votes
   but runs no tasks and never leads, so a small machine makes two managers
   three. `legion status` and the console mark witnesses.
+  A witness may sit where it reaches no manager (managers connect to it),
+  but then can't serve clients. A failover takes about 16 s to elect a new
+  leader, and about 32 s before the lost leader's node's tasks move;
+  measured in the lab and on a real cluster ([docs/HA.md](docs/HA.md)).
 - **Forms instead of YAML for it.** A Volume's Protection tab sets its
   replica (every 10 s to an hour, failover by hand or on its own, the node
   to keep it on), snapshot schedules, backups and size; Backup targets have
