@@ -19,7 +19,7 @@
     `/k/Volume/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}?tab=protection&fix=${fix}`;
 
   // A Service's fix: read as it is, to change from there.
-  let service: LObject | null = $state(null);
+  let service = $state<LObject | null>(null);
   let error = $state('');
   $effect(() => {
     if (kind !== 'Service') return;
@@ -30,6 +30,13 @@
   });
 
   let replicas = $state(2);
+  // The Volumes its pod mounts (not a stateful claim, each replica's own):
+  // more replicas would share their data.
+  const shared = $derived(
+    ((service?.spec?.pod?.volumes ?? []) as { volume?: { name: string } }[])
+      .map((v) => v.volume?.name)
+      .filter((n): n is string => !!n)
+  );
   let required = $state(false);
   let address = $state('');
   let vhid = $state(1);
@@ -86,7 +93,22 @@
     {:else if error}
       <p class="error">{error}</p>
     {:else if service && spec}
-      {#if finding.reason === 'one-replica'}
+      {#if finding.reason === 'one-replica' && shared.length}
+        <p>
+          {t(
+            'Its data is on Volume {volumes}: a second replica would share it, and a database can\u2019t survive two copies over one data directory. Keep it at 1.',
+            { volumes: shared.join(', ') }
+          )}
+        </p>
+        <p>{t('Protect the data instead, and for no loss at all run the application\u2019s own replication:')}</p>
+        {#each shared as v (v)}
+          <a
+            class="button sm"
+            href={`/k/Volume/${encodeURIComponent(namespace)}/${encodeURIComponent(v)}?tab=protection&fix=replica`}
+            >{t('Protect Volume {volume}', { volume: v })}</a
+          >
+        {/each}
+      {:else if finding.reason === 'one-replica'}
         {#if service.spec?.mode === 'stateful'}
           <p class="muted">
             {t('Each replica of a stateful service has its own data: a second one helps only if the application replicates between them.')}
@@ -104,7 +126,9 @@
           <label>{t('CARP vhid (1 to 255)')} <input type="number" min="1" max="255" bind:value={vhid} /></label>
         </div>
       {/if}
-      <SpecChange object={service} {spec} {notes} disabled={addressBad || replicas < 2} {onsaved} />
+      {#if !(finding.reason === 'one-replica' && shared.length)}
+        <SpecChange object={service} {spec} {notes} disabled={addressBad || replicas < 2} {onsaved} />
+      {/if}
     {:else}
       <p class="muted" aria-busy="true">{t('Reading it…')}</p>
     {/if}

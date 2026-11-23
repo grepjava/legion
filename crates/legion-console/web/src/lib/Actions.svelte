@@ -45,6 +45,32 @@
     return followStatus((s) => (leader = s.leaderName ?? ''));
   });
 
+  /** Scaled as asked; above one, a Service whose pod mounts a Volume (not
+   * a stateful claim) is asked about first: its tasks would share that
+   * data, which a database can't survive. */
+  async function scale() {
+    const shared = ((object.spec?.pod?.volumes ?? []) as { volume?: { name: string } }[])
+      .map((v) => v.volume?.name)
+      .filter((n): n is string => !!n);
+    if (replicas > 1 && replicas > stored && shared.length) {
+      const ok = await ask({
+        message: t(
+          'Scale {name} to {n}? Its tasks would share Volume {volumes}: fine for files only read, fatal for a database, which can\u2019t run twice over one data directory.',
+          { name, n: replicas, volumes: shared.join(', ') }
+        ),
+        action: t('Scale'),
+        danger: true
+      });
+      if (!ok) return;
+    }
+    return set(
+      'replicas',
+      replicas,
+      t('{name} scaled to {n}', { name, n: replicas }),
+      t('{name} already has {n}', { name, n: replicas })
+    );
+  }
+
   async function lead() {
     const ok = await ask(
       t(
@@ -171,13 +197,7 @@
       <button
         disabled={!!why || busy}
         title={why ?? ''}
-        onclick={() =>
-          set(
-            'replicas',
-            replicas,
-            t('{name} scaled to {n}', { name, n: replicas }),
-            t('{name} already has {n}', { name, n: replicas })
-          )}
+        onclick={scale}
         >{t('Scale')}</button
       >
     </span>
