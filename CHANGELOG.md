@@ -21,11 +21,13 @@ beyond the usual (managers first, one at a time, then workers).
   have stopped before the copy carries on. A replica says its state
   (pending, ready, stale, failed), the copy under way, its last ten copies
   and why it would not fail over now; a stale one raises `replica-stale`.
-- **Replica copies go on where they stopped.** A copy cut short (the link
-  dropped, a daemon restarted, leadership moved) is kept by the replica's
-  node (`zfs receive -s`), and the next attempt sends only the rest (`zfs
-  send -t`), so a large Volume over a slow link finishes however often
-  daemons restart. `status.replica.partial` says which copy is under way.
+- **Copies go on where they stopped: replicas, moves and backups over
+  SSH.** A copy cut short (the link dropped, a daemon restarted, leadership
+  moved) is kept by the node or host receiving it (`zfs receive -s`), and
+  the next attempt sends only the rest (`zfs send -t`), so a large Volume
+  over a slow link gets there however often daemons restart.
+  `status.replica.partial` says which replica copy is under way. Backups to
+  a directory are files, and are written again.
 - **Sends are compressed.** Every `zfs send` (replicas, moves, backups)
   sends blocks as the pool stores them (`-L -c -e`): a lz4 database at
   2x sends half what it did.
