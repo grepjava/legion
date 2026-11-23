@@ -1374,7 +1374,8 @@ export type Change =
   | { change: 'drain'; node: string }
   | { change: 'move-volume'; namespace: string; volume: string; node: string }
   | { change: 'remove-node'; node: string }
-  | { change: 'delete-service'; namespace: string; service: string };
+  | { change: 'delete-service'; namespace: string; service: string }
+  | { change: 'demote'; node: string };
 
 /** The check a deletion is given first: a node's removal or a Service's
  * deletion; none for other kinds. */

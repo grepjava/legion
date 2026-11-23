@@ -110,7 +110,10 @@
       to === 'manager'
         ? t('Promote {name} to a manager? Its daemon takes the role up and starts again.', { name })
         : t('Demote {name} to a worker? Its daemon takes the role up and starts again.', { name });
-    if (!(await ask(what, { action: to === 'manager' ? t('Promote') : t('Demote') }))) return;
+    // A demotion is checked first: what it leaves the managers with (an
+    // election if it leads, fewer than three voters), as a drain is.
+    const check = to === 'worker' ? [{ change: 'demote' as const, node: name }] : undefined;
+    if (!(await ask(what, { action: to === 'manager' ? t('Promote') : t('Demote'), check }))) return;
     return act(async () => {
       await api.nodeRole(name, to);
       return to === 'manager' ? t('{name} becomes a manager', { name }) : t('{name} becomes a worker', { name });
