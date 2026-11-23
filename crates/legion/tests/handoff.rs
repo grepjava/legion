@@ -611,7 +611,8 @@ fn a_local_image_keeps_its_data_through_a_cut_move() {
     step(&format!(
         "draining {from}: the full copy, made as the task runs"
     ));
-    lab.ok(&["node", "drain", &from]);
+    // Held by the budget on purpose: the drain check would refuse it.
+    lab.ok(&["node", "drain", &from, "--force"]);
     wait("the full copy", 600, || {
         lab.keep_volume()["status"]["migration"]["phase"] == "copied"
     });
@@ -1244,7 +1245,8 @@ fn a_local_image_goes_from_build_to_recovery() {
     ));
     let ds = format!("{ZFS_ROOT}/volumes/handoff/data-keep-0");
     lab.apply("keep", &held);
-    lab.ok(&["node", "drain", &b]);
+    // Held by the budget on purpose: the drain check would refuse it.
+    lab.ok(&["node", "drain", &b, "--force"]);
     wait("the full copy", 600, || {
         lab.keep_volume()["status"]["migration"]["phase"] == "copied"
     });

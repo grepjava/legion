@@ -466,7 +466,8 @@ fn a_move_cut_short_or_held_by_a_full_disk_loses_nothing() {
         ),
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
-    lab.ok(&["node", "drain", &from]);
+    // Held by the budget on purpose: the drain check would refuse it.
+    lab.ok(&["node", "drain", &from, "--force"]);
     let says_why = || {
         lab.list("nodes", "default")
             .iter()
