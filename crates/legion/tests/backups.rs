@@ -2,8 +2,9 @@
 //! Volume written to on n2 keeps its scheduled snapshots pruned to `keep`;
 //! its backups go to n3 over SSH, whole at first and then what changed,
 //! pruned there too; one is restored onto n3 as a new Volume with the data
-//! as it was; then to a directory on n2, a file each. No `snapshot-late`
-//! or `backup-late` alert stands meanwhile.
+//! as it was; then to a directory on n2, a file each; then to an S3 bucket
+//! (MinIO on n3), an object each, one restored from there. No
+//! `snapshot-late` or `backup-late` alert stands meanwhile.
 //!
 //! It drives real daemons, so it is ignored by default and run on the lab
 //! of `tests/common` (see there), as root: this host is the manager n1,
@@ -19,6 +20,11 @@ const IMAGE: &str = "docker.io/freebsd/freebsd-notoolchain:15.1";
 /// The user and dataset on n3 that backups go to.
 const BK_USER: &str = "legionbk";
 const BK_DATASET: &str = "llab/backups";
+/// MinIO on n3: its data, user, password and bucket.
+const S3_DIR: &str = "/var/tmp/legion-lab-s3";
+const S3_USER: &str = "legionlab";
+const S3_PASSWORD: &str = "legionlab-secret";
+const S3_BUCKET: &str = "legion-lab";
 
 /// The Volume, a writer on n2 appending a line every second, and its
 /// snapshot schedule and backups.
@@ -84,6 +90,10 @@ impl Drop for Cleanup<'_> {
             &format!("zfs destroy -r {BK_DATASET} 2>/dev/null; pw userdel {BK_USER} -r 2>/dev/null; true"),
         );
         let _ = self.0.on("n2", "rm -rf /var/tmp/legion-lab-bk");
+        let _ = self.0.on(
+            "n3",
+            &format!("pkill -f 'minio server {S3_DIR}'; sleep 1; rm -rf {S3_DIR} /root/.mc; true"),
+        );
     }
 }
 
@@ -261,6 +271,85 @@ spec:
         let out = lab.on("n2", "ls /var/tmp/legion-lab-bk/default.data/ 2>/dev/null");
         text(&out.stdout).lines().filter(|l| l.ends_with(".zfs")).count() == 2
     });
+
+    // To an S3-compatible bucket: MinIO on n3, reached from n2 over HTTP,
+    // signed. MinIO's own client says what the bucket holds.
+    let mc = "$(command -v minio-client || command -v mc)";
+    let out = lab.on(
+        "n3",
+        &format!(
+            "set -e
+            command -v minio >/dev/null || ASSUME_ALWAYS_YES=yes pkg install -q minio minio-client >/dev/null
+            mkdir -p {S3_DIR}
+            MINIO_ROOT_USER={S3_USER} MINIO_ROOT_PASSWORD={S3_PASSWORD}                 daemon -f minio server {S3_DIR} --address :9000 --quiet
+            i=0
+            until {mc} alias set lab http://127.0.0.1:9000 {S3_USER} {S3_PASSWORD} >/dev/null 2>&1; do
+                i=$((i + 1)); [ $i -lt 60 ] || {{ echo 'MinIO did not start' >&2; exit 3; }}
+                sleep 1
+            done
+            {mc} mb -p lab/{S3_BUCKET} >/dev/null"
+        ),
+    );
+    assert!(out.status.success(), "MinIO on n3: {}", text(&out.stderr));
+    apply(
+        &lab,
+        &format!(
+            "apiVersion: legion/v1
+kind: Secret
+metadata: {{ name: s3-key, namespace: default }}
+spec:
+  text: {S3_PASSWORD}
+---
+apiVersion: legion/v1
+kind: BackupTarget
+metadata: {{ name: cloud }}
+spec:
+  s3: {{ endpoint: \"http://{}:9000\", bucket: {S3_BUCKET}, prefix: lab/run, accessKeyId: {S3_USER}, secretKeySecret: {{ namespace: default, name: s3-key }} }}
+",
+            n3.addr
+        ),
+    );
+    apply(&lab, &app("cloud"));
+    let objects = || {
+        let out = lab.on(
+            "n3",
+            &format!("{mc} ls --recursive lab/{S3_BUCKET}/lab/run/default.data/ 2>/dev/null"),
+        );
+        text(&out.stdout)
+            .lines()
+            .filter(|l| l.ends_with(".zfs"))
+            .count()
+    };
+    lab.wait_or_report("two backups as objects in the bucket, pruned to keep", 360, || {
+        let v = volume(&lab);
+        let b = &v["status"]["backup"];
+        let runs = b["runs"].as_array().cloned().unwrap_or_default();
+        // A new target's status starts afresh: a third run there means one
+        // was pruned.
+        b["target"] == "cloud"
+            && b["failures"].as_u64().unwrap_or(0) == 0
+            && runs.len() >= 3
+            && runs.last().is_some_and(|r| r["error"].as_str().unwrap_or("").is_empty())
+            && objects() == 2
+    });
+    let held = lab.ok(&["volume", "backups", "data", "--from", "cloud"]);
+    let first = held
+        .lines()
+        .skip(1)
+        .find_map(|l| l.split_whitespace().next())
+        .expect("a backup in the bucket")
+        .to_owned();
+    lab.ok(&[
+        "volume", "restore", "--from", "cloud", &format!("data@{first}"), "--node", "n3", "--name",
+        "data-s3",
+    ]);
+    let restored = format!("{}/volumes/default/data-s3", common::ZFS_ROOT);
+    let lines = lab.on(
+        "n3",
+        &format!("cat \"$(zfs get -H -o value mountpoint {restored})/log\" | wc -l"),
+    );
+    let n: u64 = text(&lines.stdout).trim().parse().unwrap_or(0);
+    assert!(n > 30, "the data restored from the bucket has the writer's lines: {n}");
 
     let alerts = lab.ok(&["alerts"]);
     assert!(
