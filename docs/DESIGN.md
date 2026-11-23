@@ -556,18 +556,24 @@ Built in phase 1 (`crates/legion-manager`, `crates/legion`).
   ends `Cancelled`, and calls to methods it does not serve count under
   `unknown`. Every manager reports its
   Raft state (leader, term, log and applied indexes, voters, and on the
-  leader each follower's lag). Only the leader reports the cluster:
+  leader each follower's lag). Every manager in a cluster with a leader
+  reports the cluster, from its own replica, so a scraper of any one
+  manager sees it all whichever leads:
   objects by kind and namespace, tasks by state, restarts of tasks not
   ended, each such task's containers with its state, node and image as
   labels (`legion_task_info`, 1) and when its pod started
   (`legion_task_start_time_seconds`, as its node's runtime recorded it,
   kept across a daemon restart), services' replicas and ready tasks, nodes,
   each node's ZFS space used and available and each ZFS Volume's used and
-  available bytes as its agent last reported them (`legion_node_zfs_*`,
+  available bytes as its agent last reported them (the agents report to
+  the leader; a follower follows the leader's usage and has what it last
+  sent, a witness none) (`legion_node_zfs_*`,
   `legion_volume_{used,available}_bytes`), each sized Volume's size
   (`legion_volume_size_bytes`), and each quota's
-  limits beside what the namespace uses of them. A sum across managers
-  then counts each thing once. The agent reports each running
+  limits beside what the namespace uses of them. Each series of the
+  cluster's then comes once per manager scraped: take it once (`max
+  without (instance)`) before summing, as packaging/grafana's dashboard
+  does. The agent reports each running
   container's usage from rctl on the container's own jail: CPU time and
   percent, resident and virtual memory, swap, processes, threads, open
   files and storage I/O (the infra jail, which counts its containers

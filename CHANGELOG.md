@@ -73,6 +73,10 @@ beyond the usual (managers first, one at a time, then workers).
 
 ### Upgrading
 
+- Queries summing a cluster metric (`legion_tasks`, `legion_nodes`,
+  `legion_service_*`, `legion_volume_*`...) across several managers count
+  it once per manager now that every manager reports it: take it once
+  first with `max without (instance)`.
 - **VM pods now need their namespace to allow them**: `spec.security.allow:
   [vm]` on the Namespace, which only the cluster admin sets. A bhyve VM's
   hypervisor runs on the host outside any jail, so no namespace runs one
@@ -127,6 +131,13 @@ beyond the usual (managers first, one at a time, then workers).
 
 ### Metrics
 
+- Every manager reports the cluster's metrics, not only the leader: its
+  objects, tasks, nodes and quotas from its own replica, and the agents'
+  pool and Volume space as the leader last sent them. A scraper of one
+  manager no longer goes blank while another leads. Upgrading: a query
+  summing a cluster metric across several managers now counts it once
+  per manager; take it once first (`max without (instance)`), as the
+  Grafana dashboard now does.
 - `legion_task_info` and `legion_task_start_time_seconds`; each node's ZFS
   space and each Volume's used, available and size. The Grafana dashboard
   has a Tasks and storage row.
