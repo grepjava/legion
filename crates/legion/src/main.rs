@@ -929,6 +929,12 @@ pub enum NodeCommand {
     /// heartbeat or two and starts again as a manager, its tasks running
     /// on. It joins Raft as a learner and votes once caught up.
     Promote { node: String },
+    /// Hand leadership to the manager NODE (not a witness), with nothing
+    /// brought down: the leader goes quiet until the others' leases on it
+    /// run out (about 10 s, when nothing is placed or changed; running
+    /// tasks carry on), then NODE stands and is elected. Before upgrading
+    /// or rebooting the leader's machine, say.
+    Lead { node: String },
     /// Make a manager a worker, in place: it leaves the Raft membership
     /// (never the last voter, nor the last that may lead), gives up the CA
     /// key and its store, and its daemon starts again as a worker, its

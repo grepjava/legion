@@ -2,7 +2,9 @@
 //! so ignored by default: this host is the manager n1, the first VM the
 //! manager n2, the second VM the witness n3, which joins with `--witness`
 //! and runs no agent (see `tests/cluster.rs` for the environment). Two
-//! managers and a witness are three voters: the leader's daemon killed,
+//! managers and a witness are three voters: leadership is handed from one
+//! full manager to the other with nothing brought down; the leader's
+//! daemon killed,
 //! the other full manager leads, never the witness; writes go on through
 //! the witness; the lost node's tasks move to the node left; and the old
 //! leader comes back as a follower.
@@ -122,6 +124,25 @@ fn a_witness_keeps_the_quorum_and_a_full_manager_takes_over() {
     wait("a task on n1 and on n2", 600, || {
         running(&lab, &lab.server()) == ["n1", "n2"]
     });
+
+    step("leadership handed to the other full manager, nothing brought down");
+    let before = leader(&lab, &lab.server()).expect("a leader");
+    let to = if before == "n1" { "n2" } else { "n1" };
+    let placed = running(&lab, &lab.server());
+    let said = lab.ok(&["node", "lead", to]);
+    eprintln!("{}", said.trim());
+    wait("the other full manager leads", 60, || {
+        leader(&lab, &witness).as_deref() == Some(to)
+    });
+    assert_eq!(
+        running(&lab, &lab.server()),
+        placed,
+        "every task where it was"
+    );
+    assert!(
+        ["n1", "n2"].iter().all(|n| lab.node_state(n) == "ready"),
+        "no node marked down"
+    );
 
     step("the leader's daemon killed: the other full manager leads, never the witness");
     let lead = leader(&lab, &lab.server()).expect("a leader");

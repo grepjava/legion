@@ -1043,6 +1043,19 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             );
         }
         Command::Node {
+            command: crate::NodeCommand::Lead { node },
+        } => {
+            let r = cluster
+                .lead(pb::LeadRequest { node })
+                .await?
+                .into_inner();
+            println!(
+                "{} leads now; nothing could be written for {:.1} s, and running tasks carried on",
+                r.leader,
+                r.took_ms as f64 / 1000.0
+            );
+        }
+        Command::Node {
             command: crate::NodeCommand::Label { node, labels },
         } => {
             let changes = labels
@@ -1211,6 +1224,7 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 | crate::NodeCommand::ErrorsSeen { .. }
                 | crate::NodeCommand::Scrub { .. }
                 | crate::NodeCommand::Promote { .. }
+                | crate::NodeCommand::Lead { .. }
                 | crate::NodeCommand::Demote { .. } => unreachable!("handled above"),
             };
             let r#ref = ObjectRef {
