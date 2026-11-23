@@ -901,6 +901,9 @@ spec:
     for path in [
         "/",
         "/alerts",
+        "/availability",
+        "/backup-targets",
+        "/k/Volume/team-a/data-keeper-0?tab=protection",
         "/deploy",
         "/templates",
         "/import",
