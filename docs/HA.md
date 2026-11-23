@@ -72,6 +72,32 @@ serve clients: a request sent to it is passed on to the leader, which it
 can't reach ("connecting to ...: timed out", seen on 2026-11-23). Point
 the CLI, the console and agents at the full managers.
 
+**Handing leadership on.** Before upgrading or rebooting the leader's
+machine, hand leadership to another manager with nothing brought down:
+
+```sh
+legion node lead weft      # or Lead on a manager's page in the console
+```
+
+Raft's followers refuse to vote while they still trust the leader's lease
+(10 s), and openraft 0.9 has no call that hands leadership over, so the
+leader goes quiet: it stops its heartbeats, writes nothing and confirms
+nothing until every lease on it has run out, then asks the manager named to
+stand, which, its log as long as any, is elected. For those 10 to 11 s
+nothing is placed or changed (writes are refused as by a manager that
+does not lead, and heartbeats go unanswered); no node is marked down, as a
+new leader counts nodes' silence from when it took over, and running tasks
+carry on. A witness can't be named; the leader comes back as a follower,
+able to lead again later.
+
+**Demoting or removing a manager** is checked first, as a drain is: the
+console's confirmation and `legion node demote` (`--dry-run` to only
+look) say what it leaves the managers with: an election if it leads (about
+16 s with no leader), fewer than three voters, one manager left that may
+lead. Leaving only witnesses is refused (`--force` overrides the check, not
+the leader, which refuses it too). To move leadership, hand it on rather
+than demote.
+
 **How long a failover takes.** A manager lost, the others elect another
 once they stop hearing it: a follower waits a random 5 to 10 s
 (`election_timeout_min/max`), and refuses to vote for anyone while it
@@ -216,6 +242,19 @@ itself again, losing the form, when a tab came or went with it (a Volume
 given a replica gains a Replica tab); a Volume with no node yet was said
 to be on "node ?"; and the warning about Services that would run on cut
 off stayed after they were fixed, its list read once.
+
+### Handing leadership on, and demotion's check
+
+- In-process (`leadership_is_handed_on_with_nothing_down`, three runs):
+  two managers and a witness, a worker heartbeating throughout; refused for
+  a witness, the leader itself and a user; handed to the second manager in
+  3.53 s (the tests' lease is 3 s), every manager following it, the
+  witness never leading, the worker never marked down, writes going on;
+  then handed back the same way.
+- Demotion's check (`a_manager_leaving_says_what_the_others_are_left_with`,
+  and through the API in `a_witness_votes_but_never_leads`): the leader of
+  two managers and a witness says `leaders`, `quorum` and `leader`, none
+  blocking; demoting the only manager that may lead blocks.
 
 ### Not tested
 

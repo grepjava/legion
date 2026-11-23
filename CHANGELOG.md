@@ -55,10 +55,29 @@ beyond the usual (managers first, one at a time, then workers).
   load balancer address, a Volume's protection, or the commands for a
   witness. Every change is shown as a diff and saved only over what was
   read.
+- **Leadership handed on** with nothing brought down: `legion node lead
+  NODE`, or Lead on a manager's page. About 10 s with nothing written; no
+  node marked down, running tasks carry on.
+- **Demoting or removing a manager is checked first**, in the console and
+  the CLI (`legion node demote --dry-run`): an election if it leads, fewer
+  than three voters, one manager left that may lead; demoting the last
+  manager that may lead is refused.
+- **A manager's shutdown is bounded**: its connections get 10 s to end,
+  then are closed, and each task after them 10 s; a stream passed on from
+  the leader ends with its manager. A witness across a NAT had hung on a
+  half-open connection.
 - **Self-fencing.** A pod with `onPartition: stop` now stops on its node
   even when the daemon is dead: the agent renews a lease as heartbeats are
   answered, and each container's supervisor stops it once the lease runs
   out. A Volume's automatic failover is then safe in that case too.
+
+### Upgrading
+
+- **VM pods now need their namespace to allow them**: `spec.security.allow:
+  [vm]` on the Namespace, which only the cluster admin sets. A bhyve VM's
+  hypervisor runs on the host outside any jail, so no namespace runs one
+  unless allowed. Running VM tasks carry on; a Service with a VM container
+  is refused (saying so) until its namespace allows `vm`.
 
 ### Nodes and hosts
 
@@ -145,6 +164,15 @@ beyond the usual (managers first, one at a time, then workers).
   (`Cluster.WatchUsage`, `WatchUsageHistory`, `WatchStatus`,
   `WatchLoadBalancers`, `WatchConnections`, `WatchCa`). Exec stays a
   WebSocket. Streams end when the manager closes.
+- **Topology right-click** (or the menu key, Shift+F10) on a Service,
+  task, node or Volume: start, stop, pause, restart, scale, move to another
+  node with its data (and every Service sharing it, checked first as one
+  change), duplicate onto a node with a copy of its data, protect its
+  data, roll back, logs, console, events, edit, delete; a node paused,
+  drained or made the leader. **Drag** a Service or Volume onto a node to
+  move it there. A Service whose data is a Volume is never offered a
+  second replica: two Postgres over one data directory, each in its own
+  jail, don't see each other's lock.
 - Topology's links are named for what they show (WCAG 2.5.3); a sign-in
   link pasted into the sign-in tab is read.
 - Unit tests of its helpers (`npm test`, Vitest), run by CI with the type

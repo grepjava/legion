@@ -1721,6 +1721,11 @@ make ZFS volumes. Built in `legion_api::volume`, `legion-agent::volumes`,
 
 ### 6.8 bhyve tasks
 
+A VM pod runs only in a namespace whose `spec.security.allow` lists `vm`
+(9), which only the cluster admin sets: bhyve, unlike a jail, runs on the
+host. Legion is a jail orchestrator; VM pods are an opt-in for a workload
+that needs another kernel, not a VM manager (Sylve, CBSD and vm-bhyve are).
+
 Can a virtual machine be a pod? The spike (`legion-net/tests/bhyve.rs`)
 boots a small FreeBSD guest (`tests/bhyve-guest.sh`: this host's kernel,
 `/rescue`, `nc` and an rc, built by makefs) from a zvol with `bhyveload`
@@ -2082,8 +2087,10 @@ Built (phase 2, `legion_api::compose`, `legion stack deploy|convert|rm`):
   `enforceStatfs` 1 or 2) loosens that, and admission refuses a Service,
   Job or CronJob that loosens more than its Namespace's
   `spec.security.allow` lists (the same names, plus `securelevel` for a
-  level below 2 and `enforceStatfs` for 1). Namespaces are cluster-scoped,
-  so only the cluster admin decides. A Namespace tightened later holds for
+  level below 2, `enforceStatfs` for 1, and `vm` for a container that is
+  a bhyve VM, 6.8: its hypervisor runs on the host, as root and outside
+  any jail, so since 2026-11-23 no namespace runs one unless allowed).
+  Namespaces are cluster-scoped, so only the cluster admin decides. A Namespace tightened later holds for
   everything made from then on, from specs admitted earlier too: such a
   task waits Pending with the reason, one not yet started is stopped, and a
   CronJob's run is skipped. Tasks already running keep what they started
