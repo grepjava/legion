@@ -8,11 +8,15 @@
   import { t, tn } from '#lib/i18n.svelte.ts';
   import Ico from '#lib/Ico.svelte';
   import Tile from '#lib/Tile.svelte';
+  import HaFix from '#lib/HaFix.svelte';
   import { Crown, RefreshCw, Server, TriangleAlert, CircleAlert } from '@lucide/svelte';
 
   let report = $state<HaReport | null>(null);
   let error = $state('');
   let busy = $state(false);
+  // The finding whose fix is open, by its reason and object.
+  let fixing = $state('');
+  const keyOf = (f: HaFinding) => f.reason + ' ' + (f.object ?? '');
 
   async function load(ns: string) {
     busy = true;
@@ -104,10 +108,11 @@
           <th scope="col">{t('About')}</th>
           <th scope="col">{t('What would happen')}</th>
           <th scope="col">{t('How to put it right')}</th>
+          <th scope="col"><span class="sr-only">{t('Fix')}</span></th>
         </tr>
       </thead>
       <tbody>
-        {#each report.findings as f (f.reason + (f.object ?? ''))}
+        {#each report.findings as f (keyOf(f))}
           <tr>
             <td>
               <span class="state {f.severity === 'risk' ? 'bad' : 'wait'}">
@@ -119,7 +124,29 @@
             </td>
             <td>{f.message}</td>
             <td>{f.fix}</td>
+            <td class="controls">
+              <button
+                class="sm"
+                aria-expanded={fixing === keyOf(f)}
+                onclick={() => (fixing = fixing === keyOf(f) ? '' : keyOf(f))}
+              >
+                {fixing === keyOf(f) ? t('Close') : t('Fix')}
+              </button>
+            </td>
           </tr>
+          {#if fixing === keyOf(f)}
+            <tr class="fix-row">
+              <td colspan="5">
+                <HaFix
+                  finding={f}
+                  onsaved={() => {
+                    fixing = '';
+                    void load(session.namespace);
+                  }}
+                />
+              </td>
+            </tr>
+          {/if}
         {/each}
       </tbody>
     </table>

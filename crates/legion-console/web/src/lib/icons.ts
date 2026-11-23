@@ -87,6 +87,7 @@ const pages: Record<string, IconComponent> = {
   '/topology': Network,
   '/network': Cable,
   '/disk': ChartPie,
+  '/backup-targets': DatabaseBackup,
   '/diagnostics': Stethoscope,
   '/volumes': HardDrive,
   '/images': Layers,

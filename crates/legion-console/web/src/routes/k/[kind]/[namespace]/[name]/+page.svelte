@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import Tabs from '#lib/Tabs.svelte';
   import { page } from '$app/state';
   import { fromAddress, keepInAddress } from '#lib/address.svelte.ts';
@@ -22,6 +23,7 @@
   import UsageCharts from '#lib/UsageCharts.svelte';
   import VolumeData from '#lib/VolumeData.svelte';
   import VolumeReplica from '#lib/VolumeReplica.svelte';
+  import VolumeProtection from '#lib/VolumeProtection.svelte';
   import BuildLog from '#lib/BuildLog.svelte';
   import Events from '#lib/Events.svelte';
   import { cannotWrite, openWorkbench, session } from '#lib/session.svelte.ts';
@@ -47,10 +49,12 @@
     | 'terminal'
     | 'data'
     | 'replica'
+    | 'protection'
     | 'buildlog'
     | 'events'
     | 'yaml' =
     $state('details');
+  let fix = $state('');
   // The tab open, in the address, so a reload or a link keeps it.
   keepInAddress('tab', () => tab, 'details');
 
@@ -61,7 +65,11 @@
     // The tab the address names (`?tab=buildlog`), if the kind has it;
     // read as the page opens, not followed (the tab chosen is kept there).
     const wanted = fromAddress('tab');
-    tab = tabs.find((x) => x.id === wanted)?.id ?? 'details';
+    // What a fix on the Availability page asks the tab to fill in.
+    fix = fromAddress('fix') ?? '';
+    // Not followed: a tab that comes or goes with the object (a Volume's
+    // Replica) must not read the page again.
+    tab = untrack(() => tabs.find((x) => x.id === wanted)?.id ?? 'details');
     api
       .get(kind, namespace, name)
       .then((o) => (object = o))
@@ -90,6 +98,7 @@
     ...(kind === 'Service' || kind === 'Job' ? [{ id: 'search', label: t('Logs') }] : []),
     ...(kind === 'Node' ? [{ id: 'tasks', label: t('Tasks') }] : []),
     ...(kind === 'Volume' ? [{ id: 'data', label: t('Data') }] : []),
+    ...(kind === 'Volume' ? [{ id: 'protection', label: t('Protection') }] : []),
     ...(kind === 'Volume' && replicated ? [{ id: 'replica', label: t('Replica') }] : []),
     ...(kind === 'Namespace' ? [{ id: 'quota', label: t('Quota') }] : []),
     ...(kind === 'Task' || kind === 'Service' || kind === 'Node' ? [{ id: 'usage', label: t('Telemetry') }] : []),
@@ -362,6 +371,8 @@
     <VolumeData volume={object} />
   {:else if tab === 'replica'}
     <VolumeReplica volume={object} />
+  {:else if tab === 'protection'}
+    <VolumeProtection volume={object} prefill={fix} />
   {:else if tab === 'logs'}
     <TaskLogs task={object} />
   {:else if tab === 'files'}

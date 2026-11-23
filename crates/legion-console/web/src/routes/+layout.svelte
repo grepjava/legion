@@ -366,6 +366,7 @@
     '/topology': t('Topology'),
     '/network': t('Network'),
     '/disk': t('Disk usage'),
+    '/backup-targets': t('Backup targets'),
     '/diagnostics': t('Diagnostics'),
     '/cluster': t('Operations'),
     '/audit': t('Audit'),
@@ -473,7 +474,10 @@
       ...nsKinds
         .filter((k) => !LISTED_ELSEWHERE.has(k.kind) && (KIND_GROUP[k.kind] ?? 'config') === group)
         .map((k) => kindItem(k.kind)),
-      ...clusterKinds.filter((k) => KIND_GROUP[k.kind] === group).map((k) => kindItem(k.kind))
+      ...clusterKinds
+        .filter((k) => KIND_GROUP[k.kind] === group)
+        // Backup targets have a page of their own, with a form.
+        .map((k) => (k.kind === 'BackupTarget' ? pageItem('/backup-targets', t('Backup targets')) : kindItem(k.kind)))
     ];
     return [
       {
