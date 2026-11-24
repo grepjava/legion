@@ -5365,3 +5365,82 @@ fn a_member_that_says_it_is_primary_unnamed_is_stopped() {
     w.apply(p.actions);
     assert_eq!(w.replication("pg").phase, Phase::Split);
 }
+
+impl World {
+    /// The operator asks for a new primary, as `legion replication` writes.
+    fn request(&mut self, kind: &str, to: Option<&str>, at: i64) {
+        let i = self
+            .services
+            .iter()
+            .position(|s| s.object.metadata.name == "pg")
+            .unwrap();
+        let mut spec = self.services[i].object.spec.clone();
+        let mut q = serde_json::json!({ "kind": kind, "at": at });
+        if let Some(to) = to {
+            q["to"] = to.into();
+        }
+        spec["replication"]["request"] = q;
+        let yaml = serde_yaml_ng::to_string(&spec).unwrap();
+        self.service("pg", &yaml);
+    }
+}
+
+/// A switchover stops the primary, waits for the member asked for to hold
+/// all it wrote, then promotes it; asking for the primary itself, or for
+/// no one in a failover, is refused and said so.
+#[test]
+fn a_switchover_promotes_the_member_asked_for_once_it_has_caught_up() {
+    use legion_api::replication::{ChangeKind, Phase};
+    let mut w = World::new();
+    database(&mut w, DATABASE);
+    w.members_say(1, |_| 500, &[]);
+    w.settle();
+
+    w.request("switchover", Some("pg-0"), 1);
+    w.members_say(1, |_| 500, &[]);
+    w.settle();
+    let st = w.replication("pg");
+    assert!(st.change.is_none());
+    assert_eq!(st.refused, "pg-0 is the primary already");
+    w.request("failover", None, 2);
+    w.members_say(1, |_| 500, &[]);
+    w.settle();
+    assert_eq!(
+        w.replication("pg").refused,
+        "name the member to promote (--to)"
+    );
+
+    // pg-2 behind pg-1: it waits, the primary stopped meanwhile.
+    w.request("switchover", Some("pg-2"), 3);
+    w.members_say(1, |i| if i == 2 { 400 } else { 500 }, &[0]);
+    w.settle();
+    let st = w.replication("pg");
+    assert_eq!(st.phase, Phase::FailingOver);
+    let c = st.change.as_ref().unwrap();
+    assert_eq!(c.kind, ChangeKind::Switchover);
+    assert!(c.to.is_none());
+    assert!(st.message.contains("catch up"), "{}", st.message);
+    assert!(
+        !w.tasks.iter().any(|t| t.spec.slot == Some(0)
+            && active_running(t)
+            && t.spec
+                .replication
+                .as_ref()
+                .is_some_and(|r| r.role == legion_api::replication::spi::Role::Primary)),
+        "the old primary is stopped, nothing named primary meanwhile"
+    );
+
+    // Caught up: promoted.
+    w.members_say(1, |_| 500, &[0]);
+    w.settle();
+    let st = w.replication("pg");
+    assert_eq!(st.primary.as_deref(), Some("pg-2"));
+    w.members_say(2, |_| 600, &[]);
+    w.settle();
+    let st = w.replication("pg");
+    assert!(st.change.is_none());
+    assert_eq!(st.last_change.unwrap().kind, ChangeKind::Switchover);
+    assert_eq!(w.roles("pg").get(&2).map(String::as_str), Some("primary"));
+    assert_eq!(w.roles("pg").get(&0).map(String::as_str), Some("replica"));
+    assert!(w.faults.is_empty(), "{:?}", w.faults);
+}

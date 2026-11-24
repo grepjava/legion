@@ -113,6 +113,61 @@ pub(super) fn pass(
         st.phase = Phase::Forming;
     }
     let primary_ord = st.primary.as_deref().and_then(|p| ordinal(svc, p));
+    // The tasks of ordinal `p` that may run its database: each must stop
+    // before another member is promoted.
+    let fence_of = |p: Option<u32>| -> Vec<String> {
+        p.map(|p| {
+            tasks
+                .iter()
+                .filter(|t| {
+                    t.spec.slot == Some(p)
+                        && (!t.status.state.is_terminal() || t.status.state == TaskState::Orphaned)
+                })
+                .map(|t| t.uid().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+    };
+
+    // The operator's request, acted on once.
+    if let Some(q) = &r.request
+        && st.handled != Some(q.at)
+        && st.change.is_none()
+    {
+        st.handled = Some(q.at);
+        st.refused.clear();
+        let target = q.to.as_deref().map(|m| (m, ordinal(svc, m)));
+        let why = match target {
+            Some((m, None)) => Some(format!("{m} is not a member of {svc}")),
+            Some((m, Some(i))) if i >= n => Some(format!("{m} is not a member of {svc}")),
+            Some((m, Some(i))) if Some(i) == primary_ord => {
+                Some(format!("{m} is the primary already"))
+            }
+            None if q.kind == ChangeKind::Failover => {
+                Some("name the member to promote (--to)".to_owned())
+            }
+            _ => None,
+        };
+        match why {
+            Some(why) => st.refused = why,
+            None => {
+                st.change = Some(Change {
+                    kind: q.kind,
+                    from: st.primary.clone(),
+                    to: None,
+                    reason: match q.kind {
+                        ChangeKind::Switchover => "a switchover was asked for".to_owned(),
+                        ChangeKind::Failover => "a failover was asked for".to_owned(),
+                    },
+                    started: wall_ms(),
+                    force: q.force,
+                    fence: fence_of(primary_ord),
+                    target: q.to.clone(),
+                });
+                memory.unhealthy_since.remove(&uid);
+            }
+        }
+    }
 
     // The primary's health, and the change it calls for.
     let mut manual = None;
@@ -137,19 +192,7 @@ pub(super) fn pass(
             if served && (gone || now >= due) {
                 if r.failover == Failover::Automatic {
                     let from = st.primary.clone();
-                    let fence = primary_ord
-                        .map(|p| {
-                            tasks
-                                .iter()
-                                .filter(|t| {
-                                    t.spec.slot == Some(p)
-                                        && (!t.status.state.is_terminal()
-                                            || t.status.state == TaskState::Orphaned)
-                                })
-                                .map(|t| t.uid().to_owned())
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let fence = fence_of(primary_ord);
                     st.change = Some(Change {
                         kind: ChangeKind::Failover,
                         reason: format!(
@@ -162,6 +205,7 @@ pub(super) fn pass(
                         started: wall_ms(),
                         force: false,
                         fence,
+                        target: None,
                     });
                     memory.unhealthy_since.remove(&uid);
                 } else {
@@ -218,7 +262,14 @@ pub(super) fn pass(
             }
             if fenced {
                 let from = c.from.as_deref().and_then(|f| ordinal(svc, f));
-                match candidate(r, &st.primary_position, c.force, n, from, &status_of) {
+                let choice = Choice {
+                    force: c.force,
+                    n,
+                    from,
+                    target: c.target.as_deref().and_then(|t| ordinal(svc, t)),
+                    planned: c.kind == ChangeKind::Switchover,
+                };
+                match candidate(r, &st.primary_position, &choice, &status_of) {
                     Ok(i) => {
                         st.epoch += 1;
                         st.primary = Some(member(svc, i));
@@ -291,7 +342,11 @@ pub(super) fn pass(
     };
     for (i, t) in &current {
         let want = TaskReplication {
-            config: r.clone(),
+            // The operator's request is the leader's alone.
+            config: Replication {
+                request: None,
+                ..r.clone()
+            },
             epoch: st.epoch,
             role: if Some(*i) == named {
                 Role::Primary
@@ -398,19 +453,34 @@ fn behind_ok(r: &Replication, st: &ReplicationStatus, x: &spi::Status) -> bool {
     }
 }
 
+/// What a change of primary chooses among.
+struct Choice {
+    /// Pass over the lag, synchronous and catching-up checks.
+    force: bool,
+    /// The members: ordinals below it.
+    n: u32,
+    /// The old primary's ordinal.
+    from: Option<u32>,
+    /// The member the operator named.
+    target: Option<u32>,
+    /// A switchover: the new primary must have all the old one wrote.
+    planned: bool,
+}
+
 /// The replica to promote: of those heard from lately, not the old primary,
-/// the one furthest ahead, the lowest ordinal of equals; within
-/// `maximumLag` of the last primary position seen, and, with synchronous
-/// replicas, only once enough replicas reported that the furthest ahead
-/// surely holds every confirmed commit. `force` passes over both checks.
+/// the one furthest ahead (or the one named), the lowest ordinal of equals;
+/// within `maximumLag` of the last primary position seen, and, with
+/// synchronous replicas, only once enough replicas reported that the
+/// furthest ahead surely holds every confirmed commit. A switchover's waits
+/// until it holds all the old primary wrote: as far as any other replica
+/// and the last position seen of the primary. `force` passes over these.
 fn candidate<'a>(
     r: &Replication,
     primary_position: &Option<spi::Position>,
-    force: bool,
-    n: u32,
-    from: Option<u32>,
+    c: &Choice,
     status_of: &dyn Fn(u32) -> Option<&'a spi::Status>,
 ) -> Result<u32, String> {
+    let (force, n, from) = (c.force, c.n, c.from);
     let replicas: Vec<(u32, spi::Position)> = (0..n)
         .filter(|i| Some(*i) != from)
         .filter_map(|i| {
@@ -437,17 +507,41 @@ fn candidate<'a>(
                 }
         })
         .collect();
-    eligible
+    let furthest = replicas.iter().map(|(_, p)| *p).max();
+    if let Some(t) = c.target {
+        let Some((_, p)) = replicas.iter().find(|(i, _)| *i == t) else {
+            return Err(format!(
+                "the member asked for, ordinal {t}, is not heard from as a replica"
+            ));
+        };
+        if !force {
+            if !eligible.iter().any(|(i, _)| *i == t) {
+                return Err(format!("ordinal {t} is further behind than maximumLag"));
+            }
+            if c.planned && (Some(*p) < furthest || primary_position.is_some_and(|q| *p < q)) {
+                return Err(format!("waiting for ordinal {t} to catch up"));
+            }
+        }
+        return Ok(t);
+    }
+    let best = eligible
         .iter()
         .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
-        .map(|(i, _)| *i)
-        .ok_or_else(|| {
-            if replicas.is_empty() {
-                "no replica heard from lately".to_owned()
-            } else {
-                "every replica is further behind than maximumLag".to_owned()
-            }
-        })
+        .map(|(i, p)| (*i, *p));
+    if let Some((_, p)) = best
+        && c.planned
+        && !force
+        && primary_position.is_some_and(|q| p < q)
+    {
+        return Err("waiting for a replica to catch up with the primary".to_owned());
+    }
+    best.map(|(i, _)| i).ok_or_else(|| {
+        if replicas.is_empty() {
+            "no replica heard from lately".to_owned()
+        } else {
+            "every replica is further behind than maximumLag".to_owned()
+        }
+    })
 }
 
 /// Whether the task's node reads a task's `replication`: an agent before

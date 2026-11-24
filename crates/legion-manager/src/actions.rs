@@ -194,6 +194,58 @@ pub async fn restart(
     }
 }
 
+/// `legion replication switchover` and `failover`: a replicated Service's
+/// request for a new primary (`to`, or for a switchover the replica
+/// furthest ahead), which the leader acts on once (DESIGN.md §6.9); what
+/// was done, for the user.
+pub async fn replication_request(
+    api: &mut impl ObjectsApi,
+    namespace: String,
+    service: String,
+    kind: legion_api::replication::ChangeKind,
+    to: Option<String>,
+    force: bool,
+) -> Result<String, Status> {
+    let r#ref = ObjectRef {
+        kind: Kind::Service.to_string(),
+        namespace,
+        name: service,
+    };
+    loop {
+        let mut object = read(api.get(r#ref.clone()).await?)?;
+        if !object.spec["replication"].is_object() {
+            return Err(Status::failed_precondition(format!(
+                "{} replicates no database",
+                object.key()
+            )));
+        }
+        // Two requests within a millisecond are two requests.
+        let last = object.spec["replication"]["request"]["at"].as_i64();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64);
+        let request = legion_api::replication::ChangeRequest {
+            kind,
+            to: to.clone(),
+            force,
+            at: last.map_or(now, |l| now.max(l + 1)),
+        };
+        object.spec["replication"]["request"] = serde_json::to_value(&request).expect("serialises");
+        if let Some(resp) = write_over(api, &object).await? {
+            let what = match kind {
+                legion_api::replication::ChangeKind::Switchover => "switchover",
+                legion_api::replication::ChangeKind::Failover => "failover",
+            };
+            return Ok(format!(
+                "{} {what} asked for{} (version {}); follow it with legion replication status",
+                object.key(),
+                to.map(|t| format!(", to {t}")).unwrap_or_default(),
+                resp.object.unwrap_or_default().version
+            ));
+        }
+    }
+}
+
 /// `legion cronjob run`: a run of a CronJob now, outside its schedule, as
 /// the Job its schedule would make this minute (which a run due this
 /// minute then counts as its own); what was done, for the user. Its

@@ -53,6 +53,27 @@ pub struct Replication {
     /// What becomes of a member whose data cannot follow the primary.
     #[serde(default, skip_serializing_if = "Reclone::is_deny")]
     pub reclone: Reclone,
+    /// The operator's latest request for a new primary (`legion
+    /// replication switchover` and `failover`), acted on once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<ChangeRequest>,
+}
+
+/// An operator's request for a new primary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChangeRequest {
+    /// `switchover`: planned, the primary running; `failover`: the primary
+    /// lost, under `failover: manual`.
+    pub kind: ChangeKind,
+    /// The member to promote; unset, the replica furthest ahead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// Pass over the lag and synchronous checks.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
+    /// When it was asked, Unix milliseconds: a new time is a new request.
+    pub at: i64,
 }
 
 fn automatic() -> Failover {
@@ -199,6 +220,12 @@ pub struct ReplicationStatus {
     pub change: Option<Change>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_change: Option<LastChange>,
+    /// The operator's request last acted on (its `at`), and what came of
+    /// it when it was refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handled: Option<i64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub refused: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,6 +299,9 @@ pub struct Change {
     /// primary, so they wait.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fence: Vec<String>,
+    /// The member the operator asked for, if one was named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

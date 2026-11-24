@@ -1,9 +1,9 @@
 //! `legion`: the daemon (`legion daemon`) and the CLI that talks to it.
 
 mod activity;
+mod app;
 mod autolock;
 mod ca;
-mod app;
 mod cli;
 mod daemon;
 mod doctor;
@@ -509,6 +509,12 @@ enum Command {
         #[command(subcommand)]
         command: CronJobCommand,
     },
+    /// A replicated database's members (DESIGN.md §6.9): where each stands,
+    /// and a new primary by switchover or failover.
+    Replication {
+        #[command(subcommand)]
+        command: ReplicationCommand,
+    },
     /// The audit trail, oldest first: who changed what, opened which
     /// sessions, and what was refused (the cluster admin's only). Events
     /// name objects, never what they hold.
@@ -994,6 +1000,42 @@ pub enum CronJobCommand {
 }
 
 #[derive(Subcommand)]
+pub enum ReplicationCommand {
+    /// The members of SERVICE: each one's role, position and lag, the
+    /// primary Legion names, and any change of primary under way.
+    Status {
+        service: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// Planned: the primary stops cleanly, and once the replica TO (or the
+    /// one furthest ahead) holds all it wrote, that one is promoted.
+    Switchover {
+        service: String,
+        #[arg(long)]
+        to: Option<String>,
+        /// Promote without waiting for it to catch up.
+        #[arg(long)]
+        force: bool,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// The primary is lost (`failover: manual`): promote TO once the old
+    /// primary is fenced.
+    Failover {
+        service: String,
+        #[arg(long)]
+        to: String,
+        /// Pass over the lag and synchronous checks: writes the others
+        /// confirmed may be lost.
+        #[arg(long)]
+        force: bool,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum VolumeCommand {
     /// Move a Volume's data to NODE (its `spec.node`): copied while its
     /// tasks run, which then stop and start again there once the rest has
@@ -1458,7 +1500,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
             yes,
             pf_conf,
             ..
-        } => doctor::fix_pf(&legion_sys::Shell::new(), &pf_conf, &[doctor::LEGION_HOOKS], yes),
+        } => doctor::fix_pf(
+            &legion_sys::Shell::new(),
+            &pf_conf,
+            &[doctor::LEGION_HOOKS],
+            yes,
+        ),
         Command::Doctor { zfs_root, json, .. } => {
             doctor::run(&legion_sys::Shell::new(), zfs_root.as_deref(), json)
         }

@@ -10,7 +10,9 @@ use legion_api::app::{Catalog, CatalogApp, Manifest};
 /// The catalog at `base`.
 pub async fn catalog(base: &str) -> anyhow::Result<Catalog> {
     let url = format!("{}/catalog.json", base.trim_end_matches('/'));
-    let body = legion_image::fetch::get(&url).await.map_err(anyhow::Error::msg)?;
+    let body = legion_image::fetch::get(&url)
+        .await
+        .map_err(anyhow::Error::msg)?;
     serde_json::from_slice(&body).with_context(|| format!("reading {url}"))
 }
 
@@ -28,7 +30,9 @@ pub async fn app(base: &str, id: &str) -> anyhow::Result<(CatalogApp, Manifest)>
     } else {
         format!("{}/{}", base.trim_end_matches('/'), found.manifest_url)
     };
-    let body = legion_image::fetch::get(&url).await.map_err(anyhow::Error::msg)?;
+    let body = legion_image::fetch::get(&url)
+        .await
+        .map_err(anyhow::Error::msg)?;
     let text = String::from_utf8(body).with_context(|| format!("reading {url}"))?;
     let m = legion_api::app::manifest(&text).map_err(anyhow::Error::msg)?;
     Ok((found, m))
@@ -75,13 +79,20 @@ pub async fn show(base: &str, id: &str) -> anyhow::Result<()> {
         .variables
         .iter()
         .map(|v| {
-            let default = match (v.kind.as_str(), v.default.as_deref().filter(|d| !d.is_empty())) {
+            let default = match (
+                v.kind.as_str(),
+                v.default.as_deref().filter(|d| !d.is_empty()),
+            ) {
                 ("secret", None) => "(made up)".to_owned(),
                 (_, Some(d)) => d.to_owned(),
                 (_, None) if v.is_storage() => v.name.to_lowercase().replace('_', "-"),
                 (_, None) => "(empty: the app's own)".to_owned(),
             };
-            let kind = if v.is_storage() { "volume".to_owned() } else { v.kind.clone() };
+            let kind = if v.is_storage() {
+                "volume".to_owned()
+            } else {
+                v.kind.clone()
+            };
             [v.name.clone(), kind, default, v.label.clone()]
         })
         .collect();
@@ -114,11 +125,21 @@ pub async fn rendered(
     {
         bail!(
             "{id} has no variant {v}: {}",
-            m.variants.iter().map(|x| x.id.as_str()).collect::<Vec<_>>().join(", ")
+            m.variants
+                .iter()
+                .map(|x| x.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
-    legion_api::app::render(&m, &a.image, variant.as_deref(), &values, &legion_api::app::random_secret)
-        .map_err(anyhow::Error::msg)
+    legion_api::app::render(
+        &m,
+        &a.image,
+        variant.as_deref(),
+        &values,
+        &legion_api::app::random_secret,
+    )
+    .map_err(anyhow::Error::msg)
 }
 
 /// The stack `id` deploys as, `stack` in `namespace`: its objects, what
@@ -138,7 +159,10 @@ pub async fn stack(
         &compose,
         stack,
         namespace,
-        &legion_api::compose::Inputs { env: &get, read: &read },
+        &legion_api::compose::Inputs {
+            env: &get,
+            read: &read,
+        },
     )
     .map_err(|e| anyhow::anyhow!("{id}: {e}"))?;
     for w in &converted.warnings {

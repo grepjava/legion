@@ -103,7 +103,11 @@ pub fn fix_pf(
         }
         Plan::Nothing => println!(
             "Loads {path} into pf{}.",
-            if at_boot { "" } else { ", and has pf start at boot (pf_enable=YES)" }
+            if at_boot {
+                ""
+            } else {
+                ", and has pf start at boot (pf_enable=YES)"
+            }
         ),
         Plan::Change { .. } => {
             let backup = format!("{path}.legion-<time>");
@@ -127,17 +131,34 @@ To undo: {}",
             anyhow::bail!("nothing changed");
         }
     }
-    let done = pffix::apply(sys, &files, path, &plan, &pffix::stamp(std::time::SystemTime::now()))
-        .map_err(anyhow::Error::msg)?;
+    let done = pffix::apply(
+        sys,
+        &files,
+        path,
+        &plan,
+        &pffix::stamp(std::time::SystemTime::now()),
+    )
+    .map_err(anyhow::Error::msg)?;
     for step in &done.steps {
         println!("  {step}");
     }
     if let Some(b) = &done.backup {
         println!("To undo: {}", pffix::undo(path, b));
     }
-    let after: Vec<_> = sets.iter().map(|h| check::pf_anchors(sys, h.anchor, h.lines)).collect();
+    let after: Vec<_> = sets
+        .iter()
+        .map(|h| check::pf_anchors(sys, h.anchor, h.lines))
+        .collect();
     for f in &after {
-        print!("{}", line(check::label(f.state, true), &f.id, &f.detail, f.remedy.as_deref().unwrap_or("")));
+        print!(
+            "{}",
+            line(
+                check::label(f.state, true),
+                &f.id,
+                &f.detail,
+                f.remedy.as_deref().unwrap_or("")
+            )
+        );
     }
     if after.iter().any(|f| f.state != State::Met) {
         anyhow::bail!("pf still does not call every anchor");

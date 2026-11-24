@@ -393,7 +393,9 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                 status.node_id
             );
             // On the manager's own host, pf is this host's to set up.
-            let host = host_port(server).rsplit_once(':').map_or(host_port(server), |(h, _)| h);
+            let host = host_port(server)
+                .rsplit_once(':')
+                .map_or(host_port(server), |(h, _)| h);
             if matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
                 crate::doctor::offer_pf_fix();
             }
@@ -919,7 +921,8 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             let stack = name.unwrap_or_else(|| app.clone());
             let namespace = namespace.unwrap_or_else(|| stack.clone());
             let (converted, env) =
-                crate::app::stack(&catalog, &app, &set, variant.as_deref(), &stack, &namespace).await?;
+                crate::app::stack(&catalog, &app, &set, variant.as_deref(), &stack, &namespace)
+                    .await?;
             let _ = dry_run;
             // Made only when missing, allowing what its containers ask
             // for; one there is keeps what it allows, as the admin set it.
@@ -947,7 +950,12 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             let secrets: Vec<_> = env
                 .iter()
                 .filter(|(k, _)| !set.iter().any(|s| s.starts_with(&format!("{k}="))))
-                .filter(|(k, _)| k.contains("PASSWORD") || k.contains("SECRET") || k.contains("TOKEN") || k.ends_with("_KEY"))
+                .filter(|(k, _)| {
+                    k.contains("PASSWORD")
+                        || k.contains("SECRET")
+                        || k.contains("TOKEN")
+                        || k.ends_with("_KEY")
+                })
                 .collect();
             for (k, v) in secrets {
                 println!("{k}={v}  (made up: keep it)");
@@ -1045,10 +1053,7 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
         Command::Node {
             command: crate::NodeCommand::Lead { node },
         } => {
-            let r = cluster
-                .lead(pb::LeadRequest { node })
-                .await?
-                .into_inner();
+            let r = cluster.lead(pb::LeadRequest { node }).await?.into_inner();
             println!(
                 "{} leads now; nothing could be written for {:.1} s, and running tasks carried on",
                 r.leader,
@@ -1435,6 +1440,9 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             .map_err(|s| anyhow::anyhow!("{}", s.message()))?;
             println!("{done}");
         }
+        Command::Replication { command } => {
+            println!("{}", replication(&mut objects, command).await?);
+        }
         Command::Reach { namespace } => {
             let namespace = namespace.unwrap_or_else(|| "default".into());
             let r = cluster
@@ -1782,6 +1790,128 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
     Ok(())
 }
 
+/// `legion replication`: what was done, or where the members stand.
+async fn replication(
+    objects: &mut Objects,
+    command: crate::ReplicationCommand,
+) -> anyhow::Result<String> {
+    use crate::ReplicationCommand as C;
+    use legion_api::replication::ChangeKind;
+    let (service, namespace, kind, to, force) = match command {
+        C::Status { service, namespace } => {
+            let o = objects
+                .get(ObjectRef {
+                    kind: Kind::Service.as_str().into(),
+                    namespace: namespace.unwrap_or_default(),
+                    name: service,
+                })
+                .await
+                .map_err(|s| anyhow::anyhow!("{}", s.message()))?;
+            let o = Object::try_from(o.into_inner())?;
+            let status: legion_api::service::ServiceStatus =
+                serde_json::from_value(o.status.clone()).unwrap_or_default();
+            let Some(st) = status.replication else {
+                bail!("{} replicates no database", o.key());
+            };
+            return Ok(replication_table(&st));
+        }
+        C::Switchover {
+            service,
+            to,
+            force,
+            namespace,
+        } => (service, namespace, ChangeKind::Switchover, to, force),
+        C::Failover {
+            service,
+            to,
+            force,
+            namespace,
+        } => (service, namespace, ChangeKind::Failover, Some(to), force),
+    };
+    legion_manager::actions::replication_request(
+        objects,
+        namespace.unwrap_or_default(),
+        service,
+        kind,
+        to,
+        force,
+    )
+    .await
+    .map_err(|s| anyhow::anyhow!("{}", s.message()))
+}
+
+/// A replicated database's status, for people.
+pub(crate) fn replication_table(st: &legion_api::replication::ReplicationStatus) -> String {
+    use std::fmt::Write;
+    let mut out = format!(
+        "primary {} (epoch {}), {}",
+        st.primary.as_deref().unwrap_or("none"),
+        st.epoch,
+        st.phase.as_str()
+    );
+    if !st.message.is_empty() {
+        let _ = write!(out, ": {}", st.message);
+    }
+    out.push('\n');
+    let _ = writeln!(
+        out,
+        "{:<20} {:<8} {:<8} {:<22} {:<12} TASK",
+        "MEMBER", "ROLE", "HEALTHY", "POSITION", "LAG"
+    );
+    for (name, m) in &st.members {
+        let lag = m
+            .status
+            .lag
+            .as_ref()
+            .map_or(String::new(), |l| match (l.bytes, l.seconds) {
+                (Some(b), _) => legion_api::quantity::Bytes(b).to_string(),
+                (None, Some(s)) => format!("{s:.1}s"),
+                _ => String::new(),
+            });
+        let _ = writeln!(
+            out,
+            "{:<20} {:<8} {:<8} {:<22} {:<12} {}{}",
+            name,
+            m.status.role.as_str(),
+            if m.status.healthy { "yes" } else { "no" },
+            m.status.position.map_or(String::new(), |p| p.to_string()),
+            lag,
+            m.task,
+            if m.error.is_empty() {
+                String::new()
+            } else {
+                format!("  ({})", m.error)
+            }
+        );
+    }
+    if let Some(c) = &st.change {
+        let _ = writeln!(
+            out,
+            "under way: {:?} from {} to {}: {}",
+            c.kind,
+            c.from.as_deref().unwrap_or("none"),
+            c.to.as_deref()
+                .or(c.target.as_deref())
+                .unwrap_or("(to choose)"),
+            c.reason
+        );
+    }
+    if let Some(l) = &st.last_change {
+        let _ = writeln!(
+            out,
+            "last change: {:?} from {} to {}, {}",
+            l.kind,
+            l.from.as_deref().unwrap_or("none"),
+            l.to,
+            l.reason
+        );
+    }
+    if !st.refused.is_empty() {
+        let _ = writeln!(out, "last request refused: {}", st.refused);
+    }
+    out.trim_end().to_owned()
+}
+
 /// Rolls a service back to the spec its latest update came from; what
 /// happened, for people.
 pub(crate) async fn rollback(
@@ -1846,7 +1976,8 @@ async fn stack(objects: &mut Objects, command: StackCommand) -> anyhow::Result<(
                 .await;
             match found {
                 Err(s) if s.code() == tonic::Code::NotFound => {
-                    let ns = Object::new(Kind::Namespace, "", &namespace, converted.namespace_spec());
+                    let ns =
+                        Object::new(Kind::Namespace, "", &namespace, converted.namespace_spec());
                     apply(objects, &ns).await?;
                 }
                 Err(s) if s.code() != tonic::Code::PermissionDenied => {
