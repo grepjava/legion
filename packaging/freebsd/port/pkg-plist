@@ -3,6 +3,7 @@ share/man/man1/legion.1.gz
 etc/newsyslog.conf.d/legion.conf
 etc/rc.d/legion
 @dir libexec/legion/volume
+libexec/legion/replication/postgres
 @dir libexec/legion
 %%PORTEXAMPLES%%%%EXAMPLESDIR%%/volume-plugins/README.md
 %%PORTEXAMPLES%%%%EXAMPLESDIR%%/volume-plugins/hostpath

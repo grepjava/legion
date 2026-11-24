@@ -8,6 +8,7 @@
 #   etc/rc.d/legion
 #   etc/newsyslog.conf.d/legion.conf
 #   libexec/legion/volume/          (volume plugins go here)
+#   libexec/legion/replication/postgres  (replication plugins, DESIGN.md 6.9)
 #   share/doc/legion/
 #   share/man/man1/legion.1
 #
@@ -26,18 +27,22 @@ major=$(uname -r | cut -d . -f 1)
 arch=$(uname -p)
 name=legion-${version}-freebsd${major}-${arch}
 
-cargo build --release --locked -p legion
+cargo build --release --locked -p legion -p legion-pg
 
 stage=$(mktemp -d -t legion-release)
 trap 'rm -rf "$stage"' EXIT
 root=$stage/$name
 install -d "$root/bin" "$root/etc/rc.d" "$root/etc/newsyslog.conf.d" \
-    "$root/libexec/legion/volume" "$root/share/doc/legion" "$root/share/man/man1"
+    "$root/libexec/legion/volume" "$root/libexec/legion/replication" \
+    "$root/share/doc/legion" "$root/share/man/man1"
 install -s -m 755 target/release/legion "$root/bin/legion"
+install -s -m 755 target/release/legion-replication-postgres \
+    "$root/libexec/legion/replication/postgres"
 install -m 555 packaging/freebsd/rc.d/legion "$root/etc/rc.d/legion"
 install -m 644 packaging/freebsd/newsyslog.conf.d/legion.conf \
     "$root/etc/newsyslog.conf.d/legion.conf"
-install -m 644 README.md CLI.md LICENSE docs/DESIGN.md "$root/share/doc/legion/"
+install -m 644 README.md CLI.md LICENSE docs/DESIGN.md docs/REPLICATION.md \
+    "$root/share/doc/legion/"
 install -m 444 man/legion.1 "$root/share/man/man1/legion.1"
 
 mkdir -p "$out"

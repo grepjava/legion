@@ -180,6 +180,12 @@ enum Command {
         /// /usr/local/libexec/legion/volume].
         #[arg(long)]
         volume_plugins: Option<PathBuf>,
+        /// Where the node's replication plugins are: executables, by the
+        /// name a Service's `replication.plugin` gives, mounted read-only
+        /// into the containers that run them [default:
+        /// /usr/local/libexec/legion/replication].
+        #[arg(long)]
+        replication_plugins: Option<PathBuf>,
         /// The file of iSCSI targets this node writes for the LUNs it
         /// provides (`iscsi: { node }`), which ctld's own UCL
         /// configuration includes (`.include "FILE"`); without it the node
@@ -1363,6 +1369,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             mesh_relay,
             load_balancer_interface,
             volume_plugins,
+            replication_plugins,
             iscsi_targets,
             iscsi_portal_group,
             iscsi_portal,
@@ -1420,6 +1427,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 mesh_relay,
                 load_balancer_interface,
                 volume_plugins,
+                replication_plugins,
                 iscsi_targets,
                 iscsi_portal_group,
                 iscsi_portal,

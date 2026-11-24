@@ -19,9 +19,9 @@ USES=		cargo
 USE_GITHUB=	yes
 GH_ACCOUNT=	grepjava
 
-CARGO_INSTALL_PATH=	crates/legion
+CARGO_INSTALL_PATH=	crates/legion crates/legion-pg
 
-PORTDOCS=	CLI.md DESIGN.md README.md
+PORTDOCS=	CLI.md DESIGN.md README.md REPLICATION.md
 
 OPTIONS_DEFINE=	DOCS EXAMPLES
 
@@ -40,6 +40,10 @@ post-install:
 	${INSTALL_DATA} ${WRKSRC}/packaging/freebsd/newsyslog.conf.d/legion.conf \
 		${STAGEDIR}${PREFIX}/etc/newsyslog.conf.d/legion.conf
 	${MKDIR} ${STAGEDIR}${PREFIX}/libexec/legion/volume
+	${MKDIR} ${STAGEDIR}${PREFIX}/libexec/legion/replication
+	${MV} ${STAGEDIR}${PREFIX}/bin/legion-replication-postgres \
+		${STAGEDIR}${PREFIX}/libexec/legion/replication/postgres
+	${STRIP_CMD} ${STAGEDIR}${PREFIX}/libexec/legion/replication/postgres
 	${INSTALL_MAN} ${WRKSRC}/man/legion.1 ${STAGEDIR}${PREFIX}/share/man/man1/legion.1
 
 post-install-EXAMPLES-on:
@@ -54,6 +58,6 @@ post-install-EXAMPLES-on:
 post-install-DOCS-on:
 	${MKDIR} ${STAGEDIR}${DOCSDIR}
 	${INSTALL_DATA} ${WRKSRC}/README.md ${WRKSRC}/CLI.md ${WRKSRC}/docs/DESIGN.md \
-		${STAGEDIR}${DOCSDIR}
+		${WRKSRC}/docs/REPLICATION.md ${STAGEDIR}${DOCSDIR}
 
 .include <bsd.port.post.mk>

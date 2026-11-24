@@ -45,6 +45,8 @@ pub struct Options {
     pub mesh_relay: bool,
     /// Where the volume plugins are, if not in the default place.
     pub volume_plugins: Option<PathBuf>,
+    /// Where the replication plugins are, if not in the default place.
+    pub replication_plugins: Option<PathBuf>,
     pub iscsi_targets: Option<PathBuf>,
     pub iscsi_portal_group: String,
     pub iscsi_portal: Option<String>,
@@ -570,6 +572,9 @@ async fn start_agent(
     config.zfs_root = opts.zfs_root.clone();
     if let Some(dir) = &opts.volume_plugins {
         config.plugin_dir = dir.clone();
+    }
+    if let Some(dir) = &opts.replication_plugins {
+        config.replication_dir = dir.clone();
     }
     if let Some(file) = &opts.iscsi_targets {
         legion_agent::exports::ensure_targets(file, &opts.iscsi_portal_group)
