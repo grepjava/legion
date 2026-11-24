@@ -2066,7 +2066,10 @@ pub(crate) fn endpoints(
             continue;
         };
         let status: TaskStatus = serde_json::from_value(t.status.clone()).unwrap_or_default();
-        if status.state != TaskState::Running {
+        // A starting task with its pod's address is a source too: its init
+        // containers (a migration, a database member's `prepare`) reach
+        // its namespace's services before its own containers run.
+        if !matches!(status.state, TaskState::Starting | TaskState::Running) {
             continue;
         }
         let Some(ip) = status.ip.as_deref().and_then(|s| s.parse().ok()) else {
@@ -2085,6 +2088,7 @@ pub(crate) fn endpoints(
             .or_default();
         entry.1.push(ip);
         if spec.desired_state == DesiredState::Running
+            && status.state == TaskState::Running
             && status.ready
             && heard.contains(spec.node.as_str())
         {
@@ -2592,6 +2596,54 @@ mod tests {
         );
         let out = routes(&[plain, theirs].into_iter().map(|o| (o.key(), o)).collect());
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// A task still starting, its pod's address known, is a source of its
+    /// namespace (network policy lets its init containers in) but no
+    /// endpoint.
+    #[test]
+    fn a_starting_task_is_a_source_but_no_endpoint() {
+        let task = |name: &str, state: &str, ip: &str| {
+            let mut t = Object::new(
+                Kind::Task,
+                "a",
+                name,
+                serde_json::json!({
+                    "service": "web",
+                    "serviceUid": "svc-uid",
+                    "serviceGeneration": 1,
+                    "node": "n1",
+                    "pod": {"containers": [{"name": "c", "image": "x"}]},
+                }),
+            );
+            t.status = serde_json::json!({"state": state, "ip": ip, "ready": true});
+            t
+        };
+        let mut web = Object::new(
+            Kind::Service,
+            "a",
+            "web",
+            serde_json::json!({"pod": {"containers": [{"name": "c", "image": "x"}]}}),
+        );
+        web.metadata.uid = "svc-uid".into();
+        let services = [web].into_iter().map(|o| (o.key(), o)).collect();
+        let tasks = [
+            task("web-1-1", "running", "10.200.0.2"),
+            task("web-2-1", "starting", "10.200.0.3"),
+            task("web-3-1", "assigned", "10.200.0.4"),
+        ]
+        .into_iter()
+        .map(|o| (o.key(), o))
+        .collect();
+        let mut n1 = Object::new(Kind::Node, "", "n1", serde_json::json!({}));
+        n1.status = serde_json::json!({"state": "ready"});
+        let nodes = [n1].into_iter().map(|o| (o.key(), o)).collect();
+        let out = endpoints(&services, &tasks, &nodes);
+        assert_eq!(
+            out[0].alive,
+            [Ipv4Addr::new(10, 200, 0, 2), Ipv4Addr::new(10, 200, 0, 3)]
+        );
+        assert_eq!(out[0].ready, [Ipv4Addr::new(10, 200, 0, 2)]);
     }
 
     /// A Job's running tasks go out as its namespace's, with no VIP, ports
