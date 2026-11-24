@@ -92,6 +92,22 @@ pub trait Runtime: Send + Sync + 'static {
     fn wait(&self, id: &str) -> impl Future<Output = Result<i32>> + Send;
     /// Runs a command in a running container and collects its output.
     fn exec(&self, id: &str, cmd: &[String]) -> impl Future<Output = Result<ExecOutput>> + Send;
+    /// As `exec`, with `input` as the command's standard input.
+    fn exec_input(
+        &self,
+        id: &str,
+        cmd: &[String],
+        input: &[u8],
+    ) -> impl Future<Output = Result<ExecOutput>> + Send {
+        let _ = (id, cmd, input);
+        async { Err(Error::Failed("this runtime gives an exec no input".into())) }
+    }
+    /// Gives a created container's command `input` as its standard input
+    /// (otherwise empty), before it is started.
+    fn set_input(&self, id: &str, input: &[u8]) -> impl Future<Output = Result<()>> + Send {
+        let _ = (id, input);
+        async { Err(Error::Failed("this runtime gives a container no input".into())) }
+    }
     /// Starts a command in a running container with its output streamed
     /// and, with `stdin`, its input from the caller.
     fn exec_attach(

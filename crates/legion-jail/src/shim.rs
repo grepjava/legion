@@ -227,7 +227,7 @@ mod imp {
     use legion_runtime::Output;
 
     use crate::log::Writer;
-    use crate::state::{self, EXIT, Exit, LOG, RECORD, RUN, Record, Run};
+    use crate::state::{self, EXIT, Exit, LOG, RECORD, RUN, Record, Run, STDIN};
 
     /// How much output a container keeps, per file (two are kept).
     const LOG_MAX: u64 = 8 << 20;
@@ -300,6 +300,13 @@ mod imp {
         let (out_r, out_w) = pipe()?;
         let (err_r, err_w) = pipe()?;
         let (st_r, st_w) = pipe()?;
+        // Opened here: inside the jail the container's directory is out of
+        // sight.
+        let input = std::fs::File::open(dir.join(STDIN)).ok();
+        let input_fd = input.as_ref().map_or(-1, |f| {
+            use std::os::fd::AsRawFd;
+            f.as_raw_fd()
+        });
         // SAFETY: this process has one thread, so the child may do anything
         // before exec.
         let pid = unsafe { libc::fork() };
@@ -308,7 +315,7 @@ mod imp {
         }
         if pid == 0 {
             // SAFETY: in the child, which never returns.
-            unsafe { child(rec, jid, &[out_w, err_w], st_w) };
+            unsafe { child(rec, jid, &[out_w, err_w], st_w, input_fd) };
         }
         // SAFETY: closing our copies of the child's ends.
         unsafe {
@@ -316,6 +323,7 @@ mod imp {
             libc::close(err_w);
             libc::close(st_w);
         }
+        drop(input);
         let failure = read_to_end(st_r);
         if !failure.is_empty() {
             let mut status = 0;
@@ -462,7 +470,7 @@ mod imp {
     ///
     /// # Safety
     /// Only in a child just forked from a single-threaded process.
-    unsafe fn child(rec: &Record, jid: i32, out: &[RawFd; 2], status: RawFd) -> ! {
+    unsafe fn child(rec: &Record, jid: i32, out: &[RawFd; 2], status: RawFd, input: RawFd) -> ! {
         // One started with stdio closed may have been given 0, 1 or 2 for
         // any of its descriptors: each is moved above 2 before the
         // command's stdio is set up, as `dup2` onto itself would leave it
@@ -498,12 +506,17 @@ mod imp {
                 Err(e) => fail(e),
             }
         };
-        // SAFETY: the command's stdio: no input, output to the pipes.
+        // SAFETY: the command's stdio: its input if it was given one, else
+        // none, and output to the pipes.
         unsafe {
-            let null = above(libc::open(
-                c"/dev/null".as_ptr(),
-                libc::O_RDONLY | libc::O_CLOEXEC,
-            ));
+            let null = if input >= 0 {
+                above(input)
+            } else {
+                above(libc::open(
+                    c"/dev/null".as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC,
+                ))
+            };
             let (stdout, stderr) = (above(out[0]), above(out[1]));
             if null >= 0 {
                 libc::dup2(null, 0);

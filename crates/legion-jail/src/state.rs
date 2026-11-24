@@ -116,6 +116,9 @@ pub const STARTING: &str = "starting.json";
 pub const RUN: &str = "run.json";
 pub const EXIT: &str = "exit.json";
 pub const LOG: &str = "log";
+/// What the command reads on its standard input, when given one
+/// (`Runtime::set_input`); otherwise it reads nothing.
+pub const STDIN: &str = "stdin";
 /// The supervisor's own complaints.
 pub const SHIM_LOG: &str = "shim.log";
 

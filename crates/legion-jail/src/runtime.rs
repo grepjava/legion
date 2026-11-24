@@ -1781,54 +1781,21 @@ impl legion_runtime::Runtime for JailRuntime {
     }
 
     async fn exec(&self, id: &str, cmd: &[String]) -> Result<ExecOutput> {
-        let (_, jid) = self.running_jid(id)?;
-        let dir = self.container_dir(id);
-        let mut args: Vec<OsString> = vec![
-            "exec".into(),
-            dir.into_os_string(),
-            jid.to_string().into(),
-            Terminal::None.arg().into(),
-        ];
-        args.extend(cmd.iter().map(OsString::from));
-        let refs: Vec<&std::ffi::OsStr> = args.iter().map(OsString::as_os_str).collect();
-        let mut command = self.shim_command(&refs);
-        // In a group of its own, which goes if this future is dropped
-        // first; kill_on_drop has tokio reap the command then.
-        command
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .process_group(0)
-            .kill_on_drop(true);
-        let mut child = command.spawn().map_err(internal)?;
-        let group = KillGroup(child.id());
-        // The output to its end before the command is reaped: until then
-        // its id, and its group's, are no one else's, even if what it
-        // started holds the output open after it ends.
-        let (mut stdout, mut stderr) = (child.stdout.take(), child.stderr.take());
-        let (out, err) = tokio::try_join!(
-            async {
-                match &mut stdout {
-                    Some(s) => read_capped(s, EXEC_OUTPUT).await,
-                    None => Ok(Vec::new()),
-                }
-            },
-            async {
-                match &mut stderr {
-                    Some(s) => read_capped(s, EXEC_OUTPUT).await,
-                    None => Ok(Vec::new()),
-                }
-            },
-        )
-        .map_err(internal)?;
-        let status = child.wait().await;
-        // Reaped now, so its id may be another's soon.
-        group.disarm();
-        Ok(ExecOutput {
-            exit_code: exit_code(status.map_err(internal)?),
-            stdout: out,
-            stderr: err,
-        })
+        self.exec_with(id, cmd, None).await
+    }
+
+    async fn exec_input(&self, id: &str, cmd: &[String], input: &[u8]) -> Result<ExecOutput> {
+        self.exec_with(id, cmd, Some(input)).await
+    }
+
+    async fn set_input(&self, id: &str, input: &[u8]) -> Result<()> {
+        self.record(id)?;
+        let path = self.container_dir(id).join(state::STDIN);
+        let mut f = std::fs::OpenOptions::new();
+        f.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut f, 0o600);
+        std::io::Write::write_all(&mut f.open(&path).map_err(internal)?, input).map_err(internal)
     }
 
     async fn exec_attach(
@@ -2410,6 +2377,79 @@ fn read_packages(dbdir: &Path) -> std::result::Result<Vec<u8>, legion_image::Err
 /// Whether SQLite's standard error says a statement failed.
 fn sqlite_failed(stderr: &str) -> bool {
     stderr.to_ascii_lowercase().contains("error")
+}
+
+impl JailRuntime {
+    /// `exec`, with `input` as the command's standard input if given.
+    async fn exec_with(&self, id: &str, cmd: &[String], input: Option<&[u8]>) -> Result<ExecOutput> {
+        let (_, jid) = self.running_jid(id)?;
+        let dir = self.container_dir(id);
+        let mut args: Vec<OsString> = vec![
+            "exec".into(),
+            dir.into_os_string(),
+            jid.to_string().into(),
+            Terminal::None.arg().into(),
+        ];
+        args.extend(cmd.iter().map(OsString::from));
+        let refs: Vec<&std::ffi::OsStr> = args.iter().map(OsString::as_os_str).collect();
+        let mut command = self.shim_command(&refs);
+        // In a group of its own, which goes if this future is dropped
+        // first; kill_on_drop has tokio reap the command then.
+        command
+            .stdin(if input.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(internal)?;
+        let group = KillGroup(child.id());
+        // Written aside: a command that reads none of it must not hold up
+        // the reading of its output; dropping the pipe ends its input.
+        let feed = match (input, child.stdin.take()) {
+            (Some(bytes), Some(mut pipe)) => {
+                let bytes = bytes.to_vec();
+                Some(tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = pipe.write_all(&bytes).await;
+                }))
+            }
+            _ => None,
+        };
+        // The output to its end before the command is reaped: until then
+        // its id, and its group's, are no one else's, even if what it
+        // started holds the output open after it ends.
+        let (mut stdout, mut stderr) = (child.stdout.take(), child.stderr.take());
+        let (out, err) = tokio::try_join!(
+            async {
+                match &mut stdout {
+                    Some(s) => read_capped(s, EXEC_OUTPUT).await,
+                    None => Ok(Vec::new()),
+                }
+            },
+            async {
+                match &mut stderr {
+                    Some(s) => read_capped(s, EXEC_OUTPUT).await,
+                    None => Ok(Vec::new()),
+                }
+            },
+        )
+        .map_err(internal)?;
+        if let Some(f) = feed {
+            f.abort();
+        }
+        let status = child.wait().await;
+        // Reaped now, so its id may be another's soon.
+        group.disarm();
+        Ok(ExecOutput {
+            exit_code: exit_code(status.map_err(internal)?),
+            stdout: out,
+            stderr: err,
+        })
+    }
 }
 
 #[cfg(test)]
