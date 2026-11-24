@@ -1518,9 +1518,9 @@ fn new_task(
         pod: s.spec.pod.clone(),
         images: pins.clone(),
         snapshot: None,
-        // Set by the replication pass once the task is on a node that
-        // reads it.
-        replication: None,
+        // A database's member knows its role from the start, as its agent
+        // may start it before the next pass: the topology follows.
+        replication: replication::initial(s, replica),
     };
     let mut object = Object::new(
         Kind::Task,
@@ -1677,6 +1677,9 @@ fn eligible(
     }
     if n.status.platform.no_limits && s.spec.pod.limited() {
         return Err("no limits (kern.racct.enable)");
+    }
+    if s.spec.replication.is_some() && !replication::reads(n) {
+        return Err("its agent is too old to replicate a database (protocol 4)");
     }
     let (os, arch, linux) = n.status.platform.runs();
     if s.refused.contains(&(os.to_owned(), arch.to_owned(), linux)) {

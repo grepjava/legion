@@ -590,9 +590,43 @@ fn reads_replication(t: &Task, nodes: &[Node]) -> bool {
     nodes
         .iter()
         .find(|n| n.name() == t.spec.node)
-        .is_some_and(|n| {
-            legion_api::protocol::Protocol::said(n.status.protocol.speaks, n.status.protocol.oldest)
-                .speaks
-                >= REPLICATES
-        })
+        .is_some_and(reads)
+}
+
+/// Whether a node's agent reads a task's `replication`.
+pub(super) fn reads(n: &Node) -> bool {
+    legion_api::protocol::Protocol::said(n.status.protocol.speaks, n.status.protocol.oldest).speaks
+        >= REPLICATES
+}
+
+/// What a new task of ordinal `slot` of a replicated Service is told at
+/// first: its role as recorded (ordinal 0 before any primary is named;
+/// none while one is being replaced), the epoch, and no topology yet,
+/// which the pass gives it, so a replica waits at `prepare`.
+pub(super) fn initial(s: &Service, slot: Option<u32>) -> Option<TaskReplication> {
+    let r = s.spec.replication.as_ref()?;
+    let svc = &s.object.metadata.name;
+    let st: Option<ReplicationStatus> = s
+        .object
+        .status
+        .get("replication")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let named = match &st {
+        None => Some(0),
+        Some(st) if st.change.as_ref().is_some_and(|c| c.to.is_none()) => None,
+        Some(st) => st.primary.as_deref().and_then(|p| ordinal(svc, p)),
+    };
+    Some(TaskReplication {
+        config: Replication {
+            request: None,
+            ..r.clone()
+        },
+        epoch: st.as_ref().map_or(1, |st| st.epoch.max(1)),
+        role: if named.is_some() && named == slot {
+            Role::Primary
+        } else {
+            Role::Replica
+        },
+        topology: spi::Topology::default(),
+    })
 }

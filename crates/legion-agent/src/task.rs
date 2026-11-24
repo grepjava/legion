@@ -53,8 +53,7 @@ pub(crate) enum Msg {
 
 /// What each member of a replicated database on the node last said, by
 /// task uid.
-pub(crate) type Members =
-    Arc<Mutex<BTreeMap<String, legion_api::replication::MemberReport>>>;
+pub(crate) type Members = Arc<Mutex<BTreeMap<String, legion_api::replication::MemberReport>>>;
 
 pub(crate) struct Ctx<R, C> {
     pub runtime: Arc<R>,
@@ -462,6 +461,9 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             match self.rx.recv().await {
                 Some(Msg::Stop) => return Abort::Stopped,
                 Some(Msg::Pause(p)) => self.paused = p,
+                // Told while starting: `prepare` reads it when it tries
+                // again, and the member is tended from it once running.
+                Some(Msg::Replication(r)) => self.a.spec.replication = r.map(|r| *r),
                 Some(_) => {}
                 None => return Abort::Closing,
             }

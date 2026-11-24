@@ -5485,3 +5485,35 @@ fn a_switchover_promotes_the_member_asked_for_once_it_has_caught_up() {
     assert_eq!(w.roles("pg").get(&0).map(String::as_str), Some("replica"));
     assert!(w.faults.is_empty(), "{:?}", w.faults);
 }
+
+/// A member's task carries its role from the moment it is made, as its
+/// agent may start it before the next pass; a node too old to read it gets
+/// none.
+#[test]
+fn a_members_task_is_made_knowing_its_role_and_kept_off_old_nodes() {
+    let mut w = World::new();
+    w.node("old", &[]);
+    w.node("new", &[]);
+    w.nodes[1].status.protocol = legion_api::protocol::Protocol::current();
+    w.service("pg", &DATABASE.replace("replicas: 3", "replicas: 1"));
+    let p = w.plan();
+    let made: Vec<TaskSpecOf> = p
+        .actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Create(o) if o.kind == Kind::Task => {
+                Some(serde_json::from_value(o.spec.clone()).unwrap())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(made.len(), 1, "{:?}", p.actions);
+    let r = made[0].replication.as_ref().expect("told at once");
+    assert_eq!(r.role, legion_api::replication::spi::Role::Primary);
+    assert_eq!(r.epoch, 1);
+    w.apply(p.actions);
+    w.settle();
+    assert_eq!(w.placed("pg"), ["new"]);
+}
+
+type TaskSpecOf = legion_api::task::TaskSpec;
