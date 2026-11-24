@@ -1,0 +1,20 @@
+[package]
+name = "legion-pg"
+description = "Legion's PostgreSQL replication plugin (docs/REPLICATION.md, SPI v1)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "legion-replication-postgres"
+path = "src/main.rs"
+
+[dependencies]
+legion-api.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

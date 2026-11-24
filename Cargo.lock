@@ -1878,6 +1878,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "legion-pg"
+version = "0.2.0"
+dependencies = [
+ "legion-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "legion-pki"
 version = "0.2.0"
 dependencies = [
