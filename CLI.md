@@ -144,6 +144,17 @@ Trigger a rolling restart (`restartedAt`) or roll back to the previous spec.
 ### `legion cronjob run <CRONJOB> [-n <NS>]`
 Trigger a CronJob immediately outside its schedule.
 
+### `legion replication <status|switchover|failover> <SERVICE> [-n <NS>]`
+A replicated database's members (DESIGN.md 6.9, docs/REPLICATION.md).
+`status` shows each member's role, health, position and lag, the primary
+Legion names, any change under way and the last one. `switchover [--to
+MEMBER] [--force]` stops the primary cleanly and promotes MEMBER (or the
+replica furthest ahead) once it holds all the old primary wrote.
+`failover --to MEMBER [--force]` promotes MEMBER when the primary is lost
+under `failover: manual`; `--force` passes over the lag and synchronous
+checks. Each is a request in the Service's spec, acted on once; a refused
+one is said in `status`.
+
 ---
 
 ## Observability, Storage, Network & Sessions

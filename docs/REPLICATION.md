@@ -1,7 +1,7 @@
 # Database replication plugins (SPI v1)
 
-**Status: draft for review, nothing built.** The Legion side is in
-DESIGN.md 6.9.
+**Status: SPI v1, built** (2026-11-24). The Legion side is in DESIGN.md
+6.9.
 
 A stateful Service can have its members replicate a database among
 themselves: one primary, the others replicas streaming from it. Legion
@@ -108,6 +108,10 @@ Every request has these fields. Operations add their own.
   epoch lower than one it already sent to that member.
 - `topology` is Legion's current view. `primary` is absent while there
   is none (before the first start, or during a failover).
+- `role` (`prepare` only) is the role to start in. `reclone` (`prepare`
+  of a replica only) is true when the member answered `diverged` before
+  and the Service allows it to be copied anew: discard the data and copy
+  the primary's.
 - `options` is the Service's `replication.options`, passed as given.
   Secrets go in as files the Service mounts (`/run/secrets/...`), named
   in options. Legion never sends a secret's value in a request.
@@ -204,7 +208,10 @@ promotion, when members join or leave, and when the synchronous settings
 change.
 
 - **On the primary:** accept and keep data for the listed members (for
-  example, retention or slots per member) and apply `synchronous`.
+  example, retention or slots per member) and apply `synchronous`: wait
+  for `count` of its `members` to confirm each commit, or for none when it
+  is absent. Legion lists only the replicas healthy and streaming, so a
+  lost one never stops the primary taking writes.
 - **On a replica:** follow `topology.primary`, without a restart where
   the database allows. A member that is still primary in an older epoch
   answers `restart`.

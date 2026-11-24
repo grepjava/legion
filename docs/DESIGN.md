@@ -1771,7 +1771,7 @@ and reaches it at its address. Its memory and CPUs count as its
 requests at the least, as they are set aside whole. Not built: volumes
 for a guest (virtio-blk zvols).
 
-### 6.9 Database replication (proposed, not built)
+### 6.9 Database replication
 
 A Volume `replica` copies a database's data with ZFS every
 `everySeconds`. That is crash-consistent, loses what was written since
@@ -1784,7 +1784,10 @@ and replicas serve reads. Legion decides which member is primary. A
 contract (docs/REPLICATION.md, SPI v1), does the database's part.
 Legion's own PostgreSQL plugin uses the same contract.
 
-Proposed choices, to confirm:
+**Built** (2026-11-24): steps 1 to 6 of the plan below, with the console
+and the conformance check still to come; tested by the API, plugin, agent
+and planner tests and a lab test (`crates/legion/tests/replication.rs`)
+not yet run. The choices, agreed with the user:
 
 1. **The contract is an executable with JSON**, run in the task's jail,
    like CNI and the volume plugins (6.7). A gRPC sidecar would put a
@@ -1805,6 +1808,45 @@ Proposed choices, to confirm:
 3. **Failover is automatic by default,** under the fencing rules
    `failover: automatic` already uses. Operators also get a planned
    switchover and a manual failover.
+
+How it was built, where it differs from the outline below:
+
+- **Role and topology travel in the task's spec** (`spec.replication`:
+  the Service's settings, the epoch, the role, the topology), protocol 4,
+  as `paused` does. The agent acts on it level-triggered: `prepare` before
+  the container starts, then every 5 s `status`, `promote` when named
+  primary while a replica, `configure` when the epoch or topology changed.
+  Every call can be repeated, so a new leader or a restarted agent simply
+  carries on.
+- **The request is on the plugin's standard input** in both places: a
+  running container's exec is given it (`Runtime::exec_input`), and
+  `prepare` runs in a container made as the database's (its image, user,
+  environment, secrets and mounts) whose command reads it from a file its
+  supervisor opens before entering the jail (`Runtime::set_input`).
+- **What members say goes with the heartbeats** (`members_json`), kept in
+  the leader's memory beside the tasks' use, never written per report. The
+  Service's `status.replication` records the leader's decisions (epoch,
+  primary, change under way, synchronous set) at once, and the members'
+  positions and lag at most every 30 s.
+- **A change of primary is recorded before anything is asked of a
+  member**: the old primary's tasks (`change.fence`) must have stopped, or
+  be cut off past their stop grace period and 5 s, before another member is
+  named; meanwhile no member is told there is a primary, so a replacement
+  task of the old primary waits at `prepare`.
+- **Synchronous replicas, as Patroni's non-strict mode**: the primary waits
+  for those of its replicas healthy and streaming as last seen
+  (`status.replication.synchronous`, `ANY k (...)`), none if none are,
+  rather than stop taking writes. A failover promotes only one of that set,
+  once at least `|set| - k + 1` of it have reported.
+- **Re-cloning is the plugin's**: after `diverged` with `reclone: allow`,
+  the agent calls `prepare` once more with `"reclone": true`.
+- **Requests**: `legion replication switchover|failover` write
+  `spec.replication.request` (kind, target, force, a time), which the
+  leader acts on once (`status.replication.handled`, `refused`).
+- **Not built yet**: switchover before a drain, a rolling update or a
+  scale-down that would stop the primary (they stop it, and the primary is
+  replaced by failover); the console tab; `legion replication check`; the
+  watchdog; WAL archiving.
 
 **The spec.** The fields go on a stateful Service:
 

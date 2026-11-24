@@ -9,8 +9,31 @@ New work goes under **Unreleased** as it lands on `main`.
 
 ## Unreleased
 
-Since 0.2.0. Agents and managers still speak protocol 3: no upgrade order
-beyond the usual (managers first, one at a time, then workers).
+Since 0.2.0. Agents and managers speak protocol 4 (a task's spec may make
+it a member of a replicated database); the usual upgrade order holds
+(managers first, one at a time, then workers), and a replicated Service's
+members are told their role only on nodes that read it.
+
+### Replicated databases
+
+- **A pluggable replication interface (SPI v1, docs/REPLICATION.md).** A
+  stateful Service's `replication` has its members replicate a database
+  among themselves: Legion names the primary (Raft), a plugin anyone can
+  write (an executable, JSON on standard input and output, run in the
+  database's own jail) does the database's part: `describe`, `prepare`,
+  `status`, `promote`, `configure`.
+- **PostgreSQL, built in** (`libexec/legion/replication/postgres`): the
+  primary made with checksums and a replication role, replicas copied with
+  `pg_basebackup`, an old primary brought back with `pg_rewind`, a slot per
+  member, synchronous replicas with `synchronous: N`.
+- **Failover**: automatic by default (`failoverAfter`, `maximumLag`), the
+  old primary fenced first (stopped, or cut off with `onPartition: stop`
+  past its grace period), the replica furthest ahead promoted, the others
+  pointed at it; `failover: manual` reports and waits.
+- **Routing**: the Service's address goes to the healthy primary alone (to
+  none during a change), and with `read: true`, `<service>-read` to the
+  healthy replicas.
+- **`legion replication status|switchover|failover`.**
 
 ### Volumes
 
