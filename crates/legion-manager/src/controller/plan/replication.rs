@@ -263,6 +263,11 @@ pub(super) fn pass(
             if fenced {
                 let from = c.from.as_deref().and_then(|f| ordinal(svc, f));
                 let choice = Choice {
+                    sync: st
+                        .synchronous
+                        .iter()
+                        .filter_map(|m| ordinal(svc, m))
+                        .collect(),
                     force: c.force,
                     n,
                     from,
@@ -329,15 +334,37 @@ pub(super) fn pass(
             .unwrap_or_default(),
         dns: format!("{svc}-{i}.{svc}.{ns}"),
     };
+    // The replicas the primary waits for: those healthy and streaming,
+    // seen while it is healthy; kept as they were meanwhile.
+    if r.synchronous > 0 && st.change.is_none() {
+        let healthy = named
+            .and_then(status_of)
+            .is_some_and(|x| x.role == Role::Primary && x.healthy);
+        if healthy {
+            st.synchronous = (0..n)
+                .filter(|i| Some(*i) != named)
+                .filter(|i| {
+                    status_of(*i)
+                        .is_some_and(|x| x.role == Role::Replica && x.healthy && x.streaming)
+                })
+                .map(|i| member(svc, i))
+                .collect();
+        }
+    } else if r.synchronous == 0 {
+        st.synchronous.clear();
+    }
+    let waited_for: Vec<String> = st
+        .synchronous
+        .iter()
+        .filter(|m| named.is_none_or(|p| ordinal(svc, m) != Some(p)))
+        .cloned()
+        .collect();
     let topology = spi::Topology {
         primary: named.map(addr),
         members: (0..n).map(addr).collect(),
-        synchronous: (r.synchronous > 0).then(|| spi::Synchronous {
-            count: r.synchronous,
-            members: (0..n)
-                .filter(|i| Some(*i) != named)
-                .map(|i| member(svc, i))
-                .collect(),
+        synchronous: (r.synchronous > 0 && !waited_for.is_empty()).then(|| spi::Synchronous {
+            count: r.synchronous.min(waited_for.len() as u32),
+            members: waited_for,
         }),
     };
     for (i, t) in &current {
@@ -465,6 +492,8 @@ struct Choice {
     target: Option<u32>,
     /// A switchover: the new primary must have all the old one wrote.
     planned: bool,
+    /// The replicas the old primary waited for, if it did.
+    sync: Vec<u32>,
 }
 
 /// The replica to promote: of those heard from lately, not the old primary,
@@ -481,21 +510,32 @@ fn candidate<'a>(
     status_of: &dyn Fn(u32) -> Option<&'a spi::Status>,
 ) -> Result<u32, String> {
     let (force, n, from) = (c.force, c.n, c.from);
-    let replicas: Vec<(u32, spi::Position)> = (0..n)
-        .filter(|i| Some(*i) != from)
+    // With synchronous replicas, only those the old primary waited for
+    // surely hold what it confirmed.
+    let k = r.synchronous;
+    let pool: Vec<u32> = if k > 0 && !force && !c.sync.is_empty() {
+        c.sync.clone()
+    } else {
+        (0..n).collect()
+    };
+    let replicas: Vec<(u32, spi::Position)> = pool
+        .iter()
+        .copied()
+        .filter(|i| Some(*i) != from && *i < n)
         .filter_map(|i| {
             let x = status_of(i)?;
             (x.role == Role::Replica).then_some((i, x.position?))
         })
         .collect();
-    let others = (0..n).filter(|i| Some(*i) != from).count() as u32;
-    let k = r.synchronous;
-    if k > 0 && !force && (replicas.len() as u32) < others.saturating_sub(k) + 1 {
-        return Err(format!(
-            "{} of {others} replicas heard from; with {k} synchronous, {} must be, to be sure the one furthest ahead holds every confirmed commit",
-            replicas.len(),
-            others.saturating_sub(k) + 1
-        ));
+    if k > 0 && !force && !c.sync.is_empty() {
+        let s = c.sync.len() as u32;
+        let needed = s - k.min(s) + 1;
+        if (replicas.len() as u32) < needed {
+            return Err(format!(
+                "{} of {s} synchronous replicas heard from; {needed} must be, to be sure the one furthest ahead holds every confirmed commit",
+                replicas.len()
+            ));
+        }
     }
     let eligible: Vec<&(u32, spi::Position)> = replicas
         .iter()

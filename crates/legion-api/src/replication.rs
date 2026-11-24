@@ -210,6 +210,12 @@ pub struct ReplicationStatus {
     /// Each member's last `status`, by member.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub members: BTreeMap<String, MemberStatus>,
+    /// With `synchronous`, the replicas the primary waits for: those healthy
+    /// and streaming, as last seen while the primary was. A failover
+    /// promotes only one of them; none, and the primary runs on without
+    /// waiting, rather than stop taking writes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synchronous: Vec<String>,
     /// The furthest position seen of a primary: what automatic failover
     /// measures lag against.
     #[serde(default, skip_serializing_if = "Option::is_none")]

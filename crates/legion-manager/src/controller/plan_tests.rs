@@ -5082,6 +5082,7 @@ impl World {
                             status: Some(spi::Status {
                                 role: r.role,
                                 healthy: true,
+                                streaming: r.role == spi::Role::Replica,
                                 position: Some(spi::Position {
                                     term,
                                     offset: position(i),
@@ -5290,7 +5291,8 @@ fn a_failover_waits_for_the_synchronous_quorum_and_passes_over_laggards() {
     let st = w.replication("pg");
     assert!(st.change.as_ref().unwrap().to.is_none());
     assert!(
-        st.message.contains("1 of 2 replicas heard from"),
+        st.message
+            .contains("1 of 2 synchronous replicas heard from"),
         "{}",
         st.message
     );
@@ -5299,6 +5301,45 @@ fn a_failover_waits_for_the_synchronous_quorum_and_passes_over_laggards() {
     w.members_say(1, |i| if i == 2 { 1000 } else { 4900 }, &[0]);
     w.settle();
     assert_eq!(w.replication("pg").primary.as_deref(), Some("pg-1"));
+
+    // Serving, it waits for pg-2 alone: pg-0 is gone, so writes go on.
+    w.members_say(2, |_| 6000, &[0]);
+    w.settle();
+    let st = w.replication("pg");
+    assert_eq!(st.synchronous, ["pg-2"]);
+    let t = w
+        .tasks
+        .iter()
+        .find(|t| t.spec.slot == Some(1) && active_running(t))
+        .unwrap();
+    let sync = t
+        .spec
+        .replication
+        .as_ref()
+        .unwrap()
+        .topology
+        .synchronous
+        .clone()
+        .unwrap();
+    assert_eq!((sync.count, sync.members), (1, vec!["pg-2".to_owned()]));
+    // And none at all once pg-2 is lost too: the primary waits for no one.
+    w.members_say(2, |_| 6000, &[0, 2]);
+    w.settle();
+    assert!(w.replication("pg").synchronous.is_empty());
+    let t = w
+        .tasks
+        .iter()
+        .find(|t| t.spec.slot == Some(1) && active_running(t))
+        .unwrap();
+    assert!(
+        t.spec
+            .replication
+            .as_ref()
+            .unwrap()
+            .topology
+            .synchronous
+            .is_none()
+    );
 }
 
 /// `failover: manual`: a lost primary is reported, nothing promoted.
