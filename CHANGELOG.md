@@ -35,6 +35,15 @@ members are told their role only on nodes that read it.
   healthy replicas.
 - **`legion replication status|switchover|failover`.**
 
+### Networking
+
+- **Init containers reach their namespace's services under isolation.** A
+  task still starting, its pod's address known, now counts as a source of
+  its namespace for network policy and namespace isolation, so an init
+  container (a migration, a database member's `prepare`) is no longer
+  dropped on its way to a service of its own namespace. It is still no
+  endpoint until it runs and is ready.
+
 ### Volumes
 
 - **Replica failover.** A Volume's replica (a copy kept on another node,
