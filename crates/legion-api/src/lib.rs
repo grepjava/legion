@@ -38,6 +38,7 @@ pub mod protocol;
 pub mod quantity;
 pub mod quota;
 pub mod rbac;
+pub mod replication;
 pub mod route;
 pub mod security;
 pub mod service;

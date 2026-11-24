@@ -1145,6 +1145,13 @@ fn service(
                 (i.clone(), recipe.to_owned())
             })
             .collect(),
+        // Written by the replication pass, which runs after this one.
+        replication: s
+            .object
+            .status
+            .get("replication")
+            .and_then(|r| serde_json::from_value(r.clone()).ok()),
+        read_virtual_ip: None,
     };
     let status = serde_json::to_value(&status).expect("status serialises");
     if s.object.status != status {

@@ -50,6 +50,10 @@ pub struct ServiceSpec {
     /// old to pause runs on (`legion_api::protocol`, 3).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub paused: bool,
+    /// Stateful services only: the members replicate a database among
+    /// themselves, Legion naming the primary (DESIGN.md §6.9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replication: Option<crate::replication::Replication>,
 }
 
 fn is_zero(n: &i32) -> bool {
@@ -173,6 +177,35 @@ impl ServiceSpec {
     }
 }
 
+impl ServiceSpec {
+    fn admit_replication(&self, r: &crate::replication::Replication) -> Result<(), Invalid> {
+        if self.mode != ServiceMode::Stateful {
+            return Err(Invalid::new(
+                "replication",
+                "only a stateful service's members replicate a database: each has its own Volumes",
+            ));
+        }
+        let containers: Vec<&str> = self.pod.containers.iter().map(|c| c.name.as_str()).collect();
+        r.admit("replication", self.replicas.unwrap_or(1), &containers)?;
+        // One mechanism per Volume: the database copies itself.
+        if let Some((name, _)) = self.pod.claims().find(|(_, c)| c.replica.is_some()) {
+            return Err(Invalid::new(
+                format!("pod.volumes[{name}].claim.replica"),
+                "the members replicate the database themselves (`replication`);                  a ZFS replica of their Volumes would be a second copy that never takes over",
+            ));
+        }
+        if r.failover == crate::volume::Failover::Automatic
+            && self.pod.on_partition != OnPartition::Stop
+        {
+            return Err(Invalid::new(
+                "pod.onPartition",
+                "`replication.failover: automatic` needs `onPartition: stop`, so a primary                  cut off stops writing before a replica is promoted (or set `failover: manual`)",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Spec for ServiceSpec {
     fn admit(&mut self) -> Result<(), Invalid> {
         match self.mode {
@@ -233,6 +266,9 @@ impl Spec for ServiceSpec {
                      replica takes over"
                 ),
             ));
+        }
+        if let Some(r) = &self.replication {
+            self.admit_replication(r)?;
         }
         for (name, c) in self.pod.claims() {
             crate::volume::check_schedules(
@@ -1772,6 +1808,13 @@ pub struct ServiceStatus {
     /// does from FreeBSD's packages (empty when there is none).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub linux_images: BTreeMap<String, String>,
+    /// A replicated database's members, as the leader records them
+    /// (DESIGN.md §6.9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replication: Option<crate::replication::ReplicationStatus>,
+    /// The `<service>-read` address, with `replication.read`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_virtual_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

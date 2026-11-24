@@ -594,3 +594,42 @@ fn a_vm_is_its_pod_alone() {
         assert!(e.contains(says), "{e}");
     }
 }
+
+#[test]
+fn a_replicated_database_is_admitted_on_a_stateful_service_alone() {
+    let ok = service(
+        "  mode: stateful\n  replicas: 3\n  replication: { plugin: postgres, synchronous: 1, read: true }\n  pod:\n    onPartition: stop\n    containers: [{ name: pg, image: pg:17 }]\n    volumes: [{ name: data, claim: { size: 1Gi } }]\n",
+    );
+    let o = admitted(&ok);
+    assert_eq!(o.spec["replication"]["failover"], "automatic");
+    assert_eq!(o.spec["replication"]["failoverAfter"], "30s");
+    let manual = service(
+        "  mode: stateful\n  replication: { plugin: postgres, failover: manual }\n  pod:\n    containers: [{ name: pg, image: pg:17 }]\n",
+    );
+    admitted(&manual);
+    for (spec, error) in [
+        (
+            "  replication: { plugin: postgres, failover: manual }\n  pod:\n    containers: [{ name: pg, image: pg:17 }]\n",
+            "spec.replication: only a stateful service's members replicate",
+        ),
+        (
+            "  mode: stateful\n  replication: { plugin: postgres }\n  pod:\n    containers: [{ name: pg, image: pg:17 }]\n",
+            "spec.pod.onPartition: `replication.failover: automatic` needs `onPartition: stop`",
+        ),
+        (
+            "  mode: stateful\n  replication: { plugin: postgres, failover: manual }\n  pod:\n    containers: [{ name: pg, image: pg:17 }]\n    volumes: [{ name: data, claim: { replica: {} } }]\n",
+            "spec.pod.volumes[data].claim.replica: the members replicate the database themselves",
+        ),
+        (
+            "  mode: stateful\n  replicas: 2\n  replication: { plugin: postgres, failover: manual, synchronous: 2 }\n  pod:\n    containers: [{ name: pg, image: pg:17 }]\n",
+            "spec.replication.synchronous: 2: below the replica count (2)",
+        ),
+        (
+            "  mode: stateful\n  replication: { plugin: postgres, failover: manual, bogus: 1 }\n  pod:\n    containers: [{ name: pg, image: pg:17 }]\n",
+            "bogus",
+        ),
+    ] {
+        let e = rejected(&service(spec));
+        assert!(e.contains(error), "{e}\nwanted: {error}");
+    }
+}

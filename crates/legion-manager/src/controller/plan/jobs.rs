@@ -85,6 +85,7 @@ impl Job {
                 priority: 0,
                 stopped: false,
                 paused: false,
+                replication: None,
             },
             refused: Default::default(),
             covered: self.covered,
