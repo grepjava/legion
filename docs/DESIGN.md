@@ -1771,6 +1771,187 @@ and reaches it at its address. Its memory and CPUs count as its
 requests at the least, as they are set aside whole. Not built: volumes
 for a guest (virtio-blk zvols).
 
+### 6.9 Database replication (proposed, not built)
+
+A Volume `replica` copies a database's data with ZFS every
+`everySeconds`. That is crash-consistent, loses what was written since
+the last copy, and leaves the copy unusable until it takes over. A
+replicated stateful Service has its members replicate the database
+themselves: one primary, the others replicas streaming its log. Losing
+the primary then loses seconds (asynchronous) or nothing (synchronous),
+and replicas serve reads. Legion decides which member is primary. A
+**replication plugin**, an executable anyone can write to a published
+contract (docs/REPLICATION.md, SPI v1), does the database's part.
+Legion's own PostgreSQL plugin uses the same contract.
+
+Proposed choices, to confirm:
+
+1. **The contract is an executable with JSON**, run in the task's jail,
+   like CNI and the volume plugins (6.7). A gRPC sidecar would put a
+   server and a port in every pod. A Rust trait would only let people who
+   build Legion write one.
+   - The plugin runs **in the database container's own jail**, a
+     process per call, not in a jail of its own.
+   - Its tools are the image's: `pg_rewind` must match the server's
+     version.
+   - It sees the data directory and the socket at their own paths, and
+     acts as the user owning the data.
+   - A sidecar jail would need its own matching tools and shared
+     ownership and sockets. If someone needs that isolation, it can
+     come later as a `describe` capability.
+2. **PostgreSQL v1 is asynchronous and synchronous.** Synchronous is a
+   setting for PostgreSQL. What it takes from Legion is the promotion
+   rule below.
+3. **Failover is automatic by default,** under the fencing rules
+   `failover: automatic` already uses. Operators also get a planned
+   switchover and a manual failover.
+
+**The spec.** The fields go on a stateful Service:
+
+```yaml
+mode: stateful
+replicas: 3
+replication:
+  plugin: postgres          # or command: [...] from the image
+  container: postgres       # default: the pod's only container
+  options: { replicationPasswordFile: /run/secrets/pg-replication }
+  failover: automatic       # automatic | manual
+  failoverAfter: 30s        # a primary not ready this long, its node up
+  maximumLag: 64Mi          # automatic failover passes over a replica further behind
+  synchronous: 0            # replicas that must confirm each commit
+  read: true                # a <svc>-read endpoint over the replicas
+  reclone: deny             # allow: a diverged member is emptied and copied anew
+```
+
+Admission refuses the following:
+
+- `replication` outside `mode: stateful`.
+- A claim with a ZFS `replica`: one mechanism per Volume.
+- `failover: automatic` without `onPartition: stop` on the replicated
+  container.
+- `synchronous` of `replicas` or more.
+- Settings the plugin's `describe` lacks capabilities for. This is
+  checked by the agent, and the Service says why.
+
+Snapshots, schedules, backups and migration of the members' Volumes are
+unchanged.
+
+**Status.** It is recorded in the store, so a new leader carries on
+mid-failover:
+
+- `status.replication`: `epoch`, `primary` (the member), and per member
+  the last `status` (role, position, lag, healthy, when).
+- `phase`: `forming`, `healthy`, `degraded` (a replica missing or
+  behind), `failing-over` or `split`.
+- `lastFailover`: from and to, why, positions, and time.
+
+The epoch and the new primary are written **before** `promote` is
+called. A leader that stops halfway leaves the next one the record, and
+`promote` and `configure` may be repeated.
+
+**Starting.** Members start in order, as now, with ordinal 0 primary
+the first time. After that, the start order follows the recorded
+primary: it starts first, then the replicas. Before each task's main
+container starts, the agent runs the plugin's `prepare` with the role
+the store gives it, as an init step in that container's image, mounts
+and secrets. Then the agent calls `status` every 5 s and sends the
+results with the task's status. The Service controller calls
+`configure` on every member when the topology changes.
+
+**Routing.**
+
+- **Writes:** the Service's address and DNS name (`<svc>.<ns>`) go to
+  the primary only. Its endpoint is the member Legion names primary,
+  provided it is ready and its last `status` says `primary` and healthy.
+  Clients written for one PostgreSQL keep working.
+- **Reads:** with `read: true`, a second address and name
+  (`<svc>-read.<ns>`) go to the ready replicas, or to the primary while
+  none is ready.
+- **Members:** `<svc>-<n>.<svc>.<ns>` stays for each member.
+
+During a failover the write endpoint is empty, so connections fail fast
+rather than reaching an old primary.
+
+**Failover.** The leader's replication controller, a pass of the
+Service controller, handles it:
+
+1. **The primary is lost.**
+   - Its node is down, and the task is orphaned.
+   - Or its node is up, but the task has not been ready, or its
+     `status` has not been healthy, for `failoverAfter`.
+2. **Fence it.**
+   - If its node is up, the task is stopped, and the stop is confirmed
+     by the agent.
+   - If its node is down, every task of the Service there must have
+     `onPartition: stop` and have been orphaned for its stop grace
+     period plus 5 s. This is the rule Volume replicas already follow
+     (docs/PARTITIONS.md).
+   - Otherwise Legion waits and says why.
+3. **Pick a candidate:** the replica with the highest position.
+   - It must have a fresh `status` (under 15 s old, from a ready node)
+     and be within `maximumLag` of the last primary position seen.
+   - Ties go to the lowest ordinal.
+   - With `synchronous: k` over `n` replicas, a commit was confirmed by
+     `k` of them. The furthest-ahead replica is then certain to hold
+     every confirmed commit only if at least `n - k + 1` replicas
+     report. With fewer, automatic failover waits; it never guesses.
+4. **Record, then act.** Record `epoch + 1` and the new primary, call
+   `promote` on it, then `configure` on the others. The old primary's
+   task starts again as a replica, and its `prepare` rewinds it or (with
+   `reclone: allow`) copies it anew.
+
+With `failover: manual`, Legion stops after step 2 and reports. The
+commands are:
+
+- `legion replication status SVC`.
+- `legion replication switchover SVC [--to MEMBER]` (planned):
+  1. Wait until the target has caught up.
+  2. Stop the primary cleanly.
+  3. Wait until the target has received the primary's final position.
+  4. Promote it.
+- `legion replication failover SVC --to MEMBER [--force]`: steps 2 to 4
+  with the operator's choice. `--force` passes over the lag and
+  synchronous checks.
+
+**Draining, updates and scaling.** These use switchover so the primary
+is never simply stopped:
+
+- **Drain:** draining the primary's node switches over first.
+- **Update:** a rolling update replaces the replicas first, then
+  switches over, then replaces the old primary.
+- **Scale-down:** if the highest ordinal is the primary, it switches
+  over first.
+
+**Console.** The Service gets a Replication tab: the members, roles,
+positions, lag and phase, with switchover and failover behind the usual
+review. Alerts fire on `degraded`, `split` and failed failovers, and
+`legion_replication_lag_bytes` is exported.
+
+**Risks and limits.**
+
+- A node whose daemon died with its pods running looks the same as a
+  node cut off. Its PostgreSQL keeps accepting writes from that node's
+  own pods, which the dead agent's pf table still routes there. Those
+  writes are lost when the member rewinds, as for Volume replicas
+  (docs/PARTITIONS.md).
+- A watchdog would close this gap: the plugin's `status` acting as a
+  lease that, unrenewed, stops the database. It is an open question for
+  after v1.
+
+**Plan.**
+
+1. The SPI document, and this section.
+2. The API, admission and status.
+3. The agent: `prepare`, `status` and calls.
+4. The controller: forming, routing and `configure`.
+5. Failover, switchover and the CLI.
+6. The PostgreSQL plugin and `legion replication check`.
+7. A lab test that kills the primary at each step (before fencing,
+   mid-promote, and with the leader killed mid-failover) and checks
+   that no confirmed write is lost with `synchronous: 1`.
+8. The console.
+9. Next, WAL archiving to the S3 targets for point-in-time recovery.
+
 ## 7. Object model
 
 Every object has the same envelope:
