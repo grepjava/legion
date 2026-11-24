@@ -46,6 +46,10 @@ pub struct TaskSpec {
     /// for an update that snapshots them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<VolumeSnapshot>,
+    /// A member of a replicated database: its role and the topology, as
+    /// the leader names them (DESIGN.md §6.9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replication: Option<crate::replication::TaskReplication>,
 }
 
 /// A snapshot of a stateful task's claimed Volumes (DESIGN.md §4.3).

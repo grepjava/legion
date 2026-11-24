@@ -125,7 +125,9 @@ pub trait Control: Send + Sync + 'static {
     /// state of each load balancer address it took up; returns how long to
     /// wait before the next heartbeat. `lacks`, when the host was checked
     /// since the last one: what `legion doctor` finds it lacks; `host`,
-    /// when read since: the host and its pools.
+    /// when read since: the host and its pools. `members`: what the node's
+    /// members of replicated databases last said.
+    #[allow(clippy::too_many_arguments)]
     fn heartbeat(
         &self,
         node: &str,
@@ -134,6 +136,7 @@ pub trait Control: Send + Sync + 'static {
         telemetry: Option<NodeTelemetry>,
         lacks: Option<Vec<legion_api::node::HostLack>>,
         host: Option<legion_api::node::HostReport>,
+        members: Vec<legion_api::replication::MemberReport>,
     ) -> impl Future<Output = Result<Duration, ControlError>> + Send;
 
     /// Days between scrubs of the node's pools, as the last heartbeat's
@@ -786,6 +789,7 @@ impl Control for GrpcControl {
         rx
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn heartbeat(
         &self,
         node: &str,
@@ -794,7 +798,10 @@ impl Control for GrpcControl {
         telemetry: Option<NodeTelemetry>,
         lacks: Option<Vec<legion_api::node::HostLack>>,
         host: Option<legion_api::node::HostReport>,
+        members: Vec<legion_api::replication::MemberReport>,
     ) -> Result<Duration, ControlError> {
+        let members_json =
+            (!members.is_empty()).then(|| serde_json::to_vec(&members).expect("serialises"));
         let usage = usage
             .into_iter()
             .filter_map(|(key, u)| {
@@ -809,6 +816,7 @@ impl Control for GrpcControl {
             .collect();
         let req = HeartbeatRequest {
             node: node.to_owned(),
+            members_json,
             usage,
             carp: carp
                 .into_iter()

@@ -123,6 +123,7 @@ fn request(s: &Setup, me: u32, primary: Option<u32>, role: Option<Role>) -> Stri
         },
         options,
         role,
+        reclone: false,
     };
     serde_json::to_string(&r).unwrap()
 }
@@ -470,4 +471,26 @@ fn helpers_quote_and_name_safely() {
     assert!(replaced.starts_with("local all all trust\n"));
     assert!(!replaced.contains("old"));
     assert_eq!(replaced.matches(HBA_BEGIN).count(), 1);
+}
+
+#[test]
+fn a_replica_allowed_to_reclone_discards_its_data_and_copies_the_primary() {
+    let s = setup();
+    if !usable(&s) {
+        return;
+    }
+    std::fs::write(s.data.join("PG_VERSION"), "17\n").unwrap();
+    std::fs::create_dir(s.data.join("base")).unwrap();
+    std::fs::write(s.data.join("base").join("1"), "old").unwrap();
+    let mut req: Request =
+        serde_json::from_str(&request(&s, 1, Some(0), Some(Role::Replica))).unwrap();
+    req.reclone = true;
+    let mut h = Fake::default();
+    h.on("IDENTIFY_SYSTEM", true, "7300000000000000001|2|0/5000000|\n", "");
+    let out = handle("prepare", &serde_json::to_string(&req).unwrap(), &mut h).unwrap();
+    assert!(out.contains("cloned"), "{out}");
+    assert!(!s.data.join("base").exists(), "the old data went");
+    assert!(s.data.exists(), "the directory stays");
+    assert!(h.ran("pg_basebackup -D"));
+    assert!(!h.ran("pg_controldata"));
 }

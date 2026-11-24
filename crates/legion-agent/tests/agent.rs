@@ -38,7 +38,11 @@ struct Flaky {
     /// Whether the endpoints are held back, as from a manager slow to
     /// answer: a receiver taken meanwhile sees them once released.
     hold_endpoints: Arc<AtomicBool>,
+    /// The members' reports the last heartbeat carried.
+    members: Members,
 }
+
+type Members = Arc<std::sync::Mutex<Vec<legion_api::replication::MemberReport>>>;
 
 impl Control for Flaky {
     async fn register(
@@ -148,6 +152,7 @@ impl Control for Flaky {
         self.inner.data(namespace, kind, name).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn heartbeat(
         &self,
         node: &str,
@@ -156,9 +161,11 @@ impl Control for Flaky {
         telemetry: Option<legion_api::dispatch::NodeTelemetry>,
         lacks: Option<Vec<legion_api::node::HostLack>>,
         host: Option<legion_api::node::HostReport>,
+        members: Vec<legion_api::replication::MemberReport>,
     ) -> Result<Duration, ControlError> {
+        *self.members.lock().unwrap() = members.clone();
         self.inner
-            .heartbeat(node, usage, carp, telemetry, lacks, host)
+            .heartbeat(node, usage, carp, telemetry, lacks, host, members)
             .await
     }
 
@@ -189,6 +196,8 @@ struct Harness {
     fail_releases: Arc<std::sync::atomic::AtomicUsize>,
     /// Whether the agent's endpoints are held back.
     hold_endpoints: Arc<AtomicBool>,
+    /// The members' reports the agent's last heartbeat carried.
+    members: Members,
 }
 
 impl Harness {
@@ -250,6 +259,7 @@ impl Harness {
             fail_reports: Arc::default(),
             fail_releases: Arc::default(),
             hold_endpoints: Arc::default(),
+            members: Arc::default(),
         };
         h.start_agent();
         h
@@ -280,6 +290,7 @@ impl Harness {
                 fail_reports: self.fail_reports.clone(),
                 fail_releases: self.fail_releases.clone(),
                 hold_endpoints: self.hold_endpoints.clone(),
+                members: self.members.clone(),
             }),
         );
         self.metrics = Some(agent.metrics());
@@ -360,17 +371,31 @@ impl Harness {
     }
 
     async fn task_in(&self, namespace: &str, name: &str, pod: &str, job: bool) -> ObjectKey {
+        self.task_with(namespace, name, pod, serde_json::json!({ "job": job }))
+            .await
+    }
+
+    /// A task whose spec has `extra`'s fields besides.
+    async fn task_with(
+        &self,
+        namespace: &str,
+        name: &str,
+        pod: &str,
+        extra: serde_json::Value,
+    ) -> ObjectKey {
         let pod: serde_json::Value = serde_yaml_ng::from_str(pod).unwrap();
-        let mut spec: TaskSpec = legion_api::parse(&serde_json::json!({
+        let mut json = serde_json::json!({
             "service": "web",
             "serviceUid": "0000000000000001",
             "serviceGeneration": 1,
-            "job": job,
             "slot": 1,
             "node": NODE,
             "pod": pod,
-        }))
-        .unwrap();
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            json[k] = v.clone();
+        }
+        let mut spec: TaskSpec = legion_api::parse(&json).unwrap();
         spec.admit().unwrap();
         let mut object = Object::new(
             Kind::Task,
@@ -3558,4 +3583,135 @@ async fn a_claim_a_failed_start_made_is_let_go_of_in_the_end() {
         v.status["node"].as_str().unwrap_or_default().to_owned()
     };
     eventually("let go", || node().is_empty()).await;
+}
+
+/// A member of a replicated database: its plugin prepares it before its
+/// container starts (waiting while it says to), is asked where it stands
+/// while it runs, which goes with the heartbeats, and is promoted and
+/// configured as its spec names it primary. Told to start again, the task
+/// ends; refused for good at `prepare`, it fails saying why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_database_member_is_prepared_tended_and_promoted_as_told() {
+    use legion_api::replication::spi::Role;
+    let h = Harness::new().await;
+    h.rt.add_image("pg:17");
+    // The plugin: prepare waits once, then succeeds; status says what the
+    // promote has made it; configure may be told to ask for a restart.
+    let state = Arc::new(std::sync::Mutex::new((0u32, Role::Replica, false)));
+    let s = state.clone();
+    h.rt.set_plugin(Arc::new(move |op: &str, _req: &[u8]| {
+        let mut st = s.lock().unwrap();
+        let fail = |code: &str, msg: &str| {
+            (1, format!(r#"{{"error":{{"code":"{code}","message":"{msg}"}}}}"#), msg.to_owned())
+        };
+        match op {
+            "prepare" => {
+                st.0 += 1;
+                if st.0 < 2 {
+                    return fail("retry", "the primary is not up");
+                }
+                (0, r#"{"action":"cloned"}"#.into(), String::new())
+            }
+            "status" => (
+                0,
+                format!(
+                    r#"{{"role":"{}","healthy":true,"position":{{"term":1,"offset":"42"}}}}"#,
+                    st.1.as_str()
+                ),
+                String::new(),
+            ),
+            "promote" => {
+                st.1 = Role::Primary;
+                (0, "{}".into(), String::new())
+            }
+            "configure" if st.2 => fail("restart", "a primary told to follow"),
+            _ => (0, "{}".into(), String::new()),
+        }
+    }));
+    let pod = r#"containers: [{ name: pg, image: "pg:17" }]"#;
+    let told = |role: Role, epoch: u64| {
+        serde_json::json!({
+            "config": { "command": ["/usr/local/bin/repl"] },
+            "epoch": epoch,
+            "role": role.as_str(),
+            "topology": { "members": [{ "member": "pg-0" }, { "member": "pg-1" }] }
+        })
+    };
+    let member = serde_json::json!({
+        "service": "pg", "stateful": true, "replication": told(Role::Replica, 1)
+    });
+    let key = h.task_with("shop", "pg-1", pod, member).await;
+    let set = |role: Role, epoch: u64| {
+        let key = key.clone();
+        let h = &h;
+        async move {
+            let mut o = h.store.get(&key).unwrap().unwrap();
+            o.spec["replication"] = told(role, epoch);
+            let v = o.metadata.version;
+            h.write(o, Precondition::Version(v)).await;
+        }
+    };
+    h.wait_state(&key, TaskState::Running).await;
+    let calls = h.rt.plugin_calls();
+    let prepares: Vec<_> = calls.iter().filter(|c| c.1 == "prepare").collect();
+    assert_eq!(prepares.len(), 2, "waited once: {calls:?}");
+    assert_eq!(prepares[0].0, "shop_pg-1_pg.prepare");
+    let req: serde_json::Value = serde_json::from_slice(&prepares[0].2).unwrap();
+    assert_eq!(req["role"], "replica");
+    assert_eq!(req["self"]["member"], "pg-1");
+    assert_eq!(req["spiVersion"], "1");
+
+    // Running: asked where it stands, which the heartbeats carry.
+    eventually("its status reported", || {
+        h.members
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.task == "shop/pg-1" && m.status.as_ref().is_some_and(|s| s.role == Role::Replica) && m.applied == 1)
+    })
+    .await;
+    assert!(h.rt.plugin_calls().iter().any(|c| c.1 == "configure"));
+
+    // Named primary: promoted, then configured for the new epoch.
+    set(Role::Primary, 2).await;
+    eventually("promoted", || {
+        h.members.lock().unwrap().iter().any(|m| {
+            m.status.as_ref().is_some_and(|s| s.role == Role::Primary) && m.applied == 2
+        })
+    })
+    .await;
+    assert_eq!(
+        h.rt.plugin_calls().iter().filter(|c| c.1 == "promote").count(),
+        1,
+        "promoted once"
+    );
+
+    // A topology it can only follow by starting again: the task ends.
+    state.lock().unwrap().2 = true;
+    set(Role::Replica, 3).await;
+    let st = h.wait_state(&key, TaskState::Failed).await;
+    assert!(st.message.contains("a primary told to follow"), "{}", st.message);
+    eventually("its report gone", || {
+        !h.members.lock().unwrap().iter().any(|m| m.task == "shop/pg-1")
+    })
+    .await;
+    h.nothing_left().await;
+
+    // Refused at prepare: it fails, saying why.
+    h.rt.set_plugin(Arc::new(|op: &str, _| match op {
+        "prepare" => (
+            1,
+            r#"{"error":{"code":"diverged","message":"another database"}}"#.into(),
+            String::new(),
+        ),
+        _ => (0, "{}".into(), String::new()),
+    }));
+    let member = serde_json::json!({
+        "service": "pg", "stateful": true, "replication": told(Role::Replica, 3)
+    });
+    let key = h.task_with("shop", "pg-2", pod, member).await;
+    let st = h.wait_state(&key, TaskState::Failed).await;
+    assert!(st.message.contains("diverged: another database"), "{}", st.message);
+    assert!(st.message.contains("reclone"), "{}", st.message);
+    h.nothing_left().await;
 }

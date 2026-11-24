@@ -554,6 +554,23 @@ impl<H: Host> Pg<'_, H> {
         std::fs::rename(&aside, &path).map_err(|e| Fail::new(format!("{}: {e}", path.display())))
     }
 
+    /// Removes what the data directory holds, keeping the directory (its
+    /// owner and mode are the image's).
+    fn empty(&self) -> R<()> {
+        let entries = std::fs::read_dir(&self.data)
+            .map_err(|e| Fail::new(format!("{}: {e}", self.data.display())))?;
+        for e in entries.flatten() {
+            let path = e.path();
+            let gone = if e.file_type().is_ok_and(|t| t.is_dir()) {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            gone.map_err(|e| Fail::new(format!("{}: {e}", path.display())))?;
+        }
+        Ok(())
+    }
+
     fn has_database(&self) -> bool {
         self.data.join("PG_VERSION").exists()
     }
@@ -725,6 +742,9 @@ impl<H: Host> Pg<'_, H> {
             p.address.clone()
         };
         let env = [("PGPASSWORD", pw.clone())];
+        if self.req.reclone {
+            self.empty()?;
+        }
         let action;
         if !self.has_database() {
             let empty = std::fs::read_dir(&self.data).map_or(true, |mut d| d.next().is_none());

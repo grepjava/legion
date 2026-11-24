@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use legion_api::dispatch::{NodeTelemetry, TaskUsage};
+use legion_api::replication::MemberReport;
 use tokio::time::Instant;
 
 /// Reports older than this are left out: the task stopped, or its node
@@ -41,6 +42,9 @@ pub struct Usage {
     /// sent, the leader sending it again when it changes, and dropped when
     /// the follower stops following.
     mirrored: Mutex<BTreeMap<String, NodeTelemetry>>,
+    /// By `namespace/task`: what the node last said of each member of a
+    /// replicated database, and when (DESIGN.md §6.9).
+    members: Mutex<HashMap<String, (String, Instant, MemberReport)>>,
 }
 
 /// Host ZFS & network sample at a moment, in milliseconds since the epoch.
@@ -80,6 +84,41 @@ struct Report {
 }
 
 impl Usage {
+    /// What `node` says of its members of replicated databases: only of
+    /// tasks `runs_on` says are on it.
+    pub fn record_members(
+        &self,
+        node: &str,
+        reports: Vec<MemberReport>,
+        runs_on: impl Fn(&str) -> bool,
+    ) {
+        let now = Instant::now();
+        let mut members = self.members.lock().unwrap();
+        members.retain(|_, (_, at, _)| now.duration_since(*at) < FRESH);
+        for r in reports {
+            if runs_on(&r.task) {
+                members.insert(r.task.clone(), (node.to_owned(), now, r));
+            }
+        }
+    }
+
+    /// The members' reports, by `namespace/task`, with their node and age.
+    pub fn members(&self) -> BTreeMap<String, (String, Duration, MemberReport)> {
+        let now = Instant::now();
+        self.members
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, (_, at, _))| now.duration_since(*at) < FRESH)
+            .map(|(k, (node, at, r))| {
+                (
+                    k.clone(),
+                    (node.clone(), now.duration_since(*at), r.clone()),
+                )
+            })
+            .collect()
+    }
+
     /// Changes each time a node's report is taken: each heartbeat, its
     /// CARP states and certificate's CA taken before (`Dispatcher::heartbeat`).
     pub fn reports(&self) -> tokio::sync::watch::Receiver<u64> {

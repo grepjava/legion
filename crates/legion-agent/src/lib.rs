@@ -87,6 +87,9 @@ pub struct AgentConfig {
     pub volumes_dir: PathBuf,
     /// Volume plugins, executables by name (DESIGN.md §6.7).
     pub plugin_dir: PathBuf,
+    /// Replication plugins, executables by name, mounted read-only into
+    /// the containers that run them (DESIGN.md §6.9).
+    pub replication_dir: PathBuf,
     /// How this node exports the iSCSI LUNs of the Volumes it provides.
     pub iscsi: exports::IscsiConfig,
     /// The node's end of the WireGuard mesh to other nodes; without it, pods
@@ -168,6 +171,7 @@ impl AgentConfig {
             logs_dir: None,
             zfs_root: None,
             plugin_dir: PathBuf::from(DEFAULT_PLUGIN_DIR),
+            replication_dir: PathBuf::from(legion_api::replication::PLUGIN_DIR),
             iscsi: exports::IscsiConfig {
                 portal_group: exports::PORTAL_GROUP.to_owned(),
                 ..Default::default()
@@ -206,6 +210,8 @@ struct Worker {
     stopping: bool,
     /// Whether the worker was last told to pause its task.
     paused: bool,
+    /// The member's role and topology the worker was last told.
+    replication: Option<legion_api::replication::TaskReplication>,
     /// Set with a stop, which a status report under way gives way to.
     halt: tokio::sync::watch::Sender<bool>,
 }
@@ -224,6 +230,8 @@ impl<R: Runtime, C: Control> Agent<R, C> {
                 zfs_root: config.zfs_root,
                 volumes_dir: config.volumes_dir,
                 plugin_dir: config.plugin_dir,
+                replication_dir: config.replication_dir,
+                members: Arc::default(),
                 volume_lock: Arc::default(),
                 net: Arc::default(),
                 ips: Arc::default(),
@@ -382,7 +390,7 @@ impl<R: Runtime, C: Control> Agent<R, C> {
             ctx.control.clone(),
             ctx.node.clone(),
             carp_states,
-            (lacks, hosted),
+            (lacks, hosted, ctx.members.clone()),
             metrics::AgentMetrics {
                 runtime: ctx.runtime.clone(),
                 sys: ctx.sys.clone(),
@@ -1305,7 +1313,7 @@ async fn heartbeats<R: Runtime, C: Control>(
     control: Arc<C>,
     node: String,
     carp: CarpStates,
-    (lacks, hosted): (Lacks, Hosted),
+    (lacks, hosted, members): (Lacks, Hosted, task::Members),
     metrics: metrics::AgentMetrics<R>,
     usage_period: Duration,
 ) {
@@ -1330,8 +1338,14 @@ async fn heartbeats<R: Runtime, C: Control>(
         let checked = lacks.lock().unwrap_or_else(|e| e.into_inner()).take();
         let sending = checked.clone();
         let read = hosted.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let reports: Vec<_> = members
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
         match control
-            .heartbeat(&node, usage, held, telemetry, sending, read.clone())
+            .heartbeat(&node, usage, held, telemetry, sending, read.clone(), reports)
             .await
         {
             Ok(p) => {
@@ -1445,11 +1459,21 @@ async fn reconcile<R: Runtime, C: Control>(
                 if !wanted && !w.stopping && a.spec.desired_state == DesiredState::Shutdown {
                     w.halt.send_replace(true);
                     w.stopping = w.tx.send(Msg::Stop).await.is_ok();
-                } else if wanted && !w.stopping && w.paused != a.spec.paused {
+                } else if wanted && !w.stopping {
                     // Told again on the next reconcile if the worker's
                     // queue is full.
-                    if w.tx.try_send(Msg::Pause(a.spec.paused)).is_ok() {
+                    if w.paused != a.spec.paused
+                        && w.tx.try_send(Msg::Pause(a.spec.paused)).is_ok()
+                    {
                         w.paused = a.spec.paused;
+                    }
+                    if w.replication != a.spec.replication
+                        && w
+                            .tx
+                            .try_send(Msg::Replication(a.spec.replication.clone().map(Box::new)))
+                            .is_ok()
+                    {
+                        w.replication = a.spec.replication.clone();
                     }
                 }
             }
@@ -1462,6 +1486,7 @@ async fn reconcile<R: Runtime, C: Control>(
                 let (tx, rx) = mpsc::channel(64);
                 let (halt, halted) = tokio::sync::watch::channel(false);
                 let paused = a.spec.paused;
+                let replication = a.spec.replication.clone();
                 let (worker_ctx, a, key) = (ctx.clone(), a.clone(), uid.clone());
                 let handle = running.spawn(async move {
                     let end = task::run(worker_ctx, a, rx, halted).await;
@@ -1475,6 +1500,7 @@ async fn reconcile<R: Runtime, C: Control>(
                         stopping: false,
                         // The worker reads it from its assignment.
                         paused,
+                        replication,
                         halt,
                     },
                 );

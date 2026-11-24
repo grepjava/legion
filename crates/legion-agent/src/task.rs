@@ -25,6 +25,8 @@ use crate::probe::{self, Outcome, Prober};
 use crate::runtime::Runtime;
 use crate::{files, logins, output, volumes};
 
+mod member;
+
 /// How long a new pod waits for its guard: the policy pass retries a
 /// failed load every few seconds.
 const GUARD_WAIT: Duration = Duration::from_secs(60);
@@ -45,7 +47,14 @@ pub(crate) enum Msg {
     /// Freeze the pod's containers where they are (`true`), or let them go
     /// on, as the task's spec now says.
     Pause(bool),
+    /// The member's role and topology, as the task's spec now says.
+    Replication(Option<Box<legion_api::replication::TaskReplication>>),
 }
+
+/// What each member of a replicated database on the node last said, by
+/// task uid.
+pub(crate) type Members =
+    Arc<Mutex<BTreeMap<String, legion_api::replication::MemberReport>>>;
 
 pub(crate) struct Ctx<R, C> {
     pub runtime: Arc<R>,
@@ -60,6 +69,11 @@ pub(crate) struct Ctx<R, C> {
     pub volumes_dir: std::path::PathBuf,
     /// Volume plugins, by name.
     pub plugin_dir: std::path::PathBuf,
+    /// Replication plugins, by name.
+    pub replication_dir: std::path::PathBuf,
+    /// What each member of a replicated database last said, by task uid,
+    /// sent with each heartbeat.
+    pub members: Members,
     /// Keeps attaching and letting go of volumes apart.
     pub volume_lock: Arc<tokio::sync::Mutex<()>>,
     /// Set once the node has registered, before any worker starts.
@@ -107,6 +121,8 @@ impl<R, C> Clone for Ctx<R, C> {
             zfs_root: self.zfs_root.clone(),
             volumes_dir: self.volumes_dir.clone(),
             plugin_dir: self.plugin_dir.clone(),
+            replication_dir: self.replication_dir.clone(),
+            members: self.members.clone(),
             volume_lock: self.volume_lock.clone(),
             net: self.net.clone(),
             ips: self.ips.clone(),
@@ -210,6 +226,8 @@ struct Worker<R, C> {
     /// Whether the task's spec says to pause it, as last told; the status
     /// says whether it is.
     paused: bool,
+    /// A member of a replicated database: what it last applied.
+    member: member::State,
 }
 
 /// How a worker ended: the state it last reported, and that status if the
@@ -241,9 +259,11 @@ pub(crate) async fn run<R: Runtime, C: Control>(
         probe_rx,
         tap: None,
         paused,
+        member: Default::default(),
     };
     let span = tracing::info_span!("task", task = %w.a.key, uid = %w.a.uid);
     w.main().instrument(span).await;
+    w.forget_member();
     // What it last reported.
     Ended {
         state: w.status.state,
@@ -758,7 +778,12 @@ impl<R: Runtime, C: Control> Worker<R, C> {
 
         let mut members = Vec::new();
         let apps: Vec<_> = self.pod().containers.clone();
+        let member = self.member_container();
         for c in &apps {
+            let is_member = member.as_deref() == Some(c.name.as_str());
+            if is_member {
+                self.prepare_member(c, &infra, &sources, &files).await?;
+            }
             let mut spec = pod::container_spec(&self.ctx.node, &self.a, c, Role::App, &infra);
             self.fence(&mut spec);
             if let Some(vm) = &c.vm {
@@ -770,6 +795,9 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             }
             spec.mounts.extend(volumes::mounts(c, &sources));
             files.apply(&c.name, &mut spec);
+            if is_member {
+                spec.mounts.extend(self.plugin_mount()?);
+            }
             let id = rt
                 .create(&spec)
                 .await
@@ -1222,6 +1250,15 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             } else {
                 pod.members.iter().filter_map(|m| m.restart_at).min()
             };
+            // A member is asked where it stands while it runs, not paused.
+            if self.a.spec.replication.is_some() && self.member.due.is_none() {
+                self.member.due = Some(Instant::now());
+            }
+            let member_due = if self.status.paused || self.a.spec.replication.is_none() {
+                None
+            } else {
+                self.member.due
+            };
             tokio::select! {
                 msg = self.rx.recv() => match msg {
                     // The agent is shutting down; the pod keeps running.
@@ -1233,6 +1270,10 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                     Some(Msg::Pause(p)) => {
                         self.paused = p;
                         self.apply_pause(&mut pod).await;
+                    }
+                    Some(Msg::Replication(r)) => {
+                        self.a.spec.replication = r.map(|r| *r);
+                        self.member.due = Some(Instant::now());
                     }
                     Some(Msg::Died { id, .. }) if id == pod.infra => {
                         if !self.remove_pod().await {
@@ -1290,6 +1331,15 @@ impl<R: Runtime, C: Control> Worker<R, C> {
                     }
                 },
                 Some(r) = self.probe_rx.recv() => self.probed(&mut pod, r).await,
+                _ = sleep_until(member_due) => {
+                    self.member.due = Some(Instant::now() + member::EVERY);
+                    if let Some(why) = self.tend_member(&pod).await {
+                        if !self.remove_pod().await {
+                            return;
+                        }
+                        return self.finish(TaskState::Failed, why, None).await;
+                    }
+                }
                 _ = sleep_until(next_restart) => {
                     let now = Instant::now();
                     for i in 0..pod.members.len() {

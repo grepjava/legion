@@ -128,7 +128,19 @@ struct State {
     stop_delays: BTreeMap<String, Duration>,
     /// Containers, by name, whose removal fails.
     unremovable_names: BTreeSet<String>,
+    /// Each container's standard input, by id (`set_input`).
+    inputs: BTreeMap<String, Vec<u8>>,
+    /// What answers a replication plugin's calls, run with input or as a
+    /// container given input.
+    plugin: Option<FakePlugin>,
+    /// Plugin calls so far: the container's name, the operation and the
+    /// request.
+    plugin_calls: Vec<(String, String, Vec<u8>)>,
 }
+
+/// A scripted plugin: the operation and request to the exit code, output
+/// and error output.
+pub type FakePlugin = Arc<dyn Fn(&str, &[u8]) -> (i32, String, String) + Send + Sync>;
 
 /// An attached exec's view of its session.
 struct SessionHandle {
@@ -376,6 +388,16 @@ impl FakeRuntime {
         self.state().hold_init = hold;
     }
 
+    /// Calls of a replication plugin are answered by `plugin` from now on.
+    pub fn set_plugin(&self, plugin: FakePlugin) {
+        self.state().plugin = Some(plugin);
+    }
+
+    /// The plugin calls so far: container name, operation, request.
+    pub fn plugin_calls(&self) -> Vec<(String, String, Vec<u8>)> {
+        self.state().plugin_calls.clone()
+    }
+
     /// Exec in the container `name` exits with `code` from now on.
     pub fn set_exec(&self, name: &str, code: i32) {
         self.state().exec.insert(name.to_owned(), code);
@@ -572,7 +594,12 @@ impl Runtime for FakeRuntime {
     async fn image_os(&self, reference: &str) -> Result<Option<String>> {
         let s = self.state();
         Ok(s.images.contains(reference).then(|| {
-            if s.linux.contains(reference) { "linux" } else { "freebsd" }.to_owned()
+            if s.linux.contains(reference) {
+                "linux"
+            } else {
+                "freebsd"
+            }
+            .to_owned()
         }))
     }
 
@@ -834,9 +861,24 @@ impl Runtime for FakeRuntime {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
         c.jail = Some(jail);
-        if c.spec.labels.get(LABEL_ROLE).map(String::as_str) == Some("init")
-            && let Some(code) = init_exit
+        let (name, argv) = (c.spec.name.clone(), c.spec.entrypoint.clone());
+        let is_init = c.spec.labels.get(LABEL_ROLE).map(String::as_str) == Some("init");
+        // A container given input runs as the plugin, and ends.
+        if let Some(input) = s.inputs.get(id).cloned()
+            && let Some(plugin) = s.plugin.clone()
         {
+            let op = argv.last().cloned().unwrap_or_default();
+            s.plugin_calls
+                .push((name.clone(), op.clone(), input.clone()));
+            drop(s);
+            let (code, out, err) = plugin(&op, &input);
+            self.log(&name, Output::Stdout, &out);
+            self.log(&name, Output::Stderr, &err);
+            let mut s = self.state();
+            self.die(&mut s, id, code);
+            return Ok(());
+        }
+        if is_init && let Some(code) = init_exit {
             self.die(&mut s, id, code);
         }
         Ok(())
@@ -885,7 +927,11 @@ impl Runtime for FakeRuntime {
             return Err(api(500, "device busy"));
         }
         self.die(&mut s, id, 137);
-        s.containers.remove(id);
+        // Its output goes with it, as the jail runtime's with its
+        // directory; a container made again under its name starts afresh.
+        if let Some(c) = s.containers.remove(id) {
+            s.logs.remove(&c.spec.name);
+        }
         Ok(())
     }
 
@@ -949,6 +995,43 @@ impl Runtime for FakeRuntime {
             },
             ..Default::default()
         })
+    }
+
+    async fn exec_input(&self, id: &str, cmd: &[String], input: &[u8]) -> Result<ExecOutput> {
+        let (name, plugin) = {
+            let mut s = self.state();
+            let c = s
+                .containers
+                .get(id)
+                .ok_or_else(|| api(404, "no such container"))?;
+            if !c.running {
+                return Err(api(500, "container state improper"));
+            }
+            let name = c.spec.name.clone();
+            let op = cmd.last().cloned().unwrap_or_default();
+            s.plugin_calls.push((name.clone(), op, input.to_vec()));
+            s.execs += 1;
+            (name, s.plugin.clone())
+        };
+        let _ = name;
+        let Some(plugin) = plugin else {
+            return Err(api(500, "no plugin"));
+        };
+        let (code, out, err) = plugin(cmd.last().map_or("", String::as_str), input);
+        Ok(ExecOutput {
+            exit_code: code,
+            stdout: out.into_bytes(),
+            stderr: err.into_bytes(),
+        })
+    }
+
+    async fn set_input(&self, id: &str, input: &[u8]) -> Result<()> {
+        let mut s = self.state();
+        if !s.containers.contains_key(id) {
+            return Err(api(404, "no such container"));
+        }
+        s.inputs.insert(id.to_owned(), input.to_vec());
+        Ok(())
     }
 
     async fn exec_attach(

@@ -293,6 +293,69 @@ pub struct LastChange {
     pub at: i64,
 }
 
+/// What a member's task is told (its spec's `replication`): the Service's
+/// settings, and its role and the topology as the leader last named them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TaskReplication {
+    pub config: Replication,
+    pub epoch: u64,
+    pub role: spi::Role,
+    #[serde(default)]
+    pub topology: spi::Topology,
+}
+
+impl TaskReplication {
+    /// The request for `operation` from member `me`.
+    pub fn request(
+        &self,
+        operation: &str,
+        namespace: &str,
+        service: &str,
+        me: spi::Member,
+        now_ms: i64,
+    ) -> spi::Request {
+        spi::Request {
+            spi_version: spi::VERSION.into(),
+            operation: operation.into(),
+            deadline: now_ms + spi::deadline(operation).as_millis() as i64,
+            service: spi::ServiceRef {
+                namespace: namespace.into(),
+                name: service.into(),
+            },
+            epoch: self.epoch,
+            me,
+            topology: self.topology.clone(),
+            options: self.config.options.clone(),
+            role: (operation == "prepare").then_some(self.role),
+            reclone: false,
+        }
+    }
+}
+
+/// What an agent reports of a member, with each heartbeat.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberReport {
+    /// The task, `<namespace>/<name>`.
+    pub task: String,
+    pub member: String,
+    /// The epoch whose topology the member last applied (`configure`).
+    #[serde(default)]
+    pub applied: u64,
+    /// The last `status`, when one answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<spi::Status>,
+    /// The last call that failed, and its code.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub code: String,
+    /// Unix milliseconds of the last `status`.
+    #[serde(default)]
+    pub at: i64,
+}
+
 /// The plugin contract, SPI v1 (docs/REPLICATION.md).
 pub mod spi {
     use serde::{Deserialize, Serialize};
@@ -328,6 +391,11 @@ pub mod spi {
         /// `prepare` only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub role: Option<Role>,
+        /// `prepare` of a replica only, after it answered `diverged` and
+        /// the Service allows it (`reclone: allow`): discard the data and
+        /// copy the primary's anew.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub reclone: bool,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -751,6 +819,7 @@ mod tests {
             },
             options: Default::default(),
             role: Some(Role::Replica),
+            reclone: false,
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["spiVersion"], "1");

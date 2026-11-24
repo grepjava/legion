@@ -207,6 +207,10 @@ message HeartbeatRequest {
   // when the agent read them since its last heartbeat; the leader writes
   // them to the Node's status when they changed.
   optional bytes host_json = 6;
+  // The node's members of replicated databases: a JSON array of
+  // legion_api::replication::MemberReport, each as last seen (DESIGN.md
+  // §6.9). Kept in the leader's memory, never written.
+  optional bytes members_json = 7;
 }
 
 message NodeTelemetry {

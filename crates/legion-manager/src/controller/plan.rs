@@ -1471,6 +1471,9 @@ fn new_task(
         pod: s.spec.pod.clone(),
         images: pins.clone(),
         snapshot: None,
+        // Set by the replication pass once the task is on a node that
+        // reads it.
+        replication: None,
     };
     let mut object = Object::new(
         Kind::Task,

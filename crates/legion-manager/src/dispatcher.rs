@@ -1388,6 +1388,7 @@ impl Dispatcher for DispatcherService {
                 telemetry,
                 lacks_json,
                 host_json,
+                members_json,
                 ..
             } = req.into_inner();
             let mut forwarded = to_leader(
@@ -1398,6 +1399,7 @@ impl Dispatcher for DispatcherService {
                     telemetry,
                     lacks_json,
                     host_json,
+                    members_json,
                 },
                 &worker,
             )?;
@@ -1422,6 +1424,7 @@ impl Dispatcher for DispatcherService {
             telemetry,
             lacks_json,
             host_json,
+            members_json,
             ..
         } = req.into_inner();
         if let Some(json) = host_json {
@@ -1509,6 +1512,12 @@ impl Dispatcher for DispatcherService {
                 .flatten()
                 .is_some_and(|t| t.spec.get("node").and_then(|n| n.as_str()) == Some(node.as_str()))
         };
+        if let Some(json) = members_json {
+            match serde_json::from_slice::<Vec<legion_api::replication::MemberReport>>(&json) {
+                Ok(reports) => self.api.usage.record_members(&node, reports, runs_on),
+                Err(e) => tracing::warn!(%node, "its members' reports, unread: {e}"),
+            }
+        }
         self.api.usage.record(
             &node,
             reported.into_iter().map(|u| {
