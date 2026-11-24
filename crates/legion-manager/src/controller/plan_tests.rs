@@ -781,7 +781,10 @@ fn a_service_says_which_linux_images_it_runs() {
     assert_eq!(left, ["web-1-1 running n1"]);
     w.service("web", &format!("replicas: 0\n{POD}"));
     w.settle();
-    assert!(w.status("web").linux_images.is_empty(), "no running task, nothing said");
+    assert!(
+        w.status("web").linux_images.is_empty(),
+        "no running task, nothing said"
+    );
 }
 
 #[test]
@@ -5049,3 +5052,316 @@ fn automatic_failover_needs_pods_that_stop_when_cut_off() {
 
 #[path = "dryrun_tests.rs"]
 mod dryrun_tests;
+
+impl World {
+    /// Every running member of a replicated database says what an agent
+    /// running its plugin would: the role its spec names (promoted when
+    /// named primary), healthy, at `position(ordinal)` on `term`; or
+    /// nothing, for the ordinals `silent` names.
+    fn members_say(&mut self, term: u64, position: impl Fn(u32) -> u64, silent: &[u32]) {
+        use legion_api::replication::{MemberReport, spi};
+        self.memory.members = self
+            .tasks
+            .iter()
+            .filter(|t| t.status.state == TaskState::Running)
+            .filter_map(|t| {
+                let r = t.spec.replication.as_ref()?;
+                let i = t.spec.slot?;
+                if silent.contains(&i) {
+                    return None;
+                }
+                Some((
+                    format!("shop/{}", t.object.metadata.name),
+                    (
+                        t.spec.node.clone(),
+                        Duration::ZERO,
+                        MemberReport {
+                            task: format!("shop/{}", t.object.metadata.name),
+                            member: format!("{}-{i}", t.spec.service),
+                            applied: r.epoch,
+                            status: Some(spi::Status {
+                                role: r.role,
+                                healthy: true,
+                                position: Some(spi::Position {
+                                    term,
+                                    offset: position(i),
+                                }),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    ),
+                ))
+            })
+            .collect();
+    }
+
+    fn replication(&self, service: &str) -> legion_api::replication::ReplicationStatus {
+        self.status(service).replication.expect("replicated")
+    }
+
+    /// The role each running member's task is told, by ordinal.
+    fn roles(&self, service: &str) -> BTreeMap<u32, String> {
+        self.tasks
+            .iter()
+            .filter(|t| t.spec.service == service && active_running(t))
+            .filter_map(|t| {
+                Some((
+                    t.spec.slot?,
+                    t.spec.replication.as_ref()?.role.as_str().to_owned(),
+                ))
+            })
+            .collect()
+    }
+
+    /// The node of ordinal `i`'s running task.
+    fn node_of(&self, i: u32) -> String {
+        self.tasks
+            .iter()
+            .find(|t| t.spec.slot == Some(i) && active_running(t))
+            .unwrap()
+            .spec
+            .node
+            .clone()
+    }
+}
+
+fn active_running(t: &Task) -> bool {
+    t.spec.desired_state == DesiredState::Running && t.status.state == TaskState::Running
+}
+
+const DATABASE: &str = "mode: stateful
+replicas: 3
+replication: { plugin: postgres, failoverAfter: 10s }
+pod:
+  onPartition: stop
+  stopGracePeriod: 30s
+  containers: [{ name: pg, image: \"pg:17\" }]
+  volumes: [{ name: data, claim: { size: 1Gi } }]";
+
+fn database(w: &mut World, spec: &str) {
+    for n in ["n1", "n2", "n3"] {
+        w.node(n, &[]);
+    }
+    for n in w.nodes.iter_mut() {
+        n.status.protocol = legion_api::protocol::Protocol::current();
+    }
+    w.service("pg", spec);
+    w.settle();
+}
+
+/// Forming: ordinal 0 is named primary, every member's task is told its
+/// role and the topology, and once the primary serves it is healthy.
+#[test]
+fn a_replicated_database_names_its_first_primary_and_tells_each_member() {
+    use legion_api::replication::Phase;
+    let mut w = World::new();
+    database(&mut w, DATABASE);
+    assert_eq!(w.running().len(), 3);
+    let st = w.replication("pg");
+    assert_eq!((st.primary.as_deref(), st.epoch), (Some("pg-0"), 1));
+    assert_eq!(st.phase, Phase::Forming);
+    assert_eq!(
+        w.roles("pg"),
+        BTreeMap::from([
+            (0, "primary".into()),
+            (1, "replica".into()),
+            (2, "replica".into())
+        ])
+    );
+    let t = w.tasks.iter().find(|t| t.spec.slot == Some(1)).unwrap();
+    let r = t.spec.replication.as_ref().unwrap();
+    assert_eq!(r.topology.primary.as_ref().unwrap().member, "pg-0");
+    assert_eq!(r.topology.members.len(), 3);
+    assert_eq!(r.topology.primary.as_ref().unwrap().dns, "pg-0.pg.shop");
+
+    w.members_say(1, |_| 100, &[]);
+    w.settle();
+    let st = w.replication("pg");
+    assert_eq!(st.phase, Phase::Healthy, "{}", st.message);
+    assert_eq!(st.members.len(), 3);
+    assert!(st.primary_position.is_some());
+    assert!(w.faults.is_empty(), "{:?}", w.faults);
+}
+
+/// The primary's node goes down: once it has been unhealthy for
+/// `failoverAfter` and its task surely stopped (its stop grace period of
+/// 30 s and 5 s), the replica furthest ahead is promoted, the epoch goes up, and
+/// every member is told; once the new primary serves, the change is done.
+#[test]
+fn a_lost_primary_is_fenced_then_the_replica_furthest_ahead_promoted() {
+    use legion_api::replication::Phase;
+    let mut w = World::new();
+    database(&mut w, DATABASE);
+    w.members_say(1, |_| 100, &[]);
+    w.settle();
+    let n0 = w.node_of(0);
+    w.state(&n0, NodeState::Down);
+    // pg-2 is further ahead than pg-1.
+    let ahead = |i: u32| if i == 2 { 150 } else { 120 };
+    w.members_say(1, ahead, &[0]);
+    w.settle();
+    assert_eq!(
+        w.replication("pg").primary.as_deref(),
+        Some("pg-0"),
+        "not yet: failoverAfter"
+    );
+
+    w.advance(11);
+    w.members_say(1, ahead, &[0]);
+    w.settle();
+    let st = w.replication("pg");
+    assert_eq!(st.phase, Phase::FailingOver);
+    let c = st.change.as_ref().expect("a change");
+    assert!(c.to.is_none(), "fencing first: {}", st.message);
+    assert!(st.message.contains("cut off"), "{}", st.message);
+    assert!(
+        !w.roles("pg").values().any(|r| r == "primary"),
+        "no member is told it is primary while the old one is fenced"
+    );
+
+    // Its stop grace period and 5 s after it was cut off: promoted.
+    w.advance(25);
+    w.members_say(1, ahead, &[0]);
+    w.settle();
+    let st = w.replication("pg");
+    assert_eq!(st.primary.as_deref(), Some("pg-2"));
+    assert_eq!(st.epoch, 2);
+    assert_eq!(w.roles("pg").get(&2).map(String::as_str), Some("primary"));
+    assert_eq!(w.roles("pg").get(&1).map(String::as_str), Some("replica"));
+    let t1 = w
+        .tasks
+        .iter()
+        .find(|t| t.spec.slot == Some(1) && active_running(t))
+        .unwrap();
+    assert_eq!(
+        t1.spec
+            .replication
+            .as_ref()
+            .unwrap()
+            .topology
+            .primary
+            .as_ref()
+            .unwrap()
+            .member,
+        "pg-2",
+        "the others follow the new primary"
+    );
+
+    // The new primary serves: done.
+    w.members_say(2, |_| 200, &[0]);
+    w.settle();
+    let st = w.replication("pg");
+    assert!(st.change.is_none());
+    let last = st.last_change.expect("recorded");
+    assert_eq!(
+        (last.from.as_deref(), last.to.as_str()),
+        (Some("pg-0"), "pg-2")
+    );
+    assert_eq!(st.phase, Phase::Degraded, "pg-0 is still away");
+    assert!(w.faults.is_empty(), "{:?}", w.faults);
+}
+
+/// With synchronous replicas, a failover waits until enough replicas have
+/// been heard from that the furthest ahead surely holds every confirmed
+/// commit; with `maximumLag`, one too far behind is passed over.
+#[test]
+fn a_failover_waits_for_the_synchronous_quorum_and_passes_over_laggards() {
+    let mut w = World::new();
+    database(
+        &mut w,
+        &DATABASE.replace(
+            "failoverAfter: 10s }",
+            "failoverAfter: 10s, synchronous: 1, maximumLag: 1Ki }",
+        ),
+    );
+    w.members_say(1, |_| 5000, &[]);
+    w.settle();
+    let n0 = w.node_of(0);
+    w.state(&n0, NodeState::Down);
+    w.members_say(1, |_| 5000, &[0, 1]);
+    w.settle();
+    w.advance(11);
+    w.members_say(1, |_| 5000, &[0, 1]);
+    w.settle();
+    w.advance(25);
+    w.members_say(1, |_| 5000, &[0, 1]);
+    w.settle();
+    let st = w.replication("pg");
+    assert!(st.change.as_ref().unwrap().to.is_none());
+    assert!(
+        st.message.contains("1 of 2 replicas heard from"),
+        "{}",
+        st.message
+    );
+
+    // Both heard from, pg-2 far behind: pg-1.
+    w.members_say(1, |i| if i == 2 { 1000 } else { 4900 }, &[0]);
+    w.settle();
+    assert_eq!(w.replication("pg").primary.as_deref(), Some("pg-1"));
+}
+
+/// `failover: manual`: a lost primary is reported, nothing promoted.
+#[test]
+fn a_manual_failover_reports_the_lost_primary_and_waits() {
+    use legion_api::replication::Phase;
+    let mut w = World::new();
+    database(
+        &mut w,
+        &DATABASE.replace(
+            "failoverAfter: 10s }",
+            "failoverAfter: 10s, failover: manual }",
+        ),
+    );
+    w.members_say(1, |_| 100, &[]);
+    w.settle();
+    w.members_say(1, |_| 100, &[0]);
+    w.settle();
+    w.advance(11);
+    w.members_say(1, |_| 100, &[0]);
+    w.settle();
+    let st = w.replication("pg");
+    assert!(st.change.is_none());
+    assert_eq!(st.primary.as_deref(), Some("pg-0"));
+    assert_eq!(st.phase, Phase::Degraded);
+    assert!(
+        st.message.contains("legion replication failover pg"),
+        "{}",
+        st.message
+    );
+}
+
+/// A member told it is a replica that says it is primary is stopped.
+#[test]
+fn a_member_that_says_it_is_primary_unnamed_is_stopped() {
+    use legion_api::replication::{Phase, spi::Role};
+    let mut w = World::new();
+    database(&mut w, DATABASE);
+    w.members_say(1, |_| 100, &[]);
+    w.settle();
+    let key = w
+        .tasks
+        .iter()
+        .find(|t| t.spec.slot == Some(1) && active_running(t))
+        .map(|t| format!("shop/{}", t.object.metadata.name))
+        .unwrap();
+    w.memory
+        .members
+        .get_mut(&key)
+        .unwrap()
+        .2
+        .status
+        .as_mut()
+        .unwrap()
+        .role = Role::Primary;
+    let p = w.plan();
+    let stopped = p.actions.iter().any(|a| match a {
+        Action::Update(o, _) => {
+            format!("shop/{}", o.metadata.name) == key && o.spec["desiredState"] == "shutdown"
+        }
+        _ => false,
+    });
+    assert!(stopped, "the split member is stopped");
+    w.apply(p.actions);
+    assert_eq!(w.replication("pg").phase, Phase::Split);
+}

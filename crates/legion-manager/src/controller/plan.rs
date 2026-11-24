@@ -29,6 +29,7 @@ mod drain;
 pub mod dryrun;
 mod jobs;
 mod migrate;
+mod replication;
 pub use jobs::{CronJob, Job, Jobs};
 
 /// Terminal tasks kept per slot, as Swarm's task history limit.
@@ -199,6 +200,14 @@ pub struct Memory {
     /// This leader's first pass: tasks failed by then were judged by the
     /// leader before, which knew how long they ran.
     pub began: Option<Instant>,
+    /// What members of replicated databases last said, by `namespace/task`,
+    /// with their node and the report's age; set before each pass.
+    pub members: BTreeMap<String, (String, Duration, legion_api::replication::MemberReport)>,
+    /// Since when each replicated Service's primary (by Service uid) has
+    /// not been healthy. A new leader counts anew, which only waits longer.
+    pub unhealthy_since: BTreeMap<String, Instant>,
+    /// When each replicated Service's status (by uid) was last written.
+    pub replication_written: BTreeMap<String, Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -467,6 +476,8 @@ fn orphan(tasks: &[Task], nodes: &[Node], plan: &mut Plan) -> (Vec<Task>, BTreeS
 #[derive(Debug, Default)]
 struct Addresses {
     vip: Option<Ipv4Addr>,
+    /// The `<service>-read` VIP, for a replicated database's replicas.
+    read_vip: Option<Ipv4Addr>,
     published: Vec<PublishedPort>,
     /// Ports the service names that an older service holds.
     conflicts: Vec<String>,
@@ -485,6 +496,8 @@ fn addresses(services: &[Service]) -> BTreeMap<&str, Addresses> {
             .as_ref()
             .is_some_and(|e| e.mode == EndpointMode::Vip && !e.ports.is_empty())
     };
+    let wants_read_vip =
+        |s: &Service| wants_vip(s) && s.spec.replication.as_ref().is_some_and(|r| r.read);
     let in_range = |ip: Ipv4Addr| {
         let host_bits = 32 - u32::from(SERVICE_PREFIX);
         u32::from(ip) >> host_bits == u32::from(SERVICE_NET) >> host_bits
@@ -519,6 +532,13 @@ fn addresses(services: &[Service]) -> BTreeMap<&str, Addresses> {
             && vips.insert(ip)
         {
             a.vip = Some(ip);
+        }
+        if wants_read_vip(s)
+            && let Some(ip) = old.read_virtual_ip.as_deref().and_then(|v| v.parse().ok())
+            && in_range(ip)
+            && vips.insert(ip)
+        {
+            a.read_vip = Some(ip);
         }
         for p in s.spec.endpoint.iter().flat_map(|e| &e.ports) {
             if p.publish == Publish::None {
@@ -567,6 +587,12 @@ fn addresses(services: &[Service]) -> BTreeMap<&str, Addresses> {
         if wants_vip(s) && a.vip.is_none() {
             a.vip = next_vip.by_ref().find(|ip| !vips.contains(ip));
             if let Some(ip) = a.vip {
+                vips.insert(ip);
+            }
+        }
+        if wants_read_vip(s) && a.read_vip.is_none() {
+            a.read_vip = next_vip.by_ref().find(|ip| !vips.contains(ip));
+            if let Some(ip) = a.read_vip {
                 vips.insert(ip);
             }
         }
@@ -809,7 +835,32 @@ fn service(
     };
     // A stateful service starts a task only once every lower ordinal has a
     // ready one, and updates from its highest ordinal down.
+    // A replicated database's members start once its primary has: the
+    // primary first, whatever its ordinal, and the others while it is
+    // being replaced (they wait for one at their plugin's `prepare`).
+    let primary_slot: Option<Option<Slot>> = s.spec.replication.as_ref().map(|_| {
+        // Before any is named, ordinal 0 will be.
+        let Some(st) = previous.replication.as_ref() else {
+            return Some(Slot::Replica(0));
+        };
+        if st.change.as_ref().is_some_and(|c| c.to.is_none()) {
+            return None;
+        }
+        let p = st.primary.as_deref()?;
+        let n: u32 = p
+            .strip_prefix(s.object.metadata.name.as_str())?
+            .strip_prefix('-')?
+            .parse()
+            .ok()?;
+        Some(Slot::Replica(n))
+    });
     let ready_below = |slot: &Slot| {
+        if let Some(primary) = &primary_slot {
+            return match primary {
+                Some(p) => p == slot || by_slot.get(p).is_some_and(|l| l.iter().any(|t| up(t))),
+                None => true,
+            };
+        }
         !stateful
             || wanted
                 .iter()
@@ -1116,6 +1167,7 @@ fn service(
     }
 
     pause(s, tasks, nodes, plan);
+    let replication = replication::pass(s, tasks, nodes, memory, now, plan);
 
     // Status, from the tasks as they are now.
     let running: Vec<&&Task> = tasks
@@ -1145,13 +1197,8 @@ fn service(
                 (i.clone(), recipe.to_owned())
             })
             .collect(),
-        // Written by the replication pass, which runs after this one.
-        replication: s
-            .object
-            .status
-            .get("replication")
-            .and_then(|r| serde_json::from_value(r.clone()).ok()),
-        read_virtual_ip: None,
+        replication,
+        read_virtual_ip: addrs.read_vip.map(|ip| ip.to_string()),
     };
     let status = serde_json::to_value(&status).expect("status serialises");
     if s.object.status != status {

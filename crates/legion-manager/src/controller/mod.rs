@@ -96,6 +96,7 @@ async fn lead(store: &Store, usage: &crate::usage::Usage) {
             }
         };
         memory.usage = usage.fresh();
+        memory.members = usage.members();
         let wake = pass(store, &mut memory).await;
         // Sleep until something changes, the planned wake-up, or the period.
         let mut watcher = match store.watch(from, None) {

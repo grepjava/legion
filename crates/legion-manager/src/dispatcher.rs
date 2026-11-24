@@ -2096,7 +2096,7 @@ pub(crate) fn endpoints(
     }
     services
         .values()
-        .map(|s| {
+        .flat_map(|s| {
             let status: ServiceStatus =
                 serde_json::from_value(s.status.clone()).unwrap_or_default();
             let (mut ready, mut alive, ordinals) = by_service
@@ -2105,11 +2105,18 @@ pub(crate) fn endpoints(
             ready.sort();
             alive.sort();
             let spec = legion_api::parse::<ServiceSpec>(&s.spec).ok();
+            let roles = spec
+                .as_ref()
+                .and_then(|spec| Some((spec.replication.as_ref()?, status.replication.as_ref()?)))
+                .map(|(_, st)| database_roles(&s.metadata.name, st, &ordinals));
+            if let Some((primary, _)) = &roles {
+                ready = primary.clone();
+            }
             let load_balancer = spec
                 .as_ref()
                 .and_then(|spec| spec.endpoint.as_ref()?.load_balancer.as_ref())
                 .map(|lb| load_balancer_holders(&s.metadata.uid, lb, &holders));
-            let ports = spec
+            let ports: Vec<EndpointPort> = spec
                 .and_then(|spec| {
                     let pod = spec.pod;
                     let ports = spec.endpoint?.ports;
@@ -2134,7 +2141,38 @@ pub(crate) fn endpoints(
                     )
                 })
                 .unwrap_or_default();
-            ServiceEndpoints {
+            // The replicas' own address, unpublished, where reads go.
+            let read = roles
+                .zip(
+                    status
+                        .read_virtual_ip
+                        .as_deref()
+                        .and_then(|v| v.parse().ok()),
+                )
+                .map(|((primary, replicas), vip)| ServiceEndpoints {
+                    namespace: s.metadata.namespace.clone(),
+                    name: format!("{}-read", s.metadata.name),
+                    uid: format!("{}r", s.metadata.uid),
+                    labels: s.metadata.labels.clone(),
+                    vip: Some(vip),
+                    ports: ports
+                        .iter()
+                        .map(|p| EndpointPort {
+                            published: None,
+                            ..p.clone()
+                        })
+                        .collect(),
+                    ready: if replicas.is_empty() {
+                        primary
+                    } else {
+                        replicas
+                    },
+                    alive: alive.clone(),
+                    ordinals: BTreeMap::new(),
+                    job: false,
+                    load_balancer: None,
+                });
+            std::iter::once(ServiceEndpoints {
                 namespace: s.metadata.namespace.clone(),
                 name: s.metadata.name.clone(),
                 uid: s.metadata.uid.clone(),
@@ -2146,7 +2184,8 @@ pub(crate) fn endpoints(
                 ordinals,
                 job: false,
                 load_balancer,
-            }
+            })
+            .chain(read)
         })
         .chain(
             jobs.into_iter()
@@ -2168,6 +2207,40 @@ pub(crate) fn endpoints(
                 }),
         )
         .collect()
+}
+
+/// A replicated database's ready members as its endpoints take them: the
+/// primary Legion names, if it says it is primary and healthy (none during
+/// a change of primary, so writes fail fast rather than reach an old one),
+/// and the healthy replicas, for reads.
+fn database_roles(
+    service: &str,
+    st: &legion_api::replication::ReplicationStatus,
+    ordinals: &BTreeMap<u32, Ipv4Addr>,
+) -> (Vec<Ipv4Addr>, Vec<Ipv4Addr>) {
+    use legion_api::replication::spi::Role;
+    let named = match &st.change {
+        Some(c) if c.to.is_none() => None,
+        _ => st.primary.as_deref(),
+    };
+    let says = |member: &str, role: Role| {
+        st.members
+            .get(member)
+            .is_some_and(|m| m.status.role == role && m.status.healthy)
+    };
+    let mut primary = Vec::new();
+    let mut replicas = Vec::new();
+    for (n, ip) in ordinals {
+        let member = format!("{service}-{n}");
+        if named == Some(member.as_str()) {
+            if says(&member, Role::Primary) {
+                primary.push(*ip);
+            }
+        } else if says(&member, Role::Replica) {
+            replicas.push(*ip);
+        }
+    }
+    (primary, replicas)
 }
 
 /// Who holds a service's load balancer address: every node in `nodes`,
@@ -2570,6 +2643,97 @@ mod tests {
             [Ipv4Addr::new(10, 200, 0, 8), Ipv4Addr::new(10, 200, 0, 9)]
         );
         assert!(job.vip.is_none() && job.ports.is_empty() && job.ready.is_empty());
+    }
+
+    /// A replicated database's address goes to the primary Legion names,
+    /// once it says it is primary and healthy, and to none while another is
+    /// being promoted; `<service>-read` to its healthy replicas.
+    #[test]
+    fn a_replicated_databases_writes_go_to_its_primary_and_reads_to_its_replicas() {
+        let task = |n: u32, ip: &str| {
+            let mut t = Object::new(
+                Kind::Task,
+                "a",
+                &format!("pg-{n}-1"),
+                serde_json::json!({
+                    "service": "pg",
+                    "serviceUid": "svc-uid",
+                    "serviceGeneration": 1,
+                    "slot": n,
+                    "stateful": true,
+                    "node": "n1",
+                    "pod": {"containers": [{"name": "c", "image": "x"}]},
+                }),
+            );
+            t.status = serde_json::json!({"state": "running", "ip": ip, "ready": true});
+            t
+        };
+        let member = |role: &str, healthy: bool| serde_json::json!({"task": "t", "at": 1, "role": role, "healthy": healthy});
+        let service = |change: serde_json::Value| {
+            let mut pg = Object::new(
+                Kind::Service,
+                "a",
+                "pg",
+                serde_json::json!({
+                    "mode": "stateful",
+                    "replicas": 3,
+                    "replication": {"plugin": "postgres", "read": true},
+                    "endpoint": {"ports": [{"port": 5432}]},
+                    "pod": {"containers": [{"name": "c", "image": "x"}]},
+                }),
+            );
+            pg.metadata.uid = "svc-uid".into();
+            pg.status = serde_json::json!({
+                "observedGeneration": 1, "desired": 3, "running": 3, "ready": 3,
+                "virtualIp": "10.201.0.1",
+                "readVirtualIp": "10.201.0.2",
+                "replication": {
+                    "epoch": 2, "primary": "pg-1", "phase": "healthy",
+                    "members": {
+                        "pg-0": member("replica", true),
+                        "pg-1": member("primary", true),
+                        "pg-2": member("replica", false),
+                    },
+                    "change": change,
+                }
+            });
+            [pg].into_iter()
+                .map(|o| (o.key(), o))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let tasks = [
+            task(0, "10.200.0.10"),
+            task(1, "10.200.0.11"),
+            task(2, "10.200.0.12"),
+        ]
+        .into_iter()
+        .map(|o| (o.key(), o))
+        .collect();
+        let ip = |last: u8| Ipv4Addr::new(10, 200, 0, last);
+        let mut n1 = Object::new(Kind::Node, "", "n1", serde_json::json!({}));
+        n1.status = serde_json::json!({"state": "ready"});
+        let nodes = [n1].into_iter().map(|o| (o.key(), o)).collect();
+        let out = endpoints(&service(serde_json::Value::Null), &tasks, &nodes);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0].name, "pg");
+        assert_eq!(out[0].ready, [ip(11)], "writes: the primary alone");
+        assert_eq!(out[0].alive.len(), 3);
+        assert_eq!(out[0].ordinals.len(), 3, "each member keeps its own name");
+        let read = &out[1];
+        assert_eq!(
+            (read.name.as_str(), read.uid.as_str()),
+            ("pg-read", "svc-uidr")
+        );
+        assert_eq!(read.vip, Some(Ipv4Addr::new(10, 201, 0, 2)));
+        assert_eq!(read.ready, [ip(10)], "reads: the healthy replicas");
+        assert!(read.ports.iter().all(|p| p.published.is_none()));
+
+        // Fencing the old primary before another is named: no writes.
+        let change = serde_json::json!({
+            "kind": "failover", "from": "pg-1", "reason": "lost", "started": 1
+        });
+        let out = endpoints(&service(change), &tasks, &nodes);
+        assert!(out[0].ready.is_empty(), "{out:?}");
     }
 
     fn subnet(n: u32) -> String {

@@ -266,6 +266,12 @@ pub struct Change {
     /// The operator passed over the lag and synchronous checks.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub force: bool,
+    /// The old primary's tasks, by uid, as the change began: each must
+    /// have stopped, or be surely stopped by its node cut off, before
+    /// another member is promoted. Tasks made since are told there is no
+    /// primary, so they wait.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fence: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
