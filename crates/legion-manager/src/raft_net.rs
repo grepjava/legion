@@ -50,7 +50,7 @@ const MIN_BUDGET: usize = 16 * 1024;
 const FIRST_BUDGET: usize = 128 * 1024;
 /// Of the time a call has beyond the round trip, the share its bytes are
 /// sized to fill.
-const FILL: f64 = 0.5;
+const FILL: f64 = 0.4;
 
 /// What a leader has learned of the link to each peer, from how long calls
 /// take: how many bytes of log a call may carry. Each call must finish
@@ -65,10 +65,10 @@ pub(crate) type Budgets = Arc<Mutex<HashMap<NodeId, Link>>>;
 
 /// See [`Budgets`]: the quickest call seen stands for the round trip, and
 /// the bytes calls moved beyond it in the time they took for the link's
-/// rate; the budget fills half the time a call has beyond the round trip.
-/// Until a rate is known, a call that took under a quarter of its time
-/// doubles the budget. A call that ran out of time halves it, and says the
-/// rate is below what it tried.
+/// rate; the budget fills 40% of the time a call has beyond the round
+/// trip, growing by at most a quarter a call. Until a rate is known, a call
+/// that took under a quarter of its time doubles the budget. A call that
+/// ran out of time halves it, and says the rate is below what it tried.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Link {
     pub budget: usize,
@@ -293,9 +293,12 @@ impl Link {
             self.rate
         };
         let budget = match rate {
+            // Down at once, up by a quarter a call: a rate measured while
+            // the connection's window was open would raise it past what a
+            // call carries once it closes again.
             Some(r) => {
                 let room = allowed.saturating_sub(rtt).as_secs_f64();
-                (r * room * FILL) as usize
+                ((r * room * FILL) as usize).min(self.budget.saturating_add(self.budget / 4))
             }
             None if t < allowed / 4 && size >= self.budget / 2 => self.budget.saturating_mul(2),
             None => self.budget,
@@ -569,11 +572,18 @@ mod tests {
         let wan = wan.after(128 * 1024, Some(ms(240 + 262)), allowed);
         let rate = wan.rate.unwrap();
         assert!((480_000.0..520_000.0).contains(&rate), "{rate}");
-        // Half of the 560 ms beyond the round trip, at that rate.
-        assert!((130_000..145_000).contains(&wan.budget), "{wan:?}");
+        // 40% of the 560 ms beyond the round trip, at that rate: below
+        // the first budget, so taken at once.
+        assert!((105_000..117_000).contains(&wan.budget), "{wan:?}");
+        // Faster calls raise it by a quarter a call at most.
+        let up = wan.after(wan.budget, Some(ms(240 + 50)), allowed);
+        assert_eq!(up.budget, wan.budget + wan.budget / 4);
         // A call that runs out of time: half of it, and a rate below it.
         let out = wan.after(400_000, None, allowed);
         assert_eq!(out.budget, wan.budget.min(200_000));
+        // Then sized to the rate it lowered, not straight back up.
+        let after = out.after(2_000, Some(ms(250)), allowed);
+        assert!(after.budget <= out.budget + out.budget / 4, "{after:?}");
         assert!(out.rate.unwrap() <= 400_000.0 / 0.8);
         // Calls keep timing out: down to the floor, never below.
         let mut b = Link::default();
