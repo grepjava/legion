@@ -371,6 +371,7 @@ impl TaskReplication {
             options: self.config.options.clone(),
             role: (operation == "prepare").then_some(self.role),
             reclone: false,
+            probe: None,
         }
     }
 }
@@ -410,6 +411,7 @@ pub mod spi {
             "status" => 4,
             "describe" => 10,
             "configure" | "promote" => 60,
+            "probe" => 30,
             // A first copy of a large database takes what it takes.
             _ => 24 * 3600,
         })
@@ -438,6 +440,35 @@ pub mod spi {
         /// copy the primary's anew.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         pub reclone: bool,
+        /// `probe` only (capability `probe`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub probe: Option<Probe>,
+    }
+
+    /// What `probe` does, for the conformance check
+    /// (`legion replication check`): on the primary, write a marker
+    /// `{"write": KEY}` (committed as any write is, so synchronous
+    /// replicas confirm it); on any member, say whether one is there
+    /// `{"read": KEY}`. Keys are letters, digits, `-` and `_`, up to 64.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub enum Probe {
+        Write(String),
+        Read(String),
+    }
+
+    impl Probe {
+        pub fn key(&self) -> &str {
+            match self {
+                Probe::Write(k) | Probe::Read(k) => k,
+            }
+        }
+    }
+
+    /// `probe`'s response.
+    #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+    pub struct Probed {
+        pub found: bool,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -584,6 +615,9 @@ pub mod spi {
         pub rewind: bool,
         #[serde(default)]
         pub seed_from_snapshot: bool,
+        /// Answers `probe`, so the conformance check can see data travel.
+        #[serde(default)]
+        pub probe: bool,
     }
 
     impl Describe {
@@ -862,6 +896,7 @@ mod tests {
             options: Default::default(),
             role: Some(Role::Replica),
             reclone: false,
+            probe: None,
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["spiVersion"], "1");

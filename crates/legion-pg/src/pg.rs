@@ -503,6 +503,7 @@ pub fn handle(operation: &str, input: &str, h: &mut impl Host) -> R<String> {
         "status" => serde_json::to_value(pg.status()?).expect("serialises"),
         "promote" => pg.promote()?,
         "configure" => pg.configure()?,
+        "probe" => pg.probe()?,
         other => return Err(Fail::new(format!("no operation {other:?}"))),
     };
     Ok(v.to_string())
@@ -517,6 +518,7 @@ pub fn describe() -> Describe {
             readable_replicas: true,
             rewind: true,
             seed_from_snapshot: false,
+            probe: true,
         },
     }
 }
@@ -869,6 +871,41 @@ impl<H: Host> Pg<'_, H> {
             return Err(Fail::code(code, format!("psql: {}", tail(&out.stderr))));
         }
         Ok(out.stdout.trim().to_owned())
+    }
+
+    /// The conformance check's marker: a row of `legion_probe` in the
+    /// `postgres` database, written on the primary as any commit is (so
+    /// synchronous replicas confirm it), looked for on any member.
+    fn probe(&mut self) -> R<Value> {
+        let Some(p) = self.req.probe.clone() else {
+            return Err(Fail::new("probe: say what to write or read"));
+        };
+        let key = p.key();
+        if key.is_empty()
+            || key.len() > 64
+            || !key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(Fail::new(format!("probe: bad key {key:?}")));
+        }
+        let found = match &p {
+            spi::Probe::Write(k) => {
+                self.psql(&format!(
+                    "CREATE TABLE IF NOT EXISTS legion_probe (key text PRIMARY KEY, \
+                     at timestamptz NOT NULL DEFAULT now()); \
+                     INSERT INTO legion_probe (key) VALUES ('{k}') ON CONFLICT DO NOTHING"
+                ))?;
+                true
+            }
+            spi::Probe::Read(k) => {
+                self.psql("SELECT to_regclass('public.legion_probe') IS NOT NULL")? == "t"
+                    && self.psql(&format!(
+                        "SELECT count(*) FROM legion_probe WHERE key = '{k}'"
+                    ))? != "0"
+            }
+        };
+        Ok(json!({ "found": found }))
     }
 
     fn status(&mut self) -> R<Status> {

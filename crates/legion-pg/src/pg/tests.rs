@@ -124,6 +124,7 @@ fn request(s: &Setup, me: u32, primary: Option<u32>, role: Option<Role>) -> Stri
         options,
         role,
         reclone: false,
+        probe: None,
     };
     serde_json::to_string(&r).unwrap()
 }
@@ -499,4 +500,43 @@ fn a_replica_allowed_to_reclone_discards_its_data_and_copies_the_primary() {
     assert!(s.data.exists(), "the directory stays");
     assert!(h.ran("pg_basebackup -D"));
     assert!(!h.ran("pg_controldata"));
+}
+
+#[test]
+fn probe_writes_a_marker_and_reads_it_back() {
+    let s = setup();
+    if !usable(&s) {
+        return;
+    }
+    let with = |probe: spi::Probe| {
+        let mut r: Request = serde_json::from_str(&request(&s, 0, Some(0), None)).unwrap();
+        r.probe = Some(probe);
+        serde_json::to_string(&r).unwrap()
+    };
+    let mut h = Fake::default();
+    let out = handle("probe", &with(spi::Probe::Write("k-1".into())), &mut h).unwrap();
+    assert_eq!(out, r#"{"found":true}"#);
+    assert!(h.ran("INSERT INTO legion_probe (key) VALUES ('k-1') ON CONFLICT DO NOTHING"));
+
+    // No table yet: not found, nothing else asked.
+    let mut h = Fake::default();
+    h.on("to_regclass", true, "f\n", "");
+    let out = handle("probe", &with(spi::Probe::Read("k-1".into())), &mut h).unwrap();
+    assert_eq!(out, r#"{"found":false}"#);
+    assert!(!h.ran("FROM legion_probe"));
+    let mut h = Fake::default();
+    h.on("to_regclass", true, "t\n", "");
+    h.on("FROM legion_probe WHERE key = 'k-1'", true, "1\n", "");
+    let out = handle("probe", &with(spi::Probe::Read("k-1".into())), &mut h).unwrap();
+    assert_eq!(out, r#"{"found":true}"#);
+
+    // A key that could say more than a key is refused.
+    let e = handle(
+        "probe",
+        &with(spi::Probe::Write("x'); DROP".into())),
+        &mut Fake::default(),
+    )
+    .unwrap_err();
+    assert!(e.message.contains("bad key"), "{}", e.message);
+    assert!(describe().capabilities.probe);
 }
