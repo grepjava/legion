@@ -57,8 +57,17 @@
     | 'yaml' =
     $state('details');
   let fix = $state('');
+  // The tab the address asked for that comes with the object, until it is
+  // read.
+  let later: string | null = $state(null);
   // The tab open, in the address, so a reload or a link keeps it.
   keepInAddress('tab', () => tab, 'details');
+  $effect(() => {
+    if (!later || !object) return;
+    const found = tabs.find((x) => x.id === later);
+    if (found) tab = found.id;
+    later = null;
+  });
 
   $effect(() => {
     object = null;
@@ -72,6 +81,10 @@
     // Not followed: a tab that comes or goes with the object (a Volume's
     // Replica) must not read the page again.
     tab = untrack(() => tabs.find((x) => x.id === wanted)?.id ?? 'details');
+    // A tab that comes with the object (a Service's Replication, a
+    // Volume's Replica) is not there before it is read: opened then, if
+    // the object has it.
+    later = untrack(() => (tabs.some((x) => x.id === wanted) ? null : (wanted ?? null)));
     api
       .get(kind, namespace, name)
       .then((o) => (object = o))
