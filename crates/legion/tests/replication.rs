@@ -644,6 +644,9 @@ spec:
         "(() => { const s = document.querySelector('form.change select');
            s.value = 'switchover'; s.dispatchEvent(new Event('change', { bubbles: true })); })()",
     );
+    // Reviewed first, as every change the console makes.
+    b.click("Review the change");
+    b.shows("What would change", 30);
     b.click("Ask for the switchover");
     lab.waited_pg("the switchover the console asked for", 300, || {
         let r = lab.repl();
