@@ -57,6 +57,29 @@ pub struct Replication {
     /// replication switchover` and `failover`), acted on once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<ChangeRequest>,
+    /// The database's log shipped to a BackupTarget as it is written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<Archive>,
+}
+
+/// Log archiving (`replication.archive`): every member's plugin keeps each
+/// finished piece of the database's log (PostgreSQL's WAL segments) in a
+/// spool it names (`spool` in its `status`), and the leader has the
+/// member's node ship them to the target, under
+/// `<prefix>/<namespace>.<service>/wal/`, dropping those older than
+/// `keep`. With the Volume backups to the same target, it is what a
+/// restore to a point in time replays.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Archive {
+    /// A BackupTarget, `s3` or `directory`.
+    pub target: String,
+    #[serde(default = "default_keep")]
+    pub keep: Duration,
+}
+
+fn default_keep() -> Duration {
+    Duration::from_secs(7 * 86400)
 }
 
 /// An operator's request for a new primary.
@@ -162,6 +185,18 @@ impl Replication {
                 field(path, "failoverAfter"),
                 "at least 5s: a primary is checked every 5s",
             ));
+        }
+        if let Some(a) = &self.archive {
+            let path = field(path, "archive");
+            if a.target.is_empty() {
+                return Err(Invalid::new(field(&path, "target"), "name a BackupTarget"));
+            }
+            if a.keep.millis() < 3_600_000 {
+                return Err(Invalid::new(
+                    field(&path, "keep"),
+                    "at least 1h: a restore replays the log since a backup",
+                ));
+            }
         }
         if self.synchronous > 0 && self.synchronous >= replicas {
             return Err(Invalid::new(
@@ -319,6 +354,31 @@ pub enum ChangeKind {
     Switchover,
 }
 
+/// Where a replicated database's log archiving stands
+/// (`status.archive`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveStatus {
+    pub target: String,
+    /// The newest piece of the log the target holds, by name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last: String,
+    /// When a member's spool was last emptied to the target, Unix ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shipped_ms: Option<i64>,
+    /// When the target was last pruned to `keep`, Unix ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pruned_ms: Option<i64>,
+    /// Pieces waiting in the members' spools after the last runs.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pending: u32,
+    /// Runs failed in a row, and why the last did.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub failures: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+}
+
 /// The last completed change of primary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -372,6 +432,7 @@ impl TaskReplication {
             role: (operation == "prepare").then_some(self.role),
             reclone: false,
             probe: None,
+            archive: self.config.archive.is_some(),
         }
     }
 }
@@ -443,6 +504,10 @@ pub mod spi {
         /// `probe` only (capability `probe`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub probe: Option<Probe>,
+        /// Keep each finished piece of the log in a spool for Legion to
+        /// ship (capability `archive`), and say where in `status`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub archive: bool,
     }
 
     /// What `probe` does, for the conformance check
@@ -618,6 +683,9 @@ pub mod spi {
         /// Answers `probe`, so the conformance check can see data travel.
         #[serde(default)]
         pub probe: bool,
+        /// Keeps its log for Legion to ship, when asked (`archive`).
+        #[serde(default)]
+        pub archive: bool,
     }
 
     impl Describe {
@@ -634,6 +702,9 @@ pub mod spi {
             }
             if r.read && !self.capabilities.readable_replicas {
                 return Some("`read` is set; the plugin's replicas serve no reads".into());
+            }
+            if r.archive.is_some() && !self.capabilities.archive {
+                return Some("`archive` is set; the plugin keeps no log for Legion to ship".into());
             }
             None
         }
@@ -658,6 +729,11 @@ pub mod spi {
         pub lag: Option<Lag>,
         #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
         pub detail: serde_json::Map<String, serde_json::Value>,
+        /// Asked to `archive`: the directory, as the container sees it,
+        /// holding the finished pieces of the log for Legion to ship and
+        /// remove. Files ending `.part` are being written.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub spool: Option<String>,
     }
 
     #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -897,6 +973,7 @@ mod tests {
             role: Some(Role::Replica),
             reclone: false,
             probe: None,
+            archive: false,
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["spiVersion"], "1");

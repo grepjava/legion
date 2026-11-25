@@ -16,6 +16,13 @@ const INCLUDE: &str = "include_if_exists = 'legion-replication.conf'";
 /// The replication password, as libpq's password file, for a replica's
 /// `primary_conninfo`.
 pub const PASSFILE: &str = "legion-replication.pgpass";
+/// The spool, in the data directory, that `archive_command` leaves each
+/// finished WAL file in for Legion to ship (`replication.archive`).
+pub const SPOOL: &str = "legion_wal";
+/// Files the spool holds at most: past them `archive-wal` fails, so
+/// PostgreSQL keeps its WAL (and says why) rather than the spool filling
+/// the Volume while Legion cannot ship.
+pub const SPOOL_MAX: usize = 1024;
 const HBA_BEGIN: &str = "# legion-replication begin";
 const HBA_END: &str = "# legion-replication end";
 
@@ -353,12 +360,23 @@ pub fn parse_status(line: &str, members: &[Member]) -> R<Status> {
         synchronous: false,
         lag,
         detail,
+        spool: None,
     })
 }
 
 /// The settings file for a role: what replication needs, and for a
 /// replica where its primary is.
-pub fn conf(o: &Options, data: &Path, me: &Member, primary: Option<&Member>) -> String {
+/// `archive`: the plugin's own path, which `archive_command` runs as
+/// `<plugin> archive-wal %p %f <spool>`. Every member archives
+/// (`always`): a replica promoted then has what the old primary wrote
+/// before, and the target takes each file once, by name.
+pub fn conf(
+    o: &Options,
+    data: &Path,
+    me: &Member,
+    primary: Option<&Member>,
+    archive: Option<&str>,
+) -> String {
     let mut c = format!(
         "# Written by Legion's replication plugin at each prepare and configure.\n\
          listen_addresses = '*'\n\
@@ -374,6 +392,15 @@ pub fn conf(o: &Options, data: &Path, me: &Member, primary: Option<&Member>) -> 
         keep = o.max_slot_wal_keep_size,
         wal = o.wal_keep_size,
     );
+    match archive {
+        Some(exe) => c.push_str(&format!(
+            "archive_mode = always\n\
+             archive_command = '\"{exe}\" archive-wal \"%p\" \"%f\" \"{spool}\"'\n\
+             archive_timeout = 60\n",
+            spool = spool_of(data),
+        )),
+        None => c.push_str("archive_mode = off\n"),
+    }
     if let Some(p) = primary {
         let host = if p.address.is_empty() {
             &p.dns
@@ -509,6 +536,61 @@ pub fn handle(operation: &str, input: &str, h: &mut impl Host) -> R<String> {
     Ok(v.to_string())
 }
 
+/// The spool of the data directory `data`, as the container sees it.
+fn spool_of(data: &Path) -> String {
+    format!("{}/{SPOOL}", data.display())
+}
+
+/// This plugin's path, as the agent ran it (in the container, where
+/// `archive_command` runs it too).
+fn own_path() -> String {
+    std::env::args().next().unwrap_or_default()
+}
+
+/// `archive_command`: `<plugin> archive-wal <path> <name> <spool>` keeps
+/// the finished WAL file `path` (relative to the data directory, where
+/// PostgreSQL runs it) as `<spool>/<name>`, whole and on disk before it
+/// says so: written aside, synced, renamed, the directory synced. Kept
+/// already (a retry after a crash), it succeeds. A spool of
+/// [`SPOOL_MAX`] files fails it: PostgreSQL keeps the WAL and tries again.
+pub fn archive_wal(path: &Path, name: &str, spool: &Path) -> Result<(), String> {
+    if name.is_empty() || name.contains('/') || name.starts_with('.') {
+        return Err(format!("archive-wal: {name:?} is no WAL file's name"));
+    }
+    let size = std::fs::metadata(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .len();
+    let kept = spool.join(name);
+    if std::fs::metadata(&kept).is_ok_and(|m| m.len() == size) {
+        return Ok(());
+    }
+    let held = std::fs::read_dir(spool)
+        .map_err(|e| format!("{}: {e}", spool.display()))?
+        .count();
+    if held >= SPOOL_MAX {
+        return Err(format!(
+            "{} holds {held} files Legion has not shipped yet: see the Service's status.archive",
+            spool.display()
+        ));
+    }
+    let aside = spool.join(format!("{name}.part"));
+    let copied = (|| {
+        std::fs::copy(path, &aside)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&aside)?
+            .sync_all()?;
+        std::fs::rename(&aside, &kept)?;
+        #[cfg(unix)]
+        std::fs::File::open(spool)?.sync_all()?;
+        Ok::<(), std::io::Error>(())
+    })();
+    copied.map_err(|e| {
+        let _ = std::fs::remove_file(&aside);
+        format!("archive-wal {name}: {e}")
+    })
+}
+
 pub fn describe() -> Describe {
     Describe {
         spi_versions: vec![spi::VERSION.into()],
@@ -519,6 +601,7 @@ pub fn describe() -> Describe {
             rewind: true,
             seed_from_snapshot: false,
             probe: true,
+            archive: true,
         },
     }
 }
@@ -588,7 +671,13 @@ impl<H: Host> Pg<'_, H> {
     /// The configuration for this member's role: the settings file, the
     /// include, the access lines and, for a replica, its password file.
     fn configure_files(&mut self, primary: Option<&Member>) -> R<()> {
-        let text = conf(&self.o, &self.data, &self.req.me, primary);
+        let exe = self.req.archive.then(own_path);
+        if exe.is_some() {
+            let spool = self.data.join(SPOOL);
+            std::fs::create_dir_all(&spool)
+                .map_err(|e| Fail::new(format!("{}: {e}", spool.display())))?;
+        }
+        let text = conf(&self.o, &self.data, &self.req.me, primary, exe.as_deref());
         self.write(CONF, &text, false)?;
         let main = self.data.join("postgresql.conf");
         let current = std::fs::read_to_string(&main).unwrap_or_default();
@@ -910,7 +999,11 @@ impl<H: Host> Pg<'_, H> {
 
     fn status(&mut self) -> R<Status> {
         let line = self.psql(STATUS_SQL)?;
-        parse_status(&line, &self.req.topology.members)
+        let mut s = parse_status(&line, &self.req.topology.members)?;
+        if self.req.archive {
+            s.spool = Some(spool_of(&self.data));
+        }
+        Ok(s)
     }
 
     fn promote(&mut self) -> R<Value> {

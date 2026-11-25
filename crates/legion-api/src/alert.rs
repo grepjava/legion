@@ -68,6 +68,7 @@ pub enum AlertKind {
     DatabaseDegraded,
     DatabaseSplit,
     DatabaseStalled,
+    ArchiveLate,
 }
 
 impl AlertKind {
@@ -92,6 +93,7 @@ impl AlertKind {
             AlertKind::DatabaseDegraded => "database-degraded",
             AlertKind::DatabaseSplit => "database-split",
             AlertKind::DatabaseStalled => "database-stalled",
+            AlertKind::ArchiveLate => "archive-late",
         }
     }
 }
@@ -186,7 +188,15 @@ pub struct DatabaseInput<'a> {
     pub message: &'a str,
     /// How long a change of primary has been under way, if one is.
     pub change_for: Option<Duration>,
+    /// With `replication.archive`: its runs failed in a row, and why the
+    /// last did.
+    pub archive_failures: u32,
+    pub archive_message: &'a str,
 }
+
+/// Archive runs failing in a row past this raise `archive-late`: a run is
+/// tried every 15 s, then after a backoff.
+pub const ARCHIVE_FAILURES: u32 = 3;
 
 /// A change of primary under way longer than this raises
 /// `database-stalled`: one that goes well takes seconds to a minute.
@@ -526,6 +536,16 @@ pub fn alerts(i: &Inputs) -> Vec<Alert> {
             )),
             _ => {}
         }
+        if d.archive_failures >= ARCHIVE_FAILURES {
+            out.push(alert(
+                AlertKind::ArchiveLate,
+                Severity::Warning,
+                format!(
+                    "Service {}'s log has not been archived for the last {} runs: {}",
+                    d.name, d.archive_failures, d.archive_message
+                ),
+            ));
+        }
     }
     // Builds told apart by their version: those of the nodes up, unless
     // one says none (an agent from before it did).
@@ -716,7 +736,7 @@ impl ReceiverSpec {
 }
 
 /// The kinds of alert there are, as receivers name them.
-pub const KINDS: [AlertKind; 19] = [
+pub const KINDS: [AlertKind; 20] = [
     AlertKind::NoLeader,
     AlertKind::NoQuorum,
     AlertKind::NodeDown,
@@ -736,6 +756,7 @@ pub const KINDS: [AlertKind; 19] = [
     AlertKind::DatabaseDegraded,
     AlertKind::DatabaseSplit,
     AlertKind::DatabaseStalled,
+    AlertKind::ArchiveLate,
 ];
 
 fn http_url(url: &str) -> bool {
@@ -1164,7 +1185,7 @@ namespaces: ['']",
         // A kind added to AlertKind but not to KINDS couldn't be chosen.
         let named: std::collections::BTreeSet<_> = KINDS.iter().map(|k| k.as_str()).collect();
         assert_eq!(named.len(), KINDS.len());
-        let last = AlertKind::DatabaseStalled;
+        let last = AlertKind::ArchiveLate;
         assert!(KINDS.contains(&last));
     }
 
@@ -1252,6 +1273,8 @@ namespaces: ['']",
             phase,
             message: "why",
             change_for,
+            archive_failures: 0,
+            archive_message: "",
         };
         let i = Inputs {
             leader: true,
@@ -1282,6 +1305,34 @@ namespaces: ['']",
             got[1].message,
             "Service e's change of primary has been under way for 5m, with no primary taking \
              writes meanwhile: why"
+        );
+    }
+
+    #[test]
+    fn a_log_not_archived_for_three_runs_raises_archive_late() {
+        let db = |failures| Inputs {
+            leader: true,
+            databases: vec![DatabaseInput {
+                namespace: "data",
+                name: "pg",
+                phase: crate::replication::Phase::Healthy,
+                message: "",
+                change_for: None,
+                archive_failures: failures,
+                archive_message: "pg-0: 403 Forbidden",
+            }],
+            ..Default::default()
+        };
+        assert!(alerts(&db(2)).is_empty());
+        let got = alerts(&db(3));
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            (got[0].kind, got[0].severity),
+            (AlertKind::ArchiveLate, Severity::Warning)
+        );
+        assert_eq!(
+            got[0].message,
+            "Service pg's log has not been archived for the last 3 runs: pg-0: 403 Forbidden"
         );
     }
 

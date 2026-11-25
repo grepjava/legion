@@ -244,14 +244,22 @@ pub(crate) fn current(api: &ApiService) -> Vec<(Alert, i64)> {
         });
     }
     // Replicated databases, as the leader last recorded them.
-    let databases: Vec<(&Object, legion_api::replication::ReplicationStatus)> = services
+    let databases: Vec<(
+        &Object,
+        legion_api::replication::ReplicationStatus,
+        Option<legion_api::replication::ArchiveStatus>,
+    )> = services
         .iter()
         .filter_map(|o| {
             let st = serde_json::from_value(o.status.get("replication")?.clone()).ok()?;
-            Some((o, st))
+            let archive = o
+                .status
+                .get("archive")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+            Some((o, st, archive))
         })
         .collect();
-    for (o, st) in &databases {
+    for (o, st, archive) in &databases {
         inputs.databases.push(alert::DatabaseInput {
             namespace: &o.metadata.namespace,
             name: &o.metadata.name,
@@ -261,6 +269,8 @@ pub(crate) fn current(api: &ApiService) -> Vec<(Alert, i64)> {
                 .change
                 .as_ref()
                 .map(|c| Duration::from_millis(now_ms.saturating_sub(c.started).max(0) as u64)),
+            archive_failures: archive.as_ref().map_or(0, |a| a.failures),
+            archive_message: archive.as_ref().map_or("", |a| a.message.as_str()),
         });
     }
     if let Some(c) = &api.peer_tls

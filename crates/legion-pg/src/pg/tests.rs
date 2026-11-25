@@ -125,6 +125,7 @@ fn request(s: &Setup, me: u32, primary: Option<u32>, role: Option<Role>) -> Stri
         role,
         reclone: false,
         probe: None,
+        archive: false,
     };
     serde_json::to_string(&r).unwrap()
 }
@@ -539,4 +540,51 @@ fn probe_writes_a_marker_and_reads_it_back() {
     .unwrap_err();
     assert!(e.message.contains("bad key"), "{}", e.message);
     assert!(describe().capabilities.probe);
+}
+
+#[test]
+fn asked_to_archive_every_member_spools_its_wal_through_the_plugin() {
+    let o: Options = serde_json::from_value(json!({})).unwrap();
+    let c = conf(
+        &o,
+        Path::new("/var/db/pg/data"),
+        &member(1),
+        None,
+        Some("/.legion/replication/postgres"),
+    );
+    assert!(c.contains("archive_mode = always\n"), "{c}");
+    assert!(
+        c.contains(
+            "archive_command = '\"/.legion/replication/postgres\" archive-wal \"%p\" \"%f\" \"/var/db/pg/data/legion_wal\"'\n"
+        ),
+        "{c}"
+    );
+    assert!(c.contains("archive_timeout = 60\n"), "{c}");
+    let c = conf(&o, Path::new("/var/db/pg/data"), &member(1), None, None);
+    assert!(c.contains("archive_mode = off\n"), "{c}");
+}
+
+#[test]
+fn archive_wal_keeps_each_file_whole_once_and_refuses_past_a_full_spool() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = dir.path().join("spool");
+    std::fs::create_dir(&spool).unwrap();
+    let name = "000000010000000000000003";
+    let wal = dir.path().join(name);
+    std::fs::write(&wal, b"sixteen bytes!!!").unwrap();
+    archive_wal(&wal, name, &spool).unwrap();
+    assert_eq!(
+        std::fs::read(spool.join(name)).unwrap(),
+        b"sixteen bytes!!!"
+    );
+    assert!(!spool.join(format!("{name}.part")).exists());
+    // Again, after a crash before PostgreSQL heard: kept already.
+    archive_wal(&wal, name, &spool).unwrap();
+    assert!(archive_wal(&wal, "../escape", &spool).is_err());
+    // Full: PostgreSQL keeps its WAL and tries again.
+    for i in 0..SPOOL_MAX {
+        std::fs::write(spool.join(format!("f{i}")), b"").unwrap();
+    }
+    let e = archive_wal(&wal, "000000010000000000000004", &spool).unwrap_err();
+    assert!(e.contains("Legion has not shipped"), "{e}");
 }

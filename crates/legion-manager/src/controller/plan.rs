@@ -1220,6 +1220,15 @@ fn service(
             .collect(),
         replication,
         read_virtual_ip: addrs.read_vip.map(|ip| ip.to_string()),
+        // Written by the archiver, not by this pass; gone with the
+        // archiving.
+        archive: s
+            .spec
+            .replication
+            .as_ref()
+            .and_then(|r| r.archive.as_ref())
+            .and_then(|_| s.object.status.get("archive"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
     };
     let status = serde_json::to_value(&status).expect("status serialises");
     if s.object.status != status {
