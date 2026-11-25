@@ -144,7 +144,8 @@ impl Lab {
         lab.pull();
         ok(&format!("zfs set jailed=on {}", lab.zfs_root));
         ok(&format!(
-            "jail -c name={JAIL} path=/ vnet persist children.max=64 enforce_statfs=1              devfs_ruleset=4 \
+            "jail -c name={JAIL} path=/ vnet persist children.max=64 enforce_statfs=1 \
+             devfs_ruleset=4 \
              allow.raw_sockets allow.chflags allow.mount allow.mount.devfs \
              allow.mount.nullfs allow.mount.tmpfs allow.mount.zfs"
         ));

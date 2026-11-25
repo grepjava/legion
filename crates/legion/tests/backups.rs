@@ -281,7 +281,8 @@ spec:
             "set -e
             command -v minio >/dev/null || ASSUME_ALWAYS_YES=yes pkg install -q minio minio-client >/dev/null
             mkdir -p {S3_DIR}
-            MINIO_ROOT_USER={S3_USER} MINIO_ROOT_PASSWORD={S3_PASSWORD}                 daemon -f minio server {S3_DIR} --address :9000 --quiet
+            MINIO_ROOT_USER={S3_USER} MINIO_ROOT_PASSWORD={S3_PASSWORD} \
+                daemon -f minio server {S3_DIR} --address :9000 --quiet
             i=0
             until {mc} alias set lab http://127.0.0.1:9000 {S3_USER} {S3_PASSWORD} >/dev/null 2>&1; do
                 i=$((i + 1)); [ $i -lt 60 ] || {{ echo 'MinIO did not start' >&2; exit 3; }}

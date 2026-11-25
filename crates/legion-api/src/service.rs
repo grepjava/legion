@@ -1508,7 +1508,8 @@ impl FromStr for Constraint {
                 _ => {
                     return Err(format!(
                         "{lhs:?}: expected node.name, node.hostname, node.role, \
-                         node.platform.os, node.platform.arch, node.platform.linux                          or node.labels.<key>"
+                         node.platform.os, node.platform.arch, node.platform.linux \
+                         or node.labels.<key>"
                     ));
                 }
             },
@@ -1822,6 +1823,10 @@ pub struct ServiceStatus {
     /// The `<service>-read` address, with `replication.read`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_virtual_ip: Option<String>,
+    /// Where `replication.archive` stands, as the leader's archiver
+    /// writes it; carried over by the controller's pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<crate::replication::ArchiveStatus>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
