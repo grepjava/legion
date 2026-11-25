@@ -275,6 +275,9 @@ pub struct ReplicaStatus {
 /// it to the manager: the next starts again.
 pub const NOT_RESUMABLE: &str = "the copy cut short cannot be resumed";
 
+/// The snapshot of a move's full copy, on both nodes.
+pub const MOVE_FULL: &str = "legion-move-1";
+
 /// A replica's copy cut short, to go on with.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

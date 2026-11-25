@@ -87,6 +87,12 @@ message SessionOpen {
     // replayed. An agent from before it ends the session with an error:
     // the session has no action.
     ArchiveFetch archive_fetch = 26;
+    // Managers only: the GUID of a snapshot of the Volume here, on
+    // `stdout` (nothing if it is not here), then `exit_code` 0; a copy
+    // that went in before the manager leading it could write so down is
+    // found by it. An agent from before it ends the session with an
+    // error: the session has no action.
+    SnapshotGuid snapshot_guid = 27;
   }
 }
 
@@ -122,6 +128,13 @@ message ReplicaSend {
 
 message ResumeToken {
   string volume = 1;
+}
+
+// `snapshot` is a replica's or a move's (`legion-replica-N`,
+// `legion-move-1`): no other is asked of.
+message SnapshotGuid {
+  string volume = 1;
+  string snapshot = 2;
 }
 
 // Receives what `ReplicaSend` sends: a full copy replaces what is here; an

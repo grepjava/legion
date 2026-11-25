@@ -1798,6 +1798,22 @@ impl Sys for FakeSys {
         self.received(dataset, &got.name, &got.since, got.data)
     }
 
+    /// Of the snapshot's name and what it holds: as with ZFS, the same on
+    /// both ends of a send, and another for one taken again under the same
+    /// name once the data changed (taken again over the same data, it
+    /// stays the same, which no test tells apart).
+    fn zfs_guid(&self, snapshot: &str) -> Result<Option<String>> {
+        use std::hash::{Hash, Hasher};
+        let s = self.state();
+        if !s.snapshots.contains_key(snapshot) {
+            return Ok(None);
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        snapshot.split_once('@').map(|(_, n)| n).hash(&mut h);
+        s.contents.get(snapshot).hash(&mut h);
+        Ok(Some(h.finish().to_string()))
+    }
+
     fn zfs_resume_token(&self, dataset: &str) -> Result<Option<String>> {
         let s = self.state();
         if !s.datasets.contains_key(dataset) {

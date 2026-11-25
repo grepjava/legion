@@ -398,11 +398,7 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::ac
                     f.0 += 1;
                     f.1 = Instant::now();
                     tracing::warn!(volume = %key, to = %taken.node, attempt = f.0, "copying the replica: {e}");
-                    let why = format!(
-                        "{e} (attempt {}; the next in {}s)",
-                        f.0,
-                        backoff(f.0).as_secs()
-                    );
+                    let why = crate::migrate::failed_note(&e, f.0, crate::console::now_ms());
                     let full_needed = e.contains(FULL_NEEDED);
                     // Cut short: the replica's node kept what it took (an
                     // agent from before it did not; the next attempt
@@ -630,6 +626,17 @@ async fn copy(
         },
         false => String::new(),
     };
+    // Nothing kept to go on with: the copy may have gone in whole before
+    // the leader that sent it could say so.
+    if resume
+        && token.is_empty()
+        && crate::migrate::copied_already(hub, &key.namespace, &key.name, snapshot, from, to).await
+    {
+        return Outcome {
+            sent: 0,
+            result: Ok(0),
+        };
+    }
     let result = send(hub, key, from, to, base, snapshot, token, counted).await;
     Outcome {
         sent: counted.load(std::sync::atomic::Ordering::Relaxed),

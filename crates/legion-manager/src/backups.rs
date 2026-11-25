@@ -24,7 +24,7 @@ use legion_store::Store;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 
-use crate::migrate::{backoff, update};
+use crate::migrate::{backoff, failed_note, update};
 use crate::session::{Attachment, Hub};
 
 /// How often the Volumes are looked at.
@@ -166,11 +166,8 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::ac
                     }
                     Err(e) => {
                         st.failures += 1;
-                        st.message = format!(
-                            "{e} (attempt {}; the next in {}s)",
-                            st.failures,
-                            backoff(st.failures).as_secs()
-                        );
+                        // The backoff counts from the attempt's start.
+                        st.message = failed_note(e, st.failures, at_ms);
                         st.record(BackupRun {
                             at_ms,
                             took_ms,

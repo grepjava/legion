@@ -124,6 +124,9 @@ async fn run<R: Runtime>(
         Some(Action::ResumeToken(opts)) => {
             transfer::resume_token(&volumes, &open.namespace, opts, &tx).await
         }
+        Some(Action::SnapshotGuid(opts)) => {
+            transfer::snapshot_guid(&volumes, &open.namespace, opts, &tx).await
+        }
         Some(Action::VolumeDrop(volume)) => {
             transfer::drop_copy(&volumes, &open.namespace, &volume, &tx).await
         }

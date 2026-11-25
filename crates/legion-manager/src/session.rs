@@ -211,6 +211,7 @@ impl Pods for PodsService {
                 | Action::ReplicaSend(_)
                 | Action::ReplicaReceive(_)
                 | Action::ResumeToken(_)
+                | Action::SnapshotGuid(_)
                 | Action::ExportSync(_),
             ) => {
                 return Err(Status::invalid_argument(

@@ -1206,7 +1206,8 @@ namespaces: ['']",
                 late_snapshots: vec![LateSnapshots {
                     age: Duration::from_secs(3 * 3600),
                     every: Duration::from_secs(3600),
-                    why: "node n2: out of space (attempt 4; the next in 80s)".into(),
+                    why: "node n2: out of space (attempt 4; the next after 2026-11-25T12:05:54Z)"
+                        .into(),
                 }],
                 ..Default::default()
             }],
@@ -1217,7 +1218,7 @@ namespaces: ['']",
         assert_eq!(got[0].kind.as_str(), "snapshot-late");
         assert_eq!(
             got[0].message,
-            "Volume pg-db-0's last scheduled snapshot was taken 3h ago, meant to be every 1h: node n2: out of space (attempt 4; the next in 80s)"
+            "Volume pg-db-0's last scheduled snapshot was taken 3h ago, meant to be every 1h: node n2: out of space (attempt 4; the next after 2026-11-25T12:05:54Z)"
         );
     }
 
@@ -1244,7 +1245,7 @@ namespaces: ['']",
                         target: "offsite".into(),
                         age: None,
                         every: Duration::from_secs(3600),
-                        why: "offsite: Permission denied (attempt 1; the next in 5s)".into(),
+                        why: "offsite: Permission denied (attempt 1; the next after 2026-11-25T12:05:54Z)".into(),
                     }),
                     ..Default::default()
                 },
@@ -1260,7 +1261,7 @@ namespaces: ['']",
         );
         assert_eq!(
             got[1].message,
-            "Volume logs has not been backed up to offsite yet, meant to be every 1h: offsite: Permission denied (attempt 1; the next in 5s)"
+            "Volume logs has not been backed up to offsite yet, meant to be every 1h: offsite: Permission denied (attempt 1; the next after 2026-11-25T12:05:54Z)"
         );
     }
 
@@ -1347,7 +1348,7 @@ namespaces: ['']",
                     node: "n2".into(),
                     age: Duration::from_secs(16 * 60),
                     every: Duration::from_secs(300),
-                    why: "node n2: refused (attempt 3; the next in 40s)".into(),
+                    why: "node n2: refused (attempt 3; the next after 2026-11-25T12:05:54Z)".into(),
                 }),
                 ..Default::default()
             }],
@@ -1361,7 +1362,7 @@ namespaces: ['']",
         assert_eq!(
             got[0].message,
             "Volume pg-db-0's replica on n2 was last copied 16m ago, meant to be every 5m: \
-             node n2: refused (attempt 3; the next in 40s)"
+             node n2: refused (attempt 3; the next after 2026-11-25T12:05:54Z)"
         );
     }
 }

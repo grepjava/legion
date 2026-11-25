@@ -14,15 +14,15 @@ use futures::StreamExt;
 use legion_api::volume::NOT_RESUMABLE;
 use legion_proto::v1::session_frame::Frame;
 use legion_proto::v1::{
-    ReplicaReceive, ReplicaSend, ResumeToken, SessionFrame, VolumeExport, VolumeImport,
-    VolumeReceive, VolumeSend, VolumeSnapshotAction, VolumeSnapshotResult,
+    ReplicaReceive, ReplicaSend, ResumeToken, SessionFrame, SnapshotGuid, VolumeExport,
+    VolumeImport, VolumeReceive, VolumeSend, VolumeSnapshotAction, VolumeSnapshotResult,
 };
 use legion_sys::Sys;
 use tokio::sync::{Mutex, mpsc};
 use tonic::{Status, Streaming};
 
 /// The snapshot of the full copy, and of the last part.
-pub const FULL: &str = "legion-move-1";
+pub const FULL: &str = legion_api::volume::MOVE_FULL;
 pub const LAST: &str = "legion-move-2";
 /// The start of a backup's snapshot's name; each has its own, so two
 /// backups at once leave each other's alone.
@@ -388,6 +388,32 @@ pub(crate) async fn resume_token(
     .map_err(Status::internal)?;
     if let Some(token) = token {
         let _ = tx.send(frame(Frame::Stdout(token.into_bytes()))).await;
+    }
+    let _ = tx.send(frame(Frame::ExitCode(0))).await;
+    Ok(())
+}
+
+/// The GUID of a replica's or a move's snapshot of the Volume here, on
+/// `stdout`, or nothing if it is not here.
+pub(crate) async fn snapshot_guid(
+    v: &Volumes,
+    namespace: &str,
+    opts: SnapshotGuid,
+    tx: &mpsc::Sender<SessionFrame>,
+) -> Result<(), Status> {
+    if !(replica_snapshot(&opts.snapshot) || opts.snapshot == FULL) {
+        return Err(Status::invalid_argument(
+            "not a replica's or a move's snapshot",
+        ));
+    }
+    let snapshot = format!("{}@{}", v.dataset(namespace, &opts.volume)?, opts.snapshot);
+    let guid = crate::task::blocking(&v.sys, move |sys| {
+        sys.zfs_guid(&snapshot).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(Status::internal)?;
+    if let Some(guid) = guid {
+        let _ = tx.send(frame(Frame::Stdout(guid.into_bytes()))).await;
     }
     let _ = tx.send(frame(Frame::ExitCode(0))).await;
     Ok(())
@@ -1050,6 +1076,50 @@ mod tests {
         assert!(e.contains("a full copy is needed"), "{e}");
         assert!(replica_snapshot("legion-replica-12") && !replica_snapshot("legion-replica-x"));
         assert!(!replica_snapshot("mine"));
+    }
+
+    /// A copy that went in just before the leader sending it stopped:
+    /// sending it again from the base it was sent from finds that base
+    /// gone here (only the newest is kept), but the snapshot is here, the
+    /// same as the holder's, which is what the next leader asks first.
+    /// One taken again under the same name over changed data is another.
+    /// Seen 2026-11-25: a 36 GB replica dropped and copied whole.
+    #[test]
+    fn a_copy_that_went_in_is_known_by_its_snapshots_guid() {
+        let lock = Mutex::new(());
+        let (from, to) = (FakeSys::new(), FakeSys::new());
+        from.zfs_create(DS, &[]).unwrap();
+        from.write_dataset(DS, b"one");
+        let copy = |base: &str, snap: &str| -> Result<(), String> {
+            let mut out = Vec::new();
+            replica_give(&from, &lock, DS, base, snap, &mut out)?;
+            replica_take(&to, &lock, DS, base, snap, &mut out.as_slice())
+        };
+        let guid = |sys: &FakeSys, snap: &str| sys.zfs_guid(&format!("{DS}@{snap}")).unwrap();
+        copy("", "legion-replica-1").unwrap();
+        from.write_dataset(DS, b"two");
+        copy("legion-replica-1", "legion-replica-2").unwrap();
+        // The leader stopped before it wrote down replica-2 went in.
+        assert_eq!(to.zfs_snapshots(DS).unwrap(), ["legion-replica-2"]);
+        assert!(guid(&to, "legion-replica-2").is_some());
+        assert_eq!(
+            guid(&to, "legion-replica-2"),
+            guid(&from, "legion-replica-2")
+        );
+        assert_eq!(guid(&to, "legion-replica-1"), None);
+        // Sending it again, as before, needs the whole copy.
+        let e = copy("legion-replica-1", "legion-replica-2").unwrap_err();
+        assert!(e.contains("a full copy is needed"), "{e}");
+        // Taken again over other data, under the same name: not the same.
+        from.write_dataset(DS, b"three");
+        from.zfs_destroy(&format!("{DS}@legion-replica-2"), false)
+            .unwrap();
+        from.zfs_snapshot(&format!("{DS}@legion-replica-2"))
+            .unwrap();
+        assert_ne!(
+            guid(&to, "legion-replica-2"),
+            guid(&from, "legion-replica-2")
+        );
     }
 
     /// A replica's copy cut short (the link dropped, a daemon restarted):

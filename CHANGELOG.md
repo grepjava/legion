@@ -295,6 +295,17 @@ members are told their role only on nodes that read it.
 - A note's text was read from a Config's text, which only a Config not yet
   admitted has; it is read from its data.
 - An app's default given as an `.env` value kept its quotes.
+- A leader that stopped just after a replica's copy went in, before it
+  wrote that down, made the next leader drop the replica and copy the
+  Volume whole (seen on a 36 GB Volume, hours over Wi-Fi, with no usable
+  replica meanwhile): the next leader now asks both nodes for the
+  snapshot's GUID first and, the same, takes the copy as done. A move's
+  full copy is checked the same way. Agents from before answer nothing,
+  and the copy goes on as before.
+- A failed copy, move, scheduled snapshot or backup said when the next
+  attempt starts as "the next in 5s", wrong as soon as it was read later
+  and all through a long attempt after it; it gives the time instead
+  ("the next after 2026-11-25T12:05:54Z").
 
 ## 0.2.0 (2026-11-18)
 

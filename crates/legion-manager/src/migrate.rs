@@ -18,8 +18,8 @@ use legion_api::{Kind, Object, ObjectKey};
 use legion_proto::v1::session_frame::Frame;
 use legion_proto::v1::session_open::Action;
 use legion_proto::v1::{
-    InputClosed, ResumeToken, SessionError, SessionFrame, SessionOffer, SessionOpen, VolumeReceive,
-    VolumeSend,
+    InputClosed, ResumeToken, SessionError, SessionFrame, SessionOffer, SessionOpen, SnapshotGuid,
+    VolumeReceive, VolumeSend,
 };
 use legion_store::{Command, NodeId, Outcome, Precondition, Store};
 use tokio::sync::watch;
@@ -41,6 +41,18 @@ pub(crate) fn backoff(count: u32) -> Duration {
     RETRY
         .saturating_mul(2u32.saturating_pow(count.saturating_sub(1)))
         .min(RETRY_MAX)
+}
+
+/// `error` as a status keeps it after the `count`th failure in a row,
+/// the backoff counted from `from_ms`: with the time the next attempt may
+/// start, not "in 5s", which a status read later (or kept through a long
+/// attempt after it) gets wrong.
+pub(crate) fn failed_note(error: &str, count: u32, from_ms: i64) -> String {
+    let next = from_ms.div_euclid(1000) + backoff(count).as_secs() as i64;
+    format!(
+        "{error} (attempt {count}; the next after {})",
+        legion_api::clock::format(next)
+    )
 }
 
 /// A migration's failures in a row, of one phase to one node.
@@ -171,9 +183,8 @@ async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::activity::Sta
                         .into_iter()
                         .filter(|n| !ready.contains(n))
                         .collect();
-                    let next = backoff(f.count);
                     tracing::warn!(volume = %key, to = %m.to, attempt = f.count, "moving the volume: {e}");
-                    let why = format!("{e} (attempt {}; the next in {}s)", f.count, next.as_secs());
+                    let why = failed_note(&e, f.count, crate::console::now_ms());
                     note(store, &key, &m, &why).await;
                 }
                 Ok(()) => {
@@ -432,13 +443,72 @@ pub(crate) async fn resume_token(
     volume: &str,
     node: &str,
 ) -> Result<String, String> {
+    let action = Action::ResumeToken(ResumeToken {
+        volume: volume.to_owned(),
+    });
+    ask(hub, namespace, node, action, "a resume token").await
+}
+
+/// The GUID of the Volume's `snapshot` on `node` (a replica's or a move's):
+/// empty if it is not there, or if its agent is from before it was asked.
+async fn snapshot_guid(
+    hub: &Arc<Hub>,
+    namespace: &str,
+    volume: &str,
+    snapshot: &str,
+    node: &str,
+) -> Result<String, String> {
+    let action = Action::SnapshotGuid(SnapshotGuid {
+        volume: volume.to_owned(),
+        snapshot: snapshot.to_owned(),
+    });
+    ask(hub, namespace, node, action, "a snapshot's GUID").await
+}
+
+/// Whether a copy of the Volume's `snapshot` from `from` is in on `to`
+/// already: both hold it, the same one. A copy that went in just before
+/// the manager leading it stopped, which the next leader goes on with: it
+/// is done, where sending it again would find the base it was sent from
+/// gone on `to` (only the newest is kept) and start the whole copy again
+/// (seen 2026-11-25: a 36 GB replica dropped and copied whole for hours
+/// after a leader restart a second after a copy went in). Anything not
+/// known says no, as before.
+pub(crate) async fn copied_already(
+    hub: &Arc<Hub>,
+    namespace: &str,
+    volume: &str,
+    snapshot: &str,
+    from: &str,
+    to: &str,
+) -> bool {
+    let there = snapshot_guid(hub, namespace, volume, snapshot, to).await;
+    let here = snapshot_guid(hub, namespace, volume, snapshot, from).await;
+    let same = same_snapshot(there.as_deref(), here.as_deref());
+    if same {
+        tracing::info!(volume, snapshot, from, to, "the copy went in already");
+    }
+    same
+}
+
+/// See [`copied_already`]: both known, and the same.
+fn same_snapshot(there: Result<&str, &String>, here: Result<&str, &String>) -> bool {
+    matches!((there, here), (Ok(a), Ok(b)) if !a.is_empty() && a == b)
+}
+
+/// What an agent says on `stdout` to a question of a manager's, as text:
+/// empty if its agent is from before it was asked.
+async fn ask(
+    hub: &Arc<Hub>,
+    namespace: &str,
+    node: &str,
+    action: Action,
+    what: &str,
+) -> Result<String, String> {
     let offer = SessionOffer {
         id: legion_pki::random_secret(),
         open: Some(SessionOpen {
             namespace: namespace.to_owned(),
-            action: Some(Action::ResumeToken(ResumeToken {
-                volume: volume.to_owned(),
-            })),
+            action: Some(action),
             ..Default::default()
         }),
         ..Default::default()
@@ -468,11 +538,16 @@ pub(crate) async fn resume_token(
                 None => return Err(format!("node {node}: its session ended early")),
             }
         }
-        String::from_utf8(out).map_err(|_| format!("node {node}: a resume token that is not text"))
+        String::from_utf8(out).map_err(|_| format!("node {node}: {what} that is not text"))
     };
     tokio::time::timeout(TOKEN_WAIT, asking)
         .await
-        .map_err(|_| format!("node {node}: no resume token in {}s", TOKEN_WAIT.as_secs()))?
+        .map_err(|_| {
+            format!(
+                "node {node}: no answer for {what} in {}s",
+                TOKEN_WAIT.as_secs()
+            )
+        })?
 }
 
 /// How long a node has to say what it kept of a copy cut short.
@@ -498,6 +573,19 @@ async fn full_copy(
             .map_err(|e| Copied::failed(e, false, sent))?,
         false => String::new(),
     };
+    if token.is_empty()
+        && copied_already(
+            hub,
+            namespace,
+            volume,
+            legion_api::volume::MOVE_FULL,
+            from,
+            to,
+        )
+        .await
+    {
+        return Ok(());
+    }
     if !token.is_empty() {
         tracing::info!(volume, from, to, "going on with the full copy cut short");
         match transfer(hub, namespace, volume, from, to, false, &token, sent).await {
@@ -822,6 +910,33 @@ mod tests {
         let waits: Vec<u64> = (1..=8).map(|n| backoff(n).as_secs()).collect();
         assert_eq!(waits, [5, 10, 20, 40, 80, 160, 300, 300]);
         assert_eq!(backoff(u32::MAX), RETRY_MAX);
+    }
+
+    /// A copy is in already only if both nodes hold the same snapshot;
+    /// anything unknown (an agent from before, a node not answering, the
+    /// snapshot not there) says no, and the copy goes on as before.
+    #[test]
+    fn a_copy_is_in_already_only_if_both_hold_the_same_snapshot() {
+        let e = "node n2: refused".to_owned();
+        assert!(same_snapshot(Ok("123"), Ok("123")));
+        assert!(!same_snapshot(Ok("123"), Ok("456")), "taken again");
+        assert!(
+            !same_snapshot(Ok(""), Ok("123")),
+            "not on the replica's node"
+        );
+        assert!(!same_snapshot(Ok(""), Ok("")), "agents from before");
+        assert!(!same_snapshot(Err(&e), Ok("123")));
+        assert!(!same_snapshot(Ok("123"), Err(&e)));
+    }
+
+    #[test]
+    fn a_failure_says_when_the_next_attempt_may_start_as_a_time() {
+        // 2026-11-25T12:05:34.481Z, a third failure: 20 s on.
+        let at = 1_795_608_334_481;
+        assert_eq!(
+            failed_note("node weft went away", 3, at),
+            "node weft went away (attempt 3; the next after 2026-11-25T12:05:54Z)"
+        );
     }
 
     #[test]

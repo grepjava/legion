@@ -18,8 +18,8 @@ use std::str::FromStr;
 pub mod check;
 mod fake;
 pub mod live;
-pub mod pffix;
 mod memory;
+pub mod pffix;
 mod shell;
 
 pub use fake::{FakeSys, FakeWireGuard};
@@ -288,6 +288,13 @@ pub trait Sys: Send + Sync {
     /// The resume token of a stream `dataset` took part of, if it did.
     fn zfs_resume_token(&self, dataset: &str) -> Result<Option<String>> {
         let _ = dataset;
+        Ok(None)
+    }
+    /// The GUID of `snapshot` (`<dataset>@<name>`), if it is there: the
+    /// same on a node that received it as on the one that sent it, and
+    /// another for a snapshot taken again under the same name.
+    fn zfs_guid(&self, snapshot: &str) -> Result<Option<String>> {
+        let _ = snapshot;
         Ok(None)
     }
     /// Gives up what `dataset` took of a stream cut short (`zfs receive

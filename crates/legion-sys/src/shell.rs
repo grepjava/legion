@@ -1209,6 +1209,19 @@ impl<R: Runner> Sys for Shell<R> {
         Ok((!token.is_empty() && token != "-").then(|| token.to_owned()))
     }
 
+    fn zfs_guid(&self, snapshot: &str) -> Result<Option<String>> {
+        let a = args(["get", "-H", "-o", "value", "guid", snapshot]);
+        let out = self.output("zfs", &a, None)?;
+        if !out.success {
+            if out.stderr.contains("does not exist") {
+                return Ok(None);
+            }
+            return Err(failed("zfs", &a, &out));
+        }
+        let guid = out.stdout.trim();
+        Ok((!guid.is_empty() && guid != "-").then(|| guid.to_owned()))
+    }
+
     fn zfs_receive_abort(&self, dataset: &str) -> Result<()> {
         self.run("zfs", &args(["receive", "-A", dataset])).map(drop)
     }
