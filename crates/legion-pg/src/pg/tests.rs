@@ -171,6 +171,7 @@ fn a_new_primary_is_made_configured_and_given_its_replication_role() {
     );
     let conf = std::fs::read_to_string(data.join(CONF)).unwrap();
     assert!(conf.contains("wal_level = replica"));
+    assert!(conf.contains("wal_keep_size = '512MB'"), "{conf}");
     assert!(!conf.contains("primary_conninfo"));
     let main = std::fs::read_to_string(data.join("postgresql.conf")).unwrap();
     assert_eq!(main.matches(INCLUDE).count(), 1);
@@ -486,7 +487,12 @@ fn a_replica_allowed_to_reclone_discards_its_data_and_copies_the_primary() {
         serde_json::from_str(&request(&s, 1, Some(0), Some(Role::Replica))).unwrap();
     req.reclone = true;
     let mut h = Fake::default();
-    h.on("IDENTIFY_SYSTEM", true, "7300000000000000001|2|0/5000000|\n", "");
+    h.on(
+        "IDENTIFY_SYSTEM",
+        true,
+        "7300000000000000001|2|0/5000000|\n",
+        "",
+    );
     let out = handle("prepare", &serde_json::to_string(&req).unwrap(), &mut h).unwrap();
     assert!(out.contains("cloned"), "{out}");
     assert!(!s.data.join("base").exists(), "the old data went");

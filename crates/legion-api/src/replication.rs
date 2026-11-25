@@ -839,7 +839,7 @@ mod tests {
             member: "pg-1".into(),
             ordinal: 1,
             address: "10.200.1.17".into(),
-            dns: "pg-1.pg.data".into(),
+            dns: "pg-1.pg.data.legion".into(),
         };
         let r = Request {
             spi_version: VERSION.into(),

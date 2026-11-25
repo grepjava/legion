@@ -157,6 +157,10 @@ pub struct Options {
     replication_user: String,
     replication_password_file: Option<String>,
     max_slot_wal_keep_size: String,
+    /// WAL every member keeps, whatever its replicas: a primary cut off and
+    /// back is rewound (`pg_rewind`) from the last checkpoint before the
+    /// timelines parted, which it must still hold.
+    wal_keep_size: String,
     initdb_args: Vec<String>,
     /// Where replicas (and, with `allowClients`, clients) connect from.
     cidrs: Vec<String>,
@@ -176,6 +180,7 @@ impl Default for Options {
             replication_user: "replicator".into(),
             replication_password_file: None,
             max_slot_wal_keep_size: "4GB".into(),
+            wal_keep_size: "512MB".into(),
             initdb_args: Vec::new(),
             cidrs: vec!["0.0.0.0/0".into(), "::/0".into()],
             allow_clients: true,
@@ -363,9 +368,11 @@ pub fn conf(o: &Options, data: &Path, me: &Member, primary: Option<&Member>) -> 
          wal_log_hints = on\n\
          max_wal_senders = 16\n\
          max_replication_slots = 16\n\
-         max_slot_wal_keep_size = '{keep}'\n",
+         max_slot_wal_keep_size = '{keep}'\n\
+         wal_keep_size = '{wal}'\n",
         port = o.port,
         keep = o.max_slot_wal_keep_size,
+        wal = o.wal_keep_size,
     );
     if let Some(p) = primary {
         let host = if p.address.is_empty() {
@@ -479,6 +486,7 @@ pub fn handle(operation: &str, input: &str, h: &mut impl Host) -> R<String> {
     identifier("replicationUser", &o.replication_user)?;
     identifier("superuser", &o.superuser)?;
     plain("maxSlotWalKeepSize", &o.max_slot_wal_keep_size)?;
+    plain("walKeepSize", &o.wal_keep_size)?;
     for c in &o.cidrs {
         plain("cidrs", c)?;
     }

@@ -88,13 +88,13 @@ Every request has these fields. Operations add their own.
     "member": "pg-1",
     "ordinal": 1,
     "address": "10.200.1.17",
-    "dns": "pg-1.pg.data"
+    "dns": "pg-1.pg.data.legion"
   },
   "topology": {
-    "primary": { "member": "pg-0", "address": "10.200.0.9", "dns": "pg-0.pg.data" },
+    "primary": { "member": "pg-0", "address": "10.200.0.9", "dns": "pg-0.pg.data.legion" },
     "members": [
-      { "member": "pg-0", "address": "10.200.0.9", "dns": "pg-0.pg.data" },
-      { "member": "pg-1", "address": "10.200.1.17", "dns": "pg-1.pg.data" },
+      { "member": "pg-0", "address": "10.200.0.9", "dns": "pg-0.pg.data.legion" },
+      { "member": "pg-1", "address": "10.200.1.17", "dns": "pg-1.pg.data.legion" },
       { "member": "pg-2", "address": "10.200.2.4", "dns": "pg-2.pg.data" }
     ],
     "synchronous": { "count": 1, "members": ["pg-1", "pg-2"] }
@@ -268,6 +268,7 @@ Options:
 | `replicationUser` | `replicator` | Created at `prepare` on the primary |
 | `replicationPasswordFile` | required | A Secret mounted in the pod |
 | `maxSlotWalKeepSize` | `4GB` | Bounds what a stopped replica's slot holds on the primary |
+| `walKeepSize` | `512MB` | WAL every member keeps, so a primary cut off and back can be rewound |
 | `initdbArgs` | `[]` | Added to `initdb` |
 
 - **`prepare`, primary, empty data directory:** `initdb
@@ -275,7 +276,7 @@ Options:
   then writes `legion-replication.conf`, included from
   `postgresql.conf`, which holds `wal_level=replica`, `hot_standby=on`,
   `max_wal_senders`, `max_replication_slots` and
-  `max_slot_wal_keep_size`. It adds `pg_hba.conf` lines for replication
+  `max_slot_wal_keep_size` and `wal_keep_size`. It adds `pg_hba.conf` lines for replication
   from the pod network, and creates the replication role in single-user
   mode (`postgres --single`), since nothing is running yet.
 - **`prepare`, replica:**

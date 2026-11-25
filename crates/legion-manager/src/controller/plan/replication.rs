@@ -332,7 +332,8 @@ pub(super) fn pass(
             .get(&i)
             .and_then(|t| t.status.ip.clone())
             .unwrap_or_default(),
-        dns: format!("{svc}-{i}.{svc}.{ns}"),
+        // Whole, so no search domain is needed.
+        dns: format!("{svc}-{i}.{svc}.{ns}.legion"),
     };
     // The replicas the primary waits for: those healthy and streaming,
     // seen while it is healthy; kept as they were meanwhile.

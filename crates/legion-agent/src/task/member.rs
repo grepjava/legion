@@ -90,7 +90,7 @@ impl<R: Runtime, C: Control> Worker<R, C> {
             member: format!("{svc}-{ordinal}"),
             ordinal,
             address: self.status.ip.clone().unwrap_or_default(),
-            dns: format!("{svc}-{ordinal}.{svc}.{}", self.a.key.namespace),
+            dns: format!("{svc}-{ordinal}.{svc}.{}.legion", self.a.key.namespace),
         }
     }
 

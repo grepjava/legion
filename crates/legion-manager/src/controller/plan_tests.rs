@@ -5174,7 +5174,7 @@ fn a_replicated_database_names_its_first_primary_and_tells_each_member() {
     let r = t.spec.replication.as_ref().unwrap();
     assert_eq!(r.topology.primary.as_ref().unwrap().member, "pg-0");
     assert_eq!(r.topology.members.len(), 3);
-    assert_eq!(r.topology.primary.as_ref().unwrap().dns, "pg-0.pg.shop");
+    assert_eq!(r.topology.primary.as_ref().unwrap().dns, "pg-0.pg.shop.legion");
 
     w.members_say(1, |_| 100, &[]);
     w.settle();
