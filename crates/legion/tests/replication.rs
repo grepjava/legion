@@ -7,8 +7,12 @@
 //! `failoverAfter` and its task surely stopped, the replica is promoted
 //! with every row, the Service's address follows, and writes go on. Mended,
 //! the old primary comes back as a replica of the new one (pg_rewind) and
-//! has the rows written meanwhile. Last, a switchover hands the primary
-//! back, losing nothing.
+//! has the rows written meanwhile. A switchover hands the primary back,
+//! losing nothing. A rolling update then replaces the replica first and
+//! switches over before replacing the primary. Last, the daemon of the
+//! primary's node is killed: the container's supervisor stops PostgreSQL
+//! once the node's lease runs out (self-fencing, the watchdog), before
+//! the replica is promoted; the daemon back, the old primary rejoins.
 //!
 //! It drives real daemons, so it is ignored by default and run on the lab
 //! of `tests/common` (see there), as root, with the Postgres image of
@@ -20,6 +24,7 @@ mod common;
 
 use common::{Lab, Role, text, vm, wait};
 use serde_json::Value;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const PLUGIN_DIR: &str = "/usr/local/libexec/legion/replication";
 
@@ -380,6 +385,103 @@ fn a_replicated_database_fails_over_and_its_old_primary_rejoins() {
     });
     lab.waited_pg("every row on both", 300, || {
         lab.rows_on(0) == Some(502) && lab.rows_on(1) == Some(502)
+    });
+
+    step("a rolling update replaces the replica, switches over, then the old primary");
+    let updated = APP.replace(
+        "-c, log_destination=stderr]",
+        "-c, log_destination=stderr, -c, work_mem=8MB]",
+    );
+    std::fs::write(&app, &updated).unwrap();
+    lab.ok(&["apply", "-f", app.to_str().unwrap()]);
+    let on_new_pod = |n: u64| {
+        lab.member(n).is_some_and(|t| {
+            t["spec"]["pod"]["containers"][0]["command"]
+                .to_string()
+                .contains("work_mem=8MB")
+        })
+    };
+    lab.waited_pg("both members updated, the primary handed over", 600, || {
+        let r = lab.repl();
+        on_new_pod(0)
+            && on_new_pod(1)
+            && r["change"].is_null()
+            && r["phase"] == "healthy"
+            && r["lastChange"]["reason"] == "a rolling update replaces the primary"
+    });
+    let r = lab.repl();
+    assert_eq!(r["lastChange"]["kind"], "switchover", "{r}");
+    assert_eq!(
+        r["primary"], "pg-1",
+        "pg-0 was primary, so it went last: {r}"
+    );
+    lab.waited_pg("writing after the update", 120, || {
+        lab.through(0, "pg", "insert into orders (item) values ('updated')")
+            .is_some()
+    });
+    lab.waited_pg("every row on both after the update", 300, || {
+        lab.rows_on(0) == Some(503) && lab.rows_on(1) == Some(503)
+    });
+
+    step("the primary's daemon killed: its PostgreSQL stops before the replica is promoted");
+    let primary_node = lab.member(1).unwrap()["spec"]["node"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let pv = &lab.vms[vm(&primary_node)];
+    let out = lab.ssh(pv, "pkill -KILL -f 'legion-lab daemon'");
+    assert!(out.status.success(), "killing {primary_node}'s daemon");
+    let killed = std::time::Instant::now();
+    let wall = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    };
+    // Its supervisor stops it once the lease runs out, no agent there.
+    let mut stopped_at = None;
+    while killed.elapsed() < Duration::from_secs(180) {
+        let out = lab.ssh(pv, "pgrep -f 'postgres -D /var/db/pg/data' || true");
+        if text(&out.stdout).trim().is_empty() {
+            stopped_at = Some(wall());
+            break;
+        }
+        assert!(
+            lab.repl()["primary"] == "pg-1",
+            "pg-0 promoted while pg-1's PostgreSQL still ran: {}",
+            lab.repl()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let Some(stopped_at) = stopped_at else {
+        lab.dump_pg();
+        panic!("PostgreSQL on {primary_node} still runs 180 s after its daemon was killed");
+    };
+    eprintln!(
+        "stopped by its supervisor {:?} after the kill",
+        killed.elapsed()
+    );
+    lab.waited_pg("pg-0 promoted", 300, || {
+        let r = lab.repl();
+        r["primary"] == "pg-0" && r["change"].is_null() && r["lastChange"]["to"] == "pg-0"
+    });
+    let r = lab.repl();
+    assert_eq!(r["lastChange"]["kind"], "failover", "{r}");
+    let promoted_at = r["lastChange"]["at"].as_i64().unwrap();
+    assert!(
+        stopped_at < promoted_at,
+        "stopped at {stopped_at}, promotion recorded at {promoted_at}"
+    );
+    assert_eq!(lab.rows_on(0), Some(503), "every row pg-1 confirmed");
+
+    step("the daemon back: the old primary rejoins as a replica");
+    lab.restart_vm(vm(&primary_node), Role::Worker);
+    lab.waited_pg("pg-1 following pg-0", 600, || {
+        lab.psql(1, "select pg_is_in_recovery()").as_deref() == Some("t")
+            && lab.rows_on(1) == Some(503)
+    });
+    lab.waited_pg("healthy at the end", 180, || {
+        lab.repl()["phase"] == "healthy"
     });
 
     step("clean up");

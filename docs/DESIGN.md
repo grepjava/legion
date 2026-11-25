@@ -1850,8 +1850,8 @@ How it was built, where it differs from the outline below:
   primary is a replica and stops like one. Without such a replica it is
   stopped as before. A rolling update takes the primary's slot last.
   Eviction by a `NoExecute` taint stays immediate.
-- **Not built yet**: the console tab; `legion replication check`; the
-  watchdog; WAL archiving.
+- **Not built yet**: the console tab; `legion replication check`; WAL
+  archiving.
 
 **The spec.** The fields go on a stateful Service:
 
@@ -1977,13 +1977,17 @@ review. Alerts fire on `degraded`, `split` and failed failovers, and
 **Risks and limits.**
 
 - A node whose daemon died with its pods running looks the same as a
-  node cut off. Its PostgreSQL keeps accepting writes from that node's
-  own pods, which the dead agent's pf table still routes there. Those
-  writes are lost when the member rewinds, as for Volume replicas
-  (docs/PARTITIONS.md).
-- A watchdog would close this gap: the plugin's `status` acting as a
-  lease that, unrenewed, stops the database. It is an open question for
-  after v1.
+  node cut off. The watchdog for it is self-fencing (docs/PARTITIONS.md),
+  which automatic failover already requires (`onPartition: stop`): the
+  agent renews a lease as the managers answer its heartbeats, and the
+  database container's supervisor, which outlives the daemon, stops it
+  once the lease runs out, when the managers would mark the node down.
+  It has stopped, killed after its stop grace period at the latest,
+  before the fence's wait (orphaned, plus that grace period and 5 s)
+  ends, so no write is taken on the old primary once another is named.
+  A plugin `status` used as a lease would add nothing to it: a database
+  that hangs but runs is stopped through its agent like any unhealthy
+  primary. The lab test kills the primary's daemon and checks the order.
 
 **Plan.**
 

@@ -224,7 +224,9 @@ Response: `{}`.
 - `promote` comes only after the previous primary is fenced. Its task
   is stopped, confirmed by its agent, or its node is cut off and every
   task of the Service there has `onPartition: stop` and has passed its
-  stop grace period plus 5 s.
+  stop grace period plus 5 s. Such a task's supervisor stops it on its
+  own by then, even with the node's daemon gone (self-fencing,
+  docs/PARTITIONS.md).
 - `prepare` runs with the database stopped. `status`, `promote` and
   `configure` run with it running and ready. Calls for one member never
   overlap.
