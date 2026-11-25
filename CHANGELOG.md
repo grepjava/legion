@@ -154,11 +154,13 @@ members are told their role only on nodes that read it.
   answered, and each container's supervisor stops it once the lease runs
   out. A Volume's automatic failover is then safe in that case too.
 - **Managers far apart keep up**: a leader sends a manager what of the
-  log fits the time a call has (the heartbeat interval), learned per
-  manager from how long calls take, and openraft goes on from there at
-  once. A witness across the internet catching up after a restart no
-  longer logs streams of `payload too large` errors while each batch is
-  halved down to one entry and grown back.
+  log fits the time a call has (the heartbeat interval), sized from the
+  link as measured (its round trip and rate), and openraft goes on from
+  there at once. A witness across the internet caught up after a leader
+  restart in a flood of `payload too large` errors (each batch halved down
+  to one entry, then grown back and halved again); now a few, while the
+  backlog crosses (a lossy uplink's retransmission timeouts still outlast
+  some calls), and none in between.
 
 ### Upgrading
 
