@@ -547,13 +547,6 @@ spec:
         lab.repl()["phase"] == "healthy"
     });
 
-    step("clean up");
-    lab.ok(&["delete", "service", "pg", "-n", "data"]);
-    lab.waited_pg("every task gone", 180, || {
-        lab.list("tasks", "data")
-            .iter()
-            .all(|t| t["status"]["state"] != "running")
-    });
     step("the log archived to the bucket across the failovers");
     let objects = |what: &str| {
         let out = lab.on(
@@ -590,6 +583,13 @@ spec:
         text(&r.stdout)
     );
 
+    step("clean up");
+    lab.ok(&["delete", "service", "pg", "-n", "data"]);
+    lab.waited_pg("every task gone", 180, || {
+        lab.list("tasks", "data")
+            .iter()
+            .all(|t| t["status"]["state"] != "running")
+    });
     step("the conformance check on the PostgreSQL plugin, in a namespace of its own");
     let check = lab.dir.join("check.yaml");
     std::fs::write(
