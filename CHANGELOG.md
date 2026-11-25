@@ -156,11 +156,13 @@ members are told their role only on nodes that read it.
 - **Managers far apart keep up**: a leader sends a manager what of the
   log fits the time a call has (the heartbeat interval), sized from the
   link as measured (its round trip and rate), and openraft goes on from
-  there at once. A witness across the internet caught up after a leader
-  restart in a flood of `payload too large` errors (each batch halved down
-  to one entry, then grown back and halved again); now a few, while the
-  backlog crosses (a lossy uplink's retransmission timeouts still outlast
-  some calls), and none in between.
+  there at once. Managers' connections to each other use FreeBSD's RACK
+  TCP stack where `tcp_rack` is loaded, which resends a lost last segment
+  within a fraction of a round trip. A witness across the internet caught
+  up after a leader restart in a flood of `payload too large` errors (each
+  batch halved down to one entry, then grown back and halved again); now
+  none with RACK loaded on the full managers, and a few without it on a
+  lossy uplink (docs/HA.md, A witness far off).
 
 ### Upgrading
 

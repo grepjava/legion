@@ -72,6 +72,27 @@ serve clients: a request sent to it is passed on to the leader, which it
 can't reach ("connecting to ...: timed out", seen on 2026-11-23). Point
 the CLI, the console and agents at the full managers.
 
+**A witness far off.** Each call to replicate to it has a heartbeat
+interval (1 s) to finish. The leader sends what the link carries in that
+time, sized from how long calls take, and goes on from where a call got
+to. What it can't help is a lost packet: FreeBSD's default TCP stack waits
+a retransmission timeout for a call's lost last segment, longer than the
+call has across 200 ms or more, so a lossy uplink shows as `payload too
+large` warnings (a timed-out call, sent again in fewer entries) while a
+backlog crosses, after a leader restart say. Load the RACK stack on the
+full managers, which resends it within a fraction of a round trip:
+
+```sh
+kldload tcp_rack
+sysrc -f /boot/loader.conf tcp_rack_load=YES
+```
+
+Managers' connections to each other use it where it is loaded (the host's
+default stays as it is; `sockstat -S` shows `rack` on them). Measured on
+2026-11-25 with a witness 230 ms off on a 4 Mbit/s home uplink: a leader
+restart's 2.5 MB backlog crossed in 70 s with about 20 warnings on the
+default stack, and in 40 s with none on RACK, 28 segments lost either way.
+
 **Handing leadership on.** Before upgrading or rebooting the leader's
 machine, hand leadership to another manager with nothing brought down:
 
