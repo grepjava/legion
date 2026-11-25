@@ -1281,7 +1281,8 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
                     );
                 }
                 print!(
-                    "Hand {namespace}/{volume} to its replica? What runs on its node now writes                      to a copy that is dropped. Type the Volume's name to go on: "
+                    "Hand {namespace}/{volume} to its replica? What runs on its node now writes \
+                     to a copy that is dropped. Type the Volume's name to go on: "
                 );
                 std::io::stdout().flush()?;
                 let mut typed = String::new();

@@ -939,7 +939,8 @@ pub(crate) fn promoted(
         Some(NodeState::Down) => {}
         Some(state) => {
             return Err(format!(
-                "{from}, holding volume {name}, is {}: only a Volume whose node is down is promoted;                  move it instead (legion volume move)",
+                "{from}, holding volume {name}, is {}: only a Volume whose node is down is promoted; \
+                 move it instead (legion volume move)",
                 state.as_str()
             ));
         }

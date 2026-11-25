@@ -196,7 +196,8 @@ impl ServiceSpec {
         if let Some((name, _)) = self.pod.claims().find(|(_, c)| c.replica.is_some()) {
             return Err(Invalid::new(
                 format!("pod.volumes[{name}].claim.replica"),
-                "the members replicate the database themselves (`replication`);                  a ZFS replica of their Volumes would be a second copy that never takes over",
+                "the members replicate the database themselves (`replication`); \
+                 a ZFS replica of their Volumes would be a second copy that never takes over",
             ));
         }
         if r.failover == crate::volume::Failover::Automatic
@@ -204,7 +205,8 @@ impl ServiceSpec {
         {
             return Err(Invalid::new(
                 "pod.onPartition",
-                "`replication.failover: automatic` needs `onPartition: stop`, so a primary                  cut off stops writing before a replica is promoted (or set `failover: manual`)",
+                "`replication.failover: automatic` needs `onPartition: stop`, so a primary \
+                 cut off stops writing before a replica is promoted (or set `failover: manual`)",
             ));
         }
         Ok(())
