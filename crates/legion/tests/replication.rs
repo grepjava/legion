@@ -13,8 +13,10 @@
 //! primary's node is killed: the container's supervisor stops PostgreSQL
 //! once the node's lease runs out (self-fencing, the watchdog), before
 //! the replica is promoted; the daemon back, the old primary rejoins.
-//! Then `legion replication check` runs the plugin through the contract
-//! with three members in a namespace of its own.
+//! All along, the log is archived to a bucket (MinIO on n3): its segments
+//! and each new timeline's history are there at the end. Then `legion
+//! replication check` runs the plugin through the contract with three
+//! members in a namespace of its own.
 //!
 //! It drives real daemons, so it is ignored by default and run on the lab
 //! of `tests/common` (see there), as root, with the Postgres image of
@@ -29,6 +31,11 @@ use serde_json::Value;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const PLUGIN_DIR: &str = "/usr/local/libexec/legion/replication";
+/// MinIO on n3, the bucket the database's log is archived to.
+const S3_DIR: &str = "/var/tmp/legion-lab-wal";
+const S3_USER: &str = "legionlab";
+const S3_PASSWORD: &str = "legionlab-secret";
+const S3_BUCKET: &str = "legion-wal";
 
 const APP: &str = r#"
 apiVersion: legion/v1
@@ -57,6 +64,7 @@ spec:
     failoverAfter: 10s
     synchronous: 1
     read: true
+    archive: { target: pg-wal }
     options:
       pgdata: /var/db/pg/data
       replicationPasswordFile: /run/secrets/pg-replication
@@ -239,6 +247,18 @@ impl Lab {
     }
 }
 
+/// Stops MinIO on n3 and removes its bucket, however the test ends.
+struct Minio<'a>(&'a Lab);
+
+impl Drop for Minio<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.on(
+            "n3",
+            &format!("pkill -f 'minio server {S3_DIR}'; sleep 1; rm -rf {S3_DIR} /root/.mc; true"),
+        );
+    }
+}
+
 fn cut_off(host: &str, other: &str) -> String {
     format!(
         "pfctl -si | grep -q 'Status: Enabled' || {{ echo 'pf is not enabled' >&2; exit 1; }}
@@ -277,6 +297,47 @@ fn a_replicated_database_fails_over_and_its_old_primary_rejoins() {
     lab.install_plugin(&built);
     lab.load_image(&image);
     lab.ok(&["node", "pause", "n1"]);
+
+    step("MinIO on n3, the bucket the log is archived to");
+    let _minio = Minio(&lab);
+    let mc = "$(command -v minio-client || command -v mc)";
+    let out = lab.on(
+        "n3",
+        &format!(
+            "set -e
+            command -v minio >/dev/null || ASSUME_ALWAYS_YES=yes pkg install -q minio minio-client >/dev/null
+            mkdir -p {S3_DIR}
+            MINIO_ROOT_USER={S3_USER} MINIO_ROOT_PASSWORD={S3_PASSWORD} \
+                daemon -f minio server {S3_DIR} --address :9000 --quiet
+            i=0
+            until {mc} alias set wal http://127.0.0.1:9000 {S3_USER} {S3_PASSWORD} >/dev/null 2>&1; do
+                i=$((i + 1)); [ $i -lt 60 ] || {{ echo 'MinIO did not start' >&2; exit 3; }}
+                sleep 1
+            done
+            {mc} mb -p wal/{S3_BUCKET} >/dev/null"
+        ),
+    );
+    assert!(out.status.success(), "MinIO on n3: {}", text(&out.stderr));
+    let target = lab.dir.join("wal.yaml");
+    std::fs::write(
+        &target,
+        format!(
+            "apiVersion: legion/v1
+kind: Secret
+metadata: {{ name: s3-key, namespace: default }}
+spec: {{ text: {S3_PASSWORD} }}
+---
+apiVersion: legion/v1
+kind: BackupTarget
+metadata: {{ name: pg-wal }}
+spec:
+  s3: {{ endpoint: \"http://{}:9000\", bucket: {S3_BUCKET}, prefix: lab, accessKeyId: {S3_USER}, secretKeySecret: {{ namespace: default, name: s3-key }} }}
+",
+            lab.vms[vm("n3")].addr
+        ),
+    )
+    .unwrap();
+    lab.ok(&["apply", "-f", target.to_str().unwrap()]);
 
     step("two members: the primary made, the replica copied from it");
     let app = lab.dir.join("pg.yaml");
@@ -493,6 +554,42 @@ fn a_replicated_database_fails_over_and_its_old_primary_rejoins() {
             .iter()
             .all(|t| t["status"]["state"] != "running")
     });
+    step("the log archived to the bucket across the failovers");
+    let objects = |what: &str| {
+        let out = lab.on(
+            "n3",
+            &format!("{mc} ls wal/{S3_BUCKET}/lab/data.pg/wal/ 2>/dev/null"),
+        );
+        text(&out.stdout)
+            .lines()
+            .filter(|l| l.trim_end().ends_with(what))
+            .count()
+    };
+    lab.waited_pg(
+        "WAL segments and the timelines' history in the bucket",
+        300,
+        || {
+            let a = &lab.pg()["status"]["archive"];
+            a["target"] == "pg-wal"
+                && a["failures"].as_u64().unwrap_or(0) == 0
+                && a["shippedMs"].as_i64().is_some()
+                && objects(".history") >= 2
+                && objects("") > 3
+        },
+    );
+    eprintln!(
+        "archived: {} files, {} timeline histories, status {}",
+        objects(""),
+        objects(".history"),
+        lab.pg()["status"]["archive"]
+    );
+    let r = lab.legion(&["replication", "status", "pg", "-n", "data"], &[]);
+    assert!(
+        text(&r.stdout).contains("archive to pg-wal: last "),
+        "{}",
+        text(&r.stdout)
+    );
+
     step("the conformance check on the PostgreSQL plugin, in a namespace of its own");
     let check = lab.dir.join("check.yaml");
     std::fs::write(

@@ -1824,7 +1824,11 @@ async fn replication(
             let Some(st) = status.replication else {
                 bail!("{} replicates no database", o.key());
             };
-            return Ok(replication_table(&st));
+            let mut out = replication_table(&st);
+            if let Some(a) = status.archive {
+                out.push_str(&archive_line(&a, now_ms()));
+            }
+            return Ok(out);
         }
         C::Switchover {
             service,
@@ -1850,6 +1854,41 @@ async fn replication(
     )
     .await
     .map_err(|s| anyhow::anyhow!("{}", s.message()))
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// Where a replicated database's log archiving stands, for people.
+pub(crate) fn archive_line(a: &legion_api::replication::ArchiveStatus, now_ms: i64) -> String {
+    let ago = |at: Option<i64>| {
+        at.map_or("never".to_owned(), |t| {
+            format!(
+                "{} ago",
+                legion_api::clock::span(std::time::Duration::from_millis(
+                    (now_ms - t).max(0) as u64
+                ))
+            )
+        })
+    };
+    let mut out = format!(
+        "archive to {}: last {}, shipped {}, pruned {}",
+        a.target,
+        if a.last.is_empty() { "none" } else { &a.last },
+        ago(a.shipped_ms),
+        ago(a.pruned_ms)
+    );
+    if a.pending > 0 {
+        out.push_str(&format!(", {} waiting", a.pending));
+    }
+    if a.failures > 0 {
+        out.push_str(&format!("; {} runs failed: {}", a.failures, a.message));
+    }
+    out.push('\n');
+    out
 }
 
 /// A replicated database's status, for people.

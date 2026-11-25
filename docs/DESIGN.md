@@ -1859,7 +1859,18 @@ How it was built, where it differs from the outline below:
   in its container as the agent does (the exec session with the request
   on standard input), and sees data travel through an optional `probe`
   operation (capability `probe`), so it needs nothing of the database.
-- **Not built yet**: WAL archiving.
+- **Log archiving** (`replication.archive: { target, keep }`, an `s3`
+  BackupTarget): the plugin spools each finished piece of the log (every
+  PostgreSQL member, `archive_mode = always`) and says where in `status`;
+  the leader's archiver maps the spool to the member's claimed Volume
+  through the pod's mounts and, every 15 s, offers the node holding it an
+  `ArchiveRun` with the target and its key. The agent ships what is
+  there, once per name, removes it, and hourly prunes the target to
+  `keep`. Credentials never enter the jail. `status.archive` is the
+  archiver's alone, carried over by the controller; three failed runs in
+  a row raise `archive-late`.
+- **Not built yet**: a restore to a point in time done by Legion (by hand
+  for now, docs/REPLICATION.md).
 
 **The spec.** The fields go on a stateful Service:
 

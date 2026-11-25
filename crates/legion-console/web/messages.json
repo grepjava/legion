@@ -506,6 +506,8 @@
   },
   "Loading…": "",
   "Log": "",
+  "Log archived to {target}: last {last}, shipped {shipped}, pruned {pruned}.": "",
+  "Log archived to {target}: nothing shipped yet.": "",
   "Logs": "",
   "Logs for {name}": "",
   "Long operations": "",
@@ -1604,6 +1606,7 @@
   },
   "{n} running": "",
   "{n} running; {what}: {stage}": "",
+  "{n} runs failed: {why}": "",
   "{n} s": "",
   "{n} s ago": "",
   "{n} services": {
@@ -1628,6 +1631,7 @@
     "other": ""
   },
   "{n} vulnerable": "",
+  "{n} waiting.": "",
   "{n} warnings": {
     "one": "",
     "other": ""

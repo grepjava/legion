@@ -227,6 +227,22 @@
     </tbody>
   </table>
 
+  {#if want.archive}
+    {@const a = service.status?.archive}
+    <p class="muted">
+      {a
+        ? t('Log archived to {target}: last {last}, shipped {shipped}, pruned {pruned}.', {
+            target: a.target,
+            last: a.last || t('none'),
+            shipped: a.shippedMs ? t('{span} ago', { span: span(now - a.shippedMs) }) : t('never'),
+            pruned: a.prunedMs ? t('{span} ago', { span: span(now - a.prunedMs) }) : t('never')
+          })
+        : t('Log archived to {target}: nothing shipped yet.', { target: want.archive.target })}
+      {#if a?.pending}{t('{n} waiting.', { n: a.pending })}{/if}
+    </p>
+    {#if a?.failures}<p class="error">{t('{n} runs failed: {why}', { n: a.failures, why: a.message })}</p>{/if}
+  {/if}
+
   {#if st.lastChange}
     <p class="muted">
       {t('Last change: {kind} from {from} to {to}, {when} ago: {reason}', {

@@ -34,6 +34,13 @@ members are told their role only on nodes that read it.
   none during a change), and with `read: true`, `<service>-read` to the
   healthy replicas.
 - **`legion replication status|switchover|failover`.**
+- **Log archiving** (`replication.archive: { target, keep }`): each
+  member's finished WAL files shipped to an S3 BackupTarget as they are
+  written (at least every minute), from every member so a failover leaves
+  no gap, pruned to `keep` (7 days by default); `status.archive`,
+  `legion replication status` and the console say how far it got, and
+  `archive-late` fires after three failed runs. A restore to a point in
+  time is by hand for now (docs/REPLICATION.md).
 - **`legion replication check -f FILE`**: the conformance check, run on
   the cluster. It drives a plugin through every step of the contract,
   including a primary stopped dead and brought back, with markers written

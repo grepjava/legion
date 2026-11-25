@@ -113,6 +113,11 @@ Every request has these fields. Operations add their own.
   of a replica only) is true when the member answered `diverged` before
   and the Service allows it to be copied anew: discard the data and copy
   the primary's.
+- `archive` (capability `archive`) is true when the Service archives
+  its log (`replication.archive`): the plugin keeps each finished piece of
+  the database's log in a spool directory and says where in `status`
+  (`spool`). Legion ships what is there to the target and removes it.
+  Files ending `.part` are being written and are left alone.
 - `options` is the Service's `replication.options`, passed as given.
   Secrets go in as files the Service mounts (`/run/secrets/...`), named
   in options. Legion never sends a secret's value in a request.
@@ -131,7 +136,8 @@ Called once per plugin and image, before anything else.
     "readableReplicas": true,
     "rewind": true,
     "seedFromSnapshot": false,
-    "probe": true
+    "probe": true,
+    "archive": true
   } }
 ```
 
@@ -188,6 +194,9 @@ Run every 5 s on every running member, like a probe. It must be quick
 - `lag` is optional. A replica reports it from its own view. A primary
   may leave it out.
 - `detail` is free-form, shown to operators as given.
+- `spool`, asked to `archive`: the directory, as the container sees it,
+  holding finished pieces of the log for Legion to ship. It must be on one
+  of the pod's claimed Volumes, so the node can reach it.
 
 Legion routes writes to a member only while Legion names it primary
 **and** its `status` says `primary` and healthy. A member Legion calls a
@@ -297,6 +306,18 @@ Options:
 | `walKeepSize` | `512MB` | WAL every member keeps, so a primary cut off and back can be rewound |
 | `initdbArgs` | `[]` | Added to `initdb` |
 
+Asked to `archive`, every member sets `archive_mode = always` and
+`archive_command` to the plugin itself, `<plugin> archive-wal %p %f
+<spool>`, with `archive_timeout = 60` (a quiet database still ships a
+file a minute). It copies each finished WAL file, timeline history files
+included, into `<pgdata>/legion_wal`, synced before it says so, and
+fails once 1024 files wait there, so PostgreSQL keeps its WAL rather than
+fill the Volume while Legion cannot ship. Every member archives, not
+only the primary: a replica promoted then has what the old primary wrote
+before, and the target takes each name once. `archive_mode` takes effect
+at a start, so archiving turned on for a running Service starts at each
+member's next restart (`legion restart`).
+
 - **`prepare`, primary, empty data directory:** `initdb
   --data-checksums` (pg_rewind needs checksums or `wal_log_hints`). It
   then writes `legion-replication.conf`, included from
@@ -334,6 +355,13 @@ Options:
   - A primary of an older epoch (`pg_is_in_recovery()` false) answers
     `restart`.
 
-Not in v1: archiving WAL to S3 for point-in-time recovery, which comes
-next with the S3 backup targets; seeding a replica from a ZFS snapshot
-(`seedFromSnapshot`); cascading replicas; logical replication.
+A restore to a point in time is by hand for now: restore a backup of a
+member's Volume (`legion volume restore --from TARGET VOLUME@TIME --as
+NEW`), copy the WAL files after it from
+`<prefix>/<namespace>.<service>/wal/` into its data directory's
+`pg_wal`, set `recovery_target_time` and touch `recovery.signal`, then
+start a one-member Service on it. Doing this for you is the next step.
+
+Not in v1: a restore to a point in time done by Legion; seeding a replica
+from a ZFS snapshot (`seedFromSnapshot`); cascading replicas; logical
+replication.
