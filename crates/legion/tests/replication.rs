@@ -13,6 +13,8 @@
 //! primary's node is killed: the container's supervisor stops PostgreSQL
 //! once the node's lease runs out (self-fencing, the watchdog), before
 //! the replica is promoted; the daemon back, the old primary rejoins.
+//! Then `legion replication check` runs the plugin through the contract
+//! with three members in a namespace of its own.
 //!
 //! It drives real daemons, so it is ignored by default and run on the lab
 //! of `tests/common` (see there), as root, with the Postgres image of
@@ -491,5 +493,30 @@ fn a_replicated_database_fails_over_and_its_old_primary_rejoins() {
             .iter()
             .all(|t| t["status"]["state"] != "running")
     });
+    step("the conformance check on the PostgreSQL plugin, in a namespace of its own");
+    let check = lab.dir.join("check.yaml");
+    std::fs::write(
+        &check,
+        APP.replace("name: data }", "name: check }")
+            .replace("namespace: data }", "namespace: check }")
+            .replace("replicas: 2", "replicas: 3"),
+    )
+    .unwrap();
+    let out = lab.legion(
+        &["replication", "check", "-f", check.to_str().unwrap()],
+        &[],
+    );
+    eprintln!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(out.status.success(), "the check failed");
+    let said = text(&out.stdout);
+    for step in [
+        "ok    describe: postgresql",
+        "ok    probe: a marker written on the primary is read on both replicas",
+        "ok    the marker written just before the stop is on the new primary",
+        "passed",
+    ] {
+        assert!(said.contains(step), "{step} missing");
+    }
+
     step("done");
 }

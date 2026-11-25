@@ -1026,6 +1026,24 @@ pub enum ReplicationCommand {
         #[arg(short, long)]
         namespace: Option<String>,
     },
+    /// Runs a replication plugin through its contract on this cluster
+    /// (docs/REPLICATION.md, Conformance): the replicated Service in FILE
+    /// (replicas: 3, failing over on its own) and what comes with it are
+    /// applied; once formed, each member's plugin is called as its agent
+    /// calls it, every operation twice, data seen to travel (with the
+    /// plugin's probe); the primary is stopped dead, a replica must be
+    /// promoted and the other follow it, and the old primary come back as
+    /// a replica. Removed after, unless --keep or a step failed.
+    Check {
+        #[arg(short, long)]
+        file: PathBuf,
+        /// Into this namespace, whatever FILE says.
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// Leave it running after.
+        #[arg(long)]
+        keep: bool,
+    },
     /// The primary is lost (`failover: manual`): promote TO once the old
     /// primary is fenced.
     Failover {

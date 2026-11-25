@@ -1440,6 +1440,14 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
             .map_err(|s| anyhow::anyhow!("{}", s.message()))?;
             println!("{done}");
         }
+        Command::Replication {
+            command:
+                crate::ReplicationCommand::Check {
+                    file,
+                    namespace,
+                    keep,
+                },
+        } => check::run(&mut objects, &channel, &file, namespace, keep).await?,
         Command::Replication { command } => {
             println!("{}", replication(&mut objects, command).await?);
         }
@@ -1790,6 +1798,8 @@ pub async fn run(server: &str, identity: &Path, command: Command) -> anyhow::Res
     Ok(())
 }
 
+mod check;
+
 /// `legion replication`: what was done, or where the members stand.
 async fn replication(
     objects: &mut Objects,
@@ -1827,6 +1837,7 @@ async fn replication(
             force,
             namespace,
         } => (service, namespace, ChangeKind::Failover, Some(to), force),
+        C::Check { .. } => unreachable!("run apart"),
     };
     legion_manager::actions::replication_request(
         objects,

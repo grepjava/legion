@@ -1853,7 +1853,13 @@ How it was built, where it differs from the outline below:
 - **The console** has the Replication tab, alerts and metrics described
   below; the stalled alert is a change of primary under way over 3
   minutes, as a failed failover keeps waiting rather than giving up.
-- **Not built yet**: `legion replication check`; WAL archiving.
+- **`legion replication check`** drives a plugin through the contract on a
+  cluster, by Legion itself, from a Service file (docs/REPLICATION.md,
+  Conformance), not a harness of its own: it calls each member's plugin
+  in its container as the agent does (the exec session with the request
+  on standard input), and sees data travel through an optional `probe`
+  operation (capability `probe`), so it needs nothing of the database.
+- **Not built yet**: WAL archiving.
 
 **The spec.** The fields go on a stateful Service:
 

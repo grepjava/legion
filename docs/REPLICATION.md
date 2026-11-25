@@ -24,7 +24,8 @@ written to this contract and nothing more.
    again with the same request. Each operation must leave the same state
    when called twice. `promote` on a primary succeeds and does nothing.
 3. **Small, versioned, extended by capabilities.** v1 has five
-   operations. Additions come as capabilities a plugin declares in
+   operations, and `probe` for the conformance check where a plugin
+   declares it. Additions come as capabilities a plugin declares in
    `describe`, never as changed meanings.
 
 ## Running a plugin
@@ -129,7 +130,8 @@ Called once per plugin and image, before anything else.
     "synchronous": true,
     "readableReplicas": true,
     "rewind": true,
-    "seedFromSnapshot": false
+    "seedFromSnapshot": false,
+    "probe": true
   } }
 ```
 
@@ -191,6 +193,16 @@ Legion routes writes to a member only while Legion names it primary
 **and** its `status` says `primary` and healthy. A member Legion calls a
 replica that reports `primary` is reported as split, and Legion stops it.
 
+### `probe` (capability `probe`)
+
+Only for the conformance check below, never called by Legion's agents.
+The request adds `"probe": {"write": KEY}` or `{"read": KEY}`, where KEY
+is letters, digits, `-` and `_`, up to 64. A write, on the primary,
+stores a marker under KEY, committed as any write is (so synchronous
+replicas confirm it). A read, on any member, says whether it is there.
+Response: `{"found": true | false}`. The deadline is 30 s. A plugin
+without it is still checked, except that data is not seen to travel.
+
 ### `promote`
 
 Make this replica the primary, with the request's `topology` (it is
@@ -235,23 +247,35 @@ Response: `{}`.
 
 ## Conformance
 
-`legion replication check PLUGIN --image IMAGE` (to be built with v1)
-runs a plugin through the contract on one node with real jails:
+`legion replication check -f FILE [-n NAMESPACE] [--keep]` runs a plugin
+through the contract on a cluster, in real jails, with Legion driving it
+as it drives any database. FILE holds a replicated Service with
+`replicas: 3` and automatic failover, and what it needs (Secrets, a
+Namespace); one node is enough. The check applies it, then:
 
-1. `describe`.
-2. Three members `prepare`d and started.
-3. Writes on the primary seen on both replicas, and `status` positions
-   ordered.
-4. The primary killed, the furthest replica promoted, and the third
-   member `configure`d to follow it.
-5. The old primary `prepare`d as a replica (rewound or cloned) and
-   following.
-6. Every operation called twice with the same request, with the same
-   result.
-7. With `synchronous`, nothing acknowledged before the kill is lost.
+1. Calls `describe` in member 0's container, and refuses a plugin that
+   does not speak SPI 1, or lacks `synchronous` the Service asks for.
+2. Waits for Legion to form it: three members `prepare`d, started and
+   healthy, a primary named.
+3. Calls `status` twice on each member, directly, as the agent does: the
+   same both times, the role the member was told, replicas no further
+   than the primary.
+4. With `probe`, writes a marker on the primary and reads it on both
+   replicas.
+5. Calls `configure` twice on every member and `promote` twice on the
+   primary: the same answers, still healthy.
+6. Writes a marker, then stops the primary dead (`kill -STOP -1` in its
+   container). Legion must fence it, promote a replica and raise the
+   epoch. With `synchronous`, the marker must be on the new primary; a
+   marker written there must reach the third member, `configure`d to
+   follow it.
+7. Waits for the old primary to come back, `prepare`d as a replica
+   (rewound or cloned), holding what was written since.
 
-A plugin that passes is one Legion can drive. The PostgreSQL plugin is
-held to the same check in Legion's lab.
+It prints each step as it passes, and removes what it applied and the
+members' Volumes, unless `--keep`. A step that fails stops it and leaves
+everything for a look. A plugin that passes is one Legion can drive.
+Legion's lab runs it on the PostgreSQL plugin.
 
 ## Legion's PostgreSQL plugin (`postgres`)
 

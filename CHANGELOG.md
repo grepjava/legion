@@ -34,6 +34,11 @@ members are told their role only on nodes that read it.
   none during a change), and with `read: true`, `<service>-read` to the
   healthy replicas.
 - **`legion replication status|switchover|failover`.**
+- **`legion replication check -f FILE`**: the conformance check, run on
+  the cluster. It drives a plugin through every step of the contract,
+  including a primary stopped dead and brought back, with markers written
+  and read through a new optional `probe` operation (the PostgreSQL plugin
+  has it).
 - **The console's Replication tab** on a replicated Service: the named
   primary and epoch, the phase and why, each member's role, position, lag
   and when it was last heard from, a change under way and the last one,

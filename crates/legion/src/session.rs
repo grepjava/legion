@@ -235,6 +235,37 @@ pub async fn exec(
     }
 }
 
+/// Runs `command` with `input` on its standard input, and returns its
+/// exit code, standard output and standard error.
+pub async fn run(
+    channel: &Channel,
+    target: &Target,
+    command: Vec<String>,
+    input: Vec<u8>,
+) -> anyhow::Result<(i32, Vec<u8>, Vec<u8>)> {
+    let action = Action::Exec(ExecOptions {
+        command,
+        stdin: true,
+        tty: false,
+        size: None,
+    });
+    let mut s = Session::open(channel, target.open(action)).await?;
+    if !input.is_empty() {
+        s.tx.send(frame(Frame::Input(input))).await?;
+    }
+    s.tx.send(frame(Frame::InputClosed(InputClosed {}))).await?;
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    loop {
+        match s.next().await? {
+            Some(Frame::Stdout(data)) => stdout.extend(data),
+            Some(Frame::Stderr(data)) => stderr.extend(data),
+            Some(Frame::ExitCode(code)) => return Ok((code, stdout, stderr)),
+            Some(_) => {}
+            None => bail!("the session ended without the command's exit code"),
+        }
+    }
+}
+
 /// Sends stdin as input until it ends, then closes the input.
 async fn send_stdin(tx: mpsc::Sender<SessionFrame>) {
     let mut stdin = tokio::io::stdin();

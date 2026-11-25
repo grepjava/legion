@@ -155,6 +155,14 @@ under `failover: manual`; `--force` passes over the lag and synchronous
 checks. Each is a request in the Service's spec, acted on once; a refused
 one is said in `status`.
 
+### `legion replication check -f <FILE> [-n <NS>] [--keep]`
+The conformance check (docs/REPLICATION.md): applies the replicated
+Service in FILE (`replicas: 3`, automatic failover), then drives its
+plugin through the contract on the cluster, each operation twice, a
+primary stopped dead and brought back, data seen to travel with the
+plugin's `probe`. Prints each step as it passes; removes what it applied
+unless `--keep` or a step failed.
+
 ---
 
 ## Observability, Storage, Network & Sessions
