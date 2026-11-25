@@ -302,6 +302,13 @@ members are told their role only on nodes that read it.
   snapshot's GUID first and, the same, takes the copy as done. A move's
   full copy is checked the same way. Agents from before answer nothing,
   and the copy goes on as before.
+- A copy cut short by a leader restart could lose what it had kept: the
+  receive the old leader fed held the dataset for over 20 s after its
+  sender was gone, the new leader's attempts to go on were refused as busy
+  meanwhile, and three of them in a row gave the part up (19 GB of a
+  36 GB replica, copied again from nothing). A refusal while the attempt
+  before is still being taken in no longer counts, for a replica's copy or
+  a move's full copy.
 - A failed copy, move, scheduled snapshot or backup said when the next
   attempt starts as "the next in 5s", wrong as soon as it was read later
   and all through a long attempt after it; it gives the time instead

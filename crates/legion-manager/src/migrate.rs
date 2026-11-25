@@ -164,6 +164,7 @@ async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::activity::Sta
             running.remove(&key);
             match result {
                 Err(Copied { why: e, stalled }) => {
+                    let busy = legion_api::volume::receive_busy(&e);
                     let f = failed.entry(key.clone()).or_insert(Failures {
                         to: m.to.clone(),
                         phase: m.phase,
@@ -176,7 +177,13 @@ async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::activity::Sta
                         (f.to, f.phase, f.count, f.stalled) = (m.to.clone(), m.phase, 0, 0);
                     }
                     f.count += 1;
-                    f.stalled = if stalled { f.stalled + 1 } else { 0 };
+                    // One refused while the attempt before is still being
+                    // taken in leaves the count as it was.
+                    f.stalled = match (stalled, busy) {
+                        (true, _) => f.stalled + 1,
+                        (false, true) => f.stalled,
+                        (false, false) => 0,
+                    };
                     f.last = Instant::now();
                     let ready = ready_nodes(store);
                     f.away = [from, m.to.clone()]
@@ -622,9 +629,12 @@ impl From<String> for Copied {
 impl Copied {
     fn failed(why: String, resumed: bool, sent: &std::sync::atomic::AtomicU64) -> Copied {
         let moved = sent.load(std::sync::atomic::Ordering::Relaxed);
+        // Refused while the attempt before is still being taken in on the
+        // new node: no sign of anything wrong with what it kept.
+        let busy = legion_api::volume::receive_busy(&why);
         Copied {
             why,
-            stalled: resumed && moved < legion_api::volume::PartialCopy::PROGRESS,
+            stalled: resumed && moved < legion_api::volume::PartialCopy::PROGRESS && !busy,
         }
     }
 }
@@ -910,6 +920,17 @@ mod tests {
         let waits: Vec<u64> = (1..=8).map(|n| backoff(n).as_secs()).collect();
         assert_eq!(waits, [5, 10, 20, 40, 80, 160, 300, 300]);
         assert_eq!(backoff(u32::MAX), RETRY_MAX);
+    }
+
+    /// A move's full copy refused while the attempt before is still being
+    /// taken in is no stall, however little it moved.
+    #[test]
+    fn a_full_copy_refused_as_busy_is_no_stall() {
+        let none = std::sync::atomic::AtomicU64::new(0);
+        let busy = format!("node n2: {}: EBUSY", legion_api::volume::RECEIVE_BUSY);
+        assert!(!Copied::failed(busy, true, &none).stalled);
+        assert!(Copied::failed("node n2: refused".into(), true, &none).stalled);
+        assert!(!Copied::failed("node n2: refused".into(), false, &none).stalled);
     }
 
     /// A copy is in already only if both nodes hold the same snapshot;

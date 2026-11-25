@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 use futures::StreamExt;
-use legion_api::volume::NOT_RESUMABLE;
+use legion_api::volume::{NOT_RESUMABLE, RECEIVE_BUSY};
 use legion_proto::v1::session_frame::Frame;
 use legion_proto::v1::{
     ReplicaReceive, ReplicaSend, ResumeToken, SessionFrame, SnapshotGuid, VolumeExport,
@@ -94,8 +94,7 @@ pub(crate) async fn receive(
     let work = crate::task::blocking(&v.sys, move |sys| {
         let mut input = FrameReader::new(rx);
         if opts.resume && !opts.last {
-            sys.zfs_receive_resumable(&ds, &mut input)
-                .map_err(|e| e.to_string())
+            receive_rest(sys, &ds, &mut input)
         } else {
             take(sys, &lock, &ds, opts.last, &mut input)
         }
@@ -509,9 +508,26 @@ fn replica_resumed(
     snapshot: &str,
     input: &mut dyn Read,
 ) -> Result<(), String> {
-    sys.zfs_receive_resumable(ds, input)
-        .map_err(|e| e.to_string())?;
+    receive_rest(sys, ds, input)?;
     keep_only(sys, lock, ds, snapshot)
+}
+
+/// Takes the rest of a copy cut short into `ds` (a replica's, or a move's
+/// full copy). Refused while the attempt before is still being taken in,
+/// it says so ([`RECEIVE_BUSY`]): the manager tries again later without
+/// counting it against what was kept. Seen 2026-11-25: a leader restart
+/// left the receive it fed holding the dataset for over 20 s, three
+/// attempts were refused meanwhile, and 19 GB kept of a 36 GB copy was
+/// given up.
+fn receive_rest(sys: &dyn Sys, ds: &str, input: &mut dyn Read) -> Result<(), String> {
+    sys.zfs_receive_resumable(ds, input).map_err(|e| {
+        let e = e.to_string();
+        if legion_api::volume::receive_busy(&e) {
+            format!("{RECEIVE_BUSY}: {e}")
+        } else {
+            e
+        }
+    })
 }
 
 /// Of the replica's snapshots of `ds`, drops all but `snapshot`.
@@ -1271,6 +1287,37 @@ mod tests {
     /// old one sends only the rest from the token, its full snapshot kept,
     /// and the last part goes onto it as before. A token for any other
     /// snapshot is refused as not resumable.
+    /// The rest of a copy cut short, sent while the receive the last
+    /// attempt fed still holds the dataset (its sender gone, it has not
+    /// noticed yet): refused as such, what was kept left alone, and the
+    /// next attempt goes on from it.
+    #[test]
+    fn the_rest_refused_while_the_last_attempt_is_taken_in_goes_on_later() {
+        let lock = Mutex::new(());
+        let (from, to) = (FakeSys::new(), FakeSys::new());
+        from.zfs_create(DS, &[]).unwrap();
+        to.zfs_create("tank/legion/volumes/shop", &[]).unwrap();
+        from.write_dataset(DS, &[3u8; 1000]);
+        from.fail_next("zfs send");
+        let mut out = Vec::new();
+        replica_give(&from, &lock, DS, "", "legion-replica-1", &mut out).unwrap_err();
+        replica_take(&to, &lock, DS, "", "legion-replica-1", &mut out.as_slice()).unwrap_err();
+        let token = to.zfs_resume_token(DS).unwrap().expect("what came is kept");
+        let rest = || {
+            let mut rest = Vec::new();
+            replica_resume(&from, DS, "legion-replica-1", &token, &mut rest).unwrap();
+            rest
+        };
+        to.still_receiving(DS);
+        let e = replica_resumed(&to, &lock, DS, "legion-replica-1", &mut rest().as_slice())
+            .unwrap_err();
+        assert!(e.contains(RECEIVE_BUSY), "{e}");
+        assert!(legion_api::volume::receive_busy(&e));
+        assert_eq!(to.zfs_resume_token(DS).unwrap(), Some(token.clone()));
+        replica_resumed(&to, &lock, DS, "legion-replica-1", &mut rest().as_slice()).unwrap();
+        assert_eq!(to.dataset_contents(DS).unwrap(), [3u8; 1000]);
+    }
+
     #[test]
     fn a_moves_full_copy_cut_short_goes_on() {
         let lock = Mutex::new(());

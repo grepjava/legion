@@ -122,6 +122,9 @@ struct State {
     carp: BTreeMap<(String, u8), (Carp, CarpState)>,
     /// Commands that fail once, the next time they run.
     failing: BTreeSet<String>,
+    /// Datasets the next resumed receive into finds still held by a
+    /// receive before it (EBUSY).
+    still_receiving: BTreeSet<String>,
     before_clone: Option<Hook>,
     before_send: Option<Hook>,
     after_receive: Option<Hook>,
@@ -479,6 +482,13 @@ must destroy them to overwrite it"
     /// (after taking the stream in).
     pub fn fail_next(&self, command: &str) {
         self.state().failing.insert(command.to_owned());
+    }
+
+    /// The next resumed receive into `dataset` finds it still held by the
+    /// receive before it, cut off as its sender stopped but not yet over:
+    /// refused as ZFS refuses it (EBUSY, in libzfs's words).
+    pub fn still_receiving(&self, dataset: &str) {
+        self.state().still_receiving.insert(dataset.to_owned());
     }
 
     /// Runs `f` as the next `zfs clone` starts: what is on disk then is what
@@ -1742,6 +1752,14 @@ impl Sys for FakeSys {
         let mut got = Stream::parse(&stream)?;
         {
             let mut s = self.state();
+            if got.offset.is_some() && s.still_receiving.remove(dataset) {
+                return Err(fail(
+                    "zfs receive",
+                    format!(
+                        "cannot receive resume stream: destination {dataset} contains partially-complete state from \"zfs receive -s\"."
+                    ),
+                ));
+            }
             match (got.offset, s.partial.get(dataset)) {
                 (None, Some(_)) => return Err(partially(dataset)),
                 (None, None) => {}

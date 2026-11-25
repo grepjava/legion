@@ -406,10 +406,7 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::ac
                     // Attempts to go on that keep failing without getting
                     // anywhere (a sending agent from before resuming sends
                     // a new stream, which is refused) give it up.
-                    let tries = match (resumed, outcome.sent >= PartialCopy::PROGRESS) {
-                        (Some(tries), false) => tries + 1,
-                        _ => 0,
-                    };
+                    let tries = next_tries(resumed, outcome.sent, &e);
                     let partial =
                         (!full_needed && !e.contains(NOT_RESUMABLE) && tries < PartialCopy::TRIES)
                             .then(|| PartialCopy {
@@ -576,6 +573,20 @@ pub(crate) async fn lead(store: &Store, hub: &Arc<Hub>, activity: &Arc<crate::ac
             }
         }
         tokio::time::sleep(PERIOD).await;
+    }
+}
+
+/// The attempts in a row at going on with a copy cut short that got
+/// nowhere, after one that failed with `error` having sent `sent`
+/// (`resumed`: it went on with one, after that many). One refused while
+/// the attempt before is still being taken in on the replica's node
+/// ([`legion_api::volume::RECEIVE_BUSY`]) is no sign of anything wrong
+/// with what was kept: it does not count.
+fn next_tries(resumed: Option<u32>, sent: u64, error: &str) -> u32 {
+    match resumed {
+        Some(tries) if legion_api::volume::receive_busy(error) => tries,
+        Some(tries) if sent < PartialCopy::PROGRESS => tries + 1,
+        _ => 0,
     }
 }
 
@@ -1051,6 +1062,25 @@ mod tests {
             blockers(&automatic, &s, &nodes, &[stop]),
             ["the last copy was taken on n1 before the data moved: the next is whole"]
         );
+    }
+
+    /// Attempts at going on with a copy cut short count when they get
+    /// nowhere, up to giving it up; one refused while the attempt before is
+    /// still being taken in does not (seen 2026-11-25: three refused in
+    /// 20 s after a leader restart gave up 19 GB of a 36 GB copy).
+    #[test]
+    fn a_resume_refused_as_busy_does_not_count() {
+        let busy = "node n2: the attempt before is still being taken in here: ...";
+        let old = "node n2: cannot receive resume stream: destination tank/v contains partially-complete state from \"zfs receive -s\".";
+        assert_eq!(next_tries(Some(1), 0, "node n2: refused"), 2);
+        assert_eq!(next_tries(Some(1), 0, busy), 1);
+        assert_eq!(
+            next_tries(Some(2), 0, old),
+            2,
+            "as an agent from before says it"
+        );
+        assert_eq!(next_tries(Some(2), PartialCopy::PROGRESS, "cut"), 0);
+        assert_eq!(next_tries(None, 0, busy), 0);
     }
 
     /// A copy cut short goes on at once, due or not, from the same

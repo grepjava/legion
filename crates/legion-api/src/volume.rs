@@ -275,6 +275,19 @@ pub struct ReplicaStatus {
 /// it to the manager: the next starts again.
 pub const NOT_RESUMABLE: &str = "the copy cut short cannot be resumed";
 
+/// What a copy cut short says when the receiving node is still taking in
+/// the attempt before it (cut off as its sender stopped, it lets go of the
+/// dataset only once it notices, seconds later): nothing is wrong with
+/// what it kept, so the attempt is no sign the copy cannot go on.
+pub const RECEIVE_BUSY: &str = "the attempt before is still being taken in here";
+
+/// Whether a copy's error is [`RECEIVE_BUSY`]; also as an agent from
+/// before it says so, in ZFS's words (EBUSY on a resume: the dataset still
+/// held by a receive).
+pub fn receive_busy(error: &str) -> bool {
+    error.contains(RECEIVE_BUSY) || error.contains("contains partially-complete state")
+}
+
 /// The snapshot of a move's full copy, on both nodes.
 pub const MOVE_FULL: &str = "legion-move-1";
 
