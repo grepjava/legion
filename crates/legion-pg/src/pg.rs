@@ -16,10 +16,8 @@ const INCLUDE: &str = "include_if_exists = 'legion-replication.conf'";
 /// The replication password, as libpq's password file, for a replica's
 /// `primary_conninfo`.
 pub const PASSFILE: &str = "legion-replication.pgpass";
-/// The spool that `archive_command` leaves each finished WAL file in for
-/// Legion to ship (`replication.archive`): `<data>.legion_wal` beside the
-/// data directory, or `legion_wal` in it when the data directory is a
-/// filesystem's top ([`spool_dir`]).
+/// The spool, in the data directory, that `archive_command` leaves each
+/// finished WAL file in for Legion to ship (`replication.archive`).
 pub const SPOOL: &str = "legion_wal";
 /// Files the spool holds at most: past them `archive-wal` fails, so
 /// PostgreSQL keeps its WAL (and says why) rather than the spool filling
@@ -592,47 +590,14 @@ fn spool_of(data: &Path) -> String {
     spool_dir(data).display().to_string()
 }
 
-/// Where the spool of the data directory `data` is: beside it
-/// (`<data>.legion_wal`), on the same filesystem (the same Volume), so
-/// that nothing replacing the data directory takes what was archived but
-/// not yet shipped: `pg_rewind` removes what the source lacks, a new copy
-/// of the primary starts from an empty directory (seen 2026-11-25: a
-/// rewound old primary's unshipped segment lost, and a restore across it
-/// failed). Inside it only when the data directory is a filesystem's top
-/// (nothing beside it is on the Volume); see [`Pg::keep_unshipped`].
+/// The spool of the data directory `data`. In it: the plugin runs as the
+/// database's user, who may write nothing beside it (the Volume's top is
+/// root's), so whatever replaces the data directory waits until Legion
+/// has shipped the spool ([`Pg::keep_unshipped`]).
 fn spool_dir(data: &Path) -> PathBuf {
     // Formatted, not joined: the container's paths take `/` wherever the
     // plugin is built.
-    let inside = PathBuf::from(format!("{}/{SPOOL}", data.display()));
-    let (Some(parent), Some(name)) = (data.parent(), data.file_name()) else {
-        return inside;
-    };
-    if same_filesystem(parent, data) {
-        PathBuf::from(format!(
-            "{}/{}.{SPOOL}",
-            parent.display(),
-            name.to_string_lossy()
-        ))
-    } else {
-        inside
-    }
-}
-
-/// Whether `a` and `b` are on one filesystem; not if either is missing.
-fn same_filesystem(a: &Path, b: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        match (std::fs::metadata(a), std::fs::metadata(b)) {
-            (Ok(a), Ok(b)) => a.dev() == b.dev(),
-            _ => false,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (a, b);
-        false
-    }
+    PathBuf::from(format!("{}/{SPOOL}", data.display()))
 }
 
 /// Archives into `spool` what PostgreSQL finished in `data` but had not
@@ -656,13 +621,6 @@ pub fn archive_ready(data: &Path, spool: &Path) -> Result<usize, String> {
         n += 1;
     }
     Ok(n)
-}
-
-/// What a spool inside the data directory `data` holds, if anything: it
-/// would go with the data directory, so it must be shipped first.
-fn unshipped_inside(data: &Path, spool: &Path) -> Option<usize> {
-    let held = spooled(spool);
-    (spool.starts_with(data) && held > 0).then_some(held)
 }
 
 /// The files `spool` holds, being written aside left out.
@@ -799,10 +757,14 @@ impl<H: Host> Pg<'_, H> {
     }
 
     /// Before the data directory is replaced (rewound, or emptied for a
-    /// new copy): what PostgreSQL finished but had not archived goes to the
-    /// spool, and a spool inside the data directory (its top a
-    /// filesystem's, see [`spool_dir`]) must have been shipped first, so
-    /// that the archive has no gap a restore would stop at.
+    /// new copy), which would take the spool in it: what PostgreSQL
+    /// finished but had not archived goes to the spool (a primary stopped
+    /// at once leaves some), and the spool must have been shipped, so that
+    /// the archive has no gap a restore would stop at (seen 2026-11-25: an
+    /// old primary rewound to rejoin lost a segment it had archived but
+    /// Legion had not shipped, and a restore across it stopped short).
+    /// Waiting holds up only this replica: Legion counts only replicas
+    /// streaming as synchronous, so the primary goes on taking writes.
     fn keep_unshipped(&mut self) -> R<()> {
         if !self.req.archive {
             return Ok(());
@@ -811,7 +773,8 @@ impl<H: Host> Pg<'_, H> {
         std::fs::create_dir_all(&spool)
             .map_err(|e| Fail::new(format!("{}: {e}", spool.display())))?;
         archive_ready(&self.data, &spool).map_err(|e| Fail::code(spi::RETRY, e))?;
-        if let Some(held) = unshipped_inside(&self.data, &spool) {
+        let held = spooled(&spool);
+        if held > 0 {
             return Err(Fail::code(
                 spi::RETRY,
                 format!(
@@ -876,20 +839,6 @@ impl<H: Host> Pg<'_, H> {
             let spool = spool_dir(&self.data);
             std::fs::create_dir_all(&spool)
                 .map_err(|e| Fail::new(format!("{}: {e}", spool.display())))?;
-            // A spool from before it moved beside the data directory: what
-            // it holds goes on to the new one.
-            let old = self.data.join(SPOOL);
-            if spool != old && old.is_dir() {
-                let entries = std::fs::read_dir(&old)
-                    .map_err(|e| Fail::new(format!("{}: {e}", old.display())))?;
-                for e in entries.flatten() {
-                    let to = spool.join(e.file_name());
-                    std::fs::rename(e.path(), &to)
-                        .map_err(|err| Fail::new(format!("{}: {err}", to.display())))?;
-                }
-                std::fs::remove_dir(&old)
-                    .map_err(|e| Fail::new(format!("{}: {e}", old.display())))?;
-            }
         }
         let restore = self.replaying().then(|| self.req.restore.clone()).flatten();
         let text = conf(

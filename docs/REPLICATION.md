@@ -327,16 +327,15 @@ Asked to `archive`, every member sets `archive_mode = always` and
 file a minute). It copies each finished WAL file, timeline history files
 included, into the spool, synced before it says so, and fails once 1024
 files wait there, so PostgreSQL keeps its WAL rather than fill the Volume
-while Legion cannot ship. The spool is `<pgdata>.legion_wal`, beside the
-data directory on the same Volume, so that nothing replacing the data
-directory takes what was archived but not shipped: `pg_rewind` removes
+while Legion cannot ship. The spool is `<pgdata>/legion_wal`, and what
+replaces the data directory would take it with it: `pg_rewind` removes
 what the new primary lacks, and a new copy starts from an empty
-directory. Before either, the plugin also archives what PostgreSQL
+directory. So before either, the plugin archives what PostgreSQL
 finished but had not archived yet (a primary stopped at once leaves
-some). Mount the Volume above the data directory (`/var/db/pg` for
-`/var/db/pg/data`); with the data directory at the Volume's top the
-spool stays inside it, `<pgdata>/legion_wal`, and a rewind or a new
-copy waits until Legion has shipped it. Every member archives, not
+some) and waits (`retry`) until Legion has shipped the spool. Only that
+replica waits: Legion counts only replicas streaming as synchronous, so
+the primary goes on taking writes; with the target unreachable it waits
+until the target is back. Every member archives, not
 only the primary: a replica promoted then has what the old primary wrote
 before, and the target takes each name once. `archive_mode` takes effect
 at a start, so archiving turned on for a running Service starts at each

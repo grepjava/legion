@@ -305,11 +305,10 @@ members are told their role only on nodes that read it.
 - A restore to a point in time could stop short after failovers: an old
   primary rewound to rejoin lost the WAL it had archived but Legion had
   not shipped yet, as `pg_rewind` removes what the new primary lacks (seen
-  in the lab with PostgreSQL 18). The PostgreSQL plugin now spools beside
-  the data directory (`<pgdata>.legion_wal`, files from the old spool
-  moved over), archives what PostgreSQL finished but had not archived
-  before a rewind or a new copy, and with the data directory at the
-  Volume's top waits for the spool to be shipped first.
+  in the lab with PostgreSQL 18). Before a rewind or a new copy, the
+  PostgreSQL plugin now archives what PostgreSQL finished but had not
+  archived, and waits until Legion has shipped the spool; only that
+  replica waits, the primary taking writes meanwhile.
 - A copy cut short by a leader restart could lose what it had kept: the
   receive the old leader fed held the dataset for over 20 s after its
   sender was gone, the new leader's attempts to go on were refused as busy

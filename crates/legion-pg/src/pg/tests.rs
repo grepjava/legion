@@ -766,30 +766,21 @@ fn a_restore_onto_no_database_is_refused() {
 
 /// Seen 2026-11-25: an old primary rewound (`pg_rewind` removes what the
 /// new primary lacks) lost a WAL segment it had archived but Legion had
-/// not shipped, and a restore across it stopped short. The spool is
-/// beside the data directory now, what PostgreSQL finished but had not
-/// archived goes to it before the rewind, and a spool from before moves.
-#[cfg(unix)]
+/// not shipped, and a restore across it stopped short. Before a rewind,
+/// what PostgreSQL finished but had not archived goes to the spool, and
+/// the rewind waits until the spool is shipped.
 #[test]
-fn a_rewind_keeps_what_was_archived_but_not_shipped() {
+fn a_rewind_waits_until_what_was_archived_is_shipped() {
     let s = setup();
     if !usable(&s) {
         return;
     }
-    let spool = PathBuf::from(format!(
-        "{}/data.legion_wal",
-        s.data.parent().unwrap().display()
-    ));
-    assert_eq!(spool_dir(&s.data), spool);
-    // An old primary: an old spool inside, a finished segment not archived.
-    std::fs::write(
-        s.data.join("PG_VERSION"),
-        "18
-",
-    )
-    .unwrap();
-    std::fs::create_dir(s.data.join(SPOOL)).unwrap();
-    std::fs::write(s.data.join(SPOOL).join("000000040000000000000004"), "four").unwrap();
+    let spool = spool_dir(&s.data);
+    // An old primary: one segment archived, one finished but not.
+    std::fs::write(s.data.join("PG_VERSION"), "18\n").unwrap();
+    std::fs::create_dir(&spool).unwrap();
+    std::fs::write(spool.join("000000040000000000000004"), "four").unwrap();
+    std::fs::write(spool.join("000000040000000000000006.part"), "").unwrap();
     let status = s.data.join("pg_wal/archive_status");
     std::fs::create_dir_all(&status).unwrap();
     std::fs::write(s.data.join("pg_wal/000000040000000000000005"), "five").unwrap();
@@ -797,65 +788,55 @@ fn a_rewind_keeps_what_was_archived_but_not_shipped() {
     let mut req: Request =
         serde_json::from_str(&request(&s, 1, Some(0), Some(Role::Replica))).unwrap();
     req.archive = true;
+    let req = serde_json::to_string(&req).unwrap();
+    let old_primary = || {
+        let mut h = Fake::default();
+        h.on("pg_controldata", true, CONTROL, "");
+        h.on(
+            "IDENTIFY_SYSTEM",
+            true,
+            "7300000000000000001|2|0/5000000|\n",
+            "",
+        );
+        h.on("pg_rewind", true, "", "pg_rewind: Done!");
+        h
+    };
+    let mut h = old_primary();
+    let e = handle("prepare", &req, &mut h).unwrap_err();
+    assert_eq!(e.code, spi::RETRY, "{}", e.message);
+    assert!(e.message.contains("2 archived WAL files"), "{}", e.message);
+    assert!(!h.ran("pg_rewind"));
+    let read = |n: &str| std::fs::read_to_string(spool.join(n)).unwrap();
+    assert_eq!(read("000000040000000000000005"), "five", "archived first");
+    assert!(status.join("000000040000000000000005.done").exists());
+    // Legion ships them (a file half written aside is not one): rewound.
+    std::fs::remove_file(spool.join("000000040000000000000004")).unwrap();
+    std::fs::remove_file(spool.join("000000040000000000000005")).unwrap();
+    let mut h = old_primary();
+    let out = handle("prepare", &req, &mut h).unwrap();
+    assert!(out.contains("rewound"), "{out}");
+    assert!(h.ran("pg_rewind"));
+}
+
+/// Without archiving, nothing waits on a spool.
+#[test]
+fn without_archiving_a_rewind_does_not_wait_on_a_spool() {
+    let s = setup();
+    if !usable(&s) {
+        return;
+    }
+    std::fs::write(s.data.join("PG_VERSION"), "18\n").unwrap();
+    std::fs::create_dir(spool_dir(&s.data)).unwrap();
+    std::fs::write(spool_dir(&s.data).join("000000010000000000000001"), "").unwrap();
     let mut h = Fake::default();
     h.on("pg_controldata", true, CONTROL, "");
     h.on(
         "IDENTIFY_SYSTEM",
         true,
-        "7300000000000000001|2|0/5000000|
-",
+        "7300000000000000001|2|0/5000000|\n",
         "",
     );
     h.on("pg_rewind", true, "", "pg_rewind: Done!");
-    let out = handle("prepare", &serde_json::to_string(&req).unwrap(), &mut h).unwrap();
-    assert!(out.contains("rewound"), "{out}");
-    let read = |n: &str| std::fs::read_to_string(spool.join(n)).unwrap();
-    assert_eq!(
-        read("000000040000000000000004"),
-        "four",
-        "moved from the old spool"
-    );
-    assert_eq!(
-        read("000000040000000000000005"),
-        "five",
-        "archived before the rewind"
-    );
-    assert!(status.join("000000040000000000000005.done").exists());
-    assert!(!s.data.join(SPOOL).exists(), "the old spool went");
-    let conf = std::fs::read_to_string(s.data.join(CONF)).unwrap();
-    assert!(
-        conf.contains(&format!("\"{}\"'", spool.display())),
-        "archive_command spools beside: {conf}"
-    );
-}
-
-/// A spool that must stay in the data directory (its top a filesystem's)
-/// is shipped before anything replaces the data directory; one beside it
-/// never holds that up.
-#[test]
-fn a_spool_inside_the_data_directory_is_shipped_before_it_is_replaced() {
-    let dir = tempfile::tempdir().unwrap();
-    let data = dir.path().join("data");
-    let inside = data.join(SPOOL);
-    let beside = dir.path().join("data.legion_wal");
-    std::fs::create_dir_all(&inside).unwrap();
-    std::fs::create_dir_all(&beside).unwrap();
-    assert_eq!(unshipped_inside(&data, &inside), None, "empty");
-    std::fs::write(inside.join("000000010000000000000001.part"), "").unwrap();
-    assert_eq!(
-        unshipped_inside(&data, &inside),
-        None,
-        "only one being written"
-    );
-    std::fs::write(inside.join("000000010000000000000001"), "").unwrap();
-    assert_eq!(unshipped_inside(&data, &inside), Some(1));
-    std::fs::write(beside.join("000000010000000000000002"), "").unwrap();
-    assert_eq!(unshipped_inside(&data, &beside), None);
-    // Where it is: beside on the data directory's filesystem; inside when
-    // that cannot be told (no data directory yet).
-    let none = dir.path().join("none");
-    assert_eq!(
-        spool_dir(&none),
-        PathBuf::from(format!("{}/{SPOOL}", none.display()))
-    );
+    let req = request(&s, 1, Some(0), Some(Role::Replica));
+    assert!(handle("prepare", &req, &mut h).unwrap().contains("rewound"));
 }
