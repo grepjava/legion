@@ -729,7 +729,8 @@ fn service(
     // A replicated database's primary, which a drain, a rolling update or
     // a scale-down hands over to a replica before stopping (DESIGN.md
     // 6.9), and why it is to.
-    let primary = replication::hands_over(s, tasks, memory).map(|t| t.uid().to_owned());
+    let holding = replication::hands_over(s, tasks, memory);
+    let primary = holding.map(|(t, _)| t.uid().to_owned());
     let primary = primary.as_deref();
     let mut handover: Option<&'static str> = None;
 
@@ -1188,6 +1189,9 @@ fn service(
     }
 
     pause(s, tasks, nodes, plan);
+    // The switchover starts once a replica can take over; until then the
+    // primary waits, still serving.
+    let handover = handover.filter(|_| holding.is_some_and(|(_, ready)| ready));
     let replication = replication::pass(s, tasks, nodes, memory, now, handover, plan);
 
     // Status, from the tasks as they are now.

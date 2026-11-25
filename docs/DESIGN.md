@@ -1844,11 +1844,13 @@ How it was built, where it differs from the outline below:
   `spec.replication.request` (kind, target, force, a time), which the
   leader acts on once (`status.replication.handled`, `refused`).
 - **Draining, updates and scale-downs hand over** (below): the planner
-  holds back the stop of a healthy primary that has a healthy, streaming
-  replica staying on, reports it as `switchover`, and the replication pass
-  starts a switchover with the reason; once a replica is promoted the old
-  primary is a replica and stops like one. Without such a replica it is
-  stopped as before. A rolling update takes the primary's slot last.
+  holds back the stop of a healthy primary while another member staying on
+  runs a task, reports it as `switchover`, and once one of them is a
+  healthy replica streaming from it the replication pass starts a
+  switchover with the reason; once a replica is promoted the old primary
+  is a replica and stops like one. A replica still catching up (one the
+  update just replaced) is waited for, not passed over. With no other
+  member running, the primary is stopped as before. A rolling update takes the primary's slot last.
   Eviction by a `NoExecute` taint stays immediate.
 - **The console** has the Replication tab, alerts and metrics described
   below; the stalled alert is a change of primary under way over 3

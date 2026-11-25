@@ -5526,12 +5526,22 @@ impl World {
     /// `position`, until `done` holds; checks along the way that the
     /// primary's task never stops unless a switchover was recorded first.
     fn step_members(&mut self, position: u64, done: impl Fn(&mut World) -> bool) {
+        self.step_members_but(position, &[], done);
+    }
+
+    /// As [`Self::step_members`], the members of `silent` saying nothing.
+    fn step_members_but(
+        &mut self,
+        position: u64,
+        silent: &[u32],
+        done: impl Fn(&mut World) -> bool,
+    ) {
         use legion_api::replication::spi::Role;
         for _ in 0..80 {
             if done(self) {
                 return;
             }
-            self.members_say(1, |_| position, &[]);
+            self.members_say(1, |_| position, silent);
             let p = self.plan();
             let st = self.status("pg").replication;
             for a in &p.actions {
@@ -5672,4 +5682,63 @@ fn scaling_down_past_the_primary_switches_over_first() {
     w.members_say(1, |_| 500, &[]);
     w.settle();
     assert_eq!(w.running().len(), 1);
+}
+
+/// The lab's case: the replica an update replaced has not said yet that it
+/// is healthy when the update reaches the primary. The primary waits,
+/// serving, rather than being stopped with no one to take over; once the
+/// replica speaks, the switchover goes ahead.
+#[test]
+fn an_update_waits_for_the_replaced_replica_before_handing_over() {
+    use legion_api::replication::ChangeKind;
+    let spec = DATABASE.replace("replicas: 3", "replicas: 2");
+    let mut w = World::new();
+    database(&mut w, &spec);
+    w.members_say(1, |_| 500, &[]);
+    w.settle();
+    w.service("pg", &spec.replace("pg:17", "pg:18"));
+    let updated = |w: &mut World, i: u32| {
+        w.tasks.iter().any(|t| {
+            t.spec.slot == Some(i)
+                && active_running(t)
+                && t.spec.pod.containers[0].image == "pg:18"
+        })
+    };
+    // The replica replaced, and silent: the primary holds.
+    w.step_members_but(500, &[1], |w| updated(w, 1));
+    for _ in 0..20 {
+        w.members_say(1, |_| 500, &[1]);
+        let p = w.plan();
+        w.apply(p.actions);
+        w.agents();
+    }
+    assert!(!updated(&mut w, 0), "the primary was not replaced");
+    let primary = w
+        .tasks
+        .iter()
+        .find(|t| t.spec.slot == Some(0) && active_running(t))
+        .expect("the primary runs on")
+        .clone();
+    assert_eq!(primary.spec.pod.containers[0].image, "pg:17");
+    assert!(w.replication("pg").change.is_none(), "no switchover yet");
+    w.members_say(1, |_| 500, &[1]);
+    assert_eq!(
+        w.drain_wait_of(&primary.object.metadata.uid),
+        Some("switchover")
+    );
+
+    // It speaks: the switchover, then the old primary replaced.
+    w.step_members(500, |w| {
+        updated(w, 0) && updated(w, 1) && w.replication("pg").change.is_none()
+    });
+    let last = w.replication("pg").last_change.expect("a switchover");
+    assert_eq!(last.kind, ChangeKind::Switchover);
+    assert_eq!(last.to, "pg-1");
+}
+
+impl World {
+    /// Why the planner left task `uid` running this pass, if it said.
+    fn drain_wait_of(&mut self, uid: &str) -> Option<&'static str> {
+        self.plan().waits.get(uid).copied()
+    }
 }

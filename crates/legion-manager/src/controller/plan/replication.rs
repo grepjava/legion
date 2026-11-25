@@ -503,10 +503,17 @@ fn fresh<'m>(members: &'m Members, ns: &str, t: &Task) -> Option<&'m MemberRepor
 
 /// The primary's task, when a planned stop of it (a drain, a rolling
 /// update, a scale-down) is to wait for a switchover: no change is under
-/// way, it is healthy, and a member staying on is a healthy replica
-/// streaming from it. Without such a replica it is simply stopped, as
-/// there is no one to hand over to.
-pub(super) fn hands_over<'a>(s: &Service, tasks: &[&'a Task], memory: &Memory) -> Option<&'a Task> {
+/// way, it is healthy, and another member staying on runs a task. With it,
+/// whether the switchover can start: one of them is a healthy replica
+/// streaming from it. One still catching up (a replica just replaced by
+/// the update) is waited for, rather than the primary stopped. With no
+/// other member running, the primary is simply stopped: there is no one
+/// to hand over to.
+pub(super) fn hands_over<'a>(
+    s: &Service,
+    tasks: &[&'a Task],
+    memory: &Memory,
+) -> Option<(&'a Task, bool)> {
     s.spec.replication.as_ref()?;
     let st: ReplicationStatus = s
         .object
@@ -532,10 +539,13 @@ pub(super) fn hands_over<'a>(s: &Service, tasks: &[&'a Task], memory: &Memory) -
     };
     let primary = current.get(&p)?;
     let healthy = status(p).is_some_and(|x| x.role == Role::Primary && x.healthy);
-    let successor = (0..n)
-        .filter(|i| *i != p)
-        .any(|i| status(i).is_some_and(|x| x.role == Role::Replica && x.healthy && x.streaming));
-    (healthy && successor).then_some(*primary)
+    let others: Vec<u32> = (0..n)
+        .filter(|i| *i != p && current.contains_key(i))
+        .collect();
+    let successor = others
+        .iter()
+        .any(|i| status(*i).is_some_and(|x| x.role == Role::Replica && x.healthy && x.streaming));
+    (healthy && !others.is_empty()).then_some((*primary, successor))
 }
 
 /// Whether a replica is within `maximumLag` of the primary.

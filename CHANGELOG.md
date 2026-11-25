@@ -57,8 +57,9 @@ members are told their role only on nodes that read it.
 - **A primary is handed over, not stopped**: a drain of its node (or its
   data moving), a rolling update (which now replaces the replicas first and
   the primary last) and a scale-down past it switch over to a healthy
-  replica first; the drain shows it as `switchover` meanwhile. With no
-  healthy replica to hand over to, it stops as before.
+  replica first, waiting for one still catching up; the drain shows it as
+  `switchover` meanwhile. With no other member running, it stops as
+  before.
 
 ### Networking
 
