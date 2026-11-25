@@ -1044,6 +1044,35 @@ pub enum ReplicationCommand {
         #[arg(long)]
         keep: bool,
     },
+    /// A new Service, SERVICE, with FROM's database as it was at TO
+    /// (`replication.restore`): FROM's spec, as many members as --replicas
+    /// says, its first member's Volume restored from the newest backup of
+    /// FROM's members taken before TO, and the log FROM archived replayed
+    /// up to TO. FROM goes on as it is. `legion replication status
+    /// SERVICE` says how far it got.
+    Restore {
+        service: String,
+        #[arg(long)]
+        from: String,
+        /// RFC 3339 in UTC (2026-11-25T10:00:00Z); without it, all the log
+        /// there is.
+        #[arg(long)]
+        to: Option<String>,
+        /// Start from this backup, VOLUME@NAME as `legion volume backups`
+        /// lists them.
+        #[arg(long)]
+        backup: Option<String>,
+        /// The BackupTarget holding FROM's log, if not its `archive.target`.
+        #[arg(long)]
+        target: Option<String>,
+        /// Restore onto this node.
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        replicas: u32,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
     /// The primary is lost (`failover: manual`): promote TO once the old
     /// primary is fenced.
     Failover {

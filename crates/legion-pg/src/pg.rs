@@ -23,6 +23,8 @@ pub const SPOOL: &str = "legion_wal";
 /// PostgreSQL keeps its WAL (and says why) rather than the spool filling
 /// the Volume while Legion cannot ship.
 pub const SPOOL_MAX: usize = 1024;
+/// In the data directory: the restore it was set up for (`restore.id`).
+pub const RESTORE_ID: &str = "legion_restore.id";
 const HBA_BEGIN: &str = "# legion-replication begin";
 const HBA_END: &str = "# legion-replication end";
 
@@ -396,6 +398,7 @@ pub fn conf(
     me: &Member,
     primary: Option<&Member>,
     archive: Option<&str>,
+    restore: Option<&spi::Restore>,
 ) -> String {
     let mut c = format!(
         "# Written by Legion's replication plugin at each prepare and configure.\n\
@@ -420,6 +423,22 @@ pub fn conf(
             spool = spool_of(data),
         )),
         None => c.push_str("archive_mode = off\n"),
+    }
+    // Replaying a restored backup's log: from the files Legion fetched,
+    // else the member's own spool (what it archived before the backup
+    // and Legion had yet to ship), up to the time asked, then promoted on
+    // a timeline of its own.
+    if let Some(r) = restore {
+        c.push_str(&format!(
+            "restore_command = 'cp \"{log}/%f\" \"%p\" 2>/dev/null || cp \"{spool}/%f\" \"%p\"'\n\
+             recovery_target_timeline = 'latest'\n\
+             recovery_target_action = 'promote'\n",
+            log = r.log,
+            spool = spool_of(data),
+        ));
+        if let Some(to) = &r.to {
+            c.push_str(&format!("recovery_target_time = '{to}'\n"));
+        }
     }
     if let Some(p) = primary {
         let host = if p.address.is_empty() {
@@ -622,6 +641,7 @@ pub fn describe() -> Describe {
             seed_from_snapshot: false,
             probe: true,
             archive: true,
+            restore: true,
         },
     }
 }
@@ -688,6 +708,47 @@ impl<H: Host> Pg<'_, H> {
         self.data.join("PG_VERSION").exists()
     }
 
+    /// The restore this data directory was last set up for.
+    fn restored_as(&self) -> Option<String> {
+        std::fs::read_to_string(self.data.join(RESTORE_ID))
+            .ok()
+            .map(|s| s.trim().to_owned())
+    }
+
+    /// Replaying a restored log: set up for a restore, and PostgreSQL has
+    /// not finished it (it removes `recovery.signal` once promoted).
+    fn replaying(&self) -> bool {
+        self.data.join("recovery.signal").exists()
+            && !self.data.join("standby.signal").exists()
+            && self.restored_as().is_some()
+    }
+
+    /// `prepare` told to restore: the data directory set up to replay the
+    /// log, once per restore; told again (a restart while it replays, or
+    /// after), it carries on as it is.
+    fn set_up_restore(&mut self, r: &spi::Restore) -> R<bool> {
+        plain("restore.log", &r.log)?;
+        if let Some(to) = &r.to {
+            plain("restore.to", to)?;
+        }
+        if self.restored_as().as_deref() == Some(r.id.as_str()) {
+            return Ok(false);
+        }
+        if !self.has_database() {
+            return Err(Fail::new(format!(
+                "restore: {} holds no database: the backup restored is not of this data directory",
+                self.data.display()
+            )));
+        }
+        // The backup was taken as the server ran: its lock file, and a
+        // replica's signal, are the old member's.
+        let _ = std::fs::remove_file(self.data.join("postmaster.pid"));
+        let _ = std::fs::remove_file(self.data.join("standby.signal"));
+        self.write("recovery.signal", "", false)?;
+        self.write(RESTORE_ID, &format!("{}\n", r.id), false)?;
+        Ok(true)
+    }
+
     /// The configuration for this member's role: the settings file, the
     /// include, the access lines and, for a replica, its password file.
     fn configure_files(&mut self, primary: Option<&Member>) -> R<()> {
@@ -697,7 +758,15 @@ impl<H: Host> Pg<'_, H> {
             std::fs::create_dir_all(&spool)
                 .map_err(|e| Fail::new(format!("{}: {e}", spool.display())))?;
         }
-        let text = conf(&self.o, &self.data, &self.req.me, primary, exe.as_deref());
+        let restore = self.replaying().then(|| self.req.restore.clone()).flatten();
+        let text = conf(
+            &self.o,
+            &self.data,
+            &self.req.me,
+            primary,
+            exe.as_deref(),
+            restore.as_ref(),
+        );
         self.write(CONF, &text, false)?;
         let main = self.data.join("postgresql.conf");
         let current = std::fs::read_to_string(&main).unwrap_or_default();
@@ -733,6 +802,11 @@ impl<H: Host> Pg<'_, H> {
 
     fn prepare_primary(&mut self) -> R<Value> {
         let mut action = "none";
+        if let Some(r) = self.req.restore.clone()
+            && self.set_up_restore(&r)?
+        {
+            action = "restoring";
+        }
         if !self.has_database() {
             let empty = std::fs::read_dir(&self.data).map_or(true, |mut d| d.next().is_none());
             if !empty {
@@ -793,6 +867,9 @@ impl<H: Host> Pg<'_, H> {
         // Named primary: a promotion cut short is finished by starting
         // without the standby's signal.
         let _ = std::fs::remove_file(self.data.join("standby.signal"));
+        if self.replaying() && action == "none" {
+            action = "replaying";
+        }
         self.configure_files(None)?;
         Ok(json!({ "action": action }))
     }
@@ -1050,6 +1127,13 @@ impl<H: Host> Pg<'_, H> {
     fn status(&mut self) -> R<Status> {
         let line = self.psql(STATUS_SQL)?;
         let mut s = parse_status(&line, &self.req.topology.members)?;
+        // Replaying a restored log: the primary to be, not yet serving.
+        if s.role == Role::Replica && self.replaying() {
+            s.role = Role::Primary;
+            s.healthy = false;
+            s.lag = None;
+            s.detail.insert("restoring".into(), json!(true));
+        }
         if self.req.archive {
             s.spool = Some(spool_of(&self.data));
         }
@@ -1059,6 +1143,9 @@ impl<H: Host> Pg<'_, H> {
     fn promote(&mut self) -> R<Value> {
         if !self.is_me(self.req.topology.primary.as_ref()) {
             return Err(Fail::new("promote: the topology names another primary"));
+        }
+        if self.replaying() {
+            return Err(Fail::code(spi::RETRY, "replaying the restored log"));
         }
         if self.psql("SELECT pg_is_in_recovery()")? == "t" {
             let r = self.psql("SELECT pg_promote(true, 50)")?;
@@ -1076,6 +1163,9 @@ impl<H: Host> Pg<'_, H> {
         let recovery = self.psql("SELECT pg_is_in_recovery()")? == "t";
         let primary = self.req.topology.primary.clone();
         if self.is_me(primary.as_ref()) {
+            if recovery && self.replaying() {
+                return Err(Fail::code(spi::RETRY, "replaying the restored log"));
+            }
             if recovery {
                 return Err(Fail::new(
                     "named primary but not promoted: promote it first",

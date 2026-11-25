@@ -155,6 +155,16 @@ under `failover: manual`; `--force` passes over the lag and synchronous
 checks. Each is a request in the Service's spec, acted on once; a refused
 one is said in `status`.
 
+### `legion replication restore <NEW> --from <SERVICE> [--to <TIME>] [--replicas <N>] [-n <NS>]`
+A new Service NEW with SERVICE's database as it was at TIME (RFC 3339 in
+UTC; without it, all the log there is): SERVICE's spec, `--replicas`
+members (1 by default, `synchronous` lowered to fit), its first member's Volume restored from the newest
+backup of SERVICE's members taken before TIME, and the log SERVICE
+archived replayed up to TIME (docs/REPLICATION.md, Restoring to a point in
+time). `--backup VOLUME@NAME`, `--target TARGET` and `--node NODE` choose
+for it. SERVICE goes on as it is; `legion replication status NEW` says how
+far it got.
+
 ### `legion replication check -f <FILE> [-n <NS>] [--keep]`
 The conformance check (docs/REPLICATION.md): applies the replicated
 Service in FILE (`replicas: 3`, automatic failover), then drives its

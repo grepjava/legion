@@ -39,8 +39,14 @@ members are told their role only on nodes that read it.
   written (at least every minute), from every member so a failover leaves
   no gap, pruned to `keep` (7 days by default); `status.archive`,
   `legion replication status` and the console say how far it got, and
-  `archive-late` fires after three failed runs. A restore to a point in
-  time is by hand for now (docs/REPLICATION.md).
+  `archive-late` fires after three failed runs.
+- **A restore to a point in time** (`legion replication restore NEW --from
+  SVC --to TIME`, or `replication.restore` on a Service): a new Service
+  with SVC's database as it was at TIME, from the newest backup of its
+  members' Volumes taken before and the log it archived, replayed by the
+  plugin (a new SPI capability, `restore`; the PostgreSQL plugin has it).
+  SVC goes on as it is; `legion replication status` and the console's
+  Replication tab say how far the restore got.
 - **`legion replication check -f FILE`**: the conformance check, run on
   the cluster. It drives a plugin through every step of the contract,
   including a primary stopped dead and brought back, with markers written

@@ -7,6 +7,9 @@
 //! Each file goes once, by name: one the target holds already, as every
 //! member spools what it has and a replica's are a primary's too, is not
 //! sent again. A file leaves the spool only once the target holds it.
+//!
+//! For a restore to a point in time, the other way: the target's files
+//! fetched into a restored Volume, for the plugin to replay ([`fetch`]).
 
 use std::path::{Path, PathBuf};
 
@@ -23,6 +26,7 @@ pub(crate) trait Store: Send + Sync {
     /// Each file there, with when it was stored (Unix ms).
     fn dated(&self) -> Result<Vec<(String, i64)>, String>;
     fn remove(&self, name: &str) -> Result<(), String>;
+    fn get(&self, name: &str) -> Result<Vec<u8>, String>;
 }
 
 impl Store for crate::s3::S3 {
@@ -37,6 +41,89 @@ impl Store for crate::s3::S3 {
     }
     fn remove(&self, name: &str) -> Result<(), String> {
         crate::s3::S3::remove(self, name)
+    }
+    fn get(&self, name: &str) -> Result<Vec<u8>, String> {
+        crate::s3::S3::get(self, name)
+    }
+}
+
+/// What a fetch did.
+#[derive(Debug, Default, PartialEq, serde::Serialize)]
+pub(crate) struct Fetched {
+    pub fetched: u32,
+    pub bytes: u64,
+    /// Files in the directory after it.
+    pub files: u32,
+}
+
+/// Fetches each file `store` holds into `dir` (made if missing), written
+/// aside and renamed once whole, owned by `owner` (uid, gid) when given;
+/// one there already at its size stays.
+pub(crate) fn fetch(
+    dir: &Path,
+    store: &dyn Store,
+    owner: Option<(u32, u32)>,
+) -> Result<Fetched, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    own(dir, owner)?;
+    let mut done = Fetched::default();
+    let mut names: Vec<String> = store.dated()?.into_iter().map(|(n, _)| n).collect();
+    names.sort();
+    for name in &names {
+        if name.is_empty() || name.contains('/') || name.starts_with('.') {
+            continue;
+        }
+        let path = dir.join(name);
+        let data = store.get(name)?;
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() == data.len() as u64) {
+            done.files += 1;
+            continue;
+        }
+        let aside = dir.join(format!(".{name}.part"));
+        let size = data.len() as u64;
+        let written = (|| {
+            std::fs::write(&aside, &data)?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&aside)?
+                .sync_all()?;
+            std::fs::rename(&aside, &path)
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&aside);
+            return Err(format!("{}: {e}", path.display()));
+        }
+        own(&path, owner)?;
+        done.fetched += 1;
+        done.bytes += size;
+        done.files += 1;
+    }
+    Ok(done)
+}
+
+/// Gives `path` to `owner`, when given.
+fn own(path: &Path, owner: Option<(u32, u32)>) -> Result<(), String> {
+    #[cfg(unix)]
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::chown(path, Some(uid), Some(gid))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, owner);
+    Ok(())
+}
+
+/// The owner of `path`, to give what is fetched next to the data.
+fn owner_of(path: &Path) -> Option<(u32, u32)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| (m.uid(), m.gid()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
     }
 }
 
@@ -167,6 +254,66 @@ pub(crate) async fn run_session(
     Ok(())
 }
 
+/// A manager's session fetching a Service's archived log into a restored
+/// Volume, or removing it once replayed.
+pub(crate) async fn fetch_session(
+    v: &crate::transfer::Volumes,
+    namespace: &str,
+    o: legion_proto::v1::ArchiveFetch,
+    tx: &tokio::sync::mpsc::Sender<legion_proto::v1::SessionFrame>,
+) -> Result<(), Status> {
+    let ds = v.dataset(namespace, &o.volume)?;
+    if o.path.is_empty() {
+        return Err(Status::invalid_argument("path: a directory in the Volume"));
+    }
+    if o.remove {
+        let gone = crate::task::blocking(&v.sys, move |sys| {
+            let dir = host_path(sys, &ds, &o.path)?;
+            match std::fs::remove_dir_all(&dir) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    Err(format!("{}: {e}", dir.display()))
+                }
+                _ => Ok(Fetched::default()),
+            }
+        })
+        .await
+        .map_err(Status::failed_precondition)?;
+        let json = serde_json::to_vec(&gone).map_err(|e| Status::internal(e.to_string()))?;
+        let _ = tx.send(frame(Frame::Stdout(json))).await;
+        let _ = tx.send(frame(Frame::ExitCode(0))).await;
+        return Ok(());
+    }
+    let t = o
+        .target
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("no target"))?;
+    let spec: BackupTargetSpec = serde_json::from_str(&t.spec_json)
+        .map_err(|e| Status::invalid_argument(format!("target {}: {e}", t.name)))?;
+    let Some(s3) = &spec.s3 else {
+        return Err(Status::failed_precondition(format!(
+            "target {}: a database's log is on an s3 target",
+            t.name
+        )));
+    };
+    if o.of.is_empty() || o.of.contains('/') {
+        return Err(Status::invalid_argument("of: <namespace>.<service>"));
+    }
+    let rt = tokio::runtime::Handle::current();
+    let store = crate::s3::S3::new(s3, &t.key, &format!("{}/wal", o.of), rt)
+        .map_err(Status::failed_precondition)?;
+    let fetched = crate::task::blocking(&v.sys, move |sys| {
+        let top = host_path(sys, &ds, "")?;
+        let dir = host_path(sys, &ds, &o.path)?;
+        fetch(&dir, &store, owner_of(&top))
+    })
+    .await
+    .map_err(Status::failed_precondition)?;
+    let json = serde_json::to_vec(&fetched).map_err(|e| Status::internal(e.to_string()))?;
+    let _ = tx.send(frame(Frame::Stdout(json))).await;
+    let _ = tx.send(frame(Frame::ExitCode(0))).await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +353,49 @@ mod tests {
             self.0.lock().unwrap().remove(name);
             Ok(())
         }
+        fn get(&self, name: &str) -> Result<Vec<u8>, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .get(name)
+                .map(|(d, _)| d.clone())
+                .ok_or_else(|| format!("{name}: no such object"))
+        }
+    }
+
+    #[test]
+    fn the_archived_log_is_fetched_whole_and_once() {
+        let held = Held::default();
+        for (n, d) in [
+            ("000000010000000000000001", "a"),
+            ("000000020000000000000002", "bb"),
+            ("00000002.history", "1\t0/2000000\tno reason"),
+        ] {
+            held.0
+                .lock()
+                .unwrap()
+                .insert(n.into(), (d.as_bytes().to_vec(), 1));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let into = dir.path().join("legion_restore");
+        let done = fetch(&into, &held, None).unwrap();
+        assert_eq!((done.fetched, done.files), (3, 3));
+        assert_eq!(
+            std::fs::read(into.join("000000020000000000000002")).unwrap(),
+            b"bb"
+        );
+        // Again, after one more was archived: only that one is fetched.
+        held.0
+            .lock()
+            .unwrap()
+            .insert("000000020000000000000003".into(), (b"c".to_vec(), 2));
+        let again = fetch(&into, &held, None).unwrap();
+        assert_eq!((again.fetched, again.bytes, again.files), (1, 1, 4));
+        let names: Vec<String> = std::fs::read_dir(&into)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(names.iter().all(|n| !n.ends_with(".part")), "{names:?}");
     }
 
     #[test]

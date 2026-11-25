@@ -82,6 +82,11 @@ message SessionOpen {
     // removed, the target pruned when asked. An agent from before it ends
     // the session with an error: the session has no action.
     ArchiveRun archive_run = 25;
+    // Managers only, a restore to a point in time (DESIGN.md 6.9): the
+    // log a Service archived fetched into a Volume, or removed from it once
+    // replayed. An agent from before it ends the session with an error:
+    // the session has no action.
+    ArchiveFetch archive_fetch = 26;
   }
 }
 
@@ -381,6 +386,20 @@ message ArchiveRun {
   string of = 4;
   uint64 keep_seconds = 5;
   bool prune = 6;
+}
+
+// Fetches every file the target holds under `<prefix>/<of>/wal/` into the
+// directory `path` of the Volume `volume` (its mountpoint's relative path),
+// made if missing and owned as the Volume's top directory is, each file
+// written aside and renamed once whole; one there already at its size is
+// not fetched again. With `remove`, removes the directory instead. Says
+// `{"fetched", "bytes", "files"}` as JSON on `stdout`, then `exit_code` 0.
+message ArchiveFetch {
+  string volume = 1;
+  string path = 2;
+  BackupTargetAccess target = 3;
+  string of = 4;
+  bool remove = 5;
 }
 
 // The Volume's backups the target holds, oldest first, as `snapshots`.

@@ -60,6 +60,174 @@ pub struct Replication {
     /// The database's log shipped to a BackupTarget as it is written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive: Option<Archive>,
+    /// A new Service's data restored to a point in time, from another's
+    /// backups and archived log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<Restore>,
+}
+
+/// A restore to a point in time (`replication.restore`). Before the
+/// Service's first member starts, the leader restores a backup of one of
+/// Service `from`'s members' Volumes as the first member's Volume, and
+/// fetches the log `from` archived next to the data
+/// ([`RESTORE_LOG`]). The plugin then replays the log up to `to`, and the
+/// member becomes the primary there, on a timeline of its own; the other
+/// members copy it as any replica does. It is done once: a Service whose
+/// first member's Volume exists already is not restored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Restore {
+    /// The Service, in this namespace, whose backups and log are restored;
+    /// it may be gone.
+    pub from: String,
+    /// Replayed up to this time, RFC 3339 in UTC
+    /// (`2026-11-25T10:00:00Z`); unset, all the log there is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// The BackupTarget holding the log; unset, `from`'s
+    /// `archive.target`, else this Service's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// The BackupTarget holding the Volume backups; unset, the claim's
+    /// `backup.target` (`from`'s, else this Service's), else `target`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backups: Option<String>,
+    /// The backup to start from, `VOLUME@NAME` as `legion volume backups`
+    /// lists them; unset, the newest of `from`'s members' backups taken
+    /// before `to`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<String>,
+    /// The claim holding the database; unset, the pod's only one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<String>,
+    /// The node restored onto; unset, a ready one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+}
+
+/// Where the fetched log is put, in the restored Volume.
+pub const RESTORE_LOG: &str = "legion_restore";
+
+impl Restore {
+    /// `to` in Unix milliseconds.
+    pub fn to_ms(&self) -> Option<i64> {
+        self.to.as_deref().and_then(crate::volume::iso_ms)
+    }
+
+    /// What tells one restore from another: a different one is set up
+    /// anew.
+    pub fn id(&self) -> String {
+        format!("{}@{}", self.from, self.to.as_deref().unwrap_or("end"))
+    }
+
+    fn admit(&self, path: &str, claims: &[&str]) -> Result<(), Invalid> {
+        crate::validate_name(&self.from)
+            .map_err(|e| Invalid::new(field(path, "from"), e.to_string()))?;
+        if let Some(to) = &self.to {
+            let utc = to.ends_with('Z') && to.contains('T');
+            if !utc || crate::volume::iso_ms(to).is_none() {
+                return Err(Invalid::new(
+                    field(path, "to"),
+                    format!("{to:?}: a time in UTC, as 2026-11-25T10:00:00Z"),
+                ));
+            }
+        }
+        if let Some(b) = &self.backup
+            && !b
+                .split_once('@')
+                .is_some_and(|(v, n)| !v.is_empty() && !n.is_empty())
+        {
+            return Err(Invalid::new(
+                field(path, "backup"),
+                format!("{b:?}: VOLUME@NAME, as `legion volume backups` lists them"),
+            ));
+        }
+        match (&self.claim, claims) {
+            (Some(c), _) if !claims.contains(&c.as_str()) => Err(Invalid::new(
+                field(path, "claim"),
+                format!("{c:?}: no such claim in the pod"),
+            )),
+            (None, [_]) | (Some(_), _) => Ok(()),
+            (None, _) => Err(Invalid::new(
+                field(path, "claim"),
+                "name the claim holding the database: the pod has none or several",
+            )),
+        }
+    }
+
+    /// The claim restored.
+    pub fn claim<'a>(&'a self, claims: &[&'a str]) -> Option<&'a str> {
+        self.claim.as_deref().or(match claims {
+            [only] => Some(*only),
+            _ => None,
+        })
+    }
+}
+
+/// Where a restore stands (`status.restore`), as the leader writes it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreStatus {
+    pub phase: RestorePhase,
+    /// The restore it is for ([`Restore::id`]).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    /// The backup restored, `VOLUME@NAME`, and when it was taken (Unix ms).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub backup: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taken_ms: Option<i64>,
+    /// The Volume restored, and its node.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub volume: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub node: String,
+    /// The log fetched: how many files, and where the container sees them.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fetched: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub log: String,
+    /// Tries failed in a row, and why the last did.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub failures: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    /// When it last changed, Unix ms.
+    #[serde(default)]
+    pub at: i64,
+    /// The fetched log was removed from the Volume, once replayed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cleaned: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestorePhase {
+    /// The backup and the log are being put in place; no member runs.
+    #[default]
+    Restoring,
+    /// In place: the first member replays the log.
+    Replaying,
+    /// The first member became the primary.
+    Done,
+    /// The first member's Volume was there already: nothing restored.
+    Skipped,
+}
+
+impl RestorePhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RestorePhase::Restoring => "restoring",
+            RestorePhase::Replaying => "replaying",
+            RestorePhase::Done => "done",
+            RestorePhase::Skipped => "skipped",
+        }
+    }
+
+    /// The members may run: the data is in place, or none was restored.
+    pub fn lets_run(self) -> bool {
+        self != RestorePhase::Restoring
+    }
 }
 
 /// Log archiving (`replication.archive`): every member's plugin keeps each
@@ -154,7 +322,11 @@ impl Replication {
         path: &str,
         replicas: u32,
         containers: &[&str],
+        claims: &[&str],
     ) -> Result<(), Invalid> {
+        if let Some(r) = &self.restore {
+            r.admit(&field(path, "restore"), claims)?;
+        }
         match (&self.plugin, self.command.is_empty()) {
             (Some(p), true) => check_plugin(&field(path, "plugin"), p)?,
             (None, false) => check_absolute(&field(path, "command"), &self.command[0])?,
@@ -405,6 +577,10 @@ pub struct TaskReplication {
     pub role: spi::Role,
     #[serde(default)]
     pub topology: spi::Topology,
+    /// The first member, while it replays a restored log: what its
+    /// `prepare` is told.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<spi::Restore>,
 }
 
 impl TaskReplication {
@@ -433,6 +609,9 @@ impl TaskReplication {
             reclone: false,
             probe: None,
             archive: self.config.archive.is_some(),
+            restore: (operation == "prepare")
+                .then(|| self.restore.clone())
+                .flatten(),
         }
     }
 }
@@ -508,6 +687,28 @@ pub mod spi {
         /// ship (capability `archive`), and say where in `status`.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         pub archive: bool,
+        /// `prepare` of the primary only (capability `restore`): the data
+        /// directory holds a restored backup; replay the log from `log`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub restore: Option<Restore>,
+    }
+
+    /// A restore to a point in time, as `prepare` is told it: the data
+    /// directory holds a backup taken while the database ran; replay the
+    /// log files in `log` (a directory as the container sees it, named as
+    /// the database archived them) up to `to` (RFC 3339, UTC; unset, all of
+    /// them), then run as the primary. `id` tells one restore from another:
+    /// told the same again (a restart while replaying, or once done) the
+    /// plugin carries on rather than start over. Until it is done, `status`
+    /// says `role: primary`, `healthy: false`, and `detail.restoring`, and
+    /// `configure` answers `retry`.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Restore {
+        pub id: String,
+        pub log: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub to: Option<String>,
     }
 
     /// What `probe` does, for the conformance check
@@ -686,6 +887,9 @@ pub mod spi {
         /// Keeps its log for Legion to ship, when asked (`archive`).
         #[serde(default)]
         pub archive: bool,
+        /// Replays a restored backup's log to a point in time (`restore`).
+        #[serde(default)]
+        pub restore: bool,
     }
 
     impl Describe {
@@ -705,6 +909,9 @@ pub mod spi {
             }
             if r.archive.is_some() && !self.capabilities.archive {
                 return Some("`archive` is set; the plugin keeps no log for Legion to ship".into());
+            }
+            if r.restore.is_some() && !self.capabilities.restore {
+                return Some("`restore` is set; the plugin replays no restored log".into());
             }
             None
         }
@@ -805,7 +1012,7 @@ mod tests {
         assert_eq!(r.failover, Failover::Automatic);
         assert_eq!(r.failover_after, Duration::from_secs(30));
         assert_eq!(r.reclone, Reclone::Deny);
-        r.admit("replication", 3, &["postgres"]).unwrap();
+        r.admit("replication", 3, &["postgres"], &["data"]).unwrap();
         assert_eq!(r.container(&["postgres"]), Some("postgres"));
         assert_eq!(
             r.argv("status"),
@@ -860,14 +1067,16 @@ mod tests {
             (&named, &["pg"][..], "replication.container"),
             (&plugin(), &["pg", "exporter"][..], "replication.container"),
         ] {
-            let e = r.admit("replication", 3, containers).unwrap_err();
+            let e = r
+                .admit("replication", 3, containers, &["data"])
+                .unwrap_err();
             assert_eq!(e.path, at, "{e}");
         }
         Replication {
             synchronous: 2,
             ..plugin()
         }
-        .admit("replication", 3, &["pg"])
+        .admit("replication", 3, &["pg"], &["data"])
         .unwrap();
     }
 
@@ -974,6 +1183,7 @@ mod tests {
             reclone: false,
             probe: None,
             archive: false,
+            restore: None,
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["spiVersion"], "1");
@@ -981,5 +1191,78 @@ mod tests {
         assert_eq!(v["role"], "replica");
         assert!(v["topology"].get("primary").is_none());
         assert_eq!(serde_json::from_value::<Request>(v).unwrap(), r);
+    }
+
+    #[test]
+    fn a_restore_is_admitted_with_a_time_in_utc_and_its_claim() {
+        let with = |restore: serde_json::Value| -> Replication {
+            serde_json::from_value(serde_json::json!({ "plugin": "postgres", "restore": restore }))
+                .unwrap()
+        };
+        let ok = with(serde_json::json!({ "from": "pg", "to": "2026-11-25T10:00:00Z" }));
+        ok.admit("replication", 2, &["pg"], &["data"]).unwrap();
+        let r = ok.restore.as_ref().unwrap();
+        assert_eq!(r.id(), "pg@2026-11-25T10:00:00Z");
+        assert_eq!(r.to_ms(), crate::volume::iso_ms("2026-11-25T10:00:00.000Z"));
+        assert_eq!(r.claim(&["data"]), Some("data"));
+        assert_eq!(
+            with(serde_json::json!({ "from": "pg" }))
+                .restore
+                .unwrap()
+                .id(),
+            "pg@end"
+        );
+        for (bad, path) in [
+            (
+                serde_json::json!({ "from": "pg", "to": "2026-11-25 10:00" }),
+                "replication.restore.to",
+            ),
+            (
+                serde_json::json!({ "from": "pg", "to": "2026-11-25T10:00:00+08:00" }),
+                "replication.restore.to",
+            ),
+            (
+                serde_json::json!({ "from": "pg", "to": "2026-13-25T10:00:00Z" }),
+                "replication.restore.to",
+            ),
+            (
+                serde_json::json!({ "from": "pg", "backup": "nameonly" }),
+                "replication.restore.backup",
+            ),
+            (
+                serde_json::json!({ "from": "Bad_Name" }),
+                "replication.restore.from",
+            ),
+            (
+                serde_json::json!({ "from": "pg", "claim": "other" }),
+                "replication.restore.claim",
+            ),
+        ] {
+            let e = with(bad.clone())
+                .admit("replication", 2, &["pg"], &["data"])
+                .unwrap_err();
+            assert_eq!(e.path, path, "{bad}: {e:?}");
+        }
+        // Several claims: name the one restored.
+        let e = ok
+            .admit("replication", 2, &["pg"], &["data", "logs"])
+            .unwrap_err();
+        assert_eq!(e.path, "replication.restore.claim");
+    }
+
+    #[test]
+    fn backup_names_tell_when_they_were_taken() {
+        use crate::volume::{iso_ms, stamp, stamp_ms};
+        let ms = iso_ms("2026-11-22T14:30:05Z").unwrap();
+        assert_eq!(stamp(ms), "20261122T143005Z");
+        assert_eq!(stamp_ms("legion-bk-offsite-20261122T143005Z"), Some(ms));
+        assert_eq!(
+            stamp_ms("lab/data.pg-pg-0/legion-bk-wal-20261122T143005Z.zfs"),
+            Some(ms)
+        );
+        assert_eq!(stamp_ms("legion-bk-offsite"), None);
+        assert_eq!(stamp_ms("x-2026112XT143005Z"), None);
+        assert_eq!(iso_ms("2026-11-22T14:30:05"), Some(ms));
+        assert_eq!(iso_ms("2026-11-22T14:30"), None);
     }
 }

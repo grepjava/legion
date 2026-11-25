@@ -151,6 +151,9 @@ async fn run<R: Runtime>(
         Some(Action::ArchiveRun(o)) => {
             crate::archive::run_session(&volumes, &open.namespace, o, &tx).await
         }
+        Some(Action::ArchiveFetch(o)) => {
+            crate::archive::fetch_session(&volumes, &open.namespace, o, &tx).await
+        }
         Some(Action::Doctor(_)) => crate::doctor::send(&volumes, &tx).await,
         Some(Action::Connections(_)) => crate::connections::send(&volumes, &tx).await,
         Some(Action::Files(opts)) => {

@@ -99,6 +99,59 @@ pub fn stamp(ms: i64) -> String {
     )
 }
 
+/// `2026-11-25T04:05:06.123Z` (or without the fraction, or the `Z`) in
+/// Unix milliseconds, read as UTC.
+pub fn iso_ms(t: &str) -> Option<i64> {
+    let (date, time) = t.trim().trim_end_matches('Z').split_once('T')?;
+    let mut d = date.split('-').map(|x| x.parse::<i64>());
+    let (y, m, day) = (d.next()?.ok()?, d.next()?.ok()?, d.next()?.ok()?);
+    let (hms, frac) = time.split_once('.').unwrap_or((time, "0"));
+    let mut h = hms.split(':').map(|x| x.parse::<i64>());
+    let (hh, mm, ss) = (h.next()?.ok()?, h.next()?.ok()?, h.next()?.ok()?);
+    if d.next().is_some()
+        || h.next().is_some()
+        || !(1..=12).contains(&m)
+        || !(1..=31).contains(&day)
+        || hh > 23
+        || mm > 59
+        || ss > 60
+        || !frac.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let ms: i64 = format!("{frac:0<3}")[..3].parse().ok()?;
+    // Days since 1970-01-01 of a civil date (Howard Hinnant's algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(((days * 24 + hh) * 60 + mm) * 60_000 + ss * 1000 + ms)
+}
+
+/// The time a snapshot's or backup's name ends with ([`stamp`]), in Unix
+/// milliseconds: `legion-bk-offsite-20261122T143005Z` (`.zfs` after it,
+/// as a target holds it, is passed over).
+pub fn stamp_ms(name: &str) -> Option<i64> {
+    let name = name.trim_end_matches(".zfs");
+    let s = name.get(name.len().checked_sub(16)?..)?;
+    let b = s.as_bytes();
+    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
+    if !(digits(0..8) && b[8] == b'T' && digits(9..15) && b[15] == b'Z') {
+        return None;
+    }
+    iso_ms(&format!(
+        "{}-{}-{}T{}:{}:{}Z",
+        &s[0..4],
+        &s[4..6],
+        &s[6..8],
+        &s[9..11],
+        &s[11..13],
+        &s[13..15]
+    ))
+}
+
 /// Checks schedules given at `field`: each at least a minute apart, none
 /// twice, keeping 1 to 1000, at most 8.
 pub fn check_schedules(schedules: &[SnapshotSchedule], field: &str) -> Result<(), Invalid> {

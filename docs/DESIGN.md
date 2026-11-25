@@ -1871,8 +1871,18 @@ How it was built, where it differs from the outline below:
   `keep`. Credentials never enter the jail. `status.archive` is the
   archiver's alone, carried over by the controller; three failed runs in
   a row raise `archive-late`.
-- **Not built yet**: a restore to a point in time done by Legion (by hand
-  for now, docs/REPLICATION.md).
+- **A restore to a point in time** (`replication.restore`, `legion
+  replication restore NEW --from SVC --to TIME`): a new Service, whose
+  tasks the controller holds back until the leader's restorer has the
+  first member's data in place: the newest backup of `from`'s members'
+  Volumes taken before `to` restored as `<claim>-<new>-0` on an active
+  node (`BackupRestore`), and `from`'s archived log fetched into it
+  (`ArchiveFetch`, into `legion_restore`). The first member's `prepare` is
+  then told to `restore` (SPI capability `restore`); the others are told
+  no primary until it serves, which makes the restore `done`, and the
+  fetched log is removed. `status.restore` is the restorer's but for
+  `done`, which the controller says. A first member's Volume there
+  already is never restored over (`skipped`).
 
 **The spec.** The fields go on a stateful Service:
 

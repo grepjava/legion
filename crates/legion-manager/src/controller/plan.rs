@@ -12,6 +12,7 @@ use std::time::Duration;
 use legion_api::image::ImageStatus;
 use legion_api::node::{Availability, NodeSpec, NodeState, NodeStatus};
 use legion_api::quota::{Quota, Usage};
+use legion_api::replication::{RestorePhase, RestoreStatus};
 use legion_api::security::NamespaceSecurity;
 use legion_api::service::FailureAction;
 use legion_api::service::{
@@ -693,6 +694,18 @@ fn service(
     let Some(pins) = pins(&s.spec.pod, images.as_ref(), nodes, s.covered) else {
         return;
     };
+    // A restore to a point in time (DESIGN.md 6.9) puts the first member's
+    // data in place before anything runs: the leader's restorer says when
+    // (`status.restore`).
+    let restore = restore_of(s);
+    if s.spec
+        .replication
+        .as_ref()
+        .is_some_and(|r| r.restore.is_some())
+        && !restore.as_ref().is_some_and(|r| r.phase.lets_run())
+    {
+        return;
+    }
     let mut update = match track_update(s, tasks, &previous, memory, plan) {
         Some(update) => update,
         None => return,
@@ -1233,6 +1246,13 @@ fn service(
             .and_then(|r| r.archive.as_ref())
             .and_then(|_| s.object.status.get("archive"))
             .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        restore: restore.map(|mut r| {
+            // Done once the restored member has served as the primary.
+            if r.phase == RestorePhase::Replaying && replication_served(s, tasks) {
+                r.phase = RestorePhase::Done;
+            }
+            r
+        }),
     };
     let status = serde_json::to_value(&status).expect("status serialises");
     if s.object.status != status {
@@ -1241,6 +1261,27 @@ fn service(
         plan.actions
             .push(Action::Update(o, s.object.metadata.version));
     }
+}
+
+/// What the leader's restorer last wrote of a restore, while the Service
+/// asks for one.
+fn restore_of(s: &Service) -> Option<RestoreStatus> {
+    s.spec.replication.as_ref()?.restore.as_ref()?;
+    s.object
+        .status
+        .get("restore")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
+/// The restored member serves as the primary: the replication pass saw it
+/// healthy as one (it records where it got to), and it runs.
+fn replication_served(s: &Service, tasks: &[&Task]) -> bool {
+    let st: Option<legion_api::replication::ReplicationStatus> = s
+        .object
+        .status
+        .get("replication")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    st.is_some_and(|st| st.primary_position.is_some()) && tasks.iter().any(|t| t.active())
 }
 
 /// The Volumes a stateful service's claims ask for, one per claim and

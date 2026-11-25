@@ -126,6 +126,7 @@ fn request(s: &Setup, me: u32, primary: Option<u32>, role: Option<Role>) -> Stri
         reclone: false,
         probe: None,
         archive: false,
+        restore: None,
     };
     serde_json::to_string(&r).unwrap()
 }
@@ -613,6 +614,7 @@ fn asked_to_archive_every_member_spools_its_wal_through_the_plugin() {
         &member(1),
         None,
         Some("/.legion/replication/postgres"),
+        None,
     );
     assert!(c.contains("archive_mode = always\n"), "{c}");
     assert!(
@@ -622,7 +624,14 @@ fn asked_to_archive_every_member_spools_its_wal_through_the_plugin() {
         "{c}"
     );
     assert!(c.contains("archive_timeout = 60\n"), "{c}");
-    let c = conf(&o, Path::new("/var/db/pg/data"), &member(1), None, None);
+    let c = conf(
+        &o,
+        Path::new("/var/db/pg/data"),
+        &member(1),
+        None,
+        None,
+        None,
+    );
     assert!(c.contains("archive_mode = off\n"), "{c}");
 }
 
@@ -649,4 +658,102 @@ fn archive_wal_keeps_each_file_whole_once_and_refuses_past_a_full_spool() {
     }
     let e = archive_wal(&wal, "000000010000000000000004", &spool).unwrap_err();
     assert!(e.contains("Legion has not shipped"), "{e}");
+}
+
+#[test]
+fn a_restored_backup_replays_the_log_to_the_time_asked_once() {
+    let s = setup();
+    if !usable(&s) {
+        return;
+    }
+    let data = s.data.clone();
+    // A backup of a replica, taken as it ran.
+    for f in ["PG_VERSION", "standby.signal", "postmaster.pid"] {
+        std::fs::write(data.join(f), "x\n").unwrap();
+    }
+    let restore = spi::Restore {
+        id: "pg@2026-11-25T10:00:00Z".into(),
+        log: "/var/db/pg/legion_restore".into(),
+        to: Some("2026-11-25T10:00:00Z".into()),
+    };
+    let mut req: Request =
+        serde_json::from_str(&request(&s, 0, Some(0), Some(Role::Primary))).unwrap();
+    req.restore = Some(restore.clone());
+    let req = serde_json::to_string(&req).unwrap();
+    let out = handle("prepare", &req, &mut Fake::default()).unwrap();
+    assert!(out.contains("restoring"), "{out}");
+    assert!(data.join("recovery.signal").exists());
+    assert!(!data.join("standby.signal").exists());
+    assert!(!data.join("postmaster.pid").exists());
+    let conf = std::fs::read_to_string(data.join(CONF)).unwrap();
+    assert!(
+        conf.contains("restore_command = 'cp \"/var/db/pg/legion_restore/%f\" \"%p\""),
+        "{conf}"
+    );
+    assert!(
+        conf.contains("recovery_target_time = '2026-11-25T10:00:00Z'"),
+        "{conf}"
+    );
+    assert!(
+        conf.contains("recovery_target_action = 'promote'"),
+        "{conf}"
+    );
+
+    // Replaying: status says the primary to be, not healthy; configure and
+    // promote wait.
+    let mut h = Fake::default();
+    h.on("pg_is_in_recovery(), ", true, "t|1|100|f||0||", "");
+    let st: Status = serde_json::from_str(&handle("status", &req, &mut h).unwrap()).unwrap();
+    assert_eq!((st.role, st.healthy), (Role::Primary, false));
+    assert_eq!(st.detail["restoring"], json!(true));
+    let mut h = Fake::default();
+    h.on("SELECT pg_is_in_recovery()", true, "t", "");
+    let e = handle("configure", &req, &mut h).unwrap_err();
+    assert_eq!(e.code, spi::RETRY);
+    let e = handle("promote", &req, &mut Fake::default()).unwrap_err();
+    assert_eq!(e.code, spi::RETRY);
+
+    // A restart while replaying: carried on, not set up anew.
+    std::fs::write(data.join("recovery.signal"), "kept").unwrap();
+    let out = handle("prepare", &req, &mut Fake::default()).unwrap();
+    assert!(out.contains("replaying"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(data.join("recovery.signal")).unwrap(),
+        "kept"
+    );
+
+    // Done (PostgreSQL removed the signal): told again, nothing is replayed.
+    std::fs::remove_file(data.join("recovery.signal")).unwrap();
+    let out = handle("prepare", &req, &mut Fake::default()).unwrap();
+    assert!(out.contains("\"none\""), "{out}");
+    assert!(!data.join("recovery.signal").exists());
+    let conf = std::fs::read_to_string(data.join(CONF)).unwrap();
+    assert!(!conf.contains("restore_command"), "{conf}");
+    assert!(describe().capabilities.restore);
+}
+
+#[test]
+fn a_restore_onto_no_database_is_refused() {
+    let s = setup();
+    if !usable(&s) {
+        return;
+    }
+    let mut req: Request =
+        serde_json::from_str(&request(&s, 0, Some(0), Some(Role::Primary))).unwrap();
+    req.restore = Some(spi::Restore {
+        id: "pg@end".into(),
+        log: "/var/db/pg/legion_restore".into(),
+        to: None,
+    });
+    let e = handle(
+        "prepare",
+        &serde_json::to_string(&req).unwrap(),
+        &mut Fake::default(),
+    )
+    .unwrap_err();
+    assert!(e.message.contains("holds no database"), "{}", e.message);
+    assert!(
+        !s.data.join("PG_VERSION").exists(),
+        "no database made in its place"
+    );
 }

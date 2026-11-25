@@ -4,7 +4,9 @@
   // and lag as it last said, a change of primary under way and the last
   // one. A switchover or a failover is asked for as `legion replication`
   // asks: the Service's `replication.request`, reviewed before it is saved
-  // (SpecChange), which the leader acts on once.
+  // (SpecChange), which the leader acts on once. A Service made by a
+  // restore to a point in time says where the restore stands, before any
+  // member runs too.
   import { bytes, type LObject } from './api.ts';
   import { cannotWrite } from './session.svelte.ts';
   import { t } from './i18n.svelte.ts';
@@ -57,6 +59,16 @@
   const name = $derived(service.metadata.name);
   const why = $derived(cannotWrite(ns));
   const st = $derived(service.status?.replication as Status | undefined);
+  interface Restore {
+    phase: string;
+    backup?: string;
+    takenMs?: number;
+    node?: string;
+    fetched?: number;
+    failures?: number;
+    message?: string;
+  }
+  const restore = $derived(service.status?.restore as Restore | undefined);
   const want = $derived(service.spec?.replication ?? {});
   const replicas = $derived((service.spec?.replicas ?? 1) as number);
   const members = $derived(Array.from({ length: replicas }, (_, i) => `${name}-${i}`));
@@ -144,6 +156,26 @@
   );
 </script>
 
+{#if restore && want.restore}
+  <p class={restore.failures ? 'error' : 'muted'} role="status">
+    {restore.backup
+      ? t('Restore {phase}: {from} to {to}, from the backup {backup} taken {taken} on {node}; {n} files of log.', {
+          phase: restore.phase,
+          from: want.restore.from,
+          to: want.restore.to ?? t('the end of its log'),
+          backup: restore.backup,
+          taken: restore.takenMs ? new Date(restore.takenMs).toISOString() : '?',
+          node: restore.node ?? '?',
+          n: restore.fetched ?? 0
+        })
+      : t('Restore {phase}: {from} to {to}.', {
+          phase: restore.phase,
+          from: want.restore.from,
+          to: want.restore.to ?? t('the end of its log')
+        })}
+    {#if restore.message}{restore.message}{/if}
+  </p>
+{/if}
 {#if !st}
   <p class="muted">{t('The leader has not recorded this database yet.')}</p>
 {:else}

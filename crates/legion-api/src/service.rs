@@ -191,7 +191,13 @@ impl ServiceSpec {
             .iter()
             .map(|c| c.name.as_str())
             .collect();
-        r.admit("replication", self.replicas.unwrap_or(1), &containers)?;
+        let claims: Vec<&str> = self.pod.claims().map(|(name, _)| name).collect();
+        r.admit(
+            "replication",
+            self.replicas.unwrap_or(1),
+            &containers,
+            &claims,
+        )?;
         // One mechanism per Volume: the database copies itself.
         if let Some((name, _)) = self.pod.claims().find(|(_, c)| c.replica.is_some()) {
             return Err(Invalid::new(
@@ -1827,6 +1833,11 @@ pub struct ServiceStatus {
     /// writes it; carried over by the controller's pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive: Option<crate::replication::ArchiveStatus>,
+    /// Where `replication.restore` stands, as the leader's restorer
+    /// writes it; carried over by the controller's pass, which says when
+    /// it is done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<crate::replication::RestoreStatus>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

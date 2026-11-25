@@ -5699,9 +5699,7 @@ fn an_update_waits_for_the_replaced_replica_before_handing_over() {
     w.service("pg", &spec.replace("pg:17", "pg:18"));
     let updated = |w: &mut World, i: u32| {
         w.tasks.iter().any(|t| {
-            t.spec.slot == Some(i)
-                && active_running(t)
-                && t.spec.pod.containers[0].image == "pg:18"
+            t.spec.slot == Some(i) && active_running(t) && t.spec.pod.containers[0].image == "pg:18"
         })
     };
     // The replica replaced, and silent: the primary holds.
@@ -5741,4 +5739,90 @@ impl World {
     fn drain_wait_of(&mut self, uid: &str) -> Option<&'static str> {
         self.plan().waits.get(uid).copied()
     }
+}
+
+impl World {
+    /// The restorer's word on Service `name` (`status.restore`).
+    fn restorer_says(&mut self, name: &str, restore: serde_json::Value) {
+        let s = self
+            .services
+            .iter_mut()
+            .find(|s| s.object.metadata.name == name)
+            .unwrap();
+        if !s.object.status.is_object() {
+            s.object.status = serde_json::json!({});
+        }
+        s.object.status["restore"] = restore;
+    }
+}
+
+/// A restore to a point in time: nothing runs until the restorer has the
+/// first member's data in place; then that member alone is told to
+/// replay the log, the others no primary to copy; once it serves as the
+/// primary, the restore is done and the others follow it.
+#[test]
+fn a_restored_database_runs_once_its_data_is_in_place_and_replays_first() {
+    use legion_api::replication::RestorePhase;
+    let spec = DATABASE.replace(
+        "failoverAfter: 10s }",
+        "failoverAfter: 10s, restore: { from: old, to: '2026-11-25T10:00:00Z', target: wal } }",
+    );
+    let mut w = World::new();
+    database(&mut w, &spec);
+    assert!(w.running().is_empty(), "nothing before the restorer says");
+    assert!(
+        w.volumes.is_empty(),
+        "no empty Volume made in the restore's place"
+    );
+
+    w.restorer_says("pg", serde_json::json!({ "phase": "restoring", "at": 1 }));
+    w.settle();
+    assert!(w.running().is_empty(), "nothing while it restores");
+
+    w.restorer_says(
+        "pg",
+        serde_json::json!({ "phase": "replaying", "log": "/var/db/pg/legion_restore", "at": 2 }),
+    );
+    w.settle();
+    assert_eq!(w.running().len(), 3);
+    let told = |w: &World, i: u32| {
+        w.tasks
+            .iter()
+            .find(|t| t.spec.slot == Some(i) && active_running(t))
+            .and_then(|t| t.spec.replication.clone())
+            .unwrap()
+    };
+    let first = told(&w, 0);
+    assert_eq!(first.role, legion_api::replication::spi::Role::Primary);
+    let r = first.restore.expect("the first member replays");
+    assert_eq!(
+        (r.id.as_str(), r.log.as_str(), r.to.as_deref()),
+        (
+            "old@2026-11-25T10:00:00Z",
+            "/var/db/pg/legion_restore",
+            Some("2026-11-25T10:00:00Z")
+        )
+    );
+    for i in [1, 2] {
+        let t = told(&w, i);
+        assert!(t.restore.is_none());
+        assert!(
+            t.topology.primary.is_none(),
+            "no primary to copy while it replays"
+        );
+    }
+    assert_eq!(
+        w.status("pg").restore.unwrap().phase,
+        RestorePhase::Replaying
+    );
+
+    // Served as the primary: done, and the others told where it is.
+    w.members_say(2, |_| 100, &[]);
+    w.settle();
+    assert_eq!(w.status("pg").restore.unwrap().phase, RestorePhase::Done);
+    assert!(told(&w, 0).restore.is_none());
+    assert_eq!(
+        told(&w, 1).topology.primary.map(|p| p.member).as_deref(),
+        Some("pg-0")
+    );
 }

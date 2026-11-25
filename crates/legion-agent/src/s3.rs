@@ -424,6 +424,20 @@ impl S3 {
         })
     }
 
+    /// The object `name` under this one's keys, whole.
+    pub(crate) fn get(&self, name: &str) -> Result<Vec<u8>, String> {
+        let key = format!("{}/{name}", self.base);
+        self.block(async {
+            let r = self
+                .call(reqwest::Method::GET, &key, &[], Vec::new(), true)
+                .await?;
+            r.bytes()
+                .await
+                .map(|b| b.to_vec())
+                .map_err(|e| format!("taking {name}: {e}"))
+        })
+    }
+
     /// Removes the object `name` under this one's keys.
     pub(crate) fn remove(&self, name: &str) -> Result<(), String> {
         let key = format!("{}/{name}", self.base);
@@ -434,21 +448,7 @@ impl S3 {
 
 /// `2026-11-25T04:05:06.000Z` (S3's `LastModified`) in Unix ms.
 pub(crate) fn iso_ms(t: &str) -> Option<i64> {
-    let (date, time) = t.trim().trim_end_matches('Z').split_once('T')?;
-    let mut d = date.split('-').map(|x| x.parse::<i64>());
-    let (y, m, day) = (d.next()?.ok()?, d.next()?.ok()?, d.next()?.ok()?);
-    let (hms, frac) = time.split_once('.').unwrap_or((time, "0"));
-    let mut h = hms.split(':').map(|x| x.parse::<i64>());
-    let (hh, mm, ss) = (h.next()?.ok()?, h.next()?.ok()?, h.next()?.ok()?);
-    let ms: i64 = format!("{frac:0<3}")[..3].parse().ok()?;
-    // Days since 1970-01-01 of a civil date (Howard Hinnant's algorithm).
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some(((days * 24 + hh) * 60 + mm) * 60_000 + ss * 1000 + ms)
+    legion_api::volume::iso_ms(t)
 }
 
 impl Remote for S3 {

@@ -11,7 +11,7 @@ use std::time::Duration;
 use legion_api::replication::spi::{self, Role};
 use legion_api::replication::{
     Change, ChangeKind, LastChange, MemberReport, MemberStatus, Phase, Replication,
-    ReplicationStatus, TaskReplication,
+    ReplicationStatus, RestorePhase, RestoreStatus, TaskReplication,
 };
 use legion_api::service::OnPartition;
 use legion_api::task::TaskState;
@@ -366,6 +366,9 @@ pub(super) fn pass(
         .filter(|m| named.is_none_or(|p| ordinal(svc, m) != Some(p)))
         .cloned()
         .collect();
+    // A restored first member replaying its log is no primary to copy
+    // yet: the others wait (told none) until it serves.
+    let replaying = replaying(s, r);
     let topology = spi::Topology {
         primary: named.map(addr),
         members: (0..n).map(addr).collect(),
@@ -375,6 +378,7 @@ pub(super) fn pass(
         }),
     };
     for (i, t) in &current {
+        let primary = Some(*i) == named;
         let want = TaskReplication {
             // The operator's request is the leader's alone.
             config: Replication {
@@ -382,12 +386,19 @@ pub(super) fn pass(
                 ..r.clone()
             },
             epoch: st.epoch,
-            role: if Some(*i) == named {
+            role: if primary {
                 Role::Primary
             } else {
                 Role::Replica
             },
-            topology: topology.clone(),
+            topology: match &replaying {
+                Some(_) if !primary => spi::Topology {
+                    primary: None,
+                    ..topology.clone()
+                },
+                _ => topology.clone(),
+            },
+            restore: replaying.clone().filter(|_| primary),
         };
         if t.spec.replication.as_ref() == Some(&want) || !reads_replication(t, nodes) {
             continue;
@@ -694,17 +705,38 @@ pub(super) fn initial(s: &Service, slot: Option<u32>) -> Option<TaskReplication>
         None => Some(0),
         Some(_) => None,
     };
+    let primary = named.is_some() && named == slot;
     Some(TaskReplication {
         config: Replication {
             request: None,
             ..r.clone()
         },
         epoch: st.as_ref().map_or(1, |st| st.epoch.max(1)),
-        role: if named.is_some() && named == slot {
+        role: if primary {
             Role::Primary
         } else {
             Role::Replica
         },
         topology: spi::Topology::default(),
+        // A restored first member is told so from its first `prepare`:
+        // without it, the backup would start as a primary where it was
+        // taken.
+        restore: replaying(s, r).filter(|_| primary),
+    })
+}
+
+/// What a restored first member replaying its log is told, while it does.
+fn replaying(s: &Service, r: &Replication) -> Option<spi::Restore> {
+    let want = r.restore.as_ref()?;
+    let x = s
+        .object
+        .status
+        .get("restore")
+        .and_then(|v| serde_json::from_value::<RestoreStatus>(v.clone()).ok())
+        .filter(|x| x.phase == RestorePhase::Replaying)?;
+    Some(spi::Restore {
+        id: want.id(),
+        log: x.log,
+        to: want.to.clone(),
     })
 }

@@ -48,6 +48,7 @@ mod raft_net;
 mod removed;
 mod replicate;
 pub mod requests;
+mod restore;
 pub mod roles;
 mod security;
 mod session;

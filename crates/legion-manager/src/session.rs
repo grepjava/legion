@@ -242,6 +242,11 @@ impl Pods for PodsService {
                     "a database's log is archived by the managers, as its `replication.archive` says",
                 ));
             }
+            Some(Action::ArchiveFetch(_)) => {
+                return Err(Status::invalid_argument(
+                    "a database's log is fetched by the managers, as its `replication.restore` says",
+                ));
+            }
             Some(Action::ImageOp(_)) => {
                 return Err(Status::invalid_argument(
                     "node image actions go through Cluster.NodeImages",

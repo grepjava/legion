@@ -1821,14 +1821,45 @@ async fn replication(
             let o = Object::try_from(o.into_inner())?;
             let status: legion_api::service::ServiceStatus =
                 serde_json::from_value(o.status.clone()).unwrap_or_default();
-            let Some(st) = status.replication else {
-                bail!("{} replicates no database", o.key());
+            let mut out = match (status.replication, &status.restore) {
+                (Some(st), _) => replication_table(&st),
+                (None, Some(_)) => String::new(),
+                (None, None) => bail!("{} replicates no database", o.key()),
             };
-            let mut out = replication_table(&st);
             if let Some(a) = status.archive {
                 out.push_str(&archive_line(&a, now_ms()));
             }
+            if let Some(r) = &status.restore {
+                out.push_str(&restore_line(r));
+            }
             return Ok(out);
+        }
+        C::Restore {
+            service,
+            from,
+            to,
+            backup,
+            target,
+            node,
+            replicas,
+            namespace,
+        } => {
+            return restore(
+                objects,
+                namespace.unwrap_or_else(|| "default".into()),
+                service,
+                legion_api::replication::Restore {
+                    from,
+                    to,
+                    target,
+                    backups: None,
+                    backup,
+                    claim: None,
+                    node,
+                },
+                replicas,
+            )
+            .await;
         }
         C::Switchover {
             service,
@@ -1860,6 +1891,82 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// Makes Service `service` from `restore.from`'s spec, restoring its
+/// database to a point in time.
+async fn restore(
+    objects: &mut Objects,
+    namespace: String,
+    service: String,
+    restore: legion_api::replication::Restore,
+    replicas: u32,
+) -> anyhow::Result<String> {
+    let get = |name: &str| ObjectRef {
+        kind: Kind::Service.as_str().into(),
+        namespace: namespace.clone(),
+        name: name.to_owned(),
+    };
+    if objects.get(get(&service)).await.is_ok() {
+        bail!("Service {namespace}/{service} exists: restore under another name");
+    }
+    let from = objects.get(get(&restore.from)).await.map_err(|s| {
+        anyhow::anyhow!(
+            "{}: without it, write the Service yourself with `replication.restore` (docs/REPLICATION.md)",
+            s.message()
+        )
+    })?;
+    let from = Object::try_from(from.into_inner())?;
+    let mut spec: legion_api::service::ServiceSpec =
+        legion_api::parse(&from.spec).map_err(|e| anyhow::anyhow!("{}: {e}", from.key()))?;
+    let Some(r) = spec.replication.as_mut() else {
+        bail!("{} replicates no database", from.key());
+    };
+    r.request = None;
+    r.restore = Some(restore.clone());
+    // Synchronous replicas are fewer than the members, which count the
+    // primary.
+    r.synchronous = r.synchronous.min(replicas.saturating_sub(1));
+    spec.replicas = Some(replicas);
+    spec.stopped = false;
+    let object = Object::new(
+        Kind::Service,
+        &namespace,
+        &service,
+        serde_json::to_value(&spec)?,
+    );
+    apply(objects, &object).await?;
+    Ok(format!(
+        "Service {namespace}/{service} made from {}: restoring {}'s data to {}; `legion replication status {service} -n {namespace}` says how far it got",
+        restore.from,
+        restore.from,
+        restore.to.as_deref().unwrap_or("the end of its log"),
+    ))
+}
+
+/// Where a restore to a point in time stands, for people.
+pub(crate) fn restore_line(r: &legion_api::replication::RestoreStatus) -> String {
+    let mut out = format!("restore {}", r.phase.as_str());
+    if !r.backup.is_empty() {
+        out.push_str(&format!(": from {}", r.backup));
+        if let Some(t) = r.taken_ms {
+            out.push_str(&format!(" (taken {})", legion_api::volume::stamp(t)));
+        }
+        if !r.node.is_empty() {
+            out.push_str(&format!(" onto {}", r.node));
+        }
+    }
+    if r.fetched > 0 {
+        out.push_str(&format!(", {} files of log", r.fetched));
+    }
+    if !r.message.is_empty() {
+        out.push_str(&format!("; {}", r.message));
+    }
+    if r.failures > 0 {
+        out.push_str(&format!(" ({} tries failed)", r.failures));
+    }
+    out.push('\n');
+    out
 }
 
 /// Where a replicated database's log archiving stands, for people.

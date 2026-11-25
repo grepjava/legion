@@ -180,6 +180,7 @@ impl Check<'_> {
             (caps.seed_from_snapshot, "seedFromSnapshot"),
             (caps.probe, "probe"),
             (caps.archive, "archive"),
+            (caps.restore, "restore"),
         ]
         .iter()
         .filter(|(on, _)| *on)

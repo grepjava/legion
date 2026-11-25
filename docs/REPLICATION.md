@@ -118,6 +118,12 @@ Every request has these fields. Operations add their own.
   the database's log in a spool directory and says where in `status`
   (`spool`). Legion ships what is there to the target and removes it.
   Files ending `.part` are being written and are left alone.
+- `restore` (`prepare` of the primary only, capability `restore`) is
+  `{"id", "log", "to"}` when the data directory holds a restored backup
+  of another database to replay to a point in time (below, Restoring to a
+  point in time). `log` is a directory, as the container sees it, holding
+  the log files as the database archived them. `to` is an RFC 3339 time
+  in UTC; absent, all the log there is.
 - `options` is the Service's `replication.options`, passed as given.
   Secrets go in as files the Service mounts (`/run/secrets/...`), named
   in options. Legion never sends a secret's value in a request.
@@ -137,13 +143,15 @@ Called once per plugin and image, before anything else.
     "rewind": true,
     "seedFromSnapshot": false,
     "probe": true,
-    "archive": true
+    "archive": true,
+    "restore": true
   } }
 ```
 
 Legion uses the highest version both support, and refuses a Service
 whose settings need a capability the plugin lacks: `synchronous` above
-0 needs `synchronous`, and a read endpoint needs `readableReplicas`.
+0 needs `synchronous`, a read endpoint needs `readableReplicas`,
+`archive` needs `archive`, and `restore` needs `restore`.
 
 ### `prepare`
 
@@ -158,6 +166,13 @@ It makes the data directory ready to start in that role:
   serves.
 - **Primary, existing data:** make sure the replication configuration is
   in place, and nothing more.
+- **Primary, told to `restore`:** set the data directory up to replay the
+  files in `log` up to `to`, then serve as the primary on a history of its
+  own. Only once per `id`: told the same again (a restart while it
+  replays, or once it is done), it carries on as it is. Until it serves,
+  `status` says `role: primary`, `healthy: false` and
+  `detail.restoring: true`, and `configure` and `promote` answer `retry`.
+  Data that is no database is refused, never replaced by a new one.
 - **Replica:** whatever it takes to start as a replica of
   `topology.primary`. That means copying it when the directory is empty,
   rewinding when this member's history diverged (an old primary coming
@@ -355,13 +370,55 @@ member's next restart (`legion restart`).
   - A primary of an older epoch (`pg_is_in_recovery()` false) answers
     `restart`.
 
-A restore to a point in time is by hand for now: restore a backup of a
-member's Volume (`legion volume restore --from TARGET VOLUME@TIME --as
-NEW`), copy the WAL files after it from
-`<prefix>/<namespace>.<service>/wal/` into its data directory's
-`pg_wal`, set `recovery_target_time` and touch `recovery.signal`, then
-start a one-member Service on it. Doing this for you is the next step.
+- **`prepare` told to `restore`:** it removes the backup's
+  `postmaster.pid` and `standby.signal` (a replica's backup is as good as
+  a primary's), writes `recovery.signal` and `legion_restore.id`, and adds
+  to `legion-replication.conf` `restore_command` (a copy from `log`, else
+  from the member's own spool), `recovery_target_time`,
+  `recovery_target_timeline = 'latest'` (so it follows the failovers the
+  log went through) and `recovery_target_action = 'promote'`. PostgreSQL
+  removes `recovery.signal` once promoted, and the next `prepare` leaves
+  the settings out.
 
-Not in v1: a restore to a point in time done by Legion; seeding a replica
-from a ZFS snapshot (`seedFromSnapshot`); cascading replicas; logical
-replication.
+## Restoring to a point in time
+
+With a Service's log archived (`replication.archive`) and its members'
+Volumes backed up to a BackupTarget (the claim's `backup`), Legion
+restores the database as it was at a time, as a new Service:
+
+```
+legion replication restore pg-then --from pg --to 2026-11-25T10:00:00Z [--replicas N]
+```
+
+makes Service `pg-then` from `pg`'s spec with:
+
+```yaml
+replication:
+  restore:
+    from: pg                      # whose backups and log; it may be gone
+    to: 2026-11-25T10:00:00Z      # UTC; unset, all the log there is
+    target: offsite               # the log's target; unset, from's archive.target, else this Service's
+    backups: vault                # the Volume backups' target; unset, the claim's backup.target, else target
+    backup: pg-pg-1@legion-bk-vault-20261125T090000Z   # unset, the newest of from's members' before `to`
+    claim: pg                     # unset, the pod's only claim
+    node: n2                      # unset, a ready node taking new tasks
+```
+
+Written by hand, it restores from a Service that is gone. Before any
+member of the new Service runs, the leader restores the backup as its
+first member's Volume (`<claim>-<service>-0`) on the node, and fetches
+the files under `<prefix>/<namespace>.<from>/wal/` into its
+`legion_restore` directory. The first member's `prepare` is then told to
+`restore`; the other members wait (they are told no primary) until it
+serves as the primary, then copy it as any replica does. The fetched
+log is then removed. `status.restore` says where it stands (`restoring`,
+`replaying`, `done`, or `skipped` when the first member's Volume was
+there already: nothing is restored over data), as `legion replication
+status` and the console's Replication tab do. A step that fails is tried
+again, after a backoff, and said there.
+
+The original goes on as it was; the restored database has a history of
+its own from `to` on, and with `archive` its log goes under its own name.
+
+Not in v1: seeding a replica from a ZFS snapshot (`seedFromSnapshot`);
+cascading replicas; logical replication.
