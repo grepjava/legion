@@ -41,20 +41,51 @@ pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 /// whatever its size.
 pub(crate) const MAX_BATCH: usize = 4 * 1024 * 1024;
 
-/// The least a peer's [`Budgets`] falls to.
+/// The least a call's budget falls to.
 const MIN_BUDGET: usize = 16 * 1024;
+/// A call's budget before anything is known of the link: what a slow one
+/// (4 Mbit/s up, 230 ms off) carries in a heartbeat interval, so a
+/// leader's first calls after a restart don't run out of time while it
+/// learns. A fast link grows it at once.
+const FIRST_BUDGET: usize = 128 * 1024;
+/// Of the time a call has beyond the round trip, the share its bytes are
+/// sized to fill.
+const FILL: f64 = 0.5;
 
-/// How many bytes of log a call to each peer may carry, learned from how
-/// long calls take. Each call must finish within the heartbeat interval
-/// (openraft's timeout for it), and a peer far away (a witness across the
-/// internet, 200 ms off) can't take [`MAX_BATCH`] in that time, least of
-/// all a peer catching up after a restart. A leader sends what fits and
-/// says how far it got ([`AppendEntriesResponse::PartialSuccess`]), so
-/// openraft goes on from there at once; a call that ran out of time halves
-/// the budget, and one that took under a quarter of it while near the
-/// budget doubles it. Shared by the peer's clients, as openraft makes a new
-/// one for each replication stream.
-pub(crate) type Budgets = Arc<Mutex<HashMap<NodeId, usize>>>;
+/// What a leader has learned of the link to each peer, from how long calls
+/// take: how many bytes of log a call may carry. Each call must finish
+/// within the heartbeat interval (openraft's timeout for it), and a peer far
+/// away (a witness across the internet, 230 ms off on a home uplink) can't
+/// take [`MAX_BATCH`] in that time, least of all one catching up after a
+/// restart. A leader sends what fits and says how far it got
+/// ([`AppendEntriesResponse::PartialSuccess`]), so openraft goes on from
+/// there at once. Shared by the peer's clients, as openraft makes a new one
+/// for each replication stream.
+pub(crate) type Budgets = Arc<Mutex<HashMap<NodeId, Link>>>;
+
+/// See [`Budgets`]: the quickest call seen stands for the round trip, and
+/// the bytes calls moved beyond it in the time they took for the link's
+/// rate; the budget fills half the time a call has beyond the round trip.
+/// Until a rate is known, a call that took under a quarter of its time
+/// doubles the budget. A call that ran out of time halves it, and says the
+/// rate is below what it tried.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Link {
+    pub budget: usize,
+    pub rtt: Option<std::time::Duration>,
+    /// Bytes a second.
+    pub rate: Option<f64>,
+}
+
+impl Default for Link {
+    fn default() -> Self {
+        Link {
+            budget: FIRST_BUDGET,
+            rtt: None,
+            rate: None,
+        }
+    }
+}
 
 /// The header saying what a manager speaks: `speaks/oldest`.
 const PROTOCOL_HEADER: &str = "legion-protocol";
@@ -235,18 +266,45 @@ fn fitting(sizes: impl IntoIterator<Item = usize>, budget: usize) -> usize {
     n
 }
 
-/// A peer's budget after a call of `size` bytes that took `took` of the
-/// `allowed` time, or ran out of it (`None`): see [`Budgets`].
-fn next_budget(
-    budget: usize,
-    size: usize,
-    took: Option<std::time::Duration>,
-    allowed: std::time::Duration,
-) -> usize {
-    match took {
-        None => (size / 2).min(budget).max(MIN_BUDGET),
-        Some(t) if t < allowed / 4 && size >= budget / 2 => budget.saturating_mul(2).min(MAX_BATCH),
-        Some(_) => budget,
+impl Link {
+    /// The link after a call of `size` bytes that took `took` of the
+    /// `allowed` time, or ran out of it (`None`).
+    fn after(
+        self,
+        size: usize,
+        took: Option<std::time::Duration>,
+        allowed: std::time::Duration,
+    ) -> Link {
+        let Some(t) = took else {
+            let tried = size as f64 / allowed.as_secs_f64();
+            return Link {
+                budget: (size / 2).min(self.budget).max(MIN_BUDGET),
+                rate: Some(self.rate.map_or(tried, |r| r.min(tried))),
+                ..self
+            };
+        };
+        let rtt = self.rtt.map_or(t, |r| r.min(t));
+        // Only a call well beyond the round trip says what the link moves.
+        let beyond = t.saturating_sub(rtt).as_secs_f64();
+        let rate = if size >= MIN_BUDGET && beyond >= 0.02 {
+            let r = size as f64 / beyond;
+            Some(self.rate.map_or(r, |old| (old + r) / 2.0))
+        } else {
+            self.rate
+        };
+        let budget = match rate {
+            Some(r) => {
+                let room = allowed.saturating_sub(rtt).as_secs_f64();
+                (r * room * FILL) as usize
+            }
+            None if t < allowed / 4 && size >= self.budget / 2 => self.budget.saturating_mul(2),
+            None => self.budget,
+        };
+        Link {
+            budget: budget.clamp(MIN_BUDGET, MAX_BATCH),
+            rtt: Some(rtt),
+            rate,
+        }
     }
 }
 
@@ -292,12 +350,8 @@ impl RaftNetwork<TypeConfig> for PeerClient {
         // From the start: encoding a large batch takes its share too.
         let start = tokio::time::Instant::now();
         let allowed = option.hard_ttl().mul_f64(0.8);
-        let budget = *self
-            .budgets
-            .lock()
-            .unwrap()
-            .entry(self.target)
-            .or_insert(MAX_BATCH);
+        let link = *self.budgets.lock().unwrap().entry(self.target).or_default();
+        let budget = link.budget;
         let entries = rpc.entries.len();
         let keep = fitting(rpc.entries.iter().map(encoded_len), budget);
         // What doesn't fit goes in the next call, at once: openraft goes on
@@ -329,7 +383,7 @@ impl RaftNetwork<TypeConfig> for PeerClient {
         self.budgets
             .lock()
             .unwrap()
-            .insert(self.target, next_budget(budget, size, took, allowed));
+            .insert(self.target, link.after(size, took, allowed));
         match result {
             Ok(result) => result.map(partly),
             Err(_) => Err(RPCError::PayloadTooLarge(
@@ -481,7 +535,7 @@ pub(crate) async fn read_index(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BATCH, MIN_BUDGET, encoded_len, fitting, next_budget};
+    use super::{FIRST_BUDGET, Link, MAX_BATCH, MIN_BUDGET, encoded_len, fitting};
     use std::time::Duration;
 
     #[test]
@@ -499,24 +553,37 @@ mod tests {
     #[test]
     fn the_budget_follows_what_the_link_carries_in_time() {
         let allowed = Duration::from_millis(800);
-        // Out of time: half of what was sent, never below the floor.
-        assert_eq!(next_budget(MAX_BATCH, 1 << 20, None, allowed), 1 << 19);
-        assert_eq!(next_budget(MAX_BATCH, 1000, None, allowed), MIN_BUDGET);
-        // Quick with a full call: double, up to the most.
-        let quick = Some(Duration::from_millis(100));
-        assert_eq!(next_budget(1 << 19, 1 << 19, quick, allowed), 1 << 20);
-        assert_eq!(next_budget(MAX_BATCH, MAX_BATCH, quick, allowed), MAX_BATCH);
-        // Quick with a small call says nothing about the link.
-        assert_eq!(next_budget(1 << 19, 1000, quick, allowed), 1 << 19);
-        // In time but not quick: kept.
-        let slow = Some(Duration::from_millis(500));
-        assert_eq!(next_budget(1 << 19, 1 << 19, slow, allowed), 1 << 19);
-        // A link that keeps timing out settles at the floor.
-        let mut b = MAX_BATCH;
-        for _ in 0..20 {
-            b = next_budget(b, b, None, allowed);
+        let ms = Duration::from_millis;
+        // A LAN: quick calls double it from the first budget up to the most.
+        let mut lan = Link::default();
+        assert_eq!(lan.budget, FIRST_BUDGET);
+        for _ in 0..8 {
+            lan = lan.after(lan.budget, Some(ms(5)), allowed);
         }
-        assert_eq!(b, MIN_BUDGET);
+        assert_eq!(lan.budget, MAX_BATCH, "{lan:?}");
+
+        // The witness: 230 ms off, about 500 kB/s up. A small call learns
+        // the round trip; a full one the rate, which sizes the next.
+        let wan = Link::default().after(2_000, Some(ms(240)), allowed);
+        assert_eq!((wan.rtt, wan.budget), (Some(ms(240)), FIRST_BUDGET));
+        let wan = wan.after(128 * 1024, Some(ms(240 + 262)), allowed);
+        let rate = wan.rate.unwrap();
+        assert!((480_000.0..520_000.0).contains(&rate), "{rate}");
+        // Half of the 560 ms beyond the round trip, at that rate.
+        assert!((130_000..145_000).contains(&wan.budget), "{wan:?}");
+        // A call that runs out of time: half of it, and a rate below it.
+        let out = wan.after(400_000, None, allowed);
+        assert_eq!(out.budget, wan.budget.min(200_000));
+        assert!(out.rate.unwrap() <= 400_000.0 / 0.8);
+        // Calls keep timing out: down to the floor, never below.
+        let mut b = Link::default();
+        for _ in 0..20 {
+            b = b.after(b.budget, None, allowed);
+        }
+        assert_eq!(b.budget, MIN_BUDGET);
+        // A small quick call says nothing of the rate.
+        let same = wan.after(1_000, Some(ms(245)), allowed);
+        assert_eq!(same.rate, wan.rate);
     }
 
     #[test]
