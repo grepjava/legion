@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 
 pub mod activity;
 pub mod admit;
-pub mod app;
 pub mod alert;
+pub mod app;
 pub mod audit;
 pub mod backup;
 pub mod build;

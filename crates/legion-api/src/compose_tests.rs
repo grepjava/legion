@@ -636,10 +636,17 @@ services:
     assert_eq!(allowed("db"), [crate::security::Allow::Sysvipc].into());
     assert_eq!(
         allowed("ping"),
-        [crate::security::Allow::RawSockets, crate::security::Allow::Mlock].into()
+        [
+            crate::security::Allow::RawSockets,
+            crate::security::Allow::Mlock
+        ]
+        .into()
     );
     assert!(
-        stack.warnings.iter().any(|w| w.contains("allow.mount") && w.contains("not one Legion sets")),
+        stack
+            .warnings
+            .iter()
+            .any(|w| w.contains("allow.mount") && w.contains("not one Legion sets")),
         "{:?}",
         stack.warnings
     );
@@ -649,7 +656,10 @@ services:
 fn a_stacks_namespace_allows_what_its_containers_ask_for() {
     let yaml = "services:\n  db:\n    image: pg\n    annotations: { org.freebsd.jail.allow.sysvipc: \"true\" }\n  web:\n    image: web\n";
     let stack = convert_with(yaml, &[]).unwrap();
-    assert_eq!(stack.namespace_spec(), json!({ "security": { "allow": ["sysvipc"] } }));
+    assert_eq!(
+        stack.namespace_spec(),
+        json!({ "security": { "allow": ["sysvipc"] } })
+    );
     let plain = convert_with("services:\n  web:\n    image: web\n", &[]).unwrap();
     assert_eq!(plain.namespace_spec(), json!({}));
 }

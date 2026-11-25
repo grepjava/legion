@@ -121,7 +121,8 @@ pub fn manifest(yaml: &str) -> Result<Manifest, String> {
         #[serde(default, rename = "x-fjord")]
         fjord: Option<Fjord>,
     }
-    let doc: Doc = serde_yaml_ng::from_str(yaml).map_err(|e| format!("reading the manifest: {e}"))?;
+    let doc: Doc =
+        serde_yaml_ng::from_str(yaml).map_err(|e| format!("reading the manifest: {e}"))?;
     let f = doc.fjord.unwrap_or_default();
     Ok(Manifest {
         name: f.info.name,
@@ -166,13 +167,19 @@ pub fn render(
     if !unknown.is_empty() {
         return Err(format!(
             "{} is no variable of {}",
-            unknown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+            unknown
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
             m.name
         ));
     }
     let mut doc: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&m.compose).map_err(|e| format!("reading the manifest: {e}"))?;
-    let map = doc.as_mapping_mut().ok_or("the manifest is not a compose file")?;
+    let map = doc
+        .as_mapping_mut()
+        .ok_or("the manifest is not a compose file")?;
     map.remove("x-fjord");
     // Each storage variable's value is a Volume, declared as compose wants.
     let volumes = map
@@ -181,7 +188,8 @@ pub fn render(
     if let Some(vols) = volumes.as_mapping_mut() {
         for v in m.variables.iter().filter(|v| v.is_storage()) {
             let name = &env[&v.name];
-            crate::validate_name(name).map_err(|e| format!("{}: {name:?} names a Volume: {e}", v.name))?;
+            crate::validate_name(name)
+                .map_err(|e| format!("{}: {name:?} names a Volume: {e}", v.name))?;
             vols.entry(name.as_str().into())
                 .or_insert_with(|| serde_yaml_ng::Value::Mapping(Default::default()));
         }
@@ -190,7 +198,10 @@ pub fn render(
         }
     }
     // The variant is the main image's tag.
-    if let (Some(tag), Some(services)) = (variant, map.get_mut("services").and_then(|s| s.as_mapping_mut())) {
+    if let (Some(tag), Some(services)) = (
+        variant,
+        map.get_mut("services").and_then(|s| s.as_mapping_mut()),
+    ) {
         for (_, svc) in services.iter_mut() {
             if let Some(img) = svc.get_mut("image")
                 && let Some(s) = img.as_str()
@@ -209,8 +220,7 @@ pub fn render(
 /// `@every 1h`, as the catalog's own tools read it.
 fn unquote(v: &str) -> String {
     let v = v.trim();
-    for q in ['"', '\'']
-    {
+    for q in ['"', '\''] {
         if v.len() >= 2 && v.starts_with(q) && v.ends_with(q) {
             return v[1..v.len() - 1].to_owned();
         }
@@ -239,7 +249,9 @@ pub fn random_secret() -> String {
             *byte = x as u8;
         }
     }
-    b.iter().map(|c| ALPHABET[*c as usize % ALPHABET.len()] as char).collect()
+    b.iter()
+        .map(|c| ALPHABET[*c as usize % ALPHABET.len()] as char)
+        .collect()
 }
 
 #[cfg(test)]
@@ -291,20 +303,44 @@ x-fjord:
         let m = manifest(VW).unwrap();
         assert_eq!(m.name, "Vaultwarden");
         assert_eq!(m.variables.len(), 4);
-        assert_eq!(m.variables[2].default.as_deref(), Some("1000"), "a number read as text");
+        assert_eq!(
+            m.variables[2].default.as_deref(),
+            Some("1000"),
+            "a number read as text"
+        );
         assert!(m.variables[1].is_storage());
-        assert_eq!(m.variants[1], Variant { id: "pkg".into(), label: "FreeBSD quarterly packages".into(), default: true });
+        assert_eq!(
+            m.variants[1],
+            Variant {
+                id: "pkg".into(),
+                label: "FreeBSD quarterly packages".into(),
+                default: true
+            }
+        );
     }
 
     #[test]
     fn rendered_it_deploys_as_a_stack_with_its_data_on_a_volume() {
         let m = manifest(VW).unwrap();
         let values = BTreeMap::from([("WEB_PORT".to_owned(), "18080".to_owned())]);
-        let (compose, env) = render(&m, "ghcr.io/daemonless/vaultwarden", Some("pkg"), &values, &|| "s3cret".into()).unwrap();
+        let (compose, env) = render(
+            &m,
+            "ghcr.io/daemonless/vaultwarden",
+            Some("pkg"),
+            &values,
+            &|| "s3cret".into(),
+        )
+        .unwrap();
         assert_eq!(env["WEB_PORT"], "18080");
         assert_eq!(env["CONFIG_DATA"], "config");
-        assert_eq!(env["ADMIN_TOKEN"], "s3cret", "a secret not given is made up");
-        assert!(compose.contains("ghcr.io/daemonless/vaultwarden:pkg"), "{compose}");
+        assert_eq!(
+            env["ADMIN_TOKEN"], "s3cret",
+            "a secret not given is made up"
+        );
+        assert!(
+            compose.contains("ghcr.io/daemonless/vaultwarden:pkg"),
+            "{compose}"
+        );
         assert!(!compose.contains("x-fjord"), "{compose}");
         let get = |k: &str| env.get(k).cloned();
         let stack = crate::compose::convert(
@@ -317,8 +353,18 @@ x-fjord:
             },
         )
         .unwrap();
-        let kinds: Vec<_> = stack.objects.iter().map(|o| (o.kind, o.metadata.name.as_str())).collect();
-        assert_eq!(kinds, [(crate::Kind::Volume, "config"), (crate::Kind::Service, "vaultwarden")]);
+        let kinds: Vec<_> = stack
+            .objects
+            .iter()
+            .map(|o| (o.kind, o.metadata.name.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (crate::Kind::Volume, "config"),
+                (crate::Kind::Service, "vaultwarden")
+            ]
+        );
     }
 
     #[test]
@@ -327,8 +373,16 @@ x-fjord:
         let typo = BTreeMap::from([("WEBPORT".to_owned(), "1".to_owned())]);
         let e = render(&m, "", None, &typo, &|| "x".into()).unwrap_err();
         assert!(e.contains("WEBPORT is no variable"), "{e}");
-        m.variables.push(AppVariable { name: "DB_TYPE".into(), kind: "string".into(), ..Default::default() });
-        m.variables.push(AppVariable { name: "HTML_PATH".into(), kind: "path".into(), ..Default::default() });
+        m.variables.push(AppVariable {
+            name: "DB_TYPE".into(),
+            kind: "string".into(),
+            ..Default::default()
+        });
+        m.variables.push(AppVariable {
+            name: "HTML_PATH".into(),
+            kind: "path".into(),
+            ..Default::default()
+        });
         let (compose, env) = render(&m, "", None, &BTreeMap::new(), &|| "x".into()).unwrap();
         assert_eq!(env["DB_TYPE"], "", "left to the app");
         assert_eq!(env["HTML_PATH"], "html-path", "a Volume named after it");
@@ -336,7 +390,10 @@ x-fjord:
         m.variables.truncate(4);
         let bad = BTreeMap::from([("CONFIG_DATA".to_owned(), "../etc".to_owned())]);
         m.variables.pop();
-        assert!(render(&m, "", None, &bad, &|| "x".into()).is_err(), "a Volume's name is a name");
+        assert!(
+            render(&m, "", None, &bad, &|| "x".into()).is_err(),
+            "a Volume's name is a name"
+        );
     }
 
     #[test]

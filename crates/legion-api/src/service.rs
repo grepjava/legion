@@ -185,7 +185,12 @@ impl ServiceSpec {
                 "only a stateful service's members replicate a database: each has its own Volumes",
             ));
         }
-        let containers: Vec<&str> = self.pod.containers.iter().map(|c| c.name.as_str()).collect();
+        let containers: Vec<&str> = self
+            .pod
+            .containers
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
         r.admit("replication", self.replicas.unwrap_or(1), &containers)?;
         // One mechanism per Volume: the database copies itself.
         if let Some((name, _)) = self.pod.claims().find(|(_, c)| c.replica.is_some()) {

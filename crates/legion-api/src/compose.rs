@@ -495,7 +495,8 @@ impl Converter<'_> {
                         };
                         let allow_name = match param {
                             "allow.raw_sockets" => "rawSockets",
-                            "allow.sysvipc" | "allow.sysvmsg" | "allow.sysvsem" | "allow.sysvshm" => "sysvipc",
+                            "allow.sysvipc" | "allow.sysvmsg" | "allow.sysvsem"
+                            | "allow.sysvshm" => "sysvipc",
                             "allow.mlock" => "mlock",
                             "allow.chflags" => "chflags",
                             other => {
