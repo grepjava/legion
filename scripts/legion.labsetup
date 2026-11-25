@@ -109,11 +109,17 @@ export LEGION_CLUSTER_VMS='lab2=lab@10.78.0.2 lab3=lab@10.78.0.3'
 export LEGION_CLUSTER_KEY=/home/lab/.ssh/id_ed25519
 export LEGION_CLUSTER_LOSE=reboot
 EOF
-# Chromium, for the console's browser test, from lab base 5 on: without it
-# the test's precondition fails rather than the test passing unrun.
-if command -v chrome > /dev/null; then
-    echo "export LEGION_BROWSER=$(command -v chrome)" >> /var/tmp/lab.env
-fi
+# Chromium, for the console's browser test: without it the test's
+# precondition fails rather than the test passing unrun. The native
+# package's `chrome`, else Google's Linux build (`google-chrome`, through
+# the Linux ABI), as FreeBSD 15's package sets have had no native chromium
+# since the lab's base was rebuilt on 15.1.
+for b in chrome google-chrome; do
+    if command -v "$b" > /dev/null; then
+        echo "export LEGION_BROWSER=$(command -v "$b")" >> /var/tmp/lab.env
+        break
+    fi
+done
 # axe-core, for the console test's accessibility step, copied in by the
 # run (--copy ...:/var/tmp/axe.min.js) from the console's devDependencies.
 if [ -f /var/tmp/axe.min.js ]; then
