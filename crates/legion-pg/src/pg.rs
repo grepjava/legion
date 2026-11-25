@@ -269,7 +269,21 @@ pub struct Control {
     pub system: String,
     pub timeline: u64,
     pub state: String,
+    /// The settings a standby must match or exceed, as the server last
+    /// ran with them (`-c NAME=VALUE`).
+    pub settings: Vec<(String, String)>,
 }
+
+/// `pg_controldata`'s names for the settings it records, and the
+/// server's.
+const RECORDED: [(&str, &str); 6] = [
+    ("max_connections setting", "max_connections"),
+    ("max_worker_processes setting", "max_worker_processes"),
+    ("max_wal_senders setting", "max_wal_senders"),
+    ("max_prepared_xacts setting", "max_prepared_transactions"),
+    ("max_locks_per_xact setting", "max_locks_per_transaction"),
+    ("track_commit_timestamp setting", "track_commit_timestamp"),
+];
 
 pub fn parse_controldata(text: &str) -> R<Control> {
     let get = |key: &str| {
@@ -283,10 +297,16 @@ pub fn parse_controldata(text: &str) -> R<Control> {
         .and_then(|t| t.parse().ok())
         .ok_or_else(|| Fail::new("pg_controldata: no timeline"))?;
     let state = get("Database cluster state").unwrap_or_default();
+    let settings = RECORDED
+        .iter()
+        .filter_map(|(key, name)| Some(((*name).to_owned(), get(key)?)))
+        .filter(|(_, v)| !v.is_empty() && v.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .collect();
     Ok(Control {
         system,
         timeline,
         state,
+        settings,
     })
 }
 
@@ -742,32 +762,38 @@ impl<H: Host> Pg<'_, H> {
                 return Err(Fail::new(format!("initdb: {}", tail(&out.stderr))));
             }
             action = "initialized";
+            // The role, before anything can connect: in single-user mode,
+            // on the new database only. On data that ran, single-user mode
+            // starts with the defaults, not the container's settings, and
+            // logs them (max_connections and the like) into the WAL,
+            // where replicas set lower then refuse to replay it. A
+            // database that ran has its role made at its next configure.
+            let pw = self.password()?;
+            let args = vec![
+                "--single".to_owned(),
+                "-j".into(),
+                "-D".into(),
+                self.data.display().to_string(),
+                "postgres".into(),
+            ];
+            let out = self.run(
+                "postgres",
+                &args,
+                &[],
+                Some(&role_sql(&self.o.replication_user, &pw)),
+            )?;
+            let said = format!("{}\n{}", out.stdout, out.stderr);
+            if !out.ok || said.contains("ERROR:") || said.contains("FATAL:") {
+                return Err(Fail::new(format!(
+                    "making the replication role: {}",
+                    tail(&said)
+                )));
+            }
         }
         // Named primary: a promotion cut short is finished by starting
         // without the standby's signal.
         let _ = std::fs::remove_file(self.data.join("standby.signal"));
         self.configure_files(None)?;
-        let pw = self.password()?;
-        let args = vec![
-            "--single".to_owned(),
-            "-j".into(),
-            "-D".into(),
-            self.data.display().to_string(),
-            "postgres".into(),
-        ];
-        let out = self.run(
-            "postgres",
-            &args,
-            &[],
-            Some(&role_sql(&self.o.replication_user, &pw)),
-        )?;
-        let said = format!("{}\n{}", out.stdout, out.stderr);
-        if !out.ok || said.contains("ERROR:") || said.contains("FATAL:") {
-            return Err(Fail::new(format!(
-                "making the replication role: {}",
-                tail(&said)
-            )));
-        }
         Ok(json!({ "action": action }))
     }
 
@@ -895,9 +921,33 @@ impl<H: Host> Pg<'_, H> {
                 ));
             }
             if ran_as_primary(&local.state) || local.timeline != timeline {
-                // pg_rewind brings a crashed target to a clean stop itself,
-                // which a standby's signal would refuse.
+                // pg_rewind needs a target stopped cleanly, which a
+                // standby's signal would refuse.
                 let _ = std::fs::remove_file(self.data.join("standby.signal"));
+                // pg_rewind would bring a crashed one to a clean stop with
+                // the configuration files' settings, not the container's,
+                // and log them into the WAL, where replicas set lower then
+                // refuse to replay it: done here with the settings the
+                // server last ran with, which logs nothing.
+                if !local.state.starts_with("shut down") {
+                    let mut args = vec!["--single".to_owned()];
+                    for (name, value) in &local.settings {
+                        args.push("-c".into());
+                        args.push(format!("{name}={value}"));
+                    }
+                    args.extend([
+                        "-D".to_owned(),
+                        self.data.display().to_string(),
+                        "template1".into(),
+                    ]);
+                    let out = self.run("postgres", &args, &[], Some(""))?;
+                    if !out.ok {
+                        return Err(Fail::new(format!(
+                            "finishing crash recovery before pg_rewind: {}",
+                            tail(&out.stderr)
+                        )));
+                    }
+                }
                 let args = vec![
                     format!("--target-pgdata={}", self.data.display()),
                     format!(
@@ -1047,6 +1097,10 @@ impl<H: Host> Pg<'_, H> {
     /// A slot for each other member, none for those gone, and the
     /// synchronous quorum.
     fn configure_primary(&mut self) -> R<()> {
+        // The replication role as the Secret says, on a database that ran
+        // before (restored, or its password changed).
+        let pw = self.password()?;
+        self.psql(&role_sql(&self.o.replication_user, &pw))?;
         let wanted: Vec<String> = self
             .req
             .topology

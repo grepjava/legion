@@ -219,6 +219,68 @@ Database cluster state:               shut down\n\
 Latest checkpoint's TimeLineID:       1\n";
 
 #[test]
+fn a_crashed_primary_finishes_recovery_with_the_settings_it_ran_with_before_pg_rewind() {
+    let s = setup();
+    if !usable(&s) {
+        return;
+    }
+    std::fs::write(s.data.join("PG_VERSION"), "17").unwrap();
+    let crashed = "Database system identifier:           7300000000000000001\n\
+Database cluster state:               in production\n\
+Latest checkpoint's TimeLineID:       1\n\
+max_connections setting:              30\n\
+max_worker_processes setting:         8\n\
+max_wal_senders setting:              16\n\
+max_prepared_xacts setting:           0\n\
+max_locks_per_xact setting:           64\n\
+track_commit_timestamp setting:       off\n";
+    let mut h = Fake::default();
+    h.on("pg_controldata", true, crashed, "");
+    h.on(
+        "IDENTIFY_SYSTEM",
+        true,
+        "7300000000000000001|2|0/3000060|\n",
+        "",
+    );
+    handle(
+        "prepare",
+        &request(&s, 1, Some(0), Some(Role::Replica)),
+        &mut h,
+    )
+    .unwrap();
+    let single = h
+        .ran
+        .iter()
+        .position(|(p, a, _)| p == "postgres" && a.contains(&"--single".to_owned()))
+        .expect("crash recovery in single-user mode");
+    let (_, args, _) = &h.ran[single];
+    for set in [
+        "max_connections=30",
+        "max_locks_per_transaction=64",
+        "track_commit_timestamp=off",
+    ] {
+        assert!(args.contains(&set.to_owned()), "{set} in {args:?}");
+    }
+    let rewind = h
+        .ran
+        .iter()
+        .position(|(p, _, _)| p == "pg_rewind")
+        .expect("rewound");
+    assert!(single < rewind, "recovered before the rewind");
+
+    // A primary named on data that ran: no single-user mode at all.
+    let mut h = Fake::default();
+    h.on("pg_controldata", true, crashed, "");
+    handle(
+        "prepare",
+        &request(&s, 0, Some(0), Some(Role::Primary)),
+        &mut h,
+    )
+    .unwrap();
+    assert!(!h.ran("--single"), "{:?}", h.ran);
+}
+
+#[test]
 fn a_replica_is_copied_when_empty_rewound_when_it_ran_as_primary_and_refused_another_database() {
     let s = setup();
     if !usable(&s) {
