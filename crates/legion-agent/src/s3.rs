@@ -358,6 +358,97 @@ impl S3 {
     fn block<T>(&self, f: impl std::future::Future<Output = T>) -> T {
         self.rt.block_on(f)
     }
+
+    /// The size of the object `name` under this one's keys, if there.
+    pub(crate) fn size_of(&self, name: &str) -> Result<Option<u64>, String> {
+        let key = format!("{}/{name}", self.base);
+        self.block(async {
+            match self
+                .call(reqwest::Method::HEAD, &key, &[], Vec::new(), true)
+                .await
+            {
+                Ok(r) => Ok(r.content_length()),
+                // A HEAD's 404 has no body to say more.
+                Err(e) if e.contains(": 404 ") => Ok(None),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    /// Stores `data` as the object `name` under this one's keys, whole.
+    pub(crate) fn put(&self, name: &str, data: Vec<u8>) -> Result<(), String> {
+        let key = format!("{}/{name}", self.base);
+        self.block(self.call(reqwest::Method::PUT, &key, &[], data, true))
+            .map(drop)
+    }
+
+    /// The objects under this one's keys: each name, and when it was
+    /// stored (Unix ms).
+    pub(crate) fn dated(&self) -> Result<Vec<(String, i64)>, String> {
+        let prefix = format!("{}/", self.base);
+        self.block(async {
+            let mut found = Vec::new();
+            let mut next = String::new();
+            loop {
+                let mut q = vec![("list-type", "2"), ("prefix", prefix.as_str())];
+                if !next.is_empty() {
+                    q.push(("continuation-token", &next));
+                }
+                let r = self
+                    .call(reqwest::Method::GET, "", &q, Vec::new(), true)
+                    .await?;
+                let xml = r.text().await.map_err(|e| format!("listing: {e}"))?;
+                for c in blocks(&xml, "Contents") {
+                    let key = texts(c, "Key").into_iter().next().unwrap_or_default();
+                    let at = texts(c, "LastModified")
+                        .first()
+                        .and_then(|t| iso_ms(t))
+                        .unwrap_or(0);
+                    if let Some(name) = key.strip_prefix(&prefix)
+                        && !name.contains('/')
+                    {
+                        found.push((name.to_owned(), at));
+                    }
+                }
+                let truncated = texts(&xml, "IsTruncated")
+                    .first()
+                    .is_some_and(|t| t == "true");
+                next = texts(&xml, "NextContinuationToken")
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                if !truncated || next.is_empty() {
+                    return Ok(found);
+                }
+            }
+        })
+    }
+
+    /// Removes the object `name` under this one's keys.
+    pub(crate) fn remove(&self, name: &str) -> Result<(), String> {
+        let key = format!("{}/{name}", self.base);
+        self.block(self.call(reqwest::Method::DELETE, &key, &[], Vec::new(), true))
+            .map(drop)
+    }
+}
+
+/// `2026-11-25T04:05:06.000Z` (S3's `LastModified`) in Unix ms.
+pub(crate) fn iso_ms(t: &str) -> Option<i64> {
+    let (date, time) = t.trim().trim_end_matches('Z').split_once('T')?;
+    let mut d = date.split('-').map(|x| x.parse::<i64>());
+    let (y, m, day) = (d.next()?.ok()?, d.next()?.ok()?, d.next()?.ok()?);
+    let (hms, frac) = time.split_once('.').unwrap_or((time, "0"));
+    let mut h = hms.split(':').map(|x| x.parse::<i64>());
+    let (hh, mm, ss) = (h.next()?.ok()?, h.next()?.ok()?, h.next()?.ok()?);
+    let ms: i64 = format!("{frac:0<3}")[..3].parse().ok()?;
+    // Days since 1970-01-01 of a civil date (Howard Hinnant's algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(((days * 24 + hh) * 60 + mm) * 60_000 + ss * 1000 + ms)
 }
 
 impl Remote for S3 {

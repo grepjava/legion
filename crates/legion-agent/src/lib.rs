@@ -21,6 +21,7 @@ use legion_sys::Sys;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
+mod archive;
 mod backups;
 mod browse;
 mod build;

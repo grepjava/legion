@@ -77,6 +77,11 @@ message SessionOpen {
     // from before it ends the session with an error: the session has no
     // action.
     ResumeToken resume_token = 24;
+    // Managers only, a replicated database's log archiving (DESIGN.md
+    // 6.9): the files of a member's spool shipped to the target and
+    // removed, the target pruned when asked. An agent from before it ends
+    // the session with an error: the session has no action.
+    ArchiveRun archive_run = 25;
   }
 }
 
@@ -360,6 +365,22 @@ message BackupRun {
   string snapshot = 3;
   string base = 4;
   uint32 keep = 5;
+}
+
+// Ships each finished file of the spool at `path` in the Volume `volume`
+// (its mountpoint's relative path) to the target, under
+// `<prefix>/<of>/wal/<name>` (`of` is `<namespace>.<service>`), unless the
+// target holds it already, then removes it from the spool; files ending
+// `.part` are still being written. With `prune`, removes the target's
+// older than `keep_seconds`. Says `{"shipped", "bytes", "last", "pending",
+// "pruned"}` as JSON on `stdout`, then `exit_code` 0.
+message ArchiveRun {
+  string volume = 1;
+  string path = 2;
+  BackupTargetAccess target = 3;
+  string of = 4;
+  uint64 keep_seconds = 5;
+  bool prune = 6;
 }
 
 // The Volume's backups the target holds, oldest first, as `snapshots`.

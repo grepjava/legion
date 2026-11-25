@@ -115,6 +115,7 @@ pub(crate) async fn run(
                     crate::replicate::lead(&store, &hub, &activity),
                     crate::snapshots::lead(&store, &hub),
                     crate::backups::lead(&store, &hub, &activity),
+                    crate::archive::lead(&store, &hub),
                     crate::exports::lead(&store, &hub),
                 );
             } => {}

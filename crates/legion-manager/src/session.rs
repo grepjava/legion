@@ -237,6 +237,11 @@ impl Pods for PodsService {
                     "a Volume's backups go through its `backup` and Volumes.Backups and RestoreFrom",
                 ));
             }
+            Some(Action::ArchiveRun(_)) => {
+                return Err(Status::invalid_argument(
+                    "a database's log is archived by the managers, as its `replication.archive` says",
+                ));
+            }
             Some(Action::ImageOp(_)) => {
                 return Err(Status::invalid_argument(
                     "node image actions go through Cluster.NodeImages",

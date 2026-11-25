@@ -23,6 +23,7 @@ pub mod console;
 mod gateway;
 mod lead;
 pub use gateway::Console;
+mod archive;
 mod backups;
 pub mod controller;
 mod diagnostics;
