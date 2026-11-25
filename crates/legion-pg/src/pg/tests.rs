@@ -690,9 +690,15 @@ fn a_restored_backup_replays_the_log_to_the_time_asked_once() {
         conf.contains("restore_command = 'cp \"/var/db/pg/legion_restore/%f\" \"%p\""),
         "{conf}"
     );
+    // As PostgreSQL takes it: `Z` is refused as a time zone abbreviation
+    // (found in the lab).
     assert!(
-        conf.contains("recovery_target_time = '2026-11-25T10:00:00Z'"),
+        conf.contains("recovery_target_time = '2026-11-25 10:00:00+00'"),
         "{conf}"
+    );
+    assert_eq!(
+        pg_time("2026-11-25T10:00:00.250Z"),
+        "2026-11-25 10:00:00.250+00"
     );
     assert!(
         conf.contains("recovery_target_action = 'promote'"),

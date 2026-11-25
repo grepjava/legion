@@ -437,7 +437,7 @@ pub fn conf(
             spool = spool_of(data),
         ));
         if let Some(to) = &r.to {
-            c.push_str(&format!("recovery_target_time = '{to}'\n"));
+            c.push_str(&format!("recovery_target_time = '{}'\n", pg_time(to)));
         }
     }
     if let Some(p) = primary {
@@ -458,6 +458,16 @@ pub fn conf(
         ));
     }
     c
+}
+
+/// An RFC 3339 time in UTC (`2026-11-25T10:00:00Z`) as
+/// `recovery_target_time` takes it, which refuses time zone abbreviations,
+/// `Z` among them: `2026-11-25 10:00:00+00`.
+pub fn pg_time(t: &str) -> String {
+    match t.strip_suffix('Z') {
+        Some(utc) => format!("{}+00", utc.replacen('T', " ", 1)),
+        None => t.replacen('T', " ", 1),
+    }
 }
 
 /// `pg_hba.conf` with this plugin's lines (between its markers) as they
