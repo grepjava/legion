@@ -179,6 +179,7 @@ impl Check<'_> {
             (caps.rewind, "rewind"),
             (caps.seed_from_snapshot, "seedFromSnapshot"),
             (caps.probe, "probe"),
+            (caps.archive, "archive"),
         ]
         .iter()
         .filter(|(on, _)| *on)
