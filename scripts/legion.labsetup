@@ -87,6 +87,11 @@ su -l lab -c "rm -rf ~/legion-prev && mkdir ~/legion-prev &&
     cd ~/legion-prev && cargo build --locked --bin legion"
 test -x /home/lab/legion-prev/target/debug/legion
 
+# Legion's PostgreSQL replication plugin, for the replication test, built
+# from the tree under test as the tests themselves are.
+su -l lab -c "cd ~/tree && cargo build --bin legion-replication-postgres -p legion-pg"
+test -x /home/lab/tree/target/debug/legion-replication-postgres
+
 cat > /var/tmp/lab.env << EOF
 export LEGION_STORAGE_NFS=127.0.0.1:$lvol/export
 export LEGION_SYS_NFS=127.0.0.1:$lvol/export
@@ -98,6 +103,7 @@ export LEGION_BHYVE_LAB=/var/tmp/lbhyve
 export LEGION_CLUSTER_LAB=/var/tmp/lcluster
 export LEGION_PG_IMAGE=/var/tmp/legion-pg.oci.tar
 export LEGION_PREVIOUS=/home/lab/legion-prev/target/debug/legion
+export LEGION_PG_PLUGIN=/home/lab/tree/target/debug/legion-replication-postgres
 export LEGION_CLUSTER_HOST=10.78.0.1
 export LEGION_CLUSTER_VMS='lab2=lab@10.78.0.2 lab3=lab@10.78.0.3'
 export LEGION_CLUSTER_KEY=/home/lab/.ssh/id_ed25519

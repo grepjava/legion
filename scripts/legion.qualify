@@ -134,7 +134,7 @@ test legion stateful a_replicated_volume_carries_on_from_its_copy_when_its_host_
 test legion stateful a_replicated_volume_fails_over_on_its_own_when_its_node_is_cut_off host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_PG_IMAGE
 # A replicated database (DESIGN.md 6.9): PostgreSQL with Legion's plugin, the
 # primary's node cut off, its replica promoted, the old one rejoining.
-test legion replication a_replicated_database_fails_over_and_its_old_primary_rejoins host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_PG_IMAGE
+test legion replication a_replicated_database_fails_over_and_its_old_primary_rejoins host cluster 3600 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY env:LEGION_PG_IMAGE env:LEGION_PG_PLUGIN
 # Scheduled snapshots and backups (TODO.MD item 1): n3 the SSH backup host.
 test legion backups volumes_keep_scheduled_snapshots_and_backups_that_restore host cluster 2400 env:LEGION_CLUSTER_LAB env:LEGION_CLUSTER_HOST env:LEGION_CLUSTER_VMS env:LEGION_CLUSTER_KEY
 # pf set up by legion doctor --fix pf (TODO.MD item 3), on n2's pf.conf, put back after.

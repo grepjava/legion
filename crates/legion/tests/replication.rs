@@ -13,7 +13,8 @@
 //! It drives real daemons, so it is ignored by default and run on the lab
 //! of `tests/common` (see there), as root, with the Postgres image of
 //! `tests/stateful/Containerfile` in `LEGION_PG_IMAGE`, as `stateful.rs`
-//! is. It builds the plugin (`legion-pg`) and installs it on every node.
+//! is, and the plugin (`legion-pg`) built in `LEGION_PG_PLUGIN`, which it
+//! installs on every node.
 
 mod common;
 
@@ -77,23 +78,12 @@ spec:
     volumes: [{ name: pg, claim: { size: 512Mi } }]
 "#;
 
-/// The plugin, built for this host: the tree's `legion-pg`.
+/// The plugin, built for this host: `legion-pg` of the tree under test,
+/// as the lab's setup builds it.
 fn plugin() -> String {
-    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
-    let status = std::process::Command::new("cargo")
-        .args([
-            "build",
-            "--bin",
-            "legion-replication-postgres",
-            "-p",
-            "legion-pg",
-        ])
-        .current_dir(root)
-        .status()
-        .expect("cargo");
-    assert!(status.success(), "building the plugin");
-    let target = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| format!("{root}/target"));
-    format!("{target}/debug/legion-replication-postgres")
+    let path = std::env::var("LEGION_PG_PLUGIN").expect("set LEGION_PG_PLUGIN");
+    assert!(std::path::Path::new(&path).is_file(), "no plugin at {path}");
+    path
 }
 
 impl Lab {
