@@ -14,7 +14,12 @@
 //! once the node's lease runs out (self-fencing, the watchdog), before
 //! the replica is promoted; the daemon back, the old primary rejoins.
 //! All along, the log is archived to a bucket (MinIO on n3): its segments
-//! and each new timeline's history are there at the end. Then `legion
+//! and each new timeline's history are there at the end, and the members'
+//! Volumes are backed up there since the update. In the console, in a
+//! headless Chromium, the Service's Replication tab shows the members and
+//! asks for a switchover, which happens. Then the database is restored to a
+//! point in time as a new Service (`legion replication restore`): it has
+//! the rows written before the point and not the one after. Last, `legion
 //! replication check` runs the plugin through the contract with three
 //! members in a namespace of its own.
 //!
@@ -22,10 +27,14 @@
 //! of `tests/common` (see there), as root, with the Postgres image of
 //! `tests/stateful/Containerfile` in `LEGION_PG_IMAGE`, as `stateful.rs`
 //! is, and the plugin (`legion-pg`) built in `LEGION_PG_PLUGIN`, which it
-//! installs on every node.
+//! installs on every node, and a Chromium in `LEGION_BROWSER`, as the
+//! console's tests have.
+
+#![cfg(unix)]
 
 mod common;
 
+use common::browser::Browser;
 use common::{Lab, Role, text, vm, wait};
 use serde_json::Value;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -140,8 +149,13 @@ impl Lab {
 
     /// The running task of member `n`.
     fn member(&self, n: u64) -> Option<Value> {
+        self.member_of("pg", n)
+    }
+
+    /// The running task of Service `svc`'s member `n`.
+    fn member_of(&self, svc: &str, n: u64) -> Option<Value> {
         self.list("tasks", "data").into_iter().find(|t| {
-            t["spec"]["service"] == "pg"
+            t["spec"]["service"] == svc
                 && t["spec"]["slot"] == n
                 && t["spec"]["desiredState"] == "running"
                 && t["status"]["state"] == "running"
@@ -150,7 +164,12 @@ impl Lab {
 
     /// `query` on member `n`, over its own socket, as the superuser.
     fn psql(&self, n: u64, query: &str) -> Option<String> {
-        let t = self.member(n)?;
+        self.psql_of("pg", n, query)
+    }
+
+    /// `query` on Service `svc`'s member `n`.
+    fn psql_of(&self, svc: &str, n: u64, query: &str) -> Option<String> {
+        let t = self.member_of(svc, n)?;
         let task = t["metadata"]["name"].as_str()?.to_owned();
         let out = self.legion(
             &[
@@ -279,12 +298,19 @@ pfctl -q -F states
 #[ignore = "needs root and ZFS on FreeBSD, two more nodes and the image; see the module docs"]
 fn a_replicated_database_fails_over_and_its_old_primary_rejoins() {
     let image = std::env::var("LEGION_PG_IMAGE").expect("set LEGION_PG_IMAGE");
+    let browser = std::env::var("LEGION_BROWSER").expect("set LEGION_BROWSER to a Chromium");
+    assert!(
+        std::path::Path::new(&browser).is_file(),
+        "no browser at {browser}"
+    );
     let built = plugin();
     let mut lab = Lab::from_env();
     let step = |what: &str| eprintln!("--- {what}");
+    let listen = format!("{}:7480", lab.host);
+    let url = format!("https://{listen}");
 
     step("a manager and two workers, the plugin on each; the manager paused");
-    lab.start_host(&[]);
+    lab.start_host(&["--console-listen", &listen]);
     lab.ok(&["init"]);
     let worker = lab.ok(&["join-token", "worker"]).trim().to_owned();
     lab.join(0, &worker, Role::Worker);
@@ -451,10 +477,17 @@ spec:
     });
 
     step("a rolling update replaces the replica, switches over, then the old primary");
-    let updated = APP.replace(
-        "-c, log_destination=stderr]",
-        "-c, log_destination=stderr, -c, work_mem=8MB]",
-    );
+    // With it, each member's Volume is backed up to the bucket, at once
+    // and then hourly: what a restore to a point in time starts from.
+    let updated = APP
+        .replace(
+            "-c, log_destination=stderr]",
+            "-c, log_destination=stderr, -c, work_mem=8MB]",
+        )
+        .replace(
+            "claim: { size: 512Mi }",
+            "claim: { size: 512Mi, backup: { target: pg-wal, every: 1h, keep: 2 } }",
+        );
     std::fs::write(&app, &updated).unwrap();
     lab.ok(&["apply", "-f", app.to_str().unwrap()]);
     let on_new_pod = |n: u64| {
@@ -583,7 +616,184 @@ spec:
         text(&r.stdout)
     );
 
+    step("the console's Replication tab shows the members and asks for a switchover");
+    let mut b = Browser::start(&lab.dir.join("browser"));
+    let out = lab.ok(&["console", "login", "--url", &url]);
+    let link = out
+        .split_whitespace()
+        .find(|w| w.starts_with("https://"))
+        .unwrap_or_else(|| panic!("a sign-in link in {out:?}"))
+        .to_owned();
+    b.goto(&link);
+    b.shows("Sign out", 30);
+    b.goto(&format!("{url}/k/Service/data/pg?tab=replication"));
+    let primary = lab.repl()["primary"].as_str().unwrap().to_owned();
+    let replica = if primary == "pg-0" { "pg-1" } else { "pg-0" };
+    for shown in [
+        "named primary",
+        "healthy",
+        "streaming",
+        "Log archived to pg-wal",
+        "Change the primary",
+    ] {
+        b.shows(shown, 60);
+    }
+    let page = b.text();
+    assert!(page.contains(&primary) && page.contains(replica), "{page}");
+    b.eval(
+        "(() => { const s = document.querySelector('form.change select');
+           s.value = 'switchover'; s.dispatchEvent(new Event('change', { bubbles: true })); })()",
+    );
+    b.click("Ask for the switchover");
+    lab.waited_pg("the switchover the console asked for", 300, || {
+        let r = lab.repl();
+        r["primary"] == replica
+            && r["change"].is_null()
+            && r["lastChange"]["reason"] == "a switchover was asked for"
+    });
+    b.shows("Last change: switchover", 60);
+    lab.waited_pg("healthy after the console's switchover", 180, || {
+        lab.repl()["phase"] == "healthy"
+    });
+
+    step("restored to a point in time as a new Service: the rows before it, not after");
+    let wall = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    };
+    let volume = |name: &str| -> Value {
+        serde_json::from_str(&lab.ok(&["get", "volume", name, "-n", "data", "-o", "json"])).unwrap()
+    };
+    lab.waited_pg("a backup of each member's Volume", 600, || {
+        ["pg-pg-0", "pg-pg-1"]
+            .iter()
+            .all(|v| volume(v)["status"]["backup"]["takenMs"].as_i64().is_some())
+    });
+    lab.waited_pg("writing the row before the point", 120, || {
+        lab.through(0, "pg", "insert into orders (item) values ('before-point')")
+            .is_some()
+    });
+    let rows_then: u64 = lab
+        .through(0, "pg", "select count(*) from orders")
+        .and_then(|n| n.parse().ok())
+        .expect("counting the rows");
+    // Seconds apart, as the point is read from this host's clock and the
+    // commits are stamped by the VM's.
+    std::thread::sleep(Duration::from_secs(5));
+    // `2026-11-25T10:00:00Z`, from the stamp backups are named by.
+    let s = legion_api::volume::stamp(wall());
+    let point = format!(
+        "{}-{}-{}T{}:{}:{}Z",
+        &s[0..4],
+        &s[4..6],
+        &s[6..8],
+        &s[9..11],
+        &s[11..13],
+        &s[13..15]
+    );
+    std::thread::sleep(Duration::from_secs(5));
+    lab.through(0, "pg", "insert into orders (item) values ('after-point')")
+        .expect("writing the row after the point");
+    // The segment holding both rows finished and shipped.
+    let p: u64 = lab.repl()["primary"]
+        .as_str()
+        .and_then(|p| p.strip_prefix("pg-"))
+        .and_then(|n| n.parse().ok())
+        .unwrap();
+    lab.psql(p, "select pg_switch_wal()")
+        .expect("switching the primary's WAL");
+    let switched = wall();
+    lab.waited_pg("the log past the point archived", 300, || {
+        let a = &lab.pg()["status"]["archive"];
+        a["shippedMs"].as_i64().is_some_and(|t| t > switched + 5000)
+            && a["pending"].as_u64().unwrap_or(0) == 0
+    });
+    lab.ok(&[
+        "replication",
+        "restore",
+        "pg-restored",
+        "--from",
+        "pg",
+        "--to",
+        &point,
+        "-n",
+        "data",
+    ]);
+    let restored = || {
+        lab.list("services", "data")
+            .into_iter()
+            .find(|s| s["metadata"]["name"] == "pg-restored")
+            .unwrap_or_default()
+    };
+    lab.waited_pg("the restored database serving", 900, || {
+        let s = restored();
+        s["status"]["restore"]["phase"] == "done"
+            && s["status"]["replication"]["phase"] == "healthy"
+    });
+    let st = restored()["status"]["restore"].clone();
+    eprintln!("restored: {st}");
+    assert!(
+        st["backup"]
+            .as_str()
+            .is_some_and(|b| b.starts_with("pg-pg-")),
+        "{st}"
+    );
+    assert!(st["fetched"].as_u64().unwrap_or(0) > 3, "{st}");
+    let count = |item: &str| {
+        lab.psql_of(
+            "pg-restored",
+            0,
+            &format!("select count(*) from orders where item = '{item}'"),
+        )
+    };
+    assert_eq!(
+        count("before-point").as_deref(),
+        Some("1"),
+        "the row before the point"
+    );
+    assert_eq!(
+        count("after-point").as_deref(),
+        Some("0"),
+        "the row after it"
+    );
+    assert_eq!(
+        lab.psql_of("pg-restored", 0, "select count(*) from orders")
+            .and_then(|n| n.parse::<u64>().ok()),
+        Some(rows_then)
+    );
+    assert_eq!(
+        lab.psql_of("pg-restored", 0, "select pg_is_in_recovery()")
+            .as_deref(),
+        Some("f"),
+        "the restored member serves as the primary"
+    );
+    // The original goes on, both rows there.
+    assert_eq!(
+        lab.through(
+            0,
+            "pg",
+            "select count(*) from orders where item = 'after-point'"
+        )
+        .as_deref(),
+        Some("1")
+    );
+    lab.waited_pg("the fetched log removed once replayed", 120, || {
+        restored()["status"]["restore"]["cleaned"] == true
+    });
+    let r = lab.legion(&["replication", "status", "pg-restored", "-n", "data"], &[]);
+    assert!(
+        text(&r.stdout).contains("restore done: from pg-pg-"),
+        "{}",
+        text(&r.stdout)
+    );
+    b.goto(&format!("{url}/k/Service/data/pg-restored?tab=replication"));
+    b.shows("Restore done", 60);
+    b.shows("named primary", 60);
+
     step("clean up");
+    lab.ok(&["delete", "service", "pg-restored", "-n", "data"]);
     lab.ok(&["delete", "service", "pg", "-n", "data"]);
     lab.waited_pg("every task gone", 180, || {
         lab.list("tasks", "data")
