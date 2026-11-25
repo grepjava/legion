@@ -34,6 +34,11 @@ members are told their role only on nodes that read it.
   none during a change), and with `read: true`, `<service>-read` to the
   healthy replicas.
 - **`legion replication status|switchover|failover`.**
+- **A primary is handed over, not stopped**: a drain of its node (or its
+  data moving), a rolling update (which now replaces the replicas first and
+  the primary last) and a scale-down past it switch over to a healthy
+  replica first; the drain shows it as `switchover` meanwhile. With no
+  healthy replica to hand over to, it stops as before.
 
 ### Networking
 

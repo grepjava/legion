@@ -138,7 +138,11 @@ fn reported_storage(
     for (node, t) in nodes {
         for v in &t.volumes {
             f.sample(
-                &[("namespace", &v.namespace), ("volume", &v.volume), ("node", node)],
+                &[
+                    ("namespace", &v.namespace),
+                    ("volume", &v.volume),
+                    ("node", node),
+                ],
                 v.used_bytes as f64,
             );
         }
@@ -150,7 +154,11 @@ fn reported_storage(
     for (node, t) in nodes {
         for v in &t.volumes {
             f.sample(
-                &[("namespace", &v.namespace), ("volume", &v.volume), ("node", node)],
+                &[
+                    ("namespace", &v.namespace),
+                    ("volume", &v.volume),
+                    ("node", node),
+                ],
                 v.avail_bytes as f64,
             );
         }
@@ -179,7 +187,11 @@ fn sizes(store: &Store, m: &mut Metrics) {
         };
         let node = o.status["node"].as_str().unwrap_or_default();
         f.sample(
-            &[("namespace", &o.metadata.namespace), ("volume", &o.metadata.name), ("node", node)],
+            &[
+                ("namespace", &o.metadata.namespace),
+                ("volume", &o.metadata.name),
+                ("node", node),
+            ],
             size.0 as f64,
         );
     }

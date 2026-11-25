@@ -726,6 +726,12 @@ fn service(
     if stateful {
         claims(s, &wanted, volumes, plan);
     }
+    // A replicated database's primary, which a drain, a rolling update or
+    // a scale-down hands over to a replica before stopping (DESIGN.md
+    // 6.9), and why it is to.
+    let primary = replication::hands_over(s, tasks, memory).map(|t| t.uid().to_owned());
+    let primary = primary.as_deref();
+    let mut handover: Option<&'static str> = None;
 
     // Slots no longer wanted: stop what runs there and drop the history. A
     // node that only takes no new tasks (paused, suspect, or tainted
@@ -766,6 +772,10 @@ fn service(
         }
         for t in list {
             if t.active() {
+                if primary == Some(t.uid()) {
+                    hand_over(t, SCALED_DOWN, &mut handover, plan);
+                    continue;
+                }
                 if stateful {
                     if one_stopping {
                         continue;
@@ -927,6 +937,14 @@ fn service(
     if stateful {
         order.reverse();
     }
+    // A replicated database's primary is updated last, once its replicas
+    // are, so that it hands over to an updated one.
+    if let Some(Some(p)) = &primary_slot
+        && let Some(i) = order.iter().position(|o| *o == p)
+    {
+        let p = order.remove(i);
+        order.push(p);
+    }
 
     // An update that snapshots has its tasks take the snapshot before they
     // run, and its rollback's tasks return to it.
@@ -992,8 +1010,11 @@ fn service(
             // One that cannot be placed before the data has moved has the
             // old task stop once it is copied.
             if new.status.state == TaskState::Running && new.status.ready {
-                for old in outdated.iter().chain(&moving) {
-                    plan.actions.push(stop(old));
+                for old in &outdated {
+                    stop_or_hand_over(old, primary, UPDATED, &mut handover, plan);
+                }
+                for old in &moving {
+                    stop_or_hand_over(old, primary, MOVED, &mut handover, plan);
                 }
             } else {
                 if outdated.iter().any(|t| up(t)) {
@@ -1001,18 +1022,18 @@ fn service(
                     // only holds room the new one may need: the ready one
                     // stays.
                     for old in outdated.iter().filter(|t| !up(t)) {
-                        plan.actions.push(stop(old));
+                        stop_or_hand_over(old, primary, UPDATED, &mut handover, plan);
                     }
                 }
                 if bound && !moving.is_empty() && !new.placed() && copied && may_stop(&moving) {
                     for old in &moving {
-                        plan.actions.push(stop(old));
+                        stop_or_hand_over(old, primary, MOVED, &mut handover, plan);
                     }
                 } else if !bound {
                     // Off a draining node and not ready: nothing to wait
                     // for.
                     for old in moving.iter().filter(|t| !up(t)) {
-                        plan.actions.push(stop(old));
+                        stop_or_hand_over(old, primary, MOVED, &mut handover, plan);
                     }
                     for old in moving.iter().filter(|t| up(t)) {
                         plan.waits.insert(old.uid().to_owned(), "replacement");
@@ -1041,7 +1062,7 @@ fn service(
             let stopping = copied && (bound || !start_first || !ready) && may_stop(&moving);
             if stopping {
                 for old in &moving {
-                    plan.actions.push(stop(old));
+                    stop_or_hand_over(old, primary, MOVED, &mut handover, plan);
                 }
             } else {
                 // Not bound, it is replaced first; bound, it waits.
@@ -1076,7 +1097,7 @@ fn service(
                 if !start_first && may_stop(&outdated) {
                     budget -= 1;
                     for old in &outdated {
-                        plan.actions.push(stop(old));
+                        stop_or_hand_over(old, primary, UPDATED, &mut handover, plan);
                     }
                 } else if !stateful {
                     budget -= 1;
@@ -1167,7 +1188,7 @@ fn service(
     }
 
     pause(s, tasks, nodes, plan);
-    let replication = replication::pass(s, tasks, nodes, memory, now, plan);
+    let replication = replication::pass(s, tasks, nodes, memory, now, handover, plan);
 
     // Status, from the tasks as they are now.
     let running: Vec<&&Task> = tasks
@@ -1585,6 +1606,34 @@ fn pause(s: &Service, tasks: &[&Task], nodes: &[Node], plan: &mut Plan) {
         plan.actions
             .push(Action::Update(o, t.object.metadata.version));
     }
+}
+
+/// Why a replicated database's primary hands over: what would stop it.
+const MOVED: &str = "the primary is moving off its node";
+const UPDATED: &str = "a rolling update replaces the primary";
+const SCALED_DOWN: &str = "scaling down removes the primary";
+
+/// Stops `t`, unless it is a replicated database's `primary` that hands
+/// over to a replica first: it then runs on (`switchover`) and the
+/// replication pass starts the switchover, after which it is a replica
+/// and stops as any.
+fn stop_or_hand_over(
+    t: &Task,
+    primary: Option<&str>,
+    why: &'static str,
+    handover: &mut Option<&'static str>,
+    plan: &mut Plan,
+) {
+    if primary == Some(t.uid()) {
+        hand_over(t, why, handover, plan);
+    } else {
+        plan.actions.push(stop(t));
+    }
+}
+
+fn hand_over(t: &Task, why: &'static str, handover: &mut Option<&'static str>, plan: &mut Plan) {
+    handover.get_or_insert(why);
+    plan.waits.insert(t.uid().to_owned(), "switchover");
 }
 
 fn stop(t: &Task) -> Action {

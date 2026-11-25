@@ -51,6 +51,7 @@ pub(super) fn pass(
     nodes: &[Node],
     memory: &mut Memory,
     now: Instant,
+    handover: Option<&str>,
     plan: &mut Plan,
 ) -> Option<ReplicationStatus> {
     let r = s.spec.replication.as_ref()?;
@@ -68,23 +69,9 @@ pub(super) fn pass(
         s.spec.replicas.unwrap_or(1)
     };
 
-    // Each ordinal's task: the newest one wanted running.
-    let mut current: BTreeMap<u32, &Task> = BTreeMap::new();
-    for t in tasks {
-        if let Some(i) = t.spec.slot
-            && t.active()
-            && current.get(&i).is_none_or(|c| c.uid() < t.uid())
-        {
-            current.insert(i, t);
-        }
-    }
-    let report = |i: u32| -> Option<&MemberReport> {
-        let t = current.get(&i)?;
-        let (_, age, r) = memory
-            .members
-            .get(&format!("{ns}/{}", t.object.metadata.name))?;
-        (*age < FRESH).then_some(r)
-    };
+    let current = current(tasks);
+    let members = &memory.members;
+    let report = |i: u32| fresh(members, ns, current.get(&i)?);
     let status_of = |i: u32| report(i).and_then(|r| r.status.as_ref());
 
     // What each member last said, kept while it says nothing new.
@@ -128,6 +115,25 @@ pub(super) fn pass(
         })
         .unwrap_or_default()
     };
+
+    // A planned stop of the primary (a drain, an update, a scale-down)
+    // waits for a switchover to a replica: started here.
+    if let Some(why) = handover
+        && st.change.is_none()
+        && primary_ord.is_some()
+    {
+        st.change = Some(Change {
+            kind: ChangeKind::Switchover,
+            from: st.primary.clone(),
+            to: None,
+            reason: why.to_owned(),
+            started: wall_ms(),
+            force: false,
+            fence: fence_of(primary_ord),
+            target: None,
+        });
+        memory.unhealthy_since.remove(&uid);
+    }
 
     // The operator's request, acted on once.
     if let Some(q) = &r.request
@@ -471,6 +477,65 @@ pub(super) fn pass(
         memory.replication_written.insert(uid, now);
     }
     Some(st)
+}
+
+/// Each ordinal's task: the newest one wanted running.
+fn current<'a>(tasks: &[&'a Task]) -> BTreeMap<u32, &'a Task> {
+    let mut current: BTreeMap<u32, &Task> = BTreeMap::new();
+    for t in tasks {
+        if let Some(i) = t.spec.slot
+            && t.active()
+            && current.get(&i).is_none_or(|c| c.uid() < t.uid())
+        {
+            current.insert(i, t);
+        }
+    }
+    current
+}
+
+type Members = BTreeMap<String, (String, Duration, MemberReport)>;
+
+/// What a member's task said lately, if it did.
+fn fresh<'m>(members: &'m Members, ns: &str, t: &Task) -> Option<&'m MemberReport> {
+    let (_, age, r) = members.get(&format!("{ns}/{}", t.object.metadata.name))?;
+    (*age < FRESH).then_some(r)
+}
+
+/// The primary's task, when a planned stop of it (a drain, a rolling
+/// update, a scale-down) is to wait for a switchover: no change is under
+/// way, it is healthy, and a member staying on is a healthy replica
+/// streaming from it. Without such a replica it is simply stopped, as
+/// there is no one to hand over to.
+pub(super) fn hands_over<'a>(s: &Service, tasks: &[&'a Task], memory: &Memory) -> Option<&'a Task> {
+    s.spec.replication.as_ref()?;
+    let st: ReplicationStatus = s
+        .object
+        .status
+        .get("replication")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())?;
+    if st.change.is_some() {
+        return None;
+    }
+    let svc = &s.object.metadata.name;
+    let ns = &s.object.metadata.namespace;
+    let n = if s.spec.stopped {
+        0
+    } else {
+        s.spec.replicas.unwrap_or(1)
+    };
+    let p = ordinal(svc, st.primary.as_deref()?)?;
+    let current = current(tasks);
+    let status = |i: u32| {
+        fresh(&memory.members, ns, current.get(&i)?)?
+            .status
+            .as_ref()
+    };
+    let primary = current.get(&p)?;
+    let healthy = status(p).is_some_and(|x| x.role == Role::Primary && x.healthy);
+    let successor = (0..n)
+        .filter(|i| *i != p)
+        .any(|i| status(i).is_some_and(|x| x.role == Role::Replica && x.healthy && x.streaming));
+    (healthy && successor).then_some(*primary)
 }
 
 /// Whether a replica is within `maximumLag` of the primary.

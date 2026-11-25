@@ -968,7 +968,13 @@ mod tests {
         r.partial.as_mut().unwrap().tries = 2;
         under_way(&mut r, 4000, "n1", "", "legion-replica-2000");
         assert_eq!(r.partial.as_ref().unwrap().tries, 2);
-        under_way(&mut r, 5000, "n1", "legion-replica-2000", "legion-replica-5000");
+        under_way(
+            &mut r,
+            5000,
+            "n1",
+            "legion-replica-2000",
+            "legion-replica-5000",
+        );
         assert_eq!(r.partial.as_ref().unwrap().tries, 0);
     }
 

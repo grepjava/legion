@@ -356,10 +356,16 @@ mod tests {
             ("unmet", "required", "kldload pf")
         );
         assert_eq!((f[1].id.as_str(), f[1].remedy.as_str()), ("racct", ""));
-        assert!(said.pf_fix.is_none(), "an agent from before --fix pf says nothing of it");
+        assert!(
+            said.pf_fix.is_none(),
+            "an agent from before --fix pf says nothing of it"
+        );
 
         // An agent with it says what `--fix pf` would do, carried as it is.
-        let hooks = legion_sys::pffix::Hooks { anchor: "legion/*", lines: legion_net::lb::HOOKS };
+        let hooks = legion_sys::pffix::Hooks {
+            anchor: "legion/*",
+            lines: legion_net::lb::HOOKS,
+        };
         let plan = json!({
             "path": "/nonexistent/pf.conf",
             "plan": legion_sys::pffix::plan(None, &[hooks]),
@@ -371,6 +377,11 @@ mod tests {
         let fix = said.pf_fix.unwrap();
         assert_eq!(fix["path"], "/nonexistent/pf.conf");
         assert_eq!(fix["plan"]["action"], "change");
-        assert!(fix["plan"]["added"].as_array().unwrap().contains(&json!("anchor \"legion/*\"")));
+        assert!(
+            fix["plan"]["added"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("anchor \"legion/*\""))
+        );
     }
 }

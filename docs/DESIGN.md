@@ -1843,9 +1843,14 @@ How it was built, where it differs from the outline below:
 - **Requests**: `legion replication switchover|failover` write
   `spec.replication.request` (kind, target, force, a time), which the
   leader acts on once (`status.replication.handled`, `refused`).
-- **Not built yet**: switchover before a drain, a rolling update or a
-  scale-down that would stop the primary (they stop it, and the primary is
-  replaced by failover); the console tab; `legion replication check`; the
+- **Draining, updates and scale-downs hand over** (below): the planner
+  holds back the stop of a healthy primary that has a healthy, streaming
+  replica staying on, reports it as `switchover`, and the replication pass
+  starts a switchover with the reason; once a replica is promoted the old
+  primary is a replica and stops like one. Without such a replica it is
+  stopped as before. A rolling update takes the primary's slot last.
+  Eviction by a `NoExecute` taint stays immediate.
+- **Not built yet**: the console tab; `legion replication check`; the
   watchdog; WAL archiving.
 
 **The spec.** The fields go on a stateful Service:

@@ -5174,7 +5174,10 @@ fn a_replicated_database_names_its_first_primary_and_tells_each_member() {
     let r = t.spec.replication.as_ref().unwrap();
     assert_eq!(r.topology.primary.as_ref().unwrap().member, "pg-0");
     assert_eq!(r.topology.members.len(), 3);
-    assert_eq!(r.topology.primary.as_ref().unwrap().dns, "pg-0.pg.shop.legion");
+    assert_eq!(
+        r.topology.primary.as_ref().unwrap().dns,
+        "pg-0.pg.shop.legion"
+    );
 
     w.members_say(1, |_| 100, &[]);
     w.settle();
@@ -5517,3 +5520,156 @@ fn a_members_task_is_made_knowing_its_role_and_kept_off_old_nodes() {
 }
 
 type TaskSpecOf = legion_api::task::TaskSpec;
+
+impl World {
+    /// Steps passes with every running member saying it is healthy at
+    /// `position`, until `done` holds; checks along the way that the
+    /// primary's task never stops unless a switchover was recorded first.
+    fn step_members(&mut self, position: u64, done: impl Fn(&mut World) -> bool) {
+        use legion_api::replication::spi::Role;
+        for _ in 0..80 {
+            if done(self) {
+                return;
+            }
+            self.members_say(1, |_| position, &[]);
+            let p = self.plan();
+            let st = self.status("pg").replication;
+            for a in &p.actions {
+                let Action::Update(o, _) = a else { continue };
+                let Some(t) = self.tasks.iter().find(|t| t.object.key() == o.key()) else {
+                    continue;
+                };
+                let primary = t
+                    .spec
+                    .replication
+                    .as_ref()
+                    .is_some_and(|r| r.role == Role::Primary);
+                if primary
+                    && o.spec["desiredState"] == "shutdown"
+                    && t.spec.desired_state == DesiredState::Running
+                {
+                    let recorded = st.as_ref().and_then(|s| s.change.as_ref()).is_some()
+                        || p.actions.iter().any(|a| {
+                            matches!(a, Action::Update(o, _) if o.kind == Kind::Service
+                                && o.status["replication"]["change"]["kind"] == "switchover")
+                        });
+                    assert!(
+                        recorded,
+                        "the primary {} stopped without a switchover",
+                        o.metadata.name
+                    );
+                }
+            }
+            self.apply(p.actions);
+            self.agents();
+        }
+        assert!(done(self), "did not get there: {:?}", self.tasks());
+    }
+}
+
+/// A rolling update replaces the replicas first, then switches over to an
+/// updated one, then replaces the old primary, which is never simply
+/// stopped.
+#[test]
+fn a_rolling_update_switches_over_before_replacing_the_primary() {
+    use legion_api::replication::ChangeKind;
+    let mut w = World::new();
+    database(&mut w, DATABASE);
+    w.members_say(1, |_| 500, &[]);
+    w.settle();
+    w.service("pg", &DATABASE.replace("pg:17", "pg:18"));
+    let image = |w: &mut World, i: u32| {
+        w.tasks
+            .iter()
+            .find(|t| t.spec.slot == Some(i) && active_running(t))
+            .map(|t| t.spec.pod.containers[0].image.clone())
+    };
+    w.step_members(500, |w| {
+        (0..3).all(|i| image(w, i).as_deref() == Some("pg:18"))
+            && w.replication("pg").change.is_none()
+    });
+    let st = w.replication("pg");
+    let last = st.last_change.clone().unwrap_or_else(|| panic!("{st:#?}"));
+    assert_eq!(last.kind, ChangeKind::Switchover);
+    assert_eq!(last.reason, "a rolling update replaces the primary");
+    assert_eq!(last.from.as_deref(), Some("pg-0"));
+    assert_ne!(st.primary.as_deref(), Some("pg-0"));
+    assert_eq!(w.roles("pg").get(&0).map(String::as_str), Some("replica"));
+    assert!(w.faults.is_empty(), "{:?}", w.faults);
+}
+
+/// Draining the primary's node switches over first: the primary runs on
+/// (`switchover`) until a replica is promoted, then moves as a replica.
+#[test]
+fn draining_the_primarys_node_switches_over_first() {
+    use legion_api::replication::ChangeKind;
+    let mut w = World::new();
+    database(&mut w, DATABASE);
+    w.node("n4", &[]);
+    w.nodes.last_mut().unwrap().status.protocol = legion_api::protocol::Protocol::current();
+    w.members_say(1, |_| 500, &[]);
+    w.settle();
+    let from = w.node_of(0);
+    w.availability(&from, Availability::Drain);
+    w.step_members(500, |w| {
+        w.migrate();
+        w.tasks
+            .iter()
+            .filter(|t| t.spec.node == from)
+            .all(|t| t.status.state.is_terminal())
+            && w.replication("pg").change.is_none()
+            && w.replication("pg").last_change.is_some()
+    });
+    let st = w.replication("pg");
+    let last = st.last_change.unwrap();
+    assert_eq!(last.kind, ChangeKind::Switchover);
+    assert_eq!(last.reason, "the primary is moving off its node");
+    assert_ne!(st.primary.as_deref(), Some("pg-0"));
+}
+
+/// Scaling down past the primary switches over to a member that stays;
+/// with no replica to hand over to, the primary is simply stopped.
+#[test]
+fn scaling_down_past_the_primary_switches_over_first() {
+    use legion_api::replication::ChangeKind;
+    let mut w = World::new();
+    database(&mut w, DATABASE);
+    w.members_say(1, |_| 500, &[]);
+    w.settle();
+    w.request("switchover", Some("pg-2"), 1);
+    w.step_members(500, |w| {
+        let st = w.replication("pg");
+        st.primary.as_deref() == Some("pg-2") && st.change.is_none()
+    });
+
+    let spec = w.services[0].object.spec.clone();
+    let mut spec = serde_yaml_ng::to_string(&spec).unwrap();
+    spec = spec.replace("replicas: 3", "replicas: 2");
+    w.service("pg", &spec);
+    w.step_members(500, |w| {
+        let st = w.replication("pg");
+        st.change.is_none()
+            && st
+                .last_change
+                .as_ref()
+                .is_some_and(|l| l.from.as_deref() == Some("pg-2"))
+            && !w
+                .tasks
+                .iter()
+                .any(|t| t.spec.slot == Some(2) && !t.status.state.is_terminal())
+    });
+    let st = w.replication("pg");
+    let last = st.last_change.unwrap();
+    assert_eq!(last.kind, ChangeKind::Switchover);
+    assert_eq!(last.reason, "scaling down removes the primary");
+    assert!(matches!(st.primary.as_deref(), Some("pg-0" | "pg-1")));
+
+    // Down to one: no replica stays to hand over to, nothing is held.
+    let spec = serde_yaml_ng::to_string(&w.services[0].object.spec)
+        .unwrap()
+        .replace("replicas: 2", "replicas: 1");
+    w.service("pg", &spec);
+    w.members_say(1, |_| 500, &[]);
+    w.settle();
+    assert_eq!(w.running().len(), 1);
+}

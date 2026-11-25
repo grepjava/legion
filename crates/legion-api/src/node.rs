@@ -386,8 +386,9 @@ pub struct DrainItem {
     pub name: String,
     /// For a task still told to run: `budget` (its service's disruption
     /// budget holds it), `data` (its data is copied first),
-    /// `replacement` (its replacement starts first), or `running` (not yet
-    /// planned). Told to stop: `stopping`, or `unconfirmed` (orphaned, not
+    /// `replacement` (its replacement starts first), `switchover` (a
+    /// replicated database's primary, handing over to a replica first), or
+    /// `running` (not yet planned). Told to stop: `stopping`, or `unconfirmed` (orphaned, not
     /// yet seen to stop). For a Volume: `copying` or `finishing`, as its
     /// data moves off, or `waiting` for its move to start (again, after
     /// one called off as the node it went to stopped being ready).
