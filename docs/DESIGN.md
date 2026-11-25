@@ -1863,7 +1863,10 @@ How it was built, where it differs from the outline below:
   operation (capability `probe`), so it needs nothing of the database.
 - **Log archiving** (`replication.archive: { target, keep }`, an `s3`
   BackupTarget): the plugin spools each finished piece of the log (every
-  PostgreSQL member, `archive_mode = always`) and says where in `status`;
+  PostgreSQL member, `archive_mode = always`), beside the data directory
+  so a rewind or a new copy cannot take what is not shipped yet (and
+  archives what PostgreSQL left unarchived before either), and says where
+  in `status`;
   the leader's archiver maps the spool to the member's claimed Volume
   through the pod's mounts and, every 15 s, offers the node holding it an
   `ArchiveRun` with the target and its key. The agent ships what is
