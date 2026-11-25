@@ -147,6 +147,12 @@ members are told their role only on nodes that read it.
   even when the daemon is dead: the agent renews a lease as heartbeats are
   answered, and each container's supervisor stops it once the lease runs
   out. A Volume's automatic failover is then safe in that case too.
+- **Managers far apart keep up**: a leader sends a manager what of the
+  log fits the time a call has (the heartbeat interval), learned per
+  manager from how long calls take, and openraft goes on from there at
+  once. A witness across the internet catching up after a restart no
+  longer logs streams of `payload too large` errors while each batch is
+  halved down to one entry and grown back.
 
 ### Upgrading
 

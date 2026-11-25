@@ -37,11 +37,24 @@ pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 /// Largest log batch a leader sends in one call, once encoded. openraft
 /// batches up to `max_payload_entries` whatever their size, and objects of
 /// up to a MiB each would pass [`MAX_MESSAGE`] together, which the peer
-/// refuses, and no smaller batch would follow. Each call must also finish
-/// within the heartbeat interval (openraft's timeout for it). A batch above
-/// this is sent again in fewer entries; one entry alone goes whatever its
-/// size.
+/// refuses, and no smaller batch would follow. One entry alone goes
+/// whatever its size.
 pub(crate) const MAX_BATCH: usize = 4 * 1024 * 1024;
+
+/// The least a peer's [`Budgets`] falls to.
+const MIN_BUDGET: usize = 16 * 1024;
+
+/// How many bytes of log a call to each peer may carry, learned from how
+/// long calls take. Each call must finish within the heartbeat interval
+/// (openraft's timeout for it), and a peer far away (a witness across the
+/// internet, 200 ms off) can't take [`MAX_BATCH`] in that time, least of
+/// all a peer catching up after a restart. A leader sends what fits and
+/// says how far it got ([`AppendEntriesResponse::PartialSuccess`]), so
+/// openraft goes on from there at once; a call that ran out of time halves
+/// the budget, and one that took under a quarter of it while near the
+/// budget doubles it. Shared by the peer's clients, as openraft makes a new
+/// one for each replication stream.
+pub(crate) type Budgets = Arc<Mutex<HashMap<NodeId, usize>>>;
 
 /// The header saying what a manager speaks: `speaks/oldest`.
 const PROTOCOL_HEADER: &str = "legion-protocol";
@@ -78,6 +91,7 @@ pub struct GrpcNetwork {
     speaking: Speaking,
     heard: Heard,
     refusals: Refusals,
+    budgets: Budgets,
 }
 
 impl GrpcNetwork {
@@ -90,6 +104,7 @@ impl GrpcNetwork {
             speaking,
             heard,
             refusals: Refusals::default(),
+            budgets: Budgets::default(),
         }
     }
 }
@@ -111,6 +126,7 @@ impl RaftNetworkFactory<TypeConfig> for GrpcNetwork {
             speaking: self.speaking.clone(),
             heard: self.heard.clone(),
             refusals: self.refusals.clone(),
+            budgets: self.budgets.clone(),
         }
     }
 }
@@ -132,6 +148,7 @@ pub struct PeerClient {
     speaking: Speaking,
     heard: Heard,
     refusals: Refusals,
+    budgets: Budgets,
 }
 
 type RpcErr<E> = RPCError<NodeId, BasicNode, RaftError<NodeId, E>>;
@@ -204,16 +221,50 @@ impl PeerClient {
     }
 }
 
-/// How many of a batch of `entries` encoding to `size` bytes to send
-/// instead, to stay within `limit`: in proportion, and always fewer, so a
-/// batch of entries larger than the average shrinks again on the next try;
-/// `None` for a batch that fits or one entry.
-fn fewer_entries(entries: usize, size: usize, limit: usize) -> Option<u64> {
-    if size <= limit || entries <= 1 {
-        return None;
+/// How many of the leading entries of `sizes` (each one's encoded size)
+/// fit in `budget` together: always at least one.
+fn fitting(sizes: impl IntoIterator<Item = usize>, budget: usize) -> usize {
+    let (mut n, mut total) = (0, 0usize);
+    for size in sizes {
+        total = total.saturating_add(size);
+        if n > 0 && total > budget {
+            break;
+        }
+        n += 1;
     }
-    let fit = (entries as u128 * limit as u128 / size as u128) as usize;
-    Some(fit.clamp(1, entries - 1) as u64)
+    n
+}
+
+/// A peer's budget after a call of `size` bytes that took `took` of the
+/// `allowed` time, or ran out of it (`None`): see [`Budgets`].
+fn next_budget(
+    budget: usize,
+    size: usize,
+    took: Option<std::time::Duration>,
+    allowed: std::time::Duration,
+) -> usize {
+    match took {
+        None => (size / 2).min(budget).max(MIN_BUDGET),
+        Some(t) if t < allowed / 4 && size >= budget / 2 => budget.saturating_mul(2).min(MAX_BATCH),
+        Some(_) => budget,
+    }
+}
+
+/// The length of `value` encoded, without keeping it.
+fn encoded_len<T: Serialize>(value: &T) -> usize {
+    struct Count(usize);
+    impl io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
 }
 
 enum Method {
@@ -235,29 +286,54 @@ fn status_to_rpc<E: std::error::Error>(status: Status) -> RpcErr<E> {
 impl RaftNetwork<TypeConfig> for PeerClient {
     async fn append_entries(
         &mut self,
-        rpc: AppendEntriesRequest<TypeConfig>,
+        mut rpc: AppendEntriesRequest<TypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RpcErr<openraft::error::Infallible>> {
         // From the start: encoding a large batch takes its share too.
-        let deadline = tokio::time::Instant::now() + option.hard_ttl().mul_f64(0.8);
+        let start = tokio::time::Instant::now();
+        let allowed = option.hard_ttl().mul_f64(0.8);
+        let budget = *self
+            .budgets
+            .lock()
+            .unwrap()
+            .entry(self.target)
+            .or_insert(MAX_BATCH);
+        let entries = rpc.entries.len();
+        let keep = fitting(rpc.entries.iter().map(encoded_len), budget);
+        // What doesn't fit goes in the next call, at once: openraft goes on
+        // from the last entry this one says it sent.
+        let sent = (keep < entries).then(|| {
+            rpc.entries.truncate(keep);
+            rpc.entries.last().map(|e| e.log_id)
+        });
         let json =
             serde_json::to_vec(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        let entries = rpc.entries.len();
-        if let Some(hint) = fewer_entries(entries, json.len(), MAX_BATCH) {
-            return Err(RPCError::PayloadTooLarge(
-                PayloadTooLarge::new_entries_hint(hint),
-            ));
-        }
-        if entries <= 1 {
-            return self.send(Method::Append, json, &option).await;
+        let size = json.len();
+        let partly = |r: AppendEntriesResponse<NodeId>| match (r, sent) {
+            (AppendEntriesResponse::Success, Some(last)) => {
+                AppendEntriesResponse::PartialSuccess(last)
+            }
+            (r, _) => r,
+        };
+        if keep <= 1 {
+            return self.send(Method::Append, json, &option).await.map(partly);
         }
         // openraft gives each call the heartbeat interval and, past it,
         // sends the same batch again: on a link too slow for it, never
-        // anything. A batch that runs out of time goes again in half.
-        match tokio::time::timeout_at(deadline, self.send(Method::Append, json, &option)).await {
-            Ok(result) => result,
+        // anything. A batch that runs out of time halves the budget and
+        // goes again at once in fewer entries.
+        let result =
+            tokio::time::timeout_at(start + allowed, self.send(Method::Append, json, &option))
+                .await;
+        let took = result.is_ok().then(|| start.elapsed());
+        self.budgets
+            .lock()
+            .unwrap()
+            .insert(self.target, next_budget(budget, size, took, allowed));
+        match result {
+            Ok(result) => result.map(partly),
             Err(_) => Err(RPCError::PayloadTooLarge(
-                PayloadTooLarge::new_entries_hint((entries / 2) as u64),
+                PayloadTooLarge::new_entries_hint((keep / 2).max(1) as u64),
             )),
         }
     }
@@ -405,24 +481,47 @@ pub(crate) async fn read_index(
 
 #[cfg(test)]
 mod tests {
-    use super::fewer_entries;
+    use super::{MAX_BATCH, MIN_BUDGET, encoded_len, fitting, next_budget};
+    use std::time::Duration;
 
     #[test]
-    fn batches_above_the_limit_shrink_until_one_entry() {
-        assert_eq!(fewer_entries(300, 100, 100), None);
-        assert_eq!(fewer_entries(1, 1000, 100), None);
-        // 70 entries of a MiB against 8 MiB: 8 of them.
-        assert_eq!(fewer_entries(70, 70 << 20, 8 << 20), Some(8));
-        // Just over the limit still drops one.
-        assert_eq!(fewer_entries(10, 101, 100), Some(9));
-        // Far over: one.
-        assert_eq!(fewer_entries(2, 10_000, 100), Some(1));
-        // A shrinking batch always reaches one entry.
-        let (mut n, per) = (300usize, 3usize << 20);
-        while let Some(h) = fewer_entries(n, n * per, 8 << 20) {
-            assert!((h as usize) < n);
-            n = h as usize;
+    fn a_call_carries_the_leading_entries_that_fit() {
+        assert_eq!(fitting([10; 30], 100), 10);
+        assert_eq!(fitting([10; 5], 100), 5);
+        assert_eq!(fitting([60, 50, 10], 100), 1);
+        // One entry goes whatever its size.
+        assert_eq!(fitting([1000, 1], 100), 1);
+        assert_eq!(fitting([], 100), 0);
+        // 70 entries of a MiB within MAX_BATCH: 4 of them.
+        assert_eq!(fitting(std::iter::repeat_n(1 << 20, 70), MAX_BATCH), 4);
+    }
+
+    #[test]
+    fn the_budget_follows_what_the_link_carries_in_time() {
+        let allowed = Duration::from_millis(800);
+        // Out of time: half of what was sent, never below the floor.
+        assert_eq!(next_budget(MAX_BATCH, 1 << 20, None, allowed), 1 << 19);
+        assert_eq!(next_budget(MAX_BATCH, 1000, None, allowed), MIN_BUDGET);
+        // Quick with a full call: double, up to the most.
+        let quick = Some(Duration::from_millis(100));
+        assert_eq!(next_budget(1 << 19, 1 << 19, quick, allowed), 1 << 20);
+        assert_eq!(next_budget(MAX_BATCH, MAX_BATCH, quick, allowed), MAX_BATCH);
+        // Quick with a small call says nothing about the link.
+        assert_eq!(next_budget(1 << 19, 1000, quick, allowed), 1 << 19);
+        // In time but not quick: kept.
+        let slow = Some(Duration::from_millis(500));
+        assert_eq!(next_budget(1 << 19, 1 << 19, slow, allowed), 1 << 19);
+        // A link that keeps timing out settles at the floor.
+        let mut b = MAX_BATCH;
+        for _ in 0..20 {
+            b = next_budget(b, b, None, allowed);
         }
-        assert!(n * per <= 8 << 20 || n == 1);
+        assert_eq!(b, MIN_BUDGET);
+    }
+
+    #[test]
+    fn encoded_len_counts_the_json() {
+        let v = serde_json::json!({"a": [1, 2, 3], "b": "x"});
+        assert_eq!(encoded_len(&v), serde_json::to_vec(&v).unwrap().len());
     }
 }
